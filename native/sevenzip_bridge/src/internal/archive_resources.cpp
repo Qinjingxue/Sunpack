@@ -7,181 +7,172 @@
 #include "sevenzip_status.hpp"
 #include "sevenzip_streams.hpp"
 
-namespace sunpack::sevenzip {
-
+namespace sunpack::sevenzip
+{
 
 #ifdef _WIN32
 
-ResourceAnalysisResult analyze_archive_resources_internal(
+    ResourceAnalysisResult analyze_archive_resources_internal(
 
-    CreateObjectFunc create_object,
+        CreateObjectFunc create_object,
 
-    const std::wstring& archive_path,
+        const std::wstring &archive_path,
 
-    const std::wstring& password,
+        const std::wstring &password,
 
-    const std::vector<std::wstring>& part_paths
+        const std::vector<std::wstring> &part_paths
 
-) {
+    )
+    {
 
-    ResourceAnalysisResult result;
+        ResourceAnalysisResult result;
 
-    result.archive_size = archive_input_size(archive_path, part_paths);
+        result.archive_size = archive_input_size(archive_path, part_paths);
 
-    bool any_format_created = false;
+        bool any_format_created = false;
 
-    HRESULT last_hr = E_FAIL;
-    bool last_encryption_evidence = false;
+        HRESULT last_hr = E_FAIL;
+        bool last_encryption_evidence = false;
 
+        for (const GUID &format : candidate_formats(archive_path, part_paths))
+        {
 
+            ComPtr<IInArchive> archive;
 
-    for (const GUID& format : candidate_formats(archive_path, part_paths)) {
+            HRESULT hr = create_object(&format, &IID_IInArchive, reinterpret_cast<void **>(archive.out()));
 
-        ComPtr<IInArchive> archive;
+            if (hr != S_OK || !archive)
+            {
 
-        HRESULT hr = create_object(&format, &IID_IInArchive, reinterpret_cast<void**>(archive.out()));
+                last_hr = hr;
 
-        if (hr != S_OK || !archive) {
+                continue;
+            }
 
-            last_hr = hr;
+            any_format_created = true;
 
-            continue;
+            bool stream_opened = false;
 
-        }
+            ComPtr<IInStream> stream = open_archive_stream(archive_path, part_paths, stream_opened);
 
-        any_format_created = true;
+            if (!stream_opened)
+            {
 
+                result.status = PasswordTestStatus::Error;
 
+                result.message = "archive file could not be opened";
 
-        bool stream_opened = false;
+                return result;
+            }
 
-        ComPtr<IInStream> stream = open_archive_stream(archive_path, part_paths, stream_opened);
+            auto *raw_open_callback = new OpenCallback(password, callback_archive_path(archive_path, part_paths), part_paths);
+            ComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
-        if (!stream_opened) {
+            hr = archive->Open(stream.get(), nullptr, open_callback.get());
+            last_encryption_evidence = raw_open_callback->password_requested();
 
-            result.status = PasswordTestStatus::Error;
+            if (hr != S_OK)
+            {
 
-            result.message = "archive file could not be opened";
+                last_hr = hr;
 
-            return result;
+                continue;
+            }
 
-        }
+            const bool ok = fill_resource_analysis_from_open_archive(archive.get(), result);
 
+            archive->Close();
 
+            if (!ok)
+            {
 
-        auto* raw_open_callback = new OpenCallback(password, callback_archive_path(archive_path, part_paths), part_paths);
-        ComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
-
-        hr = archive->Open(stream.get(), nullptr, open_callback.get());
-        last_encryption_evidence = raw_open_callback->password_requested();
-
-        if (hr != S_OK) {
-
-            last_hr = hr;
-
-            continue;
-
-        }
-
-
-
-        const bool ok = fill_resource_analysis_from_open_archive(archive.get(), result);
-
-        archive->Close();
-
-        if (!ok) {
+                return result;
+            }
 
             return result;
+        }
 
+        if (!any_format_created)
+        {
+
+            result.status = PasswordTestStatus::Unsupported;
+
+            result.message = "7z.dll did not create a supported archive handler";
+        }
+        else if (looks_wrong_password(last_hr, kOpOk, last_encryption_evidence))
+        {
+
+            result.status = PasswordTestStatus::WrongPassword;
+
+            result.encrypted = true;
+
+            result.message = "archive is encrypted or password is wrong";
+        }
+        else
+        {
+
+            result.status = PasswordTestStatus::Unsupported;
+
+            result.message = "archive could not be opened by supported handlers";
         }
 
         return result;
-
     }
-
-
-
-    if (!any_format_created) {
-
-        result.status = PasswordTestStatus::Unsupported;
-
-        result.message = "7z.dll did not create a supported archive handler";
-
-    } else if (looks_wrong_password(last_hr, kOpOk, last_encryption_evidence)) {
-
-        result.status = PasswordTestStatus::WrongPassword;
-
-        result.encrypted = true;
-
-        result.message = "archive is encrypted or password is wrong";
-
-    } else {
-
-        result.status = PasswordTestStatus::Unsupported;
-
-        result.message = "archive could not be opened by supported handlers";
-
-    }
-
-    return result;
-
-}
 
 #endif
 
-ResourceAnalysisResult analyze_archive_resources_with_parts(
+    ResourceAnalysisResult analyze_archive_resources_with_parts(
 
-    const std::wstring& seven_zip_dll_path,
+        const std::wstring &seven_zip_dll_path,
 
-    const std::wstring& archive_path,
+        const std::wstring &archive_path,
 
-    const std::vector<std::wstring>& part_paths,
+        const std::vector<std::wstring> &part_paths,
 
-    const std::wstring& password
+        const std::wstring &password
 
-) {
+    )
+    {
 
 #ifdef _WIN32
 
-    ComModule module(seven_zip_dll_path);
+        ComModule module(seven_zip_dll_path);
 
-    auto create_object = module.create_object();
+        auto create_object = module.create_object();
 
-    if (!create_object) {
+        if (!create_object)
+        {
+
+            ResourceAnalysisResult result;
+
+            result.status = PasswordTestStatus::BackendUnavailable;
+
+            result.message = "7z.dll could not be loaded";
+
+            return result;
+        }
+
+        return analyze_archive_resources_internal(create_object, archive_path, password, part_paths);
+
+#else
+
+        (void)seven_zip_dll_path;
+
+        (void)archive_path;
+
+        (void)part_paths;
+
+        (void)password;
 
         ResourceAnalysisResult result;
 
         result.status = PasswordTestStatus::BackendUnavailable;
 
-        result.message = "7z.dll could not be loaded";
+        result.message = "native archive resource analysis is only implemented on Windows";
 
         return result;
 
+#endif
     }
 
-    return analyze_archive_resources_internal(create_object, archive_path, password, part_paths);
-
-#else
-
-    (void)seven_zip_dll_path;
-
-    (void)archive_path;
-
-    (void)part_paths;
-
-    (void)password;
-
-    ResourceAnalysisResult result;
-
-    result.status = PasswordTestStatus::BackendUnavailable;
-
-    result.message = "native archive resource analysis is only implemented on Windows";
-
-    return result;
-
-#endif
-
-}
-
-
-}  // namespace sunpack::sevenzip
+} // namespace sunpack::sevenzip

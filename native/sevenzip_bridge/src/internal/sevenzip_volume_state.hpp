@@ -1,13 +1,5 @@
 #pragma once
 
-// Volume-scoped write state.
-//
-// VolumeState lifetime is the worker's, not a writer's: meters, the future
-// disk-full gate and (later) free-space watching belong to the volume, while the
-// AsyncFileWriter that does the work is a reclaimable resource.  Splitting the two
-// is what keeps the process-wide meters continuous across writer reclamation
-// (docs/sevenzip_worker_per_volume_write.zh.md §3.1/§3.3).
-
 #include "sevenzip_writer_meters.hpp"
 
 #ifdef _WIN32
@@ -17,42 +9,32 @@
 #include <memory>
 #include <string>
 
-namespace sunpack::sevenzip {
+namespace sunpack::sevenzip
+{
 
-using VolumeKey = std::string;
+    using VolumeKey = std::string;
+    struct VolumeState
+    {
+        explicit VolumeState(VolumeKey volume_key, bool is_persistent)
+            : key(std::move(volume_key)), persistent(is_persistent) {}
 
-// Persistent state for one output volume.
-//
-// ``persistent`` distinguishes a real physical volume from a synthetic per-job
-// key produced when volume resolution failed (§2.3): physical state is kept for
-// the worker's lifetime, synthetic state is deleted together with its writer
-// because the key can never be reused.
-struct VolumeState {
-    explicit VolumeState(VolumeKey volume_key, bool is_persistent)
-        : key(std::move(volume_key)), persistent(is_persistent) {}
+        const VolumeKey key;
+        const bool persistent = true;
 
-    const VolumeKey key;
-    const bool persistent = true;
+        WriterCounters counters;
 
-    // Per-volume meters.  Diagnostics and future per-volume policy; the
-    // controller reads the process-wide WriterMeters instead.
-    WriterCounters counters;
+        std::atomic<std::uint64_t> accounting_violations{0};
 
-    // Non-zero means the accounting identity was violated for this volume: a
-    // saturating pending release had to clamp, i.e. some byte was accounted twice.
-    // Release builds keep running; this counter is what makes the defect visible.
-    std::atomic<std::uint64_t> accounting_violations{0};
+        std::atomic<VolumeSpaceState> space_state{VolumeSpaceState::Ready};
+    };
 
-    // Future disk-full gate (§8).  Nothing acts on this yet.
-    std::atomic<VolumeSpaceState> space_state{VolumeSpaceState::Ready};
-};
+    using VolumeStatePtr = std::shared_ptr<VolumeState>;
 
-using VolumeStatePtr = std::shared_ptr<VolumeState>;
+    inline VolumeStatePtr make_volume_state(VolumeKey key, bool persistent)
+    {
+        return std::make_shared<VolumeState>(std::move(key), persistent);
+    }
 
-inline VolumeStatePtr make_volume_state(VolumeKey key, bool persistent) {
-    return std::make_shared<VolumeState>(std::move(key), persistent);
 }
-
-}  // namespace sunpack::sevenzip
 
 #endif
