@@ -382,7 +382,7 @@ def test_native_worker_result_escapes_control_characters(tmp_path):
         "archive_path": str(archive),
         "output_dir": str(tmp_path / "out"),
     }
-    runner = SevenZipRunner({"max_task_seconds": 2})
+    runner = SevenZipRunner({"watchdog_no_progress_timeout_seconds": 2})
     runner.worker_path = worker_path
     runner.seven_zip_dll_path = seven_zip_dll
     try:
@@ -419,7 +419,6 @@ def test_native_worker_asyncio_event_controller_completes_job(tmp_path):
     async def run_attempt():
         runner = SevenZipRunner(
             {
-                "max_task_seconds": 5,
                 "watchdog_no_progress_timeout_seconds": 2,
                 "cancel_grace_seconds": 0.5,
             }
@@ -467,7 +466,7 @@ def test_native_worker_asyncio_process_exit_completes_pending_job(tmp_path):
     assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "worker_lost"
 
 
-def test_native_worker_asyncio_deadline_cancels_without_polling(tmp_path):
+def test_native_worker_asyncio_no_progress_cancels_without_polling(tmp_path):
     worker = tmp_path / "stalled_worker.cmd"
     worker.write_text(
         '@echo {"type":"worker_ready"}\r\n'
@@ -478,7 +477,7 @@ def test_native_worker_asyncio_deadline_cancels_without_polling(tmp_path):
     )
     runner = SevenZipRunner(
         {
-            "max_task_seconds": 0.05,
+            "watchdog_no_progress_timeout_seconds": 0.05,
             "cancel_grace_seconds": 0.5,
         }
     )
@@ -500,7 +499,7 @@ def test_native_worker_asyncio_deadline_cancels_without_polling(tmp_path):
 
     assert completed.returncode == -101
     assert completed.worker_diagnostics["process_failure"]["failure_kind"] == "timeout"
-    assert "timed out" in completed.stderr
+    assert "no observable progress" in completed.stderr
 
 
 def test_native_worker_starts_in_neutral_working_directory(tmp_path, monkeypatch):
@@ -1200,13 +1199,13 @@ def test_extraction_scheduler_classifies_malformed_worker_output_as_process_exit
     assert result.diagnostics["process_failure"]["message"]
 
 
-def test_sevenzip_runner_observed_process_timeout_reports_process_timeout(tmp_path):
+def test_sevenzip_runner_observed_no_progress_reports_process_timeout(tmp_path):
     worker = tmp_path / "sleep_worker.cmd"
     worker.write_text("@ping 127.0.0.1 -n 3 >nul\r\n", encoding="utf-8")
     scheduler = ExtractionScheduler(
         max_retries=1,
         process_config={
-            "max_task_seconds": 0.1,
+            "watchdog_no_progress_timeout_seconds": 0.1,
             "cancel_grace_seconds": 0.5,
         },
     )

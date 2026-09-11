@@ -28,8 +28,8 @@ def test_pipeline_runner_passes_native_worker_overrides():
         "recursive_extract": "1",
         "performance": {
             "worker": {
-                "max_task_seconds": 1800,
                 "watchdog_no_progress_timeout_seconds": 180,
+                "thread_capacity": 3,
             },
         },
     }))
@@ -44,8 +44,8 @@ def test_pipeline_runner_passes_native_worker_overrides():
             await engine.run(["missing.zip"])
     asyncio.run(run())
 
-    assert captured["extractor"]["max_task_seconds"] == 1800
     assert captured["extractor"]["watchdog_no_progress_timeout_seconds"] == 180
+    assert captured["extractor"]["thread_capacity"] == 3
 
 
 def test_pipeline_progress_observer_receives_extract_ready_before_native_progress(tmp_path):

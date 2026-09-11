@@ -83,7 +83,6 @@
       "hold_windows": 8,
       "warm_start_decay_seconds": 0.0,
       "warm_start_confirmations": 2,
-      "max_task_seconds": 1800,
       "watchdog_no_progress_timeout_seconds": 180,
       "thread_capacity": 0,
       "stage_thread_capacity": 0,

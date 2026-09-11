@@ -186,8 +186,7 @@ CLI 可用 `--recur` 临时覆盖。
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `performance.worker.max_task_seconds` | `int` / `float` | 单个解压任务总时长上限，`0` 表示不限。 |
-| `performance.worker.watchdog_no_progress_timeout_seconds` | `int` / `float` | worker 无进展超时，`0` 表示不限。 |
+| `performance.worker.watchdog_no_progress_timeout_seconds` | `int` / `float` | worker 无进展超时，`0` 表示不限。任务没有总时长上限：只要 worker 仍在输出事件就持续推进，只有真正停滞才会被判定超时。 |
 | `performance.worker.thread_capacity` | `int` | `IInArchive` 线程硬容量；`0` 由 worker 按机器能力探测。实际活动任务数由 native 自适应准入。 |
 | `performance.worker.stage_thread_capacity` | `int` | 同步扫描、分析、校验、修复和后处理的固定 worker 线程容量；`0` 自动按机器能力选择。 |
 | `performance.worker.max_inflight_files` | `int` | 同时存在的文件级异步状态机上限；`0` 自动取 worker 总容量的 4 倍，范围 64–512。 |

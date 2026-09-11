@@ -122,14 +122,10 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
 def _worker_job_deadline(state: dict[str, Any]) -> float | None:
     if state.get("cancel_requested"):
         return float(state.get("cancel_deadline") or 0.0)
-    deadlines: list[float] = []
-    max_task_seconds = max(0.0, float(state.get("max_task_seconds") or 0.0))
-    if max_task_seconds:
-        deadlines.append(float(state["started_at"]) + max_task_seconds)
     no_progress_timeout = max(0.0, float(state.get("no_progress_timeout") or 0.0))
-    if no_progress_timeout:
-        deadlines.append(float(state["last_progress_at"]) + no_progress_timeout)
-    return min(deadlines) if deadlines else None
+    if not no_progress_timeout:
+        return None
+    return float(state["last_progress_at"]) + no_progress_timeout
 
 
 def _worker_job_due_reason(state: dict[str, Any], now: float) -> str | None:
@@ -138,10 +134,7 @@ def _worker_job_due_reason(state: dict[str, Any], now: float) -> str | None:
         return None
     if state.get("cancel_requested"):
         return str(state.get("timeout_message") or "sevenzip_worker cancellation grace expired")
-    no_progress_timeout = max(0.0, float(state.get("no_progress_timeout") or 0.0))
-    if no_progress_timeout and now >= float(state["last_progress_at"]) + no_progress_timeout:
-        return "sevenzip_worker made no observable progress"
-    return "sevenzip_worker timed out"
+    return "sevenzip_worker made no observable progress"
 
 
 def _earliest_worker_deadline(states) -> float | None:
@@ -222,16 +215,11 @@ class _NativeWorkerProcess:
         state = {
             "on_line": on_line,
             "on_timeout": on_timeout,
-            "started_at": now,
             "last_progress_at": now,
             "cancel_requested": False,
             "cancel_deadline": 0.0,
             "completion_lock": threading.Lock(),
             "worker_epoch": self.worker_epoch,
-            "max_task_seconds": max(
-                0.0,
-                float(self.process_config.get("max_task_seconds", 0) or 0),
-            ),
             "no_progress_timeout": max(
                 0.0,
                 float(self.process_config.get("watchdog_no_progress_timeout_seconds", 0) or 0),
@@ -519,12 +507,10 @@ class _AsyncNativeWorkerProcess:
         self._jobs[job_id] = {
             "on_line": on_line,
             "on_timeout": on_timeout,
-            "started_at": now,
             "last_progress_at": now,
             "cancel_requested": False,
             "cancel_deadline": 0.0,
             "state": "submitted",
-            "max_task_seconds": max(0.0, float(self.process_config.get("max_task_seconds", 0) or 0)),
             "no_progress_timeout": max(
                 0.0,
                 float(self.process_config.get("watchdog_no_progress_timeout_seconds", 0) or 0),

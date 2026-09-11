@@ -41,7 +41,7 @@ def _advanced_payload(precheck=None):
         "recursive_extract": "*",
         "post_extract": {"archive_cleanup_mode": "r", "flatten_single_directory": True},
         "filesystem": {"directory_scan_mode": "*", "scan_filters_enabled": True, "scan_filters": []},
-        "performance": {"worker": {"initial_active_jobs": 0, "max_task_seconds": 1800}},
+        "performance": {"worker": {"initial_active_jobs": 0, "watchdog_no_progress_timeout_seconds": 180}},
         "verification": _verification_config(),
         "detection": {
             "enabled": True,
@@ -71,7 +71,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["cli"]["language"] == "zh"
     assert config["filesystem"]["directory_scan_mode"] == "recursive"
     assert config["filesystem"]["scan_filters"][0]["range"] == "r >= 2 MB"
-    assert config["performance"]["worker"]["max_task_seconds"] == 1800
+    assert config["performance"]["worker"]["watchdog_no_progress_timeout_seconds"] == 180
     assert config["performance"]["worker"]["initial_active_jobs"] == 3
 
 
