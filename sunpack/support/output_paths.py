@@ -21,7 +21,9 @@ def default_output_dir_for_task(task: ArchiveTask, output_config: dict | None = 
         out_dir = os.path.join(os.path.dirname(path), os.path.basename(out_name))
     if normalized_path(out_dir) == normalized_path(path):
         out_dir += "_extracted"
-    return _non_existing_output_dir(out_dir)
+    # Return an absolute normalized path so callers derive the write-routing key
+    # and the extraction request from the identical string.
+    return normalized_output_dir(_non_existing_output_dir(out_dir))
 
 
 def _relative_parent(path: str, common_root: str | None) -> str:
@@ -51,6 +53,34 @@ def _is_relative_to(path: str, root: str) -> bool:
         return os.path.commonpath((os.path.abspath(path), os.path.abspath(root))) == os.path.abspath(root)
     except ValueError:
         return False
+
+
+def normalized_output_dir(path: str) -> str:
+    """Absolute, normalized output path.
+
+    The volume key and the extraction request must be derived from the same path
+    string: resolving a relative path in one place and letting the worker resolve
+    it against its own working directory in another would silently mis-route the
+    per-volume write facility.
+    """
+    return os.path.abspath(os.path.normpath(str(path)))
+
+
+def resolve_output_volume_key(path: str) -> str:
+    """Volume identity for an output path, or an empty string when unknown.
+
+    Reported by the Rust layer (nearest existing ancestor -> canonicalize ->
+    volume GUID), because the output directory usually does not exist yet when the
+    job is built.  An empty result is not fatal: the caller substitutes a
+    synthetic per-job key so the job still gets its own write facility instead of
+    sharing another volume's.
+    """
+    try:
+        from sunpack_native import resolve_output_volume_key as _resolve
+
+        return str(_resolve(normalized_output_dir(path)) or "")
+    except Exception:
+        return ""
 
 
 def _non_existing_output_dir(path: str) -> str:

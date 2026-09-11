@@ -2,7 +2,7 @@ use super::WatchFileObservation;
 use std::ffi::{c_void, OsStr};
 use std::io;
 use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::ptr::{null, null_mut};
 
 type Handle = *mut c_void;
@@ -334,11 +334,47 @@ fn volume_device(path: &Path) -> io::Result<String> {
     {
         return Err(io::Error::last_os_error());
     }
-    let mut volume = nul_terminated(&volume_name).to_vec();
+    Ok(volume_key_from(&volume_name))
+}
+
+/// Volume identity for an output path that may not exist yet.
+///
+/// `volume_device` cannot be used directly for extraction targets: it starts with
+/// `std::fs::canonicalize`, which requires the whole path to exist, while an
+/// extraction output directory usually does not exist when the job is built.  The
+/// nearest existing ancestor is canonicalized instead, which also resolves a
+/// junction or volume mount point on the way down to its real device.
+pub(super) fn resolve_output_volume(path: &Path) -> io::Result<String> {
+    let anchor = nearest_existing_ancestor(path)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no existing ancestor"))?;
+    volume_device(&anchor)
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current: PathBuf = if path.as_os_str().is_empty() {
+        std::env::current_dir().ok()?
+    } else {
+        path.to_path_buf()
+    };
+    loop {
+        if current.exists() {
+            return Some(current);
+        }
+        match current.parent() {
+            Some(parent) if parent != current && !parent.as_os_str().is_empty() => {
+                current = parent.to_path_buf();
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn volume_key_from(volume_name: &[u16]) -> String {
+    let mut volume = nul_terminated(volume_name).to_vec();
     if volume.last() == Some(&('\\' as u16)) {
         volume.pop();
     }
-    Ok(String::from_utf16_lossy(&volume).to_ascii_lowercase())
+    String::from_utf16_lossy(&volume).to_ascii_lowercase()
 }
 
 fn canonical_wide(path: &Path) -> io::Result<Vec<u16>> {
@@ -355,4 +391,49 @@ fn nul_terminated(values: &[u16]) -> &[u16] {
         .position(|value| *value == 0)
         .unwrap_or(values.len());
     &values[..length]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nearest_existing_ancestor_walks_up_to_a_real_directory() {
+        let root = std::env::temp_dir();
+        let nested = root
+            .join("sunpack-volume-anchor-probe")
+            .join("level-one")
+            .join("level-two");
+        assert!(!nested.exists(), "probe path must not exist");
+        let anchor = nearest_existing_ancestor(&nested).expect("an existing ancestor");
+        assert!(anchor.exists());
+        assert!(anchor.starts_with(&root) || root.starts_with(&anchor));
+    }
+
+    #[test]
+    fn nearest_existing_ancestor_returns_none_without_any_ancestor() {
+        // A UNC path whose server does not exist has no reachable ancestor.
+        let missing = Path::new(r"\\sunpack-nonexistent-host\share\out");
+        assert!(nearest_existing_ancestor(missing).is_none());
+    }
+
+    #[test]
+    fn resolve_output_volume_handles_a_not_yet_created_directory() {
+        let root = std::env::temp_dir();
+        let pending = root
+            .join("sunpack-volume-anchor-probe")
+            .join("output-does-not-exist");
+        let from_pending = resolve_output_volume(&pending).expect("volume for a pending path");
+        let from_root = resolve_output_volume(&root).expect("volume for the existing root");
+        // Both live under the same temp root, including on a machine where the
+        // temp directory is a junction to another volume.
+        assert_eq!(from_pending, from_root);
+        assert!(from_pending.contains("volume{") || from_pending.contains("\\\\"));
+    }
+
+    #[test]
+    fn resolve_output_volume_rejects_an_unreachable_unc_path() {
+        let missing = Path::new(r"\\sunpack-nonexistent-host\share\out");
+        assert!(resolve_output_volume(missing).is_err());
+    }
 }

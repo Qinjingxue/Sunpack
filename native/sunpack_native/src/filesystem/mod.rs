@@ -81,8 +81,26 @@ pub(crate) fn validate_ntfs_watch_root(path: &str) -> PyResult<()> {
 }
 
 #[pyfunction]
-pub(crate) fn watch_broker_acquire() -> PyResult<()> {
+pub(crate) fn resolve_output_volume_key(path: &str) -> PyResult<Option<String>> {
     #[cfg(windows)]
+    {
+        return match windows::resolve_output_volume(Path::new(path)) {
+            Ok(key) => Ok(Some(key)),
+            // An unresolvable volume is not an error: the caller falls back to a
+            // synthetic per-job key so the job still gets an isolated facility
+            // instead of silently sharing another volume's writer.
+            Err(_) => Ok(None),
+        };
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Ok(None)
+    }
+}
+
+#[pyfunction]
+pub(crate) fn watch_broker_acquire() -> PyResult<()> {    #[cfg(windows)]
     {
         return sunpack_usn_core::broker_acquire().map_err(os_error);
     }

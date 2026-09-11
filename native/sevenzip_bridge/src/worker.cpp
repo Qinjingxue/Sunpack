@@ -33,6 +33,7 @@
 #include "internal/native_worker_sizing.hpp"
 #ifdef _WIN32
 #include "internal/sevenzip_async_output.hpp"
+#include "internal/sevenzip_volume_registry.hpp"
 #endif
 
 namespace {
@@ -884,6 +885,10 @@ std::string diagnostics_json(const sunpack::sevenzip::ExtractArchiveResult& resu
 
 int run_request(
     const std::string& request,
+    // The write facility for this job's output volume, borrowed from the
+    // registry lease held by worker_loop.  Null for dry runs, which write
+    // nothing.  The historical parameter name says "shared_writer"; the
+    // semantics are now per-volume, not process-wide.
     const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer = nullptr,
     const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr
 ) {
@@ -1278,7 +1283,13 @@ public:
         const sunpack::sevenzip::NativeSizingPlan& sizing,
         sunpack::sevenzip::NativeRuntimeConfig runtime_config
     )
-        : shared_writer_(make_shared_writer()),
+        : writer_meters_(std::make_shared<sunpack::sevenzip::WriterMeters>()),
+          // One environment snapshot for every volume facility: the writers must
+          // be identical by construction, not by all happening to read the same
+          // variables (§3.4).
+          writer_registry_(std::make_shared<sunpack::sevenzip::VolumeWriterRegistry>(
+              writer_meters_,
+              sunpack::sevenzip::configured_async_writer_config())),
           worker_count_((std::max)(std::size_t{1}, sizing.thread_capacity)),
           memory_budget_(sizing.memory_budget_bytes),
           queue_capacity_(configured_native_queue_capacity()),
@@ -1333,7 +1344,7 @@ public:
                 return future;
             }
             if (!job_id.empty()) {
-                cancel_tokens_[job_id] = cancel_token;
+                cancel_tokens_[job_id] = std::make_shared<JobControl>(cancel_token, nullptr);
             }
             queue_.push_back(Job{
                 std::move(request),
@@ -1351,18 +1362,27 @@ public:
 
     bool cancel(const std::string& job_id) noexcept {
         std::shared_ptr<std::atomic<bool>> token;
+        std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto found = cancel_tokens_.find(job_id);
             if (found == cancel_tokens_.end()) {
                 return false;
             }
-            token = found->second;
+            token = found->second->cancel_token;
+            writer = found->second->writer;
+        }
+        if (!token) {
+            return false;
         }
         token->store(true, std::memory_order_release);
 #ifdef _WIN32
-        if (shared_writer_) {
-            shared_writer_->wake_waiters();
+        // Only the facility this job is actually writing to needs waking: its
+        // producer may be parked in that facility's backpressure wait.  A job that
+        // has not acquired a lease yet (or a dry run) has no writer and needs only
+        // the token.
+        if (writer) {
+            writer->wake_waiters();
         }
 #endif
         condition_.notify_all();
@@ -1391,10 +1411,10 @@ public:
         }
         workers_.clear();
 #ifdef _WIN32
-        if (shared_writer_) {
-            shared_writer_->finish();
-            shared_writer_.reset();
-        }
+        // Every remaining writer finishes and joins here, with the registry mutex
+        // released.  Reaching this point implies all leases were released: the
+        // worker threads are joined, and a lease never outlives its job.
+        writer_registry_->shutdown();
 #endif
     }
 
@@ -1404,6 +1424,15 @@ private:
         bool foreground = true;
         std::size_t memory_reserve = 64U << 20;
         std::size_t dictionary_reserve = 0;
+        // Routing key for the per-volume write facility, resolved by the caller
+        // before submission (the worker does not link the Rust volume resolver).
+        // Always non-empty in practice: the producer substitutes a synthetic
+        // "job:<id>" key when resolution fails, so a job never silently shares
+        // another volume's writer.
+        std::string volume_key;
+        // False only for dry runs, which write nothing: no facility, no writer
+        // threads, and no volume readiness gate should apply to them.
+        bool requires_writer = true;
     };
 
     struct Job {
@@ -1411,6 +1440,21 @@ private:
         std::shared_ptr<std::promise<int>> promise;
         std::shared_ptr<std::atomic<bool>> cancel_token;
         JobMetadata metadata;
+    };
+
+    // Per-job cancellation control.  ``writer`` is bound once the job holds a
+    // facility lease, so a cancel wakes exactly one volume's writer instead of
+    // every facility (§6.3).  It stays empty for queued and dry-run jobs, which
+    // only need the token.
+    struct JobControl {
+        JobControl() = default;
+        JobControl(
+            std::shared_ptr<std::atomic<bool>> token,
+            std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> bound_writer)
+            : cancel_token(std::move(token)), writer(std::move(bound_writer)) {}
+
+        std::shared_ptr<std::atomic<bool>> cancel_token;
+        std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
     };
 
     static JobMetadata metadata_from_request(const std::string& request) noexcept {
@@ -1421,6 +1465,8 @@ private:
             metadata.request_id = json_string_field(request, "job_id", "");
         }
         metadata.foreground = json_string_field(request, "origin", "foreground") != "watch";
+        metadata.volume_key = json_string_field(request, "output_volume_key", "");
+        metadata.requires_writer = !json_bool_field(request, "dry_run", false);
         if (json_uint_field_in_object(request, "native_memory_reserve_bytes", &value)) {
             metadata.memory_reserve = (std::max)(
                 std::size_t{1}, static_cast<std::size_t>((std::min)(
@@ -1480,7 +1526,9 @@ private:
             "\",\"event\":\"" + event +
             "\",\"request_id\":\"" + json_escape(metadata.request_id) +
             "\",\"origin\":\"" + std::string(metadata.foreground ? "foreground" : "watch") +
-            "\",\"memory_reserve_bytes\":" + std::to_string(metadata.memory_reserve) +
+            "\",\"output_volume_key\":\"" + json_escape(metadata.volume_key) +
+            "\",\"requires_writer\":" + std::string(metadata.requires_writer ? "true" : "false") +
+            ",\"memory_reserve_bytes\":" + std::to_string(metadata.memory_reserve) +
             ",\"dictionary_reserve_bytes\":" + std::to_string(metadata.dictionary_reserve) +
             ",\"active_jobs\":" + std::to_string(active_jobs) +
             ",\"active_memory_bytes\":" + std::to_string(active_memory) +
@@ -1565,7 +1613,9 @@ private:
         const sunpack::sevenzip::NativeRuntimeSnapshot& snapshot,
         std::size_t queued_jobs,
         unsigned sampled_interval_ms,
-        unsigned next_interval_ms
+        unsigned next_interval_ms,
+        std::uint64_t discarded_write_bytes = 0,
+        bool writer_idle = true
     ) noexcept {
         print_json_line(
             "{\"type\":\"native_controller\",\"queued_jobs\":" + std::to_string(queued_jobs) +
@@ -1583,6 +1633,8 @@ private:
             ",\"completed_jobs_per_second\":" + std::to_string(snapshot.completed_jobs_per_second) +
             ",\"completed_files_per_second\":" + std::to_string(snapshot.completed_files_per_second) +
             ",\"pending_write_bytes\":" + std::to_string(snapshot.pending_write_bytes) +
+            ",\"discarded_write_bytes\":" + std::to_string(discarded_write_bytes) +
+            ",\"writer_idle\":" + std::string(writer_idle ? "true" : "false") +
             ",\"activity_session\":" + std::to_string(snapshot.activity_session) +
             ",\"saturated_segment\":" + std::to_string(snapshot.saturated_segment) +
             ",\"warm_start_used\":" + std::string(snapshot.warm_start_used ? "true" : "false") +
@@ -1600,6 +1652,17 @@ private:
         print_json_line(
             "{\"type\":\"native_controller\",\"event\":\"" +
             std::string(event) + "\"}");
+    }
+
+    // Facility lifecycle, so an empty `live_facilities` count can be told apart
+    // from "the volume key never reached the writer".
+    static void print_writer_facility_event(
+        const char* event,
+        const std::string& volume_key
+    ) noexcept {
+        print_json_line(
+            "{\"type\":\"native_writer\",\"event\":\"" + std::string(event) +
+            "\",\"volume_key\":\"" + json_escape(volume_key) + "\"}");
     }
 
 #ifdef _WIN32
@@ -1699,6 +1762,10 @@ private:
 
     void controller_loop() noexcept {
         constexpr unsigned minimum_sample_interval_ms = 100;
+        // Upper bound on a parked sleep: reclamation has to keep running while the
+        // adaptive controller is idle, and a facility can appear from a worker
+        // thread that never touches this condition variable (§5.5).
+        constexpr auto parked_wait_cap = std::chrono::milliseconds(1000);
         unsigned next_interval_ms = native_sample_interval_ms();
         auto last_sample_at = std::chrono::steady_clock::now();
         auto idle_since = last_sample_at;
@@ -1706,8 +1773,21 @@ private:
         while (true) {
             std::unique_lock<std::mutex> wait_lock(mutex_);
             if (monitor_parked) {
-                controller_condition_.wait(
+                auto parked_wait = parked_wait_cap;
+#ifdef _WIN32
+                if (const auto deadline = writer_registry_->next_reap_deadline()) {
+                    const auto now = std::chrono::steady_clock::now();
+                    parked_wait = (std::min)(
+                        parked_wait_cap,
+                        *deadline > now
+                            ? std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now) +
+                                std::chrono::milliseconds(1)
+                            : std::chrono::milliseconds(1));
+                }
+#endif
+                controller_condition_.wait_for(
                     wait_lock,
+                    parked_wait,
                     [this] { return stopping_ || controller_recheck_; });
             } else {
                 controller_condition_.wait_for(
@@ -1719,19 +1799,30 @@ private:
                 break;
             }
             controller_recheck_ = false;
+#ifdef _WIN32
+            // Driven from this thread rather than a reaper thread of its own: the
+            // parked path above already wakes on the earliest reclaim deadline.
+            for (const auto& volume : writer_registry_->reap_idle()) {
+                print_writer_facility_event("writer_facility_reaped", volume);
+            }
+#endif
             const auto now = std::chrono::steady_clock::now();
             if (monitor_parked) {
                 if (queue_.empty() && active_jobs_ == 0) {
                     continue;
                 }
                 sunpack::sevenzip::NativeThroughputCounters counters;
+                std::uint64_t discarded_write_bytes = 0;
+                bool writer_idle = true;
 #ifdef _WIN32
-                if (shared_writer_) {
-                    const auto metrics = shared_writer_->snapshot_metrics();
-                    counters.accepted_bytes = metrics.accepted_bytes;
-                    counters.written_bytes = metrics.written_bytes;
-                    counters.completed_files = metrics.completed_files;
-                    counters.completed_jobs = metrics.completed_jobs;
+                {
+                    const auto metrics = writer_registry_->snapshot();
+                    counters.accepted_bytes = metrics.meters.accepted_bytes;
+                    counters.written_bytes = metrics.meters.written_bytes;
+                    counters.completed_files = metrics.meters.completed_files;
+                    counters.completed_jobs = metrics.meters.completed_jobs;
+                    discarded_write_bytes = metrics.meters.discarded_bytes;
+                    writer_idle = metrics.meters.pending_bytes == 0 && !metrics.any_active_jobs;
                 }
 #endif
                 const double idle_seconds = std::chrono::duration<double>(
@@ -1745,7 +1836,12 @@ private:
                 wait_lock.unlock();
                 print_controller_lifecycle_event("activity_started");
                 print_controller_event(
-                    snapshot, queued_jobs, 0, controller_interval_ms(snapshot, queued_jobs));
+                    snapshot,
+                    queued_jobs,
+                    0,
+                    controller_interval_ms(snapshot, queued_jobs),
+                    discarded_write_bytes,
+                    writer_idle);
             } else {
                 wait_lock.unlock();
             }
@@ -1769,16 +1865,27 @@ private:
             const auto sample = read_runtime_sample(
                 runtime_controller_.resource_diagnostics_enabled());
             sunpack::sevenzip::NativeThroughputCounters throughput;
+            std::uint64_t discarded_write_bytes = 0;
+            std::uint64_t pending_write_bytes = 0;
+            bool writer_has_active_jobs = false;
 #ifdef _WIN32
-            if (shared_writer_) {
-                const auto metrics = shared_writer_->snapshot_metrics();
-                throughput.accepted_bytes = metrics.accepted_bytes;
-                throughput.written_bytes = metrics.written_bytes;
-                throughput.completed_files = metrics.completed_files;
-                throughput.completed_jobs = metrics.completed_jobs;
+            {
+                const auto metrics = writer_registry_->snapshot();
+                throughput.accepted_bytes = metrics.meters.accepted_bytes;
+                throughput.written_bytes = metrics.meters.written_bytes;
+                throughput.completed_files = metrics.meters.completed_files;
+                throughput.completed_jobs = metrics.meters.completed_jobs;
+                discarded_write_bytes = metrics.meters.discarded_bytes;
+                pending_write_bytes = metrics.meters.pending_bytes;
+                writer_has_active_jobs = metrics.any_active_jobs;
             }
 #endif
-            const bool writer_idle = throughput.accepted_bytes == throughput.written_bytes;
+            // accepted == written is NOT an idle signal: a cancelled or failed
+            // buffer leaves a permanent gap that never closes.  The pending gauge
+            // is the correct byte-level source, but it can legitimately read zero
+            // between chunks or after a cancelled job abandoned its staging, so a
+            // writer is only idle when no job is registered either.
+            const bool writer_idle = pending_write_bytes == 0 && !writer_has_active_jobs;
             bool parked = false;
             sunpack::sevenzip::NativeRuntimeSnapshot parked_snapshot;
             {
@@ -1794,7 +1901,8 @@ private:
             }
             if (parked) {
                 reset_system_cpu_sample();
-                print_controller_event(parked_snapshot, 0, sampled_interval_ms, 0);
+                print_controller_event(
+                    parked_snapshot, 0, sampled_interval_ms, 0, discarded_write_bytes, writer_idle);
                 print_controller_lifecycle_event("activity_parked");
                 continue;
             }
@@ -1819,7 +1927,8 @@ private:
             }
             next_interval_ms = controller_interval_ms(snapshot, queued_jobs);
             if (changed || snapshot.resource_diagnostics_enabled) {
-                print_controller_event(snapshot, queued_jobs, sampled_interval_ms, next_interval_ms);
+                print_controller_event(snapshot, queued_jobs, sampled_interval_ms, next_interval_ms,
+                    discarded_write_bytes, writer_idle);
             }
             if (changed) {
                 condition_.notify_all();
@@ -1827,12 +1936,33 @@ private:
         }
     }
 
-    static std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> make_shared_writer() {
-#ifdef _WIN32
-        return std::make_shared<sunpack::sevenzip::AsyncFileWriter>();
-#else
-        return nullptr;
-#endif
+    // Fallback routing key when the request carried none.  Never share a fallback
+    // bucket: a job whose volume is unknown gets its own isolated facility rather
+    // than silently sharing another volume's writer (§2.3).
+    static std::string synthetic_volume_key(const std::string& request) {
+        const std::string job_id = json_string_field(request, "job_id", "");
+        return job_id.empty() ? std::string("job:unidentified") : "job:" + job_id;
+    }
+
+    // Bind the facility to the job so a cancel wakes only that volume's writer
+    // (§6.3).  Called before run_request, so the weak reference is valid for the
+    // whole extraction.
+    void register_cancel_writer(
+        const std::string& request,
+        const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& writer
+    ) noexcept {
+        if (!writer) {
+            return;
+        }
+        const std::string job_id = json_string_field(request, "job_id", "");
+        if (job_id.empty()) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        const auto found = cancel_tokens_.find(job_id);
+        if (found != cancel_tokens_.end()) {
+            found->second->writer = writer;
+        }
     }
 
     void worker_loop() noexcept {
@@ -1867,7 +1997,26 @@ private:
             print_active_event(job, "job_started", admitted_jobs, admitted_memory);
             int code = -100;
             try {
-                code = run_request(job.request, shared_writer_, job.cancel_token);
+                if (job.metadata.requires_writer) {
+                    // The lease lives in an explicit scope so it is released before
+                    // the job is reported finished below.  That ordering gives the
+                    // invariant the controller and the reaper rely on:
+                    //   active_jobs_ == 0  =>  every finished job's lease is gone
+                    // (§6.4)
+                    const std::string key = job.metadata.volume_key.empty()
+                        ? synthetic_volume_key(job.request)
+                        : job.metadata.volume_key;
+                    auto lease = writer_registry_->acquire(key);
+                    if (lease.created_facility()) {
+                        print_writer_facility_event("writer_facility_created", key);
+                    }
+                    register_cancel_writer(job.request, lease.writer_pointer());
+                    code = run_request(job.request, lease.writer_pointer(), job.cancel_token);
+                } else {
+                    // Dry runs write nothing: no facility, no writer threads, no
+                    // buffers and no volume readiness gate (§6.2).
+                    code = run_request(job.request, nullptr, job.cancel_token);
+                }
             } catch (...) {
                 code = -100;
             }
@@ -1902,11 +2051,15 @@ private:
 #endif
     }
 
-    std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> shared_writer_;
     std::vector<std::thread> workers_;
     std::thread controller_thread_;
+    // Process-wide write meters and the per-volume facilities.  The meters are
+    // declared first so they outlive every writer: a reclaimed facility must never
+    // take the aggregate counters with it (§3.1).
+    sunpack::sevenzip::WriterMetersPtr writer_meters_;
+    sunpack::sevenzip::VolumeWriterRegistryPtr writer_registry_;
     std::deque<Job> queue_;
-    std::unordered_map<std::string, std::shared_ptr<std::atomic<bool>>> cancel_tokens_;
+    std::unordered_map<std::string, std::shared_ptr<JobControl>> cancel_tokens_;
     std::mutex mutex_;
     std::condition_variable condition_;
     std::condition_variable controller_condition_;

@@ -42,6 +42,8 @@ set(SUP7Z_INTERNAL_SOURCES
     src/internal/sevenzip_sdk.cpp
     src/internal/sevenzip_status.cpp
     src/internal/sevenzip_streams.cpp
+    src/internal/sevenzip_volume_registry.cpp
+    src/internal/sevenzip_writer_meters.cpp
     src/internal/strict_archive_validation.cpp
 )
 

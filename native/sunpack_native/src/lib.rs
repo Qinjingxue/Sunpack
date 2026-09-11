@@ -226,6 +226,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(postprocess::scan_watch_candidates, m)?)?;
     m.add_function(wrap_pyfunction!(postprocess::watch_candidate_for_path, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_filesystem_type, m)?)?;
+    m.add_function(wrap_pyfunction!(filesystem::resolve_output_volume_key, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::validate_ntfs_watch_root, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_file_is_ready, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_is_connected, m)?)?;

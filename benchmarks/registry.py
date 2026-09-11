@@ -36,6 +36,8 @@ _ROWS = [
     ("extraction", "worker-small-file-scheduling", "benchmarks.scenarios.worker_small_file_scheduling", "Native worker parallelism and fairness under many small archive jobs."),
     ("extraction", "worker-initial-concurrency-matrix", "benchmarks.scenarios.worker_initial_concurrency_matrix", "Initial native-worker concurrency across ZIP, 7z, RAR, solid, and non-solid archives."),
     ("extraction", "worker-single-file-write", "benchmarks.scenarios.worker_single_file_write", "Before/after native worker throughput for one large output file."),
+    ("extraction", "worker-multi-volume-write", "benchmarks.scenarios.worker_multi_volume_write", "Per-volume writer scheduling across two real physical disks."),
+    ("extraction", "worker-volume-writer-scheduling", "benchmarks.scenarios.worker_volume_writer_scheduling", "Cross-volume versus same-volume writer scheduling with a paired control."),
     ("extraction", "worker-resource-pressure", "benchmarks.scenarios.worker_resource_pressure", "Real 7z CPU, IO, and decoder-memory contention."),
     ("extraction", "split-pressure", "benchmarks.scenarios.extraction_split_pressure", "Split and carrier archive matrix."),
 ]

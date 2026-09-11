@@ -5,6 +5,7 @@ import argparse
 import csv
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import psutil
@@ -134,9 +135,11 @@ def _run_worker(
     prefetch_archive: bool,
     cleanup_output: bool,
     dry_run: bool,
+    output_root: Path | None = None,
 ) -> dict[str, Any]:
     archive = Path(corpus["archive"])
-    output_dir = workspace.outputs / f"{phase}-{run:02d}-{label}"
+    output_dir = (output_root or workspace.outputs) / f"{phase}-{run:02d}-{label}"
+    output_dir.mkdir(parents=True, exist_ok=True)
     if prefetch_archive:
         _prefetch_archive(archive, chunk_bytes=8 * MIB)
 
@@ -258,6 +261,9 @@ def _run_worker(
     }
     if cleanup_output:
         shutil.rmtree(output_dir, ignore_errors=True)
+    elif output_root is not None:
+        # Keep an explicit output root from accumulating runs across invocations.
+        shutil.rmtree(output_dir, ignore_errors=True)
     return row
 
 
@@ -274,7 +280,104 @@ def _median(rows: list[dict[str, Any]], key: str) -> float | None:
     return round(statistics.median(values), 6) if values else None
 
 
-def _summarize(rows: list[dict[str, Any]], labels: list[str]) -> dict[str, Any]:
+def _percentile(values: list[float], fraction: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    position = max(0, min(len(ordered) - 1, math.ceil(len(ordered) * fraction) - 1))
+    return round(ordered[position], 6)
+
+
+def _mad(values: list[float]) -> float | None:
+    """Raw median absolute deviation (unscaled)."""
+    if not values:
+        return None
+    center = statistics.median(values)
+    return statistics.median([abs(value - center) for value in values])
+
+
+def _regression_gate(
+    baseline_rows: list[dict[str, Any]],
+    candidate_rows: list[dict[str, Any]],
+    *,
+    hard_percent: float,
+) -> dict[str, Any]:
+    """§9.2 noise-aware non-regression gate.
+
+    The single-disk path is architecturally unchanged by the per-volume writer
+    refactor, so this gate treats any reproducible slowdown beyond the run-to-run
+    noise band as a failure rather than granting a fixed budget.
+    """
+    baseline_values = [float(row["throughput_mib_per_second"]) for row in baseline_rows]
+    candidate_values = [float(row["throughput_mib_per_second"]) for row in candidate_rows]
+    if not baseline_values or not candidate_values:
+        return {"evaluated": False, "reason": "no measured runs"}
+    baseline_median = statistics.median(baseline_values)
+    candidate_median = statistics.median(candidate_values)
+    mad = _mad(baseline_values)
+    # §9.2 noise estimate.  Either 3 x MAD or 3 x (IQR / 1.349), whichever is
+    # tighter: a single cold-cache outlier inflates MAD and would otherwise buy a
+    # wide allowance that hides a real regression.
+    noise_floor = 0.0
+    if len(baseline_values) >= 3:
+        mad_floor = 3.0 * float(mad) if mad is not None else 0.0
+        candidates = [mad_floor]
+        if len(baseline_values) >= 4:
+            p25 = _percentile(baseline_values, 0.25)
+            p75 = _percentile(baseline_values, 0.75)
+            if p25 is not None and p75 is not None:
+                candidates.append(3.0 * (p75 - p25) / 1.349)
+        noise_floor = min(value for value in candidates if value > 0.0) if any(
+            value > 0.0 for value in candidates
+        ) else 0.0
+    drop_ratio = (baseline_median - candidate_median) / baseline_median if baseline_median else 0.0
+    allowed = max(hard_percent, (noise_floor / baseline_median) if baseline_median else 0.0)
+    over_line = drop_ratio > allowed
+    baseline_p05 = _percentile(baseline_values, 0.05)
+    candidate_p05 = _percentile(candidate_values, 0.05)
+    tail_ok = (
+        baseline_p05 is None
+        or candidate_p05 is None
+        or candidate_p05 >= baseline_p05 * 0.95
+    )
+    # §9.2 requires reproducibility: a single noisy run may be recorded but must not
+    # block the change.  Split the measured runs in half and require both halves to
+    # agree before treating an over-line result as a regression.
+    reproducible = False
+    if len(candidate_values) >= 4:
+        ordered = sorted(candidate_values)
+        half = len(ordered) // 2
+        first, second = statistics.median(ordered[:half]), statistics.median(ordered[half:])
+        reproducible = (
+            (baseline_median - first) / baseline_median > allowed
+            and (baseline_median - second) / baseline_median > allowed
+        )
+        reproducible = bool(reproducible and not tail_ok)
+    gate = {
+        "evaluated": True,
+        "baseline_median_mib_per_second": round(baseline_median, 6),
+        "candidate_median_mib_per_second": round(candidate_median, 6),
+        "baseline_mad_mib_per_second": None if mad is None else round(mad, 6),
+        "noise_floor_mib_per_second": round(noise_floor, 6),
+        "drop_percent": round(drop_ratio * 100.0, 3),
+        "allowed_drop_percent": round(allowed * 100.0, 3),
+        "hard_percent": round(hard_percent * 100.0, 3),
+        "baseline_p05_mib_per_second": baseline_p05,
+        "candidate_p05_mib_per_second": candidate_p05,
+        "tail_ok": bool(tail_ok),
+        "over_line": bool(over_line),
+        "reproducible": reproducible,
+        "passed": bool(not over_line),
+    }
+    return gate
+
+
+def _summarize(
+    rows: list[dict[str, Any]],
+    labels: list[str],
+    *,
+    hard_percent: float = 0.02,
+) -> dict[str, Any]:
     measured = [row for row in rows if row["phase"] == "run"]
     by_worker: dict[str, dict[str, Any]] = {}
     for label in labels:
@@ -303,6 +406,28 @@ def _summarize(rows: list[dict[str, Any]], labels: list[str]) -> dict[str, Any]:
                 "throughput_percent_delta": round((after / before - 1.0) * 100.0, 3) if before else None,
                 "throughput_ratio": round(after / before, 6) if before else None,
             }
+        measured_by_label: dict[str, list[dict[str, Any]]] = {
+            label: [row for row in measured if row["label"] == label] for label in labels
+        }
+        gate = _regression_gate(
+            measured_by_label.get("baseline", []),
+            measured_by_label.get("candidate", []),
+            hard_percent=hard_percent,
+        )
+        summary["regression_gate"] = gate
+        per_label_noise: dict[str, Any] = {}
+        for label in labels:
+            values = [float(row["throughput_mib_per_second"]) for row in measured_by_label[label]]
+            per_label_noise[label] = {
+                "median_mib_per_second": round(statistics.median(values), 6) if values else None,
+                "mad_mib_per_second": None if not values else round(float(_mad(values)), 6),
+                "p05_mib_per_second": _percentile(values, 0.05),
+                "p95_mib_per_second": _percentile(values, 0.95),
+                "runs": len(values),
+            }
+        summary["throughput_distribution"] = per_label_noise
+        if gate.get("evaluated"):
+            summary["all_passed"] = bool(summary["all_passed"] and gate["passed"])
     return summary
 
 
@@ -328,7 +453,12 @@ def _worker_specs(args: argparse.Namespace, parser: argparse.ArgumentParser) -> 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Compare native worker output throughput for one large ZIP_STORED member.")
-    parser.add_argument("--payload-gib", type=int, default=1)
+    parser.add_argument(
+        "--payload-gib",
+        type=float,
+        default=2.0,
+        help="payload size; the §9.2 noise floor scales as 1/sqrt(size), so small payloads are noisy",
+    )
     parser.add_argument("--chunk-mib", type=int, default=8)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
@@ -338,6 +468,16 @@ def main() -> int:
     parser.add_argument("--worker-path", type=Path, help="Run one worker executable without a before/after comparison.")
     parser.add_argument("--baseline-worker-path", type=Path, help="Pre-change worker executable.")
     parser.add_argument("--candidate-worker-path", type=Path, help="Post-change worker executable.")
+    parser.add_argument(
+        "--max-regression-percent",
+        type=float,
+        default=2.0,
+        help=(
+            "§9.2 non-regression budget for the architecturally unchanged single-disk "
+            "path, as a percentage; the effective allowance is "
+            "max(this, 3 x MAD of the baseline runs)."
+        ),
+    )
     parser.add_argument("--prefetch-archive", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--dry-run", action="store_true", help="Measure 7z decode and callback throughput without output I/O.")
     parser.add_argument(
@@ -346,15 +486,25 @@ def main() -> int:
         help="Open output with write-through semantics for a physical-disk throughput measurement.",
     )
     parser.add_argument("--results-root", type=Path)
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        help=(
+            "directory for extraction output; point this at a non-system volume for a "
+            "quiet §9.2 measurement (the default workspace lives on the repo volume)"
+        ),
+    )
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--keep-workdir", action="store_true")
     args = parser.parse_args()
-    if args.payload_gib < 1 or args.chunk_mib < 1 or args.runs < 1 or args.warmups < 0:
+    if args.payload_gib <= 0 or args.chunk_mib < 1 or args.runs < 1 or args.warmups < 0:
         parser.error("payload size, chunk size, and runs must be positive; warmups must be non-negative")
     if not 1 <= args.writer_threads <= 32:
         parser.error("--writer-threads must be between 1 and 32")
     if args.timeout_seconds <= 0 or args.sample_interval <= 0:
         parser.error("--timeout-seconds and --sample-interval must be positive")
+    if args.max_regression_percent < 0:
+        parser.error("--max-regression-percent must be non-negative")
     if args.write_through:
         os.environ["SUNPACK_ASYNC_WRITER_WRITE_THROUGH"] = "1"
     else:
@@ -367,10 +517,10 @@ def main() -> int:
     if not dll_path.is_file():
         parser.error(f"7z.dll is unavailable: {dll_path}")
 
-    payload_bytes = args.payload_gib * GIB
+    payload_bytes = int(args.payload_gib * GIB)
     chunk_bytes = args.chunk_mib * MIB
     with BenchmarkWorkspace(SCENARIO, results_root=args.results_root, keep_workdir=args.keep_workdir) as workspace:
-        print(f"building {args.payload_gib} GiB stored ZIP corpus ...", flush=True)
+        print(f"building {args.payload_gib:g} GiB stored ZIP corpus ...", flush=True)
         corpus = _create_archive(workspace.corpus, payload_bytes=payload_bytes, chunk_bytes=chunk_bytes)
         print(
             f"  archive={corpus['archive_bytes'] / MIB:.1f} MiB build={corpus['build_seconds']:.2f}s "
@@ -400,6 +550,7 @@ def main() -> int:
                     prefetch_archive=bool(args.prefetch_archive),
                     cleanup_output=not args.keep_workdir,
                     dry_run=bool(args.dry_run),
+                    output_root=args.output_root,
                 )
                 rows.append(row)
                 print(
@@ -407,7 +558,7 @@ def main() -> int:
                     f"wall={row['worker_wall_seconds']:.3f}s rss={row['worker_rss_peak_mib']} MiB passed={row['passed']}",
                     flush=True,
                 )
-        summary = _summarize(rows, labels)
+        summary = _summarize(rows, labels, hard_percent=args.max_regression_percent / 100.0)
         report = {
             "parameters": {
                 "payload_gib": args.payload_gib,
@@ -420,6 +571,7 @@ def main() -> int:
                 "prefetch_archive": bool(args.prefetch_archive),
                 "dry_run": bool(args.dry_run),
                 "write_through": bool(args.write_through),
+                "max_regression_percent": args.max_regression_percent,
             },
             "environment": {
                 "workers": {label: str(path) for label, path in worker_specs},

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "sevenzip_paths.hpp"
+#include "sevenzip_volume_state.hpp"
+#include "sevenzip_writer_meters.hpp"
 
 #ifdef _WIN32
 
@@ -67,9 +69,36 @@ public:
     struct Metrics {
         std::uint64_t accepted_bytes = 0;
         std::uint64_t written_bytes = 0;
+        // Bytes that entered the writer but will never reach the disk (cancelled
+        // or permanently failed).  Together with pending_bytes this keeps the
+        // accounting identity below exact:
+        //   accepted = written + discarded + pending
+        std::uint64_t discarded_bytes = 0;
+        // Gauge: bytes accepted but neither written nor discarded yet.
+        std::uint64_t pending_bytes = 0;
         std::uint64_t completed_files = 0;
         std::uint64_t completed_jobs = 0;
     };
+
+    // Latest process-wide meters, as sampled by the owner for the controller.
+    // The counters live in WriterMeters, not here: a reclaimed writer must not
+    // take the aggregate with it.
+    WriterMeterSnapshot snapshot_global_meters() const noexcept {
+        return snapshot_counters(meters_->counters);
+    }
+
+    // Per-volume meters for diagnostics.
+    WriterMeterSnapshot snapshot_volume_meters() const noexcept {
+        return state_ ? snapshot_counters(state_->counters) : WriterMeterSnapshot{};
+    }
+
+    const AsyncWriterConfig& config() const noexcept { return config_; }
+
+    const VolumeStatePtr& volume_state() const noexcept { return state_; }
+
+    // Routing key this facility was built for.  The lease uses it to release the
+    // right registry entry without a reverse lookup.
+    const std::string& volume_key() const noexcept { return state_->key; }
 
     struct WorkItem {
         enum class Kind { Data, Close };
@@ -143,6 +172,9 @@ public:
         bool closed = false;
         bool close_requested = false;
         bool close_enqueued = false;
+        // Guards the inflight_file_count_ release so a repeated close cannot
+        // double-decrement the reclamation counter.
+        bool inflight_released = false;
         HANDLE handle = INVALID_HANDLE_VALUE;
         bool open_attempted = false;
     };
@@ -168,39 +200,35 @@ public:
     };
 
     static constexpr std::size_t kBufferSize = 1U << 20;
-    static constexpr std::size_t kBufferCount = 64;
-    static constexpr std::size_t kMaxQueuedJobs = 4096;
     static constexpr std::size_t kDefaultWriterCount = 4;
     static constexpr std::size_t kMaxWriterCount = 8;
     static constexpr std::size_t kDefaultJobInFlightBytes = 32U << 20;
     static constexpr std::size_t kDefaultFileInFlightBytes = 8U << 20;
 
-    AsyncFileWriter() : writer_count_(configured_writer_count()) {
-        buffers_.reserve(kBufferCount);
-        for (std::size_t index = 0; index < kBufferCount; ++index) {
-            auto buffer = std::make_unique<Buffer>();
-            free_buffers_.push_back(buffer.get());
-            buffers_.push_back(std::move(buffer));
-        }
-        workers_.reserve(writer_count_);
-        try {
-            for (std::size_t index = 0; index < writer_count_; ++index) {
-                workers_.emplace_back([this] { writer_loop(); });
-            }
-        } catch (...) {
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                stopping_ = true;
-            }
-            work_cv_.notify_all();
-            for (auto& worker : workers_) {
-                if (worker.joinable()) {
-                    worker.join();
-                }
-            }
-            throw;
-        }
+    // Volume-scoped facility.  ``meters`` is process-wide and owned by whoever
+    // outlives every writer; ``state`` carries the volume's own counters and the
+    // future disk-full gate.  Both are shared_ptr rather than a registry-map raw
+    // pointer so an unordered_map rehash can never dangle them (§3.2).
+    AsyncFileWriter(
+        std::shared_ptr<WriterMeters> meters,
+        VolumeStatePtr state,
+        AsyncWriterConfig config = {})
+        : meters_(meters ? std::move(meters) : std::make_shared<WriterMeters>()),
+          state_(state ? std::move(state) : make_volume_state(std::string{}, false)),
+          config_(config),
+          writer_count_((std::max)(std::size_t{1}, config.threads_per_volume)),
+          buffer_count_((std::max)(std::size_t{4}, config.buffer_count)),
+          queue_limit_((std::max)(std::size_t{1}, config.queue_limit)) {
+        initialize();
     }
+
+    // Convenience construction for tests and for callers that do not take part in
+    // the per-volume registry yet.  Uses the environment snapshot.
+    AsyncFileWriter()
+        : AsyncFileWriter(
+              std::make_shared<WriterMeters>(),
+              make_volume_state(std::string{}, false),
+              configured_async_writer_config()) {}
 
     ~AsyncFileWriter() { finish(); }
 
@@ -233,6 +261,7 @@ public:
             std::move(path), std::move(item_path), item_index, trace_index);
         std::lock_guard<std::mutex> lock(mutex_);
         active_files_.push_back(file);
+        ++inflight_file_count_;
         return file;
     }
 
@@ -393,7 +422,7 @@ public:
                         ++file->outstanding_data;
                     }
                     file->accepted_bytes.fetch_add(chunk, std::memory_order_relaxed);
-                    total_accepted_bytes_.fetch_add(chunk, std::memory_order_relaxed);
+                    account_accepted(chunk);
                     consumed += chunk;
                     if (buffer->size == kBufferSize) {
                         queued_staging = enqueue_staging_locked(file, false);
@@ -494,7 +523,8 @@ public:
         const HRESULT result = terminal_result_locked(job);
         unregister_job_locked(job);
         if (result == S_OK) {
-            total_completed_jobs_.fetch_add(1, std::memory_order_relaxed);
+            meters_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
+            state_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
         }
         return result;
     }
@@ -550,12 +580,49 @@ public:
     }
 
     Metrics snapshot_metrics() const noexcept {
+        const auto meters = snapshot_counters(meters_->counters);
         return Metrics{
-            total_accepted_bytes_.load(std::memory_order_relaxed),
-            total_written_bytes_.load(std::memory_order_relaxed),
-            total_completed_files_.load(std::memory_order_relaxed),
-            total_completed_jobs_.load(std::memory_order_relaxed),
+            meters.accepted_bytes,
+            meters.written_bytes,
+            meters.discarded_bytes,
+            meters.pending_bytes,
+            meters.completed_files,
+            meters.completed_jobs,
         };
+    }
+
+    // True when this facility holds no outstanding work: no queued items, no
+    // open or in-flight files and no registered job.
+    //
+    // "Open" rather than "referenced": extraction callbacks legitimately keep
+    // strong FileState references for the whole job (they snapshot file results at
+    // finalize), so counting live references would make a facility unreclaimable
+    // forever.  What matters for reclamation is that no write work remains.
+    bool is_quiescent() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (queued_jobs_ != 0 || inflight_file_count_ != 0) {
+            return false;
+        }
+        for (const auto& weak_job : active_jobs_) {
+            if (!weak_job.expired()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // True while any job is still registered, i.e. finish_job() has not completed
+    // for every make_job().  The pending gauge alone is not an idle signal: a job
+    // can legitimately drain to zero bytes between chunks while its extraction is
+    // still running.
+    bool has_active_jobs() const noexcept {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& weak_job : active_jobs_) {
+            if (!weak_job.expired()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     void record_operation_result(const FileStatePtr& file, Int32 operation_result) noexcept {
@@ -616,26 +683,83 @@ public:
     }
 
 private:
-    static std::size_t configured_writer_count() noexcept {
-        wchar_t text[16]{};
-        const DWORD length = GetEnvironmentVariableW(
-            L"SUNPACK_ASYNC_WRITER_THREADS", text, static_cast<DWORD>(std::size(text)));
-        if (length == 0 || length >= std::size(text)) {
-            return kDefaultWriterCount;
+    void initialize() {
+        buffers_.reserve(buffer_count_);
+        for (std::size_t index = 0; index < buffer_count_; ++index) {
+            auto buffer = std::make_unique<Buffer>();
+            free_buffers_.push_back(buffer.get());
+            buffers_.push_back(std::move(buffer));
         }
-        wchar_t* end = nullptr;
-        const unsigned long configured = std::wcstoul(text, &end, 10);
-        if (end == text || *end != L'\0' || configured == 0) {
-            return kDefaultWriterCount;
+        workers_.reserve(writer_count_);
+        try {
+            for (std::size_t index = 0; index < writer_count_; ++index) {
+                workers_.emplace_back([this] { writer_loop(); });
+            }
+        } catch (...) {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                stopping_ = true;
+            }
+            work_cv_.notify_all();
+            for (auto& worker : workers_) {
+                if (worker.joinable()) {
+                    worker.join();
+                }
+            }
+            throw;
         }
-        return (std::min)(static_cast<std::size_t>(configured), kMaxWriterCount);
     }
 
-    static bool write_through_enabled() noexcept {
-        wchar_t text[8]{};
-        const DWORD length = GetEnvironmentVariableW(
-            L"SUNPACK_ASYNC_WRITER_WRITE_THROUGH", text, static_cast<DWORD>(std::size(text)));
-        return length == 1 && text[0] == L'1';
+    bool write_through() const noexcept { return config_.write_through; }
+
+    // The only writers of the byte counters.  Keeping every byte through exactly
+    // one of these three paths is what makes the accounting identity hold:
+    //   accepted = written + discarded + pending
+    // Do not add fetch_add calls on the counters anywhere else.  Each path feeds
+    // two sinks: the volume's own meters (diagnostics) and the process-wide meters
+    // (the controller's only input).
+    void account_accepted(std::size_t bytes) noexcept {
+        const std::uint64_t value = static_cast<std::uint64_t>(bytes);
+        meters_->counters.accepted_bytes.fetch_add(value, std::memory_order_relaxed);
+        meters_->counters.pending_bytes.fetch_add(value, std::memory_order_relaxed);
+        state_->counters.accepted_bytes.fetch_add(value, std::memory_order_relaxed);
+        state_->counters.pending_bytes.fetch_add(value, std::memory_order_relaxed);
+    }
+
+    void account_written(std::size_t bytes) noexcept {
+        const std::uint64_t value = static_cast<std::uint64_t>(bytes);
+        meters_->counters.written_bytes.fetch_add(value, std::memory_order_relaxed);
+        state_->counters.written_bytes.fetch_add(value, std::memory_order_relaxed);
+        account_pending_release(bytes);
+    }
+
+    void account_discarded(std::size_t bytes) noexcept {
+        if (bytes == 0) {
+            return;
+        }
+        const std::uint64_t value = static_cast<std::uint64_t>(bytes);
+        meters_->counters.discarded_bytes.fetch_add(value, std::memory_order_relaxed);
+        state_->counters.discarded_bytes.fetch_add(value, std::memory_order_relaxed);
+        account_pending_release(bytes);
+    }
+
+    void account_pending_release(std::size_t bytes) noexcept {
+        release_pending(meters_->counters.pending_bytes, bytes);
+        release_pending(state_->counters.pending_bytes, bytes);
+    }
+
+    static void release_pending(std::atomic<std::uint64_t>& pending, std::size_t bytes) noexcept {
+        const std::uint64_t value = static_cast<std::uint64_t>(bytes);
+        // Saturating release: the gauge must never wrap, so a double-count bug
+        // degrades into a stuck gauge instead of an enormous one.
+        std::uint64_t current = pending.load(std::memory_order_relaxed);
+        for (;;) {
+            const std::uint64_t next = current > value ? current - value : 0;
+            if (pending.compare_exchange_weak(
+                    current, next, std::memory_order_relaxed, std::memory_order_relaxed)) {
+                return;
+            }
+        }
     }
 
     void set_job_error_locked(const JobStatePtr& job, HRESULT hr, int win32_error) noexcept {
@@ -687,7 +811,7 @@ private:
             // even though it cannot accept another byte.
             return file && file->staging_buffer &&
                 file->staging_buffer->size == kBufferSize &&
-                queued_jobs_ < kMaxQueuedJobs;
+                queued_jobs_ < queue_limit_;
         }
         if (file->staging_buffer) {
             return file->staging_buffer->size < kBufferSize;
@@ -754,6 +878,11 @@ private:
         Buffer* buffer = file->staging_buffer;
         file->staging_buffer = nullptr;
         if (buffer->size != 0) {
+            // The whole staging buffer never entered process_data(), so every byte
+            // is discarded here.  Buffers that did reach process_data() settle
+            // their remainder there, which keeps a partially written buffer from
+            // being counted twice.
+            account_discarded(buffer->size);
             if (file->inflight_bytes >= buffer->size) {
                 file->inflight_bytes -= buffer->size;
             } else {
@@ -785,7 +914,7 @@ private:
         if (!file || !file->staging_buffer || file->staging_buffer->size == 0) {
             return false;
         }
-        if (!force_queue && queued_jobs_ >= kMaxQueuedJobs) {
+        if (!force_queue && queued_jobs_ >= queue_limit_) {
             return false;
         }
 
@@ -874,7 +1003,7 @@ private:
         }
         file->open_attempted = true;
         DWORD creation_flags = FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OVERLAPPED;
-        if (write_through_enabled()) {
+        if (write_through()) {
             creation_flags |= FILE_FLAG_WRITE_THROUGH;
         }
         file->handle = CreateFileW(
@@ -913,10 +1042,12 @@ private:
     }
 
     void add_written_bytes(const FileStatePtr& file, DWORD written) noexcept {
+        // Lock-free accounting: the three account_* helpers are the only writers of
+        // the byte counters, so they must not depend on mutex_ being held or free.
+        account_written(written);
         std::lock_guard<std::mutex> lock(mutex_);
         if (file) {
             file->written_bytes += written;
-            total_written_bytes_.fetch_add(written, std::memory_order_relaxed);
         }
     }
 
@@ -928,13 +1059,14 @@ private:
         const auto job = file->job;
         const HRESULT global_error = current_error(job);
         if (global_error != S_OK) {
-            record_failure(file, global_error, current_win32_error(job));
+            record_failure(file, global_error, current_win32_error(job), buffer->size);
             return;
         }
         if (!open_file(file) || !begin_data_write(file)) {
             const HRESULT error = current_error(job);
             if (error != S_OK) {
-                record_failure(file, error, current_win32_error(job));
+                record_failure(
+                    file, error, current_win32_error(job), buffer->size);
             }
             return;
         }
@@ -955,10 +1087,17 @@ private:
                 request_size,
                 nullptr,
                 &overlapped);
+            // A failure part way through a buffer must discard only the bytes that
+            // did not reach the disk; the successfully written prefix is already
+            // accounted by add_written_bytes below.
             if (!started && GetLastError() != ERROR_IO_PENDING) {
                 const DWORD error = GetLastError();
                 end_data_write(file);
-                record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
+                record_failure(
+                    file,
+                    HRESULT_FROM_WIN32(error),
+                    static_cast<int>(error),
+                    buffer->size - transferred);
                 return;
             }
 
@@ -966,12 +1105,20 @@ private:
             if (!GetOverlappedResult(file->handle, &overlapped, &written, TRUE)) {
                 const DWORD error = GetLastError();
                 end_data_write(file);
-                record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
+                record_failure(
+                    file,
+                    HRESULT_FROM_WIN32(error),
+                    static_cast<int>(error),
+                    buffer->size - transferred);
                 return;
             }
             if (written == 0) {
                 end_data_write(file);
-                record_failure(file, HRESULT_FROM_WIN32(ERROR_WRITE_FAULT), ERROR_WRITE_FAULT);
+                record_failure(
+                    file,
+                    HRESULT_FROM_WIN32(ERROR_WRITE_FAULT),
+                    ERROR_WRITE_FAULT,
+                    buffer->size - transferred);
                 return;
             }
             transferred += written;
@@ -1007,7 +1154,7 @@ private:
             file->handle = INVALID_HANDLE_VALUE;
         }
         if (handle != INVALID_HANDLE_VALUE) {
-            if (write_through_enabled() && !FlushFileBuffers(handle)) {
+            if (write_through() && !FlushFileBuffers(handle)) {
                 const DWORD error = GetLastError();
                 record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
             }
@@ -1036,9 +1183,16 @@ private:
             if (job && job->pending_jobs != 0) {
                 --job->pending_jobs;
             }
+            if (!file->inflight_released) {
+                file->inflight_released = true;
+                if (inflight_file_count_ != 0) {
+                    --inflight_file_count_;
+                }
+            }
         }
         if (completed_successfully) {
-            total_completed_files_.fetch_add(1, std::memory_order_relaxed);
+            meters_->counters.completed_files.fetch_add(1, std::memory_order_relaxed);
+            state_->counters.completed_files.fetch_add(1, std::memory_order_relaxed);
         }
         producer_cv_.notify_all();
     }
@@ -1081,7 +1235,16 @@ private:
         producer_cv_.notify_all();
     }
 
-    void record_failure(const FileStatePtr& file, HRESULT hr, int win32_error) noexcept {
+    void record_failure(
+        const FileStatePtr& file,
+        HRESULT hr,
+        int win32_error,
+        std::size_t discarded_bytes = 0
+    ) noexcept {
+        // ``discarded_bytes`` is the caller's remainder: bytes that reached
+        // process_data() but will never be written.  Callers that did not take a
+        // buffer out of the queue pass 0 and let release_buffer() settle it.
+        account_discarded(discarded_bytes);
         {
             std::lock_guard<std::mutex> lock(mutex_);
             mark_file_failure_locked(file, hr, win32_error);
@@ -1110,11 +1273,17 @@ private:
     mutable std::mutex mutex_;
     std::condition_variable producer_cv_;
     std::condition_variable work_cv_;
+    // Process-wide meters.  Owned elsewhere; the writer only contributes to them.
+    const std::shared_ptr<WriterMeters> meters_;
+    // Volume meters and the future disk-full gate for this facility's volume.
+    const VolumeStatePtr state_;
+    const AsyncWriterConfig config_;
     const std::size_t writer_count_;
-    std::atomic<std::uint64_t> total_accepted_bytes_{0};
-    std::atomic<std::uint64_t> total_written_bytes_{0};
-    std::atomic<std::uint64_t> total_completed_files_{0};
-    std::atomic<std::uint64_t> total_completed_jobs_{0};
+    const std::size_t buffer_count_;
+    const std::size_t queue_limit_;
+    // Live FileState count, maintained by the writer itself.  The reclaim path
+    // must never have to walk the weak_ptr vector to answer this (§5.4).
+    std::size_t inflight_file_count_ = 0;
     std::size_t queued_jobs_ = 0;
     bool stopping_ = false;
 };

@@ -16,6 +16,7 @@ from sunpack.contracts.tasks import ArchiveTask
 from sunpack.extraction.internal.sevenzip.worker_diagnostics import attach_worker_diagnostics
 from sunpack.support import archive_knowledge_projection as knowledge_view
 from sunpack.support.archive_state_view import ArchiveStateByteView
+from sunpack.support.output_paths import normalized_output_dir, resolve_output_volume_key
 from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
 from sunpack.support.runtime_cwd import runtime_working_directory
 
@@ -1233,6 +1234,12 @@ class SevenZipRunner:
         phase_prefix: str = "sevenzip_build_job",
     ) -> dict:
         attempt_id = f"{str(getattr(task, 'key', '') or archive_path)}:{time.monotonic_ns()}"
+        # The routing key and the request must use the same absolute path (see
+        # normalized_output_dir).  A failed volume resolution falls back to a
+        # synthetic per-job key so the job gets an isolated write facility rather
+        # than silently sharing another volume's.
+        out_dir = normalized_output_dir(out_dir)
+        volume_key = resolve_output_volume_key(out_dir) or f"job:{attempt_id}"
         job = {
             "job_id": attempt_id,
             "attempt_id": attempt_id,
@@ -1244,6 +1251,7 @@ class SevenZipRunner:
             "archive_path": archive_path,
             "part_paths": list(part_paths or [archive_path]),
             "output_dir": out_dir,
+            "output_volume_key": volume_key,
             "password": password or "",
         }
         self._apply_native_job_budget(job)
