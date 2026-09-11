@@ -283,9 +283,12 @@ public:
             return;
         }
         std::lock_guard lock(mutex_);
-        ++epoch_;
-        chunks_.clear();
-        next_offset_ = end;
+        chunks_.erase(std::remove_if(chunks_.begin(), chunks_.end(), [end](const Chunk& chunk) {
+            return chunk.offset + chunk.size <= end;
+        }), chunks_.end());
+        if (chunks_.empty()) {
+            next_offset_ = end;
+        }
         active_ = true;
         schedule_locked();
         ready_.notify_all();

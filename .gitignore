@@ -93,3 +93,6 @@ tests/real/error_records
 /benchmarks/.cache/
 /benchmarks/.work/
 /.cache/
+
+/benchmarks/.starvation/
+benchmarks/.flags
