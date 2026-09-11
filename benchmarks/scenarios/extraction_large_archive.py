@@ -296,7 +296,6 @@ class RequestRuntimeProfiler:
 
         _wrap(runtime, "execute_async", timings, "pipeline_runtime_execute")
         _wrap(runtime, "_plan_task_isolated", timings, "pipeline_plan_task_isolated")
-        _wrap(_child(runtime, "space_guard"), "bind_root", timings, "pipeline_space_bind")
         _wrap(_child(runtime, "nested_extraction_policy"), "authorize_batch", timings, "pipeline_nested_authorize")
 
         _wrap(scanner, "direct_file_tasks", timings, "pipeline_direct_scan")
@@ -479,7 +478,6 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         "pipeline_direct_scan",
         "pipeline_plan_task_isolated",
         "pipeline_nested_authorize",
-        "pipeline_space_bind",
         "output_take_scan_session",
         "pipeline_final_report",
         "extractor_close",

@@ -3,17 +3,9 @@ import sys
 from typing import Iterable
 
 from send2trash import send2trash
-from sunpack_native import cleanup_file_identity as _native_cleanup_file_identity
 from sunpack_native import delete_files_batch as _native_delete_files_batch
 from sunpack.contracts.results import ArchiveCleanupResult
 from sunpack.i18n import I18nContext
-
-
-def _identity(path: str) -> tuple:
-    value = _native_cleanup_file_identity(path)
-    if value is None:
-        raise FileNotFoundError(path)
-    return tuple(int(part) for part in value)
 
 
 def _path_key(path: str) -> str:
@@ -44,31 +36,19 @@ class ArchiveCleanup:
             if not paths:
                 self._print(self.i18n.t("cleanup.none"))
         results: list[ArchiveCleanupResult] = []
-        pending: list[tuple[str, int, tuple]] = []
+        pending: list[tuple[str, int]] = []
         for path in paths:
             prior = (previous or {}).get(_path_key(path))
             attempts = prior.attempts + 1 if prior else 1
             if self.mode == "keep":
                 results.append(ArchiveCleanupResult(path, self.mode, "kept", attempts))
                 continue
-            identity = ()
-            try:
-                identity = _identity(path)
-                if prior and not prior.source_matches(identity):
-                    results.append(ArchiveCleanupResult(path, self.mode, "failed", attempts,
-                                                       0, "Source file identity changed",
-                                                       source_identity=identity))
-                    continue
-            except FileNotFoundError:
+            if not os.path.exists(path):
                 results.append(ArchiveCleanupResult(path, self.mode, "missing", attempts))
-                continue
-            except Exception as exc:
-                results.append(ArchiveCleanupResult(path, self.mode, "failed", attempts,
-                                                   int(getattr(exc, "winerror", 0) or 0), str(exc)))
                 continue
             self._print(self.i18n.t("cleanup.delete" if self.mode == "delete" else "cleanup.recycle",
                                     reason=self.i18n.t("cleanup.label"), filename=os.path.basename(path)))
-            pending.append((path, attempts, identity))
+            pending.append((path, attempts))
         if self.mode == "delete":
             try:
                 native_results = list(_native_delete_files_batch([item[0] for item in pending]))
@@ -77,12 +57,11 @@ class ArchiveCleanup:
                 return [
                     *results,
                     *(
-                        ArchiveCleanupResult(path, self.mode, "failed", attempts, code,
-                                             str(exc), source_identity=identity)
-                        for path, attempts, identity in pending
+                        ArchiveCleanupResult(path, self.mode, "failed", attempts, code, str(exc))
+                        for path, attempts in pending
                     ),
                 ]
-            for index, (path, attempts, identity) in enumerate(pending):
+            for index, (path, attempts) in enumerate(pending):
                 item = native_results[index] if index < len(native_results) else {
                     "status": "error",
                     "error": "Native cleanup returned no result",
@@ -92,20 +71,18 @@ class ArchiveCleanup:
                 status = native_status if native_status in {"deleted", "missing"} else "failed"
                 results.append(ArchiveCleanupResult(path, self.mode, status, attempts,
                                                    int(item.get("error_code") or 0),
-                                                   str(item.get("error") or ""),
-                                                   source_identity=identity))
+                                                   str(item.get("error") or "")))
         else:
-            for path, attempts, identity in pending:
+            for path, attempts in pending:
                 try:
                     send2trash(path)
-                    results.append(ArchiveCleanupResult(path, self.mode, "recycled", attempts,
-                                                       source_identity=identity))
+                    results.append(ArchiveCleanupResult(path, self.mode, "recycled", attempts))
                 except Exception as exc:
                     code = int(getattr(exc, "winerror", 0) or 0)
                     if not code:
                         code = int(getattr(exc, "hresult", 0) or 0) & 0xFFFF
                     results.append(ArchiveCleanupResult(path, self.mode, "failed", attempts,
-                                                       code, str(exc), source_identity=identity))
+                                                       code, str(exc)))
         return results
 
     def cleanup_archive_file(self, path: str, reason: str | None = None) -> ArchiveCleanupResult:

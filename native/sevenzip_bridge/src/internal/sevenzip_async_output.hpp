@@ -1,7 +1,6 @@
 #pragma once
 
 #include "sevenzip_paths.hpp"
-#include "disk_space.hpp"
 
 #ifdef _WIN32
 
@@ -33,7 +32,6 @@ public:
               cancel_token(std::move(external_cancel)) {}
 
         // All scheduler state is protected by AsyncFileWriter::mutex_.
-        std::shared_ptr<DiskSpaceLease> disk_space;
         HRESULT first_error = S_OK;
         int first_win32_error = 0;
         std::size_t inflight_bytes = 0;
@@ -126,8 +124,6 @@ public:
         // fill their staging buffers concurrently.  The writer mutex still
         // protects scheduler/accounting state.
         std::mutex producer_mutex;
-        UInt64 charged_length = 0;
-        UInt64 expected_size = 0;
         Buffer* staging_buffer = nullptr;
         std::size_t inflight_bytes = 0;
         std::size_t outstanding_data = 0;
@@ -230,15 +226,11 @@ public:
         std::wstring path,
         std::wstring item_path,
         UInt32 item_index,
-        std::size_t trace_index,
-        UInt64 expected_size = 0
+        std::size_t trace_index
     ) {
         auto file = std::make_shared<FileState>(
             job ? job : make_job(),
             std::move(path), std::move(item_path), item_index, trace_index);
-        file->expected_size = expected_size;
-        if (!file->job->disk_space)
-            file->job->disk_space = std::make_shared<DiskSpaceLease>(file->path, current_disk_space_policy);
         std::lock_guard<std::mutex> lock(mutex_);
         active_files_.push_back(file);
         return file;
@@ -270,18 +262,6 @@ public:
         // lock here makes the writer API safe for concurrent callers of the
         // same file without serializing producers for other files.
         std::unique_lock<std::mutex> producer_lock(file->producer_mutex);
-        const auto lease = job->disk_space;
-        const auto accepted = file->accepted_bytes.load();
-        const auto charge = lease->rounded(accepted + size);
-        if (charge > file->charged_length) {
-            const auto hint = file->expected_size > accepted ? file->expected_size - accepted : 0;
-            if (!lease->consume(charge - file->charged_length, hint)) {
-                const DWORD error = lease->error();
-                record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
-                return HRESULT_FROM_WIN32(error);
-            }
-            file->charged_length = charge;
-        }
         while (consumed < size) {
             bool queued_staging = false;
             bool newly_acquired_staging = false;
@@ -995,7 +975,6 @@ private:
                 return;
             }
             transferred += written;
-            job->disk_space->written(written);
             add_written_bytes(file, written);
         }
         end_data_write(file);

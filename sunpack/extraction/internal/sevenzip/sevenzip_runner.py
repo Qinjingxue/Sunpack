@@ -1430,10 +1430,6 @@ class SevenZipRunner:
         return self.seven_zip_dll_path
 
     def _apply_native_job_budget(self, job: dict) -> None:
-        policy = getattr(self, "disk_space_policy", {})
-        job["disk_space_reserve_bytes"] = int(policy.get("reserve_bytes", 0))
-        job["disk_space_quantum_bytes"] = int(policy.get("quantum_bytes", 64 << 20))
-        job["disk_space_sample_ms"] = int(policy.get("sample_ms", 500))
         configured = self.process_config.get("job_buffer_budget_bytes")
         if configured is None:
             return

@@ -1,4 +1,4 @@
-from dataclasses import InitVar, dataclass, field
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import List
 
@@ -19,22 +19,10 @@ class ArchiveCleanupResult:
     attempts: int = 1
     error_code: int = 0
     message: str = ""
-    source_identity: InitVar[tuple] = ()
-
-    def __post_init__(self, source_identity: tuple) -> None:
-        # Retry identity is intentionally not part of the public result schema.
-        object.__setattr__(self, "_source_identity", tuple(source_identity))
 
     @property
     def retryable(self) -> bool:
-        return (
-            self.status == "failed"
-            and self.error_code in {32, 33}
-            and bool(self._source_identity)
-        )
-
-    def source_matches(self, identity: tuple) -> bool:
-        return bool(self._source_identity) and self._source_identity == tuple(identity)
+        return self.status == "failed" and self.error_code in {32, 33}
 
 
 @dataclass(frozen=True)

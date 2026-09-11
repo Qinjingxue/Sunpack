@@ -483,7 +483,6 @@ class _RequestRuntime:
         request_runner = services.sevenzip_runner.fork()
         request_runner.request_id = submission.request_id
         request_runner.origin = submission.origin
-        request_runner.disk_space_policy = dict(performance.get("disk_space", {}))
         self.extractor = ExtractionScheduler(
             cli_passwords=submission.user_passwords,
             builtin_passwords=submission.builtin_passwords,

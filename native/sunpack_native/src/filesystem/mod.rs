@@ -23,19 +23,6 @@ pub(crate) fn watch_file_observation(
     windows::watch_file_observation(path, since_usn).map_err(os_error)
 }
 
-#[cfg(windows)]
-pub(crate) fn file_identity(path: &Path) -> std::io::Result<(u32, u64, u64, u64)> {
-    windows::file_identity(path)
-}
-
-#[cfg(not(windows))]
-pub(crate) fn file_identity(_path: &Path) -> std::io::Result<(u32, u64, u64, u64)> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "file identity requires Windows",
-    ))
-}
-
 #[cfg(not(windows))]
 pub(crate) fn watch_file_observation(
     _path: &Path,

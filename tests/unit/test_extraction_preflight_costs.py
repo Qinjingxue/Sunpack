@@ -9,11 +9,10 @@ from sunpack.extraction.internal.workflow.single_archive_extractor import Single
 from sunpack.passwords.result import PasswordResolution, PasswordResolutionStatus
 
 
-def test_successful_first_attempt_does_not_query_python_disk_space(tmp_path):
+def test_successful_first_attempt_does_not_query_python_free_space(tmp_path):
     archive = tmp_path / "input.7z"
     archive.write_bytes(b"dummy")
     output = tmp_path / "out"
-    calls = []
     task = ArchiveTask(FactBag(), 1, main_path=str(archive), all_parts=[str(archive)], detected_ext=".7z")
     task.fact_bag.set("archive.encrypted", False)
     runner = SimpleNamespace(
@@ -40,7 +39,6 @@ def test_successful_first_attempt_does_not_query_python_disk_space(tmp_path):
     result = extractor.extract(task, str(output))
 
     assert result.success
-    assert calls == []
 
 
 def test_validated_encrypted_rar_skips_empty_password_resource_analysis(tmp_path, monkeypatch):

@@ -26,8 +26,6 @@ def should_retry_extract_failure(
     err_lower = _norm(err_text)
     worker_result = worker_result_payload(run_result) or worker_result_payload(err_text)
     if worker_result:
-        if worker_result.get("failure_kind") in {"disk_space", "disk_space_query"}:
-            return False
         if worker_result.get("wrong_password") or worker_result.get("damaged") or worker_result.get("missing_volume"):
             return False
         if worker_result.get("native_status") in {"wrong_password", "damaged", "unsupported"}:
@@ -64,10 +62,6 @@ def classify_extract_failure(
     err_lower = _norm(err_text)
     worker_result = worker_result_payload(run_result) or worker_result_payload(err_text)
     if worker_result:
-        if worker_result.get("failure_kind") in {"disk_space", "disk_space_query"}:
-            return _failure(FailureKind.FILESYSTEM_ERROR,
-                            "failure.insufficient_space" if worker_result["failure_kind"] == "disk_space" else "failure.space_query",
-                            details=dict(worker_result))
         if worker_result.get("missing_volume"):
             return _failure(
                 FailureKind.MISSING_VOLUME,

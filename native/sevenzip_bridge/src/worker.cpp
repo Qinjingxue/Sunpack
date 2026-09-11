@@ -913,11 +913,6 @@ int run_request(
     const std::wstring format_hint = utf8_to_wide(json_string_field(request, "format_hint", ""));
     const std::wstring codepage = utf8_to_wide(json_string_field(request, "codepage", ""));
     const bool dry_run = json_bool_field(request, "dry_run", false);
-    current_disk_space_policy = {};
-    unsigned long long disk_value = 0;
-    if (json_uint_field_in_object(request, "disk_space_reserve_bytes", &disk_value)) current_disk_space_policy.reserve_bytes = disk_value;
-    if (json_uint_field_in_object(request, "disk_space_quantum_bytes", &disk_value)) current_disk_space_policy.quantum_bytes = (std::max)(1ULL, (std::min)(64ULL << 20, disk_value));
-    if (json_uint_field_in_object(request, "disk_space_sample_ms", &disk_value)) current_disk_space_policy.sample_ms = (std::max)(1ULL, (std::min)(60000ULL, disk_value));
     unsigned long long job_buffer_budget = 0;
     json_uint_field_in_object(request, "job_buffer_budget_bytes", &job_buffer_budget);
 
@@ -1009,7 +1004,7 @@ int run_request(
         // the retryable all-candidates-rejected contract.
         result = extract_with_password(password_candidates.front());
         const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
-        if (!direct_ok && result.failure_kind != "disk_space" && result.failure_kind != "disk_space_query") {
+        if (!direct_ok) {
             const auto probe = run_password_candidate_probe(dll_path, archive_input, password_candidates);
             result.password_attempts = probe.attempts;
             if (probe.status == PasswordTestStatus::WrongPassword) {
@@ -1044,14 +1039,6 @@ int run_request(
         }
     }
 
-    const std::string disk_fields =
-        ",\"disk_space\":{\"volume\":\"" + json_escape(wide_to_utf8(result.disk_space_volume)) +
-        "\",\"available_bytes\":" + std::to_string(result.disk_space_available) +
-        ",\"requested_bytes\":" + std::to_string(result.disk_space_requested) +
-        ",\"error_code\":" + std::to_string(result.disk_space_error) +
-        ",\"queries\":" + std::to_string(result.disk_space_queries) +
-        ",\"grants\":" + std::to_string(result.disk_space_grants) +
-        ",\"rejections\":" + std::to_string(result.disk_space_rejections) + "}";
     const bool ok = result.status == PasswordTestStatus::Ok && result.command_ok;
     const std::string failure_fields = ok ? "" :
         ",\"failure_stage\":\"" + json_escape(result.failure_stage) +
@@ -1100,7 +1087,7 @@ int run_request(
         "\",\"verified_manifest\":" + verified_manifest_json(result, ok && !dry_run) +
         ",\"failed_item\":\"" + json_escape(wide_to_utf8(result.failed_item)) +
         "\",\"message\":\"" + json_escape(result.message) + "\"" +
-        failure_fields + input_trace_field + diagnostic_fields + disk_fields + "}");
+        failure_fields + input_trace_field + diagnostic_fields + "}");
     return ok ? 0 : 1;
 }
 

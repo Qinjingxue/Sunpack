@@ -463,8 +463,7 @@ public:
 
     explicit SynchronousFileOutStream(const std::wstring& path, ExtractOutputTrace* trace = nullptr, std::size_t item_trace_index = 0)
 
-        : disk_space_(std::make_shared<DiskSpaceLease>(path, current_disk_space_policy)),
-          trace_(trace),
+        : trace_(trace),
           item_trace_index_(item_trace_index),
 
           compute_crc_(trace_ && item_trace_index_ < trace_->items.size() &&
@@ -565,14 +564,6 @@ public:
 
         }
 
-        const auto charge = disk_space_->rounded(bytes_written_ + size);
-        if (charge > charged_length_ && !disk_space_->consume(charge - charged_length_)) {
-            const auto error = disk_space_->error();
-            if (trace_) { trace_->last_hresult = HRESULT_FROM_WIN32(error); trace_->last_win32_error = error; }
-            mark_item_failure(HRESULT_FROM_WIN32(error), error);
-            return HRESULT_FROM_WIN32(error);
-        }
-        charged_length_ = charge;
         DWORD written = 0;
 
         if (!WriteFile(handle_, data, size, &written, nullptr)) {
@@ -597,7 +588,6 @@ public:
 
         }
 
-        disk_space_->written(written);
         bytes_written_ += written;
         if (compute_crc_) {
             crc32_ = update_crc32(crc32_, data, written);
@@ -663,8 +653,6 @@ private:
 
     }
 
-    std::shared_ptr<DiskSpaceLease> disk_space_;
-    UInt64 charged_length_ = 0;
     LONG refs_ = 1;
 
     ExtractOutputTrace* trace_ = nullptr;
@@ -1021,7 +1009,6 @@ public:
         output_root_(win32_extended_path(output_dir_)),
 
         output_root_initially_empty_(directory_is_empty_or_missing(output_root_)) {
-        if (async_job_) async_job_->disk_space = std::make_shared<DiskSpaceLease>(output_dir_, current_disk_space_policy);
         used_output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
         created_directories_.reserve(static_cast<std::size_t>(estimated_items) + 1U);
     }
@@ -1047,7 +1034,6 @@ public:
 
     UInt64 failed_item_bytes_written() const { return failed_item_bytes_written_; }
 
-    std::shared_ptr<DiskSpaceLease> disk_space() const { return async_job_ ? async_job_->disk_space : nullptr; }
     bool output_error() const { return output_error_; }
 
     bool output_root_initially_empty() const { return output_root_initially_empty_; }
@@ -1201,12 +1187,6 @@ public:
             return E_ABORT;
         }
 
-        if (!dry_run_ && async_job_ && !async_job_->disk_space->check_total(total)) {
-            const auto error = async_job_->disk_space->error();
-            output_error_ = true;
-            if (output_trace_) { output_trace_->last_hresult = HRESULT_FROM_WIN32(error); output_trace_->last_win32_error = error; }
-            return HRESULT_FROM_WIN32(error);
-        }
         total_bytes_ = total;
 
         emit("total", 0, L"");
@@ -1442,7 +1422,7 @@ public:
         const bool compute_crc = output_trace_ && current_trace_index_ < output_trace_->items.size() &&
             !output_trace_->items[current_trace_index_].has_source_crc32;
         current_async_file_ = async_writer_->make_file(async_job_,
-            target.wstring(), name, index, current_trace_index_, has_expected_size ? expected_size : 0);
+            target.wstring(), name, index, current_trace_index_);
         async_files_.push_back(current_async_file_);
         *outStream = new AsyncFileOutStream(async_writer_, current_async_file_, compute_crc);
 

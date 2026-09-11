@@ -180,10 +180,6 @@ struct ExtractArchiveResult {
     ExtractInputTrace input_trace;
     ExtractOutputTrace output_trace;
     std::vector<ExtractHandlerAttempt> handler_attempts;
-    std::wstring disk_space_volume;
-    unsigned long long disk_space_available = 0, disk_space_requested = 0;
-    unsigned long long disk_space_queries = 0, disk_space_grants = 0, disk_space_rejections = 0;
-    unsigned int disk_space_error = 0;
 };
 
 using ExtractProgressCallback = std::function<void(const ExtractProgressEvent&)>;

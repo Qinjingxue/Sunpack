@@ -509,32 +509,6 @@ ExtractArchiveResult extract_archive_internal(
 
         archive->Close();
 
-        if (const auto space = raw_extract_callback->disk_space()) {
-            result.disk_space_volume = space->root();
-            result.disk_space_available = space->available();
-            result.disk_space_requested = space->requested();
-            result.disk_space_error = space->error();
-            if (const auto volume = space->volume()) {
-                std::lock_guard<std::mutex> lock(volume->mutex);
-                result.disk_space_queries = volume->queries;
-                result.disk_space_grants = volume->grants;
-                result.disk_space_rejections = volume->rejections;
-            }
-        }
-        const auto write_error = result.output_trace.last_win32_error;
-        if (result.disk_space_error || write_error == ERROR_DISK_FULL || write_error == ERROR_HANDLE_DISK_FULL) {
-            if (!result.disk_space_error) result.disk_space_error = write_error;
-            result.status = PasswordTestStatus::Error;
-            result.command_ok = false;
-            const bool full = result.disk_space_error == ERROR_DISK_FULL || result.disk_space_error == ERROR_HANDLE_DISK_FULL;
-            result.failure_stage = "output_write";
-            result.failure_kind = full ? "disk_space" : "disk_space_query";
-            result.message = full ? "output volume has insufficient free space" : "output volume free space query failed";
-            return result;
-        }
-
-
-
         if (hr == S_OK && last_op_res == kOpOk) {
 
             if (!result.failed_item.empty()) {

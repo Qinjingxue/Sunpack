@@ -134,17 +134,11 @@ class ExtractionExecutionTests(unittest.TestCase):
             self.assertTrue(result.success)
             self.assertEqual(result.all_parts, [str(archive_path), str(launcher_path)])
 
-    def test_extractor_retries_unclassified_process_failure_without_space_heuristic(self):
+    def test_extractor_retries_unclassified_process_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "sample.zip"
             archive_path.write_bytes(b"zip")
             out_dir = Path(tmp) / "sample"
-
-            calls = []
-
-            def ensure_space(required_gb):
-                calls.append(required_gb)
-                return True
 
             extractor = ExtractionScheduler(max_retries=2)
             extractor.password_resolver = FakePasswordResolver()
@@ -163,7 +157,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             result = extractor.extract(task, str(out_dir))
 
             self.assertTrue(result.success)
-            self.assertEqual(calls, [])
 
     def test_extractor_retries_transient_failure_and_cleans_partial_output(self):
         with tempfile.TemporaryDirectory() as tmp:

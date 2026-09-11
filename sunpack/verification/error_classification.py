@@ -52,8 +52,6 @@ _PASSWORD = {
 _EXECUTION = {
     "backend_unavailable",
     "decoded_name_count_mismatch",
-    "disk_space",
-    "disk_space_query",
     "input_stream",
     "output_filesystem",
     "process_exit",

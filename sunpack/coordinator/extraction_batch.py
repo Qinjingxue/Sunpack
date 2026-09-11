@@ -501,9 +501,6 @@ class ExtractionBatchRunner:
                     verification=verification,
                     attempts=attempt_index + 1,
                 )
-                if any(payload.get("failure_kind") in {"disk_space", "disk_space_query"}
-                       for payload in _nested_diagnostic_payloads(result)):
-                    return current_outcome
                 self._annotate_recovery_outcome(task, current_outcome, source="original", round_index=current_sequence)
                 if (
                     not volume_retry_attempted

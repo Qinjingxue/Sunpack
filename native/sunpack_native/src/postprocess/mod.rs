@@ -105,19 +105,6 @@ pub(crate) fn delete_files_batch(py: Python<'_>, paths: Vec<String>) -> PyResult
     Ok(results.unbind())
 }
 
-#[pyfunction]
-pub(crate) fn cleanup_file_identity(
-    py: Python<'_>,
-    path: String,
-) -> PyResult<Option<(u32, u64, u64, u64)>> {
-    let identity = py.detach(|| crate::filesystem::file_identity(Path::new(&path)));
-    match identity {
-        Ok(identity) => Ok(Some(identity)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error.into()),
-    }
-}
-
 fn scan_watch_dir_recursive(
     py: Python<'_>,
     root: &Path,

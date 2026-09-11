@@ -26,26 +26,6 @@ struct ReadFileUsnData {
     max_major_version: u16,
 }
 
-#[repr(C)]
-struct FileTime {
-    low: u32,
-    high: u32,
-}
-
-#[repr(C)]
-struct ByHandleFileInformation {
-    file_attributes: u32,
-    creation_time: FileTime,
-    last_access_time: FileTime,
-    last_write_time: FileTime,
-    volume_serial_number: u32,
-    file_size_high: u32,
-    file_size_low: u32,
-    number_of_links: u32,
-    file_index_high: u32,
-    file_index_low: u32,
-}
-
 #[link(name = "Kernel32")]
 extern "system" {
     fn CreateFileW(
@@ -68,7 +48,6 @@ extern "system" {
         overlapped: *mut c_void,
     ) -> i32;
     fn CloseHandle(object: Handle) -> i32;
-    fn GetFileInformationByHandle(file: Handle, information: *mut ByHandleFileInformation) -> i32;
     fn GetVolumePathNameW(file_name: *const u16, volume_path: *mut u16, buffer_length: u32) -> i32;
     fn GetVolumeNameForVolumeMountPointW(
         volume_mount_point: *const u16,
@@ -196,51 +175,6 @@ pub(super) fn watch_file_is_ready(path: &Path) -> io::Result<bool> {
         }
         Err(error) => Err(error),
     }
-}
-
-pub(super) fn file_identity(path: &Path) -> io::Result<(u32, u64, u64, u64)> {
-    let metadata = std::fs::metadata(path)?;
-    let path = canonical_wide(path)?;
-    let flags = if metadata.is_dir() {
-        FILE_FLAG_BACKUP_SEMANTICS
-    } else {
-        FILE_ATTRIBUTE_NORMAL
-    };
-    let handle = unsafe {
-        CreateFileW(
-            path.as_ptr(),
-            FILE_READ_ATTRIBUTES,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-            null(),
-            OPEN_EXISTING,
-            flags,
-            null_mut(),
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return Err(io::Error::last_os_error());
-    }
-    let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::zeroed();
-    let succeeded = unsafe { GetFileInformationByHandle(handle, information.as_mut_ptr()) };
-    let error = if succeeded == 0 {
-        Some(io::Error::last_os_error())
-    } else {
-        None
-    };
-    unsafe {
-        CloseHandle(handle);
-    }
-    if let Some(error) = error {
-        return Err(error);
-    }
-    let information = unsafe { information.assume_init() };
-    Ok((
-        information.volume_serial_number,
-        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low),
-        (u64::from(information.file_size_high) << 32) | u64::from(information.file_size_low),
-        (u64::from(information.last_write_time.high) << 32)
-            | u64::from(information.last_write_time.low),
-    ))
 }
 
 fn open_path(

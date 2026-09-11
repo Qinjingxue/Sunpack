@@ -235,7 +235,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(postprocess::delete_files_batch, m)?)?;
-    m.add_function(wrap_pyfunction!(postprocess::cleanup_file_identity, m)?)?;
     m.add_function(wrap_pyfunction!(
         password::seven_zip::seven_zip_fast_verify_passwords,
         m

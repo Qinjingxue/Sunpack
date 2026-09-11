@@ -1,14 +1,11 @@
 import asyncio
-from dataclasses import asdict, replace
-from types import SimpleNamespace
+from dataclasses import asdict
 
 import pytest
 
-from sunpack.config.fields.extraction import normalize_disk_space
 from sunpack.contracts.pipeline import PipelineArtifacts, PipelineResponse
 from sunpack.contracts.results import RunSummary
 from sunpack.coordinator.engine import DirectOutputCommitter, MappedOutputCommitter
-from sunpack.extraction.internal.workflow.errors import classify_extract_failure, should_retry_extract_failure
 from sunpack.postprocess.actions import PostProcessActions
 import sunpack.postprocess.internal.cleanup as cleanup
 from tests.helpers.fake_pipeline_engine import _InlineBroker
@@ -67,21 +64,6 @@ def test_failed_cleanup_is_bounded_and_repeat_commit_is_idempotent(tmp_path, mon
     assert response.summary.success_count == 1
 
 
-def test_retry_does_not_delete_changed_source(tmp_path, monkeypatch):
-    path = tmp_path/'a.zip'; path.write_text('old')
-    def fail(path):
-        raise locked()
-    monkeypatch.setattr(cleanup, 'send2trash', fail)
-    actions = PostProcessActions(config())
-    previous = actions.apply(archives_to_clean=[[str(path)]])
-    path.write_text('replacement file')
-    result = actions.apply(archives_to_clean=[[str(path)]],
-                           previous_cleanup={cleanup.os.path.normcase(str(path)): previous[0]})[0]
-    assert result.status == 'failed' and not result.retryable
-    assert 'identity' in result.message
-    assert path.read_text() == 'replacement file'
-
-
 def test_mapped_commit_reports_real_path_and_permanent_error_once(tmp_path, monkeypatch):
     original = tmp_path/'old.zip'; promoted = tmp_path/'promoted.zip'; promoted.write_text('data')
     def fail(path):
@@ -113,29 +95,12 @@ def test_native_delete_reports_missing_and_deleted(tmp_path):
     assert {r.status for r in report} == {'deleted','missing'} and not path.exists()
 
 
-@pytest.mark.parametrize('kind', ['disk_space','disk_space_query'])
-def test_disk_failures_are_terminal_before_password_or_damage(kind):
-    process=SimpleNamespace(returncode=8,stdout='',stderr='write error',worker_diagnostics={'result':{
-        'failure_kind':kind, 'wrong_password':True, 'damaged':True}})
-    assert not should_retry_extract_failure(process,'write error')
-    failure=classify_extract_failure(process,'write error',is_split_archive=True,password_evidence='zipcrypto_header_byte')
-    assert not failure.repairable and not failure.is_password_failure
-    assert failure.details['failure_kind'] == kind
-
-
-def test_disk_policy_validation():
-    assert normalize_disk_space({})['reserve_bytes'] == 0
-    with pytest.raises(ValueError):
-        normalize_disk_space({'quantum_bytes': 0})
-
-
-def test_cleanup_result_public_schema_excludes_retry_identity():
+def test_cleanup_result_public_schema_is_stable():
     result = cleanup.ArchiveCleanupResult(
         'archive.zip',
         'recycle',
         'failed',
         error_code=32,
-        source_identity=(1, 2, 3, 4),
     )
     assert result.retryable
     assert set(asdict(result)) == {
