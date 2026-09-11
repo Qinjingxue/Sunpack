@@ -24,6 +24,8 @@
 
 #include <functional>
 
+#include <map>
+
 #include <memory>
 
 #include <mutex>
@@ -107,32 +109,106 @@ inline InputPrefetchConfig input_prefetch_config_for_archive(
     return config;
 }
 
-inline HRESULT read_path_at(const std::wstring& path, UInt64 offset, void* data, UInt32 size, UInt32* processed) noexcept {
-    if (processed) {
-        *processed = 0;
+// Read handle for one file that is opened once and reused for every read.
+//
+// Every reader in this header needs repeated offset reads of the same file: the
+// prefetch thread fills one window after another, and PatchedInStream walks a
+// carrier segment by segment.  Reopening the file for each of those reads (a
+// CreateFileW/CloseHandle pair plus path resolution and whatever filter drivers
+// attach to it) adds nothing but fixed per-window cost, so a handle lives as
+// long as the stream or the reader that owns it.
+//
+// The handle carries its own file cursor and is therefore owned by exactly one
+// thread that reads sequentially.  Streams that also serve the 7z.dll decoder
+// keep a second, independent handle for decoder driven Seek/Read calls.
+class [[nodiscard]] PathHandle final {
+public:
+    explicit PathHandle(const std::wstring& path) noexcept
+        : handle_(CreateFileW(win32_extended_path(path).c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                              nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr)),
+          open_error_(handle_ == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS) {}
+
+    PathHandle(const PathHandle&) = delete;
+    PathHandle& operator=(const PathHandle&) = delete;
+    PathHandle(PathHandle&&) = delete;
+    PathHandle& operator=(PathHandle&&) = delete;
+
+    ~PathHandle() { close(); }
+
+    bool valid() const noexcept { return handle_ != INVALID_HANDLE_VALUE; }
+
+    // Win32 error of the failed open, so callers report the real reason instead
+    // of whatever GetLastError() happens to hold later.
+    DWORD open_error() const noexcept { return open_error_; }
+
+    // Reads directly at the requested offset; the caller's own position is not
+    // part of the contract, so nothing outside this handle observes a seek.
+    HRESULT read_at(UInt64 offset, void* data, UInt32 size, UInt32* processed) noexcept {
+        if (processed) {
+            *processed = 0;
+        }
+        if (handle_ == INVALID_HANDLE_VALUE) {
+            return HRESULT_FROM_WIN32(open_error_ != ERROR_SUCCESS ? open_error_ : ERROR_INVALID_HANDLE);
+        }
+        LARGE_INTEGER distance{};
+        distance.QuadPart = static_cast<LONGLONG>(offset);
+        if (!SetFilePointerEx(handle_, distance, nullptr, FILE_BEGIN)) {
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
+        DWORD read = 0;
+        const BOOL ok = ReadFile(handle_, data, size, &read, nullptr);
+        if (!ok) {
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
+        if (processed) {
+            *processed = read;
+        }
+        return S_OK;
     }
-    HANDLE handle = CreateFileW(win32_extended_path(path).c_str(), GENERIC_READ,
-                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (handle == INVALID_HANDLE_VALUE) {
-        return HRESULT_FROM_WIN32(GetLastError());
+
+    void close() noexcept {
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            CloseHandle(handle_);
+            handle_ = INVALID_HANDLE_VALUE;
+        }
     }
-    LARGE_INTEGER distance{};
-    distance.QuadPart = static_cast<LONGLONG>(offset);
-    if (!SetFilePointerEx(handle, distance, nullptr, FILE_BEGIN)) {
-        const HRESULT result = HRESULT_FROM_WIN32(GetLastError());
-        CloseHandle(handle);
-        return result;
+
+private:
+    HANDLE handle_ = INVALID_HANDLE_VALUE;
+    DWORD open_error_ = ERROR_SUCCESS;
+};
+
+// One long lived read handle per distinct path, opened on first use.  Only the
+// prefetch thread or the decoder thread that owns the stream touches a cache,
+// never both at once.  Failed opens are not remembered, so a file that is still
+// locked when first probed is retried on the next read.
+class PathHandleCache final {
+public:
+    PathHandleCache() = default;
+    PathHandleCache(const PathHandleCache&) = delete;
+    PathHandleCache& operator=(const PathHandleCache&) = delete;
+
+    HRESULT read_at(const std::wstring& path, UInt64 offset, void* data, UInt32 size, UInt32* processed) noexcept {
+        if (processed) {
+            *processed = 0;
+        }
+        const auto found = handles_.find(path);
+        if (found != handles_.end()) {
+            return found->second->read_at(offset, data, size, processed);
+        }
+        auto handle = std::make_unique<PathHandle>(path);
+        if (!handle->valid()) {
+            return HRESULT_FROM_WIN32(handle->open_error());
+        }
+        PathHandle* raw = handle.get();
+        handles_.emplace(path, std::move(handle));
+        return raw->read_at(offset, data, size, processed);
     }
-    DWORD read = 0;
-    const BOOL ok = ReadFile(handle, data, size, &read, nullptr);
-    const HRESULT result = ok ? S_OK : HRESULT_FROM_WIN32(GetLastError());
-    CloseHandle(handle);
-    if (processed && ok) {
-        *processed = read;
-    }
-    return result;
-}
+
+private:
+    std::map<std::wstring, std::unique_ptr<PathHandle>> handles_;
+};
 
 class SequentialPrefetcher final {
 public:
@@ -444,10 +520,17 @@ public:
         }
 
         if (size_ && prefetch_config.enabled) {
-            const std::wstring prefetch_path = path_;
-            prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, size_, [prefetch_path](UInt64 offset, void* data, UInt32 read_size, UInt32* processed) {
-                return read_path_at(prefetch_path, offset, data, read_size, processed);
-            });
+            // The prefetch thread gets a handle of its own so its offset reads
+            // never touch the decoder handle or its file cursor.
+            prefetch_reader_ = std::make_unique<PathHandle>(path_);
+            if (prefetch_reader_->valid()) {
+                PathHandle* reader = prefetch_reader_.get();
+                prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, size_, [reader](UInt64 offset, void* data, UInt32 read_size, UInt32* processed) {
+                    return reader->read_at(offset, data, read_size, processed);
+                });
+            } else {
+                prefetch_reader_.reset();
+            }
         }
         if (trace_ && read_file_timing_enabled()) {
             trace_->prefetch_enabled = prefetch_ && prefetch_->enabled();
@@ -709,6 +792,9 @@ private:
     UInt64 position_ = 0;
 
     UInt64 size_ = 0;
+
+    // Declared before the prefetcher so it outlives the prefetch thread.
+    std::unique_ptr<PathHandle> prefetch_reader_;
 
     std::unique_ptr<SequentialPrefetcher> prefetch_;
 
@@ -1164,7 +1250,7 @@ private:
             const UInt64 remaining = sizes_[index] - part_offset;
             const UInt32 want = static_cast<UInt32>(std::min<UInt64>(size - total_read, remaining));
             UInt32 read = 0;
-            const HRESULT result = read_path_at(paths_[index], part_offset, out + total_read, want, &read);
+            const HRESULT result = prefetch_handles_.read_at(paths_[index], part_offset, out + total_read, want, &read);
             if (result != S_OK) {
                 return result;
             }
@@ -1219,6 +1305,10 @@ private:
     UInt64 cached_handle_position_ = 0;
 
     bool valid_ = true;
+
+    // Declared before the prefetcher so the handles outlive the prefetch thread.
+    // Mutable because the prefetch reader runs from a const accessor.
+    mutable PathHandleCache prefetch_handles_;
 
     std::unique_ptr<SequentialPrefetcher> prefetch_;
 
@@ -1688,7 +1778,7 @@ private:
             const UInt64 remaining = range.length - offset_in_range;
             const UInt32 want = static_cast<UInt32>(std::min<UInt64>(size - total_read, remaining));
             UInt32 read = 0;
-            const HRESULT result = read_path_at(range.path, range.start + offset_in_range, out + total_read, want, &read);
+            const HRESULT result = prefetch_handles_.read_at(range.path, range.start + offset_in_range, out + total_read, want, &read);
             if (result != S_OK) {
                 return result;
             }
@@ -1789,6 +1879,10 @@ private:
     std::unique_ptr<SequentialPrefetcher> prefetch_;
 
     bool valid_ = true;
+
+    // Declared after the prefetcher, which stops its thread before this closes
+    // the handles; mutable for the same reason as in MultiFileInStream.
+    mutable PathHandleCache prefetch_handles_;
 
 };
 
@@ -2086,57 +2180,28 @@ private:
         if (read_out) {
             *read_out = 0;
         }
+        const UInt64 source_offset = segment.source_start + offset_in_segment;
         if (trace_) {
             trace_->last_read_virtual_offset = position_;
-            trace_->last_read_source_offset = segment.source_start + offset_in_segment;
+            trace_->last_read_source_offset = source_offset;
             trace_->last_read_requested = want;
             trace_->last_read_returned = 0;
             trace_->last_source_path = segment.path;
         }
-        HANDLE handle = CreateFileW(win32_extended_path(segment.path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (handle == INVALID_HANDLE_VALUE) {
-            const DWORD error = GetLastError();
-            const HRESULT hr = HRESULT_FROM_WIN32(error);
-            if (trace_) {
-                trace_->read_error = true;
-                trace_->last_hresult = hr;
-                trace_->last_win32_error = static_cast<int>(error);
-            }
-            return hr;
-        }
-        LARGE_INTEGER distance{};
-        distance.QuadPart = static_cast<LONGLONG>(segment.source_start + offset_in_segment);
-        if (!SetFilePointerEx(handle, distance, nullptr, FILE_BEGIN)) {
-            const DWORD error = GetLastError();
-            CloseHandle(handle);
-            const HRESULT hr = HRESULT_FROM_WIN32(error);
-            if (trace_) {
-                trace_->read_error = true;
-                trace_->last_hresult = hr;
-                trace_->last_win32_error = static_cast<int>(error);
-            }
-            return hr;
-        }
-        DWORD read = 0;
-        BOOL ok = FALSE;
-        DWORD error = ERROR_SUCCESS;
+        UInt32 read = 0;
+        HRESULT result = S_OK;
         {
             ReadFileWallTimer timer(trace_);
-            ok = ReadFile(handle, out, want, &read, nullptr);
-            if (!ok) {
-                error = GetLastError();
-            }
+            result = read_handles_.read_at(segment.path, source_offset, out, want, &read);
         }
-        CloseHandle(handle);
-        if (!ok) {
-            const HRESULT hr = HRESULT_FROM_WIN32(error);
+        if (result != S_OK) {
+            const DWORD error = GetLastError();
             if (trace_) {
                 trace_->read_error = true;
-                trace_->last_hresult = hr;
+                trace_->last_hresult = result;
                 trace_->last_win32_error = static_cast<int>(error);
             }
-            return hr;
+            return result;
         }
         if (read_out) {
             *read_out = read;
@@ -2153,6 +2218,9 @@ private:
     UInt64 position_ = 0;
 
     ExtractInputTrace* trace_ = nullptr;
+
+    // One long lived read handle per source file instead of one per Read call.
+    PathHandleCache read_handles_;
 
     bool valid_ = true;
 
