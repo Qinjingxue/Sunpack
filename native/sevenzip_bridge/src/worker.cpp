@@ -1362,7 +1362,7 @@ public:
 
     bool cancel(const std::string& job_id) noexcept {
         std::shared_ptr<std::atomic<bool>> token;
-        std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
+        std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> writer_to_wake;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             const auto found = cancel_tokens_.find(job_id);
@@ -1370,7 +1370,10 @@ public:
                 return false;
             }
             token = found->second->cancel_token;
-            writer = found->second->writer;
+            // Upgrade the weak reference while the entry is still alive, but only
+            // for the duration of this call: the token is what carries the cancel,
+            // the writer is only the thing that has to be woken.
+            writer_to_wake = found->second->writer.lock();
         }
         if (!token) {
             return false;
@@ -1380,9 +1383,9 @@ public:
         // Only the facility this job is actually writing to needs waking: its
         // producer may be parked in that facility's backpressure wait.  A job that
         // has not acquired a lease yet (or a dry run) has no writer and needs only
-        // the token.
-        if (writer) {
-            writer->wake_waiters();
+        // the token.  A facility already reclaimed leaves an expired weak_ptr.
+        if (writer_to_wake) {
+            writer_to_wake->wake_waiters();
         }
 #endif
         condition_.notify_all();
@@ -1446,6 +1449,13 @@ private:
     // facility lease, so a cancel wakes exactly one volume's writer instead of
     // every facility (§6.3).  It stays empty for queued and dry-run jobs, which
     // only need the token.
+    //
+    // The writer reference is deliberately WEAK: it exists only so cancel() can
+    // reach the right backpressure wait.  Keeping it strong would add a third
+    // owner next to the registry and the lease and break the §12 invariant that
+    // the lease is the only thing keeping a facility alive -- worse, erasing the
+    // entry under the executor mutex could then run ~AsyncFileWriter (and its
+    // thread joins) while that mutex is held.
     struct JobControl {
         JobControl() = default;
         JobControl(
@@ -1454,7 +1464,7 @@ private:
             : cancel_token(std::move(token)), writer(std::move(bound_writer)) {}
 
         std::shared_ptr<std::atomic<bool>> cancel_token;
-        std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
+        std::weak_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
     };
 
     static JobMetadata metadata_from_request(const std::string& request) noexcept {
@@ -1946,7 +1956,9 @@ private:
 
     // Bind the facility to the job so a cancel wakes only that volume's writer
     // (§6.3).  Called before run_request, so the weak reference is valid for the
-    // whole extraction.
+    // whole extraction.  Assigning a strong pointer into the weak field does not
+    // extend the facility's lifetime: the lease held by worker_loop is the only
+    // owner, and it outlives every cancel() that can observe this binding.
     void register_cancel_writer(
         const std::string& request,
         const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& writer

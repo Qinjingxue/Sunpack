@@ -101,9 +101,10 @@ enum class VolumeSpaceState {
 // be built from the same values by construction, not by "they all happen to read
 // the same variables".
 struct AsyncWriterConfig {
-    // Threads per volume facility.  Note this is per volume, not per process:
-    // SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME took over from the old global
-    // SUNPACK_ASYNC_WRITER_THREADS name (§5.1).
+    // Threads per volume facility.  Note this is per volume, not per process: the
+    // old process-wide SUNPACK_ASYNC_WRITER_THREADS name is gone and is not read
+    // even as a fallback, so a stale value cannot silently multiply by the number
+    // of volumes (§5.1).
     std::size_t threads_per_volume = 4;
     // Buffer slots.  The 1 MiB backing store is allocated lazily, so this bounds
     // the staging window rather than resident memory (§5.1.1).

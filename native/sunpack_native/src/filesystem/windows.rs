@@ -345,28 +345,67 @@ fn volume_device(path: &Path) -> io::Result<String> {
 /// nearest existing ancestor is canonicalized instead, which also resolves a
 /// junction or volume mount point on the way down to its real device.
 pub(super) fn resolve_output_volume(path: &Path) -> io::Result<String> {
-    let anchor = nearest_existing_ancestor(path)
+    let anchor = nearest_existing_ancestor(path)?
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no existing ancestor"))?;
     volume_device(&anchor)
 }
 
-fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+/// Walks up until a directory that provably exists, or fails.
+///
+/// `Path::exists()` reports `false` for every metadata error, so a transient
+/// sharing violation or an access-denied ancestor would be silently skipped and
+/// the walk would continue past the real junction or volume mount point, yielding
+/// the wrong volume.  Mis-routing a job is worse than not routing it: the caller
+/// falls back to a synthetic per-job key when this returns `Err`, which keeps the
+/// job isolated instead of silently sharing another volume's writer.
+///
+/// A UNC path also must never walk past its own share root.  `\\server\share` has
+/// the parent `\\server`, and `\\server` has the parent `\\`, whose parent is the
+/// drive-relative prefix -- continuing there resolves to whatever the process
+/// working directory happens to be on, which is exactly the silent mis-share this
+/// function exists to prevent.  An unreachable share is therefore an error, not
+/// an invitation to keep climbing.
+fn nearest_existing_ancestor(path: &Path) -> io::Result<Option<PathBuf>> {
     let mut current: PathBuf = if path.as_os_str().is_empty() {
-        std::env::current_dir().ok()?
+        std::env::current_dir()?
     } else {
         path.to_path_buf()
     };
     loop {
-        if current.exists() {
-            return Some(current);
+        match current.try_exists() {
+            Ok(true) => return Ok(Some(current)),
+            Ok(false) => {}
+            // A query that cannot be answered is not evidence of absence.
+            Err(error) => return Err(error),
         }
-        match current.parent() {
-            Some(parent) if parent != current && !parent.as_os_str().is_empty() => {
-                current = parent.to_path_buf();
-            }
-            _ => return None,
+        let Some(parent) = current.parent() else {
+            return Ok(None);
+        };
+        if parent == current || parent.as_os_str().is_empty() {
+            return Ok(None);
         }
+        if !is_fully_rooted(&parent) {
+            // The walk reached a drive-relative or share-relative boundary and
+            // found nothing that exists.  Continuing would resolve the path
+            // against the process working directory, i.e. an unrelated volume.
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no existing ancestor inside the target root",
+            ));
+        }
+        current = parent.to_path_buf();
     }
+}
+
+/// True when the path still names a concrete rooted location.
+///
+/// `C:` alone is drive-relative: it has a `Prefix` but no `RootDir`, and its
+/// `parent()` is the empty path, which then resolves against the working
+/// directory.  A UNC share root (`\\server\share`) is a single `Prefix` plus a
+/// `RootDir` and has no parent at all, so the loop ends there on its own.
+fn is_fully_rooted(path: &Path) -> bool {
+    path.components()
+        .any(|component| matches!(component, std::path::Component::RootDir))
 }
 
 fn volume_key_from(volume_name: &[u16]) -> String {
@@ -405,16 +444,38 @@ mod tests {
             .join("level-one")
             .join("level-two");
         assert!(!nested.exists(), "probe path must not exist");
-        let anchor = nearest_existing_ancestor(&nested).expect("an existing ancestor");
+        let anchor = nearest_existing_ancestor(&nested)
+            .expect("a probe under the temp root must be answerable")
+            .expect("an existing ancestor");
         assert!(anchor.exists());
         assert!(anchor.starts_with(&root) || root.starts_with(&anchor));
     }
 
     #[test]
-    fn nearest_existing_ancestor_returns_none_without_any_ancestor() {
-        // A UNC path whose server does not exist has no reachable ancestor.
+    fn nearest_existing_ancestor_reports_an_unanswerable_query() {
+        // An unreachable UNC host cannot be answered either way, so this must be
+        // an error rather than a silent "does not exist".  Treating it as absence
+        // would let the walk continue past the real device boundary -- and past
+        // the share root it would fall through to the drive-relative prefix, i.e.
+        // whatever volume the process working directory is on.
         let missing = Path::new(r"\\sunpack-nonexistent-host\share\out");
-        assert!(nearest_existing_ancestor(missing).is_none());
+        match nearest_existing_ancestor(missing) {
+            Err(_) => {}
+            Ok(None) => {}
+            Ok(Some(anchor)) => panic!("unexpectedly resolved an unreachable path: {anchor:?}"),
+        }
+    }
+
+    #[test]
+    fn unreachable_unc_path_never_resolves_to_a_local_volume() {
+        let missing = Path::new(r"\\sunpack-nonexistent-host\share\out");
+        // The regression this guards: the walk reached the drive-relative prefix
+        // and returned the working directory's volume.
+        let resolved = resolve_output_volume(missing);
+        assert!(
+            resolved.is_err(),
+            "an unreachable share resolved to {resolved:?} instead of failing"
+        );
     }
 
     #[test]

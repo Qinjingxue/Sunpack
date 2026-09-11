@@ -46,6 +46,7 @@ from benchmarks.scenarios.worker_single_file_write import (
     _worker_counters,
 )
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from sunpack.support.output_paths import normalized_output_dir, resolve_output_volume_key
 from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
 
 
@@ -273,13 +274,21 @@ def _job_payload(
     output_dir: Path,
     dll_path: Path,
 ) -> str:
+    # The routing key must be resolved the same way production does, from the
+    # normalized output path.  Omitting it makes the worker fall back to a
+    # synthetic `job:<id>` key, which gives every job its own facility no matter
+    # which volume it writes to -- so the scenario would pass without ever
+    # exercising per-volume routing.
+    normalized = normalized_output_dir(str(output_dir))
+    volume_key = resolve_output_volume_key(normalized) or f"job:{job_id}"
     return json.dumps(
         {
             "job_id": job_id,
             "seven_zip_dll_path": str(dll_path),
             "archive_path": str(archive),
             "part_paths": [str(archive)],
-            "output_dir": str(output_dir),
+            "output_dir": normalized,
+            "output_volume_key": volume_key,
             "password": "",
             "format_hint": "zip",
             "dry_run": False,

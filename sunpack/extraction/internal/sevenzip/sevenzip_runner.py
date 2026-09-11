@@ -65,7 +65,7 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
             environment.pop("SUNPACK_NATIVE_WORKER_THREAD_CAPACITY", None)
             if thread_capacity > 0:
                 environment["SUNPACK_NATIVE_WORKER_THREAD_CAPACITY"] = str(thread_capacity)
-    set_int("writer_threads", "SUNPACK_ASYNC_WRITER_THREADS")
+    set_int("writer_threads", "SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME")
     set_int("sample_interval_ms", "SUNPACK_NATIVE_SAMPLE_INTERVAL_MS", minimum=100)
     set_int("initial_active_jobs", "SUNPACK_NATIVE_INITIAL_ACTIVE_JOBS", minimum=0)
 

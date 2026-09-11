@@ -69,16 +69,13 @@ bool configured_flag(const wchar_t* name) noexcept {
 
 AsyncWriterConfig configured_async_writer_config() noexcept {
     AsyncWriterConfig config;
-    // Per-volume thread count.  The name is deliberately different from the old
-    // process-wide SUNPACK_ASYNC_WRITER_THREADS so a stale value cannot silently
-    // multiply by the number of volumes.
+    // Per-volume thread count.  The old process-wide name is deliberately NOT
+    // read as a fallback: a leftover SUNPACK_ASYNC_WRITER_THREADS would silently
+    // multiply by the number of volumes, and the project does not carry version
+    // compatibility shims.
     config.threads_per_volume = configured_size(
         L"SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME",
-        configured_size(
-            L"SUNPACK_ASYNC_WRITER_THREADS",
-            kDefaultThreadsPerVolume,
-            1,
-            kMaxThreadsPerVolume),
+        kDefaultThreadsPerVolume,
         1,
         kMaxThreadsPerVolume);
     config.buffer_count = configured_size(

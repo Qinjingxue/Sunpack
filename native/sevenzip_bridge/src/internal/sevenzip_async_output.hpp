@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdlib>
@@ -744,22 +745,37 @@ private:
     }
 
     void account_pending_release(std::size_t bytes) noexcept {
-        release_pending(meters_->counters.pending_bytes, bytes);
-        release_pending(state_->counters.pending_bytes, bytes);
+        release_pending(meters_->counters.pending_bytes, *state_, bytes);
+        release_pending(state_->counters.pending_bytes, *state_, bytes);
     }
 
-    static void release_pending(std::atomic<std::uint64_t>& pending, std::size_t bytes) noexcept {
+    static void release_pending(
+        std::atomic<std::uint64_t>& pending,
+        VolumeState& volume,
+        std::size_t bytes
+    ) noexcept {
         const std::uint64_t value = static_cast<std::uint64_t>(bytes);
-        // Saturating release: the gauge must never wrap, so a double-count bug
-        // degrades into a stuck gauge instead of an enormous one.
+        // Saturating release: the gauge must never wrap, so a bug degrades into a
+        // stuck gauge instead of an enormous one.  Saturation would also hide an
+        // over-release -- freeing more than was ever pending reads as "idle" to
+        // the controller -- so debug builds assert it and release builds count it
+        // per volume for the diagnostics.
+#ifndef NDEBUG
+        const std::uint64_t previous = pending.fetch_sub(value, std::memory_order_relaxed);
+        assert(previous >= value && "pending gauge over-released: a byte was accounted twice");
+#else
         std::uint64_t current = pending.load(std::memory_order_relaxed);
         for (;;) {
+            if (current < value) {
+                volume.accounting_violations.fetch_add(1, std::memory_order_relaxed);
+            }
             const std::uint64_t next = current > value ? current - value : 0;
             if (pending.compare_exchange_weak(
                     current, next, std::memory_order_relaxed, std::memory_order_relaxed)) {
                 return;
             }
         }
+#endif
     }
 
     void set_job_error_locked(const JobStatePtr& job, HRESULT hr, int win32_error) noexcept {

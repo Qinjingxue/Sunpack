@@ -13,6 +13,7 @@
 #ifdef _WIN32
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -36,6 +37,11 @@ struct VolumeState {
     // Per-volume meters.  Diagnostics and future per-volume policy; the
     // controller reads the process-wide WriterMeters instead.
     WriterCounters counters;
+
+    // Non-zero means the accounting identity was violated for this volume: a
+    // saturating pending release had to clamp, i.e. some byte was accounted twice.
+    // Release builds keep running; this counter is what makes the defect visible.
+    std::atomic<std::uint64_t> accounting_violations{0};
 
     // Future disk-full gate (§8).  Nothing acts on this yet.
     std::atomic<VolumeSpaceState> space_state{VolumeSpaceState::Ready};

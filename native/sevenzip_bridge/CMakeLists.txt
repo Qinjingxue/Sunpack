@@ -110,6 +110,20 @@ target_include_directories(sunpack_sevenzip_async_output
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+add_executable(sunpack_sevenzip_writer_cost
+    tests/writer_construction_cost.cpp
+)
+apply_release_optimizations(sunpack_sevenzip_writer_cost)
+
+target_link_libraries(sunpack_sevenzip_writer_cost
+    PRIVATE sunpack_sevenzip_core
+)
+
+target_include_directories(sunpack_sevenzip_writer_cost
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
 add_executable(sunpack_sevenzip_worker
     src/worker.cpp
 )
