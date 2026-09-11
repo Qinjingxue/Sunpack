@@ -17,6 +17,7 @@ from typing import Any, Callable
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sunpack.coordinator.engine import DirectOutputCommitter, PipelineEngine
+import sunpack.coordinator.engine as engine_module
 import sunpack.analysis.engine as analysis_engine_module
 import sunpack.analysis.fuzzy_pipeline.modules.binary_profile as binary_profile_module
 import sunpack.analysis.structure_pipeline.modules.compression_streams as compression_streams_module
@@ -263,6 +264,32 @@ class RequestRuntimeProfiler:
 
         setattr(owner, name, measured)
 
+    def _install_cleanup_timer(self, scope) -> None:
+        """Time per-task source cleanup and the share spent at its barrier gate.
+
+        Source cleanup now runs once per finished task instead of once per
+        request, so its cost and its barrier contention are measured separately
+        from the batch-level pass.
+        """
+
+        if scope is None:
+            return
+        self._install_instance_method(scope, "release_task", "batch_cleanup_task")
+        original_barrier = engine_module.promotion_barrier
+
+        @contextlib.contextmanager
+        def measured_barrier(*args: Any, **kwargs: Any):
+            with original_barrier(*args, **kwargs) as report:
+                timings = self._active_timings
+                if timings is not None:
+                    timings["batch_cleanup_barrier"].append(
+                        float(getattr(report, "gate_wait_seconds", 0.0) or 0.0)
+                    )
+                yield report
+
+        self._global_restores.append((engine_module, "promotion_barrier", original_barrier))
+        engine_module.promotion_barrier = measured_barrier
+
     def _install_global_dynamic_method(self, owner: type, name: str, label: Callable[..., str]) -> None:
         descriptor = owner.__dict__[name]
         original = getattr(owner, name)
@@ -297,6 +324,7 @@ class RequestRuntimeProfiler:
         _wrap(runtime, "execute_async", timings, "pipeline_runtime_execute")
         _wrap(runtime, "_plan_task_isolated", timings, "pipeline_plan_task_isolated")
         _wrap(_child(runtime, "nested_extraction_policy"), "authorize_batch", timings, "pipeline_nested_authorize")
+        self._install_cleanup_timer(_child(runtime, "cleanup_scope"))
 
         _wrap(scanner, "direct_file_tasks", timings, "pipeline_direct_scan")
         _wrap(scanner, "scan_targets", timings, "pipeline_nested_scan")
@@ -448,6 +476,7 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         "batch_password_preflight",
         "batch_resource_profiles",
         "batch_report_task_finished",
+        "batch_cleanup_task",
         "output_scan",
     ))
     output_snapshot_children = sum(total(label) for label in (
@@ -485,6 +514,13 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
     return {
         "batch_overhead_excluding_extract": round(total("batch_execute") - total("extract_total"), 6),
         "batch_parent_python_residual": round(total("batch_execute") - batch_direct_children, 6),
+        "batch_cleanup_invocations": len(timings.get("batch_cleanup_task", ())),
+        "batch_cleanup_share": round(
+            total("batch_cleanup_task") / total("batch_execute"), 6
+        ) if total("batch_execute") else 0.0,
+        "batch_cleanup_barrier_share": round(
+            total("batch_cleanup_barrier") / total("batch_cleanup_task"), 6
+        ) if total("batch_cleanup_task") else 0.0,
         "execute_ready_overhead_excluding_extract_verify": round(
             total("batch_execute") - total("extract_total") - total("verify_total"),
             6,

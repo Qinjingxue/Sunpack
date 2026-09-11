@@ -202,6 +202,7 @@ class ExtractionBatchRunner:
         default_output_dir_for_task=None,
         missing_volume_retry=None,
         ensure_input_lease=None,
+        cleanup_scope=None,
     ) -> List[str]:
         """Execute independent logical archives as interleaved coroutines."""
 
@@ -219,6 +220,11 @@ class ExtractionBatchRunner:
             )
             resolver = self._cached_output_dir_resolver(resolver)
             prepared = self._skip_tasks_inside_batch_outputs(tasks, resolver)
+            if cleanup_scope is not None:
+                # Reference counts must exist before any task can finish, so a
+                # shared source path is never deleted while another task in this
+                # round still has to read it.
+                cleanup_scope.register(prepared)
             return resolver, prepared
 
         output_dir_resolver, prepared_tasks = await broker.run(
@@ -236,7 +242,7 @@ class ExtractionBatchRunner:
             )
 
         async def execute_one(task):
-            return await self._execute_one_async(
+            task, outcome = await self._execute_one_async(
                 task,
                 output_dir_resolver,
                 broker=broker,
@@ -244,17 +250,35 @@ class ExtractionBatchRunner:
                 missing_volume_retry=missing_volume_retry,
                 ensure_input_lease=ensure_input_lease,
             )
+            output_dir = self.collect_result(task, outcome)
+            if cleanup_scope is not None and output_dir:
+                # Source archives are cleaned as soon as this task's extract and
+                # verification are both finished, because verification reads the
+                # source archive back to build its manifest.
+                await cleanup_scope.release_task(
+                    task,
+                    outcome_kind=outcome.outcome_kind,
+                    broker=broker,
+                    cancellation=cancellation,
+                )
+            return task, outcome
 
         # Python only bounds blocking preparation through the broker. Every
         # extraction-ready task is submitted to the native worker, where
         # fairness and resource admission are centralized.
-        outcomes = await map_unbounded(prepared_tasks, execute_one)
+        try:
+            outcomes = await map_unbounded(prepared_tasks, execute_one)
+        finally:
+            if cleanup_scope is not None:
+                # Cancelled or otherwise unreported tasks still hold references;
+                # drop them so a round can never strand the table.
+                await cleanup_scope.sweep(broker=broker)
 
         output_dirs = []
         logical_scan_roots = []
         output_inventories: dict[str, OutputInventory] = {}
         for task, outcome in outcomes:
-            output_dir = self.collect_result(task, outcome)
+            output_dir = outcome.result.out_dir if outcome.result is not None else ""
             if not output_dir:
                 continue
             output_dirs.append(output_dir)
@@ -1492,11 +1516,6 @@ class ExtractionBatchRunner:
             if outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
                 self.context.success_count += 1
                 self.context.processed_keys.add(task.key)
-                cleanup_parts = list(dict.fromkeys([
-                    *(res.all_parts or []),
-                    *(task.cleanup_parts or task.all_parts or []),
-                ]))
-                self.context.unpacked_archives.append(cleanup_parts)
                 self.context.flatten_candidates.add(out_dir)
                 self.context.target_results.append(TargetRunResult(
                     input_path=task.main_path,

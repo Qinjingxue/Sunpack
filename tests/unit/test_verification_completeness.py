@@ -169,7 +169,6 @@ def test_main_flow_accepts_recoverable_partial_after_repair_has_no_candidate(tmp
     assert runner.collect_result(task, outcome) == str(out_dir)
     assert runner.context.partial_success_count == 1
     assert runner.context.success_count == 0
-    assert runner.context.unpacked_archives == []
     assert runner.context.flatten_candidates == set()
     recovered = runner.context.recovered_outputs[0]
     assert recovered["archive_coverage"]["expected_files"] == 3

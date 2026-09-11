@@ -1052,9 +1052,8 @@ def promotion_barrier(
     cache_releasers: Iterable[Callable[[str], Any]] = (),
     timeout: float = 30.0,
     strict_open_file_audit: bool = False,
+    quiesce: bool = True,
 ) -> Iterator[PromotionBarrierReport]:
-    """Exclude new opens, evict exact caches, prove cleanliness, then mutate paths."""
-
     root_identities = file_identities(roots, directories=True)
     if not root_identities:
         yield PromotionBarrierReport(roots=())
@@ -1071,7 +1070,7 @@ def promotion_barrier(
     token = uuid.uuid4().hex
     current = current_task_resource_scope()
     promotion_started = False
-    if current is not None:
+    if quiesce and current is not None:
         current.begin_promotion(timeout=max(0.0, deadline - time.monotonic()))
         promotion_started = True
     with _CHANGED:

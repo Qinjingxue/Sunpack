@@ -68,7 +68,7 @@ class FakePipelineEngine:
         summary = runner.run_targets(paths)
         summary.cleanup_results = []
         self._recent_passwords = list(getattr(runner, "recent_passwords", ()) or ())
-        context = getattr(runner, "context", SimpleNamespace(flatten_candidates=(), unpacked_archives=()))
+        context = getattr(runner, "context", SimpleNamespace(flatten_candidates=()))
         recovered_outputs = getattr(context, "recovered_outputs", ()) or ()
         generated_outputs = [
             str(item.get("out_dir") or "")
@@ -79,7 +79,6 @@ class FakePipelineEngine:
             request_id=uuid.uuid4().hex,
             summary=summary,
             artifacts=PipelineArtifacts(
-                archives_to_clean=tuple(tuple(parts) for parts in getattr(context, "unpacked_archives", ()) or ()),
                 flatten_targets=tuple([*(getattr(context, "flatten_candidates", ()) or ()), *generated_outputs]),
             ),
             recent_passwords=tuple(self._recent_passwords),

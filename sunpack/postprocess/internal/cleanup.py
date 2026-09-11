@@ -84,6 +84,3 @@ class ArchiveCleanup:
                     results.append(ArchiveCleanupResult(path, self.mode, "failed", attempts,
                                                        code, str(exc)))
         return results
-
-    def cleanup_archive_file(self, path: str, reason: str | None = None) -> ArchiveCleanupResult:
-        return self.cleanup_success_archives([[path]])[0]

@@ -1,5 +1,5 @@
 import threading
-from typing import List, Set
+from typing import Any, Dict, List, Set
 
 from sunpack.contracts.failures import FailureInfo
 from sunpack.contracts.results import TargetRunResult
@@ -14,7 +14,7 @@ class RunContext:
         self.failures: List[FailureInfo] = []
         self.recovered_outputs: List[dict] = []
         self.processed_keys: Set[str] = set()
-        self.unpacked_archives: List[List[str]] = []
+        self.cleanup_refs: Dict[str, Any] = {}
         self.flatten_candidates: Set[str] = set()
         self.target_results: List[TargetRunResult] = []
         self.policy_skips: List[dict] = []

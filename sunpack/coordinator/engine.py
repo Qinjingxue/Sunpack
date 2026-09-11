@@ -12,7 +12,7 @@ from typing import Any, Callable, Iterable, Mapping, Protocol, TextIO
 from sunpack.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.repair_inspection import RepairInspectionService
 from sunpack.contracts.pipeline import PipelineArtifacts, PipelineResponse, PipelineTarget
-from sunpack.contracts.results import OutcomeKind, RunSummary
+from sunpack.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary
 from sunpack.contracts.run_context import RunContext
 from sunpack.coordinator.extraction_batch import ExtractionBatchRunner
 from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy
@@ -366,6 +366,12 @@ def _replace_mapping_in_place(target: dict, source: dict) -> None:
             target[key] = copy.deepcopy(value)
 
 
+def _postprocess_actions_factory(config: dict, **kwargs):
+    """Indirection kept for callers that replace ``PostProcessActions``."""
+
+    return PostProcessActions(config, **kwargs)
+
+
 def _worker_config(config: dict) -> dict:
     performance = config.get("performance") if isinstance(config.get("performance"), dict) else {}
     worker = performance.get("worker") if isinstance(performance.get("worker"), dict) else {}
@@ -427,6 +433,130 @@ class _PipelineServices:
         )
 
 
+class _CleanupRefScope:
+    def __init__(self, context: RunContext, config: dict, factory: Callable[..., Any]):
+        from sunpack.coordinator.cleanup_refs import CleanupRefTable
+
+        self._context = context
+        self._config = config
+        self._factory = factory
+        self.request_id = ""
+        self._table = CleanupRefTable()
+
+    def bind(self, request_id: str) -> "_CleanupRefScope":
+        self.request_id = str(request_id or "")
+        self._context.cleanup_refs[self.request_id] = self._table
+        return self
+
+    def register(self, tasks) -> None:
+        self._table.register_all(tasks)
+
+    async def release_task(self, task, *, outcome_kind, broker, cancellation=None) -> "ReleaseOutcome":
+        from sunpack.coordinator.cleanup_refs import ReleaseOutcome
+        from sunpack.contracts.results import OutcomeKind
+
+        if outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
+            self._table.mark_cleanup_eligible(task)
+        request = self._table.release(task)
+        if not (request.paths and request.should_clean):
+            # Nothing to remove: either the path is still referenced elsewhere,
+            # or every owner that released it failed.
+            return ReleaseOutcome(task_key=request.task_key, released=request.paths)
+        return await self._apply(request, broker=broker, cancellation=cancellation)
+
+    async def sweep(self, *, broker, cancellation=None) -> list["ReleaseOutcome"]:
+        outcomes = []
+        for request in self._table.sweep():
+            if not (request.paths and request.should_clean):
+                continue
+            outcomes.append(await self._apply(request, broker=broker, cancellation=cancellation))
+        return outcomes
+
+    async def _apply(self, request, *, broker, cancellation=None) -> "ReleaseOutcome":
+        from sunpack.coordinator.cleanup_refs import ReleaseOutcome
+        from sunpack.support.archive_sessions import release_archive_sessions_under
+        from sunpack.support.resource_lifecycle import (
+            ResourceBusyError,
+            ResourceLifecycleError,
+            promotion_barrier,
+        )
+
+        def run_cleanup():
+            existing = [path for path in request.paths if os.path.exists(path)]
+            results: list[ArchiveCleanupResult] = []
+            error = ""
+            if existing:
+                try:
+                    with promotion_barrier(
+                        existing,
+                        cache_releasers=(release_archive_sessions_under,),
+                        quiesce=False,
+                    ):
+                        results.extend(
+                            self._factory(self._config, stdout=None).apply(
+                                archives_to_clean=[[path] for path in existing],
+                                flatten_targets=[],
+                            )
+                        )
+                except (ResourceBusyError, ResourceLifecycleError) as exc:
+                    error = str(exc)
+                    code = int(getattr(exc, "winerror", 0) or 0)
+                    results.extend(
+                        ArchiveCleanupResult(
+                            path,
+                            self._mode(),
+                            "failed",
+                            1,
+                            code or 32,
+                            f"cleanup barrier unavailable: {exc}",
+                        )
+                        for path in existing
+                    )
+            # A path that was already gone is reported as missing rather than
+            # silently dropped, so the summary still accounts for every source.
+            seen = {item.path for item in results}
+            results.extend(
+                ArchiveCleanupResult(path, self._mode(), "missing")
+                for path in request.paths
+                if path not in seen
+            )
+            ordered = {item.path: item for item in results}
+            final = [ordered[path] for path in request.paths if path in ordered]
+            deleted = tuple(item.path for item in final if item.status in {"recycled", "deleted"})
+            return ReleaseOutcome(
+                task_key=request.task_key,
+                released=request.paths,
+                deleted=deleted,
+                failed=tuple(item for item in final if item.status == "failed"),
+                error=error,
+            )
+
+        try:
+            outcome = await broker.run(
+                "postprocess",
+                request.task_key or self.request_id,
+                run_cleanup,
+                request_id=self.request_id,
+                cancellation=cancellation,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # A closed or unavailable broker must not fail the extraction; the
+            # source archives simply stay in place.
+            return ReleaseOutcome(task_key=request.task_key, released=request.paths, error=str(exc))
+        if outcome.deleted:
+            # The deleted sources are gone, so refresh their folders instead of
+            # naming paths that no longer exist.
+            notify_shell_directories_updated(
+                tuple(dict.fromkeys(os.path.dirname(path) for path in outcome.deleted if os.path.dirname(path)))
+            )
+        return outcome
+
+    def _mode(self) -> str:
+        return str(self._config.get("post_extract", {}).get("archive_cleanup_mode", "recycle"))
+
+
 class _RequestRuntime:
     """All mutable state belonging to exactly one PipelineEngine submission."""
 
@@ -454,12 +584,11 @@ class _RequestRuntime:
             stdout=submission.stdout,
             stderr=submission.stderr,
         )
-        self.postprocess = PostProcessActions(
-            self.config,
+        self.cleanup_scope = _CleanupRefScope(
             self.context,
-            language=self.language,
-            stdout=submission.stdout,
-        )
+            self.config,
+            _postprocess_actions_factory,
+        ).bind(submission.request_id)
         self.task_scanner = ArchiveTaskScanner(
             self.config,
             self.context,
@@ -640,6 +769,7 @@ class _RequestRuntime:
                     default_output_dir_for_task=ownership.output_dir_for_task,
                     missing_volume_retry=self._resolve_missing_volume_once,
                     ensure_input_lease=self._ensure_task_lease,
+                    cleanup_scope=self.cleanup_scope,
                 )
                 next_scan_session = self.output_scan_policy.take_scan_session(new_roots)
                 ownership.remember_results(self.context.target_results[before_results:])
@@ -716,8 +846,7 @@ def _finalize_response(
     retry_results=None,
 ) -> PipelineResponse:
     if getattr(response.summary, "_postprocess_completed", False) and retry_results is None:
-        return replace(response, artifacts=PipelineArtifacts(archives_to_clean=tuple(
-            (item.path,) for item in response.summary.cleanup_results if item.status == "failed")))
+        return response
     mapping = {path_key(old): os.path.abspath(new) for old, new in (output_path_map or {}).items()}
 
     def remap(path: str) -> str:
@@ -735,37 +864,36 @@ def _finalize_response(
         old, new = max(ancestors, key=lambda item: len(os.path.abspath(item[0])))
         return os.path.join(os.path.abspath(new), os.path.relpath(normalized, os.path.abspath(old)))
 
-    archives_to_clean = [
-        [remap(path) for path in archive_parts]
-        for archive_parts in response.artifacts.archives_to_clean
-    ]
-    flatten_targets = [remap(path) for path in response.artifacts.flatten_targets]
+    flatten_targets_all = [remap(path) for path in response.artifacts.flatten_targets]
     shell_refresh_paths = [remap(path) for path in response.artifacts.shell_refresh_paths]
     previous = None
+    cleanup_requests = ()
     if retry_results is not None:
-        archives_to_clean = [[item.path] for item in retry_results]
-        flatten_targets = []
+        # Only failed cleanups are retried here.  Source archives are already
+        # removed task by task (see _CleanupRefScope), so the first pass through
+        # this function has nothing left to delete.
+        flatten_targets_all = []
         shell_refresh_paths = []
+        cleanup_requests = tuple((item.path,) for item in retry_results)
         previous = {path_key(item.path): item for item in retry_results}
     post_extract = config.get("post_extract", {})
     flatten_enabled = post_extract.get("flatten_single_directory", True)
-    cleanup_mode = post_extract.get("archive_cleanup_mode", "recycle")
-    mutation_roots = list(flatten_targets) if flatten_enabled else []
-    if cleanup_mode != "keep":
-        mutation_roots.extend(path for family in archives_to_clean for path in family)
+    flatten_targets = flatten_targets_all if flatten_enabled else []
+    mutation_roots = list(flatten_targets)
+    mutation_roots.extend(path for family in cleanup_requests for path in family)
     if mutation_roots:
         with promotion_barrier(
             mutation_roots,
             cache_releasers=(release_archive_sessions_under,),
         ):
             cleanup_results = PostProcessActions(config, stdout=stdout).apply(
-                archives_to_clean=archives_to_clean,
+                archives_to_clean=list(cleanup_requests),
                 flatten_targets=flatten_targets,
                 previous_cleanup=previous,
             )
     else:
         cleanup_results = PostProcessActions(config, stdout=stdout).apply(
-            archives_to_clean=archives_to_clean,
+            archives_to_clean=list(cleanup_requests),
             flatten_targets=flatten_targets,
             previous_cleanup=previous,
         )
@@ -774,9 +902,7 @@ def _finalize_response(
     merged.update({path_key(item.path): item for item in cleanup_results})
     response.summary.cleanup_results = list(merged.values())
     response.summary._postprocess_completed = True
-    artifacts = PipelineArtifacts(archives_to_clean=tuple(
-        (item.path,) for item in merged.values() if item.status == "failed"))
-    return replace(response, artifacts=artifacts)
+    return response
 
 
 class _RequestOwnership:
@@ -831,10 +957,6 @@ class _RequestOwnership:
         results = {item.request_id: [] for item in self.submissions}
         for result in context.target_results:
             results[self.owner_for_path(result.input_path).request_id].append(result)
-        archives = {item.request_id: [] for item in self.submissions}
-        for parts in context.unpacked_archives:
-            if parts:
-                archives[self.owner_for_path(parts[0]).request_id].append(tuple(parts))
         flatten = {item.request_id: [] for item in self.submissions}
         for path in context.flatten_candidates:
             owner_id = self._owner_for_output(path) or self.owner_for_path(path).request_id
@@ -885,10 +1007,8 @@ class _RequestOwnership:
                 request_id=submission.request_id,
                 summary=summary,
                 artifacts=PipelineArtifacts(
-                    archives_to_clean=tuple(archives[submission.request_id]),
                     flatten_targets=tuple(sorted(flatten[submission.request_id], key=lambda value: value.count(os.sep))),
                     shell_refresh_paths=tuple(dict.fromkeys([
-                        *(path for archive_parts in archives[submission.request_id] for path in archive_parts),
                         *(
                             result.output_dir
                             for result in request_results

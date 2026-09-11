@@ -30,7 +30,7 @@ def WatchScheduler(*args, pipeline_engine=None, **kwargs):
         pipeline_engine = FakePipelineEngine(
             lambda _config: SimpleNamespace(
                 recent_passwords=[],
-                context=SimpleNamespace(flatten_candidates=set(), unpacked_archives=[]),
+                context=SimpleNamespace(flatten_candidates=set()),
                 run_targets=lambda _paths: SimpleNamespace(
                     success_count=0,
                     partial_success_count=0,
