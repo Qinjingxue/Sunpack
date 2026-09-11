@@ -481,7 +481,7 @@ class SingleArchiveExtractor:
             )
 
         self._cleanup_output(out_dir, OutputCleanupEvent.RETRY_EXHAUSTED)
-        failure = self._failure_info(FailureKind.PROCESS_ERROR, "retry_exhausted", "failure.insufficient_space")
+        failure = self._failure_info(FailureKind.PROCESS_ERROR, "retry_exhausted", "failure.retry_exhausted")
         return self._failed(
             archive,
             out_dir,
