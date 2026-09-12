@@ -1405,6 +1405,55 @@ void g30_probe_authorising_sample_becomes_the_watermark() {
           "G-30: 全程只应有一条 resumed");
 }
 
+// ---------------------------------------------------------------------------
+// G-31 episode 历史不堆积：全部恢复后诊断节流表必须被丢弃（架构师第十二轮 P2）
+// ---------------------------------------------------------------------------
+void g31_monitor_drops_episode_history_after_recovery() {
+    auto log = std::make_shared<SinkLog>();
+    auto gate = make_gate("job:g31", log);
+
+    auto blocked = std::make_shared<std::vector<VolumeStatePtr>>();
+    auto state = sunpack::sevenzip::make_volume_state("job:g31", false);
+    state->space_gate = gate;
+
+    auto status_calls = std::make_shared<std::atomic<int>>(0);
+    // ★ 诊断间隔（10 s）故意远大于测试推进的时间步长（200 ms）：于是"新 episode 的
+    //   第一拍能否立刻发出诊断"**完全等价于**"节流表有没有在上一次恢复时被清掉"。
+    VolumeSpaceMonitor monitor(
+        VolumeSpaceMonitor::Options{5ms, 10s},
+        [blocked] { return *blocked; },
+        [status_calls](const VolumeStatePtr &, std::uint64_t, std::uint64_t, bool, unsigned long) {
+            status_calls->fetch_add(1);
+        });
+
+    auto now = std::chrono::steady_clock::now();
+
+    // ① episode 1：满盘 → 采样 → 必须发出诊断。
+    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    blocked->push_back(state);
+    monitor.note_blocked();
+    monitor.tick(now);
+    check(status_calls->load() >= 1, "G-31: episode 1 必须发出诊断");
+    check(monitor.sampling(), "G-31: episode 1 必须处于采样中");
+
+    // ② 恢复：拉取返回空 → 停止采样，并且**整个 episode 的历史被丢弃**。
+    blocked->clear();
+    monitor.tick(now + 100ms);
+    check(!monitor.sampling(), "G-31: 全部恢复后必须停止采样");
+
+    // ③ episode 2：同一个卷再次满盘。此刻距上一次诊断只有 200 ms（< 10 s）——
+    //    若 last_status_at_ 没有被清掉，这一拍会被节流掉，计数保持 1。
+    //    （registry 里的 job:<id> 条目 idle 后会被 erase，而 monitor 的这张表原先会
+    //      永久留下它的 key：长期大量不同 job 都满盘过 = 无界增长。）
+    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    blocked->push_back(state);
+    monitor.note_blocked();
+    monitor.tick(now + 200ms);
+    check(status_calls->load() >= 2,
+          "G-31: ★ 恢复之后必须丢弃 episode 历史（新 episode 的第一拍必须立刻可诊断）");
+    check(monitor.sampling(), "G-31: episode 2 必须重新开始采样");
+}
+
 }  // namespace
 
 #endif
@@ -1451,6 +1500,8 @@ int main(int argc, char **argv) {
         {"G-28 one blocked per job per episode", g28_one_blocked_per_job_per_episode},
         {"G-29 no late blocked after recovery", g29_no_late_blocked_after_recovery},
         {"G-30 probe authorising sample becomes the watermark", g30_probe_authorising_sample_becomes_the_watermark},
+        {"G-31 monitor drops episode history after recovery",
+         g31_monitor_drops_episode_history_after_recovery},
     };
     constexpr int kCaseCount = static_cast<int>(std::size(cases));
 

@@ -87,10 +87,27 @@ namespace sunpack::sevenzip
             return false;
         }
 
+        // ★ 终态前置检查（**调用方语义**，不是骨架的一部分）。
+        //
+        //   骨架现在是"先尝试、后求值谓词"（异常驱动的冷路径），而目录创建多了一条
+        //   业务语义：**取消 / draining 时绝不能真的去创建目录**（R-11c）。
+        //   数据路径不需要这个检查 —— attempt_data_write() 自己就是终态权威。
+        //
+        //   ⚠️ 只在 gate 存在时检查：开关关闭（gate == nullptr）必须逐语义回到改动前
+        //      （§7.3），而改动前的 gate == nullptr 分支是"只尝试一次、绝不出于终态跳过"。
+        if (gate != nullptr && terminal && terminal())
+        {
+            if (out_error)
+            {
+                *out_error = std::make_error_code(std::errc::operation_canceled);
+            }
+            return false;
+        }
+
         unsigned long failure_code = 0;
         const AttemptResult result = retry_with_space_gate(
             gate,
-            terminal,
+            [&terminal] { return terminal; }, // 惰性：正常创建目录时根本不构造谓词
             directory.native(),
             [&directory, &failure_code]() noexcept -> AttemptResult
             {

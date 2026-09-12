@@ -99,7 +99,18 @@ namespace sunpack::sevenzip
 
             if (states.empty())
             {
-                // ★ 异常状态已完全消除 → 停止采样，回到零开销。
+                // ★ 异常状态已**完全**消除 → 停止采样，并把这一个 episode 的全部历史丢掉：
+                //   * `sampling_` 归零 → 之后的每个 tick 连 registry 都不拉（常态零开销）；
+                //   * `last_status_at_` 清空 → 诊断节流表不随"曾经满盘过的卷"无界增长。
+                //     registry 的 `job:<id>` 这类非 persistent 条目 idle 后会被 erase，
+                //     而 monitor 的这张表原先会永久留下它的 key（架构师第十二轮 P2）；
+                //   * `next_poll_at_` 归零 → 下一个 episode 的第一拍立即可采样（不被上一个
+                //     episode 的限速窗口推迟）。
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    last_status_at_.clear();
+                    next_poll_at_ = std::chrono::steady_clock::time_point{};
+                }
                 sampling_.store(false, std::memory_order_relaxed);
                 return;
             }

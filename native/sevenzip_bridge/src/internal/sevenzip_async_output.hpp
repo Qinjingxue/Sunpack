@@ -1174,21 +1174,23 @@ namespace sunpack::sevenzip
                     Buffer *buffer = item.buffer;
                     const FileStatePtr file = buffer ? buffer->file : nullptr;
 
-                    // ★ 谓词**只读 atomic**（stopping_ 是 writer 私有 atomic；
-                    //   job->terminal_requested / cancel_token 同样是 atomic）。
-                    //   job 必须**按值**捕获 shared_ptr —— 谓词可能活过局部作用域。
-                    const JobStatePtr job = file ? file->job : nullptr;
-                    const TerminalPredicate terminal_pred = writer_terminal_predicate(job);
-
                     // transferred 跨重试保留：空间失败时已经落盘的前缀不能被重复记账，
                     // 重试也从 output_offset + transferred 继续（同 handle、同 offset 语义）。
                     UInt32 transferred = 0;
 
                     // ★★ writer_loop **不认识 ProbeLease**，也不调用任何 gate 状态接口。
                     //     全部空间状态交互发生在骨架内部（唯一权威实现）。
+                    //
+                    // ★★ **热路径零开销**（架构师第十二轮 P1）：这里既不再预先构造终态
+                    //     谓词，也不再先问 gate"盘满了吗"。骨架先做真实 WriteFile：
+                    //       * 成功 / 永久失败 / 取消 → 直接返回，gate 一次都没被碰过；
+                    //       * 真实 ERROR_DISK_FULL → 才进入冷路径，此时才构造下面这个谓词。
+                    //     磁盘自己就是检测器：writer 停止尝试的唯一依据只能是真实失败。
+                    //     `file` 在本行之后仍然存活，因此按引用捕获它是安全的
+                    //     （工厂只在冷路径、只在本调用内部被求值一次）。
                     const AttemptResult result = retry_with_space_gate(
                         file ? file->volume_space_gate() : nullptr,
-                        terminal_pred,
+                        [this, &file] { return writer_terminal_predicate(file ? file->job : nullptr); },
                         file ? std::wstring_view(file->path) : std::wstring_view{},
                         [&] {
                             // 一次真实尝试：只返回 AttemptResult，绝不碰 gate、绝不记账
@@ -1319,9 +1321,20 @@ namespace sunpack::sevenzip
         AttemptResult open_file_with_space_gate(const FileStatePtr &file,
                                                 const TerminalPredicate &terminal) noexcept
         {
+            // ★ 终态前置检查（**调用方语义**，不是骨架的一部分）。
+            //   骨架现在是"先尝试、后求值谓词"；而 Open 路径的语义是
+            //   **取消 / draining 时绝不产生任何真实 I/O**（否则会凭空创建一个空文件）。
+            //   Data 路径不需要它：attempt_data_write() 自己就是终态权威
+            //   （入口先查 current_error(job)，未通过则一个字节都不写、也不 CreateFileW）。
+            //   ⚠️ 只在 gate 存在时检查：开关关闭必须逐语义回到改动前（§7.3）。
+            if (file && file->space_gate && terminal && terminal())
+            {
+                return {AttemptResult::Kind::Terminal, 0};
+            }
+
             const AttemptResult result = retry_with_space_gate(
                 file ? file->space_gate.get() : nullptr,
-                terminal,
+                [&terminal] { return terminal; }, // 只做一次真实 open —— 冷路径才需要谓词
                 file ? std::wstring_view(file->path) : std::wstring_view{},
                 [this, &file] { return try_open_file_locked(file); });
 
@@ -1580,10 +1593,13 @@ namespace sunpack::sevenzip
                     // ⚠️ handle 在骨架外面被摘下来了（file->handle = INVALID_HANDLE_VALUE），
                     //   因此 attempt 里的 FlushFileBuffers 用的是**同一个** handle，
                     //   暂停期间它不会被关闭（同 handle 续写语义的一部分）。
-                    const TerminalPredicate flush_terminal = writer_terminal_predicate(job);
+                    // ★ 终态谓词同样是**惰性**的：flush 正常成功时它根本不会被构造。
+                    //   flush 在 drain 期间必须真实执行（数据落盘语义），因此这里
+                    //   **不**做终态前置检查 —— 取消时的 "file->failed" 已经在
+                    //   process_close 入口由 record_failure 置位。
                     const AttemptResult flush_result = retry_with_space_gate(
                         file->space_gate.get(),
-                        flush_terminal,
+                        [this, &job] { return writer_terminal_predicate(job); },
                         file->path,
                         [this, handle]() noexcept -> AttemptResult
                         {

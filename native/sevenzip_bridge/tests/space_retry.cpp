@@ -1215,6 +1215,113 @@ void r22_partial_write_then_space_failure(const std::filesystem::path &directory
 }
 
 // ---------------------------------------------------------------------------
+// R-23 正常路径**从不进入 gate**（架构师第十二轮 P1：异常驱动的冷路径）
+// ---------------------------------------------------------------------------
+void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) {
+    // ① 干净卷：多 buffer 的正常写入**一次都不能调用 wait()**。
+    //
+    //   这是"没有满盘时这个功能不存在"的**结构性**证明，而不是性能承诺：
+    //   骨架先做真实 WriteFile，只有真的 SpaceFailure 才会走到 gate；因此
+    //   gate 快路径（取 mutex / shared_ptr 引用计数 / 构造终态谓词）在正常路径上
+    //   根本不存在。若有人把 wait() 挪回 attempt 之前，这个计数立刻变成非 0。
+    {
+        constexpr std::size_t kPayload = 4 * kMib; // 4 个 buffer → 多次真实 WriteFile
+        const auto payload = make_payload(kPayload);
+        Harness harness(directory, 1, 8);
+        auto &writer = *harness.writer;
+
+        const auto path = directory / L"r23-hot-path.bin";
+        const auto job = writer.make_job(8 * kMib);
+        const auto file = writer.make_file(job, path.wstring(), L"r23-hot-path.bin", 0, 0);
+        std::uint32_t processed = 0;
+        check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
+                           &processed) == S_OK &&
+                  processed == payload.size(),
+              "R-23: ① 写入必须全部被接受");
+        // ⚠️ 必须先 close_file 再 finish_job：pending_jobs 是在 close_file 里递增的，
+        //    漏掉它 finish_job 会立刻返回（还没 drain），内容比对必然失败。
+        writer.record_operation_result(file, 0);
+        writer.close_file(file, 0, false, {});
+        check(writer.finish_job(job) == S_OK, "R-23: ① 干净写入必须成功");
+
+        check(harness.gate->wait_call_count() == 0,
+              "R-23: ★ 正常写入路径绝不能进入 gate（wait() 调用次数必须为 0）");
+        check(harness.gate->phase() == VolumeSpacePhase::Ready,
+              "R-23: ① 干净路径不得改变卷状态");
+        check(harness.log->total() == 0, "R-23: ① 干净路径不得产生任何空间事件");
+        check(read_file(path) == payload, "R-23: ① 数据必须完整");
+    }
+
+    // ② 真实空间失败：此时（也只有此时）骨架才允许进入 gate。
+    {
+        constexpr std::size_t kPayload = 1 * kMib;
+        const auto payload = make_payload(kPayload);
+        Harness harness(directory, 1, 8);
+        auto &writer = *harness.writer;
+        const auto path = directory / L"r23-cold-path.bin";
+        writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
+
+        const auto job = writer.make_job(2 * kMib);
+        const auto file = writer.make_file(job, path.wstring(), L"r23-cold-path.bin", 0, 0);
+        std::uint32_t processed = 0;
+        check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
+                           &processed) == S_OK,
+              "R-23: ② 写入必须被接受");
+
+        check(wait_until([&] { return harness.gate->blocked(); }, 5s),
+              "R-23: ② 真实空间失败必须让卷进入暂停");
+        check(harness.gate->wait_call_count() >= 1,
+              "R-23: ★ 只有真实空间失败之后才允许调用 wait()");
+
+        check(harness.release_probe_and_wait_ready(), "R-23: ② 恢复后必须回到 Ready");
+        writer.record_operation_result(file, 0);
+        writer.close_file(file, 0, false, {});
+        check(writer.finish_job(job) == S_OK, "R-23: ② 恢复后 job 必须成功");
+        check(read_file(path) == payload, "R-23: ② 数据必须完整");
+    }
+
+    // ③ 恢复之后重新归零：后续正常写入不得再进入 gate（开销随异常状态一起消失）。
+    {
+        constexpr std::size_t kPayload = 1 * kMib;
+        const auto payload = make_payload(kPayload);
+        Harness harness(directory, 1, 8);
+        auto &writer = *harness.writer;
+        const auto path = directory / L"r23-after-recovery.bin";
+        writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
+
+        const auto job = writer.make_job(2 * kMib);
+        const auto file = writer.make_file(job, path.wstring(), L"r23-after-recovery.bin", 0, 0);
+        std::uint32_t processed = 0;
+        check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
+                           &processed) == S_OK,
+              "R-23: ③ 写入必须被接受");
+        check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-23: ③ 必须进入暂停");
+        check(harness.release_probe_and_wait_ready(), "R-23: ③ 恢复后必须回到 Ready");
+        writer.record_operation_result(file, 0);
+        writer.close_file(file, 0, false, {});
+        check(writer.finish_job(job) == S_OK, "R-23: ③ 恢复后 job 必须成功");
+
+        const std::uint64_t calls_after_recovery = harness.gate->wait_call_count();
+        const auto second_path = directory / L"r23-after-recovery-2.bin";
+        const auto second_job = writer.make_job(2 * kMib);
+        const auto second_file =
+            writer.make_file(second_job, second_path.wstring(), L"r23-after-recovery-2.bin", 0, 0);
+        std::uint32_t second_processed = 0;
+        check(writer.write(second_file, payload.data(),
+                           static_cast<std::uint32_t>(payload.size()),
+                           &second_processed) == S_OK &&
+                  second_processed == payload.size(),
+              "R-23: ③ 恢复后的写入必须全部被接受");
+        writer.record_operation_result(second_file, 0);
+        writer.close_file(second_file, 0, false, {});
+        check(writer.finish_job(second_job) == S_OK, "R-23: ③ 恢复后的 job 必须成功");
+        check(harness.gate->wait_call_count() == calls_after_recovery,
+              "R-23: ★ 恢复之后的正常写入同样不得再进入 gate（回到零开销）");
+        check(read_file(second_path) == payload, "R-23: ③ 数据必须完整");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Phase 6c 默认开启验收（R22："默认值忘改 → 功能永不生效"的唯一防线）
 // ---------------------------------------------------------------------------
 void phase_6c_default_enabled() {
@@ -1283,10 +1390,23 @@ void error_code_contract() {
     check(!is_space_exhaustion_error(std::error_code{}), "契约: 空的 error_code 不是空间错误");
 
     // 骨架的四态语义（gate == nullptr 时 SpaceFailure 必须原样外泄）。
+    //
+    // ★ 注意"先尝试、后求值谓词"：契约用例里的谓词工厂**不得**被调用
+    //   （gate == nullptr 时骨架连 SpaceFailure 之后的冷路径都不进）。
+    std::atomic<int> factory_calls{0};
     AttemptResult straight = sunpack::sevenzip::retry_with_space_gate(
-        nullptr, TerminalPredicate{}, L"x", [] { return AttemptResult{AttemptResult::Kind::SpaceFailure, 112UL}; });
+        nullptr,
+        [&factory_calls]
+        {
+            factory_calls.fetch_add(1);
+            return TerminalPredicate{};
+        },
+        L"x",
+        [] { return AttemptResult{AttemptResult::Kind::SpaceFailure, 112UL}; });
     check(straight.kind == AttemptResult::Kind::SpaceFailure && straight.win32_error == 112,
           "契约: gate == nullptr 时 SpaceFailure 必须原样返回（由调用方转旧语义）");
+    check(factory_calls.load() == 0,
+          "契约: gate == nullptr 时终态谓词工厂绝不能被调用（连冷路径都不进）");
 }
 
 }  // namespace
@@ -1324,6 +1444,8 @@ int main(int argc, char **argv) {
         {"R-21 open space error is retryable", [&] { r21_open_space_error_is_retryable(directory); }},
         {"R-22 partial write then space failure",
          [&] { r22_partial_write_then_space_failure(directory); }},
+        {"R-23 hot path never enters the gate",
+         [&] { r23_hot_path_never_enters_the_gate(directory); }},
         {"Phase 6c default enabled", phase_6c_default_enabled},
         {"error code contract", error_code_contract},
     };

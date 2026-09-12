@@ -408,6 +408,13 @@ namespace sunpack::sevenzip
         bool watermark_valid() const noexcept;
         std::vector<std::string> affected_job_ids() const;
         std::size_t waiter_count() const noexcept;
+        // ★ 只读观测：wait() 被调用的**累计**次数。
+        //
+        //   存在的唯一理由是让测试能**证明**"正常写路径从不进入 gate"：
+        //   骨架是异常驱动的（先真实 I/O，只有真的 SpaceFailure 才进来），因此
+        //   从未满盘时这个计数**恒为 0**，而 R-23 直接断言这一点。
+        //   没有新增任何状态 —— 只是把已有的 waiter token 计数器暴露出来（纯读）。
+        std::uint64_t wait_call_count() const noexcept;
         const std::string &volume_key() const noexcept { return volume_key_; }
         bool query_root_resolved() const noexcept;
 
@@ -963,6 +970,12 @@ namespace sunpack::sevenzip
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return query_root_resolved_;
+    }
+
+    inline std::uint64_t VolumeSpaceGate::wait_call_count() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return next_waiter_token_ - 1; // token 从 1 开始 → 调用次数 = token - 1
     }
 
     inline void VolumeSpaceGate::remove_waiter_locked(std::uint64_t token) noexcept
