@@ -373,6 +373,15 @@ namespace sunpack::sevenzip
         // ---- 4) monitor 接口 ----------------------------------------------
         // ★ 全项目唯一一处把"卷身份"翻译成"可查询路径"的地方。
         //   query_root_ 未解析（synthetic 卷首次失败前）时返回 false。
+        //
+        // ★★ `query_free_bytes()` 是**唯一**的卷空间查询入口，而它只被 monitor 调用。
+        //     writer / probe owner 线程**从不**查询磁盘空间（架构师第三轮"彻底解法"）：
+        //       - 首次空间失败：直接 `watermark_valid_ = false → Blocked → 立即发事件`；
+        //       - monitor 的第一次成功采样成为 baseline，并立即允许一次真实 probe；
+        //       - probe 失败后继续等待下一次 `free > watermark`。
+        //     好处：`GetDiskFreeSpaceExW` 再也不会在 writer 线程上同步执行，
+        //     失联 UNC / 坏网络盘不可能卡住 writer 或 probe owner（T-WIN-20 用的是本地
+        //     VHD，测不到这一类）；同时 `commit_fresh_watermark()` 整个被删除。
         bool query_free_bytes(std::uint64_t *free_bytes, std::uint64_t *total_bytes) noexcept;
         unsigned long last_query_error() const noexcept;
         // B5：卷暂时不可查询（拔盘 / UNC 断开 / 权限变化 / query_root 未解析）。
@@ -441,22 +450,6 @@ namespace sunpack::sevenzip
         VolumeSpaceTransition make_transition_locked(VolumeSpaceTransition::Kind kind,
                                                      bool discontinuity) const;
         void emit_transitions(const std::vector<VolumeSpaceTransition> &transitions) noexcept;
-        // Ready → Blocked 时的一次【新鲜】查询 + 提交。**必须在 mutex_ 之外调用**。
-        //
-        // ⚠️ 已接受的 v1 限制（架构师第三轮）：这次查询虽然不在 gate 锁内，但仍然由
-        //    **当前 writer 线程同步执行**。若输出是失联 UNC / 坏网络盘 / 某些过滤驱动，
-        //    `GetDiskFreeSpaceExW` 可能长时间不返回，于是这个 writer 线程被卡住，
-        //    shutdown 最终仍要等它 —— T-WIN-20 用的是本地 VHD，测不到这一种。
-        //
-        //    架构上唯一**必须**非阻塞的是 monitor 侧的查询（§4.4.2：绝不在 executor
-        //    mutex_ 内查询，否则 submit/cancel/admission 全被堵住），那一条已经满足。
-        //
-        //    彻底解法（需要改冻结架构，未采纳）：**所有 free-space query 都只让 monitor
-        //    做** —— 首次失败直接 `watermark_valid=false → Blocked → 立即发事件`，
-        //    monitor 第一次成功采样即 baseline 并允许一次 probe；这样可以删掉
-        //    commit_fresh_watermark()，writer 永不调用空间查询。
-        void commit_fresh_watermark(std::uint64_t episode_token,
-                                    const std::wstring &query_path) noexcept;
 
         mutable std::mutex mutex_;
         std::condition_variable cv_;
@@ -595,14 +588,14 @@ namespace sunpack::sevenzip
     {
         std::vector<VolumeSpaceTransition> transitions;
         bool opened_episode = false;
-        std::uint64_t episode_token = 0;
-        std::wstring query_path;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
             last_win32_error_ = win32_error;
 
             // synthetic 卷：首次空间错误时就用真实失败路径就地解析查询根。
+            // ⚠️ 这里只做**路径解析**（`GetVolumePathNameW`，不是查询），
+            //    磁盘可用空间由 monitor 独占查询 —— writer 线程永不查询。
             if (!query_root_resolved_ && !failed_path.empty())
             {
                 std::wstring resolved;
@@ -619,15 +612,36 @@ namespace sunpack::sevenzip
                 phase_ = VolumeSpacePhase::Blocked;
                 // 水位必须**按 episode 重新建立**：跨 episode 永久单调会让
                 // "ep1 失败于 500 MiB、ep2 失败于 10 MiB"的用户即使释放到 200 MiB
-                // 也永远不 probe。
+                // 也永远不 probe。置为无效后由 monitor 的第一次成功采样建立 baseline。
                 watermark_valid_ = false;
                 failed_free_watermark_ = 0;
                 probe_owner_token_ = 0;
-                blocked_event_emitted_ = false; // 初始 blocked 事件还没生成
+                blocked_event_emitted_ = false;
                 blocked_since_ = std::chrono::steady_clock::now();
                 opened_episode = true;
-                episode_token = episode_id_;
-                query_path = query_root_;
+
+                // ★ 事件在**同一把锁内**生成，出锁后立即发送。
+                //
+                //   于是"进入 Blocked"与"blocked 事件可见"之间**没有任何**可被他人
+                //   插队的窗口 —— 这从构造上消灭了两个问题：
+                //     1) 架构师第八轮 P1："恢复之后才加入 affected_jobs_ 的新 job
+                //        收到迟到 blocked"（它没收到过 resumed，会让 Python 的
+                //        space_waiting 永久为真）。旧实现要在锁外做新鲜查询，那个
+                //        窗口里 monitor 完全可能 poll→Probing→probe 成功→Ready；
+                //     2) 与 register_job() 补发重复投递同 episode 的 blocked。
+                //   下面的 `phase_ != Ready` 判断在当前实现下恒为真（同一把锁内没
+                //   有人能改回 Ready），保留它是为了**防止将来有人把事件生成挪到
+                //   锁外时这个 bug 重新长回来**。
+                if (phase_ != VolumeSpacePhase::Ready)
+                {
+                    transitions.push_back(make_transition_locked(
+                        VolumeSpaceTransition::Kind::Blocked, /*discontinuity=*/true));
+                    blocked_event_emitted_ = true;
+                }
+                else
+                {
+                    blocked_event_emitted_ = false;
+                }
             }
             // Blocked / Probing：只更新失败证据（last_win32_error_ 已记录）。
             // ★ Probing 期间绝不夺走现有 probe ownership —— "盘是否已恢复"的裁决权
@@ -635,64 +649,9 @@ namespace sunpack::sevenzip
             //   还是满的"，是有效证据但不推翻正在进行的 probe。
         }
 
-        if (opened_episode)
-        {
-            // ★ 新鲜查询在 gate mutex_ **之外**执行（§4.2.4.1）。
-            //   wait() / wake_waiters() 是取消与关停的必经路径，让它们被一次慢查询
-            //   （离线 UNC 可能卡几秒）堵住是不可接受的。校验成本只是一个 uint64 比较。
-            commit_fresh_watermark(episode_token, query_path);
-
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (episode_id_ == episode_token)
-                {
-                    transitions.push_back(make_transition_locked(
-                        VolumeSpaceTransition::Kind::Blocked, /*discontinuity=*/true));
-                    blocked_event_emitted_ = true;
-                }
-            }
-        }
-
         cv_.notify_all();
         emit_transitions(transitions);
         return opened_episode;
-    }
-
-    inline void VolumeSpaceGate::commit_fresh_watermark(
-        std::uint64_t episode_token, const std::wstring &query_path) noexcept
-    {
-        std::uint64_t free_bytes = 0;
-        std::uint64_t total_bytes = 0;
-        bool queried = false;
-        // 空路径不调用 API，因此**不能**读 GetLastError()（那是别的调用留下的陈旧值）。
-        unsigned long query_error = ERROR_PATH_NOT_FOUND;
-        if (!query_path.empty())
-        {
-            queried = query_volume_free_bytes(query_path, &free_bytes, &total_bytes);
-            query_error = queried ? 0UL : GetLastError();
-        }
-
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (episode_id_ != episode_token)
-        {
-            // 期间 episode 已被他人改动 → 丢弃本次结果，不修改任何状态。
-            return;
-        }
-        last_query_ok_ = queried;
-        last_query_error_ = queried ? 0UL : query_error;
-        if (queried)
-        {
-            last_free_bytes_ = free_bytes;
-            // "first evidence wins"：若 monitor 已经用一次同样新鲜的成功采样建立了
-            // baseline，就不要用更旧的值覆盖它。
-            if (!watermark_valid_)
-            {
-                failed_free_watermark_ = free_bytes;
-                watermark_valid_ = true;
-            }
-        }
-        // 查询失败 → 保持 watermark_valid_ = false（不猜）。此时 poll() 会把第一次
-        // 成功观测设为 baseline 并立即发放一次许可。
     }
 
     inline VolumeSpaceGate::WaitResult VolumeSpaceGate::wait(
@@ -882,8 +841,6 @@ namespace sunpack::sevenzip
     inline void VolumeSpaceGate::settle_space_failure(
         std::uint64_t token, unsigned long win32_error, std::wstring_view failed_path) noexcept
     {
-        std::uint64_t episode_token = 0;
-        std::wstring query_path;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!owns_probe_locked(token))
@@ -902,35 +859,10 @@ namespace sunpack::sevenzip
                     query_root_resolved_ = true;
                 }
             }
-            episode_token = episode_id_;
-            query_path = query_root_;
-        }
-
-        // 同 episode 内 probe 失败：再做一次【新鲜】查询（同样在锁外），
-        // watermark = max(watermark, fresh)。**sink 不上报**（同一 episode 内去重）。
-        std::uint64_t free_bytes = 0;
-        std::uint64_t total_bytes = 0;
-        bool queried = false;
-        unsigned long query_error = ERROR_PATH_NOT_FOUND;
-        if (!query_path.empty())
-        {
-            queried = query_volume_free_bytes(query_path, &free_bytes, &total_bytes);
-            query_error = queried ? 0UL : GetLastError();
-        }
-
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (episode_id_ == episode_token)
-            {
-                last_query_ok_ = queried;
-                last_query_error_ = queried ? 0UL : query_error;
-                if (queried)
-                {
-                    last_free_bytes_ = free_bytes;
-                    failed_free_watermark_ = (std::max)(failed_free_watermark_, free_bytes);
-                    watermark_valid_ = true;
-                }
-            }
+            // ★ 这里**不做**新鲜查询（架构师第三轮"彻底解法"）。
+            //   水位保持为"授权这次 probe 的那次 monitor 采样值"，因此下一次许可
+            //   仍然要求一次**严格更高**的 monitor 采样 —— 语义与旧实现一致，
+            //   但查询完全回到 monitor 线程上（probe owner 永不做磁盘查询）。
         }
         cv_.notify_all();
     }

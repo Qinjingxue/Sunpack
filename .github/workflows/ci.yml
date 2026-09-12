@@ -40,7 +40,9 @@ jobs:
 
       - name: Prepare native/tool environment
         shell: pwsh
-        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -SkipAcceptanceTestTools
+        # lite: this lane has no model work, so pulling the full repair-system
+        # (torch / torch-geometric) would be several minutes of dead weight.
+        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -RepairSystem lite -SkipAcceptanceTestTools
 
       - name: Configure
         shell: pwsh
@@ -123,11 +125,20 @@ jobs:
       # preparation steps as the native job.
       - name: Prepare native/tool environment
         shell: pwsh
-        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -SkipAcceptanceTestTools
+        # lite: this lane has no model work, so pulling the full repair-system
+        # (torch / torch-geometric) would be several minutes of dead weight.
+        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -RepairSystem lite -SkipAcceptanceTestTools
 
-      - name: Build native worker and 7z wrapper
+      # setup_windows_dev.ps1 already builds and copies the worker + 7z wrapper into
+      # tools/ (its Build-SevenZipWrapper step) and runs CTest. There is no separate
+      # build step here on purpose: an earlier revision called
+      # `build_windows.ps1 -SkipInstaller`, but that parameter does not exist, so this
+      # job failed for real in CI before ever reaching pytest.
+      - name: Verify worker artifacts
         shell: pwsh
-        run: .\scripts\build_windows.ps1 -Arch x64 -SkipInstaller
+        run: |
+          & .venv\Scripts\python.exe -c "from sunpack.support.resources import get_sevenzip_bridge_worker_path, get_7z_dll_path; import os, sys; w = get_sevenzip_bridge_worker_path(); d = get_7z_dll_path(); print('worker:', w); print('7z.dll:', d); sys.exit(0 if os.path.exists(w) and os.path.exists(d) else 1)"
+          if ($LASTEXITCODE -ne 0) { throw "native worker artifacts missing after setup" }
 
       - name: Run test suite
         shell: pwsh
@@ -168,11 +179,19 @@ jobs:
 
       - name: Prepare native/tool environment
         shell: pwsh
-        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -SkipAcceptanceTestTools
+        # lite: this lane has no model work, so pulling the full repair-system
+        # (torch / torch-geometric) would be several minutes of dead weight.
+        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -RepairSystem lite -SkipAcceptanceTestTools
 
-      - name: Build Windows package
+      # No separate build step: setup_windows_dev.ps1 already creates the worker,
+      # 7z.dll and the wrapper in tools/. An earlier revision called
+      # `build_windows.ps1 -SkipInstaller` here -- a parameter that does not exist,
+      # which is exactly how this lane failed for real in CI.
+      - name: Verify worker artifacts
         shell: pwsh
-        run: .\scripts\build_windows.ps1 -Arch x64 -SkipInstaller
+        run: |
+          & .venv\Scripts\python.exe -c "from sunpack.support.resources import get_sevenzip_bridge_worker_path, get_7z_dll_path; import os, sys; w = get_sevenzip_bridge_worker_path(); d = get_7z_dll_path(); print('worker:', w); print('7z.dll:', d); sys.exit(0 if os.path.exists(w) and os.path.exists(d) else 1)"
+          if ($LASTEXITCODE -ne 0) { throw "native worker artifacts missing after setup" }
 
       # The VHD lands on the runner's temp drive; each test creates, attaches,
       # fills, releases, detaches and deletes its own disk.
