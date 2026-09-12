@@ -1,4 +1,5 @@
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -12,12 +13,13 @@ from tests.helpers.generated_fixtures import build_cli_pipeline_fixture
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
-def run_cli(*args):
+def run_cli(*args, cwd=None):
     return subprocess.run(
         [sys.executable, "-B", str(PROJECT_ROOT / "sunpack.py"), *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
+        cwd=cwd,
     )
 
 
@@ -183,6 +185,62 @@ class CliBasicTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("--analyze", result.stdout)
 
+    def test_extract_out_dir_places_output_below_the_given_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            archive = root / "payload.zip"
+            with zipfile.ZipFile(archive, "w") as zf:
+                zf.writestr("marker.txt", "routed")
+            out_dir = root / "elsewhere" / "out"
+
+            result = run_cli(
+                "extract",
+                "--json",
+                "--direct-file",
+                "--out-dir",
+                str(out_dir),
+                "--cleanup",
+                "k",
+                str(archive),
+                "--no-pause",
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            payload = json.loads(result.stdout)
+            self.assertEqual(payload["summary"]["success_count"], 1)
+            self.assertEqual(
+                payload["inputs"]["config_overrides"]["output_dir"],
+                str(out_dir.resolve()),
+            )
+            self.assertEqual(
+                (out_dir / "payload" / "marker.txt").read_text(encoding="utf-8"),
+                "routed",
+            )
+            self.assertFalse((root / "payload").exists())
+
+    def test_extract_out_dir_is_resolved_to_an_absolute_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fixture = build_cli_pipeline_fixture(root)
+            request_dir = root / "request"
+            request_dir.mkdir()
+
+            result = run_cli(
+                "extract",
+                "--json",
+                "--out-dir",
+                "relative-out",
+                "--no-pause",
+                str(fixture),
+                cwd=str(request_dir),
+            )
+
+            payload = json.loads(result.stdout)
+            self.assertEqual(
+                payload["inputs"]["config_overrides"]["output_dir"],
+                str((request_dir / "relative-out").resolve()),
+            )
+
     def test_watch_help_documents_watchdog_options(self):
         result = run_cli("watch", "-h")
 
@@ -191,6 +249,12 @@ class CliBasicTests(unittest.TestCase):
         self.assertIn("start", result.stdout)
         self.assertIn("list", result.stdout)
         self.assertIn("startup", result.stdout)
+
+    def test_watch_add_help_documents_the_output_directory_option(self):
+        result = run_cli("watch", "add", "-h")
+
+        self.assertEqual(result.returncode, 0)
+        self.assertIn("--output-dir", result.stdout)
 
     def test_passwords_help_only_shows_password_relevant_options(self):
         result = run_cli("passwords", "-h")

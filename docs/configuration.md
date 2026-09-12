@@ -237,6 +237,7 @@ native worker 启动时采集逻辑处理器数和可用物理内存。线程容
 | `quiet_min_seconds` | `float` | 取得首个有效间隔后，动态静默时间的下限，默认 2.5 秒。它可以高于冷启动时间。 |
 | `quiet_max_seconds` | `float` | 动态静默时间上限，默认 180 秒。 |
 | `recursive` | `bool` | 是否递归监控目录。 |
+| `out_dir` | `string` | 监控输出的默认根目录，默认 `.`（即输出到各自输入目录旁）。相对路径相对于对应的输入目录解析。单个监控目录可以用监控目录文件里的 `输入 | 输出` 形式覆盖它。 |
 | `initial_scan` | `bool` | 启动 watcher 时是否扫描已有文件。 |
 | `max_folders` | `int` | 单次 watch 接受的最大路径数量。 |
 | `observer_stop_timeout_seconds` | `float` | 停止 watchdog observer 时等待线程退出的超时。 |
@@ -247,6 +248,8 @@ native worker 启动时采集逻辑处理器数和可用物理内存。线程容
 watch 不按扩展名或下载器类型推测下载状态。`created`、`moved`、`modified` 事件使输入进入活跃态；首次使用 `cold_start_seconds`，取得首个有效内容变化间隔后立即进入不低于 `quiet_min_seconds` 的动态区间，随后按该文件最近 12 次实际内容变化的最大间隔调整。长间隔会立即拉长，缩短时每次只向目标移动一部分，最终受 `quiet_min_seconds` 和 `quiet_max_seconds` 限制。只有 size 或 mtime 变化的事件参与间隔学习，但其他内容事件仍会重置当前静默计时。每个活跃周期只触发一次主流程；普通成功、部分成功和失败都不会自行重试。新分卷到达或密码源变化会把受影响的输入重新置为活跃态。
 
 watch 的试解压输出位于监控根目录下的 `.sunpack_watch_probes`。该顶层目录在 watcher 运行和多次尝试之间保持存在；启动恢复以及每次尝试结束时只清理其内部工作内容，避免监控目录因为顶层临时目录反复创建、删除而刷新。完整成功始终提升到正式输出目录；部分成功按 `partial_output_policy` 清理或提升；失败始终清理试解压工作内容。
+
+每个监控目录可以在监控目录文件 `sunpack_watch_roots.txt` 中单独指定输出根目录（`输入 | 输出`，输出可跨盘）；没有指定时使用 `watch.out_dir` 的默认值。`watch.out_dir` 是相对路径时相对于对应输入目录解析，因此它同时是“输入输出同目录”的默认值，也是旧的单全局输出目录行为。试解压工作区始终在输入目录下，与该目录配置的输出根目录无关；提升到其他卷时走跨卷移动。
 
 ## extraction
 

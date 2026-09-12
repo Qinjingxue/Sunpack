@@ -57,9 +57,12 @@ python sunpack.py extract [options] <paths...>
 | `--no-builtin-pw` | 禁用内置高频密码表。 |
 | `--recur VALUE` | 覆盖递归解压设置。当前解析器接受正整数、`*`、`?`。 |
 | `--cleanup VALUE` | 覆盖成功解压后的原压缩包处理方式：`d` 删除，`r` 回收站，`k` 不动。 |
+| `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录。相对路径基于调用目录解析为绝对路径。 |
 | `--direct-file` | 把每个输入路径当作归档文件，跳过初始目录扫描和 detection，直接进入 analysis -> extraction -> verification/repair -> postprocess。只适合明确指定文件。 |
 | `--flatten` | 解压后扁平化单一顶层目录。 |
 | `--no-flatten` | 保留解压目录结构。 |
+
+`--out-dir` 指定输出根目录后，解压结果落在 `输出根目录 / 输入路径相对 common_root 的部分 / 压缩包名`；不指定时落在压缩包旁边。嵌套压缩包如果在输出根目录内部生成，其子压缩包仍然解压在自己旁边。
 
 `--recur` 的取值：
 
@@ -75,6 +78,7 @@ python sunpack.py extract D:\A.7z -p 123456 -p secret
 python sunpack.py extract D:\Archives --pw-file .\passwords.txt --cleanup r
 python sunpack.py extract D:\Nested --recur * --no-flatten
 python sunpack.py extract --direct-file D:\MaybeArchive.bin
+python sunpack.py extract D:\Archives -o E:\Unpacked
 ```
 
 退出码：
@@ -137,18 +141,43 @@ python sunpack.py inspect D:\Downloads -v
 用法：
 
 ```powershell
-python sunpack.py watch [options] <paths...>
+python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
 ```
 
 `watch` 会监听一个或多个文件夹。服务启动时只创建一个常驻 pipeline engine 和一个 native worker；文件持续静默达到配置阈值后提交到 engine，多个提交直接进入 worker 内部队列，由 worker 的线程调度器统一处理。相同快照不因解压结果而重试，新分卷和密码源变化会开启新的活跃周期。
 
-常用参数与 `extract` 基本一致，包括密码、输出目录、递归、清理策略、JSON/quiet/verbose/pause 等。worker 初始并发由 CPU 和可用内存自动计算。
+监控目录本身存放在程序目录下的 `sunpack_watch_roots.txt`，一行一个目录。每行可以只写输入目录，也可以用 `|` 分隔显式指定该目录的输出根目录：
+
+```text
+C:\Downloads
+E:\Archives | E:\Output
+F:\Incoming | .
+```
+
+- `C:\Downloads`：输入输出同路径（沿用 `watch.out_dir`，默认为 `.`）。
+- `E:\Archives | E:\Output`：完全独立的输出根目录，可以跨盘。
+- `F:\Incoming | .`：显式写成本身，等价于只写输入目录。
+- 相对输出路径相对于它所在行的输入目录解析，因此不受 watch 服务进程工作目录影响。
+- 解压始终先在同一输入目录下的 `.sunpack_watch_probes` 中进行，成功后再提升（promotion）到输出根目录；跨盘时自动退化为跨卷移动。
+
+`add` 子命令：
+
+| 参数 | 说明 |
+| --- | --- |
+| `-o OUTPUT_DIR`, `--output-dir OUTPUT_DIR` | 为该目录指定输出根目录。一次只能添加一个目录，多个目录请直接编辑监控目录文件。 |
+| `--start` | 添加后启动 watch。 |
+| `--initial-scan` | 添加后扫描目录中已有文件。 |
+
+`list` 和 `status` 会按 `输入 | 输出` 的形式列出监控目录。`remove` 只按输入目录删除，输出根目录中的内容不会被删除。
 
 示例：
 
 ```powershell
-python sunpack.py watch D:\Downloads --out-dir D:\Unpacked
-python sunpack.py watch D:\Incoming -p 123456 --cleanup r --recur *
+python sunpack.py watch add D:\Downloads -o E:\Unpacked
+python sunpack.py watch add D:\Incoming --initial-scan
+python sunpack.py watch list
+python sunpack.py watch start --initial-scan
+python sunpack.py watch reload
 ```
 
 ## passwords

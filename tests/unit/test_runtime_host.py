@@ -88,7 +88,7 @@ def test_runtime_host_owns_watch_and_switches_host_and_worker_qos(monkeypatch):
             self.reloads += 1
             return True
 
-        async def add_roots(self, paths, *, initial_scan=True):
+        async def add_roots(self, paths, *, outputs=None, initial_scan=True):
             return {"roots_path": "roots.txt", "added": list(paths), "applied": True}
 
         async def remove_roots(self, paths):

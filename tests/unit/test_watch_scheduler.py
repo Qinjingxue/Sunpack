@@ -2025,6 +2025,86 @@ def test_relative_output_directory_is_resolved_per_matching_watch_root(tmp_path,
     assert captured["output"]["common_root"] == str(second_root.resolve())
 
 
+def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    first_out = tmp_path / "out-first"
+    second_out = tmp_path / "elsewhere" / "out-second"
+    archive_path = second_root / "sample.zip"
+    _write_zip(archive_path)
+    captured = {}
+
+    class SuccessRunner:
+        recent_passwords = []
+
+        def __init__(self, config):
+            self.output_dir = Path(config["output"]["root"]) / "sample"
+            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)}, recovered_outputs=[])
+
+        def run_targets(self, paths):
+            captured["probe_root"] = self.output_dir
+            self.output_dir.mkdir(parents=True)
+            (self.output_dir / "payload.bin").write_bytes(b"payload")
+            return _watch_summary(paths[0], OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
+
+    watcher = WatchScheduler(
+        {"watch": {"clipboard_monitor_enabled": False}},
+        [str(first_root), str(second_root)],
+        out_dir=str(tmp_path / "legacy-out"),
+        output_roots={
+            str(first_root): str(first_out),
+            str(second_root): str(second_out),
+        },
+        state_path=str(first_root / ".sunpack_watch" / "state.json"),
+        quiet_seconds=0,
+        initial_scan=False,
+        pipeline_engine=FakePipelineEngine(SuccessRunner),
+    )
+    watcher.enqueue(str(archive_path))
+
+    result = _await(watcher.run_once())
+
+    assert result.succeeded == 1
+    # Compression still runs in the probe workspace below the input root, so the
+    # promotion stays a rename; only the promoted output moves to the configured
+    # output root.
+    assert captured["probe_root"].is_relative_to(second_root / ".sunpack_watch_probes")
+    assert list(second_out.rglob("payload.bin"))
+    assert not (tmp_path / "legacy-out").exists()
+    assert not list(first_out.rglob("payload.bin"))
+
+
+def test_watch_root_without_configured_output_keeps_the_global_out_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    watch_root = tmp_path / "in"
+    watch_root.mkdir()
+    archive_path = watch_root / "sub" / "sample.zip"
+    archive_path.parent.mkdir()
+    _write_zip(archive_path)
+
+    def output_root_for(out_dir, output_roots):
+        watcher = WatchScheduler(
+            {},
+            [str(watch_root)],
+            out_dir=out_dir,
+            output_roots=output_roots,
+            state_path=str(tmp_path / "state.json"),
+            quiet_seconds=0,
+            initial_scan=False,
+        )
+        return watcher._output_root_for(str(archive_path))
+
+    # A roots line that names only the input root stays exactly as it always
+    # behaved: output goes next to the input when watch.out_dir is ".".
+    assert output_root_for(".", None) == str(watch_root.resolve())
+    assert output_root_for(str(tmp_path / "global-out"), None) == str((tmp_path / "global-out").resolve())
+    # Writing the input root explicitly means the same thing.
+    assert output_root_for(".", {str(watch_root): str(watch_root)}) == str(watch_root.resolve())
+
+
 def test_watch_scheduler_initial_scan_ignores_nested_archives(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 

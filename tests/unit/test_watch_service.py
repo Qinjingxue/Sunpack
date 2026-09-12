@@ -50,7 +50,7 @@ def test_watch_service_forces_complete_content_policy_for_pipeline_engine(tmp_pa
             },
         },
     )
-    monkeypatch.setattr(service_module, "read_watch_roots", lambda: [str(tmp_path)])
+    monkeypatch.setattr(service_module, "read_watch_root_entries", lambda: ([str(tmp_path)], {}))
 
     class Engine:
         async def __aenter__(self):
@@ -95,7 +95,7 @@ def test_watch_service_attaches_and_releases_toast_with_watch_lifecycle(tmp_path
         },
     }
     monkeypatch.setattr(service_module, "load_config", lambda: config)
-    monkeypatch.setattr(service_module, "read_watch_roots", lambda: [str(tmp_path)])
+    monkeypatch.setattr(service_module, "read_watch_root_entries", lambda: ([str(tmp_path)], {}))
     captured = {}
 
     class Engine:
@@ -162,7 +162,7 @@ def test_scheduler_restart_keeps_unchanged_toast_manager(tmp_path, monkeypatch):
         }
     }
     monkeypatch.setattr(service_module, "load_config", lambda: config)
-    monkeypatch.setattr(service_module, "read_watch_roots", lambda: [str(tmp_path)])
+    monkeypatch.setattr(service_module, "read_watch_root_entries", lambda: ([str(tmp_path)], {}))
 
     class Scheduler:
         def __init__(self, *_args, **_kwargs):
@@ -248,7 +248,7 @@ def test_watch_runtime_delegates_start_to_runtime_host(monkeypatch):
 
 
 def test_watch_add_reports_start_request_without_creating_watch_process(tmp_path, monkeypatch):
-    monkeypatch.setattr(watch_command, "add_watch_roots", lambda paths: (tmp_path / "roots.txt", paths))
+    monkeypatch.setattr(watch_command, "add_watch_roots", lambda paths, outputs=None: (tmp_path / "roots.txt", paths))
 
     class FakeHost:
         watch_enabled = False
@@ -278,7 +278,7 @@ def test_watch_add_applies_directly_to_running_service(tmp_path, monkeypatch):
     class FakeHost:
         watch_enabled = True
 
-        async def add_watch_roots(self, paths, *, initial_scan=True):
+        async def add_watch_roots(self, paths, *, outputs=None, initial_scan=True):
             calls.append((list(paths), initial_scan))
             return {
                 "roots_path": str(tmp_path / "roots.txt"),
@@ -805,6 +805,138 @@ def test_remove_watch_root_cleans_service_owned_artifacts(tmp_path, monkeypatch)
     assert (other_root / ".sunpack_watch_probes").exists()
 
 
+def test_watch_roots_file_records_an_output_root_per_input_root(tmp_path, monkeypatch):
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    first = tmp_path / "downloads"
+    second = tmp_path / "archives"
+    other_drive = tmp_path / "elsewhere"
+    first.mkdir()
+    second.mkdir()
+    other_drive.mkdir()
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    service_module.add_watch_roots([str(first)], {str(first): str(other_drive)})
+    service_module.add_watch_roots([str(second)], {str(second): "."})
+
+    roots, root_outputs = service_module.read_watch_root_entries()
+    assert roots == [str(first.resolve()), str(second.resolve())]
+    assert root_outputs == {
+        service_module.path_key(str(first.resolve())): str(other_drive.resolve()),
+        service_module.path_key(str(second.resolve())): str(second.resolve()),
+    }
+    assert "|" in roots_path.read_text(encoding="utf-8")
+
+
+def test_watch_roots_file_resolves_relative_output_against_its_input_root(tmp_path, monkeypatch):
+    program_dir = tmp_path / "program"
+    working_dir = tmp_path / "windows-system-directory"
+    program_dir.mkdir()
+    working_dir.mkdir()
+    roots_path = program_dir / "sunpack_watch_roots.txt"
+    watch_root = tmp_path / "downloads"
+    nested_root = watch_root / "nested"
+    nested_root.mkdir(parents=True)
+    roots_path.write_text(
+        f"{watch_root} | extracted\n{nested_root} | D:\\Out\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(working_dir)
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    roots, root_outputs = service_module.read_watch_root_entries()
+
+    assert roots == [str(watch_root.resolve()), str(nested_root.resolve())]
+    assert root_outputs[service_module.path_key(str(watch_root.resolve()))] == str(
+        (watch_root / "extracted").resolve()
+    )
+    assert root_outputs[service_module.path_key(str(nested_root.resolve()))] == "D:\\Out"
+
+
+def test_add_watch_root_is_idempotent_without_output_and_still_sets_output_otherwise(tmp_path, monkeypatch):
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    _, added = service_module.add_watch_roots([str(watch_root), str(watch_root)])
+    _, readded = service_module.add_watch_roots([str(watch_root)])
+    _, updated = service_module.add_watch_roots([str(watch_root)], {str(watch_root): "extracted"})
+
+    assert added == [str(watch_root.resolve())]
+    assert readded == []
+    assert updated == []
+    _, root_outputs = service_module.read_watch_root_entries()
+    assert root_outputs[service_module.path_key(str(watch_root.resolve()))] == str(
+        (watch_root / "extracted").resolve()
+    )
+
+
+def test_removing_watch_root_drops_only_its_output_root(tmp_path, monkeypatch):
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    first = tmp_path / "downloads"
+    second = tmp_path / "archives"
+    first.mkdir()
+    second.mkdir()
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+    service_module.add_watch_roots([str(first)], {str(first): str(tmp_path / "out-first")})
+    service_module.add_watch_roots([str(second)], {str(second): str(tmp_path / "out-second")})
+
+    service_module.remove_watch_roots([str(first)])
+
+    roots, root_outputs = service_module.read_watch_root_entries()
+    assert roots == [str(second.resolve())]
+    assert list(root_outputs) == [service_module.path_key(str(second.resolve()))]
+
+
+def test_watch_roots_lines_without_output_keep_the_configured_out_dir(tmp_path, monkeypatch):
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    roots_path.write_text(f"# comment\n\n{watch_root}\n", encoding="utf-8")
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    roots, root_outputs = service_module.read_watch_root_entries()
+
+    assert roots == [str(watch_root.resolve())]
+    assert root_outputs == {}
+
+
+def test_watch_service_scheduler_receives_root_outputs(tmp_path, monkeypatch):
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    roots_path.write_text(f"{watch_root} | D:\\Extracted\n", encoding="utf-8")
+    state_dir = tmp_path / ".sunpack_watch"
+    captured = {}
+
+    class FakeScheduler:
+        def __init__(self, config, roots, **kwargs):
+            captured["roots"] = roots
+            captured["kwargs"] = kwargs
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+    monkeypatch.setattr(
+        service_module,
+        "load_config",
+        lambda: {"watch": {"state_dir": str(state_dir), "out_dir": ".", "tray_enabled": False}},
+    )
+    monkeypatch.setattr(service_module, "WatchScheduler", FakeScheduler)
+
+    service = WatchService(engine_factory=lambda _config: FakePipelineEngine(FakeRunner))
+    _await(service._start_scheduler())
+
+    assert captured["roots"] == [str(watch_root.resolve())]
+    assert captured["kwargs"]["output_roots"] == {
+        service_module.path_key(str(watch_root.resolve())): "D:\\Extracted"
+    }
+
+
 def test_remove_unmonitored_root_skips_artifact_cleanup(tmp_path, monkeypatch):
     roots_path = tmp_path / "sunpack_watch_roots.txt"
     target = tmp_path / "not-watched"
@@ -898,9 +1030,9 @@ def test_watch_roots_add_is_serialized_across_concurrent_callers(tmp_path, monke
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
     original_write = service_module._write_watch_roots_unlocked
 
-    def slow_write(roots, path):
+    def slow_write(roots, path, **kwargs):
         time.sleep(0.05)
-        return original_write(roots, path)
+        return original_write(roots, path, **kwargs)
 
     monkeypatch.setattr(service_module, "_write_watch_roots_unlocked", slow_write)
     threads = [
@@ -1026,7 +1158,7 @@ def test_watch_service_passes_direct_scan_roots_to_scheduler(tmp_path, monkeypat
             }
         },
     )
-    monkeypatch.setattr(service_module, "read_watch_roots", lambda: [str(watch_root)])
+    monkeypatch.setattr(service_module, "read_watch_root_entries", lambda: ([str(watch_root)], {}))
     monkeypatch.setattr(service_module, "WatchScheduler", FakeScheduler)
     service = WatchService(engine_factory=lambda _config: Engine())
     _await(service._start_scheduler(initial_scan_roots=[str(requested_root)]))
@@ -1072,6 +1204,65 @@ def test_watch_service_waits_indefinitely_when_scheduler_is_idle(tmp_path, monke
     service._control_queue.put_nowait(CONTROL_STOP)
     assert _await(service.run()) == 0
     assert len(scheduler_runs) == 1
+
+
+def test_watch_add_pins_the_requested_output_dir_and_list_shows_it(tmp_path, monkeypatch):
+    from sunpack.cli.cli import build_cli_parser
+    from sunpack.cli.cli_context import CliContext
+    from sunpack.cli import runtime_state
+
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    class FakeHost:
+        watch_enabled = False
+
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    args = build_cli_parser(CliContext(language="en")).parse_args(
+        ["watch", "add", str(watch_root), "--output-dir", "extracted"]
+    )
+
+    code, result = _await(watch_command._handle_add(args, SimpleNamespace(cwd=str(tmp_path), t=lambda key, **_: key)))
+
+    assert code == 0
+    assert result.summary["added"] == [str(watch_root.resolve())]
+    assert roots_path.read_text(encoding="utf-8").splitlines() == [f"{watch_root.resolve()} | extracted"]
+    _, _, root_outputs = service_module.list_watch_root_entries()
+    assert root_outputs == {
+        service_module.path_key(str(watch_root.resolve())): str((watch_root / "extracted").resolve())
+    }
+
+    list_code, listed = watch_command._handle_list()
+
+    assert list_code == 0
+    assert listed.items == [
+        f"{watch_root.resolve()} | {watch_root / 'extracted'}"
+    ]
+
+
+def test_watch_add_rejects_one_output_dir_for_several_roots(tmp_path, monkeypatch):
+    from sunpack.cli.cli import build_cli_parser
+    from sunpack.cli.cli_context import CliContext
+    from sunpack.cli import runtime_state
+
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    class FakeHost:
+        watch_enabled = False
+
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    args = build_cli_parser(CliContext(language="en")).parse_args(
+        ["watch", "add", "C:/one", "C:/two", "--output-dir", "extracted"]
+    )
+
+    code, result = _await(watch_command._handle_add(args, SimpleNamespace(cwd=str(tmp_path), t=lambda key, **_: key)))
+
+    assert code != 0
+    assert result.errors == ["cli.watch.output_dir_single_path"]
+    assert not roots_path.exists()
 
 
 def test_watch_service_recalculates_deadline_after_scheduler_wakeup(tmp_path, monkeypatch):
