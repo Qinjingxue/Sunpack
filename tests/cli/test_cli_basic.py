@@ -209,8 +209,8 @@ class CliBasicTests(unittest.TestCase):
             payload = json.loads(result.stdout)
             self.assertEqual(payload["summary"]["success_count"], 1)
             self.assertEqual(
-                payload["inputs"]["config_overrides"]["output_dir"],
-                str(out_dir.resolve()),
+                Path(payload["inputs"]["config_overrides"]["output_dir"]).resolve(),
+                out_dir.resolve(),
             )
             self.assertEqual(
                 (out_dir / "payload" / "marker.txt").read_text(encoding="utf-8"),
@@ -237,8 +237,8 @@ class CliBasicTests(unittest.TestCase):
 
             payload = json.loads(result.stdout)
             self.assertEqual(
-                payload["inputs"]["config_overrides"]["output_dir"],
-                str((request_dir / "relative-out").resolve()),
+                Path(payload["inputs"]["config_overrides"]["output_dir"]).resolve(),
+                (request_dir / "relative-out").resolve(),
             )
 
     def test_watch_help_documents_watchdog_options(self):
