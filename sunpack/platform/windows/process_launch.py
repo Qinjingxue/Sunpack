@@ -6,7 +6,7 @@ import subprocess
 from ctypes import wintypes
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from sunpack.platform.windows.elevation import is_process_elevated
 
@@ -102,16 +102,38 @@ class NativeProcess:
             _kernel32().CloseHandle(handle)
 
 
-def launch_unelevated(argv: Sequence[str], *, cwd: str | None = None):
+def _environment_block(environment: Mapping[str, str]) -> ctypes.Array:
+    """Build a UTF-16 Windows environment block for CreateProcessWithTokenW."""
+    entries: list[str] = []
+    for name, value in environment.items():
+        name_text = str(name)
+        value_text = str(value)
+        if "\x00" in name_text or "\x00" in value_text:
+            raise ValueError("environment names and values cannot contain NUL characters")
+        entries.append(f"{name_text}={value_text}")
+
+    entries.sort(key=lambda entry: entry.split("=", 1)[0].casefold())
+    block = "\x00".join(entries) + "\x00\x00"
+    return ctypes.create_unicode_buffer(block)
+
+
+def launch_unelevated(
+    argv: Sequence[str],
+    *,
+    cwd: str | None = None,
+    env: Mapping[str, str] | None = None,
+):
     """Start a process with the interactive shell's medium-integrity token."""
 
     command = [str(item) for item in argv if str(item)]
     if not command:
         raise ValueError("launch_unelevated requires an executable")
+    environment = dict(os.environ if env is None else env)
     if not is_process_elevated():
         return subprocess.Popen(
             command,
             cwd=cwd,
+            env=environment,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
@@ -154,6 +176,7 @@ def launch_unelevated(argv: Sequence[str], *, cwd: str | None = None):
         )
         process = PROCESS_INFORMATION()
         command_line = ctypes.create_unicode_buffer(subprocess.list2cmdline(command))
+        environment_block = _environment_block(environment)
         executable = os.path.abspath(command[0])
         working_directory = os.path.abspath(cwd) if cwd else os.path.dirname(executable)
         if not _advapi32().CreateProcessWithTokenW(
@@ -162,7 +185,7 @@ def launch_unelevated(argv: Sequence[str], *, cwd: str | None = None):
             executable,
             command_line,
             CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW,
-            None,
+            ctypes.cast(environment_block, ctypes.c_void_p),
             working_directory,
             ctypes.byref(startup),
             ctypes.byref(process),

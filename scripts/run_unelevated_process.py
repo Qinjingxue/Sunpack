@@ -106,7 +106,11 @@ def main(argv: list[str] | None = None) -> int:
         "--",
         *args.command,
     ]
-    process = launch_unelevated(helper_command, cwd=cwd)
+    process = launch_unelevated(
+        helper_command,
+        cwd=cwd,
+        env=_child_environment(args),
+    )
     try:
         try:
             exit_code = process.wait(timeout=max(0.1, args.timeout_seconds) + 10.0)
