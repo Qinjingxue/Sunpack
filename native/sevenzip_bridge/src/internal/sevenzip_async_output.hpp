@@ -1414,7 +1414,17 @@ namespace sunpack::sevenzip
                                          UInt64 output_offset,
                                          UInt32 &transferred) noexcept
         {
-            transferred = 0;
+            // ⚠️ **绝不在这里重置 transferred。**
+            //
+            //   它是 in/out 参数，由 writer_loop 初始化一次，并跨 retry 保留：
+            //   同一个 buffer 内"部分成功 → 空间失败 → 恢复后重试"必须从
+            //   output_offset + transferred 继续。若在这里清零：
+            //     * 已确认落盘的前缀会被从原始 offset **再写一遍** → add_written_bytes
+            //       二次记账 → written > accepted、pending 被重复 release；
+            //     * 于是 accepted == written + discarded + pending 这条核心不变量被破坏。
+            //   （早期版本的 NTFS 满盘实验恰好总是 bytesTransferred = 0 的整请求失败，
+            //     所以真实 VHD 测试全绿也照样漏掉了它。R-22 用"单次最多写 256 KiB +
+            //     第二次注入 ERROR_DISK_FULL"把这个场景钉死。）
             if (!file || !buffer || !buffer->data)
             {
                 return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
@@ -1469,10 +1479,16 @@ namespace sunpack::sevenzip
                 ResetEvent(buffer->completion_event);
 
                 const DWORD request_size = buffer->size - transferred;
+                DWORD effective_size = request_size;
+                const UInt32 chunk_limit = max_write_chunk_.load(std::memory_order_relaxed);
+                if (chunk_limit != 0 && effective_size > chunk_limit)
+                {
+                    effective_size = chunk_limit; // 缝隙 D3：强制制造 partial write
+                }
                 const BOOL started = WriteFile(
                     file->handle,
                     buffer->data.get() + transferred,
-                    request_size,
+                    effective_size,
                     nullptr,
                     &overlapped);
                 if (!started && GetLastError() != ERROR_IO_PENDING)
@@ -1845,6 +1861,17 @@ namespace sunpack::sevenzip
             flush_fault_skip_.store(skip, std::memory_order_relaxed);
         }
 
+        // 缝隙 D3：限制单次 WriteFile 的最大字节数（0 = 不限制）。
+        //
+        // ⚠️ 为什么必须有它：NTFS 满盘时 `GetOverlappedResult` 报的是
+        //    `bytesTransferred = 0` 的**整请求失败**，因此真实的 VHD 测试永远走不到
+        //    "同一 buffer 内部分成功 → 再空间失败 → 恢复后必须从中间续写"这条路径。
+        //    没有这个缝隙，`transferred` 跨 retry 的语义就无法被测试钉死。
+        void set_max_write_chunk_for_test(UInt32 bytes) noexcept
+        {
+            max_write_chunk_.store(bytes, std::memory_order_relaxed);
+        }
+
     private:
         static FailureClassifier default_failure_classifier()
         {
@@ -1859,6 +1886,7 @@ namespace sunpack::sevenzip
         std::atomic<unsigned long> flush_fault_error_{0};
         std::atomic<int> flush_fault_remaining_{0};
         std::atomic<int> flush_fault_skip_{0};
+        std::atomic<UInt32> max_write_chunk_{0}; // 缝隙 D3：0 = 不限制
 
         // 返回 true 表示本次系统调用被注入的故障取代。
         template <typename Remaining, typename Skip>

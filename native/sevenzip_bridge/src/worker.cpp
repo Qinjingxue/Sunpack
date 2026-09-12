@@ -1424,15 +1424,44 @@ public:
 
     bool had_job_failure() const noexcept { return any_job_failed_; }
 
+    // 等待队列与在跑的 job 全部结束。**只用于 stdin EOF 的排空路径**。
+    //
+    // 此时控制器线程与 space monitor 必须仍然存活 —— 排空期间才出现的"满盘"
+    // 否则没有任何线程会 query/poll（见 stop(false) 的注释）。
+    // 完成后由调用方走正常的 stop() 路径：置 stopping_ → notify → join。
+    void wait_for_pending_jobs_to_drain() noexcept {
+        std::unique_lock<std::mutex> lock(mutex_);
+        condition_.wait(lock, [this] { return queue_.empty() && active_jobs_ == 0; });
+    }
+
     // cancel_pending_jobs：
     //   true  —— 显式 {"worker_command":"shutdown"}：等价于"取消所有尚未完成的 job"。
     //            必须先置 terminal 条件再 wake，否则阻塞在卷空间 gate 上的 worker
     //            永远看不到停止请求，join 永久阻塞（T-WIN-11 / T-WIN-20）。
-    //   false —— stdin EOF：**排空**语义，与改动前逐字节一致。
-    //            ⚠️ 一次性调用（`echo request | worker.exe`）在读完请求后立刻 EOF，
-    //            此时 job 往往还没开始跑。若这里也置 cancel token，就会把刚提交的
-    //            job 直接打成 cancelled（实测会让 18 个既有 worker 用例失败）。
+    //   false —— stdin EOF：**先排空、再停止**。
     void stop(bool cancel_pending_jobs = true) noexcept {
+        if (!cancel_pending_jobs) {
+            // ★★ EOF 的"排空"绝不能等价于"立刻 stopping_=true 然后 join"。
+            //
+            //   controller_loop() 一看到 stopping_ 就 break，而
+            //   space_monitor_->tick() **只由这个 controller 驱动**。若在这里提前
+            //   结束 controller，就存在这条闭环（T-WIN-24 钉死它）：
+            //
+            //     echo job | worker.exe → stdin EOF → 排空开始
+            //       → 随后 WriteFile 遇到 ERROR_DISK_FULL → gate 进入 Blocked
+            //       → 用户释放空间，但**没有任何线程再 query/poll**
+            //       → job 永久挂住，而本函数正卡在 join(worker) 上
+            //       ⇒ 整个进程永久不退出
+            //
+            //   abort_all_space_gates() 救不了：EOF 模式故意没有置真 cancel token，
+            //   被唤醒的 waiter 重新求值 terminal 仍是 false，于是继续睡。
+            //
+            //   所以 EOF 的正确模型是「draining ≠ stopping」：先等 queue 空且
+            //   active_jobs == 0（此时 controller / monitor / workers 全部还活着，
+            //   满盘仍然能被 poll 到并恢复），**然后**才真正进入 stopping 并 join。
+            //   这也保留了"一次性调用不取消刚提交的 job"这条既有语义。
+            wait_for_pending_jobs_to_drain();
+        }
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (stopping_) {
@@ -1863,9 +1892,14 @@ private:
         switch (transition.kind) {
             case Kind::Blocked:
             case Kind::Resumed:
-                // 只有这两类转换会改变"吞吐环境"，因此只有它们推进 generation。
-                // Probing -> Blocked（probe 失败 / inconclusive）**不**推进。
-                space_epoch_.fetch_add(1, std::memory_order_acq_rel);
+                // ★ 只有**真实的卷可写性变化**才推进 generation。
+                //   `register_job()` 对新 job 的补发通知同样是 Kind::Blocked，但那只是
+                //   事件补齐（磁盘可写环境没变）；若也算进去，"blocked 卷持续进入新
+                //   job"会让自适应控制器反复 reset learning。
+                //   Probing -> Blocked（probe 失败 / inconclusive）同样不推进。
+                if (transition.discontinuity) {
+                    space_epoch_.fetch_add(1, std::memory_order_acq_rel);
+                }
                 break;
             case Kind::Status:
             default:

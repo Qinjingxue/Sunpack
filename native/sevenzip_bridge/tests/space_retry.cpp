@@ -1149,6 +1149,72 @@ void r21_open_space_error_is_retryable(const std::filesystem::path &directory) {
 }
 
 // ---------------------------------------------------------------------------
+// R-22 同一 buffer 内"部分成功 → 空间失败 → 恢复后必须从中间续写"
+// ---------------------------------------------------------------------------
+void r22_partial_write_then_space_failure(const std::filesystem::path &directory) {
+    // ★ 这是 `transferred` 必须跨 retry 保留的**唯一**确定性防线。
+    //
+    //   真实的 NTFS 满盘报的是 `bytesTransferred = 0` 的整请求失败，因此真实 VHD
+    //   测试**永远走不到**这条路径。这里用缝隙 D3 把单次 WriteFile 限制成 256 KiB，
+    //   强制产生"部分成功 + 随后空间失败"的组合。
+    //
+    //   若 attempt_data_write() 在入口重置 transferred：
+    //     * 已落盘的 256 KiB 会从 offset 0 被再写一遍 → add_written_bytes 二次记账
+    //       ⇒ written > accepted；
+    //     * pending 被重复 release ⇒ accepted == written + discarded + pending 破裂。
+    Harness harness(directory, 1, 8);
+    auto &writer = *harness.writer;
+
+    constexpr std::size_t kPayload = 1 * kMib;
+    constexpr std::size_t kChunk = 256 * 1024;
+    const auto payload = make_payload(kPayload);
+    const auto path = directory / L"r22-partial.bin";
+
+    writer.set_max_write_chunk_for_test(static_cast<std::uint32_t>(kChunk));
+    // 第 1 次 WriteFile 放过（成功写 kChunk），第 2 次注入空间失败。
+    writer.set_write_fault_for_test(ERROR_DISK_FULL, 1, 1);
+
+    const auto job = writer.make_job(2 * kMib);
+    const auto file = writer.make_file(job, path.wstring(), L"r22-partial.bin", 0, 0);
+    std::uint32_t processed = 0;
+    check(writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
+                       &processed) == S_OK,
+          "R-22: 写入必须被接受");
+
+    check(wait_until([&] { return harness.gate->blocked(); }, 5s),
+          "R-22: 部分成功后的空间失败必须让卷进入暂停");
+
+    // 暂停期间：已确认落盘的前缀必须**恰好**被记账一次。
+    const auto paused = writer.snapshot_metrics();
+    check(paused.written_bytes == kChunk,
+          "R-22: 暂停期间 written 必须等于已确认落盘的前缀（256 KiB）");
+    check(paused.accepted_bytes == kPayload, "R-22: accepted 必须仍是完整 payload");
+    check(paused.discarded_bytes == 0, "R-22: 暂停期间 discarded 必须为 0");
+    check(paused.accepted_bytes ==
+              paused.written_bytes + paused.discarded_bytes + paused.pending_bytes,
+          "R-22: 暂停期间记账不变量必须保持");
+
+    check(harness.release_probe_and_wait_ready(), "R-22: 恢复后必须回到 Ready");
+    writer.record_operation_result(file, 0);
+    writer.close_file(file, 0, false, {});
+    check(writer.finish_job(job) == S_OK, "R-22: 恢复后 job 必须成功");
+
+    const auto metrics = writer.snapshot_metrics();
+    check(metrics.written_bytes == kPayload,
+          "R-22: written 必须**恰好**等于 payload —— 多一字节就说明前缀被重复记账");
+    check(metrics.accepted_bytes == kPayload, "R-22: accepted 必须等于 payload");
+    check(metrics.discarded_bytes == 0, "R-22: 成功路径不得产生 discarded");
+    check(metrics.pending_bytes == 0, "R-22: pending 必须归零");
+    check(metrics.accepted_bytes ==
+              metrics.written_bytes + metrics.discarded_bytes + metrics.pending_bytes,
+          "R-22: 结束时必须保持 accepted == written + discarded + pending");
+    check(harness.state->accounting_violations.load(std::memory_order_relaxed) == 0,
+          "R-22: pending 不得被重复 release（accounting_violations 必须为 0）");
+    check(read_file(path) == payload,
+          "R-22: 输出必须逐字节等于 payload（续写不得丢数据、不得错位）");
+}
+
+// ---------------------------------------------------------------------------
 // Phase 6c 默认开启验收（R22："默认值忘改 → 功能永不生效"的唯一防线）
 // ---------------------------------------------------------------------------
 void phase_6c_default_enabled() {
@@ -1256,6 +1322,8 @@ int main(int argc, char **argv) {
          [&] { r18_permanent_failure_records_discarded(directory); }},
         {"R-19 exactly one discard per buffer", [&] { r19_exactly_one_discard_per_buffer(directory); }},
         {"R-21 open space error is retryable", [&] { r21_open_space_error_is_retryable(directory); }},
+        {"R-22 partial write then space failure",
+         [&] { r22_partial_write_then_space_failure(directory); }},
         {"Phase 6c default enabled", phase_6c_default_enabled},
         {"error code contract", error_code_contract},
     };

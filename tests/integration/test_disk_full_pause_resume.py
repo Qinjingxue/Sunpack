@@ -234,6 +234,20 @@ class WorkerSession:
         self.process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
         self.process.stdin.flush()
 
+    def close_stdin(self) -> None:
+        """关掉 stdin 制造 EOF（一次性 `echo request | worker.exe` 的形态）。
+
+        EOF 之后 worker 进入**排空**：停止接收新请求，但 controller、space monitor
+        与 worker 线程必须继续活着 —— 见 worker.cpp `stop(false)` 的注释。
+        """
+
+        assert self.process is not None and self.process.stdin is not None
+        try:
+            self.process.stdin.close()
+        except Exception:
+            pass
+        self.process.stdin = None
+
     def snapshot(self) -> list[dict]:
         with self._lock:
             return list(self._all)
@@ -731,6 +745,76 @@ def test_win12_two_jobs_on_one_volume_both_notified(tmp_path_factory):
 
         assert (out_a / "payload.bin").read_bytes() == payload_a
         assert (out_b / "payload.bin").read_bytes() == payload_b
+
+
+# ---------------------------------------------------------------------------
+# T-WIN-24 EOF 排空期间遇到满盘：必须仍能恢复，并且进程正常退出
+# ---------------------------------------------------------------------------
+@requires_vhd
+def test_win24_eof_drain_survives_a_full_disk(tmp_path_factory):
+    r"""EOF 排空**不得**提前终止 controller / space monitor。
+
+    这是架构师第三轮指出的一个**由"EOF 不取消 job"这条修复本身引入**的交叉 bug：
+
+    ```text
+    echo job | worker.exe → stdin EOF → 排空开始
+      → 随后 WriteFile 遇到 ERROR_DISK_FULL → gate Blocked
+      → 用户释放空间，但 controller 已经因为 stopping_ 退出
+      → 没有任何线程再 query/poll → job 永久挂住
+      → 而 stop(false) 正卡在 join(worker) 上
+      ⇒ 整个进程永久不退出
+    ```
+
+    本用例不注入任何 cancel / shutdown：只关 stdin，然后要求
+    "满盘 → 释放 → 恢复 → 正常退出"整条链路成立。
+    """
+
+    vhd_directory = _vhd_directory(tmp_path_factory)
+    work = Path(tmp_path_factory.mktemp("space-work"))
+    archive = work / "eof.zip"
+    payload = _make_archive(archive, 8 * _MIB)
+
+    with SpaceVhd(vhd_directory, "V") as vhd:
+        output_dir = vhd.root / "out"
+        output_dir.mkdir()
+        vhd.fill_until_free_below(1 * _MIB)
+
+        session = WorkerSession(_worker_path(), _gate_environment())
+        session.__enter__()
+        try:
+            session.send(_job_request("tw24", archive, output_dir))
+            # ★ 制造 EOF —— 此后不再发送任何命令（不 cancel、不 shutdown）。
+            session.close_stdin()
+
+            blocked = session.wait_for(
+                lambda event: event.get("event") == "space_blocked", timeout=120.0
+            )
+            assert blocked is not None, (
+                "EOF 排空期间满盘仍必须能进入 Blocked；实际事件流："
+                + json.dumps(session.space_events(), ensure_ascii=False)
+            )
+
+            vhd.release()
+            resumed = session.wait_for(
+                lambda event: event.get("event") == "space_resumed", timeout=180.0
+            )
+            assert resumed is not None, (
+                "EOF 之后 controller/monitor 必须仍然活着 —— 否则释放空间也永远不恢复"
+                "（这正是『排空不能提前 stopping_』要防的闭环）"
+            )
+
+            result = session.wait_for(lambda e: e.get("type") == "result", timeout=240.0)
+            assert result is not None and result.get("status") == "ok", result
+
+            # ★ 排空结束后进程必须**自己**退出（EOF 路径），不能永久挂在 join 上。
+            exit_code = session.wait_exit(timeout=60.0)
+            assert isinstance(exit_code, int)
+        finally:
+            session.close()
+
+        extracted = output_dir / "payload.bin"
+        assert extracted.exists()
+        assert extracted.read_bytes() == payload, "EOF 排空路径的输出必须完整"
 
 
 # ---------------------------------------------------------------------------

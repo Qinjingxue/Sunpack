@@ -57,6 +57,13 @@ namespace sunpack::sevenzip
         double blocked_seconds = 0.0;
         bool query_ok = true;
         unsigned long query_error = 0;
+        // ★ 这是否是一次**真实的卷可写性变化**（Ready→Blocked / Probing→Ready）。
+        //
+        //   `register_job()` 对新注册 job 的**补发通知**也发 Kind::Blocked，但那只是
+        //   事件补齐，磁盘可写环境根本没变。controller 的 discontinuity generation
+        //   只能由真实转换推进 —— 否则"blocked 卷持续进入新 job"会让自适应控制器
+        //   反复 reset learning（与"只有真实转换才是 throughput discontinuity"不符）。
+        bool discontinuity = false;
         std::vector<std::string> job_ids;
     };
 
@@ -431,9 +438,23 @@ namespace sunpack::sevenzip
         }
 
         void remove_waiter_locked(std::uint64_t token) noexcept;
-        VolumeSpaceTransition make_transition_locked(VolumeSpaceTransition::Kind kind) const;
+        VolumeSpaceTransition make_transition_locked(VolumeSpaceTransition::Kind kind,
+                                                     bool discontinuity) const;
         void emit_transitions(const std::vector<VolumeSpaceTransition> &transitions) noexcept;
         // Ready → Blocked 时的一次【新鲜】查询 + 提交。**必须在 mutex_ 之外调用**。
+        //
+        // ⚠️ 已接受的 v1 限制（架构师第三轮）：这次查询虽然不在 gate 锁内，但仍然由
+        //    **当前 writer 线程同步执行**。若输出是失联 UNC / 坏网络盘 / 某些过滤驱动，
+        //    `GetDiskFreeSpaceExW` 可能长时间不返回，于是这个 writer 线程被卡住，
+        //    shutdown 最终仍要等它 —— T-WIN-20 用的是本地 VHD，测不到这一种。
+        //
+        //    架构上唯一**必须**非阻塞的是 monitor 侧的查询（§4.4.2：绝不在 executor
+        //    mutex_ 内查询，否则 submit/cancel/admission 全被堵住），那一条已经满足。
+        //
+        //    彻底解法（需要改冻结架构，未采纳）：**所有 free-space query 都只让 monitor
+        //    做** —— 首次失败直接 `watermark_valid=false → Blocked → 立即发事件`，
+        //    monitor 第一次成功采样即 baseline 并允许一次 probe；这样可以删掉
+        //    commit_fresh_watermark()，writer 永不调用空间查询。
         void commit_fresh_watermark(std::uint64_t episode_token,
                                     const std::wstring &query_path) noexcept;
 
@@ -444,6 +465,14 @@ namespace sunpack::sevenzip
         VolumeSpacePhase phase_ = VolumeSpacePhase::Ready;
         std::uint64_t episode_id_ = 0;            // 每次 Ready→Blocked 递增
         bool watermark_valid_ = false;            // 初期查询失败则不猜
+        // 当前 episode 的 `space_blocked` **是否已经生成**（transition 已经发给 sink）。
+        //
+        // ⚠️ Ready→Blocked 的流程是：先在锁内进入 Blocked，再在锁外做新鲜查询，
+        //    最后才生成并发送 transition。如果新 job 恰好落在"已 Blocked 但事件还没发"
+        //    的窗口里，`register_job()` 的补发会与随后的初始 transition **重复**投递
+        //    同 episode 的 blocked（Python 只对 stale-resumed 去重，不重复去重 blocked）。
+        //    用这个标志把补发限制在"初始事件已经发出"之后。
+        bool blocked_event_emitted_ = false;
         std::uint64_t failed_free_watermark_ = 0; // **仅在当前 episode 内单调**
         std::uint64_t probe_owner_token_ = 0;     // 0 = 许可待领取
         std::uint64_t next_token_ = 1;
@@ -527,12 +556,19 @@ namespace sunpack::sevenzip
                 return false;
             }
             affected_jobs_.push_back(job_id);
-            if (phase_ != VolumeSpacePhase::Ready)
+            if (phase_ != VolumeSpacePhase::Ready && blocked_event_emitted_)
             {
                 // 补发：解决"job 卡在 producer backpressure，永远没有 writer 线程
                 // 进入 gate->wait()"的情形 —— 它已经注册，所以照样收到通知。
+                //
+                // ⚠️ 两个刻意的限定：
+                //   1) `discontinuity = false` —— 这只是事件补齐，磁盘可写环境没变，
+                //      绝不能推进 controller 的 discontinuity generation；
+                //   2) 只在初始 blocked 事件**已经发出**之后补发 —— 否则它会和随即
+                //      生成的初始 transition 重复投递同 episode 的 blocked。
                 VolumeSpaceTransition transition =
-                    make_transition_locked(VolumeSpaceTransition::Kind::Blocked);
+                    make_transition_locked(VolumeSpaceTransition::Kind::Blocked,
+                                           /*discontinuity=*/false);
                 transition.job_ids.clear();
                 transition.job_ids.push_back(job_id);
                 transitions.push_back(std::move(transition));
@@ -587,6 +623,7 @@ namespace sunpack::sevenzip
                 watermark_valid_ = false;
                 failed_free_watermark_ = 0;
                 probe_owner_token_ = 0;
+                blocked_event_emitted_ = false; // 初始 blocked 事件还没生成
                 blocked_since_ = std::chrono::steady_clock::now();
                 opened_episode = true;
                 episode_token = episode_id_;
@@ -609,8 +646,9 @@ namespace sunpack::sevenzip
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (episode_id_ == episode_token)
                 {
-                    transitions.push_back(
-                        make_transition_locked(VolumeSpaceTransition::Kind::Blocked));
+                    transitions.push_back(make_transition_locked(
+                        VolumeSpaceTransition::Kind::Blocked, /*discontinuity=*/true));
+                    blocked_event_emitted_ = true;
                 }
             }
         }
@@ -665,8 +703,10 @@ namespace sunpack::sevenzip
         if (!self)
         {
             // 生命周期不变量被破坏（gate 不是 shared_ptr 持有）。
-            // 不崩溃：按终态返回，让调用方走既有失败路径。
-            return WaitResult{};
+            // ⚠️ 必须返回 **Terminal**（而不是默认构造的 `WaitResult{}`，那是 Ready）：
+            //    Ready 会让调用方"未持有许可地重试一次"，在 gate 已经不可用的前提下
+            //    会变成无许可的忙重试。Terminal 让它走既有失败路径、不丢数据地放弃。
+            return {WaitResult::Kind::Terminal, ProbeLease{}};
         }
 
         std::unique_lock<std::mutex> lock(mutex_);
@@ -830,9 +870,10 @@ namespace sunpack::sevenzip
             phase_ = VolumeSpacePhase::Ready;
             probe_owner_token_ = 0;
             last_win32_error_ = 0;
+            blocked_event_emitted_ = false;
             blocked_since_ = std::chrono::steady_clock::time_point{};
-            transitions.push_back(
-                make_transition_locked(VolumeSpaceTransition::Kind::Resumed));
+            transitions.push_back(make_transition_locked(
+                VolumeSpaceTransition::Kind::Resumed, /*discontinuity=*/true));
         }
         cv_.notify_all(); // 全部等待者恢复
         emit_transitions(transitions);
@@ -970,10 +1011,11 @@ namespace sunpack::sevenzip
     }
 
     inline VolumeSpaceTransition VolumeSpaceGate::make_transition_locked(
-        VolumeSpaceTransition::Kind kind) const
+        VolumeSpaceTransition::Kind kind, bool discontinuity) const
     {
         VolumeSpaceTransition transition;
         transition.kind = kind;
+        transition.discontinuity = discontinuity;
         transition.volume_key = volume_key_;
         transition.episode_id = episode_id_;
         transition.win32_error = last_win32_error_;

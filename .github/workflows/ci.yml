@@ -1,0 +1,185 @@
+name: CI
+
+# 架构师第三轮的发布流程意见：本仓库此前**只有** release.yml（构建/发布），
+# 没有任何 CI 测试工作流 —— 因此"1209 pytest + 7 个 VHD"只是本机验证结果，
+# 在 GitHub 上不可独立追溯。这个工作流把 L1/L2/L3/L5 变成每个 PR 都能看到的证据。
+#
+# L4（真实满盘 VHD，tests/integration/test_disk_full_pause_resume.py）**故意不放在这里**：
+#   * 需要管理员权限（diskpart 建/挂 VHD）；
+#   * 每个用例会写入整个 VHD 容量（默认 1 GiB × 1~2 个盘）；
+#   * 一次完整跑约 1 分钟，但会明显拖慢 PR 反馈。
+# 它是 release / nightly / 手动提权 lane 的验收，见文件末尾的 vhd-lane job
+# （`workflow_dispatch` 手动触发）。
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # L1/L2/L5（native）：5 个 C++ 测试可执行文件
+  # ---------------------------------------------------------------------------
+  native:
+    name: Native (space gate / space retry / async output / smoke / writer cost)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Prepare native/tool environment
+        shell: pwsh
+        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -SkipAcceptanceTestTools
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          $cmake = Join-Path $PWD ".venv\Scripts\cmake.exe"
+          if (-not (Test-Path -LiteralPath $cmake)) { $cmake = "cmake" }
+          & $cmake -S native\sevenzip_bridge -B native\sevenzip_bridge\build-x64
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $cmake = Join-Path $PWD ".venv\Scripts\cmake.exe"
+          if (-not (Test-Path -LiteralPath $cmake)) { $cmake = "cmake" }
+          & $cmake --build native\sevenzip_bridge\build-x64 --config Release
+          if ($LASTEXITCODE -ne 0) { throw "native build failed" }
+
+      # Each target runs separately so any single failure fails the job: the
+      # accounting red line (async_output) plus both new space suites
+      # (space_gate / space_retry) live here.
+      - name: Run native tests
+        shell: pwsh
+        run: |
+          $rel = "native\sevenzip_bridge\build-x64\Release"
+          $targets = @(
+            "sunpack_sevenzip_async_output",
+            "sunpack_sevenzip_smoke",
+            "sunpack_sevenzip_writer_cost",
+            "sunpack_sevenzip_space_gate",
+            "sunpack_sevenzip_space_retry"
+          )
+          $failed = @()
+          foreach ($target in $targets) {
+            Write-Host "=== $target ==="
+            & (Join-Path $rel "$target.exe")
+            if ($LASTEXITCODE -ne 0) { $failed += $target }
+          }
+          if ($failed.Count -gt 0) { throw "native tests failed: $($failed -join ', ')" }
+
+      # Merge gate 4 from the implementation doc: space-class error codes may be
+      # classified in exactly one place.
+      - name: Vocabulary and single-classification-point checks
+        shell: pwsh
+        run: |
+          $forbidden = 'WriteOutcome|OpenOutcome|SpaceRetryResult|last_space_error|out_space_error'
+          $hits = Select-String -Path "native\sevenzip_bridge\src\internal\*.hpp","native\sevenzip_bridge\src\internal\*.cpp","native\sevenzip_bridge\src\*.cpp" `
+            -Pattern $forbidden -ErrorAction SilentlyContinue |
+            Where-Object { $_.Line -notmatch '^\s*//' -and $_.Line -notmatch '✗|禁止' }
+          if ($hits) { $hits | ForEach-Object { Write-Host $_ }; throw "forbidden vocabulary found" }
+
+          $codes = Select-String -Path "native\sevenzip_bridge\src\internal\*.hpp","native\sevenzip_bridge\src\internal\*.cpp" `
+            -Pattern 'case ERROR_DISK_FULL|case ERROR_HANDLE_DISK_FULL|case ERROR_DISK_QUOTA_EXCEEDED|case ERROR_DISK_RESOURCES_EXHAUSTED' `
+            -ErrorAction SilentlyContinue
+          $offenders = $codes | Where-Object { $_.Path -notmatch 'sevenzip_space_error\.hpp$' }
+          if ($offenders) { $offenders | ForEach-Object { Write-Host $_ }; throw "space error codes classified outside sevenzip_space_error.hpp" }
+
+  # ---------------------------------------------------------------------------
+  # L3 + 既有 pytest 全集（含真 worker 的 worker 协议用例）
+  # ---------------------------------------------------------------------------
+  python:
+    name: Python (unit / functional / cli + worker extraction)
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      # The real worker tests need the native artifacts, so this job runs the same
+      # preparation steps as the native job.
+      - name: Prepare native/tool environment
+        shell: pwsh
+        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -SkipAcceptanceTestTools
+
+      - name: Build native worker and 7z wrapper
+        shell: pwsh
+        run: .\scripts\build_windows.ps1 -Arch x64 -SkipInstaller
+
+      - name: Run test suite
+        shell: pwsh
+        run: .\scripts\run_ci_tests.ps1 -ParallelWorkers 2
+
+      - name: Space event contract tests
+        shell: pwsh
+        run: |
+          & .venv\Scripts\python.exe -m pytest -q tests/unit/test_volume_space_events.py
+
+  # ---------------------------------------------------------------------------
+  # L4（真实满盘 VHD）：手动触发 / nightly 的提权 Windows lane
+  #
+  # 用 `gh workflow run ci.yml` 或 GitHub UI 的 "Run workflow" 触发。
+  # 需要 runner 允许 diskpart（windows-2022 runner 的默认用户**是**管理员）。
+  # 不想让它在每次 PR 上跑就保持只由 workflow_dispatch 触发。
+  # ---------------------------------------------------------------------------
+  vhd-lane:
+    name: L4 real disk-full end-to-end (VHD, manual)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.10"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Prepare native/tool environment
+        shell: pwsh
+        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -SkipAcceptanceTestTools
+
+      - name: Build Windows package
+        shell: pwsh
+        run: .\scripts\build_windows.ps1 -Arch x64 -SkipInstaller
+
+      # The VHD lands on the runner's temp drive; each test creates, attaches,
+      # fills, releases, detaches and deletes its own disk.
+      - name: Real disk-full end-to-end
+        shell: pwsh
+        env:
+          SUNPACK_SPACE_TEST_VHD: "1"
+        run: |
+          & .venv\Scripts\python.exe -m pytest -q tests\integration\test_disk_full_pause_resume.py
+          if ($LASTEXITCODE -ne 0) { throw "L4 disk-full end-to-end failed" }
