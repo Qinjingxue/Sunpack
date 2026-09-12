@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import os
 import threading
 import time
 
 import pytest
 
+import sunpack.support.archive_sessions as archive_sessions
 import sunpack.support.resource_lifecycle as lifecycle
 from sunpack.support.resource_lifecycle import (
     ResourceBusyError,
@@ -145,6 +148,112 @@ def test_promotion_fails_closed_for_another_tasks_live_resource(tmp_path):
     assert not released.is_set()
     scope.close()
     assert released.is_set()
+
+
+def test_promotion_drains_archive_session_borrow_before_publishing_gate(tmp_path, monkeypatch):
+    path = tmp_path / "shared.rar"
+    path.write_bytes(b"payload")
+
+    class FakeArchiveSession:
+        def __init__(self, archive_path):
+            self.archive_path = archive_path
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr(archive_sessions, "NativeArchiveSession", FakeArchiveSession)
+    monkeypatch.setattr(
+        archive_sessions.sunpack_native,
+        "release_reader_resources_under",
+        lambda _root: {},
+    )
+    monkeypatch.setattr(
+        archive_sessions.sunpack_native,
+        "clear_reader_resources",
+        lambda: {},
+    )
+
+    real_registration = archive_sessions.lifecycle_registration
+
+    @contextlib.contextmanager
+    def short_registration(files, *, timeout=30.0):
+        with real_registration(files, timeout=min(float(timeout), 0.2)) as identities:
+            yield identities
+
+    # Keep the regression bounded on the old implementation, where the
+    # second lookup waits for the full promotion barrier timeout.
+    monkeypatch.setattr(archive_sessions, "lifecycle_registration", short_registration)
+
+    reader_scope = TaskResourceScope("archive-reader", files=(path,))
+    promoter_scope = TaskResourceScope("archive-promoter", files=(path,))
+    promoter = None
+    revisitor = None
+    promotion_errors = []
+    revisit_errors = []
+    release_under_entered = threading.Event()
+    revisit_succeeded = threading.Event()
+    revisited = threading.Event()
+
+    try:
+        with reader_scope.activate():
+            session = archive_sessions.get_archive_session(str(path))
+            reader_context = contextvars.copy_context()
+
+        real_release_under = promoter_scope.release_under
+
+        def release_under_with_handshake(roots):
+            report = real_release_under(roots)
+            # In the fixed implementation this point is before the promotion
+            # gate is published.  Hold the promoter here until the revisitor
+            # has completed its lookup, making the ordering deterministic.
+            release_under_entered.set()
+            if not revisit_succeeded.wait(1.0):
+                raise AssertionError("revisitor did not complete before the promotion gate")
+            return report
+
+        promoter_scope.release_under = release_under_with_handshake
+
+        def promote() -> None:
+            try:
+                with promotion_barrier((path,), timeout=1.0, strict_open_file_audit=False):
+                    pass
+            except BaseException as exc:
+                promotion_errors.append(exc)
+
+        with promoter_scope.activate():
+            promoter_context = contextvars.copy_context()
+        promoter = threading.Thread(
+            target=lambda: promoter_context.run(promote),
+        )
+        promoter.start()
+        assert release_under_entered.wait(0.5)
+
+        def revisit_in_scope() -> None:
+            try:
+                assert archive_sessions.get_archive_session(str(path)) is session
+                revisit_succeeded.set()
+            except BaseException as exc:
+                revisit_errors.append(exc)
+            finally:
+                revisited.set()
+
+        revisitor = threading.Thread(
+            target=lambda: reader_context.run(revisit_in_scope),
+        )
+        revisitor.start()
+        assert revisited.wait(0.5)
+    finally:
+        reader_scope.close()
+        promoter_scope.close()
+        if revisitor is not None:
+            revisitor.join(1.0)
+        if promoter is not None:
+            promoter.join(1.0)
+        archive_sessions.clear_archive_sessions()
+
+    assert revisit_errors == []
+    assert promotion_errors == []
 
 
 def test_promotion_waits_for_current_tasks_concurrent_operation(tmp_path):

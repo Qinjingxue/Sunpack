@@ -48,9 +48,9 @@ def failed_result(path, error_code=32):
     return ArchiveCleanupResult(str(path), 'recycle', 'failed', 1, error_code, 'sharing violation')
 
 
-def _scope():
+def _scope(mode='recycle'):
     context = RunContext()
-    return _CleanupRefScope(context, config(), engine_module.PostProcessActions).bind('request-1')
+    return _CleanupRefScope(context, config(mode), engine_module.PostProcessActions).bind('request-1')
 
 
 # reference counting
@@ -190,6 +190,28 @@ def test_scope_barrier_failure_is_recorded_for_retry(tmp_path, monkeypatch):
     assert outcome.failed[0].status == 'failed'
     assert outcome.failed[0].retryable is True
     assert 'barrier' in outcome.failed[0].message
+    assert source.exists() is True
+
+
+def test_scope_keep_skips_cleanup_promotion_barrier(tmp_path, monkeypatch):
+    source = tmp_path / 'kept.zip'
+    source.write_text('payload')
+    scope = _scope('keep')
+    task = _Task('kept.zip', [source])
+    scope.register([task])
+
+    def exploding_barrier(*_args, **_kwargs):
+        raise AssertionError('keep cleanup must not establish a promotion barrier')
+
+    monkeypatch.setattr(resource_lifecycle, 'promotion_barrier', exploding_barrier)
+
+    outcome = asyncio.run(scope.release_task(
+        task, outcome_kind=OutcomeKind.COMPLETE_SUCCESS, broker=_InlineBroker()))
+
+    assert outcome.released == (str(source),)
+    assert outcome.deleted == ()
+    assert outcome.failed == ()
+    assert outcome.error == ''
     assert source.exists() is True
 
 

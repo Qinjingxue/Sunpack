@@ -486,17 +486,29 @@ class _CleanupRefScope:
             error = ""
             if existing:
                 try:
-                    with promotion_barrier(
-                        existing,
-                        cache_releasers=(release_archive_sessions_under,),
-                        quiesce=False,
-                    ):
+                    actions = self._factory(self._config, stdout=None)
+                    if self._mode() == "keep":
+                        # Keeping sources is not a filesystem mutation.  Do not
+                        # establish a source promotion barrier merely to produce
+                        # the corresponding "kept" cleanup results.
                         results.extend(
-                            self._factory(self._config, stdout=None).apply(
+                            actions.apply(
                                 archives_to_clean=[[path] for path in existing],
                                 flatten_targets=[],
                             )
                         )
+                    else:
+                        with promotion_barrier(
+                            existing,
+                            cache_releasers=(release_archive_sessions_under,),
+                            quiesce=False,
+                        ):
+                            results.extend(
+                                actions.apply(
+                                    archives_to_clean=[[path] for path in existing],
+                                    flatten_targets=[],
+                                )
+                            )
                 except (ResourceBusyError, ResourceLifecycleError) as exc:
                     error = str(exc)
                     code = int(getattr(exc, "winerror", 0) or 0)

@@ -934,37 +934,6 @@ def _release_promotable_records(roots: Sequence[FileIdentity]) -> ReleaseReport:
     return _release_records(records)
 
 
-def _wait_for_task_resources(
-    roots: Sequence[FileIdentity],
-    timeout: float,
-    *,
-    exclude_operation_task_id: str | None = None,
-) -> None:
-    deadline = time.monotonic() + max(0.0, float(timeout))
-    with _CHANGED:
-        while True:
-            busy = [
-                record
-                for record in _matching_active_records(roots)
-                if record.policy is ResourcePolicy.TASK_OWNED and record.task_id is not None
-            ]
-            active_operations = _matching_active_file_operations(
-                roots,
-                exclude_task_id=exclude_operation_task_id,
-            )
-            if not busy and not active_operations:
-                return
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ResourceBusyError(
-                    "promotion blocked by active task resources: "
-                    + _format_busy(busy)
-                    + "; active operations: "
-                    + _format_active_file_operations(active_operations)
-                )
-            _CHANGED.wait(remaining)
-
-
 def _own_open_files_under(roots: Sequence[FileIdentity]) -> tuple[str, ...]:
     try:
         import psutil
@@ -1073,15 +1042,54 @@ def promotion_barrier(
     if quiesce and current is not None:
         current.begin_promotion(timeout=max(0.0, deadline - time.monotonic()))
         promotion_started = True
+
+    released_resources = 0
+    if current is not None:
+        try:
+            # The promoter must stop owning overlapping resources before it
+            # waits for other tasks.  Do this before publishing the gate so a
+            # borrower can finish naturally instead of being trapped behind
+            # the promotion it is needed to release.
+            current_report = current.release_under(root_identities)
+            released_resources += current_report.released
+            if not current_report.ok:
+                raise ResourceLifecycleError(f"promotion task cleanup failed: {current_report.failed}")
+        except BaseException:
+            if promotion_started:
+                current.end_promotion()
+            raise
+
     with _CHANGED:
         try:
-            while _promotion_conflict(root_identities) is not None:
+            while True:
+                conflict = _promotion_conflict(root_identities)
+                busy = [
+                    record
+                    for record in _matching_active_records(root_identities)
+                    if record.policy is ResourcePolicy.TASK_OWNED and record.task_id is not None
+                ]
+                active_operations = _matching_active_file_operations(
+                    root_identities,
+                    exclude_task_id=current.task_id if current is not None else None,
+                )
+                if conflict is None and not busy and not active_operations:
+                    # lifecycle_registration() and file-operation admission
+                    # use _CHANGED too.  Holding it across this check and the
+                    # insert closes the admission race before mutation starts.
+                    _ACTIVE_PROMOTIONS[token] = root_identities
+                    _CHANGED.notify_all()
+                    break
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise ResourceBusyError("timed out waiting for an overlapping promotion barrier")
+                    if conflict is not None and not busy and not active_operations:
+                        raise ResourceBusyError("timed out waiting for an overlapping promotion barrier")
+                    raise ResourceBusyError(
+                        "promotion blocked by active task resources: "
+                        + _format_busy(busy)
+                        + "; active operations: "
+                        + _format_active_file_operations(active_operations)
+                    )
                 _CHANGED.wait(remaining)
-            _ACTIVE_PROMOTIONS[token] = root_identities
-            _CHANGED.notify_all()
         except BaseException:
             if promotion_started:
                 current.end_promotion()
@@ -1094,23 +1102,10 @@ def promotion_barrier(
     context_token = _CURRENT_PROMOTION_ROOTS.set(root_identities)
     try:
         cleanup_started = time.monotonic()
-        if current is not None:
-            current_report = current.release_under(root_identities)
-            report.released_resources += current_report.released
-            if not current_report.ok:
-                raise ResourceLifecycleError(f"promotion task cleanup failed: {current_report.failed}")
-
         release_report = _release_promotable_records(root_identities)
-        report.released_resources += release_report.released
+        report.released_resources = released_resources + release_report.released
         if not release_report.ok:
             raise ResourceLifecycleError(f"promotion cache cleanup failed: {release_report.failed}")
-
-        remaining = max(0.0, deadline - time.monotonic())
-        _wait_for_task_resources(
-            root_identities,
-            remaining,
-            exclude_operation_task_id=current.task_id if current is not None else None,
-        )
 
         native_promotion_token = _begin_native_promotion(root_identities)
 
