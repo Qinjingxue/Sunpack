@@ -1909,6 +1909,27 @@ def test_watch_scheduler_reprocesses_split_group_after_source_cleanup(tmp_path, 
     assert len(runs) == 2
 
 
+def test_predicted_output_dir_uses_split_group_logical_name(tmp_path):
+    watch_root = tmp_path / "watched"
+    watch_root.mkdir()
+    watcher = WatchScheduler(
+        {"watch": {"clipboard_monitor_enabled": False}},
+        [str(watch_root)],
+        out_dir=".",
+        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
+        quiet_seconds=0,
+        initial_scan=False,
+    )
+
+    result = watcher._predicted_output_dirs(
+        str(watch_root / "sample.7z.001"),
+        {"output": {"root": str(tmp_path / "out"), "common_root": str(watch_root)}},
+        logical_name="sample",
+    )
+
+    assert result == [str(tmp_path / "out" / "sample")]
+
+
 def test_watch_scheduler_processes_same_path_again_after_input_changes(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive_path = tmp_path / "sample.zip"

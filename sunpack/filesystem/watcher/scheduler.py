@@ -490,7 +490,11 @@ class WatchScheduler:
                 "root": self._output_root_for(candidate.path),
                 "common_root": self._common_root_for(candidate.path),
             }
-            predicted = self._predicted_output_dirs(candidate.path, output_config)
+            predicted = self._predicted_output_dirs(
+                candidate.path,
+                output_config,
+                logical_name=dispatch.group.logical_name if dispatch.group is not None else "",
+            )
             if any(_paths_overlap(path, current) for path in predicted for current in reserved):
                 deferred.append(DeferredWatch(candidate=candidate, group=dispatch.group))
                 continue
@@ -1146,14 +1150,23 @@ class WatchScheduler:
         }
         final_output_config = dict(run_config)
         final_output_config["output"] = dict(run_config["output"])
-        predicted_final_dirs = self._predicted_output_dirs(candidate.path, final_output_config)
+        logical_name = group.logical_name if group is not None else ""
+        predicted_final_dirs = self._predicted_output_dirs(
+            candidate.path,
+            final_output_config,
+            logical_name=logical_name,
+        )
         probe_workspace = self._prepare_probe_workspace(candidate.path)
         run_config["output"] = {
             **run_config["output"],
             "root": probe_workspace,
             "common_root": final_output_config["output"]["common_root"],
         }
-        predicted_probe_dirs = self._predicted_output_dirs(candidate.path, run_config)
+        predicted_probe_dirs = self._predicted_output_dirs(
+            candidate.path,
+            run_config,
+            logical_name=logical_name,
+        )
         from sunpack.cli.runtime_state import runtime_host
 
         host = runtime_host()
@@ -1755,13 +1768,20 @@ class WatchScheduler:
         member_keys = {path_key(path) for path in snapshot.input_paths}
         return path_key(candidate.path) in member_keys
 
-    def _predicted_output_dirs(self, path: str, run_config: dict) -> list[str]:
+    def _predicted_output_dirs(
+        self,
+        path: str,
+        run_config: dict,
+        *,
+        logical_name: str = "",
+    ) -> list[str]:
         try:
             task = ArchiveTask(
                 fact_bag=FactBag(),
                 score=0,
                 main_path=os.path.abspath(path),
                 all_parts=[os.path.abspath(path)],
+                logical_name=logical_name,
             )
             return dedupe_normalized_paths([default_output_dir_for_task(task, run_config.get("output", {}))])
         except Exception:
