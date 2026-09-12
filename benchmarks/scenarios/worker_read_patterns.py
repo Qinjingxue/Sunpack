@@ -548,7 +548,7 @@ def main() -> int:
                     ],
                 }
             else:
-                corpus, cached = _cached_corpus(
+                corpus, skipped, cache_info = _cached_corpus(
                     workspace.corpus,
                     cache_root=args.corpus_cache_root,
                     small_files=args.small_files,
@@ -565,7 +565,7 @@ def main() -> int:
                     seven_zip_variants=seven_zip_variants,
                     large_content=args.large_content,
                     cached_corpus=corpus,
-                    cache_info={**cached, "content": args.large_content},
+                    cache_info={**cache_info, "content": args.large_content, "skipped": skipped},
                 )
             if not cases:
                 raise RuntimeError("no archive cases are available")
