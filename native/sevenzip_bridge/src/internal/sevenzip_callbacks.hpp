@@ -6,6 +6,8 @@
 
 #include "sevenzip_async_output.hpp"
 
+#include "sevenzip_space_directory.hpp"
+
 #ifdef _WIN32
 
 #include <algorithm>
@@ -1026,6 +1028,25 @@ namespace sunpack::sevenzip
 
         bool output_root_initially_empty() const { return output_root_initially_empty_; }
 
+#ifdef _WIN32
+        // 测试缝隙 F：直接驱动条目目录创建（ensure_directory 本身是 private）。
+        // 生产代码不调用。
+        //
+        // 覆盖的核心回归是**memo 不被投毒**：一次失败的目录创建绝不能被
+        // created_directories_ 记住 —— 旧代码"先插入 memo 再调用 create_directories"
+        // 会让该目录永远不再被真正创建，而且错误码被 catch 换成 E_FAIL/0。
+        bool ensure_directory_for_test(const std::wstring &directory, int *out_error_code)
+        {
+            std::error_code error;
+            const bool ready = ensure_directory(std::filesystem::path(directory), &error);
+            if (out_error_code)
+            {
+                *out_error_code = error.value();
+            }
+            return ready;
+        }
+#endif
+
         void finalize_output() noexcept
         {
             if (output_finalized_)
@@ -1370,6 +1391,11 @@ namespace sunpack::sevenzip
             std::filesystem::path target;
             try
             {
+                // ⚠️ 目录创建失败现在**由真实 std::error_code 判定**，不再靠
+                //    catch(...) 一律归成 E_FAIL（那会丢掉空间错误码，
+                //    使"输出盘满 → 自动暂停"无法触发）。
+                std::error_code directory_error;
+                bool directory_ready = true;
 
                 if (is_dir)
                 {
@@ -1379,35 +1405,60 @@ namespace sunpack::sevenzip
 
                         target = output_root_ / safe_path.value();
 
-                        ensure_directory(target);
+                        directory_ready = ensure_directory(target, &directory_error);
 
-                        if (output_trace_ && current_trace_index_ < output_trace_->items.size())
+                        if (directory_ready && output_trace_ && current_trace_index_ < output_trace_->items.size())
                         {
                             output_trace_->items[current_trace_index_].output_path = target.lexically_relative(output_root_).generic_wstring();
                         }
                     }
 
-                    dirs_written_ += 1;
+                    if (directory_ready)
+                    {
+                        dirs_written_ += 1;
 
-                    return S_OK;
+                        return S_OK;
+                    }
                 }
-
-                if (!dry_run_)
+                else if (!dry_run_)
                 {
 
                     target = available_output_path(output_root_ / safe_path.value());
 
-                    ensure_directory(target.parent_path());
+                    directory_ready = ensure_directory(target.parent_path(), &directory_error);
 
-                    if (output_trace_ && current_trace_index_ < output_trace_->items.size())
+                    if (directory_ready && output_trace_ && current_trace_index_ < output_trace_->items.size())
                     {
 
                         output_trace_->items[current_trace_index_].output_path = target.lexically_relative(output_root_).generic_wstring();
                     }
                 }
+
+                if (!directory_ready)
+                {
+                    failed_item_ = name;
+
+                    failed_item_index_ = index;
+
+                    failed_item_bytes_written_ = current_item_bytes_written_;
+
+                    output_error_ = true;
+
+                    // 透传真实错误码：空间不足与路径不可用必须能被上层区分。
+                    const int win32_error = directory_error.value();
+                    if (output_trace_)
+                    {
+                        output_trace_->last_win32_error = win32_error;
+                    }
+                    mark_current_item_failure(
+                        HRESULT_FROM_WIN32(static_cast<DWORD>(win32_error)), win32_error);
+
+                    return static_cast<Int32>(HRESULT_FROM_WIN32(static_cast<DWORD>(win32_error)));
+                }
             }
             catch (...)
             {
+                // 兜底：只应捕获非 filesystem 的意外异常（例如 bad_alloc）。
 
                 failed_item_ = name;
 
@@ -1530,6 +1581,36 @@ namespace sunpack::sevenzip
         }
 
     private:
+        // 本 callback 所属卷的空间 gate（可能为 nullptr：功能关闭 / 无卷身份）。
+        VolumeSpaceGate *volume_space_gate() const noexcept
+        {
+#ifdef _WIN32
+            return async_writer_ ? async_writer_->volume_state()->space_gate.get() : nullptr;
+#else
+            return nullptr;
+#endif
+        }
+
+        // gate 的终态谓词：显式取消 或 writer 整体停止。
+        // 谓词只读 atomic（cancel_token / stopping_ 都是 atomic）。
+        TerminalPredicate space_terminal_predicate() const
+        {
+            const auto token = cancel_token_;
+            const auto writer = async_writer_;
+            return [token, writer]
+            {
+                if (token && token->load(std::memory_order_acquire))
+                {
+                    return true;
+                }
+#ifdef _WIN32
+                return writer && writer->stopping();
+#else
+                return false;
+#endif
+            };
+        }
+
         std::filesystem::path available_output_path(const std::filesystem::path &requested)
         {
             const auto requested_key = normalized_output_path_key(requested);
@@ -1545,14 +1626,68 @@ namespace sunpack::sevenzip
             return candidate;
         }
 
-        void ensure_directory(const std::filesystem::path &directory)
+        // ------------------------------------------------------------------
+        // 可暂停的目录创建（条目目录 + 父目录）。
+        //
+        // ★ 与 archive_extract.cpp 的根输出目录创建**共用同一个原语**
+        //   create_directories_with_space_gate()，不允许各自写一份重试逻辑。
+        //
+        // ★ `created_directories_.insert` 必须在**成功之后**：
+        //   旧代码"先插入 memo 再调用 create_directories"会把一次失败永久记住 ——
+        //   该目录再也不会被真正创建（memo 投毒），而且失败被 catch 换成
+        //   E_FAIL/0（丢掉真实错误码）→ 满盘时空间暂停根本不触发。
+        //
+        // ⚠️ ensure_no_reparse_ancestors() 仍会抛 filesystem_error（它是安全检查，
+        //    不属于空间路径），因此必须在 noexcept 的 helper **之外**用 try/catch
+        //    包住 —— 让它穿进 helper 就是 std::terminate()。
+        // ------------------------------------------------------------------
+        bool ensure_directory(const std::filesystem::path &directory, std::error_code *out_error)
         {
-            ensure_no_reparse_ancestors(directory);
-            const auto key = normalized_output_path_key(directory);
-            if (created_directories_.insert(key).second)
+            if (out_error)
             {
-                std::filesystem::create_directories(directory);
+                out_error->clear();
             }
+
+            try
+            {
+                ensure_no_reparse_ancestors(directory);
+            }
+            catch (const std::filesystem::filesystem_error &error)
+            {
+                if (out_error)
+                {
+                    *out_error = error.code();
+                }
+                return false;
+            }
+            catch (...)
+            {
+                if (out_error)
+                {
+                    *out_error = std::make_error_code(std::errc::permission_denied);
+                }
+                return false;
+            }
+
+            const auto key = normalized_output_path_key(directory);
+            if (created_directories_.find(key) != created_directories_.end())
+            {
+                return true; // 已确认创建成功过
+            }
+
+            std::error_code create_error;
+            if (!create_directories_with_space_gate(
+                    directory, volume_space_gate(), space_terminal_predicate(), &create_error))
+            {
+                if (out_error)
+                {
+                    *out_error = create_error;
+                }
+                return false;
+            }
+
+            created_directories_.insert(key);
+            return true;
         }
 
         void ensure_no_reparse_ancestors(const std::filesystem::path &directory) const

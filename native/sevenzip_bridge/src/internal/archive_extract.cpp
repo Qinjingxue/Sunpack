@@ -15,6 +15,11 @@
 #include "sevenzip_streams.hpp"
 
 #ifdef _WIN32
+#include "sevenzip_async_output.hpp"
+#include "sevenzip_space_directory.hpp"
+#endif
+
+#ifdef _WIN32
 
 #include <algorithm>
 #include <utility>
@@ -264,18 +269,56 @@ namespace sunpack::sevenzip
 
         if (!dry_run)
         {
-
-            try
+            // ★ P0：根输出目录创建是"输出目录所在盘满"的**最常见入口**。
+            //   它在 ExtractToDiskCallback 被构造之前发生，因此早期实现会在 gate
+            //   存在之前直接以 output_filesystem 失败返回 —— 「输出盘满 → 自动暂停」
+            //   根本不成立。
+            //
+            //   修法（§3.11）：**不搬动位置**（搬动会把上一轮刚删掉的 job 生命周期
+            //   问题带回来），直接从已经存在的 shared_writer 取 gate。
+            //   shared_writer 在 run_request 里就由 writer_registry_->acquire(key)
+            //   拿到，因此这里必然已经存在。
+            VolumeSpaceGate *space_gate = nullptr;
+#ifdef _WIN32
+            if (shared_writer)
             {
-
-                std::filesystem::create_directories(std::filesystem::path(win32_extended_path(output_dir)));
+                space_gate = shared_writer->volume_state()->space_gate.get();
             }
-            catch (...)
+#endif
+            // 终态谓词：显式取消（executor stop() 会置真 cancel_tokens_）或
+            // writer 整体停止（registry shutdown → AsyncFileWriter::finish()）。
+            const TerminalPredicate space_terminal = [cancel_token, shared_writer]
             {
+                if (cancel_token && cancel_token->load(std::memory_order_acquire))
+                {
+                    return true;
+                }
+#ifdef _WIN32
+                return shared_writer && shared_writer->stopping();
+#else
+                return false;
+#endif
+            };
 
+            std::error_code prepare_error;
+            const bool directory_ready = create_directories_with_space_gate(
+                std::filesystem::path(win32_extended_path(output_dir)),
+                space_gate,
+                space_terminal,
+                &prepare_error);
+
+            if (!directory_ready)
+            {
                 result.status = PasswordTestStatus::Error;
 
                 set_failure(result, "output_prepare", "output_filesystem");
+
+                // ★ 旧代码用 catch(...) 把真实的 std::error_code 整个丢掉了。
+                //   现在把原始信息走**既有**的 trace 通道带出去
+                //   （不新增公共结构字段），让上层能区分"空间不足"与"路径不可用"。
+                result.output_trace.last_win32_error = prepare_error.value();
+                result.output_trace.last_hresult =
+                    static_cast<int>(HRESULT_FROM_WIN32(static_cast<DWORD>(prepare_error.value())));
 
                 result.message = "output directory could not be created";
 

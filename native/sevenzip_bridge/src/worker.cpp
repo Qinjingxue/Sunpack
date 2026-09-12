@@ -33,6 +33,7 @@
 #include "internal/native_worker_sizing.hpp"
 #ifdef _WIN32
 #include "internal/sevenzip_async_output.hpp"
+#include "internal/sevenzip_space_monitor.hpp"
 #include "internal/sevenzip_volume_registry.hpp"
 #endif
 
@@ -1284,12 +1285,27 @@ public:
         sunpack::sevenzip::NativeRuntimeConfig runtime_config
     )
         : writer_meters_(std::make_shared<sunpack::sevenzip::WriterMeters>()),
+          // ★ ChangeSink 的唯一所有者链（§4.7.4.1）：
+          //     NativeJobExecutor（本处，捕获 this）
+          //       → VolumeWriterRegistry(meters, config, sink)
+          //         → VolumeSpaceGate(volume_key, query_root_hint, sink)
+          //   gate 的生命周期长于 writer facility，因此 AsyncFileWriter **绝不**
+          //   持有或重设 sink（否则 facility 被 reap / 重建时会覆盖 persistent
+          //   gate 的回调）。这也要求 executor 的生命周期长于所有 gate ——
+          //   由"registry 在 executor 成员里、且 ~NativeJobExecutor → stop() →
+          //   registry->shutdown() 先于 executor 析构完成"保证。
+          space_change_sink_(
+              [this](const sunpack::sevenzip::VolumeSpaceTransition &transition) {
+                  on_space_transition(transition);
+              }),
           // One environment snapshot for every volume facility: the writers must
           // be identical by construction, not by all happening to read the same
           // variables (§3.4).
+          writer_config_(sunpack::sevenzip::configured_async_writer_config()),
           writer_registry_(std::make_shared<sunpack::sevenzip::VolumeWriterRegistry>(
               writer_meters_,
-              sunpack::sevenzip::configured_async_writer_config())),
+              writer_config_,
+              space_change_sink_)),
           worker_count_((std::max)(std::size_t{1}, sizing.thread_capacity)),
           memory_budget_(sizing.memory_budget_bytes),
           queue_capacity_(configured_native_queue_capacity()),
@@ -1297,6 +1313,20 @@ public:
               worker_count_,
               memory_budget_,
               std::move(runtime_config)) {
+        // ★ monitor 不维护自己的 membership：每个 tick 直接从 registry 拉 blocked
+        //   volumes。tick() **必须**在 executor mutex_ 之外调用（见 controller_loop）。
+        space_monitor_ = std::make_unique<sunpack::sevenzip::VolumeSpaceMonitor>(
+            sunpack::sevenzip::VolumeSpaceMonitor::Options{
+                writer_config_.space_poll_interval,
+                writer_config_.space_status_report_interval},
+            [this] { return writer_registry_->blocked_volumes(); },
+            [this](const sunpack::sevenzip::VolumeStatePtr &state,
+                   std::uint64_t free_bytes,
+                   std::uint64_t pending_bytes,
+                   bool query_ok,
+                   unsigned long query_error) {
+                print_volume_space_status(state, free_bytes, pending_bytes, query_ok, query_error);
+            });
         workers_.reserve(worker_count_);
         for (std::size_t index = 0; index < worker_count_; ++index) {
             workers_.emplace_back([this] { worker_loop(); });
@@ -1394,16 +1424,50 @@ public:
 
     bool had_job_failure() const noexcept { return any_job_failed_; }
 
-    void stop() noexcept {
+    // cancel_pending_jobs：
+    //   true  —— 显式 {"worker_command":"shutdown"}：等价于"取消所有尚未完成的 job"。
+    //            必须先置 terminal 条件再 wake，否则阻塞在卷空间 gate 上的 worker
+    //            永远看不到停止请求，join 永久阻塞（T-WIN-11 / T-WIN-20）。
+    //   false —— stdin EOF：**排空**语义，与改动前逐字节一致。
+    //            ⚠️ 一次性调用（`echo request | worker.exe`）在读完请求后立刻 EOF，
+    //            此时 job 往往还没开始跑。若这里也置 cancel token，就会把刚提交的
+    //            job 直接打成 cancelled（实测会让 18 个既有 worker 用例失败）。
+    void stop(bool cancel_pending_jobs = true) noexcept {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (stopping_) {
                 return;
             }
             stopping_ = true;
+            // ★ 关键顺序：**先把所有 job 的 terminal 条件置位，再 wake。**
+            //
+            //   只 wake 而不改变任何 terminal 条件是没有意义的 —— 被唤醒的 writer
+            //   会重新求值为 false 并继续睡，join() 永久阻塞。
+            //
+            //   cancel_tokens_ 已经持有每个 active job 的共享 cancel token，因此
+            //   置真它们即覆盖**全部有 job 的 writer**；没有 job 的 writer 由
+            //   AsyncFileWriter::finish()（registry shutdown 时）置自己的 stopping_。
+            //   两者合起来覆盖每一个 gate waiter。
+            //
+            //   ⚠️ 只在**显式 shutdown 命令**上置位；stdin EOF 走"排空"语义（见
+            //      stop() 的参数说明）。
+            if (cancel_pending_jobs) {
+                for (auto& entry : cancel_tokens_) {
+                    if (entry.second && entry.second->cancel_token) {
+                        entry.second->cancel_token->store(true, std::memory_order_release);
+                    }
+                }
+            }
         }
         condition_.notify_all();
         controller_condition_.notify_all();
+#ifdef _WIN32
+        // ★ 必须在 join() **之前**：否则卡在 volume gate 上的 worker 永远看不到
+        //   上面已置位的 terminal 条件，join 永久阻塞。
+        //   因为 gate 没有 aborted_ 永久闩锁，这一步只是 wake_waiters() 的广播，
+        //   **不改变任何 gate 状态**（persistent volume 的 gate 不会被毒死）。
+        writer_registry_->abort_all_space_gates();
+#endif
         if (controller_thread_.joinable()) {
             controller_thread_.join();
         }
@@ -1675,6 +1739,141 @@ private:
             "\",\"volume_key\":\"" + json_escape(volume_key) + "\"}");
     }
 
+    // ---------------------------------------------------------------------
+    // 卷空间事件（§4.7）。
+    //
+    // ★ 通道必须是 `progress` + **真实 job_id** + 逐 job 发送：
+    //   两条 dispatcher 都会丢弃 job_id 为空或查不到的事件，而
+    //   `native_event_callback` 在生产代码里从未接线（死代码）。
+    //
+    // ★ 事件名与 Python 内部状态名**刻意不同名**：
+    //      native: space_blocked / space_status / space_resumed
+    //      Python: state["space_waiting"]
+    //   避免"space_waiting 到底是状态转换、心跳还是诊断"的语义混乱。
+    //
+    // ★ 扇出对象是 `affected_jobs_`（job 集合），**不是** waiters_（线程集合）：
+    //   probe owner 抢到许可后会从 waiters_ 移除，遍历 waiters_ 会让它永远收不到
+    //   space_resumed；而卡在 producer backpressure 的 job 根本不会有 writer 线程
+    //   进入 gate->wait()。
+    // ---------------------------------------------------------------------
+    static const char* space_event_name(
+        sunpack::sevenzip::VolumeSpaceTransition::Kind kind
+    ) noexcept {
+        switch (kind) {
+            case sunpack::sevenzip::VolumeSpaceTransition::Kind::Blocked:
+                return "space_blocked";
+            case sunpack::sevenzip::VolumeSpaceTransition::Kind::Resumed:
+                return "space_resumed";
+            case sunpack::sevenzip::VolumeSpaceTransition::Kind::Status:
+            default:
+                return "space_status";
+        }
+    }
+
+    static std::string space_event_payload(
+        const char* event,
+        const std::string& job_id,
+        const std::string& volume_key,
+        std::uint64_t episode_id,
+        unsigned long win32_error,
+        std::uint64_t free_bytes,
+        std::uint64_t pending_bytes,
+        double blocked_seconds,
+        bool query_ok,
+        unsigned long query_error
+    ) {
+        std::string payload =
+            "{\"type\":\"progress\",\"job_id\":\"" + json_escape(job_id) +
+            "\",\"event\":\"" + event +
+            "\",\"volume_key\":\"" + json_escape(volume_key) +
+            "\",\"episode_id\":" + std::to_string(episode_id) +
+            ",\"win32_error\":" + std::to_string(win32_error) +
+            ",\"free_bytes\":" + std::to_string(free_bytes) +
+            ",\"pending_bytes\":" + std::to_string(pending_bytes) +
+            ",\"blocked_seconds\":" + std::to_string(blocked_seconds) +
+            ",\"volume_query_ok\":" + (query_ok ? "true" : "false") +
+            ",\"volume_query_error\":" + std::to_string(query_error) + "}";
+        return payload;
+    }
+
+    static void print_volume_space_event(
+        const sunpack::sevenzip::VolumeSpaceTransition& transition
+    ) noexcept {
+        const char* event = space_event_name(transition.kind);
+        for (const auto& job_id : transition.job_ids) {
+            print_json_line(space_event_payload(
+                event,
+                job_id,
+                transition.volume_key,
+                transition.episode_id,
+                transition.win32_error,
+                transition.free_bytes,
+                transition.pending_bytes,
+                transition.blocked_seconds,
+                transition.query_ok,
+                transition.query_error));
+        }
+    }
+
+    void print_volume_space_status(
+        const sunpack::sevenzip::VolumeStatePtr& state,
+        std::uint64_t free_bytes,
+        std::uint64_t pending_bytes,
+        bool query_ok,
+        unsigned long query_error
+    ) noexcept {
+        if (!state || !state->space_gate) {
+            return;
+        }
+        // 低频诊断（默认 15s）。**不是**看门狗保活：Python 的 space_waiting 只由
+        // space_blocked / space_resumed 驱动。
+        const auto& gate = *state->space_gate;
+        const auto job_ids = gate.affected_job_ids();
+        if (job_ids.empty()) {
+            return;
+        }
+        const std::uint64_t episode_id = gate.episode_id();
+        for (const auto& job_id : job_ids) {
+            print_json_line(space_event_payload(
+                "space_status",
+                job_id,
+                transition_volume_key(state),
+                episode_id,
+                query_ok ? 0UL : query_error,
+                free_bytes,
+                pending_bytes,
+                0.0,
+                query_ok,
+                query_error));
+        }
+    }
+
+    static std::string transition_volume_key(
+        const sunpack::sevenzip::VolumeStatePtr& state
+    ) {
+        return state ? state->key : std::string{};
+    }
+
+    // gate 的 ChangeSink 落地：既驱动 controller 的 discontinuity generation，
+    // 又把事件扇出给每个 affected job。
+    void on_space_transition(
+        const sunpack::sevenzip::VolumeSpaceTransition& transition
+    ) noexcept {
+        using Kind = sunpack::sevenzip::VolumeSpaceTransition::Kind;
+        switch (transition.kind) {
+            case Kind::Blocked:
+            case Kind::Resumed:
+                // 只有这两类转换会改变"吞吐环境"，因此只有它们推进 generation。
+                // Probing -> Blocked（probe 失败 / inconclusive）**不**推进。
+                space_epoch_.fetch_add(1, std::memory_order_acq_rel);
+                break;
+            case Kind::Status:
+            default:
+                break;
+        }
+        print_volume_space_event(transition);
+    }
+
 #ifdef _WIN32
     static std::uint64_t filetime_ticks(const FILETIME& value) noexcept {
         ULARGE_INTEGER combined{};
@@ -1785,10 +1984,19 @@ private:
             if (monitor_parked) {
                 auto parked_wait = parked_wait_cap;
 #ifdef _WIN32
+                // ★ sticky hint：一旦进程出现过 blocked 卷，parked 睡眠上限就降到
+                //   poll_interval。它**不是精确状态**（绝不能用 has_blocked_ +
+                //   note_ready() 那种写法：多卷场景下"A 恢复 → 清零 → 仍 Blocked 的
+                //   B 永远不再被 poll"）。它也绝不参与"要不要 poll 哪些 gate"——
+                //   那个决定每个 tick 都从 registry.blocked_volumes() 重新拉。
+                if (space_monitor_->ever_had_blocked() &&
+                    writer_config_.space_poll_interval > std::chrono::milliseconds::zero()) {
+                    parked_wait = (std::min)(parked_wait, writer_config_.space_poll_interval);
+                }
                 if (const auto deadline = writer_registry_->next_reap_deadline()) {
                     const auto now = std::chrono::steady_clock::now();
                     parked_wait = (std::min)(
-                        parked_wait_cap,
+                        parked_wait,
                         *deadline > now
                             ? std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now) +
                                 std::chrono::milliseconds(1)
@@ -1809,14 +2017,30 @@ private:
                 break;
             }
             controller_recheck_ = false;
+            const auto now = std::chrono::steady_clock::now();
+            // ★ 关键：**把 reap 和 space monitor 都移出 executor 的锁**。
+            //
+            //   reap_idle() 自己取 registry mutex_，不需要 executor mutex_
+            //   （顺带修掉一个既有的"持锁过久"问题）。
+            //
+            //   space_monitor_->tick() 会通过 blocked_volumes() 取 registry mutex_，
+            //   并可能执行一次很慢的 GetDiskFreeSpaceExW（离线 UNC / 坏盘可能卡几秒）。
+            //   若在 mutex_ 内调用，submit() / cancel() / admission 会被全部堵住；
+            //   锁序也会变成 executor → registry → gate，与 worker_loop 的
+            //   executor → registry 叠加后，任何 gate → executor 的回调都会死锁。
+            wait_lock.unlock();
 #ifdef _WIN32
             // Driven from this thread rather than a reaper thread of its own: the
             // parked path above already wakes on the earliest reclaim deadline.
             for (const auto& volume : writer_registry_->reap_idle()) {
                 print_writer_facility_event("writer_facility_reaped", volume);
             }
+            // 采样器只在"进程曾经出现过 blocked 卷"之后才真正工作（sticky hint），
+            // 因此在没有磁盘满的正常运行中这一行几乎零成本。
+            space_monitor_->tick(now);
 #endif
-            const auto now = std::chrono::steady_clock::now();
+            wait_lock.lock();
+
             if (monitor_parked) {
                 if (queue_.empty() && active_jobs_ == 0) {
                     continue;
@@ -1838,6 +2062,9 @@ private:
                 const double idle_seconds = std::chrono::duration<double>(
                     now - idle_since).count();
                 runtime_controller_.begin_activity(counters, idle_seconds);
+                // 刚从 parked 进入 active：begin_activity 已经 prime + reset 了
+                // 学习状态，因此把 generation 基线对齐，避免多触发一次无用 rebase。
+                last_seen_space_epoch_ = space_epoch_.load(std::memory_order_acquire);
                 monitor_parked = false;
                 last_sample_at = now - std::chrono::milliseconds(minimum_sample_interval_ms);
                 reset_system_cpu_sample();
@@ -1924,14 +2151,26 @@ private:
                 if (stopping_) {
                     break;
                 }
+                // ★ 外部不连续（卷可写集合变化）后的重建：必须在 observe() **之前**。
+                //   last_seen_space_epoch_ 是**赋值**而不是自增，因此一个 tick 内
+                //   17 → 19 只会 rebase 一次（对"累加多次"天然幂等）。
+                //   rebase 必须带 current_counters：prime_counters() 是唯一更新
+                //   previous_counters_ 的地方，缺它则第一个新 baseline 的 delta
+                //   会跨越 discontinuity，学习仍被污染。
+                const std::uint64_t space_epoch = space_epoch_.load(std::memory_order_acquire);
+                if (space_epoch != last_seen_space_epoch_) {
+                    last_seen_space_epoch_ = space_epoch;
+                    changed = runtime_controller_.rebase_after_external_discontinuity(throughput);
+                }
                 queued_jobs = queue_.size();
                 changed = runtime_controller_.observe(
-                    sample,
-                    throughput,
-                    queued_jobs,
-                    active_jobs_,
-                    active_memory_,
-                    elapsed_seconds);
+                                sample,
+                                throughput,
+                                queued_jobs,
+                                active_jobs_,
+                                active_memory_,
+                                elapsed_seconds) ||
+                          changed;
                 snapshot = runtime_controller_.snapshot(
                     active_jobs_, active_memory_);
             }
@@ -2023,6 +2262,16 @@ private:
                         print_writer_facility_event("writer_facility_created", key);
                     }
                     register_cancel_writer(job.request, lease.writer_pointer());
+                    // ★ affected_jobs_ 的注册点在 **volume lease scope**，不是
+                    //   make_job / finish_job —— 根输出目录创建（满盘最常见的入口）
+                    //   发生在 make_job 之前，否则那次满盘会开启 episode 却通知 0 个 job，
+                    //   Python 看门狗会把"合法暂停"当成 no-progress 杀掉。
+                    //
+                    //   ⚠️ 必须声明在 lease **之后**：C++ 逆序析构保证
+                    //      registration 先于 lease 析构 → 注销发生在 lease 释放之前。
+                    //   job_id 此时已经可用（下面 job_finished 用的就是它）。
+                    const std::string scope_job_id = json_string_field(job.request, "job_id", "");
+                    sunpack::sevenzip::SpaceJobRegistration space_registration(lease, scope_job_id);
                     code = run_request(job.request, lease.writer_pointer(), job.cancel_token);
                 } else {
                     // Dry runs write nothing: no facility, no writer threads, no
@@ -2068,8 +2317,24 @@ private:
     // Process-wide write meters and the per-volume facilities.  The meters are
     // declared first so they outlive every writer: a reclaimed facility must never
     // take the aggregate counters with it (§3.1).
+    //
+    // ★ 声明顺序即析构顺序的逆序，这三项的顺序是**有约束的**：
+    //     space_change_sink_ 捕获 this 并被 gate 长期持有
+    //       ⇒ 必须在 writer_registry_ **之前**声明（后析构）
+    //     writer_config_ 被 writer_registry_ 与 space_monitor_ 使用
+    //       ⇒ 必须在两者之前声明
+    //     space_monitor_ 的 BlockedProvider 捕获 this 并调用 writer_registry_
+    //       ⇒ 必须在 writer_registry_ **之后**声明（先析构）
     sunpack::sevenzip::WriterMetersPtr writer_meters_;
+    sunpack::sevenzip::VolumeSpaceChangeSink space_change_sink_;
+    sunpack::sevenzip::AsyncWriterConfig writer_config_;
     sunpack::sevenzip::VolumeWriterRegistryPtr writer_registry_;
+    std::unique_ptr<sunpack::sevenzip::VolumeSpaceMonitor> space_monitor_;
+    // throughput environment discontinuity generation：任何可能让吞吐比较失真的
+    // 空间状态变化都让它前进一次。controller 只问"自上次采样以来有没有发生过"，
+    // 不关心发生了一次还是三次（因此 controller 侧是**赋值**而不是自增）。
+    std::atomic<std::uint64_t> space_epoch_{0};
+    std::uint64_t last_seen_space_epoch_ = 0;
     std::deque<Job> queue_;
     std::unordered_map<std::string, std::shared_ptr<JobControl>> cancel_tokens_;
     std::mutex mutex_;
@@ -2164,10 +2429,14 @@ int main() {
         const bool shutdown = json_string_field(line, "worker_command", "") == "shutdown";
         const int code = run_message(line, executor);
         if (shutdown) {
+            // 显式 shutdown：取消所有尚未完成的 job（这也是打破"满盘暂停"闭环的
+            // 最小改动：满盘阻塞的 worker 必须先看到 terminal 条件才能被 join）。
             executor.stop();
             return code;
         }
     }
-    executor.stop();
+    // stdin EOF：一次性调用（`echo request | worker.exe`）的正常结束。
+    // **排空**队列后再退出，不取消任何 job —— 与改动前逐字节一致。
+    executor.stop(/*cancel_pending_jobs=*/false);
     return executor.had_job_failure() ? 1 : 0;
 }

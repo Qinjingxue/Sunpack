@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cwchar>
+#include <optional>
 
 namespace sunpack::sevenzip
 {
@@ -73,6 +74,22 @@ namespace sunpack::sevenzip
             return text[0] == L'1' || text[0] == L'y' || text[0] == L'Y';
         }
 
+        // 三态版本：**"未设置"与"显式设为假"必须可区分**。
+        //
+        // ⚠️ 这正是 space_gate_enabled 的"默认开启"能成立的原因：若沿用
+        //    configured_flag()（未设置也返回 false），那么无论结构体默认值写什么，
+        //    都会被这里覆盖成 false —— "默认开启"永远不生效（R22 的真实形态）。
+        std::optional<bool> configured_flag_value(const wchar_t *name) noexcept
+        {
+            wchar_t text[8]{};
+            const DWORD length = GetEnvironmentVariableW(name, text, static_cast<DWORD>(std::size(text)));
+            if (length == 0 || length >= std::size(text))
+            {
+                return std::nullopt; // 未设置（或空值）→ 保持结构体默认值
+            }
+            return length == 1 && (text[0] == L'1' || text[0] == L'y' || text[0] == L'Y');
+        }
+
     } // namespace
 
     AsyncWriterConfig configured_async_writer_config() noexcept
@@ -93,6 +110,18 @@ namespace sunpack::sevenzip
             kDefaultIdleTimeoutMs / 1000ULL,
             kMaxIdleTimeoutMs / 1000ULL);
         config.idle_timeout = std::chrono::milliseconds(idle_seconds * 1000ULL);
+
+        // --- 空间不足自动暂停/恢复 ---
+        // ★ 唯一的总开关。**未设置时保持结构体默认值（当前为 true）**，
+        //   显式设置才覆盖 —— 这样"默认开启"与"一键回退（=0）"同时成立。
+        if (const auto flag = configured_flag_value(L"SUNPACK_VOLUME_SPACE_GATE"))
+        {
+            config.space_gate_enabled = *flag;
+        }
+        config.space_poll_interval = std::chrono::milliseconds(configured_size(
+            L"SUNPACK_VOLUME_SPACE_POLL_MS", 1000, 50, 60000));
+        config.space_status_report_interval = std::chrono::milliseconds(configured_size(
+            L"SUNPACK_VOLUME_SPACE_STATUS_REPORT_MS", 15000, 1000, 600000));
         return config;
     }
 

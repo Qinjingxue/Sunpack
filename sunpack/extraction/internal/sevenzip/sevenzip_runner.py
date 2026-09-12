@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import queue
 import subprocess
@@ -19,6 +20,8 @@ from sunpack.support.archive_state_view import ArchiveStateByteView
 from sunpack.support.output_paths import normalized_output_dir, resolve_output_volume_key
 from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
 from sunpack.support.runtime_cwd import runtime_working_directory
+
+_LOGGER = logging.getLogger(__name__)
 
 
 def _apply_native_environment(environment: dict[str, str], process_config: dict) -> dict[str, str]:
@@ -116,13 +119,114 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
         "SUNPACK_NATIVE_MEMORY_RESUME_AVAILABLE_BYTES",
     )
     set_int("max_queue_jobs", "SUNPACK_NATIVE_MAX_QUEUE_JOBS")
+    # --- 空间不足自动暂停/恢复（卷级 gate）---------------------------------
+    # ★ 唯一的总开关。默认关闭，只在实现文档 Phase 6（PR-6）的最后一步改为默认开启。
+    #   ⚠️ 只允许一个开关：曾考虑过的 space_events_understood 是第二个 feature gate，
+    #      已按架构师意见删除，不要加回来。
+    space_gate = process_config.get("space_gate_enabled")
+    if space_gate is not None:
+        enabled = str(space_gate).strip().lower() not in {"0", "false", "no", "off"}
+        environment["SUNPACK_VOLUME_SPACE_GATE"] = "1" if enabled else "0"
+    set_int("space_poll_interval_ms", "SUNPACK_VOLUME_SPACE_POLL_MS", minimum=50)
+    set_int(
+        "space_status_report_interval_ms",
+        "SUNPACK_VOLUME_SPACE_STATUS_REPORT_MS",
+        minimum=1000,
+    )
     environment.pop("SUNPACK_NATIVE_PROCESS_MODE", None)
     return environment
 
 
+# native 侧的空间事件名。**与 Python 内部状态名刻意不同名**：
+#     native: space_blocked / space_status / space_resumed
+#     Python: state["space_waiting"]
+# 避免"space_waiting 到底是状态转换、心跳还是诊断"的语义混乱。
+_SPACE_EVENTS = frozenset({"space_blocked", "space_status", "space_resumed"})
+_SPACE_JOB_STATES = frozenset({"queued", "admitted", "running", "output_closed"})
+_KNOWN_JOB_EVENTS = frozenset(
+    {
+        "job_queued",
+        "job_admitted",
+        "job_started",
+        "job_finished",
+        "result",
+        *_SPACE_EVENTS,
+    }
+)
+
+
+def _on_space_event(state: dict[str, Any], event: str, payload: dict) -> None:
+    """把空间事件折进 job 等待状态，**不污染 job 生命周期状态机**。
+
+    ⚠️ 必须拒绝 stale event：native 侧在 gate 锁内生成 transition、锁**外**发送，
+    因此 resumed(ep17) 可能先于 blocked(ep17) 到达。若照单全收，space_waiting 会被
+    永久置回 True。只靠 (space_episode, space_resumed_seen) 两个值即可判定。
+    """
+
+    try:
+        episode = int(payload.get("episode_id") or 0)
+    except (TypeError, ValueError):
+        episode = 0
+    latest = int(state.get("space_episode") or 0)
+    if episode < latest:
+        return  # 旧 episode，丢弃
+    if episode > latest:
+        state["space_episode"] = episode
+        state["space_resumed_seen"] = False
+
+    if event == "space_resumed":
+        state["space_resumed_seen"] = True
+        state["space_waiting"] = False
+    else:  # space_blocked / space_status
+        if state.get("space_resumed_seen"):
+            return  # ★ stale：同一 episode 已恢复过
+        if event == "space_blocked":
+            state["space_waiting"] = True
+            state["space_blocked_volume_key"] = str(payload.get("volume_key") or "")
+            try:
+                state["space_blocked_win32_error"] = int(payload.get("win32_error") or 0)
+            except (TypeError, ValueError):
+                state["space_blocked_win32_error"] = 0
+
+
+def _apply_native_event_to_job_state(
+    state: dict[str, Any], payload: dict, logger: Any = None
+) -> bool:
+    """返回 True 表示消费了该事件（它属于空间事件，不得写入 state["state"]）。
+
+    非空间事件仍按既有语义写入 `state["state"] = event.removeprefix("job_")`。
+    """
+
+    if not isinstance(payload, dict):
+        return False
+    event = str(payload.get("event") or "")
+    if payload.get("type") == "result":
+        state["state"] = "result_received"
+        return False
+    if not event:
+        if logger is not None and payload.get("type"):
+            logger.debug("sevenzip_worker unknown event type: %s", payload.get("type"))
+        return False
+    if event in _SPACE_EVENTS:
+        _on_space_event(state, event, payload)
+        return True
+    if payload.get("type") == "progress" and event not in _KNOWN_JOB_EVENTS:
+        if logger is not None:
+            logger.debug("sevenzip_worker unknown progress event: %s", event)
+    state["state"] = event.removeprefix("job_")
+    return False
+
+
 def _worker_job_deadline(state: dict[str, Any]) -> float | None:
+    # 显式取消优先：cancel deadline 不受 space-wait 影响，
+    # 否则"磁盘满以后连用户都无法取消"（B1）。
     if state.get("cancel_requested"):
         return float(state.get("cancel_deadline") or 0.0)
+    # 合法暂停：不产生 no-progress deadline（看门狗不计时）。
+    # 注意这与 space_poll_interval **完全解耦**：看门狗配 0.05s 也不会误杀
+    # space-blocked 的 job，因为它根本不再计时。
+    if state.get("space_waiting"):
+        return None
     no_progress_timeout = max(0.0, float(state.get("no_progress_timeout") or 0.0))
     if not no_progress_timeout:
         return None
@@ -275,17 +379,13 @@ class _NativeWorkerProcess:
                     async_state = self._async_jobs.get(job_id) if job_id else None
                     job_state = self._job_states.get(job_id) if job_id else None
                     if job_state is not None and isinstance(payload, dict):
-                        event = str(payload.get("event") or "")
-                        if payload.get("type") == "result":
-                            job_state["state"] = "result_received"
-                        elif event == "job_queued":
-                            job_state["state"] = "queued"
-                        elif event == "job_admitted":
-                            job_state["state"] = "admitted"
-                        elif event == "job_started":
-                            job_state["state"] = "running"
-                        elif event == "job_finished":
-                            job_state["state"] = "output_closed"
+                        # 空间事件表达的是"等待状态"，不是 job 生命周期状态。
+                        # 绝不能写进 job_state["state"]（watch_memory / 基准测试读到的
+                        # 状态会失真），但 payload 仍要交给 on_line 送到 progress_callback。
+                        if _apply_native_event_to_job_state(
+                            job_state, payload, _LOGGER
+                        ):
+                            job_state["last_progress_at"] = time.monotonic()
                 if async_state is not None:
                     completed = False
                     callback_error = ""
@@ -583,11 +683,10 @@ class _AsyncNativeWorkerProcess:
                     continue
                 state["last_progress_at"] = time.monotonic()
                 self._deadline_changed.set()
-                event = str(payload.get("event") or "") if isinstance(payload, dict) else ""
-                if payload.get("type") == "result":
-                    state["state"] = "result_received"
-                elif event:
-                    state["state"] = event.removeprefix("job_")
+                # ⚠️ 空间事件必须在 `state["state"] = event.removeprefix("job_")`
+                #    **之前**被识别，否则 job 生命周期状态仍会被污染。
+                #    payload 仍要交给 on_line，以便送到 progress_callback → UI。
+                _apply_native_event_to_job_state(state, payload, _LOGGER)
                 try:
                     completed = bool(state["on_line"](line))
                 except Exception as exc:

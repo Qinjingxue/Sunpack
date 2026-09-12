@@ -98,7 +98,10 @@
       "memory_budget_bytes": 0,
       "job_buffer_budget_bytes": 33554432,
       "memory_pause_available_mb": 1024,
-      "memory_resume_available_mb": 2048
+      "memory_resume_available_mb": 2048,
+      "space_gate_enabled": true,
+      "space_poll_interval_ms": 1000,
+      "space_status_report_interval_ms": 15000
     },
     "resource_guard": {
       "enabled": false,

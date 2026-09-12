@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
 
+#include <algorithm>
 #include <chrono>
 #include <utility>
 
@@ -36,9 +37,12 @@ namespace sunpack::sevenzip
         writer_.reset();
     }
 
-    VolumeWriterRegistry::VolumeWriterRegistry(WriterMetersPtr meters, AsyncWriterConfig config)
+    VolumeWriterRegistry::VolumeWriterRegistry(WriterMetersPtr meters,
+                                               AsyncWriterConfig config,
+                                               VolumeSpaceChangeSink sink)
         : meters_(meters ? std::move(meters) : std::make_shared<WriterMeters>()),
-          config_(config) {}
+          config_(config),
+          sink_(std::move(sink)) {}
 
     VolumeWriterRegistry::~VolumeWriterRegistry() { shutdown(); }
 
@@ -58,6 +62,39 @@ namespace sunpack::sevenzip
                 found = entries_.emplace(key, std::move(entry)).first;
             }
             Entry &entry = found->second;
+
+            // ★ gate 懒创建 + 只在这里注入 sink。已有 entry 的 gate 绝不重设
+            //   （persistent gate 的回调在 writer 回收 / 重建期间保持不变）。
+            //   ★ 只在**功能开启**时创建：space_gate_enabled = false 时
+            //     VolumeState::space_gate 必须保持 nullptr，让所有空间判定短路、
+            //     走完全现状的永久失败路径（§7.3）。这也是"每次 acquire() 零新增
+            //     开销"的保证（writer_construction_cost 是回归红线）。
+            //   空 key 的兜底 writer（无真实卷身份）同样不创建 gate。
+            if (!entry.state->space_gate && !key.empty() && config_.space_gate_enabled)
+            {
+                // pending_bytes 是 gate 唯一拿不到的展示字段（gate 不认识 VolumeState，
+                // 依赖方向必须单向）。用 weak_ptr 在 sink 包装里补齐，**不能**捕获
+                // shared_ptr（VolumeState → gate → lambda → VolumeState = 泄漏）。
+                std::weak_ptr<VolumeState> weak_state = entry.state;
+                const VolumeSpaceChangeSink inner = sink_;
+                entry.state->space_gate = std::make_shared<VolumeSpaceGate>(
+                    key,
+                    std::string{},
+                    [weak_state, inner](const VolumeSpaceTransition &transition)
+                    {
+                        if (!inner)
+                        {
+                            return;
+                        }
+                        VolumeSpaceTransition enriched = transition;
+                        if (const auto state = weak_state.lock())
+                        {
+                            enriched.pending_bytes = pending_bytes_of(state->counters);
+                        }
+                        inner(enriched);
+                    });
+            }
+
             if (!entry.writer)
             {
 
@@ -220,6 +257,44 @@ namespace sunpack::sevenzip
             keys.push_back(item.first);
         }
         return keys;
+    }
+
+    std::vector<VolumeStatePtr> VolumeWriterRegistry::blocked_volumes() const
+    {
+        std::vector<VolumeStatePtr> blocked;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            blocked.reserve(entries_.size());
+            for (const auto &item : entries_)
+            {
+                const VolumeStatePtr &state = item.second.state;
+                // 只做 shared_ptr 快照，**不在锁内调用 gate**（那会引入 registry → gate
+                // 之外的额外持锁时间；blocked() 自身要取 gate mutex_）。
+                if (state && state->space_gate)
+                {
+                    blocked.push_back(state);
+                }
+            }
+        }
+
+        // 锁外过滤：锁序 registry → 释放 → gate，与 reap_idle() 同序。
+        blocked.erase(
+            std::remove_if(blocked.begin(), blocked.end(),
+                           [](const VolumeStatePtr &state)
+                           { return !state->space_gate->blocked(); }),
+            blocked.end());
+        return blocked;
+    }
+
+    void VolumeWriterRegistry::abort_all_space_gates() noexcept
+    {
+        // 关停路径：只唤醒，**不改变任何 gate 状态**。
+        // 被唤醒的 writer 用自己传入的 terminal predicate 决定去留；因为
+        // NativeJobExecutor::stop() 已经先把所有 cancel_token 置真，谓词此刻为真。
+        for (const auto &state : blocked_volumes())
+        {
+            state->space_gate->wake_waiters();
+        }
     }
 
     void VolumeWriterRegistry::shutdown() noexcept

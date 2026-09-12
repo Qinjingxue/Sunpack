@@ -26,6 +26,17 @@ function(apply_release_optimizations target_name)
     endif()
 endfunction()
 
+# Every translation unit in this project is UTF-8: comments carry Chinese text and
+# the section sign (U+00A7).  Without /utf-8 MSVC decodes sources with the system code
+# page (936 on the development machines), which mojibakes the comments and — worse —
+# can swallow the following source character when a multi-byte sequence's trailing
+# byte is interpreted as a lead byte.  That turns documentation into syntax errors.
+function(apply_source_charset target_name)
+    if(MSVC)
+        target_compile_options(${target_name} PRIVATE /utf-8)
+    endif()
+endfunction()
+
 set(SUP7Z_INTERNAL_SOURCES
     src/internal/archive_extract.cpp
     src/internal/archive_crc_manifest.cpp
@@ -51,6 +62,7 @@ add_library(sunpack_sevenzip_core STATIC
     ${SUP7Z_INTERNAL_SOURCES}
 )
 apply_release_optimizations(sunpack_sevenzip_core)
+apply_source_charset(sunpack_sevenzip_core)
 
 target_include_directories(sunpack_sevenzip_core
     PUBLIC
@@ -71,6 +83,7 @@ add_library(sunpack_sevenzip SHARED
     ${SUP7Z_INTERNAL_SOURCES}
 )
 apply_release_optimizations(sunpack_sevenzip)
+apply_source_charset(sunpack_sevenzip)
 
 target_include_directories(sunpack_sevenzip
     PUBLIC
@@ -86,6 +99,7 @@ add_executable(sunpack_sevenzip_smoke
     tests/smoke.cpp
 )
 apply_release_optimizations(sunpack_sevenzip_smoke)
+apply_source_charset(sunpack_sevenzip_smoke)
 
 target_link_libraries(sunpack_sevenzip_smoke
     PRIVATE sunpack_sevenzip_core
@@ -100,6 +114,7 @@ add_executable(sunpack_sevenzip_async_output
     tests/async_output.cpp
 )
 apply_release_optimizations(sunpack_sevenzip_async_output)
+apply_source_charset(sunpack_sevenzip_async_output)
 
 target_link_libraries(sunpack_sevenzip_async_output
     PRIVATE sunpack_sevenzip_core
@@ -110,10 +125,51 @@ target_include_directories(sunpack_sevenzip_async_output
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
+# L1: VolumeSpaceGate 纯逻辑单测（无文件系统、无满盘）。
+add_executable(sunpack_sevenzip_space_gate
+    tests/space_gate.cpp
+)
+apply_release_optimizations(sunpack_sevenzip_space_gate)
+apply_source_charset(sunpack_sevenzip_space_gate)
+
+target_link_libraries(sunpack_sevenzip_space_gate
+    PRIVATE sunpack_sevenzip_core
+)
+
+target_include_directories(sunpack_sevenzip_space_gate
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+if(WIN32)
+    target_compile_definitions(sunpack_sevenzip_space_gate PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
+# L2: writer 重试 + 记账不变量单测（注入式失败）。
+add_executable(sunpack_sevenzip_space_retry
+    tests/space_retry.cpp
+)
+apply_release_optimizations(sunpack_sevenzip_space_retry)
+apply_source_charset(sunpack_sevenzip_space_retry)
+
+target_link_libraries(sunpack_sevenzip_space_retry
+    PRIVATE sunpack_sevenzip_core
+)
+
+target_include_directories(sunpack_sevenzip_space_retry
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+)
+
+if(WIN32)
+    target_compile_definitions(sunpack_sevenzip_space_retry PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
 add_executable(sunpack_sevenzip_writer_cost
     tests/writer_construction_cost.cpp
 )
 apply_release_optimizations(sunpack_sevenzip_writer_cost)
+apply_source_charset(sunpack_sevenzip_writer_cost)
 
 target_link_libraries(sunpack_sevenzip_writer_cost
     PRIVATE sunpack_sevenzip_core
@@ -128,6 +184,7 @@ add_executable(sunpack_sevenzip_worker
     src/worker.cpp
 )
 apply_release_optimizations(sunpack_sevenzip_worker)
+apply_source_charset(sunpack_sevenzip_worker)
 
 target_link_libraries(sunpack_sevenzip_worker
     PRIVATE sunpack_sevenzip_core
@@ -138,14 +195,13 @@ if(WIN32)
 
     add_executable(sunpack_launcher src/launcher.cpp)
     apply_release_optimizations(sunpack_launcher)
+    apply_source_charset(sunpack_launcher)
     target_compile_definitions(sunpack_launcher PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
-    if(MSVC)
-        # launcher.cpp contains UTF-8 string literals (localized messages).
-        target_compile_options(sunpack_launcher PRIVATE /utf-8)
-    endif()
     target_link_libraries(sunpack_launcher PRIVATE Shell32)
 endif()
 
 enable_testing()
 add_test(NAME sunpack_sevenzip_smoke COMMAND sunpack_sevenzip_smoke)
 add_test(NAME sunpack_sevenzip_async_output COMMAND sunpack_sevenzip_async_output)
+add_test(NAME sunpack_sevenzip_space_gate COMMAND sunpack_sevenzip_space_gate)
+add_test(NAME sunpack_sevenzip_space_retry COMMAND sunpack_sevenzip_space_retry)

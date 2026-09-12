@@ -9,6 +9,19 @@ from sunpack.contracts.failures import FailureInfo
 from sunpack.contracts.results import ArchiveCleanupResult
 from sunpack.i18n import I18nContext
 
+# native 侧的空间事件名（与 sevenzip_runner 的 _SPACE_EVENTS 一致）。
+# 它们表达的是"等待状态"，不是 job 生命周期状态。
+_SPACE_EVENTS = frozenset({"space_blocked", "space_status", "space_resumed"})
+
+
+def _format_bytes(value: int) -> str:
+    size = float(max(0, int(value)))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < 1024.0 or unit == "TiB":
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024.0
+    return f"{size:.1f} TiB"
+
 
 class RunReporter:
     """Thread-safe, user-facing progress for one pipeline run."""
@@ -41,6 +54,12 @@ class RunReporter:
         self._panel_tasks: list[int] = []
         self._task_rows: dict[int, dict[str, Any]] = {}
         self._last_streamed_progress: dict[int, int] = {}
+        # (volume_key, episode_id) -> 仍在等待该 episode 的 job_id 集合。
+        # ★ job 终态时必须把它从所有 episode 集合里移除；集合空则提示消失。
+        #   gate 正确地不会因为"最后一个 waiter 消失"而恢复（铁律一），因此
+        #   **不能**只在收到 space_resumed 时才清理 —— 否则所有等待 job 都被取消后，
+        #   watch 模式会永久留下"空间不足"提示（§4.7.5）。
+        self._space_blocked_jobs: dict[tuple[str, int], set[str]] = {}
         self._last_render_at = 0.0
 
     def scan_started(self, round_index: int) -> None:
@@ -112,6 +131,10 @@ class RunReporter:
     def task_progress(self, task: Any, event: dict[str, Any]) -> None:
         if self.quiet:
             return
+        name = str(event.get("event") or "")
+        if name in _SPACE_EVENTS:
+            self._space_progress(task, name, event)
+            return
         try:
             completed = max(0, int(event.get("completed_bytes", 0) or 0))
             total = max(0, int(event.get("total_bytes", 0) or 0))
@@ -124,6 +147,10 @@ class RunReporter:
                 return
             old_percent = int(float(row.get("progress", 0.0)) * 100)
             new_percent = int(progress * 100)
+            # 磁盘满暂停期间不得把状态改回 extracting：暂停是"等待"，不是进度。
+            if row.get("space_blocked"):
+                self._remember_progress_locked(row, progress, completed, total)
+                return
             row.update({
                 "state": "extracting",
                 "progress": progress,
@@ -143,6 +170,69 @@ class RunReporter:
                 if new_percent >= 100 or displayed_percent >= last_percent + 10:
                     self._last_streamed_progress[task_id] = displayed_percent
                     self._print(self._format_task_row(row))
+
+    # ------------------------------------------------------------------
+    # 空间不足暂停/恢复（§4.7.2 / §4.7.5）
+    #
+    # ★ 按 (volume_key, episode_id) 去重：同一卷的多个 job、以及 native 侧
+    #   锁外发送造成的重复事件都只会显示一次。
+    # ★ space_status 是**低频诊断**（默认 15s），不是看门狗保活。
+    # ★ 卷不可查询时必须能区分"空间不足"与"卷不可访问"（B5）。
+    # ------------------------------------------------------------------
+    def _space_progress(self, task: Any, event: str, payload: dict[str, Any]) -> None:
+        key = (str(payload.get("volume_key") or ""), int(payload.get("episode_id") or 0))
+        job_id = str(payload.get("job_id") or "")
+        with self._lock:
+            row = self._task_rows.get(id(task))
+            if row is None:
+                return
+            if event == "space_resumed":
+                row["space_blocked"] = False
+                row.pop("space_episode", None)
+                self._space_blocked_jobs.pop(key, None)
+                self._restore_progress_locked(row)
+                if self._interactive:
+                    self._render_panel_locked(force=True)
+                return
+
+            row["space_blocked"] = True
+            row["space_episode"] = key[1]
+            row["state"] = "disk_paused"
+            if job_id:
+                self._space_blocked_jobs.setdefault(key, set()).add(job_id)
+            if event == "space_status":
+                detail = self._space_status_detail(payload)
+                if detail:
+                    row["detail"] = detail
+            else:
+                row["detail"] = ""
+            if self._interactive:
+                self._render_panel_locked(force=True)
+            elif not self._interactive and event == "space_blocked":
+                self._print(self.i18n.t(
+                    "report.disk_paused",
+                    name=_task_name(task),
+                    free=_format_bytes(int(payload.get("free_bytes") or 0)),
+                ))
+
+    def _space_status_detail(self, payload: dict[str, Any]) -> str:
+        # B5：卷查询失败（拔盘 / UNC 断开 / 权限变化）与"空间不足"必须可区分。
+        if not bool(payload.get("volume_query_ok", True)):
+            return self.i18n.t(
+                "report.status.disk_unavailable",
+                error=str(payload.get("volume_query_error") or 0),
+            )
+        return ""
+
+    def _remember_progress_locked(
+        self, row: dict[str, Any], progress: float, completed: int, total: int
+    ) -> None:
+        row["progress"] = progress
+        row["completed_bytes"] = completed
+        row["total_bytes"] = total
+
+    def _restore_progress_locked(self, row: dict[str, Any]) -> None:
+        row["state"] = "extracting"
 
     def task_finished(self, task: Any, outcome: Any, round_index: int) -> None:
         with self._lock:
@@ -321,6 +411,7 @@ class RunReporter:
             "waiting": "report.status.waiting",
             "preparing": "report.status.preparing",
             "extracting": "report.status.extracting",
+            "disk_paused": "report.status.disk_paused",
             "repairing": "report.status.repairing",
             "error": "report.status.error",
             "partial": "report.status.partial",
@@ -331,6 +422,7 @@ class RunReporter:
             "waiting": "\033[90m",
             "preparing": "\033[36m",
             "extracting": "\033[36m",
+            "disk_paused": "\033[33m",
             "repairing": "\033[33m",
             "error": "\033[31m",
             "partial": "\033[33m",
