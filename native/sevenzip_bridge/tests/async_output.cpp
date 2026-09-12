@@ -353,7 +353,9 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
             return false;
         }
         first = &lease.writer();
-        if (lease.writer().config().threads_per_volume != 2) {
+        if (lease.writer().config().threads_per_volume != 2 ||
+            lease.writer().config().buffer_count != 8 ||
+            lease.writer().config().queue_limit != 4096) {
             std::cerr << "facility did not receive the registry config\n";
             return false;
         }
@@ -448,6 +450,12 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         auto lease = registry.acquire("job:probe-1");
         if (!lease.valid() || lease.writer().volume_state()->persistent) {
             std::cerr << "synthetic key was not marked non-persistent\n";
+            return false;
+        }
+        if (lease.writer().config().threads_per_volume != 2 ||
+            lease.writer().config().buffer_count != 8 ||
+            lease.writer().config().queue_limit != 4096) {
+            std::cerr << "synthetic key did not keep the registry config\n";
             return false;
         }
         if (registry.acquire("job:probe-1").created_facility()) {

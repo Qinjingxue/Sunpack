@@ -1283,7 +1283,8 @@ public:
               [this](const sunpack::sevenzip::VolumeSpaceTransition &transition) {
                   on_space_transition(transition);
               }),
-          // One environment snapshot shared by every volume facility, so the writers are identical by construction.
+          // One environment snapshot supplies the base config; the registry may adjust
+          // threads_per_volume for a specific volume when its facility is first created.
           writer_config_(sunpack::sevenzip::configured_async_writer_config()),
           writer_registry_(std::make_shared<sunpack::sevenzip::VolumeWriterRegistry>(
               writer_meters_,

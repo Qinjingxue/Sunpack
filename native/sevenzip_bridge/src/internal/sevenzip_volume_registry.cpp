@@ -1,9 +1,12 @@
 #include "sevenzip_volume_registry.hpp"
+#include "sevenzip_space_gate.hpp"
 
 #ifdef _WIN32
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
+#include <winioctl.h>
 #include <utility>
 
 namespace sunpack::sevenzip
@@ -11,6 +14,69 @@ namespace sunpack::sevenzip
 
     namespace
     {
+
+        std::optional<bool> query_volume_seek_penalty(const std::string &key)
+        {
+            std::wstring wide_key;
+            wide_key.reserve(key.size());
+            for (const unsigned char value : key)
+            {
+                wide_key.push_back(static_cast<wchar_t>(value));
+            }
+            if (!is_volume_guid_key(wide_key))
+            {
+                // Synthetic keys and non-volume paths keep the existing configuration.
+                return std::nullopt;
+            }
+
+            // CreateFileW opens the volume device itself only without a trailing slash;
+            // the slash form names the volume root directory.
+            const HANDLE volume = CreateFileW(
+                wide_key.c_str(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                nullptr,
+                OPEN_EXISTING,
+                0,
+                nullptr);
+            if (volume == INVALID_HANDLE_VALUE)
+            {
+                return std::nullopt;
+            }
+
+            STORAGE_PROPERTY_QUERY query{};
+            query.PropertyId = StorageDeviceSeekPenaltyProperty;
+            query.QueryType = PropertyStandardQuery;
+            DEVICE_SEEK_PENALTY_DESCRIPTOR descriptor{};
+            DWORD bytes_returned = 0;
+            const BOOL success = DeviceIoControl(
+                volume,
+                IOCTL_STORAGE_QUERY_PROPERTY,
+                &query,
+                sizeof(query),
+                &descriptor,
+                sizeof(descriptor),
+                &bytes_returned,
+                nullptr);
+            CloseHandle(volume);
+
+            if (!success || bytes_returned < sizeof(descriptor))
+            {
+                return std::nullopt;
+            }
+            return descriptor.IncursSeekPenalty != FALSE;
+        }
+
+        AsyncWriterConfig config_for_volume(
+            const std::string &key,
+            AsyncWriterConfig config)
+        {
+            if (query_volume_seek_penalty(key).value_or(false))
+            {
+                config.threads_per_volume = 1;
+            }
+            return config;
+        }
 
         const VolumeStatePtr &empty_volume_state() noexcept
         {
@@ -90,7 +156,8 @@ namespace sunpack::sevenzip
 
             if (!entry.writer)
             {
-                entry.writer = std::make_shared<AsyncFileWriter>(meters_, entry.state, config_);
+                entry.writer = std::make_shared<AsyncFileWriter>(
+                    meters_, entry.state, config_for_volume(key, config_));
                 created = true;
             }
             ++entry.leases;
