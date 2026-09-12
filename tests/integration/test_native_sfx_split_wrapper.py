@@ -3,6 +3,7 @@ import pytest
 from sunpack.config.loader import load_config
 from sunpack.coordinator.task_scan import direct_file_task
 from sunpack.detection.input_planning import ArchiveInputPlanningStage
+from sunpack.passwords.archive_tester import ArchivePasswordTester
 from sunpack.passwords.verifier.rar_fast import RarFastVerifier
 from sunpack.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
 from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
@@ -63,9 +64,30 @@ def test_input_planned_single_sfx_uses_format_fast_password_probe(tmp_path, arch
     )
 
     assert outcome.ok is True, outcome
-    assert outcome.matched_index == 1
+    # A fast probe is a hint, not a verdict: zipcrypto validates a single header byte, so an
+    # unrelated password may be reported next to the real one (matched_indices=(0, 1)). The
+    # contract is that the real password is among the reported candidates.
+    matched_indices = outcome.matched_indices or (outcome.matched_index,)
+    assert 1 in matched_indices, outcome
+    if archive_format == "zip":
+        assert outcome.match_evidence == "zipcrypto_header_byte", outcome
+        assert outcome.final_confirmation_required is True, outcome
     assert probe_input["open_mode"] in {"file_range", "concat_ranges"}
     assert task.split_info.archive_input.open_mode == extraction_mode
+
+    # The verification chain the pipeline builds must confirm the real password instead of
+    # settling for the first candidate a weak fast probe reported.
+    chain = ArchivePasswordTester().password_scheduler.verifier
+    confirmed = chain.verify_batch(
+        str(case.entry_path),
+        [WRONG_PASSWORD, PASSWORD],
+        part_paths=parts,
+        archive_input=probe_input,
+    )
+
+    assert confirmed.ok is True, confirmed
+    assert confirmed.final_confirmation_required is False, confirmed
+    assert confirmed.matched_index == 1, confirmed
 
 
 @pytest.mark.parametrize(

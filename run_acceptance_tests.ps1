@@ -24,6 +24,50 @@ if ($ParallelWorkers -le 0) {
 
 $script:StepResults = @()
 
+function Initialize-ExitCodeProbe {
+    if ("SunPack.ProcessExit" -as [type]) {
+        return
+    }
+    Add-Type -Namespace SunPack -Name ProcessExit -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetExitCodeProcess(System.IntPtr hProcess, out uint lpExitCode);
+
+public static bool TryGetExitCode(System.IntPtr hProcess, ref int exitCode) {
+    uint code;
+    if (!GetExitCodeProcess(hProcess, out code)) {
+        return false;
+    }
+    exitCode = unchecked((int)code);
+    return true;
+}
+'@
+}
+
+function Get-ChildExitCode {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        $ProcessHandle = $null
+    )
+
+    # Windows PowerShell 5.1 can leave Start-Process -PassThru ExitCode unset ($null), and
+    # [int]$null silently becomes 0, which would report a failing pytest run as exit 0.
+    if ($null -ne $Process.ExitCode) {
+        return [int]$Process.ExitCode
+    }
+    if ($ProcessHandle -is [IntPtr] -and $ProcessHandle -ne [IntPtr]::Zero) {
+        try {
+            Initialize-ExitCodeProbe
+            $code = 0
+            # 259 is STILL_ACTIVE: the handle outlived the process without an exit code.
+            if ([SunPack.ProcessExit]::TryGetExitCode($ProcessHandle, [ref]$code) -and $code -ne 259) {
+                return [int]$code
+            }
+        } catch {
+        }
+    }
+    return $null
+}
+
 function Invoke-TestStep {
     param(
         [Parameter(Mandatory = $true)]
@@ -91,6 +135,16 @@ function Invoke-TestStep {
         }
         $process = Start-Process @startProcessArgs
 
+        # Windows PowerShell 5.1 builds the -PassThru wrapper lazily and only binds a real
+        # process handle while the child is still alive. Capture it now so the exit code stays
+        # readable after the wait; without this the code below sees $null on a 5.1 host.
+        $processHandle = $null
+        try {
+            $processHandle = $process.Handle
+        } catch {
+            $processHandle = $null
+        }
+
         $timeoutMs = [Math]::Max(1, $TimeoutSeconds) * 1000
         if (-not $process.WaitForExit($timeoutMs)) {
             $terminated = $false
@@ -119,24 +173,42 @@ function Invoke-TestStep {
             return
         }
 
-        $exitCode = [int]$process.ExitCode
+        $exitCode = Get-ChildExitCode -Process $process -ProcessHandle $processHandle
         if ($junitReportPath) {
             if (-not (Test-Path -LiteralPath $junitReportPath)) {
                 Write-Host "    FAIL - pytest did not produce its JUnit report" -ForegroundColor Red
-                $exitCode = if ($exitCode -eq 0) { -2 } else { $exitCode }
+                $exitCode = if ($null -eq $exitCode -or $exitCode -eq 0) { -2 } else { $exitCode }
             } else {
                 try {
-                    [xml]$junitReport = Get-Content -LiteralPath $junitReportPath -Raw
+                    # pytest writes UTF-8 and skip messages may be non-ASCII. Get-Content without
+                    # an explicit -Encoding decodes such a report as ANSI on Windows PowerShell,
+                    # which corrupts the XML until it is no longer parseable.
+                    [xml]$junitReport = [System.IO.File]::ReadAllText(
+                        $junitReportPath, [System.Text.Encoding]::UTF8
+                    )
                     $reportedFailures = @($junitReport.SelectNodes("//testcase/failure | //testcase/error")).Count
                     if ($reportedFailures -gt 0) {
                         Write-Host "    FAIL - pytest JUnit report contains $reportedFailures failure(s) or error(s)" -ForegroundColor Red
-                        $exitCode = if ($exitCode -eq 0) { 1 } else { $exitCode }
+                        $exitCode = if ($null -eq $exitCode -or $exitCode -eq 0) { 1 } else { $exitCode }
+                    } elseif ($null -eq $exitCode) {
+                        # No exit code from the host, so the report is the only verdict available.
+                        $reportedTests = @($junitReport.SelectNodes("//testcase")).Count
+                        if ($reportedTests -eq 0) {
+                            Write-Host "    FAIL - pytest JUnit report contains no test case" -ForegroundColor Red
+                            $exitCode = -2
+                        } else {
+                            Write-Host "    NOTE - this PowerShell host did not expose the pytest exit code; the JUnit report is used" -ForegroundColor DarkGray
+                            $exitCode = 0
+                        }
                     }
                 } catch {
                     Write-Host ("    FAIL - could not read pytest JUnit report: " + $_.Exception.Message) -ForegroundColor Red
-                    $exitCode = if ($exitCode -eq 0) { -2 } else { $exitCode }
+                    $exitCode = if ($null -eq $exitCode) { -2 } else { $exitCode }
                 }
             }
+        } elseif ($null -eq $exitCode) {
+            Write-Host "    FAIL - the process exit code is unavailable on this PowerShell host" -ForegroundColor Red
+            $exitCode = -2
         }
         $duration = ((Get-Date) - $startTime).TotalSeconds
         $script:StepResults += [pscustomobject]@{
