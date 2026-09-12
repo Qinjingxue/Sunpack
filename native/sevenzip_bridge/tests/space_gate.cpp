@@ -992,17 +992,33 @@ void g24_sticky_hint_survives_recovery() {
     state->space_gate = gate;
     states->push_back(state);
 
-    VolumeSpaceMonitor monitor(VolumeSpaceMonitor::Options{5ms, 5ms},
-                               [states] { return *states; },
-                               VolumeSpaceMonitor::StatusSink{});
-    check(!monitor.ever_had_blocked(), "G-24: 初始必须是 false");
+    // 统计 provider 被调用的次数 —— 用它可以**测出**"未满盘过时 monitor 零开销"。
+    auto provider_calls = std::make_shared<std::atomic<int>>(0);
+    VolumeSpaceMonitor monitor(
+        VolumeSpaceMonitor::Options{5ms, 5ms},
+        [states, provider_calls] {
+            provider_calls->fetch_add(1);
+            return *states;
+        },
+        VolumeSpaceMonitor::StatusSink{});
+    check(!monitor.sampling(), "G-24: 初始必须不采样");
 
-    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    // ★ 常态零开销：没有任何卷 blocked 时，tick() 连 registry 都不拉。
+    //   （provider 就是 registry.blocked_volumes()，它要取 registry mutex_。）
     const auto now = std::chrono::steady_clock::now();
     monitor.tick(now);
-    check(monitor.ever_had_blocked(), "G-24: 观测到 blocked 卷后必须点亮");
+    monitor.tick(now + 10ms);
+    check(provider_calls->load() == 0,
+          "G-24: 没有 blocked 卷时 tick() 不得调用 provider（常态零 registry 开销）");
 
-    // A 卷恢复 → sticky hint **必须仍为 true**（否则多卷场景下 B 永不再被 poll）。
+    // 真实满盘会发生什么：executor 的 ChangeSink 收到 space_blocked → note_blocked()。
+    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    monitor.note_blocked();
+    monitor.tick(now + 20ms);
+    check(monitor.sampling(), "G-24: note_blocked 之后必须开始采样");
+    check(provider_calls->load() >= 1, "G-24: 开始采样后必须真的拉 blocked 卷");
+
+    // A 卷恢复 → 这次拉取返回空 → **采样必须停下**（开销随异常状态消失而消失）。
     gate->poll(500 * kMib);
     {
         auto result = wait_bounded(gate);
@@ -1011,7 +1027,13 @@ void g24_sticky_hint_survives_recovery() {
     check(gate->phase() == VolumeSpacePhase::Ready, "G-24: 卷已恢复");
     states->clear(); // 恢复后不再出现在 blocked_volumes() 里
     monitor.tick(now + 100ms);
-    check(monitor.ever_had_blocked(), "G-24: sticky hint 在卷恢复后必须仍为 true");
+    check(!monitor.sampling(),
+          "G-24: ★ 异常状态消除后必须停止采样（不能像 sticky 历史那样永远拉 registry）");
+    const int calls_after_recovery = provider_calls->load();
+    monitor.tick(now + 200ms);
+    monitor.tick(now + 300ms);
+    check(provider_calls->load() == calls_after_recovery,
+          "G-24: ★ 恢复之后 tick() 必须回到零开销（不再调用 provider）");
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1071,7 @@ void g25_two_volumes_recover_independently() {
     gate_b->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
 
     auto now = std::chrono::steady_clock::now();
+    monitor.note_blocked(); // executor 的 ChangeSink 在第一条 space_blocked 时做的事
     monitor.tick(now);
     // 采样器只提供数值；这里直接驱动 gate 的许可，模拟"水位已改善"。
     check(gate_a->poll(100 * kMib), "G-25: A 必须能发放许可");
@@ -1068,8 +1091,11 @@ void g25_two_volumes_recover_independently() {
     status_seen_b->store(false);
     status_calls->store(0);
 
-    // 旧设计会在这里因为 has_blocked_ 被清零而直接 return → B 永远不再被 poll。
-    check(monitor.ever_had_blocked(), "G-25: A 恢复后 sticky hint 必须仍为 true");
+    // 旧设计在这里会因为 has_blocked_ 被清零而直接 return → B 永远不再被 poll。
+    //
+    // ★ 新设计的清零条件是"**拉取结果为空**"，不是任何 transition：A 恢复时这次拉取
+    //   返回的是 [B]（非空），所以采样继续、B 仍被 poll；只有 B 也恢复后才停下。
+    check(monitor.sampling(), "G-25: A 恢复后采样必须继续（B 仍然 blocked）");
     monitor.tick(now + 100ms);
     check(status_seen_b->load(), "G-25: A 恢复之后 B 必须仍被采样");
     check(status_calls->load() >= 1, "G-25: monitor 必须仍在工作");

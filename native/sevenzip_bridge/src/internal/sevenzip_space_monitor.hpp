@@ -65,6 +65,23 @@ namespace sunpack::sevenzip
 
         void tick(std::chrono::steady_clock::time_point now) noexcept
         {
+            // ── 常态零开销 / 恢复后停开销 ───────────────────────────────────
+            //
+            // `sampling_` 只在"有卷进入 Blocked"（ChangeSink → note_blocked()）时置位，
+            // 并且**只在一次拉取返回空**（即确认当下没有任何 blocked 卷）时清零。
+            // 因此：
+            //   * 从未满盘：每个 tick 只有一条 relaxed 原子读，**不取任何锁**；
+            //   * 满盘期间：正常采样（限速 + 逐卷 poll）；
+            //   * **恢复之后：最多再拉一次，然后就彻底停下** —— 开销随异常状态消失而消失。
+            //
+            // ⚠️ 清零条件**绝不能**挂在任何 gate transition 上（例如"收到 resumed 就清零"）：
+            //    多卷场景下 A 恢复时这次拉取返回的是 [B]（非空），于是采样继续、B 仍被 poll；
+            //    而"清零"只会在真的没有任何 blocked 卷时发生。这正是 §4.4.1 那个
+            //    "A 恢复 → 清零 → 仍 Blocked 的 B 永不再被 poll"回归的反面。
+            if (!sampling_.load(std::memory_order_relaxed))
+            {
+                return;
+            }
             if (!provider_)
             {
                 return;
@@ -80,17 +97,12 @@ namespace sunpack::sevenzip
                 return;
             }
 
-            // 只有真的观测到 blocked 卷才点亮 sticky hint。
-            //
-            // ⚠️ 顺序很关键：早期骨架的第一行是 `if (!ever_had_blocked_) return;`，
-            //    但**没有任何地方展示它如何变成 true** —— 照抄会让 monitor 永远不工作
-            //    （与 §4.4.1 指出的 entries_ 缺陷同类）。因此这里先拉一次、再点亮、
-            //    最后才做限速判断。
             if (states.empty())
             {
+                // ★ 异常状态已完全消除 → 停止采样，回到零开销。
+                sampling_.store(false, std::memory_order_relaxed);
                 return;
             }
-            ever_had_blocked_.store(true, std::memory_order_relaxed);
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -128,17 +140,20 @@ namespace sunpack::sevenzip
             }
         }
 
-        // ★ sticky hint：进程第一次出现 blocked 卷后就**永远**为 true。
-        //   **不是精确状态**，只用于"要不要缩短 parked controller 的睡眠"。
+        // ★ 采样是否处于"活跃"状态。**不是**"是否曾经满盘过"的 sticky 历史，
+        //   而是"当下是否可能有 blocked 卷"的精确近似：
+        //     note_blocked() 置位；一次拉取返回空则清零。
+        //   用途只有两个：
+        //     1) tick() 的常态/恢复后早退（未置位 → 连 registry 都不拉）；
+        //     2) 缩短 parked controller 的睡眠上限。
         //
-        //   ⚠️ 绝不能用 has_blocked_ + note_ready() 那种精确 bool：多卷场景下
-        //      "A 恢复 → 清零 → 仍 Blocked 的 B 永远不再被 poll"。
-        //   ⚠️ 它也绝不参与"要不要 poll 哪些 gate"——那个决定每个 tick 都从
-        //      registry.blocked_volumes() 重新拉。
-        bool ever_had_blocked() const noexcept
-        {
-            return ever_had_blocked_.load(std::memory_order_relaxed);
-        }
+        //   ⚠️ 绝不能用"收到 resumed / 最后一个 waiter 离开就清零"那种写法：
+        //      多卷场景下 A 恢复时仍 Blocked 的 B 必须继续被 poll。
+        bool sampling() const noexcept { return sampling_.load(std::memory_order_relaxed); }
+
+        // 由 ChangeSink 在收到 `space_blocked` transition 时调用 —— 这是"开始采样"的
+        // 唯一驱动点（"真的发生满盘"与"开始采样"是同一件事）。
+        void note_blocked() noexcept { sampling_.store(true, std::memory_order_relaxed); }
 
     private:
         void maybe_emit_status(const VolumeStatePtr &state,
@@ -177,7 +192,7 @@ namespace sunpack::sevenzip
         BlockedProvider provider_;
         StatusSink status_;
         mutable std::mutex mutex_; // 只保护 next_poll_at_ / 诊断节流表
-        std::atomic<bool> ever_had_blocked_{false};
+        std::atomic<bool> sampling_{false};
         std::chrono::steady_clock::time_point next_poll_at_{};
         std::unordered_map<std::string, std::chrono::steady_clock::time_point> last_status_at_;
     };

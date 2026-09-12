@@ -1900,6 +1900,11 @@ private:
                 if (transition.discontinuity) {
                     space_epoch_.fetch_add(1, std::memory_order_acq_rel);
                 }
+                if (transition.kind == Kind::Blocked) {
+                    // 点亮 monitor 的 sticky hint —— 这是"开始采样 blocked 卷"的唯一驱动点。
+                    // 未满盘过时 monitor 的 tick() 一个 registry 锁都不取（常态零开销）。
+                    space_monitor_->note_blocked();
+                }
                 break;
             case Kind::Status:
             default:
@@ -2023,7 +2028,10 @@ private:
                 //   note_ready() 那种写法：多卷场景下"A 恢复 → 清零 → 仍 Blocked 的
                 //   B 永远不再被 poll"）。它也绝不参与"要不要 poll 哪些 gate"——
                 //   那个决定每个 tick 都从 registry.blocked_volumes() 重新拉。
-                if (space_monitor_->ever_had_blocked() &&
+                // ★ 常态零开销 + **恢复后停止开销**：monitor 只在有卷进入 Blocked 时
+                //   开始采样，并在"一次拉取返回空"（异常状态完全消除）后立刻停下。
+                //   因此这里用 sampling() 而不是"曾经满盘过"的 sticky 历史。
+                if (space_monitor_->sampling() &&
                     writer_config_.space_poll_interval > std::chrono::milliseconds::zero()) {
                     parked_wait = (std::min)(parked_wait, writer_config_.space_poll_interval);
                 }
