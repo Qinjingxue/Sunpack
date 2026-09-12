@@ -1305,6 +1305,80 @@ void g29_no_late_blocked_after_recovery() {
           "G-29: 新 episode 才会给 J2 发 blocked");
 }
 
+// ---------------------------------------------------------------------------
+// G-30 授权 probe 的采样必须立即成为新水位（架构师第九轮 P1）
+// ---------------------------------------------------------------------------
+void g30_probe_authorising_sample_becomes_the_watermark() {
+    // 不变量：**任何成功授权 probe 的 monitor 采样，就是当时的 failure watermark。**
+    //
+    // 漏掉它会造成"每个 poll 周期重复 probe"：
+    //   baseline 100 → 用户释放到 200 → 200 > 100 → probe → 真实 I/O 仍失败 → Blocked
+    //   → 水位仍是 100 → 下一秒 monitor 仍看到 200 > 100 → 又 probe → 又失败 → 死循环
+    // 即"空间只涨过一次、但涨得还不够完成 I/O"时，此后即使用户什么都不做，
+    // 也会按 poll_interval **永久做真实 I/O probe**。
+    auto log = std::make_shared<SinkLog>();
+    auto gate = make_gate("job:g30", log);
+
+    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+
+    // ① baseline = 100（水位无效 → 第一次成功观测即 baseline 并授权）
+    check(gate->poll(100), "G-30: 第一次成功观测必须建立 baseline 并授权 probe");
+    check(gate->failed_free_watermark() == 100, "G-30: baseline 必须是 100");
+    {
+        auto result = wait_bounded(gate);
+        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    }
+    check(gate->failed_free_watermark() == 100, "G-30: probe 失败后水位保持 100");
+
+    // ② 200 > 100 → 授权；这次授权必须把水位推进到 200
+    check(gate->poll(200), "G-30: 更高的采样必须授权 probe");
+    check(gate->failed_free_watermark() == 200,
+          "G-30: ★ 授权 probe 的采样必须立即成为新水位（否则会每周期重复 probe）");
+    {
+        auto result = wait_bounded(gate);
+        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
+        // probe 真实失败（monitor-only：settle 里不做任何查询、不改水位）
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    }
+    check(gate->phase() == VolumeSpacePhase::Blocked, "G-30: probe 失败回 Blocked");
+    check(gate->failed_free_watermark() == 200,
+          "G-30: ★ probe 失败后水位必须仍是 200（不再回退到 100）");
+
+    // ③ 同一个采样值不得再授权（这是"不重复 probe"的直接断言）
+    check(!gate->poll(200), "G-30: ★ 相同采样值**不得**再授权 probe（否则每周期重复 probe）");
+    check(gate->phase() == VolumeSpacePhase::Blocked, "G-30: 必须仍是 Blocked");
+    check(gate->poll(201), "G-30: 严格更高的采样才重新授权");
+    {
+        auto result = wait_bounded(gate);
+        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    }
+    check(!gate->poll(201), "G-30: 201 这一档也不得被重复授权");
+
+    // ④ 连续多轮：每轮把水位推进一格，验证不会出现"同一水位被反复授权"
+    for (std::uint64_t level = 300; level <= 500; level += 100)
+    {
+        check(gate->poll(level), "G-30: 更高的采样必须授权");
+        check(gate->failed_free_watermark() == level, "G-30: 水位必须跟随授权采样");
+        auto result = wait_bounded(gate);
+        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
+        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+        check(!gate->poll(level), "G-30: 该水位不得被重复授权（无重复 probe）");
+    }
+
+    // ⑤ 真实成功仍然终止 episode（水位语义不改变铁律一）
+    check(gate->poll(600), "G-30: 更高的采样必须授权");
+    {
+        auto result = wait_bounded(gate);
+        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
+        result.lease.report_success();
+    }
+    check(gate->phase() == VolumeSpacePhase::Ready, "G-30: 真实成功必须回 Ready");
+    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 1,
+          "G-30: 全程只应有一条 resumed");
+}
+
 }  // namespace
 
 #endif
@@ -1350,6 +1424,7 @@ int main(int argc, char **argv) {
          g27_only_real_transitions_advance_the_discontinuity_generation},
         {"G-28 one blocked per job per episode", g28_one_blocked_per_job_per_episode},
         {"G-29 no late blocked after recovery", g29_no_late_blocked_after_recovery},
+        {"G-30 probe authorising sample becomes the watermark", g30_probe_authorising_sample_becomes_the_watermark},
     };
     constexpr int kCaseCount = static_cast<int>(std::size(cases));
 

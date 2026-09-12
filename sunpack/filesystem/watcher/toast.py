@@ -80,6 +80,10 @@ class _TaskProgress:
     # 暂停不是进度：进度条不得因此推进，但提示文案必须能表达"已暂停"。
     disk_blocked: bool = False
     space_detail: str = ""
+    # 该 task 在空间事件里出现过的真实 job_id。用于在 job 终态时把它从
+    # (volume_key, episode) → job_id 集合里**真正删掉** —— 否则长时间 watch 会
+    # 只增不减地留下无用 map 项（架构师第九轮卫生问题）。
+    space_job_ids: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -274,6 +278,7 @@ class WatchToastCoordinator:
         task_progress.disk_blocked = True
         if job_id:
             self._space_blocked_jobs.setdefault(key, set()).add(job_id)
+            task_progress.space_job_ids.add(job_id)
         if event == "space_status":
             if not bool(payload.get("volume_query_ok", True)):
                 # B5：卷不可访问与"空间不足"必须可区分。
@@ -292,18 +297,26 @@ class WatchToastCoordinator:
             return not any(self._space_blocked_jobs.values())
 
     def _release_space_jobs_for_request_locked(self, request: _RequestProgress) -> None:
-        """job 终态时把它的 task 从所有 episode 集合里移除；集合空则提示消失。"""
+        """job 终态时把它从所有 episode 集合里移除；集合空则提示消失。
+
+        ⚠️ 必须**真的 discard job_id**（而不只是清 task 上的标志位）：否则
+        `_space_blocked_jobs` 只增不减，长时间 watch 会留下无用 map 项。
+        gate 正确地不会因为"最后一个 waiter 消失"而恢复（铁律一），所以这些集合
+        只能靠 job 终态来清理。
+        """
 
         if not self._space_blocked_jobs:
             return
         for task_progress in request.tasks.values():
-            if not task_progress.disk_blocked:
-                continue
             task_progress.disk_blocked = False
             task_progress.space_detail = ""
-        for key in list(self._space_blocked_jobs):
-            if not self._space_blocked_jobs[key]:
-                self._space_blocked_jobs.pop(key, None)
+            if not task_progress.space_job_ids:
+                continue
+            for key in list(self._space_blocked_jobs):
+                self._space_blocked_jobs[key].difference_update(task_progress.space_job_ids)
+                if not self._space_blocked_jobs[key]:
+                    self._space_blocked_jobs.pop(key, None)
+            task_progress.space_job_ids.clear()
 
     def succeeded(self, request_id: str, output_dirs: list[str], warnings: list[str] | None = None) -> None:
         self._terminal(request_id, "success", output_dirs=output_dirs, errors=warnings)

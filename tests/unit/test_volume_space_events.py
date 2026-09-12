@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -94,14 +95,59 @@ def _json_line(payload: dict) -> str:
     return "@echo " + rendered
 
 
+def _write_python_worker(tmp_path: Path, events: list[dict], name: str = "space_worker") -> Path:
+    """写一个**能回显真实 job_id** 的假 worker。
+
+    ⚠️ 为什么不能用纯 `.cmd`：runner 在 `_build_job()` 里**自己生成** job_id
+    （`f"{task.key}:{time.monotonic_ns()}"`）并覆盖调用方传入的值。硬编码 job_id 的
+    `.cmd` 会被两条 dispatcher 当成"未知 job_id"直接丢弃 —— 事件根本到不了
+    `progress_callback`，测试会以"UI 什么都没收到"的方式**假绿**。
+    因此这里用 Python 脚本从 stdin 的请求 JSON 里取出真实 job_id 再回显。
+    """
+
+    script = tmp_path / f"{name}.py"
+    script.write_text(
+        "import json, sys\n"
+        f"EVENTS = {events!r}\n"
+        "print(json.dumps({'type': 'worker_ready'}), flush=True)\n"
+        "for line in sys.stdin:\n"
+        "    line = line.strip()\n"
+        "    if not line:\n"
+        "        continue\n"
+        "    try:\n"
+        "        request = json.loads(line)\n"
+        "    except ValueError:\n"
+        "        request = {}\n"
+        "    command = request.get('worker_command')\n"
+        "    if command == 'shutdown':\n"
+        "        break\n"
+        "    if command == 'cancel':\n"
+        "        print(json.dumps({'type': 'cancel_ack', 'job_id': request.get('job_id', '')}),"
+        " flush=True)\n"
+        "        continue\n"
+        "    job_id = str(request.get('job_id') or '')\n"
+        "    for event in EVENTS:\n"
+        "        print(json.dumps({**event, 'job_id': job_id}), flush=True)\n",
+        encoding="utf-8",
+    )
+    runner = tmp_path / f"{name}.cmd"
+    runner.write_text(
+        f'@echo off\r\n"{sys.executable}" "{script}"\r\n',
+        encoding="utf-8",
+    )
+    return runner
+
+
 # ---------------------------------------------------------------------------
 # T-EVT-1 事件送达且不污染 job 状态
 # ---------------------------------------------------------------------------
 def test_space_event_reaches_callback_without_polluting_job_state():
+    from sunpack.extraction.internal.sevenzip.sevenzip_runner import _SPACE_ACCEPTED
+
     for event in ("space_blocked", "space_status", "space_resumed"):
         state = _running_state()
-        dispatched = _apply_native_event_to_job_state(state, _space_event(event))
-        assert dispatched is True
+        outcome = _apply_native_event_to_job_state(state, _space_event(event))
+        assert outcome == _SPACE_ACCEPTED, event
         assert state["state"] == "running", event
 
 
@@ -196,7 +242,8 @@ def test_space_gate_environment_mapping():
     environment = _apply_native_environment({}, {"space_gate_enabled": "off"})
     assert environment["SUNPACK_VOLUME_SPACE_GATE"] == "0"
 
-    # 未配置时不写入：native 侧保持它自己的默认值（当前为 0）。
+    # 未配置时不写入：native 侧保持它自己的默认值（Phase 6c 之后为 true，
+    # 见 native/sevenzip_bridge/src/internal/sevenzip_writer_meters.hpp）。
     environment = _apply_native_environment({}, {})
     assert "SUNPACK_VOLUME_SPACE_GATE" not in environment
 
@@ -328,6 +375,110 @@ def test_new_episode_resets_resumed_seen():
     _on_space_event(state, "space_blocked", _space_event("space_blocked", episode=2))
     assert state["space_waiting"] is True
     assert state["space_resumed_seen"] is False
+
+
+# ---------------------------------------------------------------------------
+# T-EVT-15 stale 空间事件必须被**中央拦下**，不得送到 UI/Toast
+# ---------------------------------------------------------------------------
+def test_on_space_event_reports_acceptance():
+    """`_on_space_event` 的返回值是全系统**唯一**的 stale 判定。"""
+
+    from sunpack.extraction.internal.sevenzip.sevenzip_runner import (
+        _SPACE_ACCEPTED,
+        _SPACE_NOT_APPLICABLE,
+        _SPACE_STALE,
+    )
+
+    state = _running_state()
+    # 非空间事件 → NOT_APPLICABLE（交给既有 job 状态机）
+    assert (
+        _apply_native_event_to_job_state(state, {"type": "progress", "event": "job_started"})
+        == _SPACE_NOT_APPLICABLE
+    )
+    assert state["state"] == "started"
+    # 当前空间事件 → ACCEPTED
+    assert (
+        _apply_native_event_to_job_state(state, _space_event("space_blocked", episode=3))
+        == _SPACE_ACCEPTED
+    )
+    assert state["space_waiting"] is True
+    # resumed 之后迟到的 blocked / status → STALE
+    assert (
+        _apply_native_event_to_job_state(state, _space_event("space_resumed", episode=3))
+        == _SPACE_ACCEPTED
+    )
+    assert state["space_waiting"] is False
+    assert (
+        _apply_native_event_to_job_state(state, _space_event("space_blocked", episode=3))
+        == _SPACE_STALE
+    )
+    assert (
+        _apply_native_event_to_job_state(state, _space_event("space_status", episode=3))
+        == _SPACE_STALE
+    )
+    # 旧 episode 也是 STALE
+    assert (
+        _apply_native_event_to_job_state(state, _space_event("space_resumed", episode=2))
+        == _SPACE_STALE
+    )
+    assert state["space_waiting"] is False, "stale 事件绝不能改变等待状态"
+
+
+def test_stale_space_event_is_not_forwarded_to_the_ui(tmp_path):
+    """端到端：native 按 resumed(ep3) → blocked(ep3) 乱序发送时，
+    progress_callback（UI/Toast 的唯一入口）**只能**看到 resumed。
+
+    修好之前：watchdog 正确（`space_waiting=False`），但 UI 会被迟到的 blocked
+    重新打回"磁盘暂停"——三方状态不一致。
+    """
+
+    archive = tmp_path / "archive.zip"
+    archive.write_bytes(b"payload")
+    worker = _write_python_worker(
+        tmp_path,
+        [
+            _space_event("space_blocked", episode=3),
+            _space_event("space_resumed", episode=3),
+            # ★ native 在 gate 锁外发送，这条 blocked(ep3) 晚到是合法的。
+            _space_event("space_blocked", episode=3),
+            _space_event("space_status", episode=3),
+        ],
+        name="stale_worker",
+    )
+
+    runner = SevenZipRunner(
+        {
+            # 足够长的看门狗：本用例要的是"事件被过滤"，不是看门狗行为。
+            "watchdog_no_progress_timeout_seconds": 30,
+            "cancel_grace_seconds": 0.5,
+        }
+    )
+    runner.worker_path = str(worker)
+    seen: list[dict] = []
+    runner.progress_callback = lambda task, event: seen.append(event)
+
+    async def run_attempt():
+        try:
+            await asyncio.wait_for(
+                runner.submit_attempt_asyncio({"job_id": "event-job"}, task=_task(archive)),
+                timeout=5,
+            )
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+        finally:
+            await runner.aclose()
+
+    asyncio.run(run_attempt())
+
+    forwarded = [
+        str(event.get("event"))
+        for event in seen
+        if str(event.get("event", "")).startswith("space_")
+    ]
+    assert forwarded == ["space_blocked", "space_resumed"], (
+        "迟到的 blocked(ep3)/status(ep3) 必须在 dispatcher 层被拦下，"
+        f"绝不能进 UI；实际转发序列：{forwarded}"
+    )
 
 
 # ---------------------------------------------------------------------------

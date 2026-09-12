@@ -154,13 +154,28 @@ _KNOWN_JOB_EVENTS = frozenset(
     }
 )
 
+# `_apply_native_event_to_job_state()` 的三种结果。
+#
+#   NOT_APPLICABLE —— 不是空间事件：照旧写 state["state"] 并向下游转发
+#   ACCEPTED       —— 当前空间事件：更新等待状态，**继续向下游转发**
+#   STALE          —— 过期空间事件：**不得向下游（progress_callback → UI/Toast）转发**
+_SPACE_NOT_APPLICABLE = "not_space"
+_SPACE_ACCEPTED = "accepted"
+_SPACE_STALE = "stale"
 
-def _on_space_event(state: dict[str, Any], event: str, payload: dict) -> None:
+
+def _on_space_event(state: dict[str, Any], event: str, payload: dict) -> bool:
     """把空间事件折进 job 等待状态，**不污染 job 生命周期状态机**。
 
     ⚠️ 必须拒绝 stale event：native 侧在 gate 锁内生成 transition、锁**外**发送，
     因此 resumed(ep17) 可能先于 blocked(ep17) 到达。若照单全收，space_waiting 会被
     永久置回 True。只靠 (space_episode, space_resumed_seen) 两个值即可判定。
+
+    ★ 返回 True = 这条事件是**当前**状态；False = 它已过期。
+      返回值是**全系统唯一的 stale 判定**：dispatcher 用它决定要不要把原始 line
+      继续交给 `on_line` / progress_callback，从而让 UI/Toast 不可能被迟到事件
+      重新打回"磁盘暂停"（否则会出现 native 已恢复、watchdog 也知道恢复了、
+      但 UI 仍显示"已暂停"的三方不一致）。
     """
 
     try:
@@ -169,7 +184,7 @@ def _on_space_event(state: dict[str, Any], event: str, payload: dict) -> None:
         episode = 0
     latest = int(state.get("space_episode") or 0)
     if episode < latest:
-        return  # 旧 episode，丢弃
+        return False  # 旧 episode，丢弃
     if episode > latest:
         state["space_episode"] = episode
         state["space_resumed_seen"] = False
@@ -177,44 +192,49 @@ def _on_space_event(state: dict[str, Any], event: str, payload: dict) -> None:
     if event == "space_resumed":
         state["space_resumed_seen"] = True
         state["space_waiting"] = False
-    else:  # space_blocked / space_status
-        if state.get("space_resumed_seen"):
-            return  # ★ stale：同一 episode 已恢复过
-        if event == "space_blocked":
-            state["space_waiting"] = True
-            state["space_blocked_volume_key"] = str(payload.get("volume_key") or "")
-            try:
-                state["space_blocked_win32_error"] = int(payload.get("win32_error") or 0)
-            except (TypeError, ValueError):
-                state["space_blocked_win32_error"] = 0
+        return True
+    # space_blocked / space_status
+    if state.get("space_resumed_seen"):
+        return False  # ★ stale：同一 episode 已恢复过
+    if event == "space_blocked":
+        state["space_waiting"] = True
+        state["space_blocked_volume_key"] = str(payload.get("volume_key") or "")
+        try:
+            state["space_blocked_win32_error"] = int(payload.get("win32_error") or 0)
+        except (TypeError, ValueError):
+            state["space_blocked_win32_error"] = 0
+    return True
 
 
 def _apply_native_event_to_job_state(
     state: dict[str, Any], payload: dict, logger: Any = None
-) -> bool:
-    """返回 True 表示消费了该事件（它属于空间事件，不得写入 state["state"]）。
+) -> str:
+    """返回 `_SPACE_NOT_APPLICABLE` / `_SPACE_ACCEPTED` / `_SPACE_STALE`。
 
     非空间事件仍按既有语义写入 `state["state"] = event.removeprefix("job_")`。
     """
 
     if not isinstance(payload, dict):
-        return False
+        return _SPACE_NOT_APPLICABLE
     event = str(payload.get("event") or "")
     if payload.get("type") == "result":
         state["state"] = "result_received"
-        return False
+        return _SPACE_NOT_APPLICABLE
     if not event:
         if logger is not None and payload.get("type"):
             logger.debug("sevenzip_worker unknown event type: %s", payload.get("type"))
-        return False
+        return _SPACE_NOT_APPLICABLE
     if event in _SPACE_EVENTS:
-        _on_space_event(state, event, payload)
-        return True
+        return (
+            _SPACE_ACCEPTED
+            if _on_space_event(state, event, payload)
+            else _SPACE_STALE
+        )
     if payload.get("type") == "progress" and event not in _KNOWN_JOB_EVENTS:
         if logger is not None:
             logger.debug("sevenzip_worker unknown progress event: %s", event)
     state["state"] = event.removeprefix("job_")
-    return False
+    return _SPACE_NOT_APPLICABLE
 
 
 def _worker_job_deadline(state: dict[str, Any]) -> float | None:
@@ -378,15 +398,23 @@ class _NativeWorkerProcess:
                         self._controller_events.append({"received_at": time.perf_counter(), **payload})
                     async_state = self._async_jobs.get(job_id) if job_id else None
                     job_state = self._job_states.get(job_id) if job_id else None
+                    forward = True
                     if job_state is not None and isinstance(payload, dict):
                         # 空间事件表达的是"等待状态"，不是 job 生命周期状态。
                         # 绝不能写进 job_state["state"]（watch_memory / 基准测试读到的
-                        # 状态会失真），但 payload 仍要交给 on_line 送到 progress_callback。
-                        if _apply_native_event_to_job_state(
-                            job_state, payload, _LOGGER
+                        # 状态会失真）。
+                        #
+                        # ★ 过期的空间事件必须在这里被**中央拦下**，不再向下游
+                        #   （on_line → progress_callback → UI/Toast）转发：native 在 gate
+                        #   锁外发送，resumed(ep3) 先到、blocked(ep3) 后到是合法的，
+                        #   若继续转发，UI 会被打回"磁盘暂停"，而 watchdog 已经认为恢复了。
+                        if (
+                            _apply_native_event_to_job_state(job_state, payload, _LOGGER)
+                            == _SPACE_STALE
                         ):
-                            job_state["last_progress_at"] = time.monotonic()
-                if async_state is not None:
+                            forward = False
+                        job_state["last_progress_at"] = time.monotonic()
+                if forward and async_state is not None:
                     completed = False
                     callback_error = ""
                     with async_state["completion_lock"]:
@@ -685,8 +713,14 @@ class _AsyncNativeWorkerProcess:
                 self._deadline_changed.set()
                 # ⚠️ 空间事件必须在 `state["state"] = event.removeprefix("job_")`
                 #    **之前**被识别，否则 job 生命周期状态仍会被污染。
-                #    payload 仍要交给 on_line，以便送到 progress_callback → UI。
-                _apply_native_event_to_job_state(state, payload, _LOGGER)
+                # ★ 过期的空间事件（同 episode 已见 resumed）必须被**中央拦下**：
+                #   不再交给 on_line → progress_callback → UI/Toast，否则 UI 会被
+                #   迟到的 blocked 重新打回"磁盘暂停"，而 watchdog 已经认为恢复了。
+                if (
+                    _apply_native_event_to_job_state(state, payload, _LOGGER)
+                    == _SPACE_STALE
+                ):
+                    continue
                 try:
                     completed = bool(state["on_line"](line))
                 except Exception as exc:

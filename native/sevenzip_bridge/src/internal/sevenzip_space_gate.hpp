@@ -451,6 +451,40 @@ namespace sunpack::sevenzip
                                                      bool discontinuity) const;
         void emit_transitions(const std::vector<VolumeSpaceTransition> &transitions) noexcept;
 
+        // synthetic 卷的查询根解析：**锁外做 Win32 调用，锁内只提交结果**。
+        //
+        // ⚠️ `resolve_query_root_from_path()` 内部是 `GetVolumePathNameW` —— 一个真实的
+        //    文件系统调用。它绝不能在 gate mutex_ 内执行：对失联 UNC / 坏盘的一次慢解析
+        //    会堵住同卷的 `wait()` / `wake_waiters()`，而那是**取消与关停的必经路径**。
+        //    （架构师第九轮 P2：让 gate 锁内彻底没有外部文件系统调用。）
+        //
+        // 快速路径只取一次锁并立即返回，因此 resolved 卷（绝大多数）零额外开销。
+        void resolve_query_root_outside_lock(const std::wstring &failed_path) noexcept
+        {
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (query_root_resolved_)
+                {
+                    return;
+                }
+            }
+            if (failed_path.empty())
+            {
+                return;
+            }
+            std::wstring resolved;
+            if (!resolve_query_root_from_path(failed_path, &resolved))
+            {
+                return;
+            }
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!query_root_resolved_) // 别人先解析了就保留先到的结果
+            {
+                query_root_ = std::move(resolved);
+                query_root_resolved_ = true;
+            }
+        }
+
         mutable std::mutex mutex_;
         std::condition_variable cv_;
 
@@ -589,22 +623,13 @@ namespace sunpack::sevenzip
         std::vector<VolumeSpaceTransition> transitions;
         bool opened_episode = false;
 
+        // ★ 先做（可能的）锁外解析：synthetic 卷首次失败时用真实失败路径就地解析
+        //   查询根。**只有路径解析，没有磁盘查询** —— 查询永远由 monitor 独占。
+        resolve_query_root_outside_lock(std::wstring(failed_path));
+
         {
             std::lock_guard<std::mutex> lock(mutex_);
             last_win32_error_ = win32_error;
-
-            // synthetic 卷：首次空间错误时就用真实失败路径就地解析查询根。
-            // ⚠️ 这里只做**路径解析**（`GetVolumePathNameW`，不是查询），
-            //    磁盘可用空间由 monitor 独占查询 —— writer 线程永不查询。
-            if (!query_root_resolved_ && !failed_path.empty())
-            {
-                std::wstring resolved;
-                if (resolve_query_root_from_path(std::wstring(failed_path), &resolved))
-                {
-                    query_root_ = std::move(resolved);
-                    query_root_resolved_ = true;
-                }
-            }
 
             if (phase_ == VolumeSpacePhase::Ready)
             {
@@ -785,14 +810,30 @@ namespace sunpack::sevenzip
 
             if (!watermark_valid_)
             {
-                // 初期查询失败过；这是第一次成功观测 → 立即设为 baseline 并允许一次
-                // 真实 probe。**不是**"先比较再决定"（`free > 0` 为假会让这个卷永久卡住）。
+                // monitor 的第一次成功观测（初期没有 baseline）→ 立即设为 baseline 并允许
+                // 一次真实 probe。**不是**"先比较再决定"（`free > 0` 为假会让这个卷永久卡住）。
                 failed_free_watermark_ = free_bytes_now;
                 watermark_valid_ = true;
+                failed_free_watermark_ = free_bytes_now;
                 issued = true;
             }
             else if (free_bytes_now > failed_free_watermark_)
             {
+
+                // ★★★ 授权 probe 的这次采样必须**立即成为新的 failure watermark**。
+                //
+                //   不变量：**任何成功授权 probe 的 monitor 采样，就是当时的失败水位。**
+                //
+                //   漏掉这一行会造成（架构师第九轮 P1）：
+                //     baseline = 100 MiB → 用户释放到 200 MiB → 200 > 100 → 发 probe
+                //     → 真实 I/O 仍失败 → Blocked，但水位**仍是 100**
+                //     → 下一秒 monitor 仍看到 200 > 100 → 又发 probe → 又失败 → 无限循环
+                //   即"空间只涨过一次、但涨得还不够完成 I/O"时，此后即使用户什么都不做，
+                //   也会**每个 poll 周期做一次真实 I/O probe**，违背 watermark 的全部意义。
+                //
+                //   有了这一行：probe 成功 → Ready（下次 episode 会重置水位）；
+                //   probe 失败 → 下一次必须观察到**比这次更高**的 free bytes 才重试。
+                failed_free_watermark_ = free_bytes_now;
                 issued = true;
             }
 
@@ -841,6 +882,9 @@ namespace sunpack::sevenzip
     inline void VolumeSpaceGate::settle_space_failure(
         std::uint64_t token, unsigned long win32_error, std::wstring_view failed_path) noexcept
     {
+        // 锁外解析（同上：绝不在 gate mutex_ 内做 Win32 文件系统调用）。
+        resolve_query_root_outside_lock(std::wstring(failed_path));
+
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!owns_probe_locked(token))
@@ -850,19 +894,10 @@ namespace sunpack::sevenzip
             phase_ = VolumeSpacePhase::Blocked;
             probe_owner_token_ = 0;
             last_win32_error_ = win32_error;
-            if (!query_root_resolved_ && !failed_path.empty())
-            {
-                std::wstring resolved;
-                if (resolve_query_root_from_path(std::wstring(failed_path), &resolved))
-                {
-                    query_root_ = std::move(resolved);
-                    query_root_resolved_ = true;
-                }
-            }
             // ★ 这里**不做**新鲜查询（架构师第三轮"彻底解法"）。
-            //   水位保持为"授权这次 probe 的那次 monitor 采样值"，因此下一次许可
-            //   仍然要求一次**严格更高**的 monitor 采样 —— 语义与旧实现一致，
-            //   但查询完全回到 monitor 线程上（probe owner 永不做磁盘查询）。
+            //   水位已经由 poll() 在发放许可时推进为"授权这次 probe 的采样值"，
+            //   因此下一次许可要求一次**严格更高**的 monitor 采样 ——
+            //   这正是 watermark 存在的意义（否则会每周期重复 probe）。
         }
         cv_.notify_all();
     }
