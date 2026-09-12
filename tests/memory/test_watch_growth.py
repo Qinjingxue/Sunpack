@@ -74,7 +74,7 @@ def test_watch_memory_growth_with_many_completed_files(tmp_path, record_property
     ``SUNPACK_WATCH_MEMORY_INTERVAL_SECONDS`` (default 0.2), and
     ``SUNPACK_WATCH_MEMORY_TIMEOUT_SECONDS`` (default 90).
     ``SUNPACK_WATCH_MEMORY_MAX_ACTIVE_PIPELINES`` can be set to 1 to
-    exclude Windows output-promotion contention from a run.
+    exclude Windows output contention from a run.
 
     The detailed JSON report includes RSS, private memory, child processes,
     reader cache, global cache namespaces, archive sessions, inspection cache,

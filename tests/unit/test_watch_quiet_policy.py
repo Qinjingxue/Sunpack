@@ -27,11 +27,6 @@ def test_explicit_cold_start_takes_precedence_over_legacy_alias():
     assert config["boundary_confirmation_seconds"] == 0.5
 
 
-def test_obsolete_partial_output_policy_is_removed():
-    assert "partial_output_policy" not in normalize_watch_config({})
-    assert "partial_output_policy" not in normalize_watch_config({"partial_output_policy": "promote"})
-
-
 def test_policy_starts_below_dynamic_floor_then_corrects_after_first_interval():
     tracker = AdaptiveQuietTracker(AdaptiveQuietPolicy())
 

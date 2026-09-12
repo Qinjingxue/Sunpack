@@ -4,7 +4,6 @@ import ctypes
 import asyncio
 import hashlib
 import os
-import shutil
 from copy import deepcopy
 from contextlib import contextmanager
 from ctypes import wintypes
@@ -300,12 +299,7 @@ def remove_watch_roots(paths: list[str], *, cleanup: bool = True) -> tuple[Path,
 
 
 def _cleanup_removed_watch_root_artifacts(roots: list[str]) -> None:
-    """Remove service-owned artifacts for roots that were actually removed.
-
-    The password file and the hidden ``.sunpack_watch_probes`` workspaces both live under the
-    input root, so removing the watch root removes them; a separately configured output root
-    is never deleted.
-    """
+    """Remove service-owned artifacts for roots that were actually removed."""
 
     for root in roots:
         normalized = normalize_root(root)
@@ -315,14 +309,6 @@ def _cleanup_removed_watch_root_artifacts(roots: list[str]) -> None:
                 password_file.unlink()
         except OSError:
             pass
-
-        probe_root = Path(normalized) / ".sunpack_watch_probes"
-        try:
-            if probe_root.is_dir():
-                shutil.rmtree(probe_root)
-        except OSError:
-            pass
-
 
 def list_watch_roots() -> tuple[Path, list[str]]:
     roots_path = watch_roots_path()
@@ -539,8 +525,8 @@ class WatchService:
 
     async def remove_roots(self, paths: list[str]) -> dict:
         async with self._reload_lock:
-            # Stop/reconcile the running scheduler before deleting probe
-            # workspaces, so an in-flight extraction cannot race cleanup.
+            # Stop/reconcile the running scheduler before removing its watch
+            # state, so an in-flight extraction cannot race reconfiguration.
             roots_path, removed = remove_watch_roots(paths, cleanup=False)
             if not removed:
                 self.log.write("watch_roots_remove_skipped", requested=_normalize_scan_roots(paths))

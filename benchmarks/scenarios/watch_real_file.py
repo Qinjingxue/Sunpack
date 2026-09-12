@@ -55,17 +55,15 @@ def _wrap_scheduler_timers(watcher: WatchScheduler, destination: Path, timings: 
 
     watcher._submit_candidate = types.MethodType(submit, watcher)
 
-    original_promote = watcher._promote_probe_outputs
+    original_complete = watcher._complete_candidate
 
-    async def promote(self, *args: Any, **kwargs: Any):
-        started = _now()
-        try:
-            return await original_promote(*args, **kwargs)
-        finally:
-            timings["promotion_seconds"] = _now() - started
-            timings["promotion_finished"] = _now()
+    async def complete(self, request):
+        result = await original_complete(request)
+        if result.succeeded:
+            timings["completed_finished"] = _now()
+        return result
 
-    watcher._promote_probe_outputs = types.MethodType(promote, watcher)
+    watcher._complete_candidate = types.MethodType(complete, watcher)
 
 
 def _phase_seconds(profiler: RequestRuntimeProfiler) -> dict[str, float]:
@@ -83,7 +81,6 @@ def _output_summary(root: Path, source_name: str) -> dict[str, Any]:
         for path in root.rglob("*")
         if path.is_file()
         and path.name not in excluded
-        and ".sunpack_watch_probes" not in path.parts
     ]
     return {
         "file_count": len(files),
@@ -129,7 +126,7 @@ async def _run_once(
             config,
             [str(root)],
             # A relative dot is resolved against the watched root, so the
-            # promoted result lands in the watch directory itself.
+            # result lands in the watch directory itself.
             out_dir=".",
             state_path=str(state_path),
             quiet_seconds=quiet_seconds,
@@ -152,13 +149,7 @@ async def _run_once(
             tick_started = _now()
             await watcher.run_once()
             tick_seconds.append(_now() - tick_started)
-            if "promotion_finished" in timings:
-                # One final harvest records the completed target and lets the
-                # scheduler finish its state transition before teardown.
-                tick_started = _now()
-                await watcher.run_once()
-                tick_seconds.append(_now() - tick_started)
-                timings["post_promotion_harvest_seconds"] = _now() - timings["promotion_finished"]
+            if "completed_finished" in timings:
                 completed = True
                 break
             for path, entry in watcher.state.entries.items():
@@ -171,13 +162,11 @@ async def _run_once(
             await asyncio.sleep(0.01 if delay is None else min(max(delay, 0.001), 0.05))
         else:
             raise TimeoutError(
-                f"watch did not promote output before {timeout:g}s; "
+                f"watch did not complete output before {timeout:g}s; "
                 f"pending={watcher.pending_count}, timings={timings}"
             )
 
-        # The requested end point is the physical promotion into watch_root,
-        # not the optional follow-up tick that harvests state/log completion.
-        timings["finished"] = timings.get("promotion_finished", _now())
+        timings["finished"] = timings.get("completed_finished", _now())
         watchdog_event = timings.get("watchdog_first_enqueue")
         totals = _phase_seconds(profiler)
         result = {
@@ -205,11 +194,11 @@ async def _run_once(
                     - timings["copy_finished"]
                 ),
                 "pipeline_run": totals.get("pipeline_run", 0.0),
-                "probe_promotion": timings.get("promotion_seconds", 0.0),
-                "end_to_end_copy_start_to_promotion": (
+                "watch_completion": timings.get("completed_finished", 0.0) - timings["copy_finished"]
+                if "completed_finished" in timings else 0.0,
+                "end_to_end_copy_start_to_completion": (
                     timings["finished"] - copy_started
                 ),
-                "post_promotion_harvest": timings.get("post_promotion_harvest_seconds", 0.0),
             },
             "pipeline_timing_seconds": totals,
             "watch_tick_seconds": {
@@ -277,7 +266,7 @@ def main() -> int:
                 quiet_seconds=args.quiet_seconds,
                 timeout=args.timeout,
             )))
-        end_to_end = [row["timings_seconds"]["end_to_end_copy_start_to_promotion"] for row in samples]
+        end_to_end = [row["timings_seconds"]["end_to_end_copy_start_to_completion"] for row in samples]
         report = {
             "watch_broker": broker_metadata,
             "parameters": {
@@ -301,8 +290,8 @@ def main() -> int:
                 "median_pipeline_seconds": statistics.median(
                     row["timings_seconds"]["pipeline_run"] for row in samples
                 ),
-                "median_promotion_seconds": statistics.median(
-                    row["timings_seconds"]["probe_promotion"] for row in samples
+                "median_watch_completion_seconds": statistics.median(
+                    row["timings_seconds"]["watch_completion"] for row in samples
                 ),
                 "successful_runs": sum(bool(row["completed"]) for row in samples),
                 "terminal_statuses": [row["terminal_status"] for row in samples if row["terminal_status"]],

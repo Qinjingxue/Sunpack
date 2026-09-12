@@ -1,11 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-import errno
 import hashlib
 import json
 import os
-import shutil
 import threading
 import time
 import uuid
@@ -15,11 +13,9 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from sunpack.config.fields.watch import DEFAULT_WATCH_CONFIG
-from sunpack.contracts.detection import FactBag
 from sunpack.contracts.failures import FailureKind, PASSWORD_FAILURE_KINDS
 from sunpack.contracts.filesystem import FileEntry
 from sunpack.contracts.results import OutcomeKind
-from sunpack.contracts.tasks import ArchiveTask
 from sunpack.contracts.pipeline import PipelineTarget
 from sunpack.filesystem.directory_scanner import (
     apply_ordered_filters_to_entries,
@@ -55,29 +51,19 @@ from sunpack.passwords.internal.clipboard_monitor import ClipboardPasswordMonito
 from sunpack.passwords.internal.lists import dedupe_passwords
 from sunpack.passwords.internal.local_files import DIRECTORY_PASSWORD_FILE_NAME, is_directory_password_file
 from sunpack.passwords.internal.store import MAX_RECENT_PASSWORDS
-from sunpack.support.output_paths import default_output_dir_for_task
 from sunpack.support.path_keys import path_key
 from sunpack.support.collections import dedupe_normalized_paths
-from sunpack.support.archive_sessions import release_archive_sessions_under
 from sunpack.support.resource_lifecycle import (
     ResourceKind,
-    audit_open_files,
     lifecycle_registration,
     open_service_file,
-    promotion_barrier,
     register_service_resource,
-    resource_snapshot,
-    task_scandir,
 )
-from sunpack.coordinator.engine import IdentityOutputCommitter, MappedOutputCommitter
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
 
 
-PROBE_PROMOTION_RETRY_SECONDS = 0.02
-PROBE_PROMOTION_MAX_RETRY_SECONDS = 0.5
-PROBE_PROMOTION_MAX_RETRIES = 12
 USN_REASON_DATA_OVERWRITE = 0x00000001
 USN_REASON_DATA_EXTEND = 0x00000002
 USN_REASON_DATA_TRUNCATION = 0x00000004
@@ -121,25 +107,7 @@ class _ActivePipelineRequest:
     candidate: WatchCandidate
     group: WatchGroupSnapshot | None
     task: asyncio.Task
-    config: dict
-    probe_workspace: str
-    predicted_probe_dirs: list[str]
-    predicted_final_dirs: list[str]
     registry_owner: str = ""
-
-
-def _paths_overlap(first: str, second: str) -> bool:
-    first_abs = os.path.abspath(first)
-    second_abs = os.path.abspath(second)
-    if path_key(first_abs) == path_key(second_abs):
-        return True
-    try:
-        return (
-            os.path.commonpath((first_abs, second_abs)) == first_abs
-            or os.path.commonpath((first_abs, second_abs)) == second_abs
-        )
-    except ValueError:
-        return False
 
 
 class WatchScheduler:
@@ -183,6 +151,7 @@ class WatchScheduler:
                 path_key(root),
                 os.path.abspath(os.path.join(root, self.out_dir)) if not os.path.isabs(expanded_out_dir) else self.out_dir,
             )
+        self._validate_output_roots()
         configured_cold_start = watch_config.get(
             "cold_start_seconds",
             watch_config.get("quiet_seconds", DEFAULT_WATCH_CONFIG["cold_start_seconds"]),
@@ -294,6 +263,21 @@ class WatchScheduler:
             max_entries=int(watch_config["clipboard_builtin_max_entries"]),
         )
 
+    def _validate_output_roots(self) -> None:
+        resolved = [
+            (root, self.output_roots[path_key(root)])
+            for root in self.watch_roots
+        ]
+        for index, (first_root, first_output) in enumerate(resolved):
+            for second_root, second_output in resolved[index + 1:]:
+                if path_key(first_output) == path_key(second_output):
+                    continue
+                if _is_relative_to(first_output, second_output) or _is_relative_to(second_output, first_output):
+                    raise ValueError(
+                        "watch output roots must not contain one another: "
+                        f"{first_root} -> {first_output}; {second_root} -> {second_output}"
+                    )
+
     async def start(self):
         await self.pipeline_engine.work_broker.run(
             "watch_start",
@@ -306,7 +290,6 @@ class WatchScheduler:
         if self._started:
             return
         self._ensure_directory_password_files()
-        self._recover_probe_workspaces()
         removed_entries, removed_groups = self.state.prune_missing_records()
         if removed_entries or removed_groups:
             self.log.write(
@@ -430,8 +413,6 @@ class WatchScheduler:
             state=self.state,
             prepare_candidate=self._prepare_group_head,
         )
-        dispatches, output_deferred = self._filter_output_conflicts(dispatches)
-        deferred.extend(output_deferred)
         for item in deferred:
             if item.group is not None:
                 # A different member of this split group is still pending or
@@ -471,36 +452,6 @@ class WatchScheduler:
         if state_is_idle:
             self.state.compact_if_needed()
         return result
-
-    def _filter_output_conflicts(self, dispatches):
-        with self._lock:
-            active = [
-                path
-                for request in self._inflight_requests
-                for path in request.predicted_final_dirs
-            ]
-        selected = []
-        deferred = []
-        reserved = list(active)
-        for dispatch in dispatches:
-            candidate = dispatch.candidate
-            output_config = dict(self.config)
-            output_config["output"] = {
-                **(output_config.get("output", {}) if isinstance(output_config.get("output"), dict) else {}),
-                "root": self._output_root_for(candidate.path),
-                "common_root": self._common_root_for(candidate.path),
-            }
-            predicted = self._predicted_output_dirs(
-                candidate.path,
-                output_config,
-                logical_name=dispatch.group.logical_name if dispatch.group is not None else "",
-            )
-            if any(_paths_overlap(path, current) for path in predicted for current in reserved):
-                deferred.append(DeferredWatch(candidate=candidate, group=dispatch.group))
-                continue
-            selected.append(dispatch)
-            reserved.extend(predicted)
-        return selected, deferred
 
     async def _harvest_completed_requests(self) -> WatchRunResult:
         with self._lock:
@@ -790,7 +741,7 @@ class WatchScheduler:
     def should_ignore_event_path(self, path: str) -> bool:
         if not path:
             return True
-        return self._is_under_metadata_dir(path) or self._is_under_probe_root(path)
+        return self._is_under_metadata_dir(path)
 
     def _log_candidate_ignored(self, path: str, reason: str, **payload) -> None:
         normalized = os.path.normcase(os.path.abspath(str(path))) if path else ""
@@ -1148,25 +1099,6 @@ class WatchScheduler:
             "root": output_root,
             "common_root": self._common_root_for(candidate.path),
         }
-        final_output_config = dict(run_config)
-        final_output_config["output"] = dict(run_config["output"])
-        logical_name = group.logical_name if group is not None else ""
-        predicted_final_dirs = self._predicted_output_dirs(
-            candidate.path,
-            final_output_config,
-            logical_name=logical_name,
-        )
-        probe_workspace = self._prepare_probe_workspace(candidate.path)
-        run_config["output"] = {
-            **run_config["output"],
-            "root": probe_workspace,
-            "common_root": final_output_config["output"]["common_root"],
-        }
-        predicted_probe_dirs = self._predicted_output_dirs(
-            candidate.path,
-            run_config,
-            logical_name=logical_name,
-        )
         from sunpack.cli.runtime_state import runtime_host
 
         host = runtime_host()
@@ -1187,7 +1119,6 @@ class WatchScheduler:
         try:
             task = asyncio.create_task(self.pipeline_engine.run(
                 [PipelineTarget(candidate.path, output=run_config["output"])],
-                output_committer=IdentityOutputCommitter(),
                 progress_callback=lambda archive_task, event: self._notify(
                     "progress",
                     notification_id,
@@ -1208,33 +1139,31 @@ class WatchScheduler:
             candidate=candidate,
             group=group,
             task=task,
-            config=run_config,
-            probe_workspace=probe_workspace,
-            predicted_probe_dirs=predicted_probe_dirs,
-            predicted_final_dirs=predicted_final_dirs,
             registry_owner=notification_id if host is not None else "",
         )
 
     async def _complete_candidate(self, request: _ActivePipelineRequest) -> WatchRunResult:
         candidate = request.candidate
         group = request.group
-        try:
-            response = await request.task
-        except Exception:
-            self._cleanup_probe_workspace(request.probe_workspace)
-            raise
+        response = await request.task
         summary = response.summary
         self._remember_recent_passwords(response.recent_passwords)
         target_result = _target_result_for_path(summary, candidate.path)
         outcome_kind = _summary_outcome_kind(summary, target_result)
-        probe_output_dirs = dedupe_normalized_paths([
+        target_output_dir = (
+            target_result.get("output_dir", "")
+            if isinstance(target_result, dict)
+            else getattr(target_result, "output_dir", "")
+        ) if target_result is not None else ""
+        generated_output_dirs = dedupe_normalized_paths([
             *response.artifacts.flatten_targets,
+            *getattr(response.artifacts, "shell_refresh_paths", ()),
             *(
                 str(item.get("out_dir") or "")
                 for item in (getattr(summary, "recovered_outputs", []) or [])
                 if isinstance(item, dict)
             ),
-            *request.predicted_probe_dirs,
+            str(target_output_dir or ""),
         ])
 
         summary_failures = list(getattr(summary, "failures", []) or [])
@@ -1259,7 +1188,6 @@ class WatchScheduler:
         )
 
         if outcome_kind == OutcomeKind.PARTIAL_SUCCESS and missing_volume_failures:
-            self._cleanup_probe_workspace(request.probe_workspace)
             failure_payloads = [_failure_to_dict(failure) for failure in missing_volume_failures]
             payload = {**failure_payloads[0], "blockers": [BLOCKER_MISSING_VOLUME]}
             error = str(
@@ -1293,7 +1221,6 @@ class WatchScheduler:
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
         if outcome_kind == OutcomeKind.PARTIAL_SUCCESS:
-            self._cleanup_probe_workspace(request.probe_workspace)
             nested_reasons = _nested_failure_reasons(
                 nested_password_failures,
                 nested_missing_volume_failures,
@@ -1452,7 +1379,6 @@ class WatchScheduler:
                 failure_payload=payload,
             )
             self.log.write(status, path=candidate.path, error=error, failures=failure_payloads)
-            self._cleanup_probe_workspace(request.probe_workspace)
             if blockers and not nested_notification:
                 self._notify("suppressed", request.notification_id)
             else:
@@ -1479,11 +1405,9 @@ class WatchScheduler:
                 status="ignored_no_tasks",
             )
             self.log.write("no_tasks_found", path=candidate.path)
-            self._cleanup_probe_workspace(request.probe_workspace)
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
         if outcome_kind != OutcomeKind.COMPLETE_SUCCESS:
-            self._cleanup_probe_workspace(request.probe_workspace)
             error = self.i18n.t("watch.failure.no_complete_outcome")
             if group is not None:
                 self.state.record_group_terminal(group, status="failed_terminal")
@@ -1491,15 +1415,6 @@ class WatchScheduler:
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
-        generated_output_dirs, output_path_map = await self._promote_probe_outputs(
-            probe_output_dirs,
-            request.predicted_final_dirs,
-            request.probe_workspace,
-        )
-        response = await MappedOutputCommitter(self.pipeline_engine.work_broker, output_path_map).commit(
-            request.config,
-            response,
-        )
         if group is not None:
             completed_group = self._current_group_snapshot(group, candidate.path)
             if completed_group is None:
@@ -1574,167 +1489,6 @@ class WatchScheduler:
             return self._common_root_for(path)
         return self.output_roots[path_key(matched_root)]
 
-    def _probe_root_for(self, path: str) -> str:
-        return os.path.join(self._common_root_for(path), ".sunpack_watch_probes")
-
-    def _probe_roots(self) -> list[str]:
-        roots = []
-        for root in self.watch_roots:
-            base = root if os.path.isdir(root) else os.path.dirname(root)
-            roots.append(os.path.join(os.path.abspath(base), ".sunpack_watch_probes"))
-        return dedupe_normalized_paths(roots)
-
-    def _is_under_probe_root(self, path: str) -> bool:
-        normalized = os.path.abspath(path)
-        return _is_under_any_root(normalized, self._probe_roots())
-
-    def _recover_probe_workspaces(self) -> None:
-        for root in self._probe_roots():
-            os.makedirs(root, exist_ok=True)
-            _clear_directory_contents(root)
-
-    def _prepare_probe_workspace(self, path: str) -> str:
-        identity = hashlib.sha256(os.path.normcase(os.path.abspath(path)).encode("utf-8")).hexdigest()[:20]
-        probe_root = self._probe_root_for(path)
-        os.makedirs(probe_root, exist_ok=True)
-        owner_dir = os.path.join(probe_root, identity)
-        with promotion_barrier(
-            (owner_dir,),
-            cache_releasers=(release_archive_sessions_under,),
-        ):
-            shutil.rmtree(owner_dir, ignore_errors=True)
-        workspace = os.path.join(owner_dir, "work")
-        os.makedirs(workspace, exist_ok=True)
-        return workspace
-
-    def _cleanup_probe_workspace(self, workspace: str) -> None:
-        owner_dir = os.path.dirname(os.path.abspath(workspace))
-        probe_root = os.path.dirname(owner_dir)
-        with promotion_barrier(
-            (owner_dir,),
-            cache_releasers=(release_archive_sessions_under,),
-        ):
-            shutil.rmtree(owner_dir, ignore_errors=True)
-        os.makedirs(probe_root, exist_ok=True)
-
-    async def _promote_probe_outputs(
-        self,
-        probe_outputs: list[str],
-        predicted_final_dirs: list[str],
-        workspace: str,
-    ) -> tuple[list[str], dict[str, str]]:
-        reported_sources = [
-            path
-            for path in dedupe_normalized_paths(probe_outputs)
-            if os.path.isdir(path) and _is_relative_to(path, workspace)
-        ]
-        sources = [
-            path
-            for path in reported_sources
-            if not any(path != parent and _is_relative_to(path, parent) for parent in reported_sources)
-        ]
-        promoted: list[str] = []
-        path_map: dict[str, str] = {}
-        plans: list[tuple[str, str]] = []
-        for index, source in enumerate(sources):
-            if index < len(predicted_final_dirs):
-                target = predicted_final_dirs[index]
-            else:
-                target = os.path.join(os.path.dirname(predicted_final_dirs[0]), os.path.basename(source))
-            target = _next_nonexisting_path(target)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            plans.append((source, target))
-        promotion_roots = [*sources, *(target for _source, target in plans)]
-        with promotion_barrier(
-            promotion_roots,
-            cache_releasers=(release_archive_sessions_under,),
-        ) as barrier_report:
-            for source, target in plans:
-                try:
-                    await self._retry_probe_promotion_on_access_denied(
-                        lambda source=source, target=target: os.replace(source, target),
-                        source,
-                        target,
-                    )
-                except OSError as exc:
-                    if exc.errno != errno.EXDEV and getattr(exc, "winerror", None) != 17:
-                        raise
-                    await self._retry_probe_promotion_on_access_denied(
-                        lambda source=source, target=target: shutil.move(source, target),
-                        source,
-                        target,
-                    )
-                promoted.append(target)
-                path_map[source] = target
-                for reported in reported_sources:
-                    if reported != source and _is_relative_to(reported, source):
-                        path_map[reported] = os.path.join(target, os.path.relpath(reported, source))
-        self.log.write(
-            "probe_promotion_barrier",
-            roots=list(barrier_report.roots),
-            released_resources=barrier_report.released_resources,
-            gate_wait_seconds=barrier_report.gate_wait_seconds,
-            cleanup_seconds=barrier_report.cleanup_seconds,
-            barrier_seconds=barrier_report.barrier_seconds,
-        )
-        await self.pipeline_engine.work_broker.run(
-            "watch_cleanup",
-            workspace,
-            self._cleanup_probe_workspace,
-            workspace,
-            request_id=f"watch:{workspace}",
-        )
-        return promoted, path_map
-
-    async def _retry_probe_promotion_on_access_denied(
-        self,
-        operation: Callable[[], object],
-        source: str,
-        target: str,
-    ) -> None:
-        retries = 0
-        while True:
-            try:
-                await self.pipeline_engine.work_broker.run(
-                    "watch_promotion",
-                    source,
-                    operation,
-                    request_id=f"watch:{source}",
-                )
-                return
-            except OSError as exc:
-                if getattr(exc, "winerror", None) != 5:
-                    raise
-                if retries == 0:
-                    self.log.write(
-                        "probe_promotion_access_denied_audit",
-                        source=source,
-                        target=target,
-                        resources=list(resource_snapshot((source,))),
-                        open_files=list(audit_open_files((source,))),
-                    )
-                if retries >= PROBE_PROMOTION_MAX_RETRIES:
-                    raise
-                retries += 1
-                self.log.write_throttled(
-                    "probe_promotion_retry",
-                    throttle_key=f"{os.path.normcase(source)}->{os.path.normcase(target)}",
-                    interval_seconds=30.0,
-                    source=source,
-                    target=target,
-                    retry=retries,
-                    max_retries=PROBE_PROMOTION_MAX_RETRIES,
-                    retry_seconds=min(
-                        PROBE_PROMOTION_RETRY_SECONDS * (2 ** max(0, retries - 1)),
-                        PROBE_PROMOTION_MAX_RETRY_SECONDS,
-                    ),
-                    error=str(exc),
-                )
-                await asyncio.sleep(min(
-                    PROBE_PROMOTION_RETRY_SECONDS * (2 ** max(0, retries - 1)),
-                    PROBE_PROMOTION_MAX_RETRY_SECONDS,
-                ))
-
     def _is_under_watched_root(self, path: str) -> bool:
         normalized = os.path.normcase(os.path.abspath(path))
         for root in self.watch_roots:
@@ -1767,25 +1521,6 @@ class WatchScheduler:
             return False
         member_keys = {path_key(path) for path in snapshot.input_paths}
         return path_key(candidate.path) in member_keys
-
-    def _predicted_output_dirs(
-        self,
-        path: str,
-        run_config: dict,
-        *,
-        logical_name: str = "",
-    ) -> list[str]:
-        try:
-            task = ArchiveTask(
-                fact_bag=FactBag(),
-                score=0,
-                main_path=os.path.abspath(path),
-                all_parts=[os.path.abspath(path)],
-                logical_name=logical_name,
-            )
-            return dedupe_normalized_paths([default_output_dir_for_task(task, run_config.get("output", {}))])
-        except Exception:
-            return []
 
     def _refresh_password_sources(self) -> str:
         with self._password_source_lock:
@@ -1842,11 +1577,14 @@ class _WatchEventHandler(FileSystemEventHandler):
 
     def on_moved(self, event: FileSystemEvent):
         src_path = getattr(event, "src_path", "")
+        is_directory = bool(getattr(event, "is_directory", False))
         if src_path:
             self._handle_departure_path(
                 src_path,
-                is_directory=bool(getattr(event, "is_directory", False)),
+                is_directory=is_directory,
             )
+        if is_directory:
+            return
         dest_path = getattr(event, "dest_path", "")
         if dest_path:
             self._handle_path(dest_path, event_type="moved", src_path=src_path)
@@ -1998,30 +1736,6 @@ def _paths_match(path: str, expected: str, *, recursive: bool) -> bool:
     )
 
 
-def _is_under_any_root(path: str, roots: list[str]) -> bool:
-    return any(_is_relative_to(path, root) for root in roots if root)
-
-
-def _clear_directory_contents(path: str) -> None:
-    try:
-        with task_scandir(path) as iterator:
-            entries = list(iterator)
-    except OSError:
-        return
-    with promotion_barrier(
-        (path,),
-        cache_releasers=(release_archive_sessions_under,),
-    ):
-        for entry in entries:
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    shutil.rmtree(entry.path, ignore_errors=True)
-                else:
-                    os.unlink(entry.path)
-            except OSError:
-                continue
-
-
 def _target_result_for_path(summary, path: str):
     expected = os.path.normcase(os.path.abspath(path))
     for item in list(getattr(summary, "target_results", []) or []):
@@ -2049,18 +1763,6 @@ def _summary_outcome_kind(summary, target_result) -> OutcomeKind:
     if int(getattr(summary, "success_count", 0) or 0) > 0:
         return OutcomeKind.COMPLETE_SUCCESS
     return OutcomeKind.FAILURE
-
-
-def _next_nonexisting_path(path: str) -> str:
-    if not os.path.exists(path):
-        return path
-    base = f"{path}_extracted"
-    if not os.path.exists(base):
-        return base
-    index = 2
-    while os.path.exists(f"{base}_{index}"):
-        index += 1
-    return f"{base}_{index}"
 
 
 def _password_source_signature(

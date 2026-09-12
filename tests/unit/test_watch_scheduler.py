@@ -10,6 +10,8 @@ import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 import sunpack.filesystem.watcher.scheduler as scheduler_module
 import sunpack.passwords.internal.builtin as builtin_module
 import sunpack.passwords.internal.clipboard_monitor as clipboard_monitor_module
@@ -350,7 +352,6 @@ class _DeferredPipelineEngine:
         *,
         direct=False,
         request_config=None,
-        output_committer=None,
         progress_callback=None,
         origin="foreground",
     ):
@@ -453,7 +454,7 @@ def _watch_summary(path: str, kind: OutcomeKind, verification: dict):
     )
 
 
-def test_successful_watch_task_commits_postprocess_after_promotion(tmp_path, monkeypatch):
+def test_successful_watch_task_uses_direct_output_root(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
@@ -486,7 +487,7 @@ def test_successful_watch_task_commits_postprocess_after_promotion(tmp_path, mon
     assert list((tmp_path / "out").rglob("payload.bin"))
 
 
-def test_failed_watch_task_does_not_commit_probe_output(tmp_path, monkeypatch):
+def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
@@ -525,9 +526,8 @@ def test_failed_watch_task_does_not_commit_probe_output(tmp_path, monkeypatch):
     result = _await(watcher.run_once())
 
     assert result.failed == 1
-    probe_root = tmp_path / ".sunpack_watch_probes"
-    assert probe_root.is_dir()
-    assert list(probe_root.iterdir()) == []
+    assert (tmp_path / "out" / "sample" / "invalid.bin").is_file()
+    assert not (tmp_path / ".sunpack_watch_probes").exists()
 
 
 def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, monkeypatch):
@@ -547,7 +547,7 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
         def run_targets(self, paths):
             kind = outcomes[len(calls)]
             calls.append(kind)
-            self.output_dir.mkdir(parents=True)
+            self.output_dir.mkdir(parents=True, exist_ok=True)
             (self.output_dir / "payload.bin").write_bytes(b"payload")
             if kind == OutcomeKind.PARTIAL_SUCCESS:
                 self.context.recovered_outputs = [{"out_dir": str(self.output_dir)}]
@@ -568,9 +568,6 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
     )
     watcher.enqueue(str(archive))
     assert _await(watcher.run_once()).processed == 1
-    probe_root = tmp_path / ".sunpack_watch_probes"
-    assert probe_root.is_dir()
-    assert list(probe_root.iterdir()) == []
     assert _await(watcher.run_once()).processed == 0
     with archive.open("ab") as stream:
         stream.write(b"changed")
@@ -579,11 +576,10 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
 
     assert final.succeeded == 1
     assert (tmp_path / "out" / "sample" / "payload.bin").is_file()
-    assert probe_root.is_dir()
-    assert list(probe_root.iterdir()) == []
+    assert not (tmp_path / ".sunpack_watch_probes").exists()
 
 
-def test_partial_result_is_rejected_and_probe_output_is_discarded(tmp_path, monkeypatch):
+def test_partial_result_is_rejected_but_direct_output_remains(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
@@ -622,161 +618,9 @@ def test_partial_result_is_rejected_and_probe_output_is_discarded(tmp_path, monk
     assert result.succeeded == 0
     assert result.failed == 1
     assert result.errors == ["Watch extraction rejected partial content"]
-    assert not (tmp_path / "out" / "sample" / "recovered.bin").exists()
-    probe_root = tmp_path / ".sunpack_watch_probes"
-    assert probe_root.is_dir()
-    assert list(probe_root.iterdir()) == []
+    assert (tmp_path / "out" / "sample" / "recovered.bin").is_file()
+    assert not (tmp_path / ".sunpack_watch_probes").exists()
     assert _await(watcher.run_once()).processed == 0
-
-
-def test_probe_promotion_keeps_nested_outputs_inside_outer_directory(tmp_path):
-    watch_root = tmp_path / "downloads"
-    watch_root.mkdir()
-    watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
-        [str(watch_root)],
-        out_dir=str(watch_root),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
-    )
-    workspace = Path(watcher._prepare_probe_workspace(str(watch_root / "outer.zip")))
-    outer = workspace / "outer"
-    inner = outer / "inner"
-    inner.mkdir(parents=True)
-    (inner / "payload.bin").write_bytes(b"payload")
-
-    promoted, path_map = _await(watcher._promote_probe_outputs(
-        [str(outer), str(inner)],
-        [str(watch_root / "outer")],
-        str(workspace),
-    ))
-
-    assert promoted == [str(watch_root / "outer")]
-    assert path_map[str(inner)] == str(watch_root / "outer" / "inner")
-    assert (watch_root / "outer" / "inner" / "payload.bin").is_file()
-    assert not (watch_root / "inner").exists()
-
-
-def test_probe_promotion_retries_winerror_5_until_success(tmp_path, monkeypatch):
-    watch_root = tmp_path / "downloads"
-    watch_root.mkdir()
-    watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
-        [str(watch_root)],
-        out_dir=str(watch_root),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
-    )
-    workspace = Path(watcher._prepare_probe_workspace(str(watch_root / "sample.zip")))
-    source = workspace / "sample"
-    source.mkdir()
-    (source / "payload.bin").write_bytes(b"payload")
-    real_replace = scheduler_module.os.replace
-    replace_attempts = []
-    sleeps = []
-
-    def intermittently_denied(current, target):
-        replace_attempts.append((current, target))
-        if len(replace_attempts) < 3:
-            error = PermissionError("temporarily denied")
-            error.winerror = 5
-            raise error
-        real_replace(current, target)
-
-    monkeypatch.setattr(scheduler_module.os, "replace", intermittently_denied)
-    async def record_sleep(delay):
-        sleeps.append(delay)
-    monkeypatch.setattr(scheduler_module.asyncio, "sleep", record_sleep)
-
-    promoted, _ = _await(watcher._promote_probe_outputs(
-        [str(source)],
-        [str(watch_root / "sample")],
-        str(workspace),
-    ))
-
-    assert promoted == [str(watch_root / "sample")]
-    assert len(replace_attempts) == 3
-    assert sleeps == [0.02, 0.04]
-    assert (watch_root / "sample" / "payload.bin").is_file()
-
-
-def test_probe_promotion_does_not_retry_other_errors(tmp_path, monkeypatch):
-    watch_root = tmp_path / "downloads"
-    watch_root.mkdir()
-    watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
-        [str(watch_root)],
-        out_dir=str(watch_root),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
-    )
-    workspace = Path(watcher._prepare_probe_workspace(str(watch_root / "sample.zip")))
-    source = workspace / "sample"
-    source.mkdir()
-    sleeps = []
-    error = PermissionError("sharing violation")
-    error.winerror = 32
-    monkeypatch.setattr(scheduler_module.os, "replace", lambda *_args: (_ for _ in ()).throw(error))
-    async def record_sleep(delay):
-        sleeps.append(delay)
-    monkeypatch.setattr(scheduler_module.asyncio, "sleep", record_sleep)
-
-    try:
-        _await(watcher._promote_probe_outputs(
-            [str(source)],
-            [str(watch_root / "sample")],
-            str(workspace),
-        ))
-    except PermissionError as exc:
-        assert exc is error
-    else:
-        raise AssertionError("expected non-WinError 5 failure to propagate")
-
-    assert sleeps == []
-
-
-def test_probe_promotion_stops_after_bounded_winerror_5_retries(tmp_path, monkeypatch):
-    watch_root = tmp_path / "downloads"
-    watch_root.mkdir()
-    watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
-        [str(watch_root)],
-        out_dir=str(watch_root),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
-    )
-    workspace = Path(watcher._prepare_probe_workspace(str(watch_root / "sample.zip")))
-    source = workspace / "sample"
-    source.mkdir()
-    attempts = []
-    sleeps = []
-
-    def always_denied(*_args):
-        attempts.append("attempt")
-        error = PermissionError("still denied")
-        error.winerror = 5
-        raise error
-
-    monkeypatch.setattr(scheduler_module.os, "replace", always_denied)
-    async def record_sleep(delay):
-        sleeps.append(delay)
-    monkeypatch.setattr(scheduler_module.asyncio, "sleep", record_sleep)
-
-    try:
-        _await(watcher._promote_probe_outputs(
-            [str(source)],
-            [str(watch_root / "sample")],
-            str(workspace),
-        ))
-    except PermissionError as exc:
-        assert exc.winerror == 5
-    else:
-        raise AssertionError("expected retries to stop at the configured limit")
-
-    assert len(attempts) == scheduler_module.PROBE_PROMOTION_MAX_RETRIES + 1
-    assert len(sleeps) == scheduler_module.PROBE_PROMOTION_MAX_RETRIES
-    assert sleeps == sorted(sleeps)
-    assert sleeps[-1] == scheduler_module.PROBE_PROMOTION_MAX_RETRY_SECONDS
 
 
 def test_content_event_during_processing_starts_a_new_active_epoch(tmp_path, monkeypatch):
@@ -1057,27 +901,6 @@ def test_watch_scheduler_preserves_existing_directory_password_file(tmp_path, mo
 
     assert password_file.read_text(encoding="utf-8") == "existing-secret\n"
     assert watcher.pending_count == 0
-
-
-def test_watch_scheduler_start_cleans_probe_contents_but_keeps_probe_root(tmp_path, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
-    probe_root = tmp_path / ".sunpack_watch_probes"
-    stale_workspace = probe_root / "stale-owner" / "work"
-    stale_workspace.mkdir(parents=True)
-    (stale_workspace / "partial.bin").write_bytes(b"partial")
-    watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
-        [str(tmp_path)],
-        out_dir=str(tmp_path / "out"),
-        state_path=str(tmp_path / "state.json"),
-        initial_scan=False,
-    )
-
-    _await(watcher.start())
-
-    assert probe_root.is_dir()
-    assert list(probe_root.iterdir()) == []
-    _await(watcher.stop())
 
 
 def test_watch_scheduler_never_recurses_for_current_directory_scan_mode(tmp_path, monkeypatch):
@@ -1416,8 +1239,8 @@ def test_watch_scheduler_processes_direct_quiet_candidate_with_watch_root_common
     assert result.processed == 1
     assert result.succeeded == 1
     assert captured["paths"] == [str(archive_path.resolve())]
-    assert Path(captured["config"]["output"]["root"]).parent.parent.name == ".sunpack_watch_probes"
-    assert Path(captured["config"]["output"]["root"]).is_relative_to(watch_root)
+    assert Path(captured["config"]["output"]["root"]) == (tmp_path / "out").resolve()
+    assert not (watch_root / ".sunpack_watch_probes").exists()
     assert captured["config"]["output"]["common_root"] == str(watch_root.resolve())
 
 
@@ -1844,6 +1667,34 @@ def test_watch_scheduler_reprocesses_identical_archive_after_it_moves_out_and_ba
     assert len(runs) == 2
 
 
+def test_watch_event_handler_cleans_moved_directory_source_without_arrival_enqueue(tmp_path):
+    watch_root = tmp_path / "watched"
+    watch_root.mkdir()
+    watcher = WatchScheduler(
+        {"watch": {"clipboard_monitor_enabled": False}},
+        [str(watch_root)],
+        out_dir=str(tmp_path / "out"),
+        state_path=str(tmp_path / "state.json"),
+        initial_scan=False,
+    )
+    departed = []
+    enqueued = []
+    watcher.notify_path_departed = lambda path, *, recursive=False: departed.append((path, recursive))
+    watcher.enqueue = lambda *args, **kwargs: enqueued.append((args, kwargs))
+
+    source = watch_root / "moving-dir"
+    destination = watch_root / "moved-dir"
+    handler = scheduler_module._WatchEventHandler(watcher)
+    handler.on_moved(SimpleNamespace(
+        src_path=str(source),
+        dest_path=str(destination),
+        is_directory=True,
+    ))
+
+    assert departed == [(str(source), True)]
+    assert enqueued == []
+
+
 def test_watch_scheduler_reprocesses_split_group_after_source_cleanup(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     watch_root = tmp_path / "watched"
@@ -1907,27 +1758,6 @@ def test_watch_scheduler_reprocesses_split_group_after_source_cleanup(tmp_path, 
 
     assert _await(watcher.run_once()).succeeded == 1
     assert len(runs) == 2
-
-
-def test_predicted_output_dir_uses_split_group_logical_name(tmp_path):
-    watch_root = tmp_path / "watched"
-    watch_root.mkdir()
-    watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
-        [str(watch_root)],
-        out_dir=".",
-        state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
-        initial_scan=False,
-    )
-
-    result = watcher._predicted_output_dirs(
-        str(watch_root / "sample.7z.001"),
-        {"output": {"root": str(tmp_path / "out"), "common_root": str(watch_root)}},
-        logical_name="sample",
-    )
-
-    assert result == [str(tmp_path / "out" / "sample")]
 
 
 def test_watch_scheduler_processes_same_path_again_after_input_changes(tmp_path, monkeypatch):
@@ -2042,7 +1872,7 @@ def test_relative_output_directory_is_resolved_per_matching_watch_root(tmp_path,
 
     assert result.succeeded == 1
     assert Path(captured["output"]["root"]).is_relative_to(second_root)
-    assert ".sunpack_watch_probes" in Path(captured["output"]["root"]).parts
+    assert Path(captured["output"]["root"]) == second_root.resolve()
     assert captured["output"]["common_root"] == str(second_root.resolve())
 
 
@@ -2066,7 +1896,7 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
             self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)}, recovered_outputs=[])
 
         def run_targets(self, paths):
-            captured["probe_root"] = self.output_dir
+            captured["output_dir"] = self.output_dir
             self.output_dir.mkdir(parents=True)
             (self.output_dir / "payload.bin").write_bytes(b"payload")
             return _watch_summary(paths[0], OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
@@ -2089,11 +1919,55 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
     result = _await(watcher.run_once())
 
     assert result.succeeded == 1
-    # Promotion stays a rename: compression runs in the probe workspace below the input root.
-    assert captured["probe_root"].is_relative_to(second_root / ".sunpack_watch_probes")
+    assert captured["output_dir"].is_relative_to(second_out)
     assert list(second_out.rglob("payload.bin"))
     assert not (tmp_path / "legacy-out").exists()
     assert not list(first_out.rglob("payload.bin"))
+
+
+def test_watch_scheduler_rejects_nested_output_roots(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+
+    with pytest.raises(ValueError, match="must not contain one another"):
+        WatchScheduler(
+            {"watch": {"clipboard_monitor_enabled": False}},
+            [str(first_root), str(second_root)],
+            output_roots={
+                str(first_root): str(tmp_path / "output"),
+                str(second_root): str(tmp_path / "output" / "nested"),
+            },
+            state_path=str(tmp_path / "state.json"),
+            initial_scan=False,
+        )
+
+
+def test_watch_scheduler_allows_shared_output_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    first_root.mkdir()
+    second_root.mkdir()
+    output_root = tmp_path / "output"
+
+    watcher = WatchScheduler(
+        {"watch": {"clipboard_monitor_enabled": False}},
+        [str(first_root), str(second_root)],
+        output_roots={
+            str(first_root): str(output_root),
+            str(second_root): str(output_root),
+        },
+        state_path=str(tmp_path / "state.json"),
+        initial_scan=False,
+    )
+
+    assert watcher.output_roots == {
+        scheduler_module.path_key(str(first_root)): str(output_root.resolve()),
+        scheduler_module.path_key(str(second_root)): str(output_root.resolve()),
+    }
 
 
 def test_watch_root_always_has_a_resolved_output_root(tmp_path, monkeypatch):

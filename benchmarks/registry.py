@@ -23,7 +23,7 @@ _ROWS = [
     ("scan", "directory", "benchmarks.scenarios.scan_directory", "Directory scanner comparison."),
     ("scan", "hotspots", "benchmarks.scenarios.scan_hotspots", "Full scan hotspot instrumentation."),
     ("scan", "synthetic-pressure", "benchmarks.scenarios.scan_synthetic_pressure", "Synthetic mixed-corpus scan."),
-    ("watch", "real-file", "benchmarks.scenarios.watch_real_file", "End-to-end watch arrival, extraction, and promotion."),
+    ("watch", "real-file", "benchmarks.scenarios.watch_real_file", "End-to-end watch arrival, extraction, and completion."),
     ("watch", "arrival-matrix", "benchmarks.scenarios.watch_arrival_matrix", "Watch arrival/move methods versus quiet-window policies."),
     ("watch", "split-arrival", "benchmarks.scenarios.watch_split_arrival", "Split-volume order and slow-arrival watch benchmark."),
     ("watch", "state-persistence", "benchmarks.scenarios.watch_state_persistence", "Incremental watch-state latency versus retained state size."),

@@ -70,7 +70,7 @@ def _manifest(root: Path, source_names: set[str]) -> list[dict[str, Any]]:
     excluded = source_names | {"state.json", "events.jsonl", ".sunpack-passwords.txt"}
     rows: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*")):
-        if not path.is_file() or path.name in excluded or ".sunpack_watch_probes" in path.parts:
+        if not path.is_file() or path.name in excluded:
             continue
         digest = hashlib.sha256()
         with path.open("rb") as handle:
@@ -138,22 +138,6 @@ def _install_instrumentation(
             })
 
     watcher._complete_candidate = types.MethodType(complete, watcher)
-
-    original_promote = watcher._promote_probe_outputs
-
-    async def promote(self, *args: Any, **kwargs: Any):
-        started = _now()
-        try:
-            return await original_promote(*args, **kwargs)
-        finally:
-            timings.setdefault("promotions", []).append({
-                "started": started,
-                "finished": _now(),
-                "seconds": _now() - started,
-            })
-
-    watcher._promote_probe_outputs = types.MethodType(promote, watcher)
-
 
 async def _pump(watcher: WatchScheduler) -> float:
     started = _now()
@@ -330,7 +314,10 @@ async def _wait_for_completion(
     deadline = _now() + timeout_seconds
     while _now() < deadline:
         tick_seconds.append(await _pump(watcher))
-        if timings.get("promotions") and watcher.pending_count == 0 and not watcher._inflight_requests:
+        if any(
+            row.get("state_status") in {"done_or_cleared", "done"}
+            for row in timings.get("attempts", [])
+        ) and watcher.pending_count == 0 and not watcher._inflight_requests:
             return
         delay = watcher.next_delay_seconds()
         await asyncio.sleep(0.01 if delay is None else min(max(delay, 0.001), 0.05))
@@ -375,6 +362,7 @@ async def _run_case(
     watcher: WatchScheduler | None = None
     timings: dict[str, Any] = {"case_started": _now()}
     attempts: list[dict[str, Any]] = []
+    timings["attempts"] = attempts
     tick_seconds: list[float] = []
     try:
         await engine.__aenter__()
@@ -415,7 +403,6 @@ async def _run_case(
             if row.get("state_status") not in {None, "", "done_or_cleared", "done"}
         ]
         manifest_json = json.dumps(manifest, ensure_ascii=False, sort_keys=True).encode("utf-8")
-        promotions = timings.get("promotions", [])
         return {
             "run_index": run_index,
             "mode": mode,
@@ -431,14 +418,12 @@ async def _run_case(
                     if first_processing is not None else None
                 ),
                 "pipeline_total_all_attempts": pipeline_total,
-                "promotion_total": sum(item["seconds"] for item in promotions),
                 "arrival_start_to_completion": timings["case_finished"] - timings["case_started"],
                 "post_arrival_to_completion": timings["case_finished"] - timings["arrival_finished"],
             },
             "attempt_count": len(profiler.request_timings),
             "completed_attempt_count": len(completed_attempts),
             "failed_or_terminal_attempt_count": len(failed_attempts),
-            "promotion_count": len(promotions),
             "attempts": attempts,
             "pipeline_seconds_by_request": pipeline_by_request,
             "enqueue_event_count": len(timings.get("enqueue_events", [])),
@@ -454,7 +439,7 @@ async def _run_case(
                 "manifest": manifest,
                 "manifest_sha256": hashlib.sha256(manifest_json).hexdigest(),
             },
-            "success": bool(promotions and manifest),
+            "success": bool(completed_attempts and manifest),
         }
     finally:
         if watcher is not None:

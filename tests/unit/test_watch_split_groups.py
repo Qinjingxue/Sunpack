@@ -202,8 +202,8 @@ def test_watch_does_not_hold_plain_numeric_files_as_missing_volumes(tmp_path):
 
     result = _run_once(watcher)
 
-    assert result.processed == 1
-    assert len(attempts) == 1
+    assert result.processed == 2
+    assert len(attempts) == 2
 
 
 def test_watch_holds_strong_middle_gap_until_missing_volume_arrives(tmp_path):

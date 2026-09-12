@@ -7,7 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, Mapping, Protocol, TextIO
+from typing import Any, Callable, Iterable, TextIO
 
 from sunpack.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.repair_inspection import RepairInspectionService
@@ -52,39 +52,9 @@ class _Submission:
     progress_callback: Callable[[Any, dict[str, Any]], None] | None = None
 
 
-class AsyncOutputCommitter(Protocol):
-    async def commit(self, config: dict, response: PipelineResponse) -> PipelineResponse: ...
-
-
-class DirectOutputCommitter:
-    def __init__(self, broker: AsyncWorkBroker, *, stdout=None):
-        self._broker = broker
-        self._stdout = stdout
-
-    async def commit(self, config: dict, response: PipelineResponse) -> PipelineResponse:
-        return await _commit_response(self._broker, config, response, stdout=self._stdout)
-
-
-class IdentityOutputCommitter:
-    """Let an embedding perform an atomic output commit after inspection."""
-
-    async def commit(self, config: dict, response: PipelineResponse) -> PipelineResponse:
-        return response
-
-
-class MappedOutputCommitter:
-    def __init__(self, broker: AsyncWorkBroker, output_path_map: Mapping[str, str]):
-        self._broker = broker
-        self._output_path_map = dict(output_path_map)
-
-    async def commit(self, config: dict, response: PipelineResponse) -> PipelineResponse:
-        return await _commit_response(self._broker, config, response, output_path_map=self._output_path_map)
-
-
-async def _commit_response(broker, config, response, *, output_path_map=None, stdout=None):
+async def _commit_response(broker, config, response, *, stdout=None):
     response = await broker.run("postprocess", response.request_id, _finalize_response,
-                                config, response, output_path_map=output_path_map,
-                                stdout=stdout, request_id=response.request_id)
+                                config, response, stdout=stdout, request_id=response.request_id)
     for delay in (0.1, 0.3):
         pending = [item for item in response.summary.cleanup_results if item.retryable and item.attempts < 3]
         if not pending:
@@ -163,7 +133,6 @@ class PipelineEngine:
         targets: Iterable[str | PipelineTarget],
         *,
         direct: bool = False,
-        output_committer: AsyncOutputCommitter | None = None,
         request_config: dict | None = None,
         stdout: TextIO | None = None,
         stderr: TextIO | None = None,
@@ -220,8 +189,7 @@ class PipelineEngine:
                 start_time = time.time()
                 response = await runtime.execute_async(self._broker, cancellation)
                 self._remember_recent_passwords(response.recent_passwords)
-                committer = output_committer or DirectOutputCommitter(self._broker, stdout=stdout)
-                response = await committer.commit(submission.config, response)
+                response = await _commit_response(self._broker, submission.config, response, stdout=stdout)
                 if getattr(response.summary, "_postprocess_completed", False):
                     await self._broker.run(
                         "report",
@@ -848,31 +816,13 @@ def _finalize_response(
     config: dict,
     response: PipelineResponse,
     *,
-    output_path_map: Mapping[str, str] | None = None,
     stdout=None,
     retry_results=None,
 ) -> PipelineResponse:
     if getattr(response.summary, "_postprocess_completed", False) and retry_results is None:
         return response
-    mapping = {path_key(old): os.path.abspath(new) for old, new in (output_path_map or {}).items()}
-
-    def remap(path: str) -> str:
-        normalized = os.path.abspath(path)
-        exact = mapping.get(path_key(normalized))
-        if exact:
-            return exact
-        ancestors = [
-            (old, new)
-            for old, new in (output_path_map or {}).items()
-            if _is_relative_to(normalized, old)
-        ]
-        if not ancestors:
-            return path
-        old, new = max(ancestors, key=lambda item: len(os.path.abspath(item[0])))
-        return os.path.join(os.path.abspath(new), os.path.relpath(normalized, os.path.abspath(old)))
-
-    flatten_targets_all = [remap(path) for path in response.artifacts.flatten_targets]
-    shell_refresh_paths = [remap(path) for path in response.artifacts.shell_refresh_paths]
+    flatten_targets_all = list(response.artifacts.flatten_targets)
+    shell_refresh_paths = list(response.artifacts.shell_refresh_paths)
     previous = None
     cleanup_requests = ()
     if retry_results is not None:

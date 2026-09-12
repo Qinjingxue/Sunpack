@@ -241,15 +241,16 @@ native worker 启动时采集逻辑处理器数和可用物理内存。线程容
 | `initial_scan` | `bool` | 启动 watcher 时是否扫描已有文件。 |
 | `max_folders` | `int` | 单次 watch 接受的最大路径数量。 |
 | `observer_stop_timeout_seconds` | `float` | 停止 watchdog observer 时等待线程退出的超时。 |
-| `partial_output_policy` | `string` | 部分恢复产物的处置方式：`discard`（默认）清理试解压目录，`promote` 将部分恢复产物提升到正式输出目录。 |
 
 没有活跃文件或待处理密码重试时，watch 服务会无限等待 watchdog 或控制事件；只有静默期和 debounce 尚未到期时才设置一次性 deadline。
 
 watch 不按扩展名或下载器类型推测下载状态。`created`、`moved`、`modified` 事件使输入进入活跃态；首次使用 `cold_start_seconds`，取得首个有效内容变化间隔后立即进入不低于 `quiet_min_seconds` 的动态区间，随后按该文件最近 12 次实际内容变化的最大间隔调整。长间隔会立即拉长，缩短时每次只向目标移动一部分，最终受 `quiet_min_seconds` 和 `quiet_max_seconds` 限制。只有 size 或 mtime 变化的事件参与间隔学习，但其他内容事件仍会重置当前静默计时。每个活跃周期只触发一次主流程；普通成功、部分成功和失败都不会自行重试。新分卷到达或密码源变化会把受影响的输入重新置为活跃态。
 
-watch 的试解压输出位于监控根目录下的 `.sunpack_watch_probes`。该顶层目录在 watcher 运行和多次尝试之间保持存在；启动恢复以及每次尝试结束时只清理其内部工作内容，避免监控目录因为顶层临时目录反复创建、删除而刷新。完整成功始终提升到正式输出目录；部分成功按 `partial_output_policy` 清理或提升；失败始终清理试解压工作内容。
+watch 直接使用每个监控目录解析出的绝对输出根目录。完整输出、部分输出和失败输出均由主 Pipeline 的输出策略处理；Pipeline 完成 postprocess、资源释放后，watch 才发送完成通知。输出根目录位于监控目录下时，watch 保持非递归事件监听，目录事件只处理 source 离开状态，不把 destination 目录作为候选文件。
 
-每个监控目录在监控目录文件 `sunpack_watch_roots.txt` 中都可以写成 `输入 | 输出`（输出可跨盘），只写输入目录时使用 `watch.out_dir`。这两种写法只在读取监控目录文件时区分：进入 watch 服务后每个输入目录都只有一个绝对的输出根目录，`watch.out_dir` 不参与后续任何输出路径决策。试解压工作区始终在输入目录下，与该目录的输出根目录无关；提升到其他卷时走跨卷移动。
+每个监控目录在监控目录文件 `sunpack_watch_roots.txt` 中都可以写成 `输入 | 输出`（输出可跨盘），只写输入目录时使用 `watch.out_dir`。这两种写法只在读取监控目录文件时区分：进入 watch 服务后每个输入目录都只有一个绝对的输出根目录，`watch.out_dir` 不参与后续任何输出路径决策。解压直接写入该输出根目录，不再经过输入目录下的临时工作区，因此跨盘输出也不会产生额外的落地后复制或移动。
+
+不同监控目录的输出根不能互为严格的祖先与子目录；相同的输出根可以由多个监控目录共享，具体任务仍由 Pipeline 的输出预留处理。
 
 ## extraction
 

@@ -51,7 +51,6 @@ def _output_summary(root: Path, source_name: str) -> dict[str, Any]:
         path for path in root.rglob("*")
         if path.is_file()
         and path.name not in excluded
-        and ".sunpack_watch_probes" not in path.parts
     ]
     return {
         "file_count": len(files),
@@ -117,19 +116,6 @@ def _install_instrumentation(
             })
 
     watcher._complete_candidate = types.MethodType(complete, watcher)
-
-    original_promote = watcher._promote_probe_outputs
-
-    async def promote(self, *args: Any, **kwargs: Any):
-        started = _now()
-        try:
-            return await original_promote(*args, **kwargs)
-        finally:
-            timings["promotion_seconds"] = _now() - started
-            timings["promotion_finished"] = _now()
-
-    watcher._promote_probe_outputs = types.MethodType(promote, watcher)
-
 
 async def _pump(watcher: WatchScheduler) -> float:
     started = _now()
@@ -231,7 +217,7 @@ async def _arrive(
     await _pump(watcher)
 
 
-async def _wait_for_promotion(
+async def _wait_for_completion(
     watcher: WatchScheduler,
     timings: dict[str, Any],
     *,
@@ -241,12 +227,15 @@ async def _wait_for_promotion(
     deadline = _now() + timeout_seconds
     while _now() < deadline:
         tick_seconds.append(await _pump(watcher))
-        if "promotion_finished" in timings:
+        if any(
+            row.get("state_status") in {"done_or_cleared", "done"}
+            for row in timings.get("attempts", [])
+        ) and watcher.pending_count == 0 and not watcher._inflight_requests:
             return
         delay = watcher.next_delay_seconds()
         await asyncio.sleep(0.01 if delay is None else min(max(delay, 0.001), 0.05))
     raise TimeoutError(
-        f"watch did not promote output in {timeout_seconds:g}s; "
+        f"watch did not complete output in {timeout_seconds:g}s; "
         f"pending={watcher.pending_count}"
     )
 
@@ -285,6 +274,7 @@ async def _run_case(
     watcher: WatchScheduler | None = None
     timings: dict[str, Any] = {"case_started": _now()}
     attempts: list[dict[str, Any]] = []
+    timings["attempts"] = attempts
     tick_seconds: list[float] = []
     try:
         await engine.__aenter__()
@@ -304,10 +294,10 @@ async def _run_case(
             watcher, source, root, mode,
             chunk_size=chunk_size, delay_seconds=delay_seconds, timings=timings,
         )
-        await _wait_for_promotion(
+        await _wait_for_completion(
             watcher, timings, timeout_seconds=timeout_seconds, tick_seconds=tick_seconds,
         )
-        timings["case_finished"] = timings["promotion_finished"]
+        timings["case_finished"] = _now()
         pipeline_by_request = [_timing_totals(row) for row in profiler.request_timings]
         pipeline_total = sum(row.get("pipeline_run", 0.0) for row in pipeline_by_request)
         first_processing = next(
@@ -335,9 +325,8 @@ async def _run_case(
                     if first_processing is not None else None
                 ),
                 "pipeline_total_all_attempts": pipeline_total,
-                "promotion": timings.get("promotion_seconds", 0.0),
-                "arrival_start_to_promotion": timings["case_finished"] - timings["case_started"],
-                "post_arrival_to_promotion": timings["case_finished"] - timings["arrival_finished"],
+                "arrival_start_to_completion": timings["case_finished"] - timings["case_started"],
+                "post_arrival_to_completion": timings["case_finished"] - timings["arrival_finished"],
             },
             "attempt_count": len(profiler.request_timings),
             "completed_attempt_count": len(completed_attempts),
@@ -352,7 +341,7 @@ async def _run_case(
                 "max": max(tick_seconds) if tick_seconds else 0.0,
             },
             "output": _output_summary(root, source.name),
-            "success": True,
+            "success": bool(completed_attempts),
             "interruption_used": "interruption_finished" in timings,
             "partial_deleted": "partial_deleted" in timings,
         }
@@ -413,7 +402,7 @@ def main() -> int:
         for sample in samples:
             group = grouped.setdefault(sample["mode"], {})
             key = str(sample["quiet_seconds_argument"])
-            group.setdefault(key, []).append(sample["timings_seconds"]["arrival_start_to_promotion"])
+            group.setdefault(key, []).append(sample["timings_seconds"]["arrival_start_to_completion"])
         summary = {
             mode: {
                 quiet: {

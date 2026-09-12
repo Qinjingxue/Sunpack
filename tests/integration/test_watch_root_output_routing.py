@@ -77,7 +77,7 @@ def _extracted(output_root: Path, case: ArchiveCase) -> bool:
     return bool(list(output_root.rglob(case.marker_name)))
 
 
-def test_watch_routes_each_root_to_its_output_root_and_keeps_probes_with_the_input(tmp_path):
+def test_watch_routes_each_root_to_its_output_root_without_input_tree_outputs(tmp_path):
     case = ArchiveFixtureFactory().create(tmp_path / "fixtures", "watch_output_routing", "zip", payload_size=PAYLOAD_SIZE)
     first_root = tmp_path / "first"
     second_root = tmp_path / "second"
@@ -117,5 +117,4 @@ def test_watch_routes_each_root_to_its_output_root_and_keeps_probes_with_the_inp
     # Every watch root has exactly one output root.
     assert not list(first_out.rglob(case.marker_name))
     assert not list(first_root.rglob(case.marker_name))
-    # Promotion stays a rename: compression runs in the probe workspace below the input root.
-    assert (second_root / ".sunpack_watch_probes").is_dir()
+    assert not (second_root / ".sunpack_watch_probes").exists()

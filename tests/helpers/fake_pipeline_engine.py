@@ -53,7 +53,6 @@ class FakePipelineEngine:
         request_config=None,
         stdout=None,
         stderr=None,
-        output_committer=None,
         progress_callback=None,
         origin="foreground",
         detection_options=None,
@@ -83,8 +82,6 @@ class FakePipelineEngine:
             ),
             recent_passwords=tuple(self._recent_passwords),
         )
-        if output_committer is not None:
-            response = await output_committer.commit(config, response)
         return response
 
 

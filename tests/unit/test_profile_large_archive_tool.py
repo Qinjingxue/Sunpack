@@ -91,7 +91,6 @@ def test_pipeline_derived_timings_remove_nested_batch_and_planning_costs():
         "pipeline_run": [1.0],
         "pipeline_runtime_create": [0.2],
         "pipeline_runtime_execute": [0.77],
-        "pipeline_output_commit": [0.01],
         "batch_execute": [0.6],
         "pipeline_plan_task_isolated": [0.1],
         "planning_signature_prepass": [0.08],
@@ -106,4 +105,4 @@ def test_pipeline_derived_timings_remove_nested_batch_and_planning_costs():
     assert derived["pipeline_runtime_outside_batch"] == pytest.approx(0.17)
     assert derived["pipeline_plan_task_unattributed"] == pytest.approx(0.02)
     assert derived["pipeline_runtime_outside_batch_residual"] == pytest.approx(0.0)
-    assert derived["pipeline_run_outer_residual"] == pytest.approx(0.02)
+    assert derived["pipeline_run_outer_residual"] == pytest.approx(0.03)

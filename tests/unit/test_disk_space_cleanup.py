@@ -10,7 +10,7 @@ from sunpack.contracts.pipeline import PipelineArtifacts, PipelineResponse
 from sunpack.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary
 from sunpack.contracts.run_context import RunContext
 from sunpack.coordinator.cleanup_refs import CleanupRefTable
-from sunpack.coordinator.engine import DirectOutputCommitter, MappedOutputCommitter, _CleanupRefScope
+from sunpack.coordinator.engine import _CleanupRefScope, _commit_response
 from sunpack.postprocess.actions import PostProcessActions
 import sunpack.postprocess.internal.cleanup as cleanup
 from tests.helpers.fake_pipeline_engine import _InlineBroker
@@ -236,7 +236,7 @@ class _RecordingBroker:
         return result
 
 
-def test_committer_retries_only_the_failed_leftovers(tmp_path, monkeypatch):
+def test_postprocess_retries_only_the_failed_leftovers(tmp_path, monkeypatch):
     first_path, second_path = tmp_path / 'a.zip', tmp_path / 'b.zip'
     first_path.write_text('a')
     second_path.write_text('b')
@@ -250,7 +250,7 @@ def test_committer_retries_only_the_failed_leftovers(tmp_path, monkeypatch):
     response.summary.cleanup_results = [first, second]
     broker = _RecordingBroker()
 
-    asyncio.run(DirectOutputCommitter(broker).commit(config(), response))
+    asyncio.run(_commit_response(broker, config(), response))
 
     # First pass has no retry payload, then two passes carrying the two failures.
     assert [None if call is None else len(call) for call in broker.calls] == [None, 2, 2]
@@ -258,7 +258,7 @@ def test_committer_retries_only_the_failed_leftovers(tmp_path, monkeypatch):
     assert sorted(item.attempts for item in final) == [3, 3]
 
 
-def test_committer_skips_the_retry_pass_when_nothing_is_retryable(tmp_path, monkeypatch):
+def test_postprocess_skips_the_retry_pass_when_nothing_is_retryable(tmp_path, monkeypatch):
     path = tmp_path / 'a.zip'
     path.write_text('a')
 
@@ -272,12 +272,12 @@ def test_committer_skips_the_retry_pass_when_nothing_is_retryable(tmp_path, monk
     response.summary.cleanup_results = [failed_result(path, error_code=5)]
     broker = _RecordingBroker()
 
-    asyncio.run(DirectOutputCommitter(broker).commit(config(), response))
+    asyncio.run(_commit_response(broker, config(), response))
 
     assert broker.calls == [None]
 
 
-def test_committer_stops_retrying_once_the_attempt_budget_is_spent(tmp_path, monkeypatch):
+def test_postprocess_stops_retrying_once_the_attempt_budget_is_spent(tmp_path, monkeypatch):
     path = tmp_path / 'a.zip'
     path.write_text('a')
 
@@ -290,7 +290,7 @@ def test_committer_stops_retrying_once_the_attempt_budget_is_spent(tmp_path, mon
     response.summary.cleanup_results = [exhausted]
     broker = _RecordingBroker()
 
-    asyncio.run(DirectOutputCommitter(broker).commit(config(), response))
+    asyncio.run(_commit_response(broker, config(), response))
 
     assert broker.calls == [None]
 
@@ -308,7 +308,7 @@ def test_retry_pass_deletes_the_failed_leftover(tmp_path, monkeypatch):
     response = response_for()
     response.summary.cleanup_results = [failed_result(path)]
 
-    response = asyncio.run(DirectOutputCommitter(_InlineBroker()).commit(config(), response))
+    response = asyncio.run(_commit_response(_InlineBroker(), config(), response))
 
     assert calls == [str(path)]
     assert [item.attempts for item in response.summary.cleanup_results] == [2]
@@ -325,42 +325,23 @@ def test_failed_cleanup_is_bounded_and_repeat_commit_is_idempotent(tmp_path, mon
         raise locked()
 
     monkeypatch.setattr(cleanup, 'send2trash', fail)
-    committer = DirectOutputCommitter(_InlineBroker())
+    broker = _InlineBroker()
 
     def fresh_response():
         response = response_for()
         response.summary.cleanup_results = [failed_result(path)]
         return response
 
-    response = asyncio.run(committer.commit(config(), fresh_response()))
+    response = asyncio.run(_commit_response(broker, config(), fresh_response()))
     assert response.summary.cleanup_results[0].attempts == 3
     assert len(calls) == 2
 
-    asyncio.run(committer.commit(config(), response))
+    asyncio.run(_commit_response(broker, config(), response))
     assert len(calls) == 2
     assert response.summary.success_count == 1
 
 
-def test_mapped_commit_leaves_cleanup_alone(tmp_path, monkeypatch):
-    """Cleanup travels through the summary rather than artifacts: a mapped commit is a no-op."""
-
-    probe_dir = tmp_path / 'probe'
-    probe_dir.mkdir()
-    promoted = tmp_path / 'promoted.zip'
-    promoted.write_text('data')
-    calls = []
-
-    def deny(target):
-        calls.append(target)
-
-    monkeypatch.setattr(cleanup, 'send2trash', deny)
-    response = asyncio.run(
-        MappedOutputCommitter(_InlineBroker(), {str(probe_dir): str(tmp_path)}).commit(
-            config(), response_for()
-        )
-    )
-    assert calls == []
-    assert response.summary.cleanup_results == []
+def test_pipeline_artifacts_public_schema_is_stable():
     assert set(asdict(PipelineArtifacts()).keys()) == {'flatten_targets', 'shell_refresh_paths'}
 
 
@@ -381,7 +362,7 @@ def test_retry_only_touches_the_failed_leftovers(tmp_path, monkeypatch):
     response.summary.cleanup_results = [failed_result(second_path)]
     broker = _RecordingBroker()
 
-    asyncio.run(DirectOutputCommitter(broker).commit(config(), response))
+    asyncio.run(_commit_response(broker, config(), response))
 
     assert set(calls) == {str(second_path)}
     assert str(first_path) not in calls

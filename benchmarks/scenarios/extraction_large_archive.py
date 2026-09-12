@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from sunpack.coordinator.engine import DirectOutputCommitter, PipelineEngine
+from sunpack.coordinator.engine import PipelineEngine
 import sunpack.coordinator.engine as engine_module
 import sunpack.analysis.engine as analysis_engine_module
 import sunpack.analysis.fuzzy_pipeline.modules.binary_profile as binary_profile_module
@@ -121,7 +121,6 @@ class RequestRuntimeProfiler:
         self._install_instance_method(path_leases, "try_acquire", "pipeline_lease_acquire")
         self._install_instance_method(path_leases, "try_replace", "pipeline_lease_replace")
         self._install_instance_method(path_leases, "release", "pipeline_lease_release")
-        self._install_global_method(DirectOutputCommitter, "commit", "pipeline_output_commit")
         self._install_global_method(DirectoryScanner, "inventory_file_indices", "output_inventory_filter")
         self._install_global_method(DirectoryScanner, "snapshot_from_entries", "output_snapshot_filter")
         self._install_global_method(
@@ -545,8 +544,7 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         "pipeline_run_outer_residual": round(
             total("pipeline_run")
             - total("pipeline_runtime_create")
-            - total("pipeline_runtime_execute")
-            - total("pipeline_output_commit"),
+            - total("pipeline_runtime_execute"),
             6,
         ),
         "worker_wait_residual": round(total("sevenzip_worker") - worker_protocol_children, 6),
