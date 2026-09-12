@@ -60,8 +60,6 @@ class CleanupRefTable:
         #: Paths at least one owner asked to remove once it is the last one.
         self._wanted: dict[str, int] = {}
 
-    # -- registration ---------------------------------------------------
-
     def register(self, task) -> None:
         owner = id(task)
         if owner in self._owned:
@@ -88,8 +86,6 @@ class CleanupRefTable:
         for path in entry[2]:
             key = absolute_path_key(path)
             self._wanted[key] = self._wanted.get(key, 0) + 1
-
-    # -- release --------------------------------------------------------
 
     def release(self, task) -> ReleaseRequest:
         return self._pop(id(task))
@@ -119,9 +115,8 @@ class CleanupRefTable:
             self._paths.pop(key, None)
             wanted = self._wanted.pop(key, 0)
             zeroed.append(path)
-            # Whoever takes the count to zero performs the deletion.  An owner
-            # that is not eligible itself must not delete, but an eligible owner
-            # sharing the path already asked for it to go.
+            # Whoever takes the count to zero performs the deletion; an ineligible owner must not
+            # delete, but an eligible owner sharing the path already asked for it to go.
             if eligible or wanted > 0:
                 should_clean = True
         return ReleaseRequest(
@@ -129,8 +124,6 @@ class CleanupRefTable:
             paths=tuple(zeroed),
             should_clean=should_clean and bool(zeroed),
         )
-
-    # -- queries --------------------------------------------------------
 
     def count(self, path: str) -> int:
         return self._counts.get(absolute_path_key(path), 0)

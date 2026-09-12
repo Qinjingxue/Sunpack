@@ -61,8 +61,8 @@ namespace sunpack::sevenzip
         }
         if (resources.available_memory_bytes == 0 || tuning.memory_budget_denominator == 0)
         {
-            // Unknown memory is represented as an unlimited hard budget. CPU still
-            // bounds the executor, and every submitted job keeps its own reserve.
+            // Unknown memory is reported as an unlimited hard budget; CPU still bounds
+            // the executor and every submitted job keeps its own reserve.
             return 0;
         }
         const std::uint64_t quotient =

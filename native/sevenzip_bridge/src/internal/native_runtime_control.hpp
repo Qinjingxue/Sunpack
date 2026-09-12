@@ -172,20 +172,7 @@ namespace sunpack::sevenzip
         NativeRuntimeControl(const NativeRuntimeControl &) = delete;
         NativeRuntimeControl &operator=(const NativeRuntimeControl &) = delete;
 
-        // ------------------------------------------------------------------
-        // 外部不连续（卷可写集合变化 = 空间 episode 变化）之后的重建。
-        //
-        // ⚠️ **必须带 current_counters**：prime_counters() 是唯一更新
-        //    previous_counters_ 的地方，缺它则第一个新 baseline 的 counter_delta
-        //    会跨越 discontinuity（磁盘满期间 pending/完成数都变了），
-        //    学习窗口仍然被污染。
-        //
-        // 复用 SegmentInterrupted 而不是新增枚举值：语义完全吻合
-        //（"当前测量段因外部原因作废"），且 worker.cpp 的 controller_decision_name()
-        // 与 Python 侧消费端零协议改动。
-        //
-        // 不做的事：不回滚 active_limit、不 freeze 学习。
-        // ------------------------------------------------------------------
+        // Rebuilds the learning baseline after an external discontinuity; the current counters are required, since prime_counters() is the only updater of previous_counters_ and a missing update would carry the discontinuity into the first new baseline.
         bool rebase_after_external_discontinuity(
             const NativeThroughputCounters &current_counters) noexcept
         {
@@ -481,7 +468,6 @@ namespace sunpack::sevenzip
                                        ? counters.accepted_bytes - counters.written_bytes
                                        : 0;
         }
-
 
         void begin_saturated_segment() noexcept
         {

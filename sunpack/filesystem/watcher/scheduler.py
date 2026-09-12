@@ -170,10 +170,9 @@ class WatchScheduler:
         validate_ntfs_watch_roots(self.watch_roots)
         expanded_out_dir = os.path.expanduser(out_dir)
         self.out_dir = os.path.normpath(expanded_out_dir) if not os.path.isabs(expanded_out_dir) else os.path.abspath(expanded_out_dir)
-        # Every watch root has exactly one absolute output root, resolved here so
-        # no request path ever has to choose between a per-root and a global
-        # output directory.  ``out_dir`` only supplies the roots that the caller
-        # did not enumerate; it stays relative to its own input root.
+        # Every watch root has exactly one absolute output root, resolved here so no request path
+        # ever chooses between a per-root and a global output directory.  out_dir only supplies the
+        # roots the caller did not enumerate, and stays relative to its own input root.
         self.output_roots = {
             path_key(os.path.abspath(str(root))): os.path.abspath(os.path.expanduser(str(output)))
             for root, output in (output_roots or {}).items()
@@ -1558,8 +1557,7 @@ class WatchScheduler:
     def _output_root_for(self, path: str) -> str:
         matched_root = _longest_matching_root(os.path.abspath(path), self.watch_roots)
         if matched_root is None:
-            # Only reachable for a path outside every watch root, which
-            # ``enqueue`` already rejects.
+            # Only reachable for a path outside every watch root, which enqueue already rejects.
             return self._common_root_for(path)
         return self.output_roots[path_key(matched_root)]
 

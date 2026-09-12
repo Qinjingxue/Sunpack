@@ -8,21 +8,11 @@
 
 namespace sunpack::sevenzip
 {
-    // 卷空间不足类的**唯一判定入口**。任何"空间不足类"的瞬时卷错误都必须经由这里，
-    // 不允许在调用点重新列举错误码（否则多处判定逻辑必然漂移）。
+    // 卷空间不足类的唯一判定入口：任何"空间不足类"的瞬时卷错误都必须经由这里，不允许在
+    // 调用点重新列举错误码。
     //
-    // 数值已用 Windows SDK 10.0.26100.0 的 shared\winerror.h 逐条核对。
-    //
-    // ⚠️ 曾写错过的两个码（务必不要写回）：
-    //     ERROR_DISK_RESOURCES_EXHAUSTED  = 314  (0x13A)
-    //     ERROR_NONPAGED_SYSTEM_RESOURCES = 1451 (0x5AB)   ← 不是磁盘错误！
-    //   把 1451 放进本函数会让"系统 nonpaged 资源不足"被当成磁盘满，
-    //   于是任务进入永不结束的"等待释放磁盘空间"。
-    //
-    // 刻意不纳入的错误码：
-    //   ERROR_FILE_TOO_LARGE (223)              —— 单文件上限，释放空间不会改变结果
-    //   ERROR_NONPAGED_SYSTEM_RESOURCES (1451)  —— 系统资源，与磁盘无关
-    //   ERROR_CRC (23) / ERROR_WRITE_FAULT (29) —— 非空间类，属既有永久失败
+    // 不纳入：ERROR_NONPAGED_SYSTEM_RESOURCES (1451) 是系统资源不足、ERROR_FILE_TOO_LARGE
+    // (223) 是单文件上限，两者释放磁盘空间都不会改变结果。
     inline bool is_space_exhaustion_error(unsigned long win32_error) noexcept
     {
         switch (win32_error)
@@ -37,9 +27,8 @@ namespace sunpack::sevenzip
         }
     }
 
-    // std::filesystem 的 non-throwing overload 把 Win32 码放进 std::error_code，
-    // 其 category() 在 MSVC 上是 system_category()、value() 即 Win32 码。
-    // 没有这个重载，根输出目录 / 条目目录创建路径无法与本函数共用判定。
+    // std::filesystem 的 non-throwing overload 把 Win32 码放进 std::error_code，其
+    // category() 在 MSVC 上是 system_category()、value() 即 Win32 码。
     inline bool is_space_exhaustion_error(const std::error_code &error) noexcept
     {
         if (!error)

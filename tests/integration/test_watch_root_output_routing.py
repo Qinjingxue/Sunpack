@@ -114,11 +114,8 @@ def test_watch_routes_each_root_to_its_output_root_and_keeps_probes_with_the_inp
     extracted = list(second_out.rglob(case.marker_name))
     assert len(extracted) == 1
     assert extracted[0].read_text(encoding="utf-8") == case.marker_text
-    # Every watch root has exactly one output root; the other root's output stays
-    # empty and neither input root collects the promoted output.
+    # Every watch root has exactly one output root.
     assert not list(first_out.rglob(case.marker_name))
     assert not list(first_root.rglob(case.marker_name))
-    # Compression still happens in the probe workspace below the input root, so
-    # the promotion stays a rename; only the promoted output crosses to the
-    # configured output root.
+    # Promotion stays a rename: compression runs in the probe workspace below the input root.
     assert (second_root / ".sunpack_watch_probes").is_dir()

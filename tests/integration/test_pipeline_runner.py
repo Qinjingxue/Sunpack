@@ -160,8 +160,7 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
     assert summary.failed_tasks == []
     assert not archive.exists()
     assert (tmp_path / "payload" / "inside.txt").exists()
-    # Source archives are cleaned per task, so postprocess now runs before the
-    # extractor is closed at the end of the request.
+    # Source archives are cleaned per task, so postprocess runs before the extractor is closed.
     assert call_order[:2] == ["postprocess", "close"]
 
 

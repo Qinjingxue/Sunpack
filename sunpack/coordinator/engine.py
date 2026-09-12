@@ -367,7 +367,7 @@ def _replace_mapping_in_place(target: dict, source: dict) -> None:
 
 
 def _postprocess_actions_factory(config: dict, **kwargs):
-    """Indirection kept for callers that replace ``PostProcessActions``."""
+    """Indirection point for callers that replace PostProcessActions."""
 
     return PostProcessActions(config, **kwargs)
 
@@ -459,8 +459,7 @@ class _CleanupRefScope:
             self._table.mark_cleanup_eligible(task)
         request = self._table.release(task)
         if not (request.paths and request.should_clean):
-            # Nothing to remove: either the path is still referenced elsewhere,
-            # or every owner that released it failed.
+            # Nothing to remove: the path is still referenced elsewhere, or every owner that released it failed.
             return ReleaseOutcome(task_key=request.task_key, released=request.paths)
         return await self._apply(request, broker=broker, cancellation=cancellation)
 
@@ -512,8 +511,7 @@ class _CleanupRefScope:
                         )
                         for path in existing
                     )
-            # A path that was already gone is reported as missing rather than
-            # silently dropped, so the summary still accounts for every source.
+            # A path that was already gone is reported as missing, so the summary still accounts for every source.
             seen = {item.path for item in results}
             results.extend(
                 ArchiveCleanupResult(path, self._mode(), "missing")
@@ -542,12 +540,10 @@ class _CleanupRefScope:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # A closed or unavailable broker must not fail the extraction; the
-            # source archives simply stay in place.
+            # A closed or unavailable broker must not fail the extraction; the sources stay in place.
             return ReleaseOutcome(task_key=request.task_key, released=request.paths, error=str(exc))
         if outcome.deleted:
-            # The deleted sources are gone, so refresh their folders instead of
-            # naming paths that no longer exist.
+            # The deleted sources are gone, so refresh their folders.
             notify_shell_directories_updated(
                 tuple(dict.fromkeys(os.path.dirname(path) for path in outcome.deleted if os.path.dirname(path)))
             )
@@ -644,8 +640,7 @@ class _RequestRuntime:
             try:
                 callback(task, dict(event))
             except Exception:
-                # Progress observers are deliberately best-effort.  A broken
-                # UI/notification sink must never fail an extraction request.
+                # Progress observers are best-effort; a broken UI/notification sink must never fail an extraction.
                 pass
 
     def _resolve_missing_volume_once(self, task, _outcome):
@@ -869,9 +864,7 @@ def _finalize_response(
     previous = None
     cleanup_requests = ()
     if retry_results is not None:
-        # Only failed cleanups are retried here.  Source archives are already
-        # removed task by task (see _CleanupRefScope), so the first pass through
-        # this function has nothing left to delete.
+        # Only failed cleanups are retried here; successful sources are already removed task by task.
         flatten_targets_all = []
         shell_refresh_paths = []
         cleanup_requests = tuple((item.path,) for item in retry_results)

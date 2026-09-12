@@ -2068,9 +2068,7 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
     result = _await(watcher.run_once())
 
     assert result.succeeded == 1
-    # Compression still runs in the probe workspace below the input root, so the
-    # promotion stays a rename; only the promoted output moves to the configured
-    # output root.
+    # Promotion stays a rename: compression runs in the probe workspace below the input root.
     assert captured["probe_root"].is_relative_to(second_root / ".sunpack_watch_probes")
     assert list(second_out.rglob("payload.bin"))
     assert not (tmp_path / "legacy-out").exists()
@@ -2097,8 +2095,7 @@ def test_watch_root_always_has_a_resolved_output_root(tmp_path, monkeypatch):
         )
         return watcher.output_roots[scheduler_module.path_key(str(watch_root.resolve()))]
 
-    # A caller that does not enumerate outputs still gets one absolute output
-    # root per watch root; nothing is left for the request path to fall back on.
+    # A caller that does not enumerate outputs still gets one absolute output root per watch root.
     assert output_root_for(".") == str(watch_root.resolve())
     assert output_root_for(str(tmp_path / "global-out")) == str((tmp_path / "global-out").resolve())
     # An enumerated output root wins over the process-wide one.

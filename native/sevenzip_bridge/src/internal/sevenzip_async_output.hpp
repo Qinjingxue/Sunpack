@@ -38,22 +38,11 @@ namespace sunpack::sevenzip
                 : max_inflight_bytes(budget),
                   cancel_token(std::move(external_cancel)) {}
 
-            // ★ 唤醒判据：**只由 atomic 组成**，gate 的 wait() 可以无锁读。
-            //
-            //   非 atomic 的 cancelled / first_error 由本 writer 的 mutex_ 保护，
-            //   而 gate 的 wait() 不持那把锁 —— 直接读它们是 data race / UB，
-            //   让谓词去 lock writer mutex 又会引入 gate -> writer 锁依赖（禁止）。
-            //
-            //   所有会令本 job 终局的地方都必须同步置 true：
-            //       set_job_error_locked()   （首次永久错误）
-            //       cancel_job_locked()      （取消 / token / executor shutdown）
-            //       finish()                 （writer 整体停止 —— 走 cancel_job_locked）
-            //
-            //   ⚠️ 空间错误**不得**置位这一位（那正是暂停语义的前提）：
-            //      空间路径不调用 set_job_error_locked / cancel_job_locked。
+            // 必须是 atomic：gate 的 wait() 在 writer mutex_ 之外无锁读它。
+            // 每个令本 job 终局的地方都要同步置 true；空间错误不得置位（那是暂停语义的前提）。
             std::atomic<bool> terminal_requested{false};
 
-            // 详细错误结果：仍保留在 writer mutex_ 之下，仅供诊断与最终归类。
+            // 详细错误结果，由本 writer 的 mutex_ 保护。
             HRESULT first_error = S_OK;
             int first_win32_error = 0;
             std::size_t inflight_bytes = 0;
@@ -111,10 +100,7 @@ namespace sunpack::sevenzip
 
         const VolumeStatePtr &volume_state() const noexcept { return state_; }
 
-        // writer 是否已停止接收/推进工作。供 writer 之外的调用点（根输出目录创建、
-        // 条目目录创建、GetStream）构造 gate 的 terminal predicate 使用：
-        // 这两项合起来覆盖每一个 gate waiter —— executor stop() 置真 cancel_tokens_，
-        // registry shutdown → finish() 置真本 writer 的 stopping_。
+        // writer 是否已停止接收/推进工作，供 gate 的 terminal predicate 在非 atomic 上下文使用。
         bool stopping() const noexcept { return stopping_.load(std::memory_order_acquire); }
 
         const std::string &volume_key() const noexcept { return state_->key; }
@@ -168,9 +154,8 @@ namespace sunpack::sevenzip
             const UInt32 item_index = 0;
             const std::size_t trace_index = 0;
 
-            // 本文件所属卷的空间 gate（**可能为 nullptr**：功能关闭 / 无卷身份）。
-            // 在 make_file() 时从 VolumeState 快照进来，因此 writer 线程不需要
-            // 再取 state_（gate 的存活期长于 writer，但拿到的指针在整个尝试期间稳定）。
+            // 本文件所属卷的空间 gate，可能为 nullptr（功能关闭 / 无卷身份）。
+            // 在 make_file() 时快照进来，writer 线程不再取 state_。
             VolumeSpaceGate *volume_space_gate() const noexcept { return space_gate.get(); }
 
         private:
@@ -288,8 +273,7 @@ namespace sunpack::sevenzip
                 job ? job : make_job(),
                 std::move(path), std::move(item_path), item_index, trace_index);
             std::lock_guard<std::mutex> lock(mutex_);
-            // 快照本卷的空间 gate。功能关闭 / 空 key 的兜底 writer 时为 nullptr，
-            // 于是 retry_with_space_gate 走 gate == nullptr 的**完全现状**分支。
+            // 快照本卷的空间 gate；功能关闭 / 空 key 时为 nullptr。
             file->space_gate = state_ ? state_->space_gate : nullptr;
             active_files_.push_back(file);
             ++inflight_file_count_;
@@ -606,8 +590,8 @@ namespace sunpack::sevenzip
                 cancel_job_locked(job);
             }
             cleanup_cancelled_staging(job);
-            // 取消必须能穿透"因满盘而暂停"：置 terminal_requested 之后还要唤醒
-            // 卡在卷 gate 上的 writer 线程，否则它只能等 wait_tick 超时才察觉取消。
+            // 置 terminal_requested 之后必须唤醒卡在卷 gate 上的 writer 线程，
+            // 否则取消只能等 wait_tick 超时才被察觉。
             if (state_ && state_->space_gate)
             {
                 state_->space_gate->wake_waiters();
@@ -633,8 +617,7 @@ namespace sunpack::sevenzip
                     }
                 }
             }
-            // 卷空间 gate 的等待者也要被唤醒：取消必须能穿透"因满盘而暂停"。
-            // gate 的 wait() 会重新求值调用方传入的 terminal predicate（读 cancel_token）。
+            // 取消必须能穿透"因满盘而暂停"：卷 gate 的等待者也要被唤醒。
             if (state_ && state_->space_gate)
             {
                 state_->space_gate->wake_waiters();
@@ -767,11 +750,9 @@ namespace sunpack::sevenzip
             {
                 cleanup_cancelled_staging(job);
             }
-            // ★ 唤醒（**不是** abort）：本 writer 的 stopping_ 已经置位、且所有 active job
-            //   都已被 cancel_job_locked 置 terminal_requested，所以谓词此刻为真，
-            //   卡在卷 gate 上的 writer 线程会返回 Terminal 并正常退出。
-            //   gate 的状态**不因关停而改变**（没有 aborted_ 永久闩锁）——
-            //   否则 persistent volume 的 gate 会被 idle reap 永久毒死。
+
+            // 只唤醒，不 abort：所有 active job 已置 terminal_requested，谓词此刻为真；
+            // gate 状态不因关停而改变，否则 persistent 卷的 gate 会被 idle reap 永久毒死。
             if (state_ && state_->space_gate)
             {
                 state_->space_gate->wake_waiters();
@@ -1169,25 +1150,15 @@ namespace sunpack::sevenzip
 
                 if (item.kind == WorkItem::Kind::Data)
                 {
-                    // buffer 的所有权在本循环内。只有真正终结时才 release，
+                    // buffer 的所有权在本循环内，只有真正终结时才 release，
                     // 因此"暂停"期间 buffer 天然保持 inflight，producer 反压成立。
                     Buffer *buffer = item.buffer;
                     const FileStatePtr file = buffer ? buffer->file : nullptr;
 
-                    // transferred 跨重试保留：空间失败时已经落盘的前缀不能被重复记账，
-                    // 重试也从 output_offset + transferred 继续（同 handle、同 offset 语义）。
+                    // dequeue 的 buffer 剩余字节只由 writer_loop 结算：空间失败时已落盘的
+                    // 前缀不被重复记账，重试从 output_offset + transferred 继续（同 handle、同 offset）。
                     UInt32 transferred = 0;
 
-                    // ★★ writer_loop **不认识 ProbeLease**，也不调用任何 gate 状态接口。
-                    //     全部空间状态交互发生在骨架内部（唯一权威实现）。
-                    //
-                    // ★★ **热路径零开销**（架构师第十二轮 P1）：这里既不再预先构造终态
-                    //     谓词，也不再先问 gate"盘满了吗"。骨架先做真实 WriteFile：
-                    //       * 成功 / 永久失败 / 取消 → 直接返回，gate 一次都没被碰过；
-                    //       * 真实 ERROR_DISK_FULL → 才进入冷路径，此时才构造下面这个谓词。
-                    //     磁盘自己就是检测器：writer 停止尝试的唯一依据只能是真实失败。
-                    //     `file` 在本行之后仍然存活，因此按引用捕获它是安全的
-                    //     （工厂只在冷路径、只在本调用内部被求值一次）。
                     const AttemptResult result = retry_with_space_gate(
                         file ? file->volume_space_gate() : nullptr,
                         [this, &file] { return writer_terminal_predicate(file ? file->job : nullptr); },
@@ -1197,11 +1168,9 @@ namespace sunpack::sevenzip
                             return attempt_data_write(file, buffer, item.output_offset, transferred);
                         });
 
-                    // ★ 收尾记账：dequeue 的 buffer 剩余字节**只在这里**结算。
+                    // 收尾记账：dequeue 的 buffer 剩余字节只在这里结算。
                     if (result.kind == AttemptResult::Kind::SpaceFailure)
                     {
-                        // 只可能在这里出现：gate == nullptr（骨架内部已吃掉
-                        // gate != nullptr 的情形）。执行旧版永久失败语义。
                         record_legacy_space_failure(file, buffer, transferred, result.win32_error);
                         release_buffer(buffer);
                         continue;
@@ -1228,27 +1197,13 @@ namespace sunpack::sevenzip
             }
         }
 
-        // ---------------------------------------------------------------------
-        // 一次 CreateFileW 尝试（**在 writer mutex_ 内**，只做一次，绝不等待）。
-        //
-        // ★ 保留 writer mutex 对 CreateFile 尝试的**串行化**：同一个 FileState 的
-        //   多个 Data WorkItem 会被多个 per-volume writer 线程并发处理
-        //   （active_data_writes / peak_active_data_writes 就是证据）。去掉锁后两个
-        //   线程可能同时 CreateFileW(CREATE_NEW)：T1 成功、T2 得到 ERROR_FILE_EXISTS
-        //   → T2 把整个 job 标成永久失败。
-        //
-        // ★ 真正禁止的是「持 writer mutex **等磁盘恢复**」，而不是「持 writer mutex
-        //   **调一次 CreateFileW**」。等待由调用方在**锁外**做（retry_with_space_gate）。
-        //
-        // ★ open_attempted 的语义修正：从"尝试过一次就永不再试"改为
-        //   "**已建立 handle 或已永久失败**"。空间错误**不置位** → 重试可达。
-        //
-        // ★ 空间错误**不需要任何残留清理**：T-WIN-1b 实测证明可以在同一个 handle 上
-        //   续写；而且 CreateFileW(CREATE_NEW) 在 0 字节可用时依然成功（NTFS 不预分配），
-        //   空间错误实际发生在随后的 WriteFile。因此整个 FileState 生命周期内
-        //   CreateFileW 只调用一次，**没有** OPEN_EXISTING 分支、没有 ownership 字段、
-        //   没有 remove_space_failure_residue()。
-        // ---------------------------------------------------------------------
+        // 一次 CreateFileW 尝试：在 writer mutex_ 内且只做一次，绝不等待。
+        // 同一 FileState 的多个 Data WorkItem 会被多个 writer 线程并发处理，去锁后
+        // 两个线程可能同时 CreateFileW(CREATE_NEW)，后者得到 ERROR_FILE_EXISTS 而把 job 标成永久失败；
+        // 等磁盘恢复由调用方在锁外做（retry_with_space_gate）。
+        // open_attempted 的语义是"已建立 handle 或已永久失败"，空间错误不置位。
+        // 空间错误无需清理残留：0 字节可用时 CreateFileW(CREATE_NEW) 仍成功，
+        // 错误实际发生在随后的 WriteFile，因此整个 FileState 生命周期内只调用一次 CreateFileW。
         AttemptResult try_open_file_locked(const FileStatePtr &file) noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
@@ -1262,7 +1217,7 @@ namespace sunpack::sevenzip
             }
             if (file->open_attempted)
             {
-                // 旧语义：已尝试过且未成功 → 不再尝试。
+                // 已尝试过且未成功，不再尝试。
                 return {AttemptResult::Kind::PermanentFailure, ERROR_OPEN_FAILED};
             }
 
@@ -1271,8 +1226,7 @@ namespace sunpack::sevenzip
             {
                 creation_flags |= FILE_FLAG_WRITE_THROUGH;
             }
-            // 缝隙 B：这一行是"同 handle 续写"的回归防线所在。
-            // （整个 FileState 生命周期内 CreateFileW 只应被调用一次。）
+            // 整个 FileState 生命周期内 CreateFileW 只应被调用一次。
             if (open_probe_)
             {
                 open_probe_(file->path);
@@ -1292,11 +1246,10 @@ namespace sunpack::sevenzip
                 {
                     if (!file->space_gate)
                     {
-                        // 开关关闭：逐语义对齐旧 open_file()（它在**任何**错误上都先置
-                        // open_attempted = true 再标记失败，即"不再尝试"）。
+                        // gate 关闭时任何错误都置 open_attempted = true，即不再尝试。
                         file->open_attempted = true;
                     }
-                    // ★ 不置 open_attempted → 重试可达；不置 file/job 失败 → job 不终局。
+                    // 不置 open_attempted 与 file/job 失败，重试可达且 job 不终局。
                     return {AttemptResult::Kind::SpaceFailure,
                             static_cast<unsigned long>(error)};
                 }
@@ -1313,20 +1266,14 @@ namespace sunpack::sevenzip
             return {AttemptResult::Kind::Succeeded, 0};
         }
 
-        // 打开文件（**锁外等待**版本）：一次真实尝试 = 一次 try_open_file_locked。
-        // gate == nullptr 时只尝试一次并**原样外泄** SpaceFailure，由这里执行 Open
-        // 路径的旧语义（§4.5.0.1：mark_file_failure + set_job_error +
-        // **置 open_attempted = true**；与 Data 路径的 record_legacy_space_failure
-        // 不同，后者需要 buffer / transferred 语义）。
+        // 打开文件（锁外等待）：一次真实尝试 = 一次 try_open_file_locked。
+        // gate == nullptr 时只尝试一次并原样外泄 SpaceFailure，由这里按 Open 路径收尾：
+        // mark_file_failure + set_job_error + 置 open_attempted = true。
         AttemptResult open_file_with_space_gate(const FileStatePtr &file,
                                                 const TerminalPredicate &terminal) noexcept
         {
-            // ★ 终态前置检查（**调用方语义**，不是骨架的一部分）。
-            //   骨架现在是"先尝试、后求值谓词"；而 Open 路径的语义是
-            //   **取消 / draining 时绝不产生任何真实 I/O**（否则会凭空创建一个空文件）。
-            //   Data 路径不需要它：attempt_data_write() 自己就是终态权威
-            //   （入口先查 current_error(job)，未通过则一个字节都不写、也不 CreateFileW）。
-            //   ⚠️ 只在 gate 存在时检查：开关关闭必须逐语义回到改动前（§7.3）。
+            // 终态前置检查属于调用方语义：取消 / draining 时绝不产生任何真实 I/O，
+            // 否则会凭空创建一个空文件；只在 gate 存在时检查。
             if (file && file->space_gate && terminal && terminal())
             {
                 return {AttemptResult::Kind::Terminal, 0};
@@ -1364,8 +1311,7 @@ namespace sunpack::sevenzip
                    AttemptResult::Kind::Succeeded;
         }
 
-        // gate 的终态谓词：**只读 atomic**（stopping_ / terminal_requested / cancel_token）。
-        // job 按值捕获 shared_ptr —— 谓词可能活过局部作用域。
+        // gate 的终态谓词：只读 atomic，并在冷路径上才被求值。
         TerminalPredicate writer_terminal_predicate(const JobStatePtr &job) const
         {
             return [this, job]
@@ -1408,36 +1354,18 @@ namespace sunpack::sevenzip
             }
         }
 
-        // ---------------------------------------------------------------------
-        // 一次真实的 WriteFile 尝试。**只返回结果，绝不碰 gate、绝不记 discarded。**
-        //
-        // `transferred` 是 in/out：进入时是本次 buffer 已经落盘的前缀（跨重试保留），
-        // 退出时是新的前缀。这样：
-        //   * add_written_bytes 只对**新**写入的字节调用 → 重试不会重复记账；
-        //   * 空间失败时重试从 output_offset + transferred 继续
-        //     （同 handle、同偏移语义，§17.4 的实测结论）。
-        //
-        // 不变量校验：
-        //   * 成功路径上 add_written_bytes 只对应真实 GetOverlappedResult 成功；
-        //   * 所有失败路径都配对 end_data_write，active_data_writes 归零；
-        //   * 空间失败路径**不**调用 record_failure（否则记账与 job 终态都被破坏）。
-        // ---------------------------------------------------------------------
+        // 一次真实的 WriteFile 尝试：只返回结果，绝不碰 gate、绝不记 discarded。
+        // `transferred` 是 in/out（本次 buffer 已落盘的前缀，跨重试保留），add_written_bytes
+        // 只对新写入的字节调用，因此重试不会重复记账。
+        // 不变量：所有失败路径都配对 end_data_write（active_data_writes 归零）；
+        // 空间失败路径不调用 record_failure，否则记账与 job 终态都被破坏。
         AttemptResult attempt_data_write(const FileStatePtr &file,
                                          Buffer *buffer,
                                          UInt64 output_offset,
                                          UInt32 &transferred) noexcept
         {
-            // ⚠️ **绝不在这里重置 transferred。**
-            //
-            //   它是 in/out 参数，由 writer_loop 初始化一次，并跨 retry 保留：
-            //   同一个 buffer 内"部分成功 → 空间失败 → 恢复后重试"必须从
-            //   output_offset + transferred 继续。若在这里清零：
-            //     * 已确认落盘的前缀会被从原始 offset **再写一遍** → add_written_bytes
-            //       二次记账 → written > accepted、pending 被重复 release；
-            //     * 于是 accepted == written + discarded + pending 这条核心不变量被破坏。
-            //   （早期版本的 NTFS 满盘实验恰好总是 bytesTransferred = 0 的整请求失败，
-            //     所以真实 VHD 测试全绿也照样漏掉了它。R-22 用"单次最多写 256 KiB +
-            //     第二次注入 ERROR_DISK_FULL"把这个场景钉死。）
+            // 绝不在这里重置 transferred：清零会把已落盘前缀从原始 offset 再写一遍，
+            // add_written_bytes 二次记账 -> accepted = written + discarded + pending 被破坏。
             if (!file || !buffer || !buffer->data)
             {
                 return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
@@ -1447,18 +1375,14 @@ namespace sunpack::sevenzip
             const HRESULT global_error = current_error(job);
             if (global_error != S_OK)
             {
-                // 已经是终态（取消 / 其他文件已永久失败 / writer 停止）。
-                // 仍然要标记本文件失败，否则 process_close 的
-                // completed_successfully = !file->failed 会把失败文件计入 completed_files。
+                // 已是终态：仍需标记本文件失败，否则 process_close 会把它计入 completed_files；
                 // 剩余字节的 discarded 由 writer_loop 收尾（此处传 0）。
                 record_failure(file, global_error, current_win32_error(job), 0);
                 return {AttemptResult::Kind::Terminal, 0};
             }
 
-            // ★ 打开文件：**只做一次锁内尝试**，绝不在这里嵌套 retry_with_space_gate。
-            //   外层（Data 骨架）可能正持有 probe 许可，内层 wait() 会在 Probing 上
-            //   永久阻塞。SpaceFailure 直接上抛，由外层骨架重试整次尝试 ——
-            //   open_attempted 未被置位，因此重试会真正再调一次 CreateFileW。
+            // 打开文件只做一次锁内尝试，绝不在这里嵌套 retry_with_space_gate：
+            // 外层可能正持有 probe 许可，内层 wait() 会在 Probing 上永久阻塞。
             const AttemptResult open_result = try_open_file_locked(file);
             if (open_result.kind != AttemptResult::Kind::Succeeded)
             {
@@ -1496,7 +1420,7 @@ namespace sunpack::sevenzip
                 const UInt32 chunk_limit = max_write_chunk_.load(std::memory_order_relaxed);
                 if (chunk_limit != 0 && effective_size > chunk_limit)
                 {
-                    effective_size = chunk_limit; // 缝隙 D3：强制制造 partial write
+                    effective_size = chunk_limit; // 测试注入：强制制造 partial write
                 }
                 const BOOL started = WriteFile(
                     file->handle,
@@ -1532,9 +1456,8 @@ namespace sunpack::sevenzip
             return {AttemptResult::Kind::Succeeded, 0};
         }
 
-        // 写入失败的分类：**空间类错误必须走 SpaceFailure**，由骨架决定重试，
-        // 绝不能在这里调用 record_failure（那会立刻把 pending 记成 discarded、
-        // 把 file/job 标记成永久失败）。
+        // 空间类错误必须走 SpaceFailure 交给骨架重试，绝不能在这里调用 record_failure
+        // （那会把 pending 记成 discarded 并把 file/job 标记成永久失败）。
         AttemptResult classify_data_failure(const FileStatePtr &file, DWORD error) noexcept
         {
             if (failure_classifier_(static_cast<unsigned long>(error)))
@@ -1566,8 +1489,7 @@ namespace sunpack::sevenzip
             }
             if (should_open)
             {
-                // close 阶段的 open 走同一骨架（在 writer 线程上，不持有 probe 许可，
-                // 因此不会与外层重试冲突）。
+                // close 阶段的 open 走同一骨架：在 writer 线程上、不持有 probe 许可。
                 open_file(file, writer_terminal_predicate(job));
             }
 
@@ -1581,22 +1503,11 @@ namespace sunpack::sevenzip
             {
                 if (write_through())
                 {
-                    // ★ flush 必须走**同一个骨架**：早期设计只有
-                    //   "FlushFileBuffers → space error → gate->wait() → retry"，
-                    //   缺 report_space_failure / ProbeLease / probe 结算。若 gate 原本
-                    //   是 Ready，直接 wait() 会立刻返回（Ready 快路径）→ flush 变成
-                    //   **忙重试**，而且 probe 许可从未被结算。
-                    //
-                    //   仅 write-through 路径（B4）：非 write-through 时 CloseHandle
-                    //   本身就会 flush，不需要额外的可暂停等待。
-                    //
-                    // ⚠️ handle 在骨架外面被摘下来了（file->handle = INVALID_HANDLE_VALUE），
-                    //   因此 attempt 里的 FlushFileBuffers 用的是**同一个** handle，
-                    //   暂停期间它不会被关闭（同 handle 续写语义的一部分）。
-                    // ★ 终态谓词同样是**惰性**的：flush 正常成功时它根本不会被构造。
-                    //   flush 在 drain 期间必须真实执行（数据落盘语义），因此这里
-                    //   **不**做终态前置检查 —— 取消时的 "file->failed" 已经在
-                    //   process_close 入口由 record_failure 置位。
+                    // flush 必须走同一个骨架（report_space_failure / ProbeLease / probe 结算），
+                    // 否则 gate 原本 Ready 时 wait() 立刻返回，flush 变成忙重试；
+                    // 仅 write-through 路径需要它（非 write-through 时 CloseHandle 本身就会 flush）。
+                    // handle 在骨架外被摘下，暂停期间不关闭，flush 复用同一个 handle。
+                    // flush 在 drain 期间必须真实执行，因此这里不做终态前置检查。
                     const AttemptResult flush_result = retry_with_space_gate(
                         file->space_gate.get(),
                         [this, &job] { return writer_terminal_predicate(job); },
@@ -1631,9 +1542,8 @@ namespace sunpack::sevenzip
 
                     if (flush_result.kind != AttemptResult::Kind::Succeeded)
                     {
-                        // ★ 逐路径的旧语义（§4.5.0.1）：Flush 用 record_failure 且
-                        //   discarded_bytes = 0（剩余字节由 writer_loop 收尾负责）。
-                        //   注意 SpaceFailure 只可能在 gate == nullptr 时外泄。
+                        // Flush 路径用 record_failure(file, hr, err, 0)：剩余字节由 writer_loop 收尾，
+                        // SpaceFailure 只可能在 gate == nullptr 时外泄。
                         record_failure(
                             file,
                             HRESULT_FROM_WIN32(static_cast<DWORD>(flush_result.win32_error)),
@@ -1734,22 +1644,8 @@ namespace sunpack::sevenzip
             producer_cv_.notify_all();
         }
 
-        // ---------------------------------------------------------------------
-        // gate == nullptr（功能关闭 / 无卷身份）时的**旧语义收尾**。
-        //
-        // 必须逐条对应改动前的 record_failure(file, hr, err, buffer->size - transferred)：
-        //      1) account_discarded(pending -> discarded)
-        //      2) file 终局失败
-        //      3) job 终局失败（set_job_error_locked 同时置 terminal_requested）
-        //      4) 唤醒 producer
-        //
-        // ⚠️ 只适用于 **Data** 路径（它需要 buffer / transferred 语义）。
-        //    Open / Flush / Directory 三条路径的旧语义各不相同，各自处理：
-        //      Open      → mark_file_failure_locked + set_job_error_locked + open_attempted = true
-        //      Flush     → record_failure(file, hr, err, 0)
-        //      Directory → 返回 false + 原始 std::error_code
-        //    把四条路径合并成一个 helper 会破坏"开关关闭 = 逐语义回到现状"这条合并门禁。
-        // ---------------------------------------------------------------------
+        // gate == nullptr（功能关闭 / 无卷身份）时的永久失败收尾，只适用于 Data 路径：
+        // account_discarded(remaining) + file 终局失败 + job 终局失败 + 唤醒 producer。
         void record_legacy_space_failure(const FileStatePtr &file,
                                          const Buffer *buffer,
                                          UInt32 transferred,
@@ -1778,13 +1674,9 @@ namespace sunpack::sevenzip
             int win32_error,
             std::size_t discarded_bytes = 0) noexcept
         {
-            // ``discarded_bytes`` is the caller's remainder: bytes that reached the
-            // writer thread but will never be written.
-            //
-            // ★ 空间/终态路径一律传 0：**已 dequeue 的 buffer 剩余字节只由
-            //   writer_loop 的收尾负责**（§4.5.3.1 的唯一不变量）。这样 discarded
-            //   对"已 dequeue 的 buffer"只有一个写入点，不变量可以一眼证明。
-            //   仍在 staging 的 buffer 由 discard_staging_locked() 负责，两者不重叠。
+            // discarded_bytes 是调用方持有的剩余字节；空间/终态路径一律传 0 ——
+            // 已 dequeue 的 buffer 剩余字节只由 writer_loop 收尾负责，
+            // staging 中的 buffer 由 discard_staging_locked() 负责，两者不重叠。
             account_discarded(discarded_bytes);
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -1825,24 +1717,14 @@ namespace sunpack::sevenzip
         const std::size_t queue_limit_;
         std::size_t inflight_file_count_ = 0;
         std::size_t queued_jobs_ = 0;
-        // ★ 必须是 atomic：gate 的 terminal predicate 会**无锁**读它
-        //   （AsyncFileWriter::stopping_ 与 NativeJobExecutor::stopping_ 是两个
-        //    互不可见的量，不能互相顶替）。
+        // 必须是 atomic：gate 的 terminal predicate 会无锁读它。
         std::atomic<bool> stopping_{false};
 
     public:
-        // ------------------------------------------------------------------
-        // 测试缝隙（生产代码永不设置）
-        //
-        // 缝隙 A：failure_classifier 可注入。C++ 单测无法制造真实的 ERROR_DISK_FULL，
-        //         于是用"真实的其它错误码"驱动同一条代码路径：把 classifier 配成
-        //         "ERROR_ACCESS_DENIED(5) 视为空间类"，对只读目录写 → CreateFileW /
-        //         WriteFile 返回 5 → writer 进入等待 → 测试改回权限 → 重试成功。
-        //         断言 gate 记录的必须是**原始码**（5，而不是 112）。
-        // 缝隙 B：CreateFileW 调用探针。"同 handle 续写"的回归防线：正常恢复期间
-        //         每个 FileState 的 CreateFileW 调用次数必须恒为 1。
-        // 缝隙 D：WriteFile 故障注入（见下）。
-        // ------------------------------------------------------------------
+        // 测试专用，生产代码永不设置：
+        //   A：failure_classifier 可注入，用真实的其他错误码驱动空间失败路径。
+        //   B：CreateFileW 调用探针，每个 FileState 的 CreateFileW 调用次数必须恒为 1。
+        //   D：WriteFile / FlushFileBuffers 故障注入。
         using FailureClassifier = std::function<bool(unsigned long win32_error)>;
         using OpenProbe = std::function<void(const std::wstring &path)>;
 
@@ -1853,14 +1735,8 @@ namespace sunpack::sevenzip
 
         void set_open_probe_for_test(OpenProbe probe) noexcept { open_probe_ = std::move(probe); }
 
-        // 缝隙 D：WriteFile 故障注入（在调用真实 WriteFile **之前**生效）。
-        //   skip 次调用被放过，随后 faults 次连续以 win32_error 失败，之后恢复。
-        //
-        //   ⚠️ 为什么需要它（而不是只用缝隙 C 的"只读目录"路线）：
-        //      只读目录只会让 CreateFileW 返回 ERROR_ACCESS_DENIED，**打不到
-        //      WriteFile**；而本阶段要覆盖的恰恰是 WriteFile 重试、probe 结算、
-        //      暂停期间的记账不变量。C++ 单测无法制造真实的 ERROR_DISK_FULL，
-        //      因此把"真实系统调用"这一步替换掉，其余代码路径全部是真实的。
+        // WriteFile 故障注入，在调用真实 WriteFile 之前生效。
+        // 放过 skip 次调用后，连续 faults 次以 win32_error 失败，之后恢复。
         void set_write_fault_for_test(unsigned long win32_error, int faults, int skip = 0) noexcept
         {
             write_fault_error_.store(win32_error, std::memory_order_relaxed);
@@ -1868,8 +1744,7 @@ namespace sunpack::sevenzip
             write_fault_skip_.store(skip, std::memory_order_relaxed);
         }
 
-        // 缝隙 D2：FlushFileBuffers 故障注入（同样在真实调用之前生效）。
-        //   write-through 路径的 flush 走的是同一个重试骨架，必须能被独立驱动。
+        // FlushFileBuffers 故障注入，同样在真实调用之前生效。
         void set_flush_fault_for_test(unsigned long win32_error, int faults, int skip = 0) noexcept
         {
             flush_fault_error_.store(win32_error, std::memory_order_relaxed);
@@ -1877,12 +1752,8 @@ namespace sunpack::sevenzip
             flush_fault_skip_.store(skip, std::memory_order_relaxed);
         }
 
-        // 缝隙 D3：限制单次 WriteFile 的最大字节数（0 = 不限制）。
-        //
-        // ⚠️ 为什么必须有它：NTFS 满盘时 `GetOverlappedResult` 报的是
-        //    `bytesTransferred = 0` 的**整请求失败**，因此真实的 VHD 测试永远走不到
-        //    "同一 buffer 内部分成功 → 再空间失败 → 恢复后必须从中间续写"这条路径。
-        //    没有这个缝隙，`transferred` 跨 retry 的语义就无法被测试钉死。
+        // 限制单次 WriteFile 的最大字节数（0 = 不限制），强制制造 partial write，
+        // 否则 transferred 跨 retry 的语义无法被测试。
         void set_max_write_chunk_for_test(UInt32 bytes) noexcept
         {
             max_write_chunk_.store(bytes, std::memory_order_relaxed);
@@ -1902,7 +1773,7 @@ namespace sunpack::sevenzip
         std::atomic<unsigned long> flush_fault_error_{0};
         std::atomic<int> flush_fault_remaining_{0};
         std::atomic<int> flush_fault_skip_{0};
-        std::atomic<UInt32> max_write_chunk_{0}; // 缝隙 D3：0 = 不限制
+        std::atomic<UInt32> max_write_chunk_{0};
 
         // 返回 true 表示本次系统调用被注入的故障取代。
         template <typename Remaining, typename Skip>

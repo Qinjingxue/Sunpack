@@ -108,9 +108,8 @@ bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {
     }
     const auto snapshot = writer.snapshot_file(file);
     const auto metrics = writer.snapshot_metrics();
-    // A permanently failed buffer must be accounted as discarded, not left as a
-    // permanent accepted/written gap.  This is what makes the pending gauge a
-    // usable idle signal.
+    // A permanently failed buffer is accounted as discarded, not left as a
+    // permanent accepted/written gap.
     if (metrics.pending_bytes != 0 || metrics.discarded_bytes != 1 ||
         metrics.accepted_bytes != metrics.written_bytes + metrics.discarded_bytes) {
         std::cerr << "failed-open accounting: accepted=" << metrics.accepted_bytes
@@ -127,9 +126,8 @@ bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {
 
 bool cancelled_job_returns_pending_to_zero(const std::filesystem::path& directory) {
     AsyncFileWriter writer;
-    // A job budget below the payload gives the writer real pipeline depth; the
-    // exact accepted count depends on how fast the disk drains, so the assertions
-    // below only pin the accounting identity, not a particular byte count.
+    // A job budget below the payload gives real pipeline depth, so the exact accepted
+    // count varies and the assertions pin only the accounting identity.
     constexpr std::size_t job_budget = 4U << 20;
     constexpr std::size_t payload_size = 16U << 20;
     std::vector<unsigned char> payload(payload_size, 0x5A);
@@ -221,9 +219,8 @@ bool meters_separate_volumes_but_share_the_global_sink(const std::filesystem::pa
     const std::vector<unsigned char> first(first_size, 0x11);
     const std::vector<unsigned char> second(second_size, 0x22);
 
-    // The meters are process-wide, so both writers contribute to one sink while
-    // keeping independent volume meters.  This is the split the controller and the
-    // diagnostics rely on (§3.1).
+    // Both writers contribute to one process-wide sink while keeping independent
+    // volume meters.
     auto meters = std::make_shared<WriterMeters>();
     AsyncFileWriter volume_a(meters, make_volume_state("a:", true), AsyncWriterConfig{});
     AsyncFileWriter volume_b(meters, make_volume_state("b:", true), AsyncWriterConfig{});
@@ -336,8 +333,7 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
         std::cerr << "fresh registry is not empty\n";
         return false;
     }
-    // An empty key is still routed: it must never be rejected into a shared
-    // fallback, but it also must not be treated as a volume identity by accident.
+    // An empty key is still routed, and must not be treated as a volume identity.
     {
         auto lease = registry.acquire("");
         if (!lease.valid() || !lease.writer().volume_key().empty() ||
@@ -381,8 +377,8 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
         return false;
     }
 
-    // One job's data must reach the process-wide meters and vanish with the lease
-    // only from the per-volume view.
+    // One job's data must reach the process-wide meters and, from the per-volume
+    // view, vanish with the lease.
     {
         auto lease = registry.acquire("volume-a");
         const std::vector<unsigned char> payload(1U << 20, 0x77);
@@ -418,8 +414,7 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
         std::cerr << "registry still holds entries after shutdown\n";
         return false;
     }
-    // Counters survive reclamation because they belong to the meters, not the
-    // facility.  This is what keeps the controller's deltas monotonic.
+    // Counters survive reclamation because they belong to the meters, not the facility.
     const auto after = snapshot_counters(meters->counters);
     if (after.written_bytes != (1U << 20)) {
         std::cerr << "process-wide meters did not survive shutdown: "
@@ -444,7 +439,7 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
     config.threads_per_volume = 2;
     config.buffer_count = 8;
     // The idle timeout only applies to persistent physical volumes; a synthetic
-    // per-job key is reclaimable as soon as its lease is gone (§5.4).
+    // per-job key is reclaimable as soon as its lease is gone.
     config.idle_timeout = std::chrono::milliseconds(50);
     VolumeWriterRegistry registry(meters, config);
 

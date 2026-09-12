@@ -17,20 +17,12 @@
 
 namespace sunpack::sevenzip
 {
-    // ---------------------------------------------------------------------
-    // 纯**采样器**。**不维护自己的 membership**：
-    //     每次 tick 直接从 registry 拉 blocked volumes，不缓存、不 re-arm。
-    //     全部水位规则在 gate.poll() 里（monitor 不做任何比较）。
+    // 纯采样器：每次 tick 直接从 registry 拉 blocked volumes，不维护自己的 membership，
+    // 不缓存、不 re-arm；全部水位规则在 gate.poll() 里（monitor 不做任何比较）。
     //
-    // 这样直接删除：entries_ membership / rearmed_ 标志 / dormant 摘除与重加 /
-    // set_wake_monitor()。现实中同一进程接触的物理输出卷数量通常就是个位数，
-    // 异常路径扫描几个 VolumeState 的成本可以忽略。
-    //
-    // ⚠️ tick() **必须**由 controller_loop 在 executor mutex_ **之外**调用：
-    //    它会取 registry mutex_ 并可能执行一次很慢的 GetDiskFreeSpaceExW
-    //    （离线 UNC / 坏盘可能卡几秒）。放在 mutex_ 内会把 submit() / cancel() /
-    //    admission 全部堵住。
-    // ---------------------------------------------------------------------
+    // tick() 必须由 controller_loop 在 executor mutex_ 之外调用：它会取 registry mutex_ 并
+    // 可能执行一次很慢的 GetDiskFreeSpaceExW（离线 UNC / 坏盘可能卡几秒），放在 mutex_ 内
+    // 会把 submit() / cancel() / admission 全部堵住。
     class VolumeSpaceMonitor final
     {
     public:
@@ -65,19 +57,12 @@ namespace sunpack::sevenzip
 
         void tick(std::chrono::steady_clock::time_point now) noexcept
         {
-            // ── 常态零开销 / 恢复后停开销 ───────────────────────────────────
+            // sampling_ 只在"有卷进入 Blocked"（ChangeSink → note_blocked()）时置位，并且
+            // 只在一次拉取返回空（确认当下没有任何 blocked 卷）时清零：从未满盘时每个 tick
+            // 只有一条 relaxed 原子读，恢复之后最多再拉一次就彻底停下。
             //
-            // `sampling_` 只在"有卷进入 Blocked"（ChangeSink → note_blocked()）时置位，
-            // 并且**只在一次拉取返回空**（即确认当下没有任何 blocked 卷）时清零。
-            // 因此：
-            //   * 从未满盘：每个 tick 只有一条 relaxed 原子读，**不取任何锁**；
-            //   * 满盘期间：正常采样（限速 + 逐卷 poll）；
-            //   * **恢复之后：最多再拉一次，然后就彻底停下** —— 开销随异常状态消失而消失。
-            //
-            // ⚠️ 清零条件**绝不能**挂在任何 gate transition 上（例如"收到 resumed 就清零"）：
-            //    多卷场景下 A 恢复时这次拉取返回的是 [B]（非空），于是采样继续、B 仍被 poll；
-            //    而"清零"只会在真的没有任何 blocked 卷时发生。这正是 §4.4.1 那个
-            //    "A 恢复 → 清零 → 仍 Blocked 的 B 永不再被 poll"回归的反面。
+            // 清零条件只能挂在"拉取返回空"上：多卷下 A 恢复时这次拉取返回的是 [B]（非空），
+            // 采样必须继续、B 仍要被 poll。
             if (!sampling_.load(std::memory_order_relaxed))
             {
                 return;
@@ -99,13 +84,8 @@ namespace sunpack::sevenzip
 
             if (states.empty())
             {
-                // ★ 异常状态已**完全**消除 → 停止采样，并把这一个 episode 的全部历史丢掉：
-                //   * `sampling_` 归零 → 之后的每个 tick 连 registry 都不拉（常态零开销）；
-                //   * `last_status_at_` 清空 → 诊断节流表不随"曾经满盘过的卷"无界增长。
-                //     registry 的 `job:<id>` 这类非 persistent 条目 idle 后会被 erase，
-                //     而 monitor 的这张表原先会永久留下它的 key（架构师第十二轮 P2）；
-                //   * `next_poll_at_` 归零 → 下一个 episode 的第一拍立即可采样（不被上一个
-                //     episode 的限速窗口推迟）。
+                // 异常状态已完全消除：停止采样，并丢掉这个 episode 的全部历史 —— 诊断节流
+                // 表不随 registry 已摘除的卷 key 无界增长，下一 episode 的第一拍也立即可采样。
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
                     last_status_at_.clear();
@@ -137,33 +117,24 @@ namespace sunpack::sevenzip
                 std::uint64_t total_bytes = 0;
                 if (!gate.query_free_bytes(&free_bytes, &total_bytes))
                 {
-                    // B5：卷暂时不可查询（拔盘 / UNC 断开 / 权限变化 / query_root 未解析）。
-                    // 不转 Ready、不转 Probing、不新增状态；只记录诊断并下轮重试。
+                    // 卷暂时不可查询（拔盘 / UNC 断开 / 权限变化 / query_root 未解析）：
+                    // 不转 Ready / Probing，只记录诊断并下轮重试。
                     const unsigned long error = gate.last_query_error();
                     gate.note_query_failure(error);
                     maybe_emit_status(state, 0, false, error, now);
                     continue;
                 }
 
-                // ★ monitor 不做任何水位比较：一个采样值，交给 gate 自己裁决。
                 gate.poll(free_bytes);
                 maybe_emit_status(state, free_bytes, true, 0, now);
             }
         }
 
-        // ★ 采样是否处于"活跃"状态。**不是**"是否曾经满盘过"的 sticky 历史，
-        //   而是"当下是否可能有 blocked 卷"的精确近似：
-        //     note_blocked() 置位；一次拉取返回空则清零。
-        //   用途只有两个：
-        //     1) tick() 的常态/恢复后早退（未置位 → 连 registry 都不拉）；
-        //     2) 缩短 parked controller 的睡眠上限。
-        //
-        //   ⚠️ 绝不能用"收到 resumed / 最后一个 waiter 离开就清零"那种写法：
-        //      多卷场景下 A 恢复时仍 Blocked 的 B 必须继续被 poll。
+        // 采样是否处于"活跃"状态：note_blocked() 置位，一次拉取返回空则清零。
+        // 用途只有 tick() 的常态早退与缩短 parked controller 的睡眠上限。
         bool sampling() const noexcept { return sampling_.load(std::memory_order_relaxed); }
 
-        // 由 ChangeSink 在收到 `space_blocked` transition 时调用 —— 这是"开始采样"的
-        // 唯一驱动点（"真的发生满盘"与"开始采样"是同一件事）。
+        // 由 ChangeSink 在收到 space_blocked transition 时调用（开始采样的唯一驱动点）。
         void note_blocked() noexcept { sampling_.store(true, std::memory_order_relaxed); }
 
     private:
@@ -195,7 +166,7 @@ namespace sunpack::sevenzip
             }
             catch (...)
             {
-                // 低频诊断输出失败绝不影响采样循环。
+                // 诊断输出失败绝不影响采样循环。
             }
         }
 

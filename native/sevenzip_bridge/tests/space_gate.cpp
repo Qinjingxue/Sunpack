@@ -1,13 +1,4 @@
-// L1：VolumeSpaceGate 纯逻辑单测（无文件系统、无满盘）。
-//
-// 用例编号与《SunPack Worker 磁盘空间不足自动暂停与恢复实现文档.md》§10.2 的
-// G-1..G-26 一一对应。文档里没有的额外断言会标注 [附加]。
-//
-// 两个关键脚手架：
-//   * unresolved_failed_path() —— 让 "Ready -> Blocked 时的新鲜查询" 确定性地失败，
-//     从而可以精确控制 watermark_valid_ 与"第一次成功观测即 baseline"的语义。
-//   * current_volume_key()    —— 本机临时目录所在物理卷的真实身份键，
-//     覆盖 "resolved 卷" 一侧（尾反斜杠、构造时解析查询根）。
+// VolumeSpaceGate 纯逻辑单测（无文件系统、无满盘）。
 
 #include "internal/sevenzip_space_gate.hpp"
 #include "internal/sevenzip_space_monitor.hpp"
@@ -55,19 +46,12 @@ bool check(bool condition, const std::string &what) {
 constexpr std::uint64_t kMib = 1024ULL * 1024ULL;
 constexpr std::uint64_t kGiB = 1024ULL * kMib;
 
-// "没有可用的失败路径" —— 让 Ready→Blocked 时的**新鲜查询确定性地失败**，
-// 从而可以精确控制 watermark_valid_ 与"第一次成功观测即 baseline"的语义。
-//
-// ⚠️ 不要用"随机不存在的 volume GUID 路径"来做这件事：本机实测
-//    GetVolumePathNameW(`\\?\Volume{<随机 GUID>}\x.bin`) 有时会**成功**并返回
-//    当前卷的挂载根（于是新鲜查询成功、watermark 变成真实可用空间），
-//    测试会变成不确定的。空路径是唯一确定的做法。
+// 空的 failed_path 是让新鲜查询确定性失败的唯一做法：随机 GUID 路径有时会解析成功。
 std::wstring unresolved_failed_path() {
     return std::wstring{};
 }
 
-// 本机临时目录所在物理卷的身份键，形状与 Rust 的 volume_key_from() 一致
-// （\\?\volume{...} 小写、无尾反斜杠）。
+// 临时目录所在物理卷的身份键，形状与 Rust 的 volume_key_from() 一致（小写、无尾反斜杠）。
 std::wstring current_volume_key() {
     wchar_t temp[MAX_PATH + 1]{};
     if (GetTempPathW(MAX_PATH, temp) == 0) {
@@ -162,9 +146,7 @@ bool wait_until(const std::function<bool()> &predicate, std::chrono::millisecond
     return predicate();
 }
 
-// 测试自身写错时应当**失败**而不是挂死：主线程里所有"期待 Probe"的 wait 都带上
-// 一个到期即放弃的谓词。注意 wait() 先查 terminal、再查 Ready，所以只用在期待
-// Probe 的场合（期待 Ready 的场合必须传空谓词，见 G-15）。
+// 测试自身写错时应当失败而不是挂死：只用在期待 Probe 的场合（期待 Ready 时必须传空谓词）。
 VolumeSpaceGate::WaitResult wait_bounded(const std::shared_ptr<VolumeSpaceGate> &gate,
                                          std::chrono::milliseconds timeout = 3s) {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
@@ -183,7 +165,7 @@ struct LeaseSlot {
 
 void wait_and_keep(const std::shared_ptr<VolumeSpaceGate> &gate,
                    const std::shared_ptr<LeaseSlot> &slot) {
-    // 线程内阻塞等待：**不加超时谓词**，否则会假造出 Terminal。
+    // 线程内阻塞等待：不加超时谓词，否则会假造出 Terminal。
     const TerminalPredicate no_termination{};
     auto result = gate->wait(no_termination);
     switch (result.kind) {
@@ -205,9 +187,7 @@ void wait_and_keep(const std::shared_ptr<VolumeSpaceGate> &gate,
     }
 }
 
-// ---------------------------------------------------------------------------
-// G-1 初始状态
-// ---------------------------------------------------------------------------
+// 初始状态
 void g1_initial_state() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g1", log);
@@ -224,9 +204,7 @@ void g1_initial_state() {
     check(log->total() == 0, "G-1: 初始不应产生任何事件");
 }
 
-// ---------------------------------------------------------------------------
-// G-2 首次失败
-// ---------------------------------------------------------------------------
+// 首次失败
 void g2_first_failure_opens_episode() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g2", log);
@@ -247,9 +225,7 @@ void g2_first_failure_opens_episode() {
           "G-2: space_blocked 必须携带卷身份键");
 }
 
-// ---------------------------------------------------------------------------
-// G-3 水位不足不 probe
-// ---------------------------------------------------------------------------
+// 水位不足不 probe
 void g3_no_probe_below_watermark() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g3", log);
@@ -269,9 +245,7 @@ void g3_no_probe_below_watermark() {
     check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0, "G-3: 不得发出 space_resumed");
 }
 
-// ---------------------------------------------------------------------------
-// G-4 水位改善 → probe（两个等待线程只有一个拿到有效 lease）
-// ---------------------------------------------------------------------------
+// 水位改善 → probe（两个等待线程只有一个拿到有效 lease）
 void g4_improved_watermark_issues_single_probe() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g4", log);
@@ -309,9 +283,7 @@ void g4_improved_watermark_issues_single_probe() {
     check(slot->ready.load(), "G-4: 另一个线程必须被唤醒并返回 Ready");
 }
 
-// ---------------------------------------------------------------------------
-// G-5 probe 成功
-// ---------------------------------------------------------------------------
+// probe 成功
 void g5_probe_success_resumes_everyone() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g5", log);
@@ -352,9 +324,7 @@ void g5_probe_success_resumes_everyone() {
           "G-5: space_resumed 必须扇出给 affected job");
 }
 
-// ---------------------------------------------------------------------------
-// G-6 probe 失败 → 水位单调（仅本 episode）
-// ---------------------------------------------------------------------------
+// probe 失败 → 水位单调（仅本 episode）
 void g6_failed_probe_keeps_watermark_monotonic() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g6", log);
@@ -407,9 +377,7 @@ void g6_failed_probe_keeps_watermark_monotonic() {
           "G-6[附加]: 同一 episode 内 probe 失败不得产生新事件");
 }
 
-// ---------------------------------------------------------------------------
-// G-7 前次 lease 未结算时不得再发放许可
-// ---------------------------------------------------------------------------
+// 前次 lease 未结算时不得再发放许可
 void g7_no_second_permit_while_probing() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g7", log);
@@ -427,9 +395,7 @@ void g7_no_second_permit_while_probing() {
     check(gate->poll(100 * kGiB), "G-7: 许可结算后必须能再次发放");
 }
 
-// ---------------------------------------------------------------------------
-// G-8 幂等上报
-// ---------------------------------------------------------------------------
+// 幂等上报
 void g8_concurrent_failures_open_one_episode() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g8", log);
@@ -450,9 +416,7 @@ void g8_concurrent_failures_open_one_episode() {
           "G-8: sink 只能被调用一次");
 }
 
-// ---------------------------------------------------------------------------
-// G-9 wake_waiters()
-// ---------------------------------------------------------------------------
+// wake_waiters()
 void g9_wake_waiters_does_not_change_state() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g9", log, 20ms);
@@ -486,9 +450,7 @@ void g9_wake_waiters_does_not_change_state() {
     check(gate->waiter_count() == 0, "G-9: waiters_ 必须清空");
 }
 
-// ---------------------------------------------------------------------------
-// G-10 terminal predicate
-// ---------------------------------------------------------------------------
+// terminal predicate
 void g10_terminal_predicate_is_honoured() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g10", log, 20ms);
@@ -512,9 +474,7 @@ void g10_terminal_predicate_is_honoured() {
     check(elapsed < 1s, "G-10: 必须在 poll_interval 量级内返回");
 }
 
-// ---------------------------------------------------------------------------
-// G-11 lease 析构兜底
-// ---------------------------------------------------------------------------
+// lease 析构兜底
 void g11_lease_destructor_is_inconclusive() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g11", log, 20ms);
@@ -533,9 +493,7 @@ void g11_lease_destructor_is_inconclusive() {
     check(gate->poll(200 * kMib), "G-11: 许可必须已释放，下一个 poll 能再发放");
 }
 
-// ---------------------------------------------------------------------------
-// G-12 waiter 全部离开 ≠ Ready
-// ---------------------------------------------------------------------------
+// waiter 全部离开 ≠ Ready
 void g12_all_waiters_leaving_is_not_ready() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g12", log, 20ms);
@@ -561,22 +519,19 @@ void g12_all_waiters_leaving_is_not_ready() {
     check(gate->episode_id() == 1, "G-12: episode_id 不得变化");
 }
 
-// ---------------------------------------------------------------------------
-// G-13 affected_jobs_ 与 waiters_ 分离
-// ---------------------------------------------------------------------------
+// affected_jobs_ 与 waiters_ 分离
 void g13_event_fanout_uses_affected_jobs() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g13", log);
 
-    // ① 注册 job 后**没有**任何 waiter 时报满 → 该 job 仍必须收到 space_blocked。
+    // ① 注册 job 后没有任何 waiter 时报满 → 该 job 仍必须收到 space_blocked。
     gate->register_job("A");
     check(gate->waiter_count() == 0, "G-13: 此时不应有任何 waiter");
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     check(log->count_for(VolumeSpaceTransition::Kind::Blocked, "A") == 1,
           "G-13: 没有 waiter 时 affected job 仍必须收到 space_blocked");
 
-    // ② job 抢到 probe 并成功 → 它**仍必须**收到 space_resumed
-    //    （它已经从 waiters_ 里被移除，所以遍历 waiters_ 会漏掉它）。
+    // ② job 抢到 probe 并成功 → 它仍必须收到 space_resumed（它已被移出 waiters_）。
     gate->poll(500 * kMib);
     {
         auto result = wait_bounded(gate);
@@ -587,9 +542,7 @@ void g13_event_fanout_uses_affected_jobs() {
           "G-13: probe owner 必须收到 space_resumed");
 }
 
-// ---------------------------------------------------------------------------
-// G-14 注册时补发
-// ---------------------------------------------------------------------------
+// 注册时补发
 void g14_registration_on_blocked_volume_replays() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g14", log);
@@ -611,9 +564,7 @@ void g14_registration_on_blocked_volume_replays() {
           "G-14: Probing 期间注册同样必须补发");
 }
 
-// ---------------------------------------------------------------------------
-// G-15 Ready/Terminal 可区分（R7 的数据正确性 bug）
-// ---------------------------------------------------------------------------
+// Ready/Terminal 可区分
 void g15_ready_and_terminal_are_distinguishable() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g15", log);
@@ -628,7 +579,7 @@ void g15_ready_and_terminal_are_distinguishable() {
     }
     check(gate->phase() == VolumeSpacePhase::Ready, "G-15: B 已把卷恢复");
 
-    // A 现在才进入 wait()：必须得到 Ready（可重试），**绝不能**被误判为取消。
+    // A 现在才进入 wait()：必须得到 Ready（可重试），绝不能被误判为取消。
     auto late = gate->wait(TerminalPredicate{});
     check(late.kind == VolumeSpaceGate::WaitResult::Kind::Ready,
           "G-15: 迟到的等待者必须拿到 Kind::Ready，不是 Terminal");
@@ -640,9 +591,7 @@ void g15_ready_and_terminal_are_distinguishable() {
           "G-15: 谓词为真时必须返回 Kind::Terminal");
 }
 
-// ---------------------------------------------------------------------------
-// G-16 report_inconclusive()
-// ---------------------------------------------------------------------------
+// report_inconclusive()
 void g16_inconclusive_probe_never_resumes() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g16", log);
@@ -661,9 +610,7 @@ void g16_inconclusive_probe_never_resumes() {
     check(gate->episode_id() == 1, "G-16: episode_id 不得变化");
 }
 
-// ---------------------------------------------------------------------------
-// G-17 episode 切换重置 watermark（R9）
-// ---------------------------------------------------------------------------
+// episode 切换重置 watermark
 void g17_episode_switch_resets_watermark() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g17", log);
@@ -679,7 +626,7 @@ void g17_episode_switch_resets_watermark() {
     }
     check(gate->phase() == VolumeSpacePhase::Ready, "G-17: ep1 已恢复");
 
-    // ep2：失败时 free = 10 MiB → 水位必须是 10 MiB，**不是** 500 MiB。
+    // ep2：失败时 free = 10 MiB → 水位必须是 10 MiB，不是 500 MiB。
     gate->report_space_failure(ERROR_DISK_FULL, unresolvable);
     check(gate->episode_id() == 2, "G-17: 必须是第 2 个 episode");
     check(!gate->watermark_valid() && gate->failed_free_watermark() == 0,
@@ -690,12 +637,9 @@ void g17_episode_switch_resets_watermark() {
           "G-17: ep2 水位必须是 10 MiB（不是 500 MiB）");
 }
 
-// ---------------------------------------------------------------------------
-// G-18 水位一律由 monitor 采样建立；查询失败只影响诊断（架构师第三轮"彻底解法"）
-// ---------------------------------------------------------------------------
+// 水位一律由 monitor 采样建立；查询失败只影响诊断
 void g18_watermark_comes_only_from_the_monitor() {
-    // ① episode 打开后水位**一律无效** —— 与 query_root 是否可解析**无关**，
-    //    因为 writer / probe owner 侧已经完全不做磁盘查询了。
+    // ① episode 打开后水位一律无效，与 query_root 是否可解析无关。
     auto resolved_log = std::make_shared<SinkLog>();
     auto resolved = make_gate(to_ascii(current_volume_key()), resolved_log);
     check(resolved->query_root_resolved(), "G-18: resolved 卷构造时就解析好了查询根");
@@ -719,9 +663,7 @@ void g18_watermark_comes_only_from_the_monitor() {
     }
     check(!resolved->poll(free_now), "G-18: 相同观测值不得再次发放许可");
 
-    // ③ 未解析的 synthetic 卷：monitor 查询失败是 **B5 诊断**，
-    //    状态必须**保持 Blocked**、不发 probe —— 这正是"卷不可访问"与
-    //    "空间不足"必须能被区分开的场景。
+    // ③ 未解析的 synthetic 卷：查询失败只记诊断，状态必须保持 Blocked。
     auto synthetic = make_gate("job:g18", std::make_shared<SinkLog>());
     std::uint64_t ignored = 0;
     check(!synthetic->query_root_resolved(), "G-18: synthetic 卷构造时不得有查询根");
@@ -753,9 +695,7 @@ void g18_watermark_comes_only_from_the_monitor() {
     check(synthetic->failed_free_watermark() == free_after, "G-18: 该采样成为 baseline");
 }
 
-// ---------------------------------------------------------------------------
-// G-19 query_root 解析
-// ---------------------------------------------------------------------------
+// query_root 解析
 void g19_query_root_resolution() {
     // ① resolved 卷：查询路径就是 key + "\"。
     const std::wstring volume_key = current_volume_key();
@@ -773,8 +713,7 @@ void g19_query_root_resolution() {
     check(total_bytes > 0, "G-19: 卷总容量必须为正");
     check(free_bytes <= total_bytes, "G-19: 可用空间不得超过总容量");
 
-    // ★ 尾反斜杠不是装饰：去掉它 GetDiskFreeSpaceExW 会以 ERROR_INVALID_FUNCTION 失败。
-    //   （§16.1 的真机实测结论，这里作为回归防线固定下来。）
+    // 尾反斜杠不是装饰：去掉它 GetDiskFreeSpaceExW 会以 ERROR_INVALID_FUNCTION 失败。
     std::uint64_t ignored_free = 0;
     std::uint64_t ignored_total = 0;
     check(!sunpack::sevenzip::query_volume_free_bytes(volume_key, &ignored_free, &ignored_total),
@@ -805,9 +744,7 @@ void g19_query_root_resolution() {
     check(synthetic_query_ok, "G-19: 解析后必须可查询");
 }
 
-// ---------------------------------------------------------------------------
-// G-20 只有真实成功才 Ready
-// ---------------------------------------------------------------------------
+// 只有真实成功才 Ready
 void g20_only_real_success_resumes() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate(to_ascii(current_volume_key()), log, 20ms);
@@ -859,9 +796,7 @@ void g20_only_real_success_resumes() {
           "G-20: 全程不得发出 space_resumed");
 }
 
-// ---------------------------------------------------------------------------
-// G-21 lease token 所有权
-// ---------------------------------------------------------------------------
+// lease token 所有权
 void g21_lease_token_ownership() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g21", log);
@@ -928,9 +863,7 @@ void g21_lease_token_ownership() {
           "G-21: 旁路 late failure 不得把 owner 的成功打成 Blocked");
 }
 
-// ---------------------------------------------------------------------------
-// G-22 affected_jobs_ set 语义
-// ---------------------------------------------------------------------------
+// affected_jobs_ set 语义
 void g22_affected_jobs_set_semantics() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g22", log);
@@ -963,9 +896,7 @@ void g22_affected_jobs_set_semantics() {
     check(gate->affected_job_ids().empty(), "G-22: 全部注销后集合为空");
 }
 
-// ---------------------------------------------------------------------------
-// G-23 poll() 独占水位逻辑
-// ---------------------------------------------------------------------------
+// poll() 独占水位逻辑
 void g23_poll_owns_all_watermark_logic() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g23", log);
@@ -980,9 +911,7 @@ void g23_poll_owns_all_watermark_logic() {
     check(!gate->poll(100 * kMib), "G-23: 第二次 poll 不得再发放许可");
 }
 
-// ---------------------------------------------------------------------------
-// G-24 sticky hint
-// ---------------------------------------------------------------------------
+// sticky hint
 void g24_sticky_hint_survives_recovery() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g24", log);
@@ -992,7 +921,7 @@ void g24_sticky_hint_survives_recovery() {
     state->space_gate = gate;
     states->push_back(state);
 
-    // 统计 provider 被调用的次数 —— 用它可以**测出**"未满盘过时 monitor 零开销"。
+    // 统计 provider 被调用的次数，用于测出"未满盘时 monitor 零开销"。
     auto provider_calls = std::make_shared<std::atomic<int>>(0);
     VolumeSpaceMonitor monitor(
         VolumeSpaceMonitor::Options{5ms, 5ms},
@@ -1003,8 +932,7 @@ void g24_sticky_hint_survives_recovery() {
         VolumeSpaceMonitor::StatusSink{});
     check(!monitor.sampling(), "G-24: 初始必须不采样");
 
-    // ★ 常态零开销：没有任何卷 blocked 时，tick() 连 registry 都不拉。
-    //   （provider 就是 registry.blocked_volumes()，它要取 registry mutex_。）
+    // 常态零开销：没有任何卷 blocked 时，tick() 连 registry 都不拉。
     const auto now = std::chrono::steady_clock::now();
     monitor.tick(now);
     monitor.tick(now + 10ms);
@@ -1018,7 +946,7 @@ void g24_sticky_hint_survives_recovery() {
     check(monitor.sampling(), "G-24: note_blocked 之后必须开始采样");
     check(provider_calls->load() >= 1, "G-24: 开始采样后必须真的拉 blocked 卷");
 
-    // A 卷恢复 → 这次拉取返回空 → **采样必须停下**（开销随异常状态消失而消失）。
+    // A 卷恢复 → 这次拉取返回空 → 采样必须停下。
     gate->poll(500 * kMib);
     {
         auto result = wait_bounded(gate);
@@ -1036,9 +964,7 @@ void g24_sticky_hint_survives_recovery() {
           "G-24: ★ 恢复之后 tick() 必须回到零开销（不再调用 provider）");
 }
 
-// ---------------------------------------------------------------------------
-// G-25 双卷恢复独立性（sticky 替换精确 bool 的直接回归测试）
-// ---------------------------------------------------------------------------
+// 双卷恢复独立性
 void g25_two_volumes_recover_independently() {
     auto log_a = std::make_shared<SinkLog>();
     auto log_b = std::make_shared<SinkLog>();
@@ -1091,10 +1017,8 @@ void g25_two_volumes_recover_independently() {
     status_seen_b->store(false);
     status_calls->store(0);
 
-    // 旧设计在这里会因为 has_blocked_ 被清零而直接 return → B 永远不再被 poll。
-    //
-    // ★ 新设计的清零条件是"**拉取结果为空**"，不是任何 transition：A 恢复时这次拉取
-    //   返回的是 [B]（非空），所以采样继续、B 仍被 poll；只有 B 也恢复后才停下。
+    // 采样清零的条件是"拉取结果为空"，不是任何 transition：A 恢复时这次拉取返回 [B]，
+    // 所以采样继续、B 仍被 poll；只有 B 也恢复后才停下。
     check(monitor.sampling(), "G-25: A 恢复后采样必须继续（B 仍然 blocked）");
     monitor.tick(now + 100ms);
     check(status_seen_b->load(), "G-25: A 恢复之后 B 必须仍被采样");
@@ -1115,9 +1039,7 @@ void g25_two_volumes_recover_independently() {
     check(gate_b->phase() == VolumeSpacePhase::Ready, "G-25: B 后释放空间时必须仍能恢复");
 }
 
-// ---------------------------------------------------------------------------
-// G-26 registration 覆盖根目录创建
-// ---------------------------------------------------------------------------
+// registration 覆盖根目录创建
 void g26_registration_covers_root_directory_creation() {
     // 「不创建任何 JobState」：直接按 volume lease scope 的方式注册。
     auto log = std::make_shared<SinkLog>();
@@ -1158,7 +1080,7 @@ void g26_registration_covers_root_directory_creation() {
     check(registry->blocked_volumes().empty(),
           "G-26: 未 blocked 的卷不出现在 blocked_volumes()");
 
-    // [附加] 功能关闭时 gate 必须保持 nullptr（§7.3 的短路前提）。
+    // [附加] 功能关闭时 gate 必须保持 nullptr。
     AsyncWriterConfig off_config;
     off_config.space_gate_enabled = false;
     off_config.threads_per_volume = 1;
@@ -1175,13 +1097,10 @@ void g26_registration_covers_root_directory_creation() {
     registry->shutdown();
 }
 
-// ---------------------------------------------------------------------------
-// G-27 discontinuity 只由**真实**卷状态变化推进（架构师第三轮）
-// ---------------------------------------------------------------------------
+// discontinuity 只由真实卷状态变化推进
 void g27_only_real_transitions_advance_the_discontinuity_generation() {
-    // `space_epoch_` 在 executor 侧由 on_space_transition() 驱动；本用例把 gate 侧的
-    // 判据钉死：transition.discontinuity 只在真正的 Ready→Blocked / Probing→Ready
-    // 上为 true，补发通知必须为 false。
+    // transition.discontinuity 只在真正的 Ready→Blocked / Probing→Ready 上为 true，
+    // 补发通知必须为 false。
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g27", log);
 
@@ -1196,7 +1115,7 @@ void g27_only_real_transitions_advance_the_discontinuity_generation() {
               "G-27: 真实的 Ready→Blocked 必须 discontinuity = true");
     }
 
-    // ★ 补发通知：新 job 注册到**已经 blocked** 的卷上。
+    // 补发通知：新 job 注册到已经 blocked 的卷上。
     log->clear();
     check(gate->register_job("J2"), "G-27: 注册必须成功");
     {
@@ -1244,14 +1163,12 @@ void g27_only_real_transitions_advance_the_discontinuity_generation() {
     check(log->total() == 0, "G-27: Ready 卷注册新 job 不得补发任何事件");
 }
 
-// ---------------------------------------------------------------------------
-// G-28 一个 job 在同一 episode 内恰好收到一条 blocked（去重）
-// ---------------------------------------------------------------------------
+// 一个 job 在同一 episode 内恰好收到一条 blocked（去重）
 void g28_one_blocked_per_job_per_episode() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g28", log);
 
-    // 初始 blocked 事件**已经发出**之后再注册：只应补发一条，且总数恰好为 1。
+    // 初始 blocked 事件已经发出之后再注册：只应补发一条，且总数恰好为 1。
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     gate->register_job("J");
     check(log->count_for(VolumeSpaceTransition::Kind::Blocked, "J") == 1,
@@ -1273,21 +1190,9 @@ void g28_one_blocked_per_job_per_episode() {
           "G-28: 新 episode 才会再给 J 发一条 blocked");
 }
 
-// ---------------------------------------------------------------------------
-// G-29 恢复之后才加入的 job 绝不能收到"迟到 blocked"（架构师第八轮 P1 的契约）
-// ---------------------------------------------------------------------------
+// 恢复之后才加入的 job 绝不能收到"迟到 blocked"
 void g29_no_late_blocked_after_recovery() {
-    // 架构师指出的旧窗口（锁外新鲜查询期间 monitor 完成 probe → Ready）：
-    //
-    //   J1: Ready→Blocked(ep1) → report_space_failure 正在锁外查询
-    //   monitor: poll→Probing→probe 成功→Ready，给**当时**的 affected jobs 发 resumed(ep1)
-    //   J2 此时注册：gate 已 Ready → 不补发
-    //   原始查询返回：episode_id 仍是 ep1 → 旧代码仍生成 blocked(ep1)
-    //                 → 快照此时包含 J2 → **J2 收到它从没配对过 resumed 的 blocked**
-    //                 → Python space_waiting 永久为真、看门狗被永久关闭
-    //
-    // 现在"进入 Blocked 与生成 blocked 在同一把锁内"，这个窗口从构造上不存在；
-    // 下面的断言把契约钉死，防止将来有人把事件生成挪回锁外。
+    // 进入 Blocked 与生成 blocked 在同一把锁内，因此 blocked 的 job 快照只能含当时已注册的 job。
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g29", log);
 
@@ -1296,8 +1201,7 @@ void g29_no_late_blocked_after_recovery() {
     check(log->count_for(VolumeSpaceTransition::Kind::Blocked, "J1") == 1,
           "G-29: J1 必须收到 blocked");
 
-    // blocked 事件的 job 快照只能包含**当时已注册**的 job：
-    // 进入 Blocked 与生成事件之间没有任何可被插队的窗口。
+    // blocked 事件的 job 快照只能包含当时已注册的 job。
     const auto blocked_events = log->snapshot();
     check(!blocked_events.empty() && blocked_events.front().job_ids.size() == 1,
           "G-29: blocked 的 job 快照只能含当时已注册的 job");
@@ -1312,7 +1216,7 @@ void g29_no_late_blocked_after_recovery() {
     check(log->count_for(VolumeSpaceTransition::Kind::Resumed, "J1") == 1,
           "G-29: J1 必须收到 resumed");
 
-    // ★ 恢复之后加入的 J2：绝不能收到本 episode 的 blocked。
+    // 恢复之后加入的 J2：绝不能收到本 episode 的 blocked。
     check(gate->register_job("J2"), "G-29: J2 注册必须成功");
     check(log->count_for(VolumeSpaceTransition::Kind::Blocked, "J2") == 0,
           "G-29: 恢复后加入的 job 绝不能收到迟到 blocked（它没收到过 resumed）");
@@ -1324,24 +1228,17 @@ void g29_no_late_blocked_after_recovery() {
     check(immediate.kind == VolumeSpaceGate::WaitResult::Kind::Ready,
           "G-29: 恢复后加入的 job 必须立刻拿到 Ready");
 
-    // 只有**下一个** episode 才会轮到 J2。
+    // 只有下一个 episode 才会轮到 J2。
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     check(gate->episode_id() == 2, "G-29: 必须是第 2 个 episode");
     check(log->count_for(VolumeSpaceTransition::Kind::Blocked, "J2") == 1,
           "G-29: 新 episode 才会给 J2 发 blocked");
 }
 
-// ---------------------------------------------------------------------------
-// G-30 授权 probe 的采样必须立即成为新水位（架构师第九轮 P1）
-// ---------------------------------------------------------------------------
+// 授权 probe 的采样必须立即成为新水位
 void g30_probe_authorising_sample_becomes_the_watermark() {
-    // 不变量：**任何成功授权 probe 的 monitor 采样，就是当时的 failure watermark。**
-    //
-    // 漏掉它会造成"每个 poll 周期重复 probe"：
-    //   baseline 100 → 用户释放到 200 → 200 > 100 → probe → 真实 I/O 仍失败 → Blocked
-    //   → 水位仍是 100 → 下一秒 monitor 仍看到 200 > 100 → 又 probe → 又失败 → 死循环
-    // 即"空间只涨过一次、但涨得还不够完成 I/O"时，此后即使用户什么都不做，
-    // 也会按 poll_interval **永久做真实 I/O probe**。
+    // 不变量：任何成功授权 probe 的 monitor 采样，就是当时的 failure watermark；
+    // 否则水位不前进，同一个采样值会按 poll_interval 反复授权真实 I/O probe。
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g30", log);
 
@@ -1364,14 +1261,14 @@ void g30_probe_authorising_sample_becomes_the_watermark() {
     {
         auto result = wait_bounded(gate);
         check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-30: 拿到许可");
-        // probe 真实失败（monitor-only：settle 里不做任何查询、不改水位）
+        // probe 真实失败（settle 里不做任何查询、不改水位）
         result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     }
     check(gate->phase() == VolumeSpacePhase::Blocked, "G-30: probe 失败回 Blocked");
     check(gate->failed_free_watermark() == 200,
           "G-30: ★ probe 失败后水位必须仍是 200（不再回退到 100）");
 
-    // ③ 同一个采样值不得再授权（这是"不重复 probe"的直接断言）
+    // ③ 同一个采样值不得再授权。
     check(!gate->poll(200), "G-30: ★ 相同采样值**不得**再授权 probe（否则每周期重复 probe）");
     check(gate->phase() == VolumeSpacePhase::Blocked, "G-30: 必须仍是 Blocked");
     check(gate->poll(201), "G-30: 严格更高的采样才重新授权");
@@ -1393,7 +1290,7 @@ void g30_probe_authorising_sample_becomes_the_watermark() {
         check(!gate->poll(level), "G-30: 该水位不得被重复授权（无重复 probe）");
     }
 
-    // ⑤ 真实成功仍然终止 episode（水位语义不改变铁律一）
+    // ⑤ 真实成功仍然终止 episode（水位语义不变）
     check(gate->poll(600), "G-30: 更高的采样必须授权");
     {
         auto result = wait_bounded(gate);
@@ -1405,9 +1302,7 @@ void g30_probe_authorising_sample_becomes_the_watermark() {
           "G-30: 全程只应有一条 resumed");
 }
 
-// ---------------------------------------------------------------------------
-// G-31 episode 历史不堆积：全部恢复后诊断节流表必须被丢弃（架构师第十二轮 P2）
-// ---------------------------------------------------------------------------
+// 全部恢复后诊断节流表必须被丢弃
 void g31_monitor_drops_episode_history_after_recovery() {
     auto log = std::make_shared<SinkLog>();
     auto gate = make_gate("job:g31", log);
@@ -1417,8 +1312,8 @@ void g31_monitor_drops_episode_history_after_recovery() {
     state->space_gate = gate;
 
     auto status_calls = std::make_shared<std::atomic<int>>(0);
-    // ★ 诊断间隔（10 s）故意远大于测试推进的时间步长（200 ms）：于是"新 episode 的
-    //   第一拍能否立刻发出诊断"**完全等价于**"节流表有没有在上一次恢复时被清掉"。
+    // 诊断间隔（10 s）故意远大于测试推进的时间步长（200 ms），于是"新 episode 的第一拍
+    // 能否立刻发出诊断"等价于"节流表有没有在上一次恢复时被清掉"。
     VolumeSpaceMonitor monitor(
         VolumeSpaceMonitor::Options{5ms, 10s},
         [blocked] { return *blocked; },
@@ -1436,15 +1331,13 @@ void g31_monitor_drops_episode_history_after_recovery() {
     check(status_calls->load() >= 1, "G-31: episode 1 必须发出诊断");
     check(monitor.sampling(), "G-31: episode 1 必须处于采样中");
 
-    // ② 恢复：拉取返回空 → 停止采样，并且**整个 episode 的历史被丢弃**。
+    // ② 恢复：拉取返回空 → 停止采样，整个 episode 的历史被丢弃。
     blocked->clear();
     monitor.tick(now + 100ms);
     check(!monitor.sampling(), "G-31: 全部恢复后必须停止采样");
 
-    // ③ episode 2：同一个卷再次满盘。此刻距上一次诊断只有 200 ms（< 10 s）——
-    //    若 last_status_at_ 没有被清掉，这一拍会被节流掉，计数保持 1。
-    //    （registry 里的 job:<id> 条目 idle 后会被 erase，而 monitor 的这张表原先会
-    //      永久留下它的 key：长期大量不同 job 都满盘过 = 无界增长。）
+    // ③ episode 2：同一个卷再次满盘，此刻距上一次诊断只有 200 ms（< 10 s）；
+    //    若这张节流表没有被清掉，这一拍会被节流掉，计数保持 1。
     gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
     blocked->push_back(state);
     monitor.note_blocked();

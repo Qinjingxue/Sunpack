@@ -53,7 +53,7 @@ def _scope():
     return _CleanupRefScope(context, config(), engine_module.PostProcessActions).bind('request-1')
 
 
-# --- reference counting -------------------------------------------------
+# reference counting
 
 
 def test_last_owner_deletes_and_failed_owner_never_does(tmp_path):
@@ -90,9 +90,7 @@ def test_success_survives_a_failed_owner_releasing_first(tmp_path):
     table.register_all([failing, succeeding])
     table.mark_cleanup_eligible(succeeding)
 
-    # The failed owner drops its reference first and must not delete.
     assert table.release(failing).should_clean is False
-    # The successful owner still asks for the path and takes the count to zero.
     request = table.release(succeeding)
     assert request.paths == (shared,)
     assert request.should_clean is True
@@ -120,7 +118,7 @@ def test_registration_is_idempotent_per_task(tmp_path):
     assert table.count(shared) == 1
 
 
-# --- task level scope ---------------------------------------------------
+# task level scope
 
 
 def test_scope_cleans_when_the_last_owner_finishes(tmp_path, monkeypatch):
@@ -195,15 +193,11 @@ def test_scope_barrier_failure_is_recorded_for_retry(tmp_path, monkeypatch):
     assert source.exists() is True
 
 
-# --- request level retry ------------------------------------------------
+# request level retry
 
 
 class _RecordingBroker:
-    """Runs finalize for real but records which retry payload it was handed.
-
-    Source archives are already gone at this point in the real pipeline, so the
-    first pass finds nothing to delete and only marks postprocessing complete.
-    """
+    """Runs finalize for real but records which retry payload it was handed."""
 
     def __init__(self):
         self.calls = []
@@ -236,8 +230,7 @@ def test_committer_retries_only_the_failed_leftovers(tmp_path, monkeypatch):
 
     asyncio.run(DirectOutputCommitter(broker).commit(config(), response))
 
-    # First pass has no retry payload, then two bounded backoff passes that each
-    # carry exactly the two failed leftovers.
+    # First pass has no retry payload, then two passes carrying the two failures.
     assert [None if call is None else len(call) for call in broker.calls] == [None, 2, 2]
     final = broker.responses[-1].summary.cleanup_results
     assert sorted(item.attempts for item in final) == [3, 3]
@@ -321,14 +314,13 @@ def test_failed_cleanup_is_bounded_and_repeat_commit_is_idempotent(tmp_path, mon
     assert response.summary.cleanup_results[0].attempts == 3
     assert len(calls) == 2
 
-    # A second commit of an already exhausted result must not try again.
     asyncio.run(committer.commit(config(), response))
     assert len(calls) == 2
     assert response.summary.success_count == 1
 
 
 def test_mapped_commit_leaves_cleanup_alone(tmp_path, monkeypatch):
-    """Cleanup no longer travels through artifacts, so a mapped commit is a no-op."""
+    """Cleanup travels through the summary rather than artifacts: a mapped commit is a no-op."""
 
     probe_dir = tmp_path / 'probe'
     probe_dir.mkdir()
@@ -374,7 +366,7 @@ def test_retry_only_touches_the_failed_leftovers(tmp_path, monkeypatch):
     assert [len(call) for call in broker.calls if call] == [1, 1]
 
 
-# --- unrelated pipeline contracts ---------------------------------------
+# unrelated pipeline contracts
 
 
 def test_native_delete_reports_missing_and_deleted(tmp_path):

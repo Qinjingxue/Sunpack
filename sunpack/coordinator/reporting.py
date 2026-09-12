@@ -9,8 +9,7 @@ from sunpack.contracts.failures import FailureInfo
 from sunpack.contracts.results import ArchiveCleanupResult
 from sunpack.i18n import I18nContext
 
-# native 侧的空间事件名（与 sevenzip_runner 的 _SPACE_EVENTS 一致）。
-# 它们表达的是"等待状态"，不是 job 生命周期状态。
+# native 侧的空间事件名（与 sevenzip_runner 的 _SPACE_EVENTS 一致），表达等待状态而非 job 生命周期状态。
 _SPACE_EVENTS = frozenset({"space_blocked", "space_status", "space_resumed"})
 
 
@@ -54,11 +53,7 @@ class RunReporter:
         self._panel_tasks: list[int] = []
         self._task_rows: dict[int, dict[str, Any]] = {}
         self._last_streamed_progress: dict[int, int] = {}
-        # (volume_key, episode_id) -> 仍在等待该 episode 的 job_id 集合。
-        # ★ job 终态时必须把它从所有 episode 集合里移除；集合空则提示消失。
-        #   gate 正确地不会因为"最后一个 waiter 消失"而恢复（铁律一），因此
-        #   **不能**只在收到 space_resumed 时才清理 —— 否则所有等待 job 都被取消后，
-        #   watch 模式会永久留下"空间不足"提示（§4.7.5）。
+        # (volume_key, episode_id) -> 仍在等待该 episode 的 job_id 集合；收到 space_resumed 时移除。
         self._space_blocked_jobs: dict[tuple[str, int], set[str]] = {}
         self._last_render_at = 0.0
 
@@ -160,10 +155,8 @@ class RunReporter:
             if self._interactive and new_percent != old_percent:
                 self._render_panel_locked(force=False)
             elif not self._interactive:
-                # Terminals without cursor-control support still deserve visible
-                # extraction progress.  Emit a throttled, line-based bar so this
-                # also works through wrappers and redirected output without
-                # flooding logs for every worker event.
+                # Terminals without cursor control get a throttled, line-based bar that also
+                # works through wrappers and redirected output without flooding logs.
                 task_id = id(task)
                 last_percent = self._last_streamed_progress.get(task_id, -10)
                 displayed_percent = (new_percent // 10) * 10
@@ -171,14 +164,7 @@ class RunReporter:
                     self._last_streamed_progress[task_id] = displayed_percent
                     self._print(self._format_task_row(row))
 
-    # ------------------------------------------------------------------
-    # 空间不足暂停/恢复（§4.7.2 / §4.7.5）
-    #
-    # ★ 按 (volume_key, episode_id) 去重：同一卷的多个 job、以及 native 侧
-    #   锁外发送造成的重复事件都只会显示一次。
-    # ★ space_status 是**低频诊断**（默认 15s），不是看门狗保活。
-    # ★ 卷不可查询时必须能区分"空间不足"与"卷不可访问"（B5）。
-    # ------------------------------------------------------------------
+    # 空间不足暂停/恢复：按 (volume_key, episode_id) 去重；space_status 是低频诊断（默认 15s），不是看门狗保活。
     def _space_progress(self, task: Any, event: str, payload: dict[str, Any]) -> None:
         key = (str(payload.get("volume_key") or ""), int(payload.get("episode_id") or 0))
         job_id = str(payload.get("job_id") or "")
@@ -216,7 +202,7 @@ class RunReporter:
                 ))
 
     def _space_status_detail(self, payload: dict[str, Any]) -> str:
-        # B5：卷查询失败（拔盘 / UNC 断开 / 权限变化）与"空间不足"必须可区分。
+        # 卷查询失败（拔盘 / UNC 断开 / 权限变化）必须与"空间不足"可区分。
         if not bool(payload.get("volume_query_ok", True)):
             return self.i18n.t(
                 "report.status.disk_unavailable",

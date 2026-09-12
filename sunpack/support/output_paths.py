@@ -21,8 +21,7 @@ def default_output_dir_for_task(task: ArchiveTask, output_config: dict | None = 
         out_dir = os.path.join(os.path.dirname(path), os.path.basename(out_name))
     if normalized_path(out_dir) == normalized_path(path):
         out_dir += "_extracted"
-    # Return an absolute normalized path so callers derive the write-routing key
-    # and the extraction request from the identical string.
+    # Absolute normalized path: the write-routing key and the extraction request must come from the identical string.
     return normalized_output_dir(_non_existing_output_dir(out_dir))
 
 
@@ -58,10 +57,8 @@ def _is_relative_to(path: str, root: str) -> bool:
 def normalized_output_dir(path: str) -> str:
     """Absolute, normalized output path.
 
-    The volume key and the extraction request must be derived from the same path
-    string: resolving a relative path in one place and letting the worker resolve
-    it against its own working directory in another would silently mis-route the
-    per-volume write facility.
+    The volume key and the extraction request must derive from the same string; a relative
+    path resolved in two different places would mis-route the per-volume write facility.
     """
     return os.path.abspath(os.path.normpath(str(path)))
 
@@ -69,11 +66,9 @@ def normalized_output_dir(path: str) -> str:
 def resolve_output_volume_key(path: str) -> str:
     """Volume identity for an output path, or an empty string when unknown.
 
-    Reported by the Rust layer (nearest existing ancestor -> canonicalize ->
-    volume GUID), because the output directory usually does not exist yet when the
-    job is built.  An empty result is not fatal: the caller substitutes a
-    synthetic per-job key so the job still gets its own write facility instead of
-    sharing another volume's.
+    Reported by the Rust layer, because the output directory usually does not exist yet when
+    the job is built.  An empty result makes the caller substitute a synthetic per-job key so
+    the job still gets its own write facility.
     """
     try:
         from sunpack_native import resolve_output_volume_key as _resolve

@@ -150,8 +150,7 @@ def _build_cases(
     targeted_formats = {"7z", "rar-split", "tar"}
     requested = set(formats)
     if cached_corpus is not None:
-        # The cache already holds the payload tree, so solid variants are rebuilt
-        # against it only when they are missing rather than on every round.
+        # The cache already holds the payload tree; rebuild only missing solid variants.
         corpus = cached_corpus
         skipped: dict[str, str] = {}
         variants, variant_skipped = _solid_variants(
@@ -216,8 +215,7 @@ def _build_cases(
 def _archive_format(path: Path) -> str:
     """Map an archive path to the native worker's format hint.
 
-    Split 7z volumes end in ``.7z.001`` and split RAR volumes in ``.partN.rar``;
-    everything else is recognised by its final suffix.
+    Split 7z volumes end in `.7z.001`, split RAR volumes in `.partN.rar`.
     """
     name = path.name.lower()
     if re.search(r"\.7z\.\d{3}$", name):
@@ -244,12 +242,7 @@ def _archive_format(path: Path) -> str:
 
 
 def _explicit_archives(values: list[str], *, payload_bytes: int) -> list[dict[str, Any]]:
-    """Build cases from archives supplied on the command line.
-
-    Hand-built archives let one run cover several compression methods and sizes
-    that the generated corpus does not produce, without paying the corpus build
-    cost again on every round.
-    """
+    """Build cases from archives supplied on the command line."""
     cases: list[dict[str, Any]] = []
     for name, path in _parse_archive_args(values):
         if not path.is_file():
@@ -291,12 +284,9 @@ def _prefetch_recommendation(row: dict[str, Any]) -> str:
 def _starvation_verdict(row: dict[str, Any]) -> str:
     """Report whether the decoder ever had to fall back to a synchronous read.
 
-    A hit means the consumer found the window already buffered, so it never
-    touched the file.  A miss means it had to read the file itself and discard
-    the prefetch epoch, which is exactly the decoder-starvation signal.  Reads
-    that are not multiples of the prefetch window (archive tails, header
-    probes) are expected to miss, so the verdict compares misses against the
-    logical read count instead of demanding zero.
+    A miss means the consumer read the file itself and discarded the prefetch
+    epoch; misses are compared against the logical read count rather than
+    demanding zero.
     """
     hits = row.get("input_prefetch_hit_count")
     misses = row.get("input_prefetch_miss_count")
@@ -365,10 +355,8 @@ def _pattern_table(rows: list[dict[str, Any]]) -> str:
 def _cold_copy_case(case: dict[str, Any], slot: Path) -> dict[str, Any]:
     """Point a case at a freshly written copy of its archive.
 
-    The cache manager keys cached pages by file, so a path that was just written
-    and never read has no cached pages even while the source archive the corpus
-    built is fully resident.  That is what makes this the only reliable way to
-    measure cold-cache behaviour without a cache-clearing tool.
+    Cached pages are keyed by file, so a freshly written path has none — the only
+    reliable cold-cache measurement without a cache-clearing tool.
     """
     source = Path(case["archive_path"])
     slot = slot.with_suffix(source.suffix)

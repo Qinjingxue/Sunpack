@@ -116,18 +116,8 @@ namespace sunpack::sevenzip
         return config;
     }
 
-    // Read handle for one file that is opened once and reused for every read.
-    //
-    // Every reader in this header needs repeated offset reads of the same file: the
-    // prefetch thread fills one window after another, and PatchedInStream walks a
-    // carrier segment by segment.  Reopening the file for each of those reads (a
-    // CreateFileW/CloseHandle pair plus path resolution and whatever filter drivers
-    // attach to it) adds nothing but fixed per-window cost, so a handle lives as
-    // long as the stream or the reader that owns it.
-    //
-    // The handle carries its own file cursor and is therefore owned by exactly one
-    // thread that reads sequentially.  Streams that also serve the 7z.dll decoder
-    // keep a second, independent handle for decoder driven Seek/Read calls.
+    // Opened once per file and reused; the handle carries its own file cursor and is owned by exactly one thread that reads sequentially.
+    // Streams that also serve the 7z.dll decoder keep a second, independent handle for decoder driven Seek/Read calls.
     class [[nodiscard]] PathHandle final
     {
     public:
@@ -146,12 +136,10 @@ namespace sunpack::sevenzip
 
         bool valid() const noexcept { return handle_ != INVALID_HANDLE_VALUE; }
 
-        // Win32 error of the failed open, so callers report the real reason instead
-        // of whatever GetLastError() happens to hold later.
+        // Win32 error of the failed open, so callers report the real reason.
         DWORD open_error() const noexcept { return open_error_; }
 
-        // Reads directly at the requested offset; the caller's own position is not
-        // part of the contract, so nothing outside this handle observes a seek.
+        // Reads directly at the requested offset; the caller's own position is not part of the contract.
         HRESULT read_at(UInt64 offset, void *data, UInt32 size, UInt32 *processed) noexcept
         {
             if (processed)
@@ -195,10 +183,8 @@ namespace sunpack::sevenzip
         DWORD open_error_ = ERROR_SUCCESS;
     };
 
-    // One long lived read handle per distinct path, opened on first use.  Only the
-    // prefetch thread or the decoder thread that owns the stream touches a cache,
-    // never both at once.  Failed opens are not remembered, so a file that is still
-    // locked when first probed is retried on the next read.
+    // One long lived handle per distinct path, opened on first use; only the owning thread touches a cache, never two at once.
+    // Failed opens are not remembered, so a file that is still locked when first probed is retried on the next read.
     class PathHandleCache final
     {
     public:
@@ -601,8 +587,7 @@ namespace sunpack::sevenzip
 
             if (size_ && prefetch_config.enabled)
             {
-                // The prefetch thread gets a handle of its own so its offset reads
-                // never touch the decoder handle or its file cursor.
+                // A handle of its own, so prefetch offset reads never touch the decoder handle or its file cursor.
                 prefetch_reader_ = std::make_unique<PathHandle>(path_);
                 if (prefetch_reader_->valid())
                 {
@@ -1391,8 +1376,7 @@ namespace sunpack::sevenzip
 
         bool valid_ = true;
 
-        // Declared before the prefetcher so the handles outlive the prefetch thread.
-        // Mutable because the prefetch reader runs from a const accessor.
+        // Declared before the prefetcher so the handles outlive its thread; mutable because the prefetch reader runs from a const accessor.
         mutable PathHandleCache prefetch_handles_;
 
         std::unique_ptr<SequentialPrefetcher> prefetch_;
@@ -1972,8 +1956,7 @@ namespace sunpack::sevenzip
 
         bool valid_ = true;
 
-        // Declared after the prefetcher, which stops its thread before this closes
-        // the handles; mutable for the same reason as in MultiFileInStream.
+        // Declared after the prefetcher, which stops its thread before this closes the handles; mutable as in MultiFileInStream.
         mutable PathHandleCache prefetch_handles_;
     };
 
@@ -2376,7 +2359,7 @@ namespace sunpack::sevenzip
 
         ExtractInputTrace *trace_ = nullptr;
 
-        // One long lived read handle per source file instead of one per Read call.
+        // One long lived read handle per source file, not reopened per Read call.
         PathHandleCache read_handles_;
 
         bool valid_ = true;

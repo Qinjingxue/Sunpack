@@ -265,12 +265,7 @@ class RequestRuntimeProfiler:
         setattr(owner, name, measured)
 
     def _install_cleanup_timer(self, scope) -> None:
-        """Time per-task source cleanup and the share spent at its barrier gate.
-
-        Source cleanup now runs once per finished task instead of once per
-        request, so its cost and its barrier contention are measured separately
-        from the batch-level pass.
-        """
+        """Time per-task source cleanup and the share spent at its barrier gate."""
 
         if scope is None:
             return

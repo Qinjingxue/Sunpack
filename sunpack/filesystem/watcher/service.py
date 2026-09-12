@@ -29,12 +29,8 @@ from sunpack.support.resource_lifecycle import (
 
 SERVICE_STATE = "state.json"
 WATCH_ROOTS_FILENAME = "sunpack_watch_roots.txt"
-# One roots entry is ``<input root> | <output root>``.  ``|`` is the separator
-# because it cannot appear in a Windows path, it never collides with a drive
-# letter, and a root containing spaces stays readable.  A line without the
-# separator is the legacy form and means "output beside the input"; that
-# compatibility lives here and nowhere else.  Everywhere past this parser a
-# watch root has exactly one absolute output root.
+# One roots entry is ``<input root> | <output root>``; ``|`` cannot appear in a Windows path.
+# A line without the separator means "output beside the input", a form understood only here.
 WATCH_ROOT_OUTPUT_SEPARATOR = "|"
 ROOTS_MUTEX_PREFIX = "Local\\SunPackWatchRoots"
 CONTROL_STOP = "stop"
@@ -186,7 +182,7 @@ def watch_roots_path() -> Path:
 
 
 def _watch_root_line_output(line: str) -> str:
-    """Output root as written on one roots line, or "" for the legacy form."""
+    """Output root as written on one roots line, or "" when the line has no separator."""
     _input_part, separator, output_part = line.partition(WATCH_ROOT_OUTPUT_SEPARATOR)
     return output_part.strip() if separator else ""
 
@@ -194,13 +190,8 @@ def _watch_root_line_output(line: str) -> str:
 def _iter_watch_root_entries(default_output_root: str, path: Path | None):
     """Yield ``(input_root, output_root)`` as absolute paths, in file order.
 
-    This is the only place the legacy single-path form is understood: a line
-    without ``|`` means the root keeps the configured ``watch.out_dir``, which
-    is how the roots file has always behaved.  Past this function a root always
-    has its own resolved output root, so nothing downstream needs a fallback.
-    A relative output root is resolved against the input root on its own line,
-    never against the process working directory: the service is commonly
-    launched from somewhere unrelated, such as a system directory.
+    A line without a separator keeps the configured ``watch.out_dir``.  A relative output root
+    is resolved against its own input root, never against the process working directory.
     """
     roots_path = path or watch_roots_path()
     try:
@@ -227,9 +218,8 @@ def read_watch_root_outputs(
 ) -> dict[str, str]:
     """Every watch root mapped to its one absolute output root.
 
-    Keyed by the canonical input root because that is how the scheduler looks a
-    candidate's watch root up.  Roots that only differ by case share one entry,
-    so the last line that names a root wins.
+    Keyed by the canonical input root; roots differing only by case share one entry, so the
+    last line that names a root wins.
     """
     return {
         path_key(input_root): output_root
@@ -238,12 +228,7 @@ def read_watch_root_outputs(
 
 
 def read_watch_roots(default_output_root: str = ".", path: Path | None = None) -> list[str]:
-    """The watched input roots, in their own casing and file order.
-
-    The service owns the output root of every input, so callers that only need
-    the folders (scanner, Observer, USN, password files) keep the same
-    ``list[str]`` they always had.
-    """
+    """The watched input roots, in their own casing and file order."""
     roots: list[str] = []
     seen: set[str] = set()
     for input_root, _output_root in _iter_watch_root_entries(default_output_root, path):
@@ -317,13 +302,9 @@ def remove_watch_roots(paths: list[str], *, cleanup: bool = True) -> tuple[Path,
 def _cleanup_removed_watch_root_artifacts(roots: list[str]) -> None:
     """Remove service-owned artifacts for roots that were actually removed.
 
-    The scheduler creates the directory password file on first use and keeps
-    probe extraction workspaces in a hidden ``.sunpack_watch_probes``
-    directory.  Both live under the input root regardless of the output root
-    configured for it: the password file remains a watch-owned input even after
-    the user populates it, and probes stay beside their input so the promotion
-    is a rename.  Removing the watch root therefore removes its own artifacts;
-    a separately configured output root is never deleted.
+    The password file and the hidden ``.sunpack_watch_probes`` workspaces both live under the
+    input root, so removing the watch root removes them; a separately configured output root
+    is never deleted.
     """
 
     for root in roots:

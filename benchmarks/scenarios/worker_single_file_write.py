@@ -302,11 +302,8 @@ def _regression_gate(
     *,
     hard_percent: float,
 ) -> dict[str, Any]:
-    """§9.2 noise-aware non-regression gate.
-
-    The single-disk path is architecturally unchanged by the per-volume writer
-    refactor, so this gate treats any reproducible slowdown beyond the run-to-run
-    noise band as a failure rather than granting a fixed budget.
+    """Noise-aware non-regression gate: a reproducible slowdown beyond the run-to-run
+    noise band fails rather than getting a fixed budget.
     """
     baseline_values = [float(row["throughput_mib_per_second"]) for row in baseline_rows]
     candidate_values = [float(row["throughput_mib_per_second"]) for row in candidate_rows]
@@ -315,9 +312,7 @@ def _regression_gate(
     baseline_median = statistics.median(baseline_values)
     candidate_median = statistics.median(candidate_values)
     mad = _mad(baseline_values)
-    # §9.2 noise estimate.  Either 3 x MAD or 3 x (IQR / 1.349), whichever is
-    # tighter: a single cold-cache outlier inflates MAD and would otherwise buy a
-    # wide allowance that hides a real regression.
+    # Noise estimate: 3 x MAD or 3 x (IQR / 1.349), whichever is tighter.
     noise_floor = 0.0
     if len(baseline_values) >= 3:
         mad_floor = 3.0 * float(mad) if mad is not None else 0.0
@@ -340,9 +335,7 @@ def _regression_gate(
         or candidate_p05 is None
         or candidate_p05 >= baseline_p05 * 0.95
     )
-    # §9.2 requires reproducibility: a single noisy run may be recorded but must not
-    # block the change.  Split the measured runs in half and require both halves to
-    # agree before treating an over-line result as a regression.
+    # Reproducibility: both halves of the measured runs must agree.
     reproducible = False
     if len(candidate_values) >= 4:
         ordered = sorted(candidate_values)

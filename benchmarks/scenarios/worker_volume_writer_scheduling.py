@@ -6,21 +6,16 @@ under two configurations, alternating them inside every repetition:
   cross   job A -> volume A, job B -> volume B
   same    job A -> volume A, job B -> volume A   (control)
 
-Alternating matters: measured single-job throughput on this machine drifts by
-about 20% between runs, which is larger than the effect under test, so comparing
-two configurations recorded minutes apart proves nothing.
+Configurations are alternated inside every repetition: run-to-run drift on this
+machine is larger than the effect under test, so comparing phases recorded minutes
+apart proves nothing.
 
-Why a control instead of an absolute threshold (docs §9.3): the extraction
-pipeline has its own parallel ceiling. With a cache-resident payload, two
-concurrent jobs reach roughly 1.5x one job whether or not they share a volume, so
-an absolute "sum of two solo runs" gate would reject a layout that is in fact
-working. The control isolates the variable that matters -- whether both jobs
-writing to one volume is slower than writing to two -- and the run is only
-meaningful while the payload is large enough to stay I/O bound.
+The control exists because the extraction pipeline has its own parallel ceiling,
+so an absolute threshold would reject a layout that is in fact working; the run is
+only meaningful while the payload is large enough to stay I/O bound.
 
-Unrelated volumes needed for capacity isolation: if the two targets resolve to the
-same PhysicalDisk the scenario skips with an explicit reason instead of producing
-a misleading verdict.
+The scenario skips with an explicit reason when both targets resolve to the same
+PhysicalDisk.
 """
 from __future__ import annotations
 
@@ -51,11 +46,8 @@ from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worke
 
 SCENARIO = "extraction.worker-volume-writer-scheduling"
 
-# Page cache is the number one confounder for this measurement: with a resident
-# archive neither job touches a disk for reads and the writes are absorbed by the
-# cache, so the two configurations measure the same non-disk bottleneck and the
-# layout difference disappears.  Every measurement therefore starts by evicting the
-# corpus from the standby list.
+# Every measurement evicts the corpus from the page cache first: with a resident
+# archive both configurations hit the same non-disk bottleneck.
 _FILE_FLAG_NO_BUFFERING = 0x20000000
 _FILE_FLAG_WRITE_THROUGH = 0x80000000
 _GENERIC_WRITE = 0x40000000
@@ -78,9 +70,8 @@ _kernel32.CloseHandle.argtypes = [ctypes.wintypes.HANDLE]
 def _purge_file_cache(path: Path) -> None:
     """Evict one file from the system cache (best effort).
 
-    A write-through, unbuffered open invalidates the cached pages for the file
-    without modifying it, which is what makes each measurement see the corpus on
-    the device rather than in RAM.
+    A write-through, unbuffered open invalidates the file's cached pages without
+    modifying it.
     """
     try:
         handle = _kernel32.CreateFileW(
@@ -97,20 +88,8 @@ def _purge_file_cache(path: Path) -> None:
     if handle != _INVALID_HANDLE:
         _kernel32.CloseHandle(handle)
 
-# §9.3 gates.
-#
-# HISTORY, because the first version of this scenario reached a wrong conclusion.
-# It kept the corpus in the page cache and put every archive on one volume, so
-# neither job touched a disk for reads and the writes were absorbed by the cache.
-# Measured that way the two configurations are indistinguishable, and the scenario
-# reported "the pipeline bounds throughput, the layout does not matter" -- which
-# did not survive a cold-cache measurement.
-#
-# With the corpus evicted before every measurement the layout effect is
-# repeatable: cross-volume wins all paired samples here, and a direct cold-cache
-# probe puts the per-volume worker 31% above the pre-refactor single-pool worker
-# (3875 vs 2953 MiB/s aggregate).  The gates assert the direction and the win
-# rate, not a magnitude, because the magnitude depends on how cold the cache is.
+# Gates: assert the direction and the win rate, not a magnitude (it depends on how
+# cold the cache is).
 MIN_CONCURRENT_JOBS = 2
 CROSS_NOT_SLOWER_FLOOR = 0.90   # median paired ratio must stay above this
 CROSS_WIN_RATIO = 0.75          # and cross must win most paired samples
@@ -180,9 +159,8 @@ class _Job:
         self.output_dir = output_dir
         self.payload_bytes = payload_bytes
         self.drive = drive
-        # The archive lives on the same volume as the output.  Putting it anywhere
-        # else makes the reading job contend with the other job's writes on a
-        # third volume, which hides the effect this scenario exists to measure.
+        # The archive lives on the same volume as the output, or the read load moves
+        # to a third volume and hides the effect this scenario measures.
         self.archive = archive
         self.result: dict[str, Any] | None = None
         self.failure = ""
@@ -301,8 +279,7 @@ def _run_configuration(
         )
     return {
         "label": label,
-        # Summing the concurrent per-job rates is the peak-concurrency aggregate:
-        # the two jobs run at the same time, so both rates are sustained together.
+        # Both jobs run concurrently, so their per-job rates add up.
         "aggregate_throughput_mib_per_second": round(sum(row["throughput_mib_per_second"] for row in rows), 3),
         "jobs": rows,
         "verified": all(row["verified"] for row in rows),

@@ -1,9 +1,5 @@
 // Measures AsyncFileWriter construction cost, which decides whether building a
 // facility while holding the registry mutex is acceptable.
-//
-// Construction spawns threads_per_volume threads plus the buffer/event shells, so
-// the question is whether that is microseconds (leave acquire() simple) or
-// milliseconds (move construction out of the lock).
 #include "internal/sevenzip_async_output.hpp"
 #include "internal/sevenzip_volume_registry.hpp"
 
@@ -56,8 +52,8 @@ int main() {
             std::chrono::duration<double, std::micro>(finished - started).count());
     }
 
-    // 2. First acquire per volume, i.e. the path that constructs under the lock,
-    //    measured across distinct volumes so each one is a cold construction.
+    // 2. First acquire per volume, i.e. the path that constructs under the lock;
+    //    distinct volumes so each one is a cold construction.
     std::vector<double> acquire_first;
     {
         auto meters = std::make_shared<WriterMeters>();

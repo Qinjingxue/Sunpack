@@ -863,11 +863,9 @@ def test_legacy_single_path_line_keeps_the_configured_out_dir(tmp_path, monkeypa
 
     key = service_module.path_key(str(watch_root.resolve()))
 
-    # The default configured output root is "." -> output beside the input, which
-    # is exactly what a single-path roots file has always meant.
+    # The default configured output root is "." -> output beside the input.
     assert service_module.read_watch_root_outputs() == {key: str(watch_root.resolve())}
-    # An explicit configured root still applies to legacy lines, so a deployed
-    # watch.out_dir keeps working; it is resolved per input root.
+    # An explicit configured root still applies to legacy lines, resolved per input root.
     assert service_module.read_watch_root_outputs("D:\\Unpacked") == {key: "D:\\Unpacked"}
     assert service_module.read_watch_root_outputs("extracted") == {
         key: str((watch_root / "extracted").resolve())

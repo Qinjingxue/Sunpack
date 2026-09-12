@@ -886,10 +886,7 @@ std::string diagnostics_json(const sunpack::sevenzip::ExtractArchiveResult& resu
 
 int run_request(
     const std::string& request,
-    // The write facility for this job's output volume, borrowed from the
-    // registry lease held by worker_loop.  Null for dry runs, which write
-    // nothing.  The historical parameter name says "shared_writer"; the
-    // semantics are now per-volume, not process-wide.
+    // The job's output-volume write facility, borrowed from the registry lease held by worker_loop; null for dry runs.
     const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer = nullptr,
     const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr
 ) {
@@ -1003,11 +1000,7 @@ int run_request(
         result.failure_kind = "patched_input_candidates_unsupported";
         result.message = "password candidate batches are not supported for patched input";
     } else if (password_candidates.size() == 1) {
-        // A fast verifier has already reduced the search space to one
-        // candidate. Running the bounded password probe again would duplicate
-        // work immediately before the real extraction transaction. On failure,
-        // run it once as a diagnostic so weak ZipCrypto header matches preserve
-        // the retryable all-candidates-rejected contract.
+        // Single candidate: extract directly; the bounded probe runs once only as a failure diagnostic to preserve the all-candidates-rejected contract.
         result = extract_with_password(password_candidates.front());
         const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
         if (!direct_ok) {
@@ -1285,22 +1278,12 @@ public:
         sunpack::sevenzip::NativeRuntimeConfig runtime_config
     )
         : writer_meters_(std::make_shared<sunpack::sevenzip::WriterMeters>()),
-          // ★ ChangeSink 的唯一所有者链（§4.7.4.1）：
-          //     NativeJobExecutor（本处，捕获 this）
-          //       → VolumeWriterRegistry(meters, config, sink)
-          //         → VolumeSpaceGate(volume_key, query_root_hint, sink)
-          //   gate 的生命周期长于 writer facility，因此 AsyncFileWriter **绝不**
-          //   持有或重设 sink（否则 facility 被 reap / 重建时会覆盖 persistent
-          //   gate 的回调）。这也要求 executor 的生命周期长于所有 gate ——
-          //   由"registry 在 executor 成员里、且 ~NativeJobExecutor → stop() →
-          //   registry->shutdown() 先于 executor 析构完成"保证。
+          // The sink is owned solely by the executor and the long-lived gates: AsyncFileWriter never holds or resets it.
           space_change_sink_(
               [this](const sunpack::sevenzip::VolumeSpaceTransition &transition) {
                   on_space_transition(transition);
               }),
-          // One environment snapshot for every volume facility: the writers must
-          // be identical by construction, not by all happening to read the same
-          // variables (§3.4).
+          // One environment snapshot shared by every volume facility, so the writers are identical by construction.
           writer_config_(sunpack::sevenzip::configured_async_writer_config()),
           writer_registry_(std::make_shared<sunpack::sevenzip::VolumeWriterRegistry>(
               writer_meters_,
@@ -1313,8 +1296,7 @@ public:
               worker_count_,
               memory_budget_,
               std::move(runtime_config)) {
-        // ★ monitor 不维护自己的 membership：每个 tick 直接从 registry 拉 blocked
-        //   volumes。tick() **必须**在 executor mutex_ 之外调用（见 controller_loop）。
+        // tick() must be called with the executor mutex_ released; the monitor keeps no membership and pulls blocked volumes from the registry.
         space_monitor_ = std::make_unique<sunpack::sevenzip::VolumeSpaceMonitor>(
             sunpack::sevenzip::VolumeSpaceMonitor::Options{
                 writer_config_.space_poll_interval,
@@ -1400,9 +1382,7 @@ public:
                 return false;
             }
             token = found->second->cancel_token;
-            // Upgrade the weak reference while the entry is still alive, but only
-            // for the duration of this call: the token is what carries the cancel,
-            // the writer is only the thing that has to be woken.
+            // Locked only for this call: the token carries the cancel, the writer is just the thing to wake.
             writer_to_wake = found->second->writer.lock();
         }
         if (!token) {
@@ -1410,10 +1390,7 @@ public:
         }
         token->store(true, std::memory_order_release);
 #ifdef _WIN32
-        // Only the facility this job is actually writing to needs waking: its
-        // producer may be parked in that facility's backpressure wait.  A job that
-        // has not acquired a lease yet (or a dry run) has no writer and needs only
-        // the token.  A facility already reclaimed leaves an expired weak_ptr.
+        // Wake only the facility this job writes to, whose producer may be parked in that backpressure wait; a reclaimed facility leaves an expired weak_ptr.
         if (writer_to_wake) {
             writer_to_wake->wake_waiters();
         }
@@ -1424,42 +1401,17 @@ public:
 
     bool had_job_failure() const noexcept { return any_job_failed_; }
 
-    // 等待队列与在跑的 job 全部结束。**只用于 stdin EOF 的排空路径**。
-    //
-    // 此时控制器线程与 space monitor 必须仍然存活 —— 排空期间才出现的"满盘"
-    // 否则没有任何线程会 query/poll（见 stop(false) 的注释）。
-    // 完成后由调用方走正常的 stop() 路径：置 stopping_ → notify → join。
+    // Waits for the queue and all active jobs to finish; only used on the stdin EOF drain path, where the controller and space monitor must still be alive.
     void wait_for_pending_jobs_to_drain() noexcept {
         std::unique_lock<std::mutex> lock(mutex_);
         condition_.wait(lock, [this] { return queue_.empty() && active_jobs_ == 0; });
     }
 
-    // cancel_pending_jobs：
-    //   true  —— 显式 {"worker_command":"shutdown"}：等价于"取消所有尚未完成的 job"。
-    //            必须先置 terminal 条件再 wake，否则阻塞在卷空间 gate 上的 worker
-    //            永远看不到停止请求，join 永久阻塞（T-WIN-11 / T-WIN-20）。
-    //   false —— stdin EOF：**先排空、再停止**。
+    // cancel_pending_jobs: true (explicit shutdown) cancels every unfinished job, false (stdin EOF) drains first.
+    // Terminal conditions must be set before waking, otherwise a worker parked on a volume space gate never sees the stop and join blocks forever.
     void stop(bool cancel_pending_jobs = true) noexcept {
         if (!cancel_pending_jobs) {
-            // ★★ EOF 的"排空"绝不能等价于"立刻 stopping_=true 然后 join"。
-            //
-            //   controller_loop() 一看到 stopping_ 就 break，而
-            //   space_monitor_->tick() **只由这个 controller 驱动**。若在这里提前
-            //   结束 controller，就存在这条闭环（T-WIN-24 钉死它）：
-            //
-            //     echo job | worker.exe → stdin EOF → 排空开始
-            //       → 随后 WriteFile 遇到 ERROR_DISK_FULL → gate 进入 Blocked
-            //       → 用户释放空间，但**没有任何线程再 query/poll**
-            //       → job 永久挂住，而本函数正卡在 join(worker) 上
-            //       ⇒ 整个进程永久不退出
-            //
-            //   abort_all_space_gates() 救不了：EOF 模式故意没有置真 cancel token，
-            //   被唤醒的 waiter 重新求值 terminal 仍是 false，于是继续睡。
-            //
-            //   所以 EOF 的正确模型是「draining ≠ stopping」：先等 queue 空且
-            //   active_jobs == 0（此时 controller / monitor / workers 全部还活着，
-            //   满盘仍然能被 poll 到并恢复），**然后**才真正进入 stopping 并 join。
-            //   这也保留了"一次性调用不取消刚提交的 job"这条既有语义。
+            // Draining must not set stopping_ yet: the controller exits on stopping_ and is the only driver of space_monitor_->tick(), so a job blocked on a full disk would never be polled again and join would hang forever.
             wait_for_pending_jobs_to_drain();
         }
         {
@@ -1468,18 +1420,6 @@ public:
                 return;
             }
             stopping_ = true;
-            // ★ 关键顺序：**先把所有 job 的 terminal 条件置位，再 wake。**
-            //
-            //   只 wake 而不改变任何 terminal 条件是没有意义的 —— 被唤醒的 writer
-            //   会重新求值为 false 并继续睡，join() 永久阻塞。
-            //
-            //   cancel_tokens_ 已经持有每个 active job 的共享 cancel token，因此
-            //   置真它们即覆盖**全部有 job 的 writer**；没有 job 的 writer 由
-            //   AsyncFileWriter::finish()（registry shutdown 时）置自己的 stopping_。
-            //   两者合起来覆盖每一个 gate waiter。
-            //
-            //   ⚠️ 只在**显式 shutdown 命令**上置位；stdin EOF 走"排空"语义（见
-            //      stop() 的参数说明）。
             if (cancel_pending_jobs) {
                 for (auto& entry : cancel_tokens_) {
                     if (entry.second && entry.second->cancel_token) {
@@ -1491,10 +1431,7 @@ public:
         condition_.notify_all();
         controller_condition_.notify_all();
 #ifdef _WIN32
-        // ★ 必须在 join() **之前**：否则卡在 volume gate 上的 worker 永远看不到
-        //   上面已置位的 terminal 条件，join 永久阻塞。
-        //   因为 gate 没有 aborted_ 永久闩锁，这一步只是 wake_waiters() 的广播，
-        //   **不改变任何 gate 状态**（persistent volume 的 gate 不会被毒死）。
+        // Must run before join(): gate waiters would otherwise never see the terminal conditions set above. It only broadcasts and changes no gate state.
         writer_registry_->abort_all_space_gates();
 #endif
         if (controller_thread_.joinable()) {
@@ -1507,9 +1444,7 @@ public:
         }
         workers_.clear();
 #ifdef _WIN32
-        // Every remaining writer finishes and joins here, with the registry mutex
-        // released.  Reaching this point implies all leases were released: the
-        // worker threads are joined, and a lease never outlives its job.
+        // All leases are released by now (worker threads joined, a lease never outlives its job); the registry mutex is not held here.
         writer_registry_->shutdown();
 #endif
     }
@@ -1520,14 +1455,9 @@ private:
         bool foreground = true;
         std::size_t memory_reserve = 64U << 20;
         std::size_t dictionary_reserve = 0;
-        // Routing key for the per-volume write facility, resolved by the caller
-        // before submission (the worker does not link the Rust volume resolver).
-        // Always non-empty in practice: the producer substitutes a synthetic
-        // "job:<id>" key when resolution fails, so a job never silently shares
-        // another volume's writer.
+        // Routing key for the per-volume write facility, resolved by the caller before submission; never empty in practice.
         std::string volume_key;
-        // False only for dry runs, which write nothing: no facility, no writer
-        // threads, and no volume readiness gate should apply to them.
+        // False only for dry runs, which write nothing and need no facility, writer threads or readiness gate.
         bool requires_writer = true;
     };
 
@@ -1538,17 +1468,7 @@ private:
         JobMetadata metadata;
     };
 
-    // Per-job cancellation control.  ``writer`` is bound once the job holds a
-    // facility lease, so a cancel wakes exactly one volume's writer instead of
-    // every facility (§6.3).  It stays empty for queued and dry-run jobs, which
-    // only need the token.
-    //
-    // The writer reference is deliberately WEAK: it exists only so cancel() can
-    // reach the right backpressure wait.  Keeping it strong would add a third
-    // owner next to the registry and the lease and break the §12 invariant that
-    // the lease is the only thing keeping a facility alive -- worse, erasing the
-    // entry under the executor mutex could then run ~AsyncFileWriter (and its
-    // thread joins) while that mutex is held.
+    // The writer reference is deliberately weak: a strong one would keep a facility alive past its lease and could run ~AsyncFileWriter under the executor mutex.
     struct JobControl {
         JobControl() = default;
         JobControl(
@@ -1757,8 +1677,7 @@ private:
             std::string(event) + "\"}");
     }
 
-    // Facility lifecycle, so an empty `live_facilities` count can be told apart
-    // from "the volume key never reached the writer".
+    // Facility lifecycle, so an empty `live_facilities` count can be told apart from a volume key that never reached the writer.
     static void print_writer_facility_event(
         const char* event,
         const std::string& volume_key
@@ -1768,23 +1687,7 @@ private:
             "\",\"volume_key\":\"" + json_escape(volume_key) + "\"}");
     }
 
-    // ---------------------------------------------------------------------
-    // 卷空间事件（§4.7）。
-    //
-    // ★ 通道必须是 `progress` + **真实 job_id** + 逐 job 发送：
-    //   两条 dispatcher 都会丢弃 job_id 为空或查不到的事件，而
-    //   `native_event_callback` 在生产代码里从未接线（死代码）。
-    //
-    // ★ 事件名与 Python 内部状态名**刻意不同名**：
-    //      native: space_blocked / space_status / space_resumed
-    //      Python: state["space_waiting"]
-    //   避免"space_waiting 到底是状态转换、心跳还是诊断"的语义混乱。
-    //
-    // ★ 扇出对象是 `affected_jobs_`（job 集合），**不是** waiters_（线程集合）：
-    //   probe owner 抢到许可后会从 waiters_ 移除，遍历 waiters_ 会让它永远收不到
-    //   space_resumed；而卡在 producer backpressure 的 job 根本不会有 writer 线程
-    //   进入 gate->wait()。
-    // ---------------------------------------------------------------------
+    // Space events go out on the `progress` channel, one per affected job, with a real job_id: both dispatchers drop events whose job_id is empty or unknown.
     static const char* space_event_name(
         sunpack::sevenzip::VolumeSpaceTransition::Kind kind
     ) noexcept {
@@ -1854,8 +1757,7 @@ private:
         if (!state || !state->space_gate) {
             return;
         }
-        // 低频诊断（默认 15s）。**不是**看门狗保活：Python 的 space_waiting 只由
-        // space_blocked / space_resumed 驱动。
+        // Low-frequency diagnostic (default 15s); Python's space_waiting is driven only by space_blocked/space_resumed, not by this.
         const auto& gate = *state->space_gate;
         const auto job_ids = gate.affected_job_ids();
         if (job_ids.empty()) {
@@ -1883,8 +1785,7 @@ private:
         return state ? state->key : std::string{};
     }
 
-    // gate 的 ChangeSink 落地：既驱动 controller 的 discontinuity generation，
-    // 又把事件扇出给每个 affected job。
+    // ChangeSink landing: drives the controller's discontinuity generation and fans the event out to affected jobs.
     void on_space_transition(
         const sunpack::sevenzip::VolumeSpaceTransition& transition
     ) noexcept {
@@ -1892,17 +1793,12 @@ private:
         switch (transition.kind) {
             case Kind::Blocked:
             case Kind::Resumed:
-                // ★ 只有**真实的卷可写性变化**才推进 generation。
-                //   `register_job()` 对新 job 的补发通知同样是 Kind::Blocked，但那只是
-                //   事件补齐（磁盘可写环境没变）；若也算进去，"blocked 卷持续进入新
-                //   job"会让自适应控制器反复 reset learning。
-                //   Probing -> Blocked（probe 失败 / inconclusive）同样不推进。
+                // Only a real volume writability change advances the generation; register_job() catch-up notifications are Blocked too but are not a discontinuity.
                 if (transition.discontinuity) {
                     space_epoch_.fetch_add(1, std::memory_order_acq_rel);
                 }
                 if (transition.kind == Kind::Blocked) {
-                    // 点亮 monitor 的 sticky hint —— 这是"开始采样 blocked 卷"的唯一驱动点。
-                    // 未满盘过时 monitor 的 tick() 一个 registry 锁都不取（常态零开销）。
+                    // The only driver that starts sampling a blocked volume; without it a tick takes no registry lock.
                     space_monitor_->note_blocked();
                 }
                 break;
@@ -2010,9 +1906,7 @@ private:
 
     void controller_loop() noexcept {
         constexpr unsigned minimum_sample_interval_ms = 100;
-        // Upper bound on a parked sleep: reclamation has to keep running while the
-        // adaptive controller is idle, and a facility can appear from a worker
-        // thread that never touches this condition variable (§5.5).
+        // Upper bound on a parked sleep: a facility can appear from a worker thread that never touches this condition variable.
         constexpr auto parked_wait_cap = std::chrono::milliseconds(1000);
         unsigned next_interval_ms = native_sample_interval_ms();
         auto last_sample_at = std::chrono::steady_clock::now();
@@ -2023,14 +1917,7 @@ private:
             if (monitor_parked) {
                 auto parked_wait = parked_wait_cap;
 #ifdef _WIN32
-                // ★ sticky hint：一旦进程出现过 blocked 卷，parked 睡眠上限就降到
-                //   poll_interval。它**不是精确状态**（绝不能用 has_blocked_ +
-                //   note_ready() 那种写法：多卷场景下"A 恢复 → 清零 → 仍 Blocked 的
-                //   B 永远不再被 poll"）。它也绝不参与"要不要 poll 哪些 gate"——
-                //   那个决定每个 tick 都从 registry.blocked_volumes() 重新拉。
-                // ★ 常态零开销 + **恢复后停止开销**：monitor 只在有卷进入 Blocked 时
-                //   开始采样，并在"一次拉取返回空"（异常状态完全消除）后立刻停下。
-                //   因此这里用 sampling() 而不是"曾经满盘过"的 sticky 历史。
+                // Uses sampling() rather than an "ever blocked" sticky flag: membership is re-pulled from the registry every tick, so a flag could leave a still-blocked volume unpolled.
                 if (space_monitor_->sampling() &&
                     writer_config_.space_poll_interval > std::chrono::milliseconds::zero()) {
                     parked_wait = (std::min)(parked_wait, writer_config_.space_poll_interval);
@@ -2060,25 +1947,13 @@ private:
             }
             controller_recheck_ = false;
             const auto now = std::chrono::steady_clock::now();
-            // ★ 关键：**把 reap 和 space monitor 都移出 executor 的锁**。
-            //
-            //   reap_idle() 自己取 registry mutex_，不需要 executor mutex_
-            //   （顺带修掉一个既有的"持锁过久"问题）。
-            //
-            //   space_monitor_->tick() 会通过 blocked_volumes() 取 registry mutex_，
-            //   并可能执行一次很慢的 GetDiskFreeSpaceExW（离线 UNC / 坏盘可能卡几秒）。
-            //   若在 mutex_ 内调用，submit() / cancel() / admission 会被全部堵住；
-            //   锁序也会变成 executor → registry → gate，与 worker_loop 的
-            //   executor → registry 叠加后，任何 gate → executor 的回调都会死锁。
+            // reap and space monitor run outside the executor mutex_: taking it would invert the executor -> registry -> gate lock order against gate -> executor callbacks.
             wait_lock.unlock();
 #ifdef _WIN32
-            // Driven from this thread rather than a reaper thread of its own: the
-            // parked path above already wakes on the earliest reclaim deadline.
+            // Driven from this thread: the parked path above already wakes on the earliest reclaim deadline.
             for (const auto& volume : writer_registry_->reap_idle()) {
                 print_writer_facility_event("writer_facility_reaped", volume);
             }
-            // 采样器只在"进程曾经出现过 blocked 卷"之后才真正工作（sticky hint），
-            // 因此在没有磁盘满的正常运行中这一行几乎零成本。
             space_monitor_->tick(now);
 #endif
             wait_lock.lock();
@@ -2104,8 +1979,7 @@ private:
                 const double idle_seconds = std::chrono::duration<double>(
                     now - idle_since).count();
                 runtime_controller_.begin_activity(counters, idle_seconds);
-                // 刚从 parked 进入 active：begin_activity 已经 prime + reset 了
-                // 学习状态，因此把 generation 基线对齐，避免多触发一次无用 rebase。
+                // begin_activity already primed and reset the learning state, so align the generation baseline to avoid a redundant rebase.
                 last_seen_space_epoch_ = space_epoch_.load(std::memory_order_acquire);
                 monitor_parked = false;
                 last_sample_at = now - std::chrono::milliseconds(minimum_sample_interval_ms);
@@ -2159,11 +2033,7 @@ private:
                 writer_has_active_jobs = metrics.any_active_jobs;
             }
 #endif
-            // accepted == written is NOT an idle signal: a cancelled or failed
-            // buffer leaves a permanent gap that never closes.  The pending gauge
-            // is the correct byte-level source, but it can legitimately read zero
-            // between chunks or after a cancelled job abandoned its staging, so a
-            // writer is only idle when no job is registered either.
+            // accepted == written is not an idle signal (a cancelled buffer leaves a permanent gap) and the pending gauge can read zero between chunks, so a writer is idle only when no job is registered either.
             const bool writer_idle = pending_write_bytes == 0 && !writer_has_active_jobs;
             bool parked = false;
             sunpack::sevenzip::NativeRuntimeSnapshot parked_snapshot;
@@ -2193,12 +2063,7 @@ private:
                 if (stopping_) {
                     break;
                 }
-                // ★ 外部不连续（卷可写集合变化）后的重建：必须在 observe() **之前**。
-                //   last_seen_space_epoch_ 是**赋值**而不是自增，因此一个 tick 内
-                //   17 → 19 只会 rebase 一次（对"累加多次"天然幂等）。
-                //   rebase 必须带 current_counters：prime_counters() 是唯一更新
-                //   previous_counters_ 的地方，缺它则第一个新 baseline 的 delta
-                //   会跨越 discontinuity，学习仍被污染。
+                // Rebuild the learning baseline before observe(): rebase_after_external_discontinuity must carry the current counters.
                 const std::uint64_t space_epoch = space_epoch_.load(std::memory_order_acquire);
                 if (space_epoch != last_seen_space_epoch_) {
                     last_seen_space_epoch_ = space_epoch;
@@ -2227,19 +2092,13 @@ private:
         }
     }
 
-    // Fallback routing key when the request carried none.  Never share a fallback
-    // bucket: a job whose volume is unknown gets its own isolated facility rather
-    // than silently sharing another volume's writer (§2.3).
+    // Fallback routing key: an unknown volume gets its own isolated facility rather than sharing another volume's writer.
     static std::string synthetic_volume_key(const std::string& request) {
         const std::string job_id = json_string_field(request, "job_id", "");
         return job_id.empty() ? std::string("job:unidentified") : "job:" + job_id;
     }
 
-    // Bind the facility to the job so a cancel wakes only that volume's writer
-    // (§6.3).  Called before run_request, so the weak reference is valid for the
-    // whole extraction.  Assigning a strong pointer into the weak field does not
-    // extend the facility's lifetime: the lease held by worker_loop is the only
-    // owner, and it outlives every cancel() that can observe this binding.
+    // Binds the facility so a cancel wakes only that volume's writer; the lease held by worker_loop stays the only owner.
     void register_cancel_writer(
         const std::string& request,
         const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& writer
@@ -2291,11 +2150,7 @@ private:
             int code = -100;
             try {
                 if (job.metadata.requires_writer) {
-                    // The lease lives in an explicit scope so it is released before
-                    // the job is reported finished below.  That ordering gives the
-                    // invariant the controller and the reaper rely on:
-                    //   active_jobs_ == 0  =>  every finished job's lease is gone
-                    // (§6.4)
+                    // The lease is released before the job is reported finished, so active_jobs_ == 0 implies every finished job's lease is gone.
                     const std::string key = job.metadata.volume_key.empty()
                         ? synthetic_volume_key(job.request)
                         : job.metadata.volume_key;
@@ -2304,20 +2159,11 @@ private:
                         print_writer_facility_event("writer_facility_created", key);
                     }
                     register_cancel_writer(job.request, lease.writer_pointer());
-                    // ★ affected_jobs_ 的注册点在 **volume lease scope**，不是
-                    //   make_job / finish_job —— 根输出目录创建（满盘最常见的入口）
-                    //   发生在 make_job 之前，否则那次满盘会开启 episode 却通知 0 个 job，
-                    //   Python 看门狗会把"合法暂停"当成 no-progress 杀掉。
-                    //
-                    //   ⚠️ 必须声明在 lease **之后**：C++ 逆序析构保证
-                    //      registration 先于 lease 析构 → 注销发生在 lease 释放之前。
-                    //   job_id 此时已经可用（下面 job_finished 用的就是它）。
+                    // Registered inside the volume lease scope and declared after it: root output dir creation can fill the disk before make_job, and reverse destruction must deregister before the lease is released.
                     const std::string scope_job_id = json_string_field(job.request, "job_id", "");
                     sunpack::sevenzip::SpaceJobRegistration space_registration(lease, scope_job_id);
                     code = run_request(job.request, lease.writer_pointer(), job.cancel_token);
                 } else {
-                    // Dry runs write nothing: no facility, no writer threads, no
-                    // buffers and no volume readiness gate (§6.2).
                     code = run_request(job.request, nullptr, job.cancel_token);
                 }
             } catch (...) {
@@ -2356,25 +2202,13 @@ private:
 
     std::vector<std::thread> workers_;
     std::thread controller_thread_;
-    // Process-wide write meters and the per-volume facilities.  The meters are
-    // declared first so they outlive every writer: a reclaimed facility must never
-    // take the aggregate counters with it (§3.1).
-    //
-    // ★ 声明顺序即析构顺序的逆序，这三项的顺序是**有约束的**：
-    //     space_change_sink_ 捕获 this 并被 gate 长期持有
-    //       ⇒ 必须在 writer_registry_ **之前**声明（后析构）
-    //     writer_config_ 被 writer_registry_ 与 space_monitor_ 使用
-    //       ⇒ 必须在两者之前声明
-    //     space_monitor_ 的 BlockedProvider 捕获 this 并调用 writer_registry_
-    //       ⇒ 必须在 writer_registry_ **之后**声明（先析构）
+    // Declaration order is destruction order reversed: meters, sink and config outlive writer_registry_, and space_monitor_ holds writer_registry_ and is destroyed before it.
     sunpack::sevenzip::WriterMetersPtr writer_meters_;
     sunpack::sevenzip::VolumeSpaceChangeSink space_change_sink_;
     sunpack::sevenzip::AsyncWriterConfig writer_config_;
     sunpack::sevenzip::VolumeWriterRegistryPtr writer_registry_;
     std::unique_ptr<sunpack::sevenzip::VolumeSpaceMonitor> space_monitor_;
-    // throughput environment discontinuity generation：任何可能让吞吐比较失真的
-    // 空间状态变化都让它前进一次。controller 只问"自上次采样以来有没有发生过"，
-    // 不关心发生了一次还是三次（因此 controller 侧是**赋值**而不是自增）。
+    // Throughput-environment discontinuity generation: the controller only asks whether one happened since its last sample, so it assigns the value instead of accumulating.
     std::atomic<std::uint64_t> space_epoch_{0};
     std::uint64_t last_seen_space_epoch_ = 0;
     std::deque<Job> queue_;
@@ -2423,8 +2257,7 @@ int run_message(
     if (command == "shutdown") {
         return 0;
     }
-    // Native owns queued work. Keeping one future per accepted message would
-    // reintroduce a Python-independent caller-side queue in the worker main.
+    // Native owns queued work; keeping a future per message here would reintroduce a caller-side queue in the worker main.
     executor.submit(request);
     return 0;
 }
@@ -2471,14 +2304,10 @@ int main() {
         const bool shutdown = json_string_field(line, "worker_command", "") == "shutdown";
         const int code = run_message(line, executor);
         if (shutdown) {
-            // 显式 shutdown：取消所有尚未完成的 job（这也是打破"满盘暂停"闭环的
-            // 最小改动：满盘阻塞的 worker 必须先看到 terminal 条件才能被 join）。
             executor.stop();
             return code;
         }
     }
-    // stdin EOF：一次性调用（`echo request | worker.exe`）的正常结束。
-    // **排空**队列后再退出，不取消任何 job —— 与改动前逐字节一致。
     executor.stop(/*cancel_pending_jobs=*/false);
     return executor.had_job_failure() ? 1 : 0;
 }

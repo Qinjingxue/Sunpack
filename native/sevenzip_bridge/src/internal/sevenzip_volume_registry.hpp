@@ -101,14 +101,10 @@ namespace sunpack::sevenzip
 
         std::size_t reclaimed_count() const noexcept;
 
-        // 当前处于 Blocked / Probing 的卷。**快照式**：锁内拷贝 shared_ptr，
-        // 锁外返回，调用方在 registry mutex_ 之外使用返回值。
-        // 没有 dedup_key / facility_key / SpaceGroup / BlockedVolume 结构 ——
-        // 卷身份就是 VolumeState::key。
+        // 当前处于 Blocked / Probing 的卷；锁内只拷贝 shared_ptr，锁外返回。
         std::vector<VolumeStatePtr> blocked_volumes() const;
 
-        // 关停用：对所有 blocked gate 调用 wake_waiters()。
-        // **不改变任何 gate 状态**（没有 aborted_ 永久闩锁）。
+        // 关停用：唤醒所有等待者，不改变任何 gate 状态。
         void abort_all_space_gates() noexcept;
 
         void shutdown() noexcept;
@@ -127,10 +123,7 @@ namespace sunpack::sevenzip
 
         const WriterMetersPtr meters_;
         const AsyncWriterConfig config_;
-        // ★ ChangeSink 的唯一所有者链：
-        //     NativeJobExecutor → VolumeWriterRegistry(meters, config, sink)
-        //         → VolumeSpaceGate(volume_key, query_root_hint, sink)
-        //   gate 只在**新建 entry** 时创建并注入 sink；已有 entry 的 gate 绝不重设。
+        // gate 只在新建 entry 时创建并注入 sink；已有 entry 的 gate 不得重设。
         const VolumeSpaceChangeSink sink_;
         mutable std::mutex mutex_;
         std::unordered_map<std::string, Entry> entries_;
@@ -140,18 +133,7 @@ namespace sunpack::sevenzip
 
     using VolumeWriterRegistryPtr = std::shared_ptr<VolumeWriterRegistry>;
 
-    // ---------------------------------------------------------------------
-    // `affected_jobs_` 的注册点必须在 **volume lease scope**（§4.7.1 的 P0）。
-    //
-    // 早期设计把 register/unregister 放在 make_job() / finish_job()，而根输出目录
-    // 创建（archive_extract.cpp，满盘最常见的入口）发生在 make_job 之前 ——
-    // 那次满盘会开启 episode 并发出 space_blocked 给 **0 个 job**，Python 因此
-    // 不知道 job 正在合法暂停，看门狗仍按 no-progress 计时并把它杀掉。
-    //
-    // ⚠️ 声明顺序要求：必须写在 `auto lease = writer_registry_->acquire(key);`
-    //    **之后**，这样它**先于** lease 析构（C++ 逆序析构）—— 保证"注销发生在
-    //    lease 释放之前"，避免 gate 已被回收却仍在注销。
-    // ---------------------------------------------------------------------
+    // 必须在 volume lease 之后声明，才能先于 lease 析构：注销发生在 lease 释放之前。
     class SpaceJobRegistration final
     {
     public:

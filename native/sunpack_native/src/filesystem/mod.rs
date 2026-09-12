@@ -86,9 +86,7 @@ pub(crate) fn resolve_output_volume_key(path: &str) -> PyResult<Option<String>> 
     {
         return match windows::resolve_output_volume(Path::new(path)) {
             Ok(key) => Ok(Some(key)),
-            // An unresolvable volume is not an error: the caller falls back to a
-            // synthetic per-job key so the job still gets an isolated facility
-            // instead of silently sharing another volume's writer.
+            // Unresolvable volume: the caller falls back to a synthetic per-job key.
             Err(_) => Ok(None),
         };
     }

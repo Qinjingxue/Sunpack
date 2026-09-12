@@ -26,11 +26,8 @@ function(apply_release_optimizations target_name)
     endif()
 endfunction()
 
-# Every translation unit in this project is UTF-8: comments carry Chinese text and
-# the section sign (U+00A7).  Without /utf-8 MSVC decodes sources with the system code
-# page (936 on the development machines), which mojibakes the comments and — worse —
-# can swallow the following source character when a multi-byte sequence's trailing
-# byte is interpreted as a lead byte.  That turns documentation into syntax errors.
+# Sources are UTF-8; without /utf-8 MSVC decodes them with the system code page and
+# can fail to parse multi-byte sequences.
 function(apply_source_charset target_name)
     if(MSVC)
         target_compile_options(${target_name} PRIVATE /utf-8)
@@ -125,7 +122,6 @@ target_include_directories(sunpack_sevenzip_async_output
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
 
-# L1: VolumeSpaceGate 纯逻辑单测（无文件系统、无满盘）。
 add_executable(sunpack_sevenzip_space_gate
     tests/space_gate.cpp
 )

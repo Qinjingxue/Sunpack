@@ -221,9 +221,8 @@ class ExtractionBatchRunner:
             resolver = self._cached_output_dir_resolver(resolver)
             prepared = self._skip_tasks_inside_batch_outputs(tasks, resolver)
             if cleanup_scope is not None:
-                # Reference counts must exist before any task can finish, so a
-                # shared source path is never deleted while another task in this
-                # round still has to read it.
+                # Reference counts must exist before any task can finish, so a shared source path is
+                # never deleted while another task in this round still has to read it.
                 cleanup_scope.register(prepared)
             return resolver, prepared
 
@@ -252,9 +251,8 @@ class ExtractionBatchRunner:
             )
             output_dir = self.collect_result(task, outcome)
             if cleanup_scope is not None and output_dir:
-                # Source archives are cleaned as soon as this task's extract and
-                # verification are both finished, because verification reads the
-                # source archive back to build its manifest.
+                # Clean up as soon as extract and verification are both finished, because
+                # verification reads the source archive back to build its manifest.
                 await cleanup_scope.release_task(
                     task,
                     outcome_kind=outcome.outcome_kind,
@@ -270,8 +268,8 @@ class ExtractionBatchRunner:
             outcomes = await map_unbounded(prepared_tasks, execute_one)
         finally:
             if cleanup_scope is not None:
-                # Cancelled or otherwise unreported tasks still hold references;
-                # drop them so a round can never strand the table.
+                # Cancelled or otherwise unreported tasks still hold references; drop them so a
+                # round can never strand the table.
                 await cleanup_scope.sweep(broker=broker)
 
         output_dirs = []

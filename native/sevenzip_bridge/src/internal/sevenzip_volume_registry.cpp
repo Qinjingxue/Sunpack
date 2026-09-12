@@ -31,7 +31,6 @@ namespace sunpack::sevenzip
         registry_ = nullptr;
         if (registry != nullptr && writer_)
         {
-
             registry->release(writer_->volume_key());
         }
         writer_.reset();
@@ -55,7 +54,6 @@ namespace sunpack::sevenzip
             auto found = entries_.find(key);
             if (found == entries_.end())
             {
-
                 const bool persistent = !key.empty() && key.rfind("job:", 0) != 0;
                 Entry entry;
                 entry.state = make_volume_state(key, persistent);
@@ -63,17 +61,12 @@ namespace sunpack::sevenzip
             }
             Entry &entry = found->second;
 
-            // ★ gate 懒创建 + 只在这里注入 sink。已有 entry 的 gate 绝不重设
-            //   （persistent gate 的回调在 writer 回收 / 重建期间保持不变）。
-            //   ★ 只在**功能开启**时创建：space_gate_enabled = false 时
-            //     VolumeState::space_gate 必须保持 nullptr，让所有空间判定短路、
-            //     走完全现状的永久失败路径（§7.3）。这也是"每次 acquire() 零新增
-            //     开销"的保证（writer_construction_cost 是回归红线）。
-            //   空 key 的兜底 writer（无真实卷身份）同样不创建 gate。
+            // gate 懒创建且只在这里注入 sink，已有 entry 的 gate 绝不重设；
+            // 功能关闭或空 key 时必须保持 nullptr，让空间判定短路。
             if (!entry.state->space_gate && !key.empty() && config_.space_gate_enabled)
             {
                 // pending_bytes 是 gate 唯一拿不到的展示字段（gate 不认识 VolumeState，
-                // 依赖方向必须单向）。用 weak_ptr 在 sink 包装里补齐，**不能**捕获
+                // 依赖方向必须单向）。用 weak_ptr 在 sink 包装里补齐，不能捕获
                 // shared_ptr（VolumeState → gate → lambda → VolumeState = 泄漏）。
                 std::weak_ptr<VolumeState> weak_state = entry.state;
                 const VolumeSpaceChangeSink inner = sink_;
@@ -97,7 +90,6 @@ namespace sunpack::sevenzip
 
             if (!entry.writer)
             {
-
                 entry.writer = std::make_shared<AsyncFileWriter>(meters_, entry.state, config_);
                 created = true;
             }
@@ -131,14 +123,12 @@ namespace sunpack::sevenzip
                 entry.idle_since = std::chrono::steady_clock::now();
                 if (entry.state && entry.state->persistent)
                 {
-
                     entry.reap_deadline = config_.idle_timeout > std::chrono::milliseconds::zero()
                                               ? entry.idle_since + config_.idle_timeout
                                               : std::chrono::steady_clock::time_point{};
                 }
                 else
                 {
-
                     entry.reap_deadline = entry.idle_since;
                 }
             }
@@ -196,7 +186,6 @@ namespace sunpack::sevenzip
                 retired.push_back(std::move(entry.writer));
                 if (entry.state && entry.state->persistent)
                 {
-
                     entry.writer.reset();
                     entry.idle_since = std::chrono::steady_clock::time_point{};
                     entry.reap_deadline = std::chrono::steady_clock::time_point{};
@@ -204,7 +193,6 @@ namespace sunpack::sevenzip
                 }
                 else
                 {
-
                     it = entries_.erase(it);
                 }
                 ++reclaimed_count_;
@@ -268,8 +256,7 @@ namespace sunpack::sevenzip
             for (const auto &item : entries_)
             {
                 const VolumeStatePtr &state = item.second.state;
-                // 只做 shared_ptr 快照，**不在锁内调用 gate**（那会引入 registry → gate
-                // 之外的额外持锁时间；blocked() 自身要取 gate mutex_）。
+                // 锁内只取 shared_ptr 快照，绝不调用 gate（blocked() 自身要取 gate mutex_）。
                 if (state && state->space_gate)
                 {
                     blocked.push_back(state);
@@ -277,7 +264,7 @@ namespace sunpack::sevenzip
             }
         }
 
-        // 锁外过滤：锁序 registry → 释放 → gate，与 reap_idle() 同序。
+        // 锁外过滤，锁序 registry -> gate。
         blocked.erase(
             std::remove_if(blocked.begin(), blocked.end(),
                            [](const VolumeStatePtr &state)
@@ -288,9 +275,7 @@ namespace sunpack::sevenzip
 
     void VolumeWriterRegistry::abort_all_space_gates() noexcept
     {
-        // 关停路径：只唤醒，**不改变任何 gate 状态**。
-        // 被唤醒的 writer 用自己传入的 terminal predicate 决定去留；因为
-        // NativeJobExecutor::stop() 已经先把所有 cancel_token 置真，谓词此刻为真。
+        // 关停路径：只唤醒被 blocked 的 gate，不改变任何 gate 状态。
         for (const auto &state : blocked_volumes())
         {
             state->space_gate->wake_waiters();

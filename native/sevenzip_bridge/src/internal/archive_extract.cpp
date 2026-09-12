@@ -185,9 +185,8 @@ namespace sunpack::sevenzip
             unsigned int count = 0;
             for (const auto &item : trace.items)
             {
-                // A later successful item cannot retroactively prove that the password
-                // was correct when an earlier encrypted item already failed.  Only CRC
-                // matches completed before the first item failure are usable evidence.
+                // A later success cannot prove the password was right after an earlier failure:
+                // only CRC matches completed before the first failing item count as evidence.
                 if (item.failed || item.operation_result != kOpOk)
                 {
                     break;
@@ -269,15 +268,8 @@ namespace sunpack::sevenzip
 
         if (!dry_run)
         {
-            // ★ P0：根输出目录创建是"输出目录所在盘满"的**最常见入口**。
-            //   它在 ExtractToDiskCallback 被构造之前发生，因此早期实现会在 gate
-            //   存在之前直接以 output_filesystem 失败返回 —— 「输出盘满 → 自动暂停」
-            //   根本不成立。
-            //
-            //   修法（§3.11）：**不搬动位置**（搬动会把上一轮刚删掉的 job 生命周期
-            //   问题带回来），直接从已经存在的 shared_writer 取 gate。
-            //   shared_writer 在 run_request 里就由 writer_registry_->acquire(key)
-            //   拿到，因此这里必然已经存在。
+            // The space gate must come from the already existing shared_writer: this runs
+            // before ExtractToDiskCallback exists, and the writer is the only gate source.
             VolumeSpaceGate *space_gate = nullptr;
 #ifdef _WIN32
             if (shared_writer)
@@ -313,9 +305,8 @@ namespace sunpack::sevenzip
 
                 set_failure(result, "output_prepare", "output_filesystem");
 
-                // ★ 旧代码用 catch(...) 把真实的 std::error_code 整个丢掉了。
-                //   现在把原始信息走**既有**的 trace 通道带出去
-                //   （不新增公共结构字段），让上层能区分"空间不足"与"路径不可用"。
+                // Forward the raw std::error_code through the existing trace channel so the
+                // caller can tell "no space" apart from "path unusable".
                 result.output_trace.last_win32_error = prepare_error.value();
                 result.output_trace.last_hresult =
                     static_cast<int>(HRESULT_FROM_WIN32(static_cast<DWORD>(prepare_error.value())));
@@ -505,10 +496,8 @@ namespace sunpack::sevenzip
 
             hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.get());
 
-            // ISequentialOutStream::Write consumes buffers into a bounded async
-            // writer. Do not publish extraction success until every queued file
-            // write and close has completed and any delayed filesystem error has
-            // been folded back into the callback result.
+            // Extraction success must not be published before every queued write and close
+            // has finished and any delayed filesystem error has been folded back in.
             raw_extract_callback->finalize_output();
 
             last_hr = hr;

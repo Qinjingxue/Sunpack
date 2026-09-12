@@ -1,20 +1,7 @@
-// L2：writer 重试 + 记账不变量单测（注入式失败）。
+// writer 重试 + 记账不变量单测（注入式失败）。
 //
-// 用例编号与《SunPack Worker 磁盘空间不足自动暂停与恢复实现文档.md》§10.3 的
-// R-1..R-20 对应。本阶段（Phase 1 / PR-2）覆盖 Data 路径的全部用例；
-// R-9（flush 满盘）与 R-10（目录创建 + memo 不投毒）需要 Phase 4 的骨架接入，
-// R-11b（Open / Flush 的 flag-off 边界）需要 Phase 4，R-11c 需要 Phase 4，
-// 它们在对应阶段补齐（见文件末尾的说明）。
-//
-// 测试策略：C++ 单测无法制造真实的 ERROR_DISK_FULL，因此用**注入式失败**把
-// "真实系统调用"这一步替换掉，其余代码路径（重试骨架、gate 状态机、probe 结算、
-// 记账收尾）全部是真实的：
-//   * 缝隙 D（writer.set_write_fault_for_test）—— WriteFile 故障注入。
-//   * 缝隙 A/B（failure_classifier / CreateFileW 探针）—— 见头文件说明。
-//
-// 驱动 gate 的方式：给 VolumeState 挂一个 **resolved 不了查询路径**的 gate
-// （随机 volume GUID 作为 failed_path），于是 watermark_valid_ == false，
-// 第一次 poll(x) 就会建立 baseline 并发放一个 probe 许可 —— 完全确定，无需满盘。
+// C++ 单测无法制造真实的 ERROR_DISK_FULL，因此用注入式失败替换掉真实系统调用，
+// 其余代码路径（重试骨架、gate 状态机、probe 结算、记账收尾）全部是真实的。
 
 #include "internal/sevenzip_async_output.hpp"
 #include "internal/sevenzip_callbacks.hpp"
@@ -78,7 +65,7 @@ std::filesystem::path make_test_directory() {
     return directory;
 }
 
-// "没有可用的失败路径"：让新鲜查询确定性地失败。resolved 卷忽略这个参数。
+// 空 failed_path：让新鲜查询确定性地失败。resolved 卷忽略这个参数。
 std::wstring_view unresolved_failed_path() {
     return std::wstring_view{};
 }
@@ -119,10 +106,8 @@ struct SinkLog {
     }
 };
 
-// 模拟"用户释放了足够空间"：用**真实**可用空间 + 1 GiB 明确越过水位。
-// ⚠️ 不能用一个小常量（如 1）：gate 的初始水位来自一次真实的新鲜查询
-//    （writer 侧 report_space_failure 传的是真实失败路径，因此查询会成功），
-//    一个小于真实可用空间的采样值不会越过水位，许可就永远发不出来。
+// 模拟"用户释放了足够空间"：用真实可用空间 + 1 GiB 明确越过水位；小的常量采样值
+// 不会越过水位，许可就永远发不出来。
 bool release_permit(const std::shared_ptr<VolumeSpaceGate> &gate) {
     std::uint64_t free_now = 0;
     std::uint64_t total = 0;
@@ -148,12 +133,6 @@ std::vector<unsigned char> make_payload(std::size_t size) {
 }
 
 // 每个用例的公共脚手架：一个挂了 gate 的 VolumeState + 一个 writer。
-//
-// query_root_hint 用**真实的临时目录**，于是：
-//   * 构造时 query_root_resolved_ == true；
-//   * Ready→Blocked 的新鲜查询**确定性地成功**，watermark = 该卷真实可用空间；
-//   * 恢复时用 poll(当前可用 + 1 GiB) 明确越过水位 —— 完全确定，不依赖任何
-//     "解析不出卷根"的偶然行为。
 struct Harness {
     explicit Harness(const std::filesystem::path &query_root,
                      std::size_t threads = 1,
@@ -219,14 +198,12 @@ std::vector<unsigned char> read_file(const std::filesystem::path &path) {
                                       std::istreambuf_iterator<char>());
 }
 
-// ---------------------------------------------------------------------------
 // R-1/R-2/R-3/R-5/R-6/R-20：一次完整的"满盘 → 暂停 → 恢复 → 数据完整"循环
-// ---------------------------------------------------------------------------
 void r1_to_r6_and_r20_pause_and_resume(const std::filesystem::path &directory) {
     Harness harness(directory, 2, 8);
     auto &writer = *harness.writer;
 
-    // 缝隙 B：统计 CreateFileW 调用次数（"同 handle 续写"的回归防线）。
+    // 统计 CreateFileW 调用次数（"同 handle 续写"的回归防线）。
     std::atomic<int> open_calls{0};
     writer.set_open_probe_for_test([&open_calls](const std::wstring &) { open_calls.fetch_add(1); });
 
@@ -248,8 +225,7 @@ void r1_to_r6_and_r20_pause_and_resume(const std::filesystem::path &directory) {
 
     check(wait_until([&] { return harness.gate->blocked(); }, 5s),
           "R-1: 空间错误必须让卷进入暂停（而不是 job 永久失败）");
-    // ⚠️ 事件是在 gate 锁**释放之后**才回调 sink 的（锁序要求），因此"进入暂停"与
-    //    "事件已送达"是两个时刻。断言事件计数前必须再等一下。
+    // 事件是在 gate 锁释放之后才回调 sink 的（锁序要求）：断言事件计数前必须再等一下。
     check(wait_until([&] { return harness.log->count(VolumeSpaceTransition::Kind::Blocked) >= 1; },
                      5s),
           "R-1: space_blocked 必须在暂停后送达");
@@ -308,9 +284,7 @@ void r1_to_r6_and_r20_pause_and_resume(const std::filesystem::path &directory) {
           "R-20: 恢复必须只产生一条 space_resumed");
 }
 
-// ---------------------------------------------------------------------------
 // R-4 producer 反压成立
-// ---------------------------------------------------------------------------
 void r4_producer_backpressure(const std::filesystem::path &directory) {
     Harness harness(directory, 1, 8);
     auto &writer = *harness.writer;
@@ -360,9 +334,7 @@ void r4_producer_backpressure(const std::filesystem::path &directory) {
     check(read_file(path) == payload, "R-4: 数据必须逐字节完整");
 }
 
-// ---------------------------------------------------------------------------
 // R-7 取消穿透
-// ---------------------------------------------------------------------------
 void r7_cancel_pierces_pause(const std::filesystem::path &directory) {
     Harness harness(directory, 1, 8);
     auto &writer = *harness.writer;
@@ -394,9 +366,7 @@ void r7_cancel_pierces_pause(const std::filesystem::path &directory) {
           "R-7: 取消后必须保持 accepted == written + discarded");
 }
 
-// ---------------------------------------------------------------------------
-// R-8 `finish()` 可关停（暂停期间）
-// ---------------------------------------------------------------------------
+// R-8 finish() 可关停（暂停期间）
 void r8_finish_while_paused(const std::filesystem::path &directory) {
     Harness harness(directory, 1, 8);
     auto &writer = *harness.writer;
@@ -417,16 +387,14 @@ void r8_finish_while_paused(const std::filesystem::path &directory) {
     const auto elapsed = std::chrono::steady_clock::now() - started;
     check(elapsed < 1s, "R-8: 暂停期间 finish() 必须能在 1s 内返回");
 
-    // 关停**不得**改变 gate 状态（没有 aborted_ 永久闩锁）。
+    // 关停不得改变 gate 状态（没有 aborted_ 永久闩锁）。
     check(harness.gate->phase() != VolumeSpacePhase::Ready,
           "R-8: finish() 只唤醒，绝不能把 gate 伪造成 Ready");
     check(harness.log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
           "R-8: finish() 不得发出 space_resumed");
 }
 
-// ---------------------------------------------------------------------------
-// R-11a 开关关闭 —— Data 路径（§4.5.0）
-// ---------------------------------------------------------------------------
+// R-11a 开关关闭 —— Data 路径
 void r11a_flag_off_data_legacy_semantics(const std::filesystem::path &directory) {
     // gate == nullptr：功能关闭 / 无卷身份。
     AsyncWriterConfig config;
@@ -453,7 +421,7 @@ void r11a_flag_off_data_legacy_semantics(const std::filesystem::path &directory)
     check(wait_until([&] { return writer.snapshot_file(file).failed; }, 5s),
           "R-11a: 关闭开关时空间错误必须走旧的永久失败路径");
 
-    // ★ 四条旧副作用逐条断言（只断言"job 最终失败"是不够的）。
+    // 四条旧副作用逐条断言（只断言"job 最终失败"是不够的）。
     const auto snapshot = writer.snapshot_file(file);
     check(snapshot.failed, "R-11a: 副作用 1 —— file->failed 必须置位");
     check(snapshot.win32_error == ERROR_DISK_FULL,
@@ -479,9 +447,7 @@ void r11a_flag_off_data_legacy_semantics(const std::filesystem::path &directory)
     check(writer.volume_state()->space_gate == nullptr, "R-11a: 不得创建 gate");
 }
 
-// ---------------------------------------------------------------------------
 // R-13 关停不被暂停卡住（含 abort_all_space_gates）
-// ---------------------------------------------------------------------------
 void r13_abort_then_finish(const std::filesystem::path &directory) {
     AsyncWriterConfig config;
     config.threads_per_volume = 1;
@@ -512,7 +478,7 @@ void r13_abort_then_finish(const std::filesystem::path &directory) {
     check(wait_until([&] { return gate->blocked(); }, 5s), "R-13: 必须进入暂停");
     check(!registry->blocked_volumes().empty(), "R-13: blocked_volumes() 必须包含该卷");
 
-    // abort 只是 wake_waiters() 的广播：**不改变任何 gate 状态**。
+    // abort 只是 wake_waiters() 的广播：不改变任何 gate 状态。
     const auto before = gate->episode_id();
     registry->abort_all_space_gates();
     check(gate->blocked(), "R-13: abort 不得把 gate 伪造成 Ready");
@@ -527,9 +493,7 @@ void r13_abort_then_finish(const std::filesystem::path &directory) {
     registry->shutdown();
 }
 
-// ---------------------------------------------------------------------------
-// R-14 终态补记 discarded（架构师第 5 条）
-// ---------------------------------------------------------------------------
+// R-14 终态补记 discarded
 void r14_terminal_records_discarded(const std::filesystem::path &directory) {
     Harness harness(directory, 1, 8);
     auto &writer = *harness.writer;
@@ -562,9 +526,7 @@ void r14_terminal_records_discarded(const std::filesystem::path &directory) {
           "R-14: 必须保持 accepted == written + discarded");
 }
 
-// ---------------------------------------------------------------------------
-// R-15 事件注册/注销（§4.7.1）
-// ---------------------------------------------------------------------------
+// R-15 事件注册/注销
 void r15_space_job_registration(const std::filesystem::path &directory) {
     (void)directory;
     AsyncWriterConfig config;
@@ -579,7 +541,7 @@ void r15_space_job_registration(const std::filesystem::path &directory) {
     check(static_cast<bool>(gate), "R-15: 必须有 gate");
 
     {
-        // ⚠️ 声明在 lease 之后 ⇒ 先于 lease 析构。
+        // 声明在 lease 之后 ⇒ 先于 lease 析构。
         SpaceJobRegistration registration(lease, "J");
         check(registration.registered(), "R-15: guard 必须已注册");
         const auto ids = gate->affected_job_ids();
@@ -597,9 +559,7 @@ void r15_space_job_registration(const std::filesystem::path &directory) {
     registry.shutdown();
 }
 
-// ---------------------------------------------------------------------------
-// R-16 writer 回收不毒死 gate（R6）
-// ---------------------------------------------------------------------------
+// R-16 writer 回收不毒死 gate
 void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directory) {
     AsyncWriterConfig config;
     config.threads_per_volume = 1;
@@ -643,7 +603,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
     check(reclaimed.size() == 1, "R-16: 空闲 facility 必须被回收");
     check(registry->volume_keys().size() == 1, "R-16: persistent 卷状态必须存活");
 
-    // 重建 writer 后必须仍能正常等待与恢复（旧设计会永久毒死 gate）。
+    // 重建 writer 后必须仍能正常等待与恢复。
     {
         auto lease = registry->acquire(key);
         check(lease.created_facility(), "R-16: 必须重建 facility");
@@ -686,9 +646,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
     registry->shutdown();
 }
 
-// ---------------------------------------------------------------------------
-// R-17 open 并发不误判（架构师第 6 条）
-// ---------------------------------------------------------------------------
+// R-17 open 并发不误判
 void r17_concurrent_open_is_serialized(const std::filesystem::path &directory) {
     Harness harness(directory, 4, 8);
     auto &writer = *harness.writer;
@@ -718,9 +676,7 @@ void r17_concurrent_open_is_serialized(const std::filesystem::path &directory) {
     check(read_file(path) == payload, "R-17: 数据必须完整");
 }
 
-// ---------------------------------------------------------------------------
-// R-18 PermanentFailure 也补记 discarded（架构师第 9 条）
-// ---------------------------------------------------------------------------
+// R-18 PermanentFailure 也补记 discarded
 void r18_permanent_failure_records_discarded(const std::filesystem::path &directory) {
     Harness harness(directory, 1, 8);
     auto &writer = *harness.writer;
@@ -754,9 +710,7 @@ void r18_permanent_failure_records_discarded(const std::filesystem::path &direct
           "R-18: 非空间错误绝不能伪造成 space_resumed");
 }
 
-// ---------------------------------------------------------------------------
 // R-19 每个 dequeue buffer 恰好记一次（四种返回路径）
-// ---------------------------------------------------------------------------
 void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) {
     // ① Succeeded → 增量 0
     {
@@ -829,9 +783,7 @@ void r19_exactly_one_discard_per_buffer(const std::filesystem::path &directory) 
     }
 }
 
-// ---------------------------------------------------------------------------
 // R-9 close 阶段空间错误（write_through 的 flush 走同一骨架）
-// ---------------------------------------------------------------------------
 void r9_flush_space_error(const std::filesystem::path &directory) {
     Harness harness(directory, 1, 8, /*write_through=*/true);
     auto &writer = *harness.writer;
@@ -871,14 +823,12 @@ void r9_flush_space_error(const std::filesystem::path &directory) {
           "R-9: 恢复必须产生一条 space_resumed");
 }
 
-// ---------------------------------------------------------------------------
 // R-10 目录创建重试 + memo 不投毒
-// ---------------------------------------------------------------------------
 void r10_directory_retry_and_memo(const std::filesystem::path &directory) {
     using sunpack::sevenzip::create_directories_with_space_gate;
     using sunpack::sevenzip::set_directory_failure_classifier_for_test;
 
-    // ① 非空间类失败：必须原样透传**真实**错误码（不是 E_FAIL，也不是 PATH_NOT_FOUND）。
+    // ① 非空间类失败：必须原样透传真实错误码（不是 E_FAIL，也不是 PATH_NOT_FOUND）。
     const auto blocked_path = directory / L"r10-blocked-dir";
     {
         std::ofstream blocker(blocked_path, std::ios::binary);
@@ -965,12 +915,9 @@ void r10_directory_retry_and_memo(const std::filesystem::path &directory) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// R-11b 开关关闭 —— Open / Flush 路径（§4.5.0.1）
-// ---------------------------------------------------------------------------
+// R-11b 开关关闭 —— Open / Flush 路径
 void r11b_flag_off_open_and_flush(const std::filesystem::path &directory) {
-    // ① Open 的空间类错误：旧语义 = 标记 file/job 失败 + **置 open_attempted**
-    //    （"不再尝试"），并且只尝试一次。
+    // ① Open 的空间类错误：标记 file/job 失败 + 置 open_attempted，并且只尝试一次。
     {
         AsyncWriterConfig config;
         config.threads_per_volume = 1;
@@ -1013,7 +960,7 @@ void r11b_flag_off_open_and_flush(const std::filesystem::path &directory) {
     }
 
     // ② Flush 的空间类错误（write_through）：record_failure(file, hr, err, 0) 的副作用，
-    //    且 discarded **不由该路径增长**。
+    //    且 discarded 不由该路径增长。
     {
         AsyncWriterConfig config;
         config.threads_per_volume = 1;
@@ -1050,13 +997,11 @@ void r11b_flag_off_open_and_flush(const std::filesystem::path &directory) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// R-11c 开关关闭 —— Directory 路径（§4.5.0.1）
-// ---------------------------------------------------------------------------
+// R-11c 开关关闭 —— Directory 路径
 void r11c_flag_off_directory(const std::filesystem::path &directory) {
     using sunpack::sevenzip::create_directories_with_space_gate;
 
-    // gate == nullptr 时：只尝试一次，原样返回**原始** std::error_code，绝不重试。
+    // gate == nullptr 时：只尝试一次，原样返回原始 std::error_code，绝不重试。
     const auto blocked_path = directory / L"r11c-blocked-dir";
     {
         std::ofstream blocker(blocked_path, std::ios::binary);
@@ -1078,7 +1023,7 @@ void r11c_flag_off_directory(const std::filesystem::path &directory) {
     check(!std::filesystem::is_directory(blocked_path),
           "R-11c: 失败时不得创建出目录");
 
-    // Terminal：有 gate 且谓词为真时必须放弃，且**不能**把 0 当成"成功"的错误码。
+    // Terminal：有 gate 且谓词为真时必须放弃，且不能把 0 当成"成功"的错误码。
     // （gate == nullptr 时骨架按定义只尝试一次、不求值谓词 —— 见 error_code_contract 的
     // 四态语义断言。）
     auto terminal_gate = std::make_shared<VolumeSpaceGate>(
@@ -1095,14 +1040,12 @@ void r11c_flag_off_directory(const std::filesystem::path &directory) {
           "R-11c: Terminal 时绝不能真的去创建目录");
 }
 
-// ---------------------------------------------------------------------------
-// R-21 open 空间错误可重试（Phase 2 / PR-8；文档用例表止于 R-20）
-// ---------------------------------------------------------------------------
+// R-21 open 空间错误可重试
 void r21_open_space_error_is_retryable(const std::filesystem::path &directory) {
     Harness harness(directory, 1, 8);
     auto &writer = *harness.writer;
 
-    // 缝隙 A + 真实错误码：把 ERROR_FILE_EXISTS(80) 谎报成空间类。
+    // 注入分类器 + 真实错误码：把 ERROR_FILE_EXISTS(80) 谎报成空间类。
     // 目标位置上先放一个普通文件 → CreateFileW(CREATE_NEW) 必然失败。
     writer.set_failure_classifier_for_test(
         [](unsigned long error)
@@ -1133,7 +1076,7 @@ void r21_open_space_error_is_retryable(const std::filesystem::path &directory) {
     check(writer.current_error(job) == S_OK, "R-21: 暂停期间 job 不得被标记失败");
     check(harness.log->count(VolumeSpaceTransition::Kind::Blocked) >= 1,
           "R-21: 必须开启一个 episode");
-    // gate 记录的必须是**原始码**（80），不是被替换过的 112。
+    // gate 记录的必须是原始码（80），不是被替换过的 112。
     const auto transitions = harness.log->snapshot();
     check(!transitions.empty() && transitions.front().win32_error == ERROR_FILE_EXISTS,
           "R-21: 事件必须携带分类器看到的原始码（80，而不是 112）");
@@ -1148,20 +1091,10 @@ void r21_open_space_error_is_retryable(const std::filesystem::path &directory) {
     check(read_file(path) == payload, "R-21: 数据必须完整");
 }
 
-// ---------------------------------------------------------------------------
 // R-22 同一 buffer 内"部分成功 → 空间失败 → 恢复后必须从中间续写"
-// ---------------------------------------------------------------------------
 void r22_partial_write_then_space_failure(const std::filesystem::path &directory) {
-    // ★ 这是 `transferred` 必须跨 retry 保留的**唯一**确定性防线。
-    //
-    //   真实的 NTFS 满盘报的是 `bytesTransferred = 0` 的整请求失败，因此真实 VHD
-    //   测试**永远走不到**这条路径。这里用缝隙 D3 把单次 WriteFile 限制成 256 KiB，
-    //   强制产生"部分成功 + 随后空间失败"的组合。
-    //
-    //   若 attempt_data_write() 在入口重置 transferred：
-    //     * 已落盘的 256 KiB 会从 offset 0 被再写一遍 → add_written_bytes 二次记账
-    //       ⇒ written > accepted；
-    //     * pending 被重复 release ⇒ accepted == written + discarded + pending 破裂。
+    // 把单次 WriteFile 限制成 256 KiB，强制产生"部分成功 + 随后空间失败"的组合：
+    // 真实的 NTFS 满盘报的是整请求失败，走不到这条路径。
     Harness harness(directory, 1, 8);
     auto &writer = *harness.writer;
 
@@ -1184,7 +1117,7 @@ void r22_partial_write_then_space_failure(const std::filesystem::path &directory
     check(wait_until([&] { return harness.gate->blocked(); }, 5s),
           "R-22: 部分成功后的空间失败必须让卷进入暂停");
 
-    // 暂停期间：已确认落盘的前缀必须**恰好**被记账一次。
+    // 暂停期间：已确认落盘的前缀必须恰好被记账一次。
     const auto paused = writer.snapshot_metrics();
     check(paused.written_bytes == kChunk,
           "R-22: 暂停期间 written 必须等于已确认落盘的前缀（256 KiB）");
@@ -1214,16 +1147,10 @@ void r22_partial_write_then_space_failure(const std::filesystem::path &directory
           "R-22: 输出必须逐字节等于 payload（续写不得丢数据、不得错位）");
 }
 
-// ---------------------------------------------------------------------------
-// R-23 正常路径**从不进入 gate**（架构师第十二轮 P1：异常驱动的冷路径）
-// ---------------------------------------------------------------------------
+// R-23 正常路径从不进入 gate
 void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) {
-    // ① 干净卷：多 buffer 的正常写入**一次都不能调用 wait()**。
-    //
-    //   这是"没有满盘时这个功能不存在"的**结构性**证明，而不是性能承诺：
-    //   骨架先做真实 WriteFile，只有真的 SpaceFailure 才会走到 gate；因此
-    //   gate 快路径（取 mutex / shared_ptr 引用计数 / 构造终态谓词）在正常路径上
-    //   根本不存在。若有人把 wait() 挪回 attempt 之前，这个计数立刻变成非 0。
+    // ① 干净卷：多 buffer 的正常写入一次都不能调用 wait() —— 骨架先做真实 WriteFile，
+    //    只有真的 SpaceFailure 才会走到 gate。
     {
         constexpr std::size_t kPayload = 4 * kMib; // 4 个 buffer → 多次真实 WriteFile
         const auto payload = make_payload(kPayload);
@@ -1238,8 +1165,8 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
                            &processed) == S_OK &&
                   processed == payload.size(),
               "R-23: ① 写入必须全部被接受");
-        // ⚠️ 必须先 close_file 再 finish_job：pending_jobs 是在 close_file 里递增的，
-        //    漏掉它 finish_job 会立刻返回（还没 drain），内容比对必然失败。
+        // 必须先 close_file 再 finish_job：pending_jobs 是在 close_file 里递增的，
+        // 漏掉它 finish_job 会立刻返回（还没 drain），内容比对必然失败。
         writer.record_operation_result(file, 0);
         writer.close_file(file, 0, false, {});
         check(writer.finish_job(job) == S_OK, "R-23: ① 干净写入必须成功");
@@ -1321,9 +1248,6 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Phase 6c 默认开启验收（R22："默认值忘改 → 功能永不生效"的唯一防线）
-// ---------------------------------------------------------------------------
 void phase_6c_default_enabled() {
     constexpr const wchar_t *kName = L"SUNPACK_VOLUME_SPACE_GATE";
     wchar_t saved[16]{};
@@ -1336,7 +1260,7 @@ void phase_6c_default_enabled() {
     check(defaulted.space_gate_enabled,
           "Phase 6c: 未设置 SUNPACK_VOLUME_SPACE_GATE 时 space_gate_enabled 必须为 true");
 
-    // ② 一键回退路径必须仍然有效（§7.3：关闭时逐语义回到改动前）。
+    // ② 一键回退路径必须仍然有效（关闭时逐语义回到改动前）。
     SetEnvironmentVariableW(kName, L"0");
     check(!sunpack::sevenzip::configured_async_writer_config().space_gate_enabled,
           "Phase 6c: SUNPACK_VOLUME_SPACE_GATE=0 必须能关掉");
@@ -1363,9 +1287,7 @@ void phase_6c_default_enabled() {
           "Phase 6c: space_status_report_interval 默认值必须在 [1000, 600000] ms 内");
 }
 
-// ---------------------------------------------------------------------------
-// [附加] 错误码契约回归防线（§4.1）
-// ---------------------------------------------------------------------------
+// [附加] 错误码契约回归防线
 void error_code_contract() {
     using sunpack::sevenzip::is_space_exhaustion_error;
     check(is_space_exhaustion_error(112UL), "契约: ERROR_DISK_FULL(112) 必须是空间错误");
@@ -1391,8 +1313,8 @@ void error_code_contract() {
 
     // 骨架的四态语义（gate == nullptr 时 SpaceFailure 必须原样外泄）。
     //
-    // ★ 注意"先尝试、后求值谓词"：契约用例里的谓词工厂**不得**被调用
-    //   （gate == nullptr 时骨架连 SpaceFailure 之后的冷路径都不进）。
+    // 注意"先尝试、后求值谓词"：契约用例里的谓词工厂不得被调用
+    // （gate == nullptr 时骨架连 SpaceFailure 之后的冷路径都不进）。
     std::atomic<int> factory_calls{0};
     AttemptResult straight = sunpack::sevenzip::retry_with_space_gate(
         nullptr,

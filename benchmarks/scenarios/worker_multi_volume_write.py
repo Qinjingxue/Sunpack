@@ -1,23 +1,3 @@
-"""Verify per-volume writer scheduling on two real physical disks.
-
-The scenario measures the same worker executable under three conditions:
-
-1. solo: each target volume extracts one job alone;
-2. both: a single worker process runs one job per volume concurrently;
-3. both-reversed: the same pair submitted in the opposite order.
-
-Acceptance follows ``docs/sevenzip_worker_per_volume_write.zh.md`` §9.3:
-
-* aggregate throughput >= 0.90 x (solo_C + solo_D)   (hard fail below 0.80);
-* each volume keeps >= 0.85 x its own solo throughput;
-* solo throughput >= 0.90 x the volume's measured sequential write capability;
-* a single worker reports at least 2 concurrent jobs during the pair phase;
-* the two jobs' active windows overlap by >= 90% of the shorter job.
-
-Unrelated volumes needed for capacity isolation: if the two targets resolve to
-the same PhysicalDisk the scenario skips with an explicit reason instead of
-producing a misleading result.
-"""
 from __future__ import annotations
 
 import argparse
@@ -52,21 +32,17 @@ from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worke
 
 SCENARIO = "extraction.worker-multi-volume-write"
 
-# §9.3 thresholds.  These are hard gates, not diagnostics.
+# Hard gates, not diagnostics.
 AGGREGATE_FLOOR = 0.90          # of (solo_C + solo_D)
 AGGREGATE_HARD_FAIL = 0.80      # below this the disks are not actually additive
 PER_VOLUME_FLOOR = 0.85         # of that volume's own solo throughput
 OVERLAP_FLOOR = 0.90            # of the shorter job's active window
 MIN_CONCURRENT_JOBS = 2
-# Measured on this machine: the extraction pipeline saturates around 1.5x one job
-# when the payload is cache resident, so a same-disk control can match a genuine
-# cross-disk run.  A payload large enough to be I/O bound makes the two differ by
-# roughly 1.5x here; the gate sits between the two regimes.
+# Cross-disk must beat the same-disk control by this factor to count as additive.
 CROSS_VS_SAME_DISK_FLOOR = 1.15
-# Sanity floor only: the raw probe writes 8 MiB blocks with no decode, no CRC and
-# no staging copies, so extraction legitimately lands below it (measured ~0.84 on
-# both NVMe volumes before this refactor).  A collapse below this means the
-# extraction pipeline itself broke, not that the disks are slow.
+# Sanity floor only: the raw probe has no decode, CRC or staging copies, so
+# extraction legitimately lands below it; a collapse below this means the
+# extraction pipeline itself broke.
 SOLO_CAPABILITY_SANITY = 0.50
 
 _TOPOLOGY_SCRIPT = r"""
@@ -135,7 +111,7 @@ def _mad(values: list[float]) -> float:
 
 
 def _noise_floor(values: list[float]) -> float:
-    """3 x MAD is the §9.2 noise estimate; 0.0 means "not measured"."""
+    """3 x MAD noise estimate; 0.0 means "not measured"."""
     if len(values) < 3:
         return 0.0
     return 3.0 * _mad(values)
@@ -274,11 +250,8 @@ def _job_payload(
     output_dir: Path,
     dll_path: Path,
 ) -> str:
-    # The routing key must be resolved the same way production does, from the
-    # normalized output path.  Omitting it makes the worker fall back to a
-    # synthetic `job:<id>` key, which gives every job its own facility no matter
-    # which volume it writes to -- so the scenario would pass without ever
-    # exercising per-volume routing.
+    # Resolve the routing key from the normalized output path as production does;
+    # omitting it falls back to `job:<id>` and the scenario stops testing routing.
     normalized = normalized_output_dir(str(output_dir))
     volume_key = resolve_output_volume_key(normalized) or f"job:{job_id}"
     return json.dumps(
@@ -366,10 +339,7 @@ def _run_phase(
         worker.close()
 
     phase_seconds = max(1e-6, (phase_finished - phase_started) / 1_000_000_000.0)
-    # Peak-concurrency window: from the first job starting to the last one
-    # finishing.  The submission-to-completion window also contains this harness's
-    # own per-job overhead, which would understate the concurrent throughput the
-    # comparison is about.
+    # Peak-concurrency window: first job start to last job finish.
     starts = [run.started_ns for run in runs if run.started_ns]
     ends = [run.finished_ns for run in runs if run.finished_ns]
     if starts and ends and min(ends) > max(starts):
@@ -448,7 +418,7 @@ def _evaluate(
     mode: str,
     same_disk: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Apply the §9.3 gates and return a structured verdict."""
+    """Apply the acceptance gates and return a structured verdict."""
     checks: list[dict[str, Any]] = []
     solo_throughput = {drive: _median(item["values"]) for drive, item in solo.items()}
     drives = sorted(solo_throughput)
@@ -563,8 +533,7 @@ def _evaluate(
 
     noise = {drive: _noise_floor(solo[drive]["values"]) for drive in drives}
 
-    # Same-disk control: the direct proof that the per-volume layout is doing real
-    # work, independent of the extraction pipeline's own parallel ceiling.
+    # Same-disk control: proof the per-volume layout works, independent of the pipeline ceiling.
     control_summary: dict[str, Any] = {"measured": False}
     if same_disk:
         control_values = [
@@ -593,10 +562,7 @@ def _evaluate(
                 "value": round(ratio, 4),
                 "threshold": CROSS_VS_SAME_DISK_FLOOR,
                 "gate": True,
-                # Matching the control means the run was squeezed against the
-                # extraction pipeline's own parallel ceiling, which is
-                # inconclusive rather than a pass: increase the payload until the
-                # two configurations separate.
+                # Matching the control means the run was squeezed against the pipeline ceiling.
                 "passed": bool(control_summary["paired"].get("evaluated")) and
                     ratio >= CROSS_VS_SAME_DISK_FLOOR,
             }
@@ -607,9 +573,7 @@ def _evaluate(
         verdict = "pass" if performance_passed else "fail"
         all_passed = performance_passed
     elif mode == "baseline":
-        # The pre-refactor worker shares one global writer pool across volumes; its
-        # non-additivity is the defect under repair, so a baseline run records the
-        # reference numbers instead of failing on them.
+        # Baseline records the reference numbers instead of failing on the gates.
         verdict = "reference"
         all_passed = True
     else:
@@ -631,14 +595,7 @@ def _evaluate(
 
 
 def _paired_ratio(cross_values: list[float], control_values: list[float]) -> dict[str, Any]:
-    """Compare two concurrent configurations from paired, alternating samples.
-
-    Comparing medians of phases recorded minutes apart lets thermal and
-    background drift dominate: measured single-job throughput on this machine
-    moves by 20% between runs, which is larger than the effect under test.  The
-    two concurrent configurations therefore have to be sampled alternately and
-    compared per repetition.
-    """
+    """Compare two concurrent configurations from paired, alternating samples."""
     count = min(len(cross_values), len(control_values))
     if count == 0:
         return {"evaluated": False, "reason": "no paired samples"}
@@ -662,12 +619,7 @@ def _paired_ratio(cross_values: list[float], control_values: list[float]) -> dic
 
 
 def _with_details(payload: Any, report: dict[str, Any]) -> Any:
-    """Carry the per-phase detail into the rendered artifact.
-
-    ``report_from_payload`` keeps scenario/parameters/summary/environment only; the
-    phase timeline and per-job rows are the evidence behind the §9.3 verdict, so
-    they ride along inside ``parameters`` and survive into ``report.json``.
-    """
+    """Carry the per-phase detail into the rendered artifact via ``parameters``."""
     try:
         payload.parameters.setdefault("phases", report.get("phases") or [])
     except AttributeError:
@@ -839,7 +791,7 @@ def main() -> int:
             str(target["drive"]): {"values": [], "rows": []} for target in targets
         }
 
-        # Phase 1: solo per volume (ordering alternated to cancel thermal/first-touch bias).
+        # Solo per volume; ordering is alternated to cancel thermal/first-touch bias.
         for iteration in range(args.warmups + args.runs):
             phase = "warmup" if iteration < args.warmups else "run"
             ordered = targets if iteration % 2 == 0 else list(reversed(targets))
@@ -871,12 +823,8 @@ def main() -> int:
                     solo_values[drive]["rows"].append(result)
                 print(f"{phase}-{iteration} solo {drive}: {value:.1f} MiB/s", flush=True)
 
-        # Phase 2: pair on one worker process, with a deliberately smaller second job.
-        #
-        # The same-disk control is interleaved into the same loop rather than run as
-        # a separate phase: measured single-job throughput on this machine drifts by
-        # ~20% between runs, which is larger than the effect under test, so the two
-        # concurrent configurations have to be sampled next to each other.
+        # Pair on one worker process, with a deliberately smaller second job; the same-disk
+        # control is interleaved so both concurrent configurations are sampled next to each other.
         pair_rows: list[dict[str, Any]] = []
         same_disk_rows: list[dict[str, Any]] = []
         for iteration in range(args.warmups + args.runs):
@@ -928,10 +876,7 @@ def main() -> int:
             if not args.same_disk_control:
                 continue
 
-            # Same-disk control, immediately after the cross-disk sample.  With a
-            # payload large enough to stay I/O bound this must be clearly slower; if
-            # it matches, the run was squeezed against the extraction pipeline's own
-            # ceiling and proves nothing either way.
+            # Same-disk control, immediately after the cross-disk sample.
             control_dir = work_roots[str(targets[0]["drive"])] / "same-disk" / f"{phase}-{iteration:02d}"
             control_targets = []
             for index in range(2):

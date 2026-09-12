@@ -13,8 +13,7 @@ from typing import Any, Protocol
 from sunpack.contracts.failures import FailureKind, PASSWORD_FAILURE_KINDS
 from sunpack.i18n import I18nContext
 
-# native 侧的空间事件名（与 sevenzip_runner / coordinator.reporting 一致）。
-# 它们表达的是"等待状态"，不是 job 生命周期状态。
+# native 侧的空间事件名（与 sevenzip_runner / coordinator.reporting 一致），表达等待状态而非 job 生命周期状态。
 _SPACE_EVENTS = frozenset({"space_blocked", "space_status", "space_resumed"})
 from sunpack.support.resource_lifecycle import task_glob, write_task_text
 from sunpack.platform.windows.toast_protocol import (
@@ -76,13 +75,10 @@ class _TaskProgress:
     name: str
     completed_bytes: int = 0
     total_bytes: int = 0
-    # 该 task 当前是否因输出卷空间不足而被 native 合法暂停。
-    # 暂停不是进度：进度条不得因此推进，但提示文案必须能表达"已暂停"。
+    # 该 task 因输出卷空间不足被 native 合法暂停：进度条不得推进，但提示文案必须能表达"已暂停"。
     disk_blocked: bool = False
     space_detail: str = ""
-    # 该 task 在空间事件里出现过的真实 job_id。用于在 job 终态时把它从
-    # (volume_key, episode) → job_id 集合里**真正删掉** —— 否则长时间 watch 会
-    # 只增不减地留下无用 map 项（架构师第九轮卫生问题）。
+    # 该 task 在空间事件里出现过的真实 job_id，job 终态时从 (volume_key, episode) → job_id 集合里删除。
     space_job_ids: set[str] = field(default_factory=set)
 
 
@@ -191,8 +187,7 @@ class WatchToastCoordinator:
         self._finalize_generation = 0
         self._finalize_timer: threading.Timer | None = None
         self._closed = False
-        # (volume_key, episode_id) -> 仍在等待该 episode 的 job_id 集合。
-        # 全部等待 job 终态后集合变空，"空间不足"提示必须消失（§4.7.5）。
+        # (volume_key, episode_id) -> 仍在等待该 episode 的 job_id 集合；全部等待 job 终态后集合变空。
         self._space_blocked_jobs: dict[tuple[str, int], set[str]] = {}
         self.report_store = WatchFailureReportStore(
             state_dir,
@@ -240,15 +235,7 @@ class WatchToastCoordinator:
             task_progress.total_bytes = total
             self._publish_progress_locked()
 
-    # ------------------------------------------------------------------
-    # 空间不足暂停/恢复（§4.7.5）
-    #
-    # ★ 把"空间不足"**并入既有进度快照**，不另发 publish：否则 toast 会在
-    #   "进度"与"暂停"两条通知之间来回抖动。
-    # ★ 按 (volume_key, episode_id) 维护**仍在等待的 job 集合**：gate 正确地不会
-    #   因为"最后一个 waiter 消失"而恢复（铁律一），所以不能只等 space_resumed。
-    #   集合空时提示必须消失，否则 watch 模式会永久留下"空间不足"。
-    # ------------------------------------------------------------------
+    # 空间不足暂停/恢复：按 (volume_key, episode_id) 维护仍在等待的 job 集合，集合空后提示必须消失。
     def _space_progress_locked(
         self, request: _RequestProgress, task: Any, event: str, payload: dict[str, Any]
     ) -> None:
@@ -281,7 +268,7 @@ class WatchToastCoordinator:
             task_progress.space_job_ids.add(job_id)
         if event == "space_status":
             if not bool(payload.get("volume_query_ok", True)):
-                # B5：卷不可访问与"空间不足"必须可区分。
+                # 卷不可访问与"空间不足"必须可区分。
                 task_progress.space_detail = self.i18n.t(
                     "report.status.disk_unavailable",
                     error=str(payload.get("volume_query_error") or 0),
@@ -297,13 +284,7 @@ class WatchToastCoordinator:
             return not any(self._space_blocked_jobs.values())
 
     def _release_space_jobs_for_request_locked(self, request: _RequestProgress) -> None:
-        """job 终态时把它从所有 episode 集合里移除；集合空则提示消失。
-
-        ⚠️ 必须**真的 discard job_id**（而不只是清 task 上的标志位）：否则
-        `_space_blocked_jobs` 只增不减，长时间 watch 会留下无用 map 项。
-        gate 正确地不会因为"最后一个 waiter 消失"而恢复（铁律一），所以这些集合
-        只能靠 job 终态来清理。
-        """
+        """job 终态时把它的 job_id 从所有 episode 集合里移除，集合空则提示消失。"""
 
         if not self._space_blocked_jobs:
             return
@@ -380,9 +361,6 @@ class WatchToastCoordinator:
             for task in request.tasks.values():
                 if task.total_bytes > 0:
                     task.completed_bytes = task.total_bytes
-            # ★ job 终态时必须解除"空间不足"提示：gate 正确地不会因为"最后一个
-            #   waiter 消失"而恢复（铁律一），所以全部等待 job 都被取消后不会再有
-            #   space_resumed —— 只等它会让 watch 模式永久留下"空间不足"。
             self._release_space_jobs_for_request_locked(request)
             self._publish_progress_locked()
             self._schedule_finalize_if_drained_locked()
@@ -436,9 +414,7 @@ class WatchToastCoordinator:
             )
         else:
             value_text = self.i18n.t("toast.progress.indeterminate")
-        # ★ 空间不足**并入既有进度快照**，不另发 publish：否则 toast 会在
-        #   "进度"与"暂停"两条通知之间来回抖动，而且关闭其中一条会连带清掉另一条。
-        #   只有仍有等待中的 job 时才显示（全部等待 job 终态后必须消失，§4.7.5）。
+        # 空间不足并入既有进度快照，不另发 publish，否则 toast 会在"进度"与"暂停"之间来回抖动。
         if any(task.disk_blocked for task in tasks):
             mode = ToastProgressMode.INDETERMINATE
             value = 0.0

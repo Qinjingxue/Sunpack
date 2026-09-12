@@ -1,16 +1,5 @@
 name: CI
 
-# 架构师第三轮的发布流程意见：本仓库此前**只有** release.yml（构建/发布），
-# 没有任何 CI 测试工作流 —— 因此"1209 pytest + 7 个 VHD"只是本机验证结果，
-# 在 GitHub 上不可独立追溯。这个工作流把 L1/L2/L3/L5 变成每个 PR 都能看到的证据。
-#
-# L4（真实满盘 VHD，tests/integration/test_disk_full_pause_resume.py）**故意不放在这里**：
-#   * 需要管理员权限（diskpart 建/挂 VHD）；
-#   * 每个用例会写入整个 VHD 容量（默认 1 GiB × 1~2 个盘）；
-#   * 一次完整跑约 1 分钟，但会明显拖慢 PR 反馈。
-# 它是 release / nightly / 手动提权 lane 的验收，见文件末尾的 vhd-lane job
-# （`workflow_dispatch` 手动触发）。
-
 on:
   push:
     branches: ["**"]
@@ -21,9 +10,6 @@ permissions:
   contents: read
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # L1/L2/L5（native）：5 个 C++ 测试可执行文件
-  # ---------------------------------------------------------------------------
   native:
     name: Native (space gate / space retry / async output / smoke / writer cost)
     runs-on: windows-2022
@@ -40,8 +26,7 @@ jobs:
 
       - name: Prepare native/tool environment
         shell: pwsh
-        # lite: this lane has no model work, so pulling the full repair-system
-        # (torch / torch-geometric) would be several minutes of dead weight.
+        # lite: this lane does no model work, so the full repair-system would be dead weight.
         run: .\scripts\setup_windows_dev.ps1 -Arch x64 -RepairSystem lite -SkipAcceptanceTestTools
 
       - name: Configure
@@ -59,9 +44,7 @@ jobs:
           & $cmake --build native\sevenzip_bridge\build-x64 --config Release
           if ($LASTEXITCODE -ne 0) { throw "native build failed" }
 
-      # Each target runs separately so any single failure fails the job: the
-      # accounting red line (async_output) plus both new space suites
-      # (space_gate / space_retry) live here.
+      # Each target runs separately so a single failure fails the job.
       - name: Run native tests
         shell: pwsh
         run: |
@@ -81,8 +64,7 @@ jobs:
           }
           if ($failed.Count -gt 0) { throw "native tests failed: $($failed -join ', ')" }
 
-      # Merge gate 4 from the implementation doc: space-class error codes may be
-      # classified in exactly one place.
+      # Space-class error codes may be classified in exactly one place.
       - name: Vocabulary and single-classification-point checks
         shell: pwsh
         run: |
@@ -98,9 +80,6 @@ jobs:
           $offenders = $codes | Where-Object { $_.Path -notmatch 'sevenzip_space_error\.hpp$' }
           if ($offenders) { $offenders | ForEach-Object { Write-Host $_ }; throw "space error codes classified outside sevenzip_space_error.hpp" }
 
-  # ---------------------------------------------------------------------------
-  # L3 + 既有 pytest 全集（含真 worker 的 worker 协议用例）
-  # ---------------------------------------------------------------------------
   python:
     name: Python (unit / functional / cli + worker extraction)
     runs-on: windows-2022
@@ -121,19 +100,14 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
 
-      # The real worker tests need the native artifacts, so this job runs the same
-      # preparation steps as the native job.
+      # The real-worker tests need the native artifacts.
       - name: Prepare native/tool environment
         shell: pwsh
-        # lite: this lane has no model work, so pulling the full repair-system
-        # (torch / torch-geometric) would be several minutes of dead weight.
+        # lite: this lane does no model work, so the full repair-system would be dead weight.
         run: .\scripts\setup_windows_dev.ps1 -Arch x64 -RepairSystem lite -SkipAcceptanceTestTools
 
-      # setup_windows_dev.ps1 already builds and copies the worker + 7z wrapper into
-      # tools/ (its Build-SevenZipWrapper step) and runs CTest. There is no separate
-      # build step here on purpose: an earlier revision called
-      # `build_windows.ps1 -SkipInstaller`, but that parameter does not exist, so this
-      # job failed for real in CI before ever reaching pytest.
+      # setup_windows_dev.ps1 already builds and copies the worker, its 7z wrapper and
+      # 7z.dll into tools/; there is no separate build step here.
       - name: Verify worker artifacts
         shell: pwsh
         run: |
@@ -149,13 +123,7 @@ jobs:
         run: |
           & .venv\Scripts\python.exe -m pytest -q tests/unit/test_volume_space_events.py
 
-  # ---------------------------------------------------------------------------
-  # L4（真实满盘 VHD）：手动触发 / nightly 的提权 Windows lane
-  #
-  # 用 `gh workflow run ci.yml` 或 GitHub UI 的 "Run workflow" 触发。
-  # 需要 runner 允许 diskpart（windows-2022 runner 的默认用户**是**管理员）。
-  # 不想让它在每次 PR 上跑就保持只由 workflow_dispatch 触发。
-  # ---------------------------------------------------------------------------
+  # Manual/nightly lane: needs administrator rights to create and attach VHDs.
   vhd-lane:
     name: L4 real disk-full end-to-end (VHD, manual)
     if: github.event_name == 'workflow_dispatch'
@@ -179,22 +147,18 @@ jobs:
 
       - name: Prepare native/tool environment
         shell: pwsh
-        # lite: this lane has no model work, so pulling the full repair-system
-        # (torch / torch-geometric) would be several minutes of dead weight.
+        # lite: this lane does no model work, so the full repair-system would be dead weight.
         run: .\scripts\setup_windows_dev.ps1 -Arch x64 -RepairSystem lite -SkipAcceptanceTestTools
 
-      # No separate build step: setup_windows_dev.ps1 already creates the worker,
-      # 7z.dll and the wrapper in tools/. An earlier revision called
-      # `build_windows.ps1 -SkipInstaller` here -- a parameter that does not exist,
-      # which is exactly how this lane failed for real in CI.
+      # No separate build step: setup_windows_dev.ps1 already produces the worker,
+      # its 7z wrapper and 7z.dll in tools/.
       - name: Verify worker artifacts
         shell: pwsh
         run: |
           & .venv\Scripts\python.exe -c "from sunpack.support.resources import get_sevenzip_bridge_worker_path, get_7z_dll_path; import os, sys; w = get_sevenzip_bridge_worker_path(); d = get_7z_dll_path(); print('worker:', w); print('7z.dll:', d); sys.exit(0 if os.path.exists(w) and os.path.exists(d) else 1)"
           if ($LASTEXITCODE -ne 0) { throw "native worker artifacts missing after setup" }
 
-      # The VHD lands on the runner's temp drive; each test creates, attaches,
-      # fills, releases, detaches and deletes its own disk.
+      # Each test creates, fills, releases and deletes its own VHD under the runner temp drive.
       - name: Real disk-full end-to-end
         shell: pwsh
         env:

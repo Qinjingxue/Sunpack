@@ -1,22 +1,16 @@
-"""L4：真实满盘端到端（VHD）。
+"""真实满盘端到端（VHD）。
 
-对应《SunPack Worker 磁盘空间不足自动暂停与恢复实现文档.md》§10.4 的 T-WIN-*。
+默认 `pytest.skip`；仅当 `SUNPACK_SPACE_TEST_VHD=1` 且进程具备管理员权限时执行
+（`diskpart` 需要提权）。
 
-**门控**：默认 `pytest.skip`；仅当 `SUNPACK_SPACE_TEST_VHD=1` **且**进程具备管理员
-权限时执行（`diskpart` 需要提权）。这与文档 §10.4 的门控一字不差。
+用 VHD 而不是写满开发机磁盘，是为了精确控制容量并可随时 attach / detach / 删除。
 
-**为什么用 VHD 而不是写满测试盘**：写满开发机磁盘会破坏环境；VHD 可精确控制容量
-（本文件默认 2 GiB 固定盘），可随时 attach / detach / 删除。
+注入式失败的用例替代不了这里：真实的 `ERROR_DISK_FULL` 是否真的从 `WriteFile` /
+`create_directories` 里出来、满盘时 SDK 是否真的被 producer 反压挡住、满盘期间
+`shutdown` / `cancel` 是否真的能穿透 native 侧的 gate、释放空间后同 handle 续写是否
+真的成功，都只有真实满盘才能证明。
 
-**为什么这些用例不能被 L1/L2 取代**：L1/L2 用注入式失败替换"真实系统调用"这一步，
-因此它们证明不了：
-
-  * 真实的 `ERROR_DISK_FULL` 是否真的从 `WriteFile` / `create_directories` 里出来；
-  * 真实满盘时 SDK 是否真的被 producer 反压挡住（R13 的未验证假设）；
-  * 满盘期间 `shutdown` / `cancel` 是否真的能穿透 native 侧的 gate（T-WIN-11/20）；
-  * 释放空间后同 handle 续写是否真的成功（T-WIN-2 / T-WIN-23）。
-
-每个用例都会**自己创建并销毁** VHD：它们不依赖任何预置盘符或残留文件。
+每个用例都会自己创建并销毁 VHD：它们不依赖任何预置盘符或残留文件。
 """
 
 from __future__ import annotations
@@ -58,14 +52,11 @@ requires_vhd = pytest.mark.skipif(
 _MIB = 1 << 20
 
 
-# ---------------------------------------------------------------------------
-# diskpart 驱动的 VHD 生命周期
-# ---------------------------------------------------------------------------
 class SpaceVhd:
     """一个固定容量的 NTFS 测试盘。
 
     用完必须 `close()`：卸载并删除 VHDX 文件。所有用例都用 try/finally 保证这一点，
-    否则满盘残留会污染后续（以及别处的）测试。
+    否则满盘残留会污染后续测试。
     """
 
     def __init__(self, directory: Path, letter: str, size_mb: int = 1024):
@@ -75,7 +66,7 @@ class SpaceVhd:
         self._attached = False
         self._filler: Path | None = None
 
-    # ---- diskpart 原语 -------------------------------------------------
+    # diskpart 原语
     @staticmethod
     def _diskpart(script: str) -> None:
         completed = subprocess.run(
@@ -138,7 +129,7 @@ class SpaceVhd:
                 except OSError:
                     time.sleep(0.25)
 
-    # ---- 空间控制 ------------------------------------------------------
+    # 空间控制
     @property
     def root(self) -> Path:
         return Path(f"{self.letter}:\\")
@@ -175,13 +166,10 @@ class SpaceVhd:
         self.close()
 
 
-# ---------------------------------------------------------------------------
-# native worker 会话（直接驱动协议，不经 SevenZipRunner）
-# ---------------------------------------------------------------------------
 class WorkerSession:
     """按行 JSON 协议驱动 sunpack_sevenzip_worker.exe。
 
-    SevenZipRunner 会在自己的看门狗里取消 job，而这里要测的恰恰是 native 侧的行为，
+    SevenZipRunner 会在自己的看门狗里取消 job，而这里要测的是 native 侧的行为，
     因此本文件直接说协议：写请求、读事件、按需 cancel / shutdown。
     """
 
@@ -189,8 +177,7 @@ class WorkerSession:
         self.worker_path = str(worker_path)
         self.extra_environment = dict(extra_environment or {})
         self.process: subprocess.Popen | None = None
-        # ⚠️ **累积**列表，不是消费式队列：早先的 `space_events()` 会 drain 掉队列，
-        #    把同时到达的 result 事件永久丢掉，于是后面的 wait_for(result) 永远等不到。
+        # 累积列表，不是消费式队列：drain 会丢掉同时到达的 result 事件。
         self._all: list[dict] = []
         self._lock = threading.Lock()
         self._raw: list[str] = []
@@ -237,8 +224,8 @@ class WorkerSession:
     def close_stdin(self) -> None:
         """关掉 stdin 制造 EOF（一次性 `echo request | worker.exe` 的形态）。
 
-        EOF 之后 worker 进入**排空**：停止接收新请求，但 controller、space monitor
-        与 worker 线程必须继续活着 —— 见 worker.cpp `stop(false)` 的注释。
+        EOF 之后 worker 进入排空：停止接收新请求，但 controller、space monitor
+        与 worker 线程必须继续活着。
         """
 
         assert self.process is not None and self.process.stdin is not None
@@ -253,7 +240,7 @@ class WorkerSession:
             return list(self._all)
 
     def wait_for(self, predicate, timeout: float = 300.0) -> dict | None:
-        """等待**第一个**满足条件的事件（非破坏性：可以反复调用）。"""
+        """等待第一个满足条件的事件（非破坏性：可以反复调用）。"""
 
         deadline = time.monotonic() + timeout
         while True:
@@ -297,9 +284,6 @@ class WorkerSession:
         self.process = None
 
 
-# ---------------------------------------------------------------------------
-# 测试工件
-# ---------------------------------------------------------------------------
 def _worker_path() -> Path:
     from sunpack.support.resources import get_sevenzip_bridge_worker_path
 
@@ -319,7 +303,7 @@ def _seven_zip_dll() -> Path:
 
 
 def _make_archive(path: Path, payload_bytes: int, entries: int = 1) -> bytes:
-    """写一个 **stored（不压缩）** 的 zip，返回原始内容以便逐字节比对。"""
+    """写一个 stored（不压缩）的 zip，返回原始内容以便逐字节比对。"""
 
     payload = bytes((index * 131 + index // 509) & 0xFF for index in range(payload_bytes))
     with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as archive:
@@ -333,11 +317,10 @@ def _make_archive(path: Path, payload_bytes: int, entries: int = 1) -> bytes:
 
 
 def _physical_volume_key(path: Path) -> str:
-    r"""解析输出目录所在的**真实**物理卷身份键（\\?\Volume{GUID} 小写无尾反斜杠）。
+    r"""解析输出目录所在的真实物理卷身份键（\\?\Volume{GUID} 小写无尾反斜杠）。
 
     解析失败时返回空串 —— 此时 native 侧退化成 synthetic `job:<id>` 键，仍然安全，
-    只是跨 job 去重失效（§4.3.4）。多卷用例必须拿到真实键，否则测不到"同一物理卷 =
-    同一 gate"这条性质。
+    只是跨 job 去重失效。
     """
 
     try:
@@ -363,11 +346,11 @@ def _job_request(job_id: str, archive: Path, output_dir: Path, volume_key: str =
 def _gate_environment() -> dict[str, str]:
     """打开卷空间 gate。
 
-    默认显式注入 `SUNPACK_VOLUME_SPACE_GATE=1`：L4 必须在"功能被明确开启"这一前提下
+    默认显式注入 `SUNPACK_VOLUME_SPACE_GATE=1`：必须在"功能被明确开启"这一前提下
     验证行为，否则一旦默认值被改回 false，本文件会静默地测了个寂寞。
 
-    设 `SUNPACK_SPACE_TEST_USE_NATIVE_DEFAULT=1` 时**不注入任何开关** —— 这条路专门
-    用来验证 Phase 6c 之后的"默认开启"本身真的生效（端到端，而不是只读配置）。
+    设 `SUNPACK_SPACE_TEST_USE_NATIVE_DEFAULT=1` 时不注入任何开关，用来验证
+    "默认开启"本身真的生效（端到端，而不是只读配置）。
     """
 
     if os.environ.get("SUNPACK_SPACE_TEST_USE_NATIVE_DEFAULT") == "1":
@@ -384,8 +367,7 @@ def _vhd_directory(tmp_path_factory) -> Path:
     """VHD 落地目录。
 
     默认落在 pytest 的临时目录（通常在 C:），但可以用 `SUNPACK_SPACE_TEST_VHD_DIR`
-    指向一个空间充裕的盘 —— 每个用例会写入整个 VHD 容量（固定盘），
-    把几 GiB 写到系统盘并不合适。
+    指向一个空间充裕的盘 —— 每个用例会写入整个 VHD 容量（固定盘）。
     """
 
     configured = os.environ.get("SUNPACK_SPACE_TEST_VHD_DIR")
@@ -396,15 +378,12 @@ def _vhd_directory(tmp_path_factory) -> Path:
     return Path(tmp_path_factory.mktemp("space-vhd"))
 
 
-# ---------------------------------------------------------------------------
-# T-WIN-17 根输出目录满盘（P0 验收）
-# ---------------------------------------------------------------------------
 @requires_vhd
 def test_win17_root_output_directory_on_full_volume(tmp_path_factory):
-    """输出目录**尚不存在**且所在盘已满时，必须出现 space_blocked 而不是直接失败。
+    """输出目录尚不存在且所在盘已满时，必须出现 space_blocked 而不是直接失败。
 
-    这是 §3.11 那个 P0 的验收：根输出目录创建发生在 ExtractToDiskCallback 构造之前，
-    早期实现会在这里直接以 output_prepare / output_filesystem 返回。
+    根输出目录创建发生在 ExtractToDiskCallback 构造之前，直接失败会以
+    output_prepare / output_filesystem 返回。
     """
 
     vhd_directory = _vhd_directory(tmp_path_factory)
@@ -432,7 +411,7 @@ def test_win17_root_output_directory_on_full_volume(tmp_path_factory):
             assert blocked["episode_id"] >= 1
             assert blocked["win32_error"] in {112, 39, 314, 1295}
             assert blocked["volume_query_ok"] is True
-            # ★ P0 的核心断言：绝不能是 output_prepare / output_filesystem 直接失败。
+            # 核心断言：绝不能是 output_prepare / output_filesystem 直接失败。
             premature = session.wait_for(
                 lambda event: event.get("type") == "result", timeout=0.5
             )
@@ -455,9 +434,6 @@ def test_win17_root_output_directory_on_full_volume(tmp_path_factory):
         assert extracted.read_bytes() == payload, "输出必须逐字节等于原始内容"
 
 
-# ---------------------------------------------------------------------------
-# T-WIN-2 / T-WIN-23 单个 writer 写满 → 释放 → 恢复，数据完整
-# ---------------------------------------------------------------------------
 @requires_vhd
 def test_win2_single_writer_full_then_release(tmp_path_factory):
     vhd_directory = _vhd_directory(tmp_path_factory)
@@ -478,7 +454,7 @@ def test_win2_single_writer_full_then_release(tmp_path_factory):
             )
             assert blocked is not None
 
-            # 暂停期间不得有终态结果（B1 契约）。
+            # 暂停期间不得有终态结果。
             assert session.wait_for(lambda e: e.get("type") == "result", timeout=1.0) is None
 
             vhd.release()
@@ -492,9 +468,6 @@ def test_win2_single_writer_full_then_release(tmp_path_factory):
         assert extracted.read_bytes() == payload
 
 
-# ---------------------------------------------------------------------------
-# T-WIN-13 取消最后一个 waiter 不得变成"已恢复"
-# ---------------------------------------------------------------------------
 @requires_vhd
 def test_win13_cancelling_last_waiter_is_not_resume(tmp_path_factory):
     vhd_directory = _vhd_directory(tmp_path_factory)
@@ -517,7 +490,7 @@ def test_win13_cancelling_last_waiter_is_not_resume(tmp_path_factory):
             result = session.wait_for(lambda e: e.get("type") == "result", timeout=60.0)
             assert result is not None and result.get("status") == "failed"
 
-            # ★ 铁律一：取消绝不等于"卷已恢复"。
+            # 取消绝不等于"卷已恢复"。
             session.send({"worker_command": "shutdown"})
             assert session.wait_exit(timeout=30.0) is not None
             assert not [
@@ -527,9 +500,6 @@ def test_win13_cancelling_last_waiter_is_not_resume(tmp_path_factory):
             ], "取消最后一个 waiter 绝不能产生 space_resumed"
 
 
-# ---------------------------------------------------------------------------
-# T-WIN-20 满盘暂停期间 shutdown 必须真的能穿透 gate
-# ---------------------------------------------------------------------------
 @requires_vhd
 def test_win20_shutdown_pierces_a_paused_gate(tmp_path_factory):
     vhd_directory = _vhd_directory(tmp_path_factory)
@@ -550,8 +520,7 @@ def test_win20_shutdown_pierces_a_paused_gate(tmp_path_factory):
                 lambda event: event.get("event") == "space_blocked", timeout=90.0
             ) is not None
 
-            # ⚠️ 这里**不**事先显式取消任何 job：专测"只 wake 不改 terminal 条件"
-            #    那个回归（文档 §4.5.6.1）。
+            # 这里不事先显式取消任何 job：专测"只 wake 不改 terminal 条件"。
             started = time.monotonic()
             session.send({"worker_command": "shutdown"})
             session.wait_exit(timeout=15.0)
@@ -561,9 +530,6 @@ def test_win20_shutdown_pierces_a_paused_gate(tmp_path_factory):
             session.close()
 
 
-# ---------------------------------------------------------------------------
-# T-WIN-21 双卷独立（sticky hint 的端到端回归）
-# ---------------------------------------------------------------------------
 @requires_vhd
 def test_win21_two_volumes_recover_independently(tmp_path_factory):
     vhd_directory = _vhd_directory(tmp_path_factory)
@@ -582,8 +548,7 @@ def test_win21_two_volumes_recover_independently(tmp_path_factory):
         vhd_b.fill_until_free_below(512 * 1024)
 
         with WorkerSession(_worker_path(), _gate_environment()) as session:
-            # 用**真实**卷身份键：两个 job 各自命中一个物理卷的 gate，
-            # 这样才真的在测"两个物理卷 + sticky hint"。
+            # 用真实卷身份键：两个 job 各自命中一个物理卷的 gate。
             key_a = _physical_volume_key(out_a)
             key_b = _physical_volume_key(out_b)
             assert key_a and key_b and key_a != key_b, (key_a, key_b)
@@ -631,8 +596,7 @@ def test_win21_two_volumes_recover_independently(tmp_path_factory):
                 for event in session.space_events()
             ), "B 仍然满盘，绝不能被误判为已恢复"
 
-            # ★ 关键：A 恢复**之后**再释放 B，B 也必须能恢复
-            #   （旧的精确 bool has_blocked_ 会在这里永久卡住 B）。
+            # A 恢复之后再释放 B，B 也必须能恢复。
             vhd_b.release()
             result_a = session.wait_for(
                 lambda event: event.get("type") == "result"
@@ -654,17 +618,13 @@ def test_win21_two_volumes_recover_independently(tmp_path_factory):
         assert (out_b / "payload.bin").read_bytes() == payload_b
 
 
-# ---------------------------------------------------------------------------
-# T-WIN-12 两个 job 阻塞在同一卷：各自收到 space_blocked（同一 episode_id）与 resumed
-# ---------------------------------------------------------------------------
 @requires_vhd
 def test_win12_two_jobs_on_one_volume_both_notified(tmp_path_factory):
-    """`affected_jobs_` 扇出的端到端验收（§4.7.1.1 的两个 bug）。
+    """`affected_jobs_` 扇出的端到端验收。
 
-    * 两个 job 命中**同一个物理卷** → 同一个 gate → **一个 episode**；
-    * 每个 job 各收到一条 space_blocked（不是"只有 probe owner 收到"）；
-    * 恢复时每个 job 各收到一条 space_resumed（probe owner 也必须在其中 ——
-      它抢到许可后已经从 waiters_ 里移除，遍历 waiters_ 会漏掉它）。
+    两个 job 命中同一个物理卷 → 同一个 gate → 一个 episode，各自收到一条
+    space_blocked；恢复时每个 job 各收到一条 space_resumed，probe owner 也必须在
+    其中（它抢到许可后已经从 waiters_ 里移除，遍历 waiters_ 会漏掉它）。
     """
 
     vhd_directory = _vhd_directory(tmp_path_factory)
@@ -747,23 +707,9 @@ def test_win12_two_jobs_on_one_volume_both_notified(tmp_path_factory):
         assert (out_b / "payload.bin").read_bytes() == payload_b
 
 
-# ---------------------------------------------------------------------------
-# T-WIN-24 EOF 排空期间遇到满盘：必须仍能恢复，并且进程正常退出
-# ---------------------------------------------------------------------------
 @requires_vhd
 def test_win24_eof_drain_survives_a_full_disk(tmp_path_factory):
-    r"""EOF 排空**不得**提前终止 controller / space monitor。
-
-    这是架构师第三轮指出的一个**由"EOF 不取消 job"这条修复本身引入**的交叉 bug：
-
-    ```text
-    echo job | worker.exe → stdin EOF → 排空开始
-      → 随后 WriteFile 遇到 ERROR_DISK_FULL → gate Blocked
-      → 用户释放空间，但 controller 已经因为 stopping_ 退出
-      → 没有任何线程再 query/poll → job 永久挂住
-      → 而 stop(false) 正卡在 join(worker) 上
-      ⇒ 整个进程永久不退出
-    ```
+    r"""EOF 排空不得提前终止 controller / space monitor。
 
     本用例不注入任何 cancel / shutdown：只关 stdin，然后要求
     "满盘 → 释放 → 恢复 → 正常退出"整条链路成立。
@@ -783,7 +729,7 @@ def test_win24_eof_drain_survives_a_full_disk(tmp_path_factory):
         session.__enter__()
         try:
             session.send(_job_request("tw24", archive, output_dir))
-            # ★ 制造 EOF —— 此后不再发送任何命令（不 cancel、不 shutdown）。
+            # 制造 EOF：此后不再发送任何命令（不 cancel、不 shutdown）。
             session.close_stdin()
 
             blocked = session.wait_for(
@@ -806,7 +752,7 @@ def test_win24_eof_drain_survives_a_full_disk(tmp_path_factory):
             result = session.wait_for(lambda e: e.get("type") == "result", timeout=240.0)
             assert result is not None and result.get("status") == "ok", result
 
-            # ★ 排空结束后进程必须**自己**退出（EOF 路径），不能永久挂在 join 上。
+            # 排空结束后进程必须自己退出（EOF 路径），不能永久挂在 join 上。
             exit_code = session.wait_exit(timeout=60.0)
             assert isinstance(exit_code, int)
         finally:
@@ -817,9 +763,6 @@ def test_win24_eof_drain_survives_a_full_disk(tmp_path_factory):
         assert extracted.read_bytes() == payload, "EOF 排空路径的输出必须完整"
 
 
-# ---------------------------------------------------------------------------
-# T-WIN-15 卷不可查询：保持 Blocked，并把诊断带出去
-# ---------------------------------------------------------------------------
 @requires_vhd
 def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
     vhd_directory = _vhd_directory(tmp_path_factory)
@@ -838,10 +781,8 @@ def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
                 lambda event: event.get("event") == "space_blocked", timeout=90.0
             ) is not None
 
-            # 拔盘：卷不再可查询。B5：保持 Blocked，只带诊断出去。
-            # ⚠️ **不要**先 release()：那会把空间还给卷，probe 会成功 → gate 回 Ready →
-            #    该卷从 blocked_volumes() 消失 → 再也不会有 space_status。
-            #    本用例要测的正是"卷仍然不可写且不可查询"。
+            # 拔盘：卷不再可查询，必须保持 Blocked 并带出诊断。
+            # 不能先 release()：probe 会成功 → gate 回 Ready → 再也不会有 space_status。
             vhd.detach()
             status = session.wait_for(
                 lambda event: event.get("event") == "space_status"
@@ -853,11 +794,11 @@ def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
                 + json.dumps(session.space_events(), ensure_ascii=False)
             )
             assert int(status.get("volume_query_error") or 0) != 0
-            # ★ 绝不能变成"已恢复"。
+            # 绝不能变成"已恢复"。
             assert not [
                 event
                 for event in session.space_events()
                 if event.get("event") == "space_resumed"
             ], "不可查询的卷绝不能产生 space_resumed"
-            # 也绝不能产生终态结果（B1：空间压力本身不得产生 job 终态）。
+            # 也绝不能产生终态结果：空间压力本身不得产生 job 终态。
             assert session.wait_for(lambda e: e.get("type") == "result", timeout=2.0) is None

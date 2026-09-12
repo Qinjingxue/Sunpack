@@ -1029,12 +1029,7 @@ namespace sunpack::sevenzip
         bool output_root_initially_empty() const { return output_root_initially_empty_; }
 
 #ifdef _WIN32
-        // 测试缝隙 F：直接驱动条目目录创建（ensure_directory 本身是 private）。
-        // 生产代码不调用。
-        //
-        // 覆盖的核心回归是**memo 不被投毒**：一次失败的目录创建绝不能被
-        // created_directories_ 记住 —— 旧代码"先插入 memo 再调用 create_directories"
-        // 会让该目录永远不再被真正创建，而且错误码被 catch 换成 E_FAIL/0。
+        // 直接驱动条目目录创建（ensure_directory 本身是 private），生产代码不调用。
         bool ensure_directory_for_test(const std::wstring &directory, int *out_error_code)
         {
             std::error_code error;
@@ -1142,8 +1137,7 @@ namespace sunpack::sevenzip
             if (writer_error != S_OK)
             {
                 output_error_ = true;
-                // FileState diagnostics are authoritative once the writer has drained.
-                // Fall back only for scheduler failures that have no associated file.
+                // FileState 诊断在 writer 排空后才是权威，仅对无关联文件的调度失败回退。
                 if (!has_failed_file)
                 {
                     mark_current_item_failure(writer_error, writer_win32_error);
@@ -1391,9 +1385,7 @@ namespace sunpack::sevenzip
             std::filesystem::path target;
             try
             {
-                // ⚠️ 目录创建失败现在**由真实 std::error_code 判定**，不再靠
-                //    catch(...) 一律归成 E_FAIL（那会丢掉空间错误码，
-                //    使"输出盘满 → 自动暂停"无法触发）。
+                // 目录创建失败按真实 std::error_code 判定并透传，空间错误码不能被吞成 E_FAIL。
                 std::error_code directory_error;
                 bool directory_ready = true;
 
@@ -1581,7 +1573,7 @@ namespace sunpack::sevenzip
         }
 
     private:
-        // 本 callback 所属卷的空间 gate（可能为 nullptr：功能关闭 / 无卷身份）。
+        // 本 callback 所属卷的空间 gate，可能为 nullptr（功能关闭 / 无卷身份）。
         VolumeSpaceGate *volume_space_gate() const noexcept
         {
 #ifdef _WIN32
@@ -1591,8 +1583,7 @@ namespace sunpack::sevenzip
 #endif
         }
 
-        // gate 的终态谓词：显式取消 或 writer 整体停止。
-        // 谓词只读 atomic（cancel_token / stopping_ 都是 atomic）。
+        // gate 的终态谓词：显式取消或 writer 整体停止，只读 atomic。
         TerminalPredicate space_terminal_predicate() const
         {
             const auto token = cancel_token_;
@@ -1626,21 +1617,9 @@ namespace sunpack::sevenzip
             return candidate;
         }
 
-        // ------------------------------------------------------------------
-        // 可暂停的目录创建（条目目录 + 父目录）。
-        //
-        // ★ 与 archive_extract.cpp 的根输出目录创建**共用同一个原语**
-        //   create_directories_with_space_gate()，不允许各自写一份重试逻辑。
-        //
-        // ★ `created_directories_.insert` 必须在**成功之后**：
-        //   旧代码"先插入 memo 再调用 create_directories"会把一次失败永久记住 ——
-        //   该目录再也不会被真正创建（memo 投毒），而且失败被 catch 换成
-        //   E_FAIL/0（丢掉真实错误码）→ 满盘时空间暂停根本不触发。
-        //
-        // ⚠️ ensure_no_reparse_ancestors() 仍会抛 filesystem_error（它是安全检查，
-        //    不属于空间路径），因此必须在 noexcept 的 helper **之外**用 try/catch
-        //    包住 —— 让它穿进 helper 就是 std::terminate()。
-        // ------------------------------------------------------------------
+        // 可暂停的目录创建，与根输出目录创建共用同一个原语。
+        // created_directories_.insert 必须在成功之后：把失败的目录记进 memo 会让它不再被创建。
+        // ensure_no_reparse_ancestors() 会抛 filesystem_error，必须在 noexcept 的 helper 之外 catch。
         bool ensure_directory(const std::filesystem::path &directory, std::error_code *out_error)
         {
             if (out_error)
@@ -1804,9 +1783,7 @@ namespace sunpack::sevenzip
 
             if (item.done && item.has_source_crc32)
             {
-                // Seven-Zip only reports kOpOk after validating the decoded bytes
-                // against the archive CRC. Reuse that proven value instead of
-                // hashing the same pre-write buffer a second time.
+                // Seven-Zip 只在按归档 CRC 校验通过后才报 kOpOk，直接复用该值。
                 item.output_crc32 = item.source_crc32;
                 item.has_output_crc32 = true;
             }

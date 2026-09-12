@@ -119,10 +119,7 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
         "SUNPACK_NATIVE_MEMORY_RESUME_AVAILABLE_BYTES",
     )
     set_int("max_queue_jobs", "SUNPACK_NATIVE_MAX_QUEUE_JOBS")
-    # --- 空间不足自动暂停/恢复（卷级 gate）---------------------------------
-    # ★ 唯一的总开关。默认关闭，只在实现文档 Phase 6（PR-6）的最后一步改为默认开启。
-    #   ⚠️ 只允许一个开关：曾考虑过的 space_events_understood 是第二个 feature gate，
-    #      已按架构师意见删除，不要加回来。
+    # 空间不足自动暂停/恢复（卷级 gate）的唯一总开关。
     space_gate = process_config.get("space_gate_enabled")
     if space_gate is not None:
         enabled = str(space_gate).strip().lower() not in {"0", "false", "no", "off"}
@@ -137,10 +134,8 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
     return environment
 
 
-# native 侧的空间事件名。**与 Python 内部状态名刻意不同名**：
-#     native: space_blocked / space_status / space_resumed
-#     Python: state["space_waiting"]
-# 避免"space_waiting 到底是状态转换、心跳还是诊断"的语义混乱。
+# native 侧的空间事件名（space_blocked / space_status / space_resumed），与 Python 内部状态名
+# state["space_waiting"] 刻意不同名。
 _SPACE_EVENTS = frozenset({"space_blocked", "space_status", "space_resumed"})
 _SPACE_JOB_STATES = frozenset({"queued", "admitted", "running", "output_closed"})
 _KNOWN_JOB_EVENTS = frozenset(
@@ -154,28 +149,17 @@ _KNOWN_JOB_EVENTS = frozenset(
     }
 )
 
-# `_apply_native_event_to_job_state()` 的三种结果。
-#
-#   NOT_APPLICABLE —— 不是空间事件：照旧写 state["state"] 并向下游转发
-#   ACCEPTED       —— 当前空间事件：更新等待状态，**继续向下游转发**
-#   STALE          —— 过期空间事件：**不得向下游（progress_callback → UI/Toast）转发**
+# `_apply_native_event_to_job_state()` 的三种结果，其中 STALE 的过期空间事件不得向下游转发。
 _SPACE_NOT_APPLICABLE = "not_space"
 _SPACE_ACCEPTED = "accepted"
 _SPACE_STALE = "stale"
 
 
 def _on_space_event(state: dict[str, Any], event: str, payload: dict) -> bool:
-    """把空间事件折进 job 等待状态，**不污染 job 生命周期状态机**。
+    """把空间事件折进 job 等待状态，不写 job 生命周期状态。
 
-    ⚠️ 必须拒绝 stale event：native 侧在 gate 锁内生成 transition、锁**外**发送，
-    因此 resumed(ep17) 可能先于 blocked(ep17) 到达。若照单全收，space_waiting 会被
-    永久置回 True。只靠 (space_episode, space_resumed_seen) 两个值即可判定。
-
-    ★ 返回 True = 这条事件是**当前**状态；False = 它已过期。
-      返回值是**全系统唯一的 stale 判定**：dispatcher 用它决定要不要把原始 line
-      继续交给 `on_line` / progress_callback，从而让 UI/Toast 不可能被迟到事件
-      重新打回"磁盘暂停"（否则会出现 native 已恢复、watchdog 也知道恢复了、
-      但 UI 仍显示"已暂停"的三方不一致）。
+    native 在 gate 锁外发送事件，resumed 可能先于同一 episode 的 blocked 到达；
+    返回 False 表示该事件已过期，dispatcher 必须丢弃原始 line。
     """
 
     try:
@@ -184,7 +168,7 @@ def _on_space_event(state: dict[str, Any], event: str, payload: dict) -> bool:
         episode = 0
     latest = int(state.get("space_episode") or 0)
     if episode < latest:
-        return False  # 旧 episode，丢弃
+        return False  # 更早的 episode，丢弃
     if episode > latest:
         state["space_episode"] = episode
         state["space_resumed_seen"] = False
@@ -193,9 +177,8 @@ def _on_space_event(state: dict[str, Any], event: str, payload: dict) -> bool:
         state["space_resumed_seen"] = True
         state["space_waiting"] = False
         return True
-    # space_blocked / space_status
     if state.get("space_resumed_seen"):
-        return False  # ★ stale：同一 episode 已恢复过
+        return False  # stale：同一 episode 已恢复过
     if event == "space_blocked":
         state["space_waiting"] = True
         state["space_blocked_volume_key"] = str(payload.get("volume_key") or "")
@@ -238,13 +221,10 @@ def _apply_native_event_to_job_state(
 
 
 def _worker_job_deadline(state: dict[str, Any]) -> float | None:
-    # 显式取消优先：cancel deadline 不受 space-wait 影响，
-    # 否则"磁盘满以后连用户都无法取消"（B1）。
+    # 显式取消优先：cancel deadline 不受 space-wait 影响。
     if state.get("cancel_requested"):
         return float(state.get("cancel_deadline") or 0.0)
-    # 合法暂停：不产生 no-progress deadline（看门狗不计时）。
-    # 注意这与 space_poll_interval **完全解耦**：看门狗配 0.05s 也不会误杀
-    # space-blocked 的 job，因为它根本不再计时。
+    # 合法暂停不产生 no-progress deadline：看门狗对 space-blocked 的 job 完全不计时，与 space_poll_interval 无关。
     if state.get("space_waiting"):
         return None
     no_progress_timeout = max(0.0, float(state.get("no_progress_timeout") or 0.0))
@@ -331,9 +311,7 @@ class _NativeWorkerProcess:
     ) -> None:
         """Send a job without allocating a Python wait thread.
 
-        The stdout dispatcher is the only reader of the long-lived worker's
-        pipe.  Completion handlers therefore receive native events directly,
-        while the native process owns the extraction concurrency.
+        The stdout dispatcher is the only reader of the worker's pipe; the native process owns extraction concurrency.
         """
         self.register_job(job_id)
         now = time.monotonic()
@@ -400,14 +378,7 @@ class _NativeWorkerProcess:
                     job_state = self._job_states.get(job_id) if job_id else None
                     forward = True
                     if job_state is not None and isinstance(payload, dict):
-                        # 空间事件表达的是"等待状态"，不是 job 生命周期状态。
-                        # 绝不能写进 job_state["state"]（watch_memory / 基准测试读到的
-                        # 状态会失真）。
-                        #
-                        # ★ 过期的空间事件必须在这里被**中央拦下**，不再向下游
-                        #   （on_line → progress_callback → UI/Toast）转发：native 在 gate
-                        #   锁外发送，resumed(ep3) 先到、blocked(ep3) 后到是合法的，
-                        #   若继续转发，UI 会被打回"磁盘暂停"，而 watchdog 已经认为恢复了。
+                        # 空间事件表达的是等待状态，绝不能写进 job_state["state"]（会让 watch_memory / 状态读取失真）。
                         if (
                             _apply_native_event_to_job_state(job_state, payload, _LOGGER)
                             == _SPACE_STALE
@@ -588,13 +559,7 @@ class _AsyncNativeWorkerProcess:
             return
         self.worker_epoch = uuid.uuid4().hex
         environment = _apply_native_environment(os.environ.copy(), self.process_config)
-        # The native worker reports each finished job as a single JSON line on
-        # stdout whose size grows with the extracted file count.  asyncio's
-        # default StreamReader limit is 64 KiB; a result line that exceeds it
-        # raises LimitOverrunError inside readline(), silently killing the
-        # stdout dispatcher and leaving every pending job future unresolved.
-        # Raise the per-line cap so large archives (thousands of entries) can
-        # complete instead of hanging the pipeline after extraction finishes.
+        # Result lines grow with the extracted file count; asyncio's 64 KiB default would raise LimitOverrunError and kill the stdout dispatcher.
         self.process = await asyncio.create_subprocess_exec(
             self.worker_path,
             stdin=asyncio.subprocess.PIPE,
@@ -711,11 +676,7 @@ class _AsyncNativeWorkerProcess:
                     continue
                 state["last_progress_at"] = time.monotonic()
                 self._deadline_changed.set()
-                # ⚠️ 空间事件必须在 `state["state"] = event.removeprefix("job_")`
-                #    **之前**被识别，否则 job 生命周期状态仍会被污染。
-                # ★ 过期的空间事件（同 episode 已见 resumed）必须被**中央拦下**：
-                #   不再交给 on_line → progress_callback → UI/Toast，否则 UI 会被
-                #   迟到的 blocked 重新打回"磁盘暂停"，而 watchdog 已经认为恢复了。
+                # 空间事件必须在写 state["state"] = event.removeprefix("job_") 之前识别，否则 job 生命周期状态会被污染。
                 if (
                     _apply_native_event_to_job_state(state, payload, _LOGGER)
                     == _SPACE_STALE
@@ -986,10 +947,7 @@ class SevenZipRunner:
     def submit_attempt(self, job: dict | None = None, **kwargs) -> Future:
         """Submit an extraction attempt to native scheduling.
 
-        Persistent workers receive the JSON request immediately and complete
-        the returned future from the single stdout dispatcher.  The Python
-        callback executor is used only for short completion continuations; it
-        does not wait on native extraction jobs.
+        The returned future is completed by the stdout dispatcher; the Python callback executor never waits on native jobs.
         """
         try:
             if job is None:
@@ -1367,10 +1325,9 @@ class SevenZipRunner:
         phase_prefix: str = "sevenzip_build_job",
     ) -> dict:
         attempt_id = f"{str(getattr(task, 'key', '') or archive_path)}:{time.monotonic_ns()}"
-        # The routing key and the request must use the same absolute path (see
-        # normalized_output_dir).  A failed volume resolution falls back to a
-        # synthetic per-job key so the job gets an isolated write facility rather
-        # than silently sharing another volume's.
+        # The routing key and the request must use the same absolute path.  A failed
+        # volume resolution falls back to a synthetic per-job key so the job gets an
+        # isolated write facility rather than silently sharing another volume's.
         out_dir = normalized_output_dir(out_dir)
         volume_key = resolve_output_volume_key(out_dir) or f"job:{attempt_id}"
         job = {
