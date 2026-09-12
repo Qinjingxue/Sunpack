@@ -2077,7 +2077,7 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
     assert not list(first_out.rglob("payload.bin"))
 
 
-def test_watch_root_without_configured_output_keeps_the_global_out_dir(tmp_path, monkeypatch):
+def test_watch_root_always_has_a_resolved_output_root(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2085,7 +2085,7 @@ def test_watch_root_without_configured_output_keeps_the_global_out_dir(tmp_path,
     archive_path.parent.mkdir()
     _write_zip(archive_path)
 
-    def output_root_for(out_dir, output_roots):
+    def output_root_for(out_dir, output_roots=None):
         watcher = WatchScheduler(
             {},
             [str(watch_root)],
@@ -2095,14 +2095,16 @@ def test_watch_root_without_configured_output_keeps_the_global_out_dir(tmp_path,
             quiet_seconds=0,
             initial_scan=False,
         )
-        return watcher._output_root_for(str(archive_path))
+        return watcher.output_roots[scheduler_module.path_key(str(watch_root.resolve()))]
 
-    # A roots line that names only the input root stays exactly as it always
-    # behaved: output goes next to the input when watch.out_dir is ".".
-    assert output_root_for(".", None) == str(watch_root.resolve())
-    assert output_root_for(str(tmp_path / "global-out"), None) == str((tmp_path / "global-out").resolve())
-    # Writing the input root explicitly means the same thing.
-    assert output_root_for(".", {str(watch_root): str(watch_root)}) == str(watch_root.resolve())
+    # A caller that does not enumerate outputs still gets one absolute output
+    # root per watch root; nothing is left for the request path to fall back on.
+    assert output_root_for(".") == str(watch_root.resolve())
+    assert output_root_for(str(tmp_path / "global-out")) == str((tmp_path / "global-out").resolve())
+    # An enumerated output root wins over the process-wide one.
+    assert output_root_for(".", {str(watch_root): str(tmp_path / "per-root")}) == str(
+        (tmp_path / "per-root").resolve()
+    )
 
 
 def test_watch_scheduler_initial_scan_ignores_nested_archives(tmp_path, monkeypatch):

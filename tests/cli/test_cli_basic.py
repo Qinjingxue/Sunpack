@@ -250,12 +250,6 @@ class CliBasicTests(unittest.TestCase):
         self.assertIn("list", result.stdout)
         self.assertIn("startup", result.stdout)
 
-    def test_watch_add_help_documents_the_output_directory_option(self):
-        result = run_cli("watch", "add", "-h")
-
-        self.assertEqual(result.returncode, 0)
-        self.assertIn("--output-dir", result.stdout)
-
     def test_passwords_help_only_shows_password_relevant_options(self):
         result = run_cli("passwords", "-h")
 

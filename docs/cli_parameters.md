@@ -154,26 +154,18 @@ E:\Archives | E:\Output
 F:\Incoming | .
 ```
 
-- `C:\Downloads`：输入输出同路径（沿用 `watch.out_dir`，默认为 `.`）。
-- `E:\Archives | E:\Output`：完全独立的输出根目录，可以跨盘。
-- `F:\Incoming | .`：显式写成本身，等价于只写输入目录。
+- `C:\Downloads`：只写输入目录，沿用 `watch.out_dir`（默认 `.`，即输出到该输入目录本身）。
+- `E:\Archives | E:\Output`：该目录使用独立的输出根目录，可以跨盘。
+- `F:\Incoming | .`：显式写成本身。
 - 相对输出路径相对于它所在行的输入目录解析，因此不受 watch 服务进程工作目录影响。
 - 解压始终先在同一输入目录下的 `.sunpack_watch_probes` 中进行，成功后再提升（promotion）到输出根目录；跨盘时自动退化为跨卷移动。
 
-`add` 子命令：
-
-| 参数 | 说明 |
-| --- | --- |
-| `-o OUTPUT_DIR`, `--output-dir OUTPUT_DIR` | 为该目录指定输出根目录。一次只能添加一个目录，多个目录请直接编辑监控目录文件。 |
-| `--start` | 添加后启动 watch。 |
-| `--initial-scan` | 添加后扫描目录中已有文件。 |
-
-`list` 和 `status` 会按 `输入 | 输出` 的形式列出监控目录。`remove` 只按输入目录删除，输出根目录中的内容不会被删除。
+每个监控目录在服务内部只有一个绝对的输出根目录；`watch.out_dir` 只对没有写输出路径的旧格式行生效。`list` 按输入目录列出监控目录，`remove` 只按输入目录删除，输出根目录中的内容不会被删除。
 
 示例：
 
 ```powershell
-python sunpack.py watch add D:\Downloads -o E:\Unpacked
+python sunpack.py watch add D:\Downloads
 python sunpack.py watch add D:\Incoming --initial-scan
 python sunpack.py watch list
 python sunpack.py watch start --initial-scan

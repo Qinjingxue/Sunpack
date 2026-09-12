@@ -97,7 +97,6 @@ def test_watch_routes_each_root_to_its_output_root_and_keeps_probes_with_the_inp
             watcher = WatchScheduler(
                 config,
                 [str(first_root), str(second_root)],
-                out_dir=".",
                 output_roots=output_roots,
                 state_path=str(tmp_path / "state.json"),
                 quiet_seconds=0,
@@ -115,7 +114,8 @@ def test_watch_routes_each_root_to_its_output_root_and_keeps_probes_with_the_inp
     extracted = list(second_out.rglob(case.marker_name))
     assert len(extracted) == 1
     assert extracted[0].read_text(encoding="utf-8") == case.marker_text
-    # The configured output root replaces the legacy one for its own input root only.
+    # Every watch root has exactly one output root; the other root's output stays
+    # empty and neither input root collects the promoted output.
     assert not list(first_out.rglob(case.marker_name))
     assert not list(first_root.rglob(case.marker_name))
     # Compression still happens in the probe workspace below the input root, so

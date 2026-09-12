@@ -5,13 +5,11 @@ from sunpack.cli.cli_parsers import CliHelpFormatter, build_common_parser, local
 from sunpack.cli.cli_types import CliCommandResult
 from sunpack.cli.persistent_runtime import load_request_config
 from sunpack.filesystem.watcher.service import (
-    WATCH_ROOT_OUTPUT_SEPARATOR,
     add_watch_roots,
-    list_watch_root_entries,
+    list_watch_roots,
     remove_watch_roots,
     service_state_dir,
 )
-from sunpack.support.path_keys import path_key
 
 
 COMMAND = "watch"
@@ -37,7 +35,6 @@ def register(subparsers, ctx):
 
     add_parser = actions.add_parser("add", parents=[common], help=ctx.t("cli.watch.add"), formatter_class=CliHelpFormatter)
     add_parser.add_argument("paths", nargs="+", help=ctx.t("cli.watch.paths"))
-    add_parser.add_argument("-o", "--output-dir", dest="output_dir", help=ctx.t("cli.watch.output_dir"))
     add_parser.add_argument("--start", action="store_true", help=ctx.t("cli.watch.start_after_add"))
     add_parser.add_argument("--initial-scan", action="store_true", help=ctx.t("cli.watch.initial_scan"))
 
@@ -97,30 +94,14 @@ async def _handle_add(args, ctx):
     start_requested = bool(getattr(args, "start", False))
     initial_scan_requested = bool(getattr(args, "initial_scan", False))
     paths = list(args.paths or [])
-    output_dir = getattr(args, "output_dir", None)
-    # The watch roots file stays the place for per-root output roots; ``-o``
-    # only covers the simple one-root case and refuses to guess which output
-    # belongs to which root.
-    if output_dir and len(paths) != 1:
-        return EXIT_USAGE, CliCommandResult(
-            command=COMMAND,
-            inputs={"action": "add", "paths": paths},
-            summary={},
-            errors=[ctx.t("cli.watch.output_dir_single_path")],
-        )
-    outputs = {paths[0]: output_dir} if output_dir else None
     host = require_runtime_host()
     apply_summary = None
     if host.watch_enabled:
-        apply_summary = await host.add_watch_roots(
-            paths,
-            outputs=outputs,
-            initial_scan=initial_scan_requested,
-        )
+        apply_summary = await host.add_watch_roots(paths, initial_scan=initial_scan_requested)
         roots_path = apply_summary["roots_path"]
         added = list(apply_summary["added"])
     else:
-        roots_path_obj, added = add_watch_roots(paths, outputs)
+        roots_path_obj, added = add_watch_roots(paths)
         roots_path = str(roots_path_obj)
     start_summary = None
     if start_requested and not host.watch_enabled:
@@ -133,7 +114,6 @@ async def _handle_add(args, ctx):
         summary={
             "roots_path": str(roots_path),
             "added": added,
-            "outputs": dict(outputs or {}),
             "apply": apply_summary,
             "start": start_summary,
             "start_requested": start_requested,
@@ -165,12 +145,12 @@ async def _handle_remove(args, ctx):
 
 
 def _handle_list():
-    roots_path, roots, root_outputs = list_watch_root_entries()
+    roots_path, roots = list_watch_roots()
     return 0, CliCommandResult(
         command=COMMAND,
         inputs={"action": "list"},
         summary={"roots_path": str(roots_path), "count": len(roots)},
-        items=[_describe_watch_root(root, root_outputs) for root in roots],
+        items=roots,
     )
 
 
@@ -192,23 +172,14 @@ def _handle_status(ctx):
     from sunpack.cli.runtime_state import require_runtime_host
 
     config = load_request_config(ctx.cwd)
-    _, roots, root_outputs = list_watch_root_entries()
+    _, roots = list_watch_roots()
     host_status = require_runtime_host().watch_status()
     return 0, CliCommandResult(
         command=COMMAND,
         inputs={"action": "status"},
         summary={**host_status, "count": len(roots), "state_dir": service_state_dir(config)},
-        items=[_describe_watch_root(root, root_outputs) for root in roots],
+        items=roots,
     )
-
-
-def _describe_watch_root(root: str, root_outputs: dict[str, str]) -> str:
-    """Render one watch root the same way the roots file expresses it."""
-    output_root = root_outputs.get(path_key(root))
-    if not output_root:
-        # Written on its own: the scheduler follows the configured watch.out_dir.
-        return root
-    return f"{root} {WATCH_ROOT_OUTPUT_SEPARATOR} {output_root}"
 
 
 def _handle_startup(args):

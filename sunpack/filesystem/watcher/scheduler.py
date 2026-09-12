@@ -148,8 +148,8 @@ class WatchScheduler:
         config: dict,
         watch_roots: list[str],
         *,
-        out_dir: str,
         output_roots: dict[str, str] | None = None,
+        out_dir: str = ".",
         state_path: str,
         quiet_seconds: float | None = None,
         initial_scan: bool | None = None,
@@ -169,16 +169,21 @@ class WatchScheduler:
         self.watch_roots = [os.path.abspath(path) for path in watch_roots]
         validate_ntfs_watch_roots(self.watch_roots)
         expanded_out_dir = os.path.expanduser(out_dir)
-        self._relative_out_dir = not os.path.isabs(expanded_out_dir)
-        self.out_dir = os.path.normpath(expanded_out_dir) if self._relative_out_dir else os.path.abspath(expanded_out_dir)
-        # Watch roots may pin their own output root.  The mapping is keyed by the
-        # canonical input root and holds absolute paths; roots without an entry
-        # keep the process-wide ``out_dir`` above.
+        self.out_dir = os.path.normpath(expanded_out_dir) if not os.path.isabs(expanded_out_dir) else os.path.abspath(expanded_out_dir)
+        # Every watch root has exactly one absolute output root, resolved here so
+        # no request path ever has to choose between a per-root and a global
+        # output directory.  ``out_dir`` only supplies the roots that the caller
+        # did not enumerate; it stays relative to its own input root.
         self.output_roots = {
             path_key(os.path.abspath(str(root))): os.path.abspath(os.path.expanduser(str(output)))
             for root, output in (output_roots or {}).items()
             if str(output or "").strip()
         }
+        for root in self.watch_roots:
+            self.output_roots.setdefault(
+                path_key(root),
+                os.path.abspath(os.path.join(root, self.out_dir)) if not os.path.isabs(expanded_out_dir) else self.out_dir,
+            )
         configured_cold_start = watch_config.get(
             "cold_start_seconds",
             watch_config.get("quiet_seconds", DEFAULT_WATCH_CONFIG["cold_start_seconds"]),
@@ -1552,15 +1557,11 @@ class WatchScheduler:
 
     def _output_root_for(self, path: str) -> str:
         matched_root = _longest_matching_root(os.path.abspath(path), self.watch_roots)
-        if matched_root is not None:
-            # Report the request's output root through the same normalized
-            # absolute string the write facility is routed by.
-            configured_output = self.output_roots.get(path_key(matched_root))
-            if configured_output:
-                return configured_output
-        if not self._relative_out_dir:
-            return self.out_dir
-        return os.path.abspath(os.path.join(self._common_root_for(path), self.out_dir))
+        if matched_root is None:
+            # Only reachable for a path outside every watch root, which
+            # ``enqueue`` already rejects.
+            return self._common_root_for(path)
+        return self.output_roots[path_key(matched_root)]
 
     def _probe_root_for(self, path: str) -> str:
         return os.path.join(self._common_root_for(path), ".sunpack_watch_probes")
