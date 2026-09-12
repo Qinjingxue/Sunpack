@@ -24,6 +24,14 @@ if ($ParallelWorkers -le 0) {
 
 $script:StepResults = @()
 
+function Test-CurrentProcessAdministrator {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+$script:AcceptanceProcessIsAdministrator = Test-CurrentProcessAdministrator
+
 function Initialize-ExitCodeProbe {
     if ("SunPack.ProcessExit" -as [type]) {
         return
@@ -75,7 +83,8 @@ function Invoke-TestStep {
         [Parameter(Mandatory = $true)]
         [string[]]$Command,
         [int]$TimeoutSeconds = $StepTimeoutSeconds,
-        [switch]$QuietOutput
+        [switch]$QuietOutput,
+        [switch]$KeepElevationIfAdministrator
     )
 
     Write-Host ""
@@ -108,18 +117,23 @@ function Invoke-TestStep {
         Write-Host ("    " + $joinedCommand) -ForegroundColor DarkGray
     }
 
-    # The acceptance script may itself require elevation to install the temporary
-    # Watch Broker service. Always put the actual test/smoke command behind the
-    # existing token-switching helper so pytest and all of its descendants run
-    # with the interactive user's normal token.
-    $runnerArguments = @(
-        $unelevatedRunner,
-        "--cwd", $repoRoot,
-        "--timeout-seconds", [string]$TimeoutSeconds,
-        "--",
-        $Command[0]
-    )
-    $runnerArguments += $argsList
+    $runnerArguments = @()
+    if ($KeepElevationIfAdministrator -and $script:AcceptanceProcessIsAdministrator) {
+        Write-Host "    Running this step with the acceptance process administrator token." -ForegroundColor DarkGray
+        $runnerArguments = $argsList
+    } else {
+        # The acceptance script may itself require elevation to install the temporary
+        # Watch Broker service. Keep ordinary test/smoke commands behind the existing
+        # token-switching helper so pytest and its descendants use the normal token.
+        $runnerArguments = @(
+            $unelevatedRunner,
+            "--cwd", $repoRoot,
+            "--timeout-seconds", [string]$TimeoutSeconds,
+            "--",
+            $Command[0]
+        )
+        $runnerArguments += $argsList
+    }
 
     $process = $null
     try {
@@ -731,6 +745,15 @@ try {
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
         "tests/integration", "tests/real",
+        "--ignore", "tests/integration/test_disk_full_pause_resume.py",
+        "--durations=20"
+    )
+    Invoke-TestStep -Label "Parallel administrator VHD disk-full tests" -KeepElevationIfAdministrator -Command @(
+        $python,
+        "-m", "pytest", "-q",
+        "-n", [string]$ParallelWorkers,
+        "--dist", "worksteal",
+        "tests/integration/test_disk_full_pause_resume.py",
         "--durations=20"
     )
     Invoke-TestStep -Label "CLI help smoke test" -Command @($python, "sunpack.py", "--help") -QuietOutput

@@ -1,7 +1,6 @@
 """真实满盘端到端（VHD）。
 
-默认 `pytest.skip`；仅当 `SUNPACK_SPACE_TEST_VHD=1` 且进程具备管理员权限时执行
-（`diskpart` 需要提权）。
+默认 `pytest.skip`；仅当进程具备管理员权限时执行（`diskpart` 需要提权）。
 
 用 VHD 而不是写满开发机磁盘，是为了精确控制容量并可随时 attach / detach / 删除。
 
@@ -22,10 +21,12 @@ import queue
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 import zipfile
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -34,7 +35,15 @@ pytestmark = pytest.mark.skipif(
     sys.platform != "win32", reason="VHD / diskpart 是 Windows-only"
 )
 
-_VHD_ENABLED = os.environ.get("SUNPACK_SPACE_TEST_VHD") == "1"
+_MIB = 1 << 20
+_VHD_ALIGNMENT_MB = 8
+_VHD_MIN_SIZE_MB = 16
+_VHD_FILESYSTEM_SAFETY_BYTES = 8 * _MIB
+_VHD_HOST_FREE_RESERVE_BYTES = 32 * _MIB
+_DISKPART_MAX_ATTEMPTS = 8
+_DISKPART_RETRY_DELAY_SECONDS = 0.75
+_DISKPART_LOCK_TIMEOUT_SECONDS = 120.0
+_DISKPART_LOCK_PATH = Path(tempfile.gettempdir()) / "sunpack-diskpart-test.lock"
 
 
 def _is_admin() -> bool:
@@ -45,68 +54,202 @@ def _is_admin() -> bool:
 
 
 requires_vhd = pytest.mark.skipif(
-    not (_VHD_ENABLED and _is_admin()),
-    reason="需要 SUNPACK_SPACE_TEST_VHD=1 且管理员权限（diskpart 提权）",
+    not _is_admin(),
+    reason="需要管理员权限（diskpart 提权）",
 )
 
-_MIB = 1 << 20
+
+def _available_drive_letter(preferred: str) -> str:
+    drive_mask = ctypes.windll.kernel32.GetLogicalDrives()
+    all_letters = [chr(code) for code in range(ord("D"), ord("Z") + 1)]
+    candidates: list[str] = []
+
+    # xdist workers must not all race for the same preferred letter. Reserve a
+    # deterministic pair of candidate letters per worker; the second slot is
+    # needed by the one test that mounts two VHDs at once.
+    worker_name = os.environ.get("PYTEST_XDIST_WORKER", "")
+    if worker_name.startswith("gw") and worker_name[2:].isdigit():
+        worker_index = int(worker_name[2:])
+        slot = 1 if preferred.upper() in {"W", "Y"} else 0
+        worker_candidate_index = worker_index * 2 + slot
+        if worker_candidate_index < len(all_letters):
+            candidates.append(all_letters[worker_candidate_index])
+
+    candidates.append(preferred.upper())
+    candidates.extend(all_letters)
+    candidates = list(dict.fromkeys(candidates))
+    for letter in candidates:
+        if not drive_mask & (1 << (ord(letter) - ord("A"))):
+            return letter
+    raise RuntimeError("no unused Windows drive letter is available for the VHD test")
+
+
+def _dynamic_vhd_size_mb(directory: Path, payload_bytes: int, blocked_free_bytes: int) -> int:
+    required_bytes = (
+        payload_bytes
+        + blocked_free_bytes
+        + _VHD_FILESYSTEM_SAFETY_BYTES
+    )
+    required_mb = (required_bytes + _MIB - 1) // _MIB
+    size_mb = max(
+        _VHD_MIN_SIZE_MB,
+        ((required_mb + _VHD_ALIGNMENT_MB - 1) // _VHD_ALIGNMENT_MB) * _VHD_ALIGNMENT_MB,
+    )
+
+    host_free_bytes = shutil.disk_usage(str(directory)).free
+    host_required_bytes = size_mb * _MIB + _VHD_HOST_FREE_RESERVE_BYTES
+    if host_free_bytes < host_required_bytes:
+        pytest.skip(
+            "宿主磁盘剩余空间不足以安全创建 VHDX："
+            f"需要约 {host_required_bytes // _MIB} MiB，"
+            f"当前约 {host_free_bytes // _MIB} MiB"
+        )
+    return size_mb
+
+
+@contextmanager
+def _diskpart_critical_section():
+    """Serialize only the OS-global DiskPart command, not the test workloads."""
+    import msvcrt
+
+    _DISKPART_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    stream = open(_DISKPART_LOCK_PATH, "a+b")
+    stream.seek(0, os.SEEK_END)
+    if stream.tell() == 0:
+        stream.write(b"0")
+        stream.flush()
+
+    deadline = time.monotonic() + _DISKPART_LOCK_TIMEOUT_SECONDS
+    try:
+        while True:
+            stream.seek(0)
+            try:
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("timed out waiting for the global DiskPart test lock")
+                time.sleep(0.1)
+        yield
+    finally:
+        try:
+            stream.seek(0)
+            msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+        finally:
+            stream.close()
 
 
 class SpaceVhd:
-    """一个固定容量的 NTFS 测试盘。
+    """一个按用例需求动态计算容量的固定容量 NTFS 测试盘。
 
     用完必须 `close()`：卸载并删除 VHDX 文件。所有用例都用 try/finally 保证这一点，
-    否则满盘残留会污染后续测试。
+    否则满盘残留会污染后续测试。盘符在挂载时从当前未使用盘符中选择。
     """
 
-    def __init__(self, directory: Path, letter: str, size_mb: int = 1024):
+    def __init__(
+        self,
+        directory: Path,
+        letter: str,
+        *,
+        payload_bytes: int,
+        blocked_free_bytes: int,
+    ):
+        self.directory = directory
         self.path = directory / f"space-{letter.lower()}-{uuid.uuid4().hex[:8]}.vhdx"
+        self._preferred_letter = letter
         self.letter = letter
-        self.size_mb = size_mb
+        self.payload_bytes = payload_bytes
+        self.blocked_free_bytes = blocked_free_bytes
+        self.size_mb: int | None = None
         self._attached = False
+        self._needs_diskpart_cleanup = False
         self._filler: Path | None = None
 
     # diskpart 原语
     @staticmethod
     def _diskpart(script: str) -> None:
-        completed = subprocess.run(
-            ["diskpart"],
-            input=script,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        # diskpart 在部分失败时仍返回 0，因此必须检查输出。
-        combined = f"{completed.stdout}\n{completed.stderr}"
-        if "Virtual Disk Service error" in combined or "错误" in combined and "DiskPart" not in combined:
-            raise RuntimeError(f"diskpart failed:\n{combined}")
-        if completed.returncode != 0:
-            raise RuntimeError(f"diskpart exit {completed.returncode}:\n{combined}")
+        last_error = ""
+        for attempt in range(_DISKPART_MAX_ATTEMPTS):
+            with _diskpart_critical_section():
+                completed = subprocess.run(
+                    ["diskpart"],
+                    input=script,
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                )
+            # diskpart 在部分失败时仍返回 0，因此必须检查输出。
+            combined = f"{completed.stdout}\n{completed.stderr}"
+            last_error = combined
+            transient = "disk management services" in combined.lower()
+            if not transient:
+                if "Virtual Disk Service error" in combined or "错误" in combined and "DiskPart" not in combined:
+                    raise RuntimeError(f"diskpart failed:\n{combined}")
+                if completed.returncode != 0:
+                    raise RuntimeError(f"diskpart exit {completed.returncode}:\n{combined}")
+                return
+            if attempt + 1 < _DISKPART_MAX_ATTEMPTS:
+                time.sleep(_DISKPART_RETRY_DELAY_SECONDS * (attempt + 1))
+
+        raise RuntimeError(f"diskpart remained unavailable after retries:\n{last_error}")
 
     def attach(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        if self.path.exists():
-            self.path.unlink()
-        self._diskpart(
-            "\n".join(
-                [
-                    f"create vdisk file={self.path} maximum={self.size_mb} type=fixed",
-                    f"select vdisk file={self.path}",
-                    "attach vdisk",
-                    "create partition primary",
-                    "format fs=ntfs quick label=SUNPACKSPACE",
-                    f"assign letter={self.letter}",
-                    "exit",
-                ]
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+            self.size_mb = _dynamic_vhd_size_mb(
+                self.directory,
+                self.payload_bytes,
+                self.blocked_free_bytes,
             )
-        )
-        self._attached = True
-        deadline = time.monotonic() + 60.0
-        while time.monotonic() < deadline:
-            if Path(f"{self.letter}:\\").exists():
+            self.letter = _available_drive_letter(self._preferred_letter)
+            if self.path.exists():
+                self.path.unlink()
+            self._needs_diskpart_cleanup = True
+            self._diskpart(
+                "\n".join(
+                    [
+                        f"create vdisk file={self.path} maximum={self.size_mb} type=fixed",
+                        f"select vdisk file={self.path}",
+                        "attach vdisk",
+                        "create partition primary",
+                        "format fs=ntfs quick label=SUNPACKSPACE",
+                        f"assign letter={self.letter}",
+                        "exit",
+                    ]
+                )
+            )
+            self._attached = True
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                if Path(f"{self.letter}:\\").exists():
+                    return
+                time.sleep(0.25)
+            raise RuntimeError(f"volume {self.letter}: did not appear")
+        except BaseException:
+            self._detach_best_effort()
+            self._remove_image()
+            raise
+
+    def _detach_best_effort(self) -> None:
+        if not self._needs_diskpart_cleanup:
+            return
+        try:
+            self._diskpart(
+                "\n".join([f"select vdisk file={self.path}", "detach vdisk", "exit"])
+            )
+        except Exception:
+            pass
+        self._attached = False
+        self._needs_diskpart_cleanup = False
+
+    def _remove_image(self) -> None:
+        for _ in range(20):
+            try:
+                if self.path.exists():
+                    self.path.unlink()
                 return
-            time.sleep(0.25)
-        raise RuntimeError(f"volume {self.letter}: did not appear")
+            except OSError:
+                time.sleep(0.25)
 
     def detach(self) -> None:
         if not self._attached:
@@ -115,19 +258,14 @@ class SpaceVhd:
             "\n".join([f"select vdisk file={self.path}", "detach vdisk", "exit"])
         )
         self._attached = False
+        self._needs_diskpart_cleanup = False
 
     def close(self) -> None:
         try:
             self.release()
-            self.detach()
         finally:
-            for _ in range(20):
-                try:
-                    if self.path.exists():
-                        self.path.unlink()
-                    break
-                except OSError:
-                    time.sleep(0.25)
+            self._detach_best_effort()
+            self._remove_image()
 
     # 空间控制
     @property
@@ -247,6 +385,8 @@ class WorkerSession:
             for event in self.snapshot():
                 if predicate(event):
                     return event
+            if self.process is not None and self.process.poll() is not None:
+                return None
             if time.monotonic() >= deadline:
                 return None
             time.sleep(0.05)
@@ -391,7 +531,12 @@ def test_win17_root_output_directory_on_full_volume(tmp_path_factory):
     archive = work / "big.zip"
     payload = _make_archive(archive, 8 * _MIB)
 
-    with SpaceVhd(vhd_directory, "V") as vhd:
+    with SpaceVhd(
+        vhd_directory,
+        "V",
+        payload_bytes=len(payload),
+        blocked_free_bytes=256 * 1024,
+    ) as vhd:
         # 留出不到 1 MiB：连目录项都可能创建不出来。
         vhd.fill_until_free_below(256 * 1024)
         assert vhd.free_bytes() < 1 * _MIB
@@ -441,7 +586,12 @@ def test_win2_single_writer_full_then_release(tmp_path_factory):
     archive = work / "resume.zip"
     payload = _make_archive(archive, 8 * _MIB)
 
-    with SpaceVhd(vhd_directory, "W") as vhd:
+    with SpaceVhd(
+        vhd_directory,
+        "W",
+        payload_bytes=len(payload),
+        blocked_free_bytes=1 * _MIB,
+    ) as vhd:
         output_dir = vhd.root / "out"
         output_dir.mkdir()
         # 留出 ~1 MiB：足够开始写，但绝不够写完 8 MiB。
@@ -475,7 +625,12 @@ def test_win13_cancelling_last_waiter_is_not_resume(tmp_path_factory):
     archive = work / "cancel.zip"
     _make_archive(archive, 8 * _MIB)
 
-    with SpaceVhd(vhd_directory, "X") as vhd:
+    with SpaceVhd(
+        vhd_directory,
+        "X",
+        payload_bytes=8 * _MIB,
+        blocked_free_bytes=1 * _MIB,
+    ) as vhd:
         output_dir = vhd.root / "out"
         output_dir.mkdir()
         vhd.fill_until_free_below(1 * _MIB)
@@ -507,7 +662,12 @@ def test_win20_shutdown_pierces_a_paused_gate(tmp_path_factory):
     archive = work / "shutdown.zip"
     _make_archive(archive, 8 * _MIB)
 
-    with SpaceVhd(vhd_directory, "Y") as vhd:
+    with SpaceVhd(
+        vhd_directory,
+        "Y",
+        payload_bytes=8 * _MIB,
+        blocked_free_bytes=1 * _MIB,
+    ) as vhd:
         output_dir = vhd.root / "out"
         output_dir.mkdir()
         vhd.fill_until_free_below(1 * _MIB)
@@ -539,7 +699,20 @@ def test_win21_two_volumes_recover_independently(tmp_path_factory):
     payload_a = _make_archive(archive_a, 4 * _MIB)
     payload_b = _make_archive(archive_b, 4 * _MIB)
 
-    with SpaceVhd(vhd_directory, "V") as vhd_a, SpaceVhd(vhd_directory, "W") as vhd_b:
+    with (
+        SpaceVhd(
+            vhd_directory,
+            "V",
+            payload_bytes=len(payload_a),
+            blocked_free_bytes=512 * 1024,
+        ) as vhd_a,
+        SpaceVhd(
+            vhd_directory,
+            "W",
+            payload_bytes=len(payload_b),
+            blocked_free_bytes=512 * 1024,
+        ) as vhd_b,
+    ):
         out_a = vhd_a.root / "out"
         out_b = vhd_b.root / "out"
         out_a.mkdir()
@@ -608,10 +781,13 @@ def test_win21_two_volumes_recover_independently(tmp_path_factory):
                 and event.get("job_id") == "tw21-b",
                 timeout=300.0,
             )
-            assert result_a is not None and result_a.get("status") == "ok", result_a
+            assert result_a is not None and result_a.get("status") == "ok", (
+                "tw21-a 未在超时前完成；事件流："
+                + json.dumps(session.events(), ensure_ascii=False)
+            )
             assert result_b is not None and result_b.get("status") == "ok", (
-                result_b,
-                json.dumps(session.space_events(), ensure_ascii=False),
+                "tw21-b 未在超时前完成；事件流："
+                + json.dumps(session.events(), ensure_ascii=False)
             )
 
         assert (out_a / "payload.bin").read_bytes() == payload_a
@@ -634,7 +810,12 @@ def test_win12_two_jobs_on_one_volume_both_notified(tmp_path_factory):
     payload_a = _make_archive(archive_a, 4 * _MIB)
     payload_b = _make_archive(archive_b, 4 * _MIB)
 
-    with SpaceVhd(vhd_directory, "V") as vhd:
+    with SpaceVhd(
+        vhd_directory,
+        "V",
+        payload_bytes=len(payload_a) + len(payload_b),
+        blocked_free_bytes=1536 * 1024,
+    ) as vhd:
         out_a = vhd.root / "out-a"
         out_b = vhd.root / "out-b"
         out_a.mkdir()
@@ -720,7 +901,12 @@ def test_win24_eof_drain_survives_a_full_disk(tmp_path_factory):
     archive = work / "eof.zip"
     payload = _make_archive(archive, 8 * _MIB)
 
-    with SpaceVhd(vhd_directory, "V") as vhd:
+    with SpaceVhd(
+        vhd_directory,
+        "V",
+        payload_bytes=len(payload),
+        blocked_free_bytes=1 * _MIB,
+    ) as vhd:
         output_dir = vhd.root / "out"
         output_dir.mkdir()
         vhd.fill_until_free_below(1 * _MIB)
@@ -770,7 +956,12 @@ def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
     archive = work / "detach.zip"
     _make_archive(archive, 8 * _MIB)
 
-    with SpaceVhd(vhd_directory, "V") as vhd:
+    with SpaceVhd(
+        vhd_directory,
+        "V",
+        payload_bytes=8 * _MIB,
+        blocked_free_bytes=1 * _MIB,
+    ) as vhd:
         output_dir = vhd.root / "out"
         output_dir.mkdir()
         vhd.fill_until_free_below(1 * _MIB)

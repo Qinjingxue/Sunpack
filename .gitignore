@@ -96,5 +96,3 @@ tests/real/error_records
 
 /benchmarks/.starvation/
 benchmarks/.flags
-SunPack Worker 磁盘空间不足自动暂停与恢复架构设计.md
-SunPack Worker 磁盘空间不足自动暂停与恢复实现文档.md
