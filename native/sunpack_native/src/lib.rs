@@ -192,6 +192,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
+        analysis_native::batch_tar_first_header_reject,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         analysis_native::inspect_compression_stream_structure,
         m
     )?)?;

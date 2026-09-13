@@ -843,6 +843,151 @@ pub(crate) fn inspect_tar_header_structure(
     Ok(result.unbind())
 }
 
+#[derive(Default)]
+struct TarFirstHeaderBatchStats {
+    short_file_count: usize,
+    open_read_512_count: usize,
+    definite_reject_count: usize,
+    unknown_count: usize,
+    metadata_error_count: usize,
+    open_error_count: usize,
+    read_error_count: usize,
+}
+
+enum TarFirstHeaderProbe {
+    ShortFile,
+    Opened { definite_reject: bool },
+    MetadataError,
+    OpenError,
+    ReadError,
+}
+
+impl TarFirstHeaderBatchStats {
+    fn add(&mut self, probe: TarFirstHeaderProbe) {
+        match probe {
+            TarFirstHeaderProbe::ShortFile => self.short_file_count += 1,
+            TarFirstHeaderProbe::Opened { definite_reject } => {
+                self.open_read_512_count += 1;
+                if definite_reject {
+                    self.definite_reject_count += 1;
+                } else {
+                    self.unknown_count += 1;
+                }
+            }
+            TarFirstHeaderProbe::MetadataError => {
+                self.metadata_error_count += 1;
+                self.unknown_count += 1;
+            }
+            TarFirstHeaderProbe::OpenError => {
+                self.open_error_count += 1;
+                self.unknown_count += 1;
+            }
+            TarFirstHeaderProbe::ReadError => {
+                self.read_error_count += 1;
+                self.unknown_count += 1;
+            }
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.short_file_count += other.short_file_count;
+        self.open_read_512_count += other.open_read_512_count;
+        self.definite_reject_count += other.definite_reject_count;
+        self.unknown_count += other.unknown_count;
+        self.metadata_error_count += other.metadata_error_count;
+        self.open_error_count += other.open_error_count;
+        self.read_error_count += other.read_error_count;
+    }
+}
+
+fn probe_tar_first_header(path: &str) -> TarFirstHeaderProbe {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return TarFirstHeaderProbe::MetadataError;
+    };
+    if metadata.len() < TAR_BLOCK_SIZE as u64 {
+        return TarFirstHeaderProbe::ShortFile;
+    }
+
+    let Ok(reader) = ManagedReader::open(path) else {
+        return TarFirstHeaderProbe::OpenError;
+    };
+    let mut header = [0u8; TAR_BLOCK_SIZE];
+    let Ok(read) = reader.read_into_at(0, &mut header) else {
+        return TarFirstHeaderProbe::ReadError;
+    };
+    if read != TAR_BLOCK_SIZE {
+        return TarFirstHeaderProbe::ReadError;
+    }
+
+    let definite_reject = header.iter().all(|byte| *byte == 0)
+        || !tar_header_plausible(&header).1.is_empty();
+    TarFirstHeaderProbe::Opened { definite_reject }
+}
+
+#[pyfunction]
+#[pyo3(signature = (paths, workers=1))]
+pub(crate) fn batch_tar_first_header_reject(
+    py: Python<'_>,
+    paths: Vec<String>,
+    workers: usize,
+) -> PyResult<Py<PyDict>> {
+    if !(1..=4).contains(&workers) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "workers must be between 1 and 4",
+        ));
+    }
+    let file_count = paths.len();
+    let started = Instant::now();
+    let stats = py.detach(move || {
+        if workers == 1 {
+            return paths.iter().map(|path| probe_tar_first_header(path)).fold(
+                TarFirstHeaderBatchStats::default(),
+                |mut stats, probe| {
+                    stats.add(probe);
+                    stats
+                },
+            );
+        }
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(workers)
+            .build()
+            .expect("TAR benchmark thread pool should build");
+        pool.install(|| {
+            paths
+                .par_iter()
+                .map(|path| probe_tar_first_header(path))
+                .fold(
+                    TarFirstHeaderBatchStats::default,
+                    |mut stats, probe| {
+                        stats.add(probe);
+                        stats
+                    },
+                )
+                .reduce(
+                    TarFirstHeaderBatchStats::default,
+                    |mut left, right| {
+                        left.merge(right);
+                        left
+                    },
+                )
+        })
+    });
+
+    let result = PyDict::new(py);
+    result.set_item("file_count", file_count)?;
+    result.set_item("workers", workers)?;
+    result.set_item("short_file_count", stats.short_file_count)?;
+    result.set_item("open_read_512_count", stats.open_read_512_count)?;
+    result.set_item("definite_reject_count", stats.definite_reject_count)?;
+    result.set_item("unknown_count", stats.unknown_count)?;
+    result.set_item("metadata_error_count", stats.metadata_error_count)?;
+    result.set_item("open_error_count", stats.open_error_count)?;
+    result.set_item("read_error_count", stats.read_error_count)?;
+    result.set_item("wall_seconds", started.elapsed().as_secs_f64())?;
+    Ok(result.unbind())
+}
+
 #[pyfunction]
 pub(crate) fn inspect_compression_stream_structure(
     py: Python<'_>,
