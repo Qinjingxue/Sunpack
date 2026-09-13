@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from sunpack.analysis.view import MultiVolumeBinaryView
 from sunpack.contracts.detection import FactBag
 from sunpack.detection.pipeline.processors.context import FactProcessorContext
+from sunpack.detection.pipeline.processors.modules.format_structure import compression_stream as compression_processor
 from sunpack.detection.pipeline.processors.modules.format_structure import rar as rar_processor
 from sunpack.detection.pipeline.processors.modules.format_structure.rar import process_rar_structure
 from sunpack.detection.pipeline.processors.modules.format_structure import seven_zip as seven_zip_processor
@@ -124,6 +125,53 @@ def test_seven_zip_short_magic_keeps_strict_probe(tmp_path, monkeypatch):
     monkeypatch.setattr(seven_zip_processor, "ArchiveAnalyzer", FakeAnalyzer)
 
     result = process_seven_zip_structure(context)
+
+    assert calls == ["init", "probe"]
+    assert result == {"plausible": False, "strong_accept": False}
+
+
+def test_compression_cached_magic_miss_skips_strict_probe(tmp_path, monkeypatch):
+    part = tmp_path / "ordinary.bin"
+    part.write_bytes(b"ordinary data")
+    context = _context([part], "", "compression.stream_structure")
+    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("compression strict probe should be skipped after a definite magic miss")
+
+    monkeypatch.setattr(compression_processor, "ArchiveAnalyzer", fail_if_called)
+
+    result = compression_processor.process_compression_stream_structure(context)
+
+    assert result == {
+        "magic_matched": False,
+        "plausible": False,
+        "strong_accept": False,
+        "detected_ext": "",
+        "confidence": "none",
+        "error": "bad_signature",
+        "evidence": [],
+        "damage_flags": [],
+    }
+
+
+def test_compression_without_cached_magic_keeps_strict_probe(tmp_path, monkeypatch):
+    part = tmp_path / "ordinary.bin"
+    part.write_bytes(b"ordinary data")
+    context = _context([part], "", "compression.stream_structure")
+    calls = []
+
+    class FakeAnalyzer:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("init")
+
+        def probe_compression_stream(self, *_args, **_kwargs):
+            calls.append("probe")
+            return _fake_probe_result(plausible=False, strong_accept=False)
+
+    monkeypatch.setattr(compression_processor, "ArchiveAnalyzer", FakeAnalyzer)
+
+    result = compression_processor.process_compression_stream_structure(context)
 
     assert calls == ["init", "probe"]
     assert result == {"plausible": False, "strong_accept": False}
