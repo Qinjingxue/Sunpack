@@ -10,6 +10,7 @@ use rayon::prelude::*;
 
 use crate::io::reader::ManagedReader;
 use crate::password::rar::{rar4_decrypt_header_flags, rar5_decrypt_main_header};
+use crate::analysis_native::structure::unified_prefilter_mask_from_head;
 
 const SEVEN_ZIP: &[u8] = b"7z\xbc\xaf'\x1c";
 const RAR4: &[u8] = b"Rar!\x1a\x07\x00";
@@ -44,6 +45,7 @@ pub(crate) struct VolumeAnchor {
     pub(crate) evidence: Vec<&'static str>,
     pub(crate) error: String,
     pub(crate) bytes_read: u64,
+    pub(crate) format_reject_mask: u32,
 }
 
 impl VolumeAnchor {
@@ -163,6 +165,7 @@ fn probe_path(
         return result;
     }
     result.bytes_read += prefix.len() as u64;
+    result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix);
     let allow_embedded = prefix.starts_with(b"MZ");
     let has_rar4_signature = anchored_signature(&prefix, RAR4, allow_embedded).is_some();
     if (allow_embedded || (password.is_some() && has_rar4_signature))

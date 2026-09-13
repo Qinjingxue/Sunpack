@@ -176,6 +176,10 @@ class DetectionScheduler:
         if not any(self._format_negative_fact_names_by_mask):
             return
 
+        scan_session = getattr(self, "_active_scan_session", None)
+        if scan_session is None or not hasattr(scan_session, "format_reject_masks_for_paths"):
+            return
+
         pending: list[tuple[FactBag, str]] = []
         for bag in fact_bags:
             path = self._single_file_prefilter_path(bag)
@@ -184,17 +188,13 @@ class DetectionScheduler:
         if not pending:
             return
 
-        try:
-            import sunpack_native
-
-            masks = list(sunpack_native.unified_prefilter([path for _, path in pending]))
-        except Exception:
-            return
-        if len(masks) != len(pending):
+        cached_masks = scan_session.format_reject_masks_for_paths([path for _, path in pending])
+        if not cached_masks:
             return
 
-        for (bag, _path), mask in zip(pending, masks):
-            if not isinstance(mask, int):
+        for bag, path in pending:
+            mask = cached_masks.get(path_key(path))
+            if mask is None:
                 continue
             fact_names = self._format_negative_fact_names_by_mask[mask & _FORMAT_NEGATIVE_ALL_BITS]
             updates = {

@@ -1,7 +1,6 @@
-from unittest.mock import patch
-
 from sunpack.contracts.detection import FactBag
 from sunpack.detection.scheduler import DetectionScheduler
+from sunpack.support.path_keys import path_key
 from tests.helpers.config_factory import get_config
 
 
@@ -9,6 +8,18 @@ def _bag(path: str) -> FactBag:
     bag = FactBag()
     bag.set("file.path", path)
     return bag
+
+
+class _EvidenceSession:
+    def __init__(self, masks):
+        self.masks = {path_key(path): mask for path, mask in masks.items()}
+
+    def format_reject_masks_for_paths(self, paths):
+        return {
+            path_key(path): self.masks[path_key(path)]
+            for path in paths
+            if path_key(path) in self.masks
+        }
 
 
 def test_unified_format_prefill_only_handles_single_physical_inputs():
@@ -24,13 +35,9 @@ def test_unified_format_prefill_only_handles_single_physical_inputs():
     companion.set("candidate.member_paths", ["C:/game/launcher.exe"])
     companion.set("relation.is_split_exe_companion", True)
 
-    with patch(
-        "sunpack_native.unified_prefilter",
-        return_value=[31],
-    ) as prefilter:
-        scheduler._prefill_format_negatives([single, split, companion])
+    scheduler._active_scan_session = _EvidenceSession({"C:/game/ordinary.bin": 31})
+    scheduler._prefill_format_negatives([single, split, companion])
 
-    prefilter.assert_called_once_with(["C:/game/ordinary.bin"])
     for fact_name in (
         "zip.eocd_structure",
         "rar.structure",
@@ -49,15 +56,10 @@ def test_unified_format_prefill_is_fail_open_and_requires_scan_session():
     single = _bag("C:/game/ordinary.bin")
     single.set("candidate.member_paths", ["C:/game/ordinary.bin"])
 
-    with patch("sunpack_native.unified_prefilter", side_effect=OSError("probe failed")) as prefilter:
-        scheduler._active_scan_session = None
-        scheduler._prefill_format_negatives([single])
-        prefilter.assert_not_called()
-
-        scheduler._active_scan_session = object()
-        scheduler._prefill_format_negatives([single])
-
-    assert prefilter.call_count == 1
+    scheduler._active_scan_session = None
+    scheduler._prefill_format_negatives([single])
+    scheduler._active_scan_session = _EvidenceSession({})
+    scheduler._prefill_format_negatives([single])
     assert single.to_dict() == {
         "file.path": "C:/game/ordinary.bin",
         "candidate.member_paths": ["C:/game/ordinary.bin"],
@@ -74,8 +76,8 @@ def test_unified_format_prefill_does_not_overwrite_existing_or_missing_facts():
     single.set("zip.eocd_structure", existing)
     single.mark_missing("rar.structure")
 
-    with patch("sunpack_native.unified_prefilter", return_value=[31]):
-        scheduler._prefill_format_negatives([single])
+    scheduler._active_scan_session = _EvidenceSession({"C:/game/ordinary.bin": 31})
+    scheduler._prefill_format_negatives([single])
 
     assert single.get("zip.eocd_structure") is existing
     assert single.is_missing("rar.structure")

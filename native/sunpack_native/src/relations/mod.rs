@@ -92,29 +92,100 @@ pub(crate) fn relations_split_sort_key(path: &str) -> (u8, u32, String) {
 }
 
 #[pyfunction]
-#[pyo3(signature = (snapshot, path_passwords=None))]
+#[pyo3(signature = (snapshot, path_passwords=None, candidate_paths=None))]
 pub(crate) fn relations_build_candidate_groups_from_snapshot(
     py: Python<'_>,
     snapshot: PyRef<'_, NativeDirectorySnapshot>,
     path_passwords: Option<Vec<(String, String)>>,
-) -> PyResult<Vec<Py<PyDict>>> {
+    candidate_paths: Option<Vec<String>>,
+) -> PyResult<(Vec<Py<PyDict>>, Vec<String>, Vec<u32>)> {
     let records: Vec<(String, Option<u64>)> = snapshot
         .file_records()
         .map(|(path, size)| (path.to_string(), size))
         .collect();
     let paths: Vec<String> = records.iter().map(|(path, _)| path.clone()).collect();
     let all_paths = sorted_unique_paths(paths.clone());
-    let anchors = py.detach(|| {
-        probe_volume_anchor_paths(&paths, 1024 * 1024, 65_557, path_passwords.as_deref())
+    let candidate_keys = candidate_paths.map(|paths| {
+        paths
+            .into_iter()
+            .map(|path| path.to_ascii_lowercase())
+            .collect::<HashSet<_>>()
     });
+    let initial_probe_paths: Vec<String> = candidate_keys
+        .as_ref()
+        .map(|keys| {
+            paths
+                .iter()
+                .filter(|path| keys.contains(&path.to_ascii_lowercase()))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_else(|| paths.clone());
+    let initial_anchors = py.detach(|| {
+        probe_volume_anchor_paths(
+            &initial_probe_paths,
+            1024 * 1024,
+            65_557,
+            path_passwords.as_deref(),
+        )
+    });
+    let anchors = if let Some(candidate_keys) = candidate_keys.as_ref() {
+        let expanded_directories: HashSet<String> = initial_anchors
+            .iter()
+            .filter(|anchor| anchor_requires_sibling_evidence(anchor))
+            .map(|anchor| parent_directory_key(&anchor.path))
+            .collect();
+        let additional_probe_paths: Vec<String> = paths
+            .iter()
+            .filter(|path| {
+                expanded_directories.contains(&parent_directory_key(path))
+                    && !candidate_keys.contains(&path.to_ascii_lowercase())
+            })
+            .cloned()
+            .collect();
+        if additional_probe_paths.is_empty() {
+            initial_anchors
+        } else {
+            let mut anchors = initial_anchors;
+            let additional_anchors = py.detach(|| {
+                probe_volume_anchor_paths(
+                    &additional_probe_paths,
+                    1024 * 1024,
+                    65_557,
+                    path_passwords.as_deref(),
+                )
+            });
+            anchors.extend(additional_anchors);
+            anchors
+        }
+    } else {
+        initial_anchors
+    };
+    let format_masks_by_path: HashMap<String, u32> = anchors
+        .iter()
+        .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor.format_reject_mask))
+        .collect();
+    let format_reject_masks: Vec<u32> = paths
+        .iter()
+        .map(|path| format_masks_by_path.get(&path.to_ascii_lowercase()).copied().unwrap_or(0))
+        .collect();
     let anchors_by_path: HashMap<String, VolumeAnchor> = anchors
         .into_iter()
         .filter(has_relation_evidence)
         .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
         .collect();
+    let relation_records: Vec<(String, Option<u64>)> = if let Some(candidate_keys) = candidate_keys.as_ref() {
+        records
+            .iter()
+            .filter(|(path, _)| candidate_keys.contains(&path.to_ascii_lowercase()))
+            .cloned()
+            .collect()
+    } else {
+        records.clone()
+    };
     let mut dir_files: HashMap<String, Vec<RelationInput>> = HashMap::new();
     let mut dir_order: Vec<String> = Vec::new();
-    for (path, size) in records {
+    for (path, size) in relation_records {
         let path_value = Path::new(&path);
         let parent = path_value
             .parent()
@@ -135,13 +206,33 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
         });
     }
     let groups = build_candidate_groups_from_inputs(py, dir_files, dir_order)?;
+    let groups = if let Some(candidate_keys) = candidate_keys {
+        groups
+            .into_iter()
+            .filter(|group| {
+                group_head_path(py, group)
+                    .is_ok_and(|path| candidate_keys.contains(&path.to_ascii_lowercase()))
+            })
+            .collect()
+    } else {
+        groups
+    };
     let paths_by_directory = paths_by_directory(&all_paths);
-    merge_structure_resolved_groups_from_evidence(
+    let groups = merge_structure_resolved_groups_from_evidence(
         py,
         groups,
         &paths_by_directory,
         &anchors_by_path,
-    )
+    )?;
+    Ok((groups, paths, format_reject_masks))
+}
+
+fn group_head_path(py: Python<'_>, raw: &Py<PyDict>) -> PyResult<String> {
+    raw.bind(py)
+        .get_item("head_path")?
+        .map(|value| value.extract::<String>())
+        .transpose()
+        .map(|value| value.unwrap_or_default())
 }
 
 #[pyfunction]
@@ -219,6 +310,19 @@ fn paths_by_directory(paths: &[String]) -> HashMap<String, Vec<String>> {
             .push(path.clone());
     }
     grouped
+}
+
+fn anchor_requires_sibling_evidence(anchor: &VolumeAnchor) -> bool {
+    if anchor.confidence != "strong" || anchor.format.is_empty() {
+        return false;
+    }
+    anchor.multivolume
+        || anchor.sfx
+        || anchor.encrypted
+        || anchor
+            .evidence
+            .iter()
+            .any(|item| *item == "rar5:encryption_header")
 }
 
 fn resolve_volume_from_evidence(

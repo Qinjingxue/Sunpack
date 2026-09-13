@@ -849,15 +849,9 @@ const UNIFIED_PREFILTER_SEVEN_ZIP: u32 = 1 << 2;
 const UNIFIED_PREFILTER_TAR: u32 = 1 << 3;
 const UNIFIED_PREFILTER_COMPRESSION: u32 = 1 << 4;
 
-fn unified_prefilter_mask(path: &str) -> u32 {
-    let Ok(reader) = ManagedReader::open(path) else {
-        return 0;
-    };
-    let file_size = reader.len();
-    let mut head = [0u8; TAR_BLOCK_SIZE];
-    let Ok(read) = reader.read_into_at(0, &mut head) else {
-        return 0;
-    };
+pub(crate) fn unified_prefilter_mask_from_head(file_size: u64, head: &[u8]) -> u32 {
+    let read = head.len().min(TAR_BLOCK_SIZE);
+    let head = &head[..read];
     let mut rejected = 0;
     if file_size < TAR_BLOCK_SIZE as u64 {
         rejected |= UNIFIED_PREFILTER_TAR;
@@ -888,52 +882,11 @@ fn unified_prefilter_mask(path: &str) -> u32 {
         rejected |= UNIFIED_PREFILTER_COMPRESSION;
     }
     if read == TAR_BLOCK_SIZE
-        && (head.iter().all(|byte| *byte == 0) || !tar_header_plausible(&head).1.is_empty())
+        && (head.iter().all(|byte| *byte == 0) || !tar_header_plausible(head).1.is_empty())
     {
         rejected |= UNIFIED_PREFILTER_TAR;
     }
     rejected
-}
-
-#[pyfunction]
-pub(crate) fn unified_prefilter(py: Python<'_>, paths: Vec<String>) -> PyResult<Vec<u32>> {
-    let masks = py.detach(move || {
-        if paths.len() < 2 {
-            return paths
-                .into_iter()
-                .map(|path| unified_prefilter_mask(&path))
-                .collect::<Vec<_>>();
-        }
-
-        let chunk_count = paths.len().min(4);
-        let chunk_size = paths.len().div_ceil(chunk_count);
-        let mut chunks: Vec<Vec<String>> = Vec::with_capacity(chunk_count);
-        let mut chunk = Vec::with_capacity(chunk_size);
-        for path in paths {
-            chunk.push(path);
-            if chunk.len() == chunk_size {
-                chunks.push(chunk);
-                chunk = Vec::with_capacity(chunk_size);
-            }
-        }
-        if !chunk.is_empty() {
-            chunks.push(chunk);
-        }
-
-        chunks
-            .into_par_iter()
-            .map(|chunk| {
-                chunk
-                    .into_iter()
-                    .map(|path| unified_prefilter_mask(&path))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-    });
-    Ok(masks)
 }
 
 #[pyfunction]

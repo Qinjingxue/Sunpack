@@ -206,14 +206,30 @@ class RelationsGroupBuilder:
         snapshot: DirectorySnapshot,
         path_passwords: dict[str, str] | None = None,
     ) -> List[CandidateGroup]:
-        native_groups = _native_build_candidate_groups(
-            snapshot.native_snapshot,
+        candidate_path_values = [
+            path
+            for path, _size, _mtime_ns in snapshot.iter_file_columns()
+        ]
+        candidate_paths = {path_key(path) for path in candidate_path_values}
+        native_groups, evidence_paths, reject_masks = _native_build_candidate_groups(
+            snapshot.raw_native_snapshot,
             _native_password_pairs(path_passwords),
+            candidate_path_values,
+        )
+        snapshot.set_format_reject_masks(
+            [path for path in evidence_paths if path_key(path) in candidate_paths],
+            [
+                mask
+                for path, mask in zip(evidence_paths, reject_masks)
+                if path_key(path) in candidate_paths
+            ],
         )
         groups: List[CandidateGroup] = []
         for raw in native_groups:
             if not isinstance(raw, dict):
                 raise ValueError("native relations returned a non-object group")
+            if path_key(raw.get("head_path")) not in candidate_paths:
+                continue
             group = self._candidate_group_from_native(raw)
             if group is None:
                 raise ValueError("native relations returned an invalid group")

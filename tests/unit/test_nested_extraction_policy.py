@@ -83,8 +83,8 @@ def test_odds_fusion_settings_must_be_finite_and_in_range(field, value):
         normalize_nested_extraction_policy({field: value})
 
 
-def test_normal_detection_session_does_not_collect_raw_snapshots():
-    assert DetectionScanSession(config=_config()).include_raw_snapshots is False
+def test_normal_detection_session_retains_raw_snapshots_for_relation_evidence():
+    assert DetectionScanSession(config=_config()).include_raw_snapshots is True
 
 
 def test_second_round_root_child_has_no_special_privilege(tmp_path):
