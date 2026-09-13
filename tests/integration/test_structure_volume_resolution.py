@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import asyncio
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -10,6 +11,7 @@ import pytest
 from sunpack.config.loader import load_config
 from sunpack.config.schema import normalize_config
 from sunpack.contracts.tasks import ArchiveTask
+from sunpack.contracts.filesystem import DirectorySnapshot, FileEntry
 from sunpack.coordinator.engine import PipelineEngine
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.coordinator.target_groups import relation_group_to_fact_bag
@@ -214,6 +216,84 @@ def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):
     assert group.split_observed_missing_ranges == [(4, 4)]
     assert group.split_completeness_status == "middle_gap"
     assert group.split_completeness_confidence == "strong"
+
+
+def test_structure_resolution_stays_within_the_head_parent_directory(
+    mixed_real_volumes, tmp_path
+):
+    """A same-stem first volume in another directory cannot affect resolution."""
+    _fixture_root, _common, _cases, paths_by_format = mixed_real_volumes
+    scan_root = tmp_path / "directory_scope"
+    first_directory = scan_root / "first"
+    second_directory = scan_root / "second"
+    first_directory.mkdir(parents=True)
+    second_directory.mkdir()
+
+    source_parts = paths_by_format["7z"]
+    source_by_number = {
+        _source_volume_number(path.name, index): path
+        for index, path in enumerate(source_parts, start=1)
+    }
+    assert 1 in source_by_number and 3 in source_by_number
+    first_parts = []
+    for number in (1, 3):
+        target = first_directory / source_by_number[number].name
+        shutil.copy2(source_by_number[number], target)
+        first_parts.append(target)
+    foreign_first = second_directory / first_parts[0].name
+    shutil.copy2(first_parts[0], foreign_first)
+
+    all_paths = [str(path) for path in [*first_parts, foreign_first]]
+    scheduler = RelationsScheduler()
+    direct_group = scheduler.resolve_volume_once(
+        [str(first_parts[0])],
+        all_paths,
+        format_hint="7z",
+    )
+    assert direct_group is not None
+    assert set(direct_group.input_paths) == {str(path) for path in first_parts}
+
+    entries = [
+        FileEntry(path=path, is_dir=False, size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
+        for path in [*first_parts, foreign_first]
+    ]
+    snapshot = DirectorySnapshot.from_entries(scan_root, entries)
+    groups = scheduler.build_candidate_groups(snapshot)
+    first_group = next(
+        group
+        for group in groups
+        if str(first_parts[0]) in group.input_paths
+    )
+    assert set(first_group.input_paths) == {str(path) for path in first_parts}
+    assert first_group.split_group_complete is False
+    assert first_group.split_missing_indices == [2]
+    assert all(Path(path).parent == first_directory for path in first_group.input_paths)
+    assert not any(
+        str(foreign_first) in group.input_paths
+        and any(str(path) in group.input_paths for path in first_parts)
+        for group in groups
+    )
+
+
+def test_structure_resolution_rejects_current_paths_from_different_directories(
+    mixed_real_volumes, tmp_path
+):
+    _fixture_root, _common, _cases, paths_by_format = mixed_real_volumes
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    source = paths_by_format["7z"][0]
+    first_path = first / source.name
+    second_path = second / source.name
+    shutil.copy2(source, first_path)
+    shutil.copy2(source, second_path)
+
+    assert RelationsScheduler().resolve_volume_once(
+        [str(first_path), str(second_path)],
+        [str(first_path), str(second_path)],
+        format_hint="7z",
+    ) is None
 
 
 @pytest.mark.skipif(get_optional_winrar() is None, reason="WinRAR is required to generate modern split ZIP")

@@ -135,7 +135,13 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
         });
     }
     let groups = build_candidate_groups_from_inputs(py, dir_files, dir_order)?;
-    merge_structure_resolved_groups_from_evidence(py, groups, &all_paths, &anchors_by_path)
+    let paths_by_directory = paths_by_directory(&all_paths);
+    merge_structure_resolved_groups_from_evidence(
+        py,
+        groups,
+        &paths_by_directory,
+        &anchors_by_path,
+    )
 }
 
 #[pyfunction]
@@ -150,11 +156,23 @@ pub(crate) fn relations_resolve_volume_once(
     if current_paths.is_empty() || candidate_paths.is_empty() {
         return Ok(None);
     }
+    let Some(directory) = single_directory_scope(&current_paths) else {
+        return Ok(None);
+    };
     let mut all_paths = current_paths.clone();
     all_paths.extend(candidate_paths);
-    all_paths = sorted_unique_paths(all_paths);
+    let mut visible_paths = sorted_unique_paths(all_paths);
+    visible_paths.retain(|path| parent_directory_key(path) == directory);
+    if visible_paths.is_empty() {
+        return Ok(None);
+    }
     let anchors = py.detach(|| {
-        probe_volume_anchor_paths(&all_paths, 1024 * 1024, 65_557, path_passwords.as_deref())
+        probe_volume_anchor_paths(
+            &visible_paths,
+            1024 * 1024,
+            65_557,
+            path_passwords.as_deref(),
+        )
     });
     let anchor_by_path: HashMap<String, VolumeAnchor> = anchors
         .into_iter()
@@ -164,7 +182,7 @@ pub(crate) fn relations_resolve_volume_once(
     resolve_volume_from_evidence(
         py,
         &current_paths,
-        &all_paths,
+        &visible_paths,
         format_hint,
         &anchor_by_path,
     )
@@ -176,10 +194,37 @@ fn sorted_unique_paths(mut paths: Vec<String>) -> Vec<String> {
     paths
 }
 
+fn parent_directory_key(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(|value| value.to_string_lossy().to_string())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn single_directory_scope(paths: &[String]) -> Option<String> {
+    let directory = parent_directory_key(paths.first()?);
+    paths
+        .iter()
+        .all(|path| parent_directory_key(path) == directory)
+        .then_some(directory)
+}
+
+fn paths_by_directory(paths: &[String]) -> HashMap<String, Vec<String>> {
+    let mut grouped = HashMap::new();
+    for path in paths {
+        grouped
+            .entry(parent_directory_key(path))
+            .or_insert_with(Vec::new)
+            .push(path.clone());
+    }
+    grouped
+}
+
 fn resolve_volume_from_evidence(
     py: Python<'_>,
     current_paths: &[String],
-    all_paths: &[String],
+    visible_paths: &[String],
     format_hint: &str,
     anchor_by_path: &HashMap<String, VolumeAnchor>,
 ) -> PyResult<Option<Py<PyDict>>> {
@@ -221,8 +266,9 @@ fn resolve_volume_from_evidence(
     if primary_stem.is_empty() {
         return Ok(None);
     }
-    let structural_peers: Vec<&VolumeAnchor> = anchor_by_path
-        .values()
+    let structural_peers: Vec<&VolumeAnchor> = visible_paths
+        .iter()
+        .filter_map(|path| anchor_by_path.get(&path.to_ascii_lowercase()))
         .filter(|anchor| {
             is_retry_anchor(anchor)
                 && anchor.format == target_format
@@ -247,8 +293,9 @@ fn resolve_volume_from_evidence(
     } else {
         primary_stem.clone()
     };
-    let structural_formats: HashSet<&str> = anchor_by_path
-        .values()
+    let structural_formats: HashSet<&str> = visible_paths
+        .iter()
+        .filter_map(|path| anchor_by_path.get(&path.to_ascii_lowercase()))
         .filter(|anchor| {
             is_retry_anchor(anchor)
                 && retry_primary_stem(basename(&anchor.path)) == primary_stem
@@ -259,11 +306,16 @@ fn resolve_volume_from_evidence(
     let allow_generic_name_fallback =
         structural_formats.len() == 1 && structural_formats.contains(target_format);
     let structural_upper_bound =
-        retry_structural_upper_bound(all_paths, anchor_by_path, target_format, &primary_stem);
+        retry_structural_upper_bound(
+            visible_paths,
+            anchor_by_path,
+            target_format,
+            &primary_stem,
+        );
 
     let mut selected: HashMap<u32, ResolvedVolume> = HashMap::new();
     let mut structural_number_conflict = false;
-    for path in all_paths {
+    for path in visible_paths {
         let name = basename(path);
         if retry_primary_stem(name) != primary_stem {
             continue;
@@ -429,7 +481,7 @@ fn native_group_all_parts(py: Python<'_>, raw: &Py<PyDict>) -> PyResult<Vec<Stri
 fn merge_structure_resolved_groups_from_evidence(
     py: Python<'_>,
     groups: Vec<Py<PyDict>>,
-    all_paths: &[String],
+    paths_by_directory: &HashMap<String, Vec<String>>,
     anchors_by_path: &HashMap<String, VolumeAnchor>,
 ) -> PyResult<Vec<Py<PyDict>>> {
     let views: Vec<NativeGroupMergeView> = groups
@@ -481,10 +533,14 @@ fn merge_structure_resolved_groups_from_evidence(
             }
             current_paths
         };
+        let Some(visible_paths) = paths_by_directory.get(&parent_directory_key(&group.head_path))
+        else {
+            continue;
+        };
         let Some(resolved) = resolve_volume_from_evidence(
             py,
             &current_paths,
-            all_paths,
+            visible_paths,
             &anchor.format,
             anchors_by_path,
         )?
