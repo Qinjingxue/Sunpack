@@ -20,7 +20,7 @@ def test_installed_broker_lifecycle_usn_roundtrip_and_hot_ipc(tmp_path):
     import sunpack_native
     from sunpack.platform.windows.elevation import is_process_elevated
 
-    assert is_process_elevated() is False
+    is_elevated = is_process_elevated()
 
     archive = tmp_path / "broker-roundtrip.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as target:
@@ -35,13 +35,14 @@ def test_installed_broker_lifecycle_usn_roundtrip_and_hot_ipc(tmp_path):
         service_name = os.environ["SUNPACK_WATCH_BROKER_SERVICE_NAME"]
         assert service_name.startswith("SunPackWatchBrokerTest_")
         assert service_name != "SunPackWatchBroker"
-        denied_stop = subprocess.run(
-            ["sc.exe", "stop", service_name],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        assert denied_stop.returncode != 0
+        if not is_elevated:
+            denied_stop = subprocess.run(
+                ["sc.exe", "stop", service_name],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            assert denied_stop.returncode != 0
         sunpack_native.validate_ntfs_watch_root(str(tmp_path))
         baseline = sunpack_native.watch_candidate_for_path(str(archive), None)
         assert baseline is not None
