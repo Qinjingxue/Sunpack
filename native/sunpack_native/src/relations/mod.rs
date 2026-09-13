@@ -103,10 +103,11 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
         .map(|(path, size)| (path.to_string(), size))
         .collect();
     let paths: Vec<String> = records.iter().map(|(path, _)| path.clone()).collect();
+    let all_paths = sorted_unique_paths(paths.clone());
     let anchors = py.detach(|| {
         probe_volume_anchor_paths(&paths, 1024 * 1024, 65_557, path_passwords.as_deref())
     });
-    let mut anchors_by_path: HashMap<String, VolumeAnchor> = anchors
+    let anchors_by_path: HashMap<String, VolumeAnchor> = anchors
         .into_iter()
         .filter(has_relation_evidence)
         .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
@@ -127,13 +128,14 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
             dir_order.push(parent.clone());
         }
         dir_files.entry(parent).or_default().push(RelationInput {
-            anchor: anchors_by_path.remove(&path.to_ascii_lowercase()),
+            anchor: anchors_by_path.get(&path.to_ascii_lowercase()).cloned(),
             path,
             name,
             size,
         });
     }
-    build_candidate_groups_from_inputs(py, dir_files, dir_order)
+    let groups = build_candidate_groups_from_inputs(py, dir_files, dir_order)?;
+    merge_structure_resolved_groups_from_evidence(py, groups, &all_paths, &anchors_by_path)
 }
 
 #[pyfunction]
@@ -150,8 +152,7 @@ pub(crate) fn relations_resolve_volume_once(
     }
     let mut all_paths = current_paths.clone();
     all_paths.extend(candidate_paths);
-    all_paths.sort_by_key(|path| path.to_ascii_lowercase());
-    all_paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    all_paths = sorted_unique_paths(all_paths);
     let anchors = py.detach(|| {
         probe_volume_anchor_paths(&all_paths, 1024 * 1024, 65_557, path_passwords.as_deref())
     });
@@ -159,6 +160,29 @@ pub(crate) fn relations_resolve_volume_once(
         .into_iter()
         .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
         .collect();
+
+    resolve_volume_from_evidence(
+        py,
+        &current_paths,
+        &all_paths,
+        format_hint,
+        &anchor_by_path,
+    )
+}
+
+fn sorted_unique_paths(mut paths: Vec<String>) -> Vec<String> {
+    paths.sort_by_key(|path| path.to_ascii_lowercase());
+    paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    paths
+}
+
+fn resolve_volume_from_evidence(
+    py: Python<'_>,
+    current_paths: &[String],
+    all_paths: &[String],
+    format_hint: &str,
+    anchor_by_path: &HashMap<String, VolumeAnchor>,
+) -> PyResult<Option<Py<PyDict>>> {
 
     let hint = normalize_retry_format(format_hint);
     let current_structural: Vec<&VolumeAnchor> = current_paths
@@ -235,11 +259,11 @@ pub(crate) fn relations_resolve_volume_once(
     let allow_generic_name_fallback =
         structural_formats.len() == 1 && structural_formats.contains(target_format);
     let structural_upper_bound =
-        retry_structural_upper_bound(&all_paths, &anchor_by_path, target_format, &primary_stem);
+        retry_structural_upper_bound(all_paths, anchor_by_path, target_format, &primary_stem);
 
     let mut selected: HashMap<u32, ResolvedVolume> = HashMap::new();
     let mut structural_number_conflict = false;
-    for path in &all_paths {
+    for path in all_paths {
         let name = basename(path);
         if retry_primary_stem(name) != primary_stem {
             continue;
@@ -271,7 +295,7 @@ pub(crate) fn relations_resolve_volume_once(
                 structural_number_conflict |= insert_resolved_volume(
                     &mut selected,
                     ResolvedVolume {
-                        path: path.clone(),
+                        path: path.to_string(),
                         number,
                         source: "structure",
                         role: if anchor.anchor_roles.contains(&"first")
@@ -322,7 +346,7 @@ pub(crate) fn relations_resolve_volume_once(
         let _ = insert_resolved_volume(
             &mut selected,
             ResolvedVolume {
-                path: path.clone(),
+                path: path.to_string(),
                 number,
                 source: "anchored_name",
                 role: if number == 1 { "first" } else { "member" },
@@ -357,6 +381,160 @@ pub(crate) fn relations_resolve_volume_once(
         anchor_by_path.get(&anchor_path.to_ascii_lowercase()),
     )
     .map(Some)
+}
+
+#[derive(Debug)]
+struct NativeGroupMergeView {
+    raw: Py<PyDict>,
+    head_path: String,
+    input_paths: Vec<String>,
+    split_group_complete: Option<bool>,
+}
+
+fn native_group_merge_view(
+    py: Python<'_>,
+    raw: Py<PyDict>,
+) -> PyResult<NativeGroupMergeView> {
+    let dict = raw.bind(py);
+    let head_path = dict
+        .get_item("head_path")?
+        .map(|value| value.extract::<String>())
+        .transpose()?
+        .unwrap_or_default();
+    let input_paths = dict
+        .get_item("all_parts")?
+        .map(|value| value.extract::<Vec<String>>())
+        .transpose()?
+        .unwrap_or_default();
+    let split_group_complete = match dict.get_item("split_group_complete")? {
+        Some(value) if !value.is_none() => Some(value.extract::<bool>()?),
+        _ => None,
+    };
+    Ok(NativeGroupMergeView {
+        raw,
+        head_path,
+        input_paths,
+        split_group_complete,
+    })
+}
+
+fn native_group_all_parts(py: Python<'_>, raw: &Py<PyDict>) -> PyResult<Vec<String>> {
+    raw.bind(py)
+        .get_item("all_parts")?
+        .map(|value| value.extract::<Vec<String>>())
+        .transpose()
+        .map(|value| value.unwrap_or_default())
+}
+
+fn merge_structure_resolved_groups_from_evidence(
+    py: Python<'_>,
+    groups: Vec<Py<PyDict>>,
+    all_paths: &[String],
+    anchors_by_path: &HashMap<String, VolumeAnchor>,
+) -> PyResult<Vec<Py<PyDict>>> {
+    let views: Vec<NativeGroupMergeView> = groups
+        .into_iter()
+        .map(|raw| native_group_merge_view(py, raw))
+        .collect::<PyResult<_>>()?;
+    let mut replacements: Vec<(HashSet<String>, Option<Py<PyDict>>)> = Vec::new();
+    let mut claimed: HashSet<String> = HashSet::new();
+
+    for group in &views {
+        let Some(anchor) = anchors_by_path.get(&group.head_path.to_ascii_lowercase()) else {
+            continue;
+        };
+        let has_first_role = anchor.anchor_roles.iter().any(|role| *role == "first");
+        let has_encryption_header = anchor
+            .evidence
+            .iter()
+            .any(|item| *item == "rar5:encryption_header");
+        let group_keys: HashSet<String> = group
+            .input_paths
+            .iter()
+            .map(|path| path.to_ascii_lowercase())
+            .collect();
+        let head_missing_from_contract =
+            !group_keys.contains(&group.head_path.to_ascii_lowercase());
+        let eligible = anchor.confidence == "strong"
+            && (anchor.multivolume
+                || anchor.sfx
+                || (anchor.format == "rar" && (anchor.encrypted || has_encryption_header)))
+            && (has_first_role || anchor.sfx || has_encryption_header)
+            && !anchor.format.is_empty()
+            && (head_missing_from_contract
+                || group.split_group_complete != Some(true)
+                || group.input_paths.len() <= 1);
+        if !eligible {
+            continue;
+        }
+
+        let current_paths = if head_missing_from_contract {
+            vec![group.head_path.clone()]
+        } else {
+            let mut current_paths = Vec::with_capacity(group.input_paths.len() + 1);
+            let mut current_keys = HashSet::new();
+            for path in std::iter::once(&group.head_path).chain(group.input_paths.iter()) {
+                let key = path.to_ascii_lowercase();
+                if current_keys.insert(key) {
+                    current_paths.push(path.clone());
+                }
+            }
+            current_paths
+        };
+        let Some(resolved) = resolve_volume_from_evidence(
+            py,
+            &current_paths,
+            all_paths,
+            &anchor.format,
+            anchors_by_path,
+        )?
+        else {
+            continue;
+        };
+        let resolved_paths = native_group_all_parts(py, &resolved)?;
+        if resolved_paths.len() <= 1 {
+            continue;
+        }
+        let resolved_keys: HashSet<String> = resolved_paths
+            .iter()
+            .map(|path| path.to_ascii_lowercase())
+            .collect();
+        if resolved_keys.iter().any(|key| claimed.contains(key)) {
+            continue;
+        }
+        claimed.extend(resolved_keys.iter().cloned());
+        replacements.push((resolved_keys, Some(resolved)));
+    }
+
+    if replacements.is_empty() {
+        return Ok(views.into_iter().map(|group| group.raw).collect());
+    }
+
+    let mut emitted = vec![false; replacements.len()];
+    let mut merged = Vec::with_capacity(views.len());
+    for group in views {
+        let group_keys: HashSet<String> = group
+            .input_paths
+            .iter()
+            .map(|path| path.to_ascii_lowercase())
+            .collect();
+        let replacement_index = replacements.iter().position(|(keys, _)| {
+            keys.iter().any(|key| group_keys.contains(key))
+        });
+        let Some(index) = replacement_index else {
+            merged.push(group.raw);
+            continue;
+        };
+        if !emitted[index] {
+            let replacement = replacements[index]
+                .1
+                .take()
+                .expect("unemitted native relation replacement");
+            merged.push(replacement);
+            emitted[index] = true;
+        }
+    }
+    Ok(merged)
 }
 
 #[derive(Debug, Clone)]

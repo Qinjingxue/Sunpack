@@ -55,7 +55,6 @@ class RelationsGroupBuilder:
             if discovered:
                 path_passwords = discovered
                 groups = self.build_candidate_groups_without_discovery(snapshot, discovered)
-        groups = self._merge_structure_resolved_groups(groups, path_passwords=path_passwords)
         return self._attach_launcher_companions(groups)
 
     @staticmethod
@@ -220,92 +219,6 @@ class RelationsGroupBuilder:
                 raise ValueError("native relations returned an invalid group")
             groups.append(group)
         return groups
-
-    def _merge_structure_resolved_groups(
-        self,
-        groups: List[CandidateGroup],
-        *,
-        path_passwords: dict[str, str] | None = None,
-    ) -> List[CandidateGroup]:
-        """Use bounded structure evidence only to build logical volume groups."""
-        candidate_paths = list(dict.fromkeys(
-            path
-            for group in groups
-            for path in [group.head_path, *group.input_paths]
-        ))
-        replacements: list[tuple[set[str], CandidateGroup]] = []
-        claimed: set[str] = set()
-        for group in groups:
-            anchor = group.head_metadata if isinstance(group.head_metadata, dict) else {}
-            roles = {str(value).lower() for value in (anchor.get("anchor_roles") or [])}
-            evidence = {str(value).lower() for value in (anchor.get("evidence") or [])}
-            group_keys = {path_key(path) for path in group.input_paths}
-            head_missing_from_contract = path_key(group.head_path) not in group_keys
-            if not bool(
-                anchor.get("confidence") == "strong"
-                and (
-                    anchor.get("multivolume")
-                    or anchor.get("sfx")
-                    or (
-                        anchor.get("format") == "rar"
-                        and (
-                            anchor.get("encrypted")
-                            or "rar5:encryption_header" in evidence
-                        )
-                    )
-                )
-                and (
-                    "first" in roles
-                    or anchor.get("sfx")
-                    or "rar5:encryption_header" in evidence
-                )
-                and anchor.get("format")
-                and (
-                    head_missing_from_contract
-                    or group.split_group_complete is not True
-                    # A strong SFX/volume anchor can be emitted as a
-                    # one-volume provisional group.  Give the existing
-                    # directory resolver a chance to expand it before the
-                    # candidate reaches detection.
-                    or len(group.input_paths) <= 1
-                )
-            ):
-                continue
-            current_paths = (
-                [group.head_path]
-                if head_missing_from_contract
-                else list(dict.fromkeys([group.head_path, *group.input_paths]))
-            )
-            resolved = self.resolve_volume_once(
-                current_paths,
-                candidate_paths,
-                format_hint=str(anchor["format"]),
-                path_passwords=path_passwords,
-            )
-            if resolved is None or len(resolved.input_paths) <= 1:
-                continue
-            keys = {path_key(path) for path in resolved.input_paths}
-            if keys & claimed:
-                continue
-            claimed.update(keys)
-            replacements.append((keys, resolved))
-
-        if not replacements:
-            return groups
-        merged: List[CandidateGroup] = []
-        emitted: set[int] = set()
-        for group in groups:
-            group_keys = {path_key(path) for path in group.input_paths}
-            replacement_index = next(
-                (index for index, (keys, _resolved) in enumerate(replacements) if keys & group_keys),
-                None,
-            )
-            if replacement_index is None:
-                merged.append(group)
-            elif replacement_index not in emitted:
-                merged.append(replacements[replacement_index][1])
-                emitted.add(replacement_index)
-        return merged
 
     def resolve_volume_once(
         self,
