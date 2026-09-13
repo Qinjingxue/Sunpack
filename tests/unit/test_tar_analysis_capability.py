@@ -1,9 +1,12 @@
 import io
 import tarfile
 
+import pytest
+
 from sunpack.analysis import ArchiveAnalyzer, MultiVolumeAnalysisSource, TarProbeOptions
 from sunpack.contracts.detection import FactBag
 from sunpack.detection.pipeline.processors.context import FactProcessorContext
+from sunpack.detection.pipeline.processors.modules.format_structure import tar_header as tar_processor
 from sunpack.detection.pipeline.processors.modules.format_structure.tar_header import process_tar_header_structure
 
 
@@ -43,6 +46,7 @@ def test_tar_detection_projects_public_analysis_observation(tmp_path):
     path.write_bytes(_tar_bytes())
     facts = FactBag()
     facts.set("file.path", str(path))
+    facts.set("file.size", path.stat().st_size)
     context = FactProcessorContext(facts, "tar.header_structure", {}, {}, None)
 
     raw = process_tar_header_structure(context)
@@ -51,6 +55,109 @@ def test_tar_detection_projects_public_analysis_observation(tmp_path):
     assert raw["ustar_magic"] is True
     assert raw["fuzzy_numeric_fields_valid"] is True
     assert raw["entry_walk_ok"] is True
+
+
+def _tar_context(path):
+    facts = FactBag()
+    facts.set("file.path", str(path))
+    return FactProcessorContext(facts, "tar.header_structure", {}, {}, None)
+
+
+def test_tar_small_cached_size_skips_strict_probe(tmp_path, monkeypatch):
+    path = tmp_path / "small.bin"
+    path.write_bytes(b"not a tar")
+    context = _tar_context(path)
+    context.fact_bag.set("file.size", path.stat().st_size)
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("TAR strict probe should be skipped for a short file")
+
+    monkeypatch.setattr(tar_processor, "ArchiveAnalyzer", fail_if_called)
+
+    raw = process_tar_header_structure(context)
+
+    assert raw["plausible"] is False
+    assert raw["error"] == "bad_signature"
+
+
+@pytest.mark.parametrize("error", sorted(tar_processor.DEFINITE_FIRST_HEADER_REJECTS))
+def test_tar_definite_first_header_reject_skips_strict_probe(tmp_path, monkeypatch, error):
+    path = tmp_path / "candidate.bin"
+    path.write_bytes(b"x" * 512)
+    context = _tar_context(path)
+    context.fact_bag.set("file.size", 512)
+
+    monkeypatch.setattr(
+        tar_processor.sunpack_native,
+        "inspect_tar_header_structure",
+        lambda *_args, **_kwargs: {"error": error},
+    )
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("TAR strict probe should be skipped after a definite first-header rejection")
+
+    monkeypatch.setattr(tar_processor, "ArchiveAnalyzer", fail_if_called)
+
+    raw = process_tar_header_structure(context)
+
+    assert raw["plausible"] is False
+    assert raw["error"] == "bad_signature"
+
+
+def test_tar_inconclusive_first_header_keeps_strict_probe(tmp_path, monkeypatch):
+    path = tmp_path / "candidate.bin"
+    path.write_bytes(b"x" * 512)
+    context = _tar_context(path)
+    context.fact_bag.set("file.size", 512)
+    calls = []
+
+    monkeypatch.setattr(
+        tar_processor.sunpack_native,
+        "inspect_tar_header_structure",
+        lambda *_args, **_kwargs: {"error": "member_payload_out_of_range"},
+    )
+
+    class FakeAnalyzer:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("init")
+
+        def probe_tar(self, *_args, **_kwargs):
+            calls.append("probe")
+            return type("ProbeResult", (), {"to_raw_dict": lambda self: {"plausible": False}})()
+
+    monkeypatch.setattr(tar_processor, "ArchiveAnalyzer", FakeAnalyzer)
+
+    raw = process_tar_header_structure(context)
+
+    assert calls == ["init", "probe"]
+    assert raw == {"plausible": False}
+
+
+def test_tar_without_cached_size_keeps_strict_probe(tmp_path, monkeypatch):
+    path = tmp_path / "candidate.bin"
+    path.write_bytes(b"x" * 512)
+    context = _tar_context(path)
+    calls = []
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("TAR quick probe should not run without cached file.size")
+
+    monkeypatch.setattr(tar_processor.sunpack_native, "inspect_tar_header_structure", fail_if_called)
+
+    class FakeAnalyzer:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("init")
+
+        def probe_tar(self, *_args, **_kwargs):
+            calls.append("probe")
+            return type("ProbeResult", (), {"to_raw_dict": lambda self: {"plausible": False}})()
+
+    monkeypatch.setattr(tar_processor, "ArchiveAnalyzer", FakeAnalyzer)
+
+    raw = process_tar_header_structure(context)
+
+    assert calls == ["init", "probe"]
+    assert raw == {"plausible": False}
 
 
 def test_public_tar_capability_keeps_fuzzy_evidence_when_checksum_is_bad(tmp_path):
