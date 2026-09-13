@@ -71,6 +71,7 @@ class DetectionScheduler:
         self._active_scan_session = scan_session
         self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
         try:
+            self._prefill_precheck_head_facts(fact_bags)
             return self.rule_manager.evaluate_pool(fact_bags)
         finally:
             self._active_scan_session = None
@@ -84,6 +85,7 @@ class DetectionScheduler:
         self._active_scan_session = scan_session
         self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
         try:
+            self._prefill_precheck_head_facts(fact_bags)
             return self.rule_manager.evaluate_precheck_pool(fact_bags)
         finally:
             self._active_scan_session = None
@@ -136,6 +138,17 @@ class DetectionScheduler:
                 fact_configs=provider.fact_configs,
                 enabled_processors=self.enabled_processors,
             ).ensure_facts(bag, required_facts)
+
+    def _prefill_precheck_head_facts(self, fact_bags: list[FactBag]) -> None:
+        scan_session = getattr(self, "_active_scan_session", None)
+        if not fact_bags or scan_session is None:
+            return
+        BatchFactProvider(
+            config=self.config,
+            fact_configs=self.fact_config_defaults,
+            enabled_fact_modules=self.enabled_fact_modules,
+            scan_session=scan_session,
+        ).prefill_facts(fact_bags, {"file.size", "file.magic_bytes"})
 
     def _processor_input_facts(self, fact_names: set[str]) -> set[str]:
         inputs: set[str] = set()

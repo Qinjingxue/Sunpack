@@ -27,29 +27,48 @@ class BatchFactProvider:
             self.prefill_fact(fact_bags, fact_name)
 
     def _prefetch_file_head_facts(self, fact_bags: list[FactBag], fact_names: set[str]) -> None:
-        if self.scan_session is None or not ({"file.size", "file.magic_bytes"} & set(fact_names)):
+        want_size = "file.size" in fact_names
+        want_magic = "file.magic_bytes" in fact_names
+        if self.scan_session is None or not (want_size or want_magic):
             return
-        paths = [bag.get("file.path") or "" for bag in fact_bags if bag.get("file.path")]
+
+        pending_bags = [
+            bag
+            for bag in fact_bags
+            if bag.get("file.path")
+            and (
+                (want_size and not bag.has("file.size"))
+                or (want_magic and not bag.has("file.magic_bytes"))
+                # Keep populating this auxiliary fact exactly as before when
+                # the provider is entered for a bag that already has its
+                # requested head facts.
+                or not bag.has("file.mtime_ns")
+            )
+        ]
+        if not pending_bags:
+            return
+
+        paths = [bag.get("file.path") or "" for bag in pending_bags]
         if not paths:
             return
         facts_by_key = self.scan_session.file_head_facts_for_paths(
             paths,
-            magic_size=16 if "file.magic_bytes" in fact_names else 0,
+            magic_size=16 if want_magic else 0,
             copy_results=False,
         )
-        for bag in fact_bags:
+        for bag in pending_bags:
             path = bag.get("file.path") or ""
             if not path:
                 continue
             facts = facts_by_key.get(path_key(path), {})
             size = facts.get("size")
-            if isinstance(size, int) and not bag.has("file.size"):
+            if isinstance(size, int) and want_size and not bag.has("file.size"):
                 bag.set("file.size", size)
             mtime_ns = facts.get("mtime_ns")
             if isinstance(mtime_ns, int):
                 bag.set("file.mtime_ns", mtime_ns)
             magic = facts.get("magic")
-            if "file.magic_bytes" in fact_names and isinstance(magic, bytes) and not bag.has("file.magic_bytes"):
+            if want_magic and isinstance(magic, bytes) and not bag.has("file.magic_bytes"):
                 bag.set("file.magic_bytes", magic[:16])
 
     def prefill_fact(self, fact_bags: list[FactBag], fact_name: str):
