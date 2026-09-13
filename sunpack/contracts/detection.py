@@ -12,6 +12,9 @@ class FactBag:
     def set(self, key: str, value: Any):
         self._facts[key] = value
 
+    def update(self, facts: Dict[str, Any]) -> None:
+        self._facts.update(facts)
+
     def unset(self, key: str):
         self._facts.pop(key, None)
 

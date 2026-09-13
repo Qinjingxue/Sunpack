@@ -16,15 +16,17 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
     member_paths = [path for path in input_paths if path != group.head_path]
     carrier_path = group.carrier_path or group.head_path
     cleanup_paths = group.owned_paths
-    bag.set("file.path", carrier_path)
-    bag.set("file.logical_name", group.logical_name)
-    bag.set("candidate.kind", group.kind)
-    bag.set("candidate.entry_path", group.entry_path)
-    bag.set("candidate.member_paths", input_paths)
-    bag.set("candidate.logical_name", group.logical_name)
-    bag.set("candidate.carrier_path", carrier_path)
-    bag.set("candidate.companion_paths", list(group.companion_paths or []))
-    bag.set("candidate.cleanup_paths", cleanup_paths)
+    bag.update({
+        "file.path": carrier_path,
+        "file.logical_name": group.logical_name,
+        "candidate.kind": group.kind,
+        "candidate.entry_path": group.entry_path,
+        "candidate.member_paths": input_paths,
+        "candidate.logical_name": group.logical_name,
+        "candidate.carrier_path": carrier_path,
+        "candidate.companion_paths": list(group.companion_paths or []),
+        "candidate.cleanup_paths": cleanup_paths,
+    })
     # A split SFX launcher is a companion to the real archive volumes, not
     # part of the archive input.  Preserve that carrier identity before
     # format prechecks run; the ordinary offset-zero format probe must be
@@ -36,6 +38,13 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
         != os.path.normcase(os.path.abspath(group.head_path))
     ):
         bag.set("file.container_type", "pe")
+    needs_archive_metadata = bool(
+        group.split_volumes
+        or group.is_split_candidate
+        or relation.is_split_related
+        or group.companion_paths
+        or group.carrier_path
+    )
     single_incomplete_volume = group.split_group_complete is False and len(group.split_volumes) == 1
     if group.split_volumes and not single_incomplete_volume:
         format_hint = _split_format_hint(
@@ -43,59 +52,76 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
             group.split_volumes[0].style,
             group.split_volumes[0].prefix,
         )
-        source_descriptor = ArchiveInputDescriptor.from_split_volumes(
-            archive_path=group.entry_path,
-            volumes=group.split_volumes,
-            format_hint=format_hint,
-            logical_name=group.logical_name,
-        )
-        bag.set("relation.format_hint", format_hint)
-        format_hint_is_exact = bool(format_hint) and group.split_group_complete is True and all(
-            volume.source == "standard" for volume in group.split_volumes
-        )
-        bag.set(
-            "relation.format_hint_confidence",
-            "strong" if format_hint_is_exact else "weak" if format_hint else "none",
-        )
-    else:
-        format_hint = (
-            _split_format_hint(
-                relation.split_family,
-                group.split_volumes[0].style,
-                group.split_volumes[0].prefix,
+        bag.update({
+            "relation.format_hint": format_hint,
+            "relation.format_hint_confidence": "strong" if bool(format_hint) and group.split_group_complete is True and all(
+                volume.source == "standard" for volume in group.split_volumes
+            ) else "weak" if format_hint else "none",
+        })
+        if needs_archive_metadata:
+            source_descriptor = ArchiveInputDescriptor.from_split_volumes(
+                archive_path=group.entry_path,
+                volumes=group.split_volumes,
+                format_hint=format_hint,
+                logical_name=group.logical_name,
             )
-            if group.split_volumes
-            else ""
+    elif group.split_volumes:
+        format_hint = _split_format_hint(
+            relation.split_family,
+            group.split_volumes[0].style,
+            group.split_volumes[0].prefix,
         )
-        source_descriptor = ArchiveInputDescriptor.from_parts(
-            archive_path=group.entry_path,
-            format_hint=format_hint,
-            logical_name=group.logical_name,
-        )
-        bag.set("relation.format_hint", format_hint)
-        bag.set("relation.format_hint_confidence", "weak" if format_hint else "none")
-    state = ArchiveState.from_archive_input(source_descriptor)
-    bag.set("archive.input", source_descriptor.to_dict())
-    bag.set("archive.state", state.to_dict())
-    bag.set("archive.source", state.source.to_dict())
-    file_size = group.carrier_size if group.carrier_path and isinstance(group.carrier_size, int) else group.head_size
-    if isinstance(file_size, int):
+        bag.update({
+            "relation.format_hint": format_hint,
+            "relation.format_hint_confidence": "weak" if format_hint else "none",
+        })
+        if needs_archive_metadata:
+            source_descriptor = ArchiveInputDescriptor.from_parts(
+                archive_path=group.entry_path,
+                format_hint=format_hint,
+                logical_name=group.logical_name,
+            )
+    else:
+        format_hint = ""
+        bag.update({
+            "relation.format_hint": format_hint,
+            "relation.format_hint_confidence": "none",
+        })
+
+    if needs_archive_metadata:
+        state = ArchiveState.from_archive_input(source_descriptor)
+        bag.update({
+            "archive.input": source_descriptor.to_dict(),
+            "archive.state": state.to_dict(),
+            "archive.source": state.source.to_dict(),
+        })
+
+    bag.update({
+        "file.split_members": list(member_paths),
+        "file.split_role": relation.split_role,
+        "file.is_split_candidate": group.is_split_candidate or relation.is_split_related,
+        "relation.is_split_related": group.is_split_candidate or relation.is_split_related,
+        "relation.is_split_member": relation.is_split_member,
+        "relation.has_split_companions": relation.has_split_companions or bool(group.companion_paths),
+        "relation.is_split_exe_companion": relation.is_split_exe_companion,
+        "relation.is_disguised_split_exe_companion": relation.is_disguised_split_exe_companion,
+        "relation.has_generic_001_head": relation.has_generic_001_head,
+        "relation.is_plain_numeric_member": relation.is_plain_numeric_member,
+        "relation.match_rar_disguised": relation.match_rar_disguised,
+        "relation.match_rar_head": relation.match_rar_head,
+        "relation.match_001_head": relation.match_001_head,
+        "relation.split_entry_path": group.head_path,
+        "relation.split_member_count": len(input_paths) if group.is_split_candidate else 0,
+        "relation.split_layout_status": group.split_layout_status,
+        "relation.split_completeness_status": group.split_completeness_status,
+        "relation.split_completeness_confidence": group.split_completeness_confidence,
+        "relation.split_completeness_basis": list(group.split_completeness_basis or []),
+        "relation.split_family": relation.split_family,
+        "relation.split_index": relation.split_index,
+        "relation.split_is_first": relation.split_role == "first",
+    })
+    if isinstance(file_size := (group.carrier_size if group.carrier_path and isinstance(group.carrier_size, int) else group.head_size), int):
         bag.set("file.size", file_size)
-    bag.set("file.split_members", list(member_paths))
-    bag.set("file.split_role", relation.split_role)
-    bag.set("file.is_split_candidate", group.is_split_candidate or relation.is_split_related)
-    bag.set("relation.is_split_related", group.is_split_candidate or relation.is_split_related)
-    bag.set("relation.is_split_member", relation.is_split_member)
-    bag.set("relation.has_split_companions", relation.has_split_companions or bool(group.companion_paths))
-    bag.set("relation.is_split_exe_companion", relation.is_split_exe_companion)
-    bag.set("relation.is_disguised_split_exe_companion", relation.is_disguised_split_exe_companion)
-    bag.set("relation.has_generic_001_head", relation.has_generic_001_head)
-    bag.set("relation.is_plain_numeric_member", relation.is_plain_numeric_member)
-    bag.set("relation.match_rar_disguised", relation.match_rar_disguised)
-    bag.set("relation.match_rar_head", relation.match_rar_head)
-    bag.set("relation.match_001_head", relation.match_001_head)
-    bag.set("relation.split_entry_path", group.head_path)
-    bag.set("relation.split_member_count", len(input_paths) if group.is_split_candidate else 0)
     if group.split_group_complete is not None:
         bag.set("relation.split_group_complete", bool(group.split_group_complete))
     bag.set(
@@ -111,13 +137,6 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
             "relation.split_observed_missing_ranges",
             [list(value) for value in group.split_observed_missing_ranges],
         )
-    bag.set("relation.split_layout_status", group.split_layout_status)
-    bag.set("relation.split_completeness_status", group.split_completeness_status)
-    bag.set("relation.split_completeness_confidence", group.split_completeness_confidence)
-    bag.set("relation.split_completeness_basis", list(group.split_completeness_basis or []))
-    bag.set("relation.split_family", relation.split_family)
-    bag.set("relation.split_index", relation.split_index)
-    bag.set("relation.split_is_first", relation.split_role == "first")
     if group.split_volumes:
         bag.set("relation.split_volumes", [
             {

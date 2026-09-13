@@ -22,6 +22,7 @@ _FORMAT_NEGATIVE_FACTS = {
     1 << 3: ("tar.header_structure", "tar_header_structure"),
     1 << 4: ("compression.stream_structure", "compression_stream_structure"),
 }
+_FORMAT_NEGATIVE_ALL_BITS = sum(_FORMAT_NEGATIVE_FACTS)
 
 
 def _canonical_not_matched_structure() -> dict[str, Any]:
@@ -54,6 +55,15 @@ class DetectionScheduler:
         detector_config = detection_config(config)
         self.enabled_fact_modules = self._enabled_module_names(detector_config.get("fact_collectors"))
         self.enabled_processors = self._enabled_module_names(detector_config.get("processors"))
+        active_format_facts = tuple(
+            (bit, fact_name)
+            for bit, (fact_name, processor_name) in _FORMAT_NEGATIVE_FACTS.items()
+            if self.enabled_processors is None or processor_name in self.enabled_processors
+        )
+        self._format_negative_fact_names_by_mask = tuple(
+            tuple(fact_name for bit, fact_name in active_format_facts if mask & bit)
+            for mask in range(_FORMAT_NEGATIVE_ALL_BITS + 1)
+        )
         self.fact_config_defaults = self._fact_config_defaults(
             detector_config.get("fact_collectors"),
             detector_config.get("processors"),
@@ -163,13 +173,7 @@ class DetectionScheduler:
         if not fact_bags or getattr(self, "_active_scan_session", None) is None:
             return
 
-        enabled = self.enabled_processors
-        active_facts = {
-            bit: (fact_name, processor_name)
-            for bit, (fact_name, processor_name) in _FORMAT_NEGATIVE_FACTS.items()
-            if enabled is None or processor_name in enabled
-        }
-        if not active_facts:
+        if not any(self._format_negative_fact_names_by_mask):
             return
 
         pending: list[tuple[FactBag, str]] = []
@@ -192,10 +196,14 @@ class DetectionScheduler:
         for (bag, _path), mask in zip(pending, masks):
             if not isinstance(mask, int):
                 continue
-            for bit, (fact_name, _processor_name) in active_facts.items():
-                if not mask & bit or bag.has(fact_name) or bag.is_missing(fact_name):
-                    continue
-                bag.set(fact_name, _canonical_not_matched_structure())
+            fact_names = self._format_negative_fact_names_by_mask[mask & _FORMAT_NEGATIVE_ALL_BITS]
+            updates = {
+                fact_name: _canonical_not_matched_structure()
+                for fact_name in fact_names
+                if not bag.has(fact_name) and not bag.is_missing(fact_name)
+            }
+            if updates:
+                bag.update(updates)
 
     @staticmethod
     def _single_file_prefilter_path(bag: FactBag) -> str | None:
