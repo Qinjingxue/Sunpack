@@ -383,6 +383,9 @@ def build_correct_password_case(root: Path, archive_format: str, variant: str, *
 
 
 def build_format_cases(root: Path, archive_format: str) -> list[PressureCase]:
+    if archive_format in PLAIN_ONLY_FORMATS:
+        return [build_or_skip(root, archive_format, "single_plain")]
+
     cases: list[PressureCase] = []
 
     cases.append(build_or_skip(root, archive_format, "single_plain"))
@@ -420,6 +423,9 @@ def build_format_cases(root: Path, archive_format: str) -> list[PressureCase]:
 
 
 def build_acceptance_format_cases(root: Path, archive_format: str) -> list[PressureCase]:
+    if archive_format in PLAIN_ONLY_FORMATS:
+        return [build_or_skip(root, archive_format, "single_plain")]
+
     cases: list[PressureCase] = []
     if archive_format == "7z":
         cases.append(build_or_skip(root, archive_format, "single_plain"))
