@@ -3,7 +3,7 @@ from sunpack.verification.error_classification import classify_verification_erro
 from sunpack.verification.registry import register_verification_method
 from sunpack.contracts.verification import (
     DECISION_ACCEPT_PARTIAL,
-    DECISION_REPAIR,
+    DECISION_RETRY_EXTRACT,
     DECISION_REQUEST_PASSWORD,
     CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
     CONTENT_INTEGRITY_UNKNOWN,
@@ -55,7 +55,7 @@ class ExtractionExitSignalMethod:
                     decision_hint=DECISION_ACCEPT_PARTIAL if content_integrity in {
                         CONTENT_INTEGRITY_VERIFIED_PARTIAL,
                         CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
-                    } else DECISION_REPAIR,
+                    } else DECISION_RETRY_EXTRACT,
                     file_observations=observations,
                     issues=[
                         VerificationIssue(
@@ -76,7 +76,7 @@ class ExtractionExitSignalMethod:
                 completeness_hint=0.0,
                 content_integrity_hint=content_integrity,
                 container_integrity_hint=error_class.container_integrity,
-                decision_hint=DECISION_REPAIR,
+                decision_hint=DECISION_RETRY_EXTRACT,
                 issues=[
                     VerificationIssue(
                         method=self.name,
@@ -104,7 +104,7 @@ class ExtractionExitSignalMethod:
                 status="failed",
                 completeness_hint=0.0,
                 content_integrity_hint=CONTENT_INTEGRITY_UNKNOWN,
-                decision_hint=DECISION_REPAIR,
+                decision_hint=DECISION_RETRY_EXTRACT,
                 issues=[
                     *issues,
                     VerificationIssue(

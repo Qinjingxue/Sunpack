@@ -24,7 +24,7 @@ def test_detected_extensions_do_not_rename_source_files(tmp_path):
 
     tasks = [
         direct_file_task(str(split_first), all_parts=[str(split_first), str(split_second)]),
-        ArchiveTask(fact_bag=single_bag, score=10, main_path=str(fake_doc), all_parts=[str(fake_doc)]),
+        ArchiveTask(fact_bag=single_bag, main_path=str(fake_doc), all_parts=[str(fake_doc)]),
     ]
 
     assert split_first.exists()
@@ -46,7 +46,7 @@ def test_embedded_carrier_keeps_physical_extension_and_detected_format(tmp_path)
     bag.set("file.embedded_archive_found", True)
     bag.set("embedded_archive.analysis", {"found": True, "detected_ext": ".rar", "offset": 128})
 
-    task = ArchiveTask(fact_bag=bag, score=10, main_path=str(carrier), all_parts=[str(carrier)])
+    task = ArchiveTask(fact_bag=bag, main_path=str(carrier), all_parts=[str(carrier)])
     assert carrier.exists()
     assert task.main_path == str(carrier)
     assert task.archive_input().format_hint == "rar"
@@ -60,8 +60,8 @@ def test_output_dir_resolver_disambiguates_duplicate_task_outputs(tmp_path):
     zip_file.touch()
     existing_output.write_text("existing file", encoding="utf-8")
 
-    first = ArchiveTask(fact_bag=FactBag(), score=10, main_path=str(seven_zip), logical_name="collision")
-    second = ArchiveTask(fact_bag=FactBag(), score=10, main_path=str(zip_file), logical_name="collision")
+    first = ArchiveTask(fact_bag=FactBag(), main_path=str(seven_zip), logical_name="collision")
+    second = ArchiveTask(fact_bag=FactBag(), main_path=str(zip_file), logical_name="collision")
 
     def default_output_dir(task):
         return str(tmp_path / task.logical_name)
@@ -86,7 +86,7 @@ def test_output_dir_resolver_avoids_existing_output_directory(tmp_path):
     archive.touch()
     (tmp_path / "photos").mkdir()
     (tmp_path / "photos(1)").mkdir()
-    task = ArchiveTask(fact_bag=FactBag(), score=10, main_path=str(archive), logical_name="photos")
+    task = ArchiveTask(fact_bag=FactBag(), main_path=str(archive), logical_name="photos")
 
     resolver = RenameScheduler().build_output_dir_resolver([task], lambda item: str(tmp_path / item.logical_name))
 
@@ -95,8 +95,8 @@ def test_output_dir_resolver_avoids_existing_output_directory(tmp_path):
 
 def test_output_reservations_disambiguate_concurrent_requests_before_directories_exist(tmp_path):
     registry = OutputReservationRegistry()
-    first_task = ArchiveTask(fact_bag=FactBag(), score=10, main_path=str(tmp_path / "a.zip"))
-    second_task = ArchiveTask(fact_bag=FactBag(), score=10, main_path=str(tmp_path / "b.zip"))
+    first_task = ArchiveTask(fact_bag=FactBag(), main_path=str(tmp_path / "a.zip"))
+    second_task = ArchiveTask(fact_bag=FactBag(), main_path=str(tmp_path / "b.zip"))
     default = lambda _task: str(tmp_path / "shared")
 
     first = RenameScheduler(registry, "first").build_output_dir_resolver([first_task], default)

@@ -11,7 +11,6 @@ class ScanResult:
     main_path: str
     all_parts: List[str]
     should_extract: bool
-    score: int
     stop_reason: str
     matched_rules: List[str]
     detected_ext: str
@@ -32,7 +31,6 @@ class ScanOrchestrator:
                 main_path=task.main_path,
                 all_parts=list(task.all_parts),
                 should_extract=True,
-                score=task.score,
                 stop_reason=task.stop_reason,
                 matched_rules=list(task.matched_rules),
                 detected_ext=task.detected_ext,

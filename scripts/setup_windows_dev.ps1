@@ -3,8 +3,6 @@ param(
     [switch]$Clean,
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64",
-    [ValidateSet("full", "lite")]
-    [string]$RepairSystem = "full",
     [switch]$SkipAcceptanceTestTools
 )
 
@@ -654,21 +652,6 @@ required = [
     'scan_embedded_archives', 'scan_magics_anywhere',
     'scan_zip_central_directory_names', 'inspect_zip_eocd_structure',
     'inspect_pe_overlay_structure',
-    'repair_read_file_range', 'repair_concat_ranges_to_bytes',
-    'repair_write_candidate', 'repair_copy_range_to_file',
-    'repair_concat_ranges_to_file', 'repair_patch_file',
-    'archive_state_to_bytes_native', 'archive_state_size_native',
-    'archive_state_write_to_file_native', 'archive_state_zip_manifest_native',
-    'zip_deep_partial_recovery', 'zip_rebuild_from_local_headers',
-    'zip_directory_field_repair', 'zip_conflict_resolver_rebuild',
-    'gzip_footer_fix_repair', 'gzip_deflate_member_resync_repair',
-    'zstd_frame_salvage_repair', 'tar_boundary_repair',
-    'compression_stream_partial_recovery',
-    'compression_stream_trailing_junk_trim', 'tar_compressed_partial_recovery',
-    'archive_carrier_crop_recovery',
-    'seven_zip_scan_source', 'seven_zip_atomic_repair',
-    'archive_nested_payload_salvage',
-    'rar_block_chain_trim_recovery', 'rar_end_block_repair',
     'watch_broker_acquire', 'watch_broker_release',
     'watch_broker_is_connected', 'watch_broker_ping_seconds',
 ]
@@ -700,44 +683,9 @@ function Test-SevenZipWorker {
     )
 }
 
-function Install-ModelRuntimeDependencies {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PythonPath,
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$BuildArch
-    )
-
-    Write-Step "Installing model runtime dependencies"
-    if ($BuildArch -eq "arm64") {
-        Invoke-Native -FilePath "uv" -Arguments @(
-            "pip", "install", "--python", $PythonPath,
-            "torch==2.7.0",
-            "--index-url", "https://download.pytorch.org/whl/cpu"
-        )
-        Invoke-Native -FilePath "uv" -Arguments @("pip", "install", "--python", $PythonPath, "torch-geometric==2.8.0")
-    } else {
-        Invoke-Native -FilePath "uv" -Arguments @("sync", "--locked", "--extra", "dev", "--extra", "model-runtime", "--python", $PythonPath)
-    }
-    # A successful pip metadata check does not prove compiled Python modules are
-    # intact. Repair the character-detection dependency used by requests, which
-    # torch-geometric imports transitively.
-    Invoke-Native -FilePath "uv" -Arguments @(
-        "pip", "install", "--python", $PythonPath, "--reinstall", "--no-cache",
-        "requests>=2.31,<3", "charset-normalizer>=3.4,<4"
-    )
-    Invoke-Native -FilePath $PythonPath -Arguments @(
-        "-c",
-        "import requests, charset_normalizer, torch, torch_geometric; print('requests', requests.__version__); print('charset_normalizer', charset_normalizer.__version__); print('torch', torch.__version__); print('torch_geometric', torch_geometric.__version__)"
-    )
-}
-
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 $buildArch = $Arch.ToLowerInvariant()
-$repairSystemMode = $RepairSystem.ToLowerInvariant()
 $processArch = Get-ProcessBuildArch
 $rustTarget = Get-RustTarget -BuildArch $buildArch
 
@@ -746,7 +694,6 @@ if ($env:OS -ne "Windows_NT") {
     throw "This setup script only supports Windows."
 }
 Write-Host "Requested architecture: $buildArch"
-Write-Host "Repair system: $repairSystemMode"
 Write-Host "Python/process architecture: $processArch"
 if ($processArch -ne $buildArch) {
     throw "Development setup for native Python extensions must run under a target-architecture Python. This process is '$processArch', so it cannot prepare a real '$buildArch' environment."
@@ -794,16 +741,10 @@ if (Test-Path -LiteralPath $venvConfigPath) {
     }
 }
 Invoke-Native -FilePath "uv" -Arguments @("sync", "--locked", "--extra", "dev", "--python", $pythonCommand)
-if ($repairSystemMode -eq "full") {
-    Install-ModelRuntimeDependencies -PythonPath $venvPython -RepoRoot $repoRoot -BuildArch $buildArch
-} else {
-    Write-Host "Skipping model runtime dependencies for lite environment." -ForegroundColor Yellow
-}
 
 $env:Path = "$venvScripts;$env:Path"
 $env:PYTHONPATH = $repoRoot
 $env:VIRTUAL_ENV = $venvPath
-$env:SUNPACK_REPAIR_SYSTEM = $repairSystemMode
 
 Write-Step "Building and installing Rust native extension"
 $maturinCommand = Get-MaturinCommand -VenvScripts $venvScripts
@@ -853,7 +794,7 @@ Write-Step "Writing environment manifest"
 Invoke-Native -FilePath "powershell" -Arguments @(
     "-NoProfile", "-ExecutionPolicy", "Bypass",
     "-File", (Join-Path $repoRoot "scripts\environment_manifest.ps1"),
-    "-RepoRoot", $repoRoot, "-Arch", $buildArch, "-RepairSystem", $repairSystemMode
+    "-RepoRoot", $repoRoot, "-Arch", $buildArch
 )
 
 Write-Step "Verifying local source execution"

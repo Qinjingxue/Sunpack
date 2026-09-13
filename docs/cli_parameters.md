@@ -58,7 +58,7 @@ python sunpack.py extract [options] <paths...>
 | `--recur VALUE` | 覆盖递归解压设置。当前解析器接受正整数、`*`、`?`。 |
 | `--cleanup VALUE` | 覆盖成功解压后的原压缩包处理方式：`d` 删除，`r` 回收站，`k` 不动。 |
 | `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录。相对路径基于调用目录解析为绝对路径。 |
-| `--direct-file` | 把每个输入路径当作归档文件，跳过初始目录扫描和 detection，直接进入 analysis -> extraction -> verification/repair -> postprocess。只适合明确指定文件。 |
+| `--direct-file` | 把每个输入路径当作归档文件，跳过初始目录扫描和 detection，直接进入 analysis -> extraction -> verification -> postprocess。只适合明确指定文件。 |
 | `--flatten` | 解压后扁平化单一顶层目录。 |
 | `--no-flatten` | 保留解压目录结构。 |
 
@@ -117,7 +117,7 @@ python sunpack.py scan D:\Downloads -v
 python sunpack.py inspect [options] <paths...>
 ```
 
-`inspect` 是 CLI 的只读 detection diagnostics 命令：它会列出候选文件的判定结果、分数、决策阶段、停止原因、确认层结果和 fact 错误。它不同于 repair loop 内部的 `sunpack.repair_inspection` 层；后者不作为 CLI 命令暴露。
+`inspect` 是 CLI 的只读 detection diagnostics 命令：它会列出候选文件的判定结果、决策阶段、停止原因和 fact 错误。
 
 使用 `-v` 时，文本输出会额外打印生效配置、命中规则、打分明细、确认层结果和 fact 错误；JSON 输出会保留这些结构化字段，便于对误判做回归用例。
 
@@ -244,4 +244,4 @@ python sunpack.py config validate --json
 .\scripts\unregister_context_menu.ps1
 ```
 
-发行包内的注册脚本会使用脚本父目录中的 `sunpack.exe`，因此不依赖 `sunpack-x64-lite` 等外层目录名。从源码树运行时，脚本也会识别唯一的 `dist/sunpack-*/sunpack.exe`；若存在多个构建产物，必须用 `-AppPath` 明确选择。找不到打包程序时才使用 `python sunpack.py`。卸载脚本只删除固定注册表键，不依赖安装目录。默认菜单项对文件夹或目录空白处执行 `extract <目标> --ask-pw --pause`，适合给非终端使用场景保留暂停窗口。
+发行包内的注册脚本会使用脚本父目录中的 `sunpack.exe`，因此不依赖外层目录名。从源码树运行时，脚本也会识别唯一的 `dist/sunpack-*/sunpack.exe`；若存在多个构建产物，必须用 `-AppPath` 明确选择。找不到打包程序时才使用 `python sunpack.py`。卸载脚本只删除固定注册表键，不依赖安装目录。默认菜单项对文件夹或目录空白处执行 `extract <目标> --ask-pw --pause`，适合给非终端使用场景保留暂停窗口。

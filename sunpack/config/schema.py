@@ -28,7 +28,6 @@ CONFIG_FIELD_PROVIDER_MODULES = (
     "sunpack.config.fields.filesystem",
     "sunpack.config.fields.passwords",
     "sunpack.config.fields.postprocess",
-    "sunpack.config.fields.repair",
     "sunpack.config.fields.verification",
     "sunpack.config.fields.watch",
 )

@@ -232,7 +232,7 @@ def test_embedded_failure_retains_nested_password_cause():
     assert restored.contains(FailureKind.WRONG_PASSWORD)
 
 
-def test_password_failure_bypasses_repair_verification(tmp_path):
+def test_password_failure_bypasses_verification(tmp_path):
     archive = tmp_path / "encrypted.zip"
     archive.write_bytes(b"encrypted")
     failure = FailureInfo(
@@ -298,7 +298,6 @@ class _NativeTester:
 def _task(path) -> ArchiveTask:
     return ArchiveTask(
         fact_bag=FactBag(),
-        score=10,
         key=str(path),
         main_path=str(path),
         all_parts=[str(path)],

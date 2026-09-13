@@ -65,7 +65,6 @@ def _running_state(**overrides) -> dict:
 def _task(archive: Path) -> ArchiveTask:
     return ArchiveTask(
         fact_bag=FactBag(),
-        score=100,
         main_path=str(archive),
         all_parts=[str(archive)],
         key=str(archive),

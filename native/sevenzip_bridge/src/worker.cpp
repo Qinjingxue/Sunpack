@@ -355,7 +355,6 @@ struct WorkerArchiveInput {
     std::vector<int> volume_numbers;
     std::string validation_error;
     std::vector<sunpack::sevenzip::ExtractInputRange> ranges;
-    std::vector<sunpack::sevenzip::ExtractPatchOperation> patches;
 };
 
 sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
@@ -437,29 +436,6 @@ sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
     return result;
 }
 
-std::vector<unsigned char> base64_decode(const std::string& text) {
-    static const std::string alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    std::vector<unsigned char> out;
-    int value = 0;
-    int bits = -8;
-    for (const unsigned char ch : text) {
-        if (ch == '=') {
-            break;
-        }
-        const auto index = alphabet.find(static_cast<char>(ch));
-        if (index == std::string::npos) {
-            continue;
-        }
-        value = (value << 6) + static_cast<int>(index);
-        bits += 6;
-        if (bits >= 0) {
-            out.push_back(static_cast<unsigned char>((value >> bits) & 0xFF));
-            bits -= 8;
-        }
-    }
-    return out;
-}
-
 std::vector<sunpack::sevenzip::ExtractInputRange> parse_input_ranges(const std::string& request, const std::string& archive_path) {
     using sunpack::sevenzip::ExtractInputRange;
     std::vector<ExtractInputRange> ranges;
@@ -522,8 +498,6 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
     return ranges;
 }
 
-std::vector<sunpack::sevenzip::ExtractPatchOperation> parse_patch_operations_from_state(const std::string& request);
-
 WorkerArchiveInput parse_archive_input_descriptor(
     const std::string& request,
     const std::wstring& fallback_archive_path,
@@ -537,19 +511,11 @@ WorkerArchiveInput parse_archive_input_descriptor(
     input.part_paths = fallback_part_paths;
 
     std::string descriptor = json_object_field(request, "archive_input");
-    const std::string state = json_object_field(request, "archive_state");
-    if (!state.empty()) {
-        const std::string state_source = json_object_field(state, "source");
-        if (!state_source.empty()) {
-            descriptor = state_source;
-        }
-    }
     if (descriptor.empty()) {
         input.ranges = parse_input_ranges(request, json_string_field(request, "archive_path", ""));
         if (!input.ranges.empty()) {
             input.open_mode = utf8_to_wide(json_string_field(request, "kind", "concat_ranges"));
         }
-        input.patches = parse_patch_operations_from_state(request);
         return input;
     }
 
@@ -621,38 +587,7 @@ WorkerArchiveInput parse_archive_input_descriptor(
             input.ranges = parse_ranges_from_objects(json_object_array_field(descriptor, "parts"), entry_path);
         }
     }
-    input.patches = parse_patch_operations_from_state(request);
     return input;
-}
-
-std::vector<sunpack::sevenzip::ExtractPatchOperation> parse_patch_operations_from_state(const std::string& request) {
-    using sunpack::sevenzip::ExtractPatchOperation;
-    std::vector<ExtractPatchOperation> operations;
-    const std::string state = json_object_field(request, "archive_state");
-    if (state.empty()) {
-        return operations;
-    }
-    for (const auto& patch_json : json_object_array_field(state, "patches")) {
-        for (const auto& operation_json : json_object_array_field(patch_json, "operations")) {
-            ExtractPatchOperation operation;
-            operation.op = utf8_to_wide(json_string_field(operation_json, "op", ""));
-            operation.target = utf8_to_wide(json_string_field(operation_json, "target", "logical"));
-            unsigned long long offset = 0;
-            if (json_uint_field_in_object(operation_json, "offset", &offset)) {
-                operation.offset = offset;
-            }
-            unsigned long long size = 0;
-            if (json_uint_field_in_object(operation_json, "size", &size)) {
-                operation.size = size;
-                operation.has_size = true;
-            }
-            operation.data = base64_decode(json_string_field(operation_json, "data_b64", ""));
-            if (!operation.op.empty()) {
-                operations.push_back(std::move(operation));
-            }
-        }
-    }
-    return operations;
 }
 
 std::mutex g_output_mutex;
@@ -984,9 +919,7 @@ int run_request(
         return 2;
     }
     auto extract_with_password = [&](const std::wstring& selected_password) {
-        return !archive_input.patches.empty()
-            ? extract_archive_with_patches(dll_path, archive_input.archive_path, archive_input.part_paths, archive_input.ranges, archive_input.patches, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
-            : archive_input.ranges.empty()
+        return archive_input.ranges.empty()
             ? extract_archive_with_parts(dll_path, archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
             : extract_archive_with_ranges(dll_path, archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
     };
@@ -994,11 +927,6 @@ int run_request(
     ExtractArchiveResult result;
     if (password_candidates.empty()) {
         result = extract_with_password(password);
-    } else if (!archive_input.patches.empty()) {
-        result.status = PasswordTestStatus::Error;
-        result.failure_stage = "password_probe";
-        result.failure_kind = "patched_input_candidates_unsupported";
-        result.message = "password candidate batches are not supported for patched input";
     } else if (password_candidates.size() == 1) {
         // Single candidate: extract directly; the bounded probe runs once only as a failure diagnostic to preserve the all-candidates-rejected contract.
         result = extract_with_password(password_candidates.front());

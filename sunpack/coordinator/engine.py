@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, TextIO
 
 from sunpack.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.repair_inspection import RepairInspectionService
 from sunpack.contracts.pipeline import PipelineArtifacts, PipelineResponse, PipelineTarget
 from sunpack.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary
 from sunpack.contracts.run_context import RunContext
@@ -230,12 +229,9 @@ class PipelineEngine:
                 runtime_cache_stats,
             )
 
-            services = (self._services.repair_inspection_service,)
-            before = runtime_cache_stats(inspection_services=services)
-            cleared = clear_all_runtime_caches(
-                inspection_services=(self._services.repair_inspection_service,),
-            )
-            after = runtime_cache_stats(inspection_services=services)
+            before = runtime_cache_stats()
+            cleared = clear_all_runtime_caches()
+            after = runtime_cache_stats()
             return {"before": before, "cleared": cleared, "after": after}
 
         return await self._broker.run("cache_cleanup", "engine", clear, request_id="engine")
@@ -368,9 +364,6 @@ class _PipelineServices:
         self.broker = broker
         self.max_inflight_files = 64
         self.output_reservations = OutputReservationRegistry()
-        self.repair_inspection_service = RepairInspectionService(
-            config,
-        )
         worker_config = _worker_config(config)
         self.sevenzip_runner = SevenZipRunner(worker_config)
         self._automatic_stage_capacity = int(worker_config.get("stage_thread_capacity", 0) or 0) == 0
@@ -389,9 +382,7 @@ class _PipelineServices:
         def close_services() -> None:
             from sunpack.support.runtime_cache_cleanup import clear_all_runtime_caches
 
-            clear_all_runtime_caches(
-                inspection_services=(self.repair_inspection_service,),
-            )
+            clear_all_runtime_caches()
 
         await broker.run(
             "service_close",
@@ -608,7 +599,6 @@ class _RequestRuntime:
             self.output_scan_policy,
             self.rename_scheduler,
             self.config,
-            repair_inspection_service=services.repair_inspection_service,
             progress_reporter=self.reporter,
             request_id=submission.request_id,
         )

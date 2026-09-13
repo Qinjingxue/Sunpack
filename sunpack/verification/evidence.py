@@ -19,8 +19,6 @@ class VerificationEvidence:
     extraction_result: ExtractionResult
     archive_state: ArchiveState
     archive_source: dict[str, Any]
-    patch_digest: str
-    state_is_patched: bool
     archive_path: str
     output_dir: str
     password: str | None
@@ -31,7 +29,6 @@ class VerificationEvidence:
     extraction_diagnostics: dict[str, Any] = field(default_factory=dict)
     worker_result: dict[str, Any] = field(default_factory=dict)
     worker_native_diagnostics: dict[str, Any] = field(default_factory=dict)
-    repair_hints: dict[str, Any] = field(default_factory=dict)
     selected_codepage: str | None = None
     progress_manifest: dict[str, Any] | None = None
 
@@ -72,8 +69,6 @@ def build_verification_evidence(
     with _phase(phase_timer, f"{phase_prefix}_diagnostics"):
         worker_result = _worker_result(extraction_diagnostics)
         worker_native_diagnostics = _worker_native_diagnostics(worker_result)
-    with _phase(phase_timer, f"{phase_prefix}_repair_hints"):
-        repair_hints = _repair_hints(analysis_facts, archive_state, worker_result, worker_native_diagnostics)
     with _phase(phase_timer, f"{phase_prefix}_progress_manifest"):
         progress_manifest = _load_progress_manifest(extraction_result)
     return VerificationEvidence(
@@ -81,8 +76,6 @@ def build_verification_evidence(
         extraction_result=extraction_result,
         archive_state=archive_state,
         archive_source=archive_state.source.to_dict(),
-        patch_digest=archive_state.effective_patch_digest(),
-        state_is_patched=bool(archive_state.patches),
         archive_path=archive_input.entry_path,
         output_dir=extraction_result.out_dir,
         password=password,
@@ -93,7 +86,6 @@ def build_verification_evidence(
         extraction_diagnostics=extraction_diagnostics,
         worker_result=worker_result,
         worker_native_diagnostics=worker_native_diagnostics,
-        repair_hints=repair_hints,
         selected_codepage=extraction_result.selected_codepage,
         progress_manifest=progress_manifest,
     )
@@ -137,28 +129,6 @@ def _worker_result(diagnostics: dict[str, Any]) -> dict[str, Any]:
 def _worker_native_diagnostics(worker_result: dict[str, Any]) -> dict[str, Any]:
     diagnostics = worker_result.get("diagnostics") if isinstance(worker_result, dict) else {}
     return dict(diagnostics) if isinstance(diagnostics, dict) else {}
-
-
-def _repair_hints(
-    analysis_facts: dict[str, Any],
-    archive_state: ArchiveState,
-    worker_result: dict[str, Any],
-    worker_native_diagnostics: dict[str, Any],
-) -> dict[str, Any]:
-    segment = analysis_facts.get("segment") if isinstance(analysis_facts.get("segment"), dict) else {}
-    state_analysis = archive_state.analysis if isinstance(archive_state.analysis, dict) else {}
-    hints = {
-        "selected_format": analysis_facts.get("selected_format") or state_analysis.get("selected_format") or archive_state.format_hint or archive_state.source.format_hint,
-        "analysis_status": analysis_facts.get("status") or state_analysis.get("status"),
-        "analysis_confidence": state_analysis.get("confidence"),
-        "segment_start": segment.get("start_offset"),
-        "segment_end": segment.get("end_offset"),
-        "damage_flags": list(segment.get("damage_flags") or []),
-        "failure_stage": worker_result.get("failure_stage") or worker_native_diagnostics.get("failure_stage"),
-        "failure_kind": worker_result.get("failure_kind") or worker_native_diagnostics.get("failure_kind"),
-        "native_status": worker_result.get("native_status") or worker_native_diagnostics.get("native_status"),
-    }
-    return {key: value for key, value in hints.items() if value not in (None, "", [])}
 
 
 def _phase(timer: Callable[..., Any] | None, name: str):

@@ -219,8 +219,6 @@ namespace sunpack::sevenzip
 
         const std::vector<ExtractInputRange> &input_ranges,
 
-        const std::vector<ExtractPatchOperation> &input_patches,
-
         const std::wstring &format_hint,
 
         const std::wstring &output_dir,
@@ -351,38 +349,6 @@ namespace sunpack::sevenzip
 
             ComPtr<IInStream> stream = [&]()
             {
-                if (!input_patches.empty())
-                {
-
-                    std::vector<ExtractInputRange> patch_ranges = input_ranges;
-
-                    if (patch_ranges.empty())
-                    {
-
-                        const std::vector<std::wstring> effective_parts = part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
-
-                        for (const auto &path : effective_parts)
-                        {
-
-                            ExtractInputRange range;
-
-                            range.path = path;
-
-                            range.start = 0;
-
-                            range.has_end = false;
-
-                            patch_ranges.push_back(std::move(range));
-                        }
-                    }
-
-                    auto *patched_stream = new PatchedInStream(patch_ranges, input_patches, &result.input_trace);
-
-                    stream_opened = patched_stream->is_open();
-
-                    return ComPtr<IInStream>(patched_stream);
-                }
-
                 if (!input_ranges.empty())
                 {
 
@@ -802,8 +768,6 @@ namespace sunpack::sevenzip
 
             {},
 
-            {},
-
             format_hint,
 
             output_dir,
@@ -922,8 +886,6 @@ namespace sunpack::sevenzip
 
             ranges,
 
-            {},
-
             format_hint,
 
             output_dir,
@@ -972,137 +934,6 @@ namespace sunpack::sevenzip
         result.failure_kind = "backend_unavailable";
 
         result.message = "native archive range extraction is only implemented on Windows";
-
-        return result;
-
-#endif
-    }
-
-    ExtractArchiveResult extract_archive_with_patches(
-
-        const std::wstring &seven_zip_dll_path,
-
-        const std::wstring &archive_path,
-
-        const std::vector<std::wstring> &part_paths,
-
-        const std::vector<ExtractInputRange> &ranges,
-
-        const std::vector<ExtractPatchOperation> &patches,
-
-        const std::wstring &format_hint,
-
-        const std::wstring &password,
-
-        const std::wstring &output_dir,
-
-        const std::wstring &codepage,
-
-        const std::vector<std::wstring> &decoded_names,
-
-        ExtractProgressCallback progress,
-
-        bool dry_run,
-
-        std::shared_ptr<AsyncFileWriter> shared_writer,
-
-        std::size_t job_buffer_budget,
-
-        std::shared_ptr<std::atomic<bool>> cancel_token
-
-    )
-    {
-
-#ifdef _WIN32
-
-        ComModule module(seven_zip_dll_path);
-
-        auto create_object = module.create_object();
-
-        if (!create_object)
-        {
-
-            ExtractArchiveResult result;
-
-            result.status = PasswordTestStatus::BackendUnavailable;
-
-            set_failure(result, "backend_load", "backend_unavailable");
-
-            result.message = "7z.dll could not be loaded";
-
-            return result;
-        }
-
-        const std::vector<std::wstring> effective_part_paths =
-
-            part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
-
-        return extract_archive_internal(
-
-            create_object,
-
-            archive_path,
-
-            password,
-
-            effective_part_paths,
-
-            ranges,
-
-            patches,
-
-            format_hint,
-
-            output_dir,
-
-            codepage,
-
-            decoded_names,
-
-            std::move(progress),
-
-            dry_run,
-            {},
-            false,
-            std::move(shared_writer),
-            job_buffer_budget,
-            std::move(cancel_token));
-
-#else
-
-        (void)seven_zip_dll_path;
-
-        (void)archive_path;
-
-        (void)part_paths;
-
-        (void)ranges;
-
-        (void)patches;
-
-        (void)format_hint;
-
-        (void)password;
-
-        (void)output_dir;
-
-        (void)codepage;
-
-        (void)decoded_names;
-
-        (void)progress;
-
-        (void)dry_run;
-
-        ExtractArchiveResult result;
-
-        result.status = PasswordTestStatus::BackendUnavailable;
-
-        result.failure_stage = "backend_load";
-
-        result.failure_kind = "backend_unavailable";
-
-        result.message = "native archive patched extraction is only implemented on Windows";
 
         return result;
 

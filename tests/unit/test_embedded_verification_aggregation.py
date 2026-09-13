@@ -5,7 +5,8 @@ from sunpack.contracts.verification import (
     CONTENT_INTEGRITY_VERIFIED_COMPLETE,
     DECISION_ACCEPT,
     DECISION_ACCEPT_PARTIAL,
-    DECISION_REPAIR,
+    DECISION_FAIL,
+    DECISION_RETRY_EXTRACT,
     VERIFICATION_STRENGTH_CRC,
     ArchiveCoverageSummary,
     VerificationResult,
@@ -75,7 +76,7 @@ def test_one_damaged_embedded_payload_keeps_carrier_partial():
             "success": False,
             "partial_outputs": True,
         }, _verification(
-            decision=DECISION_REPAIR,
+            decision=DECISION_RETRY_EXTRACT,
             integrity=CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
             completeness=0.5,
             complete=1,
@@ -105,5 +106,5 @@ def test_verifier_accept_does_not_hide_embedded_extraction_failure():
         )),
     ])
 
-    assert result.decision_hint == DECISION_REPAIR
+    assert result.decision_hint == DECISION_FAIL
     assert result.assessment_status != ASSESSMENT_COMPLETE

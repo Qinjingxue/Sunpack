@@ -8,7 +8,7 @@ from typing import Any, Callable
 from sunpack.analysis import ArchiveAnalysisReport, ArchiveAnalyzer
 from sunpack.analysis.request import AnalysisRequest
 from sunpack.coordinator.nested_extraction_policy import EMBEDDED_SCAN_ALLOWED_FACT
-from sunpack.analysis.source import PatchedAnalysisSource, analysis_source_for_descriptor
+from sunpack.analysis.source import analysis_source_for_descriptor
 from sunpack.support.archive_input_projection import (
     write_source_extractable_segments,
     write_source_password_probe_input,
@@ -169,16 +169,10 @@ class ArchiveInputPlanningStage:
 
     def _analyze_task(self, task: ArchiveTask) -> ArchiveAnalysisReport:
         state = task.archive_state()
-        if state.patches:
-            source = PatchedAnalysisSource(
-                state,
-                report_path=state.source.entry_path or task.main_path,
-            )
-        else:
-            source = analysis_source_for_descriptor(
-                state.to_archive_input_descriptor(),
-                report_path=task.main_path,
-            )
+        source = analysis_source_for_descriptor(
+            state.to_archive_input_descriptor(),
+            report_path=task.main_path,
+        )
         prepass = task.fact_bag.get("analysis.signature_prepass")
         initial_prepass = (
             dict(prepass)
@@ -334,8 +328,6 @@ class ArchiveInputPlanningStage:
             source = replace(state.source, format_hint=selected_format) if selected_format else state.source
             new_state = ArchiveState(
                 source=source,
-                patches=list(state.patches),
-                patch_digest=state.effective_patch_digest(),
                 logical_name=state.logical_name,
                 format_hint=selected_format or state.format_hint,
                 analysis=analysis,
@@ -352,11 +344,8 @@ class ArchiveInputPlanningStage:
     def _extractable_segments(self, report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:
         if _is_damaged_native_archive_fallback(report):
             # The embedded scanner also acts as a last-resort ZIP local-header
-            # scanner.  For a native archive, those ranges are recovery
-            # fragments, not independent embedded archives.  Sending them to
-            # the embedded extractor bypasses verification and the repair
-            # policy, and can incorrectly report a partial salvage as a
-            # complete extraction.
+            # scanner. For a native archive, those ranges are malformed
+            # fragments, not independent embedded archives.
             return []
         candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]] = []
         index = 1

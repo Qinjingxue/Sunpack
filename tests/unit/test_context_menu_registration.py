@@ -10,7 +10,7 @@ from pathlib import Path
 def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag():
     repo = Path(__file__).resolve().parents[2]
     script = repo / "scripts" / "register_context_menu.ps1"
-    executable = repo / "dist" / "sunpack-x64-lite" / "sunpack.exe"
+    executable = repo / "dist" / "sunpack-x64" / "sunpack.exe"
     if not executable.exists():
         executable = Path(os.environ.get("COMSPEC", r"C:\Windows\System32\cmd.exe"))
 

@@ -17,7 +17,6 @@ from sunpack.contracts.verification import (
     DECISION_ACCEPT_PARTIAL,
     DECISION_FAIL,
     DECISION_NONE,
-    DECISION_REPAIR,
     DECISION_REQUEST_PASSWORD,
     DECISION_RETRY_EXTRACT,
     CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
@@ -145,7 +144,6 @@ class VerificationPipeline:
                 container_hints=container_hints,
                 verification_strengths=verification_strengths,
                 decision_hints=decision_hints,
-                repair_hints=evidence.repair_hints,
                 evidence=evidence,
             )
     def _build_result(
@@ -161,7 +159,6 @@ class VerificationPipeline:
         container_hints: list[str],
         verification_strengths: list[str],
         decision_hints: list[str],
-        repair_hints: dict | None = None,
         evidence: VerificationEvidence,
     ) -> VerificationResult:
         file_observations = _dedupe_observations(file_observations)
@@ -245,7 +242,6 @@ class VerificationPipeline:
             output_confidence=output_quality.confidence,
             archive_coverage=archive_coverage,
             file_observations=file_observations,
-            repair_hints=dict(repair_hints or {}),
         )
 
 
@@ -274,7 +270,7 @@ def aggregate_payload_verifications(
             verification.decision_hint
             if bool(segment.get("success"))
             or verification.decision_hint != DECISION_ACCEPT
-            else DECISION_REPAIR
+            else DECISION_FAIL
         )
         for segment, verification in payloads
     ]
@@ -293,8 +289,8 @@ def aggregate_payload_verifications(
     elif DECISION_REQUEST_PASSWORD in decisions:
         decision_hint = DECISION_REQUEST_PASSWORD
         assessment_status = ASSESSMENT_UNUSABLE
-    elif DECISION_REPAIR in decisions or DECISION_RETRY_EXTRACT in decisions:
-        decision_hint = DECISION_REPAIR
+    elif DECISION_RETRY_EXTRACT in decisions:
+        decision_hint = DECISION_RETRY_EXTRACT
         assessment_status = ASSESSMENT_UNUSABLE
     else:
         decision_hint = DECISION_FAIL
@@ -354,12 +350,6 @@ def aggregate_payload_verifications(
         }
         for (segment, verification), decision in zip(payloads, decisions)
     ]
-    repair_hints = next((
-        dict(verification.repair_hints)
-        for (segment, verification), decision in zip(payloads, decisions)
-        if decision != DECISION_ACCEPT and verification.repair_hints
-    ), {})
-    repair_hints["embedded_payload_verifications"] = segment_summaries
     return VerificationResult(
         methods_run=list(dict.fromkeys(method for result in results for method in result.methods_run)),
         issues=[issue for result in results for issue in result.issues],
@@ -389,7 +379,6 @@ def aggregate_payload_verifications(
         output_confidence=output_confidence,
         archive_coverage=coverage,
         file_observations=[item for result in results for item in result.file_observations],
-        repair_hints=repair_hints,
     )
 
 
@@ -612,7 +601,6 @@ def _container_integrity_from_evidence(evidence: VerificationEvidence) -> str:
     flags = _collect_container_flags(
         evidence.analysis_facts,
         evidence.archive_state_analysis,
-        evidence.repair_hints,
     )
     if flags & _STRUCTURAL_DAMAGE_FLAGS:
         return CONTAINER_INTEGRITY_STRUCTURALLY_DAMAGED
@@ -925,7 +913,7 @@ def _decision_hint(
         return DECISION_FAIL
     if not evidence_sufficient:
         if content_integrity in {CONTENT_INTEGRITY_VERIFIED_PARTIAL, CONTENT_INTEGRITY_PAYLOAD_DAMAGED}:
-            return DECISION_REPAIR
+            return DECISION_RETRY_EXTRACT
         return DECISION_FAIL
     high_output_quality = (
         output_quality_score >= complete_accept_threshold
@@ -953,8 +941,8 @@ def _decision_hint(
     }:
         if high_output_quality or output_partial_acceptable:
             return DECISION_ACCEPT_PARTIAL
-        return DECISION_REPAIR
-    for decision in (DECISION_REPAIR, DECISION_RETRY_EXTRACT, DECISION_ACCEPT_PARTIAL, DECISION_ACCEPT):
+        return DECISION_RETRY_EXTRACT
+    for decision in (DECISION_RETRY_EXTRACT, DECISION_ACCEPT_PARTIAL, DECISION_ACCEPT):
         if decision in decision_hints:
             return decision
     if assessment_status == ASSESSMENT_PARTIAL and content_integrity in {
@@ -968,7 +956,7 @@ def _decision_hint(
     if assessment_status == ASSESSMENT_PARTIAL and output_partial_acceptable:
         return DECISION_ACCEPT_PARTIAL
     if assessment_status in {ASSESSMENT_PARTIAL, ASSESSMENT_INCONSISTENT}:
-        return DECISION_REPAIR
+        return DECISION_RETRY_EXTRACT
     return DECISION_FAIL
 
 

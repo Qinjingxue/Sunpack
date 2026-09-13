@@ -514,7 +514,7 @@ mod tests {
     #[test]
     fn internal_sunpack_metadata_is_not_user_context() {
         assert!(relative_contains_internal_metadata(
-            ".sunpack\\recovery_report.json"
+            ".sunpack\\metadata.json"
         ));
         assert!(!relative_contains_internal_metadata("game\\readme.txt"));
     }

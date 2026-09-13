@@ -529,13 +529,6 @@ class ArchiveSecurityState:
 
 
 @dataclass(frozen=True)
-class ArchiveRepairState:
-    repaired: bool = False
-    rounds: list[dict[str, Any]] = field(default_factory=list)
-    terminal_reason: str = ""
-
-
-@dataclass(frozen=True)
 class ArchiveRuntimeState:
     output_dir: str = ""
     diagnostics: dict[str, Any] = field(default_factory=dict)
@@ -551,7 +544,6 @@ class ArchiveDescriptor:
     layout: ArchiveLayoutState = field(default_factory=ArchiveLayoutState)
     integrity: ArchiveIntegrityState = field(default_factory=ArchiveIntegrityState)
     security: ArchiveSecurityState = field(default_factory=ArchiveSecurityState)
-    repair: ArchiveRepairState = field(default_factory=ArchiveRepairState)
     runtime: ArchiveRuntimeState = field(default_factory=ArchiveRuntimeState)
 
     def to_dict(self) -> dict[str, Any]:
@@ -564,6 +556,5 @@ class ArchiveDescriptor:
             "layout": self.layout.__dict__,
             "integrity": self.integrity.__dict__,
             "security": self.security.__dict__,
-            "repair": self.repair.__dict__,
             "runtime": self.runtime.__dict__,
         }

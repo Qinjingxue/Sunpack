@@ -73,7 +73,6 @@ pub(crate) fn inspect_zip_directory_consistency(
     let mut descriptor_present = 0usize;
     let mut descriptor_missing = 0usize;
     let mut descriptor_flag_mismatch = 0usize;
-    let mut spurious_descriptor_candidates = 0usize;
     let mut descriptor_candidate_span_overlap = 0usize;
     let mut descriptor_payload_end_to_next_local_delta_min: Option<usize> = None;
     let mut cd_compressed_size_points_into_descriptor = 0usize;
@@ -349,9 +348,6 @@ pub(crate) fn inspect_zip_directory_consistency(
             if has_descriptor && ((entry.flags | local.flags) & 0x08) == 0 {
                 descriptor_span_present_without_flag += 1;
             }
-            if zip_inspect_spurious_descriptor_candidate(&data, &all_entries, index, entry, local, physical_cd_offset) {
-                spurious_descriptor_candidates += 1;
-            }
             if let Some(next_entry) = checked_entries.get(index + 1) {
                 if let Some(next_local_offset) = (next_entry.local_header_offset as usize).checked_add(prefix_len) {
                     if next_local_offset > payload_end {
@@ -408,7 +404,6 @@ pub(crate) fn inspect_zip_directory_consistency(
     descriptor.set_item("descriptor_present_count", descriptor_present)?;
     descriptor.set_item("descriptor_missing_count", descriptor_missing)?;
     descriptor.set_item("descriptor_flag_mismatch_count", descriptor_flag_mismatch)?;
-    descriptor.set_item("spurious_descriptor_candidate_count", spurious_descriptor_candidates)?;
     descriptor.set_item("descriptor_candidate_span_overlap_count", descriptor_candidate_span_overlap)?;
     descriptor.set_item(
         "descriptor_payload_end_to_next_local_delta_min",
@@ -1723,17 +1718,6 @@ fn zip_graph_explanation<'py>(
     explanation.set_item("delta", delta)?;
     explanation.set_item("reason", reason)?;
     explanations.append(explanation)
-}
-
-fn zip_inspect_spurious_descriptor_candidate(
-    data: &[u8],
-    entries: &[CentralEntry],
-    index: usize,
-    entry: &CentralEntry,
-    local: &LocalHeader,
-    cd_offset: usize,
-) -> bool {
-    spurious_descriptor_delete_for_entry(data, entries, index, entry, local, cd_offset).is_some()
 }
 
 fn scan_zip_local_headers(data: &[u8], before: usize, limit: usize) -> Vec<LocalHeader> {

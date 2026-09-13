@@ -7,7 +7,7 @@ def discover_rule_metadata() -> dict[str, dict[str, Any]]:
     discover_rules()
     registry = get_rule_registry()
     metadata: dict[str, dict[str, Any]] = {}
-    for layer in ("precheck", "scoring"):
+    for layer in ("precheck",):
         for name, rule_cls in registry.get_all_rules(layer).items():
             fact_requirements = []
             for requirement in getattr(rule_cls, "fact_requirements", []) or []:

@@ -1,14 +1,9 @@
-import struct
-import zlib
-
 from sunpack.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
 from sunpack.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.contracts.archive_state import ArchiveState, PatchOperation, PatchPlan
 from sunpack.contracts.detection import FactBag
 from sunpack.contracts.tasks import ArchiveTask, SplitArchiveInfo
 from sunpack.coordinator.task_scan import direct_file_task
 from sunpack.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.repair_inspection import RepairInspectionService
 from sunpack.support import archive_knowledge_projection as knowledge_view
 
 
@@ -27,7 +22,7 @@ def _task(path, *, parts=None, volumes=None):
         return direct_file_task(str(path), all_parts=[str(item) for item in parts])
     descriptor = ArchiveInputDescriptor.from_parts(archive_path=str(path), logical_name="case")
     return ArchiveTask(
-        fact_bag=FactBag(), score=10, main_path=str(path), all_parts=[str(path)], logical_name="case",
+        fact_bag=FactBag(), main_path=str(path), all_parts=[str(path)], logical_name="case",
         split_info=SplitArchiveInfo(archive_input=descriptor),
     )
 
@@ -91,7 +86,6 @@ def test_input_planning_stage_writes_extractable_segment_without_switching_task_
     state = task.fact_bag.get("archive.state")
     assert state["source"]["open_mode"] == "file"
     assert state["source"]["format_hint"] == "zip"
-    assert state["patches"] == []
 
 
 def test_input_planning_stage_keeps_sfx_segment_for_standard_archive_extension(tmp_path):
@@ -439,30 +433,6 @@ def test_input_planning_preserves_structured_password_probe_for_split_segment_at
     assert [part["path"] for part in probe["parts"]] == [str(first), str(second)]
 
 
-def test_input_planner_understands_rar_patch_state_without_reading_carrier_prefix(tmp_path):
-    prefix = b"MZ-RAR-SFX-STUB" * 8
-    rar_payload = _rar4_bytes()
-    carrier = tmp_path / "rar-carrier.exe"
-    carrier.write_bytes(prefix + rar_payload)
-    task = _task(carrier)
-    state = ArchiveState.from_archive_input(
-        ArchiveInputDescriptor.from_parts(archive_path=str(carrier), format_hint="rar"),
-        patches=[PatchPlan(
-            id="crop-rar-sfx-prefix",
-            operations=[PatchOperation.delete_range(offset=0, size=len(prefix))],
-            confidence=0.98,
-        )],
-    )
-    task.set_archive_state(state)
-
-    report = RepairInspectionService().analyze_task(task)
-
-    assert task.archive_state().effective_patch_digest() == state.effective_patch_digest()
-    assert any(evidence.format == "rar" for evidence in report.evidences)
-    assert report.path == str(carrier)
-    assert report.size == len(rar_payload)
-
-
 def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_path):
     part1 = tmp_path / "case.7z.001"
     part2 = tmp_path / "case.7z.002"
@@ -506,14 +476,3 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
     }
     state = task.fact_bag.get("archive.state")
     assert state["source"]["open_mode"] == "native_volumes"
-
-
-def _rar4_block(header_type: int, flags: int = 0, payload: bytes = b"") -> bytes:
-    header_size = 7 + len(payload)
-    header = struct.pack("<HBHH", 0, header_type, flags, header_size)
-    crc = zlib.crc32(header[2:] + payload) & 0xFFFF
-    return struct.pack("<H", crc) + header[2:] + payload
-
-
-def _rar4_bytes() -> bytes:
-    return b"Rar!\x1a\x07\x00" + _rar4_block(0x73) + _rar4_block(0x7B)

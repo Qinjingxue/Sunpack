@@ -209,7 +209,7 @@ def _format_structure_payload(fmt: str, details: dict[str, Any], *, task: Archiv
             return dict(private)
         # The native RAR/TAR/stream probes return their structural fields at
         # the top level. Preserve them under format.<fmt>.structure so the
-        # format-private diagnosis graph can observe the fields it models.
+        # Format-specific consumers can observe the structural fields they model.
         return {
             key: value
             for key, value in details.items()

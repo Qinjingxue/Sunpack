@@ -23,25 +23,15 @@ class OutputCleanupEvent(str, Enum):
     VERIFICATION_RETRY = "verification_retry"
     UNRECOVERABLE_FAILURE = "unrecoverable_failure"
     RETRY_EXHAUSTED = "retry_exhausted"
-    EMPTY_REPAIR_OUTPUT = "empty_repair_output"
     TERMINAL_FAILURE = "terminal_failure"
     POLICY_REJECTED_PARTIAL = "policy_rejected_partial"
-    BEAM_CANDIDATE_PREPARE = "beam_candidate_prepare"
-    BEAM_CANDIDATE_REJECTED = "beam_candidate_rejected"
-    BEAM_CONTINUE = "beam_continue"
-    INCUMBENT_REPLACE = "incumbent_replace"
-    INCUMBENT_DISCARD = "incumbent_discard"
     PROMOTE_REPLACE_TARGET = "promote_replace_target"
     PARTIAL_FILE_DISCARD = "partial_file_discard"
-    REPAIR_POLICY_STOP = "repair_policy_stop"
 
 
 class OutputRole(str, Enum):
     CANONICAL = "canonical"
-    BEAM_CANDIDATE = "beam_candidate"
-    INCUMBENT = "incumbent"
     PARTIAL_FILE = "partial_file"
-    REPAIR_WORKSPACE = "repair_workspace"
 
 
 @dataclass(frozen=True)
@@ -162,7 +152,7 @@ class OutputCleanupManager:
             return OutputCleanupResult(reason="symlink_refused", **base)
 
         is_directory = os.path.isdir(path)
-        if request.role != OutputRole.PARTIAL_FILE and not is_directory and request.role != OutputRole.REPAIR_WORKSPACE:
+        if request.role != OutputRole.PARTIAL_FILE and not is_directory:
             return OutputCleanupResult(reason="managed_directory_required", **base)
         if request.role == OutputRole.PARTIAL_FILE and not os.path.isfile(path):
             return OutputCleanupResult(reason="managed_file_required", **base)
@@ -228,9 +218,21 @@ class OutputCleanupManager:
         if role == OutputRole.PARTIAL_FILE:
             root = _absolute(ownership.planned_output_dir)
             return bool(root and _is_strict_descendant(path, root))
-        root = _absolute(ownership.workspace_root)
-        return bool(root and _is_strict_descendant(path, root))
+        return False
 
+
+def cleanup_output_for_retry(
+    path: str,
+    *,
+    planned_output_dir: str | None = None,
+    event: OutputCleanupEvent = OutputCleanupEvent.VERIFICATION_RETRY,
+) -> OutputCleanupResult:
+    """Remove an extraction-owned output before an ordinary retry."""
+    return DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
+        path,
+        event=event,
+        planned_output_dir=planned_output_dir or path,
+    )
 
 DEFAULT_OUTPUT_CLEANUP_MANAGER = OutputCleanupManager()
 

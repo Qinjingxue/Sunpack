@@ -388,7 +388,7 @@ class ArchiveMetadataScanner:
 
         Strict decoding only proves that a byte sequence is possible.  In
         particular, ordinary CP932 pairs frequently decode as rare GBK
-        extension characters.  Scoring unique units avoids repeated parent
+        extension characters.  Ranking unique units avoids repeated parent
         directories dominating archives with many entries.
         """
         if encoding not in {"cp932", "cp936", "cp950"}:

@@ -26,10 +26,8 @@ from sunpack.analysis.source import (
     AnalysisSource,
     FileAnalysisSource,
     MultiVolumeAnalysisSource,
-    PatchedAnalysisSource,
     analysis_source,
 )
-from sunpack.analysis.view import PatchedBinaryView
 
 
 class ArchiveAnalyzer:
@@ -66,14 +64,6 @@ class ArchiveAnalyzer:
             return self._engine.analyze_paths(
                 resolved.volumes,
                 report_path=resolved.report_path or None,
-                initial_prepass=initial_prepass,
-                capabilities=capabilities,
-                embedded_scan_allowed=embedded_scan_allowed,
-            )
-        if isinstance(resolved, PatchedAnalysisSource):
-            return self._engine.analyze_view(
-                PatchedBinaryView(resolved.state),
-                report_path=resolved.report_path,
                 initial_prepass=initial_prepass,
                 capabilities=capabilities,
                 embedded_scan_allowed=embedded_scan_allowed,
@@ -152,6 +142,4 @@ class ArchiveAnalyzer:
             return self._engine._build_single_view(source.path)
         if isinstance(source, MultiVolumeAnalysisSource):
             return self._engine._build_multi_volume_view(source.volumes)
-        if isinstance(source, PatchedAnalysisSource):
-            return PatchedBinaryView(source.state)
         raise TypeError(f"unsupported analysis source: {type(source).__name__}")

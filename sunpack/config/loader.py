@@ -106,7 +106,6 @@ _NAMED_MODULE_LIST_PATHS = {
     ("detection", "fact_collectors"),
     ("detection", "processors"),
     ("detection", "rule_pipeline", "precheck"),
-    ("detection", "rule_pipeline", "scoring"),
 }
 
 _OVERRIDE_ORDERED_NAMED_MODULE_LIST_PATHS = {
@@ -317,7 +316,7 @@ def _validate_pipeline(config: dict[str, Any]):
     pipeline = rule_pipeline_config(config)
     if not isinstance(pipeline, dict):
         raise ConfigError("Missing required config object: detection.rule_pipeline")
-    for layer in ("precheck", "scoring"):
+    for layer in ("precheck",):
         rules = pipeline.get(layer)
         if not isinstance(rules, list):
             raise ConfigError(f"Missing required detection.rule_pipeline list: {layer}")

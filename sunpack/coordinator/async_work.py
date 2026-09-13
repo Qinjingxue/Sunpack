@@ -433,7 +433,7 @@ def _stage_priority(stage: str) -> int:
         return 50
     if any(token in value for token in ("commit", "postprocess", "promotion")):
         return 40
-    if any(token in value for token in ("verify", "repair", "continuation")):
+    if any(token in value for token in ("verify", "continuation")):
         return 30
     if any(token in value for token in ("preflight", "admission", "plan")):
         return 20

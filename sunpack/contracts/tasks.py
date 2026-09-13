@@ -7,7 +7,6 @@ from sunpack.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveIntegrityState,
     ArchiveRelationState,
-    ArchiveRepairState,
 )
 from sunpack.contracts.archive_knowledge import ArchiveKnowledge, merge_knowledge
 from sunpack.contracts.archive_state import ArchiveState
@@ -28,7 +27,6 @@ class SplitArchiveInfo:
 @dataclass
 class ArchiveTask:
     fact_bag: FactBag
-    score: int
     key: str = ""
     main_path: str = ""
     all_parts: Optional[List[str]] = None
@@ -80,7 +78,7 @@ class ArchiveTask:
             self._write_detection_boundary_knowledge()
 
     @classmethod
-    def from_fact_bag(cls, fact_bag: FactBag, score: int, decision=None) -> "ArchiveTask":
+    def from_fact_bag(cls, fact_bag: FactBag, decision=None) -> "ArchiveTask":
         main_path = fact_bag.get("candidate.entry_path") or ""
         all_parts = list(fact_bag.get("candidate.member_paths") or [])
         carrier_path = str(fact_bag.get("candidate.carrier_path") or fact_bag.get("file.path") or main_path)
@@ -114,7 +112,6 @@ class ArchiveTask:
         )
         task = cls(
             fact_bag=fact_bag,
-            score=score,
             key=key,
             main_path=main_path,
             all_parts=all_parts,
@@ -162,7 +159,6 @@ class ArchiveTask:
     def adopt_detection_plan(self, replacement: "ArchiveTask") -> None:
         """Replace this task's detection/input plan while preserving its identity."""
         self.fact_bag = replacement.fact_bag
-        self.score = replacement.score
         self.key = replacement.key
         self.main_path = replacement.main_path
         self.all_parts = list(replacement.all_parts or [])
@@ -236,8 +232,6 @@ class ArchiveTask:
             state = self.archive_state()
             self._store_archive_state(ArchiveState(
                 source=state.source,
-                patches=list(state.patches),
-                patch_digest=state.effective_patch_digest(),
                 logical_name=state.logical_name,
                 format_hint=state.format_hint,
                 analysis=dict(state.analysis),
@@ -318,8 +312,6 @@ class ArchiveTask:
             with _phase(phase_timer, f"{phase_prefix}_rebuild_state_with_knowledge"):
                 state = ArchiveState(
                     source=state.source,
-                    patches=list(state.patches),
-                    patch_digest=state.effective_patch_digest(),
                     logical_name=state.logical_name,
                     format_hint=state.format_hint,
                     analysis=dict(state.analysis),
@@ -329,13 +321,9 @@ class ArchiveTask:
         with _phase(phase_timer, f"{phase_prefix}_snapshot"):
             state_payload = _archive_state_snapshot(state)
             source_payload = state.source.to_dict()
-            patch_stack = [patch.to_dict() for patch in state.patches]
-            patch_digest = state.effective_patch_digest()
         with _phase(phase_timer, f"{phase_prefix}_fact_bag_set"):
             self.fact_bag.set("archive.state", state_payload)
             self.fact_bag.set("archive.source", source_payload)
-            self.fact_bag.set("archive.patch_stack", patch_stack)
-            self.fact_bag.set("archive.patch_digest", patch_digest)
         with _phase(phase_timer, f"{phase_prefix}_knowledge_payload"):
             knowledge_payload = dict(state.knowledge)
         with _phase(phase_timer, f"{phase_prefix}_replace_knowledge"):
@@ -356,8 +344,6 @@ class ArchiveTask:
         damage_flags = []
         if isinstance(evidence, dict):
             damage_flags.extend(evidence.get("damage_flags") or [])
-        repair_loop = knowledge_view.repair_loop(self)
-        repair_rounds = repair_loop.get("rounds")
         source_derivation = knowledge_view.source_derivation(self)
         relation = ArchiveRelationState(
             kind=str(source_derivation.get("kind") or ("split_archive" if self.split_info.is_split else "file")),
@@ -380,11 +366,6 @@ class ArchiveTask:
             ),
             relation=relation,
             integrity=ArchiveIntegrityState(damage_flags=_dedupe([str(item) for item in damage_flags])),
-            repair=ArchiveRepairState(
-                repaired=knowledge_view.archive_repaired(self),
-                rounds=list(repair_rounds) if isinstance(repair_rounds, list) else [],
-                terminal_reason=str(repair_loop.get("terminal_reason") or ""),
-            ),
         )
 
     def _format_hint(self) -> str:

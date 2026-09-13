@@ -8,7 +8,6 @@ from sunpack.contracts.verification import (
     ASSESSMENT_COMPLETE,
     DECISION_ACCEPT,
     DECISION_ACCEPT_PARTIAL,
-    DECISION_REPAIR,
     CONTENT_INTEGRITY_UNKNOWN,
     ArchiveCoverageSummary,
     FileVerificationObservation,

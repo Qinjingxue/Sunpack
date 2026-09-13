@@ -55,7 +55,6 @@ acceptance-dataset-*/
 relationship-grouping-*/
 rpgmaker-semantic-*/
 fixtures/fakepicture.jpg
-.sunpack_repair/
 testfiles/
 test_pipeline_run/
 test_extract/
@@ -73,11 +72,6 @@ native/sevenzip_bridge/build-*/
 datasets/
 bug.txt
 .deepseek/
-repair_training/tmp/
-repair_training/runs/
-repair_training/latest_run.txt
-repair_training/latest_runs.json
-
 # Temporary 7z comparison artifacts
 .codex_7z_compare/
 

@@ -28,7 +28,7 @@ def run_extract_verify(runner, task, out_dir, *, missing_volume_retry=None):
                     request_id="test",
                 )
                 done, value = await broker.run(
-                    "test_verify_repair", task.key or task.main_path,
+                    "test_verify_extract", task.key or task.main_path,
                     _send, state, result, request_id="test",
                 )
                 if done:

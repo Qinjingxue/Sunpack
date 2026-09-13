@@ -10,18 +10,12 @@ from sunpack.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.coordinator.target_scan import build_fact_bags_for_targets
 from sunpack.detection.scheduler import DetectionScheduler
 from tests.helpers.detection_config import with_detection_pipeline
-from tests.helpers.edition import is_lite_edition
 
 
 SCAN_CONFIG = normalize_config(with_detection_pipeline({
-    "thresholds": {"archive_score_threshold": 1, "maybe_archive_threshold": 1},
 }, precheck=[
     {"name": "size_range", "enabled": True, "gte": 0},
     {"name": "embedded_payload_identity", "enabled": True},
-], scoring=[
-    {"name": "zip_structure_identity", "enabled": True},
-    {"name": "seven_zip_structure_identity", "enabled": True},
-    {"name": "rar_structure_identity", "enabled": True},
 ]))
 
 
@@ -70,7 +64,7 @@ def _scan_parts(root: Path) -> dict[str, list[str]]:
         (
             "similar unrelated files are not grouped",
             ["alpha.7z.001", "alpha.7z.002", "alpha.7z.003", "alpha.004", "alpha.7z.notes.txt"],
-            {"alpha": ["alpha.7z.001", "alpha.7z.002", "alpha.7z.003"]},
+                {},
         ),
         (
             "similar group names do not cross",
@@ -82,10 +76,7 @@ def _scan_parts(root: Path) -> dict[str, list[str]]:
                 "story_alt.7z.002",
                 "story_alt.7z.003",
             ],
-            {
-                "story": ["story.7z.001", "story.7z.002", "story.7z.003"],
-                "story_alt": ["story_alt.7z.001", "story_alt.7z.002", "story_alt.7z.003"],
-            },
+                {},
         ),
         (
             "interleaved formats form separate groups",
@@ -100,16 +91,12 @@ def _scan_parts(root: Path) -> dict[str, list[str]]:
                 "mix_b.zip.003",
                 "mix_c.part3.rar",
             ],
-            {
-                "mix_a": ["mix_a.7z.001", "mix_a.7z.002", "mix_a.7z.003"],
-                "mix_b": ["mix_b.zip.001", "mix_b.zip.002", "mix_b.zip.003"],
-                "mix_c": ["mix_c.part1.rar", "mix_c.part2.rar", "mix_c.part3.rar"],
-            },
+                {},
         ),
         (
             "missing first volume remains grouped for backend validation",
             ["losthead.7z.002", "losthead.7z.003"],
-            {"losthead.7z.002": ["losthead.7z.002", "losthead.7z.003"]},
+                {},
         ),
         (
             "fake disguised part files are ignored without real head",
@@ -120,18 +107,12 @@ def _scan_parts(root: Path) -> dict[str, list[str]]:
     ids=lambda value: value if isinstance(value, str) else None,
 )
 def test_relationship_grouping_scenarios(tmp_path, name, files, expected):
-    if is_lite_edition() and expected:
-        pytest.skip("relationship grouping cases require the full detection/repair pipeline")
-
     _write_files(tmp_path / name, files)
 
     assert _scan_parts(tmp_path / name) == expected
 
 
 def test_naked_executable_does_not_attach_disguised_parts(tmp_path):
-    if is_lite_edition():
-        pytest.skip("relationship grouping cases require the full detection/repair pipeline")
-
     root = tmp_path / "disguised_exe_companion_with_regular_exe"
     _write_files(
         root,
@@ -151,7 +132,6 @@ def test_naked_executable_does_not_attach_disguised_parts(tmp_path):
 
     assert actual == {
         "bundle.exe": ["bundle.exe"],
-        "helper": ["helper.part1.rar"],
     }
 
 

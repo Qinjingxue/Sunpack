@@ -149,12 +149,12 @@ FACT_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "file.detected_ext": {
         "type": "str",
-        "producer": "rules.scoring",
+        "producer": "rules.precheck",
         "description": "Archive extension inferred from magic/probe/embedded evidence.",
     },
     "file.magic_matched": {
         "type": "bool",
-        "producer": "rules.scoring",
+        "producer": "rules.precheck",
         "description": "Whether archive identity matched a strong magic signature.",
     },
     "file.container_type": {
@@ -164,12 +164,12 @@ FACT_SCHEMA: dict[str, dict[str, Any]] = {
     },
     "file.probe_detected_archive": {
         "type": "bool",
-        "producer": "rules.scoring",
+        "producer": "rules.precheck",
         "description": "Whether probe-like evidence indicates an archive.",
     },
     "file.probe_offset": {
         "type": "int",
-        "producer": "rules.scoring",
+        "producer": "rules.precheck",
         "description": "Offset where embedded/probed archive payload starts.",
     },
     "file.embedded_archive_found": {

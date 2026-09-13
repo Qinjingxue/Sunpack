@@ -13,7 +13,6 @@ def write_detection_task(task: ArchiveTask) -> None:
         decision = getattr(task.decision, "decision", "")
     payload: dict[str, Any] = {
         "decision": str(decision or ""),
-        "score": int(task.score or 0),
         "stop_reason": str(task.stop_reason or ""),
         "matched_rules": list(task.matched_rules or []),
         "detected_ext": str(task.detected_ext or task.fact_bag.get("file.detected_ext") or ""),

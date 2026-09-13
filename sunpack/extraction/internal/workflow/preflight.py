@@ -31,7 +31,6 @@ class PreExtractInspector:
                     message="Missing or incomplete split volume",
                     message_key="failure.missing_volume",
                     user_action="provide_missing_volume",
-                    repairable=False,
                     details={
                         "completeness_status": status,
                         "confidence": confidence,

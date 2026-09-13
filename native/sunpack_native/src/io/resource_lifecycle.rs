@@ -62,20 +62,6 @@ impl TrackedFile {
     }
 
     #[track_caller]
-    pub(crate) fn open_read_write(path: impl AsRef<Path>, kind: &'static str) -> io::Result<Self> {
-        let path = path.as_ref();
-        let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
-        let file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
-        Ok(Self {
-            file: Some(file),
-            resource,
-        })
-    }
-
-    #[track_caller]
     pub(crate) fn open_reader(path: impl AsRef<Path>, kind: &'static str) -> io::Result<Self> {
         let path = path.as_ref();
         let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;

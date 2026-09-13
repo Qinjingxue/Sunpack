@@ -55,7 +55,7 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
         else:
             assert group.split_volumes[0].source == "structure"
 
-        task = ArchiveTask.from_fact_bag(relation_group_to_fact_bag(group), score=100)
+        task = ArchiveTask.from_fact_bag(relation_group_to_fact_bag(group))
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(task)
         assert len(planned) == 1
         extractor = ExtractionScheduler(max_retries=1)
@@ -81,7 +81,6 @@ def test_mixed_directory_schedules_only_one_structural_head_per_format(mixed_rea
                 {"name": "zip_structure_accept", "enabled": True},
                 {"name": "rar_structure_accept", "enabled": True},
             ],
-            scoring=[],
         )
     )
 
@@ -103,7 +102,6 @@ def test_pipeline_uses_initial_structure_group_without_missing_volume_retry(
         with_detection_pipeline(
             {
                 "recursive_extract": "1",
-                "repair": {"enabled": False},
                 "verification": {"enabled": False, "methods": []},
                 "post_extract": {
                     "archive_cleanup_mode": "k",
@@ -118,7 +116,6 @@ def test_pipeline_uses_initial_structure_group_without_missing_volume_retry(
                 {"name": "size_range", "enabled": True, "gte": 0},
                 {"name": "seven_zip_structure_accept", "enabled": True},
             ],
-            scoring=[{"name": "seven_zip_structure_identity", "enabled": True}],
         )
     )
 
@@ -262,14 +259,12 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path):
     config = normalize_config(
         with_detection_pipeline(
             {
-                "repair": {"enabled": False},
                 "verification": {"enabled": False, "methods": []},
             },
             precheck=[
                 {"name": "size_range", "enabled": True, "gte": 0},
                 {"name": "zip_structure_accept", "enabled": True},
             ],
-            scoring=[{"name": "zip_structure_identity", "enabled": True}],
         )
     )
     tasks = ArchiveTaskProvider(config).scan_targets([str(mixed)])
@@ -323,7 +318,6 @@ def test_embedded_7z_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_
     config = normalize_config(
         with_detection_pipeline(
             {
-                "repair": {"enabled": False},
                 "verification": {"enabled": False, "methods": []},
             },
             precheck=[
@@ -331,7 +325,6 @@ def test_embedded_7z_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_
                 {"name": "seven_zip_structure_accept", "enabled": True},
                 {"name": "embedded_payload_identity", "enabled": True},
             ],
-            scoring=[{"name": "seven_zip_structure_identity", "enabled": True}],
         )
     )
     tasks = ArchiveTaskProvider(config).scan_targets([str(mixed)])
@@ -394,7 +387,6 @@ def test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tm
     config = normalize_config(
         with_detection_pipeline(
             {
-                "repair": {"enabled": False},
                 "verification": {"enabled": False, "methods": []},
             },
             precheck=[
@@ -402,7 +394,6 @@ def test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tm
                 {"name": "rar_structure_accept", "enabled": True},
                 {"name": "embedded_payload_identity", "enabled": True},
             ],
-            scoring=[{"name": "rar_structure_identity", "enabled": True}],
         )
     )
     tasks = ArchiveTaskProvider(config).scan_targets([str(mixed)])
@@ -500,7 +491,6 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
     config = normalize_config(
         with_detection_pipeline(
             {
-                "repair": {"enabled": False},
                 "verification": {"enabled": False, "methods": []},
                 "process": {},
             },
@@ -510,11 +500,6 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
                 {"name": "zip_structure_accept", "enabled": True},
                 {"name": "rar_structure_accept", "enabled": True},
                 {"name": "embedded_payload_identity", "enabled": True},
-            ],
-            scoring=[
-                {"name": "seven_zip_structure_identity", "enabled": True},
-                {"name": "zip_structure_identity", "enabled": True},
-                {"name": "rar_structure_identity", "enabled": True},
             ],
         )
     )

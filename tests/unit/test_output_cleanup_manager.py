@@ -9,8 +9,6 @@ from sunpack.support.output_cleanup import (
     OutputCleanupManager,
     OutputRole,
 )
-from sunpack.repair.result import RepairResult
-from sunpack.repair.stage import ArchiveRepairStage
 
 
 def test_terminal_failure_preserves_nonempty_canonical_output(tmp_path):
@@ -65,23 +63,6 @@ def test_canonical_cleanup_refuses_unowned_and_root_paths(tmp_path):
     assert output.is_dir()
 
 
-def test_scoped_cleanup_refuses_path_outside_workspace(tmp_path):
-    workspace = tmp_path / "workspace"
-    workspace.mkdir()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-
-    result = OutputCleanupManager().cleanup_scoped_path(
-        str(outside),
-        event=OutputCleanupEvent.BEAM_CANDIDATE_REJECTED,
-        role=OutputRole.BEAM_CANDIDATE,
-        workspace_root=str(workspace),
-    )
-
-    assert result.reason == "unowned_output"
-    assert outside.is_dir()
-
-
 def test_partial_file_cleanup_is_limited_to_output_root(tmp_path):
     output = tmp_path / "output"
     output.mkdir()
@@ -118,29 +99,6 @@ def test_executor_failure_is_reported_without_claiming_cleanup(tmp_path):
     assert result.reason == "cleanup_failed"
     assert result.error == "locked"
     assert output.is_dir()
-
-
-def test_repair_policy_stop_only_removes_registered_workspace_children(tmp_path):
-    workspace = tmp_path / "workspace"
-    owned_dir = workspace / "owned-dir"
-    owned_file = workspace / "owned.bin"
-    outside = tmp_path / "outside"
-    owned_dir.mkdir(parents=True)
-    owned_file.write_bytes(b"owned")
-    outside.mkdir()
-    stage = object.__new__(ArchiveRepairStage)
-    stage.config = {"workspace": str(workspace)}
-    result = RepairResult(
-        status="repaired",
-        workspace_paths=[str(owned_dir), str(owned_file), str(outside), str(workspace)],
-    )
-
-    stage._cleanup_policy_stop_temporary_outputs(result)
-
-    assert not owned_dir.exists()
-    assert not owned_file.exists()
-    assert outside.is_dir()
-    assert workspace.is_dir()
 
 
 def test_output_deletion_primitives_are_confined_to_approved_infrastructure():

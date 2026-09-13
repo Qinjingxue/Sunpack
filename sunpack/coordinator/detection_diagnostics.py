@@ -11,7 +11,6 @@ from sunpack.detection.options import DetectionOptions
 class DetectionDiagnostic:
     path: str
     should_extract: bool
-    score: int
     stop_reason: str
     matched_rules: list[str]
     detected_ext: str
@@ -21,7 +20,6 @@ class DetectionDiagnostic:
     decision_stage: str
     discarded_at: str
     deciding_rule: str
-    score_breakdown: list
 
 
 class DetectionDiagnostics:
@@ -43,7 +41,6 @@ class DetectionDiagnostics:
             results.append(DetectionDiagnostic(
                 path=file_path_str,
                 should_extract=decision.should_extract,
-                score=decision.total_score,
                 stop_reason=decision.stop_reason or "",
                 matched_rules=decision.matched_rules,
                 detected_ext=bag.get("file.detected_ext", ""),
@@ -53,7 +50,6 @@ class DetectionDiagnostics:
                 decision_stage=decision.decision_stage,
                 discarded_at=decision.discarded_at or "",
                 deciding_rule=decision.deciding_rule or "",
-                score_breakdown=list(decision.score_breakdown or []),
             ))
 
         return results

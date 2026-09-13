@@ -22,13 +22,6 @@ def detection_pipeline_config() -> dict:
                 "deep_scan_single_candidate_ratio": 0.3,
             },
         ],
-        scoring=[
-            {"name": "seven_zip_structure_identity", "enabled": True},
-            {"name": "rar_structure_identity", "enabled": True},
-            {"name": "zip_structure_identity", "enabled": True},
-            {"name": "tar_structure_identity", "enabled": True},
-            {"name": "compression_stream_identity", "enabled": True},
-        ],
     )
 
 

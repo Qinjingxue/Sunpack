@@ -55,9 +55,6 @@ def write_value(
     *,
     source_layer: str,
     source_module: str = "",
-    round: int | None = None,
-    source_digest: str = "",
-    patch_digest: str = "",
     confidence: float | None = None,
 ) -> ArchiveKnowledge:
     knowledge = ensure_knowledge(target)
@@ -66,9 +63,6 @@ def write_value(
         value,
         source_layer=source_layer,
         source_module=source_module,
-        round=round,
-        source_digest=source_digest,
-        patch_digest=patch_digest,
         confidence=confidence,
     )
     return knowledge
@@ -81,9 +75,6 @@ def write_payload(
     *,
     source_layer: str,
     source_module: str = "",
-    round: int | None = None,
-    source_digest: str = "",
-    patch_digest: str = "",
     confidence: float | None = None,
 ) -> ArchiveKnowledge:
     knowledge = ensure_knowledge(target)
@@ -96,9 +87,6 @@ def write_payload(
             value,
             source_layer=source_layer,
             source_module=source_module,
-            round=round,
-            source_digest=source_digest,
-            patch_digest=patch_digest,
             confidence=confidence,
         )
     return knowledge
@@ -111,9 +99,6 @@ def write_prepared_payload(
     *,
     source_layer: str,
     source_module: str = "",
-    round: int | None = None,
-    source_digest: str = "",
-    patch_digest: str = "",
     confidence: float | None = None,
 ) -> ArchiveKnowledge:
     """Write a newly built JSON-safe payload without recursively normalizing it again."""
@@ -126,9 +111,6 @@ def write_prepared_payload(
             value,
             source_layer=source_layer,
             source_module=source_module,
-            round=round,
-            source_digest=source_digest,
-            patch_digest=patch_digest,
             confidence=confidence,
         )
     return knowledge
@@ -146,9 +128,6 @@ def write_flags(
     *,
     source_layer: str,
     source_module: str = "",
-    round: int | None = None,
-    source_digest: str = "",
-    patch_digest: str = "",
     confidence: float | None = None,
 ) -> ArchiveKnowledge:
     knowledge = ensure_knowledge(target)
@@ -158,7 +137,7 @@ def write_flags(
         source_layer=source_layer,
         source_module=source_module,
     )
-    if round is not None or source_digest or patch_digest or confidence is not None:
+    if confidence is not None:
         write_evidence(
             knowledge,
             path=f"{namespace}.flags",
@@ -224,7 +203,7 @@ def _compact_evidence_value(value: Any) -> Any:
         output: dict[str, Any] = {}
         for key, item in value.items():
             text_key = str(key)
-            if text_key in {"archive_state", "candidate_features", "candidate_log", "workspace_paths"}:
+            if text_key == "archive_state":
                 output[text_key] = _compact_large_value(text_key, item)
             elif text_key in {"stdout", "stderr"} and isinstance(item, str):
                 output[text_key] = item[:4000]

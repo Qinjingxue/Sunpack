@@ -1,6 +1,5 @@
 from typing import Dict, Type
 
-from sunpack.config.edition import detection_scoring_enabled
 from sunpack.detection.pipeline.rules.base import RuleBase
 from sunpack.support.module_discovery import import_static_modules
 
@@ -13,19 +12,10 @@ _PRECHECK_RULE_MODULES = (
     "sunpack.detection.pipeline.rules.precheck.embedded_payload_identity",
 )
 
-_SCORING_RULE_MODULES = (
-    "sunpack.detection.pipeline.rules.scoring.compression_stream_identity",
-    "sunpack.detection.pipeline.rules.scoring.rar_structure_identity",
-    "sunpack.detection.pipeline.rules.scoring.seven_zip_structure_identity",
-    "sunpack.detection.pipeline.rules.scoring.tar_structure_identity",
-    "sunpack.detection.pipeline.rules.scoring.zip_structure_identity",
-)
-
 class RuleRegistry:
     def __init__(self):
         self._rules: Dict[str, Dict[str, Type[RuleBase]]] = {
             "precheck": {},
-            "scoring": {},
         }
 
     def register(self, layer: str, name: str, rule_cls: Type[RuleBase]):
@@ -56,9 +46,6 @@ def discover_rules():
     if _discovered:
         return
 
-    modules = _PRECHECK_RULE_MODULES
-    if detection_scoring_enabled():
-        modules += _SCORING_RULE_MODULES
-    import_static_modules(modules)
+    import_static_modules(_PRECHECK_RULE_MODULES)
 
     _discovered = True

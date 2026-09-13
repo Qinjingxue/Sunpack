@@ -55,7 +55,6 @@ def write_verification_result(
             "output_quality": output_quality,
             "archive_coverage": _archive_coverage_payload(result.archive_coverage),
             "coverage_breakdown": _coverage_breakdown(result),
-            "repair_hints": dict(result.repair_hints or {}),
         }
     with _phase(phase_timer, f"{phase_prefix}_write_summary"):
         prepared_summary = prepare_knowledge_value(summary)
@@ -77,7 +76,6 @@ def write_verification_result(
     if residual:
         with _phase(phase_timer, f"{phase_prefix}_write_residual_flags"):
             write_flags(knowledge, "verification.residual", residual, source_layer="verification", source_module="scheduler")
-            write_flags(knowledge, "repair.residual", residual, source_layer="verification", source_module="scheduler")
     with _phase(phase_timer, f"{phase_prefix}_commit"):
         commit_task_knowledge(task, knowledge, phase_timer=phase_timer, phase_prefix=f"{phase_prefix}_commit")
 

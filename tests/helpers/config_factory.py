@@ -43,9 +43,6 @@ CONFIGS: dict[str, dict[str, Any]] = {
         {"name": "rar_structure_accept", "enabled": True},
         {"name": "compression_stream_accept", "enabled": True},
         {"name": "embedded_payload_identity", "enabled": True},
-    ], scoring=[
-        {"name": "seven_zip_structure_identity", "enabled": True},
-        {"name": "rar_structure_identity", "enabled": True},
     ]),
     "archive_scan_deep_embedded": with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 6, "maybe_archive_threshold": 3},
@@ -64,9 +61,6 @@ CONFIGS: dict[str, dict[str, Any]] = {
         {"name": "rar_structure_accept", "enabled": True},
         {"name": "compression_stream_accept", "enabled": True},
         {"name": "embedded_payload_identity", "enabled": True, "deep_scan_single_candidate_ratio": 1e-9},
-    ], scoring=[
-        {"name": "seven_zip_structure_identity", "enabled": True},
-        {"name": "rar_structure_identity", "enabled": True},
     ]),
 }
 

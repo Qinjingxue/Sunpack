@@ -16,7 +16,7 @@ from sunpack.verification.registry import register_verification_method
 from sunpack.contracts.verification import (
     DECISION_ACCEPT,
     DECISION_ACCEPT_PARTIAL,
-    DECISION_REPAIR,
+    DECISION_RETRY_EXTRACT,
     CONTENT_INTEGRITY_VERIFIED_COMPLETE,
     CONTENT_INTEGRITY_VERIFIED_PARTIAL,
     VERIFICATION_STRENGTH_ORACLE,
@@ -37,11 +37,11 @@ class OracleExpectedOutputMatchMethod:
         coverage = coverage_from_archive_and_output(expected, output_files, method=self.name)
         details = coverage_details(coverage)
         status = "passed" if coverage.failed_files == 0 and coverage.missing_files == 0 and coverage.partial_files == 0 else "warning"
-        decision = DECISION_ACCEPT if coverage.completeness >= 0.999 else DECISION_ACCEPT_PARTIAL if coverage.completeness > 0 else DECISION_REPAIR
+        decision = DECISION_ACCEPT if coverage.completeness >= 0.999 else DECISION_ACCEPT_PARTIAL if coverage.completeness > 0 else DECISION_RETRY_EXTRACT
         issue = VerificationIssue(
             method=self.name,
             code="info.oracle_expected_output_coverage",
-            message="Training oracle expected files were matched against extraction output",
+            message="Expected-file oracle entries were matched against extraction output",
             path=evidence.output_dir,
             expected=len(expected),
             actual={"coverage": details, "oracle_strength": knowledge_view.get(evidence.task, "verification.oracle.oracle_strength", "")},

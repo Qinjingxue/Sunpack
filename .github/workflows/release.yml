@@ -104,7 +104,7 @@ jobs:
           retention-days: 14
 
   build:
-    name: Build ${{ matrix.arch }} lite
+    name: Build ${{ matrix.arch }}
     needs: build-notes
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 150
@@ -113,13 +113,11 @@ jobs:
       matrix:
         include:
           - arch: x64
-            repair_system: lite
             runner: windows-2022
             rust_target: x86_64-pc-windows-msvc
             python_arch: x64
             python_version: "3.11"
           - arch: arm64
-            repair_system: lite
             runner: windows-11-arm
             rust_target: aarch64-pc-windows-msvc
             python_arch: arm64
@@ -160,7 +158,7 @@ jobs:
       - name: Prepare native/tool environment
         shell: pwsh
         run: |
-          .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -RepairSystem ${{ matrix.repair_system }} -SkipAcceptanceTestTools
+          .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -SkipAcceptanceTestTools
 
       - name: Ensure Inno Setup compiler
         shell: pwsh
@@ -208,7 +206,6 @@ jobs:
             SkipTests = $true
             NoPause = $true
             Arch = "${{ matrix.arch }}"
-            RepairSystem = "${{ matrix.repair_system }}"
           }
           if ($version -ne "") {
             $buildArgs.Version = $version
@@ -220,7 +217,7 @@ jobs:
         run: |
           $installers = @(
             Get-ChildItem -LiteralPath "release" `
-              -Filter "sunpack-windows-${{ matrix.arch }}-${{ matrix.repair_system }}-*-setup.exe" `
+              -Filter "sunpack-windows-${{ matrix.arch }}-*-setup.exe" `
               -File
           )
           if ($installers.Count -ne 1) {
@@ -231,14 +228,14 @@ jobs:
       - name: Verify package architecture
         shell: pwsh
         run: |
-          $packageRoot = "dist\sunpack-${{ matrix.arch }}-${{ matrix.repair_system }}"
+          $packageRoot = "dist\sunpack-${{ matrix.arch }}"
           .\scripts\verify_windows_package_arch.ps1 -PackageRoot $packageRoot -Arch ${{ matrix.arch }}
 
       - name: Smoke test Windows installer
         shell: pwsh
         run: |
           $installer = Get-ChildItem -LiteralPath "release" `
-            -Filter "sunpack-windows-${{ matrix.arch }}-${{ matrix.repair_system }}-*-setup.exe" `
+            -Filter "sunpack-windows-${{ matrix.arch }}-*-setup.exe" `
             -File |
             Select-Object -First 1
           .\scripts\test_windows_installer.ps1 -InstallerPath $installer.FullName
@@ -246,8 +243,8 @@ jobs:
       - name: Upload package artifact
         uses: actions/upload-artifact@v7
         with:
-          name: sunpack-windows-${{ matrix.arch }}-${{ matrix.repair_system }}
-          path: release/sunpack-windows-${{ matrix.arch }}-${{ matrix.repair_system }}-*-setup.exe
+          name: sunpack-windows-${{ matrix.arch }}
+          path: release/sunpack-windows-${{ matrix.arch }}-*-setup.exe
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
@@ -286,12 +283,10 @@ jobs:
       - name: Prepare acceptance environment
         shell: pwsh
         run: |
-          .\scripts\setup_windows_dev.ps1 -Arch x64 -RepairSystem lite
+          .\scripts\setup_windows_dev.ps1 -Arch x64
 
       - name: Run acceptance tests
         shell: pwsh
-        env:
-          SUNPACK_REPAIR_SYSTEM: lite
         run: |
           .\run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh -StepTimeoutSeconds 900
 
@@ -331,10 +326,10 @@ jobs:
           set -euo pipefail
           mapfile -t packages < <(find artifacts -type f -name 'sunpack-windows-*-setup.exe' | sort)
           if [ "${#packages[@]}" -ne 2 ]; then
-            echo "Expected two lite Windows installers, found ${#packages[@]}." >&2
+            echo "Expected two Windows installers, found ${#packages[@]}." >&2
             exit 1
           fi
-          for package in x64-lite arm64-lite; do
+          for package in x64 arm64; do
             if ! printf '%s\n' "${packages[@]}" | grep -Eq "/sunpack-windows-${package}-.*-setup\.exe$"; then
               echo "Missing ${package} Windows installer." >&2
               exit 1

@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import threading
 import asyncio
-from types import SimpleNamespace
 
 import pytest
 from sunpack.contracts.archive_knowledge import ArchiveKnowledge
@@ -13,7 +11,7 @@ from sunpack.support.archive_knowledge_projection import (
     source_fingerprint,
 )
 from sunpack.support.global_cache_manager import GLOBAL_CACHE
-from sunpack.support.runtime_cache_cleanup import clear_all_runtime_caches
+from sunpack.support.runtime_cache_cleanup import clear_all_runtime_caches, runtime_cache_stats
 
 
 _TEST_LOOP = asyncio.new_event_loop()
@@ -41,22 +39,18 @@ def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
     attempt_cache.remember_success("fingerprint", "password")
     attempt_cache.remember_negative("fingerprint", "wrong")
 
-    inspection_cache = SimpleNamespace(
-        _items={"item": object()},
-        _lock=threading.Lock(),
-        max_entries=8,
-    )
-    inspection = SimpleNamespace(
-        cache=inspection_cache,
-        clear_cache=lambda: inspection_cache._items.clear(),
-    )
+    stats = runtime_cache_stats()
+    assert stats["global_cache"]["entries"] >= 1
+    assert stats["projection_cache"]["entries"] >= 1
+    assert stats["relation_probe_cache"] == {"successes": 1, "negative": 1}
+    assert "inspection" not in stats
 
-    report = clear_all_runtime_caches(inspection_services=(inspection,))
+    report = clear_all_runtime_caches()
 
     assert report["global_cache"]["entries"] >= 1
     assert report["projection_cache"]["entries"] >= 1
     assert report["relation_probe_cache"] == {"successes": 1, "negative": 1}
-    assert report["inspection"] == [{"entries": 1}]
+    assert "inspection" not in report
     assert GLOBAL_CACHE.stats()["entries"] == 0
     assert source_fingerprint(knowledge)
     assert report["errors"] == []

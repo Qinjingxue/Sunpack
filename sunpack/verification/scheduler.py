@@ -10,7 +10,7 @@ from sunpack.verification.pipeline import VerificationPipeline, aggregate_payloa
 from sunpack.contracts.verification import (
     ASSESSMENT_DISABLED,
     DECISION_ACCEPT,
-    DECISION_REPAIR,
+    DECISION_FAIL,
     DECISION_REQUEST_PASSWORD,
     CONTENT_INTEGRITY_UNKNOWN,
     CONTAINER_INTEGRITY_UNKNOWN,
@@ -75,8 +75,7 @@ class VerificationScheduler:
                     assessment_status=ASSESSMENT_DISABLED,
                     content_integrity=CONTENT_INTEGRITY_UNKNOWN,
                     container_integrity=CONTAINER_INTEGRITY_UNKNOWN,
-                    decision_hint=DECISION_REQUEST_PASSWORD if password_failure else DECISION_REPAIR,
-                    repair_hints=dict(evidence.repair_hints),
+                    decision_hint=DECISION_REQUEST_PASSWORD if password_failure else DECISION_FAIL,
                 )
                 return result
             result = VerificationResult(
@@ -87,7 +86,6 @@ class VerificationScheduler:
                 container_integrity=CONTAINER_INTEGRITY_UNKNOWN,
                 verification_strength=VERIFICATION_STRENGTH_EXTRACTION,
                 decision_hint=DECISION_ACCEPT,
-                repair_hints=dict(evidence.repair_hints),
             )
             return result
         with _phase(phase_timer, f"{phase_prefix}_pipeline"):

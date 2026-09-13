@@ -5,8 +5,6 @@ param(
     [switch]$SkipEnvironmentRefresh,
     [ValidateSet("x64", "arm64")]
     [string]$Arch = "x64",
-    [ValidateSet("full", "lite")]
-    [string]$RepairSystem = "full",
     [ValidateRange(0, 32)]
     [int]$ParallelWorkers = 0,
     [int]$StepTimeoutSeconds = 900
@@ -305,21 +303,6 @@ required = [
     'scan_embedded_archives', 'scan_magics_anywhere',
     'scan_zip_central_directory_names', 'inspect_zip_eocd_structure',
     'inspect_pe_overlay_structure',
-    'repair_read_file_range', 'repair_concat_ranges_to_bytes',
-    'repair_write_candidate', 'repair_copy_range_to_file',
-    'repair_concat_ranges_to_file', 'repair_patch_file',
-    'archive_state_to_bytes_native', 'archive_state_size_native',
-    'archive_state_write_to_file_native', 'archive_state_zip_manifest_native',
-    'zip_deep_partial_recovery', 'zip_rebuild_from_local_headers',
-    'zip_directory_field_repair', 'zip_conflict_resolver_rebuild',
-    'gzip_footer_fix_repair', 'gzip_deflate_member_resync_repair',
-    'zstd_frame_salvage_repair', 'tar_boundary_repair',
-    'compression_stream_partial_recovery',
-    'compression_stream_trailing_junk_trim', 'tar_compressed_partial_recovery',
-    'archive_carrier_crop_recovery',
-    'seven_zip_scan_source', 'seven_zip_atomic_repair',
-    'archive_nested_payload_salvage',
-    'rar_block_chain_trim_recovery', 'rar_end_block_repair',
     'watch_broker_acquire', 'watch_broker_release',
     'watch_broker_is_connected', 'watch_broker_ping_seconds',
 ]
@@ -510,16 +493,10 @@ function Get-EnvironmentRefreshReasons {
         "psutil",
         "send2trash",
         "watchdog",
-        "zstandard",
-        "numpy",
-        "requests",
-        "charset_normalizer"
+        "zstandard"
     )
-    if ($RepairSystem -eq "full") {
-        $requiredPythonModules += @("torch", "torch_geometric")
-    }
     if (-not (Test-PythonImports -PythonPath $VenvPython -Modules $requiredPythonModules)) {
-        $reasons.Add(".venv is missing or cannot import runtime, test, or model modules")
+        $reasons.Add(".venv is missing or cannot import runtime or test modules")
     }
 
     $previousErrorActionPreference = $ErrorActionPreference
@@ -531,7 +508,7 @@ function Get-EnvironmentRefreshReasons {
         $ErrorActionPreference = $previousErrorActionPreference
     }
     if ($nativeSmokeExitCode -ne 0) {
-        $reasons.Add("sunpack_native is missing new native repair APIs")
+        $reasons.Add("sunpack_native native smoke check failed")
     }
 
     $nativeExtension = Get-NativeExtensionPath -PythonPath $VenvPython
@@ -606,8 +583,7 @@ function Ensure-AcceptanceEnvironment {
     Invoke-Native -FilePath "powershell" -Arguments @(
         "-ExecutionPolicy", "Bypass",
         "-File", (Join-Path $RepoRoot "scripts\setup_windows_dev.ps1"),
-        "-Arch", $Arch,
-        "-RepairSystem", $RepairSystem
+        "-Arch", $Arch
     )
 
     # Verify persistence immediately; a successful setup subprocess is not
@@ -650,7 +626,7 @@ function Test-EnvironmentManifest {
 
     $manifestScript = Join-Path $RepoRoot "scripts\environment_manifest.ps1"
     & powershell -NoProfile -ExecutionPolicy Bypass -File $manifestScript `
-        -RepoRoot $RepoRoot -Arch $Arch -RepairSystem $RepairSystem -Check *> $null
+        -RepoRoot $RepoRoot -Arch $Arch -Check *> $null
     return ($LASTEXITCODE -eq 0)
 }
 

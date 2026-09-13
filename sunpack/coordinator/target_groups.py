@@ -78,8 +78,6 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
     bag.set("archive.input", source_descriptor.to_dict())
     bag.set("archive.state", state.to_dict())
     bag.set("archive.source", state.source.to_dict())
-    bag.set("archive.patch_stack", [])
-    bag.set("archive.patch_digest", state.effective_patch_digest())
     file_size = group.carrier_size if group.carrier_path and isinstance(group.carrier_size, int) else group.head_size
     if isinstance(file_size, int):
         bag.set("file.size", file_size)

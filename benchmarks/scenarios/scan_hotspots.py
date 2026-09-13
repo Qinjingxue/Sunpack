@@ -311,7 +311,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
     recorder.wrap(processor_runner.ProcessingCoordinator, "ensure_fact", "processors.ensure_fact")
     recorder.wrap(rule_manager.RuleManager, "evaluate_pool", "rules.evaluate_pool")
     recorder.wrap(rule_manager.RuleManager, "_run_precheck", "rules.run_precheck")
-    recorder.wrap(rule_manager.RuleManager, "_ensure_scoring_rule_facts", "rules.ensure_scoring_rule_facts")
 
 
 def summarize_scan_session(session: Any | None) -> dict[str, Any]:

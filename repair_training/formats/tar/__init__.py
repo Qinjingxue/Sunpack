@@ -1,1 +1,0 @@
-"""TAR training plugin."""

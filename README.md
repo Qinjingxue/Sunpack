@@ -14,7 +14,7 @@ Sunpack包含四部分，前台命令启动器（sunpack.exe），后台常驻�
 
 默认Sunpack为了性能不处理小于1MB的文件，如需调整，可更改sunpack_config.json中的"range": "r >= 1 MB"
 
-Sunpack默认采用Lite版本，Full版本包含机器学习压缩数据修复训练系统，但该系统目前因复杂度过高，效果有限而暂停开发
+SunPack只提供单一运行时版本；论文和离线实验代码不属于用户可见产品运行时。
 
 ## 命令速览
 
@@ -90,10 +90,6 @@ python sunpack.py config validate
 app/config
   -> coordinator
      filesystem->relations-> detection -> extraction -> verification
-                             ^                            |
-                             |                            v
-                            +---------- repair -----------+
-                          repair_inspection ──> analysis
      -> postprocess
 ```
 

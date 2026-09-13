@@ -13,10 +13,10 @@ from sunpack.detection import DetectionScheduler
 from tests.helpers.detection_config import with_detection_pipeline
 
 
-def config_with_rules(scoring):
+def config_with_rules():
     return with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3},
-    }, precheck=[{"name": "size_range", "enabled": True, "gte": 0}], scoring=scoring)
+    }, precheck=[{"name": "size_range", "enabled": True, "gte": 0}])
 
 
 def embedded_config(*, ratio=1.0):
@@ -49,7 +49,7 @@ class DetectionBehaviorTests(unittest.TestCase):
             second.write_bytes(b"two")
             (root / "orphan.002").write_bytes(b"alone")
 
-            groups = build_fact_bags_for_targets([str(root)], config=config_with_rules([]))
+            groups = build_fact_bags_for_targets([str(root)], config=config_with_rules())
             split_group = next(group for group in groups if group.get("file.logical_name") == "game")
             orphan = next(group for group in groups if group.get("file.path", "").endswith("orphan.002"))
             self.assertTrue(split_group.get("relation.is_split_related"))
@@ -64,7 +64,7 @@ class DetectionBehaviorTests(unittest.TestCase):
             second = root / "game.part2.rar"
             first.write_bytes(b"one")
             second.write_bytes(b"two")
-            results = DetectionDiagnostics(config_with_rules([])).collect([str(root)])
+            results = DetectionDiagnostics(config_with_rules()).collect([str(root)])
             split_result = next(result for result in results if result.fact_bag.get("file.logical_name") == "game")
             self.assertEqual(split_result.path, str(first))
             self.assertEqual(split_result.fact_bag.get("file.split_members"), [str(second)])
@@ -81,7 +81,7 @@ class DetectionBehaviorTests(unittest.TestCase):
             self.assertTrue(result.fact_bag.get("file.embedded_archive_found"))
             self.assertTrue(result.fact_bag.get("analysis.signature_prepass", {}).get("full_scan_complete"))
 
-    def test_embedded_scan_precedes_scoring_for_nonzero_offset_archive(self):
+    def test_embedded_scan_precedes_precheck_for_nonzero_offset_archive(self):
         with tempfile.TemporaryDirectory() as tmp:
             carrier = Path(tmp) / "carrier.bin"
             carrier.write_bytes(b"carrier-prefix" + zip_bytes())
@@ -97,7 +97,6 @@ class DetectionBehaviorTests(unittest.TestCase):
                     "enabled": True,
                     "deep_scan_single_candidate_ratio": 1.0,
                 }],
-                scoring=[{"name": "zip_structure_identity", "enabled": True}],
             )
 
             results = ArchiveTaskProvider(config).detect_targets([str(carrier)])
@@ -172,7 +171,6 @@ class DetectionBehaviorTests(unittest.TestCase):
         config = with_detection_pipeline(
             {"thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3}},
             precheck=[{"name": "seven_zip_structure_accept", "enabled": True}],
-            scoring=[],
         )
 
         decision = DetectionScheduler(config).evaluate_bag(bag)

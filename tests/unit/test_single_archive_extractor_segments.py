@@ -129,7 +129,6 @@ def _task(path):
     bag.set("candidate.member_paths", [str(path)])
     return ArchiveTask(
         fact_bag=bag,
-        score=10,
         main_path=str(path),
         all_parts=[str(path)],
         logical_name="case",
@@ -291,10 +290,7 @@ def test_verifier_accepts_carrier_when_every_embedded_payload_is_complete(tmp_pa
     assert verification.container_integrity == CONTAINER_INTEGRITY_UNKNOWN
     assert verification.archive_coverage.expected_files == 2
     assert verification.archive_coverage.complete_files == 2
-    assert [
-        item["decision_hint"]
-        for item in verification.repair_hints["embedded_payload_verifications"]
-    ] == [DECISION_ACCEPT, DECISION_ACCEPT]
+    assert verification.decision_hint == DECISION_ACCEPT
 
 
 def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path):

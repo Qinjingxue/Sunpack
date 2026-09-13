@@ -14,9 +14,7 @@ def test_filename_only_scan_does_not_absorb_unmarked_fuzzy_parts(tmp_path):
 
     config = with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 1, "maybe_archive_threshold": 1},
-    }, scoring=[
-        {"name": "seven_zip_structure_identity", "enabled": True},
-    ])
+    })
 
     bags = build_fact_bags_for_targets([str(tmp_path)], config=config)
     grouped = next(bag for bag in bags if bag.get("file.path") == str(first))

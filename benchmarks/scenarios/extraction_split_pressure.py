@@ -203,12 +203,6 @@ class PipelineTimingProbe:
         self._wrap(batch, "collect_result", "batch_collect_result")
         self._wrap(batch, "_report_task_started", "batch_report_task_started")
         self._wrap(batch, "_report_task_finished", "batch_report_task_finished")
-        repair_stage = getattr(batch, "repair_stage", None)
-        self._wrap(repair_stage, "repair_after_verification_assessment_result", "repair_after_verification")
-        self._wrap(batch, "_repair_after_verification_with_beam", "repair_beam")
-        repair_scheduler = getattr(repair_stage, "scheduler", None) if repair_stage is not None else None
-        if repair_scheduler is not None:
-            self._wrap(repair_scheduler, "generate_repair_candidates", "repair_candidates")
         self._wrap(output_scan, "scan_roots_from_outputs", "output_scan")
         self._wrap(output_scan, "take_scan_session", "output_take_scan_session")
         self._wrap(extractor, "inspect", "password_preflight")
@@ -234,7 +228,6 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
             "batch_execute_ms": 0.0,
             "prepare_ms": 0.0,
             "analysis_ms": 0.0,
-            "repair_ms": 0.0,
             "execute_ready_ms": 0.0,
             "execute_all_wall_ms": 0.0,
             "preflight_ms": 0.0,
@@ -262,17 +255,10 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
         + recorder.ms("output_take_scan_session"),
         2,
     )
-    repair_ms = round(
-        recorder.ms("repair_after_verification")
-        + recorder.ms("repair_beam")
-        + recorder.ms("repair_candidates"),
-        2,
-    )
     measured_stages = (
         recorder.ms("pipeline_scan")
         + recorder.ms("input_planning")
         + batch_execute_ms
-        + repair_ms
         + recorder.ms("password_preflight")
         + recorder.ms("password_resolve")
         + recorder.ms("password_native_test_archive")
@@ -291,7 +277,6 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
         "batch_execute_ms": batch_execute_ms,
         "prepare_ms": recorder.ms("batch_prepare"),
         "analysis_ms": recorder.ms("input_planning"),
-        "repair_ms": repair_ms,
         "execute_ready_ms": 0.0,
         "execute_all_wall_ms": round(pipeline_ms, 2),
         "preflight_ms": recorder.ms("password_preflight"),
@@ -794,7 +779,6 @@ def print_table(rows: list[dict]):
         "pipeline_scan_ms",
         "batch_execute_ms",
         "analysis_ms",
-        "repair_ms",
         "execute_ready_ms",
         "execute_all_wall_ms",
         "preflight_ms",

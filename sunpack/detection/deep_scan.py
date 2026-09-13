@@ -45,7 +45,6 @@ def evaluate_deep_bag(fact_bag: FactBag) -> RuleDecision:
 def _decision(should_extract: bool, reason: str) -> RuleDecision:
     return RuleDecision(
         should_extract=should_extract,
-        total_score=100 if should_extract else 0,
         matched_rules=[DEEP_SCAN_RULE] if should_extract else [],
         stop_reason=reason,
         decision="archive" if should_extract else "not_archive",

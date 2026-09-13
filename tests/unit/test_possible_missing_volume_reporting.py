@@ -17,7 +17,6 @@ def _task(*, split: bool = True, missing_indices=()) -> ArchiveTask:
         bag.set("relation.split_missing_indices", list(missing_indices))
     return ArchiveTask(
         fact_bag=bag,
-        score=10,
         main_path="sample.7z.001" if split else "sample.7z",
         all_parts=["sample.7z.001"] if split else ["sample.7z"],
         split_info=SplitArchiveInfo(is_split=split),

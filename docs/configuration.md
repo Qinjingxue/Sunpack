@@ -46,7 +46,6 @@ pytest 默认注入一份覆盖，关闭 `size_range` 过滤器，因此测试�
 ```json
 {
   "cli": {},
-  "thresholds": {},
   "recursive_extract": "*",
   "nested_extraction_policy": {},
   "post_extract": {},
@@ -54,7 +53,6 @@ pytest 默认注入一份覆盖，关闭 `size_range` 过滤器，因此测试�
   "performance": {},
   "analysis": {},
   "verification": {},
-  "repair": {},
   "detection": {}
 }
 ```
@@ -64,15 +62,6 @@ pytest 默认注入一份覆盖，关闭 `size_range` 过滤器，因此测试�
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
 | `language` | `str` | CLI 语言。`zh` 启用中文，其它值回退英文。 |
-
-## thresholds
-
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `archive_score_threshold` | `int` | `6` | detection 分数达到该值时生成解压任务。 |
-| `maybe_archive_threshold` | `int` | `3` | 分数达到该值但低于归档阈值时标记为可疑归档，但不生成解压任务。 |
-
-`maybe_archive_threshold <= score < archive_score_threshold` 只保留诊断状态；项目没有 detection confirmation 层，也不会在该区间启动昂贵的二次确认。
 
 ## recursive_extract
 
@@ -188,7 +177,7 @@ CLI 可用 `--recur` 临时覆盖。
 | --- | --- | --- |
 | `performance.worker.watchdog_no_progress_timeout_seconds` | `int` / `float` | worker 无进展超时，`0` 表示不限。任务没有总时长上限：只要 worker 仍在输出事件就持续推进，只有真正停滞才会被判定超时。 |
 | `performance.worker.thread_capacity` | `int` | `IInArchive` 线程硬容量；`0` 由 worker 按机器能力探测。实际活动任务数由 native 自适应准入。 |
-| `performance.worker.stage_thread_capacity` | `int` | 同步扫描、分析、校验、修复和后处理的固定 worker 线程容量；`0` 自动按机器能力选择。 |
+| `performance.worker.stage_thread_capacity` | `int` | 同步扫描、分析、校验和后处理的固定 worker 线程容量；`0` 自动按机器能力选择。 |
 | `performance.worker.max_inflight_files` | `int` | 同时存在的文件级异步状态机上限；`0` 自动取 worker 总容量的 4 倍，范围 64–512。 |
 | `performance.worker.max_pending_stage_jobs` | `int` | Python blocking lane 的待执行作业硬上限，满载时异步生产者等待而不创建新线程。 |
 | `performance.worker.adaptive_enabled` | `bool` | 是否启用基于实际输出吞吐的 native 动态并发控制。 |
@@ -256,11 +245,11 @@ watch 直接使用每个监控目录解析出的绝对输出根目录。完整�
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
-| `write_progress_manifest` | `bool` | 是否把内部 progress manifest 写成输出目录中的 `.sunpack/extraction_manifest.json`；默认只保留在内存里供 verification/repair 使用。 |
+| `write_progress_manifest` | `bool` | 是否把内部 progress manifest 写成输出目录中的 `.sunpack/extraction_manifest.json`；默认只保留在内存里供 verification 使用。 |
 
-## input_planning / repair_inspection / analysis
+## input_planning / analysis
 
-三组配置分别对应业务输入规划、repair 检查缓存和通用分析能力。正常主流程由 Detection/input planner 调用 Analysis 形成 worker 输入；只有 repair loop 进入 Repair Inspection。
+两组配置分别对应业务输入规划和通用分析能力。正常主流程由 Detection/input planner 调用 Analysis 形成 worker 输入。
 
 `input_planning` 字段：
 
@@ -268,8 +257,6 @@ watch 直接使用每个监控目录解析出的绝对输出根目录。完整�
 | --- | --- | --- |
 | `enabled` | `bool` | 是否启用归档输入规划。 |
 | `cache_size` | `int` | request 级中立 Analysis report 缓存数量。输入规划按任务顺序执行，不再由 Python 任务 worker 数量控制。 |
-
-`repair_inspection.cache_size` 控制 repair 状态报告缓存数量。cache identity 包含 source identity、分卷、patch digest 和 repair inspection request，避免不同修复状态互相污染。
 
 `analysis` 只配置单次通用能力调用：
 
@@ -281,7 +268,6 @@ watch 直接使用每个监控目录解析出的绝对输出根目录。完整�
 | `prepass` | `dict` | signature prepass 配置。 |
 | `fuzzy` | `dict` | fuzzy binary profile 配置。 |
 | `thresholds.extractable_confidence` | `float` | analysis 认为可直接抽取的置信度。 |
-| `thresholds.repair_confidence` | `float` | 保留给损坏/修复倾向判断的置信度参考。 |
 | `modules` | `list[dict]` | ZIP/RAR/7z/TAR/压缩流等结构模块开关和参数。 |
 
 完整 embedded 深扫由顶层共享配置控制：
@@ -296,8 +282,8 @@ watch 直接使用每个监控目录解析出的绝对输出根目录。完整�
 
 重要行为：
 
-- Analysis 的中等置信度不直接触发 repair。流程先尝试 extraction，再由 verification 判断是否需要 repair。
-- Input planning cache 以归档 source fingerprint 分组；Inspect cache 额外区分 patch digest 和 request fingerprint。
+- Analysis 的结构事实用于输入规划和 verification，不触发额外的修改路径。
+- Input planning cache 以归档 source fingerprint 分组。
 - 结构读取和大文件 I/O 走 Rust binary view，不保留 Python 大文件解析 fallback。
 
 常见 module 参数：
@@ -326,8 +312,6 @@ watch 直接使用每个监控目录解析出的绝对输出根目录。完整�
 | `retry_on_verification_failure` | `bool` | verification 失败时是否允许普通重试。 |
 | `methods` | `list[dict]` | 有序 verification method 列表。 |
 
-旧配置项 `initial_score`、`pass_threshold`、`fail_fast_threshold` 已不是当前模型的一部分，不应再写入配置。
-
 内置 method：
 
 | 方法 | 说明 |
@@ -340,88 +324,6 @@ watch 直接使用每个监控目录解析出的绝对输出根目录。完整�
 | `sample_readability` | 用 Rust 抽样读取输出文件头尾，确认产物基本可读。 |
 
 `archive_test_crc` 和 `sample_readability` 当前默认启用。前者已经 Rust 化输出索引和 CRC 比较，适合大量小文件场景。
-
-## repair
-
-`repair` 只响应 verification 的 `repair` 决策。它生成候选或 patch plan，候选必须重新 extraction + verification，由比较器决定是否接受、继续修复或停止。
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `enabled` | `bool` | 是否启用 repair 层。 |
-| `workspace` | `str` | repair 候选工作目录。 |
-| `keep_candidates` | `bool` | 是否保留候选文件。 |
-| `max_modules_per_job` | `int` | 单个 repair job 最多尝试多少模块。 |
-| `max_attempts_per_task` | `int` | 兼容字段；当前主要使用 repair round 限制。 |
-| `max_repair_rounds_per_task` | `int` | 单任务 repair loop 上限。 |
-| `max_repair_seconds_per_task` | `int` / `float` | 单任务 repair 总耗时上限。 |
-| `max_repair_generated_files_per_task` | `int` | 单任务最多生成候选文件数。 |
-| `max_repair_generated_mb_per_task` | `int` / `float` | 单任务最多生成候选总大小。 |
-| `stages` | `dict` | `targeted`、`safe_repair`、`deep` 阶段开关。 |
-| `safety` | `dict` | `allow_unsafe`、`allow_partial`、`allow_lossy`。 |
-| `deep` | `dict` | deep 模块候选数、输入/输出大小、条目数和验证预算。 |
-| `auto_deep` | `dict` | targeted/safe 无改进时自动放行少量 deep 候选。 |
-| `beam` | `dict` | patch plan beam 搜索和候选评估上限。 |
-| `policy` | `dict` | 内置 diagnosis HGT 与 repair policy transformer 的运行控制。 |
-| `modules` | `list[dict]` | 显式 repair 模块开关。 |
-
-### policy
-
-| 字段 | 类型 | 默认 | 说明 |
-| --- | --- | --- | --- |
-| `enabled` | `bool` | `true` | 是否启用内置双模型 repair policy。 |
-| `strict_model_errors` | `bool` | `false` | 模型推理异常时是否直接抛出；关闭时记录模型错误并返回 unavailable。 |
-| `graph_stop_stale_patience` | `int` | `100` | repair 图连续多少次没有最佳状态提升后强制 stop。 |
-
-双模型由 `sunpack.repair.model.RepairModelRuntime` 直接管理。`provider_package`、`step_mode`、`fallback_to_selector` 和 `disable_beam_when_model_active` 均已删除，配置中出现会直接报错。模型资产由根目录 `models/manifest.json` 管理，可用 `python -m pytest tests\unit\test_model_runtime.py` 检查。
-
-### repair stages
-
-| stage | 用途 |
-| --- | --- |
-| `targeted` | 精确字段修复，例如 ZIP EOCD、7z header CRC、RAR end block。 |
-| `safe_repair` | 边界修剪、尾部垃圾、元数据降级、低风险部分恢复。 |
-| `deep` | 高成本扫描或重建，例如 ZIP deep partial、nested payload、7z solid block salvage、RAR quarantine。 |
-
-`stages.deep` 默认关闭，但 `auto_deep.enabled` 默认开启：只有 targeted/safe 失败、verification 仍请求 repair、且输入大小低于限制时，才自动尝试少量 deep 候选。
-
-### beam
-
-| 字段 | 说明 |
-| --- | --- |
-| `enabled` | 是否启用候选 beam 评估。 |
-| `beam_width` | 每轮保留的状态数量。 |
-| `max_candidates_per_state` | 每个状态最多展开候选数。 |
-| `max_analyze_candidates` | 每轮进入 analysis 的候选上限。 |
-| `max_assess_candidates` | 每轮进入 extraction/verification 的候选上限。 |
-| `max_rounds` | 单次 beam 最多轮数。 |
-| `min_improvement` | 候选必须超过 incumbent 的最小完整度提升。 |
-
-候选比较会综合 assessment status、完整度、complete/partial/failed/missing 文件数、source integrity、patch cost 和 repair module 排名。完整度没有提升时，loop 会主动停止。
-
-### 当前模块矩阵
-
-配置文件中的 `repair.modules` 应与注册表一致。可以用下面的脚本检查：
-
-```powershell
-@'
-from sunpack.repair.pipeline.registry import discover_repair_modules, get_repair_module_registry
-discover_repair_modules()
-print(sorted(get_repair_module_registry().all()))
-'@ | python -
-```
-
-当前主要能力：
-
-| 格式 | 能力 |
-| --- | --- |
-| ZIP | EOCD/comment/CD count/CD offset/ZIP64/local header/data descriptor 修复，central directory rebuild，entry quarantine，partial/deep recovery，overlap/duplicate/conflict resolver。 |
-| TAR | header checksum、metadata downgrade、sparse/PAX/GNU longname、trailing junk、trailing zero block、压缩 TAR 截断恢复。 |
-| gzip/bzip2/xz/zstd | trailing junk trim、footer/frame salvage、truncated partial recovery。 |
-| 7z | start header CRC、next header field、boundary trim、precise boundary、CRC field、solid block partial salvage。 |
-| RAR | trailing junk、carrier crop、block chain trim、end block repair、file quarantine rebuild。 |
-| nested/carrier | carrier crop deep recovery、nested payload salvage。 |
-
-旧键 `repair.trigger_on_medium_confidence`、`repair.trigger_on_extraction_failure` 和 `repair.thresholds` 已移除；配置中出现这些键会直接报错。
 
 ## detection
 
@@ -463,10 +365,7 @@ print(sorted(get_repair_module_registry().all()))
 
 Detection 不调用完整 analysis scheduler 做确认。Detection 中的任意位置 embedding 由递归控制器授权后的 `embedded_payload_identity` 执行；绕过 Detection 的任务则由 Analysis 在头尾分析未解决时调用同一个 scanner。其他格式事实均由有界 Rust probe 产生。大文件压缩流只读取头尾窗口，ZIP 读取 EOCD 尾窗和有限目录项，7z/RAR/TAR 读取受配置上限约束的头部或条目。
 
-检测规则分两层：
-
-- `precheck`：完整结构的严格识别。每个格式规则声明常见格式和扩展名；关系层提供逻辑分卷提示后，匹配规则会被临时提前，校验失败再回到配置顺序。安装器否决与 embedded payload 识别固定最后执行。
-- `scoring`：只处理字段损坏、结构不完整等模糊证据。
+检测规则只保留严格 precheck：完整结构的识别、载体否决与 embedded payload 识别。每个格式规则声明常见格式和扩展名；关系层提供逻辑分卷提示后，匹配规则会被临时提前，校验失败再回到配置顺序。
 
 每条规则至少包含：
 
@@ -484,15 +383,7 @@ Detection 不调用完整 analysis scheduler 做确认。Detection 中的任意�
 | `rar_structure_accept` | precheck | main header/block walk 可信的 RAR 快速接受。 |
 | `compression_stream_accept` | precheck | 完整校验 gzip、bzip2、xz、zstd 流并快速接受。 |
 | `embedded_payload_identity` | precheck | 先否决已知安装器，再对获准深扫且找到可靠嵌入归档的文件直接接受。 |
-| `zip_structure_identity` | scoring | 累计 local header、EOCD、目录锚点和逻辑命名先验。 |
-| `tar_structure_identity` | scoring | 累计 ustar、成员名、数值字段、typeflag、payload 范围和逻辑命名先验。 |
-| `seven_zip_structure_identity` | scoring | 累计 signature、版本、next-header 范围、CRC/NID 和逻辑命名先验。 |
-| `rar_structure_identity` | scoring | 累计 signature、版本、header type/size、后续块和逻辑命名先验。 |
-| `compression_stream_identity` | scoring | 累计流 signature、header 字段、第二锚点、局部完整性和逻辑命名先验。 |
-
-Scoring 不执行严格完整性校验，也不调用 analysis scheduler。扩展名不是独立规则，而是各格式规则内部最多 2 分的命名先验；扩展名或分卷名称本身永远达不到归档阈值。格式字段由 Rust probe 读取，CRC、目录闭合、完整解码和精确流尾仍只用于 precheck 强接受，失败时 scoring 可继续组合其他独立字段。
-
-模糊证据字段依据 PKWARE ZIP APPNOTE、7-Zip 官方恢复说明、RARLAB RAR 5.0 technote、POSIX ustar、RFC 1952、bzip2 1.0.8 manual、XZ File Format 1.2.1 和 Zstandard Compression Format 设计。历史 `extension`、`magic_bytes`、`embedded_archive`、`structure_evidence_identity` scoring 规则、detection 专用 `structure_evidence` processor、CAB/ARJ/CPIO 孤立支持和 confirmation 层均不再存在。
+格式字段由 Rust probe 读取，结构不满足 precheck 时直接保留失败或非归档事实。
 
 ### deep_scan_single_candidate_ratio
 
@@ -539,8 +430,7 @@ Scoring 不执行严格完整性校验，也不调用 analysis scheduler。扩�
 
 ## 修改建议
 
-- 想减少误解压：优先调 `filesystem.scan_filters`、结构 identity 和确认规则。
-- 想提高召回率：优先调 `extension`、结构 identity、`embedded_payload_identity` 和阈值。
-- 想控制修复成本：调 `repair.max_repair_*`、`deep`、`auto_deep` 和 `beam`。
-- 想看为什么失败或为什么接受：跑 `inspect -v`，再看 recovery report 和 verification coverage。
+- 想减少误解压：优先调 `filesystem.scan_filters` 和 precheck 规则。
+- 想提高召回率：优先调 `embedded_payload_identity` 和输入规划参数。
+- 想看为什么失败或为什么接受：跑 `inspect -v`，再看 verification coverage。
 - 修改后运行 `python sunpack.py config validate`。

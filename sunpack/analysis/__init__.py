@@ -15,7 +15,6 @@ from sunpack.analysis.source import (
     AnalysisSource,
     FileAnalysisSource,
     MultiVolumeAnalysisSource,
-    PatchedAnalysisSource,
     analysis_source,
 )
 from sunpack.analysis.result import (
@@ -58,7 +57,6 @@ __all__ = [
     "AnalysisSource",
     "FileAnalysisSource",
     "MultiVolumeAnalysisSource",
-    "PatchedAnalysisSource",
     "analysis_source",
     "VolumeAnchorEvidence",
     "VolumeEvidenceIndex",

@@ -39,7 +39,7 @@ def test_pipeline_progress_observer_receives_a_copy_and_cannot_fail_pipeline(tmp
 
 def test_extract_ready_semantic_event_uses_ordered_progress_sink(tmp_path):
     archive = tmp_path / "ready.zip"
-    task = ArchiveTask(fact_bag=FactBag(), score=1, main_path=str(archive), all_parts=[str(archive)])
+    task = ArchiveTask(fact_bag=FactBag(), main_path=str(archive), all_parts=[str(archive)])
     events = []
     runner = SevenZipRunner({})
     runner.progress_callback = lambda current_task, event: events.append((current_task, event))

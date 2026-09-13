@@ -6,9 +6,6 @@ from dataclasses import asdict, dataclass
 from sunpack.support.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent
 
 
-REPAIR_ENTERED_FACT = "pipeline.repair_entered"
-
-
 @dataclass(frozen=True)
 class FailedOutputCleanupResult:
     cleaned: bool = False
@@ -27,7 +24,6 @@ def cleanup_failed_output_if_eligible(
     *,
     planned_output_dir: str,
     failed: bool,
-    repair_entered: bool,
     force_owned_output_cleanup: bool = False,
 ) -> FailedOutputCleanupResult:
     """Apply the postprocess cleanup policy to a terminal extraction output."""
@@ -35,8 +31,6 @@ def cleanup_failed_output_if_eligible(
     planned = os.path.abspath(str(planned_output_dir or "")) if planned_output_dir else ""
     if not failed:
         return FailedOutputCleanupResult(reason="task_not_failed", output_dir=path)
-    if repair_entered and not force_owned_output_cleanup:
-        return FailedOutputCleanupResult(reason="repair_entered", output_dir=path)
     if not path or not planned or os.path.normcase(path) != os.path.normcase(planned):
         return FailedOutputCleanupResult(reason="unowned_output_dir", output_dir=path)
     cleanup = DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(

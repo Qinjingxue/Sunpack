@@ -59,7 +59,7 @@ class ArchiveTaskProvider:
 
             decision = detection.decision
             if decision.should_extract:
-                task = ArchiveTask.from_fact_bag(bag, decision.total_score, decision=decision)
+                task = ArchiveTask.from_fact_bag(bag, decision=decision)
                 _write_initial_task_knowledge(task)
                 if task.key in processed_keys:
                     continue
@@ -73,12 +73,12 @@ class ArchiveTaskProvider:
         if not bag.has(EMBEDDED_SCAN_ALLOWED_FACT):
             bag.set(EMBEDDED_SCAN_ALLOWED_FACT, False)
         if self._detection_pipeline_disabled():
-            task = ArchiveTask.from_fact_bag(bag, score=0)
+            task = ArchiveTask.from_fact_bag(bag)
         else:
             decision = self.detector.evaluate_bag(bag)
             if not decision.should_extract:
                 return None
-            task = ArchiveTask.from_fact_bag(bag, decision.total_score, decision=decision)
+            task = ArchiveTask.from_fact_bag(bag, decision=decision)
         _write_initial_task_knowledge(task)
         return task
 
@@ -113,7 +113,7 @@ class ArchiveTaskProvider:
             main_path = bag.get("candidate.entry_path")
             if not main_path or not self._is_standard_archive_candidate(main_path, bag):
                 continue
-            task = ArchiveTask.from_fact_bag(bag, score=0)
+            task = ArchiveTask.from_fact_bag(bag)
             _write_initial_task_knowledge(task)
             if task.key in processed_keys:
                 continue
@@ -147,7 +147,7 @@ class ArchiveTaskProvider:
         if self._has_enabled_modules(detector_config.get("processors")):
             return False
         pipeline = rule_pipeline_config(self.config)
-        for layer in ("precheck", "scoring"):
+        for layer in ("precheck",):
             if self._has_enabled_modules(pipeline.get(layer)):
                 return False
         return True

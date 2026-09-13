@@ -13,7 +13,7 @@ def test_native_worker_progress_event_is_forwarded_to_task_callback(tmp_path):
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as handle:
         handle.writestr("payload.bin", payload)
 
-    task = ArchiveTask(fact_bag=FactBag(), score=1, main_path=str(archive), all_parts=[str(archive)])
+    task = ArchiveTask(fact_bag=FactBag(), main_path=str(archive), all_parts=[str(archive)])
     events = []
     runner = SevenZipRunner({})
     runner.worker_path = get_sevenzip_bridge_worker_path()

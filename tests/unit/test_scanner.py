@@ -755,7 +755,6 @@ def test_archive_task_provider_detection_enabled_false_uses_standard_archive_fal
             "processors": [{"name": "zip_structure", "enabled": True}],
             "rule_pipeline": {
                 "precheck": [{"name": "zip_structure_accept", "enabled": True}],
-                "scoring": [{"name": "zip_structure_identity", "enabled": True}],
             },
         },
         "filesystem": {"scan_filters": []},

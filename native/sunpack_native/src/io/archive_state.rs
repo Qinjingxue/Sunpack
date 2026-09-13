@@ -1,9 +1,7 @@
 use crate::io::resource_lifecycle::TrackedFile;
-use base64::Engine;
 use encoding_rs::{BIG5, GBK, SHIFT_JIS, UTF_8};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -19,18 +17,16 @@ const ZIP_UNICODE_PATH_EXTRA_FIELD: u16 = 0x7075;
 pub(crate) fn archive_state_to_bytes_native(
     py: Python<'_>,
     source: &Bound<'_, PyDict>,
-    patches: &Bound<'_, PyList>,
 ) -> PyResult<Py<PyBytes>> {
-    let data = materialize_archive_state(source, patches)?;
+    let data = materialize_archive_state(source)?;
     Ok(PyBytes::new(py, &data).unbind())
 }
 
 #[pyfunction]
 pub(crate) fn archive_state_size_native(
     source: &Bound<'_, PyDict>,
-    patches: &Bound<'_, PyList>,
 ) -> PyResult<u64> {
-    Ok(build_segments(source, patches)?
+    Ok(build_segments(source)?
         .iter()
         .map(|segment| segment.len())
         .sum())
@@ -39,10 +35,9 @@ pub(crate) fn archive_state_size_native(
 #[pyfunction]
 pub(crate) fn archive_state_write_to_file_native(
     source: &Bound<'_, PyDict>,
-    patches: &Bound<'_, PyList>,
     output_path: &str,
 ) -> PyResult<String> {
-    let segments = build_segments(source, patches)?;
+    let segments = build_segments(source)?;
     let output = Path::new(output_path);
     ensure_parent(output)?;
     let temp = temp_path(output);
@@ -59,37 +54,34 @@ pub(crate) fn archive_state_write_to_file_native(
 }
 
 #[pyfunction]
-#[pyo3(signature = (source, patches, max_items=200000, password=None, codepage=None))]
+#[pyo3(signature = (source, max_items=200000, password=None, codepage=None))]
 pub(crate) fn archive_state_zip_manifest_native(
     py: Python<'_>,
     source: &Bound<'_, PyDict>,
-    patches: &Bound<'_, PyList>,
     max_items: usize,
     password: Option<&str>,
     codepage: Option<&str>,
 ) -> PyResult<Py<PyDict>> {
-    let data = materialize_archive_state(source, patches)?;
+    let data = materialize_archive_state(source)?;
     zip_manifest_from_bytes(py, &data, max_items, password, codepage).map(|value| value.unbind())
 }
 
 #[pyfunction]
-#[pyo3(signature = (source, patches, max_items=200000))]
+#[pyo3(signature = (source, max_items=200000))]
 pub(crate) fn archive_state_tar_manifest_native(
     py: Python<'_>,
     source: &Bound<'_, PyDict>,
-    patches: &Bound<'_, PyList>,
     max_items: usize,
 ) -> PyResult<Py<PyDict>> {
-    let segments = build_segments(source, patches)?;
+    let segments = build_segments(source)?;
     let mut reader = TarSegmentReader::new(segments);
     tar_manifest_from_reader(py, &mut reader, max_items).map(|value| value.unbind())
 }
 
 pub(crate) fn materialize_archive_state(
     source: &Bound<'_, PyDict>,
-    patches: &Bound<'_, PyList>,
 ) -> PyResult<Vec<u8>> {
-    let segments = build_segments(source, patches)?;
+    let segments = build_segments(source)?;
     let total: u64 = segments.iter().map(|segment| segment.len()).sum();
     let mut output = Vec::with_capacity(total.min(COPY_CHUNK_SIZE as u64) as usize);
     for segment in &segments {
@@ -101,14 +93,12 @@ pub(crate) fn materialize_archive_state(
 #[derive(Debug, Clone)]
 enum Segment {
     Range { path: String, start: u64, len: u64 },
-    Bytes(Vec<u8>),
 }
 
 impl Segment {
     fn len(&self) -> u64 {
         match self {
             Segment::Range { len, .. } => *len,
-            Segment::Bytes(data) => data.len() as u64,
         }
     }
 }
@@ -172,10 +162,6 @@ impl TarSegmentReader {
             let available = (self.segments[index].len() - within) as usize;
             let take = available.min(output.len() - written);
             match self.segments[index].clone() {
-                Segment::Bytes(data) => {
-                    let start = within as usize;
-                    output[written..written + take].copy_from_slice(&data[start..start + take]);
-                }
                 Segment::Range { path, start, .. } => {
                     if self.file_index != Some(index) {
                         let file = TrackedFile::open(&path, "tar_segment_file")?;
@@ -709,166 +695,11 @@ fn tar_duplicate_path(path: &str, index: usize) -> String {
     format!("{prefix}{stem}({index}){suffix}")
 }
 
-fn build_segments(
-    source: &Bound<'_, PyDict>,
-    patches: &Bound<'_, PyList>,
-) -> PyResult<Vec<Segment>> {
-    let mut segments = source_segments(source)?;
-    for patch in patches.iter() {
-        let patch = patch.cast::<PyDict>()?;
-        let Some(operations_obj) = patch.get_item("operations")? else {
-            continue;
-        };
-        let operations = operations_obj.cast::<PyList>()?;
-        for operation in operations.iter() {
-            let operation = operation.cast::<PyDict>()?;
-            if optional_string(operation, "target")?.unwrap_or_else(|| "logical".to_string())
-                != "logical"
-            {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "unsupported patch target for native archive state view",
-                ));
-            }
-            let op =
-                optional_string(operation, "op")?.unwrap_or_else(|| "replace_range".to_string());
-            let offset = optional_u64(operation, "offset")?.unwrap_or(0);
-            validate_operation_expected(&segments, operation, &op, offset)?;
-            match op.as_str() {
-                "replace_range" => {
-                    let data = operation_data(operation)?;
-                    let size = optional_u64(operation, "size")?.unwrap_or(data.len() as u64);
-                    if size != data.len() as u64 {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "replace_range patch must not change logical size",
-                        ));
-                    }
-                    segments = replace_segments(&segments, offset, size, Segment::Bytes(data))?;
-                }
-                "truncate" => {
-                    segments = slice_segments(&segments, 0, offset)?;
-                }
-                "append" => {
-                    let data = operation_data(operation)?;
-                    if !data.is_empty() {
-                        segments.push(Segment::Bytes(data));
-                    }
-                }
-                "insert" => {
-                    let data = operation_data(operation)?;
-                    if !data.is_empty() {
-                        segments = insert_segments(&segments, offset, Segment::Bytes(data))?;
-                    }
-                }
-                "delete" => {
-                    let size = optional_u64(operation, "size")?.ok_or_else(|| {
-                        pyo3::exceptions::PyValueError::new_err("delete patch requires size")
-                    })?;
-                    let total = segments_size(&segments);
-                    if offset.checked_add(size).is_none_or(|end| end > total) {
-                        return Err(pyo3::exceptions::PyValueError::new_err(
-                            "delete patch is outside the current virtual archive",
-                        ));
-                    }
-                    let before = slice_segments(&segments, 0, offset)?;
-                    let after = slice_segments(&segments, offset + size, total)?;
-                    segments = [before, after].concat();
-                }
-                _ => {
-                    return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                        "unknown patch operation: {op}"
-                    )))
-                }
-            }
-        }
-    }
-    Ok(segments
+fn build_segments(source: &Bound<'_, PyDict>) -> PyResult<Vec<Segment>> {
+    Ok(source_segments(source)?
         .into_iter()
         .filter(|segment| segment.len() > 0)
         .collect())
-}
-
-fn validate_operation_expected(
-    segments: &[Segment],
-    operation: &Bound<'_, PyDict>,
-    op: &str,
-    offset: u64,
-) -> PyResult<()> {
-    let expected_b64 = optional_string(operation, "expected_b64")?.unwrap_or_default();
-    let expected_sha256 = optional_string(operation, "expected_sha256")?.unwrap_or_default();
-    if expected_b64.is_empty() && expected_sha256.is_empty() {
-        return Ok(());
-    }
-    let total = segments_size(segments);
-    let effective_offset = if op == "append" { total } else { offset };
-    if effective_offset > total {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "patch precondition offset is outside the current virtual archive",
-        ));
-    }
-    let expected = if expected_b64.is_empty() {
-        None
-    } else {
-        Some(
-            base64::engine::general_purpose::STANDARD
-                .decode(expected_b64.as_bytes())
-                .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?,
-        )
-    };
-    let expected_len = match expected.as_ref() {
-        Some(data) => Some(data.len() as u64),
-        None => expected_length_for_operation(operation, op)?,
-    };
-    let actual = read_segments_range(segments, effective_offset, expected_len)?;
-    if let Some(expected) = expected {
-        if actual != expected {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "patch precondition failed: expected bytes do not match",
-            ));
-        }
-    }
-    if !expected_sha256.is_empty() {
-        let digest = format!("{:x}", Sha256::digest(&actual));
-        if digest != expected_sha256 {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "patch precondition failed: expected sha256 does not match",
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn expected_length_for_operation(operation: &Bound<'_, PyDict>, op: &str) -> PyResult<Option<u64>> {
-    match op {
-        "replace_range" | "delete" => optional_u64(operation, "size"),
-        "insert" | "append" => Ok(Some(0)),
-        _ => Ok(None),
-    }
-}
-
-fn read_segments_range(segments: &[Segment], offset: u64, len: Option<u64>) -> PyResult<Vec<u8>> {
-    let total = segments_size(segments);
-    if offset > total {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "patch precondition range is outside the current virtual archive",
-        ));
-    }
-    let end = match len {
-        Some(len) => offset.checked_add(len).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("patch precondition range overflow")
-        })?,
-        None => total,
-    };
-    if end > total {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "patch precondition range is outside the current virtual archive",
-        ));
-    }
-    let range = slice_segments(segments, offset, end)?;
-    let mut output = Vec::with_capacity((end - offset).min(COPY_CHUNK_SIZE as u64) as usize);
-    for segment in &range {
-        append_segment(&mut output, segment)?;
-    }
-    Ok(output)
 }
 
 fn source_segments(source: &Bound<'_, PyDict>) -> PyResult<Vec<Segment>> {
@@ -949,78 +780,8 @@ fn range_segment(path: &str, start: u64, end: Option<u64>) -> PyResult<Segment> 
     })
 }
 
-fn replace_segments(
-    segments: &[Segment],
-    offset: u64,
-    size: u64,
-    replacement: Segment,
-) -> PyResult<Vec<Segment>> {
-    let total = segments_size(segments);
-    if offset.checked_add(size).is_none_or(|end| end > total) {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "replace_range patch is outside the current virtual archive",
-        ));
-    }
-    let before = slice_segments(segments, 0, offset)?;
-    let after = slice_segments(segments, offset + size, total)?;
-    Ok([before, vec![replacement], after].concat())
-}
-
-fn insert_segments(segments: &[Segment], offset: u64, inserted: Segment) -> PyResult<Vec<Segment>> {
-    let total = segments_size(segments);
-    if offset > total {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "insert patch is outside the current virtual archive",
-        ));
-    }
-    let before = slice_segments(segments, 0, offset)?;
-    let after = slice_segments(segments, offset, total)?;
-    Ok([before, vec![inserted], after].concat())
-}
-
-fn slice_segments(segments: &[Segment], start: u64, end: u64) -> PyResult<Vec<Segment>> {
-    let mut output = Vec::new();
-    let mut cursor = 0u64;
-    for segment in segments {
-        let segment_start = cursor;
-        let segment_end = cursor + segment.len();
-        cursor = segment_end;
-        if segment_end <= start {
-            continue;
-        }
-        if segment_start >= end {
-            break;
-        }
-        let take_start = start.max(segment_start) - segment_start;
-        let take_end = end.min(segment_end) - segment_start;
-        if take_end <= take_start {
-            continue;
-        }
-        match segment {
-            Segment::Bytes(data) => output.push(Segment::Bytes(
-                data[take_start as usize..take_end as usize].to_vec(),
-            )),
-            Segment::Range {
-                path,
-                start: source_start,
-                ..
-            } => output.push(Segment::Range {
-                path: path.clone(),
-                start: source_start + take_start,
-                len: take_end - take_start,
-            }),
-        }
-    }
-    Ok(output)
-}
-
-fn segments_size(segments: &[Segment]) -> u64 {
-    segments.iter().map(|segment| segment.len()).sum()
-}
-
 fn append_segment(output: &mut Vec<u8>, segment: &Segment) -> PyResult<()> {
     match segment {
-        Segment::Bytes(data) => output.extend_from_slice(data),
         Segment::Range { path, start, len } => {
             let mut file = TrackedFile::open(path, "archive_state_source")?;
             file.seek(SeekFrom::Start(*start))?;
@@ -1033,7 +794,6 @@ fn append_segment(output: &mut Vec<u8>, segment: &Segment) -> PyResult<()> {
 
 fn write_segment(target: &mut TrackedFile, segment: &Segment) -> PyResult<()> {
     match segment {
-        Segment::Bytes(data) => target.write_all(data)?,
         Segment::Range { path, start, len } => {
             let mut source = TrackedFile::open(path, "archive_state_source")?;
             source.seek(SeekFrom::Start(*start))?;
@@ -1049,23 +809,6 @@ fn write_segment(target: &mut TrackedFile, segment: &Segment) -> PyResult<()> {
         }
     }
     Ok(())
-}
-
-fn operation_data(operation: &Bound<'_, PyDict>) -> PyResult<Vec<u8>> {
-    if optional_string(operation, "data_ref")?.is_some_and(|value| !value.is_empty()) {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "data_ref patch payloads are not supported by native archive state view yet",
-        ));
-    }
-    let Some(data_b64) = optional_string(operation, "data_b64")? else {
-        return Ok(Vec::new());
-    };
-    if data_b64.is_empty() {
-        return Ok(Vec::new());
-    }
-    base64::engine::general_purpose::STANDARD
-        .decode(data_b64.as_bytes())
-        .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))
 }
 
 fn zip_manifest_from_bytes<'py>(
@@ -1089,7 +832,7 @@ fn zip_manifest_from_bytes<'py>(
         result.set_item("files", PyList::empty(py))?;
         result.set_item(
             "message",
-            "Patched archive state is not a readable ZIP: EOCD not found",
+            "Archive state is not a readable ZIP: EOCD not found",
         )?;
         return Ok(result);
     };
@@ -1104,7 +847,7 @@ fn zip_manifest_from_bytes<'py>(
     while cursor + 46 <= data.len() && cursor < expected_end {
         if &data[cursor..cursor + 4] != CD_SIG {
             damaged = true;
-            message = "Patched archive state ZIP central directory stopped before expected end"
+            message = "Archive state ZIP central directory stopped before expected end"
                 .to_string();
             break;
         }
@@ -1123,7 +866,7 @@ fn zip_manifest_from_bytes<'py>(
         let record_end = name_end + extra_len + comment_len;
         if record_end > data.len() || record_end > expected_end {
             damaged = true;
-            message = "Patched archive state ZIP central directory entry is truncated".to_string();
+            message = "Archive state ZIP central directory entry is truncated".to_string();
             break;
         }
         item_count += 1;
@@ -1140,7 +883,7 @@ fn zip_manifest_from_bytes<'py>(
             item.set_item("packed_size", compressed_size)?;
             item.set_item("has_crc", true)?;
             item.set_item("crc32", crc32)?;
-            item.set_item("source", "patched_state_zip_central_directory_native")?;
+            item.set_item("source", "archive_state_zip_central_directory_native")?;
             files.append(item)?;
             file_count += 1;
         }
@@ -1157,7 +900,7 @@ fn zip_manifest_from_bytes<'py>(
             {
                 damaged = true;
                 checksum_error = true;
-                message = format!("Patched archive state ZIP payload CRC failed at: {name}");
+                message = format!("Archive state ZIP payload CRC failed at: {name}");
             }
         }
         cursor = record_end;

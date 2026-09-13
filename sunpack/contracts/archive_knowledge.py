@@ -56,16 +56,7 @@ class ArchiveKnowledge:
             return 0
 
     def source_identity(self) -> dict[str, Any]:
-        state = self.get("archive.state", {})
         source = self.get("source.input", {})
-        if isinstance(state, dict):
-            patch_digest = state.get("patch_digest") or state.get("effective_patch_digest")
-            if patch_digest:
-                return {
-                    "kind": "archive_state",
-                    "patch_digest": str(patch_digest),
-                    "format_hint": state.get("format_hint") or (source or {}).get("format_hint") if isinstance(source, dict) else state.get("format_hint"),
-                }
         if isinstance(source, dict):
             return {
                 "kind": str(source.get("kind") or source.get("open_mode") or "file"),
@@ -89,9 +80,6 @@ class ArchiveKnowledge:
         *,
         source_layer: str = "",
         source_module: str = "",
-        round: int | None = None,
-        source_digest: str = "",
-        patch_digest: str = "",
         confidence: float | None = None,
         timestamp: str | None = None,
     ) -> "ArchiveKnowledge":
@@ -109,9 +97,6 @@ class ArchiveKnowledge:
         provenance = _provenance(
             source_layer=source_layer,
             source_module=source_module,
-            round=round,
-            source_digest=source_digest,
-            patch_digest=patch_digest,
             confidence=confidence,
             timestamp=timestamp,
         )
@@ -126,9 +111,6 @@ class ArchiveKnowledge:
         *,
         source_layer: str = "",
         source_module: str = "",
-        round: int | None = None,
-        source_digest: str = "",
-        patch_digest: str = "",
         confidence: float | None = None,
         timestamp: str | None = None,
     ) -> "ArchiveKnowledge":
@@ -146,9 +128,6 @@ class ArchiveKnowledge:
         provenance = _provenance(
             source_layer=source_layer,
             source_module=source_module,
-            round=round,
-            source_digest=source_digest,
-            patch_digest=patch_digest,
             confidence=confidence,
             timestamp=timestamp,
         )
@@ -235,7 +214,7 @@ def project_knowledge_sources(knowledge: Any) -> list[dict[str, Any]]:
     if not raw:
         return []
     sources = [raw]
-    for key in ("filesystem", "relations", "detection", "analysis", "extraction", "verification", "repair", "policy", "format"):
+    for key in ("filesystem", "relations", "detection", "analysis", "extraction", "verification", "policy", "format"):
         value = raw.get(key)
         if isinstance(value, dict):
             sources.append(value)
@@ -273,9 +252,6 @@ def _provenance(
     *,
     source_layer: str = "",
     source_module: str = "",
-    round: int | None = None,
-    source_digest: str = "",
-    patch_digest: str = "",
     confidence: float | None = None,
     timestamp: str | None = None,
 ) -> dict[str, Any]:
@@ -284,12 +260,6 @@ def _provenance(
         payload["source_layer"] = source_layer
     if source_module:
         payload["source_module"] = source_module
-    if round is not None:
-        payload["round"] = int(round)
-    if source_digest:
-        payload["source_digest"] = source_digest
-    if patch_digest:
-        payload["patch_digest"] = patch_digest
     if confidence is not None:
         payload["confidence"] = float(confidence)
     if payload:
@@ -338,7 +308,7 @@ def _compact_evidence_value(value: Any) -> Any:
         output: dict[str, Any] = {}
         for key, item in value.items():
             text_key = str(key)
-            if text_key in {"archive_state", "candidate_features", "candidate_log", "workspace_paths"}:
+            if text_key == "archive_state":
                 output[text_key] = _compact_large_value(text_key, item)
             elif text_key in {"stdout", "stderr"} and isinstance(item, str):
                 output[text_key] = item[:4000]

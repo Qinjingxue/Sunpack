@@ -10,7 +10,6 @@ import zipfile
 import pytest
 
 from sunpack.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, ArchiveInputRange
-from sunpack.contracts.archive_state import ArchiveState, PatchOperation, PatchPlan
 from sunpack.contracts.detection import FactBag
 from sunpack.contracts.tasks import ArchiveTask
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import (
@@ -729,81 +728,6 @@ def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace(
     assert "native_rows" not in result["verified_manifest"]
 
 
-def test_worker_dry_run_reads_archive_state_with_patch_stack(tmp_path):
-    worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
-    archive, eocd = _create_zip_with_bad_eocd_count(tmp_path)
-    descriptor = ArchiveInputDescriptor.from_parts(archive_path=str(archive), format_hint="zip")
-    state = ArchiveState.from_archive_input(
-        descriptor,
-        patches=[PatchPlan(operations=[PatchOperation.replace_bytes(offset=eocd + 10, data=struct.pack("<H", 1))])],
-    )
-    payload = {
-        "job_id": "patched-state",
-        "seven_zip_dll_path": seven_zip_dll,
-        "archive_path": str(archive),
-        "part_paths": [str(archive)],
-        "archive_state": state.to_dict(),
-        "format_hint": "zip",
-        "dry_run": True,
-    }
-
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
-    worker_result = next(item for item in lines if item.get("type") == "result")
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert worker_result["status"] == "ok"
-    assert worker_result["diagnostics"]["input_trace"]["mode"] == "virtual_patch"
-
-
-def test_worker_dry_run_reads_7z_archive_state_with_sfx_crop_patch(tmp_path):
-    worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
-    archive, filename = _create_7z(tmp_path, "sfx-patched", "7z patched payload")
-    prefix = b"MZ-SFX-STUB" * 17
-    carrier = tmp_path / "sfx-carrier.exe"
-    carrier.write_bytes(prefix + archive.read_bytes())
-    state = ArchiveState.from_archive_input(
-        ArchiveInputDescriptor.from_parts(archive_path=str(carrier), format_hint="7z"),
-        patches=[PatchPlan(
-            id="crop-7z-sfx-prefix",
-            operations=[PatchOperation.delete_range(offset=0, size=len(prefix))],
-            confidence=0.98,
-        )],
-    )
-    payload = {
-        "job_id": "patched-7z-state",
-        "seven_zip_dll_path": seven_zip_dll,
-        "archive_path": str(carrier),
-        "part_paths": [str(carrier)],
-        "archive_state": state.to_dict(),
-        "format_hint": "7z",
-        "dry_run": True,
-    }
-
-    result = subprocess.run(
-        [worker],
-        input=json.dumps(payload, ensure_ascii=False),
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-    worker_result = _worker_result(result.stdout)
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert worker_result["status"] == "ok"
-    assert worker_result["diagnostics"]["input_trace"]["mode"] == "virtual_patch"
-    assert worker_result["diagnostics"]["input_trace"]["virtual_size"] == archive.stat().st_size
-    assert worker_result["diagnostics"]["output_trace"]["items"][0]["path"].endswith(filename)
-
-
 def test_worker_output_trace_includes_per_item_failure(tmp_path):
     worker = _require_worker_or_skip()
     seven_zip_dll = _require_7z_dll_or_skip()
@@ -1227,7 +1151,6 @@ def _task(path, archive_input=None):
         bag.set("archive.input", archive_input)
     return ArchiveTask(
         fact_bag=bag,
-        score=100,
         main_path=str(path),
         all_parts=[str(path)],
         key=str(path),

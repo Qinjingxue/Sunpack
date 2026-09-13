@@ -3,9 +3,7 @@ import subprocess
 
 import pytest
 
-from sunpack.repair.loop import terminal_failure_reason
 from sunpack.extraction.internal.workflow.errors import classify_extract_failure
-from sunpack.contracts.extraction import ExtractionResult
 from sunpack.contracts.failures import FailureKind
 from sunpack.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
@@ -30,45 +28,6 @@ def test_split_worker_damage_takes_precedence_over_wrong_password_signal():
     )
 
     assert failure.message_key == "failure.damaged"
-
-
-def test_split_payload_damage_is_not_terminal_wrong_password():
-    result = ExtractionResult(
-        success=False,
-        archive="payload.7z.001",
-        out_dir="out",
-        all_parts=["payload.7z.001", "payload.7z.002"],
-        error="密码错误",
-        diagnostics={
-            "result": {
-                "wrong_password": True,
-                "damaged": True,
-                "checksum_error": True,
-                "failure_kind": "checksum_error",
-            },
-        },
-    )
-
-    assert terminal_failure_reason(result) == ""
-
-
-def test_plain_wrong_password_stays_terminal_for_split_archive():
-    result = ExtractionResult(
-        success=False,
-        archive="payload.7z.001",
-        out_dir="out",
-        all_parts=["payload.7z.001", "payload.7z.002"],
-        error="密码错误",
-        diagnostics={
-            "result": {
-                "wrong_password": True,
-                "damaged": False,
-                "checksum_error": False,
-            },
-        },
-    )
-
-    assert terminal_failure_reason(result) == "wrong_password"
 
 
 def test_unknown_empty_password_on_split_input_is_not_conclusive_password_evidence():

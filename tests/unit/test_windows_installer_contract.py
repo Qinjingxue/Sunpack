@@ -163,7 +163,7 @@ def test_build_and_release_workflow_publish_installers_only():
     assert "portable archive" not in workflow
     assert "sunpack-windows-*.zip" not in workflow
     assert "test_windows_installer.ps1" in workflow
-    assert "Expected two lite Windows installers" in workflow
+    assert "Expected one Windows installer" in workflow
     assert "*-setup.exe" in workflow
 
 
@@ -202,24 +202,6 @@ def test_build_notes_handles_recreated_tags_and_noninteractive_log_output():
     assert "grep -q" not in workflow
 
 
-def test_build_passes_edition_and_architecture_to_acceptance_setup():
-    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
-    acceptance_script = (ROOT / "run_acceptance_tests.ps1").read_text(encoding="utf-8")
-
-    assert '"-Arch", $buildArch' in build_script
-    assert '"-RepairSystem", $repairSystemMode' in build_script
-    assert '[string]$RepairSystem = "full"' in acceptance_script
-    assert '"-RepairSystem", $RepairSystem' in acceptance_script
-
-
-def test_lite_build_excludes_model_runtime_from_shared_environment():
-    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
-
-    assert '"zstandard"' in build_script
-    assert '"--nofollow-import-to=$package"' in build_script
-    assert "Assert-LitePackageExcludesModelRuntime -PackageRoot $distAppRoot" in build_script
-
-
 def test_build_uses_nuitka_only():
     build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
     project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
@@ -238,9 +220,7 @@ def test_build_uses_nuitka_only():
     assert "$nuitkaWatchDist" not in build_script
     assert 'Embed-WindowsApplicationManifest -PythonPath $venvPython' in build_script
     assert '"scripts\\embed_windows_manifest.py"' in build_script
-    assert '"--nofollow-import-to=$package"' in build_script
     assert "Invoke-NuitkaStandaloneBuild" in build_script
-    assert '"sunpack.repair.model.policy"' in build_script
     assert "sunpack.detection.pipeline.rules.hard_stop" not in build_script
     assert "sunpack.detection.pipeline.rules.confirmation" not in build_script
     assert '"nuitka>=2"' in project
@@ -355,20 +335,7 @@ def test_release_packages_copy_only_runtime_tool_files():
         assert '"sunpack_toast.dll"' in script
         assert "Assert-PackagedRuntimeTools" in script
     assert "Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot" in build_script
-    assert 'Assert-PathMissing -LiteralPath (Join-Path $distAppRoot "zstandard")' in build_script
     assert 'Copy-Item -LiteralPath $toolsRoot -Destination $distToolsRoot -Recurse -Force' not in build_script
-
-
-def test_release_packages_exclude_test_only_python_runtime():
-    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
-    project = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-
-    assert '"zstandard",' in build_script
-    assert '"--nofollow-import-to=$package"' in build_script
-    assert 'if ($repairSystemMode -eq "lite")' in build_script
-    assert 'Assert-PathMissing -LiteralPath (Join-Path $distAppRoot "zstandard")' in build_script
-    assert '"zstandard>=0.22.0"' not in project.split("[project.optional-dependencies]", 1)[0]
-    assert '"zstandard>=0.22.0"' in project
 
 
 def test_acceptance_setup_bootstraps_and_checks_real_archive_generators():

@@ -10,7 +10,6 @@
 - `integration/`：pipeline、解压和真实执行路径测试。
 - `real/`：按计划组织的真实归档和真实 watch 端到端矩阵；这里是完整真实场景的权威入口。
 - `cli/`：CLI parser、命令契约和命令行为测试。
-- `training/`：训练产物与正式模型运行时之间的评估和一致性测试。
 
 性能测量、profile 和压力脚本统一放在仓库根目录的 `benchmarks/`，不参与
 pytest 收集。pytest 中只保留行为断言；资源或时序稳定性断言使用 opt-in marker。
@@ -53,7 +52,7 @@ python -m benchmarks --list
 CI 和 acceptance runner（包括根目录 `run_acceptance_tests.ps1`）默认使用逻辑 CPU 核心数的四分之一（下限为 1）个 worker，
 也可通过 `-ParallelWorkers` 调整，例如 `.\scripts\run_ci_tests.ps1 -ParallelWorkers 4`。
 
-`run_acceptance_tests.ps1` 会运行 CLI、unit、functional、integration 和完整 `tests/real` 真实归档/watch 矩阵，并执行 CLI smoke checks；暂不包含 `tests/training/`。模型张量化、训练边界和其他专项脚本仍留在 pytest/CI 专项路径中运行。
+`run_acceptance_tests.ps1` 会运行 CLI、unit、functional、integration 和完整 `tests/real` 真实归档/watch 矩阵，并执行 CLI smoke checks。
 
 脚本中的各测试步骤相互独立：某一步失败或超时后仍会继续执行后续步骤，最后统一汇总；只要存在失败步骤，脚本最终仍返回非零退出码。
 

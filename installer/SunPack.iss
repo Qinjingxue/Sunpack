@@ -2,7 +2,7 @@
   #define AppVersion "dev"
 #endif
 #ifndef SourceDir
-  #define SourceDir "..\dist\sunpack-x64-lite"
+  #define SourceDir "..\dist\sunpack-x64"
 #endif
 #ifndef OutputDir
   #define OutputDir "..\release"
@@ -13,15 +13,11 @@
 #ifndef TargetArch
   #define TargetArch "x64"
 #endif
-#ifndef RepairSystem
-  #define RepairSystem "lite"
-#endif
-
 [Setup]
 AppId={{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}
 AppName=SunPack
 AppVersion={#AppVersion}
-AppVerName=SunPack {#AppVersion} ({#TargetArch}, {#RepairSystem})
+AppVerName=SunPack {#AppVersion} ({#TargetArch})
 AppPublisher=SunPack
 DefaultDirName={autopf}\SunPack
 PrivilegesRequired=admin

@@ -1,7 +1,6 @@
 from typing import Any, List
 
 from sunpack.config.detection_view import rule_pipeline_config
-from sunpack.config.edition import detection_scoring_enabled
 from sunpack.detection.pipeline.rules.config_validator import RuleConfigValidator
 from sunpack.detection.pipeline.rules.types import PreparedRule
 
@@ -13,9 +12,6 @@ class RulePreparer:
         self.validator = validator
 
     def prepare(self, layer: str) -> List[PreparedRule]:
-        if layer == "scoring" and not detection_scoring_enabled():
-            return []
-
         prepared: List[PreparedRule] = []
         pipeline_config = rule_pipeline_config(self.config)
         for rule_cfg in pipeline_config.get(layer, []):

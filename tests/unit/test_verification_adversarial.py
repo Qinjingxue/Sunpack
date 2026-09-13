@@ -13,7 +13,7 @@ def test_expected_name_matching_is_case_and_path_normalized(tmp_path):
     (out_dir / "Docs" / "Readme.TXT").write_text("hello", encoding="utf-8")
     bag = FactBag()
     bag.set("resource.analysis", {"expected_names": ["docs/readme.txt"]})
-    task = ArchiveTask(fact_bag=bag, score=10, key="sample", main_path=str(archive), all_parts=[str(archive)])
+    task = ArchiveTask(fact_bag=bag, key="sample", main_path=str(archive), all_parts=[str(archive)])
     result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
 
     verification = VerificationScheduler({

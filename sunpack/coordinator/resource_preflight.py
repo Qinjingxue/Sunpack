@@ -153,7 +153,7 @@ class ResourcePreflightInspector:
             descriptor = task.archive_state().to_archive_input_descriptor()
         except (TypeError, ValueError):
             return False
-        return bool(task.archive_state().patches) or descriptor.open_mode != "file"
+        return descriptor.open_mode != "file"
 
     def _password_for(self, task: ArchiveTask) -> str:
         if self.password_session is None:

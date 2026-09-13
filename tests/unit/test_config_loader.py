@@ -49,7 +49,6 @@ def _advanced_payload(precheck=None):
             "processors": [],
             "rule_pipeline": {
                 "precheck": precheck or [],
-                "scoring": [{"name": "zip_structure_identity", "enabled": True}],
             },
         },
     }

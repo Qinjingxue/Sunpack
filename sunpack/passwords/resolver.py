@@ -219,15 +219,6 @@ class PasswordResolver:
                 encrypted=False,
             )
 
-        if self._facts_have_patches(fact_bag) and password_state == "required":
-            return PasswordResolution(
-                password=None,
-                status=PasswordResolutionStatus.PASSWORD_REQUIRED,
-                error_text="password verification is unsupported for patched archive state without a resolved password",
-                archive_key=archive_key,
-                encrypted=True,
-            )
-
         archive_input = self._archive_input_for_password_probe(fact_bag) or {}
         fingerprint = build_archive_fingerprint(
             archive_path,
@@ -431,12 +422,3 @@ class PasswordResolver:
             return str(source_derivation.get("candidate_logical_name") or source_derivation.get("candidate_entry_path") or "")
         source_input = knowledge.get("source.input") or {}
         return str(source_input.get("logical_name") or source_input.get("entry_path") or "") if isinstance(source_input, dict) else ""
-
-    @staticmethod
-    def _facts_have_patches(fact_bag: FactBag | None) -> bool:
-        if fact_bag is None:
-            return False
-        state_payload = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge")).get("archive.state") or {}
-        if isinstance(state_payload, dict):
-            return bool(state_payload.get("patches") or state_payload.get("patch_stack") or [])
-        return False

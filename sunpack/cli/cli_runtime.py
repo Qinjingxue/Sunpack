@@ -14,7 +14,6 @@ from sunpack.passwords.internal.clipboard import read_clipboard_passwords
 
 
 def build_effective_config(config: dict) -> dict[str, Any]:
-    thresholds = config.get("thresholds", {}) if isinstance(config.get("thresholds"), dict) else {}
     pipeline_config = rule_pipeline_config(config)
     size_rule = scan_filter_config(config, "size_range")
     size_range_min_bytes = None
@@ -24,10 +23,6 @@ def build_effective_config(config: dict) -> dict[str, Any]:
         elif "greater_than_or_equal" in size_rule:
             size_range_min_bytes = size_rule["greater_than_or_equal"]
     return {
-        "thresholds": {
-            "archive_score_threshold": thresholds.get("archive_score_threshold", 6),
-            "maybe_archive_threshold": thresholds.get("maybe_archive_threshold", 3),
-        },
         "size_range_min_bytes": size_range_min_bytes,
         "worker": {
             "controller": "native_worker",
@@ -41,7 +36,7 @@ def build_effective_config(config: dict) -> dict[str, Any]:
                     for rule in pipeline_config.get(layer, [])
                     if isinstance(rule, dict)
                 ]
-                for layer in ("precheck", "scoring")
+                for layer in ("precheck",)
             }
         },
         "filesystem": {
@@ -264,7 +259,6 @@ def scan_result_to_item(res) -> dict[str, Any]:
         "main_path": main_path,
         "all_parts": all_parts,
         "decision": res.decision,
-        "score": res.score,
         "detected_ext": res.detected_ext,
         "split_role": getattr(res, "split_role", facts.get("file.split_role")),
         "reasons": list(res.matched_rules or []),
@@ -286,8 +280,6 @@ def inspect_result_to_item(res) -> dict[str, Any]:
         "deciding_rule": getattr(res, "deciding_rule", "") or None,
         "stop_reason": getattr(res, "stop_reason", "") or None,
         "should_extract": res.should_extract,
-        "score": res.score,
-        "score_breakdown": list(getattr(res, "score_breakdown", []) or []),
         "size": facts.get("file.size", size),
         "ext": ext,
         "detected_ext": res.detected_ext or facts.get("file.detected_ext") or None,

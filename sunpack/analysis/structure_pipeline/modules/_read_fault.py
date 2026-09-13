@@ -2,7 +2,7 @@ from __future__ import annotations
 
 
 def read_fault_damage_flags(native: dict) -> list[str]:
-    """Project a native field-level read fault into repair-routing evidence."""
+    """Project a native field-level read fault into input-integrity evidence."""
 
     fault = native.get("read_error")
     if not isinstance(fault, dict):

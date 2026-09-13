@@ -88,7 +88,6 @@ def classify_extract_failure(
                     return _failure(
                         FailureKind.DAMAGED,
                         "failure.damaged",
-                        repairable=True,
                         details={
                             "evidence": "zipcrypto_entry_crc_proven_before_failure",
                             "password_crc_proven_items": int(worker_result.get("password_crc_proven_items") or 0),
@@ -106,7 +105,6 @@ def classify_extract_failure(
             return _failure(
                 FailureKind.DAMAGED,
                 "failure.damaged",
-                repairable=True,
                 details=(
                     _missing_volume_details(worker_result, confirmed=False)
                     if worker_result.get("missing_volume_suspected")
@@ -119,13 +117,12 @@ def classify_extract_failure(
             return _failure(
                 FailureKind.DAMAGED,
                 "failure.damaged",
-                repairable=True,
                 details=_missing_volume_details(worker_result, confirmed=False),
             )
         if worker_result.get("checksum_error"):
-            return _failure(FailureKind.DAMAGED, "failure.damaged", repairable=True)
+            return _failure(FailureKind.DAMAGED, "failure.damaged")
         if worker_result.get("damaged") or worker_result.get("native_status") == "damaged":
-            return _failure(FailureKind.DAMAGED, "failure.damaged", repairable=True)
+            return _failure(FailureKind.DAMAGED, "failure.damaged")
         if worker_result.get("unsupported_method"):
             return _failure(FailureKind.UNSUPPORTED, "failure.unsupported")
         if worker_result.get("native_status") == "backend_unavailable":
@@ -140,17 +137,17 @@ def classify_extract_failure(
             details={"missing_volume_confirmed": True, "evidence": "explicit_backend_message"},
         )
     if "unexpected end of archive" in err_lower or "unexpected end of data" in err_lower:
-        return _failure(FailureKind.DAMAGED, "failure.damaged", repairable=True)
+        return _failure(FailureKind.DAMAGED, "failure.damaged")
     if "crc failed" in err_lower or "data error in encrypted file" in err_lower:
         if is_split_archive:
-            return _failure(FailureKind.DAMAGED, "failure.damaged", repairable=True)
-        return _failure(FailureKind.DAMAGED, "failure.damaged", repairable=True)
+            return _failure(FailureKind.DAMAGED, "failure.damaged")
+        return _failure(FailureKind.DAMAGED, "failure.damaged")
     if "headers error" in err_lower or "data error" in err_lower:
-        return _failure(FailureKind.DAMAGED, "failure.damaged", repairable=True)
+        return _failure(FailureKind.DAMAGED, "failure.damaged")
     if "cannot open the file as" in err_lower or "can not open the file as archive" in err_lower:
-        return _failure(FailureKind.DAMAGED, "failure.damaged", repairable=True)
+        return _failure(FailureKind.DAMAGED, "failure.damaged")
     if "is not archive" in err_lower or "archive is corrupted" in err_lower or "checksum error" in err_lower:
-        return _failure(FailureKind.DAMAGED, "failure.damaged", repairable=True)
+        return _failure(FailureKind.DAMAGED, "failure.damaged")
     if "unsupported compression method" in err_lower or "unsupported method" in err_lower:
         return _failure(FailureKind.UNSUPPORTED, "failure.unsupported")
 
@@ -185,7 +182,6 @@ def _failure(
     message_key: str,
     *,
     user_action: str = "",
-    repairable: bool = False,
     details: dict | None = None,
     **params,
 ) -> FailureInfo:
@@ -196,7 +192,6 @@ def _failure(
         message_key=message_key,
         message_params=dict(params),
         user_action=user_action,
-        repairable=repairable,
         details=dict(details or {}),
     )
 

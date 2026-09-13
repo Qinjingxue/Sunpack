@@ -9,9 +9,7 @@ param(
     [string]$Version,
     [string]$InnoCompilerPath,
     [ValidateSet("x64", "arm64")]
-    [string]$Arch = "x64",
-    [ValidateSet("full", "lite")]
-    [string]$RepairSystem
+    [string]$Arch = "x64"
 )
 
 Set-StrictMode -Version Latest
@@ -166,26 +164,6 @@ function Assert-PathMissing {
     }
 }
 
-function Assert-LitePackageExcludesModelRuntime {
-    param([Parameter(Mandatory = $true)][string]$PackageRoot)
-
-    $forbiddenNames = @("torch", "torch_geometric", "torchgen", "functorch")
-    $forbidden = Get-ChildItem -LiteralPath $PackageRoot -Recurse -Force -ErrorAction SilentlyContinue |
-        Where-Object {
-            $name = $_.Name.ToLowerInvariant()
-            foreach ($prefix in $forbiddenNames) {
-                if ($name -eq $prefix -or $name -like "$prefix.*" -or $name -like "$prefix-*" -or $name -like "${prefix}_*") {
-                    return $true
-                }
-            }
-            return $false
-        } |
-        Select-Object -First 1
-
-    if ($null -ne $forbidden) {
-        throw "Lite package contains model runtime artifact: $($forbidden.FullName)"
-    }
-}
 
 function Remove-PreviousNativeExtension {
     param(
@@ -356,20 +334,6 @@ function Get-MaturinCommand {
     throw "maturin executable not found. Install the project build extra or make maturin available in PATH."
 }
 
-function Assert-FileHashEqual {
-    param(
-        [Parameter(Mandatory = $true)][string]$Source,
-        [Parameter(Mandatory = $true)][string]$Destination
-    )
-    Assert-PathExists -LiteralPath $Source -Description "Model source file"
-    Assert-PathExists -LiteralPath $Destination -Description "Packaged model file"
-    $sourceHash = (Get-FileHash -LiteralPath $Source -Algorithm SHA256).Hash
-    $destinationHash = (Get-FileHash -LiteralPath $Destination -Algorithm SHA256).Hash
-    if ($sourceHash -ne $destinationHash) {
-        throw "SHA-256 mismatch after copying model asset: $Destination"
-    }
-}
-
 function Test-CommandRuns {
     param(
         [Parameter(Mandatory = $true)]
@@ -441,23 +405,8 @@ required = [
     'scan_embedded_archives', 'scan_magics_anywhere',
     'scan_zip_central_directory_names', 'inspect_zip_eocd_structure',
     'inspect_pe_overlay_structure',
-    'repair_read_file_range', 'repair_concat_ranges_to_bytes',
-    'repair_write_candidate', 'repair_copy_range_to_file',
-    'repair_concat_ranges_to_file', 'repair_patch_file',
-    'archive_state_to_bytes_native', 'archive_state_size_native',
-    'archive_state_write_to_file_native', 'archive_state_zip_manifest_native',
-    'zip_deep_partial_recovery', 'zip_rebuild_from_local_headers',
-    'zip_directory_field_repair', 'zip_conflict_resolver_rebuild',
-    'gzip_footer_fix_repair', 'gzip_deflate_member_resync_repair',
-    'zstd_frame_salvage_repair', 'tar_boundary_repair',
-    'compression_stream_partial_recovery',
-    'compression_stream_trailing_junk_trim', 'tar_compressed_partial_recovery',
-    'archive_carrier_crop_recovery',
-    'seven_zip_scan_source', 'seven_zip_atomic_repair',
-    'archive_nested_payload_salvage',
-    'rar_block_chain_trim_recovery', 'rar_end_block_repair',
     'watch_broker_acquire', 'watch_broker_release',
-    'watch_broker_is_connected', 'watch_broker_ping_seconds',
+    'watch_broker_is_connected', 'watch_broker_ping_seconds'
 ]
 assert n.native_available()
 missing = [name for name in required if not callable(getattr(n, name, None))]
@@ -526,32 +475,6 @@ function Get-InnoSetupCompiler {
     throw "Inno Setup 6 compiler (ISCC.exe) was not found. Install JRSoftware.InnoSetup or pass -InnoCompilerPath."
 }
 
-function Install-ModelRuntimeDependencies {
-    param(
-        [Parameter(Mandatory = $true)]
-        [string]$PythonPath,
-        [Parameter(Mandatory = $true)]
-        [string]$RepoRoot,
-        [Parameter(Mandatory = $true)]
-        [string]$BuildArch
-    )
-
-    Write-Step "Installing model runtime dependencies"
-    if ($BuildArch -eq "arm64") {
-        Invoke-Native -FilePath "uv" -Arguments @(
-            "pip", "install", "--python", $PythonPath,
-            "torch==2.7.0",
-            "--index-url", "https://download.pytorch.org/whl/cpu"
-        )
-        Invoke-Native -FilePath "uv" -Arguments @("pip", "install", "--python", $PythonPath, "torch-geometric==2.8.0")
-    } else {
-        Invoke-Native -FilePath "uv" -Arguments @("sync", "--locked", "--extra", "dev", "--extra", "model-runtime", "--python", $PythonPath)
-    }
-    Invoke-Native -FilePath $PythonPath -Arguments @(
-        "-c",
-        "import torch, torch_geometric; print('torch', torch.__version__); print('torch_geometric', torch_geometric.__version__)"
-    )
-}
 
 function Test-SevenZipWrapper {
     param([string]$PythonPath)
@@ -752,32 +675,14 @@ function Confirm-AcceptanceTests {
     }
 }
 
-function Read-RepairSystemMode {
-    while ($true) {
-        $rawAnswer = Read-Host "Select build edition: [F]ull or [L]ite"
-        $answer = if ($null -eq $rawAnswer) { "" } else { $rawAnswer.Trim() }
-        if ($answer -match "^(?i:f|full)$") {
-            return "full"
-        }
-        if ($answer -match "^(?i:l|lite)$") {
-            return "lite"
-        }
-        Write-Host "Please enter F/full or L/lite." -ForegroundColor Yellow
-    }
-}
 
 function New-NuitkaEntrypoint {
     param(
         [Parameter(Mandatory = $true)]
-        [string]$Path,
-        [Parameter(Mandatory = $true)]
-        [ValidateSet("full", "lite")]
-        [string]$RepairSystem
+        [string]$Path
     )
 
     $content = @(
-        "import os",
-        "os.environ['SUNPACK_REPAIR_SYSTEM'] = '$RepairSystem'",
         "from sunpack.support.entrypoint import main",
         "raise SystemExit(main())",
         ""
@@ -820,9 +725,6 @@ function Invoke-NuitkaStandaloneBuild {
         [string]$IconPath,
         [Parameter(Mandatory = $true)]
         [string[]]$DynamicPackages,
-        [Parameter(Mandatory = $true)]
-        [string]$SitePackages,
-        [switch]$IncludeModelRuntime,
         [string]$PgoArgs,
         [switch]$EnableExperimentalCProfileGuidedOptimization,
         [Parameter(Mandatory = $true)]
@@ -850,24 +752,6 @@ function Invoke-NuitkaStandaloneBuild {
     }
     foreach ($package in $DynamicPackages) {
         $arguments += "--include-package=$package"
-    }
-
-    if ($IncludeModelRuntime) {
-        foreach ($package in @("torch", "torch_geometric")) {
-            $arguments += "--include-package=$package"
-        }
-        $metadataDirs = Get-ChildItem -LiteralPath $SitePackages -Directory -Filter "*.dist-info" |
-            Where-Object {
-                $_.Name -like "torch-*.dist-info" -or $_.Name -like "torch_geometric-*.dist-info"
-            } |
-            Sort-Object -Property FullName -Unique
-        foreach ($metadataDir in $metadataDirs) {
-            $arguments += "--include-data-dir=$($metadataDir.FullName)=$($metadataDir.Name)"
-        }
-    } else {
-        foreach ($package in @("torch", "torch_geometric", "torchgen", "functorch", "zstandard")) {
-            $arguments += "--nofollow-import-to=$package"
-        }
     }
 
     foreach ($module in @("ssl", "_ssl")) {
@@ -945,10 +829,6 @@ function Assert-PackagedRuntimeTools {
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 $buildArch = $Arch.ToLowerInvariant()
-if (-not $PSBoundParameters.ContainsKey("RepairSystem")) {
-    $RepairSystem = if ($interactivePrompting) { Read-RepairSystemMode } else { "full" }
-}
-$repairSystemMode = $RepairSystem.ToLowerInvariant()
 $processArch = Get-ProcessBuildArch
 $rustTarget = Get-RustTarget -BuildArch $buildArch
 
@@ -957,7 +837,6 @@ if ($env:OS -ne "Windows_NT") {
     throw "This build script only supports Windows."
 }
 Write-Host "Requested architecture: $buildArch"
-Write-Host "Repair system: $repairSystemMode"
 Write-Host "Build system: Nuitka"
 Write-Host "Build Python/process architecture: $processArch"
 if ($processArch -ne $buildArch) {
@@ -971,8 +850,6 @@ $venvScripts = Join-Path $venvPath "Scripts"
 $sunpackEntryPath = Join-Path $repoRoot "sunpack.py"
 $installerScriptPath = Join-Path $repoRoot "installer\SunPack.iss"
 $projectPath = Join-Path $repoRoot "pyproject.toml"
-$modelsRoot = Join-Path $repoRoot "models"
-$modelManifestPath = Join-Path $modelsRoot "manifest.json"
 $iconPath = Join-Path $repoRoot "sunpack.ico"
 $applicationManifestPath = Join-Path $repoRoot "sunpack.manifest"
 $manifestEmbeddingScriptPath = Join-Path $repoRoot "scripts\embed_windows_manifest.py"
@@ -998,7 +875,7 @@ $distRoot = Join-Path $repoRoot "dist"
 $buildRoot = Join-Path $repoRoot "build"
 $nativeWheelRoot = Join-Path $buildRoot ("native-wheels-" + $buildArch)
 $releaseRoot = Join-Path $repoRoot "release"
-$distFolderName = "sunpack-" + $buildArch + "-" + $repairSystemMode
+$distFolderName = "sunpack-" + $buildArch
 $appExeName = "sunpack.exe"
 $runtimeExeName = "sunpack-runtime.exe"
 $distAppRoot = Join-Path $distRoot $distFolderName
@@ -1010,7 +887,7 @@ $distServiceRoot = Join-Path $distAppRoot "service"
 $distWatchBrokerPath = Join-Path $distServiceRoot "sunpack-watch-broker.exe"
 $distLicensesRoot = Join-Path $distAppRoot "licenses"
 $versionValue = Get-ReleaseVersion -ExplicitVersion $Version -RepoRoot $repoRoot
-$releaseInstallerName = "sunpack-windows-{0}-{1}-{2}-setup.exe" -f $buildArch, $repairSystemMode, $versionValue
+$releaseInstallerName = "sunpack-windows-{0}-{1}-setup.exe" -f $buildArch, $versionValue
 $releaseInstallerPath = Join-Path $releaseRoot $releaseInstallerName
 $runAcceptanceTests = -not $SkipTests
 
@@ -1020,9 +897,6 @@ if ($promptForAcceptanceTests) {
 
 Assert-PathExists -LiteralPath $projectPath -Description "pyproject.toml"
 Assert-PathExists -LiteralPath $sunpackEntryPath -Description "SunPack entry point"
-if ($repairSystemMode -eq "full") {
-    Assert-PathExists -LiteralPath $modelManifestPath -Description "models/manifest.json"
-}
 Assert-PathExists -LiteralPath $installerScriptPath -Description "Inno Setup installer script"
 $innoCompiler = Get-InnoSetupCompiler -PreferredPath $InnoCompilerPath
 Assert-PathExists -LiteralPath $iconPath -Description "SunPack icon"
@@ -1055,25 +929,13 @@ if (Test-Path -LiteralPath (Join-Path $venvPath "pyvenv.cfg")) {
     }
 }
 Invoke-Native -FilePath "uv" -Arguments @("sync", "--locked", "--extra", "dev", "--python", $pythonCommand)
-if ($repairSystemMode -eq "full") {
-    Install-ModelRuntimeDependencies -PythonPath $venvPython -RepoRoot $repoRoot -BuildArch $buildArch
-} else {
-    Write-Host "Skipping model runtime dependencies for lite build." -ForegroundColor Yellow
-}
 Invoke-Native -FilePath "uv" -Arguments @("pip", "check", "--python", $venvPython)
-if ($repairSystemMode -eq "full") {
-    Invoke-Native -FilePath $venvPython -Arguments @(
-        "-c",
-        "import importlib.metadata as m; required=('torch','torch-geometric'); missing=[name for name in required if not list(m.files(name) or []) or not m.metadata(name).get('Name')]; assert not missing, f'missing distribution metadata: {missing}'"
-    )
-}
 $maturinCommand = Get-MaturinCommand -VenvScripts $venvScripts
 $cmakeCommand = Get-CMakeCommand -VenvScripts $venvScripts
 $ctestCommand = Get-CTestCommand -VenvScripts $venvScripts
 
 $env:Path = "$venvScripts;$env:Path"
 $env:PYTHONPATH = if ($env:PYTHONPATH) { "$repoRoot;$env:PYTHONPATH" } else { $repoRoot }
-$env:SUNPACK_REPAIR_SYSTEM = $repairSystemMode
 
 Write-Step "Cleaning previous build outputs"
 Remove-IfExists -LiteralPath $buildRoot
@@ -1126,7 +988,7 @@ Write-Step "Writing environment manifest"
 Invoke-Native -FilePath "powershell" -Arguments @(
     "-NoProfile", "-ExecutionPolicy", "Bypass",
     "-File", (Join-Path $repoRoot "scripts\environment_manifest.ps1"),
-    "-RepoRoot", $repoRoot, "-Arch", $buildArch, "-RepairSystem", $repairSystemMode
+    "-RepoRoot", $repoRoot, "-Arch", $buildArch
 )
 
 if ($runAcceptanceTests) {
@@ -1136,8 +998,7 @@ if ($runAcceptanceTests) {
         "-File", (Join-Path $repoRoot "run_acceptance_tests.ps1"),
         "-NoWait",
         "-SkipEnvironmentRefresh",
-        "-Arch", $buildArch,
-        "-RepairSystem", $repairSystemMode
+        "-Arch", $buildArch
     )
 } else {
     Write-Host "Skipping acceptance tests by request." -ForegroundColor Yellow
@@ -1147,43 +1008,27 @@ Write-Step "Building Windows release with Nuitka"
     $nuitkaEntryRoot = Join-Path $nuitkaBuildRoot "entries"
     $nuitkaRuntimeEntryPath = Join-Path $nuitkaEntryRoot "sunpack-runtime.py"
     $nuitkaRuntimeDist = Join-Path $nuitkaBuildRoot ([System.IO.Path]::GetFileNameWithoutExtension($runtimeExeName) + ".dist")
-    $sitePackages = Join-Path $venvPath "Lib\site-packages"
     $nuitkaDynamicPackages = @(
     "watchdog",
         "sunpack.cli.commands",
         "sunpack.config.fields",
         "sunpack.filesystem.filters.modules",
         "sunpack.detection.pipeline.facts.collectors",
-        "sunpack.detection.pipeline.processors.modules",
-        "sunpack.detection.pipeline.rules.precheck",
-        "sunpack.detection.pipeline.rules.scoring",
-        "sunpack.analysis.structure_pipeline.modules",
-        "sunpack.analysis.fuzzy_pipeline.modules",
-        "sunpack.repair.pipeline.modules",
-        "sunpack.repair.pipeline.modules.rar",
-        "sunpack.repair.pipeline.modules.seven_zip",
-        "sunpack.repair.pipeline.modules.zip",
-        "sunpack.repair.pipeline.modules.tar",
-        "sunpack.passwords.candidates",
+    "sunpack.detection.pipeline.processors.modules",
+    "sunpack.detection.pipeline.rules.precheck",
+    "sunpack.analysis.structure_pipeline.modules",
+    "sunpack.analysis.fuzzy_pipeline.modules",
+    "sunpack.passwords.candidates",
         "sunpack.extraction.internal",
         "sunpack.rename.internal",
         "sunpack.relations.internal",
         "sunpack.postprocess.internal",
-        "sunpack.verification.methods",
-        "sunpack.repair.search"
+        "sunpack.verification.methods"
     )
-    if ($repairSystemMode -eq "full") {
-        $nuitkaDynamicPackages += @(
-            "zstandard",
-            "sunpack.repair.model",
-            "sunpack.repair.model.diagnosis",
-            "sunpack.repair.model.policy"
-        )
-    }
 
     New-Item -ItemType Directory -Path $nuitkaEntryRoot -Force | Out-Null
-    New-NuitkaEntrypoint -Path $nuitkaRuntimeEntryPath -RepairSystem $repairSystemMode
-    Invoke-NuitkaStandaloneBuild -PythonPath $venvPython -EntryPath $nuitkaRuntimeEntryPath -OutputRoot $nuitkaBuildRoot -ExecutableName $runtimeExeName -ConsoleMode "disable" -IconPath $iconPath -DynamicPackages $nuitkaDynamicPackages -SitePackages $sitePackages -IncludeModelRuntime:($repairSystemMode -eq "full") -PgoArgs "--help" -EnableExperimentalCProfileGuidedOptimization:$ExperimentalCProfileGuidedOptimization -ReportPath (Join-Path $nuitkaBuildRoot "sunpack-runtime-report.xml")
+    New-NuitkaEntrypoint -Path $nuitkaRuntimeEntryPath
+    Invoke-NuitkaStandaloneBuild -PythonPath $venvPython -EntryPath $nuitkaRuntimeEntryPath -OutputRoot $nuitkaBuildRoot -ExecutableName $runtimeExeName -ConsoleMode "disable" -IconPath $iconPath -DynamicPackages $nuitkaDynamicPackages -PgoArgs "--help" -EnableExperimentalCProfileGuidedOptimization:$ExperimentalCProfileGuidedOptimization -ReportPath (Join-Path $nuitkaBuildRoot "sunpack-runtime-report.xml")
     Embed-WindowsApplicationManifest -PythonPath $venvPython -EmbeddingScriptPath $manifestEmbeddingScriptPath -ManifestPath $applicationManifestPath -ExecutablePaths @(
         (Join-Path $nuitkaRuntimeDist $runtimeExeName)
     )
@@ -1215,15 +1060,6 @@ Copy-Item -LiteralPath $iconPath -Destination $distIconPath -Force
 Copy-IfExists -Source (Join-Path $repoRoot "sunpack_advanced_config.json") -Destination $distAdvancedConfigPath
 Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot
 
-$distModelsRoot = Join-Path $distAppRoot "models"
-if ($repairSystemMode -eq "full") {
-    Copy-Item -LiteralPath $modelsRoot -Destination $distModelsRoot -Recurse -Force
-    Assert-FileHashEqual -Source $modelManifestPath -Destination (Join-Path $distModelsRoot "manifest.json")
-} else {
-    Assert-PathMissing -LiteralPath $distModelsRoot -Description "Packaged models directory"
-    Assert-LitePackageExcludesModelRuntime -PackageRoot $distAppRoot
-}
-
 New-Item -ItemType Directory -Path $distLicensesRoot -Force | Out-Null
 Copy-Item -LiteralPath $sevenZipLicensePath -Destination (Join-Path $distLicensesRoot "7zip-license.txt") -Force
 
@@ -1236,9 +1072,6 @@ Assert-PathExists -LiteralPath $distPasswordPath -Description "External password
 Assert-PathExists -LiteralPath $distConfigPath -Description "External config file"
 Assert-PathExists -LiteralPath $distIconPath -Description "External icon file"
 Assert-PackagedRuntimeTools -PackageRoot $distAppRoot
-if ($repairSystemMode -eq "lite") {
-    Assert-PathMissing -LiteralPath (Join-Path $distAppRoot "zstandard") -Description "Full-repair-only zstandard package"
-}
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "7zip-license.txt") -Description "External 7-Zip license file"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "7z.dll") -BuildArch $buildArch -Description "Packaged tools/7z.dll"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "sunpack_sevenzip.dll") -BuildArch $buildArch -Description "Packaged tools/sunpack_sevenzip.dll"
@@ -1251,7 +1084,6 @@ $metadata = @(
     "product=SunPack"
     "version=$versionValue"
     "arch=$buildArch"
-    "repair_system=$repairSystemMode"
     "git_commit=$gitCommit"
     "python=$pythonVersion"
     "built_at_utc=$([DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
@@ -1300,7 +1132,6 @@ try {
             "/DOutputDir=$installerStagingRoot",
             "/DOutputBaseFilename=$attemptBaseName",
             "/DTargetArch=$buildArch",
-            "/DRepairSystem=$repairSystemMode",
             $installerScriptPath
         )
         Assert-PathExists -LiteralPath $attemptInstallerPath -Description "Staged Windows installer"

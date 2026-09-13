@@ -16,10 +16,6 @@ SunPack 只维护一套公开源码、一套依赖声明和一条 Windows 构建
 
 ```text
 sunpack/                  产品运行时代码
-sunpack/repair/model/     正式修复模型运行时
-sunpack/repair/search/    修复搜索图与提案
-repair_training/          数据、训练与评估工具
-models/                   正式发布模型资产
 native/sunpack_native/    Rust/PyO3 扩展
 native/sevenzip_bridge/   Windows 7z.dll bridge 与 worker
 native/toast_host/        主程序内加载的 Windows toast DLL
@@ -33,12 +29,10 @@ tools-arm64/              ARM64 外部工具和原生构建产物
 
 | Extra | 用途 |
 | --- | --- |
-| 默认 | SunPack 运行依赖，不包含模型运行时 |
-| `model-runtime` | x64 模型运行时依赖，包含 PyTorch 2.10 CPU、PyG 和 zstandard |
+| 默认 | SunPack 运行依赖 |
 | `test` | pytest 与 zstandard 测试数据生成依赖 |
 | `build` | Nuitka、maturin、CMake |
-| `training` | 训练工具的附加依赖 |
-| `dev` | build、test、training 的并集，不包含 `model-runtime` |
+| `dev` | build 与 test 的并集 |
 
 常用安装方式：
 
@@ -46,10 +40,7 @@ tools-arm64/              ARM64 外部工具和原生构建产物
 uv sync --locked
 uv sync --locked --extra test
 uv sync --locked --extra dev
-uv sync --locked --extra model-runtime
 ```
-
-ARM64 的模型运行时由脚本使用 PyTorch CPU wheel 源单独安装；不要直接依赖 `model-runtime` extra 解析 ARM64 PyTorch。
 
 开发环境由 `uv` 管理并锁定在 `uv.lock`，环境目录仍为 `.venv`。如果检测到旧 `.venv` 曾启用全局 site-packages，脚本会自动删除并重建，避免本机全局包影响依赖解析。
 
@@ -63,18 +54,11 @@ ARM64 的模型运行时由脚本使用 PyTorch CPU wheel 源单独安装；不�
 
 1. 用 `uv sync --locked` 创建或复用隔离的 `.venv`
 2. 从 `uv.lock` 安装统一的 `dev` extra（开发、测试和构建依赖）
-3. 仅在 full 模式安装模型运行时依赖
-4. 清理所有旧 `sunpack_native` 残留，构建并只安装最新 wheel
-5. 准备对应架构的 `7z.exe`、`7z.dll` 和 license
-6. 构建 `sunpack_sevenzip.dll`、`sunpack_sevenzip_worker.exe` 和 `sunpack_toast.dll`
-7. 把 C++ 产物复制到工具目录
-8. 运行 Python、Rust、C++ 和 CLI smoke checks
-
-使用完整环境验证 lite 模式（环境中的 torch/PyG 不会被打进 lite 包）：
-
-```powershell
-.\scripts\setup_windows_dev.ps1 -RepairSystem lite
-```
+3. 清理所有旧 `sunpack_native` 残留，构建并只安装最新 wheel
+4. 准备对应架构的 `7z.exe`、`7z.dll` 和 license
+5. 构建 `sunpack_sevenzip.dll`、`sunpack_sevenzip_worker.exe` 和 `sunpack_toast.dll`
+6. 把 C++ 产物复制到工具目录
+7. 运行 Python、Rust、C++ 和 CLI smoke checks
 
 清理后重建：
 
@@ -134,28 +118,10 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 ```powershell
 .\.venv\Scripts\python.exe -c "import sunpack_native as n; print(n.native_available(), n.scanner_version())"
 .\.venv\Scripts\python.exe -c "from sunpack.support.sevenzip_bridge import NativePasswordTester; print(NativePasswordTester().available())"
-.\.venv\Scripts\python.exe -m pytest tests\unit\test_model_runtime.py
+.\.venv\Scripts\python.exe -m pytest tests\unit\test_config_loader.py
 ```
 
-三个命令分别验证 Rust 扩展、C++ bridge 和正式模型资产。`-RepairSystem lite` 环境下，模型运行时测试会验证“修复系统未包含”的正常状态，不会尝试加载模型。
-
-## 模型资产
-
-正式模型位于 `models/`，入口是 `models/manifest.json`。manifest 中每个模型包含：
-
-- `model_type`
-- `semantics`
-- `algorithm`
-- `packaged_path`
-- `sha256`
-
-`sha256` 是对应目录中 `model.pt` 的哈希。训练结果不会自动成为运行时模型；发布新模型时必须把完整资产复制到 `models/<format>/<role>`，更新 manifest，并运行：
-
-```powershell
-python -m pytest tests\unit\test_model_runtime.py
-```
-
-产品代码只能从 `sunpack.repair.model` 加载模型，不能从 `repair_training/runs` 或外部包加载。
+两个命令分别验证 Rust 扩展和 C++ bridge。
 
 ## 测试
 
@@ -199,8 +165,6 @@ CI 环境不会弹 UAC；验收服务管理器未提权时会立即失败，避�
 
 ```powershell
 .\scripts\build_windows.ps1 -Arch x64
-.\scripts\build_windows.ps1 -Arch x64 -RepairSystem full
-.\scripts\build_windows.ps1 -Arch x64 -RepairSystem lite
 .\scripts\build_windows.ps1 -Clean
 .\scripts\build_windows.ps1 -SkipTests
 .\scripts\build_windows.ps1 -Version 1.2.3
@@ -217,22 +181,22 @@ Windows 发布只生成安装器，不再生成 portable ZIP。构建环境必�
 4. 构建和测试 C++ bridge/worker
 5. 可选运行 acceptance tests
 6. Nuitka 构建一个无控制台的 standalone runtime；原生 `sunpack.exe` 提供 CLI 控制台交互，watch 通过私有进程模式参数启动同一 runtime 的独立进程。
-7. 复制配置、密码表、工具和 license；full 构建额外复制整个 `models/`，lite 构建显式排除并校验 torch/PyG 运行时
+7. 复制配置、密码表、工具和 license
 8. 校验关键 PE 文件架构
-9. 运行 packaged CLI、bridge smoke checks；full 构建额外运行模型加载 smoke check
+9. 运行 packaged CLI 和 bridge smoke checks
 10. 用 Inno Setup 创建 Windows 安装器
 
 输出：
 
 ```text
-dist\sunpack-<arch>-<repair_system>\
-release\sunpack-windows-<arch>-<repair_system>-<version>-setup.exe
+dist\sunpack-<arch>\
+release\sunpack-windows-<arch>-<version>-setup.exe
 ```
 
 ARM64 必须在 ARM64 Windows 和 ARM64 Python 环境中构建。已有目录可独立校验：
 
 ```powershell
-.\scripts\verify_windows_package_arch.ps1 -PackageRoot dist\sunpack-x64-lite -Arch x64
+.\scripts\verify_windows_package_arch.ps1 -PackageRoot dist\sunpack-x64 -Arch x64
 ```
 
 ## 运行时原生文件

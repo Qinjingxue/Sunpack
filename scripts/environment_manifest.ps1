@@ -2,7 +2,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$RepoRoot,
     [Parameter(Mandatory = $true)][ValidateSet("x64", "arm64")][string]$Arch,
-    [Parameter(Mandatory = $true)][ValidateSet("full", "lite")][string]$RepairSystem,
     [switch]$Check
 )
 
@@ -10,7 +9,7 @@ $ErrorActionPreference = "Stop"
 $RepoRoot = [IO.Path]::GetFullPath($RepoRoot)
 $toolsRoot = if ($Arch -eq "arm64") { Join-Path $RepoRoot "tools-arm64" } else { Join-Path $RepoRoot "tools" }
 $manifestRoot = Join-Path $RepoRoot ".sunpack_cache"
-$manifestPath = Join-Path $manifestRoot ("environment-{0}-{1}.json" -f $Arch, $RepairSystem)
+$manifestPath = Join-Path $manifestRoot ("environment-{0}.json" -f $Arch)
 
 function Get-FileDigest([string]$Path) {
     if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return "missing" }
@@ -75,7 +74,6 @@ $state = [ordered]@{
     project = "sunpack"
     native_workspace = "native/Cargo.toml"
     arch = $Arch
-    repair_system = $RepairSystem
     source_hash = $sourceHash
     components = [ordered]@{
         rust_workspace = Get-ComponentDigest $nativeRoot

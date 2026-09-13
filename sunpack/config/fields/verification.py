@@ -10,7 +10,6 @@ REQUIRED_VERIFICATION_KEYS = (
     "cleanup_failed_output",
     "complete_accept_threshold",
     "partial_accept_threshold",
-    "recovery_min_improvement",
     "retry_on_verification_failure",
     "methods",
 )
@@ -31,7 +30,6 @@ def normalize_verification_config(value: Any) -> dict[str, Any]:
     config.pop("partial_min_completeness", None)
     config["complete_accept_threshold"] = _float_field(config, "complete_accept_threshold")
     config["partial_accept_threshold"] = _float_field(config, "partial_accept_threshold")
-    config["recovery_min_improvement"] = _float_field(config, "recovery_min_improvement")
     config["retry_on_verification_failure"] = bool(config["retry_on_verification_failure"])
     config["methods"] = _normalize_methods(config.get("methods"))
     return config

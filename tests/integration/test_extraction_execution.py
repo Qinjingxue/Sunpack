@@ -82,7 +82,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                 calls.append(kwargs) or SimpleNamespace(returncode=0, stdout="", stderr="")
             )
             task = ArchiveTask(
-                fact_bag=FactBag(), score=10, main_path=str(archive_path), all_parts=[str(archive_path)]
+                fact_bag=FactBag(), main_path=str(archive_path), all_parts=[str(archive_path)]
             )
 
             result = extractor.extract(task, str(out_dir))
@@ -120,7 +120,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             bag = FactBag()
             task = ArchiveTask(
                 fact_bag=bag,
-                score=10,
                 main_path=str(archive_path),
                 all_parts=[str(archive_path)],
                 carrier_path=str(launcher_path),
@@ -149,7 +148,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             succeeded = SimpleNamespace(returncode=0, stdout="", stderr="")
 
             bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, score=10, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
 
             attempts = iter([failed, succeeded])
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: next(attempts)
@@ -184,7 +183,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                 return succeeded
 
             bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, score=10, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
 
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: fake_run()
             extractor.retry_policy.backoff = lambda _retry_count: None
@@ -206,7 +205,7 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             failed = SimpleNamespace(returncode=2, stdout="", stderr="Headers Error")
             bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, score=10, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
 
             calls = 0
 
@@ -283,7 +282,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                 return SimpleNamespace(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
             bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, score=10, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
             extractor.sevenzip_runner.extract_attempt = fake_extract
 
             result = extractor.extract(task, str(out_dir))
@@ -337,7 +336,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                 return SimpleNamespace(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
             bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, score=10, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
             extractor.sevenzip_runner.extract_attempt = fake_extract
 
             result = extractor.extract(task, str(out_dir))
@@ -359,7 +358,7 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             failed = SimpleNamespace(returncode=-100, stdout="", stderr="7z process failed to start")
             bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, score=10, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
 
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: failed
             extractor.retry_policy.backoff = lambda _retry_count: None

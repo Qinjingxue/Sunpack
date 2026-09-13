@@ -44,7 +44,7 @@ class UnitMissingObservationMethod:
             method=config["name"],
             status="warning",
             completeness_hint=0.5,
-            decision_hint="repair",
+            decision_hint="retry_extract",
             issues=[issue],
             file_observations=[
                 FileVerificationObservation(path="inside.txt", archive_path="inside.txt", state="complete", progress=1.0),
@@ -61,7 +61,7 @@ class UnitPasswordAssessmentMethod:
         return VerificationStepResult(
             method=config["name"],
             completeness_hint=0.0,
-            decision_hint="repair",
+            decision_hint="request_password",
             issues=[
                 VerificationIssue(
                     method=config["name"],
@@ -74,15 +74,15 @@ class UnitPasswordAssessmentMethod:
         )
 
 
-@register_verification_method("unit_repair_warning_complete")
-class UnitRepairWarningCompleteMethod:
+@register_verification_method("unit_warning_complete")
+class UnitWarningCompleteMethod:
     def verify(self, evidence, config):
         return VerificationStepResult(
             method=config["name"],
             status="warning",
             completeness_hint=1.0,
             content_integrity_hint="verified_complete",
-            decision_hint="repair",
+            decision_hint="retry_extract",
             issues=[
                 VerificationIssue(
                     method=config["name"],
@@ -132,7 +132,7 @@ def test_verification_scheduler_disabled_returns_disabled_assessment(tmp_path):
     assert CALLS == []
 
 
-def test_verification_scheduler_disabled_routes_failed_extraction_to_repair(tmp_path):
+def test_verification_scheduler_disabled_routes_failed_extraction_to_failure(tmp_path):
     CALLS.clear()
     task, result = _task_and_result(tmp_path)
     result = ExtractionResult(
@@ -152,7 +152,7 @@ def test_verification_scheduler_disabled_routes_failed_extraction_to_repair(tmp_
     verification = scheduler.verify(task, result)
 
     assert verification.assessment_status == "disabled"
-    assert verification.decision_hint == "repair"
+    assert verification.decision_hint == "fail"
     assert verification.completeness == 0.0
     assert CALLS == []
 
@@ -172,7 +172,7 @@ def test_verification_pipeline_aggregates_completeness_and_decision(tmp_path):
 
     verification = scheduler.verify(task, result)
 
-    assert verification.decision_hint == "repair"
+    assert verification.decision_hint == "retry_extract"
     assert verification.assessment_status == "inconsistent"
     assert verification.completeness == 0.5
     assert verification.complete_files == 1
@@ -180,13 +180,13 @@ def test_verification_pipeline_aggregates_completeness_and_decision(tmp_path):
     assert CALLS == ["unit_complete_observation", "unit_missing_observation"]
 
 
-def test_complete_assessment_accepts_despite_repair_warning_hint(tmp_path):
+def test_complete_assessment_accepts_despite_warning_hint(tmp_path):
     task, result = _task_and_result(tmp_path)
     scheduler = VerificationScheduler({
         "verification": {
             "enabled": True,
             "methods": [
-                {"name": "unit_repair_warning_complete", "enabled": True},
+                {"name": "unit_warning_complete", "enabled": True},
             ],
         }
     })
@@ -280,7 +280,7 @@ def _task_and_result(tmp_path):
     out_dir.mkdir()
     (out_dir / "inside.txt").write_text("hello", encoding="utf-8")
     bag = FactBag()
-    task = ArchiveTask(fact_bag=bag, score=10, key="sample-key", main_path=str(archive), all_parts=[str(archive)])
+    task = ArchiveTask(fact_bag=bag, key="sample-key", main_path=str(archive), all_parts=[str(archive)])
     knowledge = task.knowledge()
     knowledge.set("resource.analysis", {"file_count": 1, "total_unpacked_size": 5}, source_layer="test", source_module="fixture")
     task.set_knowledge(knowledge)

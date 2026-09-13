@@ -3,6 +3,5 @@ pub(crate) mod archive_state;
 pub(crate) mod iocp;
 pub(crate) mod read_fault;
 pub(crate) mod reader;
-pub(crate) mod repair;
 pub(crate) mod resource_lifecycle;
 pub(crate) mod util;

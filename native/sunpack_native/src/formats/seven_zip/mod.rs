@@ -3,56 +3,59 @@ use aes::{
     cipher::{block_padding::NoPadding, BlockModeDecrypt, KeyIvInit},
     Aes256,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64_STANDARD, Engine as _};
 use lzma_rust2::{
     filter::{bcj::BcjReader, bcj2::Bcj2Reader, delta::DeltaReader},
     Lzma2Reader, LzmaReader,
 };
-use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
 use sevenz_rust2::{
-    Archive, ArchiveEntry, ArchiveWriter, BlockDecoder, EncoderConfiguration, EncoderMethod,
-    Password,
+    EncoderMethod, Password,
 };
-use sha2::Digest;
-use std::fs;
-use std::io::{Cursor, Read, Seek, Write};
-use std::path::{Path, PathBuf};
+use std::io::{Cursor, Read, Seek};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
+fn seven_zip_password(password: Option<&str>) -> Password {
+    match password {
+        Some(value) if !value.is_empty() => Password::from(value),
+        _ => Password::empty(),
+    }
+}
+
+fn u32_le(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
+}
+
+fn u64_le(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
+fn crc32(bytes: &[u8]) -> u32 {
+    let mut crc = 0xffff_ffffu32;
+    for byte in bytes {
+        crc ^= *byte as u32;
+        for _ in 0..8 {
+            let mask = (crc & 1).wrapping_neg();
+            crc = (crc >> 1) ^ (0xedb8_8320 & mask);
+        }
+    }
+    !crc
+}
+
 include!("constants.rs");
 include!("types.rs");
-include!("source.rs");
 include!("header/parse.rs");
 include!("header/encoded.rs");
-include!("header/write.rs");
-include!("scan.rs");
-include!("repair/result.rs");
-include!("repair/salvage.rs");
-include!("repair/boundary.rs");
-include!("repair/crc.rs");
-include!("repair/next_header.rs");
-include!("repair/metadata.rs");
-
-#[pyfunction]
-pub(crate) fn seven_zip_runtime_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("kdf_entries", seven_zip_kdf_cache_len())?;
-    dict.set_item(
-        "encoded_header_coder_properties_entries",
-        seven_zip_encoded_header_coder_properties_cache_len(),
-    )?;
-    Ok(dict.unbind())
-}
-
-#[pyfunction]
-pub(crate) fn clear_seven_zip_runtime_caches(py: Python<'_>) -> PyResult<Py<PyDict>> {
-    let dict = PyDict::new(py);
-    dict.set_item("kdf_entries", clear_seven_zip_kdf_cache())?;
-    dict.set_item(
-        "encoded_header_coder_properties_entries",
-        clear_seven_zip_encoded_header_coder_properties_cache(),
-    )?;
-    Ok(dict.unbind())
-}

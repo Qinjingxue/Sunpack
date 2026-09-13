@@ -7,13 +7,11 @@ from pathlib import Path
 FORBIDDEN_PREFIXES = (
     "sunpack.coordinator",
     "sunpack.detection",
-    "sunpack.repair_inspection",
-    "sunpack.repair",
     "sunpack.contracts.tasks",
 )
 
 
-def test_analysis_has_no_application_or_repair_dependencies():
+def test_analysis_has_no_application_dependencies():
     root = Path(__file__).parents[2] / "sunpack" / "analysis"
     violations = []
     for path in root.rglob("*.py"):

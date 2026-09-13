@@ -20,10 +20,4 @@ def archive_pressure_config(passwords: list[str] | None = None) -> dict:
         {"name": "rar_structure_accept", "enabled": True},
         {"name": "tar_structure_accept", "enabled": True},
         {"name": "compression_stream_accept", "enabled": True},
-    ], scoring=[
-        {"name": "seven_zip_structure_identity", "enabled": True},
-        {"name": "zip_structure_identity", "enabled": True},
-        {"name": "rar_structure_identity", "enabled": True},
-        {"name": "tar_structure_identity", "enabled": True},
-        {"name": "compression_stream_identity", "enabled": True},
     ]))

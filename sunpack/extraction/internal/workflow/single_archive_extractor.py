@@ -327,29 +327,6 @@ class SingleArchiveExtractor:
                                 "total_bytes": output_inventory.stats.total_size,
                             }
                             self._fill_success_output_counts(diagnostics, output_stats)
-                        with _phase(phase_timer, f"{phase_prefix}_empty_repaired_success_check"):
-                            empty_repaired_success = self._empty_repaired_success(diagnostics, task)
-                        if empty_repaired_success:
-                            failure = self._failure_info(
-                                FailureKind.DAMAGED,
-                                "verification",
-                                "failure.no_extractable_repair_output",
-                                repairable=True,
-                            )
-                            self._log(self.i18n.t("extract.log.failed", archive=archive, error=self._localized_failure(failure)))
-                            self._cleanup_output(out_dir, OutputCleanupEvent.EMPTY_REPAIR_OUTPUT)
-                            diagnostics["failure_stage"] = "verification"
-                            diagnostics["failure_kind"] = "empty_repair_output"
-                            return self._failed(
-                                archive,
-                                out_dir,
-                                run_parts,
-                                self._localized_failure(failure),
-                                failure=failure,
-                                password_used=correct_pwd,
-                                selected_codepage=selected_codepage,
-                                diagnostics=diagnostics,
-                            )
                         self._log(self.i18n.t("extract.log.success", archive=archive))
                         manifest_path = ""
                         manifest_payload = None
@@ -501,22 +478,6 @@ class SingleArchiveExtractor:
                 status=PasswordResolutionStatus.RESOLVED,
                 archive_key=archive_key,
             )
-        archive_state = task.archive_state() if hasattr(task, "archive_state") else None
-        if archive_state is not None and archive_state.patches:
-            if not self._task_requires_password(task):
-                return PasswordResolution(
-                    password="",
-                    status=PasswordResolutionStatus.UNENCRYPTED,
-                    archive_key=archive_key,
-                    encrypted=False,
-                )
-            return PasswordResolution(
-                password=None,
-                status=PasswordResolutionStatus.PASSWORD_REQUIRED,
-                archive_key=archive_key,
-                encrypted=True,
-                error_text="password verification is unsupported for patched archive state without a resolved password",
-            )
         if not self._password_store_has_candidates(directory_passwords) and not self._task_requires_password(task):
             return PasswordResolution(
                 password="",
@@ -630,7 +591,6 @@ class SingleArchiveExtractor:
         message_key: str,
         *,
         user_action: str = "",
-        repairable: bool = False,
         **params,
     ) -> FailureInfo:
         return FailureInfo(
@@ -640,7 +600,6 @@ class SingleArchiveExtractor:
             message_key=message_key,
             message_params=dict(params),
             user_action=user_action,
-            repairable=repairable,
         )
 
     @staticmethod
@@ -678,49 +637,42 @@ class SingleArchiveExtractor:
                 FailureKind.PASSWORD_REQUIRED,
                 "failure.password_required",
                 "request_password",
-                False,
             ),
             PasswordResolutionStatus.CANDIDATES_EXHAUSTED: (
                 FailureKind.WRONG_PASSWORD,
                 "failure.password_wrong_or_unknown",
                 "request_password",
-                False,
             ),
             PasswordResolutionStatus.INCONCLUSIVE: (
                 FailureKind.PASSWORD_INCONCLUSIVE,
                 "failure.password_state_unknown",
                 "",
-                False,
             ),
             PasswordResolutionStatus.DAMAGED: (
                 FailureKind.DAMAGED,
                 "failure.damaged",
                 "",
-                True,
             ),
             PasswordResolutionStatus.UNSUPPORTED: (
                 FailureKind.UNSUPPORTED,
                 "failure.unsupported",
                 "",
-                False,
             ),
             PasswordResolutionStatus.BACKEND_ERROR: (
                 FailureKind.BACKEND_UNAVAILABLE,
                 "failure.password_verifier_unavailable",
                 "",
-                False,
             ),
             PasswordResolutionStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED: (
                 FailureKind.MISSING_VOLUME,
                 "failure.missing_volume_or_tail_damaged",
                 "",
-                False,
             ),
         }
         spec = mapping.get(resolution.status)
         if spec is None:
             return None
-        kind, message_key, user_action, repairable = spec
+        kind, message_key, user_action = spec
         native_result = resolution.test_result if isinstance(resolution.test_result, dict) else {}
         read_error = native_result.get("read_error")
         message_params = {}
@@ -745,7 +697,6 @@ class SingleArchiveExtractor:
             message_key=message_key,
             message_params=dict(message_params),
             user_action=user_action,
-            repairable=repairable,
             details={"diagnostic": resolution.error_text, "read_error": read_error},
         )
 
@@ -777,28 +728,12 @@ class SingleArchiveExtractor:
             stage=failure.stage,
             message_key="failure.password_state_unknown",
             message=failure.message,
-            repairable=False,
             details={
                 **dict(failure.details or {}),
                 "evidence": "ambiguous_empty_password_on_split_input",
                 "original_failure": failure.to_dict(),
             },
         )
-
-    @staticmethod
-    def _empty_repaired_success(diagnostics: dict, task: ArchiveTask) -> bool:
-        result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
-        if str(result.get("status") or "") != "ok":
-            return False
-        if int(result.get("item_count", 0) or 0) > 0:
-            return False
-        if int(result.get("files_written", 0) or 0) > 0 or int(result.get("bytes_written", 0) or 0) > 0:
-            return False
-        try:
-            state = task.archive_state()
-        except Exception:
-            return False
-        return bool(getattr(state, "patches", None))
 
     def _extract_embedded_segments_state_machine(
         self,
@@ -965,7 +900,6 @@ class SingleArchiveExtractor:
                 message=self.i18n.t(message_key),
                 message_key=message_key,
                 user_action="request_password" if password_failure else "",
-                repairable=all(failure.repairable for failure in segment_failures),
                 causes=tuple(segment_failures),
                 details={
                     "segment_count": len(segment_results),
@@ -1019,7 +953,6 @@ class SingleArchiveExtractor:
                 stage="embedded_segments",
                 message=self.i18n.t("failure.embedded_extract_failed"),
                 message_key="failure.embedded_extract_failed",
-                repairable=False,
                 details={"segment_count": len(segment_results)},
             )
         failed_result = self._failed(

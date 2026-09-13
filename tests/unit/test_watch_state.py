@@ -111,7 +111,7 @@ def test_failed_journal_append_does_not_change_memory(tmp_path, monkeypatch):
     assert not state.pending_work_items()
 
 
-def test_truncated_journal_tail_is_ignored_and_repaired(tmp_path):
+def test_truncated_journal_tail_is_ignored_and_recovered(tmp_path):
     state_path = tmp_path / "state.json"
     first = _candidate(tmp_path / "first.7z", 1)
     second = _candidate(tmp_path / "second.7z", 2)

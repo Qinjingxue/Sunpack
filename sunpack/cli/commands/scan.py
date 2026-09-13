@@ -45,7 +45,7 @@ def handle(args, ctx):
         reporter.info(ctx.t("cli.scan.identified", count=summary["task_count"]))
         for item in task_items:
             reporter.info(ctx.t("cli.item_path", path=item["main_path"]))
-            reporter.info(ctx.t("cli.scan.details", decision=item["decision"], score=item["score"], parts=len(item["all_parts"])))
+            reporter.info(ctx.t("cli.scan.details", decision=item["decision"], parts=len(item["all_parts"])))
             if item["detected_ext"]:
                 reporter.info(ctx.t("cli.scan.detected_ext", ext=item["detected_ext"]))
             if reporter.verbose and item["reasons"]:

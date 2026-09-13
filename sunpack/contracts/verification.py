@@ -22,7 +22,6 @@ DECISION_NONE = "none"
 DECISION_ACCEPT = "accept"
 DECISION_ACCEPT_PARTIAL = "accept_partial"
 DECISION_RETRY_EXTRACT = "retry_extract"
-DECISION_REPAIR = "repair"
 DECISION_REQUEST_PASSWORD = "request_password"
 DECISION_FAIL = "fail"
 
@@ -141,7 +140,6 @@ class VerificationResult:
     output_confidence: float = 0.0
     archive_coverage: ArchiveCoverageSummary = field(default_factory=ArchiveCoverageSummary)
     file_observations: list[FileVerificationObservation] = field(default_factory=list)
-    repair_hints: dict[str, Any] = field(default_factory=dict)
 
     @property
     def failures(self) -> list[VerificationIssue]:

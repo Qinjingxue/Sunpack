@@ -1,6 +1,6 @@
 # 开发边界说明
 
-本文档是 SunPack 当前架构的边界约定。项目已经进入 native-first、verification-driven repair loop 和模块流水线阶段：文件系统扫描/监控、关系、检测、结构分析、密码、解压、校验、修复、后处理和 CLI 都应保持清晰职责。
+本文档是 SunPack 当前架构的边界约定。项目采用 native-first、verification-driven 流水线：文件系统扫描/监控、关系、检测、结构分析、密码、解压、校验、后处理和 CLI 都应保持清晰职责。
 
 ## 总原则
 
@@ -25,10 +25,8 @@ coordinator
   -> filesystem
   -> relations
   -> detection
-  -> repair_inspection
   -> extraction
   -> verification
-  -> repair
   -> postprocess
   -> rename
   -> contracts
@@ -42,20 +40,11 @@ analysis
   -> native binary view/probes and embedded scanner
   -> neutral contracts/result objects
 
-repair_inspection
-  -> analysis public capabilities
-  -> contracts.ArchiveTask / ArchiveState
-
 extraction
   -> contracts
   -> passwords
   -> rename public API
   -> sevenzip worker
-
-repair
-  -> contracts
-  -> native binary I/O
-  -> repair modules
 
 verification
   -> contracts
@@ -72,14 +61,6 @@ filesystem / relations / rename
 passwords
   -> support.sevenzip_bridge
   -> native/Rust fast verifiers
-
-repair.scheduler
-  -> repair.model
-  -> repair.search
-
-repair_training
-  -> sunpack.repair.model
-  -> sunpack.repair.search
 
 config
   -> support
@@ -102,23 +83,19 @@ contracts
 | 候选编排 | `coordinator.task_provider.ArchiveTaskProvider` | 串联 filesystem、relations、detection 和结构救援。 |
 | 递归策略 | `coordinator.output_scan_policy.NestedOutputScanPolicy` | 判断输出目录是否进入下一轮扫描。 |
 | 通用归档分析 | `analysis.ArchiveAnalyzer` | 提供无业务调度的格式、结构、边界、fuzzy 和 embedded 分析能力。 |
-| 修复检查反馈 | `repair_inspection.RepairInspectionService` | 在 repair loop 中分析当前/patch 后状态并投影 inspection feedback。 |
 | 输入规划 | `detection.input_planning.ArchiveInputPlanningStage` | 把中立分析报告转换为主流程归档输入和 embedded 子任务。 |
 | 密码 | `sunpack.passwords` | 密码候选、调度、fast verifier、7z.dll 最终确认。 |
 | 解压 | `extraction.scheduler.ExtractionScheduler` | 单归档输出目录、密码解析、worker 解压。 |
 | 校验 | `verification.VerificationScheduler` | 解压结果完整度、来源完整性和下一步决策。 |
-| 修复 | `repair.RepairScheduler` | 根据 verification repair 决策生成修复候选。 |
 | 后处理 | `postprocess.actions.PostProcessActions` | 成功后清理和扁平化。 |
 | 文件系统监控 | `coordinator.watch_runtime.run_watch_service` / `filesystem.watcher.WatchScheduler` | CLI/GUI 共用服务入口、watchdog 事件、活跃到静默状态机和自动处理。 |
-| 修复模型 | `repair.model.RepairModelRuntime` / `repair.model.ModelAssetRegistry` | 模型资产校验、图构建和双模型推理。 |
-| 修复搜索 | `repair.search.PolicyRepairGraph` | 搜索图、恢复度评估、运行特征和模块提案。 |
 | Native ABI | `support.sevenzip_bridge` | C++ 7z.dll bridge 绑定和缓存。 |
 
 ## 领域边界
 
 ### app
 
-`app` 只负责 CLI 适配：参数解析、密码交互、配置覆盖、结果输出和退出码。它可以调用 coordinator、filesystem.watcher、passwords 和 config 的公开入口，不直接导入 detection/extraction/repair 的内部实现。
+`app` 只负责 CLI 适配：参数解析、密码交互、配置覆盖、结果输出和退出码。它可以调用 coordinator、filesystem.watcher、passwords 和 config 的公开入口，不直接导入 detection/extraction 的内部实现。
 
 ### config
 
@@ -156,17 +133,13 @@ contracts
 
 - `facts`：采集初等事实，例如路径、大小、magic bytes、scene marker。
 - `processors`：从初等 facts 推导高等 facts，例如结构事实、embedded payload、scene context、7z probe/test。
-- `rules`：只读 facts 和配置，输出 accept/reject/score/confirm。
+- `rules`：只读 facts 和配置，输出 accept/reject/confirm。
 
 规则层不应依赖 processor 实现细节；共享默认值放到公共 constants/config 模块。
 
 ### analysis
 
-`analysis` 是无业务策略的通用归档分析能力层。公共入口 `ArchiveAnalyzer` 接收 file、multi-volume、range 或 patched source 和 `AnalysisRequest`，输出格式证据、片段边界、置信度与损坏标记；`probe_volume_anchor_paths` 为 Relations 提供批量、有界、只读的原生分卷结构证据。它内部可以执行 signature prepass、fuzzy、格式 probe 和 embedded fallback，但不得依赖 `ArchiveTask`、Detection、Repair Inspection、Repair 或 Coordinator，也不得写业务 knowledge。
-
-### repair_inspection
-
-`repair_inspection` 只服务 repair loop。它把当前 `ArchiveTask`/`ArchiveState`（包括 patch stack）转换为 Analysis source，管理 repair 状态缓存，并把中立报告投影为 `inspection.*`、格式 evidence 和 `RepairInspectionFeedback`。正常主流程不进入 Repair Inspection；首次 repair diagnosis/job 构造前以及修复状态变化后必须刷新 Repair Inspection。embedded scanner 已合并进 Analysis，不再存在独立领域层。
+`analysis` 是无业务策略的通用归档分析能力层。公共入口 `ArchiveAnalyzer` 接收 file、multi-volume、range 或 segment source 和 `AnalysisRequest`，输出格式证据、片段边界、置信度与损坏标记；`probe_volume_anchor_paths` 为 Relations 提供批量、有界、只读的原生分卷结构证据。它内部可以执行 signature prepass、fuzzy、格式 probe 和 embedded fallback，但不得依赖 `ArchiveTask`、Detection 或 Coordinator，也不得写业务 knowledge。
 
 ### passwords
 
@@ -176,27 +149,9 @@ contracts
 
 `extraction` 是单归档解压执行层。它消费由 Detection/input planner 完整解析的 `ArchiveTask`、`source.*` 输入和 password resolution，调用 `sunpack_sevenzip_worker.exe` 通过 `7z.dll` 解压普通文件、`file_range` 或 `concat_ranges` 虚拟输入。它不查询 Relations、不负责扫描候选、不做批量并发、不做成功后清理。
 
-### repair
-
-`repair` 是损坏结构修复层。它响应 verification 的 `repair` 决策，使用 `repair.model` 取得 diagnosis 和 module/undo/stop 动作评分，再由 `repair.search` 管理搜索图、恢复度和模块提案。格式修复模块通过 pipeline registry 注册，返回候选文件、虚拟输入或 patch plan。模型建议不能绕过 extraction 与 verification。
-
-### repair.model
-
-`repair.model` 包含模型结构、张量化、诊断图 schema、推理、资产 registry 和唯一的 `RepairModelRuntime`。它直接加载 diagnosis 与 policy 模型，不提供 provider 注册或外部扩展链路，禁止导入 `repair_training`。
-
-### repair.search
-
-`repair.search` 包含策略搜索图、恢复度评估、运行特征和模块提案。它可以依赖 repair 的稳定契约和 pipeline registry，但不加载模型资产，也不包含格式插件注册表。
-
-模型资产统一放在仓库根目录 `models/`，由 `models/manifest.json` 声明。运行时按 manifest 定位资产并校验 `model.pt` SHA-256，不从训练 run 目录回退。
-
-### repair_training
-
-`repair_training` 包含数据生成、dataset、训练、评估和实验 run 布局。它可以复用 `sunpack.repair.model` 中与生产一致的 schema、model 和 tensorize 实现，以及 `sunpack.repair.search` 的图与提案逻辑；生产运行时不能反向依赖训练代码。
-
 ### verification
 
-`verification` 是解压结果校验和候选比较的事实来源。它从 `ArchiveTask`、`ExtractionResult`、`ArchiveState` 和 `PasswordSession` 构建证据，按配置执行 method，返回完整度、文件观察、source integrity、recoverable upper bound 和 decision hint。是否重试、是否清理失败输出、是否进入 repair loop，由 coordinator 决定。
+`verification` 是解压结果校验的事实来源。它从 `ArchiveTask`、`ExtractionResult`、`ArchiveState` 和 `PasswordSession` 构建证据，按配置执行 method，返回完整度、文件观察、source integrity、recoverable upper bound 和 decision hint。是否普通重试、是否清理失败输出，由 coordinator 决定。
 
 ### postprocess
 
@@ -204,9 +159,9 @@ contracts
 
 ### coordinator
 
-`coordinator` 是唯一流程依赖拥有者，负责 filesystem→relations→detection/input planning→extraction→verification→postprocess 主流程，以及 verification→repair_inspection→repair→repair_inspection 的反馈循环。它还负责递归轮次、批量调度、资源 token、verification retry、repair beam、候选比较和 summary。它不实现领域算法；所有领域能力均通过公开入口调用。归档清理通过 postprocess 公开动作完成。
+`coordinator` 是唯一流程依赖拥有者，负责 filesystem→relations→detection/input planning→extraction→verification→postprocess 主流程。它还负责递归轮次、批量调度、资源 token、普通 verification retry 和 summary。它不实现领域算法；所有领域能力均通过公开入口调用。归档清理通过 postprocess 公开动作完成。
 
-流程领域包禁止反向导入 `coordinator`。Detection 与 Repair Inspection 只能调用 Analysis 公共能力；Analysis 不得反向依赖它们。跨阶段数据通过共享结果契约或 `contracts` 传递。
+流程领域包禁止反向导入 `coordinator`。Detection 只能调用 Analysis 公共能力；Analysis 不得反向依赖它们。跨阶段数据通过共享结果契约或 `contracts` 传递。
 
 ### support
 
@@ -214,7 +169,7 @@ contracts
 
 ### native
 
-`native/sunpack_native` 承接跨平台热点：目录扫描、二进制视图、signature prepass、格式 probe、carrier scan、repair I/O、输出 CRC/readability、输出文件索引匹配、deep repair native 实现、密码 fast verifier 等。
+`native/sunpack_native` 承接跨平台热点：目录扫描、二进制视图、signature prepass、格式 probe、carrier scan、输出 CRC/readability、输出文件索引匹配、密码 fast verifier 等。
 
 `native/sevenzip_bridge` 承接 Windows 7z.dll ABI：archive probe/test、密码数组尝试、archive state manifest 和 `sunpack_sevenzip_worker.exe` 解压。
 
@@ -241,7 +196,7 @@ from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watch
 `filesystem.watcher` 不直接构造 coordinator engine。应用组合层创建并启动进程级
 `PipelineEngine`，再把实例注入 watcher；watcher 只提交稳定输入和消费请求结果。
 
-`PipelineEngine` 拥有跨请求常驻的扫描器、分析器、修复/验证组件、资源调度器和
+`PipelineEngine` 拥有跨请求常驻的扫描器、分析器、验证组件、资源调度器和
 7-Zip worker pool。`PipelineResponse`、输出策略、后处理清单和统计属于请求，不能
 写回 Engine 的全局累计状态。
 
@@ -266,11 +221,9 @@ powershell -ExecutionPolicy Bypass -File scripts\run_ci_tests.ps1
 - app 是否仍只是 CLI 适配？
 - coordinator 是否仍只是编排？
 - relation 能力是否通过 `RelationsScheduler` 暴露？
-- analysis 是否仍是无业务调度的通用能力，detection/repair_inspection 是否只通过公共入口调用？
-- 正常主流程是否不进入 repair_inspection，repair 首轮是否先获得 inspection feedback？
-- verification 是否先于 repair 给出完整度、source integrity 和 repair 决策？
-- repair 是否通过 native I/O 处理二进制？
-- repair 候选是否重新进入 extraction + verification，而不是直接标记成功？
+- analysis 是否仍是无业务调度的通用能力，detection 是否只通过公共入口调用？
+- verification 是否先于普通重试给出完整度和 source integrity？
+- 正常主流程是否保持 extraction → verification → postprocess 的单向生命周期？
 - support 是否没有混入业务策略？
 
 ## 当前结构速览
@@ -285,12 +238,10 @@ sunpack/
   detection/    候选检测、fact pipeline、规则判断、scene 策略
   extraction/   worker 解压黑盒和解压结果
   filesystem/   通用目录扫描、过滤和 watcher 监控能力
-  repair_inspection/  repair loop 的归档状态检查与反馈投影
   passwords/    密码候选、调度和 verifier
   postprocess/  解压成功后的清理和扁平化
   relations/    文件关系、分卷和候选组
   rename/       输出命名和临时分卷 staging
-  repair/       损坏容器修复流水线、搜索与模型运行时
   support/      资源、JSON、缓存、7z.dll ABI 绑定等基础设施
   verification/ 解压结果校验流水线
 ```
@@ -300,8 +251,6 @@ sunpack/
 仓库级目录：
 
 ```text
-models/                 正式发布模型与 manifest
-repair_training/        数据生成、训练和评估
 native/sunpack_native/  Rust/PyO3 热路径
 native/sevenzip_bridge/ Windows 7z.dll bridge 与 worker
 ```

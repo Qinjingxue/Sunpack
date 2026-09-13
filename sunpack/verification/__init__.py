@@ -9,14 +9,6 @@ from sunpack.contracts.verification import (
     VerificationStepResult,
 )
 from sunpack.verification.scheduler import VerificationScheduler
-from sunpack.verification.comparison import (
-    RecoveryAttempt,
-    RecoveryComparisonResult,
-    RecoveryRank,
-    compare_attempts,
-    rank_attempt,
-    rank_attempts,
-)
 
 
 __all__ = [
@@ -28,11 +20,5 @@ __all__ = [
     "VerificationScheduler",
     "VerificationStepRecord",
     "VerificationStepResult",
-    "RecoveryAttempt",
-    "RecoveryComparisonResult",
-    "RecoveryRank",
-    "compare_attempts",
-    "rank_attempt",
-    "rank_attempts",
     "register_verification_method",
 ]

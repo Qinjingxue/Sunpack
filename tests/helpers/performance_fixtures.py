@@ -22,8 +22,6 @@ def pressure_scan_config() -> dict:
         {"name": "blacklist", "enabled": True, "blocked_extensions": [".jar", ".docx", ".apk", ".xlsx"]},
         {"name": "embedded_payload_identity", "enabled": True, "deep_scan_single_candidate_ratio": 1e-9},
         {"name": "zip_structure_accept", "enabled": True},
-    ], scoring=[
-        {"name": "zip_structure_identity", "enabled": True},
     ])
 
 

@@ -54,7 +54,6 @@ def test_pipeline_progress_observer_receives_extract_ready_before_native_progres
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "1",
         "output": {"root": str(tmp_path / "out")},
-        "repair": {"enabled": False},
         "verification": {"enabled": False, "methods": []},
         "post_extract": {
             "archive_cleanup_mode": "k",
@@ -95,7 +94,6 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
     config = normalize_config(with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3},
         "recursive_extract": "1",
-        "repair": {"enabled": False},
         "verification": {"enabled": False, "methods": []},
         "post_extract": {
             "archive_cleanup_mode": "d",
@@ -104,8 +102,6 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
     }, precheck=[
         {"name": "size_range", "enabled": True, "gte": 0},
         {"name": "zip_structure_accept", "enabled": True},
-    ], scoring=[
-        {"name": "zip_structure_identity", "enabled": True},
     ]))
 
     engine = PipelineEngine(config)
@@ -167,7 +163,6 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
 def test_pipeline_runner_exposes_recent_passwords_without_password_manager():
     engine = PipelineEngine(normalize_config(with_detection_pipeline({
         "recursive_extract": "1",
-        "repair": {"enabled": False},
         "verification": {"enabled": False, "methods": []},
         "post_extract": {
             "archive_cleanup_mode": "k",
@@ -196,7 +191,6 @@ def test_batch_does_not_treat_existing_same_name_directory_as_output(tmp_path, m
 
     engine = PipelineEngine(normalize_config(with_detection_pipeline({
         "recursive_extract": "1",
-        "repair": {"enabled": False},
         "verification": {"enabled": False, "methods": []},
         "post_extract": {
             "archive_cleanup_mode": "k",
@@ -207,7 +201,7 @@ def test_batch_does_not_treat_existing_same_name_directory_as_output(tmp_path, m
 
     def task_for(path):
         bag = FactBag()
-        return ArchiveTask(fact_bag=bag, score=10, main_path=str(path), all_parts=[str(path)])
+        return ArchiveTask(fact_bag=bag, main_path=str(path), all_parts=[str(path)])
 
     def fake_extract(task, out_dir):
         extracted.append(task.main_path)
@@ -247,7 +241,6 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
 
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "2",
-        "repair": {"enabled": False},
         "verification": {"enabled": False, "methods": []},
         "output": {
             "root": str(output_root),
@@ -259,7 +252,7 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
         },
     }))
     engine = PipelineEngine(config)
-    task = ArchiveTask(fact_bag=FactBag(), score=10, main_path=str(archive), all_parts=[str(archive)], logical_name="payload")
+    task = ArchiveTask(fact_bag=FactBag(), main_path=str(archive), all_parts=[str(archive)], logical_name="payload")
 
     def fake_extract(item, out_dir):
         nested = Path(out_dir) / "nested.zip"

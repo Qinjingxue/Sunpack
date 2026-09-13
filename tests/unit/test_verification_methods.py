@@ -35,7 +35,7 @@ def test_extraction_exit_signal_reports_unusable_extraction(tmp_path, success, p
 
     verification = _scheduler([{"name": "extraction_exit_signal"}]).verify(task, result)
 
-    assert verification.decision_hint == "repair"
+    assert verification.decision_hint == "retry_extract"
     assert verification.assessment_status == "unusable"
     assert verification.completeness == 0.0
     assert verification.issues[0].code == expected_issue
@@ -74,7 +74,7 @@ def test_manifest_size_match_reports_complete_when_expected_size_matches(tmp_pat
     assert verification.completeness == 1.0
 
 
-def test_manifest_size_match_reports_repair_needed_for_large_manifest_gap(tmp_path):
+def test_manifest_size_match_reports_retry_for_large_manifest_gap(tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     (out_dir / "a.txt").write_text("hello", encoding="utf-8")
@@ -83,7 +83,7 @@ def test_manifest_size_match_reports_repair_needed_for_large_manifest_gap(tmp_pa
 
     verification = _scheduler([{"name": "manifest_size_match"}]).verify(task, result)
 
-    assert verification.decision_hint == "repair"
+    assert verification.decision_hint == "retry_extract"
     assert verification.assessment_status == "partial"
     assert verification.completeness < 1.0
     assert {issue.code for issue in verification.issues} == {
@@ -104,7 +104,7 @@ def test_expected_name_presence_reports_missing_entries(tmp_path):
 
     verification = _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
 
-    assert verification.decision_hint == "repair"
+    assert verification.decision_hint == "retry_extract"
     assert verification.missing_files == 2
     assert verification.issues[0].code == "fail.expected_names_all_missing"
 
@@ -158,7 +158,7 @@ def test_oracle_expected_output_match_reports_missing_and_crc_failure(tmp_path):
 
     verification = _scheduler([{"name": "oracle_expected_output_match"}]).verify(task, result)
 
-    assert verification.decision_hint == "repair"
+    assert verification.decision_hint == "retry_extract"
     assert verification.archive_coverage.expected_files == 2
     assert verification.archive_coverage.failed_files == 1
     assert verification.archive_coverage.missing_files == 1
@@ -207,12 +207,12 @@ def test_archive_test_crc_compares_archive_state_manifest_to_output_files(tmp_pa
     out_dir.mkdir()
     (out_dir / "good.txt").write_text("hello", encoding="utf-8")
     (out_dir / "bad.txt").write_text("oops", encoding="utf-8")
-    task = ArchiveTask(fact_bag=FactBag(), score=10, key="sample", main_path=str(archive), all_parts=[str(archive)], detected_ext="zip")
+    task = ArchiveTask(fact_bag=FactBag(), key="sample", main_path=str(archive), all_parts=[str(archive)], detected_ext="zip")
     result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
 
     verification = _scheduler([{"name": "archive_test_crc"}]).verify(task, result)
 
-    assert verification.decision_hint == "repair"
+    assert verification.decision_hint == "retry_extract"
     assert verification.complete_files == 1
     assert verification.failed_files == 1
     assert verification.missing_files == 1
@@ -239,16 +239,16 @@ def test_zip_verification_methods_share_one_full_archive_manifest(tmp_path, monk
     for name, payload in expected.items():
         (out_dir / name).write_bytes(payload)
     task = ArchiveTask(
-        fact_bag=FactBag(), score=10, key="shared", main_path=str(archive),
+        fact_bag=FactBag(), key="shared", main_path=str(archive),
         all_parts=[str(archive)], detected_ext="zip",
     )
     result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
     calls = []
     native_manifest = archive_state_manifest_module._native_archive_state_zip_manifest
 
-    def counted_manifest(source, patches, max_items, password, codepage):
+    def counted_manifest(source, max_items, password, codepage):
         calls.append(max_items)
-        return native_manifest(source, patches, max_items, password, codepage)
+        return native_manifest(source, max_items, password, codepage)
 
     monkeypatch.setattr(archive_state_manifest_module, "_native_archive_state_zip_manifest", counted_manifest)
     verification = _scheduler([
@@ -267,7 +267,6 @@ def test_archive_test_crc_unsupported_empty_failed_extraction_is_not_complete(tm
     out_dir = tmp_path / "missing-output"
     task = ArchiveTask(
         fact_bag=FactBag(),
-        score=10,
         key="sample-7z",
         main_path=str(archive),
         all_parts=[str(archive)],
@@ -336,7 +335,7 @@ def _task(tmp_path, analysis=None, oracle=None):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"zip")
     bag = FactBag()
-    task = ArchiveTask(fact_bag=bag, score=10, key="sample", main_path=str(archive), all_parts=[str(archive)])
+    task = ArchiveTask(fact_bag=bag, key="sample", main_path=str(archive), all_parts=[str(archive)])
     knowledge = task.knowledge()
     if analysis is not None:
         knowledge.set("resource.analysis", analysis, source_layer="test", source_module="fixture")

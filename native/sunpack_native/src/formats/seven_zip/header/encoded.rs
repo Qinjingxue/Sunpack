@@ -191,54 +191,6 @@ fn parse_seven_zip_encoded_header_descriptor(
     ))
 }
 
-fn decode_seven_zip_encoded_header_payload(
-    data: &[u8],
-    header: &SevenZipHeader,
-    password: Option<&str>,
-) -> Result<Vec<u8>, String> {
-    if header.next_header_nid != SZ_ENCODED_HEADER {
-        return Err("encoded_header_absent".to_string());
-    }
-    let raw = data
-        .get(header.next_header_start..header.archive_end)
-        .ok_or_else(|| "encoded_header_range_invalid".to_string())?;
-    decode_seven_zip_encoded_header_payload_from_raw(data, header, raw, password)
-}
-
-fn decode_seven_zip_encoded_header_payload_from_raw(
-    data: &[u8],
-    header: &SevenZipHeader,
-    raw: &[u8],
-    password: Option<&str>,
-) -> Result<Vec<u8>, String> {
-    let (pack, folder) = parse_seven_zip_encoded_header_descriptor(raw)?;
-    if pack.num_streams != pack.sizes.len() || pack.sizes.len() != folder.packed_streams.len() {
-        return Err("encoded_header_pack_stream_count_mismatch".to_string());
-    }
-    let stream_start = SEVEN_Z_HEADER_SIZE
-        .checked_add(usize::try_from(pack.pack_pos.value).unwrap_or(usize::MAX))
-        .unwrap_or(usize::MAX);
-    let mut packed_data = Vec::with_capacity(pack.sizes.len());
-    let mut cursor = stream_start;
-    for size in &pack.sizes {
-        let stream_size = usize::try_from(size.value).unwrap_or(usize::MAX);
-        let stream_end = cursor.checked_add(stream_size).unwrap_or(usize::MAX);
-        if cursor < SEVEN_Z_HEADER_SIZE
-            || stream_end > data.len()
-            || stream_end > header.next_header_start
-        {
-            return Err("encoded_header_stream_range_invalid".to_string());
-        }
-        packed_data.push(data[cursor..stream_end].to_vec());
-        cursor = stream_end;
-    }
-    let decoded = decode_seven_zip_encoded_folder(&packed_data, &folder, password)?;
-    if decoded.first().copied() != Some(SZ_HEADER) {
-        return Err("encoded_header_ast_write_failed".to_string());
-    }
-    Ok(decoded)
-}
-
 fn lzma2_dict_size(prop: u8) -> Option<u32> {
     let bits = u32::from(prop);
     if (bits & !0x3f) != 0 || bits > 40 {
@@ -581,22 +533,6 @@ fn seven_zip_kdf_cache(
         std::sync::Mutex<std::collections::VecDeque<SevenZipKdfCacheEntry>>,
     > = std::sync::OnceLock::new();
     CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::VecDeque::new()))
-}
-
-pub(crate) fn seven_zip_kdf_cache_len() -> usize {
-    seven_zip_kdf_cache()
-        .lock()
-        .map(|cache| cache.len())
-        .unwrap_or(0)
-}
-
-pub(crate) fn clear_seven_zip_kdf_cache() -> usize {
-    let mut cache = seven_zip_kdf_cache()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let removed = cache.len();
-    cache.clear();
-    removed
 }
 
 fn cached_seven_zip_aes_key(cycles: u32, salt: &[u8], password: &[u8]) -> [u8; 32] {

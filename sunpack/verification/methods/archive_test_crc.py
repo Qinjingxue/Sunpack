@@ -14,7 +14,7 @@ from sunpack.verification.methods._archive_output_match import ArchiveOutputCove
 from sunpack.verification.methods._output_stats import output_file_index_for_evidence, output_inventory_for_evidence, should_emit_file_observations
 from sunpack.verification.registry import register_verification_method
 from sunpack.contracts.verification import (
-    DECISION_REPAIR,
+    DECISION_RETRY_EXTRACT,
     FileVerificationObservation,
     CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
     CONTENT_INTEGRITY_UNKNOWN,
@@ -174,7 +174,7 @@ class ArchiveTestCrcMethod:
             verified_item_count=summary["verified_item_count"],
             archive_walk_complete=summary["archive_walk_complete"],
             recoverable_upper_bound_hint=completeness,
-            decision_hint=DECISION_REPAIR,
+            decision_hint=DECISION_RETRY_EXTRACT,
             file_observations=observations,
         )
 
@@ -191,8 +191,7 @@ class ArchiveTestCrcMethod:
                     message=archive_manifest.message,
                     path=evidence.archive_path,
                     actual={
-                        "state_aware": True,
-                        "patch_digest": evidence.patch_digest,
+                        "source_manifest": True,
                         "archive_type": getattr(archive_manifest, "archive_type", ""),
                     },
                 )],
@@ -221,7 +220,7 @@ class ArchiveTestCrcMethod:
                     else classify_verification_error(archive_manifest.failure_kind).content_integrity
                 ),
                 container_integrity_hint=classify_verification_error(archive_manifest.failure_kind).container_integrity,
-                decision_hint=DECISION_REPAIR,
+                decision_hint=DECISION_RETRY_EXTRACT,
                 issues=[VerificationIssue(
                     method=self.name,
                     code="fail.archive_crc_test_failed",
@@ -258,8 +257,7 @@ def _coverage_actual(coverage: dict[str, Any], archive_manifest, evidence: Verif
         "complete_bytes": int(coverage.get("complete_bytes", 0) or 0),
     }
     actual.update({
-        "state_aware": True,
-        "patch_digest": evidence.patch_digest,
+        "source_manifest": True,
         "archive_type": getattr(archive_manifest, "archive_type", ""),
         "content_integrity": _content_integrity(archive_manifest),
     })

@@ -4,7 +4,6 @@ from dataclasses import dataclass
 from os import PathLike
 from typing import Any, TypeAlias
 
-from sunpack.contracts.archive_state import ArchiveState
 from sunpack.contracts.archive_input import ArchiveInputDescriptor
 
 
@@ -30,22 +29,11 @@ class MultiVolumeAnalysisSource:
         object.__setattr__(self, "volumes", volumes)
 
 
-@dataclass(frozen=True, slots=True)
-class PatchedAnalysisSource:
-    state: ArchiveState
-    report_path: str = ""
-
-    def __post_init__(self) -> None:
-        if not self.state.patches:
-            raise ValueError("patched analysis source requires a non-empty patch stack")
-        object.__setattr__(self, "report_path", str(self.report_path or self.state.source.entry_path))
-
-
-AnalysisSource: TypeAlias = FileAnalysisSource | MultiVolumeAnalysisSource | PatchedAnalysisSource
+AnalysisSource: TypeAlias = FileAnalysisSource | MultiVolumeAnalysisSource
 
 
 def analysis_source(value: AnalysisSource | str | PathLike[str] | list[Any] | tuple[Any, ...]) -> AnalysisSource:
-    if isinstance(value, (FileAnalysisSource, MultiVolumeAnalysisSource, PatchedAnalysisSource)):
+    if isinstance(value, (FileAnalysisSource, MultiVolumeAnalysisSource)):
         return value
     if isinstance(value, (str, PathLike)):
         return FileAnalysisSource(str(value))

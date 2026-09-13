@@ -19,7 +19,7 @@ from sunpack.verification.methods._output_stats import (
 from sunpack.verification.registry import register_verification_method
 from sunpack.contracts.verification import (
     DECISION_NONE,
-    DECISION_REPAIR,
+    DECISION_RETRY_EXTRACT,
     CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
     CONTENT_INTEGRITY_UNKNOWN,
     CONTENT_INTEGRITY_VERIFIED_COMPLETE,
@@ -155,7 +155,7 @@ class ExpectedNamePresenceMethod:
             total_item_count=int(getattr(state_manifest, "item_count", 0) or 0),
             verified_item_count=int(getattr(state_manifest, "verified_item_count", 0) or 0),
             archive_walk_complete=bool(getattr(state_manifest, "archive_walk_complete", False)),
-            decision_hint=DECISION_REPAIR if _expected_names_are_strong(evidence, config, content_integrity, state_manifest) else DECISION_NONE,
+            decision_hint=DECISION_RETRY_EXTRACT if _expected_names_are_strong(evidence, config, content_integrity, state_manifest) else DECISION_NONE,
             file_observations=coverage.observations,
         )
 
@@ -251,8 +251,7 @@ def _merged_analysis(evidence: VerificationEvidence) -> dict[str, Any]:
 def _coverage_actual(coverage, state_manifest: ArchiveStateManifest | None, evidence: VerificationEvidence) -> dict[str, Any]:
     actual = coverage_details(coverage)
     actual.update({
-        "state_aware": True,
-        "patch_digest": evidence.patch_digest,
+        "source_manifest": True,
         "archive_type": state_manifest.archive_type if state_manifest is not None else "",
         "manifest_source": state_manifest.source if state_manifest is not None and state_manifest.ok else "analysis_or_config",
     })

@@ -80,7 +80,7 @@ class DetectionScheduler:
         fact_bags: list[FactBag],
         scan_session: Any = None,
     ) -> tuple[dict[FactBag, RuleDecision], list[FactBag]]:
-        """Evaluate strict prechecks without allowing candidates into scoring."""
+        """Evaluate strict prechecks without finalizing ordinary candidates."""
         self._active_scan_session = scan_session
         self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
         try:

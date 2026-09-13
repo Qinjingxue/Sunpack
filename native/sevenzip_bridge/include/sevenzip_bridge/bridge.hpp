@@ -191,15 +191,6 @@ struct ExtractInputRange {
     bool has_end = false;
 };
 
-struct ExtractPatchOperation {
-    std::wstring op;
-    std::wstring target = L"logical";
-    unsigned long long offset = 0;
-    unsigned long long size = 0;
-    bool has_size = false;
-    std::vector<unsigned char> data;
-};
-
 bool is_backend_available(const std::wstring& seven_zip_dll_path);
 
 PasswordTestResult test_password(
@@ -263,24 +254,6 @@ ExtractArchiveResult extract_archive_with_ranges(
     const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<ExtractInputRange>& ranges,
-    const std::wstring& format_hint,
-    const std::wstring& password,
-    const std::wstring& output_dir,
-    const std::wstring& codepage,
-    const std::vector<std::wstring>& decoded_names,
-    ExtractProgressCallback progress = {},
-    bool dry_run = false,
-    std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
-    std::size_t job_buffer_budget = 0,
-    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
-);
-
-ExtractArchiveResult extract_archive_with_patches(
-    const std::wstring& seven_zip_dll_path,
-    const std::wstring& archive_path,
-    const std::vector<std::wstring>& part_paths,
-    const std::vector<ExtractInputRange>& ranges,
-    const std::vector<ExtractPatchOperation>& patches,
     const std::wstring& format_hint,
     const std::wstring& password,
     const std::wstring& output_dir,

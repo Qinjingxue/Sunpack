@@ -13,7 +13,6 @@ def _task(tmp_path, *, status: str, confidence: str) -> ArchiveTask:
     facts.set("relation.split_missing_indices", [2])
     return ArchiveTask(
         fact_bag=facts,
-        score=10,
         key=archive.name,
         main_path=str(archive),
         all_parts=[str(archive)],

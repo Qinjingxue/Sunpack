@@ -159,6 +159,5 @@ def direct_file_task(path: str, all_parts: list[str] | None = None) -> ArchiveTa
         pass
     return ArchiveTask.from_fact_bag(
         bag,
-        score=0,
         decision=SimpleNamespace(decision="direct_file", stop_reason="cli_direct_file", matched_rules=[]),
     )

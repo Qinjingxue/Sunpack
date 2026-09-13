@@ -6,7 +6,6 @@ from sunpack.cli.cli_runtime import (
 )
 from sunpack.config.config_validator import validate_config_payload
 from tests.helpers.detection_config import with_detection_pipeline
-from tests.helpers.edition import is_lite_edition
 
 
 def _payload():
@@ -34,26 +33,6 @@ def test_config_validate_rejects_obsolete_cumulative_deep_scan_ratio():
 
     assert not result["ok"]
     assert any("deep_scan_size_coverage_ratio" in error for error in result["errors"])
-
-
-def test_config_validate_rejects_obsolete_scoring_weight_fields():
-    if is_lite_edition():
-        pytest.skip("scoring rules are disabled in Lite edition")
-
-    payload = with_detection_pipeline(
-        scoring=[
-            {
-                "name": "zip_structure_identity",
-                "enabled": True,
-                "magic_score": 2,
-            }
-        ]
-    )
-
-    result = validate_config_payload(payload)
-
-    assert not result["ok"]
-    assert any("magic_score" in error for error in result["errors"])
 
 
 def test_config_validate_rejects_normalized_config_values_in_external_shorthand_fields():
@@ -127,7 +106,7 @@ def test_output_dir_override_is_relative_to_the_request_cwd(tmp_path):
     assert config["output"]["root"] == str(tmp_path / "output")
 
 
-def test_effective_config_includes_thresholds_native_worker_and_rule_pipeline():
+def test_effective_config_includes_native_worker_and_rule_pipeline():
     config = _payload()
     config["filesystem"] = {
         "directory_scan_mode": "-",
@@ -135,12 +114,10 @@ def test_effective_config_includes_thresholds_native_worker_and_rule_pipeline():
             {"name": "size_range", "enabled": True, "gte": 1048576}
         ]
     }
-    config["thresholds"] = {"archive_score_threshold": 6, "maybe_archive_threshold": 3}
     config["performance"] = {"worker": {"thread_capacity": 0, "initial_active_jobs": 0}}
 
     effective = build_effective_config(config)
 
-    assert effective["thresholds"]["archive_score_threshold"] == 6
     assert effective["size_range_min_bytes"] == 1048576
     assert effective["filesystem"]["directory_scan_mode"] == "current_dir_only"
     assert effective["worker"]["controller"] == "native_worker"

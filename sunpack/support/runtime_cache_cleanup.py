@@ -8,7 +8,6 @@ idle process or engine.
 
 from __future__ import annotations
 
-from collections.abc import Iterable
 from typing import Any
 
 from sunpack.passwords.relation_prober import (
@@ -26,7 +25,7 @@ from sunpack.support.global_cache_manager import (
 )
 
 
-def runtime_cache_stats(*, inspection_services: Iterable[Any] = ()) -> dict[str, Any]:
+def runtime_cache_stats() -> dict[str, Any]:
     """Return lightweight counts for every cache owned by this coordinator."""
 
     result: dict[str, Any] = {
@@ -35,26 +34,11 @@ def runtime_cache_stats(*, inspection_services: Iterable[Any] = ()) -> dict[str,
         "relation_probe_cache": relation_probe_cache_stats(),
         "archive_sessions": _archive_session_stats(),
         "reader": _reader_stats(),
-        "native_seven_zip": _native_seven_zip_stats(),
-        "inspection": [],
     }
-    for service in inspection_services:
-        cache = getattr(service, "cache", None)
-        if cache is None:
-            result["inspection"].append({"available": False})
-            continue
-        try:
-            with cache._lock:
-                result["inspection"].append({
-                    "entries": len(cache._items),
-                    "max_entries": int(cache.max_entries),
-                })
-        except (AttributeError, TypeError, ValueError):
-            result["inspection"].append({"available": False})
     return result
 
 
-def clear_all_runtime_caches(*, inspection_services: Iterable[Any] = ()) -> dict[str, Any]:
+def clear_all_runtime_caches() -> dict[str, Any]:
     """Clear process-wide memoized data and return a per-owner report.
 
     The caller must establish that no pipeline request or completion callback
@@ -64,11 +48,9 @@ def clear_all_runtime_caches(*, inspection_services: Iterable[Any] = ()) -> dict
 
     report: dict[str, Any] = {"errors": []}
     for name, action in (
-        ("inspection", lambda: _clear_inspection_caches(inspection_services)),
         ("relation_probe_cache", clear_relation_probe_cache),
         ("projection_cache", clear_projection_cache),
         ("global_cache", clear_all_caches),
-        ("native_seven_zip", _clear_native_seven_zip_caches),
         ("archive_sessions", clear_archive_sessions),
     ):
         try:
@@ -80,27 +62,6 @@ def clear_all_runtime_caches(*, inspection_services: Iterable[Any] = ()) -> dict
                 "error_type": type(exc).__name__,
             })
     return report
-
-
-def _clear_inspection_caches(services: Iterable[Any]) -> list[dict[str, Any]]:
-    result = []
-    for service in services:
-        clear = getattr(service, "clear_cache", None)
-        if not callable(clear):
-            result.append({"available": False})
-            continue
-        before = _inspection_entry_count(service)
-        clear()
-        result.append({"entries": before})
-    return result
-
-
-def _inspection_entry_count(service: Any) -> int:
-    cache = getattr(service, "cache", None)
-    if cache is None:
-        return 0
-    with cache._lock:
-        return len(cache._items)
 
 
 def _archive_session_stats() -> dict[str, int]:
@@ -117,20 +78,3 @@ def _reader_stats() -> dict[str, Any]:
         return dict(reader_cache_stats())
     except (ImportError, AttributeError, TypeError):
         return {"available": False}
-
-
-def _native_seven_zip_stats() -> dict[str, Any]:
-    try:
-        from sunpack_native import seven_zip_runtime_cache_stats
-
-        return dict(seven_zip_runtime_cache_stats())
-    except (ImportError, AttributeError, TypeError):
-        return {"available": False}
-
-
-def _clear_native_seven_zip_caches() -> dict[str, Any]:
-    try:
-        from sunpack_native import clear_seven_zip_runtime_caches
-    except (ImportError, AttributeError):
-        return {"available": False}
-    return dict(clear_seven_zip_runtime_caches())

@@ -1,7 +1,6 @@
 from typing import Any, Dict
 
 from sunpack.config.detection_view import rule_pipeline_config
-from sunpack.config.edition import detection_scoring_enabled
 from sunpack.detection.pipeline.facts.schema import known_fact_names, matches_schema_type
 
 
@@ -16,15 +15,12 @@ class RuleConfigValidator:
         pipeline_config = rule_pipeline_config(config)
         if not isinstance(pipeline_config, dict):
             return ["detection.rule_pipeline must be an object"]
-        unknown_layers = sorted(set(pipeline_config) - {"precheck", "scoring"})
+        unknown_layers = sorted(set(pipeline_config) - {"precheck"})
         if unknown_layers:
             errors.append(
                 "Unknown detection.rule_pipeline field(s): " + ", ".join(unknown_layers)
             )
-        for layer in ("precheck", "scoring"):
-            if layer == "scoring" and not detection_scoring_enabled():
-                continue
-
+        for layer in ("precheck",):
             rules = pipeline_config.get(layer, [])
             if not isinstance(rules, list):
                 errors.append(f"detection.rule_pipeline.{layer} must be a list")

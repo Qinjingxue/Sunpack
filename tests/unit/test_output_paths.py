@@ -6,7 +6,6 @@ from sunpack.support.output_paths import default_output_dir_for_task
 def _task(path):
     return ArchiveTask(
         fact_bag=FactBag(),
-        score=10,
         main_path=str(path),
         all_parts=[str(path)],
         logical_name=path.stem,

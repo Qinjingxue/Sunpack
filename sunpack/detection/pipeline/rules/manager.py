@@ -4,7 +4,6 @@ from sunpack.contracts.detection import FactBag
 from sunpack.contracts.rules import RuleDecision
 from sunpack.detection.pipeline.rules.registry import discover_rules, get_rule_registry
 from sunpack.detection.pipeline.rules.config_validator import RuleConfigValidator
-from sunpack.detection.pipeline.rules.decision_policy import RuleDecisionPolicy
 from sunpack.detection.pipeline.rules.rule_preparer import RulePreparer
 from sunpack.detection.pipeline.rules.types import PreparedRule
 from sunpack.detection.pipeline.rules.fact_requirements import FactRequirement
@@ -23,24 +22,9 @@ class RuleManager:
         self.registry = get_rule_registry()
         self.config_validator = RuleConfigValidator(self.registry)
         self.rule_preparer = RulePreparer(config, self.registry, self.config_validator)
-        self.decision_policy = RuleDecisionPolicy(config)
 
     def validate_config(self) -> list[str]:
         return self.config_validator.validate_pipeline_config(self.config)
-
-    def finalize_scored_evidence(
-        self,
-        fact_bag: FactBag,
-        total_score: int,
-        matched_rules: List[str],
-        score_breakdown: list[dict[str, Any]] | None = None,
-    ) -> RuleDecision:
-        return self.decision_policy.finalize_scoring_decision(
-            fact_bag,
-            total_score,
-            matched_rules,
-            score_breakdown=score_breakdown,
-        )
 
     def _prepare_rules(self, layer: str) -> List[PreparedRule]:
         return self.rule_preparer.prepare(layer)
@@ -66,92 +50,6 @@ class RuleManager:
         effective = dict(self.fact_config_defaults.get(fact_name, {}))
         effective.update(rule_config)
         return effective
-
-    def _ensure_scoring_facts(self, fact_bags: List[FactBag], scoring_rules: List[PreparedRule]):
-        prerequisite_facts: set[str] = set()
-        rule_requirements: list[tuple[PreparedRule, list[FactRequirement]]] = []
-        for rule in scoring_rules:
-            requirements = self._rule_fact_requirements(rule)
-            rule_requirements.append((rule, requirements))
-            for requirement in requirements:
-                prerequisite_facts.update(requirement.prerequisite_facts)
-
-        if prerequisite_facts:
-            self.ensure_pool_facts(fact_bags, prerequisite_facts)
-
-        for bag in fact_bags:
-            active_facts: list[str] = []
-            seen_active_facts: set[str] = set()
-            fact_configs: dict[str, dict[str, Any]] = {}
-            for rule, requirements in rule_requirements:
-                for requirement in requirements:
-                    effective_config = self._effective_fact_config(requirement.fact_name, rule.config)
-                    if not requirement.matches(bag, effective_config):
-                        continue
-                    if requirement.fact_name not in seen_active_facts:
-                        active_facts.append(requirement.fact_name)
-                        seen_active_facts.add(requirement.fact_name)
-                    fact_configs.setdefault(requirement.fact_name, effective_config)
-            if active_facts:
-                self.ensure_pool_facts([bag], set(active_facts), fact_configs)
-
-    def _ensure_scoring_rule_facts(self, fact_bags: List[FactBag], rule: PreparedRule):
-        if not fact_bags:
-            return
-        requirements = self._rule_fact_requirements(rule)
-        prerequisite_facts: set[str] = set()
-        for requirement in requirements:
-            prerequisite_facts.update(requirement.prerequisite_facts)
-        if prerequisite_facts:
-            self.ensure_pool_facts(fact_bags, prerequisite_facts)
-
-        active_groups: dict[frozenset[str], list[FactBag]] = {}
-        for bag in fact_bags:
-            active_facts = {
-                requirement.fact_name
-                for requirement in requirements
-                if requirement.matches(bag, self._effective_fact_config(requirement.fact_name, rule.config))
-            }
-            if active_facts:
-                active_groups.setdefault(frozenset(active_facts), []).append(bag)
-
-        for active_facts, active_bags in active_groups.items():
-            fact_configs = {
-                fact_name: self._effective_fact_config(fact_name, rule.config)
-                for fact_name in active_facts
-            }
-            self.ensure_pool_facts(active_bags, set(active_facts), fact_configs)
-
-    def _remaining_minimum_score(self, scoring_rules: List[PreparedRule]) -> int:
-        minimum = 0
-        for rule in scoring_rules:
-            minimum += int(rule.instance.minimum_score(rule.config))
-        return minimum
-
-    def _scoring_decision_fixed(
-        self,
-        total_score: int,
-        remaining_rules: List[PreparedRule],
-    ) -> bool:
-        # A remaining mutually-exclusive hypothesis may win even after the
-        # extraction threshold is fixed.  It must still run so that format
-        # facts do not depend on configuration order.
-        if any(getattr(rule.instance, "score_group", None) for rule in remaining_rules):
-            return False
-        threshold = self.decision_policy.archive_threshold()
-        return total_score >= threshold and total_score + self._remaining_minimum_score(remaining_rules) >= threshold
-
-    @staticmethod
-    def _fact_snapshot(bag: FactBag, keys: set[str]) -> dict[str, tuple[bool, Any]]:
-        return {key: (bag.has(key), bag.get(key)) for key in keys}
-
-    @staticmethod
-    def _restore_fact_snapshot(bag: FactBag, snapshot: dict[str, tuple[bool, Any]]):
-        for key, (present, value) in snapshot.items():
-            if present:
-                bag.set(key, value)
-            else:
-                bag.unset(key)
 
     @staticmethod
     def _routing_values(bag: FactBag) -> tuple[set[str], set[str]]:
@@ -227,7 +125,6 @@ class RuleManager:
                     accepted = effect.decision == "accept"
                     decisions[bag] = RuleDecision(
                         should_extract=accepted,
-                        total_score=0,
                         matched_rules=[rule.name],
                         stop_reason=effect.reason,
                         decision="archive" if accepted else "not_archive",
@@ -266,100 +163,13 @@ class RuleManager:
 
     def evaluate_pool(self, fact_bags: List[FactBag]) -> Dict[FactBag, RuleDecision]:
         decisions, surviving = self._run_precheck(fact_bags)
-        if not surviving:
-            return decisions
-
-        scoring_rules = self._prepare_rules("scoring")
-        group_fact_keys: dict[str, set[str]] = {}
-        for rule in scoring_rules:
-            score_group = str(getattr(rule.instance, "score_group", None) or "")
-            if score_group:
-                group_fact_keys.setdefault(score_group, set()).update(rule.instance.produced_facts)
-        scoring_state: dict[FactBag, dict[str, Any]] = {
-            bag: {
-                "additive_entries": [],
-                "group_entries": {},
-                "group_baselines": {
-                    group: self._fact_snapshot(bag, keys)
-                    for group, keys in group_fact_keys.items()
-                },
-            }
-            for bag in surviving
-        }
-        active_bags = list(surviving)
-
-        for index, rule in enumerate(scoring_rules):
-            if not active_bags:
-                break
-            self._ensure_scoring_rule_facts(active_bags, rule)
-            remaining_rules = scoring_rules[index + 1 :]
-            next_active_bags: List[FactBag] = []
-            for bag in active_bags:
-                state = scoring_state[bag]
-                score_group = str(getattr(rule.instance, "score_group", None) or "")
-                if score_group:
-                    self._restore_fact_snapshot(bag, state["group_baselines"][score_group])
-                effect = rule.instance.evaluate(bag, rule.config)
-                if effect.decision == "score":
-                    entry = {
-                        "index": index,
-                        "rule": rule.name,
-                        "score": effect.score,
-                        "reason": effect.reason,
-                    }
-                    if score_group:
-                        entry["facts"] = self._fact_snapshot(bag, rule.instance.produced_facts)
-                        current = state["group_entries"].get(score_group)
-                        candidate_rank = (int(effect.score), str(rule.name))
-                        current_rank = (
-                            (int(current["score"]), str(current["rule"]))
-                            if current is not None
-                            else (0, "")
-                        )
-                        if effect.score > 0 and candidate_rank > current_rank:
-                            state["group_entries"][score_group] = entry
-                    else:
-                        state["additive_entries"].append(entry)
-                if score_group:
-                    self._restore_fact_snapshot(bag, state["group_baselines"][score_group])
-                current_entries = list(state["additive_entries"]) + list(state["group_entries"].values())
-                total_score = sum(int(entry["score"]) for entry in current_entries)
-                if not self._scoring_decision_fixed(
-                    total_score,
-                    remaining_rules,
-                ):
-                    next_active_bags.append(bag)
-            active_bags = next_active_bags
-
         for bag in surviving:
-            state = scoring_state[bag]
-            selected_entries = list(state["additive_entries"]) + list(state["group_entries"].values())
-            selected_entries.sort(key=lambda entry: int(entry["index"]))
-            for entry in selected_entries:
-                for key, (present, value) in entry.get("facts", {}).items():
-                    if present:
-                        bag.set(key, value)
-                    else:
-                        bag.unset(key)
-            total_score = sum(int(entry["score"]) for entry in selected_entries)
-            matched_rules = [
-                str(entry["rule"])
-                for entry in selected_entries
-                if int(entry["score"]) != 0
-            ]
-            score_breakdown = [
-                {
-                    "rule": entry["rule"],
-                    "score": entry["score"],
-                    "reason": entry["reason"],
-                }
-                for entry in selected_entries
-            ]
-            decisions[bag] = self.finalize_scored_evidence(
-                bag,
-                total_score,
-                matched_rules,
-                score_breakdown=score_breakdown,
+            decisions[bag] = RuleDecision(
+                should_extract=False,
+                matched_rules=[],
+                decision="not_archive",
+                decision_stage="precheck",
+                discarded_at="precheck",
             )
 
         return decisions
@@ -368,10 +178,5 @@ class RuleManager:
         self,
         fact_bags: List[FactBag],
     ) -> tuple[Dict[FactBag, RuleDecision], List[FactBag]]:
-        """Run only terminal precheck rules and return the surviving candidates.
-
-        The coordinator uses this boundary to authorize the optional embedded
-        scan before fuzzy scoring.  Full evaluation remains unchanged and is
-        run afterwards with the selected candidates marked in their fact bags.
-        """
+        """Run only terminal precheck rules and return surviving candidates."""
         return self._run_precheck(fact_bags)

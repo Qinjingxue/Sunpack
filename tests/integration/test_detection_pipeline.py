@@ -26,8 +26,6 @@ def minimal_config():
         {"name": "blacklist", "enabled": True, "blocked_files": []},
         {"name": "size_range", "enabled": True, "gte": 0},
         {"name": "zip_structure_accept", "enabled": True},
-    ], scoring=[
-        {"name": "zip_structure_identity", "enabled": True},
     ]))
 
 
@@ -42,7 +40,6 @@ class DetectionPipelineTests(unittest.TestCase):
             decision = DetectionScheduler(minimal_config()).evaluate_bag(bag)
 
             self.assertTrue(decision.should_extract)
-            self.assertEqual(decision.total_score, 0)
             self.assertEqual(decision.deciding_rule, "zip_structure_accept")
             self.assertEqual(bag.get("file.path"), str(archive_path))
 
@@ -58,7 +55,7 @@ class DetectionPipelineTests(unittest.TestCase):
             bag.set("candidate.member_paths", [str(source)])
             bag.set("candidate.logical_name", "fake_doc")
             bag.set("file.detected_ext", ".zip")
-            task = ArchiveTask.from_fact_bag(bag, score=10)
+            task = ArchiveTask.from_fact_bag(bag)
 
             self.assertTrue(source.exists())
             self.assertEqual(os.path.normcase(task.main_path), os.path.normcase(str(source)))

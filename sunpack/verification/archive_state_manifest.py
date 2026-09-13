@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 from sunpack.contracts.archive_state import ArchiveState
-from sunpack.support.archive_state_view import UnsupportedArchivePatch
 from sunpack.support.sevenzip_bridge import STATUS_DAMAGED, STATUS_OK, STATUS_UNSUPPORTED
 from sunpack_native import (
     archive_state_tar_manifest_native as _native_archive_state_tar_manifest,
@@ -27,7 +26,6 @@ class ArchiveStateManifest:
     archive_type: str = ""
     source: str = "archive_state"
     state_aware: bool = True
-    patch_digest: str = ""
     archive_walk_complete: bool = False
     verified_item_count: int = 0
     entries_truncated: bool = False
@@ -131,7 +129,6 @@ def _worker_verified_manifest(evidence) -> ArchiveStateManifest | None:
         archive_type=str(result.get("archive_type") or ""),
         source=str(payload.get("source") or "sevenzip_worker_extract"),
         state_aware=True,
-        patch_digest=evidence.patch_digest,
         archive_walk_complete=True,
         verified_item_count=int(payload.get("item_count", len(files)) or 0),
         entries_truncated=False,
@@ -143,7 +140,6 @@ def _evidence_manifest_identity(evidence, codepage: str) -> tuple:
     source = state.source
     return (
         repr(source.to_dict()),
-        state.effective_patch_digest(),
         str(evidence.password or ""),
         codepage,
     )
@@ -164,10 +160,9 @@ def archive_state_manifest(
     password: str | None = None,
     codepage: str | None = None,
 ) -> ArchiveStateManifest:
-    patch_digest = state.effective_patch_digest()
     hint = _format_hint(state)
     if hint == "tar" or (not hint and Path(state.source.entry_path).suffix.lower() == ".tar"):
-        return _tar_archive_state_manifest(state, max_items=max_items, patch_digest=patch_digest)
+        return _tar_archive_state_manifest(state, max_items=max_items)
     if hint and hint != "zip" and not Path(state.source.entry_path).suffix.lower() == ".zip":
         return ArchiveStateManifest(
             status=STATUS_UNSUPPORTED,
@@ -178,18 +173,16 @@ def archive_state_manifest(
             file_count=0,
             message=f"Archive-state manifest is not implemented for format: {hint}",
             archive_type=hint,
-            patch_digest=patch_digest,
         )
 
     try:
         payload = dict(_native_archive_state_zip_manifest(
             state.source.to_dict(),
-            [patch.to_dict() for patch in state.patches],
             max_items,
             password,
             codepage,
         ))
-    except (OSError, ValueError, UnsupportedArchivePatch) as exc:
+    except (OSError, ValueError) as exc:
         return ArchiveStateManifest(
             status=STATUS_UNSUPPORTED,
             is_archive=False,
@@ -198,7 +191,6 @@ def archive_state_manifest(
             item_count=0,
             file_count=0,
             message=f"Archive state cannot be opened as a verification byte view: {exc}",
-            patch_digest=patch_digest,
         )
     if not bool(payload.get("is_archive")) and not hint:
         return ArchiveStateManifest(
@@ -209,7 +201,6 @@ def archive_state_manifest(
             item_count=0,
             file_count=0,
             message="Archive-state manifest could not identify a supported archive format",
-            patch_digest=patch_digest,
         )
     files = [dict(item) for item in payload.get("files") or [] if isinstance(item, dict)]
     file_count = int(payload.get("file_count", 0) or 0)
@@ -225,7 +216,6 @@ def archive_state_manifest(
         archive_type=str(payload.get("archive_type") or "zip"),
         source=str(payload.get("source") or "archive_state_native"),
         state_aware=bool(payload.get("state_aware", True)),
-        patch_digest=patch_digest,
         archive_walk_complete=(int(payload["status"]) if payload.get("status") is not None else STATUS_DAMAGED) == STATUS_OK,
         verified_item_count=(
             int(payload.get("item_count", 0) or 0)
@@ -245,19 +235,17 @@ def _tar_archive_state_manifest(
     state: ArchiveState,
     *,
     max_items: int,
-    patch_digest: str,
 ) -> ArchiveStateManifest:
     try:
         payload = dict(_native_archive_state_tar_manifest(
             state.source.to_dict(),
-            [patch.to_dict() for patch in state.patches],
             max_items,
         ))
-    except (OSError, ValueError, UnsupportedArchivePatch) as exc:
+    except (OSError, ValueError) as exc:
         return ArchiveStateManifest(
             status=STATUS_UNSUPPORTED, is_archive=False, damaged=False, checksum_error=False,
             item_count=0, file_count=0, message=f"TAR state could not be read: {exc}",
-            archive_type="tar", patch_digest=patch_digest,
+            archive_type="tar",
         )
     files = [dict(item) for item in payload.get("files") or [] if isinstance(item, dict)]
     status = int(
@@ -276,7 +264,6 @@ def _tar_archive_state_manifest(
         message=str(payload.get("message") or ""),
         archive_type="tar",
         source=str(payload.get("source") or "archive_state_tar_native"),
-        patch_digest=patch_digest,
         archive_walk_complete=bool(payload.get("archive_walk_complete", status == STATUS_OK)),
         verified_item_count=int(payload.get("verified_item_count", 0) or 0),
         entries_truncated=bool(payload.get("entries_truncated", len(files) < file_count)),

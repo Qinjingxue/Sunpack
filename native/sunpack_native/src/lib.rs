@@ -1,19 +1,3 @@
-use formats::carrier::{
-    archive_carrier_crop_recovery, archive_nested_payload_salvage, rar_block_chain_trim_recovery,
-    rar_end_block_repair,
-};
-use formats::seven_zip::{seven_zip_atomic_repair, seven_zip_scan_source};
-use formats::stream::{
-    compression_stream_block_salvage, compression_stream_partial_recovery,
-    compression_stream_trailing_junk_trim, gzip_deflate_member_resync_repair,
-    gzip_footer_fix_repair, tar_boundary_repair, tar_compressed_partial_recovery,
-    tar_truncated_partial_recovery, zstd_frame_salvage_repair,
-};
-use formats::zip::{
-    zip_cd_local_header_reconcile_salvage, zip_conflict_resolver_rebuild,
-    zip_deep_partial_recovery, zip_directory_field_repair, zip_rebuild_from_local_headers,
-    zip_remove_spurious_data_descriptor, zip_scan_source, zip_verified_entry_salvage,
-};
 use pyo3::prelude::*;
 
 mod analysis_native;
@@ -73,14 +57,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         io::resource_lifecycle::native_end_promotion,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        formats::seven_zip::seven_zip_runtime_cache_stats,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        formats::seven_zip::clear_seven_zip_runtime_caches,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
@@ -268,18 +244,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         password::zip::zip_fast_verify_passwords_from_volumes,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(io::repair::repair_read_file_range, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        io::repair::repair_concat_ranges_to_bytes,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(io::repair::repair_write_candidate, m)?)?;
-    m.add_function(wrap_pyfunction!(io::repair::repair_copy_range_to_file, m)?)?;
-    m.add_function(wrap_pyfunction!(
-        io::repair::repair_concat_ranges_to_file,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(io::repair::repair_patch_file, m)?)?;
     m.add_function(wrap_pyfunction!(
         io::archive_state::archive_state_to_bytes_native,
         m
@@ -300,28 +264,5 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         io::archive_state::archive_state_tar_manifest_native,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(zip_deep_partial_recovery, m)?)?;
-    m.add_function(wrap_pyfunction!(zip_scan_source, m)?)?;
-    m.add_function(wrap_pyfunction!(zip_rebuild_from_local_headers, m)?)?;
-    m.add_function(wrap_pyfunction!(zip_directory_field_repair, m)?)?;
-    m.add_function(wrap_pyfunction!(zip_conflict_resolver_rebuild, m)?)?;
-    m.add_function(wrap_pyfunction!(zip_verified_entry_salvage, m)?)?;
-    m.add_function(wrap_pyfunction!(zip_cd_local_header_reconcile_salvage, m)?)?;
-    m.add_function(wrap_pyfunction!(zip_remove_spurious_data_descriptor, m)?)?;
-    m.add_function(wrap_pyfunction!(gzip_footer_fix_repair, m)?)?;
-    m.add_function(wrap_pyfunction!(gzip_deflate_member_resync_repair, m)?)?;
-    m.add_function(wrap_pyfunction!(zstd_frame_salvage_repair, m)?)?;
-    m.add_function(wrap_pyfunction!(tar_boundary_repair, m)?)?;
-    m.add_function(wrap_pyfunction!(compression_stream_partial_recovery, m)?)?;
-    m.add_function(wrap_pyfunction!(compression_stream_block_salvage, m)?)?;
-    m.add_function(wrap_pyfunction!(compression_stream_trailing_junk_trim, m)?)?;
-    m.add_function(wrap_pyfunction!(tar_compressed_partial_recovery, m)?)?;
-    m.add_function(wrap_pyfunction!(tar_truncated_partial_recovery, m)?)?;
-    m.add_function(wrap_pyfunction!(archive_carrier_crop_recovery, m)?)?;
-    m.add_function(wrap_pyfunction!(seven_zip_scan_source, m)?)?;
-    m.add_function(wrap_pyfunction!(seven_zip_atomic_repair, m)?)?;
-    m.add_function(wrap_pyfunction!(archive_nested_payload_salvage, m)?)?;
-    m.add_function(wrap_pyfunction!(rar_block_chain_trim_recovery, m)?)?;
-    m.add_function(wrap_pyfunction!(rar_end_block_repair, m)?)?;
     Ok(())
 }

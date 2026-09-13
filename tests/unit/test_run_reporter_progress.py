@@ -101,13 +101,13 @@ def test_interactive_panel_updates_fixed_row_with_progress_and_colors(tmp_path, 
     reporter.task_started(task, 1)
     reporter._last_render_at = 0.0
     reporter.task_progress(task, {"completed_bytes": 50, "total_bytes": 100})
-    reporter.task_status(task, "repairing")
+    reporter.task_status(task, "extracting")
     reporter.task_finished(task, _outcome(tmp_path / "large"), 1)
 
     output = stream.getvalue()
     assert "等待队列" in output
     assert "50%" in output
-    assert "正在修复" in output
+    assert "正在解压" in output
     assert "\033[32m" in output and "完成" in output
     assert "\033[1A" in output
     row = reporter._format_task_row(reporter._task_rows[id(task)])

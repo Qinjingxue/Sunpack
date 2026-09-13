@@ -19,7 +19,7 @@ class ZipStructureAcceptRule(RuleBase):
             "type": "bool",
             "required": False,
             "default": True,
-            "description": "Whether a structurally valid empty ZIP EOCD can be accepted before scoring.",
+            "description": "Whether a structurally valid empty ZIP EOCD can be accepted before extraction.",
         },
         "max_cd_entries_to_walk": {
             "type": "int",

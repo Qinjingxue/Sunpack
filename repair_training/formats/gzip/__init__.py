@@ -1,1 +1,0 @@
-"""GZIP training plugin."""

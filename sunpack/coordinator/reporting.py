@@ -120,8 +120,6 @@ class RunReporter:
             if self._interactive:
                 self._update_task_locked(task, state=state, detail=detail, force=True)
                 return
-            if state == "repairing":
-                self._print(self.i18n.t("report.repairing", name=_task_name(task)))
 
     def task_progress(self, task: Any, event: dict[str, Any]) -> None:
         if self.quiet:
@@ -309,14 +307,6 @@ class RunReporter:
                     self._print(self.i18n.t("report.failed", task=failed_task))
                 if structured_failures and all(failure.is_password_failure for failure in structured_failures):
                     self._print(self.i18n.t("report.password_failure"))
-                else:
-                    for repair in _terminal_repair_statuses(structured_failures):
-                        status = str(repair.get("status") or "")
-                        reason = str(repair.get("terminal_reason") or status)
-                        if status == "disabled_by_edition":
-                            self._print(self.i18n.t("report.lite_repair_unavailable"))
-                        else:
-                            self._print(self.i18n.t("report.repair_terminal", status=status, reason=reason))
         else:
             if not self.quiet:
                 self._print(self.i18n.t("report.partial_complete" if recovered else "report.all_success"))
@@ -398,7 +388,6 @@ class RunReporter:
             "preparing": "report.status.preparing",
             "extracting": "report.status.extracting",
             "disk_paused": "report.status.disk_paused",
-            "repairing": "report.status.repairing",
             "error": "report.status.error",
             "partial": "report.status.partial",
             "complete": "report.status.complete",
@@ -409,7 +398,6 @@ class RunReporter:
             "preparing": "\033[36m",
             "extracting": "\033[36m",
             "disk_paused": "\033[33m",
-            "repairing": "\033[33m",
             "error": "\033[31m",
             "partial": "\033[33m",
             "complete": "\033[32m",
@@ -455,26 +443,6 @@ class RunReporter:
 def _task_name(task: Any) -> str:
     path = str(getattr(task, "main_path", "") or "")
     return os.path.basename(path) or str(getattr(task, "logical_name", "") or path or "archive")
-
-
-def _terminal_repair_statuses(failures: list[FailureInfo]) -> list[dict[str, Any]]:
-    statuses: list[dict[str, Any]] = []
-    seen: set[tuple[str, str, str]] = set()
-    for failure in failures:
-        details = failure.details if isinstance(failure.details, dict) else {}
-        repair = details.get("repair") if isinstance(details.get("repair"), dict) else {}
-        if not repair:
-            continue
-        key = (
-            str(repair.get("system") or ""),
-            str(repair.get("status") or ""),
-            str(repair.get("terminal_reason") or ""),
-        )
-        if key in seen:
-            continue
-        seen.add(key)
-        statuses.append(dict(repair))
-    return statuses
 
 
 def _absolute_key(path: str) -> str:

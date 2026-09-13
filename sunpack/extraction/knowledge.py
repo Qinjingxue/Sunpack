@@ -282,7 +282,7 @@ def _compact_mapping(value: dict[str, Any], *, max_items: int) -> dict[str, Any]
             output["truncated_count"] = len(value) - max_items
             break
         text_key = str(key)
-        if text_key in {"archive_state", "request_payload", "job", "candidate_features", "workspace_paths"}:
+        if text_key in {"archive_state", "request_payload", "job"}:
             output[text_key] = _large_placeholder(item)
         elif isinstance(item, dict):
             output[text_key] = _compact_mapping(item, max_items=max_items)

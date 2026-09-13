@@ -70,13 +70,6 @@ def plan1_config(passwords: list[str] | None = None) -> dict:
                 {"name": "compression_stream_accept", "enabled": True},
                 {"name": "embedded_payload_identity", "enabled": True},
             ],
-            scoring=[
-                {"name": "seven_zip_structure_identity", "enabled": True},
-                {"name": "rar_structure_identity", "enabled": True},
-                {"name": "zip_structure_identity", "enabled": True},
-                {"name": "tar_structure_identity", "enabled": True},
-                {"name": "compression_stream_identity", "enabled": True},
-            ],
         )
     )
 

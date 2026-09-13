@@ -16,7 +16,7 @@ from sunpack.verification.methods._output_stats import (
 )
 from sunpack.verification.registry import register_verification_method
 from sunpack.contracts.verification import (
-    DECISION_REPAIR,
+    DECISION_RETRY_EXTRACT,
     CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
     CONTENT_INTEGRITY_UNKNOWN,
     CONTENT_INTEGRITY_VERIFIED_COMPLETE,
@@ -160,7 +160,7 @@ class ManifestSizeMatchMethod:
             verified_item_count=int(getattr(state_manifest, "verified_item_count", 0) or 0),
             archive_walk_complete=bool(getattr(state_manifest, "archive_walk_complete", False)),
             recoverable_upper_bound_hint=completeness,
-            decision_hint=DECISION_REPAIR,
+            decision_hint=DECISION_RETRY_EXTRACT,
             file_observations=name_coverage.observations if name_coverage is not None else [],
         )
 
@@ -246,8 +246,7 @@ def _merged_analysis(evidence: VerificationEvidence) -> dict:
 def _coverage_actual(coverage, state_manifest: ArchiveStateManifest, evidence: VerificationEvidence) -> dict:
     actual = coverage_details(coverage)
     actual.update({
-        "state_aware": True,
-        "patch_digest": evidence.patch_digest,
+        "source_manifest": True,
         "archive_type": state_manifest.archive_type,
         "manifest_source": state_manifest.source if state_manifest.ok else "analysis_estimate",
     })

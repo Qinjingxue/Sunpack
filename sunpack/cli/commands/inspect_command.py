@@ -12,7 +12,7 @@ from sunpack.contracts.tasks import ArchiveTask
 from sunpack.cli.persistent_runtime import load_request_config
 from sunpack.analysis import ArchiveAnalyzer
 from sunpack.analysis.request import AnalysisRequest
-from sunpack.analysis.source import PatchedAnalysisSource, analysis_source_for_descriptor
+from sunpack.analysis.source import analysis_source_for_descriptor
 from sunpack.coordinator.detection_diagnostics import DetectionDiagnostics
 from sunpack.support.json_format import to_json_text
 from sunpack.detection.options import DetectionOptions
@@ -84,7 +84,6 @@ def handle(args, ctx):
                 "cli.inspect.details",
                 decision=item["decision"],
                 extract=ctx.t("common.yes" if item["should_extract"] else "common.no"),
-                score=item["score"],
                 detected=item["detected_ext"] or "-",
             ))
             reporter.info(ctx.t("cli.inspect.decision_trace",
@@ -108,10 +107,6 @@ def handle(args, ctx):
                     reporter.info(ctx.t("cli.inspect.analysis_candidates", candidates=candidates))
             if reporter.verbose and item["reasons"]:
                 reporter.info(ctx.t("cli.inspect.matched_rules", rules=", ".join(item["reasons"])))
-            if reporter.verbose and item.get("score_breakdown"):
-                reporter.info(ctx.t("cli.inspect.score_breakdown",
-                    breakdown=to_json_text(item["score_breakdown"], pretty=False)
-                ))
             if reporter.verbose and item.get("fact_errors"):
                 reporter.info(ctx.t("cli.inspect.fact_errors", errors=to_json_text(item["fact_errors"], pretty=False)))
 
@@ -141,13 +136,9 @@ def _analysis_preview_by_path(results, config: dict) -> dict[str, dict]:
         task = _task_from_inspect_result(result)
         try:
             state = task.archive_state()
-            source = (
-                PatchedAnalysisSource(state, report_path=task.main_path)
-                if state.patches
-                else analysis_source_for_descriptor(
-                    state.to_archive_input_descriptor(),
-                    report_path=task.main_path,
-                )
+            source = analysis_source_for_descriptor(
+                state.to_archive_input_descriptor(),
+                report_path=task.main_path,
             )
             prepass = task.fact_bag.get("analysis.signature_prepass")
             report = analyzer.analyze(
@@ -181,7 +172,7 @@ def _should_analyze_result(result) -> bool:
 
 def _task_from_inspect_result(result) -> ArchiveTask:
     bag = _clone_fact_bag(result.fact_bag)
-    return ArchiveTask.from_fact_bag(bag, int(result.score or 0))
+    return ArchiveTask.from_fact_bag(bag)
 
 
 def _clone_fact_bag(source) -> FactBag:

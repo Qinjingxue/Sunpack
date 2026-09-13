@@ -2,10 +2,6 @@
   "cli": {
     "language": "zh"
   },
-  "thresholds": {
-    "archive_score_threshold": 6,
-    "maybe_archive_threshold": 3
-  },
   "recursive_extract": "*",
   "nested_extraction_policy": {
     "enabled": true,
@@ -66,11 +62,6 @@
         "date": "20270101 00:00 > d >= 20240101 00:00"
       }
     ]
-  },
-  "repair": {
-    "telemetry": {
-      "enabled": false
-    }
   },
   "detection": {
     "rule_pipeline": {

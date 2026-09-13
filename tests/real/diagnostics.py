@@ -20,8 +20,6 @@ _FACT_KEYS = (
     "archive.input",
     "archive.state",
     "archive.source",
-    "archive.patch_stack",
-    "archive.patch_digest",
 )
 
 

@@ -13,8 +13,6 @@ from sunpack.support.resource_lifecycle import (
     lifecycle_registration,
     register_current_task_resource,
 )
-from sunpack.contracts.archive_state import ArchiveState
-from sunpack.support.archive_state_view import ArchiveStateByteView
 
 
 @dataclass(frozen=True)
@@ -271,116 +269,6 @@ class MultiVolumeBinaryView:
             int(ngram_top_k),
             int(max_ngram_sample_bytes),
         ))
-
-
-class PatchedBinaryView:
-    """Random-access analysis view over ArchiveState patch stacks."""
-
-    def __init__(self, state: ArchiveState):
-        self.state = state
-        self.path = state.source.entry_path
-        self._view = ArchiveStateByteView(state)
-        self.size = int(self._view.size)
-
-    def read_at(self, offset: int, size: int) -> bytes:
-        return self._view.read_at(offset, size)
-
-    def read_tail(self, size: int) -> bytes:
-        return self._view.read_tail(size)
-
-    def stats(self) -> ReadStats:
-        stats = self._view.stats()
-        return ReadStats(read_bytes=int(stats.read_bytes), cache_hits=int(stats.cache_hits))
-
-    def signature_prepass(self, *, head_bytes: int, tail_bytes: int) -> dict | None:
-        head_len = min(max(0, int(head_bytes)), self.size)
-        tail_len = min(max(0, int(tail_bytes)), self.size)
-        head = self.read_at(0, head_len)
-        tail_offset = max(0, self.size - tail_len)
-        tail = self.read_at(tail_offset, tail_len)
-        hits = []
-        for name, signature in _KNOWN_SIGNATURES.items():
-            for offset in _find_all(head, signature):
-                hits.append({"name": name, "offset": int(offset), "source": "head"})
-            tail_start = 257 if name == "tar_ustar" else 0
-            for offset in _find_all(tail[tail_start:], signature):
-                absolute = tail_offset + tail_start + offset
-                if absolute < head_len and any(hit["name"] == name and hit["offset"] == absolute for hit in hits):
-                    continue
-                hits.append({"name": name, "offset": int(absolute), "source": "tail"})
-        hits.sort(key=lambda item: (int(item["offset"]), str(item["name"])))
-        formats = sorted(_formats_from_hits(hits))
-        return {
-            "size": self.size,
-            "head_bytes": len(head),
-            "tail_bytes": len(tail),
-            "hits": hits,
-            "formats": formats,
-            "patched": True,
-            "patch_digest": self.state.effective_patch_digest(),
-        }
-
-    def probe_zip(self, *, eocd_offset: int, max_cd_entries_to_walk: int = 64) -> dict | None:
-        return _probe_zip_view(self, int(eocd_offset), int(max_cd_entries_to_walk))
-
-    def probe_rar(self, *, start_offset: int, max_blocks_to_walk: int = 4096) -> dict | None:
-        # Patched views have no filesystem-backed native reader.  Materialize
-        # this exceptional repair-time view once and run the same Rust probe
-        # used by ordinary and multi-volume readers; the normal detection path
-        # never enters this adapter.
-        data = self.read_at(0, self.size)
-        return dict(_probe_rar_bytes(data, int(start_offset), int(max_blocks_to_walk)))
-
-    def probe_seven_zip(self, *, start_offset: int, max_next_header_check_bytes: int = 1024 * 1024) -> dict | None:
-        return _probe_seven_zip_view(self, int(start_offset), int(max_next_header_check_bytes))
-
-    def probe_tar(self, *, start_offset: int = 0, max_entries_to_walk: int = 64) -> dict | None:
-        return _probe_tar_view(self, int(start_offset), int(max_entries_to_walk))
-
-    def probe_compression_stream(self, *, format: str) -> dict | None:
-        return _probe_compression_stream_view(self, str(format))
-
-    def probe_compressed_tar(self, *, format: str, max_probe_bytes: int = 4 * 1024 * 1024) -> dict | None:
-        result = _probe_compression_stream_view(self, str(format))
-        result["tar_plausible"] = False
-        return result
-
-    def fuzzy_binary_profile(
-        self,
-        *,
-        window_bytes: int = 64 * 1024,
-        max_windows: int = 8,
-        max_sample_bytes: int = 1024 * 1024,
-        entropy_high_threshold: float = 6.8,
-        entropy_low_threshold: float = 3.5,
-        entropy_jump_threshold: float = 1.25,
-        ngram_top_k: int = 8,
-        max_ngram_sample_bytes: int = 256 * 1024,
-    ) -> dict:
-        sample_size = min(self.size, max(1024, int(max_sample_bytes)))
-        sample = self.read_at(0, sample_size)
-        tail = self.read_tail(min(sample_size, max(1024, int(window_bytes))))
-        entropy = _entropy(sample)
-        return {
-            "entropy_profile": {
-                "avg_entropy": entropy,
-                "head_entropy": _entropy(sample[:min(len(sample), int(window_bytes))]),
-                "tail_entropy": _entropy(tail),
-                "overall_high_entropy": entropy >= float(entropy_high_threshold),
-                "head_low_entropy": _entropy(sample[:min(len(sample), int(window_bytes))]) <= float(entropy_low_threshold),
-                "tail_low_entropy": _entropy(tail) <= float(entropy_low_threshold),
-            },
-            "byte_class_profile": {
-                "head": _byte_class(sample[:min(len(sample), int(window_bytes))]),
-                "tail": _byte_class(tail),
-                "average": _byte_class(sample),
-            },
-            "window_anomalies": [],
-            "run_profile": _run_profile(tail, self.size - len(tail)),
-            "ngram_sketch": {"byte_histogram_top": _byte_histogram(sample, int(ngram_top_k)), "magic_like_hits": []},
-            "hints": [],
-            "patched": True,
-        }
 
 
 def _normalize_volume_entries(paths) -> list[dict]:

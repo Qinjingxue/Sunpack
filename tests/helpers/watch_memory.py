@@ -305,24 +305,6 @@ def _relation_password_cache_stats() -> dict[str, int]:
         return {}
 
 
-def _inspection_cache_stats(engine: PipelineEngine | None) -> dict[str, Any]:
-    """Expose the persistent inspection cache owned by the pipeline services."""
-
-    try:
-        services = getattr(engine, "_services", None)
-        inspection = getattr(services, "repair_inspection_service", None)
-        cache = getattr(inspection, "cache", None)
-        if cache is None:
-            return {}
-        with cache._lock:
-            return {
-                "entries": len(cache._items),
-                "max_entries": int(cache.max_entries),
-            }
-    except (AttributeError, TypeError, ValueError):
-        return {}
-
-
 def _native_worker_stats(engine: PipelineEngine | None) -> dict[str, Any]:
     """Observe the single native worker and its native-owned job lifecycle."""
 
@@ -358,19 +340,8 @@ def _known_cache_stats(engine: PipelineEngine | None) -> dict[str, Any]:
         "projection": _projection_stats(),
         "archive_sessions": _archive_session_count(),
         "relation_password": _relation_password_cache_stats(),
-        "inspection": _inspection_cache_stats(engine),
-        "native_seven_zip": _native_seven_zip_cache_stats(),
         "native_worker": _native_worker_stats(engine),
     }
-
-
-def _native_seven_zip_cache_stats() -> dict[str, Any]:
-    try:
-        from sunpack_native import seven_zip_runtime_cache_stats
-
-        return dict(seven_zip_runtime_cache_stats())
-    except (ImportError, AttributeError, TypeError):
-        return {}
 
 
 def _state_stats(watcher: WatchScheduler, state_path: Path) -> dict[str, Any]:
@@ -714,7 +685,6 @@ def summarize_watch_memory(rows: list[WatchMemorySample]) -> dict[str, Any]:
     def checkpoint_row(row: WatchMemorySample) -> dict[str, Any]:
         global_cache = row.known_caches.get("global", {})
         reader = row.known_caches.get("reader", {})
-        inspection = row.known_caches.get("inspection", {})
         return {
             "label": row.label,
             "files_seen": row.files_seen,
@@ -727,7 +697,6 @@ def summarize_watch_memory(rows: list[WatchMemorySample]) -> dict[str, Any]:
             "reader_cache_bytes": int(reader.get("hot_cache_bytes", 0) or 0)
             + int(reader.get("general_cache_bytes", 0) or 0),
             "archive_sessions": row.archive_sessions,
-            "inspection_cache_entries": inspection.get("entries", 0),
             "watch_state": row.watch_state,
             "engine": row.engine,
         }
