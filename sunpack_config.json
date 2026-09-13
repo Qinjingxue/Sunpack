@@ -54,7 +54,7 @@
       {
         "name": "size_range",
         "enabled": true,
-        "range": "r >= 1 MB"
+        "range": "r > 0 B"
       },
       {
         "name": "mtime_range",

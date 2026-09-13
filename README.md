@@ -12,8 +12,6 @@ Sunpack依靠二进制特征识别压缩包，不依靠后缀，在面对混乱�
 
 Sunpack包含四部分，前台命令启动器（sunpack.exe），后台常驻程序（sunpack-runtime.exe），压缩包处理程序（sunpack_sevenzip_worker.exe），NTFS文件系统日志监控服务（sunpack-watch-broker.exe），其中因为安装器需要安装读取NTFS卷级日志的服务，需要管理员权限
 
-默认Sunpack为了性能不处理小于1MB的文件，如需调整，可更改sunpack_config.json中的"range": "r >= 1 MB"
-
 Sunpack还提供丰富的自动化配置，适配多种需求，详见配置文件
 
 ## 命令速览
