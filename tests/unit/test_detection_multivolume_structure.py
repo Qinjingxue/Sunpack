@@ -1,10 +1,13 @@
 import struct
 from binascii import crc32
+from types import SimpleNamespace
 
 from sunpack.analysis.view import MultiVolumeBinaryView
 from sunpack.contracts.detection import FactBag
 from sunpack.detection.pipeline.processors.context import FactProcessorContext
+from sunpack.detection.pipeline.processors.modules.format_structure import rar as rar_processor
 from sunpack.detection.pipeline.processors.modules.format_structure.rar import process_rar_structure
+from sunpack.detection.pipeline.processors.modules.format_structure import seven_zip as seven_zip_processor
 from sunpack.detection.pipeline.processors.modules.format_structure.seven_zip import process_seven_zip_structure
 from sunpack.detection.pipeline.processors.modules.format_structure.zip_eocd import process_zip_eocd_structure
 
@@ -29,6 +32,101 @@ def _seven_zip_bytes():
 def _rar4_block(header_type, flags=0):
     body = bytes([header_type]) + struct.pack("<HH", flags, 7)
     return struct.pack("<H", crc32(body) & 0xFFFF) + body
+
+
+def _fake_probe_result(**values):
+    return SimpleNamespace(to_raw_dict=lambda: dict(values))
+
+
+def test_rar_single_input_magic_miss_skips_strict_probe(tmp_path, monkeypatch):
+    part = tmp_path / "ordinary.bin"
+    part.write_bytes(b"ordinary data")
+    context = _context([part], "", "rar.structure")
+    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("RAR strict probe should be skipped after a definite magic miss")
+
+    monkeypatch.setattr(rar_processor, "ArchiveAnalyzer", fail_if_called)
+
+    result = process_rar_structure(context)
+
+    assert result == {
+        "magic_matched": False,
+        "plausible": False,
+        "strong_accept": False,
+        "detected_ext": "",
+        "confidence": "none",
+        "error": "bad_signature",
+        "evidence": [],
+        "damage_flags": [],
+    }
+
+
+def test_seven_zip_single_input_magic_miss_skips_strict_probe(tmp_path, monkeypatch):
+    part = tmp_path / "ordinary.bin"
+    part.write_bytes(b"ordinary data")
+    context = _context([part], "", "7z.structure")
+    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("7z strict probe should be skipped after a definite magic miss")
+
+    monkeypatch.setattr(seven_zip_processor, "ArchiveAnalyzer", fail_if_called)
+
+    result = process_seven_zip_structure(context)
+
+    assert result["magic_matched"] is False
+    assert result["plausible"] is False
+    assert result["strong_accept"] is False
+    assert result["error"] == "bad_signature"
+
+
+def test_rar_multi_input_magic_miss_keeps_strict_probe(tmp_path, monkeypatch):
+    parts = [tmp_path / "part.001", tmp_path / "part.002"]
+    for part in parts:
+        part.write_bytes(b"ordinary data")
+    context = _context(parts, "numeric_suffix", "rar.structure")
+    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
+    calls = []
+
+    class FakeAnalyzer:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("init")
+
+        def probe_rar(self, *_args, **_kwargs):
+            calls.append("probe")
+            return _fake_probe_result(plausible=False, strong_accept=False)
+
+    monkeypatch.setattr(rar_processor, "ArchiveAnalyzer", FakeAnalyzer)
+
+    result = process_rar_structure(context)
+
+    assert calls == ["init", "probe"]
+    assert result == {"plausible": False, "strong_accept": False}
+
+
+def test_seven_zip_short_magic_keeps_strict_probe(tmp_path, monkeypatch):
+    part = tmp_path / "short.bin"
+    part.write_bytes(b"short")
+    context = _context([part], "", "7z.structure")
+    context.fact_bag.set("file.magic_bytes", b"short")
+    calls = []
+
+    class FakeAnalyzer:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("init")
+
+        def probe_seven_zip(self, *_args, **_kwargs):
+            calls.append("probe")
+            return _fake_probe_result(plausible=False, strong_accept=False)
+
+    monkeypatch.setattr(seven_zip_processor, "ArchiveAnalyzer", FakeAnalyzer)
+
+    result = process_seven_zip_structure(context)
+
+    assert calls == ["init", "probe"]
+    assert result == {"plausible": False, "strong_accept": False}
 
 
 def test_seven_zip_detection_reads_next_header_from_later_volume(tmp_path):
