@@ -1,4 +1,7 @@
-use crate::analysis_native::volume_anchor::{probe_volume_anchor_paths, VolumeAnchor};
+use crate::analysis_native::volume_anchor::{
+    probe_volume_anchor_paths, probe_volume_anchor_paths_cheap, probe_volume_anchor_paths_deep,
+    VolumeAnchor,
+};
 use crate::scan::directory::NativeDirectorySnapshot;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -114,43 +117,52 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
         .filter(|path| candidate_keys.contains(&path.to_ascii_lowercase()))
         .cloned()
         .collect();
-    let initial_anchors = py.detach(|| {
-        probe_volume_anchor_paths(
-            &initial_probe_paths,
-            1024 * 1024,
-            65_557,
-            path_passwords.as_deref(),
-        )
+    // Relation is primarily a split-volume recovery layer.  Start with the
+    // shared-size 512-byte reconnaissance pass and only pay for the old deep
+    // prefix/tail inspection in directories that already contain a split
+    // signal.  The raw snapshot still supplies the complete physical sibling
+    // set for that second pass.
+    let cheap_anchors = py.detach(|| {
+        probe_volume_anchor_paths_cheap(&initial_probe_paths, path_passwords.as_deref())
     });
-    let anchors = {
-        let expanded_directories: HashSet<String> = initial_anchors
+    let mut suspicious_directories: HashSet<String> = cheap_anchors
+        .iter()
+        .filter(|anchor| anchor_requires_sibling_evidence(anchor))
+        .map(|anchor| parent_directory_key(&anchor.path))
+        .collect();
+    suspicious_directories.extend(
+        initial_probe_paths
             .iter()
-            .filter(|anchor| anchor_requires_sibling_evidence(anchor))
-            .map(|anchor| parent_directory_key(&anchor.path))
+            .filter(|path| has_split_reconnaissance_hint(path))
+            .map(|path| parent_directory_key(path)),
+    );
+    let deep_probe_paths: Vec<String> = paths
+        .iter()
+        .filter(|path| suspicious_directories.contains(&parent_directory_key(path)))
+        .cloned()
+        .collect();
+    let anchors = if deep_probe_paths.is_empty() {
+        cheap_anchors
+    } else {
+        let deep_anchors = py.detach(|| {
+            probe_volume_anchor_paths_deep(
+                &deep_probe_paths,
+                1024 * 1024,
+                65_557,
+                path_passwords.as_deref(),
+            )
+        });
+        let mut deep_by_path: HashMap<String, VolumeAnchor> = deep_anchors
+            .into_iter()
+            .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
             .collect();
-        let additional_probe_paths: Vec<String> = paths
-            .iter()
-            .filter(|path| {
-                expanded_directories.contains(&parent_directory_key(path))
-                    && !candidate_keys.contains(&path.to_ascii_lowercase())
-            })
-            .cloned()
-            .collect();
-        if additional_probe_paths.is_empty() {
-            initial_anchors
-        } else {
-            let mut anchors = initial_anchors;
-            let additional_anchors = py.detach(|| {
-                probe_volume_anchor_paths(
-                    &additional_probe_paths,
-                    1024 * 1024,
-                    65_557,
-                    path_passwords.as_deref(),
-                )
-            });
-            anchors.extend(additional_anchors);
-            anchors
+        let mut anchors = Vec::with_capacity(cheap_anchors.len() + deep_by_path.len());
+        for anchor in cheap_anchors {
+            let key = anchor.path.to_ascii_lowercase();
+            anchors.push(deep_by_path.remove(&key).unwrap_or(anchor));
         }
+        anchors.extend(deep_by_path.into_values());
+        anchors
     };
     let format_masks_by_path: HashMap<String, u32> = anchors
         .iter()
@@ -271,6 +283,13 @@ fn parent_directory_key(path: &str) -> String {
         .map(|value| value.to_string_lossy().to_string())
         .unwrap_or_default()
         .to_ascii_lowercase()
+}
+
+fn has_split_reconnaissance_hint(path: &str) -> bool {
+    parse_volume_candidates(basename(path))
+        .iter()
+        .any(|candidate| candidate.number > 0)
+        || parse_loose_rar_part_volume(basename(path)).is_some()
 }
 
 fn single_directory_scope(paths: &[String]) -> Option<String> {

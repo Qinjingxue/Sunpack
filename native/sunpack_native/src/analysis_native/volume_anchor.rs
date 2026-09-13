@@ -24,6 +24,12 @@ const DEFAULT_TAIL_LIMIT: usize = 65_557;
 const RAR4_MAIN_HEADER_PASSWORD: u16 = 0x0080;
 const VOLUME_ANCHOR_PROBE_THREADS: usize = 4;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VolumeAnchorProbeDepth {
+    Cheap,
+    Deep,
+}
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VolumeAnchor {
     pub(crate) path: String,
@@ -100,6 +106,50 @@ pub(crate) fn probe_volume_anchor_paths(
     tail_limit: usize,
     path_passwords: Option<&[(String, String)]>,
 ) -> Vec<VolumeAnchor> {
+    probe_volume_anchor_paths_with_depth(
+        paths,
+        prefix_limit,
+        tail_limit,
+        path_passwords,
+        VolumeAnchorProbeDepth::Deep,
+    )
+}
+
+pub(crate) fn probe_volume_anchor_paths_cheap(
+    paths: &[String],
+    path_passwords: Option<&[(String, String)]>,
+) -> Vec<VolumeAnchor> {
+    probe_volume_anchor_paths_with_depth(
+        paths,
+        512,
+        0,
+        path_passwords,
+        VolumeAnchorProbeDepth::Cheap,
+    )
+}
+
+pub(crate) fn probe_volume_anchor_paths_deep(
+    paths: &[String],
+    prefix_limit: usize,
+    tail_limit: usize,
+    path_passwords: Option<&[(String, String)]>,
+) -> Vec<VolumeAnchor> {
+    probe_volume_anchor_paths_with_depth(
+        paths,
+        prefix_limit,
+        tail_limit,
+        path_passwords,
+        VolumeAnchorProbeDepth::Deep,
+    )
+}
+
+fn probe_volume_anchor_paths_with_depth(
+    paths: &[String],
+    prefix_limit: usize,
+    tail_limit: usize,
+    path_passwords: Option<&[(String, String)]>,
+    depth: VolumeAnchorProbeDepth,
+) -> Vec<VolumeAnchor> {
     let password_map: HashMap<String, &str> = path_passwords
         .map(|items| {
             items
@@ -117,6 +167,7 @@ pub(crate) fn probe_volume_anchor_paths(
                     prefix_limit,
                     tail_limit,
                     password_map.get(&path.to_ascii_lowercase()).copied(),
+                    depth,
                 )
             })
             .collect()
@@ -138,6 +189,7 @@ fn probe_path(
     prefix_limit: usize,
     tail_limit: usize,
     password: Option<&str>,
+    depth: VolumeAnchorProbeDepth,
 ) -> VolumeAnchor {
     let mut result = VolumeAnchor {
         path: path.to_string(),
@@ -166,6 +218,35 @@ fn probe_path(
     }
     result.bytes_read += prefix.len() as u64;
     result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix);
+
+    if depth == VolumeAnchorProbeDepth::Cheap {
+        // Relation is a split-volume recovery layer, not a general archive
+        // detector.  The cheap pass only keeps structure that can itself seed
+        // a split suspicion, plus the leading stream facts that prevent a
+        // numbered ordinary archive from being mistaken for a volume.
+        if let Some(offset) = anchored_signature(&prefix, RAR5, false)
+            .or_else(|| anchored_signature(&prefix, RAR4, false))
+            .filter(|offset| probe_rar(&prefix, *offset, &mut result, password))
+        {
+            let _ = offset;
+            return result;
+        }
+        if let Some(offset) = anchored_signature(&prefix, SEVEN_ZIP, false)
+            .filter(|offset| probe_seven_zip(&prefix, *offset, size, &mut result))
+        {
+            let _ = offset;
+            return result;
+        }
+        if probe_zip_split_marker(&prefix, &mut result) {
+            return result;
+        }
+        if probe_embedded_zip_local_head(&prefix, &mut result) {
+            return result;
+        }
+        probe_standalone_stream(&prefix, &mut result);
+        return result;
+    }
+
     let allow_embedded = prefix.starts_with(b"MZ");
     let has_rar4_signature = anchored_signature(&prefix, RAR4, allow_embedded).is_some();
     if (allow_embedded || (password.is_some() && has_rar4_signature))
@@ -229,6 +310,41 @@ fn probe_path(
     }
     probe_standalone_stream(&prefix, &mut result);
     result
+}
+
+fn probe_zip_split_marker(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
+    if !prefix.starts_with(ZIP_SPLIT_MARKER)
+        || !plausible_zip_local(prefix, ZIP_SPLIT_MARKER.len())
+    {
+        return false;
+    }
+    out.format = "zip".to_string();
+    out.confidence = "strong".to_string();
+    out.multivolume = true;
+    out.continuation_to_next = true;
+    out.structure_offset = Some(0);
+    out.internal_volume_number = Some(1);
+    out.anchor_roles.push("first");
+    out.evidence.push("zip:split_marker");
+    true
+}
+
+fn probe_embedded_zip_local_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
+    let Some(offset) = find_signature(prefix, ZIP_LOCAL).filter(|offset| *offset > 0) else {
+        return false;
+    };
+    if !plausible_zip_local(prefix, offset) {
+        return false;
+    }
+    out.format = "zip".to_string();
+    out.confidence = "strong".to_string();
+    out.standalone = true;
+    out.structure_offset = Some(offset as u64);
+    out.internal_volume_number = Some(1);
+    out.anchor_roles.push("standalone");
+    out.anchor_roles.push("first");
+    out.evidence.push("zip:embedded_local_head");
+    true
 }
 
 fn probe_rar(
