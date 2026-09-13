@@ -17,46 +17,87 @@ struct DirectoryEntryRecord {
     mtime_ns: Option<u64>,
 }
 
-#[pyclass(module = "sunpack_native", frozen)]
-pub(crate) struct NativeDirectorySnapshot {
+#[derive(Debug)]
+struct DirectorySnapshotTable {
     paths: Vec<String>,
     is_dirs: Vec<bool>,
     sizes: Vec<Option<u64>>,
     mtimes_ns: Vec<Option<u64>>,
 }
 
+#[pyclass(module = "sunpack_native", frozen)]
+pub(crate) struct NativeDirectorySnapshot {
+    table: Arc<DirectorySnapshotTable>,
+    rows: Vec<usize>,
+}
+
 impl NativeDirectorySnapshot {
     fn from_records(records: Vec<DirectoryEntryRecord>) -> Self {
-        let mut snapshot = Self {
+        let table = Arc::new(Self::build_table(records));
+        let rows = (0..table.paths.len()).collect();
+        Self { table, rows }
+    }
+
+    fn from_views(
+        filtered: Vec<DirectoryEntryRecord>,
+        raw: Vec<DirectoryEntryRecord>,
+    ) -> (Self, Self) {
+        let table = Arc::new(Self::build_table(raw));
+        let rows_by_path: HashMap<&str, usize> = table
+            .paths
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.as_str(), index))
+            .collect();
+        let filtered_rows = filtered
+            .iter()
+            .filter_map(|record| rows_by_path.get(record.path.as_str()).copied())
+            .collect();
+        let raw_rows = (0..table.paths.len()).collect();
+        (
+            Self {
+                table: Arc::clone(&table),
+                rows: filtered_rows,
+            },
+            Self {
+                table,
+                rows: raw_rows,
+            },
+        )
+    }
+
+    fn build_table(records: Vec<DirectoryEntryRecord>) -> DirectorySnapshotTable {
+        let mut table = DirectorySnapshotTable {
             paths: Vec::with_capacity(records.len()),
             is_dirs: Vec::with_capacity(records.len()),
             sizes: Vec::with_capacity(records.len()),
             mtimes_ns: Vec::with_capacity(records.len()),
         };
         for record in records {
-            snapshot.paths.push(record.path);
-            snapshot.is_dirs.push(record.is_dir);
-            snapshot.sizes.push(record.size);
-            snapshot.mtimes_ns.push(record.mtime_ns);
+            table.paths.push(record.path);
+            table.is_dirs.push(record.is_dir);
+            table.sizes.push(record.size);
+            table.mtimes_ns.push(record.mtime_ns);
         }
-        snapshot
+        table
     }
 
     pub(crate) fn file_records(&self) -> impl Iterator<Item = (&str, Option<u64>)> {
-        self.paths
-            .iter()
-            .zip(&self.is_dirs)
-            .zip(&self.sizes)
-            .filter_map(|((path, is_dir), size)| (!is_dir).then_some((path.as_str(), *size)))
+        self.rows.iter().filter_map(|&row| {
+            (!self.table.is_dirs[row])
+                .then_some((self.table.paths[row].as_str(), self.table.sizes[row]))
+        })
     }
 
     pub(crate) fn records(&self) -> impl Iterator<Item = (&str, bool, Option<u64>, Option<u64>)> {
-        self.paths
-            .iter()
-            .zip(&self.is_dirs)
-            .zip(&self.sizes)
-            .zip(&self.mtimes_ns)
-            .map(|(((path, is_dir), size), mtime_ns)| (path.as_str(), *is_dir, *size, *mtime_ns))
+        self.rows.iter().map(|&row| {
+            (
+                self.table.paths[row].as_str(),
+                self.table.is_dirs[row],
+                self.table.sizes[row],
+                self.table.mtimes_ns[row],
+            )
+        })
     }
 }
 
@@ -277,9 +318,10 @@ impl NativeOutputInventory {
             whitelist_rules,
         )?;
         let records = build_inventory_snapshot_views(&self.root, self.files.as_ref(), &options);
+        let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
         Ok((
-            Py::new(py, NativeDirectorySnapshot::from_records(records.filtered))?,
-            Py::new(py, NativeDirectorySnapshot::from_records(records.raw))?,
+            Py::new(py, filtered)?,
+            Py::new(py, raw)?,
         ))
     }
 
@@ -336,37 +378,42 @@ fn output_file_dict(py: Python<'_>, item: &OutputFileRecord) -> PyResult<Py<PyDi
 #[pymethods]
 impl NativeDirectorySnapshot {
     fn __len__(&self) -> usize {
-        self.paths.len()
+        self.rows.len()
     }
 
     fn __bool__(&self) -> bool {
-        !self.paths.is_empty()
+        !self.rows.is_empty()
     }
 
     fn has_files(&self) -> bool {
-        self.is_dirs.iter().any(|is_dir| !is_dir)
+        self.rows.iter().any(|&row| !self.table.is_dirs[row])
     }
 
     fn materialize_columns(&self) -> (Vec<String>, Vec<bool>, Vec<Option<u64>>, Vec<Option<u64>>) {
-        (
-            self.paths.clone(),
-            self.is_dirs.clone(),
-            self.sizes.clone(),
-            self.mtimes_ns.clone(),
-        )
+        let mut paths = Vec::with_capacity(self.rows.len());
+        let mut is_dirs = Vec::with_capacity(self.rows.len());
+        let mut sizes = Vec::with_capacity(self.rows.len());
+        let mut mtimes_ns = Vec::with_capacity(self.rows.len());
+        for &row in &self.rows {
+            paths.push(self.table.paths[row].clone());
+            is_dirs.push(self.table.is_dirs[row]);
+            sizes.push(self.table.sizes[row]);
+            mtimes_ns.push(self.table.mtimes_ns[row]);
+        }
+        (paths, is_dirs, sizes, mtimes_ns)
     }
 
     fn file_columns(&self) -> (Vec<String>, Vec<Option<u64>>, Vec<Option<u64>>) {
         let mut paths = Vec::new();
         let mut sizes = Vec::new();
         let mut mtimes_ns = Vec::new();
-        for index in 0..self.paths.len() {
-            if self.is_dirs[index] {
+        for &row in &self.rows {
+            if self.table.is_dirs[row] {
                 continue;
             }
-            paths.push(self.paths[index].clone());
-            sizes.push(self.sizes[index]);
-            mtimes_ns.push(self.mtimes_ns[index]);
+            paths.push(self.table.paths[row].clone());
+            sizes.push(self.table.sizes[row]);
+            mtimes_ns.push(self.table.mtimes_ns[row]);
         }
         (paths, sizes, mtimes_ns)
     }
@@ -382,39 +429,34 @@ impl NativeDirectorySnapshot {
         let mut paths = Vec::new();
         let mut sizes = Vec::new();
         let mut mtimes_ns = Vec::new();
-        for index in 0..self.paths.len() {
-            if self.is_dirs[index] {
+        for &row in &self.rows {
+            if self.table.is_dirs[row] {
                 continue;
             }
-            let parent = Path::new(&self.paths[index])
+            let parent = Path::new(&self.table.paths[row])
                 .parent()
                 .map(|value| value.to_string_lossy().to_ascii_lowercase())
                 .unwrap_or_default();
             if !directories.contains(&parent) {
                 continue;
             }
-            paths.push(self.paths[index].clone());
-            sizes.push(self.sizes[index]);
-            mtimes_ns.push(self.mtimes_ns[index]);
+            paths.push(self.table.paths[row].clone());
+            sizes.push(self.table.sizes[row]);
+            mtimes_ns.push(self.table.mtimes_ns[row]);
         }
         (paths, sizes, mtimes_ns)
     }
 
     fn identity_rows(&self) -> Vec<(String, bool, u64, u64)> {
-        self.paths
-            .iter()
-            .zip(&self.is_dirs)
-            .zip(&self.sizes)
-            .zip(&self.mtimes_ns)
-            .map(|(((path, is_dir), size), mtime_ns)| {
+        self.rows.iter().map(|&row| {
                 (
-                    Path::new(path)
+                    Path::new(&self.table.paths[row])
                         .file_name()
                         .map(|name| name.to_string_lossy().to_ascii_lowercase())
                         .unwrap_or_default(),
-                    *is_dir,
-                    size.unwrap_or(0),
-                    mtime_ns.unwrap_or(0),
+                    self.table.is_dirs[row],
+                    self.table.sizes[row].unwrap_or(0),
+                    self.table.mtimes_ns[row].unwrap_or(0),
                 )
             })
             .collect()
@@ -681,9 +723,10 @@ pub(crate) fn scan_directory_snapshots(
         whitelist_rules,
     )?;
     let records = scan_directory_views(root_path, max_depth, &options)?;
+    let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
     Ok((
-        Py::new(py, NativeDirectorySnapshot::from_records(records.filtered))?,
-        Py::new(py, NativeDirectorySnapshot::from_records(records.raw))?,
+        Py::new(py, filtered)?,
+        Py::new(py, raw)?,
     ))
 }
 
@@ -703,12 +746,20 @@ pub(crate) fn directory_snapshot_from_columns(
     }
     Py::new(
         py,
-        NativeDirectorySnapshot {
-            paths,
-            is_dirs,
-            sizes,
-            mtimes_ns,
-        },
+        NativeDirectorySnapshot::from_records(
+            paths
+                .into_iter()
+                .zip(is_dirs)
+                .zip(sizes)
+                .zip(mtimes_ns)
+                .map(|(((path, is_dir), size), mtime_ns)| DirectoryEntryRecord {
+                    path,
+                    is_dir,
+                    size,
+                    mtime_ns,
+                })
+                .collect(),
+        ),
     )
 }
 

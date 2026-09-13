@@ -56,6 +56,7 @@ class CandidateGroup:
     companion_paths: List[str] = None
     carrier_path: str = ""
     carrier_size: int | None = None
+    format_reject_mask: int = 0
 
     @property
     def kind(self) -> str:

@@ -26,6 +26,7 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
         "candidate.carrier_path": carrier_path,
         "candidate.companion_paths": list(group.companion_paths or []),
         "candidate.cleanup_paths": cleanup_paths,
+        "candidate.format_reject_mask": int(group.format_reject_mask or 0),
     })
     # A split SFX launcher is a companion to the real archive volumes, not
     # part of the archive input.  Preserve that carrier identity before

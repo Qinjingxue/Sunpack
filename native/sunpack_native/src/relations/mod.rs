@@ -92,35 +92,28 @@ pub(crate) fn relations_split_sort_key(path: &str) -> (u8, u32, String) {
 }
 
 #[pyfunction]
-#[pyo3(signature = (snapshot, path_passwords=None, candidate_paths=None))]
+#[pyo3(signature = (raw_snapshot, filtered_snapshot, path_passwords=None))]
 pub(crate) fn relations_build_candidate_groups_from_snapshot(
     py: Python<'_>,
-    snapshot: PyRef<'_, NativeDirectorySnapshot>,
+    raw_snapshot: PyRef<'_, NativeDirectorySnapshot>,
+    filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
     path_passwords: Option<Vec<(String, String)>>,
-    candidate_paths: Option<Vec<String>>,
-) -> PyResult<(Vec<Py<PyDict>>, Vec<String>, Vec<u32>)> {
-    let records: Vec<(String, Option<u64>)> = snapshot
+) -> PyResult<Vec<Py<PyDict>>> {
+    let records: Vec<(String, Option<u64>)> = raw_snapshot
         .file_records()
         .map(|(path, size)| (path.to_string(), size))
         .collect();
     let paths: Vec<String> = records.iter().map(|(path, _)| path.clone()).collect();
     let all_paths = sorted_unique_paths(paths.clone());
-    let candidate_keys = candidate_paths.map(|paths| {
-        paths
-            .into_iter()
-            .map(|path| path.to_ascii_lowercase())
-            .collect::<HashSet<_>>()
-    });
-    let initial_probe_paths: Vec<String> = candidate_keys
-        .as_ref()
-        .map(|keys| {
-            paths
-                .iter()
-                .filter(|path| keys.contains(&path.to_ascii_lowercase()))
-                .cloned()
-                .collect()
-        })
-        .unwrap_or_else(|| paths.clone());
+    let candidate_keys: HashSet<String> = filtered_snapshot
+        .file_records()
+        .map(|(path, _)| path.to_ascii_lowercase())
+        .collect();
+    let initial_probe_paths: Vec<String> = paths
+        .iter()
+        .filter(|path| candidate_keys.contains(&path.to_ascii_lowercase()))
+        .cloned()
+        .collect();
     let initial_anchors = py.detach(|| {
         probe_volume_anchor_paths(
             &initial_probe_paths,
@@ -129,7 +122,7 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
             path_passwords.as_deref(),
         )
     });
-    let anchors = if let Some(candidate_keys) = candidate_keys.as_ref() {
+    let anchors = {
         let expanded_directories: HashSet<String> = initial_anchors
             .iter()
             .filter(|anchor| anchor_requires_sibling_evidence(anchor))
@@ -158,31 +151,21 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
             anchors.extend(additional_anchors);
             anchors
         }
-    } else {
-        initial_anchors
     };
     let format_masks_by_path: HashMap<String, u32> = anchors
         .iter()
         .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor.format_reject_mask))
-        .collect();
-    let format_reject_masks: Vec<u32> = paths
-        .iter()
-        .map(|path| format_masks_by_path.get(&path.to_ascii_lowercase()).copied().unwrap_or(0))
         .collect();
     let anchors_by_path: HashMap<String, VolumeAnchor> = anchors
         .into_iter()
         .filter(has_relation_evidence)
         .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
         .collect();
-    let relation_records: Vec<(String, Option<u64>)> = if let Some(candidate_keys) = candidate_keys.as_ref() {
-        records
-            .iter()
-            .filter(|(path, _)| candidate_keys.contains(&path.to_ascii_lowercase()))
-            .cloned()
-            .collect()
-    } else {
-        records.clone()
-    };
+    let relation_records: Vec<(String, Option<u64>)> = records
+        .iter()
+        .filter(|(path, _)| candidate_keys.contains(&path.to_ascii_lowercase()))
+        .cloned()
+        .collect();
     let mut dir_files: HashMap<String, Vec<RelationInput>> = HashMap::new();
     let mut dir_order: Vec<String> = Vec::new();
     for (path, size) in relation_records {
@@ -206,17 +189,6 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
         });
     }
     let groups = build_candidate_groups_from_inputs(py, dir_files, dir_order)?;
-    let groups = if let Some(candidate_keys) = candidate_keys {
-        groups
-            .into_iter()
-            .filter(|group| {
-                group_head_path(py, group)
-                    .is_ok_and(|path| candidate_keys.contains(&path.to_ascii_lowercase()))
-            })
-            .collect()
-    } else {
-        groups
-    };
     let paths_by_directory = paths_by_directory(&all_paths);
     let groups = merge_structure_resolved_groups_from_evidence(
         py,
@@ -224,7 +196,15 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
         &paths_by_directory,
         &anchors_by_path,
     )?;
-    Ok((groups, paths, format_reject_masks))
+    for group in &groups {
+        let head_path = group_head_path(py, group)?;
+        let mask = format_masks_by_path
+            .get(&head_path.to_ascii_lowercase())
+            .copied()
+            .unwrap_or(0);
+        group.bind(py).set_item("format_reject_mask", mask)?;
+    }
+    Ok(groups)
 }
 
 fn group_head_path(py: Python<'_>, raw: &Py<PyDict>) -> PyResult<String> {

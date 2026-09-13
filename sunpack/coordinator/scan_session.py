@@ -29,7 +29,6 @@ class DetectionScanSession:
         self._relation_group_signatures: dict[str, str] = {}
         self._fact_bags: dict[str, List[FactBag]] = {}
         self._file_head_facts: dict[str, dict[str, Any]] = {}
-        self._format_reject_masks: dict[str, int] = {}
         self._directory_identities: dict[str, tuple[str, int, tuple]] = {}
         self._scan_roots: list[str] = []
 
@@ -50,7 +49,6 @@ class DetectionScanSession:
     def prime_snapshot(self, directory: str, snapshot: DirectorySnapshot) -> None:
         """Seed a complete recursive snapshot without touching the directory again."""
         self._snapshots[self._snapshot_key(directory, max_depth=None)] = snapshot
-        self._format_reject_masks.update(snapshot.format_reject_masks)
 
     def prime_file_head_columns(
         self,
@@ -118,17 +116,8 @@ class DetectionScanSession:
                 snapshot,
                 path_passwords=path_passwords,
             )
-            self._format_reject_masks.update(snapshot.format_reject_masks)
             self._relation_group_signatures[key] = signature
         return self._relation_groups[key]
-
-    def format_reject_masks_for_paths(self, paths: list[str]) -> dict[str, int]:
-        cached = self._format_reject_masks
-        return {
-            path_key(path): cached[path_key(path)]
-            for path in paths
-            if path_key(path) in cached
-        }
 
     def fact_bags_for_directory(self, directory: str) -> List[FactBag]:
         key = self._directory_key(directory)

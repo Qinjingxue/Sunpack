@@ -3,8 +3,6 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from sunpack.support.path_keys import path_key
-
 @dataclass
 class FileEntry:
     path: Path
@@ -19,7 +17,6 @@ class DirectorySnapshot:
     root_path: Path
     _native_snapshot: Any
     _raw_native_snapshot: Any
-    _format_reject_masks: dict[str, int] | None = None
 
     @classmethod
     def from_native(
@@ -32,7 +29,6 @@ class DirectorySnapshot:
             root_path=root_path,
             _native_snapshot=native_snapshot,
             _raw_native_snapshot=raw_native_snapshot,
-            _format_reject_masks={},
         )
 
     @classmethod
@@ -69,25 +65,6 @@ class DirectorySnapshot:
     @property
     def raw_native_snapshot(self) -> Any:
         return self._raw_native_snapshot
-
-    @property
-    def format_reject_masks(self) -> dict[str, int]:
-        return self._format_reject_masks or {}
-
-    def set_format_reject_masks(self, paths: list[str], masks: list[int]) -> None:
-        self._format_reject_masks = {
-            path_key(path): int(mask)
-            for path, mask in zip(paths, masks)
-            if path
-        }
-
-    def format_reject_masks_for_paths(self, paths: list[str]) -> dict[str, int]:
-        cached = self._format_reject_masks or {}
-        return {
-            path_key(path): cached[path_key(path)]
-            for path in paths
-            if path_key(path) in cached
-        }
 
     @property
     def has_files(self) -> bool:
