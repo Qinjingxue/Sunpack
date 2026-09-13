@@ -8,6 +8,18 @@ from sunpack.detection.pipeline.rules.rule_preparer import RulePreparer
 from sunpack.detection.pipeline.rules.types import PreparedRule
 from sunpack.detection.pipeline.rules.fact_requirements import FactRequirement
 
+
+_PrecheckPlan = tuple[
+    PreparedRule,
+    tuple[FactRequirement, ...],
+    frozenset[str],
+    dict[str, dict[str, Any]],
+    frozenset[str],
+    frozenset[str],
+    bool,
+]
+
+
 class RuleManager:
     def __init__(
         self,
@@ -81,40 +93,82 @@ class RuleManager:
         return formats, extensions
 
     def _ordered_precheck_rules(self, bag: FactBag, rules: List[PreparedRule]) -> List[PreparedRule]:
-        formats, extensions = self._routing_values(bag)
-        promoted: list[PreparedRule] = []
-        remaining: list[PreparedRule] = []
+        return [
+            plan[0]
+            for plan in self._ordered_precheck_plans(
+                bag,
+                self._prepare_precheck_plan(rules),
+            )
+        ]
+
+    def _prepare_precheck_plan(self, rules: List[PreparedRule]) -> list[_PrecheckPlan]:
+        plan: list[_PrecheckPlan] = []
         for rule in rules:
-            rule_formats = set(getattr(rule.instance, "routing_formats", set()) or set())
-            rule_extensions = set(getattr(rule.instance, "routing_extensions", set()) or set())
+            requirements = tuple(self._rule_fact_requirements(rule))
+            fact_names = {requirement.fact_name for requirement in requirements}
+            prerequisite_facts = frozenset(
+                fact_name
+                for requirement in requirements
+                for fact_name in requirement.prerequisite_facts
+            )
+            effective_fact_configs = {
+                fact_name: self._effective_fact_config(fact_name, rule.config)
+                for fact_name in fact_names
+            }
+            plan.append((
+                rule,
+                requirements,
+                prerequisite_facts,
+                effective_fact_configs,
+                frozenset(getattr(rule.instance, "routing_formats", set()) or set()),
+                frozenset(getattr(rule.instance, "routing_extensions", set()) or set()),
+                bool(getattr(rule.instance, "can_be_promoted", False)),
+            ))
+        return plan
+
+    def _ordered_precheck_plans(
+        self,
+        bag: FactBag,
+        plans: list[_PrecheckPlan],
+    ) -> list[_PrecheckPlan]:
+        formats, extensions = self._routing_values(bag)
+        promoted: list[_PrecheckPlan] = []
+        remaining: list[_PrecheckPlan] = []
+        for plan in plans:
+            _, _, _, _, rule_formats, rule_extensions, can_be_promoted = plan
             matches = bool(rule_formats & formats or rule_extensions & extensions)
-            if getattr(rule.instance, "can_be_promoted", False) and matches:
-                promoted.append(rule)
+            if can_be_promoted and matches:
+                promoted.append(plan)
             else:
-                remaining.append(rule)
+                remaining.append(plan)
         return promoted + remaining
 
     def _run_precheck(self, fact_bags: List[FactBag]) -> tuple[Dict[FactBag, RuleDecision], List[FactBag]]:
         decisions: Dict[FactBag, RuleDecision] = {}
         surviving: List[FactBag] = []
         configured_rules = self._prepare_rules("precheck")
+        precheck_plan = self._prepare_precheck_plan(configured_rules)
         for bag in fact_bags:
             terminal = False
-            for rule in self._ordered_precheck_rules(bag, configured_rules):
-                requirements = self._rule_fact_requirements(rule)
-                prerequisite_facts: set[str] = set()
-                for requirement in requirements:
-                    prerequisite_facts.update(requirement.prerequisite_facts)
+            for (
+                rule,
+                requirements,
+                prerequisite_facts,
+                effective_fact_configs,
+                _,
+                _,
+                _,
+            ) in self._ordered_precheck_plans(bag, precheck_plan):
                 if prerequisite_facts:
                     self.ensure_pool_facts([bag], prerequisite_facts)
                 active_facts = {
                     requirement.fact_name
                     for requirement in requirements
-                    if requirement.matches(bag, self._effective_fact_config(requirement.fact_name, rule.config))
+                    if requirement.matches(bag, effective_fact_configs[requirement.fact_name])
                 }
                 if active_facts:
                     fact_configs = {
-                        fact_name: self._effective_fact_config(fact_name, rule.config)
+                        fact_name: effective_fact_configs[fact_name]
                         for fact_name in active_facts
                     }
                     self.ensure_pool_facts([bag], set(active_facts), fact_configs)
