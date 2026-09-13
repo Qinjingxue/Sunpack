@@ -36,6 +36,7 @@ class DetectionScheduler:
             detector_config.get("fact_collectors"),
             detector_config.get("processors"),
         )
+        self._processor_input_facts_cache: dict[frozenset[str], frozenset[str]] = {}
         self.rule_manager = RuleManager(
             config,
             ensure_pool_facts=self._ensure_pool_facts,
@@ -102,19 +103,6 @@ class DetectionScheduler:
             if (decision := decisions.get(bag)) is not None
         ]
 
-    def _provider_for(
-        self,
-        fact_bag: FactBag,
-        fact_configs: dict[str, dict[str, Any]] | None = None,
-    ) -> FactProvider:
-        return FactProvider(
-            fact_bag.get("file.path", ""),
-            config=self.config,
-            fact_configs=self._merge_fact_configs(fact_configs),
-            enabled_fact_modules=self.enabled_fact_modules,
-            scan_session=getattr(self, "_active_scan_session", None),
-        )
-
     def _ensure_pool_facts(
         self,
         fact_bags: list[FactBag],
@@ -124,14 +112,30 @@ class DetectionScheduler:
         if not required_facts:
             return
         effective_fact_configs = self._merge_fact_configs(fact_configs)
-        BatchFactProvider(
-            config=self.config,
-            fact_configs=effective_fact_configs,
-            enabled_fact_modules=self.enabled_fact_modules,
-            scan_session=getattr(self, "_active_scan_session", None),
-        ).prefill_facts(fact_bags, required_facts | self._processor_input_facts(required_facts))
+        batch_fact_names = {
+            fact_name
+            for fact_name in required_facts | self._processor_input_facts(required_facts)
+            if get_registry().get_batch_collector(fact_name) is not None
+        }
+        if batch_fact_names:
+            BatchFactProvider(
+                config=self.config,
+                fact_configs=effective_fact_configs,
+                enabled_fact_modules=self.enabled_fact_modules,
+                scan_session=getattr(self, "_active_scan_session", None),
+            ).prefill_facts(fact_bags, batch_fact_names)
         for bag in fact_bags:
-            provider = self._provider_for(bag, fact_configs=effective_fact_configs)
+            bag_fact_configs = {
+                fact_name: dict(config)
+                for fact_name, config in effective_fact_configs.items()
+            }
+            provider = FactProvider(
+                bag.get("file.path", ""),
+                config=self.config,
+                fact_configs=bag_fact_configs,
+                enabled_fact_modules=self.enabled_fact_modules,
+                scan_session=getattr(self, "_active_scan_session", None),
+            )
             ProcessingCoordinator(
                 provider,
                 config=self.config,
@@ -150,7 +154,12 @@ class DetectionScheduler:
             scan_session=scan_session,
         ).prefill_facts(fact_bags, {"file.size", "file.magic_bytes"})
 
-    def _processor_input_facts(self, fact_names: set[str]) -> set[str]:
+    def _processor_input_facts(self, fact_names: set[str]) -> frozenset[str]:
+        cache_key = frozenset(fact_names)
+        cached = self._processor_input_facts_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         inputs: set[str] = set()
         pending = list(fact_names)
         seen = set(fact_names)
@@ -165,7 +174,9 @@ class DetectionScheduler:
                 if input_fact not in seen:
                     seen.add(input_fact)
                     pending.append(input_fact)
-        return inputs
+        result = frozenset(inputs)
+        self._processor_input_facts_cache[cache_key] = result
+        return result
 
     def _enabled_module_names(self, modules_config) -> set[str] | None:
         if not isinstance(modules_config, list):

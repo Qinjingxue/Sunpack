@@ -1,5 +1,6 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
+use rayon::prelude::*;
 use regex::{RegexSet, RegexSetBuilder};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -1013,9 +1014,39 @@ pub(crate) fn batch_file_head_facts(
     magic_size: usize,
 ) -> PyResult<Vec<Py<PyDict>>> {
     let records = py.detach(|| {
-        paths
+        if paths.len() < 2 {
+            return paths
+                .into_iter()
+                .map(|path| file_head_record(path, magic_size))
+                .collect::<Vec<_>>();
+        }
+
+        let chunk_count = paths.len().min(4);
+        let chunk_size = paths.len().div_ceil(chunk_count);
+        let mut chunks: Vec<Vec<String>> = Vec::with_capacity(chunk_count);
+        let mut chunk = Vec::with_capacity(chunk_size);
+        for path in paths {
+            chunk.push(path);
+            if chunk.len() == chunk_size {
+                chunks.push(chunk);
+                chunk = Vec::with_capacity(chunk_size);
+            }
+        }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+
+        chunks
+            .into_par_iter()
+            .map(|chunk| {
+                chunk
+                    .into_iter()
+                    .map(|path| file_head_record(path, magic_size))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
             .into_iter()
-            .map(|path| file_head_record(path, magic_size))
+            .flatten()
             .collect::<Vec<_>>()
     });
     records
