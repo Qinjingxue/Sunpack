@@ -10,6 +10,7 @@ from sunpack.detection.pipeline.processors.modules.format_structure import rar a
 from sunpack.detection.pipeline.processors.modules.format_structure.rar import process_rar_structure
 from sunpack.detection.pipeline.processors.modules.format_structure import seven_zip as seven_zip_processor
 from sunpack.detection.pipeline.processors.modules.format_structure.seven_zip import process_seven_zip_structure
+from sunpack.detection.pipeline.processors.modules.format_structure import zip_eocd as zip_processor
 from sunpack.detection.pipeline.processors.modules.format_structure.zip_eocd import process_zip_eocd_structure
 
 
@@ -172,6 +173,100 @@ def test_compression_without_cached_magic_keeps_strict_probe(tmp_path, monkeypat
     monkeypatch.setattr(compression_processor, "ArchiveAnalyzer", FakeAnalyzer)
 
     result = compression_processor.process_compression_stream_structure(context)
+
+    assert calls == ["init", "probe"]
+    assert result == {"plausible": False, "strong_accept": False}
+
+
+def test_zip_single_input_magic_miss_skips_strict_probe(tmp_path, monkeypatch):
+    part = tmp_path / "ordinary.bin"
+    part.write_bytes(b"ordinary data")
+    context = _context([part], "", "zip.eocd_structure")
+    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
+
+    def fail_if_called(*_args, **_kwargs):
+        raise AssertionError("ZIP strict probe should be skipped after a definite magic miss")
+
+    monkeypatch.setattr(zip_processor, "ArchiveAnalyzer", fail_if_called)
+
+    result = process_zip_eocd_structure(context)
+
+    assert result == {
+        "magic_matched": False,
+        "plausible": False,
+        "strong_accept": False,
+        "detected_ext": "",
+        "confidence": "none",
+        "error": "bad_signature",
+        "evidence": [],
+        "damage_flags": [],
+    }
+
+
+def test_zip_without_cached_magic_keeps_strict_probe(tmp_path, monkeypatch):
+    part = tmp_path / "ordinary.bin"
+    part.write_bytes(b"ordinary data")
+    context = _context([part], "", "zip.eocd_structure")
+    calls = []
+
+    class FakeAnalyzer:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("init")
+
+        def probe_zip_eocd(self, *_args, **_kwargs):
+            calls.append("probe")
+            return _fake_probe_result(plausible=False, strong_accept=False)
+
+    monkeypatch.setattr(zip_processor, "ArchiveAnalyzer", FakeAnalyzer)
+
+    result = process_zip_eocd_structure(context)
+
+    assert calls == ["init", "probe"]
+    assert result == {"plausible": False, "strong_accept": False}
+
+
+def test_zip_start_signatures_keep_strict_probe(tmp_path, monkeypatch):
+    part = tmp_path / "candidate.bin"
+    part.write_bytes(b"candidate data")
+    context = _context([part], "", "zip.eocd_structure")
+    calls = []
+
+    class FakeAnalyzer:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("init")
+
+        def probe_zip_eocd(self, *_args, **_kwargs):
+            calls.append("probe")
+            return _fake_probe_result(plausible=True, strong_accept=True)
+
+    monkeypatch.setattr(zip_processor, "ArchiveAnalyzer", FakeAnalyzer)
+
+    for signature in (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08", b"PK\x06\x06"):
+        context.fact_bag.set("file.magic_bytes", signature)
+        assert process_zip_eocd_structure(context) == {"plausible": True, "strong_accept": True}
+
+    assert calls == ["init", "probe"] * 4
+
+
+def test_zip_multi_input_magic_miss_keeps_strict_probe(tmp_path, monkeypatch):
+    parts = [tmp_path / "part.001", tmp_path / "part.002"]
+    for part in parts:
+        part.write_bytes(b"ordinary data")
+    context = _context(parts, "numeric_suffix", "zip.eocd_structure")
+    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
+    calls = []
+
+    class FakeAnalyzer:
+        def __init__(self, *_args, **_kwargs):
+            calls.append("init")
+
+        def probe_zip_eocd(self, *_args, **_kwargs):
+            calls.append("probe")
+            return _fake_probe_result(plausible=False, strong_accept=False)
+
+    monkeypatch.setattr(zip_processor, "ArchiveAnalyzer", FakeAnalyzer)
+
+    result = process_zip_eocd_structure(context)
 
     assert calls == ["init", "probe"]
     assert result == {"plausible": False, "strong_accept": False}
