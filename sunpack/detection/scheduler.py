@@ -16,6 +16,29 @@ from sunpack.contracts.detection import FactBag
 from sunpack.contracts.rules import RuleDecision
 from sunpack.detection.deep_scan import evaluate_deep_bag
 from sunpack.detection.options import DetectionOptions
+from sunpack.support.path_keys import path_key
+
+
+_FORMAT_NEGATIVE_FACTS = {
+    1 << 0: ("zip.eocd_structure", "zip_eocd_structure"),
+    1 << 1: ("rar.structure", "rar_structure"),
+    1 << 2: ("7z.structure", "seven_zip_structure"),
+    1 << 3: ("tar.header_structure", "tar_header_structure"),
+    1 << 4: ("compression.stream_structure", "compression_stream_structure"),
+}
+
+
+def _canonical_not_matched_structure() -> dict[str, Any]:
+    return {
+        "magic_matched": False,
+        "plausible": False,
+        "strong_accept": False,
+        "detected_ext": "",
+        "confidence": "none",
+        "error": "bad_signature",
+        "evidence": [],
+        "damage_flags": [],
+    }
 
 
 @dataclass(frozen=True)
@@ -89,6 +112,7 @@ class DetectionScheduler:
         self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
         try:
             self._prefill_precheck_head_facts(fact_bags)
+            self._prefill_format_negatives(fact_bags)
             self._prefill_tar_header_negatives(fact_bags)
             return self.rule_manager.evaluate_pool(fact_bags)
         finally:
@@ -104,6 +128,7 @@ class DetectionScheduler:
         self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
         try:
             self._prefill_precheck_head_facts(fact_bags)
+            self._prefill_format_negatives(fact_bags)
             self._prefill_tar_header_negatives(fact_bags)
             return self.rule_manager.evaluate_precheck_pool(fact_bags)
         finally:
@@ -171,6 +196,73 @@ class DetectionScheduler:
             enabled_fact_modules=self.enabled_fact_modules,
             scan_session=scan_session,
         ).prefill_facts(fact_bags, {"file.size", "file.magic_bytes"})
+
+    def _prefill_format_negatives(self, fact_bags: list[FactBag]) -> None:
+        """Prefill cheap offset-zero format misses for single-file candidates.
+
+        This is deliberately narrower than the processor input projection.  A
+        candidate must prove that its logical analysis input is exactly one
+        physical file; split or carrier-related candidates remain on the
+        existing processor path.
+        """
+        if not fact_bags or getattr(self, "_active_scan_session", None) is None:
+            return
+
+        enabled = self.enabled_processors
+        active_facts = {
+            bit: (fact_name, processor_name)
+            for bit, (fact_name, processor_name) in _FORMAT_NEGATIVE_FACTS.items()
+            if enabled is None or processor_name in enabled
+        }
+        if not active_facts:
+            return
+
+        pending: list[tuple[FactBag, str]] = []
+        for bag in fact_bags:
+            path = self._single_file_prefilter_path(bag)
+            if path is not None:
+                pending.append((bag, path))
+        if not pending:
+            return
+
+        try:
+            import sunpack_native
+
+            masks = list(sunpack_native.unified_prefilter([path for _, path in pending]))
+        except Exception:
+            return
+        if len(masks) != len(pending):
+            return
+
+        for (bag, _path), mask in zip(pending, masks):
+            if not isinstance(mask, int):
+                continue
+            for bit, (fact_name, _processor_name) in active_facts.items():
+                if not mask & bit or bag.has(fact_name) or bag.is_missing(fact_name):
+                    continue
+                bag.set(fact_name, _canonical_not_matched_structure())
+
+    @staticmethod
+    def _single_file_prefilter_path(bag: FactBag) -> str | None:
+        if (
+            bag.get("relation.is_split_related")
+            or bag.get("relation.is_split_exe_companion")
+            or bag.get("relation.split_volumes")
+        ):
+            return None
+
+        file_path = bag.get("file.path")
+        member_paths = bag.get("candidate.member_paths")
+        if not isinstance(file_path, str) or not file_path:
+            return None
+        if not isinstance(member_paths, (list, tuple)) or len(member_paths) != 1:
+            return None
+        member_path = member_paths[0]
+        if not isinstance(member_path, str) or not member_path:
+            return None
+        if path_key(member_path) != path_key(file_path):
+            return None
+        return file_path
 
     def _prefill_tar_header_negatives(self, fact_bags: list[FactBag]) -> None:
         if (
