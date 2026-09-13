@@ -108,6 +108,7 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
     });
     let mut anchors_by_path: HashMap<String, VolumeAnchor> = anchors
         .into_iter()
+        .filter(has_relation_evidence)
         .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
         .collect();
     let mut dir_files: HashMap<String, Vec<RelationInput>> = HashMap::new();
@@ -447,6 +448,25 @@ fn is_retry_anchor(anchor: &VolumeAnchor) -> bool {
             || anchor.sfx
             || (anchor.format == "rar" && anchor.encrypted))
         && matches!(anchor.format.as_str(), "7z" | "zip" | "rar")
+}
+
+fn has_relation_evidence(anchor: &VolumeAnchor) -> bool {
+    !anchor.format.is_empty()
+        || !anchor.confidence.is_empty()
+        || anchor.standalone
+        || anchor.multivolume
+        || anchor.encrypted
+        || anchor.needs_password
+        || anchor.wrong_password
+        || !anchor.anchor_roles.is_empty()
+        || anchor.internal_volume_number.is_some()
+        || anchor.structure_offset.is_some()
+        || anchor.expected_logical_size.is_some()
+        || anchor.continuation_from_previous
+        || anchor.continuation_to_next
+        || anchor.sfx
+        || !anchor.evidence.is_empty()
+        || !anchor.error.is_empty()
 }
 
 fn retry_primary_stem(name: &str) -> String {

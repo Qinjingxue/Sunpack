@@ -13,6 +13,16 @@ def _groups(tmp_path: Path):
     return RelationsScheduler().build_candidate_groups(DirectoryScanner(str(tmp_path)).scan())
 
 
+def test_plain_file_relation_omits_empty_volume_anchor(tmp_path):
+    path = tmp_path / "ordinary.bin"
+    path.write_bytes(b"ordinary data")
+
+    bags = build_fact_bags_for_target(str(path))
+
+    assert bags
+    assert all(bag.get("relation.volume_anchor") is None for bag in bags)
+
+
 def test_strict_standard_numbered_7z_is_grouped(tmp_path):
     names = ["archive.7z.001", "archive.7z.002", "archive.7z.003"]
     for name in names:
