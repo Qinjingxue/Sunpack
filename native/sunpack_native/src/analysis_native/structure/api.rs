@@ -907,6 +907,99 @@ pub(crate) fn batch_tar_first_header_reject_indices(
     Ok(rejected_indices)
 }
 
+const UNIFIED_PREFILTER_ZIP: u32 = 1 << 0;
+const UNIFIED_PREFILTER_RAR: u32 = 1 << 1;
+const UNIFIED_PREFILTER_SEVEN_ZIP: u32 = 1 << 2;
+const UNIFIED_PREFILTER_TAR: u32 = 1 << 3;
+const UNIFIED_PREFILTER_COMPRESSION: u32 = 1 << 4;
+
+fn unified_prefilter_mask(path: &str) -> u32 {
+    let Ok(reader) = ManagedReader::open(path) else {
+        return 0;
+    };
+    let file_size = reader.len();
+    let mut head = [0u8; TAR_BLOCK_SIZE];
+    let Ok(read) = reader.read_into_at(0, &mut head) else {
+        return 0;
+    };
+    let mut rejected = 0;
+    if file_size < TAR_BLOCK_SIZE as u64 {
+        rejected |= UNIFIED_PREFILTER_TAR;
+    }
+    if read >= RAR5_SIGNATURE.len()
+        && !head.starts_with(RAR4_SIGNATURE)
+        && !head.starts_with(RAR5_SIGNATURE)
+    {
+        rejected |= UNIFIED_PREFILTER_RAR;
+    }
+    if read >= SEVEN_Z_SIGNATURE.len() && !head.starts_with(SEVEN_Z_SIGNATURE) {
+        rejected |= UNIFIED_PREFILTER_SEVEN_ZIP;
+    }
+    if read >= 4
+        && !head.starts_with(b"PK\x03\x04")
+        && !head.starts_with(b"PK\x05\x06")
+        && !head.starts_with(b"PK\x07\x08")
+        && !head.starts_with(b"PK\x06\x06")
+    {
+        rejected |= UNIFIED_PREFILTER_ZIP;
+    }
+    if read >= XZ_MAGIC.len()
+        && !head.starts_with(b"\x1f\x8b\x08")
+        && !head.starts_with(b"BZh")
+        && !head.starts_with(XZ_MAGIC)
+        && !head.starts_with(ZSTD_MAGIC)
+    {
+        rejected |= UNIFIED_PREFILTER_COMPRESSION;
+    }
+    if read == TAR_BLOCK_SIZE
+        && (head.iter().all(|byte| *byte == 0) || !tar_header_plausible(&head).1.is_empty())
+    {
+        rejected |= UNIFIED_PREFILTER_TAR;
+    }
+    rejected
+}
+
+#[pyfunction]
+pub(crate) fn unified_prefilter(py: Python<'_>, paths: Vec<String>) -> PyResult<Vec<u32>> {
+    let masks = py.detach(move || {
+        if paths.len() < 2 {
+            return paths
+                .into_iter()
+                .map(|path| unified_prefilter_mask(&path))
+                .collect::<Vec<_>>();
+        }
+
+        let chunk_count = paths.len().min(4);
+        let chunk_size = paths.len().div_ceil(chunk_count);
+        let mut chunks: Vec<Vec<String>> = Vec::with_capacity(chunk_count);
+        let mut chunk = Vec::with_capacity(chunk_size);
+        for path in paths {
+            chunk.push(path);
+            if chunk.len() == chunk_size {
+                chunks.push(chunk);
+                chunk = Vec::with_capacity(chunk_size);
+            }
+        }
+        if !chunk.is_empty() {
+            chunks.push(chunk);
+        }
+
+        chunks
+            .into_par_iter()
+            .map(|chunk| {
+                chunk
+                    .into_iter()
+                    .map(|path| unified_prefilter_mask(&path))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    });
+    Ok(masks)
+}
+
 #[pyfunction]
 pub(crate) fn inspect_compression_stream_structure(
     py: Python<'_>,

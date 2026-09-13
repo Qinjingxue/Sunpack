@@ -11,7 +11,7 @@ pub(crate) use structure::{
     batch_tar_first_header_reject_indices, inspect_compression_stream_structure, inspect_rar_structure,
     inspect_seven_zip_structure, inspect_tar_header_structure, inspect_zip_directory_consistency,
     inspect_zip_eocd_structure,
-    inspect_zip_local_header, inspect_zip_structure_graph,
+    inspect_zip_local_header, inspect_zip_structure_graph, unified_prefilter,
 };
 pub(crate) use view::{probe_rar_bytes, AnalysisBinaryView, AnalysisMultiVolumeView};
 pub(crate) use volume_anchor::probe_volume_anchors;
