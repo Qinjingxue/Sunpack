@@ -2,15 +2,11 @@ from dataclasses import dataclass
 from typing import Any
 
 from sunpack.config.detection_view import detection_config
-from sunpack.detection.pipeline.facts.batch_provider import BatchFactProvider
 from sunpack.detection.pipeline.facts.provider import FactProvider
 from sunpack.detection.pipeline.facts.registry import discover_collectors, get_registry
 from sunpack.detection.pipeline.processors.registry import discover_processors
 from sunpack.detection.pipeline.processors.registry import get_processor_registry
 from sunpack.detection.pipeline.processors.runner import ProcessingCoordinator
-from sunpack.detection.pipeline.processors.modules.format_structure.tar_header import (
-    prefill_tar_header_definite_negatives,
-)
 from sunpack.detection.pipeline.rules.manager import RuleManager
 from sunpack.contracts.detection import FactBag
 from sunpack.contracts.rules import RuleDecision
@@ -62,20 +58,6 @@ class DetectionScheduler:
             detector_config.get("fact_collectors"),
             detector_config.get("processors"),
         )
-        self._processor_input_facts_cache: dict[frozenset[str], frozenset[str]] = {}
-        rule_pipeline = detector_config.get("rule_pipeline")
-        precheck_rules = rule_pipeline.get("precheck", []) if isinstance(rule_pipeline, dict) else []
-        tar_rule_enabled = any(
-            isinstance(rule, dict)
-            and rule.get("name") == "tar_structure_accept"
-            and rule.get("enabled", False)
-            for rule in precheck_rules
-        )
-        tar_processor_enabled = (
-            self.enabled_processors is None
-            or "tar_header_structure" in self.enabled_processors
-        )
-        self._tar_batch_prefill_enabled = tar_rule_enabled and tar_processor_enabled
         self.rule_manager = RuleManager(
             config,
             ensure_pool_facts=self._ensure_pool_facts,
@@ -111,9 +93,7 @@ class DetectionScheduler:
         self._active_scan_session = scan_session
         self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
         try:
-            self._prefill_precheck_head_facts(fact_bags)
             self._prefill_format_negatives(fact_bags)
-            self._prefill_tar_header_negatives(fact_bags)
             return self.rule_manager.evaluate_pool(fact_bags)
         finally:
             self._active_scan_session = None
@@ -127,9 +107,7 @@ class DetectionScheduler:
         self._active_scan_session = scan_session
         self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
         try:
-            self._prefill_precheck_head_facts(fact_bags)
             self._prefill_format_negatives(fact_bags)
-            self._prefill_tar_header_negatives(fact_bags)
             return self.rule_manager.evaluate_precheck_pool(fact_bags)
         finally:
             self._active_scan_session = None
@@ -155,18 +133,6 @@ class DetectionScheduler:
         if not required_facts:
             return
         effective_fact_configs = self._merge_fact_configs(fact_configs)
-        batch_fact_names = {
-            fact_name
-            for fact_name in required_facts | self._processor_input_facts(required_facts)
-            if get_registry().get_batch_collector(fact_name) is not None
-        }
-        if batch_fact_names:
-            BatchFactProvider(
-                config=self.config,
-                fact_configs=effective_fact_configs,
-                enabled_fact_modules=self.enabled_fact_modules,
-                scan_session=getattr(self, "_active_scan_session", None),
-            ).prefill_facts(fact_bags, batch_fact_names)
         for bag in fact_bags:
             bag_fact_configs = {
                 fact_name: dict(config)
@@ -185,17 +151,6 @@ class DetectionScheduler:
                 fact_configs=provider.fact_configs,
                 enabled_processors=self.enabled_processors,
             ).ensure_facts(bag, required_facts)
-
-    def _prefill_precheck_head_facts(self, fact_bags: list[FactBag]) -> None:
-        scan_session = getattr(self, "_active_scan_session", None)
-        if not fact_bags or scan_session is None:
-            return
-        BatchFactProvider(
-            config=self.config,
-            fact_configs=self.fact_config_defaults,
-            enabled_fact_modules=self.enabled_fact_modules,
-            scan_session=scan_session,
-        ).prefill_facts(fact_bags, {"file.size", "file.magic_bytes"})
 
     def _prefill_format_negatives(self, fact_bags: list[FactBag]) -> None:
         """Prefill cheap offset-zero format misses for single-file candidates.
@@ -263,39 +218,6 @@ class DetectionScheduler:
         if path_key(member_path) != path_key(file_path):
             return None
         return file_path
-
-    def _prefill_tar_header_negatives(self, fact_bags: list[FactBag]) -> None:
-        if (
-            not self._tar_batch_prefill_enabled
-            or not fact_bags
-            or getattr(self, "_active_scan_session", None) is None
-        ):
-            return
-        prefill_tar_header_definite_negatives(fact_bags)
-
-    def _processor_input_facts(self, fact_names: set[str]) -> frozenset[str]:
-        cache_key = frozenset(fact_names)
-        cached = self._processor_input_facts_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        inputs: set[str] = set()
-        pending = list(fact_names)
-        seen = set(fact_names)
-        registry = get_processor_registry()
-        while pending:
-            fact_name = pending.pop()
-            processor = registry.get_by_output(fact_name)
-            if processor is None:
-                continue
-            for input_fact in processor.input_facts:
-                inputs.add(input_fact)
-                if input_fact not in seen:
-                    seen.add(input_fact)
-                    pending.append(input_fact)
-        result = frozenset(inputs)
-        self._processor_input_facts_cache[cache_key] = result
-        return result
 
     def _enabled_module_names(self, modules_config) -> set[str] | None:
         if not isinstance(modules_config, list):

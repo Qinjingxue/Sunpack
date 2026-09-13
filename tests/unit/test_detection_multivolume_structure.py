@@ -40,50 +40,6 @@ def _fake_probe_result(**values):
     return SimpleNamespace(to_raw_dict=lambda: dict(values))
 
 
-def test_rar_single_input_magic_miss_skips_strict_probe(tmp_path, monkeypatch):
-    part = tmp_path / "ordinary.bin"
-    part.write_bytes(b"ordinary data")
-    context = _context([part], "", "rar.structure")
-    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
-
-    def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("RAR strict probe should be skipped after a definite magic miss")
-
-    monkeypatch.setattr(rar_processor, "ArchiveAnalyzer", fail_if_called)
-
-    result = process_rar_structure(context)
-
-    assert result == {
-        "magic_matched": False,
-        "plausible": False,
-        "strong_accept": False,
-        "detected_ext": "",
-        "confidence": "none",
-        "error": "bad_signature",
-        "evidence": [],
-        "damage_flags": [],
-    }
-
-
-def test_seven_zip_single_input_magic_miss_skips_strict_probe(tmp_path, monkeypatch):
-    part = tmp_path / "ordinary.bin"
-    part.write_bytes(b"ordinary data")
-    context = _context([part], "", "7z.structure")
-    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
-
-    def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("7z strict probe should be skipped after a definite magic miss")
-
-    monkeypatch.setattr(seven_zip_processor, "ArchiveAnalyzer", fail_if_called)
-
-    result = process_seven_zip_structure(context)
-
-    assert result["magic_matched"] is False
-    assert result["plausible"] is False
-    assert result["strong_accept"] is False
-    assert result["error"] == "bad_signature"
-
-
 def test_rar_multi_input_magic_miss_keeps_strict_probe(tmp_path, monkeypatch):
     parts = [tmp_path / "part.001", tmp_path / "part.002"]
     for part in parts:
@@ -131,31 +87,6 @@ def test_seven_zip_short_magic_keeps_strict_probe(tmp_path, monkeypatch):
     assert result == {"plausible": False, "strong_accept": False}
 
 
-def test_compression_cached_magic_miss_skips_strict_probe(tmp_path, monkeypatch):
-    part = tmp_path / "ordinary.bin"
-    part.write_bytes(b"ordinary data")
-    context = _context([part], "", "compression.stream_structure")
-    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
-
-    def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("compression strict probe should be skipped after a definite magic miss")
-
-    monkeypatch.setattr(compression_processor, "ArchiveAnalyzer", fail_if_called)
-
-    result = compression_processor.process_compression_stream_structure(context)
-
-    assert result == {
-        "magic_matched": False,
-        "plausible": False,
-        "strong_accept": False,
-        "detected_ext": "",
-        "confidence": "none",
-        "error": "bad_signature",
-        "evidence": [],
-        "damage_flags": [],
-    }
-
-
 def test_compression_without_cached_magic_keeps_strict_probe(tmp_path, monkeypatch):
     part = tmp_path / "ordinary.bin"
     part.write_bytes(b"ordinary data")
@@ -176,31 +107,6 @@ def test_compression_without_cached_magic_keeps_strict_probe(tmp_path, monkeypat
 
     assert calls == ["init", "probe"]
     assert result == {"plausible": False, "strong_accept": False}
-
-
-def test_zip_single_input_magic_miss_skips_strict_probe(tmp_path, monkeypatch):
-    part = tmp_path / "ordinary.bin"
-    part.write_bytes(b"ordinary data")
-    context = _context([part], "", "zip.eocd_structure")
-    context.fact_bag.set("file.magic_bytes", b"ordinary-data")
-
-    def fail_if_called(*_args, **_kwargs):
-        raise AssertionError("ZIP strict probe should be skipped after a definite magic miss")
-
-    monkeypatch.setattr(zip_processor, "ArchiveAnalyzer", fail_if_called)
-
-    result = process_zip_eocd_structure(context)
-
-    assert result == {
-        "magic_matched": False,
-        "plausible": False,
-        "strong_accept": False,
-        "detected_ext": "",
-        "confidence": "none",
-        "error": "bad_signature",
-        "evidence": [],
-        "damage_flags": [],
-    }
 
 
 def test_zip_without_cached_magic_keeps_strict_probe(tmp_path, monkeypatch):

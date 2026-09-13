@@ -8,12 +8,10 @@ _COLLECTOR_MODULES = (
 )
 
 FactCollectorFunc = Callable[[str], Any]
-BatchFactCollectorFunc = Callable[[Any], None]
 
 class FactRegistry:
     def __init__(self):
         self._collectors: Dict[str, FactCollectorFunc] = {}
-        self._batch_collectors: Dict[str, BatchFactCollectorFunc] = {}
         self._schemas: Dict[str, dict[str, Any]] = {}
 
     def register(self, fact_name: str, collector: FactCollectorFunc, schema: dict[str, Any] | None = None):
@@ -33,22 +31,11 @@ class FactRegistry:
     def get_collector(self, fact_name: str) -> FactCollectorFunc:
         return self._collectors.get(fact_name)
 
-    def register_batch(self, fact_name: str, collector: BatchFactCollectorFunc):
-        if fact_name not in self._collectors:
-            raise ValueError(f"Batch fact collector {fact_name} must have a regular collector")
-        self._batch_collectors[fact_name] = collector
-
-    def get_batch_collector(self, fact_name: str) -> BatchFactCollectorFunc:
-        return self._batch_collectors.get(fact_name)
-
     def get_schema(self, fact_name: str) -> dict[str, Any] | None:
         return self._schemas.get(fact_name) or get_fact_schema(fact_name)
 
     def get_all_collectors(self) -> Dict[str, FactCollectorFunc]:
         return dict(self._collectors)
-
-    def get_all_batch_collectors(self) -> Dict[str, BatchFactCollectorFunc]:
-        return dict(self._batch_collectors)
 
     def get_all_schemas(self) -> Dict[str, dict[str, Any]]:
         return dict(self._schemas)
@@ -74,12 +61,6 @@ def register_fact(
         return func
     return decorator
 
-
-def register_batch_fact(fact_name: str):
-    def decorator(func: BatchFactCollectorFunc):
-        _global_registry.register_batch(fact_name, func)
-        return func
-    return decorator
 
 def get_registry() -> FactRegistry:
     return _global_registry

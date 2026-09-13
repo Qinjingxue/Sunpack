@@ -67,7 +67,6 @@ def test_game_tree_resources_are_not_authorized_for_recursive_extraction(monkeyp
         # this is only the same recursive output scan used after extraction.
         import sunpack.coordinator.task_provider as task_provider_module
         from sunpack.coordinator.scan_session import DetectionScanSession
-        from sunpack.detection.pipeline.facts.batch_provider import BatchFactProvider
         from sunpack.detection.pipeline.processors.runner import ProcessingCoordinator
         from sunpack.detection.pipeline.rules.manager import RuleManager
         from sunpack.detection.scheduler import DetectionScheduler
@@ -97,17 +96,6 @@ def test_game_tree_resources_are_not_authorized_for_recursive_extraction(monkeyp
             return result
 
         monkeypatch.setattr(scan_session, "file_head_facts_for_paths", timed_file_head_facts)
-
-        original_prefill_facts = BatchFactProvider.prefill_facts
-
-        def timed_prefill_facts(self, *args, **kwargs):
-            started = perf_counter()
-            result = original_prefill_facts(self, *args, **kwargs)
-            add_timing("batch_prefill_facts_seconds", perf_counter() - started)
-            add_count("batch_prefill_facts_calls")
-            return result
-
-        monkeypatch.setattr(BatchFactProvider, "prefill_facts", timed_prefill_facts)
 
         original_ensure_facts = ProcessingCoordinator.ensure_facts
 
