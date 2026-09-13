@@ -1,10 +1,12 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use crc32fast::hash as crc32;
 use memchr::memmem;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use rayon::prelude::*;
 
 use crate::io::reader::ManagedReader;
 use crate::password::rar::{rar4_decrypt_header_flags, rar5_decrypt_main_header};
@@ -19,6 +21,7 @@ const ZIP_SPLIT_MARKER: &[u8] = b"PK\x07\x08";
 const DEFAULT_PREFIX_LIMIT: usize = 1024 * 1024;
 const DEFAULT_TAIL_LIMIT: usize = 65_557;
 const RAR4_MAIN_HEADER_PASSWORD: u16 = 0x0080;
+const VOLUME_ANCHOR_PROBE_THREADS: usize = 4;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct VolumeAnchor {
@@ -103,17 +106,29 @@ pub(crate) fn probe_volume_anchor_paths(
                 .collect()
         })
         .unwrap_or_default();
-    paths
-        .iter()
-        .map(|path| {
-            probe_path(
-                path,
-                prefix_limit,
-                tail_limit,
-                password_map.get(&path.to_ascii_lowercase()).copied(),
-            )
-        })
-        .collect()
+    volume_anchor_probe_pool().install(|| {
+        paths
+            .par_iter()
+            .map(|path| {
+                probe_path(
+                    path,
+                    prefix_limit,
+                    tail_limit,
+                    password_map.get(&path.to_ascii_lowercase()).copied(),
+                )
+            })
+            .collect()
+    })
+}
+
+fn volume_anchor_probe_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(VOLUME_ANCHOR_PROBE_THREADS)
+            .build()
+            .expect("volume anchor probe pool must build")
+    })
 }
 
 fn probe_path(
