@@ -192,7 +192,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        analysis_native::batch_tar_first_header_reject,
+        analysis_native::batch_tar_first_header_reject_indices,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(

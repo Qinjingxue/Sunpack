@@ -2,6 +2,7 @@ from unittest.mock import patch
 
 from sunpack.contracts.detection import FactBag
 from sunpack.detection.pipeline.facts.batch_provider import BatchFactProvider
+from sunpack.detection.pipeline.processors.modules.format_structure import tar_header
 from sunpack.detection.scheduler import DetectionScheduler
 from sunpack.support.path_keys import path_key
 from tests.helpers.config_factory import get_config
@@ -72,3 +73,28 @@ def test_precheck_head_warmup_skips_independent_detection_without_scan_session()
         scheduler._prefill_precheck_head_facts([bag])
 
     provider.assert_not_called()
+
+
+def test_tar_batch_prefill_only_sets_definite_negative_bags():
+    short = _bag("C:/game/short.bin")
+    short.set("file.size", 128)
+    pending = _bag("C:/game/pending.bin")
+    pending.set("file.size", 512)
+    unknown = _bag("C:/game/unknown.bin")
+    unknown.set("file.size", 1024)
+    complete = _bag("C:/game/complete.bin")
+    complete.set("file.size", 2048)
+    complete.set("tar.header_structure", {"plausible": True})
+
+    with patch.object(
+        tar_header.sunpack_native,
+        "batch_tar_first_header_reject_indices",
+        return_value=[0],
+    ) as batch:
+        tar_header.prefill_tar_header_definite_negatives([short, pending, unknown, complete])
+
+    batch.assert_called_once_with(["C:/game/pending.bin", "C:/game/unknown.bin"])
+    assert short.get("tar.header_structure")["plausible"] is False
+    assert pending.get("tar.header_structure")["plausible"] is False
+    assert not unknown.has("tar.header_structure")
+    assert complete.get("tar.header_structure") == {"plausible": True}

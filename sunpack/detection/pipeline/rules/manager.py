@@ -159,19 +159,29 @@ class RuleManager:
                 _,
                 _,
             ) in self._ordered_precheck_plans(bag, precheck_plan):
-                if prerequisite_facts:
-                    self.ensure_pool_facts([bag], prerequisite_facts)
+                pending_prerequisite_facts = {
+                    fact_name
+                    for fact_name in prerequisite_facts
+                    if not bag.has(fact_name) and not bag.is_missing(fact_name)
+                }
+                if pending_prerequisite_facts:
+                    self.ensure_pool_facts([bag], pending_prerequisite_facts)
                 active_facts = {
                     requirement.fact_name
                     for requirement in requirements
                     if requirement.matches(bag, effective_fact_configs[requirement.fact_name])
                 }
-                if active_facts:
+                pending_active_facts = {
+                    fact_name
+                    for fact_name in active_facts
+                    if not bag.has(fact_name) and not bag.is_missing(fact_name)
+                }
+                if pending_active_facts:
                     fact_configs = {
                         fact_name: effective_fact_configs[fact_name]
-                        for fact_name in active_facts
+                        for fact_name in pending_active_facts
                     }
-                    self.ensure_pool_facts([bag], set(active_facts), fact_configs)
+                    self.ensure_pool_facts([bag], pending_active_facts, fact_configs)
                 if requirements and not active_facts:
                     continue
                 effect = self._evaluate_precheck_rule(bag, rule)
@@ -212,7 +222,16 @@ class RuleManager:
                 fact_name: self._effective_fact_config(fact_name, rule.config)
                 for fact_name in new_facts
             }
-            self.ensure_pool_facts([bag], new_facts, fact_configs)
+            pending_facts = {
+                fact_name
+                for fact_name in new_facts
+                if not bag.has(fact_name) and not bag.is_missing(fact_name)
+            }
+            if pending_facts:
+                self.ensure_pool_facts([bag], pending_facts, {
+                    fact_name: fact_configs[fact_name]
+                    for fact_name in pending_facts
+                })
             requested_facts.update(new_facts)
 
     def evaluate_pool(self, fact_bags: List[FactBag]) -> Dict[FactBag, RuleDecision]:

@@ -5,7 +5,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 use std::io::Read;
-use std::time::Instant;
 
 include!("constants.rs");
 include!("api.rs");
