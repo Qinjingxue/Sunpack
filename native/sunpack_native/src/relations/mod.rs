@@ -1131,6 +1131,16 @@ fn validate_rar_proposal(
     if first_count != 1 {
         return Ok(ProposalStatus::Inconclusive);
     }
+    if let Some(highest) = known_numbers.iter().copied().max() {
+        if (1..=highest).any(|number| !known_numbers.contains(&number)) {
+            // Header-encrypted RAR proposals may be formed from a gapped
+            // filename family so that password discovery can run.  Once the
+            // password exposes internal volume numbers, a gap proves that
+            // the current physical set is incomplete; it must not validate
+            // as a complete relation.
+            return Ok(ProposalStatus::Inconclusive);
+        }
+    }
 
     let ordered_paths: Vec<String> = proposal
         .volumes

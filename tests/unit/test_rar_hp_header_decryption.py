@@ -161,6 +161,57 @@ def test_two_standalone_hp_rars_in_same_filename_family_return_to_plain_files(tm
     assert all(group.kind == "file" and not group.is_split_candidate for group in groups)
 
 
+def test_missing_middle_hp_rar_volume_never_validates_as_complete_split(tmp_path):
+    try:
+        case = create_encrypted_rar_archive(
+            tmp_path,
+            "rar5_hp_missing_middle",
+            password="secret",
+            split=True,
+            split_volume_size=1024,
+            payload_size=12 * 1024,
+        )
+    except FileNotFoundError:
+        pytest.skip("RAR generator is not configured")
+
+    scheduler = RelationsScheduler({"user_passwords": ["secret"]})
+    numbered = sorted(
+        (
+            path,
+            scheduler.parse_numbered_volume(str(path)),
+        )
+        for path in case.archive_dir.iterdir()
+        if path.is_file()
+    )
+    numbered = [item for item in numbered if item[1] is not None]
+    numbered.sort(key=lambda item: int(item[1]["number"]))
+    assert len(numbered) >= 3
+    numbers = [int(parsed["number"]) for _path, parsed in numbered]
+    assert numbers[0] == 1
+    middle = next(path for path, parsed in numbered if int(parsed["number"]) == 2)
+    hidden = middle.with_name(f"{middle.name}.hidden")
+    middle.rename(hidden)
+    try:
+        remaining = [path.name for path, _parsed in numbered if path != middle]
+        incomplete_paths = [case.archive_dir / name for name in remaining]
+        incomplete = scheduler.build_candidate_groups(
+            _snapshot(case.archive_dir, remaining),
+            path_passwords={str(path): "secret" for path in incomplete_paths},
+        )
+        assert not any(group.kind == "split_archive" for group in incomplete)
+    finally:
+        hidden.rename(middle)
+
+    complete_paths = [path for path, _parsed in numbered]
+    complete = scheduler.build_candidate_groups(
+        _snapshot(case.archive_dir, [path.name for path in complete_paths]),
+        path_passwords={str(path): "secret" for path in complete_paths},
+    )
+    split_groups = [group for group in complete if group.kind == "split_archive"]
+    assert len(split_groups) == 1
+    assert [volume.number for volume in split_groups[0].split_volumes] == numbers
+
+
 def test_split_hp_rar_group_is_identified_from_filenames(tmp_path):
     _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
     _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX)
