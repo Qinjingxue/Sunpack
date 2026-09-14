@@ -151,7 +151,7 @@ def test_pipeline_uses_initial_structure_group_without_missing_volume_retry(
     assert marker.read_text(encoding="utf-8") == cases["7z"].marker_text
 
 
-def test_real_strict_middle_gap_survives_structure_precheck_and_holds_watch(tmp_path):
+def test_real_strict_middle_gap_is_not_emitted_as_a_relation_group(tmp_path):
     case = ArchiveFixtureFactory().create(
         tmp_path,
         "strict_middle_gap",
@@ -167,18 +167,11 @@ def test_real_strict_middle_gap_survives_structure_precheck_and_holds_watch(tmp_
     groups = RelationsScheduler().build_candidate_groups(
         DirectoryScanner(str(case.archive_dir)).scan()
     )
-    group = next(group for group in groups if group.logical_name == "strict_middle_gap")
-
-    assert group.split_group_complete is False
-    assert group.split_missing_reason == "missing_middle"
-    assert group.split_missing_indices == [2]
-    assert group.split_completeness_status == "middle_gap"
-    assert group.split_completeness_confidence == "strong"
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)
 
     snapshot = WatchGroupCoordinator({}).resolve_head(str(parts[0]))
-    assert snapshot is not None
-    assert snapshot.missing_indices == (2,)
-    assert snapshot.should_wait_for_relation_gap is True
+    assert snapshot is None
 
 
 def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):
@@ -208,14 +201,7 @@ def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):
         format_hint="7z",
     )
 
-    assert group is not None
-    assert [volume.number for volume in group.split_volumes] == [1, 2, 3, 5]
-    assert group.split_group_complete is False
-    assert group.split_missing_reason == "missing_middle"
-    assert group.split_missing_indices == [4]
-    assert group.split_observed_missing_ranges == [(4, 4)]
-    assert group.split_completeness_status == "middle_gap"
-    assert group.split_completeness_confidence == "strong"
+    assert group is None
 
 
 def test_structure_resolution_stays_within_the_head_parent_directory(
@@ -250,8 +236,7 @@ def test_structure_resolution_stays_within_the_head_parent_directory(
         all_paths,
         format_hint="7z",
     )
-    assert direct_group is not None
-    assert set(direct_group.input_paths) == {str(path) for path in first_parts}
+    assert direct_group is None
 
     entries = [
         FileEntry(path=path, is_dir=False, size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
@@ -259,15 +244,8 @@ def test_structure_resolution_stays_within_the_head_parent_directory(
     ]
     snapshot = DirectorySnapshot.from_entries(scan_root, entries)
     groups = scheduler.build_candidate_groups(snapshot)
-    first_group = next(
-        group
-        for group in groups
-        if str(first_parts[0]) in group.input_paths
-    )
-    assert set(first_group.input_paths) == {str(path) for path in first_parts}
-    assert first_group.split_group_complete is False
-    assert first_group.split_missing_indices == [2]
-    assert all(Path(path).parent == first_directory for path in first_group.input_paths)
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)
     assert not any(
         str(foreign_first) in group.input_paths
         and any(str(path) in group.input_paths for path in first_parts)
@@ -356,10 +334,10 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path):
     assert [part.volume_number for part in descriptor.parts] == [1, 2, 3, 4]
     assert [part.role for part in descriptor.parts] == ["first", "member", "member", "terminal"]
     assert [part.canonical_name for part in descriptor.parts] == [
-        "shared.z01",
-        "shared.z02",
-        "shared.z03",
-        "shared.zip",
+        "shared.alpha.z01",
+        "shared.alpha.z02",
+        "shared.alpha.z03",
+        "shared.alpha.zip",
     ]
 
     extractor = ExtractionScheduler(max_retries=0)

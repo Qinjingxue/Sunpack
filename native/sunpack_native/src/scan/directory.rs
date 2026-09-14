@@ -9,12 +9,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+use crate::analysis_native::volume_anchor::{probe_volume_anchor_paths_cheap, VolumeAnchor};
+
+#[derive(Debug, Clone)]
 struct DirectoryEntryRecord {
     path: String,
     is_dir: bool,
     size: Option<u64>,
     mtime_ns: Option<u64>,
+    relation_member_eligible: bool,
+    relation_anchor: Option<VolumeAnchor>,
 }
 
 #[derive(Debug)]
@@ -23,6 +27,8 @@ struct DirectorySnapshotTable {
     is_dirs: Vec<bool>,
     sizes: Vec<Option<u64>>,
     mtimes_ns: Vec<Option<u64>>,
+    relation_member_eligible: Vec<bool>,
+    relation_anchors: Vec<Option<VolumeAnchor>>,
 }
 
 #[pyclass(module = "sunpack_native", frozen)]
@@ -72,20 +78,32 @@ impl NativeDirectorySnapshot {
             is_dirs: Vec::with_capacity(records.len()),
             sizes: Vec::with_capacity(records.len()),
             mtimes_ns: Vec::with_capacity(records.len()),
+            relation_member_eligible: Vec::with_capacity(records.len()),
+            relation_anchors: Vec::with_capacity(records.len()),
         };
         for record in records {
             table.paths.push(record.path);
             table.is_dirs.push(record.is_dir);
             table.sizes.push(record.size);
             table.mtimes_ns.push(record.mtime_ns);
+            table
+                .relation_member_eligible
+                .push(record.relation_member_eligible);
+            table.relation_anchors.push(record.relation_anchor);
         }
         table
     }
 
-    pub(crate) fn file_records(&self) -> impl Iterator<Item = (&str, Option<u64>)> {
+    pub(crate) fn relation_file_records(
+        &self,
+    ) -> impl Iterator<Item = (&str, Option<u64>, bool, Option<&VolumeAnchor>)> + '_ {
         self.rows.iter().filter_map(|&row| {
-            (!self.table.is_dirs[row])
-                .then_some((self.table.paths[row].as_str(), self.table.sizes[row]))
+            (!self.table.is_dirs[row]).then_some((
+                self.table.paths[row].as_str(),
+                self.table.sizes[row],
+                self.table.relation_member_eligible[row],
+                self.table.relation_anchors[row].as_ref(),
+            ))
         })
     }
 
@@ -317,7 +335,8 @@ impl NativeOutputInventory {
             mtime_ranges,
             whitelist_rules,
         )?;
-        let records = build_inventory_snapshot_views(&self.root, self.files.as_ref(), &options);
+        let mut records = build_inventory_snapshot_views(&self.root, self.files.as_ref(), &options);
+        populate_relation_anchors(&mut records.raw);
         let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
         Ok((
             Py::new(py, filtered)?,
@@ -695,7 +714,8 @@ pub(crate) fn scan_directory_snapshot(
         mtime_ranges,
         whitelist_rules,
     )?;
-    let records = scan_directory(root_path, max_depth, &options)?;
+    let mut records = scan_directory(root_path, max_depth, &options)?;
+    populate_relation_anchors(&mut records);
     Py::new(py, NativeDirectorySnapshot::from_records(records))
 }
 
@@ -722,7 +742,8 @@ pub(crate) fn scan_directory_snapshots(
         mtime_ranges,
         whitelist_rules,
     )?;
-    let records = scan_directory_views(root_path, max_depth, &options)?;
+    let mut records = scan_directory_views(root_path, max_depth, &options)?;
+    populate_relation_anchors(&mut records.raw);
     let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
     Ok((
         Py::new(py, filtered)?,
@@ -731,35 +752,52 @@ pub(crate) fn scan_directory_snapshots(
 }
 
 #[pyfunction]
+#[pyo3(signature = (paths, is_dirs, sizes, mtimes_ns, relation_member_eligible=None))]
 pub(crate) fn directory_snapshot_from_columns(
     py: Python<'_>,
     paths: Vec<String>,
     is_dirs: Vec<bool>,
     sizes: Vec<Option<u64>>,
     mtimes_ns: Vec<Option<u64>>,
+    relation_member_eligible: Option<Vec<bool>>,
 ) -> PyResult<Py<NativeDirectorySnapshot>> {
     let length = paths.len();
-    if is_dirs.len() != length || sizes.len() != length || mtimes_ns.len() != length {
+    if is_dirs.len() != length
+        || sizes.len() != length
+        || mtimes_ns.len() != length
+        || relation_member_eligible
+            .as_ref()
+            .is_some_and(|values| values.len() != length)
+    {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "directory snapshot columns must have equal lengths",
         ));
     }
-    Py::new(
-        py,
-        NativeDirectorySnapshot::from_records(
-            paths
-                .into_iter()
-                .zip(is_dirs)
-                .zip(sizes)
-                .zip(mtimes_ns)
-                .map(|(((path, is_dir), size), mtime_ns)| DirectoryEntryRecord {
+    let relation_member_eligible = relation_member_eligible
+        .unwrap_or_else(|| vec![true; length]);
+    let mut records = paths
+        .into_iter()
+        .zip(is_dirs)
+        .zip(sizes)
+        .zip(mtimes_ns)
+        .zip(relation_member_eligible)
+        .map(
+            |((((path, is_dir), size), mtime_ns), relation_member_eligible)| {
+                DirectoryEntryRecord {
                     path,
                     is_dir,
                     size,
                     mtime_ns,
-                })
-                .collect(),
-        ),
+                    relation_member_eligible,
+                    relation_anchor: None,
+                }
+            },
+        )
+        .collect::<Vec<_>>();
+    populate_relation_anchors(&mut records);
+    Py::new(
+        py,
+        NativeDirectorySnapshot::from_records(records),
     )
 }
 
@@ -885,6 +923,8 @@ fn build_inventory_snapshot_views(
             is_dir: false,
             size: Some(item.size),
             mtime_ns: item.mtime_ns,
+            relation_member_eligible: true,
+            relation_anchor: None,
         };
         let index = raw_files.len();
         raw_files.push(record);
@@ -893,6 +933,7 @@ fn build_inventory_snapshot_views(
         if file_rejected_by_path(&path, &root, options)
             || file_under_rejected_directory(&path, &root, options, &mut directory_rejections)
         {
+            raw_files[index].relation_member_eligible = false;
             continue;
         }
         let family_keys = if options.size_ranges.is_empty() {
@@ -907,12 +948,23 @@ fn build_inventory_snapshot_views(
             size_accepted_split_families.extend(family_keys);
         } else if !family_keys.is_empty() {
             size_deferred.push((index, family_keys));
+            raw_files[index].relation_member_eligible = true;
+        } else {
+            raw_files[index].relation_member_eligible = true;
         }
     }
     for (index, family_keys) in size_deferred {
         pre_mtime_accepted[index] = family_keys
             .iter()
             .any(|key| size_accepted_split_families.contains(key));
+    }
+
+    for (index, record) in raw_files.iter_mut().enumerate() {
+        if pre_mtime_accepted[index]
+            && !numeric_ranges_allow(&options.mtime_ranges, record.mtime_ns)
+        {
+            record.relation_member_eligible = false;
+        }
     }
 
     let mut raw = ancestor_directory_records(&root, raw_files.iter());
@@ -1018,6 +1070,8 @@ fn ancestor_directory_records<'a>(
             is_dir: true,
             size: None,
             mtime_ns: None,
+            relation_member_eligible: false,
+            relation_anchor: None,
         })
         .collect()
 }
@@ -1049,6 +1103,8 @@ pub(crate) fn list_regular_files_in_directory(
             is_dir: false,
             size: Some(metadata.len()),
             mtime_ns: metadata_mtime_ns(&metadata),
+            relation_member_eligible: true,
+            relation_anchor: None,
         });
     }
     records
@@ -1535,6 +1591,27 @@ fn scan_directory(
     Ok(scan_directory_impl::<false>(root_path, max_depth, options, false, None)?.filtered)
 }
 
+fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
+    let paths: Vec<String> = records
+        .iter()
+        .filter(|record| !record.is_dir)
+        .map(|record| record.path.clone())
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+    let anchors = probe_volume_anchor_paths_cheap(&paths, None);
+    let anchors_by_path: HashMap<String, VolumeAnchor> = anchors
+        .into_iter()
+        .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
+        .collect();
+    for record in records.iter_mut().filter(|record| !record.is_dir) {
+        record.relation_anchor = anchors_by_path
+            .get(&record.path.to_ascii_lowercase())
+            .cloned();
+    }
+}
+
 fn scan_directory_views(
     root_path: &str,
     max_depth: Option<usize>,
@@ -1574,6 +1651,8 @@ fn scan_directory_impl<const PROFILE: bool>(
                         is_dir: false,
                         size: Some(metadata.len()),
                         mtime_ns: metadata_mtime_ns(&metadata),
+                        relation_member_eligible: true,
+                        relation_anchor: None,
                     })
             })
             .flatten();
@@ -1651,6 +1730,8 @@ fn scan_directory_impl<const PROFILE: bool>(
                         is_dir: true,
                         size: None,
                         mtime_ns: None,
+                        relation_member_eligible: false,
+                        relation_anchor: None,
                     });
                 }
                 let rejected =
@@ -1672,6 +1753,8 @@ fn scan_directory_impl<const PROFILE: bool>(
                         is_dir: true,
                         size: None,
                         mtime_ns: None,
+                        relation_member_eligible: false,
+                        relation_anchor: None,
                     });
                     child_dirs.push(path);
                 });
@@ -1685,14 +1768,19 @@ fn scan_directory_impl<const PROFILE: bool>(
 
             let size = metadata.len();
             let mtime_ns = metadata_mtime_ns(&metadata);
-            if collect_raw {
+            let raw_file_index = if collect_raw {
                 raw_records.push(DirectoryEntryRecord {
                     path: path_to_string(&path),
                     is_dir: false,
                     size: Some(size),
                     mtime_ns,
+                    relation_member_eligible: false,
+                    relation_anchor: None,
                 });
-            }
+                Some(raw_records.len() - 1)
+            } else {
+                None
+            };
             let hard_rejected =
                 measure::<PROFILE, _>(&mut profile, ProfileBucket::PathMatching, || {
                     !metadata.is_file()
@@ -1715,6 +1803,9 @@ fn scan_directory_impl<const PROFILE: bool>(
                 )
             };
             if !numeric_ranges_allow(&options.size_ranges, Some(size)) {
+                if let Some(index) = raw_file_index {
+                    raw_records[index].relation_member_eligible = true;
+                }
                 if split_family_keys.is_empty() {
                     if PROFILE {
                         if let Some(profile) = profile.as_deref_mut() {
@@ -1728,6 +1819,8 @@ fn scan_directory_impl<const PROFILE: bool>(
                             is_dir: false,
                             size: Some(size),
                             mtime_ns,
+                            relation_member_eligible: true,
+                            relation_anchor: None,
                         },
                         split_family_keys,
                     ));
@@ -1735,12 +1828,17 @@ fn scan_directory_impl<const PROFILE: bool>(
                 continue;
             }
             size_accepted_split_families.extend(split_family_keys);
+            if let Some(index) = raw_file_index {
+                raw_records[index].relation_member_eligible = true;
+            }
             measure::<PROFILE, _>(&mut profile, ProfileBucket::RecordBuilding, || {
                 records.push(DirectoryEntryRecord {
                     path: path_to_string(&path),
                     is_dir: false,
                     size: Some(size),
                     mtime_ns,
+                    relation_member_eligible: true,
+                    relation_anchor: None,
                 });
             });
             if PROFILE {
@@ -1806,6 +1904,8 @@ fn file_record_if_accepted(
         is_dir: false,
         size: Some(size),
         mtime_ns,
+        relation_member_eligible: true,
+        relation_anchor: None,
     })
 }
 

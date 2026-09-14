@@ -70,14 +70,7 @@ class WatchGroupCoordinator:
         payload = {
             "group_id": group_id,
             "members": [_file_version(path) for path in input_paths],
-            "complete": group.split_group_complete,
-            "missing_reason": group.split_missing_reason,
-            "missing_indices": list(group.split_missing_indices or []),
             "sources": [str(volume.source) for volume in volumes],
-            "completeness_status": group.split_completeness_status,
-            "completeness_confidence": group.split_completeness_confidence,
-            "completeness_basis": list(group.split_completeness_basis or []),
-            "encrypted_unresolved": bool(getattr(group, "encrypted_unresolved", False)),
         }
         input_fingerprint = _fingerprint(payload)
         ownership_fingerprint = _fingerprint({
@@ -95,14 +88,6 @@ class WatchGroupCoordinator:
             owned_paths=owned_paths,
             input_fingerprint=input_fingerprint,
             ownership_fingerprint=ownership_fingerprint,
-            complete=group.split_group_complete,
-            missing_reason=str(group.split_missing_reason or ""),
-            missing_indices=tuple(int(value) for value in (group.split_missing_indices or [])),
-            candidate_substitution=group.split_group_complete is None,
-            completeness_status=str(group.split_completeness_status or "ambiguous"),
-            completeness_confidence=str(group.split_completeness_confidence or "hint"),
-            completeness_basis=tuple(str(value) for value in (group.split_completeness_basis or [])),
-            encrypted_unresolved=bool(getattr(group, "encrypted_unresolved", False)),
         )
 
 

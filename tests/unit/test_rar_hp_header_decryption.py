@@ -134,7 +134,6 @@ def test_single_hp_rar_is_a_plain_file_group_not_a_split(tmp_path):
     group = groups[0]
     assert group.kind == "file"
     assert group.is_split_candidate is False
-    assert group.split_completeness_status != "tail_missing"
 
 
 def test_split_hp_rar_group_is_identified_from_filenames(tmp_path):
@@ -144,7 +143,6 @@ def test_split_hp_rar_group_is_identified_from_filenames(tmp_path):
     groups = RelationsScheduler().build_candidate_groups(snapshot)
     split_groups = [group for group in groups if group.kind == "split_archive"]
     assert len(split_groups) == 1
-    assert split_groups[0].split_group_complete is True
     assert [volume.number for volume in split_groups[0].split_volumes] == [1, 2]
 
 

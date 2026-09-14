@@ -135,60 +135,44 @@ def test_naked_executable_does_not_attach_disguised_parts(tmp_path):
     }
 
 
-def test_missing_middle_split_volume_remains_a_relation_hint_for_detection(tmp_path):
+def test_missing_middle_split_volume_is_not_emitted_as_a_relation_group(tmp_path):
     root = tmp_path / "missing_middle"
     _write_files(root, ["gap.7z.001", "gap.7z.002", "gap.7z.004"])
 
     bags = build_fact_bags_for_targets([str(root)], config=SCAN_CONFIG)
-    gap = next(bag for bag in bags if bag.get("candidate.logical_name") == "gap")
+    gap = [bag for bag in bags if bag.get("candidate.logical_name") == "gap"]
 
-    assert gap.get("relation.split_group_complete") is False
-    assert gap.get("relation.split_missing_reason") == "missing_middle"
-    assert gap.get("relation.split_missing_indices") == [3]
-
-    provider = ArchiveTaskProvider(SCAN_CONFIG)
-    filtered = provider._filter_incomplete_split_groups([gap])
-
-    assert filtered == [gap]
-    assert provider.failed_candidates == []
-    assert provider.failed_candidate_failures == []
+    assert gap
+    assert all(not bag.get("relation.is_split_related") for bag in gap)
+    assert all(len(bag.get("candidate.member_paths") or []) == 1 for bag in gap)
 
 
-def test_missing_head_split_volume_remains_a_relation_hint_for_detection(tmp_path):
+def test_missing_head_split_volume_is_not_emitted_as_a_relation_group(tmp_path):
     root = tmp_path / "missing_head"
     _write_files(root, ["lost.7z.002", "lost.7z.003"])
 
     bags = build_fact_bags_for_targets([str(root)], config=SCAN_CONFIG)
-    lost = next(bag for bag in bags if bag.get("candidate.logical_name") == "lost")
+    lost = [bag for bag in bags if bag.get("candidate.logical_name") == "lost"]
 
-    assert lost.get("relation.split_group_complete") is False
-    assert lost.get("relation.split_missing_reason") == "missing_head"
-    assert lost.get("relation.split_missing_indices") == [1]
-
-    provider = ArchiveTaskProvider(SCAN_CONFIG)
-    filtered = provider._filter_incomplete_split_groups([lost])
-
-    assert filtered == [lost]
-    assert provider.failed_candidates == []
-    assert provider.failed_candidate_failures == []
+    assert lost
+    assert all(not bag.get("relation.is_split_related") for bag in lost)
+    assert all(len(bag.get("candidate.member_paths") or []) == 1 for bag in lost)
 
 
-def test_missing_head_split_volume_can_be_recovered_by_fuzzy_candidate(tmp_path):
+def test_missing_head_split_volume_is_not_recovered_by_filename_only_candidate(tmp_path):
     root = tmp_path / "recovered_head"
     _write_files(root, ["lost.7z", "lost.7z.002", "lost.7z.003"])
     for path in root.iterdir():
         path.write_bytes(b"x" * (1024 * 1024))
 
     bags = build_fact_bags_for_targets([str(root)], config=SCAN_CONFIG)
-    recovered = next(
+    recovered = [
         bag for bag in bags
         if str(root / "lost.7z.002") in (bag.get("candidate.member_paths") or [])
-    )
-
-    assert [Path(path).name for path in recovered.get("candidate.member_paths")] == [
-        "lost.7z", "lost.7z.002", "lost.7z.003",
     ]
-    assert recovered.get("relation.split_group_complete") is None
-    assert recovered.get("relation.split_group_status") == "ambiguous"
-    assert recovered.get("relation.format_hint") == "7z"
-    assert recovered.get("relation.format_hint_confidence") == "weak"
+
+    assert len(recovered) == 1
+    assert [Path(path).name for path in recovered[0].get("candidate.member_paths")] == [
+        "lost.7z.002",
+    ]
+    assert not recovered[0].get("relation.is_split_related")

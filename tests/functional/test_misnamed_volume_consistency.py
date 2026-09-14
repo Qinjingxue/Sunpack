@@ -20,12 +20,8 @@ def test_filename_only_scan_does_not_absorb_unmarked_fuzzy_parts(tmp_path):
     grouped = next(bag for bag in bags if bag.get("file.path") == str(first))
 
     assert grouped.get("candidate.member_paths") == [str(first)]
-    assert [
-        (item["path"], item["number"], item["source"])
-        for item in grouped.get("relation.split_volumes")
-    ] == [
-        (str(first), 1, "standard"),
-    ]
+    assert grouped.get("relation.split_volumes") is None
+    assert not grouped.get("relation.is_split_related")
     assert all(
         str(path) not in grouped.get("candidate.member_paths")
         for path in (normal_2, normal_3, fuzzy_4, fuzzy_5)

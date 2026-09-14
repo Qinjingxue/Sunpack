@@ -10,6 +10,10 @@ class FileEntry:
     size: int | None = None
     mtime_ns: int | None = None
     metadata: dict[str, Any] | None = None
+    # True for filtered rows and for rows excluded only by a soft size rule.
+    # Hard path/prune/whitelist exclusions must remain False so relation
+    # recovery cannot resurrect them.
+    relation_member_eligible: bool | None = None
 
 
 @dataclass
@@ -46,6 +50,10 @@ class DirectorySnapshot:
                 [bool(entry.is_dir) for entry in rows],
                 [entry.size for entry in rows],
                 [entry.mtime_ns for entry in rows],
+                [
+                    True if entry.relation_member_eligible is None else bool(entry.relation_member_eligible)
+                    for entry in rows
+                ],
             )
 
         native_snapshot = build(entries)

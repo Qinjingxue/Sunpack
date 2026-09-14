@@ -27,7 +27,12 @@ class RarFastVerifier:
             part_paths=part_paths,
             archive_input=archive_input,
         )
-        if volume_input is not None and volume_input[0] in {"rar_part", "rar_oldstyle"}:
+        if volume_input is not None and volume_input[0] in {
+            "rar_part",
+            "rar_oldstyle",
+            "rar_sfx_part",
+            "sfx_numeric_suffix",
+        }:
             volume_numbers = sorted(
                 int(item.get("volume_number") or 0) for item in volume_input[1]
             )

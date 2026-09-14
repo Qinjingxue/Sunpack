@@ -429,8 +429,6 @@ class WatchScheduler:
                 group_id=snapshot.group_id,
                 head_path=snapshot.head_path,
                 input_paths=list(snapshot.input_paths),
-                missing_reason=snapshot.missing_reason,
-                missing_indices=list(snapshot.missing_indices),
             )
         active_requests = []
         for dispatch in dispatches:

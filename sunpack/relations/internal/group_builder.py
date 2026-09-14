@@ -15,6 +15,7 @@ from sunpack_native import (
 )
 
 from sunpack.contracts.filesystem import DirectorySnapshot
+from sunpack.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.passwords.internal.local_files import discover_directory_passwords_for_archive
 from sunpack.passwords.internal.store import PasswordStore
 from sunpack.passwords.relation_prober import RelationsPasswordProber
@@ -55,117 +56,7 @@ class RelationsGroupBuilder:
             if discovered:
                 path_passwords = discovered
                 groups = self.build_candidate_groups_without_discovery(snapshot, discovered)
-        return self._attach_launcher_companions(groups)
-
-    @staticmethod
-    def _attach_launcher_companions(groups: List[CandidateGroup]) -> List[CandidateGroup]:
-        """Associate a real 7z/ZIP SFX launcher with its data-volume group.
-
-        The native relation engine deliberately keeps a naked executable
-        independent when it cannot prove that it is a split member.  For SFX
-        archives that is the right input boundary, but it leaves target scans
-        unable to discover the archive when the user selects the launcher.
-        Attach only an exact logical-name match, or a strongly anchored
-        decorated-volume-name match, to one structurally grouped 7z/ZIP
-        family.  Ambiguous families and filename-only camouflage stay
-        separate, and RAR ``part1.exe`` remains a real data volume.
-        """
-        launcher_groups = [
-            group
-            for group in groups
-            if RelationsGroupBuilder._is_launcher_only_group(group)
-        ]
-        if not launcher_groups:
-            return groups
-
-        data_groups = [
-            group
-            for group in groups
-            if RelationsGroupBuilder._is_launcher_data_group(group)
-        ]
-        attachments: dict[str, list[CandidateGroup]] = {}
-        claimed_launchers: set[str] = set()
-        for launcher in launcher_groups:
-            matches = [
-                target
-                for target in data_groups
-                if RelationsGroupBuilder._launcher_matches_data_group(launcher, target)
-            ]
-            if len(matches) != 1:
-                continue
-            target = matches[0]
-            target_key = path_key(target.head_path)
-            launcher_key = path_key(launcher.head_path)
-            if launcher_key in claimed_launchers:
-                continue
-            attachments.setdefault(target_key, []).append(launcher)
-            claimed_launchers.add(launcher_key)
-
-        if not attachments:
-            return groups
-
-        merged: list[CandidateGroup] = []
-        for group in groups:
-            group_key = path_key(group.head_path)
-            companions = attachments.get(group_key)
-            if not companions:
-                if path_key(group.head_path) not in claimed_launchers:
-                    merged.append(group)
-                continue
-            group.companion_paths = list(dict.fromkeys([
-                *(group.companion_paths or []),
-                *(companion.head_path for companion in companions),
-            ]))
-            carrier = companions[0]
-            group.carrier_path = carrier.head_path
-            group.carrier_size = carrier.head_size
-            group.relation.has_split_companions = True
-            group.relation.is_split_related = True
-            merged.append(group)
-        return merged
-
-    @staticmethod
-    def _is_launcher_only_group(group: CandidateGroup) -> bool:
-        relation = group.relation
-        return bool(
-            not group.split_volumes
-            and not group.is_split_candidate
-            and not relation.is_split_related
-            and not relation.is_split_member
-            and os.path.splitext(group.head_path)[1].casefold() == ".exe"
-        )
-
-    @staticmethod
-    def _is_launcher_data_group(group: CandidateGroup) -> bool:
-        if not group.split_volumes or not (group.is_split_candidate or group.relation.is_split_related):
-            return False
-        metadata = group.head_metadata if isinstance(group.head_metadata, dict) else {}
-        values = [
-            str(group.relation.split_family or ""),
-            str(group.split_volumes[0].style or ""),
-            str(metadata.get("format") or ""),
-        ]
-        family = " ".join(values).casefold()
-        return "7z" in family or "zip" in family
-
-    @staticmethod
-    def _launcher_matches_data_group(launcher: CandidateGroup, target: CandidateGroup) -> bool:
-        """Match decorated volume names without treating arbitrary names as SFX."""
-        if target.logical_name.casefold() == launcher.logical_name.casefold():
-            return True
-        launcher_stem = Path(launcher.head_path).stem.casefold()
-        if not launcher_stem:
-            return False
-        for volume in target.split_volumes or []:
-            name = Path(volume.path).name.casefold()
-            for marker in (".7z.", ".zip."):
-                marker_index = name.find(marker)
-                if marker_index <= 0:
-                    continue
-                base = name[:marker_index]
-                if base == launcher_stem or base.endswith(f".{launcher_stem}"):
-                    return True
-        return False
+        return groups
 
     def _discover_directory_passwords(
         self,
@@ -179,26 +70,47 @@ class RelationsGroupBuilder:
         list lets the next native pass decrypt the main headers and follow the
         exact unencrypted path: real multivolume state and volume numbers.
         """
-        encrypted_paths: set[str] = set()
+        encrypted_groups: list[tuple[list[str], list[str], dict | None]] = []
         for group in groups:
-            if not getattr(group, "encrypted_unresolved", False):
+            metadata = group.head_metadata if isinstance(group.head_metadata, dict) else {}
+            if not group.is_split_candidate or not bool(metadata.get("needs_password")):
                 continue
-            encrypted_paths.add(os.path.abspath(str(group.head_path or "")))
+            proposal_paths: set[str] = set()
+            proposal_paths.add(os.path.abspath(str(group.head_path or "")))
             for member in group.input_paths:
-                encrypted_paths.add(os.path.abspath(str(member)))
-        encrypted_paths.discard("")
-        if not encrypted_paths:
+                proposal_paths.add(os.path.abspath(str(member)))
+            for member in metadata.get("proposal_paths") or []:
+                proposal_paths.add(os.path.abspath(str(member)))
+            proposal_paths.discard("")
+            if proposal_paths:
+                part_paths = list(dict.fromkeys(
+                    os.path.abspath(str(member))
+                    for member in group.input_paths
+                    if member
+                ))
+                archive_input = _relation_archive_input(group)
+                encrypted_groups.append((sorted(proposal_paths), part_paths, archive_input))
+        if not encrypted_groups:
             return None
 
         found: dict[str, str] = {}
-        for path in encrypted_paths:
-            directory_passwords = discover_directory_passwords_for_archive(path, self.config)
+        for proposal_paths, part_paths, archive_input in encrypted_groups:
+            probe_path = next((path for path in part_paths if path in proposal_paths), proposal_paths[0])
+            directory_passwords = discover_directory_passwords_for_archive(probe_path, self.config)
             password = self.password_prober.resolve_file(
-                path,
+                probe_path,
                 directory_passwords=directory_passwords,
+                part_paths=part_paths or proposal_paths,
+                archive_input=archive_input,
             )
-            if password:
-                found[path] = password
+            if not password:
+                continue
+            # A password belongs to the proposal, not just to the head path
+            # that happened to make the bounded verifier succeed.  The native
+            # validator then rechecks every member in the original path union
+            # with that one password.
+            for proposal_path in proposal_paths:
+                found[proposal_path] = password
         return found or None
 
     def build_candidate_groups_without_discovery(
@@ -408,20 +320,7 @@ class RelationsGroupBuilder:
                 is_split_candidate=bool(raw.get("is_split_candidate")),
                 head_size=raw.get("head_size"),
                 split_volumes=split_volumes,
-                split_group_complete=raw.get("split_group_complete"),
-                split_missing_reason=str(raw.get("split_missing_reason") or ""),
-                split_missing_indices=[int(value) for value in (raw.get("split_missing_indices") or [])],
-                split_observed_missing_ranges=[
-                    (int(value[0]), int(value[1]))
-                    for value in (raw.get("split_observed_missing_ranges") or [])
-                    if isinstance(value, (list, tuple)) and len(value) == 2
-                ],
-                split_layout_status=str(raw.get("split_layout_status") or "ambiguous"),
-                split_completeness_status=str(raw.get("split_completeness_status") or "ambiguous"),
-                split_completeness_confidence=str(raw.get("split_completeness_confidence") or "hint"),
-                split_completeness_basis=[str(value) for value in (raw.get("split_completeness_basis") or [])],
                 head_metadata=dict(raw.get("head_metadata") or {}),
-                encrypted_unresolved=self._group_encrypted_unresolved(raw),
                 companion_paths=[str(path) for path in (raw.get("companion_paths") or [])],
                 carrier_path=str(raw.get("carrier_path") or ""),
                 carrier_size=raw.get("carrier_size"),
@@ -430,15 +329,36 @@ class RelationsGroupBuilder:
         except (TypeError, ValueError):
             return None
 
-    @staticmethod
-    def _group_encrypted_unresolved(raw: dict) -> bool:
-        metadata = raw.get("head_metadata")
-        if not isinstance(metadata, dict):
-            return False
-        return bool(metadata.get("needs_password") or metadata.get("wrong_password"))
-
-
 def _native_password_pairs(path_passwords: dict[str, str] | None) -> list[tuple[str, str]] | None:
     if not path_passwords:
         return None
     return [(str(path), str(password)) for path, password in path_passwords.items() if str(password)]
+
+
+def _relation_archive_input(group: CandidateGroup) -> dict | None:
+    volumes = list(group.split_volumes or [])
+    if not volumes:
+        return None
+    first = volumes[0]
+    format_hint = _format_hint(
+        group.relation.split_family,
+        first.style,
+        first.prefix,
+    )
+    return ArchiveInputDescriptor.from_split_volumes(
+        archive_path=group.head_path,
+        volumes=volumes,
+        format_hint=format_hint,
+        logical_name=group.logical_name,
+    ).to_dict()
+
+
+def _format_hint(family: str, style: str, prefix: str) -> str:
+    value = f"{family} {style} {prefix}".lower()
+    if "rar" in value:
+        return "rar"
+    if "zip" in value:
+        return "zip"
+    if "7z" in value:
+        return "7z"
+    return ""

@@ -1059,7 +1059,7 @@ def test_watch_scheduler_accepts_small_split_tail_only_when_family_is_anchored(t
     watcher.enqueue(str(unrelated))
 
     pending_paths = set(watcher._pending)
-    assert str(tail.resolve()) in pending_paths
+    assert str(tail.resolve()) not in pending_paths
     assert str(unrelated.resolve()) not in pending_paths
 
 
@@ -1717,7 +1717,6 @@ def test_watch_scheduler_reprocesses_split_group_after_source_cleanup(tmp_path, 
             owned_paths=(str(archive_path),),
             input_fingerprint="same-input",
             ownership_fingerprint="same-owner",
-            complete=True,
         )
 
     class GroupCoordinator:

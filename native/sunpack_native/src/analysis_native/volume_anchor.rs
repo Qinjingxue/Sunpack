@@ -240,7 +240,19 @@ fn probe_path(
         if probe_zip_split_marker(&prefix, &mut result) {
             return result;
         }
+        if probe_zip_local_head(&prefix, &mut result) {
+            return result;
+        }
         if probe_embedded_zip_local_head(&prefix, &mut result) {
+            return result;
+        }
+        if prefix.starts_with(b"MZ") {
+            // An MZ header is only a weak SFX/carrier seed.  Do not scan a
+            // larger prefix here: the relation layer may use the filename
+            // proposal to authorize one bounded deep probe later.
+            result.confidence = "weak".to_string();
+            result.sfx = true;
+            result.evidence.push("sfx:pe_header");
             return result;
         }
         probe_standalone_stream(&prefix, &mut result);
@@ -264,6 +276,24 @@ fn probe_path(
         }
         result.bytes_read += (prefix_len - base_prefix_len) as u64;
     }
+
+    // RAR and 7z have all relation-seed structure at the head.  Do not pay
+    // the ZIP EOCD tail read for a proposal that has already identified one
+    // of these formats; ZIP is the only format below that needs the tail.
+    if let Some(offset) = anchored_signature(&prefix, RAR5, allow_embedded)
+        .or_else(|| anchored_signature(&prefix, RAR4, allow_embedded))
+        .filter(|offset| probe_rar(&prefix, *offset, &mut result, password))
+    {
+        let _ = offset;
+        return result;
+    }
+    if let Some(offset) = anchored_signature(&prefix, SEVEN_ZIP, allow_embedded)
+        .filter(|offset| probe_seven_zip(&prefix, *offset, size, &mut result))
+    {
+        let _ = offset;
+        return result;
+    }
+
     let tail_len = size.min(tail_limit as u64) as usize;
     let tail_start = size.saturating_sub(tail_len as u64);
     let tail = if tail_start == 0 {
@@ -292,19 +322,6 @@ fn probe_path(
         }
     };
 
-    if let Some(offset) = anchored_signature(&prefix, RAR5, allow_embedded)
-        .or_else(|| anchored_signature(&prefix, RAR4, allow_embedded))
-        .filter(|offset| probe_rar(&prefix, *offset, &mut result, password))
-    {
-        let _ = offset;
-        return result;
-    }
-    if let Some(offset) = anchored_signature(&prefix, SEVEN_ZIP, allow_embedded)
-        .filter(|offset| probe_seven_zip(&prefix, *offset, size, &mut result))
-    {
-        let _ = offset;
-        return result;
-    }
     if probe_zip(&prefix, &tail, tail_start, &mut result) {
         return result;
     }
@@ -326,6 +343,19 @@ fn probe_zip_split_marker(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
     out.internal_volume_number = Some(1);
     out.anchor_roles.push("first");
     out.evidence.push("zip:split_marker");
+    true
+}
+
+fn probe_zip_local_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
+    if !prefix.starts_with(ZIP_LOCAL) || !plausible_zip_local(prefix, 0) {
+        return false;
+    }
+    out.format = "zip".to_string();
+    out.confidence = "weak".to_string();
+    out.structure_offset = Some(0);
+    out.internal_volume_number = Some(1);
+    out.anchor_roles.push("first");
+    out.evidence.push("zip:local_header");
     true
 }
 
@@ -373,6 +403,8 @@ fn probe_rar(
                 if let Some((archive_flags, number)) =
                     rar5_decrypt_main_header(&prefix[offset..], password)
                 {
+                    out.needs_password = false;
+                    out.wrong_password = false;
                     out.multivolume = archive_flags & 0x01 != 0;
                     if out.multivolume {
                         out.internal_volume_number =
@@ -415,6 +447,8 @@ fn probe_rar(
         if out.encrypted {
             if let Some(password) = password {
                 if rar4_decrypt_header_flags(&prefix[offset..], password).is_some() {
+                    out.needs_password = false;
+                    out.wrong_password = false;
                     out.evidence.push("rar4:decrypted_header");
                 } else {
                     out.wrong_password = true;

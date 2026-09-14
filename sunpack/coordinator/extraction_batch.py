@@ -852,25 +852,9 @@ def _should_retry_missing_volume_resolution(
     task: ArchiveTask,
     result: ExtractionResult,
 ) -> bool:
+    del task
     failure = result.failure
-    if failure is not None and failure.contains(FailureKind.MISSING_VOLUME):
-        return True
-    anchor = task.fact_bag.get("relation.volume_anchor") or {}
-    structurally_incomplete = bool(
-        isinstance(anchor, dict)
-        and anchor.get("confidence") == "strong"
-        and anchor.get("multivolume")
-        and task.fact_bag.get("relation.split_group_complete") is False
-    )
-    return bool(
-        structurally_incomplete
-        and failure is not None
-        and failure.kind in {
-            FailureKind.UNSUPPORTED,
-            FailureKind.DAMAGED,
-            FailureKind.UNKNOWN,
-        }
-    )
+    return bool(failure is not None and failure.contains(FailureKind.MISSING_VOLUME))
 
 
 def _possible_missing_volume_failure(
@@ -884,13 +868,6 @@ def _possible_missing_volume_failure(
     if failure is not None and failure.contains(FailureKind.MISSING_VOLUME):
         return None
 
-    missing_indices = [int(value) for value in (task.fact_bag.get("relation.split_missing_indices") or [])]
-    missing_ranges = [
-        [int(value) for value in item]
-        for item in (task.fact_bag.get("relation.split_observed_missing_ranges") or [])
-        if isinstance(item, (list, tuple))
-    ]
-    observed_gap = bool(missing_indices or missing_ranges)
     probe_suspected = _failure_has_possible_missing_volume_evidence(failure)
 
     evidence = ""
@@ -898,11 +875,6 @@ def _possible_missing_volume_failure(
         evidence = "partial_recovery_on_split_input"
     elif probe_suspected:
         evidence = "backend_possible_missing_volume"
-    elif observed_gap and failure is not None and failure.kind in {
-        FailureKind.UNKNOWN,
-        FailureKind.DAMAGED,
-    }:
-        evidence = "observed_volume_gap_after_archive_failure"
     if not evidence:
         return None
 
@@ -911,10 +883,6 @@ def _possible_missing_volume_failure(
         "evidence": evidence,
         "partial_recovery": outcome_kind == OutcomeKind.PARTIAL_SUCCESS,
     }
-    if missing_indices:
-        details["observed_missing_indices"] = missing_indices
-    if missing_ranges:
-        details["observed_missing_ranges"] = missing_ranges
     if failure is not None:
         details["original_failure_kind"] = failure.kind.value
 

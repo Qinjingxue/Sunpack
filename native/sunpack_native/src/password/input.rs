@@ -161,6 +161,7 @@ impl Seek for VirtualRangeReader {
 pub(crate) struct VolumeSpec {
     pub(crate) reader: ManagedReader,
     pub(crate) number: u32,
+    pub(crate) start: u64,
 }
 
 pub(crate) fn parse_volumes(parts: &Bound<'_, PyList>) -> PyResult<Vec<VolumeSpec>> {
@@ -179,6 +180,12 @@ pub(crate) fn parse_volumes(parts: &Bound<'_, PyList>) -> PyResult<Vec<VolumeSpe
                 PyErr::new::<pyo3::exceptions::PyValueError, _>("volume_number is required")
             })?
             .extract::<u32>()?;
+        let start = dict
+            .get_item("start")?
+            .or_else(|| dict.get_item("start_offset").ok().flatten())
+            .map(|value| value.extract::<u64>())
+            .transpose()?
+            .unwrap_or(0);
         let canonical_name = dict
             .get_item("canonical_name")?
             .ok_or_else(|| {
@@ -193,6 +200,7 @@ pub(crate) fn parse_volumes(parts: &Bound<'_, PyList>) -> PyResult<Vec<VolumeSpe
         parsed.push(VolumeSpec {
             reader: ManagedReader::open(&path)?,
             number,
+            start,
         });
     }
     parsed.sort_by_key(|volume| volume.number);
@@ -357,13 +365,15 @@ impl VolumeSet {
                 .with_field(field, FieldLocation::Head)
                 .with_volume(1));
         };
-        self.read_disk_spanning(0, 0, size.min(volume_len as usize))
+        let start = self.volumes[0].start.min(volume_len);
+        let requested = size.min(volume_len.saturating_sub(start) as usize);
+        self.read_disk_spanning(0, start, requested)
             .map_err(|error| {
                 ReadFault::from_io(
                     error,
                     "read_volume",
-                    0,
-                    size.min(volume_len as usize),
+                    start,
+                    requested,
                     0,
                     volume_len,
                 )

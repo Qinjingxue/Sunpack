@@ -384,6 +384,7 @@ class ArchiveInputDescriptor:
             prefix = str(value.get("prefix") or "")
             role = str(value.get("role") or ("first" if number == 1 else "member"))
             width = int(value.get("width") or 3)
+            start = int(value.get("start", value.get("start_offset", 0)) or 0)
             if not path or number <= 0 or not style or not prefix:
                 raise ValueError("split volume is missing path, number, style, or prefix")
             normalized.append({
@@ -393,6 +394,7 @@ class ArchiveInputDescriptor:
                 "prefix": prefix,
                 "role": role,
                 "width": width,
+                "start": start,
             })
         normalized.sort(key=lambda item: item["number"])
         numbers = [item["number"] for item in normalized]
@@ -414,6 +416,8 @@ class ArchiveInputDescriptor:
                     width=item["width"],
                     role=item["role"],
                 ),
+                range=ArchiveInputRange(path=item["path"], start=item["start"])
+                if item["start"] > 0 else None,
             )
             for item in normalized
         ]
@@ -498,9 +502,6 @@ class ArchiveRelationState:
     kind: str = "file"
     is_split: bool = False
     is_sfx: bool = False
-    volumes_complete: bool | None = None
-    missing_indices: list[int] = field(default_factory=list)
-    missing_reason: str = ""
 
 
 @dataclass(frozen=True)

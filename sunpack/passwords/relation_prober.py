@@ -83,11 +83,14 @@ class RelationsPasswordProber:
         path: str,
         *,
         directory_passwords: list[str] | None = None,
+        part_paths: list[str] | None = None,
+        archive_input: dict | None = None,
     ) -> str | None:
         path = os.path.abspath(path)
         if not path or not os.path.isfile(path):
             return None
-        fingerprint = build_archive_fingerprint(path, [path])
+        probe_parts = list(part_paths) if part_paths is not None else [path]
+        fingerprint = build_archive_fingerprint(path, probe_parts, archive_input)
         cached = self.scheduler.cache.get_success(fingerprint.key)
         if cached is not None:
             return cached
@@ -97,6 +100,8 @@ class RelationsPasswordProber:
         )
         result = self.scheduler.plan_for_extraction(PasswordJob(
             archive_path=path,
+            part_paths=list(part_paths) if part_paths is not None else None,
+            archive_input=archive_input,
             fingerprint=fingerprint,
             candidates=candidates,
         ))

@@ -87,46 +87,6 @@ FACT_SCHEMA: dict[str, dict[str, Any]] = {
         "producer": "relations.group_builder",
         "description": "Number of paths in the split relation candidate.",
     },
-    "relation.split_group_complete": {
-        "type": "bool",
-        "producer": "relations.group_builder",
-        "description": "Whether the relation layer considers the split group complete enough to represent.",
-    },
-    "relation.split_missing_reason": {
-        "type": "str",
-        "producer": "relations.group_builder",
-        "description": "Reason a split group was marked incomplete, such as missing_head or missing_middle.",
-    },
-    "relation.split_missing_indices": {
-        "type": "list",
-        "producer": "relations.group_builder",
-        "description": "Split volume numbers that appear to be missing before the last observed volume.",
-    },
-    "relation.split_observed_missing_ranges": {
-        "type": "list",
-        "producer": "relations.group_builder",
-        "description": "Compact filename-observed gap ranges; these are hints, not backend-confirmed missing volumes.",
-    },
-    "relation.split_layout_status": {
-        "type": "str",
-        "producer": "relations.group_builder",
-        "description": "Filename-layout assessment: coherent, observed_gap, or ambiguous.",
-    },
-    "relation.split_completeness_status": {
-        "type": "str",
-        "producer": "relations.group_builder",
-        "description": "Structured relation assessment: coherent, middle_gap, tail_missing, or ambiguous.",
-    },
-    "relation.split_completeness_confidence": {
-        "type": "str",
-        "producer": "relations.group_builder",
-        "description": "Evidence confidence for the completeness assessment: hint, strong, or proven.",
-    },
-    "relation.split_completeness_basis": {
-        "type": "list",
-        "producer": "relations.group_builder",
-        "description": "Machine-readable evidence used by the relation completeness assessment.",
-    },
     "relation.split_family": {
         "type": "str",
         "producer": "relations.group_builder",
@@ -206,11 +166,6 @@ FACT_SCHEMA: dict[str, dict[str, Any]] = {
         "type": "dict",
         "producer": "processors.zip_eocd_structure",
         "description": "ZIP EOCD/central-directory structure and bounded encryption state derived from the candidate file.",
-    },
-    "relation.split_group_status": {
-        "type": "str",
-        "producer": "relations.group_builder",
-        "description": "Tri-state relation result: complete, incomplete, or ambiguous.",
     },
     "zip.directory_consistency": {
         "type": "dict",

@@ -46,8 +46,11 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
         or group.companion_paths
         or group.carrier_path
     )
-    single_incomplete_volume = group.split_group_complete is False and len(group.split_volumes) == 1
-    if group.split_volumes and not single_incomplete_volume:
+    password_pending = bool(
+        isinstance(group.head_metadata, dict)
+        and group.head_metadata.get("needs_password")
+    )
+    if group.split_volumes:
         format_hint = _split_format_hint(
             relation.split_family,
             group.split_volumes[0].style,
@@ -55,33 +58,16 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
         )
         bag.update({
             "relation.format_hint": format_hint,
-            "relation.format_hint_confidence": "strong" if bool(format_hint) and group.split_group_complete is True and all(
-                volume.source == "standard" for volume in group.split_volumes
-            ) else "weak" if format_hint else "none",
+            "relation.format_hint_confidence": (
+                "weak" if password_pending else "strong"
+            ) if format_hint else "none",
         })
-        if needs_archive_metadata:
-            source_descriptor = ArchiveInputDescriptor.from_split_volumes(
-                archive_path=group.entry_path,
-                volumes=group.split_volumes,
-                format_hint=format_hint,
-                logical_name=group.logical_name,
-            )
-    elif group.split_volumes:
-        format_hint = _split_format_hint(
-            relation.split_family,
-            group.split_volumes[0].style,
-            group.split_volumes[0].prefix,
+        source_descriptor = ArchiveInputDescriptor.from_split_volumes(
+            archive_path=group.entry_path,
+            volumes=group.split_volumes,
+            format_hint=format_hint,
+            logical_name=group.logical_name,
         )
-        bag.update({
-            "relation.format_hint": format_hint,
-            "relation.format_hint_confidence": "weak" if format_hint else "none",
-        })
-        if needs_archive_metadata:
-            source_descriptor = ArchiveInputDescriptor.from_parts(
-                archive_path=group.entry_path,
-                format_hint=format_hint,
-                logical_name=group.logical_name,
-            )
     else:
         format_hint = ""
         bag.update({
@@ -113,31 +99,12 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
         "relation.match_001_head": relation.match_001_head,
         "relation.split_entry_path": group.head_path,
         "relation.split_member_count": len(input_paths) if group.is_split_candidate else 0,
-        "relation.split_layout_status": group.split_layout_status,
-        "relation.split_completeness_status": group.split_completeness_status,
-        "relation.split_completeness_confidence": group.split_completeness_confidence,
-        "relation.split_completeness_basis": list(group.split_completeness_basis or []),
         "relation.split_family": relation.split_family,
         "relation.split_index": relation.split_index,
         "relation.split_is_first": relation.split_role == "first",
     })
     if isinstance(file_size := (group.carrier_size if group.carrier_path and isinstance(group.carrier_size, int) else group.head_size), int):
         bag.set("file.size", file_size)
-    if group.split_group_complete is not None:
-        bag.set("relation.split_group_complete", bool(group.split_group_complete))
-    bag.set(
-        "relation.split_group_status",
-        "complete" if group.split_group_complete is True else "incomplete" if group.split_group_complete is False else "ambiguous",
-    )
-    if group.split_missing_reason:
-        bag.set("relation.split_missing_reason", group.split_missing_reason)
-    if group.split_missing_indices:
-        bag.set("relation.split_missing_indices", list(group.split_missing_indices))
-    if group.split_observed_missing_ranges:
-        bag.set(
-            "relation.split_observed_missing_ranges",
-            [list(value) for value in group.split_observed_missing_ranges],
-        )
     if group.split_volumes:
         bag.set("relation.split_volumes", [
             {
@@ -148,6 +115,7 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
                 "style": volume.style,
                 "prefix": volume.prefix,
                 "width": volume.width,
+                "start": volume.start,
             }
             for volume in group.split_volumes
         ])
@@ -171,7 +139,11 @@ def _split_format_hint(family: str, style: str, prefix: str = "") -> str:
 
 def build_candidate_fact_bags(directory: str, relations: RelationsScheduler | None = None) -> List[FactBag]:
     scheduler = relations or RelationsScheduler()
-    snapshot = DirectoryScanner(directory).scan()
+    # Relation proposals need the raw physical view so a member excluded only
+    # by the soft size filter can still be validated and recovered.  The
+    # filesystem scanner already computes the cheap relation evidence once for
+    # that shared view.
+    snapshot = DirectoryScanner(directory, include_raw_snapshot=True).scan()
     return build_candidate_fact_bags_from_snapshot(snapshot, scheduler)
 
 

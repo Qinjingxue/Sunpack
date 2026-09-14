@@ -52,10 +52,9 @@ def test_actual_archive_failure_plus_observed_gap_reports_possible_missing_and_k
         I18nContext("en"),
     )
 
-    assert warning is not None
-    assert warning.causes == (original,)
-    assert warning.details["observed_missing_indices"] == [2]
-    assert warning.details["evidence"] == "observed_volume_gap_after_archive_failure"
+    # Relation no longer manufactures a scan-time gap.  A missing-volume
+    # failure is emitted only when the extraction/backend path proves it.
+    assert warning is None
 
 
 def test_backend_possible_missing_probe_is_promoted_after_real_failure():

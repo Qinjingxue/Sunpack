@@ -79,7 +79,7 @@ def plan_watch_dispatches(
             deferred_groups.add(snapshot.group_id)
             deferred.append(DeferredWatch(candidate=candidate, group=snapshot))
             continue
-        if not snapshot.has_head or snapshot.should_wait_for_relation_gap:
+        if not snapshot.has_head:
             state.record_group_waiting(snapshot)
             waiting.append(snapshot)
             continue

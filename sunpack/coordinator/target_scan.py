@@ -57,15 +57,10 @@ def _add_unique(target: List[FactBag], seen_keys: set[str], bags: List[FactBag])
 
 def _bag_rank(bag: FactBag) -> tuple[int, int, int]:
     """Prefer the best-supported representation of one logical candidate."""
-    complete = bag.get("relation.split_group_complete")
-    if complete is True:
-        relation_strength = 3
-    elif complete is None and bag.get("relation.is_split_related"):
-        relation_strength = 2
-    elif not bag.get("relation.is_split_related"):
+    relation_strength = 2 if bag.get("relation.is_split_related") else 1
+    anchor = bag.get("relation.volume_anchor")
+    if isinstance(anchor, dict) and anchor.get("needs_password"):
         relation_strength = 1
-    else:
-        relation_strength = 0
     volumes = len(bag.get("relation.split_volumes") or [])
     members = len(bag.get("candidate.member_paths") or [])
     return relation_strength, volumes, members

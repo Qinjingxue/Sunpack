@@ -21,7 +21,7 @@ def _task(tmp_path, *, status: str, confidence: str) -> ArchiveTask:
     )
 
 
-def test_complete_mode_preflight_rejects_only_proven_missing_volume(tmp_path):
+def test_complete_mode_ignores_removed_scan_time_missing_volume_facts(tmp_path):
     task = _task(tmp_path, status="middle_gap", confidence="proven")
 
     result = PreExtractInspector(None, None, {"content_requirement": "complete"}).inspect(
@@ -29,10 +29,7 @@ def test_complete_mode_preflight_rejects_only_proven_missing_volume(tmp_path):
         str(tmp_path / "out"),
     )
 
-    assert result.skip_result is not None
-    assert result.skip_result.failure is not None
-    assert result.skip_result.failure.kind.value == "missing_volume"
-    assert result.skip_result.failure.details["missing_indices"] == [2]
+    assert result.skip_result is None
 
 
 def test_complete_mode_does_not_convict_from_strong_name_evidence_alone(tmp_path):

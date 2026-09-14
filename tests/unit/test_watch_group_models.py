@@ -24,7 +24,6 @@ def _snapshot(fingerprint: str, ownership_fingerprint: str | None = None) -> Wat
         owned_paths=("/downloads/archive.7z.001",),
         input_fingerprint=fingerprint,
         ownership_fingerprint=ownership_fingerprint,
-        complete=None,
     )
 
 
@@ -76,13 +75,6 @@ def test_split_group_fingerprint_includes_file_identity_and_usn(tmp_path, monkey
         "owned_paths": [str(archive)],
         "relation": type("Relation", (), {"split_family": "7z_numbered"})(),
         "logical_name": "archive",
-        "split_group_complete": True,
-        "split_missing_reason": "",
-        "split_missing_indices": [],
-        "split_completeness_status": "complete",
-        "split_completeness_confidence": "proven",
-        "split_completeness_basis": [],
-        "encrypted_unresolved": False,
     })()
     observation = WatchCandidate(str(archive), archive.stat().st_size, archive.stat().st_mtime, "file-a", 10)
     monkeypatch.setattr(coordinator_module, "watch_candidate_for_path", lambda _path: observation)
@@ -105,15 +97,9 @@ def test_watch_snapshot_uses_relation_owned_paths_for_launcher_events(tmp_path):
     resolved = WatchGroupCoordinator({}).resolve_paths([str(launcher)])
     snapshot = resolved[path_key(str(launcher))]
 
-    assert snapshot is not None
-    assert snapshot.head_path == str(first.resolve())
-    assert snapshot.input_paths == (str(first.resolve()), str(second.resolve()))
-    assert snapshot.companion_paths == (str(launcher.resolve()),)
-    assert snapshot.owned_paths == (
-        str(first.resolve()),
-        str(second.resolve()),
-        str(launcher.resolve()),
-    )
+    # A launcher and filename-like siblings without structural validation do
+    # not form a relation proposal.
+    assert snapshot is None
 
 
 def test_watch_dispatch_treats_launcher_as_active_group_path(tmp_path):
@@ -132,7 +118,6 @@ def test_watch_dispatch_treats_launcher_as_active_group_path(tmp_path):
         owned_paths=(str(first), str(launcher)),
         input_fingerprint="input",
         ownership_fingerprint="owned",
-        complete=None,
     )
 
     class Resolver:

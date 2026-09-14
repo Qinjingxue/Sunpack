@@ -79,7 +79,7 @@ def _split_zip_terminal_bytes(disk_number: int) -> bytes:
     )
 
 
-def test_watch_holds_orphan_non_head_until_first_volume_arrives(tmp_path):
+def test_watch_dispatches_orphan_as_ordinary_until_relation_is_validated(tmp_path):
     attempts: list[str] = []
 
     class Runner:
@@ -102,9 +102,9 @@ def test_watch_holds_orphan_non_head_until_first_volume_arrives(tmp_path):
     watcher.enqueue(str(head))
     second_result = _run_once(watcher)
 
-    assert first.processed == 0
+    assert first.succeeded == 1
     assert second_result.succeeded == 1
-    assert attempts == [str(head.resolve())]
+    assert attempts == [str(second.resolve()), str(head.resolve())]
 
 
 def test_watch_aligned_group_deadlines_dispatch_together_without_restarting_quiet(
@@ -146,16 +146,16 @@ def test_watch_aligned_group_deadlines_dispatch_together_without_restarting_quie
     # the latest pending member instead of restarting.
     clock.advance(0.97)
     first = _run_once(watcher)
-    assert first.processed == 0
-    assert watcher.pending_count == 4
+    assert first.succeeded == 2
+    assert watcher.pending_count == 2
 
     clock.advance(0.06)
     second = _run_once(watcher)
-    assert second.succeeded == 1
-    assert attempts == [str((root / "aligned.7z.001").resolve())]
+    assert second.succeeded == 2
+    assert {path for path in attempts} == {str(part.resolve()) for part in parts}
 
 
-def test_watch_conservatively_holds_old_rar_orphan_until_head_arrives(tmp_path):
+def test_watch_dispatches_old_rar_orphan_without_structural_relation(tmp_path):
     attempts: list[str] = []
 
     class Runner:
@@ -172,14 +172,14 @@ def test_watch_conservatively_holds_old_rar_orphan_until_head_arrives(tmp_path):
         path = root / name
         path.write_bytes(name.encode())
         watcher.enqueue(str(path))
-    assert _run_once(watcher).processed == 0
+    assert _run_once(watcher).succeeded == 1
 
     head = root / "old-style.rar"
     head.write_bytes(b"head")
     watcher.enqueue(str(head))
 
     assert _run_once(watcher).succeeded == 1
-    assert attempts == [str(head.resolve())]
+    assert attempts == [str((root / "old-style.r00").resolve()), str(head.resolve())]
 
 
 def test_watch_does_not_hold_plain_numeric_files_as_missing_volumes(tmp_path):
@@ -206,7 +206,7 @@ def test_watch_does_not_hold_plain_numeric_files_as_missing_volumes(tmp_path):
     assert len(attempts) == 2
 
 
-def test_watch_holds_strong_middle_gap_until_missing_volume_arrives(tmp_path):
+def test_watch_does_not_create_scan_time_gap_state(tmp_path):
     attempts: list[str] = []
 
     class Runner:
@@ -227,13 +227,9 @@ def test_watch_holds_strong_middle_gap_until_missing_volume_arrives(tmp_path):
 
     first_result = _run_once(watcher)
 
-    assert first_result.processed == 0
-    assert attempts == []
-    state = watcher.state.group_state(next(iter(watcher.state.groups)))
-    assert state is not None
-    assert "missing_volume" not in state.blockers
-    assert state.failure_payload["details"]["completeness_status"] == "middle_gap"
-    assert state.failure_payload["details"]["completeness_confidence"] == "strong"
+    assert first_result.succeeded == 1
+    assert attempts == [str(head.resolve())]
+    assert not watcher.state.groups
 
     second = root / "gap.7z.002"
     second.write_bytes(b"middle")
@@ -241,7 +237,7 @@ def test_watch_holds_strong_middle_gap_until_missing_volume_arrives(tmp_path):
 
     second_result = _run_once(watcher)
     assert second_result.succeeded == 1
-    assert attempts == [str(head.resolve())]
+    assert attempts == [str(head.resolve()), str(second.resolve())]
 
 
 def test_watch_dispatches_weak_camouflaged_gap_for_backend_classification(tmp_path):
@@ -294,7 +290,7 @@ def test_watch_does_not_infer_missing_tail_from_equal_volume_sizes(tmp_path):
     assert attempts == [str(head.resolve())]
 
 
-def test_watch_holds_modern_split_zip_until_terminal_volume_arrives(tmp_path):
+def test_watch_rechecks_a_zip_family_when_terminal_arrives(tmp_path):
     attempts: list[str] = []
 
     class Runner:
@@ -315,12 +311,9 @@ def test_watch_holds_modern_split_zip_until_terminal_volume_arrives(tmp_path):
 
     first_result = _run_once(watcher)
 
-    assert first_result.processed == 0
-    assert attempts == []
-    state = watcher.state.group_state(next(iter(watcher.state.groups)))
-    assert state is not None
-    assert state.failure_payload["details"]["completeness_status"] == "tail_missing"
-    assert state.failure_payload["details"]["completeness_confidence"] == "strong"
+    assert first_result.succeeded == 1
+    assert attempts == [str(first.resolve())]
+    assert not watcher.state.groups
 
     terminal = root / "shared.zip"
     terminal.write_bytes(_split_zip_terminal_bytes(2))
@@ -328,7 +321,7 @@ def test_watch_holds_modern_split_zip_until_terminal_volume_arrives(tmp_path):
 
     second_result = _run_once(watcher)
     assert second_result.succeeded == 1
-    assert attempts == [str(first.resolve())]
+    assert attempts == [str(first.resolve()), str(terminal.resolve())]
 
 
 def test_watch_runtime_missing_volume_retries_only_after_group_changes(tmp_path):
@@ -361,7 +354,7 @@ def test_watch_runtime_missing_volume_retries_only_after_group_changes(tmp_path)
     watcher.enqueue(str(third))
 
     assert _run_once(watcher).succeeded == 1
-    assert attempts == [str(head.resolve()), str(head.resolve())]
+    assert attempts == [str(head.resolve()), str(second.resolve()), str(third.resolve())]
 
 
 def test_watch_treats_possible_missing_partial_recovery_as_suspended(tmp_path):
@@ -391,10 +384,7 @@ def test_watch_treats_possible_missing_partial_recovery_as_suspended(tmp_path):
     watcher.enqueue(str(second))
 
     assert _run_once(watcher).failed == 1
-    group_state = watcher.state.group_state(next(iter(watcher.state.groups)))
-    assert group_state is not None
-    assert group_state.status == "suspended"
-    assert group_state.has_blocker("missing_volume")
+    assert not watcher.state.groups
 
     watcher.enqueue(str(head), force=True)
     assert _run_once(watcher).processed == 0
@@ -403,7 +393,7 @@ def test_watch_treats_possible_missing_partial_recovery_as_suspended(tmp_path):
     watcher.enqueue(str(third))
 
     assert _run_once(watcher).succeeded == 1
-    assert attempts == [str(head.resolve()), str(head.resolve())]
+    assert attempts == [str(head.resolve()), str(second.resolve()), str(third.resolve())]
 
 
 def test_watch_combined_missing_volume_and_password_requires_both_changes(tmp_path):
@@ -431,7 +421,7 @@ def test_watch_combined_missing_volume_and_password_requires_both_changes(tmp_pa
     second.write_bytes(b"part-2")
     watcher.enqueue(str(head))
     watcher.enqueue(str(second))
-    assert _run_once(watcher).failed == 1
+    assert _run_once(watcher).succeeded == 1
 
     watcher.notify_password_source_changed("test")
     assert _run_once(watcher).processed == 0
@@ -440,7 +430,7 @@ def test_watch_combined_missing_volume_and_password_requires_both_changes(tmp_pa
     watcher.enqueue(str(third))
 
     assert _run_once(watcher).succeeded == 1
-    assert len(attempts) == 2
+    assert len(attempts) == 3
 
 
 def test_watch_replaces_missing_blocker_with_password_blocker_after_retry(tmp_path):
@@ -466,16 +456,16 @@ def test_watch_replaces_missing_blocker_with_password_blocker_after_retry(tmp_pa
     second.write_bytes(b"part-2")
     watcher.enqueue(str(head))
     watcher.enqueue(str(second))
-    assert _run_once(watcher).failed == 1
+    assert _run_once(watcher).failed == 2
 
     third = root / "sample.7z.003"
     third.write_bytes(b"part-3")
     watcher.enqueue(str(third))
-    assert _run_once(watcher).failed == 1
+    assert _run_once(watcher).succeeded == 1
     watcher.notify_password_source_changed("test")
 
     assert _run_once(watcher).succeeded == 1
-    assert len(attempts) == 3
+    assert len(attempts) == 4
 
 
 def test_watch_combined_failure_waits_for_split_group_change(tmp_path):
@@ -512,7 +502,7 @@ def test_watch_combined_failure_waits_for_split_group_change(tmp_path):
     watcher.enqueue(str(third))
 
     assert _run_once(watcher).succeeded == 1
-    assert attempts == [str(head.resolve()), str(head.resolve())]
+    assert attempts == [str(head.resolve()), str(second.resolve()), str(third.resolve())]
 
 
 def test_watch_split_suspension_survives_restart(tmp_path):
@@ -546,4 +536,4 @@ def test_watch_split_suspension_survives_restart(tmp_path):
     restarted.enqueue(str(third))
 
     assert _run_once(restarted).succeeded == 1
-    assert len(attempts) == 2
+    assert len(attempts) == 3

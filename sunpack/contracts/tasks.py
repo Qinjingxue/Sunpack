@@ -349,9 +349,6 @@ class ArchiveTask:
             kind=str(source_derivation.get("kind") or ("split_archive" if self.split_info.is_split else "file")),
             is_split=bool(self.split_info.is_split),
             is_sfx=bool(self.split_info.is_sfx_stub),
-            volumes_complete=source_derivation.get("split_group_complete"),
-            missing_indices=list(source_derivation.get("split_missing_indices") or []),
-            missing_reason=str(source_derivation.get("split_missing_reason") or ""),
         )
         return ArchiveDescriptor(
             id=str(self.key or self.main_path),
@@ -411,9 +408,6 @@ class ArchiveTask:
                     "candidate_carrier_path": self.carrier_path or self.main_path,
                     "candidate_cleanup_paths": list(self.cleanup_parts or []),
                     "candidate_logical_name": self.logical_name,
-                    "split_group_complete": self.fact_bag.get("relation.split_group_complete"),
-                    "split_missing_indices": list(self.fact_bag.get("relation.split_missing_indices") or []),
-                    "split_missing_reason": str(self.fact_bag.get("relation.split_missing_reason") or ""),
                 },
             },
             "relations": {

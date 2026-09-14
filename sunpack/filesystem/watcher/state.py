@@ -23,7 +23,7 @@ from .group_models import (
 )
 
 
-STATE_VERSION = 14
+STATE_VERSION = 15
 LOADABLE_STATE_VERSIONS = {STATE_VERSION}
 DEFAULT_JOURNAL_COMPACT_RECORDS = 4096
 DEFAULT_JOURNAL_COMPACT_BYTES = 4 * 1024 * 1024
@@ -575,11 +575,9 @@ class WatchStateStore:
         """Remove state records whose recorded filesystem paths are gone.
 
         ``entries`` describe one concrete input file, so a missing entry path
-        makes the record stale.  A group can legitimately describe an
-        incomplete split archive: paths listed in ``missing_indices`` are
-        expected to be absent and are not stored as owned paths.  Therefore a
-        group is stale when one of its already-recorded physical paths is
-        definitely gone, not merely because the group is incomplete.
+        makes the record stale.  A group stores only concrete paths that were
+        validated and dispatched, so it is stale when one of its already-
+        recorded physical paths is definitely gone.
 
         Filesystem errors other than a definite missing path are treated as
         unknown and retain the record.  This keeps a transient permission or
@@ -719,14 +717,7 @@ class WatchStateStore:
                 failure_payload={
                     "kind": "relation_waiting",
                     "stage": "relation",
-                    "message": "waiting for a split volume indicated by strong relation evidence",
-                    "details": {
-                        "observed_reason": snapshot.missing_reason,
-                        "observed_indices": list(snapshot.missing_indices),
-                        "completeness_status": snapshot.completeness_status,
-                        "completeness_confidence": snapshot.completeness_confidence,
-                        "completeness_basis": list(snapshot.completeness_basis),
-                    },
+                    "message": "waiting for a dispatchable split candidate",
                 },
             )
             self._commit_operations_locked([
@@ -836,8 +827,6 @@ class WatchStateStore:
             ownership_fingerprint=snapshot.ownership_fingerprint,
             last_attempted_input_fingerprint=last_attempted_input_fingerprint,
             password_generation=password_generation,
-            missing_reason=snapshot.missing_reason,
-            missing_indices=list(snapshot.missing_indices),
             failure_payload=dict(failure_payload),
             attempt_count=(previous.attempt_count if previous else 0) + (1 if increment_attempt else 0),
             updated_at=time.time(),

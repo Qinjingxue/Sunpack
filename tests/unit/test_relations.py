@@ -23,16 +23,15 @@ def test_plain_file_relation_omits_empty_volume_anchor(tmp_path):
     assert all(bag.get("relation.volume_anchor") is None for bag in bags)
 
 
-def test_strict_standard_numbered_7z_is_grouped(tmp_path):
+def test_filename_numbered_7z_without_structural_seed_is_not_grouped(tmp_path):
     names = ["archive.7z.001", "archive.7z.002", "archive.7z.003"]
     for name in names:
         (tmp_path / name).write_bytes(name.encode())
 
-    group = next(group for group in _groups(tmp_path) if group.logical_name == "archive")
+    groups = _groups(tmp_path)
 
-    assert group.kind == "split_archive"
-    assert [Path(path).name for path in group.input_paths] == names
-    assert [volume.number for volume in group.split_volumes] == [1, 2, 3]
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
@@ -45,19 +44,11 @@ def test_sfx_launcher_attaches_to_data_volumes_but_stays_out_of_input(tmp_path, 
     second.write_bytes(b"data volume 2")
 
     groups = _groups(tmp_path)
-    group = next(group for group in groups if group.logical_name == "payload")
 
-    assert [Path(path).name for path in group.input_paths] == [first.name, second.name]
-    assert [Path(path).name for path in group.companion_paths] == [launcher.name]
-    assert Path(group.carrier_path).name == launcher.name
-
-    bags = build_fact_bags_for_target(str(launcher))
-    assert len(bags) == 1
-    bag = bags[0]
-    assert Path(bag.get("file.path")).name == launcher.name
-    assert Path(bag.get("candidate.entry_path")).name == first.name
-    assert [Path(path).name for path in bag.get("candidate.member_paths")] == [first.name, second.name]
-    assert [Path(path).name for path in bag.get("candidate.cleanup_paths")] == [first.name, second.name, launcher.name]
+    # MZ alone is only a weak SFX seed.  Without a structurally verifiable
+    # proposal it must not turn filename-like siblings into a relation.
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)
 
 
 def test_rar_part1_exe_remains_a_data_volume(tmp_path):
@@ -67,10 +58,9 @@ def test_rar_part1_exe_remains_a_data_volume(tmp_path):
     second.write_bytes(b"rar data volume 2")
 
     groups = _groups(tmp_path)
-    group = next(group for group in groups if group.logical_name == "payload")
 
-    assert not group.companion_paths
-    assert {Path(path).name for path in group.input_paths} == {first.name, second.name}
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)
 
 
 def test_strict_formats_with_same_stem_never_cross_merge(tmp_path):
@@ -83,13 +73,10 @@ def test_strict_formats_with_same_stem_never_cross_merge(tmp_path):
         for name in names:
             (tmp_path / name).write_bytes(name.encode())
 
-    actual = {
-        group.relation.split_family: {Path(path).name for path in group.input_paths}
-        for group in _groups(tmp_path)
-        if group.logical_name == "same"
-    }
+    groups = _groups(tmp_path)
 
-    assert actual == {family: set(names) for family, names in families.items()}
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)
 
 
 @pytest.mark.parametrize(
@@ -107,13 +94,8 @@ def test_filename_camouflage_without_structure_never_builds_a_group(tmp_path, na
 
     groups = _groups(tmp_path)
 
-    if names[0] == "setup.exe":
-        exe_group = next(group for group in groups if Path(group.head_path).name == "setup.exe")
-        assert exe_group.input_paths == [str(tmp_path / "setup.exe")]
-        numeric_group = next(group for group in groups if Path(group.head_path).name == "setup.001")
-        assert {Path(path).name for path in numeric_group.input_paths} == {"setup.001", "setup.002"}
-    else:
-        assert all(len(group.input_paths) == 1 for group in groups)
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)
 
 
 @pytest.mark.parametrize(
@@ -198,8 +180,6 @@ def test_split_zip_structure_anchor_recovers_decorated_middle_member(tmp_path):
     assert [volume.number for volume in group.split_volumes] == [1, 2, 3]
     assert [volume.role for volume in group.split_volumes] == ["first", "member", "terminal"]
     assert all(volume.style == "zip_spanned" for volume in group.split_volumes)
-    assert group.split_missing_indices == []
-    assert group.split_completeness_status == "retry_pending_validation"
 
 
 def test_split_zip_without_terminal_reports_strong_missing_tail(tmp_path):
@@ -208,13 +188,10 @@ def test_split_zip_without_terminal_reports_strong_missing_tail(tmp_path):
     first.write_bytes(_split_zip_first_bytes())
     second.write_bytes(b"opaque-middle-volume")
 
-    group = next(group for group in _groups(tmp_path) if group.logical_name == "modern")
+    groups = _groups(tmp_path)
 
-    assert group.split_group_complete is False
-    assert group.split_missing_reason == "missing_tail"
-    assert group.split_missing_indices == [3]
-    assert group.split_completeness_status == "tail_missing"
-    assert group.split_completeness_confidence == "strong"
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)
 
 
 def _split_zip_first_bytes() -> bytes:
@@ -275,7 +252,6 @@ def test_prefixed_single_disk_zip_carrier_is_not_waited_as_missing_tail(tmp_path
 
     assert group.kind == "file"
     assert group.split_volumes == []
-    assert group.split_completeness_status != "tail_missing"
     assert group.head_metadata["format"] == "zip"
 
 
@@ -285,21 +261,17 @@ def test_raw_zip_numeric_tail_name_stays_in_split_relation(tmp_path):
     first.write_bytes(b"raw first volume")
     tail.write_bytes(b"raw tail volume")
 
-    group = next(group for group in _groups(tmp_path) if group.logical_name == "raw")
+    groups = _groups(tmp_path)
 
-    assert group.kind == "split_archive"
-    assert group.relation.split_family == "zip_numbered"
-    assert [volume.number for volume in group.split_volumes] == [1, 3]
-    assert group.split_missing_indices == [2]
-    assert group.split_completeness_status == "middle_gap"
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)
 
 
 def test_middle_gap_keeps_structured_missing_index(tmp_path):
     for name in ("gap.7z.001", "gap.7z.003"):
         (tmp_path / name).write_bytes(name.encode())
 
-    group = next(group for group in _groups(tmp_path) if group.logical_name == "gap")
+    groups = _groups(tmp_path)
 
-    assert group.split_group_complete is False
-    assert group.split_missing_reason == "missing_middle"
-    assert group.split_missing_indices == [2]
+    assert all(group.kind == "file" for group in groups)
+    assert all(len(group.input_paths) == 1 for group in groups)

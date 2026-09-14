@@ -14,7 +14,7 @@ def test_selected_directory_and_file_inside_it_are_deduped(tmp_path):
     assert len(matching) == 1
 
 
-def test_selected_split_member_scans_parent_and_returns_group(tmp_path):
+def test_selected_split_member_without_structural_proof_stays_single_candidate(tmp_path):
     first = tmp_path / "payload.7z.001"
     second = tmp_path / "payload.7z.002"
     first.write_bytes(b"7z\xbc\xaf\x27\x1c")
@@ -23,11 +23,11 @@ def test_selected_split_member_scans_parent_and_returns_group(tmp_path):
     bags = build_fact_bags_for_targets([str(second)])
 
     assert len(bags) == 1
-    assert bags[0].get("file.path") == str(first)
-    assert str(second) in bags[0].get("file.split_members")
-    assert bags[0].get("candidate.kind") == "split_archive"
-    assert bags[0].get("candidate.entry_path") == str(first)
-    assert bags[0].get("candidate.member_paths") == [str(first), str(second)]
+    assert bags[0].get("file.path") == str(second)
+    assert bags[0].get("file.split_members") == []
+    assert bags[0].get("candidate.kind") == "file"
+    assert bags[0].get("candidate.entry_path") == str(second)
+    assert bags[0].get("candidate.member_paths") == [str(second)]
 
 
 def test_direct_file_arguments_group_explicit_zero_based_split_volumes_without_directory_scan(tmp_path):

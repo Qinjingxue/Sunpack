@@ -50,11 +50,11 @@ class DetectionBehaviorTests(unittest.TestCase):
             (root / "orphan.002").write_bytes(b"alone")
 
             groups = build_fact_bags_for_targets([str(root)], config=config_with_rules())
-            split_group = next(group for group in groups if group.get("file.logical_name") == "game")
+            split_group = next(group for group in groups if group.get("file.path") == str(first))
             orphan = next(group for group in groups if group.get("file.path", "").endswith("orphan.002"))
-            self.assertTrue(split_group.get("relation.is_split_related"))
+            self.assertFalse(split_group.get("relation.is_split_related"))
             self.assertEqual(split_group.get("candidate.entry_path"), str(first))
-            self.assertEqual(split_group.get("candidate.member_paths"), [str(first), str(second)])
+            self.assertEqual(split_group.get("candidate.member_paths"), [str(first)])
             self.assertFalse(orphan.get("relation.is_split_related"))
 
     def test_inspect_uses_target_grouping_for_directory_split_sets(self):
@@ -65,9 +65,9 @@ class DetectionBehaviorTests(unittest.TestCase):
             first.write_bytes(b"one")
             second.write_bytes(b"two")
             results = DetectionDiagnostics(config_with_rules()).collect([str(root)])
-            split_result = next(result for result in results if result.fact_bag.get("file.logical_name") == "game")
+            split_result = next(result for result in results if result.fact_bag.get("file.path") == str(first))
             self.assertEqual(split_result.path, str(first))
-            self.assertEqual(split_result.fact_bag.get("file.split_members"), [str(second)])
+            self.assertEqual(split_result.fact_bag.get("file.split_members"), [])
 
     def test_unresolved_extensionless_file_gets_reliable_full_embedded_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
