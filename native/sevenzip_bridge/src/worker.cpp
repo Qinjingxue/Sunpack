@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -29,6 +30,7 @@
 #include "internal/sevenzip_status.hpp"
 #include "internal/archive_operations.hpp"
 #include "internal/sevenzip_formats.hpp"
+#include "internal/sevenzip_sdk.hpp"
 #include "internal/native_runtime_control.hpp"
 #include "internal/native_worker_sizing.hpp"
 #ifdef _WIN32
@@ -1021,7 +1023,7 @@ int run_request(
 std::size_t configured_native_queue_capacity() noexcept {
     const char* value = std::getenv("SUNPACK_NATIVE_MAX_QUEUE_JOBS");
     if (!value || !*value) {
-        return 0;
+        return 4096;
     }
     char* end = nullptr;
     const unsigned long long configured = std::strtoull(value, &end, 10);
@@ -1262,6 +1264,8 @@ public:
                 promise->set_value(-100);
                 return future;
             }
+            idle_trimmed_ = false;
+            idle_since_ = {};
             if (memory_budget_ != 0 && metadata.memory_reserve > memory_budget_) {
                 any_job_failed_ = true;
                 promise->set_value(-1);
@@ -1835,6 +1839,7 @@ private:
 
     void controller_loop() noexcept {
         constexpr unsigned minimum_sample_interval_ms = 100;
+        constexpr auto deep_idle_trim_timeout = std::chrono::seconds(60);
         // Upper bound on a parked sleep: a facility can appear from a worker thread that never touches this condition variable.
         constexpr auto parked_wait_cap = std::chrono::milliseconds(1000);
         unsigned next_interval_ms = native_sample_interval_ms();
@@ -1889,6 +1894,30 @@ private:
 
             if (monitor_parked) {
                 if (queue_.empty() && active_jobs_ == 0) {
+                    if (idle_since_ == std::chrono::steady_clock::time_point{}) {
+                        idle_since_ = now;
+                    }
+                    const bool deep_trim_due =
+                        !idle_trimmed_ && now - idle_since_ >= deep_idle_trim_timeout;
+                    if (!deep_trim_due) {
+                        continue;
+                    }
+
+                    // The snapshot is intentionally only taken at the deep-trim boundary;
+                    // the parked controller keeps the normal one-second wake-up cheap.
+                    wait_lock.unlock();
+                    const auto metrics = writer_registry_->snapshot();
+                    const bool writer_idle =
+                        metrics.meters.pending_bytes == 0 && !metrics.any_active_jobs;
+                    wait_lock.lock();
+                    if (stopping_) {
+                        break;
+                    }
+                    if (monitor_parked && !idle_trimmed_ && queue_.empty() &&
+                        active_jobs_ == 0 && active_memory_ == 0 && writer_idle)
+                    {
+                        trim_idle_resources();
+                    }
                     continue;
                 }
                 sunpack::sevenzip::NativeThroughputCounters counters;
@@ -1974,6 +2003,7 @@ private:
                     controller_recheck_ = false;
                     monitor_parked = true;
                     idle_since = now;
+                    idle_since_ = now;
                     parked = true;
                 }
             }
@@ -2129,6 +2159,20 @@ private:
 #endif
     }
 
+    // Called by controller_loop with mutex_ held. A submission cannot race this
+    // operation, so unloading the 7z module is safe once the invariants hold.
+    void trim_idle_resources() noexcept {
+        assert(queue_.empty());
+        assert(cancel_tokens_.empty());
+        assert(active_jobs_ == 0);
+        assert(active_memory_ == 0);
+        std::deque<Job>().swap(queue_);
+        std::unordered_map<std::string, std::shared_ptr<JobControl>>().swap(cancel_tokens_);
+        writer_registry_->trim_idle_states();
+        sunpack::sevenzip::release_cached_create_object();
+        idle_trimmed_ = true;
+    }
+
     std::vector<std::thread> workers_;
     std::thread controller_thread_;
     // Declaration order is destruction order reversed: meters, sink and config outlive writer_registry_, and space_monitor_ holds writer_registry_ and is destroyed before it.
@@ -2152,6 +2196,8 @@ private:
     std::size_t active_jobs_ = 0;
     std::size_t active_memory_ = 0;
     bool controller_recheck_ = false;
+    std::chrono::steady_clock::time_point idle_since_{};
+    bool idle_trimmed_ = false;
     bool any_job_failed_ = false;
     bool stopping_ = false;
 #ifdef _WIN32

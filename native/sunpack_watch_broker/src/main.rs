@@ -48,7 +48,8 @@ const MAX_CONNECTED_CLIENTS: u32 = 64;
 const CLIENT_CONNECT_TIMEOUT_MS: u32 = 5_000;
 const LAST_CLIENT_DEBOUNCE: Duration = Duration::from_secs(1);
 const MAX_VOLUME_CONTEXTS: usize = 64;
-const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(60);
+const BROKER_IDLE_SWEEP: Duration = Duration::from_secs(60);
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
 static CONFIG: OnceLock<BrokerConfig> = OnceLock::new();
 
@@ -271,12 +272,17 @@ fn serve_client(
     loop {
         let mut request_bytes = [0u8; REQUEST_BYTES];
         let read_timeout = if lease.active {
-            INFINITE
+            BROKER_IDLE_SWEEP.as_millis() as u32
         } else {
             CLIENT_CONNECT_TIMEOUT_MS
         };
         match read_overlapped(pipe.raw(), stop_event, &mut request_bytes, read_timeout)? {
-            IoResult::Stopped | IoResult::Disconnected | IoResult::TimedOut => break,
+            IoResult::Stopped | IoResult::Disconnected => break,
+            IoResult::TimedOut if lease.active => {
+                journals.reap_idle()?;
+                continue;
+            }
+            IoResult::TimedOut => break,
             IoResult::Completed(size) if size == REQUEST_BYTES => {}
             IoResult::Completed(_) => {
                 let response = Response {
@@ -406,6 +412,23 @@ type SharedJournalReader = Arc<Mutex<JournalReader>>;
 type VolumeTable = HashMap<String, (SharedJournalReader, Instant)>;
 
 impl JournalDispatcher {
+    fn reap_idle(&self) -> io::Result<()> {
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| io::Error::other("volume table poisoned"))?;
+        Self::reap_idle_locked(&mut entries, now);
+        Ok(())
+    }
+
+    fn reap_idle_locked(entries: &mut VolumeTable, now: Instant) {
+        entries.retain(|_, (reader, last_used)| {
+            Arc::strong_count(reader) > 1
+                || now.saturating_duration_since(*last_used) < VOLUME_CONTEXT_IDLE_TTL
+        });
+    }
+
     fn reader_for(&self, volume_guid: &str) -> io::Result<Arc<Mutex<JournalReader>>> {
         validate_volume_guid(volume_guid)?;
         let key = volume_guid.to_ascii_lowercase();
@@ -414,10 +437,7 @@ impl JournalDispatcher {
             .entries
             .lock()
             .map_err(|_| io::Error::other("volume table poisoned"))?;
-        entries.retain(|_, (reader, last_used)| {
-            Arc::strong_count(reader) > 1
-                || now.saturating_duration_since(*last_used) < VOLUME_CONTEXT_IDLE_TTL
-        });
+        Self::reap_idle_locked(&mut entries, now);
         if let Some((reader, last_used)) = entries.get_mut(&key) {
             *last_used = now;
             return Ok(Arc::clone(reader));
@@ -880,5 +900,23 @@ mod tests {
             .unwrap();
         assert!(Arc::ptr_eq(&first, &same));
         assert!(!Arc::ptr_eq(&first, &other));
+    }
+
+    #[test]
+    fn dispatcher_reaps_idle_volume_without_a_new_request() {
+        let dispatcher = JournalDispatcher::default();
+        let reader = dispatcher
+            .reader_for(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}")
+            .unwrap();
+        drop(reader);
+        {
+            let mut entries = dispatcher.entries.lock().unwrap();
+            let (_, last_used) = entries
+                .get_mut(r"\\?\volume{01234567-89ab-cdef-0123-456789abcdef}")
+                .unwrap();
+            *last_used = Instant::now() - VOLUME_CONTEXT_IDLE_TTL - Duration::from_secs(1);
+        }
+        dispatcher.reap_idle().unwrap();
+        assert!(dispatcher.entries.lock().unwrap().is_empty());
     }
 }

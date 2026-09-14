@@ -7,6 +7,7 @@ import subprocess
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import Future
 from contextlib import nullcontext
 from typing import Any, Callable
@@ -253,7 +254,7 @@ class _NativeWorkerProcess:
         self.process: subprocess.Popen | None = None
         self.worker_epoch = ""
         self.stderr_queue: queue.Queue[str | None] = queue.Queue()
-        self._controller_events: list[dict[str, Any]] = []
+        self._controller_events: deque[dict[str, Any]] = deque(maxlen=4096)
         self._job_states: dict[str, dict[str, Any]] = {}
         self._async_jobs: dict[str, dict[str, Any]] = {}
         self._dispatch_lock = threading.Lock()

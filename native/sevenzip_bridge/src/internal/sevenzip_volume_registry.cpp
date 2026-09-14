@@ -270,6 +270,27 @@ namespace sunpack::sevenzip
         return reclaimed;
     }
 
+    void VolumeWriterRegistry::trim_idle_states()
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = entries_.begin(); it != entries_.end();)
+        {
+            const Entry &entry = it->second;
+            if (entry.leases == 0 && !entry.writer)
+            {
+                it = entries_.erase(it);
+            }
+            else
+            {
+                ++it;
+            }
+        }
+        if (entries_.empty())
+        {
+            entries_.rehash(0);
+        }
+    }
+
     std::optional<std::chrono::steady_clock::time_point> VolumeWriterRegistry::next_reap_deadline() const
     {
         std::lock_guard<std::mutex> lock(mutex_);

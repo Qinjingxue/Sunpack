@@ -97,6 +97,8 @@ namespace sunpack::sevenzip
 
         std::vector<std::string> reap_idle();
 
+        void trim_idle_states();
+
         std::optional<std::chrono::steady_clock::time_point> next_reap_deadline() const;
 
         std::size_t reclaimed_count() const noexcept;

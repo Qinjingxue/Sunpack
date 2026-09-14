@@ -277,6 +277,11 @@ namespace sunpack::sevenzip
             file->space_gate = state_ ? state_->space_gate : nullptr;
             active_files_.push_back(file);
             ++inflight_file_count_;
+            if (active_files_.size() >= 1024 &&
+                active_files_.size() > inflight_file_count_ * 2 + 256)
+            {
+                prune_expired_files_locked();
+            }
             return file;
         }
 
@@ -571,6 +576,7 @@ namespace sunpack::sevenzip
                               { return job->pending_jobs == 0; });
             const HRESULT result = terminal_result_locked(job);
             unregister_job_locked(job);
+            prune_expired_files_locked();
             if (result == S_OK)
             {
                 meters_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
@@ -769,6 +775,21 @@ namespace sunpack::sevenzip
         }
 
     private:
+        void prune_expired_files_locked() noexcept
+        {
+            for (auto it = active_files_.begin(); it != active_files_.end();)
+            {
+                if (it->expired())
+                {
+                    it = active_files_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
+        }
+
         void initialize()
         {
             buffers_.reserve(buffer_count_);
