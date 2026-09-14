@@ -1264,8 +1264,6 @@ public:
                 promise->set_value(-100);
                 return future;
             }
-            idle_trimmed_ = false;
-            idle_since_ = {};
             if (memory_budget_ != 0 && metadata.memory_reserve > memory_budget_) {
                 any_job_failed_ = true;
                 promise->set_value(-1);
@@ -1288,6 +1286,8 @@ public:
                 print_worker_event(job_id, "job_finished", metadata);
                 return future;
             }
+            idle_trimmed_ = false;
+            idle_since_ = {};
             if (!job_id.empty()) {
                 cancel_tokens_[job_id] = std::make_shared<JobControl>(cancel_token, nullptr);
             }

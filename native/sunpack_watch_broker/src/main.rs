@@ -150,7 +150,13 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
     let mut first_instance = true;
     let mut idle_since = None;
     let mut pending_accept: Option<PendingPipeAccept> = None;
+    let mut next_journal_sweep = Instant::now() + BROKER_IDLE_SWEEP;
     loop {
+        let now = Instant::now();
+        if now >= next_journal_sweep {
+            journals.reap_idle()?;
+            next_journal_sweep = now + BROKER_IDLE_SWEEP;
+        }
         workers.retain(|worker: &thread::JoinHandle<()>| !worker.is_finished());
         let leases = active_leases.load(Ordering::Acquire);
         let clients = connected_clients.load(Ordering::Acquire);
@@ -207,7 +213,11 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
         } else {
             Some(started + Duration::from_millis(CLIENT_CONNECT_TIMEOUT_MS as u64))
         };
-        let timeout_ms = deadline_timeout_ms(idle_deadline);
+        let wake_deadline = match idle_deadline {
+            Some(deadline) => Some(std::cmp::min(deadline, next_journal_sweep)),
+            None => Some(next_journal_sweep),
+        };
+        let timeout_ms = deadline_timeout_ms(wake_deadline);
         let wait = if let Some(accept) = pending_accept.as_ref() {
             let handles = [stop_event, accept.event(), state_changed.raw()];
             unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout_ms) }
@@ -272,17 +282,12 @@ fn serve_client(
     loop {
         let mut request_bytes = [0u8; REQUEST_BYTES];
         let read_timeout = if lease.active {
-            BROKER_IDLE_SWEEP.as_millis() as u32
+            INFINITE
         } else {
             CLIENT_CONNECT_TIMEOUT_MS
         };
         match read_overlapped(pipe.raw(), stop_event, &mut request_bytes, read_timeout)? {
-            IoResult::Stopped | IoResult::Disconnected => break,
-            IoResult::TimedOut if lease.active => {
-                journals.reap_idle()?;
-                continue;
-            }
-            IoResult::TimedOut => break,
+            IoResult::Stopped | IoResult::Disconnected | IoResult::TimedOut => break,
             IoResult::Completed(size) if size == REQUEST_BYTES => {}
             IoResult::Completed(_) => {
                 let response = Response {

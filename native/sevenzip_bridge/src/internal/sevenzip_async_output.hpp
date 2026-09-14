@@ -777,17 +777,12 @@ namespace sunpack::sevenzip
     private:
         void prune_expired_files_locked() noexcept
         {
-            for (auto it = active_files_.begin(); it != active_files_.end();)
-            {
-                if (it->expired())
-                {
-                    it = active_files_.erase(it);
-                }
-                else
-                {
-                    ++it;
-                }
-            }
+            active_files_.erase(
+                std::remove_if(
+                    active_files_.begin(),
+                    active_files_.end(),
+                    [](const auto &file) { return file.expired(); }),
+                active_files_.end());
         }
 
         void initialize()
