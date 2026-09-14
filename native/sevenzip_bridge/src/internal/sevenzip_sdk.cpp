@@ -13,24 +13,6 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-    namespace
-    {
-
-        struct CreateObjectCache
-        {
-            std::mutex mutex;
-            std::wstring path;
-            std::unique_ptr<ComModule> module;
-        };
-
-        CreateObjectCache &create_object_cache()
-        {
-            static CreateObjectCache cache;
-            return cache;
-        }
-
-    } // namespace
-
     const GUID IID_ISequentialInStream = {
 
         0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00}};
@@ -106,26 +88,23 @@ namespace sunpack::sevenzip
     CreateObjectFunc cached_create_object(const std::wstring &seven_zip_dll_path)
     {
 
-        auto &cache = create_object_cache();
-        std::lock_guard<std::mutex> lock(cache.mutex);
+        static std::mutex mutex;
 
-        if (!cache.module || cache.path != seven_zip_dll_path)
+        static std::wstring cached_path;
+
+        static std::unique_ptr<ComModule> cached_module;
+
+        std::lock_guard<std::mutex> lock(mutex);
+
+        if (!cached_module || cached_path != seven_zip_dll_path)
         {
 
-            cache.module = std::make_unique<ComModule>(seven_zip_dll_path);
+            cached_module = std::make_unique<ComModule>(seven_zip_dll_path);
 
-            cache.path = seven_zip_dll_path;
+            cached_path = seven_zip_dll_path;
         }
 
-        return cache.module ? cache.module->create_object() : nullptr;
-    }
-
-    void release_cached_create_object() noexcept
-    {
-        auto &cache = create_object_cache();
-        std::lock_guard<std::mutex> lock(cache.mutex);
-        cache.module.reset();
-        cache.path.clear();
+        return cached_module ? cached_module->create_object() : nullptr;
     }
 
 #endif

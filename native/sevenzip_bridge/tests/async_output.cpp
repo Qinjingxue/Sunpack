@@ -509,12 +509,7 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         std::cerr << "reclaimed facility is still counted as live\n";
         return false;
     }
-    registry.trim_idle_states();
-    if (!registry.empty()) {
-        std::cerr << "idle persistent volume state survived deep trim\n";
-        return false;
-    }
-    // The facility can be rebuilt for the same volume afterwards.
+    // The facility can be rebuilt for the same volume while its persistent state is retained.
     {
         auto lease = registry.acquire("volume-p");
         if (!lease.valid() || !lease.writer().is_quiescent()) {

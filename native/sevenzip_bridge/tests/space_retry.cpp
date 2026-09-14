@@ -476,7 +476,8 @@ void r13_abort_then_finish(const std::filesystem::path &directory) {
     std::uint32_t processed = 0;
     writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed);
     check(wait_until([&] { return gate->blocked(); }, 5s), "R-13: 必须进入暂停");
-    check(!registry->blocked_volumes().empty(), "R-13: blocked_volumes() 必须包含该卷");
+    check(!registry->blocked_volumes(false).empty(), "R-13: 关停快照必须包含该卷");
+    check(registry->blocked_volumes().empty(), "R-13: 无 affected job 的卷不应驱动空间采样");
 
     // abort 只是 wake_waiters() 的广播：不改变任何 gate 状态。
     const auto before = gate->episode_id();

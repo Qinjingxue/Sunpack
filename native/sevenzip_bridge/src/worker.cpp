@@ -6,7 +6,6 @@
 
 #include <algorithm>
 #include <atomic>
-#include <cassert>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
@@ -20,6 +19,7 @@
 #include <mutex>
 #include <deque>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -1286,8 +1286,6 @@ public:
                 print_worker_event(job_id, "job_finished", metadata);
                 return future;
             }
-            idle_trimmed_ = false;
-            idle_since_ = {};
             if (!job_id.empty()) {
                 cancel_tokens_[job_id] = std::make_shared<JobControl>(cancel_token, nullptr);
             }
@@ -1839,9 +1837,6 @@ private:
 
     void controller_loop() noexcept {
         constexpr unsigned minimum_sample_interval_ms = 100;
-        constexpr auto deep_idle_trim_timeout = std::chrono::seconds(60);
-        // Upper bound on a parked sleep: a facility can appear from a worker thread that never touches this condition variable.
-        constexpr auto parked_wait_cap = std::chrono::milliseconds(1000);
         unsigned next_interval_ms = native_sample_interval_ms();
         auto last_sample_at = std::chrono::steady_clock::now();
         auto idle_since = last_sample_at;
@@ -1849,27 +1844,35 @@ private:
         while (true) {
             std::unique_lock<std::mutex> wait_lock(mutex_);
             if (monitor_parked) {
-                auto parked_wait = parked_wait_cap;
 #ifdef _WIN32
-                // Uses sampling() rather than an "ever blocked" sticky flag: membership is re-pulled from the registry every tick, so a flag could leave a still-blocked volume unpolled.
+                std::optional<std::chrono::steady_clock::time_point> parked_deadline;
+                const auto deadline_now = std::chrono::steady_clock::now();
+                // Normal idle has no timeout.  Sampling is armed only for the
+                // full-disk recovery path, and writer reaping has an exact deadline.
                 if (space_monitor_->sampling() &&
                     writer_config_.space_poll_interval > std::chrono::milliseconds::zero()) {
-                    parked_wait = (std::min)(parked_wait, writer_config_.space_poll_interval);
+                    parked_deadline = deadline_now + writer_config_.space_poll_interval;
                 }
                 if (const auto deadline = writer_registry_->next_reap_deadline()) {
-                    const auto now = std::chrono::steady_clock::now();
-                    parked_wait = (std::min)(
-                        parked_wait,
-                        *deadline > now
-                            ? std::chrono::duration_cast<std::chrono::milliseconds>(*deadline - now) +
-                                std::chrono::milliseconds(1)
-                            : std::chrono::milliseconds(1));
+                    if (!parked_deadline || *deadline < *parked_deadline) {
+                        parked_deadline = *deadline;
+                    }
                 }
-#endif
-                controller_condition_.wait_for(
+                if (parked_deadline) {
+                    controller_condition_.wait_until(
+                        wait_lock,
+                        *parked_deadline,
+                        [this] { return stopping_ || controller_recheck_; });
+                } else {
+                    controller_condition_.wait(
+                        wait_lock,
+                        [this] { return stopping_ || controller_recheck_; });
+                }
+#else
+                controller_condition_.wait(
                     wait_lock,
-                    parked_wait,
                     [this] { return stopping_ || controller_recheck_; });
+#endif
             } else {
                 controller_condition_.wait_for(
                     wait_lock,
@@ -1892,34 +1895,10 @@ private:
 #endif
             wait_lock.lock();
 
+            if (monitor_parked && queue_.empty() && active_jobs_ == 0) {
+                continue;
+            }
             if (monitor_parked) {
-                if (queue_.empty() && active_jobs_ == 0) {
-                    if (idle_since_ == std::chrono::steady_clock::time_point{}) {
-                        idle_since_ = now;
-                    }
-                    const bool deep_trim_due =
-                        !idle_trimmed_ && now - idle_since_ >= deep_idle_trim_timeout;
-                    if (!deep_trim_due) {
-                        continue;
-                    }
-
-                    // The snapshot is intentionally only taken at the deep-trim boundary;
-                    // the parked controller keeps the normal one-second wake-up cheap.
-                    wait_lock.unlock();
-                    const auto metrics = writer_registry_->snapshot();
-                    const bool writer_idle =
-                        metrics.meters.pending_bytes == 0 && !metrics.any_active_jobs;
-                    wait_lock.lock();
-                    if (stopping_) {
-                        break;
-                    }
-                    if (monitor_parked && !idle_trimmed_ && queue_.empty() &&
-                        active_jobs_ == 0 && active_memory_ == 0 && writer_idle)
-                    {
-                        trim_idle_resources();
-                    }
-                    continue;
-                }
                 sunpack::sevenzip::NativeThroughputCounters counters;
                 std::uint64_t discarded_write_bytes = 0;
                 bool writer_idle = true;
@@ -2003,7 +1982,6 @@ private:
                     controller_recheck_ = false;
                     monitor_parked = true;
                     idle_since = now;
-                    idle_since_ = now;
                     parked = true;
                 }
             }
@@ -2159,20 +2137,6 @@ private:
 #endif
     }
 
-    // Called by controller_loop with mutex_ held. A submission cannot race this
-    // operation, so unloading the 7z module is safe once the invariants hold.
-    void trim_idle_resources() noexcept {
-        assert(queue_.empty());
-        assert(cancel_tokens_.empty());
-        assert(active_jobs_ == 0);
-        assert(active_memory_ == 0);
-        std::deque<Job>().swap(queue_);
-        std::unordered_map<std::string, std::shared_ptr<JobControl>>().swap(cancel_tokens_);
-        writer_registry_->trim_idle_states();
-        sunpack::sevenzip::release_cached_create_object();
-        idle_trimmed_ = true;
-    }
-
     std::vector<std::thread> workers_;
     std::thread controller_thread_;
     // Declaration order is destruction order reversed: meters, sink and config outlive writer_registry_, and space_monitor_ holds writer_registry_ and is destroyed before it.
@@ -2196,8 +2160,6 @@ private:
     std::size_t active_jobs_ = 0;
     std::size_t active_memory_ = 0;
     bool controller_recheck_ = false;
-    std::chrono::steady_clock::time_point idle_since_{};
-    bool idle_trimmed_ = false;
     bool any_job_failed_ = false;
     bool stopping_ = false;
 #ifdef _WIN32

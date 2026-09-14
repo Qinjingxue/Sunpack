@@ -17,7 +17,7 @@
 
 namespace sunpack::sevenzip
 {
-    // 纯采样器：每次 tick 直接从 registry 拉 blocked volumes，不维护自己的 membership，
+    // 纯采样器：每次 tick 直接从 registry 拉仍有 affected job 的 blocked volumes，不维护自己的 membership，
     // 不缓存、不 re-arm；全部水位规则在 gate.poll() 里（monitor 不做任何比较）。
     //
     // tick() 必须由 controller_loop 在 executor mutex_ 之外调用：它会取 registry mutex_ 并
@@ -131,7 +131,7 @@ namespace sunpack::sevenzip
         }
 
         // 采样是否处于"活跃"状态：note_blocked() 置位，一次拉取返回空则清零。
-        // 用途只有 tick() 的常态早退与缩短 parked controller 的睡眠上限。
+        // 用途只有 tick() 的常态早退与为 parked controller 提供异常路径 deadline。
         bool sampling() const noexcept { return sampling_.load(std::memory_order_relaxed); }
 
         // 由 ChangeSink 在收到 space_blocked transition 时调用（开始采样的唯一驱动点）。

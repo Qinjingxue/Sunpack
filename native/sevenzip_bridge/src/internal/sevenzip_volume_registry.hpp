@@ -97,14 +97,13 @@ namespace sunpack::sevenzip
 
         std::vector<std::string> reap_idle();
 
-        void trim_idle_states();
-
         std::optional<std::chrono::steady_clock::time_point> next_reap_deadline() const;
 
         std::size_t reclaimed_count() const noexcept;
 
-        // 当前处于 Blocked / Probing 的卷；锁内只拷贝 shared_ptr，锁外返回。
-        std::vector<VolumeStatePtr> blocked_volumes() const;
+        // 默认只返回仍有 affected job 的 Blocked / Probing 卷，供空间监控采样。
+        // 关停路径可传 false，以便唤醒没有 job id 的 gate waiter。
+        std::vector<VolumeStatePtr> blocked_volumes(bool require_affected_jobs = true) const;
 
         // 关停用：唤醒所有等待者，不改变任何 gate 状态。
         void abort_all_space_gates() noexcept;

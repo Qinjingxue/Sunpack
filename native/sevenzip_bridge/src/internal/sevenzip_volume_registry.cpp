@@ -270,27 +270,6 @@ namespace sunpack::sevenzip
         return reclaimed;
     }
 
-    void VolumeWriterRegistry::trim_idle_states()
-    {
-        std::lock_guard<std::mutex> lock(mutex_);
-        for (auto it = entries_.begin(); it != entries_.end();)
-        {
-            const Entry &entry = it->second;
-            if (entry.leases == 0 && !entry.writer)
-            {
-                it = entries_.erase(it);
-            }
-            else
-            {
-                ++it;
-            }
-        }
-        if (entries_.empty())
-        {
-            entries_.rehash(0);
-        }
-    }
-
     std::optional<std::chrono::steady_clock::time_point> VolumeWriterRegistry::next_reap_deadline() const
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -335,7 +314,7 @@ namespace sunpack::sevenzip
         return keys;
     }
 
-    std::vector<VolumeStatePtr> VolumeWriterRegistry::blocked_volumes() const
+    std::vector<VolumeStatePtr> VolumeWriterRegistry::blocked_volumes(bool require_affected_jobs) const
     {
         std::vector<VolumeStatePtr> blocked;
         {
@@ -355,8 +334,12 @@ namespace sunpack::sevenzip
         // 锁外过滤，锁序 registry -> gate。
         blocked.erase(
             std::remove_if(blocked.begin(), blocked.end(),
-                           [](const VolumeStatePtr &state)
-                           { return !state->space_gate->blocked(); }),
+                           [require_affected_jobs](const VolumeStatePtr &state)
+                           {
+                               return !state->space_gate->blocked() ||
+                                      (require_affected_jobs &&
+                                       !state->space_gate->has_affected_jobs());
+                           }),
             blocked.end());
         return blocked;
     }
@@ -364,7 +347,7 @@ namespace sunpack::sevenzip
     void VolumeWriterRegistry::abort_all_space_gates() noexcept
     {
         // 关停路径：只唤醒被 blocked 的 gate，不改变任何 gate 状态。
-        for (const auto &state : blocked_volumes())
+        for (const auto &state : blocked_volumes(false))
         {
             state->space_gate->wake_waiters();
         }

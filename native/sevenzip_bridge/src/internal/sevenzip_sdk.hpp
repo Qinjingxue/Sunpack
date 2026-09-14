@@ -261,8 +261,6 @@ namespace sunpack::sevenzip
 
     CreateObjectFunc cached_create_object(const std::wstring &seven_zip_dll_path);
 
-    void release_cached_create_object() noexcept;
-
 #endif
 
 } // namespace sunpack::sevenzip

@@ -348,6 +348,7 @@ namespace sunpack::sevenzip
         std::uint64_t episode_id() const noexcept;
         bool watermark_valid() const noexcept;
         std::vector<std::string> affected_job_ids() const;
+        bool has_affected_jobs() const noexcept;
         std::size_t waiter_count() const noexcept;
         // wait() 被调用的累计次数（只读），供测试证明正常写路径从不进入 gate。
         std::uint64_t wait_call_count() const noexcept;
@@ -833,6 +834,12 @@ namespace sunpack::sevenzip
     {
         std::lock_guard<std::mutex> lock(mutex_);
         return affected_jobs_;
+    }
+
+    inline bool VolumeSpaceGate::has_affected_jobs() const noexcept
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return !affected_jobs_.empty();
     }
 
     inline std::size_t VolumeSpaceGate::waiter_count() const noexcept
