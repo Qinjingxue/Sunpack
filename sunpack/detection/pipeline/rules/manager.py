@@ -7,6 +7,7 @@ from sunpack.detection.pipeline.rules.config_validator import RuleConfigValidato
 from sunpack.detection.pipeline.rules.rule_preparer import RulePreparer
 from sunpack.detection.pipeline.rules.types import PreparedRule
 from sunpack.detection.pipeline.rules.fact_requirements import FactRequirement
+from sunpack.support.path_keys import path_key
 
 
 _PrecheckPlan = tuple[
@@ -17,7 +18,17 @@ _PrecheckPlan = tuple[
     frozenset[str],
     frozenset[str],
     bool,
+    int,
 ]
+
+
+_FORMAT_REJECT_BITS_BY_RULE = {
+    "zip_structure_accept": 1 << 0,
+    "rar_structure_accept": 1 << 1,
+    "seven_zip_structure_accept": 1 << 2,
+    "tar_structure_accept": 1 << 3,
+    "compression_stream_accept": 1 << 4,
+}
 
 
 class RuleManager:
@@ -123,6 +134,7 @@ class RuleManager:
                 frozenset(getattr(rule.instance, "routing_formats", set()) or set()),
                 frozenset(getattr(rule.instance, "routing_extensions", set()) or set()),
                 bool(getattr(rule.instance, "can_be_promoted", False)),
+                _FORMAT_REJECT_BITS_BY_RULE.get(rule.name, 0),
             ))
         return plan
 
@@ -135,7 +147,7 @@ class RuleManager:
         promoted: list[_PrecheckPlan] = []
         remaining: list[_PrecheckPlan] = []
         for plan in plans:
-            _, _, _, _, rule_formats, rule_extensions, can_be_promoted = plan
+            _, _, _, _, rule_formats, rule_extensions, can_be_promoted, _ = plan
             matches = bool(rule_formats & formats or rule_extensions & extensions)
             if can_be_promoted and matches:
                 promoted.append(plan)
@@ -143,13 +155,47 @@ class RuleManager:
                 remaining.append(plan)
         return promoted + remaining
 
-    def _run_precheck(self, fact_bags: List[FactBag]) -> tuple[Dict[FactBag, RuleDecision], List[FactBag]]:
+    @staticmethod
+    def _single_file_format_reject_mask(bag: FactBag) -> int:
+        """Return the native reject mask only for a proven single input.
+
+        Relation anchors also exist for split and carrier candidates, but their
+        head bytes are not sufficient to reject a logical multi-file input.
+        Keep the same fail-open boundary as the former negative-fact prefill.
+        """
+        if (
+            bag.get("relation.is_split_related")
+            or bag.get("relation.is_split_exe_companion")
+            or bag.get("relation.split_volumes")
+        ):
+            return 0
+        file_path = bag.get("file.path")
+        member_paths = bag.get("candidate.member_paths")
+        if not isinstance(file_path, str) or not file_path:
+            return 0
+        if not isinstance(member_paths, (list, tuple)) or len(member_paths) != 1:
+            return 0
+        member_path = member_paths[0]
+        if not isinstance(member_path, str) or not member_path:
+            return 0
+        if path_key(member_path) != path_key(file_path):
+            return 0
+        mask = bag.get("candidate.format_reject_mask")
+        return mask & 0x1F if isinstance(mask, int) else 0
+
+    def _run_precheck(
+        self,
+        fact_bags: List[FactBag],
+        *,
+        accepted_only: bool = False,
+    ) -> tuple[Dict[FactBag, RuleDecision], List[FactBag]]:
         decisions: Dict[FactBag, RuleDecision] = {}
         surviving: List[FactBag] = []
         configured_rules = self._prepare_rules("precheck")
         precheck_plan = self._prepare_precheck_plan(configured_rules)
         for bag in fact_bags:
             terminal = False
+            reject_mask = self._single_file_format_reject_mask(bag)
             for (
                 rule,
                 requirements,
@@ -158,7 +204,13 @@ class RuleManager:
                 _,
                 _,
                 _,
+                reject_bit,
             ) in self._ordered_precheck_plans(bag, precheck_plan):
+                if reject_bit and reject_mask & reject_bit and all(
+                    not bag.has(requirement.fact_name)
+                    for requirement in requirements
+                ):
+                    continue
                 pending_prerequisite_facts = {
                     fact_name
                     for fact_name in prerequisite_facts
@@ -187,15 +239,16 @@ class RuleManager:
                 effect = self._evaluate_precheck_rule(bag, rule)
                 if effect.decision in {"reject", "accept"}:
                     accepted = effect.decision == "accept"
-                    decisions[bag] = RuleDecision(
-                        should_extract=accepted,
-                        matched_rules=[rule.name],
-                        stop_reason=effect.reason,
-                        decision="archive" if accepted else "not_archive",
-                        decision_stage="precheck",
-                        discarded_at=None if accepted else "precheck",
-                        deciding_rule=rule.name,
-                    )
+                    if accepted or not accepted_only:
+                        decisions[bag] = RuleDecision(
+                            should_extract=accepted,
+                            matched_rules=[rule.name],
+                            stop_reason=effect.reason,
+                            decision="archive" if accepted else "not_archive",
+                            decision_stage="precheck",
+                            discarded_at=None if accepted else "precheck",
+                            deciding_rule=rule.name,
+                        )
                     terminal = True
                     break
                 if effect.decision != "pass":
@@ -253,3 +306,8 @@ class RuleManager:
     ) -> tuple[Dict[FactBag, RuleDecision], List[FactBag]]:
         """Run only terminal precheck rules and return surviving candidates."""
         return self._run_precheck(fact_bags)
+
+    def evaluate_extractable_pool(self, fact_bags: List[FactBag]) -> Dict[FactBag, RuleDecision]:
+        """Return only accepted decisions for the task-producing scan path."""
+        decisions, _ = self._run_precheck(fact_bags, accepted_only=True)
+        return decisions

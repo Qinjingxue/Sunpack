@@ -12,30 +12,6 @@ from sunpack.contracts.detection import FactBag
 from sunpack.contracts.rules import RuleDecision
 from sunpack.detection.deep_scan import evaluate_deep_bag
 from sunpack.detection.options import DetectionOptions
-from sunpack.support.path_keys import path_key
-
-
-_FORMAT_NEGATIVE_FACTS = {
-    1 << 0: ("zip.eocd_structure", "zip_eocd_structure"),
-    1 << 1: ("rar.structure", "rar_structure"),
-    1 << 2: ("7z.structure", "seven_zip_structure"),
-    1 << 3: ("tar.header_structure", "tar_header_structure"),
-    1 << 4: ("compression.stream_structure", "compression_stream_structure"),
-}
-_FORMAT_NEGATIVE_ALL_BITS = sum(_FORMAT_NEGATIVE_FACTS)
-
-
-def _canonical_not_matched_structure() -> dict[str, Any]:
-    return {
-        "magic_matched": False,
-        "plausible": False,
-        "strong_accept": False,
-        "detected_ext": "",
-        "confidence": "none",
-        "error": "bad_signature",
-        "evidence": [],
-        "damage_flags": [],
-    }
 
 
 @dataclass(frozen=True)
@@ -55,15 +31,6 @@ class DetectionScheduler:
         detector_config = detection_config(config)
         self.enabled_fact_modules = self._enabled_module_names(detector_config.get("fact_collectors"))
         self.enabled_processors = self._enabled_module_names(detector_config.get("processors"))
-        active_format_facts = tuple(
-            (bit, fact_name)
-            for bit, (fact_name, processor_name) in _FORMAT_NEGATIVE_FACTS.items()
-            if self.enabled_processors is None or processor_name in self.enabled_processors
-        )
-        self._format_negative_fact_names_by_mask = tuple(
-            tuple(fact_name for bit, fact_name in active_format_facts if mask & bit)
-            for mask in range(_FORMAT_NEGATIVE_ALL_BITS + 1)
-        )
         self.fact_config_defaults = self._fact_config_defaults(
             detector_config.get("fact_collectors"),
             detector_config.get("processors"),
@@ -103,7 +70,6 @@ class DetectionScheduler:
         self._active_scan_session = scan_session
         self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
         try:
-            self._prefill_format_negatives(fact_bags)
             return self.rule_manager.evaluate_pool(fact_bags)
         finally:
             self._active_scan_session = None
@@ -117,7 +83,6 @@ class DetectionScheduler:
         self._active_scan_session = scan_session
         self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
         try:
-            self._prefill_format_negatives(fact_bags)
             return self.rule_manager.evaluate_precheck_pool(fact_bags)
         finally:
             self._active_scan_session = None
@@ -132,6 +97,30 @@ class DetectionScheduler:
             DetectionResult(fact_bag=bag, decision=decision)
             for bag in fact_bags
             if (decision := decisions.get(bag)) is not None
+        ]
+
+    def evaluate_extractable_bags(
+        self,
+        fact_bags: list[FactBag],
+        scan_session: Any = None,
+    ) -> list[DetectionResult]:
+        """Build detection results only for candidates accepted for extraction."""
+        if self.options.deep_scan:
+            decisions = {
+                fact_bag: evaluate_deep_bag(fact_bag)
+                for fact_bag in fact_bags
+            }
+        else:
+            self._active_scan_session = scan_session
+            self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
+            try:
+                decisions = self.rule_manager.evaluate_extractable_pool(fact_bags)
+            finally:
+                self._active_scan_session = None
+        return [
+            DetectionResult(fact_bag=bag, decision=decision)
+            for bag in fact_bags
+            if (decision := decisions.get(bag)) is not None and decision.should_extract
         ]
 
     def _ensure_pool_facts(
@@ -161,62 +150,6 @@ class DetectionScheduler:
                 fact_configs=provider.fact_configs,
                 enabled_processors=self.enabled_processors,
             ).ensure_facts(bag, required_facts)
-
-    def _prefill_format_negatives(self, fact_bags: list[FactBag]) -> None:
-        """Prefill cheap offset-zero format misses for single-file candidates.
-
-        This is deliberately narrower than the processor input projection.  A
-        candidate must prove that its logical analysis input is exactly one
-        physical file; split or carrier-related candidates remain on the
-        existing processor path.
-        """
-        if not fact_bags:
-            return
-
-        if not any(self._format_negative_fact_names_by_mask):
-            return
-
-        pending: list[FactBag] = []
-        for bag in fact_bags:
-            if self._single_file_prefilter_path(bag) is not None:
-                pending.append(bag)
-        if not pending:
-            return
-
-        for bag in pending:
-            mask = bag.get("candidate.format_reject_mask")
-            if not isinstance(mask, int):
-                continue
-            fact_names = self._format_negative_fact_names_by_mask[mask & _FORMAT_NEGATIVE_ALL_BITS]
-            updates = {
-                fact_name: _canonical_not_matched_structure()
-                for fact_name in fact_names
-                if not bag.has(fact_name) and not bag.is_missing(fact_name)
-            }
-            if updates:
-                bag.update(updates)
-
-    @staticmethod
-    def _single_file_prefilter_path(bag: FactBag) -> str | None:
-        if (
-            bag.get("relation.is_split_related")
-            or bag.get("relation.is_split_exe_companion")
-            or bag.get("relation.split_volumes")
-        ):
-            return None
-
-        file_path = bag.get("file.path")
-        member_paths = bag.get("candidate.member_paths")
-        if not isinstance(file_path, str) or not file_path:
-            return None
-        if not isinstance(member_paths, (list, tuple)) or len(member_paths) != 1:
-            return None
-        member_path = member_paths[0]
-        if not isinstance(member_path, str) or not member_path:
-            return None
-        if path_key(member_path) != path_key(file_path):
-            return None
-        return file_path
 
     def _enabled_module_names(self, modules_config) -> set[str] | None:
         if not isinstance(modules_config, list):

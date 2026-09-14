@@ -66,6 +66,8 @@ def test_game_tree_resources_are_not_authorized_for_recursive_extraction(monkeyp
         # Detection is run against the real tree, but no extractor is invoked:
         # this is only the same recursive output scan used after extraction.
         import sunpack.coordinator.task_provider as task_provider_module
+        import sunpack.detection.pipeline.rules.manager as rule_manager_module
+        import sunpack.detection.scheduler as detection_scheduler_module
         from sunpack.coordinator.scan_session import DetectionScanSession
         from sunpack.detection.pipeline.processors.runner import ProcessingCoordinator
         from sunpack.detection.pipeline.rules.manager import RuleManager
@@ -82,6 +84,37 @@ def test_game_tree_resources_are_not_authorized_for_recursive_extraction(monkeyp
 
         def add_count(name, value=1):
             detailed_counts[name] = detailed_counts.get(name, 0) + value
+
+        original_rule_decision = rule_manager_module.RuleDecision
+
+        def timed_rule_decision(*args, **kwargs):
+            started = perf_counter()
+            result = original_rule_decision(*args, **kwargs)
+            elapsed = perf_counter() - started
+            if not kwargs.get("matched_rules"):
+                add_timing("negative_rule_decision_materialization_seconds", elapsed)
+                add_count("negative_rule_decision_materialization_calls")
+            else:
+                add_timing("terminal_rule_decision_materialization_seconds", elapsed)
+                add_count("terminal_rule_decision_materialization_calls")
+            return result
+
+        monkeypatch.setattr(rule_manager_module, "RuleDecision", timed_rule_decision)
+
+        original_detection_result = detection_scheduler_module.DetectionResult
+
+        def timed_detection_result(*args, **kwargs):
+            started = perf_counter()
+            result = original_detection_result(*args, **kwargs)
+            add_timing("detection_result_materialization_seconds", perf_counter() - started)
+            add_count("detection_result_materialization_calls")
+            return result
+
+        monkeypatch.setattr(
+            detection_scheduler_module,
+            "DetectionResult",
+            timed_detection_result,
+        )
 
         original_file_head_facts = scan_session.file_head_facts_for_paths
 
@@ -220,6 +253,21 @@ def test_game_tree_resources_are_not_authorized_for_recursive_extraction(monkeyp
 
         monkeypatch.setattr(DetectionScheduler, "evaluate_pool", timed_evaluate_pool)
 
+        original_evaluate_extractable_bags = DetectionScheduler.evaluate_extractable_bags
+
+        def timed_evaluate_extractable_bags(self, *args, **kwargs):
+            started = perf_counter()
+            result = original_evaluate_extractable_bags(self, *args, **kwargs)
+            timings["evaluate_extractable_bags_seconds"] = perf_counter() - started
+            timings["extractable_result_count"] = len(result)
+            return result
+
+        monkeypatch.setattr(
+            DetectionScheduler,
+            "evaluate_extractable_bags",
+            timed_evaluate_extractable_bags,
+        )
+
         original_rule_evaluate_pool = RuleManager.evaluate_pool
 
         def timed_rule_evaluate_pool(self, *args, **kwargs):
@@ -296,16 +344,6 @@ def test_game_tree_resources_are_not_authorized_for_recursive_extraction(monkeyp
         )
 
         provider = ArchiveTaskProvider(config)
-        original_evaluate_bags = provider.detector.evaluate_bags
-
-        def timed_evaluate_bags(*args, **kwargs):
-            started = perf_counter()
-            result = original_evaluate_bags(*args, **kwargs)
-            timings["evaluate_bags_seconds"] = perf_counter() - started
-            timings["detection_result_count"] = len(result)
-            return result
-
-        monkeypatch.setattr(provider.detector, "evaluate_bags", timed_evaluate_bags)
 
         started = perf_counter()
         tasks = provider.scan_targets(

@@ -52,7 +52,12 @@ class ArchiveTaskProvider:
             )
 
         tasks: list[ArchiveTask] = []
-        for detection in self.detect_targets(scan_roots, scan_session=scan_session, is_recursive_scan=is_recursive_scan):
+        for detection in self.detect_targets(
+            scan_roots,
+            scan_session=scan_session,
+            is_recursive_scan=is_recursive_scan,
+            accepted_only=True,
+        ):
             bag = detection.fact_bag
             if not bag.get("candidate.entry_path"):
                 continue
@@ -126,6 +131,7 @@ class ArchiveTaskProvider:
         *,
         scan_session: DetectionScanSession | None = None,
         is_recursive_scan: bool = False,
+        accepted_only: bool = False,
     ):
         scan_session = scan_session or DetectionScanSession(config=self.config)
         candidate_bags = build_fact_bags_for_targets(scan_roots, session=scan_session, config=self.config)
@@ -134,6 +140,11 @@ class ArchiveTaskProvider:
             fact_bags,
             is_recursive_scan=is_recursive_scan,
         ).apply(fact_bags)
+        if accepted_only:
+            return self.detector.evaluate_extractable_bags(
+                fact_bags,
+                scan_session=scan_session,
+            )
         return self.detector.evaluate_bags(fact_bags, scan_session=scan_session)
 
     def _detection_pipeline_disabled(self) -> bool:

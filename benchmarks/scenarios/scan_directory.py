@@ -34,6 +34,7 @@ SCAN_STAGE_KEYS = (
     "path_matching_ns",
     "record_building_ns",
     "traversal_overhead_ns",
+    "relation_anchor_population_ns",
     "scan_unattributed_ns",
     "native_unattributed_ns",
     "snapshot_building_ns",
@@ -76,6 +77,7 @@ def run_sample(root: Path, scenario: str, config_path: Path) -> dict[str, Any]:
         options["size_ranges"],
         options["mtime_ranges"],
         options["whitelist_rules"],
+        True,
     )
     native_wall_ns = perf_counter_ns() - wall_started
 
@@ -104,6 +106,7 @@ def run_sample(root: Path, scenario: str, config_path: Path) -> dict[str, Any]:
             "path_matching_ns",
             "record_building_ns",
             "traversal_overhead_ns",
+            "relation_anchor_population_ns",
         )
     )
     result["scan_unattributed_ns"] = max(
@@ -112,6 +115,7 @@ def run_sample(root: Path, scenario: str, config_path: Path) -> dict[str, Any]:
     measured_native_ns = (
         result["options_compile_ns"]
         + result["scan_total_ns"]
+        + result["relation_anchor_population_ns"]
         + result["snapshot_building_ns"]
     )
     result.update(

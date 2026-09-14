@@ -3,64 +3,80 @@ from sunpack.detection.scheduler import DetectionScheduler
 from tests.helpers.config_factory import get_config
 
 
-def _bag(path: str) -> FactBag:
+def _bag(path: str, *, members: list[str] | None = None) -> FactBag:
     bag = FactBag()
     bag.set("file.path", path)
+    bag.set("candidate.member_paths", members or [path])
     return bag
 
 
-def test_unified_format_prefill_only_handles_single_physical_inputs():
-    scheduler = DetectionScheduler(get_config("minimal"))
-    scheduler.enabled_processors = None
-
+def test_format_reject_mask_skips_only_single_file_prechecks(monkeypatch):
+    config = get_config(
+        "archive_scan_full",
+        overrides={
+            "detection": {
+                "rule_pipeline": {
+                    "precheck": [
+                        {"name": "zip_structure_accept", "enabled": True},
+                    ],
+                },
+            },
+        },
+    )
+    scheduler = DetectionScheduler(config)
     single = _bag("C:/game/ordinary.bin")
-    single.set("candidate.member_paths", ["C:/game/ordinary.bin"])
-    single.set("candidate.format_reject_mask", 31)
-    split = _bag("C:/game/part.001")
-    split.set("candidate.member_paths", ["C:/game/part.001", "C:/game/part.002"])
-    companion = _bag("C:/game/launcher.exe")
-    companion.set("candidate.member_paths", ["C:/game/launcher.exe"])
-    companion.set("relation.is_split_exe_companion", True)
+    single.set("candidate.format_reject_mask", 1)
 
-    scheduler._prefill_format_negatives([single, split, companion])
+    def fail_if_facts_are_requested(*args, **kwargs):
+        raise AssertionError("definite single-file reject must not run ZIP processor")
 
-    for fact_name in (
-        "zip.eocd_structure",
-        "rar.structure",
-        "7z.structure",
-        "tar.header_structure",
-        "compression.stream_structure",
-    ):
-        assert single.get(fact_name)["plausible"] is False
-        assert not split.has(fact_name)
-        assert not companion.has(fact_name)
+    monkeypatch.setattr(scheduler, "_ensure_pool_facts", fail_if_facts_are_requested)
+    decision = scheduler.evaluate_bag(single)
+
+    assert decision.should_extract is False
+    assert not single.has("zip.eocd_structure")
 
 
-def test_unified_format_prefill_is_fail_open_without_snapshot_evidence():
-    scheduler = DetectionScheduler(get_config("minimal"))
-    scheduler.enabled_processors = None
-    single = _bag("C:/game/ordinary.bin")
-    single.set("candidate.member_paths", ["C:/game/ordinary.bin"])
+def test_format_reject_mask_is_fail_open_for_split_inputs(monkeypatch):
+    config = get_config(
+        "archive_scan_full",
+        overrides={
+            "detection": {
+                "rule_pipeline": {
+                    "precheck": [
+                        {"name": "zip_structure_accept", "enabled": True},
+                    ],
+                },
+            },
+        },
+    )
+    scheduler = DetectionScheduler(config)
+    split = _bag(
+        "C:/game/part.001",
+        members=["C:/game/part.001", "C:/game/part.002"],
+    )
+    split.set("candidate.format_reject_mask", 1)
+    requested: list[set[str]] = []
 
-    scheduler._prefill_format_negatives([single])
-    assert single.to_dict() == {
-        "file.path": "C:/game/ordinary.bin",
-        "candidate.member_paths": ["C:/game/ordinary.bin"],
-    }
+    def record_fact_request(fact_bags, required_facts, fact_configs=None):
+        requested.append(set(required_facts))
+        for bag in fact_bags:
+            for fact_name in required_facts:
+                bag.mark_missing(fact_name)
+
+    monkeypatch.setattr(scheduler, "_ensure_pool_facts", record_fact_request)
+    decision = scheduler.evaluate_bag(split)
+
+    assert decision.should_extract is False
+    assert requested == [{"zip.eocd_structure"}]
 
 
-def test_unified_format_prefill_does_not_overwrite_existing_or_missing_facts():
-    scheduler = DetectionScheduler(get_config("minimal"))
-    scheduler.enabled_processors = None
-    single = _bag("C:/game/ordinary.bin")
-    single.set("candidate.member_paths", ["C:/game/ordinary.bin"])
-    single.set("candidate.format_reject_mask", 31)
-    existing = {"plausible": True}
-    single.set("zip.eocd_structure", existing)
-    single.mark_missing("rar.structure")
+def test_extractable_pool_drops_negative_decisions():
+    config = get_config("minimal")
+    scheduler = DetectionScheduler(config)
+    negative = _bag("C:/game/ordinary.bin")
 
-    scheduler._prefill_format_negatives([single])
+    results = scheduler.evaluate_extractable_bags([negative])
 
-    assert single.get("zip.eocd_structure") is existing
-    assert single.is_missing("rar.structure")
-    assert single.get("7z.structure")["plausible"] is False
+    assert results == []
+    assert negative.get("file.path") == "C:/game/ordinary.bin"

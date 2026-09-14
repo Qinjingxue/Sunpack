@@ -548,6 +548,7 @@ struct DirectoryScanProfile {
     path_matching: Duration,
     record_building: Duration,
     traversal_overhead: Duration,
+    relation_anchor_population: Duration,
     scan_total: Duration,
     directories_opened: usize,
     entries_seen: usize,
@@ -597,6 +598,10 @@ impl DirectoryScanProfile {
         dict.set_item(
             "traversal_overhead_ns",
             duration_ns(self.traversal_overhead),
+        )?;
+        dict.set_item(
+            "relation_anchor_population_ns",
+            duration_ns(self.relation_anchor_population),
         )?;
         dict.set_item("scan_total_ns", duration_ns(self.scan_total))?;
         dict.set_item("snapshot_building_ns", duration_ns(snapshot_building))?;
@@ -802,7 +807,7 @@ pub(crate) fn directory_snapshot_from_columns(
 }
 
 #[pyfunction]
-#[pyo3(signature = (root_path, max_depth, patterns, prune_dir_globs, blocked_extensions, blocked_file_names, size_ranges, mtime_ranges, whitelist_rules))]
+#[pyo3(signature = (root_path, max_depth, patterns, prune_dir_globs, blocked_extensions, blocked_file_names, size_ranges, mtime_ranges, whitelist_rules, include_relation_anchors=false))]
 pub(crate) fn profile_directory_scan(
     py: Python<'_>,
     root_path: &str,
@@ -814,6 +819,7 @@ pub(crate) fn profile_directory_scan(
     size_ranges: Vec<NumericRangeTuple>,
     mtime_ranges: Vec<NumericRangeTuple>,
     whitelist_rules: Vec<WhitelistRuleTuple>,
+    include_relation_anchors: bool,
 ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<PyDict>)> {
     let call_started = Instant::now();
     let options_started = Instant::now();
@@ -829,8 +835,18 @@ pub(crate) fn profile_directory_scan(
     let options_compile = options_started.elapsed();
 
     let mut profile = DirectoryScanProfile::default();
-    let entries =
-        scan_directory_impl::<true>(root_path, max_depth, &options, false, Some(&mut profile))?;
+    let mut entries = scan_directory_impl::<true>(
+        root_path,
+        max_depth,
+        &options,
+        include_relation_anchors,
+        Some(&mut profile),
+    )?;
+    if include_relation_anchors {
+        let started = Instant::now();
+        populate_relation_anchors(&mut entries.raw);
+        profile.relation_anchor_population = started.elapsed();
+    }
 
     let snapshot_started = Instant::now();
     let snapshot = Py::new(py, NativeDirectorySnapshot::from_records(entries.filtered))?;
