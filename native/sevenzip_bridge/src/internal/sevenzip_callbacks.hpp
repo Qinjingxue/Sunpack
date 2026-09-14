@@ -658,7 +658,7 @@ namespace sunpack::sevenzip
                                 file_(std::move(file)),
                                 compute_crc_(compute_crc)
         {
-            magic_.reserve(16);
+            magic_.reserve(512);
         }
 
         ~AsyncFileOutStream()
@@ -718,10 +718,10 @@ namespace sunpack::sevenzip
             {
                 crc32_ = update_crc32(crc32_, data, consumed);
             }
-            if (consumed != 0 && magic_.size() < 16)
+            if (consumed != 0 && magic_.size() < 512)
             {
                 const auto *bytes = static_cast<const unsigned char *>(data);
-                const std::size_t take = std::min<std::size_t>(16 - magic_.size(), consumed);
+                const std::size_t take = std::min<std::size_t>(512 - magic_.size(), consumed);
                 magic_.insert(magic_.end(), bytes, bytes + take);
             }
             if (processedSize)

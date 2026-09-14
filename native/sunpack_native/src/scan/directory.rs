@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use crate::analysis_native::volume_anchor::{probe_volume_anchor_paths_cheap, VolumeAnchor};
+use crate::analysis_native::volume_anchor::{
+    probe_volume_anchor_from_head, probe_volume_anchor_paths_cheap,
+    probe_volume_anchor_records_cheap, VolumeAnchor,
+};
 
 #[derive(Debug, Clone)]
 struct DirectoryEntryRecord {
@@ -925,12 +928,13 @@ fn build_inventory_snapshot_views(
 ) -> DirectoryScanRecords {
     let root = lexical_normalize_path(Path::new(root_path));
     let mut raw_files = Vec::with_capacity(files.len());
+    let mut raw_file_item_indices = Vec::with_capacity(files.len());
     let mut pre_mtime_accepted = Vec::with_capacity(files.len());
     let mut size_accepted_split_families = HashSet::new();
     let mut size_deferred = Vec::new();
     let mut directory_rejections = HashMap::new();
 
-    for item in files {
+    for (item_index, item) in files.iter().enumerate() {
         let Some(path) = inventory_file_path(&root, item) else {
             continue;
         };
@@ -944,6 +948,7 @@ fn build_inventory_snapshot_views(
         };
         let index = raw_files.len();
         raw_files.push(record);
+        raw_file_item_indices.push(item_index);
         pre_mtime_accepted.push(false);
 
         if file_rejected_by_path(&path, &root, options)
@@ -980,6 +985,20 @@ fn build_inventory_snapshot_views(
             && !numeric_ranges_allow(&options.mtime_ranges, record.mtime_ns)
         {
             record.relation_member_eligible = false;
+        }
+    }
+
+    for (record, &item_index) in raw_files.iter_mut().zip(&raw_file_item_indices) {
+        if !record.relation_member_eligible {
+            continue;
+        }
+        let item = &files[item_index];
+        if item.magic.len() >= item.size.min(512) as usize {
+            record.relation_anchor = Some(probe_volume_anchor_from_head(
+                &record.path,
+                item.size,
+                &item.magic,
+            ));
         }
     }
 
@@ -1608,26 +1627,39 @@ fn scan_directory(
 }
 
 fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
-    let paths: Vec<String> = records
+    let eligible_indices: Vec<usize> = records
         .iter()
-        .filter(|record| !record.is_dir && record.relation_member_eligible)
-        .map(|record| record.path.clone())
+        .enumerate()
+        .filter_map(|(index, record)| {
+            (!record.is_dir
+                && record.relation_member_eligible
+                && record.relation_anchor.is_none())
+                .then_some(index)
+        })
         .collect();
-    if paths.is_empty() {
+    if eligible_indices.is_empty() {
         return;
     }
-    let anchors = probe_volume_anchor_paths_cheap(&paths, None);
-    let anchors_by_path: HashMap<String, VolumeAnchor> = anchors
-        .into_iter()
-        .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
-        .collect();
-    for record in records
-        .iter_mut()
-        .filter(|record| !record.is_dir && record.relation_member_eligible)
-    {
-        record.relation_anchor = anchors_by_path
-            .get(&record.path.to_ascii_lowercase())
-            .cloned();
+
+    let mut known_size_inputs = Vec::new();
+    let mut unknown_size_inputs = Vec::new();
+    for &index in &eligible_indices {
+        let record = &records[index];
+        if let Some(size) = record.size {
+            known_size_inputs.push((record.path.clone(), size));
+        } else {
+            unknown_size_inputs.push(record.path.clone());
+        }
+    }
+    let mut known_anchors = probe_volume_anchor_records_cheap(&known_size_inputs).into_iter();
+    let mut unknown_anchors = probe_volume_anchor_paths_cheap(&unknown_size_inputs, None).into_iter();
+    for index in eligible_indices {
+        let anchor = if records[index].size.is_some() {
+            known_anchors.next()
+        } else {
+            unknown_anchors.next()
+        };
+        records[index].relation_anchor = anchor;
     }
 }
 

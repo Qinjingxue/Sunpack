@@ -1014,7 +1014,7 @@ def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
     assert len(row) == 14
     assert row[11] == 1
     assert row[12] > 0
-    assert row[13] == payload[:16].hex()
+    assert row[13] == payload.hex()
     assert (out_dir / source.name).read_bytes() == payload
 
 

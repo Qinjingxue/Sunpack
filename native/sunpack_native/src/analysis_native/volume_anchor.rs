@@ -9,6 +9,7 @@ use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 
 use crate::io::reader::ManagedReader;
+use crate::io::resource_lifecycle::TrackedFile;
 use crate::password::rar::{rar4_decrypt_header_flags, rar5_decrypt_main_header};
 use crate::analysis_native::structure::unified_prefilter_mask_from_head;
 use crate::scan::pe_overlay::pe_headers_plausible;
@@ -24,6 +25,7 @@ const DEFAULT_PREFIX_LIMIT: usize = 1024 * 1024;
 const DEFAULT_TAIL_LIMIT: usize = 65_557;
 const RAR4_MAIN_HEADER_PASSWORD: u16 = 0x0080;
 const VOLUME_ANCHOR_PROBE_THREADS: usize = 4;
+const CHEAP_FAST_PROBE_THREADS: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum VolumeAnchorProbeDepth {
@@ -131,6 +133,43 @@ pub(crate) fn probe_volume_anchor_paths_cheap(
     )
 }
 
+pub(crate) fn probe_volume_anchor_records_cheap(
+    records: &[(String, u64)],
+) -> Vec<VolumeAnchor> {
+    cheap_fast_probe_pool().install(|| {
+        records
+            .par_iter()
+            .map(|(path, size)| probe_path_cheap_direct(path, *size, None))
+            .collect()
+    })
+}
+
+pub(crate) fn probe_volume_anchor_from_head(
+    path: &str,
+    size: u64,
+    head: &[u8],
+) -> VolumeAnchor {
+    let prefix_len = head.len().min(size.min(512) as usize);
+    let mut result = VolumeAnchor {
+        path: path.to_string(),
+        size,
+        bytes_read: prefix_len as u64,
+        ..VolumeAnchor::default()
+    };
+    result.format_reject_mask = unified_prefilter_mask_from_head(size, &head[..prefix_len]);
+    probe_cheap_prefix(result, &head[..prefix_len], None)
+}
+
+fn cheap_fast_probe_pool() -> &'static rayon::ThreadPool {
+    static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
+    POOL.get_or_init(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(CHEAP_FAST_PROBE_THREADS)
+            .build()
+            .expect("cheap volume anchor probe pool must build")
+    })
+}
+
 pub(crate) fn probe_volume_anchor_paths_deep(
     paths: &[String],
     prefix_limit: usize,
@@ -223,43 +262,7 @@ fn probe_path(
     result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix);
 
     if depth == VolumeAnchorProbeDepth::Cheap {
-        // Relation is a split-volume recovery layer, not a general archive
-        // detector.  The cheap pass only keeps structure that can itself seed
-        // a split suspicion, plus the leading stream facts that prevent a
-        // numbered ordinary archive from being mistaken for a volume.
-        if let Some(offset) = anchored_signature(&prefix, RAR5, false)
-            .or_else(|| anchored_signature(&prefix, RAR4, false))
-            .filter(|offset| probe_rar(&prefix, *offset, &mut result, password))
-        {
-            let _ = offset;
-            return result;
-        }
-        if let Some(offset) = anchored_signature(&prefix, SEVEN_ZIP, false)
-            .filter(|offset| probe_seven_zip(&prefix, *offset, size, &mut result))
-        {
-            let _ = offset;
-            return result;
-        }
-        if probe_zip_split_marker(&prefix, &mut result) {
-            return result;
-        }
-        if probe_zip_local_head(&prefix, &mut result) {
-            return result;
-        }
-        if probe_embedded_zip_local_head(&prefix, &mut result) {
-            return result;
-        }
-        if prefix.starts_with(b"MZ") {
-            // An MZ header is only a weak SFX/carrier seed.  Do not scan a
-            // larger prefix here: the relation layer may use the filename
-            // proposal to authorize one bounded deep probe later.
-            result.confidence = "weak".to_string();
-            result.sfx = true;
-            result.evidence.push("sfx:pe_header");
-            return result;
-        }
-        probe_standalone_stream(&prefix, &mut result);
-        return result;
+        return probe_cheap_prefix(result, &prefix, password);
     }
 
     let allow_embedded = prefix.starts_with(b"MZ");
@@ -350,6 +353,80 @@ fn probe_path(
         result.evidence.push("sfx:pe_header");
     }
     result
+}
+
+fn probe_cheap_prefix(
+    mut result: VolumeAnchor,
+    prefix: &[u8],
+    password: Option<&str>,
+) -> VolumeAnchor {
+    // Relation is a split-volume recovery layer, not a general archive
+    // detector.  The cheap pass only keeps structure that can itself seed
+    // a split suspicion, plus the leading stream facts that prevent a
+    // numbered ordinary archive from being mistaken for a volume.
+    if let Some(offset) = anchored_signature(prefix, RAR5, false)
+        .or_else(|| anchored_signature(prefix, RAR4, false))
+        .filter(|offset| probe_rar(prefix, *offset, &mut result, password))
+    {
+        let _ = offset;
+        return result;
+    }
+    if let Some(offset) = anchored_signature(prefix, SEVEN_ZIP, false)
+        .filter(|offset| probe_seven_zip(prefix, *offset, result.size, &mut result))
+    {
+        let _ = offset;
+        return result;
+    }
+    if probe_zip_split_marker(prefix, &mut result) {
+        return result;
+    }
+    if probe_zip_local_head(prefix, &mut result) {
+        return result;
+    }
+    if probe_embedded_zip_local_head(prefix, &mut result) {
+        return result;
+    }
+    if prefix.starts_with(b"MZ") {
+        // An MZ header is only a weak SFX/carrier seed.  Do not scan a
+        // larger prefix here: the relation layer may use the filename
+        // proposal to authorize one bounded deep probe later.
+        result.confidence = "weak".to_string();
+        result.sfx = true;
+        result.evidence.push("sfx:pe_header");
+        return result;
+    }
+    probe_standalone_stream(prefix, &mut result);
+    result
+}
+
+fn probe_path_cheap_direct(path: &str, size: u64, password: Option<&str>) -> VolumeAnchor {
+    let mut result = VolumeAnchor {
+        path: path.to_string(),
+        size,
+        ..VolumeAnchor::default()
+    };
+    let read_len = size.min(512) as usize;
+    let mut prefix = [0u8; 512];
+    let mut file = match open_cheap_file(path) {
+        Ok(file) => file,
+        Err(error) => {
+            result.error = error.to_string();
+            return result;
+        }
+    };
+    if let Err(error) = file.read_exact(&mut prefix[..read_len]) {
+        result.error = error.to_string();
+        return result;
+    }
+    result.bytes_read = read_len as u64;
+    result.format_reject_mask = unified_prefilter_mask_from_head(size, &prefix[..read_len]);
+    probe_cheap_prefix(result, &prefix[..read_len], password)
+}
+
+fn open_cheap_file(path: &str) -> std::io::Result<TrackedFile> {
+    // Cheap probes still use the lifecycle guard, but skip the managed reader's
+    // metadata/canonicalization/handle-cache path for this one-shot read.
+    TrackedFile::open_reader(path, "volume_anchor_cheap")
 }
 
 fn probe_zip_split_marker(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
