@@ -101,3 +101,31 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
     watcher._pending["busy"] = object()
     _TEST_LOOP.run_until_complete(watcher._maybe_clear_idle_caches())
     assert engine.clear_calls == 1
+
+
+def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
+    wakeups = []
+    watcher = WatchScheduler(
+        {
+            "watch": {
+                "clipboard_monitor_enabled": False,
+                "runtime_cache_cleanup_enabled": True,
+                "runtime_cache_cleanup_idle_seconds": 10,
+            }
+        },
+        [str(tmp_path)],
+        out_dir=str(tmp_path / "out"),
+        state_path=str(tmp_path / "state.json"),
+        quiet_seconds=0,
+        initial_scan=False,
+        pipeline_engine=_CleanupOnlyEngine(),
+        wake_callback=lambda: wakeups.append("wake"),
+    )
+
+    watcher._arm_idle_cache_cleanup()
+    watcher.set_external_activity(True)
+    assert watcher._cache_cleanup_deadline is None
+
+    watcher.set_external_activity(False)
+    assert watcher.next_delay_seconds() == pytest.approx(10, abs=0.1)
+    assert wakeups == ["wake"]

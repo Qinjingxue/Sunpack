@@ -583,6 +583,14 @@ class WatchScheduler:
             idle_seconds=self.runtime_cache_cleanup_idle_seconds,
         )
 
+    def set_external_activity(self, active: bool) -> None:
+        """Track foreground work that runs outside the watch pipeline."""
+        if active:
+            self._reset_idle_cache_cleanup()
+            return
+        self._arm_idle_cache_cleanup()
+        self._wake_service()
+
     async def _maybe_clear_idle_caches(self) -> None:
         if not self.runtime_cache_cleanup_enabled:
             return

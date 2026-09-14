@@ -129,6 +129,40 @@ def test_runtime_host_owns_watch_and_switches_host_and_worker_qos(monkeypatch):
     assert ("host_qos", False) in events
 
 
+def test_runtime_host_brackets_overlapping_foreground_activity(monkeypatch):
+    activity = []
+    background_schedules = []
+
+    class FakeScheduler:
+        def set_external_activity(self, active):
+            activity.append(active)
+
+    host = RuntimeHost()
+    host._watch_service = SimpleNamespace(scheduler=FakeScheduler())
+    host._watch_task = SimpleNamespace(done=lambda: False)
+
+    async def set_process_mode(*, background):
+        return None
+
+    monkeypatch.setattr(host, "_set_process_mode", set_process_mode)
+    monkeypatch.setattr(host, "_schedule_background", lambda: background_schedules.append(True))
+
+    async def scenario():
+        await host.foreground_started()
+        await host.foreground_started()
+        assert activity == [True]
+
+        await host.foreground_finished()
+        assert activity == [True]
+        assert background_schedules == []
+
+        await host.foreground_finished()
+        assert activity == [True, False]
+        assert background_schedules == [True]
+
+    asyncio.run(scenario())
+
+
 def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_path):
     import sunpack.cli.runtime_host as module
     import sunpack.platform.windows.toast_host as toast
