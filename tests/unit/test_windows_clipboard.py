@@ -79,3 +79,31 @@ def test_windows_clipboard_rejects_allocation_over_limit(monkeypatch):
 
     assert clipboard_module._read_windows_unicode_clipboard(max_chars=10) == ""
     assert global_lock.argtypes == [clipboard_module.wintypes.HANDLE]
+
+
+def test_read_clipboard_passwords_single_line_mode_rejects_internal_line_breaks(monkeypatch):
+    cases = [
+        ("password", ["password"]),
+        ("password\r\n", ["password"]),
+        ("a\nb", []),
+        ("a\r\nb", []),
+        ("a\n\na", []),
+    ]
+
+    for text, expected in cases:
+        monkeypatch.setattr(
+            clipboard_module,
+            "_read_windows_unicode_clipboard",
+            lambda *, max_chars, text=text: text,
+        )
+        assert clipboard_module.read_clipboard_passwords(single_line=True) == expected
+
+
+def test_read_clipboard_passwords_keeps_multiline_default_behavior(monkeypatch):
+    monkeypatch.setattr(
+        clipboard_module,
+        "_read_windows_unicode_clipboard",
+        lambda *, max_chars: "a\nb",
+    )
+
+    assert clipboard_module.read_clipboard_passwords() == ["a", "b"]

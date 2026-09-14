@@ -10,7 +10,13 @@ def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, m
     builtin_path = tmp_path / "builtin_passwords.txt"
     builtin_path.write_text("existing\n", encoding="utf-8")
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-    monkeypatch.setattr(clipboard_monitor_module, "read_clipboard_passwords", lambda: [f"clip-{index}" for index in range(35)])
+    single_line_calls = []
+
+    def _read_clipboard_passwords(*, single_line):
+        single_line_calls.append(single_line)
+        return [f"clip-{index}" for index in range(35)]
+
+    monkeypatch.setattr(clipboard_monitor_module, "read_clipboard_passwords", _read_clipboard_passwords)
     notifications = []
 
     monitor = ClipboardPasswordMonitor(
@@ -22,6 +28,7 @@ def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, m
     monitor._handle_clipboard_update()
 
     passwords = builtin_module.get_builtin_passwords()
+    assert single_line_calls == [True]
     assert notifications == ["clipboard"]
     assert "existing" in passwords
     assert "clip-0" not in passwords

@@ -2506,7 +2506,11 @@ def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     builtin_path = tmp_path / "builtin_passwords.txt"
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-    monkeypatch.setattr(clipboard_monitor_module, "read_clipboard_passwords", lambda: ["clipboard-secret"])
+    monkeypatch.setattr(
+        clipboard_monitor_module,
+        "read_clipboard_passwords",
+        lambda *, single_line: ["clipboard-secret"],
+    )
     attempts = []
 
     class ConfigAwareRunner:

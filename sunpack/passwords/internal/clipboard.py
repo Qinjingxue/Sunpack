@@ -13,11 +13,16 @@ def read_clipboard_passwords(
     *,
     max_chars: int = DEFAULT_MAX_CLIPBOARD_CHARS,
     max_password_length: int = DEFAULT_MAX_PASSWORD_LENGTH,
+    single_line: bool = False,
 ) -> list[str]:
     """Best-effort text clipboard reader for password candidates."""
     text = _read_windows_unicode_clipboard(max_chars=max_chars)
     if not text:
         return []
+    if single_line:
+        text = text.rstrip("\r\n")
+        if "\r" in text or "\n" in text:
+            return []
     return dedupe_passwords(_plausible_passwords(parse_password_lines(text), max_password_length=max_password_length))
 
 

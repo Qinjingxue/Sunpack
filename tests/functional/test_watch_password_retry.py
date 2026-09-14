@@ -105,7 +105,11 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
                 directory_password_file.write_text(password + "\n", encoding="utf-8")
                 watcher.notify_password_table_changed(str(directory_password_file))
             else:
-                monkeypatch.setattr(clipboard_monitor_module, "read_clipboard_passwords", lambda: [password])
+                monkeypatch.setattr(
+                    clipboard_monitor_module,
+                    "read_clipboard_passwords",
+                    lambda *, single_line: [password],
+                )
                 watcher._clipboard_monitor._handle_clipboard_update()
             second = await _wait_for_completed_watch_run(watcher)
             return second, watcher, list(output_root.rglob("payload.txt"))

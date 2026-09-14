@@ -51,7 +51,7 @@ class ClipboardPasswordMonitor:
         self._hwnd = None
 
     def _handle_clipboard_update(self) -> None:
-        passwords = read_clipboard_passwords()
+        passwords = read_clipboard_passwords(single_line=True)
         if not passwords:
             return
         if merge_watch_clipboard_passwords(passwords, max_entries=self.max_entries):
