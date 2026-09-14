@@ -39,7 +39,9 @@ _MIB = 1 << 20
 _VHD_ALIGNMENT_MB = 8
 _VHD_MIN_SIZE_MB = 16
 _VHD_FILESYSTEM_SAFETY_BYTES = 8 * _MIB
+_VHD_POST_FORMAT_HEADROOM_BYTES = 2 * _MIB
 _VHD_HOST_FREE_RESERVE_BYTES = 32 * _MIB
+_VHD_MAX_EXPANSION_ATTEMPTS = 4
 _DISKPART_MAX_ATTEMPTS = 8
 _DISKPART_RETRY_DELAY_SECONDS = 0.75
 _DISKPART_LOCK_TIMEOUT_SECONDS = 120.0
@@ -84,18 +86,7 @@ def _available_drive_letter(preferred: str) -> str:
     raise RuntimeError("no unused Windows drive letter is available for the VHD test")
 
 
-def _dynamic_vhd_size_mb(directory: Path, payload_bytes: int, blocked_free_bytes: int) -> int:
-    required_bytes = (
-        payload_bytes
-        + blocked_free_bytes
-        + _VHD_FILESYSTEM_SAFETY_BYTES
-    )
-    required_mb = (required_bytes + _MIB - 1) // _MIB
-    size_mb = max(
-        _VHD_MIN_SIZE_MB,
-        ((required_mb + _VHD_ALIGNMENT_MB - 1) // _VHD_ALIGNMENT_MB) * _VHD_ALIGNMENT_MB,
-    )
-
+def _ensure_vhd_host_capacity(directory: Path, size_mb: int) -> None:
     host_free_bytes = shutil.disk_usage(str(directory)).free
     host_required_bytes = size_mb * _MIB + _VHD_HOST_FREE_RESERVE_BYTES
     if host_free_bytes < host_required_bytes:
@@ -104,6 +95,25 @@ def _dynamic_vhd_size_mb(directory: Path, payload_bytes: int, blocked_free_bytes
             f"需要约 {host_required_bytes // _MIB} MiB，"
             f"当前约 {host_free_bytes // _MIB} MiB"
         )
+
+
+def _aligned_vhd_size_mb(required_bytes: int) -> int:
+    required_mb = (required_bytes + _MIB - 1) // _MIB
+    return max(
+        _VHD_MIN_SIZE_MB,
+        ((required_mb + _VHD_ALIGNMENT_MB - 1) // _VHD_ALIGNMENT_MB)
+        * _VHD_ALIGNMENT_MB,
+    )
+
+
+def _dynamic_vhd_size_mb(directory: Path, payload_bytes: int, blocked_free_bytes: int) -> int:
+    required_bytes = (
+        payload_bytes
+        + blocked_free_bytes
+        + _VHD_FILESYSTEM_SAFETY_BYTES
+    )
+    size_mb = _aligned_vhd_size_mb(required_bytes)
+    _ensure_vhd_host_capacity(directory, size_mb)
     return size_mb
 
 
@@ -202,29 +212,65 @@ class SpaceVhd:
                 self.blocked_free_bytes,
             )
             self.letter = _available_drive_letter(self._preferred_letter)
-            if self.path.exists():
-                self.path.unlink()
-            self._needs_diskpart_cleanup = True
-            self._diskpart(
-                "\n".join(
-                    [
-                        f"create vdisk file={self.path} maximum={self.size_mb} type=fixed",
-                        f"select vdisk file={self.path}",
-                        "attach vdisk",
-                        "create partition primary",
-                        "format fs=ntfs quick label=SUNPACKSPACE",
-                        f"assign letter={self.letter}",
-                        "exit",
-                    ]
-                )
+            required_usable_bytes = (
+                self.payload_bytes
+                + self.blocked_free_bytes
+                + _VHD_POST_FORMAT_HEADROOM_BYTES
             )
-            self._attached = True
-            deadline = time.monotonic() + 60.0
-            while time.monotonic() < deadline:
-                if Path(f"{self.letter}:\\").exists():
+
+            for attempt in range(_VHD_MAX_EXPANSION_ATTEMPTS):
+                if self.path.exists():
+                    self.path.unlink()
+                self._needs_diskpart_cleanup = True
+                self._diskpart(
+                    "\n".join(
+                        [
+                            f"create vdisk file={self.path} maximum={self.size_mb} type=fixed",
+                            f"select vdisk file={self.path}",
+                            "attach vdisk",
+                            "create partition primary",
+                            "format fs=ntfs quick label=SUNPACKSPACE",
+                            f"assign letter={self.letter}",
+                            "exit",
+                        ]
+                    )
+                )
+                self._attached = True
+                deadline = time.monotonic() + 60.0
+                while time.monotonic() < deadline:
+                    if self.root.exists():
+                        break
+                    time.sleep(0.25)
+                else:
+                    raise RuntimeError(f"volume {self.letter}: did not appear")
+
+                # VHD 的名义容量不等于格式化后的可用容量，尤其是 16 MiB 的小型 NTFS
+                # 卷：MFT 等元数据可能吃掉大半空间。必须基于真实可用空间决定是否扩容，
+                # 否则删除 filler 后仍可能装不下 payload，测试会永远等下一次空间增加。
+                usable_bytes = self.free_bytes()
+                if usable_bytes >= required_usable_bytes:
                     return
-                time.sleep(0.25)
-            raise RuntimeError(f"volume {self.letter}: did not appear")
+                if attempt + 1 >= _VHD_MAX_EXPANSION_ATTEMPTS:
+                    raise RuntimeError(
+                        "formatted VHD remained too small after expansion: "
+                        f"size={self.size_mb} MiB, usable={usable_bytes} bytes, "
+                        f"required={required_usable_bytes} bytes"
+                    )
+
+                shortfall_bytes = required_usable_bytes - usable_bytes
+                growth_bytes = max(
+                    _VHD_ALIGNMENT_MB * _MIB,
+                    shortfall_bytes + _VHD_POST_FORMAT_HEADROOM_BYTES,
+                )
+                next_size_mb = _aligned_vhd_size_mb(
+                    self.size_mb * _MIB + growth_bytes
+                )
+                self.detach()
+                self._remove_image()
+                if self.path.exists():
+                    raise RuntimeError(f"could not remove undersized VHDX: {self.path}")
+                _ensure_vhd_host_capacity(self.directory, next_size_mb)
+                self.size_mb = next_size_mb
         except BaseException:
             self._detach_best_effort()
             self._remove_image()
