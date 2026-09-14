@@ -22,7 +22,7 @@ def test_i18n_catalogs_have_matching_keys_and_placeholders():
 def test_cli_discovers_builtin_command_modules_in_order():
     modules = discover_command_modules()
 
-    assert [module.COMMAND for module in modules] == ["extract", "watch", "scan", "inspect", "passwords", "config"]
+    assert [module.COMMAND for module in modules] == ["extract", "watch", "scan", "inspect", "passwords", "config", "doctor"]
 
 
 def test_cli_command_modules_declare_required_contract():
@@ -45,6 +45,7 @@ def test_cli_parser_registers_discovered_commands():
         "inspect": ["inspect", "."],
         "passwords": ["passwords"],
         "config": ["config", "show"],
+        "doctor": ["doctor"],
     }
 
     for command, args in command_args.items():

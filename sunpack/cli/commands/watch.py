@@ -35,6 +35,7 @@ def register(subparsers, ctx):
 
     add_parser = actions.add_parser("add", parents=[common], help=ctx.t("cli.watch.add"), formatter_class=CliHelpFormatter)
     add_parser.add_argument("paths", nargs="+", help=ctx.t("cli.watch.paths"))
+    add_parser.add_argument("-o", "--out-dir", dest="output_dir", help=ctx.t("cli.watch.output_dir"))
     add_parser.add_argument("--start", action="store_true", help=ctx.t("cli.watch.start_after_add"))
     add_parser.add_argument("--initial-scan", action="store_true", help=ctx.t("cli.watch.initial_scan"))
 
@@ -94,14 +95,32 @@ async def _handle_add(args, ctx):
     start_requested = bool(getattr(args, "start", False))
     initial_scan_requested = bool(getattr(args, "initial_scan", False))
     paths = list(args.paths or [])
+    output_dir = getattr(args, "output_dir", None)
+    if output_dir is not None and len(paths) != 1:
+        return EXIT_USAGE, CliCommandResult(
+            command=COMMAND,
+            inputs={"action": "add", "paths": paths, "output_dir": output_dir},
+            summary={},
+            errors=[ctx.t("cli.watch.output_dir_single_path")],
+        )
     host = require_runtime_host()
     apply_summary = None
     if host.watch_enabled:
-        apply_summary = await host.add_watch_roots(paths, initial_scan=initial_scan_requested)
+        if output_dir is None:
+            apply_summary = await host.add_watch_roots(paths, initial_scan=initial_scan_requested)
+        else:
+            apply_summary = await host.add_watch_roots(
+                paths,
+                output_dir=output_dir,
+                initial_scan=initial_scan_requested,
+            )
         roots_path = apply_summary["roots_path"]
         added = list(apply_summary["added"])
     else:
-        roots_path_obj, added = add_watch_roots(paths)
+        if output_dir is None:
+            roots_path_obj, added = add_watch_roots(paths)
+        else:
+            roots_path_obj, added = add_watch_roots(paths, output_dir=output_dir)
         roots_path = str(roots_path_obj)
     start_summary = None
     if start_requested and not host.watch_enabled:
@@ -110,7 +129,7 @@ async def _handle_add(args, ctx):
         )
     return 0, CliCommandResult(
         command=COMMAND,
-        inputs={"action": "add", "paths": paths},
+        inputs={"action": "add", "paths": paths, "output_dir": output_dir},
         summary={
             "roots_path": str(roots_path),
             "added": added,

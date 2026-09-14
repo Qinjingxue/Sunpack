@@ -184,12 +184,21 @@ class RuntimeHost:
         self.log_event("watch_reloaded" if reloaded else "watch_reload_skipped")
         return {"reloaded": reloaded, "running": True, "generation": self._watch_generation}
 
-    async def add_watch_roots(self, paths: list[str], *, initial_scan: bool = True) -> dict:
+    async def add_watch_roots(
+        self,
+        paths: list[str],
+        *,
+        output_dir: str | None = None,
+        initial_scan: bool = True,
+    ) -> dict:
         service = self._watch_service
         if service is None or not self.watch_enabled:
             self.log_event("watch_roots_add_ignored", paths=list(paths))
             return {"added": [], "applied": False, "running": False}
-        result = await service.add_roots(paths, initial_scan=initial_scan)
+        if output_dir is None:
+            result = await service.add_roots(paths, initial_scan=initial_scan)
+        else:
+            result = await service.add_roots(paths, output_dir=output_dir, initial_scan=initial_scan)
         self.log_event(
             "watch_roots_added",
             added=list(result["added"]),

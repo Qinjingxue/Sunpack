@@ -129,6 +129,21 @@ function New-CommandString {
     return ('"{0}" "{1}" extract "{2}" --out-dir "{3}"{4} --pause' -f $Launcher.AppPath, $Launcher.ScriptPath, $TargetToken, $OutDirToken, $passwordArg)
 }
 
+function New-FileCommandString {
+    param(
+        [hashtable]$Launcher,
+        [string]$TargetToken,
+        [bool]$PromptPasswords
+    )
+
+    $passwordArg = if ($PromptPasswords) { " --ask-pw" } else { "" }
+    if ($Launcher.Mode -eq "app") {
+        return ('"{0}" extract "{1}"{2} --pause' -f $Launcher.AppPath, $TargetToken, $passwordArg)
+    }
+
+    return ('"{0}" "{1}" extract "{2}"{3} --pause' -f $Launcher.AppPath, $Launcher.ScriptPath, $TargetToken, $passwordArg)
+}
+
 function New-WatchCommandString {
     param(
         [hashtable]$Launcher,
@@ -192,12 +207,12 @@ function Set-ContextMenuParent {
         [string]$SubCommandsKey
     )
 
-    $null = New-Item -Path $KeyPath -Force
-    Set-Item -Path $KeyPath -Value $MenuLabel
-    Set-ItemProperty -Path $KeyPath -Name "MUIVerb" -Value $MenuLabel
-    Set-ItemProperty -Path $KeyPath -Name "Icon" -Value $IconValue
-    Set-ItemProperty -Path $KeyPath -Name "ExtendedSubCommandsKey" -Value $SubCommandsKey
-    Remove-ItemProperty -Path $KeyPath -Name "SubCommands" -ErrorAction SilentlyContinue
+    $null = New-Item -LiteralPath $KeyPath -Force
+    Set-Item -LiteralPath $KeyPath -Value $MenuLabel
+    Set-ItemProperty -LiteralPath $KeyPath -Name "MUIVerb" -Value $MenuLabel
+    Set-ItemProperty -LiteralPath $KeyPath -Name "Icon" -Value $IconValue
+    Set-ItemProperty -LiteralPath $KeyPath -Name "ExtendedSubCommandsKey" -Value $SubCommandsKey
+    Remove-ItemProperty -LiteralPath $KeyPath -Name "SubCommands" -ErrorAction SilentlyContinue
     $localShellKey = Join-Path $KeyPath "shell"
     if (Test-Path -LiteralPath $localShellKey) {
         Remove-Item -LiteralPath $localShellKey -Recurse -Force
@@ -214,13 +229,13 @@ function Set-ContextMenuCommand {
     )
 
     $keyPath = Join-Path (Join-Path $ParentKeyPath "shell") $CommandName
-    $null = New-Item -Path $keyPath -Force
-    Set-Item -Path $keyPath -Value $MenuLabel
-    Set-ItemProperty -Path $keyPath -Name "MUIVerb" -Value $MenuLabel
-    Set-ItemProperty -Path $keyPath -Name "Icon" -Value $IconValue
+    $null = New-Item -LiteralPath $keyPath -Force
+    Set-Item -LiteralPath $keyPath -Value $MenuLabel
+    Set-ItemProperty -LiteralPath $keyPath -Name "MUIVerb" -Value $MenuLabel
+    Set-ItemProperty -LiteralPath $keyPath -Name "Icon" -Value $IconValue
     $commandKey = Join-Path $keyPath "command"
-    $null = New-Item -Path $commandKey -Force
-    Set-Item -Path $commandKey -Value $CommandLine
+    $null = New-Item -LiteralPath $commandKey -Force
+    Set-Item -LiteralPath $commandKey -Value $CommandLine
 }
 
 function Get-MenuLanguage {
@@ -276,10 +291,13 @@ $resolvedMenuText = if ($MenuText) { $MenuText } else { "sunpack" }
 
 $folderKey = "HKCU:\Software\Classes\Directory\shell\SunPack"
 $backgroundKey = "HKCU:\Software\Classes\Directory\Background\shell\SunPack"
+$fileKey = "HKCU:\Software\Classes\*\shell\SunPack"
 $folderSubCommandsName = "SunPack.FolderContextMenu"
 $backgroundSubCommandsName = "SunPack.BackgroundContextMenu"
+$fileSubCommandsName = "SunPack.FileContextMenu"
 $folderSubCommandsKey = "HKCU:\Software\Classes\$folderSubCommandsName"
 $backgroundSubCommandsKey = "HKCU:\Software\Classes\$backgroundSubCommandsName"
+$fileSubCommandsKey = "HKCU:\Software\Classes\$fileSubCommandsName"
 $subMenuTexts = Get-SubMenuTexts -Language $menuLanguage
 
 $folderToken = ConvertTo-RootSafeDirectoryToken -Token "%1"
@@ -292,6 +310,8 @@ $backgroundPromptCommand = New-CommandString -Launcher $launcher -TargetToken $b
 $backgroundDirectCommand = New-CommandString -Launcher $launcher -TargetToken $backgroundToken -OutDirToken $backgroundToken -PromptPasswords $false
 $backgroundWatchCommand = New-WatchCommandString -Launcher $launcher -TargetToken $backgroundToken
 $backgroundUnwatchCommand = New-WatchRemoveCommandString -Launcher $launcher -TargetToken $backgroundToken
+$filePromptCommand = New-FileCommandString -Launcher $launcher -TargetToken "%1" -PromptPasswords $true
+$fileDirectCommand = New-FileCommandString -Launcher $launcher -TargetToken "%1" -PromptPasswords $false
 
 if ($DryRun) {
     [pscustomobject]@{
@@ -304,6 +324,8 @@ if ($DryRun) {
         background_direct = $backgroundDirectCommand
         background_watch = $backgroundWatchCommand
         background_unwatch = $backgroundUnwatchCommand
+        file_prompt = $filePromptCommand
+        file_direct = $fileDirectCommand
     } | ConvertTo-Json -Compress
     return
 }
@@ -318,6 +340,9 @@ Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "Pr
 Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "DirectExtract" -MenuLabel $subMenuTexts.Direct -CommandLine $backgroundDirectCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "WatchFolder" -MenuLabel $subMenuTexts.Watch -CommandLine $backgroundWatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "UnwatchFolder" -MenuLabel $subMenuTexts.Unwatch -CommandLine $backgroundUnwatchCommand -IconValue $resolvedIconPath
+Set-ContextMenuParent -KeyPath $fileKey -MenuLabel $resolvedMenuText -IconValue $resolvedIconPath -SubCommandsKey $fileSubCommandsName
+Set-ContextMenuCommand -ParentKeyPath $fileSubCommandsKey -CommandName "PromptPassword" -MenuLabel $subMenuTexts.Prompt -CommandLine $filePromptCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $fileSubCommandsKey -CommandName "DirectExtract" -MenuLabel $subMenuTexts.Direct -CommandLine $fileDirectCommand -IconValue $resolvedIconPath
 
 Write-Host "Context menu registration completed." -ForegroundColor Green
 Write-Host "Folder menu key:" $folderKey

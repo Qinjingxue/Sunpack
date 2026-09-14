@@ -51,6 +51,11 @@ def _load_library(path: str | None = None):
     return library
 
 
+def self_test_toast() -> None:
+    library = _load_library()
+    _check_hresult(library.sunpack_toast_self_test())
+
+
 class _NativeToastPresenter:
     def __init__(self, *, library_path=None, diagnostic_log_path=None):
         self._library = _load_library(library_path)

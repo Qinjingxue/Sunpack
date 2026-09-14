@@ -51,6 +51,24 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         assert "--ask-pw" not in argv
         assert "--pause" in argv
 
+    for key in ("file_prompt",):
+        expanded = commands[key].replace("%1", r"D:\archive.bin")
+        argv = _windows_argv(expanded)
+        assert argv[1] == "extract"
+        assert ntpath.normpath(argv[2]) == r"D:\archive.bin"
+        assert "--out-dir" not in argv
+        assert "--ask-pw" in argv
+        assert "--pause" in argv
+
+    for key in ("file_direct",):
+        expanded = commands[key].replace("%1", r"D:\archive.bin")
+        argv = _windows_argv(expanded)
+        assert argv[1] == "extract"
+        assert ntpath.normpath(argv[2]) == r"D:\archive.bin"
+        assert "--out-dir" not in argv
+        assert "--ask-pw" not in argv
+        assert "--pause" in argv
+
     for key in ("folder_watch", "background_watch"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
         argv = _windows_argv(expanded)

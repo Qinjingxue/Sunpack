@@ -32,6 +32,7 @@ WATCH_ROOTS_FILENAME = "sunpack_watch_roots.txt"
 # A line without the separator means "output beside the input", a form understood only here.
 WATCH_ROOT_OUTPUT_SEPARATOR = "|"
 ROOTS_MUTEX_PREFIX = "Local\\SunPackWatchRoots"
+WatchRootEntry = tuple[str, str | None]
 CONTROL_STOP = "stop"
 CONTROL_RELOAD = "reload"
 CONTROL_SCHEDULER_WAKEUP = "scheduler_wakeup"
@@ -180,35 +181,59 @@ def watch_roots_path() -> Path:
     return get_resource_path(WATCH_ROOTS_FILENAME)
 
 
-def _watch_root_line_output(line: str) -> str:
-    """Output root as written on one roots line, or "" when the line has no separator."""
-    _input_part, separator, output_part = line.partition(WATCH_ROOT_OUTPUT_SEPARATOR)
-    return output_part.strip() if separator else ""
+def _resolve_watch_output_root(input_root: str, configured_output_root: str) -> str:
+    candidate = Path(str(configured_output_root).strip()).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(input_root) / candidate
+    return normalize_root(str(candidate))
 
 
-def _iter_watch_root_entries(default_output_root: str, path: Path | None):
-    """Yield ``(input_root, output_root)`` as absolute paths, in file order.
+def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
+    """Read unique ``(input_root, explicit_output_root)`` entries in file order.
 
-    A line without a separator keeps the configured ``watch.out_dir``.  A relative output root
-    is resolved against its own input root, never against the process working directory.
+    A missing explicit output is represented by ``None`` so callers can preserve the distinction
+    between a legacy line and a root with its own output mapping.  If a file contains duplicate
+    input roots, the first input spelling/order is kept and the last output mapping wins.
     """
     roots_path = path or watch_roots_path()
     try:
         lines = read_task_text(roots_path, encoding="utf-8").splitlines()
     except OSError:
-        return
+        return []
+    entries: list[WatchRootEntry] = []
+    positions: dict[str, int] = {}
     for line in lines:
         value = line.strip()
         if not value or value.startswith("#"):
             continue
-        input_root = value.partition(WATCH_ROOT_OUTPUT_SEPARATOR)[0].strip()
+        input_part, separator, output_part = value.partition(WATCH_ROOT_OUTPUT_SEPARATOR)
+        input_root = input_part.strip()
         if not input_root:
             continue
         input_root = normalize_root(input_root)
-        configured = _watch_root_line_output(value) or default_output_root
-        candidate = Path(configured).expanduser()
-        output_root = str(candidate) if candidate.is_absolute() else os.path.join(input_root, str(candidate))
-        yield input_root, normalize_root(output_root)
+        explicit_output = None
+        if separator and output_part.strip():
+            explicit_output = _resolve_watch_output_root(input_root, output_part)
+        key = path_key(input_root)
+        position = positions.get(key)
+        if position is None:
+            positions[key] = len(entries)
+            entries.append((input_root, explicit_output))
+        else:
+            original_input, _original_output = entries[position]
+            entries[position] = (original_input, explicit_output)
+    return entries
+
+
+def _iter_watch_root_entries(default_output_root: str, path: Path | None):
+    """Yield ``(input_root, output_root)`` as absolute paths, in file order.
+
+    A line without an explicit output keeps the configured ``watch.out_dir``.  Relative output
+    roots are resolved against their own input root, never against the process working directory.
+    """
+    for input_root, explicit_output in _read_watch_root_entries(path):
+        output_root = explicit_output or _resolve_watch_output_root(input_root, default_output_root)
+        yield input_root, output_root
 
 
 def read_watch_root_outputs(
@@ -242,40 +267,66 @@ def read_watch_roots(default_output_root: str = ".", path: Path | None = None) -
 def write_watch_roots(roots: list[str], path: Path | None = None) -> Path:
     roots_path = path or watch_roots_path()
     with _watch_roots_mutex(roots_path):
-        return _write_watch_roots_unlocked(roots, roots_path)
+        return _write_watch_root_entries_unlocked([(root, None) for root in roots], roots_path)
 
 
-def _write_watch_roots_unlocked(roots: list[str], roots_path: Path) -> Path:
-    normalized_roots = []
+def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path: Path) -> Path:
+    normalized_entries: list[WatchRootEntry] = []
     seen = set()
-    for root in roots:
-        normalized = normalize_root(root)
-        key = path_key(normalized)
+    for input_root, output_root in entries:
+        normalized_input = normalize_root(input_root)
+        key = path_key(normalized_input)
         if key in seen:
             continue
-        normalized_roots.append(normalized)
+        normalized_output = (
+            None
+            if output_root is None or not str(output_root).strip()
+            else _resolve_watch_output_root(normalized_input, str(output_root))
+        )
+        normalized_entries.append((normalized_input, normalized_output))
         seen.add(key)
     roots_path.parent.mkdir(parents=True, exist_ok=True)
-    write_task_text(roots_path, "".join(f"{root}\n" for root in normalized_roots), encoding="utf-8")
+    write_task_text(
+        roots_path,
+        "".join(
+            f"{input_root}{f' {WATCH_ROOT_OUTPUT_SEPARATOR} {output_root}' if output_root else ''}\n"
+            for input_root, output_root in normalized_entries
+        ),
+        encoding="utf-8",
+    )
     return roots_path
 
 
-def add_watch_roots(paths: list[str]) -> tuple[Path, list[str]]:
+def _write_watch_roots_unlocked(roots: list[str], roots_path: Path) -> Path:
+    """Compatibility wrapper for callers that write legacy plain-root entries."""
+    return _write_watch_root_entries_unlocked([(root, None) for root in roots], roots_path)
+
+
+def add_watch_roots(
+    paths: list[str],
+    *,
+    output_dir: str | None = None,
+) -> tuple[Path, list[str]]:
     roots_path = watch_roots_path()
     with _watch_roots_mutex(roots_path):
-        roots = read_watch_roots(path=roots_path)
-        seen = {path_key(root) for root in roots}
+        entries = _read_watch_root_entries(path=roots_path)
+        seen = {path_key(input_root) for input_root, _output_root in entries}
         added = []
         for path in paths:
             normalized = normalize_root(path)
             key = path_key(normalized)
             if key in seen:
                 continue
-            roots.append(normalized)
+            explicit_output = (
+                None
+                if output_dir is None
+                else _resolve_watch_output_root(normalized, output_dir)
+            )
+            entries.append((normalized, explicit_output))
             seen.add(key)
             added.append(normalized)
         if added:
-            _write_watch_roots_unlocked(roots, roots_path)
+            _write_watch_root_entries_unlocked(entries, roots_path)
     return roots_path, added
 
 
@@ -283,16 +334,16 @@ def remove_watch_roots(paths: list[str], *, cleanup: bool = True) -> tuple[Path,
     roots_path = watch_roots_path()
     with _watch_roots_mutex(roots_path):
         expected = {path_key(normalize_root(path)) for path in paths}
-        roots = read_watch_roots(path=roots_path)
-        kept = []
+        entries = _read_watch_root_entries(path=roots_path)
+        kept: list[WatchRootEntry] = []
         removed = []
-        for root in roots:
-            if path_key(root) in expected:
-                removed.append(root)
+        for input_root, output_root in entries:
+            if path_key(input_root) in expected:
+                removed.append(input_root)
             else:
-                kept.append(root)
+                kept.append((input_root, output_root))
         if removed:
-            _write_watch_roots_unlocked(kept, roots_path)
+            _write_watch_root_entries_unlocked(kept, roots_path)
     if cleanup:
         _cleanup_removed_watch_root_artifacts(removed)
     return roots_path, removed
@@ -500,9 +551,18 @@ class WatchService:
     async def reload(self) -> bool:
         return await self._reload_config()
 
-    async def add_roots(self, paths: list[str], *, initial_scan: bool = True) -> dict:
+    async def add_roots(
+        self,
+        paths: list[str],
+        *,
+        output_dir: str | None = None,
+        initial_scan: bool = True,
+    ) -> dict:
         async with self._reload_lock:
-            roots_path, added = add_watch_roots(paths)
+            if output_dir is None:
+                roots_path, added = add_watch_roots(paths)
+            else:
+                roots_path, added = add_watch_roots(paths, output_dir=output_dir)
             if not added:
                 self.log.write("watch_roots_add_skipped", requested=_normalize_scan_roots(paths))
                 return {

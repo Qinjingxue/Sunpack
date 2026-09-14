@@ -1,9 +1,24 @@
 from pathlib import Path
 
-from sunpack.platform.windows.toast_host import _check_hresult, _load_library
+from sunpack.platform.windows.toast_host import _check_hresult, _load_library, self_test_toast
 
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_toast_self_test_wrapper_checks_native_hresult(monkeypatch):
+    calls = []
+
+    class Library:
+        def sunpack_toast_self_test(self):
+            calls.append(True)
+            return 0
+
+    monkeypatch.setattr("sunpack.platform.windows.toast_host._load_library", lambda: Library())
+
+    self_test_toast()
+
+    assert calls == [True]
 
 
 def test_built_toast_dll_self_test():

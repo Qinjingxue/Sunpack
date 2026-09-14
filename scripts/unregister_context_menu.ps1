@@ -4,8 +4,10 @@ $ErrorActionPreference = "Stop"
 $keys = @(
     "HKCU:\Software\Classes\Directory\shell\SunPack",
     "HKCU:\Software\Classes\Directory\Background\shell\SunPack",
+    "HKCU:\Software\Classes\*\shell\SunPack",
     "HKCU:\Software\Classes\SunPack.FolderContextMenu",
-    "HKCU:\Software\Classes\SunPack.BackgroundContextMenu"
+    "HKCU:\Software\Classes\SunPack.BackgroundContextMenu",
+    "HKCU:\Software\Classes\SunPack.FileContextMenu"
 )
 
 foreach ($key in $keys) {

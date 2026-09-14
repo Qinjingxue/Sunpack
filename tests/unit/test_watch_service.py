@@ -850,6 +850,35 @@ def test_watch_roots_file_resolves_relative_output_against_its_input_root(tmp_pa
     assert root_outputs[service_module.path_key(str(nested_root.resolve()))] == "D:\\Out"
 
 
+def test_adding_and_removing_root_preserves_other_output_mappings(tmp_path, monkeypatch):
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    added_root = tmp_path / "added"
+    for directory in (first, second, added_root):
+        directory.mkdir()
+    roots_path.write_text(
+        f"{first} | D:\\FirstOut\n{second} | E:\\SecondOut\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    _, added = service_module.add_watch_roots([str(added_root)], output_dir="unpacked")
+    assert added == [str(added_root.resolve())]
+    assert roots_path.read_text(encoding="utf-8").splitlines() == [
+        f"{first.resolve()} | D:\\FirstOut",
+        f"{second.resolve()} | E:\\SecondOut",
+        f"{added_root.resolve()} | {(added_root / 'unpacked').resolve()}",
+    ]
+
+    _, removed = service_module.remove_watch_roots([str(added_root)])
+    assert removed == [str(added_root.resolve())]
+    assert roots_path.read_text(encoding="utf-8").splitlines() == [
+        f"{first.resolve()} | D:\\FirstOut",
+        f"{second.resolve()} | E:\\SecondOut",
+    ]
+
+
 def test_legacy_single_path_line_keeps_the_configured_out_dir(tmp_path, monkeypatch):
     roots_path = tmp_path / "sunpack_watch_roots.txt"
     watch_root = tmp_path / "downloads"
@@ -1212,6 +1241,92 @@ def test_watch_add_writes_a_plain_root_and_list_shows_it(tmp_path, monkeypatch):
 
     assert list_code == 0
     assert listed.items == [str(watch_root.resolve())]
+
+
+def test_watch_add_accepts_one_output_dir_and_persists_absolute_mapping(tmp_path, monkeypatch):
+    from sunpack.cli.cli import build_cli_parser
+    from sunpack.cli.cli_context import CliContext
+    from sunpack.cli import runtime_state
+
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    watch_root = tmp_path / "downloads"
+    watch_root.mkdir()
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    class FakeHost:
+        watch_enabled = False
+
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    parser = build_cli_parser(CliContext(language="en"))
+    args = parser.parse_args(["watch", "add", str(watch_root), "-o", "unpacked"])
+
+    code, result = _await(
+        watch_command._handle_add(
+            args,
+            SimpleNamespace(cwd=str(tmp_path), t=lambda key, **_: key),
+        )
+    )
+
+    assert code == 0
+    assert result.inputs["output_dir"] == "unpacked"
+    assert roots_path.read_text(encoding="utf-8").splitlines() == [
+        f"{watch_root.resolve()} | {(watch_root / 'unpacked').resolve()}"
+    ]
+
+
+def test_watch_add_rejects_shared_output_for_multiple_paths(monkeypatch):
+    from sunpack.cli import runtime_state
+
+    monkeypatch.setattr(
+        runtime_state,
+        "require_runtime_host",
+        lambda: (_ for _ in ()).throw(AssertionError("host must not be acquired")),
+    )
+    code, result = _await(
+        watch_command._handle_add(
+            SimpleNamespace(paths=["C:/first", "C:/second"], output_dir="out", start=False, initial_scan=False),
+            SimpleNamespace(t=lambda key, **_: "single-path"),
+        )
+    )
+
+    assert code == 2
+    assert result.errors == ["single-path"]
+
+
+def test_running_watch_add_forwards_output_dir(tmp_path, monkeypatch):
+    requested = ["C:/downloads/new"]
+    calls = []
+
+    class FakeHost:
+        watch_enabled = True
+
+        async def add_watch_roots(self, paths, *, output_dir=None, initial_scan=True):
+            calls.append((list(paths), output_dir, initial_scan))
+            return {
+                "roots_path": str(tmp_path / "roots.txt"),
+                "added": requested,
+                "applied": True,
+                "running": True,
+            }
+
+    from sunpack.cli import runtime_state
+
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    code, result = _await(
+        watch_command._handle_add(
+            SimpleNamespace(
+                paths=requested,
+                output_dir="C:/output",
+                start=False,
+                initial_scan=True,
+            ),
+            SimpleNamespace(t=lambda key, **_: key),
+        )
+    )
+
+    assert code == 0
+    assert calls == [(requested, "C:/output", True)]
+    assert result.inputs["output_dir"] == "C:/output"
 
 
 def test_watch_service_recalculates_deadline_after_scheduler_wakeup(tmp_path, monkeypatch):
