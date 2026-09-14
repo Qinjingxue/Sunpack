@@ -11,7 +11,7 @@ from typing import Any
 from sunpack.support.resource_lifecycle import open_service_file
 
 
-DEFAULT_EVENTS_MAX_BYTES = 5 * 1024 * 1024
+DEFAULT_EVENTS_MAX_BYTES = 1 * 1024 * 1024
 DEFAULT_EVENTS_BACKUP_COUNT = 1
 
 _PATH_LOCKS_GUARD = threading.Lock()

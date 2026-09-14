@@ -100,8 +100,8 @@ class WatchFailureReportStore:
         i18n: I18nContext,
         *,
         retention_days: int = 30,
-        max_files: int = 256,
-        max_bytes: int = 16 * 1024 * 1024,
+        max_files: int = 16,
+        max_bytes: int = 2 * 1024 * 1024,
     ):
         self.directory = Path(state_dir) / "failures"
         self.i18n = i18n
@@ -193,8 +193,8 @@ class WatchToastCoordinator:
             state_dir,
             self.i18n,
             retention_days=int(watch.get("toast_report_retention_days", 30)),
-            max_files=int(watch.get("toast_report_max_files", 256)),
-            max_bytes=int(watch.get("toast_report_max_bytes", 16 * 1024 * 1024)),
+            max_files=int(watch.get("toast_report_max_files", 16)),
+            max_bytes=int(watch.get("toast_report_max_bytes", 2 * 1024 * 1024)),
         )
 
     def submitted(self, request_id: str, source_path: str) -> None:

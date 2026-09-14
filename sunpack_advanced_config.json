@@ -130,8 +130,8 @@
     "toast_success_ttl_seconds": 3.0,
     "toast_failure_ttl_seconds": 5.0,
     "toast_report_retention_days": 30,
-    "toast_report_max_files": 256,
-    "toast_report_max_bytes": 16777216,
+    "toast_report_max_files": 16,
+    "toast_report_max_bytes": 2097152,
     "state_dir": ""
   },
   "passwords": {

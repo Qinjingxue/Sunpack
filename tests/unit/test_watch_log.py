@@ -12,8 +12,8 @@ def _records(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def test_watch_log_defaults_to_five_megabytes():
-    assert DEFAULT_EVENTS_MAX_BYTES == 5 * 1024 * 1024
+def test_watch_log_defaults_to_one_megabyte():
+    assert DEFAULT_EVENTS_MAX_BYTES == 1 * 1024 * 1024
 
 
 def test_watch_log_rotates_before_append_and_bounds_backups(tmp_path):

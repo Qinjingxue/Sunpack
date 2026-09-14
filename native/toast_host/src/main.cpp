@@ -362,7 +362,7 @@ void append_dismissal_event(
     );
     if (file == INVALID_HANDLE_VALUE) return;
     LARGE_INTEGER size{};
-    if (GetFileSizeEx(file, &size) && size.QuadPart > 1024 * 1024) {
+    if (GetFileSizeEx(file, &size) && size.QuadPart > 512 * 1024) {
         CloseHandle(file);
         file = CreateFileW(
             log_path.c_str(),
