@@ -49,7 +49,6 @@ const CLIENT_CONNECT_TIMEOUT_MS: u32 = 5_000;
 const LAST_CLIENT_DEBOUNCE: Duration = Duration::from_secs(1);
 const MAX_VOLUME_CONTEXTS: usize = 64;
 const VOLUME_CONTEXT_IDLE_TTL: Duration = Duration::from_secs(60);
-const BROKER_IDLE_SWEEP: Duration = Duration::from_secs(60);
 const PIPE_SDDL: &str = "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
 static CONFIG: OnceLock<BrokerConfig> = OnceLock::new();
 
@@ -150,13 +149,7 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
     let mut first_instance = true;
     let mut idle_since = None;
     let mut pending_accept: Option<PendingPipeAccept> = None;
-    let mut next_journal_sweep = Instant::now() + BROKER_IDLE_SWEEP;
     loop {
-        let now = Instant::now();
-        if now >= next_journal_sweep {
-            journals.reap_idle()?;
-            next_journal_sweep = now + BROKER_IDLE_SWEEP;
-        }
         workers.retain(|worker: &thread::JoinHandle<()>| !worker.is_finished());
         let leases = active_leases.load(Ordering::Acquire);
         let clients = connected_clients.load(Ordering::Acquire);
@@ -213,11 +206,7 @@ fn serve_watch_lifetimes(stop_event: HANDLE) -> io::Result<()> {
         } else {
             Some(started + Duration::from_millis(CLIENT_CONNECT_TIMEOUT_MS as u64))
         };
-        let wake_deadline = match idle_deadline {
-            Some(deadline) => Some(std::cmp::min(deadline, next_journal_sweep)),
-            None => Some(next_journal_sweep),
-        };
-        let timeout_ms = deadline_timeout_ms(wake_deadline);
+        let timeout_ms = deadline_timeout_ms(idle_deadline);
         let wait = if let Some(accept) = pending_accept.as_ref() {
             let handles = [stop_event, accept.event(), state_changed.raw()];
             unsafe { WaitForMultipleObjects(handles.len() as u32, handles.as_ptr(), 0, timeout_ms) }
@@ -417,16 +406,6 @@ type SharedJournalReader = Arc<Mutex<JournalReader>>;
 type VolumeTable = HashMap<String, (SharedJournalReader, Instant)>;
 
 impl JournalDispatcher {
-    fn reap_idle(&self) -> io::Result<()> {
-        let now = Instant::now();
-        let mut entries = self
-            .entries
-            .lock()
-            .map_err(|_| io::Error::other("volume table poisoned"))?;
-        Self::reap_idle_locked(&mut entries, now);
-        Ok(())
-    }
-
     fn reap_idle_locked(entries: &mut VolumeTable, now: Instant) {
         entries.retain(|_, (reader, last_used)| {
             Arc::strong_count(reader) > 1
@@ -908,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatcher_reaps_idle_volume_without_a_new_request() {
+    fn dispatcher_lazily_reaps_idle_volume_on_next_request() {
         let dispatcher = JournalDispatcher::default();
         let reader = dispatcher
             .reader_for(r"\\?\Volume{01234567-89ab-cdef-0123-456789abcdef}")
@@ -921,7 +900,12 @@ mod tests {
                 .unwrap();
             *last_used = Instant::now() - VOLUME_CONTEXT_IDLE_TTL - Duration::from_secs(1);
         }
-        dispatcher.reap_idle().unwrap();
-        assert!(dispatcher.entries.lock().unwrap().is_empty());
+        let next = dispatcher
+            .reader_for(r"\\?\Volume{fedcba98-7654-3210-fedc-ba9876543210}")
+            .unwrap();
+        drop(next);
+        let entries = dispatcher.entries.lock().unwrap();
+        assert!(!entries.contains_key(r"\\?\volume{01234567-89ab-cdef-0123-456789abcdef}"));
+        assert!(entries.contains_key(r"\\?\volume{fedcba98-7654-3210-fedc-ba9876543210}"));
     }
 }

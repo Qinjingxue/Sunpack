@@ -264,6 +264,42 @@ namespace sunpack::sevenzip
                 }
                 ++reclaimed_count_;
             }
+
+            const auto is_retained_state = [](const Entry &entry) noexcept
+            {
+                return entry.state && entry.state->persistent && entry.leases == 0 &&
+                       !entry.writer;
+            };
+            std::size_t retained_states = 0;
+            for (const auto &item : entries_)
+            {
+                if (is_retained_state(item.second))
+                {
+                    ++retained_states;
+                }
+            }
+            if (retained_states > kMaxRetainedVolumeStates)
+            {
+                std::size_t to_remove = retained_states - kMaxRetainedVolumeStates;
+                bool trimmed = false;
+                for (auto it = entries_.begin(); it != entries_.end() && to_remove != 0;)
+                {
+                    if (is_retained_state(it->second))
+                    {
+                        it = entries_.erase(it);
+                        --to_remove;
+                        trimmed = true;
+                    }
+                    else
+                    {
+                        ++it;
+                    }
+                }
+                if (trimmed)
+                {
+                    entries_.rehash(0);
+                }
+            }
         }
 
         retired.clear();

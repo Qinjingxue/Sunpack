@@ -509,6 +509,20 @@ bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
         std::cerr << "reclaimed facility is still counted as live\n";
         return false;
     }
+    // Historical persistent states are bounded independently of active and warm facilities.
+    for (std::size_t index = 0; index < 65; ++index) {
+        auto lease = registry.acquire("volume-cap-" + std::to_string(index));
+        if (!lease.valid()) {
+            std::cerr << "persistent volume could not be acquired for retention cap\n";
+            return false;
+        }
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+    registry.reap_idle();
+    if (registry.volume_keys().size() > 64) {
+        std::cerr << "persistent volume retention cap was exceeded\n";
+        return false;
+    }
     // The facility can be rebuilt for the same volume while its persistent state is retained.
     {
         auto lease = registry.acquire("volume-p");

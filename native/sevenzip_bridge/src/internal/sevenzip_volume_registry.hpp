@@ -111,6 +111,8 @@ namespace sunpack::sevenzip
         void shutdown() noexcept;
 
     private:
+        static constexpr std::size_t kMaxRetainedVolumeStates = 64;
+
         struct Entry
         {
             VolumeStatePtr state;
