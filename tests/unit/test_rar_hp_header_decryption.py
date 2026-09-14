@@ -136,6 +136,17 @@ def test_single_hp_rar_is_a_plain_file_group_not_a_split(tmp_path):
     assert group.is_split_candidate is False
 
 
+def test_single_hp_rar_with_split_like_filename_remains_a_plain_file_group(tmp_path):
+    _write_hex(tmp_path / "single.part1.rar", SINGLE_HP_HEX)
+    snapshot = _snapshot(tmp_path, ["single.part1.rar"])
+
+    groups = RelationsScheduler().build_candidate_groups(snapshot)
+
+    assert len(groups) == 1
+    assert groups[0].kind == "file"
+    assert groups[0].is_split_candidate is False
+
+
 def test_split_hp_rar_group_is_identified_from_filenames(tmp_path):
     _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
     _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX)

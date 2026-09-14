@@ -171,8 +171,7 @@ def test_real_strict_middle_gap_is_not_emitted_as_a_relation_group(tmp_path):
     assert all(len(group.input_paths) == 1 for group in groups)
 
     snapshot = WatchGroupCoordinator({}).resolve_head(str(parts[0]))
-    assert snapshot is not None
-    assert not snapshot.has_head
+    assert snapshot is None
 
 
 def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):

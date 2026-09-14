@@ -59,14 +59,6 @@ struct ProposalValidation {
 }
 
 #[derive(Debug, Clone)]
-struct StrongSeedDescriptor {
-    path: String,
-    logical_name: String,
-    split_family: String,
-    related_paths: Vec<String>,
-}
-
-#[derive(Debug, Clone)]
 struct FileRelationNative {
     filename: String,
     logical_name: String,
@@ -215,7 +207,7 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
             }
         })
         .collect();
-    let (groups, _) = build_candidate_groups_from_physical(
+    let groups = build_candidate_groups_from_physical(
         py,
         raw_rows,
         &filtered_keys,
@@ -224,66 +216,12 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
     Ok(groups)
 }
 
-#[pyfunction]
-#[pyo3(signature = (raw_snapshot, filtered_snapshot, path_passwords=None))]
-pub(crate) fn relations_build_candidate_groups_with_state_from_snapshot(
-    py: Python<'_>,
-    raw_snapshot: PyRef<'_, NativeDirectorySnapshot>,
-    filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
-    path_passwords: Option<Vec<(String, String)>>,
-) -> PyResult<Py<PyDict>> {
-    let filtered_keys: HashSet<String> = filtered_snapshot
-        .relation_file_records()
-        .map(|(path, _, _, _)| path.to_ascii_lowercase())
-        .collect();
-    let raw_rows: Vec<RelationInput> = raw_snapshot
-        .relation_file_records()
-        .map(|(path, size, relation_member_eligible, anchor)| {
-            let path = path.to_string();
-            let path_key = path.to_ascii_lowercase();
-            let name = Path::new(&path)
-                .file_name()
-                .map(|value| value.to_string_lossy().to_string())
-                .unwrap_or_default();
-            RelationInput {
-                path,
-                path_key,
-                name,
-                size,
-                relation_member_eligible,
-                anchor: anchor.cloned(),
-            }
-        })
-        .collect();
-    let (groups, strong_seeds) = build_candidate_groups_from_physical(
-        py,
-        raw_rows,
-        &filtered_keys,
-        path_passwords.as_deref(),
-    )?;
-    let out = PyDict::new(py);
-    out.set_item("groups", PyList::new(py, groups)?)?;
-    let seed_dicts = strong_seeds
-        .into_iter()
-        .map(|seed| {
-            let item = PyDict::new(py);
-            item.set_item("path", seed.path)?;
-            item.set_item("logical_name", seed.logical_name)?;
-            item.set_item("split_family", seed.split_family)?;
-            item.set_item("related_paths", seed.related_paths)?;
-            Ok(item)
-        })
-        .collect::<PyResult<Vec<_>>>()?;
-    out.set_item("strong_seed_paths", PyList::new(py, seed_dicts)?)?;
-    Ok(out.unbind())
-}
-
 fn build_candidate_groups_from_physical(
     py: Python<'_>,
     rows: Vec<RelationInput>,
     filtered_keys: &HashSet<String>,
     path_passwords: Option<&[(String, String)]>,
-) -> PyResult<(Vec<Py<PyDict>>, Vec<StrongSeedDescriptor>)> {
+) -> PyResult<Vec<Py<PyDict>>> {
     let mut by_directory: HashMap<String, Vec<RelationInput>> = HashMap::new();
     let mut directory_order = Vec::new();
     for row in rows {
@@ -295,7 +233,6 @@ fn build_candidate_groups_from_physical(
     }
 
     let mut output = Vec::new();
-    let mut strong_seed_descriptors = Vec::new();
     // A password map is only supplied on the retry pass after an encrypted
     // proposal has already been discovered and its password has been
     // verified against at least one member.  If that retry still cannot
@@ -346,7 +283,10 @@ fn build_candidate_groups_from_physical(
             // rebuild it after an MZ seed has been promoted by structure.
             name_index = DirectoryNameIndex::build(&directory_rows);
         }
-        let mut strong_seed_paths = HashSet::new();
+        let mut strong_suppressed_paths = inconclusive_encrypted_family_paths(
+            &directory_rows,
+            &name_index,
+        );
         let mut proposals = Vec::new();
         let mut proposal_keys = HashSet::new();
 
@@ -360,19 +300,17 @@ fn build_candidate_groups_from_physical(
                 continue;
             };
             if strength == "strong" {
-                strong_seed_paths.insert(seed.path.to_ascii_lowercase());
-                if let Some(descriptor) = strong_seed_descriptor(
-                    seed,
-                    &directory_rows,
-                    &name_index,
-                    anchor,
-                ) {
-                    if strong_seed_descriptors.iter().all(|existing: &StrongSeedDescriptor| {
-                        !existing.path.eq_ignore_ascii_case(&descriptor.path)
-                    }) {
-                        strong_seed_descriptors.push(descriptor);
-                    }
-                }
+                strong_suppressed_paths.insert(seed.path.to_ascii_lowercase());
+                strong_suppressed_paths.extend(
+                    strong_seed_related_paths(
+                        seed,
+                        &directory_rows,
+                        &name_index,
+                        anchor,
+                    )
+                    .into_iter()
+                    .map(|path| path.to_ascii_lowercase()),
+                );
             }
             for interpretation in name_index.interpretations(seed, &anchor.format) {
                 if !has_filtered_family_trigger(
@@ -492,12 +430,12 @@ fn build_candidate_groups_from_physical(
                 && !claimed_paths.contains(&row.path.to_ascii_lowercase())
                 && !password_paths.contains(&row.path.to_ascii_lowercase())
                 && !attempted_password_paths.contains(&row.path.to_ascii_lowercase())
-                && !strong_seed_paths.contains(&row.path.to_ascii_lowercase())
+                && !strong_suppressed_paths.contains(&row.path.to_ascii_lowercase())
         }) {
             output.push(ordinary_file_group_to_dict(py, row)?);
         }
     }
-    Ok((output, strong_seed_descriptors))
+    Ok(output)
 }
 
 fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
@@ -537,35 +475,65 @@ fn seed_strength_for_row(
     name_index: &DirectoryNameIndex,
 ) -> Option<&'static str> {
     let anchor = row.anchor.as_ref()?;
-    if let Some(strength) = cheap_seed_strength(anchor) {
-        if strength == "weak"
-            && anchor.encrypted
-            && !anchor.standalone
-            && anchor.anchor_roles.contains(&"encrypted_volume")
-            && name_index
-                .candidates(row)
-                .iter()
-                .any(|candidate| candidate.number > 0)
-        {
-            return Some("strong");
-        }
-        return Some(strength);
-    }
-    // Header encryption hides the RAR volume flags.  The native observation
-    // still proves that this is an encrypted archive volume, while the
-    // numbered filename proves it is not a standalone input.  Treat that
-    // combination as a strong seed so an incomplete download is ignored until
-    // the missing head/password evidence arrives; do not add a format-specific
-    // ordinary-candidate suppression path.
-    (anchor.confidence == "strong"
+    let strength = cheap_seed_strength(anchor)?;
+    if strength == "weak"
+        && anchor.format == "rar"
+        && anchor.sfx
+        && anchor.pe_structure
         && anchor.encrypted
-        && !anchor.standalone
-        && anchor.anchor_roles.contains(&"encrypted_volume")
-        && name_index
-            .candidates(row)
-            .iter()
-            .any(|candidate| candidate.number > 0))
-        .then_some("strong")
+        && anchor.anchor_roles.iter().any(|role| *role == "encrypted_volume")
+        && anchor.structure_offset.is_some_and(|offset| offset > 0)
+        && name_index.candidates(row).iter().any(|candidate| {
+            candidate.number == 1
+                && candidate.family == "rar"
+                && Path::new(&row.name)
+                    .extension()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
+        })
+    {
+        return Some("strong");
+    }
+    Some(strength)
+}
+
+fn inconclusive_encrypted_family_paths(
+    rows: &[RelationInput],
+    name_index: &DirectoryNameIndex,
+) -> HashSet<String> {
+    let mut families: HashMap<String, Vec<String>> = HashMap::new();
+    for row in rows {
+        let Some(anchor) = row.anchor.as_ref() else {
+            continue;
+        };
+        if anchor.format != "rar"
+            || anchor.confidence != "strong"
+            || !anchor.encrypted
+            || anchor.standalone
+            || !anchor.anchor_roles.iter().any(|role| *role == "encrypted_volume")
+        {
+            continue;
+        }
+        for candidate in name_index.candidates(row).iter().filter(|candidate| {
+            candidate.number > 0
+                && (candidate.family == "rar" || candidate.family == "generic")
+        }) {
+            let logical_name = logical_name_from_parsed(candidate).to_ascii_lowercase();
+            if logical_name.is_empty() {
+                continue;
+            }
+            families
+                .entry(logical_name)
+                .or_default()
+                .push(row.path.clone());
+        }
+    }
+
+    families
+        .into_values()
+        .filter(|paths| paths.iter().map(|path| path.to_ascii_lowercase()).collect::<HashSet<_>>().len() >= 2)
+        .flat_map(|paths| paths.into_iter().map(|path| path.to_ascii_lowercase()))
+        .collect()
 }
 
 fn is_weak_sfx_split_head(row: &RelationInput, name_index: &DirectoryNameIndex) -> bool {
@@ -613,12 +581,12 @@ fn is_strong_multivolume_first_seed(
             && numbered_first)
 }
 
-fn strong_seed_descriptor(
+fn strong_seed_related_paths(
     row: &RelationInput,
     rows: &[RelationInput],
     name_index: &DirectoryNameIndex,
     anchor: &VolumeAnchor,
-) -> Option<StrongSeedDescriptor> {
+) -> Vec<String> {
     let parsed = name_index
         .candidates(row)
         .iter()
@@ -633,14 +601,9 @@ fn strong_seed_descriptor(
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| get_logical_name(&row.name, false));
     if logical_name.is_empty() {
-        return None;
+        return Vec::new();
     }
-    let style = parsed.map(|value| value.style).unwrap_or(if anchor.sfx {
-        "rar_sfx_part"
-    } else {
-        "part_numbered"
-    });
-    let related_paths = rows
+    rows
         .iter()
         .filter(|candidate_row| candidate_row.relation_member_eligible)
         .filter(|candidate_row| {
@@ -654,13 +617,7 @@ fn strong_seed_descriptor(
             })
         })
         .map(|candidate_row| candidate_row.path.clone())
-        .collect();
-    Some(StrongSeedDescriptor {
-        path: row.path.clone(),
-        logical_name,
-        split_family: split_family_for_proposal(&anchor.format, style),
-        related_paths,
-    })
+        .collect()
 }
 
 fn name_interpretations_from_candidates(
@@ -1776,7 +1733,7 @@ pub(crate) fn relations_resolve_volume_once(
         .filter(|path| parent_directory_key(path) == directory)
         .map(|path| path.to_ascii_lowercase())
         .collect();
-    let (groups, _) = build_candidate_groups_from_physical(
+    let groups = build_candidate_groups_from_physical(
         py,
         rows,
         &filtered_keys,

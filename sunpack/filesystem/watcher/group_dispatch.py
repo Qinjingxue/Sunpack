@@ -58,7 +58,14 @@ def plan_watch_dispatches(
     deferred_groups: set[str] = set()
 
     for candidate in ready:
-        snapshot = resolved.get(path_key(candidate.path))
+        candidate_key = path_key(candidate.path)
+        if candidate_key not in resolved:
+            # Relation resolution deliberately omitted this path from the
+            # current tick (for example an incomplete strong-seed family).
+            # Keep it suppressed until a later filesystem event causes a new
+            # relation scan; do not turn it into an ordinary-file dispatch.
+            continue
+        snapshot = resolved[candidate_key]
         if snapshot is None:
             entry = state.latest_entry_for_path(candidate.path)
             blockers = _entry_blockers(entry)
