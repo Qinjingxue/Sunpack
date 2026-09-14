@@ -106,21 +106,15 @@ async def _handle_add(args, ctx):
     host = require_runtime_host()
     apply_summary = None
     if host.watch_enabled:
-        if output_dir is None:
-            apply_summary = await host.add_watch_roots(paths, initial_scan=initial_scan_requested)
-        else:
-            apply_summary = await host.add_watch_roots(
-                paths,
-                output_dir=output_dir,
-                initial_scan=initial_scan_requested,
-            )
+        apply_summary = await host.add_watch_roots(
+            paths,
+            output_dir=output_dir,
+            initial_scan=initial_scan_requested,
+        )
         roots_path = apply_summary["roots_path"]
         added = list(apply_summary["added"])
     else:
-        if output_dir is None:
-            roots_path_obj, added = add_watch_roots(paths)
-        else:
-            roots_path_obj, added = add_watch_roots(paths, output_dir=output_dir)
+        roots_path_obj, added = add_watch_roots(paths, output_dir=output_dir)
         roots_path = str(roots_path_obj)
     start_summary = None
     if start_requested and not host.watch_enabled:

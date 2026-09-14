@@ -195,10 +195,7 @@ class RuntimeHost:
         if service is None or not self.watch_enabled:
             self.log_event("watch_roots_add_ignored", paths=list(paths))
             return {"added": [], "applied": False, "running": False}
-        if output_dir is None:
-            result = await service.add_roots(paths, initial_scan=initial_scan)
-        else:
-            result = await service.add_roots(paths, output_dir=output_dir, initial_scan=initial_scan)
+        result = await service.add_roots(paths, output_dir=output_dir, initial_scan=initial_scan)
         self.log_event(
             "watch_roots_added",
             added=list(result["added"]),

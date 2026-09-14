@@ -95,16 +95,9 @@ def _watch_root_checks() -> list[dict]:
     checks = []
     for root in roots:
         if os.path.isdir(root):
-            checks.append(_check("watch_root", "ok", root, path=root))
+            checks.append(_check("watch_root", "ok", path=root))
         else:
-            checks.append(
-                _check(
-                    "watch_root",
-                    "warn",
-                    f"{root} - directory not found",
-                    path=root,
-                )
-            )
+            checks.append(_check("watch_root", "warn", "directory not found", path=root))
     return checks
 
 
@@ -135,6 +128,7 @@ def handle(args, ctx):
         "checks": len(checks),
         "ok": sum(check["status"] == "ok" for check in checks),
         "warnings": sum(check["status"] == "warn" for check in checks),
+        "skipped": sum(check["status"] == "skip" for check in checks),
         "failed": sum(check["status"] == "fail" for check in checks),
     }
     errors = [str(check.get("detail", check["name"])) for check in checks if check["status"] == "fail"]
@@ -150,6 +144,7 @@ def handle(args, ctx):
                 "cli.doctor.summary",
                 ok=counts["ok"],
                 warnings=counts["warnings"],
+                skipped=counts["skipped"],
                 failed=counts["failed"],
             )
         )

@@ -251,7 +251,7 @@ def test_watch_runtime_delegates_start_to_runtime_host(monkeypatch):
 
 
 def test_watch_add_reports_start_request_without_creating_watch_process(tmp_path, monkeypatch):
-    monkeypatch.setattr(watch_command, "add_watch_roots", lambda paths: (tmp_path / "roots.txt", paths))
+    monkeypatch.setattr(watch_command, "add_watch_roots", lambda paths, output_dir=None: (tmp_path / "roots.txt", paths))
 
     class FakeHost:
         watch_enabled = False
@@ -281,7 +281,7 @@ def test_watch_add_applies_directly_to_running_service(tmp_path, monkeypatch):
     class FakeHost:
         watch_enabled = True
 
-        async def add_watch_roots(self, paths, *, initial_scan=True):
+        async def add_watch_roots(self, paths, *, output_dir=None, initial_scan=True):
             calls.append((list(paths), initial_scan))
             return {
                 "roots_path": str(tmp_path / "roots.txt"),

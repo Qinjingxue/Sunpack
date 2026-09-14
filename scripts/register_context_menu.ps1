@@ -207,7 +207,7 @@ function Set-ContextMenuParent {
         [string]$SubCommandsKey
     )
 
-    $null = New-Item -LiteralPath $KeyPath -Force
+    $null = New-Item -Path $KeyPath -Force
     Set-Item -LiteralPath $KeyPath -Value $MenuLabel
     Set-ItemProperty -LiteralPath $KeyPath -Name "MUIVerb" -Value $MenuLabel
     Set-ItemProperty -LiteralPath $KeyPath -Name "Icon" -Value $IconValue
@@ -229,12 +229,12 @@ function Set-ContextMenuCommand {
     )
 
     $keyPath = Join-Path (Join-Path $ParentKeyPath "shell") $CommandName
-    $null = New-Item -LiteralPath $keyPath -Force
+    $null = New-Item -Path $keyPath -Force
     Set-Item -LiteralPath $keyPath -Value $MenuLabel
     Set-ItemProperty -LiteralPath $keyPath -Name "MUIVerb" -Value $MenuLabel
     Set-ItemProperty -LiteralPath $keyPath -Name "Icon" -Value $IconValue
     $commandKey = Join-Path $keyPath "command"
-    $null = New-Item -LiteralPath $commandKey -Force
+    $null = New-Item -Path $commandKey -Force
     Set-Item -LiteralPath $commandKey -Value $CommandLine
 }
 

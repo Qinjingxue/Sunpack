@@ -20,6 +20,7 @@ sunpack.exe <command> [options] [paths...]
 - `inspect`：输出每个文件的检测细节，不修改文件。
 - `passwords`：查看实际会参与尝试的密码列表。
 - `config`：查看或校验简化配置与高级配置合并后的有效配置。
+- `doctor`：只读检查配置和运行环境，不启动处理流程。
 
 ## 通用输出参数
 
@@ -169,10 +170,13 @@ F:\Incoming | .
 ```powershell
 python sunpack.py watch add D:\Downloads
 python sunpack.py watch add D:\Incoming --initial-scan
+python sunpack.py watch add D:\Downloads -o unpacked
 python sunpack.py watch list
 python sunpack.py watch start --initial-scan
 python sunpack.py watch reload
 ```
+
+`watch add` 的 `-o` / `--out-dir` 只能和一个输入目录一起使用。相对输出路径按该输入目录解析并以绝对路径持久化；已有目录不会因为重复 `add` 而更新输出映射，需先 `remove` 再重新 `add`。
 
 ## passwords
 
@@ -235,6 +239,17 @@ python sunpack.py config validate --json
 ```
 
 
+## doctor
+
+用法：
+
+```powershell
+python sunpack.py doctor [--json] [--quiet]
+```
+
+`doctor` 只读检查配置、`sunpack_native`、`7z.dll`、SevenZip worker、Toast native self-test，以及已配置的 watch roots。不存在的 watch root 只报告警告；不启动 watch、worker 或真实解压，也不修改注册表。存在失败项时退出码为 `1`，只有警告或跳过项时退出码仍为 `0`。
+
+
 ## Windows 右键菜单
 
 项目提供当前用户级右键菜单脚本：
@@ -244,4 +259,6 @@ python sunpack.py config validate --json
 .\scripts\unregister_context_menu.ps1
 ```
 
-发行包内的注册脚本会使用脚本父目录中的 `sunpack.exe`，因此不依赖外层目录名。从源码树运行时，脚本也会识别唯一的 `dist/sunpack-*/sunpack.exe`；若存在多个构建产物，必须用 `-AppPath` 明确选择。找不到打包程序时才使用 `python sunpack.py`。卸载脚本只删除固定注册表键，不依赖安装目录。默认菜单项对文件夹或目录空白处执行 `extract <目标> --ask-pw --pause`，适合给非终端使用场景保留暂停窗口。
+发行包内的注册脚本会使用脚本父目录中的 `sunpack.exe`，因此不依赖外层目录名。从源码树运行时，脚本也会识别唯一的 `dist/sunpack-*/sunpack.exe`；若存在多个构建产物，必须用 `-AppPath` 明确选择。找不到打包程序时才使用 `python sunpack.py`。卸载脚本只删除固定注册表键，不依赖安装目录。
+
+文件夹和目录空白处菜单保留解压、监控和取消监控动作；任意文件的 `*` 菜单只提供直接解压和交互输入密码解压，分别执行 `extract "%1" --pause` 与 `extract "%1" --ask-pw --pause`，输出默认落在归档旁边。

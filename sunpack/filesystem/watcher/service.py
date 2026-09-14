@@ -559,10 +559,7 @@ class WatchService:
         initial_scan: bool = True,
     ) -> dict:
         async with self._reload_lock:
-            if output_dir is None:
-                roots_path, added = add_watch_roots(paths)
-            else:
-                roots_path, added = add_watch_roots(paths, output_dir=output_dir)
+            roots_path, added = add_watch_roots(paths, output_dir=output_dir)
             if not added:
                 self.log.write("watch_roots_add_skipped", requested=_normalize_scan_roots(paths))
                 return {

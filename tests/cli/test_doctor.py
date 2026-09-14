@@ -40,9 +40,10 @@ def test_doctor_reports_checks_and_missing_watch_roots_as_warnings(tmp_path, mon
 
     assert code == 0
     assert [check["status"] for check in result.items] == ["ok", "ok", "ok", "ok", "skip", "warn"]
-    assert result.summary == {"checks": 6, "ok": 4, "warnings": 1, "failed": 0}
+    assert result.summary == {"checks": 6, "ok": 4, "warnings": 1, "skipped": 1, "failed": 0}
     assert "[WARN] Watch root" in stdout.getvalue()
-    assert "directory not found" in stdout.getvalue()
+    assert f"[WARN] Watch root {missing}: directory not found" in stdout.getvalue()
+    assert f": {missing} - directory not found" not in stdout.getvalue()
     assert stderr.getvalue() == ""
 
 
