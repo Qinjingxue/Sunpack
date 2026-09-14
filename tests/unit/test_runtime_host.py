@@ -134,7 +134,7 @@ def test_runtime_host_brackets_overlapping_foreground_activity(monkeypatch):
     background_schedules = []
 
     class FakeScheduler:
-        def set_external_activity(self, active):
+        async def set_external_activity(self, active):
             activity.append(active)
 
     host = RuntimeHost()
@@ -156,6 +156,53 @@ def test_runtime_host_brackets_overlapping_foreground_activity(monkeypatch):
         assert activity == [True]
         assert background_schedules == []
 
+        await host.foreground_finished()
+        assert activity == [True, False]
+        assert background_schedules == [True]
+
+    asyncio.run(scenario())
+
+
+def test_runtime_host_does_not_bypass_a_waiting_first_foreground(monkeypatch):
+    activity = []
+    background_schedules = []
+
+    class FakeScheduler:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+
+        async def set_external_activity(self, active):
+            activity.append(active)
+            if active:
+                self.started.set()
+                await self.release.wait()
+
+    async def scenario():
+        scheduler = FakeScheduler()
+        host = RuntimeHost()
+        host._watch_service = SimpleNamespace(scheduler=scheduler)
+        host._watch_task = SimpleNamespace(done=lambda: False)
+
+        async def set_process_mode(*, background):
+            return None
+
+        monkeypatch.setattr(host, "_set_process_mode", set_process_mode)
+        monkeypatch.setattr(host, "_schedule_background", lambda: background_schedules.append(True))
+
+        first = asyncio.create_task(host.foreground_started())
+        await scheduler.started.wait()
+        second = asyncio.create_task(host.foreground_started())
+        await asyncio.sleep(0)
+        assert not second.done()
+        assert host._foreground_requests == 0
+
+        scheduler.release.set()
+        await asyncio.gather(first, second)
+        assert host._foreground_requests == 2
+        assert activity == [True]
+
+        await host.foreground_finished()
         await host.foreground_finished()
         assert activity == [True, False]
         assert background_schedules == [True]

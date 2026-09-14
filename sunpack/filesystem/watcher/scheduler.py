@@ -212,6 +212,8 @@ class WatchScheduler:
             float(watch_config.get("runtime_cache_cleanup_idle_seconds", 10.0)),
         )
         self._cache_cleanup_deadline: float | None = None
+        self._runtime_cache_gate = asyncio.Lock()
+        self._external_activity_gate_held = False
         if pipeline_engine is None:
             raise ValueError("WatchScheduler requires a PipelineEngine")
         self.pipeline_engine = pipeline_engine
@@ -583,13 +585,22 @@ class WatchScheduler:
             idle_seconds=self.runtime_cache_cleanup_idle_seconds,
         )
 
-    def set_external_activity(self, active: bool) -> None:
-        """Track foreground work that runs outside the watch pipeline."""
+    async def set_external_activity(self, active: bool) -> None:
+        """Serialize foreground runtime work with idle cache cleanup."""
+        if not self.runtime_cache_cleanup_enabled:
+            return
         if active:
+            await self._runtime_cache_gate.acquire()
+            self._external_activity_gate_held = True
             self._reset_idle_cache_cleanup()
             return
-        self._arm_idle_cache_cleanup()
-        self._wake_service()
+        try:
+            self._arm_idle_cache_cleanup()
+            self._wake_service()
+        finally:
+            if self._external_activity_gate_held:
+                self._external_activity_gate_held = False
+                self._runtime_cache_gate.release()
 
     async def _maybe_clear_idle_caches(self) -> None:
         if not self.runtime_cache_cleanup_enabled:
@@ -600,25 +611,34 @@ class WatchScheduler:
                 return
             if self._pending or self._inflight_requests:
                 return
-            self._cache_cleanup_deadline = None
-        self.log.write("cache_cleanup_started")
-        started = time.perf_counter()
-        report = await self.pipeline_engine.clear_runtime_caches()
-        if report.get("skipped"):
+        if self._external_activity_gate_held:
+            return
+        async with self._runtime_cache_gate:
+            now = time.monotonic()
             with self._lock:
-                if (
-                    self._cache_cleanup_deadline is None
-                    and not self._pending
-                    and not self._inflight_requests
-                ):
-                    self._cache_cleanup_deadline = (
-                        time.monotonic() + self.runtime_cache_cleanup_idle_seconds
-                    )
-        self.log.write(
-            "cache_cleanup_finished",
-            elapsed_seconds=time.perf_counter() - started,
-            report=report,
-        )
+                if self._cache_cleanup_deadline is None or now < self._cache_cleanup_deadline:
+                    return
+                if self._pending or self._inflight_requests:
+                    return
+                self._cache_cleanup_deadline = None
+            self.log.write("cache_cleanup_started")
+            started = time.perf_counter()
+            report = await self.pipeline_engine.clear_runtime_caches()
+            if report.get("skipped"):
+                with self._lock:
+                    if (
+                        self._cache_cleanup_deadline is None
+                        and not self._pending
+                        and not self._inflight_requests
+                    ):
+                        self._cache_cleanup_deadline = (
+                            time.monotonic() + self.runtime_cache_cleanup_idle_seconds
+                        )
+            self.log.write(
+                "cache_cleanup_finished",
+                elapsed_seconds=time.perf_counter() - started,
+                report=report,
+            )
 
     def enqueue(
         self,

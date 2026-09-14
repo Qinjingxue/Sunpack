@@ -26,6 +26,7 @@ class RuntimeHost:
         state_changed: Callable[[], None] | None = None,
     ) -> None:
         self._lock = asyncio.Lock()
+        self._foreground_state_lock = asyncio.Lock()
         self._qos_lock = asyncio.Lock()
         self._watch_service: WatchService | None = None
         self._watch_task: asyncio.Task[int] | None = None
@@ -236,13 +237,14 @@ class RuntimeHost:
         self.log_event("host_stopped", exit_reason=str(exit_reason))
 
     async def foreground_started(self) -> None:
-        first = self._foreground_requests == 0
-        self._foreground_requests += 1
-        if first and self.watch_enabled:
-            service = self._watch_service
-            scheduler = service.scheduler if service is not None else None
-            if scheduler is not None:
-                scheduler.set_external_activity(True)
+        async with self._foreground_state_lock:
+            first = self._foreground_requests == 0
+            if first and self.watch_enabled:
+                service = self._watch_service
+                scheduler = service.scheduler if service is not None else None
+                if scheduler is not None:
+                    await scheduler.set_external_activity(True)
+            self._foreground_requests += 1
         self.log_event("foreground_started", foreground_requests=self._foreground_requests)
         demote = self._demote_task
         self._demote_task = None
@@ -251,13 +253,16 @@ class RuntimeHost:
         await self._set_process_mode(background=False)
 
     async def foreground_finished(self) -> None:
-        self._foreground_requests = max(0, self._foreground_requests - 1)
+        async with self._foreground_state_lock:
+            self._foreground_requests = max(0, self._foreground_requests - 1)
+            last = self._foreground_requests == 0 and self.watch_enabled
+            if last:
+                service = self._watch_service
+                scheduler = service.scheduler if service is not None else None
+                if scheduler is not None:
+                    await scheduler.set_external_activity(False)
         self.log_event("foreground_finished", foreground_requests=self._foreground_requests)
-        if self._foreground_requests == 0 and self.watch_enabled:
-            service = self._watch_service
-            scheduler = service.scheduler if service is not None else None
-            if scheduler is not None:
-                scheduler.set_external_activity(False)
+        if last:
             self._schedule_background()
 
     def _schedule_background(self) -> None:
