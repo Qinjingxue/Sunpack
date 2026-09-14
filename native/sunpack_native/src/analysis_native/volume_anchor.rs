@@ -326,6 +326,21 @@ fn probe_path(
         return result;
     }
     probe_standalone_stream(&prefix, &mut result);
+    // A deep probe of a launcher that carries its archive in external
+    // split-volume files still needs to retain the PE/SFX seed.  There is no
+    // embedded archive signature to promote it to a format-specific anchor,
+    // but losing the MZ evidence here would make the filename proposal look
+    // like an ordinary non-SFX executable and detach the companion from the
+    // already validated external volumes.
+    if allow_embedded
+        && result.format.is_empty()
+        && result.error.is_empty()
+        && !result.evidence.iter().any(|item| *item == "sfx:pe_header")
+    {
+        result.confidence = "weak".to_string();
+        result.sfx = true;
+        result.evidence.push("sfx:pe_header");
+    }
     result
 }
 

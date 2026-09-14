@@ -289,6 +289,7 @@ impl AnalysisBinaryView {
                 result.set_item("strong_accept", true)?;
                 result.set_item("blocks_checked", index + 1)?;
                 result.set_item("end_block_found", true)?;
+                result.set_item("end_block_flags", u64::from(header_flags))?;
                 result.set_item("segment_end", next_cursor)?;
                 result.set_item("evidence", evidence)?;
                 return Ok(());
@@ -489,11 +490,15 @@ impl AnalysisBinaryView {
                 result.set_item("block_walk_ok", true)?;
             }
             if header_type == 5 {
+                let end_flags = read_vint(&full, field_cursor)
+                    .map(|(value, _)| value)
+                    .unwrap_or(0);
                 evidence.append("rar5:end_block")?;
                 result.set_item("plausible", true)?;
                 result.set_item("strong_accept", true)?;
                 result.set_item("blocks_checked", index + 1)?;
                 result.set_item("end_block_found", true)?;
+                result.set_item("end_block_flags", end_flags)?;
                 result.set_item("segment_end", next_cursor)?;
                 result.set_item("evidence", evidence)?;
                 return Ok(());

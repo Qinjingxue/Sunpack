@@ -863,12 +863,26 @@ def _possible_missing_volume_failure(
     failure: FailureInfo | None,
     i18n: I18nContext,
 ) -> FailureInfo | None:
-    if outcome_kind == OutcomeKind.COMPLETE_SUCCESS or not _task_is_split_input(task):
+    encrypted_rar_member = _is_unresolved_encrypted_rar_member(task)
+    if outcome_kind == OutcomeKind.COMPLETE_SUCCESS or (
+        not _task_is_split_input(task) and not encrypted_rar_member
+    ):
         return None
     if failure is not None and failure.contains(FailureKind.MISSING_VOLUME):
         return None
+    # Header-encrypted RAR members cannot expose their volume number until a
+    # password is available.  They must remain ordinary visible candidates
+    # (a lone ``part2`` may be a standalone archive), but a damaged extraction
+    # of one is still the same user-visible condition as any other incomplete
+    # split input.  Keep authentication failures in their original category.
+    if encrypted_rar_member and failure is not None and failure.contains(
+        FailureKind.PASSWORD_REQUIRED,
+        FailureKind.WRONG_PASSWORD,
+        FailureKind.PASSWORD_INCONCLUSIVE,
+    ):
+        return None
 
-    probe_suspected = _failure_has_possible_missing_volume_evidence(failure)
+    probe_suspected = encrypted_rar_member or _failure_has_possible_missing_volume_evidence(failure)
 
     evidence = ""
     if outcome_kind == OutcomeKind.PARTIAL_SUCCESS:
@@ -903,6 +917,36 @@ def _task_is_split_input(task: ArchiveTask) -> bool:
         or task.fact_bag.get("relation.is_split_related")
         or len(task.all_parts or []) > 1
     )
+
+
+def _is_unresolved_encrypted_rar_member(task: ArchiveTask) -> bool:
+    """Recognize a password-blocked RAR volume without suppressing it.
+
+    The relation layer deliberately does not hide filename-only ``partN``
+    files: a lone header-encrypted member must still be offered as an
+    ordinary candidate.  Once extraction proves that such a candidate cannot
+    stand alone, report the bounded missing-volume diagnosis here instead of
+    inventing a filename-based relation or relabeling it as generic damage.
+    """
+    bag = task.fact_bag
+    anchor = bag.get("relation.volume_anchor")
+    if not isinstance(anchor, dict):
+        return False
+    if str(anchor.get("format") or "").casefold() != "rar":
+        return False
+    if not bool(anchor.get("needs_password")):
+        return False
+    if not any(
+        str(item) in {"rar4:encryption_header", "rar5:encryption_header"}
+        for item in (anchor.get("evidence") or [])
+    ):
+        return False
+    name = os.path.basename(str(bag.get("file.path") or task.main_path or "")).casefold()
+    # This is intentionally only a classification hint, never a relation
+    # builder.  The standard RAR spelling is the only form needed here; all
+    # disguised/ambiguous forms remain visible as ordinary candidates and
+    # retain their backend's original failure classification.
+    return ".part" in name and any(character.isdigit() for character in name[name.find(".part") + 5 :])
 
 
 def _failure_has_possible_missing_volume_evidence(failure: FailureInfo | None) -> bool:

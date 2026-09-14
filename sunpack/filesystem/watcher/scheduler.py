@@ -1419,6 +1419,12 @@ class WatchScheduler:
                 self.state.clear_group(group.group_id)
             else:
                 self.state.record_group_done(completed_group)
+            # A split group owns every physical input and launcher companion.
+            # Earlier arrivals may have been attempted as standalone files and
+            # left retry blockers behind.  Once the canonical group completes,
+            # those per-file blockers are obsolete; retaining them makes watch
+            # state report a missing volume after a successful group extraction.
+            self.state.clear_entries(group.owned_paths)
         self.state.mark(
             candidate.path,
             candidate.size,

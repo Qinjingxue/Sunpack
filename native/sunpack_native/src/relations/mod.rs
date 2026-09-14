@@ -1,6 +1,7 @@
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_paths_cheap, probe_volume_anchor_paths_deep, VolumeAnchor,
 };
+use crate::analysis_native::{probe_rar_path, probe_rar_volume_paths, probe_zip_volume_paths};
 use crate::scan::directory::NativeDirectorySnapshot;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -12,6 +13,7 @@ use std::sync::OnceLock;
 #[derive(Debug, Clone)]
 struct RelationInput {
     path: String,
+    path_key: String,
     name: String,
     size: Option<u64>,
     relation_member_eligible: bool,
@@ -82,6 +84,69 @@ struct ParsedVolume {
     decorated: bool,
 }
 
+#[derive(Debug, Default)]
+struct DirectoryNameIndex {
+    entries_by_path: HashMap<String, DirectoryNameEntry>,
+}
+
+#[derive(Debug, Default)]
+struct DirectoryNameEntry {
+    parsed: Vec<ParsedVolume>,
+    interpretations: HashMap<String, Vec<NameInterpretation>>,
+}
+
+impl DirectoryNameIndex {
+    fn build(rows: &[RelationInput]) -> Self {
+        let entries_by_path = rows
+            .iter()
+            .map(|row| {
+                let parsed = parse_volume_candidates(&row.name);
+                let interpretations = ["", "rar", "7z", "zip"]
+                    .into_iter()
+                    .map(|target_format| {
+                        (
+                            target_format.to_string(),
+                            name_interpretations_from_candidates(
+                                &row.name,
+                                &parsed,
+                                target_format,
+                                row.anchor.as_ref(),
+                            ),
+                        )
+                    })
+                    .collect();
+                (
+                    row.path_key.clone(),
+                    DirectoryNameEntry {
+                        parsed,
+                        interpretations,
+                    },
+                )
+            })
+            .collect();
+        Self { entries_by_path }
+    }
+
+    fn candidates<'a>(&'a self, row: &RelationInput) -> &'a [ParsedVolume] {
+        self.entries_by_path
+            .get(&row.path_key)
+            .map(|entry| entry.parsed.as_slice())
+            .unwrap_or(&[])
+    }
+
+    fn interpretations(
+        &self,
+        row: &RelationInput,
+        target_format: &str,
+    ) -> &[NameInterpretation] {
+        self.entries_by_path
+            .get(&row.path_key)
+            .and_then(|entry| entry.interpretations.get(target_format))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+}
+
 #[pyfunction]
 pub(crate) fn relations_detect_split_role(filename: &str) -> Option<String> {
     detect_split_role(filename).map(str::to_string)
@@ -124,12 +189,14 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
         .relation_file_records()
         .map(|(path, size, relation_member_eligible, anchor)| {
             let path = path.to_string();
+            let path_key = path.to_ascii_lowercase();
             let name = Path::new(&path)
                 .file_name()
                 .map(|value| value.to_string_lossy().to_string())
                 .unwrap_or_default();
             RelationInput {
                 path,
+                path_key,
                 name,
                 size,
                 relation_member_eligible,
@@ -166,8 +233,8 @@ fn build_candidate_groups_from_physical(
         let Some(directory_rows) = by_directory.remove(&directory) else {
             continue;
         };
+        let name_index = DirectoryNameIndex::build(&directory_rows);
         let mut strong_seed_paths = HashSet::new();
-        let mut unresolved_split_member_paths = HashSet::new();
         let mut proposals = Vec::new();
         let mut proposal_keys = HashSet::new();
 
@@ -186,11 +253,9 @@ fn build_candidate_groups_from_physical(
             if strength == "strong" {
                 strong_seed_paths.insert(seed.path.to_ascii_lowercase());
             }
-            if is_unresolved_encrypted_split_member(seed) {
-                unresolved_split_member_paths.insert(seed.path.to_ascii_lowercase());
-            }
-            for interpretation in name_interpretations(&seed.name, &anchor.format, Some(anchor)) {
+            for interpretation in name_index.interpretations(seed, &anchor.format) {
                 if !has_filtered_family_trigger(
+                    &name_index,
                     &directory_rows,
                     filtered_keys,
                     &interpretation,
@@ -198,6 +263,7 @@ fn build_candidate_groups_from_physical(
                     continue;
                 }
                 for proposal in name_proposals_for_seed(
+                    &name_index,
                     &directory_rows,
                     filtered_keys,
                     seed,
@@ -245,6 +311,29 @@ fn build_candidate_groups_from_physical(
             }
         }
 
+        let password_indexes: Vec<usize> = validations
+            .iter()
+            .enumerate()
+            .filter_map(|(index, validation)| {
+                (validation.status == ProposalStatus::NeedsPassword).then_some(index)
+            })
+            .collect();
+        let mut password_conflicted = HashSet::new();
+        for left_index in 0..password_indexes.len() {
+            for right_index in (left_index + 1)..password_indexes.len() {
+                let left = &validations[password_indexes[left_index]].proposal;
+                let right = &validations[password_indexes[right_index]].proposal;
+                if proposal_owned_paths(left)
+                    .intersection(&proposal_owned_paths(right))
+                    .next()
+                    .is_some()
+                {
+                    password_conflicted.insert(password_indexes[left_index]);
+                    password_conflicted.insert(password_indexes[right_index]);
+                }
+            }
+        }
+
         let mut claimed_paths = HashSet::new();
         let mut password_paths = HashSet::new();
         for (index, validation) in validations.iter().enumerate() {
@@ -259,23 +348,65 @@ fn build_candidate_groups_from_physical(
             output.push(validated_proposal_to_dict(py, validation)?);
         }
 
-        // A unique proposal whose relation facts are encrypted must remain
-        // visible to the existing password path.  It is deliberately not a
-        // split CandidateGroup yet and is never allowed to fall through as a
-        // normal single archive.
-        for validation in validations.iter().filter(|validation| {
-            validation.status == ProposalStatus::NeedsPassword
-        }) {
-            password_paths.extend(proposal_owned_paths(&validation.proposal));
+        // Only an unambiguous encrypted proposal is handed to the existing
+        // password path.  Ambiguous proposals must not claim the same
+        // physical files or suppress their ordinary single-file analysis.
+        for (index, validation) in validations.iter().enumerate() {
+            if validation.status != ProposalStatus::NeedsPassword {
+                continue;
+            }
+            if password_conflicted.contains(&index) {
+                continue;
+            }
+            let owned = proposal_owned_paths(&validation.proposal);
+            if owned.iter().any(|path| claimed_paths.contains(path)) {
+                continue;
+            }
+            password_paths.extend(owned);
             output.push(password_error_proposal_to_dict(py, validation)?);
         }
+
+        // Header-encrypted RAR members cannot reveal whether they are the
+        // first volume until a password decrypts the header.  Keep a lone
+        // ``foo.part2.rar`` visible as an ordinary candidate, but do not
+        // dispatch every member of an unresolved same-family encrypted set
+        // independently when the family has already supplied at least two
+        // structural RAR seeds.  A complete proposal is removed from this
+        // set by claimed_paths/password_paths above; this branch only avoids
+        // turning an incomplete encrypted family into parallel false tasks.
+        let mut encrypted_family_counts: HashMap<String, usize> = HashMap::new();
+        let mut encrypted_family_keys: HashMap<String, String> = HashMap::new();
+        for row in directory_rows.iter().filter(|row| row.relation_member_eligible) {
+            let Some(anchor) = row.anchor.as_ref() else {
+                continue;
+            };
+            if !is_unresolved_encrypted_rar_anchor(anchor) {
+                continue;
+            }
+            let family = name_index
+                .interpretations(row, "rar")
+                .first()
+                .map(|item| item.prefix.clone())
+                .unwrap_or_else(|| get_logical_name(&row.name, false).to_ascii_lowercase());
+            *encrypted_family_counts.entry(family.clone()).or_default() += 1;
+            encrypted_family_keys.insert(row.path.to_ascii_lowercase(), family);
+        }
+        let unresolved_encrypted_family_paths: HashSet<String> = encrypted_family_keys
+            .into_iter()
+            .filter_map(|(path, family)| {
+                (encrypted_family_counts.get(&family).copied().unwrap_or(0) > 1
+                    && !claimed_paths.contains(&path)
+                    && !password_paths.contains(&path))
+                .then_some(path)
+            })
+            .collect();
 
         for row in directory_rows.iter().filter(|row| {
                 filtered_keys.contains(&row.path.to_ascii_lowercase())
                 && !claimed_paths.contains(&row.path.to_ascii_lowercase())
                 && !password_paths.contains(&row.path.to_ascii_lowercase())
                 && !strong_seed_paths.contains(&row.path.to_ascii_lowercase())
-                && !unresolved_split_member_paths.contains(&row.path.to_ascii_lowercase())
+                && !unresolved_encrypted_family_paths.contains(&row.path.to_ascii_lowercase())
         }) {
             output.push(ordinary_file_group_to_dict(py, row)?);
         }
@@ -315,25 +446,22 @@ fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
         .then_some("strong")
 }
 
-fn is_unresolved_encrypted_split_member(row: &RelationInput) -> bool {
-    let Some(anchor) = row.anchor.as_ref() else {
-        return false;
-    };
-    if anchor.format != "rar" || !anchor.needs_password {
-        return false;
-    }
-    parse_volume_candidates(&row.name).iter().any(|candidate| {
-        candidate.family == "rar" && candidate.number > 1
-    })
+fn is_unresolved_encrypted_rar_anchor(anchor: &VolumeAnchor) -> bool {
+    anchor.format == "rar"
+        && anchor.needs_password
+        && anchor.evidence.iter().any(|item| {
+            *item == "rar4:encryption_header" || *item == "rar5:encryption_header"
+        })
 }
 
-fn name_interpretations(
+fn name_interpretations_from_candidates(
     name: &str,
+    parsed_candidates: &[ParsedVolume],
     target_format: &str,
     anchor: Option<&VolumeAnchor>,
 ) -> Vec<NameInterpretation> {
     let mut values = Vec::new();
-    for parsed in parse_volume_candidates(name) {
+    for parsed in parsed_candidates {
         // A split SFX data head commonly keeps the launcher token in the
         // filename (for example `bundle.exe.part1.*`) even when the payload
         // format is 7z or ZIP.  The filename parser quite correctly treats
@@ -427,13 +555,14 @@ fn name_interpretations(
 }
 
 fn name_proposals_for_seed(
+    name_index: &DirectoryNameIndex,
     rows: &[RelationInput],
     filtered_keys: &HashSet<String>,
     seed: &RelationInput,
     seed_interpretation: &NameInterpretation,
 ) -> Vec<RelationProposal> {
     if !seed_interpretation.format.is_empty() {
-        return make_name_proposal(rows, filtered_keys, seed_interpretation)
+        return make_name_proposal(name_index, rows, filtered_keys, seed_interpretation)
             .into_iter()
             .collect();
     }
@@ -447,7 +576,7 @@ fn name_proposals_for_seed(
         row.relation_member_eligible
             && !row.path.eq_ignore_ascii_case(&seed.path)
     }) {
-        for parsed in parse_volume_candidates(&row.name) {
+        for parsed in name_index.candidates(row) {
             if !matches!(parsed.family, "rar" | "7z" | "zip")
                 || !logical_name_from_parsed(&parsed)
                     .eq_ignore_ascii_case(&seed_interpretation.prefix)
@@ -461,9 +590,10 @@ fn name_proposals_for_seed(
     // An unknown MZ seed must converge to one filename-declared format before
     // any deep validator is authorized.  A mixed 7z/ZIP/RAR family remains
     // ambiguous and is intentionally left to the ordinary embedded pipeline.
-    let Some(format) = (formats.len() == 1).then(|| formats.into_iter().next().unwrap()) else {
+    if formats.len() != 1 {
         return Vec::new();
-    };
+    }
+    let format = formats.into_iter().next().unwrap();
     let mut concrete = seed_interpretation.clone();
     concrete.format = format.to_string();
     concrete.style = if format == "rar" {
@@ -471,20 +601,22 @@ fn name_proposals_for_seed(
     } else {
         "part_numbered".to_string()
     };
-    if let Some(proposal) = make_name_proposal(rows, filtered_keys, &concrete) {
+    if let Some(proposal) = make_name_proposal(name_index, rows, filtered_keys, &concrete) {
         return vec![proposal];
     }
     Vec::new()
 }
 
 fn has_filtered_family_trigger(
+    name_index: &DirectoryNameIndex,
     rows: &[RelationInput],
     filtered_keys: &HashSet<String>,
     interpretation: &NameInterpretation,
 ) -> bool {
     rows.iter().any(|row| {
-        filtered_keys.contains(&row.path.to_ascii_lowercase())
-            && name_interpretations(&row.name, &interpretation.format, row.anchor.as_ref())
+            filtered_keys.contains(&row.path.to_ascii_lowercase())
+            && name_index
+                .interpretations(row, &interpretation.format)
                 .iter()
                 .any(|candidate| {
                     candidate.format == interpretation.format
@@ -494,6 +626,7 @@ fn has_filtered_family_trigger(
 }
 
 fn make_name_proposal(
+    name_index: &DirectoryNameIndex,
     rows: &[RelationInput],
     filtered_keys: &HashSet<String>,
     seed_interpretation: &NameInterpretation,
@@ -501,38 +634,45 @@ fn make_name_proposal(
     let mut slots: HashMap<u32, Vec<(String, NameInterpretation)>> = HashMap::new();
     let mut companions = Vec::new();
     for row in rows.iter().filter(|row| row.relation_member_eligible) {
-        let interpretations = name_interpretations(
-            &row.name,
+        let possible_launcher = row
+            .anchor
+            .as_ref()
+            .is_some_and(is_possible_sfx_launcher);
+        let numbered_volume_name = name_index
+            .candidates(row)
+            .iter()
+            .any(|candidate| candidate.number > 0);
+        let launcher_name_match = !numbered_volume_name
+            && (is_launcher_candidate(&row.name, &seed_interpretation.prefix)
+                || is_camouflaged_sfx_launcher(&row.name, &seed_interpretation.prefix));
+        // An unnumbered MZ/SFX file with the proposal's logical name is a
+        // launcher companion, even though the structural fallback below can
+        // otherwise reinterpret any SFX seed as volume 1.  Numbered `.exe`
+        // members do not match this predicate and remain real volumes.
+        if possible_launcher && launcher_name_match {
+            companions.push(row.path.clone());
+            continue;
+        }
+        let interpretations = name_index.interpretations(
+            row,
             &seed_interpretation.format,
-            row.anchor.as_ref(),
         );
-        let matching: Vec<NameInterpretation> = interpretations
-            .into_iter()
+        let matching = interpretations
+            .iter()
             .filter(|candidate| {
                 candidate.format == seed_interpretation.format
                     && candidate.prefix == seed_interpretation.prefix
-            })
-            .collect();
-        if !matching.is_empty() {
-            for candidate in matching {
+            });
+        let mut matched = false;
+        for candidate in matching {
+            matched = true;
                 slots
                     .entry(candidate.number)
                     .or_default()
-                    .push((row.path.clone(), candidate));
-            }
-            continue;
+                    .push((row.path.clone(), candidate.clone()));
         }
-        if is_launcher_candidate(&row.name, &seed_interpretation.prefix) {
-            companions.push(row.path.clone());
-        } else if row.anchor.as_ref().is_some_and(|anchor| anchor.sfx)
-            && is_camouflaged_sfx_launcher(&row.name, &seed_interpretation.prefix)
-        {
-            // A 7z/ZIP SFX data volume may carry a stable base token wrapped
-            // in harmless filename noise (for example
-            // ``noise.payload.7z.001.junk``), while the PE launcher keeps
-            // ``payload.exe``.  The launcher is still identified by its MZ
-            // seed; only the name relationship is relaxed here.
-            companions.push(row.path.clone());
+        if matched {
+            continue;
         }
     }
 
@@ -588,10 +728,10 @@ fn make_name_proposal(
     }
     let has_filtered_trigger = rows.iter().any(|row| {
             filtered_keys.contains(&row.path.to_ascii_lowercase())
-                && name_interpretations(
-                    &row.name,
+                && name_index
+                .interpretations(
+                    row,
                     &seed_interpretation.format,
-                    row.anchor.as_ref(),
                 )
                 .iter()
                 .any(|candidate| {
@@ -614,6 +754,27 @@ fn make_name_proposal(
         volumes,
         companions,
     })
+}
+
+fn is_possible_sfx_launcher(anchor: &VolumeAnchor) -> bool {
+    let weak_mz_seed = anchor
+        .format
+        .is_empty()
+        && anchor.sfx
+        && anchor
+            .evidence
+            .iter()
+            .any(|item| *item == "sfx:pe_header");
+    let cheap_embedded_archive = matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
+        && (anchor.sfx
+            || anchor
+                .evidence
+                .iter()
+                .any(|item| *item == "zip:embedded_local_head"))
+        && anchor.standalone
+        && anchor.structure_offset.is_some_and(|offset| offset > 0)
+        && anchor.anchor_roles.iter().any(|role| *role == "first");
+    weak_mz_seed || cheap_embedded_archive
 }
 
 fn zip_terminal_name_matches(name: &str, logical_prefix: &str) -> bool {
@@ -677,41 +838,96 @@ fn is_camouflaged_sfx_launcher(name: &str, logical_name: &str) -> bool {
 
 fn validate_relation_proposal(
     py: Python<'_>,
-    proposal: RelationProposal,
+    mut proposal: RelationProposal,
     rows: &[RelationInput],
     path_passwords: Option<&[(String, String)]>,
 ) -> PyResult<ProposalValidation> {
-    let mut paths: Vec<String> = proposal
-        .volumes
-        .iter()
-        .map(|(path, _, _, _, _)| path.clone())
-        .chain(proposal.companions.iter().cloned())
-        .collect();
-    paths.sort_by_key(|path| path.to_ascii_lowercase());
-    paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-
-    let deep_anchors = py.detach(|| {
-        probe_volume_anchor_paths_deep(
-            &paths,
-            1024 * 1024,
-            65_557,
-            path_passwords,
-        )
-    });
     let mut anchors: HashMap<String, VolumeAnchor> = rows
         .iter()
         .filter_map(|row| row.anchor.clone().map(|anchor| (row.path.to_ascii_lowercase(), anchor)))
         .collect();
+
+    // A filename-matched `.exe` is only a companion hypothesis.  It may be
+    // attached to a split relation after a deep probe proves that it is an
+    // MZ/SFX carrier for this exact format.  Unverified name matches must not
+    // become owned paths, otherwise an unrelated same-name executable could
+    // be claimed and later cleaned with the archive.
+    if !proposal.companions.is_empty() {
+        let companion_candidates = proposal.companions.clone();
+        let companion_anchors = py.detach(|| {
+            probe_volume_anchor_paths_deep(
+                &companion_candidates,
+                1024 * 1024,
+                65_557,
+                path_passwords,
+            )
+        });
+        let mut verified_companions = Vec::new();
+        for anchor in companion_anchors {
+            let embedded_verified = anchor.format == proposal.format
+                && anchor.confidence == "strong"
+                && anchor.sfx
+                && anchor.structure_offset.is_some_and(|offset| offset > 0);
+            // Some real SFX split layouts keep the launcher as a standalone
+            // PE stub and put the archive bytes in external .001/.002...
+            // volumes.  Such a launcher cannot expose an embedded format
+            // signature, but the deep probe must still preserve its MZ seed.
+            // It is safe to attach only this already filename-matched,
+            // MZ-proven stub after the proposal's own volumes pass their
+            // format validator; an arbitrary same-name non-PE executable is
+            // never promoted.
+            let external_sfx_stub_verified = anchor.format.is_empty()
+                && anchor.confidence == "weak"
+                && anchor.sfx
+                && anchor.error.is_empty()
+                && anchor
+                    .evidence
+                    .iter()
+                    .any(|item| *item == "sfx:pe_header");
+            let verified = embedded_verified || external_sfx_stub_verified;
+            anchors.insert(anchor.path.to_ascii_lowercase(), anchor.clone());
+            if verified {
+                verified_companions.push(anchor.path);
+            }
+        }
+        verified_companions.sort_by_key(|path| path.to_ascii_lowercase());
+        verified_companions.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        proposal.companions = verified_companions;
+        if proposal.companions.len() > 1 {
+            return Ok(ProposalValidation {
+                status: ProposalStatus::Inconclusive,
+                proposal,
+                anchors,
+            });
+        }
+    }
+
+    let mut volume_paths: Vec<String> = proposal
+        .volumes
+        .iter()
+        .map(|(path, _, _, _, _)| path.clone())
+        .collect();
+    volume_paths.sort_by_key(|path| path.to_ascii_lowercase());
+    volume_paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    let tail_limit = if proposal.format == "zip" { 65_557 } else { 0 };
+    let deep_anchors = py.detach(|| {
+        probe_volume_anchor_paths_deep(
+            &volume_paths,
+            1024 * 1024,
+            tail_limit,
+            path_passwords,
+        )
+    });
     for anchor in deep_anchors {
         anchors.insert(anchor.path.to_ascii_lowercase(), anchor);
     }
 
     let status = match proposal.format.as_str() {
-        "rar" => validate_rar_proposal(&proposal, &anchors),
-        "7z" => validate_seven_zip_proposal(&proposal, &anchors, rows),
-        "zip" => validate_zip_proposal(&proposal, &anchors),
-        _ => ProposalStatus::Unsupported,
-    };
+        "rar" => validate_rar_proposal(py, &proposal, &anchors),
+        "7z" => Ok(validate_seven_zip_proposal(&proposal, &anchors, rows)),
+        "zip" => validate_zip_proposal(py, &proposal, &anchors),
+        _ => Ok(ProposalStatus::Unsupported),
+    }?;
 
     Ok(ProposalValidation {
         status,
@@ -721,18 +937,19 @@ fn validate_relation_proposal(
 }
 
 fn validate_rar_proposal(
+    py: Python<'_>,
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
-) -> ProposalStatus {
+) -> PyResult<ProposalStatus> {
     let mut first_count = 0usize;
     let mut raw_sfx_head = false;
     let mut known_numbers = HashSet::new();
     for (path, number, _, _, _) in &proposal.volumes {
         let Some(anchor) = anchors.get(&path.to_ascii_lowercase()) else {
-            return ProposalStatus::Inconclusive;
+            return Ok(ProposalStatus::Inconclusive);
         };
         if anchor.needs_password || anchor.wrong_password {
-            return ProposalStatus::NeedsPassword;
+            return Ok(ProposalStatus::NeedsPassword);
         }
         let is_raw_sfx_head = *number == 1
             && anchor.format == "rar"
@@ -754,9 +971,9 @@ fn validate_rar_proposal(
         }
         if anchor.format != "rar" || anchor.confidence != "strong" || !anchor.multivolume {
             return if anchor.format.is_empty() {
-                ProposalStatus::Inconclusive
+                Ok(ProposalStatus::Inconclusive)
             } else {
-                ProposalStatus::Reject
+                Ok(ProposalStatus::Reject)
             };
         }
         if anchor.anchor_roles.contains(&"first") || anchor.sfx {
@@ -764,14 +981,84 @@ fn validate_rar_proposal(
         }
         if let Some(internal) = anchor.internal_volume_number {
             if internal != *number || !known_numbers.insert(internal) {
-                return ProposalStatus::Reject;
+                return Ok(ProposalStatus::Reject);
             }
         }
     }
     if first_count != 1 {
-        return ProposalStatus::Inconclusive;
+        return Ok(ProposalStatus::Inconclusive);
     }
-    ProposalStatus::Valid
+
+    let ordered_paths: Vec<String> = proposal
+        .volumes
+        .iter()
+        .map(|(path, _, _, _, _)| path.clone())
+        .collect();
+    // An SFX first volume does not by itself imply a raw byte-split stream.
+    // WinRAR commonly emits a normal RAR header at the start of every later
+    // volume, while other SFX producers split the payload into opaque chunks.
+    // Only the latter may be validated through one concatenated view; when a
+    // later member has its own RAR anchor, terminal proof must run against
+    // that physical last volume.
+    let raw_sfx = proposal
+        .volumes
+        .iter()
+        .find(|(_, number, _, _, _)| *number == 1)
+        .and_then(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()))
+        .is_some_and(|anchor| anchor.sfx && anchor.structure_offset.is_some_and(|offset| offset > 0))
+        && proposal.volumes.iter().skip(1).all(|(path, _, _, _, _)| {
+            anchors
+                .get(&path.to_ascii_lowercase())
+                .is_some_and(|anchor| anchor.format.is_empty())
+        });
+    let terminal = if raw_sfx {
+        let start_offset = proposal
+            .volumes
+            .iter()
+            .find(|(_, number, _, _, _)| *number == 1)
+            .and_then(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()).map(|anchor| {
+                (path.clone(), anchor.structure_offset.unwrap_or(0))
+            }))
+            .map(|(_, offset)| offset)
+            .unwrap_or(0);
+        match probe_rar_volume_paths(py, &ordered_paths, start_offset, 4096) {
+            Ok(result) => result,
+            Err(_) => return Ok(ProposalStatus::Inconclusive),
+        }
+    } else {
+        let Some((path, _, _, _, _)) = proposal.volumes.iter().max_by_key(|(_, number, _, _, _)| *number) else {
+            return Ok(ProposalStatus::Inconclusive);
+        };
+        let offset = anchors
+            .get(&path.to_ascii_lowercase())
+            .and_then(|anchor| anchor.structure_offset)
+            .unwrap_or(0);
+        match probe_rar_path(py, path, offset, 4096) {
+            Ok(result) => result,
+            Err(_) => return Ok(ProposalStatus::Inconclusive),
+        }
+    };
+    let terminal = terminal.bind(py);
+    if terminal
+        .get_item("password_required")?
+        .and_then(|value| value.extract::<bool>().ok())
+        .unwrap_or(false)
+    {
+        return Ok(ProposalStatus::NeedsPassword);
+    }
+    let end_found = terminal
+        .get_item("end_block_found")?
+        .and_then(|value| value.extract::<bool>().ok())
+        .unwrap_or(false);
+    let end_flags = terminal
+        .get_item("end_block_flags")?
+        .and_then(|value| value.extract::<u64>().ok())
+        .unwrap_or(0);
+    if end_found && end_flags & 0x01 == 0 {
+        Ok(ProposalStatus::Valid)
+    } else {
+        Ok(ProposalStatus::Inconclusive)
+    }
 }
 
 fn validate_seven_zip_proposal(
@@ -822,24 +1109,25 @@ fn validate_seven_zip_proposal(
 }
 
 fn validate_zip_proposal(
+    py: Python<'_>,
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
-) -> ProposalStatus {
+) -> PyResult<ProposalStatus> {
     let Some((first_path, _, _, _, _)) = proposal
         .volumes
         .iter()
         .find(|(_, number, _, _, _)| *number == 1)
     else {
-        return ProposalStatus::Reject;
+        return Ok(ProposalStatus::Reject);
     };
     let Some(first) = anchors.get(&first_path.to_ascii_lowercase()) else {
-        return ProposalStatus::Inconclusive;
+        return Ok(ProposalStatus::Inconclusive);
     };
     if first.format != "zip" || first.confidence == "unsupported" {
         return if first.format.is_empty() {
-            ProposalStatus::Inconclusive
+            Ok(ProposalStatus::Inconclusive)
         } else {
-            ProposalStatus::Reject
+            Ok(ProposalStatus::Reject)
         };
     }
     let terminal_paths: Vec<&String> = proposal
@@ -853,7 +1141,7 @@ fn validate_zip_proposal(
         })
         .collect();
     if terminal_paths.len() != 1 {
-        return ProposalStatus::Inconclusive;
+        return Ok(ProposalStatus::Inconclusive);
     }
     let terminal = anchors
         .get(&terminal_paths[0].to_ascii_lowercase())
@@ -874,10 +1162,10 @@ fn validate_zip_proposal(
             .iter()
             .any(|item| *item == "zip:eocd_split_terminal");
         if !first_is_spanned || !terminal_is_spanned {
-            return ProposalStatus::Reject;
+            return Ok(ProposalStatus::Reject);
         }
         if terminal.internal_volume_number != Some(highest) {
-            return ProposalStatus::Reject;
+            return Ok(ProposalStatus::Reject);
         }
     } else {
         let first_is_raw = first.evidence.iter().any(|item| *item == "zip:local_header");
@@ -886,10 +1174,61 @@ fn validate_zip_proposal(
             .iter()
             .any(|item| *item == "zip:eocd_single_disk_without_local_header");
         if !first_is_raw || !terminal_is_single_disk {
-            return ProposalStatus::Inconclusive;
+            return Ok(ProposalStatus::Inconclusive);
         }
     }
-    ProposalStatus::Valid
+
+    // A raw `.zip.001` family is a logical concatenation, not a ZIP
+    // multi-disk archive.  Re-run the canonical Rust ZIP view over the
+    // concatenated volumes so the EOCD, central directory and every sampled
+    // local-header link are proven against the same byte stream.  Spanned
+    // ZIPs have their own disk-number proof above and intentionally remain on
+    // that path because the strict single-disk ZIP view rejects multi-disk
+    // EOCDs by design.
+    if proposal.style != "zip_spanned" {
+        let ordered_paths: Vec<String> = proposal
+            .volumes
+            .iter()
+            .map(|(path, _, _, _, _)| path.clone())
+            .collect();
+        let Some(raw) = (match probe_zip_volume_paths(py, &ordered_paths, 4096) {
+            Ok(result) => result,
+            Err(_) => return Ok(ProposalStatus::Inconclusive),
+        }) else {
+            return Ok(ProposalStatus::Inconclusive);
+        };
+        let raw = raw.bind(py);
+        let plausible = raw
+            .get_item("plausible")?
+            .and_then(|value| value.extract::<bool>().ok())
+            .unwrap_or(false);
+        let archive_starts_at_expected_offset = raw
+            .get_item("archive_offset")?
+            .and_then(|value| value.extract::<u64>().ok())
+            .unwrap_or(u64::MAX)
+            == first.structure_offset.unwrap_or(0);
+        let central_directory_walk_ok = raw
+            .get_item("central_directory_walk_ok")?
+            .and_then(|value| value.extract::<bool>().ok())
+            .unwrap_or(false);
+        let local_header_links_ok = raw
+            .get_item("local_header_links_ok")?
+            .and_then(|value| value.extract::<bool>().ok())
+            .unwrap_or(false);
+        let error = raw
+            .get_item("error")?
+            .and_then(|value| value.extract::<String>().ok())
+            .unwrap_or_default();
+        if !plausible
+            || !archive_starts_at_expected_offset
+            || !central_directory_walk_ok
+            || !local_header_links_ok
+            || !error.is_empty()
+        {
+            return Ok(ProposalStatus::Inconclusive);
+        }
+    }
+    Ok(ProposalStatus::Valid)
 }
 
 fn ordinary_file_group_to_dict(
@@ -1181,6 +1520,7 @@ pub(crate) fn relations_resolve_volume_once(
         .iter()
         .map(|path| RelationInput {
             path: path.clone(),
+            path_key: path.to_ascii_lowercase(),
             name: basename(path).to_string(),
             size: anchor_by_path
                 .get(&path.to_ascii_lowercase())
@@ -1780,6 +2120,14 @@ fn parse_loose_rar_part_volume(path: &str) -> Option<ParsedVolume> {
         .name("prefix")?
         .as_str()
         .trim_end_matches(['.', '_', '-', ' ']);
+    let prefix = prefix
+        .rsplit_once('.')
+        .filter(|(_, noise)| {
+            (1..=4).contains(&noise.len())
+                && noise.chars().all(|character| character.is_ascii_uppercase())
+        })
+        .map(|(base, _)| base)
+        .unwrap_or(prefix);
     if prefix.is_empty() {
         return None;
     }
@@ -2201,13 +2549,4 @@ mod tests {
         assert_eq!(parsed.family, "generic");
     }
 
-    #[test]
-    fn observed_missing_ranges_are_compact_and_compatibility_indices_are_bounded() {
-        let present = HashSet::from([1, 1_000_000]);
-        let (ranges, indices) = observed_missing(&present, 1_000_000);
-        assert_eq!(ranges, vec![(2, 999_999)]);
-        assert_eq!(indices.len(), 256);
-        assert_eq!(indices[0], 2);
-        assert_eq!(indices[255], 257);
-    }
 }

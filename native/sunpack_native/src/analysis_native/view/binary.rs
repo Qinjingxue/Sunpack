@@ -368,6 +368,7 @@ impl AnalysisBinaryView {
         result.set_item("version", 0u8)?;
         result.set_item("blocks_checked", 0usize)?;
         result.set_item("end_block_found", false)?;
+        result.set_item("end_block_flags", 0u64)?;
         result.set_item("first_header_offset", 0u64)?;
         result.set_item("first_header_size", 0u64)?;
         result.set_item("first_header_type", 0u64)?;
