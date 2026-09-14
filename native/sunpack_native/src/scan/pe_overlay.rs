@@ -19,6 +19,45 @@ const ARCHIVE_MAGICS: &[(&[u8], &str, &str)] = &[
     (b"\x28\xb5\x2f\xfd", "zstd", ".zst"),
 ];
 
+/// Validate the bounded PE header region already read by a caller.
+///
+/// This is deliberately only the header/section-table proof.  It does not
+/// inspect an overlay or look for an embedded archive, so relation handling
+/// can distinguish a real launcher from an arbitrary file beginning with
+/// `MZ` without introducing another binary scan path.
+pub(crate) fn pe_headers_plausible(prefix: &[u8], actual_size: u64) -> bool {
+    if prefix.len() < 64 || !prefix.starts_with(b"MZ") {
+        return false;
+    }
+    let pe_header_offset = u32_le(prefix, 0x3C) as usize;
+    let Some(coff_end) = pe_header_offset.checked_add(24) else {
+        return false;
+    };
+    if pe_header_offset < 64
+        || coff_end as u64 > actual_size
+        || coff_end > prefix.len()
+        || prefix.get(pe_header_offset..pe_header_offset + PE_SIGNATURE.len())
+            != Some(PE_SIGNATURE)
+    {
+        return false;
+    }
+
+    let section_count = u16_le(prefix, pe_header_offset + 6) as usize;
+    let optional_header_size = u16_le(prefix, pe_header_offset + 20) as usize;
+    let Some(section_table_offset) = coff_end.checked_add(optional_header_size) else {
+        return false;
+    };
+    let Some(section_table_size) = section_count.checked_mul(SECTION_HEADER_SIZE) else {
+        return false;
+    };
+    let Some(section_table_end) = section_table_offset.checked_add(section_table_size) else {
+        return false;
+    };
+    section_count > 0
+        && section_table_end as u64 <= actual_size
+        && section_table_end <= prefix.len()
+}
+
 #[pyfunction]
 #[pyo3(signature = (path, file_size=None, magic_bytes=None))]
 pub(crate) fn inspect_pe_overlay_structure(

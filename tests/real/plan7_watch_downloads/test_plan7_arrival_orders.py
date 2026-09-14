@@ -88,7 +88,7 @@ def test_plan7_launcher_first_then_data_volumes_reacts_after_group_completion(
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
-def test_plan7_data_volumes_before_launcher_keeps_launcher_independent(
+def test_plan7_data_volumes_before_launcher_do_not_resubmit(
     tmp_path, archive_format
 ):
     case = _build_case(tmp_path, archive_format)
@@ -113,11 +113,7 @@ def test_plan7_data_volumes_before_launcher_keeps_launcher_independent(
         for _ in range(3):
             harness.watcher.run_once()
         later_submissions = harness.submission_events[submissions_before_launcher:]
-        assert later_submissions
-        assert all(
-            tuple(path.name for path in map(Path, event.paths)) == (launcher.name,)
-            for event in later_submissions
-        )
+        assert not later_submissions
     finally:
         harness.close()
 
@@ -132,8 +128,10 @@ def test_plan7_rar_part1_exe_is_real_input_when_arriving_as_head(tmp_path):
     try:
         plan_case = type("PlanCase", (), {"case": case, "archive_format": "rar", "sfx": True})()
         order = split_arrival_order(plan_case, random.Random(19), policy="head_first")
-        for volume in order:
+        for index, volume in enumerate(order):
             arrive_slowly(harness, volume)
+            if index < len(order) - 1:
+                assert not harness.submission_events
         stable_at = harness.stable_at_by_name[order[0].name]
         _finish_case(harness, case, stable_at)
         assert any(

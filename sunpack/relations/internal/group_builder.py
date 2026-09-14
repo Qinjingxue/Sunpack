@@ -7,6 +7,7 @@ from typing import List, Optional, Set
 from sunpack_native import (
     list_regular_files_in_directory as _native_list_regular_files_in_directory,
     relations_build_candidate_groups_from_snapshot as _native_build_candidate_groups,
+    relations_build_candidate_groups_with_state_from_snapshot as _native_build_candidate_groups_with_state,
     relations_detect_split_role as _native_detect_split_role,
     relations_logical_name as _native_logical_name,
     relations_parse_numbered_volume as _native_parse_numbered_volume,
@@ -50,14 +51,26 @@ class RelationsGroupBuilder:
         snapshot: DirectorySnapshot,
         path_passwords: dict[str, str] | None = None,
     ) -> List[CandidateGroup]:
-        groups = self.build_candidate_groups_without_discovery(snapshot, path_passwords)
+        groups, _ = self.build_candidate_groups_with_state(snapshot, path_passwords)
+        return groups
+
+    def build_candidate_groups_with_state(
+        self,
+        snapshot: DirectorySnapshot,
+        path_passwords: dict[str, str] | None = None,
+    ) -> tuple[List[CandidateGroup], list[dict[str, object]]]:
+        groups, strong_seed_paths = self.build_candidate_groups_without_discovery_with_state(
+            snapshot,
+            path_passwords,
+        )
         if path_passwords is None:
             discovered = self._discover_directory_passwords(groups)
             if discovered:
-                path_passwords = discovered
-                groups = self.build_candidate_groups_without_discovery(snapshot, discovered)
-        return groups
-
+                groups, strong_seed_paths = self.build_candidate_groups_without_discovery_with_state(
+                    snapshot,
+                    discovered,
+                )
+        return groups, strong_seed_paths
     def _discover_directory_passwords(
         self,
         groups: List[CandidateGroup],
@@ -118,11 +131,26 @@ class RelationsGroupBuilder:
         snapshot: DirectorySnapshot,
         path_passwords: dict[str, str] | None = None,
     ) -> List[CandidateGroup]:
-        native_groups = _native_build_candidate_groups(
+        groups, _ = self.build_candidate_groups_without_discovery_with_state(
+            snapshot,
+            path_passwords,
+        )
+        return groups
+
+    def build_candidate_groups_without_discovery_with_state(
+        self,
+        snapshot: DirectorySnapshot,
+        path_passwords: dict[str, str] | None = None,
+    ) -> tuple[List[CandidateGroup], list[dict[str, object]]]:
+        raw_result = _native_build_candidate_groups_with_state(
             snapshot.raw_native_snapshot,
             snapshot.native_snapshot,
             _native_password_pairs(path_passwords),
         )
+        native_groups = raw_result.get("groups") if isinstance(raw_result, dict) else None
+        native_seed_paths = raw_result.get("strong_seed_paths") if isinstance(raw_result, dict) else None
+        if not isinstance(native_groups, list):
+            raise ValueError("native relations returned invalid group state")
         groups: List[CandidateGroup] = []
         for raw in native_groups:
             if not isinstance(raw, dict):
@@ -131,7 +159,17 @@ class RelationsGroupBuilder:
             if group is None:
                 raise ValueError("native relations returned an invalid group")
             groups.append(group)
-        return groups
+        strong_seed_paths = [
+            {
+                "path": str(item.get("path") or ""),
+                "logical_name": str(item.get("logical_name") or ""),
+                "split_family": str(item.get("split_family") or ""),
+                "related_paths": [str(path) for path in (item.get("related_paths") or []) if path],
+            }
+            for item in (native_seed_paths or [])
+            if isinstance(item, dict) and item.get("path")
+        ]
+        return groups, strong_seed_paths
 
     def resolve_volume_once(
         self,

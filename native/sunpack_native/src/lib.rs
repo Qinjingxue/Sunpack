@@ -141,6 +141,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
+        relations::relations_build_candidate_groups_with_state_from_snapshot,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         relations::relations_resolve_volume_once,
         m
     )?)?;

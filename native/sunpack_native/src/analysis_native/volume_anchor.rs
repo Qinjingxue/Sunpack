@@ -11,6 +11,7 @@ use rayon::prelude::*;
 use crate::io::reader::ManagedReader;
 use crate::password::rar::{rar4_decrypt_header_flags, rar5_decrypt_main_header};
 use crate::analysis_native::structure::unified_prefilter_mask_from_head;
+use crate::scan::pe_overlay::pe_headers_plausible;
 
 const SEVEN_ZIP: &[u8] = b"7z\xbc\xaf'\x1c";
 const RAR4: &[u8] = b"Rar!\x1a\x07\x00";
@@ -48,6 +49,7 @@ pub(crate) struct VolumeAnchor {
     pub(crate) continuation_from_previous: bool,
     pub(crate) continuation_to_next: bool,
     pub(crate) sfx: bool,
+    pub(crate) pe_structure: bool,
     pub(crate) evidence: Vec<&'static str>,
     pub(crate) error: String,
     pub(crate) bytes_read: u64,
@@ -76,6 +78,7 @@ impl VolumeAnchor {
         )?;
         out.set_item("continuation_to_next", self.continuation_to_next)?;
         out.set_item("sfx", self.sfx)?;
+        out.set_item("pe_structure", self.pe_structure)?;
         out.set_item("evidence", PyList::new(py, self.evidence)?)?;
         out.set_item("error", self.error)?;
         out.set_item("bytes_read", self.bytes_read)?;
@@ -275,6 +278,11 @@ fn probe_path(
             return result;
         }
         result.bytes_read += (prefix_len - base_prefix_len) as u64;
+    }
+
+    if allow_embedded && pe_headers_plausible(&prefix, size) {
+        result.pe_structure = true;
+        result.evidence.push("sfx:pe_structure");
     }
 
     // RAR and 7z have all relation-seed structure at the head.  Do not pay

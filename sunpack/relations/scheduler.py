@@ -31,6 +31,16 @@ class RelationsScheduler:
     ) -> list[CandidateGroup]:
         return self._builder.build_candidate_groups(snapshot, path_passwords=path_passwords)
 
+    def build_candidate_groups_with_state(
+        self,
+        snapshot: DirectorySnapshot,
+        path_passwords: dict[str, str] | None = None,
+    ) -> tuple[list[CandidateGroup], list[dict[str, object]]]:
+        return self._builder.build_candidate_groups_with_state(
+            snapshot,
+            path_passwords=path_passwords,
+        )
+
     def resolve_volume_once(
         self,
         current_paths: list[str],

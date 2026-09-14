@@ -26,6 +26,7 @@ class DetectionScanSession:
         self.include_raw_snapshots = include_raw_snapshots
         self._snapshots: dict[str, DirectorySnapshot] = {}
         self._relation_groups: dict[str, List[CandidateGroup]] = {}
+        self._relation_seed_states: dict[str, list[dict[str, object]]] = {}
         self._relation_group_signatures: dict[str, str] = {}
         self._fact_bags: dict[str, List[FactBag]] = {}
         self._file_head_facts: dict[str, dict[str, Any]] = {}
@@ -112,12 +113,18 @@ class DetectionScanSession:
         cached_signature = self._relation_group_signatures.get(key)
         if refresh or key not in self._relation_groups or cached_signature != signature:
             snapshot = self.snapshot_for_directory(directory)
-            self._relation_groups[key] = self.relations.build_candidate_groups(
+            groups, seed_states = self.relations.build_candidate_groups_with_state(
                 snapshot,
                 path_passwords=path_passwords,
             )
+            self._relation_groups[key] = groups
+            self._relation_seed_states[key] = seed_states
             self._relation_group_signatures[key] = signature
         return self._relation_groups[key]
+
+    def relation_seed_states_for_directory(self, directory: str) -> list[dict[str, object]]:
+        self.relation_groups_for_directory(directory)
+        return self._relation_seed_states.get(self._directory_key(directory), [])
 
     def fact_bags_for_directory(self, directory: str) -> List[FactBag]:
         key = self._directory_key(directory)

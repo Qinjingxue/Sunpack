@@ -43,6 +43,12 @@ class WatchGroupCoordinator:
             session = DetectionScanSession(self.relations, config=self.config)
             groups = session.relation_groups_for_directory(directory)
             snapshots = [self._snapshot(group, directory) for group in groups if group.kind == "split_archive"]
+            snapshots.extend(
+                self._seed_snapshots(
+                    directory,
+                    session.relation_seed_states_for_directory(directory),
+                )
+            )
             for path in directory_paths:
                 selected = next(
                     (snapshot for snapshot in snapshots if path_key(path) in {path_key(item) for item in snapshot.owned_paths}),
@@ -90,6 +96,71 @@ class WatchGroupCoordinator:
             ownership_fingerprint=ownership_fingerprint,
         )
 
+    def _seed_snapshots(
+        self,
+        directory: str,
+        seed_states: list[dict[str, object]],
+    ) -> list[WatchGroupSnapshot]:
+        """Represent a structurally proven incomplete seed as existing wait state.
+
+        The snapshot deliberately has no head.  ``plan_watch_dispatches`` already
+        records such a snapshot as waiting and will reconsider it on the next
+        filesystem event; no separate incomplete-volume state is introduced.
+        """
+        grouped: dict[tuple[str, str], set[str]] = defaultdict(set)
+        for state in seed_states:
+            logical_name = str(state.get("logical_name") or "")
+            split_family = str(state.get("split_family") or "")
+            if not logical_name or not split_family:
+                continue
+            key = (logical_name.casefold(), split_family.casefold())
+            paths = state.get("related_paths") or [state.get("path")]
+            grouped[key].update(str(path) for path in paths if path)
+
+        snapshots: list[WatchGroupSnapshot] = []
+        for (logical_key, family_key), paths in grouped.items():
+            input_paths = tuple(sorted(paths, key=path_key))
+            if not input_paths:
+                continue
+            logical_name = next(
+                (
+                    str(state.get("logical_name"))
+                    for state in seed_states
+                    if str(state.get("logical_name") or "").casefold() == logical_key
+                    and str(state.get("split_family") or "").casefold() == family_key
+                ),
+                logical_key,
+            )
+            split_family = next(
+                (
+                    str(state.get("split_family"))
+                    for state in seed_states
+                    if str(state.get("logical_name") or "").casefold() == logical_key
+                    and str(state.get("split_family") or "").casefold() == family_key
+                ),
+                family_key,
+            )
+            group_id = _group_id(directory, logical_name, split_family)
+            payload = {
+                "group_id": group_id,
+                "members": [_file_version(path) for path in input_paths],
+                "sources": ["seed"],
+            }
+            snapshots.append(
+                WatchGroupSnapshot(
+                    group_id=group_id,
+                    directory=os.path.abspath(directory),
+                    logical_name=logical_name,
+                    split_family=split_family,
+                    head_path="",
+                    input_paths=input_paths,
+                    companion_paths=(),
+                    owned_paths=input_paths,
+                    input_fingerprint=_fingerprint(payload),
+                    ownership_fingerprint=_fingerprint(payload),
+                )
+            )
+        return snapshots
 
 def _group_id(directory: str, logical_name: str, split_family: str) -> str:
     raw = "|".join((path_key(directory), split_family.lower(), logical_name.lower()))

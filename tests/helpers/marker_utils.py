@@ -22,15 +22,29 @@ def marker_scan_state(root: Path, marker_name: str, marker_text: str) -> str:
     event loop that drives the pipeline.
     """
     candidate_exists = False
-    for path in root.rglob(marker_name):
+
+    def safe_rglob(pattern: str):
+        try:
+            yield from root.rglob(pattern)
+        except FileNotFoundError:
+            # Extraction/cleanup may remove a directory while pathlib is
+            # advancing the iterator.  Treat this tick as a changed
+            # filesystem view; the next poll will observe the stable state.
+            return
+
+    for path in safe_rglob(marker_name):
         try:
             if path.read_text(encoding="utf-8") == marker_text:
                 return "found"
         except OSError:
             candidate_exists = True
             continue
-    for path in root.rglob("*"):
-        if not path.is_file():
+    for path in safe_rglob("*"):
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
+            candidate_exists = True
             continue
         try:
             if path.read_text(encoding="utf-8") == marker_text:
