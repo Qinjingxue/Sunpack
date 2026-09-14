@@ -1,7 +1,10 @@
 use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_paths_cheap, probe_volume_anchor_paths_deep, VolumeAnchor,
 };
-use crate::analysis_native::{probe_rar_path, probe_rar_volume_paths, probe_zip_volume_paths};
+use crate::analysis_native::{
+    probe_rar_path, probe_rar_terminal_with_password, probe_rar_volume_paths,
+    probe_zip_volume_paths,
+};
 use crate::scan::directory::NativeDirectorySnapshot;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -229,6 +232,18 @@ fn build_candidate_groups_from_physical(
     }
 
     let mut output = Vec::new();
+    // A password map is only supplied on the retry pass after an encrypted
+    // proposal has already been discovered and its password has been
+    // verified against at least one member.  If that retry still cannot
+    // prove a complete relation (for example because a volume is missing),
+    // those physical paths must not fall back to ordinary single-file
+    // candidates.  The first pass has no password map, so weak encrypted
+    // files retain their normal fail-open behaviour.
+    let attempted_password_paths: HashSet<String> = path_passwords
+        .unwrap_or(&[])
+        .iter()
+        .map(|(path, _)| path.to_ascii_lowercase())
+        .collect();
     for directory in directory_order {
         let Some(directory_rows) = by_directory.remove(&directory) else {
             continue;
@@ -366,47 +381,22 @@ fn build_candidate_groups_from_physical(
             output.push(password_error_proposal_to_dict(py, validation)?);
         }
 
-        // Header-encrypted RAR members cannot reveal whether they are the
-        // first volume until a password decrypts the header.  Keep a lone
-        // ``foo.part2.rar`` visible as an ordinary candidate, but do not
-        // dispatch every member of an unresolved same-family encrypted set
-        // independently when the family has already supplied at least two
-        // structural RAR seeds.  A complete proposal is removed from this
-        // set by claimed_paths/password_paths above; this branch only avoids
-        // turning an incomplete encrypted family into parallel false tasks.
-        let mut encrypted_family_counts: HashMap<String, usize> = HashMap::new();
-        let mut encrypted_family_keys: HashMap<String, String> = HashMap::new();
-        for row in directory_rows.iter().filter(|row| row.relation_member_eligible) {
-            let Some(anchor) = row.anchor.as_ref() else {
-                continue;
-            };
-            if !is_unresolved_encrypted_rar_anchor(anchor) {
-                continue;
-            }
-            let family = name_index
-                .interpretations(row, "rar")
-                .first()
-                .map(|item| item.prefix.clone())
-                .unwrap_or_else(|| get_logical_name(&row.name, false).to_ascii_lowercase());
-            *encrypted_family_counts.entry(family.clone()).or_default() += 1;
-            encrypted_family_keys.insert(row.path.to_ascii_lowercase(), family);
-        }
-        let unresolved_encrypted_family_paths: HashSet<String> = encrypted_family_keys
-            .into_iter()
-            .filter_map(|(path, family)| {
-                (encrypted_family_counts.get(&family).copied().unwrap_or(0) > 1
-                    && !claimed_paths.contains(&path)
-                    && !password_paths.contains(&path))
-                .then_some(path)
-            })
-            .collect();
-
         for row in directory_rows.iter().filter(|row| {
+                let unresolved_encrypted_fragment = row
+                    .anchor
+                    .as_ref()
+                    .is_some_and(|anchor| {
+                        is_unresolved_encrypted_volume_fragment(
+                            anchor,
+                            name_index.candidates(row),
+                        )
+                    });
                 filtered_keys.contains(&row.path.to_ascii_lowercase())
                 && !claimed_paths.contains(&row.path.to_ascii_lowercase())
                 && !password_paths.contains(&row.path.to_ascii_lowercase())
+                && !attempted_password_paths.contains(&row.path.to_ascii_lowercase())
                 && !strong_seed_paths.contains(&row.path.to_ascii_lowercase())
-                && !unresolved_encrypted_family_paths.contains(&row.path.to_ascii_lowercase())
+                && !unresolved_encrypted_fragment
         }) {
             output.push(ordinary_file_group_to_dict(py, row)?);
         }
@@ -446,12 +436,24 @@ fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
         .then_some("strong")
 }
 
-fn is_unresolved_encrypted_rar_anchor(anchor: &VolumeAnchor) -> bool {
+fn is_unresolved_encrypted_volume_fragment(
+    anchor: &VolumeAnchor,
+    parsed_names: &[ParsedVolume],
+) -> bool {
+    // A header-encrypted RAR volume with no standalone proof is not a
+    // recoverable single-file archive. When the first volume is absent, or a
+    // numbered member is missing, the filename proposal never reaches the
+    // validator; allowing these rows to fall through as ordinary candidates
+    // would submit every remaining fragment to extraction. Keep this gate
+    // structural: weak filename-only encrypted hints remain ordinary.
     anchor.format == "rar"
-        && anchor.needs_password
-        && anchor.evidence.iter().any(|item| {
-            *item == "rar4:encryption_header" || *item == "rar5:encryption_header"
-        })
+        && anchor.confidence == "strong"
+        && anchor.encrypted
+        && (anchor.needs_password || anchor.wrong_password)
+        && !anchor.standalone
+        && parsed_names
+            .iter()
+            .any(|parsed| parsed.family == "rar" && parsed.number > 0)
 }
 
 fn name_interpretations_from_candidates(
@@ -742,10 +744,15 @@ fn make_name_proposal(
     if !has_filtered_trigger {
         return None;
     }
+    // A structural fallback is only a placeholder for the unnumbered head;
+    // it must not erase a concrete family style supplied by another member.
+    // In particular, `archive.rar` may be structurally identified as volume
+    // 1 while `archive.r00` carries the actual `rar_oldstyle` contract.
     let style = volumes
         .iter()
-        .find(|volume| volume.1 == 1)
-        .map(|volume| volume.2.clone())
+        .map(|volume| volume.2.as_str())
+        .find(|style| *style != "structural_name")
+        .map(str::to_owned)
         .unwrap_or_else(|| seed_interpretation.style.clone());
     Some(RelationProposal {
         format: seed_interpretation.format.clone(),
@@ -868,25 +875,8 @@ fn validate_relation_proposal(
                 && anchor.confidence == "strong"
                 && anchor.sfx
                 && anchor.structure_offset.is_some_and(|offset| offset > 0);
-            // Some real SFX split layouts keep the launcher as a standalone
-            // PE stub and put the archive bytes in external .001/.002...
-            // volumes.  Such a launcher cannot expose an embedded format
-            // signature, but the deep probe must still preserve its MZ seed.
-            // It is safe to attach only this already filename-matched,
-            // MZ-proven stub after the proposal's own volumes pass their
-            // format validator; an arbitrary same-name non-PE executable is
-            // never promoted.
-            let external_sfx_stub_verified = anchor.format.is_empty()
-                && anchor.confidence == "weak"
-                && anchor.sfx
-                && anchor.error.is_empty()
-                && anchor
-                    .evidence
-                    .iter()
-                    .any(|item| *item == "sfx:pe_header");
-            let verified = embedded_verified || external_sfx_stub_verified;
             anchors.insert(anchor.path.to_ascii_lowercase(), anchor.clone());
-            if verified {
+            if embedded_verified {
                 verified_companions.push(anchor.path);
             }
         }
@@ -923,7 +913,7 @@ fn validate_relation_proposal(
     }
 
     let status = match proposal.format.as_str() {
-        "rar" => validate_rar_proposal(py, &proposal, &anchors),
+        "rar" => validate_rar_proposal(py, &proposal, &anchors, path_passwords),
         "7z" => Ok(validate_seven_zip_proposal(&proposal, &anchors, rows)),
         "zip" => validate_zip_proposal(py, &proposal, &anchors),
         _ => Ok(ProposalStatus::Unsupported),
@@ -940,6 +930,7 @@ fn validate_rar_proposal(
     py: Python<'_>,
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
+    path_passwords: Option<&[(String, String)]>,
 ) -> PyResult<ProposalStatus> {
     let mut first_count = 0usize;
     let mut raw_sfx_head = false;
@@ -1011,17 +1002,58 @@ fn validate_rar_proposal(
                 .get(&path.to_ascii_lowercase())
                 .is_some_and(|anchor| anchor.format.is_empty())
         });
+    let raw_sfx_start_offset = proposal
+        .volumes
+        .iter()
+        .find(|(_, number, _, _, _)| *number == 1)
+        .and_then(|(path, _, _, _, _)| {
+            anchors
+                .get(&path.to_ascii_lowercase())
+                .and_then(|anchor| anchor.structure_offset)
+        })
+        .unwrap_or(0);
+    let password = proposal_password(proposal, path_passwords);
+    let header_encrypted = proposal.volumes.iter().any(|(path, _, _, _, _)| {
+        anchors
+            .get(&path.to_ascii_lowercase())
+            .is_some_and(|anchor| anchor.encrypted)
+    });
+    let terminal_proof = if header_encrypted {
+        let Some(password) = password else {
+            return Ok(ProposalStatus::NeedsPassword);
+        };
+        let proof_paths = if raw_sfx {
+            ordered_paths.clone()
+        } else {
+            let Some((path, _, _, _, _)) = proposal.volumes.iter().max_by_key(|(_, number, _, _, _)| *number) else {
+                return Ok(ProposalStatus::Inconclusive);
+            };
+            vec![path.clone()]
+        };
+        let proof_offset = if raw_sfx { raw_sfx_start_offset } else {
+            anchors
+                .get(&proof_paths[0].to_ascii_lowercase())
+                .and_then(|anchor| anchor.structure_offset)
+                .unwrap_or(0)
+        };
+        match py.detach(|| {
+            probe_rar_terminal_with_password(&proof_paths, proof_offset, password, 4096)
+        }) {
+            Ok(Some(proof)) => Some((proof.end_block_found, proof.end_block_flags)),
+            Ok(None) | Err(_) => return Ok(ProposalStatus::Inconclusive),
+        }
+    } else {
+        None
+    };
+    if let Some((end_found, end_flags)) = terminal_proof {
+        return if end_found && end_flags & 0x01 == 0 {
+            Ok(ProposalStatus::Valid)
+        } else {
+            Ok(ProposalStatus::Inconclusive)
+        };
+    }
     let terminal = if raw_sfx {
-        let start_offset = proposal
-            .volumes
-            .iter()
-            .find(|(_, number, _, _, _)| *number == 1)
-            .and_then(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()).map(|anchor| {
-                (path.clone(), anchor.structure_offset.unwrap_or(0))
-            }))
-            .map(|(_, offset)| offset)
-            .unwrap_or(0);
-        match probe_rar_volume_paths(py, &ordered_paths, start_offset, 4096) {
+        match probe_rar_volume_paths(py, &ordered_paths, raw_sfx_start_offset, 4096) {
             Ok(result) => result,
             Err(_) => return Ok(ProposalStatus::Inconclusive),
         }
@@ -1059,6 +1091,20 @@ fn validate_rar_proposal(
     } else {
         Ok(ProposalStatus::Inconclusive)
     }
+}
+
+fn proposal_password<'a>(
+    proposal: &RelationProposal,
+    path_passwords: Option<&'a [(String, String)]>,
+) -> Option<&'a str> {
+    let path_passwords = path_passwords?;
+    path_passwords.iter().find_map(|(path, password)| {
+        proposal
+            .volumes
+            .iter()
+            .any(|(volume_path, _, _, _, _)| volume_path.eq_ignore_ascii_case(path))
+            .then_some(password.as_str())
+    })
 }
 
 fn validate_seven_zip_proposal(

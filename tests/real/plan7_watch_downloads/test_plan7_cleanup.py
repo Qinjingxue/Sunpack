@@ -19,7 +19,7 @@ from tests.real.plan7_watch_downloads.plan7_support import (
 FACTORY = ArchiveFixtureFactory()
 
 
-def test_plan7_sfx_split_success_cleans_launcher_and_data_volumes(tmp_path):
+def test_plan7_sfx_split_success_does_not_claim_unverified_launcher(tmp_path):
     case = FACTORY.create(
         tmp_path / "fixtures",
         "p7_cleanup_sfx_7z",
@@ -53,9 +53,13 @@ def test_plan7_sfx_split_success_cleans_launcher_and_data_volumes(tmp_path):
         )
         assert time.perf_counter() - stable_at < 60.0
         assert not harness.watcher.state.entries
+        input_names = set(input_volume_names(plan_case))
         assert all(
             not (harness.watch_root / path.name).exists()
             for path in order
-        ), "successful SFX split cleanup must remove data volumes and PE launcher"
+            if path.name in input_names
+        )
+        launcher = next(path for path in order if path.name not in input_names)
+        assert (harness.watch_root / launcher.name).exists()
     finally:
         harness.close()

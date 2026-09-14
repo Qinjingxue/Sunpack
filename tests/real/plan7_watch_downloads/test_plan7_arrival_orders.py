@@ -88,7 +88,7 @@ def test_plan7_launcher_first_then_data_volumes_reacts_after_group_completion(
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
-def test_plan7_data_volumes_before_launcher_preserves_known_extreme_behavior(
+def test_plan7_data_volumes_before_launcher_keeps_launcher_independent(
     tmp_path, archive_format
 ):
     case = _build_case(tmp_path, archive_format)
@@ -112,7 +112,12 @@ def test_plan7_data_volumes_before_launcher_preserves_known_extreme_behavior(
         arrive_slowly(harness, launcher)
         for _ in range(3):
             harness.watcher.run_once()
-        assert len(harness.submission_events) == submissions_before_launcher
+        later_submissions = harness.submission_events[submissions_before_launcher:]
+        assert later_submissions
+        assert all(
+            tuple(path.name for path in map(Path, event.paths)) == (launcher.name,)
+            for event in later_submissions
+        )
     finally:
         harness.close()
 

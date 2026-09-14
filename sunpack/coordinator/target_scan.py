@@ -112,6 +112,21 @@ def build_fact_bags_for_targets(
             bag for bag in parent_bags
             if selected_key in _bag_paths(bag)
         ]
+        if _is_unverified_external_sfx_launcher(matched, file_path):
+            expected_name = session.logical_name_for_archive(os.path.basename(file_path)).lower()
+            split_matches = [
+                bag for bag in parent_bags
+                if bag.get("relation.is_split_related")
+                and _sfx_logical_names_match(
+                    os.path.basename(bag.get("file.logical_name", "")).lower(),
+                    expected_name,
+                )
+            ]
+            if split_matches:
+                # This is a selection alias only. The launcher remains out of
+                # the archive input and cleanup paths; the split group carries
+                # the structurally proven data volumes.
+                matched = [_selection_alias_for_external_sfx(bag) for bag in split_matches]
         if not matched:
             expected_name = session.logical_name_for_archive(os.path.basename(file_path)).lower()
             matched = [
@@ -122,6 +137,39 @@ def build_fact_bags_for_targets(
         _add_unique(fact_bags, seen_keys, matched)
 
     return fact_bags
+
+
+def _is_unverified_external_sfx_launcher(bags: list[FactBag], file_path: str) -> bool:
+    if os.path.splitext(file_path)[1].casefold() != ".exe" or len(bags) != 1:
+        return False
+    anchor = bags[0].get("relation.volume_anchor")
+    if not isinstance(anchor, dict):
+        return False
+    evidence = anchor.get("evidence")
+    return (
+        not anchor.get("format")
+        and bool(anchor.get("sfx"))
+        and isinstance(evidence, list)
+        and "sfx:pe_header" in evidence
+    )
+
+
+def _selection_alias_for_external_sfx(bag: FactBag) -> FactBag:
+    alias = FactBag()
+    alias.update(bag.to_dict())
+    alias.set("file.container_type", "pe")
+    return alias
+
+
+def _sfx_logical_names_match(candidate_name: str, launcher_name: str) -> bool:
+    if not candidate_name or not launcher_name:
+        return False
+    return (
+        candidate_name == launcher_name
+        or candidate_name.startswith(f"{launcher_name}.")
+        or candidate_name.endswith(f".{launcher_name}")
+        or f".{launcher_name}." in candidate_name
+    )
 
 
 def _context_root_for_file(file_path: str, config: dict) -> str:

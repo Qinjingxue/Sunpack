@@ -1594,7 +1594,7 @@ fn scan_directory(
 fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
     let paths: Vec<String> = records
         .iter()
-        .filter(|record| !record.is_dir)
+        .filter(|record| !record.is_dir && record.relation_member_eligible)
         .map(|record| record.path.clone())
         .collect();
     if paths.is_empty() {
@@ -1605,7 +1605,10 @@ fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
         .into_iter()
         .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
         .collect();
-    for record in records.iter_mut().filter(|record| !record.is_dir) {
+    for record in records
+        .iter_mut()
+        .filter(|record| !record.is_dir && record.relation_member_eligible)
+    {
         record.relation_anchor = anchors_by_path
             .get(&record.path.to_ascii_lowercase())
             .cloned();
