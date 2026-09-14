@@ -233,18 +233,6 @@ fn build_candidate_groups_from_physical(
     }
 
     let mut output = Vec::new();
-    // A password map is only supplied on the retry pass after an encrypted
-    // proposal has already been discovered and its password has been
-    // verified against at least one member.  If that retry still cannot
-    // prove a complete relation (for example because a volume is missing),
-    // those physical paths must not fall back to ordinary single-file
-    // candidates.  The first pass has no password map, so weak encrypted
-    // files retain their normal fail-open behaviour.
-    let attempted_password_paths: HashSet<String> = path_passwords
-        .unwrap_or(&[])
-        .iter()
-        .map(|(path, _)| path.to_ascii_lowercase())
-        .collect();
     for directory in directory_order {
         let Some(mut directory_rows) = by_directory.remove(&directory) else {
             continue;
@@ -283,10 +271,7 @@ fn build_candidate_groups_from_physical(
             // rebuild it after an MZ seed has been promoted by structure.
             name_index = DirectoryNameIndex::build(&directory_rows);
         }
-        let mut strong_suppressed_paths = inconclusive_encrypted_family_paths(
-            &directory_rows,
-            &name_index,
-        );
+        let mut strong_suppressed_paths = HashSet::new();
         let mut proposals = Vec::new();
         let mut proposal_keys = HashSet::new();
 
@@ -345,6 +330,33 @@ fn build_candidate_groups_from_physical(
                 &directory_rows,
                 path_passwords,
             )?);
+        }
+
+        // A password retry may structurally prove every observed member as a
+        // volume while still being inconclusive because the head or terminal
+        // volume is absent.  Keep that incomplete proposal out of ordinary
+        // fallback.  Standalone encrypted files do not satisfy the all-volume
+        // proof and therefore remain ordinary after their proposal is rejected.
+        if path_passwords.is_some() {
+            for validation in &validations {
+                if validation.status != ProposalStatus::Inconclusive
+                    || !validation.proposal.volumes.iter().all(|(path, _, _, _, _)| {
+                        validation
+                            .anchors
+                            .get(&path.to_ascii_lowercase())
+                            .is_some_and(|anchor| {
+                                anchor.format == "rar"
+                                    && anchor.confidence == "strong"
+                                    && (anchor.multivolume
+                                        || anchor.continuation_from_previous
+                                        || anchor.continuation_to_next)
+                            })
+                    })
+                {
+                    continue;
+                }
+                strong_suppressed_paths.extend(proposal_owned_paths(&validation.proposal));
+            }
         }
 
         let valid_indexes: Vec<usize> = validations
@@ -429,7 +441,6 @@ fn build_candidate_groups_from_physical(
             filtered_keys.contains(&row.path.to_ascii_lowercase())
                 && !claimed_paths.contains(&row.path.to_ascii_lowercase())
                 && !password_paths.contains(&row.path.to_ascii_lowercase())
-                && !attempted_password_paths.contains(&row.path.to_ascii_lowercase())
                 && !strong_suppressed_paths.contains(&row.path.to_ascii_lowercase())
         }) {
             output.push(ordinary_file_group_to_dict(py, row)?);
@@ -495,45 +506,6 @@ fn seed_strength_for_row(
         return Some("strong");
     }
     Some(strength)
-}
-
-fn inconclusive_encrypted_family_paths(
-    rows: &[RelationInput],
-    name_index: &DirectoryNameIndex,
-) -> HashSet<String> {
-    let mut families: HashMap<String, Vec<String>> = HashMap::new();
-    for row in rows {
-        let Some(anchor) = row.anchor.as_ref() else {
-            continue;
-        };
-        if anchor.format != "rar"
-            || anchor.confidence != "strong"
-            || !anchor.encrypted
-            || anchor.standalone
-            || !anchor.anchor_roles.iter().any(|role| *role == "encrypted_volume")
-        {
-            continue;
-        }
-        for candidate in name_index.candidates(row).iter().filter(|candidate| {
-            candidate.number > 0
-                && (candidate.family == "rar" || candidate.family == "generic")
-        }) {
-            let logical_name = logical_name_from_parsed(candidate).to_ascii_lowercase();
-            if logical_name.is_empty() {
-                continue;
-            }
-            families
-                .entry(logical_name)
-                .or_default()
-                .push(row.path.clone());
-        }
-    }
-
-    families
-        .into_values()
-        .filter(|paths| paths.iter().map(|path| path.to_ascii_lowercase()).collect::<HashSet<_>>().len() >= 2)
-        .flat_map(|paths| paths.into_iter().map(|path| path.to_ascii_lowercase()))
-        .collect()
 }
 
 fn is_weak_sfx_split_head(row: &RelationInput, name_index: &DirectoryNameIndex) -> bool {
@@ -885,11 +857,38 @@ fn make_name_proposal(
         ));
     }
     volumes.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-    if volumes.len() < 2 || !volumes.iter().any(|volume| volume.1 == 1) {
+    let encrypted_rar_hypothesis = seed_interpretation.format == "rar"
+        && volumes.len() >= 2
+        // An encrypted RAR SFX part1.exe is already promoted by the narrow
+        // structural SFX seed rule above.  Do not let an incomplete filename
+        // proposal turn that seed into a watch-dispatchable split candidate
+        // before the remaining volumes arrive.
+        && !volumes.iter().any(|(path, _, _, _, _)| {
+            rows.iter()
+                .find(|row| row.path.eq_ignore_ascii_case(path))
+                .and_then(|row| row.anchor.as_ref())
+                .is_some_and(|anchor| anchor.sfx)
+        })
+        && volumes.iter().all(|(path, _, _, _, _)| {
+            rows.iter()
+                .find(|row| row.path.eq_ignore_ascii_case(path))
+                .and_then(|row| row.anchor.as_ref())
+                .is_some_and(|anchor| {
+                    anchor.format == "rar"
+                        && anchor.encrypted
+                        && anchor.needs_password
+                        && !anchor.standalone
+                })
+        });
+    if volumes.len() < 2
+        || (!encrypted_rar_hypothesis && !volumes.iter().any(|volume| volume.1 == 1))
+    {
         return None;
     }
     let highest = volumes.iter().map(|volume| volume.1).max().unwrap_or(0);
-    if (1..=highest).any(|number| !volumes.iter().any(|volume| volume.1 == number)) {
+    if !encrypted_rar_hypothesis
+        && (1..=highest).any(|number| !volumes.iter().any(|volume| volume.1 == number))
+    {
         return None;
     }
     let has_filtered_trigger = rows.iter().any(|row| {

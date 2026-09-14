@@ -147,6 +147,20 @@ def test_single_hp_rar_with_split_like_filename_remains_a_plain_file_group(tmp_p
     assert groups[0].is_split_candidate is False
 
 
+def test_two_standalone_hp_rars_in_same_filename_family_return_to_plain_files(tmp_path):
+    _write_hex(tmp_path / "same.part1.rar", SINGLE_HP_HEX)
+    _write_hex(tmp_path / "same.part2.rar", SINGLE_HP_HEX)
+    snapshot = _snapshot(tmp_path, ["same.part1.rar", "same.part2.rar"])
+
+    groups = RelationsScheduler({"user_passwords": ["secret"]}).build_candidate_groups(snapshot)
+
+    assert {os.path.basename(group.head_path) for group in groups} == {
+        "same.part1.rar",
+        "same.part2.rar",
+    }
+    assert all(group.kind == "file" and not group.is_split_candidate for group in groups)
+
+
 def test_split_hp_rar_group_is_identified_from_filenames(tmp_path):
     _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
     _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX)
