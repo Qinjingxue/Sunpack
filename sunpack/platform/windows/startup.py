@@ -4,6 +4,8 @@ import subprocess
 import winreg
 
 from sunpack.gui.launcher import watch_launch_argv
+from sunpack.support.process_executable import current_process_executable
+from sunpack.support.runtime_identity import runtime_id_argument, runtime_id_available
 
 
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -11,7 +13,12 @@ VALUE_NAME = "SunPackWatchService"
 
 
 def startup_command() -> str:
-    return subprocess.list2cmdline(watch_launch_argv(prefer_windowed_python=True))
+    executable = current_process_executable()
+    if executable.name.lower() == "sunpack-runtime.exe" and runtime_id_available():
+        argv = [str(executable), runtime_id_argument(), "watch", "start"]
+    else:
+        argv = watch_launch_argv(prefer_windowed_python=True)
+    return subprocess.list2cmdline(argv)
 
 
 def enable_startup(command: str | None = None) -> str:

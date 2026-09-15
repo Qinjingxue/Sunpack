@@ -31,10 +31,12 @@ def test_installer_optionally_registers_watch_autostart():
     assert "english.TaskAutostart=Start sunpack Watch when Windows starts" in script
     assert "chinesesimplified.TaskAutostart=Windows 启动时运行 sunpack 监控" in script
     assert "Software\\Microsoft\\Windows\\CurrentVersion\\Run" in script
-    assert 'ValueName: "SunPackWatchService"' in script
-    assert 'ValueData: """{app}\\sunpack.exe"" watch start"' in script
-    assert "Tasks: autostart" in script
-    assert "uninsdeletevalue" in script
+    assert "WizardIsTaskSelected('autostart')" in script
+    assert "watch startup enable" in script
+    assert "SW_HIDE" in script
+    assert "ewWaitUntilTerminated" in script
+    assert 'ValueData: """{app}\\sunpack.exe"" watch start"' not in script
+    assert "uninsdeletevalue" not in script
 
 
 def test_installer_does_not_register_start_menu_entries():

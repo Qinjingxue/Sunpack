@@ -228,7 +228,11 @@ try {
         throw "Context menu command does not reference the installed executable: $directCommand"
     }
     $startupCommand = [string](Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName).$startupValueName
-    if ($startupCommand -ne ('"{0}" watch start' -f $appPath)) {
+    $escapedRuntime = [regex]::Escape($runtimeAppPath)
+    if ($startupCommand -notmatch (
+        '^"' + $escapedRuntime +
+        '" --_sunpack-runtime-id=v2-[0-9a-f]{16} watch start$'
+    )) {
         throw "Startup Run value is incorrect: $startupCommand"
     }
 

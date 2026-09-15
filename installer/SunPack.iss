@@ -104,9 +104,6 @@ Type: files; Name: "{userprograms}\SunPack\Uninstall SunPack.lnk"
 Type: files; Name: "{userprograms}\SunPack\SunPack Watch Notifications.lnk"
 Type: dirifempty; Name: "{userprograms}\SunPack"
 
-[Registry]
-Root: HKCU; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: string; ValueName: "SunPackWatchService"; ValueData: """{app}\sunpack.exe"" watch start"; Tasks: autostart; Flags: uninsdeletevalue
-
 [UninstallRun]
 Filename: "{app}\sunpack-runtime.exe"; Parameters: "--unregister-toast"; RunOnceId: "SunPackToast"; Flags: runhidden waituntilterminated skipifdoesntexist
 
@@ -502,6 +499,8 @@ begin
 end;
 
 procedure CurStepChanged(CurStep: TSetupStep);
+var
+  ResultCode: Integer;
 begin
   if CurStep = ssPostInstall then
   begin
@@ -512,6 +511,20 @@ begin
       RunContextMenuScript(True)
     else
       RunContextMenuScript(False);
+    if WizardIsTaskSelected('autostart') then
+    begin
+      if not Exec(
+        ExpandConstant('{app}\sunpack.exe'),
+        'watch startup enable',
+        '',
+        SW_HIDE,
+        ewWaitUntilTerminated,
+        ResultCode
+      ) then
+        Log('Failed to enable SunPack watch autostart')
+      else if ResultCode <> 0 then
+        Log(Format('SunPack watch autostart command exited with code %d', [ResultCode]));
+    end;
   end;
 end;
 
