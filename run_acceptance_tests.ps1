@@ -15,7 +15,6 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $unelevatedRunner = Join-Path $repoRoot "scripts\run_unelevated_process.py"
 $testArtifactCleanupScript = Join-Path $repoRoot "scripts\cleanup_test_artifacts.ps1"
-$pytestBaseTemp = Join-Path $repoRoot ".sunpack-test-tmp"
 Set-Location $repoRoot
 
 if ($ParallelWorkers -le 0) {
@@ -732,7 +731,6 @@ try {
         "-m", "pytest", "-q",
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
-        "--basetemp", $pytestBaseTemp,
         "tests/cli", "tests/unit", "tests/functional",
         "--durations=20"
     )
@@ -741,7 +739,6 @@ try {
         "-m", "pytest", "-q",
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
-        "--basetemp", $pytestBaseTemp,
         "tests/integration", "tests/real",
         "--ignore", "tests/integration/test_disk_full_pause_resume.py",
         "--durations=20"
@@ -751,7 +748,6 @@ try {
         "-m", "pytest", "-q",
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
-        "--basetemp", $pytestBaseTemp,
         "tests/integration/test_disk_full_pause_resume.py",
         "--durations=20"
     )
