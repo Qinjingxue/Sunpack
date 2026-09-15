@@ -47,14 +47,14 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
 
 ### Command overview
 
-| Command     | Description                                                            |
-| ----------- | ---------------------------------------------------------------------- |
-| `extract`   | Extract files.                                                         |
-| `watch`     | Monitor directories and extract archives automatically once found.      |
-| `scan`      | Scan a directory for archives; useful for identifying archives.        |
-| `inspect`   | Print detailed detection data; a debugging command with JSON output.   |
-| `passwords` | Show the password list that will be attempted in this run.             |
-| `doctor`    | Read-only check of configuration and runtime environment.              |
+| Command     | Description                                                          |
+| ----------- | -------------------------------------------------------------------- |
+| `extract`   | Extract files.                                                       |
+| `watch`     | Monitor directories and extract archives automatically once found.   |
+| `scan`      | Scan a directory for archives; useful for identifying archives.      |
+| `inspect`   | Print detailed detection data; a debugging command with JSON output. |
+| `passwords` | Show the password list that will be attempted in this run.           |
+| `doctor`    | Read-only check of configuration and runtime environment.            |
 
 > See [CLI parameter reference](docs/cli_parameters.md) for detailed options.
 
@@ -70,6 +70,10 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 ---
 
 ## Core capabilities
+
+### Recognition Capability
+
+- SunPack identifies potential archive files by analyzing their binary data, including disguised archives embedded within carrier files and multi-volume archives.
 
 ### Recursive processing
 
