@@ -1,8 +1,6 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <shlobj.h>
-#include <propkey.h>
-#include <propvarutil.h>
 #include <NotificationActivationCallback.h>
 
 #include <winrt/base.h>
@@ -48,6 +46,8 @@ constexpr wchar_t kProgressToastTag[] = L"watch-progress";
 constexpr wchar_t kFinalToastTag[] = L"watch-final";
 constexpr wchar_t kToastGroup[] = L"SunPack";
 constexpr wchar_t kClsidText[] = L"{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}";
+constexpr wchar_t kToastDisplayName[] = L"SunPack";
+constexpr wchar_t kToastIconBackgroundColor[] = L"FF0078D4";
 constexpr CLSID kToastActivatorClsid = {
     0xc5a6b4e9, 0x3184, 0x44e2, {0x9f, 0x15, 0x6a, 0x71, 0x80, 0x4f, 0x7a, 0x36}
 };
@@ -134,18 +134,22 @@ std::wstring quote_argument(std::wstring_view value) {
     return result;
 }
 
-std::wstring programs_shortcut_path(bool create_directory = true) {
+std::wstring legacy_toast_shortcut_path() {
     PWSTR raw = nullptr;
-    winrt::check_hresult(SHGetKnownFolderPath(FOLDERID_Programs, KF_FLAG_CREATE, nullptr, &raw));
+    winrt::check_hresult(SHGetKnownFolderPath(FOLDERID_Programs, KF_FLAG_DONT_VERIFY, nullptr, &raw));
     std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> owner(raw, CoTaskMemFree);
-    const std::filesystem::path directory = std::filesystem::path(raw) / L"SunPack";
-    if (create_directory) {
-        std::filesystem::create_directories(directory);
-    }
-    return (directory / L"SunPack Watch Notifications.lnk").wstring();
+    return (std::filesystem::path(raw) / L"SunPack" / L"SunPack Watch Notifications.lnk").wstring();
 }
 
-void set_registry_string(HKEY root, const std::wstring& subkey, const std::wstring& value) {
+void remove_legacy_toast_shortcut() noexcept {
+    try {
+        std::filesystem::remove(legacy_toast_shortcut_path());
+    } catch (...) {
+    }
+}
+
+void set_registry_string(HKEY root, const std::wstring& subkey,
+                         const wchar_t* value_name, const std::wstring& value) {
     HKEY key = nullptr;
     const LSTATUS created = RegCreateKeyExW(
         root,
@@ -163,7 +167,7 @@ void set_registry_string(HKEY root, const std::wstring& subkey, const std::wstri
     }
     const LSTATUS written = RegSetValueExW(
         key,
-        nullptr,
+        value_name,
         0,
         REG_SZ,
         reinterpret_cast<const BYTE*>(value.c_str()),
@@ -175,77 +179,79 @@ void set_registry_string(HKEY root, const std::wstring& subkey, const std::wstri
     }
 }
 
+std::optional<std::wstring> get_registry_string(
+    HKEY root, const std::wstring& subkey, const wchar_t* value_name
+) {
+    DWORD bytes = 0;
+    if (RegGetValueW(
+        root, subkey.c_str(), value_name, RRF_RT_REG_SZ,
+        nullptr, nullptr, &bytes
+    ) != ERROR_SUCCESS || bytes < sizeof(wchar_t)) {
+        return std::nullopt;
+    }
+    std::wstring value(bytes / sizeof(wchar_t), L'\0');
+    if (RegGetValueW(
+        root, subkey.c_str(), value_name, RRF_RT_REG_SZ,
+        nullptr, value.data(), &bytes
+    ) != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+    value.resize(std::wcslen(value.c_str()));
+    return value;
+}
+
+std::wstring toast_app_id_registry_path() {
+    return std::wstring(L"Software\\Classes\\AppUserModelId\\") + kAppId;
+}
+
+std::wstring toast_icon_path(const std::wstring& executable) {
+    return (std::filesystem::path(executable).parent_path() / L"sunpack.ico").wstring();
+}
+
 void register_toast_identity(const std::wstring& executable, const std::wstring& arguments) {
-    const std::wstring registry_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
-    set_registry_string(HKEY_CURRENT_USER, registry_path, quote_argument(executable) + L" " + arguments);
+    const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
+    set_registry_string(
+        HKEY_CURRENT_USER, com_path, nullptr, quote_argument(executable) + L" " + arguments
+    );
 
-    winrt::com_ptr<IShellLinkW> link;
-    winrt::check_hresult(CoCreateInstance(
-        CLSID_ShellLink,
-        nullptr,
-        CLSCTX_INPROC_SERVER,
-        IID_PPV_ARGS(link.put())
-    ));
-    winrt::check_hresult(link->SetPath(executable.c_str()));
-    winrt::check_hresult(link->SetArguments(arguments.c_str()));
-    winrt::check_hresult(link->SetDescription(L"SunPack Watch notifications"));
-
-    const auto store = link.as<IPropertyStore>();
-    PROPVARIANT app_id{};
-    winrt::check_hresult(InitPropVariantFromString(kAppId, &app_id));
-    winrt::check_hresult(store->SetValue(PKEY_AppUserModel_ID, app_id));
-    PropVariantClear(&app_id);
-    PROPVARIANT activator{};
-    winrt::check_hresult(InitPropVariantFromCLSID(kToastActivatorClsid, &activator));
-    winrt::check_hresult(store->SetValue(PKEY_AppUserModel_ToastActivatorCLSID, activator));
-    PropVariantClear(&activator);
-    winrt::check_hresult(store->Commit());
-    const auto persist = link.as<IPersistFile>();
-    winrt::check_hresult(persist->Save(programs_shortcut_path().c_str(), TRUE));
+    const std::wstring app_id_path = toast_app_id_registry_path();
+    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName", kToastDisplayName);
+    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri", toast_icon_path(executable));
+    set_registry_string(
+        HKEY_CURRENT_USER, app_id_path, L"IconBackgroundColor", kToastIconBackgroundColor
+    );
+    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"CustomActivator", kClsidText);
+    remove_legacy_toast_shortcut();
 }
 
 bool toast_identity_registered(const std::wstring& executable, const std::wstring& arguments) noexcept {
     try {
-        const std::wstring registry_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
-        DWORD bytes = 0;
-        if (RegGetValueW(
-            HKEY_CURRENT_USER,
-            registry_path.c_str(),
-            nullptr,
-            RRF_RT_REG_SZ,
-            nullptr,
-            nullptr,
-            &bytes
-        ) != ERROR_SUCCESS || bytes < sizeof(wchar_t)) {
-            return false;
-        }
-        std::wstring value(bytes / sizeof(wchar_t), L'\0');
-        if (RegGetValueW(
-            HKEY_CURRENT_USER,
-            registry_path.c_str(),
-            nullptr,
-            RRF_RT_REG_SZ,
-            nullptr,
-            value.data(),
-            &bytes
-        ) != ERROR_SUCCESS) {
-            return false;
-        }
-        value.resize(std::wcslen(value.c_str()));
-        const std::wstring expected = quote_argument(executable) + L" " + arguments;
-        return value == expected && std::filesystem::is_regular_file(programs_shortcut_path(false));
+        const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
+        const std::wstring app_id_path = toast_app_id_registry_path();
+        return get_registry_string(HKEY_CURRENT_USER, com_path, nullptr) ==
+                   quote_argument(executable) + L" " + arguments &&
+               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName") ==
+                   kToastDisplayName &&
+               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri") ==
+                   toast_icon_path(executable) &&
+               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconBackgroundColor") ==
+                   kToastIconBackgroundColor &&
+               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"CustomActivator") ==
+                   kClsidText;
     } catch (...) {
         return false;
     }
 }
 
 void unregister_toast_identity() noexcept {
-    const std::wstring registry_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText;
-    RegDeleteTreeW(HKEY_CURRENT_USER, registry_path.c_str());
     try {
-        std::filesystem::remove(programs_shortcut_path(false));
+        const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText;
+        const std::wstring app_id_path = toast_app_id_registry_path();
+        RegDeleteTreeW(HKEY_CURRENT_USER, com_path.c_str());
+        RegDeleteTreeW(HKEY_CURRENT_USER, app_id_path.c_str());
     } catch (...) {
     }
+    remove_legacy_toast_shortcut();
 }
 
 std::wstring xml_escape(std::wstring_view text) {
@@ -839,7 +845,7 @@ int self_test() {
         if (!rejected) return 4;
     }
     {
-        // Exercise the real context without registering a user shortcut or
+        // Exercise the real context without registering a user identity or
         // interfering with the production activator in a running watch.
         CLSID test_clsid{};
         winrt::check_hresult(CoCreateGuid(&test_clsid));

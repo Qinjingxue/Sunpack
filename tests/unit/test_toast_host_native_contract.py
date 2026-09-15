@@ -37,6 +37,19 @@ def test_native_context_releases_presenter_and_activation_before_apartment():
     assert "wWinMain" not in source
 
 
+def test_native_toast_identity_uses_registry_without_a_start_menu_shortcut():
+    source = (ROOT / "native/toast_host/src/main.cpp").read_text(encoding="utf-8")
+
+    assert 'L"Software\\\\Classes\\\\AppUserModelId\\\\"' in source
+    for value_name in ("DisplayName", "IconUri", "IconBackgroundColor", "CustomActivator"):
+        assert f'L"{value_name}"' in source
+    assert "IShellLinkW" not in source
+    assert "PKEY_AppUserModel_ID" not in source
+    assert "PKEY_AppUserModel_ToastActivatorCLSID" not in source
+    assert "RegDeleteTreeW(HKEY_CURRENT_USER, app_id_path.c_str())" in source
+    assert "remove_legacy_toast_shortcut();" in source
+
+
 def test_build_produces_library_and_only_packages_library():
     cmake = (ROOT / "native/toast_host/CMakeLists.txt").read_text(encoding="utf-8")
     assert "SHARED src/main.cpp" in cmake

@@ -73,6 +73,11 @@ def test_installer_registers_only_the_uninstaller_in_start_menu():
     assert 'Name: "{commonprograms}\\sunpack.exe.lnk"' in script
     assert '[UninstallDelete]' in script
 
+    smoke = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
+    assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")' in smoke
+    assert "Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath" in smoke
+    assert 'foreach ($name in @("SunPack Watch Notifications.lnk"' in smoke
+
 
 def test_installer_owns_a_minimal_demand_start_watch_broker_service():
     installer = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")

@@ -129,6 +129,8 @@ $folderMenuKey = "HKCU:\Software\Classes\Directory\shell\SunPack"
 $backgroundMenuKey = "HKCU:\Software\Classes\Directory\Background\shell\SunPack"
 $startupRunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $startupValueName = "SunPackWatchService"
+$toastAppIdKey = "HKCU:\Software\Classes\AppUserModelId\SunPack.Watch.Toast"
+$toastClsidKey = "HKCU:\Software\Classes\CLSID\{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}\LocalServer32"
 $serviceName = "SunPackWatchBroker"
 $userDataRoot = Join-Path $env:LOCALAPPDATA "SunPack"
 $userDataBackup = $null
@@ -158,15 +160,11 @@ function Get-SunPackStartMenuEntries {
 
 function Assert-SunPackStartMenu {
     $entries = @(Get-SunPackStartMenuEntries)
-    $installerNames = @(
-        $entries |
-            Where-Object { $_.Name -ine "SunPack Watch Notifications.lnk" } |
-            Select-Object -ExpandProperty Name
-    )
+    $installerNames = @($entries | Select-Object -ExpandProperty Name)
     if ($installerNames.Count -ne 1 -or $installerNames[0] -ne "Uninstall SunPack.lnk") {
         throw "Installer Start menu entries should contain only the uninstaller. Entries: $($installerNames -join ', ')"
     }
-    foreach ($name in @("SunPack Command Prompt.lnk", "sunpack.exe.lnk")) {
+    foreach ($name in @("SunPack Watch Notifications.lnk", "SunPack Command Prompt.lnk", "sunpack.exe.lnk")) {
         foreach ($path in @(Get-StartMenuShortcutPaths -Name $name)) {
             if (Test-Path -LiteralPath $path) {
                 throw "Obsolete Start menu shortcut remains: $path"
@@ -175,11 +173,32 @@ function Assert-SunPackStartMenu {
     }
 }
 
+function Assert-ToastRegistryIdentity {
+    param([Parameter(Mandatory = $true)][string]$RuntimePath)
+
+    $identity = Get-ItemProperty -LiteralPath $toastAppIdKey -ErrorAction Stop
+    if ($identity.DisplayName -ne "SunPack" -or
+        $identity.IconUri -ne (Join-Path (Split-Path -Parent $RuntimePath) "sunpack.ico") -or
+        $identity.IconBackgroundColor -ne "FF0078D4" -or
+        $identity.CustomActivator -ne "{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}") {
+        throw "Toast AppUserModelId registry identity is incorrect."
+    }
+    $activationCommand = [string](Get-Item -LiteralPath $toastClsidKey -ErrorAction Stop).GetValue("")
+    if ($activationCommand -ne ('"{0}" --toast-activated' -f $RuntimePath)) {
+        throw "Toast COM activation command is incorrect: $activationCommand"
+    }
+}
+
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     throw "Installer smoke test requires the service to be absent: $serviceName"
 }
 if (Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName -ErrorAction SilentlyContinue) {
     throw "Installer smoke test requires a clean startup state and will not overwrite an existing Run value: $startupValueName"
+}
+foreach ($key in @($toastAppIdKey, $toastClsidKey)) {
+    if (Test-Path -LiteralPath $key) {
+        throw "Installer smoke test requires a clean Toast registration state and will not overwrite: $key"
+    }
 }
 
 foreach ($key in @(
@@ -237,6 +256,8 @@ try {
     if (-not (Test-Path -LiteralPath $brokerPath)) {
         throw "Installed Watch Broker executable was not found: $brokerPath"
     }
+    Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")
+    Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath
     Assert-SunPackStartMenu
     $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
     if ($null -eq $service) {
@@ -399,6 +420,11 @@ try {
     }
     if (Test-Path -LiteralPath $installRoot) {
         throw "Uninstaller left the application directory behind: $installRoot"
+    }
+    foreach ($key in @($toastAppIdKey, $toastClsidKey)) {
+        if (Test-Path -LiteralPath $key) {
+            throw "Uninstaller left Toast registration behind: $key"
+        }
     }
     foreach ($name in @(
         "SunPack Watch Notifications.lnk",

@@ -36,7 +36,6 @@ target_link_libraries(sunpack_toast PRIVATE
     runtimeobject
     ole32
     shell32
-    propsys
     advapi32
 )
 
