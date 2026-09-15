@@ -101,6 +101,27 @@ function Invoke-UnelevatedChecked {
     }
 }
 
+function Write-DiagnosticLogTail {
+    param(
+        [Parameter(Mandatory = $true)][string]$Label,
+        [Parameter(Mandatory = $true)][string]$Path,
+        [int]$Tail = 200
+    )
+    Write-Host "::group::SunPack diagnostic: $Label"
+    try {
+        if (Test-Path -LiteralPath $Path -PathType Leaf) {
+            Write-Host "Path: $Path"
+            Get-Content -LiteralPath $Path -Tail $Tail -ErrorAction Stop
+        } else {
+            Write-Host "Diagnostic log was not found: $Path"
+        }
+    } catch {
+        Write-Host "Failed to read diagnostic log '$Path': $($_.Exception.Message)"
+    } finally {
+        Write-Host "::endgroup::"
+    }
+}
+
 function Test-PathEntry {
     param([string]$PathValue, [string]$Expected)
     $expectedPath = [System.IO.Path]::GetFullPath($Expected).TrimEnd('\')
@@ -325,7 +346,18 @@ try {
     if ($installedRuntimeProcesses.Count -ne 0) {
         throw "Packaged runtime did not exit before the startup cold-start test: $runtimeAppPath"
     }
-    Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @($runtimeIdentity, "watch", "start")
+    try {
+        Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @($runtimeIdentity, "watch", "start")
+    } catch {
+        $runtimeIdValue = $runtimeIdentity.Substring($runtimeIdentity.IndexOf("=") + 1)
+        Write-DiagnosticLogTail `
+            -Label "persistent runtime events" `
+            -Path (Join-Path $userDataRoot "runtime-$runtimeIdValue.state.events.jsonl")
+        Write-DiagnosticLogTail `
+            -Label "watch service events" `
+            -Path (Join-Path $userDataRoot ".sunpack_watch\events.jsonl")
+        throw
+    }
 
     $watchRoot = Join-Path $testRoot "watch-root"
     New-Item -ItemType Directory -Path $watchRoot -Force | Out-Null

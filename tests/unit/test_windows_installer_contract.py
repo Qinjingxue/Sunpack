@@ -350,6 +350,9 @@ def test_installer_smoke_exercises_generated_uninstall_residue_cleanup():
     assert 'Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown")' in script
     assert "Packaged runtime did not exit before the startup cold-start test" in script
     assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @($runtimeIdentity, "watch", "start")' in script
+    assert "Write-DiagnosticLogTail" in script
+    assert '"runtime-$runtimeIdValue.state.events.jsonl"' in script
+    assert '".sunpack_watch\\events.jsonl"' in script
     assert "run_unelevated_process.py" in script
     assert "Upgrade install left stale configuration data behind" in script
     assert "Set-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName" in script
