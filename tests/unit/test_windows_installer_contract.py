@@ -340,6 +340,26 @@ def test_release_packages_copy_only_runtime_tool_files():
     assert 'Copy-Item -LiteralPath $toolsRoot -Destination $distToolsRoot -Recurse -Force' not in build_script
 
 
+def test_release_package_includes_third_party_license_material():
+    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+    notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    lgpl = (ROOT / "licenses" / "LGPL-2.1.txt").read_text(encoding="utf-8")
+
+    assert "$lgplLicensePath" in build_script
+    assert "$thirdPartyNoticesPath" in build_script
+    assert 'Join-Path $distLicensesRoot "LGPL-2.1.txt"' in build_script
+    assert "$distThirdPartyNoticesPath" in build_script
+    assert "7z.dll" in notices
+    assert "7z.exe" in notices
+    assert "7z.sfx" in notices
+    assert "7zCon.sfx" in notices
+    assert "7-zip.dll" in notices
+    assert "7-zip32.dll" in notices
+    assert "https://www.7-zip.org/" in notices
+    assert "GNU LESSER GENERAL PUBLIC LICENSE" in lgpl
+    assert "Version 2.1, February 1999" in lgpl
+
+
 def test_acceptance_setup_bootstraps_and_checks_real_archive_generators():
     setup_script = (ROOT / "scripts" / "setup_windows_dev.ps1").read_text(encoding="utf-8")
     acceptance_script = (ROOT / "run_acceptance_tests.ps1").read_text(encoding="utf-8")

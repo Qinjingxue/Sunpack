@@ -26,6 +26,7 @@ SunPack 通过二进制特征而非文件扩展名识别压缩包，对混乱后
   - [开发相关](#开发相关)
   - [架构速览](#架构速览)
   - [测试](#测试)
+- [许可证](#许可证)
 
 ## 安装说明
 
@@ -159,3 +160,13 @@ uv run --locked pytest
 ```powershell
 .\run_acceptance_tests.ps1
 ```
+
+---
+
+## 许可证
+
+SunPack 源代码采用 MIT 许可证，详见 [LICENSE](LICENSE)
+
+发布的软件包中可能包含第三方组件，包括 7-Zip。此类第三方组件仍分别受其各自许可证约束，相关许可证与声明可参见 [licenses/](licenses/) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+
+随 7-Zip 一并提供的 GNU LGPL 2.1 完整许可证文本可在 [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt) 中查看

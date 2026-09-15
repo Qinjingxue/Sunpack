@@ -235,7 +235,7 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 5. 构建和测试 C++ bridge/worker 与 toast DLL
 6. 可选运行 acceptance tests
 7. 构建无控制台 runtime 和 CLI launcher
-8. 复制配置、密码表、工具、Watch Broker 和 license
+8. 复制配置、密码表、工具、Watch Broker、第三方许可证文件和声明
 9. 校验关键 PE 文件架构
 10. 运行 packaged CLI、bridge 和 worker smoke checks
 11. 用 Inno Setup 创建 Windows 安装器
@@ -245,6 +245,9 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 ```text
 dist\sunpack-<arch>\
 dist\sunpack-<arch>\service\sunpack-watch-broker.exe
+dist\sunpack-<arch>\licenses\7zip-license.txt
+dist\sunpack-<arch>\licenses\LGPL-2.1.txt
+dist\sunpack-<arch>\THIRD_PARTY_NOTICES.md
 release\sunpack-windows-<arch>-<version>-setup.exe
 ```
 

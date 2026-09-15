@@ -871,6 +871,8 @@ $sevenZipWorkerPath = Join-Path $toolsRoot "sunpack_sevenzip_worker.exe"
 $toastHostPath = Join-Path $toolsRoot "sunpack_toast.dll"
 $launcherBuildPath = Join-Path $sevenZipWrapperBuildDir "Release\sunpack_launcher.exe"
 $sevenZipLicensePath = Join-Path $repoRoot "licenses\7zip-license.txt"
+$lgplLicensePath = Join-Path $repoRoot "licenses\LGPL-2.1.txt"
+$thirdPartyNoticesPath = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 $distRoot = Join-Path $repoRoot "dist"
 $buildRoot = Join-Path $repoRoot "build"
 $nativeWheelRoot = Join-Path $buildRoot ("native-wheels-" + $buildArch)
@@ -886,6 +888,7 @@ $distToolsRoot = Join-Path $distAppRoot "tools"
 $distServiceRoot = Join-Path $distAppRoot "service"
 $distWatchBrokerPath = Join-Path $distServiceRoot "sunpack-watch-broker.exe"
 $distLicensesRoot = Join-Path $distAppRoot "licenses"
+$distThirdPartyNoticesPath = Join-Path $distAppRoot "THIRD_PARTY_NOTICES.md"
 $versionValue = Get-ReleaseVersion -ExplicitVersion $Version -RepoRoot $repoRoot
 $releaseInstallerName = "sunpack-windows-{0}-{1}-setup.exe" -f $buildArch, $versionValue
 $releaseInstallerPath = Join-Path $releaseRoot $releaseInstallerName
@@ -910,6 +913,8 @@ Assert-PathExists -LiteralPath (Join-Path $toastHostRoot "CMakeLists.txt") -Desc
 Assert-PathExists -LiteralPath $sevenZipPath -Description "Bundled 7-Zip executable"
 Assert-PathExists -LiteralPath $sevenZipDllPath -Description "Bundled 7-Zip runtime DLL"
 Assert-PathExists -LiteralPath $sevenZipLicensePath -Description "7-Zip license file"
+Assert-PathExists -LiteralPath $lgplLicensePath -Description "GNU LGPL 2.1 license file"
+Assert-PathExists -LiteralPath $thirdPartyNoticesPath -Description "Third-party notices file"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
 Assert-CommandExists -Command "uv" -Description "uv dependency manager"
 Assert-PeMachine -LiteralPath $sevenZipPath -BuildArch $buildArch -Description "Bundled 7-Zip executable"
@@ -1062,6 +1067,8 @@ Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot
 
 New-Item -ItemType Directory -Path $distLicensesRoot -Force | Out-Null
 Copy-Item -LiteralPath $sevenZipLicensePath -Destination (Join-Path $distLicensesRoot "7zip-license.txt") -Force
+Copy-Item -LiteralPath $lgplLicensePath -Destination (Join-Path $distLicensesRoot "LGPL-2.1.txt") -Force
+Copy-Item -LiteralPath $thirdPartyNoticesPath -Destination $distThirdPartyNoticesPath -Force
 
 $distScriptsRoot = Join-Path $distAppRoot "scripts"
 New-Item -ItemType Directory -Path $distScriptsRoot -Force | Out-Null
@@ -1073,6 +1080,8 @@ Assert-PathExists -LiteralPath $distConfigPath -Description "External config fil
 Assert-PathExists -LiteralPath $distIconPath -Description "External icon file"
 Assert-PackagedRuntimeTools -PackageRoot $distAppRoot
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "7zip-license.txt") -Description "External 7-Zip license file"
+Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "LGPL-2.1.txt") -Description "Packaged GNU LGPL 2.1 license file"
+Assert-PathExists -LiteralPath $distThirdPartyNoticesPath -Description "Packaged third-party notices file"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "7z.dll") -BuildArch $buildArch -Description "Packaged tools/7z.dll"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "sunpack_sevenzip.dll") -BuildArch $buildArch -Description "Packaged tools/sunpack_sevenzip.dll"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "sunpack_sevenzip_worker.exe") -BuildArch $buildArch -Description "Packaged tools/sunpack_sevenzip_worker.exe"
