@@ -52,7 +52,7 @@ class ZipAnalysisModule:
                     segments=[ArchiveSegment(start_offset=start, end_offset=None, confidence=0.70,
                                              damage_flags=["central_directory_unavailable"],
                                              evidence=["zip:validated_local_header"])],
-                    details={"recovery_strategy": "validated_local_header", "boundary_confidence": "low"},
+                    details={"boundary_confidence": "low"},
                 ))
         return combine_format_candidates("zip", evidences, preserve_multiple=prepass.get("source") == "embedded_scan")
 
@@ -168,7 +168,6 @@ class ZipAnalysisModule:
             **native,
             "boundary_confidence": "low",
             "integrity_confidence": "unknown",
-            "recovery_strategy": "local_header_scan",
             "directory_confidence": "low",
         }
         evidence = ["zip:local_header"]

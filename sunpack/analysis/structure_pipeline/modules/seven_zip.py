@@ -1,6 +1,5 @@
 from sunpack.analysis.structure_pipeline.module import AnalysisModuleSpec
 from sunpack.analysis.structure_pipeline.registry import register_analysis_module
-from sunpack.analysis.structure_pipeline.modules._boundaries import next_archive_boundary
 from sunpack.analysis.structure_pipeline.modules._fuzzy import apply_fuzzy_routes
 from sunpack.analysis.structure_pipeline.modules._read_fault import read_fault_damage_flags
 from sunpack.analysis.result import ArchiveFormatEvidence, ArchiveSegment
@@ -21,10 +20,10 @@ class SevenZipAnalysisModule:
                 start_offset=start,
                 max_next_header_check_bytes=int(config.get("max_next_header_check_bytes", 1024 * 1024) or 1024 * 1024),
             ))
-            candidates.append(self._from_native(observation.to_raw_dict(), start, next_archive_boundary(prepass, start, view.size), prepass, view.size))
+            candidates.append(self._from_native(observation.to_raw_dict(), start, prepass, view.size))
         return combine_format_candidates("7z", candidates, preserve_multiple=prepass.get("source") == "embedded_scan")
 
-    def _from_native(self, native: dict, start: int, boundary: int, prepass: dict, file_size: int) -> ArchiveFormatEvidence:
+    def _from_native(self, native: dict, start: int, prepass: dict, file_size: int) -> ArchiveFormatEvidence:
         if not native.get("magic_matched"):
             return ArchiveFormatEvidence(format="7z", confidence=0.0, status="not_found", details=native)
         evidence = list(native.get("evidence") or ["7z:signature"])
@@ -74,7 +73,7 @@ class SevenZipAnalysisModule:
             confidence=confidence,
             status=status,
             segments=[ArchiveSegment(start_offset=start, end_offset=end_offset, confidence=confidence, damage_flags=damage_flags, evidence=evidence)],
-            warnings=[] if end_offset or boundary_unreliable else ["7z segment end inferred from next archive signature or EOF"],
+            warnings=[] if end_offset or boundary_unreliable else ["7z archive structure does not prove an end for this segment"],
             details=native,
         )
 

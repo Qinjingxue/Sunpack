@@ -11,6 +11,7 @@ from io import BytesIO
 
 import pytest
 
+from sunpack.analysis.embedded import scan_embedded_archives
 from sunpack.analysis.result import ArchiveFormatEvidence
 from sunpack.analysis.engine import AnalysisEngine
 from sunpack.analysis.structure_pipeline.module import AnalysisModuleSpec
@@ -303,7 +304,9 @@ def test_zip_bad_central_directory_recovers_from_local_header(tmp_path):
     assert zip_evidence.confidence == 0.70
     assert zip_evidence.segments[0].end_offset is None
     assert "local_header_recovery" in zip_evidence.segments[0].damage_flags
-    assert zip_evidence.details["recovery_strategy"] == "local_header_scan"
+    assert zip_evidence.segments[0].evidence == ["zip:local_header"]
+    assert zip_evidence.details["boundary_confidence"] == "low"
+    assert zip_evidence.details["directory_confidence"] == "low"
 
 
 def test_analysis_scheduler_prefers_structural_boundary_over_next_signature(tmp_path):
@@ -369,6 +372,79 @@ def test_rar_missing_main_header_marks_encrypted_unwalkable(tmp_path):
     assert rar.segments[0].end_offset is None
     assert "valid_encrypted_but_unwalkable" in rar.segments[0].damage_flags
     assert rar.details["password_required"] is True
+
+
+def test_rar5_header_encrypted_carrier_end_ignores_unvalidated_signature_hits(tmp_path):
+    """A chance byte pattern inside an encrypted carrier payload must not end the segment.
+
+    RAR5 header encryption leaves the archive end unknowable from the archive structure,
+    so the only admissible fallback is the enclosing input end.  Raw signature hits are
+    not evidence of another archive: the gzip and bzip2 magics are three bytes long and
+    do occur by chance inside encrypted payloads, and honouring them truncates a healthy
+    carrier archive into a damaged extraction.
+    """
+    encrypted = b"Rar!\x1a\x07\x01\x00" + _rar5_block(4)
+    fake_gzip = b"\x1f\x8b\x08"
+    fake_bzip2 = b"BZh"
+    payload = b"\x00" * 32 + fake_gzip + b"\x00" * 32 + fake_bzip2 + b"\x00" * 32
+    prefix = b"carrier-shell"
+    body = prefix + encrypted + payload
+    path = _write_bytes(tmp_path / "encrypted-carrier.bin", body)
+    gzip_offset = body.index(fake_gzip)
+    bzip2_offset = body.index(fake_bzip2)
+
+    report = AnalysisEngine().analyze_path(str(path))
+    rar = {item.format: item for item in report.selected}["rar"]
+    segment = rar.segments[0]
+
+    raw_hits = {(hit.get("name"), int(hit.get("offset") or 0)) for hit in report.prepass.get("hits", [])}
+    assert ("gzip", gzip_offset) in raw_hits
+    assert ("bzip2", bzip2_offset) in raw_hits
+    assert rar.details["header_encrypted"] is True
+    assert rar.details["segment_end"] == 0
+    assert segment.start_offset == len(prefix)
+    assert segment.end_offset == len(body)
+    assert segment.end_offset not in {gzip_offset, bzip2_offset}
+
+
+def test_rar5_header_encrypted_candidate_reuses_scanner_bounded_end(tmp_path):
+    """An unwalkable RAR keeps the scanner's already validated upper bound as its end.
+
+    The native embedded scanner resolves a bounded range for a validated logical archive
+    whose own end is unknowable: the start of the next validated logical archive, else
+    EOF.  Analysis consumes that bound instead of re-deriving a boundary from raw hits.
+    """
+    encrypted = b"Rar!\x1a\x07\x01\x00" + _rar5_block(4)
+    follower = _rar5_bytes()
+    carrier_size = len(b"carrier")
+    body = b"carrier" + encrypted + b"\x00" * 64 + follower
+    follower_start = carrier_size + len(encrypted) + 64
+    path = _write_bytes(tmp_path / "two-archives.bin", body)
+
+    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
+    assert {
+        candidate.offset: candidate.range_end_offset
+        for candidate in scan.candidates
+        if candidate.format == "rar" and candidate.boundary_kind == "bounded"
+    } == {carrier_size: follower_start}
+    assert (carrier_size, follower_start) not in {
+        (candidate.offset, candidate.end_offset) for candidate in scan.candidates
+    }
+
+    report = AnalysisEngine().analyze_path(
+        str(path),
+        initial_prepass=scan.to_prepass(),
+        embedded_scan_allowed=True,
+    )
+    segments = {
+        (segment.start_offset, segment.end_offset)
+        for evidence in report.selected
+        if evidence.format == "rar"
+        for segment in evidence.segments
+    }
+
+    assert (carrier_size, follower_start) in segments
+    assert (follower_start, len(body)) in segments
 
 
 def test_analysis_scheduler_uses_7z_start_header_for_segment_end(tmp_path):

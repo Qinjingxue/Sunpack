@@ -1,6 +1,5 @@
 from sunpack.analysis.structure_pipeline.module import AnalysisModuleSpec
 from sunpack.analysis.structure_pipeline.registry import register_analysis_module
-from sunpack.analysis.structure_pipeline.modules._boundaries import next_archive_boundary
 from sunpack.analysis.structure_pipeline.modules._fuzzy import apply_fuzzy_routes
 from sunpack.analysis.structure_pipeline.modules._read_fault import read_fault_damage_flags
 from sunpack.analysis.result import ArchiveFormatEvidence, ArchiveSegment
@@ -22,9 +21,17 @@ class RarAnalysisModule:
             return ArchiveFormatEvidence(format="rar", confidence=0.0, status="not_found")
         candidates = []
         exact_starts = set()
+        bounded_ends: dict[int, int] = {}
         for item in embedded:
             start = int(item.get("offset") or 0)
             end = item.get("end_offset")
+            # A validated logical candidate whose own end is unknowable still carries the
+            # scanner-resolved upper bound for its bytes.  That bound comes from verified
+            # logical archive starts (or EOF), so it is the only admissible fallback when
+            # the archive structure cannot prove its own exact end.
+            bounded_end = int(item.get("range_end_offset") or 0)
+            if bounded_end > start:
+                bounded_ends[start] = bounded_end
             if end is None or item["boundary_kind"] != "exact":
                 continue
             exact_starts.add(start)
@@ -60,13 +67,13 @@ class RarAnalysisModule:
             candidates.append(self._from_native(
                 observation.to_raw_dict(),
                 start,
-                next_archive_boundary(prepass, start, view.size),
+                bounded_ends.get(start, view.size),
                 prepass,
                 view.size,
             ))
         return combine_format_candidates("rar", candidates, preserve_multiple=prepass.get("source") == "embedded_scan")
 
-    def _from_native(self, native: dict, start: int, boundary: int, prepass: dict, file_size: int) -> ArchiveFormatEvidence:
+    def _from_native(self, native: dict, start: int, fallback_end: int, prepass: dict, file_size: int) -> ArchiveFormatEvidence:
         if not native.get("magic_matched"):
             return ArchiveFormatEvidence(format="rar", confidence=0.0, status="not_found", details=native)
         evidence = list(native.get("evidence") or ["rar:signature"])
@@ -74,7 +81,7 @@ class RarAnalysisModule:
         plausible = bool(native.get("plausible"))
         error = str(native.get("error") or "")
         taxonomy = self._classify_damage(native)
-        segment_end = int(native.get("segment_end") or 0) or boundary
+        segment_end = int(native.get("segment_end") or 0) or fallback_end
         if strong:
             status = "extractable"
             confidence = 0.97
@@ -101,7 +108,6 @@ class RarAnalysisModule:
         native.setdefault("integrity_confidence", "unknown")
         if taxonomy == "probably_truncated":
             native["boundary_confidence"] = "low"
-            native["recovery_strategy"] = "block_chain_prefix"
         elif taxonomy == "valid_encrypted_but_unwalkable":
             native["boundary_confidence"] = "low"
             native["password_required"] = True
@@ -139,7 +145,7 @@ class RarAnalysisModule:
             return ["rar block chain is incomplete; archive is probably truncated"]
         if taxonomy == "valid_encrypted_but_unwalkable":
             return ["rar header appears encrypted or unreadable; password is required before boundary walk"]
-        return ["rar segment end inferred from next archive signature or EOF"]
+        return ["rar archive structure does not prove an exact end; segment is bounded by the enclosing input"]
 
 
 register_analysis_module(RarAnalysisModule())
