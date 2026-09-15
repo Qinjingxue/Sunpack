@@ -1,18 +1,20 @@
-# 开发边界说明
+# Development boundaries
 
-本文档是 SunPack 当前架构的边界约定。项目采用 native-first、verification-driven 流水线：文件系统扫描/监控、关系、检测、结构分析、密码、解压、校验、后处理和 CLI 都应保持清晰职责。
+**English** | [简体中文](zh-CN/development_boundaries.md)
 
-## 总原则
+This document defines the boundary conventions of the current SunPack architecture. The project uses a native-first, verification-driven pipeline: filesystem scanning/monitoring, relations, detection, structural analysis, passwords, extraction, verification, post-processing, and the CLI all keep clear responsibilities.
 
-1. 跨领域调用公开入口，不直接依赖别的领域的 `internal`。
-2. `contracts` 放共享数据契约，不放流程控制。
-3. `coordinator` 只编排流程，不实现领域算法。
-4. `app` 只做 CLI 参数、交互和输出适配。
-5. `support` 只放跨领域基础设施和外部 ABI 绑定，不放业务策略。
-6. Rust/C++ 原生层承接性能热点和 ABI 适配，不拥有最终业务 decision。
-7. 配置别名属于用户接口，可以保留；新增内部适配层或 Python fallback 必须有明确的边界和测试。
+## General principles
 
-## 推荐依赖方向
+1. Cross-domain calls go through public entry points; never depend directly on another domain's `internal`.
+2. `contracts` holds shared data contracts, not flow control.
+3. `coordinator` only orchestrates the flow; it does not implement domain algorithms.
+4. `app` only does CLI arguments, interaction, and output adaptation.
+5. `support` holds only cross-domain infrastructure and external ABI bindings, not business policy.
+6. The Rust/C++ native layer handles performance hotspots and ABI adaptation; it does not own final business decisions.
+7. Configuration aliases are part of the user interface and may be kept; any new internal adaptation layer or Python fallback must have explicit boundaries and tests.
+
+## Recommended dependency direction
 
 ```text
 app
@@ -69,51 +71,51 @@ contracts
   -> standard library
 ```
 
-## 公开入口
+## Public entry points
 
-| 领域 | 公开入口 | 职责 |
+| Domain | Public entry point | Responsibility |
 | ---- | -------- | ---- |
-| CLI | `sunpack.cli.cli.main` | 命令行入口。 |
-| GUI Watch | `sunpack.gui.main.main` | 无控制台托盘入口，复用 watch runtime。 |
-| 配置 | `config.loader.load_config` / `config.schema` | 配置读取、校验、归一化。 |
-| 契约 | `contracts.*` | 跨模块共享数据结构，包括 `RunContext`。 |
-| 文件系统 | `filesystem.directory_scanner.DirectoryScanner` | 目录扫描和过滤。 |
-| 关系 | `relations.RelationsScheduler` | 分卷、候选组、逻辑名和分卷成员查询。 |
-| 检测 | `detection.DetectionScheduler` | 对 Coordinator 提供的候选 facts 做规则判断。 |
-| 候选编排 | `coordinator.task_provider.ArchiveTaskProvider` | 串联 filesystem、relations、detection 和结构救援。 |
-| 递归策略 | `coordinator.output_scan_policy.NestedOutputScanPolicy` | 判断输出目录是否进入下一轮扫描。 |
-| 通用归档分析 | `analysis.ArchiveAnalyzer` | 提供无业务调度的格式、结构、边界、fuzzy 和 embedded 分析能力。 |
-| 输入规划 | `detection.input_planning.ArchiveInputPlanningStage` | 把中立分析报告转换为主流程归档输入和 embedded 子任务。 |
-| 密码 | `sunpack.passwords` | 密码候选、调度、fast verifier、7z.dll 最终确认。 |
-| 解压 | `extraction.scheduler.ExtractionScheduler` | 单归档输出目录、密码解析、worker 解压。 |
-| 校验 | `verification.VerificationScheduler` | 解压结果完整度、来源完整性和下一步决策。 |
-| 后处理 | `postprocess.actions.PostProcessActions` | 成功后清理和扁平化。 |
-| 文件系统监控 | `coordinator.watch_runtime.run_watch_service` / `filesystem.watcher.WatchScheduler` | CLI/GUI 共用服务入口、watchdog 事件、活跃到静默状态机和自动处理。 |
-| Native ABI | `support.sevenzip_bridge` | C++ 7z.dll bridge 绑定和缓存。 |
+| CLI | `sunpack.cli.cli.main` | Command-line entry point. |
+| GUI Watch | `sunpack.gui.main.main` | Console-less tray entry point; reuses the watch runtime. |
+| Configuration | `config.loader.load_config` / `config.schema` | Configuration loading, validation, normalization. |
+| Contracts | `contracts.*` | Cross-module shared data structures, including `RunContext`. |
+| Filesystem | `filesystem.directory_scanner.DirectoryScanner` | Directory scanning and filtering. |
+| Relations | `relations.RelationsScheduler` | Volumes, candidate groups, logical names, and volume-member queries. |
+| Detection | `detection.DetectionScheduler` | Rule decisions over the candidate facts provided by the Coordinator. |
+| Candidate orchestration | `coordinator.task_provider.ArchiveTaskProvider` | Chains filesystem, relations, detection, and structural rescue. |
+| Recursion policy | `coordinator.output_scan_policy.NestedOutputScanPolicy` | Decides whether an output directory enters the next scan round. |
+| General archive analysis | `analysis.ArchiveAnalyzer` | Provides format, structure, boundary, fuzzy, and embedded analysis without business scheduling. |
+| Input planning | `detection.input_planning.ArchiveInputPlanningStage` | Converts neutral analysis reports into main-pipeline archive inputs and embedded subtasks. |
+| Passwords | `sunpack.passwords` | Password candidates, scheduling, fast verifiers, final 7z.dll confirmation. |
+| Extraction | `extraction.scheduler.ExtractionScheduler` | Per-archive output directory, password resolution, worker extraction. |
+| Verification | `verification.VerificationScheduler` | Extraction result completeness, source integrity, and the next-step decision. |
+| Post-processing | `postprocess.actions.PostProcessActions` | Cleanup and flattening after success. |
+| Filesystem monitoring | `coordinator.watch_runtime.run_watch_service` / `filesystem.watcher.WatchScheduler` | Shared CLI/GUI service entry point, watchdog events, the active-to-quiet state machine, and automatic processing. |
+| Native ABI | `support.sevenzip_bridge` | C++ 7z.dll bridge bindings and caching. |
 
-## 领域边界
+## Domain boundaries
 
 ### app
 
-`app` 只负责 CLI 适配：参数解析、密码交互、配置覆盖、结果输出和退出码。它可以调用 coordinator、filesystem.watcher、passwords 和 config 的公开入口，不直接导入 detection/extraction 的内部实现。
+`app` is responsible only for CLI adaptation: argument parsing, password interaction, configuration overrides, result output, and exit codes. It may call the public entry points of coordinator, filesystem.watcher, passwords, and config, and must not import detection/extraction internals directly.
 
 ### config
 
-`config` 接管外部配置读取、字段声明、归一化和展示。配置别名如 `recursive_extract: "*" / "?"`、`filesystem.directory_scan_mode: "*" / "-"`、`archive_cleanup_mode: "d/r/k"` 是用户接口的一部分，可以保留。领域运行时应消费归一化后的内部值。
+`config` takes over external configuration reading, field declarations, normalization, and presentation. Configuration aliases such as `recursive_extract: "*" / "?"`, `filesystem.directory_scan_mode: "*" / "-"`, and `archive_cleanup_mode: "d/r/k"` are part of the user interface and may be kept. Domain runtime code should consume the normalized internal values.
 
 ### contracts
 
-`contracts` 是共享数据契约层。`FactBag`、`ArchiveTask`、`ExtractionResult`、`VerificationResult` 和 `RunContext` 应放这里。不要跨模块读取私有字段，例如 `FactBag._facts`。
+`contracts` is the shared data contract layer. `FactBag`, `ArchiveTask`, `ExtractionResult`, `VerificationResult`, and `RunContext` belong here. Do not read private fields across modules, for example `FactBag._facts`.
 
 ### filesystem
 
-`filesystem` 负责目录遍历、过滤、`DirectorySnapshot` 构建，以及 watchdog 监控能力。watcher 复用 `filesystem.scan_filters`，输入从活跃态进入静默态时交给调用方注入的主流程 runner；它不按扩展名或处理结果自行推测重试时机。Windows watch 根的 NTFS/USN 校验和 USN reason 查询由专门的 native 组件负责，watcher 只消费观察结果。
+`filesystem` handles directory traversal, filtering, `DirectorySnapshot` construction, and watchdog monitoring capability. The watcher reuses `filesystem.scan_filters` and hands input to the main-pipeline runner injected by the caller once it moves from active to quiet; it does not guess retry timing from extensions or processing results on its own. NTFS/USN validation of Windows watch roots and USN reason queries are handled by dedicated native components, and the watcher only consumes observation results.
 
 ### relations
 
-`relations` 负责文件之间的关系：严格分卷主文件、成员、SFX companion、结构证据仲裁和逻辑名。初始发现不得用宽松文件名直接建组；确认缺卷后只允许执行一次由结构锚点约束的重找。外部模块只能调用 `RelationsScheduler`，不要直接依赖 `relations.internal`。完整契约见 [Structure-first volume resolution](volume_resolution.md)。
+`relations` handles relationships between files: strict volume primary files, members, SFX companions, arbitration of structural evidence, and logical names. Initial discovery must not group files directly by loose file names; after a missing volume is confirmed, only one re-search constrained by a structural anchor is allowed. External modules may only call `RelationsScheduler`, and must not depend on `relations.internal` directly. See [Structure-first volume resolution](volume_resolution.md) for the complete contract.
 
-允许公开的关系能力包括：
+Publicly allowed relation capabilities include:
 
 - `build_candidate_groups(snapshot)`
 - `detect_split_role(filename)`
@@ -127,96 +129,95 @@ contracts
 
 ### detection
 
-`detection` 只回答“候选是否应进入解压任务”。它分三层：
+`detection` only answers whether a candidate should become an extraction task. It has three layers:
 
-目录扫描和关系分组由 Coordinator 驱动。Detection 可通过 Analysis 公共能力获得中立结构证据，并独自拥有候选授权、规则、评分以及归档输入规划。
+Directory scanning and relation grouping are driven by the Coordinator. Detection can obtain neutral structural evidence through public Analysis capabilities, and solely owns candidate authorization, rules, scoring, and archive input planning.
 
-- `facts`：采集初等事实，例如路径、大小和 magic bytes。
-- `processors`：从初等 facts 推导结构事实、embedded payload 和 7z probe/test 结果。
-- `rules`：只读 facts 和配置，输出 accept/reject/confirm。
+- `facts`: collect elementary facts such as path, size, and magic bytes.
+- `processors`: derive structural facts, embedded payloads, and 7z probe/test results from elementary facts.
+- `rules`: read only facts and configuration, and output accept/reject/confirm.
 
-规则层不应依赖 processor 实现细节；共享默认值放到公共 constants/config 模块。
+The rule layer must not depend on processor implementation details; shared defaults belong in a common constants/config module.
 
 ### analysis
 
-`analysis` 是无业务策略的通用归档分析能力层。公共入口 `ArchiveAnalyzer` 接收 file、multi-volume、range 或 segment source 和 `AnalysisRequest`，输出格式证据、片段边界、置信度与损坏标记；`probe_volume_anchor_paths` 为 Relations 提供批量、有界、只读的原生分卷结构证据。它内部可以执行 signature prepass、fuzzy、格式 probe 和 embedded fallback，但不得依赖 `ArchiveTask`、Detection 或 Coordinator，也不得写业务 knowledge。
+`analysis` is the general archive analysis capability layer without business policy. The public entry point `ArchiveAnalyzer` accepts a file, multi-volume, range, or segment source plus an `AnalysisRequest`, and outputs format evidence, fragment boundaries, confidence, and damage markers; `probe_volume_anchor_paths` provides Relations with batched, bounded, read-only native volume structural evidence. Internally it may run signature prepass, fuzzy, format probes, and embedded fallback, but it must not depend on `ArchiveTask`, Detection, or the Coordinator, and must not write business knowledge.
 
 ### passwords
 
-`passwords` 管理候选密码、批量调度、缓存、fast verifier 和最终 7z.dll 确认。fast verifier 只做低成本判断；命中后仍由 `SevenZipDllVerifier` 最终确认。密码层不执行解压，不判断候选是否应解压。
+`passwords` manages candidate passwords, batch scheduling, caching, fast verifiers, and the final 7z.dll confirmation. A fast verifier only makes a low-cost judgement; once it hits, `SevenZipDllVerifier` still gives the final confirmation. The password layer does not perform extraction and does not decide whether a candidate should be extracted.
 
 ### extraction
 
-`extraction` 是单归档解压执行层。它消费由 Detection/input planner 完整解析的 `ArchiveTask`、`source.*` 输入和 password resolution，调用 `sunpack_sevenzip_worker.exe` 通过 `7z.dll` 解压普通文件、`file_range` 或 `concat_ranges` 虚拟输入。它不查询 Relations、不负责扫描候选、不做批量并发、不做成功后清理。
+`extraction` is the per-archive extraction execution layer. It consumes the `ArchiveTask` fully resolved by Detection/input planner, the `source.*` inputs, and password resolution, and calls `sunpack_sevenzip_worker.exe` to extract plain files, `file_range`, or `concat_ranges` virtual inputs through `7z.dll`. It does not query Relations, is not responsible for scanning candidates, does not do batch concurrency, and does not clean up after success.
 
 ### verification
 
-`verification` 是解压结果校验的事实来源。它从 `ArchiveTask`、`ExtractionResult`、`ArchiveState` 和 `PasswordSession` 构建证据，按配置执行 method，返回完整度、文件观察、source integrity、recoverable upper bound 和 decision hint。是否普通重试、是否清理失败输出，由 coordinator 决定。
+`verification` is the source of truth for extraction result verification. It builds evidence from `ArchiveTask`, `ExtractionResult`, `ArchiveState`, and `PasswordSession`, runs methods according to the configuration, and returns completeness, file observations, source integrity, a recoverable upper bound, and a decision hint. Whether to retry normally and whether to clean up failed output is decided by the coordinator.
 
 ### postprocess
 
-`postprocess` 只处理成功后的清理和扁平化。它可以接收 `contracts.RunContext` 来消费成功归档和扁平化候选，但 `postprocess.internal` 不依赖 coordinator。
+`postprocess` only handles cleanup and flattening after success. It may accept `contracts.RunContext` to consume successful archives and flattening candidates, but `postprocess.internal` does not depend on the coordinator.
 
 ### coordinator
 
-`coordinator` 是唯一流程依赖拥有者，负责 filesystem→relations→detection/input planning→extraction→verification→postprocess 主流程。它还负责递归轮次、批量调度、资源 token、普通 verification retry 和 summary。它不实现领域算法；所有领域能力均通过公开入口调用。归档清理通过 postprocess 公开动作完成。
+`coordinator` is the sole owner of flow dependencies, responsible for the filesystem→relations→detection/input planning→extraction→verification→postprocess main pipeline. It is also responsible for recursive rounds, batch scheduling, resource tokens, normal verification retries, and the summary. It does not implement domain algorithms; all domain capabilities are called through public entry points. Archive cleanup is performed through public postprocess actions.
 
-流程领域包禁止反向导入 `coordinator`。Detection 只能调用 Analysis 公共能力；Analysis 不得反向依赖它们。跨阶段数据通过共享结果契约或 `contracts` 传递。
+Packages in the flow domains must not import `coordinator` in reverse. Detection may only call public Analysis capabilities; Analysis must not depend on them in reverse. Cross-stage data is passed through shared result contracts or `contracts`.
 
 ### support
 
-`support` 放资源查找、JSON、缓存、路径 helper 和 7z.dll wrapper 绑定。不要把检测策略、输出目录策略、密码解析或清理策略塞进 support。
+`support` holds resource lookup, JSON, caching, path helpers, and 7z.dll wrapper bindings. Do not stuff detection policy, output directory policy, password resolution, or cleanup policy into support.
 
 ### native
 
-`native/sunpack_native` 承接跨平台热点：目录扫描、二进制视图、signature prepass、格式 probe、carrier scan、输出 CRC/readability、输出文件索引匹配、密码 fast verifier 等。
+`native/sunpack_native` takes on cross-platform hotspots: directory scanning, binary views, signature prepass, format probes, carrier scan, output CRC/readability, output file index matching, password fast verifiers, and so on.
 
-`native/sevenzip_bridge` 承接 Windows 7z.dll ABI：archive probe/test、密码数组尝试、archive state manifest 和 `sunpack_sevenzip_worker.exe` 解压。
+`native/sevenzip_bridge` takes on the Windows 7z.dll ABI: archive probe/test, password array attempts, archive state manifests, and extraction through `sunpack_sevenzip_worker.exe`.
 
 ### Windows Watch Broker / USN
 
-`native/sunpack_usn_core` 是 Windows-only 的共享 Rust crate，负责卷标识、USN Journal 探测、有限范围的 reason 读取和 named-pipe 客户端协议。`native/sunpack_watch_broker` 编译为 Windows service，集中持有卷级 Journal 访问能力；`sunpack_native` 只向 Python 暴露文件观察和 lease 能力。
+`native/sunpack_usn_core` is a Windows-only shared Rust crate responsible for volume identification, USN Journal probing, bounded reason reads, and the named-pipe client protocol. `native/sunpack_watch_broker` compiles to a Windows service that centrally holds volume-level Journal access; `sunpack_native` exposes only file observation and lease capabilities to Python.
 
-watch 启动前必须确认根目录位于 NTFS 卷且 Journal 可读。文件观察先读取文件元数据和当前 USN；当前 USN 超过上次记录时，客户端请求 broker 读取 `previous_usn < usn <= current_usn` 的 reason，单次最多 1 MiB。watcher 根据 reason 区分内容变化和元数据变化，并把内容变化交给活跃/静默状态机。
+Before watch starts, it must confirm that the root directory is on an NTFS volume with a readable Journal. File observation first reads file metadata and the current USN; when the current USN exceeds the last recorded one, the client asks the broker to read the reasons for `previous_usn < usn <= current_usn`, at most 1 MiB per call. The watcher distinguishes content changes from metadata changes based on the reasons, and hands content changes to the active/quiet state machine.
 
-标准服务身份是 `SunPackWatchBroker`，标准管道为 `\\.\pipe\SunPack.WatchBroker.v1`。客户端以进程级 lease 使用服务：首个 lease 建立连接，嵌套 lease 复用连接，最后一个 lease 释放连接。测试只能使用 `SunPackWatchBrokerTest_` 和 `\\.\pipe\SunPack.WatchBroker.Test.` 前缀的隔离身份。
+The standard service identity is `SunPackWatchBroker`, with the standard pipe `\\.\pipe\SunPack.WatchBroker.v1`. Clients use the service through process-level leases: the first lease establishes the connection, nested leases reuse it, and the last lease release closes it. Tests may only use the isolated identities with the `SunPackWatchBrokerTest_` and `\\.\pipe\SunPack.WatchBroker.Test.` prefixes.
 
-## 禁止清单
+## Prohibited list
 
-以下写法通常表示边界坏掉：
+The following patterns usually mean a broken boundary:
 
 ```python
 from sunpack.some_domain.internal import ...
 ```
 
-跨领域不要依赖 internal。补 public facade 或把共享契约移到 `contracts`。
+Do not depend on `internal` across domains. Add a public facade, or move the shared contract into `contracts`.
 
 ```python
 facts = bag._facts
 ```
 
-不要读取私有状态。使用 `FactBag.to_dict()` 或补公开方法。
+Do not read private state. Use `FactBag.to_dict()`, or add a public method.
 
 ```python
 from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler
 ```
 
-`filesystem.watcher` 不直接构造 coordinator engine。应用组合层创建并启动进程级
-`PipelineEngine`，再把实例注入 watcher；watcher 只提交稳定输入和消费请求结果。
+`filesystem.watcher` does not construct the coordinator engine directly. The application composition layer creates and starts the process-level
+`PipelineEngine`, then injects the instance into the watcher; the watcher only submits stable inputs and consumes request results.
 
-`PipelineEngine` 拥有跨请求常驻的扫描器、分析器、验证组件、资源调度器和
-7-Zip worker pool。`PipelineResponse`、输出策略、后处理清单和统计属于请求，不能
-写回 Engine 的全局累计状态。
+`PipelineEngine` owns the scanner, analyzer, verification components, resource scheduler, and
+7-Zip worker pool that persist across requests. `PipelineResponse`, the output policy, the post-processing manifest, and statistics belong to a request and must not be written back into the Engine's global accumulated state.
 
 ```python
 from sunpack.detection.pipeline.processors.modules... import SOME_RULE_DEFAULT
 ```
 
-规则层不要依赖 processor 实现模块。共享默认值放到 `detection.pipeline.format_defaults` 或配置声明。
+The rule layer must not depend on processor implementation modules. Shared defaults belong in `detection.pipeline.format_defaults` or in configuration declarations.
 
-## 重构检查清单
+## Refactoring checklist
 
-每次改动后至少运行：
+After every change, at least run:
 
 ```powershell
 rg "from sunpack\.[^.]+\.internal" sunpack tests
@@ -224,43 +225,43 @@ rg "\._facts|FactBag\._facts" sunpack tests
 powershell -ExecutionPolicy Bypass -File scripts\run_ci_tests.ps1
 ```
 
-人工确认：
+Manually confirm:
 
-- app 是否仍只是 CLI 适配？
-- coordinator 是否仍只是编排？
-- relation 能力是否通过 `RelationsScheduler` 暴露？
-- analysis 是否仍是无业务调度的通用能力，detection 是否只通过公共入口调用？
-- verification 是否先于普通重试给出完整度和 source integrity？
-- 正常主流程是否保持 extraction → verification → postprocess 的单向生命周期？
-- support 是否没有混入业务策略？
+- Is app still only CLI adaptation?
+- Is coordinator still only orchestration?
+- Are relation capabilities exposed through `RelationsScheduler`?
+- Is analysis still a general capability without business scheduling, and does detection call it only through public entry points?
+- Does verification provide completeness and source integrity before a normal retry?
+- Does the normal main pipeline keep the one-way lifecycle extraction → verification → postprocess?
+- Has support avoided mixing in business policy?
 
-## 当前结构速览
+## Current structure at a glance
 
 ```text
 sunpack/
-  app/          CLI 命令、参数、输出和运行时适配
-  analysis/     无业务策略的归档分析、probe、view 和 embedded 能力
-  config/       配置读取、校验、归一化和领域配置视图
-  contracts/    跨模块数据契约
-  coordinator/  pipeline 编排、批量调度和递归
-  detection/    候选检测、fact 采集、结构规则判断
-  extraction/   worker 解压黑盒和解压结果
-  filesystem/   通用目录扫描、过滤和 watcher 监控能力
-  passwords/    密码候选、调度和 verifier
-  postprocess/  解压成功后的清理和扁平化
-  relations/    文件关系、分卷和候选组
-  rename/       输出命名和临时分卷 staging
-  support/      资源、JSON、缓存、7z.dll ABI 绑定等基础设施
-  verification/ 解压结果校验流水线
+  app/          CLI commands, arguments, output, and runtime adaptation
+  analysis/     Archive analysis, probe, view, and embedded capabilities without business policy
+  config/       Configuration loading, validation, normalization, and domain configuration views
+  contracts/    Cross-module data contracts
+  coordinator/  Pipeline orchestration, batch scheduling, and recursion
+  detection/    Candidate detection, fact collection, structural rule decisions
+  extraction/   Worker extraction black box and extraction results
+  filesystem/   General directory scanning, filtering, and watcher monitoring capability
+  passwords/    Password candidates, scheduling, and verifiers
+  postprocess/  Cleanup and flattening after successful extraction
+  relations/    File relationships, volumes, and candidate groups
+  rename/       Output naming and temporary volume staging
+  support/      Infrastructure such as resources, JSON, caching, and 7z.dll ABI bindings
+  verification/ Extraction result verification pipeline
 ```
 
-`PipelineEngine` 拥有进程级资源调度器和调用层 executor。调度器随 Engine 启停；跨任务 input planning 并发由 Coordinator 管理，Analysis 只使用注入的 capability executor，不拥有跨任务生命周期。
+`PipelineEngine` owns the process-level resource scheduler and the invocation-layer executor. The scheduler starts and stops with the Engine; cross-task input planning concurrency is managed by the Coordinator, and Analysis only uses the injected capability executor without owning cross-task lifecycles.
 
-仓库级目录：
+Repository-level directories:
 
 ```text
-native/sunpack_native/  Rust/PyO3 热路径
-native/sunpack_usn_core/ Windows USN 核心与客户端协议
-native/sunpack_watch_broker/ Windows Watch Broker 服务
-native/sevenzip_bridge/ Windows 7z.dll bridge 与 worker
+native/sunpack_native/  Rust/PyO3 hot paths
+native/sunpack_usn_core/ Windows USN core and client protocol
+native/sunpack_watch_broker/ Windows Watch Broker service
+native/sevenzip_bridge/ Windows 7z.dll bridge and worker
 ```

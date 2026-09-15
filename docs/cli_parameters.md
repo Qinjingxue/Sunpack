@@ -1,81 +1,83 @@
-# CLI 参数说明
+# CLI parameter reference
 
-入口脚本：
+**English** | [简体中文](zh-CN/cli_parameters.md)
+
+Entry script:
 
 ```powershell
 python sunpack.py <command> [options] [paths...]
 ```
 
-打包后的 Windows 程序通常可直接使用：
+The packaged Windows program is usually invoked directly:
 
 ```powershell
 sunpack.exe <command> [options] [paths...]
 ```
 
-顶层命令：
+Top-level commands:
 
-| 命令 | 作用 |
+| Command | Purpose |
 | --- | --- |
-| `extract` | 扫描、识别、解压、校验、后处理和清理。 |
-| `watch` | 监控目录，文件稳定后自动处理。 |
-| `scan` | 只扫描并列出可解压任务，不修改文件。 |
-| `inspect` | 输出检测和结构分析细节，不修改文件。 |
-| `passwords` | 查看当前命令可用的密码来源汇总。 |
-| `config` | 查看或校验合并后的有效配置。 |
-| `doctor` | 只读检查配置和运行环境。 |
+| `extract` | Scan, identify, extract, verify, post-process, and clean up. |
+| `watch` | Monitor directories and process files automatically once they are stable. |
+| `scan` | Only scan and list extractable tasks; does not modify files. |
+| `inspect` | Print detection and structural analysis details; does not modify files. |
+| `passwords` | Show a summary of the password sources available to the current command. |
+| `config` | Show or validate the merged effective configuration. |
+| `doctor` | Read-only check of configuration and runtime environment. |
 
-## 通用输出参数
+## Common output options
 
-这些参数用于 `extract`、`scan`、`inspect`：
+These options apply to `extract`, `scan`, and `inspect`:
 
-| 参数 | 说明 |
+| Option | Description |
 | --- | --- |
-| `-j`, `--json` | 以 JSON 格式输出结果，适合脚本调用。 |
-| `-q`, `--quiet` | 减少终端输出。 |
-| `-v`, `--verbose` | 输出更多检测和诊断细节。 |
-| `--pause` | 命令结束后等待按键退出。 |
-| `--no-pause` | 命令结束后不暂停。 |
+| `-j`, `--json` | Output results as JSON; suitable for scripting. |
+| `-q`, `--quiet` | Reduce terminal output. |
+| `-v`, `--verbose` | Output more detection and diagnostic detail. |
+| `--pause` | Wait for a key press before exiting. |
+| `--no-pause` | Do not pause after the command finishes. |
 
-`passwords` 只支持 `--json` 以及密码输入参数；`config` 支持 `--json` 和 `--quiet`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
+`passwords` supports only `--json` plus the password input options; `config` supports `--json` and `--quiet`. JSON results use a unified outer set of fields: `command`, `inputs`, `summary`, `errors`, `items`, `tasks`, `logs`; each command fills `items` or `tasks` according to its own semantics.
 
 ## extract
 
-用法：
+Usage:
 
 ```powershell
 python sunpack.py extract [options] <paths...>
 ```
 
-`paths` 可以是一个或多个文件、目录。目录按配置扫描并生成解压任务。
+`paths` may be one or more files or directories. Directories are scanned according to the configuration and turned into extraction tasks.
 
-参数：
+Options:
 
-| 参数 | 说明 |
+| Option | Description |
 | --- | --- |
-| `-p PASSWORD`, `--password PASSWORD` | 提供一个解压密码，可重复传入。 |
-| `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
-| `--ask-pw` | 在终端交互输入密码，空行结束。 |
-| `--no-builtin-pw` | 禁用内置密码表。 |
-| `--no-dir-pw` | 禁用归档同目录的 `.sunpack-passwords.txt`。 |
-| `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
-| `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
-| `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
-| `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录；相对路径按当前命令目录解析。 |
-| `--flatten` | 解压后提升单一顶层目录的内容。 |
-| `--no-flatten` | 保留解压目录结构。 |
-| `--write-manifest` | 把解压进度清单写入输出目录。 |
-| `--allow-partial`, `--ap` | 允许把部分恢复结果作为可接受结果。 |
-| `--direct-file` | 将每个输入路径直接作为归档尝试，跳过目录扫描和自动候选发现。 |
+| `-p PASSWORD`, `--password PASSWORD` | Provide one extraction password; may be repeated. |
+| `--pw-file PASSWORD_FILE` | Read passwords from a text file, one per line. |
+| `--ask-pw` | Prompt for passwords interactively in the terminal; an empty line ends input. |
+| `--no-builtin-pw` | Disable the built-in password table. |
+| `--no-dir-pw` | Disable `.sunpack-passwords.txt` from the archive's own directory. |
+| `--deep-detect` | Enable a full embedded scan for candidates that detection did not resolve. |
+| `--recur VALUE` | Override the number of nested extraction rounds; accepts a positive integer, `*`, or `?`. |
+| `--cleanup VALUE` | Override how the original archive is handled on success: `d` delete, `r` Recycle Bin, `k` keep. |
+| `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | Set the output root; relative paths are resolved against the current command directory. |
+| `--flatten` | Lift the contents of a single top-level directory after extraction. |
+| `--no-flatten` | Keep the extracted directory structure. |
+| `--write-manifest` | Write an extraction progress manifest into the output directory. |
+| `--allow-partial`, `--ap` | Accept partial recovery results as acceptable results. |
+| `--direct-file` | Treat every input path directly as an archive, skipping directory scanning and automatic candidate discovery. |
 
-`--out-dir` 指定后，结果落在“输出根 / 输入路径相对公共根的部分 / 归档名”下；未指定时落在归档旁边。嵌套归档在输出根内生成时，子归档仍使用自身所在位置计算输出。
+When `--out-dir` is given, results land under "output root / the input path relative to its common root / archive name"; when it is omitted, results land next to the archive. When a nested archive is produced inside the output root, the sub-archive still computes its own output location from where it sits.
 
-`--recur` 的取值：
+Values for `--recur`:
 
-- `1`、`2`、`3` 等正整数：固定递归轮数。
-- `*`：持续递归，最多 999 轮。
-- `?`：每轮询问是否继续，最多 999 轮。
+- A positive integer such as `1`, `2`, `3`: a fixed number of recursive rounds.
+- `*`: keep recursing, up to 999 rounds.
+- `?`: ask whether to continue after each round, up to 999 rounds.
 
-示例：
+Examples:
 
 ```powershell
 python sunpack.py extract D:\Downloads
@@ -86,27 +88,27 @@ python sunpack.py extract --direct-file D:\MaybeArchive.bin
 python sunpack.py extract D:\Archives -o E:\Unpacked
 ```
 
-退出码：
+Exit codes:
 
-- `0`：所有任务均完整成功。
-- `1`：至少一个任务失败。
-- `2`：参数、路径或配置错误。
-- `3`：运行时异常。
-- `4`：没有失败任务，但至少一个任务只有部分成功。
+- `0`: all tasks succeeded completely.
+- `1`: at least one task failed.
+- `2`: argument, path, or configuration error.
+- `3`: runtime exception.
+- `4`: no task failed, but at least one task only partially succeeded.
 
 ## scan
 
-用法：
+Usage:
 
 ```powershell
 python sunpack.py scan [options] <paths...>
 ```
 
-`scan` 输出识别到的解压任务、分卷关系、检测扩展名、判定和命中规则，不会解压或清理文件。
+`scan` outputs the identified extraction tasks, volume relationships, detected extensions, verdicts, and matched rules. It does not extract or clean up files.
 
-`--deep-detect` 会对符合条件但普通检测未解决的候选执行完整嵌入扫描。目录范围受 `filesystem.directory_scan_mode`、`filesystem.scan_filters_enabled` 和 `filesystem.scan_filters` 影响。
+`--deep-detect` performs a full embedded scan on candidates that qualify but were not resolved by normal detection. The directory scope is affected by `filesystem.directory_scan_mode`, `filesystem.scan_filters_enabled`, and `filesystem.scan_filters`.
 
-示例：
+Examples:
 
 ```powershell
 python sunpack.py scan D:\Downloads
@@ -116,25 +118,25 @@ python sunpack.py scan D:\Downloads -v
 
 ## inspect
 
-用法：
+Usage:
 
 ```powershell
 python sunpack.py inspect [options] <paths...>
 ```
 
-`inspect` 是只读检测诊断命令，会列出候选文件的判定结果、处理阶段、停止原因和事实错误。
+`inspect` is a read-only detection diagnostic command. It lists the verdicts, processing stages, stop reasons, and factual errors of candidate files.
 
-参数：
+Options:
 
-| 参数 | 说明 |
+| Option | Description |
 | --- | --- |
-| `--archives-only` | 只显示最终判定为可解压的项目。 |
-| `--analyze` | 为可解压或待确认候选附加格式、片段、损坏标记和候选摘要。 |
-| `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
+| `--archives-only` | Show only items finally judged extractable. |
+| `--analyze` | Attach format, fragment, damage markers, and candidate summaries to extractable or pending candidates. |
+| `--deep-detect` | Enable a full embedded scan for candidates that detection did not resolve. |
 
-`-v` 会额外打印有效配置、命中规则、评分细节和事实错误；JSON 输出保留对应结构化字段。
+`-v` additionally prints the effective configuration, matched rules, scoring details, and factual errors; JSON output keeps the corresponding structured fields.
 
-示例：
+Examples:
 
 ```powershell
 python sunpack.py inspect D:\Downloads
@@ -145,13 +147,13 @@ python sunpack.py inspect D:\Downloads -v
 
 ## watch
 
-用法：
+Usage:
 
 ```powershell
 python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
 ```
 
-监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。每行可以只写输入目录，也可以用 `|` 指定输出根：
+Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. Each line may contain only an input directory, or may use `|` to specify an output root:
 
 ```text
 C:\Downloads
@@ -159,51 +161,51 @@ E:\Archives | E:\Output
 F:\Incoming | .
 ```
 
-只写输入目录时使用 `watch.out_dir`；相对输出路径按该输入目录解析并持久化为绝对路径。输出根可以跨盘。`watch` 只观察每个根目录的直接文件，不递归监听子目录；输入根需要位于 NTFS 卷且有可读取的 USN Journal。
+When only the input directory is given, `watch.out_dir` is used; a relative output path is resolved against that input directory and persisted as an absolute path. The output root may be on a different drive. `watch` only observes the direct files of each root and does not recursively watch subdirectories; the input root must be on an NTFS volume with a readable USN Journal.
 
-子命令和参数：
+Subcommands and options:
 
-| 子命令 | 参数 | 说明 |
+| Subcommand | Option | Description |
 | --- | --- | --- |
-| `start` | `--once` | 执行一次监控扫描后退出。 |
-| `start` | `--no-tray` | 持续运行时关闭托盘入口。 |
-| `start` | `--initial-scan` | 启动时处理已有文件。 |
-| `add PATH...` | `-o/--out-dir DIR` | 添加监控根；只能同时添加一个路径。 |
-| `add PATH...` | `--start` | 添加后启动持续监控。 |
-| `add PATH...` | `--initial-scan` | 添加后对新根执行初始扫描。 |
-| `remove PATH...` | — | 按输入目录移除监控根，并清理该根的同目录密码文件。 |
-| `list` | — | 列出持久化的输入目录。 |
-| `reload` | — | 重新读取配置和监控根。 |
-| `stop` | — | 停止持续监控。 |
-| `status` | — | 显示运行状态、待处理数量、错误和根目录。 |
-| `startup enable\|disable\|status` | — | 管理当前用户登录启动项。 |
+| `start` | `--once` | Run a single monitoring scan, then exit. |
+| `start` | `--no-tray` | Disable the tray entry point while running continuously. |
+| `start` | `--initial-scan` | Process existing files at startup. |
+| `add PATH...` | `-o/--out-dir DIR` | Add a monitored root; only one path may be added at a time. |
+| `add PATH...` | `--start` | Start continuous monitoring after adding. |
+| `add PATH...` | `--initial-scan` | Run an initial scan for the new root after adding. |
+| `remove PATH...` | — | Remove a monitored root by input directory, and clean up that root's per-directory password file. |
+| `list` | — | List the persisted input directories. |
+| `reload` | — | Re-read the configuration and monitored roots. |
+| `stop` | — | Stop continuous monitoring. |
+| `status` | — | Show run status, pending counts, errors, and root directories. |
+| `startup enable\|disable\|status` | — | Manage the current user's logon startup entry. |
 
-`start` 会持续运行直到收到停止请求；`start --once` 完成一次当前调度后退出。文件写入、移动或修改会触发活跃周期，文件准备好后按配置的静默策略提交处理。新分卷到达或密码来源变化会重新激活受影响任务。
+`start` keeps running until a stop request arrives; `start --once` completes one current scheduling pass and then exits. Writing, moving, or modifying a file triggers an active cycle; once the file is ready it is submitted for processing according to the configured quiet policy. The arrival of a new volume or a change in password sources reactivates the affected tasks.
 
-`add` 的 `-o/--out-dir` 只能和一个输入目录一起使用。重复添加同一输入目录不会改变已有输出映射；先 `remove` 再 `add` 才能更新映射。不同监控根的输出根不能互为严格的祖先和子目录，相同输出根可以共享。
+`add`'s `-o/--out-dir` can only be used together with a single input directory. Adding the same input directory again does not change the existing output mapping; you must `remove` and then `add` to update the mapping. The output roots of different monitored roots must not be strict ancestors or descendants of one another; the same output root may be shared.
 
 ## passwords
 
-用法：
+Usage:
 
 ```powershell
 python sunpack.py passwords [options]
 ```
 
-参数：
+Options:
 
-| 参数 | 说明 |
+| Option | Description |
 | --- | --- |
-| `-j`, `--json` | 以 JSON 输出密码来源汇总。 |
-| `-p PASSWORD`, `--password PASSWORD` | 提供密码，可重复传入。 |
-| `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
-| `--ask-pw` | 在终端交互输入密码。 |
-| `--no-builtin-pw` | 不使用内置密码表。 |
-| `--no-dir-pw` | 该命令没有目标归档，不会读取同目录密码文件；在 `extract` 中用于关闭同目录密码。 |
+| `-j`, `--json` | Output the password source summary as JSON. |
+| `-p PASSWORD`, `--password PASSWORD` | Provide a password; may be repeated. |
+| `--pw-file PASSWORD_FILE` | Read passwords from a text file, one per line. |
+| `--ask-pw` | Prompt for passwords interactively in the terminal. |
+| `--no-builtin-pw` | Do not use the built-in password table. |
+| `--no-dir-pw` | This command has no target archive and will not read a per-directory password file; in `extract` it disables per-directory passwords. |
 
-`passwords` 没有归档路径，因此输出命令行输入、最近成功密码、剪贴板密码和内置密码的汇总；它不会为某个目录加载 `.sunpack-passwords.txt`。归档解压时的候选顺序是“最近成功密码 → 同目录密码 → CLI 参数和密码文件 → 剪贴板 → 内置密码”，重复项会去重，必要时会先尝试空密码。
+Because `passwords` has no archive path, it outputs a summary of command-line input, the most recent successful password, clipboard passwords, and built-in passwords; it does not load `.sunpack-passwords.txt` for any directory. During archive extraction, the candidate order is "most recent successful password → per-directory passwords → CLI arguments and password files → clipboard → built-in passwords". Duplicates are removed, and the empty password is tried first when necessary.
 
-示例：
+Examples:
 
 ```powershell
 python sunpack.py passwords
@@ -213,25 +215,25 @@ python sunpack.py passwords --pw-file .\passwords.txt --json
 
 ## config
 
-用法：
+Usage:
 
 ```powershell
 python sunpack.py config [options] <show|validate>
 ```
 
-| 子命令 | 说明 |
+| Subcommand | Description |
 | --- | --- |
-| `show` | 打印当前读取到的有效配置。 |
-| `validate` | 校验 JSON、字段值、检测规则名和规则配置。 |
+| `show` | Print the effective configuration currently loaded. |
+| `validate` | Validate the JSON, field values, detection rule names, and rule configuration. |
 
-参数：
+Options:
 
-| 参数 | 说明 |
+| Option | Description |
 | --- | --- |
-| `-j`, `--json` | 以 JSON 输出结果。 |
-| `-q`, `--quiet` | 减少普通文本输出。 |
+| `-j`, `--json` | Output the result as JSON. |
+| `-q`, `--quiet` | Reduce plain-text output. |
 
-示例：
+Examples:
 
 ```powershell
 python sunpack.py config show
@@ -241,30 +243,30 @@ python sunpack.py config validate --json
 
 ## doctor
 
-用法：
+Usage:
 
 ```powershell
 python sunpack.py doctor [--json] [--quiet]
 ```
 
-`doctor` 只读检查配置、原生扩展、`7z.dll`、SevenZip worker、Windows 通知能力以及已配置的监控根。不存在的监控根报告为警告；命令不会启动持续监控或真实解压，也不会修改注册表。存在失败项时退出码为 `1`，只有警告或跳过项时退出码为 `0`。
+`doctor` performs a read-only check of the configuration, the native extension, `7z.dll`, the SevenZip worker, Windows notification capability, and the configured monitored roots. A monitored root that does not exist is reported as a warning; the command never starts continuous monitoring or a real extraction, and never modifies the registry. The exit code is `1` when any check fails, and `0` when there are only warnings or skipped items.
 
-## Windows 右键菜单
+## Windows context menu
 
-当前用户级右键菜单脚本：
+Per-user context menu scripts:
 
 ```powershell
 .\scripts\register_context_menu.ps1
 .\scripts\unregister_context_menu.ps1
 ```
 
-发行包内的注册脚本使用脚本父目录中的 `sunpack.exe`。从源码树运行时，脚本会识别唯一的 `dist/sunpack-*/sunpack.exe`；存在多个构建产物时使用 `-AppPath` 明确指定。找不到打包程序时使用 `python sunpack.py`。
+The registration script inside the distribution package uses the `sunpack.exe` in its own parent directory. When run from the source tree, the script detects the single unique `dist/sunpack-*/sunpack.exe`; when several build outputs exist, specify one explicitly with `-AppPath`. When no packaged program is found, `python sunpack.py` is used.
 
-文件夹和目录空白处菜单提供解压、监控和取消监控动作；任意文件菜单提供直接解压和交互输入密码解压，分别相当于：
+The folder and folder-background menus offer extract, monitor, and unmonitor actions; the menu for any file offers direct extraction and interactive-password extraction, equivalent to:
 
 ```text
 extract "%1" --pause
 extract "%1" --ask-pw --pause
 ```
 
-输出默认落在归档旁边。
+Output lands next to the archive by default.

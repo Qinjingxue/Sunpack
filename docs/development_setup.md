@@ -1,42 +1,44 @@
-# 开发环境和构建说明
+# Development environment and build instructions
 
-SunPack 是 Windows-only 项目。Python 依赖统一声明在根目录 `pyproject.toml`，由 `uv.lock` 锁定；Rust、C++ 和 Windows 服务使用同一条构建链路。
+**English** | [简体中文](zh-CN/development_setup.md)
 
-## 环境要求
+SunPack is a Windows-only project. Python dependencies are declared uniformly in the root `pyproject.toml` and locked by `uv.lock`; Rust, C++, and the Windows service share the same build pipeline.
+
+## Requirements
 
 - Windows 10/11
-- PowerShell 5.1 或更新版本
-- Python 3.10 或更新版本，架构必须与目标发行包一致
-- `uv` 0.12 或更新版本
-- Rust MSVC toolchain，提供 `cargo`
-- Visual Studio Build Tools 2022，包含 C++17 编译器
-- 首次安装依赖和准备 7-Zip 测试文件所需的网络连接
+- PowerShell 5.1 or newer
+- Python 3.10 or newer, with an architecture matching the target distribution package
+- `uv` 0.12 or newer
+- Rust MSVC toolchain, providing `cargo`
+- Visual Studio Build Tools 2022, including a C++17 compiler
+- Network access for the first dependency install and for preparing the 7-Zip test files
 
-项目主要目录：
+Main project directories:
 
 ```text
-sunpack/                    产品运行时代码
-native/sunpack_native/      Rust/PyO3 扩展
-native/sunpack_usn_core/    NTFS/USN 共用 Rust 核心
-native/sunpack_watch_broker/Windows Watch Broker 服务
-native/sevenzip_bridge/     Windows 7z.dll bridge 与 worker
+sunpack/                    Product runtime code
+native/sunpack_native/      Rust/PyO3 extension
+native/sunpack_usn_core/    Shared NTFS/USN Rust core
+native/sunpack_watch_broker/Windows Watch Broker service
+native/sevenzip_bridge/     Windows 7z.dll bridge and worker
 native/toast_host/          Windows toast DLL
-tools/                      x64 外部工具和原生构建产物
-tools-arm64/                ARM64 外部工具和原生构建产物
+tools/                      x64 external tools and native build outputs
+tools-arm64/                ARM64 external tools and native build outputs
 ```
 
-## Python 依赖
+## Python dependencies
 
-可安装的 extra：
+Installable extras:
 
-| Extra | 用途 |
+| Extra | Purpose |
 | --- | --- |
-| 默认 | SunPack 运行依赖 |
-| `test` | pytest 与测试数据生成依赖 |
-| `build` | Nuitka、maturin、CMake |
-| `dev` | build 与 test 的并集 |
+| default | SunPack runtime dependencies |
+| `test` | pytest and test data generation dependencies |
+| `build` | Nuitka, maturin, CMake |
+| `dev` | Union of build and test |
 
-常用安装方式：
+Common install commands:
 
 ```powershell
 uv sync --locked
@@ -44,25 +46,25 @@ uv sync --locked --extra test
 uv sync --locked --extra dev
 ```
 
-开发环境目录为 `.venv`。如果该环境启用了全局 site-packages，准备脚本会重建它，避免全局包影响依赖解析。
+The development environment directory is `.venv`. If that environment has global site-packages enabled, the setup script rebuilds it so that global packages cannot interfere with dependency resolution.
 
-## 一键准备开发环境
+## One-step development environment setup
 
 ```powershell
 .\scripts\setup_windows_dev.ps1
 ```
 
-脚本会：
+The script will:
 
-1. 用 `uv sync --locked --extra dev` 准备隔离的 `.venv`
-2. 构建并安装当前架构的 Rust/PyO3 wheel
-3. 构建 `sunpack-watch-broker.exe`
-4. 准备对应架构的 `7z.exe`、`7z.dll` 和 license
-5. 构建 `sunpack_sevenzip.dll`、`sunpack_sevenzip_worker.exe` 和 `sunpack_toast.dll`
-6. 把原生产物复制到工具目录
-7. 运行 Python、Rust、C++ 和 CLI smoke checks
+1. Prepare an isolated `.venv` with `uv sync --locked --extra dev`
+2. Build and install the Rust/PyO3 wheel for the current architecture
+3. Build `sunpack-watch-broker.exe`
+4. Prepare `7z.exe`, `7z.dll`, and the license for the matching architecture
+5. Build `sunpack_sevenzip.dll`, `sunpack_sevenzip_worker.exe`, and `sunpack_toast.dll`
+6. Copy the native artifacts into the tools directory
+7. Run Python, Rust, C++, and CLI smoke checks
 
-选项：
+Options:
 
 ```powershell
 .\scripts\setup_windows_dev.ps1 -Clean
@@ -70,62 +72,62 @@ uv sync --locked --extra dev
 .\scripts\setup_windows_dev.ps1 -SkipAcceptanceTestTools
 ```
 
-目标架构必须与当前 Python 进程架构一致。
+The target architecture must match the architecture of the current Python process.
 
 ## USN Watch Broker
 
-watch 使用 NTFS USN Journal 判断文件内容变化和文件是否已经跨过写入边界。需要访问卷级 Journal 的操作集中在 `native/sunpack_usn_core` 和 `native/sunpack_watch_broker`，Python 只消费文件观察结果和 watch 状态。
+watch uses the NTFS USN Journal to determine whether file contents have changed and whether a file has crossed a write boundary. Operations that need volume-level Journal access are concentrated in `native/sunpack_usn_core` and `native/sunpack_watch_broker`; Python only consumes file observation results and watch state.
 
-### 组件和生命周期
+### Components and lifecycle
 
-- `native/sunpack_usn_core` 是 Windows-only Rust crate，包含卷标识、Journal 探测、有限范围的 USN reason 读取以及命名管道客户端协议。
-- `native/sunpack_watch_broker` 编译为 `sunpack-watch-broker.exe`，以 Windows service 运行，持有卷级 Journal 访问能力。
-- watch 启动时先取得一个进程级 lease。第一个 lease 负责按需启动服务并建立本地 named pipe 连接；同一进程中的后续 lease 复用连接；最后一个 lease 释放时向服务发送释放请求。
-- 服务按需启动。第一个客户端在 5 秒内未连接时服务退出；最后一个 lease 释放后等待 1 秒再退出。每个服务最多保留 64 个客户端和 64 个卷上下文。
+- `native/sunpack_usn_core` is a Windows-only Rust crate containing volume identification, Journal probing, bounded USN reason reads, and the named pipe client protocol.
+- `native/sunpack_watch_broker` compiles to `sunpack-watch-broker.exe` and runs as a Windows service, holding volume-level Journal access.
+- At startup, watch first acquires a process-level lease. The first lease starts the service on demand and establishes a local named pipe connection; later leases in the same process reuse the connection; when the last lease is released, a release request is sent to the service.
+- The service starts on demand. It exits if the first client has not connected within 5 seconds; after the last lease is released it waits 1 second before exiting. Each service keeps at most 64 clients and 64 volume contexts.
 
-标准身份为：
+The standard identities are:
 
 ```text
 Service: SunPackWatchBroker
 Pipe:    \\.\pipe\SunPack.WatchBroker.v1
 ```
 
-服务只接受本机 named pipe 客户端。安装服务需要管理员权限；已安装服务由普通 watch 运行实例通过客户端协议使用。
+The service accepts only local named pipe clients. Installing the service requires administrator privileges; an installed service is used by ordinary watch instances through the client protocol.
 
-### USN 读取边界
+### USN read boundaries
 
-文件观察由 Rust 读取文件元数据和当前 USN。当前 USN 大于上次记录时，客户端请求 broker 读取：
+File observation reads file metadata and the current USN in Rust. When the current USN is greater than the last recorded one, the client asks the broker to read:
 
 ```text
 previous_usn < usn <= current_usn
 ```
 
-每次观察最多读取 1 MiB 的 reason 数据，支持 USN record version 2、3、4，并区分全部 reason 与去除 `CLOSE` 后的 reason。覆盖、扩展、截断等内容变化会进入 watch 的内容变更路径；仅元数据变化不会被当作内容写入。
+Each observation reads at most 1 MiB of reason data, supports USN record versions 2, 3, and 4, and distinguishes all reasons from the reasons with `CLOSE` removed. Content changes such as overwrite, extension, and truncation enter the watch content-change path; metadata-only changes are not treated as content writes.
 
-watch 根启动前会验证路径位于 NTFS 卷且 Journal 可读。Journal 不可用、卷标识无效或 broker 不可连接时，watch 启动失败并报告原因。
+Before a watch root starts, the path is verified to be on an NTFS volume with a readable Journal. If the Journal is unavailable, the volume identity is invalid, or the broker cannot be reached, watch startup fails and reports the reason.
 
-### 本地手动构建
+### Local manual build
 
-x64：
+x64:
 
 ```powershell
 cargo build --locked --manifest-path native\sunpack_watch_broker\Cargo.toml --release --target x86_64-pc-windows-msvc --target-dir .cache\rust-target\x64
 ```
 
-ARM64 将目标三元组和目标目录替换为 `aarch64-pc-windows-msvc` 与 `.cache\rust-target\arm64`。输出文件为：
+For ARM64, replace the target triple and target directory with `aarch64-pc-windows-msvc` and `.cache\rust-target\arm64`. The output file is:
 
 ```text
 .cache\rust-target\x64\x86_64-pc-windows-msvc\release\sunpack-watch-broker.exe
 ```
 
-开发测试服务必须使用测试身份前缀：
+A development test service must use the test identity prefixes:
 
 ```text
 Service: SunPackWatchBrokerTest_<id>
 Pipe:    \\.\pipe\SunPack.WatchBroker.Test.<id>
 ```
 
-可以用仓库脚本安装或卸载临时服务；脚本会拒绝标准服务身份，避免测试覆盖开发机上的发布服务：
+Repository scripts can install or uninstall a temporary service; the scripts reject the standard service identity so that tests cannot overwrite the release service on a development machine:
 
 ```powershell
 .\scripts\manage_test_watch_service.ps1 -Action Install `
@@ -138,7 +140,7 @@ Pipe:    \\.\pipe\SunPack.WatchBroker.Test.<id>
   -PipeName '\\.\pipe\SunPack.WatchBroker.Test.dev'
 ```
 
-## 手动构建原生组件
+## Building native components manually
 
 ### Rust/PyO3
 
@@ -162,7 +164,7 @@ Copy-Item native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip.dll tools\su
 Copy-Item native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe tools\sunpack_sevenzip_worker.exe -Force
 ```
 
-bridge 运行时还需要同一工具目录中的 `7z.dll`。
+The bridge also needs `7z.dll` in the same tools directory at run time.
 
 ### Windows toast
 
@@ -173,9 +175,9 @@ ctest --test-dir native\toast_host\build-x64 -C Release --output-on-failure
 Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_toast.dll -Force
 ```
 
-持续运行的 watch 按 `watch.toast_enabled` 创建 Windows 通知能力，并按配置发送进度、完成和失败通知。普通 CLI 请求以及 `watch start --once` 不创建通知能力。通知失败报告写入 `watch.state_dir` 管理的状态目录。
+A continuously running watch creates Windows notification capability according to `watch.toast_enabled` and sends progress, completion, and failure notifications as configured. Ordinary CLI requests and `watch start --once` do not create notification capability. Notification failure reports are written to the state directory managed by `watch.state_dir`.
 
-## Smoke Checks
+## Smoke checks
 
 ```powershell
 .\.venv\Scripts\python.exe -c "import sunpack_native as n; print(n.native_available(), n.scanner_version())"
@@ -183,39 +185,39 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 .\.venv\Scripts\python.exe -m pytest tests\unit\test_config_loader.py
 ```
 
-前两个命令分别验证 Rust 扩展和 C++ bridge；第三个命令验证配置加载。
+The first two commands verify the Rust extension and the C++ bridge respectively; the third verifies configuration loading.
 
-## 测试
+## Testing
 
-普通 pytest：
+Plain pytest:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pytest -q
 ```
 
-直接运行 pytest 时，需要 Windows NTFS Watch Broker 的用例会被跳过。完整验收通过 `run_acceptance_tests.ps1` 准备隔离测试服务，运行单元、功能、集成、真实场景、磁盘空间和 CLI smoke tests，结束后自动卸载测试服务：
+When pytest is run directly, cases that need the Windows NTFS Watch Broker are skipped. Full acceptance is done through `run_acceptance_tests.ps1`, which prepares an isolated test service, runs unit, functional, integration, real-scenario, disk-space, and CLI smoke tests, and automatically uninstalls the test service at the end:
 
 ```powershell
 .\run_acceptance_tests.ps1 -NoWait
 ```
 
-验收服务使用随机的测试服务名、named pipe 和临时环境变量，不会覆盖已安装的发布服务。CI 环境未提权时，服务安装会立即失败，避免等待交互式 UAC。
+Acceptance runs use a randomized test service name, named pipe, and temporary environment variables, and never overwrite an installed release service. In a CI environment without elevation, service installation fails immediately instead of waiting for interactive UAC.
 
-项目 CI 风格测试：
+CI-style tests for the project:
 
 ```powershell
 .\scripts\run_ci_tests.ps1
 ```
 
-## Windows 发行构建
+## Windows release build
 
-正式构建入口：
+The official build entry point:
 
 ```powershell
 .\scripts\build_windows.ps1
 ```
 
-常用参数：
+Common parameters:
 
 ```powershell
 .\scripts\build_windows.ps1 -Arch x64
@@ -224,23 +226,23 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 .\scripts\build_windows.ps1 -Version 1.2.3
 ```
 
-发布产物为 Windows 安装器。构建环境必须安装 Inno Setup 6；缺少 `ISCC.exe` 时会在构建开始前失败，也可以通过 `-InnoCompilerPath` 指定编译器路径。
+The release artifact is a Windows installer. The build environment must have Inno Setup 6 installed; when `ISCC.exe` is missing the build fails before it starts, and the compiler path can also be given with `-InnoCompilerPath`.
 
-构建过程：
+The build process:
 
-1. 创建或复用 `.venv`（`-Clean` 时清理重建）
-2. 安装项目 `dev` extra
-3. 构建并安装 Rust wheel
-4. 构建 Watch Broker
-5. 构建和测试 C++ bridge/worker 与 toast DLL
-6. 可选运行 acceptance tests
-7. 构建无控制台 runtime 和 CLI launcher
-8. 复制配置、密码表、工具、Watch Broker、第三方许可证文件和声明
-9. 校验关键 PE 文件架构
-10. 运行 packaged CLI、bridge 和 worker smoke checks
-11. 用 Inno Setup 创建 Windows 安装器
+1. Create or reuse `.venv` (cleaned and recreated with `-Clean`)
+2. Install the project `dev` extra
+3. Build and install the Rust wheel
+4. Build the Watch Broker
+5. Build and test the C++ bridge/worker and the toast DLL
+6. Optionally run acceptance tests
+7. Build the console-less runtime and the CLI launcher
+8. Copy the configuration, password table, tools, Watch Broker, third-party license files, and notices
+9. Validate the architecture of the key PE files
+10. Run packaged CLI, bridge, and worker smoke checks
+11. Create the Windows installer with Inno Setup
 
-输出：
+Output:
 
 ```text
 dist\sunpack-<arch>\
@@ -251,15 +253,15 @@ dist\sunpack-<arch>\THIRD_PARTY_NOTICES.md
 release\sunpack-windows-<arch>-<version>-setup.exe
 ```
 
-ARM64 必须在 ARM64 Windows 和 ARM64 Python 环境中构建。已有目录可独立校验：
+ARM64 must be built on ARM64 Windows with an ARM64 Python environment. An existing directory can be validated independently:
 
 ```powershell
 .\scripts\verify_windows_package_arch.ps1 -PackageRoot dist\sunpack-x64 -Arch x64
 ```
 
-## 运行时原生文件
+## Runtime native files
 
-x64 开发环境默认使用：
+The x64 development environment uses the following by default:
 
 ```text
 tools\7z.exe
@@ -269,10 +271,10 @@ tools\sunpack_sevenzip_worker.exe
 tools\sunpack_toast.dll
 ```
 
-安装包还包含：
+The installer package additionally contains:
 
 ```text
 service\sunpack-watch-broker.exe
 ```
 
-`sunpack_sevenzip.dll` 提供 probe、test、密码尝试、健康检查、资源分析和 manifest C ABI。`sunpack_sevenzip_worker.exe` 读取 JSON job，通过 `7z.dll` 解压文件、分卷和虚拟输入。`7z.exe` 用于开发 fixture、手工诊断、文件来源和发布资源准备。
+`sunpack_sevenzip.dll` provides the C ABI for probe, test, password attempts, health checks, resource analysis, and manifests. `sunpack_sevenzip_worker.exe` reads JSON jobs and extracts files, volumes, and virtual inputs through `7z.dll`. `7z.exe` is used for development fixtures, manual diagnostics, file provenance, and preparing release resources.
