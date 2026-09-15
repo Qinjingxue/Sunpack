@@ -41,19 +41,37 @@ def test_installer_optionally_registers_watch_autostart():
     assert "uninsdeletevalue" not in script
 
 
-def test_installer_does_not_register_start_menu_entries():
+def test_installer_registers_only_the_uninstaller_in_start_menu():
     script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
 
     assert "DefaultGroupName" not in script
-    assert "DisableProgramGroupPage" not in script
-    assert "[Icons]" not in script
+    assert "DisableProgramGroupPage=yes" in script
     assert "[Run]" not in script
     assert 'Parameters: "--register-toast"' not in script
     assert 'Parameters: "--unregister-toast"' in script
     assert "[UninstallRun]" in script
+
+    icons_start = script.index("[Icons]")
+    icons_end = script.find("\n[", icons_start + 1)
+    icons_section = script[icons_start:] if icons_end == -1 else script[icons_start:icons_end]
+    assert icons_section == (
+        "[Icons]\n"
+        'Name: "{autoprograms}\\SunPack\\Uninstall SunPack"; '
+        'Filename: "{uninstallexe}"\n'
+    )
+
+    # Upgrade installs remove shortcuts created by older installer versions,
+    # but the current installer creates only the uninstaller shortcut above.
     assert 'Name: "{userprograms}\\SunPack\\SunPack Command Prompt.lnk"' in script
     assert 'Name: "{userprograms}\\SunPack\\Uninstall SunPack.lnk"' in script
     assert 'Name: "{userprograms}\\SunPack\\SunPack Watch Notifications.lnk"' in script
+    assert 'Name: "{commonprograms}\\SunPack\\SunPack Command Prompt.lnk"' in script
+    assert 'Name: "{commonprograms}\\SunPack\\Uninstall SunPack.lnk"' in script
+    assert 'Name: "{userprograms}\\SunPack\\sunpack.exe.lnk"' in script
+    assert 'Name: "{userprograms}\\sunpack.exe.lnk"' in script
+    assert 'Name: "{commonprograms}\\SunPack\\sunpack.exe.lnk"' in script
+    assert 'Name: "{commonprograms}\\sunpack.exe.lnk"' in script
+    assert '[UninstallDelete]' in script
 
 
 def test_installer_owns_a_minimal_demand_start_watch_broker_service():
@@ -314,6 +332,9 @@ def test_elevated_test_failures_are_persisted_and_replayed():
 def test_installer_smoke_exercises_generated_uninstall_residue_cleanup():
     script = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
 
+    assert "Assert-SunPackStartMenu" in script
+    assert "Installer Start menu entries should contain only the uninstaller" in script
+    assert "Uninstaller left a Start menu shortcut behind" in script
     assert 'Join-Path $userDataRoot "builtin_passwords.txt"' in script
     assert 'Join-Path $userDataRoot ".sunpack_watch"' in script
     assert 'Join-Path $env:LOCALAPPDATA "SunPack\\cache"' in script

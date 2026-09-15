@@ -20,6 +20,7 @@ AppVersion={#AppVersion}
 AppVerName=SunPack {#AppVersion} ({#TargetArch})
 AppPublisher=SunPack
 DefaultDirName={autopf}\SunPack
+DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 OutputDir={#OutputDir}
 OutputBaseFilename={#OutputBaseFilename}
@@ -101,12 +102,27 @@ Type: dirifempty; Name: "{app}"
 Type: filesandordirs; Name: "{localappdata}\SunPack"
 Type: filesandordirs; Name: "{commonappdata}\SunPack\Service"
 Type: dirifempty; Name: "{commonappdata}\SunPack"
+Type: files; Name: "{userprograms}\SunPack\SunPack Watch Notifications.lnk"
+Type: files; Name: "{commonprograms}\SunPack\SunPack Command Prompt.lnk"
+Type: files; Name: "{commonprograms}\SunPack\Uninstall SunPack.lnk"
+Type: files; Name: "{userprograms}\SunPack\sunpack.exe.lnk"
+Type: files; Name: "{userprograms}\sunpack.exe.lnk"
+Type: files; Name: "{commonprograms}\SunPack\sunpack.exe.lnk"
+Type: files; Name: "{commonprograms}\sunpack.exe.lnk"
+Type: dirifempty; Name: "{userprograms}\SunPack"
 
 [InstallDelete]
 Type: files; Name: "{userprograms}\SunPack\SunPack Command Prompt.lnk"
 Type: files; Name: "{userprograms}\SunPack\Uninstall SunPack.lnk"
 Type: files; Name: "{userprograms}\SunPack\SunPack Watch Notifications.lnk"
+Type: files; Name: "{userprograms}\SunPack\sunpack.exe.lnk"
+Type: files; Name: "{userprograms}\sunpack.exe.lnk"
+Type: files; Name: "{commonprograms}\SunPack\sunpack.exe.lnk"
+Type: files; Name: "{commonprograms}\sunpack.exe.lnk"
 Type: dirifempty; Name: "{userprograms}\SunPack"
+
+[Icons]
+Name: "{autoprograms}\SunPack\Uninstall SunPack"; Filename: "{uninstallexe}"
 
 [UninstallRun]
 Filename: "{app}\sunpack-runtime.exe"; Parameters: "--unregister-toast"; RunOnceId: "SunPackToast"; Flags: runhidden waituntilterminated skipifdoesntexist

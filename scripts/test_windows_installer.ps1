@@ -133,6 +133,47 @@ $serviceName = "SunPackWatchBroker"
 $userDataRoot = Join-Path $env:LOCALAPPDATA "SunPack"
 $userDataBackup = $null
 $uninstaller = $null
+$startMenuRoots = @(
+    [Environment]::GetFolderPath([Environment+SpecialFolder]::Programs),
+    [Environment]::GetFolderPath([Environment+SpecialFolder]::CommonPrograms)
+) | Where-Object { $_ } | Select-Object -Unique
+
+function Get-StartMenuShortcutPaths {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    foreach ($root in $startMenuRoots) {
+        Join-Path (Join-Path $root "SunPack") $Name
+        Join-Path $root $Name
+    }
+}
+
+function Get-SunPackStartMenuEntries {
+    foreach ($root in $startMenuRoots) {
+        $directory = Join-Path $root "SunPack"
+        if (Test-Path -LiteralPath $directory -PathType Container) {
+            Get-ChildItem -LiteralPath $directory -Force -File -Filter "*.lnk" -ErrorAction SilentlyContinue
+        }
+    }
+}
+
+function Assert-SunPackStartMenu {
+    $entries = @(Get-SunPackStartMenuEntries)
+    $installerNames = @(
+        $entries |
+            Where-Object { $_.Name -ine "SunPack Watch Notifications.lnk" } |
+            Select-Object -ExpandProperty Name
+    )
+    if ($installerNames.Count -ne 1 -or $installerNames[0] -ne "Uninstall SunPack.lnk") {
+        throw "Installer Start menu entries should contain only the uninstaller. Entries: $($installerNames -join ', ')"
+    }
+    foreach ($name in @("SunPack Command Prompt.lnk", "sunpack.exe.lnk")) {
+        foreach ($path in @(Get-StartMenuShortcutPaths -Name $name)) {
+            if (Test-Path -LiteralPath $path) {
+                throw "Obsolete Start menu shortcut remains: $path"
+            }
+        }
+    }
+}
 
 if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
     throw "Installer smoke test requires the service to be absent: $serviceName"
@@ -196,6 +237,7 @@ try {
     if (-not (Test-Path -LiteralPath $brokerPath)) {
         throw "Installed Watch Broker executable was not found: $brokerPath"
     }
+    Assert-SunPackStartMenu
     $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
     if ($null -eq $service) {
         throw "Installer did not create the Watch Broker service: $serviceName"
@@ -298,6 +340,7 @@ try {
     if (Test-Path -LiteralPath $staleConfigDir) {
         throw "Upgrade install left stale configuration data behind: $staleConfigDir"
     }
+    Assert-SunPackStartMenu
     Invoke-UnelevatedChecked -FilePath $appPath -Arguments @("watch", "start", "--once", "--no-tray")
     $stopDeadline = (Get-Date).AddSeconds(10)
     do {
@@ -356,6 +399,25 @@ try {
     }
     if (Test-Path -LiteralPath $installRoot) {
         throw "Uninstaller left the application directory behind: $installRoot"
+    }
+    foreach ($name in @(
+        "SunPack Watch Notifications.lnk",
+        "SunPack Command Prompt.lnk",
+        "Uninstall SunPack.lnk",
+        "sunpack.exe.lnk"
+    )) {
+        foreach ($path in @(Get-StartMenuShortcutPaths -Name $name)) {
+            if (Test-Path -LiteralPath $path) {
+                throw "Uninstaller left a Start menu shortcut behind: $path"
+            }
+        }
+    }
+    foreach ($root in $startMenuRoots) {
+        $directory = Join-Path $root "SunPack"
+        if ((Test-Path -LiteralPath $directory -PathType Container) -and
+            @(Get-ChildItem -LiteralPath $directory -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+            throw "Uninstaller left Start menu entries behind: $directory"
+        }
     }
 
     Write-Host "Windows installer smoke test passed." -ForegroundColor Green
