@@ -228,10 +228,19 @@ try {
         throw "Context menu command does not reference the installed executable: $directCommand"
     }
     $startupCommand = [string](Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName).$startupValueName
-    $escapedRuntime = [regex]::Escape($runtimeAppPath)
+    # The runtime serializes the Run value through subprocess.list2cmdline, which quotes an
+    # argument only when it contains a space or a tab. The smoke-test install root lives under
+    # %TEMP% and carries no whitespace, so the executable stays unquoted there, while an
+    # install root such as "C:\Program Files\SunPack" is quoted.
+    $expectedRuntime = if ($runtimeAppPath -match '[ \t]') {
+        '"' + $runtimeAppPath + '"'
+    } else {
+        $runtimeAppPath
+    }
+    $escapedRuntime = [regex]::Escape($expectedRuntime)
     if ($startupCommand -notmatch (
-        '^"' + $escapedRuntime +
-        '" --_sunpack-runtime-id=v2-[0-9a-f]{16} watch start$'
+        '^' + $escapedRuntime +
+        ' --_sunpack-runtime-id=v2-[0-9a-f]{16} watch start$'
     )) {
         throw "Startup Run value is incorrect: $startupCommand"
     }
