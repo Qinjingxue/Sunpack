@@ -378,7 +378,7 @@ def test_running_watch_service_duplicate_add_is_a_noop(tmp_path, monkeypatch):
     starts = []
     monkeypatch.setattr(
         service_module,
-        "_write_watch_roots_unlocked",
+        "_write_watch_root_entries_unlocked",
         lambda *_args: (_ for _ in ()).throw(AssertionError("duplicate add must not rewrite roots")),
     )
 
@@ -1036,13 +1036,13 @@ def test_watch_roots_add_is_serialized_across_concurrent_callers(tmp_path, monke
     first.mkdir()
     second.mkdir()
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
-    original_write = service_module._write_watch_roots_unlocked
+    original_write = service_module._write_watch_root_entries_unlocked
 
-    def slow_write(roots, path, **kwargs):
+    def slow_write(entries, path, **kwargs):
         time.sleep(0.05)
-        return original_write(roots, path, **kwargs)
+        return original_write(entries, path, **kwargs)
 
-    monkeypatch.setattr(service_module, "_write_watch_roots_unlocked", slow_write)
+    monkeypatch.setattr(service_module, "_write_watch_root_entries_unlocked", slow_write)
     threads = [
         threading.Thread(target=service_module.add_watch_roots, args=([str(first)],)),
         threading.Thread(target=service_module.add_watch_roots, args=([str(second)],)),

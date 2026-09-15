@@ -264,12 +264,6 @@ def read_watch_roots(default_output_root: str = ".", path: Path | None = None) -
     return roots
 
 
-def write_watch_roots(roots: list[str], path: Path | None = None) -> Path:
-    roots_path = path or watch_roots_path()
-    with _watch_roots_mutex(roots_path):
-        return _write_watch_root_entries_unlocked([(root, None) for root in roots], roots_path)
-
-
 def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path: Path) -> Path:
     normalized_entries: list[WatchRootEntry] = []
     seen = set()
@@ -295,11 +289,6 @@ def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path
         encoding="utf-8",
     )
     return roots_path
-
-
-def _write_watch_roots_unlocked(roots: list[str], roots_path: Path) -> Path:
-    """Compatibility wrapper for callers that write legacy plain-root entries."""
-    return _write_watch_root_entries_unlocked([(root, None) for root in roots], roots_path)
 
 
 def add_watch_roots(
