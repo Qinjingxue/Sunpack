@@ -35,6 +35,8 @@ def test_installer_optionally_registers_watch_autostart():
     assert "watch startup enable" in script
     assert "SW_HIDE" in script
     assert "ewWaitUntilTerminated" in script
+    assert "RaiseException(CustomMessage('StartupEnableLaunchFailed'))" in script
+    assert "RaiseException(Format(CustomMessage('StartupEnableCommandFailed'), [ResultCode]))" in script
     assert 'ValueData: """{app}\\sunpack.exe"" watch start"' not in script
     assert "uninsdeletevalue" not in script
 
@@ -318,6 +320,10 @@ def test_installer_smoke_exercises_generated_uninstall_residue_cleanup():
     assert "Upgrade install overwrote the existing builtin password file" in script
     assert "Upgrade install left stale application data behind" in script
     assert "Invoke-UnelevatedChecked" in script
+    assert '$startupMatch.Groups["RuntimeIdentity"].Value' in script
+    assert 'Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown")' in script
+    assert "Packaged runtime did not exit before the startup cold-start test" in script
+    assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @($runtimeIdentity, "watch", "start")' in script
     assert "run_unelevated_process.py" in script
     assert "Upgrade install left stale configuration data behind" in script
     assert "Set-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName" in script

@@ -13,6 +13,13 @@ def test_compiled_process_uses_invoked_binary_instead_of_nuitka_python_path(tmp_
     assert process_executable.current_process_executable() == runtime.resolve()
 
 
+def test_nuitka_compiled_process_is_packaged_without_sys_frozen(monkeypatch):
+    monkeypatch.delattr(process_executable.sys, "frozen", raising=False)
+    monkeypatch.setattr(process_executable, "__compiled__", object(), raising=False)
+
+    assert process_executable.is_packaged_process() is True
+
+
 def test_source_process_uses_interpreter(tmp_path, monkeypatch):
     interpreter = tmp_path / "python.exe"
     script = tmp_path / "sunpack.py"

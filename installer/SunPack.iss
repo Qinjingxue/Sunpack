@@ -61,6 +61,8 @@ english.BrokerExecutableMissing=Packaged Watch Broker executable is missing: %s
 english.BrokerCreateFailed=Failed to create %s (sc.exe exit code %d).
 english.BrokerSidTypeFailed=Failed to set the service SID type (sc.exe exit code %d).
 english.BrokerSecurityFailed=Failed to secure the Watch Broker service (sc.exe exit code %d).
+english.StartupEnableLaunchFailed=Failed to run sunpack while enabling startup.
+english.StartupEnableCommandFailed=sunpack could not enable startup (exit code %d).
 english.PrepareRuntimeRunning=sunpack runtime processes are still running. Please stop them and run the installer again.
 english.PrepareBrokerRemoveFailed=The existing sunpack Watch Broker service could not be removed. Restart Windows and run the installer again.
 english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed. Close sunpack and run the installer again.
@@ -76,6 +78,8 @@ chinesesimplified.BrokerExecutableMissing=安装包中缺少 Watch Broker 可执
 chinesesimplified.BrokerCreateFailed=无法创建 %s（sc.exe 退出码 %d）。
 chinesesimplified.BrokerSidTypeFailed=无法设置服务 SID 类型（sc.exe 退出码 %d）。
 chinesesimplified.BrokerSecurityFailed=无法设置 Watch Broker 服务权限（sc.exe 退出码 %d）。
+chinesesimplified.StartupEnableLaunchFailed=启用开机启动时无法运行 sunpack。
+chinesesimplified.StartupEnableCommandFailed=sunpack 无法启用开机启动（退出码 %d）。
 chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。请先停止这些进程，然后重新运行安装程序。
 chinesesimplified.PrepareBrokerRemoveFailed=无法删除现有 sunpack Watch Broker 服务。请重启 Windows，然后重新运行安装程序。
 chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack 文件。请关闭 sunpack，然后重新运行安装程序。
@@ -521,9 +525,9 @@ begin
         ewWaitUntilTerminated,
         ResultCode
       ) then
-        Log('Failed to enable SunPack watch autostart')
+        RaiseException(CustomMessage('StartupEnableLaunchFailed'))
       else if ResultCode <> 0 then
-        Log(Format('SunPack watch autostart command exited with code %d', [ResultCode]));
+        RaiseException(Format(CustomMessage('StartupEnableCommandFailed'), [ResultCode]));
     end;
   end;
 end;

@@ -41,9 +41,16 @@ def test_source_bootstrap_uses_reserved_namespace_without_path_calculation():
     ]
 
 
-def test_server_command_forwards_the_launcher_identity(monkeypatch):
+def test_packaged_server_command_reexecutes_runtime_and_forwards_identity(tmp_path, monkeypatch):
     from sunpack.cli import persistent_process
 
+    runtime = tmp_path / "sunpack-runtime.exe"
+    monkeypatch.setattr(persistent_process, "is_packaged_process", lambda: True)
+    monkeypatch.setattr(persistent_process, "current_process_executable", lambda: runtime)
     monkeypatch.setattr(runtime_identity, "_runtime_id", "v2-0123456789abcdef")
 
-    assert persistent_process.server_command()[-1] == "--_sunpack-runtime-id=v2-0123456789abcdef"
+    assert persistent_process.server_command() == [
+        str(runtime),
+        "--persistent-server",
+        "--_sunpack-runtime-id=v2-0123456789abcdef",
+    ]

@@ -238,12 +238,31 @@ try {
         $runtimeAppPath
     }
     $escapedRuntime = [regex]::Escape($expectedRuntime)
-    if ($startupCommand -notmatch (
+    $startupMatch = [regex]::Match($startupCommand, (
         '^' + $escapedRuntime +
-        ' --_sunpack-runtime-id=v2-[0-9a-f]{16} watch start$'
-    )) {
+        ' (?<RuntimeIdentity>--_sunpack-runtime-id=v2-[0-9a-f]{16}) watch start$'
+    ))
+    if (-not $startupMatch.Success) {
         throw "Startup Run value is incorrect: $startupCommand"
     }
+    $runtimeIdentity = $startupMatch.Groups["RuntimeIdentity"].Value
+
+    Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown")
+    $runtimeExitDeadline = (Get-Date).AddSeconds(20)
+    do {
+        $installedRuntimeProcesses = @(
+            Get-CimInstance Win32_Process -Filter "Name='sunpack-runtime.exe'" |
+                Where-Object { $_.ExecutablePath -eq $runtimeAppPath }
+        )
+        if ($installedRuntimeProcesses.Count -eq 0) {
+            break
+        }
+        Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $runtimeExitDeadline)
+    if ($installedRuntimeProcesses.Count -ne 0) {
+        throw "Packaged runtime did not exit before the startup cold-start test: $runtimeAppPath"
+    }
+    Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @($runtimeIdentity, "watch", "start")
 
     $watchRoot = Join-Path $testRoot "watch-root"
     New-Item -ItemType Directory -Path $watchRoot -Force | Out-Null

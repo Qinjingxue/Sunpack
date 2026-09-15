@@ -9,7 +9,7 @@ from typing import Any, Callable
 
 from sunpack.config.cli_settings import load_cli_language_from_config
 from sunpack.i18n import I18nContext
-from sunpack.support.process_executable import current_process_executable
+from sunpack.support.process_executable import current_process_executable, is_packaged_process
 from sunpack.support.runtime_cwd import runtime_working_directory
 from sunpack.support.resource_lifecycle import open_service_file
 from sunpack.support.runtime_identity import (
@@ -83,7 +83,7 @@ def pipe_name() -> str:
 
 
 def server_command() -> list[str]:
-    if getattr(sys, "frozen", False):
+    if is_packaged_process():
         command = [str(current_process_executable()), SERVER_ARG]
     else:
         entry = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "sunpack.py"))
