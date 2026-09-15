@@ -13,13 +13,12 @@ import shutil
 import statistics
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
 import psutil
 
-from benchmarks.harness import render_report, report_from_payload
+from benchmarks.harness import benchmark_temp_dir, render_report, report_from_payload
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -236,13 +235,13 @@ def main() -> int:
         parser.error(f"archive does not exist: {archive}")
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
-    owned_temp = None
+    owned_temp: Path | None = None
     if args.work_dir:
         work = args.work_dir.resolve()
         work.mkdir(parents=True, exist_ok=True)
     else:
-        owned_temp = tempfile.TemporaryDirectory(prefix="sunpack-real-extract-")
-        work = Path(owned_temp.name)
+        owned_temp = benchmark_temp_dir("sunpack-real-extract-")
+        work = owned_temp
 
     rows: list[dict] = []
     try:
@@ -261,7 +260,7 @@ def main() -> int:
             shutil.rmtree(output, ignore_errors=True)
     finally:
         if owned_temp is not None:
-            owned_temp.cleanup()
+            shutil.rmtree(owned_temp, ignore_errors=True)
 
     report = {
         "schema_version": 1,

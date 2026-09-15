@@ -9,7 +9,7 @@ import argparse
 import cProfile
 import json
 import pstats
-import tempfile
+import shutil
 import time
 import tracemalloc
 import sys
@@ -18,7 +18,7 @@ from pathlib import Path
 
 import psutil
 
-from benchmarks.harness import render_report, report_from_payload
+from benchmarks.harness import benchmark_temp_dir, render_report, report_from_payload
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -79,8 +79,8 @@ def layer_specs():
 
 def run_once(profile_path: Path | None, trace_memory: bool) -> dict:
     process = psutil.Process()
-    with tempfile.TemporaryDirectory(prefix="sunpack-pressure-profile-") as temp:
-        root = Path(temp)
+    root = benchmark_temp_dir("sunpack-pressure-profile-")
+    try:
         build_started = time.perf_counter()
         expected = build_pressure_corpus(root)
         build_seconds = time.perf_counter() - build_started
@@ -125,6 +125,8 @@ def run_once(profile_path: Path | None, trace_memory: bool) -> dict:
             "top_functions": functions[:40],
             "top_allocations": allocations,
         }
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def main():

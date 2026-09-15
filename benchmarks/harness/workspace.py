@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 import uuid
@@ -13,11 +14,22 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_RESULTS_ROOT = REPO_ROOT / "benchmarks" / "results"
 DEFAULT_TEMP_ROOT = REPO_ROOT / "benchmarks" / ".work"
+BENCHMARK_RUN_ID_ENV = "SUNPACK_BENCH_RUN_ID"
 
 
 def _safe_name(value: str) -> str:
     rendered = "".join(character if character.isalnum() or character in "-." else "-" for character in value)
     return rendered.strip("-.") or "benchmark"
+
+
+def benchmark_temp_dir(prefix: str, *, temp_root: Path | None = None) -> Path:
+    """Create a temporary benchmark directory under the shared work root."""
+    root = (temp_root or DEFAULT_TEMP_ROOT).resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    requested_run_id = os.environ.get(BENCHMARK_RUN_ID_ENV)
+    run_id = _safe_name(requested_run_id) if requested_run_id else None
+    tagged_prefix = f"{prefix}{run_id}-" if run_id else prefix
+    return Path(tempfile.mkdtemp(prefix=tagged_prefix, dir=root))
 
 
 @dataclass(frozen=True)
@@ -39,11 +51,14 @@ class BenchmarkWorkspace:
         results_root: Path | None = None,
         temp_root: Path | None = None,
         keep_workdir: bool = False,
+        run_id: str | None = None,
     ):
         self.scenario = scenario
         self.results_root = (results_root or DEFAULT_RESULTS_ROOT).resolve()
         self.temp_root = (temp_root or DEFAULT_TEMP_ROOT).resolve()
         self.keep_workdir = keep_workdir
+        requested_run_id = run_id or os.environ.get(BENCHMARK_RUN_ID_ENV)
+        self.run_id = _safe_name(requested_run_id) if requested_run_id else None
         self.paths: WorkspacePaths | None = None
         self.started_at = datetime.now(timezone.utc)
 
@@ -53,7 +68,8 @@ class BenchmarkWorkspace:
         result = self.results_root / scenario_name / run_id
         result.mkdir(parents=True, exist_ok=False)
         self.temp_root.mkdir(parents=True, exist_ok=True)
-        root = Path(tempfile.mkdtemp(prefix=f"{scenario_name}-", dir=self.temp_root))
+        work_prefix = f"{scenario_name}-{self.run_id}-" if self.run_id else f"{scenario_name}-"
+        root = Path(tempfile.mkdtemp(prefix=work_prefix, dir=self.temp_root))
         corpus = root / "corpus"
         work = root / "work"
         outputs = root / "outputs"

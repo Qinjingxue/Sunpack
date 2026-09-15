@@ -6,14 +6,13 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import tracemalloc
 import zipfile
 from pathlib import Path
 
 import psutil
 
-from benchmarks.harness import render_report, report_from_payload
+from benchmarks.harness import benchmark_temp_dir, render_report, report_from_payload
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
@@ -73,7 +72,7 @@ def main() -> int:
     from sunpack.cli.cli import async_main
     from sunpack.cli import persistent_runtime
 
-    root = Path(tempfile.mkdtemp(prefix="sunpack-residual-rss-"))
+    root = benchmark_temp_dir("sunpack-residual-rss-")
     rows = []
     persistent_runtime.enable_persistent_runtime()
     try:

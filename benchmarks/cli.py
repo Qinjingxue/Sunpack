@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import uuid
 
 from .registry import SCENARIOS
 
@@ -13,6 +14,7 @@ from .registry import SCENARIOS
 BENCHMARKS_ROOT = Path(__file__).resolve().parent
 BENCHMARK_CACHE_ROOT = BENCHMARKS_ROOT / ".cache"
 BENCHMARK_WORK_ROOT = BENCHMARKS_ROOT / ".work"
+BENCHMARK_RUN_ID_ENV = "SUNPACK_BENCH_RUN_ID"
 
 # A scenario that makes a stale API call must fail loudly instead of hanging the
 # whole benchmark run.  Every scenario therefore runs in a child process under
@@ -42,6 +44,20 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _cleanup_benchmark_run_workdir(run_id: str) -> None:
+    """Remove only workspaces tagged with one benchmark parent run ID."""
+    if not BENCHMARK_WORK_ROOT.is_dir():
+        return
+    marker = f"-{run_id}-"
+    try:
+        candidates = list(BENCHMARK_WORK_ROOT.iterdir())
+    except OSError:
+        return
+    for candidate in candidates:
+        if candidate.is_dir() and marker in candidate.name:
+            shutil.rmtree(candidate, ignore_errors=True)
+
+
 def _run_scenario_in_subprocess(module: str, scenario_args: list[str], timeout: float) -> int:
     """Run one scenario module in a child process with a hard timeout.
 
@@ -51,16 +67,30 @@ def _run_scenario_in_subprocess(module: str, scenario_args: list[str], timeout: 
     ``TIMEOUT_EXIT_CODE`` instead of hanging the parent.
     """
     command = [sys.executable, "-m", module, *scenario_args]
+    run_id = f"{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    environment = os.environ.copy()
+    environment[BENCHMARK_RUN_ID_ENV] = run_id
+    keep_workdir = "--keep-workdir" in scenario_args
     try:
-        completed = subprocess.run(command, cwd=os.getcwd(), timeout=timeout, check=False)
-    except subprocess.TimeoutExpired:
-        print(
-            f"benchmark timed out after {timeout:g}s and was killed: {' '.join(command)}",
-            file=sys.stderr,
-            flush=True,
-        )
-        return TIMEOUT_EXIT_CODE
-    return int(completed.returncode)
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=os.getcwd(),
+                env=environment,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            print(
+                f"benchmark timed out after {timeout:g}s and was killed: {' '.join(command)}",
+                file=sys.stderr,
+                flush=True,
+            )
+            return TIMEOUT_EXIT_CODE
+        return int(completed.returncode)
+    finally:
+        if not keep_workdir:
+            _cleanup_benchmark_run_workdir(run_id)
 
 
 def _clean_benchmark_artifacts(args: list[str]) -> int:

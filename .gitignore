@@ -50,6 +50,7 @@ fixtures/*.bin
 /.sunpack_test_tools/
 
 # Temporary workspaces created by acceptance tests
+/.sunpack-test-tmp/
 acceptance-*/
 acceptance-dataset-*/
 relationship-grouping-*/

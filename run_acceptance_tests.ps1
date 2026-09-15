@@ -14,6 +14,8 @@ $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $unelevatedRunner = Join-Path $repoRoot "scripts\run_unelevated_process.py"
+$testArtifactCleanupScript = Join-Path $repoRoot "scripts\cleanup_test_artifacts.ps1"
+$pytestBaseTemp = Join-Path $repoRoot ".sunpack-test-tmp"
 Set-Location $repoRoot
 
 if ($ParallelWorkers -le 0) {
@@ -29,6 +31,24 @@ function Test-CurrentProcessAdministrator {
 }
 
 $script:AcceptanceProcessIsAdministrator = Test-CurrentProcessAdministrator
+
+function Invoke-TestArtifactCleanup {
+    if (-not (Test-Path -LiteralPath $testArtifactCleanupScript -PathType Leaf)) {
+        return
+    }
+    Write-Host "==> Cleaning stale SunPack test artifacts" -ForegroundColor Cyan
+    try {
+        & ([Diagnostics.Process]::GetCurrentProcess().MainModule.FileName) `
+            -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $testArtifactCleanupScript
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host ("    NOTE - stale artifact cleanup returned exit code {0}; continuing" -f $LASTEXITCODE) -ForegroundColor Yellow
+        }
+    } catch {
+        Write-Host ("    NOTE - stale artifact cleanup could not run: " + $_.Exception.Message) -ForegroundColor Yellow
+    }
+}
+
+Invoke-TestArtifactCleanup
 
 function Initialize-ExitCodeProbe {
     if ("SunPack.ProcessExit" -as [type]) {
@@ -712,6 +732,7 @@ try {
         "-m", "pytest", "-q",
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
+        "--basetemp", $pytestBaseTemp,
         "tests/cli", "tests/unit", "tests/functional",
         "--durations=20"
     )
@@ -720,6 +741,7 @@ try {
         "-m", "pytest", "-q",
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
+        "--basetemp", $pytestBaseTemp,
         "tests/integration", "tests/real",
         "--ignore", "tests/integration/test_disk_full_pause_resume.py",
         "--durations=20"
@@ -729,6 +751,7 @@ try {
         "-m", "pytest", "-q",
         "-n", [string]$ParallelWorkers,
         "--dist", "worksteal",
+        "--basetemp", $pytestBaseTemp,
         "tests/integration/test_disk_full_pause_resume.py",
         "--durations=20"
     )

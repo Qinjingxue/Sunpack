@@ -4,11 +4,12 @@ from .pressure import AdaptivePressureGate, PressureWait
 from .progress import PhaseReporter
 from .reporting import BenchmarkReport, render_report, report_from_payload, write_report
 from .timing import Measurement, measure
-from .workspace import BenchmarkWorkspace, WorkspacePaths
+from .workspace import BenchmarkWorkspace, WorkspacePaths, benchmark_temp_dir
 
 __all__ = [
     "BenchmarkReport",
     "BenchmarkWorkspace",
+    "benchmark_temp_dir",
     "AdaptivePressureGate",
     "Measurement",
     "PhaseReporter",

@@ -36,3 +36,6 @@ sunpack = "sunpack.cli.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["sunpack*"]
+
+[tool.pytest.ini_options]
+tmp_path_retention_policy = "none"
