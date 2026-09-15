@@ -1,45 +1,32 @@
 # 配置文件说明
 
-常用配置文件为 `sunpack_config.json`，只保留最常改的字段。完整高级配置文件为 `sunpack_advanced_config.json`，保留全部可调字段。
+常用配置文件是 `sunpack_config.json`，完整配置文件是 `sunpack_advanced_config.json`。程序先读取高级配置，再用简化配置覆盖同名字段：对象递归合并，数组和普通值整体覆盖。
 
-运行时会先读取 `sunpack_advanced_config.json`，再用 `sunpack_config.json` 覆盖同名字段：对象字段递归合并，数组和普通值整体覆盖。也就是说，简化配置优先级更高；用户可以把任意高级字段搬进 `sunpack_config.json` 接管它，也可以删掉字段让高级配置兜底。
+源码运行时通常从仓库根目录或当前工作目录读取配置；打包版本优先读取可执行文件旁的外部配置。配置可以在不重新打包的情况下调整。
 
-源码运行时通常读取仓库根目录或当前工作目录中的配置；打包版本优先读取可执行文件旁边的外部配置，因此用户可以在不重新打包的情况下调整行为。
-
-检查配置：
+检查和查看有效配置：
 
 ```powershell
 python sunpack.py config validate
-```
-
-查看配置：
-
-```powershell
 python sunpack.py config show
 ```
 
 ## 运行时覆盖
 
-程序支持通过环境变量 `SUNPACK_CONFIG_OVERRIDES` 在启动前动态覆盖任意配置项，不需要修改配置文件。值可以是内联 JSON 对象，也可以是某个 JSON 文件的路径。
+环境变量 `SUNPACK_CONFIG_OVERRIDES` 可以在启动前覆盖任意配置项。值可以是内联 JSON 对象，也可以是 JSON 文件路径。
 
-合并顺序（后覆盖先）：`sunpack_advanced_config.json` → `sunpack_config.json` → 运行时覆盖。覆盖遵循与配置层相同的合并规则：对象字段递归合并，命名模块列表（如 `filesystem.scan_filters`、`detection.rule_pipeline.precheck`）按 `name` 合并，因此覆盖里只需写要改的那一项。
+合并顺序为：`sunpack_advanced_config.json` → `sunpack_config.json` → 运行时覆盖。命名模块列表 `filesystem.scan_filters`、`detection.fact_collectors`、`detection.processors` 和 `detection.rule_pipeline.precheck` 按 `name` 合并，覆盖时只需写要改变的模块。
 
-例如临时放行小文件：
+例如临时关闭大小过滤：
 
 ```powershell
 $env:SUNPACK_CONFIG_OVERRIDES = '{"filesystem": {"scan_filters": [{"name": "size_range", "enabled": false}]}}'
 python sunpack.py scan C:\Archives
 ```
 
-或保留过滤器、把阈值降到 0：
+未知顶层配置节会直接报错。CLI 参数（例如 `--recur`、`--cleanup`）在配置加载后作为最后一层覆盖。
 
-```powershell
-$env:SUNPACK_CONFIG_OVERRIDES = '{"filesystem": {"scan_filters": [{"name": "size_range", "range": "r >= 0"}]}}'
-```
-
-覆盖里出现未知的顶层配置节会直接报错，避免拼错字段名被静默忽略。CLI 参数（如 `--recur`、`--cleanup`）与运行覆盖共用同一套合并逻辑，在加载完成后作为最后一层生效。
-
-pytest 默认注入一份覆盖，关闭 `size_range` 过滤器，因此测试可以使用小于 1MB 的文件；调用方如果自己设置了 `SUNPACK_CONFIG_OVERRIDES`，pytest 会保留调用方的值。
+测试运行时默认关闭 `size_range` 过滤器，使测试可以使用小于 1 MB 的文件；调用方已经设置的 `SUNPACK_CONFIG_OVERRIDES` 会被保留。
 
 ## 顶层结构
 
@@ -51,6 +38,11 @@ pytest 默认注入一份覆盖，关闭 `size_range` 过滤器，因此测试�
   "post_extract": {},
   "filesystem": {},
   "performance": {},
+  "watch": {},
+  "passwords": {},
+  "extraction": {},
+  "embedded_scan": {},
+  "input_planning": {},
   "analysis": {},
   "verification": {},
   "detection": {}
@@ -59,50 +51,54 @@ pytest 默认注入一份覆盖，关闭 `size_range` 过滤器，因此测试�
 
 ## cli
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `language` | `str` | CLI 语言。`zh` 启用中文，其它值回退英文。 |
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `language` | `str` | `zh` | CLI 语言。`zh` 使用中文，其它值使用英文。 |
 
 ## recursive_extract
 
 | 值 | 说明 |
 | --- | --- |
-| `*` | 无限递归，内部上限为 999 轮。 |
-| 正整数 | 固定递归轮数。 |
-| `?` | 每轮递归后询问是否继续。 |
+| `*` | 持续处理嵌套归档，最多 999 轮。 |
+| 正整数 | 固定允许的递归轮数。 |
+| `?` | 每轮结束后询问是否继续，最多 999 轮。 |
 
-递归轮次只表示最多允许继续扫描多少轮。第一轮完全按用户选择的文件或目录扫描范围执行，不做目录语义门控。第一轮完成后，coordinator 会用 `NestedOutputScanPolicy` 发现输出中的压缩包；从第二轮开始，`nested_extraction_policy` 在实际分析和解压前做目录语义授权。
+第一轮完全按用户给出的文件或目录范围执行。后续轮次会对解压输出中的候选归档应用 `nested_extraction_policy`，再决定是否继续处理。
 
-CLI 可用 `--recur` 临时覆盖。
+CLI 可以用 `--recur` 临时覆盖该设置。
 
 ## nested_extraction_policy
 
-该策略批量判断自动从解压结果中发现的压缩包是否像用户语义上的独立归档。它不会弹出确认，也不会减少 detection 的完整候选发现；被拒绝的候选在进入 analysis、密码处理和实际解压前停止。用户请求的第一轮扫描始终绕过该策略；第二轮起所有候选统一判断，包括输出根目录第一层的候选。
+该策略在嵌套归档进入密码处理和解压前，根据目录上下文批量判断它是否属于用户语义上的独立归档。第一轮用户明确指定的输入不受该策略影响；第二轮起，输出中发现的候选统一参与判断。
 
-判断使用同一次 filesystem 枚举产生的过滤前原始快照，因此黑名单、大小过滤等不会把普通游戏文件从目录上下文中隐藏。统计和候选合并在 Rust 中一次完成，不会为每个嵌套压缩包重复扫描目录。
+判断使用一次目录快照中的原始条目，保留黑名单和大小过滤前的目录上下文。多个候选统一聚合，一组分卷只计一个归档。拒绝的候选会出现在运行摘要的策略跳过记录中，不计为解压失败。
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `enabled` | `bool` | `true` | 是否启用解压前批量授权。 |
-| `byte_ratio_exponent` | `float` | `1` | 字节占比赔率的指数，越大越重视候选压缩包的字节主体性，必须为正数。 |
-| `project_ratio_exponent` | `float` | `1` | 压缩项目占比赔率的指数，越大越惩罚候选项目占比过低，必须为正数。 |
-| `authorization_bias` | `float` | `0` | 加在融合 log-odds 上的有限偏置；正数更宽松，负数更保守。 |
-| `minimum_authorization_score` | `float` | `0.85` | 局部和根目录授权评分均需达到的最低值。 |
-| `minimum_archive_byte_ratio` | `float` | `0.1` | 局部或根目录候选字节占比低于此值时直接拒绝。 |
-| `hard_maximum_other_projects` | `int` | `1000` | 防止递归任务爆炸的安全上限；局部或根目录有效非候选项目超过此值时直接拒绝。 |
+| `enabled` | `bool` | `true` | 是否启用嵌套归档授权。 |
+| `byte_ratio_exponent` | `float` | `1` | 候选归档字节占比的指数，必须为正数。 |
+| `project_ratio_exponent` | `float` | `1` | 候选归档项目占比的指数，必须为正数。 |
+| `authorization_bias` | `float` | `0` | 授权分偏置；正数更宽松，负数更保守。 |
+| `minimum_authorization_score` | `float` | `0.85` | 局部目录和输出根目录授权分的最低值。 |
+| `minimum_archive_byte_ratio` | `float` | `0.1` | 候选字节占比低于该值时拒绝。 |
+| `hard_maximum_other_projects` | `int` | `1000` | 有效非候选项目超过该值时拒绝。 |
 
-设候选字节占比为 `B`，候选压缩项目数为 `A`，有效非候选项目数为 `O`，压缩项目占比为 `P = A / (A + O)`。授权分使用赔率融合：`S = sigmoid(c + a×logit(B) + b×logit(P))`，其中 `a`、`b`、`c` 分别对应上述两个指数和偏置。`S` 是位于 `0..1` 的确定性置信分，不是在标注数据上校准过的真实概率。赔率模型会让接近 `100%` 的字节占比快速增强主体证据，同时让接近 `0%` 的压缩项目占比快速增强反对证据。默认参数下，字节占比为 `99%` 时，压缩项目占比约 `5%` 是授权边界。
+候选字节占比为 `B`，候选归档项目数为 `A`，有效非候选项目数为 `O`，压缩项目占比为 `P = A / (A + O)`。授权分为：
 
-候选位于更深目录时，以扫描根下包含它的第一个目录作为局部语义子树，并同时统计完整输出根；最终取两个评分中的较低值。每个独立候选归档计一个压缩项目，一组分卷仍只计一个；普通非候选文件逐个计数，不含候选的首层旁支目录额外计数；候选路径上的连续包装目录不计数。同一范围里的多个压缩包统一聚合，分卷成员去重求和。拒绝结果以 `nested_extraction_policy` 策略跳过记录在运行摘要中，不作为解压失败。
+```text
+S = sigmoid(c + a × logit(B) + b × logit(P))
+```
+
+其中 `a`、`b`、`c` 对应两个指数和偏置。`S` 是确定性的 `0..1` 评分，不表示校准概率。
 
 ## post_extract
 
 | 字段 | 类型 | 可选值 | 说明 |
 | --- | --- | --- | --- |
-| `archive_cleanup_mode` | `str` | `d`、`r`、`k` | 成功后如何处理原归档：删除、回收站、保留。 |
-| `flatten_single_directory` | `bool` | `true` / `false` | 解压结果只有一个顶层目录时，是否把内容提升一层。 |
+| `archive_cleanup_mode` | `str` | `d`、`r`、`k` | 成功后处理原归档：删除、移入回收站、保留。 |
+| `flatten_single_directory` | `bool` | `true` / `false` | 结果只有一个顶层目录时，是否提升该目录内容。 |
 
-建议默认用 `r`，避免误删原始归档。
+默认清理模式为 `r`。
 
 ## filesystem
 
@@ -113,15 +109,15 @@ CLI 可用 `--recur` 临时覆盖。
 | `*` | 递归扫描目标目录及子目录。 |
 | `-` | 只扫描目标目录第一层文件。 |
 
-该设置只影响输入目录扫描范围，不影响解压后的递归轮次。
+该设置只影响输入目录扫描范围，不影响解压输出的递归轮次。
 
 ### scan_filters
 
-`scan_filters_enabled` 是扫描过滤器总开关。设为 `false` 时保留 `scan_filters` 配置但不应用任何过滤器，适合临时排查是否被黑名单、大小范围、修改时间范围或目录剪枝挡掉。
+`scan_filters_enabled` 是过滤器总开关。设为 `false` 时，过滤器配置会保留但不执行。
 
-扫描过滤器在目录遍历阶段执行，被过滤的条目不会进入 relation、detection 或 analysis。
+过滤器按数组顺序执行。`directory_prune` 会在目录遍历阶段剪枝；`whitelist`、`blacklist`、`size_range` 和 `mtime_range` 作用于扫描条目。被过滤的文件不会进入关系识别、检测或结构分析。
 
-`scan_filters` 按配置数组中的顺序执行；第一个启用的过滤器就第一个处理扫描条目。`whitelist` 默认关闭，启用后文件必须命中 whitelist 才会继续进入它后面的过滤器；字段与 `blacklist` 一致，但语义是“允许”。例如：
+`whitelist` 示例：
 
 ```json
 {
@@ -130,28 +126,21 @@ CLI 可用 `--recur` 临时覆盖。
   "path_globs": ["archives/**"],
   "prune_dir_globs": ["archives"],
   "allowed_files": ["sample.zip"],
-  "allowed_extensions": [".zip", ".7z"]
+  "allowed_extensions": [".zip", ".7z", ".rar"]
 }
 ```
 
-`whitelist` 使用 `allowed_files` 和 `allowed_extensions` 表示允许的完整文件名和扩展名。每个 whitelist 字段为空时表示该维度不限制；多个非空字段会同时作为约束。`blacklist` 使用 `blocked_files` 和 `blocked_extensions` 表示禁止的完整文件名和扩展名。
+`whitelist` 的非空字段同时作为约束；`allowed_files` 匹配完整文件名，`allowed_extensions` 匹配扩展名。`blacklist` 使用对应的 `blocked_files` 和 `blocked_extensions`。
 
-`directory_prune` 的 `prune_dir_globs` / `path_globs` 在原生目录遍历阶段执行；命中的目录不会入栈，其整个子树也不会进入后续过滤器。`prune_dir_globs` 匹配任意层级的目录名，`path_globs` 匹配相对于扫描根的路径。`blacklist` 只负责具体文件名和扩展名过滤。
+`directory_prune` 支持 `prune_dir_globs` 和 `path_globs`。前者匹配任意层级的目录名，后者匹配相对于扫描根的路径；被剪枝目录的整个子树都不会继续遍历。
 
-`blacklist` 常用字段：
-
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `blocked_files` | `list[str]` | 完整文件名精确匹配，例如 `Thumbs.db`、`desktop.ini`。 |
-| `blocked_extensions` | `list[str]` | 阻止扫描的文件扩展名。 |
-
-`size_range` 用文件大小限制 filesystem 输出。只有落在配置范围内的文件才会进入 relation、detection 或 analysis；目录不受该过滤器影响。推荐写数学不等式，`r` 表示文件大小：
+`size_range` 用文件大小限制扫描结果，`r` 表示字节数：
 
 ```json
 {"name": "size_range", "enabled": true, "range": "1 MB < r < 10 MB"}
 ```
 
-大小单位支持 `B`、`KB`、`MB`、`GB`、`TB` 和 `KiB`、`MiB`、`GiB`、`TiB`，按 1024 进位。也兼容旧的原始范围字段：
+支持 `B`、`KB`、`MB`、`GB`、`TB` 以及 `KiB`、`MiB`、`GiB`、`TiB`，按 1024 进位。也支持以下等价字段：
 
 | 字段 | 类型 | 说明 |
 | --- | --- | --- |
@@ -161,276 +150,235 @@ CLI 可用 `--recur` 临时覆盖。
 | `lte` / `less_than_or_equal` | `int` | 文件大小必须小于等于该值。 |
 | `eq` / `equal` | `int` | 文件大小必须等于该值。 |
 
-`mtime_range` 用文件修改时间限制 filesystem 输出，推荐写数学不等式，`d` 表示文件修改时间：
+`mtime_range` 用文件修改时间限制扫描结果，`d` 表示修改时间：
 
 ```json
 {"name": "mtime_range", "enabled": false, "date": "20260430 01:40 > d > 20250320 01:30"}
 ```
 
-日期值支持纳秒时间戳、ISO 时间字符串，以及 `YYYYMMDD HH:MM` / `YYYYMMDD HH:MM:SS` / `YYYYMMDD`。旧的 `gt/gte/lt/lte/eq` 字段仍兼容。
+日期支持纳秒时间戳、ISO 时间字符串，以及 `YYYYMMDD HH:MM`、`YYYYMMDD HH:MM:SS` 和 `YYYYMMDD`。也支持 `gt`、`gte`、`lt`、`lte`、`eq` 字段。
 
-目录扫描使用 Rust `scan_directory_snapshot`。过滤器无法映射到 native 参数时会显性报错，不做 Python fallback。
+目录扫描和过滤由原生扫描能力执行；过滤器无法映射到原生参数时会明确报告错误。
 
 ## performance
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `performance.worker.watchdog_no_progress_timeout_seconds` | `int` / `float` | worker 无进展超时，`0` 表示不限。任务没有总时长上限：只要 worker 仍在输出事件就持续推进，只有真正停滞才会被判定超时。 |
-| `performance.worker.thread_capacity` | `int` | `IInArchive` 线程硬容量；`0` 由 worker 按机器能力探测。实际活动任务数由 native 自适应准入。 |
-| `performance.worker.stage_thread_capacity` | `int` | 同步扫描、分析、校验和后处理的固定 worker 线程容量；`0` 自动按机器能力选择。 |
-| `performance.worker.max_inflight_files` | `int` | 同时存在的文件级异步状态机上限；`0` 自动取 worker 总容量的 4 倍，范围 64–512。 |
-| `performance.worker.max_pending_stage_jobs` | `int` | Python blocking lane 的待执行作业硬上限，满载时异步生产者等待而不创建新线程。 |
-| `performance.worker.adaptive_enabled` | `bool` | 是否启用基于实际输出吞吐的 native 动态并发控制。 |
-| `performance.worker.initial_active_jobs` | `int` | native 初始活动任务数，`0` 自动选择。 |
-| `performance.worker.exploration_strategy` | `str` | `calibrated`（默认，从 CPU 校准值小步探索）、`rapid`（大步起探）或 `full`（从线程容量向下探索）。 |
-| `performance.worker.resource_diagnostics_enabled` | `bool` | 是否附带采样 CPU 和进程 IO，仅供校准诊断，生产默认关闭。 |
-| `performance.worker.sample_interval_ms` | `int` | native 吞吐采样间隔，最小 100 ms。 |
-| `performance.worker.minimum_window_seconds` / `maximum_window_seconds` | `float` | 单个稳定吞吐窗口的最短和最长时间。 |
-| `performance.worker.large_window_bytes` | `int` | 达到该实际写入量后使用字节/秒比较并发探测。 |
-| `performance.worker.small_window_jobs` / `small_window_files` | `int` | 小任务窗口达到该完成量后使用任务/秒或文件/秒比较。 |
-| `performance.worker.improvement_ratio` / `regression_ratio` | `float` | 接受探测和触发回退的滞回阈值。 |
-| `performance.worker.cooldown_windows` / `hold_windows` | `int` | 回退冷却和稳定点保持的窗口数。 |
-| `performance.worker.warm_start_decay_seconds` | `float` | 活动会话完全空闲后保留最近确认并发作为温启动提示的线性衰减时间；`0`（默认）禁用温启动，且任何值都不会保留旧吞吐窗口。 |
-| `performance.worker.warm_start_confirmations` | `int` | 最近并发至少被相邻吞吐窗口确认多少次后才允许用于温启动。 |
-| `performance.worker.max_queue_jobs` | `int` | native 任务队列上限；达到上限时返回可重试的背压结果。 |
-| `performance.worker.priority_aging_quantum` | `int` | native 优先级老化步长，避免低优先级请求长期饥饿。 |
-| `performance.worker.writer_threads` | `int` | native worker 统一写出线程数。 |
-| `performance.worker.memory_budget_bytes` | `int` | native worker 的估算内存准入预算；`0` 使用可用物理内存的默认比例。 |
-| `performance.worker.job_buffer_budget_bytes` | `int` | 单个 native 解压任务的输出 inflight 缓冲上限。 |
-| `performance.worker.memory_pause_available_mb` / `memory_resume_available_mb` | `int` | 系统可用内存进入紧急区时暂停新任务准入，以及恢复准入的阈值。 |
-| `resource_guard` | `dict` | 可选资源护栏，用 analysis 估算的文件数、解包大小、压缩比等限制任务。 |
+资源分析和 worker 参数都位于 `performance`。默认值如下：
 
-native worker 启动时采集逻辑处理器数和可用物理内存。线程容量为逻辑处理器数和 32 的最小值，不再由内存槽位裁剪；前台初始并发为 `ceil(逻辑处理器数 / 2)`，后台为 `ceil(逻辑处理器数 / 4)`。自动内存预算取启动时可用物理内存的 70%，但只作为累计任务 reservation 的硬准入预算。`thread_capacity`、`initial_active_jobs` 和 `memory_budget_bytes` 的正数值分别覆盖自动结果，`0` 表示自动计算。
+| 字段 | 默认 | 说明 |
+| --- | ---: | --- |
+| `precise_resource_min_size_mb` | `256` | 达到该大小且条件满足时执行更精确的资源评估。 |
+| `persistent_server_idle_seconds` | `15` | 常驻服务空闲多久后退出。 |
+| `worker.watchdog_no_progress_timeout_seconds` | `180` | 没有进展达到该时长时报告停滞；`0` 表示不限。 |
+| `worker.thread_capacity` | `0` | 解压线程容量；`0` 自动按机器能力选择。 |
+| `worker.stage_thread_capacity` | `0` | 扫描、分析、校验和后处理的线程容量；`0` 自动选择。 |
+| `worker.max_inflight_files` | `0` | 文件级并发上限；`0` 自动选择，自动范围为 64–512。 |
+| `worker.max_pending_stage_jobs` | `4096` | 阶段作业等待上限。 |
+| `worker.adaptive_enabled` | `true` | 是否按实际吞吐动态调整解压并发。 |
+| `worker.initial_active_jobs` | `0` | 初始活动任务数；`0` 自动选择。 |
+| `worker.exploration_strategy` | `calibrated` | 并发探索策略，可选 `calibrated`、`rapid`、`full`。 |
+| `worker.resource_diagnostics_enabled` | `false` | 是否采样 CPU 和进程 I/O 诊断数据。 |
+| `worker.minimum_window_seconds` / `maximum_window_seconds` | `0.25` / `1.5` | 吞吐观察窗口的最短和最长时长。 |
+| `worker.settle_seconds` | `0.1` | 调整并发后的稳定等待时间。 |
+| `worker.large_window_bytes` | `33554432` | 大任务窗口的实际写入字节数。 |
+| `worker.small_window_jobs` / `small_window_files` | `4` / `16` | 小任务窗口的任务数和文件数。 |
+| `worker.improvement_ratio` / `regression_ratio` | `1.03` / `0.97` | 接受提升和判定下降的阈值。 |
+| `worker.aggressive_step` | `4` | 快速探索时的步长。 |
+| `worker.cooldown_windows` / `hold_windows` | `2` / `8` | 回退冷却和稳定保持的窗口数。 |
+| `worker.warm_start_decay_seconds` / `warm_start_confirmations` | `0` / `2` | 温启动提示的衰减时长和确认次数。 |
+| `worker.max_queue_jobs` | `4096` | 原生任务队列上限。 |
+| `worker.priority_aging_quantum` | `32` | 优先级老化步长。 |
+| `worker.backpressure_retries` | `120` | 遇到队列背压时的重试次数。 |
+| `worker.writer_threads` | `4` | 写出线程数。 |
+| `worker.memory_budget_bytes` | `0` | 内存准入预算；`0` 自动按可用内存选择。 |
+| `worker.job_buffer_budget_bytes` | `33554432` | 单任务输出缓冲上限。 |
+| `worker.memory_pause_available_mb` / `memory_resume_available_mb` | `1024` / `2048` | 内存紧张时暂停和恢复任务准入的阈值。 |
+| `worker.space_gate_enabled` | `true` | 是否在任务进入写出阶段前检查磁盘空间。 |
+| `worker.space_poll_interval_ms` | `1000` | 磁盘空间检查间隔。 |
+| `worker.space_status_report_interval_ms` | `15000` | 磁盘空间状态报告间隔。 |
 
-所有解压任务共用的异步写入器提供累计实际接收字节、实际写入字节、完成文件和完成任务计数。控制器把一次从空闲到再次完全空闲的过程视为活动会话，但只在队列持续积压、活动任务接近当前上限时开启饱和测量段。大数据窗口比较实际写入字节/秒，小任务窗口比较完成任务/秒或文件/秒；吞吐上升时保留并继续小步探索，下降时退回之前的稳定并发并进入冷却。backlog 中断会立即放弃未完成探测、回到最近稳定并发并清空窗口；完全空闲会保存计数基线并让控制器无限期休眠。若显式启用温启动，下一活动会话可以使用随空闲时间衰减的最近确认并发作为启动提示，但仍必须重新采 baseline；实测默认禁用。CPU 和进程 IO 不参与生产决策，只有开启 `resource_diagnostics_enabled` 后才采样和输出。控制器不读取 `profile_key`，也不根据格式或 solid 状态选择并发。
+自动并发以实际写入、完成任务和完成文件的吞吐为主要依据。大任务比较字节/秒，小任务比较任务/秒或文件/秒；吞吐下降时回到稳定并发并进入冷却。格式、算法、solid 状态和文件数量不作为额外 CPU 权重。资源诊断只在显式开启时采样。
 
-归档格式、算法、solid 状态和文件数量不再产生 CPU 权重；solid 归档也没有全局单任务互斥。Python 只向 native 提供字典大小和内存 reservation，调度器据此执行硬内存准入；其余并发差异全部由整体实际吞吐反馈学习。
+### resource_guard
 
-`resource_guard` 当前常用字段：
-
-| 字段 | 说明 |
-| --- | --- |
-| `enabled` | 是否启用资源护栏。 |
-| `max_file_count` | 归档条目数超过该值时阻止解压，`0` 表示不限。 |
-| `max_total_unpacked_size` | 估算总解包大小上限，字节，`0` 表示不限。 |
-| `max_largest_item_size` | 单个最大条目上限，字节，`0` 表示不限。 |
-| `max_compression_ratio` | 压缩比上限，`0` 表示不限。 |
+| 字段 | 默认 | 说明 |
+| --- | ---: | --- |
+| `enabled` | `false` | 是否启用资源护栏。 |
+| `max_file_count` | `0` | 条目数上限；`0` 不限。 |
+| `max_total_unpacked_size` | `0` | 总解包大小上限，单位为字节；`0` 不限。 |
+| `max_largest_item_size` | `0` | 单个最大条目上限，单位为字节；`0` 不限。 |
+| `max_compression_ratio` | `0` | 压缩比上限；`0` 不限。 |
 
 ## watch
 
-`watch` 配置控制 `sunpack watch` 的默认行为；CLI 参数仍可临时覆盖对应值。
+`watch` 控制监控服务的等待、输出、剪贴板和通知行为。CLI 监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`，每行可以写 `输入目录` 或 `输入目录 | 输出根目录`。
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `cold_start_seconds` | `float` | 文件首次进入活跃态、尚无写入间隔样本时的等待时间，默认 1 秒。设为 `0` 会关闭动态等待。旧字段 `quiet_seconds` 仍作为该字段的兼容别名。 |
-| `quiet_min_seconds` | `float` | 取得首个有效间隔后，动态静默时间的下限，默认 2.5 秒。它可以高于冷启动时间。 |
-| `quiet_max_seconds` | `float` | 动态静默时间上限，默认 180 秒。 |
-| `recursive` | `bool` | 是否递归监控目录。 |
-| `out_dir` | `string` | 未写输出路径的旧格式监控目录行的默认输出根目录，默认 `.`（输出到各自输入目录旁）。相对路径相对于对应的输入目录解析。显式写了 `输入 | 输出` 的行不受它影响。 |
-| `initial_scan` | `bool` | 启动 watcher 时是否扫描已有文件。 |
-| `max_folders` | `int` | 单次 watch 接受的最大路径数量。 |
-| `observer_stop_timeout_seconds` | `float` | 停止 watchdog observer 时等待线程退出的超时。 |
+| 字段 | 默认 | 说明 |
+| --- | ---: | --- |
+| `cold_start_seconds` | `0.0` | 文件首次进入活跃态时的等待时间。默认值为 0，文件准备好后可立即处理。 |
+| `quiet_min_seconds` | `0.0` | 动态静默时间下限。 |
+| `quiet_max_seconds` | `180.0` | 动态静默时间上限；`cold_start_seconds` 为 0 时不进入动态静默等待。 |
+| `boundary_confirmation_seconds` | `0.5` | 文件边界确认的观察时间。 |
+| `max_folders` | `16` | 配置中的目录数量上限字段，当前 CLI 目录列表由 `sunpack_watch_roots.txt` 管理。 |
+| `observer_stop_timeout_seconds` | `5.0` | 停止文件系统观察线程的等待时间。 |
+| `runtime_cache_cleanup_enabled` | `true` | 是否清理空闲运行缓存。 |
+| `runtime_cache_cleanup_idle_seconds` | `10.0` | 缓存空闲多久后清理。 |
+| `password_retry_debounce_seconds` | `0.5` | 密码文件或剪贴板变化后，触发失败任务重试前的等待时间。 |
+| `password_retry_include_subtree` | `true` | 密码来源变化时是否重试对应目录的子树任务。 |
+| `clipboard_monitor_enabled` | `true` | 是否监控剪贴板密码变化。 |
+| `clipboard_builtin_max_entries` | `30` | 保留的剪贴板密码数量。 |
+| `enabled` | `false` | 配置层标记；CLI 服务实际运行状态由 `watch start` 和 `watch stop` 管理。 |
+| `roots` | `[]` | 配置中的默认根目录列表；CLI 服务使用根目录文件中的列表。 |
+| `out_dir` | `.` | 未在根目录文件中指定输出根时使用的默认输出位置；相对路径按输入目录解析。 |
+| `tray_enabled` | `true` | 是否启用托盘入口。 |
+| `toast_enabled` | `true` | 是否发送 Windows 通知。 |
+| `toast_update_interval_ms` | `50` | 通知进度更新间隔。 |
+| `toast_completion_debounce_ms` | `800` | 合并完成通知的等待时间。 |
+| `toast_success_ttl_seconds` | `3.0` | 成功通知保留时间。 |
+| `toast_failure_ttl_seconds` | `5.0` | 失败通知保留时间。 |
+| `toast_report_retention_days` | `30` | 通知失败报告保留天数。 |
+| `toast_report_max_files` | `16` | 失败报告文件数量上限。 |
+| `toast_report_max_bytes` | `2097152` | 失败报告总大小上限，单位为字节。 |
+| `state_dir` | `""` | 监控状态目录；为空时使用根目录文件旁的 `.sunpack_watch`。 |
 
-没有活跃文件或待处理密码重试时，watch 服务会无限等待 watchdog 或控制事件；只有静默期和 debounce 尚未到期时才设置一次性 deadline。
+监控服务只观察每个根目录的直接文件，不递归监听子目录。输入根必须位于 NTFS 卷，并且该卷有可读取的 USN Journal；否则该根无法启动监控。
 
-watch 不按扩展名或下载器类型推测下载状态。`created`、`moved`、`modified` 事件使输入进入活跃态；首次使用 `cold_start_seconds`，取得首个有效内容变化间隔后立即进入不低于 `quiet_min_seconds` 的动态区间，随后按该文件最近 12 次实际内容变化的最大间隔调整。长间隔会立即拉长，缩短时每次只向目标移动一部分，最终受 `quiet_min_seconds` 和 `quiet_max_seconds` 限制。只有 size 或 mtime 变化的事件参与间隔学习，但其他内容事件仍会重置当前静默计时。每个活跃周期只触发一次主流程；普通成功、部分成功和失败都不会自行重试。新分卷到达或密码源变化会把受影响的输入重新置为活跃态。
+`created`、`moved` 和 `modified` 事件会使文件进入活跃态。监控按实际内容变化学习静默间隔；单纯 size 或 mtime 变化会参与间隔学习，其它内容事件会重置当前计时。一个活跃周期只提交一次主处理流程。新分卷到达或密码来源变化会重新激活受影响任务。
 
-watch 直接使用每个监控目录解析出的绝对输出根目录。完整输出、部分输出和失败输出均由主 Pipeline 的输出策略处理；Pipeline 完成 postprocess、资源释放后，watch 才发送完成通知。输出根目录位于监控目录下时，watch 保持非递归事件监听，目录事件只处理 source 离开状态，不把 destination 目录作为候选文件。
+输出根可以跨盘。完整输出、部分输出和失败输出都直接写入对应输出根；输出根位于监控输入目录下时，输出目录事件不会被当作新的输入候选。不同监控根的输出根不能互为严格的祖先和子目录，相同输出根可以共享。
 
-每个监控目录在监控目录文件 `sunpack_watch_roots.txt` 中都可以写成 `输入 | 输出`（输出可跨盘），只写输入目录时使用 `watch.out_dir`。这两种写法只在读取监控目录文件时区分：进入 watch 服务后每个输入目录都只有一个绝对的输出根目录，`watch.out_dir` 不参与后续任何输出路径决策。解压直接写入该输出根目录，不再经过输入目录下的临时工作区，因此跨盘输出也不会产生额外的落地后复制或移动。
+## passwords
 
-不同监控目录的输出根不能互为严格的祖先与子目录；相同的输出根可以由多个监控目录共享，具体任务仍由 Pipeline 的输出预留处理。
+| 字段 | 默认 | 说明 |
+| --- | ---: | --- |
+| `clipboard_passwords_enabled` | `true` | 普通 CLI 启动时是否读取当前剪贴板文本。 |
+| `directory_passwords_enabled` | `true` | 是否读取归档同目录的密码文件。 |
+| `directory_passwords_max_file_bytes` | `1048576` | 同目录密码文件的最大读取大小。 |
+| `directory_passwords_max_password_length` | `512` | 单条密码的最大长度。 |
+
+同目录密码文件名为 `.sunpack-passwords.txt`，一行一个密码。归档解压时，候选来源按“最近成功密码 → 同目录密码 → CLI 参数和密码文件 → 剪贴板 → 内置密码”合并并去重；在归档加密状态尚未确定时，空密码也可能作为首个候选尝试。`--no-builtin-pw` 和 `--no-dir-pw` 可以分别关闭内置密码和同目录密码。
 
 ## extraction
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `write_progress_manifest` | `bool` | 是否把内部 progress manifest 写成输出目录中的 `.sunpack/extraction_manifest.json`；默认只保留在内存里供 verification 使用。 |
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `write_progress_manifest` | `bool` | `false` | 是否把进度清单写入输出目录的 `.sunpack/extraction_manifest.json`。 |
+| `content_requirement` | `str` | `complete` | 内容要求，可选 `complete` 或 `allow_partial`。 |
 
-## input_planning / analysis
+## embedded_scan
 
-两组配置分别对应业务输入规划和通用分析能力。正常主流程由 Detection/input planner 调用 Analysis 形成 worker 输入。
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `true` | 是否允许扫描文件载体中的嵌入归档。 |
 
-`input_planning` 字段：
+该设置不依赖扩展名。系统会优先使用低成本头尾信息；需要时对获准候选执行受边界约束的完整嵌入扫描。同一输入已经得到的嵌入扫描结果会在后续判断中复用。
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `enabled` | `bool` | 是否启用归档输入规划。 |
-| `cache_size` | `int` | request 级中立 Analysis report 缓存数量。输入规划按任务顺序执行，不再由 Python 任务 worker 数量控制。 |
+## input_planning
 
-`analysis` 只配置单次通用能力调用：
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `enabled` | `bool` | `true` | 是否启用归档输入规划。 |
+| `cache_size` | `int` | `512` | 单次请求中保留的分析报告数量。 |
 
-| 字段 | 类型 | 说明 |
-| --- | --- | --- |
-| `max_concurrent_reads` | `int` | 单视图并发读取上限。 |
-| `shared_cache_mb` | `int` | 二进制视图共享读缓存。 |
-| `max_read_mb_per_archive` | `int` / `null` | 单归档最多读取大小，`null` 表示不限。 |
-| `prepass` | `dict` | signature prepass 配置。 |
-| `fuzzy` | `dict` | fuzzy binary profile 配置。 |
-| `thresholds.extractable_confidence` | `float` | analysis 认为可直接抽取的置信度。 |
-| `modules` | `list[dict]` | ZIP/RAR/7z/TAR/压缩流等结构模块开关和参数。 |
+输入规划把结构分析结果转换为普通归档、分卷和嵌入输入；它不改变源文件。
 
-完整 embedded 深扫由顶层共享配置控制：
+## analysis
 
-```json
-"embedded_scan": {
-  "enabled": true
-}
-```
+| 字段 | 默认 | 说明 |
+| --- | ---: | --- |
+| `max_concurrent_reads` | `1` | 单个输入的并发读取上限。 |
+| `shared_cache_mb` | `64` | 共享二进制读取缓存大小。 |
+| `max_read_mb_per_archive` | `256` | 单个归档的读取上限；`null` 表示不限。 |
+| `prepass.enabled` | `true` | 是否读取头尾区域进行快速预检。 |
+| `prepass.head_bytes` / `tail_bytes` | `1048576` / `1048576` | 头部和尾部预检大小。 |
+| `fuzzy.enabled` | `true` | 是否启用二进制特征分析。 |
+| `thresholds.extractable_confidence` | `0.85` | 可直接抽取的最低置信度。 |
 
-`embedded_scan.enabled` 默认为 `true`。Analysis 先执行低成本头尾 prepass；只有没有选出可解压结构时，才调用其内部 Rust 全流 scanner。Detection 已经完成扫描时，调用层把完整 prepass 放入 `AnalysisRequest`，避免重复读取文件。完整深扫没有 Python fallback、扫描窗口或最大命中数配置。
+默认结构模块及主要上限：
 
-重要行为：
-
-- Analysis 的结构事实用于输入规划和 verification，不触发额外的修改路径。
-- Input planning cache 以归档 source fingerprint 分组。
-- 结构读取和大文件 I/O 走 Rust binary view，不保留 Python 大文件解析 fallback。
-
-常见 module 参数：
-
-| 模块 | 常用字段 |
+| 模块 | 默认上限 |
 | --- | --- |
-| `zip` | `max_cd_entries_to_walk` |
-| `rar` | `max_blocks_to_walk` |
-| `seven_zip` | `max_next_header_check_bytes` |
-| `tar` | `max_entries_to_walk` |
-| `gzip` / `bzip2` / `xz` / `zstd` / `tar_*` | `max_probe_bytes` |
+| `zip` | `max_cd_entries_to_walk = 64` |
+| `rar` | `max_blocks_to_walk = 4096` |
+| `seven_zip` | `max_next_header_check_bytes = 1048576` |
+| `tar` | `max_entries_to_walk = 64` |
+| `gzip`、`bzip2`、`xz`、`zstd`、`tar_gz`、`tar_bz2`、`tar_xz`、`tar_zst` | `max_probe_bytes = 4194304` |
+
+`fuzzy.modules.binary_profile` 默认使用 65536 字节窗口、最多 8 个窗口、最多 1048576 字节样本；熵阈值为高 `6.8`、低 `3.5`、跳变 `1.25`，ngram top-k 为 `8`，ngram 样本上限为 `262144` 字节。
 
 ## verification
 
-`verification` 不再是简单分数阈值模型。它会汇总多个 method 的观察结果，计算完整度、文件状态、source integrity、recoverable upper bound 和下一步决策。
+校验会综合解压退出状态、输出存在性、条目命中、清单大小、CRC 和样本可读性，再给出完整、部分或失败结论。
 
-| 字段 | 类型 | 说明 |
+| 字段 | 默认 | 说明 |
+| --- | ---: | --- |
+| `enabled` | `true` | 是否启用结果校验。 |
+| `max_retries` | `2` | 校验失败后的普通重试次数。 |
+| `cleanup_failed_output` | `true` | 重试前是否清理失败输出。 |
+| `complete_accept_threshold` | `0.999` | 完整结果最低完整度。 |
+| `partial_accept_threshold` | `0.2` | 部分结果最低完整度。 |
+| `retry_on_verification_failure` | `true` | 是否允许校验失败后重试。 |
+| `methods` | 见下表 | 有序校验方法列表。 |
+
+默认方法及关键参数：
+
+| 方法 | 关键参数 | 作用 |
 | --- | --- | --- |
-| `enabled` | `bool` | 是否启用解压结果校验流水线。 |
-| `max_retries` | `int` | verification 失败后的普通重试次数。 |
-| `cleanup_failed_output` | `bool` | 重试前是否清理失败输出目录。 |
-| `accept_partial_when_source_damaged` | `bool` | 源归档损坏时是否允许接受部分恢复结果。 |
-| `partial_min_completeness` | `float` | 部分恢复最低完整度。 |
-| `complete_accept_threshold` | `float` | complete 判定完整度阈值。 |
-| `partial_accept_threshold` | `float` | partial 判定完整度阈值。 |
-| `retry_on_verification_failure` | `bool` | verification 失败时是否允许普通重试。 |
-| `methods` | `list[dict]` | 有序 verification method 列表。 |
-
-内置 method：
-
-| 方法 | 说明 |
-| --- | --- |
-| `extraction_exit_signal` | 消费 worker 状态、诊断和 progress manifest。 |
-| `output_presence` | 检查输出目录是否存在、是否为空，并合并 worker manifest 进度。 |
-| `expected_name_presence` | 用 detection/analysis 提供的条目名样本检查输出命中情况。 |
-| `manifest_size_match` | 用归档条目数和原始大小估算完整度。 |
-| `archive_test_crc` | 用 7z.dll 读取归档状态，并由 Rust 扫描输出、建立 path/basename 索引、计算 CRC 和覆盖率。 |
-| `sample_readability` | 用 Rust 抽样读取输出文件头尾，确认产物基本可读。 |
-
-`archive_test_crc` 和 `sample_readability` 当前默认启用。前者已经 Rust 化输出索引和 CRC 比较，适合大量小文件场景。
+| `extraction_exit_signal` | `enabled: true` | 读取解压状态、诊断和进度清单。 |
+| `output_presence` | `enabled: true` | 检查输出目录及输出内容。 |
+| `expected_name_presence` | `max_expected_names: 50`、`required_match_ratio: 0.8` | 检查预期条目名命中率；缺失惩罚为 `10/35/60`。 |
+| `manifest_size_match` | `max_expected_names: 2000`、文件数容差 `2` 或 `5%`、大小容差 `1048576` 字节或 `2%` | 对比归档清单和输出规模。 |
+| `archive_test_crc` | `max_items: 200000`、`max_reported_items: 20` | 读取归档状态并比较 CRC。 |
+| `sample_readability` | `max_samples: 64`、`read_bytes: 4096`、`max_reported_items: 20` | 抽样读取输出文件，确认产物基本可读。 |
 
 ## detection
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `enabled` | `bool` | `true` | detection 层总开关。设为 `false` 时不执行 detection 规则，只对常规归档扩展名/分卷入口生成任务；需要完全绕过初始扫描时使用 `extract --direct-file <file>`。 |
+| `enabled` | `bool` | `true` | 检测总开关。关闭后仍会按常规归档扩展名和分卷入口生成任务；完全绕过初始扫描可使用 `extract --direct-file`。 |
 
-## detection.fact_collectors
+### fact_collectors
 
 | 名称 | 作用 |
 | --- | --- |
 | `file_facts` | 采集路径、名称、父目录、大小等基础信息。 |
 | `magic_bytes` | 读取文件头 magic bytes。 |
-| `scene_markers` | 采集目录场景 marker，供 `scene_facts` 处理器使用。 |
 
-## detection.processors
+### processors
 
 | 名称 | 作用 |
 | --- | --- |
-| `embedded_archive` | 对普通归档检测尚未解决且入选大小覆盖集的文件调用共享 embedded scanner。 |
-| `scene_facts` | 识别游戏、程序、资源目录等场景。 |
+| `embedded_archive` | 处理普通归档识别未解决且获准进行嵌入扫描的文件。 |
 | `zip_structure` | 检查 ZIP local header。 |
 | `zip_eocd_structure` | 检查 ZIP EOCD 和 central directory。 |
 | `tar_header_structure` | 检查 TAR header checksum 和 ustar marker。 |
 | `compression_stream_structure` | 检查 gzip、bzip2、xz、zstd 轻量流结构。 |
 | `pe_overlay_structure` | 检查 PE overlay 中的归档载荷。 |
+| `executable_carrier` | 检查可执行载体及其归档区域，默认读取上限 `8388608` 字节。 |
 | `seven_zip_structure` | 检查 7z signature、start header CRC、next header 范围和 NID。 |
 | `rar_structure` | 检查 RAR4/RAR5 signature、main header 和 block/header walk。 |
 
-嵌入扫描只有一个成本字段，位于 `embedded_payload_identity` 规则：
+### rule_pipeline.precheck
 
-| 字段 | 说明 |
+默认规则：
+
+| 规则 | 作用 |
 | --- | --- |
-| `deep_scan_single_candidate_ratio` | 单个未解决逻辑候选达到未解决候选总字节数的最低占比；默认 `0.3`。达到阈值的候选均执行可靠完整扫描。 |
+| `zip_structure_accept` | 结构可信的 ZIP 快速接受；默认允许空 ZIP。 |
+| `tar_structure_accept` | 结构可信的 TAR 快速接受。 |
+| `seven_zip_structure_accept` | start/next header 可信的 7z 快速接受，next header 检查上限 `1048576` 字节。 |
+| `rar_structure_accept` | RAR main header/block walk 可信时接受，首个 header 检查上限 `1048576` 字节。 |
+| `compression_stream_accept` | 完整校验 gzip、bzip2、xz、zstd 流。 |
+| `embedded_payload_identity` | 先识别可执行载体，再对获准且找到可靠嵌入归档的文件接受。 |
 
-单候选占比决定“哪些逻辑候选获准执行整个 embedded payload precheck 模块”，不限制单个候选的读取范围。未获准的候选不会解析 PE、识别安装器或扫描嵌入归档。分卷只作为一个逻辑候选参与总大小计算，成员卷不会重复计数。获准后先识别 executable carrier；命中已知安装器会立即拒绝且不启动完整嵌入扫描。Detection 复用 `sunpack.analysis.embedded` 的 Rust scanner、文件身份缓存和结果契约。嵌入扫描不检查扩展名，也没有窗口、最大命中数或扫描档位；结构校验得到的候选和命中图会传给 Analysis，避免再次执行全流扫描。
+`embedded_payload_identity.deep_scan_single_candidate_ratio` 默认是 `0.3`：单个逻辑候选占未解决候选总字节数达到 30% 时执行完整嵌入扫描。`0` 关闭该阶段，`1` 只选择占全部大小的候选。分卷按一个逻辑候选计数，成员卷不会重复计算。
 
-## detection.rule_pipeline
+## 密码表和密码文件
 
-Detection 不调用完整 analysis scheduler 做确认。Detection 中的任意位置 embedding 由递归控制器授权后的 `embedded_payload_identity` 执行；绕过 Detection 的任务则由 Analysis 在头尾分析未解决时调用同一个 scanner。其他格式事实均由有界 Rust probe 产生。大文件压缩流只读取头尾窗口，ZIP 读取 EOCD 尾窗和有限目录项，7z/RAR/TAR 读取受配置上限约束的头部或条目。
-
-检测规则只保留严格 precheck：完整结构的识别、载体否决与 embedded payload 识别。每个格式规则声明常见格式和扩展名；关系层提供逻辑分卷提示后，匹配规则会被临时提前，校验失败再回到配置顺序。
-
-每条规则至少包含：
-
-```json
-{"name": "zip_structure_accept", "enabled": true}
-```
-
-`config validate` 会校验规则名和规则 schema。默认配置的主要规则：
-
-| 规则 | 层 | 说明 |
-| --- | --- | --- |
-| `zip_structure_accept` | precheck | 结构可信的 ZIP 快速接受。 |
-| `tar_structure_accept` | precheck | 结构可信的 TAR 快速接受。 |
-| `seven_zip_structure_accept` | precheck | start/next header 可信的 7z 快速接受。 |
-| `rar_structure_accept` | precheck | main header/block walk 可信的 RAR 快速接受。 |
-| `compression_stream_accept` | precheck | 完整校验 gzip、bzip2、xz、zstd 流并快速接受。 |
-| `embedded_payload_identity` | precheck | 先否决已知安装器，再对获准深扫且找到可靠嵌入归档的文件直接接受。 |
-格式字段由 Rust probe 读取，结构不满足 precheck 时直接保留失败或非归档事实。
-
-### deep_scan_single_candidate_ratio
-
-默认扫描普通检测尚未解决集合中，单个逻辑候选大小占该集合总大小至少 30% 的候选：
-
-```json
-{
-  "detection": {
-    "rule_pipeline": {
-      "precheck": [
-        {
-          "name": "embedded_payload_identity",
-          "deep_scan_single_candidate_ratio": 0.3
-        }
-      ]
-    }
-  }
-}
-```
-
-`0` 禁用该阶段。阈值使用 `>=` 判断，所有达到阈值的候选都会扫描；默认 `0.3` 因而同一集合最多选中三个正大小候选。`1` 只会扫描独占未解决候选总大小的单个候选。例如只扫描占比至少 50% 的候选：
-
-```json
-{
-  "name": "embedded_payload_identity",
-  "enabled": true,
-  "deep_scan_single_candidate_ratio": 0.5
-}
-```
-
-## 密码文件
-
-`builtin_passwords.txt` 是内置高频密码表，按每行一个密码读取。不存在时程序会尝试创建默认文件。
-
-`passwords.clipboard_passwords_enabled` 控制普通 CLI 启动时是否读取当前剪贴板文本作为本次运行的密码来源。该开关不影响 watch 服务的剪贴板监控；watch 监控仍由 `watch.clipboard_monitor_enabled` 控制，并会把最近剪贴板密码合并进内置密码文件的托管区。
-
-密码来源顺序：
-
-1. `--password` 和 `--pw-file` 提供的用户密码。
-2. 最近成功密码。
-3. `builtin_passwords.txt` 内置密码。
-
-使用 `--no-builtin-pw` 可禁用内置密码。
+`builtin_passwords.txt` 每行保存一个内置密码；文件缺失时程序会尝试创建默认文件。同目录密码文件为 `.sunpack-passwords.txt`，受 `passwords` 配置节的大小和长度限制。
 
 ## 修改建议
 
-- 想减少误解压：优先调 `filesystem.scan_filters` 和 precheck 规则。
-- 想提高召回率：优先调 `embedded_payload_identity` 和输入规划参数。
-- 想看为什么失败或为什么接受：跑 `inspect -v`，再看 verification coverage。
+- 想减少误解压：调整 `filesystem.scan_filters` 和 `detection.rule_pipeline.precheck`。
+- 想提高伪装归档和载体的召回率：检查 `embedded_scan`、`detection.processors` 和 `analysis`。
+- 想分析一次输入的判定过程：使用 `inspect --analyze -v`。
 - 修改后运行 `python sunpack.py config validate`。

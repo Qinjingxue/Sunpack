@@ -14,13 +14,15 @@ sunpack.exe <command> [options] [paths...]
 
 顶层命令：
 
-- `extract`：预检查、扫描、解压、后处理和清理。
-- `watch`：监控目录，文件稳定后自动进入 extract pipeline。
-- `scan`：只扫描可解压任务，不修改文件。
-- `inspect`：输出每个文件的检测细节，不修改文件。
-- `passwords`：查看实际会参与尝试的密码列表。
-- `config`：查看或校验简化配置与高级配置合并后的有效配置。
-- `doctor`：只读检查配置和运行环境，不启动处理流程。
+| 命令 | 作用 |
+| --- | --- |
+| `extract` | 扫描、识别、解压、校验、后处理和清理。 |
+| `watch` | 监控目录，文件稳定后自动处理。 |
+| `scan` | 只扫描并列出可解压任务，不修改文件。 |
+| `inspect` | 输出检测和结构分析细节，不修改文件。 |
+| `passwords` | 查看当前命令可用的密码来源汇总。 |
+| `config` | 查看或校验合并后的有效配置。 |
+| `doctor` | 只读检查配置和运行环境。 |
 
 ## 通用输出参数
 
@@ -30,13 +32,11 @@ sunpack.exe <command> [options] [paths...]
 | --- | --- |
 | `-j`, `--json` | 以 JSON 格式输出结果，适合脚本调用。 |
 | `-q`, `--quiet` | 减少终端输出。 |
-| `-v`, `--verbose` | 输出更多调试和检测细节。 |
-| `--pause` | 命令结束后等待按键退出，适合双击或右键菜单。 |
+| `-v`, `--verbose` | 输出更多检测和诊断细节。 |
+| `--pause` | 命令结束后等待按键退出。 |
 | `--no-pause` | 命令结束后不暂停。 |
 
-`passwords` 只支持 `--json`，不支持 `--quiet`、`--verbose`、`--pause`。`config` 支持 `--json` 和 `--quiet`。
-
-所有命令的 `--json` 输出都遵循同一外层形状：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`。不同命令会根据语义填充 `items` 或 `tasks`。
+`passwords` 只支持 `--json` 以及密码输入参数；`config` 支持 `--json` 和 `--quiet`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
 
 ## extract
 
@@ -46,30 +46,34 @@ sunpack.exe <command> [options] [paths...]
 python sunpack.py extract [options] <paths...>
 ```
 
-`paths` 可以是一个或多个文件、目录。目录会被扫描并生成解压任务。
+`paths` 可以是一个或多个文件、目录。目录按配置扫描并生成解压任务。
 
 参数：
 
 | 参数 | 说明 |
 | --- | --- |
-| `-p PASSWORD`, `--password PASSWORD` | 手动提供一个解压密码，可重复传入多次。 |
+| `-p PASSWORD`, `--password PASSWORD` | 提供一个解压密码，可重复传入。 |
 | `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
 | `--ask-pw` | 在终端交互输入密码，空行结束。 |
-| `--no-builtin-pw` | 禁用内置高频密码表。 |
-| `--recur VALUE` | 覆盖递归解压设置。当前解析器接受正整数、`*`、`?`。 |
-| `--cleanup VALUE` | 覆盖成功解压后的原压缩包处理方式：`d` 删除，`r` 回收站，`k` 不动。 |
-| `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录。相对路径基于调用目录解析为绝对路径。 |
-| `--direct-file` | 把每个输入路径当作归档文件，跳过初始目录扫描和 detection，直接进入 analysis -> extraction -> verification -> postprocess。只适合明确指定文件。 |
-| `--flatten` | 解压后扁平化单一顶层目录。 |
+| `--no-builtin-pw` | 禁用内置密码表。 |
+| `--no-dir-pw` | 禁用归档同目录的 `.sunpack-passwords.txt`。 |
+| `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
+| `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
+| `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
+| `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录；相对路径按当前命令目录解析。 |
+| `--flatten` | 解压后提升单一顶层目录的内容。 |
 | `--no-flatten` | 保留解压目录结构。 |
+| `--write-manifest` | 把解压进度清单写入输出目录。 |
+| `--allow-partial`, `--ap` | 允许把部分恢复结果作为可接受结果。 |
+| `--direct-file` | 将每个输入路径直接作为归档尝试，跳过目录扫描和自动候选发现。 |
 
-`--out-dir` 指定输出根目录后，解压结果落在 `输出根目录 / 输入路径相对 common_root 的部分 / 压缩包名`；不指定时落在压缩包旁边。嵌套压缩包如果在输出根目录内部生成，其子压缩包仍然解压在自己旁边。
+`--out-dir` 指定后，结果落在“输出根 / 输入路径相对公共根的部分 / 归档名”下；未指定时落在归档旁边。嵌套归档在输出根内生成时，子归档仍使用自身所在位置计算输出。
 
 `--recur` 的取值：
 
 - `1`、`2`、`3` 等正整数：固定递归轮数。
-- `*`：无限递归，内部上限为 999 轮。
-- `?`：提示模式，内部上限为 999 轮。
+- `*`：持续递归，最多 999 轮。
+- `?`：每轮询问是否继续，最多 999 轮。
 
 示例：
 
@@ -85,10 +89,10 @@ python sunpack.py extract D:\Archives -o E:\Unpacked
 退出码：
 
 - `0`：所有任务均完整成功。
-- `1`：至少一个解压任务失败。
+- `1`：至少一个任务失败。
 - `2`：参数、路径或配置错误。
 - `3`：运行时异常。
-- `4`：没有失败任务，但至少一个任务仅部分成功。
+- `4`：没有失败任务，但至少一个任务只有部分成功。
 
 ## scan
 
@@ -98,15 +102,15 @@ python sunpack.py extract D:\Archives -o E:\Unpacked
 python sunpack.py scan [options] <paths...>
 ```
 
-`scan` 会扫描输入路径，输出识别到的解压任务、分卷关系、检测扩展名、分数和命中规则。它不会解压，也不会清理文件。
+`scan` 输出识别到的解压任务、分卷关系、检测扩展名、判定和命中规则，不会解压或清理文件。
 
-目录扫描范围受 `filesystem.directory_scan_mode`、`filesystem.scan_filters_enabled` 和 `filesystem.scan_filters` 影响；被黑名单、目录剪枝、阻止扩展名、大小范围或修改时间范围过滤掉的文件不会进入 detection。
+`--deep-detect` 会对符合条件但普通检测未解决的候选执行完整嵌入扫描。目录范围受 `filesystem.directory_scan_mode`、`filesystem.scan_filters_enabled` 和 `filesystem.scan_filters` 影响。
 
 示例：
 
 ```powershell
 python sunpack.py scan D:\Downloads
-python sunpack.py scan D:\Downloads --json
+python sunpack.py scan D:\Downloads --deep-detect --json
 python sunpack.py scan D:\Downloads -v
 ```
 
@@ -118,22 +122,24 @@ python sunpack.py scan D:\Downloads -v
 python sunpack.py inspect [options] <paths...>
 ```
 
-`inspect` 是 CLI 的只读 detection diagnostics 命令：它会列出候选文件的判定结果、决策阶段、停止原因和 fact 错误。
+`inspect` 是只读检测诊断命令，会列出候选文件的判定结果、处理阶段、停止原因和事实错误。
 
-使用 `-v` 时，文本输出会额外打印生效配置、命中规则、打分明细、确认层结果和 fact 错误；JSON 输出会保留这些结构化字段，便于对误判做回归用例。
-
-额外参数：
+参数：
 
 | 参数 | 说明 |
 | --- | --- |
 | `--archives-only` | 只显示最终判定为可解压的项目。 |
+| `--analyze` | 为可解压或待确认候选附加格式、片段、损坏标记和候选摘要。 |
+| `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
+
+`-v` 会额外打印有效配置、命中规则、评分细节和事实错误；JSON 输出保留对应结构化字段。
 
 示例：
 
 ```powershell
 python sunpack.py inspect D:\Downloads
-python sunpack.py inspect D:\Downloads --archives-only
-python sunpack.py inspect D:\Downloads --json
+python sunpack.py inspect D:\Downloads --archives-only --analyze
+python sunpack.py inspect D:\Downloads --deep-detect --json
 python sunpack.py inspect D:\Downloads -v
 ```
 
@@ -145,9 +151,7 @@ python sunpack.py inspect D:\Downloads -v
 python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
 ```
 
-`watch` 会监听一个或多个文件夹。服务启动时只创建一个常驻 pipeline engine 和一个 native worker；文件持续静默达到配置阈值后提交到 engine，多个提交直接进入 worker 内部队列，由 worker 的线程调度器统一处理。相同快照不因解压结果而重试，新分卷和密码源变化会开启新的活跃周期。
-
-监控目录本身存放在程序目录下的 `sunpack_watch_roots.txt`，一行一个目录。每行可以只写输入目录，也可以用 `|` 分隔显式指定该目录的输出根目录：
+监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。每行可以只写输入目录，也可以用 `|` 指定输出根：
 
 ```text
 C:\Downloads
@@ -155,28 +159,28 @@ E:\Archives | E:\Output
 F:\Incoming | .
 ```
 
-- `C:\Downloads`：只写输入目录，沿用 `watch.out_dir`（默认 `.`，即输出到该输入目录本身）。
-- `E:\Archives | E:\Output`：该目录使用独立的输出根目录，可以跨盘。
-- `F:\Incoming | .`：显式写成本身。
-- 相对输出路径相对于它所在行的输入目录解析，因此不受 watch 服务进程工作目录影响。
-- 解压直接写入该输入对应的输出根目录；输出根目录可以跨盘，不再需要临时目录和后续提升。
+只写输入目录时使用 `watch.out_dir`；相对输出路径按该输入目录解析并持久化为绝对路径。输出根可以跨盘。`watch` 只观察每个根目录的直接文件，不递归监听子目录；输入根需要位于 NTFS 卷且有可读取的 USN Journal。
 
-每个监控目录在服务内部只有一个绝对的输出根目录；`watch.out_dir` 只对没有写输出路径的旧格式行生效。`list` 按输入目录列出监控目录，`remove` 只按输入目录删除，输出根目录中的内容不会被删除。
+子命令和参数：
 
-不同监控目录的输出根不能互为严格的祖先与子目录；相同的输出根可以共享。
+| 子命令 | 参数 | 说明 |
+| --- | --- | --- |
+| `start` | `--once` | 执行一次监控扫描后退出。 |
+| `start` | `--no-tray` | 持续运行时关闭托盘入口。 |
+| `start` | `--initial-scan` | 启动时处理已有文件。 |
+| `add PATH...` | `-o/--out-dir DIR` | 添加监控根；只能同时添加一个路径。 |
+| `add PATH...` | `--start` | 添加后启动持续监控。 |
+| `add PATH...` | `--initial-scan` | 添加后对新根执行初始扫描。 |
+| `remove PATH...` | — | 按输入目录移除监控根，并清理该根的同目录密码文件。 |
+| `list` | — | 列出持久化的输入目录。 |
+| `reload` | — | 重新读取配置和监控根。 |
+| `stop` | — | 停止持续监控。 |
+| `status` | — | 显示运行状态、待处理数量、错误和根目录。 |
+| `startup enable\|disable\|status` | — | 管理当前用户登录启动项。 |
 
-示例：
+`start` 会持续运行直到收到停止请求；`start --once` 完成一次当前调度后退出。文件写入、移动或修改会触发活跃周期，文件准备好后按配置的静默策略提交处理。新分卷到达或密码来源变化会重新激活受影响任务。
 
-```powershell
-python sunpack.py watch add D:\Downloads
-python sunpack.py watch add D:\Incoming --initial-scan
-python sunpack.py watch add D:\Downloads -o unpacked
-python sunpack.py watch list
-python sunpack.py watch start --initial-scan
-python sunpack.py watch reload
-```
-
-`watch add` 的 `-o` / `--out-dir` 只能和一个输入目录一起使用。相对输出路径按该输入目录解析并以绝对路径持久化；已有目录不会因为重复 `add` 而更新输出映射，需先 `remove` 再重新 `add`。
+`add` 的 `-o/--out-dir` 只能和一个输入目录一起使用。重复添加同一输入目录不会改变已有输出映射；先 `remove` 再 `add` 才能更新映射。不同监控根的输出根不能互为严格的祖先和子目录，相同输出根可以共享。
 
 ## passwords
 
@@ -191,14 +195,13 @@ python sunpack.py passwords [options]
 | 参数 | 说明 |
 | --- | --- |
 | `-j`, `--json` | 以 JSON 输出密码来源汇总。 |
-| `-p PASSWORD`, `--password PASSWORD` | 手动提供密码，可重复传入。 |
+| `-p PASSWORD`, `--password PASSWORD` | 提供密码，可重复传入。 |
 | `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
 | `--ask-pw` | 在终端交互输入密码。 |
-| `--no-builtin-pw` | 不使用内置高频密码表。 |
+| `--no-builtin-pw` | 不使用内置密码表。 |
+| `--no-dir-pw` | 该命令没有目标归档，不会读取同目录密码文件；在 `extract` 中用于关闭同目录密码。 |
 
-密码合并顺序为：最近成功密码、同目录密码、命令行密码、剪贴板密码、内置密码。重复项会去重。
-
-`passwords` 命令展示本次命令参数、配置开启时启动时读取的当前剪贴板文本，以及内置密码合并后的列表；最近成功密码是在一次 `extract` 运行过程中由 `passwords` 层维护的运行态列表。
+`passwords` 没有归档路径，因此输出命令行输入、最近成功密码、剪贴板密码和内置密码的汇总；它不会为某个目录加载 `.sunpack-passwords.txt`。归档解压时的候选顺序是“最近成功密码 → 同目录密码 → CLI 参数和密码文件 → 剪贴板 → 内置密码”，重复项会去重，必要时会先尝试空密码。
 
 示例：
 
@@ -216,12 +219,10 @@ python sunpack.py passwords --pw-file .\passwords.txt --json
 python sunpack.py config [options] <show|validate>
 ```
 
-子命令：
-
 | 子命令 | 说明 |
 | --- | --- |
-| `show` | 打印当前读取到的配置文件内容。 |
-| `validate` | 校验 JSON、规则名、规则配置 schema 和 fact schema。 |
+| `show` | 打印当前读取到的有效配置。 |
+| `validate` | 校验 JSON、字段值、检测规则名和规则配置。 |
 
 参数：
 
@@ -238,7 +239,6 @@ python sunpack.py config validate
 python sunpack.py config validate --json
 ```
 
-
 ## doctor
 
 用法：
@@ -247,18 +247,24 @@ python sunpack.py config validate --json
 python sunpack.py doctor [--json] [--quiet]
 ```
 
-`doctor` 只读检查配置、`sunpack_native`、`7z.dll`、SevenZip worker、Toast native self-test，以及已配置的 watch roots。不存在的 watch root 只报告警告；不启动 watch、worker 或真实解压，也不修改注册表。存在失败项时退出码为 `1`，只有警告或跳过项时退出码仍为 `0`。
-
+`doctor` 只读检查配置、原生扩展、`7z.dll`、SevenZip worker、Windows 通知能力以及已配置的监控根。不存在的监控根报告为警告；命令不会启动持续监控或真实解压，也不会修改注册表。存在失败项时退出码为 `1`，只有警告或跳过项时退出码为 `0`。
 
 ## Windows 右键菜单
 
-项目提供当前用户级右键菜单脚本：
+当前用户级右键菜单脚本：
 
 ```powershell
 .\scripts\register_context_menu.ps1
 .\scripts\unregister_context_menu.ps1
 ```
 
-发行包内的注册脚本会使用脚本父目录中的 `sunpack.exe`，因此不依赖外层目录名。从源码树运行时，脚本也会识别唯一的 `dist/sunpack-*/sunpack.exe`；若存在多个构建产物，必须用 `-AppPath` 明确选择。找不到打包程序时才使用 `python sunpack.py`。卸载脚本只删除固定注册表键，不依赖安装目录。
+发行包内的注册脚本使用脚本父目录中的 `sunpack.exe`。从源码树运行时，脚本会识别唯一的 `dist/sunpack-*/sunpack.exe`；存在多个构建产物时使用 `-AppPath` 明确指定。找不到打包程序时使用 `python sunpack.py`。
 
-文件夹和目录空白处菜单保留解压、监控和取消监控动作；任意文件的 `*` 菜单只提供直接解压和交互输入密码解压，分别执行 `extract "%1" --pause` 与 `extract "%1" --ask-pw --pause`，输出默认落在归档旁边。
+文件夹和目录空白处菜单提供解压、监控和取消监控动作；任意文件菜单提供直接解压和交互输入密码解压，分别相当于：
+
+```text
+extract "%1" --pause
+extract "%1" --ask-pw --pause
+```
+
+输出默认落在归档旁边。

@@ -10,7 +10,7 @@
 4. `app` 只做 CLI 参数、交互和输出适配。
 5. `support` 只放跨领域基础设施和外部 ABI 绑定，不放业务策略。
 6. Rust/C++ 原生层承接性能热点和 ABI 适配，不拥有最终业务 decision。
-7. 配置别名属于用户接口，可以保留；内部兼容壳、Python 逻辑 fallback 和旧接口桥应避免堆积。
+7. 配置别名属于用户接口，可以保留；新增内部适配层或 Python fallback 必须有明确的边界和测试。
 
 ## 推荐依赖方向
 
@@ -107,7 +107,7 @@ contracts
 
 ### filesystem
 
-`filesystem` 负责目录遍历、过滤、`DirectorySnapshot` 构建，以及 watchdog 监控能力。watcher 复用 `filesystem.scan_filters`，输入从活跃态进入静默态时交给调用方注入的主流程 runner；它不按扩展名或处理结果自行推测重试时机。
+`filesystem` 负责目录遍历、过滤、`DirectorySnapshot` 构建，以及 watchdog 监控能力。watcher 复用 `filesystem.scan_filters`，输入从活跃态进入静默态时交给调用方注入的主流程 runner；它不按扩展名或处理结果自行推测重试时机。Windows watch 根的 NTFS/USN 校验和 USN reason 查询由专门的 native 组件负责，watcher 只消费观察结果。
 
 ### relations
 
@@ -131,8 +131,8 @@ contracts
 
 目录扫描和关系分组由 Coordinator 驱动。Detection 可通过 Analysis 公共能力获得中立结构证据，并独自拥有候选授权、规则、评分以及归档输入规划。
 
-- `facts`：采集初等事实，例如路径、大小、magic bytes、scene marker。
-- `processors`：从初等 facts 推导高等 facts，例如结构事实、embedded payload、scene context、7z probe/test。
+- `facts`：采集初等事实，例如路径、大小和 magic bytes。
+- `processors`：从初等 facts 推导结构事实、embedded payload 和 7z probe/test 结果。
 - `rules`：只读 facts 和配置，输出 accept/reject/confirm。
 
 规则层不应依赖 processor 实现细节；共享默认值放到公共 constants/config 模块。
@@ -172,6 +172,14 @@ contracts
 `native/sunpack_native` 承接跨平台热点：目录扫描、二进制视图、signature prepass、格式 probe、carrier scan、输出 CRC/readability、输出文件索引匹配、密码 fast verifier 等。
 
 `native/sevenzip_bridge` 承接 Windows 7z.dll ABI：archive probe/test、密码数组尝试、archive state manifest 和 `sunpack_sevenzip_worker.exe` 解压。
+
+### Windows Watch Broker / USN
+
+`native/sunpack_usn_core` 是 Windows-only 的共享 Rust crate，负责卷标识、USN Journal 探测、有限范围的 reason 读取和 named-pipe 客户端协议。`native/sunpack_watch_broker` 编译为 Windows service，集中持有卷级 Journal 访问能力；`sunpack_native` 只向 Python 暴露文件观察和 lease 能力。
+
+watch 启动前必须确认根目录位于 NTFS 卷且 Journal 可读。文件观察先读取文件元数据和当前 USN；当前 USN 超过上次记录时，客户端请求 broker 读取 `previous_usn < usn <= current_usn` 的 reason，单次最多 1 MiB。watcher 根据 reason 区分内容变化和元数据变化，并把内容变化交给活跃/静默状态机。
+
+标准服务身份是 `SunPackWatchBroker`，标准管道为 `\\.\pipe\SunPack.WatchBroker.v1`。客户端以进程级 lease 使用服务：首个 lease 建立连接，嵌套 lease 复用连接，最后一个 lease 释放连接。测试只能使用 `SunPackWatchBrokerTest_` 和 `\\.\pipe\SunPack.WatchBroker.Test.` 前缀的隔离身份。
 
 ## 禁止清单
 
@@ -235,7 +243,7 @@ sunpack/
   config/       配置读取、校验、归一化和领域配置视图
   contracts/    跨模块数据契约
   coordinator/  pipeline 编排、批量调度和递归
-  detection/    候选检测、fact pipeline、规则判断、scene 策略
+  detection/    候选检测、fact 采集、结构规则判断
   extraction/   worker 解压黑盒和解压结果
   filesystem/   通用目录扫描、过滤和 watcher 监控能力
   passwords/    密码候选、调度和 verifier
@@ -252,5 +260,7 @@ sunpack/
 
 ```text
 native/sunpack_native/  Rust/PyO3 热路径
+native/sunpack_usn_core/ Windows USN 核心与客户端协议
+native/sunpack_watch_broker/ Windows Watch Broker 服务
 native/sevenzip_bridge/ Windows 7z.dll bridge 与 worker
 ```
