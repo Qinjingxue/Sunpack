@@ -1,5 +1,6 @@
 #include "sevenzip_bridge/bridge.hpp"
 #include "internal/sevenzip_paths.hpp"
+#include "internal/password_probe_policy.hpp"
 #include "internal/sevenzip_status.hpp"
 #include "internal/native_runtime_control.hpp"
 #include "internal/native_worker_sizing.hpp"
@@ -70,6 +71,20 @@ sunpack::sevenzip::NativeRuntimeConfig deterministic_runtime_config(std::size_t 
     config.cooldown_windows = 1;
     config.hold_windows = 2;
     return config;
+}
+
+bool check_empty_bounded_password_probe_requires_positive_evidence() {
+    using sunpack::sevenzip::EmptyBoundedPasswordProbeDisposition;
+    using sunpack::sevenzip::empty_bounded_password_probe_disposition;
+    return
+        empty_bounded_password_probe_disposition(false, 0, false) ==
+            EmptyBoundedPasswordProbeDisposition::RejectInconclusive &&
+        empty_bounded_password_probe_disposition(true, 0, false) ==
+            EmptyBoundedPasswordProbeDisposition::RejectInconclusive &&
+        empty_bounded_password_probe_disposition(true, 0, true) ==
+            EmptyBoundedPasswordProbeDisposition::AcceptOpenProof &&
+        empty_bounded_password_probe_disposition(true, 3, false) ==
+            EmptyBoundedPasswordProbeDisposition::TestAllItems;
 }
 
 bool check_runtime_control_uses_only_limit_and_hard_memory_for_admission() {
@@ -319,6 +334,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_password_probe_status_names()) {
         std::cerr << "password probe status name check failed\n";
         return 4;
+    }
+    if (!check_empty_bounded_password_probe_requires_positive_evidence()) {
+        std::cerr << "empty bounded password probe evidence check failed\n";
+        return 15;
     }
     if (!check_runtime_control_uses_only_limit_and_hard_memory_for_admission()) {
         std::cerr << "runtime control admission check failed\n";

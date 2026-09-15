@@ -4,6 +4,8 @@
 
 #include "archive_open_plan.hpp"
 
+#include "password_probe_policy.hpp"
+
 #include "sevenzip_callbacks.hpp"
 
 #include "sevenzip_formats.hpp"
@@ -63,17 +65,25 @@ namespace sunpack::sevenzip
             return archive_type == L"7z" || archive_type == L"rar" || archive_type == L"rar4" || archive_type == L"rar5";
         }
 
-        std::vector<UInt32> bounded_password_probe_indices(IInArchive *archive)
+        struct BoundedPasswordProbeSelection
         {
+            std::vector<UInt32> indices;
+            bool item_count_known = false;
+            UInt32 item_count = 0;
+        };
+
+        BoundedPasswordProbeSelection bounded_password_probe_selection(IInArchive *archive)
+        {
+            BoundedPasswordProbeSelection selection;
             if (!archive)
             {
-                return {};
+                return selection;
             }
-            UInt32 item_count = 0;
-            if (archive->GetNumberOfItems(&item_count) != S_OK)
+            if (archive->GetNumberOfItems(&selection.item_count) != S_OK)
             {
-                return {};
+                return selection;
             }
+            selection.item_count_known = true;
             PROPVARIANT archive_value;
             PropVariantInit(&archive_value);
             const bool solid = archive->GetArchiveProperty(kpidSolid, &archive_value) == S_OK && prop_bool(archive_value);
@@ -87,7 +97,7 @@ namespace sunpack::sevenzip
             };
             std::vector<Candidate> regular;
             bool has_encrypted = false;
-            for (UInt32 index = 0; index < item_count; ++index)
+            for (UInt32 index = 0; index < selection.item_count; ++index)
             {
                 PROPVARIANT value;
                 PropVariantInit(&value);
@@ -110,7 +120,7 @@ namespace sunpack::sevenzip
             }
             if (regular.empty())
             {
-                return {};
+                return selection;
             }
             auto eligible = [has_encrypted](const Candidate &item)
             {
@@ -119,7 +129,7 @@ namespace sunpack::sevenzip
             auto selected = std::find_if(regular.begin(), regular.end(), eligible);
             if (selected == regular.end())
             {
-                return {};
+                return selection;
             }
             if (!solid)
             {
@@ -131,7 +141,8 @@ namespace sunpack::sevenzip
                     }
                 }
             }
-            return {selected->index};
+            selection.indices = {selected->index};
+            return selection;
         }
 
     } // namespace
@@ -318,23 +329,56 @@ namespace sunpack::sevenzip
 
                 ComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
-                const auto probe_indices = bounded_password_probe_indices(archive.get());
+                const auto probe_selection = bounded_password_probe_selection(archive.get());
 
-                if (bounded_password_probe && probe_indices.empty())
+                if (bounded_password_probe && probe_selection.indices.empty())
                 {
-
-                    hr = S_OK;
-
-                    last_op_res = kOpOk;
+                    const auto disposition = empty_bounded_password_probe_disposition(
+                        probe_selection.item_count_known,
+                        probe_selection.item_count,
+                        last_encryption_evidence);
+                    if (disposition == EmptyBoundedPasswordProbeDisposition::AcceptOpenProof)
+                    {
+                        // Header-encrypted empty archives are verified by the successful
+                        // password-bearing Open call itself.
+                        hr = S_OK;
+                        last_op_res = kOpOk;
+                        result.operation_result = last_op_res;
+                    }
+                    else if (disposition == EmptyBoundedPasswordProbeDisposition::TestAllItems)
+                    {
+                        // A non-empty item list with no regular file consists of directory
+                        // entries.  Exercise the handler instead of treating an empty
+                        // selection as an automatically successful password check.
+                        hr = archive->Extract(
+                            nullptr,
+                            static_cast<UInt32>(kAllItems),
+                            kTestMode,
+                            extract_callback.get());
+                        last_op_res = raw_extract_callback->operation_result();
+                        result.operation_result = last_op_res;
+                        last_encryption_evidence = last_encryption_evidence || raw_extract_callback->password_requested();
+                    }
+                    else
+                    {
+                        // Some 7z handlers can open a different archive generation while
+                        // exposing zero items (notably the RAR4 handler on RAR5 SFX input).
+                        // That is not password proof: try the next handler/candidate.
+                        last_hr = S_FALSE;
+                        last_op_res = kOpWrongPassword;
+                        result.operation_result = last_op_res;
+                        archive->Close();
+                        continue;
+                    }
                 }
                 else
                 {
 
                     hr = archive->Extract(
 
-                        bounded_password_probe ? probe_indices.data() : nullptr,
+                        bounded_password_probe ? probe_selection.indices.data() : nullptr,
 
-                        bounded_password_probe ? static_cast<UInt32>(probe_indices.size()) : static_cast<UInt32>(kAllItems),
+                        bounded_password_probe ? static_cast<UInt32>(probe_selection.indices.size()) : static_cast<UInt32>(kAllItems),
 
                         kTestMode,
 
