@@ -1,0 +1,4 @@
+# WinGet manifests are submitted byte-for-byte to microsoft/winget-pkgs and are
+# validated there as YAML. Keep them on LF so the local files, the Git blobs, and
+# the submitted manifests stay identical.
+packaging/winget/manifests/**/*.yaml text eol=lf

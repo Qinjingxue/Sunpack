@@ -26,16 +26,27 @@ $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $packageIdentifier = "Qinjingxue.SunPack"
 $manifestVersion = "1.12.0"
+# Inno Setup AppId from installer/SunPack.iss. Inno escapes a literal leading
+# brace by doubling it, so the registry uninstall key is "<AppId>_is1" and the
+# Add/Remove Programs product code keeps the single-brace form. Both
+# architectures share this AppId. The value must stay quoted in YAML because a
+# leading brace otherwise parses as a flow mapping rather than a string.
+$productCode = "'{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}'"
 
 function Normalize-PackageVersion {
     param([Parameter(Mandatory = $true)][string]$Value)
 
+    # The release tag is the authoritative version, and installers built from a
+    # tag report it verbatim through Inno Setup's AppVersion. A leading "v" is
+    # therefore part of the version and must survive into PackageVersion so it
+    # matches the tag and the Add/Remove Programs DisplayVersion exactly.
     $normalized = $Value.Trim()
-    if ($normalized.StartsWith("v", [System.StringComparison]::OrdinalIgnoreCase)) {
-        $normalized = $normalized.Substring(1)
+    $numericPart = $normalized
+    if ($numericPart.StartsWith("v", [System.StringComparison]::OrdinalIgnoreCase)) {
+        $numericPart = $numericPart.Substring(1)
     }
-    if ($normalized -notmatch '^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$') {
-        throw "Version must be a release version such as 0.8.0 or 0.8.0-rc.1: $Value"
+    if ($numericPart -notmatch '^[0-9]+(?:\.[0-9]+){1,3}(?:[-+][0-9A-Za-z.-]+)?$') {
+        throw "Version must be a release version such as v0.8.0, 0.8.0, or 0.8.0-rc.1: $Value"
     }
     return $normalized
 }
@@ -54,9 +65,16 @@ function Write-Utf8NoBom {
 }
 
 $packageVersion = Normalize-PackageVersion -Value $Version
-$tag = if ([string]::IsNullOrWhiteSpace($ReleaseTag)) { "v$packageVersion" } else { $ReleaseTag.Trim() }
+# PackageVersion and the release tag are one and the same value. The installers
+# are built from the tag (build_windows.ps1 -Version <tag>) and report it
+# through AppVersion, so an independent -ReleaseTag could silently desync the
+# manifest from the release it points at.
+$tag = if ([string]::IsNullOrWhiteSpace($ReleaseTag)) { $packageVersion } else { $ReleaseTag.Trim() }
 if ($tag -notmatch '^[^/\\]+$') {
     throw "ReleaseTag must not contain path separators: $tag"
+}
+if ($tag -ne $packageVersion) {
+    throw "ReleaseTag must match Version because the package version and the release tag are the same value: Version=$packageVersion ReleaseTag=$tag"
 }
 if ($Repository -notmatch '^[^/\\]+/[^/\\]+$') {
     throw "Repository must have the owner/name form: $Repository"
@@ -76,6 +94,18 @@ $x64InstallerUrl = "$releaseBaseUrl/sunpack-windows-x64-$tag-setup.exe"
 $arm64InstallerUrl = "$releaseBaseUrl/sunpack-windows-arm64-$tag-setup.exe"
 $x64Hash = $X64Sha256.ToUpperInvariant()
 $arm64Hash = $Arm64Sha256.ToUpperInvariant()
+
+# ReleaseDate is the tag's own commit date, so the manifest describes when the
+# release was cut rather than when the manifest happened to be prepared. The
+# field is optional, so a version without a local tag still produces a valid
+# manifest; it just omits the date.
+$releaseDateLine = ""
+$tagCommitDate = (& git -C $repoRoot log -1 --format=%cs "$tag^{commit}" 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -eq 0 -and $tagCommitDate -match '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') {
+    $releaseDateLine = "ReleaseDate: $tagCommitDate"
+} else {
+    Write-Warning "Tag '$tag' was not found locally, so the manifest omits ReleaseDate."
+}
 
 $versionManifest = @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.version.$manifestVersion.schema.json
@@ -101,19 +131,21 @@ Installers:
   - Architecture: x64
     InstallerUrl: $x64InstallerUrl
     InstallerSha256: $x64Hash
+    ProductCode: $productCode
     AppsAndFeaturesEntries:
       - DisplayName: SunPack $tag (x64)
         DisplayVersion: $tag
         Publisher: SunPack
-        InstallerType: inno
+        ProductCode: $productCode
   - Architecture: arm64
     InstallerUrl: $arm64InstallerUrl
     InstallerSha256: $arm64Hash
+    ProductCode: $productCode
     AppsAndFeaturesEntries:
       - DisplayName: SunPack $tag (arm64)
         DisplayVersion: $tag
         Publisher: SunPack
-        InstallerType: inno
+        ProductCode: $productCode
 ManifestType: installer
 ManifestVersion: $manifestVersion
 "@
@@ -132,6 +164,7 @@ License: MIT
 LicenseUrl: https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE
 ShortDescription: Windows archive detection, extraction, and verification tool
 Description: SunPack identifies and processes archives by binary features, including disguised extensions, nested archives, encrypted archives, split volumes, and embedded archives.
+$releaseDateLine
 Tags:
   - archive
   - compression
