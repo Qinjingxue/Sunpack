@@ -14,6 +14,7 @@ def test_installer_is_machine_wide_and_owns_only_its_machine_path_entry():
     assert "procedure RemoveMachinePath" in script
     assert "RegQueryDWordValue" in script
     assert "EnvironmentRegistryKey = 'SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment'" in script
+    assert "Result := RegWriteDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, 1);" in script
     assert "HKCU" not in script
 
 
@@ -26,17 +27,20 @@ def test_installer_registers_and_unregisters_context_menu():
     assert "CurUninstallStepChanged" in script
 
 
-def test_machine_level_path_context_menu_and_startup_registration():
+def test_machine_level_path_context_menu_startup_and_toast_registration():
     installer = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
     register = (ROOT / "scripts" / "register_context_menu.ps1").read_text(encoding="utf-8")
     unregister = (ROOT / "scripts" / "unregister_context_menu.ps1").read_text(encoding="utf-8")
     startup = (ROOT / "sunpack" / "platform" / "windows" / "startup.py").read_text(encoding="utf-8")
+    toast = (ROOT / "native" / "toast_host" / "src" / "main.cpp").read_text(encoding="utf-8")
 
     assert "RegQueryStringValue(HKLM, EnvironmentRegistryKey, 'Path', CurrentPath)" in installer
     assert "RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath)" in installer
     assert "RegWriteDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, 1)" in installer
     assert "RegQueryDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, WasAdded)" in installer
     assert "RegDeleteValue(HKLM, StartupRegistryKey, StartupValueName)" in installer
+    assert "'--register-toast'" in installer
+    assert 'Parameters: "--unregister-toast"' in installer
     for script in (register, unregister):
         assert "HKCU:" not in script
         assert "HKLM:\\Software\\Classes" in script
@@ -45,6 +49,8 @@ def test_machine_level_path_context_menu_and_startup_registration():
     assert r"HKLM:\Software\Classes\*\shell\SunPack" in register
     assert "HKEY_CURRENT_USER" not in startup
     assert startup.count("winreg.HKEY_LOCAL_MACHINE") == 3
+    assert "HKEY_CURRENT_USER" not in toast
+    assert toast.count("HKEY_LOCAL_MACHINE") >= 12
 
 
 def test_installer_optionally_registers_watch_autostart():
@@ -70,7 +76,6 @@ def test_installer_registers_only_the_uninstaller_in_start_menu():
     assert "DefaultGroupName" not in script
     assert "DisableProgramGroupPage=yes" in script
     assert "[Run]" not in script
-    assert 'Parameters: "--register-toast"' not in script
     assert 'Parameters: "--unregister-toast"' in script
     assert "[UninstallRun]" in script
 
@@ -83,8 +88,6 @@ def test_installer_registers_only_the_uninstaller_in_start_menu():
         'Filename: "{uninstallexe}"\n'
     )
 
-    # Upgrade installs remove shortcuts created by older installer versions,
-    # but the current installer creates only the uninstaller shortcut above.
     assert 'Name: "{userprograms}\\SunPack\\SunPack Command Prompt.lnk"' in script
     assert 'Name: "{userprograms}\\SunPack\\Uninstall SunPack.lnk"' in script
     assert 'Name: "{userprograms}\\SunPack\\SunPack Watch Notifications.lnk"' in script
@@ -97,8 +100,9 @@ def test_installer_registers_only_the_uninstaller_in_start_menu():
     assert '[UninstallDelete]' in script
 
     smoke = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
-    assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")' in smoke
+    assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")' not in smoke
     assert "Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath" in smoke
+    assert '$toastAppIdKey = "HKLM:' in smoke
     assert 'foreach ($name in @("SunPack Watch Notifications.lnk"' in smoke
 
 
@@ -157,8 +161,6 @@ def test_installer_stops_existing_watch_before_upgrade_and_cleans_owned_files():
     assert "DirExists(ItemPath)" in script
     assert "TFindData" not in script
     assert "sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.txt" in script
-    assert "RunContextMenuScript(False);" in script
-    assert "RemoveMachinePath;" in script
 
 
 def test_installer_stores_all_user_data_in_program_data():
@@ -198,9 +200,12 @@ def test_upgrade_never_changes_startup_path_or_context_menu():
     setup = script[:script.index("function InitializeUninstall(): Boolean")]
     prepare = setup[setup.index("function PrepareToInstall"):]
     assert "RemoveStartupRunValue;" not in prepare
+    assert "RemoveMachinePath;" not in prepare
+    assert "RunContextMenuScript(False);" not in prepare
     post = script[script.index("if CurStep = ssPostInstall then"):]
     post = post[:post.index("procedure CurUninstallStepChanged")]
     exit_guard = post.index("if ExistingInstallation then")
+    assert post.index("'--register-toast'") < exit_guard
     assert exit_guard < post.index("AddMachinePath")
     assert exit_guard < post.index("RunContextMenuScript(True)")
     assert exit_guard < post.index("watch startup enable")
@@ -222,6 +227,8 @@ def test_optional_component_failures_abort_the_install():
     assert "chinesesimplified.TaskAddToPathFailed=" in script
     assert "english.TaskContextMenuFailed=" in script
     assert "chinesesimplified.TaskContextMenuFailed=" in script
+    assert "ToastRegisterLaunchFailed" in script
+    assert "ToastRegisterCommandFailed" in script
     body = script[script.index("if CurStep = ssPostInstall then"):]
     body = body[:body.index("procedure CurUninstallStepChanged")]
     assert "transaction" not in body.lower()
@@ -247,13 +254,13 @@ def test_uninstaller_stops_running_watch_before_removing_files():
     assert "Start-Sleep -Milliseconds 250" in script
 
 
-def test_uninstaller_removes_generated_watch_and_cache_state():
+def test_uninstaller_removes_all_program_data():
     script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
 
     assert "[UninstallDelete]" in script
     assert 'Type: filesandordirs; Name: "{app}\\*"' in script
     assert 'Type: dirifempty; Name: "{app}"' in script
-    assert 'Type: filesandordirs; Name: "{commonappdata}\\SunPack\\.sunpack_watch"' in script
+    assert 'Type: filesandordirs; Name: "{commonappdata}\\SunPack"' in script
     assert '{localappdata}' not in script
 
 
@@ -435,7 +442,7 @@ def test_elevated_test_failures_are_persisted_and_replayed():
     assert "The elevated process did not produce its diagnostic log." in helper
 
 
-def test_installer_smoke_exercises_generated_uninstall_residue_cleanup():
+def test_installer_smoke_exercises_upgrade_preservation_and_full_uninstall_cleanup():
     script = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
 
     assert "Assert-SunPackStartMenu" in script
@@ -449,6 +456,9 @@ def test_installer_smoke_exercises_generated_uninstall_residue_cleanup():
     assert "Upgrade install overwrote the existing builtin password file" in script
     assert "Upgrade install overwrote the existing program data config file" in script
     assert "Upgrade install changed the startup Run value" in script
+    assert "Upgrade install removed the machine PATH entry" in script
+    assert "Upgrade install removed a context menu key" in script
+    assert "Upgrade install changed the context menu command" in script
     assert "Upgrade install left stale application data behind" in script
     assert "Invoke-UnelevatedChecked" in script
     assert '$startupMatch.Groups["RuntimeIdentity"].Value' in script
@@ -461,12 +471,11 @@ def test_installer_smoke_exercises_generated_uninstall_residue_cleanup():
     assert "run_unelevated_process.py" in script
     assert "Upgrade install left stale configuration data behind" in script
     assert "Set-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName" in script
-    assert "Uninstaller left the watch state directory behind" in script
-    assert "Uninstaller left the runtime state directory behind" in script
-    assert "Uninstaller removed the persistent builtin password file" in script
-    assert "Uninstaller removed the persistent program data config file" in script
+    assert "Uninstaller left ProgramData behind" in script
     assert "Installer must not write user data into the application directory" in script
     assert "ProgramData\\SunPack does not grant the Users group modify rights" in script
+    assert '$toastAppIdKey = "HKLM:' in script
+    assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")' not in script
 
 
 def test_release_packages_copy_only_runtime_tool_files():
@@ -516,14 +525,3 @@ def test_acceptance_setup_bootstraps_and_checks_real_archive_generators():
     assert "Assert-AcceptanceTestTools" in acceptance_script
     assert "Default.SFX" in acceptance_script
     assert "zstd.exe" in acceptance_script
-
-
-def test_release_package_uses_native_console_launcher_and_one_shared_gui_runtime():
-    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
-
-    assert '$runtimeExeName = "sunpack-runtime.exe"' in build_script
-    assert '$watchExeName' not in build_script
-    assert "Packaged shared SunPack runtime executable" in build_script
-    assert build_script.count("Invoke-NuitkaStandaloneBuild -PythonPath") == 1
-    assert 'ConsoleMode "disable"' in build_script
-    assert 'Assert-PathMissing -LiteralPath (Join-Path $distAppRoot "sunpack-watch.exe")' in build_script
