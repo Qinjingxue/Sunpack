@@ -32,6 +32,10 @@ SunPack 通过二进制特征而非文件扩展名识别压缩包，对混乱后
 
 ## 安装说明
 
+### 系统要求
+
+SunPack 仅支持 Windows 10 版本 1607 及更高版本和 Windows 11。
+
 从 [GitHub Releases](https://github.com/Qinjingxue/Sunpack/releases/latest) 下载最新的 `sunpack-windows-<arch>-<version>-setup.exe`
 
 1. 根据系统架构选择安装包：Intel/AMD 64 位 Windows 选择 `x64`，Windows on ARM 选择 `arm64`。

@@ -32,6 +32,10 @@ SunPack identifies archives by binary signatures rather than file extensions, an
 
 ## Installation
 
+### System requirements
+
+SunPack supports only Windows 10 version 1607 or later and Windows 11.
+
 Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Releases](https://github.com/Qinjingxue/Sunpack/releases/latest).
 
 1. Pick the installer that matches your system architecture: `x64` for Intel/AMD 64-bit Windows, `arm64` for Windows on ARM.
