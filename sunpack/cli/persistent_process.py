@@ -10,6 +10,7 @@ from typing import Any, Callable
 from sunpack.config.cli_settings import load_cli_language_from_config
 from sunpack.i18n import I18nContext
 from sunpack.support.process_executable import current_process_executable, is_packaged_process
+from sunpack.support.resources import writable_data_dir
 from sunpack.support.runtime_cwd import runtime_working_directory
 from sunpack.support.resource_lifecycle import open_service_file
 from sunpack.support.runtime_identity import (
@@ -70,11 +71,8 @@ def handle_early_argv(argv: list[str]) -> int | None:
 
 
 def state_path() -> str:
-    import tempfile
-
-    root = os.path.join(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir(), "SunPack")
     identity = runtime_id() or "direct"
-    return os.path.join(root, f"runtime-{identity}.state")
+    return str(writable_data_dir() / f"runtime-{identity}.state")
 
 
 def pipe_name() -> str:

@@ -41,7 +41,7 @@ SunPack 仅支持 Windows 10 版本 1607 及更高版本和 Windows 11。
 1. 根据系统架构选择安装包：Intel/AMD 64 位 Windows 选择 `x64`，Windows on ARM 选择 `arm64`。
 2. 运行安装器并接受 UAC 提权。默认安装到 `C:\Program Files\SunPack`；安装 Watch Broker 服务需要管理员权限。
 3. 按需选择安装向导中的附加项：
-   - 将安装目录加入当前用户的 `PATH`。完成安装后请重新打开 PowerShell。
+   - 将安装目录加入本机 `PATH`。完成安装后请重新打开 PowerShell。
    - 注册资源管理器中的文件夹、文件夹背景右键菜单。
    - 随 Windows 启动 SunPack Watch（默认不启用）。
 
@@ -66,7 +66,7 @@ SunPack 仅支持 Windows 10 版本 1607 及更高版本和 Windows 11。
 
 Sunpack为达到最大方便性，在使用时会尝试从各处获取密码，高速尝试所有候选密码，在上千候选密码下几乎无感速度，自动找到正确密码并使用，使用的密码来源有：
 
-- 内置密码文件：每次解压均使用，可在watch模式下使用托盘右键菜单打开修改，位于Appdata/Local/Sunpack/builtin_passwords.txt。其中watch模式会自动收集剪贴板历史记录写入该文件，上限配置默认30条
+- 内置密码文件：每次解压均使用，可在watch模式下使用托盘右键菜单打开修改，安装版位于%ProgramData%\SunPack\builtin_passwords.txt。其中watch模式会自动收集剪贴板历史记录写入该文件，上限配置默认30条
 - 用户输入：右键菜单，CLI调出的交互输入密码模式的输入
 - 剪贴板：解压前自动读取剪贴板文本作为密码
 - 目录下的密码记录文件：自动寻找目录下的.sunpack-passwords.txt，读取每行作为一个密码，watch模式会自动创建

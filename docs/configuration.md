@@ -4,7 +4,7 @@
 
 The commonly used configuration file is `sunpack_config.json`; the complete configuration file is `sunpack_advanced_config.json`. The program reads the advanced configuration first, then overrides fields with the same name from the simplified configuration: objects are merged recursively, while arrays and plain values are overridden wholesale.
 
-When running from source, the configuration is usually read from the repository root or the current working directory; the packaged version prefers an external configuration next to the executable. The configuration can be adjusted without repackaging.
+When running from source, the configuration is usually read from the repository root or the current working directory. The installed version always reads `%ProgramData%\SunPack\sunpack_config.json` and takes `sunpack_advanced_config.json` from the install directory as the versioned base layer, so `sunpack_config.json` can be adjusted without reinstalling.
 
 Check and view the effective configuration:
 

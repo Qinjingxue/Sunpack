@@ -141,19 +141,34 @@ function Test-PathEntry {
     return $false
 }
 
+function Get-MachinePath {
+    $key = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey(
+        "SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+    )
+    if ($null -eq $key) {
+        return ""
+    }
+    try {
+        return [string]$key.GetValue("Path", "", [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    } finally {
+        $key.Close()
+    }
+}
+
 $resolvedInstaller = (Resolve-Path -LiteralPath $InstallerPath).Path
 $testRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sunpack-installer-smoke-" + $PID)
 $installRoot = Join-Path $testRoot "SunPack"
 $installLog = Join-Path $testRoot "install.log"
 $uninstallLog = Join-Path $testRoot "uninstall.log"
-$folderMenuKey = "HKCU:\Software\Classes\Directory\shell\SunPack"
-$backgroundMenuKey = "HKCU:\Software\Classes\Directory\Background\shell\SunPack"
-$startupRunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$folderMenuKey = "HKLM:\Software\Classes\Directory\shell\SunPack"
+$backgroundMenuKey = "HKLM:\Software\Classes\Directory\Background\shell\SunPack"
+$startupRunKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
+$systemEnvironmentKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 $startupValueName = "SunPackWatchService"
 $toastAppIdKey = "HKCU:\Software\Classes\AppUserModelId\SunPack.Watch.Toast"
 $toastClsidKey = "HKCU:\Software\Classes\CLSID\{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}\LocalServer32"
 $serviceName = "SunPackWatchBroker"
-$userDataRoot = Join-Path $env:LOCALAPPDATA "SunPack"
+$userDataRoot = Join-Path $env:ProgramData "SunPack"
 $userDataBackup = $null
 $uninstaller = $null
 $startMenuRoots = @(
@@ -225,8 +240,8 @@ foreach ($key in @($toastAppIdKey, $toastClsidKey)) {
 foreach ($key in @(
     $folderMenuKey,
     $backgroundMenuKey,
-    "HKCU:\Software\Classes\SunPack.FolderContextMenu",
-    "HKCU:\Software\Classes\SunPack.BackgroundContextMenu"
+    "HKLM:\Software\Classes\SunPack.FolderContextMenu",
+    "HKLM:\Software\Classes\SunPack.BackgroundContextMenu"
 )) {
     if (Test-Path -LiteralPath $key) {
         throw "Installer smoke test requires a clean context-menu state and will not overwrite an existing key: $key"
@@ -236,13 +251,13 @@ foreach ($key in @(
 New-Item -ItemType Directory -Path $testRoot -Force | Out-Null
 try {
     if (Test-Path -LiteralPath $userDataRoot) {
-        $userDataBackup = Join-Path $env:LOCALAPPDATA ("SunPack.installer-test-backup-" + [guid]::NewGuid().ToString("N"))
+        $userDataBackup = Join-Path $env:ProgramData ("SunPack.installer-test-backup-" + [guid]::NewGuid().ToString("N"))
         $resolvedDataRoot = [System.IO.Path]::GetFullPath($userDataRoot)
         $resolvedBackup = [System.IO.Path]::GetFullPath($userDataBackup)
-        $localAppDataRoot = [System.IO.Path]::GetFullPath($env:LOCALAPPDATA).TrimEnd('\') + '\'
-        if (-not $resolvedDataRoot.StartsWith($localAppDataRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
-            -not $resolvedBackup.StartsWith($localAppDataRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
-            throw "Refusing to move user data outside LocalAppData."
+        $programDataRoot = [System.IO.Path]::GetFullPath($env:ProgramData).TrimEnd('\') + '\'
+        if (-not $resolvedDataRoot.StartsWith($programDataRoot, [System.StringComparison]::OrdinalIgnoreCase) -or
+            -not $resolvedBackup.StartsWith($programDataRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            throw "Refusing to move user data outside ProgramData."
         }
         Move-Item -LiteralPath $userDataRoot -Destination $userDataBackup
     }
@@ -259,6 +274,7 @@ try {
 
     $appPath = Join-Path $installRoot "sunpack.exe"
     $runtimeAppPath = Join-Path $installRoot "sunpack-runtime.exe"
+    $configPath = Join-Path $userDataRoot "sunpack_config.json"
     $builtinPasswordsPath = Join-Path $userDataRoot "builtin_passwords.txt"
     $watchRootsPath = Join-Path $userDataRoot "sunpack_watch_roots.txt"
     $brokerPath = Join-Path $installRoot "service\sunpack-watch-broker.exe"
@@ -271,8 +287,29 @@ try {
     if (Test-Path -LiteralPath (Join-Path $installRoot "sunpack-watch.exe")) {
         throw "Retired duplicate watch executable was installed."
     }
+    foreach ($persistentName in @("sunpack_config.json", "sunpack_watch_roots.txt", "builtin_passwords.txt")) {
+        if (Test-Path -LiteralPath (Join-Path $installRoot $persistentName)) {
+            throw "Installer must not write user data into the application directory: $persistentName"
+        }
+    }
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        throw "Installed sunpack_config.json was not found in ProgramData: $configPath"
+    }
     if (-not (Test-Path -LiteralPath $builtinPasswordsPath)) {
         throw "Installed builtin password file was not found: $builtinPasswordsPath"
+    }
+    $programDataAcl = Get-Acl -LiteralPath $userDataRoot
+    $usersModify = @(
+        $programDataAcl.Access |
+            Where-Object {
+                $_.IdentityReference.Value -in @("BUILTIN\Users", "Users") -and
+                $_.AccessControlType -eq "Allow" -and
+                ($_.FileSystemRights -band [System.Security.AccessControl.FileSystemRights]::Modify) -eq
+                    [System.Security.AccessControl.FileSystemRights]::Modify
+            }
+    )
+    if ($usersModify.Count -eq 0) {
+        throw "ProgramData\SunPack does not grant the Users group modify rights: $userDataRoot"
     }
     if (-not (Test-Path -LiteralPath $brokerPath)) {
         throw "Installed Watch Broker executable was not found: $brokerPath"
@@ -297,16 +334,16 @@ try {
     }
     Invoke-Checked -FilePath $appPath -Arguments @("--help")
 
-    $userPath = [string](Get-ItemProperty -LiteralPath "HKCU:\Environment" -Name "Path" -ErrorAction SilentlyContinue).Path
+    $userPath = Get-MachinePath
     if (-not (Test-PathEntry -PathValue $userPath -Expected $installRoot)) {
-        throw "Installer did not add the application directory to the current user's PATH."
+        throw "Installer did not add the application directory to the machine PATH."
     }
     foreach ($key in @($folderMenuKey, $backgroundMenuKey)) {
         if (-not (Test-Path -LiteralPath $key)) {
             throw "Installer did not register the expected context menu key: $key"
         }
     }
-    $directCommandKey = "HKCU:\Software\Classes\SunPack.FolderContextMenu\shell\DirectExtract\command"
+    $directCommandKey = "HKLM:\Software\Classes\SunPack.FolderContextMenu\shell\DirectExtract\command"
     $directCommand = [string](Get-Item -LiteralPath $directCommandKey).GetValue("")
     if ($directCommand -notlike "*$appPath*") {
         throw "Context menu command does not reference the installed executable: $directCommand"
@@ -365,11 +402,18 @@ try {
     Set-Content -LiteralPath $watchRootsPath -Value $watchRootsContent -Encoding UTF8 -NoNewline
     $builtinPasswordsContent = "installer-smoke-user-password`n"
     Set-Content -LiteralPath $builtinPasswordsPath -Value $builtinPasswordsContent -Encoding UTF8 -NoNewline
+    $configContent = "{`"cli`": {`"language`": `"en`"}}`n"
+    Set-Content -LiteralPath $configPath -Value $configContent -Encoding UTF8 -NoNewline
     $staleUpgradeMarker = Join-Path $installRoot "stale-upgrade-marker.json"
     Set-Content -LiteralPath $staleUpgradeMarker -Value "stale" -Encoding UTF8
     $staleConfigDir = Join-Path $installRoot "config"
     New-Item -ItemType Directory -Path $staleConfigDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $staleConfigDir "old-settings.json") -Value "stale" -Encoding UTF8
+    $staleDataMarker = Join-Path $userDataRoot "stale-runtime-state.json"
+    Set-Content -LiteralPath $staleDataMarker -Value "stale" -Encoding UTF8
+    $staleDataDir = Join-Path $userDataRoot "runtime-cwd"
+    New-Item -ItemType Directory -Path $staleDataDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $staleDataDir "stale.json") -Value "stale" -Encoding UTF8
     Invoke-Checked -FilePath $resolvedInstaller -Arguments @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
@@ -387,11 +431,25 @@ try {
     if ($builtinPasswordsAfterUpgrade -ne $builtinPasswordsContent) {
         throw "Upgrade install overwrote the existing builtin password file: $builtinPasswordsPath"
     }
+    $configAfterUpgrade = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
+    if ($configAfterUpgrade -ne $configContent) {
+        throw "Upgrade install overwrote the existing program data config file: $configPath"
+    }
     if (Test-Path -LiteralPath $staleUpgradeMarker) {
         throw "Upgrade install left stale application data behind: $staleUpgradeMarker"
     }
     if (Test-Path -LiteralPath $staleConfigDir) {
         throw "Upgrade install left stale configuration data behind: $staleConfigDir"
+    }
+    if (Test-Path -LiteralPath $staleDataMarker) {
+        throw "Upgrade install left stale runtime state behind: $staleDataMarker"
+    }
+    if (Test-Path -LiteralPath $staleDataDir) {
+        throw "Upgrade install left stale runtime state behind: $staleDataDir"
+    }
+    $startupCommandAfterUpgrade = [string](Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName).$startupValueName
+    if ($startupCommandAfterUpgrade -ne $startupCommand) {
+        throw "Upgrade install changed the startup Run value: $startupCommandAfterUpgrade"
     }
     Assert-SunPackStartMenu
     Invoke-UnelevatedChecked -FilePath $appPath -Arguments @("watch", "start", "--once", "--no-tray")
@@ -406,14 +464,17 @@ try {
     if ($null -eq $brokerService -or $brokerService.Status -ne "Stopped") {
         throw "Watch Broker did not stop after the one-shot Watch client released its lease."
     }
-    Remove-Item -LiteralPath $watchRootsPath -Force
-    Remove-Item -LiteralPath $builtinPasswordsPath -Force
+    Remove-Item -LiteralPath $watchRootsPath -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $builtinPasswordsPath -Force -ErrorAction SilentlyContinue
+    Set-Content -LiteralPath $watchRootsPath -Value "$watchRoot`n" -Encoding UTF8
+    Set-Content -LiteralPath $builtinPasswordsPath -Value "uninstall-keep`n" -Encoding UTF8
+    Set-Content -LiteralPath $configPath -Value $configContent -Encoding UTF8
     $watchStateDir = Join-Path $userDataRoot ".sunpack_watch"
     New-Item -ItemType Directory -Path $watchStateDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $watchStateDir "watch.stop") -Value "installer-smoke" -Encoding UTF8
-    $localSunPackCache = Join-Path $env:LOCALAPPDATA "SunPack\cache"
-    New-Item -ItemType Directory -Path $localSunPackCache -Force | Out-Null
-    Set-Content -LiteralPath (Join-Path $localSunPackCache "machine_probe.json") -Value "{}" -Encoding UTF8
+    $runtimeStateDir = Join-Path $userDataRoot "runtime-cwd"
+    New-Item -ItemType Directory -Path $runtimeStateDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $runtimeStateDir "stale.json") -Value "{}" -Encoding UTF8
     Set-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName -Value ('"{0}" watch start' -f $appPath)
 
     $uninstaller = Get-ChildItem -LiteralPath $installRoot -Filter "unins*.exe" -File | Select-Object -First 1
@@ -429,9 +490,9 @@ try {
     $uninstaller = $null
     Wait-UninstallCompletion -InstallRoot $installRoot -ServiceName $serviceName
 
-    $userPathAfter = [string](Get-ItemProperty -LiteralPath "HKCU:\Environment" -Name "Path" -ErrorAction SilentlyContinue).Path
+    $userPathAfter = Get-MachinePath
     if (Test-PathEntry -PathValue $userPathAfter -Expected $installRoot) {
-        throw "Uninstaller left the application directory in the current user's PATH."
+        throw "Uninstaller left the application directory in the machine PATH."
     }
     foreach ($key in @($folderMenuKey, $backgroundMenuKey)) {
         if (Test-Path -LiteralPath $key) {
@@ -444,8 +505,17 @@ try {
     if (Test-Path -LiteralPath $watchStateDir) {
         throw "Uninstaller left the watch state directory behind: $watchStateDir"
     }
-    if (Test-Path -LiteralPath $localSunPackCache) {
-        throw "Uninstaller left the local SunPack cache behind: $localSunPackCache"
+    if (Test-Path -LiteralPath $runtimeStateDir) {
+        throw "Uninstaller left the runtime state directory behind: $runtimeStateDir"
+    }
+    if (-not (Test-Path -LiteralPath $builtinPasswordsPath)) {
+        throw "Uninstaller removed the persistent builtin password file: $builtinPasswordsPath"
+    }
+    if (-not (Test-Path -LiteralPath $watchRootsPath)) {
+        throw "Uninstaller removed the persistent watch roots file: $watchRootsPath"
+    }
+    if (-not (Test-Path -LiteralPath $configPath)) {
+        throw "Uninstaller removed the persistent program data config file: $configPath"
     }
     if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
         throw "Uninstaller left the Watch Broker service installed: $serviceName"
@@ -492,11 +562,21 @@ try {
     }
     Remove-Item -LiteralPath $userDataRoot -Recurse -Force -ErrorAction SilentlyContinue
     Remove-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName -ErrorAction SilentlyContinue
+    $machinePathAfterCleanup = Get-MachinePath
+    if (Test-PathEntry -PathValue $machinePathAfterCleanup -Expected $installRoot) {
+        $cleanedPath = @(
+            ([string]$machinePathAfterCleanup -split ';') |
+                Where-Object { $_.Trim() -and -not $_.Trim().Equals($installRoot, [System.StringComparison]::OrdinalIgnoreCase) }
+        ) -join ';'
+        Set-ItemProperty -LiteralPath $systemEnvironmentKey -Name "Path" -Value $cleanedPath
+    }
+    Remove-ItemProperty -LiteralPath "HKLM:\Software\SunPack" -Name "PathAddedByInstaller" -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath "HKLM:\Software\SunPack" -Force -ErrorAction SilentlyContinue
     foreach ($key in @(
         $folderMenuKey,
         $backgroundMenuKey,
-        "HKCU:\Software\Classes\SunPack.FolderContextMenu",
-        "HKCU:\Software\Classes\SunPack.BackgroundContextMenu"
+        "HKLM:\Software\Classes\SunPack.FolderContextMenu",
+        "HKLM:\Software\Classes\SunPack.BackgroundContextMenu"
     )) {
         Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue
     }

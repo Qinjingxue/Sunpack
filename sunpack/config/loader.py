@@ -9,7 +9,8 @@ from sunpack.config.advanced_defaults import _payload as _advanced_defaults_payl
 from sunpack.config.detection_view import DIRECTORY_SCAN_MODES, directory_scan_mode, rule_pipeline_config, scan_filters_config
 from sunpack.config.schema import ConfigSchemaError, config_fields, normalize_config, validate_external_config
 from sunpack.support.json_format import load_json_file
-from sunpack.support.resources import candidate_resource_paths, dedupe_paths, first_existing_path
+from sunpack.support.resources import candidate_resource_paths, dedupe_paths, first_existing_path, program_data_dir
+from sunpack.support.process_executable import is_packaged_process
 
 
 class ConfigError(RuntimeError):
@@ -44,11 +45,14 @@ def _candidate_config_paths(filename: str, request_cwd: str | Path | None = None
     )
 
 
+def _searched_config_paths(filename: str, request_cwd: str | Path | None = None) -> list[Path]:
+    if not is_packaged_process() or filename != SIMPLE_CONFIG_FILENAME:
+        return _candidate_config_paths(filename) if request_cwd is None else _candidate_config_paths(filename, request_cwd)
+    return [program_data_dir() / filename]
+
+
 def _first_existing_config(filename: str, request_cwd: str | Path | None = None) -> Path | None:
-    # Preserve the one-argument call for existing integrations that customize
-    # the candidate list in tests or embedding environments.
-    paths = _candidate_config_paths(filename) if request_cwd is None else _candidate_config_paths(filename, request_cwd)
-    return first_existing_path(paths)
+    return first_existing_path(_searched_config_paths(filename, request_cwd))
 
 
 def _known_config_sections() -> frozenset[str]:
@@ -191,8 +195,8 @@ def _load_layered_config_paths(
 ) -> tuple[Path, dict[str, Any]]:
     if simple_path is None and advanced_path is None:
         searched = [
-            *[str(path) for path in (_candidate_config_paths(SIMPLE_CONFIG_FILENAME) if request_cwd is None else _candidate_config_paths(SIMPLE_CONFIG_FILENAME, request_cwd))],
-            *[str(path) for path in (_candidate_config_paths(ADVANCED_CONFIG_FILENAME) if request_cwd is None else _candidate_config_paths(ADVANCED_CONFIG_FILENAME, request_cwd))],
+            *[str(path) for path in _searched_config_paths(SIMPLE_CONFIG_FILENAME, request_cwd)],
+            *[str(path) for path in _searched_config_paths(ADVANCED_CONFIG_FILENAME, request_cwd)],
         ]
         raise ConfigError(f"Missing required {SIMPLE_CONFIG_FILENAME} or {ADVANCED_CONFIG_FILENAME}. Searched: {', '.join(searched)}")
 

@@ -271,3 +271,31 @@ def test_changing_override_invalidates_config_cache(tmp_path, monkeypatch):
 
     monkeypatch.setenv(loader.OVERRIDES_ENV_VAR, json.dumps({"recursive_extract": "2"}))
     assert loader.load_raw_config_payload()[1]["recursive_extract"] == "2"
+
+
+def test_packaged_config_layers_program_data_simple_over_program_advanced(tmp_path, monkeypatch):
+    program_data = tmp_path / "ProgramData"
+    program_files = tmp_path / "Program Files" / "SunPack"
+    (program_data / "SunPack").mkdir(parents=True)
+    program_files.mkdir(parents=True)
+    _write_json(program_files / loader.ADVANCED_CONFIG_FILENAME, _advanced_payload())
+    _write_json(program_data / "SunPack" / loader.SIMPLE_CONFIG_FILENAME, {"cli": {"language": "zh"}})
+
+    monkeypatch.setattr(loader, "is_packaged_process", lambda: True)
+    monkeypatch.setattr(loader, "program_data_dir", lambda: program_data / "SunPack")
+    monkeypatch.setattr(
+        loader,
+        "candidate_resource_paths",
+        lambda filename, request_cwd=None: [program_files / filename],
+    )
+    loader.clear_config_cache()
+    try:
+        assert loader._searched_config_paths(loader.SIMPLE_CONFIG_FILENAME) == [
+            program_data / "SunPack" / loader.SIMPLE_CONFIG_FILENAME
+        ]
+        assert loader._searched_config_paths(loader.ADVANCED_CONFIG_FILENAME)[0] == (
+            program_files / loader.ADVANCED_CONFIG_FILENAME
+        )
+        assert loader.load_config()["cli"]["language"] == "zh"
+    finally:
+        loader.clear_config_cache()

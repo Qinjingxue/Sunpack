@@ -41,7 +41,7 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
 1. Pick the installer that matches your system architecture: `x64` for Intel/AMD 64-bit Windows, `arm64` for Windows on ARM.
 2. Run the installer and accept the UAC elevation prompt. It installs to `C:\Program Files\SunPack` by default; installing the Watch Broker service requires administrator privileges.
 3. Choose the optional items in the setup wizard as needed:
-   - Add the installation directory to the current user's `PATH`. Reopen PowerShell after the installation completes.
+   - Add the installation directory to the machine `PATH`. Reopen PowerShell after the installation completes.
    - Register the Explorer context menu for folders and folder backgrounds.
    - Start SunPack Watch with Windows (disabled by default).
 
@@ -66,7 +66,7 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
 
 For maximum convenience, SunPack gathers passwords from several sources at run time, tries all candidate passwords at high speed — with thousands of candidates it is nearly imperceptible — and automatically finds and uses the correct one. The password sources are:
 
-- Built-in password file: used on every extraction. It can be opened and edited from the tray context menu in watch mode, and lives at `Appdata/Local/Sunpack/builtin_passwords.txt`. Watch mode automatically collects clipboard history into this file, with a default limit of 30 entries.
+- Built-in password file: used on every extraction. It can be opened and edited from the tray context menu in watch mode, and lives at `%ProgramData%\SunPack\builtin_passwords.txt` in the installed version. Watch mode automatically collects clipboard history into this file, with a default limit of 30 entries.
 - User input: the context menu, and the interactive password prompt launched from the CLI.
 - Clipboard: the clipboard text is read as a password before extraction.
 - Per-directory password file: SunPack automatically looks for `.sunpack-passwords.txt` in the directory and reads each line as one password; watch mode creates it automatically.

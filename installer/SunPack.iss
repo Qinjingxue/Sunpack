@@ -64,6 +64,8 @@ english.BrokerSidTypeFailed=Failed to set the service SID type (sc.exe exit code
 english.BrokerSecurityFailed=Failed to secure the Watch Broker service (sc.exe exit code %d).
 english.StartupEnableLaunchFailed=Failed to run sunpack while enabling startup.
 english.StartupEnableCommandFailed=sunpack could not enable startup (exit code %d).
+english.TaskAddToPathFailed=Failed to add sunpack to the current user's PATH.
+english.TaskContextMenuFailed=Failed to register the sunpack folder context menu.
 english.PrepareRuntimeRunning=sunpack runtime processes are still running. Please stop them and run the installer again.
 english.PrepareBrokerRemoveFailed=The existing sunpack Watch Broker service could not be removed. Restart Windows and run the installer again.
 english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed. Close sunpack and run the installer again.
@@ -81,6 +83,8 @@ chinesesimplified.BrokerSidTypeFailed=无法设置服务 SID 类型（sc.exe 退
 chinesesimplified.BrokerSecurityFailed=无法设置 Watch Broker 服务权限（sc.exe 退出码 %d）。
 chinesesimplified.StartupEnableLaunchFailed=启用开机启动时无法运行 sunpack。
 chinesesimplified.StartupEnableCommandFailed=sunpack 无法启用开机启动（退出码 %d）。
+chinesesimplified.TaskAddToPathFailed=无法将 sunpack 添加到当前用户的 PATH。
+chinesesimplified.TaskContextMenuFailed=无法注册 sunpack 文件夹右键菜单。
 chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。请先停止这些进程，然后重新运行安装程序。
 chinesesimplified.PrepareBrokerRemoveFailed=无法删除现有 sunpack Watch Broker 服务。请重启 Windows，然后重新运行安装程序。
 chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack 文件。请关闭 sunpack，然后重新运行安装程序。
@@ -92,15 +96,23 @@ Name: "contextmenu"; Description: "{cm:TaskContextMenu}"; GroupDescription: "{cm
 Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:GroupBackgroundWatch}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack_watch_roots.txt,builtin_passwords.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#SourceDir}\sunpack_watch_roots.txt"; DestDir: "{localappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
-Source: "{#SourceDir}\builtin_passwords.txt"; DestDir: "{localappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
+Source: "{#SourceDir}\sunpack_watch_roots.txt"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
+Source: "{#SourceDir}\builtin_passwords.txt"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
+
+[Dirs]
+Name: "{commonappdata}\SunPack"; Permissions: users-modify
 
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\*"
 Type: dirifempty; Name: "{app}"
-Type: filesandordirs; Name: "{localappdata}\SunPack"
 Type: filesandordirs; Name: "{commonappdata}\SunPack\Service"
+Type: filesandordirs; Name: "{commonappdata}\SunPack\.sunpack_watch"
+Type: filesandordirs; Name: "{commonappdata}\SunPack\runtime-cwd"
+Type: files; Name: "{commonappdata}\SunPack\*.state"
+Type: files; Name: "{commonappdata}\SunPack\*.state.lock"
+Type: files; Name: "{commonappdata}\SunPack\runtime-*.state.events.jsonl"
 Type: dirifempty; Name: "{commonappdata}\SunPack"
 Type: files; Name: "{userprograms}\SunPack\SunPack Watch Notifications.lnk"
 Type: files; Name: "{commonprograms}\SunPack\SunPack Command Prompt.lnk"
@@ -130,7 +142,7 @@ Filename: "{app}\sunpack-runtime.exe"; Parameters: "--unregister-toast"; RunOnce
 [Code]
 const
   SunPackRegistryKey = 'Software\SunPack';
-  EnvironmentRegistryKey = 'Environment';
+  EnvironmentRegistryKey = 'SYSTEM\CurrentControlSet\Control\Session Manager\Environment';
   StartupRegistryKey = 'Software\Microsoft\Windows\CurrentVersion\Run';
   StartupValueName = 'SunPackWatchService';
   PathMarkerName = 'PathAddedByInstaller';
@@ -275,26 +287,30 @@ begin
   end;
 end;
 
-procedure AddUserPath;
+function AddMachinePath: Boolean;
 var
   CurrentPath: string;
   AppPath: string;
   NewPath: string;
 begin
   AppPath := ExpandConstant('{app}');
-  if not RegQueryStringValue(HKCU, EnvironmentRegistryKey, 'Path', CurrentPath) then
+  if not RegQueryStringValue(HKLM, EnvironmentRegistryKey, 'Path', CurrentPath) then
     CurrentPath := '';
   if PathContains(CurrentPath, AppPath) then
+  begin
+    Result := True;
     Exit;
+  end;
   NewPath := CurrentPath;
   if (NewPath <> '') and (NewPath[Length(NewPath)] <> ';') then
     NewPath := NewPath + ';';
   NewPath := NewPath + AppPath;
-  if RegWriteExpandStringValue(HKCU, EnvironmentRegistryKey, 'Path', NewPath) then
-    RegWriteDWordValue(HKCU, SunPackRegistryKey, PathMarkerName, 1);
+  Result := RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath);
+  if Result then
+    RegWriteDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, 1);
 end;
 
-procedure RemoveUserPath;
+procedure RemoveMachinePath;
 var
   WasAdded: Cardinal;
   CurrentPath: string;
@@ -303,9 +319,9 @@ var
   NewPath: string;
   AppPath: string;
 begin
-  if not RegQueryDWordValue(HKCU, SunPackRegistryKey, PathMarkerName, WasAdded) or (WasAdded <> 1) then
+  if not RegQueryDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, WasAdded) or (WasAdded <> 1) then
     Exit;
-  if not RegQueryStringValue(HKCU, EnvironmentRegistryKey, 'Path', CurrentPath) then
+  if not RegQueryStringValue(HKLM, EnvironmentRegistryKey, 'Path', CurrentPath) then
     CurrentPath := '';
   Remaining := CurrentPath;
   AppPath := NormalizePathEntry(ExpandConstant('{app}'));
@@ -320,14 +336,14 @@ begin
       NewPath := NewPath + Trim(Token);
     end;
   end;
-  RegWriteExpandStringValue(HKCU, EnvironmentRegistryKey, 'Path', NewPath);
-  RegDeleteValue(HKCU, SunPackRegistryKey, PathMarkerName);
-  RegDeleteKeyIfEmpty(HKCU, SunPackRegistryKey);
+  RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath);
+  RegDeleteValue(HKLM, SunPackRegistryKey, PathMarkerName);
+  RegDeleteKeyIfEmpty(HKLM, SunPackRegistryKey);
 end;
 
 procedure RemoveStartupRunValue;
 begin
-  RegDeleteValue(HKCU, StartupRegistryKey, StartupValueName);
+  RegDeleteValue(HKLM, StartupRegistryKey, StartupValueName);
 end;
 
 function PowerShellSingleQuotedString(Value: string): string;
@@ -336,7 +352,7 @@ begin
   Result := '''' + Value + '''';
 end;
 
-procedure RunContextMenuScript(RegisterMenu: Boolean);
+function RunContextMenuScript(RegisterMenu: Boolean): Boolean;
 var
   PowerShellPath: string;
   ScriptPath: string;
@@ -359,12 +375,21 @@ begin
   if not FileExists(ScriptPath) then
   begin
     Log('Context menu script was not found: ' + ScriptPath);
+    Result := False;
     Exit;
   end;
   if not Exec(PowerShellPath, Parameters, '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
-    Log('Failed to start context menu script: ' + ScriptPath)
+  begin
+    Log('Failed to start context menu script: ' + ScriptPath);
+    Result := False;
+  end
   else if ResultCode <> 0 then
+  begin
     Log(Format('Context menu script exited with code %d: %s', [ResultCode, ScriptPath]));
+    Result := False;
+  end
+  else
+    Result := True;
 end;
 
 procedure StopExistingProcesses;
@@ -430,33 +455,32 @@ begin
   Result := WaitForExistingRuntimesToExit;
 end;
 
-function IsPersistentInstallFile(const FileName: string): Boolean;
+function IsPersistentProgramDataFile(const FileName: string): Boolean;
 begin
   Result :=
+    (CompareText(FileName, 'sunpack_config.json') = 0) or
     (CompareText(FileName, 'sunpack_watch_roots.txt') = 0) or
     (CompareText(FileName, 'builtin_passwords.txt') = 0);
 end;
 
-function ClearInstallDirectory: Boolean;
+function ClearDirectory(Path: string): Boolean;
 var
-  AppPath: string;
   SearchPath: string;
   ItemPath: string;
   FindData: TFindRec;
 begin
   Result := True;
-  AppPath := ExpandConstant('{app}');
-  if not DirExists(AppPath) then
+  if not DirExists(Path) then
     Exit;
 
-  SearchPath := AddBackslash(AppPath) + '*';
+  SearchPath := AddBackslash(Path) + '*';
   if not FindFirst(SearchPath, FindData) then
     Exit;
   try
     repeat
       if (FindData.Name <> '.') and (FindData.Name <> '..') then
       begin
-        ItemPath := AddBackslash(AppPath) + FindData.Name;
+        ItemPath := AddBackslash(Path) + FindData.Name;
         if DirExists(ItemPath) then
         begin
           if not DelTree(ItemPath, True, True, True) and DirExists(ItemPath) then
@@ -465,11 +489,51 @@ begin
             Result := False;
           end;
         end
-        else if not IsPersistentInstallFile(FindData.Name) then
+        else if not DeleteFile(ItemPath) and FileExists(ItemPath) then
+        begin
+          Log('Failed to remove old SunPack file: ' + ItemPath);
+          Result := False;
+        end;
+      end;
+    until not FindNext(FindData);
+  finally
+    FindClose(FindData);
+  end;
+end;
+
+function ClearProgramDataExceptPersistentFiles: Boolean;
+var
+  DataPath: string;
+  SearchPath: string;
+  ItemPath: string;
+  FindData: TFindRec;
+begin
+  Result := True;
+  DataPath := ExpandConstant('{commonappdata}\SunPack');
+  if not DirExists(DataPath) then
+    Exit;
+
+  SearchPath := AddBackslash(DataPath) + '*';
+  if not FindFirst(SearchPath, FindData) then
+    Exit;
+  try
+    repeat
+      if (FindData.Name <> '.') and (FindData.Name <> '..') then
+      begin
+        ItemPath := AddBackslash(DataPath) + FindData.Name;
+        if DirExists(ItemPath) then
+        begin
+          if not DelTree(ItemPath, True, True, True) and DirExists(ItemPath) then
+          begin
+            Log('Failed to remove old SunPack runtime state directory: ' + ItemPath);
+            Result := False;
+          end;
+        end
+        else if not IsPersistentProgramDataFile(FindData.Name) then
         begin
           if not DeleteFile(ItemPath) and FileExists(ItemPath) then
           begin
-            Log('Failed to remove old SunPack file: ' + ItemPath);
+            Log('Failed to remove old SunPack runtime state file: ' + ItemPath);
             Result := False;
           end;
         end;
@@ -480,6 +544,14 @@ begin
   end;
 end;
 
+function ClearInstallDirectory: Boolean;
+begin
+  Result := ClearDirectory(ExpandConstant('{app}'));
+end;
+
+var
+  ExistingInstallation: Boolean;
+
 procedure InitializeWizard();
 begin
   WizardForm.LicenseAcceptedRadio.Checked := True;
@@ -487,6 +559,7 @@ end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  ExistingInstallation := FileExists(ExpandConstant('{app}\sunpack.exe'));
   if not StopExistingProcessesAndWait then
   begin
     Result := CustomMessage('PrepareRuntimeRunning');
@@ -498,8 +571,12 @@ begin
     Exit;
   end;
   RunContextMenuScript(False);
-  RemoveStartupRunValue;
-  RemoveUserPath;
+  RemoveMachinePath;
+  if not ClearProgramDataExceptPersistentFiles then
+  begin
+    Result := CustomMessage('PrepareOldFilesRemoveFailed');
+    Exit;
+  end;
   if not ClearInstallDirectory then
   begin
     Result := CustomMessage('PrepareOldFilesRemoveFailed');
@@ -525,12 +602,15 @@ begin
   if CurStep = ssPostInstall then
   begin
     InstallBrokerService;
-    if WizardIsTaskSelected('addtopath') then
-      AddUserPath;
+    if ExistingInstallation then
+      Exit;
+    if WizardIsTaskSelected('addtopath') and not AddMachinePath then
+      RaiseException(CustomMessage('TaskAddToPathFailed'));
     if WizardIsTaskSelected('contextmenu') then
-      RunContextMenuScript(True)
-    else
-      RunContextMenuScript(False);
+    begin
+      if not RunContextMenuScript(True) then
+        RaiseException(CustomMessage('TaskContextMenuFailed'));
+    end;
     if WizardIsTaskSelected('autostart') then
     begin
       if not Exec(
@@ -555,6 +635,6 @@ begin
     StopAndDeleteBrokerService;
     RunContextMenuScript(False);
     RemoveStartupRunValue;
-    RemoveUserPath;
+    RemoveMachinePath;
   end;
 end;

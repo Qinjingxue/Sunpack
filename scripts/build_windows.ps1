@@ -1057,10 +1057,12 @@ Assert-PackagedNativeExtension -PackageRoot $distAppRoot -BuildArch $buildArch
 Write-Step "Adding release metadata and helper scripts"
 $distPasswordPath = Join-Path $distAppRoot "builtin_passwords.txt"
 $distConfigPath = Join-Path $distAppRoot "sunpack_config.json"
+$distWatchRootsPath = Join-Path $distAppRoot "sunpack_watch_roots.txt"
 $distAdvancedConfigPath = Join-Path $distAppRoot "sunpack_advanced_config.json"
 $distIconPath = Join-Path $distAppRoot "sunpack.ico"
 Copy-Item -LiteralPath (Join-Path $repoRoot "builtin_passwords.txt") -Destination $distPasswordPath -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot "sunpack_config.json") -Destination $distConfigPath -Force
+Copy-IfExists -Source (Join-Path $repoRoot "sunpack_watch_roots.txt") -Destination $distWatchRootsPath
 Copy-Item -LiteralPath $iconPath -Destination $distIconPath -Force
 Copy-IfExists -Source (Join-Path $repoRoot "sunpack_advanced_config.json") -Destination $distAdvancedConfigPath
 Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot
@@ -1100,6 +1102,19 @@ $metadata = @(
 [System.IO.File]::WriteAllLines($versionFilePath, $metadata)
 
 if ($processArch -eq $buildArch) {
+    # The packaged runtime keeps its writable data under %ProgramData%\SunPack.
+    # The installer seeds the missing data files there, so a machine that never
+    # ran the installer needs the same seed before the smoke tests can execute
+    # the packaged build. Existing data is never overwritten.
+    $packagedDataRoot = Join-Path $env:ProgramData "SunPack"
+    New-Item -ItemType Directory -Path $packagedDataRoot -Force | Out-Null
+    foreach ($seedPath in @($distConfigPath, $distPasswordPath)) {
+        $dataPath = Join-Path $packagedDataRoot (Split-Path -Leaf $seedPath)
+        if (-not (Test-Path -LiteralPath $dataPath)) {
+            Copy-Item -LiteralPath $seedPath -Destination $dataPath
+        }
+    }
+
     Write-Step "Running packaged smoke tests"
     try {
         Invoke-Native -FilePath $distExePath -Arguments @("--help")
@@ -1108,8 +1123,8 @@ if ($processArch -eq $buildArch) {
         Invoke-Native -FilePath $distExePath -Arguments @("config", "validate", "--json")
     } finally {
         # Every launcher request may start the packaged persistent runtime. It
-        # uses %LOCALAPPDATA%\SunPack\runtime-cwd, so leaving it alive pins the
-        # user-data directory and breaks the installer smoke test that follows.
+        # uses %ProgramData%\SunPack\runtime-cwd, so leaving it alive pins the
+        # data directory and breaks the installer smoke test that follows.
         Invoke-Native -FilePath $distExePath -Arguments @("--persistent-shutdown")
         Wait-ExecutableExit -ExecutablePath $distRuntimeExePath
     }

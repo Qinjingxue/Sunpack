@@ -241,7 +241,11 @@ function Set-ContextMenuCommand {
 function Get-MenuLanguage {
     param([string]$RepoRoot)
 
-    $configPath = Join-Path $RepoRoot "sunpack_config.json"
+    $configPath = if (Test-Path -LiteralPath (Join-Path $RepoRoot "sunpack.exe") -PathType Leaf) {
+        Join-Path $env:ProgramData "SunPack\sunpack_config.json"
+    } else {
+        Join-Path $RepoRoot "sunpack_config.json"
+    }
     if (-not (Test-Path -LiteralPath $configPath)) {
         return "en"
     }
@@ -289,15 +293,15 @@ $resolvedIconPath = if ($IconPath) { (Resolve-Path -LiteralPath $IconPath).Path 
 $menuLanguage = Get-MenuLanguage -RepoRoot $repoRoot
 $resolvedMenuText = if ($MenuText) { $MenuText } else { "sunpack" }
 
-$folderKey = "HKCU:\Software\Classes\Directory\shell\SunPack"
-$backgroundKey = "HKCU:\Software\Classes\Directory\Background\shell\SunPack"
-$fileKey = "HKCU:\Software\Classes\*\shell\SunPack"
+$folderKey = "HKLM:\Software\Classes\Directory\shell\SunPack"
+$backgroundKey = "HKLM:\Software\Classes\Directory\Background\shell\SunPack"
+$fileKey = "HKLM:\Software\Classes\*\shell\SunPack"
 $folderSubCommandsName = "SunPack.FolderContextMenu"
 $backgroundSubCommandsName = "SunPack.BackgroundContextMenu"
 $fileSubCommandsName = "SunPack.FileContextMenu"
-$folderSubCommandsKey = "HKCU:\Software\Classes\$folderSubCommandsName"
-$backgroundSubCommandsKey = "HKCU:\Software\Classes\$backgroundSubCommandsName"
-$fileSubCommandsKey = "HKCU:\Software\Classes\$fileSubCommandsName"
+$folderSubCommandsKey = "HKLM:\Software\Classes\$folderSubCommandsName"
+$backgroundSubCommandsKey = "HKLM:\Software\Classes\$backgroundSubCommandsName"
+$fileSubCommandsKey = "HKLM:\Software\Classes\$fileSubCommandsName"
 $subMenuTexts = Get-SubMenuTexts -Language $menuLanguage
 
 $folderToken = ConvertTo-RootSafeDirectoryToken -Token "%1"

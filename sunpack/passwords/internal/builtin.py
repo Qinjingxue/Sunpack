@@ -5,7 +5,7 @@ from sunpack.i18n import I18nContext
 from sunpack.support.resource_lifecycle import open_service_file, read_task_text, write_task_text
 
 from sunpack.passwords.internal.lists import dedupe_passwords, read_password_file
-from sunpack.support.resources import find_resource_path, get_resource_path
+from sunpack.support.resources import get_resource_path
 
 
 DEFAULT_BUILTIN_PASSWORDS = ["123456", "123", "0000", "789"]
@@ -27,8 +27,7 @@ def get_builtin_passwords() -> list[str]:
 
 
 def builtin_password_path() -> Path:
-    writable_path = get_resource_path("builtin_passwords.txt")
-    return writable_path if writable_path.exists() else (find_resource_path("builtin_passwords.txt") or writable_path)
+    return get_resource_path("builtin_passwords.txt")
 
 
 def merge_watch_clipboard_passwords(passwords: list[str], *, max_entries: int = 30) -> bool:

@@ -209,6 +209,13 @@ std::wstring join_config_path(const std::wstring& directory, const wchar_t* file
     return directory + L"\\" + filename;
 }
 
+std::vector<std::wstring> program_data_roots() {
+    std::array<wchar_t, 32768> program_data{};
+    const DWORD length = GetEnvironmentVariableW(L"PROGRAMDATA", program_data.data(), static_cast<DWORD>(program_data.size()));
+    if (length == 0 || length >= program_data.size()) return {};
+    return {std::wstring(program_data.data(), length) + L"\\SunPack"};
+}
+
 std::wstring first_existing_config(const std::vector<std::wstring>& roots, const wchar_t* filename) {
     for (const auto& root : roots) {
         const std::wstring path = join_config_path(root, filename);
@@ -228,26 +235,13 @@ std::string normalize_language(const std::string& raw) {
     return value == "zh" ? "zh" : "en";
 }
 
-// Resolves cli.language the same way sunpack.config.cli_settings does:
-// sunpack_config.json wins over sunpack_advanced_config.json; config files are
-// searched next to the launcher, in the invocation directory, then in the
-// invocation directory's sunpack-2 sibling. Missing or unreadable config falls
-// back to English, matching the Python default.
-std::string cli_language_from_config(const std::wstring& launcher_dir, const std::wstring& invocation_cwd) {
-    std::vector<std::wstring> roots;
-    for (const std::wstring& root : {launcher_dir, invocation_cwd, join_config_path(invocation_cwd, L"sunpack-2")}) {
-        if (root.empty()) continue;
-        bool duplicate = false;
-        for (const auto& existing : roots) {
-            if (existing == root) {
-                duplicate = true;
-                break;
-            }
-        }
-        if (!duplicate) roots.push_back(root);
-    }
-    const std::wstring simple_path = first_existing_config(roots, L"sunpack_config.json");
-    const std::wstring advanced_path = first_existing_config(roots, L"sunpack_advanced_config.json");
+// Resolves cli.language the same way the Python config layer does for an
+// installed build: sunpack_config.json comes from %ProgramData%\SunPack and
+// sunpack_advanced_config.json from the install directory. Missing or
+// unreadable config falls back to English, matching the Python default.
+std::string cli_language_from_config(const std::wstring& launcher_dir) {
+    const std::wstring simple_path = first_existing_config(program_data_roots(), L"sunpack_config.json");
+    const std::wstring advanced_path = first_existing_config({launcher_dir}, L"sunpack_advanced_config.json");
     std::string language;
     if (!simple_path.empty()) language = config_language(simple_path);
     if (language.empty() && !advanced_path.empty()) language = config_language(advanced_path);
@@ -255,12 +249,12 @@ std::string cli_language_from_config(const std::wstring& launcher_dir, const std
 }
 
 std::wstring state_path(const InstallContext& context) {
-    std::array<wchar_t, 32768> local{};
-    DWORD length = GetEnvironmentVariableW(L"LOCALAPPDATA", local.data(), static_cast<DWORD>(local.size()));
-    if (length == 0 || length >= local.size()) {
-        length = GetTempPathW(static_cast<DWORD>(local.size()), local.data());
+    std::array<wchar_t, 32768> program_data{};
+    DWORD length = GetEnvironmentVariableW(L"PROGRAMDATA", program_data.data(), static_cast<DWORD>(program_data.size()));
+    if (length == 0 || length >= program_data.size()) {
+        return {};
     }
-    return std::wstring(local.data(), length) + L"\\SunPack\\runtime-" + wide_utf8(context.runtime_id) + L".state";
+    return std::wstring(program_data.data(), length) + L"\\SunPack\\runtime-" + wide_utf8(context.runtime_id) + L".state";
 }
 
 bool parse_state(const InstallContext& context, std::wstring& pipe_name,
@@ -565,7 +559,7 @@ int wmain(int argc, wchar_t** argv) {
     int code = 1;
     bool ok = request(context, request_arguments, shutdown, code, invocation_cwd);
     if (!ok && !shutdown) {
-        const std::string language = cli_language_from_config(launcher_cwd, invocation_cwd);
+        const std::string language = cli_language_from_config(launcher_cwd);
         DWORD spawn_error = ERROR_SUCCESS;
         HANDLE runtime_process = nullptr;
         DWORD runtime_exit_code = STILL_ACTIVE;
@@ -607,7 +601,7 @@ int wmain(int argc, wchar_t** argv) {
     if (!ok && shutdown) code = 0;
     std::string language;
     if (pause || (!ok && !shutdown)) {
-        language = cli_language_from_config(launcher_cwd, invocation_cwd);
+        language = cli_language_from_config(launcher_cwd);
     }
     if (!ok && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kPersistentTimeoutEn, kPersistentTimeoutZh) + "\n");

@@ -4,7 +4,7 @@
 
 常用配置文件是 `sunpack_config.json`，完整配置文件是 `sunpack_advanced_config.json`。程序先读取高级配置，再用简化配置覆盖同名字段：对象递归合并，数组和普通值整体覆盖。
 
-源码运行时通常从仓库根目录或当前工作目录读取配置；打包版本优先读取可执行文件旁的外部配置。配置可以在不重新打包的情况下调整。
+源码运行时通常从仓库根目录或当前工作目录读取配置。安装版固定读取 `%ProgramData%\SunPack\sunpack_config.json`，并以安装目录中的 `sunpack_advanced_config.json` 作为随版本更新的基础层，因此无需重装即可调整 `sunpack_config.json`。
 
 检查和查看有效配置：
 

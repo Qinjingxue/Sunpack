@@ -3,7 +3,18 @@ import platform
 import sys
 from pathlib import Path
 
-from sunpack.support.process_executable import current_process_executable
+from sunpack.support.process_executable import current_process_executable, is_packaged_process
+
+
+def program_data_dir() -> Path:
+    program_data = os.environ.get("PROGRAMDATA", "").strip()
+    if not program_data:
+        raise RuntimeError("PROGRAMDATA is not defined; SunPack requires the Windows ProgramData directory.")
+    return Path(program_data) / "SunPack"
+
+
+def writable_data_dir() -> Path:
+    return program_data_dir() if is_packaged_process() else candidate_resource_roots()[0]
 
 
 def dedupe_paths(paths: list[Path]) -> list[Path]:
@@ -60,15 +71,7 @@ def find_resource_path(filename: str) -> Path | None:
 
 
 def get_resource_path(filename: str) -> Path:
-    if (getattr(sys, "frozen", False) or "__compiled__" in globals()) and filename in {
-        ".sunpack_watch",
-        "builtin_passwords.txt",
-        "sunpack_watch_roots.txt",
-    }:
-        local_app_data = os.environ.get("LOCALAPPDATA", "").strip()
-        if local_app_data:
-            return Path(local_app_data) / "SunPack" / filename
-    return candidate_resource_roots()[0] / filename
+    return writable_data_dir() / filename
 
 
 def get_7z_path() -> str:
