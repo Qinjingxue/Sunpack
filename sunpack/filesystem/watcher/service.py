@@ -745,7 +745,15 @@ class WatchService:
             tray.start()
         except Exception as exc:
             self.log.write("tray_start_error", error=str(exc), error_type=type(exc).__name__)
-            raise
+            try:
+                tray.stop()
+            except Exception as stop_exc:
+                self.log.write(
+                    "tray_stop_error",
+                    error=str(stop_exc),
+                    error_type=type(stop_exc).__name__,
+                )
+            self.tray = None
 
     def _stop_tray(self) -> None:
         if self.tray is not None:

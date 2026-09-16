@@ -681,6 +681,35 @@ def test_watch_service_tray_only_reload_does_not_restart_scheduler(tmp_path, mon
     assert tray_events == ["start"]
 
 
+def test_watch_service_keeps_running_when_optional_tray_cannot_start():
+    events = []
+
+    class Log:
+        def write(self, event, **payload):
+            events.append((event, payload))
+
+    class Tray:
+        def start(self):
+            raise OSError("tray unavailable")
+
+        def stop(self):
+            events.append(("tray_cleanup", {}))
+
+    service = object.__new__(WatchService)
+    service.service_config = {"tray_enabled": True}
+    service.tray_factory = lambda _service: Tray()
+    service.tray = None
+    service.log = Log()
+
+    service._start_tray()
+
+    assert service.tray is None
+    assert events == [
+        ("tray_start_error", {"error": "tray unavailable", "error_type": "OSError"}),
+        ("tray_cleanup", {}),
+    ]
+
+
 def test_watch_service_language_reload_refreshes_existing_tray(tmp_path, monkeypatch):
     roots_path = tmp_path / "sunpack_watch_roots.txt"
     root = tmp_path / "watched"

@@ -23,6 +23,8 @@ WM_CLOSE = 0x0010
 NIM_ADD = 0x00000000
 NIM_MODIFY = 0x00000001
 NIM_DELETE = 0x00000002
+NIM_SETVERSION = 0x00000004
+NOTIFYICON_VERSION_4 = 4
 NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
@@ -34,6 +36,7 @@ WM_RBUTTONUP = 0x0205
 WM_LBUTTONDBLCLK = 0x0203
 IDI_APPLICATION = 32512
 SW_SHOWNORMAL = 1
+MSGFLT_ALLOW = 1
 LRESULT = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
 WPARAM = getattr(wintypes, "WPARAM", ctypes.c_size_t)
 LPARAM = getattr(wintypes, "LPARAM", ctypes.c_void_p)
@@ -150,6 +153,13 @@ class WindowsTrayIcon:
         self.user32.RegisterClassW.restype = wintypes.ATOM
         self.user32.RegisterWindowMessageW.argtypes = [wintypes.LPCWSTR]
         self.user32.RegisterWindowMessageW.restype = wintypes.UINT
+        self.user32.ChangeWindowMessageFilterEx.argtypes = [
+            wintypes.HWND,
+            wintypes.UINT,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+        ]
+        self.user32.ChangeWindowMessageFilterEx.restype = wintypes.BOOL
         self.user32.CreateWindowExW.argtypes = [
             wintypes.DWORD,
             wintypes.LPCWSTR,
@@ -241,7 +251,8 @@ class WindowsTrayIcon:
             self._hwnd = hwnd
             with _TRAY_INSTANCES_LOCK:
                 _TRAY_INSTANCES[int(hwnd)] = self
-            self._add_icon(hwnd)
+            self._allow_taskbar_created_message(hwnd)
+            self._ensure_icon(hwnd)
             self._ready.set()
             msg = wintypes.MSG()
             while True:
@@ -289,18 +300,62 @@ class WindowsTrayIcon:
             None,
         )
 
-    def _add_icon(self, hwnd) -> None:
+    def _notification_data(self, hwnd, *, flags: int) -> NOTIFYICONDATA:
         data = NOTIFYICONDATA()
         data.cbSize = ctypes.sizeof(NOTIFYICONDATA)
         data.hWnd = hwnd
         data.uID = 1
-        data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
-        data.uCallbackMessage = WM_TRAYICON
-        data.hIcon = self._load_icon()
-        data.szTip = self._text("tip")
+        data.uFlags = flags
+        if flags & NIF_MESSAGE:
+            data.uCallbackMessage = WM_TRAYICON
+        if flags & NIF_ICON:
+            data.hIcon = self._load_icon()
+        if flags & NIF_TIP:
+            data.szTip = self._text("tip")
+        return data
+
+    def _add_icon(self, hwnd) -> None:
+        data = self._notification_data(hwnd, flags=NIF_MESSAGE | NIF_ICON | NIF_TIP)
         if not self.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)):
             raise ctypes.WinError(ctypes.GetLastError())
         self._icon_registered = True
+        self._set_icon_version(hwnd)
+
+    def _modify_icon(self, hwnd) -> None:
+        data = self._notification_data(hwnd, flags=NIF_MESSAGE | NIF_ICON | NIF_TIP)
+        if not self.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data)):
+            raise ctypes.WinError(ctypes.GetLastError())
+        self._icon_registered = True
+
+    def _set_icon_version(self, hwnd) -> None:
+        data = self._notification_data(hwnd, flags=0)
+        data.uVersion = NOTIFYICON_VERSION_4
+        if not self.shell32.Shell_NotifyIconW(NIM_SETVERSION, ctypes.byref(data)):
+            self._log_callback_error(ctypes.WinError(ctypes.GetLastError()), None)
+
+    def _ensure_icon(self, hwnd, *, modify_fallback: bool = False) -> bool:
+        self._icon_registered = False
+        try:
+            self._add_icon(hwnd)
+            return True
+        except OSError as exc:
+            self._log_callback_error(exc, self._taskbar_created_message if modify_fallback else None)
+        if modify_fallback:
+            try:
+                self._modify_icon(hwnd)
+                return True
+            except OSError as exc:
+                self._log_callback_error(exc, self._taskbar_created_message)
+        return False
+
+    def _allow_taskbar_created_message(self, hwnd) -> None:
+        if not self.user32.ChangeWindowMessageFilterEx(
+            hwnd,
+            self._taskbar_created_message,
+            MSGFLT_ALLOW,
+            None,
+        ):
+            self._log_callback_error(ctypes.WinError(ctypes.GetLastError()), None)
 
     def _delete_icon(self, hwnd) -> None:
         data = NOTIFYICONDATA()
@@ -312,9 +367,10 @@ class WindowsTrayIcon:
 
     def _restore_icon(self, hwnd) -> None:
         # Explorer discards notification-area icons when it recreates the
-        # taskbar, even though the owning process and window remain alive.
-        self._icon_registered = False
-        self._add_icon(hwnd)
+        # taskbar. Some display changes broadcast the same message without
+        # removing the old icon, so fall back to MODIFY when ADD reports that
+        # the icon already exists.
+        self._ensure_icon(hwnd, modify_fallback=True)
 
     def _load_icon(self):
         for icon_path in _candidate_icon_paths():
@@ -329,7 +385,10 @@ class WindowsTrayIcon:
         if msg == getattr(self, "_taskbar_created_message", None):
             self._restore_icon(hwnd)
             return 0
-        if msg == WM_TRAYICON and lparam in {WM_RBUTTONUP, WM_LBUTTONDBLCLK}:
+        # NOTIFYICON_VERSION_4 packs the notification code into LOWORD(lParam),
+        # while legacy Shell versions pass the same code as the entire value.
+        tray_event = int(lparam or 0) & 0xFFFF
+        if msg == WM_TRAYICON and tray_event in {WM_RBUTTONUP, WM_LBUTTONDBLCLK}:
             self._show_menu(hwnd)
             return 0
         if msg == WM_COMMAND:
@@ -348,12 +407,7 @@ class WindowsTrayIcon:
         hwnd = self._hwnd
         if not hwnd or not self._icon_registered:
             return
-        data = NOTIFYICONDATA()
-        data.cbSize = ctypes.sizeof(NOTIFYICONDATA)
-        data.hWnd = hwnd
-        data.uID = 1
-        data.uFlags = NIF_TIP
-        data.szTip = self._text("tip")
+        data = self._notification_data(hwnd, flags=NIF_TIP)
         if not self.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data)):
             raise ctypes.WinError(ctypes.GetLastError())
 
