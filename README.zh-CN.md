@@ -58,6 +58,7 @@ SunPack 仅支持 Windows 10 版本 1607 及更高版本和 Windows 11。
 | `scan`      | 扫描发现目录下压缩包，可用于识别归档         |
 | `inspect`   | 输出详细检测数据，调试命令，支持json诊断输出 |
 | `passwords` | 查看本次会参与尝试的密码列表。               |
+| `config`    | 查看或校验当前有效配置                       |
 | `doctor`    | 只读检查配置和运行环境                       |
 
 > 详细参数见 [CLI 参数说明](docs/zh-CN/cli_parameters.md)。
