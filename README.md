@@ -58,6 +58,7 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
 | `scan`      | Scan a directory for archives; useful for identifying archives.      |
 | `inspect`   | Print detailed detection data; a debugging command with JSON output. |
 | `passwords` | Show the password list that will be attempted in this run.           |
+| `config`    | Show or validate the effective configuration.                        |
 | `doctor`    | Read-only check of configuration and runtime environment.            |
 
 > See [CLI parameter reference](docs/cli_parameters.md) for detailed options.
