@@ -15,8 +15,10 @@ from sunpack.support.process_executable import current_process_executable
 
 WM_NULL = 0x0000
 WM_DESTROY = 0x0002
+WM_DISPLAYCHANGE = 0x007E
 WM_NCDESTROY = 0x0082
 WM_COMMAND = 0x0111
+WM_DPICHANGED = 0x02E0
 WM_USER = 0x0400
 WM_TRAYICON = WM_USER + 20
 WM_CLOSE = 0x0010
@@ -28,13 +30,18 @@ NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
 LR_LOADFROMFILE = 0x00000010
 IMAGE_ICON = 1
+SM_CXSMICON = 49
+SM_CYSMICON = 50
 MF_STRING = 0x00000000
 TPM_RIGHTBUTTON = 0x0002
 WM_RBUTTONUP = 0x0205
 WM_LBUTTONDBLCLK = 0x0203
 IDI_APPLICATION = 32512
 SW_SHOWNORMAL = 1
+WS_EX_TOOLWINDOW = 0x00000080
 MSGFLT_ALLOW = 1
+USER_DEFAULT_SCREEN_DPI = 96
+DEFAULT_SMALL_ICON_SIZE = 16
 LRESULT = getattr(wintypes, "LRESULT", ctypes.c_ssize_t)
 WPARAM = getattr(wintypes, "WPARAM", ctypes.c_size_t)
 LPARAM = getattr(wintypes, "LPARAM", ctypes.c_void_p)
@@ -158,6 +165,25 @@ class WindowsTrayIcon:
             wintypes.LPVOID,
         ]
         self.user32.ChangeWindowMessageFilterEx.restype = wintypes.BOOL
+        self.user32.FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+        self.user32.FindWindowW.restype = wintypes.HWND
+        self.user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+        self.user32.GetDpiForWindow.restype = wintypes.UINT
+        self.user32.GetSystemMetricsForDpi.argtypes = [ctypes.c_int, wintypes.UINT]
+        self.user32.GetSystemMetricsForDpi.restype = ctypes.c_int
+        self.user32.LoadImageW.argtypes = [
+            wintypes.HINSTANCE,
+            wintypes.LPCWSTR,
+            wintypes.UINT,
+            ctypes.c_int,
+            ctypes.c_int,
+            wintypes.UINT,
+        ]
+        self.user32.LoadImageW.restype = wintypes.HANDLE
+        self.user32.LoadIconW.argtypes = [wintypes.HINSTANCE, wintypes.LPCWSTR]
+        self.user32.LoadIconW.restype = wintypes.HANDLE
+        self.user32.DestroyIcon.argtypes = [wintypes.HANDLE]
+        self.user32.DestroyIcon.restype = wintypes.BOOL
         self.user32.CreateWindowExW.argtypes = [
             wintypes.DWORD,
             wintypes.LPCWSTR,
@@ -201,7 +227,6 @@ class WindowsTrayIcon:
         self._closed = threading.Event()
         self._startup_error: BaseException | None = None
         self._hwnd = None
-        self._icon = None
         self._icon_registered = False
         self._taskbar_created_message = self.user32.RegisterWindowMessageW(
             TASKBAR_CREATED_MESSAGE_NAME
@@ -284,7 +309,7 @@ class WindowsTrayIcon:
         hinstance = self.kernel32.GetModuleHandleW(None)
         _ensure_tray_class_registered(self.user32, hinstance)
         return self.user32.CreateWindowExW(
-            0,
+            WS_EX_TOOLWINDOW,
             _TRAY_CLASS_NAME,
             _TRAY_CLASS_NAME,
             0,
@@ -298,7 +323,7 @@ class WindowsTrayIcon:
             None,
         )
 
-    def _notification_data(self, hwnd, *, flags: int) -> NOTIFYICONDATA:
+    def _notification_data(self, hwnd, *, flags: int, icon=None) -> NOTIFYICONDATA:
         data = NOTIFYICONDATA()
         data.cbSize = ctypes.sizeof(NOTIFYICONDATA)
         data.hWnd = hwnd
@@ -307,22 +332,34 @@ class WindowsTrayIcon:
         if flags & NIF_MESSAGE:
             data.uCallbackMessage = WM_TRAYICON
         if flags & NIF_ICON:
-            data.hIcon = self._load_icon()
+            data.hIcon = icon
         if flags & NIF_TIP:
             data.szTip = self._text("tip")
         return data
 
     def _add_icon(self, hwnd) -> None:
-        data = self._notification_data(hwnd, flags=NIF_MESSAGE | NIF_ICON | NIF_TIP)
-        if not self.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)):
-            raise ctypes.WinError(ctypes.GetLastError())
+        self._notify_with_icon(NIM_ADD, hwnd)
         self._icon_registered = True
 
     def _modify_icon(self, hwnd) -> None:
-        data = self._notification_data(hwnd, flags=NIF_MESSAGE | NIF_ICON | NIF_TIP)
-        if not self.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data)):
-            raise ctypes.WinError(ctypes.GetLastError())
+        self._notify_with_icon(NIM_MODIFY, hwnd)
         self._icon_registered = True
+
+    def _notify_with_icon(self, operation: int, hwnd) -> None:
+        icon, owned = self._load_icon()
+        if not icon:
+            raise ctypes.WinError(ctypes.GetLastError())
+        try:
+            data = self._notification_data(
+                hwnd,
+                flags=NIF_MESSAGE | NIF_ICON | NIF_TIP,
+                icon=icon,
+            )
+            if not self.shell32.Shell_NotifyIconW(operation, ctypes.byref(data)):
+                raise ctypes.WinError(ctypes.GetLastError())
+        finally:
+            if owned and not self.user32.DestroyIcon(icon):
+                self._log_callback_error(ctypes.WinError(ctypes.GetLastError()), None)
 
     def _ensure_icon(self, hwnd, *, modify_fallback: bool = False) -> bool:
         self._icon_registered = False
@@ -363,18 +400,44 @@ class WindowsTrayIcon:
         # the icon already exists.
         self._ensure_icon(hwnd, modify_fallback=True)
 
-    def _load_icon(self):
+    def _tray_icon_size(self) -> tuple[int, int]:
+        taskbar = self.user32.FindWindowW("Shell_TrayWnd", None)
+        dpi = self.user32.GetDpiForWindow(taskbar) if taskbar else 0
+        dpi = dpi or USER_DEFAULT_SCREEN_DPI
+        width = self.user32.GetSystemMetricsForDpi(SM_CXSMICON, dpi)
+        height = self.user32.GetSystemMetricsForDpi(SM_CYSMICON, dpi)
+        return width or DEFAULT_SMALL_ICON_SIZE, height or DEFAULT_SMALL_ICON_SIZE
+
+    def _load_icon(self) -> tuple[int, bool]:
+        width, height = self._tray_icon_size()
         for icon_path in _candidate_icon_paths():
             if icon_path.exists():
-                icon = self.user32.LoadImageW(None, str(icon_path), IMAGE_ICON, 0, 0, LR_LOADFROMFILE)
+                icon = self.user32.LoadImageW(
+                    None,
+                    str(icon_path),
+                    IMAGE_ICON,
+                    width,
+                    height,
+                    LR_LOADFROMFILE,
+                )
                 if icon:
-                    self._icon = icon
-                    return icon
-        return self.user32.LoadIconW(None, ctypes.c_wchar_p(IDI_APPLICATION))
+                    return icon, True
+        return self.user32.LoadIconW(None, ctypes.c_wchar_p(IDI_APPLICATION)), False
+
+    def _refresh_icon_for_display(self, hwnd, msg: int) -> None:
+        if not self._icon_registered:
+            return
+        try:
+            self._modify_icon(hwnd)
+        except OSError as exc:
+            self._log_callback_error(exc, msg)
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == getattr(self, "_taskbar_created_message", None):
             self._restore_icon(hwnd)
+            return 0
+        if msg in {WM_DISPLAYCHANGE, WM_DPICHANGED}:
+            self._refresh_icon_for_display(hwnd, msg)
             return 0
         if msg == WM_TRAYICON and lparam in {WM_RBUTTONUP, WM_LBUTTONDBLCLK}:
             self._show_menu(hwnd)

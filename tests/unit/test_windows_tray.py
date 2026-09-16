@@ -102,6 +102,168 @@ def test_tray_close_and_destroy_have_distinct_responsibilities():
     assert calls == [("destroy", 123), ("quit", 0)]
 
 
+def test_tray_message_window_uses_toolwindow_extended_style(monkeypatch):
+    calls = []
+
+    class Kernel32:
+        def GetModuleHandleW(self, _name):
+            return 456
+
+    class User32:
+        def CreateWindowExW(self, *args):
+            calls.append(args)
+            return 123
+
+    tray = object.__new__(WindowsTrayIcon)
+    tray.kernel32 = Kernel32()
+    tray.user32 = User32()
+    monkeypatch.setattr(tray_module, "_ensure_tray_class_registered", lambda *_args: None)
+
+    assert tray._create_window() == 123
+    assert calls[0][0] == tray_module.WS_EX_TOOLWINDOW
+
+
+def test_owned_icon_is_destroyed_after_successful_shell_notification():
+    destroyed = []
+
+    class User32:
+        def DestroyIcon(self, icon):
+            destroyed.append(icon)
+            return True
+
+    class Shell32:
+        def Shell_NotifyIconW(self, _operation, _data):
+            return True
+
+    tray = object.__new__(WindowsTrayIcon)
+    tray.user32 = User32()
+    tray.shell32 = Shell32()
+    tray._load_icon = lambda: (321, True)
+    tray._notification_data = lambda _hwnd, flags, icon: tray_module.NOTIFYICONDATA()
+    tray._log_callback_error = lambda *_args: None
+
+    tray._notify_with_icon(tray_module.NIM_ADD, 123)
+
+    assert destroyed == [321]
+
+
+def test_owned_icon_is_destroyed_when_shell_rejects_notification(monkeypatch):
+    destroyed = []
+
+    class User32:
+        def DestroyIcon(self, icon):
+            destroyed.append(icon)
+            return True
+
+    class Shell32:
+        def Shell_NotifyIconW(self, _operation, _data):
+            return False
+
+    tray = object.__new__(WindowsTrayIcon)
+    tray.user32 = User32()
+    tray.shell32 = Shell32()
+    tray._load_icon = lambda: (321, True)
+    tray._notification_data = lambda _hwnd, flags, icon: tray_module.NOTIFYICONDATA()
+    tray._log_callback_error = lambda *_args: None
+    monkeypatch.setattr(tray_module.ctypes, "GetLastError", lambda: 5, raising=False)
+    monkeypatch.setattr(
+        tray_module.ctypes,
+        "WinError",
+        lambda code: OSError(code, "shell unavailable"),
+        raising=False,
+    )
+
+    try:
+        tray._notify_with_icon(tray_module.NIM_ADD, 123)
+    except OSError as exc:
+        assert exc.errno == 5
+    else:
+        raise AssertionError("Shell failure must remain visible to the tray recovery state machine")
+
+    assert destroyed == [321]
+
+
+def test_shared_fallback_icon_is_not_destroyed(monkeypatch):
+    class User32:
+        def LoadIconW(self, _instance, _name):
+            return 654
+
+        def DestroyIcon(self, _icon):
+            raise AssertionError("shared LoadIconW handle must not be destroyed")
+
+    class Shell32:
+        def Shell_NotifyIconW(self, _operation, _data):
+            return True
+
+    tray = object.__new__(WindowsTrayIcon)
+    tray.user32 = User32()
+    tray.shell32 = Shell32()
+    tray._tray_icon_size = lambda: (16, 16)
+    tray._notification_data = lambda _hwnd, flags, icon: tray_module.NOTIFYICONDATA()
+    tray._log_callback_error = lambda *_args: None
+    monkeypatch.setattr(tray_module, "_candidate_icon_paths", lambda: [])
+
+    tray._notify_with_icon(tray_module.NIM_ADD, 123)
+
+
+def test_custom_icon_uses_current_taskbar_dpi_size(tmp_path, monkeypatch):
+    icon_path = tmp_path / "sunpack.ico"
+    icon_path.touch()
+    calls = []
+
+    class User32:
+        def FindWindowW(self, class_name, window_name):
+            calls.append(("find", class_name, window_name))
+            return 123
+
+        def GetDpiForWindow(self, hwnd):
+            calls.append(("dpi", hwnd))
+            return 192
+
+        def GetSystemMetricsForDpi(self, metric, dpi):
+            calls.append(("metric", metric, dpi))
+            return {tray_module.SM_CXSMICON: 32, tray_module.SM_CYSMICON: 30}[metric]
+
+        def LoadImageW(self, instance, path, image_type, width, height, flags):
+            calls.append(("load", instance, path, image_type, width, height, flags))
+            return 789
+
+    tray = object.__new__(WindowsTrayIcon)
+    tray.user32 = User32()
+    monkeypatch.setattr(tray_module, "_candidate_icon_paths", lambda: [icon_path])
+
+    assert tray._load_icon() == (789, True)
+    assert ("dpi", 123) in calls
+    assert ("metric", tray_module.SM_CXSMICON, 192) in calls
+    assert ("metric", tray_module.SM_CYSMICON, 192) in calls
+    assert (
+        "load",
+        None,
+        str(icon_path),
+        tray_module.IMAGE_ICON,
+        32,
+        30,
+        tray_module.LR_LOADFROMFILE,
+    ) in calls
+
+
+def test_display_changes_refresh_only_a_registered_icon():
+    calls = []
+    tray = object.__new__(WindowsTrayIcon)
+    tray._taskbar_created_message = 0xC123
+    tray._icon_registered = True
+    tray._modify_icon = calls.append
+    tray._log_callback_error = lambda *_args: None
+
+    assert tray._wndproc(123, tray_module.WM_DISPLAYCHANGE, 0, 0) == 0
+    assert tray._wndproc(123, tray_module.WM_DPICHANGED, 0, 0) == 0
+    assert calls == [123, 123]
+
+    tray._icon_registered = False
+    assert tray._wndproc(123, tray_module.WM_DISPLAYCHANGE, 0, 0) == 0
+    assert calls == [123, 123]
+
+
 def test_taskbar_created_message_restores_tray_icon():
     calls = []
     tray = object.__new__(WindowsTrayIcon)
