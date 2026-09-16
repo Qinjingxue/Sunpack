@@ -23,8 +23,6 @@ WM_CLOSE = 0x0010
 NIM_ADD = 0x00000000
 NIM_MODIFY = 0x00000001
 NIM_DELETE = 0x00000002
-NIM_SETVERSION = 0x00000004
-NOTIFYICON_VERSION_4 = 4
 NIF_MESSAGE = 0x00000001
 NIF_ICON = 0x00000002
 NIF_TIP = 0x00000004
@@ -319,19 +317,12 @@ class WindowsTrayIcon:
         if not self.shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(data)):
             raise ctypes.WinError(ctypes.GetLastError())
         self._icon_registered = True
-        self._set_icon_version(hwnd)
 
     def _modify_icon(self, hwnd) -> None:
         data = self._notification_data(hwnd, flags=NIF_MESSAGE | NIF_ICON | NIF_TIP)
         if not self.shell32.Shell_NotifyIconW(NIM_MODIFY, ctypes.byref(data)):
             raise ctypes.WinError(ctypes.GetLastError())
         self._icon_registered = True
-
-    def _set_icon_version(self, hwnd) -> None:
-        data = self._notification_data(hwnd, flags=0)
-        data.uVersion = NOTIFYICON_VERSION_4
-        if not self.shell32.Shell_NotifyIconW(NIM_SETVERSION, ctypes.byref(data)):
-            self._log_callback_error(ctypes.WinError(ctypes.GetLastError()), None)
 
     def _ensure_icon(self, hwnd, *, modify_fallback: bool = False) -> bool:
         self._icon_registered = False
@@ -385,10 +376,7 @@ class WindowsTrayIcon:
         if msg == getattr(self, "_taskbar_created_message", None):
             self._restore_icon(hwnd)
             return 0
-        # NOTIFYICON_VERSION_4 packs the notification code into LOWORD(lParam),
-        # while legacy Shell versions pass the same code as the entire value.
-        tray_event = int(lparam or 0) & 0xFFFF
-        if msg == WM_TRAYICON and tray_event in {WM_RBUTTONUP, WM_LBUTTONDBLCLK}:
+        if msg == WM_TRAYICON and lparam in {WM_RBUTTONUP, WM_LBUTTONDBLCLK}:
             self._show_menu(hwnd)
             return 0
         if msg == WM_COMMAND:

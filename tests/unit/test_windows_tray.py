@@ -168,40 +168,6 @@ def test_taskbar_restore_keeps_icon_pending_when_add_and_modify_fail():
     assert errors == [("add failed", 0xC123), ("modify failed", 0xC123)]
 
 
-def test_successful_add_negotiates_notify_icon_version_4():
-    calls = []
-
-    class Shell32:
-        def Shell_NotifyIconW(self, operation, data):
-            calls.append((operation, data._obj.uVersion))
-            return True
-
-    tray = object.__new__(WindowsTrayIcon)
-    tray.shell32 = Shell32()
-    tray._icon_registered = False
-    tray._notification_data = lambda _hwnd, flags: tray_module.NOTIFYICONDATA()
-    tray._log_callback_error = lambda *_args: None
-
-    tray._add_icon(123)
-
-    assert calls == [
-        (tray_module.NIM_ADD, 0),
-        (tray_module.NIM_SETVERSION, tray_module.NOTIFYICON_VERSION_4),
-    ]
-    assert tray._icon_registered is True
-
-
-def test_notify_icon_version_4_event_uses_low_word_of_lparam():
-    shown = []
-    tray = object.__new__(WindowsTrayIcon)
-    tray._taskbar_created_message = 0xC123
-    tray._show_menu = shown.append
-
-    packed_lparam = (1 << 16) | tray_module.WM_RBUTTONUP
-    assert tray._wndproc(123, tray_module.WM_TRAYICON, 0, packed_lparam) == 0
-    assert shown == [123]
-
-
 def test_global_tray_callback_contains_python_exceptions(monkeypatch):
     errors = []
     instance = SimpleNamespace(
