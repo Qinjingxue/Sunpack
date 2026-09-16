@@ -64,6 +64,8 @@ english.BrokerSidTypeFailed=Failed to set the service SID type (sc.exe exit code
 english.BrokerSecurityFailed=Failed to secure the Watch Broker service (sc.exe exit code %d).
 english.StartupEnableLaunchFailed=Failed to run sunpack while enabling startup.
 english.StartupEnableCommandFailed=sunpack could not enable startup (exit code %d).
+english.ToastRegisterLaunchFailed=Failed to run sunpack while registering machine-wide notifications.
+english.ToastRegisterCommandFailed=sunpack could not register machine-wide notifications (exit code %d).
 english.TaskAddToPathFailed=Failed to add sunpack to the current user's PATH.
 english.TaskContextMenuFailed=Failed to register the sunpack folder context menu.
 english.PrepareRuntimeRunning=sunpack runtime processes are still running. Please stop them and run the installer again.
@@ -83,6 +85,8 @@ chinesesimplified.BrokerSidTypeFailed=无法设置服务 SID 类型（sc.exe 退
 chinesesimplified.BrokerSecurityFailed=无法设置 Watch Broker 服务权限（sc.exe 退出码 %d）。
 chinesesimplified.StartupEnableLaunchFailed=启用开机启动时无法运行 sunpack。
 chinesesimplified.StartupEnableCommandFailed=sunpack 无法启用开机启动（退出码 %d）。
+chinesesimplified.ToastRegisterLaunchFailed=注册机器级通知时无法运行 sunpack。
+chinesesimplified.ToastRegisterCommandFailed=sunpack 无法注册机器级通知（退出码 %d）。
 chinesesimplified.TaskAddToPathFailed=无法将 sunpack 添加到当前用户的 PATH。
 chinesesimplified.TaskContextMenuFailed=无法注册 sunpack 文件夹右键菜单。
 chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。请先停止这些进程，然后重新运行安装程序。
@@ -107,15 +111,9 @@ Name: "{commonappdata}\SunPack"; Permissions: users-modify
 [UninstallDelete]
 Type: filesandordirs; Name: "{app}\*"
 Type: dirifempty; Name: "{app}"
-Type: filesandordirs; Name: "{commonappdata}\SunPack\Service"
-Type: filesandordirs; Name: "{commonappdata}\SunPack\.sunpack_watch"
-Type: filesandordirs; Name: "{commonappdata}\SunPack\runtime-cwd"
-Type: files; Name: "{commonappdata}\SunPack\*.state"
-Type: files; Name: "{commonappdata}\SunPack\*.state.lock"
-Type: files; Name: "{commonappdata}\SunPack\runtime-*.state.events.jsonl"
-Type: dirifempty; Name: "{commonappdata}\SunPack"
+Type: filesandordirs; Name: "{commonappdata}\SunPack"
 Type: files; Name: "{userprograms}\SunPack\SunPack Watch Notifications.lnk"
-Type: files; Name: "{commonprograms}\SunPack\SunPack Command Prompt.lnk"
+Type: filesandordirs; Name: "{commonprograms}\SunPack\SunPack Command Prompt.lnk"
 Type: files; Name: "{commonprograms}\SunPack\Uninstall SunPack.lnk"
 Type: files; Name: "{userprograms}\SunPack\sunpack.exe.lnk"
 Type: files; Name: "{userprograms}\sunpack.exe.lnk"
@@ -182,8 +180,6 @@ function StopAndDeleteBrokerService: Boolean;
 var
   ResultCode: Integer;
 begin
-  { Stop is best-effort because a fresh install has no service and a released
-    demand-start service is normally already stopped. }
   RunServiceControl('stop ' + WatchBrokerServiceName, ResultCode);
   Sleep(250);
   if not RunServiceControl('delete ' + WatchBrokerServiceName, ResultCode) then
@@ -219,9 +215,6 @@ begin
   BrokerPath := ExpandConstant('{app}\service\sunpack-watch-broker.exe');
   if not FileExists(BrokerPath) then
     RaiseException(Format(CustomMessage('BrokerExecutableMissing'), [BrokerPath]));
-  { sc.exe must receive literal quote characters as part of binPath. The
-    outer AddQuotes groups the argument; the backslash-escaped inner quotes
-    are persisted in the SCM ImagePath value. }
   QuotedImagePath := '\"' + BrokerPath + '\"';
   Parameters :=
     'create ' + WatchBrokerServiceName +
@@ -307,7 +300,7 @@ begin
   NewPath := NewPath + AppPath;
   Result := RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath);
   if Result then
-    RegWriteDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, 1);
+    Result := RegWriteDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, 1);
 end;
 
 procedure RemoveMachinePath;
@@ -570,8 +563,6 @@ begin
     Result := CustomMessage('PrepareBrokerRemoveFailed');
     Exit;
   end;
-  RunContextMenuScript(False);
-  RemoveMachinePath;
   if not ClearProgramDataExceptPersistentFiles then
   begin
     Result := CustomMessage('PrepareOldFilesRemoveFailed');
@@ -602,6 +593,17 @@ begin
   if CurStep = ssPostInstall then
   begin
     InstallBrokerService;
+    if not Exec(
+      ExpandConstant('{app}\sunpack-runtime.exe'),
+      '--register-toast',
+      '',
+      SW_HIDE,
+      ewWaitUntilTerminated,
+      ResultCode
+    ) then
+      RaiseException(CustomMessage('ToastRegisterLaunchFailed'))
+    else if ResultCode <> 0 then
+      RaiseException(Format(CustomMessage('ToastRegisterCommandFailed'), [ResultCode]));
     if ExistingInstallation then
       Exit;
     if WizardIsTaskSelected('addtopath') and not AddMachinePath then
