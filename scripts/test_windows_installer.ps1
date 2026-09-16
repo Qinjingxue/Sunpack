@@ -165,8 +165,8 @@ $backgroundMenuKey = "HKLM:\Software\Classes\Directory\Background\shell\SunPack"
 $startupRunKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
 $systemEnvironmentKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 $startupValueName = "SunPackWatchService"
-$toastAppIdKey = "HKCU:\Software\Classes\AppUserModelId\SunPack.Watch.Toast"
-$toastClsidKey = "HKCU:\Software\Classes\CLSID\{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}\LocalServer32"
+$toastAppIdKey = "HKLM:\Software\Classes\AppUserModelId\SunPack.Watch.Toast"
+$toastClsidKey = "HKLM:\Software\Classes\CLSID\{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}\LocalServer32"
 $serviceName = "SunPackWatchBroker"
 $userDataRoot = Join-Path $env:ProgramData "SunPack"
 $userDataBackup = $null
@@ -314,7 +314,6 @@ try {
     if (-not (Test-Path -LiteralPath $brokerPath)) {
         throw "Installed Watch Broker executable was not found: $brokerPath"
     }
-    Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")
     Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath
     Assert-SunPackStartMenu
     $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
@@ -349,10 +348,6 @@ try {
         throw "Context menu command does not reference the installed executable: $directCommand"
     }
     $startupCommand = [string](Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName).$startupValueName
-    # The runtime serializes the Run value through subprocess.list2cmdline, which quotes an
-    # argument only when it contains a space or a tab. The smoke-test install root lives under
-    # %TEMP% and carries no whitespace, so the executable stays unquoted there, while an
-    # install root such as "C:\Program Files\SunPack" is quoted.
     $expectedRuntime = if ($runtimeAppPath -match '[ \t]') {
         '"' + $runtimeAppPath + '"'
     } else {
@@ -447,10 +442,24 @@ try {
     if (Test-Path -LiteralPath $staleDataDir) {
         throw "Upgrade install left stale runtime state behind: $staleDataDir"
     }
+    $machinePathAfterUpgrade = Get-MachinePath
+    if (-not (Test-PathEntry -PathValue $machinePathAfterUpgrade -Expected $installRoot)) {
+        throw "Upgrade install removed the machine PATH entry."
+    }
+    foreach ($key in @($folderMenuKey, $backgroundMenuKey)) {
+        if (-not (Test-Path -LiteralPath $key)) {
+            throw "Upgrade install removed a context menu key: $key"
+        }
+    }
+    $directCommandAfterUpgrade = [string](Get-Item -LiteralPath $directCommandKey).GetValue("")
+    if ($directCommandAfterUpgrade -ne $directCommand) {
+        throw "Upgrade install changed the context menu command: $directCommandAfterUpgrade"
+    }
     $startupCommandAfterUpgrade = [string](Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName).$startupValueName
     if ($startupCommandAfterUpgrade -ne $startupCommand) {
         throw "Upgrade install changed the startup Run value: $startupCommandAfterUpgrade"
     }
+    Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath
     Assert-SunPackStartMenu
     Invoke-UnelevatedChecked -FilePath $appPath -Arguments @("watch", "start", "--once", "--no-tray")
     $stopDeadline = (Get-Date).AddSeconds(10)
@@ -464,10 +473,8 @@ try {
     if ($null -eq $brokerService -or $brokerService.Status -ne "Stopped") {
         throw "Watch Broker did not stop after the one-shot Watch client released its lease."
     }
-    Remove-Item -LiteralPath $watchRootsPath -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $builtinPasswordsPath -Force -ErrorAction SilentlyContinue
     Set-Content -LiteralPath $watchRootsPath -Value "$watchRoot`n" -Encoding UTF8
-    Set-Content -LiteralPath $builtinPasswordsPath -Value "uninstall-keep`n" -Encoding UTF8
+    Set-Content -LiteralPath $builtinPasswordsPath -Value "uninstall-delete`n" -Encoding UTF8
     Set-Content -LiteralPath $configPath -Value $configContent -Encoding UTF8
     $watchStateDir = Join-Path $userDataRoot ".sunpack_watch"
     New-Item -ItemType Directory -Path $watchStateDir -Force | Out-Null
@@ -502,20 +509,8 @@ try {
     if (Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName -ErrorAction SilentlyContinue) {
         throw "Uninstaller left the startup Run value behind: $startupValueName"
     }
-    if (Test-Path -LiteralPath $watchStateDir) {
-        throw "Uninstaller left the watch state directory behind: $watchStateDir"
-    }
-    if (Test-Path -LiteralPath $runtimeStateDir) {
-        throw "Uninstaller left the runtime state directory behind: $runtimeStateDir"
-    }
-    if (-not (Test-Path -LiteralPath $builtinPasswordsPath)) {
-        throw "Uninstaller removed the persistent builtin password file: $builtinPasswordsPath"
-    }
-    if (-not (Test-Path -LiteralPath $watchRootsPath)) {
-        throw "Uninstaller removed the persistent watch roots file: $watchRootsPath"
-    }
-    if (-not (Test-Path -LiteralPath $configPath)) {
-        throw "Uninstaller removed the persistent program data config file: $configPath"
+    if (Test-Path -LiteralPath $userDataRoot) {
+        throw "Uninstaller left ProgramData behind: $userDataRoot"
     }
     if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
         throw "Uninstaller left the Watch Broker service installed: $serviceName"
@@ -576,7 +571,9 @@ try {
         $folderMenuKey,
         $backgroundMenuKey,
         "HKLM:\Software\Classes\SunPack.FolderContextMenu",
-        "HKLM:\Software\Classes\SunPack.BackgroundContextMenu"
+        "HKLM:\Software\Classes\SunPack.BackgroundContextMenu",
+        $toastAppIdKey,
+        (Split-Path -Parent $toastClsidKey)
     )) {
         Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue
     }
