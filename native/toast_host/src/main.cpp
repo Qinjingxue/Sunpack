@@ -134,20 +134,6 @@ std::wstring quote_argument(std::wstring_view value) {
     return result;
 }
 
-std::wstring legacy_toast_shortcut_path() {
-    PWSTR raw = nullptr;
-    winrt::check_hresult(SHGetKnownFolderPath(FOLDERID_Programs, KF_FLAG_DONT_VERIFY, nullptr, &raw));
-    std::unique_ptr<wchar_t, decltype(&CoTaskMemFree)> owner(raw, CoTaskMemFree);
-    return (std::filesystem::path(raw) / L"SunPack" / L"SunPack Watch Notifications.lnk").wstring();
-}
-
-void remove_legacy_toast_shortcut() noexcept {
-    try {
-        std::filesystem::remove(legacy_toast_shortcut_path());
-    } catch (...) {
-    }
-}
-
 void set_registry_string(HKEY root, const std::wstring& subkey,
                          const wchar_t* value_name, const std::wstring& value) {
     HKEY key = nullptr;
@@ -211,32 +197,31 @@ std::wstring toast_icon_path(const std::wstring& executable) {
 void register_toast_identity(const std::wstring& executable, const std::wstring& arguments) {
     const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
     set_registry_string(
-        HKEY_CURRENT_USER, com_path, nullptr, quote_argument(executable) + L" " + arguments
+        HKEY_LOCAL_MACHINE, com_path, nullptr, quote_argument(executable) + L" " + arguments
     );
 
     const std::wstring app_id_path = toast_app_id_registry_path();
-    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName", kToastDisplayName);
-    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri", toast_icon_path(executable));
+    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"DisplayName", kToastDisplayName);
+    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconUri", toast_icon_path(executable));
     set_registry_string(
-        HKEY_CURRENT_USER, app_id_path, L"IconBackgroundColor", kToastIconBackgroundColor
+        HKEY_LOCAL_MACHINE, app_id_path, L"IconBackgroundColor", kToastIconBackgroundColor
     );
-    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"CustomActivator", kClsidText);
-    remove_legacy_toast_shortcut();
+    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"CustomActivator", kClsidText);
 }
 
 bool toast_identity_registered(const std::wstring& executable, const std::wstring& arguments) noexcept {
     try {
         const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
         const std::wstring app_id_path = toast_app_id_registry_path();
-        return get_registry_string(HKEY_CURRENT_USER, com_path, nullptr) ==
+        return get_registry_string(HKEY_LOCAL_MACHINE, com_path, nullptr) ==
                    quote_argument(executable) + L" " + arguments &&
-               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName") ==
+               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"DisplayName") ==
                    kToastDisplayName &&
-               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri") ==
+               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconUri") ==
                    toast_icon_path(executable) &&
-               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconBackgroundColor") ==
+               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconBackgroundColor") ==
                    kToastIconBackgroundColor &&
-               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"CustomActivator") ==
+               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"CustomActivator") ==
                    kClsidText;
     } catch (...) {
         return false;
@@ -247,11 +232,10 @@ void unregister_toast_identity() noexcept {
     try {
         const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText;
         const std::wstring app_id_path = toast_app_id_registry_path();
-        RegDeleteTreeW(HKEY_CURRENT_USER, com_path.c_str());
-        RegDeleteTreeW(HKEY_CURRENT_USER, app_id_path.c_str());
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, com_path.c_str());
+        RegDeleteTreeW(HKEY_LOCAL_MACHINE, app_id_path.c_str());
     } catch (...) {
     }
-    remove_legacy_toast_shortcut();
 }
 
 std::wstring xml_escape(std::wstring_view text) {
@@ -795,8 +779,6 @@ private:
     bool progress_shown_{};
 };
 
-// This context and all of its WinRT objects belong to the Python toast thread.
-// Member order keeps the apartment alive through presenter and COM teardown.
 struct ToastContext {
     explicit ToastContext(const CLSID& clsid = kToastActivatorClsid) : activation(clsid) {}
     WinrtApartmentScope apartment;
@@ -832,7 +814,7 @@ int self_test() {
     const auto decoded = hex_decode(hex_encode(original));
     if (!decoded || *decoded != original) return 1;
     if (xml_escape(L"<&\"'>") != L"&lt;&amp;&quot;&apos;&gt;") return 2;
-    std::vector<std::uint8_t> payload(40, 0); // header and six empty strings
+    std::vector<std::uint8_t> payload(40, 0);
     payload[0] = static_cast<std::uint8_t>(SnapshotKind::success);
     payload[1] = static_cast<std::uint8_t>(ProgressMode::determinate);
     const double progress = 0.25;
@@ -845,8 +827,6 @@ int self_test() {
         if (!rejected) return 4;
     }
     {
-        // Exercise the real context without registering a user identity or
-        // interfering with the production activator in a running watch.
         CLSID test_clsid{};
         winrt::check_hresult(CoCreateGuid(&test_clsid));
         ToastContext context(test_clsid);
@@ -861,7 +841,6 @@ int self_test() {
         });
         other.join();
         if (wrong_thread != RPC_E_WRONG_THREAD) return 6;
-        // Resolve our live COM factory, as Windows does for a button click.
         winrt::com_ptr<IClassFactory> factory;
         winrt::check_hresult(CoGetClassObject(test_clsid, CLSCTX_LOCAL_SERVER, nullptr, IID_PPV_ARGS(factory.put())));
         winrt::com_ptr<INotificationActivationCallback> callback;
@@ -921,8 +900,6 @@ HRESULT sunpack_toast_unregister() noexcept {
     return protect([] { unregister_toast_identity(); });
 }
 
-// Windows can cold-activate the main executable for a notification that was
-// clicked during shutdown. A live watch already owns the registered factory.
 HRESULT sunpack_toast_activate() noexcept {
     return protect([] {
         WinrtApartmentScope apartment;
