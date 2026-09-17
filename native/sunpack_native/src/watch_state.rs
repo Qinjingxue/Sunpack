@@ -10,7 +10,7 @@ const EXTRACTION_BATCH_RECORDS: usize = 256;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug)]
-enum JsonValue {
+pub(crate) enum JsonValue {
     Null,
     Bool(bool),
     Signed(i128),
@@ -58,7 +58,7 @@ fn extract_json_key(value: &Bound<'_, PyAny>) -> PyResult<String> {
     ))
 }
 
-fn extract_json(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
+pub(crate) fn extract_json(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
     if value.is_none() {
         return Ok(JsonValue::Null);
     }
@@ -189,7 +189,7 @@ fn write_json_string<W: Write>(writer: &mut W, value: &str) -> io::Result<()> {
     writer.write_all(b"\"")
 }
 
-fn write_json_value<W: Write>(writer: &mut W, value: &JsonValue) -> io::Result<()> {
+pub(crate) fn write_json_value<W: Write>(writer: &mut W, value: &JsonValue) -> io::Result<()> {
     match value {
         JsonValue::Null => writer.write_all(b"null"),
         JsonValue::Bool(true) => writer.write_all(b"true"),
