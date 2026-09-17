@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, fields, replace
+from dataclasses import asdict, dataclass, field, replace
 import errno
 import json
 import os
@@ -9,6 +9,8 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Iterable
+
+from sunpack_native import write_watch_state_snapshot_native as _native_write_watch_state_snapshot
 
 from sunpack.filesystem.watcher.journal_commit import (
     JournalTicket,
@@ -108,10 +110,6 @@ def _rotate_sequence_segment(path: Path, boundary: int) -> tuple[int, int] | Non
         _SEQUENCE_SEGMENT_START[key] = new_start
         return old_start, new_start
 
-
-def _flush_file(handle) -> None:
-    handle.flush()
-    os.fsync(handle.fileno())
 
 
 def _sync_file_path(path: Path) -> None:
@@ -528,76 +526,31 @@ class WatchStateStore:
             groups=self.groups.copy(),
         )
 
-    @staticmethod
-    def _write_record(handle, record: Any) -> None:
-        handle.write("{")
-        first = True
-        for record_field in fields(record):
-            if first:
-                first = False
-            else:
-                handle.write(",")
-            json.dump(record_field.name, handle, ensure_ascii=False)
-            handle.write(":")
-            json.dump(
-                getattr(record, record_field.name),
-                handle,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-        handle.write("}")
-
-    @classmethod
-    def _write_record_map(cls, handle, name: str, records: dict[str, Any]) -> None:
-        handle.write(f',"{name}":{{')
-        first = True
-        for key, record in records.items():
-            if first:
-                first = False
-            else:
-                handle.write(",")
-            json.dump(key, handle, ensure_ascii=False, separators=(",", ":"))
-            handle.write(":")
-            cls._write_record(handle, record)
-        handle.write("}")
-
     def _write_snapshot_view(self, view: _SnapshotView) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path: Path | None = None
         try:
+            # ResourceLifecycle owns creation/cleanup of the sibling tempfile;
+            # native code owns JSON encoding, buffered sequential I/O and fsync.
             with named_task_temporary_file(
-                mode="w",
-                encoding="utf-8",
-                newline="",
+                mode="w+b",
                 dir=self.path.parent,
                 prefix=f".{self.path.name}.",
                 suffix=".tmp",
                 delete=False,
             ) as temp:
                 temp_path = Path(temp.name)
-                temp.write(
-                    f'{{"version":{STATE_VERSION},"checkpoint_seq":{view.checkpoint_seq},'
-                    f'"password_generation":{view.password_generation},'
-                    '"password_source_signature":'
-                )
-                json.dump(
-                    view.password_source_signature,
-                    temp,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                temp.write(',"watch_cursors":')
-                json.dump(
-                    view.watch_cursors,
-                    temp,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                )
-                self._write_record_map(temp, "pending_work", view.pending_work)
-                self._write_record_map(temp, "entries", view.entries)
-                self._write_record_map(temp, "groups", view.groups)
-                temp.write("}")
-                _flush_file(temp)
+            _native_write_watch_state_snapshot(
+                str(temp_path),
+                STATE_VERSION,
+                view.checkpoint_seq,
+                view.password_generation,
+                view.password_source_signature,
+                view.watch_cursors,
+                view.pending_work,
+                view.entries,
+                view.groups,
+            )
             os.replace(temp_path, self.path)
             _sync_file_path(self.path)
         finally:
