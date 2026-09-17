@@ -48,6 +48,19 @@ def _state_path_lock(path: Path) -> threading.RLock:
         return lock
 
 
+def _flush_file(handle) -> None:
+    """Make a critical state transition durable before dependent filesystem work."""
+
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
+def _sync_file_path(path: Path) -> None:
+    # Windows' CRT commit path requires a writable descriptor.
+    with open_service_file(path, "rb+") as handle:
+        os.fsync(handle.fileno())
+
+
 @dataclass
 class WatchPendingWork:
     path: str
@@ -56,6 +69,11 @@ class WatchPendingWork:
     file_id: str = ""
     change_usn: int = 0
     force: bool = False
+    password_scope_dir: str = ""
+    internal_recovery: bool = False
+    active_outputs: dict[str, str] = field(default_factory=dict)
+    committed_roots: list[str] = field(default_factory=list)
+    completed_sources: list[str] = field(default_factory=list)
 
     @property
     def fingerprint(self) -> str:
@@ -268,7 +286,9 @@ class WatchStateStore:
             ) as temp:
                 temp_path = Path(temp.name)
                 writer(temp)
+                _flush_file(temp)
             os.replace(temp_path, target)
+            _sync_file_path(target)
         finally:
             if temp_path is not None:
                 try:
@@ -332,7 +352,12 @@ class WatchStateStore:
         self._update_compaction_due_locked()
         return True
 
-    def _commit_operations_locked(self, operations: list[dict[str, Any]]) -> None:
+    def _commit_operations_locked(
+        self,
+        operations: list[dict[str, Any]],
+        *,
+        durable: bool = False,
+    ) -> None:
         if not operations:
             return
         decoded = [self._decode_operation(operation) for operation in operations]
@@ -356,6 +381,8 @@ class WatchStateStore:
             newline="",
         ) as handle:
             handle.write(serialized)
+            if durable:
+                _flush_file(handle)
         for operation in decoded:
             self._apply_decoded_operation_locked(operation)
         self._journal_records += 1
@@ -448,20 +475,39 @@ class WatchStateStore:
         else:
             records[key] = value
 
-    def queue_active(self, candidate, *, force: bool = False) -> None:
-        pending = WatchPendingWork(
-            path=os.path.abspath(candidate.path),
-            size=int(candidate.size),
-            mtime=float(candidate.mtime),
-            file_id=str(getattr(candidate, "file_id", "") or ""),
-            change_usn=int(getattr(candidate, "change_usn", 0) or 0),
-            force=bool(force),
-        )
+    def queue_active(
+        self,
+        candidate,
+        *,
+        force: bool = False,
+        password_scope_dir: str = "",
+        internal_recovery: bool = False,
+    ) -> None:
         key = _path_key(candidate.path)
         with self._state_lock:
+            previous = self.pending_work.get(key)
+            pending = WatchPendingWork(
+                path=os.path.abspath(candidate.path),
+                size=int(candidate.size),
+                mtime=float(candidate.mtime),
+                file_id=str(getattr(candidate, "file_id", "") or ""),
+                change_usn=int(getattr(candidate, "change_usn", 0) or 0),
+                force=bool(force),
+                password_scope_dir=os.path.abspath(
+                    password_scope_dir
+                    or (previous.password_scope_dir if previous else "")
+                    or os.path.dirname(os.path.abspath(candidate.path))
+                ),
+                internal_recovery=bool(
+                    internal_recovery or (previous.internal_recovery if previous else False)
+                ),
+                active_outputs=dict(previous.active_outputs if previous else {}),
+                committed_roots=list(previous.committed_roots if previous else []),
+                completed_sources=list(previous.completed_sources if previous else []),
+            )
             self._commit_operations_locked([
                 self._put_operation("pending_work", key, pending),
-            ])
+            ], durable=True)
 
     def record_attempt(
         self,
@@ -472,6 +518,8 @@ class WatchStateStore:
         change_usn: int = 0,
     ) -> None:
         with self._state_lock:
+            key = _path_key(path)
+            previous = self.pending_work.get(key)
             pending = WatchPendingWork(
                 path=os.path.abspath(path),
                 size=size,
@@ -479,8 +527,16 @@ class WatchStateStore:
                 file_id=file_id,
                 change_usn=int(change_usn),
                 force=False,
+                password_scope_dir=(
+                    previous.password_scope_dir
+                    if previous
+                    else os.path.dirname(os.path.abspath(path))
+                ),
+                internal_recovery=bool(previous.internal_recovery if previous else False),
+                active_outputs=dict(previous.active_outputs if previous else {}),
+                committed_roots=list(previous.committed_roots if previous else []),
+                completed_sources=list(previous.completed_sources if previous else []),
             )
-            key = _path_key(path)
             self._commit_operations_locked([
                 self._put_operation("pending_work", key, pending),
             ])
@@ -488,6 +544,109 @@ class WatchStateStore:
     def pending_work_items(self) -> list[WatchPendingWork]:
         with self._state_lock:
             return list(self.pending_work.values())
+
+    def pending_work_for_path(self, path: str) -> WatchPendingWork | None:
+        with self._state_lock:
+            return self.pending_work.get(_path_key(path))
+
+    def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str) -> bool:
+        if not task_path or not output_dir:
+            return False
+        with self._state_lock:
+            key = _path_key(owner_path)
+            pending = self.pending_work.get(key)
+            if pending is None:
+                return False
+            active = dict(pending.active_outputs)
+            active[os.path.abspath(task_path)] = os.path.abspath(output_dir)
+            updated = replace(pending, active_outputs=active)
+            self._commit_operations_locked([
+                self._put_operation("pending_work", key, updated),
+            ], durable=True)
+            return True
+
+    def record_task_output_committed(self, owner_path: str, task_path: str, output_dir: str) -> bool:
+        if not task_path:
+            return False
+        with self._state_lock:
+            key = _path_key(owner_path)
+            pending = self.pending_work.get(key)
+            if pending is None:
+                return False
+            task_path = os.path.abspath(task_path)
+            active = dict(pending.active_outputs)
+            active.pop(task_path, None)
+            roots = list(pending.committed_roots)
+            if output_dir:
+                root = os.path.abspath(output_dir)
+                root_key = _path_key(root)
+                if not any(
+                    root_key == _path_key(value)
+                    or _is_path_under(root_key, _path_key(value))
+                    for value in roots
+                ):
+                    # Keep only the outermost committed roots. One targeted
+                    # recursive recovery scan then covers nested task outputs
+                    # without rescanning every descendant output directory.
+                    roots = [
+                        value
+                        for value in roots
+                        if not _is_path_under(_path_key(value), root_key)
+                    ]
+                    roots.append(root)
+            completed = list(pending.completed_sources)
+            task_key = _path_key(task_path)
+            if (
+                task_key != _path_key(owner_path)
+                and not any(_path_key(value) == task_key for value in completed)
+            ):
+                # A committed recursive task must not be rediscovered from a
+                # committed output root after a crash. The original Watch owner
+                # remains the recovery anchor and is intentionally not listed.
+                completed.append(task_path)
+            updated = replace(
+                pending,
+                active_outputs=active,
+                committed_roots=roots,
+                completed_sources=completed,
+            )
+            self._commit_operations_locked([
+                self._put_operation("pending_work", key, updated),
+            ], durable=True)
+            return True
+
+    def rebase_pending_work(
+        self,
+        owner_path: str,
+        candidates: Iterable,
+        *,
+        password_scope_dir: str = "",
+    ) -> None:
+        with self._state_lock:
+            owner_key = _path_key(owner_path)
+            previous = self.pending_work.get(owner_key)
+            scope = os.path.abspath(
+                password_scope_dir
+                or (previous.password_scope_dir if previous else "")
+                or os.path.dirname(os.path.abspath(owner_path))
+            )
+            unique = {}
+            for candidate in candidates:
+                unique.setdefault(_path_key(candidate.path), candidate)
+            operations = [self._delete_operation("pending_work", owner_key)]
+            for key, candidate in sorted(unique.items()):
+                pending = WatchPendingWork(
+                    path=os.path.abspath(candidate.path),
+                    size=int(candidate.size),
+                    mtime=float(candidate.mtime),
+                    file_id=str(getattr(candidate, "file_id", "") or ""),
+                    change_usn=int(getattr(candidate, "change_usn", 0) or 0),
+                    force=True,
+                    password_scope_dir=scope,
+                    internal_recovery=True,
+                )
+                operations.append(self._put_operation("pending_work", key, pending))
+            self._commit_operations_locked(operations, durable=True)
 
     def complete_work(self, paths: Iterable[str]) -> None:
         with self._state_lock:
@@ -499,7 +658,7 @@ class WatchStateStore:
             self._commit_operations_locked([
                 self._delete_operation("pending_work", key)
                 for key in sorted(keys)
-            ])
+            ], durable=True)
 
     def complete_work_if_matches(self, candidate) -> None:
         with self._state_lock:
@@ -516,7 +675,7 @@ class WatchStateStore:
                 return
             self._commit_operations_locked([
                 self._delete_operation("pending_work", key),
-            ])
+            ], durable=True)
 
     def forget_path(self, path: str, *, recursive: bool = False) -> bool:
         normalized = os.path.abspath(path)
@@ -679,7 +838,7 @@ class WatchStateStore:
                 if previous is not None:
                     self._commit_operations_locked([
                         self._delete_operation("entries", key),
-                    ])
+                    ], durable=True)
                 return
             entry = WatchStateEntry(
                 path=os.path.abspath(path),
@@ -698,11 +857,15 @@ class WatchStateStore:
             )
             self._commit_operations_locked([
                 self._put_operation("entries", key, entry),
-            ])
+            ], durable=True)
 
     def group_state(self, group_id: str) -> WatchGroupState | None:
         with self._state_lock:
             return self.groups.get(group_id)
+
+    def group_items(self) -> list[WatchGroupState]:
+        with self._state_lock:
+            return list(self.groups.values())
 
     def record_group_waiting(self, snapshot: WatchGroupSnapshot) -> None:
         with self._state_lock:
@@ -728,7 +891,7 @@ class WatchStateStore:
             )
             self._commit_operations_locked([
                 self._put_operation("groups", snapshot.group_id, record),
-            ])
+            ], durable=True)
 
     def record_group_attempt(self, snapshot: WatchGroupSnapshot) -> None:
         with self._state_lock:
@@ -771,7 +934,7 @@ class WatchStateStore:
             )
             self._commit_operations_locked([
                 self._put_operation("groups", snapshot.group_id, record),
-            ])
+            ], durable=True)
 
     def record_group_terminal(
         self,
@@ -793,7 +956,7 @@ class WatchStateStore:
             )
             self._commit_operations_locked([
                 self._put_operation("groups", snapshot.group_id, record),
-            ])
+            ], durable=True)
 
     def record_group_done(self, snapshot: WatchGroupSnapshot) -> None:
         self.record_group_terminal(snapshot, status="done")

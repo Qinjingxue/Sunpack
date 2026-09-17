@@ -610,7 +610,16 @@ class _RequestRuntime:
             try:
                 callback(task, dict(event))
             except Exception:
-                # Progress observers are best-effort; a broken UI/notification sink must never fail an extraction.
+                lifecycle_event = str(event.get("event") or "") in {
+                    "task_output_started",
+                    "task_output_committed",
+                }
+                if getattr(self.submission, "origin", "") == "watch" and lifecycle_event:
+                    # These two events are the Watch write-ahead boundary. If the
+                    # durable state write fails, extraction/source cleanup must not
+                    # proceed as if crash recovery were armed.
+                    raise
+                # Ordinary progress observers remain best-effort UI/reporting.
                 pass
 
     def _resolve_missing_volume_once(self, task, _outcome):

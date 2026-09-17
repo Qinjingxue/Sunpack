@@ -1,0 +1,285 @@
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+from sunpack.filesystem.watcher.scanner import WatchCandidate
+from sunpack.filesystem.watcher.state import WatchStateStore
+
+
+def _candidate(path, *, size=10, mtime=1.0):
+    return WatchCandidate(path=str(path), size=size, mtime=mtime, file_id="id", change_usn=3)
+
+
+def test_pending_output_recovery_state_round_trips(tmp_path):
+    state_path = tmp_path / "state.json"
+    source = tmp_path / "outer.zip"
+    source.write_bytes(b"x")
+    inner = tmp_path / "out" / "inner.zip"
+    output = tmp_path / "out" / "inner"
+    state = WatchStateStore(str(state_path))
+    state.queue_active(_candidate(source), password_scope_dir=str(tmp_path))
+    assert state.record_task_output_started(str(source), str(inner), str(output))
+
+    reloaded = WatchStateStore(str(state_path))
+    [pending] = reloaded.pending_work_items()
+    assert pending.active_outputs[str(inner.resolve())] == str(output.resolve())
+    assert pending.password_scope_dir == str(tmp_path.resolve())
+
+    assert reloaded.record_task_output_committed(str(source), str(inner), str(output))
+    [committed] = WatchStateStore(str(state_path)).pending_work_items()
+    assert committed.active_outputs == {}
+    assert committed.committed_roots == [str(output.resolve())]
+    assert committed.completed_sources == [str(inner.resolve())]
+
+
+def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
+    state_path = tmp_path / "state.json"
+    outer = tmp_path / "outer.zip"
+    first = tmp_path / "out" / "first.zip"
+    second = tmp_path / "out" / "second.zip"
+    for path in (outer, first, second):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"x")
+    state = WatchStateStore(str(state_path))
+    state.queue_active(_candidate(outer), password_scope_dir=str(tmp_path))
+    state.rebase_pending_work(
+        str(outer),
+        [_candidate(first), _candidate(second)],
+        password_scope_dir=str(tmp_path),
+    )
+
+    recovered = WatchStateStore(str(state_path)).pending_work_items()
+    assert {item.path for item in recovered} == {str(first.resolve()), str(second.resolve())}
+    assert all(item.internal_recovery for item in recovered)
+    assert all(item.password_scope_dir == str(tmp_path.resolve()) for item in recovered)
+    assert all(not item.active_outputs and not item.committed_roots for item in recovered)
+
+
+def test_critical_pending_transition_calls_fsync(tmp_path, monkeypatch):
+    import sunpack.filesystem.watcher.state as state_module
+
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    source = tmp_path / "queued.zip"
+    source.write_bytes(b"x")
+    calls = []
+    monkeypatch.setattr(state_module.os, "fsync", lambda fd: calls.append(fd))
+    state.queue_active(_candidate(source))
+    assert calls, "queue admission must cross a durability barrier"
+
+
+def test_noncritical_attempt_refresh_does_not_force_an_extra_fsync(tmp_path, monkeypatch):
+    import sunpack.filesystem.watcher.state as state_module
+
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    source = tmp_path / "queued.zip"
+    source.write_bytes(b"x")
+    state.queue_active(_candidate(source))
+    calls = []
+    monkeypatch.setattr(state_module.os, "fsync", lambda fd: calls.append(fd))
+    state.record_attempt(str(source), 10, 2.0, "id", 4)
+    assert calls == []
+
+
+def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
+    import sunpack.filesystem.watcher.scheduler as scheduler_module
+
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    password_archive = tmp_path / "password.zip"
+    missing_archive = tmp_path / "missing.7z.001"
+    password_archive.write_bytes(b"x")
+    missing_archive.write_bytes(b"x")
+    scope = tmp_path / "scope"
+    scope.mkdir()
+    password_entry = SimpleNamespace(
+        path=str(password_archive),
+        status="failed_password",
+        password_scope_dir=str(scope),
+        failure_payload={"password_scope_signature": "old"},
+    )
+    missing_entry = SimpleNamespace(
+        path=str(missing_archive),
+        status="suspended_missing_volume",
+        password_scope_dir=str(tmp_path),
+        failure_payload={},
+    )
+    waiting_member = tmp_path / "waiting.7z.002"
+    waiting_member.write_bytes(b"x")
+    waiting_group = SimpleNamespace(
+        status="waiting",
+        head_path="",
+        input_paths=[str(waiting_member)],
+        owned_paths=[str(waiting_member)],
+    )
+    scheduler.state = SimpleNamespace(
+        entry_items=lambda: [password_entry, missing_entry],
+        group_items=lambda: [waiting_group],
+    )
+    scheduler.config = {}
+    calls = []
+    scheduler.enqueue = lambda path, **kwargs: calls.append((path, kwargs))
+    monkeypatch.setattr(scheduler_module, "_directory_password_signature", lambda *_args: "new")
+
+    scheduler._reconcile_persisted_blockers()
+
+    assert [call[0] for call in calls] == [
+        str(password_archive),
+        str(missing_archive),
+        str(waiting_member),
+    ]
+    assert calls[0][1]["event_type"] == "startup_password_reconcile"
+    assert calls[1][1]["event_type"] == "startup_missing_volume_reconcile"
+    assert calls[2][1]["event_type"] == "startup_group_reconcile"
+
+
+
+def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
+    import threading
+    import sunpack.filesystem.watcher.scheduler as scheduler_module
+
+    source = tmp_path / "outer.zip"
+    source.write_bytes(b"x")
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    state.queue_active(_candidate(source))
+
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler._lock = threading.Lock()
+    scheduler._pending = {}
+    scheduler._active_states = {}
+    scheduler._quiet_trackers = {}
+    scheduler._latest_observations = {}
+    scheduler._inflight_requests = [SimpleNamespace(candidate=_candidate(source), group=None)]
+    scheduler.state = state
+    scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
+    scheduler._wake_callback = None
+
+    scheduler.notify_path_departed(str(source))
+
+    assert state.pending_work_for_path(str(source)) is not None
+
+
+def test_departed_unowned_path_is_still_forgotten(tmp_path):
+    import threading
+    import sunpack.filesystem.watcher.scheduler as scheduler_module
+
+    source = tmp_path / "gone.zip"
+    source.write_bytes(b"x")
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    state.queue_active(_candidate(source))
+
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler._lock = threading.Lock()
+    scheduler._pending = {}
+    scheduler._active_states = {}
+    scheduler._quiet_trackers = {}
+    scheduler._latest_observations = {}
+    scheduler._inflight_requests = []
+    scheduler.state = state
+    scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
+    scheduler._wake_callback = None
+
+    scheduler.notify_path_departed(str(source))
+
+    assert state.pending_work_for_path(str(source)) is None
+
+
+
+def test_critical_semantic_event_propagates_callback_failure():
+    import pytest
+    from sunpack.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
+
+    runner = SevenZipRunner({})
+    runner.progress_callback = lambda *_args: (_ for _ in ()).throw(RuntimeError("state write failed"))
+    task = SimpleNamespace()
+
+    with pytest.raises(RuntimeError, match="state write failed"):
+        runner.emit_semantic_event(task, "task_output_started", critical=True, output_dir="out")
+
+    # Ordinary progress semantics remain best-effort.
+    runner.emit_semantic_event(task, "ui_progress", critical=False)
+
+
+
+def test_committed_roots_collapse_nested_outputs(tmp_path):
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    outer = tmp_path / "outer.zip"
+    outer.write_bytes(b"x")
+    state.queue_active(_candidate(outer))
+    root = tmp_path / "out" / "outer"
+    child_source = root / "child.zip"
+    child_output = root / "child"
+
+    state.record_task_output_started(str(outer), str(outer), str(root))
+    state.record_task_output_committed(str(outer), str(outer), str(root))
+    state.record_task_output_started(str(outer), str(child_source), str(child_output))
+    state.record_task_output_committed(str(outer), str(child_source), str(child_output))
+
+    [pending] = state.pending_work_items()
+    assert pending.committed_roots == [str(root.resolve())]
+    assert pending.completed_sources == [str(child_source.resolve())]
+
+
+def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path):
+    import threading
+    import pytest
+    import sunpack.filesystem.watcher.scheduler as scheduler_module
+
+    source = tmp_path / "archive.zip"
+    source.write_bytes(b"payload")
+    candidate = _candidate(source, size=7)
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler._lock = threading.Lock()
+    scheduler._pending = {}
+    scheduler._active_states = {}
+    scheduler._latest_observations = {}
+    scheduler._quiet_trackers = {}
+    scheduler._filter_revision = 0
+    scheduler.cold_start_seconds = 0.0
+    scheduler._quiet_policy = SimpleNamespace()
+    scheduler.state = SimpleNamespace(
+        latest_entry_for_path=lambda _path: None,
+        queue_active=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk failed")),
+    )
+    scheduler.config = {}
+    scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None, write_throttled=lambda *_args, **_kwargs: None)
+    scheduler._wake_callback = None
+    scheduler.metadata_files = set()
+    scheduler.metadata_dir = ""
+    scheduler.watch_roots = [str(tmp_path)]
+    scheduler.filters = []
+    scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
+    scheduler._passes_filesystem_filters = lambda _candidate: True
+    monkeypatch_target = scheduler_module._candidate_for_event_path
+    scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate
+    try:
+        with pytest.raises(OSError, match="disk failed"):
+            scheduler.enqueue(str(source), force=True)
+    finally:
+        scheduler_module._candidate_for_event_path = monkeypatch_target
+
+    assert scheduler._pending == {}
+    assert scheduler._active_states == {}
+
+
+
+def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):
+    import sunpack.filesystem.watcher.scheduler as scheduler_module
+
+    state = WatchStateStore(str(tmp_path / "state.json"))
+    archive = tmp_path / "inner.zip"
+    archive.write_bytes(b"x")
+    state.mark(
+        str(archive),
+        1,
+        archive.stat().st_mtime,
+        status="failed_password",
+        failure_payload={"kind": "wrong_password", "blockers": ["password"]},
+    )
+
+    assert scheduler_module._persisted_blocker_owns_retry(state, str(archive)) is True
+    state.mark(
+        str(archive),
+        1,
+        archive.stat().st_mtime,
+        status="done",
+    )
+    assert scheduler_module._persisted_blocker_owns_retry(state, str(archive)) is False
