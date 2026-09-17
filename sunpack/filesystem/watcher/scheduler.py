@@ -73,6 +73,10 @@ from sunpack.support.resource_lifecycle import (
     open_service_file,
     register_service_resource,
 )
+from sunpack.support.output_cleanup import (
+    DEFAULT_OUTPUT_CLEANUP_MANAGER,
+    OutputCleanupEvent,
+)
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -339,11 +343,8 @@ class WatchScheduler:
                 raise
         self._clipboard_monitor.start()
         self._started = True
-        for pending in self.state.pending_work_items():
-            if os.path.exists(pending.path):
-                self.enqueue(pending.path, force=pending.force, event_type="recovery")
-            else:
-                self.state.forget_path(pending.path)
+        self._recover_persisted_work()
+        self._reconcile_persisted_blockers()
         if self.initial_scan or self.initial_scan_roots is not None:
             scan_roots = self.watch_roots if self.initial_scan_roots is None else self.initial_scan_roots
             for candidate in scan_watch_candidates(scan_roots, recursive=self.recursive):
@@ -361,6 +362,170 @@ class WatchScheduler:
             quiet_min_seconds=self._quiet_policy.minimum_seconds,
             quiet_max_seconds=self._quiet_policy.maximum_seconds,
         )
+
+    def _recover_persisted_work(self) -> None:
+        """Recover only durable in-flight work; never scan unrelated Watch roots."""
+
+        for pending in self.state.pending_work_items():
+            active_outputs = dict(getattr(pending, "active_outputs", {}) or {})
+            committed_roots = list(getattr(pending, "committed_roots", []) or [])
+            completed_sources = {
+                path_key(path)
+                for path in list(getattr(pending, "completed_sources", []) or [])
+                if path
+            }
+            scope_dir = str(getattr(pending, "password_scope_dir", "") or "")
+            internal = bool(getattr(pending, "internal_recovery", False))
+
+            if not active_outputs and not committed_roots:
+                if os.path.exists(pending.path):
+                    self.enqueue(
+                        pending.path,
+                        force=pending.force,
+                        event_type="recovery",
+                        _crash_recovery=internal,
+                        _recovery_scope_dir=scope_dir,
+                        _state_prequeued=True,
+                    )
+                else:
+                    self.state.forget_path(pending.path)
+                continue
+
+            cleanup_failed = False
+            for output_dir in dict.fromkeys(active_outputs.values()):
+                result = DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_canonical(
+                    output_dir,
+                    event=OutputCleanupEvent.EXTRACTION_ABORT,
+                    planned_output_dir=output_dir,
+                )
+                self.log.write(
+                    "crash_output_cleanup",
+                    owner_path=pending.path,
+                    output_dir=output_dir,
+                    cleaned=result.cleaned,
+                    already_absent=result.already_absent,
+                    reason=result.reason,
+                    error=result.error,
+                )
+                if not (result.cleaned or result.already_absent):
+                    cleanup_failed = True
+            if cleanup_failed:
+                # Keep the durable owner record. A later process start can retry
+                # cleanup without ever writing into an unknown half-output.
+                continue
+
+            recovered: dict[str, WatchCandidate] = {}
+            for task_path in active_outputs:
+                if path_key(task_path) in completed_sources:
+                    continue
+                candidate = _candidate_for_event_path(task_path)
+                if (
+                    candidate is not None
+                    and not _persisted_blocker_owns_retry(self.state, candidate.path)
+                ):
+                    recovered.setdefault(path_key(candidate.path), candidate)
+
+            scan_failed = False
+            for root in committed_roots:
+                if not os.path.isdir(root):
+                    continue
+                try:
+                    candidates = scan_watch_candidates([root], recursive=True)
+                except OSError as exc:
+                    self.log.write(
+                        "crash_resume_scan_failed",
+                        owner_path=pending.path,
+                        root=root,
+                        error=str(exc),
+                    )
+                    scan_failed = True
+                    break
+                for candidate in candidates:
+                    if path_key(candidate.path) in completed_sources:
+                        continue
+                    if _persisted_blocker_owns_retry(self.state, candidate.path):
+                        continue
+                    recovered.setdefault(path_key(candidate.path), candidate)
+            if scan_failed:
+                continue
+
+            if active_outputs and not recovered and not committed_roots:
+                self.log.write(
+                    "crash_recovery_source_missing",
+                    owner_path=pending.path,
+                    task_paths=list(active_outputs),
+                )
+                continue
+
+            candidates = list(recovered.values())
+            # Atomically replace the old owner with concrete recovery candidates
+            # before rebuilding the in-memory queue. A second crash between the
+            # two steps therefore restarts from the new durable candidates.
+            self.state.rebase_pending_work(
+                pending.path,
+                candidates,
+                password_scope_dir=scope_dir,
+            )
+            for candidate in candidates:
+                self.enqueue(
+                    candidate.path,
+                    force=True,
+                    event_type="crash_recovery",
+                    _crash_recovery=True,
+                    _recovery_scope_dir=scope_dir,
+                    _state_prequeued=True,
+                )
+
+    def _reconcile_persisted_blockers(self) -> None:
+        """Re-evaluate only persisted blockers once at startup; no polling."""
+
+        for entry in self.state.entry_items():
+            if not os.path.exists(entry.path):
+                continue
+            if entry.status == "failed_password":
+                payload = entry.failure_payload if isinstance(entry.failure_payload, dict) else {}
+                previous = str(payload.get("password_scope_signature") or "")
+                current = _directory_password_signature(entry.password_scope_dir, self.config)
+                if previous != current:
+                    self.enqueue(
+                        entry.path,
+                        force=True,
+                        event_type="startup_password_reconcile",
+                        _password_retry_snapshot=entry,
+                    )
+                continue
+            if entry.status == "suspended_missing_volume":
+                # Re-resolving this one known input lets the existing group
+                # fingerprint gate decide whether an offline volume arrival made
+                # it retryable. Unchanged groups remain suspended without extract.
+                self.enqueue(
+                    entry.path,
+                    force=True,
+                    event_type="startup_missing_volume_reconcile",
+                )
+
+        for group in self.state.group_items():
+            if group.status != "waiting":
+                continue
+            # A pre-dispatch split group can be waiting before a canonical head
+            # exists, so there may be no failure entry to reconcile. Re-enqueue
+            # one persisted member only; the existing relation resolver scans
+            # that split family directory and sees any volumes that arrived while
+            # SunPack was offline. This is one startup event, not polling.
+            candidate_path = next(
+                (
+                    value
+                    for value in [group.head_path, *group.input_paths, *group.owned_paths]
+                    if value and os.path.isfile(value)
+                ),
+                "",
+            )
+            if candidate_path:
+                self.enqueue(
+                    candidate_path,
+                    force=True,
+                    event_type="startup_group_reconcile",
+                )
 
     def _ensure_directory_password_files(self) -> None:
         for root in self.watch_roots:
@@ -662,6 +827,9 @@ class WatchScheduler:
         event_type: str = "unknown",
         src_path: str = "",
         _password_retry_snapshot: WatchStateEntry | None = None,
+        _crash_recovery: bool = False,
+        _recovery_scope_dir: str = "",
+        _state_prequeued: bool = False,
     ):
         if self.should_ignore_event_path(path):
             return
@@ -684,7 +852,8 @@ class WatchScheduler:
             _password_retry_snapshot is not None
             and _candidate_matches_password_failure(candidate, _password_retry_snapshot)
         )
-        if not self._is_under_watched_root(candidate.path) and not password_retry:
+        internal_recovery = bool(_crash_recovery)
+        if not self._is_under_watched_root(candidate.path) and not password_retry and not internal_recovery:
             self._log_candidate_ignored(candidate.path, "outside_watched_roots")
             return
         if self._is_under_metadata_dir(candidate.path):
@@ -717,7 +886,7 @@ class WatchScheduler:
                 state.filtered_mtime = candidate.mtime
                 self._wake_service()
                 return
-        if not password_retry and not self._passes_filesystem_filters(candidate):
+        if not password_retry and not internal_recovery and not self._passes_filesystem_filters(candidate):
             self._log_candidate_ignored(candidate.path, "filtered_out")
             return
         became_active = False
@@ -732,12 +901,22 @@ class WatchScheduler:
                 return
             state = self._active_states.get(candidate.path)
             if state is None:
-                retry_is_unchanged = password_retry
+                retry_is_unchanged = password_retry or internal_recovery
                 active_quiet_seconds = (
                     0.0
                     if retry_is_unchanged
                     else self._observe_candidate_activity(candidate, now)
                 )
+                # Persist before making the candidate visible to concurrent
+                # scheduler/event paths. If fsync fails there is no in-memory
+                # work that can proceed without a crash-recovery record.
+                if not _state_prequeued:
+                    self.state.queue_active(
+                        candidate,
+                        force=force,
+                        password_scope_dir=_recovery_scope_dir,
+                        internal_recovery=internal_recovery,
+                    )
                 self._pending[candidate.path] = candidate
                 self._latest_observations[candidate.path] = candidate
                 became_active = True
@@ -765,7 +944,6 @@ class WatchScheduler:
                 state.filtered_size = candidate.size
                 state.filtered_mtime = candidate.mtime
         if became_active:
-            self.state.queue_active(candidate, force=force)
             self.log.write(
                 "candidate_active",
                 path=candidate.path,
@@ -831,6 +1009,19 @@ class WatchScheduler:
     def notify_path_departed(self, path: str, *, recursive: bool = False) -> None:
         normalized = os.path.abspath(path)
         with self._lock:
+            # Task-level cleanup is allowed to delete an input before the whole
+            # recursive Watch request finishes. Those watcher delete events must
+            # not erase the durable crash owner while the request still owns the
+            # path/group; completion will retire it after all recovery anchors are
+            # committed.
+            inflight_owned = any(
+                _paths_match(request.candidate.path, normalized, recursive=recursive)
+                or any(
+                    _paths_match(member, normalized, recursive=recursive)
+                    for member in (request.group.owned_paths if request.group is not None else ())
+                )
+                for request in self._inflight_requests
+            )
             pending_paths = [
                 candidate_path
                 for candidate_path in self._pending
@@ -853,7 +1044,16 @@ class WatchScheduler:
             ]
             for candidate_path in observation_paths:
                 self._latest_observations.pop(candidate_path, None)
-        forgotten = self.state.forget_path(normalized, recursive=recursive)
+        pending_record = self.state.pending_work_for_path(normalized)
+        recovery_armed = bool(
+            pending_record is not None
+            and (pending_record.active_outputs or pending_record.committed_roots)
+        )
+        forgotten = (
+            False
+            if inflight_owned or recovery_armed
+            else self.state.forget_path(normalized, recursive=recursive)
+        )
         self.log.write(
             "candidate_departed",
             path=normalized,
@@ -900,7 +1100,15 @@ class WatchScheduler:
                 or filtered_size != refreshed.size
                 or filtered_mtime != refreshed.mtime
             )
-            if filter_stale and not self._passes_filesystem_filters(refreshed):
+            pending_record = self.state.pending_work_for_path(path)
+            internal_recovery = bool(
+                pending_record is not None and pending_record.internal_recovery
+            )
+            if (
+                filter_stale
+                and not internal_recovery
+                and not self._passes_filesystem_filters(refreshed)
+            ):
                 self._drop_active(path, generation)
                 self.state.complete_work([path])
                 continue
@@ -1064,12 +1272,11 @@ class WatchScheduler:
         with self._lock:
             if candidate.path in self._pending or candidate.path in self._active_states:
                 return
+            # Same write-ahead rule as enqueue(): do not expose deferred work
+            # to memory until its crash queue record is durable.
+            self.state.queue_active(candidate, force=True)
             self._pending[candidate.path] = candidate
             self._active_states[candidate.path] = state
-            # Persist the armed attempt (the same as enqueue("modified")) so a
-            # restart recovers this member for dispatch once the group is
-            # ready, without keeping the in-memory force flag hot.
-            self.state.queue_active(candidate, force=True)
         self._wake_service()
 
     def _observe_candidate_activity(
@@ -1131,17 +1338,21 @@ class WatchScheduler:
         with self._password_source_lock:
             run_config = dict(self.config)
             retry_entry = self.state.latest_entry_for_path(candidate.path)
+            pending = self.state.pending_work_for_path(candidate.path)
+            scope_dir = ""
             if retry_entry is not None and retry_entry.status == "failed_password":
                 scope_dir = retry_entry.password_scope_dir
-                if scope_dir:
-                    scoped_passwords = discover_directory_passwords_for_archive(
-                        os.path.join(scope_dir, "__sunpack_password_retry__"),
-                        self.config,
-                    )
-                    run_config["user_passwords"] = dedupe_passwords([
-                        *list(run_config.get("user_passwords") or []),
-                        *scoped_passwords,
-                    ])
+            elif pending is not None:
+                scope_dir = str(pending.password_scope_dir or "")
+            if scope_dir:
+                scoped_passwords = discover_directory_passwords_for_archive(
+                    os.path.join(scope_dir, "__sunpack_password_retry__"),
+                    self.config,
+                )
+                run_config["user_passwords"] = dedupe_passwords([
+                    *list(run_config.get("user_passwords") or []),
+                    *scoped_passwords,
+                ])
             self.pipeline_engine.update_password_sources(
                 user_passwords=run_config.get("user_passwords", []),
                 builtin_passwords=run_config.get("builtin_passwords", []),
@@ -1172,8 +1383,8 @@ class WatchScheduler:
         try:
             task = asyncio.create_task(self.pipeline_engine.run(
                 [PipelineTarget(candidate.path, output=run_config["output"])],
-                progress_callback=lambda archive_task, event: self._notify(
-                    "progress",
+                progress_callback=lambda archive_task, event: self._handle_pipeline_progress(
+                    candidate.path,
                     notification_id,
                     archive_task,
                     event,
@@ -1194,6 +1405,30 @@ class WatchScheduler:
             task=task,
             registry_owner=notification_id if host is not None else "",
         )
+
+    def _handle_pipeline_progress(
+        self,
+        owner_path: str,
+        notification_id: str,
+        archive_task,
+        event: dict,
+    ) -> None:
+        name = str(event.get("event") or "")
+        if name == "task_output_started":
+            self.state.record_task_output_started(
+                owner_path,
+                str(getattr(archive_task, "main_path", "") or ""),
+                str(event.get("output_dir") or ""),
+            )
+            return
+        if name == "task_output_committed":
+            self.state.record_task_output_committed(
+                owner_path,
+                str(getattr(archive_task, "main_path", "") or ""),
+                str(event.get("output_dir") or ""),
+            )
+            return
+        self._notify("progress", notification_id, archive_task, event)
 
     async def _complete_candidate(self, request: _ActivePipelineRequest) -> WatchRunResult:
         candidate = request.candidate
@@ -1242,6 +1477,7 @@ class WatchScheduler:
         )
         original_scope = _password_scope_for_path(self.state, candidate.path)
         password_scope_dir = original_scope or os.path.dirname(os.path.abspath(candidate.path))
+        password_scope_signature = _directory_password_signature(password_scope_dir, self.config)
 
         # The watched input has its own lifecycle even when a recursively generated
         # archive fails later. A successful direct task leaves group/state now;
@@ -1273,6 +1509,7 @@ class WatchScheduler:
                 path=candidate.path,
                 blockers=blockers,
                 password_scope_dir=password_scope_dir if direct_password else "",
+                password_scope_signature=password_scope_signature if direct_password else "",
             )
             error = _failure_message(
                 direct_failure,
@@ -1331,6 +1568,7 @@ class WatchScheduler:
                 path=retry_candidate.path,
                 blockers=[BLOCKER_PASSWORD],
                 password_scope_dir=password_scope_dir,
+                password_scope_signature=password_scope_signature,
             )
             error = _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
             self.state.mark(
@@ -1453,6 +1691,14 @@ class WatchScheduler:
             self.log.write("no_tasks_found", path=candidate.path)
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
+
+        if direct_outcome == OutcomeKind.PARTIAL_SUCCESS:
+            error = self.i18n.t("watch.failure.partial_rejected")
+            if group is not None:
+                self.state.record_group_terminal(group, status="failed_terminal")
+            self.log.write("partial_rejected", path=candidate.path, error=error)
+            self._notify("failed", request.notification_id, [error], [])
+            return WatchRunResult(processed=1, failed=1, errors=[error])
 
         if direct_outcome != OutcomeKind.COMPLETE_SUCCESS:
             error = self.i18n.t("watch.failure.no_complete_outcome")
@@ -1863,23 +2109,54 @@ def _failure_payload(
     path: str = "",
     blockers: list[str] | None = None,
     password_scope_dir: str = "",
+    password_scope_signature: str = "",
 ) -> dict:
     payload = _failure_to_dict(failure)
     if blockers is not None:
         payload["blockers"] = list(blockers)
     if password_scope_dir:
         payload["password_scope_dir"] = os.path.abspath(password_scope_dir)
+    if password_scope_signature:
+        payload["password_scope_signature"] = password_scope_signature
     if path:
         details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
         payload["details"] = {**details, "path": os.path.abspath(path)}
     return payload
 
 
+def _persisted_blocker_owns_retry(state: WatchStateStore, path: str) -> bool:
+    entry = state.latest_entry_for_path(path)
+    return bool(
+        entry is not None
+        and entry.status in {"failed_password", "suspended_missing_volume"}
+    )
+
+
 def _password_scope_for_path(state: WatchStateStore, path: str) -> str:
     entry = state.latest_entry_for_path(path)
     if entry is not None and entry.status == "failed_password":
         return entry.password_scope_dir
-    return ""
+    pending = state.pending_work_for_path(path)
+    return str(pending.password_scope_dir or "") if pending is not None else ""
+
+
+def _directory_password_signature(scope_dir: str, config: dict) -> str:
+    if not scope_dir:
+        return ""
+    path = os.path.join(os.path.abspath(scope_dir), DIRECTORY_PASSWORD_FILE_NAME)
+    if not is_directory_password_file(path, config):
+        return "disabled"
+    try:
+        stat_result = os.stat(path)
+    except FileNotFoundError:
+        return "missing"
+    except OSError as exc:
+        return f"unknown:{getattr(exc, 'winerror', None) or exc.errno or 0}"
+    return ":".join((
+        str(int(stat_result.st_size)),
+        str(int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000)))),
+        str(int(getattr(stat_result, "st_ctime_ns", int(stat_result.st_ctime * 1_000_000_000)))),
+    ))
 
 
 def _summary_processed_no_tasks(summary) -> bool:

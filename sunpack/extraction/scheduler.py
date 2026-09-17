@@ -52,6 +52,21 @@ class ExtractionScheduler:
     def set_progress_callback(self, callback: Callable[[ArchiveTask, dict], None] | None) -> None:
         self.sevenzip_runner.progress_callback = callback
 
+    def emit_semantic_event(
+        self,
+        task: ArchiveTask,
+        event: str,
+        *,
+        critical: bool = False,
+        **payload: Any,
+    ) -> None:
+        self.sevenzip_runner.emit_semantic_event(
+            task,
+            event,
+            critical=critical,
+            **payload,
+        )
+
     @property
     def recent_passwords(self) -> list[str]:
         return self.password_store.recent_passwords

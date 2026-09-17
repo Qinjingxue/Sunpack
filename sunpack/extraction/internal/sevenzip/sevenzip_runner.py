@@ -1506,10 +1506,28 @@ class SevenZipRunner:
         except Exception:
             pass
 
-    def emit_semantic_event(self, task: ArchiveTask, event: str, **payload: Any) -> None:
-        """Publish a pipeline-owned event through the ordered progress sink."""
+    def emit_semantic_event(
+        self,
+        task: ArchiveTask,
+        event: str,
+        *,
+        critical: bool = False,
+        **payload: Any,
+    ) -> None:
+        """Publish a pipeline-owned event through the ordered progress sink.
 
-        self._emit_progress(task, {"type": "semantic", "event": str(event), **payload})
+        Ordinary progress remains best-effort. Critical lifecycle boundaries are
+        allowed to propagate observer failures so Watch never performs dependent
+        filesystem work after its durable recovery write failed.
+        """
+
+        item = {"type": "semantic", "event": str(event), **payload}
+        if not critical:
+            self._emit_progress(task, item)
+            return
+        callback = self.progress_callback
+        if callback is not None:
+            callback(task, item)
 
     def _emit_native_event(self, task: ArchiveTask | None, event: dict[str, Any]) -> None:
         callback = self.native_event_callback

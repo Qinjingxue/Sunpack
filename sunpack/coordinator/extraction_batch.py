@@ -193,6 +193,15 @@ class ExtractionBatchRunner:
                 ensure_input_lease=ensure_input_lease,
             )
             output_dir = self.collect_result(task, outcome)
+            if output_dir and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
+                # Watch crash recovery must durably move its restart anchor to the
+                # verified output before task-level cleanup may delete the source.
+                self.extractor.emit_semantic_event(
+                    task,
+                    "task_output_committed",
+                    critical=True,
+                    output_dir=output_dir,
+                )
             if cleanup_scope is not None and output_dir:
                 # Clean up as soon as extract and verification are both finished, because
                 # verification reads the source archive back to build its manifest.
@@ -310,6 +319,15 @@ class ExtractionBatchRunner:
             self._report_task_finished(task, terminal)
             return task, terminal
 
+        # This is the last point before extraction may create/write the canonical
+        # output. Watch persists it synchronously so a killed process can remove
+        # exactly the interrupted output on restart.
+        self.extractor.emit_semantic_event(
+            task,
+            "task_output_started",
+            critical=True,
+            output_dir=planned_out_dir,
+        )
         state = self._extract_verify_state_machine(
             task,
             planned_out_dir,

@@ -2068,7 +2068,7 @@ def test_watch_scheduler_does_not_retry_terminal_failure_for_unchanged_event(tmp
     assert [event[0] for event in notifications.events] == ["submitted", "failed"]
 
 
-def test_nested_password_failure_notifies_but_keeps_password_blocker(tmp_path, monkeypatch):
+def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 
     class NestedPasswordRunner:
@@ -2100,20 +2100,16 @@ def test_nested_password_failure_notifies_but_keeps_password_blocker(tmp_path, m
     watcher.enqueue(str(archive_path))
     result = _await(watcher.run_once())
 
-    entry = next(iter(watcher.state.entries.values()))
     failed_event = next(event for event in notifications.events if event[0] == "failed")
     assert result.failed == 1
-    assert entry.status == "failed_password"
-    assert entry.failure_payload["blockers"] == ["password"]
-    assert entry.failure_payload["details"] == {
-        "scope": "nested_archive",
-        "reason": "password",
-    }
-    assert failed_event[2][0].startswith("内层压缩包密码错误：")
+    assert not watcher.state.entries
+    assert failed_event[2][0].endswith("nested-inner.7z.001: wrong password")
+    assert failed_event[3][0]["kind"] == "wrong_password"
+    assert not failed_event[3][0].get("details")
     assert not any(event[0] == "suppressed" for event in notifications.events)
 
 
-def test_nested_missing_volume_notifies_without_missing_volume_blocker(tmp_path, monkeypatch):
+def test_unstructured_nested_missing_volume_is_terminal_without_wait_anchor(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
 
     class NestedMissingRunner:
@@ -2148,11 +2144,9 @@ def test_nested_missing_volume_notifies_without_missing_volume_blocker(tmp_path,
     failed_event = next(event for event in notifications.events if event[0] == "failed")
     assert result.failed == 1
     assert not watcher.state.entries
-    assert failed_event[2][0].startswith("Nested archive missing volume:")
-    assert failed_event[3][0]["details"] == {
-        "scope": "nested_archive",
-        "reason": "missing_volume",
-    }
+    assert failed_event[2][0].endswith("nested-inner.7z.001: missing split volume")
+    assert failed_event[3][0]["kind"] == "missing_volume"
+    assert not failed_event[3][0].get("details")
     assert not any(event[0] == "suppressed" for event in notifications.events)
 
 
