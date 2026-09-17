@@ -11,7 +11,7 @@ permissions:
 jobs:
   watch-state:
     runs-on: windows-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - name: Set up uv
@@ -31,6 +31,10 @@ jobs:
       - name: Compile modified modules
         shell: pwsh
         run: .\.venv\Scripts\python.exe -m py_compile sunpack\filesystem\watcher\state.py sunpack\filesystem\watcher\journal_commit.py tests\unit\test_watch_state.py
-      - name: Run Watch state tests
+      - name: Run Watch persistence and scheduler tests
         shell: pwsh
-        run: .\.venv\Scripts\python.exe -m pytest -q tests\unit\test_watch_state.py
+        run: |
+          .\.venv\Scripts\python.exe -m pytest -q tests\unit\test_watch_state.py tests\unit\test_watch_crash_recovery.py tests\unit\test_watch_group_models.py tests\unit\test_watch_scheduler.py
+      - name: Benchmark Watch state persistence
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m benchmarks.scenarios.watch_state_persistence --records 3000 30000 100000 --rounds 5
