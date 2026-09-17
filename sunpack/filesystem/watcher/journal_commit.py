@@ -5,7 +5,9 @@ import os
 import queue
 import threading
 import time
-from typing import Final
+from typing import Any, Final
+
+from sunpack.support.resource_lifecycle import open_service_file
 
 
 # Small enough to be invisible to a single request, large enough to merge a burst
@@ -64,16 +66,16 @@ class _GroupCommitter:
         return ticket
 
     @staticmethod
-    def _write_all(fd: int, payload: bytes) -> None:
+    def _write_all(handle: Any, payload: bytes) -> None:
         view = memoryview(payload)
         while view:
-            written = os.write(fd, view)
-            if written <= 0:
+            written = handle.write(view)
+            if written is None or written <= 0:
                 raise OSError('short watch journal write')
             view = view[written:]
 
     def _run(self) -> None:
-        handles: dict[str, int] = {}
+        handles: dict[str, Any] = {}
         while True:
             first = self._queue.get()
             batch = [first]
@@ -96,15 +98,12 @@ class _GroupCommitter:
                     continue
                 try:
                     if request.payload:
-                        fd = handles.get(path)
-                        if fd is None:
+                        handle = handles.get(path)
+                        if handle is None:
                             os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-                            flags = os.O_APPEND | os.O_CREAT | os.O_WRONLY
-                            if hasattr(os, 'O_BINARY'):
-                                flags |= os.O_BINARY
-                            fd = os.open(path, flags, 0o666)
-                            handles[path] = fd
-                        self._write_all(fd, request.payload)
+                            handle = open_service_file(path, 'ab', buffering=0)
+                            handles[path] = handle
+                        self._write_all(handle, request.payload)
                     if request.durable:
                         durable_paths.add(path)
                     if request.close:
@@ -117,17 +116,17 @@ class _GroupCommitter:
                 if path in errors:
                     continue
                 try:
-                    fd = handles.get(path)
-                    if fd is not None:
-                        os.fsync(fd)
+                    handle = handles.get(path)
+                    if handle is not None:
+                        os.fsync(handle.fileno())
                 except BaseException as exc:
                     errors[path] = exc
 
             for path in close_paths:
-                fd = handles.pop(path, None)
-                if fd is not None:
+                handle = handles.pop(path, None)
+                if handle is not None:
                     try:
-                        os.close(fd)
+                        handle.close()
                     except BaseException as exc:
                         errors.setdefault(path, exc)
 

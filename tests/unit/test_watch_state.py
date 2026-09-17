@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import sunpack.filesystem.watcher.journal_commit as watch_journal_module
 import sunpack.filesystem.watcher.state as watch_state_module
 from sunpack.filesystem.watcher.group_models import WatchGroupState
 from sunpack.filesystem.watcher.state import (
@@ -104,7 +105,7 @@ def test_failed_journal_append_does_not_change_memory(tmp_path, monkeypatch):
     def fail_open(*_args, **_kwargs):
         raise OSError("journal unavailable")
 
-    monkeypatch.setattr(watch_state_module, "open_service_file", fail_open)
+    monkeypatch.setattr(watch_journal_module, "open_service_file", fail_open)
 
     with pytest.raises(OSError, match="journal unavailable"):
         state.queue_active(_candidate(tmp_path / "queued.7z"))

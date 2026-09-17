@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import hashlib
 import os
-import shutil
 from pathlib import Path
 
 from sunpack_native import (
     publish_watch_staged_output as _native_publish,
     watch_path_identity as _native_path_identity,
 )
+from sunpack.support.output_cleanup import cleanup_watch_staging_path
 from sunpack.support.output_inventory import OutputInventory
 
 STAGING_PREFIX = ".sunpack-partial-"
@@ -40,20 +40,22 @@ def prepare_staging_output(final_output_dir: str, source_path: str) -> str:
     parent = os.path.dirname(staging)
     os.makedirs(parent, exist_ok=True)
     if os.path.lexists(staging):
-        if os.path.islink(staging) or os.path.isfile(staging):
-            os.remove(staging)
-        else:
-            shutil.rmtree(staging)
+        _remove_staging_path(staging)
     return staging
+
+
+def _remove_staging_path(staging: str) -> None:
+    result = cleanup_watch_staging_path(staging)
+    if result.cleaned or result.already_absent:
+        return
+    detail = f": {result.error}" if result.error else ""
+    raise OSError(f"watch staging cleanup failed ({result.reason}){detail}")
 
 
 def cleanup_staging_output(staging: str) -> None:
     if not staging or not is_staging_path(staging) or not os.path.lexists(staging):
         return
-    if os.path.islink(staging) or os.path.isfile(staging):
-        os.remove(staging)
-    else:
-        shutil.rmtree(staging)
+    _remove_staging_path(staging)
 
 
 def publish_staging_output(staging: str, final_output_dir: str) -> None:
