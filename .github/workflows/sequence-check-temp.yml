@@ -1,0 +1,29 @@
+name: Temporary Watch Sequence Check
+
+on:
+  push:
+    branches:
+      - fix/watch-sequence-checkpoint
+
+permissions:
+  contents: read
+
+jobs:
+  watch-state:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.0"
+      - name: Install Python test dependencies
+        shell: pwsh
+        run: uv sync --locked --extra test
+      - name: Compile modified modules
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m py_compile sunpack\filesystem\watcher\state.py sunpack\filesystem\watcher\journal_commit.py tests\unit\test_watch_state.py
+      - name: Run Watch state tests
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m pytest -q tests\unit\test_watch_state.py
