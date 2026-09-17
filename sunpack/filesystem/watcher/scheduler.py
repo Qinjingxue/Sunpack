@@ -50,6 +50,9 @@ from sunpack.filesystem.watcher.scanner import (
     scan_watch_candidates,
     validate_ntfs_watch_roots,
     watch_file_is_ready,
+    watch_path_identity,
+    watch_root_changes,
+    watch_volume_cursor,
 )
 from sunpack.filesystem.watcher.scanner import _candidate_for as _watch_candidate_for_path
 from sunpack.filesystem.watcher.state import WatchStateEntry, WatchStateStore
@@ -77,6 +80,11 @@ from sunpack.support.output_cleanup import (
     DEFAULT_OUTPUT_CLEANUP_MANAGER,
     OutputCleanupEvent,
 )
+from sunpack.support.watch_staging import (
+    cleanup_staging_output,
+    publish_staging_output,
+)
+from sunpack.postprocess.actions import PostProcessActions
 
 from watchdog.events import FileSystemEvent, FileSystemEventHandler
 from watchdog.observers import Observer
@@ -232,6 +240,8 @@ class WatchScheduler:
         self._cache_cleanup_deadline: float | None = None
         self._runtime_cache_gate = asyncio.Lock()
         self._external_activity_gate_held = False
+        self._startup_suppress_paths: set[str] = set()
+        self._startup_retire_paths: set[str] = set()
         if pipeline_engine is None:
             raise ValueError("WatchScheduler requires a PipelineEngine")
         self.pipeline_engine = pipeline_engine
@@ -310,6 +320,7 @@ class WatchScheduler:
         if self._started:
             return
         self._ensure_directory_password_files()
+        self._prepare_usn_startup_baseline()
         removed_entries, removed_groups = self.state.prune_missing_records()
         if removed_entries or removed_groups:
             self.log.write(
@@ -345,6 +356,7 @@ class WatchScheduler:
         self._started = True
         self._recover_persisted_work()
         self._reconcile_persisted_blockers()
+        self._recover_usn_startup_gap()
         if self.initial_scan or self.initial_scan_roots is not None:
             scan_roots = self.watch_roots if self.initial_scan_roots is None else self.initial_scan_roots
             for candidate in scan_watch_candidates(scan_roots, recursive=self.recursive):
@@ -363,6 +375,168 @@ class WatchScheduler:
             quiet_max_seconds=self._quiet_policy.maximum_seconds,
         )
 
+    def _watch_root_directory(self, root: str) -> str:
+        root = os.path.abspath(root)
+        return root if os.path.isdir(root) else os.path.dirname(root)
+
+    def _prepare_usn_startup_baseline(self) -> None:
+        """Durably establish first-run cursors before the observer can miss a gap."""
+        missing: dict[str, dict[str, int]] = {}
+        for root in self.watch_roots:
+            directory = self._watch_root_directory(root)
+            try:
+                volume, journal_id, next_usn = watch_volume_cursor(directory)
+            except Exception as exc:
+                self.log.write("usn_cursor_unavailable", root=root, error=str(exc))
+                continue
+            if self.state.watch_cursor(volume) is None:
+                missing[volume] = {"journal_id": journal_id, "next_usn": next_usn}
+        if missing:
+            self.state.merge_watch_cursors(missing, durable=True)
+
+    def _recover_usn_startup_gap(self) -> None:
+        """Replay only NTFS changes since the durable cursor; never poll."""
+        cursor_updates: dict[str, dict[str, int]] = {}
+        changed_paths: dict[str, str] = {}
+        fallback_roots: set[str] = set()
+        for root in self.watch_roots:
+            directory = self._watch_root_directory(root)
+            try:
+                volume, journal_id, end_usn = watch_volume_cursor(directory)
+                saved = self.state.watch_cursor(volume)
+                if (
+                    saved is None
+                    or int(saved.get("journal_id", 0) or 0) != journal_id
+                    or int(saved.get("next_usn", 0) or 0) > end_usn
+                ):
+                    fallback_roots.add(root)
+                else:
+                    start_usn = int(saved.get("next_usn", 0) or 0)
+                    if end_usn > start_usn:
+                        for path in watch_root_changes(directory, start_usn, end_usn):
+                            absolute = os.path.abspath(path)
+                            if os.path.isfile(root) and path_key(absolute) != path_key(root):
+                                continue
+                            changed_paths.setdefault(path_key(absolute), absolute)
+                cursor_updates[volume] = {
+                    "journal_id": journal_id,
+                    "next_usn": end_usn,
+                }
+            except Exception as exc:
+                fallback_roots.add(root)
+                self.log.write("usn_recovery_fallback", root=root, error=str(exc))
+
+        for root in sorted(fallback_roots):
+            try:
+                for candidate in scan_watch_candidates([root], recursive=False):
+                    changed_paths.setdefault(path_key(candidate.path), candidate.path)
+            except OSError as exc:
+                self.log.write("usn_fallback_scan_failed", root=root, error=str(exc))
+
+        for key, path in changed_paths.items():
+            if key in self._startup_suppress_paths:
+                continue
+            if _persisted_blocker_owns_retry(self.state, path):
+                continue
+            self.enqueue(path, force=True, event_type="startup_usn_recovery")
+
+        with self._lock:
+            recovered_candidates = list(self._pending.values())
+        # Candidate owners and cursor advancement are one durable transaction.
+        # A crash observes either the old cursor or every replay candidate.
+        if cursor_updates:
+            self.state.queue_recovery_batch(
+                recovered_candidates,
+                cursor_updates,
+                retire_paths=self._startup_retire_paths,
+            )
+        self._startup_retire_paths.clear()
+        self.log.write(
+            "usn_startup_recovered",
+            changed=len(changed_paths),
+            queued=len(recovered_candidates),
+            fallback_roots=sorted(fallback_roots),
+        )
+
+    def _publication_identity_matches(self, path: str, expected_file_id: str) -> bool:
+        if not expected_file_id:
+            return True
+        try:
+            _volume, file_id, _usn = watch_path_identity(path)
+        except Exception:
+            return False
+        return str(file_id or "").lower() == str(expected_file_id or "").lower()
+
+    def _recover_committed_publications(self, pending) -> bool:
+        publications = dict(getattr(pending, "publications", {}) or {})
+        if not publications:
+            return True
+        for publication in publications.values():
+            task_path = os.path.abspath(str(publication.get("task_path") or ""))
+            staging = os.path.abspath(str(publication.get("staging_dir") or "")) if publication.get("staging_dir") else ""
+            final = os.path.abspath(str(publication.get("output_dir") or ""))
+            expected_id = str(publication.get("staging_file_id") or "")
+            if not task_path or not final:
+                return False
+            staging_exists = bool(staging and os.path.isdir(staging))
+            final_exists = os.path.isdir(final)
+            if staging_exists and final_exists:
+                self.log.write(
+                    "crash_publish_conflict",
+                    owner_path=pending.path,
+                    task_path=task_path,
+                    staging_dir=staging,
+                    output_dir=final,
+                )
+                return False
+            if final_exists:
+                if not self._publication_identity_matches(final, expected_id):
+                    self.log.write("crash_publish_identity_mismatch", path=final)
+                    return False
+            elif staging_exists:
+                if not self._publication_identity_matches(staging, expected_id):
+                    self.log.write("crash_staging_identity_mismatch", path=staging)
+                    return False
+                try:
+                    publish_staging_output(staging, final)
+                except Exception as exc:
+                    self.log.write(
+                        "crash_publish_failed",
+                        task_path=task_path,
+                        staging_dir=staging,
+                        output_dir=final,
+                        error=str(exc),
+                    )
+                    return False
+            else:
+                # Verified publication vanished before it could be published.
+                # If the source survives, normal recovery can safely re-extract it.
+                if os.path.isfile(task_path):
+                    continue
+                self.log.write(
+                    "crash_committed_output_missing",
+                    task_path=task_path,
+                    output_dir=final,
+                )
+                return False
+
+            self._startup_suppress_paths.add(path_key(task_path))
+            if os.path.exists(task_path):
+                try:
+                    results = PostProcessActions(self.config, stdout=None).apply(
+                        archives_to_clean=[[task_path]],
+                        flatten_targets=[],
+                    )
+                except Exception as exc:
+                    self.log.write("crash_source_cleanup_failed", path=task_path, error=str(exc))
+                    return False
+                if any(getattr(item, "status", "") == "failed" for item in results):
+                    self.log.write("crash_source_cleanup_failed", path=task_path)
+                    return False
+            if staging and os.path.exists(staging):
+                cleanup_staging_output(staging)
+        return True
+
     def _recover_persisted_work(self) -> None:
         """Recover only durable in-flight work; never scan unrelated Watch roots."""
 
@@ -376,8 +550,12 @@ class WatchScheduler:
             }
             scope_dir = str(getattr(pending, "password_scope_dir", "") or "")
             internal = bool(getattr(pending, "internal_recovery", False))
+            publications = dict(getattr(pending, "publications", {}) or {})
 
-            if not active_outputs and not committed_roots:
+            if publications and not self._recover_committed_publications(pending):
+                continue
+
+            if not active_outputs and not committed_roots and not publications:
                 if os.path.exists(pending.path):
                     self.enqueue(
                         pending.path,
@@ -458,6 +636,9 @@ class WatchScheduler:
                 continue
 
             candidates = list(recovered.values())
+            if publications and not candidates:
+                self._startup_retire_paths.add(pending.path)
+                continue
             # Atomically replace the old owner with concrete recovery candidates
             # before rebuilding the in-memory queue. A second crash between the
             # two steps therefore restarts from the new durable candidates.
@@ -911,11 +1092,15 @@ class WatchScheduler:
                 # scheduler/event paths. If fsync fails there is no in-memory
                 # work that can proceed without a crash-recovery record.
                 if not _state_prequeued:
+                    durable_owner = bool(password_retry or internal_recovery)
                     self.state.queue_active(
                         candidate,
                         force=force,
                         password_scope_dir=_recovery_scope_dir,
                         internal_recovery=internal_recovery,
+                        durable_owner=durable_owner,
+                        persist=durable_owner,
+                        durable=durable_owner,
                     )
                 self._pending[candidate.path] = candidate
                 self._latest_observations[candidate.path] = candidate
@@ -1418,7 +1603,7 @@ class WatchScheduler:
             self.state.record_task_output_started(
                 owner_path,
                 str(getattr(archive_task, "main_path", "") or ""),
-                str(event.get("output_dir") or ""),
+                str(event.get("staging_dir") or event.get("output_dir") or ""),
             )
             return
         if name == "task_output_committed":
@@ -1426,6 +1611,8 @@ class WatchScheduler:
                 owner_path,
                 str(getattr(archive_task, "main_path", "") or ""),
                 str(event.get("output_dir") or ""),
+                staging_dir=str(event.get("staging_dir") or ""),
+                staging_file_id=str(event.get("staging_file_id") or ""),
             )
             return
         self._notify("progress", notification_id, archive_task, event)

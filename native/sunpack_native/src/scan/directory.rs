@@ -221,6 +221,53 @@ pub(crate) struct NativeOutputInventory {
     identity_paths: bool,
 }
 
+pub(crate) fn rebase_output_inventory_root_impl(
+    inventory: &NativeOutputInventory,
+    new_root: String,
+) -> NativeOutputInventory {
+    let old_root = PathBuf::from(&inventory.root);
+    let new_root_path = PathBuf::from(&new_root);
+    let mut changed = false;
+    let mut files = Vec::with_capacity(inventory.files.len());
+    for item in inventory.files.iter() {
+        let mut item = item.clone();
+        for slot in [&mut item.abs_path, &mut item.output_path] {
+            let Some(raw) = slot.as_ref() else { continue; };
+            let path = Path::new(raw);
+            if !path.is_absolute() {
+                continue;
+            }
+            if let Ok(relative) = path.strip_prefix(&old_root) {
+                *slot = Some(path_to_string(&new_root_path.join(relative)));
+                changed = true;
+            }
+        }
+        files.push(item);
+    }
+    NativeOutputInventory {
+        root: new_root,
+        exists: inventory.exists,
+        is_dir: inventory.is_dir,
+        file_count: inventory.file_count,
+        dir_count: inventory.dir_count,
+        total_size: inventory.total_size,
+        transient_file_count: inventory.transient_file_count,
+        unreadable_count: inventory.unreadable_count,
+        files: if changed { Arc::new(files) } else { Arc::clone(&inventory.files) },
+        worker_crc_available: inventory.worker_crc_available,
+        worker_inventory_complete: inventory.worker_inventory_complete,
+        identity_paths: inventory.identity_paths,
+    }
+}
+
+#[pyfunction]
+pub(crate) fn rebase_output_inventory_root(
+    inventory: PyRef<'_, NativeOutputInventory>,
+    new_root: String,
+) -> NativeOutputInventory {
+    rebase_output_inventory_root_impl(&inventory, new_root)
+}
+
 #[pymethods]
 impl NativeOutputInventory {
     #[getter]

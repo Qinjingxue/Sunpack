@@ -16,20 +16,44 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
     source.write_bytes(b"x")
     inner = tmp_path / "out" / "inner.zip"
     output = tmp_path / "out" / "inner"
+    staging = tmp_path / "out" / ".sunpack-partial-test"
     state = WatchStateStore(str(state_path))
-    state.queue_active(_candidate(source), password_scope_dir=str(tmp_path))
+    state.queue_active(
+        _candidate(source),
+        password_scope_dir=str(tmp_path),
+        durable_owner=True,
+        persist=True,
+        durable=True,
+    )
     assert state.record_task_output_started(str(source), str(inner), str(output))
 
-    reloaded = WatchStateStore(str(state_path))
-    [pending] = reloaded.pending_work_items()
-    assert pending.active_outputs[str(inner.resolve())] == str(output.resolve())
-    assert pending.password_scope_dir == str(tmp_path.resolve())
+    [live] = state.pending_work_items()
+    assert live.active_outputs[str(inner.resolve())] == str(output.resolve())
 
-    assert reloaded.record_task_output_committed(str(source), str(inner), str(output))
+    # START is diagnostic only. A restart intentionally forgets it because
+    # deterministic staging can be rediscovered without a second fsync.
+    [before_commit] = WatchStateStore(str(state_path)).pending_work_items()
+    assert before_commit.active_outputs == {}
+    assert before_commit.password_scope_dir == str(tmp_path.resolve())
+
+    assert state.record_task_output_committed(
+        str(source),
+        str(inner),
+        str(output),
+        staging_dir=str(staging),
+        staging_file_id="staging-id",
+    )
     [committed] = WatchStateStore(str(state_path)).pending_work_items()
     assert committed.active_outputs == {}
     assert committed.committed_roots == [str(output.resolve())]
     assert committed.completed_sources == [str(inner.resolve())]
+    [publication] = committed.publications.values()
+    assert publication == {
+        "task_path": str(inner.resolve()),
+        "staging_dir": str(staging.resolve()),
+        "staging_file_id": "staging-id",
+        "output_dir": str(output.resolve()),
+    }
 
 
 def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
@@ -55,16 +79,51 @@ def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
     assert all(not item.active_outputs and not item.committed_roots for item in recovered)
 
 
-def test_critical_pending_transition_calls_fsync(tmp_path, monkeypatch):
-    import sunpack.filesystem.watcher.state as state_module
+def test_live_enqueue_keeps_owner_memory_only(tmp_path):
+    import threading
+    import sunpack.filesystem.watcher.scheduler as scheduler_module
 
-    state = WatchStateStore(str(tmp_path / "state.json"))
     source = tmp_path / "queued.zip"
-    source.write_bytes(b"x")
+    source.write_bytes(b"payload")
+    candidate = _candidate(source, size=7)
     calls = []
-    monkeypatch.setattr(state_module.os, "fsync", lambda fd: calls.append(fd))
-    state.queue_active(_candidate(source))
-    assert calls, "queue admission must cross a durability barrier"
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler._lock = threading.Lock()
+    scheduler._pending = {}
+    scheduler._active_states = {}
+    scheduler._latest_observations = {}
+    scheduler._quiet_trackers = {}
+    scheduler._filter_revision = 0
+    scheduler.cold_start_seconds = 0.0
+    scheduler._quiet_policy = SimpleNamespace()
+    scheduler.state = SimpleNamespace(
+        latest_entry_for_path=lambda _path: None,
+        queue_active=lambda *_args, **kwargs: calls.append(kwargs),
+    )
+    scheduler.config = {}
+    scheduler.log = SimpleNamespace(
+        write=lambda *_args, **_kwargs: None,
+        write_throttled=lambda *_args, **_kwargs: None,
+    )
+    scheduler._wake_callback = None
+    scheduler.metadata_files = set()
+    scheduler.metadata_dir = ""
+    scheduler.watch_roots = [str(tmp_path)]
+    scheduler.filters = []
+    scheduler._observe_candidate_activity = lambda *_args, **_kwargs: 0.0
+    scheduler._passes_filesystem_filters = lambda _candidate: True
+    monkeypatch_target = scheduler_module._candidate_for_event_path
+    scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate
+    try:
+        scheduler.enqueue(str(source), force=True, event_type="modified")
+    finally:
+        scheduler_module._candidate_for_event_path = monkeypatch_target
+
+    assert len(calls) == 1
+    assert calls[0]["durable_owner"] is False
+    assert calls[0]["persist"] is False
+    assert calls[0]["durable"] is False
+    assert candidate.path in scheduler._pending
 
 
 def test_noncritical_attempt_refresh_does_not_force_an_extra_fsync(tmp_path, monkeypatch):
@@ -131,7 +190,6 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
     assert calls[2][1]["event_type"] == "startup_group_reconcile"
 
 
-
 def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
     import threading
     import sunpack.filesystem.watcher.scheduler as scheduler_module
@@ -182,7 +240,6 @@ def test_departed_unowned_path_is_still_forgotten(tmp_path):
     assert state.pending_work_for_path(str(source)) is None
 
 
-
 def test_critical_semantic_event_propagates_callback_failure():
     import pytest
     from sunpack.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
@@ -196,7 +253,6 @@ def test_critical_semantic_event_propagates_callback_failure():
 
     # Ordinary progress semantics remain best-effort.
     runner.emit_semantic_event(task, "ui_progress", critical=False)
-
 
 
 def test_committed_roots_collapse_nested_outputs(tmp_path):
@@ -235,12 +291,22 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     scheduler._filter_revision = 0
     scheduler.cold_start_seconds = 0.0
     scheduler._quiet_policy = SimpleNamespace()
+
+    def fail_queue(*_args, **kwargs):
+        assert kwargs["durable_owner"] is True
+        assert kwargs["persist"] is True
+        assert kwargs["durable"] is True
+        raise OSError("disk failed")
+
     scheduler.state = SimpleNamespace(
         latest_entry_for_path=lambda _path: None,
-        queue_active=lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("disk failed")),
+        queue_active=fail_queue,
     )
     scheduler.config = {}
-    scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None, write_throttled=lambda *_args, **_kwargs: None)
+    scheduler.log = SimpleNamespace(
+        write=lambda *_args, **_kwargs: None,
+        write_throttled=lambda *_args, **_kwargs: None,
+    )
     scheduler._wake_callback = None
     scheduler.metadata_files = set()
     scheduler.metadata_dir = ""
@@ -252,13 +318,18 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     scheduler_module._candidate_for_event_path = lambda *_args, **_kwargs: candidate
     try:
         with pytest.raises(OSError, match="disk failed"):
-            scheduler.enqueue(str(source), force=True)
+            scheduler.enqueue(
+                str(source),
+                force=True,
+                event_type="recovery",
+                _crash_recovery=True,
+                _recovery_scope_dir=str(tmp_path),
+            )
     finally:
         scheduler_module._candidate_for_event_path = monkeypatch_target
 
     assert scheduler._pending == {}
     assert scheduler._active_states == {}
-
 
 
 def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):

@@ -19,6 +19,7 @@ const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FSCTL_READ_FILE_USN_DATA: u32 = 0x0009_00eb;
 const ERROR_SHARING_VIOLATION: i32 = 32;
 const ERROR_LOCK_VIOLATION: i32 = 33;
+const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
 
 #[repr(C)]
 struct ReadFileUsnData {
@@ -54,6 +55,7 @@ extern "system" {
         volume_name: *mut u16,
         buffer_length: u32,
     ) -> i32;
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
     fn GetVolumeInformationW(
         root_path_name: *const u16,
         volume_name: *mut u16,
@@ -151,6 +153,35 @@ pub(super) fn watch_file_observation(
         }
     }
     Ok(observation)
+}
+
+pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i64)> {
+    let observation = watch_file_observation(path, None)?;
+    Ok((volume_device(path)?, observation.file_id, observation.change_usn))
+}
+
+pub(super) fn publish_watch_staged_output(staging: &Path, final_path: &Path) -> io::Result<()> {
+    if !staging.is_dir() {
+        return Err(io::Error::new(io::ErrorKind::NotFound, "Watch staging directory is missing"));
+    }
+    if final_path.try_exists()? {
+        return Err(io::Error::new(io::ErrorKind::AlreadyExists, "Watch final output already exists"));
+    }
+    let source_volume = volume_device(staging)?;
+    let destination_volume = resolve_output_volume(final_path)?;
+    if !source_volume.eq_ignore_ascii_case(&destination_volume) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "Watch staging and final output must be on the same NTFS volume"));
+    }
+    let source = canonical_wide(staging)?;
+    let parent = final_path.parent().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "final output has no parent"))?;
+    let parent = std::fs::canonicalize(parent)?;
+    let name = final_path.file_name().ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "final output has no file name"))?;
+    let destination_path = parent.join(name);
+    let destination: Vec<u16> = destination_path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub(super) fn watch_file_is_ready(path: &Path) -> io::Result<bool> {
@@ -306,6 +337,12 @@ fn read_change_reasons(
 
 pub(super) fn validate_volume_journal(path: &Path) -> io::Result<()> {
     sunpack_usn_core::broker_probe_volume(&volume_device(path)?)
+}
+
+pub(super) fn watch_volume_cursor(path: &Path) -> io::Result<(String, u64, i64)> {
+    let volume = volume_device(path)?;
+    let (journal_id, next_usn) = sunpack_usn_core::broker_volume_cursor(&volume)?;
+    Ok((volume, journal_id, next_usn))
 }
 
 fn volume_device(path: &Path) -> io::Result<String> {

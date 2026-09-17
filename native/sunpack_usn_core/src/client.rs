@@ -1,4 +1,5 @@
 use crate::protocol::{parse_file_id, Opcode, Request, Response, Status, RESPONSE_BYTES};
+const MAX_BROKER_PAYLOAD_BYTES: usize = 64 * 1024;
 use crate::{
     ChangeReasons, PIPE_NAME, PIPE_NAME_ENV, SERVICE_NAME, SERVICE_NAME_ENV, TEST_PIPE_NAME_PREFIX,
     TEST_SERVICE_NAME_PREFIX,
@@ -50,19 +51,37 @@ impl Drop for BrokerConnection {
 
 impl BrokerConnection {
     fn transact(&mut self, request: Request) -> io::Result<Response> {
-        let request_id = request.request_id;
-        let request = request.encode()?;
-        write_exact(self.0, &request)?;
-        let mut response = [0u8; RESPONSE_BYTES];
-        read_exact(self.0, &mut response)?;
-        let response = Response::decode(&response)?;
-        if response.request_id != request_id {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "broker response request ID mismatch",
-            ));
+        let (response, payload) = self.transact_payload(request)?;
+        if !payload.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected broker payload"));
         }
         Ok(response)
+    }
+
+    fn transact_payload(&mut self, request: Request) -> io::Result<(Response, Vec<u8>)> {
+        let request_id = request.request_id;
+        let payload_response = request.opcode == Opcode::ReadRootChanges;
+        let request = request.encode()?;
+        write_exact(self.0, &request)?;
+        let mut response_bytes = [0u8; RESPONSE_BYTES];
+        read_exact(self.0, &mut response_bytes)?;
+        let response = Response::decode(&response_bytes)?;
+        if response.request_id != request_id {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "broker response request ID mismatch"));
+        }
+        let payload_len = if payload_response && response.status == Status::Ok {
+            response.reasons_all as usize
+        } else {
+            0
+        };
+        if payload_len > MAX_BROKER_PAYLOAD_BYTES {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "broker payload exceeds limit"));
+        }
+        let mut payload = vec![0u8; payload_len];
+        if payload_len > 0 {
+            read_exact(self.0, &mut payload)?;
+        }
+        Ok((response, payload))
     }
 }
 
@@ -125,9 +144,14 @@ pub fn broker_ping() -> io::Result<Duration> {
 }
 
 pub fn broker_probe_volume(volume_guid: &str) -> io::Result<()> {
+    broker_volume_cursor(volume_guid).map(|_| ())
+}
+
+pub fn broker_volume_cursor(volume_guid: &str) -> io::Result<(u64, i64)> {
     let mut request = Request::simple(Opcode::ProbeVolume, next_request_id());
     request.volume_guid = volume_guid.to_owned();
-    ensure_ok(transact_request(request)?).map(|_| ())
+    let response = ensure_ok(transact_request(request)?)?;
+    Ok((response.journal_id, response.next_usn))
 }
 
 pub fn broker_read_change_reasons(
@@ -148,6 +172,52 @@ pub fn broker_read_change_reasons(
         all: response.reasons_all,
         without_close: response.reasons_without_close,
     })
+}
+
+pub fn broker_read_root_changes(
+    volume_guid: &str,
+    root_file_id: &str,
+    start_usn: i64,
+    end_usn: i64,
+) -> io::Result<Vec<String>> {
+    let (file_id, file_id_len) = parse_file_id(root_file_id)?;
+    let mut request = Request::simple(Opcode::ReadRootChanges, next_request_id());
+    request.volume_guid = volume_guid.to_owned();
+    request.file_id = file_id;
+    request.file_id_len = file_id_len;
+    request.previous_usn = start_usn;
+    request.current_usn = end_usn;
+    let state = STATE.get_or_init(|| Mutex::new(ClientState::default()));
+    let mut state = state.lock().map_err(|_| io::Error::other("broker client state poisoned"))?;
+    if state.leases == 0 {
+        return Err(io::Error::new(io::ErrorKind::NotConnected, "SunPack Watch Broker has not been acquired"));
+    }
+    if state.connection.is_none() {
+        state.connection = Some(connect_and_hello()?);
+    }
+    let (response, payload) = state.connection.as_mut().unwrap().transact_payload(request)?;
+    ensure_ok(response)?;
+    decode_path_payload(&payload)
+}
+
+fn decode_path_payload(payload: &[u8]) -> io::Result<Vec<String>> {
+    let mut offset = 0usize;
+    let mut result = Vec::new();
+    while offset < payload.len() {
+        if offset + 4 > payload.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated path payload"));
+        }
+        let length = u32::from_le_bytes(payload[offset..offset+4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + length > payload.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated path payload item"));
+        }
+        result.push(std::str::from_utf8(&payload[offset..offset+length])
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "path payload is not UTF-8"))?
+            .to_owned());
+        offset += length;
+    }
+    Ok(result)
 }
 
 fn transact_request(request: Request) -> io::Result<Response> {

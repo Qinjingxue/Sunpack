@@ -15,6 +15,12 @@ from sunpack.relations.stage import ArchiveRelationStage
 from sunpack.coordinator.verification_stage import verify_and_project
 from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.support.output_inventory import OutputInventory
+from sunpack.support.watch_staging import (
+    prepare_staging_output,
+    publish_staging_output,
+    rebase_extraction_result,
+    staging_file_identity,
+)
 from sunpack.contracts.extraction import ExtractionResult
 from sunpack.contracts.failures import FailureInfo, FailureKind
 from sunpack.extraction.knowledge import write_extraction_result
@@ -102,6 +108,7 @@ class ExtractionBatchRunner:
         config: dict | None = None,
         progress_reporter: Any | None = None,
         request_id: str = "",
+        origin: str = "",
     ):
         self.context = context
         self.extractor = extractor
@@ -113,6 +120,7 @@ class ExtractionBatchRunner:
         self.i18n = I18nContext(cli_config.get("language"))
         self.progress_reporter = progress_reporter
         self.request_id = str(request_id or "")
+        self.origin = str(origin or "")
         self.progress_round_index = 1
         self.progress_direct_mode = False
         self.relation_stage = ArchiveRelationStage()
@@ -193,15 +201,6 @@ class ExtractionBatchRunner:
                 ensure_input_lease=ensure_input_lease,
             )
             output_dir = self.collect_result(task, outcome)
-            if output_dir and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
-                # Watch crash recovery must durably move its restart anchor to the
-                # verified output before task-level cleanup may delete the source.
-                self.extractor.emit_semantic_event(
-                    task,
-                    "task_output_committed",
-                    critical=True,
-                    output_dir=output_dir,
-                )
             if cleanup_scope is not None and output_dir:
                 # Clean up as soon as extract and verification are both finished, because
                 # verification reads the source archive back to build its manifest.
@@ -319,18 +318,32 @@ class ExtractionBatchRunner:
             self._report_task_finished(task, terminal)
             return task, terminal
 
-        # This is the last point before extraction may create/write the canonical
-        # output. Watch persists it synchronously so a killed process can remove
-        # exactly the interrupted output on restart.
-        self.extractor.emit_semantic_event(
-            task,
-            "task_output_started",
-            critical=True,
-            output_dir=planned_out_dir,
-        )
+        final_out_dir = planned_out_dir
+        execution_out_dir = planned_out_dir
+        staging_dir = ""
+        if self.origin == "watch":
+            staging_dir = await broker.run(
+                "watch_staging_prepare",
+                file_id,
+                prepare_staging_output,
+                final_out_dir,
+                task.main_path,
+                request_id=self.request_id,
+                cancellation=cancellation,
+            )
+            execution_out_dir = staging_dir
+            # START is diagnostic only now.  Correctness comes from deterministic
+            # staging + the single commit-before-publish barrier.
+            self.extractor.emit_semantic_event(
+                task,
+                "task_output_started",
+                critical=False,
+                output_dir=final_out_dir,
+                staging_dir=staging_dir,
+            )
         state = self._extract_verify_state_machine(
             task,
-            planned_out_dir,
+            execution_out_dir,
             missing_volume_retry=missing_volume_retry,
         )
         sent = None
@@ -348,7 +361,43 @@ class ExtractionBatchRunner:
             )
             if done:
                 outcome = value
-                outcome.planned_out_dir = planned_out_dir
+                outcome.planned_out_dir = execution_out_dir
+                if (
+                    self.origin == "watch"
+                    and staging_dir
+                    and outcome.outcome_kind in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}
+                ):
+                    if outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
+                        staging_id = await broker.run(
+                            "watch_staging_identity",
+                            file_id,
+                            staging_file_identity,
+                            staging_dir,
+                            request_id=self.request_id,
+                            cancellation=cancellation,
+                        )
+                        # This is the only synchronous durability barrier on the
+                        # normal successful Watch ArchiveTask path.  Source cleanup
+                        # cannot run until this callback returns.
+                        self.extractor.emit_semantic_event(
+                            task,
+                            "task_output_committed",
+                            critical=True,
+                            output_dir=final_out_dir,
+                            staging_dir=staging_dir,
+                            staging_file_id=staging_id,
+                        )
+                    await broker.run(
+                        "watch_publish",
+                        file_id,
+                        publish_staging_output,
+                        staging_dir,
+                        final_out_dir,
+                        request_id=self.request_id,
+                        cancellation=cancellation,
+                    )
+                    rebase_extraction_result(outcome.result, staging_dir, final_out_dir)
+                    outcome.planned_out_dir = final_out_dir
                 self._report_task_finished(task, outcome)
                 return task, outcome
             request = value
