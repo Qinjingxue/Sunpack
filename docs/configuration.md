@@ -61,9 +61,9 @@ Test runs disable the `size_range` filter by default so that tests can use files
 
 | Value | Description |
 | --- | --- |
-| `*` | Keep processing nested archives, up to 999 rounds. |
+| `*` | Keep processing nested archives while each round produces new processable archives. |
 | Positive integer | A fixed number of allowed recursive rounds. |
-| `?` | Ask whether to continue after each round, up to 999 rounds. |
+| `?` | Ask whether to continue after each round that produces new processable archives. |
 
 The first round runs exactly over the file or directory scope the user gave. Subsequent rounds apply `nested_extraction_policy` to the candidate archives found in the extraction output, and then decide whether to continue processing.
 
