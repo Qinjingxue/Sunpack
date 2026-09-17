@@ -410,6 +410,8 @@ class WatchStateStore:
         self._journal_records += 1
         self._journal_bytes += len(serialized)
         self._update_compaction_due_locked()
+        if self._journal_bytes >= self._hard_compact_bytes:
+            self._compact_locked()
 
     def _commit_operations_concurrent(
         self,

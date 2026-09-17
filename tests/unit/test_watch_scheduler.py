@@ -837,6 +837,7 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
 
 def test_watch_scheduler_scans_only_requested_initial_scan_roots(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    monkeypatch.setattr(RuntimeWatchScheduler, "_recover_usn_startup_gap", lambda self: None)
 
     first_root = tmp_path / "first"
     second_root = tmp_path / "second"

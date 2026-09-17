@@ -84,7 +84,7 @@ async def _drive_watch_until(
         combined.errors.extend(result.errors)
         with watcher._lock:
             inflight = bool(watcher._inflight_requests)
-        if condition() and watcher.pending_count == 0 and not inflight:
+        if watcher.pending_count == 0 and not inflight and condition():
             return combined
         await asyncio.sleep(0.01)
     pytest.fail(
