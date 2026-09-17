@@ -208,76 +208,38 @@ def test_password_or_missing_volume_suppression_never_creates_a_final_toast(tmp_
     coordinator.stop()
 
 
-@pytest.mark.parametrize(
-    ("reason", "expected"),
-    [
-        ("password", "内层归档需要密码"),
-        ("missing_volume", "内层归档缺少分卷"),
-    ],
-)
-def test_visible_nested_failure_emits_reason_toast_and_report(tmp_path, reason, expected):
+def test_failure_toast_does_not_interpret_nested_scope(tmp_path):
     host = _Host()
     coordinator = WatchToastCoordinator(host, _config(language="zh", debounce_ms=0), str(tmp_path / "state"))
-    task = _task(tmp_path / "nested-inner.zip")
-    coordinator.submitted("nested", str(tmp_path / "outer.zip"))
-    _ready(coordinator, "nested", task)
+    task = _task(tmp_path / "nested-inner.7z.001")
+    coordinator.submitted("request", str(tmp_path / "outer.zip"))
+    _ready(coordinator, "request", task)
     coordinator.failed(
-        "nested",
-        [f"嵌套压缩包内层失败：{task.main_path}"],
+        "request",
+        [f"nested-inner.7z.001 [missing split volume]"],
         [{
-            "kind": "wrong_password" if reason == "password" else "missing_volume",
-            "message": "nested failure",
-            "details": {"scope": "nested_archive", "reason": reason},
+            "kind": "missing_volume",
+            "message": "missing split volume",
+            "details": {"scope": "nested_archive", "reason": "missing_volume"},
         }],
     )
     terminal = host.wait_for_terminal_snapshots()
     assert len(terminal) == 1
-    assert expected in terminal[0].body
-    report_path = terminal[0].actions[-1].target
-    report = Path(report_path).read_text(encoding="utf-8")
-    assert expected in report
-    assert "nested-inner.zip" in report
+    assert terminal[0].kind == ToastSnapshotKind.FAILURE
+    assert "内层归档缺少分卷" not in terminal[0].body
+    report = Path(terminal[0].actions[-1].target).read_text(encoding="utf-8")
+    assert "nested-inner.7z.001" in report
+    assert "原因：内层归档缺少分卷" not in report
     coordinator.stop()
 
 
-def test_invisible_nested_failure_does_not_create_a_final_toast(tmp_path):
+def test_invisible_failure_does_not_create_a_final_toast(tmp_path):
     host = _Host()
     coordinator = WatchToastCoordinator(host, _config(debounce_ms=0), str(tmp_path / "state"))
-    coordinator.submitted("nested", str(tmp_path / "outer.zip"))
-    coordinator.failed(
-        "nested",
-        ["nested failure"],
-        [{
-            "kind": "wrong_password",
-            "details": {"scope": "nested_archive", "reason": "password"},
-        }],
-    )
+    coordinator.submitted("request", str(tmp_path / "outer.zip"))
+    coordinator.failed("request", ["failure"], [{"kind": "unknown"}])
     time.sleep(0.04)
-
     assert _terminal_snapshots(host) == []
-    coordinator.stop()
-
-
-def test_nested_toast_reuses_failure_kind_when_reason_detail_is_missing(tmp_path):
-    host = _Host()
-    coordinator = WatchToastCoordinator(host, _config(language="zh", debounce_ms=0), str(tmp_path / "state"))
-    task = _task(tmp_path / "nested-inner.7z.001")
-    coordinator.submitted("nested", str(tmp_path / "outer.zip"))
-    _ready(coordinator, "nested", task)
-    coordinator.failed(
-        "nested",
-        ["nested failure"],
-        [{
-            "kind": "missing_volume",
-            "message": "missing split volume",
-            "details": {"scope": "nested_archive"},
-        }],
-    )
-    time.sleep(0.04)
-
-    terminal = _terminal_snapshots(host)
-    assert len(terminal) == 1
-    assert "内层归档缺少分卷" in terminal[0].body
     coordinator.stop()
 
 
