@@ -10,7 +10,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Protocol
 
-from sunpack.contracts.failures import FailureKind, PASSWORD_FAILURE_KINDS
 from sunpack.i18n import I18nContext
 
 # native 侧的空间事件名（与 sevenzip_runner / coordinator.reporting 一致），表达等待状态而非 job 生命周期状态。
@@ -123,9 +122,6 @@ class WatchFailureReportStore:
         ]
         for index, request in enumerate(failures, 1):
             lines.append(self.i18n.t("toast.report.failure", index=index, path=request.source_path))
-            reason = _request_nested_reason(request)
-            if reason:
-                lines.append(self.i18n.t(f"toast.report.reason.{reason}"))
             error = "; ".join(value for value in request.errors if value) or self.i18n.t("toast.report.unknown_error")
             lines.append(self.i18n.t("toast.report.error", error=error))
             if request.failure_payloads:
@@ -488,36 +484,17 @@ class WatchToastCoordinator:
             if failed and succeeded:
                 kind = ToastSnapshotKind.MIXED
                 title = self.i18n.t("toast.final.mixed.title")
-                nested_reason = _aggregate_nested_reason(failed)
-                if nested_reason:
-                    body = self.i18n.t(
-                        "toast.final.mixed.nested.body",
-                        succeeded=len(succeeded),
-                        failed=len(failed),
-                        duration=duration,
-                        reason=self.i18n.t(_nested_reason_key(nested_reason)),
-                    )
-                else:
-                    body = self.i18n.t(
-                        "toast.final.mixed.body",
-                        succeeded=len(succeeded),
-                        failed=len(failed),
-                        duration=duration,
-                    )
+                body = self.i18n.t(
+                    "toast.final.mixed.body",
+                    succeeded=len(succeeded),
+                    failed=len(failed),
+                    duration=duration,
+                )
                 ttl = self._failure_ttl_ms
             elif failed:
                 kind = ToastSnapshotKind.FAILURE
                 title = self.i18n.t("toast.final.failure.title")
-                nested_reason = _aggregate_nested_reason(failed)
-                if nested_reason:
-                    body = self.i18n.t(
-                        "toast.final.nested.body",
-                        failed=len(failed),
-                        duration=duration,
-                        reason=self.i18n.t(_nested_reason_key(nested_reason)),
-                    )
-                else:
-                    body = self.i18n.t("toast.final.failure.body", failed=len(failed), duration=duration)
+                body = self.i18n.t("toast.final.failure.body", failed=len(failed), duration=duration)
                 ttl = self._failure_ttl_ms
             else:
                 kind = ToastSnapshotKind.SUCCESS
@@ -574,79 +551,6 @@ def _existing_directories(paths: list[str]) -> list[str]:
             seen.add(key)
             result.append(path)
     return result
-
-
-def _failure_reason_codes(failure_payloads: list[dict[str, Any]]) -> list[str]:
-    reasons: list[str] = []
-    for payload in failure_payloads:
-        if not isinstance(payload, dict):
-            continue
-        details = payload.get("details")
-        if not isinstance(details, dict) or details.get("scope") != "nested_archive":
-            continue
-        candidates = details.get("reasons") or [details.get("reason")]
-        for reason in candidates:
-            reason = str(reason or "")
-            if reason in {"password", "missing_volume"} and reason not in reasons:
-                reasons.append(reason)
-        for reason in _failure_kind_reason_codes(payload):
-            if reason not in reasons:
-                reasons.append(reason)
-    return reasons
-
-
-def _failure_kind_reason_codes(payload: dict[str, Any]) -> list[str]:
-    reasons: list[str] = []
-    if any(_payload_contains_kind(payload, kind) for kind in PASSWORD_FAILURE_KINDS):
-        reasons.append("password")
-    if _payload_contains_kind(payload, FailureKind.MISSING_VOLUME):
-        reasons.append("missing_volume")
-    return reasons
-
-
-def _payload_contains_kind(payload: dict[str, Any], expected: FailureKind) -> bool:
-    try:
-        if FailureKind(str(payload.get("kind"))) is expected:
-            return True
-    except (TypeError, ValueError):
-        pass
-    return any(
-        _payload_contains_kind(cause, expected)
-        for cause in (payload.get("causes") or [])
-        if isinstance(cause, dict)
-    )
-
-
-def _request_nested_reason(request: _RequestProgress) -> str:
-    reasons = _failure_reason_codes(request.failure_payloads)
-    if not reasons:
-        return ""
-    if len(reasons) == 1:
-        return reasons[0]
-    return "attention"
-
-
-def _aggregate_nested_reason(requests: list[_RequestProgress]) -> str:
-    reasons: list[str] = []
-    has_unclassified = False
-    for request in requests:
-        request_reasons = _failure_reason_codes(request.failure_payloads)
-        if not request_reasons:
-            has_unclassified = True
-        for reason in request_reasons:
-            if reason not in reasons:
-                reasons.append(reason)
-    if not reasons:
-        return ""
-    if has_unclassified or len(reasons) != 1:
-        return "attention"
-    return reasons[0]
-
-
-def _nested_reason_key(reason: str) -> str:
-    if reason not in {"password", "missing_volume", "attention"}:
-        reason = "attention"
-    return f"toast.final.nested.reason.{reason}"
 
 
 def _common_output_target(paths: list[str]) -> str:

@@ -20,11 +20,21 @@ from sunpack.cli.cli_runtime import (
 )
 from sunpack.cli.cli_types import CliCommandResult
 from sunpack.cli.persistent_runtime import load_request_config, pipeline_engine
-from sunpack.contracts.failures import FailureInfo
+from sunpack.contracts.failures import FailureInfo, FailureKind
+from sunpack.contracts.retry_targets import (
+    merge_latest_results,
+    password_retry_paths,
+    result_error,
+    result_failure,
+    result_outcome,
+    result_path,
+)
+from sunpack.contracts.results import OutcomeKind
 from sunpack.passwords import dedupe_passwords
 from sunpack.support.collections import dedupe_values
 from sunpack.detection.options import DetectionOptions
 import asyncio
+import os
 import uuid
 
 COMMAND = "extract"
@@ -100,6 +110,11 @@ async def handle(args, ctx):
 
     attempts = []
     retry_count = 0
+    current_targets = list(target_paths)
+    latest_target_results: dict[str, object] = {}
+    all_processed_keys: list[str] = []
+    all_recovered_outputs: list[dict] = []
+    cleanup_results_by_path = {}
     initial_password_summary = build_password_summary(
         passwords,
         use_builtin_passwords=not args.no_builtin_passwords,
@@ -125,7 +140,7 @@ async def handle(args, ctx):
             )
             run_config["builtin_passwords"] = list(password_summary.builtin_passwords)
             response = await engine.run(
-                target_paths,
+                current_targets,
                 direct=bool(getattr(args, "direct_file", False)),
                 request_config=run_config,
                 stdout=ctx.stderr if args.json else ctx.stdout,
@@ -137,6 +152,17 @@ async def handle(args, ctx):
             failed_tasks = list(summary.failed_tasks)
             failures = list(summary.failures)
             processed_keys = list(summary.processed_keys)
+            merge_latest_results(latest_target_results, summary)
+            all_processed_keys.extend(processed_keys)
+            for item in list(getattr(summary, "recovered_outputs", []) or []):
+                if item not in all_recovered_outputs:
+                    all_recovered_outputs.append(item)
+            for item in list(getattr(summary, "cleanup_results", []) or []):
+                cleanup_results_by_path[os.path.normcase(os.path.abspath(item.path))] = item
+            retry_targets = [path for path in password_retry_paths(summary) if os.path.exists(path)]
+            if not retry_targets and _has_retryable_password_failure(failures):
+                # Compatibility for lightweight summaries without target_results.
+                retry_targets = [path for path in current_targets if os.path.exists(path)]
             attempts.append({
                 "success_count": summary.success_count,
                 "failed_count": len(failed_tasks),
@@ -146,7 +172,7 @@ async def handle(args, ctx):
                 "wrong_password_failure": has_password_failure(failures),
                 "failures": [failure.to_dict() for failure in failures],
             })
-            if not _should_retry_password_failure(args, failures):
+            if not _should_retry_password_failure(args, retry_targets):
                 break
             if not await _confirm_password_retry(ctx):
                 break
@@ -162,6 +188,7 @@ async def handle(args, ctx):
                 reporter.info(ctx.t("cli.extract.retry_no_passwords"))
                 break
             passwords = _dedupe([*passwords, *new_passwords])
+            current_targets = retry_targets
             retry_count += 1
             reporter.info(ctx.t("cli.extract.retry_round"))
         recent_passwords = engine.recent_passwords
@@ -172,6 +199,30 @@ async def handle(args, ctx):
         recent_passwords=recent_passwords,
         clipboard_passwords=clipboard_passwords,
     )
+
+    if latest_target_results:
+        final_results = list(latest_target_results.values())
+        success_count = sum(
+            result_outcome(item) == OutcomeKind.COMPLETE_SUCCESS
+            for item in final_results
+        )
+        partial_success_count = sum(
+            result_outcome(item) == OutcomeKind.PARTIAL_SUCCESS
+            for item in final_results
+        )
+        failed_tasks = [
+            _target_result_error(item)
+            for item in final_results
+            if result_outcome(item) == OutcomeKind.FAILURE
+        ]
+        processed_keys = all_processed_keys
+        recovered_outputs = all_recovered_outputs
+        cleanup_results = list(cleanup_results_by_path.values())
+    else:
+        success_count = summary.success_count
+        partial_success_count = getattr(summary, "partial_success_count", 0)
+        recovered_outputs = list(getattr(summary, "recovered_outputs", []) or [])
+        cleanup_results = list(getattr(summary, "cleanup_results", []) or [])
 
     result = CliCommandResult(
         command=COMMAND,
@@ -186,15 +237,15 @@ async def handle(args, ctx):
             "deep_detect": deep_detect,
         },
         summary={
-            "success_count": summary.success_count,
+            "success_count": success_count,
             "failed_count": len(failed_tasks),
             "processed_count": len(set(processed_keys)),
-            "partial_success_count": getattr(summary, "partial_success_count", 0),
-            "recovered_outputs": list(getattr(summary, "recovered_outputs", []) or []),
+            "partial_success_count": partial_success_count,
+            "recovered_outputs": recovered_outputs,
             "use_builtin_passwords": not args.no_builtin_passwords,
             "password_retry_count": retry_count,
             "cleanup_retry_count": sum(
-                max(0, item.attempts - 1) for item in summary.cleanup_results
+                max(0, item.attempts - 1) for item in cleanup_results
             ),
             "cleanup_results": [
                 {
@@ -205,7 +256,7 @@ async def handle(args, ctx):
                     "error_code": item.error_code,
                     "message": item.message,
                 }
-                for item in summary.cleanup_results
+                for item in cleanup_results
             ],
         },
         errors=failed_tasks,
@@ -216,6 +267,16 @@ async def handle(args, ctx):
         return EXIT_TASK_FAILED, result
     return 0, result
 
+
+
+def _target_result_error(item) -> str:
+    path = result_path(item)
+    failure = result_failure(item)
+    message = result_error(item) or (getattr(failure, "message", "") if failure is not None else "")
+    name = os.path.basename(path) if path else ""
+    if name and message:
+        return f"{name} [{message}]"
+    return message or name
 
 def _extract_run_config(
     config: dict,
@@ -245,12 +306,15 @@ def has_password_failure(failures: list[FailureInfo]) -> bool:
     return any(failure.is_password_failure for failure in failures)
 
 
-def _should_retry_password_failure(args, failures: list[FailureInfo]) -> bool:
-    return (
-        has_password_failure(failures)
-        and not getattr(args, "json", False)
-        and not getattr(args, "quiet", False)
+def _has_retryable_password_failure(failures: list[FailureInfo]) -> bool:
+    return any(
+        failure.is_password_failure and not failure.contains(FailureKind.MISSING_VOLUME)
+        for failure in failures
     )
+
+
+def _should_retry_password_failure(args, retry_targets: list[str]) -> bool:
+    return bool(retry_targets) and not getattr(args, "json", False) and not getattr(args, "quiet", False)
 
 
 async def _confirm_password_retry(ctx) -> bool:

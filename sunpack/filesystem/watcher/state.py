@@ -86,6 +86,12 @@ class WatchStateEntry:
         base = f"{self.path}|{self.size}|{self.mtime:.6f}"
         return f"{base}|{self.file_id}|{self.change_usn}"
 
+    @property
+    def password_scope_dir(self) -> str:
+        payload = self.failure_payload if isinstance(self.failure_payload, dict) else {}
+        configured = str(payload.get("password_scope_dir") or "").strip()
+        return os.path.abspath(configured) if configured else os.path.dirname(os.path.abspath(self.path))
+
 
 class WatchStateStore:
     """Persistent crash queue and retry blockers for watch mode."""
@@ -642,10 +648,10 @@ class WatchStateStore:
                 if entry.status != "failed_password":
                     continue
                 try:
-                    parent = Path(entry.path).resolve().parent
+                    scope = Path(entry.password_scope_dir).resolve()
                     if include_subtree:
-                        parent.relative_to(root)
-                    elif parent != root:
+                        scope.relative_to(root)
+                    elif scope != root:
                         continue
                 except ValueError:
                     continue

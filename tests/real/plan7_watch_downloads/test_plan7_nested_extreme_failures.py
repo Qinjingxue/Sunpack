@@ -155,7 +155,7 @@ def test_plan7_nested_inner_unknown_password_watch_is_password_blocked(
     tmp_path,
     plan7_error,
 ):
-    """watch 模式下，内层未知密码应阻塞密码而不是缺分卷。"""
+    """watch 模式下，密码失败挂在实际内层任务并静默等待密码变化。"""
     outer = _nested_encrypted_outer(tmp_path)
     label = "nested-inner-password-watch"
     toast_config = plan7_watch_config(passwords=[])
@@ -176,23 +176,19 @@ def test_plan7_nested_inner_unknown_password_watch_is_password_blocked(
         plan7_error.update({
             "case": "nested_outer_plain_inner_encrypted_watch",
             "result": result.__dict__,
+            "entry_path": entry.path,
             "entry_status": entry.status,
             "failure_kind": entry.failure_kind,
             "blockers": list((entry.failure_payload or {}).get("blockers") or []),
             "toast_kind": terminal.kind.value if terminal is not None else "",
-            "toast_body": terminal.body if terminal is not None else "",
         })
         assert result.failed == 1
         assert entry.status == "failed_password"
+        assert Path(entry.path).name == "nested-inner-encrypted.zip"
+        assert Path(entry.path) != outer
         assert entry.failure_kind == FailureKind.WRONG_PASSWORD.value
         assert (entry.failure_payload or {}).get("blockers") == ["password"]
-        assert terminal is not None
-        assert terminal.kind == ToastSnapshotKind.FAILURE
-        assert "内层归档需要密码" in terminal.body
-        report_path = terminal.actions[-1].target
-        report = Path(report_path).read_text(encoding="utf-8")
-        assert "内层归档需要密码" in report
-        assert "nested-inner-encrypted.zip" in report
+        assert terminal is None
     finally:
         toast.stop()
         harness.close()
@@ -202,7 +198,7 @@ def test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked(
     tmp_path,
     plan7_error,
 ):
-    """watch 模式下，内层缺分卷不得把外层 ZIP 放入缺分卷队列。"""
+    """watch 模式下，生成归档缺分卷是终态失败，不建立等待 blocker。"""
     outer = _nested_missing_volume_outer(tmp_path)
     label = "nested-inner-missing-volume-watch"
     toast_config = plan7_watch_config(passwords=[])
@@ -219,11 +215,9 @@ def test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked(
         arrive_slowly(harness, outer)
         result = _settle_watch(harness)
         terminal = _terminal_toast(toast_host)
-        events = (tmp_path / "nested-inner-missing-volume-watch" / "events.jsonl").read_text(
-            encoding="utf-8"
-        )
+        events = (tmp_path / label / "events.jsonl").read_text(encoding="utf-8")
         missing_volume_reported = result.failed == 1 and any(
-            "嵌套压缩包内层分卷缺失" in error for error in result.errors
+            "nested-inner-split.7z.001" in error for error in result.errors
         )
         ignored_at_scan = (
             result.failed == 0
@@ -235,12 +229,11 @@ def test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked(
             "result": result.__dict__,
             "state_entries": list(harness.watcher.state.entries),
             "state_groups": list(harness.watcher.state.groups),
-            "failed_nested_missing_volume_logged": '"event":"failed_nested_missing_volume"' in events,
+            "failed_terminal_logged": '"event":"failed_terminal"' in events,
             "suspended_missing_volume_logged": '"event":"suspended_missing_volume"' in events,
             "missing_volume_reported": missing_volume_reported,
             "ignored_at_scan": ignored_at_scan,
             "toast_kind": terminal.kind.value if terminal is not None else "",
-            "toast_body": terminal.body if terminal is not None else "",
         })
         assert missing_volume_reported or ignored_at_scan
         assert not harness.watcher.state.entries
@@ -248,17 +241,13 @@ def test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked(
         assert '"event":"suspended_missing_volume"' not in events
         assert terminal is not None
         if missing_volume_reported:
-            assert '"event":"failed_nested_missing_volume"' in events
-            assert any("nested-inner-split.7z.001" in error for error in result.errors)
+            assert '"event":"failed_terminal"' in events
             assert terminal.kind == ToastSnapshotKind.FAILURE
-            assert "内层归档缺少分卷" in terminal.body
-            report_path = terminal.actions[-1].target
-            report = Path(report_path).read_text(encoding="utf-8")
-            assert "内层归档缺少分卷" in report
+            report = Path(terminal.actions[-1].target).read_text(encoding="utf-8")
             assert "nested-inner-split.7z.001" in report
         else:
-            assert '"event":"failed_nested_missing_volume"' not in events
             assert terminal.kind == ToastSnapshotKind.SUCCESS
     finally:
         toast.stop()
         harness.close()
+

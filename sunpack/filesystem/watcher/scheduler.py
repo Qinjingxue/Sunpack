@@ -13,7 +13,17 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from sunpack.config.fields.watch import DEFAULT_WATCH_CONFIG
-from sunpack.contracts.failures import FailureKind, PASSWORD_FAILURE_KINDS
+from sunpack.contracts.failures import FailureKind
+from sunpack.contracts.retry_targets import (
+    failure_contains,
+    failure_is_password,
+    password_retry_results,
+    result_error,
+    result_failure,
+    result_outcome,
+    result_path,
+    target_results,
+)
 from sunpack.contracts.filesystem import FileEntry
 from sunpack.contracts.results import OutcomeKind
 from sunpack.contracts.pipeline import PipelineTarget
@@ -49,7 +59,11 @@ from sunpack.passwords.internal import builtin as builtin_passwords_module
 from sunpack.passwords.internal.builtin import get_builtin_passwords
 from sunpack.passwords.internal.clipboard_monitor import ClipboardPasswordMonitor
 from sunpack.passwords.internal.lists import dedupe_passwords
-from sunpack.passwords.internal.local_files import DIRECTORY_PASSWORD_FILE_NAME, is_directory_password_file
+from sunpack.passwords.internal.local_files import (
+    DIRECTORY_PASSWORD_FILE_NAME,
+    discover_directory_passwords_for_archive,
+    is_directory_password_file,
+)
 from sunpack.passwords.internal.store import MAX_RECENT_PASSWORDS
 from sunpack.support.path_keys import path_key
 from sunpack.support.collections import dedupe_normalized_paths
@@ -666,7 +680,11 @@ class WatchScheduler:
         if candidate is None:
             self._log_candidate_ignored(path, "not_a_file_or_unreadable")
             return
-        if not self._is_under_watched_root(candidate.path):
+        password_retry = (
+            _password_retry_snapshot is not None
+            and _candidate_matches_password_failure(candidate, _password_retry_snapshot)
+        )
+        if not self._is_under_watched_root(candidate.path) and not password_retry:
             self._log_candidate_ignored(candidate.path, "outside_watched_roots")
             return
         if self._is_under_metadata_dir(candidate.path):
@@ -699,7 +717,7 @@ class WatchScheduler:
                 state.filtered_mtime = candidate.mtime
                 self._wake_service()
                 return
-        if not self._passes_filesystem_filters(candidate):
+        if not password_retry and not self._passes_filesystem_filters(candidate):
             self._log_candidate_ignored(candidate.path, "filtered_out")
             return
         became_active = False
@@ -714,10 +732,7 @@ class WatchScheduler:
                 return
             state = self._active_states.get(candidate.path)
             if state is None:
-                retry_is_unchanged = (
-                    _password_retry_snapshot is not None
-                    and _candidate_matches_password_failure(candidate, _password_retry_snapshot)
-                )
+                retry_is_unchanged = password_retry
                 active_quiet_seconds = (
                     0.0
                     if retry_is_unchanged
@@ -1115,6 +1130,18 @@ class WatchScheduler:
         notification_id = uuid.uuid4().hex
         with self._password_source_lock:
             run_config = dict(self.config)
+            retry_entry = self.state.latest_entry_for_path(candidate.path)
+            if retry_entry is not None and retry_entry.status == "failed_password":
+                scope_dir = retry_entry.password_scope_dir
+                if scope_dir:
+                    scoped_passwords = discover_directory_passwords_for_archive(
+                        os.path.join(scope_dir, "__sunpack_password_retry__"),
+                        self.config,
+                    )
+                    run_config["user_passwords"] = dedupe_passwords([
+                        *list(run_config.get("user_passwords") or []),
+                        *scoped_passwords,
+                    ])
             self.pipeline_engine.update_password_sources(
                 user_passwords=run_config.get("user_passwords", []),
                 builtin_passwords=run_config.get("builtin_passwords", []),
@@ -1174,8 +1201,10 @@ class WatchScheduler:
         response = await request.task
         summary = response.summary
         self._remember_recent_passwords(response.recent_passwords)
+
         target_result = _target_result_for_path(summary, candidate.path)
         outcome_kind = _summary_outcome_kind(summary, target_result)
+        direct_outcome = result_outcome(target_result) or outcome_kind
         target_output_dir = (
             target_result.get("output_dir", "")
             if isinstance(target_result, dict)
@@ -1192,38 +1221,67 @@ class WatchScheduler:
             str(target_output_dir or ""),
         ])
 
-        summary_failures = list(getattr(summary, "failures", []) or [])
-        target_failure = _target_result_failure(target_result)
-        if target_failure is not None and target_failure not in summary_failures:
-            summary_failures.append(target_failure)
-        missing_volume_failures = _candidate_missing_volume_failures(
-            target_result,
-            summary_failures,
-        )
-        candidate_password_failures = _candidate_password_failures(
-            target_result,
-            summary_failures,
-        )
-        nested_missing_volume_failures = _nested_missing_volume_failures(
-            target_result,
-            summary_failures,
-        )
-        nested_password_failures = _nested_password_failures(
-            target_result,
-            summary_failures,
-        )
+        results = target_results(summary)
+        failures = list(getattr(summary, "failures", []) or [])
+        for item in results:
+            failure = result_failure(item)
+            if failure is not None and failure not in failures:
+                failures.append(failure)
 
-        if outcome_kind == OutcomeKind.PARTIAL_SUCCESS and missing_volume_failures:
-            failure_payloads = [_failure_to_dict(failure) for failure in missing_volume_failures]
-            payload = {**failure_payloads[0], "blockers": [BLOCKER_MISSING_VOLUME]}
-            error = str(
-                getattr(missing_volume_failures[0], "message", "")
-                or self.i18n.t("failure.possible_missing_volume")
+        direct_failure = result_failure(target_result)
+        if direct_failure is None and target_result is None and len(failures) == 1:
+            # Lightweight scheduler fakes historically expose only summary.failures.
+            direct_failure = failures[0]
+
+        direct_missing = bool(
+            direct_failure is not None
+            and failure_contains(direct_failure, FailureKind.MISSING_VOLUME)
+        )
+        direct_password = bool(
+            direct_failure is not None and failure_is_password(direct_failure)
+        )
+        original_scope = _password_scope_for_path(self.state, candidate.path)
+        password_scope_dir = original_scope or os.path.dirname(os.path.abspath(candidate.path))
+
+        # The watched input has its own lifecycle even when a recursively generated
+        # archive fails later. A successful direct task leaves group/state now;
+        # later recovery is anchored to the failed task itself.
+        if direct_outcome == OutcomeKind.COMPLETE_SUCCESS:
+            if group is not None:
+                completed_group = self._current_group_snapshot(group, candidate.path)
+                if completed_group is None:
+                    self.state.clear_group(group.group_id)
+                else:
+                    self.state.record_group_done(completed_group)
+                self.state.clear_entries(group.owned_paths)
+            self.state.mark(
+                candidate.path,
+                candidate.size,
+                candidate.mtime,
+                file_id=candidate.file_id,
+                change_usn=candidate.change_usn,
+                status="done",
+            )
+
+        waiting_failures: list = []
+        if direct_missing:
+            blockers = [BLOCKER_MISSING_VOLUME]
+            if direct_password:
+                blockers.append(BLOCKER_PASSWORD)
+            payload = _failure_payload(
+                direct_failure,
+                path=candidate.path,
+                blockers=blockers,
+                password_scope_dir=password_scope_dir if direct_password else "",
+            )
+            error = _failure_message(
+                direct_failure,
+                self.i18n.t("failure.possible_missing_volume"),
             )
             if group is not None:
                 self.state.record_group_suspended(
                     group,
-                    blockers=[BLOCKER_MISSING_VOLUME],
+                    blockers=blockers,
                     failure_payload=payload,
                 )
             self.state.mark(
@@ -1240,185 +1298,147 @@ class WatchScheduler:
                 "suspended_missing_volume",
                 path=candidate.path,
                 error=error,
-                failures=failure_payloads,
-                partial_recovery=True,
+                failures=[payload],
+                partial_recovery=direct_outcome == OutcomeKind.PARTIAL_SUCCESS,
             )
-            self._notify("suppressed", request.notification_id)
-            return WatchRunResult(processed=1, failed=1, errors=[error])
+            waiting_failures.append(direct_failure)
 
-        if outcome_kind == OutcomeKind.PARTIAL_SUCCESS:
-            nested_reasons = _nested_failure_reasons(
-                nested_password_failures,
-                nested_missing_volume_failures,
+        recorded_password_failures: list = []
+        recorded_password_payloads: dict[str, dict] = {}
+        retry_results = password_retry_results(summary)
+        if not results and direct_failure is not None:
+            if (
+                failure_is_password(direct_failure)
+                and not failure_contains(direct_failure, FailureKind.MISSING_VOLUME)
+            ):
+                retry_results = [None]
+
+        for item in retry_results:
+            failure = direct_failure if item is None else result_failure(item)
+            retry_path = candidate.path if item is None else result_path(item)
+            if failure is None or not retry_path:
+                continue
+            retry_candidate = (
+                candidate
+                if path_key(retry_path) == path_key(candidate.path)
+                else _candidate_for_event_path(retry_path)
             )
-            if nested_reasons:
-                failed = list(summary.failed_tasks)
-                nested_failures = _nested_related_failures(
-                    nested_password_failures,
-                    nested_missing_volume_failures,
-                )
-                primary_failure = nested_failures[0] if nested_failures else None
-                raw_error = failed[0] if failed else ""
-                error = _nested_failure_error(
-                    nested_reasons[0],
-                    primary_failure,
-                    fallback=raw_error,
-                    i18n=self.i18n,
-                )
-                failure_payloads = [_failure_to_dict(failure) for failure in nested_failures]
-                blockers = [BLOCKER_PASSWORD] if "password" in nested_reasons else []
-                status = (
-                    "failed_password"
-                    if blockers
-                    else "failed_nested_missing_volume"
-                )
-                payload = _add_nested_failure_details(
-                    {
-                        **(failure_payloads[0] if failure_payloads else {}),
-                        "blockers": list(blockers),
-                    },
-                    nested_reasons,
-                )
-                if failure_payloads:
-                    failure_payloads[0] = payload
-                if group is not None:
-                    if blockers:
-                        self.state.record_group_suspended(
-                            group,
-                            blockers=blockers,
-                            failure_payload=payload,
-                        )
-                    else:
-                        self.state.record_group_terminal(group, status=status, failure_payload=payload)
-                self.state.mark(
-                    candidate.path,
-                    candidate.size,
-                    candidate.mtime,
-                    file_id=candidate.file_id,
-                    change_usn=candidate.change_usn,
-                    status=status,
-                    error=error,
-                    failure_payload=payload,
-                )
-                self.log.write(
-                    status,
-                    path=candidate.path,
-                    error=error,
-                    failures=failure_payloads,
-                )
-                self._notify("failed", request.notification_id, [error], failure_payloads)
-                return WatchRunResult(processed=1, failed=1, errors=[error])
-
-            error = self.i18n.t("watch.failure.partial_rejected")
-            if group is not None:
-                self.state.record_group_terminal(group, status="failed")
+            if retry_candidate is None:
+                # No surviving source means there is no task that can ever retry.
+                continue
+            payload = _failure_payload(
+                failure,
+                path=retry_candidate.path,
+                blockers=[BLOCKER_PASSWORD],
+                password_scope_dir=password_scope_dir,
+            )
+            error = _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
             self.state.mark(
-                candidate.path,
-                candidate.size,
-                candidate.mtime,
-                file_id=candidate.file_id,
-                change_usn=candidate.change_usn,
-                status="failed",
-                error=error,
-            )
-            self.log.write(
-                "partial_rejected",
-                path=candidate.path,
-                error=error,
-            )
-            self._notify("failed", request.notification_id, [error], [])
-            return WatchRunResult(processed=1, failed=1, errors=[error])
-
-        failed = list(summary.failed_tasks)
-        if failed:
-            error = failed[0] if failed else self.i18n.t("watch.failure.extraction_failed")
-            failures = summary_failures
-            failure_payloads = [_failure_to_dict(failure) for failure in failures]
-            is_password_failure = bool(
-                candidate_password_failures or nested_password_failures
-            )
-            is_missing_volume = bool(missing_volume_failures)
-            nested_reasons = _nested_failure_reasons(
-                nested_password_failures,
-                nested_missing_volume_failures,
-            )
-            nested_notification = bool(nested_reasons) and not (
-                candidate_password_failures or missing_volume_failures
-            )
-            blockers = []
-            if is_missing_volume:
-                blockers.append(BLOCKER_MISSING_VOLUME)
-            if is_password_failure:
-                blockers.append(BLOCKER_PASSWORD)
-            status = (
-                "failed_password"
-                if is_password_failure
-                else "suspended_missing_volume"
-                if is_missing_volume
-                else "failed_nested_missing_volume"
-                if "missing_volume" in nested_reasons
-                else "failed_terminal"
-            )
-            if nested_notification:
-                error = _nested_failure_error(
-                    nested_reasons[0],
-                    _nested_related_failures(
-                        nested_password_failures,
-                        nested_missing_volume_failures,
-                    )[0],
-                    fallback=error,
-                    i18n=self.i18n,
-                )
-            primary_failures = (
-                candidate_password_failures
-                or missing_volume_failures
-                or nested_password_failures
-                or nested_missing_volume_failures
-                or failures
-            )
-            primary_payload = _failure_to_dict(primary_failures[0]) if primary_failures else {}
-            payload = _add_nested_failure_details(
-                {**primary_payload, "blockers": list(blockers)},
-                nested_reasons,
-            )
-            if nested_reasons:
-                primary_raw_payload = _failure_to_dict(primary_failures[0]) if primary_failures else {}
-                for index, failure_payload in enumerate(failure_payloads):
-                    if failure_payload == primary_raw_payload:
-                        failure_payloads[index] = payload
-                        break
-                else:
-                    failure_payloads.insert(0, payload)
-            if group is not None:
-                if blockers:
-                    self.state.record_group_suspended(group, blockers=blockers, failure_payload=payload)
-                else:
-                    self.state.record_group_terminal(group, status=status, failure_payload=payload)
-            self.state.mark(
-                candidate.path,
-                candidate.size,
-                candidate.mtime,
-                file_id=candidate.file_id,
-                change_usn=candidate.change_usn,
-                status=status,
+                retry_candidate.path,
+                retry_candidate.size,
+                retry_candidate.mtime,
+                file_id=retry_candidate.file_id,
+                change_usn=retry_candidate.change_usn,
+                status="failed_password",
                 error=error,
                 failure_payload=payload,
             )
-            self.log.write(status, path=candidate.path, error=error, failures=failure_payloads)
-            if blockers and not nested_notification:
-                self._notify("suppressed", request.notification_id)
-            else:
-                self._notify(
-                    "failed",
-                    request.notification_id,
-                    [error] if nested_notification else failed,
-                    failure_payloads,
+            self.log.write(
+                "failed_password",
+                path=retry_candidate.path,
+                error=error,
+                failures=[payload],
+            )
+            recorded_password_failures.append(failure)
+            recorded_password_payloads[path_key(retry_candidate.path)] = payload
+
+        direct_password_payload = recorded_password_payloads.get(path_key(candidate.path))
+        if (
+            group is not None
+            and not direct_missing
+            and direct_outcome != OutcomeKind.COMPLETE_SUCCESS
+        ):
+            if direct_password_payload is not None:
+                self.state.record_group_suspended(
+                    group,
+                    blockers=[BLOCKER_PASSWORD],
+                    failure_payload=direct_password_payload,
                 )
+            else:
+                self.state.record_group_terminal(
+                    group,
+                    status="failed_terminal",
+                    failure_payload=_failure_payload(
+                        direct_failure,
+                        path=candidate.path,
+                    ) if direct_failure is not None else None,
+                )
+
+        terminal_failures = [
+            failure
+            for failure in failures
+            if failure not in waiting_failures
+            and failure not in recorded_password_failures
+        ]
+        failed = list(getattr(summary, "failed_tasks", []) or [])
+
+        if terminal_failures:
+            payloads = [_failure_to_dict(failure) for failure in terminal_failures]
+            terminal_errors = []
+            for item in results:
+                failure = result_failure(item)
+                if failure not in terminal_failures:
+                    continue
+                task_path = result_path(item)
+                message = result_error(item) or _failure_message(
+                    failure,
+                    self.i18n.t("watch.failure.extraction_failed"),
+                )
+                terminal_errors.append(
+                    f"{os.path.basename(task_path)} [{message}]" if task_path else message
+                )
+            errors = terminal_errors or failed or [
+                _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
+                for failure in terminal_failures
+            ]
+            error = errors[0] if errors else self.i18n.t("watch.failure.extraction_failed")
+            self.log.write(
+                "failed_terminal",
+                path=candidate.path,
+                error=error,
+                failures=payloads,
+            )
+            self._notify("failed", request.notification_id, errors, payloads)
+            return WatchRunResult(processed=1, failed=1, errors=errors)
+
+        if direct_missing:
+            self._notify("suppressed", request.notification_id)
             return WatchRunResult(
                 processed=1,
                 failed=1,
-                errors=[error] if nested_notification else failed,
+                errors=[_failure_message(
+                    direct_failure,
+                    self.i18n.t("failure.possible_missing_volume"),
+                )],
             )
+
+        if recorded_password_failures:
+            self._notify("suppressed", request.notification_id)
+            errors = failed or [
+                _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
+                for failure in recorded_password_failures
+            ]
+            return WatchRunResult(processed=1, failed=1, errors=errors)
+
+        if failed:
+            # Unstructured failures cannot participate in an automatic wait.
+            error = failed[0]
+            if group is not None and direct_outcome != OutcomeKind.COMPLETE_SUCCESS:
+                self.state.record_group_terminal(group, status="failed_terminal")
+            self.log.write("failed_terminal", path=candidate.path, error=error, failures=[])
+            self._notify("failed", request.notification_id, failed, [])
+            return WatchRunResult(processed=1, failed=1, errors=failed)
+
         if _summary_processed_no_tasks(summary):
             if group is not None:
                 self.state.record_group_terminal(group, status="ignored_no_tasks")
@@ -1433,7 +1453,8 @@ class WatchScheduler:
             self.log.write("no_tasks_found", path=candidate.path)
             self._notify("suppressed", request.notification_id)
             return WatchRunResult(processed=1)
-        if outcome_kind != OutcomeKind.COMPLETE_SUCCESS:
+
+        if direct_outcome != OutcomeKind.COMPLETE_SUCCESS:
             error = self.i18n.t("watch.failure.no_complete_outcome")
             if group is not None:
                 self.state.record_group_terminal(group, status="failed_terminal")
@@ -1441,36 +1462,41 @@ class WatchScheduler:
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
-        if group is not None:
-            completed_group = self._current_group_snapshot(group, candidate.path)
-            if completed_group is None:
-                self.state.clear_group(group.group_id)
-            else:
-                self.state.record_group_done(completed_group)
-            # A split group owns every physical input and launcher companion.
-            # Earlier arrivals may have been attempted as standalone files and
-            # left retry blockers behind.  Once the canonical group completes,
-            # those per-file blockers are obsolete; retaining them makes watch
-            # state report a missing volume after a successful group extraction.
-            self.state.clear_entries(group.owned_paths)
-        self.state.mark(
-            candidate.path,
-            candidate.size,
-            candidate.mtime,
-            file_id=candidate.file_id,
-            change_usn=candidate.change_usn,
-            status="done",
+        self.log.write(
+            "done",
+            path=candidate.path,
+            success_count=summary.success_count,
+            output_dirs=generated_output_dirs,
         )
-        self.log.write("done", path=candidate.path, success_count=summary.success_count, output_dirs=generated_output_dirs)
-        cleanup_failed = [item for item in response.summary.cleanup_results if item.status == "failed"]
-        self.log.write("cleanup", path=candidate.path,
-                       results=[{"path": item.path, "status": item.status, "attempts": item.attempts,
-                                 "error_code": item.error_code, "message": item.message}
-                                for item in response.summary.cleanup_results],
-                       retry_count=sum(max(0, item.attempts - 1) for item in response.summary.cleanup_results))
+        cleanup_failed = [
+            item for item in response.summary.cleanup_results
+            if item.status == "failed"
+        ]
+        self.log.write(
+            "cleanup",
+            path=candidate.path,
+            results=[
+                {
+                    "path": item.path,
+                    "status": item.status,
+                    "attempts": item.attempts,
+                    "error_code": item.error_code,
+                    "message": item.message,
+                }
+                for item in response.summary.cleanup_results
+            ],
+            retry_count=sum(
+                max(0, item.attempts - 1)
+                for item in response.summary.cleanup_results
+            ),
+        )
         if cleanup_failed:
-            self._notify("succeeded", request.notification_id, generated_output_dirs,
-                         [self.i18n.t("cleanup.incomplete", count=len(cleanup_failed))])
+            self._notify(
+                "succeeded",
+                request.notification_id,
+                generated_output_dirs,
+                [self.i18n.t("cleanup.incomplete", count=len(cleanup_failed))],
+            )
         else:
             self._notify("succeeded", request.notification_id, generated_output_dirs)
         return WatchRunResult(processed=1, succeeded=summary.success_count)
@@ -1515,11 +1541,14 @@ class WatchScheduler:
         return os.path.dirname(path)
 
     def _output_root_for(self, path: str) -> str:
-        matched_root = _longest_matching_root(os.path.abspath(path), self.watch_roots)
-        if matched_root is None:
-            # Only reachable for a path outside every watch root, which enqueue already rejects.
-            return self._common_root_for(path)
-        return self.output_roots[path_key(matched_root)]
+        normalized = os.path.abspath(path)
+        matched_root = _longest_matching_root(normalized, self.watch_roots)
+        if matched_root is not None:
+            return self.output_roots[path_key(matched_root)]
+        # Password retries may start from a recursively generated archive that
+        # already lives under a configured output root.
+        output_root = _longest_matching_root(normalized, list(self.output_roots.values()))
+        return output_root or self._common_root_for(path)
 
     def _is_under_watched_root(self, path: str) -> bool:
         normalized = os.path.normcase(os.path.abspath(path))
@@ -1588,7 +1617,7 @@ class WatchScheduler:
         with self._lock:
             for entry in entries:
                 if entry.status == "failed_password":
-                    self._password_dirty_dirs[os.path.dirname(entry.path)] = now
+                    self._password_dirty_dirs[entry.password_scope_dir] = now
                     marked = True
         if marked:
             self._wake_service()
@@ -1820,138 +1849,37 @@ def _failure_to_dict(failure) -> dict:
     return {}
 
 
-def _failure_contains(failure, kind: FailureKind) -> bool:
+def _failure_message(failure, fallback: str) -> str:
     if isinstance(failure, dict):
-        raw_kind = failure.get("kind")
-        if raw_kind in {kind, kind.value, str(kind)}:
-            return True
-        return any(
-            _failure_contains(cause, kind)
-            for cause in (failure.get("causes") or [])
-        )
-    contains = getattr(failure, "contains", None)
-    if callable(contains):
-        try:
-            return bool(contains(kind))
-        except Exception:
-            pass
-    return getattr(failure, "kind", None) == kind
-
-
-def _failure_is_password(failure) -> bool:
-    if isinstance(failure, dict):
-        raw_kind = failure.get("kind")
-        try:
-            if FailureKind(str(raw_kind)) in PASSWORD_FAILURE_KINDS:
-                return True
-        except (TypeError, ValueError):
-            pass
-        return any(_failure_is_password(cause) for cause in (failure.get("causes") or []))
-    return bool(getattr(failure, "is_password_failure", False))
-
-
-def _target_result_failure(target_result):
-    if isinstance(target_result, dict):
-        return target_result.get("failure")
-    return getattr(target_result, "failure", None) if target_result is not None else None
-
-
-def _candidate_failures(target_result, failures, predicate) -> list:
-    """Return failures owned by the watched candidate itself."""
-    target_failure = _target_result_failure(target_result)
-    if target_result is None:
-        return [failure for failure in failures if predicate(failure)]
-    if target_failure is not None and predicate(target_failure):
-        return [target_failure]
-    return []
-
-
-def _nested_failures(target_result, failures, predicate) -> list:
-    """Return failures owned by recursively extracted child archives."""
-    if target_result is None:
-        return []
-    if _candidate_failures(target_result, failures, predicate):
-        return []
-    return [failure for failure in failures if predicate(failure)]
-
-
-def _candidate_missing_volume_failures(target_result, failures) -> list:
-    """Return missing-volume failures owned by the watched candidate.
-
-    A pipeline response may contain failures from recursively extracted child
-    archives.  Those failures must not turn the parent archive into a split
-    volume watch blocker.  Real responses carry a TargetRunResult for every
-    archive, so use the current candidate's direct failure there.  The
-    target-result-free fallback keeps lightweight scheduler fakes compatible.
-    """
-    return _candidate_failures(
-        target_result,
-        failures,
-        lambda failure: _failure_contains(failure, FailureKind.MISSING_VOLUME),
-    )
-
-
-def _candidate_password_failures(target_result, failures) -> list:
-    return _candidate_failures(target_result, failures, _failure_is_password)
-
-
-def _nested_missing_volume_failures(target_result, failures) -> list:
-    """Return missing-volume failures that belong to a recursively extracted child."""
-    return _nested_failures(
-        target_result,
-        failures,
-        lambda failure: _failure_contains(failure, FailureKind.MISSING_VOLUME),
-    )
-
-
-def _nested_password_failures(target_result, failures) -> list:
-    return _nested_failures(target_result, failures, _failure_is_password)
-
-
-def _nested_failure_reasons(password_failures, missing_volume_failures) -> list[str]:
-    reasons = []
-    if password_failures:
-        reasons.append("password")
-    if missing_volume_failures:
-        reasons.append(FailureKind.MISSING_VOLUME.value)
-    return reasons
-
-
-def _nested_related_failures(password_failures, missing_volume_failures) -> list:
-    return [*password_failures, *missing_volume_failures]
-
-
-def _nested_failure_error(
-    reason: str,
-    failure,
-    *,
-    fallback: str = "",
-    i18n: I18nContext | None = None,
-) -> str:
-    i18n = i18n or I18nContext()
-    if fallback:
-        message = fallback
-    elif isinstance(failure, dict):
-        message = failure.get("message") or ""
+        message = failure.get("message")
     else:
         message = getattr(failure, "message", "") if failure is not None else ""
-    message = str(message or i18n.t("watch.failure.unknown_nested"))
-    key = "watch.failure.nested_password" if reason == "password" else "watch.failure.nested_missing_volume"
-    return i18n.t(key, message=message)
+    return str(message or fallback)
 
 
-def _add_nested_failure_details(payload: dict, reasons: list[str]) -> dict:
-    if not reasons:
-        return payload
-    details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
-    details = {
-        **details,
-        "scope": "nested_archive",
-        "reason": reasons[0],
-    }
-    if len(reasons) > 1:
-        details["reasons"] = list(reasons)
-    return {**payload, "details": details}
+def _failure_payload(
+    failure,
+    *,
+    path: str = "",
+    blockers: list[str] | None = None,
+    password_scope_dir: str = "",
+) -> dict:
+    payload = _failure_to_dict(failure)
+    if blockers is not None:
+        payload["blockers"] = list(blockers)
+    if password_scope_dir:
+        payload["password_scope_dir"] = os.path.abspath(password_scope_dir)
+    if path:
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        payload["details"] = {**details, "path": os.path.abspath(path)}
+    return payload
+
+
+def _password_scope_for_path(state: WatchStateStore, path: str) -> str:
+    entry = state.latest_entry_for_path(path)
+    if entry is not None and entry.status == "failed_password":
+        return entry.password_scope_dir
+    return ""
 
 
 def _summary_processed_no_tasks(summary) -> bool:
