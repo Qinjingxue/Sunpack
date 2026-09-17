@@ -23,6 +23,7 @@ from sunpack.support.resource_lifecycle import (
     named_task_temporary_file,
     open_service_file,
     read_task_text,
+    task_scandir,
 )
 
 from .group_models import (
@@ -242,11 +243,17 @@ class WatchStateStore:
     def _journal_paths(self) -> list[Path]:
         prefix = f"{self.path.stem}.journal."
         suffix = ".jsonl"
-        paths = []
-        for path in self.path.parent.glob(f"{prefix}*{suffix}"):
-            if self._segment_start_from_path(path) is not None:
-                paths.append(path)
-        return sorted(paths, key=lambda item: self._segment_start_from_path(item) or 0)
+        paths: list[tuple[int, Path]] = []
+        with task_scandir(self.path.parent) as entries:
+            for entry in entries:
+                if not entry.name.startswith(prefix) or not entry.name.endswith(suffix):
+                    continue
+                path = Path(entry.path)
+                start = self._segment_start_from_path(path)
+                if start is not None:
+                    paths.append((start, path))
+        paths.sort(key=lambda item: item[0])
+        return [path for _, path in paths]
 
     def _segment_start_from_path(self, path: Path) -> int | None:
         prefix = f"{self.path.stem}.journal."
