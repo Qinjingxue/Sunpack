@@ -1,0 +1,40 @@
+name: Temporary Watch Sequence Check
+
+on:
+  push:
+    branches:
+      - fix/watch-sequence-checkpoint
+
+permissions:
+  contents: read
+
+jobs:
+  watch-state:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v5
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.0"
+      - name: Install development dependencies
+        shell: pwsh
+        run: uv sync --locked --extra dev
+      - name: Build and install sunpack_native
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\maturin.exe build --manifest-path native\sunpack_native\Cargo.toml --release --target-dir .cache\rust-target\x64 --out build\native-wheels-dev
+          $wheel = Get-ChildItem build\native-wheels-dev\sunpack_native-*.whl | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 -ExpandProperty FullName
+          uv pip uninstall --python .\.venv\Scripts\python.exe sunpack-native
+          uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
+      - name: Compile modified modules
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m py_compile sunpack\filesystem\watcher\state.py sunpack\filesystem\watcher\journal_commit.py tests\unit\test_watch_state.py
+      - name: Run Watch persistence and scheduler tests
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pytest -q tests\unit\test_watch_state.py tests\unit\test_watch_crash_recovery.py tests\unit\test_watch_group_models.py tests\unit\test_watch_scheduler.py
+      - name: Benchmark Watch state persistence
+        shell: pwsh
+        run: .\.venv\Scripts\python.exe -m benchmarks.scenarios.watch_state_persistence --records 3000 30000 100000 --rounds 5
