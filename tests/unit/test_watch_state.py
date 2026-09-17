@@ -468,3 +468,58 @@ def test_prune_missing_records_retains_records_when_presence_is_unknown(tmp_path
 
     assert state.prune_missing_records() == (0, 0)
     assert state.latest_entry_for_path(str(archive)) is not None
+
+
+def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
+    state_path = tmp_path / "state.json"
+    archive = tmp_path / "雪-special.zip"
+    state = WatchStateStore(str(state_path))
+    state.mark(
+        str(archive),
+        123,
+        45.5,
+        file_id="id-雪",
+        change_usn=99,
+        status="failed_password",
+        error="bad\n\"password\\雪",
+        failure_payload={
+            "kind": "password",
+            "blockers": ["password"],
+            "nested": {
+                "unicode": "雪☃",
+                "escaped": "line1\nline2\t\\\"",
+                "values": [True, False, None, 1, -2, 3.25],
+                "tuple": ("a", "b"),
+            },
+        },
+    )
+    state.watch_cursors = {
+        "volume:雪": {"journal_id": 2**63 + 17, "next_usn": 2**63 + 19}
+    }
+    state.groups["group-雪"] = WatchGroupState(
+        group_id="group-雪",
+        directory=str(tmp_path),
+        logical_name="archive-雪",
+        split_family="7z",
+        head_path=str(archive),
+        input_paths=[str(archive)],
+        owned_paths=[str(archive)],
+        status="suspended",
+        blockers=["missing_volume"],
+        failure_payload={"message": "缺少分卷", "indices": [2, 3]},
+        updated_at=12.0,
+    )
+    state.save()
+
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    entry = next(iter(payload["entries"].values()))
+    assert payload["version"] == watch_state_module.STATE_VERSION
+    assert payload["watch_cursors"]["volume:雪"]["journal_id"] == 2**63 + 17
+    assert entry["last_error"] == "bad\n\"password\\雪"
+    assert entry["failure_payload"]["nested"]["unicode"] == "雪☃"
+    assert entry["failure_payload"]["nested"]["tuple"] == ["a", "b"]
+    assert payload["groups"]["group-雪"]["failure_payload"]["message"] == "缺少分卷"
+
+    reloaded = WatchStateStore(str(state_path))
+    assert reloaded.latest_entry_for_path(str(archive)).failure_payload["nested"]["escaped"] == "line1\nline2\t\\\""
+    assert reloaded.watch_cursor("volume:雪")["next_usn"] == 2**63 + 19
