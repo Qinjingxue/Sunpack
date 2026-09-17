@@ -89,9 +89,12 @@ def _seed_state(state: WatchStateStore, total_records: int) -> None:
             ownership_fingerprint=f"owner-{index}",
             last_attempted_input_fingerprint=f"input-{index}",
             password_generation=2,
-            missing_reason="middle_gap",
-            missing_indices=[2],
-            failure_payload={"kind": "missing_volume", "stage": "relation"},
+            failure_payload={
+                "kind": "missing_volume",
+                "stage": "relation",
+                "missing_reason": "middle_gap",
+                "missing_indices": [2],
+            },
             attempt_count=1,
             updated_at=1720000200.0 + index,
         )

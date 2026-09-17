@@ -81,13 +81,18 @@ class _GroupCommitter:
             batch = [first]
             deadline = time.perf_counter() + GROUP_COMMIT_WINDOW_SECONDS
             while True:
-                remaining = deadline - time.perf_counter()
-                if remaining <= 0:
-                    break
                 try:
-                    batch.append(self._queue.get(timeout=remaining))
+                    batch.append(self._queue.get_nowait())
+                    continue
                 except queue.Empty:
+                    pass
+                if time.perf_counter() >= deadline:
                     break
+                # A timed queue.get() shorter than the Windows timer tick is
+                # rounded up to the full tick (~15.6 ms here), which would cost
+                # a tick per transaction.  Yielding re-checks the queue without
+                # ever waiting on a coarse timer.
+                time.sleep(0)
 
             errors: dict[str, BaseException] = {}
             durable_paths: set[str] = set()
