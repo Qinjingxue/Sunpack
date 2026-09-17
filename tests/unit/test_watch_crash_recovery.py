@@ -354,3 +354,54 @@ def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):
         status="done",
     )
     assert scheduler_module._persisted_blocker_owns_retry(state, str(archive)) is False
+
+
+
+def test_committed_publication_recovers_namespace_rollback_after_source_cleanup(tmp_path):
+    """Durable publication intent makes the rename safely replayable after power loss."""
+    import sunpack.filesystem.watcher.scheduler as scheduler_module
+    from sunpack.support.watch_staging import publish_staging_output
+
+    state_path = tmp_path / "state.json"
+    source = tmp_path / "outer.zip"
+    source.write_bytes(b"source")
+    staging = tmp_path / ".sunpack-partial-power-loss"
+    final = tmp_path / "published"
+    staging.mkdir()
+    (staging / "payload.bin").write_bytes(b"verified-output")
+
+    state = WatchStateStore(str(state_path))
+    state.queue_active(
+        _candidate(source, size=len(b"source")),
+        durable_owner=True,
+        persist=True,
+        durable=True,
+    )
+    assert state.record_task_output_committed(
+        str(source),
+        str(source),
+        str(final),
+        staging_dir=str(staging),
+        staging_file_id="",
+    )
+
+    # Normal success publishes with a same-volume atomic rename. Emulate the
+    # only power-loss state WRITE_THROUGH previously tried to prevent: the call
+    # returned, source cleanup ran, but NTFS namespace persistence rolls back to
+    # the durable staging name after reboot.
+    publish_staging_output(str(staging), str(final))
+    final.rename(staging)
+    source.unlink()
+
+    restarted = WatchStateStore(str(state_path))
+    [pending] = restarted.pending_work_items()
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler.state = restarted
+    scheduler.config = {}
+    scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
+    scheduler._startup_suppress_paths = set()
+
+    assert scheduler._recover_committed_publications(pending) is True
+    assert final.is_dir()
+    assert not staging.exists()
+    assert (final / "payload.bin").read_bytes() == b"verified-output"
