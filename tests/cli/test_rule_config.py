@@ -37,7 +37,7 @@ def test_config_validate_rejects_obsolete_cumulative_deep_scan_ratio():
 
 def test_config_validate_rejects_normalized_config_values_in_external_shorthand_fields():
     payload = _payload()
-    payload["recursive_extract"] = {"mode": "infinite", "max_rounds": 999}
+    payload["recursive_extract"] = {"mode": "infinite"}
     payload["post_extract"] = {"archive_cleanup_mode": "recycle"}
     payload["filesystem"] = {"directory_scan_mode": "recursive", "scan_filters": []}
 

@@ -8,9 +8,9 @@ from sunpack.config.schema import ConfigField
 def normalize_recursive_extract(value: Any) -> dict[str, Any]:
     raw = str(value).strip().lower()
     if raw == "*":
-        return {"mode": "infinite", "max_rounds": 999}
+        return {"mode": "infinite"}
     if raw == "?":
-        return {"mode": "prompt", "max_rounds": 999}
+        return {"mode": "prompt"}
     try:
         rounds = int(raw)
     except (TypeError, ValueError) as exc:

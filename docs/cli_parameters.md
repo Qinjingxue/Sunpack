@@ -74,8 +74,8 @@ When `--out-dir` is given, results land under "output root / the input path rela
 Values for `--recur`:
 
 - A positive integer such as `1`, `2`, `3`: a fixed number of recursive rounds.
-- `*`: keep recursing, up to 999 rounds.
-- `?`: ask whether to continue after each round, up to 999 rounds.
+- `*`: keep recursing while each round produces new processable nested archives.
+- `?`: ask whether to continue after each round that produces new processable nested archives.
 
 Examples:
 

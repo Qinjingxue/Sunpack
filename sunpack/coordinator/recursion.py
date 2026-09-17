@@ -4,7 +4,7 @@ from sunpack.i18n import I18nContext
 class RecursionController:
     def __init__(self, mode: str, max_rounds: int = 1, language: str = "en"):
         self.mode = mode # "fixed", "prompt", "infinite"
-        self.max_rounds = max_rounds
+        self.max_rounds = max_rounds if mode == "fixed" else None
         self.i18n = I18nContext(language)
 
     def should_continue(self, round_index: int, new_roots_found: bool) -> bool:
