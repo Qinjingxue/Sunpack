@@ -14,6 +14,7 @@ from sunpack_native import write_watch_state_snapshot_native as _native_write_wa
 
 from sunpack.filesystem.watcher.journal_commit import (
     JournalTicket,
+    seed_state_stream,
     submit_segment_seal,
     submit_state_transaction,
     submit_stream_flush,
@@ -198,7 +199,7 @@ class WatchStateStore:
         self._compact_records = max(1, int(compact_records))
         self._compact_bytes = max(1, int(compact_bytes))
         self._hard_compact_bytes = max(self._compact_bytes, int(hard_compact_bytes))
-        self._writer_stream = f"{_state_path_key(self.path)}:{id(self):x}"
+        self._writer_stream = _state_path_key(self.path)
 
         self.pending_work: dict[str, WatchPendingWork] = {}
         self.entries: dict[str, WatchStateEntry] = {}
@@ -222,6 +223,7 @@ class WatchStateStore:
         self._snapshot_exists = False
         self._external_sequence_gap = False
         self.load()
+        seed_state_stream(stream=self._writer_stream, seq=self._applied_seq)
 
     @property
     def journal_path(self) -> Path:
@@ -456,10 +458,9 @@ class WatchStateStore:
 
         with self._state_lock:
             self._raise_persistence_fault_locked()
-            path = self.journal_path
             ticket = submit_stream_flush(
                 stream=self._writer_stream,
-                path=str(path),
+                target_seq=self._applied_seq,
                 on_error=self._on_journal_error,
             )
         ticket.wait()
@@ -610,6 +611,8 @@ class WatchStateStore:
                         stream=self._writer_stream,
                         old_path=str(self._segment_path(old_start)),
                         new_path=str(self._segment_path(new_start)),
+                        old_start=old_start,
+                        boundary=boundary,
                         on_error=self._on_journal_error,
                     )
                 else:

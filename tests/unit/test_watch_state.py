@@ -7,7 +7,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import sunpack.filesystem.watcher.journal_commit as watch_journal_module
 import sunpack.filesystem.watcher.state as watch_state_module
 from sunpack.filesystem.watcher.group_models import WatchGroupState
 from sunpack.filesystem.watcher.state import (
@@ -86,16 +85,13 @@ def test_incremental_update_appends_segment_without_replacing_snapshot(tmp_path,
     assert reloaded.path == str((tmp_path / "queued.7z").resolve())
 
 
-def test_failed_journal_append_faults_store(tmp_path, monkeypatch):
+def test_failed_journal_append_faults_store(tmp_path):
     state = WatchStateStore(str(tmp_path / "state.json"))
     state.save()
+    # Force native OpenOptions(file) to fail without relying on Python internals.
+    state.journal_path.mkdir()
 
-    def fail_open(*_args, **_kwargs):
-        raise OSError("journal unavailable")
-
-    monkeypatch.setattr(watch_journal_module, "open_service_file", fail_open)
-
-    with pytest.raises(OSError, match="journal unavailable"):
+    with pytest.raises(RuntimeError, match="native Watch journal append failed"):
         state.queue_active(_candidate(tmp_path / "queued.7z"), durable=True)
     with pytest.raises(RuntimeError, match="persistence is unavailable"):
         state.queue_active(_candidate(tmp_path / "second.7z"), durable=True)
