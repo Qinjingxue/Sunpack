@@ -1,10 +1,11 @@
+use crate::io::resource_lifecycle::TrackedFile;
 use crate::watch_state::{extract_json, write_json_value, JsonValue};
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict};
 use std::collections::{BTreeMap, HashMap};
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
@@ -92,7 +93,7 @@ impl NativeJournalTicket {
 
 struct SegmentState {
     path: PathBuf,
-    file: Arc<File>,
+    file: Arc<TrackedFile>,
     last_seq: u64,
     write_epoch: u64,
     flushed_epoch: u64,
@@ -349,21 +350,21 @@ fn fail_stream(shared: &Shared, stream: &str, error: impl Into<String>) {
     shared.cv.notify_all();
 }
 
-fn open_segment(path: &Path) -> io::Result<File> {
+fn open_segment(path: &Path) -> io::Result<TrackedFile> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let mut options = OpenOptions::new();
-    options.create(true).append(true).read(true);
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        const FILE_SHARE_READ: u32 = 0x0000_0001;
-        const FILE_SHARE_WRITE: u32 = 0x0000_0002;
-        const FILE_SHARE_DELETE: u32 = 0x0000_0004;
-        options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
-    }
-    options.open(path)
+    TrackedFile::open_with(path, "watch_journal_segment", |options| {
+        options.create(true).append(true).read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            const FILE_SHARE_READ: u32 = 0x0000_0001;
+            const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+            const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+            options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE);
+        }
+    })
 }
 
 fn segment_file(
@@ -371,7 +372,7 @@ fn segment_file(
     stream: &str,
     segment_start: u64,
     path: &Path,
-) -> io::Result<Arc<File>> {
+) -> io::Result<Arc<TrackedFile>> {
     {
         let state = lock_state(shared);
         if let Some(segment) = state
@@ -421,9 +422,8 @@ fn encode_transaction(version: u32, seq: u64, operations: &JsonValue) -> io::Res
     Ok(payload)
 }
 
-fn write_file(file: &File, payload: &[u8]) -> io::Result<()> {
-    let mut handle = file;
-    handle.write_all(payload)
+fn write_file(file: &TrackedFile, payload: &[u8]) -> io::Result<()> {
+    file.write_shared(payload)
 }
 
 struct AppendWorkItem {
@@ -686,7 +686,7 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
 struct FlushSnapshot {
     start: u64,
     epoch: u64,
-    file: Arc<File>,
+    file: Arc<TrackedFile>,
 }
 
 struct FlushWork {

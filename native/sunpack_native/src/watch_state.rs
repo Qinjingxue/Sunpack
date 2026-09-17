@@ -1,7 +1,7 @@
+use crate::io::resource_lifecycle::TrackedFile;
 use pyo3::exceptions::{PyRuntimeError, PyTypeError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
-use std::fs::OpenOptions;
 use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 
@@ -120,9 +120,9 @@ fn extract_record(record: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
     let mut items = Vec::with_capacity(field_defs.len());
     for (field_name, _) in field_defs.iter() {
         let key = field_name.extract::<String>()?;
-        let value = attrs
-            .get_item(key.as_str())?
-            .ok_or_else(|| type_error(format!("Watch snapshot dataclass field is missing: {key}")))?;
+        let value = attrs.get_item(key.as_str())?.ok_or_else(|| {
+            type_error(format!("Watch snapshot dataclass field is missing: {key}"))
+        })?;
         items.push((key, extract_json(&value)?));
     }
     Ok(JsonValue::Object(items))
@@ -243,7 +243,7 @@ fn write_record_batch<W: Write>(
 
 fn write_record_map(
     py: Python<'_>,
-    writer: &mut BufWriter<std::fs::File>,
+    writer: &mut BufWriter<TrackedFile>,
     name: &'static [u8],
     records: &Bound<'_, PyDict>,
 ) -> PyResult<()> {
@@ -289,15 +289,15 @@ pub(crate) fn write_watch_state_snapshot_native(
     let cursors = extract_json(watch_cursors.as_any())?;
     let file = py
         .detach(|| {
-            let mut options = OpenOptions::new();
-            options.write(true).truncate(true);
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt;
-                const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
-                options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
-            }
-            options.open(&path)
+            TrackedFile::open_with(&path, "watch_state_snapshot", |options| {
+                options.write(true).truncate(true);
+                #[cfg(windows)]
+                {
+                    use std::os::windows::fs::OpenOptionsExt;
+                    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
+                    options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
+                }
+            })
         })
         .map_err(io_error)?;
     let mut writer = BufWriter::with_capacity(SNAPSHOT_BUFFER_BYTES, file);

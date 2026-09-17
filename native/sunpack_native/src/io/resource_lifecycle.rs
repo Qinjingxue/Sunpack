@@ -62,6 +62,26 @@ impl TrackedFile {
     }
 
     #[track_caller]
+    pub(crate) fn open_with<F>(
+        path: impl AsRef<Path>,
+        kind: &'static str,
+        configure: F,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&mut std::fs::OpenOptions),
+    {
+        let path = path.as_ref();
+        let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
+        let mut options = std::fs::OpenOptions::new();
+        configure(&mut options);
+        let file = options.open(path)?;
+        Ok(Self {
+            file: Some(file),
+            resource,
+        })
+    }
+
+    #[track_caller]
     pub(crate) fn open_reader(path: impl AsRef<Path>, kind: &'static str) -> io::Result<Self> {
         let path = path.as_ref();
         let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
@@ -94,6 +114,11 @@ impl TrackedFile {
         self.file
             .as_mut()
             .expect("tracked file methods cannot run after close")
+    }
+
+    pub(crate) fn write_shared(&self, buffer: &[u8]) -> io::Result<()> {
+        let mut file = self.file();
+        file.write_all(buffer)
     }
 
     pub(crate) fn close(&mut self) -> bool {
