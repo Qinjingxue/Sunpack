@@ -195,12 +195,11 @@ class _JournalWriter:
                 time.sleep(0)
 
             durable_paths: set[str] = set()
-            append_payloads: dict[int, bytes] = {}
             request_errors: dict[int, BaseException] = {}
 
             for request in batch:
                 if isinstance(request, _FlushAllRequest):
-                    for path, handle in list(handles.items()):
+                    for handle in list(handles.values()):
                         try:
                             os.fsync(handle.fileno())
                         except BaseException as exc:
@@ -233,7 +232,6 @@ class _JournalWriter:
                             handle = open_service_file(request.path, "ab", buffering=0)
                             handles[request.path] = handle
                         self._write_all(handle, payload)
-                        append_payloads[id(request)] = payload
                         request.ticket.bytes_written = len(payload)
                         if request.durable:
                             durable_paths.add(request.path)
@@ -263,8 +261,7 @@ class _JournalWriter:
                             os.fsync(handle.fileno())
                         continue
                 except BaseException as exc:
-                    if not isinstance(request, _FlushAllRequest):
-                        stream_errors[request.stream] = exc
+                    stream_errors[request.stream] = exc
                     request_errors[id(request)] = exc
                     self._notify_error(request, exc)
 
@@ -285,8 +282,6 @@ class _JournalWriter:
                     if error is not None:
                         stream_errors[request.stream] = error
                         self._notify_error(request, error)
-                elif error is None and isinstance(request, _FlushRequest):
-                    error = path_errors.get(request.path)
                 request.ticket._error = error
                 request.ticket._done.set()
 
