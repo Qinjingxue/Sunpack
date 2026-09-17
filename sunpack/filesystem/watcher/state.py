@@ -10,6 +10,10 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
+from sunpack.filesystem.watcher.journal_commit import (
+    submit_journal_append,
+    submit_journal_close,
+)
 from sunpack.support.resource_lifecycle import (
     named_task_temporary_file,
     open_service_file,
@@ -23,8 +27,8 @@ from .group_models import (
 )
 
 
-STATE_VERSION = 15
-LOADABLE_STATE_VERSIONS = {STATE_VERSION}
+STATE_VERSION = 16
+LOADABLE_STATE_VERSIONS = {15, STATE_VERSION}
 DEFAULT_JOURNAL_COMPACT_RECORDS = 4096
 DEFAULT_JOURNAL_COMPACT_BYTES = 512 * 1024
 DEFAULT_JOURNAL_HARD_BYTES = 1 * 1024 * 1024
@@ -71,9 +75,11 @@ class WatchPendingWork:
     force: bool = False
     password_scope_dir: str = ""
     internal_recovery: bool = False
+    durable_owner: bool = False
     active_outputs: dict[str, str] = field(default_factory=dict)
     committed_roots: list[str] = field(default_factory=list)
     completed_sources: list[str] = field(default_factory=list)
+    publications: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def fingerprint(self) -> str:
@@ -125,6 +131,7 @@ class WatchStateStore:
         self.path = Path(path)
         self.journal_path = self.path.with_name(f"{self.path.stem}.journal.jsonl")
         self._state_lock = _state_path_lock(self.path)
+        self._journal_io_gate = threading.Lock()
         self._compact_records = max(1, int(compact_records))
         self._compact_bytes = max(1, int(compact_bytes))
         self._hard_compact_bytes = max(self._compact_bytes, int(hard_compact_bytes))
@@ -136,6 +143,7 @@ class WatchStateStore:
         self.groups: dict[str, WatchGroupState] = {}
         self.password_generation = 0
         self.password_source_signature = ""
+        self.watch_cursors: dict[str, dict[str, int]] = {}
         self.load()
 
     def load(self) -> None:
@@ -162,6 +170,16 @@ class WatchStateStore:
                         self.password_source_signature = str(
                             payload.get("password_source_signature") or ""
                         )
+                        raw_cursors = payload.get("watch_cursors")
+                        if isinstance(raw_cursors, dict):
+                            self.watch_cursors = {
+                                str(key).lower(): {
+                                    "journal_id": int(value.get("journal_id", 0) or 0),
+                                    "next_usn": int(value.get("next_usn", 0) or 0),
+                                }
+                                for key, value in raw_cursors.items()
+                                if isinstance(value, dict)
+                            }
                         self.pending_work = self._load_records(
                             payload.get("pending_work"),
                             WatchPendingWork,
@@ -229,6 +247,7 @@ class WatchStateStore:
         self.groups = {}
         self.password_generation = 0
         self.password_source_signature = ""
+        self.watch_cursors = {}
         self._journal_records = 0
         self._journal_bytes = 0
         self._compaction_due = False
@@ -238,6 +257,7 @@ class WatchStateStore:
             "version": STATE_VERSION,
             "password_generation": self.password_generation,
             "password_source_signature": self.password_source_signature,
+            "watch_cursors": self.watch_cursors,
             "pending_work": {
                 key: asdict(value)
                 for key, value in self.pending_work.items()
@@ -274,6 +294,14 @@ class WatchStateStore:
     def _atomic_replace_text_locked(self, target: Path, writer) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         temp_path: Path | None = None
+        gate = self._journal_io_gate if target == self.journal_path else None
+        if gate is not None:
+            gate.acquire()
+            try:
+                submit_journal_close(str(target)).wait()
+            except BaseException:
+                gate.release()
+                raise
         try:
             with named_task_temporary_file(
                 mode="w",
@@ -295,6 +323,8 @@ class WatchStateStore:
                     temp_path.unlink()
                 except FileNotFoundError:
                     pass
+            if gate is not None:
+                gate.release()
 
     def _load_journal_locked(self) -> bool:
         if not self.journal_path.exists():
@@ -362,8 +392,6 @@ class WatchStateStore:
             return
         decoded = [self._decode_operation(operation) for operation in operations]
         if not self.path.exists():
-            # The base snapshot must predate this transaction so a crash after
-            # the append can always reconstruct the complete state.
             self._write_snapshot_locked()
         transaction = {
             "version": STATE_VERSION,
@@ -372,24 +400,52 @@ class WatchStateStore:
         serialized = (
             json.dumps(transaction, ensure_ascii=True, separators=(",", ":"))
             + "\n"
-        )
+        ).encode("utf-8")
         self.journal_path.parent.mkdir(parents=True, exist_ok=True)
-        with open_service_file(
-            self.journal_path,
-            "a",
-            encoding="utf-8",
-            newline="",
-        ) as handle:
-            handle.write(serialized)
-            if durable:
-                _flush_file(handle)
+        with self._journal_io_gate:
+            ticket = submit_journal_append(str(self.journal_path), serialized, durable=durable)
+        ticket.wait()
         for operation in decoded:
             self._apply_decoded_operation_locked(operation)
         self._journal_records += 1
-        self._journal_bytes += len(serialized.encode("utf-8"))
+        self._journal_bytes += len(serialized)
         self._update_compaction_due_locked()
-        if self._journal_bytes >= self._hard_compact_bytes:
-            self._compact_locked()
+
+    def _commit_operations_concurrent(
+        self,
+        operations: list[dict[str, Any]],
+        *,
+        durable: bool,
+    ) -> None:
+        """Append without holding the state lock across the physical flush.
+
+        Task commit delta operations commute, so concurrent ArchiveTasks can queue
+        their records together and share one FlushFileBuffers/fsync barrier.
+        """
+        if not operations:
+            return
+        decoded = [self._decode_operation(operation) for operation in operations]
+        with self._state_lock:
+            if not self.path.exists():
+                self._write_snapshot_locked()
+        transaction = {
+            "version": STATE_VERSION,
+            "operations": operations,
+        }
+        serialized = (
+            json.dumps(transaction, ensure_ascii=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
+        with self._journal_io_gate:
+            ticket = submit_journal_append(str(self.journal_path), serialized, durable=durable)
+        ticket.wait()
+        with self._state_lock:
+            for operation in decoded:
+                self._apply_decoded_operation_locked(operation)
+            self._journal_records += 1
+            self._journal_bytes += len(serialized)
+            self._update_compaction_due_locked()
 
     def _update_compaction_due_locked(self) -> None:
         self._compaction_due = (
@@ -440,6 +496,41 @@ class WatchStateStore:
             signature = str(value.get("password_source_signature") or "")
             return action, "", "", (generation, signature)
 
+        if action == "set_watch_cursors":
+            value = operation.get("value")
+            if not isinstance(value, dict):
+                raise TypeError("watch cursor value must be an object")
+            normalized = {
+                str(key).lower(): {
+                    "journal_id": int(item.get("journal_id", 0) or 0),
+                    "next_usn": int(item.get("next_usn", 0) or 0),
+                }
+                for key, item in value.items()
+                if isinstance(item, dict)
+            }
+            return action, "", "", normalized
+        if action == "task_commit":
+            value = operation.get("value")
+            if not isinstance(value, dict):
+                raise TypeError("task commit value must be an object")
+            owner = value.get("owner")
+            if not isinstance(owner, dict):
+                raise TypeError("task commit owner must be an object")
+            task_path = os.path.abspath(str(value.get("task_path") or ""))
+            output_dir = os.path.abspath(str(value.get("output_dir") or ""))
+            staging_dir = os.path.abspath(str(value.get("staging_dir") or "")) if value.get("staging_dir") else ""
+            staging_file_id = str(value.get("staging_file_id") or "")
+            if not task_path or not output_dir:
+                raise ValueError("task commit requires task/output paths")
+            owner_record = WatchPendingWork(**owner)
+            return action, "pending_work", _path_key(owner_record.path), {
+                "owner": owner_record,
+                "task_path": task_path,
+                "output_dir": output_dir,
+                "staging_dir": staging_dir,
+                "staging_file_id": staging_file_id,
+            }
+
         collection = str(operation.get("collection") or "")
         record_types = {
             "pending_work": WatchPendingWork,
@@ -469,6 +560,54 @@ class WatchStateStore:
         if action == "set_metadata":
             self.password_generation, self.password_source_signature = value
             return
+        if action == "set_watch_cursors":
+            self.watch_cursors = dict(value)
+            return
+        if action == "task_commit":
+            pending = self.pending_work.get(key)
+            if pending is None:
+                pending = value["owner"]
+            task_path = value["task_path"]
+            output_dir = value["output_dir"]
+            staging_dir = value["staging_dir"]
+            staging_file_id = value.get("staging_file_id", "")
+            active = dict(pending.active_outputs)
+            active.pop(task_path, None)
+            publications = dict(getattr(pending, "publications", {}) or {})
+            publications[_path_key(task_path)] = {
+                "task_path": task_path,
+                "staging_dir": staging_dir,
+                "staging_file_id": staging_file_id,
+                "output_dir": output_dir,
+            }
+            roots = list(pending.committed_roots)
+            root_key = _path_key(output_dir)
+            if not any(
+                root_key == _path_key(existing)
+                or _is_path_under(root_key, _path_key(existing))
+                for existing in roots
+            ):
+                roots = [
+                    existing
+                    for existing in roots
+                    if not _is_path_under(_path_key(existing), root_key)
+                ]
+                roots.append(output_dir)
+            completed = list(pending.completed_sources)
+            task_key = _path_key(task_path)
+            if (
+                task_key != _path_key(pending.path)
+                and not any(_path_key(existing) == task_key for existing in completed)
+            ):
+                completed.append(task_path)
+            self.pending_work[key] = replace(
+                pending,
+                active_outputs=active,
+                committed_roots=roots,
+                completed_sources=completed,
+                publications=publications,
+            )
+            return
         records = getattr(self, collection)
         if action == "delete":
             records.pop(key, None)
@@ -482,6 +621,9 @@ class WatchStateStore:
         force: bool = False,
         password_scope_dir: str = "",
         internal_recovery: bool = False,
+        durable_owner: bool = False,
+        persist: bool = True,
+        durable: bool = False,
     ) -> None:
         key = _path_key(candidate.path)
         with self._state_lock:
@@ -501,13 +643,20 @@ class WatchStateStore:
                 internal_recovery=bool(
                     internal_recovery or (previous.internal_recovery if previous else False)
                 ),
+                durable_owner=bool(
+                    durable_owner or (previous.durable_owner if previous else False)
+                ),
                 active_outputs=dict(previous.active_outputs if previous else {}),
                 committed_roots=list(previous.committed_roots if previous else []),
                 completed_sources=list(previous.completed_sources if previous else []),
+                publications=dict(getattr(previous, "publications", {}) if previous else {}),
             )
-            self._commit_operations_locked([
-                self._put_operation("pending_work", key, pending),
-            ], durable=True)
+            if persist:
+                self._commit_operations_locked([
+                    self._put_operation("pending_work", key, pending),
+                ], durable=durable)
+            else:
+                self.pending_work[key] = pending
 
     def record_attempt(
         self,
@@ -533,13 +682,18 @@ class WatchStateStore:
                     else os.path.dirname(os.path.abspath(path))
                 ),
                 internal_recovery=bool(previous.internal_recovery if previous else False),
+                durable_owner=bool(previous.durable_owner if previous else False),
                 active_outputs=dict(previous.active_outputs if previous else {}),
                 committed_roots=list(previous.committed_roots if previous else []),
                 completed_sources=list(previous.completed_sources if previous else []),
+                publications=dict(getattr(previous, "publications", {}) if previous else {}),
             )
-            self._commit_operations_locked([
-                self._put_operation("pending_work", key, pending),
-            ])
+            if previous is not None and not previous.durable_owner:
+                self.pending_work[key] = pending
+            else:
+                self._commit_operations_locked([
+                    self._put_operation("pending_work", key, pending),
+                ])
 
     def pending_work_items(self) -> list[WatchPendingWork]:
         with self._state_lock:
@@ -550,6 +704,12 @@ class WatchStateStore:
             return self.pending_work.get(_path_key(path))
 
     def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str) -> bool:
+        """Compatibility observation only; correctness no longer depends on START fsync.
+
+        New Watch extraction uses deterministic staging and a single commit-before-
+        publish barrier.  Keeping this non-durable record preserves diagnostics and
+        allows old recovery tests/state to remain readable without adding latency.
+        """
         if not task_path or not output_dir:
             return False
         with self._state_lock:
@@ -560,60 +720,48 @@ class WatchStateStore:
             active = dict(pending.active_outputs)
             active[os.path.abspath(task_path)] = os.path.abspath(output_dir)
             updated = replace(pending, active_outputs=active)
-            self._commit_operations_locked([
-                self._put_operation("pending_work", key, updated),
-            ], durable=True)
+            self.pending_work[key] = updated
             return True
 
-    def record_task_output_committed(self, owner_path: str, task_path: str, output_dir: str) -> bool:
-        if not task_path:
+    def record_task_output_committed(
+        self,
+        owner_path: str,
+        task_path: str,
+        output_dir: str,
+        *,
+        staging_dir: str = "",
+        staging_file_id: str = "",
+    ) -> bool:
+        if not task_path or not output_dir:
             return False
         with self._state_lock:
             key = _path_key(owner_path)
             pending = self.pending_work.get(key)
             if pending is None:
                 return False
-            task_path = os.path.abspath(task_path)
-            active = dict(pending.active_outputs)
-            active.pop(task_path, None)
-            roots = list(pending.committed_roots)
-            if output_dir:
-                root = os.path.abspath(output_dir)
-                root_key = _path_key(root)
-                if not any(
-                    root_key == _path_key(value)
-                    or _is_path_under(root_key, _path_key(value))
-                    for value in roots
-                ):
-                    # Keep only the outermost committed roots. One targeted
-                    # recursive recovery scan then covers nested task outputs
-                    # without rescanning every descendant output directory.
-                    roots = [
-                        value
-                        for value in roots
-                        if not _is_path_under(_path_key(value), root_key)
-                    ]
-                    roots.append(root)
-            completed = list(pending.completed_sources)
-            task_key = _path_key(task_path)
-            if (
-                task_key != _path_key(owner_path)
-                and not any(_path_key(value) == task_key for value in completed)
-            ):
-                # A committed recursive task must not be rediscovered from a
-                # committed output root after a crash. The original Watch owner
-                # remains the recovery anchor and is intentionally not listed.
-                completed.append(task_path)
-            updated = replace(
-                pending,
-                active_outputs=active,
-                committed_roots=roots,
-                completed_sources=completed,
+            owner = WatchPendingWork(
+                path=pending.path,
+                size=pending.size,
+                mtime=pending.mtime,
+                file_id=pending.file_id,
+                change_usn=pending.change_usn,
+                force=pending.force,
+                password_scope_dir=pending.password_scope_dir,
+                internal_recovery=pending.internal_recovery,
+                durable_owner=pending.durable_owner,
             )
-            self._commit_operations_locked([
-                self._put_operation("pending_work", key, updated),
-            ], durable=True)
-            return True
+        operation = {
+            "op": "task_commit",
+            "value": {
+                "owner": asdict(owner),
+                "task_path": os.path.abspath(task_path),
+                "output_dir": os.path.abspath(output_dir),
+                "staging_dir": os.path.abspath(staging_dir) if staging_dir else "",
+                "staging_file_id": str(staging_file_id or ""),
+            },
+        }
+        self._commit_operations_concurrent([operation], durable=True)
+        return True
 
     def rebase_pending_work(
         self,
@@ -644,11 +792,12 @@ class WatchStateStore:
                     force=True,
                     password_scope_dir=scope,
                     internal_recovery=True,
+                    durable_owner=True,
                 )
                 operations.append(self._put_operation("pending_work", key, pending))
             self._commit_operations_locked(operations, durable=True)
 
-    def complete_work(self, paths: Iterable[str]) -> None:
+    def complete_work(self, paths: Iterable[str], *, durable: bool = False) -> None:
         with self._state_lock:
             keys = {
                 _path_key(path)
@@ -658,9 +807,9 @@ class WatchStateStore:
             self._commit_operations_locked([
                 self._delete_operation("pending_work", key)
                 for key in sorted(keys)
-            ], durable=True)
+            ], durable=durable)
 
-    def complete_work_if_matches(self, candidate) -> None:
+    def complete_work_if_matches(self, candidate, *, durable: bool | None = None) -> None:
         with self._state_lock:
             key = _path_key(candidate.path)
             pending = self.pending_work.get(key)
@@ -673,9 +822,10 @@ class WatchStateStore:
                 or pending.change_usn != int(candidate.change_usn)
             ):
                 return
+            use_durable = pending.durable_owner if durable is None else bool(durable)
             self._commit_operations_locked([
                 self._delete_operation("pending_work", key),
-            ], durable=True)
+            ], durable=use_durable)
 
     def forget_path(self, path: str, *, recursive: bool = False) -> bool:
         normalized = os.path.abspath(path)
@@ -701,6 +851,93 @@ class WatchStateStore:
             )
             self._commit_operations_locked(operations)
             return bool(operations)
+
+    def watch_cursor_snapshot(self) -> dict[str, dict[str, int]]:
+        with self._state_lock:
+            return {key: dict(value) for key, value in self.watch_cursors.items()}
+
+    def merge_watch_cursors(self, cursors: dict[str, dict[str, int]], *, durable: bool = True) -> None:
+        with self._state_lock:
+            merged = {key: dict(value) for key, value in self.watch_cursors.items()}
+            for key, value in cursors.items():
+                if not isinstance(value, dict):
+                    continue
+                merged[str(key).lower()] = {
+                    "journal_id": int(value.get("journal_id", 0) or 0),
+                    "next_usn": int(value.get("next_usn", 0) or 0),
+                }
+            self._commit_operations_locked([
+                {"op": "set_watch_cursors", "value": merged},
+            ], durable=durable)
+
+    def queue_recovery_batch(
+        self,
+        candidates: Iterable,
+        cursors: dict[str, dict[str, int]],
+        *,
+        retire_paths: Iterable[str] = (),
+    ) -> None:
+        """Atomically cover a USN range and retain every recovered candidate.
+
+        Once the cursor advances, these owners are the fallback if the process
+        dies before extraction.  One transaction/fsync covers the whole startup
+        batch instead of one barrier per file.
+        """
+        with self._state_lock:
+            operations: list[dict[str, Any]] = []
+            for path in retire_paths:
+                key = _path_key(path)
+                if key in self.pending_work:
+                    operations.append(self._delete_operation("pending_work", key))
+            for candidate in candidates:
+                key = _path_key(candidate.path)
+                previous = self.pending_work.get(key)
+                pending = WatchPendingWork(
+                    path=os.path.abspath(candidate.path),
+                    size=int(candidate.size),
+                    mtime=float(candidate.mtime),
+                    file_id=str(getattr(candidate, "file_id", "") or ""),
+                    change_usn=int(getattr(candidate, "change_usn", 0) or 0),
+                    force=True,
+                    password_scope_dir=os.path.abspath(
+                        (previous.password_scope_dir if previous else "")
+                        or os.path.dirname(os.path.abspath(candidate.path))
+                    ),
+                    internal_recovery=bool(previous.internal_recovery if previous else False),
+                    durable_owner=True,
+                    active_outputs=dict(previous.active_outputs if previous else {}),
+                    committed_roots=list(previous.committed_roots if previous else []),
+                    completed_sources=list(previous.completed_sources if previous else []),
+                    publications=dict(getattr(previous, "publications", {}) if previous else {}),
+                )
+                operations.append(self._put_operation("pending_work", key, pending))
+            merged = {key: dict(value) for key, value in self.watch_cursors.items()}
+            for key, value in cursors.items():
+                if isinstance(value, dict):
+                    merged[str(key).lower()] = {
+                        "journal_id": int(value.get("journal_id", 0) or 0),
+                        "next_usn": int(value.get("next_usn", 0) or 0),
+                    }
+            operations.append({"op": "set_watch_cursors", "value": merged})
+            self._commit_operations_locked(operations, durable=True)
+
+    def watch_cursor(self, volume_key: str) -> dict[str, int] | None:
+        with self._state_lock:
+            value = self.watch_cursors.get(str(volume_key).lower())
+            return dict(value) if value is not None else None
+
+    def record_watch_cursors(self, cursors: dict[str, dict[str, int]]) -> None:
+        normalized = {
+            str(key).lower(): {
+                "journal_id": int(value.get("journal_id", 0) or 0),
+                "next_usn": int(value.get("next_usn", 0) or 0),
+            }
+            for key, value in cursors.items()
+            if isinstance(value, dict)
+        }
+        self._commit_operations_concurrent([
+            {"op": "set_watch_cursors", "value": normalized},
+        ], durable=True)
 
     def latest_entry_for_path(self, path: str) -> WatchStateEntry | None:
         with self._state_lock:

@@ -1,7 +1,7 @@
 use std::io;
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"SPWB");
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 3;
 pub const MAX_VOLUME_GUID_BYTES: usize = 64;
 pub const FILE_ID_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 128;
@@ -16,6 +16,7 @@ pub enum Opcode {
     ReadChangeReasons = 3,
     Ping = 4,
     Release = 5,
+    ReadRootChanges = 6,
 }
 
 impl TryFrom<u16> for Opcode {
@@ -28,6 +29,7 @@ impl TryFrom<u16> for Opcode {
             3 => Ok(Self::ReadChangeReasons),
             4 => Ok(Self::Ping),
             5 => Ok(Self::Release),
+            6 => Ok(Self::ReadRootChanges),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "unknown broker opcode",
@@ -186,6 +188,7 @@ pub struct Response {
     pub journal_id: u64,
     pub reasons_all: u32,
     pub reasons_without_close: u32,
+    pub next_usn: i64,
 }
 
 impl Response {
@@ -197,6 +200,7 @@ impl Response {
             journal_id: 0,
             reasons_all: 0,
             reasons_without_close: 0,
+            next_usn: 0,
         }
     }
 
@@ -210,6 +214,7 @@ impl Response {
         bytes[24..32].copy_from_slice(&self.journal_id.to_le_bytes());
         bytes[32..36].copy_from_slice(&self.reasons_all.to_le_bytes());
         bytes[36..40].copy_from_slice(&self.reasons_without_close.to_le_bytes());
+        bytes[40..48].copy_from_slice(&self.next_usn.to_le_bytes());
         bytes
     }
 
@@ -235,6 +240,7 @@ impl Response {
             journal_id: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
             reasons_all: u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
             reasons_without_close: u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            next_usn: i64::from_le_bytes(bytes[40..48].try_into().unwrap()),
         })
     }
 }

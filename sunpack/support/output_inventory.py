@@ -8,6 +8,7 @@ from sunpack_native import (
     NativeOutputInventory,
     NativeWorkerManifest,
     output_inventory_from_serialized as _native_inventory_from_serialized,
+    rebase_output_inventory_root as _native_rebase_output_inventory_root,
     scan_output_inventory as _native_scan_output_inventory,
 )
 from sunpack.extraction.internal.sevenzip.worker_diagnostics import native_worker_manifest
@@ -78,6 +79,14 @@ class OutputInventory:
 
     def all_crc_ok(self) -> bool:
         return bool(self._native.all_crc_ok())
+
+    def rebased_root(self, new_root: str) -> "OutputInventory":
+        return OutputInventory.from_native(
+            _native_rebase_output_inventory_root(
+                self._native,
+                os.path.abspath(new_root),
+            )
+        )
 
     def to_dict(self) -> dict[str, Any]:
         return {

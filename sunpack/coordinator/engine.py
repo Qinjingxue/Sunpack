@@ -601,6 +601,7 @@ class _RequestRuntime:
             self.config,
             progress_reporter=self.reporter,
             request_id=submission.request_id,
+            origin=submission.origin,
         )
 
     def _report_progress(self, task: Any, event: dict[str, Any]) -> None:
@@ -610,10 +611,7 @@ class _RequestRuntime:
             try:
                 callback(task, dict(event))
             except Exception:
-                lifecycle_event = str(event.get("event") or "") in {
-                    "task_output_started",
-                    "task_output_committed",
-                }
+                lifecycle_event = str(event.get("event") or "") == "task_output_committed"
                 if getattr(self.submission, "origin", "") == "watch" and lifecycle_event:
                     # These two events are the Watch write-ahead boundary. If the
                     # durable state write fails, extraction/source cleanup must not

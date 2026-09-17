@@ -147,6 +147,65 @@ pub(crate) fn watch_broker_ping_seconds() -> PyResult<f64> {
 }
 
 #[pyfunction]
+pub(crate) fn watch_path_identity(path: &str) -> PyResult<(String, String, i64)> {
+    #[cfg(windows)]
+    {
+        return windows::watch_path_identity(Path::new(path)).map_err(os_error);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(PyRuntimeError::new_err("watch mode requires Windows NTFS"))
+    }
+}
+
+#[pyfunction]
+pub(crate) fn watch_root_changes(
+    path: &str,
+    start_usn: i64,
+    end_usn: i64,
+) -> PyResult<Vec<String>> {
+    #[cfg(windows)]
+    {
+        let path = Path::new(path);
+        let (volume, file_id, _) = windows::watch_path_identity(path).map_err(os_error)?;
+        return sunpack_usn_core::broker_read_root_changes(&volume, &file_id, start_usn, end_usn)
+            .map_err(os_error);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (path, start_usn, end_usn);
+        Err(PyRuntimeError::new_err("watch mode requires Windows NTFS"))
+    }
+}
+
+#[pyfunction]
+pub(crate) fn publish_watch_staged_output(staging: &str, final_path: &str) -> PyResult<()> {
+    #[cfg(windows)]
+    {
+        return windows::publish_watch_staged_output(Path::new(staging), Path::new(final_path)).map_err(os_error);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (staging, final_path);
+        Err(PyRuntimeError::new_err("Watch staging publish requires Windows NTFS"))
+    }
+}
+
+#[pyfunction]
+pub(crate) fn watch_volume_cursor(path: &str) -> PyResult<(String, u64, i64)> {
+    #[cfg(windows)]
+    {
+        return windows::watch_volume_cursor(Path::new(path)).map_err(os_error);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        Err(PyRuntimeError::new_err("watch mode requires Windows NTFS"))
+    }
+}
+
+#[pyfunction]
 pub(crate) fn watch_file_is_ready(path: &str) -> PyResult<bool> {
     #[cfg(windows)]
     {

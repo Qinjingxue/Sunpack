@@ -73,10 +73,15 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<io::reader::NativeArchiveSession>()?;
     m.add_class::<scan::directory::NativeDirectorySnapshot>()?;
     m.add_class::<scan::directory::NativeOutputInventory>()?;
+    m.add_function(wrap_pyfunction!(scan::directory::rebase_output_inventory_root, m)?)?;
     m.add_class::<scan::directory::NativeWorkerManifest>()?;
     m.add_function(wrap_pyfunction!(scan::magic::scan_after_markers, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_acquire, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_release, m)?)?;
+    m.add_function(wrap_pyfunction!(filesystem::watch_volume_cursor, m)?)?;
+    m.add_function(wrap_pyfunction!(filesystem::watch_path_identity, m)?)?;
+    m.add_function(wrap_pyfunction!(filesystem::watch_root_changes, m)?)?;
+    m.add_function(wrap_pyfunction!(filesystem::publish_watch_staged_output, m)?)?;
     m.add_function(wrap_pyfunction!(scan::magic::scan_magics_anywhere, m)?)?;
     m.add_function(wrap_pyfunction!(
         analysis_native::fuzzy_binary_profile_for_paths,
