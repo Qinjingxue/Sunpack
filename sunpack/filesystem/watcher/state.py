@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, field, replace
+from dataclasses import asdict, dataclass, field, fields, replace
 import errno
 import json
 import os
@@ -43,6 +43,7 @@ _STATE_PATH_LOCKS_GUARD = threading.Lock()
 _STATE_PATH_LOCKS: dict[str, threading.RLock] = {}
 _SEQUENCE_GUARD = threading.Lock()
 _SEQUENCE_NEXT: dict[str, int] = {}
+_SEQUENCE_SEGMENT_START: dict[str, int] = {}
 
 
 def _state_path_key(path: Path) -> str:
@@ -59,23 +60,53 @@ def _state_path_lock(path: Path) -> threading.RLock:
         return lock
 
 
-def _seed_sequence(path: Path, last_seq: int) -> None:
+def _seed_sequence(path: Path, last_seq: int) -> int:
     key = _state_path_key(path)
     with _SEQUENCE_GUARD:
         _SEQUENCE_NEXT[key] = max(_SEQUENCE_NEXT.get(key, 1), int(last_seq) + 1)
+        return _SEQUENCE_SEGMENT_START.setdefault(key, int(last_seq) + 1)
 
 
 def _reset_sequence(path: Path, next_seq: int = 1) -> None:
+    key = _state_path_key(path)
     with _SEQUENCE_GUARD:
-        _SEQUENCE_NEXT[_state_path_key(path)] = max(1, int(next_seq))
+        value = max(1, int(next_seq))
+        _SEQUENCE_NEXT[key] = value
+        _SEQUENCE_SEGMENT_START[key] = value
 
 
-def _reserve_sequence(path: Path, floor: int) -> int:
+def _reserve_sequence(path: Path, floor: int) -> tuple[int, int]:
     key = _state_path_key(path)
     with _SEQUENCE_GUARD:
         seq = max(_SEQUENCE_NEXT.get(key, 1), int(floor) + 1)
         _SEQUENCE_NEXT[key] = seq + 1
-        return seq
+        segment_start = _SEQUENCE_SEGMENT_START.setdefault(key, seq)
+        return seq, segment_start
+
+
+def _sequence_tail(path: Path) -> int:
+    with _SEQUENCE_GUARD:
+        return _SEQUENCE_NEXT.get(_state_path_key(path), 1) - 1
+
+
+def _current_sequence_segment(path: Path, fallback: int) -> int:
+    with _SEQUENCE_GUARD:
+        return _SEQUENCE_SEGMENT_START.get(_state_path_key(path), int(fallback))
+
+
+def _rotate_sequence_segment(path: Path, boundary: int) -> tuple[int, int] | None:
+    """Atomically cut the WAL only when this store owns the full sequence prefix."""
+
+    key = _state_path_key(path)
+    with _SEQUENCE_GUARD:
+        if _SEQUENCE_NEXT.get(key, 1) - 1 != int(boundary):
+            return None
+        old_start = _SEQUENCE_SEGMENT_START.setdefault(key, int(boundary) + 1)
+        if old_start > int(boundary):
+            return None
+        new_start = int(boundary) + 1
+        _SEQUENCE_SEGMENT_START[key] = new_start
+        return old_start, new_start
 
 
 def _flush_file(handle) -> None:
@@ -196,7 +227,8 @@ class WatchStateStore:
 
     @property
     def journal_path(self) -> Path:
-        return self._segment_path(self._active_segment_start)
+        start = _current_sequence_segment(self.path, self._active_segment_start)
+        return self._segment_path(start)
 
     def _segment_path(self, start_seq: int) -> Path:
         return self.path.with_name(
@@ -302,8 +334,7 @@ class WatchStateStore:
             except FileNotFoundError:
                 pass
             self._load_journal_segments_locked()
-            self._active_segment_start = self._applied_seq + 1
-            _seed_sequence(self.path, self._applied_seq)
+            self._active_segment_start = _seed_sequence(self.path, self._applied_seq)
             self._update_compaction_due_locked()
 
     @staticmethod
@@ -325,11 +356,10 @@ class WatchStateStore:
     def _load_journal_segments_locked(self) -> None:
         paths = self._journal_paths()
         expected_seq = self._checkpoint_seq + 1
-        for path_index, path in enumerate(paths):
+        for path in paths:
             segment_start = self._segment_start_from_path(path)
             if segment_start is None:
                 continue
-            is_last_segment = path_index == len(paths) - 1
             segment_records = 0
             segment_bytes = 0
             try:
@@ -337,12 +367,12 @@ class WatchStateStore:
                     for line_number, line in enumerate(handle, start=1):
                         if not line:
                             continue
+                        # A process may restart after a torn final append and then
+                        # continue in a new segment.  An incomplete final line is
+                        # therefore harmless in any immutable old segment; a real
+                        # lost transaction is still caught by the next seq gap.
                         if not line.endswith("\n"):
-                            if is_last_segment:
-                                break
-                            raise WatchStateJournalError(
-                                f"truncated sealed watch journal at {path}:{line_number}"
-                            )
+                            break
                         try:
                             transaction = json.loads(line)
                         except json.JSONDecodeError as exc:
@@ -499,7 +529,26 @@ class WatchStateStore:
         )
 
     @staticmethod
-    def _write_record_map(handle, name: str, records: dict[str, Any]) -> None:
+    def _write_record(handle, record: Any) -> None:
+        handle.write("{")
+        first = True
+        for record_field in fields(record):
+            if first:
+                first = False
+            else:
+                handle.write(",")
+            json.dump(record_field.name, handle, ensure_ascii=False)
+            handle.write(":")
+            json.dump(
+                getattr(record, record_field.name),
+                handle,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        handle.write("}")
+
+    @classmethod
+    def _write_record_map(cls, handle, name: str, records: dict[str, Any]) -> None:
         handle.write(f',"{name}":{{')
         first = True
         for key, record in records.items():
@@ -509,7 +558,7 @@ class WatchStateStore:
                 handle.write(",")
             json.dump(key, handle, ensure_ascii=False, separators=(",", ":"))
             handle.write(":")
-            json.dump(vars(record), handle, ensure_ascii=False, separators=(",", ":"))
+            cls._write_record(handle, record)
         handle.write("}")
 
     def _write_snapshot_view(self, view: _SnapshotView) -> None:
@@ -559,10 +608,12 @@ class WatchStateStore:
                     pass
 
     def _request_checkpoint_locked(self, *, force: bool = False) -> None:
+        if _sequence_tail(self.path) != self._applied_seq:
+            self._external_sequence_gap = True
         if self._external_sequence_gap:
             if force:
                 self._checkpoint_error = RuntimeError(
-                    "cannot checkpoint a WatchStateStore that observed another writer"
+                    "cannot checkpoint a WatchStateStore that does not own the full sequence prefix"
                 )
                 self._checkpoint_condition.notify_all()
             return
@@ -588,19 +639,30 @@ class WatchStateStore:
                     self._checkpoint_running = False
                     self._checkpoint_condition.notify_all()
                     return
+                if _sequence_tail(self.path) != self._applied_seq:
+                    self._external_sequence_gap = True
+                    self._checkpoint_error = RuntimeError(
+                        "cannot checkpoint a WatchStateStore that does not own the full sequence prefix"
+                    )
+                    self._checkpoint_running = False
+                    self._checkpoint_condition.notify_all()
+                    return
                 boundary = self._applied_seq
                 view = self._capture_snapshot_locked()
-                old_start = self._active_segment_start
-                if old_start <= boundary:
-                    new_start = boundary + 1
-                    old_path = self._segment_path(old_start)
-                    new_path = self._segment_path(new_start)
+                rotation = _rotate_sequence_segment(self.path, boundary)
+                if rotation is not None:
+                    old_start, new_start = rotation
                     self._active_segment_start = new_start
                     seal_ticket = submit_segment_seal(
                         stream=self._writer_stream,
-                        old_path=str(old_path),
-                        new_path=str(new_path),
+                        old_path=str(self._segment_path(old_start)),
+                        new_path=str(self._segment_path(new_start)),
                         on_error=self._on_journal_error,
+                    )
+                else:
+                    self._active_segment_start = _current_sequence_segment(
+                        self.path,
+                        boundary + 1,
                     )
                 self._checkpoint_requested = False
 
@@ -702,10 +764,10 @@ class WatchStateStore:
         self._raise_persistence_fault_locked()
         decoded = [self._decode_operation(operation) for operation in operations]
         previous_seq = self._applied_seq
-        seq = _reserve_sequence(self.path, previous_seq)
+        seq, segment_start = _reserve_sequence(self.path, previous_seq)
         if seq != previous_seq + 1:
             self._external_sequence_gap = True
-        segment_start = self._active_segment_start
+        self._active_segment_start = segment_start
         ticket = submit_state_transaction(
             stream=self._writer_stream,
             path=str(self._segment_path(segment_start)),
@@ -728,17 +790,16 @@ class WatchStateStore:
         if self._compaction_due:
             self._request_checkpoint_locked()
 
-        if durable:
-            # Preserve the durability contract without holding the global state
-            # lock across physical write/fsync.  The operation is already in the
-            # sequenced FIFO and visible in memory before another transaction can
-            # receive the next sequence number.
-            self._state_lock.release()
-            try:
-                ticket.wait()
-            finally:
-                self._state_lock.acquire()
-            self._raise_persistence_fault_locked()
+        # Both durable and ordinary calls return only after their WAL bytes have
+        # reached the writer.  Durable tickets additionally include the fsync
+        # barrier.  The global state lock is released for that wait, so unrelated
+        # Watch state progression is never serialized behind physical I/O.
+        self._state_lock.release()
+        try:
+            ticket.wait()
+        finally:
+            self._state_lock.acquire()
+        self._raise_persistence_fault_locked()
 
     def _commit_operations_concurrent(
         self,
