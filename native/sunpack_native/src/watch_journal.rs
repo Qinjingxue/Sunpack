@@ -9,9 +9,13 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-const DURABLE_COALESCE_MICROS: u64 = 500;
+const DURABLE_SINGLE_PROBE_MICROS: u64 = 50;
+const DURABLE_BURST_COALESCE_MICROS: u64 = 500;
+const DURABLE_SLOW_STORAGE_COALESCE_MICROS: u64 = 750;
+const DURABLE_SLOW_STORAGE_THRESHOLD_MICROS: u64 = 10_000;
+const WRITER_BATCH_MAX_RECORDS: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
 enum TicketGoal {
@@ -104,8 +108,11 @@ struct StreamState {
     segments: BTreeMap<u64, SegmentState>,
     error: Option<String>,
     write_count: u64,
+    write_calls: u64,
     flush_rounds: u64,
     flush_calls: u64,
+    last_flush_micros: u64,
+    coalesce_micros_total: u64,
 }
 
 #[derive(Default)]
@@ -419,8 +426,120 @@ fn write_file(file: &File, payload: &[u8]) -> io::Result<()> {
     handle.write_all(payload)
 }
 
+struct AppendWorkItem {
+    stream: String,
+    path: PathBuf,
+    segment_start: u64,
+    seq: u64,
+    version: u32,
+    operations: JsonValue,
+    durable: bool,
+    bytes_written: Arc<AtomicU64>,
+}
+
+fn append_work_item(
+    stream: String,
+    path: PathBuf,
+    segment_start: u64,
+    seq: u64,
+    version: u32,
+    operations: JsonValue,
+    durable: bool,
+    bytes_written: Arc<AtomicU64>,
+) -> AppendWorkItem {
+    AppendWorkItem {
+        stream,
+        path,
+        segment_start,
+        seq,
+        version,
+        operations,
+        durable,
+        bytes_written,
+    }
+}
+
+fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<()> {
+    let first = batch
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "empty journal batch"))?;
+    let mut payload = Vec::with_capacity(batch.len().saturating_mul(512));
+    let mut record_sizes = Vec::with_capacity(batch.len());
+    for item in batch {
+        let encoded = encode_transaction(item.version, item.seq, &item.operations)?;
+        record_sizes.push(encoded.len());
+        payload.extend_from_slice(&encoded);
+    }
+
+    // The writer is the only component that can advance written_seq, so this
+    // validation can happen before the single batched write without another
+    // serialization lock around the I/O itself.
+    {
+        let state = lock_state(shared);
+        let written = state
+            .streams
+            .get(&first.stream)
+            .map(|stream| stream.written_seq)
+            .unwrap_or(0);
+        let mut previous = written;
+        for item in batch {
+            if item.seq <= previous {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "non-monotonic Watch journal sequence: written={previous}, got={}",
+                        item.seq
+                    ),
+                ));
+            }
+            previous = item.seq;
+        }
+    }
+
+    let file = segment_file(shared, &first.stream, first.segment_start, &first.path)?;
+    write_file(&file, &payload)?;
+
+    let mut state = lock_state(shared);
+    let stream_state = state.streams.entry(first.stream.clone()).or_default();
+    let last_seq = batch.last().expect("non-empty batch").seq;
+    {
+        let segment = stream_state
+            .segments
+            .get_mut(&first.segment_start)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "Watch journal segment disappeared")
+            })?;
+        segment.last_seq = last_seq;
+        segment.write_epoch = segment.write_epoch.saturating_add(batch.len() as u64);
+    }
+    stream_state.written_seq = last_seq;
+    stream_state.write_count = stream_state.write_count.saturating_add(batch.len() as u64);
+    stream_state.write_calls = stream_state.write_calls.saturating_add(1);
+    if let Some(target) = batch
+        .iter()
+        .filter(|item| item.durable)
+        .map(|item| item.seq)
+        .max()
+    {
+        stream_state.requested_seq = stream_state.requested_seq.max(target);
+    }
+    for (item, size) in batch.iter().zip(record_sizes) {
+        item.bytes_written.store(size as u64, Ordering::Release);
+    }
+    shared.cv.notify_all();
+    Ok(())
+}
+
 fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
-    while let Ok(command) = rx.recv() {
+    let mut pending: Option<WriterCommand> = None;
+    loop {
+        let command = match pending.take() {
+            Some(command) => command,
+            None => match rx.recv() {
+                Ok(command) => command,
+                Err(_) => break,
+            },
+        };
         match command {
             WriterCommand::Append {
                 stream,
@@ -432,51 +551,80 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                 durable,
                 bytes_written,
             } => {
-                if stream_failed(&shared, &stream) {
+                let batch_stream = stream.clone();
+                let batch_path = path.clone();
+                let batch_start = segment_start;
+                let mut batch = vec![append_work_item(
+                    stream,
+                    path,
+                    segment_start,
+                    seq,
+                    version,
+                    operations,
+                    durable,
+                    bytes_written,
+                )];
+
+                // Zero-wait opportunistic batching: once one append is ready,
+                // consume only commands that are already queued for the same
+                // stream/segment. Never sleep to manufacture a writer batch.
+                while batch.len() < WRITER_BATCH_MAX_RECORDS {
+                    match rx.try_recv() {
+                        Ok(WriterCommand::Append {
+                            stream,
+                            path,
+                            segment_start,
+                            seq,
+                            version,
+                            operations,
+                            durable,
+                            bytes_written,
+                        }) => {
+                            if stream == batch_stream
+                                && path == batch_path
+                                && segment_start == batch_start
+                            {
+                                batch.push(append_work_item(
+                                    stream,
+                                    path,
+                                    segment_start,
+                                    seq,
+                                    version,
+                                    operations,
+                                    durable,
+                                    bytes_written,
+                                ));
+                            } else {
+                                pending = Some(WriterCommand::Append {
+                                    stream,
+                                    path,
+                                    segment_start,
+                                    seq,
+                                    version,
+                                    operations,
+                                    durable,
+                                    bytes_written,
+                                });
+                                break;
+                            }
+                        }
+                        Ok(other) => {
+                            pending = Some(other);
+                            break;
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
+                }
+
+                if stream_failed(&shared, &batch_stream) {
                     shared.cv.notify_all();
                     continue;
                 }
-                let result = (|| -> io::Result<usize> {
-                    let payload = encode_transaction(version, seq, &operations)?;
-                    let file = segment_file(&shared, &stream, segment_start, &path)?;
-                    write_file(&file, &payload)?;
-
-                    let mut state = lock_state(&shared);
-                    let stream_state = state.streams.entry(stream.clone()).or_default();
-                    if seq <= stream_state.written_seq {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "non-monotonic Watch journal sequence: written={}, got={seq}",
-                                stream_state.written_seq
-                            ),
-                        ));
-                    }
-                    let segment =
-                        stream_state
-                            .segments
-                            .get_mut(&segment_start)
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::NotFound,
-                                    "Watch journal segment disappeared",
-                                )
-                            })?;
-                    segment.last_seq = seq;
-                    segment.write_epoch = segment.write_epoch.saturating_add(1);
-                    stream_state.written_seq = seq;
-                    stream_state.write_count = stream_state.write_count.saturating_add(1);
-                    if durable {
-                        stream_state.requested_seq = stream_state.requested_seq.max(seq);
-                    }
-                    bytes_written.store(payload.len() as u64, Ordering::Release);
-                    shared.cv.notify_all();
-                    Ok(payload.len())
-                })();
-                if let Err(error) = result {
+                if let Err(error) = write_append_batch(&shared, &batch) {
                     fail_stream(
                         &shared,
-                        &stream,
+                        &batch_stream,
                         format!("native Watch journal append failed: {error}"),
                     );
                 }
@@ -563,10 +711,21 @@ fn close_ready_segments(stream: &mut StreamState) {
     }
 }
 
+fn adaptive_coalesce_window(activity_during_probe: bool, last_flush_micros: u64) -> u64 {
+    if !activity_during_probe {
+        return DURABLE_SINGLE_PROBE_MICROS;
+    }
+    if last_flush_micros >= DURABLE_SLOW_STORAGE_THRESHOLD_MICROS {
+        DURABLE_SLOW_STORAGE_COALESCE_MICROS
+    } else {
+        DURABLE_BURST_COALESCE_MICROS
+    }
+}
+
 fn next_flush_work(shared: &Shared) -> FlushWork {
     let mut state = lock_state(shared);
     loop {
-        let key = state
+        let candidate = state
             .streams
             .iter()
             .find(|(_, stream)| {
@@ -574,16 +733,38 @@ fn next_flush_work(shared: &Shared) -> FlushWork {
                     && stream.requested_seq > stream.durable_seq
                     && stream.written_seq >= stream.requested_seq
             })
-            .map(|(key, _)| key.clone());
+            .map(|(key, stream)| (key.clone(), stream.written_seq, stream.requested_seq));
 
-        if let Some(key) = key {
-            // Coalesce only on the durability side. Writer/ordinary WAL never
-            // waits for this window. Releasing the state mutex lets the writer
-            // advance written_seq while we wait, so one physical sync can cover
-            // a larger durable prefix.
+        if let Some((key, initial_written, initial_requested)) = candidate {
+            // Probe briefly first. An isolated commit pays only 50us rather than
+            // the old fixed 500us. If writer/requested frontiers are still
+            // advancing, extend the window so a burst shares one physical flush.
             drop(state);
-            thread::sleep(Duration::from_micros(DURABLE_COALESCE_MICROS));
+            thread::sleep(Duration::from_micros(DURABLE_SINGLE_PROBE_MICROS));
             state = lock_state(shared);
+            let (activity, window) = {
+                let Some(stream) = state.streams.get(&key) else {
+                    continue;
+                };
+                if stream.error.is_some()
+                    || stream.requested_seq <= stream.durable_seq
+                    || stream.written_seq < stream.requested_seq
+                {
+                    continue;
+                }
+                let activity = stream.written_seq > initial_written
+                    || stream.requested_seq > initial_requested;
+                (
+                    activity,
+                    adaptive_coalesce_window(activity, stream.last_flush_micros),
+                )
+            };
+            if activity && window > DURABLE_SINGLE_PROBE_MICROS {
+                drop(state);
+                thread::sleep(Duration::from_micros(window - DURABLE_SINGLE_PROBE_MICROS));
+                state = lock_state(shared);
+            }
+
             let Some(stream) = state.streams.get_mut(&key) else {
                 continue;
             };
@@ -616,6 +797,7 @@ fn next_flush_work(shared: &Shared) -> FlushWork {
                 continue;
             }
 
+            stream.coalesce_micros_total = stream.coalesce_micros_total.saturating_add(window);
             return FlushWork {
                 stream: key,
                 target,
@@ -642,6 +824,7 @@ fn flusher_loop(shared: Arc<Shared>) {
             .iter()
             .map(|segment| (segment.start, segment.epoch))
             .collect();
+        let flush_started = Instant::now();
         let mut flush_error = None;
         for segment in &segments {
             if let Err(error) = segment.file.sync_all() {
@@ -650,6 +833,7 @@ fn flusher_loop(shared: Arc<Shared>) {
             }
         }
         let flush_calls = segments.len() as u64;
+        let flush_micros = flush_started.elapsed().as_micros().min(u64::MAX as u128) as u64;
         drop(segments);
 
         if let Some(error) = flush_error {
@@ -672,6 +856,7 @@ fn flusher_loop(shared: Arc<Shared>) {
         }
         stream_state.flush_rounds = stream_state.flush_rounds.saturating_add(1);
         stream_state.flush_calls = stream_state.flush_calls.saturating_add(flush_calls);
+        stream_state.last_flush_micros = flush_micros;
         stream_state.durable_seq = stream_state.durable_seq.max(target);
         close_ready_segments(stream_state);
         shared.cv.notify_all();
@@ -741,8 +926,11 @@ pub(crate) fn watch_journal_stats(py: Python<'_>, stream: String) -> PyResult<Py
         result.set_item("requested_seq", stream.requested_seq)?;
         result.set_item("sealed_seq", stream.sealed_seq)?;
         result.set_item("write_count", stream.write_count)?;
+        result.set_item("write_calls", stream.write_calls)?;
         result.set_item("flush_rounds", stream.flush_rounds)?;
         result.set_item("flush_calls", stream.flush_calls)?;
+        result.set_item("last_flush_micros", stream.last_flush_micros)?;
+        result.set_item("coalesce_micros_total", stream.coalesce_micros_total)?;
         result.set_item("segments", stream.segments.len())?;
         result.set_item("error", stream.error.clone())?;
     } else {
@@ -751,8 +939,11 @@ pub(crate) fn watch_journal_stats(py: Python<'_>, stream: String) -> PyResult<Py
         result.set_item("requested_seq", 0)?;
         result.set_item("sealed_seq", 0)?;
         result.set_item("write_count", 0)?;
+        result.set_item("write_calls", 0)?;
         result.set_item("flush_rounds", 0)?;
         result.set_item("flush_calls", 0)?;
+        result.set_item("last_flush_micros", 0)?;
+        result.set_item("coalesce_micros_total", 0)?;
         result.set_item("segments", 0)?;
         result.set_item("error", Option::<String>::None)?;
     }
@@ -841,6 +1032,53 @@ mod tests {
         assert!(stream_state.durable_seq >= 1);
         assert!(stream_state.sealed_seq >= 1);
         assert!(!stream_state.segments.contains_key(&1));
+        drop(state);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn adaptive_coalescing_keeps_idle_commit_short_and_extends_bursts() {
+        assert_eq!(
+            adaptive_coalesce_window(false, 0),
+            DURABLE_SINGLE_PROBE_MICROS
+        );
+        assert_eq!(
+            adaptive_coalesce_window(true, 1_000),
+            DURABLE_BURST_COALESCE_MICROS
+        );
+        assert_eq!(
+            adaptive_coalesce_window(true, DURABLE_SLOW_STORAGE_THRESHOLD_MICROS),
+            DURABLE_SLOW_STORAGE_COALESCE_MICROS
+        );
+    }
+
+    #[test]
+    fn writer_batches_already_queued_appends_without_waiting() {
+        let shared = Arc::new(Shared::new());
+        let (tx, rx) = mpsc::channel();
+        let path = unique_path("writer_batch");
+        let stream = path.to_string_lossy().to_string();
+        for seq in 1..=32u64 {
+            tx.send(WriterCommand::Append {
+                stream: stream.clone(),
+                path: path.clone(),
+                segment_start: 1,
+                seq,
+                version: 17,
+                operations: empty_operations(),
+                durable: false,
+                bytes_written: Arc::new(AtomicU64::new(0)),
+            })
+            .unwrap();
+        }
+        drop(tx);
+        writer_loop(shared.clone(), rx);
+
+        let state = lock_state(&shared);
+        let stream_state = state.streams.get(&stream).unwrap();
+        assert_eq!(stream_state.written_seq, 32);
+        assert_eq!(stream_state.write_count, 32);
+        assert_eq!(stream_state.write_calls, 1);
         drop(state);
         let _ = fs::remove_file(path);
     }
