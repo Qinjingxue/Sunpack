@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from sunpack.filesystem.watcher.journal_commit import (
-    submit_journal_append,
-    submit_journal_close,
+    JournalTicket,
+    submit_segment_seal,
+    submit_state_transaction,
+    submit_stream_flush,
 )
 from sunpack.support.resource_lifecycle import (
     named_task_temporary_file,
@@ -27,23 +29,28 @@ from .group_models import (
 )
 
 
-STATE_VERSION = 16
-LOADABLE_STATE_VERSIONS = {15, STATE_VERSION}
-DEFAULT_JOURNAL_COMPACT_RECORDS = 4096
-DEFAULT_JOURNAL_COMPACT_BYTES = 512 * 1024
-DEFAULT_JOURNAL_HARD_BYTES = 1 * 1024 * 1024
+STATE_VERSION = 17
+DEFAULT_JOURNAL_COMPACT_RECORDS = 8192
+DEFAULT_JOURNAL_COMPACT_BYTES = 8 * 1024 * 1024
+DEFAULT_JOURNAL_HARD_BYTES = 256 * 1024 * 1024
 
 
 class WatchStateJournalError(RuntimeError):
-    """The durable watch-state journal is corrupt before its final record."""
+    """The durable Watch state sequence is corrupt or discontinuous."""
 
 
 _STATE_PATH_LOCKS_GUARD = threading.Lock()
 _STATE_PATH_LOCKS: dict[str, threading.RLock] = {}
+_SEQUENCE_GUARD = threading.Lock()
+_SEQUENCE_NEXT: dict[str, int] = {}
+
+
+def _state_path_key(path: Path) -> str:
+    return os.path.normcase(os.path.abspath(str(path)))
 
 
 def _state_path_lock(path: Path) -> threading.RLock:
-    key = os.path.normcase(os.path.abspath(str(path)))
+    key = _state_path_key(path)
     with _STATE_PATH_LOCKS_GUARD:
         lock = _STATE_PATH_LOCKS.get(key)
         if lock is None:
@@ -52,9 +59,26 @@ def _state_path_lock(path: Path) -> threading.RLock:
         return lock
 
 
-def _flush_file(handle) -> None:
-    """Make a critical state transition durable before dependent filesystem work."""
+def _seed_sequence(path: Path, last_seq: int) -> None:
+    key = _state_path_key(path)
+    with _SEQUENCE_GUARD:
+        _SEQUENCE_NEXT[key] = max(_SEQUENCE_NEXT.get(key, 1), int(last_seq) + 1)
 
+
+def _reset_sequence(path: Path, next_seq: int = 1) -> None:
+    with _SEQUENCE_GUARD:
+        _SEQUENCE_NEXT[_state_path_key(path)] = max(1, int(next_seq))
+
+
+def _reserve_sequence(path: Path, floor: int) -> int:
+    key = _state_path_key(path)
+    with _SEQUENCE_GUARD:
+        seq = max(_SEQUENCE_NEXT.get(key, 1), int(floor) + 1)
+        _SEQUENCE_NEXT[key] = seq + 1
+        return seq
+
+
+def _flush_file(handle) -> None:
     handle.flush()
     os.fsync(handle.fileno())
 
@@ -117,8 +141,19 @@ class WatchStateEntry:
         return os.path.abspath(configured) if configured else os.path.dirname(os.path.abspath(self.path))
 
 
+@dataclass(frozen=True)
+class _SnapshotView:
+    checkpoint_seq: int
+    password_generation: int
+    password_source_signature: str
+    watch_cursors: dict[str, dict[str, int]]
+    pending_work: dict[str, WatchPendingWork]
+    entries: dict[str, WatchStateEntry]
+    groups: dict[str, WatchGroupState]
+
+
 class WatchStateStore:
-    """Persistent crash queue and retry blockers for watch mode."""
+    """Persistent crash queue with sequenced WAL and asynchronous checkpoints."""
 
     def __init__(
         self,
@@ -129,22 +164,70 @@ class WatchStateStore:
         hard_compact_bytes: int = DEFAULT_JOURNAL_HARD_BYTES,
     ):
         self.path = Path(path)
-        self.journal_path = self.path.with_name(f"{self.path.stem}.journal.jsonl")
         self._state_lock = _state_path_lock(self.path)
-        self._journal_io_gate = threading.Lock()
+        self._checkpoint_condition = threading.Condition(self._state_lock)
         self._compact_records = max(1, int(compact_records))
         self._compact_bytes = max(1, int(compact_bytes))
         self._hard_compact_bytes = max(self._compact_bytes, int(hard_compact_bytes))
-        self._journal_records = 0
-        self._journal_bytes = 0
-        self._compaction_due = False
+        self._writer_stream = f"{_state_path_key(self.path)}:{id(self):x}"
+
         self.pending_work: dict[str, WatchPendingWork] = {}
         self.entries: dict[str, WatchStateEntry] = {}
         self.groups: dict[str, WatchGroupState] = {}
         self.password_generation = 0
         self.password_source_signature = ""
         self.watch_cursors: dict[str, dict[str, int]] = {}
+
+        self._checkpoint_seq = 0
+        self._applied_seq = 0
+        self._active_segment_start = 1
+        self._segment_records: dict[int, int] = {}
+        self._segment_bytes: dict[int, int] = {}
+        self._journal_records = 0
+        self._journal_bytes = 0
+        self._compaction_due = False
+        self._checkpoint_running = False
+        self._checkpoint_requested = False
+        self._checkpoint_error: BaseException | None = None
+        self._persistence_fault: BaseException | None = None
+        self._snapshot_exists = False
+        self._external_sequence_gap = False
         self.load()
+
+    @property
+    def journal_path(self) -> Path:
+        return self._segment_path(self._active_segment_start)
+
+    def _segment_path(self, start_seq: int) -> Path:
+        return self.path.with_name(
+            f"{self.path.stem}.journal.{int(start_seq):020d}.jsonl"
+        )
+
+    @property
+    def _legacy_journal_path(self) -> Path:
+        return self.path.with_name(f"{self.path.stem}.journal.jsonl")
+
+    def _journal_paths(self) -> list[Path]:
+        prefix = f"{self.path.stem}.journal."
+        suffix = ".jsonl"
+        paths = []
+        for path in self.path.parent.glob(f"{prefix}*{suffix}"):
+            if self._segment_start_from_path(path) is not None:
+                paths.append(path)
+        return sorted(paths, key=lambda item: self._segment_start_from_path(item) or 0)
+
+    def _segment_start_from_path(self, path: Path) -> int | None:
+        prefix = f"{self.path.stem}.journal."
+        suffix = ".jsonl"
+        name = path.name
+        if not name.startswith(prefix) or not name.endswith(suffix):
+            return None
+        raw = name[len(prefix) : -len(suffix)]
+        try:
+            value = int(raw)
+        except ValueError:
+            return None
+        return value if value >= 1 else None
 
     def load(self) -> None:
         with self._state_lock:
@@ -153,55 +236,75 @@ class WatchStateStore:
             if self.path.exists():
                 try:
                     payload = json.loads(read_task_text(self.path, encoding="utf-8"))
-                except Exception:
-                    payload = None
-                if isinstance(payload, dict):
-                    version = payload.get("version")
-                    if version not in LOADABLE_STATE_VERSIONS:
-                        incompatible = True
-                    else:
-                        try:
-                            self.password_generation = max(
-                                0,
-                                int(payload.get("password_generation", 0)),
-                            )
-                        except (TypeError, ValueError):
-                            self.password_generation = 0
-                        self.password_source_signature = str(
-                            payload.get("password_source_signature") or ""
+                except Exception as exc:
+                    raise WatchStateJournalError(
+                        f"corrupt watch state snapshot at {self.path}"
+                    ) from exc
+                if not isinstance(payload, dict):
+                    raise WatchStateJournalError(
+                        f"invalid watch state snapshot at {self.path}"
+                    )
+                if payload.get("version") != STATE_VERSION:
+                    incompatible = True
+                else:
+                    self._snapshot_exists = True
+                    try:
+                        self._checkpoint_seq = max(
+                            0,
+                            int(payload.get("checkpoint_seq", 0)),
                         )
-                        raw_cursors = payload.get("watch_cursors")
-                        if isinstance(raw_cursors, dict):
-                            self.watch_cursors = {
-                                str(key).lower(): {
-                                    "journal_id": int(value.get("journal_id", 0) or 0),
-                                    "next_usn": int(value.get("next_usn", 0) or 0),
-                                }
-                                for key, value in raw_cursors.items()
-                                if isinstance(value, dict)
+                        self._applied_seq = self._checkpoint_seq
+                        self.password_generation = max(
+                            0,
+                            int(payload.get("password_generation", 0)),
+                        )
+                    except (TypeError, ValueError) as exc:
+                        raise WatchStateJournalError(
+                            f"invalid watch state snapshot metadata at {self.path}"
+                        ) from exc
+                    self.password_source_signature = str(
+                        payload.get("password_source_signature") or ""
+                    )
+                    raw_cursors = payload.get("watch_cursors")
+                    if isinstance(raw_cursors, dict):
+                        self.watch_cursors = {
+                            str(key).lower(): {
+                                "journal_id": int(value.get("journal_id", 0) or 0),
+                                "next_usn": int(value.get("next_usn", 0) or 0),
                             }
-                        self.pending_work = self._load_records(
-                            payload.get("pending_work"),
-                            WatchPendingWork,
-                        )
-                        self.entries = self._load_records(
-                            payload.get("entries"),
-                            WatchStateEntry,
-                        )
-                        self.groups = self._load_records(
-                            payload.get("groups"),
-                            WatchGroupState,
-                            normalize_keys=False,
-                        )
+                            for key, value in raw_cursors.items()
+                            if isinstance(value, dict)
+                        }
+                    self.pending_work = self._load_records(
+                        payload.get("pending_work"),
+                        WatchPendingWork,
+                    )
+                    self.entries = self._load_records(
+                        payload.get("entries"),
+                        WatchStateEntry,
+                    )
+                    self.groups = self._load_records(
+                        payload.get("groups"),
+                        WatchGroupState,
+                        normalize_keys=False,
+                    )
+
             if incompatible:
-                # State schemas are intentionally not migrated. Replace an old
-                # or incompatible snapshot and its journal as one new empty state.
-                self._reset_memory_locked()
-                self._compact_locked()
+                self._discard_incompatible_state_locked()
+                view = self._capture_snapshot_locked()
+                self._write_snapshot_view(view)
+                self._snapshot_exists = True
+                _reset_sequence(self.path, 1)
                 return
-            if not self._load_journal_locked():
-                self._reset_memory_locked()
-                self._compact_locked()
+
+            try:
+                self._legacy_journal_path.unlink()
+            except FileNotFoundError:
+                pass
+            self._load_journal_segments_locked()
+            self._active_segment_start = self._applied_seq + 1
+            _seed_sequence(self.path, self._applied_seq)
+            self._update_compaction_due_locked()
 
     @staticmethod
     def _load_records(payload, record_type, *, normalize_keys: bool = True) -> dict:
@@ -219,23 +322,145 @@ class WatchStateStore:
             result[record_key] = record
         return result
 
+    def _load_journal_segments_locked(self) -> None:
+        paths = self._journal_paths()
+        expected_seq = self._checkpoint_seq + 1
+        for path_index, path in enumerate(paths):
+            segment_start = self._segment_start_from_path(path)
+            if segment_start is None:
+                continue
+            is_last_segment = path_index == len(paths) - 1
+            segment_records = 0
+            segment_bytes = 0
+            try:
+                with open_service_file(path, "r", encoding="utf-8", newline="") as handle:
+                    for line_number, line in enumerate(handle, start=1):
+                        if not line:
+                            continue
+                        if not line.endswith("\n"):
+                            if is_last_segment:
+                                break
+                            raise WatchStateJournalError(
+                                f"truncated sealed watch journal at {path}:{line_number}"
+                            )
+                        try:
+                            transaction = json.loads(line)
+                        except json.JSONDecodeError as exc:
+                            raise WatchStateJournalError(
+                                f"corrupt watch state journal at {path}:{line_number}"
+                            ) from exc
+                        if not isinstance(transaction, dict):
+                            raise WatchStateJournalError(
+                                f"invalid watch state journal record at {path}:{line_number}"
+                            )
+                        if transaction.get("version") != STATE_VERSION:
+                            raise WatchStateJournalError(
+                                f"incompatible watch state journal at {path}:{line_number}"
+                            )
+                        try:
+                            seq = int(transaction["seq"])
+                        except (KeyError, TypeError, ValueError) as exc:
+                            raise WatchStateJournalError(
+                                f"invalid watch state sequence at {path}:{line_number}"
+                            ) from exc
+                        if seq <= self._checkpoint_seq:
+                            continue
+                        if seq != expected_seq:
+                            raise WatchStateJournalError(
+                                f"non-contiguous watch state sequence at {path}:{line_number}: "
+                                f"expected {expected_seq}, got {seq}"
+                            )
+                        operations = transaction.get("operations")
+                        if not isinstance(operations, list) or not operations:
+                            raise WatchStateJournalError(
+                                f"invalid watch state operations at {path}:{line_number}"
+                            )
+                        try:
+                            decoded = [
+                                self._decode_operation(operation)
+                                for operation in operations
+                            ]
+                        except (TypeError, ValueError, KeyError) as exc:
+                            raise WatchStateJournalError(
+                                f"invalid watch state operation at {path}:{line_number}"
+                            ) from exc
+                        for operation in decoded:
+                            self._apply_decoded_operation_locked(operation)
+                        self._applied_seq = seq
+                        expected_seq = seq + 1
+                        segment_records += 1
+                        segment_bytes += len(line.encode("utf-8"))
+            except FileNotFoundError:
+                continue
+            if segment_records:
+                self._segment_records[segment_start] = segment_records
+                self._segment_bytes[segment_start] = segment_bytes
+                self._journal_records += segment_records
+                self._journal_bytes += segment_bytes
+
+    def _discard_incompatible_state_locked(self) -> None:
+        self._reset_memory_locked()
+        for path in [self.path, self._legacy_journal_path, *self._journal_paths()]:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+
     def save(self) -> None:
-        """Force a compact snapshot for explicit callers and clean shutdowns."""
+        """Force one checkpoint and wait until it covers the current sequence."""
+
+        with self._checkpoint_condition:
+            self._raise_persistence_fault_locked()
+            target_seq = self._applied_seq
+            self._request_checkpoint_locked(force=True)
+            while (
+                (not self._snapshot_exists or self._checkpoint_seq < target_seq)
+                and self._checkpoint_error is None
+                and self._persistence_fault is None
+            ):
+                self._checkpoint_condition.wait()
+            self._raise_persistence_fault_locked()
+            if self._checkpoint_error is not None:
+                raise self._checkpoint_error
+
+    def flush(self) -> None:
+        """Flush all journal operations submitted before this call."""
 
         with self._state_lock:
-            self._compact_locked()
+            self._raise_persistence_fault_locked()
+            path = self.journal_path
+            ticket = submit_stream_flush(
+                stream=self._writer_stream,
+                path=str(path),
+                on_error=self._on_journal_error,
+            )
+        ticket.wait()
+        with self._state_lock:
+            self._raise_persistence_fault_locked()
 
     def compact_if_needed(self, *, force: bool = False) -> bool:
+        """Request a checkpoint without doing snapshot work on the caller."""
+
         with self._state_lock:
             if not force and not self._compaction_due:
                 return False
-            self._compact_locked()
+            self._request_checkpoint_locked(force=force)
             return True
 
     @property
     def compaction_due(self) -> bool:
         with self._state_lock:
             return self._compaction_due
+
+    @property
+    def checkpoint_seq(self) -> int:
+        with self._state_lock:
+            return self._checkpoint_seq
+
+    @property
+    def applied_seq(self) -> int:
+        with self._state_lock:
+            return self._applied_seq
 
     def entry_items(self) -> list[WatchStateEntry]:
         with self._state_lock:
@@ -248,139 +473,223 @@ class WatchStateStore:
         self.password_generation = 0
         self.password_source_signature = ""
         self.watch_cursors = {}
+        self._checkpoint_seq = 0
+        self._applied_seq = 0
+        self._active_segment_start = 1
+        self._segment_records = {}
+        self._segment_bytes = {}
         self._journal_records = 0
         self._journal_bytes = 0
         self._compaction_due = False
+        self._snapshot_exists = False
+        self._external_sequence_gap = False
 
-    def _snapshot_payload_locked(self) -> dict[str, Any]:
-        return {
-            "version": STATE_VERSION,
-            "password_generation": self.password_generation,
-            "password_source_signature": self.password_source_signature,
-            "watch_cursors": self.watch_cursors,
-            "pending_work": {
-                key: asdict(value)
-                for key, value in self.pending_work.items()
-            },
-            "entries": {
-                key: asdict(value)
-                for key, value in self.entries.items()
-            },
-            "groups": {
-                key: asdict(value)
-                for key, value in self.groups.items()
-            },
-        }
-
-    def _write_snapshot_locked(self) -> None:
-        payload = self._snapshot_payload_locked()
-        self._atomic_replace_text_locked(
-            self.path,
-            lambda handle: json.dump(
-                payload,
-                handle,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
+    def _capture_snapshot_locked(self) -> _SnapshotView:
+        # Records are replaced, not mutated in place, by WatchStateStore.  A
+        # shallow root copy therefore freezes a checkpoint view in O(dict copy)
+        # time without recursively duplicating every nested payload.
+        return _SnapshotView(
+            checkpoint_seq=self._applied_seq,
+            password_generation=self.password_generation,
+            password_source_signature=self.password_source_signature,
+            watch_cursors={key: dict(value) for key, value in self.watch_cursors.items()},
+            pending_work=self.pending_work.copy(),
+            entries=self.entries.copy(),
+            groups=self.groups.copy(),
         )
 
-    def _compact_locked(self) -> None:
-        self._write_snapshot_locked()
-        self._atomic_replace_text_locked(self.journal_path, lambda _handle: None)
-        self._journal_records = 0
-        self._journal_bytes = 0
-        self._compaction_due = False
+    @staticmethod
+    def _write_record_map(handle, name: str, records: dict[str, Any]) -> None:
+        handle.write(f',"{name}":{{')
+        first = True
+        for key, record in records.items():
+            if first:
+                first = False
+            else:
+                handle.write(",")
+            json.dump(key, handle, ensure_ascii=False, separators=(",", ":"))
+            handle.write(":")
+            json.dump(vars(record), handle, ensure_ascii=False, separators=(",", ":"))
+        handle.write("}")
 
-    def _atomic_replace_text_locked(self, target: Path, writer) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
+    def _write_snapshot_view(self, view: _SnapshotView) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path: Path | None = None
-        gate = self._journal_io_gate if target == self.journal_path else None
-        if gate is not None:
-            gate.acquire()
-            try:
-                submit_journal_close(str(target)).wait()
-            except BaseException:
-                gate.release()
-                raise
         try:
             with named_task_temporary_file(
                 mode="w",
                 encoding="utf-8",
                 newline="",
-                dir=target.parent,
-                prefix=f".{target.name}.",
+                dir=self.path.parent,
+                prefix=f".{self.path.name}.",
                 suffix=".tmp",
                 delete=False,
             ) as temp:
                 temp_path = Path(temp.name)
-                writer(temp)
+                temp.write(
+                    f'{{"version":{STATE_VERSION},"checkpoint_seq":{view.checkpoint_seq},'
+                    f'"password_generation":{view.password_generation},'
+                    '"password_source_signature":'
+                )
+                json.dump(
+                    view.password_source_signature,
+                    temp,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                temp.write(',"watch_cursors":')
+                json.dump(
+                    view.watch_cursors,
+                    temp,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+                self._write_record_map(temp, "pending_work", view.pending_work)
+                self._write_record_map(temp, "entries", view.entries)
+                self._write_record_map(temp, "groups", view.groups)
+                temp.write("}")
                 _flush_file(temp)
-            os.replace(temp_path, target)
-            _sync_file_path(target)
+            os.replace(temp_path, self.path)
+            _sync_file_path(self.path)
         finally:
             if temp_path is not None:
                 try:
                     temp_path.unlink()
                 except FileNotFoundError:
                     pass
-            if gate is not None:
-                gate.release()
 
-    def _load_journal_locked(self) -> bool:
-        if not self.journal_path.exists():
-            return True
-        try:
-            content = read_task_text(self.journal_path, encoding="utf-8")
-        except FileNotFoundError:
-            return True
-        complete_content = content
-        if content and not content.endswith("\n"):
-            last_newline = content.rfind("\n")
-            complete_content = content[: last_newline + 1]
-            self._atomic_replace_text_locked(
-                self.journal_path,
-                lambda handle: handle.write(complete_content),
-            )
+    def _request_checkpoint_locked(self, *, force: bool = False) -> None:
+        if self._external_sequence_gap:
+            if force:
+                self._checkpoint_error = RuntimeError(
+                    "cannot checkpoint a WatchStateStore that observed another writer"
+                )
+                self._checkpoint_condition.notify_all()
+            return
+        if self._checkpoint_running:
+            self._checkpoint_requested = True
+            return
+        if not force and not self._compaction_due:
+            return
+        self._checkpoint_running = True
+        self._checkpoint_requested = False
+        self._checkpoint_error = None
+        threading.Thread(
+            target=self._checkpoint_loop,
+            name="sunpack-watch-checkpoint",
+            daemon=True,
+        ).start()
 
-        decoded_operations = []
-        record_count = 0
-        for line_number, line in enumerate(complete_content.splitlines(), start=1):
-            if not line:
+    def _checkpoint_loop(self) -> None:
+        while True:
+            seal_ticket: JournalTicket | None = None
+            with self._state_lock:
+                if self._persistence_fault is not None:
+                    self._checkpoint_running = False
+                    self._checkpoint_condition.notify_all()
+                    return
+                boundary = self._applied_seq
+                view = self._capture_snapshot_locked()
+                old_start = self._active_segment_start
+                if old_start <= boundary:
+                    new_start = boundary + 1
+                    old_path = self._segment_path(old_start)
+                    new_path = self._segment_path(new_start)
+                    self._active_segment_start = new_start
+                    seal_ticket = submit_segment_seal(
+                        stream=self._writer_stream,
+                        old_path=str(old_path),
+                        new_path=str(new_path),
+                        on_error=self._on_journal_error,
+                    )
+                self._checkpoint_requested = False
+
+            error: BaseException | None = None
+            try:
+                if seal_ticket is not None:
+                    seal_ticket.wait()
+                self._write_snapshot_view(view)
+                self._retire_segments_through(boundary)
+            except BaseException as exc:
+                error = exc
+
+            with self._checkpoint_condition:
+                if error is None:
+                    self._snapshot_exists = True
+                    self._checkpoint_seq = max(self._checkpoint_seq, boundary)
+                    retired_record_starts = [
+                        start for start in self._segment_records if start <= boundary
+                    ]
+                    for start in retired_record_starts:
+                        self._journal_records -= self._segment_records.pop(start, 0)
+                        self._journal_bytes -= self._segment_bytes.pop(start, 0)
+                    self._journal_records = max(0, self._journal_records)
+                    self._journal_bytes = max(0, self._journal_bytes)
+                    self._checkpoint_error = None
+                    self._update_compaction_due_locked()
+                else:
+                    self._checkpoint_error = error
+                    self._update_compaction_due_locked()
+                    if self._journal_bytes >= self._hard_compact_bytes:
+                        self._persistence_fault = RuntimeError(
+                            "Watch state checkpoint failed at the journal safety limit"
+                        )
+                        self._persistence_fault.__cause__ = error
+
+                self._checkpoint_condition.notify_all()
+                if error is not None:
+                    self._checkpoint_running = False
+                    return
+                if (
+                    self._applied_seq > boundary
+                    and (self._checkpoint_requested or self._compaction_due)
+                ):
+                    continue
+                self._checkpoint_running = False
+                return
+
+    def _retire_segments_through(self, boundary: int) -> None:
+        for path in self._journal_paths():
+            start = self._segment_start_from_path(path)
+            if start is None or start > boundary:
                 continue
             try:
-                transaction = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise WatchStateJournalError(
-                    f"corrupt watch state journal at {self.journal_path}:{line_number}"
-                ) from exc
-            if not isinstance(transaction, dict):
-                raise WatchStateJournalError(
-                    f"invalid watch state journal record at {self.journal_path}:{line_number}"
-                )
-            if transaction.get("version") not in LOADABLE_STATE_VERSIONS:
-                return False
-            operations = transaction.get("operations")
-            if not isinstance(operations, list) or not operations:
-                raise WatchStateJournalError(
-                    f"invalid watch state journal operations at {self.journal_path}:{line_number}"
-                )
-            try:
-                decoded_operations.extend(
-                    self._decode_operation(operation)
-                    for operation in operations
-                )
-            except (TypeError, ValueError, KeyError) as exc:
-                raise WatchStateJournalError(
-                    f"invalid watch state journal operation at {self.journal_path}:{line_number}"
-                ) from exc
-            record_count += 1
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                # Snapshot publication already made these segments redundant.
+                # A later checkpoint/startup may retry cleanup safely.
+                pass
 
-        for operation in decoded_operations:
-            self._apply_decoded_operation_locked(operation)
-        self._journal_records = record_count
-        self._journal_bytes = len(complete_content.encode("utf-8"))
-        self._update_compaction_due_locked()
-        return True
+    def _on_journal_written(self, segment_start: int, byte_count: int) -> None:
+        with self._state_lock:
+            self._segment_bytes[segment_start] = (
+                self._segment_bytes.get(segment_start, 0) + int(byte_count)
+            )
+            self._journal_bytes += int(byte_count)
+            self._update_compaction_due_locked()
+            if self._compaction_due:
+                self._request_checkpoint_locked()
+            if (
+                self._checkpoint_error is not None
+                and self._journal_bytes >= self._hard_compact_bytes
+            ):
+                self._persistence_fault = RuntimeError(
+                    "Watch state journal reached its safety limit after checkpoint failure"
+                )
+                self._persistence_fault.__cause__ = self._checkpoint_error
+                self._checkpoint_condition.notify_all()
+
+    def _on_journal_error(self, error: BaseException) -> None:
+        with self._checkpoint_condition:
+            if self._persistence_fault is None:
+                self._persistence_fault = error
+            self._checkpoint_condition.notify_all()
+
+    def _raise_persistence_fault_locked(self) -> None:
+        if self._persistence_fault is not None:
+            raise RuntimeError("Watch state persistence is unavailable") from self._persistence_fault
 
     def _commit_operations_locked(
         self,
@@ -390,28 +699,46 @@ class WatchStateStore:
     ) -> None:
         if not operations:
             return
+        self._raise_persistence_fault_locked()
         decoded = [self._decode_operation(operation) for operation in operations]
-        if not self.path.exists():
-            self._write_snapshot_locked()
-        transaction = {
-            "version": STATE_VERSION,
-            "operations": operations,
-        }
-        serialized = (
-            json.dumps(transaction, ensure_ascii=True, separators=(",", ":"))
-            + "\n"
-        ).encode("utf-8")
-        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._journal_io_gate:
-            ticket = submit_journal_append(str(self.journal_path), serialized, durable=durable)
-        ticket.wait()
+        previous_seq = self._applied_seq
+        seq = _reserve_sequence(self.path, previous_seq)
+        if seq != previous_seq + 1:
+            self._external_sequence_gap = True
+        segment_start = self._active_segment_start
+        ticket = submit_state_transaction(
+            stream=self._writer_stream,
+            path=str(self._segment_path(segment_start)),
+            segment_start=segment_start,
+            seq=seq,
+            version=STATE_VERSION,
+            operations=operations,
+            durable=durable,
+            on_written=self._on_journal_written,
+            on_error=self._on_journal_error,
+        )
         for operation in decoded:
             self._apply_decoded_operation_locked(operation)
+        self._applied_seq = seq
+        self._segment_records[segment_start] = (
+            self._segment_records.get(segment_start, 0) + 1
+        )
         self._journal_records += 1
-        self._journal_bytes += len(serialized)
         self._update_compaction_due_locked()
-        if self._journal_bytes >= self._hard_compact_bytes:
-            self._compact_locked()
+        if self._compaction_due:
+            self._request_checkpoint_locked()
+
+        if durable:
+            # Preserve the durability contract without holding the global state
+            # lock across physical write/fsync.  The operation is already in the
+            # sequenced FIFO and visible in memory before another transaction can
+            # receive the next sequence number.
+            self._state_lock.release()
+            try:
+                ticket.wait()
+            finally:
+                self._state_lock.acquire()
+            self._raise_persistence_fault_locked()
 
     def _commit_operations_concurrent(
         self,
@@ -419,35 +746,8 @@ class WatchStateStore:
         *,
         durable: bool,
     ) -> None:
-        """Append without holding the state lock across the physical flush.
-
-        Task commit delta operations commute, so concurrent ArchiveTasks can queue
-        their records together and share one FlushFileBuffers/fsync barrier.
-        """
-        if not operations:
-            return
-        decoded = [self._decode_operation(operation) for operation in operations]
         with self._state_lock:
-            if not self.path.exists():
-                self._write_snapshot_locked()
-        transaction = {
-            "version": STATE_VERSION,
-            "operations": operations,
-        }
-        serialized = (
-            json.dumps(transaction, ensure_ascii=True, separators=(",", ":"))
-            + "\n"
-        ).encode("utf-8")
-        self.journal_path.parent.mkdir(parents=True, exist_ok=True)
-        with self._journal_io_gate:
-            ticket = submit_journal_append(str(self.journal_path), serialized, durable=durable)
-        ticket.wait()
-        with self._state_lock:
-            for operation in decoded:
-                self._apply_decoded_operation_locked(operation)
-            self._journal_records += 1
-            self._journal_bytes += len(serialized)
-            self._update_compaction_due_locked()
+            self._commit_operations_locked(operations, durable=durable)
 
     def _update_compaction_due_locked(self) -> None:
         self._compaction_due = (
@@ -706,12 +1006,7 @@ class WatchStateStore:
             return self.pending_work.get(_path_key(path))
 
     def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str) -> bool:
-        """Compatibility observation only; correctness no longer depends on START fsync.
-
-        New Watch extraction uses deterministic staging and a single commit-before-
-        publish barrier.  Keeping this non-durable record preserves diagnostics and
-        allows old recovery tests/state to remain readable without adding latency.
-        """
+        """Diagnostic observation; correctness no longer depends on START fsync."""
         if not task_path or not output_dir:
             return False
         with self._state_lock:
@@ -879,12 +1174,7 @@ class WatchStateStore:
         *,
         retire_paths: Iterable[str] = (),
     ) -> None:
-        """Atomically cover a USN range and retain every recovered candidate.
-
-        Once the cursor advances, these owners are the fallback if the process
-        dies before extraction.  One transaction/fsync covers the whole startup
-        batch instead of one barrier per file.
-        """
+        """Atomically cover a USN range and retain every recovered candidate."""
         with self._state_lock:
             operations: list[dict[str, Any]] = []
             for path in retire_paths:
@@ -976,17 +1266,7 @@ class WatchStateStore:
             ])
 
     def prune_missing_records(self) -> tuple[int, int]:
-        """Remove state records whose recorded filesystem paths are gone.
-
-        ``entries`` describe one concrete input file, so a missing entry path
-        makes the record stale.  A group stores only concrete paths that were
-        validated and dispatched, so it is stale when one of its already-
-        recorded physical paths is definitely gone.
-
-        Filesystem errors other than a definite missing path are treated as
-        unknown and retain the record.  This keeps a transient permission or
-        volume error from destroying retry state during startup.
-        """
+        """Remove state records whose concrete filesystem paths are gone."""
         with self._state_lock:
             entry_keys = [
                 key
@@ -1239,6 +1519,7 @@ class WatchStateStore:
             attempt_count=(previous.attempt_count if previous else 0) + (1 if increment_attempt else 0),
             updated_at=time.time(),
         )
+
 
 def _path_key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
