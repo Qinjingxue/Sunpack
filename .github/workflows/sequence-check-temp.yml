@@ -11,16 +11,23 @@ permissions:
 jobs:
   watch-state:
     runs-on: windows-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v5
       - name: Set up uv
         uses: astral-sh/setup-uv@v6
         with:
           version: "0.12.0"
-      - name: Install Python test dependencies
+      - name: Install development dependencies
         shell: pwsh
-        run: uv sync --locked --extra test
+        run: uv sync --locked --extra dev
+      - name: Build and install sunpack_native
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\maturin.exe build --manifest-path native\sunpack_native\Cargo.toml --release --target-dir .cache\rust-target\x64 --out build\native-wheels-dev
+          $wheel = Get-ChildItem build\native-wheels-dev\sunpack_native-*.whl | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1 -ExpandProperty FullName
+          uv pip uninstall --python .\.venv\Scripts\python.exe sunpack-native
+          uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
       - name: Compile modified modules
         shell: pwsh
         run: .\.venv\Scripts\python.exe -m py_compile sunpack\filesystem\watcher\state.py sunpack\filesystem\watcher\journal_commit.py tests\unit\test_watch_state.py
