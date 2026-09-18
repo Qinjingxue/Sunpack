@@ -216,6 +216,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 
 | 字段 | 默认 | 说明 |
 | --- | ---: | --- |
+| `process_mode` | `normal` | 持续 Watch 的 RuntimeHost 与 native worker 的 Windows 进程调度模式。`normal` 保持正常调度；`background` 启用 Windows Background Processing Mode，会降低 CPU、I/O 和内存调度优先级，在系统有负载或异构核心 CPU 上可能显著降低吞吐。 |
 | `cold_start_seconds` | `0.0` | 文件首次进入活跃态时的等待时间。默认值为 0，文件准备好后可立即处理。 |
 | `quiet_min_seconds` | `0.0` | 动态静默时间下限。 |
 | `quiet_max_seconds` | `180.0` | 动态静默时间上限；`cold_start_seconds` 为 0 时不进入动态静默等待。 |
