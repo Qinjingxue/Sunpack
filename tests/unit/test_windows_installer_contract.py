@@ -515,12 +515,27 @@ def test_installer_smoke_uses_process_exit_code_for_started_processes():
         script.index("function Invoke-Checked {"):
         script.index("function Invoke-UninstallerChecked {")
     ]
+    invoke_uninstaller = script[
+        script.index("function Invoke-UninstallerChecked {"):
+        script.index("function Wait-UninstallCompletion {")
+    ]
 
-    assert "Start-Process" in invoke_checked
-    assert "-PassThru" in invoke_checked
-    assert "\n        -Wait `" not in invoke_checked
-    assert ".WaitForExit(" in invoke_checked
-    assert "$process.ExitCode" in invoke_checked
+    assert "function Initialize-ExitCodeProbe {" in script
+    assert "GetExitCodeProcess" in script
+    assert "function Get-ChildExitCode {" in script
+    assert "$null -ne $Process.ExitCode" in script
+    assert "[SunPack.ProcessExit]::TryGetExitCode" in script
+
+    for process_runner in (invoke_checked, invoke_uninstaller):
+        assert "Start-Process" in process_runner
+        assert "-PassThru" in process_runner
+        assert "\n        -Wait `" not in process_runner
+        assert "$processHandle = $process.Handle" in process_runner
+        assert ".WaitForExit(" in process_runner
+        assert "Get-ChildExitCode -Process $process -ProcessHandle $processHandle" in process_runner
+
+    assert "Command exit code is unavailable on this PowerShell host" in invoke_checked
+    assert "Uninstaller exit code is unavailable on this PowerShell host" in invoke_uninstaller
     assert "Command timed out after $TimeoutSeconds seconds" in invoke_checked
     assert "after #23 an upgrade intentionally restores a persistent" in invoke_checked
     assert "Write-SmokePhase" in script
