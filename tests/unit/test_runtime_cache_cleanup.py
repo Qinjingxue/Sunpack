@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from sunpack.cli.runtime_host import RuntimeHost
 from sunpack.contracts.archive_knowledge import ArchiveKnowledge
+import sunpack.filesystem.watcher.scheduler as watcher_scheduler
 from sunpack.filesystem.watcher.scheduler import WatchScheduler
 from sunpack.passwords.relation_prober import _shared_attempt_cache, clear_relation_probe_cache
 from sunpack.support.archive_knowledge_projection import (
@@ -94,8 +95,10 @@ class _StatsCleanupEngine(_CleanupOnlyEngine):
         return {"before": before, "cleared": cleared, "after": after}
 
 
-def test_watch_deadline_clears_only_after_idle_window(tmp_path):
+def test_watch_deadline_clears_only_after_idle_window(tmp_path, monkeypatch):
     engine = _CleanupOnlyEngine()
+    trims = []
+    monkeypatch.setattr(watcher_scheduler, "trim_working_set", lambda: trims.append(True) or True)
     watcher = WatchScheduler(
         {
             "watch": {
@@ -117,6 +120,7 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
     watcher._cache_cleanup_deadline = 0
     _TEST_LOOP.run_until_complete(watcher._maybe_clear_idle_caches())
     assert engine.clear_calls == 1
+    assert trims == [True]
     assert watcher._cache_cleanup_deadline is None
 
     watcher._arm_idle_cache_cleanup()
@@ -125,6 +129,7 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
     watcher._pending["busy"] = object()
     _TEST_LOOP.run_until_complete(watcher._maybe_clear_idle_caches())
     assert engine.clear_calls == 1
+    assert trims == [True]
 
 
 def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
