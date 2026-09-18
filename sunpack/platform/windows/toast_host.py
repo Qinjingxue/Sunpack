@@ -14,13 +14,68 @@ from sunpack.support.process_executable import current_process_executable
 from sunpack.support.resources import get_toast_library_path
 
 
-def _activation_command() -> tuple[str, str]:
+_TOAST_APP_ID_KEY = r"Software\Classes\AppUserModelId\SunPack.Watch.Toast"
+
+
+def _runtime_argv(argument: str) -> list[str]:
     if getattr(sys, "frozen", False) or "__compiled__" in globals():
-        return str(current_process_executable()), "--toast-activated"
-    # COM must be able to activate the main program in source runs as well.
+        return [str(current_process_executable()), argument]
     executable = current_process_executable().with_name("pythonw.exe")
     script = Path(__file__).resolve().parents[3] / "sunpack.py"
-    return str(executable), subprocess.list2cmdline([str(script), "--toast-activated"])
+    return [str(executable), str(script), argument]
+
+
+def _activation_command() -> tuple[str, str]:
+    argv = _runtime_argv("--toast-activated")
+    return argv[0], subprocess.list2cmdline(argv[1:])
+
+
+def _remove_current_user_toast_identity() -> None:
+    import winreg
+
+    try:
+        winreg.DeleteKey(winreg.HKEY_CURRENT_USER, _TOAST_APP_ID_KEY)
+    except FileNotFoundError:
+        pass
+
+
+def _wait_process(process, *, timeout: float = 30.0) -> int:
+    try:
+        try:
+            exit_code = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            exit_code = None
+        if exit_code is None:
+            try:
+                process.terminate()
+                process.wait(timeout=5.0)
+            except Exception:
+                pass
+            raise OSError("current-user Toast cleanup timed out")
+        if int(exit_code) != 0:
+            raise OSError(f"current-user Toast cleanup failed with exit code {int(exit_code)}")
+        return int(exit_code)
+    finally:
+        close = getattr(process, "close", None)
+        if callable(close):
+            close()
+
+
+def _unregister_toast() -> None:
+    from sunpack.platform.windows.elevation import is_process_elevated
+
+    if not is_process_elevated():
+        _remove_current_user_toast_identity()
+        return
+
+    library = _load_library()
+    _check_hresult(library.sunpack_toast_unregister())
+
+    from sunpack.platform.windows.process_launch import launch_unelevated
+
+    argv = _runtime_argv("--unregister-toast")
+    process = launch_unelevated(argv, cwd=str(current_process_executable().parent))
+    _wait_process(process)
 
 
 def _check_hresult(result: int) -> None:
@@ -80,11 +135,13 @@ class _NativeToastPresenter:
 def handle_toast_argv(argv: list[str]) -> int | None:
     if not argv or argv[0] not in {"--register-toast", "--unregister-toast", "--toast-activated"}:
         return None
+    if argv[0] == "--unregister-toast":
+        _unregister_toast()
+        return 0
+
     library = _load_library()
     if argv[0] == "--register-toast":
         result = library.sunpack_toast_register(*_activation_command())
-    elif argv[0] == "--unregister-toast":
-        result = library.sunpack_toast_unregister()
     else:
         result = library.sunpack_toast_activate()
     _check_hresult(result)
