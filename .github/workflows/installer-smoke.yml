@@ -1,0 +1,74 @@
+name: Windows installer smoke regression
+
+on:
+  pull_request:
+    paths:
+      - "installer/**"
+      - "scripts/test_windows_installer.ps1"
+      - "scripts/build_windows.ps1"
+      - "sunpack/**"
+      - "native/**"
+      - ".github/workflows/installer-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Installer smoke x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+
+      - name: Prepare native/tool environment
+        shell: pwsh
+        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -SkipAcceptanceTestTools
+
+      - name: Ensure Inno Setup compiler
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup --yes --no-progress
+          }
+
+      - name: Build Windows package
+        shell: pwsh
+        run: .\scripts\build_windows.ps1 -SkipTests -NoPause -Arch x64
+
+      - name: Smoke test Windows installer
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -LiteralPath "release" -Filter "sunpack-windows-x64-*-setup.exe" -File |
+            Select-Object -First 1
+          if (-not $installer) {
+            throw "Windows installer was not produced."
+          }
+          .\scripts\test_windows_installer.ps1 -InstallerPath $installer.FullName
