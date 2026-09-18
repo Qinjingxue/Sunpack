@@ -38,6 +38,7 @@ def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, m
 
 def test_windows_clipboard_loop_reads_current_clipboard_after_listener_registration():
     handled = []
+    cleanup = []
 
     class FakeStopEvent:
         def is_set(self):
@@ -57,17 +58,93 @@ def test_windows_clipboard_loop_reads_current_clipboard_after_listener_registrat
         def GetMessageW(self, _msg, _hwnd, _minimum, _maximum):
             return 0
 
-        def RemoveClipboardFormatListener(self, _hwnd):
+        def RemoveClipboardFormatListener(self, hwnd):
+            cleanup.append(("listener", hwnd))
             return True
 
-        def DestroyWindow(self, _hwnd):
+        def DestroyWindow(self, hwnd):
+            cleanup.append(("window", hwnd))
             return True
 
     loop = object.__new__(_WindowsClipboardLoop)
     loop.monitor = FakeMonitor()
     loop.user32 = FakeUser32()
     loop._create_window = lambda: 123
+    loop._unregister_window_class = lambda: cleanup.append(("class", loop.class_name))
+    loop.class_name = "test-class"
 
     loop.run()
 
     assert handled == ["clipboard"]
+    assert loop.monitor._hwnd is None
+    assert cleanup == [
+        ("listener", 123),
+        ("window", 123),
+        ("class", "test-class"),
+    ]
+
+
+def test_windows_clipboard_loop_does_not_create_window_after_class_registration_failure(monkeypatch):
+    create_calls = []
+
+    class FakeKernel32:
+        def GetModuleHandleW(self, _name):
+            return 1
+
+    class FakeUser32:
+        def RegisterClassW(self, _wndclass):
+            return 0
+
+        def CreateWindowExW(self, *_args):
+            create_calls.append(True)
+            return 123
+
+    loop = object.__new__(_WindowsClipboardLoop)
+    loop.monitor = object()
+    loop.user32 = FakeUser32()
+    loop.kernel32 = FakeKernel32()
+    loop.class_name = "test-class"
+    loop._wndproc_ref = None
+    loop._hinstance = None
+    loop._class_registered = False
+
+    monkeypatch.setattr(
+        clipboard_monitor_module.ctypes,
+        "WINFUNCTYPE",
+        lambda *_args: lambda callback: callback,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        clipboard_monitor_module.ctypes,
+        "cast",
+        lambda *_args: clipboard_monitor_module.ctypes.c_void_p(1),
+    )
+
+    assert loop._create_window() is None
+    assert create_calls == []
+    assert loop._wndproc_ref is None
+    assert loop._hinstance is None
+    assert loop._class_registered is False
+
+
+def test_windows_clipboard_loop_unregisters_class_before_releasing_wndproc():
+    unregister_calls = []
+
+    class FakeUser32:
+        def UnregisterClassW(self, class_name, hinstance):
+            unregister_calls.append((class_name, hinstance))
+            return True
+
+    loop = object.__new__(_WindowsClipboardLoop)
+    loop.user32 = FakeUser32()
+    loop.class_name = "test-class"
+    loop._hinstance = 7
+    loop._class_registered = True
+    loop._wndproc_ref = object()
+
+    loop._unregister_window_class()
+
+    assert unregister_calls == [("test-class", 7)]
+    assert loop._class_registered is False
+    assert loop._hinstance is None
+    assert loop._wndproc_ref is None
