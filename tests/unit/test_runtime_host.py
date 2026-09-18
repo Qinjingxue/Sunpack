@@ -163,6 +163,43 @@ def test_runtime_host_brackets_overlapping_foreground_activity(monkeypatch):
     asyncio.run(scenario())
 
 
+def test_runtime_host_releases_original_scheduler_gate_when_watch_stops_mid_request(monkeypatch):
+    activity = []
+    background_schedules = []
+
+    class FakeScheduler:
+        async def set_external_activity(self, active):
+            activity.append(active)
+
+    host = RuntimeHost()
+    scheduler = FakeScheduler()
+    host._watch_service = SimpleNamespace(scheduler=scheduler)
+    host._watch_task = SimpleNamespace(done=lambda: False)
+
+    async def set_process_mode(*, background):
+        return None
+
+    monkeypatch.setattr(host, "_set_process_mode", set_process_mode)
+    monkeypatch.setattr(host, "_schedule_background", lambda: background_schedules.append(True))
+
+    async def scenario():
+        await host.foreground_started()
+        assert activity == [True]
+
+        # watch stop clears the current service before the foreground request
+        # reaches its finally block. The same scheduler gate still must be
+        # released instead of being looked up from the now-empty host state.
+        host._watch_service = None
+        host._watch_task = None
+
+        await host.foreground_finished()
+        assert activity == [True, False]
+        assert host._foreground_scheduler is None
+        assert background_schedules == []
+
+    asyncio.run(scenario())
+
+
 def test_runtime_host_does_not_bypass_a_waiting_first_foreground(monkeypatch):
     activity = []
     background_schedules = []
