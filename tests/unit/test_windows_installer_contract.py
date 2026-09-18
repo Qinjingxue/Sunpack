@@ -216,7 +216,7 @@ def test_upgrade_restores_watch_only_when_it_was_running_before_install():
     upgrade_guard = post[post.index("if ExistingInstallation then"):]
     upgrade_guard = upgrade_guard[:upgrade_guard.index("if WizardIsTaskSelected('addtopath')")]
     assert "RestoreWatchAfterUpgrade;" in upgrade_guard
-    assert "Exit;" in upgrade_guard
+    assert "Exit;" not in upgrade_guard
 
 
 def test_upgrade_preserves_path_and_context_menu_but_applies_selected_startup_state():
