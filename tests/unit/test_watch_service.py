@@ -645,6 +645,46 @@ def test_watch_service_reload_applies_new_roots_without_restarting_tray(tmp_path
     assert service.tray is tray
 
 
+def test_watch_service_runtime_mode_reload_does_not_restart_scheduler(tmp_path, monkeypatch):
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    roots_path.write_text("", encoding="utf-8")
+    state_dir = tmp_path / ".sunpack_watch"
+    configs = iter(
+        [
+            {
+                "runtime": {"process_mode": "normal"},
+                "watch": {"state_dir": str(state_dir), "tray_enabled": False},
+            },
+            {
+                "runtime": {"process_mode": "high"},
+                "watch": {"state_dir": str(state_dir), "tray_enabled": False},
+            },
+        ]
+    )
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+    monkeypatch.setattr(service_module, "load_config", lambda: next(configs))
+    applied = []
+
+    async def config_applied(config):
+        applied.append(config["runtime"]["process_mode"])
+
+    service = WatchService(
+        engine_factory=lambda _config: FakePipelineEngine(FakeRunner),
+        config_applied_callback=config_applied,
+    )
+    scheduler_starts = []
+
+    async def start_scheduler(**kwargs):
+        scheduler_starts.append(kwargs)
+
+    monkeypatch.setattr(service, "_start_scheduler", start_scheduler)
+
+    assert _await(service.reload()) is True
+    assert scheduler_starts == []
+    assert applied == ["high"]
+    assert service.config["runtime"]["process_mode"] == "high"
+
+
 def test_watch_service_tray_only_reload_does_not_restart_scheduler(tmp_path, monkeypatch):
     roots_path = tmp_path / "sunpack_watch_roots.txt"
     root = tmp_path / "watched"
