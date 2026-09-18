@@ -106,6 +106,40 @@ def _response(direct, nested=None):
     )
 
 
+def test_generated_password_failure_defers_flatten_until_retry_completes(tmp_path, monkeypatch):
+    watcher, root, output, _sink = _watcher(tmp_path, monkeypatch)
+    outer = root / "outer.zip"
+    inner_dir = output / "outer"
+    inner_dir.mkdir()
+    inner = inner_dir / "inner.zip"
+    outer.write_bytes(b"outer")
+    inner.write_bytes(b"inner")
+    flatten_calls = []
+    monkeypatch.setattr(
+        watcher,
+        "_run_deferred_flatten",
+        lambda response: flatten_calls.append(response.request_id),
+    )
+
+    failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")
+    blocked = _response(
+        TargetRunResult(str(outer), OutcomeKind.COMPLETE_SUCCESS, output_dir=str(inner_dir)),
+        TargetRunResult(str(inner), OutcomeKind.FAILURE, error="wrong password", failure=failure),
+    )
+    blocked_result = asyncio.run(_complete(watcher, _candidate(outer), blocked))
+
+    assert blocked_result.failed == 1
+    assert flatten_calls == []
+
+    resumed = _response(
+        TargetRunResult(str(inner), OutcomeKind.COMPLETE_SUCCESS, output_dir=str(inner_dir)),
+    )
+    resumed_result = asyncio.run(_complete(watcher, _candidate(inner), resumed))
+
+    assert resumed_result.succeeded == 1
+    assert flatten_calls == ["request"]
+
+
 def test_generated_password_failure_is_anchored_to_failed_task(tmp_path, monkeypatch):
     watcher, root, output, sink = _watcher(tmp_path, monkeypatch)
     outer = root / "outer.zip"

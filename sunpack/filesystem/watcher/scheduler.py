@@ -1688,9 +1688,9 @@ class WatchScheduler:
                 status="done",
             )
             # Directory-swap flatten changes the output root identity. Retire
-            # the durable Watch publication before replacing that directory.
+            # the durable Watch publication now; cosmetic flatten waits until all
+            # retryable nested blockers have been classified below.
             self.state.complete_work_if_matches(request.candidate)
-            self._run_deferred_flatten(response)
 
         waiting_failures: list = []
         if direct_missing:
@@ -1900,6 +1900,11 @@ class WatchScheduler:
             self.log.write("failed_terminal", path=candidate.path, error=error, failures=[])
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
+
+        # Flatten is final cosmetic work for the whole recursive chain. Any
+        # password/missing-volume/other retryable nested blocker returned above
+        # without changing paths; only a fully completed chain reaches here.
+        self._run_deferred_flatten(response)
 
         self.log.write(
             "done",
