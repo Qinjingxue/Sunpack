@@ -49,11 +49,17 @@ class ReloadPlan:
     restart_scheduler: bool
     reconcile_tray: bool
     state_dir_changed: bool
+    runtime_process_mode_changed: bool
     initial_scan_roots: tuple[str, ...]
 
     @property
     def changed(self) -> bool:
-        return self.restart_scheduler or self.reconcile_tray or self.state_dir_changed
+        return (
+            self.restart_scheduler
+            or self.reconcile_tray
+            or self.state_dir_changed
+            or self.runtime_process_mode_changed
+        )
 
 
 def _acquire_watch_broker() -> None:
@@ -133,6 +139,9 @@ def _config_without_tray(config: dict) -> dict:
     if isinstance(watch, dict):
         watch.pop("tray_enabled", None)
         watch.pop("roots", None)
+    runtime = result.get("runtime")
+    if isinstance(runtime, dict):
+        runtime.pop("process_mode", None)
     return result
 
 
@@ -166,6 +175,8 @@ def _build_reload_plan(
         or _service_config_without_tray(new_service_config)
         != _service_config_without_tray(old_service_config)
     )
+    old_runtime = old_config.get("runtime") if isinstance(old_config.get("runtime"), dict) else {}
+    new_runtime = new_config.get("runtime") if isinstance(new_config.get("runtime"), dict) else {}
     return ReloadPlan(
         restart_scheduler=restart_scheduler,
         reconcile_tray=(
@@ -173,6 +184,10 @@ def _build_reload_plan(
             != _tray_signature(old_config, old_service_config)
         ),
         state_dir_changed=state_dir_changed,
+        runtime_process_mode_changed=(
+            str(old_runtime.get("process_mode") or "normal")
+            != str(new_runtime.get("process_mode") or "normal")
+        ),
         initial_scan_roots=scan_roots,
     )
 
@@ -375,6 +390,7 @@ class WatchService:
         tray_factory=None,
         group_coordinator_factory=None,
         toast_manager_factory=None,
+        config_applied_callback=None,
     ):
         if engine_factory is None and pipeline_engine is None:
             raise ValueError("WatchService requires an engine_factory.")
@@ -383,6 +399,7 @@ class WatchService:
         self.group_coordinator_factory = group_coordinator_factory
         self.tray_factory = tray_factory
         self.toast_manager_factory = toast_manager_factory
+        self.config_applied_callback = config_applied_callback
         self.config = load_config()
         self.service_config = service_config_from(self.config)
         self.state_dir = service_state_dir(self.config)
@@ -916,6 +933,8 @@ class WatchService:
                 )
             if plan.reconcile_tray:
                 self._reconcile_tray()
+            if plan.runtime_process_mode_changed and self.config_applied_callback is not None:
+                await self.config_applied_callback(self.config)
         except Exception as exc:
             failed_log = self.log
             self.config, self.service_config, self.state_dir, self.log = previous
@@ -939,6 +958,7 @@ class WatchService:
             roots=self.roots,
             scheduler_restarted=plan.restart_scheduler,
             tray_reconciled=plan.reconcile_tray,
+            runtime_process_mode_changed=plan.runtime_process_mode_changed,
             initial_scan_roots=list(plan.initial_scan_roots),
         )
         return True
