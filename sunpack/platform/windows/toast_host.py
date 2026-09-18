@@ -39,28 +39,6 @@ def _remove_current_user_toast_identity() -> None:
         pass
 
 
-def _wait_process(process, *, timeout: float = 30.0) -> int:
-    try:
-        try:
-            exit_code = process.wait(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            exit_code = None
-        if exit_code is None:
-            try:
-                process.terminate()
-                process.wait(timeout=5.0)
-            except Exception:
-                pass
-            raise OSError("current-user Toast cleanup timed out")
-        if int(exit_code) != 0:
-            raise OSError(f"current-user Toast cleanup failed with exit code {int(exit_code)}")
-        return int(exit_code)
-    finally:
-        close = getattr(process, "close", None)
-        if callable(close):
-            close()
-
-
 def _unregister_toast() -> None:
     from sunpack.platform.windows.elevation import is_process_elevated
 
@@ -75,7 +53,14 @@ def _unregister_toast() -> None:
 
     argv = _runtime_argv("--unregister-toast")
     process = launch_unelevated(argv, cwd=str(current_process_executable().parent))
-    _wait_process(process)
+    try:
+        exit_code = process.wait()
+        if int(exit_code) != 0:
+            raise OSError(f"current-user Toast cleanup failed with exit code {int(exit_code)}")
+    finally:
+        close = getattr(process, "close", None)
+        if callable(close):
+            close()
 
 
 def _check_hresult(result: int) -> None:
