@@ -155,6 +155,46 @@ def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
     assert wakeups == ["wake"]
 
 
+def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_path):
+    from sunpack.cli.runtime_state import set_runtime_host
+
+    async def scenario():
+        engine = _CleanupOnlyEngine()
+        watcher = WatchScheduler(
+            {
+                "watch": {
+                    "clipboard_monitor_enabled": False,
+                    "runtime_cache_cleanup_enabled": False,
+                    "runtime_cache_cleanup_idle_seconds": 10,
+                }
+            },
+            [str(tmp_path)],
+            out_dir=str(tmp_path / "out"),
+            state_path=str(tmp_path / "state.json"),
+            cold_start_seconds=0,
+            initial_scan=False,
+            pipeline_engine=engine,
+        )
+        host = RuntimeHost()
+        set_runtime_host(host)
+        try:
+            await host._set_configured_process_mode({"runtime": {"process_mode": "background"}})
+            await host.set_cli_process_mode_override("high")
+            assert host.process_mode == "high"
+
+            watcher._arm_idle_cache_cleanup()
+            watcher._cache_cleanup_deadline = 0
+            await watcher._maybe_clear_idle_caches()
+
+            assert host.process_mode == "background"
+            assert host._cli_process_mode_override is None
+            assert engine.clear_calls == 0
+        finally:
+            set_runtime_host(None)
+
+    asyncio.run(scenario())
+
+
 def test_cleanup_gate_waits_for_foreground_activity(tmp_path):
     async def scenario():
         engine = _CleanupOnlyEngine()
