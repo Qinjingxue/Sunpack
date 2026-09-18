@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 
 import json
 import os
@@ -485,6 +486,58 @@ def test_successful_watch_task_uses_direct_output_root(tmp_path, monkeypatch):
 
     assert result.succeeded == 1
     assert list((tmp_path / "out").rglob("payload.bin"))
+
+
+def test_watch_deferred_flatten_runs_after_pending_work_retirement(tmp_path, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    archive = tmp_path / "sample.zip"
+    _write_zip(archive)
+    observations = []
+
+    @contextlib.contextmanager
+    def recording_barrier(_roots, **_kwargs):
+        observations.append(("barrier", path_key(str(archive)) in watcher.state.pending_work))
+        yield
+
+    class RecordingActions:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def apply(self, **_kwargs):
+            observations.append(("flatten", path_key(str(archive)) in watcher.state.pending_work))
+            return []
+
+    monkeypatch.setattr(scheduler_module, "promotion_barrier", recording_barrier)
+    monkeypatch.setattr(scheduler_module, "PostProcessActions", RecordingActions)
+
+    class SuccessRunner:
+        recent_passwords = []
+
+        def __init__(self, config):
+            self.output_dir = Path(config["output"]["root"]) / "sample"
+            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)}, recovered_outputs=[])
+
+        def run_targets(self, paths):
+            self.output_dir.mkdir(parents=True)
+            wrapper = self.output_dir / "wrapper"
+            wrapper.mkdir()
+            (wrapper / "payload.bin").write_bytes(b"payload")
+            return _watch_summary(paths[0], OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
+
+    watcher = WatchScheduler(
+        {"watch": {"clipboard_monitor_enabled": False}},
+        [str(tmp_path)],
+        out_dir=str(tmp_path / "out"),
+        state_path=str(tmp_path / "state.json"),
+        quiet_seconds=0,
+        initial_scan=False,
+        pipeline_engine=FakePipelineEngine(SuccessRunner),
+    )
+    watcher.enqueue(str(archive))
+    result = _await(watcher.run_once())
+
+    assert result.succeeded == 1
+    assert observations == [("barrier", False), ("flatten", False)]
 
 
 def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
