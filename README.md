@@ -116,7 +116,7 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 
 ## Configuration
 
-The main configuration file is `sunpack_config.json`; there is also an advanced configuration file, `sunpack_advanced_config.json`.
+The main configuration file is `sunpack_config.json`; there is also an advanced configuration file, `sunpack_advanced_config.json`.Configuration changes are automatically hot-reloaded in watch mode, so there is no need to restart the process.
 
 The main configuration file overrides the advanced configuration for the same fields; fields can be moved manually from the advanced configuration to the main one.
 

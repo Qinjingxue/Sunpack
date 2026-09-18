@@ -116,7 +116,7 @@ Sunpack为达到最大方便性，在使用时会尝试从各处获取密码，�
 
 ## 配置
 
-主配置文件是 `sunpack_config.json`，另有高级配置`sunpack_advanced_config.json`
+主配置文件是 `sunpack_config.json`，另有高级配置`sunpack_advanced_config.json`，配置在watch模式下可自动热重载，修改配置无需重启进程
 
 主配置文件优先覆盖高级配置相同字段配置，高级配置可手动将字段移至主配置
 
