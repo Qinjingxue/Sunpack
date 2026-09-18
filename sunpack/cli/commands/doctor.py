@@ -19,7 +19,6 @@ ORDER = 60
 SUNPACK_REGISTRY_KEY = r"Software\SunPack"
 ENVIRONMENT_REGISTRY_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 SERVICE_REGISTRY_KEY = r"SYSTEM\CurrentControlSet\Services\SunPackWatchBroker"
-TOAST_APP_ID_KEY = r"Software\Classes\AppUserModelId\SunPack.Watch.Toast"
 TOAST_CLSID = "{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}"
 TOAST_LOCAL_SERVER_KEY = rf"Software\Classes\CLSID\{TOAST_CLSID}\LocalServer32"
 PATH_MARKER_NAME = "PathAddedByInstaller"
@@ -170,12 +169,9 @@ def _broker_service_check() -> dict:
 
 def _toast_registration_check() -> dict:
     try:
-        activator = _read_hklm_value(TOAST_APP_ID_KEY, "CustomActivator")
         command = _read_hklm_value(TOAST_LOCAL_SERVER_KEY)
-        if activator is None or command is None:
-            return _check("toast_registration", "fail", "machine registration is missing")
-        if str(activator).casefold() != TOAST_CLSID.casefold():
-            return _check("toast_registration", "fail", f"unexpected activator: {activator}")
+        if command is None:
+            return _check("toast_registration", "fail", "machine COM registration is missing")
         executable = current_process_executable()
         if not _text_contains_path(command, executable) or "--toast-activated" not in str(command):
             return _check("toast_registration", "fail", f"activation command is stale: {command}")

@@ -236,7 +236,6 @@ $backgroundMenuKey = "HKLM:\Software\Classes\Directory\Background\shell\SunPack"
 $startupRunKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
 $systemEnvironmentKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 $startupValueName = "SunPackWatchService"
-$toastAppIdKey = "HKLM:\Software\Classes\AppUserModelId\SunPack.Watch.Toast"
 $toastClsidKey = "HKLM:\Software\Classes\CLSID\{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}\LocalServer32"
 $serviceName = "SunPackWatchBroker"
 $userDataRoot = Join-Path $env:ProgramData "SunPack"
@@ -273,16 +272,9 @@ function Assert-SunPackStartMenu {
     }
 }
 
-function Assert-ToastRegistryIdentity {
+function Assert-ToastMachineRegistration {
     param([Parameter(Mandatory = $true)][string]$RuntimePath)
 
-    $identity = Get-ItemProperty -LiteralPath $toastAppIdKey -ErrorAction Stop
-    if ($identity.DisplayName -ne "SunPack" -or
-        $identity.IconUri -ne (Join-Path (Split-Path -Parent $RuntimePath) "sunpack.ico") -or
-        $identity.IconBackgroundColor -ne "FF0078D4" -or
-        $identity.CustomActivator -ne "{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}") {
-        throw "Toast AppUserModelId registry identity is incorrect."
-    }
     $activationCommand = [string](Get-Item -LiteralPath $toastClsidKey -ErrorAction Stop).GetValue("")
     if ($activationCommand -ne ('"{0}" --toast-activated' -f $RuntimePath)) {
         throw "Toast COM activation command is incorrect: $activationCommand"
@@ -295,7 +287,7 @@ if (Get-Service -Name $serviceName -ErrorAction SilentlyContinue) {
 if (Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName -ErrorAction SilentlyContinue) {
     throw "Installer smoke test requires a clean startup state and will not overwrite an existing Run value: $startupValueName"
 }
-foreach ($key in @($toastAppIdKey, $toastClsidKey)) {
+foreach ($key in @($toastClsidKey)) {
     if (Test-Path -LiteralPath $key) {
         throw "Installer smoke test requires a clean Toast registration state and will not overwrite: $key"
     }
@@ -378,7 +370,7 @@ try {
     if (-not (Test-Path -LiteralPath $brokerPath)) {
         throw "Installed Watch Broker executable was not found: $brokerPath"
     }
-    Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath
+    Assert-ToastMachineRegistration -RuntimePath $runtimeAppPath
     Assert-SunPackStartMenu
     $service = Get-CimInstance Win32_Service -Filter "Name='$serviceName'"
     if ($null -eq $service) {
@@ -554,7 +546,7 @@ try {
     if ($startupCommandAfterUpgrade -ne $startupCommand) {
         throw "Upgrade install changed the startup Run value: $startupCommandAfterUpgrade"
     }
-    Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath
+    Assert-ToastMachineRegistration -RuntimePath $runtimeAppPath
     Assert-SunPackStartMenu
 
     Write-SmokePhase -State "STAGE" -Label "prepare stopped-Watch upgrade"
@@ -638,7 +630,7 @@ try {
     if (Test-Path -LiteralPath $installRoot) {
         throw "Uninstaller left the application directory behind: $installRoot"
     }
-    foreach ($key in @($toastAppIdKey, $toastClsidKey)) {
+    foreach ($key in @($toastClsidKey)) {
         if (Test-Path -LiteralPath $key) {
             throw "Uninstaller left Toast registration behind: $key"
         }
@@ -687,7 +679,6 @@ try {
         $backgroundMenuKey,
         "HKLM:\Software\Classes\SunPack.FolderContextMenu",
         "HKLM:\Software\Classes\SunPack.BackgroundContextMenu",
-        $toastAppIdKey,
         (Split-Path -Parent $toastClsidKey)
     )) {
         Remove-Item -LiteralPath $key -Recurse -Force -ErrorAction SilentlyContinue

@@ -199,38 +199,35 @@ std::wstring toast_icon_path(const std::wstring& executable) {
     return (std::filesystem::path(executable).parent_path() / L"sunpack.ico").wstring();
 }
 
-void register_toast_identity(const std::wstring& executable, const std::wstring& arguments) {
-    const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
-    set_registry_string(
-        HKEY_LOCAL_MACHINE, com_path, nullptr, quote_argument(executable) + L" " + arguments
-    );
-
+void register_toast_app_identity(const std::wstring& executable) {
     const std::wstring app_id_path = toast_app_id_registry_path();
-    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"DisplayName", kToastDisplayName, REG_EXPAND_SZ);
-    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconUri", toast_icon_path(executable), REG_EXPAND_SZ);
-    set_registry_string(
-        HKEY_LOCAL_MACHINE, app_id_path, L"IconBackgroundColor", kToastIconBackgroundColor
-    );
-    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"CustomActivator", kClsidText);
+    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName", kToastDisplayName, REG_EXPAND_SZ);
+    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri", toast_icon_path(executable), REG_EXPAND_SZ);
+    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconBackgroundColor", kToastIconBackgroundColor);
+    set_registry_string(HKEY_CURRENT_USER, app_id_path, L"CustomActivator", kClsidText);
 }
 
-bool toast_identity_registered(const std::wstring& executable, const std::wstring& arguments) noexcept {
+bool toast_app_identity_registered(const std::wstring& executable) noexcept {
     try {
-        const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
         const std::wstring app_id_path = toast_app_id_registry_path();
-        return get_registry_string(HKEY_LOCAL_MACHINE, com_path, nullptr) ==
-                   quote_argument(executable) + L" " + arguments &&
-               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"DisplayName", REG_EXPAND_SZ) ==
+        return get_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName", REG_EXPAND_SZ) ==
                    kToastDisplayName &&
-               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconUri", REG_EXPAND_SZ) ==
+               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri", REG_EXPAND_SZ) ==
                    toast_icon_path(executable) &&
-               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconBackgroundColor") ==
+               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconBackgroundColor") ==
                    kToastIconBackgroundColor &&
-               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"CustomActivator") ==
+               get_registry_string(HKEY_CURRENT_USER, app_id_path, L"CustomActivator") ==
                    kClsidText;
     } catch (...) {
         return false;
     }
+}
+
+void register_toast_activator(const std::wstring& executable, const std::wstring& arguments) {
+    const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText + L"\\LocalServer32";
+    set_registry_string(
+        HKEY_LOCAL_MACHINE, com_path, nullptr, quote_argument(executable) + L" " + arguments
+    );
 }
 
 void unregister_toast_identity() noexcept {
@@ -238,7 +235,7 @@ void unregister_toast_identity() noexcept {
         const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText;
         const std::wstring app_id_path = toast_app_id_registry_path();
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, com_path.c_str());
-        RegDeleteTreeW(HKEY_LOCAL_MACHINE, app_id_path.c_str());
+        RegDeleteTreeW(HKEY_CURRENT_USER, app_id_path.c_str());
     } catch (...) {
     }
 }
@@ -864,8 +861,8 @@ HRESULT sunpack_toast_create(const wchar_t* executable, const wchar_t* arguments
     return protect([&] {
         if (!executable || !arguments) winrt::throw_hresult(E_INVALIDARG);
         auto context = std::make_unique<ToastContext>();
-        if (!toast_identity_registered(executable, arguments)) {
-            register_toast_identity(executable, arguments);
+        if (!toast_app_identity_registered(executable)) {
+            register_toast_app_identity(executable);
         }
         context->diagnostic_log_path = log_path ? log_path : L"";
         *output = context.release();
@@ -897,7 +894,7 @@ HRESULT sunpack_toast_register(const wchar_t* executable, const wchar_t* argumen
     return protect([&] {
         if (!executable || !arguments) winrt::throw_hresult(E_INVALIDARG);
         WinrtApartmentScope apartment;
-        register_toast_identity(executable, arguments);
+        register_toast_activator(executable, arguments);
     });
 }
 

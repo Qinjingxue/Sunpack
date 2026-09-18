@@ -93,8 +93,8 @@ def test_installer_registers_only_the_uninstaller_in_start_menu():
 
     smoke = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
     assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")' not in smoke
-    assert "Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath" in smoke
-    assert '$toastAppIdKey = "HKLM:' in smoke
+    assert "Assert-ToastMachineRegistration -RuntimePath $runtimeAppPath" in smoke
+    assert '$toastClsidKey = "HKLM:' in smoke
 
 
 def test_installer_owns_a_minimal_demand_start_watch_broker_service():
@@ -521,7 +521,7 @@ def test_installer_smoke_exercises_upgrade_preservation_and_full_uninstall_clean
     assert "Uninstaller left ProgramData behind" in script
     assert "Installer must not write user data into the application directory" in script
     assert "ProgramData\\SunPack does not grant the Users group modify rights" in script
-    assert '$toastAppIdKey = "HKLM:' in script
+    assert '$toastClsidKey = "HKLM:' in script
     assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")' not in script
 
 
