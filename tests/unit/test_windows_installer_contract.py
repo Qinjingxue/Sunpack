@@ -304,6 +304,7 @@ def test_uninstaller_removes_all_program_data():
     script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
 
     assert "[UninstallDelete]" in script
+    assert 'Name: "{app}"; Flags: uninsalwaysuninstall' in script
     assert 'Type: filesandordirs; Name: "{app}\\*"' in script
     assert 'Type: dirifempty; Name: "{app}"' in script
     assert 'Type: filesandordirs; Name: "{commonappdata}\\SunPack"' in script
