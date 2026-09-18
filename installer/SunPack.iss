@@ -34,7 +34,7 @@ ChangesEnvironment=yes
 ChangesAssociations=yes
 CloseApplications=yes
 RestartApplications=no
-UsePreviousAppDir=no
+UsePreviousAppDir=yes
 UsePreviousTasks=yes
 UsedUserAreasWarning=no
 
