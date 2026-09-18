@@ -368,6 +368,29 @@ def test_windows_build_runs_installer_smoke_after_installer_creation():
     assert installer_ready < smoke_step < smoke_invoke < success
 
 
+def test_windows_build_always_pauses_at_exit_unless_no_pause():
+    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+
+    assert "function Wait-BeforeBuildExit {" in build_script
+    assert "if ($NoPause) {" in build_script
+    assert 'Write-Host "Press Enter to exit..." -ForegroundColor Cyan' in build_script
+    assert "$null = Read-Host" in build_script
+    assert "Never let the pause path hide the original build failure." in build_script
+    assert (
+        "if (-not $NoPause -and -not [Console]::IsInputRedirected "
+        "-and -not [Console]::IsOutputRedirected)"
+    ) not in build_script
+
+    main_try = build_script.index(
+        "try {\n$repoRoot = Split-Path -Parent "
+        "(Split-Path -Parent $MyInvocation.MyCommand.Path)"
+    )
+    success = build_script.index('Write-Host "Build completed successfully."')
+    final_pause = build_script.rindex("} finally {\n    Wait-BeforeBuildExit\n}")
+
+    assert main_try < success < final_pause
+
+
 def test_local_build_requires_inno_setup():
     build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 
