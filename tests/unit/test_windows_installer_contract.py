@@ -15,7 +15,15 @@ def test_installer_is_machine_wide_and_owns_only_its_machine_path_entry():
     assert "RegQueryDWordValue" in script
     assert "EnvironmentRegistryKey = 'SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment'" in script
     assert "Result := RegWriteDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, 1);" in script
-    assert "HKCU" not in script
+
+    add_path = script[script.index("function AddMachinePath: Boolean;"):]
+    add_path = add_path[:add_path.index("\nprocedure RemoveMachinePath")]
+    remove_path = script[script.index("procedure RemoveMachinePath"):]
+    remove_path = remove_path[:remove_path.index("\nfunction PowerShellSingleQuotedString")]
+    assert "HKCU" not in add_path
+    assert "HKCU" not in remove_path
+    assert "HKLM" in add_path
+    assert "HKLM" in remove_path
 
 
 def test_installer_registers_and_unregisters_context_menu():
@@ -215,7 +223,8 @@ def test_upgrade_restores_watch_only_when_it_was_running_before_install():
     post = post[:post.index("procedure CurUninstallStepChanged")]
     upgrade_guard = post[post.index("if ExistingInstallation then"):]
     upgrade_guard = upgrade_guard[:upgrade_guard.index("if WizardIsTaskSelected('addtopath')")]
-    assert "RestoreWatchAfterUpgrade;" in upgrade_guard
+    assert "if ExistingInstallation then\n      RestoreWatchAfterUpgrade" in upgrade_guard
+    assert upgrade_guard.index("RestoreWatchAfterUpgrade") < upgrade_guard.index("else")
     assert "Exit;" not in upgrade_guard
 
 
