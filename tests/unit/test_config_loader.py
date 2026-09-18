@@ -58,20 +58,36 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     simple = tmp_path / "sunpack_config.json"
     advanced = tmp_path / "sunpack_advanced_config.json"
     payload = _advanced_payload()
+    payload["watch"] = {"process_mode": "background"}
     payload["filesystem"]["scan_filters"] = [{"name": "size_range", "enabled": True, "range": "r >= 1 MB"}]
     _write_json(advanced, payload)
     _write_json(simple, {
         "cli": {"language": "zh"},
+        "watch": {"process_mode": "normal"},
         "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "range": "r >= 2 MB"}]},
         "performance": {"worker": {"initial_active_jobs": 3}},
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     config = loader.load_config()
     assert config["cli"]["language"] == "zh"
+    assert config["watch"]["process_mode"] == "normal"
     assert config["filesystem"]["directory_scan_mode"] == "recursive"
     assert config["filesystem"]["scan_filters"][0]["range"] == "r >= 2 MB"
     assert config["performance"]["worker"]["watchdog_no_progress_timeout_seconds"] == 180
     assert config["performance"]["worker"]["initial_active_jobs"] == 3
+
+def test_load_config_rejects_invalid_watch_process_mode(tmp_path, monkeypatch):
+    simple = tmp_path / "sunpack_config.json"
+    advanced = tmp_path / "sunpack_advanced_config.json"
+    payload = _advanced_payload()
+    payload["watch"] = {"process_mode": "turbo"}
+    _write_json(advanced, payload)
+    _write_json(simple, {})
+    monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
+
+    with pytest.raises(loader.ConfigError, match="watch.process_mode"):
+        loader.load_config()
+
 
 
 def test_load_config_uses_explicit_request_cwd(tmp_path, monkeypatch):
