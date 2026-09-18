@@ -231,7 +231,7 @@ struct FlattenStats {
 /// One flatten transaction: replace the output root directory object with the
 /// deepest single-child directory.  The payload tree moves as one namespace
 /// object, so cost depends on wrapper depth rather than direct child count.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FlattenPhase {
     Prepared,
     Detached,
