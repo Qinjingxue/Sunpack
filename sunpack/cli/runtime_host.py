@@ -263,6 +263,8 @@ class RuntimeHost:
                 scheduler = service.scheduler if service is not None else None
                 if scheduler is not None:
                     await scheduler.set_external_activity(False)
+                else:
+                    await self.expire_cli_process_mode_override()
         self.log_event("foreground_finished", foreground_requests=self._foreground_requests)
 
     @property
