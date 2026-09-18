@@ -1813,6 +1813,18 @@ class WatchScheduler:
         ]
         failed = list(getattr(summary, "failed_tasks", []) or [])
 
+        # Flatten is final cosmetic work once no future retry depends on the
+        # current recursive paths. Terminal nested failures do not own a retry
+        # anchor, so they must not strand an otherwise successful outer output
+        # in its pre-flatten layout.
+        should_flatten = (
+            direct_outcome == OutcomeKind.COMPLETE_SUCCESS
+            and not direct_missing
+            and not recorded_password_failures
+        )
+        if should_flatten:
+            self._run_deferred_flatten(response)
+
         if terminal_failures:
             payloads = [_failure_to_dict(failure) for failure in terminal_failures]
             terminal_errors = []
@@ -1900,11 +1912,6 @@ class WatchScheduler:
             self.log.write("failed_terminal", path=candidate.path, error=error, failures=[])
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
-
-        # Flatten is final cosmetic work for the whole recursive chain. Any
-        # password/missing-volume/other retryable nested blocker returned above
-        # without changing paths; only a fully completed chain reaches here.
-        self._run_deferred_flatten(response)
 
         self.log.write(
             "done",

@@ -210,6 +210,12 @@ def test_password_retry_can_advance_to_the_next_generated_task(tmp_path, monkeyp
 
 def test_generated_missing_volume_is_terminal_and_not_suspended(tmp_path, monkeypatch):
     watcher, root, output, sink = _watcher(tmp_path, monkeypatch)
+    flatten_calls = []
+    monkeypatch.setattr(
+        watcher,
+        "_run_deferred_flatten",
+        lambda response: flatten_calls.append(response.request_id),
+    )
     outer = root / "outer.zip"
     inner_dir = output / "outer"
     inner_dir.mkdir()
@@ -226,11 +232,18 @@ def test_generated_missing_volume_is_terminal_and_not_suspended(tmp_path, monkey
     assert result.failed == 1
     assert watcher.state.latest_entry_for_path(str(outer)) is None
     assert watcher.state.latest_entry_for_path(str(inner)) is None
+    assert flatten_calls == ["request"]
     assert [action for action, _ in sink.actions] == ["failed"]
 
 
 def test_direct_missing_volume_still_suspends_watch_input(tmp_path, monkeypatch):
     watcher, root, _output, sink = _watcher(tmp_path, monkeypatch)
+    flatten_calls = []
+    monkeypatch.setattr(
+        watcher,
+        "_run_deferred_flatten",
+        lambda response: flatten_calls.append(response.request_id),
+    )
     archive = root / "direct.7z.001"
     archive.write_bytes(b"part")
     failure = FailureInfo(FailureKind.MISSING_VOLUME, "extraction", "missing volume")
@@ -242,4 +255,5 @@ def test_direct_missing_volume_still_suspends_watch_input(tmp_path, monkeypatch)
     assert result.failed == 1
     entry = watcher.state.latest_entry_for_path(str(archive))
     assert entry is not None and entry.status == "suspended_missing_volume"
+    assert flatten_calls == []
     assert [action for action, _ in sink.actions] == ["suppressed"]
