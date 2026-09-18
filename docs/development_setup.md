@@ -226,7 +226,7 @@ Common parameters:
 .\scripts\build_windows.ps1 -Version 1.2.3
 ```
 
-The release artifact is a Windows installer. The build environment must have Inno Setup 6 installed; when `ISCC.exe` is missing the build fails before it starts, and the compiler path can also be given with `-InnoCompilerPath`. The build always runs packaged smoke checks and the full Windows installer lifecycle smoke test after creating the installer; `-SkipTests` skips the acceptance suite only.
+The release artifact is a Windows installer. The build environment must have Inno Setup 6 installed; when `ISCC.exe` is missing the build fails before it starts, and the compiler path can also be given with `-InnoCompilerPath`. The build runs packaged smoke checks and compiles the final installer with the real Inno Setup compiler; installer behavior is covered by static contract tests rather than a machine-state-dependent install/upgrade/uninstall E2E. `-SkipTests` skips the acceptance suite only.
 
 The build process:
 
@@ -241,7 +241,6 @@ The build process:
 9. Validate the architecture of the key PE files
 10. Run packaged CLI, bridge, and worker smoke checks
 11. Create the Windows installer with Inno Setup
-12. Run the full installer install/upgrade/uninstall smoke test
 
 Output:
 

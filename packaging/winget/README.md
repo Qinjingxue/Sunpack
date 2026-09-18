@@ -85,7 +85,7 @@ generated manifest directory (WinGet validates the complete multi-file set):
     -ManifestRoot .\packaging\winget\manifests\q\Qinjingxue\SunPack\v0.5.1
 ```
 
-Then install the same manifest in a clean Windows environment and run the
-repository's installer smoke test against the exact release installer. Submit
-only one package version and only the three manifest files to
-`microsoft/winget-pkgs`.
+The repository validates the installer through real Inno Setup compilation and
+static installer contract tests; it does not run a machine-state-dependent
+install/upgrade/uninstall smoke test. Submit only one package version and only
+the three manifest files to `microsoft/winget-pkgs`.

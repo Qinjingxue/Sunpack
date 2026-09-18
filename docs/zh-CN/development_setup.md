@@ -226,7 +226,7 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 .\scripts\build_windows.ps1 -Version 1.2.3
 ```
 
-发布产物为 Windows 安装器。构建环境必须安装 Inno Setup 6；缺少 `ISCC.exe` 时会在构建开始前失败，也可以通过 `-InnoCompilerPath` 指定编译器路径。构建在生成安装器后会始终自动运行 packaged smoke checks 和完整的 Windows 安装器安装/升级/卸载 smoke test；`-SkipTests` 只跳过 acceptance suite。
+发布产物为 Windows 安装器。构建环境必须安装 Inno Setup 6；缺少 `ISCC.exe` 时会在构建开始前失败，也可以通过 `-InnoCompilerPath` 指定编译器路径。构建会运行 packaged smoke checks，并使用真实 Inno Setup 编译器生成最终安装器；安装器行为通过静态 contract tests 校验，不再运行依赖机器状态的安装/升级/卸载 E2E。`-SkipTests` 只跳过 acceptance suite。
 
 构建过程：
 
@@ -241,7 +241,6 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 9. 校验关键 PE 文件架构
 10. 运行 packaged CLI、bridge 和 worker smoke checks
 11. 用 Inno Setup 创建 Windows 安装器
-12. 运行完整的安装器安装、升级和卸载 smoke test
 
 输出：
 

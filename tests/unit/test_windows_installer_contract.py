@@ -102,11 +102,6 @@ def test_installer_registers_only_the_uninstaller_in_start_menu():
     assert 'Name: "{commonprograms}\\SunPack\\Uninstall SunPack.lnk"' in script
     assert '[UninstallDelete]' in script
 
-    smoke = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
-    assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")' not in smoke
-    assert "Assert-ToastMachineRegistration -RuntimePath $runtimeAppPath" in smoke
-    assert '$toastClsidKey = "HKLM:' in smoke
-
 
 def test_installer_owns_a_minimal_demand_start_watch_broker_service():
     installer = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
@@ -344,52 +339,12 @@ def test_build_and_release_workflow_publish_installers_only():
     assert "$releaseZipPath" not in build_script
     assert "portable archive" not in workflow
     assert "sunpack-windows-*.zip" not in workflow
-    assert "test_windows_installer.ps1" in build_script
-    assert 'Write-Step "Running Windows installer smoke test"' in build_script
-    assert '"-InstallerPath", $releaseInstallerPath' in build_script
+    assert not (ROOT / "scripts" / "test_windows_installer.ps1").exists()
+    assert "test_windows_installer.ps1" not in build_script
+    assert 'Write-Step "Running Windows installer smoke test"' not in build_script
     assert "- name: Smoke test Windows installer" not in workflow
     assert "Expected one Windows installer" in workflow
     assert "*-setup.exe" in workflow
-
-
-def test_windows_build_runs_installer_smoke_after_installer_creation():
-    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
-
-    installer_ready = build_script.index(
-        'Assert-PathExists -LiteralPath $releaseInstallerPath -Description "Windows installer"'
-    )
-    smoke_step = build_script.index('Write-Step "Running Windows installer smoke test"')
-    smoke_invoke = build_script.index(
-        '"-InstallerPath", $releaseInstallerPath',
-        smoke_step,
-    )
-    success = build_script.index('Write-Host "Build completed successfully."')
-
-    assert installer_ready < smoke_step < smoke_invoke < success
-
-
-def test_local_build_skips_installer_smoke_only_for_existing_host_install_state():
-    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
-    smoke_script = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
-
-    assert '$installerSmokeArguments += "-SkipIfHostInstalled"' in build_script
-    assert '$env:CI' in build_script
-    assert '$env:GITHUB_ACTIONS' in build_script
-    assert "if (-not $runningInCi) {" in build_script
-
-    assert "[switch]$SkipIfHostInstalled" in smoke_script
-    assert "function Get-InstalledSunPackHostState {" in smoke_script
-    assert 'Get-Service -Name "SunPackWatchBroker"' in smoke_script
-    assert '"SunPackWatchService"' in smoke_script
-    assert (
-        "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
-        "{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1"
-    ) in smoke_script
-    assert "Skipping Windows installer smoke test because this machine already has SunPack installation state" in smoke_script
-
-    preflight = smoke_script.index("if ($SkipIfHostInstalled) {")
-    elevation = smoke_script.index('. (Join-Path $PSScriptRoot "test_elevation.ps1")')
-    assert preflight < elevation
 
 
 def test_windows_build_always_pauses_at_exit_unless_no_pause():
@@ -417,22 +372,6 @@ def test_windows_build_always_pauses_at_exit_unless_no_pause():
     success_pause = build_script.rindex("\nWait-BeforeBuildExit\n")
 
     assert main_try < success < catch_block < failure_pause < rethrow < success_pause
-
-
-def test_installer_smoke_failure_pauses_before_rethrow():
-    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
-
-    smoke = build_script.index('Write-Step "Running Windows installer smoke test"')
-    invoke = build_script.index(
-        '"-InstallerPath", $releaseInstallerPath',
-        smoke,
-    )
-    catch_block = build_script.rindex("} catch {\n    Write-Host \"\"")
-    failure_message = build_script.index('Write-Host ("Build failed: {0}"', catch_block)
-    pause = build_script.index("Wait-BeforeBuildExit", failure_message)
-    rethrow = build_script.index("\n    throw\n", pause)
-
-    assert smoke < invoke < catch_block < failure_message < pause < rethrow
 
 
 def test_local_build_requires_inno_setup():
@@ -509,44 +448,6 @@ def test_windows_native_smoke_checks_follow_current_embedded_scan_api():
         assert "'scan_directory_entries'" not in script, path
 
 
-def test_installer_smoke_uses_process_exit_code_for_started_processes():
-    script = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
-    invoke_checked = script[
-        script.index("function Invoke-Checked {"):
-        script.index("function Invoke-UninstallerChecked {")
-    ]
-    invoke_uninstaller = script[
-        script.index("function Invoke-UninstallerChecked {"):
-        script.index("function Wait-UninstallCompletion {")
-    ]
-
-    assert "function Initialize-ExitCodeProbe {" in script
-    assert "GetExitCodeProcess" in script
-    assert "function Get-ChildExitCode {" in script
-    assert "$null -ne $Process.ExitCode" in script
-    assert "[SunPack.ProcessExit]::TryGetExitCode" in script
-
-    for process_runner in (invoke_checked, invoke_uninstaller):
-        assert "Start-Process" in process_runner
-        assert "-PassThru" in process_runner
-        assert "\n        -Wait `" not in process_runner
-        assert "$processHandle = $process.Handle" in process_runner
-        assert ".WaitForExit(" in process_runner
-        assert "Get-ChildExitCode -Process $process -ProcessHandle $processHandle" in process_runner
-
-    assert "Command exit code is unavailable on this PowerShell host" in invoke_checked
-    assert "Uninstaller exit code is unavailable on this PowerShell host" in invoke_uninstaller
-    assert "Command timed out after $TimeoutSeconds seconds" in invoke_checked
-    assert "after #23 an upgrade intentionally restores a persistent" in invoke_checked
-    assert "Write-SmokePhase" in script
-    assert "running-Watch upgrade install" in script
-    assert "stopped-Watch upgrade install" in script
-    assert "Invoke-UninstallerChecked" in script
-    assert "entire descendant tree" in script
-    assert "Wait-UninstallCompletion -InstallRoot $installRoot -ServiceName $serviceName" in script
-    assert "Command failed with exit code" in script
-
-
 def test_acceptance_runs_watch_suites_in_current_powershell():
     acceptance = (ROOT / "run_acceptance_tests.ps1").read_text(encoding="utf-8")
 
@@ -571,7 +472,7 @@ def test_acceptance_test_steps_run_through_unelevated_runner():
     assert "run_unelevated_process.py" in acceptance
 
 
-def test_packaged_smoke_tests_shutdown_the_persistent_runtime_before_installer_test():
+def test_packaged_smoke_tests_shutdown_the_persistent_runtime_after_checks():
     build = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 
     smoke = build.index('Write-Step "Running packaged smoke tests"')
@@ -598,50 +499,6 @@ def test_elevated_test_failures_are_persisted_and_replayed():
     assert "Elevated test process failed. Diagnostic log:" in helper
     assert "Get-Content -LiteralPath $diagnosticPath" in helper
     assert "The elevated process did not produce its diagnostic log." in helper
-
-
-def test_installer_smoke_exercises_upgrade_preservation_and_full_uninstall_cleanup():
-    script = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
-
-    assert "Assert-SunPackStartMenu" in script
-    assert "Installer Start menu entries should contain only the uninstaller" in script
-    assert "Uninstaller left a Start menu shortcut behind" in script
-    assert 'Join-Path $userDataRoot "builtin_passwords.txt"' in script
-    assert 'Join-Path $userDataRoot ".sunpack_watch"' in script
-    assert 'Join-Path $userDataRoot "sunpack_config.json"' in script
-    assert '$userDataRoot = Join-Path $env:ProgramData "SunPack"' in script
-    assert "LOCALAPPDATA" not in script
-    assert "Upgrade install lost the existing builtin password entry" in script
-    assert "Upgrade install overwrote the existing program data config file" in script
-    assert "Upgrade install changed the startup Run value" in script
-    assert "Upgrade install removed the machine PATH entry" in script
-    assert "Upgrade install removed a context menu key" in script
-    assert "Upgrade install changed the context menu command" in script
-    assert "Upgrade install left stale application data behind" in script
-    assert "Installer smoke precondition failed: Watch is not running before the upgrade." in script
-    assert "Upgrade install removed the durable Watch state directory" in script
-    assert "Upgrade install did not restore the Watch instance that was running before upgrade." in script
-    assert "Invoke-UnelevatedJson" in script
-    assert "Invoke-UnelevatedChecked" in script
-    assert '$startupMatch.Groups["RuntimeIdentity"].Value' in script
-    assert 'Invoke-Checked -Label "initial persistent shutdown" -TimeoutSeconds 45 -FilePath $appPath -Arguments @("--persistent-shutdown")' in script
-    assert "Packaged runtime did not exit before the startup cold-start test" in script
-    assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @($runtimeIdentity, "watch", "start")' in script
-    assert "Write-DiagnosticLogTail" in script
-    assert '"runtime-$runtimeIdValue.state.events.jsonl"' in script
-    assert '".sunpack_watch\\events.jsonl"' in script
-    assert "run_unelevated_process.py" in script
-    assert "Upgrade install left stale configuration data behind" in script
-    assert '$staleRuntimeMarker = Join-Path $staleDataDir "stale.json"' in script
-    assert "if (Test-Path -LiteralPath $staleRuntimeMarker)" in script
-    assert "if (Test-Path -LiteralPath $staleDataDir)" not in script
-    assert "A successfully restored Watch recreates runtime-cwd/<runtime-id> by design." in script
-    assert "Set-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName" in script
-    assert "Uninstaller left ProgramData behind" in script
-    assert "Installer must not write user data into the application directory" in script
-    assert "ProgramData\\SunPack does not grant the Users group modify rights" in script
-    assert '$toastClsidKey = "HKLM:' in script
-    assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")' not in script
 
 
 def test_release_packages_copy_only_runtime_tool_files():
