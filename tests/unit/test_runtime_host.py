@@ -52,7 +52,7 @@ def test_extract_reports_watch_busy_without_starting_another_task(tmp_path):
     assert result.errors == ["该任务已由 watch 处理，请等待"]
 
 
-def test_runtime_host_applies_static_watch_process_mode(monkeypatch):
+def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
     import sunpack.cli.runtime_host as runtime_host_module
     import sunpack.cli.persistent_runtime as persistent_runtime
     import sunpack.platform.windows.process_qos as process_qos
@@ -62,14 +62,16 @@ def test_runtime_host_applies_static_watch_process_mode(monkeypatch):
     class FakeEngine:
         async def set_process_mode(self, *, mode):
             events.append(("worker_mode", mode))
+            return {"applied": True}
 
     engine = FakeEngine()
 
     class FakeService:
-        def __init__(self, *, pipeline_engine, **_kwargs):
+        def __init__(self, *, pipeline_engine, config_applied_callback=None, **_kwargs):
             assert pipeline_engine is engine
             self.scheduler = None
-            self.config = {"watch": {"process_mode": "high"}}
+            self.config = {"runtime": {"process_mode": "background"}}
+            self._config_applied_callback = config_applied_callback
             self._stop = asyncio.Event()
 
         async def run(self, *, initial_scan=False, initial_scan_roots=None):
@@ -85,7 +87,8 @@ def test_runtime_host_applies_static_watch_process_mode(monkeypatch):
             self._stop.set()
 
         async def reload(self):
-            self.config = {"watch": {"process_mode": "background"}}
+            self.config = {"runtime": {"process_mode": "normal"}}
+            await self._config_applied_callback(self.config)
             return True
 
         async def add_roots(self, paths, *, output_dir=None, initial_scan=True):
@@ -100,7 +103,7 @@ def test_runtime_host_applies_static_watch_process_mode(monkeypatch):
     monkeypatch.setattr(
         runtime_host_module,
         "load_config",
-        lambda: {"watch": {"process_mode": "high"}},
+        lambda: {"runtime": {"process_mode": "background"}},
     )
     monkeypatch.setattr(runtime_host_module, "shared_pipeline_engine", shared_engine)
     monkeypatch.setattr(runtime_host_module, "WatchService", FakeService)
@@ -112,39 +115,40 @@ def test_runtime_host_applies_static_watch_process_mode(monkeypatch):
     )
 
     async def scenario():
-        state_changes = []
-        host = RuntimeHost(state_changed=lambda: state_changes.append(host.watch_enabled))
-        started = await host.start_watch(tray_enabled=False, initial_scan=True)
-        assert started["started"] is True
-        assert host.watch_enabled is True
+        host = RuntimeHost()
+        await host.start_watch(tray_enabled=False)
+        assert host.process_mode == "background"
+
+        await host.set_cli_process_mode_override("high")
+        assert host.process_mode == "high"
 
         assert (await host.reload_watch())["reloaded"] is True
-        assert (await host.add_watch_roots(["C:/second"], initial_scan=True))["added"] == ["C:/second"]
-        assert (await host.remove_watch_roots(["C:/second"]))["removed"] == ["C:/second"]
+        assert host._configured_process_mode == "normal"
+        assert host.process_mode == "high"
 
         before_foreground = list(events)
         await host.foreground_started()
         await host.foreground_finished()
         assert events == before_foreground
 
-        stopped = await host.stop_watch()
-        assert stopped["stopped"] is True
-        assert host.watch_enabled is False
-        assert host._process_mode == "background"
-        await host.close()
-        assert True in state_changes
-        assert state_changes[-1] is False
+        assert await host.expire_cli_process_mode_override() is True
+        assert host.process_mode == "normal"
+        assert await host.expire_cli_process_mode_override() is False
+
+        await host.stop_watch()
+        assert host.process_mode == "normal"
 
     asyncio.run(scenario())
     assert [event for event in events if event[0] == "worker_mode"] == [
-        ("worker_mode", "high"),
         ("worker_mode", "background"),
+        ("worker_mode", "high"),
+        ("worker_mode", "normal"),
     ]
     assert [event for event in events if event[0] == "host_mode"] == [
-        ("host_mode", "high"),
         ("host_mode", "background"),
+        ("host_mode", "high"),
+        ("host_mode", "normal"),
     ]
-
 
 def test_runtime_host_brackets_overlapping_foreground_activity():
     activity = []
