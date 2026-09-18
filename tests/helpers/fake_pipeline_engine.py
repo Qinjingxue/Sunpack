@@ -39,8 +39,8 @@ class FakePipelineEngine:
     def reconfigure_request(self, config):
         self.config = dict(config)
 
-    async def set_process_mode(self, *, background):
-        self.background = bool(background)
+    async def set_process_mode(self, *, mode):
+        self.process_mode = str(mode)
 
     async def clear_runtime_caches(self):
         return {"fake": True}
