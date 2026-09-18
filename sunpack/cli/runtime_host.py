@@ -290,6 +290,8 @@ class RuntimeHost:
         return True
 
     async def sync_process_mode_to_engine(self, engine) -> None:
+        if self._process_mode == "normal":
+            return
         try:
             await engine.set_process_mode(mode=self._process_mode)
         except Exception:
