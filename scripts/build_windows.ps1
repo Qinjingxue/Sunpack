@@ -28,7 +28,14 @@ function Wait-BeforeBuildExit {
         return
     }
     Write-Host ""
-    Write-Host "Press Enter to exit..." -ForegroundColor Cyan
+    Write-Host "Press any key to exit..." -ForegroundColor Cyan
+    try {
+        if (-not [Console]::IsInputRedirected) {
+            $null = [Console]::ReadKey($true)
+            return
+        }
+    } catch {
+    }
     try {
         $null = Read-Host
     } catch {
@@ -1196,8 +1203,12 @@ Write-Host "Build completed successfully." -ForegroundColor Green
 Write-Host "Version: $versionValue"
 Write-Host "App directory: $distAppRoot"
 Write-Host "Windows installer: $releaseInstallerPath"
-
-} finally {
+} catch {
+    Write-Host ""
+    Write-Host ("Build failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
     Wait-BeforeBuildExit
+    throw
 }
+
+Wait-BeforeBuildExit
 
