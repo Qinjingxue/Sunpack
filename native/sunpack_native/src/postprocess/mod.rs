@@ -64,7 +64,11 @@ pub(crate) fn flatten_single_branch_directories(
     }
 
     let mut stats = FlattenStats::default();
-    flatten_single_branch_chain(&base_path, &mut stats);
+    // The rename chain is pure filesystem work, and every rename publishes a
+    // directory change the watch scheduler has to consume.  Release the GIL for
+    // the loop (as delete_files_batch already does) so those two can overlap
+    // instead of serializing on the interpreter lock.
+    py.detach(|| flatten_single_branch_chain(&base_path, &mut stats));
     result.set_item("moved", stats.moved)?;
     result.set_item("removed_dirs", stats.removed_dirs)?;
     result.set_item("errors", PyList::new(py, stats.errors)?)?;

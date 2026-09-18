@@ -40,6 +40,10 @@ python -m benchmarks extraction worker-resource-pressure --modes cpu,io,memory -
 python -m benchmarks watch real-file C:\path\to\R3961.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-r3961.json
 python -m benchmarks watch arrival-matrix C:\path\to\R3961.jpg --quiet-values 0,1.25 --runs 2 --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-arrival-matrix.json
 python -m benchmarks watch split-arrival C:\path\to\archive.7z.001 C:\path\to\archive.7z.002 C:\path\to\archive.7z.003 C:\path\to\archive.7z.004 --quiet-values 0,1.25 --chunk-mib 4 --chunk-delay-ms 50 --json-out benchmarks/results/watch-split-arrival.json
+python -m benchmarks watch format-matrix --runs 3 --warmups 1 --json-out benchmarks/results/watch-format-matrix.json
+python -m benchmarks watch format-matrix --formats 7z,zip,rar --variants plain,encrypted --workloads many_small --runs 3
+# A/B the post-extract flatten stage (post_extract.flatten_single_directory) on real outputs
+python -m benchmarks watch format-matrix --formats zip,rar,tar,7z --flatten-modes on,off --runs 1
 python -m benchmarks extraction split-pressure --profile acceptance --strict
 python -m benchmarks memory residual-rss
 python -m benchmarks memory many-tasks --python-rounds 5 --worker-rounds 3 --json-out benchmarks/results/memory-growth.json
@@ -117,6 +121,33 @@ The reusable harness in `benchmarks/harness` defines the common wall/CPU clocks,
 RSS/Private Bytes process-tree memory sampling, real-archive workspace lifecycle, and
 versioned JSON report envelope. New scenarios must use those components instead of
 adding another local timer, memory sampler, or temporary-directory policy.
+
+`watch format-matrix` measures the internal stages of the production watch path
+(`WatchScheduler` -> `PipelineEngine`) for every generated archive format. It reuses the
+format-matrix corpus builder, so ZIP, 7z, split 7z, RAR, split RAR, TAR, gzip, bzip2, xz,
+zstd and the compressed-TAR aliases all arrive through the same watched directory, and it
+instruments every submitted request with the same `RequestRuntimeProfiler` that
+`extraction large-archive-profile` uses. Variants reproduce the input shapes the product
+must handle: `plain`, `disguised` (`.jpg` extension), `carrier`
+(`[garbage][archive][garbage]`), `encrypted` (real encryption with wrong password
+candidates first, so password resolution is measured), and `nested` (an archive inside an
+archive, so the recursive pass runs inside one watch request). Split formats only run
+`plain`, because renaming or re-wrapping individual volumes changes the volume chain
+itself; every skipped case is recorded with its reason.
+
+Per case the report keeps the wall-clock arrival view (`feed`, `feed_to_first_processing`,
+`post_feed_to_completion`, `case_wall`), the terminal outcome, and the full per-stage
+breakdown (`stage_seconds`, `stage_seconds_by_request`) plus a `headline_seconds` rollup
+whose columns are printed as a table: pipeline run, planning, batch execute, extract,
+verify, output scan, and native worker time. `aggregates` holds the median of every stage
+per `workload:format:variant` case. A successful request clears its watch-state entry, so
+the terminal outcome is taken from the completed pipeline reply and the durable state
+statuses are reported separately as informational `state_statuses`/`blocked_statuses`.
+`--flatten-modes on,off` repeats every case with `post_extract.flatten_single_directory`
+forced on or off, which isolates the post-extract flatten stage from extraction itself.
+Rounds alternate case order to avoid thermal and ordering bias, `--warmups` samples are
+recorded but excluded from `aggregates`, and every case has its own `--timeout` so one
+stuck format cannot consume the whole scenario budget.
 
 `extraction sevenzip-worker-matrix` measures the native persistent
 `sunpack_sevenzip_worker.exe` directly. It reuses the format-matrix corpus builder,
