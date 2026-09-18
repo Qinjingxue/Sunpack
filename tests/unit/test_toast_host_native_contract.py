@@ -49,7 +49,8 @@ def test_native_toast_identity_uses_current_user_and_keeps_machine_com_activator
     assert 'get_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri"' in source
     assert 'register_toast_app_identity(HKEY_LOCAL_MACHINE' not in source
     assert 'register_toast_activator(executable, arguments);' in source
-    assert 'RegDeleteTreeW(HKEY_CURRENT_USER, app_id_path.c_str())' in source
+    assert 'RegDeleteTreeW(HKEY_LOCAL_MACHINE, com_path.c_str())' in source
+    assert 'RegDeleteTreeW(HKEY_CURRENT_USER, app_id_path.c_str())' not in source
     assert "IShellLinkW" not in source
     assert "PKEY_AppUserModel_ID" not in source
     assert "PKEY_AppUserModel_ToastActivatorCLSID" not in source

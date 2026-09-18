@@ -230,12 +230,10 @@ void register_toast_activator(const std::wstring& executable, const std::wstring
     );
 }
 
-void unregister_toast_identity() noexcept {
+void unregister_toast_activator() noexcept {
     try {
         const std::wstring com_path = std::wstring(L"Software\\Classes\\CLSID\\") + kClsidText;
-        const std::wstring app_id_path = toast_app_id_registry_path();
         RegDeleteTreeW(HKEY_LOCAL_MACHINE, com_path.c_str());
-        RegDeleteTreeW(HKEY_CURRENT_USER, app_id_path.c_str());
     } catch (...) {
     }
 }
@@ -899,7 +897,7 @@ HRESULT sunpack_toast_register(const wchar_t* executable, const wchar_t* argumen
 }
 
 HRESULT sunpack_toast_unregister() noexcept {
-    return protect([] { unregister_toast_identity(); });
+    return protect([] { unregister_toast_activator(); });
 }
 
 HRESULT sunpack_toast_activate() noexcept {
