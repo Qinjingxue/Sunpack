@@ -63,14 +63,14 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     _write_json(advanced, payload)
     _write_json(simple, {
         "cli": {"language": "zh"},
-        "watch": {"process_mode": "normal"},
+        "watch": {"process_mode": "high"},
         "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "range": "r >= 2 MB"}]},
         "performance": {"worker": {"initial_active_jobs": 3}},
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     config = loader.load_config()
     assert config["cli"]["language"] == "zh"
-    assert config["watch"]["process_mode"] == "normal"
+    assert config["watch"]["process_mode"] == "high"
     assert config["filesystem"]["directory_scan_mode"] == "recursive"
     assert config["filesystem"]["scan_filters"][0]["range"] == "r >= 2 MB"
     assert config["performance"]["worker"]["watchdog_no_progress_timeout_seconds"] == 180
