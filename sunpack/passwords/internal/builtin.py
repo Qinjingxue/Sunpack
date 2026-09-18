@@ -27,8 +27,7 @@ def get_builtin_passwords() -> list[str]:
         return list(DEFAULT_BUILTIN_PASSWORDS)
 
     try:
-        text = read_task_text(builtin_path, encoding="utf-8")
-        passwords = _parse_builtin_passwords(text)
+        passwords = read_builtin_password_file(builtin_path)
     except Exception:
         return list(DEFAULT_BUILTIN_PASSWORDS)
     return passwords or list(DEFAULT_BUILTIN_PASSWORDS)
@@ -36,6 +35,10 @@ def get_builtin_passwords() -> list[str]:
 
 def builtin_password_path() -> Path:
     return get_resource_path("builtin_passwords.txt")
+
+
+def read_builtin_password_file(path: str | Path) -> list[str]:
+    return _parse_builtin_passwords(read_task_text(Path(path), encoding="utf-8"))
 
 
 def merge_watch_clipboard_passwords(passwords: list[str], *, max_entries: int = 30) -> bool:
