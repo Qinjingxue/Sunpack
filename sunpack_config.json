@@ -3,7 +3,7 @@
     "language": "zh"
   },
   "runtime": {
-    "process_mode": "normal"
+    "process_mode": "high"
   },
   "recursive_extract": "*",
   "nested_extraction_policy": {

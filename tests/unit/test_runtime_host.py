@@ -66,10 +66,14 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
 
     engine = FakeEngine()
 
+    class FakeScheduler:
+        async def set_external_activity(self, active):
+            events.append(("activity", active))
+
     class FakeService:
         def __init__(self, *, pipeline_engine, config_applied_callback=None, **_kwargs):
             assert pipeline_engine is engine
-            self.scheduler = None
+            self.scheduler = FakeScheduler()
             self.config = {"runtime": {"process_mode": "background"}}
             self._config_applied_callback = config_applied_callback
             self._stop = asyncio.Event()
@@ -126,10 +130,18 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
         assert host._configured_process_mode == "normal"
         assert host.process_mode == "high"
 
-        before_foreground = list(events)
+        qos_before_foreground = [
+            event for event in events if event[0] in {"worker_mode", "host_mode"}
+        ]
         await host.foreground_started()
         await host.foreground_finished()
-        assert events == before_foreground
+        assert [
+            event for event in events if event[0] in {"worker_mode", "host_mode"}
+        ] == qos_before_foreground
+        assert [event for event in events if event[0] == "activity"] == [
+            ("activity", True),
+            ("activity", False),
+        ]
 
         assert await host.expire_cli_process_mode_override() is True
         assert host.process_mode == "normal"
@@ -149,6 +161,48 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
         ("host_mode", "high"),
         ("host_mode", "normal"),
     ]
+
+def test_runtime_host_without_watch_scheduler_expires_cli_override_on_foreground_finish(monkeypatch):
+    import sunpack.cli.persistent_runtime as persistent_runtime
+    import sunpack.platform.windows.process_qos as process_qos
+
+    modes = []
+
+    class FakeEngine:
+        async def set_process_mode(self, *, mode):
+            modes.append(("worker", mode))
+            return {"applied": True}
+
+    engine = FakeEngine()
+    monkeypatch.setattr(persistent_runtime, "current_pipeline_engine", lambda: engine)
+    monkeypatch.setattr(
+        process_qos,
+        "set_processing_mode",
+        lambda *, mode: modes.append(("host", mode)),
+    )
+
+    async def scenario():
+        host = RuntimeHost()
+        host._watch_service = SimpleNamespace(scheduler=None)
+        host._watch_task = SimpleNamespace(done=lambda: False)
+        await host._set_configured_process_mode({"runtime": {"process_mode": "normal"}})
+        await host.set_cli_process_mode_override("high")
+        assert host.process_mode == "high"
+
+        await host.foreground_started()
+        await host.foreground_finished()
+
+        assert host._cli_process_mode_override is None
+        assert host.process_mode == "normal"
+
+    asyncio.run(scenario())
+    assert modes == [
+        ("worker", "high"),
+        ("host", "high"),
+        ("worker", "normal"),
+        ("host", "normal"),
+    ]
+
 
 def test_runtime_host_brackets_overlapping_foreground_activity():
     activity = []
