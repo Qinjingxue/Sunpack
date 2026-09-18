@@ -2,6 +2,9 @@
   "cli": {
     "language": "zh"
   },
+  "watch": {
+    "process_mode": "normal"
+  },
   "recursive_extract": "*",
   "nested_extraction_policy": {
     "enabled": true,
