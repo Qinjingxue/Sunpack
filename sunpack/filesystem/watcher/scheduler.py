@@ -58,6 +58,7 @@ from sunpack.filesystem.watcher.scanner import _candidate_for as _watch_candidat
 from sunpack.filesystem.watcher.state import WatchStateEntry, WatchStateStore
 from sunpack.filesystem.watcher.toast import NullWatchNotificationSink
 from sunpack.i18n import I18nContext
+from sunpack.platform.windows.process_qos import trim_working_set
 from sunpack.passwords.internal import builtin as builtin_passwords_module
 from sunpack.passwords.internal.builtin import get_builtin_passwords
 from sunpack.passwords.internal.clipboard_monitor import ClipboardPasswordMonitor
@@ -1001,6 +1002,8 @@ class WatchScheduler:
                 elapsed_seconds=time.perf_counter() - started,
                 report=report,
             )
+            if not report.get("skipped"):
+                trim_working_set()
 
     def enqueue(
         self,
