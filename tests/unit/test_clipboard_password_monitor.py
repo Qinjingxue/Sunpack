@@ -8,7 +8,12 @@ from sunpack.passwords.internal.clipboard_monitor import _WindowsClipboardLoop
 
 def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, monkeypatch):
     builtin_path = tmp_path / "builtin_passwords.txt"
-    builtin_path.write_text("existing\n", encoding="utf-8")
+    builtin_path.write_text(
+        "existing\n"
+        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN}\n"
+        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_END}\n",
+        encoding="utf-8",
+    )
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     single_line_calls = []
 
@@ -148,3 +153,33 @@ def test_windows_clipboard_loop_unregisters_class_before_releasing_wndproc():
     assert loop._class_registered is False
     assert loop._hinstance is None
     assert loop._wndproc_ref is None
+
+
+def test_clipboard_monitor_rejects_internal_multiline_text(tmp_path, monkeypatch):
+    import sunpack.passwords.internal.clipboard as clipboard_module
+
+    builtin_path = tmp_path / "builtin_passwords.txt"
+    original = (
+        "existing\n"
+        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN}\n"
+        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_END}\n"
+    )
+    builtin_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
+    monkeypatch.setattr(
+        clipboard_module,
+        "_read_windows_unicode_clipboard",
+        lambda *, max_chars: "first line\nsecond line",
+    )
+
+    notifications = []
+    monitor = ClipboardPasswordMonitor(
+        on_passwords_changed=notifications.append,
+        max_entries=30,
+        enabled=True,
+    )
+
+    monitor._handle_clipboard_update()
+
+    assert builtin_path.read_text(encoding="utf-8") == original
+    assert notifications == []
