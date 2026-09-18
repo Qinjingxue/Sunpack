@@ -216,6 +216,7 @@ Automatic concurrency is driven mainly by the throughput of actual writes, compl
 
 | Field | Default | Description |
 | --- | ---: | --- |
+| `process_mode` | `normal` | Windows process scheduling mode for the continuous Watch host and native worker. `normal` keeps normal scheduling; `background` enables Windows Background Processing Mode, which lowers CPU, I/O, and memory scheduling priority and may significantly reduce throughput under load or on heterogeneous-core CPUs. |
 | `cold_start_seconds` | `0.0` | Wait time when a file first becomes active. The default is 0, so a file can be processed as soon as it is ready. |
 | `quiet_min_seconds` | `0.0` | Lower bound of the dynamic quiet time. |
 | `quiet_max_seconds` | `180.0` | Upper bound of the dynamic quiet time; when `cold_start_seconds` is 0, no dynamic quiet wait is entered. |
