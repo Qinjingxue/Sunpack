@@ -109,7 +109,7 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 
 ### Low background resource usage
 
-- Manages cache lifetimes well and automatically releases useless caches after processing files. All components together typically occupy less than 30 MB of active working-set memory while idle in the background.
+- Manages cache lifetimes well and automatically releases useless caches after processing files.
 - Uses purely event notifications while the system is idle; an idle background process consumes no CPU on polling.
 
 ---
