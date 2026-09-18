@@ -52,11 +52,7 @@ def set_processing_mode(*, mode: str) -> str:
                 return "unavailable"
 
             if _MODE == "background":
-                if not set_priority_class(process, PROCESS_MODE_BACKGROUND_END):
-                    return "unavailable"
-                _MODE = "normal"
-                if normalized == "normal":
-                    return "normal"
+                set_priority_class(process, PROCESS_MODE_BACKGROUND_END)
 
             requested = HIGH_PRIORITY_CLASS if normalized == "high" else NORMAL_PRIORITY_CLASS
             if set_priority_class(process, requested):
