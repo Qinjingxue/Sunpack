@@ -149,6 +149,7 @@ class CliBasicTests(unittest.TestCase):
         self.assertIn("--out-dir", result.stdout)
         self.assertIn("--write-manifest", result.stdout)
         self.assertIn("--direct-file", result.stdout)
+        self.assertIn("--process-mode", result.stdout)
         self.assertNotIn("--min-size", result.stdout)
 
     def test_extract_direct_file_bypasses_initial_scan(self):
@@ -248,6 +249,7 @@ class CliBasicTests(unittest.TestCase):
         self.assertIn("start", result.stdout)
         self.assertIn("list", result.stdout)
         self.assertIn("startup", result.stdout)
+        self.assertNotIn("--process-mode", result.stdout)
 
     def test_passwords_help_only_shows_password_relevant_options(self):
         result = run_cli("passwords", "-h")
