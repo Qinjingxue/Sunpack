@@ -3,11 +3,11 @@ from tests.helpers.detection_config import with_detection_pipeline
 
 
 def test_filename_only_scan_does_not_absorb_unmarked_fuzzy_parts(tmp_path):
-    first = tmp_path / "rj081295.7z.001"
-    normal_2 = tmp_path / "rj081295"
-    normal_3 = tmp_path / "rj081295.7z"
-    fuzzy_4 = tmp_path / "95.7z.005"
-    fuzzy_5 = tmp_path / "rj0815.7"
+    first = tmp_path / "sample123456.7z.001"
+    normal_2 = tmp_path / "sample123456"
+    normal_3 = tmp_path / "sample123456.7z"
+    fuzzy_4 = tmp_path / "56.7z.005"
+    fuzzy_5 = tmp_path / "sample1234.7"
 
     for path in (first, normal_2, normal_3, fuzzy_4, fuzzy_5):
         path.write_bytes(b"7z\xbc\xaf\x27\x1c" + b"x" * (1024 * 1024))

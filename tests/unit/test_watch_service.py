@@ -1153,7 +1153,7 @@ def test_watch_service_scheduler_never_recurses(tmp_path, monkeypatch):
 
     assert captured["roots"] == [str(watch_root.resolve())]
     assert "recursive" not in captured["kwargs"]
-    assert captured["kwargs"]["quiet_seconds"] == 0.0
+    assert captured["kwargs"]["cold_start_seconds"] == 0.0
     assert service.scheduler.recursive is False
     assert captured["started"] is True
 

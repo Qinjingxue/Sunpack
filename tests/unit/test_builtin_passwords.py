@@ -76,18 +76,3 @@ def test_builtin_parser_preserves_hash_prefixed_and_surrounding_space_passwords(
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
 
     assert builtin_module.get_builtin_passwords() == ["#secret", " password ", "   "]
-
-
-def test_builtin_parser_ignores_known_legacy_generated_metadata(tmp_path, monkeypatch):
-    builtin_path = tmp_path / "builtin_passwords.txt"
-    builtin_path.write_text(
-        "# 此文件为内置高频密码配置表，用户可自行编辑，每行一个密码。\n"
-        "user-secret\n"
-        "# BEGIN SUNPACK WATCH CLIPBOARD PASSWORDS\n"
-        "old-clip\n"
-        "# END SUNPACK WATCH CLIPBOARD PASSWORDS\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-
-    assert builtin_module.get_builtin_passwords() == ["user-secret", "old-clip"]

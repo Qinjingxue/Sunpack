@@ -88,22 +88,13 @@ def test_installer_registers_only_the_uninstaller_in_start_menu():
         'Filename: "{uninstallexe}"\n'
     )
 
-    assert 'Name: "{userprograms}\\SunPack\\SunPack Command Prompt.lnk"' in script
-    assert 'Name: "{userprograms}\\SunPack\\Uninstall SunPack.lnk"' in script
-    assert 'Name: "{userprograms}\\SunPack\\SunPack Watch Notifications.lnk"' in script
-    assert 'Name: "{commonprograms}\\SunPack\\SunPack Command Prompt.lnk"' in script
     assert 'Name: "{commonprograms}\\SunPack\\Uninstall SunPack.lnk"' in script
-    assert 'Name: "{userprograms}\\SunPack\\sunpack.exe.lnk"' in script
-    assert 'Name: "{userprograms}\\sunpack.exe.lnk"' in script
-    assert 'Name: "{commonprograms}\\SunPack\\sunpack.exe.lnk"' in script
-    assert 'Name: "{commonprograms}\\sunpack.exe.lnk"' in script
     assert '[UninstallDelete]' in script
 
     smoke = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
     assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @("--register-toast")' not in smoke
     assert "Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath" in smoke
     assert '$toastAppIdKey = "HKLM:' in smoke
-    assert 'foreach ($name in @("SunPack Watch Notifications.lnk"' in smoke
 
 
 def test_installer_owns_a_minimal_demand_start_watch_broker_service():
@@ -580,9 +571,6 @@ def test_installer_seeds_localized_editable_text_files_without_overwriting_exist
     assert "WatchClipboardBlockBegin = '#!SUNPACK-WATCH-CLIPBOARD-BEGIN';" in script
     assert "WatchClipboardBlockEnd = '#!SUNPACK-WATCH-CLIPBOARD-END';" in script
     assert "LoadStringFromFile(FilePath, Contents)" in script
-    assert "LegacyWatchClipboardBlockBeginEn" in script
-    assert "LegacyWatchClipboardBlockBeginZh" in script
-    assert "StringChangeEx(Contents, LegacyWatchClipboardBlockBeginEn, WatchClipboardBlockBegin, True)" in script
     assert "english.WatchRootsFileHeader=# Watched folders. Add one folder per line." in script
     assert "chinesesimplified.WatchRootsFileHeader=# 监控文件夹配置，每行填写一个监控目录。" in script
     assert "english.WatchRootsFileMapping=# Optional output mapping: input folder | output folder" in script

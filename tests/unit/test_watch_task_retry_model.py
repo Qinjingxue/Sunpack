@@ -58,7 +58,7 @@ def _watcher(tmp_path, monkeypatch):
         [str(root)],
         output_roots={str(root): str(output)},
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(_Runner),
         notification_sink=sink,

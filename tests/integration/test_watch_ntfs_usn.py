@@ -29,7 +29,7 @@ def _watch_broker_lease():
         sunpack_native.watch_broker_release()
 
 
-def _watcher(root: Path, *, quiet_seconds: float = 0.05) -> WatchScheduler:
+def _watcher(root: Path, *, cold_start_seconds: float = 0.05) -> WatchScheduler:
     return WatchScheduler(
         {
             "watch": {
@@ -41,7 +41,7 @@ def _watcher(root: Path, *, quiet_seconds: float = 0.05) -> WatchScheduler:
         [str(root)],
         out_dir=str(root / "out"),
         state_path=str(root / ".watch-state" / "state.json"),
-        quiet_seconds=quiet_seconds,
+        cold_start_seconds=cold_start_seconds,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(lambda _config: None),
     )

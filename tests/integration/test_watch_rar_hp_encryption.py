@@ -118,7 +118,7 @@ def test_watch_single_hp_rar_extracts_with_correct_password(tmp_path):
         async with PipelineEngine(config) as delegate:
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), quiet_seconds=0,
+                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=delegate,
                 group_coordinator=WatchGroupCoordinator(config),
             )
@@ -145,7 +145,7 @@ def test_watch_single_hp_rar_reports_wrong_password_without_hanging(tmp_path):
         async with PipelineEngine(config) as delegate:
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), quiet_seconds=0,
+                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=delegate,
                 group_coordinator=WatchGroupCoordinator(config),
             )
@@ -174,7 +174,7 @@ def test_watch_split_hp_rar_extracts_with_correct_password(tmp_path):
         async with PipelineEngine(config) as delegate:
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), quiet_seconds=0,
+                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=delegate,
                 group_coordinator=WatchGroupCoordinator(config),
             )
@@ -205,7 +205,7 @@ def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path)
         async with PipelineEngine(config) as delegate:
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), quiet_seconds=0,
+                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=delegate,
                 group_coordinator=WatchGroupCoordinator(config),
             )

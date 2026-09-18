@@ -4,27 +4,8 @@ import math
 
 import pytest
 
-from sunpack.config.fields.watch import normalize_watch_config
 from sunpack.filesystem.watcher.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
 from tests.helpers.watch_write_simulator import WriteScenario, representative_write_scenarios, simulate_writes
-
-
-def test_watch_quiet_config_migrates_legacy_cold_start_without_clamping_dynamic_floor():
-    config = normalize_watch_config(
-        {"quiet_seconds": 5, "quiet_min_seconds": 8, "quiet_max_seconds": 3}
-    )
-
-    assert config["cold_start_seconds"] == 5
-    assert config["quiet_min_seconds"] == 8
-    assert config["quiet_max_seconds"] == 8
-    assert "quiet_seconds" not in config
-
-
-def test_explicit_cold_start_takes_precedence_over_legacy_alias():
-    config = normalize_watch_config({"quiet_seconds": 5, "cold_start_seconds": 1})
-
-    assert config["cold_start_seconds"] == 1
-    assert config["boundary_confirmation_seconds"] == 0.5
 
 
 def test_policy_starts_below_dynamic_floor_then_corrects_after_first_interval():

@@ -105,8 +105,8 @@ def test_task_metadata_cache_survives_scanner_instance_change(tmp_path):
 
 def test_unicode_path_extra_field_takes_precedence_over_codepage_guess(tmp_path):
     archive = tmp_path / "unicode-extra.zip"
-    raw_name = "【びよびよ研究室】ケイ.psd".encode("cp932")
-    expected_name = "【びよびよ研究室】ケイ.psd"
+    raw_name = "【サンプル】テスト素材.psd".encode("cp932")
+    expected_name = "【サンプル】テスト素材.psd"
     _write_stored_zip(archive, raw_name, b"payload", unicode_name=expected_name)
 
     result = ArchiveMetadataScanner().scan(str(archive))

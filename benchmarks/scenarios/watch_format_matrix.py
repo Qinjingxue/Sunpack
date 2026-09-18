@@ -399,7 +399,7 @@ async def _run_case(
     workspace: BenchmarkWorkspace,
     *,
     label: str,
-    quiet_seconds: float,
+    cold_start_seconds: float,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     root = workspace.work / label / "watch"
@@ -445,7 +445,7 @@ async def _run_case(
             # land in the watch directory itself, exactly like production watch.
             out_dir=".",
             state_path=str(state_path),
-            quiet_seconds=quiet_seconds,
+            cold_start_seconds=cold_start_seconds,
             initial_scan=False,
             pipeline_engine=engine,
             group_coordinator=WatchGroupCoordinator(config),
@@ -753,7 +753,7 @@ def main() -> int:
                         feed,
                         workspace,
                         label=label,
-                        quiet_seconds=args.quiet_seconds,
+                        cold_start_seconds=args.quiet_seconds,
                         timeout_seconds=args.timeout,
                     ))
                 sample["round"] = round_index

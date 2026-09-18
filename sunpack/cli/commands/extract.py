@@ -20,7 +20,7 @@ from sunpack.cli.cli_runtime import (
 )
 from sunpack.cli.cli_types import CliCommandResult
 from sunpack.cli.persistent_runtime import load_request_config, pipeline_engine
-from sunpack.contracts.failures import FailureInfo, FailureKind
+from sunpack.contracts.failures import FailureInfo
 from sunpack.contracts.retry_targets import (
     merge_latest_results,
     password_retry_paths,
@@ -160,9 +160,6 @@ async def handle(args, ctx):
             for item in list(getattr(summary, "cleanup_results", []) or []):
                 cleanup_results_by_path[os.path.normcase(os.path.abspath(item.path))] = item
             retry_targets = [path for path in password_retry_paths(summary) if os.path.exists(path)]
-            if not retry_targets and _has_retryable_password_failure(failures):
-                # Compatibility for lightweight summaries without target_results.
-                retry_targets = [path for path in current_targets if os.path.exists(path)]
             attempts.append({
                 "success_count": summary.success_count,
                 "failed_count": len(failed_tasks),
@@ -304,13 +301,6 @@ def _extract_run_config(
 
 def has_password_failure(failures: list[FailureInfo]) -> bool:
     return any(failure.is_password_failure for failure in failures)
-
-
-def _has_retryable_password_failure(failures: list[FailureInfo]) -> bool:
-    return any(
-        failure.is_password_failure and not failure.contains(FailureKind.MISSING_VOLUME)
-        for failure in failures
-    )
 
 
 def _should_retry_password_failure(args, retry_targets: list[str]) -> bool:

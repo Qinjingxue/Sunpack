@@ -29,10 +29,10 @@ from sunpack.filesystem.watcher.scheduler import WatchScheduler
 
 TESTFILES_ROOT = Path(__file__).resolve().parents[2] / "testfiles"
 DEFAULT_SOURCE_NAMES = (
-    "【びよびよ研究室】 アリス＆ケイ びよびよ 【元データ PSDファイル 】.7z.001",
-    "【びよびよ研究室】 アリス＆ケイ びよびよ 【元データ PSDファイル 】.7z.002",
-    "【びよびよ研究室】 アリス＆ケイ びよびよ 【元データ PSDファイル 】.7z.003",
-    "【びよびよ研究室】 アリス＆ケイ びよびよ 【元データ PSDファイル 】.7z.004",
+    "【サンプル】 ダミー素材 【テストデータ】.7z.001",
+    "【サンプル】 ダミー素材 【テストデータ】.7z.002",
+    "【サンプル】 ダミー素材 【テストデータ】.7z.003",
+    "【サンプル】 ダミー素材 【テストデータ】.7z.004",
 )
 DEFAULT_MODES = (
     "shuffle_rename",
@@ -334,7 +334,7 @@ async def _run_case(
     run_index: int,
     label: str,
     mode: str,
-    quiet_seconds: float,
+    cold_start_seconds: float,
     chunk_size: int,
     delay_seconds: float,
     timeout_seconds: float,
@@ -371,7 +371,7 @@ async def _run_case(
             [str(root)],
             out_dir=".",
             state_path=str(state_path),
-            quiet_seconds=quiet_seconds,
+            cold_start_seconds=cold_start_seconds,
             initial_scan=False,
             pipeline_engine=engine,
             group_coordinator=WatchGroupCoordinator(config),
@@ -406,8 +406,8 @@ async def _run_case(
         return {
             "run_index": run_index,
             "mode": mode,
-            "quiet_seconds_argument": quiet_seconds,
-            "cold_start_seconds": quiet_seconds,
+            "quiet_seconds_argument": cold_start_seconds,
+            "cold_start_seconds": cold_start_seconds,
             "configured_quiet_min_seconds": float(config["watch"].get("quiet_min_seconds", 1.25)),
             "sources": [{"name": path.name, "bytes": path.stat().st_size} for path in sources],
             "arrival_order": timings.get("arrival_order", []),
@@ -488,7 +488,7 @@ def main() -> int:
                         run_index=run_index,
                         label=label,
                         mode=mode,
-                        quiet_seconds=quiet_seconds,
+                        cold_start_seconds=quiet_seconds,
                         chunk_size=chunk_size,
                         delay_seconds=delay_seconds,
                         timeout_seconds=args.timeout,

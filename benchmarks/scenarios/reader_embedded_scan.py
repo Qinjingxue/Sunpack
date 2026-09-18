@@ -25,7 +25,7 @@ from benchmarks.harness import (
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-DEFAULT_SAMPLE = REPO_ROOT / "testfiles" / "R243V1.mp4"
+DEFAULT_SAMPLE = REPO_ROOT / "testfiles" / "sample.mp4"
 SCENARIO = "reader.embedded-scan"
 
 

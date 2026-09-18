@@ -236,10 +236,6 @@ class WatchStateStore:
             f"{self.path.stem}.journal.{int(start_seq):020d}.jsonl"
         )
 
-    @property
-    def _legacy_journal_path(self) -> Path:
-        return self.path.with_name(f"{self.path.stem}.journal.jsonl")
-
     def _journal_paths(self) -> list[Path]:
         prefix = f"{self.path.stem}.journal."
         suffix = ".jsonl"
@@ -341,10 +337,6 @@ class WatchStateStore:
                 _reset_sequence(self.path, 1)
                 return
 
-            try:
-                self._legacy_journal_path.unlink()
-            except FileNotFoundError:
-                pass
             self._load_journal_segments_locked()
             self._active_segment_start = _seed_sequence(self.path, self._applied_seq)
             self._update_compaction_due_locked()
@@ -442,7 +434,7 @@ class WatchStateStore:
 
     def _discard_incompatible_state_locked(self) -> None:
         self._reset_memory_locked()
-        for path in [self.path, self._legacy_journal_path, *self._journal_paths()]:
+        for path in [self.path, *self._journal_paths()]:
             try:
                 path.unlink()
             except FileNotFoundError:

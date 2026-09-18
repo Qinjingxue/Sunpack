@@ -107,7 +107,7 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=engine,
     )
@@ -140,7 +140,7 @@ def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=_CleanupOnlyEngine(),
         wake_callback=lambda: wakeups.append("wake"),
@@ -169,7 +169,7 @@ def test_cleanup_gate_waits_for_foreground_activity(tmp_path):
             [str(tmp_path)],
             out_dir=str(tmp_path / "out"),
             state_path=str(tmp_path / "state.json"),
-            quiet_seconds=0,
+            cold_start_seconds=0,
             initial_scan=False,
             pipeline_engine=engine,
         )
@@ -202,7 +202,7 @@ def test_external_activity_waits_for_cleanup_already_in_progress(tmp_path):
             [str(tmp_path)],
             out_dir=str(tmp_path / "out"),
             state_path=str(tmp_path / "state.json"),
-            quiet_seconds=0,
+            cold_start_seconds=0,
             initial_scan=False,
             pipeline_engine=engine,
         )
@@ -238,7 +238,7 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path, monkeyp
             [str(tmp_path)],
             out_dir=str(tmp_path / "out"),
             state_path=str(tmp_path / "state.json"),
-            quiet_seconds=0,
+            cold_start_seconds=0,
             initial_scan=False,
             pipeline_engine=engine,
         )

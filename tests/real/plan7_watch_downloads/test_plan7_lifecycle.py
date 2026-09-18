@@ -45,7 +45,7 @@ def test_plan7_existing_file_initial_scan_and_quiet_window(tmp_path):
         tmp_path,
         "initial_scan",
         passwords=[*wrong_password_list(), PASSWORD],
-        quiet_seconds=0.05,
+        cold_start_seconds=0.05,
         initial_scan=True,
     )
     try:

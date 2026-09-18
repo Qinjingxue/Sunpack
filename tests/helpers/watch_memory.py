@@ -177,7 +177,7 @@ class WatchMemoryHarness:
         config: dict[str, Any],
         *,
         label: str = "watch-memory",
-        quiet_seconds: float = 0.0,
+        cold_start_seconds: float = 0.0,
     ) -> "WatchMemoryHarness":
         base = root / label
         watch_root = base / "watch"
@@ -191,7 +191,7 @@ class WatchMemoryHarness:
             [str(watch_root)],
             out_dir=str(output_root),
             state_path=str(state_path),
-            quiet_seconds=quiet_seconds,
+            cold_start_seconds=cold_start_seconds,
             initial_scan=False,
             pipeline_engine=engine,
             group_coordinator=WatchGroupCoordinator(config),

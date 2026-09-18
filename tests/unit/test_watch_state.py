@@ -229,8 +229,6 @@ def test_previous_state_schema_is_discarded_without_migration(tmp_path):
         json.dumps({"version": 16, "pending_work": {"legacy": {"path": "legacy"}}}),
         encoding="utf-8",
     )
-    legacy_journal = state_path.with_name("state.journal.jsonl")
-    legacy_journal.write_text('{"version":16,"operations":[]}\n', encoding="utf-8")
 
     state = WatchStateStore(str(state_path))
 
@@ -238,7 +236,6 @@ def test_previous_state_schema_is_discarded_without_migration(tmp_path):
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     assert payload["version"] == watch_state_module.STATE_VERSION
     assert payload["checkpoint_seq"] == 0
-    assert not legacy_journal.exists()
 
 
 def test_concurrent_updates_share_one_ordered_sequence(tmp_path):

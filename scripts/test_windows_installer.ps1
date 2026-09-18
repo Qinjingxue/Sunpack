@@ -231,13 +231,6 @@ function Assert-SunPackStartMenu {
     if ($installerNames.Count -ne 1 -or $installerNames[0] -ne "Uninstall SunPack.lnk") {
         throw "Installer Start menu entries should contain only the uninstaller. Entries: $($installerNames -join ', ')"
     }
-    foreach ($name in @("SunPack Watch Notifications.lnk", "SunPack Command Prompt.lnk", "sunpack.exe.lnk")) {
-        foreach ($path in @(Get-StartMenuShortcutPaths -Name $name)) {
-            if (Test-Path -LiteralPath $path) {
-                throw "Obsolete Start menu shortcut remains: $path"
-            }
-        }
-    }
 }
 
 function Assert-ToastRegistryIdentity {
@@ -598,12 +591,7 @@ try {
             throw "Uninstaller left Toast registration behind: $key"
         }
     }
-    foreach ($name in @(
-        "SunPack Watch Notifications.lnk",
-        "SunPack Command Prompt.lnk",
-        "Uninstall SunPack.lnk",
-        "sunpack.exe.lnk"
-    )) {
+    foreach ($name in @("Uninstall SunPack.lnk")) {
         foreach ($path in @(Get-StartMenuShortcutPaths -Name $name)) {
             if (Test-Path -LiteralPath $path) {
                 throw "Uninstaller left a Start menu shortcut behind: $path"

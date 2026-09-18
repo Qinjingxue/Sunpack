@@ -26,7 +26,7 @@ from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
 from sunpack.filesystem.watcher.scheduler import WatchScheduler
 
 
-DEFAULT_SOURCE = Path(__file__).resolve().parents[2] / "testfiles" / "R3961.jpg"
+DEFAULT_SOURCE = Path(__file__).resolve().parents[2] / "testfiles" / "sample.jpg"
 DEFAULT_MODES = (
     "fast_direct",
     "atomic_move",
@@ -246,7 +246,7 @@ async def _run_case(
     *,
     label: str,
     mode: str,
-    quiet_seconds: float,
+    cold_start_seconds: float,
     passwords: list[str],
     chunk_size: int,
     delay_seconds: float,
@@ -283,7 +283,7 @@ async def _run_case(
             [str(root)],
             out_dir=".",
             state_path=str(state_path),
-            quiet_seconds=quiet_seconds,
+            cold_start_seconds=cold_start_seconds,
             initial_scan=False,
             pipeline_engine=engine,
             group_coordinator=WatchGroupCoordinator(config),
@@ -314,8 +314,8 @@ async def _run_case(
         ]
         return {
             "mode": mode,
-            "quiet_seconds_argument": quiet_seconds,
-            "cold_start_seconds": quiet_seconds,
+            "quiet_seconds_argument": cold_start_seconds,
+            "cold_start_seconds": cold_start_seconds,
             "configured_quiet_min_seconds": float(config["watch"].get("quiet_min_seconds", 1.25)),
             "source_bytes": source.stat().st_size,
             "timings_seconds": {
@@ -392,7 +392,7 @@ def main() -> int:
                         workspace,
                         label=label,
                         mode=mode,
-                        quiet_seconds=quiet_seconds,
+                        cold_start_seconds=quiet_seconds,
                         passwords=passwords,
                         chunk_size=chunk_size,
                         delay_seconds=delay_seconds,

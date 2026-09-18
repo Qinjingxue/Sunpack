@@ -38,7 +38,7 @@ def _partial_summary(*failures: FailureInfo):
     )
 
 
-def _watcher(tmp_path, runner_factory, *, quiet_seconds=0) -> WatchScheduler:
+def _watcher(tmp_path, runner_factory, *, cold_start_seconds=0) -> WatchScheduler:
     root = tmp_path / "in"
     root.mkdir(exist_ok=True)
     return WatchScheduler(
@@ -46,7 +46,7 @@ def _watcher(tmp_path, runner_factory, *, quiet_seconds=0) -> WatchScheduler:
         [str(root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=quiet_seconds,
+        cold_start_seconds=cold_start_seconds,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(runner_factory),
         group_coordinator=WatchGroupCoordinator({}),
@@ -131,7 +131,7 @@ def test_watch_aligned_group_deadlines_dispatch_together_without_restarting_quie
 
     clock = _FakeClock(1000.0)
     monkeypatch.setattr(scheduler_module.time, "time", lambda: clock.value)
-    watcher = _watcher(tmp_path, Runner, quiet_seconds=1.0)
+    watcher = _watcher(tmp_path, Runner, cold_start_seconds=1.0)
     root = tmp_path / "in"
     parts = [root / f"aligned.7z.00{index}" for index in (1, 2, 3, 4)]
     for part in parts:

@@ -122,24 +122,7 @@ Name: "{commonappdata}\SunPack"; Permissions: users-modify
 Type: filesandordirs; Name: "{app}\*"
 Type: dirifempty; Name: "{app}"
 Type: filesandordirs; Name: "{commonappdata}\SunPack"
-Type: files; Name: "{userprograms}\SunPack\SunPack Watch Notifications.lnk"
-Type: filesandordirs; Name: "{commonprograms}\SunPack\SunPack Command Prompt.lnk"
 Type: files; Name: "{commonprograms}\SunPack\Uninstall SunPack.lnk"
-Type: files; Name: "{userprograms}\SunPack\sunpack.exe.lnk"
-Type: files; Name: "{userprograms}\sunpack.exe.lnk"
-Type: files; Name: "{commonprograms}\SunPack\sunpack.exe.lnk"
-Type: files; Name: "{commonprograms}\sunpack.exe.lnk"
-Type: dirifempty; Name: "{userprograms}\SunPack"
-
-[InstallDelete]
-Type: files; Name: "{userprograms}\SunPack\SunPack Command Prompt.lnk"
-Type: files; Name: "{userprograms}\SunPack\Uninstall SunPack.lnk"
-Type: files; Name: "{userprograms}\SunPack\SunPack Watch Notifications.lnk"
-Type: files; Name: "{userprograms}\SunPack\sunpack.exe.lnk"
-Type: files; Name: "{userprograms}\sunpack.exe.lnk"
-Type: files; Name: "{commonprograms}\SunPack\sunpack.exe.lnk"
-Type: files; Name: "{commonprograms}\sunpack.exe.lnk"
-Type: dirifempty; Name: "{userprograms}\SunPack"
 
 [Icons]
 Name: "{autoprograms}\SunPack\Uninstall SunPack"; Filename: "{uninstallexe}"
@@ -158,10 +141,6 @@ const
   WatchBrokerServiceName = 'SunPackWatchBroker';
   WatchClipboardBlockBegin = '#!SUNPACK-WATCH-CLIPBOARD-BEGIN';
   WatchClipboardBlockEnd = '#!SUNPACK-WATCH-CLIPBOARD-END';
-  LegacyWatchClipboardBlockBeginEn = '# BEGIN SUNPACK WATCH CLIPBOARD PASSWORDS';
-  LegacyWatchClipboardBlockEndEn = '# END SUNPACK WATCH CLIPBOARD PASSWORDS';
-  LegacyWatchClipboardBlockBeginZh = '# 开始 SUNPACK 监控剪贴板密码';
-  LegacyWatchClipboardBlockEndZh = '# 结束 SUNPACK 监控剪贴板密码';
   WatchBrokerServiceSddl = 'D:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;LCRP;;;IU)';
 
 function RunServiceControl(const Parameters: string; var ResultCode: Integer): Boolean;
@@ -666,7 +645,6 @@ var
   DataPath: string;
   FilePath: string;
   Contents: string;
-  Changed: Boolean;
 begin
   DataPath := ExpandConstant('{commonappdata}\SunPack');
   ForceDirectories(DataPath);
@@ -687,36 +665,19 @@ begin
     if not LoadStringFromFile(FilePath, Contents) then
       RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
 
-    Changed := False;
     if (Pos(WatchClipboardBlockBegin, Contents) = 0) and
        (Pos(WatchClipboardBlockEnd, Contents) = 0) then
     begin
-      if ((Pos(LegacyWatchClipboardBlockBeginEn, Contents) > 0) and
-          (Pos(LegacyWatchClipboardBlockEndEn, Contents) > 0)) or
-         ((Pos(LegacyWatchClipboardBlockBeginZh, Contents) > 0) and
-          (Pos(LegacyWatchClipboardBlockEndZh, Contents) > 0)) then
-      begin
-        StringChangeEx(Contents, LegacyWatchClipboardBlockBeginEn, WatchClipboardBlockBegin, True);
-        StringChangeEx(Contents, LegacyWatchClipboardBlockEndEn, WatchClipboardBlockEnd, True);
-        StringChangeEx(Contents, LegacyWatchClipboardBlockBeginZh, WatchClipboardBlockBegin, True);
-        StringChangeEx(Contents, LegacyWatchClipboardBlockEndZh, WatchClipboardBlockEnd, True);
-        Changed := True;
-      end
-      else
-      begin
-        if (Contents <> '') and (Copy(Contents, Length(Contents), 1) <> #10) then
-          Contents := Contents + #13#10;
-        Contents :=
-          Contents + #13#10 +
-          CustomMessage('BuiltinPasswordsWatchManagedNote') + #13#10 +
-          WatchClipboardBlockBegin + #13#10 +
-          WatchClipboardBlockEnd + #13#10;
-        Changed := True;
-      end;
+      if (Contents <> '') and (Copy(Contents, Length(Contents), 1) <> #10) then
+        Contents := Contents + #13#10;
+      Contents :=
+        Contents + #13#10 +
+        CustomMessage('BuiltinPasswordsWatchManagedNote') + #13#10 +
+        WatchClipboardBlockBegin + #13#10 +
+        WatchClipboardBlockEnd + #13#10;
+      if not SaveStringToFile(FilePath, Contents, False) then
+        RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
     end;
-
-    if Changed and not SaveStringToFile(FilePath, Contents, False) then
-      RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
   end;
 
   FilePath := AddBackslash(DataPath) + 'sunpack_watch_roots.txt';

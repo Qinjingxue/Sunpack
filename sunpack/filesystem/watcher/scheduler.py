@@ -147,7 +147,7 @@ class WatchScheduler:
         output_roots: dict[str, str] | None = None,
         out_dir: str = ".",
         state_path: str,
-        quiet_seconds: float | None = None,
+        cold_start_seconds: float | None = None,
         initial_scan: bool | None = None,
         initial_scan_roots: Iterable[str] | None = None,
         observer_stop_timeout_seconds: float | None = None,
@@ -182,13 +182,12 @@ class WatchScheduler:
         self._validate_output_roots()
         configured_cold_start = watch_config.get(
             "cold_start_seconds",
-            watch_config.get("quiet_seconds", DEFAULT_WATCH_CONFIG["cold_start_seconds"]),
+            DEFAULT_WATCH_CONFIG["cold_start_seconds"],
         )
         self.cold_start_seconds = max(
             0.0,
-            float(configured_cold_start if quiet_seconds is None else quiet_seconds),
+            float(configured_cold_start if cold_start_seconds is None else cold_start_seconds),
         )
-        self.quiet_seconds = self.cold_start_seconds
         self.recursive = False
         self.initial_scan = bool(initial_scan)
         self.initial_scan_roots = (

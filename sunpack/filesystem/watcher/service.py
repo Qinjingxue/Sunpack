@@ -660,10 +660,10 @@ class WatchService:
                 out_dir=out_dir,
                 output_roots=self.root_outputs,
                 state_path=state_path,
-                quiet_seconds=float(
+                cold_start_seconds=float(
                     watch_config.get(
                         "cold_start_seconds",
-                        watch_config.get("quiet_seconds", DEFAULT_WATCH_CONFIG["cold_start_seconds"]),
+                        DEFAULT_WATCH_CONFIG["cold_start_seconds"],
                     )
                 ),
                 initial_scan=bool(initial_scan),

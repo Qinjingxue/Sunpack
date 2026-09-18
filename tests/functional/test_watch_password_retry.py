@@ -92,7 +92,7 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), quiet_seconds=0,
+                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=engine,
             )
             watcher.enqueue(str(archive))
@@ -191,7 +191,7 @@ def test_watch_aggregates_all_zipcrypto_fast_matches(tmp_path, monkeypatch, incl
         async with PipelineEngine(config) as engine:
             watcher = WatchScheduler(
                 config, [str(watch_root)], out_dir=str(output_root),
-                state_path=str(tmp_path / "state.json"), quiet_seconds=0,
+                state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=engine,
             )
             watcher.enqueue(str(archive))

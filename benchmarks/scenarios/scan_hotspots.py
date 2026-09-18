@@ -1,9 +1,9 @@
 r"""Profile SunPack scan hot spots on large, messy directories.
 
 Examples:
-    python -m benchmarks scan hotspots C:\Users\29402\Desktop --mode filesystem --max-depth 1
-    python -m benchmarks scan hotspots C:\Users\29402\Desktop --mode candidates --rss-stop-mib 1200
-    python -m benchmarks scan hotspots C:\Users\29402\Desktop --mode full --json-out benchmarks\results\scan-hotspots.json --profile-out benchmarks\results\scan-hotspots.prof
+    python -m benchmarks scan hotspots C:\path\to\scan-root --mode filesystem --max-depth 1
+    python -m benchmarks scan hotspots C:\path\to\scan-root --mode candidates --rss-stop-mib 1200
+    python -m benchmarks scan hotspots C:\path\to\scan-root --mode full --json-out benchmarks\results\scan-hotspots.json --profile-out benchmarks\results\scan-hotspots.prof
 """
 
 from __future__ import annotations

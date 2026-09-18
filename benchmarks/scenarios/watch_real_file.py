@@ -29,7 +29,7 @@ from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
 from sunpack.filesystem.watcher.scheduler import WatchScheduler
 
 
-DEFAULT_SOURCE = Path(__file__).resolve().parents[2] / "testfiles" / "R3961.jpg"
+DEFAULT_SOURCE = Path(__file__).resolve().parents[2] / "testfiles" / "sample.jpg"
 
 
 def _now() -> float:
@@ -94,7 +94,7 @@ async def _run_once(
     workspace: BenchmarkWorkspace,
     *,
     passwords: list[str],
-    quiet_seconds: float,
+    cold_start_seconds: float,
     timeout: float,
 ) -> dict[str, Any]:
     root = workspace.work / "watch"
@@ -129,7 +129,7 @@ async def _run_once(
             # result lands in the watch directory itself.
             out_dir=".",
             state_path=str(state_path),
-            quiet_seconds=quiet_seconds,
+            cold_start_seconds=cold_start_seconds,
             initial_scan=False,
             pipeline_engine=engine,
             group_coordinator=WatchGroupCoordinator(config),
@@ -263,7 +263,7 @@ def main() -> int:
                 source,
                 workspace,
                 passwords=passwords,
-                quiet_seconds=args.quiet_seconds,
+                cold_start_seconds=args.quiet_seconds,
                 timeout=args.timeout,
             )))
         end_to_end = [row["timings_seconds"]["end_to_end_copy_start_to_completion"] for row in samples]

@@ -12,13 +12,6 @@ DEFAULT_BUILTIN_PASSWORDS = ["123456", "123", "0000", "789"]
 WATCH_CLIPBOARD_BLOCK_BEGIN = "#!SUNPACK-WATCH-CLIPBOARD-BEGIN"
 WATCH_CLIPBOARD_BLOCK_END = "#!SUNPACK-WATCH-CLIPBOARD-END"
 
-_LEGACY_WATCH_CLIPBOARD_MARKERS = {
-    "# BEGIN SUNPACK WATCH CLIPBOARD PASSWORDS",
-    "# END SUNPACK WATCH CLIPBOARD PASSWORDS",
-    "# 开始 SUNPACK 监控剪贴板密码",
-    "# 结束 SUNPACK 监控剪贴板密码",
-}
-
 
 def get_builtin_passwords() -> list[str]:
     builtin_path = builtin_password_path()
@@ -92,7 +85,6 @@ def _reserved_builtin_lines() -> set[str]:
     reserved = {
         WATCH_CLIPBOARD_BLOCK_BEGIN,
         WATCH_CLIPBOARD_BLOCK_END,
-        *_LEGACY_WATCH_CLIPBOARD_MARKERS,
     }
     for language in ("en", "zh"):
         i18n = I18nContext(language)

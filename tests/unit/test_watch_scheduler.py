@@ -192,7 +192,7 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
         [str(watch_root)],
         out_dir=".",
         state_path=str(state_path),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
     )
 
@@ -371,7 +371,7 @@ def test_watch_run_once_harvests_futures_without_waiting_for_slow_batch(tmp_path
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=engine,
     )
@@ -427,7 +427,7 @@ def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_pa
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(Runner),
     )
@@ -476,7 +476,7 @@ def test_successful_watch_task_uses_direct_output_root(tmp_path, monkeypatch):
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(SuccessRunner),
     )
@@ -518,7 +518,7 @@ def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FailureRunner),
     )
@@ -562,7 +562,7 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(SequenceRunner),
     )
@@ -606,7 +606,7 @@ def test_partial_result_is_rejected_but_direct_output_remains(tmp_path, monkeypa
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(PartialRunner),
     )
@@ -649,7 +649,7 @@ def test_content_event_during_processing_starts_a_new_active_epoch(tmp_path, mon
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(MutatingRunner),
     )
@@ -673,7 +673,7 @@ def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=engine,
         wake_callback=lambda: wakeups.append("wake"),
@@ -752,7 +752,7 @@ def test_content_event_during_processing_still_starts_new_epoch_from_latest_meta
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=engine,
     )
@@ -821,7 +821,7 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(state_path),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=True,
     )
 
@@ -851,7 +851,7 @@ def test_watch_scheduler_scans_only_requested_initial_scan_roots(tmp_path, monke
         [str(first_root), str(second_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         initial_scan_roots=[str(second_root)],
     )
@@ -919,7 +919,7 @@ def test_watch_scheduler_never_recurses_for_current_directory_scan_mode(tmp_path
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=True,
     )
 
@@ -944,7 +944,7 @@ def test_watch_scheduler_never_recurses_for_recursive_directory_scan_mode(tmp_pa
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=True,
     )
 
@@ -971,7 +971,7 @@ def test_watch_scheduler_uses_stop_timeout_without_suffix_prefilter(tmp_path, mo
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         observer_stop_timeout_seconds=1.25,
     )
@@ -1013,7 +1013,7 @@ def test_watch_scheduler_uses_filesystem_filters_for_candidates(tmp_path, monkey
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
     )
 
@@ -1084,7 +1084,7 @@ def test_watch_scheduler_reuses_filter_result_for_unchanged_pending_candidate(tm
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=30,
+        cold_start_seconds=30,
         initial_scan=False,
     )
     original_passes = watcher._passes_filesystem_filters
@@ -1119,7 +1119,7 @@ def test_event_burst_with_unchanged_usn_does_not_restart_quiet_window(tmp_path, 
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(lambda _config: SimpleNamespace(
             context=SimpleNamespace(flatten_candidates=set(), recovered_outputs=[]),
@@ -1146,7 +1146,7 @@ def test_candidate_deadline_changes_wake_watch_service(tmp_path, monkeypatch):
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=30,
+        cold_start_seconds=30,
         initial_scan=False,
         wake_callback=lambda: wakeups.append("wake"),
     )
@@ -1178,7 +1178,7 @@ def test_watch_scheduler_rechecks_filesystem_filters_before_processing(tmp_path,
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
     )
     original_passes = watcher._passes_filesystem_filters
@@ -1229,7 +1229,7 @@ def test_watch_scheduler_processes_direct_quiet_candidate_with_watch_root_common
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1267,7 +1267,7 @@ def test_watch_scheduler_sends_quiet_nonstandard_extension_to_main_pipeline(tmp_
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1302,7 +1302,7 @@ def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypat
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=10,
+        cold_start_seconds=10,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1339,7 +1339,7 @@ def test_watch_scheduler_timestamp_restore_does_not_reset_content_quiet_window(t
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=10,
+        cold_start_seconds=10,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1370,7 +1370,7 @@ def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(t
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=10,
+        cold_start_seconds=10,
         initial_scan=False,
         wake_callback=lambda: wakeups.append("wake"),
     )
@@ -1442,7 +1442,7 @@ def test_watch_scheduler_growth_resets_the_common_quiet_window(tmp_path, monkeyp
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=10,
+        cold_start_seconds=10,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1472,7 +1472,7 @@ def test_watch_scheduler_does_not_log_duplicate_pending_candidate(tmp_path, monk
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
     )
     watcher.enqueue(str(archive_path))
@@ -1503,7 +1503,7 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(NoTasksRunner),
     )
@@ -1537,7 +1537,7 @@ def test_watch_scheduler_ignores_nested_paths(tmp_path, monkeypatch):
         [str(watch_root)],
         out_dir=str(out_root),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
     )
     watcher.enqueue(str(archive_path))
@@ -1568,7 +1568,7 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
         [str(tmp_path)],
         out_dir=str(tmp_path),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1604,7 +1604,7 @@ def test_watch_scheduler_does_not_reprocess_unchanged_input_when_output_is_delet
         [str(tmp_path)],
         out_dir=".",
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1650,7 +1650,7 @@ def test_watch_scheduler_reprocesses_identical_archive_after_it_moves_out_and_ba
         [str(watch_root)],
         out_dir=".",
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1742,7 +1742,7 @@ def test_watch_scheduler_reprocesses_split_group_after_source_cleanup(tmp_path, 
         [str(watch_root)],
         out_dir=".",
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
         group_coordinator=GroupCoordinator(),
@@ -1779,7 +1779,7 @@ def test_watch_scheduler_processes_same_path_again_after_input_changes(tmp_path,
         [str(tmp_path)],
         out_dir=".",
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1803,7 +1803,7 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
         [str(tmp_path)],
         out_dir=".",
         state_path=str(state_path),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
     )
     stat = archive_path.stat()
@@ -1825,7 +1825,7 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
         [str(tmp_path)],
         out_dir=".",
         state_path=str(state_path),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1862,7 +1862,7 @@ def test_relative_output_directory_is_resolved_per_matching_watch_root(tmp_path,
         [str(first_root), str(second_root)],
         out_dir=".",
         state_path=str(first_root / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -1910,7 +1910,7 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
             str(second_root): str(second_out),
         },
         state_path=str(first_root / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(SuccessRunner),
     )
@@ -1985,7 +1985,7 @@ def test_watch_root_always_has_a_resolved_output_root(tmp_path, monkeypatch):
             out_dir=out_dir,
             output_roots=output_roots,
             state_path=str(tmp_path / "state.json"),
-            quiet_seconds=0,
+            cold_start_seconds=0,
             initial_scan=False,
         )
         return watcher.output_roots[scheduler_module.path_key(str(watch_root.resolve()))]
@@ -2015,7 +2015,7 @@ def test_watch_scheduler_initial_scan_ignores_nested_archives(tmp_path, monkeypa
         [str(tmp_path)],
         out_dir=str(tmp_path),
         state_path=str(state_path),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=True,
     )
     _await(watcher.start())
@@ -2051,7 +2051,7 @@ def test_watch_scheduler_does_not_retry_terminal_failure_for_unchanged_event(tmp
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FailingRunner),
         notification_sink=notifications,
@@ -2092,7 +2092,7 @@ def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(t
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(NestedPasswordRunner),
         notification_sink=notifications,
@@ -2133,7 +2133,7 @@ def test_unstructured_nested_missing_volume_is_terminal_without_wait_anchor(tmp_
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(NestedMissingRunner),
         notification_sink=notifications,
@@ -2181,7 +2181,7 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(InconclusiveRunner),
     )
@@ -2230,7 +2230,7 @@ def test_watch_scheduler_retries_password_failure_after_password_source_change(t
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
         notification_sink=notifications,
@@ -2272,7 +2272,7 @@ def test_password_retry_wakeup_uses_debounce_deadline_without_pending_candidate(
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         wake_callback=lambda: wakeups.append(monotonic_clock["value"]),
     )
@@ -2433,7 +2433,7 @@ def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_back
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
     )
@@ -2478,7 +2478,7 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(state_path),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(CapturingRunner),
     )
@@ -2534,7 +2534,7 @@ def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
@@ -2589,7 +2589,7 @@ def test_watch_scheduler_retries_on_builtin_password_file_watchdog_event(tmp_pat
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
@@ -2643,7 +2643,7 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(state_path),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
@@ -2655,7 +2655,7 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(state_path),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(ConfigAwareRunner),
     )
@@ -2701,7 +2701,7 @@ def test_watch_scheduler_promotes_recent_success_password_and_retries_other_fail
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(LearningRunner),
     )
@@ -2755,7 +2755,7 @@ def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path,
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
     )
@@ -2795,7 +2795,7 @@ def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FailingRunner),
     )
@@ -2822,7 +2822,7 @@ def test_watch_scheduler_silently_ignores_metadata_events(tmp_path, monkeypatch)
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(metadata_dir / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
     )
 
@@ -2886,7 +2886,7 @@ def test_watch_scheduler_does_not_special_case_downloader_suffixes(tmp_path, mon
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
     )
     watcher.enqueue(str(temporary), event_type="created")
@@ -2916,7 +2916,7 @@ def test_watch_scheduler_same_stat_same_usn_event_does_not_reset_quiet_window(tm
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=10,
+        cold_start_seconds=10,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -2949,7 +2949,7 @@ def test_modified_epoch_triggers_even_when_size_mtime_and_file_id_are_unchanged(
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=10,
+        cold_start_seconds=10,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
@@ -3072,7 +3072,7 @@ def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
-        quiet_seconds=0,
+        cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(FakePipelineRunner),
     )
