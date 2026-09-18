@@ -3,9 +3,20 @@ from __future__ import annotations
 import sunpack.passwords.internal.builtin as builtin_module
 
 
-def test_watch_clipboard_passwords_are_persisted_in_managed_builtin_block(tmp_path, monkeypatch):
+def _seed_builtin_file(path, *passwords: str) -> None:
+    path.write_text(
+        "# Built-in common password list. You can edit this file; use one password per line.\n"
+        + "".join(f"{password}\n" for password in passwords)
+        + "\n# The following section is managed automatically by SunPack Watch.\n"
+        + f"{builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN}\n"
+        + f"{builtin_module.WATCH_CLIPBOARD_BLOCK_END}\n",
+        encoding="utf-8",
+    )
+
+
+def test_watch_clipboard_passwords_are_persisted_only_inside_managed_block(tmp_path, monkeypatch):
     builtin_path = tmp_path / "builtin_passwords.txt"
-    builtin_path.write_text("user-secret\n# comment\n", encoding="utf-8")
+    _seed_builtin_file(builtin_path, "user-secret")
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
 
     changed = builtin_module.merge_watch_clipboard_passwords(["clip-a", "clip-b"], max_entries=10)
@@ -21,7 +32,7 @@ def test_watch_clipboard_passwords_are_persisted_in_managed_builtin_block(tmp_pa
 
 def test_watch_clipboard_password_block_keeps_most_recent_entries(tmp_path, monkeypatch):
     builtin_path = tmp_path / "builtin_passwords.txt"
-    builtin_path.write_text("user-secret\n", encoding="utf-8")
+    _seed_builtin_file(builtin_path, "user-secret")
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
 
     builtin_module.merge_watch_clipboard_passwords(["a", "b"], max_entries=2)
@@ -34,38 +45,49 @@ def test_watch_clipboard_password_block_keeps_most_recent_entries(tmp_path, monk
     assert "\nc\n" in text
 
 
-def test_watch_clipboard_password_block_uses_chinese_markers_for_zh_cli(tmp_path, monkeypatch):
+def test_watch_clipboard_password_markers_do_not_change_with_cli_language(tmp_path, monkeypatch):
     builtin_path = tmp_path / "builtin_passwords.txt"
-    builtin_path.write_text("user-secret\n", encoding="utf-8")
+    _seed_builtin_file(builtin_path, "user-secret")
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     monkeypatch.setattr(builtin_module, "load_cli_language_from_config", lambda: "zh")
 
     assert builtin_module.merge_watch_clipboard_passwords(["剪贴板密码"], max_entries=10) is True
 
     text = builtin_path.read_text(encoding="utf-8")
-    assert builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN_ZH in text
-    assert builtin_module.WATCH_CLIPBOARD_BLOCK_END_ZH in text
-    assert builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN not in text
+    assert builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN in text
+    assert builtin_module.WATCH_CLIPBOARD_BLOCK_END in text
+    assert "# 开始 SUNPACK 监控剪贴板密码" not in text
     assert builtin_module.get_builtin_passwords() == ["user-secret", "剪贴板密码"]
 
 
-def test_watch_clipboard_password_block_migrates_marker_language_without_duplication(tmp_path, monkeypatch):
+def test_watch_clipboard_writer_refuses_to_invent_missing_managed_block(tmp_path, monkeypatch):
+    builtin_path = tmp_path / "builtin_passwords.txt"
+    original = "#legacy-password\nuser-secret\n"
+    builtin_path.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
+
+    assert builtin_module.merge_watch_clipboard_passwords(["new-clip"], max_entries=10) is False
+    assert builtin_path.read_text(encoding="utf-8") == original
+
+
+def test_builtin_parser_preserves_hash_prefixed_and_surrounding_space_passwords(tmp_path, monkeypatch):
+    builtin_path = tmp_path / "builtin_passwords.txt"
+    _seed_builtin_file(builtin_path, "#secret", " password ", "   ")
+    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
+
+    assert builtin_module.get_builtin_passwords() == ["#secret", " password ", "   "]
+
+
+def test_builtin_parser_ignores_known_legacy_generated_metadata(tmp_path, monkeypatch):
     builtin_path = tmp_path / "builtin_passwords.txt"
     builtin_path.write_text(
-        "user-secret\n\n"
-        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN}\n"
+        "# 此文件为内置高频密码配置表，用户可自行编辑，每行一个密码。\n"
+        "user-secret\n"
+        "# BEGIN SUNPACK WATCH CLIPBOARD PASSWORDS\n"
         "old-clip\n"
-        f"{builtin_module.WATCH_CLIPBOARD_BLOCK_END}\n",
+        "# END SUNPACK WATCH CLIPBOARD PASSWORDS\n",
         encoding="utf-8",
     )
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-    monkeypatch.setattr(builtin_module, "load_cli_language_from_config", lambda: "zh")
 
-    assert builtin_module.merge_watch_clipboard_passwords(["new-clip"], max_entries=10) is True
-
-    text = builtin_path.read_text(encoding="utf-8")
-    assert builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN_ZH in text
-    assert builtin_module.WATCH_CLIPBOARD_BLOCK_END_ZH in text
-    assert builtin_module.WATCH_CLIPBOARD_BLOCK_BEGIN not in text
-    assert text.count("old-clip") == 1
-    assert text.count("new-clip") == 1
+    assert builtin_module.get_builtin_passwords() == ["user-secret", "old-clip"]

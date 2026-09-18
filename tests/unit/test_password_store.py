@@ -532,3 +532,20 @@ def test_hundreds_of_archives_reuse_confirmed_password_after_one_candidate_batch
         )
         assert resolution.password == "shared-secret"
         resolver.confirm_extraction(resolution)
+
+
+def test_password_store_reads_structured_builtin_file(tmp_path):
+    builtin_file = tmp_path / "builtin_passwords.txt"
+    builtin_file.write_text(
+        "# Built-in common password list. You can edit this file; use one password per line.\n"
+        "#secret\n"
+        "# The following section is managed automatically by SunPack Watch.\n"
+        "#!SUNPACK-WATCH-CLIPBOARD-BEGIN\n"
+        "clip-secret\n"
+        "#!SUNPACK-WATCH-CLIPBOARD-END\n",
+        encoding="utf-8",
+    )
+
+    store = PasswordStore.from_sources(builtin_passwords_file=str(builtin_file))
+
+    assert store.builtin_passwords == ["#secret", "clip-secret"]

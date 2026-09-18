@@ -13,9 +13,9 @@ from sunpack.passwords.internal.local_files import (
 def test_discovers_same_directory_sunpack_passwords(tmp_path):
     archive = tmp_path / "archive.zip"
     archive.write_bytes(b"not really an archive")
-    (tmp_path / ".sunpack-passwords.txt").write_text("# comment\nouter-secret\n\n", encoding="utf-8")
+    (tmp_path / ".sunpack-passwords.txt").write_text("#secret\nouter-secret\n password \n\n", encoding="utf-8")
 
-    assert discover_directory_passwords_for_archive(str(archive), {}) == ["outer-secret"]
+    assert discover_directory_passwords_for_archive(str(archive), {}) == ["#secret", "outer-secret", " password "]
 
 
 def test_ignores_other_same_directory_txt_files(tmp_path):

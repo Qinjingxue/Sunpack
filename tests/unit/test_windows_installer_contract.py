@@ -538,6 +538,14 @@ def test_installer_seeds_localized_editable_text_files_without_overwriting_exist
     assert "SaveStringToFile(FilePath, Contents, False)" in script
     assert "english.BuiltinPasswordsFileHeader=# Built-in common password list." in script
     assert "chinesesimplified.BuiltinPasswordsFileHeader=# 此文件为内置高频密码配置表" in script
+    assert "english.BuiltinPasswordsWatchManagedNote=# The following section is managed automatically by SunPack Watch." in script
+    assert "chinesesimplified.BuiltinPasswordsWatchManagedNote=# 以下区域由 SunPack Watch 自动维护，请勿手动编辑。" in script
+    assert "WatchClipboardBlockBegin = '#!SUNPACK-WATCH-CLIPBOARD-BEGIN';" in script
+    assert "WatchClipboardBlockEnd = '#!SUNPACK-WATCH-CLIPBOARD-END';" in script
+    assert "LoadStringFromFile(FilePath, Contents)" in script
+    assert "LegacyWatchClipboardBlockBeginEn" in script
+    assert "LegacyWatchClipboardBlockBeginZh" in script
+    assert "StringChangeEx(Contents, LegacyWatchClipboardBlockBeginEn, WatchClipboardBlockBegin, True)" in script
     assert "english.WatchRootsFileHeader=# Watched folders. Add one folder per line." in script
     assert "chinesesimplified.WatchRootsFileHeader=# 监控文件夹配置，每行填写一个监控目录。" in script
     assert "english.WatchRootsFileMapping=# Optional output mapping: input folder | output folder" in script

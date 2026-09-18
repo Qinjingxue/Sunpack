@@ -2,7 +2,8 @@ from dataclasses import dataclass, field
 from threading import RLock
 from typing import List
 
-from sunpack.passwords.internal.lists import dedupe_passwords, read_password_file
+from sunpack.passwords.internal.builtin import read_builtin_password_file
+from sunpack.passwords.internal.lists import dedupe_passwords
 
 
 MAX_RECENT_PASSWORDS = 64
@@ -28,7 +29,7 @@ class PasswordStore:
     ) -> "PasswordStore":
         if builtin_passwords is None and builtin_passwords_file:
             try:
-                builtin_passwords = read_password_file(builtin_passwords_file)
+                builtin_passwords = read_builtin_password_file(builtin_passwords_file)
             except Exception:
                 builtin_passwords = []
         return cls(
