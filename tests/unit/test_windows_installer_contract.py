@@ -373,7 +373,8 @@ def test_windows_build_always_pauses_at_exit_unless_no_pause():
 
     assert "function Wait-BeforeBuildExit {" in build_script
     assert "if ($NoPause) {" in build_script
-    assert 'Write-Host "Press Enter to exit..." -ForegroundColor Cyan' in build_script
+    assert 'Write-Host "Press any key to exit..." -ForegroundColor Cyan' in build_script
+    assert "$null = [Console]::ReadKey($true)" in build_script
     assert "$null = Read-Host" in build_script
     assert "Never let the pause path hide the original build failure." in build_script
     assert (
@@ -386,9 +387,28 @@ def test_windows_build_always_pauses_at_exit_unless_no_pause():
         "(Split-Path -Parent $MyInvocation.MyCommand.Path)"
     )
     success = build_script.index('Write-Host "Build completed successfully."')
-    final_pause = build_script.rindex("} finally {\n    Wait-BeforeBuildExit\n}")
+    catch_block = build_script.rindex("} catch {\n    Write-Host \"\"")
+    failure_pause = build_script.index("Wait-BeforeBuildExit", catch_block)
+    rethrow = build_script.index("\n    throw\n", failure_pause)
+    success_pause = build_script.rindex("\nWait-BeforeBuildExit\n")
 
-    assert main_try < success < final_pause
+    assert main_try < success < catch_block < failure_pause < rethrow < success_pause
+
+
+def test_installer_smoke_failure_pauses_before_rethrow():
+    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+
+    smoke = build_script.index('Write-Step "Running Windows installer smoke test"')
+    invoke = build_script.index(
+        '"-InstallerPath", $releaseInstallerPath',
+        smoke,
+    )
+    catch_block = build_script.rindex("} catch {\n    Write-Host \"\"")
+    failure_message = build_script.index('Write-Host ("Build failed: {0}"', catch_block)
+    pause = build_script.index("Wait-BeforeBuildExit", failure_message)
+    rethrow = build_script.index("\n    throw\n", pause)
+
+    assert smoke < invoke < catch_block < failure_message < pause < rethrow
 
 
 def test_local_build_requires_inno_setup():
