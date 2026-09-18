@@ -116,6 +116,7 @@ Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack_config.json,sunpa
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
 
 [Dirs]
+Name: "{app}"; Flags: uninsalwaysuninstall
 Name: "{commonappdata}\SunPack"; Permissions: users-modify
 
 [UninstallDelete]
