@@ -171,10 +171,12 @@ def test_installer_stores_all_user_data_in_program_data():
     assert "function IsPersistentProgramDataFile(const FileName: string): Boolean" in script
     for name in ("sunpack_config.json", "sunpack_watch_roots.txt", "builtin_passwords.txt"):
         assert f"CompareText(FileName, '{name}') = 0" in script
-        assert (
-            f'Source: "{{#SourceDir}}\\{name}"; DestDir: "{{commonappdata}}\\SunPack"; '
-            "Flags: onlyifdoesntexist skipifsourcedoesntexist"
-        ) in script
+    assert (
+        'Source: "{#SourceDir}\\sunpack_config.json"; DestDir: "{commonappdata}\\SunPack"; '
+        "Flags: onlyifdoesntexist skipifsourcedoesntexist"
+    ) in script
+    assert 'Source: "{#SourceDir}\\sunpack_watch_roots.txt";' not in script
+    assert 'Source: "{#SourceDir}\\builtin_passwords.txt";' not in script
     assert "function ClearProgramDataExceptPersistentFiles: Boolean" in script
     assert "if not ClearProgramDataExceptPersistentFiles then" in script
 
@@ -525,3 +527,18 @@ def test_acceptance_setup_bootstraps_and_checks_real_archive_generators():
     assert "Assert-AcceptanceTestTools" in acceptance_script
     assert "Default.SFX" in acceptance_script
     assert "zstd.exe" in acceptance_script
+
+
+def test_installer_seeds_localized_editable_text_files_without_overwriting_existing_files():
+    script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
+
+    assert "procedure EnsureLocalizedEditableConfigFiles;" in script
+    assert "EnsureLocalizedEditableConfigFiles;" in script
+    assert "if not FileExists(FilePath) then" in script
+    assert "SaveStringToFile(FilePath, Contents, False)" in script
+    assert "english.BuiltinPasswordsFileHeader=# Built-in common password list." in script
+    assert "chinesesimplified.BuiltinPasswordsFileHeader=# 此文件为内置高频密码配置表" in script
+    assert "english.WatchRootsFileHeader=# Watched folders. Add one folder per line." in script
+    assert "chinesesimplified.WatchRootsFileHeader=# 监控文件夹配置，每行填写一个监控目录。" in script
+    assert "english.WatchRootsFileMapping=# Optional output mapping: input folder | output folder" in script
+    assert "chinesesimplified.WatchRootsFileMapping=# 可选输出目录映射格式：输入目录 | 输出目录" in script
