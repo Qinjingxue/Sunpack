@@ -14,19 +14,44 @@ if ($null -ne $elevatedExitCode) {
     exit $elevatedExitCode
 }
 
+function Write-SmokeStage {
+    param([Parameter(Mandatory = $true)][string]$Label)
+    Write-Host ("[installer-smoke] {0} {1}" -f (Get-Date -Format "HH:mm:ss.fff"), $Label)
+}
+
 function Invoke-Checked {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [string[]]$Arguments = @()
+        [string[]]$Arguments = @(),
+        [int]$TimeoutSeconds = 120,
+        [string]$Label = ""
     )
+    $stage = if ($Label) { $Label } else { "$FilePath $($Arguments -join ' ')" }
+    Write-SmokeStage "START $stage"
     $process = Start-Process `
         -FilePath $FilePath `
         -ArgumentList $Arguments `
-        -Wait `
         -PassThru `
         -NoNewWindow
-    if ($process.ExitCode -ne 0) {
-        throw "Command failed with exit code $($process.ExitCode): $FilePath $($Arguments -join ' ')"
+    try {
+        if (-not $process.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
+            Write-SmokeStage "TIMEOUT $stage pid=$($process.Id)"
+            try {
+                Stop-Process -Id $process.Id -Force -ErrorAction SilentlyContinue
+            } catch {
+            }
+            throw "Command timed out after $TimeoutSeconds seconds: $stage"
+        }
+        # Refresh the Process object and ExitCode after the bounded wait. Unlike
+        # Start-Process -Wait this waits only for the launched process, not a
+        # deliberately persistent descendant such as sunpack-runtime.exe.
+        $process.WaitForExit()
+        if ($process.ExitCode -ne 0) {
+            throw "Command failed with exit code $($process.ExitCode): $stage"
+        }
+        Write-SmokeStage "PASS $stage"
+    } finally {
+        $process.Dispose()
     }
 }
 
@@ -294,8 +319,9 @@ try {
         "/TASKS=addtopath,contextmenu,autostart",
         "/DIR=$installRoot",
         "/LOG=$installLog"
-    )
+    ) -TimeoutSeconds 180 -Label "initial install"
 
+    Write-SmokeStage "validate initial installation"
     $appPath = Join-Path $installRoot "sunpack.exe"
     $runtimeAppPath = Join-Path $installRoot "sunpack-runtime.exe"
     $configPath = Join-Path $userDataRoot "sunpack_config.json"
@@ -355,7 +381,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or $serviceDacl -notmatch '\(A;;LCRP;;;IU\)') {
         throw "Watch Broker service DACL does not grant only start/query rights to interactive users: $serviceDacl"
     }
-    Invoke-Checked -FilePath $appPath -Arguments @("--help")
+    Invoke-Checked -FilePath $appPath -Arguments @("--help") -TimeoutSeconds 30 -Label "installed CLI help"
 
     $userPath = Get-MachinePath
     if (-not (Test-PathEntry -PathValue $userPath -Expected $installRoot)) {
@@ -387,7 +413,7 @@ try {
     }
     $runtimeIdentity = $startupMatch.Groups["RuntimeIdentity"].Value
 
-    Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown")
+    Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown") -TimeoutSeconds 30 -Label "persistent runtime shutdown"
     $runtimeExitDeadline = (Get-Date).AddSeconds(20)
     do {
         $installedRuntimeProcesses = @(
@@ -439,6 +465,7 @@ try {
     $staleDataDir = Join-Path $userDataRoot "runtime-cwd"
     New-Item -ItemType Directory -Path $staleDataDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $staleDataDir "stale.json") -Value "stale" -Encoding UTF8
+    Write-SmokeStage "prepare running-Watch upgrade"
     $watchStatusBeforeUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
     if (-not [bool]$watchStatusBeforeUpgrade.summary.running) {
         throw "Installer smoke precondition failed: Watch is not running before the upgrade."
@@ -451,7 +478,7 @@ try {
         "/TASKS=addtopath,contextmenu,autostart",
         "/DIR=$installRoot",
         "/LOG=$installLog"
-    )
+    ) -TimeoutSeconds 180 -Label "running-Watch upgrade install"
     $watchRootsAfterUpgrade = Get-Content -LiteralPath $watchRootsPath -Raw -Encoding UTF8
     if ($watchRootsAfterUpgrade -ne $watchRootsContent) {
         throw "Upgrade install overwrote the existing watch roots file: $watchRootsPath"
@@ -487,6 +514,7 @@ try {
     if (-not (Test-Path -LiteralPath $upgradeWatchStateMarker -PathType Leaf)) {
         throw "Upgrade install removed the durable Watch state directory: $watchStateDir"
     }
+    Write-SmokeStage "validate running-Watch upgrade"
     $watchStatusAfterUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
     if (-not [bool]$watchStatusAfterUpgrade.summary.running) {
         throw "Upgrade install did not restore the Watch instance that was running before upgrade."
@@ -511,6 +539,7 @@ try {
     Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath
     Assert-SunPackStartMenu
 
+    Write-SmokeStage "prepare stopped-Watch upgrade"
     Invoke-UnelevatedChecked -FilePath $appPath -Arguments @("watch", "stop")
     $watchStatusBeforeStoppedUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
     if ([bool]$watchStatusBeforeStoppedUpgrade.summary.running) {
@@ -524,7 +553,7 @@ try {
         "/TASKS=addtopath,contextmenu,autostart",
         "/DIR=$installRoot",
         "/LOG=$installLog"
-    )
+    ) -TimeoutSeconds 180 -Label "stopped-Watch upgrade install"
     $watchStatusAfterStoppedUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
     if ([bool]$watchStatusAfterStoppedUpgrade.summary.running) {
         throw "Upgrade install restarted Watch even though it was stopped before upgrade."
@@ -534,6 +563,7 @@ try {
         throw "Stopped-state upgrade changed the startup Run value: $startupCommandAfterStoppedUpgrade"
     }
 
+    Write-SmokeStage "validate one-shot Watch lifecycle"
     Invoke-UnelevatedChecked -FilePath $appPath -Arguments @("watch", "start", "--once", "--no-tray")
     $stopDeadline = (Get-Date).AddSeconds(10)
     do {
@@ -556,6 +586,7 @@ try {
     Set-Content -LiteralPath (Join-Path $runtimeStateDir "stale.json") -Value "{}" -Encoding UTF8
     Set-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName -Value ('"{0}" watch start' -f $appPath)
 
+    Write-SmokeStage "validate uninstall cleanup"
     $uninstaller = Get-ChildItem -LiteralPath $installRoot -Filter "unins*.exe" -File | Select-Object -First 1
     if ($null -eq $uninstaller) {
         throw "Inno Setup uninstaller was not created under: $installRoot"
