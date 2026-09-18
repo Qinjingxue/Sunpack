@@ -627,13 +627,12 @@ class _AsyncNativeWorkerProcess:
     async def cancel(self, job_id: str) -> None:
         await self.send(json.dumps({"worker_command": "cancel", "job_id": job_id}, separators=(",", ":")))
 
-    async def set_process_mode(self, *, background: bool) -> dict[str, Any]:
+    async def set_process_mode(self, *, mode: str) -> dict[str, Any]:
         current = self._process_mode_waiter
         if current is not None and not current.done():
             await current
         waiter = asyncio.get_running_loop().create_future()
         self._process_mode_waiter = waiter
-        mode = "background" if background else "normal"
         await self.send(json.dumps({"worker_command": "set_process_mode", "mode": mode}, separators=(",", ":")))
         try:
             result = dict(await asyncio.wait_for(asyncio.shield(waiter), timeout=2.0))
@@ -892,9 +891,9 @@ class SevenZipRunner:
         worker = await self._async_worker_holder_or_create().get_or_start(None)
         return dict(worker.handshake)
 
-    async def set_process_mode_asyncio(self, *, background: bool) -> dict[str, Any]:
+    async def set_process_mode_asyncio(self, *, mode: str) -> dict[str, Any]:
         worker = await self._async_worker_holder_or_create().get_or_start(None)
-        return await worker.set_process_mode(background=background)
+        return await worker.set_process_mode(mode=mode)
 
     def extract_attempt(
         self,
