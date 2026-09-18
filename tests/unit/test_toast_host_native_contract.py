@@ -37,7 +37,7 @@ def test_native_context_releases_presenter_and_activation_before_apartment():
     assert "wWinMain" not in source
 
 
-def test_native_toast_identity_is_machine_wide_without_a_start_menu_shortcut():
+def test_native_toast_identity_keeps_machine_registration_and_ensures_current_user_identity():
     source = (ROOT / "native/toast_host/src/main.cpp").read_text(encoding="utf-8")
 
     assert 'L"Software\\\\Classes\\\\AppUserModelId\\\\"' in source
@@ -45,13 +45,12 @@ def test_native_toast_identity_is_machine_wide_without_a_start_menu_shortcut():
         assert f'L"{value_name}"' in source
     assert 'L"DisplayName", kToastDisplayName, REG_EXPAND_SZ' in source
     assert 'L"IconUri", toast_icon_path(executable), REG_EXPAND_SZ' in source
-    assert 'L"DisplayName", REG_EXPAND_SZ) ==' in source
-    assert 'L"IconUri", REG_EXPAND_SZ) ==' in source
+    assert 'register_toast_app_identity(HKEY_LOCAL_MACHINE, executable);' in source
+    assert 'toast_app_identity_registered(HKEY_CURRENT_USER, executable)' in source
+    assert 'register_toast_app_identity(HKEY_CURRENT_USER, executable);' in source
     assert "IShellLinkW" not in source
     assert "PKEY_AppUserModel_ID" not in source
     assert "PKEY_AppUserModel_ToastActivatorCLSID" not in source
-    assert "HKEY_CURRENT_USER" not in source
-    assert source.count("HKEY_LOCAL_MACHINE") >= 12
     assert "RegDeleteTreeW(HKEY_LOCAL_MACHINE, app_id_path.c_str())" in source
     assert "remove_legacy_toast_shortcut" not in source
 
