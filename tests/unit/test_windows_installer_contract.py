@@ -161,6 +161,7 @@ def test_installer_stops_existing_watch_before_upgrade_and_cleans_owned_files():
     assert "DirExists(ItemPath)" in script
     assert "TFindData" not in script
     assert "sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.txt" in script
+    assert "QueryExistingWatchRunning" in script
 
 
 def test_installer_stores_all_user_data_in_program_data():
@@ -177,21 +178,53 @@ def test_installer_stores_all_user_data_in_program_data():
     ) in script
     assert 'Source: "{#SourceDir}\\sunpack_watch_roots.txt";' not in script
     assert 'Source: "{#SourceDir}\\builtin_passwords.txt";' not in script
-    assert "function ClearProgramDataExceptPersistentFiles: Boolean" in script
-    assert "if not ClearProgramDataExceptPersistentFiles then" in script
+    assert "function ClearProgramDataExceptPersistentFiles(" in script
+    assert "const WatchStateDir: string" in script
+    assert "if not ClearProgramDataExceptPersistentFiles(ExistingInstallation, ExistingWatchStateDir) then" in script
 
 
-def test_upgrade_preserves_program_data_except_the_three_user_files():
+def test_upgrade_preserves_user_files_and_default_watch_state():
     script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
 
     prepare = script[script.index("function PrepareToInstall"):]
     prepare = prepare[:prepare.index("\nfunction ")]
-    assert "ClearProgramDataExceptPersistentFiles" in prepare
+    assert "ClearProgramDataExceptPersistentFiles(ExistingInstallation, ExistingWatchStateDir)" in prepare
     assert "RemoveStartupRunValue" not in prepare
-    clear = script[script.index("function ClearProgramDataExceptPersistentFiles: Boolean"):]
+    assert "function IsPersistentWatchStatePath" in script
+    assert "CompareText(ItemName, '.sunpack_watch') = 0" in script
+    assert "IsSameOrChildPath(WatchStateDir, ItemPath)" in script
+    assert "IsSameOrChildPath(ItemPath, WatchStateDir)" in script
+    clear = script[script.index("function ClearProgramDataExceptPersistentFiles("):]
     clear = clear[:clear.index("\nfunction ")]
     assert "IsPersistentProgramDataFile(FindData.Name)" in clear
+    assert "IsPersistentWatchStatePath(ItemPath, FindData.Name, WatchStateDir, PreserveWatchState)" in clear
     assert "DelTree(ItemPath, True, True, True)" in clear
+
+
+def test_upgrade_restores_watch_only_when_it_was_running_before_install():
+    script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
+
+    assert "function QueryExistingWatchRunning(var WatchStateDir: string): Boolean;" in script
+    assert "watch status --json" in script
+    assert "Exec(" in script
+    assert "RestartWatchAfterUpgrade: Boolean;" in script
+    assert "RestartWatchAfterUpgrade := False;" in script
+    assert "RestartWatchAfterUpgrade := QueryExistingWatchRunning(ExistingWatchStateDir);" in script
+    assert "UpgradeWatchStateDirValueName = 'UpgradeWatchStateDir';" in script
+    assert "RegQueryStringValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName, WatchStateDir)" in script
+    assert "procedure RestoreWatchAfterUpgrade;" in script
+    assert "'--launch-watch-unelevated'" in script
+
+    prepare = script[script.index("function PrepareToInstall"):]
+    prepare = prepare[:prepare.index("\nfunction ")]
+    assert prepare.index("QueryExistingWatchRunning") < prepare.index("StopExistingProcessesAndWait")
+
+    post = script[script.index("if CurStep = ssPostInstall then"):]
+    post = post[:post.index("procedure CurUninstallStepChanged")]
+    upgrade_guard = post[post.index("if ExistingInstallation then"):]
+    upgrade_guard = upgrade_guard[:upgrade_guard.index("if WizardIsTaskSelected('addtopath')")]
+    assert "RestoreWatchAfterUpgrade;" in upgrade_guard
+    assert "Exit;" in upgrade_guard
 
 
 def test_upgrade_never_changes_startup_path_or_context_menu():
@@ -455,13 +488,17 @@ def test_installer_smoke_exercises_upgrade_preservation_and_full_uninstall_clean
     assert 'Join-Path $userDataRoot "sunpack_config.json"' in script
     assert '$userDataRoot = Join-Path $env:ProgramData "SunPack"' in script
     assert "LOCALAPPDATA" not in script
-    assert "Upgrade install overwrote the existing builtin password file" in script
+    assert "Upgrade install lost the existing builtin password entry" in script
     assert "Upgrade install overwrote the existing program data config file" in script
     assert "Upgrade install changed the startup Run value" in script
     assert "Upgrade install removed the machine PATH entry" in script
     assert "Upgrade install removed a context menu key" in script
     assert "Upgrade install changed the context menu command" in script
     assert "Upgrade install left stale application data behind" in script
+    assert "Installer smoke precondition failed: Watch is not running before the upgrade." in script
+    assert "Upgrade install removed the durable Watch state directory" in script
+    assert "Upgrade install did not restore the Watch instance that was running before upgrade." in script
+    assert "Invoke-UnelevatedJson" in script
     assert "Invoke-UnelevatedChecked" in script
     assert '$startupMatch.Groups["RuntimeIdentity"].Value' in script
     assert 'Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown")' in script

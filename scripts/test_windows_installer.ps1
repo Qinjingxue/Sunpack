@@ -101,6 +101,37 @@ function Invoke-UnelevatedChecked {
     }
 }
 
+function Invoke-UnelevatedJson {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [int]$TimeoutSeconds = 120
+    )
+    $pythonPath = Join-Path $repoRoot ".venv\Scripts\python.exe"
+    $runnerPath = Join-Path $repoRoot "scripts\run_unelevated_process.py"
+    if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf) -or
+        -not (Test-Path -LiteralPath $runnerPath -PathType Leaf)) {
+        throw "Unelevated installer test runner is unavailable under: $repoRoot"
+    }
+    $runnerArguments = @(
+        $runnerPath,
+        "--cwd", (Split-Path -Parent $FilePath),
+        "--timeout-seconds", [string]$TimeoutSeconds,
+        "--",
+        $FilePath
+    ) + $Arguments
+    $output = & $pythonPath @runnerArguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unelevated command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
+    }
+    try {
+        return (($output | Out-String) | ConvertFrom-Json)
+    } catch {
+        throw "Unelevated command did not return valid JSON: $FilePath $($Arguments -join ' ')"
+    }
+}
+
+
 function Write-DiagnosticLogTail {
     param(
         [Parameter(Mandatory = $true)][string]$Label,
@@ -399,6 +430,11 @@ try {
     Set-Content -LiteralPath $builtinPasswordsPath -Value $builtinPasswordsContent -Encoding UTF8 -NoNewline
     $configContent = "{`"cli`": {`"language`": `"en`"}}`n"
     Set-Content -LiteralPath $configPath -Value $configContent -Encoding UTF8 -NoNewline
+    $watchStateDir = Join-Path $userDataRoot ".sunpack_watch"
+    New-Item -ItemType Directory -Path $watchStateDir -Force | Out-Null
+    $upgradeWatchStateMarker = Join-Path $watchStateDir "upgrade-preserve.marker"
+    Set-Content -LiteralPath $upgradeWatchStateMarker -Value "preserve" -Encoding UTF8
+
     $staleUpgradeMarker = Join-Path $installRoot "stale-upgrade-marker.json"
     Set-Content -LiteralPath $staleUpgradeMarker -Value "stale" -Encoding UTF8
     $staleConfigDir = Join-Path $installRoot "config"
@@ -409,6 +445,10 @@ try {
     $staleDataDir = Join-Path $userDataRoot "runtime-cwd"
     New-Item -ItemType Directory -Path $staleDataDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $staleDataDir "stale.json") -Value "stale" -Encoding UTF8
+    $watchStatusBeforeUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
+    if (-not [bool]$watchStatusBeforeUpgrade.summary.running) {
+        throw "Installer smoke precondition failed: Watch is not running before the upgrade."
+    }
     Invoke-Checked -FilePath $resolvedInstaller -Arguments @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
@@ -423,8 +463,13 @@ try {
         throw "Upgrade install overwrote the existing watch roots file: $watchRootsPath"
     }
     $builtinPasswordsAfterUpgrade = Get-Content -LiteralPath $builtinPasswordsPath -Raw -Encoding UTF8
-    if ($builtinPasswordsAfterUpgrade -ne $builtinPasswordsContent) {
-        throw "Upgrade install overwrote the existing builtin password file: $builtinPasswordsPath"
+    $builtinPasswordLinesAfterUpgrade = @($builtinPasswordsAfterUpgrade -split '\r?\n')
+    if ($builtinPasswordLinesAfterUpgrade -notcontains "installer-smoke-user-password") {
+        throw "Upgrade install lost the existing builtin password entry: $builtinPasswordsPath"
+    }
+    if ($builtinPasswordsAfterUpgrade -notmatch '#!SUNPACK-WATCH-CLIPBOARD-BEGIN' -or
+        $builtinPasswordsAfterUpgrade -notmatch '#!SUNPACK-WATCH-CLIPBOARD-END') {
+        throw "Upgrade install did not migrate the builtin password Watch block: $builtinPasswordsPath"
     }
     $configAfterUpgrade = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8
     if ($configAfterUpgrade -ne $configContent) {
@@ -441,6 +486,13 @@ try {
     }
     if (Test-Path -LiteralPath $staleDataDir) {
         throw "Upgrade install left stale runtime state behind: $staleDataDir"
+    }
+    if (-not (Test-Path -LiteralPath $upgradeWatchStateMarker -PathType Leaf)) {
+        throw "Upgrade install removed the durable Watch state directory: $watchStateDir"
+    }
+    $watchStatusAfterUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
+    if (-not [bool]$watchStatusAfterUpgrade.summary.running) {
+        throw "Upgrade install did not restore the Watch instance that was running before upgrade."
     }
     $machinePathAfterUpgrade = Get-MachinePath
     if (-not (Test-PathEntry -PathValue $machinePathAfterUpgrade -Expected $installRoot)) {
@@ -461,6 +513,30 @@ try {
     }
     Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath
     Assert-SunPackStartMenu
+
+    Invoke-UnelevatedChecked -FilePath $appPath -Arguments @("watch", "stop")
+    $watchStatusBeforeStoppedUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
+    if ([bool]$watchStatusBeforeStoppedUpgrade.summary.running) {
+        throw "Watch did not stop before the stopped-state upgrade test."
+    }
+    Invoke-Checked -FilePath $resolvedInstaller -Arguments @(
+        "/VERYSILENT",
+        "/SUPPRESSMSGBOXES",
+        "/NORESTART",
+        "/SP-",
+        "/TASKS=addtopath,contextmenu,autostart",
+        "/DIR=$installRoot",
+        "/LOG=$installLog"
+    )
+    $watchStatusAfterStoppedUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
+    if ([bool]$watchStatusAfterStoppedUpgrade.summary.running) {
+        throw "Upgrade install restarted Watch even though it was stopped before upgrade."
+    }
+    $startupCommandAfterStoppedUpgrade = [string](Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName).$startupValueName
+    if ($startupCommandAfterStoppedUpgrade -ne $startupCommand) {
+        throw "Stopped-state upgrade changed the startup Run value: $startupCommandAfterStoppedUpgrade"
+    }
+
     Invoke-UnelevatedChecked -FilePath $appPath -Arguments @("watch", "start", "--once", "--no-tray")
     $stopDeadline = (Get-Date).AddSeconds(10)
     do {
@@ -476,7 +552,6 @@ try {
     Set-Content -LiteralPath $watchRootsPath -Value "$watchRoot`n" -Encoding UTF8
     Set-Content -LiteralPath $builtinPasswordsPath -Value "uninstall-delete`n" -Encoding UTF8
     Set-Content -LiteralPath $configPath -Value $configContent -Encoding UTF8
-    $watchStateDir = Join-Path $userDataRoot ".sunpack_watch"
     New-Item -ItemType Directory -Path $watchStateDir -Force | Out-Null
     Set-Content -LiteralPath (Join-Path $watchStateDir "watch.stop") -Value "installer-smoke" -Encoding UTF8
     $runtimeStateDir = Join-Path $userDataRoot "runtime-cwd"

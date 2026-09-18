@@ -1,7 +1,44 @@
+import subprocess
 import sys
 
 
+def _launch_watch_unelevated() -> int:
+    """Installer-only bridge that restores Watch with the interactive shell token."""
+
+    from sunpack.platform.windows.process_launch import launch_unelevated
+    from sunpack.support.process_executable import current_process_executable
+
+    launcher = current_process_executable().with_name("sunpack.exe")
+    process = launch_unelevated(
+        [str(launcher), "watch", "start"],
+        cwd=str(launcher.parent),
+    )
+    try:
+        try:
+            exit_code = process.wait(timeout=30.0)
+        except subprocess.TimeoutExpired:
+            exit_code = None
+        if exit_code is None:
+            try:
+                process.terminate()
+                process.wait(timeout=5.0)
+            except Exception:
+                pass
+            return 1
+        return int(exit_code)
+    finally:
+        close = getattr(process, "close", None)
+        if callable(close):
+            close()
+
+
 def main() -> int:
+    # Installer recovery must be handled by the new runtime itself so it can
+    # deliberately cross from an elevated setup process back to the
+    # interactive shell's medium-integrity token.
+    if sys.argv[1:2] == ["--launch-watch-unelevated"]:
+        return _launch_watch_unelevated()
+
     # Registration and COM activation enter the main runtime directly and do
     # not start an extraction engine or a watch service.
     if sys.argv[1:2] and sys.argv[1] in {"--register-toast", "--unregister-toast", "--toast-activated"}:
