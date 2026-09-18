@@ -339,10 +339,37 @@ def test_unregister_toast_elevated_removes_machine_registration_then_delegates_u
     assert module.handle_toast_argv(['--unregister-toast']) == 0
     assert calls == [
         'machine',
-        ('launch', ['runtime.exe', '--unregister-toast'], str(tmp_path)),
-        ('wait', None),
+        ('launch', ['runtime.exe', '--unregister-toast-current-user'], str(tmp_path)),
+        ('wait', 30.0),
         'close',
     ]
+
+
+def test_unregister_toast_current_user_helper_never_relaunches_when_still_elevated(monkeypatch):
+    from sunpack.platform.windows import elevation, process_launch
+
+    calls = []
+    monkeypatch.setattr(elevation, 'is_process_elevated', lambda: True)
+    monkeypatch.setattr(module, '_remove_current_user_toast_identity', lambda: calls.append('user'))
+    monkeypatch.setattr(process_launch, 'launch_unelevated', lambda *_args, **_kwargs: pytest.fail('helper relaunched itself'))
+    monkeypatch.setattr(module, '_load_library', lambda: pytest.fail('helper loaded native Toast DLL'))
+
+    assert module.handle_toast_argv(['--unregister-toast-current-user']) == 0
+    assert calls == ['user']
+
+
+def test_unregister_toast_current_user_helper_is_dispatched_before_normal_runtime(monkeypatch):
+    import sys
+    from sunpack.support import entrypoint
+    from sunpack.support import runtime_identity
+
+    calls = []
+    monkeypatch.setattr(sys, 'argv', ['sunpack-runtime.exe', '--unregister-toast-current-user'])
+    monkeypatch.setattr(module, '_remove_current_user_toast_identity', lambda: calls.append('user'))
+    monkeypatch.setattr(runtime_identity, 'consume_runtime_id', lambda _argv: pytest.fail('entered normal runtime'))
+
+    assert entrypoint.main() == 0
+    assert calls == ['user']
 
 
 def test_current_user_toast_identity_cleanup_targets_hkcu(monkeypatch):
