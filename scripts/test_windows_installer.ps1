@@ -14,50 +14,90 @@ if ($null -ne $elevatedExitCode) {
     exit $elevatedExitCode
 }
 
+function Write-SmokePhase {
+    param(
+        [Parameter(Mandatory = $true)][string]$State,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [string]$Detail = ""
+    )
+    $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    $suffix = if ($Detail) { " :: $Detail" } else { "" }
+    Write-Host "[installer-smoke][$timestamp][$State] $Label$suffix"
+}
+
 function Invoke-Checked {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [string[]]$Arguments = @()
-    )
-    $process = Start-Process `
-        -FilePath $FilePath `
-        -ArgumentList $Arguments `
-        -Wait `
-        -PassThru `
-        -NoNewWindow
-    if ($process.ExitCode -ne 0) {
-        throw "Command failed with exit code $($process.ExitCode): $FilePath $($Arguments -join ' ')"
-    }
-}
-
-function Invoke-UninstallerChecked {
-    param(
-        [Parameter(Mandatory = $true)][string]$FilePath,
         [string[]]$Arguments = @(),
-        [int]$TimeoutSeconds = 300
+        [int]$TimeoutSeconds = 120,
+        [string]$Label = ""
     )
-    # Do not use Start-Process -Wait here. PowerShell 5.1 waits for the
-    # uninstaller's entire descendant tree, which includes the replacement
-    # Explorer process started after unregistering shell integrations.
+    if (-not $Label) {
+        $Label = Split-Path -Leaf $FilePath
+    }
+    $commandText = "$FilePath $($Arguments -join ' ')".Trim()
+    Write-SmokePhase -State "BEGIN" -Label $Label -Detail $commandText
+
+    # Do not use Start-Process -Wait here. Windows PowerShell can wait for
+    # descendants too; after #23 an upgrade intentionally restores a persistent
+    # Watch runtime, so waiting for the process tree turns success into a hang.
+    $startedAt = Get-Date
     $process = Start-Process `
         -FilePath $FilePath `
         -ArgumentList $Arguments `
         -PassThru `
         -NoNewWindow
     if (-not $process.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
+        $elapsed = ((Get-Date) - $startedAt).TotalSeconds
+        Write-SmokePhase -State "TIMEOUT" -Label $Label -Detail ("PID={0} elapsed={1:N1}s" -f $process.Id, $elapsed)
+        try {
+            & taskkill.exe /PID $process.Id /T /F 2>&1 | ForEach-Object { Write-Host $_ }
+        } catch {
+        }
+        throw "Command timed out after $TimeoutSeconds seconds: $commandText"
+    }
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+    $elapsed = ((Get-Date) - $startedAt).TotalSeconds
+    Write-SmokePhase -State "END" -Label $Label -Detail ("PID={0} exit={1} elapsed={2:N2}s" -f $process.Id, $exitCode, $elapsed)
+    if ($exitCode -ne 0) {
+        throw "Command failed with exit code ${exitCode}: $commandText"
+    }
+}
+function Invoke-UninstallerChecked {
+    param(
+        [Parameter(Mandatory = $true)][string]$FilePath,
+        [string[]]$Arguments = @(),
+        [int]$TimeoutSeconds = 300
+    )
+    $commandText = "$FilePath $($Arguments -join ' ')".Trim()
+    Write-SmokePhase -State "BEGIN" -Label "uninstall" -Detail $commandText
+    # Do not use Start-Process -Wait here. PowerShell 5.1 waits for the
+    # uninstaller's entire descendant tree, which includes the replacement
+    # Explorer process started after unregistering shell integrations.
+    $startedAt = Get-Date
+    $process = Start-Process `
+        -FilePath $FilePath `
+        -ArgumentList $Arguments `
+        -PassThru `
+        -NoNewWindow
+    if (-not $process.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
+        $elapsed = ((Get-Date) - $startedAt).TotalSeconds
+        Write-SmokePhase -State "TIMEOUT" -Label "uninstall" -Detail ("PID={0} elapsed={1:N1}s" -f $process.Id, $elapsed)
         try {
             $process.Kill()
         } catch {
         }
-        throw "Uninstaller timed out after $TimeoutSeconds seconds: $FilePath $($Arguments -join ' ')"
+        throw "Uninstaller timed out after $TimeoutSeconds seconds: $commandText"
     }
     $process.WaitForExit()
     $exitCode = $process.ExitCode
+    $elapsed = ((Get-Date) - $startedAt).TotalSeconds
+    Write-SmokePhase -State "END" -Label "uninstall" -Detail ("PID={0} exit={1} elapsed={2:N2}s" -f $process.Id, $exitCode, $elapsed)
     if ($null -ne $exitCode -and $exitCode -ne 0) {
-        throw "Uninstaller failed with exit code ${exitCode}: $FilePath $($Arguments -join ' ')"
+        throw "Uninstaller failed with exit code ${exitCode}: $commandText"
     }
 }
-
 function Wait-UninstallCompletion {
     param(
         [Parameter(Mandatory = $true)][string]$InstallRoot,
@@ -286,7 +326,7 @@ try {
         Move-Item -LiteralPath $userDataRoot -Destination $userDataBackup
     }
 
-    Invoke-Checked -FilePath $resolvedInstaller -Arguments @(
+    Invoke-Checked -Label "initial install" -TimeoutSeconds 180 -FilePath $resolvedInstaller -Arguments @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
@@ -355,7 +395,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or $serviceDacl -notmatch '\(A;;LCRP;;;IU\)') {
         throw "Watch Broker service DACL does not grant only start/query rights to interactive users: $serviceDacl"
     }
-    Invoke-Checked -FilePath $appPath -Arguments @("--help")
+    Invoke-Checked -Label "installed launcher help" -TimeoutSeconds 30 -FilePath $appPath -Arguments @("--help")
 
     $userPath = Get-MachinePath
     if (-not (Test-PathEntry -PathValue $userPath -Expected $installRoot)) {
@@ -387,7 +427,7 @@ try {
     }
     $runtimeIdentity = $startupMatch.Groups["RuntimeIdentity"].Value
 
-    Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown")
+    Invoke-Checked -Label "initial persistent shutdown" -TimeoutSeconds 45 -FilePath $appPath -Arguments @("--persistent-shutdown")
     $runtimeExitDeadline = (Get-Date).AddSeconds(20)
     do {
         $installedRuntimeProcesses = @(
@@ -402,6 +442,7 @@ try {
     if ($installedRuntimeProcesses.Count -ne 0) {
         throw "Packaged runtime did not exit before the startup cold-start test: $runtimeAppPath"
     }
+    Write-SmokePhase -State "STAGE" -Label "start Watch before running-state upgrade"
     try {
         Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @($runtimeIdentity, "watch", "start")
     } catch {
@@ -437,13 +478,15 @@ try {
     $staleDataMarker = Join-Path $userDataRoot "stale-runtime-state.json"
     Set-Content -LiteralPath $staleDataMarker -Value "stale" -Encoding UTF8
     $staleDataDir = Join-Path $userDataRoot "runtime-cwd"
+    $staleRuntimeMarker = Join-Path $staleDataDir "stale.json"
     New-Item -ItemType Directory -Path $staleDataDir -Force | Out-Null
-    Set-Content -LiteralPath (Join-Path $staleDataDir "stale.json") -Value "stale" -Encoding UTF8
+    Set-Content -LiteralPath $staleRuntimeMarker -Value "stale" -Encoding UTF8
+    Write-SmokePhase -State "STAGE" -Label "prepare running-Watch upgrade"
     $watchStatusBeforeUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
     if (-not [bool]$watchStatusBeforeUpgrade.summary.running) {
         throw "Installer smoke precondition failed: Watch is not running before the upgrade."
     }
-    Invoke-Checked -FilePath $resolvedInstaller -Arguments @(
+    Invoke-Checked -Label "running-Watch upgrade install" -TimeoutSeconds 180 -FilePath $resolvedInstaller -Arguments @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
@@ -481,12 +524,15 @@ try {
     if (Test-Path -LiteralPath $staleDataMarker) {
         throw "Upgrade install left stale runtime state behind: $staleDataMarker"
     }
-    if (Test-Path -LiteralPath $staleDataDir) {
-        throw "Upgrade install left stale runtime state behind: $staleDataDir"
+    # A successfully restored Watch recreates runtime-cwd/<runtime-id> by design.
+    # Only the stale marker seeded before upgrade must be gone.
+    if (Test-Path -LiteralPath $staleRuntimeMarker) {
+        throw "Upgrade install left stale runtime state behind: $staleRuntimeMarker"
     }
     if (-not (Test-Path -LiteralPath $upgradeWatchStateMarker -PathType Leaf)) {
         throw "Upgrade install removed the durable Watch state directory: $watchStateDir"
     }
+    Write-SmokePhase -State "STAGE" -Label "validate running-Watch upgrade"
     $watchStatusAfterUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
     if (-not [bool]$watchStatusAfterUpgrade.summary.running) {
         throw "Upgrade install did not restore the Watch instance that was running before upgrade."
@@ -511,12 +557,13 @@ try {
     Assert-ToastRegistryIdentity -RuntimePath $runtimeAppPath
     Assert-SunPackStartMenu
 
+    Write-SmokePhase -State "STAGE" -Label "prepare stopped-Watch upgrade"
     Invoke-UnelevatedChecked -FilePath $appPath -Arguments @("watch", "stop")
     $watchStatusBeforeStoppedUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
     if ([bool]$watchStatusBeforeStoppedUpgrade.summary.running) {
         throw "Watch did not stop before the stopped-state upgrade test."
     }
-    Invoke-Checked -FilePath $resolvedInstaller -Arguments @(
+    Invoke-Checked -Label "stopped-Watch upgrade install" -TimeoutSeconds 180 -FilePath $resolvedInstaller -Arguments @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
@@ -534,6 +581,7 @@ try {
         throw "Stopped-state upgrade changed the startup Run value: $startupCommandAfterStoppedUpgrade"
     }
 
+    Write-SmokePhase -State "STAGE" -Label "validate one-shot Watch lifecycle"
     Invoke-UnelevatedChecked -FilePath $appPath -Arguments @("watch", "start", "--once", "--no-tray")
     $stopDeadline = (Get-Date).AddSeconds(10)
     do {
