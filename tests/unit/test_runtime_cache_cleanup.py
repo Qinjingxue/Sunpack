@@ -224,7 +224,7 @@ def test_external_activity_waits_for_cleanup_already_in_progress(tmp_path):
     asyncio.run(scenario())
 
 
-def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path, monkeypatch):
+def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
     async def scenario():
         engine = _StatsCleanupEngine()
         watcher = WatchScheduler(
@@ -245,11 +245,6 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path, monkeyp
         host = RuntimeHost()
         host._watch_service = SimpleNamespace(scheduler=watcher)
         host._watch_task = SimpleNamespace(done=lambda: False)
-
-        async def set_process_mode(*, background):
-            return None
-
-        monkeypatch.setattr(host, "_set_process_mode", set_process_mode)
 
         await host.foreground_started()
         GLOBAL_CACHE.set("foreground-lifecycle", ("key",), {"payload": "value"})
