@@ -231,16 +231,6 @@ jobs:
           $packageRoot = "dist\sunpack-${{ matrix.arch }}"
           .\scripts\verify_windows_package_arch.ps1 -PackageRoot $packageRoot -Arch ${{ matrix.arch }}
 
-      - name: Smoke test Windows installer
-        timeout-minutes: 15
-        shell: pwsh
-        run: |
-          $installer = Get-ChildItem -LiteralPath "release" `
-            -Filter "sunpack-windows-${{ matrix.arch }}-*-setup.exe" `
-            -File |
-            Select-Object -First 1
-          .\scripts\test_windows_installer.ps1 -InstallerPath $installer.FullName
-
       - name: Upload package artifact
         uses: actions/upload-artifact@v7
         with:

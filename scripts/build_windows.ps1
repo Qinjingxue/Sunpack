@@ -853,6 +853,7 @@ $projectPath = Join-Path $repoRoot "pyproject.toml"
 $iconPath = Join-Path $repoRoot "sunpack.ico"
 $applicationManifestPath = Join-Path $repoRoot "sunpack.manifest"
 $manifestEmbeddingScriptPath = Join-Path $repoRoot "scripts\embed_windows_manifest.py"
+$installerSmokeScriptPath = Join-Path $repoRoot "scripts\test_windows_installer.ps1"
 $nativeCrateRoot = Join-Path $repoRoot "native\sunpack_native"
 $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
 $nativeWorkspaceLock = Join-Path $repoRoot "native\Cargo.lock"
@@ -905,6 +906,7 @@ $innoCompiler = Get-InnoSetupCompiler -PreferredPath $InnoCompilerPath
 Assert-PathExists -LiteralPath $iconPath -Description "SunPack icon"
 Assert-PathExists -LiteralPath $applicationManifestPath -Description "Windows application manifest"
 Assert-PathExists -LiteralPath $manifestEmbeddingScriptPath -Description "Manifest resource embedding script"
+Assert-PathExists -LiteralPath $installerSmokeScriptPath -Description "Windows installer smoke test script"
 Assert-PathExists -LiteralPath $nativeCargoToml -Description "sunpack_native Cargo manifest"
 Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust workspace lockfile"
 Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch Broker Cargo manifest"
@@ -1166,6 +1168,14 @@ try {
     Remove-Item -LiteralPath $installerStagingRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 Assert-PathExists -LiteralPath $releaseInstallerPath -Description "Windows installer"
+
+Write-Step "Running Windows installer smoke test"
+Invoke-Native -FilePath "powershell" -Arguments @(
+    "-NoProfile",
+    "-ExecutionPolicy", "Bypass",
+    "-File", $installerSmokeScriptPath,
+    "-InstallerPath", $releaseInstallerPath
+)
 
 Write-Host ""
 Write-Host "Build completed successfully." -ForegroundColor Green

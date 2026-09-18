@@ -344,12 +344,28 @@ def test_build_and_release_workflow_publish_installers_only():
     assert "$releaseZipPath" not in build_script
     assert "portable archive" not in workflow
     assert "sunpack-windows-*.zip" not in workflow
-    assert "test_windows_installer.ps1" in workflow
+    assert "test_windows_installer.ps1" in build_script
+    assert 'Write-Step "Running Windows installer smoke test"' in build_script
+    assert '"-InstallerPath", $releaseInstallerPath' in build_script
+    assert "- name: Smoke test Windows installer" not in workflow
     assert "Expected one Windows installer" in workflow
     assert "*-setup.exe" in workflow
-    smoke_step = workflow[workflow.index("- name: Smoke test Windows installer"):]
-    smoke_step = smoke_step[:smoke_step.index("- name: Upload package artifact")]
-    assert "timeout-minutes: 15" in smoke_step
+
+
+def test_windows_build_runs_installer_smoke_after_installer_creation():
+    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+
+    installer_ready = build_script.index(
+        'Assert-PathExists -LiteralPath $releaseInstallerPath -Description "Windows installer"'
+    )
+    smoke_step = build_script.index('Write-Step "Running Windows installer smoke test"')
+    smoke_invoke = build_script.index(
+        '"-InstallerPath", $releaseInstallerPath',
+        smoke_step,
+    )
+    success = build_script.index('Write-Host "Build completed successfully."')
+
+    assert installer_ready < smoke_step < smoke_invoke < success
 
 
 def test_local_build_requires_inno_setup():
