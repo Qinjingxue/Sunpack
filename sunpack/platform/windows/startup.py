@@ -23,14 +23,14 @@ def startup_command() -> str:
 
 def enable_startup(command: str | None = None) -> str:
     command = command or startup_command()
-    with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
         winreg.SetValueEx(key, VALUE_NAME, 0, winreg.REG_SZ, command)
     return command
 
 
 def disable_startup() -> bool:
     try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as key:
             winreg.DeleteValue(key, VALUE_NAME)
         return True
     except FileNotFoundError:
@@ -39,7 +39,7 @@ def disable_startup() -> bool:
 
 def startup_status() -> tuple[bool, str]:
     try:
-        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, RUN_KEY, 0, winreg.KEY_READ) as key:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_READ) as key:
             value, _ = winreg.QueryValueEx(key, VALUE_NAME)
         return True, str(value)
     except FileNotFoundError:

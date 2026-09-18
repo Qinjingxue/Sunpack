@@ -62,8 +62,8 @@ english.BrokerExecutableMissing=Packaged Watch Broker executable is missing: %s
 english.BrokerCreateFailed=Failed to create %s (sc.exe exit code %d).
 english.BrokerSidTypeFailed=Failed to set the service SID type (sc.exe exit code %d).
 english.BrokerSecurityFailed=Failed to secure the Watch Broker service (sc.exe exit code %d).
-english.StartupEnableLaunchFailed=Failed to run sunpack while enabling startup.
-english.StartupEnableCommandFailed=sunpack could not enable startup (exit code %d).
+english.StartupEnableLaunchFailed=Failed to run sunpack while configuring startup.
+english.StartupEnableCommandFailed=sunpack could not configure startup (exit code %d).
 english.ToastRegisterLaunchFailed=Failed to run sunpack while registering machine-wide notifications.
 english.ToastRegisterCommandFailed=sunpack could not register machine-wide notifications (exit code %d).
 english.TaskAddToPathFailed=Failed to add sunpack to the current user's PATH.
@@ -89,8 +89,8 @@ chinesesimplified.BrokerExecutableMissing=安装包中缺少 Watch Broker 可执
 chinesesimplified.BrokerCreateFailed=无法创建 %s（sc.exe 退出码 %d）。
 chinesesimplified.BrokerSidTypeFailed=无法设置服务 SID 类型（sc.exe 退出码 %d）。
 chinesesimplified.BrokerSecurityFailed=无法设置 Watch Broker 服务权限（sc.exe 退出码 %d）。
-chinesesimplified.StartupEnableLaunchFailed=启用开机启动时无法运行 sunpack。
-chinesesimplified.StartupEnableCommandFailed=sunpack 无法启用开机启动（退出码 %d）。
+chinesesimplified.StartupEnableLaunchFailed=配置开机启动时无法运行 sunpack。
+chinesesimplified.StartupEnableCommandFailed=sunpack 无法配置开机启动（退出码 %d）。
 chinesesimplified.ToastRegisterLaunchFailed=注册机器级通知时无法运行 sunpack。
 chinesesimplified.ToastRegisterCommandFailed=sunpack 无法注册机器级通知（退出码 %d）。
 chinesesimplified.TaskAddToPathFailed=无法将 sunpack 添加到当前用户的 PATH。
@@ -128,6 +128,7 @@ Type: files; Name: "{commonprograms}\SunPack\Uninstall SunPack.lnk"
 Name: "{autoprograms}\SunPack\Uninstall SunPack"; Filename: "{uninstallexe}"
 
 [UninstallRun]
+Filename: "{app}\sunpack-runtime.exe"; Parameters: "--configure-startup-current-user disable"; RunOnceId: "SunPackStartup"; Flags: runhidden waituntilterminated skipifdoesntexist
 Filename: "{app}\sunpack-runtime.exe"; Parameters: "--unregister-toast"; RunOnceId: "SunPackToast"; Flags: runhidden waituntilterminated skipifdoesntexist
 
 [Code]
@@ -330,15 +331,62 @@ begin
   RegDeleteKeyIfEmpty(HKLM, SunPackRegistryKey);
 end;
 
-procedure RemoveStartupRunValue;
-begin
-  RegDeleteValue(HKLM, StartupRegistryKey, StartupValueName);
-end;
-
 function PowerShellSingleQuotedString(Value: string): string;
 begin
   StringChangeEx(Value, '''', '''''', True);
   Result := '''' + Value + '''';
+end;
+
+function HasExplicitTaskSelection: Boolean;
+var
+  Index: Integer;
+  Value: string;
+begin
+  Result := False;
+  for Index := 1 to ParamCount do
+  begin
+    Value := Uppercase(ParamStr(Index));
+    if (Copy(Value, 1, 7) = '/TASKS=') or
+       (Copy(Value, 1, 12) = '/MERGETASKS=') then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+function QueryOriginalUserStartupEnabled(var Enabled: Boolean): Boolean;
+var
+  ResultCode: Integer;
+begin
+  Enabled := False;
+  ResultCode := -1;
+  if not ExecAsOriginalUser(
+    ExpandConstant('{sys}\reg.exe'),
+    'query "HKCU\' + StartupRegistryKey + '" /v "' + StartupValueName + '"',
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+  begin
+    Log('Failed to query the original user startup state.');
+    Result := False;
+    Exit;
+  end;
+
+  if ResultCode = 0 then
+  begin
+    Enabled := True;
+    Result := True;
+  end
+  else if ResultCode = 1 then
+    Result := True
+  else
+  begin
+    Log(Format('Original user startup state query failed with exit code %d.', [ResultCode]));
+    Result := False;
+  end;
 end;
 
 function QueryExistingWatchRunning(var WatchStateDir: string): Boolean;
@@ -723,6 +771,7 @@ var
   ExistingInstallation: Boolean;
   RestartWatchAfterUpgrade: Boolean;
   ExistingWatchStateDir: string;
+  StartupTaskDefaultApplied: Boolean;
 
 procedure RestoreWatchAfterUpgrade;
 var
@@ -746,13 +795,65 @@ begin
     Log('SunPack Watch was restored after upgrade.');
 end;
 
+procedure ApplyStartupTaskDefault;
+var
+  Enabled: Boolean;
+begin
+  if StartupTaskDefaultApplied then
+    Exit;
+  StartupTaskDefaultApplied := True;
+
+  if HasExplicitTaskSelection then
+    Exit;
+  if not FileExists(ExpandConstant('{app}\sunpack.exe')) then
+    Exit;
+  if not QueryOriginalUserStartupEnabled(Enabled) then
+    Exit;
+
+  if Enabled then
+    WizardSelectTasks('autostart')
+  else
+    WizardSelectTasks('!autostart');
+end;
+
+procedure ApplySelectedStartupState;
+var
+  StartupAction: string;
+  ResultCode: Integer;
+begin
+  if WizardIsTaskSelected('autostart') then
+    StartupAction := 'enable'
+  else
+    StartupAction := 'disable';
+
+  if not Exec(
+    ExpandConstant('{app}\sunpack-runtime.exe'),
+    '--configure-startup-current-user ' + StartupAction,
+    ExpandConstant('{app}'),
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  ) then
+    RaiseException(CustomMessage('StartupEnableLaunchFailed'))
+  else if ResultCode <> 0 then
+    RaiseException(Format(CustomMessage('StartupEnableCommandFailed'), [ResultCode]));
+end;
+
 procedure InitializeWizard();
 begin
   WizardForm.LicenseAcceptedRadio.Checked := True;
+  StartupTaskDefaultApplied := False;
+end;
+
+procedure CurPageChanged(CurPageID: Integer);
+begin
+  if CurPageID = wpSelectTasks then
+    ApplyStartupTaskDefault;
 end;
 
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
+  ApplyStartupTaskDefault;
   ExistingInstallation := FileExists(ExpandConstant('{app}\sunpack.exe'));
   RestartWatchAfterUpgrade := False;
   ExistingWatchStateDir := '';
@@ -783,7 +884,6 @@ end;
 
 function InitializeUninstall(): Boolean;
 begin
-  RemoveStartupRunValue;
   Result := StopExistingProcessesAndWait;
   if Result then
     Result := StopAndDeleteBrokerService;
@@ -811,31 +911,18 @@ begin
     else if ResultCode <> 0 then
       RaiseException(Format(CustomMessage('ToastRegisterCommandFailed'), [ResultCode]));
     if ExistingInstallation then
+      RestoreWatchAfterUpgrade
+    else
     begin
-      RestoreWatchAfterUpgrade;
-      Exit;
+      if WizardIsTaskSelected('addtopath') and not AddMachinePath then
+        RaiseException(CustomMessage('TaskAddToPathFailed'));
+      if WizardIsTaskSelected('contextmenu') then
+      begin
+        if not RunContextMenuScript(True) then
+          RaiseException(CustomMessage('TaskContextMenuFailed'));
+      end;
     end;
-    if WizardIsTaskSelected('addtopath') and not AddMachinePath then
-      RaiseException(CustomMessage('TaskAddToPathFailed'));
-    if WizardIsTaskSelected('contextmenu') then
-    begin
-      if not RunContextMenuScript(True) then
-        RaiseException(CustomMessage('TaskContextMenuFailed'));
-    end;
-    if WizardIsTaskSelected('autostart') then
-    begin
-      if not Exec(
-        ExpandConstant('{app}\sunpack.exe'),
-        'watch startup enable',
-        '',
-        SW_HIDE,
-        ewWaitUntilTerminated,
-        ResultCode
-      ) then
-        RaiseException(CustomMessage('StartupEnableLaunchFailed'))
-      else if ResultCode <> 0 then
-        RaiseException(Format(CustomMessage('StartupEnableCommandFailed'), [ResultCode]));
-    end;
+    ApplySelectedStartupState;
   end;
 end;
 
@@ -845,7 +932,6 @@ begin
   begin
     StopAndDeleteBrokerService;
     RunContextMenuScript(False);
-    RemoveStartupRunValue;
     RemoveMachinePath;
   end;
 end;

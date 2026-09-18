@@ -178,7 +178,7 @@ Subcommands and options:
 | `reload` | — | Re-read the configuration and monitored roots. |
 | `stop` | — | Stop continuous monitoring. |
 | `status` | — | Show run status, pending counts, errors, and root directories. |
-| `startup enable\|disable\|status` | — | Manage the machine-wide logon startup entry. |
+| `startup enable\|disable\|status` | — | Manage the current user's logon startup entry. |
 
 `start` keeps running until a stop request arrives; `start --once` completes one current scheduling pass and then exits. Writing, moving, or modifying a file triggers an active cycle; once the file is ready it is submitted for processing according to the configured quiet policy. The arrival of a new volume or a change in password sources reactivates the affected tasks.
 

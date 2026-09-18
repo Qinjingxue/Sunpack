@@ -233,7 +233,7 @@ $installLog = Join-Path $testRoot "install.log"
 $uninstallLog = Join-Path $testRoot "uninstall.log"
 $folderMenuKey = "HKLM:\Software\Classes\Directory\shell\SunPack"
 $backgroundMenuKey = "HKLM:\Software\Classes\Directory\Background\shell\SunPack"
-$startupRunKey = "HKLM:\Software\Microsoft\Windows\CurrentVersion\Run"
+$startupRunKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 $systemEnvironmentKey = "HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 $startupValueName = "SunPackWatchService"
 $toastClsidKey = "HKLM:\Software\Classes\CLSID\{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}\LocalServer32"
@@ -560,7 +560,7 @@ try {
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
         "/SP-",
-        "/TASKS=addtopath,contextmenu,autostart",
+        "/TASKS=addtopath,contextmenu",
         "/DIR=$installRoot",
         "/LOG=$installLog"
     )
@@ -568,9 +568,8 @@ try {
     if ([bool]$watchStatusAfterStoppedUpgrade.summary.running) {
         throw "Upgrade install restarted Watch even though it was stopped before upgrade."
     }
-    $startupCommandAfterStoppedUpgrade = [string](Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName).$startupValueName
-    if ($startupCommandAfterStoppedUpgrade -ne $startupCommand) {
-        throw "Stopped-state upgrade changed the startup Run value: $startupCommandAfterStoppedUpgrade"
+    if (Get-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName -ErrorAction SilentlyContinue) {
+        throw "Stopped-state upgrade kept startup enabled even though autostart was not selected."
     }
 
     Write-SmokePhase -State "STAGE" -Label "validate one-shot Watch lifecycle"

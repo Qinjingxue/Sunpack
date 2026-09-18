@@ -2,15 +2,13 @@ import subprocess
 import sys
 
 
-def _launch_watch_unelevated() -> int:
-    """Installer-only bridge that restores Watch with the interactive shell token."""
-
+def _launch_unelevated_launcher(arguments: list[str]) -> int:
     from sunpack.platform.windows.process_launch import launch_unelevated
     from sunpack.support.process_executable import current_process_executable
 
     launcher = current_process_executable().with_name("sunpack.exe")
     process = launch_unelevated(
-        [str(launcher), "watch", "start"],
+        [str(launcher), *arguments],
         cwd=str(launcher.parent),
     )
     try:
@@ -32,12 +30,31 @@ def _launch_watch_unelevated() -> int:
             close()
 
 
+def _launch_watch_unelevated() -> int:
+    """Installer-only bridge that restores Watch with the interactive shell token."""
+
+    return _launch_unelevated_launcher(["watch", "start"])
+
+
+def _configure_startup_current_user(action: str) -> int:
+    """Apply the installer-selected startup state to the interactive user's HKCU."""
+
+    if action not in {"enable", "disable"}:
+        return 2
+    return _launch_unelevated_launcher(["watch", "startup", action])
+
+
 def main() -> int:
     # Installer recovery must be handled by the new runtime itself so it can
     # deliberately cross from an elevated setup process back to the
     # interactive shell's medium-integrity token.
     if sys.argv[1:2] == ["--launch-watch-unelevated"]:
         return _launch_watch_unelevated()
+
+    if sys.argv[1:2] == ["--configure-startup-current-user"]:
+        if len(sys.argv) != 3:
+            return 2
+        return _configure_startup_current_user(sys.argv[2])
 
     # Registration and COM activation enter the main runtime directly and do
     # not start an extraction engine or a watch service.
