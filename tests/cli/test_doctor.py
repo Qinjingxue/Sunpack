@@ -71,7 +71,7 @@ def test_doctor_returns_task_failed_when_a_check_fails(tmp_path, monkeypatch):
     assert "[FAIL] Native module: load failed" in stderr.getvalue()
 
 
-def test_installation_checks_accept_complete_machine_registration(tmp_path, monkeypatch):
+def test_installation_checks_accept_machine_toast_com_registration(tmp_path, monkeypatch):
     install_dir = tmp_path / "SunPack"
     runtime = install_dir / "sunpack-runtime.exe"
     launcher = install_dir / "sunpack.exe"
@@ -81,7 +81,6 @@ def test_installation_checks_accept_complete_machine_registration(tmp_path, monk
 
     values = {
         (doctor.SERVICE_REGISTRY_KEY, "ImagePath"): f'"{broker}"',
-        (doctor.TOAST_APP_ID_KEY, "CustomActivator"): doctor.TOAST_CLSID,
         (doctor.TOAST_LOCAL_SERVER_KEY, ""): f'"{runtime}" --toast-activated',
         (doctor.SUNPACK_REGISTRY_KEY, doctor.PATH_MARKER_NAME): 1,
         (doctor.ENVIRONMENT_REGISTRY_KEY, "Path"): f"C:\\Windows;{install_dir}",
