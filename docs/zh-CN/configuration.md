@@ -216,7 +216,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 
 | 字段 | 默认 | 说明 |
 | --- | ---: | --- |
-| `process_mode` | `normal` | 持续 Watch 的 RuntimeHost 与 native worker 的 Windows 进程调度模式。`normal` 保持正常调度；`background` 启用 Windows Background Processing Mode，会降低 CPU、I/O 和内存调度优先级，在系统有负载或异构核心 CPU 上可能显著降低吞吐。 |
+| `process_mode` | `normal` | Watch RuntimeHost 与 native worker 的固定 Windows 进程调度模式。`normal` 使用正常优先级；`background` 启用 Windows Background Processing Mode，可能显著降低吞吐；`high` 使用 `HIGH_PRIORITY_CLASS` 优先获得 CPU 时间，但可能降低其它应用的响应性。 |
 | `cold_start_seconds` | `0.0` | 文件首次进入活跃态时的等待时间。默认值为 0，文件准备好后可立即处理。 |
 | `quiet_min_seconds` | `0.0` | 动态静默时间下限。 |
 | `quiet_max_seconds` | `180.0` | 动态静默时间上限；`cold_start_seconds` 为 0 时不进入动态静默等待。 |
@@ -243,7 +243,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `toast_report_max_bytes` | `2097152` | 失败报告总大小上限，单位为字节。 |
 | `state_dir` | `""` | 监控状态目录；为空时使用根目录文件旁的 `.sunpack_watch`。 |
 
-监控服务只观察每个根目录的直接文件，不递归监听子目录。输入根必须位于 NTFS 卷，并且该卷有可读取的 USN Journal；否则该根无法启动监控。
+`process_mode` 在 Watch 启动和 Watch 配置 reload 时应用。任务开始/结束、空闲时间、前台 CLI 请求、Watch stop 和 Watch task 结束都不会自动改变该模式。\n\n监控服务只观察每个根目录的直接文件，不递归监听子目录。输入根必须位于 NTFS 卷，并且该卷有可读取的 USN Journal；否则该根无法启动监控。
 
 `created`、`moved` 和 `modified` 事件会使文件进入活跃态。监控按实际内容变化学习静默间隔；单纯 size 或 mtime 变化会参与间隔学习，其它内容事件会重置当前计时。一个活跃周期只提交一次主处理流程。新分卷到达或密码来源变化会重新激活受影响任务。
 
