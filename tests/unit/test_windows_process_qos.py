@@ -66,3 +66,34 @@ def test_processing_mode_is_noop_off_windows(monkeypatch):
     monkeypatch.setattr(process_qos.sys, "platform", "linux")
 
     assert process_qos.set_processing_mode(background=True) == "unsupported"
+
+def test_trim_working_set_uses_current_process_on_windows(monkeypatch):
+    calls = []
+    kernel32 = type(
+        "Kernel32",
+        (),
+        {"GetCurrentProcess": _FakeFunction(lambda: 123)},
+    )()
+    psapi = type(
+        "Psapi",
+        (),
+        {"EmptyWorkingSet": _FakeFunction(lambda process: calls.append(process) or True)},
+    )()
+
+    monkeypatch.setattr(process_qos.sys, "platform", "win32")
+    monkeypatch.setattr(
+        process_qos.ctypes,
+        "WinDLL",
+        lambda name, **_kwargs: kernel32 if name == "kernel32" else psapi,
+        raising=False,
+    )
+
+    assert process_qos.trim_working_set() is True
+    assert calls == [123]
+
+
+def test_trim_working_set_is_noop_off_windows(monkeypatch):
+    monkeypatch.setattr(process_qos.sys, "platform", "linux")
+
+    assert process_qos.trim_working_set() is False
+
