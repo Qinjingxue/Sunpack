@@ -368,6 +368,30 @@ def test_windows_build_runs_installer_smoke_after_installer_creation():
     assert installer_ready < smoke_step < smoke_invoke < success
 
 
+def test_local_build_skips_installer_smoke_only_for_existing_host_install_state():
+    build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+    smoke_script = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
+
+    assert '$installerSmokeArguments += "-SkipIfHostInstalled"' in build_script
+    assert '$env:CI' in build_script
+    assert '$env:GITHUB_ACTIONS' in build_script
+    assert "if (-not $runningInCi) {" in build_script
+
+    assert "[switch]$SkipIfHostInstalled" in smoke_script
+    assert "function Get-InstalledSunPackHostState {" in smoke_script
+    assert 'Get-Service -Name "SunPackWatchBroker"' in smoke_script
+    assert '"SunPackWatchService"' in smoke_script
+    assert (
+        "HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\"
+        "{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1"
+    ) in smoke_script
+    assert "Skipping Windows installer smoke test because this machine already has SunPack installation state" in smoke_script
+
+    preflight = smoke_script.index("if ($SkipIfHostInstalled) {")
+    elevation = smoke_script.index('. (Join-Path $PSScriptRoot "test_elevation.ps1")')
+    assert preflight < elevation
+
+
 def test_windows_build_always_pauses_at_exit_unless_no_pause():
     build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 
