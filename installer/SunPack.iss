@@ -73,6 +73,7 @@ english.PrepareBrokerRemoveFailed=The existing sunpack Watch Broker service coul
 english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed. Close sunpack and run the installer again.
 english.UninstallStopFailed=sunpack runtime processes or the Watch Broker service could not be stopped. Please restart Windows and run the uninstaller again.
 english.BuiltinPasswordsFileHeader=# Built-in common password list. You can edit this file; use one password per line.
+english.BuiltinPasswordsWatchManagedNote=# The following section is managed automatically by SunPack Watch.
 english.WatchRootsFileHeader=# Watched folders. Add one folder per line.
 english.WatchRootsFileMapping=# Optional output mapping: input folder | output folder
 english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted
@@ -99,6 +100,7 @@ chinesesimplified.PrepareBrokerRemoveFailed=无法删除现有 sunpack Watch Bro
 chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack 文件。请关闭 sunpack，然后重新运行安装程序。
 chinesesimplified.UninstallStopFailed=无法停止 sunpack 运行时进程或 Watch Broker 服务。请重启 Windows，然后重新运行卸载程序。
 chinesesimplified.BuiltinPasswordsFileHeader=# 此文件为内置高频密码配置表，用户可自行编辑，每行一个密码。
+chinesesimplified.BuiltinPasswordsWatchManagedNote=# 以下区域由 SunPack Watch 自动维护，请勿手动编辑。
 chinesesimplified.WatchRootsFileHeader=# 监控文件夹配置，每行填写一个监控目录。
 chinesesimplified.WatchRootsFileMapping=# 可选输出目录映射格式：输入目录 | 输出目录
 chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted
@@ -153,6 +155,12 @@ const
   StartupValueName = 'SunPackWatchService';
   PathMarkerName = 'PathAddedByInstaller';
   WatchBrokerServiceName = 'SunPackWatchBroker';
+  WatchClipboardBlockBegin = '#!SUNPACK-WATCH-CLIPBOARD-BEGIN';
+  WatchClipboardBlockEnd = '#!SUNPACK-WATCH-CLIPBOARD-END';
+  LegacyWatchClipboardBlockBeginEn = '# BEGIN SUNPACK WATCH CLIPBOARD PASSWORDS';
+  LegacyWatchClipboardBlockEndEn = '# END SUNPACK WATCH CLIPBOARD PASSWORDS';
+  LegacyWatchClipboardBlockBeginZh = '# 开始 SUNPACK 监控剪贴板密码';
+  LegacyWatchClipboardBlockEndZh = '# 结束 SUNPACK 监控剪贴板密码';
   WatchBrokerServiceSddl = 'D:(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;LCRP;;;IU)';
 
 function RunServiceControl(const Parameters: string; var ResultCode: Integer): Boolean;
@@ -555,6 +563,7 @@ var
   DataPath: string;
   FilePath: string;
   Contents: string;
+  Changed: Boolean;
 begin
   DataPath := ExpandConstant('{commonappdata}\SunPack');
   ForceDirectories(DataPath);
@@ -562,8 +571,48 @@ begin
   FilePath := AddBackslash(DataPath) + 'builtin_passwords.txt';
   if not FileExists(FilePath) then
   begin
-    Contents := CustomMessage('BuiltinPasswordsFileHeader') + #13#10;
+    Contents :=
+      CustomMessage('BuiltinPasswordsFileHeader') + #13#10 + #13#10 +
+      CustomMessage('BuiltinPasswordsWatchManagedNote') + #13#10 +
+      WatchClipboardBlockBegin + #13#10 +
+      WatchClipboardBlockEnd + #13#10;
     if not SaveStringToFile(FilePath, Contents, False) then
+      RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
+  end
+  else
+  begin
+    if not LoadStringFromFile(FilePath, Contents) then
+      RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
+
+    Changed := False;
+    if (Pos(WatchClipboardBlockBegin, Contents) = 0) and
+       (Pos(WatchClipboardBlockEnd, Contents) = 0) then
+    begin
+      if ((Pos(LegacyWatchClipboardBlockBeginEn, Contents) > 0) and
+          (Pos(LegacyWatchClipboardBlockEndEn, Contents) > 0)) or
+         ((Pos(LegacyWatchClipboardBlockBeginZh, Contents) > 0) and
+          (Pos(LegacyWatchClipboardBlockEndZh, Contents) > 0)) then
+      begin
+        StringChangeEx(Contents, LegacyWatchClipboardBlockBeginEn, WatchClipboardBlockBegin, True);
+        StringChangeEx(Contents, LegacyWatchClipboardBlockEndEn, WatchClipboardBlockEnd, True);
+        StringChangeEx(Contents, LegacyWatchClipboardBlockBeginZh, WatchClipboardBlockBegin, True);
+        StringChangeEx(Contents, LegacyWatchClipboardBlockEndZh, WatchClipboardBlockEnd, True);
+        Changed := True;
+      end
+      else
+      begin
+        if (Contents <> '') and (Copy(Contents, Length(Contents), 1) <> #10) then
+          Contents := Contents + #13#10;
+        Contents :=
+          Contents + #13#10 +
+          CustomMessage('BuiltinPasswordsWatchManagedNote') + #13#10 +
+          WatchClipboardBlockBegin + #13#10 +
+          WatchClipboardBlockEnd + #13#10;
+        Changed := True;
+      end;
+    end;
+
+    if Changed and not SaveStringToFile(FilePath, Contents, False) then
       RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
   end;
 
