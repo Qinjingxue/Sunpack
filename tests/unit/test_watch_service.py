@@ -1500,3 +1500,30 @@ def test_watch_service_deduplicates_unchanged_pending_ticks(tmp_path, monkeypatc
         {"processed": 1, "succeeded": 1, "failed": 0, "pending": 0, "errors": []},
         {"processed": 0, "succeeded": 0, "failed": 0, "pending": 1, "errors": []},
     ]
+
+
+def test_watch_root_edits_preserve_hash_comments(tmp_path, monkeypatch):
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    roots_path.write_text(
+        "# Watched folders. Add one folder per line.\n"
+        "# Example: C:\\Downloads | D:\\Extracted\n\n"
+        f"{first}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    service_module.add_watch_roots([str(second)])
+    after_add = roots_path.read_text(encoding="utf-8")
+    assert "# Watched folders. Add one folder per line." in after_add
+    assert "# Example: C:\\Downloads | D:\\Extracted" in after_add
+
+    service_module.remove_watch_roots([str(first)], cleanup=False)
+    after_remove = roots_path.read_text(encoding="utf-8")
+    assert "# Watched folders. Add one folder per line." in after_remove
+    assert "# Example: C:\\Downloads | D:\\Extracted" in after_remove
+    assert str(first.resolve()) not in after_remove
+    assert str(second.resolve()) in after_remove
