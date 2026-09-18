@@ -226,6 +226,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         postprocess::flatten_single_branch_directories,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(
+        postprocess::recover_pending_flatten_transactions,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(postprocess::delete_files_batch, m)?)?;
     m.add_function(wrap_pyfunction!(
         password::seven_zip::seven_zip_fast_verify_passwords,

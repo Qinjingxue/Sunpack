@@ -24,6 +24,7 @@ from sunpack.coordinator.target_groups import relation_group_to_fact_bag
 from sunpack.extraction.scheduler import ExtractionScheduler
 from sunpack.i18n import I18nContext
 from sunpack.postprocess.actions import PostProcessActions
+from sunpack.postprocess.internal.flatten import recover_pending_flatten_transactions
 from sunpack.passwords.internal.store import MAX_RECENT_PASSWORDS
 from sunpack.platform.windows.shell_notify import notify_shell_directories_updated
 from sunpack.rename.scheduler import OutputReservationRegistry, RenameScheduler
@@ -121,6 +122,10 @@ class PipelineEngine:
         self._owner_loop = loop
         self._broker.bind()
         await self._services.start()
+        # Flatten owns its own small filesystem transaction.  Finish anything an
+        # earlier process left behind before this one touches output roots again;
+        # CLI and watch share this engine, so one call site covers both.
+        recover_pending_flatten_transactions()
         self._started = True
         return self
 
