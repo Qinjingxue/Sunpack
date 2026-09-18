@@ -38,7 +38,7 @@ def test_machine_level_path_context_menu_startup_and_toast_registration():
     assert "RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath)" in installer
     assert "RegWriteDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, 1)" in installer
     assert "RegQueryDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, WasAdded)" in installer
-    assert "RegDeleteValue(HKLM, StartupRegistryKey, StartupValueName)" in installer
+    assert "--configure-startup-current-user" in installer
     assert "'--register-toast'" in installer
     assert 'Parameters: "--unregister-toast"' in installer
     for script in (register, unregister):
@@ -47,8 +47,8 @@ def test_machine_level_path_context_menu_startup_and_toast_registration():
     assert r"HKLM:\Software\Classes\Directory\shell\SunPack" in register
     assert r"HKLM:\Software\Classes\Directory\Background\shell\SunPack" in register
     assert r"HKLM:\Software\Classes\*\shell\SunPack" in register
-    assert "HKEY_CURRENT_USER" not in startup
-    assert startup.count("winreg.HKEY_LOCAL_MACHINE") == 3
+    assert "HKEY_LOCAL_MACHINE" not in startup
+    assert startup.count("winreg.HKEY_CURRENT_USER") == 3
     assert 'set_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName"' in toast
     assert 'set_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri"' in toast
     assert 'register_toast_activator(executable, arguments);' in toast
@@ -64,7 +64,7 @@ def test_installer_optionally_registers_watch_autostart():
     assert "chinesesimplified.TaskAutostart=Windows 启动时运行 sunpack 监控" in script
     assert "Software\\Microsoft\\Windows\\CurrentVersion\\Run" in script
     assert "WizardIsTaskSelected('autostart')" in script
-    assert "watch startup enable" in script
+    assert "--configure-startup-current-user" in script
     assert "SW_HIDE" in script
     assert "ewWaitUntilTerminated" in script
     assert "RaiseException(CustomMessage('StartupEnableLaunchFailed'))" in script
@@ -137,9 +137,8 @@ def test_uninstaller_unconditionally_removes_watch_autostart():
 
     assert "StartupRegistryKey = 'Software\\Microsoft\\Windows\\CurrentVersion\\Run'" in script
     assert "StartupValueName = 'SunPackWatchService'" in script
-    assert "procedure RemoveStartupRunValue" in script
-    assert "RegDeleteValue(HKLM, StartupRegistryKey, StartupValueName)" in script
-    assert "RemoveStartupRunValue;" in script
+    assert "procedure RemoveStartupRunValue" not in script
+    assert 'Parameters: "--configure-startup-current-user disable"' in script
 
 
 def test_installer_stops_existing_watch_before_upgrade_and_cleans_owned_files():
@@ -183,7 +182,6 @@ def test_upgrade_preserves_user_files_and_default_watch_state():
     prepare = script[script.index("function PrepareToInstall"):]
     prepare = prepare[:prepare.index("\nfunction ")]
     assert "ClearProgramDataExceptPersistentFiles(ExistingInstallation, ExistingWatchStateDir)" in prepare
-    assert "RemoveStartupRunValue" not in prepare
     assert "function IsPersistentWatchStatePath" in script
     assert "CompareText(ItemName, '.sunpack_watch') = 0" in script
     assert "IsSameOrChildPath(WatchStateDir, ItemPath)" in script
@@ -218,29 +216,39 @@ def test_upgrade_restores_watch_only_when_it_was_running_before_install():
     upgrade_guard = post[post.index("if ExistingInstallation then"):]
     upgrade_guard = upgrade_guard[:upgrade_guard.index("if WizardIsTaskSelected('addtopath')")]
     assert "RestoreWatchAfterUpgrade;" in upgrade_guard
-    assert "Exit;" in upgrade_guard
+    assert "Exit;" not in upgrade_guard
 
 
-def test_upgrade_never_changes_startup_path_or_context_menu():
+def test_upgrade_preserves_path_and_context_menu_but_applies_selected_startup_state():
     script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
 
     assert "ExistingInstallation := FileExists(ExpandConstant('{app}\\sunpack.exe'));" in script
-    assert "if ExistingInstallation then" in script
     setup = script[:script.index("function InitializeUninstall(): Boolean")]
     prepare = setup[setup.index("function PrepareToInstall"):]
-    assert "RemoveStartupRunValue;" not in prepare
     assert "RemoveMachinePath;" not in prepare
     assert "RunContextMenuScript(False);" not in prepare
+
     post = script[script.index("if CurStep = ssPostInstall then"):]
     post = post[:post.index("procedure CurUninstallStepChanged")]
-    exit_guard = post.index("if ExistingInstallation then")
-    assert post.index("'--register-toast'") < exit_guard
-    assert exit_guard < post.index("AddMachinePath")
-    assert exit_guard < post.index("RunContextMenuScript(True)")
-    assert exit_guard < post.index("watch startup enable")
+    upgrade_guard = post.index("if ExistingInstallation then")
+    assert post.index("'--register-toast'") < upgrade_guard
+    assert upgrade_guard < post.index("AddMachinePath")
+    assert upgrade_guard < post.index("RunContextMenuScript(True)")
+    assert post.index("ApplySelectedStartupState;") > upgrade_guard
+    assert "Exit;" not in post[upgrade_guard:]
     assert "RunContextMenuScript(False)" not in post
-    uninstall = script[script.index("function InitializeUninstall(): Boolean"):]
-    assert uninstall.count("RemoveStartupRunValue;") == 2
+
+
+def test_upgrade_startup_default_tracks_current_original_user_state():
+    script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
+
+    assert "function QueryOriginalUserStartupEnabled(var Enabled: Boolean): Boolean;" in script
+    assert "ExecAsOriginalUser(" in script
+    assert "'query \"HKCU\\' + StartupRegistryKey" in script
+    assert "WizardSelectTasks('autostart')" in script
+    assert "WizardSelectTasks('!autostart')" in script
+    assert "HasExplicitTaskSelection" in script
+    assert "ApplyStartupTaskDefault;" in script
 
 
 def test_optional_component_failures_abort_the_install():
@@ -269,7 +277,7 @@ def test_uninstaller_stops_running_watch_before_removing_files():
     assert "function InitializeUninstall(): Boolean" in script
     assert "function WaitForExistingRuntimesToExit: Boolean" in script
     assert "function StopExistingProcessesAndWait: Boolean" in script
-    assert "RemoveStartupRunValue;" in script
+    assert "--configure-startup-current-user disable" in script
     assert "Result := StopExistingProcessesAndWait;" in script
     assert "Watch Broker service could not be stopped" in script
     assert "StopAndDeleteBrokerService" in script
