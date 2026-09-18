@@ -87,16 +87,22 @@ def test_background_mode_falls_back_to_below_normal(monkeypatch):
         "WinDLL",
         lambda *_args, **_kwargs: _kernel32(
             calls,
-            accepted={process_qos.BELOW_NORMAL_PRIORITY_CLASS},
+            accepted={
+                process_qos.BELOW_NORMAL_PRIORITY_CLASS,
+                process_qos.NORMAL_PRIORITY_CLASS,
+            },
         ),
         raising=False,
     )
     monkeypatch.setattr(process_qos, "_MODE", "normal")
 
     assert process_qos.set_processing_mode(mode="background") == "below_normal"
+    assert process_qos.set_processing_mode(mode="normal") == "normal"
     assert calls == [
         (123, process_qos.PROCESS_MODE_BACKGROUND_BEGIN),
         (123, process_qos.BELOW_NORMAL_PRIORITY_CLASS),
+        (123, process_qos.PROCESS_MODE_BACKGROUND_END),
+        (123, process_qos.NORMAL_PRIORITY_CLASS),
     ]
 
 
