@@ -270,3 +270,71 @@ def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_p
 
     asyncio.run(run())
     assert managers[0]["update_interval_ms"] == 123
+
+
+def test_runtime_host_only_schedules_background_when_configured():
+    async def scenario():
+        host = RuntimeHost()
+        host._watch_service = SimpleNamespace(scheduler=None)
+        host._watch_task = SimpleNamespace(done=lambda: False)
+
+        host._watch_process_mode = "normal"
+        host._schedule_background()
+        assert host._demote_task is None
+
+        host._watch_process_mode = "background"
+        host._schedule_background()
+        assert host._demote_task is not None
+        host._demote_task.cancel()
+        await asyncio.gather(host._demote_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+
+def test_runtime_host_reload_applies_watch_process_mode(monkeypatch):
+    applied = []
+    scheduled = []
+
+    class FakeService:
+        def __init__(self):
+            self.scheduler = None
+            self.config = {"watch": {"process_mode": "background"}}
+
+        async def reload(self):
+            self.config = {"watch": {"process_mode": "normal"}}
+            return True
+
+    async def scenario():
+        host = RuntimeHost()
+        host._watch_service = FakeService()
+        host._watch_task = SimpleNamespace(done=lambda: False)
+        host._watch_process_mode = "background"
+
+        async def set_process_mode(*, background):
+            applied.append(background)
+
+        monkeypatch.setattr(host, "_set_process_mode", set_process_mode)
+        monkeypatch.setattr(host, "_schedule_background", lambda: scheduled.append(True))
+
+        result = await host.reload_watch()
+
+        assert result["reloaded"] is True
+        assert host._watch_process_mode == "normal"
+        assert applied == [False]
+        assert scheduled == []
+
+        host._watch_service.config = {"watch": {"process_mode": "normal"}}
+
+        async def reload_background():
+            host._watch_service.config = {"watch": {"process_mode": "background"}}
+            return True
+
+        monkeypatch.setattr(host._watch_service, "reload", reload_background)
+        result = await host.reload_watch()
+
+        assert result["reloaded"] is True
+        assert host._watch_process_mode == "background"
+        assert scheduled == [True]
+
+    asyncio.run(scenario())
+
