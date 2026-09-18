@@ -1,12 +1,45 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [string]$InstallerPath
+    [string]$InstallerPath,
+    [switch]$SkipIfHostInstalled
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 $repoRoot = Split-Path -Parent $PSScriptRoot
+
+function Get-InstalledSunPackHostState {
+    $reasons = @()
+    if (Get-Service -Name "SunPackWatchBroker" -ErrorAction SilentlyContinue) {
+        $reasons += "Watch Broker service"
+    }
+    if (Get-ItemProperty -LiteralPath "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run" -Name "SunPackWatchService" -ErrorAction SilentlyContinue) {
+        $reasons += "startup Run value"
+    }
+    foreach ($key in @(
+        "HKLM:\Software\Classes\CLSID\{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}\LocalServer32",
+        "HKLM:\Software\Classes\Directory\shell\SunPack",
+        "HKLM:\Software\Classes\Directory\Background\shell\SunPack",
+        "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1"
+    )) {
+        if (Test-Path -LiteralPath $key) {
+            $reasons += $key
+        }
+    }
+    return @($reasons)
+}
+
+if ($SkipIfHostInstalled) {
+    $installedHostState = @(Get-InstalledSunPackHostState)
+    if ($installedHostState.Count -gt 0) {
+        Write-Host (
+            "Skipping Windows installer smoke test because this machine already has SunPack installation state: {0}" -f
+            ($installedHostState -join ", ")
+        ) -ForegroundColor Yellow
+        exit 0
+    }
+}
 
 . (Join-Path $PSScriptRoot "test_elevation.ps1")
 $elevatedExitCode = Invoke-TestScriptElevated -ScriptPath $PSCommandPath -BoundParameters $PSBoundParameters
