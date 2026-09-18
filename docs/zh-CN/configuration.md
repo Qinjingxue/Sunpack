@@ -35,6 +35,7 @@ python sunpack.py scan C:\Archives
 ```json
 {
   "cli": {},
+  "runtime": {},
   "recursive_extract": "*",
   "nested_extraction_policy": {},
   "post_extract": {},
@@ -162,6 +163,16 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 
 目录扫描和过滤由原生扫描能力执行；过滤器无法映射到原生参数时会明确报告错误。
 
+## runtime
+
+`runtime` 控制 Watch 与前台工作负载共享的进程级 Runtime 行为。
+
+| 字段 | 默认 | 说明 |
+| --- | ---: | --- |
+| `process_mode` | `normal` | 共享 RuntimeHost 与 native worker 的 Windows 调度基线。 `normal` 使用正常优先级；`background` 启用 Windows Background Processing Mode；`high` 使用 `HIGH_PRIORITY_CLASS`，可能降低其它应用的响应性。 |
+
+前台 `extract`、`scan`、`inspect` 会用各自的 `--process-mode` 临时覆盖该基线；未显式指定时 CLI override 默认是 `high`。命令结束后 override 不立即失效，而是在现有空闲维护时机（`watch.runtime_cache_cleanup_idle_seconds`）到期后清除，并恢复最新热重载的 `runtime.process_mode`。Watch 运行时修改 `runtime.process_mode` 会热应用且不重启 scheduler；若 CLI override 仍有效，则仍由 override 优先，直到空闲到期。
+
 ## performance
 
 资源分析和 worker 参数都位于 `performance`。默认值如下：
@@ -216,7 +227,6 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 
 | 字段 | 默认 | 说明 |
 | --- | ---: | --- |
-| `process_mode` | `normal` | Watch RuntimeHost 与 native worker 的固定 Windows 进程调度模式。`normal` 使用正常优先级；`background` 启用 Windows Background Processing Mode，可能显著降低吞吐；`high` 使用 `HIGH_PRIORITY_CLASS` 优先获得 CPU 时间，但可能降低其它应用的响应性。 |
 | `cold_start_seconds` | `0.0` | 文件首次进入活跃态时的等待时间。默认值为 0，文件准备好后可立即处理。 |
 | `quiet_min_seconds` | `0.0` | 动态静默时间下限。 |
 | `quiet_max_seconds` | `180.0` | 动态静默时间上限；`cold_start_seconds` 为 0 时不进入动态静默等待。 |
@@ -224,7 +234,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `max_folders` | `16` | 配置中的目录数量上限字段，当前 CLI 目录列表由 `sunpack_watch_roots.txt` 管理。 |
 | `observer_stop_timeout_seconds` | `5.0` | 停止文件系统观察线程的等待时间。 |
 | `runtime_cache_cleanup_enabled` | `true` | 是否清理空闲运行缓存。 |
-| `runtime_cache_cleanup_idle_seconds` | `10.0` | 缓存空闲多久后清理。 |
+| `runtime_cache_cleanup_idle_seconds` | `10.0` | 共享空闲维护等待时间。到期时 CLI process-mode override 失效；`runtime_cache_cleanup_enabled` 为 true 时同时清理运行缓存。 |
 | `password_retry_debounce_seconds` | `0.5` | 密码文件或剪贴板变化后，触发失败任务重试前的等待时间。 |
 | `password_retry_include_subtree` | `true` | 密码来源变化时是否重试对应目录的子树任务。 |
 | `clipboard_monitor_enabled` | `true` | 是否监控剪贴板密码变化。 |
@@ -243,7 +253,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `toast_report_max_bytes` | `2097152` | 失败报告总大小上限，单位为字节。 |
 | `state_dir` | `""` | 监控状态目录；为空时使用根目录文件旁的 `.sunpack_watch`。 |
 
-`process_mode` 在 Watch 启动和 Watch 配置 reload 时应用。任务开始/结束、空闲时间、前台 CLI 请求、Watch stop 和 Watch task 结束都不会自动改变该模式。\n\n监控服务只观察每个根目录的直接文件，不递归监听子目录。输入根必须位于 NTFS 卷，并且该卷有可读取的 USN Journal；否则该根无法启动监控。
+监控服务只观察每个根目录的直接文件，不递归监听子目录。输入根必须位于 NTFS 卷，并且该卷有可读取的 USN Journal；否则该根无法启动监控。
 
 `created`、`moved` 和 `modified` 事件会使文件进入活跃态。监控按实际内容变化学习静默间隔；单纯 size 或 mtime 变化会参与间隔学习，其它内容事件会重置当前计时。一个活跃周期只提交一次主处理流程。新分卷到达或密码来源变化会重新激活受影响任务。
 
