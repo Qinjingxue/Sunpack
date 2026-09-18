@@ -76,6 +76,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["performance"]["worker"]["watchdog_no_progress_timeout_seconds"] == 180
     assert config["performance"]["worker"]["initial_active_jobs"] == 3
 
+
 def test_load_config_rejects_invalid_watch_process_mode(tmp_path, monkeypatch):
     simple = tmp_path / "sunpack_config.json"
     advanced = tmp_path / "sunpack_advanced_config.json"
@@ -87,7 +88,6 @@ def test_load_config_rejects_invalid_watch_process_mode(tmp_path, monkeypatch):
 
     with pytest.raises(loader.ConfigError, match="watch.process_mode"):
         loader.load_config()
-
 
 
 def test_load_config_uses_explicit_request_cwd(tmp_path, monkeypatch):
