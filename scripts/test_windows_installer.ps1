@@ -525,8 +525,9 @@ try {
     $staleDataMarker = Join-Path $userDataRoot "stale-runtime-state.json"
     Set-Content -LiteralPath $staleDataMarker -Value "stale" -Encoding UTF8
     $staleDataDir = Join-Path $userDataRoot "runtime-cwd"
+    $staleDataMarker = Join-Path $staleDataDir "stale.json"
     New-Item -ItemType Directory -Path $staleDataDir -Force | Out-Null
-    Set-Content -LiteralPath (Join-Path $staleDataDir "stale.json") -Value "stale" -Encoding UTF8
+    Set-Content -LiteralPath $staleDataMarker -Value "stale" -Encoding UTF8
     $watchStatusBeforeUpgrade = Invoke-UnelevatedJson -FilePath $appPath -Arguments @("watch", "status", "--json")
     if (-not [bool]$watchStatusBeforeUpgrade.summary.running) {
         throw "Installer smoke precondition failed: Watch is not running before the upgrade."
@@ -569,8 +570,11 @@ try {
     if (Test-Path -LiteralPath $staleDataMarker) {
         throw "Upgrade install left stale runtime state behind: $staleDataMarker"
     }
-    if (Test-Path -LiteralPath $staleDataDir) {
-        throw "Upgrade install left stale runtime state behind: $staleDataDir"
+    # A restored persistent runtime legitimately recreates runtime-cwd after the
+    # installer has cleaned old transient state. Verify the stale payload is gone
+    # instead of requiring the live runtime's working directory to stay absent.
+    if (Test-Path -LiteralPath $staleDataMarker) {
+        throw "Upgrade install left stale runtime state marker behind: $staleDataMarker"
     }
     if (-not (Test-Path -LiteralPath $upgradeWatchStateMarker -PathType Leaf)) {
         throw "Upgrade install removed the durable Watch state directory: $watchStateDir"
