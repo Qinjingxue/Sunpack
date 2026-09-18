@@ -98,3 +98,31 @@ def test_finalize_response_retries_only_failed_cleanups(tmp_path, monkeypatch):
             "previous_cleanup": {engine_module.path_key(str(archive)): failed},
         }
     ]
+
+
+def test_finalize_response_can_defer_watch_flatten(tmp_path, monkeypatch):
+    output = tmp_path / "output"
+    response = PipelineResponse(
+        request_id="deferred-flatten",
+        summary=RunSummary(success_count=1, failed_tasks=[], processed_keys=[]),
+        artifacts=PipelineArtifacts(flatten_targets=(str(output),)),
+    )
+    barrier_calls: list[tuple[str, ...]] = []
+    apply_calls: list[dict] = []
+    _recording(monkeypatch, barrier_calls, apply_calls)
+
+    engine_module._finalize_response(
+        {"post_extract": {"archive_cleanup_mode": "recycle", "flatten_single_directory": True}},
+        response,
+        defer_flatten=True,
+    )
+
+    assert barrier_calls == []
+    assert apply_calls == [
+        {
+            "archives_to_clean": [],
+            "flatten_targets": [],
+            "previous_cleanup": None,
+        }
+    ]
+    assert response.artifacts.flatten_targets == (str(output),)
