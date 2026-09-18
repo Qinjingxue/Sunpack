@@ -78,6 +78,8 @@ class _WindowsClipboardLoop:
         self.kernel32.GetModuleHandleW.restype = wintypes.HINSTANCE
         self.user32.RegisterClassW.argtypes = [ctypes.POINTER(WNDCLASS)]
         self.user32.RegisterClassW.restype = wintypes.ATOM
+        self.user32.UnregisterClassW.argtypes = [wintypes.LPCWSTR, wintypes.HINSTANCE]
+        self.user32.UnregisterClassW.restype = wintypes.BOOL
         self.user32.CreateWindowExW.argtypes = [
             wintypes.DWORD,
             wintypes.LPCWSTR,
@@ -95,42 +97,56 @@ class _WindowsClipboardLoop:
         self.user32.CreateWindowExW.restype = wintypes.HWND
         self.user32.DefWindowProcW.argtypes = [wintypes.HWND, wintypes.UINT, WPARAM, LPARAM]
         self.user32.DefWindowProcW.restype = LRESULT
-        self.class_name = "SunpackClipboardPasswordMonitor"
+        self.class_name = f"SunpackClipboardPasswordMonitor_{id(self):x}"
         self._wndproc_ref = None
+        self._hinstance = None
+        self._class_registered = False
 
     def run(self) -> None:
         hwnd = self._create_window()
         if not hwnd:
             return
         self.monitor._hwnd = hwnd
-        if not self.user32.AddClipboardFormatListener(hwnd):
+        listener_registered = False
+        try:
+            listener_registered = bool(self.user32.AddClipboardFormatListener(hwnd))
+            if not listener_registered:
+                return
+            # Close the startup race between launching the watch service and
+            # registering for clipboard notifications.  A copy made during that
+            # window does not produce another WM_CLIPBOARDUPDATE, so read the
+            # current clipboard once after the listener is active.
+            self.monitor._handle_clipboard_update()
+            msg = wintypes.MSG()
+            while not self.monitor._stop_event.is_set():
+                result = self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+                if result <= 0:
+                    break
+                self.user32.TranslateMessage(ctypes.byref(msg))
+                self.user32.DispatchMessageW(ctypes.byref(msg))
+        finally:
+            if listener_registered:
+                self.user32.RemoveClipboardFormatListener(hwnd)
+            if self.monitor._hwnd == hwnd:
+                self.monitor._hwnd = None
             self.user32.DestroyWindow(hwnd)
-            return
-        # Close the startup race between launching the watch service and
-        # registering for clipboard notifications.  A copy made during that
-        # window does not produce another WM_CLIPBOARDUPDATE, so read the
-        # current clipboard once after the listener is active.
-        self.monitor._handle_clipboard_update()
-        msg = wintypes.MSG()
-        while not self.monitor._stop_event.is_set():
-            result = self.user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
-            if result <= 0:
-                break
-            self.user32.TranslateMessage(ctypes.byref(msg))
-            self.user32.DispatchMessageW(ctypes.byref(msg))
-        self.user32.RemoveClipboardFormatListener(hwnd)
-        self.user32.DestroyWindow(hwnd)
+            self._unregister_window_class()
 
     def _create_window(self):
         wndproc_type = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, WPARAM, LPARAM)
         self._wndproc_ref = wndproc_type(self._wndproc)
-        hinstance = self.kernel32.GetModuleHandleW(None)
+        self._hinstance = self.kernel32.GetModuleHandleW(None)
         wndclass = WNDCLASS()
         wndclass.lpfnWndProc = ctypes.cast(self._wndproc_ref, ctypes.c_void_p)
-        wndclass.hInstance = hinstance
+        wndclass.hInstance = self._hinstance
         wndclass.lpszClassName = self.class_name
-        self.user32.RegisterClassW(ctypes.byref(wndclass))
-        return self.user32.CreateWindowExW(
+        atom = self.user32.RegisterClassW(ctypes.byref(wndclass))
+        if not atom:
+            self._wndproc_ref = None
+            self._hinstance = None
+            return None
+        self._class_registered = True
+        hwnd = self.user32.CreateWindowExW(
             0,
             self.class_name,
             self.class_name,
@@ -141,9 +157,20 @@ class _WindowsClipboardLoop:
             0,
             self.HWND_MESSAGE,
             None,
-            hinstance,
+            self._hinstance,
             None,
         )
+        if not hwnd:
+            self._unregister_window_class()
+        return hwnd
+
+    def _unregister_window_class(self) -> None:
+        if not self._class_registered or self._hinstance is None:
+            return
+        if self.user32.UnregisterClassW(self.class_name, self._hinstance):
+            self._class_registered = False
+            self._hinstance = None
+            self._wndproc_ref = None
 
     def _wndproc(self, hwnd, msg, wparam, lparam):
         if msg == self.WM_CLIPBOARDUPDATE:
