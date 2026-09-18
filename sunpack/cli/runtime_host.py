@@ -16,9 +16,9 @@ from sunpack.filesystem.watcher.service import WatchService
 _LOG = logging.getLogger(__name__)
 
 
-def _configured_watch_process_mode(config: dict) -> str:
-    watch = config.get("watch") if isinstance(config.get("watch"), dict) else {}
-    return str(watch.get("process_mode") or "normal").strip().lower()
+def _configured_runtime_process_mode(config: dict) -> str:
+    runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
+    return str(runtime.get("process_mode") or "normal").strip().lower()
 
 
 class RuntimeHost:
@@ -38,6 +38,8 @@ class RuntimeHost:
         self._watch_generation = 0
         self._last_watch_error = ""
         self._foreground_requests = 0
+        self._configured_process_mode = "normal"
+        self._cli_process_mode_override: str | None = None
         self._process_mode = "normal"
         self._state_changed = state_changed
         self.archive_registry = ActiveArchiveRegistry()
@@ -79,8 +81,8 @@ class RuntimeHost:
                 self.log_event("watch_start_reused")
                 return {"started": False, "running": True, "generation": self._watch_generation}
             config = load_config()
+            await self._set_configured_process_mode(config)
             engine = await shared_pipeline_engine(config)
-            await self._set_process_mode(mode=_configured_watch_process_mode(config))
             tray_factory = None
             if tray_enabled:
                 from sunpack.gui.tray import WindowsTrayIcon
@@ -102,6 +104,7 @@ class RuntimeHost:
                 tray_factory=tray_factory,
                 group_coordinator_factory=WatchGroupCoordinator,
                 toast_manager_factory=toast_manager_factory,
+                config_applied_callback=self._watch_config_applied,
             )
             task = asyncio.create_task(
                 service.run(
@@ -149,8 +152,8 @@ class RuntimeHost:
             await service.scheduler.run_once()
             return 0
         config = load_config()
+        await self._set_configured_process_mode(config)
         engine = await shared_pipeline_engine(config)
-        await self._set_process_mode(mode=_configured_watch_process_mode(config))
         service = WatchService(
             pipeline_engine=engine,
             group_coordinator_factory=WatchGroupCoordinator,
@@ -184,10 +187,6 @@ class RuntimeHost:
             self.log_event("watch_reload_ignored")
             return {"reloaded": False, "running": False, "generation": self._watch_generation}
         reloaded = await service.reload()
-        if reloaded:
-            await self._set_process_mode(
-                mode=_configured_watch_process_mode(getattr(service, "config", {}))
-            )
         self.log_event("watch_reloaded" if reloaded else "watch_reload_skipped")
         return {"reloaded": reloaded, "running": True, "generation": self._watch_generation}
 
@@ -265,6 +264,48 @@ class RuntimeHost:
                 if scheduler is not None:
                     await scheduler.set_external_activity(False)
         self.log_event("foreground_finished", foreground_requests=self._foreground_requests)
+
+    @property
+    def process_mode(self) -> str:
+        return self._process_mode
+
+    async def set_cli_process_mode_override(self, mode: str) -> None:
+        normalized = str(mode or "high").strip().lower()
+        if normalized not in {"background", "normal", "high"}:
+            raise ValueError(f"unsupported process mode: {mode}")
+        self._cli_process_mode_override = normalized
+        await self._apply_effective_process_mode()
+
+    async def expire_cli_process_mode_override(self) -> bool:
+        if self._cli_process_mode_override is None:
+            return False
+        previous = self._cli_process_mode_override
+        self._cli_process_mode_override = None
+        await self._apply_effective_process_mode()
+        self.log_event(
+            "cli_process_mode_override_expired",
+            previous_mode=previous,
+            restored_mode=self._configured_process_mode,
+        )
+        return True
+
+    async def sync_process_mode_to_engine(self, engine) -> None:
+        try:
+            await engine.set_process_mode(mode=self._process_mode)
+        except Exception:
+            _LOG.exception("failed to synchronize native worker process mode")
+
+    async def _watch_config_applied(self, config: dict) -> None:
+        await self._set_configured_process_mode(config)
+
+    async def _set_configured_process_mode(self, config: dict) -> None:
+        self._configured_process_mode = _configured_runtime_process_mode(config)
+        await self._apply_effective_process_mode()
+
+    async def _apply_effective_process_mode(self) -> None:
+        await self._set_process_mode(
+            mode=self._cli_process_mode_override or self._configured_process_mode
+        )
 
     async def _set_process_mode(self, *, mode: str) -> None:
         async with self._qos_lock:
