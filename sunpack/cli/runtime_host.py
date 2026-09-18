@@ -16,6 +16,11 @@ from sunpack.filesystem.watcher.service import WatchService
 _LOG = logging.getLogger(__name__)
 
 
+def _configured_watch_process_mode(config: dict) -> str:
+    watch = config.get("watch") if isinstance(config.get("watch"), dict) else {}
+    return str(watch.get("process_mode") or "normal").strip().lower()
+
+
 class RuntimeHost:
     """Own the one engine and optional watch lifecycle for one installed executable."""
 
@@ -34,6 +39,7 @@ class RuntimeHost:
         self._last_watch_error = ""
         self._foreground_requests = 0
         self._background = False
+        self._watch_process_mode = "normal"
         self._demote_task: asyncio.Task | None = None
         self._state_changed = state_changed
         self.archive_registry = ActiveArchiveRegistry()
@@ -75,6 +81,7 @@ class RuntimeHost:
                 self.log_event("watch_start_reused")
                 return {"started": False, "running": True, "generation": self._watch_generation}
             config = load_config()
+            self._watch_process_mode = _configured_watch_process_mode(config)
             engine = await shared_pipeline_engine(config)
             tray_factory = None
             if tray_enabled:
@@ -181,6 +188,16 @@ class RuntimeHost:
             self.log_event("watch_reload_ignored")
             return {"reloaded": False, "running": False, "generation": self._watch_generation}
         reloaded = await service.reload()
+        if reloaded:
+            self._watch_process_mode = _configured_watch_process_mode(getattr(service, "config", {}))
+            if self._watch_process_mode == "background":
+                self._schedule_background()
+            else:
+                demote = self._demote_task
+                self._demote_task = None
+                if demote is not None:
+                    demote.cancel()
+                await self._set_process_mode(background=False)
         self.log_event("watch_reloaded" if reloaded else "watch_reload_skipped")
         return {"reloaded": reloaded, "running": True, "generation": self._watch_generation}
 
@@ -272,7 +289,7 @@ class RuntimeHost:
             self._schedule_background()
 
     def _schedule_background(self) -> None:
-        if self._foreground_requests or not self.watch_enabled:
+        if self._watch_process_mode != "background" or self._foreground_requests or not self.watch_enabled:
             return
         previous = self._demote_task
         if previous is not None:
