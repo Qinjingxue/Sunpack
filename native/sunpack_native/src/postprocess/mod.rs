@@ -455,48 +455,6 @@ fn only_child_directory(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-fn promote_leaf_entries(root: &Path, leaf: &Path, stats: &mut FlattenStats) {
-    let entries = match fs::read_dir(leaf) {
-        Ok(entries) => entries,
-        // A resumed transaction whose cleanup already removed the leaf levels
-        // has nothing left to promote.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-        Err(error) => {
-            stats.errors.push(format!("{}: {error}", normalize_path(leaf)));
-            return;
-        }
-    };
-    // The detach left the root empty, so the hot path needs no per-entry
-    // existence probe.  A root that is not empty keeps the historical unique
-    // naming fallback, and a concurrent writer still falls back on rename error.
-    let root_is_empty = fs::read_dir(root)
-        .map(|mut entries| entries.next().is_none())
-        .unwrap_or(false);
-    for entry in entries.flatten() {
-        let source = entry.path();
-        let Some(name) = source.file_name() else {
-            continue;
-        };
-        let mut destination = if root_is_empty {
-            root.join(name)
-        } else {
-            unique_destination(root, name)
-        };
-        if fs::rename(&source, &destination).is_err() {
-            destination = unique_destination(root, name);
-            if let Err(error) = fs::rename(&source, &destination) {
-                stats.errors.push(format!(
-                    "{} -> {}: {error}",
-                    normalize_path(&source),
-                    normalize_path(&destination)
-                ));
-                return;
-            }
-        }
-        stats.moved += 1;
-    }
-}
-
 fn remove_flatten_wrapper(work: &Path, leaf_relative: &Path) -> Result<usize, String> {
     let mut directories = vec![work.to_path_buf()];
     let mut current = work.to_path_buf();
