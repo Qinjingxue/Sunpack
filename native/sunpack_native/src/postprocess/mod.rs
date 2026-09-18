@@ -229,14 +229,8 @@ struct FlattenStats {
 }
 
 /// One flatten transaction: replace the output root directory object with the
-/// deepest single-child directory.  The payload tree moves as one namespace
+/// deepest single-child directory. The payload tree moves as one namespace
 /// object, so cost depends on wrapper depth rather than direct child count.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FlattenPhase {
-    Prepared,
-    Detached,
-}
-
 struct FlattenState {
     root: PathBuf,
     work: PathBuf,
@@ -247,8 +241,10 @@ const FLATTEN_STATE_VERSION: u32 = 3;
 
 fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats, state_dir: Option<&Path>) {
     if let Some(state_dir) = state_dir {
-        if let Some((state_file, state, phase)) = pending_flatten_state(state_dir, root) {
-            run_flatten_transaction(Some(&state_file), &state, phase, stats);
+        if let Some((state_file, state)) = pending_flatten_state(state_dir, root) {
+            if run_flatten_transaction(&state, stats, false) {
+                let _ = fs::remove_file(state_file);
+            }
             return;
         }
     }
@@ -280,9 +276,9 @@ fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats, state_dir:
         leaf_relative,
     };
 
-    // Persist the intent before changing the namespace.  The phase transition is
-    // encoded by a write-through rename of the state file, avoiding a second
-    // state-content fsync on the hot path.
+    // Persist intent before the first namespace mutation. Once a swap starts,
+    // root/work existence is enough to resume it; if a crash happens before the
+    // first rename, leaving the original unflattened tree is already safe.
     let state_file = match state_dir {
         Some(state_dir) => match write_flatten_state(state_dir, &state) {
             Ok(path) => Some(path),
@@ -293,139 +289,99 @@ fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats, state_dir:
         },
         None => None,
     };
-    run_flatten_transaction(
-        state_file.as_deref(),
-        &state,
-        FlattenPhase::Prepared,
-        stats,
-    );
+    if run_flatten_transaction(&state, stats, true) {
+        if let Some(path) = state_file {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
-/// Forward recovery uses only the durable phase marker and the current
-/// root/work namespace.  No per-entry progress exists because the payload is
-/// promoted with one directory rename.
+/// Forward recovery uses only the current root/work namespace:
+/// - root only: untouched or already complete, both safe;
+/// - work only: root detach completed, promote the recorded leaf;
+/// - root + work: leaf promotion completed, remove empty wrappers.
+///
+/// start_if_untouched is true only for the process that just wrote the state.
+/// Recovery deliberately treats an untouched tree as complete instead of
+/// restarting a cosmetic postprocess after a crash.
 fn run_flatten_transaction(
-    state_file: Option<&Path>,
     state: &FlattenState,
-    mut phase: FlattenPhase,
     stats: &mut FlattenStats,
+    start_if_untouched: bool,
 ) -> bool {
-    let mut current_state_file = state_file.map(Path::to_path_buf);
+    let leaf = state.work.join(&state.leaf_relative);
 
-    if phase == FlattenPhase::Prepared {
-        match (state.root.is_dir(), state.work.is_dir()) {
-            (true, false) => {
-                if let Err(error) = fs::rename(&state.root, &state.work) {
-                    stats.errors.push(format!(
-                        "{} -> {}: {error}",
-                        normalize_path(&state.root),
-                        normalize_path(&state.work)
-                    ));
-                    return false;
-                }
-            }
-            (false, true) => {
-                // The root detach completed before the prepared->detached state
-                // rename.  Recovery can safely finish that phase transition.
-            }
-            (true, true) => {
-                stats.errors.push(format!(
-                    "{}: flatten recovery found both root and work directories before detach commit",
-                    normalize_path(&state.root)
-                ));
-                return false;
-            }
-            (false, false) => {
-                stats.errors.push(format!(
-                    "{}: flatten recovery found neither root nor work directory",
-                    normalize_path(&state.root)
-                ));
-                return false;
-            }
-        }
-
-        if let Some(path) = current_state_file.as_deref() {
-            match mark_flatten_detached(path) {
-                Ok(detached) => current_state_file = Some(detached),
-                Err(error) => {
-                    stats
-                        .errors
-                        .push(format!("flatten detached state: {error}"));
-                    return false;
-                }
-            }
-        }
-        phase = FlattenPhase::Detached;
-    }
-
-    if phase == FlattenPhase::Detached {
-        let leaf = state.work.join(&state.leaf_relative);
-        match (state.root.is_dir(), state.work.is_dir()) {
-            (false, true) => {
-                if !leaf.is_dir() {
-                    stats.errors.push(format!(
-                        "{}: recorded flatten leaf is missing",
-                        normalize_path(&leaf)
-                    ));
-                    return false;
-                }
-                if let Err(error) = fs::rename(&leaf, &state.root) {
-                    stats.errors.push(format!(
-                        "{} -> {}: {error}",
-                        normalize_path(&leaf),
-                        normalize_path(&state.root)
-                    ));
-                    return false;
-                }
-                // "moved" is now a logical directory promotion count.  Do not
-                // enumerate the promoted leaf merely to preserve the old
-                // per-entry statistic.
-                stats.moved += 1;
-            }
-            (true, true) => {
-                if leaf.exists() {
-                    stats.errors.push(format!(
-                        "{}: flatten recovery found both promoted root and original leaf",
-                        normalize_path(&state.root)
-                    ));
-                    return false;
-                }
-                // Promotion completed; only empty wrapper cleanup remains.
-            }
-            (true, false) => {
-                if let Some(path) = current_state_file {
-                    let _ = fs::remove_file(path);
-                }
+    match (state.root.is_dir(), state.work.is_dir()) {
+        (true, false) => {
+            if !start_if_untouched {
                 return true;
             }
-            (false, false) => {
+            if let Err(error) = fs::rename(&state.root, &state.work) {
                 stats.errors.push(format!(
-                    "{}: flatten recovery lost both promoted root and work directory",
-                    normalize_path(&state.root)
+                    "{} -> {}: {error}",
+                    normalize_path(&state.root),
+                    normalize_path(&state.work)
                 ));
                 return false;
             }
         }
-
-        match remove_flatten_wrapper(&state.work, &state.leaf_relative) {
-            Ok(removed) => stats.removed_dirs += removed,
-            Err(error) => {
-                stats.errors.push(error);
+        (false, true) => {
+            // Detach completed before the interruption; continue below.
+        }
+        (true, true) => {
+            if leaf.exists() {
+                stats.errors.push(format!(
+                    "{}: flatten recovery found both promoted root and original leaf",
+                    normalize_path(&state.root)
+                ));
                 return false;
             }
+            // Leaf promotion completed; only empty wrapper cleanup remains.
         }
-
-        if !state.root.is_dir() || state.work.exists() {
+        (false, false) => {
             stats.errors.push(format!(
-                "{}: flatten transaction did not reach a complete namespace",
+                "{}: flatten recovery found neither root nor work directory",
                 normalize_path(&state.root)
             ));
             return false;
         }
     }
 
-    if let Some(path) = current_state_file {
-        let _ = fs::remove_file(path);
+    if !state.root.is_dir() {
+        if !leaf.is_dir() {
+            stats.errors.push(format!(
+                "{}: recorded flatten leaf is missing",
+                normalize_path(&leaf)
+            ));
+            return false;
+        }
+        if let Err(error) = fs::rename(&leaf, &state.root) {
+            stats.errors.push(format!(
+                "{} -> {}: {error}",
+                normalize_path(&leaf),
+                normalize_path(&state.root)
+            ));
+            return false;
+        }
+        // moved is now a logical directory promotion count. Do not enumerate
+        // the promoted leaf merely to preserve the old per-entry statistic.
+        stats.moved += 1;
+    }
+
+    match remove_flatten_wrapper(&state.work, &state.leaf_relative) {
+        Ok(removed) => stats.removed_dirs += removed,
+        Err(error) => {
+            stats.errors.push(error);
+            return false;
+        }
+    }
+
+    if !state.root.is_dir() || state.work.exists() {
+        stats.errors.push(format!(
+            "{}: flatten transaction did not reach a complete namespace",
+            normalize_path(&state.root)
+        ));
+        return false;
     }
     true
 }
@@ -523,49 +479,14 @@ fn transaction_id() -> String {
     format!("{:x}{:x}", std::process::id(), nanos)
 }
 
-fn flatten_state_file(state_dir: &Path, id: &str, phase: FlattenPhase) -> PathBuf {
-    let phase_name = match phase {
-        FlattenPhase::Prepared => "prepared",
-        FlattenPhase::Detached => "detached",
-    };
-    state_dir.join(format!("{id}.{phase_name}.state"))
-}
-
-fn flatten_state_phase(path: &Path) -> Option<FlattenPhase> {
-    let name = path.file_name()?.to_str()?;
-    if name.ends_with(".prepared.state") {
-        Some(FlattenPhase::Prepared)
-    } else if name.ends_with(".detached.state") {
-        Some(FlattenPhase::Detached)
-    } else {
-        None
-    }
-}
-
-fn detached_state_file(path: &Path) -> Option<PathBuf> {
-    let name = path.file_name()?.to_str()?;
-    let id = name.strip_suffix(".prepared.state")?;
-    Some(path.with_file_name(format!("{id}.detached.state")))
-}
-
-fn mark_flatten_detached(path: &Path) -> std::io::Result<PathBuf> {
-    if flatten_state_phase(path) == Some(FlattenPhase::Detached) {
-        return Ok(path.to_path_buf());
-    }
-    let detached = detached_state_file(path).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "flatten prepared state has an invalid filename",
-        )
-    })?;
-    rename_write_through(path, &detached)?;
-    Ok(detached)
+fn flatten_state_file(state_dir: &Path, id: &str) -> PathBuf {
+    state_dir.join(format!("{id}.state"))
 }
 
 fn write_flatten_state(state_dir: &Path, state: &FlattenState) -> std::io::Result<PathBuf> {
     fs::create_dir_all(state_dir)?;
     let id = transaction_id();
-    let path = flatten_state_file(state_dir, &id, FlattenPhase::Prepared);
+    let path = flatten_state_file(state_dir, &id);
     let temporary = state_dir.join(format!("{id}.state.tmp"));
     let text = format!(
         "version={FLATTEN_STATE_VERSION}\nroot={}\nwork={}\nleaf={}\n",
@@ -577,7 +498,7 @@ fn write_flatten_state(state_dir: &Path, state: &FlattenState) -> std::io::Resul
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
     drop(file);
-    // Commit PREPARED write-through: only its success allows the root detach.
+    // Commit the recovery intent write-through before any namespace mutation.
     rename_write_through(&temporary, &path)?;
     Ok(path)
 }
@@ -612,19 +533,13 @@ fn load_flatten_state(path: &Path) -> Option<FlattenState> {
     })
 }
 
-fn pending_flatten_state(
-    state_dir: &Path,
-    root: &Path,
-) -> Option<(PathBuf, FlattenState, FlattenPhase)> {
+fn pending_flatten_state(state_dir: &Path, root: &Path) -> Option<(PathBuf, FlattenState)> {
     for path in flatten_state_files(state_dir) {
-        let Some(phase) = flatten_state_phase(&path) else {
-            continue;
-        };
         let Some(state) = load_flatten_state(&path) else {
             continue;
         };
         if same_path(&state.root, root) {
-            return Some((path, state, phase));
+            return Some((path, state));
         }
     }
     None
@@ -633,14 +548,12 @@ fn pending_flatten_state(
 fn recover_flatten_transactions(state_dir: &Path) -> usize {
     let mut finished = 0usize;
     for path in flatten_state_files(state_dir) {
-        let Some(phase) = flatten_state_phase(&path) else {
-            continue;
-        };
         let Some(state) = load_flatten_state(&path) else {
             continue;
         };
         let mut stats = FlattenStats::default();
-        if run_flatten_transaction(Some(&path), &state, phase, &mut stats) {
+        if run_flatten_transaction(&state, &mut stats, false) {
+            let _ = fs::remove_file(&path);
             finished += 1;
         }
     }
@@ -788,7 +701,7 @@ mod tests {
         let state_file = write_flatten_state(&state_dir, &state).unwrap();
 
         fs::rename(&root, &work).unwrap();
-        assert_eq!(flatten_state_phase(&state_file), Some(FlattenPhase::Prepared));
+        assert!(state_file.is_file());
 
         assert_eq!(recover_flatten_transactions(&state_dir), 1);
         assert!(root.join("payload.txt").is_file());
@@ -814,9 +727,8 @@ mod tests {
         let prepared = write_flatten_state(&state_dir, &state).unwrap();
 
         fs::rename(&root, &work).unwrap();
-        let detached = mark_flatten_detached(&prepared).unwrap();
         fs::rename(work.join("outer/inner"), &root).unwrap();
-        assert_eq!(flatten_state_phase(&detached), Some(FlattenPhase::Detached));
+        assert!(prepared.is_file());
 
         assert_eq!(recover_flatten_transactions(&state_dir), 1);
         assert!(root.join("payload.txt").is_file());
