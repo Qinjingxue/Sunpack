@@ -186,6 +186,13 @@ async def async_main(
     args.quiet = bool(getattr(args, "quiet", False) or "-q" in argv or "--quiet" in argv)
     args.verbose = bool(getattr(args, "verbose", False) or "-v" in argv or "--verbose" in argv)
     args.pause_on_exit = bool(getattr(args, "pause_on_exit", False) or "--pause" in argv)
+    process_mode = getattr(args, "process_mode", None)
+    if process_mode is not None:
+        from sunpack.cli.runtime_state import runtime_host
+
+        host = runtime_host()
+        if host is not None:
+            await host.set_cli_process_mode_override(process_mode)
     reporter = CliReporter(
         json_mode=args.json,
         quiet=args.quiet,
