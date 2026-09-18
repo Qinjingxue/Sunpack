@@ -58,6 +58,47 @@ function Write-SmokePhase {
     Write-Host "[installer-smoke][$timestamp][$State] $Label$suffix"
 }
 
+function Initialize-ExitCodeProbe {
+    if ("SunPack.ProcessExit" -as [type]) {
+        return
+    }
+    Add-Type -Namespace SunPack -Name ProcessExit -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError = true)]
+public static extern bool GetExitCodeProcess(System.IntPtr hProcess, out uint lpExitCode);
+
+public static bool TryGetExitCode(System.IntPtr hProcess, ref int exitCode) {
+    uint code;
+    if (!GetExitCodeProcess(hProcess, out code)) {
+        return false;
+    }
+    exitCode = unchecked((int)code);
+    return true;
+}
+'@
+}
+
+function Get-ChildExitCode {
+    param(
+        [Parameter(Mandatory = $true)][System.Diagnostics.Process]$Process,
+        $ProcessHandle = $null
+    )
+
+    if ($null -ne $Process.ExitCode) {
+        return [int]$Process.ExitCode
+    }
+    if ($ProcessHandle -is [IntPtr] -and $ProcessHandle -ne [IntPtr]::Zero) {
+        try {
+            Initialize-ExitCodeProbe
+            $code = 0
+            if ([SunPack.ProcessExit]::TryGetExitCode($ProcessHandle, [ref]$code) -and $code -ne 259) {
+                return [int]$code
+            }
+        } catch {
+        }
+    }
+    return $null
+}
+
 function Invoke-Checked {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
@@ -80,6 +121,12 @@ function Invoke-Checked {
         -ArgumentList $Arguments `
         -PassThru `
         -NoNewWindow
+    $processHandle = $null
+    try {
+        $processHandle = $process.Handle
+    } catch {
+        $processHandle = $null
+    }
     if (-not $process.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
         $elapsed = ((Get-Date) - $startedAt).TotalSeconds
         Write-SmokePhase -State "TIMEOUT" -Label $Label -Detail ("PID={0} elapsed={1:N1}s" -f $process.Id, $elapsed)
@@ -90,9 +137,12 @@ function Invoke-Checked {
         throw "Command timed out after $TimeoutSeconds seconds: $commandText"
     }
     $process.WaitForExit()
-    $exitCode = $process.ExitCode
+    $exitCode = Get-ChildExitCode -Process $process -ProcessHandle $processHandle
     $elapsed = ((Get-Date) - $startedAt).TotalSeconds
     Write-SmokePhase -State "END" -Label $Label -Detail ("PID={0} exit={1} elapsed={2:N2}s" -f $process.Id, $exitCode, $elapsed)
+    if ($null -eq $exitCode) {
+        throw "Command exit code is unavailable on this PowerShell host: $commandText"
+    }
     if ($exitCode -ne 0) {
         throw "Command failed with exit code ${exitCode}: $commandText"
     }
@@ -114,6 +164,12 @@ function Invoke-UninstallerChecked {
         -ArgumentList $Arguments `
         -PassThru `
         -NoNewWindow
+    $processHandle = $null
+    try {
+        $processHandle = $process.Handle
+    } catch {
+        $processHandle = $null
+    }
     if (-not $process.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
         $elapsed = ((Get-Date) - $startedAt).TotalSeconds
         Write-SmokePhase -State "TIMEOUT" -Label "uninstall" -Detail ("PID={0} elapsed={1:N1}s" -f $process.Id, $elapsed)
@@ -124,10 +180,13 @@ function Invoke-UninstallerChecked {
         throw "Uninstaller timed out after $TimeoutSeconds seconds: $commandText"
     }
     $process.WaitForExit()
-    $exitCode = $process.ExitCode
+    $exitCode = Get-ChildExitCode -Process $process -ProcessHandle $processHandle
     $elapsed = ((Get-Date) - $startedAt).TotalSeconds
     Write-SmokePhase -State "END" -Label "uninstall" -Detail ("PID={0} exit={1} elapsed={2:N2}s" -f $process.Id, $exitCode, $elapsed)
-    if ($null -ne $exitCode -and $exitCode -ne 0) {
+    if ($null -eq $exitCode) {
+        throw "Uninstaller exit code is unavailable on this PowerShell host: $commandText"
+    }
+    if ($exitCode -ne 0) {
         throw "Uninstaller failed with exit code ${exitCode}: $commandText"
     }
 }
