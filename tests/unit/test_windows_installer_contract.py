@@ -591,3 +591,38 @@ def test_installer_compile_regression_runs_real_iscc_on_pull_requests():
     assert "test_inno_installer_compile.ps1" in workflow
     assert "pull_request:" in workflow
 
+
+
+def test_installer_smoke_uses_direct_process_waits_with_bounded_timeouts():
+    smoke = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
+    release = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    regression = (ROOT / ".github" / "workflows" / "installer-smoke.yml").read_text(encoding="utf-8")
+
+    invoke_checked = smoke[smoke.index("function Invoke-Checked {"):]
+    invoke_checked = invoke_checked[:invoke_checked.index("\nfunction ")]
+    assert "Start-Process" in invoke_checked
+    assert ".WaitForExit(" in invoke_checked
+    assert "-Wait `" not in invoke_checked
+    assert "Command timed out after $TimeoutSeconds seconds" in invoke_checked
+    assert 'Write-SmokeStage "START $stage"' in invoke_checked
+    assert 'Write-SmokeStage "PASS $stage"' in invoke_checked
+    assert '-Label "initial install"' in smoke
+    assert '-Label "running-Watch upgrade install"' in smoke
+    assert '-Label "stopped-Watch upgrade install"' in smoke
+    assert '-Label "persistent runtime shutdown"' in smoke
+    assert "timeout-minutes: 15" in release
+    assert "Smoke test Windows installer" in regression
+    assert "timeout-minutes: 15" in regression
+
+
+def test_upgrade_watch_lifecycle_commands_are_bounded_inside_installer():
+    script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
+
+    assert "function RunHiddenCommandWithTimeout(" in script
+    assert "$p.WaitForExit(" in script
+    assert "exit 124" in script
+    assert "RunHiddenCommandWithTimeout(ExistingApp, 'watch stop', 30, ResultCode)" in script
+    assert "RunHiddenCommandWithTimeout(ExistingApp, '--persistent-shutdown', 30, ResultCode)" in script
+    assert "$p.WaitForExit(20000)" in script
+    assert "'--launch-watch-unelevated'," in script
+    assert "    45," in script
