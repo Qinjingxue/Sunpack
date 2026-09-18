@@ -1,0 +1,86 @@
+name: Installer smoke regression
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "installer/**"
+      - "scripts/test_windows_installer.ps1"
+      - "native/sevenzip_bridge/src/launcher.cpp"
+      - "sunpack/cli/persistent_process.py"
+      - "sunpack/cli/persistent_runtime.py"
+      - "sunpack/cli/runtime_host.py"
+      - ".github/workflows/installer-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  installer-smoke-x64:
+    name: Installer smoke x64
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: x64
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+          cargo --version
+          rustc -Vv
+
+      - name: Prepare native/tool environment
+        shell: pwsh
+        run: .\scripts\setup_windows_dev.ps1 -Arch x64 -SkipAcceptanceTestTools
+
+      - name: Ensure Inno Setup compiler
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup --yes --no-progress
+            $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) {
+            throw "Inno Setup installation completed but ISCC.exe was not found."
+          }
+          Write-Host "Inno Setup compiler: $iscc"
+
+      - name: Build Windows installer
+        timeout-minutes: 25
+        shell: pwsh
+        run: |
+          .\scripts\build_windows.ps1 -SkipTests -NoPause -Arch x64
+
+      - name: Run installer smoke
+        timeout-minutes: 15
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -LiteralPath "release" -Filter "sunpack-windows-x64-*-setup.exe" -File | Select-Object -First 1
+          if ($null -eq $installer) {
+            throw "Built installer was not found."
+          }
+          .\scripts\test_windows_installer.ps1 -InstallerPath $installer.FullName
