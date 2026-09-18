@@ -341,6 +341,39 @@ begin
   Result := '''' + Value + '''';
 end;
 
+function RunHiddenCommandWithTimeout(
+  const FilePath, Arguments: string;
+  TimeoutSeconds: Integer;
+  var ResultCode: Integer
+): Boolean;
+var
+  PowerShellPath: string;
+  Command: string;
+  Parameters: string;
+begin
+  PowerShellPath := ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe');
+  Command :=
+    '$ErrorActionPreference = ''Stop''; try { ' +
+    '  $p = Start-Process -FilePath ' + PowerShellSingleQuotedString(FilePath) +
+       ' -ArgumentList ' + PowerShellSingleQuotedString(Arguments) +
+       ' -PassThru -WindowStyle Hidden; ' +
+    '  if (-not $p.WaitForExit(' + IntToStr(TimeoutSeconds * 1000) + ')) { ' +
+    '    try { $p.Kill() } catch {}; exit 124 ' +
+    '  }; ' +
+    '  exit $p.ExitCode ' +
+    '} catch { exit 125 }';
+  Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ' + AddQuotes(Command);
+  ResultCode := -1;
+  Result := Exec(
+    PowerShellPath,
+    Parameters,
+    '',
+    SW_HIDE,
+    ewWaitUntilTerminated,
+    ResultCode
+  );
+end;
+
 function QueryExistingWatchRunning(var WatchStateDir: string): Boolean;
 var
   ExistingApp: string;
@@ -360,8 +393,15 @@ begin
   Command :=
     '$ErrorActionPreference = ''Stop''; ' +
     'try { ' +
-    '  $json = (& ' + PowerShellSingleQuotedString(ExistingApp) + ' watch status --json 2>$null | Out-String); ' +
-    '  if ($LASTEXITCODE -ne 0) { exit 2 }; ' +
+    '  $psi = New-Object System.Diagnostics.ProcessStartInfo; ' +
+    '  $psi.FileName = ' + PowerShellSingleQuotedString(ExistingApp) + '; ' +
+    '  $psi.Arguments = ''watch status --json''; ' +
+    '  $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true; ' +
+    '  $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true; ' +
+    '  $p = [System.Diagnostics.Process]::Start($psi); ' +
+    '  if (-not $p.WaitForExit(20000)) { try { $p.Kill() } catch {}; exit 124 }; ' +
+    '  $json = $p.StandardOutput.ReadToEnd(); ' +
+    '  if ($p.ExitCode -ne 0) { exit 2 }; ' +
     '  $status = $json | ConvertFrom-Json; ' +
     '  $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey(' +
          PowerShellSingleQuotedString(SunPackRegistryKey) + '); ' +
@@ -448,11 +488,11 @@ begin
   ExistingApp := ExpandConstant('{app}\sunpack.exe');
   if not FileExists(ExistingApp) then
     Exit;
-  if not Exec(ExistingApp, 'watch stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  if not RunHiddenCommandWithTimeout(ExistingApp, 'watch stop', 30, ResultCode) then
     Log('Failed to start existing SunPack watch stop command: ' + ExistingApp)
   else if ResultCode <> 0 then
     Log(Format('Existing SunPack watch stop command exited with code %d', [ResultCode]));
-  if not Exec(ExistingApp, '--persistent-shutdown', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  if not RunHiddenCommandWithTimeout(ExistingApp, '--persistent-shutdown', 30, ResultCode) then
     Log('Failed to stop existing SunPack persistent process: ' + ExistingApp)
   else if ResultCode <> 0 then
     Log(Format('Existing SunPack persistent shutdown exited with code %d', [ResultCode]));
@@ -731,12 +771,10 @@ begin
   if not RestartWatchAfterUpgrade then
     Exit;
 
-  if not Exec(
+  if not RunHiddenCommandWithTimeout(
     ExpandConstant('{app}\sunpack-runtime.exe'),
     '--launch-watch-unelevated',
-    ExpandConstant('{app}'),
-    SW_HIDE,
-    ewWaitUntilTerminated,
+    45,
     ResultCode
   ) then
     Log('Failed to run the unelevated SunPack Watch restore helper after upgrade.')
@@ -824,12 +862,10 @@ begin
     end;
     if WizardIsTaskSelected('autostart') then
     begin
-      if not Exec(
+      if not RunHiddenCommandWithTimeout(
         ExpandConstant('{app}\sunpack.exe'),
         'watch startup enable',
-        '',
-        SW_HIDE,
-        ewWaitUntilTerminated,
+        30,
         ResultCode
       ) then
         RaiseException(CustomMessage('StartupEnableLaunchFailed'))
