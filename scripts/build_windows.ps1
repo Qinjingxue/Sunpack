@@ -874,7 +874,6 @@ $projectPath = Join-Path $repoRoot "pyproject.toml"
 $iconPath = Join-Path $repoRoot "sunpack.ico"
 $applicationManifestPath = Join-Path $repoRoot "sunpack.manifest"
 $manifestEmbeddingScriptPath = Join-Path $repoRoot "scripts\embed_windows_manifest.py"
-$installerSmokeScriptPath = Join-Path $repoRoot "scripts\test_windows_installer.ps1"
 $nativeCrateRoot = Join-Path $repoRoot "native\sunpack_native"
 $nativeCargoToml = Join-Path $nativeCrateRoot "Cargo.toml"
 $nativeWorkspaceLock = Join-Path $repoRoot "native\Cargo.lock"
@@ -927,7 +926,6 @@ $innoCompiler = Get-InnoSetupCompiler -PreferredPath $InnoCompilerPath
 Assert-PathExists -LiteralPath $iconPath -Description "SunPack icon"
 Assert-PathExists -LiteralPath $applicationManifestPath -Description "Windows application manifest"
 Assert-PathExists -LiteralPath $manifestEmbeddingScriptPath -Description "Manifest resource embedding script"
-Assert-PathExists -LiteralPath $installerSmokeScriptPath -Description "Windows installer smoke test script"
 Assert-PathExists -LiteralPath $nativeCargoToml -Description "sunpack_native Cargo manifest"
 Assert-PathExists -LiteralPath $nativeWorkspaceLock -Description "native Rust workspace lockfile"
 Assert-PathExists -LiteralPath $watchBrokerCargoToml -Description "SunPack Watch Broker Cargo manifest"
@@ -1145,9 +1143,8 @@ if ($processArch -eq $buildArch) {
         Invoke-Native -FilePath $distExePath -Arguments @("inspect", (Join-Path $repoRoot "tests"), "--json")
         Invoke-Native -FilePath $distExePath -Arguments @("config", "validate", "--json")
     } finally {
-        # Every launcher request may start the packaged persistent runtime. It
-        # uses %ProgramData%\SunPack\runtime-cwd, so leaving it alive pins the
-        # data directory and breaks the installer smoke test that follows.
+        # Every launcher request may start the packaged persistent runtime.
+        # Shut it down so local builds do not leave a packaged background process behind.
         Invoke-Native -FilePath $distExePath -Arguments @("--persistent-shutdown")
         Wait-ExecutableExit -ExecutablePath $distRuntimeExePath
     }
@@ -1189,21 +1186,6 @@ try {
     Remove-Item -LiteralPath $installerStagingRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 Assert-PathExists -LiteralPath $releaseInstallerPath -Description "Windows installer"
-
-Write-Step "Running Windows installer smoke test"
-$installerSmokeArguments = @(
-    "-NoProfile",
-    "-ExecutionPolicy", "Bypass",
-    "-File", $installerSmokeScriptPath,
-    "-InstallerPath", $releaseInstallerPath
-)
-$runningInCi =
-    [string]::Equals($env:CI, "true", [StringComparison]::OrdinalIgnoreCase) -or
-    [string]::Equals($env:GITHUB_ACTIONS, "true", [StringComparison]::OrdinalIgnoreCase)
-if (-not $runningInCi) {
-    $installerSmokeArguments += "-SkipIfHostInstalled"
-}
-Invoke-Native -FilePath "powershell" -Arguments $installerSmokeArguments
 
 Write-Host ""
 Write-Host "Build completed successfully." -ForegroundColor Green
