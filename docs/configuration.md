@@ -35,6 +35,7 @@ Test runs disable the `size_range` filter by default so that tests can use files
 ```json
 {
   "cli": {},
+  "runtime": {},
   "recursive_extract": "*",
   "nested_extraction_policy": {},
   "post_extract": {},
@@ -162,6 +163,16 @@ Dates support nanosecond timestamps, ISO time strings, and `YYYYMMDD HH:MM`, `YY
 
 Directory scanning and filtering are executed by native scanning capabilities; when a filter cannot be mapped to native parameters, an error is reported explicitly.
 
+## runtime
+
+`runtime` controls process-wide runtime behavior shared by Watch and foreground workloads.
+
+| Field | Default | Description |
+| --- | ---: | --- |
+| `process_mode` | `normal` | Baseline Windows scheduling mode for the shared RuntimeHost and native worker. `normal` uses normal priority; `background` enables Windows Background Processing Mode; `high` uses `HIGH_PRIORITY_CLASS` and may reduce responsiveness of other applications. |
+
+Foreground `extract`, `scan`, and `inspect` requests temporarily override this baseline with their `--process-mode` value; when omitted, that CLI override defaults to `high`. The override remains after the command finishes and expires at the existing idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`), then the latest hot-reloaded `runtime.process_mode` becomes effective again. Changing `runtime.process_mode` while Watch is running is hot-applied without restarting the scheduler; an active CLI override still wins until it expires.
+
 ## performance
 
 Both resource analysis and worker parameters live under `performance`. Defaults are:
@@ -216,7 +227,6 @@ Automatic concurrency is driven mainly by the throughput of actual writes, compl
 
 | Field | Default | Description |
 | --- | ---: | --- |
-| `process_mode` | `normal` | Fixed Windows process scheduling mode for the Watch host and native worker. `normal` uses normal priority; `background` enables Windows Background Processing Mode and may significantly reduce throughput; `high` uses `HIGH_PRIORITY_CLASS` to favor SunPack CPU work and may reduce responsiveness of other applications. |
 | `cold_start_seconds` | `0.0` | Wait time when a file first becomes active. The default is 0, so a file can be processed as soon as it is ready. |
 | `quiet_min_seconds` | `0.0` | Lower bound of the dynamic quiet time. |
 | `quiet_max_seconds` | `180.0` | Upper bound of the dynamic quiet time; when `cold_start_seconds` is 0, no dynamic quiet wait is entered. |
@@ -224,7 +234,7 @@ Automatic concurrency is driven mainly by the throughput of actual writes, compl
 | `max_folders` | `16` | Upper limit field for the number of directories in the configuration; the current CLI directory list is managed by `sunpack_watch_roots.txt`. |
 | `observer_stop_timeout_seconds` | `5.0` | Wait time for stopping the file system observer thread. |
 | `runtime_cache_cleanup_enabled` | `true` | Whether to clean up idle runtime caches. |
-| `runtime_cache_cleanup_idle_seconds` | `10.0` | How long a cache stays idle before cleanup. |
+| `runtime_cache_cleanup_idle_seconds` | `10.0` | Shared idle-maintenance delay. At this deadline a CLI process-mode override expires; runtime caches are also cleared when `runtime_cache_cleanup_enabled` is true. |
 | `password_retry_debounce_seconds` | `0.5` | Wait time before triggering a retry of failed jobs after the password file or clipboard changes. |
 | `password_retry_include_subtree` | `true` | Whether a password source change retries the subtree tasks of the corresponding directory. |
 | `clipboard_monitor_enabled` | `true` | Whether to monitor clipboard password changes. |
@@ -243,7 +253,7 @@ Automatic concurrency is driven mainly by the throughput of actual writes, compl
 | `toast_report_max_bytes` | `2097152` | Upper limit of total failure report size, in bytes. |
 | `state_dir` | `""` | Monitoring state directory; when empty, `.sunpack_watch` next to the root directory file is used. |
 
-`process_mode` is applied when Watch starts and when Watch configuration is reloaded. Task activity, idle time, foreground CLI requests, Watch stop, and Watch task completion do not change the selected mode automatically.\n\nThe monitoring service only observes the direct files of each root directory and does not recursively watch subdirectories. The input root must be on an NTFS volume, and that volume must have a readable USN Journal; otherwise the root cannot start monitoring.
+The monitoring service only observes the direct files of each root directory and does not recursively watch subdirectories. The input root must be on an NTFS volume, and that volume must have a readable USN Journal; otherwise the root cannot start monitoring.
 
 `created`, `moved`, and `modified` events make a file active. Monitoring learns the quiet interval from actual content changes; plain size or mtime changes take part in interval learning, while other content events reset the current timing. One active cycle submits the main processing pipeline only once. The arrival of a new volume or a change in password sources reactivates the affected tasks.
 
