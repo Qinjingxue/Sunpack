@@ -326,6 +326,9 @@ def test_build_and_release_workflow_publish_installers_only():
     assert "test_windows_installer.ps1" in workflow
     assert "Expected one Windows installer" in workflow
     assert "*-setup.exe" in workflow
+    smoke_step = workflow[workflow.index("- name: Smoke test Windows installer"):]
+    smoke_step = smoke_step[:smoke_step.index("- name: Upload package artifact")]
+    assert "timeout-minutes: 15" in smoke_step
 
 
 def test_local_build_requires_inno_setup():
@@ -404,11 +407,21 @@ def test_windows_native_smoke_checks_follow_current_embedded_scan_api():
 
 def test_installer_smoke_uses_process_exit_code_for_started_processes():
     script = (ROOT / "scripts" / "test_windows_installer.ps1").read_text(encoding="utf-8")
+    invoke_checked = script[
+        script.index("function Invoke-Checked {"):
+        script.index("function Invoke-UninstallerChecked {")
+    ]
 
-    assert "Start-Process" in script
-    assert "-PassThru" in script
-    assert ".WaitForExit(" in script
-    assert "$process.ExitCode" in script
+    assert "Start-Process" in invoke_checked
+    assert "-PassThru" in invoke_checked
+    assert "\n        -Wait `" not in invoke_checked
+    assert ".WaitForExit(" in invoke_checked
+    assert "$process.ExitCode" in invoke_checked
+    assert "Command timed out after $TimeoutSeconds seconds" in invoke_checked
+    assert "after #23 an upgrade intentionally restores a persistent" in invoke_checked
+    assert "Write-SmokePhase" in script
+    assert "running-Watch upgrade install" in script
+    assert "stopped-Watch upgrade install" in script
     assert "Invoke-UninstallerChecked" in script
     assert "entire descendant tree" in script
     assert "Wait-UninstallCompletion -InstallRoot $installRoot -ServiceName $serviceName" in script
@@ -492,7 +505,7 @@ def test_installer_smoke_exercises_upgrade_preservation_and_full_uninstall_clean
     assert "Invoke-UnelevatedJson" in script
     assert "Invoke-UnelevatedChecked" in script
     assert '$startupMatch.Groups["RuntimeIdentity"].Value' in script
-    assert 'Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown")' in script
+    assert 'Invoke-Checked -Label "initial persistent shutdown" -TimeoutSeconds 45 -FilePath $appPath -Arguments @("--persistent-shutdown")' in script
     assert "Packaged runtime did not exit before the startup cold-start test" in script
     assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @($runtimeIdentity, "watch", "start")' in script
     assert "Write-DiagnosticLogTail" in script
@@ -500,6 +513,10 @@ def test_installer_smoke_exercises_upgrade_preservation_and_full_uninstall_clean
     assert '".sunpack_watch\\events.jsonl"' in script
     assert "run_unelevated_process.py" in script
     assert "Upgrade install left stale configuration data behind" in script
+    assert '$staleRuntimeMarker = Join-Path $staleDataDir "stale.json"' in script
+    assert "if (Test-Path -LiteralPath $staleRuntimeMarker)" in script
+    assert "if (Test-Path -LiteralPath $staleDataDir)" not in script
+    assert "A successfully restored Watch recreates runtime-cwd/<runtime-id> by design." in script
     assert "Set-ItemProperty -LiteralPath $startupRunKey -Name $startupValueName" in script
     assert "Uninstaller left ProgramData behind" in script
     assert "Installer must not write user data into the application directory" in script
