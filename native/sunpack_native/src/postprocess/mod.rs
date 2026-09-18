@@ -228,41 +228,45 @@ struct FlattenStats {
     errors: Vec<String>,
 }
 
-/// One flatten transaction: promote the direct entries of the deepest
-/// single-child directory of `root` into `root` itself.
-///
-/// The outer wrapper is detached to a same-volume sibling first, so the output
-/// root keeps its own directory identity.  `source` and `leaf_relative` are the
-/// discovery-time facts a resumed transaction must never re-derive from a tree
-/// that may already be half moved.
+/// One flatten transaction: replace the output root directory object with the
+/// deepest single-child directory.  The payload tree moves as one namespace
+/// object, so cost depends on wrapper depth rather than direct child count.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FlattenPhase {
+    Prepared,
+    Detached,
+}
+
 struct FlattenState {
     root: PathBuf,
-    /// Discovery-time wrapper directory that the detach moves aside.
-    source: PathBuf,
     work: PathBuf,
     leaf_relative: PathBuf,
 }
 
-const FLATTEN_STATE_VERSION: u32 = 2;
+const FLATTEN_STATE_VERSION: u32 = 3;
 
 fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats, state_dir: Option<&Path>) {
     if let Some(state_dir) = state_dir {
-        if let Some((state_file, state)) = pending_flatten_state(state_dir, root) {
-            if run_flatten_transaction(&state, stats) {
-                let _ = fs::remove_file(state_file);
-            }
+        if let Some((state_file, state, phase)) = pending_flatten_state(state_dir, root) {
+            run_flatten_transaction(Some(&state_file), &state, phase, stats);
             return;
         }
     }
 
     let chain = discover_flatten_chain(root);
-    let Some(first) = chain.first().cloned() else {
+    let Some(leaf) = chain.last() else {
         return;
     };
-    let leaf_relative = chain[chain.len() - 1]
-        .strip_prefix(&first)
-        .map(Path::to_path_buf)
-        .unwrap_or_default();
+    let leaf_relative = match leaf.strip_prefix(root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
+        _ => {
+            stats.errors.push(format!(
+                "{}: flatten leaf is not below output root",
+                normalize_path(root)
+            ));
+            return;
+        }
+    };
     let Some(work) = flatten_work_path(root) else {
         stats.errors.push(format!(
             "{}: output root has no parent for a flatten work directory",
@@ -272,12 +276,13 @@ fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats, state_dir:
     };
     let state = FlattenState {
         root: root.to_path_buf(),
-        source: first.clone(),
         work,
         leaf_relative,
     };
-    // The durable record comes first: an interruption after the detach would
-    // otherwise leave a detached tree with nothing describing how to finish it.
+
+    // Persist the intent before changing the namespace.  The phase transition is
+    // encoded by a write-through rename of the state file, avoiding a second
+    // state-content fsync on the hot path.
     let state_file = match state_dir {
         Some(state_dir) => match write_flatten_state(state_dir, &state) {
             Ok(path) => Some(path),
@@ -288,60 +293,141 @@ fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats, state_dir:
         },
         None => None,
     };
-    if run_flatten_transaction(&state, stats) {
-        if let Some(path) = state_file {
-            let _ = fs::remove_file(path);
-        }
-    }
+    run_flatten_transaction(
+        state_file.as_deref(),
+        &state,
+        FlattenPhase::Prepared,
+        stats,
+    );
 }
 
-/// Forward recovery: the namespace itself records progress, so any interruption
-/// resumes by looking at what is currently on disk.
-fn run_flatten_transaction(state: &FlattenState, stats: &mut FlattenStats) -> bool {
-    if !state.work.is_dir() {
-        if state.source.parent() != Some(state.root.as_path()) {
-            // A state file that does not describe one of our own transactions
-            // must never move an unrelated path.
+/// Forward recovery uses only the durable phase marker and the current
+/// root/work namespace.  No per-entry progress exists because the payload is
+/// promoted with one directory rename.
+fn run_flatten_transaction(
+    state_file: Option<&Path>,
+    state: &FlattenState,
+    mut phase: FlattenPhase,
+    stats: &mut FlattenStats,
+) -> bool {
+    let mut current_state_file = state_file.map(Path::to_path_buf);
+
+    if phase == FlattenPhase::Prepared {
+        match (state.root.is_dir(), state.work.is_dir()) {
+            (true, false) => {
+                if let Err(error) = fs::rename(&state.root, &state.work) {
+                    stats.errors.push(format!(
+                        "{} -> {}: {error}",
+                        normalize_path(&state.root),
+                        normalize_path(&state.work)
+                    ));
+                    return false;
+                }
+            }
+            (false, true) => {
+                // The root detach completed before the prepared->detached state
+                // rename.  Recovery can safely finish that phase transition.
+            }
+            (true, true) => {
+                stats.errors.push(format!(
+                    "{}: flatten recovery found both root and work directories before detach commit",
+                    normalize_path(&state.root)
+                ));
+                return false;
+            }
+            (false, false) => {
+                stats.errors.push(format!(
+                    "{}: flatten recovery found neither root nor work directory",
+                    normalize_path(&state.root)
+                ));
+                return false;
+            }
+        }
+
+        if let Some(path) = current_state_file.as_deref() {
+            match mark_flatten_detached(path) {
+                Ok(detached) => current_state_file = Some(detached),
+                Err(error) => {
+                    stats
+                        .errors
+                        .push(format!("flatten detached state: {error}"));
+                    return false;
+                }
+            }
+        }
+        phase = FlattenPhase::Detached;
+    }
+
+    if phase == FlattenPhase::Detached {
+        let leaf = state.work.join(&state.leaf_relative);
+        match (state.root.is_dir(), state.work.is_dir()) {
+            (false, true) => {
+                if !leaf.is_dir() {
+                    stats.errors.push(format!(
+                        "{}: recorded flatten leaf is missing",
+                        normalize_path(&leaf)
+                    ));
+                    return false;
+                }
+                if let Err(error) = fs::rename(&leaf, &state.root) {
+                    stats.errors.push(format!(
+                        "{} -> {}: {error}",
+                        normalize_path(&leaf),
+                        normalize_path(&state.root)
+                    ));
+                    return false;
+                }
+                // "moved" is now a logical directory promotion count.  Do not
+                // enumerate the promoted leaf merely to preserve the old
+                // per-entry statistic.
+                stats.moved += 1;
+            }
+            (true, true) => {
+                if leaf.exists() {
+                    stats.errors.push(format!(
+                        "{}: flatten recovery found both promoted root and original leaf",
+                        normalize_path(&state.root)
+                    ));
+                    return false;
+                }
+                // Promotion completed; only empty wrapper cleanup remains.
+            }
+            (true, false) => {
+                if let Some(path) = current_state_file {
+                    let _ = fs::remove_file(path);
+                }
+                return true;
+            }
+            (false, false) => {
+                stats.errors.push(format!(
+                    "{}: flatten recovery lost both promoted root and work directory",
+                    normalize_path(&state.root)
+                ));
+                return false;
+            }
+        }
+
+        match remove_flatten_wrapper(&state.work, &state.leaf_relative) {
+            Ok(removed) => stats.removed_dirs += removed,
+            Err(error) => {
+                stats.errors.push(error);
+                return false;
+            }
+        }
+
+        if !state.root.is_dir() || state.work.exists() {
             stats.errors.push(format!(
-                "{}: recorded flatten source is not a direct child of {}",
-                normalize_path(&state.source),
+                "{}: flatten transaction did not reach a complete namespace",
                 normalize_path(&state.root)
             ));
             return false;
         }
-        if !state.source.is_dir() {
-            // The recorded wrapper is gone while the work tree was never
-            // created: do not guess another directory, keep the state.
-            stats.errors.push(format!(
-                "{}: recorded flatten source is missing; state kept for inspection",
-                normalize_path(&state.source)
-            ));
-            return false;
-        }
-        if let Err(error) = fs::rename(&state.source, &state.work) {
-            stats.errors.push(format!(
-                "{} -> {}: {error}",
-                normalize_path(&state.source),
-                normalize_path(&state.work)
-            ));
-            return false;
-        }
     }
-    let leaf = state.work.join(&state.leaf_relative);
-    promote_leaf_entries(&state.root, &leaf, stats);
-    if !stats.errors.is_empty() {
-        return false;
+
+    if let Some(path) = current_state_file {
+        let _ = fs::remove_file(path);
     }
-    match remove_flatten_wrapper(&state.work, &state.leaf_relative) {
-        Ok(removed) => {
-            stats.removed_dirs += removed;
-            true
-        }
-        Err(error) => {
-            stats.errors.push(error);
-            false
-        }
-    }
+    true
 }
 
 fn discover_flatten_chain(root: &Path) -> Vec<PathBuf> {
@@ -479,19 +565,53 @@ fn transaction_id() -> String {
     format!("{:x}{:x}", std::process::id(), nanos)
 }
 
-fn flatten_state_file(state_dir: &Path, id: &str) -> PathBuf {
-    state_dir.join(format!("{id}.state"))
+fn flatten_state_file(state_dir: &Path, id: &str, phase: FlattenPhase) -> PathBuf {
+    let phase_name = match phase {
+        FlattenPhase::Prepared => "prepared",
+        FlattenPhase::Detached => "detached",
+    };
+    state_dir.join(format!("{id}.{phase_name}.state"))
+}
+
+fn flatten_state_phase(path: &Path) -> Option<FlattenPhase> {
+    let name = path.file_name()?.to_str()?;
+    if name.ends_with(".prepared.state") {
+        Some(FlattenPhase::Prepared)
+    } else if name.ends_with(".detached.state") {
+        Some(FlattenPhase::Detached)
+    } else {
+        None
+    }
+}
+
+fn detached_state_file(path: &Path) -> Option<PathBuf> {
+    let name = path.file_name()?.to_str()?;
+    let id = name.strip_suffix(".prepared.state")?;
+    Some(path.with_file_name(format!("{id}.detached.state")))
+}
+
+fn mark_flatten_detached(path: &Path) -> std::io::Result<PathBuf> {
+    if flatten_state_phase(path) == Some(FlattenPhase::Detached) {
+        return Ok(path.to_path_buf());
+    }
+    let detached = detached_state_file(path).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "flatten prepared state has an invalid filename",
+        )
+    })?;
+    rename_write_through(path, &detached)?;
+    Ok(detached)
 }
 
 fn write_flatten_state(state_dir: &Path, state: &FlattenState) -> std::io::Result<PathBuf> {
     fs::create_dir_all(state_dir)?;
     let id = transaction_id();
-    let path = flatten_state_file(state_dir, &id);
+    let path = flatten_state_file(state_dir, &id, FlattenPhase::Prepared);
     let temporary = state_dir.join(format!("{id}.state.tmp"));
     let text = format!(
-        "version={FLATTEN_STATE_VERSION}\nroot={}\nsource={}\nwork={}\nleaf={}\n",
+        "version={FLATTEN_STATE_VERSION}\nroot={}\nwork={}\nleaf={}\n",
         state.root.display(),
-        state.source.display(),
         state.work.display(),
         state.leaf_relative.display()
     );
@@ -499,7 +619,7 @@ fn write_flatten_state(state_dir: &Path, state: &FlattenState) -> std::io::Resul
     file.write_all(text.as_bytes())?;
     file.sync_all()?;
     drop(file);
-    // Commit the state name write-through: only its success allows the detach.
+    // Commit PREPARED write-through: only its success allows the root detach.
     rename_write_through(&temporary, &path)?;
     Ok(path)
 }
@@ -508,7 +628,6 @@ fn load_flatten_state(path: &Path) -> Option<FlattenState> {
     let text = fs::read_to_string(path).ok()?;
     let mut version = 0u32;
     let mut root: Option<PathBuf> = None;
-    let mut source: Option<PathBuf> = None;
     let mut work: Option<PathBuf> = None;
     let mut leaf_relative = PathBuf::new();
     for line in text.lines() {
@@ -518,32 +637,36 @@ fn load_flatten_state(path: &Path) -> Option<FlattenState> {
         match key {
             "version" => version = value.parse().ok()?,
             "root" => root = Some(PathBuf::from(value)),
-            "source" => source = Some(PathBuf::from(value)),
             "work" => work = Some(PathBuf::from(value)),
             "leaf" => leaf_relative = PathBuf::from(value),
             _ => {}
         }
     }
-    // Anything that is not this exact schema is left untouched for a human or a
-    // future version instead of being guessed at.
-    if version != FLATTEN_STATE_VERSION {
+    // Development-time schemas are intentionally not guessed at: an unknown
+    // transaction is left untouched rather than risking a namespace mutation.
+    if version != FLATTEN_STATE_VERSION || leaf_relative.as_os_str().is_empty() {
         return None;
     }
     Some(FlattenState {
         root: root?,
-        source: source?,
         work: work?,
         leaf_relative,
     })
 }
 
-fn pending_flatten_state(state_dir: &Path, root: &Path) -> Option<(PathBuf, FlattenState)> {
+fn pending_flatten_state(
+    state_dir: &Path,
+    root: &Path,
+) -> Option<(PathBuf, FlattenState, FlattenPhase)> {
     for path in flatten_state_files(state_dir) {
+        let Some(phase) = flatten_state_phase(&path) else {
+            continue;
+        };
         let Some(state) = load_flatten_state(&path) else {
             continue;
         };
         if same_path(&state.root, root) {
-            return Some((path, state));
+            return Some((path, state, phase));
         }
     }
     None
@@ -552,12 +675,14 @@ fn pending_flatten_state(state_dir: &Path, root: &Path) -> Option<(PathBuf, Flat
 fn recover_flatten_transactions(state_dir: &Path) -> usize {
     let mut finished = 0usize;
     for path in flatten_state_files(state_dir) {
+        let Some(phase) = flatten_state_phase(&path) else {
+            continue;
+        };
         let Some(state) = load_flatten_state(&path) else {
             continue;
         };
         let mut stats = FlattenStats::default();
-        if run_flatten_transaction(&state, &mut stats) {
-            let _ = fs::remove_file(&path);
+        if run_flatten_transaction(Some(&path), &state, phase, &mut stats) {
             finished += 1;
         }
     }
@@ -582,34 +707,6 @@ fn same_path(left: &Path, right: &Path) -> bool {
             .to_string_lossy()
             .eq_ignore_ascii_case(&right.to_string_lossy()),
     }
-}
-
-fn unique_destination(root: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    let direct = root.join(name);
-    if !direct.exists() {
-        return direct;
-    }
-    let path = Path::new(name);
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("item");
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("");
-    for count in 1usize.. {
-        let candidate_name = if extension.is_empty() {
-            format!("{stem} ({count})")
-        } else {
-            format!("{stem} ({count}).{extension}")
-        };
-        let candidate = root.join(candidate_name);
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-    direct
 }
 
 fn normalize_path(path: &Path) -> String {
