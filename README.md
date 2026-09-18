@@ -20,7 +20,7 @@ SunPack identifies archives by binary signatures rather than file extensions, an
   - [Recursive processing](#recursive-processing)
   - [Post-processing](#post-processing)
   - [Watch mode monitoring system](#watch-mode-monitoring-system)
-  - [Robustness](#robustness)
+  - [Robustness and WAL crash recovery](#robustness-and-wal-crash-recovery)
   - [High concurrency and speed optimization](#high-concurrency-and-speed-optimization)
   - [Low background resource usage](#low-background-resource-usage)
 - [Configuration](#configuration)
@@ -78,38 +78,39 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 
 ### Recognition Capability
 
-- SunPack identifies potential archive files by analyzing their binary data, including disguised archives embedded within carrier files and multi-volume archives.
+- Identifies potential archive files by analyzing their binary data, including disguised archives embedded within carrier files and multi-volume archives.
 
 ### Recursive processing
 
-- SunPack recursively looks for nested archives by default: after a successful extraction it checks whether the resulting folder contains archives that clearly should be extracted further, and processes them recursively. The algorithm is tuned so that, in most cases, it does not wrongly extract files that should not be extracted further.
+- Recursively searches for nested archives by default: after a successful extraction it checks whether the resulting folder contains archives that clearly should be extracted further, and processes them recursively. The algorithm is tuned so that, in most cases, it does not wrongly extract files that should not be extracted further.
 
 ### Post-processing
 
-- After a successful extraction, SunPack automatically flattens meaningless nested single-child directories, keeping only the top-level folder, and moves the original archive to the Recycle Bin or deletes it (controlled by the `"archive_cleanup_mode": "r"` setting; the Recycle Bin is the default). If processing fails, it automatically cleans up the failed output and reports an error.
+- Automatically flattens meaningless nested single-child directories after a successful extraction, keeping only the top-level folder, and moves the original archive to the Recycle Bin or deletes it (controlled by the `"archive_cleanup_mode": "r"` setting; the Recycle Bin is the default). If processing fails, it automatically cleans up the failed output and reports an error.
 
 ### Watch mode monitoring system
 
-- SunPack's watch system is built on a carefully designed identification algorithm that monitors and processes archives. It quickly detects and identifies newly added archives in the relevant directories and ignores non-archive files.
+- The watch system is built on a carefully designed identification algorithm that monitors and processes archives. It quickly detects and identifies newly added archives in the relevant directories and ignores non-archive files.
 - It can recognize situations with missing volumes or passwords, and automatically retries after the password sources or the volumes change. It uses Windows notifications to show progress while processing.
 - Each monitored directory can be configured with its own output root. See [CLI parameter reference](docs/cli_parameters.md) for the exact commands and the persistence format.
 
-### Robustness
+### Robustness and WAL crash recovery
 
-- When disk space runs out, SunPack automatically pauses extraction tasks and resumes them once enough disk space is available again — no manual retry needed.
-- SunPack has a file verification system that allows partially damaged files to yield whatever usable files they can, instead of failing outright. When everything fails, it automatically cleans up the damaged files, leaving no leftovers that need manual cleanup.
-- SunPack's test suite contains a rich set of complex cases that guarantee the correctness of the program's behavior.
+- Automatically pauses extraction tasks when disk space runs out, and resumes them once enough disk space is available again — no manual retry needed.
+- Has a file verification system that allows partially damaged files to yield whatever usable files they can, instead of failing outright. When everything fails, it automatically cleans up the damaged files, leaving no leftovers that need manual cleanup.
+- Adopts a database-like WAL design: an unexpected power loss or process crash during extraction leaves no half-finished or corrupted state; the program handles it correctly and completes the task after recovery.
+- Has a test suite containing a rich set of complex cases that guarantee the correctness of the program's behavior.
 
 ### High concurrency and speed optimization
 
-- SunPack can process large numbers of archives concurrently, and has a concurrency algorithm that distributes work sensibly. In multi-file scenarios there is no need to extract files one by one — just drop them into a directory and they are all extracted quickly and automatically.
-- SunPack's high-performance computation and I/O paths are handled by Rust and C++ native code, using overlapped I/O to overlap the read, compute, and output stages of 7z extraction. Resource utilization is good, the output path is tuned separately for mechanical and NVMe drives, and cross-drive writes are direct writes with no staging copy.
-- SunPack has a rich set of benchmark cases for various scenarios, and is optimized for those benchmarks close to the maintainability limit.
+- Processes large numbers of archives concurrently, and has a concurrency algorithm that distributes work sensibly. In multi-file scenarios there is no need to extract files one by one — just drop them into a directory and they are all extracted quickly and automatically.
+- Handles the high-performance computation and I/O paths in Rust and C++ native code, using overlapped I/O to overlap the read, compute, and output stages of 7z extraction. Resource utilization is good, the output path is tuned separately for mechanical and NVMe drives, and cross-drive writes are direct writes with no staging copy.
+- Has a rich set of benchmark cases for various scenarios, and is optimized for those benchmarks close to the maintainability limit.
 
 ### Low background resource usage
 
-- SunPack manages cache lifetimes well and automatically releases useless caches after processing files. All components together typically occupy less than 15 MB of active working-set memory while idle in the background.
-- Most of SunPack uses event notifications; an idle background process consumes no CPU on polling.
+- Manages cache lifetimes well and automatically releases useless caches after processing files. All components together typically occupy less than 20 MB of active working-set memory while idle in the background.
+- Uses purely event notifications while the system is idle; an idle background process consumes no CPU on polling.
 
 ---
 
