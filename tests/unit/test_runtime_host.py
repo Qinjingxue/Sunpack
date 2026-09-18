@@ -271,6 +271,7 @@ def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_p
     asyncio.run(run())
     assert managers[0]["update_interval_ms"] == 123
 
+
 def test_runtime_host_only_schedules_background_when_configured():
     async def scenario():
         host = RuntimeHost()
