@@ -51,17 +51,33 @@ class _Submission:
     progress_callback: Callable[[Any, dict[str, Any]], None] | None = None
 
 
-async def _commit_response(broker, config, response, *, stdout=None):
-    response = await broker.run("postprocess", response.request_id, _finalize_response,
-                                config, response, stdout=stdout, request_id=response.request_id)
+async def _commit_response(broker, config, response, *, stdout=None, defer_flatten=False):
+    response = await broker.run(
+        "postprocess",
+        response.request_id,
+        _finalize_response,
+        config,
+        response,
+        stdout=stdout,
+        defer_flatten=defer_flatten,
+        request_id=response.request_id,
+    )
     for delay in (0.1, 0.3):
         pending = [item for item in response.summary.cleanup_results if item.retryable and item.attempts < 3]
         if not pending:
             break
         await asyncio.sleep(delay)
-        response = await broker.run("postprocess", response.request_id, _finalize_response,
-                                    config, response, stdout=stdout, retry_results=pending,
-                                    request_id=response.request_id)
+        response = await broker.run(
+            "postprocess",
+            response.request_id,
+            _finalize_response,
+            config,
+            response,
+            stdout=stdout,
+            retry_results=pending,
+            defer_flatten=defer_flatten,
+            request_id=response.request_id,
+        )
     return response
 
 
@@ -188,7 +204,13 @@ class PipelineEngine:
                 start_time = time.time()
                 response = await runtime.execute_async(self._broker, cancellation)
                 self._remember_recent_passwords(response.recent_passwords)
-                response = await _commit_response(self._broker, submission.config, response, stdout=stdout)
+                response = await _commit_response(
+                    self._broker,
+                    submission.config,
+                    response,
+                    stdout=stdout,
+                    defer_flatten=submission.origin == "watch",
+                )
                 if getattr(response.summary, "_postprocess_completed", False):
                     await self._broker.run(
                         "report",
@@ -815,6 +837,7 @@ def _finalize_response(
     *,
     stdout=None,
     retry_results=None,
+    defer_flatten: bool = False,
 ) -> PipelineResponse:
     if getattr(response.summary, "_postprocess_completed", False) and retry_results is None:
         return response
@@ -830,7 +853,7 @@ def _finalize_response(
         previous = {path_key(item.path): item for item in retry_results}
     post_extract = config.get("post_extract", {})
     flatten_enabled = post_extract.get("flatten_single_directory", True)
-    flatten_targets = flatten_targets_all if flatten_enabled else []
+    flatten_targets = flatten_targets_all if flatten_enabled and not defer_flatten else []
     mutation_roots = list(flatten_targets)
     mutation_roots.extend(path for family in cleanup_requests for path in family)
     if mutation_roots:
