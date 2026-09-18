@@ -72,6 +72,11 @@ english.PrepareRuntimeRunning=sunpack runtime processes are still running. Pleas
 english.PrepareBrokerRemoveFailed=The existing sunpack Watch Broker service could not be removed. Restart Windows and run the installer again.
 english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed. Close sunpack and run the installer again.
 english.UninstallStopFailed=sunpack runtime processes or the Watch Broker service could not be stopped. Please restart Windows and run the uninstaller again.
+english.BuiltinPasswordsFileHeader=# Built-in common password list. You can edit this file; use one password per line.
+english.WatchRootsFileHeader=# Watched folders. Add one folder per line.
+english.WatchRootsFileMapping=# Optional output mapping: input folder | output folder
+english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted
+english.EditableConfigCreateFailed=Failed to create the initial editable configuration file: %s
 chinesesimplified.TaskAddToPath=将 sunpack 添加到当前用户的 PATH
 chinesesimplified.TaskContextMenu=注册 sunpack 文件夹右键菜单
 chinesesimplified.TaskAutostart=Windows 启动时运行 sunpack 监控
@@ -93,6 +98,11 @@ chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。�
 chinesesimplified.PrepareBrokerRemoveFailed=无法删除现有 sunpack Watch Broker 服务。请重启 Windows，然后重新运行安装程序。
 chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack 文件。请关闭 sunpack，然后重新运行安装程序。
 chinesesimplified.UninstallStopFailed=无法停止 sunpack 运行时进程或 Watch Broker 服务。请重启 Windows，然后重新运行卸载程序。
+chinesesimplified.BuiltinPasswordsFileHeader=# 此文件为内置高频密码配置表，用户可自行编辑，每行一个密码。
+chinesesimplified.WatchRootsFileHeader=# 监控文件夹配置，每行填写一个监控目录。
+chinesesimplified.WatchRootsFileMapping=# 可选输出目录映射格式：输入目录 | 输出目录
+chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted
+chinesesimplified.EditableConfigCreateFailed=无法创建初始可编辑配置文件：%s
 
 [Tasks]
 Name: "addtopath"; Description: "{cm:TaskAddToPath}"; GroupDescription: "{cm:GroupShellIntegration}"
@@ -102,8 +112,6 @@ Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:Gro
 [Files]
 Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
-Source: "{#SourceDir}\sunpack_watch_roots.txt"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
-Source: "{#SourceDir}\builtin_passwords.txt"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
 
 [Dirs]
 Name: "{commonappdata}\SunPack"; Permissions: users-modify
@@ -542,6 +550,35 @@ begin
   Result := ClearDirectory(ExpandConstant('{app}'));
 end;
 
+procedure EnsureLocalizedEditableConfigFiles;
+var
+  DataPath: string;
+  FilePath: string;
+  Contents: string;
+begin
+  DataPath := ExpandConstant('{commonappdata}\SunPack');
+  ForceDirectories(DataPath);
+
+  FilePath := AddBackslash(DataPath) + 'builtin_passwords.txt';
+  if not FileExists(FilePath) then
+  begin
+    Contents := CustomMessage('BuiltinPasswordsFileHeader') + #13#10;
+    if not SaveStringToFile(FilePath, Contents, False) then
+      RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
+  end;
+
+  FilePath := AddBackslash(DataPath) + 'sunpack_watch_roots.txt';
+  if not FileExists(FilePath) then
+  begin
+    Contents :=
+      CustomMessage('WatchRootsFileHeader') + #13#10 +
+      CustomMessage('WatchRootsFileMapping') + #13#10 +
+      CustomMessage('WatchRootsFileExample') + #13#10;
+    if not SaveStringToFile(FilePath, Contents, False) then
+      RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
+  end;
+end;
+
 var
   ExistingInstallation: Boolean;
 
@@ -592,6 +629,7 @@ var
 begin
   if CurStep = ssPostInstall then
   begin
+    EnsureLocalizedEditableConfigFiles;
     InstallBrokerService;
     if not Exec(
       ExpandConstant('{app}\sunpack-runtime.exe'),
