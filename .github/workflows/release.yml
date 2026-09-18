@@ -232,6 +232,7 @@ jobs:
           .\scripts\verify_windows_package_arch.ps1 -PackageRoot $packageRoot -Arch ${{ matrix.arch }}
 
       - name: Smoke test Windows installer
+        timeout-minutes: 15
         shell: pwsh
         run: |
           $installer = Get-ChildItem -LiteralPath "release" `
