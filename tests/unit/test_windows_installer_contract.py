@@ -49,8 +49,11 @@ def test_machine_level_path_context_menu_startup_and_toast_registration():
     assert r"HKLM:\Software\Classes\*\shell\SunPack" in register
     assert "HKEY_CURRENT_USER" not in startup
     assert startup.count("winreg.HKEY_LOCAL_MACHINE") == 3
-    assert "HKEY_CURRENT_USER" not in toast
-    assert toast.count("HKEY_LOCAL_MACHINE") >= 12
+    assert 'set_registry_string(HKEY_CURRENT_USER, app_id_path, L"DisplayName"' in toast
+    assert 'set_registry_string(HKEY_CURRENT_USER, app_id_path, L"IconUri"' in toast
+    assert 'register_toast_activator(executable, arguments);' in toast
+    assert 'RegDeleteTreeW(HKEY_LOCAL_MACHINE, com_path.c_str())' in toast
+    assert 'RegDeleteTreeW(HKEY_CURRENT_USER, app_id_path.c_str())' not in toast
 
 
 def test_installer_optionally_registers_watch_autostart():
