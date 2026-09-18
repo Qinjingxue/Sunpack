@@ -52,7 +52,7 @@ def test_extract_reports_watch_busy_without_starting_another_task(tmp_path):
     assert result.errors == ["该任务已由 watch 处理，请等待"]
 
 
-def test_runtime_host_owns_watch_and_switches_host_and_worker_qos(monkeypatch):
+def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
     import sunpack.cli.runtime_host as runtime_host_module
     import sunpack.cli.persistent_runtime as persistent_runtime
     import sunpack.platform.windows.process_qos as process_qos
@@ -60,17 +60,19 @@ def test_runtime_host_owns_watch_and_switches_host_and_worker_qos(monkeypatch):
     events = []
 
     class FakeEngine:
-        async def set_process_mode(self, *, background):
-            events.append(("worker_qos", background))
+        async def set_process_mode(self, *, mode):
+            events.append(("worker_mode", mode))
+            return {"applied": True}
 
     engine = FakeEngine()
 
     class FakeService:
-        def __init__(self, *, pipeline_engine, **_kwargs):
+        def __init__(self, *, pipeline_engine, config_applied_callback=None, **_kwargs):
             assert pipeline_engine is engine
             self.scheduler = None
+            self.config = {"runtime": {"process_mode": "background"}}
+            self._config_applied_callback = config_applied_callback
             self._stop = asyncio.Event()
-            self.reloads = 0
 
         async def run(self, *, initial_scan=False, initial_scan_roots=None):
             events.append(("watch_started", initial_scan, initial_scan_roots))
@@ -85,7 +87,8 @@ def test_runtime_host_owns_watch_and_switches_host_and_worker_qos(monkeypatch):
             self._stop.set()
 
         async def reload(self):
-            self.reloads += 1
+            self.config = {"runtime": {"process_mode": "normal"}}
+            await self._config_applied_callback(self.config)
             return True
 
         async def add_roots(self, paths, *, output_dir=None, initial_scan=True):
@@ -97,41 +100,58 @@ def test_runtime_host_owns_watch_and_switches_host_and_worker_qos(monkeypatch):
     async def shared_engine(_config):
         return engine
 
-    monkeypatch.setattr(runtime_host_module, "load_config", lambda: {})
+    monkeypatch.setattr(
+        runtime_host_module,
+        "load_config",
+        lambda: {"runtime": {"process_mode": "background"}},
+    )
     monkeypatch.setattr(runtime_host_module, "shared_pipeline_engine", shared_engine)
     monkeypatch.setattr(runtime_host_module, "WatchService", FakeService)
     monkeypatch.setattr(persistent_runtime, "current_pipeline_engine", lambda: engine)
-    monkeypatch.setattr(process_qos, "set_processing_mode", lambda *, background: events.append(("host_qos", background)))
+    monkeypatch.setattr(
+        process_qos,
+        "set_processing_mode",
+        lambda *, mode: events.append(("host_mode", mode)),
+    )
 
     async def scenario():
-        state_changes = []
-        host = RuntimeHost(state_changed=lambda: state_changes.append(host.watch_enabled))
-        started = await host.start_watch(tray_enabled=False, initial_scan=True)
-        assert started["started"] is True
-        assert host.watch_enabled is True
+        host = RuntimeHost()
+        await host.start_watch(tray_enabled=False)
+        assert host.process_mode == "background"
+
+        await host.set_cli_process_mode_override("high")
+        assert host.process_mode == "high"
+
         assert (await host.reload_watch())["reloaded"] is True
-        assert (await host.add_watch_roots(["C:/second"], initial_scan=True))["added"] == ["C:/second"]
-        assert (await host.remove_watch_roots(["C:/second"]))["removed"] == ["C:/second"]
-        await host._set_process_mode(background=True)
+        assert host._configured_process_mode == "normal"
+        assert host.process_mode == "high"
+
+        before_foreground = list(events)
         await host.foreground_started()
         await host.foreground_finished()
-        stopped = await host.stop_watch()
-        assert stopped["stopped"] is True
-        assert host.watch_enabled is False
-        await host.close()
-        assert True in state_changes
-        assert state_changes[-1] is False
+        assert events == before_foreground
+
+        assert await host.expire_cli_process_mode_override() is True
+        assert host.process_mode == "normal"
+        assert await host.expire_cli_process_mode_override() is False
+
+        await host.stop_watch()
+        assert host.process_mode == "normal"
 
     asyncio.run(scenario())
-    assert ("worker_qos", True) in events
-    assert ("host_qos", True) in events
-    assert ("worker_qos", False) in events
-    assert ("host_qos", False) in events
+    assert [event for event in events if event[0] == "worker_mode"] == [
+        ("worker_mode", "background"),
+        ("worker_mode", "high"),
+        ("worker_mode", "normal"),
+    ]
+    assert [event for event in events if event[0] == "host_mode"] == [
+        ("host_mode", "background"),
+        ("host_mode", "high"),
+        ("host_mode", "normal"),
+    ]
 
-
-def test_runtime_host_brackets_overlapping_foreground_activity(monkeypatch):
+def test_runtime_host_brackets_overlapping_foreground_activity():
     activity = []
-    background_schedules = []
 
     class FakeScheduler:
         async def set_external_activity(self, active):
@@ -141,12 +161,6 @@ def test_runtime_host_brackets_overlapping_foreground_activity(monkeypatch):
     host._watch_service = SimpleNamespace(scheduler=FakeScheduler())
     host._watch_task = SimpleNamespace(done=lambda: False)
 
-    async def set_process_mode(*, background):
-        return None
-
-    monkeypatch.setattr(host, "_set_process_mode", set_process_mode)
-    monkeypatch.setattr(host, "_schedule_background", lambda: background_schedules.append(True))
-
     async def scenario():
         await host.foreground_started()
         await host.foreground_started()
@@ -154,18 +168,15 @@ def test_runtime_host_brackets_overlapping_foreground_activity(monkeypatch):
 
         await host.foreground_finished()
         assert activity == [True]
-        assert background_schedules == []
 
         await host.foreground_finished()
         assert activity == [True, False]
-        assert background_schedules == [True]
 
     asyncio.run(scenario())
 
 
-def test_runtime_host_does_not_bypass_a_waiting_first_foreground(monkeypatch):
+def test_runtime_host_does_not_bypass_a_waiting_first_foreground():
     activity = []
-    background_schedules = []
 
     class FakeScheduler:
         def __init__(self):
@@ -184,12 +195,6 @@ def test_runtime_host_does_not_bypass_a_waiting_first_foreground(monkeypatch):
         host._watch_service = SimpleNamespace(scheduler=scheduler)
         host._watch_task = SimpleNamespace(done=lambda: False)
 
-        async def set_process_mode(*, background):
-            return None
-
-        monkeypatch.setattr(host, "_set_process_mode", set_process_mode)
-        monkeypatch.setattr(host, "_schedule_background", lambda: background_schedules.append(True))
-
         first = asyncio.create_task(host.foreground_started())
         await scheduler.started.wait()
         second = asyncio.create_task(host.foreground_started())
@@ -205,7 +210,6 @@ def test_runtime_host_does_not_bypass_a_waiting_first_foreground(monkeypatch):
         await host.foreground_finished()
         await host.foreground_finished()
         assert activity == [True, False]
-        assert background_schedules == [True]
 
     asyncio.run(scenario())
 
@@ -261,7 +265,6 @@ def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_p
         assert managers == []
         await host.start_watch(tray_enabled=False)
         assert len(managers) == 1
-        # Foreground requests coexist without creating another notification owner.
         await host.foreground_started()
         await host.foreground_finished()
         await host.start_watch(tray_enabled=False)
@@ -270,71 +273,3 @@ def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_p
 
     asyncio.run(run())
     assert managers[0]["update_interval_ms"] == 123
-
-
-def test_runtime_host_only_schedules_background_when_configured():
-    async def scenario():
-        host = RuntimeHost()
-        host._watch_service = SimpleNamespace(scheduler=None)
-        host._watch_task = SimpleNamespace(done=lambda: False)
-
-        host._watch_process_mode = "normal"
-        host._schedule_background()
-        assert host._demote_task is None
-
-        host._watch_process_mode = "background"
-        host._schedule_background()
-        assert host._demote_task is not None
-        host._demote_task.cancel()
-        await asyncio.gather(host._demote_task, return_exceptions=True)
-
-    asyncio.run(scenario())
-
-
-def test_runtime_host_reload_applies_watch_process_mode(monkeypatch):
-    applied = []
-    scheduled = []
-
-    class FakeService:
-        def __init__(self):
-            self.scheduler = None
-            self.config = {"watch": {"process_mode": "background"}}
-
-        async def reload(self):
-            self.config = {"watch": {"process_mode": "normal"}}
-            return True
-
-    async def scenario():
-        host = RuntimeHost()
-        host._watch_service = FakeService()
-        host._watch_task = SimpleNamespace(done=lambda: False)
-        host._watch_process_mode = "background"
-
-        async def set_process_mode(*, background):
-            applied.append(background)
-
-        monkeypatch.setattr(host, "_set_process_mode", set_process_mode)
-        monkeypatch.setattr(host, "_schedule_background", lambda: scheduled.append(True))
-
-        result = await host.reload_watch()
-
-        assert result["reloaded"] is True
-        assert host._watch_process_mode == "normal"
-        assert applied == [False]
-        assert scheduled == []
-
-        host._watch_service.config = {"watch": {"process_mode": "normal"}}
-
-        async def reload_background():
-            host._watch_service.config = {"watch": {"process_mode": "background"}}
-            return True
-
-        monkeypatch.setattr(host._watch_service, "reload", reload_background)
-        result = await host.reload_watch()
-
-        assert result["reloaded"] is True
-        assert host._watch_process_mode == "background"
-        assert scheduled == [True]
-
-    asyncio.run(scenario())
-

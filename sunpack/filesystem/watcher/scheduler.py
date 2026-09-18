@@ -923,20 +923,16 @@ class WatchScheduler:
                     ),
                 )
                 delay = password_delay if delay is None else min(delay, password_delay)
-            if self.runtime_cache_cleanup_enabled and self._cache_cleanup_deadline is not None:
+            if self._cache_cleanup_deadline is not None:
                 cleanup_delay = max(0.0, self._cache_cleanup_deadline - monotonic_now)
                 delay = cleanup_delay if delay is None else min(delay, cleanup_delay)
             return delay
 
     def _reset_idle_cache_cleanup(self) -> None:
-        if not self.runtime_cache_cleanup_enabled:
-            return
         with self._lock:
             self._cache_cleanup_deadline = None
 
     def _arm_idle_cache_cleanup(self) -> None:
-        if not self.runtime_cache_cleanup_enabled:
-            return
         with self._lock:
             self._cache_cleanup_deadline = (
                 time.monotonic() + self.runtime_cache_cleanup_idle_seconds
@@ -947,9 +943,7 @@ class WatchScheduler:
         )
 
     async def set_external_activity(self, active: bool) -> None:
-        """Serialize foreground runtime work with idle cache cleanup."""
-        if not self.runtime_cache_cleanup_enabled:
-            return
+        """Serialize foreground runtime work with idle maintenance."""
         if active:
             await self._runtime_cache_gate.acquire()
             self._external_activity_gate_held = True
@@ -964,8 +958,6 @@ class WatchScheduler:
                 self._runtime_cache_gate.release()
 
     async def _maybe_clear_idle_caches(self) -> None:
-        if not self.runtime_cache_cleanup_enabled:
-            return
         now = time.monotonic()
         with self._lock:
             if self._cache_cleanup_deadline is None or now < self._cache_cleanup_deadline:
@@ -982,6 +974,13 @@ class WatchScheduler:
                 if self._pending or self._inflight_requests:
                     return
                 self._cache_cleanup_deadline = None
+            from sunpack.cli.runtime_state import runtime_host
+
+            host = runtime_host()
+            if host is not None:
+                await host.expire_cli_process_mode_override()
+            if not self.runtime_cache_cleanup_enabled:
+                return
             self.log.write("cache_cleanup_started")
             started = time.perf_counter()
             report = await self.pipeline_engine.clear_runtime_caches()

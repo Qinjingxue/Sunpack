@@ -1119,7 +1119,8 @@ sunpack::sevenzip::NativeMachineResources native_machine_resources() noexcept {
 
 std::string requested_native_process_mode() {
     const char* configured = std::getenv("SUNPACK_NATIVE_PROCESS_MODE");
-    return configured && std::string(configured) == "background" ? "background" : "normal";
+    const std::string mode = configured ? std::string(configured) : "normal";
+    return mode == "background" || mode == "high" ? mode : "normal";
 }
 
 sunpack::sevenzip::NativeSizingOverrides configured_native_sizing_overrides() noexcept {
@@ -1135,16 +1136,19 @@ sunpack::sevenzip::NativeSizingOverrides configured_native_sizing_overrides() no
 
 bool apply_native_process_mode(const std::string& mode) noexcept {
 #ifdef _WIN32
-    const DWORD requested = mode == "background"
-        ? PROCESS_MODE_BACKGROUND_BEGIN
-        : PROCESS_MODE_BACKGROUND_END;
-    if (SetPriorityClass(GetCurrentProcess(), requested) != 0) {
-        return true;
+    HANDLE process = GetCurrentProcess();
+    if (mode == "background") {
+        SetPriorityClass(process, NORMAL_PRIORITY_CLASS);
+        if (SetPriorityClass(process, PROCESS_MODE_BACKGROUND_BEGIN) != 0) {
+            return true;
+        }
+        return SetPriorityClass(process, BELOW_NORMAL_PRIORITY_CLASS) != 0;
     }
-    const DWORD fallback = mode == "background"
-        ? BELOW_NORMAL_PRIORITY_CLASS
+    SetPriorityClass(process, PROCESS_MODE_BACKGROUND_END);
+    const DWORD requested = mode == "high"
+        ? HIGH_PRIORITY_CLASS
         : NORMAL_PRIORITY_CLASS;
-    return SetPriorityClass(GetCurrentProcess(), fallback) != 0;
+    return SetPriorityClass(process, requested) != 0;
 #else
     return mode != "background";
 #endif
@@ -2183,9 +2187,10 @@ int run_message(
         return accepted ? 0 : 1;
     }
     if (command == "set_process_mode") {
-        const std::string mode = json_string_field(request, "mode", "normal") == "background"
-            ? "background"
-            : "normal";
+        std::string mode = json_string_field(request, "mode", "normal");
+        if (mode != "background" && mode != "high") {
+            mode = "normal";
+        }
         const bool applied = apply_native_process_mode(mode);
         print_json_line("{\"type\":\"process_mode_ack\",\"mode\":\"" + mode +
             "\",\"applied\":" + std::string(applied ? "true" : "false") + "}");

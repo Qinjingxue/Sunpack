@@ -2,7 +2,7 @@
   "cli": {
     "language": "zh"
   },
-  "watch": {
+  "runtime": {
     "process_mode": "normal"
   },
   "recursive_extract": "*",

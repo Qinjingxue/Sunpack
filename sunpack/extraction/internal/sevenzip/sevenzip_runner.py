@@ -627,13 +627,12 @@ class _AsyncNativeWorkerProcess:
     async def cancel(self, job_id: str) -> None:
         await self.send(json.dumps({"worker_command": "cancel", "job_id": job_id}, separators=(",", ":")))
 
-    async def set_process_mode(self, *, background: bool) -> dict[str, Any]:
+    async def set_process_mode(self, *, mode: str) -> dict[str, Any]:
         current = self._process_mode_waiter
         if current is not None and not current.done():
             await current
         waiter = asyncio.get_running_loop().create_future()
         self._process_mode_waiter = waiter
-        mode = "background" if background else "normal"
         await self.send(json.dumps({"worker_command": "set_process_mode", "mode": mode}, separators=(",", ":")))
         try:
             result = dict(await asyncio.wait_for(asyncio.shield(waiter), timeout=2.0))
@@ -822,6 +821,7 @@ class _AsyncNativeWorkerHolder:
         self._lock = asyncio.Lock()
         self._worker: _AsyncNativeWorkerProcess | None = None
         self._closed = False
+        self._process_mode = "normal"
 
     async def get_or_start(self, startupinfo) -> _AsyncNativeWorkerProcess:
         async with self._lock:
@@ -834,7 +834,15 @@ class _AsyncNativeWorkerHolder:
                     self.worker_path_callback(), startupinfo, self.process_config
                 )
                 await self._worker.start()
+                if str(self._worker.handshake.get("process_mode") or "normal") != self._process_mode:
+                    await self._worker.set_process_mode(mode=self._process_mode)
             return self._worker
+
+    def set_desired_process_mode(self, mode: str) -> None:
+        normalized = str(mode or "normal").strip().lower()
+        if normalized not in {"background", "normal", "high"}:
+            raise ValueError(f"unsupported process mode: {mode}")
+        self._process_mode = normalized
 
     async def close(self) -> None:
         async with self._lock:
@@ -892,9 +900,18 @@ class SevenZipRunner:
         worker = await self._async_worker_holder_or_create().get_or_start(None)
         return dict(worker.handshake)
 
-    async def set_process_mode_asyncio(self, *, background: bool) -> dict[str, Any]:
-        worker = await self._async_worker_holder_or_create().get_or_start(None)
-        return await worker.set_process_mode(background=background)
+    async def set_process_mode_asyncio(self, *, mode: str) -> dict[str, Any]:
+        holder = self._async_worker_holder_or_create()
+        holder.set_desired_process_mode(mode)
+        worker = await holder.get_or_start(None)
+        if str(worker.handshake.get("process_mode") or "normal") == mode:
+            return {
+                "type": "process_mode_ack",
+                "mode": mode,
+                "applied": True,
+                "worker_pid": int(getattr(worker.process, "pid", 0) or 0),
+            }
+        return await worker.set_process_mode(mode=mode)
 
     def extract_attempt(
         self,

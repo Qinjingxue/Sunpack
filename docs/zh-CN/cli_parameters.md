@@ -37,6 +37,9 @@ sunpack.exe <command> [options] [paths...]
 | `-v`, `--verbose` | 输出更多检测和诊断细节。 |
 | `--pause` | 命令结束后等待按键退出。 |
 | `--no-pause` | 命令结束后不暂停。 |
+| `--process-mode {background,normal,high}` | 临时覆盖本次工作负载使用的共享 RuntimeHost/native-worker 进程模式；默认 `high`。 |
+
+对于 `extract`、`scan`、`inspect`，process-mode override 在命令结束后继续有效，直到共享 Runtime 到达现有 Watch 空闲维护时机（`watch.runtime_cache_cleanup_idle_seconds`），随后恢复 `runtime.process_mode`。
 
 `passwords` 只支持 `--json` 以及密码输入参数；`config` 支持 `--json` 和 `--quiet`。JSON 结果使用统一外层字段：`command`、`inputs`、`summary`、`errors`、`items`、`tasks`、`logs`；具体命令按语义填充 `items` 或 `tasks`。
 

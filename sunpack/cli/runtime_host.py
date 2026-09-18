@@ -16,9 +16,9 @@ from sunpack.filesystem.watcher.service import WatchService
 _LOG = logging.getLogger(__name__)
 
 
-def _configured_watch_process_mode(config: dict) -> str:
-    watch = config.get("watch") if isinstance(config.get("watch"), dict) else {}
-    return str(watch.get("process_mode") or "normal").strip().lower()
+def _configured_runtime_process_mode(config: dict) -> str:
+    runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
+    return str(runtime.get("process_mode") or "normal").strip().lower()
 
 
 class RuntimeHost:
@@ -38,9 +38,9 @@ class RuntimeHost:
         self._watch_generation = 0
         self._last_watch_error = ""
         self._foreground_requests = 0
-        self._background = False
-        self._watch_process_mode = "normal"
-        self._demote_task: asyncio.Task | None = None
+        self._configured_process_mode = "normal"
+        self._cli_process_mode_override: str | None = None
+        self._process_mode = "normal"
         self._state_changed = state_changed
         self.archive_registry = ActiveArchiveRegistry()
         self._event_log = None
@@ -81,7 +81,7 @@ class RuntimeHost:
                 self.log_event("watch_start_reused")
                 return {"started": False, "running": True, "generation": self._watch_generation}
             config = load_config()
-            self._watch_process_mode = _configured_watch_process_mode(config)
+            await self._set_configured_process_mode(config)
             engine = await shared_pipeline_engine(config)
             tray_factory = None
             if tray_enabled:
@@ -104,6 +104,7 @@ class RuntimeHost:
                 tray_factory=tray_factory,
                 group_coordinator_factory=WatchGroupCoordinator,
                 toast_manager_factory=toast_manager_factory,
+                config_applied_callback=self._watch_config_applied,
             )
             task = asyncio.create_task(
                 service.run(
@@ -141,7 +142,6 @@ class RuntimeHost:
             )
         )
         self.log_event("watch_started")
-        self._schedule_background()
         return {"started": True, "running": True, "generation": generation}
 
     async def run_watch_once(self, *, initial_scan: bool = False) -> int:
@@ -152,6 +152,7 @@ class RuntimeHost:
             await service.scheduler.run_once()
             return 0
         config = load_config()
+        await self._set_configured_process_mode(config)
         engine = await shared_pipeline_engine(config)
         service = WatchService(
             pipeline_engine=engine,
@@ -176,9 +177,7 @@ class RuntimeHost:
                 self._watch_task = None
         self._notify_state_changed()
         if error is not None:
-            await self._set_process_mode(background=False)
             raise error
-        await self._set_process_mode(background=False)
         self.log_event("watch_stopped")
         return {"stopped": True, "running": False, "generation": self._watch_generation}
 
@@ -188,16 +187,6 @@ class RuntimeHost:
             self.log_event("watch_reload_ignored")
             return {"reloaded": False, "running": False, "generation": self._watch_generation}
         reloaded = await service.reload()
-        if reloaded:
-            self._watch_process_mode = _configured_watch_process_mode(getattr(service, "config", {}))
-            if self._watch_process_mode == "background":
-                self._schedule_background()
-            else:
-                demote = self._demote_task
-                self._demote_task = None
-                if demote is not None:
-                    demote.cancel()
-                await self._set_process_mode(background=False)
         self.log_event("watch_reloaded" if reloaded else "watch_reload_skipped")
         return {"reloaded": reloaded, "running": True, "generation": self._watch_generation}
 
@@ -250,11 +239,6 @@ class RuntimeHost:
             foreground_requests=self._foreground_requests,
             exit_reason=str(exit_reason),
         )
-        demote = self._demote_task
-        self._demote_task = None
-        if demote is not None:
-            demote.cancel()
-            await asyncio.gather(demote, return_exceptions=True)
         if self.watch_enabled:
             await self.stop_watch()
         self.log_event("host_stopped", exit_reason=str(exit_reason))
@@ -269,11 +253,6 @@ class RuntimeHost:
                     await scheduler.set_external_activity(True)
             self._foreground_requests += 1
         self.log_event("foreground_started", foreground_requests=self._foreground_requests)
-        demote = self._demote_task
-        self._demote_task = None
-        if demote is not None:
-            demote.cancel()
-        await self._set_process_mode(background=False)
 
     async def foreground_finished(self) -> None:
         async with self._foreground_state_lock:
@@ -284,30 +263,57 @@ class RuntimeHost:
                 scheduler = service.scheduler if service is not None else None
                 if scheduler is not None:
                     await scheduler.set_external_activity(False)
+                else:
+                    await self.expire_cli_process_mode_override()
         self.log_event("foreground_finished", foreground_requests=self._foreground_requests)
-        if last:
-            self._schedule_background()
 
-    def _schedule_background(self) -> None:
-        if self._watch_process_mode != "background" or self._foreground_requests or not self.watch_enabled:
+    @property
+    def process_mode(self) -> str:
+        return self._process_mode
+
+    async def set_cli_process_mode_override(self, mode: str) -> None:
+        normalized = str(mode or "high").strip().lower()
+        if normalized not in {"background", "normal", "high"}:
+            raise ValueError(f"unsupported process mode: {mode}")
+        self._cli_process_mode_override = normalized
+        await self._apply_effective_process_mode()
+
+    async def expire_cli_process_mode_override(self) -> bool:
+        if self._cli_process_mode_override is None:
+            return False
+        previous = self._cli_process_mode_override
+        self._cli_process_mode_override = None
+        await self._apply_effective_process_mode()
+        self.log_event(
+            "cli_process_mode_override_expired",
+            previous_mode=previous,
+            restored_mode=self._configured_process_mode,
+        )
+        return True
+
+    async def sync_process_mode_to_engine(self, engine) -> None:
+        if self._process_mode == "normal":
             return
-        previous = self._demote_task
-        if previous is not None:
-            previous.cancel()
+        try:
+            await engine.set_process_mode(mode=self._process_mode)
+        except Exception:
+            _LOG.exception("failed to synchronize native worker process mode")
 
-        async def demote() -> None:
-            try:
-                await asyncio.sleep(2.0)
-                if self._foreground_requests == 0 and self.watch_enabled:
-                    await self._set_process_mode(background=True)
-            except asyncio.CancelledError:
-                return
+    async def _watch_config_applied(self, config: dict) -> None:
+        await self._set_configured_process_mode(config)
 
-        self._demote_task = asyncio.create_task(demote(), name="sunpack-runtime-qos-demote")
+    async def _set_configured_process_mode(self, config: dict) -> None:
+        self._configured_process_mode = _configured_runtime_process_mode(config)
+        await self._apply_effective_process_mode()
 
-    async def _set_process_mode(self, *, background: bool) -> None:
+    async def _apply_effective_process_mode(self) -> None:
+        await self._set_process_mode(
+            mode=self._cli_process_mode_override or self._configured_process_mode
+        )
+
+    async def _set_process_mode(self, *, mode: str) -> None:
         async with self._qos_lock:
-            if self._background == bool(background):
+            if self._process_mode == mode:
                 return
             from sunpack.cli.persistent_runtime import current_pipeline_engine
             from sunpack.platform.windows.process_qos import set_processing_mode
@@ -316,17 +322,17 @@ class RuntimeHost:
             worker_result = {}
             if engine is not None:
                 try:
-                    worker_result = await engine.set_process_mode(background=background) or {}
+                    worker_result = await engine.set_process_mode(mode=mode) or {}
                 except Exception:
-                    _LOG.exception("failed to change native worker process QoS")
+                    _LOG.exception("failed to change native worker process mode")
             try:
-                set_processing_mode(background=background)
+                set_processing_mode(mode=mode)
             except Exception:
-                _LOG.exception("failed to change RuntimeHost process QoS")
-            self._background = bool(background)
+                _LOG.exception("failed to change RuntimeHost process mode")
+            self._process_mode = mode
             self.log_event(
                 "qos_changed",
-                mode="background" if background else "normal",
+                mode=mode,
                 worker_pid=int(worker_result.get("worker_pid", 0) or 0),
                 worker_applied=bool(worker_result.get("applied", False)),
             )
@@ -347,5 +353,3 @@ class RuntimeHost:
                 self._watch_service = None
                 self._watch_task = None
         self._notify_state_changed()
-        if not self.watch_enabled:
-            await self._set_process_mode(background=False)

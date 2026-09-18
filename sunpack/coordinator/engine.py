@@ -266,8 +266,8 @@ class PipelineEngine:
         """Refresh the snapshot source for future requests only."""
         _replace_mapping_in_place(self.config, config)
 
-    async def set_process_mode(self, *, background: bool) -> dict[str, Any]:
-        return await self._services.sevenzip_runner.set_process_mode_asyncio(background=background)
+    async def set_process_mode(self, *, mode: str) -> dict[str, Any]:
+        return await self._services.sevenzip_runner.set_process_mode_asyncio(mode=mode)
 
     async def aclose(self, *, graceful: bool = True) -> None:
         if self._closed:

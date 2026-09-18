@@ -35,6 +35,7 @@ Test runs disable the `size_range` filter by default so that tests can use files
 ```json
 {
   "cli": {},
+  "runtime": {},
   "recursive_extract": "*",
   "nested_extraction_policy": {},
   "post_extract": {},
@@ -162,6 +163,16 @@ Dates support nanosecond timestamps, ISO time strings, and `YYYYMMDD HH:MM`, `YY
 
 Directory scanning and filtering are executed by native scanning capabilities; when a filter cannot be mapped to native parameters, an error is reported explicitly.
 
+## runtime
+
+`runtime` controls process-wide runtime behavior shared by Watch and foreground workloads.
+
+| Field | Default | Description |
+| --- | ---: | --- |
+| `process_mode` | `normal` | Baseline Windows scheduling mode for the shared RuntimeHost and native worker. `normal` uses normal priority; `background` enables Windows Background Processing Mode; `high` uses `HIGH_PRIORITY_CLASS` and may reduce responsiveness of other applications. |
+
+Foreground `extract`, `scan`, and `inspect` requests temporarily override this baseline with their `--process-mode` value; when omitted, that CLI override defaults to `high`. The override remains after the command finishes and expires at the existing idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`), then the latest hot-reloaded `runtime.process_mode` becomes effective again. Changing `runtime.process_mode` while Watch is running is hot-applied without restarting the scheduler; an active CLI override still wins until it expires.
+
 ## performance
 
 Both resource analysis and worker parameters live under `performance`. Defaults are:
@@ -216,7 +227,6 @@ Automatic concurrency is driven mainly by the throughput of actual writes, compl
 
 | Field | Default | Description |
 | --- | ---: | --- |
-| `process_mode` | `normal` | Windows process scheduling mode for the continuous Watch host and native worker. `normal` keeps normal scheduling; `background` enables Windows Background Processing Mode, which lowers CPU, I/O, and memory scheduling priority and may significantly reduce throughput under load or on heterogeneous-core CPUs. |
 | `cold_start_seconds` | `0.0` | Wait time when a file first becomes active. The default is 0, so a file can be processed as soon as it is ready. |
 | `quiet_min_seconds` | `0.0` | Lower bound of the dynamic quiet time. |
 | `quiet_max_seconds` | `180.0` | Upper bound of the dynamic quiet time; when `cold_start_seconds` is 0, no dynamic quiet wait is entered. |
@@ -224,7 +234,7 @@ Automatic concurrency is driven mainly by the throughput of actual writes, compl
 | `max_folders` | `16` | Upper limit field for the number of directories in the configuration; the current CLI directory list is managed by `sunpack_watch_roots.txt`. |
 | `observer_stop_timeout_seconds` | `5.0` | Wait time for stopping the file system observer thread. |
 | `runtime_cache_cleanup_enabled` | `true` | Whether to clean up idle runtime caches. |
-| `runtime_cache_cleanup_idle_seconds` | `10.0` | How long a cache stays idle before cleanup. |
+| `runtime_cache_cleanup_idle_seconds` | `10.0` | Shared idle-maintenance delay. At this deadline a CLI process-mode override expires; runtime caches are also cleared when `runtime_cache_cleanup_enabled` is true. |
 | `password_retry_debounce_seconds` | `0.5` | Wait time before triggering a retry of failed jobs after the password file or clipboard changes. |
 | `password_retry_include_subtree` | `true` | Whether a password source change retries the subtree tasks of the corresponding directory. |
 | `clipboard_monitor_enabled` | `true` | Whether to monitor clipboard password changes. |

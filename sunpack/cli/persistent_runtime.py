@@ -128,6 +128,11 @@ async def pipeline_engine(
             setter(_STATE_CHANGED_CALLBACK)
         engine = await created.__aenter__()
         _ENGINE = engine
+        from sunpack.cli.runtime_state import runtime_host
+
+        host = runtime_host()
+        if host is not None:
+            await host.sync_process_mode_to_engine(engine)
     else:
         engine.reconfigure_request(copy.deepcopy(config))
     yield engine

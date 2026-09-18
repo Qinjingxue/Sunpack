@@ -73,6 +73,17 @@ def build_detection_parser(ctx: CliContext) -> argparse.ArgumentParser:
     return parser
 
 
+def build_process_mode_parser(ctx: CliContext) -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument(
+        "--process-mode",
+        choices=("background", "normal", "high"),
+        default="high",
+        help=ctx.t("cli.process_mode"),
+    )
+    return parser
+
+
 def build_extract_config_override_parser(ctx: CliContext) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--recur", dest="recursive_extract", type=parse_recursive_extract_value, help=ctx.t("cli.recursive_extract"))
