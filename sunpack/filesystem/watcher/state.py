@@ -244,14 +244,19 @@ class WatchStateStore:
         prefix = f"{self.path.stem}.journal."
         suffix = ".jsonl"
         paths: list[tuple[int, Path]] = []
-        with task_scandir(self.path.parent) as entries:
-            for entry in entries:
-                if not entry.name.startswith(prefix) or not entry.name.endswith(suffix):
-                    continue
-                path = Path(entry.path)
-                start = self._segment_start_from_path(path)
-                if start is not None:
-                    paths.append((start, path))
+
+        try:
+            with task_scandir(self.path.parent) as entries:
+                for entry in entries:
+                    if not entry.name.startswith(prefix) or not entry.name.endswith(suffix):
+                        continue
+                    path = Path(entry.path)
+                    start = self._segment_start_from_path(path)
+                    if start is not None:
+                        paths.append((start, path))
+        except FileNotFoundError:
+            return []
+
         paths.sort(key=lambda item: item[0])
         return [path for _, path in paths]
 
