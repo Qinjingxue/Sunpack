@@ -414,7 +414,7 @@ def test_installer_smoke_uses_process_exit_code_for_started_processes():
 
     assert "Start-Process" in invoke_checked
     assert "-PassThru" in invoke_checked
-    assert "-Wait" not in invoke_checked
+    assert "\n        -Wait `" not in invoke_checked
     assert ".WaitForExit(" in invoke_checked
     assert "$process.ExitCode" in invoke_checked
     assert "Command timed out after $TimeoutSeconds seconds" in invoke_checked
@@ -505,7 +505,7 @@ def test_installer_smoke_exercises_upgrade_preservation_and_full_uninstall_clean
     assert "Invoke-UnelevatedJson" in script
     assert "Invoke-UnelevatedChecked" in script
     assert '$startupMatch.Groups["RuntimeIdentity"].Value' in script
-    assert 'Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown")' in script
+    assert 'Invoke-Checked -Label "initial persistent shutdown" -TimeoutSeconds 45 -FilePath $appPath -Arguments @("--persistent-shutdown")' in script
     assert "Packaged runtime did not exit before the startup cold-start test" in script
     assert 'Invoke-UnelevatedChecked -FilePath $runtimeAppPath -Arguments @($runtimeIdentity, "watch", "start")' in script
     assert "Write-DiagnosticLogTail" in script
