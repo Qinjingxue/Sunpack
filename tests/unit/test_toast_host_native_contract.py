@@ -43,6 +43,10 @@ def test_native_toast_identity_is_machine_wide_without_a_start_menu_shortcut():
     assert 'L"Software\\\\Classes\\\\AppUserModelId\\\\"' in source
     for value_name in ("DisplayName", "IconUri", "IconBackgroundColor", "CustomActivator"):
         assert f'L"{value_name}"' in source
+    assert 'L"DisplayName", kToastDisplayName, REG_EXPAND_SZ' in source
+    assert 'L"IconUri", toast_icon_path(executable), REG_EXPAND_SZ' in source
+    assert 'L"DisplayName", REG_EXPAND_SZ) ==' in source
+    assert 'L"IconUri", REG_EXPAND_SZ) ==' in source
     assert "IShellLinkW" not in source
     assert "PKEY_AppUserModel_ID" not in source
     assert "PKEY_AppUserModel_ToastActivatorCLSID" not in source

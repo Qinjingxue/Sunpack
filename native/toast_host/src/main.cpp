@@ -135,7 +135,8 @@ std::wstring quote_argument(std::wstring_view value) {
 }
 
 void set_registry_string(HKEY root, const std::wstring& subkey,
-                         const wchar_t* value_name, const std::wstring& value) {
+                         const wchar_t* value_name, const std::wstring& value,
+                         DWORD value_type = REG_SZ) {
     HKEY key = nullptr;
     const LSTATUS created = RegCreateKeyExW(
         root,
@@ -155,7 +156,7 @@ void set_registry_string(HKEY root, const std::wstring& subkey,
         key,
         value_name,
         0,
-        REG_SZ,
+        value_type,
         reinterpret_cast<const BYTE*>(value.c_str()),
         static_cast<DWORD>((value.size() + 1) * sizeof(wchar_t))
     );
@@ -166,18 +167,22 @@ void set_registry_string(HKEY root, const std::wstring& subkey,
 }
 
 std::optional<std::wstring> get_registry_string(
-    HKEY root, const std::wstring& subkey, const wchar_t* value_name
+    HKEY root, const std::wstring& subkey, const wchar_t* value_name,
+    DWORD value_type = REG_SZ
 ) {
+    const DWORD read_flags = value_type == REG_EXPAND_SZ
+        ? RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND
+        : RRF_RT_REG_SZ;
     DWORD bytes = 0;
     if (RegGetValueW(
-        root, subkey.c_str(), value_name, RRF_RT_REG_SZ,
+        root, subkey.c_str(), value_name, read_flags,
         nullptr, nullptr, &bytes
     ) != ERROR_SUCCESS || bytes < sizeof(wchar_t)) {
         return std::nullopt;
     }
     std::wstring value(bytes / sizeof(wchar_t), L'\0');
     if (RegGetValueW(
-        root, subkey.c_str(), value_name, RRF_RT_REG_SZ,
+        root, subkey.c_str(), value_name, read_flags,
         nullptr, value.data(), &bytes
     ) != ERROR_SUCCESS) {
         return std::nullopt;
@@ -201,8 +206,8 @@ void register_toast_identity(const std::wstring& executable, const std::wstring&
     );
 
     const std::wstring app_id_path = toast_app_id_registry_path();
-    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"DisplayName", kToastDisplayName);
-    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconUri", toast_icon_path(executable));
+    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"DisplayName", kToastDisplayName, REG_EXPAND_SZ);
+    set_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconUri", toast_icon_path(executable), REG_EXPAND_SZ);
     set_registry_string(
         HKEY_LOCAL_MACHINE, app_id_path, L"IconBackgroundColor", kToastIconBackgroundColor
     );
@@ -215,9 +220,9 @@ bool toast_identity_registered(const std::wstring& executable, const std::wstrin
         const std::wstring app_id_path = toast_app_id_registry_path();
         return get_registry_string(HKEY_LOCAL_MACHINE, com_path, nullptr) ==
                    quote_argument(executable) + L" " + arguments &&
-               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"DisplayName") ==
+               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"DisplayName", REG_EXPAND_SZ) ==
                    kToastDisplayName &&
-               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconUri") ==
+               get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconUri", REG_EXPAND_SZ) ==
                    toast_icon_path(executable) &&
                get_registry_string(HKEY_LOCAL_MACHINE, app_id_path, L"IconBackgroundColor") ==
                    kToastIconBackgroundColor &&
