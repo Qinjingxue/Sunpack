@@ -19,7 +19,6 @@ ORDER = 60
 SUNPACK_REGISTRY_KEY = r"Software\SunPack"
 ENVIRONMENT_REGISTRY_KEY = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
 SERVICE_REGISTRY_KEY = r"SYSTEM\CurrentControlSet\Services\SunPackWatchBroker"
-TOAST_APP_ID_KEY = r"Software\Classes\AppUserModelId\SunPack.Watch.Toast"
 TOAST_CLSID = "{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}"
 TOAST_LOCAL_SERVER_KEY = rf"Software\Classes\CLSID\{TOAST_CLSID}\LocalServer32"
 PATH_MARKER_NAME = "PathAddedByInstaller"
