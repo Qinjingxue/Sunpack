@@ -51,10 +51,20 @@ def _unregister_toast() -> None:
 
     from sunpack.platform.windows.process_launch import launch_unelevated
 
-    argv = _runtime_argv("--unregister-toast")
+    argv = _runtime_argv("--unregister-toast-current-user")
     process = launch_unelevated(argv, cwd=str(current_process_executable().parent))
     try:
-        exit_code = process.wait()
+        try:
+            exit_code = process.wait(timeout=30.0)
+        except subprocess.TimeoutExpired:
+            exit_code = None
+        if exit_code is None:
+            try:
+                process.terminate()
+                process.wait(timeout=5.0)
+            except Exception:
+                pass
+            raise OSError("current-user Toast cleanup timed out")
         if int(exit_code) != 0:
             raise OSError(f"current-user Toast cleanup failed with exit code {int(exit_code)}")
     finally:
@@ -118,8 +128,16 @@ class _NativeToastPresenter:
 
 
 def handle_toast_argv(argv: list[str]) -> int | None:
-    if not argv or argv[0] not in {"--register-toast", "--unregister-toast", "--toast-activated"}:
+    if not argv or argv[0] not in {
+        "--register-toast",
+        "--unregister-toast",
+        "--unregister-toast-current-user",
+        "--toast-activated",
+    }:
         return None
+    if argv[0] == "--unregister-toast-current-user":
+        _remove_current_user_toast_identity()
+        return 0
     if argv[0] == "--unregister-toast":
         _unregister_toast()
         return 0
