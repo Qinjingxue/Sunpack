@@ -23,6 +23,19 @@ function Write-Step {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
+function Wait-BeforeBuildExit {
+    if ($NoPause) {
+        return
+    }
+    Write-Host ""
+    Write-Host "Press Enter to exit..." -ForegroundColor Cyan
+    try {
+        $null = Read-Host
+    } catch {
+        # Never let the pause path hide the original build failure.
+    }
+}
+
 function Get-PythonCommand {
     foreach ($candidate in @("python", "py")) {
         try {
@@ -826,6 +839,7 @@ function Assert-PackagedRuntimeTools {
     }
 }
 
+try {
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 $buildArch = $Arch.ToLowerInvariant()
@@ -1183,9 +1197,7 @@ Write-Host "Version: $versionValue"
 Write-Host "App directory: $distAppRoot"
 Write-Host "Windows installer: $releaseInstallerPath"
 
-if (-not $NoPause -and -not [Console]::IsInputRedirected -and -not [Console]::IsOutputRedirected) {
-    Write-Host ""
-    Write-Host "Press Enter to exit..." -ForegroundColor Cyan
-    $null = Read-Host
+} finally {
+    Wait-BeforeBuildExit
 }
 
