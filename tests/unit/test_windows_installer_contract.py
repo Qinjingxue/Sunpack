@@ -339,6 +339,7 @@ def test_build_and_release_workflow_publish_installers_only():
     assert "$releaseZipPath" not in build_script
     assert "portable archive" not in workflow
     assert "sunpack-windows-*.zip" not in workflow
+    assert not (ROOT / "scripts" / "test_windows_installer.ps1").exists()
     assert "test_windows_installer.ps1" not in build_script
     assert 'Write-Step "Running Windows installer smoke test"' not in build_script
     assert "- name: Smoke test Windows installer" not in workflow
