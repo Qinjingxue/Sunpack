@@ -37,6 +37,9 @@ These options apply to `extract`, `scan`, and `inspect`:
 | `-v`, `--verbose` | Output more detection and diagnostic detail. |
 | `--pause` | Wait for a key press before exiting. |
 | `--no-pause` | Do not pause after the command finishes. |
+| `--process-mode {background,normal,high}` | Temporarily override the shared RuntimeHost/native-worker process mode for this workload. Defaults to `high`. |
+
+For `extract`, `scan`, and `inspect`, the process-mode override remains effective after the command finishes and expires when the shared runtime reaches the existing Watch idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`); it then returns to `runtime.process_mode`.
 
 `passwords` supports only `--json` plus the password input options; `config` supports `--json` and `--quiet`. JSON results use a unified outer set of fields: `command`, `inputs`, `summary`, `errors`, `items`, `tasks`, `logs`; each command fills `items` or `tasks` according to its own semantics.
 
