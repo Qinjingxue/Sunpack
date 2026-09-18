@@ -58,7 +58,12 @@ def main() -> int:
 
     # Registration and COM activation enter the main runtime directly and do
     # not start an extraction engine or a watch service.
-    if sys.argv[1:2] and sys.argv[1] in {"--register-toast", "--unregister-toast", "--toast-activated"}:
+    if sys.argv[1:2] and sys.argv[1] in {
+        "--register-toast",
+        "--unregister-toast",
+        "--unregister-toast-current-user",
+        "--toast-activated",
+    }:
         from sunpack.platform.windows.toast_host import handle_toast_argv
 
         return handle_toast_argv(sys.argv[1:])
