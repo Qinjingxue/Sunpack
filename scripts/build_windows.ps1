@@ -1191,12 +1191,19 @@ try {
 Assert-PathExists -LiteralPath $releaseInstallerPath -Description "Windows installer"
 
 Write-Step "Running Windows installer smoke test"
-Invoke-Native -FilePath "powershell" -Arguments @(
+$installerSmokeArguments = @(
     "-NoProfile",
     "-ExecutionPolicy", "Bypass",
     "-File", $installerSmokeScriptPath,
     "-InstallerPath", $releaseInstallerPath
 )
+$runningInCi =
+    [string]::Equals($env:CI, "true", [StringComparison]::OrdinalIgnoreCase) -or
+    [string]::Equals($env:GITHUB_ACTIONS, "true", [StringComparison]::OrdinalIgnoreCase)
+if (-not $runningInCi) {
+    $installerSmokeArguments += "-SkipIfHostInstalled"
+}
+Invoke-Native -FilePath "powershell" -Arguments $installerSmokeArguments
 
 Write-Host ""
 Write-Host "Build completed successfully." -ForegroundColor Green
