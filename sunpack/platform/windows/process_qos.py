@@ -7,22 +7,27 @@ from ctypes import wintypes
 
 
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
+NORMAL_PRIORITY_CLASS = 0x00000020
+HIGH_PRIORITY_CLASS = 0x00000080
 PROCESS_MODE_BACKGROUND_BEGIN = 0x00100000
 PROCESS_MODE_BACKGROUND_END = 0x00200000
-NORMAL_PRIORITY_CLASS = 0x00000020
 _MODE_LOCK = threading.Lock()
-_BACKGROUND = False
+_MODE = "normal"
 
 
-def set_processing_mode(*, background: bool) -> str:
-    """Switch the current process between foreground and background QoS."""
+def set_processing_mode(*, mode: str) -> str:
+    """Apply one fixed Windows process scheduling mode."""
 
-    global _BACKGROUND
+    global _MODE
+    normalized = str(mode or "normal").strip().lower()
+    if normalized not in {"background", "normal", "high"}:
+        raise ValueError(f"unsupported process mode: {mode}")
     if sys.platform != "win32":
         return "unsupported"
+
     with _MODE_LOCK:
-        if bool(background) == _BACKGROUND:
-            return "background" if _BACKGROUND else "normal"
+        if normalized == _MODE:
+            return _MODE
         try:
             kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
             current_process = kernel32.GetCurrentProcess
@@ -32,14 +37,31 @@ def set_processing_mode(*, background: bool) -> str:
             set_priority_class.argtypes = [wintypes.HANDLE, wintypes.DWORD]
             set_priority_class.restype = wintypes.BOOL
             process = current_process()
-            requested = PROCESS_MODE_BACKGROUND_BEGIN if background else PROCESS_MODE_BACKGROUND_END
+
+            if normalized == "background":
+                if _MODE == "high":
+                    if not set_priority_class(process, NORMAL_PRIORITY_CLASS):
+                        return "unavailable"
+                    _MODE = "normal"
+                if set_priority_class(process, PROCESS_MODE_BACKGROUND_BEGIN):
+                    _MODE = "background"
+                    return "background"
+                if set_priority_class(process, BELOW_NORMAL_PRIORITY_CLASS):
+                    _MODE = "background"
+                    return "below_normal"
+                return "unavailable"
+
+            if _MODE == "background":
+                if not set_priority_class(process, PROCESS_MODE_BACKGROUND_END):
+                    return "unavailable"
+                _MODE = "normal"
+                if normalized == "normal":
+                    return "normal"
+
+            requested = HIGH_PRIORITY_CLASS if normalized == "high" else NORMAL_PRIORITY_CLASS
             if set_priority_class(process, requested):
-                _BACKGROUND = bool(background)
-                return "background" if background else "normal"
-            fallback = BELOW_NORMAL_PRIORITY_CLASS if background else NORMAL_PRIORITY_CLASS
-            if set_priority_class(process, fallback):
-                _BACKGROUND = bool(background)
-                return "below_normal" if background else "normal"
+                _MODE = normalized
+                return normalized
         except (AttributeError, OSError):
             pass
         return "unavailable"
