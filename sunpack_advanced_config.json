@@ -107,8 +107,10 @@
       "max_compression_ratio": 0
     }
   },
+  "runtime": {
+    "process_mode": "normal"
+  },
   "watch": {
-    "process_mode": "normal",
     "cold_start_seconds": 0.0,
     "quiet_min_seconds": 0.0,
     "quiet_max_seconds": 180.0,
