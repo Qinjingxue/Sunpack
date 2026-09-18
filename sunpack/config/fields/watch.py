@@ -29,8 +29,8 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
     config["max_folders"] = max(1, _int_field(config, "max_folders"))
     config["observer_stop_timeout_seconds"] = max(0.0, _float_field(config, "observer_stop_timeout_seconds"))
     process_mode = str(config.get("process_mode") or "normal").strip().lower()
-    if process_mode not in {"normal", "background"}:
-        raise ValueError("watch.process_mode must be normal or background")
+    if process_mode not in {"background", "normal", "high"}:
+        raise ValueError("watch.process_mode must be background, normal, or high")
     config["process_mode"] = process_mode
     config["runtime_cache_cleanup_enabled"] = bool(config["runtime_cache_cleanup_enabled"])
     config["runtime_cache_cleanup_idle_seconds"] = max(
