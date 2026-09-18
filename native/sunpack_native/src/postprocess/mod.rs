@@ -1,10 +1,17 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
 use crate::filesystem::watch_file_observation;
+
+#[cfg(windows)]
+#[link(name = "Kernel32")]
+extern "system" {
+    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
+}
 
 #[pyfunction]
 #[pyo3(signature = (roots, recursive=true))]
@@ -208,86 +215,168 @@ struct FlattenStats {
 }
 
 fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats) {
-    while flatten_single_branch(root, stats) {}
-}
+    let chain = discover_flatten_chain(root);
+    let Some(leaf) = chain.last() else {
+        return;
+    };
+    let leaf_relative = match leaf.strip_prefix(root) {
+        Ok(relative) if !relative.as_os_str().is_empty() => relative.to_path_buf(),
+        _ => {
+            stats.errors.push(format!(
+                "{}: flatten leaf is not below output root",
+                normalize_path(root)
+            ));
+            return;
+        }
+    };
 
-fn flatten_single_branch(root: &Path, stats: &mut FlattenStats) -> bool {
-    let Ok(entries) = fs::read_dir(root) else {
-        return false;
+    let Some(work) = rename_root_to_visible_work(root, stats) else {
+        return;
     };
-    let mut dirs = Vec::new();
-    let mut files = 0usize;
-    for entry in entries.flatten() {
-        let path = entry.path();
-        match entry.metadata() {
-            Ok(metadata) if metadata.is_dir() => dirs.push(path),
-            Ok(metadata) if metadata.is_file() => files += 1,
-            _ => {}
-        }
+    let leaf_in_work = work.join(&leaf_relative);
+    if let Err(error) = rename_no_replace(&leaf_in_work, root) {
+        stats.errors.push(format!(
+            "{} -> {}: {}",
+            normalize_path(&leaf_in_work),
+            normalize_path(root),
+            error
+        ));
+        // Do not merge, overwrite, or clean up on failure.  The complete payload
+        // remains under the visible work directory for straightforward inspection.
+        return;
     }
-    if dirs.len() != 1 || files != 0 {
-        return false;
-    }
-    let child = dirs.remove(0);
-    let Ok(child_entries) = fs::read_dir(&child) else {
-        return false;
-    };
-    for entry in child_entries.flatten() {
-        let src = entry.path();
-        let Some(name) = src.file_name() else {
-            continue;
-        };
-        let dst = unique_destination(root, name);
-        match fs::rename(&src, &dst) {
-            Ok(()) => stats.moved += 1,
-            Err(error) => stats.errors.push(format!(
-                "{} -> {}: {}",
-                normalize_path(&src),
-                normalize_path(&dst),
-                error
-            )),
-        }
-    }
-    match fs::remove_dir(&child) {
-        Ok(()) => {
-            stats.removed_dirs += 1;
-            true
-        }
-        Err(error) => {
-            stats
-                .errors
-                .push(format!("{}: {}", normalize_path(&child), error));
-            false
-        }
+    stats.moved += 1;
+
+    match remove_empty_flatten_wrappers(&work, &leaf_relative) {
+        Ok(removed) => stats.removed_dirs += removed,
+        Err(error) => stats.errors.push(error),
     }
 }
 
-fn unique_destination(root: &Path, name: &std::ffi::OsStr) -> PathBuf {
-    let direct = root.join(name);
-    if !direct.exists() {
-        return direct;
+fn discover_flatten_chain(root: &Path) -> Vec<PathBuf> {
+    let mut chain = Vec::new();
+    let mut current = root.to_path_buf();
+    while let Some(child) = only_child_directory(&current) {
+        chain.push(child.clone());
+        current = child;
     }
-    let path = Path::new(name);
-    let stem = path
-        .file_stem()
-        .and_then(|value| value.to_str())
-        .unwrap_or("item");
-    let extension = path
-        .extension()
-        .and_then(|value| value.to_str())
-        .unwrap_or("");
-    for count in 1usize.. {
-        let candidate_name = if extension.is_empty() {
-            format!("{stem} ({count})")
-        } else {
-            format!("{stem} ({count}).{extension}")
-        };
-        let candidate = root.join(candidate_name);
-        if !candidate.exists() {
-            return candidate;
+    chain
+}
+
+fn only_child_directory(dir: &Path) -> Option<PathBuf> {
+    let mut entries = fs::read_dir(dir).ok()?;
+    let first = entries.next()?.ok()?;
+    if entries.next().is_some() {
+        return None;
+    }
+    if first.metadata().ok()?.is_dir() {
+        Some(first.path())
+    } else {
+        None
+    }
+}
+
+fn rename_root_to_visible_work(root: &Path, stats: &mut FlattenStats) -> Option<PathBuf> {
+    let Some(parent) = root.parent() else {
+        stats.errors.push(format!(
+            "{}: output root has no parent for flatten work directory",
+            normalize_path(root)
+        ));
+        return None;
+    };
+    let Some(root_name) = root.file_name() else {
+        stats.errors.push(format!(
+            "{}: output root has no directory name",
+            normalize_path(root)
+        ));
+        return None;
+    };
+
+    let mut attempt = 1usize;
+    loop {
+        let mut work_name = root_name.to_os_string();
+        work_name.push(".__sunpack_flatten_work__");
+        if attempt > 1 {
+            work_name.push(attempt.to_string());
+        }
+        let work = parent.join(work_name);
+        match rename_no_replace(root, &work) {
+            Ok(()) => return Some(work),
+            Err(error) if is_name_collision(&error) => {
+                attempt = attempt.saturating_add(1);
+            }
+            Err(error) => {
+                stats.errors.push(format!(
+                    "{} -> {}: {}",
+                    normalize_path(root),
+                    normalize_path(&work),
+                    error
+                ));
+                return None;
+            }
         }
     }
-    direct
+}
+
+fn is_name_collision(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::AlreadyExists
+        || matches!(error.raw_os_error(), Some(80 | 183))
+}
+
+#[cfg(windows)]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+
+    let source_wide: Vec<u16> = source
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    if unsafe { MoveFileExW(source_wide.as_ptr(), destination_wide.as_ptr(), 0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn rename_no_replace(source: &Path, destination: &Path) -> io::Result<()> {
+    if destination.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "destination already exists",
+        ));
+    }
+    fs::rename(source, destination)
+}
+
+fn remove_empty_flatten_wrappers(work: &Path, leaf_relative: &Path) -> Result<usize, String> {
+    let leaf = work.join(leaf_relative);
+    let mut current = leaf.parent().map(Path::to_path_buf);
+    let mut removed = 0usize;
+
+    while let Some(directory) = current {
+        if !directory.starts_with(work) {
+            break;
+        }
+        match fs::remove_dir(&directory) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!("{}: {}", normalize_path(&directory), error));
+            }
+        }
+        if directory == work {
+            break;
+        }
+        current = directory.parent().map(Path::to_path_buf);
+    }
+
+    Ok(removed)
 }
 
 fn normalize_path(path: &Path) -> String {

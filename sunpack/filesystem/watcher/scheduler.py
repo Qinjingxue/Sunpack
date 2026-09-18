@@ -70,10 +70,12 @@ from sunpack.passwords.internal.local_files import (
 from sunpack.passwords.internal.store import MAX_RECENT_PASSWORDS
 from sunpack.support.path_keys import path_key
 from sunpack.support.collections import dedupe_normalized_paths
+from sunpack.support.archive_sessions import release_archive_sessions_under
 from sunpack.support.resource_lifecycle import (
     ResourceKind,
     lifecycle_registration,
     open_service_file,
+    promotion_barrier,
     register_service_resource,
 )
 from sunpack.support.output_cleanup import (
@@ -1685,6 +1687,10 @@ class WatchScheduler:
                 change_usn=candidate.change_usn,
                 status="done",
             )
+            # Directory-swap flatten changes the output root identity. Retire
+            # the durable Watch publication now; cosmetic flatten waits until all
+            # retryable nested blockers have been classified below.
+            self.state.complete_work_if_matches(request.candidate)
 
         waiting_failures: list = []
         if direct_missing:
@@ -1806,6 +1812,18 @@ class WatchScheduler:
             and failure not in recorded_password_failures
         ]
         failed = list(getattr(summary, "failed_tasks", []) or [])
+
+        # Flatten is final cosmetic work once no future retry depends on the
+        # current recursive paths. Terminal nested failures do not own a retry
+        # anchor, so they must not strand an otherwise successful outer output
+        # in its pre-flatten layout.
+        should_flatten = (
+            direct_outcome == OutcomeKind.COMPLETE_SUCCESS
+            and not direct_missing
+            and not recorded_password_failures
+        )
+        if should_flatten:
+            self._run_deferred_flatten(response)
 
         if terminal_failures:
             payloads = [_failure_to_dict(failure) for failure in terminal_failures]
@@ -1933,6 +1951,31 @@ class WatchScheduler:
         else:
             self._notify("succeeded", request.notification_id, generated_output_dirs)
         return WatchRunResult(processed=1, succeeded=summary.success_count)
+
+    def _run_deferred_flatten(self, response) -> None:
+        if not self.config.get("post_extract", {}).get("flatten_single_directory", True):
+            return
+        targets = list(response.artifacts.flatten_targets)
+        if not targets:
+            return
+        try:
+            with promotion_barrier(
+                targets,
+                cache_releasers=(release_archive_sessions_under,),
+            ):
+                PostProcessActions(self.config).apply(
+                    cleanup_archives=False,
+                    flatten_targets=targets,
+                )
+        except Exception as exc:
+            # The publication is already retired. Flatten is cosmetic here, so
+            # a postprocess failure must not resurrect or re-extract the source.
+            self.log.write(
+                "deferred_flatten_failed",
+                targets=targets,
+                error=str(exc),
+                error_type=type(exc).__name__,
+            )
 
     def _notify(self, action: str, *args) -> None:
         try:
