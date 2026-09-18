@@ -747,6 +747,7 @@ mod tests {
             .path()
             .join("StreamingAssets/aa/catalog.bin")
             .is_file());
+        assert_eq!(stats.moved, 1);
         assert_eq!(stats.removed_dirs, 1);
         assert!(stats.errors.is_empty());
     }
@@ -764,7 +765,62 @@ mod tests {
         assert!(output.path().join("payload.txt").is_file());
         assert!(!output.path().join("outer").exists());
         assert!(!output.path().join("inner").exists());
+        assert_eq!(stats.moved, 1);
         assert_eq!(stats.removed_dirs, 2);
         assert!(stats.errors.is_empty());
+    }
+
+    #[test]
+    fn flatten_recovers_after_root_detach_before_phase_commit() {
+        let parent = TestDirectory::new("recover-detach");
+        let root = parent.path().join("output");
+        let payload = root.join("outer/inner/payload.txt");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, b"payload").unwrap();
+
+        let state_dir = parent.path().join("state");
+        let work = flatten_work_path(&root).unwrap();
+        let state = FlattenState {
+            root: root.clone(),
+            work: work.clone(),
+            leaf_relative: PathBuf::from("outer").join("inner"),
+        };
+        let state_file = write_flatten_state(&state_dir, &state).unwrap();
+
+        fs::rename(&root, &work).unwrap();
+        assert_eq!(flatten_state_phase(&state_file), Some(FlattenPhase::Prepared));
+
+        assert_eq!(recover_flatten_transactions(&state_dir), 1);
+        assert!(root.join("payload.txt").is_file());
+        assert!(!work.exists());
+        assert!(flatten_state_files(&state_dir).is_empty());
+    }
+
+    #[test]
+    fn flatten_recovers_after_leaf_promotion_before_wrapper_cleanup() {
+        let parent = TestDirectory::new("recover-promote");
+        let root = parent.path().join("output");
+        let payload = root.join("outer/inner/payload.txt");
+        fs::create_dir_all(payload.parent().unwrap()).unwrap();
+        fs::write(&payload, b"payload").unwrap();
+
+        let state_dir = parent.path().join("state");
+        let work = flatten_work_path(&root).unwrap();
+        let state = FlattenState {
+            root: root.clone(),
+            work: work.clone(),
+            leaf_relative: PathBuf::from("outer").join("inner"),
+        };
+        let prepared = write_flatten_state(&state_dir, &state).unwrap();
+
+        fs::rename(&root, &work).unwrap();
+        let detached = mark_flatten_detached(&prepared).unwrap();
+        fs::rename(work.join("outer/inner"), &root).unwrap();
+        assert_eq!(flatten_state_phase(&detached), Some(FlattenPhase::Detached));
+
+        assert_eq!(recover_flatten_transactions(&state_dir), 1);
+        assert!(root.join("payload.txt").is_file());
+        assert!(!work.exists());
+        assert!(flatten_state_files(&state_dir).is_empty());
     }
 }
