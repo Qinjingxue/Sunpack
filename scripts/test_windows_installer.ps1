@@ -14,19 +14,99 @@ if ($null -ne $elevatedExitCode) {
     exit $elevatedExitCode
 }
 
+function Write-SmokePhase {
+    param(
+        [Parameter(Mandatory = $true)][string]$State,
+        [Parameter(Mandatory = $true)][string]$Label,
+        [string]$Detail = ""
+    )
+    $timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+    $suffix = if ($Detail) { " :: $Detail" } else { "" }
+    Write-Host "[installer-smoke][$timestamp][$State] $Label$suffix"
+}
+
+function Write-ProcessSnapshot {
+    param([string]$Reason = "diagnostic")
+    Write-Host "::group::SunPack process snapshot: $Reason"
+    try {
+        $processes = @(
+            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.Name -in @(
+                        "sunpack.exe",
+                        "sunpack-runtime.exe",
+                        "sunpack_sevenzip_worker.exe",
+                        "sunpack-watch-broker.exe",
+                        "powershell.exe",
+                        "pwsh.exe"
+                    )
+                } |
+                Select-Object Name, ProcessId, ParentProcessId, ExecutablePath, CommandLine
+        )
+        if ($processes.Count -eq 0) {
+            Write-Host "No SunPack-related processes are running."
+        } else {
+            $processes | Sort-Object Name, ProcessId | Format-Table -AutoSize -Wrap | Out-String -Width 4096 | Write-Host
+        }
+        $broker = Get-CimInstance Win32_Service -Filter "Name='SunPackWatchBroker'" -ErrorAction SilentlyContinue
+        if ($null -ne $broker) {
+            Write-Host ("Broker service: State={0} StartMode={1} ProcessId={2}" -f $broker.State, $broker.StartMode, $broker.ProcessId)
+        } else {
+            Write-Host "Broker service: absent"
+        }
+        try {
+            $pipes = @(Get-ChildItem -LiteralPath "\\.\pipe\" -ErrorAction Stop |
+                Where-Object { $_.Name -match "sunpack" } |
+                Select-Object -ExpandProperty Name)
+            $pipeText = if ($pipes.Count) { $pipes -join ", " } else { "<none>" }
+            Write-Host "SunPack named pipes: $pipeText"
+        } catch {
+            Write-Host "Named-pipe enumeration unavailable: $($_.Exception.Message)"
+        }
+    } finally {
+        Write-Host "::endgroup::"
+    }
+}
+
 function Invoke-Checked {
     param(
         [Parameter(Mandatory = $true)][string]$FilePath,
-        [string[]]$Arguments = @()
+        [string[]]$Arguments = @(),
+        [int]$TimeoutSeconds = 120,
+        [string]$Label = ""
     )
+    if (-not $Label) {
+        $Label = Split-Path -Leaf $FilePath
+    }
+    $commandText = "$FilePath $($Arguments -join ' ')".Trim()
+    Write-SmokePhase -State "BEGIN" -Label $Label -Detail $commandText
+
+    # Deliberately do not use Start-Process -Wait. On Windows PowerShell it can
+    # wait for descendants as well as the direct process, which is the wrong
+    # contract for a smoke test of commands that may own persistent children.
     $process = Start-Process `
         -FilePath $FilePath `
         -ArgumentList $Arguments `
-        -Wait `
         -PassThru `
         -NoNewWindow
-    if ($process.ExitCode -ne 0) {
-        throw "Command failed with exit code $($process.ExitCode): $FilePath $($Arguments -join ' ')"
+    $startedAt = Get-Date
+    if (-not $process.WaitForExit([Math]::Max(1, $TimeoutSeconds) * 1000)) {
+        $elapsed = ((Get-Date) - $startedAt).TotalSeconds
+        Write-SmokePhase -State "TIMEOUT" -Label $Label -Detail ("PID={0} elapsed={1:N1}s" -f $process.Id, $elapsed)
+        Write-ProcessSnapshot -Reason "$Label timed out"
+        try {
+            & taskkill.exe /PID $process.Id /T /F 2>&1 | ForEach-Object { Write-Host $_ }
+        } catch {
+            Write-Host "Failed to terminate timed-out process tree PID $($process.Id): $($_.Exception.Message)"
+        }
+        throw "Command timed out after $TimeoutSeconds seconds: $commandText"
+    }
+    $process.WaitForExit()
+    $exitCode = $process.ExitCode
+    $elapsed = ((Get-Date) - $startedAt).TotalSeconds
+    Write-SmokePhase -State "END" -Label $Label -Detail ("PID={0} exit={1} elapsed={2:N2}s" -f $process.Id, $exitCode, $elapsed)
+    if ($exitCode -ne 0) {
+        throw "Command failed with exit code $($exitCode): $commandText"
     }
 }
 
@@ -286,7 +366,7 @@ try {
         Move-Item -LiteralPath $userDataRoot -Destination $userDataBackup
     }
 
-    Invoke-Checked -FilePath $resolvedInstaller -Arguments @(
+    Invoke-Checked -Label "initial install" -TimeoutSeconds 180 -FilePath $resolvedInstaller -Arguments @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
@@ -355,7 +435,7 @@ try {
     if ($LASTEXITCODE -ne 0 -or $serviceDacl -notmatch '\(A;;LCRP;;;IU\)') {
         throw "Watch Broker service DACL does not grant only start/query rights to interactive users: $serviceDacl"
     }
-    Invoke-Checked -FilePath $appPath -Arguments @("--help")
+    Invoke-Checked -Label "installed launcher help" -TimeoutSeconds 30 -FilePath $appPath -Arguments @("--help")
 
     $userPath = Get-MachinePath
     if (-not (Test-PathEntry -PathValue $userPath -Expected $installRoot)) {
@@ -387,7 +467,15 @@ try {
     }
     $runtimeIdentity = $startupMatch.Groups["RuntimeIdentity"].Value
 
-    Invoke-Checked -FilePath $appPath -Arguments @("--persistent-shutdown")
+    try {
+        Invoke-Checked -Label "initial persistent shutdown" -TimeoutSeconds 45 -FilePath $appPath -Arguments @("--persistent-shutdown")
+    } catch {
+        Write-ProcessSnapshot -Reason "initial persistent shutdown failure"
+        foreach ($runtimeLog in @(Get-ChildItem -LiteralPath $userDataRoot -Filter "runtime-*.state.events.jsonl" -File -ErrorAction SilentlyContinue)) {
+            Write-DiagnosticLogTail -Label ("runtime events: " + $runtimeLog.Name) -Path $runtimeLog.FullName
+        }
+        throw
+    }
     $runtimeExitDeadline = (Get-Date).AddSeconds(20)
     do {
         $installedRuntimeProcesses = @(
@@ -443,7 +531,7 @@ try {
     if (-not [bool]$watchStatusBeforeUpgrade.summary.running) {
         throw "Installer smoke precondition failed: Watch is not running before the upgrade."
     }
-    Invoke-Checked -FilePath $resolvedInstaller -Arguments @(
+    Invoke-Checked -Label "running-watch upgrade install" -TimeoutSeconds 180 -FilePath $resolvedInstaller -Arguments @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
@@ -516,7 +604,7 @@ try {
     if ([bool]$watchStatusBeforeStoppedUpgrade.summary.running) {
         throw "Watch did not stop before the stopped-state upgrade test."
     }
-    Invoke-Checked -FilePath $resolvedInstaller -Arguments @(
+    Invoke-Checked -Label "stopped-watch upgrade install" -TimeoutSeconds 180 -FilePath $resolvedInstaller -Arguments @(
         "/VERYSILENT",
         "/SUPPRESSMSGBOXES",
         "/NORESTART",
