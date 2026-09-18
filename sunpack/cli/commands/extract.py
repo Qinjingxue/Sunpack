@@ -5,6 +5,7 @@ from sunpack.cli.cli_parsers import (
     build_detection_parser,
     build_extract_config_override_parser,
     build_password_parser,
+    build_process_mode_parser,
     localize_help_action,
 )
 from sunpack.cli.cli_runtime import (
@@ -44,7 +45,7 @@ ORDER = 10
 def register(subparsers, ctx):
     parser = subparsers.add_parser(
         COMMAND,
-        parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx), build_extract_config_override_parser(ctx)],
+        parents=[build_common_parser(ctx), build_detection_parser(ctx), build_password_parser(ctx), build_extract_config_override_parser(ctx), build_process_mode_parser(ctx)],
         help=ctx.t("cli.extract.help"),
         usage="sunpack extract [options] <paths...>",
         formatter_class=CliHelpFormatter,
