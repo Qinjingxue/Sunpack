@@ -11,6 +11,12 @@ from sunpack.support.resources import get_resource_path
 DEFAULT_BUILTIN_PASSWORDS = ["123456", "123", "0000", "789"]
 WATCH_CLIPBOARD_BLOCK_BEGIN = "# BEGIN SUNPACK WATCH CLIPBOARD PASSWORDS"
 WATCH_CLIPBOARD_BLOCK_END = "# END SUNPACK WATCH CLIPBOARD PASSWORDS"
+WATCH_CLIPBOARD_BLOCK_BEGIN_ZH = "# 开始 SUNPACK 监控剪贴板密码"
+WATCH_CLIPBOARD_BLOCK_END_ZH = "# 结束 SUNPACK 监控剪贴板密码"
+WATCH_CLIPBOARD_BLOCK_MARKERS = (
+    (WATCH_CLIPBOARD_BLOCK_BEGIN, WATCH_CLIPBOARD_BLOCK_END),
+    (WATCH_CLIPBOARD_BLOCK_BEGIN_ZH, WATCH_CLIPBOARD_BLOCK_END_ZH),
+)
 
 
 def get_builtin_passwords() -> list[str]:
@@ -69,24 +75,43 @@ def _ensure_builtin_password_file(path: Path) -> None:
         pass
 
 
+def _watch_clipboard_block_markers() -> tuple[str, str]:
+    i18n = I18nContext(load_cli_language_from_config())
+    return (
+        i18n.t("passwords.watch_clipboard_block_begin"),
+        i18n.t("passwords.watch_clipboard_block_end"),
+    )
+
+
+def _find_watch_clipboard_block(lines: list[str]) -> tuple[int, int] | None:
+    for begin_marker, end_marker in WATCH_CLIPBOARD_BLOCK_MARKERS:
+        try:
+            begin = lines.index(begin_marker)
+            end = lines.index(end_marker, begin + 1)
+        except ValueError:
+            continue
+        return begin, end
+    return None
+
+
 def _read_watch_clipboard_block(text: str) -> list[str]:
     lines = text.splitlines()
-    try:
-        begin = lines.index(WATCH_CLIPBOARD_BLOCK_BEGIN)
-        end = lines.index(WATCH_CLIPBOARD_BLOCK_END, begin + 1)
-    except ValueError:
+    bounds = _find_watch_clipboard_block(lines)
+    if bounds is None:
         return []
+    begin, end = bounds
     return [line for line in lines[begin + 1:end] if line and not line.lstrip().startswith("#")]
 
 
 def _replace_watch_clipboard_block(text: str, passwords: list[str]) -> str:
     lines = text.splitlines()
-    block = [WATCH_CLIPBOARD_BLOCK_BEGIN, *passwords, WATCH_CLIPBOARD_BLOCK_END]
-    try:
-        begin = lines.index(WATCH_CLIPBOARD_BLOCK_BEGIN)
-        end = lines.index(WATCH_CLIPBOARD_BLOCK_END, begin + 1)
+    begin_marker, end_marker = _watch_clipboard_block_markers()
+    block = [begin_marker, *passwords, end_marker]
+    bounds = _find_watch_clipboard_block(lines)
+    if bounds is not None:
+        begin, end = bounds
         lines[begin:end + 1] = block
-    except ValueError:
+    else:
         if lines and lines[-1] != "":
             lines.append("")
         lines.extend(block)

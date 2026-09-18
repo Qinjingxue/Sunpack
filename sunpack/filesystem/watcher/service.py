@@ -279,10 +279,21 @@ def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path
         )
         normalized_entries.append((normalized_input, normalized_output))
         seen.add(key)
+    comments: list[str] = []
+    try:
+        for line in read_task_text(roots_path, encoding="utf-8").splitlines():
+            if line.strip().startswith("#"):
+                comments.append(line)
+    except OSError:
+        pass
+    prefix = "".join(f"{line}\n" for line in comments)
+    if comments and normalized_entries:
+        prefix += "\n"
     roots_path.parent.mkdir(parents=True, exist_ok=True)
     write_task_text(
         roots_path,
-        "".join(
+        prefix
+        + "".join(
             f"{input_root}{f' {WATCH_ROOT_OUTPUT_SEPARATOR} {output_root}' if output_root else ''}\n"
             for input_root, output_root in normalized_entries
         ),
