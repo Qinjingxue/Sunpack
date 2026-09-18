@@ -345,6 +345,36 @@ def test_unregister_toast_elevated_removes_machine_registration_then_delegates_u
     ]
 
 
+def test_unregister_toast_elevated_bounds_current_user_cleanup_wait(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from sunpack.platform.windows import elevation, process_launch
+
+    calls = []
+    library = SimpleNamespace(sunpack_toast_unregister=lambda: 0)
+
+    class Process:
+        def wait(self, timeout=None):
+            calls.append(('wait', timeout))
+            return None
+
+        def terminate(self):
+            calls.append('terminate')
+
+        def close(self):
+            calls.append('close')
+
+    monkeypatch.setattr(elevation, 'is_process_elevated', lambda: True)
+    monkeypatch.setattr(module, '_load_library', lambda: library)
+    monkeypatch.setattr(module, '_runtime_argv', lambda argument: ['runtime.exe', argument])
+    monkeypatch.setattr(module, 'current_process_executable', lambda: tmp_path / 'runtime.exe')
+    monkeypatch.setattr(process_launch, 'launch_unelevated', lambda *_args, **_kwargs: Process())
+
+    with pytest.raises(OSError, match='current-user Toast cleanup timed out'):
+        module.handle_toast_argv(['--unregister-toast'])
+
+    assert calls == [('wait', 30.0), 'terminate', ('wait', 5.0), 'close']
+
+
 def test_unregister_toast_current_user_helper_never_relaunches_when_still_elevated(monkeypatch):
     from sunpack.platform.windows import elevation, process_launch
 
