@@ -340,7 +340,7 @@ def test_unregister_toast_elevated_removes_machine_registration_then_delegates_u
     assert calls == [
         'machine',
         ('launch', ['runtime.exe', '--unregister-toast'], str(tmp_path)),
-        ('wait', 30.0),
+        ('wait', None),
         'close',
     ]
 
