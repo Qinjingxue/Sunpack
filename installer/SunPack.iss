@@ -640,55 +640,82 @@ begin
   Result := ClearDirectory(ExpandConstant('{app}'));
 end;
 
+procedure AppendTextLine(var Lines: TArrayOfString; const Line: string);
+var
+  Index: Integer;
+begin
+  Index := GetArrayLength(Lines);
+  SetArrayLength(Lines, Index + 1);
+  Lines[Index] := Line;
+end;
+
+function TextLinesContain(var Lines: TArrayOfString; const Needle: string): Boolean;
+var
+  Index: Integer;
+begin
+  Result := False;
+  for Index := 0 to GetArrayLength(Lines) - 1 do
+  begin
+    if Pos(Needle, Lines[Index]) > 0 then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
+procedure SaveUTF8TextLines(const FilePath: string; const Lines: TArrayOfString);
+begin
+  if not SaveStringsToUTF8FileWithoutBOM(FilePath, Lines, False) then
+    RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
+end;
+
 procedure EnsureLocalizedEditableConfigFiles;
 var
   DataPath: string;
   FilePath: string;
-  Contents: string;
+  Contents: TArrayOfString;
 begin
   DataPath := ExpandConstant('{commonappdata}\SunPack');
   ForceDirectories(DataPath);
 
   FilePath := AddBackslash(DataPath) + 'builtin_passwords.txt';
+  SetArrayLength(Contents, 0);
   if not FileExists(FilePath) then
   begin
-    Contents :=
-      CustomMessage('BuiltinPasswordsFileHeader') + #13#10 + #13#10 +
-      CustomMessage('BuiltinPasswordsWatchManagedNote') + #13#10 +
-      WatchClipboardBlockBegin + #13#10 +
-      WatchClipboardBlockEnd + #13#10;
-    if not SaveStringToFile(FilePath, Contents, False) then
-      RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
+    AppendTextLine(Contents, CustomMessage('BuiltinPasswordsFileHeader'));
+    AppendTextLine(Contents, '');
+    AppendTextLine(Contents, CustomMessage('BuiltinPasswordsWatchManagedNote'));
+    AppendTextLine(Contents, WatchClipboardBlockBegin);
+    AppendTextLine(Contents, WatchClipboardBlockEnd);
+    SaveUTF8TextLines(FilePath, Contents);
   end
   else
   begin
-    if not LoadStringFromFile(FilePath, Contents) then
+    if not LoadStringsFromFile(FilePath, Contents) then
       RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
 
-    if (Pos(WatchClipboardBlockBegin, Contents) = 0) and
-       (Pos(WatchClipboardBlockEnd, Contents) = 0) then
+    if (not TextLinesContain(Contents, WatchClipboardBlockBegin)) and
+       (not TextLinesContain(Contents, WatchClipboardBlockEnd)) then
     begin
-      if (Contents <> '') and (Copy(Contents, Length(Contents), 1) <> #10) then
-        Contents := Contents + #13#10;
-      Contents :=
-        Contents + #13#10 +
-        CustomMessage('BuiltinPasswordsWatchManagedNote') + #13#10 +
-        WatchClipboardBlockBegin + #13#10 +
-        WatchClipboardBlockEnd + #13#10;
-      if not SaveStringToFile(FilePath, Contents, False) then
-        RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
+      if (GetArrayLength(Contents) = 0) or
+         (Contents[GetArrayLength(Contents) - 1] <> '') then
+        AppendTextLine(Contents, '');
+      AppendTextLine(Contents, CustomMessage('BuiltinPasswordsWatchManagedNote'));
+      AppendTextLine(Contents, WatchClipboardBlockBegin);
+      AppendTextLine(Contents, WatchClipboardBlockEnd);
+      SaveUTF8TextLines(FilePath, Contents);
     end;
   end;
 
   FilePath := AddBackslash(DataPath) + 'sunpack_watch_roots.txt';
   if not FileExists(FilePath) then
   begin
-    Contents :=
-      CustomMessage('WatchRootsFileHeader') + #13#10 +
-      CustomMessage('WatchRootsFileMapping') + #13#10 +
-      CustomMessage('WatchRootsFileExample') + #13#10;
-    if not SaveStringToFile(FilePath, Contents, False) then
-      RaiseException(Format(CustomMessage('EditableConfigCreateFailed'), [FilePath]));
+    SetArrayLength(Contents, 0);
+    AppendTextLine(Contents, CustomMessage('WatchRootsFileHeader'));
+    AppendTextLine(Contents, CustomMessage('WatchRootsFileMapping'));
+    AppendTextLine(Contents, CustomMessage('WatchRootsFileExample'));
+    SaveUTF8TextLines(FilePath, Contents);
   end;
 end;
 

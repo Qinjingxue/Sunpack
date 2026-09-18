@@ -1,0 +1,51 @@
+name: Installer compile regression
+
+on:
+  pull_request:
+    paths:
+      - "installer/**"
+      - "scripts/test_inno_installer_compile.ps1"
+      - ".github/workflows/installer-compile.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "installer/**"
+      - "scripts/test_inno_installer_compile.ps1"
+      - ".github/workflows/installer-compile.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    name: Compile Inno Setup installer
+    runs-on: windows-2022
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Ensure Inno Setup 6.3+
+        shell: pwsh
+        run: |
+          $candidates = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          )
+          $iscc = $candidates | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup --yes --no-progress
+          } else {
+            $versionText = (Get-Item -LiteralPath $iscc).VersionInfo.FileVersion
+            $version = [Version]($versionText -replace '[^0-9.].*$', '')
+            if ($version -lt [Version]"6.3.0.0") {
+              choco upgrade innosetup --yes --no-progress
+            }
+          }
+
+      - name: Compile installer script
+        shell: pwsh
+        run: .\scripts\test_inno_installer_compile.ps1

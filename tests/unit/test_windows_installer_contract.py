@@ -563,15 +563,31 @@ def test_installer_seeds_localized_editable_text_files_without_overwriting_exist
     assert "procedure EnsureLocalizedEditableConfigFiles;" in script
     assert "EnsureLocalizedEditableConfigFiles;" in script
     assert "if not FileExists(FilePath) then" in script
-    assert "SaveStringToFile(FilePath, Contents, False)" in script
+    assert "Contents: TArrayOfString;" in script
+    assert "LoadStringsFromFile(FilePath, Contents)" in script
+    assert "SaveStringsToUTF8FileWithoutBOM(FilePath, Lines, False)" in script
+    assert "LoadStringFromFile(FilePath, Contents)" not in script
+    assert "SaveStringToFile(FilePath, Contents, False)" not in script
     assert "english.BuiltinPasswordsFileHeader=# Built-in common password list." in script
     assert "chinesesimplified.BuiltinPasswordsFileHeader=# 此文件为内置高频密码配置表" in script
     assert "english.BuiltinPasswordsWatchManagedNote=# The following section is managed automatically by SunPack Watch." in script
     assert "chinesesimplified.BuiltinPasswordsWatchManagedNote=# 以下区域由 SunPack Watch 自动维护，请勿手动编辑。" in script
     assert "WatchClipboardBlockBegin = '#!SUNPACK-WATCH-CLIPBOARD-BEGIN';" in script
     assert "WatchClipboardBlockEnd = '#!SUNPACK-WATCH-CLIPBOARD-END';" in script
-    assert "LoadStringFromFile(FilePath, Contents)" in script
     assert "english.WatchRootsFileHeader=# Watched folders. Add one folder per line." in script
     assert "chinesesimplified.WatchRootsFileHeader=# 监控文件夹配置，每行填写一个监控目录。" in script
     assert "english.WatchRootsFileMapping=# Optional output mapping: input folder | output folder" in script
     assert "chinesesimplified.WatchRootsFileMapping=# 可选输出目录映射格式：输入目录 | 输出目录" in script
+
+
+def test_installer_compile_regression_runs_real_iscc_on_pull_requests():
+    compile_script = (ROOT / "scripts" / "test_inno_installer_compile.ps1").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "installer-compile.yml").read_text(encoding="utf-8")
+
+    assert "ISCC.exe" in compile_script
+    assert "installer\\SunPack.iss" in compile_script
+    assert '"/DTargetArch=$arch"' in compile_script
+    assert '@("x64", "arm64")' in compile_script
+    assert "test_inno_installer_compile.ps1" in workflow
+    assert "pull_request:" in workflow
+

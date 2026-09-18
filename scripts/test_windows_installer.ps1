@@ -419,7 +419,8 @@ try {
     New-Item -ItemType Directory -Path $watchRoot -Force | Out-Null
     $watchRootsContent = "$watchRoot`n"
     Set-Content -LiteralPath $watchRootsPath -Value $watchRootsContent -Encoding UTF8 -NoNewline
-    $builtinPasswordsContent = "installer-smoke-user-password`n"
+    $unicodePassword = "installer-smoke-unicode-" + [char]0x5BC6 + [char]0x7801 + "-" + [char]0x03A9
+    $builtinPasswordsContent = "installer-smoke-user-password`n$unicodePassword`n"
     Set-Content -LiteralPath $builtinPasswordsPath -Value $builtinPasswordsContent -Encoding UTF8 -NoNewline
     $configContent = "{`"cli`": {`"language`": `"en`"}}`n"
     Set-Content -LiteralPath $configPath -Value $configContent -Encoding UTF8 -NoNewline
@@ -459,6 +460,9 @@ try {
     $builtinPasswordLinesAfterUpgrade = @($builtinPasswordsAfterUpgrade -split '\r?\n')
     if ($builtinPasswordLinesAfterUpgrade -notcontains "installer-smoke-user-password") {
         throw "Upgrade install lost the existing builtin password entry: $builtinPasswordsPath"
+    }
+    if ($builtinPasswordLinesAfterUpgrade -notcontains $unicodePassword) {
+        throw "Upgrade install corrupted the existing Unicode builtin password entry: $builtinPasswordsPath"
     }
     if ($builtinPasswordsAfterUpgrade -notmatch '#!SUNPACK-WATCH-CLIPBOARD-BEGIN' -or
         $builtinPasswordsAfterUpgrade -notmatch '#!SUNPACK-WATCH-CLIPBOARD-END') {
