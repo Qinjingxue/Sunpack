@@ -3,6 +3,29 @@ from __future__ import annotations
 from pathlib import Path
 
 
+def marker_present(root: Path, marker_name: str) -> bool:
+    """Return whether a name matches ``marker_name`` under ``root`` right now.
+
+    Safe to call while extraction is publishing: a Watch staging directory is
+    renamed to its final name on a broker worker thread, so a directory that
+    ``rglob`` has already listed can vanish before pathlib enters it.  That
+    transient view is not evidence of absence -- the caller polls again.
+    """
+    return any(safe_rglob(root, marker_name))
+
+
+def safe_rglob(root: Path, pattern: str):
+    """``root.rglob(pattern)`` that tolerates a tree mutating under the walk.
+
+    Without this guard a rename or cleanup racing the traversal raises
+    ``FileNotFoundError`` out of ``os.scandir``.
+    """
+    try:
+        yield from root.rglob(pattern)
+    except FileNotFoundError:
+        return
+
+
 def marker_was_extracted(root: Path, marker_name: str, marker_text: str) -> bool:
     """Return whether a file whose text equals the marker was produced under root."""
     return marker_scan_state(root, marker_name, marker_text) == "found"
@@ -23,23 +46,14 @@ def marker_scan_state(root: Path, marker_name: str, marker_text: str) -> str:
     """
     candidate_exists = False
 
-    def safe_rglob(pattern: str):
-        try:
-            yield from root.rglob(pattern)
-        except FileNotFoundError:
-            # Extraction/cleanup may remove a directory while pathlib is
-            # advancing the iterator.  Treat this tick as a changed
-            # filesystem view; the next poll will observe the stable state.
-            return
-
-    for path in safe_rglob(marker_name):
+    for path in safe_rglob(root, marker_name):
         try:
             if path.read_text(encoding="utf-8") == marker_text:
                 return "found"
         except OSError:
             candidate_exists = True
             continue
-    for path in safe_rglob("*"):
+    for path in safe_rglob(root, "*"):
         try:
             if not path.is_file():
                 continue

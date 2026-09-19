@@ -11,6 +11,7 @@ from sunpack.config.loader import load_config
 from sunpack.coordinator.engine import PipelineEngine
 from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
 from sunpack.filesystem.watcher.scheduler import WatchRunResult, WatchScheduler
+from tests.helpers.marker_utils import marker_present
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory
 
 
@@ -74,7 +75,7 @@ async def _drive_watch_until(
 
 
 def _extracted(output_root: Path, case: ArchiveCase) -> bool:
-    return bool(list(output_root.rglob(case.marker_name)))
+    return marker_present(output_root, case.marker_name)
 
 
 def test_watch_routes_each_root_to_its_output_root_without_input_tree_outputs(tmp_path):

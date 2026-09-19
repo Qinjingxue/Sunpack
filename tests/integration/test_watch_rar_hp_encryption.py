@@ -12,6 +12,7 @@ from sunpack.coordinator.engine import PipelineEngine
 from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
 from sunpack.filesystem.watcher.group_models import BLOCKER_PASSWORD
 from sunpack.filesystem.watcher.scheduler import WatchRunResult, WatchScheduler
+from tests.helpers.marker_utils import marker_present
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory
 
 
@@ -101,7 +102,7 @@ def _password_blocked(watcher: WatchScheduler) -> bool:
 
 
 def _extracted(output_root: Path, case: ArchiveCase) -> bool:
-    return bool(list(output_root.rglob(case.marker_name)))
+    return marker_present(output_root, case.marker_name)
 
 
 def test_watch_single_hp_rar_extracts_with_correct_password(tmp_path):

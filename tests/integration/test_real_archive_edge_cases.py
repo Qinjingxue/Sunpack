@@ -1,4 +1,5 @@
 import json
+import shutil
 from pathlib import Path
 
 import pytest
@@ -56,6 +57,42 @@ def run_pipeline(target: Path, passwords: list[str] | None = None, *, allow_part
     )
 
 
+def _workspace_with_entry(case: ArchiveCase, root: Path) -> Path:
+    """Copy the case entry into a directory that holds nothing else.
+
+    A second pipeline run over the same directory would also scan the output the
+    first run produced there, and would report that output as an archive that is
+    already extracted instead of re-attempting the archive under test.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    for source in sorted(case.archive_dir.iterdir(), key=lambda item: item.name.lower()):
+        if source.is_file():
+            shutil.copy2(source, root / source.name)
+    return root
+
+
+def run_pipeline_in_fresh_workspace(
+    case: ArchiveCase,
+    run_root: Path,
+    output_root: Path,
+    passwords: list[str] | None = None,
+    *,
+    allow_partial: bool = False,
+):
+    config = edge_config(passwords=passwords, allow_partial=allow_partial)
+    # Extract below a dedicated output root so the run under test neither scans
+    # nor overwrites the fixture directory.
+    config["output"] = {"root": str(output_root), "common_root": str(run_root)}
+    return execute_pipeline(config, str(_workspace_with_entry(case, run_root)))
+
+
+def _failure_contains(summary, expected_options: set[str]) -> bool:
+    return any(
+        any(expected in item for expected in expected_options)
+        for item in summary.failed_tasks
+    )
+
+
 def assert_success(case: ArchiveCase, passwords: list[str] | None = None):
     summary = run_pipeline(case.archive_dir, passwords=passwords)
 
@@ -75,13 +112,41 @@ def assert_failure_contains(
 
     assert summary.success_count == 0
     assert summary.failed_tasks
-    assert any(any(expected in item for expected in expected_options) for item in summary.failed_tasks)
+    assert _failure_contains(summary, expected_options)
     if allow_best_effort_outputs:
         manifests = list(case.archive_dir.rglob("extraction_manifest.json"))
         assert manifests
         assert any(json.loads(path.read_text(encoding="utf-8")).get("partial_outputs") for path in manifests)
     else:
         assert not marker_was_extracted(case.archive_dir, case.marker_name, case.marker_text)
+
+
+def assert_wrong_password_then_success(
+    case: ArchiveCase,
+    expected_options: set[str],
+    run_root: Path,
+    output_root: Path,
+) -> None:
+    """Attempt without the password, then with it, in isolated workspaces."""
+    without_password = run_pipeline_in_fresh_workspace(
+        case, run_root / "without-password", output_root / "without-password"
+    )
+
+    assert without_password.success_count == 0
+    assert without_password.failed_tasks
+    assert _failure_contains(without_password, expected_options)
+    assert not marker_was_extracted(output_root / "without-password", case.marker_name, case.marker_text)
+
+    with_password = run_pipeline_in_fresh_workspace(
+        case,
+        run_root / "with-password",
+        output_root / "with-password",
+        passwords=[PASSWORD],
+    )
+
+    assert with_password.success_count == 1
+    assert with_password.failed_tasks == []
+    assert marker_was_extracted(output_root / "with-password", case.marker_name, case.marker_text)
 
 
 def sfx_format_params():
@@ -143,7 +208,11 @@ def test_real_archive_edge_prefixed_password_carrier_archives_require_matching_p
     require_7z()
     case = FACTORY.create(tmp_path, f"pwd_prefixed_{carrier}_{archive_format}", archive_format, password=PASSWORD, carrier=carrier)
 
-    assert_failure_contains(case, {"密码错误", "压缩包损坏", "致命错误"})
-    assert_success(case, passwords=[PASSWORD])
+    assert_wrong_password_then_success(
+        case,
+        {"密码错误", "压缩包损坏", "致命错误"},
+        tmp_path / "runs",
+        tmp_path / "runs-out",
+    )
 
 
