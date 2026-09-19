@@ -92,6 +92,7 @@ struct ExtractInputTrace {
     unsigned long long prefetch_issued_bytes = 0;
     // Snapshot taken after archive Open() and before extraction starts, so Open-prefetch A/B
     // can be measured independently from planned extraction I/O.
+    unsigned long long open_wall_ns = 0;
     unsigned long long open_read_file_call_count = 0;
     unsigned long long open_read_file_wall_ns = 0;
     unsigned long long open_logical_read_call_count = 0;
