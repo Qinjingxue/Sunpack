@@ -994,7 +994,12 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> part_paths{archive_path};
 
-        const std::vector<GUID> formats = candidate_formats_for_hint(format_hint, archive_path, part_paths);
+        const std::vector<GUID> formats = candidate_formats_for_hint(
+            format_hint,
+            archive_path,
+            part_paths,
+            ranges.empty() ? L"" : ranges.front().path,
+            ranges.empty() ? 0 : ranges.front().start);
 
         for (int i = 0; i < password_count; ++i)
         {
