@@ -2947,6 +2947,9 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
 
 
   
+  for (unsigned volumeIndex = 0; volumeIndex < _arcs.Size(); ++volumeIndex)
+    NSunpackReadPlan::SetLegacyPrefetchActive(_arcs[volumeIndex].Stream.Interface(), true);
+
 #ifdef SUP7Z_USE_PLANNED_IO
   for (unsigned volumeIndex = 0; volumeIndex < _arcs.Size(); ++volumeIndex)
     NSunpackReadPlan::Begin(_arcs[volumeIndex].Stream.Interface());
