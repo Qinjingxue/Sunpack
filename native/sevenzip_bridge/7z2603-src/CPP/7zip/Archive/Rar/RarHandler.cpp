@@ -1463,7 +1463,7 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
 
 #ifdef SUP7Z_USE_PLANNED_IO
   for (unsigned volumeIndex = 0; volumeIndex < _arcs.Size(); ++volumeIndex)
-    NSunpackReadPlan::Begin(_arcs[volumeIndex].Stream);
+    NSunpackReadPlan::Begin(_arcs[volumeIndex].Stream.Interface());
 
   FOR_VECTOR(planIndex, importantIndexes)
   {
@@ -1475,12 +1475,12 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
         break;
       const CItem &planItem = _items[planRef.ItemIndex + partIndex];
       if (planItem.PackSize != 0)
-        NSunpackReadPlan::Add(_arcs[volumeIndex].Stream, planItem.GetDataPosition(), planItem.PackSize);
+        NSunpackReadPlan::Add(_arcs[volumeIndex].Stream.Interface(), planItem.GetDataPosition(), planItem.PackSize);
     }
   }
 
   for (unsigned volumeIndex = 0; volumeIndex < _arcs.Size(); ++volumeIndex)
-    NSunpackReadPlan::End(_arcs[volumeIndex].Stream);
+    NSunpackReadPlan::End(_arcs[volumeIndex].Stream.Interface());
 #endif
 
   if (importantTotalUnPacked != 0 || !isThereUndefinedSize)
