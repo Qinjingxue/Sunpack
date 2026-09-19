@@ -384,6 +384,9 @@ public:
   HRESULT ReadBlock();
 
   HRESULT AcquireOutputBuffer();
+#if SUP7Z_USE_SHARED_OUTPUT
+  void AbortOutputLease() throw();
+#endif
   HRESULT Flush();
   HRESULT DecodeBlock(const CBlockProps &props);
   HRESULT DecodeStreams(ICompressProgressInfo *progress);
