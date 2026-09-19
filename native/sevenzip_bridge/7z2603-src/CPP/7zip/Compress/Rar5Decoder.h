@@ -9,6 +9,9 @@
 #include "../../Common/MyCom.h"
 
 #include "../ICoder.h"
+#if SUP7Z_USE_SHARED_OUTPUT
+#include "../Common/SunpackSharedOutput.h"
+#endif
 
 #include "HuffmanDecoder.h"
 
@@ -99,6 +102,10 @@ Z7_CLASS_IMP_NOQIB_2(
   size_t _winSize_Allocated;
   ISequentialInStream *_inStream;
   ISequentialOutStream *_outStream;
+#if SUP7Z_USE_SHARED_OUTPUT
+  CMyComPtr<ISunpackSharedOutput> _sharedOutput;
+  CSunpackSharedOutputLeaseRing<16> _outputLeases;
+#endif
   ICompressProgressInfo *_progress;
   Byte *_inputBuf;
 
@@ -115,6 +122,10 @@ Z7_CLASS_IMP_NOQIB_2(
   }
   void DeleteUnusedFilters();
   HRESULT WriteData(const Byte *data, size_t size);
+#if SUP7Z_USE_SHARED_OUTPUT
+  HRESULT WriteWindowData(const Byte *data, size_t size);
+  HRESULT DrainOutputLeases();
+#endif
   HRESULT ExecuteFilter(const CFilter &f);
   HRESULT WriteBuf();
   HRESULT AddFilter(CBitDecoder &_bitStream);
