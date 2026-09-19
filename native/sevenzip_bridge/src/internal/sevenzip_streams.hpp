@@ -93,31 +93,13 @@ namespace sunpack::sevenzip
     }
 
     inline InputPrefetchConfig input_prefetch_config_for_archive(
-        const std::wstring &format_hint,
-        bool native_volume_input) noexcept
+        const std::wstring & /* format_hint */,
+        bool /* native_volume_input */) noexcept
     {
-        InputPrefetchConfig config = input_prefetch_config();
-        if (!config.enabled || format_hint.empty())
-        {
-            return config;
-        }
-
-        std::wstring normalized = format_hint;
-        for (wchar_t &character : normalized)
-        {
-            if (character >= L'A' && character <= L'Z')
-            {
-                character = static_cast<wchar_t>(character - L'A' + L'a');
-            }
-        }
-
-        if (normalized == L"tar" ||
-            (native_volume_input &&
-             (normalized == L"rar" || normalized == L"rar4" || normalized == L"rar5")))
-        {
-            config.enabled = false;
-        }
-        return config;
+        // Keep format policy neutral while tuning the new shared-input path.
+        // The global environment switch still disables prefetch explicitly;
+        // formats no longer override it behind the benchmark matrix.
+        return input_prefetch_config();
     }
 
     // Opened once per file and reused; the handle carries its own file cursor and is owned by exactly one thread that reads sequentially.
@@ -144,7 +126,9 @@ namespace sunpack::sevenzip
         // Win32 error of the failed open, so callers report the real reason.
         DWORD open_error() const noexcept { return open_error_; }
 
-        // Reads directly at the requested offset; the caller's own position is not part of the contract.
+        // Reads directly at the requested offset. Sequential prefetch normally
+        // asks for the next contiguous chunk, so avoid a SetFilePointerEx
+        // syscall when the handle is already at the requested position.
         HRESULT read_at(UInt64 offset, void *data, UInt32 size, UInt32 *processed) noexcept
         {
             if (processed)
@@ -155,18 +139,28 @@ namespace sunpack::sevenzip
             {
                 return HRESULT_FROM_WIN32(open_error_ != ERROR_SUCCESS ? open_error_ : ERROR_INVALID_HANDLE);
             }
-            LARGE_INTEGER distance{};
-            distance.QuadPart = static_cast<LONGLONG>(offset);
-            if (!SetFilePointerEx(handle_, distance, nullptr, FILE_BEGIN))
+
+            if (!position_valid_ || position_ != offset)
             {
-                return HRESULT_FROM_WIN32(GetLastError());
+                LARGE_INTEGER distance{};
+                distance.QuadPart = static_cast<LONGLONG>(offset);
+                if (!SetFilePointerEx(handle_, distance, nullptr, FILE_BEGIN))
+                {
+                    position_valid_ = false;
+                    return HRESULT_FROM_WIN32(GetLastError());
+                }
+                position_ = offset;
+                position_valid_ = true;
             }
+
             DWORD read = 0;
             const BOOL ok = ReadFile(handle_, data, size, &read, nullptr);
             if (!ok)
             {
+                position_valid_ = false;
                 return HRESULT_FROM_WIN32(GetLastError());
             }
+            position_ += read;
             if (processed)
             {
                 *processed = read;
@@ -186,6 +180,8 @@ namespace sunpack::sevenzip
     private:
         HANDLE handle_ = INVALID_HANDLE_VALUE;
         DWORD open_error_ = ERROR_SUCCESS;
+        UInt64 position_ = 0;
+        bool position_valid_ = true;
     };
 
     // One long lived handle per distinct path, opened on first use; only the owning thread touches a cache, never two at once.
@@ -452,7 +448,18 @@ namespace sunpack::sevenzip
                 const bool fully_consumed = slot.lease_end >= slot.offset + slot.size;
                 slot.lease_end = 0;
                 slot.discard = false;
-                slot.state = (stale || fully_consumed) ? SlotState::Free : SlotState::Ready;
+
+                if (!stale && !fully_consumed)
+                {
+                    // The slot is still live and no capacity was freed.
+                    // schedule_locked() cannot queue anything here, and the
+                    // worker only waits for Queued slots, so notification is
+                    // unnecessary on this common partial-consume path.
+                    slot.state = SlotState::Ready;
+                    return;
+                }
+
+                slot.state = SlotState::Free;
                 schedule_locked();
                 ready_.notify_all();
                 return;
