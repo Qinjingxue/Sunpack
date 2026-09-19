@@ -58,6 +58,9 @@ namespace sunpack::sevenzip
         using JobStatePtr = std::shared_ptr<JobState>;
 
         struct Buffer;
+#if SUP7Z_USE_SHARED_OUTPUT
+        struct BorrowedLease;
+#endif
         struct FileState;
         using FileStatePtr = std::shared_ptr<FileState>;
 
@@ -203,9 +206,25 @@ namespace sunpack::sevenzip
             Staging,
             ProducerLeased,
             Queued,
-            Writing,
-            BorrowedComplete
+            Writing
         };
+
+#if SUP7Z_USE_SHARED_OUTPUT
+        enum class BorrowedLeaseState : unsigned char
+        {
+            Free,
+            InFlight,
+            Complete
+        };
+
+        struct BorrowedLease
+        {
+            AsyncFileWriter *owner = nullptr;
+            HRESULT result = S_OK;
+            BorrowedLeaseState state = BorrowedLeaseState::Free;
+            CSunpackSharedOutputLeaseToken token{};
+        };
+#endif
 
         struct Buffer
         {
@@ -236,6 +255,7 @@ namespace sunpack::sevenzip
             UInt32 reserved_size = 0;
             BufferState state = BufferState::Free;
             bool borrowed = false;
+            BorrowedLease *borrowed_lease = nullptr;
             CSunpackSharedOutputLeaseToken lease_token{};
 #endif
         };
@@ -1198,11 +1218,23 @@ namespace sunpack::sevenzip
 #if SUP7Z_USE_SHARED_OUTPUT
                 buffer->owner = this;
                 buffer->lease_token.context = buffer.get();
-                buffer->lease_token.waitAndRelease = &AsyncFileWriter::wait_borrowed_thunk;
+                buffer->lease_token.waitAndRelease = nullptr;
 #endif
                 free_buffers_.push_back(buffer.get());
                 buffers_.push_back(std::move(buffer));
             }
+#if SUP7Z_USE_SHARED_OUTPUT
+            borrowed_leases_.reserve(buffer_count_);
+            for (std::size_t index = 0; index < buffer_count_; ++index)
+            {
+                auto lease = std::make_unique<BorrowedLease>();
+                lease->owner = this;
+                lease->token.context = lease.get();
+                lease->token.waitAndRelease = &AsyncFileWriter::wait_borrowed_thunk;
+                free_borrowed_leases_.push_back(lease.get());
+                borrowed_leases_.push_back(std::move(lease));
+            }
+#endif
             workers_.reserve(writer_count_);
             try
             {
