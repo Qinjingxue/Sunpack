@@ -10,6 +10,13 @@
 
 #include "../IStream.h"
 
+// Z7_CLASS_IMP_COM_N expands Z7_IFACE_COM7_IMP(interface) for every listed
+// interface. Project-private interfaces therefore need the same method-list
+// macro that upstream 7-Zip interfaces provide in IStream.h / IPassword.h.
+#define Z7_IFACEM_ISunpackSharedInput(x) \
+    x(Borrow(UInt32 maxSize, const Byte **data, UInt32 *size, UInt64 *token)) \
+    x(ReleaseBorrowed(UInt64 token))
+
 struct ISunpackSharedInput : public IUnknown
 {
     virtual HRESULT STDMETHODCALLTYPE Borrow(
