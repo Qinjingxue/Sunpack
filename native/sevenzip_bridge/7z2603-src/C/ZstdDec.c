@@ -3259,6 +3259,21 @@ static SRes ZstdDec_DecodeBlock(CZstdDec * const p, CZstdDecState * const ds,
 
     if (p->frameState == ZSTD2_STATE_DATA)
     {
+#if SUP7Z_USE_SHARED_OUTPUT
+      if (ds->sunpackBeforeWindowReuse && p->curBlockUnpackRem != 0)
+      {
+        const size_t begin = p->decoder.winPos;
+        size_t end = begin + (size_t)p->curBlockUnpackRem;
+        if (end < begin)
+          return SZ_ERROR_FAIL;
+        {
+          const SRes sharedRes = ds->sunpackBeforeWindowReuse(
+              ds->sunpackOutputCtx, begin, end);
+          if (sharedRes != SZ_OK)
+            return sharedRes;
+        }
+      }
+#endif
       /* (p->decoder.winPos == winPos_atFuncStart) is expected,
          because this function doesn't start new block.
          if it have finished some non-empty block in this call. */
@@ -3628,15 +3643,9 @@ SRes ZstdDec_Decode(CZstdDecHandle dec, CZstdDecState *p)
           // return SZ_OK; // ask to flush again
           return SZ_ERROR_FAIL;
         }
-        // (p->wrPos == dec->decoder.winPos), and we wrap to zero:
-#if SUP7Z_USE_SHARED_OUTPUT
-        if (p->sunpackBeforeWindowReuse)
-        {
-          const SRes sharedRes = p->sunpackBeforeWindowReuse(p->sunpackOutputCtx);
-          if (sharedRes != SZ_OK)
-            return sharedRes;
-        }
-#endif
+        // (p->wrPos == dec->decoder.winPos), and we wrap to zero.
+        // Resetting positions doesn't overwrite memory; the next DATA block
+        // retires leases for the exact physical range it will write.
         dec->decoder.winPos = 0;
         p->winPos = 0;
         p->wrPos = 0;
@@ -3677,15 +3686,17 @@ SRes ZstdDec_Decode(CZstdDecHandle dec, CZstdDecState *p)
           return SZ_ERROR_FAIL;
         }
         // p->wrPos >= decoder.cycSize
+        // we move extra data after (decoder.cycSize) to start of cyclic buffer.
+        // Only the low destination prefix is overwritten by this memmove.
 #if SUP7Z_USE_SHARED_OUTPUT
-        if (p->sunpackBeforeWindowReuse)
+        if (p->sunpackBeforeWindowReuse && winPos > delta)
         {
-          const SRes sharedRes = p->sunpackBeforeWindowReuse(p->sunpackOutputCtx);
+          const SRes sharedRes = p->sunpackBeforeWindowReuse(
+              p->sunpackOutputCtx, 0, winPos - delta);
           if (sharedRes != SZ_OK)
             return sharedRes;
         }
 #endif
-        // we move extra data after (decoder.cycSize) to start of cyclic buffer:
         winPos -= delta;
         if (winPos)
         {
