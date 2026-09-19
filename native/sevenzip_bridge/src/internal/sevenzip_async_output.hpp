@@ -806,6 +806,7 @@ namespace sunpack::sevenzip
             {
                 bool queued_staging = false;
                 Buffer *buffer = nullptr;
+                BorrowedLease *lease = nullptr;
                 UInt32 chunk = 0;
                 {
                     std::unique_lock<std::mutex> lock(mutex_);
@@ -817,14 +818,18 @@ namespace sunpack::sevenzip
                             return false;
                         if (file->staging_buffer && file->staging_buffer->size != 0)
                             return queued_jobs_ < queue_limit_;
-                        // A completed borrowed buffer is intentionally pinned until
-                        // its token is retired. Never sleep here when those pinned
-                        // tokens can be the reason the pool is empty: let the
-                        // decoder retire one and retry instead.
-                        if (free_buffers_.empty() && borrowed_leases_ != 0)
+
+                        // Lease records are retired only by the decoder. If that
+                        // tiny pool is exhausted, return control so it can retire
+                        // its oldest token; writer buffers themselves are recycled
+                        // immediately on I/O completion.
+                        if (free_borrowed_leases_.empty() && borrowed_leases_ != 0)
                             return true;
-                        if (queued_jobs_ >= queue_limit_ || free_buffers_.empty())
+                        if (queued_jobs_ >= queue_limit_ ||
+                            free_buffers_.empty() ||
+                            free_borrowed_leases_.empty())
                             return false;
+
                         const std::size_t job_available = job->max_inflight_bytes -
                             (std::min)(job->inflight_bytes, job->max_inflight_bytes);
                         const std::size_t file_available = kDefaultFileInFlightBytes -
@@ -844,29 +849,40 @@ namespace sunpack::sevenzip
                     }
                     else
                     {
-                        if (free_buffers_.empty() && borrowed_leases_ != 0)
+                        if (free_borrowed_leases_.empty() && borrowed_leases_ != 0)
                             return S_FALSE;
 
                         chunk = static_cast<UInt32>(target_size);
 
                         buffer = free_buffers_.back();
                         free_buffers_.pop_back();
+                        lease = free_borrowed_leases_.back();
+                        free_borrowed_leases_.pop_back();
+
+                        lease->result = S_OK;
+                        lease->state = BorrowedLeaseState::InFlight;
+
                         buffer->file = file;
                         buffer->size = chunk;
                         buffer->reserved_size = 0;
                         buffer->borrowed_data = data;
                         buffer->borrowed = true;
+                        buffer->borrowed_lease = lease;
                         buffer->state = BufferState::Queued;
 
-                        const UInt64 output_offset = file->next_write_offset.load(std::memory_order_relaxed);
+                        const UInt64 output_offset =
+                            file->next_write_offset.load(std::memory_order_relaxed);
                         if (output_offset > (std::numeric_limits<UInt64>::max)() - chunk)
                         {
                             buffer->file.reset();
                             buffer->size = 0;
                             buffer->borrowed_data = nullptr;
                             buffer->borrowed = false;
+                            buffer->borrowed_lease = nullptr;
                             buffer->state = BufferState::Free;
                             free_buffers_.push_back(buffer);
+                            lease->state = BorrowedLeaseState::Free;
+                            free_borrowed_leases_.push_back(lease);
                             mark_file_failure_locked(file, E_FAIL, ERROR_ARITHMETIC_OVERFLOW);
                             set_job_error_locked(job, E_FAIL, ERROR_ARITHMETIC_OVERFLOW);
                             producer_cv_.notify_all();
@@ -883,8 +899,11 @@ namespace sunpack::sevenzip
                             buffer->size = 0;
                             buffer->borrowed_data = nullptr;
                             buffer->borrowed = false;
+                            buffer->borrowed_lease = nullptr;
                             buffer->state = BufferState::Free;
                             free_buffers_.push_back(buffer);
+                            lease->state = BorrowedLeaseState::Free;
+                            free_borrowed_leases_.push_back(lease);
                             mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
                             set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
                             producer_cv_.notify_all();
@@ -895,14 +914,15 @@ namespace sunpack::sevenzip
                         file->inflight_bytes += chunk;
                         ++job->pending_jobs;
                         ++file->outstanding_data;
-                        file->next_write_offset.store(output_offset + chunk, std::memory_order_relaxed);
+                        file->next_write_offset.store(
+                            output_offset + chunk, std::memory_order_relaxed);
                         file->accepted_bytes.fetch_add(chunk, std::memory_order_relaxed);
                         account_accepted(chunk);
                         ++queued_jobs_;
                         ++borrowed_leases_;
 
                         *processed_size = chunk;
-                        *token = SunpackSharedOutput_MakeToken(&buffer->lease_token);
+                        *token = SunpackSharedOutput_MakeToken(&lease->token);
                     }
                 }
 
