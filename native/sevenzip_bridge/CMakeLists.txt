@@ -42,6 +42,13 @@ option(SUP7Z_USE_X64_ASM
 option(SUP7Z_USE_ARM64_ASM
     "Use upstream 7-Zip ARM64 LZMA decoder assembly hot path"
     ON)
+option(SUP7Z_USE_PLANNED_IO
+    "Use SunPack planned archive input I/O instead of decoder-driven sequential prefetch during extraction"
+    ON)
+
+if(SUP7Z_USE_PLANNED_IO)
+    add_compile_definitions(SUP7Z_USE_PLANNED_IO=1)
+endif()
 
 set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)
