@@ -1461,6 +1461,28 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
     lastIndex = index + 1;
   }
 
+#ifdef SUP7Z_USE_PLANNED_IO
+  for (unsigned volumeIndex = 0; volumeIndex < _arcs.Size(); ++volumeIndex)
+    NSunpackReadPlan::Begin(_arcs[volumeIndex].Stream);
+
+  FOR_VECTOR(planIndex, importantIndexes)
+  {
+    const CRefItem &planRef = _refItems[importantIndexes[planIndex]];
+    for (unsigned partIndex = 0; partIndex < planRef.NumItems; ++partIndex)
+    {
+      const unsigned volumeIndex = planRef.VolumeIndex + partIndex;
+      if (volumeIndex >= _arcs.Size())
+        break;
+      const CItem &planItem = _items[planRef.ItemIndex + partIndex];
+      if (planItem.PackSize != 0)
+        NSunpackReadPlan::Add(_arcs[volumeIndex].Stream, planItem.GetDataPosition(), planItem.PackSize);
+    }
+  }
+
+  for (unsigned volumeIndex = 0; volumeIndex < _arcs.Size(); ++volumeIndex)
+    NSunpackReadPlan::End(_arcs[volumeIndex].Stream);
+#endif
+
   if (importantTotalUnPacked != 0 || !isThereUndefinedSize)
   {
     RINOK(extractCallback->SetTotal(importantTotalUnPacked))
