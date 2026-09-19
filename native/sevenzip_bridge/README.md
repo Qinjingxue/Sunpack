@@ -60,6 +60,38 @@ Builds are incremental and Release-only (`/O2 /Oi /Ot /Gy /Gw /GF` + `/GL` /
 `/LTCG /OPT:REF /OPT:ICF`); the MASM objects carry no C/C++ optimization flags
 by design, since `ml64.exe` has none.
 
+
+### Shared input buffer path
+
+`SUP7Z_USE_SHARED_INPUT` defaults to `ON`. It is a compile-time performance
+switch: the ON build lets compatible embedded 7-Zip decoders borrow immutable
+spans directly from SunPack's sequential prefetch pool, while the OFF build
+compiles the previous `Read(...)+memcpy` path unchanged. There is no
+per-read runtime mode branch.
+
+Use separate build directories for strict A/B measurements:
+
+```powershell
+cmake -S native\sevenzip_bridge -B native\sevenzip_bridge\build-shared-on  -A x64 -DSUP7Z_USE_SHARED_INPUT=ON
+cmake -S native\sevenzip_bridge -B native\sevenzip_bridge\build-shared-off -A x64 -DSUP7Z_USE_SHARED_INPUT=OFF
+cmake --build native\sevenzip_bridge\build-shared-on  --config Release
+cmake --build native\sevenzip_bridge\build-shared-off --config Release
+```
+
+The shared path keeps prefetch/decode overlap: a borrowed slot stays immutable
+until the decoder releases its lease, and the pool has one extra slot so the
+producer can refill while the decoder consumes the current span. Capability
+discovery is cached at stream/decoder setup; the hot loop does not repeat
+`QueryInterface`.
+
+Direct-span consumers include the common `CInBuffer` family, LZMA, LZMA2
+single-thread/fallback, XZ single-thread/fallback, Zstd, BZip2, PPMd byte
+streams, and stored/copy data. Decoder-owned buffers remain intentional where
+the input is a mutable algorithm work area or must live across an independent
+multi-thread block pipeline (for example RAR5's padded/compacted bit buffer and
+the native MT block readers). Those cases fall back to the old copy path rather
+than weakening overlap or adding synchronization to force nominal zero-copy.
+
 Release outputs:
 
 ```text

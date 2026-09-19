@@ -42,6 +42,33 @@ option(SUP7Z_USE_X64_ASM
 option(SUP7Z_USE_ARM64_ASM
     "Use upstream 7-Zip ARM64 LZMA decoder assembly hot path"
     ON)
+option(SUP7Z_USE_SHARED_INPUT
+    "Let embedded 7-Zip decoders borrow SunPack prefetch buffers instead of copying them"
+    ON)
+
+if(SUP7Z_USE_SHARED_INPUT)
+    add_compile_definitions(SUP7Z_USE_SHARED_INPUT=1)
+else()
+    add_compile_definitions(SUP7Z_USE_SHARED_INPUT=0)
+endif()
+
+# Strict A/B: the compile-time switch removes the borrowed-input hot path
+# entirely when OFF. Keep ON/OFF builds in different directories so benchmark
+# results can never reuse objects produced with the other code path.
+set(SUP7Z_SHARED_INPUT_LAST_SELECTION_FILE
+    "${CMAKE_BINARY_DIR}/sup7z_shared_input_last_selection.txt")
+if(EXISTS "${SUP7Z_SHARED_INPUT_LAST_SELECTION_FILE}")
+    file(READ "${SUP7Z_SHARED_INPUT_LAST_SELECTION_FILE}" SUP7Z_SHARED_INPUT_LAST_SELECTION)
+    string(STRIP "${SUP7Z_SHARED_INPUT_LAST_SELECTION}" SUP7Z_SHARED_INPUT_LAST_SELECTION)
+    if(NOT SUP7Z_SHARED_INPUT_LAST_SELECTION STREQUAL "${SUP7Z_USE_SHARED_INPUT}")
+        message(FATAL_ERROR
+            "SUP7Z_USE_SHARED_INPUT changed from '${SUP7Z_SHARED_INPUT_LAST_SELECTION}' to "
+            "'${SUP7Z_USE_SHARED_INPUT}' in the same build directory. Use separate "
+            "build-shared-input-on / build-shared-input-off directories for strict A/B.")
+    endif()
+endif()
+file(WRITE "${SUP7Z_SHARED_INPUT_LAST_SELECTION_FILE}" "${SUP7Z_USE_SHARED_INPUT}")
+message(STATUS "7-Zip shared input buffers: ${SUP7Z_USE_SHARED_INPUT}")
 
 set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)

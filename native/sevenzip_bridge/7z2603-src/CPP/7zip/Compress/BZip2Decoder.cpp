@@ -878,7 +878,11 @@ CDecoder::CDecoder():
     _outSizeDefined(false),
     _counters(NULL),
     _inBuf(NULL),
-    _inProcessed(0)
+    _inBase(NULL)
+#if SUP7Z_USE_SHARED_INPUT
+    , _borrowToken(0)
+#endif
+    , _inProcessed(0)
 {
   #ifndef Z7_ST
   MtMode = false;
@@ -912,10 +916,25 @@ CDecoder::~CDecoder()
   
   #endif
 
+#if SUP7Z_USE_SHARED_INPUT
+  ReleaseBorrowed();
+#endif
   BigFree(_counters);
   MidFree(_outBuf);
   MidFree(_inBuf);
 }
+
+#if SUP7Z_USE_SHARED_INPUT
+void CDecoder::ReleaseBorrowed() throw()
+{
+  if (_borrowToken)
+  {
+    if (_sharedInput)
+      _sharedInput->ReleaseBorrowed(_borrowToken);
+    _borrowToken = 0;
+  }
+}
+#endif
 
 
 HRESULT CDecoder::ReadInput()
@@ -923,9 +942,45 @@ HRESULT CDecoder::ReadInput()
   if (Base._buf != Base._lim || _inputFinished || _inputRes != S_OK)
     return _inputRes;
 
-  _inProcessed += (size_t)(Base._buf - _inBuf);
+  _inProcessed += (size_t)(Base._buf - _inBase);
+#if SUP7Z_USE_SHARED_INPUT
+  ReleaseBorrowed();
+#endif
+  _inBase = _inBuf;
   Base._buf = _inBuf;
   Base._lim = _inBuf;
+
+#if SUP7Z_USE_SHARED_INPUT
+  if (_sharedInput)
+  {
+    const Byte *borrowed = NULL;
+    UInt32 size = 0;
+    UInt64 token = 0;
+    const HRESULT borrowRes = _sharedInput->Borrow(kInBufSize, &borrowed, &size, &token);
+    if (borrowRes == S_OK)
+    {
+      if (!borrowed || size == 0 || token == 0)
+      {
+        if (token)
+          _sharedInput->ReleaseBorrowed(token);
+        _inputRes = E_FAIL;
+        return _inputRes;
+      }
+      _borrowToken = token;
+      _inBase = borrowed;
+      Base._buf = borrowed;
+      Base._lim = borrowed + size;
+      _inputFinished = false;
+      return S_OK;
+    }
+    if (borrowRes != S_FALSE)
+    {
+      _inputRes = borrowRes;
+      return _inputRes;
+    }
+  }
+#endif
+
   UInt32 size = 0;
   _inputRes = Base.InStream->Read(_inBuf, kInBufSize, &size);
   _inputFinished = (size == 0);
@@ -1221,6 +1276,7 @@ bool CDecoder::CreateInputBufer()
     _inBuf = (Byte *)MidAlloc(kInBufSize);
     if (!_inBuf)
       return false;
+    _inBase = _inBuf;
     Base._buf = _inBuf;
     Base._lim = _inBuf;
   }
@@ -1295,6 +1351,10 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   }
 
   Base.InStream = inStream;
+#if SUP7Z_USE_SHARED_INPUT
+  _sharedInput.Release();
+  inStream->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
+#endif
   
   // InitInputBuffer();
   
@@ -1352,6 +1412,10 @@ Z7_COM7F_IMF(CDecoder::ReadUnusedFromInBuf(void *data, UInt32 size, UInt32 *proc
   }
   if (processedSize)
     *processedSize = i;
+#if SUP7Z_USE_SHARED_INPUT
+  if (_borrowToken && Base._buf == Base._lim)
+    ReleaseBorrowed();
+#endif
   return S_OK;
 }
 
@@ -1523,6 +1587,10 @@ Z7_COM7F_IMF(CDecoder::SetNumberOfThreads(UInt32 numThreads))
 
 Z7_COM7F_IMF(CDecoder::SetInStream(ISequentialInStream *inStream))
 {
+#if SUP7Z_USE_SHARED_INPUT
+  ReleaseBorrowed();
+  _sharedInput.Release();
+#endif
   Base.InStreamRef = inStream;
   Base.InStream = inStream;
   return S_OK;
@@ -1531,6 +1599,10 @@ Z7_COM7F_IMF(CDecoder::SetInStream(ISequentialInStream *inStream))
 
 Z7_COM7F_IMF(CDecoder::ReleaseInStream())
 {
+#if SUP7Z_USE_SHARED_INPUT
+  ReleaseBorrowed();
+  _sharedInput.Release();
+#endif
   Base.InStreamRef.Release();
   Base.InStream = NULL;
   return S_OK;

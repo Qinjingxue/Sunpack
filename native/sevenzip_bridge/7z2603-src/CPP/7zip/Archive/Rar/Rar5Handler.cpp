@@ -18,6 +18,9 @@
 
 #include "../../Common/FilterCoder.h"
 #include "../../Common/LimitedStreams.h"
+#if SUP7Z_USE_SHARED_INPUT
+#include "../../Common/SunpackSharedInput.h"
+#endif
 #include "../../Common/MethodProps.h"
 #include "../../Common/ProgressUtils.h"
 #include "../../Common/RegisterArc.h"
@@ -2616,12 +2619,25 @@ Z7_COM7F_IMF(CHandler::Close())
 }
 
 
+#if SUP7Z_USE_SHARED_INPUT
+Z7_CLASS_IMP_COM_2(
+  CVolsInStream
+  , ISequentialInStream
+  , ISunpackSharedInput
+)
+#else
 Z7_CLASS_IMP_NOQIB_1(
   CVolsInStream
   , ISequentialInStream
 )
+#endif
   UInt64 _rem;
   ISequentialInStream *_stream;
+#if SUP7Z_USE_SHARED_INPUT
+  CMyComPtr<ISunpackSharedInput> _sharedInput;
+  CMyComPtr<ISunpackSharedInput> _borrowSource;
+  UInt64 _borrowToken = 0;
+#endif
   const CObjectVector<CArc> *_arcs;
   const CObjectVector<CItem> *_items;
   int _itemIndex;
@@ -2638,6 +2654,13 @@ public:
     _items = items;
     _itemIndex = (int)itemIndex;
     _stream = NULL;
+#if SUP7Z_USE_SHARED_INPUT
+    if (_borrowToken && _borrowSource)
+      _borrowSource->ReleaseBorrowed(_borrowToken);
+    _borrowToken = 0;
+    _borrowSource.Release();
+    _sharedInput.Release();
+#endif
     CrcIsOK = true;
   }
 };
@@ -2658,6 +2681,10 @@ Z7_COM7F_IMF(CVolsInStream::Read(void *data, UInt32 size, UInt32 *processedSize)
       IInStream *s = (*_arcs)[item.VolIndex].Stream;
       RINOK(InStream_SeekSet(s, item.GetDataPosition()))
       _stream = s;
+#if SUP7Z_USE_SHARED_INPUT
+      _sharedInput.Release();
+      s->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
+#endif
       if (CrcIsOK && item.IsSplitAfter())
         _hash.Init(item);
       else
@@ -2684,6 +2711,9 @@ Z7_COM7F_IMF(CVolsInStream::Read(void *data, UInt32 size, UInt32 *processedSize)
         if (!_hash.Check(item, NULL)) // RAR doesn't use MAC here
           CrcIsOK = false;
         _stream = NULL;
+#if SUP7Z_USE_SHARED_INPUT
+        _sharedInput.Release();
+#endif
       }
       if (res != S_OK)
         return res;
@@ -2696,6 +2726,88 @@ Z7_COM7F_IMF(CVolsInStream::Read(void *data, UInt32 size, UInt32 *processedSize)
   
   return S_OK;
 }
+
+#if SUP7Z_USE_SHARED_INPUT
+Z7_COM7F_IMF(CVolsInStream::Borrow(
+    UInt32 maxSize, const Byte **data, UInt32 *borrowedSize, UInt64 *token))
+{
+  if (!data || !borrowedSize || !token)
+    return E_INVALIDARG;
+  *data = NULL;
+  *borrowedSize = 0;
+  *token = 0;
+  if (maxSize == 0 || _borrowToken != 0)
+    return maxSize == 0 ? S_FALSE : E_FAIL;
+
+  if (!_stream)
+  {
+    if (_itemIndex < 0)
+      return S_FALSE;
+    const CItem &item = (*_items)[_itemIndex];
+    IInStream *s = (*_arcs)[item.VolIndex].Stream;
+    RINOK(InStream_SeekSet(s, item.GetDataPosition()))
+    _stream = s;
+    _sharedInput.Release();
+    s->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
+    if (CrcIsOK && item.IsSplitAfter())
+      _hash.Init(item);
+    else
+      _hash.Init_NoCalc();
+    _rem = item.PackSize;
+  }
+
+  if (!_sharedInput || _rem == 0)
+    return S_FALSE;
+
+  UInt32 request = maxSize;
+  if (request > _rem)
+    request = (UInt32)_rem;
+
+  const Byte *borrowed = NULL;
+  UInt32 size = 0;
+  UInt64 innerToken = 0;
+  const HRESULT res = _sharedInput->Borrow(request, &borrowed, &size, &innerToken);
+  if (res != S_OK)
+    return res;
+  if (!borrowed || size == 0 || size > request || innerToken == 0)
+  {
+    if (innerToken)
+      _sharedInput->ReleaseBorrowed(innerToken);
+    return E_FAIL;
+  }
+
+  _hash.Update(borrowed, size);
+  _rem -= size;
+
+  _borrowSource = _sharedInput;
+  _borrowToken = innerToken;
+
+  if (_rem == 0)
+  {
+    const CItem &item = (*_items)[_itemIndex];
+    _itemIndex = item.NextItem;
+    if (!_hash.Check(item, NULL))
+      CrcIsOK = false;
+    _stream = NULL;
+    _sharedInput.Release();
+  }
+
+  *data = borrowed;
+  *borrowedSize = size;
+  *token = innerToken;
+  return S_OK;
+}
+
+Z7_COM7F_IMF(CVolsInStream::ReleaseBorrowed(UInt64 token))
+{
+  if (!_borrowToken || token != _borrowToken || !_borrowSource)
+    return E_INVALIDARG;
+  const HRESULT res = _borrowSource->ReleaseBorrowed(token);
+  _borrowToken = 0;
+  _borrowSource.Release();
+  return res;
+}
+#endif
 
 
 static int FindLinkBuf(CObjectVector<CLinkFile> &linkFiles, unsigned index)

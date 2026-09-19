@@ -27,6 +27,51 @@ Z7_COM7F_IMF(CLimitedSequentialInStream::Read(void *data, UInt32 size, UInt32 *p
   return result;
 }
 
+#if SUP7Z_USE_SHARED_INPUT
+
+Z7_COM7F_IMF(CLimitedSequentialInStream::Borrow(
+    UInt32 maxSize, const Byte **data, UInt32 *borrowedSize, UInt64 *token))
+{
+  if (!data || !borrowedSize || !token)
+    return E_INVALIDARG;
+  *data = NULL;
+  *borrowedSize = 0;
+  *token = 0;
+  if (!_sharedInput || maxSize == 0)
+    return S_FALSE;
+
+  const UInt64 rem = _size - _pos;
+  if (rem == 0)
+    return S_FALSE;
+  if (maxSize > rem)
+    maxSize = (UInt32)rem;
+
+  UInt32 size = 0;
+  const HRESULT res = _sharedInput->Borrow(maxSize, data, &size, token);
+  if (res == S_OK)
+  {
+    if (size == 0 || size > maxSize)
+    {
+      if (*token)
+        _sharedInput->ReleaseBorrowed(*token);
+      *data = NULL;
+      *borrowedSize = 0;
+      *token = 0;
+      return E_FAIL;
+    }
+    _pos += size;
+    *borrowedSize = size;
+  }
+  return res;
+}
+
+Z7_COM7F_IMF(CLimitedSequentialInStream::ReleaseBorrowed(UInt64 token))
+{
+  return _sharedInput ? _sharedInput->ReleaseBorrowed(token) : S_FALSE;
+}
+
+#endif
+
 Z7_COM7F_IMF(CLimitedInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
 {
   if (processedSize)

@@ -5,6 +5,9 @@
 #define ZIP7_INC_LZMA2_DEC_MT_H
 
 #include "7zTypes.h"
+#if SUP7Z_USE_SHARED_INPUT
+#include "SunpackSharedInput.h"
+#endif
 
 EXTERN_C_BEGIN
 
@@ -53,6 +56,9 @@ SRes Lzma2DecMt_Decode(CLzma2DecMtHandle p,
     int finishMode,            // 0 - partial unpacking is allowed, 1 - if lzma2 stream must be finished
     // Byte *outBuf, size_t *outBufSize,
     ISeqInStreamPtr inStream,
+#if SUP7Z_USE_SHARED_INPUT
+    const CSunpackSharedInput *sharedInput,
+#endif
     // const Byte *inData, size_t inDataSize,
     
     // out variables:
@@ -69,7 +75,11 @@ SRes Lzma2DecMt_Init(CLzma2DecMtHandle pp,
     Byte prop,
     const CLzma2DecMtProps *props,
     const UInt64 *outDataSize, int finishMode,
-    ISeqInStreamPtr inStream);
+    ISeqInStreamPtr inStream
+#if SUP7Z_USE_SHARED_INPUT
+    , const CSunpackSharedInput *sharedInput
+#endif
+    );
 
 SRes Lzma2DecMt_Read(CLzma2DecMtHandle pp,
     Byte *data, size_t *outSize,

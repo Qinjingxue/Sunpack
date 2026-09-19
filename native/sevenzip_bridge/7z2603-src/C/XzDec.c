@@ -1478,6 +1478,10 @@ struct CXzDecMt
   size_t unpackBlockMaxSize;
   
   ISeqInStreamPtr inStream;
+#if SUP7Z_USE_SHARED_INPUT
+  const CSunpackSharedInput *sharedInput;
+  UInt64 sharedInputToken;
+#endif
   ISeqOutStreamPtr outStream;
   ICompressProgressPtr progress;
 
@@ -1548,6 +1552,10 @@ CXzDecMtHandle XzDecMt_Create(ISzAllocPtr alloc, ISzAllocPtr allocMid)
   p->outBufSize = 0;
   p->inBuf = NULL;
   p->inBufSize = 0;
+#if SUP7Z_USE_SHARED_INPUT
+  p->sharedInput = NULL;
+  p->sharedInputToken = 0;
+#endif
 
   XzUnpacker_Construct(&p->dec, &p->alignOffsetAlloc.vt);
 
@@ -1595,8 +1603,24 @@ static void XzDecMt_FreeOutBufs(CXzDecMt *p)
 
 
 
+#if SUP7Z_USE_SHARED_INPUT
+static void XzDecMt_ReleaseSharedInput(CXzDecMt *p)
+{
+  if (p->sharedInputToken)
+  {
+    if (p->sharedInput)
+      p->sharedInput->Release(p->sharedInput->ctx, p->sharedInputToken);
+    p->sharedInputToken = 0;
+  }
+}
+#endif
+
+
 static void XzDecMt_FreeSt(CXzDecMt *p)
 {
+#if SUP7Z_USE_SHARED_INPUT
+  XzDecMt_ReleaseSharedInput(p);
+#endif
   XzUnpacker_Free(&p->dec);
   
   if (p->outBuf)
@@ -2352,6 +2376,50 @@ void XzStatInfo_Clear(CXzStatInfo *p)
   also it can set stat->CombinedRes_Type to SZ_ERROR_WRITE or SZ_ERROR_PROGRESS.
 */
 
+#if SUP7Z_USE_SHARED_INPUT
+static SRes XzDecMt_ReadInput_ST(CXzDecMt *p, const Byte **data, size_t *size)
+{
+  XzDecMt_ReleaseSharedInput(p);
+
+  if (p->sharedInput)
+  {
+    const Byte *borrowedData = NULL;
+    size_t borrowedSize = *size;
+    UInt64 token = 0;
+    BoolInt borrowed = False;
+    const SRes res = p->sharedInput->Borrow(
+        p->sharedInput->ctx, *size, &borrowedData, &borrowedSize, &token, &borrowed);
+    if (res != SZ_OK)
+      return res;
+    if (borrowed)
+    {
+      if (!borrowedData || borrowedSize == 0 || borrowedSize > *size || token == 0)
+      {
+        if (token)
+          p->sharedInput->Release(p->sharedInput->ctx, token);
+        return SZ_ERROR_FAIL;
+      }
+      *data = borrowedData;
+      *size = borrowedSize;
+      p->sharedInputToken = token;
+      return SZ_OK;
+    }
+  }
+
+  *data = p->inBuf;
+  return ISeqInStream_Read(p->inStream, p->inBuf, size);
+}
+
+static SRes XzDecMt_Return_ST(CXzDecMt *p, SRes res)
+{
+  XzDecMt_ReleaseSharedInput(p);
+  return res;
+}
+#else
+#define XzDecMt_Return_ST(p, res) (res)
+#endif
+
+
 static SRes XzDecMt_Decode_ST(CXzDecMt *p
     #ifndef Z7_ST
     , BoolInt tMode
@@ -2379,7 +2447,7 @@ static SRes XzDecMt_Decode_ST(CXzDecMt *p
     p->outBufSize = 0;
     p->outBuf = (Byte *)ISzAlloc_Alloc(p->allocMid, p->props.outStep_ST);
     if (!p->outBuf)
-      return SZ_ERROR_MEM;
+      return XzDecMt_Return_ST(p, SZ_ERROR_MEM);
     p->outBufSize = p->props.outStep_ST;
   }
 
@@ -2389,7 +2457,7 @@ static SRes XzDecMt_Decode_ST(CXzDecMt *p
     p->inBufSize = 0;
     p->inBuf = (Byte *)ISzAlloc_Alloc(p->allocMid, p->props.inBufSize_ST);
     if (!p->inBuf)
-      return SZ_ERROR_MEM;
+      return XzDecMt_Return_ST(p, SZ_ERROR_MEM);
     p->inBufSize = p->props.inBufSize_ST;
   }
 
@@ -2438,8 +2506,12 @@ static SRes XzDecMt_Decode_ST(CXzDecMt *p
       {
         inPos = 0;
         inLim = p->inBufSize;
+#if SUP7Z_USE_SHARED_INPUT
+        p->readRes = XzDecMt_ReadInput_ST(p, &inData, &inLim);
+#else
         inData = p->inBuf;
         p->readRes = ISeqInStream_Read(p->inStream, (void *)p->inBuf, &inLim);
+#endif
         p->readProcessed += inLim;
         if (inLim == 0 || p->readRes != SZ_OK)
           p->readWasFinished = True;
@@ -2486,7 +2558,7 @@ static SRes XzDecMt_Decode_ST(CXzDecMt *p
         if (written != outPos)
         {
           stat->CombinedRes_Type = SZ_ERROR_WRITE;
-          return SZ_ERROR_WRITE;
+          return XzDecMt_Return_ST(p, SZ_ERROR_WRITE);
         }
         outPos = 0;
       }
@@ -2501,7 +2573,7 @@ static SRes XzDecMt_Decode_ST(CXzDecMt *p
         {
           stat->CombinedRes_Type = SZ_ERROR_PROGRESS;
           stat->ProgressRes = res;
-          return res;
+          return XzDecMt_Return_ST(p, res);
         }
         inPrev = p->inProcessed;
         outPrev = p->outProcessed;
@@ -2513,8 +2585,8 @@ static SRes XzDecMt_Decode_ST(CXzDecMt *p
       // p->codeRes is preliminary error from XzUnpacker_Code.
       // and it can be corrected later as final result
       // so we return SZ_OK here instead of (res);
-      return SZ_OK;
-      // return res;
+      return XzDecMt_Return_ST(p, SZ_OK);
+      // return XzDecMt_Return_ST(p, res);
     }
   }
 }
@@ -2605,6 +2677,9 @@ SRes XzDecMt_Decode(CXzDecMtHandle p,
     ISeqOutStreamPtr outStream,
     // Byte *outBuf, size_t *outBufSize,
     ISeqInStreamPtr inStream,
+#if SUP7Z_USE_SHARED_INPUT
+    const CSunpackSharedInput *sharedInput,
+#endif
     // const Byte *inData, size_t inDataSize,
     CXzStatInfo *stat,
     int *isMT,
@@ -2619,6 +2694,10 @@ SRes XzDecMt_Decode(CXzDecMtHandle p,
 
   p->props = *props;
 
+#if SUP7Z_USE_SHARED_INPUT
+  XzDecMt_ReleaseSharedInput(p);
+  p->sharedInput = sharedInput;
+#endif
   p->inStream = inStream;
   p->outStream = outStream;
   p->progress = progress;

@@ -642,6 +642,11 @@ std::string input_trace_json(const sunpack::sevenzip::ExtractInputTrace& trace) 
         ",\"prefetch_miss_count\":" + std::to_string(trace.prefetch_miss_count) +
         ",\"prefetch_invalidation_count\":" + std::to_string(trace.prefetch_invalidation_count) +
         ",\"prefetch_consumer_wait_ns\":" + std::to_string(trace.prefetch_consumer_wait_ns) +
+        ",\"input_borrow_count\":" + std::to_string(trace.input_borrow_count) +
+        ",\"input_borrow_bytes\":" + std::to_string(trace.input_borrow_bytes) +
+        ",\"prefetch_copy_bytes\":" + std::to_string(trace.prefetch_copy_bytes) +
+        ",\"input_pool_stall_count\":" + std::to_string(trace.input_pool_stall_count) +
+        ",\"input_pool_peak_leased\":" + std::to_string(trace.input_pool_peak_leased) +
         ",\"read_error\":" + std::string(trace.read_error ? "true" : "false") +
         ",\"last_hresult\":" + std::to_string(trace.last_hresult) +
         ",\"last_hresult_hex\":\"" + hresult_hex(trace.last_hresult) +

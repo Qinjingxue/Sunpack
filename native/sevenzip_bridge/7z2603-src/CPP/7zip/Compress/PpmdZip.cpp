@@ -43,7 +43,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   if (!_inStream.Alloc(1 << 20))
     return E_OUTOFMEMORY;
 
-  _inStream.Stream = inStream;
+  _inStream.SetStream(inStream);
   _inStream.Init();
 
   {

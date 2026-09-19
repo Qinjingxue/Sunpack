@@ -595,7 +595,7 @@ function Build-SevenZipWrapper {
     Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON")
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON", "-DSUP7Z_USE_SHARED_INPUT=ON")
     Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release")
     if ((Get-ProcessBuildArch) -eq $BuildArch) {
         Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")

@@ -140,7 +140,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
       return E_OUTOFMEMORY;
   }
   
-  _inStream.Stream = inStream;
+  _inStream.SetStream(inStream);
   SetOutStreamSize(outSize);
 
   do
@@ -195,7 +195,7 @@ Z7_COM7F_IMF(CDecoder::GetInStreamProcessedSize(UInt64 *value))
 Z7_COM7F_IMF(CDecoder::SetInStream(ISequentialInStream *inStream))
 {
   InSeqStream = inStream;
-  _inStream.Stream = inStream;
+  _inStream.SetStream(inStream);
   return S_OK;
 }
 
