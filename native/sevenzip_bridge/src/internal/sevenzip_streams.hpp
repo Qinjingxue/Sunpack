@@ -1184,6 +1184,9 @@ namespace sunpack::sevenzip
                     }
                     return hr;
                 }
+#if SUP7Z_USE_SHARED_INPUT
+                fallback_handle_needs_seek_ = false;
+#endif
                 record_logical_read(trace_, read_start, size);
                 prefetch_->after_cached_read(position_);
                 if (trace_)
@@ -1206,6 +1209,26 @@ namespace sunpack::sevenzip
 
             BOOL ok = FALSE;
             DWORD error = ERROR_SUCCESS;
+#if SUP7Z_USE_SHARED_INPUT
+            if (fallback_handle_needs_seek_)
+            {
+                LARGE_INTEGER target{};
+                target.QuadPart = static_cast<LONGLONG>(position_);
+                if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))
+                {
+                    error = GetLastError();
+                    const HRESULT hr = HRESULT_FROM_WIN32(error);
+                    if (trace_)
+                    {
+                        trace_->read_error = true;
+                        trace_->last_hresult = hr;
+                        trace_->last_win32_error = static_cast<int>(error);
+                    }
+                    return hr;
+                }
+                fallback_handle_needs_seek_ = false;
+            }
+#endif
             {
                 ReadFileWallTimer timer(trace_);
                 ok = ReadFile(handle_, data, size, &read, nullptr);
@@ -1292,23 +1315,12 @@ namespace sunpack::sevenzip
                 return S_FALSE;
             }
 
-            LARGE_INTEGER cached_position{};
-            cached_position.QuadPart = static_cast<LONGLONG>(position_ + span.size);
-            if (!SetFilePointerEx(handle_, cached_position, nullptr, FILE_BEGIN))
-            {
-                const DWORD error = GetLastError();
-                prefetch_->release_borrowed(span.token);
-                const HRESULT hr = HRESULT_FROM_WIN32(error);
-                if (trace_)
-                {
-                    trace_->read_error = true;
-                    trace_->last_hresult = hr;
-                    trace_->last_win32_error = static_cast<int>(error);
-                }
-                return hr;
-            }
-
             position_ += span.size;
+            // Do not synchronize the fallback file handle on every borrowed
+            // span. The hot zero-copy path never reads from that handle, so a
+            // SetFilePointerEx here would add one syscall per 256-512 KiB.
+            // Seek lazily only if a later prefetch miss needs synchronous I/O.
+            fallback_handle_needs_seek_ = true;
             record_logical_read(trace_, read_start, span.size);
             if (trace_)
             {
@@ -1373,6 +1385,9 @@ namespace sunpack::sevenzip
 
             const UInt64 prior_position = position_;
             position_ = static_cast<UInt64>(new_pos.QuadPart);
+#if SUP7Z_USE_SHARED_INPUT
+            fallback_handle_needs_seek_ = false;
+#endif
 
             record_logical_seek(trace_, prior_position, position_);
 
@@ -1419,6 +1434,10 @@ namespace sunpack::sevenzip
         UInt64 position_ = 0;
 
         UInt64 size_ = 0;
+
+#if SUP7Z_USE_SHARED_INPUT
+        bool fallback_handle_needs_seek_ = false;
+#endif
 
         // Declared before the prefetcher so it outlives the prefetch thread.
         std::unique_ptr<PathHandle> prefetch_reader_;
