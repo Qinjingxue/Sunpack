@@ -467,6 +467,10 @@ namespace sunpack::sevenzip
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
+            // Open is complete. If legacy prefetch is part of this build/config, enable it
+            // only for extraction; planned I/O will supersede it after a plan is installed.
+            ::NSunpackReadPlan::SetLegacyPrefetchActive(stream.Interface(), true);
+
 #ifdef SUP7Z_USE_PLANNED_IO
             // Sequential/container formats can use the entire logical input as an exact coverage plan.
             // 7z and RAR replace this conservative plan with packed extents inside their handlers.
