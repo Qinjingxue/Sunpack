@@ -175,6 +175,7 @@ namespace sunpack::sevenzip
                 CloseHandle(handle_);
                 handle_ = INVALID_HANDLE_VALUE;
             }
+            position_valid_ = false;
         }
 
     private:
