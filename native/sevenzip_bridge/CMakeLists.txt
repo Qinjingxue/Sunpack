@@ -45,9 +45,15 @@ option(SUP7Z_USE_ARM64_ASM
 option(SUP7Z_USE_PLANNED_IO
     "Use SunPack planned archive input I/O instead of decoder-driven sequential prefetch during extraction"
     ON)
+option(SUP7Z_USE_OPEN_PREFETCH
+    "Use legacy sequential prefetch while 7-Zip opens/parses archive metadata"
+    ON)
 
 if(SUP7Z_USE_PLANNED_IO)
     add_compile_definitions(SUP7Z_USE_PLANNED_IO=1)
+endif()
+if(SUP7Z_USE_OPEN_PREFETCH)
+    add_compile_definitions(SUP7Z_USE_OPEN_PREFETCH=1)
 endif()
 
 set(SUP7Z_TARGET_UARCH "unknown")
