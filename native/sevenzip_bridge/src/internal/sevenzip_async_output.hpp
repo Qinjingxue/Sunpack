@@ -4,6 +4,9 @@
 #include "sevenzip_space_retry.hpp"
 #include "sevenzip_volume_state.hpp"
 #include "sevenzip_writer_meters.hpp"
+#if SUP7Z_USE_SHARED_OUTPUT
+#include "7zip/Common/SunpackSharedOutput.h"
+#endif
 
 #ifdef _WIN32
 
@@ -168,6 +171,9 @@ namespace sunpack::sevenzip
             std::atomic<UInt64> next_write_offset{0};
             std::mutex producer_mutex;
             Buffer *staging_buffer = nullptr;
+#if SUP7Z_USE_SHARED_OUTPUT
+            Buffer *producer_buffer = nullptr;
+#endif
             std::size_t inflight_bytes = 0;
             std::size_t outstanding_data = 0;
             std::size_t active_data_writes = 0;
@@ -189,6 +195,16 @@ namespace sunpack::sevenzip
             bool inflight_released = false;
             HANDLE handle = INVALID_HANDLE_VALUE;
             bool open_attempted = false;
+        };
+
+        enum class BufferState : unsigned char
+        {
+            Free,
+            Staging,
+            ProducerLeased,
+            Queued,
+            Writing,
+            BorrowedComplete
         };
 
         struct Buffer
@@ -214,6 +230,14 @@ namespace sunpack::sevenzip
             HANDLE completion_event = nullptr;
             FileStatePtr file;
             UInt32 size = 0;
+#if SUP7Z_USE_SHARED_OUTPUT
+            AsyncFileWriter *owner = nullptr;
+            const unsigned char *borrowed_data = nullptr;
+            UInt32 reserved_size = 0;
+            BufferState state = BufferState::Free;
+            bool borrowed = false;
+            CSunpackSharedOutputLeaseToken lease_token{};
+#endif
         };
 
         static constexpr std::size_t kBufferSize = 1U << 20;
@@ -370,6 +394,12 @@ namespace sunpack::sevenzip
                             }
                             buffer->file = file;
                             buffer->size = 0;
+#if SUP7Z_USE_SHARED_OUTPUT
+                            buffer->borrowed_data = nullptr;
+                            buffer->reserved_size = 0;
+                            buffer->borrowed = false;
+                            buffer->state = BufferState::Staging;
+#endif
                             file->staging_buffer = buffer;
                             newly_acquired_staging = true;
                         }
@@ -403,6 +433,9 @@ namespace sunpack::sevenzip
                             {
                                 file->staging_buffer = nullptr;
                                 buffer->file.reset();
+#if SUP7Z_USE_SHARED_OUTPUT
+                                buffer->state = BufferState::Free;
+#endif
                                 free_buffers_.push_back(buffer);
                             }
                             continue;
@@ -442,6 +475,12 @@ namespace sunpack::sevenzip
                             file->staging_buffer = nullptr;
                             buffer->file.reset();
                             buffer->size = 0;
+#if SUP7Z_USE_SHARED_OUTPUT
+                            buffer->borrowed_data = nullptr;
+                            buffer->reserved_size = 0;
+                            buffer->borrowed = false;
+                            buffer->state = BufferState::Free;
+#endif
                             free_buffers_.push_back(buffer);
                         }
                         if (processed_size)
@@ -496,6 +535,367 @@ namespace sunpack::sevenzip
             }
             return S_OK;
         }
+
+#if SUP7Z_USE_SHARED_OUTPUT
+        HRESULT acquire_output(
+            const FileStatePtr &file,
+            UInt32 desired_size,
+            unsigned char **data,
+            UInt32 *capacity,
+            UInt64 *token)
+        {
+            if (data) *data = nullptr;
+            if (capacity) *capacity = 0;
+            if (token) *token = 0;
+            if (!file || !data || !capacity || !token || desired_size == 0)
+            {
+                return E_INVALIDARG;
+            }
+
+            const auto job = file->job;
+            if (!job)
+            {
+                return E_FAIL;
+            }
+            const std::size_t target_size = (std::min)({
+                static_cast<std::size_t>(desired_size),
+                kBufferSize,
+                job->max_inflight_bytes,
+                kDefaultFileInFlightBytes
+            });
+            if (target_size == 0)
+                return E_INVALIDARG;
+
+            std::unique_lock<std::mutex> producer_lock(file->producer_mutex);
+            for (;;)
+            {
+                bool queued_staging = false;
+                HRESULT result = S_OK;
+                Buffer *buffer = nullptr;
+                UInt32 reserve = 0;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    producer_cv_.wait(lock, [this, &job, &file, target_size]
+                    {
+                        if (terminal_result_locked(job) != S_OK || file->close_requested)
+                            return true;
+                        if (file->producer_buffer)
+                            return false;
+                        if (file->staging_buffer && file->staging_buffer->size != 0)
+                            return queued_jobs_ < queue_limit_;
+                        if (queued_jobs_ + producer_leases_ >= queue_limit_ || free_buffers_.empty())
+                            return false;
+                        const std::size_t job_available = job->max_inflight_bytes -
+                            (std::min)(job->inflight_bytes, job->max_inflight_bytes);
+                        const std::size_t file_available = kDefaultFileInFlightBytes -
+                            (std::min)(file->inflight_bytes, kDefaultFileInFlightBytes);
+                        return job_available >= target_size && file_available >= target_size;
+                    });
+
+                    result = terminal_result_locked(job);
+                    if (result != S_OK || file->close_requested)
+                        return result == S_OK ? E_ABORT : result;
+
+                    if (file->staging_buffer && file->staging_buffer->size != 0)
+                    {
+                        queued_staging = enqueue_staging_locked(file, false);
+                        if (!queued_staging)
+                            continue;
+                    }
+                    else
+                    {
+                        reserve = static_cast<UInt32>(target_size);
+
+                        buffer = free_buffers_.back();
+                        free_buffers_.pop_back();
+                        try
+                        {
+                            if (!buffer->data)
+                                buffer->data = std::make_unique<unsigned char[]>(kBufferSize);
+                        }
+                        catch (...)
+                        {
+                            free_buffers_.push_back(buffer);
+                            mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                            set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                            producer_cv_.notify_all();
+                            return E_OUTOFMEMORY;
+                        }
+
+                        buffer->file = file;
+                        buffer->size = 0;
+                        buffer->reserved_size = reserve;
+                        buffer->borrowed_data = nullptr;
+                        buffer->borrowed = false;
+                        buffer->state = BufferState::ProducerLeased;
+                        file->producer_buffer = buffer;
+                        job->inflight_bytes += reserve;
+                        file->inflight_bytes += reserve;
+                        ++producer_leases_;
+
+                        *data = buffer->data.get();
+                        *capacity = reserve;
+                        *token = SunpackSharedOutput_MakeToken(&buffer->lease_token);
+                    }
+                }
+
+                if (queued_staging)
+                {
+                    work_cv_.notify_one();
+                    continue;
+                }
+                return S_OK;
+            }
+        }
+
+        HRESULT commit_output(
+            const FileStatePtr &file,
+            UInt64 token,
+            UInt32 size,
+            UInt32 *processed_size)
+        {
+            if (processed_size) *processed_size = 0;
+            if (!file || token == 0)
+                return E_INVALIDARG;
+
+            auto *lease = reinterpret_cast<CSunpackSharedOutputLeaseToken *>(
+                static_cast<std::size_t>(token));
+            auto *buffer = lease ? static_cast<Buffer *>(lease->context) : nullptr;
+            if (!buffer || buffer->owner != this)
+                return E_INVALIDARG;
+
+            const auto job = file->job;
+            std::unique_lock<std::mutex> producer_lock(file->producer_mutex);
+            bool queued = false;
+            HRESULT result = S_OK;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (file->producer_buffer != buffer ||
+                    buffer->state != BufferState::ProducerLeased ||
+                    buffer->file.get() != file.get() ||
+                    size > buffer->reserved_size)
+                {
+                    return E_INVALIDARG;
+                }
+
+                const UInt32 reserved = buffer->reserved_size;
+                const UInt32 unused = reserved - size;
+                if (unused != 0)
+                {
+                    file->inflight_bytes -= unused;
+                    if (job)
+                        job->inflight_bytes -= unused;
+                }
+                buffer->reserved_size = 0;
+                file->producer_buffer = nullptr;
+                if (producer_leases_ != 0)
+                    --producer_leases_;
+
+                result = terminal_result_locked(job);
+                if (result != S_OK || file->close_requested || size == 0)
+                {
+                    file->inflight_bytes -= size;
+                    if (job)
+                        job->inflight_bytes -= size;
+                    buffer->file.reset();
+                    buffer->size = 0;
+                    buffer->state = BufferState::Free;
+                    free_buffers_.push_back(buffer);
+                    producer_cv_.notify_all();
+                    return result == S_OK ? (size == 0 ? S_OK : E_ABORT) : result;
+                }
+
+                const UInt64 output_offset = file->next_write_offset.load(std::memory_order_relaxed);
+                if (output_offset > (std::numeric_limits<UInt64>::max)() - size)
+                {
+                    file->inflight_bytes -= size;
+                    if (job)
+                        job->inflight_bytes -= size;
+                    buffer->file.reset();
+                    buffer->size = 0;
+                    buffer->state = BufferState::Free;
+                    free_buffers_.push_back(buffer);
+                    mark_file_failure_locked(file, E_FAIL, ERROR_ARITHMETIC_OVERFLOW);
+                    set_job_error_locked(job, E_FAIL, ERROR_ARITHMETIC_OVERFLOW);
+                    producer_cv_.notify_all();
+                    return E_FAIL;
+                }
+
+                buffer->size = size;
+                buffer->state = BufferState::Queued;
+                try
+                {
+                    work_queue_.emplace_back(WorkItem::data(buffer, output_offset));
+                }
+                catch (...)
+                {
+                    file->inflight_bytes -= size;
+                    if (job)
+                        job->inflight_bytes -= size;
+                    buffer->file.reset();
+                    buffer->size = 0;
+                    buffer->state = BufferState::Free;
+                    free_buffers_.push_back(buffer);
+                    mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                    set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                    producer_cv_.notify_all();
+                    return E_OUTOFMEMORY;
+                }
+
+                ++job->pending_jobs;
+                ++file->outstanding_data;
+                file->next_write_offset.store(output_offset + size, std::memory_order_relaxed);
+                file->accepted_bytes.fetch_add(size, std::memory_order_relaxed);
+                account_accepted(size);
+                ++queued_jobs_;
+                queued = true;
+            }
+
+            if (processed_size) *processed_size = size;
+            if (queued) work_cv_.notify_one();
+            producer_cv_.notify_all();
+            return S_OK;
+        }
+
+        HRESULT submit_borrowed(
+            const FileStatePtr &file,
+            const unsigned char *data,
+            UInt32 size,
+            UInt32 *processed_size,
+            UInt64 *token)
+        {
+            if (processed_size) *processed_size = 0;
+            if (token) *token = 0;
+            if (!file || !data || size == 0 || !processed_size || !token)
+                return E_INVALIDARG;
+
+            const auto job = file->job;
+            if (!job)
+                return E_FAIL;
+            const std::size_t target_size = (std::min)({
+                static_cast<std::size_t>(size),
+                kBufferSize,
+                job->max_inflight_bytes,
+                kDefaultFileInFlightBytes
+            });
+            if (target_size == 0)
+                return E_INVALIDARG;
+
+            std::unique_lock<std::mutex> producer_lock(file->producer_mutex);
+            for (;;)
+            {
+                bool queued_staging = false;
+                Buffer *buffer = nullptr;
+                UInt32 chunk = 0;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    producer_cv_.wait(lock, [this, &job, &file, target_size]
+                    {
+                        if (terminal_result_locked(job) != S_OK || file->close_requested)
+                            return true;
+                        if (file->producer_buffer)
+                            return false;
+                        if (file->staging_buffer && file->staging_buffer->size != 0)
+                            return queued_jobs_ < queue_limit_;
+                        // A completed borrowed buffer is intentionally pinned until
+                        // its token is retired. Never sleep here when those pinned
+                        // tokens can be the reason the pool is empty: let the
+                        // decoder retire one and retry instead.
+                        if (free_buffers_.empty() && borrowed_leases_ != 0)
+                            return true;
+                        if (queued_jobs_ >= queue_limit_ || free_buffers_.empty())
+                            return false;
+                        const std::size_t job_available = job->max_inflight_bytes -
+                            (std::min)(job->inflight_bytes, job->max_inflight_bytes);
+                        const std::size_t file_available = kDefaultFileInFlightBytes -
+                            (std::min)(file->inflight_bytes, kDefaultFileInFlightBytes);
+                        return job_available >= target_size && file_available >= target_size;
+                    });
+
+                    const HRESULT result = terminal_result_locked(job);
+                    if (result != S_OK || file->close_requested)
+                        return result == S_OK ? E_ABORT : result;
+
+                    if (file->staging_buffer && file->staging_buffer->size != 0)
+                    {
+                        queued_staging = enqueue_staging_locked(file, false);
+                        if (!queued_staging)
+                            continue;
+                    }
+                    else
+                    {
+                        if (free_buffers_.empty() && borrowed_leases_ != 0)
+                            return S_FALSE;
+
+                        chunk = static_cast<UInt32>(target_size);
+
+                        buffer = free_buffers_.back();
+                        free_buffers_.pop_back();
+                        buffer->file = file;
+                        buffer->size = chunk;
+                        buffer->reserved_size = 0;
+                        buffer->borrowed_data = data;
+                        buffer->borrowed = true;
+                        buffer->state = BufferState::Queued;
+
+                        const UInt64 output_offset = file->next_write_offset.load(std::memory_order_relaxed);
+                        if (output_offset > (std::numeric_limits<UInt64>::max)() - chunk)
+                        {
+                            buffer->file.reset();
+                            buffer->size = 0;
+                            buffer->borrowed_data = nullptr;
+                            buffer->borrowed = false;
+                            buffer->state = BufferState::Free;
+                            free_buffers_.push_back(buffer);
+                            mark_file_failure_locked(file, E_FAIL, ERROR_ARITHMETIC_OVERFLOW);
+                            set_job_error_locked(job, E_FAIL, ERROR_ARITHMETIC_OVERFLOW);
+                            producer_cv_.notify_all();
+                            return E_FAIL;
+                        }
+
+                        try
+                        {
+                            work_queue_.emplace_back(WorkItem::data(buffer, output_offset));
+                        }
+                        catch (...)
+                        {
+                            buffer->file.reset();
+                            buffer->size = 0;
+                            buffer->borrowed_data = nullptr;
+                            buffer->borrowed = false;
+                            buffer->state = BufferState::Free;
+                            free_buffers_.push_back(buffer);
+                            mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                            set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                            producer_cv_.notify_all();
+                            return E_OUTOFMEMORY;
+                        }
+
+                        job->inflight_bytes += chunk;
+                        file->inflight_bytes += chunk;
+                        ++job->pending_jobs;
+                        ++file->outstanding_data;
+                        file->next_write_offset.store(output_offset + chunk, std::memory_order_relaxed);
+                        file->accepted_bytes.fetch_add(chunk, std::memory_order_relaxed);
+                        account_accepted(chunk);
+                        ++queued_jobs_;
+                        ++borrowed_leases_;
+
+                        *processed_size = chunk;
+                        *token = SunpackSharedOutput_MakeToken(&buffer->lease_token);
+                    }
+                }
+
+                if (queued_staging)
+                {
+                    work_cv_.notify_one();
+                    continue;
+                }
+                work_cv_.notify_one();
+                return S_OK;
+            }
+        }
+#endif
 
         void close_file(
             const FileStatePtr &file,
@@ -674,7 +1074,11 @@ namespace sunpack::sevenzip
         bool is_quiescent() const noexcept
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (queued_jobs_ != 0 || inflight_file_count_ != 0)
+            if (queued_jobs_ != 0 || inflight_file_count_ != 0
+#if SUP7Z_USE_SHARED_OUTPUT
+                || borrowed_leases_ != 0
+#endif
+                )
             {
                 return false;
             }
@@ -791,6 +1195,11 @@ namespace sunpack::sevenzip
             for (std::size_t index = 0; index < buffer_count_; ++index)
             {
                 auto buffer = std::make_unique<Buffer>();
+#if SUP7Z_USE_SHARED_OUTPUT
+                buffer->owner = this;
+                buffer->lease_token.context = buffer.get();
+                buffer->lease_token.waitAndRelease = &AsyncFileWriter::wait_borrowed_thunk;
+#endif
                 free_buffers_.push_back(buffer.get());
                 buffers_.push_back(std::move(buffer));
             }
@@ -945,6 +1354,9 @@ namespace sunpack::sevenzip
         bool can_accept_locked(const JobStatePtr &job, const FileStatePtr &file) const noexcept
         {
             if (!job || !file || file->close_requested ||
+#if SUP7Z_USE_SHARED_OUTPUT
+                file->producer_buffer ||
+#endif
                 job->inflight_bytes >= job->max_inflight_bytes ||
                 file->inflight_bytes >= kDefaultFileInFlightBytes)
             {
@@ -1071,6 +1483,12 @@ namespace sunpack::sevenzip
             }
             buffer->file.reset();
             buffer->size = 0;
+#if SUP7Z_USE_SHARED_OUTPUT
+            buffer->borrowed_data = nullptr;
+            buffer->reserved_size = 0;
+            buffer->borrowed = false;
+            buffer->state = BufferState::Free;
+#endif
             free_buffers_.push_back(buffer);
         }
 
@@ -1108,6 +1526,9 @@ namespace sunpack::sevenzip
                 return false;
             }
             file->staging_buffer = nullptr;
+#if SUP7Z_USE_SHARED_OUTPUT
+            buffer->state = BufferState::Queued;
+#endif
             file->next_write_offset.store(
                 output_offset + buffer->size, std::memory_order_relaxed);
             ++queued_jobs_;
@@ -1161,6 +1582,10 @@ namespace sunpack::sevenzip
                     item = std::move(work_queue_.front());
                     work_queue_.pop_front();
                     --queued_jobs_;
+#if SUP7Z_USE_SHARED_OUTPUT
+                    if (item.kind == WorkItem::Kind::Data && item.buffer)
+                        item.buffer->state = BufferState::Writing;
+#endif
                 }
                 producer_cv_.notify_all();
 
@@ -1382,7 +1807,16 @@ namespace sunpack::sevenzip
         {
             // 绝不在这里重置 transferred：清零会把已落盘前缀从原始 offset 再写一遍，
             // add_written_bytes 二次记账 -> accepted = written + discarded + pending 被破坏。
-            if (!file || !buffer || !buffer->data)
+            if (!file || !buffer)
+            {
+                return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
+            }
+#if SUP7Z_USE_SHARED_OUTPUT
+            const unsigned char *source = buffer->borrowed ? buffer->borrowed_data : buffer->data.get();
+#else
+            const unsigned char *source = buffer->data.get();
+#endif
+            if (!source)
             {
                 return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
             }
@@ -1440,7 +1874,7 @@ namespace sunpack::sevenzip
                 }
                 const BOOL started = WriteFile(
                     file->handle,
-                    buffer->data.get() + transferred,
+                    source + transferred,
                     effective_size,
                     nullptr,
                     &overlapped);
@@ -1641,9 +2075,25 @@ namespace sunpack::sevenzip
                         --job->pending_jobs;
                     }
                 }
+#if SUP7Z_USE_SHARED_OUTPUT
+                if (buffer->borrowed)
+                {
+                    buffer->state = BufferState::BorrowedComplete;
+                }
+                else
+                {
+                    buffer->file.reset();
+                    buffer->size = 0;
+                    buffer->borrowed_data = nullptr;
+                    buffer->reserved_size = 0;
+                    buffer->state = BufferState::Free;
+                    free_buffers_.push_back(buffer);
+                }
+#else
                 buffer->file.reset();
                 buffer->size = 0;
                 free_buffers_.push_back(buffer);
+#endif
                 if (file && file->close_requested && file->outstanding_data == 0)
                 {
                     queued_close = enqueue_close_locked(file, &direct_close);
@@ -1659,6 +2109,53 @@ namespace sunpack::sevenzip
             }
             producer_cv_.notify_all();
         }
+
+#if SUP7Z_USE_SHARED_OUTPUT
+        static HRESULT wait_borrowed_thunk(void *context) noexcept
+        {
+            auto *buffer = static_cast<Buffer *>(context);
+            if (!buffer || !buffer->owner)
+                return E_INVALIDARG;
+            return buffer->owner->wait_borrowed(buffer);
+        }
+
+        HRESULT wait_borrowed(Buffer *buffer) noexcept
+        {
+            if (!buffer || buffer->owner != this)
+                return E_INVALIDARG;
+
+            HRESULT result = S_OK;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                // A borrowed source cannot be reused until the writer has
+                // actually retired the I/O. Even shutdown/cancellation must wait
+                // for BorrowedComplete; writer_loop drains queued work before exit.
+                producer_cv_.wait(lock, [buffer]
+                {
+                    return buffer->state == BufferState::BorrowedComplete;
+                });
+
+                const auto file = buffer->file;
+                const auto job = file ? file->job : nullptr;
+                if (file && file->failed)
+                    result = file->hresult;
+                else if (job)
+                    result = terminal_result_locked(job);
+
+                buffer->file.reset();
+                buffer->size = 0;
+                buffer->borrowed_data = nullptr;
+                buffer->reserved_size = 0;
+                buffer->borrowed = false;
+                buffer->state = BufferState::Free;
+                if (borrowed_leases_ != 0)
+                    --borrowed_leases_;
+                free_buffers_.push_back(buffer);
+            }
+            producer_cv_.notify_all();
+            return result;
+        }
+#endif
 
         // gate == nullptr（功能关闭 / 无卷身份）时的永久失败收尾，只适用于 Data 路径：
         // account_discarded(remaining) + file 终局失败 + job 终局失败 + 唤醒 producer。
@@ -1733,6 +2230,10 @@ namespace sunpack::sevenzip
         const std::size_t queue_limit_;
         std::size_t inflight_file_count_ = 0;
         std::size_t queued_jobs_ = 0;
+#if SUP7Z_USE_SHARED_OUTPUT
+        std::size_t producer_leases_ = 0;
+        std::size_t borrowed_leases_ = 0;
+#endif
         // 必须是 atomic：gate 的 terminal predicate 会无锁读它。
         std::atomic<bool> stopping_{false};
 

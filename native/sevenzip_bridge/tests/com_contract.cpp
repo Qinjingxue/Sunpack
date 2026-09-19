@@ -115,6 +115,24 @@ void check_open_callback()
     check(rejects(as_unknown(probe), IID_IProgress), "QI(foreign IID) == E_NOINTERFACE");
 }
 
+void check_async_output_stream()
+{
+    std::printf("AsyncFileOutStream\n");
+    auto *raw = new AsyncFileOutStream(nullptr, nullptr, false);
+    CMyComPtr<ISequentialOutStream> stream(raw);
+    IUnknown *unknown = static_cast<IUnknown *>(static_cast<ISequentialOutStream *>(raw));
+
+    check(queries_as(unknown, IID_IUnknown), "AsyncFileOutStream QI(IUnknown) == S_OK");
+    check(queries_as(unknown, IID_ISequentialOutStream),
+          "AsyncFileOutStream QI(ISequentialOutStream) == S_OK");
+#if SUP7Z_USE_SHARED_OUTPUT
+    check(queries_as(unknown, IID_ISunpackSharedOutput),
+          "AsyncFileOutStream QI(ISunpackSharedOutput) == S_OK");
+#endif
+    check(rejects(unknown, IID_IInStream),
+          "AsyncFileOutStream QI(foreign IID) == E_NOINTERFACE");
+}
+
 void check_open_archive_stream_ownership()
 {
     std::printf("open_archive_stream ownership\n");
@@ -161,6 +179,7 @@ int main()
     check_extract_to_disk_callback();
     check_open_callback();
     check_streams();
+    check_async_output_stream();
     check_open_archive_stream_ownership();
 
     if (g_failures != 0)

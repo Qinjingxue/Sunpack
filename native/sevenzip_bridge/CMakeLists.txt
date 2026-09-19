@@ -47,6 +47,19 @@ option(SUP7Z_USE_ARM64_ASM
 # whole-build switch back to the pre-optimization memcpy baseline.
 add_compile_definitions(SUP7Z_USE_SHARED_INPUT=1)
 
+# Shared output deliberately keeps the legacy memcpy path available for clean
+# A/B builds. Use a separate build directory when comparing the two variants.
+option(SUP7Z_USE_SHARED_OUTPUT
+    "Let compatible 7-Zip decoders share output buffers with the async writer"
+    ON)
+if(SUP7Z_USE_SHARED_OUTPUT)
+    add_compile_definitions(SUP7Z_USE_SHARED_OUTPUT=1)
+    message(STATUS "7-Zip shared output: enabled")
+else()
+    add_compile_definitions(SUP7Z_USE_SHARED_OUTPUT=0)
+    message(STATUS "7-Zip shared output: disabled (legacy memcpy baseline)")
+endif()
+
 set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)
     if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)

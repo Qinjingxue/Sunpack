@@ -8,6 +8,9 @@
 #if SUP7Z_USE_SHARED_INPUT
 #include "SunpackSharedInput.h"
 #endif
+#if SUP7Z_USE_SHARED_OUTPUT
+#include "SunpackSharedOutput.h"
+#endif
 
 EXTERN_C_BEGIN
 
@@ -52,6 +55,9 @@ SRes Lzma2DecMt_Decode(CLzma2DecMtHandle p,
     Byte prop,
     const CLzma2DecMtProps *props,
     ISeqOutStreamPtr outStream,
+#if SUP7Z_USE_SHARED_OUTPUT
+    const CSunpackSharedOutput *sharedOutput,
+#endif
     const UInt64 *outDataSize, // NULL means undefined
     int finishMode,            // 0 - partial unpacking is allowed, 1 - if lzma2 stream must be finished
     // Byte *outBuf, size_t *outBufSize,

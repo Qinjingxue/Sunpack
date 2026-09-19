@@ -4,6 +4,9 @@
 #define ZIP7_INC_COMPRESS_BZIP2_DECODER_H
 
 #include "../../Common/MyCom.h"
+#if SUP7Z_USE_SHARED_OUTPUT
+#include "../Common/SunpackSharedOutput.h"
+#endif
 
 // #define Z7_NO_READ_FROM_CODER
 // #define Z7_ST
@@ -242,6 +245,12 @@ public:
 
 private:
   Byte *_outBuf;
+  Byte *_outBufOwned;
+  size_t _outCapacity;
+#if SUP7Z_USE_SHARED_OUTPUT
+  CMyComPtr<ISunpackSharedOutput> _sharedOutput;
+  UInt64 _outLeaseToken;
+#endif
   size_t _outPos;
   UInt64 _outWritten;
   ISequentialOutStream *_outStream;
@@ -374,6 +383,7 @@ public:
   HRESULT ReadBlockSignature();
   HRESULT ReadBlock();
 
+  HRESULT AcquireOutputBuffer();
   HRESULT Flush();
   HRESULT DecodeBlock(const CBlockProps &props);
   HRESULT DecodeStreams(ICompressProgressInfo *progress);

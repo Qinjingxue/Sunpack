@@ -103,6 +103,13 @@ typedef struct CZstdDecState
   // size_t cycSize;      // out : if (!outBuf_fromCaller)
   size_t needWrite_Size;  // out
 
+#if SUP7Z_USE_SHARED_OUTPUT
+  // Embedded SunPack hook: called immediately before the decoder reuses or
+  // relocates its output window. NULL in normal upstream-style operation.
+  void *sunpackOutputCtx;
+  SRes (*sunpackBeforeWindowReuse)(void *ctx);
+#endif
+
   Byte *outBuf_fromCaller;
   size_t outBufSize_fromCaller;
   /* (outBufSize_fromCaller >= full_uncompressed_size_of_all_frames) is required
