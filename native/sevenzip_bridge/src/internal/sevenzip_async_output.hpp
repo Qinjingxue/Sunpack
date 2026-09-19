@@ -823,7 +823,7 @@ namespace sunpack::sevenzip
                         // tiny pool is exhausted, return control so it can retire
                         // its oldest token; writer buffers themselves are recycled
                         // immediately on I/O completion.
-                        if (free_borrowed_leases_.empty() && borrowed_leases_ != 0)
+                        if (free_borrowed_leases_.empty() && borrowed_lease_count_ != 0)
                             return true;
                         if (queued_jobs_ >= queue_limit_ ||
                             free_buffers_.empty() ||
@@ -849,7 +849,7 @@ namespace sunpack::sevenzip
                     }
                     else
                     {
-                        if (free_borrowed_leases_.empty() && borrowed_leases_ != 0)
+                        if (free_borrowed_leases_.empty() && borrowed_lease_count_ != 0)
                             return S_FALSE;
 
                         chunk = static_cast<UInt32>(target_size);
@@ -919,7 +919,7 @@ namespace sunpack::sevenzip
                         file->accepted_bytes.fetch_add(chunk, std::memory_order_relaxed);
                         account_accepted(chunk);
                         ++queued_jobs_;
-                        ++borrowed_leases_;
+                        ++borrowed_lease_count_;
 
                         *processed_size = chunk;
                         *token = SunpackSharedOutput_MakeToken(&lease->token);
@@ -1116,7 +1116,7 @@ namespace sunpack::sevenzip
             std::lock_guard<std::mutex> lock(mutex_);
             if (queued_jobs_ != 0 || inflight_file_count_ != 0
 #if SUP7Z_USE_SHARED_OUTPUT
-                || borrowed_leases_ != 0
+                || borrowed_lease_count_ != 0
 #endif
                 )
             {
@@ -1244,7 +1244,7 @@ namespace sunpack::sevenzip
                 buffers_.push_back(std::move(buffer));
             }
 #if SUP7Z_USE_SHARED_OUTPUT
-            borrowed_leases_.reserve(buffer_count_);
+            borrowed_lease_records_.reserve(buffer_count_);
             for (std::size_t index = 0; index < buffer_count_; ++index)
             {
                 auto lease = std::make_unique<BorrowedLease>();
@@ -1252,7 +1252,7 @@ namespace sunpack::sevenzip
                 lease->token.context = lease.get();
                 lease->token.waitAndRelease = &AsyncFileWriter::wait_borrowed_thunk;
                 free_borrowed_leases_.push_back(lease.get());
-                borrowed_leases_.push_back(std::move(lease));
+                borrowed_lease_records_.push_back(std::move(lease));
             }
 #endif
             workers_.reserve(writer_count_);
@@ -2209,8 +2209,8 @@ namespace sunpack::sevenzip
                 lease->result = S_OK;
                 lease->state = BorrowedLeaseState::Free;
                 free_borrowed_leases_.push_back(lease);
-                if (borrowed_leases_ != 0)
-                    --borrowed_leases_;
+                if (borrowed_lease_count_ != 0)
+                    --borrowed_lease_count_;
             }
             producer_cv_.notify_all();
             return result;
@@ -2276,7 +2276,7 @@ namespace sunpack::sevenzip
         std::vector<std::unique_ptr<Buffer>> buffers_;
         std::deque<Buffer *> free_buffers_;
 #if SUP7Z_USE_SHARED_OUTPUT
-        std::vector<std::unique_ptr<BorrowedLease>> borrowed_leases_;
+        std::vector<std::unique_ptr<BorrowedLease>> borrowed_lease_records_;
         std::deque<BorrowedLease *> free_borrowed_leases_;
 #endif
         std::vector<std::thread> workers_;
@@ -2296,7 +2296,7 @@ namespace sunpack::sevenzip
         std::size_t queued_jobs_ = 0;
 #if SUP7Z_USE_SHARED_OUTPUT
         std::size_t producer_leases_ = 0;
-        std::size_t borrowed_leases_ = 0;
+        std::size_t borrowed_lease_count_ = 0;
 #endif
         // 必须是 atomic：gate 的 terminal predicate 会无锁读它。
         std::atomic<bool> stopping_{false};
