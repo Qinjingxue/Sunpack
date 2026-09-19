@@ -217,7 +217,10 @@ PasswordTestResult test_passwords_with_parts(
     const std::vector<std::wstring>& part_paths,
     const wchar_t* const* passwords,
     int password_count,
-    const std::vector<std::wstring>& canonical_names = {}
+    const std::vector<std::wstring>& canonical_names = {},
+    const std::wstring& format_hint = L"",
+    const std::wstring& signature_path = L"",
+    unsigned long long signature_offset = 0
 );
 
 PasswordTestResult test_passwords_with_ranges(
@@ -242,7 +245,9 @@ ExtractArchiveResult extract_archive_with_parts(
     bool native_volume_input = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
     std::size_t job_buffer_budget = 0,
-    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+    const std::wstring& signature_path = L"",
+    unsigned long long signature_offset = 0
 );
 
 ExtractArchiveResult extract_archive_with_ranges(

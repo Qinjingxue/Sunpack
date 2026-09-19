@@ -238,7 +238,11 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget = 0,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+
+        const std::wstring &signature_path = L"",
+
+        UInt64 signature_offset = 0
 
     )
     {
@@ -314,7 +318,8 @@ namespace sunpack::sevenzip
             }
         }
 
-        const auto formats = candidate_formats_for_hint(format_hint, archive_path, part_paths);
+        const auto formats = candidate_formats_for_hint(
+            format_hint, archive_path, part_paths, signature_path, signature_offset);
         const auto prefetch_config = input_prefetch_config_for_archive(format_hint, native_volume_input);
 
         for (const GUID &format : formats)
@@ -727,7 +732,11 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token
+        std::shared_ptr<std::atomic<bool>> cancel_token,
+
+        const std::wstring &signature_path,
+
+        UInt64 signature_offset
 
     )
     {
@@ -766,7 +775,9 @@ namespace sunpack::sevenzip
             native_volume_input,
             std::move(shared_writer),
             job_buffer_budget,
-            std::move(cancel_token));
+            std::move(cancel_token),
+            signature_path,
+            signature_offset);
 
 #else
 
@@ -863,7 +874,9 @@ namespace sunpack::sevenzip
             false,
             std::move(shared_writer),
             job_buffer_budget,
-            std::move(cancel_token));
+            std::move(cancel_token),
+            ranges.empty() ? L"" : ranges.front().path,
+            ranges.empty() ? 0 : ranges.front().start);
 
 #else
 

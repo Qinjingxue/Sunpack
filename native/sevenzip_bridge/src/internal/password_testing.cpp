@@ -713,7 +713,13 @@ namespace sunpack::sevenzip
 
         int password_count,
 
-        const std::vector<std::wstring> &canonical_names
+        const std::vector<std::wstring> &canonical_names,
+
+        const std::wstring &format_hint,
+
+        const std::wstring &signature_path,
+
+        unsigned long long signature_offset
 
     );
 
@@ -802,7 +808,13 @@ namespace sunpack::sevenzip
 
         int password_count,
 
-        const std::vector<std::wstring> &canonical_names
+        const std::vector<std::wstring> &canonical_names,
+
+        const std::wstring &format_hint,
+
+        const std::wstring &signature_path,
+
+        unsigned long long signature_offset
 
     )
     {
@@ -863,7 +875,14 @@ namespace sunpack::sevenzip
             return needs_volume_or_tail_damaged_result("zip_eocd_unavailable");
         }
 
-        const std::vector<GUID> formats = candidate_formats(archive_path, effective_part_paths);
+        const std::vector<GUID> formats = format_hint.empty()
+            ? candidate_formats(archive_path, effective_part_paths)
+            : candidate_formats_for_hint(
+                  format_hint,
+                  archive_path,
+                  effective_part_paths,
+                  signature_path,
+                  signature_offset);
 
         for (int i = 0; i < password_count; ++i)
         {
@@ -994,7 +1013,12 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> part_paths{archive_path};
 
-        const std::vector<GUID> formats = candidate_formats_for_hint(format_hint, archive_path, part_paths);
+        const std::vector<GUID> formats = candidate_formats_for_hint(
+            format_hint,
+            archive_path,
+            part_paths,
+            ranges.empty() ? L"" : ranges.front().path,
+            ranges.empty() ? 0 : ranges.front().start);
 
         for (int i = 0; i < password_count; ++i)
         {

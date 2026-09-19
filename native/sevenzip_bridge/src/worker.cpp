@@ -355,6 +355,8 @@ struct WorkerArchiveInput {
     std::vector<std::wstring> part_paths;
     std::vector<std::wstring> canonical_names;
     std::vector<int> volume_numbers;
+    std::wstring signature_path;
+    unsigned long long signature_offset = 0;
     std::string validation_error;
     std::vector<sunpack::sevenzip::ExtractInputRange> ranges;
 };
@@ -382,7 +384,10 @@ sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
         archive_input.part_paths,
         password_ptrs.data(),
         static_cast<int>(password_ptrs.size()),
-        archive_input.canonical_names);
+        archive_input.canonical_names,
+        archive_input.format_hint,
+        archive_input.signature_path,
+        archive_input.signature_offset);
 }
 
 sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
@@ -527,7 +532,13 @@ WorkerArchiveInput parse_archive_input_descriptor(
     const std::string format_hint = json_string_field(descriptor, "format_hint", json_string_field(request, "format_hint", ""));
     input.format_hint = utf8_to_wide(format_hint);
 
-    struct ParsedPart { int number; std::wstring path; std::wstring canonical_name; };
+    struct ParsedPart {
+        int number;
+        std::wstring path;
+        std::wstring canonical_name;
+        unsigned long long start = 0;
+        bool has_start = false;
+    };
     std::vector<ParsedPart> structured_parts;
     std::vector<std::wstring> parts;
     for (const auto& object_json : json_object_array_field(descriptor, "parts")) {
@@ -540,7 +551,17 @@ WorkerArchiveInput parse_archive_input_descriptor(
                 if (!json_uint_field_in_object(object_json, "volume_number", &number) || number == 0 || canonical_name.empty()) {
                     input.validation_error = "structured volume part requires volume_number and canonical_name";
                 } else {
-                    structured_parts.push_back({static_cast<int>(number), utf8_to_wide(path), utf8_to_wide(canonical_name)});
+                    unsigned long long start = 0;
+                    const bool has_start =
+                        json_uint_field_in_object(object_json, "start", &start) ||
+                        json_uint_field_in_object(object_json, "start_offset", &start);
+                    structured_parts.push_back({
+                        static_cast<int>(number),
+                        utf8_to_wide(path),
+                        utf8_to_wide(canonical_name),
+                        start,
+                        has_start,
+                    });
                 }
             }
         }
@@ -558,6 +579,10 @@ WorkerArchiveInput parse_archive_input_descriptor(
             parts.push_back(structured_parts[index].path);
             input.canonical_names.push_back(structured_parts[index].canonical_name);
             input.volume_numbers.push_back(structured_parts[index].number);
+            if (index == 0 && structured_parts[index].has_start && structured_parts[index].start > 0) {
+                input.signature_path = structured_parts[index].path;
+                input.signature_offset = structured_parts[index].start;
+            }
         }
         if (parts.empty()) input.validation_error = "structured volume descriptor has no parts";
     }
@@ -918,7 +943,7 @@ int run_request(
     }
     auto extract_with_password = [&](const std::wstring& selected_password) {
         return archive_input.ranges.empty()
-            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
+            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token, archive_input.signature_path, archive_input.signature_offset)
             : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
     };
 
