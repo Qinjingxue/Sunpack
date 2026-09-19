@@ -174,6 +174,8 @@ def _run_job(
         input_trace = {}
     read_file_wall_ms = round(float(input_trace.get("read_file_wall_ns", 0) or 0) / 1_000_000.0, 3)
     prefetch_wait_ms = round(float(input_trace.get("prefetch_consumer_wait_ns", 0) or 0) / 1_000_000.0, 3)
+    open_read_file_wall_ms = round(float(input_trace.get("open_read_file_wall_ns", 0) or 0) / 1_000_000.0, 3)
+    open_prefetch_wait_ms = round(float(input_trace.get("open_prefetch_consumer_wait_ns", 0) or 0) / 1_000_000.0, 3)
     sequential_read_bytes = int(input_trace.get("sequential_read_bytes", 0) or 0)
     nonsequential_read_bytes = int(input_trace.get("nonsequential_read_bytes", 0) or 0)
     logical_read_bytes = sequential_read_bytes + nonsequential_read_bytes
@@ -202,6 +204,17 @@ def _run_job(
         "input_prefetch_miss_count": int(input_trace.get("prefetch_miss_count", 0) or 0),
         "input_prefetch_invalidation_count": int(input_trace.get("prefetch_invalidation_count", 0) or 0),
         "input_prefetch_issued_count": int(input_trace.get("prefetch_issued_count", 0) or 0),
+        "input_prefetch_issued_bytes": int(input_trace.get("prefetch_issued_bytes", 0) or 0),
+        "input_open_read_file_call_count": int(input_trace.get("open_read_file_call_count", 0) or 0),
+        "input_open_read_file_wall_ms": open_read_file_wall_ms,
+        "input_open_logical_read_call_count": int(input_trace.get("open_logical_read_call_count", 0) or 0),
+        "input_open_seek_count": int(input_trace.get("open_seek_count", 0) or 0),
+        "input_open_prefetch_hit_count": int(input_trace.get("open_prefetch_hit_count", 0) or 0),
+        "input_open_prefetch_miss_count": int(input_trace.get("open_prefetch_miss_count", 0) or 0),
+        "input_open_prefetch_invalidation_count": int(input_trace.get("open_prefetch_invalidation_count", 0) or 0),
+        "input_open_prefetch_consumer_wait_ms": open_prefetch_wait_ms,
+        "input_open_prefetch_issued_count": int(input_trace.get("open_prefetch_issued_count", 0) or 0),
+        "input_open_prefetch_issued_bytes": int(input_trace.get("open_prefetch_issued_bytes", 0) or 0),
         "input_prefetch_published_count": int(input_trace.get("prefetch_published_count", 0) or 0),
         "input_prefetch_orphaned_count": int(input_trace.get("prefetch_orphaned_count", 0) or 0),
         "input_prefetch_consumer_wait_ms": prefetch_wait_ms,
