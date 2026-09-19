@@ -6,6 +6,9 @@ Igor Pavlov : Public domain */
 
 #include "Sha256.h"
 #include "Delta.h"
+#if SUP7Z_USE_SHARED_INPUT
+#include "SunpackSharedInput.h"
+#endif
 
 EXTERN_C_BEGIN
 
@@ -531,6 +534,9 @@ SRes XzDecMt_Decode(CXzDecMtHandle p,
     ISeqOutStreamPtr outStream,
     // Byte *outBuf, size_t *outBufSize,
     ISeqInStreamPtr inStream,
+#if SUP7Z_USE_SHARED_INPUT
+    const CSunpackSharedInput *sharedInput,
+#endif
     // const Byte *inData, size_t inDataSize,
     CXzStatInfo *stat,         // out: decoding results and statistics
     int *isMT,                 // out: 0 means that ST (Single-Thread) version was used
