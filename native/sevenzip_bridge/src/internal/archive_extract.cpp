@@ -475,6 +475,9 @@ namespace sunpack::sevenzip
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
+            // Flush actual worker-issued read counters before taking the Open snapshot.
+            ::NSunpackReadPlan::Sync(stream.Interface());
+
             // Snapshot Open() before extraction changes the prefetch phase, so A/B runs can
             // distinguish metadata parsing behavior from planned payload reads.
             capture_open_input_trace(result.input_trace);
@@ -494,6 +497,7 @@ namespace sunpack::sevenzip
 #endif
 
             hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
+            ::NSunpackReadPlan::Sync(stream.Interface());
 
             // Extraction success must not be published before every queued write and close
             // has finished and any delayed filesystem error has been folded back in.
