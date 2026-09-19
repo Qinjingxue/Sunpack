@@ -332,6 +332,8 @@ namespace sunpack::sevenzip
             {
                 worker_.join();
             }
+            std::lock_guard lock(mutex_);
+            sync_trace_locked();
         }
 
         bool enabled() const noexcept { return config_.enabled; }
@@ -340,6 +342,12 @@ namespace sunpack::sevenzip
         {
             std::lock_guard lock(mutex_);
             ensure_worker_locked();
+        }
+
+        void sync_trace()
+        {
+            std::lock_guard lock(mutex_);
+            sync_trace_locked();
         }
 
         bool planned_mode()
@@ -577,12 +585,12 @@ namespace sunpack::sevenzip
             }
         }
 
-        void record_prefetch_issue_locked(UInt32 size) noexcept
+        void sync_trace_locked() noexcept
         {
             if (trace_ && read_file_timing_enabled())
             {
-                ++trace_->prefetch_issued_count;
-                trace_->prefetch_issued_bytes += size;
+                trace_->prefetch_issued_count = prefetch_issued_count_;
+                trace_->prefetch_issued_bytes = prefetch_issued_bytes_;
             }
         }
 
@@ -797,7 +805,6 @@ namespace sunpack::sevenzip
                 }
                 const UInt32 read_size = static_cast<UInt32>(std::min<UInt64>(remaining, wanted));
                 chunks_.push_back(Chunk{epoch_, next_offset_, read_size});
-                record_prefetch_issue_locked(read_size);
                 next_offset_ += read_size;
                 reserved += read_size;
             }
@@ -826,7 +833,6 @@ namespace sunpack::sevenzip
                 const UInt64 remaining = virtual_size_ - next_offset_;
                 const UInt32 size = static_cast<UInt32>(std::min<UInt64>(remaining, config_.window_bytes));
                 chunks_.push_back(Chunk{epoch_, next_offset_, size});
-                record_prefetch_issue_locked(size);
                 next_offset_ += size;
             }
         }
@@ -853,6 +859,8 @@ namespace sunpack::sevenzip
                     offset = chunk->offset;
                     size = chunk->size;
                     chunk->state = ChunkState::Reading;
+                    ++prefetch_issued_count_;
+                    prefetch_issued_bytes_ += size;
                 }
                 std::vector<unsigned char> bytes(size);
                 UInt32 read = 0;
@@ -882,6 +890,8 @@ namespace sunpack::sevenzip
         UInt64 virtual_size_ = 0;
         Reader reader_;
         ExtractInputTrace *trace_ = nullptr;
+        unsigned long long prefetch_issued_count_ = 0;
+        unsigned long long prefetch_issued_bytes_ = 0;
         std::mutex mutex_;
         std::condition_variable ready_;
         std::thread worker_;
@@ -1108,6 +1118,15 @@ namespace sunpack::sevenzip
             if (legacy_prefetch_active_ && prefetch_)
             {
                 prefetch_->ensure_worker();
+            }
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE SyncPrefetchTrace() SUP7Z_NOEXCEPT override
+        {
+            if (prefetch_)
+            {
+                prefetch_->sync_trace();
             }
             return S_OK;
         }
@@ -1438,6 +1457,15 @@ namespace sunpack::sevenzip
             if (legacy_prefetch_active_ && prefetch_)
             {
                 prefetch_->ensure_worker();
+            }
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE SyncPrefetchTrace() SUP7Z_NOEXCEPT override
+        {
+            if (prefetch_)
+            {
+                prefetch_->sync_trace();
             }
             return S_OK;
         }
@@ -2004,6 +2032,15 @@ namespace sunpack::sevenzip
             if (legacy_prefetch_active_ && prefetch_)
             {
                 prefetch_->ensure_worker();
+            }
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE SyncPrefetchTrace() SUP7Z_NOEXCEPT override
+        {
+            if (prefetch_)
+            {
+                prefetch_->sync_trace();
             }
             return S_OK;
         }
