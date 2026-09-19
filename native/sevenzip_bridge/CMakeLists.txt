@@ -39,7 +39,13 @@ set(SUP7Z_7Z_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/7z2603-src")
 option(SUP7Z_USE_X64_ASM
     "Use upstream 7-Zip x64 assembly hot paths (LZMA decoder, CRC32/CRC64, AES, SHA)"
     ON)
+option(SUP7Z_USE_ARM64_ASM
+    "Use upstream 7-Zip ARM64 LZMA decoder assembly hot path"
+    ON)
+set(SUP7Z_CLANG_CL_EXECUTABLE "" CACHE FILEPATH
+    "clang-cl executable used only to assemble upstream 7-Zip ARM64 LzmaDecOpt.S")
 
+set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)
     if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
         set(SUP7Z_TARGET_UARCH "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
@@ -52,16 +58,22 @@ if(MSVC)
     endif()
 endif()
 
-if(SUP7Z_USE_X64_ASM)
-    if(SUP7Z_TARGET_UARCH STREQUAL "x64" OR SUP7Z_TARGET_UARCH STREQUAL "AMD64")
-        set(SUP7Z_X64_ASM_ENABLED ON)
-    else()
-        set(SUP7Z_X64_ASM_ENABLED OFF)
-    endif()
-else()
-    set(SUP7Z_X64_ASM_ENABLED OFF)
+set(SUP7Z_X64_ASM_ENABLED OFF)
+if(SUP7Z_USE_X64_ASM AND
+   (SUP7Z_TARGET_UARCH STREQUAL "x64" OR SUP7Z_TARGET_UARCH STREQUAL "AMD64"))
+    set(SUP7Z_X64_ASM_ENABLED ON)
 endif()
 
+set(SUP7Z_ARM64_ASM_ENABLED OFF)
+if(SUP7Z_USE_ARM64_ASM AND
+   (SUP7Z_TARGET_UARCH STREQUAL "ARM64" OR SUP7Z_TARGET_UARCH STREQUAL "arm64"))
+    set(SUP7Z_ARM64_ASM_ENABLED ON)
+endif()
+
+# Keep the existing x64 selection guard stable so existing build-x64 directories
+# do not need a one-time clean after this change. ARM64 gets its own guard file:
+# old ARM64 build directories did not have this file, so the first optimized
+# configure is a normal migration; later ON/OFF flips are rejected for clean A/B.
 set(SUP7Z_ASM_LAST_SELECTION_FILE "${CMAKE_BINARY_DIR}/sup7z_asm_last_selection.txt")
 if(EXISTS "${SUP7Z_ASM_LAST_SELECTION_FILE}")
     file(READ "${SUP7Z_ASM_LAST_SELECTION_FILE}" SUP7Z_ASM_LAST_SELECTION)
@@ -77,6 +89,22 @@ if(EXISTS "${SUP7Z_ASM_LAST_SELECTION_FILE}")
 endif()
 file(WRITE "${SUP7Z_ASM_LAST_SELECTION_FILE}" "${SUP7Z_X64_ASM_ENABLED}")
 
+set(SUP7Z_ARM64_ASM_LAST_SELECTION_FILE
+    "${CMAKE_BINARY_DIR}/sup7z_arm64_asm_last_selection.txt")
+if(EXISTS "${SUP7Z_ARM64_ASM_LAST_SELECTION_FILE}")
+    file(READ "${SUP7Z_ARM64_ASM_LAST_SELECTION_FILE}" SUP7Z_ARM64_ASM_LAST_SELECTION)
+    string(STRIP "${SUP7Z_ARM64_ASM_LAST_SELECTION}" SUP7Z_ARM64_ASM_LAST_SELECTION)
+    if(NOT SUP7Z_ARM64_ASM_LAST_SELECTION STREQUAL "${SUP7Z_ARM64_ASM_ENABLED}")
+        message(FATAL_ERROR
+            "SUP7Z_USE_ARM64_ASM changed from "
+            "'${SUP7Z_ARM64_ASM_LAST_SELECTION}' to '${SUP7Z_ARM64_ASM_ENABLED}' in the same "
+            "build directory (${CMAKE_BINARY_DIR}). Delete that directory, or configure the "
+            "other setting into its own build directory (e.g. build-arm64-asm-off), so the "
+            "LzmaDec object cannot be accidentally reused across A/B builds.")
+    endif()
+endif()
+file(WRITE "${SUP7Z_ARM64_ASM_LAST_SELECTION_FILE}" "${SUP7Z_ARM64_ASM_ENABLED}")
+
 set(SUP7Z_X64_ASM_SOURCES
     "${SUP7Z_7Z_ROOT}/Asm/x86/LzmaDecOpt.asm"
     "${SUP7Z_7Z_ROOT}/Asm/x86/7zCrcOpt.asm"
@@ -85,6 +113,10 @@ set(SUP7Z_X64_ASM_SOURCES
     "${SUP7Z_7Z_ROOT}/Asm/x86/Sha1Opt.asm"
     "${SUP7Z_7Z_ROOT}/Asm/x86/Sha256Opt.asm"
 )
+set(SUP7Z_ARM64_LZMA_ASM_SOURCE
+    "${SUP7Z_7Z_ROOT}/Asm/arm64/LzmaDecOpt.S")
+set(SUP7Z_ARM64_LZMA_ASM_INCLUDE
+    "${SUP7Z_7Z_ROOT}/Asm/arm64/7zAsm.S")
 
 
 file(GLOB_RECURSE SUP7Z_BUNDLED_7Z_SOURCES CONFIGURE_DEPENDS
@@ -130,18 +162,30 @@ if(SUP7Z_X64_ASM_ENABLED)
 
     set(SUP7Z_BUNDLED_7Z_SOURCES ${SUP7Z_BUNDLED_7Z_SOURCES_WITHOUT_ASM_TWINS})
 
+endif()
+
+if(SUP7Z_X64_ASM_ENABLED OR SUP7Z_ARM64_ASM_ENABLED)
+    # Both optimized LZMA paths replace only LzmaDec_DecodeReal_3; the rest of
+    # LzmaDec.c stays compiled by the normal C compiler.
     set_source_files_properties(
         "${SUP7Z_7Z_ROOT}/C/LzmaDec.c"
         PROPERTIES
         COMPILE_DEFINITIONS Z7_LZMA_DEC_OPT)
+endif()
 
+if(SUP7Z_X64_ASM_ENABLED)
     message(STATUS
         "7-Zip asm: enabled (x64 MASM) - LzmaDecOpt, 7zCrcOpt, XzCrc64Opt, "
         "AesOpt, Sha1Opt, Sha256Opt; Sort/LzFindOpt intentionally omitted")
+elseif(SUP7Z_ARM64_ASM_ENABLED)
+    message(STATUS
+        "7-Zip asm: enabled (ARM64 clang-cl) - LzmaDecOpt.S; "
+        "CRC/AES/SHA keep upstream C/intrinsics")
 else()
     message(STATUS
         "7-Zip asm: disabled (target arch '${SUP7Z_TARGET_UARCH}', "
-        "SUP7Z_USE_X64_ASM=${SUP7Z_USE_X64_ASM}) - using upstream C/intrinsics")
+        "x64=${SUP7Z_USE_X64_ASM}, ARM64=${SUP7Z_USE_ARM64_ASM}) - "
+        "using upstream C/intrinsics")
 endif()
 
 
@@ -179,6 +223,63 @@ if(SUP7Z_X64_ASM_ENABLED)
         PRIVATE ${SUP7Z_7Z_ROOT}/Asm/x86)
 endif()
 
+if(SUP7Z_ARM64_ASM_ENABLED)
+    if(NOT EXISTS "${SUP7Z_ARM64_LZMA_ASM_SOURCE}" OR
+       NOT EXISTS "${SUP7Z_ARM64_LZMA_ASM_INCLUDE}")
+        message(FATAL_ERROR
+            "ARM64 LZMA assembly is enabled but the upstream Asm/arm64 sources are missing. "
+            "Restore LzmaDecOpt.S + 7zAsm.S or configure with "
+            "-DSUP7Z_USE_ARM64_ASM=OFF.")
+    endif()
+
+    if(NOT SUP7Z_CLANG_CL_EXECUTABLE)
+        find_program(SUP7Z_CLANG_CL_EXECUTABLE
+            NAMES clang-cl.exe clang-cl
+            HINTS
+                "${CMAKE_GENERATOR_INSTANCE}/VC/Tools/Llvm/x64/bin"
+                "${CMAKE_GENERATOR_INSTANCE}/VC/Tools/Llvm/ARM64/bin"
+                "$ENV{VCINSTALLDIR}/Tools/Llvm/x64/bin"
+                "$ENV{VCINSTALLDIR}/Tools/Llvm/ARM64/bin")
+    endif()
+    if(NOT SUP7Z_CLANG_CL_EXECUTABLE)
+        message(FATAL_ERROR
+            "ARM64 LZMA assembly requires clang-cl, matching upstream 7-Zip. "
+            "Install the Visual Studio 'C++ Clang tools for Windows' component, put "
+            "clang-cl on PATH, set -DSUP7Z_CLANG_CL_EXECUTABLE=<path>, or deliberately "
+            "configure -DSUP7Z_USE_ARM64_ASM=OFF.")
+    endif()
+
+    set(SUP7Z_ARM64_ASM_OUTPUT_DIR
+        "${CMAKE_CURRENT_BINARY_DIR}/sunpack_7zip_arm64_asm")
+    set(SUP7Z_ARM64_LZMA_OBJECT
+        "${SUP7Z_ARM64_ASM_OUTPUT_DIR}/LzmaDecOpt.obj")
+
+    # This is the same compilation model used by upstream Windows ARM64 builds:
+    # clang-cl preprocesses the GNU-style .S file and emits an ARM64 COFF object,
+    # while all normal SunPack/7-Zip C and C++ translation units remain MSVC.
+    add_custom_command(
+        OUTPUT "${SUP7Z_ARM64_LZMA_OBJECT}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${SUP7Z_ARM64_ASM_OUTPUT_DIR}"
+        COMMAND "${SUP7Z_CLANG_CL_EXECUTABLE}"
+            --target=arm64-pc-windows-msvc
+            -nologo
+            -c
+            "-Fo${SUP7Z_ARM64_LZMA_OBJECT}"
+            -Wall
+            -WX
+            "${SUP7Z_ARM64_LZMA_ASM_SOURCE}"
+        DEPENDS
+            "${SUP7Z_ARM64_LZMA_ASM_SOURCE}"
+            "${SUP7Z_ARM64_LZMA_ASM_INCLUDE}"
+        COMMENT "Assembling upstream 7-Zip ARM64 LzmaDecOpt.S with clang-cl"
+        VERBATIM)
+
+    add_custom_target(sunpack_7zip_arm64_asm_objects
+        DEPENDS "${SUP7Z_ARM64_LZMA_OBJECT}")
+    set_source_files_properties("${SUP7Z_ARM64_LZMA_OBJECT}"
+        PROPERTIES GENERATED TRUE EXTERNAL_OBJECT TRUE)
+endif()
+
 
 function(sup7z_attach_bundled_7z target_name)
     if(WIN32 AND TARGET sunpack_7zip_objects)
@@ -189,6 +290,10 @@ function(sup7z_attach_bundled_7z target_name)
     if(WIN32 AND TARGET sunpack_7zip_asm_objects)
         target_sources(${target_name} PRIVATE
             $<TARGET_OBJECTS:sunpack_7zip_asm_objects>)
+    endif()
+    if(WIN32 AND SUP7Z_ARM64_ASM_ENABLED)
+        target_sources(${target_name} PRIVATE "${SUP7Z_ARM64_LZMA_OBJECT}")
+        add_dependencies(${target_name} sunpack_7zip_arm64_asm_objects)
     endif()
 endfunction()
 
