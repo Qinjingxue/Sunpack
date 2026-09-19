@@ -7,6 +7,7 @@
 // macro edit from silently dropping it again.
 
 #include "internal/sevenzip_callbacks.hpp"
+#include "internal/sevenzip_streams.hpp"
 
 #include <cstdio>
 #include <string>
@@ -114,6 +115,22 @@ void check_open_callback()
     check(rejects(as_unknown(probe), IID_IProgress), "QI(foreign IID) == E_NOINTERFACE");
 }
 
+void check_open_archive_stream_ownership()
+{
+    std::printf("open_archive_stream ownership\n");
+
+    bool opened = false;
+    CMyComPtr<IInStream> stream = open_archive_stream(
+        L"", std::vector<std::wstring>{}, opened);
+
+    IUnknown *unknown = as_unknown(stream.Interface());
+    const ULONG after_add_ref = unknown->AddRef();
+    const ULONG after_release = unknown->Release();
+
+    check(after_add_ref == 2 && after_release == 1,
+          "open_archive_stream returns exactly one owned COM reference");
+}
+
 void check_streams()
 {
     std::printf("Streams\n");
@@ -144,6 +161,7 @@ int main()
     check_extract_to_disk_callback();
     check_open_callback();
     check_streams();
+    check_open_archive_stream_ownership();
 
     if (g_failures != 0)
     {

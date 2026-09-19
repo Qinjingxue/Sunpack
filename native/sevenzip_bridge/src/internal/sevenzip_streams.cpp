@@ -44,7 +44,7 @@ namespace sunpack::sevenzip
 
                 CMyComPtr<IInStream> owner(stream);
 
-                return owner.Detach();
+                return owner;
             }
 
             if (volumes.size() > 1)
@@ -56,7 +56,7 @@ namespace sunpack::sevenzip
 
                 CMyComPtr<IInStream> owner(stream);
 
-                return owner.Detach();
+                return owner;
             }
 
             if (volumes.size() == 1)
@@ -68,7 +68,7 @@ namespace sunpack::sevenzip
 
                 CMyComPtr<IInStream> owner(stream);
 
-                return owner.Detach();
+                return owner;
             }
 
             auto *stream = new FileInStream(archive_path, trace, L"file", prefetch_config);
@@ -77,7 +77,7 @@ namespace sunpack::sevenzip
 
             CMyComPtr<IInStream> owner(stream);
 
-            return owner.Detach();
+            return owner;
         }
 
         std::vector<std::wstring> paths = unique_existing_paths(archive_path, part_paths);
@@ -103,7 +103,7 @@ namespace sunpack::sevenzip
 
             CMyComPtr<IInStream> owner(stream);
 
-            return owner.Detach();
+            return owner;
         }
 
         auto *stream = new FileInStream(archive_path, trace, L"file", prefetch_config);
@@ -112,7 +112,7 @@ namespace sunpack::sevenzip
 
         CMyComPtr<IInStream> owner(stream);
 
-        return owner.Detach();
+        return owner;
     }
 
     std::wstring callback_archive_path(const std::wstring &archive_path, const std::vector<std::wstring> &part_paths)
