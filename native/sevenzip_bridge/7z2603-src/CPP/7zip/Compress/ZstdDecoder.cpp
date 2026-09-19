@@ -8,44 +8,11 @@
 
 #include "../Common/CWrappers.h"
 #include "../Common/StreamUtils.h"
-#if SUP7Z_USE_SHARED_OUTPUT
-#include "../Common/SunpackSharedOutput.h"
-#endif
 
 #include "ZstdDecoder.h"
 
 namespace NCompress {
 namespace NZstd {
-
-#if SUP7Z_USE_SHARED_OUTPUT
-using CZstdSharedOutputLeases = CSunpackSharedOutputRangeLeaseRing<32>;
-
-static SRes SharedOutput_BeforeWindowReuse(void *ctx, size_t begin, size_t end)
-{
-  if (!ctx)
-    return SZ_OK;
-  const HRESULT res = ((CZstdSharedOutputLeases *)ctx)->RetireOverlapping(
-      (UInt64)begin, (UInt64)end);
-  return res == S_OK ? SZ_OK : SZ_ERROR_WRITE;
-}
-
-struct CZstdSharedOutputGuard
-{
-  CZstdDecState *State;
-  CZstdSharedOutputLeases *Leases;
-
-  ~CZstdSharedOutputGuard()
-  {
-    if (Leases)
-      Leases->Drain();
-    if (State)
-    {
-      State->sunpackOutputCtx = NULL;
-      State->sunpackBeforeWindowReuse = NULL;
-    }
-  }
-};
-#endif
 
 static const size_t k_Zstd_BlockSizeMax = 1 << 17;
 /*
@@ -61,9 +28,6 @@ CDecoder::CDecoder():
     , _inProcessed(0)
     , _inBufSize(1u << 19) // larger value will reduce the number of memcpy() calls in CZstdDec code
     , _inBuf(NULL)
-#if SUP7Z_USE_SHARED_INPUT
-    , _borrowToken(0)
-#endif
     , FinishMode(false)
     , DisableHash(False)
     // , DisableHash(True) // for debug : fast decoding without hash calculation
@@ -73,25 +37,10 @@ CDecoder::CDecoder():
 
 CDecoder::~CDecoder()
 {
-#if SUP7Z_USE_SHARED_INPUT
-  ReleaseBorrowed();
-#endif
   if (_dec)
     ZstdDec_Destroy(_dec);
   MidFree(_inBuf);
 }
-
-#if SUP7Z_USE_SHARED_INPUT
-void CDecoder::ReleaseBorrowed() throw()
-{
-  if (_borrowToken)
-  {
-    if (_sharedInput)
-      _sharedInput->ReleaseBorrowed(_borrowToken);
-    _borrowToken = 0;
-  }
-}
-#endif
 
 
 Z7_COM7F_IMF(CDecoder::SetInBufSize(UInt32 , UInt32 size))
@@ -142,10 +91,6 @@ Z7_COM7F_IMF(CDecoder::ReadUnusedFromInBuf(void *data, UInt32 size, UInt32 *proc
     }
   }
   *processedSize = (UInt32)cur;
-#if SUP7Z_USE_SHARED_INPUT
-  if (_borrowToken && _state.inPos == _state.inLim)
-    ReleaseBorrowed();
-#endif
   return S_OK;
 }
 
@@ -153,10 +98,6 @@ Z7_COM7F_IMF(CDecoder::ReadUnusedFromInBuf(void *data, UInt32 size, UInt32 *proc
 
 HRESULT CDecoder::Prepare(const UInt64 *outSize)
 {
-#if SUP7Z_USE_SHARED_INPUT
-  ReleaseBorrowed();
-  _sharedInput.Release();
-#endif
   _inProcessed = 0;
   _afterDecoding_tempPos = 0;
   ZstdDecState_Clear(&_state);
@@ -195,63 +136,6 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
   RINOK(Prepare(outSize))
-#if SUP7Z_USE_SHARED_INPUT
-  inStream->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
-#endif
-#if SUP7Z_USE_SHARED_OUTPUT
-  CMyComPtr<ISunpackSharedOutput> sharedOutput;
-  if (outStream)
-    outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&sharedOutput);
-  CZstdSharedOutputLeases outputLeases;
-  CZstdSharedOutputGuard outputGuard = { &_state, sharedOutput ? &outputLeases : NULL };
-  if (sharedOutput)
-  {
-    _state.sunpackOutputCtx = &outputLeases;
-    _state.sunpackBeforeWindowReuse = SharedOutput_BeforeWindowReuse;
-  }
-
-  const auto writeOutput = [&](const Byte *data, size_t bytes) -> HRESULT
-  {
-    if (!sharedOutput)
-      return WriteStream(outStream, data, bytes);
-
-    while (bytes != 0)
-    {
-      const UInt32 request = bytes > (size_t)0xFFFFFFFFu
-          ? 0xFFFFFFFFu : (UInt32)bytes;
-      UInt32 accepted = 0;
-      UInt64 token = 0;
-      HRESULT submitRes = S_FALSE;
-      for (;;)
-      {
-        submitRes = sharedOutput->SubmitBorrowed(
-            data, request, &accepted, &token);
-        if (submitRes != S_FALSE || outputLeases.Empty())
-          break;
-        const HRESULT retireRes = outputLeases.RetireOne();
-        if (retireRes != S_OK)
-          return retireRes;
-        accepted = 0;
-        token = 0;
-      }
-      if (submitRes == S_FALSE)
-        return WriteStream(outStream, data, bytes);
-      if (submitRes != S_OK)
-        return submitRes;
-      if (accepted == 0 || accepted > request || token == 0)
-        return E_FAIL;
-
-      const UInt64 rangeBegin = (UInt64)(data - _state.win);
-      const HRESULT retireRes = outputLeases.Push(
-          token, rangeBegin, rangeBegin + accepted);
-      if (retireRes != S_OK)
-        return retireRes;
-      data += accepted;
-      bytes -= accepted;
-    }
-    return S_OK;
-  };
-#endif
   
   UInt64 inPrev = 0;
   UInt64 outPrev = 0;
@@ -266,55 +150,14 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     if (_state.inPos == _state.inLim && !readWasFinished)
     {
       _state.inPos = 0;
-#if SUP7Z_USE_SHARED_INPUT
-      ReleaseBorrowed();
-      bool borrowedInput = false;
-      if (_sharedInput)
-      {
-        const Byte *borrowed = NULL;
-        UInt32 borrowedSize = 0;
-        UInt64 token = 0;
-        const HRESULT borrowRes = _sharedInput->Borrow(_inBufSize, &borrowed, &borrowedSize, &token);
-        if (borrowRes == S_OK)
-        {
-          if (!borrowed || borrowedSize == 0 || token == 0)
-          {
-            if (token)
-              _sharedInput->ReleaseBorrowed(token);
-            hres_Read = E_FAIL;
-            readWasFinished = true;
-          }
-          else
-          {
-            _borrowToken = token;
-            _state.inBuf = borrowed;
-            _state.inLim = borrowedSize;
-            borrowedInput = true;
-            hres_Read = S_OK;
-          }
-        }
-        else if (borrowRes != S_FALSE)
-        {
-          hres_Read = borrowRes;
-          readWasFinished = true;
-        }
-      }
-      if (!borrowedInput && hres_Read == S_OK)
-      {
-        _state.inBuf = _inBuf;
-        _state.inLim = _inBufSize;
-        hres_Read = ReadStream(inStream, _inBuf, &_state.inLim);
-        if (_state.inLim != _inBufSize || hres_Read != S_OK)
-          readWasFinished = true;
-      }
-#else
       _state.inLim = _inBufSize;
       hres_Read = ReadStream(inStream, _inBuf, &_state.inLim);
+      // _state.inLim -= 5; readWasFinished = True; // for debug
       if (_state.inLim != _inBufSize || hres_Read != S_OK)
       {
-        readWasFinished = true;
+        // hres_Read = 99; // for debug
+        readWasFinished = True;
       }
-#endif
     }
     {
       const size_t inPos_Start = _state.inPos;
@@ -338,15 +181,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
       {
         // we try to flush on aligned positions, if possible
         size = _state.needWrite_Size; // minimal required write size
-        // Borrowed output should normally reach the writer's 1 MiB work-item
-        // size instead of emitting one async WriteFile per 128 KiB Zstd block.
-        // 1 MiB is still a multiple of Zstd's required 128 KiB alignment.
-        size_t effectiveStepMask = (size_t)_outStepMask;
-#if SUP7Z_USE_SHARED_OUTPUT
-        if (sharedOutput && effectiveStepMask < (((size_t)1 << 20) - 1))
-          effectiveStepMask = ((size_t)1 << 20) - 1;
-#endif
-        const size_t alignedPos = _state.winPos & ~effectiveStepMask;
+        const size_t alignedPos = _state.winPos & ~(size_t)_outStepMask;
         if (alignedPos > _state.wrPos)
         {
           const size_t size2 = alignedPos - _state.wrPos;  // optimized aligned size
@@ -367,11 +202,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
           if (curSize)
           {
             // printf("Write wrPos=%8x, size=%8x\n", (unsigned)_state.wrPos, (unsigned)size);
-#if SUP7Z_USE_SHARED_OUTPUT
-            hres = writeOutput(_state.win + _state.wrPos, curSize);
-#else
             hres = WriteStream(outStream, _state.win + _state.wrPos, curSize);
-#endif
             if (hres != S_OK)
               break;
             writtenSize += curSize; // it's real size of data that was written to stream
@@ -431,22 +262,6 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
       }
     }
   }
-#if SUP7Z_USE_SHARED_INPUT
-  if (_borrowToken && _state.inPos == _state.inLim)
-    ReleaseBorrowed();
-#endif
-#if SUP7Z_USE_SHARED_OUTPUT
-  if (sharedOutput)
-  {
-    const HRESULT drainRes = outputLeases.Drain();
-    if (hres == S_OK && drainRes != S_OK)
-      hres = drainRes;
-    _state.sunpackOutputCtx = NULL;
-    _state.sunpackBeforeWindowReuse = NULL;
-    outputGuard.State = NULL;
-    outputGuard.Leases = NULL;
-  }
-#endif
   return hres;
 }
 

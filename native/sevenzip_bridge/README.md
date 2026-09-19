@@ -60,28 +60,6 @@ Builds are incremental and Release-only (`/O2 /Oi /Ot /Gy /Gw /GF` + `/GL` /
 `/LTCG /OPT:REF /OPT:ICF`); the MASM objects carry no C/C++ optimization flags
 by design, since `ml64.exe` has none.
 
-
-### Shared input buffer path
-
-Shared input is a fixed part of the worker architecture. Compatible embedded
-7-Zip decoders borrow immutable spans directly from SunPack's sequential
-prefetch pool; there is no whole-build switch back to the old
-`Read(...)+memcpy` baseline.
-
-The shared path keeps prefetch/decode overlap: a borrowed slot stays immutable
-until the decoder releases its lease, and the pool has one extra slot so the
-producer can refill while the decoder consumes the current span. Capability
-discovery is cached at stream/decoder setup; the hot loop does not repeat
-`QueryInterface`.
-
-Direct-span consumers include the common `CInBuffer` family, LZMA, LZMA2
-single-thread/fallback, XZ single-thread/fallback, Zstd, BZip2, PPMd byte
-streams, and stored/copy data. Decoder-owned buffers remain intentional where
-the input is a mutable algorithm work area or must live across an independent
-multi-thread block pipeline (for example RAR5's padded/compacted bit buffer and
-the native MT block readers). Those cases keep their local copy fallback rather
-than weakening overlap or adding synchronization to force nominal zero-copy.
-
 Release outputs:
 
 ```text

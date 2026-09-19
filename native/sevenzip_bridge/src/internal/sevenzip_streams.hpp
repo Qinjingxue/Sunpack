@@ -4,10 +4,6 @@
 
 #include "sevenzip_sdk.hpp"
 
-#if SUP7Z_USE_SHARED_INPUT
-#include "7zip/Common/SunpackSharedInput.h"
-#endif
-
 #ifdef _WIN32
 
 #include <algorithm>
@@ -64,11 +60,13 @@ namespace sunpack::sevenzip
 
     inline InputPrefetchConfig input_prefetch_config() noexcept
     {
-        // These environment variables tune only the generic production default.
-        // Format-specific policies below intentionally take precedence.
         static const InputPrefetchConfig config = []
         {
             InputPrefetchConfig value;
+            if (const char *enabled = std::getenv("SUNPACK_SEVENZIP_PREFETCH"))
+            {
+                value.enabled = enabled[0] != '0';
+            }
             if (const char *window_kib = std::getenv("SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB"))
             {
                 const unsigned long parsed = std::strtoul(window_kib, nullptr, 10);
@@ -94,6 +92,12 @@ namespace sunpack::sevenzip
         const std::wstring &format_hint,
         bool native_volume_input) noexcept
     {
+        InputPrefetchConfig config = input_prefetch_config();
+        if (!config.enabled || format_hint.empty())
+        {
+            return config;
+        }
+
         std::wstring normalized = format_hint;
         for (wchar_t &character : normalized)
         {
@@ -103,31 +107,13 @@ namespace sunpack::sevenzip
             }
         }
 
-        // Keep the policy deliberately small: only formats with a repeatable
-        // benchmark win override the generic 512 KiB x2 default. Environment
-        // tuning changes that default only; these measured overrides still win.
-        if (normalized == L"zip")
+        if (normalized == L"tar" ||
+            (native_volume_input &&
+             (normalized == L"rar" || normalized == L"rar4" || normalized == L"rar5")))
         {
-            return {true, 128 * 1024, 2};
+            config.enabled = false;
         }
-        if (normalized == L"tar")
-        {
-            return {true, 2048 * 1024, 2};
-        }
-        if (native_volume_input &&
-            (normalized == L"rar" || normalized == L"rar4" || normalized == L"rar5"))
-        {
-            return {true, 256 * 1024, 4};
-        }
-        if (normalized == L"xz")
-        {
-            return {true, 1024 * 1024, 4};
-        }
-        if (normalized == L"tzst" || normalized == L"tar.zst")
-        {
-            return {true, 512 * 1024, 1};
-        }
-        return input_prefetch_config();
+        return config;
     }
 
     // Opened once per file and reused; the handle carries its own file cursor and is owned by exactly one thread that reads sequentially.
@@ -154,9 +140,7 @@ namespace sunpack::sevenzip
         // Win32 error of the failed open, so callers report the real reason.
         DWORD open_error() const noexcept { return open_error_; }
 
-        // Reads directly at the requested offset. Sequential prefetch normally
-        // asks for the next contiguous chunk, so avoid a SetFilePointerEx
-        // syscall when the handle is already at the requested position.
+        // Reads directly at the requested offset; the caller's own position is not part of the contract.
         HRESULT read_at(UInt64 offset, void *data, UInt32 size, UInt32 *processed) noexcept
         {
             if (processed)
@@ -167,28 +151,18 @@ namespace sunpack::sevenzip
             {
                 return HRESULT_FROM_WIN32(open_error_ != ERROR_SUCCESS ? open_error_ : ERROR_INVALID_HANDLE);
             }
-
-            if (!position_valid_ || position_ != offset)
+            LARGE_INTEGER distance{};
+            distance.QuadPart = static_cast<LONGLONG>(offset);
+            if (!SetFilePointerEx(handle_, distance, nullptr, FILE_BEGIN))
             {
-                LARGE_INTEGER distance{};
-                distance.QuadPart = static_cast<LONGLONG>(offset);
-                if (!SetFilePointerEx(handle_, distance, nullptr, FILE_BEGIN))
-                {
-                    position_valid_ = false;
-                    return HRESULT_FROM_WIN32(GetLastError());
-                }
-                position_ = offset;
-                position_valid_ = true;
+                return HRESULT_FROM_WIN32(GetLastError());
             }
-
             DWORD read = 0;
             const BOOL ok = ReadFile(handle_, data, size, &read, nullptr);
             if (!ok)
             {
-                position_valid_ = false;
                 return HRESULT_FROM_WIN32(GetLastError());
             }
-            position_ += read;
             if (processed)
             {
                 *processed = read;
@@ -203,14 +177,11 @@ namespace sunpack::sevenzip
                 CloseHandle(handle_);
                 handle_ = INVALID_HANDLE_VALUE;
             }
-            position_valid_ = false;
         }
 
     private:
         HANDLE handle_ = INVALID_HANDLE_VALUE;
         DWORD open_error_ = ERROR_SUCCESS;
-        UInt64 position_ = 0;
-        bool position_valid_ = true;
     };
 
     // One long lived handle per distinct path, opened on first use; only the owning thread touches a cache, never two at once.
@@ -247,522 +218,6 @@ namespace sunpack::sevenzip
         std::map<std::wstring, std::unique_ptr<PathHandle>> handles_;
     };
 
-#if SUP7Z_USE_SHARED_INPUT
-    class SequentialPrefetcher final
-    {
-    public:
-        using Reader = std::function<HRESULT(UInt64, void *, UInt32, UInt32 *)>;
-
-        struct BorrowedSpan
-        {
-            const unsigned char *data = nullptr;
-            UInt32 size = 0;
-            UInt64 token = 0;
-        };
-
-        SequentialPrefetcher(InputPrefetchConfig config, UInt64 virtual_size, Reader reader)
-            : config_(config), virtual_size_(virtual_size), reader_(std::move(reader))
-        {
-            if (config_.enabled && virtual_size_)
-            {
-                // depth slots reproduce the old queued/ready window. One extra
-                // slot lets the producer refill immediately while the decoder
-                // still owns the current span.
-                slots_.resize(config_.depth + 1);
-                for (auto &slot : slots_)
-                {
-                    slot.bytes = std::make_unique<unsigned char[]>(config_.window_bytes);
-                }
-                worker_ = std::thread(&SequentialPrefetcher::worker_loop, this);
-            }
-            else
-            {
-                config_.enabled = false;
-            }
-        }
-
-        ~SequentialPrefetcher()
-        {
-            {
-                std::lock_guard lock(mutex_);
-                stopping_ = true;
-            }
-            ready_.notify_all();
-            if (worker_.joinable())
-            {
-                worker_.join();
-            }
-        }
-
-        bool enabled() const noexcept { return config_.enabled; }
-
-        // Compatibility path for 7-Zip components that cannot safely borrow
-        // a span. It deliberately retains copy semantics locally.
-        bool consume(UInt64 offset, void *data, UInt32 size, ExtractInputTrace *trace)
-        {
-            if (!config_.enabled || size == 0)
-            {
-                return false;
-            }
-            const bool profiling = trace && read_file_timing_enabled();
-            const auto wait_started = profiling ? std::chrono::steady_clock::now()
-                                                : std::chrono::steady_clock::time_point{};
-            std::unique_lock lock(mutex_);
-            Slot *slot = find_full_slot_locked(offset, size);
-            if (!slot)
-            {
-                if (profiling)
-                {
-                    ++trace->prefetch_miss_count;
-                }
-                return false;
-            }
-            const UInt64 epoch = slot->epoch;
-            while ((slot->state == SlotState::Queued || slot->state == SlotState::Reading) &&
-                   !stopping_ && epoch == epoch_)
-            {
-                ready_.wait(lock);
-                slot = find_full_slot_locked(offset, size);
-                if (!slot)
-                {
-                    if (profiling)
-                    {
-                        ++trace->prefetch_miss_count;
-                        trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-                    }
-                    return false;
-                }
-            }
-            if (slot->state != SlotState::Ready || epoch != epoch_)
-            {
-                if (profiling)
-                {
-                    ++trace->prefetch_miss_count;
-                    trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-                }
-                return false;
-            }
-            std::memcpy(data, slot->bytes.get() + static_cast<std::size_t>(offset - slot->offset), size);
-            if (profiling)
-            {
-                ++trace->prefetch_hit_count;
-                trace->prefetch_copy_bytes += size;
-                trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-            }
-            return true;
-        }
-
-        // Zero-copy fast path. Borrow advances no stream state itself; the
-        // owning FileInStream does that after this succeeds. A slot stays
-        // immutable until ReleaseBorrowed() returns it to the producer.
-        bool borrow(UInt64 offset, UInt32 max_size, BorrowedSpan &span, ExtractInputTrace *trace)
-        {
-            span = {};
-            if (!config_.enabled || max_size == 0)
-            {
-                return false;
-            }
-
-            const bool profiling = trace && read_file_timing_enabled();
-            const auto wait_started = profiling ? std::chrono::steady_clock::now()
-                                                : std::chrono::steady_clock::time_point{};
-            std::unique_lock lock(mutex_);
-            Slot *slot = find_covering_slot_locked(offset);
-            if (!slot)
-            {
-                if (profiling)
-                {
-                    ++trace->prefetch_miss_count;
-                }
-                return false;
-            }
-
-            const UInt64 epoch = slot->epoch;
-            bool waited = false;
-            while ((slot->state == SlotState::Queued || slot->state == SlotState::Reading) &&
-                   !stopping_ && epoch == epoch_)
-            {
-                waited = true;
-                ready_.wait(lock);
-                slot = find_covering_slot_locked(offset);
-                if (!slot)
-                {
-                    if (profiling)
-                    {
-                        ++trace->prefetch_miss_count;
-                        ++trace->input_pool_stall_count;
-                        trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-                    }
-                    return false;
-                }
-            }
-
-            if (slot->state != SlotState::Ready || slot->epoch != epoch_)
-            {
-                if (profiling)
-                {
-                    ++trace->prefetch_miss_count;
-                    if (waited)
-                    {
-                        ++trace->input_pool_stall_count;
-                    }
-                    trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-                }
-                return false;
-            }
-
-            const UInt32 within = static_cast<UInt32>(offset - slot->offset);
-            const UInt32 available = slot->size - within;
-            const UInt32 borrowed = std::min(max_size, available);
-            UInt64 token = ++next_lease_token_;
-            if (token == 0)
-            {
-                token = ++next_lease_token_;
-            }
-
-            slot->state = SlotState::Leased;
-            slot->lease_token = token;
-            slot->lease_end = offset + borrowed;
-
-            span.data = slot->bytes.get() + within;
-            span.size = borrowed;
-            span.token = token;
-
-            // While the decoder owns this block, immediately schedule the slot
-            // that the old memcpy path would have made available after copying.
-            schedule_locked();
-            ready_.notify_all();
-
-            if (profiling)
-            {
-                ++trace->prefetch_hit_count;
-                ++trace->input_borrow_count;
-                trace->input_borrow_bytes += borrowed;
-                if (waited)
-                {
-                    ++trace->input_pool_stall_count;
-                }
-                trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-                std::size_t leased = 0;
-                for (const auto &candidate : slots_)
-                {
-                    if (candidate.state == SlotState::Leased)
-                    {
-                        ++leased;
-                    }
-                }
-                trace->input_pool_peak_leased =
-                    std::max<unsigned long long>(trace->input_pool_peak_leased, leased);
-            }
-            return true;
-        }
-
-        void release_borrowed(UInt64 token)
-        {
-            if (!config_.enabled || token == 0)
-            {
-                return;
-            }
-            std::lock_guard lock(mutex_);
-            for (auto &slot : slots_)
-            {
-                if (slot.state != SlotState::Leased || slot.lease_token != token)
-                {
-                    continue;
-                }
-
-                slot.lease_token = 0;
-                const bool stale = slot.epoch != epoch_ || slot.discard;
-                const bool fully_consumed = slot.lease_end >= slot.offset + slot.size;
-                slot.lease_end = 0;
-                slot.discard = false;
-
-                if (!stale && !fully_consumed)
-                {
-                    // The slot is still live and no capacity was freed.
-                    // schedule_locked() cannot queue anything here, and the
-                    // worker only waits for Queued slots, so notification is
-                    // unnecessary on this common partial-consume path.
-                    slot.state = SlotState::Ready;
-                    return;
-                }
-
-                slot.state = SlotState::Free;
-                schedule_locked();
-                ready_.notify_all();
-                return;
-            }
-        }
-
-        void after_sync_read(UInt64 end)
-        {
-            if (!config_.enabled || end > virtual_size_)
-            {
-                return;
-            }
-            std::lock_guard lock(mutex_);
-            retire_before_locked(end);
-            if (next_offset_ < end)
-            {
-                next_offset_ = end;
-            }
-            active_ = true;
-            schedule_locked();
-            ready_.notify_all();
-        }
-
-        void after_cached_read(UInt64 end)
-        {
-            if (!config_.enabled)
-            {
-                return;
-            }
-            std::lock_guard lock(mutex_);
-            retire_before_locked(end);
-            schedule_locked();
-            ready_.notify_all();
-        }
-
-        void invalidate(UInt64 next, ExtractInputTrace *trace)
-        {
-            if (!config_.enabled)
-            {
-                return;
-            }
-            std::lock_guard lock(mutex_);
-            bool had_live_slot = false;
-            for (auto &slot : slots_)
-            {
-                if (slot.state == SlotState::Free)
-                {
-                    continue;
-                }
-                had_live_slot = true;
-                if (slot.state == SlotState::Reading || slot.state == SlotState::Leased)
-                {
-                    slot.discard = true;
-                }
-                else
-                {
-                    reset_slot_locked(slot);
-                }
-            }
-            if (had_live_slot && trace && read_file_timing_enabled())
-            {
-                ++trace->prefetch_invalidation_count;
-            }
-            ++epoch_;
-            next_offset_ = next;
-            active_ = false;
-            ready_.notify_all();
-        }
-
-    private:
-        enum class SlotState : unsigned char
-        {
-            Free,
-            Queued,
-            Reading,
-            Ready,
-            Leased,
-            Failed
-        };
-
-        struct Slot
-        {
-            std::unique_ptr<unsigned char[]> bytes;
-            UInt64 epoch = 0;
-            UInt64 offset = 0;
-            UInt64 lease_token = 0;
-            UInt64 lease_end = 0;
-            UInt32 size = 0;
-            SlotState state = SlotState::Free;
-            bool discard = false;
-        };
-
-        static unsigned long long elapsed_ns(std::chrono::steady_clock::time_point started) noexcept
-        {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                     std::chrono::steady_clock::now() - started)
-                                     .count();
-            return elapsed > 0 ? static_cast<unsigned long long>(elapsed) : 0ULL;
-        }
-
-        Slot *find_covering_slot_locked(UInt64 offset) noexcept
-        {
-            for (auto &slot : slots_)
-            {
-                if (slot.epoch == epoch_ &&
-                    slot.state != SlotState::Free &&
-                    slot.offset <= offset &&
-                    offset - slot.offset < slot.size)
-                {
-                    return &slot;
-                }
-            }
-            return nullptr;
-        }
-
-        Slot *find_full_slot_locked(UInt64 offset, UInt32 size) noexcept
-        {
-            Slot *slot = find_covering_slot_locked(offset);
-            if (!slot)
-            {
-                return nullptr;
-            }
-            const UInt64 within = offset - slot->offset;
-            return within <= slot->size && size <= slot->size - within ? slot : nullptr;
-        }
-
-        void reset_slot_locked(Slot &slot) noexcept
-        {
-            slot.epoch = 0;
-            slot.offset = 0;
-            slot.lease_token = 0;
-            slot.lease_end = 0;
-            slot.size = 0;
-            slot.state = SlotState::Free;
-            slot.discard = false;
-        }
-
-        void retire_before_locked(UInt64 end) noexcept
-        {
-            for (auto &slot : slots_)
-            {
-                if (slot.epoch != epoch_ || slot.state == SlotState::Free)
-                {
-                    continue;
-                }
-                if (slot.offset + slot.size > end)
-                {
-                    continue;
-                }
-                if (slot.state == SlotState::Reading || slot.state == SlotState::Leased)
-                {
-                    slot.discard = true;
-                }
-                else
-                {
-                    reset_slot_locked(slot);
-                }
-            }
-        }
-
-        void schedule_locked()
-        {
-            if (!active_)
-            {
-                return;
-            }
-
-            std::size_t live = 0;
-            bool has_leased = false;
-            for (const auto &slot : slots_)
-            {
-                if (slot.epoch == epoch_ && slot.state != SlotState::Free)
-                {
-                    ++live;
-                    has_leased = has_leased || slot.state == SlotState::Leased;
-                }
-            }
-
-            const std::size_t target =
-                std::min(slots_.size(), config_.depth + (has_leased ? 1u : 0u));
-
-            while (live < target && next_offset_ < virtual_size_)
-            {
-                auto free_slot = std::find_if(slots_.begin(), slots_.end(), [](const Slot &slot)
-                                              { return slot.state == SlotState::Free; });
-                if (free_slot == slots_.end())
-                {
-                    return;
-                }
-
-                const UInt64 remaining = virtual_size_ - next_offset_;
-                free_slot->epoch = epoch_;
-                free_slot->offset = next_offset_;
-                free_slot->size = static_cast<UInt32>(
-                    std::min<UInt64>(remaining, config_.window_bytes));
-                free_slot->lease_token = 0;
-                free_slot->lease_end = 0;
-                free_slot->discard = false;
-                free_slot->state = SlotState::Queued;
-                next_offset_ += free_slot->size;
-                ++live;
-            }
-        }
-
-        void worker_loop()
-        {
-            for (;;)
-            {
-                Slot *slot = nullptr;
-                UInt64 epoch = 0;
-                UInt64 offset = 0;
-                UInt32 size = 0;
-                unsigned char *destination = nullptr;
-                {
-                    std::unique_lock lock(mutex_);
-                    ready_.wait(lock, [this]
-                                {
-                                    return stopping_ ||
-                                           std::any_of(slots_.begin(), slots_.end(), [](const Slot &candidate)
-                                                       { return candidate.state == SlotState::Queued; });
-                                });
-                    if (stopping_)
-                    {
-                        return;
-                    }
-
-                    auto queued = std::find_if(slots_.begin(), slots_.end(), [](const Slot &candidate)
-                                               { return candidate.state == SlotState::Queued; });
-                    slot = &*queued;
-                    epoch = slot->epoch;
-                    offset = slot->offset;
-                    size = slot->size;
-                    destination = slot->bytes.get();
-                    slot->state = SlotState::Reading;
-                }
-
-                UInt32 read = 0;
-                const HRESULT result = reader_(offset, destination, size, &read);
-
-                {
-                    std::lock_guard lock(mutex_);
-                    if (slot->state != SlotState::Reading ||
-                        slot->epoch != epoch ||
-                        slot->discard ||
-                        epoch != epoch_)
-                    {
-                        reset_slot_locked(*slot);
-                    }
-                    else
-                    {
-                        slot->state = (result == S_OK && read == size)
-                                          ? SlotState::Ready
-                                          : SlotState::Failed;
-                    }
-                    schedule_locked();
-                }
-                ready_.notify_all();
-            }
-        }
-
-        InputPrefetchConfig config_;
-        UInt64 virtual_size_ = 0;
-        Reader reader_;
-        std::mutex mutex_;
-        std::condition_variable ready_;
-        std::thread worker_;
-        std::vector<Slot> slots_;
-        UInt64 epoch_ = 0;
-        UInt64 next_offset_ = 0;
-        UInt64 next_lease_token_ = 0;
-        bool active_ = false;
-        bool stopping_ = false;
-    };
-
-#else
     class SequentialPrefetcher final
     {
     public:
@@ -1004,8 +459,6 @@ namespace sunpack::sevenzip
         bool stopping_ = false;
     };
 
-#endif
-
     class ReadFileWallTimer final
     {
     public:
@@ -1084,15 +537,8 @@ namespace sunpack::sevenzip
     }
 
     class FileInStream final : public CMyUnknownImp, public IInStream
-#if SUP7Z_USE_SHARED_INPUT
-        , public ISunpackSharedInput
-#endif
     {
-#if SUP7Z_USE_SHARED_INPUT
-        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, ISunpackSharedInput)
-#else
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
-#endif
         
 
     public:
@@ -1219,9 +665,6 @@ namespace sunpack::sevenzip
                     }
                     return hr;
                 }
-#if SUP7Z_USE_SHARED_INPUT
-                fallback_handle_needs_seek_ = false;
-#endif
                 record_logical_read(trace_, read_start, size);
                 prefetch_->after_cached_read(position_);
                 if (trace_)
@@ -1244,26 +687,6 @@ namespace sunpack::sevenzip
 
             BOOL ok = FALSE;
             DWORD error = ERROR_SUCCESS;
-#if SUP7Z_USE_SHARED_INPUT
-            if (fallback_handle_needs_seek_)
-            {
-                LARGE_INTEGER target{};
-                target.QuadPart = static_cast<LONGLONG>(position_);
-                if (!SetFilePointerEx(handle_, target, nullptr, FILE_BEGIN))
-                {
-                    error = GetLastError();
-                    const HRESULT hr = HRESULT_FROM_WIN32(error);
-                    if (trace_)
-                    {
-                        trace_->read_error = true;
-                        trace_->last_hresult = hr;
-                        trace_->last_win32_error = static_cast<int>(error);
-                    }
-                    return hr;
-                }
-                fallback_handle_needs_seek_ = false;
-            }
-#endif
             {
                 ReadFileWallTimer timer(trace_);
                 ok = ReadFile(handle_, data, size, &read, nullptr);
@@ -1324,93 +747,8 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-#if SUP7Z_USE_SHARED_INPUT
-        HRESULT STDMETHODCALLTYPE Borrow(
-            UInt32 maxSize,
-            const Byte **data,
-            UInt32 *borrowedSize,
-            UInt64 *token) SUP7Z_NOEXCEPT override
-        {
-            if (!data || !borrowedSize || !token)
-            {
-                return E_INVALIDARG;
-            }
-            *data = nullptr;
-            *borrowedSize = 0;
-            *token = 0;
-            if (!prefetch_ || maxSize == 0)
-            {
-                return S_FALSE;
-            }
-
-            const UInt64 read_start = position_;
-            SequentialPrefetcher::BorrowedSpan span;
-            if (!prefetch_->borrow(position_, maxSize, span, trace_))
-            {
-                return S_FALSE;
-            }
-
-            position_ += span.size;
-            // Do not synchronize the fallback file handle on every borrowed
-            // span. The hot zero-copy path never reads from that handle, so a
-            // SetFilePointerEx here would add one syscall per 256-512 KiB.
-            // Seek lazily only if a later prefetch miss needs synchronous I/O.
-            fallback_handle_needs_seek_ = true;
-            record_logical_read(trace_, read_start, span.size);
-            if (trace_)
-            {
-                trace_->position = position_;
-                trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
-                trace_->total_bytes_returned += span.size;
-                trace_->last_read_virtual_offset = read_start;
-                trace_->last_read_source_offset = read_start;
-                trace_->last_read_requested = maxSize;
-                trace_->last_read_returned = span.size;
-                trace_->last_source_path = path_;
-                trace_->last_range_index = 0;
-                trace_->last_hresult = S_OK;
-                trace_->last_win32_error = 0;
-            }
-            *data = span.data;
-            *borrowedSize = span.size;
-            *token = span.token;
-            return S_OK;
-        }
-
-        HRESULT STDMETHODCALLTYPE ReleaseBorrowed(UInt64 token) SUP7Z_NOEXCEPT override
-        {
-            if (prefetch_)
-            {
-                prefetch_->release_borrowed(token);
-            }
-            return S_OK;
-        }
-#endif
-
         HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
-#if SUP7Z_USE_SHARED_INPUT
-            // FILE_BEGIN / FILE_END are absolute with respect to current file
-            // position, so a stale fallback handle can be overwritten directly.
-            // Only FILE_CURRENT needs the handle synchronized first.
-            if (fallback_handle_needs_seek_ && seekOrigin == FILE_CURRENT)
-            {
-                LARGE_INTEGER logical_position{};
-                logical_position.QuadPart = static_cast<LONGLONG>(position_);
-                if (!SetFilePointerEx(handle_, logical_position, nullptr, FILE_BEGIN))
-                {
-                    const DWORD error = GetLastError();
-                    const HRESULT hr = HRESULT_FROM_WIN32(error);
-                    if (trace_)
-                    {
-                        trace_->last_hresult = hr;
-                        trace_->last_win32_error = static_cast<int>(error);
-                    }
-                    return hr;
-                }
-                fallback_handle_needs_seek_ = false;
-            }
-#endif
 
             LARGE_INTEGER distance{};
 
@@ -1442,9 +780,6 @@ namespace sunpack::sevenzip
 
             const UInt64 prior_position = position_;
             position_ = static_cast<UInt64>(new_pos.QuadPart);
-#if SUP7Z_USE_SHARED_INPUT
-            fallback_handle_needs_seek_ = false;
-#endif
 
             record_logical_seek(trace_, prior_position, position_);
 
@@ -1492,10 +827,6 @@ namespace sunpack::sevenzip
 
         UInt64 size_ = 0;
 
-#if SUP7Z_USE_SHARED_INPUT
-        bool fallback_handle_needs_seek_ = false;
-#endif
-
         // Declared before the prefetcher so it outlives the prefetch thread.
         std::unique_ptr<PathHandle> prefetch_reader_;
 
@@ -1503,15 +834,8 @@ namespace sunpack::sevenzip
     };
 
     class MultiFileInStream final : public CMyUnknownImp, public IInStream
-#if SUP7Z_USE_SHARED_INPUT
-        , public ISunpackSharedInput
-#endif
     {
-#if SUP7Z_USE_SHARED_INPUT
-        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, ISunpackSharedInput)
-#else
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
-#endif
         
 
     public:
@@ -1796,66 +1120,6 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-#if SUP7Z_USE_SHARED_INPUT
-        HRESULT STDMETHODCALLTYPE Borrow(
-            UInt32 maxSize,
-            const Byte **data,
-            UInt32 *borrowedSize,
-            UInt64 *token) SUP7Z_NOEXCEPT override
-        {
-            if (!data || !borrowedSize || !token)
-            {
-                return E_INVALIDARG;
-            }
-            *data = nullptr;
-            *borrowedSize = 0;
-            *token = 0;
-            if (!valid_ || !prefetch_ || maxSize == 0)
-            {
-                return S_FALSE;
-            }
-
-            const UInt64 read_start = position_;
-            SequentialPrefetcher::BorrowedSpan span;
-            if (!prefetch_->borrow(position_, maxSize, span, trace_))
-            {
-                return S_FALSE;
-            }
-
-            position_ += span.size;
-            record_logical_read(trace_, read_start, span.size);
-            if (trace_)
-            {
-                const std::size_t index = find_part_index(read_start);
-                trace_->position = position_;
-                trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
-                trace_->total_bytes_returned += span.size;
-                trace_->last_read_virtual_offset = read_start;
-                trace_->last_read_source_offset =
-                    index < offsets_.size() ? read_start - offsets_[index] : 0;
-                trace_->last_read_requested = maxSize;
-                trace_->last_read_returned = span.size;
-                trace_->last_source_path = index < paths_.size() ? paths_[index] : L"";
-                trace_->last_range_index = static_cast<UInt32>(index);
-                trace_->last_hresult = S_OK;
-                trace_->last_win32_error = 0;
-            }
-            *data = span.data;
-            *borrowedSize = span.size;
-            *token = span.token;
-            return S_OK;
-        }
-
-        HRESULT STDMETHODCALLTYPE ReleaseBorrowed(UInt64 token) SUP7Z_NOEXCEPT override
-        {
-            if (prefetch_)
-            {
-                prefetch_->release_borrowed(token);
-            }
-            return S_OK;
-        }
-#endif
-
         HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
 
@@ -2056,15 +1320,8 @@ namespace sunpack::sevenzip
     };
 
     class MultiRangeInStream final : public CMyUnknownImp, public IInStream
-#if SUP7Z_USE_SHARED_INPUT
-        , public ISunpackSharedInput
-#endif
     {
-#if SUP7Z_USE_SHARED_INPUT
-        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, ISunpackSharedInput)
-#else
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
-#endif
         
 
     public:
@@ -2378,70 +1635,6 @@ namespace sunpack::sevenzip
 
             return S_OK;
         }
-
-#if SUP7Z_USE_SHARED_INPUT
-        HRESULT STDMETHODCALLTYPE Borrow(
-            UInt32 maxSize,
-            const Byte **data,
-            UInt32 *borrowedSize,
-            UInt64 *token) SUP7Z_NOEXCEPT override
-        {
-            if (!data || !borrowedSize || !token)
-            {
-                return E_INVALIDARG;
-            }
-            *data = nullptr;
-            *borrowedSize = 0;
-            *token = 0;
-            if (!valid_ || !prefetch_ || maxSize == 0)
-            {
-                return S_FALSE;
-            }
-
-            const UInt64 read_start = position_;
-            SequentialPrefetcher::BorrowedSpan span;
-            if (!prefetch_->borrow(position_, maxSize, span, trace_))
-            {
-                return S_FALSE;
-            }
-
-            position_ += span.size;
-            record_logical_read(trace_, read_start, span.size);
-            if (trace_)
-            {
-                const std::size_t index = find_range_index(read_start);
-                trace_->position = position_;
-                trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
-                trace_->total_bytes_returned += span.size;
-                trace_->last_read_virtual_offset = read_start;
-                trace_->last_read_requested = maxSize;
-                trace_->last_read_returned = span.size;
-                if (index < ranges_.size())
-                {
-                    const auto &range = ranges_[index];
-                    trace_->last_read_source_offset =
-                        range.start + (read_start - range.virtual_offset);
-                    trace_->last_source_path = range.path;
-                }
-                trace_->last_range_index = static_cast<UInt32>(index);
-                trace_->last_hresult = S_OK;
-                trace_->last_win32_error = 0;
-            }
-            *data = span.data;
-            *borrowedSize = span.size;
-            *token = span.token;
-            return S_OK;
-        }
-
-        HRESULT STDMETHODCALLTYPE ReleaseBorrowed(UInt64 token) SUP7Z_NOEXCEPT override
-        {
-            if (prefetch_)
-            {
-                prefetch_->release_borrowed(token);
-            }
-            return S_OK;
-        }
-#endif
 
         HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {

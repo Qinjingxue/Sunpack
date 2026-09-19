@@ -843,6 +843,78 @@ def test_worker_dry_run_hashes_output_when_source_crc_is_missing(tmp_path):
     assert item["crc_verified"] is True
 
 
+@pytest.mark.parametrize(
+    ("format_hint", "prefetch_enabled"),
+    [("tar", False), ("", True)],
+)
+def test_worker_applies_format_aware_prefetch_policy(tmp_path, format_hint, prefetch_enabled):
+    worker = _require_worker_or_skip()
+    source = tmp_path / "payload.bin"
+    source.write_bytes(b"prefetch policy payload")
+    archive = tmp_path / "payload.tar"
+    with tarfile.open(archive, "w") as handle:
+        handle.add(source, arcname=source.name)
+
+    environment = os.environ.copy()
+    environment["SUNPACK_SEVENZIP_PROFILE_READS"] = "1"
+    environment["SUNPACK_SEVENZIP_PREFETCH"] = "1"
+    result = subprocess.run(
+        [worker],
+        input=json.dumps({
+            "job_id": f"prefetch-policy-{format_hint or 'empty'}",
+            "archive_path": str(archive),
+            "output_dir": str(tmp_path / "out"),
+            "format_hint": format_hint,
+            "dry_run": True,
+        }),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    worker_result = _worker_result(result.stdout)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert worker_result["input_trace"]["prefetch_enabled"] is prefetch_enabled
+
+
+def test_worker_disables_prefetch_for_native_rar_volumes(tmp_path):
+    worker = _require_worker_or_skip()
+    first = tmp_path / "archive.part1.rar"
+    second = tmp_path / "archive.part2.rar"
+    first.write_bytes(b"Rar!\x1a\x07\x01\x00")
+    second.write_bytes(b"not a complete volume")
+    environment = os.environ.copy()
+    environment["SUNPACK_SEVENZIP_PROFILE_READS"] = "1"
+    environment["SUNPACK_SEVENZIP_PREFETCH"] = "1"
+    result = subprocess.run(
+        [worker],
+        input=json.dumps({
+            "job_id": "native-rar-prefetch-policy",
+            "archive_path": str(first),
+            "output_dir": str(tmp_path / "out"),
+            "format_hint": "rar",
+            "archive_input": {
+                "entry_path": str(first),
+                "open_mode": "native_volumes",
+                "format_hint": "rar",
+                "parts": [
+                    {"path": str(first), "volume_number": 1, "canonical_name": first.name},
+                    {"path": str(second), "volume_number": 2, "canonical_name": second.name},
+                ],
+            },
+        }),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        env=environment,
+    )
+    worker_result = _worker_result(result.stdout)
+
+    assert result.returncode != 0
+    assert worker_result["input_trace"]["prefetch_enabled"] is False
+
+
 def test_worker_omits_input_profile_without_opt_in(tmp_path):
     worker = _require_worker_or_skip()
     archive, _ = _create_7z(tmp_path, "profile-disabled", "profile disabled payload")

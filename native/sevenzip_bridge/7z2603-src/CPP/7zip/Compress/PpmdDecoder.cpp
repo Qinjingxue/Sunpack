@@ -6,9 +6,6 @@
 #include "../../../C/CpuArch.h"
 
 #include "../Common/StreamUtils.h"
-#if SUP7Z_USE_SHARED_OUTPUT
-#include "../Common/SunpackSharedOutput.h"
-#endif
 
 #include "PpmdDecoder.h"
 
@@ -136,69 +133,22 @@ HRESULT CDecoder::CodeSpec(Byte *memStream, UInt32 size)
 Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream *outStream,
     const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
-#if SUP7Z_USE_SHARED_OUTPUT
-  CMyComPtr<ISunpackSharedOutput> sharedOutput;
-  if (outStream)
-    outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&sharedOutput);
-#endif
-
-  _inStream.SetStream(inStream);
+  if (!_outBuf)
+  {
+    _outBuf = (Byte *)::MidAlloc(kBufSize);
+    if (!_outBuf)
+      return E_OUTOFMEMORY;
+  }
+  
+  _inStream.Stream = inStream;
   SetOutStreamSize(outSize);
 
   do
   {
-    Byte *output = NULL;
-    UInt32 outputCapacity = kBufSize;
-#if SUP7Z_USE_SHARED_OUTPUT
-    UInt64 outputToken = 0;
-    if (sharedOutput)
-    {
-      const HRESULT acquireRes = sharedOutput->Acquire(
-          1u << 20, &output, &outputCapacity, &outputToken);
-      if (acquireRes != S_OK && acquireRes != S_FALSE)
-        return acquireRes;
-      if (acquireRes == S_FALSE)
-      {
-        output = NULL;
-        outputCapacity = kBufSize;
-        outputToken = 0;
-      }
-      else if (!output || outputCapacity == 0 || outputToken == 0)
-        return E_FAIL;
-    }
-#endif
-    if (!output)
-    {
-      if (!_outBuf)
-      {
-        _outBuf = (Byte *)::MidAlloc(kBufSize);
-        if (!_outBuf)
-          return E_OUTOFMEMORY;
-      }
-      output = _outBuf;
-      outputCapacity = kBufSize;
-    }
-
     const UInt64 startPos = _processedSize;
-    const HRESULT res = CodeSpec(output, outputCapacity);
-    const UInt32 processed = (UInt32)(_processedSize - startPos);
-#if SUP7Z_USE_SHARED_OUTPUT
-    if (outputToken)
-    {
-      UInt32 committed = 0;
-      const HRESULT writeRes = sharedOutput->Commit(
-          outputToken, processed, &committed);
-      if (writeRes != S_OK)
-        return writeRes;
-      if (committed != processed)
-        return E_FAIL;
-    }
-    else
-#endif
-    {
-      RINOK(WriteStream(outStream, output, processed))
-    }
-
+    const HRESULT res = CodeSpec(_outBuf, kBufSize);
+    const size_t processed = (size_t)(_processedSize - startPos);
+    RINOK(WriteStream(outStream, _outBuf, processed))
     RINOK(res)
     if (_status == kStatus_Finished_With_Mark)
       break;
@@ -245,7 +195,7 @@ Z7_COM7F_IMF(CDecoder::GetInStreamProcessedSize(UInt64 *value))
 Z7_COM7F_IMF(CDecoder::SetInStream(ISequentialInStream *inStream))
 {
   InSeqStream = inStream;
-  _inStream.SetStream(inStream);
+  _inStream.Stream = inStream;
   return S_OK;
 }
 

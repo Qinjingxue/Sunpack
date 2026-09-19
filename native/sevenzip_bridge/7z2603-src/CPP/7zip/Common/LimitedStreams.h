@@ -9,46 +9,18 @@
 #include "../IStream.h"
 
 #include "StreamUtils.h"
-#if SUP7Z_USE_SHARED_INPUT
-#include "SunpackSharedInput.h"
-#endif
 
-#if SUP7Z_USE_SHARED_INPUT
-Z7_CLASS_IMP_COM_2(
-  CLimitedSequentialInStream
-  , ISequentialInStream
-  , ISunpackSharedInput
-)
-#else
 Z7_CLASS_IMP_COM_1(
   CLimitedSequentialInStream
   , ISequentialInStream
 )
-#endif
   bool _wasFinished;
   CMyComPtr<ISequentialInStream> _stream;
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> _sharedInput;
-#endif
   UInt64 _size;
   UInt64 _pos;
 public:
-  void SetStream(ISequentialInStream *stream)
-  {
-    _stream = stream;
-#if SUP7Z_USE_SHARED_INPUT
-    _sharedInput.Release();
-    if (stream)
-      stream->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
-#endif
-  }
-  void ReleaseStream()
-  {
-#if SUP7Z_USE_SHARED_INPUT
-    _sharedInput.Release();
-#endif
-    _stream.Release();
-  }
+  void SetStream(ISequentialInStream *stream) { _stream = stream; }
+  void ReleaseStream() { _stream.Release(); }
   void Init(UInt64 streamSize)
   {
     _wasFinished = false;

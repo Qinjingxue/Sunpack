@@ -76,9 +76,6 @@ CDecoder::CDecoder():
 
 CDecoder::~CDecoder()
 {
-#if SUP7Z_USE_SHARED_OUTPUT
-  _outputLeases.Drain();
-#endif
   InitFilters();
   ::MidFree(_vmData);
   ::MidFree(_window);
@@ -105,75 +102,8 @@ HRESULT CDecoder::WriteData(const Byte *data, UInt32 size)
   return res;
 }
 
-#if SUP7Z_USE_SHARED_OUTPUT
-HRESULT CDecoder::DrainOutputLeases()
-{
-  return _outputLeases.Drain();
-}
-
-HRESULT CDecoder::WriteWindowData(const Byte *data, UInt32 size)
-{
-  if (!_sharedOutput)
-    return WriteData(data, size);
-
-  UInt32 outputSize = size;
-  if (_writtenFileSize < _unpackSize)
-  {
-    UInt64 remain = _unpackSize - _writtenFileSize;
-    if (remain < outputSize)
-      outputSize = (UInt32)remain;
-  }
-  else
-    outputSize = 0;
-
-  const UInt32 logicalSize = size;
-  while (outputSize != 0)
-  {
-    UInt32 accepted = 0;
-    UInt64 token = 0;
-    HRESULT res = S_FALSE;
-    for (;;)
-    {
-      res = _sharedOutput->SubmitBorrowed(
-          data, outputSize, &accepted, &token);
-      if (res != S_FALSE || _outputLeases.Empty())
-        break;
-      RINOK(_outputLeases.RetireOne())
-      accepted = 0;
-      token = 0;
-    }
-
-    if (res == S_FALSE)
-    {
-      RINOK(WriteStream(_outStream, data, outputSize))
-      data += outputSize;
-      outputSize = 0;
-      break;
-    }
-    RINOK(res)
-    if (accepted == 0 || accepted > outputSize || token == 0)
-      return E_FAIL;
-    RINOK(_outputLeases.Push(token))
-    data += accepted;
-    outputSize -= accepted;
-  }
-
-  _writtenFileSize += logicalSize;
-  return S_OK;
-}
-#endif
-
 HRESULT CDecoder::WriteArea(UInt32 startPtr, UInt32 endPtr)
 {
-#if SUP7Z_USE_SHARED_OUTPUT
-  if (_sharedOutput)
-  {
-    if (startPtr <= endPtr)
-      return WriteWindowData(_window + startPtr, endPtr - startPtr);
-    RINOK(WriteWindowData(_window + startPtr, kWindowSize - startPtr))
-    return WriteWindowData(_window, endPtr);
-  }
-#endif
   if (startPtr <= endPtr)
     return WriteData(_window + startPtr, endPtr - startPtr);
   RINOK(WriteData(_window + startPtr, kWindowSize - startPtr))
@@ -516,9 +446,6 @@ HRESULT CDecoder::DecodePPM(Int32 num, bool &keepDecompressing)
   {
     if (((_wrPtr - _winPos) & kWindowMask) < 260 && _wrPtr != _winPos)
     {
-#if SUP7Z_USE_SHARED_OUTPUT
-      RINOK(DrainOutputLeases())
-#endif
       RINOK(WriteBuf())
       if (_writtenFileSize > _unpackSize)
       {
@@ -744,9 +671,6 @@ HRESULT CDecoder::DecodeLZ(bool &keepDecompressing)
   {
     if (((_wrPtr - _winPos) & kWindowMask) < 260 && _wrPtr != _winPos)
     {
-#if SUP7Z_USE_SHARED_OUTPUT
-      RINOK(DrainOutputLeases())
-#endif
       RINOK(WriteBuf())
       if (_writtenFileSize > _unpackSize)
       {
@@ -946,16 +870,7 @@ HRESULT CDecoder::CodeReal(ICompressProgressInfo *progress)
 
   _solidAllowed = true;
 
-  {
-    const HRESULT writeRes = WriteBuf();
-#if SUP7Z_USE_SHARED_OUTPUT
-    const HRESULT drainRes = DrainOutputLeases();
-    RINOK(writeRes)
-    RINOK(drainRes)
-#else
-    RINOK(writeRes)
-#endif
-  }
+  RINOK(WriteBuf())
   const UInt64 packSize = m_InBitStream.BitDecoder.GetProcessedSize();
   RINOK(progress->SetRatioInfo(&packSize, &_writtenFileSize))
   if (_writtenFileSize < _unpackSize)
@@ -970,14 +885,6 @@ HRESULT CDecoder::CodeReal(ICompressProgressInfo *progress)
 Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream *outStream,
     const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
-#if SUP7Z_USE_SHARED_OUTPUT
-  {
-    const HRESULT priorRes = DrainOutputLeases();
-    _sharedOutput.Release();
-    if (priorRes != S_OK)
-      return priorRes;
-  }
-#endif
   try
   {
     if (!inSize)
@@ -1010,42 +917,13 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     m_InBitStream.BitDecoder.SetStream(inStream);
     m_InBitStream.BitDecoder.Init();
     _outStream = outStream;
-#if SUP7Z_USE_SHARED_OUTPUT
-    if (outStream)
-      outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&_sharedOutput);
-#endif
    
     // CCoderReleaser coderReleaser(this);
     _unpackSize = outSize ? *outSize : (UInt64)(Int64)-1;
-    HRESULT res = CodeReal(progress);
-#if SUP7Z_USE_SHARED_OUTPUT
-    {
-      const HRESULT drainRes = DrainOutputLeases();
-      _sharedOutput.Release();
-      if (res == S_OK)
-        res = drainRes;
-    }
-#endif
-    return res;
+    return CodeReal(progress);
   }
-  catch(const CInBufferException &e)
-  {
-#if SUP7Z_USE_SHARED_OUTPUT
-    DrainOutputLeases();
-    _sharedOutput.Release();
-#endif
-    /* _errorMode = true; */
-    return e.ErrorCode;
-  }
-  catch(...)
-  {
-#if SUP7Z_USE_SHARED_OUTPUT
-    DrainOutputLeases();
-    _sharedOutput.Release();
-#endif
-    /* _errorMode = true; */
-    return S_FALSE;
-  }
+  catch(const CInBufferException &e)  { /* _errorMode = true; */ return e.ErrorCode; }
+  catch(...) { /* _errorMode = true; */ return S_FALSE; }
   // CNewException is possible here. But probably CNewException is caused
   // by error in data stream.
 }

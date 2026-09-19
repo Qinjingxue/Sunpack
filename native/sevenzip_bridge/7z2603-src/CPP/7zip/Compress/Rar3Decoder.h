@@ -14,9 +14,6 @@
 #include "../ICoder.h"
 
 #include "../Common/InBuffer.h"
-#if SUP7Z_USE_SHARED_OUTPUT
-#include "../Common/SunpackSharedOutput.h"
-#endif
 
 #include "BitmDecoder.h"
 #include "HuffmanDecoder.h"
@@ -187,10 +184,6 @@ Z7_CLASS_IMP_NOQIB_2(
   UInt64 _unpackSize;
   UInt64 _writtenFileSize; // if it's > _unpackSize, then _unpackSize only written
   ISequentialOutStream *_outStream;
-#if SUP7Z_USE_SHARED_OUTPUT
-  CMyComPtr<ISunpackSharedOutput> _sharedOutput;
-  CSunpackSharedOutputLeaseRing<8> _outputLeases;
-#endif
 
   NHuffman::CDecoder<kNumHuffmanBits, kMainTableSize, 9> m_MainDecoder;
   UInt32 kDistStart[kDistTableSize];
@@ -223,10 +216,6 @@ Z7_CLASS_IMP_NOQIB_2(
   
   HRESULT WriteDataToStream(const Byte *data, UInt32 size);
   HRESULT WriteData(const Byte *data, UInt32 size);
-#if SUP7Z_USE_SHARED_OUTPUT
-  HRESULT WriteWindowData(const Byte *data, UInt32 size);
-  HRESULT DrainOutputLeases();
-#endif
   HRESULT WriteArea(UInt32 startPtr, UInt32 endPtr);
   void ExecuteFilter(unsigned tempFilterIndex, NVm::CBlockRef &outBlockRef);
   HRESULT WriteBuf();

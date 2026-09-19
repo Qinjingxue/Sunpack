@@ -169,28 +169,9 @@ HRESULT CCoder::CodeSpec(UInt32 curSize, bool finishInputStream, UInt32 inputPro
   
   if (_remainLen == kLenIdNeedInit)
   {
-#if SUP7Z_USE_SHARED_OUTPUT
-    const UInt32 kSharedRingSize = (UInt32)4 << 20;
-    const UInt32 kSharedChunkSize = (UInt32)1 << 20;
-    UInt32 outWindowSize = _deflate64Mode ? kHistorySize64 : kHistorySize32;
-    UInt32 sharedChunkSize = 0;
-    if (m_OutWindowStream.HasSharedOutput())
-    {
-      if (!_keepHistory || m_OutWindowStream.GetBufferSize() >= kSharedRingSize)
-      {
-        outWindowSize = kSharedRingSize;
-        sharedChunkSize = kSharedChunkSize;
-      }
-    }
-    m_OutWindowStream.SetSharedOutputChunkSize(sharedChunkSize);
-    if (!_keepHistory)
-      if (!m_OutWindowStream.Create(outWindowSize))
-        return E_OUTOFMEMORY;
-#else
     if (!_keepHistory)
       if (!m_OutWindowStream.Create(_deflate64Mode ? kHistorySize64: kHistorySize32))
         return E_OUTOFMEMORY;
-#endif
     RINOK(InitInStream(_needInitInStream))
     m_OutWindowStream.Init(_keepHistory);
   

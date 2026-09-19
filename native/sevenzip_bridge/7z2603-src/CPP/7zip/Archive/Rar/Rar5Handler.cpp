@@ -18,12 +18,6 @@
 
 #include "../../Common/FilterCoder.h"
 #include "../../Common/LimitedStreams.h"
-#if SUP7Z_USE_SHARED_INPUT
-#include "../../Common/SunpackSharedInput.h"
-#endif
-#if SUP7Z_USE_SHARED_OUTPUT
-#include "../../Common/SunpackSharedOutput.h"
-#endif
 #include "../../Common/MethodProps.h"
 #include "../../Common/ProgressUtils.h"
 #include "../../Common/RegisterArc.h"
@@ -510,44 +504,21 @@ bool CHash::Check(const CItem &item, NCrypto::NRar5::CDecoder *cryptoDecoder)
 }
 
 
-#if SUP7Z_USE_SHARED_OUTPUT
-Z7_CLASS_IMP_COM_2(
-  COutStreamWithHash
-  , ISequentialOutStream
-  , ISunpackSharedOutput
-)
-#else
 Z7_CLASS_IMP_NOQIB_1(
   COutStreamWithHash
   , ISequentialOutStream
 )
-#endif
   bool _size_Defined;
   ISequentialOutStream *_stream;
   UInt64 _pos;
   UInt64 _size;
   Byte *_destBuf;
-#if SUP7Z_USE_SHARED_OUTPUT
-  CMyComPtr<ISunpackSharedOutput> _sharedOutput;
-  const Byte *_leaseData;
-  UInt32 _leaseCapacity;
-  UInt64 _leaseToken;
-#endif
 public:
   CHash _hash;
 
-  COutStreamWithHash(): _destBuf(NULL)
-#if SUP7Z_USE_SHARED_OUTPUT
-    , _leaseData(NULL), _leaseCapacity(0), _leaseToken(0)
-#endif
-    {}
+  COutStreamWithHash(): _destBuf(NULL) {}
 
-#if SUP7Z_USE_SHARED_OUTPUT
-  void SetStream(ISequentialOutStream *stream);
-  void ReleaseStream();
-#else
   void SetStream(ISequentialOutStream *stream) { _stream = stream; }
-#endif
   void Init(const CItem &item, Byte *destBuf, bool needChecksumCheck)
   {
     _size_Defined = false;
@@ -589,146 +560,6 @@ Z7_COM7F_IMF(COutStreamWithHash::Write(const void *data, UInt32 size, UInt32 *pr
   return result;
 }
 
-
-
-
-#if SUP7Z_USE_SHARED_OUTPUT
-
-void COutStreamWithHash::SetStream(ISequentialOutStream *stream)
-{
-  ReleaseStream();
-  _stream = stream;
-  if (stream)
-    stream->QueryInterface(IID_ISunpackSharedOutput, (void **)&_sharedOutput);
-}
-
-void COutStreamWithHash::ReleaseStream()
-{
-  if (_leaseToken && _sharedOutput)
-  {
-    UInt32 ignored = 0;
-    _sharedOutput->Commit(_leaseToken, 0, &ignored);
-  }
-  _leaseData = NULL;
-  _leaseCapacity = 0;
-  _leaseToken = 0;
-  _sharedOutput.Release();
-  _stream = NULL;
-}
-
-Z7_COM7F_IMF(COutStreamWithHash::Acquire(
-    UInt32 desiredSize, Byte **data, UInt32 *capacity, UInt64 *token))
-{
-  if (data) *data = NULL;
-  if (capacity) *capacity = 0;
-  if (token) *token = 0;
-  if (!_sharedOutput || _leaseToken)
-    return S_FALSE;
-
-  UInt32 request = desiredSize;
-  if (_size_Defined)
-  {
-    const UInt64 rem = _size - _pos;
-    if (request > rem)
-      request = (UInt32)rem;
-    if (request == 0)
-      return S_FALSE;
-  }
-
-  Byte *p = NULL;
-  UInt32 cap = 0;
-  UInt64 t = 0;
-  const HRESULT res = _sharedOutput->Acquire(request, &p, &cap, &t);
-  if (res != S_OK)
-    return res;
-  if (!p || cap == 0 || cap > request || t == 0)
-    return E_FAIL;
-
-  _leaseData = p;
-  _leaseCapacity = cap;
-  _leaseToken = t;
-  *data = p;
-  *capacity = cap;
-  *token = t;
-  return S_OK;
-}
-
-Z7_COM7F_IMF(COutStreamWithHash::Commit(
-    UInt64 token, UInt32 size, UInt32 *processedSize))
-{
-  if (processedSize) *processedSize = 0;
-  if (!_sharedOutput || token == 0 || token != _leaseToken ||
-      !_leaseData || size > _leaseCapacity)
-    return E_INVALIDARG;
-
-  // Hash/copy while the direct lease is still exclusively owned by us.
-  // Commit transfers the writer buffer and it can be recycled immediately.
-  if (size)
-  {
-    if (_destBuf)
-      memcpy(_destBuf + (size_t)_pos, _leaseData, size);
-    _hash.Update(_leaseData, size);
-  }
-
-  UInt32 committed = 0;
-  const HRESULT res = _sharedOutput->Commit(token, size, &committed);
-  if (res == S_OK && committed != size)
-    return E_FAIL;
-  if (committed)
-    _pos += committed;
-
-  _leaseData = NULL;
-  _leaseCapacity = 0;
-  _leaseToken = 0;
-  if (processedSize)
-    *processedSize = committed;
-  return res;
-}
-
-Z7_COM7F_IMF(COutStreamWithHash::SubmitBorrowed(
-    const Byte *data, UInt32 size, UInt32 *processedSize, UInt64 *token))
-{
-  if (processedSize) *processedSize = 0;
-  if (token) *token = 0;
-  if (!_sharedOutput || !data || size == 0 || _leaseToken)
-    return S_FALSE;
-
-  UInt32 request = size;
-  if (_size_Defined)
-  {
-    const UInt64 rem = _size - _pos;
-    if (request > rem)
-      request = (UInt32)rem;
-    if (request == 0)
-      return S_FALSE;
-  }
-
-  UInt32 accepted = 0;
-  UInt64 t = 0;
-  const HRESULT res = _sharedOutput->SubmitBorrowed(
-      data, request, &accepted, &t);
-  if (res != S_OK)
-    return res;
-  if (accepted == 0 || accepted > request || t == 0)
-    return E_FAIL;
-
-  if (_destBuf)
-    memcpy(_destBuf + (size_t)_pos, data, accepted);
-  _hash.Update(data, accepted);
-  _pos += accepted;
-  *processedSize = accepted;
-  *token = t;
-  return S_OK;
-}
-
-Z7_COM7F_IMF(COutStreamWithHash::WaitBorrowed(UInt64 token))
-{
-  if (!_sharedOutput)
-    return E_NOINTERFACE;
-  return _sharedOutput->WaitBorrowed(token);
-}
-
-#endif
 
 
 
@@ -1390,9 +1221,6 @@ HRESULT CUnpacker::Code(const CItem &item, const CItem &lastItem, UInt64 packSiz
       linkFile->Data.ChangeSize_KeepData((size_t)processedSize, (size_t)processedSize);
   }
 
-#if SUP7Z_USE_SHARED_OUTPUT
-  outStream->ReleaseStream();
-#endif
   return res;
 }
 
@@ -2788,25 +2616,12 @@ Z7_COM7F_IMF(CHandler::Close())
 }
 
 
-#if SUP7Z_USE_SHARED_INPUT
-Z7_CLASS_IMP_COM_2(
-  CVolsInStream
-  , ISequentialInStream
-  , ISunpackSharedInput
-)
-#else
 Z7_CLASS_IMP_NOQIB_1(
   CVolsInStream
   , ISequentialInStream
 )
-#endif
   UInt64 _rem;
   ISequentialInStream *_stream;
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> _sharedInput;
-  CMyComPtr<ISunpackSharedInput> _borrowSource;
-  UInt64 _borrowToken = 0;
-#endif
   const CObjectVector<CArc> *_arcs;
   const CObjectVector<CItem> *_items;
   int _itemIndex;
@@ -2823,13 +2638,6 @@ public:
     _items = items;
     _itemIndex = (int)itemIndex;
     _stream = NULL;
-#if SUP7Z_USE_SHARED_INPUT
-    if (_borrowToken && _borrowSource)
-      _borrowSource->ReleaseBorrowed(_borrowToken);
-    _borrowToken = 0;
-    _borrowSource.Release();
-    _sharedInput.Release();
-#endif
     CrcIsOK = true;
   }
 };
@@ -2850,10 +2658,6 @@ Z7_COM7F_IMF(CVolsInStream::Read(void *data, UInt32 size, UInt32 *processedSize)
       IInStream *s = (*_arcs)[item.VolIndex].Stream;
       RINOK(InStream_SeekSet(s, item.GetDataPosition()))
       _stream = s;
-#if SUP7Z_USE_SHARED_INPUT
-      _sharedInput.Release();
-      s->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
-#endif
       if (CrcIsOK && item.IsSplitAfter())
         _hash.Init(item);
       else
@@ -2880,9 +2684,6 @@ Z7_COM7F_IMF(CVolsInStream::Read(void *data, UInt32 size, UInt32 *processedSize)
         if (!_hash.Check(item, NULL)) // RAR doesn't use MAC here
           CrcIsOK = false;
         _stream = NULL;
-#if SUP7Z_USE_SHARED_INPUT
-        _sharedInput.Release();
-#endif
       }
       if (res != S_OK)
         return res;
@@ -2895,88 +2696,6 @@ Z7_COM7F_IMF(CVolsInStream::Read(void *data, UInt32 size, UInt32 *processedSize)
   
   return S_OK;
 }
-
-#if SUP7Z_USE_SHARED_INPUT
-Z7_COM7F_IMF(CVolsInStream::Borrow(
-    UInt32 maxSize, const Byte **data, UInt32 *borrowedSize, UInt64 *token))
-{
-  if (!data || !borrowedSize || !token)
-    return E_INVALIDARG;
-  *data = NULL;
-  *borrowedSize = 0;
-  *token = 0;
-  if (maxSize == 0 || _borrowToken != 0)
-    return maxSize == 0 ? S_FALSE : E_FAIL;
-
-  if (!_stream)
-  {
-    if (_itemIndex < 0)
-      return S_FALSE;
-    const CItem &item = (*_items)[_itemIndex];
-    IInStream *s = (*_arcs)[item.VolIndex].Stream;
-    RINOK(InStream_SeekSet(s, item.GetDataPosition()))
-    _stream = s;
-    _sharedInput.Release();
-    s->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
-    if (CrcIsOK && item.IsSplitAfter())
-      _hash.Init(item);
-    else
-      _hash.Init_NoCalc();
-    _rem = item.PackSize;
-  }
-
-  if (!_sharedInput || _rem == 0)
-    return S_FALSE;
-
-  UInt32 request = maxSize;
-  if (request > _rem)
-    request = (UInt32)_rem;
-
-  const Byte *borrowed = NULL;
-  UInt32 size = 0;
-  UInt64 innerToken = 0;
-  const HRESULT res = _sharedInput->Borrow(request, &borrowed, &size, &innerToken);
-  if (res != S_OK)
-    return res;
-  if (!borrowed || size == 0 || size > request || innerToken == 0)
-  {
-    if (innerToken)
-      _sharedInput->ReleaseBorrowed(innerToken);
-    return E_FAIL;
-  }
-
-  _hash.Update(borrowed, size);
-  _rem -= size;
-
-  _borrowSource = _sharedInput;
-  _borrowToken = innerToken;
-
-  if (_rem == 0)
-  {
-    const CItem &item = (*_items)[_itemIndex];
-    _itemIndex = item.NextItem;
-    if (!_hash.Check(item, NULL))
-      CrcIsOK = false;
-    _stream = NULL;
-    _sharedInput.Release();
-  }
-
-  *data = borrowed;
-  *borrowedSize = size;
-  *token = innerToken;
-  return S_OK;
-}
-
-Z7_COM7F_IMF(CVolsInStream::ReleaseBorrowed(UInt64 token))
-{
-  if (!_borrowToken || token != _borrowToken || !_borrowSource)
-    return E_INVALIDARG;
-  const HRESULT res = _borrowSource->ReleaseBorrowed(token);
-  _borrowToken = 0;
-  _borrowSource.Release();
-  return res;
-}
-#endif
 
 
 static int FindLinkBuf(CObjectVector<CLinkFile> &linkFiles, unsigned index)

@@ -5,56 +5,11 @@
 #include "../../../C/Alloc.h"
 
 #include "../Common/CWrappers.h"
-#if SUP7Z_USE_SHARED_INPUT
-#include "../Common/SunpackSharedInput.h"
-#endif
 
 #include "XzDecoder.h"
 
 namespace NCompress {
 namespace NXz {
-
-#if SUP7Z_USE_SHARED_INPUT
-static SRes SharedInput_Borrow(void *ctx, size_t maxSize,
-    const Byte **data, size_t *size, UInt64 *token, BoolInt *borrowed)
-{
-  *data = NULL;
-  *size = 0;
-  *token = 0;
-  *borrowed = False;
-
-  if (!ctx || maxSize == 0)
-    return SZ_OK;
-
-  ISunpackSharedInput *source = (ISunpackSharedInput *)ctx;
-  const UInt32 request = maxSize > (size_t)0xFFFFFFFFu
-      ? 0xFFFFFFFFu : (UInt32)maxSize;
-  UInt32 borrowedSize = 0;
-  const HRESULT hres = source->Borrow(request, data, &borrowedSize, token);
-  if (hres == S_FALSE)
-    return SZ_OK;
-  if (hres != S_OK)
-    return HRESULT_To_SRes(hres, SZ_ERROR_READ);
-  if (!*data || borrowedSize == 0 || borrowedSize > request || *token == 0)
-  {
-    if (*token)
-      source->ReleaseBorrowed(*token);
-    *data = NULL;
-    *token = 0;
-    return SZ_ERROR_FAIL;
-  }
-
-  *size = borrowedSize;
-  *borrowed = True;
-  return SZ_OK;
-}
-
-static void SharedInput_Release(void *ctx, UInt64 token)
-{
-  if (ctx && token)
-    ((ISunpackSharedInput *)ctx)->ReleaseBorrowed(token);
-}
-#endif
 
 #define RET_IF_WRAP_ERROR_CONFIRMED(wrapRes, sRes, sResErrorCode) \
   if (wrapRes != S_OK && sRes == sResErrorCode) return wrapRes;
@@ -122,26 +77,11 @@ HRESULT CDecoder::Decode(ISequentialInStream *seqInStream, ISequentialOutStream 
   outWrap.Init(outStream);
   progressWrap.Init(progress);
 
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> sharedInput;
-  seqInStream->QueryInterface(IID_ISunpackSharedInput, (void **)&sharedInput);
-  CSunpackSharedInput sharedInputBridge = {};
-  if (sharedInput)
-  {
-    sharedInputBridge.ctx = sharedInput;
-    sharedInputBridge.Borrow = SharedInput_Borrow;
-    sharedInputBridge.Release = SharedInput_Release;
-  }
-#endif
-
   SRes res = XzDecMt_Decode(xz,
       &props,
       outSizeLimit, finishStream,
       &outWrap.vt,
       &inWrap.vt,
-#if SUP7Z_USE_SHARED_INPUT
-      sharedInput ? &sharedInputBridge : NULL,
-#endif
       &Stat,
       &isMT,
       progress ? &progressWrap.vt : NULL);

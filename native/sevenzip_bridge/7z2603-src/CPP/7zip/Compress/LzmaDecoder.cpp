@@ -5,12 +5,6 @@
 #include "../../../C/Alloc.h"
 
 #include "../Common/StreamUtils.h"
-#if SUP7Z_USE_SHARED_INPUT
-#include "../Common/SunpackSharedInput.h"
-#endif
-#if SUP7Z_USE_SHARED_OUTPUT
-#include "../Common/SunpackSharedOutput.h"
-#endif
 
 #include "LzmaDecoder.h"
 
@@ -131,117 +125,12 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
   SizeT wrPos = _state.dicPos;
   HRESULT readRes = S_OK;
 
-#if SUP7Z_USE_SHARED_OUTPUT
-  CMyComPtr<ISunpackSharedOutput> sharedOutput;
-  if (outStream)
-    outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&sharedOutput);
-  CSunpackSharedOutputRangeLeaseRing<16> outputLeases;
-
-  const auto writeOutput = [&](const Byte *data, size_t bytes) -> HRESULT
-  {
-    if (!sharedOutput)
-      return WriteStream(outStream, data, bytes);
-
-    while (bytes != 0)
-    {
-      const UInt32 request = bytes > (size_t)0xFFFFFFFFu
-          ? 0xFFFFFFFFu : (UInt32)bytes;
-      UInt32 accepted = 0;
-      UInt64 token = 0;
-      HRESULT submitRes = S_FALSE;
-      for (;;)
-      {
-        submitRes = sharedOutput->SubmitBorrowed(
-            data, request, &accepted, &token);
-        if (submitRes != S_FALSE || outputLeases.Empty())
-          break;
-        const HRESULT retireRes = outputLeases.RetireOne();
-        if (retireRes != S_OK)
-          return retireRes;
-        accepted = 0;
-        token = 0;
-      }
-      if (submitRes == S_FALSE)
-        return WriteStream(outStream, data, bytes);
-      if (submitRes != S_OK)
-        return submitRes;
-      if (accepted == 0 || accepted > request || token == 0)
-        return E_FAIL;
-
-      const UInt64 rangeBegin = (UInt64)(data - _state.dic);
-      const HRESULT retireRes = outputLeases.Push(
-          token, rangeBegin, rangeBegin + accepted);
-      if (retireRes != S_OK)
-        return retireRes;
-      data += accepted;
-      bytes -= accepted;
-    }
-    return S_OK;
-  };
-#endif
-
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> sharedInput;
-  inStream->QueryInterface(IID_ISunpackSharedInput, (void **)&sharedInput);
-  UInt64 borrowToken = 0;
-  const Byte *inData = _inBuf;
-  struct CLeaseGuard
-  {
-    ISunpackSharedInput *Source;
-    UInt64 *Token;
-    ~CLeaseGuard()
-    {
-      if (Source && *Token)
-        Source->ReleaseBorrowed(*Token);
-    }
-  } leaseGuard = { sharedInput, &borrowToken };
-#endif
-
   for (;;)
   {
     if (_inPos == _inLim && readRes == S_OK)
     {
       _inPos = _inLim = 0;
-#if SUP7Z_USE_SHARED_INPUT
-      if (borrowToken)
-      {
-        sharedInput->ReleaseBorrowed(borrowToken);
-        borrowToken = 0;
-      }
-
-      HRESULT borrowRes = S_FALSE;
-      if (sharedInput)
-      {
-        const Byte *borrowed = NULL;
-        UInt32 borrowedSize = 0;
-        UInt64 token = 0;
-        borrowRes = sharedInput->Borrow(_inBufSize, &borrowed, &borrowedSize, &token);
-        if (borrowRes == S_OK)
-        {
-          if (!borrowed || borrowedSize == 0 || token == 0)
-          {
-            if (token)
-              sharedInput->ReleaseBorrowed(token);
-            borrowRes = E_FAIL;
-          }
-          else
-          {
-            inData = borrowed;
-            _inLim = borrowedSize;
-            borrowToken = token;
-          }
-        }
-      }
-      if (borrowRes == S_FALSE)
-      {
-        inData = _inBuf;
-        readRes = inStream->Read(_inBuf, _inBufSize, &_inLim);
-      }
-      else if (borrowRes != S_OK)
-        readRes = borrowRes;
-#else
       readRes = inStream->Read(_inBuf, _inBufSize, &_inLim);
-#endif
     }
 
     const SizeT dicPos = _state.dicPos;
@@ -265,22 +154,10 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
       }
     }
 
-#if SUP7Z_USE_SHARED_OUTPUT
-    if (sharedOutput && size != 0)
-      RINOK(outputLeases.RetireOverlapping(
-          (UInt64)dicPos, (UInt64)(dicPos + size)))
-#endif
-
     SizeT inProcessed = _inLim - _inPos;
     ELzmaStatus status;
 
-    const SRes res = LzmaDec_DecodeToDic(&_state, dicPos + size,
-#if SUP7Z_USE_SHARED_INPUT
-        inData + _inPos,
-#else
-        _inBuf + _inPos,
-#endif
-        &inProcessed, finishMode, &status);
+    const SRes res = LzmaDec_DecodeToDic(&_state, dicPos + size, _inBuf + _inPos, &inProcessed, finishMode, &status);
 
     _lzmaStatus = status;
     _inPos += (UInt32)inProcessed;
@@ -298,30 +175,16 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
 
     if (needStop || outProcessed >= size)
     {
-#if SUP7Z_USE_SHARED_OUTPUT
-      const HRESULT res2 = writeOutput(
-          _state.dic + wrPos, _state.dicPos - wrPos);
-#else
-      const HRESULT res2 = WriteStream(
-          outStream, _state.dic + wrPos, _state.dicPos - wrPos);
-#endif
+      const HRESULT res2 = WriteStream(outStream, _state.dic + wrPos, _state.dicPos - wrPos);
 
       if (_state.dicPos == _state.dicBufSize)
-      {
-        // The next decode starts at dictionary offset 0. Its exact target
-        // range is retired at the top of the next iteration, so unrelated
-        // high-window writes can remain in flight.
         _state.dicPos = 0;
-      }
       wrPos = _state.dicPos;
       
       RINOK(res2)
 
       if (needStop)
       {
-#if SUP7Z_USE_SHARED_OUTPUT
-        RINOK(outputLeases.Drain())
-#endif
         if (res != 0)
         {
           // return SResToHRESULT(res);

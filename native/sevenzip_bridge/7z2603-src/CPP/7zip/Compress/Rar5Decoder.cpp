@@ -671,14 +671,7 @@ enum FilterType
   FILTER_ARM
 };
 
-#if SUP7Z_USE_SHARED_OUTPUT
-// Match SunPack's writer work-item size. The original unrar implementation
-// uses even larger steps, so 1 MiB remains comfortably inside decoder limits
-// while avoiding 256 KiB async writes on the zero-copy path.
-static const size_t kWriteStep = (size_t)1 << 20;
-#else
 static const size_t kWriteStep = (size_t)1 << 18;
-#endif
       // (size_t)1 << 22; // original-unrar
 
 // Original unRAR claims that maximum possible filter block size is (1 << 16) now,
@@ -715,9 +708,6 @@ CDecoder::CDecoder():
 
 CDecoder::~CDecoder()
 {
-#if SUP7Z_USE_SHARED_OUTPUT
-  _outputLeases.Drain();
-#endif
 #ifdef Z7_RAR5_SHOW_STAT
   printf("\n%4d :", 0);
   for (unsigned k = 0; k < kNumStats1; k++)
@@ -773,90 +763,6 @@ HRESULT CDecoder::WriteData(const Byte *data, size_t size)
   _writtenFileSize += size;
   return res;
 }
-
-#if SUP7Z_USE_SHARED_OUTPUT
-HRESULT CDecoder::DrainOutputLeases()
-{
-  return _outputLeases.Drain();
-}
-
-HRESULT CDecoder::WriteWindowData(const Byte *data, size_t size)
-{
-  if (!_sharedOutput)
-    return WriteData(data, size);
-
-  size_t outputSize = size;
-  if (_unpackSize_Defined)
-  {
-    if (_writtenFileSize >= _unpackSize)
-      outputSize = 0;
-    else
-    {
-      const UInt64 rem = _unpackSize - _writtenFileSize;
-      if (outputSize > rem)
-        outputSize = (size_t)rem;
-    }
-  }
-
-  const size_t logicalSize = size;
-  while (outputSize != 0)
-  {
-    const UInt32 request = outputSize > (size_t)0xFFFFFFFFu
-        ? 0xFFFFFFFFu : (UInt32)outputSize;
-    UInt32 accepted = 0;
-    UInt64 token = 0;
-    HRESULT res = S_FALSE;
-
-    for (;;)
-    {
-      res = _sharedOutput->SubmitBorrowed(
-          data, request, &accepted, &token);
-      if (res != S_FALSE || _outputLeases.Empty())
-        break;
-      RINOK(_outputLeases.RetireOne())
-      accepted = 0;
-      token = 0;
-    }
-
-    if (res == S_FALSE)
-    {
-      const HRESULT writeRes = WriteStream(_outStream, data, request);
-      if (writeRes != S_OK)
-      {
-        _writeError = true;
-        return writeRes;
-      }
-      data += request;
-      outputSize -= request;
-      continue;
-    }
-    if (res != S_OK)
-    {
-      _writeError = true;
-      return res;
-    }
-    if (accepted == 0 || accepted > request || token == 0)
-    {
-      _writeError = true;
-      return E_FAIL;
-    }
-
-    const UInt64 rangeBegin = (UInt64)(data - _window);
-    const HRESULT pushRes = _outputLeases.Push(
-        token, rangeBegin, rangeBegin + accepted);
-    if (pushRes != S_OK)
-    {
-      _writeError = true;
-      return pushRes;
-    }
-    data += accepted;
-    outputSize -= accepted;
-  }
-
-  _writtenFileSize += logicalSize;
-  return S_OK;
-}
-#endif
 
 
 #if defined(MY_CPU_SIZEOF_POINTER) \
@@ -1048,11 +954,7 @@ HRESULT CDecoder::WriteBuf()
       if (size > rem)
         size = (size_t)rem;
       // (size != 0)
-      #if SUP7Z_USE_SHARED_OUTPUT
-      RINOK(WriteWindowData(_window + _winPos - lzAvail, size))
-#else
       RINOK(WriteData(_window + _winPos - lzAvail, size))
-#endif
       _lzWritten += size;
       continue;
     }
@@ -1087,11 +989,7 @@ HRESULT CDecoder::WriteBuf()
   if (_numFilters)
     return S_OK;
   const size_t lzAvail = (size_t)(lzSize - _lzWritten);
-  #if SUP7Z_USE_SHARED_OUTPUT
-  RINOK(WriteWindowData(_window + _winPos - lzAvail, lzAvail))
-#else
   RINOK(WriteData(_window + _winPos - lzAvail, lzAvail))
-#endif
   _lzWritten += lzAvail;
   return S_OK;
 }
@@ -1803,13 +1701,7 @@ HRESULT CDecoder::DecodeLZ()
         _lzSize += wp;
         winPos -= wp;
         // (winPos < kMaxMatchLen < _winSize)
-        // so memmove is not required here. Only the destination prefix is
-        // physically overwritten at normalization; later decode chunks retire
-        // their own overlapping leases immediately before writing.
-#if SUP7Z_USE_SHARED_OUTPUT
-        if (winPos)
-          RINOK(_outputLeases.RetireOverlapping(0, (UInt64)winPos))
-#endif
+        // so memmove is not required here
         if (winPos)
           memcpy(win, win + _winSize, winPos);
         limit = _winSize;
@@ -1884,18 +1776,6 @@ HRESULT CDecoder::DecodeLZ()
 
     _limit = limit;
     _winPos = winPos;
-#if SUP7Z_USE_SHARED_OUTPUT
-    {
-      // DecodeLZ2 can finish a match slightly past _limit and may touch its
-      // vectorized pad. Retire only leases covering that physical target.
-      size_t overwriteEnd = limit + kMaxMatchLen + COPY_CHUNK_SIZE;
-      if (overwriteEnd < limit || overwriteEnd > _winSize)
-        overwriteEnd = _winSize;
-      if (winPos < overwriteEnd)
-        RINOK(_outputLeases.RetireOverlapping(
-            (UInt64)winPos, (UInt64)overwriteEnd))
-    }
-#endif
     RINOK(DecodeLZ2(_bitStream))
     _bitStream._buf = _buf_Res;
     _bitStream._bitPos = _bitPos_Res;
@@ -1950,13 +1830,6 @@ HRESULT CDecoder::CodeReal()
   HRESULT res2 = S_OK;
   if (!_writeError && res != E_OUTOFMEMORY)
     res2 = WriteBuf();
-#if SUP7Z_USE_SHARED_OUTPUT
-  {
-    const HRESULT drainRes = DrainOutputLeases();
-    if (res2 == S_OK && drainRes != S_OK)
-      res2 = drainRes;
-  }
-#endif
   /*
   if (res == S_OK)
     if (InputEofError())
@@ -1977,9 +1850,6 @@ HRESULT CDecoder::CodeReal()
 Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream *outStream,
     const UInt64 * /* inSize */, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
-#if SUP7Z_USE_SHARED_OUTPUT
-  RINOK(DrainOutputLeases())
-#endif
   _lzError = LZ_ERROR_TYPE_NO;
 /*
   if file is soild, but decoding of previous file was not finished,
@@ -2151,11 +2021,6 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   
   _inStream = inStream;
   _outStream = outStream;
-#if SUP7Z_USE_SHARED_OUTPUT
-  _sharedOutput.Release();
-  if (outStream)
-    outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&_sharedOutput);
-#endif
   _progress = progress;
   _progress_Pack = 0;
   _progress_Unpack = 0;

@@ -381,14 +381,17 @@ def _run_case(
     runs: int,
     timeout_seconds: float,
     sample_interval: float,
+    prefetch_enabled: bool,
     prefetch_window_kib: int,
     prefetch_depth: int,
+    run_start: int = 0,
     copy_slots: list[Path] | None = None,
 ) -> list[dict[str, Any]]:
     prior_environment = {
         name: os.environ.get(name)
         for name in (
             "SUNPACK_SEVENZIP_PROFILE_READS",
+            "SUNPACK_SEVENZIP_PREFETCH",
             "SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB",
             "SUNPACK_SEVENZIP_PREFETCH_DEPTH",
         )
@@ -399,13 +402,14 @@ def _run_case(
     rows: list[dict[str, Any]] = []
     try:
         os.environ["SUNPACK_SEVENZIP_PROFILE_READS"] = "1"
+        os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if prefetch_enabled else "0"
         os.environ["SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB"] = str(prefetch_window_kib)
         os.environ["SUNPACK_SEVENZIP_PREFETCH_DEPTH"] = str(prefetch_depth)
         worker = _NativeWorkerProcess(str(worker_path), None)
         sampler.start()
         sampling = True
-        for run in range(runs):
-            mode = "prefetch"
+        for run in range(run_start, run_start + runs):
+            mode = "on" if prefetch_enabled else "off"
             if copy_slots:
                 case = _cold_copy_case(case, copy_slots[run % len(copy_slots)])
             output = workspace.outputs / str(case["case_id"]).replace(":", "-") / mode / f"run-{run}"
@@ -483,6 +487,12 @@ def main() -> int:
     parser.add_argument("--7z-variant", action="append", choices=("solid", "non-solid"), dest="seven_zip_variants")
     parser.add_argument("--timeout-seconds", type=float, default=180.0)
     parser.add_argument("--sample-interval", type=float, default=0.02)
+    parser.add_argument(
+        "--prefetch",
+        choices=("on", "off", "compare"),
+        default="on",
+        help="Enable prefetch subject to the production format policy, disable it, or compare both.",
+    )
     parser.add_argument("--prefetch-window-kib", type=int, default=512)
     parser.add_argument("--prefetch-depth", type=int, default=2)
     parser.add_argument(
@@ -571,18 +581,38 @@ def main() -> int:
             for index, case in enumerate(cases, start=1):
                 print(f"[{index}/{len(cases)}] {case['case_id']} archive={case['archive_bytes']}B", flush=True)
                 try:
-                    rows.extend(_run_case(
-                        case,
-                        workspace=workspace,
-                        worker_path=worker_path,
-                        dll_path=dll_path,
-                        runs=args.runs,
-                        timeout_seconds=args.timeout_seconds,
-                        sample_interval=args.sample_interval,
-                        prefetch_window_kib=args.prefetch_window_kib,
-                        prefetch_depth=args.prefetch_depth,
-                        copy_slots=copy_slots,
-                    ))
+                    if args.prefetch == "compare":
+                        for run in range(args.runs):
+                            modes = ("off", "on") if run % 2 == 0 else ("on", "off")
+                            for mode in modes:
+                                rows.extend(_run_case(
+                                    case,
+                                    workspace=workspace,
+                                    worker_path=worker_path,
+                                    dll_path=dll_path,
+                                    runs=1,
+                                    timeout_seconds=args.timeout_seconds,
+                                    sample_interval=args.sample_interval,
+                                    prefetch_enabled=mode == "on",
+                                    prefetch_window_kib=args.prefetch_window_kib,
+                                    prefetch_depth=args.prefetch_depth,
+                                    run_start=run,
+                                    copy_slots=copy_slots,
+                                ))
+                    else:
+                        rows.extend(_run_case(
+                            case,
+                            workspace=workspace,
+                            worker_path=worker_path,
+                            dll_path=dll_path,
+                            runs=args.runs,
+                            timeout_seconds=args.timeout_seconds,
+                            sample_interval=args.sample_interval,
+                            prefetch_enabled=args.prefetch == "on",
+                            prefetch_window_kib=args.prefetch_window_kib,
+                            prefetch_depth=args.prefetch_depth,
+                            copy_slots=copy_slots,
+                        ))
                 except Exception as exc:
                     failures.append({"case_id": str(case["case_id"]), "error": repr(exc)})
                     print(f"  ERROR {exc}", flush=True)
@@ -615,12 +645,12 @@ def main() -> int:
                 "seven_zip_variants": sorted(seven_zip_variants),
                 "payload": corpus_info.get("payload"),
                 "explicit_archives": [case["case_id"] for case in cases] if args.archive else [],
-                "prefetch_default_override": {"window_kib": args.prefetch_window_kib, "depth": args.prefetch_depth},
+                "prefetch": {"mode": args.prefetch, "window_kib": args.prefetch_window_kib, "depth": args.prefetch_depth},
                 },
                 "method": {
                     "timed_region": "synchronous ReadFile calls within native IInStream implementations",
                     "logical_trace": "successful IInStream reads and seeks requested by 7z.dll",
-                    "prefetch_caveat": "Prefetch is the production path. Window/depth environment overrides tune only the generic default; measured format-specific policies take precedence. Consumer blocking is synchronous ReadFile time plus any wait for the current prefetch epoch; background ReadFile time is intentionally not added because it can overlap decompression.",
+                    "prefetch_caveat": "The on mode enables prefetch where the production format policy permits it. Consumer blocking is synchronous ReadFile time plus any wait for the current prefetch epoch; background ReadFile time is intentionally not added because it can overlap decompression.",
                     "decoder_verdict": "A prefetch miss means the consumer had to read the file itself and the prefetch epoch was discarded; misses beyond the few non-window-aligned reads (archive tails, header probes) indicate decoder starvation.",
                 },
                 "environment": {

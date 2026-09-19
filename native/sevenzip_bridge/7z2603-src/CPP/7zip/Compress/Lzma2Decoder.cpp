@@ -8,119 +8,11 @@
 // #include "../../../C/CpuTicks.h"
 
 #include "../Common/StreamUtils.h"
-#if SUP7Z_USE_SHARED_INPUT
-#include "../Common/SunpackSharedInput.h"
-#endif
-#if SUP7Z_USE_SHARED_OUTPUT
-#include "../Common/SunpackSharedOutput.h"
-#endif
 
 #include "Lzma2Decoder.h"
 
 namespace NCompress {
 namespace NLzma2 {
-
-#if SUP7Z_USE_SHARED_INPUT
-static SRes SharedInput_Borrow(void *ctx, size_t maxSize,
-    const Byte **data, size_t *size, UInt64 *token, BoolInt *borrowed)
-{
-  *data = NULL;
-  *size = 0;
-  *token = 0;
-  *borrowed = False;
-
-  if (!ctx || maxSize == 0)
-    return SZ_OK;
-
-  ISunpackSharedInput *source = (ISunpackSharedInput *)ctx;
-  const UInt32 request = maxSize > (size_t)0xFFFFFFFFu
-      ? 0xFFFFFFFFu : (UInt32)maxSize;
-  UInt32 borrowedSize = 0;
-  const HRESULT hres = source->Borrow(request, data, &borrowedSize, token);
-  if (hres == S_FALSE)
-    return SZ_OK;
-  if (hres != S_OK)
-    return HRESULT_To_SRes(hres, SZ_ERROR_READ);
-  if (!*data || borrowedSize == 0 || borrowedSize > request || *token == 0)
-  {
-    if (*token)
-      source->ReleaseBorrowed(*token);
-    *data = NULL;
-    *token = 0;
-    return SZ_ERROR_FAIL;
-  }
-
-  *size = borrowedSize;
-  *borrowed = True;
-  return SZ_OK;
-}
-
-static void SharedInput_Release(void *ctx, UInt64 token)
-{
-  if (ctx && token)
-    ((ISunpackSharedInput *)ctx)->ReleaseBorrowed(token);
-}
-#endif
-
-#if SUP7Z_USE_SHARED_OUTPUT
-struct CSharedOutputBridge
-{
-  ISunpackSharedOutput *Output;
-  HRESULT Result;
-  UInt64 Processed;
-};
-
-static SRes SharedOutput_SubmitBorrowed(void *ctx, const Byte *data, size_t size,
-    size_t *processed, UInt64 *token, BoolInt *borrowed)
-{
-  CSharedOutputBridge *bridge = (CSharedOutputBridge *)ctx;
-  *processed = 0;
-  *token = 0;
-  *borrowed = False;
-  if (!bridge || !bridge->Output || !data || size == 0)
-    return SZ_OK;
-
-  const UInt32 request = size > (size_t)0xFFFFFFFFu
-      ? 0xFFFFFFFFu : (UInt32)size;
-  UInt32 accepted = 0;
-  UInt64 lease = 0;
-  const HRESULT hres = bridge->Output->SubmitBorrowed(
-      data, request, &accepted, &lease);
-  if (hres == S_FALSE)
-    return SZ_OK;
-  if (hres != S_OK)
-  {
-    bridge->Result = hres;
-    return HRESULT_To_SRes(hres, SZ_ERROR_WRITE);
-  }
-  if (accepted == 0 || accepted > request || lease == 0)
-  {
-    bridge->Result = E_FAIL;
-    return SZ_ERROR_FAIL;
-  }
-
-  bridge->Processed += accepted;
-  *processed = accepted;
-  *token = lease;
-  *borrowed = True;
-  return SZ_OK;
-}
-
-static SRes SharedOutput_WaitBorrowed(void *ctx, UInt64 token)
-{
-  CSharedOutputBridge *bridge = (CSharedOutputBridge *)ctx;
-  if (!bridge || !bridge->Output || token == 0)
-    return SZ_ERROR_PARAM;
-
-  const HRESULT hres = bridge->Output->WaitBorrowed(token);
-  if (hres != S_OK)
-  {
-    bridge->Result = hres;
-    return HRESULT_To_SRes(hres, SZ_ERROR_WRITE);
-  }
-  return SZ_OK;
-}
-#endif
 
 CDecoder::CDecoder():
       _dec(NULL)
@@ -246,32 +138,6 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   outWrap.Init(outStream);
   progressWrap.Init(progress);
 
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> sharedInput;
-  inStream->QueryInterface(IID_ISunpackSharedInput, (void **)&sharedInput);
-  CSunpackSharedInput sharedInputBridge = {};
-  if (sharedInput)
-  {
-    sharedInputBridge.ctx = sharedInput;
-    sharedInputBridge.Borrow = SharedInput_Borrow;
-    sharedInputBridge.Release = SharedInput_Release;
-  }
-#endif
-
-#if SUP7Z_USE_SHARED_OUTPUT
-  CMyComPtr<ISunpackSharedOutput> sharedOutput;
-  if (outStream)
-    outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&sharedOutput);
-  CSharedOutputBridge sharedOutputContext = { sharedOutput.Interface(), S_OK, 0 };
-  CSunpackSharedOutput sharedOutputBridge = {};
-  if (sharedOutput)
-  {
-    sharedOutputBridge.ctx = &sharedOutputContext;
-    sharedOutputBridge.SubmitBorrowed = SharedOutput_SubmitBorrowed;
-    sharedOutputBridge.WaitBorrowed = SharedOutput_WaitBorrowed;
-  }
-#endif
-
   SRes res;
 
   UInt64 inProcessed = 0;
@@ -284,15 +150,8 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   // UInt64 cpuTicks = GetCpuTicks();
 
   res = Lzma2DecMt_Decode(_dec, _prop, &props,
-      &outWrap.vt,
-#if SUP7Z_USE_SHARED_OUTPUT
-      sharedOutput ? &sharedOutputBridge : NULL,
-#endif
-      outSize, _finishMode,
+      &outWrap.vt, outSize, _finishMode,
       &inWrap.vt,
-#if SUP7Z_USE_SHARED_INPUT
-      sharedInput ? &sharedInputBridge : NULL,
-#endif
       &inProcessed,
       &isMT,
       progress ? &progressWrap.vt : NULL);
@@ -313,22 +172,13 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 
   RET_IF_WRAP_ERROR(progressWrap.Res, res, SZ_ERROR_PROGRESS)
   RET_IF_WRAP_ERROR(outWrap.Res, res, SZ_ERROR_WRITE)
-#if SUP7Z_USE_SHARED_OUTPUT
-  RET_IF_WRAP_ERROR(sharedOutputContext.Result, res, SZ_ERROR_WRITE)
-#endif
   RET_IF_WRAP_ERROR_CONFIRMED(inWrap.Res, res, SZ_ERROR_READ)
 
   if (res == SZ_OK && _finishMode)
   {
     if (inSize && *inSize != inProcessed)
       res = SZ_ERROR_DATA;
-    if (outSize
-#if SUP7Z_USE_SHARED_OUTPUT
-        && *outSize != outWrap.Processed + sharedOutputContext.Processed
-#else
-        && *outSize != outWrap.Processed
-#endif
-        )
+    if (outSize && *outSize != outWrap.Processed)
       res = SZ_ERROR_DATA;
   }
 
@@ -380,11 +230,7 @@ Z7_COM7F_IMF(CDecoder::SetOutStreamSize(const UInt64 *outSize))
 
   _inWrap.Init(_inStream);
 
-  const SRes res = Lzma2DecMt_Init(_dec, _prop, &props, outSize, _finishMode, &_inWrap.vt
-#if SUP7Z_USE_SHARED_INPUT
-      , NULL
-#endif
-      );
+  const SRes res = Lzma2DecMt_Init(_dec, _prop, &props, outSize, _finishMode, &_inWrap.vt);
 
   if (res != SZ_OK)
     return SResToHRESULT(res);

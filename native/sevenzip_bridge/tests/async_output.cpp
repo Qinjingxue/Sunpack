@@ -4,7 +4,6 @@
 
 #include <chrono>
 #include <cstdint>
-#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -436,119 +435,6 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
     return true;
 }
 
-#if SUP7Z_USE_SHARED_OUTPUT
-bool shared_output_ownership_paths_preserve_data(const std::filesystem::path& directory) {
-    constexpr std::size_t direct_size = 3U << 20;
-    constexpr std::size_t borrowed_size = 6U << 20;
-
-    std::vector<unsigned char> direct_expected(direct_size);
-    std::vector<unsigned char> borrowed_expected(borrowed_size);
-    for (std::size_t i = 0; i < direct_expected.size(); ++i) {
-        direct_expected[i] = static_cast<unsigned char>((i * 29U + 7U) & 0xFFU);
-    }
-    for (std::size_t i = 0; i < borrowed_expected.size(); ++i) {
-        borrowed_expected[i] = static_cast<unsigned char>((i * 43U + 11U) & 0xFFU);
-    }
-
-    AsyncWriterConfig shared_config;
-    shared_config.threads_per_volume = 4;
-    shared_config.buffer_count = 4;
-    shared_config.queue_limit = 4;
-    AsyncFileWriter writer(
-        std::make_shared<WriterMeters>(),
-        make_volume_state("shared-test:", false),
-        shared_config);
-
-    {
-        const auto job = writer.make_job();
-        const auto file = writer.make_file(
-            job, (directory / L"shared-direct.bin").wstring(), L"shared-direct.bin", 20, 20);
-
-        std::size_t offset = 0;
-        while (offset < direct_expected.size()) {
-            unsigned char* data = nullptr;
-            std::uint32_t capacity = 0;
-            UInt64 token = 0;
-            const std::uint32_t request = static_cast<std::uint32_t>(
-                (std::min<std::size_t>)(1U << 20, direct_expected.size() - offset));
-            if (writer.acquire_output(file, request, &data, &capacity, &token) != S_OK ||
-                data == nullptr || capacity == 0 || capacity > request || token == 0) {
-                return false;
-            }
-            std::memcpy(data, direct_expected.data() + offset, capacity);
-            std::uint32_t committed = 0;
-            if (writer.commit_output(file, token, capacity, &committed) != S_OK ||
-                committed != capacity) {
-                return false;
-            }
-            offset += committed;
-        }
-
-        writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
-        if (writer.finish_job(job) != S_OK) {
-            return false;
-        }
-    }
-
-    {
-        const auto job = writer.make_job();
-        const auto file = writer.make_file(
-            job, (directory / L"shared-borrowed.bin").wstring(), L"shared-borrowed.bin", 21, 21);
-
-        std::vector<UInt64> tokens;
-        std::size_t retired = 0;
-        std::size_t offset = 0;
-        bool saw_backpressure = false;
-        while (offset < borrowed_expected.size()) {
-            std::uint32_t accepted = 0;
-            UInt64 token = 0;
-            const std::uint32_t request = static_cast<std::uint32_t>(
-                borrowed_expected.size() - offset);
-            const HRESULT submit = writer.submit_borrowed(
-                file, borrowed_expected.data() + offset, request, &accepted, &token);
-            if (submit == S_FALSE) {
-                saw_backpressure = true;
-                if (retired >= tokens.size() ||
-                    SunpackSharedOutput_WaitToken(tokens[retired++]) != S_OK) {
-                    return false;
-                }
-                continue;
-            }
-            if (submit != S_OK || accepted == 0 || accepted > request || token == 0) {
-                return false;
-            }
-            tokens.push_back(token);
-            offset += accepted;
-        }
-
-        for (; retired < tokens.size(); ++retired) {
-            if (SunpackSharedOutput_WaitToken(tokens[retired]) != S_OK) {
-                return false;
-            }
-        }
-        if (!saw_backpressure) {
-            std::cerr << "borrowed-output test did not exercise pool backpressure\n";
-            return false;
-        }
-
-        writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
-        if (writer.finish_job(job) != S_OK) {
-            return false;
-        }
-    }
-
-    const auto read_all = [](const std::filesystem::path& path) {
-        std::ifstream input(path, std::ios::binary);
-        return std::vector<unsigned char>(
-            std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>());
-    };
-    return read_all(directory / L"shared-direct.bin") == direct_expected &&
-           read_all(directory / L"shared-borrowed.bin") == borrowed_expected;
-}
-#endif
-
 bool registry_reclaims_idle_facilities(const std::filesystem::path& directory) {
     auto meters = std::make_shared<WriterMeters>();
     AsyncWriterConfig config;
@@ -663,9 +549,6 @@ int main() {
         meters_separate_volumes_but_share_the_global_sink(directory) &&
         quiescence_tracks_jobs_and_files(directory) &&
         configuration_is_snapshotted_not_reread(directory) &&
-#if SUP7Z_USE_SHARED_OUTPUT
-        shared_output_ownership_paths_preserve_data(directory) &&
-#endif
         registry_routes_by_volume_and_releases_leases(directory) &&
         registry_reclaims_idle_facilities(directory);
     std::error_code error;
