@@ -132,16 +132,17 @@ Z7_COM7F_IMF(CCopyCoder::Code(ISequentialInStream *inStream,
     {
       if (!coalesceToken)
         return S_OK;
+      const UInt32 expected = coalesceSize;
       UInt32 committed = 0;
       const HRESULT res = sharedOutput->Commit(
-          coalesceToken, coalesceSize, &committed);
+          coalesceToken, expected, &committed);
       coalesceData = NULL;
       coalesceCapacity = 0;
       coalesceSize = 0;
       coalesceToken = 0;
       if (res != S_OK)
         return res;
-      return committed == 0 ? E_FAIL : S_OK;
+      return committed == expected ? S_OK : E_FAIL;
     };
 
     const auto abortCoalesced = [&]()
@@ -174,39 +175,42 @@ Z7_COM7F_IMF(CCopyCoder::Code(ISequentialInStream *inStream,
 
     const auto copyIntoCoalescer = [&](const Byte *data, UInt32 size) -> HRESULT
     {
-      while (size != 0)
-      {
-        if (!coalesceToken)
-        {
-          Byte *dest = NULL;
-          UInt32 capacity = 0;
-          UInt64 token = 0;
-          const HRESULT acquireRes = sharedOutput->Acquire(
-              kSharedOutputSize, &dest, &capacity, &token);
-          if (acquireRes != S_OK)
-            return acquireRes;
-          if (!dest || capacity == 0 || token == 0)
-            return E_FAIL;
-          coalesceData = dest;
-          coalesceCapacity = capacity;
-          coalesceSize = 0;
-          coalesceToken = token;
-        }
+      if (size == 0 || size >= kSharedOutputSize)
+        return E_INVALIDARG;
 
-        UInt32 room = coalesceCapacity - coalesceSize;
-        if (room == 0)
+      // Never split one input lease across two writer-owned leases. That keeps
+      // S_FALSE fallback atomic: either the whole span was copied, or none was.
+      if (coalesceToken && coalesceCapacity - coalesceSize < size)
+        RINOK(commitCoalesced())
+
+      if (!coalesceToken)
+      {
+        Byte *dest = NULL;
+        UInt32 capacity = 0;
+        UInt64 token = 0;
+        const HRESULT acquireRes = sharedOutput->Acquire(
+            kSharedOutputSize, &dest, &capacity, &token);
+        if (acquireRes != S_OK)
+          return acquireRes;
+        if (!dest || capacity < size || token == 0)
         {
-          RINOK(commitCoalesced())
-          continue;
+          if (token)
+          {
+            UInt32 ignored = 0;
+            sharedOutput->Commit(token, 0, &ignored);
+          }
+          return E_FAIL;
         }
-        const UInt32 cur = size < room ? size : room;
-        memcpy(coalesceData + coalesceSize, data, cur);
-        coalesceSize += cur;
-        data += cur;
-        size -= cur;
-        if (coalesceSize == coalesceCapacity)
-          RINOK(commitCoalesced())
+        coalesceData = dest;
+        coalesceCapacity = capacity;
+        coalesceSize = 0;
+        coalesceToken = token;
       }
+
+      memcpy(coalesceData + coalesceSize, data, size);
+      coalesceSize += size;
+      if (coalesceSize == coalesceCapacity)
+        RINOK(commitCoalesced())
       return S_OK;
     };
 
