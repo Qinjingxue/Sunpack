@@ -250,7 +250,7 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
 
 #ifdef SUP7Z_USE_PLANNED_IO
   {
-    NSunpackReadPlan::Begin(_inStream);
+    NSunpackReadPlan::Begin(_inStream.Interface());
     CNum previousFolder = kNumNoIndex;
     for (UInt32 planIndex = 0; planIndex < numItems; ++planIndex)
     {
@@ -260,10 +260,10 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
         continue;
       const UInt64 packSize = _db.GetFolderFullPackSize(folderIndex);
       if (packSize != 0)
-        NSunpackReadPlan::Add(_inStream, _db.GetFolderStreamPos(folderIndex, 0), packSize);
+        NSunpackReadPlan::Add(_inStream.Interface(), _db.GetFolderStreamPos(folderIndex, 0), packSize);
       previousFolder = folderIndex;
     }
-    NSunpackReadPlan::End(_inStream);
+    NSunpackReadPlan::End(_inStream.Interface());
   }
 #endif
 
