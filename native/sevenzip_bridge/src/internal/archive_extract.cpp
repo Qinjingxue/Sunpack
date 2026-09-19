@@ -467,6 +467,10 @@ namespace sunpack::sevenzip
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
+            // Snapshot Open() before extraction changes the prefetch phase, so A/B runs can
+            // distinguish metadata parsing behavior from planned payload reads.
+            capture_open_input_trace(result.input_trace);
+
             // Open is complete. If legacy prefetch is part of this build/config, enable it
             // only for extraction; planned I/O will supersede it after a plan is installed.
             ::NSunpackReadPlan::SetLegacyPrefetchActive(stream.Interface(), true);
