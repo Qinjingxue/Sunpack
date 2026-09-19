@@ -247,7 +247,9 @@ Output:
 ```text
 dist\sunpack-<arch>\
 dist\sunpack-<arch>\service\sunpack-watch-broker.exe
+dist\sunpack-<arch>\licenses\SunPack-MIT.txt
 dist\sunpack-<arch>\licenses\7zip-license.txt
+dist\sunpack-<arch>\licenses\7zip-source-license.txt
 dist\sunpack-<arch>\licenses\LGPL-2.1.txt
 dist\sunpack-<arch>\THIRD_PARTY_NOTICES.md
 release\sunpack-windows-<arch>-<version>-setup.exe
