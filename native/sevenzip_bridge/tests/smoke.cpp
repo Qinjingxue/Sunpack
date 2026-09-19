@@ -81,6 +81,31 @@ bool check_rar_hint_prefers_signature_handler() {
         {'R', 'a', 'r', '!', 0x1A, 0x07, 0x01, 0x00},
         0xCC);
 
+    const auto embedded_path = root / L"large-sfx.exe";
+    const std::size_t embedded_offset = (1024 * 1024) + 32;
+    {
+        std::ofstream stream(embedded_path, std::ios::binary | std::ios::trunc);
+        std::vector<unsigned char> prefix(embedded_offset, 0);
+        prefix[0] = 'M';
+        prefix[1] = 'Z';
+        stream.write(
+            reinterpret_cast<const char*>(prefix.data()),
+            static_cast<std::streamsize>(prefix.size()));
+        const std::vector<unsigned char> rar5 = {'R', 'a', 'r', '!', 0x1A, 0x07, 0x01, 0x00};
+        stream.write(
+            reinterpret_cast<const char*>(rar5.data()),
+            static_cast<std::streamsize>(rar5.size()));
+    }
+    const auto embedded = candidate_formats_for_hint(
+        L"rar",
+        embedded_path.wstring(),
+        {},
+        embedded_path.wstring(),
+        embedded_offset);
+    const bool embedded_ok =
+        embedded.size() == 1 &&
+        embedded.front().Data4[5] == 0xCC;
+
     const auto unknown_path = root / L"unknown.rar";
     {
         std::ofstream stream(unknown_path, std::ios::binary | std::ios::trunc);
@@ -93,7 +118,7 @@ bool check_rar_hint_prefers_signature_handler() {
         fallback[1].Data4[5] == 0xCC;
 
     std::filesystem::remove_all(root, error);
-    return rar4_ok && rar5_ok && fallback_ok;
+    return rar4_ok && rar5_ok && embedded_ok && fallback_ok;
 }
 
 bool check_wrong_password_evidence() {
