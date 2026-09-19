@@ -19,13 +19,7 @@
 
 struct ISunpackSharedInput : public IUnknown
 {
-    virtual HRESULT STDMETHODCALLTYPE Borrow(
-        UInt32 maxSize,
-        const Byte **data,
-        UInt32 *size,
-        UInt64 *token) = 0;
-
-    virtual HRESULT STDMETHODCALLTYPE ReleaseBorrowed(UInt64 token) = 0;
+    Z7_IFACE_COM7_PURE(ISunpackSharedInput)
 };
 
 // Project-private IID. It is intentionally not an upstream 7-Zip interface.
