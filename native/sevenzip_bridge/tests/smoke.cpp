@@ -1,11 +1,13 @@
 #include "sevenzip_bridge/bridge.hpp"
 #include "internal/sevenzip_paths.hpp"
+#include "internal/sevenzip_formats.hpp"
 #include "internal/password_probe_policy.hpp"
 #include "internal/sevenzip_status.hpp"
 #include "internal/native_runtime_control.hpp"
 #include "internal/native_worker_sizing.hpp"
 
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -36,6 +38,62 @@ bool check_numbered_volume_paths() {
     return seven_zip_sorted.size() == 2 &&
         std::filesystem::path(seven_zip_sorted[0]).filename() == L"payload.7z.001" &&
         std::filesystem::path(seven_zip_sorted[1]).filename() == L"payload.7z.002";
+}
+
+bool check_rar_hint_prefers_signature_handler() {
+    using sunpack::sevenzip::candidate_formats_for_hint;
+
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-rar-signature-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    error.clear();
+    std::filesystem::create_directories(root, error);
+    if (error) {
+        return false;
+    }
+
+    const auto check_signature = [&](const wchar_t* name,
+                                     const std::vector<unsigned char>& signature,
+                                     unsigned char expected_id) {
+        const auto path = root / name;
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        if (!stream) {
+            return false;
+        }
+        stream.write(reinterpret_cast<const char*>(signature.data()),
+                     static_cast<std::streamsize>(signature.size()));
+        stream.close();
+        if (!stream) {
+            return false;
+        }
+
+        const auto formats = candidate_formats_for_hint(L"rar", path.wstring(), {});
+        return formats.size() == 1 && formats.front().Data4[5] == expected_id;
+    };
+
+    const bool rar4_ok = check_signature(
+        L"rar4.rar",
+        {'R', 'a', 'r', '!', 0x1A, 0x07, 0x00},
+        0x03);
+    const bool rar5_ok = check_signature(
+        L"rar5.rar",
+        {'R', 'a', 'r', '!', 0x1A, 0x07, 0x01, 0x00},
+        0xCC);
+
+    const auto unknown_path = root / L"unknown.rar";
+    {
+        std::ofstream stream(unknown_path, std::ios::binary | std::ios::trunc);
+        stream << "not-rar";
+    }
+    const auto fallback = candidate_formats_for_hint(L"rar", unknown_path.wstring(), {});
+    const bool fallback_ok =
+        fallback.size() == 2 &&
+        fallback[0].Data4[5] == 0x03 &&
+        fallback[1].Data4[5] == 0xCC;
+
+    std::filesystem::remove_all(root, error);
+    return rar4_ok && rar5_ok && fallback_ok;
 }
 
 bool check_wrong_password_evidence() {
@@ -330,6 +388,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_wrong_password_evidence()) {
         std::cerr << "wrong password evidence check failed\n";
         return 3;
+    }
+    if (!check_rar_hint_prefers_signature_handler()) {
+        std::cerr << "RAR signature handler selection check failed\n";
+        return 16;
     }
     if (!check_password_probe_status_names()) {
         std::cerr << "password probe status name check failed\n";
