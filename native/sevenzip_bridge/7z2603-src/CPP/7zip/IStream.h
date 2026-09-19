@@ -108,6 +108,63 @@ Z7_IFACE_CONSTR_STREAM_SUB(IOutStream, ISequentialOutStream, 0x04)
   x(GetSize(UInt64 *size))
 Z7_IFACE_CONSTR_STREAM(IStreamGetSize, 0x06)
 
+#ifdef SUP7Z_USE_PLANNED_IO
+#define Z7_IFACEM_IStreamSetReadPlan(x) \
+  x(BeginReadPlan()) \
+  x(AddReadPlan(UInt64 offset, UInt64 size)) \
+  x(EndReadPlan())
+Z7_IFACE_CONSTR_STREAM(IStreamSetReadPlan, 0x7e)
+
+namespace NSunpackReadPlan
+{
+  static const UInt64 kToEnd = (UInt64)(Int64)-1;
+
+  inline IStreamSetReadPlan *Query(IUnknown *stream)
+  {
+    if (!stream)
+      return NULL;
+    IStreamSetReadPlan *plan = NULL;
+    if (stream->QueryInterface(IID_IStreamSetReadPlan, (void **)&plan) != S_OK)
+      return NULL;
+    return plan;
+  }
+
+  inline void Begin(IUnknown *stream)
+  {
+    IStreamSetReadPlan *plan = Query(stream);
+    if (!plan) return;
+    plan->BeginReadPlan();
+    plan->Release();
+  }
+
+  inline void Add(IUnknown *stream, UInt64 offset, UInt64 size)
+  {
+    IStreamSetReadPlan *plan = Query(stream);
+    if (!plan) return;
+    plan->AddReadPlan(offset, size);
+    plan->Release();
+  }
+
+  inline void End(IUnknown *stream)
+  {
+    IStreamSetReadPlan *plan = Query(stream);
+    if (!plan) return;
+    plan->EndReadPlan();
+    plan->Release();
+  }
+
+  inline void PlanWhole(IUnknown *stream)
+  {
+    IStreamSetReadPlan *plan = Query(stream);
+    if (!plan) return;
+    plan->BeginReadPlan();
+    plan->AddReadPlan(0, kToEnd);
+    plan->EndReadPlan();
+    plan->Release();
+  }
+}
+#endif
+
 #define Z7_IFACEM_IOutStreamFinish(x) \
   x(OutStreamFinish())
 Z7_IFACE_CONSTR_STREAM(IOutStreamFinish, 0x07)
