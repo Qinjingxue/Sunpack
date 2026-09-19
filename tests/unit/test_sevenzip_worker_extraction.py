@@ -843,11 +843,8 @@ def test_worker_dry_run_hashes_output_when_source_crc_is_missing(tmp_path):
     assert item["crc_verified"] is True
 
 
-@pytest.mark.parametrize(
-    ("format_hint", "prefetch_enabled"),
-    [("tar", False), ("", True)],
-)
-def test_worker_applies_format_aware_prefetch_policy(tmp_path, format_hint, prefetch_enabled):
+@pytest.mark.parametrize("format_hint", ["tar", ""])
+def test_worker_keeps_prefetch_enabled_across_format_hints(tmp_path, format_hint):
     worker = _require_worker_or_skip()
     source = tmp_path / "payload.bin"
     source.write_bytes(b"prefetch policy payload")
@@ -875,10 +872,10 @@ def test_worker_applies_format_aware_prefetch_policy(tmp_path, format_hint, pref
     worker_result = _worker_result(result.stdout)
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert worker_result["input_trace"]["prefetch_enabled"] is prefetch_enabled
+    assert worker_result["input_trace"]["prefetch_enabled"] is True
 
 
-def test_worker_disables_prefetch_for_native_rar_volumes(tmp_path):
+def test_worker_keeps_prefetch_enabled_for_native_rar_volumes(tmp_path):
     worker = _require_worker_or_skip()
     first = tmp_path / "archive.part1.rar"
     second = tmp_path / "archive.part2.rar"
@@ -912,7 +909,7 @@ def test_worker_disables_prefetch_for_native_rar_volumes(tmp_path):
     worker_result = _worker_result(result.stdout)
 
     assert result.returncode != 0
-    assert worker_result["input_trace"]["prefetch_enabled"] is False
+    assert worker_result["input_trace"]["prefetch_enabled"] is True
 
 
 def test_worker_omits_input_profile_without_opt_in(tmp_path):
