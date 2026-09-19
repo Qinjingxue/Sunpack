@@ -11,9 +11,9 @@
 2. 消掉 worker 内部大量 COM 抽象，简化代码
 3. `sunpack_sevenzip.dll` 同样把 7z 编进去，并消掉部分 COM 抽象
 
-结论：需要保留 **230 个编译单元（.c/.cpp）**，物理删除其余 **249 个**；
+结论：需要保留 **228 个编译单元（.c/.cpp）**（源码 API 迁移后由 230 减至 228，见 §14），物理删除其余编译单元；
 若把整个源码树都算上（含头文件、makefile、bundles、DOC），实际保留 **479 / 1292 个文件**
-（保留集包含 230 个编译单元、226 个头文件、12 个 `Asm/` 汇编、11 个 `DOC/`）。
+（保留集包含 228 个编译单元、226 个头文件、12 个 `Asm/` 汇编、11 个 `DOC/`）。
 保留下来的部分已在本机用 MSVC 实际编译、链接并跑通格式矩阵（见文末验证记录）。
 
 > **落地状态（本轮已完成）**：源码树已按 §11 物理裁剪，构建已接入
@@ -294,7 +294,7 @@ native/sevenzip_bridge/
 | `CPP/7zip/Compress` | 101 | 52 | 49 |
 | `CPP/7zip/Crypto` | 28 | 14 | 14 |
 | `CPP/7zip/UI` + `Bundles` + `C/Util` 等 | — | 0 | 全部 |
-| **合计** | **479** | **230** | **249** |
+| **合计** | **479** | **228** | **251** |
 
 按源码字节数：保留 3.20 MB / 7.49 MB，**裁掉 57%**。
 
@@ -498,7 +498,7 @@ IInArchive ...
 
 1. `project(... LANGUAGES C CXX)` —— 保留集里有大量 `.c`，必须真正按 C 编译
 2. 新增 `sunpack_7zip_objects` **OBJECT** library，源码用 `GLOB_RECURSE CONFIGURE_DEPENDS`
-   从已裁剪的树里取，并加 **sanity check：数量必须是 230**，否则 configure 阶段报错
+   从已裁剪的树里取，并加 **sanity check：数量必须是 228**，否则 configure 阶段报错
 3. 对象直接进入最终 PE：
    `target_sources(sunpack_sevenzip PRIVATE $<TARGET_OBJECTS:sunpack_7zip_objects>)`，
    worker / smoke 通过 `sup7z_attach_bundled_7z()` 同样注入
@@ -731,3 +731,123 @@ buffer ownership / prefetch / async writer / memcpy      → 阶段 3/4
 
 改动 8 个文件，**业务行为零变化**：解压数据路径、prefetch、async writer、所有 memcpy、
 所有 COM callback 语义均未触碰。
+
+---
+
+## 14. 阶段 2 第二、三步：接口类型迁移 + GUID ownership 接管 + DLL export 层裁剪
+
+§13 只完成了"工厂与常量来源"的迁移，九套 C++ interface 类型仍是手抄的。
+本节补完那一刀，并顺带把 7z.dll 的对外导出层清掉。
+
+### 14.1 九套手抄接口彻底删除
+
+`sevenzip_sdk.hpp` 里原本还留着 `ISequentialInStream` / `IInStream` / `IProgress` /
+`IArchiveOpenCallback` / `IArchiveOpenVolumeCallback` / `ISequentialOutStream` /
+`IArchiveExtractCallback` / `ICryptoGetTextPassword` / `IInArchive` 九个 struct。
+它们位于 `sunpack::sevenzip`，与上游 `::IInArchive` 是**两套不同的 C++ 类型**，
+只是 vtable 恰好一致才没出事。现在全部换成 `using ::IInArchive;` 等九个 alias。
+
+于是 `class FileInStream : public IInStream` 才真的等价于 `: public ::IInStream`，
+`create_in_archive()` 也真的收发 `::IInArchive**`，不再靠 `void**` 偷渡。
+
+### 14.2 这一步暴露出的三个真实问题
+
+**① `throw()` 的结论此前确实没有被工程验证。** `override` 现在对着上游接口，
+编译立即报 **274 个 C2694 + 10 个 C3668**。上游 `STDMETHOD` 展开为
+`COM_DECLSPEC_NOTHROW`（MSVC 下 `__declspec(nothrow)`），MSVC 把它算进签名。
+补法：定义一个 `SUP7Z_NOEXCEPT`，53 处 override 全部补上。
+
+两个细节是实测踩出来的，不是推断：
+
+| 坑 | 现象 | 结论 |
+|----|------|------|
+| 位置 | `f() override noexcept` 报 C2059 "语法错误: noexcept" | 异常规范必须写在 `override` **之前**：`f() noexcept override` |
+| 拼写 | `/std:c++17` 下 `throw()` 本身已非法（动态异常规范被移除） | 宏展开为 `noexcept`，不是 `throw()` |
+| 可见性 | 宏定义在 `#include` 之后就太晚，`sevenzip_streams.hpp` 先用到 | 宏必须放在 `sevenzip_sdk.hpp` 最前面，早于所有 include |
+
+**② `PROPID` 不是 `UInt32`。** `OpenCallback::GetProperty` 原本写
+`GetProperty(UInt32 propID, ...)`，上游是 `GetProperty(PROPID propID, ...)`，而
+`PROPID` 是 `ULONG`。在 Windows 上 `unsigned long` 与 `unsigned int` 是**不同类型**，
+所以这个 override 根本没匹配上（C3668）。改成 `PROPID` 即通。
+
+**③ `MyInitGuid.h` 之前必须先有 COM 头。** 它一被 include 就立刻定义
+`Z7_DEFINE_GUID`，之后所有接口头都在 `INITGUID` 已定义的状态下展开，
+所以 `IUnknown` / `PROPID` / `BSTR` 必须在那之前可见。缺了就是 54 个 C2504。
+
+### 14.3 GUID ownership 接管
+
+新增 `src/internal/sevenzip_guid_defs.cpp`，唯一职责就是定义 GUID：
+
+```cpp
+#include <objbase.h>
+#include <oleauto.h>
+
+#include "Common/MyInitGuid.h"   // 必须最先，且 INITGUID 只在此 TU 生效
+
+#include "7zip/ICoder.h"          // coder IID：解码路径与 mixer 会 QueryInterface
+#include "7zip/Archive/IArchive.h"
+#include "7zip/IPassword.h"
+#include "7zip/IProgress.h"
+#include "7zip/IStream.h"
+
+Z7_DEFINE_GUID(CLSID_CArchiveHandler, ...);
+```
+
+两点值得记：
+
+- **`ICoder.h` 必须列进来**，尽管 SunPack 从不直接创建 coder：`7zDecode.obj` /
+  `CoderMixer2.obj` 会 QueryInterface 找 `IID_ICompressCoder` /
+  `IID_ICompressCoder2` / `IID_ICompressFilter`。漏了就是 175 个 LNK2001。
+- **`CLSID_CArchiveHandler` 不在任何接口头里**，必须显式定义——`CreateArchiver()`
+  用它做格式解析。原来这个 definition 是 `DllExports2.cpp` 顺带产生的。
+
+### 14.4 DLL export 层裁剪
+
+删除 `CPP/7zip/Archive/DllExports2.cpp` 与 `CPP/7zip/Compress/CodecExports.cpp`：
+
+| 文件 | 原职责 | 现状 |
+|------|--------|------|
+| `DllExports2.cpp` | `DllMain` / `CreateObject` / `SetLargePageMode` / `SetCaseSensitive` / `SetCodecs`，并顺带产生 GUID definition | 全部无调用者；GUID 职责已迁走。`NT_CHECK` 在 `_WIN64 + _UNICODE` 下展开为空操作 |
+| `CodecExports.cpp` | 对外 codec factory（`CreateCoder` / `CreateHasher` / `CreateDecoder` / …） | 唯一调用者是 `DllExports2::CreateObject()`，已退出调用链。7-Zip handler 内部走的是 `Common/CreateCoder.cpp` 的 `g_Codecs` registry，不受影响 |
+
+**保留编译单元 230 → 228**，`docs/zh-CN/sevenzip_retained_sources.txt` 已重新生成，
+CMake 的 configure 期断言同步改为 228。
+
+### 14.5 验证
+
+| 验证 | 结果 |
+|------|------|
+| x64 Release 编译 + 链接 | 通过 |
+| `ctest`（bridge 4 个单测） | 4/4 通过 |
+| `pytest tests/unit tests/cli` | 1128 通过 |
+| `run_acceptance_tests.ps1 -Arch x64` | 8/8 步骤全部 PASS |
+| 保留编译单元数 | 228（清单与源码树一致） |
+| 53 处 override 对上游接口的真实性 | 由编译器 C3668 反向证明——不匹配就报错 |
+
+### 14.6 收尾后的状态
+
+```text
+SunPack
+  ↓
+#include 官方 7-Zip 头（PRIVATE，仅 CPP 子树）
+  ↓
+create_in_archive() → ::CreateArchiver()
+  ↓
+真正的 ::IInArchive / ::IInStream / ::IArchiveExtractCallback ...
+```
+
+`CreateObjectFunc` / `embedded_create_object` / `create_object` / 手抄接口 /
+手抄 IID / 手抄 PropID / 手抄 operation-result / `ComModule` / `LoadLibrary`
+全部退出 bridge。
+
+### 14.7 下一步（架构师列的第四步）
+
+```text
+ComPtr → CMyComPtr      注意 refcount 语义不同：ComPtr(raw) 接管已有引用不 AddRef，
+                        CMyComPtr(raw) 会 AddRef；必须与 refs_ = 1 的初始语义同批迁移
+QueryInterface/AddRef/Release → CMyUnknownImp + Z7_COM_UNKNOWN_IMP_*
+CoInitializeEx / CoUninitialize 退出（需先确认无 CoCreateInstance 依赖）
+Ole32 链接依赖退出（OleAut32 要留：SysAllocString / PROPVARIANT / VariantClear）
+```
+
+本轮刻意停在这里：refcount 语义变更与类型迁移混在一起会让 refcount bug 难以定位。

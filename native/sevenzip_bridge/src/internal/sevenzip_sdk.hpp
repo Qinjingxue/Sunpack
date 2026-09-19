@@ -1,5 +1,7 @@
 #pragma once
 
+#define SUP7Z_NOEXCEPT noexcept
+
 #include "archive_operations.hpp"
 
 #include "sevenzip_bridge/bridge.hpp"
@@ -12,11 +14,6 @@
 
 #include <windows.h>
 
-// The bridge is now a source-level consumer of the bundled 7-Zip rather than a
-// 7z.dll client, so it uses upstream's declarations instead of a hand-copied
-// ABI mirror. These must come after the Windows COM headers above: the SunPack
-// targets build with WIN32_LEAN_AND_MEAN, which leaves <Windows.h> without the
-// COM/ole types 7-Zip's headers rely on.
 #include "7zip/Archive/IArchive.h"
 #include "7zip/IPassword.h"
 #include "7zip/IProgress.h"
@@ -34,11 +31,6 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-    // The declared signature is the same one the external 7z.dll exposed, and
-    // the bridge keeps its own mirror of the archive interfaces so that the
-    // implementation files stay unchanged. What matters for correctness is the
-    // IIDs, property ids and operation-result codes below: those now come from
-    // upstream, so they can no longer drift from the handler implementation.
     using ::IID_IArchiveExtractCallback;
     using ::IID_IArchiveOpenCallback;
     using ::IID_IArchiveOpenVolumeCallback;
@@ -96,87 +88,15 @@ namespace sunpack::sevenzip
 
     std::wstring win32_extended_path(const std::wstring &path);
 
-    struct ISequentialInStream : public IUnknown
-    {
-
-        virtual HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) = 0;
-    };
-
-    struct IInStream : public ISequentialInStream
-    {
-
-        virtual HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) = 0;
-    };
-
-    struct IProgress : public IUnknown
-    {
-
-        virtual HRESULT STDMETHODCALLTYPE SetTotal(UInt64 total) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *completeValue) = 0;
-    };
-
-    struct IArchiveOpenCallback : public IUnknown
-    {
-
-        virtual HRESULT STDMETHODCALLTYPE SetTotal(const UInt64 *files, const UInt64 *bytes) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *files, const UInt64 *bytes) = 0;
-    };
-
-    struct IArchiveOpenVolumeCallback : public IUnknown
-    {
-
-        virtual HRESULT STDMETHODCALLTYPE GetProperty(UInt32 propID, PROPVARIANT *value) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE GetStream(const wchar_t *name, IInStream **inStream) = 0;
-    };
-
-    struct ISequentialOutStream : public IUnknown
-    {
-
-        virtual HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) = 0;
-    };
-
-    struct IArchiveExtractCallback : public IProgress
-    {
-
-        virtual HRESULT STDMETHODCALLTYPE GetStream(UInt32 index, ISequentialOutStream **outStream, Int32 askExtractMode) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE PrepareOperation(Int32 askExtractMode) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE SetOperationResult(Int32 opRes) = 0;
-    };
-
-    struct ICryptoGetTextPassword : public IUnknown
-    {
-
-        virtual HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) = 0;
-    };
-
-    struct IInArchive : public IUnknown
-    {
-
-        virtual HRESULT STDMETHODCALLTYPE Open(IInStream *stream, const UInt64 *maxCheckStartPosition, IArchiveOpenCallback *openCallback) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE Close() = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE GetNumberOfItems(UInt32 *numItems) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE GetProperty(UInt32 index, UInt32 propID, PROPVARIANT *value) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE Extract(const UInt32 *indices, UInt32 numItems, Int32 testMode, IArchiveExtractCallback *extractCallback) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE GetArchiveProperty(UInt32 propID, PROPVARIANT *value) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE GetNumberOfProperties(UInt32 *numProps) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE GetPropertyInfo(UInt32 index, BSTR *name, UInt32 *propID, VARTYPE *varType) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE GetNumberOfArchiveProperties(UInt32 *numProps) = 0;
-
-        virtual HRESULT STDMETHODCALLTYPE GetArchivePropertyInfo(UInt32 index, BSTR *name, UInt32 *propID, VARTYPE *varType) = 0;
-    };
+    using ::IArchiveExtractCallback;
+    using ::IArchiveOpenCallback;
+    using ::IArchiveOpenVolumeCallback;
+    using ::ICryptoGetTextPassword;
+    using ::IInArchive;
+    using ::IInStream;
+    using ::IProgress;
+    using ::ISequentialInStream;
+    using ::ISequentialOutStream;
 
     template <typename T>
 

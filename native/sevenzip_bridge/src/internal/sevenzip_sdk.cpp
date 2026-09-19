@@ -5,11 +5,10 @@
 // Upstream's archive factory, provided by the bundled sources
 // (CPP/7zip/Archive/ArchiveExports.cpp) linked into the same image.
 //
-// NOTE: DllExports2.cpp must stay in the build for now even though nothing here
-// calls CreateObject() any more — it pulls in Common/MyInitGuid.h, which is the
-// only place that defines INITGUID, and therefore the only translation unit
-// that actually defines the IID_* symbols. Dropping it would leave them
-// undefined. Removing it means moving INITGUID into one of our own TUs.
+// The DLL export layer (DllExports2.cpp) and its codec factory
+// (Compress/CodecExports.cpp) have been trimmed: SunPack only ever creates
+// IInArchive, and CreateObject() additionally dispatched coder/hasher requests
+// that were never made here. GUID ownership moved to sevenzip_guid_defs.cpp.
 STDAPI CreateArchiver(const GUID *clsid, const GUID *iid, void **outObject);
 
 #endif

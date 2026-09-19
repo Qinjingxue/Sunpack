@@ -619,7 +619,7 @@ namespace sunpack::sevenzip
 
         bool is_open() const { return handle_ != INVALID_HANDLE_VALUE; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
         {
 
             if (!object)
@@ -643,9 +643,9 @@ namespace sunpack::sevenzip
             return E_NOINTERFACE;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
 
-        ULONG STDMETHODCALLTYPE Release() override
+        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
         {
 
             const ULONG refs = InterlockedDecrement(&refs_);
@@ -659,7 +659,7 @@ namespace sunpack::sevenzip
             return refs;
         }
 
-        HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) override
+        HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
 
             if (processedSize)
@@ -784,7 +784,7 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) override
+        HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
 
             LARGE_INTEGER distance{};
@@ -937,7 +937,7 @@ namespace sunpack::sevenzip
 
         bool is_open() const { return valid_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
         {
 
             if (!object)
@@ -961,9 +961,9 @@ namespace sunpack::sevenzip
             return E_NOINTERFACE;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
 
-        ULONG STDMETHODCALLTYPE Release() override
+        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
         {
 
             const ULONG refs = InterlockedDecrement(&refs_);
@@ -977,7 +977,7 @@ namespace sunpack::sevenzip
             return refs;
         }
 
-        HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) override
+        HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
 
             if (processedSize)
@@ -1195,7 +1195,7 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) override
+        HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
 
             Int64 base = 0;
@@ -1491,7 +1491,7 @@ namespace sunpack::sevenzip
 
         bool is_open() const { return valid_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
         {
 
             if (!object)
@@ -1515,9 +1515,9 @@ namespace sunpack::sevenzip
             return E_NOINTERFACE;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
 
-        ULONG STDMETHODCALLTYPE Release() override
+        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
         {
 
             const ULONG refs = InterlockedDecrement(&refs_);
@@ -1531,7 +1531,7 @@ namespace sunpack::sevenzip
             return refs;
         }
 
-        HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) override
+        HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
 
             if (processedSize)
@@ -1749,7 +1749,7 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) override
+        HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
 
             Int64 base = 0;

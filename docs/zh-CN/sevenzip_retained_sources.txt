@@ -1,7 +1,12 @@
-# SunPack 保留的 7-Zip 源码编译单元清单（解压专用子集）
+# SunPack 保留的 7-Zip 源码编译单元清单（解压专用子集 + 源码 API 迁移后）
 # 来源: native/sevenzip_bridge/7z2603-src (7-Zip 26.03)
 # 生成方式: MSVC 实际编译 + 完整链接验证（见 docs/zh-CN/sevenzip_source_trimming.md）
-# 编译单元数: 230
+# 编译单元数: 228
+#
+# 相对上一版（230）减少 2 个：
+#   CPP/7zip/Archive/DllExports2.cpp   —— 7z.dll 对外入口，SunPack 不再调用
+#   CPP/7zip/Compress/CodecExports.cpp —— 其外部 codec factory 层
+# GUID ownership 已由 src/internal/sevenzip_guid_defs.cpp 接管。
 
 
 # ---- C ----
@@ -36,9 +41,9 @@ C/Md5.c
 C/MtCoder.c
 C/MtDec.c
 C/Ppmd7.c
-C/Ppmd7aDec.c
 C/Ppmd7Dec.c
 C/Ppmd7Enc.c
+C/Ppmd7aDec.c
 C/Ppmd8.c
 C/Ppmd8Dec.c
 C/Ppmd8Enc.c
@@ -61,7 +66,7 @@ C/XzEnc.c
 C/XzIn.c
 C/ZstdDec.c
 
-# ---- CPP\7zip\Archive\7z ----
+# ---- CPP/7zip/Archive/7z ----
 CPP/7zip/Archive/7z/7zCompressionMode.cpp
 CPP/7zip/Archive/7z/7zDecode.cpp
 CPP/7zip/Archive/7z/7zEncode.cpp
@@ -77,11 +82,11 @@ CPP/7zip/Archive/7z/7zRegister.cpp
 CPP/7zip/Archive/7z/7zSpecStream.cpp
 CPP/7zip/Archive/7z/7zUpdate.cpp
 
-# ---- CPP\7zip\Archive ----
+# ---- CPP/7zip/Archive ----
 CPP/7zip/Archive/ArchiveExports.cpp
 CPP/7zip/Archive/Bz2Handler.cpp
 
-# ---- CPP\7zip\Archive\Common ----
+# ---- CPP/7zip/Archive/Common ----
 CPP/7zip/Archive/Common/CoderMixer2.cpp
 CPP/7zip/Archive/Common/DummyOutStream.cpp
 CPP/7zip/Archive/Common/FindSignature.cpp
@@ -93,23 +98,22 @@ CPP/7zip/Archive/Common/OutStreamWithCRC.cpp
 CPP/7zip/Archive/Common/OutStreamWithSha1.cpp
 CPP/7zip/Archive/Common/ParseProperties.cpp
 
-# ---- CPP\7zip\Archive ----
+# ---- CPP/7zip/Archive ----
 CPP/7zip/Archive/DeflateProps.cpp
-CPP/7zip/Archive/DllExports2.cpp
 CPP/7zip/Archive/ExtHandler.cpp
 CPP/7zip/Archive/GzHandler.cpp
 CPP/7zip/Archive/HandlerCont.cpp
 CPP/7zip/Archive/LzhHandler.cpp
 CPP/7zip/Archive/PeHandler.cpp
 
-# ---- CPP\7zip\Archive\Rar ----
+# ---- CPP/7zip/Archive/Rar ----
 CPP/7zip/Archive/Rar/Rar5Handler.cpp
 CPP/7zip/Archive/Rar/RarHandler.cpp
 
-# ---- CPP\7zip\Archive ----
+# ---- CPP/7zip/Archive ----
 CPP/7zip/Archive/SplitHandler.cpp
 
-# ---- CPP\7zip\Archive\Tar ----
+# ---- CPP/7zip/Archive/Tar ----
 CPP/7zip/Archive/Tar/TarHandler.cpp
 CPP/7zip/Archive/Tar/TarHandlerOut.cpp
 CPP/7zip/Archive/Tar/TarHeader.cpp
@@ -118,10 +122,10 @@ CPP/7zip/Archive/Tar/TarOut.cpp
 CPP/7zip/Archive/Tar/TarRegister.cpp
 CPP/7zip/Archive/Tar/TarUpdate.cpp
 
-# ---- CPP\7zip\Archive ----
+# ---- CPP/7zip/Archive ----
 CPP/7zip/Archive/XzHandler.cpp
 
-# ---- CPP\7zip\Archive\Zip ----
+# ---- CPP/7zip/Archive/Zip ----
 CPP/7zip/Archive/Zip/ZipAddCommon.cpp
 CPP/7zip/Archive/Zip/ZipHandler.cpp
 CPP/7zip/Archive/Zip/ZipHandlerOut.cpp
@@ -131,12 +135,12 @@ CPP/7zip/Archive/Zip/ZipOut.cpp
 CPP/7zip/Archive/Zip/ZipRegister.cpp
 CPP/7zip/Archive/Zip/ZipUpdate.cpp
 
-# ---- CPP\7zip\Archive ----
+# ---- CPP/7zip/Archive ----
 CPP/7zip/Archive/ZstdHandler.cpp
 
-# ---- CPP\7zip\Common ----
-CPP/7zip/Common/CreateCoder.cpp
+# ---- CPP/7zip/Common ----
 CPP/7zip/Common/CWrappers.cpp
+CPP/7zip/Common/CreateCoder.cpp
 CPP/7zip/Common/FilterCoder.cpp
 CPP/7zip/Common/InBuffer.cpp
 CPP/7zip/Common/InOutTempBuffer.cpp
@@ -157,7 +161,11 @@ CPP/7zip/Common/StreamUtils.cpp
 CPP/7zip/Common/UniqBlocks.cpp
 CPP/7zip/Common/VirtThread.cpp
 
-# ---- CPP\7zip\Compress ----
+# ---- CPP/7zip/Compress ----
+CPP/7zip/Compress/BZip2Crc.cpp
+CPP/7zip/Compress/BZip2Decoder.cpp
+CPP/7zip/Compress/BZip2Encoder.cpp
+CPP/7zip/Compress/BZip2Register.cpp
 CPP/7zip/Compress/Bcj2Coder.cpp
 CPP/7zip/Compress/Bcj2Register.cpp
 CPP/7zip/Compress/BcjCoder.cpp
@@ -166,11 +174,6 @@ CPP/7zip/Compress/BitlDecoder.cpp
 CPP/7zip/Compress/BranchMisc.cpp
 CPP/7zip/Compress/BranchRegister.cpp
 CPP/7zip/Compress/ByteSwap.cpp
-CPP/7zip/Compress/BZip2Crc.cpp
-CPP/7zip/Compress/BZip2Decoder.cpp
-CPP/7zip/Compress/BZip2Encoder.cpp
-CPP/7zip/Compress/BZip2Register.cpp
-CPP/7zip/Compress/CodecExports.cpp
 CPP/7zip/Compress/CopyCoder.cpp
 CPP/7zip/Compress/CopyRegister.cpp
 CPP/7zip/Compress/Deflate64Register.cpp
@@ -180,6 +183,7 @@ CPP/7zip/Compress/DeflateRegister.cpp
 CPP/7zip/Compress/DeltaFilter.cpp
 CPP/7zip/Compress/ImplodeDecoder.cpp
 CPP/7zip/Compress/ImplodeHuffmanDecoder.cpp
+CPP/7zip/Compress/LzOutWindow.cpp
 CPP/7zip/Compress/LzfseDecoder.cpp
 CPP/7zip/Compress/LzhDecoder.cpp
 CPP/7zip/Compress/Lzma2Decoder.cpp
@@ -189,7 +193,6 @@ CPP/7zip/Compress/LzmaDecoder.cpp
 CPP/7zip/Compress/LzmaEncoder.cpp
 CPP/7zip/Compress/LzmaRegister.cpp
 CPP/7zip/Compress/LzmsDecoder.cpp
-CPP/7zip/Compress/LzOutWindow.cpp
 CPP/7zip/Compress/LzxDecoder.cpp
 CPP/7zip/Compress/PpmdDecoder.cpp
 CPP/7zip/Compress/PpmdEncoder.cpp
@@ -211,7 +214,7 @@ CPP/7zip/Compress/ZlibDecoder.cpp
 CPP/7zip/Compress/ZlibEncoder.cpp
 CPP/7zip/Compress/ZstdDecoder.cpp
 
-# ---- CPP\7zip\Crypto ----
+# ---- CPP/7zip/Crypto ----
 CPP/7zip/Crypto/7zAes.cpp
 CPP/7zip/Crypto/7zAesRegister.cpp
 CPP/7zip/Crypto/HmacSha1.cpp
@@ -227,7 +230,7 @@ CPP/7zip/Crypto/WzAes.cpp
 CPP/7zip/Crypto/ZipCrypto.cpp
 CPP/7zip/Crypto/ZipStrong.cpp
 
-# ---- CPP\Common ----
+# ---- CPP/Common ----
 CPP/Common/CRC.cpp
 CPP/Common/CrcReg.cpp
 CPP/Common/DynLimBuf.cpp
@@ -254,7 +257,7 @@ CPP/Common/Xxh64Reg.cpp
 CPP/Common/XzCrc64Init.cpp
 CPP/Common/XzCrc64Reg.cpp
 
-# ---- CPP\Windows ----
+# ---- CPP/Windows ----
 CPP/Windows/FileDir.cpp
 CPP/Windows/FileFind.cpp
 CPP/Windows/FileIO.cpp

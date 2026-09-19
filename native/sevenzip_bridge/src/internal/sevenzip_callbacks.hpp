@@ -148,7 +148,7 @@ namespace sunpack::sevenzip
             }
         }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
         {
 
             if (!object)
@@ -185,9 +185,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
 
-        ULONG STDMETHODCALLTYPE Release() override
+        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
         {
 
             const ULONG refs = InterlockedDecrement(&refs_);
@@ -201,11 +201,11 @@ namespace sunpack::sevenzip
             return refs;
         }
 
-        HRESULT STDMETHODCALLTYPE SetTotal(const UInt64 *, const UInt64 *) override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE SetTotal(const UInt64 *, const UInt64 *) SUP7Z_NOEXCEPT override { return S_OK; }
 
-        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *, const UInt64 *) override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *, const UInt64 *) SUP7Z_NOEXCEPT override { return S_OK; }
 
-        HRESULT STDMETHODCALLTYPE GetProperty(UInt32 propID, PROPVARIANT *value) override
+        HRESULT STDMETHODCALLTYPE GetProperty(PROPID propID, PROPVARIANT *value) SUP7Z_NOEXCEPT override
         {
 
             if (!value)
@@ -229,7 +229,7 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE GetStream(const wchar_t *name, IInStream **inStream) override
+        HRESULT STDMETHODCALLTYPE GetStream(const wchar_t *name, IInStream **inStream) SUP7Z_NOEXCEPT override
         {
 
             if (!inStream)
@@ -287,7 +287,7 @@ namespace sunpack::sevenzip
         const std::wstring &missing_volume_name() const { return missing_volume_name_; }
         const std::wstring &failed_volume_name() const { return failed_volume_name_; }
 
-        HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) override
+        HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) SUP7Z_NOEXCEPT override
         {
 
             if (!password)
@@ -338,7 +338,7 @@ namespace sunpack::sevenzip
         Int32 operation_result() const { return operation_result_; }
         bool password_requested() const { return password_requested_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
         {
 
             if (!object)
@@ -370,9 +370,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
 
-        ULONG STDMETHODCALLTYPE Release() override
+        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
         {
 
             const ULONG refs = InterlockedDecrement(&refs_);
@@ -386,11 +386,11 @@ namespace sunpack::sevenzip
             return refs;
         }
 
-        HRESULT STDMETHODCALLTYPE SetTotal(UInt64) override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE SetTotal(UInt64) SUP7Z_NOEXCEPT override { return S_OK; }
 
-        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *) override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *) SUP7Z_NOEXCEPT override { return S_OK; }
 
-        HRESULT STDMETHODCALLTYPE GetStream(UInt32, ISequentialOutStream **outStream, Int32) override
+        HRESULT STDMETHODCALLTYPE GetStream(UInt32, ISequentialOutStream **outStream, Int32) SUP7Z_NOEXCEPT override
         {
 
             if (!outStream)
@@ -404,9 +404,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE PrepareOperation(Int32) override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE PrepareOperation(Int32) SUP7Z_NOEXCEPT override { return S_OK; }
 
-        HRESULT STDMETHODCALLTYPE SetOperationResult(Int32 opRes) override
+        HRESULT STDMETHODCALLTYPE SetOperationResult(Int32 opRes) SUP7Z_NOEXCEPT override
         {
 
             operation_result_ = opRes;
@@ -414,7 +414,7 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) override
+        HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) SUP7Z_NOEXCEPT override
         {
 
             if (!password)
@@ -481,7 +481,7 @@ namespace sunpack::sevenzip
 
         UInt64 bytes_written() const { return bytes_written_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
         {
 
             if (!object)
@@ -508,9 +508,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
 
-        ULONG STDMETHODCALLTYPE Release() override
+        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
         {
 
             const ULONG refs = InterlockedDecrement(&refs_);
@@ -524,7 +524,7 @@ namespace sunpack::sevenzip
             return refs;
         }
 
-        HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) override
+        HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
 
             if (processedSize)
@@ -670,7 +670,7 @@ namespace sunpack::sevenzip
             }
         }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
         {
             if (!object)
             {
@@ -689,9 +689,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
 
-        ULONG STDMETHODCALLTYPE Release() override
+        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
         {
             const ULONG refs = InterlockedDecrement(&refs_);
             if (refs == 0)
@@ -701,7 +701,7 @@ namespace sunpack::sevenzip
             return refs;
         }
 
-        HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) override
+        HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (!writer_ || !file_)
@@ -756,7 +756,7 @@ namespace sunpack::sevenzip
 
         UInt64 bytes_written() const { return bytes_written_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
         {
 
             if (!object)
@@ -783,9 +783,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
 
-        ULONG STDMETHODCALLTYPE Release() override
+        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
         {
 
             const ULONG refs = InterlockedDecrement(&refs_);
@@ -799,7 +799,7 @@ namespace sunpack::sevenzip
             return refs;
         }
 
-        HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) override
+        HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
 
             bytes_written_ += size;
@@ -1154,7 +1154,7 @@ namespace sunpack::sevenzip
             }
         }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) override
+        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
         {
 
             if (!object)
@@ -1186,9 +1186,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&refs_); }
+        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
 
-        ULONG STDMETHODCALLTYPE Release() override
+        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
         {
 
             const ULONG refs = InterlockedDecrement(&refs_);
@@ -1202,7 +1202,7 @@ namespace sunpack::sevenzip
             return refs;
         }
 
-        HRESULT STDMETHODCALLTYPE SetTotal(UInt64 total) override
+        HRESULT STDMETHODCALLTYPE SetTotal(UInt64 total) SUP7Z_NOEXCEPT override
         {
 
             std::lock_guard<std::recursive_mutex> lock(state_mutex_);
@@ -1219,7 +1219,7 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *completeValue) override
+        HRESULT STDMETHODCALLTYPE SetCompleted(const UInt64 *completeValue) SUP7Z_NOEXCEPT override
         {
 
             std::lock_guard<std::recursive_mutex> lock(state_mutex_);
@@ -1240,7 +1240,7 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE GetStream(UInt32 index, ISequentialOutStream **outStream, Int32 askExtractMode) override
+        HRESULT STDMETHODCALLTYPE GetStream(UInt32 index, ISequentialOutStream **outStream, Int32 askExtractMode) SUP7Z_NOEXCEPT override
         {
 
             std::lock_guard<std::recursive_mutex> lock(state_mutex_);
@@ -1489,9 +1489,9 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE PrepareOperation(Int32) override { return S_OK; }
+        HRESULT STDMETHODCALLTYPE PrepareOperation(Int32) SUP7Z_NOEXCEPT override { return S_OK; }
 
-        HRESULT STDMETHODCALLTYPE SetOperationResult(Int32 opRes) override
+        HRESULT STDMETHODCALLTYPE SetOperationResult(Int32 opRes) SUP7Z_NOEXCEPT override
         {
 
             std::lock_guard<std::recursive_mutex> lock(state_mutex_);
@@ -1555,7 +1555,7 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
-        HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) override
+        HRESULT STDMETHODCALLTYPE CryptoGetTextPassword(BSTR *password) SUP7Z_NOEXCEPT override
         {
 
             std::lock_guard<std::recursive_mutex> lock(state_mutex_);

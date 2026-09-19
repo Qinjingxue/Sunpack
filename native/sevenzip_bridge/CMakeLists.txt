@@ -62,9 +62,9 @@ file(GLOB_RECURSE SUP7Z_BUNDLED_7Z_SOURCES CONFIGURE_DEPENDS
 )
 
 list(LENGTH SUP7Z_BUNDLED_7Z_SOURCES SUP7Z_BUNDLED_7Z_SOURCE_COUNT)
-if(NOT SUP7Z_BUNDLED_7Z_SOURCE_COUNT EQUAL 230)
+if(NOT SUP7Z_BUNDLED_7Z_SOURCE_COUNT EQUAL 228)
     message(FATAL_ERROR
-        "Trimmed 7-Zip tree must contribute exactly 230 translation units, found "
+        "Trimmed 7-Zip tree must contribute exactly 228 translation units, found "
         "${SUP7Z_BUNDLED_7Z_SOURCE_COUNT}. Re-derive the keep set (regenerate "
         "docs/zh-CN/sevenzip_retained_sources.txt) or fix the tree.")
 endif()
@@ -119,6 +119,7 @@ set(SUP7Z_INTERNAL_SOURCES
     src/internal/password_testing.cpp
     src/internal/sevenzip_engine.cpp
     src/internal/sevenzip_formats.cpp
+    src/internal/sevenzip_guid_defs.cpp
     src/internal/sevenzip_paths.cpp
     src/internal/sevenzip_properties.cpp
     src/internal/sevenzip_sdk.cpp
