@@ -516,15 +516,31 @@ def test_release_packages_copy_only_runtime_tool_files():
     assert 'Copy-Item -LiteralPath $toolsRoot -Destination $distToolsRoot -Recurse -Force' not in build_script
 
 
-def test_release_package_includes_third_party_license_material():
+def test_release_package_includes_complete_license_material():
     build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
     notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    mit = (ROOT / "LICENSE").read_text(encoding="utf-8")
+    source_license = (ROOT / "licenses" / "7zip-source-license.txt").read_text(encoding="utf-8")
+    upstream_source_license = (
+        ROOT / "native" / "sevenzip_bridge" / "7z2603-src" / "DOC" / "License.txt"
+    ).read_text(encoding="utf-8")
     lgpl = (ROOT / "licenses" / "LGPL-2.1.txt").read_text(encoding="utf-8")
 
+    assert "$mitLicensePath" in build_script
+    assert "$sevenZipLicensePath" in build_script
+    assert "$sevenZipSourceLicensePath" in build_script
     assert "$lgplLicensePath" in build_script
     assert "$thirdPartyNoticesPath" in build_script
+    assert 'Join-Path $distLicensesRoot "SunPack-MIT.txt"' in build_script
+    assert 'Join-Path $distLicensesRoot "7zip-license.txt"' in build_script
+    assert 'Join-Path $distLicensesRoot "7zip-source-license.txt"' in build_script
     assert 'Join-Path $distLicensesRoot "LGPL-2.1.txt"' in build_script
     assert "$distThirdPartyNoticesPath" in build_script
+
+    assert "MIT License" in mit
+    assert source_license == upstream_source_license
+    assert "7z2603-src" in notices
+    assert "7zip-source-license.txt" in notices
     assert "7z.dll" in notices
     assert "7z.exe" in notices
     assert "7z.sfx" in notices
