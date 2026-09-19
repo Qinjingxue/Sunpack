@@ -119,17 +119,100 @@ Z7_COM7F_IMF(CCopyCoder::Code(ISequentialInStream *inStream,
       }
     } transit(sharedInput.Interface(), sharedOutput.Interface());
 
+    // Preserve the writer's 1 MiB work-item granularity. Small prefetch spans
+    // (ZIP is intentionally 128 KiB) are cheaper to memcpy into one writer-
+    // owned lease than to turn into many borrowed WriteFile operations.
+    const UInt32 kSharedOutputSize = 1u << 20;
+    Byte *coalesceData = NULL;
+    UInt32 coalesceCapacity = 0;
+    UInt32 coalesceSize = 0;
+    UInt64 coalesceToken = 0;
+
+    const auto commitCoalesced = [&]() -> HRESULT
+    {
+      if (!coalesceToken)
+        return S_OK;
+      UInt32 committed = 0;
+      const HRESULT res = sharedOutput->Commit(
+          coalesceToken, coalesceSize, &committed);
+      coalesceData = NULL;
+      coalesceCapacity = 0;
+      coalesceSize = 0;
+      coalesceToken = 0;
+      if (res != S_OK)
+        return res;
+      return committed == 0 ? E_FAIL : S_OK;
+    };
+
+    const auto abortCoalesced = [&]()
+    {
+      if (coalesceToken)
+      {
+        UInt32 ignored = 0;
+        sharedOutput->Commit(coalesceToken, 0, &ignored);
+      }
+      coalesceData = NULL;
+      coalesceCapacity = 0;
+      coalesceSize = 0;
+      coalesceToken = 0;
+    };
+
     const auto finishTransit = [&](HRESULT result) -> HRESULT
     {
+      if (result == S_OK)
+      {
+        const HRESULT commitRes = commitCoalesced();
+        if (commitRes != S_OK)
+          result = commitRes;
+      }
+      else
+        abortCoalesced();
+
       const HRESULT drainRes = transit.Drain();
       return result == S_OK ? drainRes : result;
     };
 
+    const auto copyIntoCoalescer = [&](const Byte *data, UInt32 size) -> HRESULT
+    {
+      while (size != 0)
+      {
+        if (!coalesceToken)
+        {
+          Byte *dest = NULL;
+          UInt32 capacity = 0;
+          UInt64 token = 0;
+          const HRESULT acquireRes = sharedOutput->Acquire(
+              kSharedOutputSize, &dest, &capacity, &token);
+          if (acquireRes != S_OK)
+            return acquireRes;
+          if (!dest || capacity == 0 || token == 0)
+            return E_FAIL;
+          coalesceData = dest;
+          coalesceCapacity = capacity;
+          coalesceSize = 0;
+          coalesceToken = token;
+        }
+
+        UInt32 room = coalesceCapacity - coalesceSize;
+        if (room == 0)
+        {
+          RINOK(commitCoalesced())
+          continue;
+        }
+        const UInt32 cur = size < room ? size : room;
+        memcpy(coalesceData + coalesceSize, data, cur);
+        coalesceSize += cur;
+        data += cur;
+        size -= cur;
+        if (coalesceSize == coalesceCapacity)
+          RINOK(commitCoalesced())
+      }
+      return S_OK;
+    };
+
     for (;;)
     {
-      // Shared input can hand us the full prefetch slot (typically 512 KiB);
-      // don't artificially chop it to CopyCoder's legacy 128 KiB buffer size.
-      UInt32 request = 1u << 20;
+      UInt32 request = kSharedOutputSize;
       if (outSize)
       {
         const UInt64 rem = *outSize - TotalSize;
@@ -157,10 +240,10 @@ Z7_COM7F_IMF(CCopyCoder::Code(ISequentialInStream *inStream,
 
       if (borrowRes == S_FALSE)
       {
-        const HRESULT drainRes = transit.Drain();
-        if (drainRes != S_OK)
-          return drainRes;
-        break; // continue below with the writer-owned buffer path
+        const HRESULT finishRes = finishTransit(S_OK);
+        if (finishRes != S_OK)
+          return finishRes;
+        break; // continue below with the generic writer-owned path
       }
       if (borrowRes != S_OK)
         return finishTransit(borrowRes);
@@ -171,67 +254,94 @@ Z7_COM7F_IMF(CCopyCoder::Code(ISequentialInStream *inStream,
         return finishTransit(E_FAIL);
       }
 
-      UInt32 accepted = 0;
-      UInt64 outputToken = 0;
-      HRESULT submitRes = S_FALSE;
-      for (;;)
+      // Only a full writer-sized span is worth pinning all the way through the
+      // asynchronous disk write. Anything smaller is copied/coalesced and its
+      // input lease is released immediately.
+      if (borrowedSize < kSharedOutputSize)
       {
-        submitRes = sharedOutput->SubmitBorrowed(
-            borrowed, borrowedSize, &accepted, &outputToken);
-        if (submitRes != S_FALSE || transit.Empty())
-          break;
-        const HRESULT retireRes = transit.RetireOne();
-        if (retireRes != S_OK)
+        HRESULT copyRes = copyIntoCoalescer(borrowed, borrowedSize);
+        if (copyRes == S_FALSE)
         {
-          sharedInput->ReleaseBorrowed(inputToken);
-          return finishTransit(retireRes);
+          // A wrapper can temporarily reject direct leases. Fall back to the
+          // normal stream path, which retains the legacy 1 MiB staging merge.
+          copyRes = WriteStream(outStream, borrowed, borrowedSize);
         }
-        accepted = 0;
-        outputToken = 0;
-      }
-
-      if (submitRes == S_FALSE)
-      {
-        const HRESULT writeRes = WriteStream(outStream, borrowed, borrowedSize);
         const HRESULT releaseRes = sharedInput->ReleaseBorrowed(inputToken);
-        if (writeRes != S_OK)
-          return finishTransit(writeRes);
+        if (copyRes != S_OK)
+          return finishTransit(copyRes);
         if (releaseRes != S_OK)
           return finishTransit(releaseRes);
       }
       else
       {
-        if (submitRes != S_OK)
+        // A pending writer-owned lease and a borrowed lease cannot coexist
+        // through CRC/hash wrappers. Commit the coalesced prefix first.
+        const HRESULT commitRes = commitCoalesced();
+        if (commitRes != S_OK)
         {
           sharedInput->ReleaseBorrowed(inputToken);
-          return finishTransit(submitRes);
-        }
-        if (accepted == 0 || accepted > borrowedSize || outputToken == 0)
-        {
-          if (outputToken)
-            sharedOutput->WaitBorrowed(outputToken);
-          sharedInput->ReleaseBorrowed(inputToken);
-          return finishTransit(E_FAIL);
+          return finishTransit(commitRes);
         }
 
-        // A solid folder boundary can shorten one borrowed output span. The
-        // remainder is copied only on that cold boundary; the common path is
-        // input-prefetch memory -> async WriteFile with no intermediate memcpy.
-        if (accepted != borrowedSize)
+        UInt32 accepted = 0;
+        UInt64 outputToken = 0;
+        HRESULT submitRes = S_FALSE;
+        for (;;)
         {
-          const HRESULT writeRes = WriteStream(
-              outStream, borrowed + accepted, borrowedSize - accepted);
-          if (writeRes != S_OK)
+          submitRes = sharedOutput->SubmitBorrowed(
+              borrowed, borrowedSize, &accepted, &outputToken);
+          if (submitRes != S_FALSE || transit.Empty())
+            break;
+          const HRESULT retireRes = transit.RetireOne();
+          if (retireRes != S_OK)
           {
-            sharedOutput->WaitBorrowed(outputToken);
             sharedInput->ReleaseBorrowed(inputToken);
-            return finishTransit(writeRes);
+            return finishTransit(retireRes);
           }
+          accepted = 0;
+          outputToken = 0;
         }
 
-        const HRESULT pushRes = transit.Push(inputToken, outputToken);
-        if (pushRes != S_OK)
-          return finishTransit(pushRes);
+        if (submitRes == S_FALSE)
+        {
+          const HRESULT writeRes = WriteStream(outStream, borrowed, borrowedSize);
+          const HRESULT releaseRes = sharedInput->ReleaseBorrowed(inputToken);
+          if (writeRes != S_OK)
+            return finishTransit(writeRes);
+          if (releaseRes != S_OK)
+            return finishTransit(releaseRes);
+        }
+        else
+        {
+          if (submitRes != S_OK)
+          {
+            sharedInput->ReleaseBorrowed(inputToken);
+            return finishTransit(submitRes);
+          }
+          if (accepted == 0 || accepted > borrowedSize || outputToken == 0)
+          {
+            if (outputToken)
+              sharedOutput->WaitBorrowed(outputToken);
+            sharedInput->ReleaseBorrowed(inputToken);
+            return finishTransit(E_FAIL);
+          }
+
+          if (accepted != borrowedSize)
+          {
+            const HRESULT writeRes = WriteStream(
+                outStream, borrowed + accepted, borrowedSize - accepted);
+            if (writeRes != S_OK)
+            {
+              sharedOutput->WaitBorrowed(outputToken);
+              sharedInput->ReleaseBorrowed(inputToken);
+              return finishTransit(writeRes);
+            }
+          }
+
+          const HRESULT pushRes = transit.Push(inputToken, outputToken);
+          if (pushRes != S_OK)
+            return finishTransit(pushRes);
+        }
       }
 
       TotalSize += borrowedSize;
