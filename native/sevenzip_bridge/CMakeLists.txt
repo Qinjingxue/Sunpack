@@ -42,8 +42,6 @@ option(SUP7Z_USE_X64_ASM
 option(SUP7Z_USE_ARM64_ASM
     "Use upstream 7-Zip ARM64 LZMA decoder assembly hot path"
     ON)
-set(SUP7Z_CLANG_CL_EXECUTABLE "" CACHE FILEPATH
-    "clang-cl executable used only to assemble upstream 7-Zip ARM64 LzmaDecOpt.S")
 
 set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)
@@ -233,13 +231,20 @@ if(SUP7Z_ARM64_ASM_ENABLED)
     endif()
 
     if(NOT SUP7Z_CLANG_CL_EXECUTABLE)
+        # Do not pre-create this cache entry as an empty string: find_program()
+        # skips searching when its result variable is already defined. A user
+        # supplied -DSUP7Z_CLANG_CL_EXECUTABLE=<path> therefore wins; otherwise
+        # we discover the host clang-cl from the selected VS instance or PATH.
+        unset(SUP7Z_CLANG_CL_EXECUTABLE CACHE)
         find_program(SUP7Z_CLANG_CL_EXECUTABLE
             NAMES clang-cl.exe clang-cl
             HINTS
                 "${CMAKE_GENERATOR_INSTANCE}/VC/Tools/Llvm/x64/bin"
                 "${CMAKE_GENERATOR_INSTANCE}/VC/Tools/Llvm/ARM64/bin"
                 "$ENV{VCINSTALLDIR}/Tools/Llvm/x64/bin"
-                "$ENV{VCINSTALLDIR}/Tools/Llvm/ARM64/bin")
+                "$ENV{VCINSTALLDIR}/Tools/Llvm/ARM64/bin"
+            DOC "clang-cl executable used only to assemble upstream 7-Zip ARM64 LzmaDecOpt.S"
+            NO_CMAKE_FIND_ROOT_PATH)
     endif()
     if(NOT SUP7Z_CLANG_CL_EXECUTABLE)
         message(FATAL_ERROR
