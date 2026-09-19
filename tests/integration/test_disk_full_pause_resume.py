@@ -30,6 +30,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 pytestmark = pytest.mark.skipif(
     sys.platform != "win32", reason="VHD / diskpart 是 Windows-only"
@@ -480,9 +481,8 @@ def _worker_path() -> Path:
 
 
 def _seven_zip_dll() -> Path:
-    from sunpack.support.resources import get_7z_dll_path
-
-    path = Path(get_7z_dll_path())
+    
+    path = Path(get_7z_cli_dll_path())
     if not path.exists():
         pytest.skip(f"7z.dll not found: {path}")
     return path
@@ -520,7 +520,6 @@ def _physical_volume_key(path: Path) -> str:
 def _job_request(job_id: str, archive: Path, output_dir: Path, volume_key: str = "") -> dict:
     request = {
         "job_id": job_id,
-        "seven_zip_dll_path": str(_seven_zip_dll()),
         "archive_path": str(archive),
         "output_dir": str(output_dir),
     }

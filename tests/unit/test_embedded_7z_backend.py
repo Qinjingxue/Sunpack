@@ -98,7 +98,6 @@ def test_worker_extracts_zip_without_7z_dll(tmp_path):
         worker,
         {
             "job_id": "embedded-backend-worker",
-            "seven_zip_dll_path": "",
             "archive_path": str(archive),
             "output_dir": str(output_dir),
             "password": "",
@@ -122,8 +121,6 @@ def test_dll_serves_probe_and_resources_without_7z_dll(tmp_path):
     from sunpack.support.sevenzip_bridge import NativePasswordTester
 
     tester = NativePasswordTester(wrapper_path=str(staging / "sunpack_sevenzip.dll"))
-    # The compatibility field must not resurrect a hard 7z.dll requirement.
-    tester.seven_zip_dll_path = ""
     assert tester.available() is True
 
     probe = tester.probe_archive(str(archive))
@@ -143,7 +140,6 @@ def test_dll_loads_with_no_7z_dll_on_disk(tmp_path):
     from sunpack.support.sevenzip_bridge import NativePasswordTester
 
     tester = NativePasswordTester(wrapper_path=str(staging / "sunpack_sevenzip.dll"))
-    tester.seven_zip_dll_path = ""
     library = tester._load()
     assert library is not None
     assert (staging / "sunpack_sevenzip.dll").is_file()

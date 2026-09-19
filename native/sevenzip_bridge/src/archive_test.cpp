@@ -99,7 +99,6 @@ namespace
 } // namespace
 
 SUP7Z_API int sup7z_test_archive(
-    const wchar_t *seven_zip_dll_path,
     const wchar_t *archive_path,
     const wchar_t *password,
     int *command_ok,
@@ -131,8 +130,7 @@ SUP7Z_API int sup7z_test_archive(
     const std::wstring archive_path_text(archive_path);
 
     const auto result = sunpack::sevenzip::test_password(
-        seven_zip_dll_path,
-        archive_path_text,
+            archive_path_text,
         password ? password : L"");
     copy_text(
         archive_type,
@@ -155,7 +153,6 @@ SUP7Z_API int sup7z_test_archive(
 }
 
 SUP7Z_API int sup7z_test_archive_with_parts(
-    const wchar_t *seven_zip_dll_path,
     const wchar_t *archive_path,
     const wchar_t *const *part_paths,
     int part_count,
@@ -189,8 +186,7 @@ SUP7Z_API int sup7z_test_archive_with_parts(
     const std::wstring archive_path_text(archive_path);
 
     const auto result = sunpack::sevenzip::test_password_with_parts(
-        seven_zip_dll_path,
-        archive_path_text,
+            archive_path_text,
         collect_part_paths(archive_path, part_paths, part_count),
         password ? password : L"");
     copy_text(

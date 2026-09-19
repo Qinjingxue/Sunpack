@@ -76,7 +76,6 @@ std::wstring manifest_json(const sunpack::sevenzip::CrcManifestResult& result) {
 }
 
 int read_manifest(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* part_paths,
     int part_count,
@@ -97,8 +96,7 @@ int read_manifest(
 
     const std::wstring archive_path_text(archive_path);
     const auto result = read_archive_crc_manifest_with_parts(
-        seven_zip_dll_path,
-        archive_path_text,
+            archive_path_text,
         collect_part_paths(archive_path, part_paths, part_count),
         password ? password : L"",
         static_cast<UInt32>(max_items < 0 ? 0 : max_items));
@@ -110,7 +108,6 @@ int read_manifest(
 }  // namespace
 
 SUP7Z_API int sup7z_read_archive_crc_manifest(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* password,
     int max_items,
@@ -120,8 +117,7 @@ SUP7Z_API int sup7z_read_archive_crc_manifest(
     int message_chars
 ) {
     return read_manifest(
-        seven_zip_dll_path,
-        archive_path,
+            archive_path,
         nullptr,
         0,
         password,
@@ -133,7 +129,6 @@ SUP7Z_API int sup7z_read_archive_crc_manifest(
 }
 
 SUP7Z_API int sup7z_read_archive_crc_manifest_with_parts(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* part_paths,
     int part_count,
@@ -145,8 +140,7 @@ SUP7Z_API int sup7z_read_archive_crc_manifest_with_parts(
     int message_chars
 ) {
     return read_manifest(
-        seven_zip_dll_path,
-        archive_path,
+            archive_path,
         part_paths,
         part_count,
         password,

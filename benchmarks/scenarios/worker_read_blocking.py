@@ -25,7 +25,8 @@ if str(ROOT) not in sys.path:
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
 from benchmarks.scenarios.sevenzip_worker_matrix import _case_job, _median, _run_job
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
 MIB = 1024 * 1024
@@ -169,7 +170,7 @@ def main() -> int:
         parser.error("--prefetch-window-kib must be 64..16384 and --prefetch-depth must be 1..8")
 
     worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
-    dll_path = Path(get_7z_dll_path()).resolve()
+    dll_path = Path(get_7z_cli_dll_path()).resolve()
     if not worker_path.is_file() or not dll_path.is_file():
         parser.error("the native worker and 7z.dll must both exist")
 
@@ -246,7 +247,7 @@ def main() -> int:
                 "cache_caveat": "Windows file-cache state is not purged or controlled; generated archives are likely warm. Use --archive with a representative pre-existing archive for a production-cache-state sample.",
                 "prefetch_comparison": "Consumer blocking is synchronous ReadFile time plus wait for prefetch; background ReadFile may overlap output work and is not added to that metric.",
             },
-            "environment": {"worker_path": str(worker_path), "seven_zip_dll_path": str(dll_path), "python": sys.version, "cpu_count": os.cpu_count()},
+            "environment": {"worker_path": str(worker_path), "python": sys.version, "cpu_count": os.cpu_count()},
             "results": rows,
             "summary": summary,
             "artifacts": {"result_dir": str(workspace.result_dir)},

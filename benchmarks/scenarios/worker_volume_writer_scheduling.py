@@ -41,7 +41,8 @@ from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_pa
 from benchmarks.scenarios.worker_single_file_write import MIB, GIB, _create_archive
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
 from sunpack.support.output_paths import resolve_output_volume_key
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
 SCENARIO = "extraction.worker-volume-writer-scheduling"
@@ -228,7 +229,6 @@ def _run_configuration(
             payload = json.dumps(
                 {
                     "job_id": job.job_id,
-                    "seven_zip_dll_path": str(dll_path),
                     "archive_path": str(job.archive),
                     "part_paths": [str(job.archive)],
                     "output_dir": str(job.output_dir),
@@ -352,7 +352,7 @@ def main() -> int:
     if not worker_path.is_file():
         parser.error(f"worker executable is unavailable: {worker_path}")
     try:
-        dll_path = Path(get_7z_dll_path()).resolve()
+        dll_path = Path(get_7z_cli_dll_path()).resolve()
     except FileNotFoundError as exc:
         parser.error(str(exc))
 
@@ -553,7 +553,6 @@ def main() -> int:
             },
             "environment": {
                 "worker": str(worker_path),
-                "seven_zip_dll_path": str(dll_path),
                 "cpu_count": os.cpu_count(),
                 "topology": targets,
                 "corpus": {key: value for key, value in corpus.items() if key != "archive"},

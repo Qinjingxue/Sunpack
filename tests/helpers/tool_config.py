@@ -107,6 +107,23 @@ def require_7z() -> Path:
     return seven_zip
 
 
+def get_7z_cli_dll_path() -> str:
+    """Locate the 7z.dll that belongs to the 7-Zip *command line* tool.
+
+    This is part of the fixture-generator toolchain, not of the SunPack
+    runtime: the product's 7-Zip backend is compiled into
+    sunpack_sevenzip.dll / sunpack_sevenzip_worker.exe and never loads 7z.dll.
+    It exists so tests and benchmarks that generate archives with tools\\7z.exe
+    can assert its companion module is present.
+    """
+    dll = require_7z().parent / "7z.dll"
+    if not dll.is_file():
+        raise FileNotFoundError(
+            f"7z.dll (companion module of the 7z.exe fixture generator) is missing next to {dll.parent}"
+        )
+    return str(dll)
+
+
 def require_zstd() -> Path:
     zstd_exe = get_test_tools()["zstd_exe"]
     if not zstd_exe or not zstd_exe.is_file():

@@ -5,7 +5,7 @@ import threading
 from dataclasses import dataclass
 from pathlib import Path
 
-from sunpack.support.resources import candidate_resource_roots, get_7z_dll_path, tool_dir_candidates
+from sunpack.support.resources import candidate_resource_roots, tool_dir_candidates
 from sunpack.support.global_cache_manager import cached_value, file_identity
 
 
@@ -155,7 +155,6 @@ class _Sup7zInputRange(ctypes.Structure):
 class _Sup7zOperationRequest(ctypes.Structure):
     _fields_ = [
         ("operation", ctypes.c_int),
-        ("seven_zip_dll_path", ctypes.c_wchar_p),
         ("archive_path", ctypes.c_wchar_p),
         ("part_paths", ctypes.POINTER(ctypes.c_wchar_p)),
         ("part_count", ctypes.c_int),
@@ -196,14 +195,8 @@ class _Sup7zOperationResult(ctypes.Structure):
 
 
 class NativePasswordTester:
-    def __init__(self, wrapper_path: str | None = None, seven_zip_dll_path: str | None = None):
+    def __init__(self, wrapper_path: str | None = None):
         self.wrapper_path = wrapper_path or self._default_wrapper_path()
-        # Inert compatibility field: the 7-Zip backend is embedded in
-        # sunpack_sevenzip.dll, so this no longer selects the backend location.
-        # It is still forwarded across the C ABI, which ignores it.
-        self.seven_zip_dll_path = (
-            seven_zip_dll_path if seven_zip_dll_path is not None else get_7z_dll_path()
-        )
         self._library = None
         self._load_lock = threading.Lock()
 
@@ -324,7 +317,6 @@ class NativePasswordTester:
 
         request = _Sup7zOperationRequest(
             operation,
-            ctypes.c_wchar_p(str(self.seven_zip_dll_path)),
             ctypes.c_wchar_p(str(effective_archive)),
             part_array,
             ctypes.c_int(len(effective_parts)),
@@ -368,7 +360,6 @@ class NativePasswordTester:
             attempts = ctypes.c_int(0)
             message = ctypes.create_unicode_buffer(512)
             status = library.sup7z_try_passwords_with_parts(
-                ctypes.c_wchar_p(str(self.seven_zip_dll_path)),
                 ctypes.c_wchar_p(str(archive_path)),
                 part_array,
                 ctypes.c_int(len(normalized_parts)),
@@ -417,7 +408,6 @@ class NativePasswordTester:
             archive_type = ctypes.create_unicode_buffer(64)
             message = ctypes.create_unicode_buffer(512)
             status = library.sup7z_test_archive_with_parts(
-                ctypes.c_wchar_p(str(self.seven_zip_dll_path)),
                 ctypes.c_wchar_p(str(archive_path)),
                 part_array,
                 ctypes.c_int(len(normalized_parts)),
@@ -492,7 +482,6 @@ class NativePasswordTester:
         message = ctypes.create_unicode_buffer(512)
 
         status = library.sup7z_analyze_archive_resources_with_parts(
-            ctypes.c_wchar_p(str(self.seven_zip_dll_path)),
             ctypes.c_wchar_p(str(archive_path)),
             part_array,
             ctypes.c_int(len(normalized_parts)),
@@ -534,7 +523,6 @@ class NativePasswordTester:
         message = ctypes.create_unicode_buffer(512)
 
         status = library.sup7z_read_archive_crc_manifest_with_parts(
-            ctypes.c_wchar_p(str(self.seven_zip_dll_path)),
             ctypes.c_wchar_p(str(archive_path)),
             part_array,
             ctypes.c_int(len(normalized_parts)),
@@ -575,7 +563,6 @@ class NativePasswordTester:
             library.sup7z_run_operation.restype = ctypes.c_int
             library.sup7z_try_passwords.argtypes = [
                 ctypes.c_wchar_p,
-                ctypes.c_wchar_p,
                 ctypes.POINTER(ctypes.c_wchar_p),
                 ctypes.c_int,
                 ctypes.POINTER(ctypes.c_int),
@@ -585,7 +572,6 @@ class NativePasswordTester:
             ]
             library.sup7z_try_passwords.restype = ctypes.c_int
             library.sup7z_try_passwords_with_parts.argtypes = [
-                ctypes.c_wchar_p,
                 ctypes.c_wchar_p,
                 ctypes.POINTER(ctypes.c_wchar_p),
                 ctypes.c_int,
@@ -600,7 +586,6 @@ class NativePasswordTester:
             library.sup7z_test_archive.argtypes = [
                 ctypes.c_wchar_p,
                 ctypes.c_wchar_p,
-                ctypes.c_wchar_p,
                 ctypes.POINTER(ctypes.c_int),
                 ctypes.POINTER(ctypes.c_int),
                 ctypes.POINTER(ctypes.c_int),
@@ -611,7 +596,6 @@ class NativePasswordTester:
             ]
             library.sup7z_test_archive.restype = ctypes.c_int
             library.sup7z_test_archive_with_parts.argtypes = [
-                ctypes.c_wchar_p,
                 ctypes.c_wchar_p,
                 ctypes.POINTER(ctypes.c_wchar_p),
                 ctypes.c_int,
@@ -628,14 +612,12 @@ class NativePasswordTester:
             library.sup7z_analyze_archive_resources.argtypes = [
                 ctypes.c_wchar_p,
                 ctypes.c_wchar_p,
-                ctypes.c_wchar_p,
                 ctypes.POINTER(_Sup7zArchiveResourceAnalysis),
                 ctypes.c_wchar_p,
                 ctypes.c_int,
             ]
             library.sup7z_analyze_archive_resources.restype = ctypes.c_int
             library.sup7z_analyze_archive_resources_with_parts.argtypes = [
-                ctypes.c_wchar_p,
                 ctypes.c_wchar_p,
                 ctypes.POINTER(ctypes.c_wchar_p),
                 ctypes.c_int,
@@ -653,7 +635,6 @@ class NativePasswordTester:
         library.sup7z_read_archive_crc_manifest.argtypes = [
             ctypes.c_wchar_p,
             ctypes.c_wchar_p,
-            ctypes.c_wchar_p,
             ctypes.c_int,
             ctypes.c_wchar_p,
             ctypes.c_int,
@@ -662,7 +643,6 @@ class NativePasswordTester:
         ]
         library.sup7z_read_archive_crc_manifest.restype = ctypes.c_int
         library.sup7z_read_archive_crc_manifest_with_parts.argtypes = [
-            ctypes.c_wchar_p,
             ctypes.c_wchar_p,
             ctypes.POINTER(ctypes.c_wchar_p),
             ctypes.c_int,
@@ -707,7 +687,6 @@ def _cache_key(tester: NativePasswordTester, archive_path: str, part_paths: list
     parts = tuple(file_identity(path) for path in list(dict.fromkeys(part_paths or [archive_path])))
     return (
         str(tester.wrapper_path),
-        str(tester.seven_zip_dll_path),
         file_identity(archive_path),
         parts,
     )

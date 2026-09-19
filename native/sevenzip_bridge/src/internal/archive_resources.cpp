@@ -97,7 +97,7 @@ namespace sunpack::sevenzip
 
             result.status = PasswordTestStatus::Unsupported;
 
-            result.message = "7z.dll did not create a supported archive handler";
+            result.message = "the embedded 7-Zip backend did not create a supported archive handler";
         }
         else if (looks_wrong_password(last_hr, kOpOk, last_encryption_evidence))
         {
@@ -123,7 +123,6 @@ namespace sunpack::sevenzip
 
     ResourceAnalysisResult analyze_archive_resources_with_parts(
 
-        const std::wstring &seven_zip_dll_path,
 
         const std::wstring &archive_path,
 
@@ -136,7 +135,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
+        const CreateObjectFunc create_object = embedded_create_object();
 
         if (!create_object)
         {
@@ -154,7 +153,6 @@ namespace sunpack::sevenzip
 
 #else
 
-        (void)seven_zip_dll_path;
 
         (void)archive_path;
 

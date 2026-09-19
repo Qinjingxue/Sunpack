@@ -179,40 +179,6 @@ namespace sunpack::sevenzip
 
     using CreateObjectFunc = HRESULT(WINAPI *)(const GUID *clsid, const GUID *iid, void **outObject);
 
-    class ComModule
-    {
-
-    public:
-        explicit ComModule(const std::wstring &path) : module_(LoadLibraryW(path.c_str())) {}
-
-        ~ComModule()
-        {
-
-            if (module_)
-            {
-
-                FreeLibrary(module_);
-            }
-        }
-
-        HMODULE get() const { return module_; }
-
-        CreateObjectFunc create_object() const
-        {
-
-            if (!module_)
-            {
-
-                return nullptr;
-            }
-
-            return reinterpret_cast<CreateObjectFunc>(GetProcAddress(module_, "CreateObject"));
-        }
-
-    private:
-        HMODULE module_ = nullptr;
-    };
-
     template <typename T>
 
     class ComPtr
@@ -259,7 +225,7 @@ namespace sunpack::sevenzip
         T *ptr_ = nullptr;
     };
 
-    CreateObjectFunc cached_create_object(const std::wstring &seven_zip_dll_path);
+    CreateObjectFunc embedded_create_object();
 
 #endif
 

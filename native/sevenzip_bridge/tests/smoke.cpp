@@ -381,13 +381,16 @@ int wmain(int argc, wchar_t** argv) {
     }
 #endif
 
-    std::wstring dll_path = L"tools\\7z.dll";
+    // The 7-Zip backend is compiled into this binary, so there is no backend
+    // location to select any more. An optional argument names the archive to
+    // probe; an empty path exercises the "no archive" path.
+    std::wstring archive_path;
     if (argc > 1) {
-        dll_path = argv[1];
+        archive_path = argv[1];
     }
 
-    const bool available = sunpack::sevenzip::is_backend_available(dll_path);
-    const auto result = sunpack::sevenzip::test_password(dll_path, L"", L"");
+    const bool available = sunpack::sevenzip::is_backend_available();
+    const auto result = sunpack::sevenzip::test_password(archive_path, L"");
 
     std::cout << "backend_available=" << (available ? "true" : "false") << "\n";
     std::cout << "status=" << sunpack::sevenzip::status_name(result.status) << "\n";

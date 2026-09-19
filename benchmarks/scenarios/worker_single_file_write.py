@@ -23,7 +23,8 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
 SCENARIO = "extraction.worker-single-file-write"
@@ -107,7 +108,6 @@ def _job_payload(
     return json.dumps(
         {
             "job_id": job_id,
-            "seven_zip_dll_path": str(dll_path),
             "archive_path": str(archive),
             "part_paths": [str(archive)],
             "output_dir": str(output_dir),
@@ -504,7 +504,7 @@ def main() -> int:
         os.environ.pop("SUNPACK_ASYNC_WRITER_WRITE_THROUGH", None)
     worker_specs = _worker_specs(args, parser)
     try:
-        dll_path = Path(get_7z_dll_path()).resolve()
+        dll_path = Path(get_7z_cli_dll_path()).resolve()
     except FileNotFoundError as exc:
         parser.error(str(exc))
     if not dll_path.is_file():
@@ -568,7 +568,6 @@ def main() -> int:
             },
             "environment": {
                 "workers": {label: str(path) for label, path in worker_specs},
-                "seven_zip_dll_path": str(dll_path),
                 "cpu_count": os.cpu_count(),
                 "python": sys.version,
             },

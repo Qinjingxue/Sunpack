@@ -434,7 +434,7 @@ namespace sunpack::sevenzip
 
                 result.status = PasswordTestStatus::Unsupported;
 
-                result.message = "7z.dll did not create a supported archive handler";
+                result.message = "the embedded 7-Zip backend did not create a supported archive handler";
             }
             else if (!any_opened && plan.uses_ranges() && encrypted_header_range_probe_candidate(plan.archive_type))
             {
@@ -653,7 +653,7 @@ namespace sunpack::sevenzip
 
             result.status = PasswordTestStatus::Unsupported;
 
-            result.message = "7z.dll did not create a supported archive handler";
+            result.message = "the embedded 7-Zip backend did not create a supported archive handler";
         }
         else if (!any_opened)
         {
@@ -696,8 +696,7 @@ namespace sunpack::sevenzip
 
     PasswordTestResult test_password_with_parts(
 
-        const std::wstring &seven_zip_dll_path,
-
+    
         const std::wstring &archive_path,
 
         const std::vector<std::wstring> &part_paths,
@@ -710,8 +709,7 @@ namespace sunpack::sevenzip
 
     PasswordTestResult test_passwords_with_parts(
 
-        const std::wstring &seven_zip_dll_path,
-
+    
         const std::wstring &archive_path,
 
         const std::vector<std::wstring> &part_paths,
@@ -726,8 +724,7 @@ namespace sunpack::sevenzip
 
     PasswordTestResult test_password(
 
-        const std::wstring &seven_zip_dll_path,
-
+    
         const std::wstring &archive_path,
 
         const std::wstring &password
@@ -735,13 +732,12 @@ namespace sunpack::sevenzip
     )
     {
 
-        return test_password_with_parts(seven_zip_dll_path, archive_path, {archive_path}, password);
+        return test_password_with_parts(archive_path, {archive_path}, password);
     }
 
     PasswordTestResult test_password_with_parts(
 
-        const std::wstring &seven_zip_dll_path,
-
+    
         const std::wstring &archive_path,
 
         const std::vector<std::wstring> &part_paths,
@@ -755,7 +751,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
+        CreateObjectFunc create_object = embedded_create_object();
 
         if (!create_object)
         {
@@ -764,7 +760,7 @@ namespace sunpack::sevenzip
 
             result.status = PasswordTestStatus::BackendUnavailable;
 
-            result.message = "7z.dll could not be loaded";
+            result.message = "the embedded 7-Zip backend is unavailable";
 
             return result;
         }
@@ -782,8 +778,7 @@ namespace sunpack::sevenzip
 
 #else
 
-        (void)seven_zip_dll_path;
-
+    
         (void)archive_path;
 
         (void)password;
@@ -801,8 +796,7 @@ namespace sunpack::sevenzip
 
     PasswordTestResult test_passwords(
 
-        const std::wstring &seven_zip_dll_path,
-
+    
         const std::wstring &archive_path,
 
         const wchar_t *const *passwords,
@@ -812,13 +806,12 @@ namespace sunpack::sevenzip
     )
     {
 
-        return test_passwords_with_parts(seven_zip_dll_path, archive_path, {archive_path}, passwords, password_count);
+        return test_passwords_with_parts(archive_path, {archive_path}, passwords, password_count);
     }
 
     PasswordTestResult test_passwords_with_parts(
 
-        const std::wstring &seven_zip_dll_path,
-
+    
         const std::wstring &archive_path,
 
         const std::vector<std::wstring> &part_paths,
@@ -834,7 +827,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
+        CreateObjectFunc create_object = embedded_create_object();
 
         if (!create_object)
         {
@@ -843,7 +836,7 @@ namespace sunpack::sevenzip
 
             result.status = PasswordTestStatus::BackendUnavailable;
 
-            result.message = "7z.dll could not be loaded";
+            result.message = "the embedded 7-Zip backend is unavailable";
 
             return result;
         }
@@ -980,8 +973,7 @@ namespace sunpack::sevenzip
 
 #else
 
-        (void)seven_zip_dll_path;
-
+    
         (void)archive_path;
 
         (void)passwords;
@@ -1001,8 +993,7 @@ namespace sunpack::sevenzip
 
     PasswordTestResult test_passwords_with_ranges(
 
-        const std::wstring &seven_zip_dll_path,
-
+    
         const std::wstring &archive_path,
 
         const std::vector<ExtractInputRange> &ranges,
@@ -1018,7 +1009,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
+        CreateObjectFunc create_object = embedded_create_object();
 
         if (!create_object)
         {
@@ -1027,7 +1018,7 @@ namespace sunpack::sevenzip
 
             result.status = PasswordTestStatus::BackendUnavailable;
 
-            result.message = "7z.dll could not be loaded";
+            result.message = "the embedded 7-Zip backend is unavailable";
 
             return result;
         }
@@ -1117,8 +1108,7 @@ namespace sunpack::sevenzip
 
 #else
 
-        (void)seven_zip_dll_path;
-
+    
         (void)archive_path;
 
         (void)ranges;

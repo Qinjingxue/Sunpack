@@ -17,7 +17,7 @@ from sunpack.contracts.tasks import ArchiveTask
 from sunpack.extraction.internal.sevenzip.worker_diagnostics import attach_worker_diagnostics
 from sunpack.support import archive_knowledge_projection as knowledge_view
 from sunpack.support.output_paths import normalized_output_dir, resolve_output_volume_key
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
 from sunpack.support.runtime_cwd import runtime_working_directory
 
 _LOGGER = logging.getLogger(__name__)
@@ -868,7 +868,6 @@ class SevenZipRunner:
         self.request_id = ""
         self.origin = "foreground"
         self.worker_path = None
-        self.seven_zip_dll_path = None
         self._worker_holder: _NativeWorkerHolder | None = shared_worker_holder
         self._owns_worker_holder = shared_worker_holder is None
         self._async_worker_holder = shared_async_worker_holder
@@ -887,7 +886,6 @@ class SevenZipRunner:
             event_loop=self._event_loop,
         )
         runner.worker_path = self.worker_path
-        runner.seven_zip_dll_path = self.seven_zip_dll_path
         runner.native_event_callback = self.native_event_callback
         runner.request_id = self.request_id
         runner.origin = self.origin
@@ -1353,7 +1351,6 @@ class SevenZipRunner:
             "origin": "watch" if self.origin == "watch" else "foreground",
             "file_id": str(getattr(task, "key", "") or archive_path),
             "stage": "extract",
-            "seven_zip_dll_path": self._seven_zip_dll_path(),
             "archive_path": archive_path,
             "part_paths": list(part_paths or [archive_path]),
             "output_dir": out_dir,
@@ -1478,10 +1475,6 @@ class SevenZipRunner:
         except Exception:
             pass
 
-    def _seven_zip_dll_path(self) -> str:
-        if self.seven_zip_dll_path is None:
-            self.seven_zip_dll_path = get_7z_dll_path()
-        return self.seven_zip_dll_path
 
     def _apply_native_job_budget(self, job: dict) -> None:
         configured = self.process_config.get("job_buffer_budget_bytes")

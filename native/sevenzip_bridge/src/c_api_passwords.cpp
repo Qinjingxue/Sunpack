@@ -5,7 +5,6 @@
 #include "c_api_common.hpp"
 
 SUP7Z_API int sup7z_try_passwords(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* passwords,
     int password_count,
@@ -27,7 +26,7 @@ SUP7Z_API int sup7z_try_passwords(
         return status_code(PasswordTestStatus::Error);
     }
 
-    const auto result = test_passwords(seven_zip_dll_path, archive_path, passwords, password_count);
+    const auto result = test_passwords(archive_path, passwords, password_count);
     if (matched_index) {
         *matched_index = result.matched_index;
     }
@@ -39,7 +38,6 @@ SUP7Z_API int sup7z_try_passwords(
 }
 
 SUP7Z_API int sup7z_try_passwords_with_parts(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* part_paths,
     int part_count,
@@ -64,8 +62,7 @@ SUP7Z_API int sup7z_try_passwords_with_parts(
     }
 
     const auto result = test_passwords_with_parts(
-        seven_zip_dll_path,
-        archive_path,
+            archive_path,
         collect_part_paths(archive_path, part_paths, part_count),
         passwords,
         password_count);

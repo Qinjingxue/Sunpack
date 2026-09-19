@@ -70,21 +70,18 @@ struct CrcManifestResult {
 };
 
 ArchiveOpenProbeResult probe_archive_open_with_parts(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
     const std::wstring& password
 );
 
 ResourceAnalysisResult analyze_archive_resources_with_parts(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
     const std::wstring& password
 );
 
 CrcManifestResult read_archive_crc_manifest_with_parts(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
     const std::wstring& password,

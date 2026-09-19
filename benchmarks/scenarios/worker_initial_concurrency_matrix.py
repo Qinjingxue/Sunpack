@@ -20,7 +20,8 @@ if str(ROOT) not in sys.path:
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
 from benchmarks.scenarios.extraction_format_matrix import RAR, SEVEN_ZIP, _run_7z, _run_rar
 from benchmarks.scenarios.worker_small_file_scheduling import ADMISSION_CASES, _run_batch
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
 SCENARIO = "extraction.worker-initial-concurrency-matrix"
@@ -277,7 +278,7 @@ def main() -> int:
         parser.error("bundled 7z.exe and Rar.exe are required for the calibration matrix")
     try:
         worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
-        dll_path = Path(get_7z_dll_path()).resolve()
+        dll_path = Path(get_7z_cli_dll_path()).resolve()
     except FileNotFoundError as exc:
         parser.error(str(exc))
 
@@ -377,7 +378,6 @@ def main() -> int:
             "environment": {
                 **resource_snapshot,
                 "worker_path": str(worker_path),
-                "seven_zip_dll_path": str(dll_path),
                 "python": sys.version,
             },
             "corpus": {

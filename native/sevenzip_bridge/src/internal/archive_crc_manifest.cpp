@@ -249,7 +249,7 @@ CrcManifestResult read_archive_crc_manifest_internal(
 
         result.status = PasswordTestStatus::Unsupported;
 
-        result.message = "7z.dll did not create a supported archive handler";
+        result.message = "the embedded 7-Zip backend did not create a supported archive handler";
 
     } else if (looks_wrong_password(last_hr, last_op_res, last_encryption_evidence)) {
 
@@ -283,7 +283,6 @@ CrcManifestResult read_archive_crc_manifest_internal(
 
 CrcManifestResult read_archive_crc_manifest_with_parts(
 
-    const std::wstring& seven_zip_dll_path,
 
     const std::wstring& archive_path,
 
@@ -297,7 +296,7 @@ CrcManifestResult read_archive_crc_manifest_with_parts(
 
 #ifdef _WIN32
 
-    const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
+    const CreateObjectFunc create_object = embedded_create_object();
 
     if (!create_object) {
 
@@ -315,7 +314,6 @@ CrcManifestResult read_archive_crc_manifest_with_parts(
 
 #else
 
-    (void)seven_zip_dll_path;
 
     (void)archive_path;
 

@@ -360,7 +360,6 @@ struct WorkerArchiveInput {
 };
 
 sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
-    const std::wstring& dll_path,
     const WorkerArchiveInput& archive_input,
     const std::vector<std::wstring>& candidates
 ) {
@@ -372,7 +371,6 @@ sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
     }
     if (!archive_input.ranges.empty()) {
         return test_passwords_with_ranges(
-            dll_path,
             archive_input.archive_path,
             archive_input.ranges,
             archive_input.format_hint,
@@ -380,7 +378,6 @@ sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
             static_cast<int>(password_ptrs.size()));
     }
     return test_passwords_with_parts(
-        dll_path,
         archive_input.archive_path,
         archive_input.part_paths,
         password_ptrs.data(),
@@ -846,7 +843,6 @@ int run_request(
         return -101;
     }
 
-    const std::wstring dll_path = utf8_to_wide(json_string_field(request, "seven_zip_dll_path", "tools\\7z.dll"));
     const std::wstring archive_path = utf8_to_wide(json_string_field(request, "archive_path", ""));
     const std::wstring output_dir = utf8_to_wide(json_string_field(request, "output_dir", ""));
     const std::wstring password = utf8_to_wide(json_string_field(request, "password", ""));
@@ -922,8 +918,8 @@ int run_request(
     }
     auto extract_with_password = [&](const std::wstring& selected_password) {
         return archive_input.ranges.empty()
-            ? extract_archive_with_parts(dll_path, archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
-            : extract_archive_with_ranges(dll_path, archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
+            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
+            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
     };
 
     ExtractArchiveResult result;
@@ -934,7 +930,7 @@ int run_request(
         result = extract_with_password(password_candidates.front());
         const bool direct_ok = result.status == PasswordTestStatus::Ok && result.command_ok;
         if (!direct_ok) {
-            const auto probe = run_password_candidate_probe(dll_path, archive_input, password_candidates);
+            const auto probe = run_password_candidate_probe(archive_input, password_candidates);
             result.password_attempts = probe.attempts;
             if (probe.status == PasswordTestStatus::WrongPassword) {
                 result.status = PasswordTestStatus::WrongPassword;
@@ -954,7 +950,7 @@ int run_request(
         result.password_candidates_all_rejected =
             result.password_candidates_all_rejected || result.wrong_password || result.password_rejected;
     } else {
-        const auto probe = run_password_candidate_probe(dll_path, archive_input, password_candidates);
+        const auto probe = run_password_candidate_probe(archive_input, password_candidates);
         if (probe.status != PasswordTestStatus::Ok ||
             probe.matched_index < 0 ||
             static_cast<std::size_t>(probe.matched_index) >= password_candidates.size()) {

@@ -640,7 +640,7 @@ namespace sunpack::sevenzip
 
             set_failure(result, "handler_create", "unsupported", last_hr);
 
-            result.message = "7z.dll did not create a supported archive handler";
+            result.message = "the embedded 7-Zip backend did not create a supported archive handler";
         }
         else if (!any_opened)
         {
@@ -679,18 +679,17 @@ namespace sunpack::sevenzip
 
 #endif
 
-    bool is_backend_available(const std::wstring &seven_zip_dll_path)
+    bool is_backend_available()
     {
 
 #ifdef _WIN32
 
-        const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
+        const CreateObjectFunc create_object = embedded_create_object();
 
         return create_object != nullptr;
 
 #else
 
-        (void)seven_zip_dll_path;
 
         return false;
 
@@ -699,7 +698,6 @@ namespace sunpack::sevenzip
 
     ExtractArchiveResult extract_archive_with_parts(
 
-        const std::wstring &seven_zip_dll_path,
 
         const std::wstring &archive_path,
 
@@ -734,7 +732,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
+        const CreateObjectFunc create_object = embedded_create_object();
 
         if (!create_object)
         {
@@ -786,7 +784,6 @@ namespace sunpack::sevenzip
 
 #else
 
-        (void)seven_zip_dll_path;
 
         (void)archive_path;
 
@@ -823,7 +820,6 @@ namespace sunpack::sevenzip
 
     ExtractArchiveResult extract_archive_with_ranges(
 
-        const std::wstring &seven_zip_dll_path,
 
         const std::wstring &archive_path,
 
@@ -854,7 +850,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
+        const CreateObjectFunc create_object = embedded_create_object();
 
         if (!create_object)
         {
@@ -901,7 +897,6 @@ namespace sunpack::sevenzip
 
 #else
 
-        (void)seven_zip_dll_path;
 
         (void)archive_path;
 

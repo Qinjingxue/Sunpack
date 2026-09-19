@@ -160,7 +160,7 @@ ArchiveOpenProbeResult probe_archive_open_internal(
     result.operation_result = last_op_res;
     if (!any_format_created) {
         result.status = PasswordTestStatus::Unsupported;
-        result.message = "7z.dll did not create a supported archive handler";
+        result.message = "the embedded 7-Zip backend did not create a supported archive handler";
     } else if (looks_damaged_probe_result(password, last_op_res)) {
         result.status = PasswordTestStatus::Damaged;
         result.is_archive = true;
@@ -183,13 +183,12 @@ ArchiveOpenProbeResult probe_archive_open_internal(
 #endif
 
 ArchiveOpenProbeResult probe_archive_open_with_parts(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
     const std::wstring& password
 ) {
 #ifdef _WIN32
-    const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
+    const CreateObjectFunc create_object = embedded_create_object();
     if (!create_object) {
         ArchiveOpenProbeResult result;
         result.status = PasswordTestStatus::BackendUnavailable;
@@ -198,7 +197,6 @@ ArchiveOpenProbeResult probe_archive_open_with_parts(
     }
     return probe_archive_open_internal(create_object, archive_path, password, part_paths);
 #else
-    (void)seven_zip_dll_path;
     (void)archive_path;
     (void)part_paths;
     (void)password;

@@ -530,13 +530,13 @@ IInArchive ...
 
 | 位置 | 改动 |
 |------|------|
-| `sunpack/support/resources.py` | `get_7z_dll_path()` 找不到时返回 `""` 而不是抛 `FileNotFoundError` |
+| `sunpack/support/resources.py` | 删除 `get_7z_dll_path()`（生产包不再知道"7z.dll 资源"这个概念） |
 | `sunpack/support/sevenzip_bridge.py` | `available()` 不再要求 7z.dll；`_load()` 删掉 7z.dll 存在性检查 |
 | `sunpack/cli/commands/doctor.py` + i18n | 移除 `sevenzip_dll` 检查项（后端已内置，磁盘上无物可查） |
 | `scripts/build_windows.ps1`、`setup_windows_dev.ps1` | `Build-SevenZipWrapper` 不再要求 7z.dll；工具清单去掉 `7z.dll` |
 | `scripts/verify_windows_package_arch.ps1` | 打包校验**反向要求** `tools\7z.dll` 不存在 |
 
-worker 侧 `seven_zip_dll_path` 字段保留（默认值也不动），下层工厂忽略该参数。
+阶段 1 仍保留 `seven_zip_dll_path` 作为惰性兼容字段；该壳已在 **§12 语义收尾**中删净。
 
 ### 11.6 验证结果
 
@@ -554,8 +554,9 @@ worker 侧 `seven_zip_dll_path` 字段保留（默认值也不动），下层工
 - 不启用 `Asm/`（`ASM_MASM` / `LzmaDecOpt.asm` / CRC/AES/SHA 汇编）——本轮不求性能对齐，
   等源码后端稳定后单独一个 PR 恢复，便于定位性能变化
 - 不引入 `SUP7Z_USE_BUNDLED_7Z` 双后端开关——embedded 是唯一后端
-- 不删 `seven_zip_dll_path`（C ABI / JSON / Python 字段）
-- 不删 `ComModule` / `DllExports2.cpp` / `CreateObjectFunc`
+- 不删 `seven_zip_dll_path`（C ABI / JSON / Python 字段）——已在 §12 语义收尾中删净
+- 不删 `ComModule` / `DllExports2.cpp` / `CreateObjectFunc`——`ComModule` 已在 §12 删除；
+  `DllExports2.cpp` 与 `CreateObjectFunc` 仍按设计保留
 - 不碰解码数据路径：prefetch、decoder、async writer、所有 memcpy、所有 COM callback 原样
 
 ### 11.8 遗留说明
@@ -565,3 +566,94 @@ worker 侧 `seven_zip_dll_path` 字段保留（默认值也不动），下层工
   `verify_windows_package_arch.ps1` 明确要求它不存在。
 - 仓库另有 `tools\7zxa.dll`（7-Zip 官方解压-only 变体），本轮未纳入处理范围。
 - ARM64 目标沿用同一套构建配置，但本机只有 x64 工具链，**ARM64 未实测**。
+
+---
+
+## 12. 语义收尾（阶段 1.5）
+
+阶段 1 为了降低迁移风险，把 `seven_zip_dll_path` 留成了"无语义兼容字段"。
+源码后端稳定后，本轮把它从整条运行时链路删净：**Python → worker JSON →
+C ABI → C++ 内部**，全链路不再出现"7z.dll 路径"这个概念。
+
+### 12.1 两个不变量
+
+**运行时不变量** —— `native/sevenzip_bridge/{src,include}` 内 `7z.dll` 命中数 = **0**：
+
+```text
+SunPack runtime 不再：
+  查找 7z.dll / 校验 7z.dll / 传递 7z.dll 路径
+  JSON 里出现 seven_zip_dll_path
+  C ABI 里出现 seven_zip_dll_path
+  LoadLibrary / GetProcAddress 7z.dll
+```
+
+**测试工具不变量** —— 允许且必须标注清楚：
+
+```text
+tests/ benchmarks/ 的 fixture 生成可用 tools\7z.exe + tools\7z.dll + tools\7zCon.sfx
+但它是 test generator dependency，不是 runtime dependency
+```
+
+### 12.2 C++ 侧删除内容
+
+| 删除对象 | 说明 |
+|----------|------|
+| `ComModule` | 整个类消失：`HMODULE` / `LoadLibraryW` / `FreeLibrary` / `GetProcAddress` 不再需要 |
+| `cached_create_object(path)` | 改名 `embedded_create_object()`，不再接收参数 |
+| 服务层形参 | `test_password(s)`、`extract_archive_*`、`probe_archive_open_*`、`analyze_archive_resources_*`、`read_archive_crc_manifest_*`、`is_backend_available` 全部去掉首参 |
+| `ArchiveOperationRequest::seven_zip_dll_path` | 结构体字段删除 |
+| worker `dll_path` | JSON 读取、局部变量、向下传递全部删除 |
+| C ABI 首参 | `sup7z_try_passwords` / `sup7z_test_archive` / `sup7z_analyze_archive_resources` / `sup7z_read_archive_crc_manifest`（含 `_with_parts` 变体）与 `Sup7zOperationRequest` 字段全部去掉 |
+| 必填校验 | 各处 `if (!seven_zip_dll_path \|\| !archive_path)` 只保留 archive 部分 |
+
+**保留不动**：`CreateObjectFunc` 函数指针类型、`DllExports2.cpp` / `ArchiveExports.cpp` /
+`CreateObject`。归档逻辑仍经由工厂函数指针获取对象，不直接绑定具体实现——
+下一阶段拆 archive/coder COM 时再决定这个间接层是否还有价值。
+
+### 12.3 Python 侧
+
+| 位置 | 改动 |
+|------|------|
+| `NativePasswordTester` | 删除构造参数与实例属性 `seven_zip_dll_path` |
+| `_Sup7zOperationRequest` | 删除该字段（与 C 结构体逐字段对齐已复核） |
+| 8 个 `argtypes` | 各去掉首个 `c_wchar_p` |
+| 5 处 ctypes 调用 | 去掉首参 |
+| `_cache_key()` | 键里去掉该字段 |
+| `SevenZipRunner` | 删除 `self.seven_zip_dll_path`、`fork()` 复制、`_seven_zip_dll_path()`、job 字段 |
+| `sevenzip_bridge_worker.py` | 不再解析 7z.dll，payload 去掉该字段 |
+
+`get_7z_dll_path()` 从生产包迁到 `tests/helpers/tool_config.py` 并改名
+**`get_7z_cli_dll_path()`** —— 名字本身就声明"这是 7z.exe 测试工具链的配套模块，
+≠ SunPack backend"。28 处 tests/benchmarks 调用点全部改指，payload 字段全部删除。
+
+### 12.4 构建与验收脚本
+
+| 位置 | 改动 |
+|------|------|
+| `Test-SevenZipWorker`（两个构建脚本） | 原断言 `get_7z_dll_path()` 存在，只是被仓库里的 `tools\7z.dll` 掩盖。改为：断言 worker 存在 + 生成真实 ZIP + 跑 `sunpack.py inspect --analyze`，端到端验证内置后端 |
+| `run_acceptance_tests.ps1` | 拆成 **runtime artifacts**（`sunpack_sevenzip.dll`、`worker.exe`）与 **fixture generators**（`7z.exe`、`7z.dll`、`7zCon.sfx`）两组，各自独立报错 |
+| 诊断文案 | `"7z.dll did not create a supported archive handler"` / `"7z.dll could not be loaded"` 改为描述内置后端（已确认无测试或 Python/Rust 消费者断言这些字符串） |
+| 源码注释 | `sevenzip_streams.hpp`、`bridge.hpp` 中"7z.dll decoder"等表述改为"embedded 7-Zip decoder" |
+
+### 12.5 本轮验证
+
+| 验证 | 结果 |
+|------|------|
+| x64 Release 编译 + 链接 | 通过 |
+| `ctest`（bridge 4 个单测） | 4/4 通过 |
+| `pytest tests/unit tests/cli` | 1128 通过 |
+| 生产 runtime 源码 `7z.dll` 命中 | **0 处** |
+| `run_acceptance_tests.ps1 -Arch x64` | 8/8 步骤全部 PASS |
+| 无 7z.dll 生存测试 | `tests/unit/test_embedded_7z_backend.py` 4/4 通过 |
+
+### 12.6 仍然刻意没做
+
+```text
+7-Zip 内部 COM 接口 · IInArchive · ISequentialIn/OutStream
+CoderMixer2 · buffer ownership · prefetch · async writer · memcpy · 汇编优化
+CreateObjectFunc 间接层
+tools\7z.exe / tools\7z.dll（测试 fixture 生成链）
+```
+
+前一组属于阶段 3/4 的性能与架构改造；后两项按 §12.1 的不变量明确保留。
+

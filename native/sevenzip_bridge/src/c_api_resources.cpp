@@ -37,7 +37,6 @@ void fill_analysis(
 }  // namespace
 
 SUP7Z_API int sup7z_analyze_archive_resources(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* password,
     Sup7zArchiveResourceAnalysis* analysis,
@@ -59,8 +58,7 @@ SUP7Z_API int sup7z_analyze_archive_resources(
 
     const std::wstring archive_path_text(archive_path);
     const auto result = analyze_archive_resources_with_parts(
-        seven_zip_dll_path,
-        archive_path_text,
+            archive_path_text,
         {archive_path_text},
         password ? password : L"");
     fill_analysis(analysis, result, archive_path_text);
@@ -69,7 +67,6 @@ SUP7Z_API int sup7z_analyze_archive_resources(
 }
 
 SUP7Z_API int sup7z_analyze_archive_resources_with_parts(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* part_paths,
     int part_count,
@@ -93,8 +90,7 @@ SUP7Z_API int sup7z_analyze_archive_resources_with_parts(
 
     const std::wstring archive_path_text(archive_path);
     const auto result = analyze_archive_resources_with_parts(
-        seven_zip_dll_path,
-        archive_path_text,
+            archive_path_text,
         collect_part_paths(archive_path, part_paths, part_count),
         password ? password : L"");
     fill_analysis(analysis, result, archive_path_text);

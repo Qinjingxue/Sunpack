@@ -11,8 +11,7 @@ def _clear_native_7z_caches():
 
 class FakeTester:
     wrapper_path = "wrapper.dll"
-    seven_zip_dll_path = "7z.dll"
-
+    
     def __init__(self):
         self.probe_calls = 0
         self.probe_inputs = []

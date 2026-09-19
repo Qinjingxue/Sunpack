@@ -70,7 +70,8 @@ struct ExtractInputTrace {
     unsigned long long read_file_wall_ns = 0;
     unsigned long long read_file_max_wall_ns = 0;
     // Logical IInStream access pattern, populated only when input-read
-    // profiling is enabled, describing the access requested by 7z.dll.
+    // profiling is enabled, describing the access requested by the embedded
+    // 7-Zip decoder.
     unsigned long long logical_read_call_count = 0;
     unsigned long long sequential_read_bytes = 0;
     unsigned long long nonsequential_read_bytes = 0;
@@ -191,16 +192,14 @@ struct ExtractInputRange {
     bool has_end = false;
 };
 
-bool is_backend_available(const std::wstring& seven_zip_dll_path);
+bool is_backend_available();
 
 PasswordTestResult test_password(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::wstring& password
 );
 
 PasswordTestResult test_password_with_parts(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
     const std::wstring& password,
@@ -208,14 +207,12 @@ PasswordTestResult test_password_with_parts(
 );
 
 PasswordTestResult test_passwords(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const wchar_t* const* passwords,
     int password_count
 );
 
 PasswordTestResult test_passwords_with_parts(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
     const wchar_t* const* passwords,
@@ -224,7 +221,6 @@ PasswordTestResult test_passwords_with_parts(
 );
 
 PasswordTestResult test_passwords_with_ranges(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<ExtractInputRange>& ranges,
     const std::wstring& format_hint,
@@ -233,7 +229,6 @@ PasswordTestResult test_passwords_with_ranges(
 );
 
 ExtractArchiveResult extract_archive_with_parts(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
     const std::wstring& format_hint,
@@ -251,7 +246,6 @@ ExtractArchiveResult extract_archive_with_parts(
 );
 
 ExtractArchiveResult extract_archive_with_ranges(
-    const std::wstring& seven_zip_dll_path,
     const std::wstring& archive_path,
     const std::vector<ExtractInputRange>& ranges,
     const std::wstring& format_hint,
@@ -278,7 +272,6 @@ const char* status_name(PasswordTestStatus status);
 #endif
 
 SUP7Z_API int sup7z_try_passwords(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* passwords,
     int password_count,
@@ -289,7 +282,6 @@ SUP7Z_API int sup7z_try_passwords(
 );
 
 SUP7Z_API int sup7z_try_passwords_with_parts(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* part_paths,
     int part_count,
@@ -302,7 +294,6 @@ SUP7Z_API int sup7z_try_passwords_with_parts(
 );
 
 SUP7Z_API int sup7z_test_archive(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* password,
     int* command_ok,
@@ -315,7 +306,6 @@ SUP7Z_API int sup7z_test_archive(
 );
 
 SUP7Z_API int sup7z_test_archive_with_parts(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* part_paths,
     int part_count,
@@ -362,7 +352,6 @@ struct Sup7zInputRange {
 
 struct Sup7zOperationRequest {
     int operation;
-    const wchar_t* seven_zip_dll_path;
     const wchar_t* archive_path;
     const wchar_t* const* part_paths;
     int part_count;
@@ -405,7 +394,6 @@ SUP7Z_API int sup7z_run_operation(
 );
 
 SUP7Z_API int sup7z_analyze_archive_resources(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* password,
     Sup7zArchiveResourceAnalysis* analysis,
@@ -414,7 +402,6 @@ SUP7Z_API int sup7z_analyze_archive_resources(
 );
 
 SUP7Z_API int sup7z_analyze_archive_resources_with_parts(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* part_paths,
     int part_count,
@@ -425,7 +412,6 @@ SUP7Z_API int sup7z_analyze_archive_resources_with_parts(
 );
 
 SUP7Z_API int sup7z_read_archive_crc_manifest(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* password,
     int max_items,
@@ -436,7 +422,6 @@ SUP7Z_API int sup7z_read_archive_crc_manifest(
 );
 
 SUP7Z_API int sup7z_read_archive_crc_manifest_with_parts(
-    const wchar_t* seven_zip_dll_path,
     const wchar_t* archive_path,
     const wchar_t* const* part_paths,
     int part_count,

@@ -27,7 +27,8 @@ from benchmarks.scenarios.worker_single_file_write import (
 )
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
 from sunpack.support.output_paths import normalized_output_dir, resolve_output_volume_key
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
 SCENARIO = "extraction.worker-multi-volume-write"
@@ -257,7 +258,6 @@ def _job_payload(
     return json.dumps(
         {
             "job_id": job_id,
-            "seven_zip_dll_path": str(dll_path),
             "archive_path": str(archive),
             "part_paths": [str(archive)],
             "output_dir": normalized,
@@ -708,7 +708,7 @@ def main() -> int:
     if not worker_path.is_file():
         parser.error(f"worker executable is unavailable: {worker_path}")
     try:
-        dll_path = Path(get_7z_dll_path()).resolve()
+        dll_path = Path(get_7z_cli_dll_path()).resolve()
     except FileNotFoundError as exc:
         parser.error(str(exc))
     if not dll_path.is_file():
@@ -939,7 +939,6 @@ def main() -> int:
             },
             "environment": {
                 "worker": str(worker_path),
-                "seven_zip_dll_path": str(dll_path),
                 "cpu_count": os.cpu_count(),
                 "python": sys.version,
                 "topology": targets,

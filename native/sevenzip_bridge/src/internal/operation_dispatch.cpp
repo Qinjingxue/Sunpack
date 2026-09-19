@@ -97,7 +97,6 @@ namespace sunpack::sevenzip
             if (!request.ranges.empty())
             {
                 return test_passwords_with_ranges(
-                    request.seven_zip_dll_path,
                     request.archive_path,
                     request.ranges,
                     request.format_hint,
@@ -105,7 +104,6 @@ namespace sunpack::sevenzip
                     static_cast<int>(pointers.size()));
             }
             return test_passwords_with_parts(
-                request.seven_zip_dll_path,
                 request.archive_path,
                 effective_parts(request),
                 pointers.data(),
@@ -119,7 +117,6 @@ namespace sunpack::sevenzip
             {
                 const auto pointers = password_ptrs({}, request.password);
                 return test_passwords_with_ranges(
-                    request.seven_zip_dll_path,
                     request.archive_path,
                     request.ranges,
                     request.format_hint,
@@ -127,7 +124,6 @@ namespace sunpack::sevenzip
                     static_cast<int>(pointers.size()));
             }
             return test_password_with_parts(
-                request.seven_zip_dll_path,
                 request.archive_path,
                 effective_parts(request),
                 request.password,
@@ -139,7 +135,6 @@ namespace sunpack::sevenzip
             if (request.ranges.empty())
             {
                 const auto open_probe = probe_archive_open_with_parts(
-                    request.seven_zip_dll_path,
                     request.archive_path,
                     effective_parts(request),
                     L"");
@@ -200,8 +195,6 @@ namespace sunpack::sevenzip
 
     ArchiveOperationResult run_archive_operation(const ArchiveOperationRequest &request)
     {
-        // seven_zip_dll_path is an inert compatibility field: the 7-Zip backend
-        // is compiled into this module, so only the archive path is required.
         if (request.archive_path.empty())
         {
             return invalid_request("missing required path");

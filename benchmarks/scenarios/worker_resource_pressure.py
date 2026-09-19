@@ -21,7 +21,8 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
-from sunpack.support.resources import get_7z_dll_path, get_7z_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_7z_path, get_sevenzip_bridge_worker_path
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 SCENARIO = "extraction.worker-resource-pressure"
 MODES = ("cpu", "io", "memory")
@@ -123,7 +124,6 @@ def _job_payload(*, job_id: str, archive: Path, output: Path, dll: Path,
     item: dict[str, Any] = {
         "job_id": job_id,
         "request_id": job_id,
-        "seven_zip_dll_path": str(dll),
         "archive_path": str(archive),
         "part_paths": [str(archive)],
         "output_dir": str(output),
@@ -297,7 +297,7 @@ def main() -> int:
         parser.error("jobs, timeouts, intervals, and size parameters must be positive")
     try:
         worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
-        dll = Path(get_7z_dll_path()).resolve()
+        dll = Path(get_7z_cli_dll_path()).resolve()
         seven_zip = Path(get_7z_path()).resolve()
     except FileNotFoundError as exc:
         parser.error(str(exc))
@@ -335,7 +335,7 @@ def main() -> int:
 
         report = {
             "parameters": vars(args) | {"modes": modes, "controllers": controllers, "capacities": capacities},
-            "environment": {"worker_path": str(worker_path), "seven_zip_dll_path": str(dll), "seven_zip_path": str(seven_zip), "cpu_count": os.cpu_count(), "python": sys.version},
+            "environment": {"worker_path": str(worker_path), "seven_zip_path": str(seven_zip), "cpu_count": os.cpu_count(), "python": sys.version},
             "corpus": {mode: {key: value for key, value in case.items() if key != "template"} for mode, case in cases.items()},
             "results": rows,
             "summary": {"rows": len(rows), "all_jobs_completed": all(row["successful_jobs"] == args.jobs for row in rows)},

@@ -29,7 +29,8 @@ from benchmarks.scenarios.extraction_format_matrix import (
 )
 from benchmarks.scenarios.sevenzip_worker_matrix import _case_job, _median, _run_job
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
 MIB = 1024 * 1024
@@ -524,7 +525,7 @@ def main() -> int:
     if args.large_content != "mixed" and not args.archive and not set(formats) <= {"7z", "rar-split", "tar"}:
         parser.error("--large-content random is currently supported only with --format 7z, --format rar-split, and --format tar")
     worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
-    dll_path = Path(get_7z_dll_path()).resolve()
+    dll_path = Path(get_7z_cli_dll_path()).resolve()
     if not worker_path.is_file() or not dll_path.is_file():
         parser.error("the native worker and 7z.dll must both exist")
 
@@ -656,7 +657,6 @@ def main() -> int:
                     "worker_path": str(worker_path),
                     "worker_size_bytes": worker_path.stat().st_size,
                     "worker_sha256": hashlib.sha256(worker_path.read_bytes()).hexdigest()[:16],
-                    "seven_zip_dll_path": str(dll_path),
                     "python": sys.version,
                 },
                 "corpus": corpus_info,

@@ -19,7 +19,7 @@ from sunpack.extraction.internal.sevenzip.sevenzip_runner import (
 )
 from sunpack.extraction.internal.sevenzip.worker_diagnostics import worker_result_payload
 from sunpack.extraction.scheduler import ExtractionScheduler
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_test_tools
 
 
@@ -36,13 +36,6 @@ def _require_7z_or_skip():
         pytest.skip("7z.exe is required to build worker extraction fixtures")
     _require_worker_or_skip()
     return seven_zip
-
-
-def _require_7z_dll_or_skip():
-    try:
-        return get_7z_dll_path()
-    except Exception as exc:
-        pytest.skip(f"7z.dll is required: {exc}")
 
 
 def _create_7z(tmp_path, name: str, text: str):
@@ -144,11 +137,9 @@ def _create_shift_jis_zip(tmp_path):
 
 def test_worker_failed_result_includes_diagnostics(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     missing = tmp_path / "missing.7z"
     payload = {
         "job_id": "diagnostics",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(missing),
         "output_dir": str(tmp_path / "out"),
     }
@@ -176,12 +167,10 @@ def test_worker_failed_result_includes_diagnostics(tmp_path):
 
 def test_worker_does_not_classify_unencrypted_open_failure_as_wrong_password(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive = tmp_path / "malformed.7z"
     archive.write_bytes(b"7z\xbc\xaf'\x1c" + b"\x00" * 26)
     payload = {
         "job_id": "unencrypted-open-failure",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(tmp_path / "out"),
         "password": "irrelevant",
@@ -205,7 +194,6 @@ def test_worker_does_not_classify_unencrypted_open_failure_as_wrong_password(tmp
 
 def test_worker_candidate_batch_probes_then_extracts_with_selected_password(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive, filename = _create_encrypted_zip(tmp_path)
     from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
 
@@ -224,7 +212,6 @@ def test_worker_candidate_batch_probes_then_extracts_with_selected_password(tmp_
     out_dir = tmp_path / "out"
     payload = {
         "job_id": "candidate-batch-success",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(out_dir),
         "format_hint": "zip",
@@ -253,12 +240,10 @@ def test_worker_candidate_batch_probes_then_extracts_with_selected_password(tmp_
 
 def test_worker_single_candidate_skips_probe_and_extracts_directly(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive, filename = _create_encrypted_zip(tmp_path)
     out_dir = tmp_path / "out-single"
     payload = {
         "job_id": "candidate-direct-success",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(out_dir),
         "format_hint": "zip",
@@ -287,7 +272,6 @@ def test_worker_single_candidate_skips_probe_and_extracts_directly(tmp_path):
 
 def test_worker_single_zipcrypto_collision_probes_only_after_direct_failure(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive, _filename = _create_encrypted_zip(tmp_path)
     from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
 
@@ -306,7 +290,6 @@ def test_worker_single_zipcrypto_collision_probes_only_after_direct_failure(tmp_
     out_dir = tmp_path / "out-single-collision"
     payload = {
         "job_id": "candidate-direct-collision",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(out_dir),
         "format_hint": "zip",
@@ -335,12 +318,10 @@ def test_worker_single_zipcrypto_collision_probes_only_after_direct_failure(tmp_
 
 def test_worker_candidate_batch_rejects_all_candidates_without_full_extraction(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive, filename = _create_encrypted_zip(tmp_path)
     out_dir = tmp_path / "out"
     payload = {
         "job_id": "candidate-batch-rejected",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(out_dir),
         "format_hint": "zip",
@@ -371,19 +352,16 @@ def test_worker_candidate_batch_rejects_all_candidates_without_full_extraction(t
 
 def test_native_worker_result_escapes_control_characters(tmp_path):
     worker_path = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive = tmp_path / "control-name.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("control-\x01-name.txt", "unsafe filename payload")
     payload = {
         "job_id": "control-name",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(tmp_path / "out"),
     }
     runner = SevenZipRunner({"watchdog_no_progress_timeout_seconds": 2})
     runner.worker_path = worker_path
-    runner.seven_zip_dll_path = seven_zip_dll
     try:
         completed = runner.submit_attempt(
             payload,
@@ -403,14 +381,12 @@ def test_native_worker_result_escapes_control_characters(tmp_path):
 
 def test_native_worker_asyncio_event_controller_completes_job(tmp_path):
     worker_path = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive = tmp_path / "async.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("async.txt", "async payload")
     out_dir = tmp_path / "async-out"
     payload = {
         "job_id": "async-event-controller",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(out_dir),
     }
@@ -423,7 +399,6 @@ def test_native_worker_asyncio_event_controller_completes_job(tmp_path):
             }
         )
         runner.worker_path = worker_path
-        runner.seven_zip_dll_path = seven_zip_dll
         try:
             return await asyncio.wait_for(
                 runner.submit_attempt_asyncio(payload, task=_task(archive)),
@@ -730,14 +705,12 @@ def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace(
 
 def test_worker_output_trace_includes_per_item_failure(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive = _create_7z_with_nested_file(tmp_path)
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     (out_dir / "conflict").write_text("blocks directory creation", encoding="utf-8")
     payload = {
         "job_id": "output-trace",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(out_dir),
     }
@@ -763,12 +736,10 @@ def test_worker_output_trace_includes_per_item_failure(tmp_path):
 
 def test_worker_propagates_delayed_async_file_open_failure(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive, _ = _create_7z(tmp_path, "async-open-failure", "payload")
     out_dir = tmp_path / "out"
     payload = {
         "job_id": "async-open-failure",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(out_dir),
         # Wildcards pass archive path traversal validation, but CreateFileW
@@ -802,12 +773,10 @@ def test_worker_propagates_delayed_async_file_open_failure(tmp_path):
 
 def test_worker_dry_run_reports_success_diagnostics_without_writing(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive, filename = _create_7z(tmp_path, "dryrun", "dry-run payload")
     dry_output = tmp_path / "dry_output"
     payload = {
         "job_id": "dry-run",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(dry_output),
         "format_hint": "7z",
@@ -842,7 +811,6 @@ def test_worker_dry_run_reports_success_diagnostics_without_writing(tmp_path):
 
 def test_worker_dry_run_hashes_output_when_source_crc_is_missing(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     payload = b"tar payload without an archive CRC"
     source = tmp_path / "payload.bin"
     source.write_bytes(payload)
@@ -853,7 +821,6 @@ def test_worker_dry_run_hashes_output_when_source_crc_is_missing(tmp_path):
         [worker],
         input=json.dumps({
             "job_id": "dry-run-no-source-crc",
-            "seven_zip_dll_path": seven_zip_dll,
             "archive_path": str(archive),
             "output_dir": "",
             "format_hint": "tar",
@@ -882,7 +849,6 @@ def test_worker_dry_run_hashes_output_when_source_crc_is_missing(tmp_path):
 )
 def test_worker_applies_format_aware_prefetch_policy(tmp_path, format_hint, prefetch_enabled):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     source = tmp_path / "payload.bin"
     source.write_bytes(b"prefetch policy payload")
     archive = tmp_path / "payload.tar"
@@ -896,7 +862,6 @@ def test_worker_applies_format_aware_prefetch_policy(tmp_path, format_hint, pref
         [worker],
         input=json.dumps({
             "job_id": f"prefetch-policy-{format_hint or 'empty'}",
-            "seven_zip_dll_path": seven_zip_dll,
             "archive_path": str(archive),
             "output_dir": str(tmp_path / "out"),
             "format_hint": format_hint,
@@ -915,7 +880,6 @@ def test_worker_applies_format_aware_prefetch_policy(tmp_path, format_hint, pref
 
 def test_worker_disables_prefetch_for_native_rar_volumes(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     first = tmp_path / "archive.part1.rar"
     second = tmp_path / "archive.part2.rar"
     first.write_bytes(b"Rar!\x1a\x07\x01\x00")
@@ -927,7 +891,6 @@ def test_worker_disables_prefetch_for_native_rar_volumes(tmp_path):
         [worker],
         input=json.dumps({
             "job_id": "native-rar-prefetch-policy",
-            "seven_zip_dll_path": seven_zip_dll,
             "archive_path": str(first),
             "output_dir": str(tmp_path / "out"),
             "format_hint": "rar",
@@ -954,7 +917,6 @@ def test_worker_disables_prefetch_for_native_rar_volumes(tmp_path):
 
 def test_worker_omits_input_profile_without_opt_in(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive, _ = _create_7z(tmp_path, "profile-disabled", "profile disabled payload")
     environment = os.environ.copy()
     environment.pop("SUNPACK_SEVENZIP_PROFILE_READS", None)
@@ -962,7 +924,6 @@ def test_worker_omits_input_profile_without_opt_in(tmp_path):
         [worker],
         input=json.dumps({
             "job_id": "profile-disabled",
-            "seven_zip_dll_path": seven_zip_dll,
             "archive_path": str(archive),
             "output_dir": str(tmp_path / "out"),
             "format_hint": "7z",
@@ -980,7 +941,6 @@ def test_worker_omits_input_profile_without_opt_in(tmp_path):
 
 def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     payload = b"streamed tar payload"
     source = tmp_path / "payload.bin"
     source.write_bytes(payload)
@@ -993,7 +953,6 @@ def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
         [worker],
         input=json.dumps({
             "job_id": "async-no-source-crc",
-            "seven_zip_dll_path": seven_zip_dll,
             "archive_path": str(archive),
             "output_dir": str(out_dir),
             "format_hint": "tar",
@@ -1020,12 +979,10 @@ def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
 
 def test_worker_applies_explicit_shift_jis_item_paths(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive, expected_name, payload_bytes = _create_shift_jis_zip(tmp_path)
     out_dir = tmp_path / "out"
     payload = {
         "job_id": "shift-jis",
-        "seven_zip_dll_path": seven_zip_dll,
         "archive_path": str(archive),
         "output_dir": str(out_dir),
         "format_hint": "zip",
@@ -1051,18 +1008,15 @@ def test_worker_applies_explicit_shift_jis_item_paths(tmp_path):
 
 def test_native_worker_queue_isolates_failed_job_and_continues(tmp_path):
     worker = _require_worker_or_skip()
-    seven_zip_dll = _require_7z_dll_or_skip()
     archive = tmp_path / "ok.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("ok.txt", "batch payload")
     runner = SevenZipRunner({"thread_capacity": 2})
     runner.worker_path = worker
-    runner.seven_zip_dll_path = seven_zip_dll
     try:
         bad = runner.submit_attempt(
             {
                 "job_id": "bad",
-                "seven_zip_dll_path": seven_zip_dll,
                 "archive_path": str(tmp_path / "missing.zip"),
                 "part_paths": [str(tmp_path / "missing.zip")],
                 "output_dir": str(tmp_path / "bad"),
@@ -1072,7 +1026,6 @@ def test_native_worker_queue_isolates_failed_job_and_continues(tmp_path):
         good = runner.submit_attempt(
             {
                 "job_id": "ok",
-                "seven_zip_dll_path": seven_zip_dll,
                 "archive_path": str(archive),
                 "part_paths": [str(archive)],
                 "output_dir": str(tmp_path / "ok"),
@@ -1186,7 +1139,6 @@ def test_extraction_scheduler_uses_worker_for_file_range(tmp_path, monkeypatch):
 
 def test_extraction_scheduler_saves_worker_diagnostics_on_failure(tmp_path):
     _require_worker_or_skip()
-    _require_7z_dll_or_skip()
     missing = tmp_path / "missing.7z"
     result = ExtractionScheduler(max_retries=1).extract(_task(missing), str(tmp_path / "out"))
 

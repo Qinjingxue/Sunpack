@@ -42,7 +42,7 @@ class SevenZipDllVerifier:
             archive_input=archive_input,
         )
         native_result = subprocess.CompletedProcess(
-            args=["7z.dll", "test-passwords", archive_path],
+            args=["embedded-7zip", "test-passwords", archive_path],
             returncode=0 if native_attempt.ok else 2,
             stdout="" if native_attempt.ok else native_attempt.message,
             stderr="" if native_attempt.ok else native_attempt.message,

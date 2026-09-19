@@ -22,7 +22,8 @@ from benchmarks.scenarios.worker_initial_concurrency_matrix import (
     _write_payloads,
 )
 from benchmarks.scenarios.worker_small_file_scheduling import ADMISSION_CASES, _run_batch
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
 SCENARIO = "extraction.worker-arrival-patterns"
@@ -187,7 +188,7 @@ def main() -> int:
     automatic_capacity, sizing = _automatic_capacity()
     capacity = args.capacity or automatic_capacity
     worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
-    dll_path = Path(get_7z_dll_path()).resolve()
+    dll_path = Path(get_7z_cli_dll_path()).resolve()
     admission_case = dict(ADMISSION_CASES["adaptive-baseline"])
     admission_case["name"] = "adaptive-baseline"
     admission_case["adaptive_enabled"] = True
@@ -261,7 +262,6 @@ def main() -> int:
                 "capacity": capacity,
                 **sizing,
                 "worker_path": str(worker_path),
-                "seven_zip_dll_path": str(dll_path),
             },
             "archive_variants": [
                 {key: str(value) if isinstance(value, Path) else value for key, value in variant.items()}

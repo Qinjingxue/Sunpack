@@ -6,7 +6,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
 
 
 @dataclass(frozen=True)
@@ -29,11 +29,9 @@ def dry_run_archive(
     timeout: float = 30.0,
 ) -> SevenZipDryRunResult:
     worker_path = get_sevenzip_bridge_worker_path()
-    seven_zip_dll_path = get_7z_dll_path()
     job_id = f"dry-run-{uuid.uuid4().hex}"
     payload = {
         "job_id": job_id,
-        "seven_zip_dll_path": seven_zip_dll_path,
         "archive_path": str(archive_path),
         "output_dir": "",
         "password": str(password or ""),

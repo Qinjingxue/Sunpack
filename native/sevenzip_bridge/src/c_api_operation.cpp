@@ -80,7 +80,6 @@ std::vector<ExtractInputRange> collect_ranges(const Sup7zInputRange* ranges, int
 ArchiveOperationRequest to_request(const Sup7zOperationRequest& request) {
     ArchiveOperationRequest operation;
     operation.operation = static_cast<Sup7zOperationKind>(request.operation);
-    operation.seven_zip_dll_path = request.seven_zip_dll_path ? request.seven_zip_dll_path : L"";
     operation.archive_path = request.archive_path ? request.archive_path : L"";
     operation.part_paths = sunpack::sevenzip::capi::collect_part_paths(
         request.archive_path,

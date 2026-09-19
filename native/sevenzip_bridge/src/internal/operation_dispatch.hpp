@@ -11,7 +11,6 @@ namespace sunpack::sevenzip
     struct ArchiveOperationRequest
     {
         Sup7zOperationKind operation = SUP7Z_OPERATION_PROBE;
-        std::wstring seven_zip_dll_path;
         std::wstring archive_path;
         std::vector<std::wstring> part_paths;
         std::vector<std::wstring> canonical_names;

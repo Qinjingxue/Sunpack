@@ -536,16 +536,30 @@ function Get-EnvironmentRefreshReasons {
     }
 
     $toolsRoot = if ($Arch -eq "arm64") { Join-Path $RepoRoot "tools-arm64" } else { Join-Path $RepoRoot "tools" }
-    $requiredTools = @(
-        (Join-Path $toolsRoot "7z.exe"),
-        (Join-Path $toolsRoot "7zCon.sfx"),
-        (Join-Path $toolsRoot "7z.dll"),
+
+    # Runtime artifacts SunPack ships and needs. These must never gain a
+    # standalone 7z.dll: the 7-Zip backend is compiled into the two binaries.
+    $runtimeArtifacts = @(
         (Join-Path $toolsRoot "sunpack_sevenzip.dll"),
         (Join-Path $toolsRoot "sunpack_sevenzip_worker.exe")
     )
-    foreach ($toolPath in $requiredTools) {
-        if (-not (Test-Path -LiteralPath $toolPath)) {
-            $reasons.Add("required runtime tool is missing: $toolPath")
+    foreach ($artifactPath in $runtimeArtifacts) {
+        if (-not (Test-Path -LiteralPath $artifactPath)) {
+            $reasons.Add("required runtime artifact is missing: $artifactPath")
+        }
+    }
+
+    # Fixture generators. 7z.dll belongs here: it is the companion module of the
+    # 7z.exe command line tool the suite uses to BUILD archives, not a runtime
+    # dependency of SunPack.
+    $fixtureGenerators = @(
+        (Join-Path $toolsRoot "7z.exe"),
+        (Join-Path $toolsRoot "7z.dll"),
+        (Join-Path $toolsRoot "7zCon.sfx")
+    )
+    foreach ($generatorPath in $fixtureGenerators) {
+        if (-not (Test-Path -LiteralPath $generatorPath)) {
+            $reasons.Add("required fixture generator is missing: $generatorPath")
         }
     }
     foreach ($tool in @(Get-AcceptanceTestToolRequirements -RepoRoot $RepoRoot)) {
@@ -559,7 +573,7 @@ function Get-EnvironmentRefreshReasons {
             $reasons.Add("acceptance test generator cannot run: $($tool.Path)")
         }
     }
-    if ($requiredTools | Where-Object { -not (Test-Path -LiteralPath $_) }) {
+    if (($runtimeArtifacts + $fixtureGenerators) | Where-Object { -not (Test-Path -LiteralPath $_) }) {
         return $reasons
     }
 

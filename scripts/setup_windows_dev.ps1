@@ -666,17 +666,50 @@ function Test-SevenZipWrapper {
 
     Invoke-Native -FilePath $PythonPath -Arguments @(
         "-c",
-        "from sunpack.support.sevenzip_bridge import NativePasswordTester; tester = NativePasswordTester(); assert tester.available(), (tester.wrapper_path, tester.seven_zip_dll_path)"
+        "from sunpack.support.sevenzip_bridge import NativePasswordTester; tester = NativePasswordTester(); assert tester.available(), tester.wrapper_path"
     )
 }
 
 function Test-SevenZipWorker {
-    param([string]$PythonPath)
+    param([string]$PythonPath, [string]$RepoRoot)
 
-    Invoke-Native -FilePath $PythonPath -Arguments @(
-        "-c",
-        "from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path; import os; assert os.path.exists(get_sevenzip_bridge_worker_path()); assert os.path.exists(get_7z_dll_path())"
-    )
+    # The 7-Zip backend is compiled into the bridge, so the old
+    # "assert tools\7z.dll exists" probe is gone. What still has to hold is that
+    # the worker binary is present AND that the embedded backend can open a real
+    # archive end to end.
+    $fixtureRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("sunpack-embedded-backend-" + [guid]::NewGuid().ToString("N"))
+    New-Item -ItemType Directory -Path $fixtureRoot -Force | Out-Null
+    try {
+        $probe = Join-Path $fixtureRoot "probe.py"
+        $fixture = Join-Path $fixtureRoot "probe.zip"
+        $probeSource = @'
+import os
+import sys
+import zipfile
+
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
+
+worker = get_sevenzip_bridge_worker_path()
+assert os.path.exists(worker), worker
+
+target = sys.argv[1]
+with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+    archive.writestr("probe.txt", "sunpack embedded backend\n" * 8)
+assert os.path.getsize(target) > 0
+'@
+        Set-Content -LiteralPath $probe -Value $probeSource -Encoding UTF8
+        Invoke-Native -FilePath $PythonPath -Arguments @($probe, $fixture)
+        Push-Location $RepoRoot
+        try {
+            Invoke-Native -FilePath $PythonPath -Arguments @(
+                "sunpack.py", "inspect", "--analyze", "--no-pause", "-q", $fixture
+            )
+        } finally {
+            Pop-Location
+        }
+    } finally {
+        Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }
 
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
@@ -779,7 +812,7 @@ $ctestCommand = Get-CTestCommand -VenvScripts $venvScripts
 Build-SevenZipWrapper -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
 Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
 Test-SevenZipWrapper -PythonPath $venvPython
-Test-SevenZipWorker -PythonPath $venvPython
+Test-SevenZipWorker -PythonPath $venvPython -RepoRoot $repoRoot
 Invoke-Native -FilePath $venvPython -Arguments @(
     "-c",
     "from sunpack.support.resources import get_toast_library_path; import os; assert os.path.exists(get_toast_library_path())"

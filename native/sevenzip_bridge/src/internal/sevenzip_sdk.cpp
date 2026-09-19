@@ -3,8 +3,8 @@
 #ifdef _WIN32
 
 // Supplied by the bundled 7-Zip sources (CPP/7zip/Archive/DllExports2.cpp) that
-// are linked into the same image. Signature is identical to the historical
-// 7z.dll export, so every call site below this one is unchanged.
+// are linked into the same image. The signature is the same one the historical
+// external backend exposed, so every call site below this one is unchanged.
 STDAPI CreateObject(const GUID *clsid, const GUID *iid, void **outObject);
 
 #endif
@@ -86,14 +86,11 @@ namespace sunpack::sevenzip
         return path;
     }
 
-    CreateObjectFunc cached_create_object(const std::wstring &seven_zip_dll_path)
+    CreateObjectFunc embedded_create_object()
     {
 
-        // The bundled 7-Zip backend replaced the 7z.dll module loader. The path
-        // argument is retained as an inert ABI/JSON compatibility field; it no
-        // longer selects the backend location.
-        (void)seven_zip_dll_path;
-
+        // The bundled 7-Zip backend replaced the external module loader, so there
+        // is exactly one factory and no module lookup left to perform.
         return &::CreateObject;
     }
 

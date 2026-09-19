@@ -117,7 +117,8 @@ namespace sunpack::sevenzip
     }
 
     // Opened once per file and reused; the handle carries its own file cursor and is owned by exactly one thread that reads sequentially.
-    // Streams that also serve the 7z.dll decoder keep a second, independent handle for decoder driven Seek/Read calls.
+    // Streams that also serve the embedded 7-Zip decoder keep a second,
+    // independent handle for decoder driven Seek/Read calls.
     class [[nodiscard]] PathHandle final
     {
     public:

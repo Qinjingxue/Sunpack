@@ -47,7 +47,8 @@ if str(ROOT) not in sys.path:
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
 from benchmarks.scenarios.extraction_format_matrix import GENERATED_FORMATS, create_corpus
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path
+from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
 def _mapped_memory(process: psutil.Process) -> dict[str, float]:
@@ -288,7 +289,6 @@ def _run_worker_phase(
                 volumes = _volume_paths(item)
                 job = {
                     "job_id": label,
-                    "seven_zip_dll_path": str(dll_path),
                     "archive_path": str(volumes[0]),
                     "part_paths": [str(path) for path in volumes],
                     "output_dir": str(output_dir),
@@ -415,7 +415,7 @@ def main() -> int:
 
     try:
         worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
-        dll_path = Path(get_7z_dll_path()).resolve()
+        dll_path = Path(get_7z_cli_dll_path()).resolve()
     except FileNotFoundError as exc:
         parser.error(str(exc))
     if not worker_path.is_file():
@@ -480,7 +480,6 @@ def main() -> int:
                 "cpu_count": os.cpu_count(),
                 "current_root": str(ROOT),
                 "worker_path": str(worker_path),
-                "seven_zip_dll_path": str(dll_path),
             },
             "corpus": {
                 "archive_count": len(corpus),
