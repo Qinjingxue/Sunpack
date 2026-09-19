@@ -390,7 +390,7 @@ namespace sunpack::sevenzip
 
             const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
             auto *raw_open_callback = new OpenCallback(
-                password, callback_path, part_paths, canonical_names, prefetch_config);
+                password, callback_path, part_paths, canonical_names, prefetch_config, &result.input_trace);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
             hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
