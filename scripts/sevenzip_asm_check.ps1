@@ -26,10 +26,12 @@ function Get-CoffSymbol {
         $virtualSize = [System.BitConverter]::ToInt32($bytes, $headerOffset + 8)
         $rawSize = [System.BitConverter]::ToInt32($bytes, $headerOffset + 16)
         $rawPointer = [System.BitConverter]::ToInt32($bytes, $headerOffset + 20)
+        $characteristics = [System.BitConverter]::ToUInt32($bytes, $headerOffset + 36)
         $sections[$i + 1] = [pscustomobject]@{
-            Name       = [System.Text.Encoding]::ASCII.GetString($bytes, $headerOffset, $nameEnd - $headerOffset)
-            Size       = $(if ($rawSize -gt 0) { $rawSize } else { $virtualSize })
-            RawPointer = $rawPointer
+            Name            = [System.Text.Encoding]::ASCII.GetString($bytes, $headerOffset, $nameEnd - $headerOffset)
+            Size            = $(if ($rawSize -gt 0) { $rawSize } else { $virtualSize })
+            RawPointer      = $rawPointer
+            Characteristics = $characteristics
         }
     }
 
@@ -47,7 +49,7 @@ function Get-CoffSymbol {
         $auxCount = [int]$bytes[$entryOffset + 17]
         $index += 1 + $auxCount
 
-        if ($storageClass -ne 2 -or $type -ne 0x20) { continue }  # external function
+        if ($storageClass -ne 2) { continue }  # external symbol
         if (-not $sections.ContainsKey([int]$sectionNumber)) { continue }
         if ($bytes[$entryOffset] -eq 0 -and $bytes[$entryOffset + 1] -eq 0 -and
             $bytes[$entryOffset + 2] -eq 0 -and $bytes[$entryOffset + 3] -eq 0) {
@@ -66,6 +68,12 @@ function Get-CoffSymbol {
         if ($candidateName -cne $SymbolName) { continue }
 
         $section = $sections[[int]$sectionNumber]
+        # MASM PROC symbols use IMAGE_SYM_DTYPE_FUNCTION (0x20), while clang's
+        # ARM64 .S global label is emitted as type 0. Exact-name matching plus
+        # requiring IMAGE_SCN_CNT_CODE keeps both formats strict without
+        # accepting a same-named data symbol.
+        if ($type -ne 0 -and $type -ne 0x20) { continue }
+        if (($section.Characteristics -band 0x20) -eq 0) { continue }
         if ($section.RawPointer -le 0 -or $section.Size -le 0) { continue }
         if ($value -lt 0 -or $value -ge $section.Size) { continue }
 
