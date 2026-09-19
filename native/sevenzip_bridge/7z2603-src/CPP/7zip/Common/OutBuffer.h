@@ -55,8 +55,9 @@ public:
 #if SUP7Z_USE_SHARED_OUTPUT
   void SetStream(ISequentialOutStream *stream);
   void SetSharedOutputChunkSize(UInt32 size) { _sharedChunkSize = size; }
-  bool HasSharedOutput() const { return _sharedOutput != NULL; }
+  bool HasSharedOutput() const { return _sharedOutput.Interface() != NULL; }
   UInt32 GetBufferSize() const { return _bufSize; }
+  HRESULT DrainSharedOutput() { return _outputLeases.Drain(); }
 #else
   void SetStream(ISequentialOutStream *stream) { _stream = stream; }
 #endif
