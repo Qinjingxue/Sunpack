@@ -39,7 +39,6 @@ public:
   COutStreamWithCRC(): _leaseData(NULL), _leaseCapacity(0), _leaseToken(0) {}
   void SetStream(ISequentialOutStream *stream);
   void ReleaseStream();
-  Z7_IFACE_COM7_IMP(ISunpackSharedOutput)
 #else
   void SetStream(ISequentialOutStream *stream) { _stream = stream; }
   void ReleaseStream() { _stream.Release(); }
