@@ -2130,7 +2130,27 @@ namespace sunpack::sevenzip
 #if SUP7Z_USE_SHARED_OUTPUT
                 if (buffer->borrowed)
                 {
-                    buffer->state = BufferState::BorrowedComplete;
+                    BorrowedLease *lease = buffer->borrowed_lease;
+                    HRESULT lease_result = S_OK;
+                    if (file && file->failed)
+                        lease_result = file->hresult;
+                    else if (job)
+                        lease_result = terminal_result_locked(job);
+
+                    if (lease)
+                    {
+                        lease->result = lease_result;
+                        lease->state = BorrowedLeaseState::Complete;
+                    }
+
+                    buffer->file.reset();
+                    buffer->size = 0;
+                    buffer->borrowed_data = nullptr;
+                    buffer->reserved_size = 0;
+                    buffer->borrowed = false;
+                    buffer->borrowed_lease = nullptr;
+                    buffer->state = BufferState::Free;
+                    free_buffers_.push_back(buffer);
                 }
                 else
                 {
@@ -2138,6 +2158,7 @@ namespace sunpack::sevenzip
                     buffer->size = 0;
                     buffer->borrowed_data = nullptr;
                     buffer->reserved_size = 0;
+                    buffer->borrowed_lease = nullptr;
                     buffer->state = BufferState::Free;
                     free_buffers_.push_back(buffer);
                 }
@@ -2165,44 +2186,31 @@ namespace sunpack::sevenzip
 #if SUP7Z_USE_SHARED_OUTPUT
         static HRESULT wait_borrowed_thunk(void *context) noexcept
         {
-            auto *buffer = static_cast<Buffer *>(context);
-            if (!buffer || !buffer->owner)
+            auto *lease = static_cast<BorrowedLease *>(context);
+            if (!lease || !lease->owner)
                 return E_INVALIDARG;
-            return buffer->owner->wait_borrowed(buffer);
+            return lease->owner->wait_borrowed(lease);
         }
 
-        HRESULT wait_borrowed(Buffer *buffer) noexcept
+        HRESULT wait_borrowed(BorrowedLease *lease) noexcept
         {
-            if (!buffer || buffer->owner != this)
+            if (!lease || lease->owner != this)
                 return E_INVALIDARG;
 
             HRESULT result = S_OK;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
-                // A borrowed source cannot be reused until the writer has
-                // actually retired the I/O. Even shutdown/cancellation must wait
-                // for BorrowedComplete; writer_loop drains queued work before exit.
-                producer_cv_.wait(lock, [buffer]
+                producer_cv_.wait(lock, [lease]
                 {
-                    return buffer->state == BufferState::BorrowedComplete;
+                    return lease->state == BorrowedLeaseState::Complete;
                 });
 
-                const auto file = buffer->file;
-                const auto job = file ? file->job : nullptr;
-                if (file && file->failed)
-                    result = file->hresult;
-                else if (job)
-                    result = terminal_result_locked(job);
-
-                buffer->file.reset();
-                buffer->size = 0;
-                buffer->borrowed_data = nullptr;
-                buffer->reserved_size = 0;
-                buffer->borrowed = false;
-                buffer->state = BufferState::Free;
+                result = lease->result;
+                lease->result = S_OK;
+                lease->state = BorrowedLeaseState::Free;
+                free_borrowed_leases_.push_back(lease);
                 if (borrowed_leases_ != 0)
                     --borrowed_leases_;
-                free_buffers_.push_back(buffer);
             }
             producer_cv_.notify_all();
             return result;
@@ -2267,6 +2275,10 @@ namespace sunpack::sevenzip
 
         std::vector<std::unique_ptr<Buffer>> buffers_;
         std::deque<Buffer *> free_buffers_;
+#if SUP7Z_USE_SHARED_OUTPUT
+        std::vector<std::unique_ptr<BorrowedLease>> borrowed_leases_;
+        std::deque<BorrowedLease *> free_borrowed_leases_;
+#endif
         std::vector<std::thread> workers_;
         std::deque<WorkItem> work_queue_;
         std::vector<std::weak_ptr<JobState>> active_jobs_;
