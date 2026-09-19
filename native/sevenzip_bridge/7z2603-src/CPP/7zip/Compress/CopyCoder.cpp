@@ -3,6 +3,7 @@
 #include "StdAfx.h"
 
 #include "../../../C/Alloc.h"
+#include "../Common/StreamUtils.h"
 #if SUP7Z_USE_SHARED_INPUT
 #include "../Common/SunpackSharedInput.h"
 #endif
