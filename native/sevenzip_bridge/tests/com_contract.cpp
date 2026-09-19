@@ -115,6 +115,37 @@ void check_open_callback()
     check(rejects(as_unknown(probe), IID_IProgress), "QI(foreign IID) == E_NOINTERFACE");
 }
 
+void check_open_callback_volume_prefetch()
+{
+    std::printf("OpenCallback volume prefetch\n");
+
+    wchar_t executable[MAX_PATH]{};
+    const DWORD length = GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    check(length != 0 && length < MAX_PATH, "test executable path is available");
+    if (length == 0 || length >= MAX_PATH)
+    {
+        return;
+    }
+
+    const std::wstring path(executable, length);
+    const std::wstring name = std::filesystem::path(path).filename().wstring();
+    InputPrefetchConfig prefetch;
+    prefetch.enabled = false;
+
+    auto *raw = new OpenCallback(
+        L"", path, std::vector<std::wstring>{path}, std::vector<std::wstring>{}, prefetch);
+    CMyComPtr<IArchiveOpenCallback> callback(raw);
+
+    CMyComPtr<IInStream> stream;
+    const HRESULT hr = raw->GetStream(name.c_str(), &stream);
+    check(hr == S_OK && stream, "volume callback opens configured stream");
+    if (hr == S_OK && stream)
+    {
+        auto *file = static_cast<FileInStream *>(stream.Interface());
+        check(!file->prefetch_enabled(), "volume callback preserves disabled prefetch policy");
+    }
+}
+
 void check_open_archive_stream_ownership()
 {
     std::printf("open_archive_stream ownership\n");
@@ -154,6 +185,7 @@ int main()
     check_extract_callback();
     check_extract_to_disk_callback();
     check_open_callback();
+    check_open_callback_volume_prefetch();
     check_streams();
     check_open_archive_stream_ownership();
 
