@@ -841,7 +841,9 @@ HRESULT CDecoder::WriteWindowData(const Byte *data, size_t size)
       return E_FAIL;
     }
 
-    const HRESULT pushRes = _outputLeases.Push(token);
+    const UInt64 rangeBegin = (UInt64)(data - _window);
+    const HRESULT pushRes = _outputLeases.Push(
+        token, rangeBegin, rangeBegin + accepted);
     if (pushRes != S_OK)
     {
       _writeError = true;
@@ -1798,15 +1800,16 @@ HRESULT CDecoder::DecodeLZ()
       size_t rem = _winSize - wp;
       if (rem == 0)
       {
-#if SUP7Z_USE_SHARED_OUTPUT
-        // We are about to recycle the physical dictionary from offset 0.
-        // Keep all previous window spans immutable until their async writes retire.
-        RINOK(DrainOutputLeases())
-#endif
         _lzSize += wp;
         winPos -= wp;
         // (winPos < kMaxMatchLen < _winSize)
-        // so memmove is not required here
+        // so memmove is not required here. Only the destination prefix is
+        // physically overwritten at normalization; later decode chunks retire
+        // their own overlapping leases immediately before writing.
+#if SUP7Z_USE_SHARED_OUTPUT
+        if (winPos)
+          RINOK(_outputLeases.RetireOverlapping(0, (UInt64)winPos))
+#endif
         if (winPos)
           memcpy(win, win + _winSize, winPos);
         limit = _winSize;
@@ -1881,6 +1884,18 @@ HRESULT CDecoder::DecodeLZ()
 
     _limit = limit;
     _winPos = winPos;
+#if SUP7Z_USE_SHARED_OUTPUT
+    {
+      // DecodeLZ2 can finish a match slightly past _limit and may touch its
+      // vectorized pad. Retire only leases covering that physical target.
+      size_t overwriteEnd = limit + kMaxMatchLen + COPY_CHUNK_SIZE;
+      if (overwriteEnd < limit || overwriteEnd > _winSize)
+        overwriteEnd = _winSize;
+      if (winPos < overwriteEnd)
+        RINOK(_outputLeases.RetireOverlapping(
+            (UInt64)winPos, (UInt64)overwriteEnd))
+    }
+#endif
     RINOK(DecodeLZ2(_bitStream))
     _bitStream._buf = _buf_Res;
     _bitStream._bitPos = _bitPos_Res;
