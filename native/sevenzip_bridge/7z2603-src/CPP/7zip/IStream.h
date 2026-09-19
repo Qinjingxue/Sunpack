@@ -108,11 +108,11 @@ Z7_IFACE_CONSTR_STREAM_SUB(IOutStream, ISequentialOutStream, 0x04)
   x(GetSize(UInt64 *size))
 Z7_IFACE_CONSTR_STREAM(IStreamGetSize, 0x06)
 
-#ifdef SUP7Z_USE_PLANNED_IO
 #define Z7_IFACEM_IStreamSetReadPlan(x) \
   x(BeginReadPlan()) \
   x(AddReadPlan(UInt64 offset, UInt64 size)) \
-  x(EndReadPlan())
+  x(EndReadPlan()) \
+  x(SetLegacyPrefetchActive(Int32 active))
 Z7_IFACE_CONSTR_STREAM(IStreamSetReadPlan, 0x7e)
 
 namespace NSunpackReadPlan
@@ -129,6 +129,15 @@ namespace NSunpackReadPlan
     return plan;
   }
 
+  inline void SetLegacyPrefetchActive(IUnknown *stream, bool active)
+  {
+    IStreamSetReadPlan *plan = Query(stream);
+    if (!plan) return;
+    plan->SetLegacyPrefetchActive(active ? 1 : 0);
+    plan->Release();
+  }
+
+#ifdef SUP7Z_USE_PLANNED_IO
   inline void Begin(IUnknown *stream)
   {
     IStreamSetReadPlan *plan = Query(stream);
@@ -162,8 +171,8 @@ namespace NSunpackReadPlan
     plan->EndReadPlan();
     plan->Release();
   }
-}
 #endif
+}
 
 #define Z7_IFACEM_IOutStreamFinish(x) \
   x(OutStreamFinish())
