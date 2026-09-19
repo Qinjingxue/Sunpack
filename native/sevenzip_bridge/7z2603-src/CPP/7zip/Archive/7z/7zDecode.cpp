@@ -6,9 +6,6 @@
 #include "../../Common/ProgressUtils.h"
 #include "../../Common/StreamObjects.h"
 #include "../../Common/StreamUtils.h"
-#if SUP7Z_USE_SHARED_INPUT
-#include "../../Common/SunpackSharedInput.h"
-#endif
 
 #include "7zDecode.h"
 
@@ -136,35 +133,19 @@ public:
 
 #ifdef USE_MIXER_MT
 
-#if SUP7Z_USE_SHARED_INPUT
-Z7_CLASS_IMP_COM_2(
-  CLockedSequentialInStreamMT
-  , ISequentialInStream
-  , ISunpackSharedInput
-)
-#else
 Z7_CLASS_IMP_COM_1(
   CLockedSequentialInStreamMT
   , ISequentialInStream
 )
-#endif
   CLockedInStream *_glob;
   UInt64 _pos;
   CMyComPtr<IUnknown> _globRef;
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> _sharedInput;
-#endif
 public:
   void Init(CLockedInStream *lockedInStream, UInt64 startPos)
   {
     _globRef = lockedInStream;
     _glob = lockedInStream;
     _pos = startPos;
-#if SUP7Z_USE_SHARED_INPUT
-    _sharedInput.Release();
-    if (lockedInStream && lockedInStream->Stream)
-      lockedInStream->Stream->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
-#endif
   }
 };
 
@@ -187,87 +168,24 @@ Z7_COM7F_IMF(CLockedSequentialInStreamMT::Read(void *data, UInt32 size, UInt32 *
   return res;
 }
 
-#if SUP7Z_USE_SHARED_INPUT
-
-Z7_COM7F_IMF(CLockedSequentialInStreamMT::Borrow(
-    UInt32 maxSize, const Byte **data, UInt32 *borrowedSize, UInt64 *token))
-{
-  if (!data || !borrowedSize || !token)
-    return E_INVALIDARG;
-  *data = NULL;
-  *borrowedSize = 0;
-  *token = 0;
-  if (!_sharedInput || maxSize == 0)
-    return S_FALSE;
-
-  NWindows::NSynchronization::CCriticalSectionLock lock(_glob->CriticalSection);
-  if (_pos != _glob->Pos)
-  {
-    RINOK(InStream_SeekSet(_glob->Stream, _pos))
-    _glob->Pos = _pos;
-  }
-
-  UInt32 size = 0;
-  const HRESULT res = _sharedInput->Borrow(maxSize, data, &size, token);
-  if (res == S_OK)
-  {
-    if (size == 0 || size > maxSize)
-    {
-      if (*token)
-        _sharedInput->ReleaseBorrowed(*token);
-      *data = NULL;
-      *borrowedSize = 0;
-      *token = 0;
-      return E_FAIL;
-    }
-    _pos += size;
-    _glob->Pos = _pos;
-    *borrowedSize = size;
-  }
-  return res;
-}
-
-Z7_COM7F_IMF(CLockedSequentialInStreamMT::ReleaseBorrowed(UInt64 token))
-{
-  return _sharedInput ? _sharedInput->ReleaseBorrowed(token) : S_FALSE;
-}
-
-#endif
-
 #endif
 
 
 #ifdef USE_MIXER_ST
 
-#if SUP7Z_USE_SHARED_INPUT
-Z7_CLASS_IMP_COM_2(
-  CLockedSequentialInStreamST
-  , ISequentialInStream
-  , ISunpackSharedInput
-)
-#else
 Z7_CLASS_IMP_COM_1(
   CLockedSequentialInStreamST
   , ISequentialInStream
 )
-#endif
   CLockedInStream *_glob;
   UInt64 _pos;
   CMyComPtr<IUnknown> _globRef;
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> _sharedInput;
-#endif
 public:
   void Init(CLockedInStream *lockedInStream, UInt64 startPos)
   {
     _globRef = lockedInStream;
     _glob = lockedInStream;
     _pos = startPos;
-#if SUP7Z_USE_SHARED_INPUT
-    _sharedInput.Release();
-    if (lockedInStream && lockedInStream->Stream)
-      lockedInStream->Stream->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
-#endif
   }
 };
 
@@ -287,52 +205,6 @@ Z7_COM7F_IMF(CLockedSequentialInStreamST::Read(void *data, UInt32 size, UInt32 *
     *processedSize = realProcessedSize;
   return res;
 }
-
-#if SUP7Z_USE_SHARED_INPUT
-
-Z7_COM7F_IMF(CLockedSequentialInStreamST::Borrow(
-    UInt32 maxSize, const Byte **data, UInt32 *borrowedSize, UInt64 *token))
-{
-  if (!data || !borrowedSize || !token)
-    return E_INVALIDARG;
-  *data = NULL;
-  *borrowedSize = 0;
-  *token = 0;
-  if (!_sharedInput || maxSize == 0)
-    return S_FALSE;
-
-  if (_pos != _glob->Pos)
-  {
-    RINOK(InStream_SeekSet(_glob->Stream, _pos))
-    _glob->Pos = _pos;
-  }
-
-  UInt32 size = 0;
-  const HRESULT res = _sharedInput->Borrow(maxSize, data, &size, token);
-  if (res == S_OK)
-  {
-    if (size == 0 || size > maxSize)
-    {
-      if (*token)
-        _sharedInput->ReleaseBorrowed(*token);
-      *data = NULL;
-      *borrowedSize = 0;
-      *token = 0;
-      return E_FAIL;
-    }
-    _pos += size;
-    _glob->Pos = _pos;
-    *borrowedSize = size;
-  }
-  return res;
-}
-
-Z7_COM7F_IMF(CLockedSequentialInStreamST::ReleaseBorrowed(UInt64 token))
-{
-  return _sharedInput ? _sharedInput->ReleaseBorrowed(token) : S_FALSE;
-}
-
-#endif
 
 #endif
 

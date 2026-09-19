@@ -88,13 +88,6 @@ struct ExtractInputTrace {
     unsigned long long prefetch_miss_count = 0;
     unsigned long long prefetch_invalidation_count = 0;
     unsigned long long prefetch_consumer_wait_ns = 0;
-    // Shared-input counters: borrow_bytes are bytes consumed directly from the
-    // prefetch pool; prefetch_copy_bytes are bytes still copied out of that pool.
-    unsigned long long input_borrow_count = 0;
-    unsigned long long input_borrow_bytes = 0;
-    unsigned long long prefetch_copy_bytes = 0;
-    unsigned long long input_pool_stall_count = 0;
-    unsigned long long input_pool_peak_leased = 0;
     unsigned long long last_logical_read_end = 0;
     bool has_last_logical_read_end = false;
     unsigned long long last_read_virtual_offset = 0;

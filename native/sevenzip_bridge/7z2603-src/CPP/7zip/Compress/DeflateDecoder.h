@@ -95,16 +95,7 @@ private:
   bool DecodeLevels(Byte *levels, unsigned numSymbols);
   bool ReadTables();
   
-  HRESULT Flush()
-  {
-    HRESULT res = m_OutWindowStream.Flush();
-#if SUP7Z_USE_SHARED_OUTPUT
-    const HRESULT drainRes = m_OutWindowStream.DrainSharedOutput();
-    if (res == S_OK)
-      res = drainRes;
-#endif
-    return res;
-  }
+  HRESULT Flush() { return m_OutWindowStream.Flush(); }
   class CCoderReleaser
   {
     CCoder *_coder;

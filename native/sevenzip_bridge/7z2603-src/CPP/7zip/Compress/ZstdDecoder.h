@@ -7,9 +7,6 @@
 
 #include "../../Common/MyCom.h"
 #include "../ICoder.h"
-#if SUP7Z_USE_SHARED_INPUT
-#include "../Common/SunpackSharedInput.h"
-#endif
 
 namespace NCompress {
 namespace NZstd {
@@ -74,11 +71,6 @@ private:
   UInt32 _inBufSize;
   UInt32 _inBufSize_Allocated;
   Byte *_inBuf;
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> _sharedInput;
-  UInt64 _borrowToken;
-  void ReleaseBorrowed() throw();
-#endif
   size_t _afterDecoding_tempPos;
 
  #ifndef Z7_NO_READ_FROM_CODER_ZSTD

@@ -4,9 +4,6 @@
 #define ZIP7_INC_COMPRESS_BZIP2_DECODER_H
 
 #include "../../Common/MyCom.h"
-#if SUP7Z_USE_SHARED_OUTPUT
-#include "../Common/SunpackSharedOutput.h"
-#endif
 
 // #define Z7_NO_READ_FROM_CODER
 // #define Z7_ST
@@ -17,9 +14,6 @@
 #endif
 
 #include "../ICoder.h"
-#if SUP7Z_USE_SHARED_INPUT
-#include "../Common/SunpackSharedInput.h"
-#endif
 
 #include "BZip2Const.h"
 #include "BZip2Crc.h"
@@ -245,12 +239,6 @@ public:
 
 private:
   Byte *_outBuf;
-  Byte *_outBufOwned;
-  size_t _outCapacity;
-#if SUP7Z_USE_SHARED_OUTPUT
-  CMyComPtr<ISunpackSharedOutput> _sharedOutput;
-  UInt64 _outLeaseToken;
-#endif
   size_t _outPos;
   UInt64 _outWritten;
   ISequentialOutStream *_outStream;
@@ -328,12 +316,6 @@ public:
   #endif
 
   Byte *_inBuf;
-  const Byte *_inBase;
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> _sharedInput;
-  UInt64 _borrowToken;
-  void ReleaseBorrowed() throw();
-#endif
   UInt64 _inProcessed;
   bool _inputFinished;
   HRESULT _inputRes;
@@ -350,11 +332,7 @@ public:
   {
     // We use InitInputBuffer() before stream init.
     // So don't read from stream here
-#if SUP7Z_USE_SHARED_INPUT
-    ReleaseBorrowed();
-#endif
     _inProcessed = 0;
-    _inBase = _inBuf;
     Base._buf = _inBuf;
     Base._lim = _inBuf;
     Base.InitBitDecoder();
@@ -363,12 +341,12 @@ public:
   UInt64 GetInputProcessedSize() const
   {
     // for NSIS case : we need also look the number of bits in bitDecoder
-    return _inProcessed + (size_t)(Base._buf - _inBase);
+    return _inProcessed + (size_t)(Base._buf - _inBuf);
   }
 
   UInt64 GetInStreamSize() const
   {
-    return _inProcessed + (size_t)(Base._buf - _inBase) - (Base._numBits >> 3);
+    return _inProcessed + (size_t)(Base._buf - _inBuf) - (Base._numBits >> 3);
   }
 
   UInt64 GetOutProcessedSize() const { return _outWritten + _outPos; }
@@ -383,10 +361,6 @@ public:
   HRESULT ReadBlockSignature();
   HRESULT ReadBlock();
 
-  HRESULT AcquireOutputBuffer();
-#if SUP7Z_USE_SHARED_OUTPUT
-  void AbortOutputLease() throw();
-#endif
   HRESULT Flush();
   HRESULT DecodeBlock(const CBlockProps &props);
   HRESULT DecodeStreams(ICompressProgressInfo *progress);

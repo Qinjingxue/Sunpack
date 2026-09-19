@@ -571,6 +571,7 @@ function Build-SevenZipWrapper {
     # Request the upstream optimized paths explicitly for product builds:
     # x64 uses MASM for LZMA/CRC/AES/SHA; ARM64 uses clang-cl only for LzmaDecOpt.S while
     # CRC/AES/SHA keep the upstream C/intrinsics implementations. Each architecture has an
+    # explicit OFF switch for same-commit A/B benchmarking and rollback.
     Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON")
     Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release")
     if ((Get-ProcessBuildArch) -eq $BuildArch) {

@@ -5,9 +5,6 @@
 #include "sevenzip_streams.hpp"
 
 #include "sevenzip_async_output.hpp"
-#if SUP7Z_USE_SHARED_OUTPUT
-#include "7zip/Common/SunpackSharedOutput.h"
-#endif
 
 #include "sevenzip_space_directory.hpp"
 
@@ -517,15 +514,8 @@ namespace sunpack::sevenzip
     };
 
     class AsyncFileOutStream final : public CMyUnknownImp, public ISequentialOutStream
-#if SUP7Z_USE_SHARED_OUTPUT
-        , public ISunpackSharedOutput
-#endif
     {
-#if SUP7Z_USE_SHARED_OUTPUT
-        Z7_COM_UNKNOWN_IMP_2(ISequentialOutStream, ISunpackSharedOutput)
-#else
         Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
-#endif
         
 
     public:
@@ -544,16 +534,6 @@ namespace sunpack::sevenzip
             if (writer_ && file_)
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-#if SUP7Z_USE_SHARED_OUTPUT
-                if (leased_token_ != 0)
-                {
-                    UInt32 ignored = 0;
-                    writer_->commit_output(file_, leased_token_, 0, &ignored);
-                    leased_token_ = 0;
-                    leased_data_ = nullptr;
-                    leased_capacity_ = 0;
-                }
-#endif
                 writer_->close_file(file_, crc32_ ^ 0xFFFFFFFFU, compute_crc_, std::move(magic_));
             }
         }
@@ -589,132 +569,12 @@ namespace sunpack::sevenzip
             return hr;
         }
 
-#if SUP7Z_USE_SHARED_OUTPUT
-        HRESULT STDMETHODCALLTYPE Acquire(
-            UInt32 desiredSize,
-            Byte **data,
-            UInt32 *capacity,
-            UInt64 *token) SUP7Z_NOEXCEPT override
-        {
-            if (data) *data = nullptr;
-            if (capacity) *capacity = 0;
-            if (token) *token = 0;
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!writer_ || !file_ || leased_token_ != 0)
-                return E_FAIL;
-
-            unsigned char *leased = nullptr;
-            UInt32 leased_capacity = 0;
-            UInt64 leased_token = 0;
-            const HRESULT hr = writer_->acquire_output(
-                file_, desiredSize, &leased, &leased_capacity, &leased_token);
-            if (hr != S_OK)
-                return hr;
-            if (!leased || leased_capacity == 0 || leased_token == 0)
-                return E_FAIL;
-
-            leased_data_ = leased;
-            leased_capacity_ = leased_capacity;
-            leased_token_ = leased_token;
-            *data = leased;
-            *capacity = leased_capacity;
-            *token = leased_token;
-            return S_OK;
-        }
-
-        HRESULT STDMETHODCALLTYPE Commit(
-            UInt64 token,
-            UInt32 size,
-            UInt32 *processedSize) SUP7Z_NOEXCEPT override
-        {
-            if (processedSize) *processedSize = 0;
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!writer_ || !file_ || token == 0 || token != leased_token_ ||
-                !leased_data_ || size > leased_capacity_)
-                return E_INVALIDARG;
-
-            // Snapshot metadata while this thread still exclusively owns the
-            // lease. commit_output() transfers buffer ownership, so the bytes
-            // cannot be touched afterwards. Apply the snapshot only if the
-            // writer actually accepted the whole lease.
-            const UInt32 next_crc = (compute_crc_ && size != 0)
-                ? update_crc32(crc32_, leased_data_, size)
-                : crc32_;
-            std::array<unsigned char, 512> magic_tail;
-            const std::size_t magic_take = size != 0 && magic_.size() < 512
-                ? std::min<std::size_t>(512 - magic_.size(), size)
-                : 0;
-            if (magic_take != 0)
-                std::memcpy(magic_tail.data(), leased_data_, magic_take);
-
-            UInt32 committed = 0;
-            const HRESULT hr = writer_->commit_output(file_, token, size, &committed);
-            leased_token_ = 0;
-            leased_data_ = nullptr;
-            leased_capacity_ = 0;
-            if (hr == S_OK && committed == size)
-            {
-                if (compute_crc_ && size != 0)
-                    crc32_ = next_crc;
-                if (magic_take != 0)
-                    magic_.insert(magic_.end(), magic_tail.data(), magic_tail.data() + magic_take);
-            }
-            if (processedSize)
-                *processedSize = committed;
-            return hr;
-        }
-
-        HRESULT STDMETHODCALLTYPE SubmitBorrowed(
-            const Byte *data,
-            UInt32 size,
-            UInt32 *processedSize,
-            UInt64 *token) SUP7Z_NOEXCEPT override
-        {
-            if (processedSize) *processedSize = 0;
-            if (token) *token = 0;
-            std::lock_guard<std::mutex> lock(mutex_);
-            if (!writer_ || !file_ || !data || size == 0 || leased_token_ != 0)
-                return E_INVALIDARG;
-
-            UInt32 accepted = 0;
-            UInt64 lease = 0;
-            const HRESULT hr = writer_->submit_borrowed(
-                file_, data, size, &accepted, &lease);
-            if (hr != S_OK)
-                return hr;
-
-            if (compute_crc_ && accepted != 0)
-                crc32_ = update_crc32(crc32_, data, accepted);
-            if (accepted != 0 && magic_.size() < 512)
-            {
-                const std::size_t take = std::min<std::size_t>(512 - magic_.size(), accepted);
-                magic_.insert(magic_.end(), data, data + take);
-            }
-
-            *processedSize = accepted;
-            *token = lease;
-            return S_OK;
-        }
-
-        HRESULT STDMETHODCALLTYPE WaitBorrowed(UInt64 token) SUP7Z_NOEXCEPT override
-        {
-            // The token is self-contained and intentionally does not depend on
-            // this stream still being the active solid-file output.
-            return SunpackSharedOutput_WaitToken(token);
-        }
-#endif
-
     private:
         std::shared_ptr<AsyncFileWriter> writer_;
         AsyncFileWriter::FileStatePtr file_;
         bool compute_crc_ = false;
         UInt32 crc32_ = 0xFFFFFFFFU;
         std::vector<unsigned char> magic_;
-#if SUP7Z_USE_SHARED_OUTPUT
-        const unsigned char *leased_data_ = nullptr;
-        UInt32 leased_capacity_ = 0;
-        UInt64 leased_token_ = 0;
-#endif
         std::mutex mutex_;
     };
 

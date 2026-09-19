@@ -115,24 +115,6 @@ void check_open_callback()
     check(rejects(as_unknown(probe), IID_IProgress), "QI(foreign IID) == E_NOINTERFACE");
 }
 
-void check_async_output_stream()
-{
-    std::printf("AsyncFileOutStream\n");
-    auto *raw = new AsyncFileOutStream(nullptr, nullptr, false);
-    CMyComPtr<ISequentialOutStream> stream(raw);
-    IUnknown *unknown = static_cast<IUnknown *>(static_cast<ISequentialOutStream *>(raw));
-
-    check(queries_as(unknown, IID_IUnknown), "AsyncFileOutStream QI(IUnknown) == S_OK");
-    check(queries_as(unknown, IID_ISequentialOutStream),
-          "AsyncFileOutStream QI(ISequentialOutStream) == S_OK");
-#if SUP7Z_USE_SHARED_OUTPUT
-    check(queries_as(unknown, IID_ISunpackSharedOutput),
-          "AsyncFileOutStream QI(ISunpackSharedOutput) == S_OK");
-#endif
-    check(rejects(unknown, IID_IInStream),
-          "AsyncFileOutStream QI(foreign IID) == E_NOINTERFACE");
-}
-
 void check_open_archive_stream_ownership()
 {
     std::printf("open_archive_stream ownership\n");
@@ -157,18 +139,12 @@ void check_streams()
     check(queries_as(as_unknown(file_raw), IID_IUnknown), "FileInStream QI(IUnknown) == S_OK");
     check(queries_as(as_unknown(file_raw), IID_ISequentialInStream), "FileInStream QI(ISequentialInStream) == S_OK");
     check(queries_as(as_unknown(file_raw), IID_IInStream), "FileInStream QI(IInStream) == S_OK");
-#if SUP7Z_USE_SHARED_INPUT
-    check(queries_as(as_unknown(file_raw), IID_ISunpackSharedInput), "FileInStream QI(ISunpackSharedInput) == S_OK");
-#endif
     check(rejects(as_unknown(file_raw), IID_IProgress), "FileInStream QI(foreign IID) == E_NOINTERFACE");
 
     auto *multi_raw = new MultiRangeInStream(std::vector<ExtractInputRange>{});
     CMyComPtr<IInStream> multi(multi_raw);
     check(queries_as(as_unknown(multi_raw), IID_ISequentialInStream), "MultiRangeInStream QI(ISequentialInStream) == S_OK");
     check(queries_as(as_unknown(multi_raw), IID_IInStream), "MultiRangeInStream QI(IInStream) == S_OK");
-#if SUP7Z_USE_SHARED_INPUT
-    check(queries_as(as_unknown(multi_raw), IID_ISunpackSharedInput), "MultiRangeInStream QI(ISunpackSharedInput) == S_OK");
-#endif
 }
 
 } // namespace
@@ -179,7 +155,6 @@ int main()
     check_extract_to_disk_callback();
     check_open_callback();
     check_streams();
-    check_async_output_stream();
     check_open_archive_stream_ownership();
 
     if (g_failures != 0)

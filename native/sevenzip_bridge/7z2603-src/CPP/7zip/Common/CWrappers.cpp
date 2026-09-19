@@ -162,27 +162,10 @@ void CSeekInStreamWrap::Init(IInStream *stream) throw()
 
 /* ---------- CByteInBufWrap ---------- */
 
-void CByteInBufWrap::ReleaseBorrowed() throw()
-{
-#if SUP7Z_USE_SHARED_INPUT
-  if (BorrowToken)
-  {
-    if (SharedInput)
-      SharedInput->ReleaseBorrowed(BorrowToken);
-    BorrowToken = 0;
-  }
-#endif
-}
-
 void CByteInBufWrap::Free() throw()
 {
-  ReleaseBorrowed();
-#if SUP7Z_USE_SHARED_INPUT
-  SharedInput.Release();
-#endif
   ::MidFree(Buf);
   Buf = NULL;
-  Base = Cur = Lim = NULL;
 }
 
 bool CByteInBufWrap::Alloc(UInt32 size) throw()
@@ -200,46 +183,13 @@ Byte CByteInBufWrap::ReadByteFromNewBlock() throw()
 {
   if (!Extra && Res == S_OK)
   {
-    Processed += (size_t)(Cur - Base);
-    ReleaseBorrowed();
-
-#if SUP7Z_USE_SHARED_INPUT
-    if (SharedInput)
-    {
-      const Byte *borrowed = NULL;
-      UInt32 avail = 0;
-      UInt64 token = 0;
-      const HRESULT borrowRes = SharedInput->Borrow(Size, &borrowed, &avail, &token);
-      if (borrowRes == S_OK)
-      {
-        if (!borrowed || avail == 0 || token == 0)
-        {
-          if (token)
-            SharedInput->ReleaseBorrowed(token);
-          Res = E_FAIL;
-        }
-        else
-        {
-          BorrowToken = token;
-          Base = Cur = borrowed;
-          Lim = borrowed + avail;
-          return *Cur++;
-        }
-      }
-      else if (borrowRes != S_FALSE)
-        Res = borrowRes;
-    }
-#endif
-
-    if (Res == S_OK)
-    {
-      UInt32 avail = 0;
-      Res = Stream->Read(Buf, Size, &avail);
-      Base = Cur = Buf;
-      Lim = Buf + avail;
-      if (avail != 0)
-        return *Cur++;
-    }
+    UInt32 avail;
+    Res = Stream->Read(Buf, Size, &avail);
+    Processed += (size_t)(Cur - Buf);
+    Cur = Buf;
+    Lim = Buf + avail;
+    if (avail != 0)
+      return *Cur++;
   }
   Extra = true;
   return 0;
@@ -256,32 +206,9 @@ static Byte Wrap_ReadByte(IByteInPtr pp) throw()
   return p->ReadByteFromNewBlock();
 }
 
-CByteInBufWrap::CByteInBufWrap() throw():
-    Cur(NULL),
-    Lim(NULL),
-    Base(NULL),
-    Buf(NULL),
-    Size(0),
-    Stream(NULL)
-#if SUP7Z_USE_SHARED_INPUT
-    , BorrowToken(0)
-#endif
-    , Processed(0),
-    Extra(false),
-    Res(S_OK)
+CByteInBufWrap::CByteInBufWrap() throw(): Buf(NULL)
 {
   vt.Read = Wrap_ReadByte;
-}
-
-void CByteInBufWrap::SetStream(ISequentialInStream *stream) throw()
-{
-  ReleaseBorrowed();
-  Stream = stream;
-#if SUP7Z_USE_SHARED_INPUT
-  SharedInput.Release();
-  if (stream)
-    stream->QueryInterface(IID_ISunpackSharedInput, (void **)&SharedInput);
-#endif
 }
 
 

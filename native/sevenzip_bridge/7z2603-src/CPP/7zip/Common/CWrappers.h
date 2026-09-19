@@ -5,9 +5,6 @@
 
 #include "../ICoder.h"
 #include "../../Common/MyCom.h"
-#if SUP7Z_USE_SHARED_INPUT
-#include "SunpackSharedInput.h"
-#endif
 
 SRes HRESULT_To_SRes(HRESULT res, SRes defaultRes) throw();
 HRESULT SResToHRESULT(SRes res) throw();
@@ -59,14 +56,9 @@ struct CByteInBufWrap
   IByteIn vt;
   const Byte *Cur;
   const Byte *Lim;
-  const Byte *Base;
   Byte *Buf;
   UInt32 Size;
   ISequentialInStream *Stream;
-#if SUP7Z_USE_SHARED_INPUT
-  CMyComPtr<ISunpackSharedInput> SharedInput;
-  UInt64 BorrowToken;
-#endif
   UInt64 Processed;
   bool Extra;
   HRESULT Res;
@@ -75,17 +67,14 @@ struct CByteInBufWrap
   ~CByteInBufWrap() { Free(); }
   void Free() throw();
   bool Alloc(UInt32 size) throw();
-  void SetStream(ISequentialInStream *stream) throw();
-  void ReleaseBorrowed() throw();
   void Init()
   {
-    ReleaseBorrowed();
-    Base = Lim = Cur = Buf;
+    Lim = Cur = Buf;
     Processed = 0;
     Extra = false;
     Res = S_OK;
   }
-  UInt64 GetProcessed() const { return Processed + (size_t)(Cur - Base); }
+  UInt64 GetProcessed() const { return Processed + (size_t)(Cur - Buf); }
   Byte ReadByteFromNewBlock() throw();
   Byte ReadByte()
   {
