@@ -116,6 +116,15 @@ namespace sunpack::sevenzip
         return config;
     }
 
+    inline InputPrefetchConfig prefetch_worker_config(InputPrefetchConfig config) noexcept
+    {
+#ifdef SUP7Z_USE_PLANNED_IO
+        // Native-volume RAR disables legacy sequential prefetch, but planned I/O still needs the worker.
+        config.enabled = true;
+#endif
+        return config;
+    }
+
     // Opened once per file and reused; the handle carries its own file cursor and is owned by exactly one thread that reads sequentially.
     // Streams that also serve the embedded 7-Zip decoder keep a second,
     // independent handle for decoder driven Seek/Read calls.
@@ -251,6 +260,86 @@ namespace sunpack::sevenzip
 
         bool enabled() const noexcept { return config_.enabled; }
 
+        bool planned_mode()
+        {
+#ifdef SUP7Z_USE_PLANNED_IO
+            std::lock_guard lock(mutex_);
+            return planned_mode_;
+#else
+            return false;
+#endif
+        }
+
+#ifdef SUP7Z_USE_PLANNED_IO
+        void begin_plan()
+        {
+            std::lock_guard lock(mutex_);
+            ++epoch_;
+            chunks_.clear();
+            plan_.clear();
+            plan_index_ = 0;
+            next_offset_ = 0;
+            next_chunk_min_size_ = 0;
+            active_ = false;
+            planned_mode_ = false;
+            building_plan_ = true;
+            ready_.notify_all();
+        }
+
+        void add_plan(UInt64 offset, UInt64 size)
+        {
+            std::lock_guard lock(mutex_);
+            if (!building_plan_ || offset >= virtual_size_ || size == 0)
+            {
+                return;
+            }
+
+            UInt64 end = virtual_size_;
+            if (size != (UInt64)(Int64)-1 && size < virtual_size_ - offset)
+            {
+                end = offset + size;
+            }
+            if (end <= offset)
+            {
+                return;
+            }
+
+            if (!plan_.empty())
+            {
+                PlannedRange &last = plan_.back();
+                const UInt64 last_end = last.offset + last.size;
+                const UInt64 merge_limit = last_end > (UInt64)(Int64)-1 - kPlanMergeGap
+                                               ? (UInt64)(Int64)-1
+                                               : last_end + kPlanMergeGap;
+                if (offset >= last.offset && offset <= merge_limit)
+                {
+                    if (end > last_end)
+                    {
+                        last.size = end - last.offset;
+                    }
+                    return;
+                }
+            }
+            plan_.push_back(PlannedRange{offset, end - offset});
+        }
+
+        void end_plan()
+        {
+            std::lock_guard lock(mutex_);
+            building_plan_ = false;
+            planned_mode_ = !plan_.empty();
+            active_ = planned_mode_;
+            plan_index_ = 0;
+            next_offset_ = planned_mode_ ? plan_[0].offset : 0;
+            next_chunk_min_size_ = 0;
+            if (planned_mode_)
+            {
+                schedule_locked();
+            }
+            ready_.notify_all();
+        }
+#endif
+
         bool consume(UInt64 offset, void *data, UInt32 size, ExtractInputTrace *trace)
         {
             if (!config_.enabled || size == 0)
@@ -262,6 +351,14 @@ namespace sunpack::sevenzip
                                                 : std::chrono::steady_clock::time_point{};
             std::unique_lock lock(mutex_);
             auto chunk = find_chunk_locked(offset, size);
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (chunk == chunks_.end() && planned_mode_ && rebase_plan_locked(offset, size))
+            {
+                schedule_locked();
+                ready_.notify_all();
+                chunk = find_chunk_locked(offset, size);
+            }
+#endif
             if (chunk == chunks_.end())
             {
                 if (profiling)
@@ -309,6 +406,12 @@ namespace sunpack::sevenzip
             {
                 return;
             }
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (planned_mode())
+            {
+                return;
+            }
+#endif
             std::lock_guard lock(mutex_);
             chunks_.erase(std::remove_if(chunks_.begin(), chunks_.end(), [end](const Chunk &chunk)
                                          { return chunk.offset + chunk.size <= end; }),
@@ -342,6 +445,12 @@ namespace sunpack::sevenzip
             {
                 return;
             }
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (planned_mode())
+            {
+                return;
+            }
+#endif
             std::lock_guard lock(mutex_);
             if (!chunks_.empty() && trace && read_file_timing_enabled())
             {
@@ -384,12 +493,88 @@ namespace sunpack::sevenzip
                                 { return chunk.offset <= offset && offset + size <= chunk.offset + chunk.size; });
         }
 
+#ifdef SUP7Z_USE_PLANNED_IO
+        struct PlannedRange
+        {
+            UInt64 offset = 0;
+            UInt64 size = 0;
+        };
+
+        static constexpr UInt64 kPlanMergeGap = 64 * 1024;
+        static constexpr UInt32 kPlannedWindowFloor = 2 * 1024 * 1024;
+
+        bool rebase_plan_locked(UInt64 offset, UInt32 size)
+        {
+            const UInt64 end = offset + size;
+            for (std::size_t i = 0; i < plan_.size(); ++i)
+            {
+                const PlannedRange &range = plan_[i];
+                const UInt64 range_end = range.offset + range.size;
+                if (range.offset <= offset && end <= range_end)
+                {
+                    ++epoch_;
+                    chunks_.clear();
+                    plan_index_ = i;
+                    next_offset_ = offset;
+                    next_chunk_min_size_ = size;
+                    active_ = true;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        void schedule_plan_locked()
+        {
+            const UInt32 planned_window = std::max<UInt32>(config_.window_bytes, kPlannedWindowFloor);
+            while (chunks_.size() < config_.depth && plan_index_ < plan_.size())
+            {
+                const PlannedRange &range = plan_[plan_index_];
+                const UInt64 range_end = range.offset + range.size;
+                if (next_offset_ < range.offset)
+                {
+                    next_offset_ = range.offset;
+                }
+                if (next_offset_ >= range_end)
+                {
+                    ++plan_index_;
+                    if (plan_index_ < plan_.size())
+                    {
+                        next_offset_ = plan_[plan_index_].offset;
+                    }
+                    continue;
+                }
+                const UInt64 remaining = range_end - next_offset_;
+                UInt64 wanted = planned_window;
+                if (next_chunk_min_size_ > wanted)
+                {
+                    wanted = next_chunk_min_size_;
+                }
+                const UInt32 read_size = static_cast<UInt32>(std::min<UInt64>(remaining, wanted));
+                chunks_.push_back(Chunk{epoch_, next_offset_, read_size});
+                next_offset_ += read_size;
+                next_chunk_min_size_ = 0;
+            }
+            if (plan_index_ >= plan_.size())
+            {
+                active_ = false;
+            }
+        }
+#endif
+
         void schedule_locked()
         {
             if (!active_)
             {
                 return;
             }
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (planned_mode_)
+            {
+                schedule_plan_locked();
+                return;
+            }
+#endif
             while (chunks_.size() < config_.depth && next_offset_ < virtual_size_)
             {
                 const UInt64 remaining = virtual_size_ - next_offset_;
@@ -455,6 +640,13 @@ namespace sunpack::sevenzip
         std::vector<Chunk> chunks_;
         UInt64 epoch_ = 0;
         UInt64 next_offset_ = 0;
+#ifdef SUP7Z_USE_PLANNED_IO
+        std::vector<PlannedRange> plan_;
+        std::size_t plan_index_ = 0;
+        UInt32 next_chunk_min_size_ = 0;
+        bool planned_mode_ = false;
+        bool building_plan_ = false;
+#endif
         bool active_ = false;
         bool stopping_ = false;
     };
@@ -537,8 +729,15 @@ namespace sunpack::sevenzip
     }
 
     class FileInStream final : public CMyUnknownImp, public IInStream
+#ifdef SUP7Z_USE_PLANNED_IO
+        , public IStreamSetReadPlan
+#endif
     {
+#ifdef SUP7Z_USE_PLANNED_IO
+        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, IStreamSetReadPlan)
+#else
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+#endif
         
 
     public:
@@ -588,14 +787,16 @@ namespace sunpack::sevenzip
                 }
             }
 
-            if (size_ && prefetch_config.enabled)
+            legacy_prefetch_enabled_ = prefetch_config.enabled;
+            const InputPrefetchConfig worker_prefetch_config = prefetch_worker_config(prefetch_config);
+            if (size_ && worker_prefetch_config.enabled)
             {
                 // A handle of its own, so prefetch offset reads never touch the decoder handle or its file cursor.
                 prefetch_reader_ = std::make_unique<PathHandle>(path_);
                 if (prefetch_reader_->valid())
                 {
                     PathHandle *reader = prefetch_reader_.get();
-                    prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, size_, [reader](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
+                    prefetch_ = std::make_unique<SequentialPrefetcher>(worker_prefetch_config, size_, [reader](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
                                                                        { return reader->read_at(offset, data, read_size, processed); });
                 }
                 else
@@ -622,6 +823,29 @@ namespace sunpack::sevenzip
         bool is_open() const { return handle_ != INVALID_HANDLE_VALUE; }
 
         bool prefetch_enabled() const noexcept { return prefetch_ && prefetch_->enabled(); }
+
+#ifdef SUP7Z_USE_PLANNED_IO
+        HRESULT STDMETHODCALLTYPE BeginReadPlan() SUP7Z_NOEXCEPT override
+        {
+            if (!prefetch_) return S_FALSE;
+            prefetch_->begin_plan();
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE AddReadPlan(UInt64 offset, UInt64 size) SUP7Z_NOEXCEPT override
+        {
+            if (!prefetch_) return S_FALSE;
+            prefetch_->add_plan(offset, size);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE EndReadPlan() SUP7Z_NOEXCEPT override
+        {
+            if (!prefetch_) return S_FALSE;
+            prefetch_->end_plan();
+            return S_OK;
+        }
+#endif
 
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
@@ -650,7 +874,7 @@ namespace sunpack::sevenzip
                 trace_->last_range_index = 0;
             }
 
-            if (prefetch_ && prefetch_->consume(position_, data, size, trace_))
+            if (prefetch_ && (legacy_prefetch_enabled_ || prefetch_->planned_mode()) && prefetch_->consume(position_, data, size, trace_))
             {
                 position_ += size;
                 LARGE_INTEGER cached_position{};
@@ -717,7 +941,7 @@ namespace sunpack::sevenzip
 
             position_ += read;
 
-            if (prefetch_ && read)
+            if (prefetch_ && legacy_prefetch_enabled_ && read)
             {
                 prefetch_->after_sync_read(position_);
             }
@@ -785,7 +1009,7 @@ namespace sunpack::sevenzip
 
             record_logical_seek(trace_, prior_position, position_);
 
-            if (prefetch_ && prior_position != position_)
+            if (prefetch_ && legacy_prefetch_enabled_ && prior_position != position_)
             {
                 prefetch_->invalidate(position_, trace_);
             }
@@ -833,11 +1057,19 @@ namespace sunpack::sevenzip
         std::unique_ptr<PathHandle> prefetch_reader_;
 
         std::unique_ptr<SequentialPrefetcher> prefetch_;
+        bool legacy_prefetch_enabled_ = false;
     };
 
     class MultiFileInStream final : public CMyUnknownImp, public IInStream
+#ifdef SUP7Z_USE_PLANNED_IO
+        , public IStreamSetReadPlan
+#endif
     {
+#ifdef SUP7Z_USE_PLANNED_IO
+        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, IStreamSetReadPlan)
+#else
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+#endif
         
 
     public:
@@ -888,9 +1120,11 @@ namespace sunpack::sevenzip
                 trace_->virtual_size = total_size_;
             }
 
-            if (valid_ && total_size_ && prefetch_config.enabled)
+            legacy_prefetch_enabled_ = prefetch_config.enabled;
+            const InputPrefetchConfig worker_prefetch_config = prefetch_worker_config(prefetch_config);
+            if (valid_ && total_size_ && worker_prefetch_config.enabled)
             {
-                prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
+                prefetch_ = std::make_unique<SequentialPrefetcher>(worker_prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
                                                                    { return read_prefetch_at(offset, data, read_size, processed); });
             }
             if (trace_ && read_file_timing_enabled())
@@ -902,6 +1136,29 @@ namespace sunpack::sevenzip
         ~MultiFileInStream() { close_cached_handle(); }
 
         bool is_open() const { return valid_; }
+
+#ifdef SUP7Z_USE_PLANNED_IO
+        HRESULT STDMETHODCALLTYPE BeginReadPlan() SUP7Z_NOEXCEPT override
+        {
+            if (!prefetch_) return S_FALSE;
+            prefetch_->begin_plan();
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE AddReadPlan(UInt64 offset, UInt64 size) SUP7Z_NOEXCEPT override
+        {
+            if (!prefetch_) return S_FALSE;
+            prefetch_->add_plan(offset, size);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE EndReadPlan() SUP7Z_NOEXCEPT override
+        {
+            if (!prefetch_) return S_FALSE;
+            prefetch_->end_plan();
+            return S_OK;
+        }
+#endif
 
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
@@ -922,7 +1179,7 @@ namespace sunpack::sevenzip
             const UInt64 read_start = position_;
             auto *out = static_cast<unsigned char *>(data);
 
-            if (prefetch_ && prefetch_->consume(position_, data, size, trace_))
+            if (prefetch_ && (legacy_prefetch_enabled_ || prefetch_->planned_mode()) && prefetch_->consume(position_, data, size, trace_))
             {
                 position_ += size;
                 record_logical_read(trace_, read_start, size);
@@ -1108,7 +1365,7 @@ namespace sunpack::sevenzip
 
             record_logical_read(trace_, read_start, total_read);
 
-            if (prefetch_ && total_read)
+            if (prefetch_ && legacy_prefetch_enabled_ && total_read)
             {
                 prefetch_->after_sync_read(position_);
             }
@@ -1151,7 +1408,7 @@ namespace sunpack::sevenzip
 
             record_logical_seek(trace_, prior_position, position_);
 
-            if (prefetch_ && prior_position != position_)
+            if (prefetch_ && legacy_prefetch_enabled_ && prior_position != position_)
             {
                 prefetch_->invalidate(position_, trace_);
             }
@@ -1307,6 +1564,7 @@ namespace sunpack::sevenzip
         mutable PathHandleCache prefetch_handles_;
 
         std::unique_ptr<SequentialPrefetcher> prefetch_;
+        bool legacy_prefetch_enabled_ = false;
     };
 
     struct NormalizedInputRange
@@ -1322,8 +1580,15 @@ namespace sunpack::sevenzip
     };
 
     class MultiRangeInStream final : public CMyUnknownImp, public IInStream
+#ifdef SUP7Z_USE_PLANNED_IO
+        , public IStreamSetReadPlan
+#endif
     {
+#ifdef SUP7Z_USE_PLANNED_IO
+        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, IStreamSetReadPlan)
+#else
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+#endif
         
 
     public:
@@ -1400,9 +1665,11 @@ namespace sunpack::sevenzip
                 trace_->virtual_size = total_size_;
             }
 
-            if (valid_ && total_size_ && prefetch_config.enabled)
+            legacy_prefetch_enabled_ = prefetch_config.enabled;
+            const InputPrefetchConfig worker_prefetch_config = prefetch_worker_config(prefetch_config);
+            if (valid_ && total_size_ && worker_prefetch_config.enabled)
             {
-                prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
+                prefetch_ = std::make_unique<SequentialPrefetcher>(worker_prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
                                                                    { return read_prefetch_at(offset, data, read_size, processed); });
             }
             if (trace_ && read_file_timing_enabled())
@@ -1418,6 +1685,29 @@ namespace sunpack::sevenzip
         }
 
         bool is_open() const { return valid_; }
+
+#ifdef SUP7Z_USE_PLANNED_IO
+        HRESULT STDMETHODCALLTYPE BeginReadPlan() SUP7Z_NOEXCEPT override
+        {
+            if (!prefetch_) return S_FALSE;
+            prefetch_->begin_plan();
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE AddReadPlan(UInt64 offset, UInt64 size) SUP7Z_NOEXCEPT override
+        {
+            if (!prefetch_) return S_FALSE;
+            prefetch_->add_plan(offset, size);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE EndReadPlan() SUP7Z_NOEXCEPT override
+        {
+            if (!prefetch_) return S_FALSE;
+            prefetch_->end_plan();
+            return S_OK;
+        }
+#endif
 
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
@@ -1438,7 +1728,7 @@ namespace sunpack::sevenzip
             const UInt64 read_start = position_;
             auto *out = static_cast<unsigned char *>(data);
 
-            if (prefetch_ && prefetch_->consume(position_, data, size, trace_))
+            if (prefetch_ && (legacy_prefetch_enabled_ || prefetch_->planned_mode()) && prefetch_->consume(position_, data, size, trace_))
             {
                 position_ += size;
                 record_logical_read(trace_, read_start, size);
@@ -1624,7 +1914,7 @@ namespace sunpack::sevenzip
 
             record_logical_read(trace_, read_start, total_read);
 
-            if (prefetch_ && total_read)
+            if (prefetch_ && legacy_prefetch_enabled_ && total_read)
             {
                 prefetch_->after_sync_read(position_);
             }
@@ -1667,7 +1957,7 @@ namespace sunpack::sevenzip
 
             record_logical_seek(trace_, prior_position, position_);
 
-            if (prefetch_ && prior_position != position_)
+            if (prefetch_ && legacy_prefetch_enabled_ && prior_position != position_)
             {
                 prefetch_->invalidate(position_, trace_);
             }
@@ -1820,6 +2110,7 @@ namespace sunpack::sevenzip
         UInt64 cached_handle_position_ = 0;
 
         std::unique_ptr<SequentialPrefetcher> prefetch_;
+        bool legacy_prefetch_enabled_ = false;
 
         bool valid_ = true;
 
