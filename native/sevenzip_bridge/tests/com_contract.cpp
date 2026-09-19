@@ -122,12 +122,18 @@ void check_streams()
     check(queries_as(as_unknown(file_raw), IID_IUnknown), "FileInStream QI(IUnknown) == S_OK");
     check(queries_as(as_unknown(file_raw), IID_ISequentialInStream), "FileInStream QI(ISequentialInStream) == S_OK");
     check(queries_as(as_unknown(file_raw), IID_IInStream), "FileInStream QI(IInStream) == S_OK");
+#if SUP7Z_USE_SHARED_INPUT
+    check(queries_as(as_unknown(file_raw), IID_ISunpackSharedInput), "FileInStream QI(ISunpackSharedInput) == S_OK");
+#endif
     check(rejects(as_unknown(file_raw), IID_IProgress), "FileInStream QI(foreign IID) == E_NOINTERFACE");
 
     auto *multi_raw = new MultiRangeInStream(std::vector<ExtractInputRange>{});
     CMyComPtr<IInStream> multi(multi_raw);
     check(queries_as(as_unknown(multi_raw), IID_ISequentialInStream), "MultiRangeInStream QI(ISequentialInStream) == S_OK");
     check(queries_as(as_unknown(multi_raw), IID_IInStream), "MultiRangeInStream QI(IInStream) == S_OK");
+#if SUP7Z_USE_SHARED_INPUT
+    check(queries_as(as_unknown(multi_raw), IID_ISunpackSharedInput), "MultiRangeInStream QI(ISunpackSharedInput) == S_OK");
+#endif
 }
 
 } // namespace
