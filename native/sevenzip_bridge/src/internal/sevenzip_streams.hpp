@@ -119,8 +119,12 @@ namespace sunpack::sevenzip
     inline InputPrefetchConfig prefetch_worker_config(InputPrefetchConfig config) noexcept
     {
 #ifdef SUP7Z_USE_PLANNED_IO
-        // Native-volume RAR disables legacy sequential prefetch, but planned I/O still needs the worker.
-        config.enabled = true;
+        // Preserve the global runtime off switch. Only bypass format-specific legacy disables
+        // (TAR and native RAR volumes) so they can still execute an explicit read plan.
+        if (!config.enabled && input_prefetch_config().enabled)
+        {
+            config.enabled = true;
+        }
 #endif
         return config;
     }
