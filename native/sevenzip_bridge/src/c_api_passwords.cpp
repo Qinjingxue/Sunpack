@@ -22,7 +22,7 @@ SUP7Z_API int sup7z_try_passwords(
     if (attempts) {
         *attempts = 0;
     }
-    if (!seven_zip_dll_path || !archive_path) {
+    if (!archive_path) {
         copy_message(message, message_chars, "missing required path");
         return status_code(PasswordTestStatus::Error);
     }
@@ -58,7 +58,7 @@ SUP7Z_API int sup7z_try_passwords_with_parts(
     if (attempts) {
         *attempts = 0;
     }
-    if (!seven_zip_dll_path || !archive_path) {
+    if (!archive_path) {
         copy_message(message, message_chars, "missing required path");
         return status_code(PasswordTestStatus::Error);
     }

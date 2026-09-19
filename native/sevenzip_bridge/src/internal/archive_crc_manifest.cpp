@@ -297,21 +297,7 @@ CrcManifestResult read_archive_crc_manifest_with_parts(
 
 #ifdef _WIN32
 
-    ComModule module(seven_zip_dll_path);
-
-    if (!module.get()) {
-
-        CrcManifestResult result;
-
-        result.status = PasswordTestStatus::BackendUnavailable;
-
-        result.message = "7z.dll could not be loaded";
-
-        return result;
-
-    }
-
-    const auto create_object = module.create_object();
+    const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
 
     if (!create_object) {
 
@@ -319,7 +305,7 @@ CrcManifestResult read_archive_crc_manifest_with_parts(
 
         result.status = PasswordTestStatus::BackendUnavailable;
 
-        result.message = "7z.dll CreateObject export was not found";
+        result.message = "7z backend could not be loaded";
 
         return result;
 

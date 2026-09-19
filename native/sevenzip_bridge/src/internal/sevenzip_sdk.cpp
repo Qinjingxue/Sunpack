@@ -2,9 +2,10 @@
 
 #ifdef _WIN32
 
-#include <memory>
-
-#include <mutex>
+// Supplied by the bundled 7-Zip sources (CPP/7zip/Archive/DllExports2.cpp) that
+// are linked into the same image. Signature is identical to the historical
+// 7z.dll export, so every call site below this one is unchanged.
+STDAPI CreateObject(const GUID *clsid, const GUID *iid, void **outObject);
 
 #endif
 
@@ -88,23 +89,12 @@ namespace sunpack::sevenzip
     CreateObjectFunc cached_create_object(const std::wstring &seven_zip_dll_path)
     {
 
-        static std::mutex mutex;
+        // The bundled 7-Zip backend replaced the 7z.dll module loader. The path
+        // argument is retained as an inert ABI/JSON compatibility field; it no
+        // longer selects the backend location.
+        (void)seven_zip_dll_path;
 
-        static std::wstring cached_path;
-
-        static std::unique_ptr<ComModule> cached_module;
-
-        std::lock_guard<std::mutex> lock(mutex);
-
-        if (!cached_module || cached_path != seven_zip_dll_path)
-        {
-
-            cached_module = std::make_unique<ComModule>(seven_zip_dll_path);
-
-            cached_path = seven_zip_dll_path;
-        }
-
-        return cached_module ? cached_module->create_object() : nullptr;
+        return &::CreateObject;
     }
 
 #endif

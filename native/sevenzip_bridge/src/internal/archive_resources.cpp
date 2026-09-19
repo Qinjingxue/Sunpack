@@ -136,9 +136,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        ComModule module(seven_zip_dll_path);
-
-        auto create_object = module.create_object();
+        const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
 
         if (!create_object)
         {
@@ -147,7 +145,7 @@ namespace sunpack::sevenzip
 
             result.status = PasswordTestStatus::BackendUnavailable;
 
-            result.message = "7z.dll could not be loaded";
+            result.message = "7z backend could not be loaded";
 
             return result;
         }

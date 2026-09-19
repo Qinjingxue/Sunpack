@@ -198,12 +198,17 @@ class _Sup7zOperationResult(ctypes.Structure):
 class NativePasswordTester:
     def __init__(self, wrapper_path: str | None = None, seven_zip_dll_path: str | None = None):
         self.wrapper_path = wrapper_path or self._default_wrapper_path()
-        self.seven_zip_dll_path = seven_zip_dll_path or get_7z_dll_path()
+        # Inert compatibility field: the 7-Zip backend is embedded in
+        # sunpack_sevenzip.dll, so this no longer selects the backend location.
+        # It is still forwarded across the C ABI, which ignores it.
+        self.seven_zip_dll_path = (
+            seven_zip_dll_path if seven_zip_dll_path is not None else get_7z_dll_path()
+        )
         self._library = None
         self._load_lock = threading.Lock()
 
     def available(self) -> bool:
-        return bool(self.wrapper_path and self.seven_zip_dll_path and Path(self.wrapper_path).exists())
+        return bool(self.wrapper_path and Path(self.wrapper_path).exists())
 
     def _part_array(self, archive_path: str, part_paths: list[str] | None):
         normalized_parts = list(dict.fromkeys(part_paths or [archive_path]))
@@ -561,8 +566,6 @@ class NativePasswordTester:
                 return self._library
             if not self.wrapper_path or not Path(self.wrapper_path).exists():
                 raise FileNotFoundError("Required sunpack_sevenzip.dll was not found.")
-            if not self.seven_zip_dll_path or not Path(self.seven_zip_dll_path).exists():
-                raise FileNotFoundError("Required 7z.dll was not found.")
 
             library = ctypes.WinDLL(str(self.wrapper_path))
             library.sup7z_run_operation.argtypes = [

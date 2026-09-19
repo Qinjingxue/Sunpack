@@ -89,7 +89,7 @@ int read_manifest(
 ) {
     using namespace sunpack::sevenzip;
     using namespace sunpack::sevenzip::capi;
-    if (!seven_zip_dll_path || !archive_path) {
+    if (!archive_path) {
         copy_message(message, message_chars, "missing required path");
         copy_wide(manifest_json_buffer, manifest_json_chars, L"{}");
         return status_code(PasswordTestStatus::Error);

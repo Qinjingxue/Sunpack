@@ -31,7 +31,6 @@ def test_doctor_reports_checks_and_missing_watch_roots_as_warnings(tmp_path, mon
     )
     monkeypatch.setattr(doctor, "validate_config_payload", lambda _payload: {"ok": True, "errors": []})
     monkeypatch.setattr(doctor, "_native_check", lambda: {"name": "native", "status": "ok"})
-    monkeypatch.setattr(doctor, "get_7z_dll_path", lambda: str(tmp_path / "7z.dll"))
     monkeypatch.setattr(doctor, "get_sevenzip_bridge_worker_path", lambda: str(tmp_path / "worker.exe"))
     monkeypatch.setattr(doctor, "list_watch_roots", lambda: (tmp_path / "roots.txt", [str(missing)]))
     monkeypatch.setattr(doctor, "is_packaged_process", lambda: False)
@@ -40,8 +39,10 @@ def test_doctor_reports_checks_and_missing_watch_roots_as_warnings(tmp_path, mon
     code, result = doctor.handle(SimpleNamespace(), ctx)
 
     assert code == 0
-    assert [check["status"] for check in result.items] == ["ok", "ok", "ok", "ok", "skip", "warn"]
-    assert result.summary == {"checks": 6, "ok": 4, "warnings": 1, "skipped": 1, "failed": 0}
+    # The 7z.dll resource check is gone: the 7-Zip backend is compiled into
+    # sunpack_sevenzip.dll, so there is no separate file left on disk to verify.
+    assert [check["status"] for check in result.items] == ["ok", "ok", "ok", "skip", "warn"]
+    assert result.summary == {"checks": 5, "ok": 3, "warnings": 1, "skipped": 1, "failed": 0}
     assert "[WARN] Watch root" in stdout.getvalue()
     assert f"[WARN] Watch root {missing}: directory not found" in stdout.getvalue()
     assert f": {missing} - directory not found" not in stdout.getvalue()
@@ -56,7 +57,6 @@ def test_doctor_returns_task_failed_when_a_check_fails(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(doctor, "validate_config_payload", lambda _payload: {"ok": True, "errors": []})
     monkeypatch.setattr(doctor, "_native_check", lambda: {"name": "native", "status": "fail", "detail": "load failed"})
-    monkeypatch.setattr(doctor, "get_7z_dll_path", lambda: str(tmp_path / "7z.dll"))
     monkeypatch.setattr(doctor, "get_sevenzip_bridge_worker_path", lambda: str(tmp_path / "worker.exe"))
     monkeypatch.setattr(doctor, "_toast_check", lambda _config, _valid: {"name": "toast", "status": "ok"})
     monkeypatch.setattr(doctor, "list_watch_roots", lambda: (tmp_path / "roots.txt", []))

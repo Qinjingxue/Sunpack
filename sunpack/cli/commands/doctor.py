@@ -10,7 +10,7 @@ from sunpack.cli.persistent_runtime import load_request_config_payload
 from sunpack.config.config_validator import validate_config_payload
 from sunpack.filesystem.watcher.service import list_watch_roots
 from sunpack.support.process_executable import current_process_executable, is_packaged_process
-from sunpack.support.resources import get_7z_dll_path, get_sevenzip_bridge_worker_path, program_data_dir
+from sunpack.support.resources import get_sevenzip_bridge_worker_path, program_data_dir
 
 
 COMMAND = "doctor"
@@ -293,7 +293,6 @@ def handle(args, ctx):
     checks = [
         config_check,
         _native_check(),
-        _resource_check("sevenzip_dll", get_7z_dll_path),
         _resource_check("sevenzip_worker", get_sevenzip_bridge_worker_path),
     ]
     if is_packaged_process():

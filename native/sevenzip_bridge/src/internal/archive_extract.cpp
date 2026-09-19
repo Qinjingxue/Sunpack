@@ -684,9 +684,9 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        ComModule module(seven_zip_dll_path);
+        const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
 
-        return module.get() != nullptr && module.create_object() != nullptr;
+        return create_object != nullptr;
 
 #else
 
@@ -734,9 +734,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        ComModule module(seven_zip_dll_path);
-
-        auto create_object = module.create_object();
+        const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
 
         if (!create_object)
         {
@@ -747,7 +745,7 @@ namespace sunpack::sevenzip
 
             set_failure(result, "backend_load", "backend_unavailable");
 
-            result.message = "7z.dll could not be loaded";
+            result.message = "7z backend could not be loaded";
 
             return result;
         }
@@ -856,9 +854,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        ComModule module(seven_zip_dll_path);
-
-        auto create_object = module.create_object();
+        const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
 
         if (!create_object)
         {
@@ -869,7 +865,7 @@ namespace sunpack::sevenzip
 
             set_failure(result, "backend_load", "backend_unavailable");
 
-            result.message = "7z.dll could not be loaded";
+            result.message = "7z backend could not be loaded";
 
             return result;
         }

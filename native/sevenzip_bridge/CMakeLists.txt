@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(sunpack_sevenzip LANGUAGES CXX)
+# The retained 7-Zip subset contains plenty of C sources, so C must be enabled.
+project(sunpack_sevenzip LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_C_STANDARD 99)
 
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
 
@@ -31,6 +33,70 @@ endfunction()
 function(apply_source_charset target_name)
     if(MSVC)
         target_compile_options(${target_name} PRIVATE /utf-8)
+    endif()
+endfunction()
+
+# ---------------------------------------------------------------------------
+# Bundled 7-Zip backend
+#
+# 7z2603-src is physically trimmed so that "what is in the tree" is exactly
+# "what gets compiled" (see docs/zh-CN/sevenzip_source_trimming.md). The list
+# therefore comes from the tree itself instead of a second hand-maintained
+# manifest.
+#
+# It is an OBJECT library on purpose: 7-Zip registers archive handlers and
+# codecs through file-local static initialisers that export no referenced
+# symbol. A STATIC library would let the linker discard those objects and every
+# CreateObject() call would fail with CLASS_E_CLASSNOTAVAILABLE. Object files
+# placed straight into the final PE cannot be dropped that way.
+#
+# Compile configuration is deliberately NOT shared with the SunPack targets:
+# WIN32_LEAN_AND_MEAN strips the Windows/COM types 7-Zip itself needs
+# (LPCOLESTR, IUnknown, PROPID), so it must stay off here.
+# ---------------------------------------------------------------------------
+set(SUP7Z_7Z_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/7z2603-src")
+
+file(GLOB_RECURSE SUP7Z_BUNDLED_7Z_SOURCES CONFIGURE_DEPENDS
+    "${SUP7Z_7Z_ROOT}/C/*.c"
+    "${SUP7Z_7Z_ROOT}/CPP/*.cpp"
+)
+
+list(LENGTH SUP7Z_BUNDLED_7Z_SOURCES SUP7Z_BUNDLED_7Z_SOURCE_COUNT)
+if(NOT SUP7Z_BUNDLED_7Z_SOURCE_COUNT EQUAL 230)
+    message(FATAL_ERROR
+        "Trimmed 7-Zip tree must contribute exactly 230 translation units, found "
+        "${SUP7Z_BUNDLED_7Z_SOURCE_COUNT}. Re-derive the keep set (regenerate "
+        "docs/zh-CN/sevenzip_retained_sources.txt) or fix the tree.")
+endif()
+
+add_library(sunpack_7zip_objects OBJECT ${SUP7Z_BUNDLED_7Z_SOURCES})
+
+# PRIVATE: the 7-Zip include root must not leak into the bridge sources, or
+# bridge headers such as internal/sevenzip_sdk.hpp get shadowed by 7-Zip's.
+target_include_directories(sunpack_7zip_objects PRIVATE ${SUP7Z_7Z_ROOT})
+
+target_compile_definitions(sunpack_7zip_objects PRIVATE NOMINMAX)
+apply_release_optimizations(sunpack_7zip_objects)
+apply_source_charset(sunpack_7zip_objects)
+
+if(WIN32)
+    target_compile_definitions(sunpack_7zip_objects PRIVATE UNICODE _UNICODE)
+    target_link_libraries(sunpack_7zip_objects PUBLIC OleAut32 Ole32 User32 AdvApi32)
+endif()
+
+# NOTE: assembly hot paths (Asm/x86/LzmaDecOpt.asm, 7zCrcOpt.asm, ...) are kept
+# in the tree on purpose but are NOT wired into this target yet. This milestone
+# only swaps the backend's link origin, so the portable C/C++ paths are used
+# first; restoring the arch-optimised assembly is a separate change.
+
+# Every target that links sunpack_sevenzip_core needs these objects too: core
+# contains sevenzip_sdk.obj, which references CreateObject unconditionally. Only
+# smoke.cpp exercises the archive backend itself, but the symbol has to resolve
+# for the remaining tests as well.
+function(sup7z_attach_bundled_7z target_name)
+    if(WIN32 AND TARGET sunpack_7zip_objects)
+        target_sources(${target_name} PRIVATE
+            $<TARGET_OBJECTS:sunpack_7zip_objects>)
     endif()
 endfunction()
 
@@ -90,6 +156,13 @@ target_include_directories(sunpack_sevenzip
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX SUP7Z_BUILD_DLL)
     target_link_libraries(sunpack_sevenzip PRIVATE OleAut32 Ole32)
+
+    # The bundled 7-Zip objects go straight into the DLL image. They are NOT
+    # routed through sunpack_sevenzip_core: that is a STATIC library, and its
+    # archive members would be dropped again for the same "no referenced
+    # symbol" reason the OBJECT library exists to avoid.
+    target_sources(sunpack_sevenzip PRIVATE
+        $<TARGET_OBJECTS:sunpack_7zip_objects>)
 endif()
 
 add_executable(sunpack_sevenzip_smoke
@@ -101,6 +174,8 @@ apply_source_charset(sunpack_sevenzip_smoke)
 target_link_libraries(sunpack_sevenzip_smoke
     PRIVATE sunpack_sevenzip_core
 )
+
+sup7z_attach_bundled_7z(sunpack_sevenzip_smoke)
 
 target_include_directories(sunpack_sevenzip_smoke
     PRIVATE
@@ -117,6 +192,8 @@ target_link_libraries(sunpack_sevenzip_async_output
     PRIVATE sunpack_sevenzip_core
 )
 
+sup7z_attach_bundled_7z(sunpack_sevenzip_async_output)
+
 target_include_directories(sunpack_sevenzip_async_output
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -131,6 +208,8 @@ apply_source_charset(sunpack_sevenzip_space_gate)
 target_link_libraries(sunpack_sevenzip_space_gate
     PRIVATE sunpack_sevenzip_core
 )
+
+sup7z_attach_bundled_7z(sunpack_sevenzip_space_gate)
 
 target_include_directories(sunpack_sevenzip_space_gate
     PRIVATE
@@ -152,6 +231,8 @@ target_link_libraries(sunpack_sevenzip_space_retry
     PRIVATE sunpack_sevenzip_core
 )
 
+sup7z_attach_bundled_7z(sunpack_sevenzip_space_retry)
+
 target_include_directories(sunpack_sevenzip_space_retry
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -171,6 +252,8 @@ target_link_libraries(sunpack_sevenzip_writer_cost
     PRIVATE sunpack_sevenzip_core
 )
 
+sup7z_attach_bundled_7z(sunpack_sevenzip_writer_cost)
+
 target_include_directories(sunpack_sevenzip_writer_cost
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
@@ -185,6 +268,8 @@ apply_source_charset(sunpack_sevenzip_worker)
 target_link_libraries(sunpack_sevenzip_worker
     PRIVATE sunpack_sevenzip_core
 )
+
+sup7z_attach_bundled_7z(sunpack_sevenzip_worker)
 
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip_worker PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)

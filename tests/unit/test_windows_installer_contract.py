@@ -501,19 +501,32 @@ def test_elevated_test_failures_are_persisted_and_replayed():
     assert "The elevated process did not produce its diagnostic log." in helper
 
 
+def _packaged_runtime_tool_names_block(script: str) -> str:
+    start = script.index("function Get-PackagedRuntimeToolNames")
+    end = script.index("\n}", start)
+    return script[start:end]
+
+
 def test_release_packages_copy_only_runtime_tool_files():
     build_script = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
     verifier = (ROOT / "scripts" / "verify_windows_package_arch.ps1").read_text(encoding="utf-8")
 
     for script in (build_script, verifier):
         assert "function Get-PackagedRuntimeToolNames" in script
-        assert '"7z.dll"' in script
-        assert '"sunpack_sevenzip.dll"' in script
-        assert '"sunpack_sevenzip_worker.exe"' in script
-        assert '"sunpack_toast.dll"' in script
+        packaged = _packaged_runtime_tool_names_block(script)
+        assert '"sunpack_sevenzip.dll"' in packaged
+        assert '"sunpack_sevenzip_worker.exe"' in packaged
+        assert '"sunpack_toast.dll"' in packaged
         assert "Assert-PackagedRuntimeTools" in script
+        # The 7-Zip backend is compiled into sunpack_sevenzip.dll and
+        # sunpack_sevenzip_worker.exe, so a packaged tools\7z.dll would only
+        # re-introduce the external backend dependency.
+        assert '"7z.dll"' not in packaged
     assert "Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot" in build_script
     assert 'Copy-Item -LiteralPath $toolsRoot -Destination $distToolsRoot -Recurse -Force' not in build_script
+    # ...and both scripts must actively reject a stale 7z.dll.
+    assert 'Assert-PathMissing -LiteralPath (Join-Path $distToolsRoot "7z.dll")' in build_script
+    assert 'Assert-PathMissing -LiteralPath (Join-Path $root "tools\\7z.dll")' in verifier
 
 
 def test_release_package_includes_complete_license_material():

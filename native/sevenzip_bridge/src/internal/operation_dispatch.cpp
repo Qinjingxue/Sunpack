@@ -200,7 +200,9 @@ namespace sunpack::sevenzip
 
     ArchiveOperationResult run_archive_operation(const ArchiveOperationRequest &request)
     {
-        if (request.seven_zip_dll_path.empty() || request.archive_path.empty())
+        // seven_zip_dll_path is an inert compatibility field: the 7-Zip backend
+        // is compiled into this module, so only the archive path is required.
+        if (request.archive_path.empty())
         {
             return invalid_request("missing required path");
         }

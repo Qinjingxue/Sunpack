@@ -201,7 +201,6 @@ function Ensure-Bundled7ZipAssets {
 
     $requiredToolFiles = @(
         "7z.exe",
-        "7z.dll",
         "7z.sfx",
         "7zCon.sfx",
         "7-zip.dll"
@@ -587,14 +586,11 @@ function Build-SevenZipWrapper {
         [Parameter(Mandatory = $true)]
         [string]$ToolsRoot,
         [Parameter(Mandatory = $true)]
-        [string]$SevenZipDllPath,
-        [Parameter(Mandatory = $true)]
         [string]$BuildArch
     )
 
-    Write-Step "Building 7z.dll C++ wrapper"
+    Write-Step "Building embedded 7-Zip bridge"
     Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
-    Assert-PathExists -LiteralPath $SevenZipDllPath -Description "Bundled 7z.dll"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
     Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release")
@@ -717,7 +713,6 @@ $toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch)
 $buildRoot = Join-Path $repoRoot "build"
 $nativeWheelRoot = Join-Path $buildRoot ("native-wheels-dev-" + $buildArch)
 $toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Join-Path $repoRoot ("tools-" + $buildArch) }
-$sevenZipDllPath = Join-Path $toolsRoot "7z.dll"
 $sevenZipLicensePath = Join-Path $repoRoot "licenses\7zip-license.txt"
 
 Assert-PathExists -LiteralPath $projectPath -Description "pyproject.toml"
@@ -781,7 +776,7 @@ if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {
 }
 $cmakeCommand = Get-CMakeCommand -VenvScripts $venvScripts
 $ctestCommand = Get-CTestCommand -VenvScripts $venvScripts
-Build-SevenZipWrapper -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -SevenZipDllPath $sevenZipDllPath -BuildArch $buildArch
+Build-SevenZipWrapper -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
 Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
 Test-SevenZipWrapper -PythonPath $venvPython
 Test-SevenZipWorker -PythonPath $venvPython

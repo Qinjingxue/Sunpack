@@ -49,7 +49,7 @@ SUP7Z_API int sup7z_analyze_archive_resources(
     if (analysis) {
         *analysis = Sup7zArchiveResourceAnalysis{};
     }
-    if (!seven_zip_dll_path || !archive_path) {
+    if (!archive_path) {
         copy_message(message, message_chars, "missing required path");
         if (analysis) {
             analysis->status = status_code(PasswordTestStatus::Error);
@@ -83,7 +83,7 @@ SUP7Z_API int sup7z_analyze_archive_resources_with_parts(
     if (analysis) {
         *analysis = Sup7zArchiveResourceAnalysis{};
     }
-    if (!seven_zip_dll_path || !archive_path) {
+    if (!archive_path) {
         copy_message(message, message_chars, "missing required path");
         if (analysis) {
             analysis->status = status_code(PasswordTestStatus::Error);

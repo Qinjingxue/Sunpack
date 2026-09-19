@@ -120,9 +120,17 @@ def get_toast_library_path() -> str:
 
 
 def get_7z_dll_path() -> str:
+    """Locate a legacy standalone 7z.dll, if one happens to be present.
+
+    The 7-Zip backend is compiled into sunpack_sevenzip.dll and
+    sunpack_sevenzip_worker.exe, so this resolver is no longer a runtime
+    requirement. It survives only so that scripts and diagnostics that still
+    reference the old field keep working; callers must treat an empty string as
+    "embedded backend" rather than as an error.
+    """
     for root in candidate_resource_roots():
         for relative in tuple(tool_dir / "7z.dll" for tool_dir in tool_dir_candidates()) + (Path("7z.dll"),):
             seven_z = root / relative
             if seven_z.exists():
                 return str(seven_z)
-    raise FileNotFoundError("Required bundled 7z.dll was not found under tools\\ or the application root.")
+    return ""

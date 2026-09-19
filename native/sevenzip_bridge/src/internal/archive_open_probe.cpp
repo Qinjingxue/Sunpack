@@ -189,12 +189,11 @@ ArchiveOpenProbeResult probe_archive_open_with_parts(
     const std::wstring& password
 ) {
 #ifdef _WIN32
-    ComModule module(seven_zip_dll_path);
-    auto create_object = module.create_object();
+    const CreateObjectFunc create_object = cached_create_object(seven_zip_dll_path);
     if (!create_object) {
         ArchiveOpenProbeResult result;
         result.status = PasswordTestStatus::BackendUnavailable;
-        result.message = "7z.dll could not be loaded";
+        result.message = "7z backend could not be loaded";
         return result;
     }
     return probe_archive_open_internal(create_object, archive_path, password, part_paths);

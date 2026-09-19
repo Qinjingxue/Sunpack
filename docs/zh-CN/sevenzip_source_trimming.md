@@ -12,8 +12,14 @@
 3. `sunpack_sevenzip.dll` 同样把 7z 编进去，并消掉部分 COM 抽象
 
 结论：需要保留 **230 个编译单元（.c/.cpp）**，物理删除其余 **249 个**；
-若把整个源码树都算上（含头文件、makefile、bundles、DOC），实际保留约 **220 / 1292 个文件**。
+若把整个源码树都算上（含头文件、makefile、bundles、DOC），实际保留 **479 / 1292 个文件**
+（保留集包含 230 个编译单元、226 个头文件、12 个 `Asm/` 汇编、11 个 `DOC/`）。
 保留下来的部分已在本机用 MSVC 实际编译、链接并跑通格式矩阵（见文末验证记录）。
+
+> **落地状态（本轮已完成）**：源码树已按 §11 物理裁剪，构建已接入
+> `sunpack_7zip_objects` OBJECT library，`sunpack_sevenzip.dll` /
+> `sunpack_sevenzip_worker.exe` 已不再加载 `7z.dll`。
+> 具体改动范围与验证结果见 **§11 落地记录**。
 
 > 为什么保留数比"只解压"的直觉多：7z 的注册宏会为每个 handler 生成
 > `CreateArcOut`（写档工厂），因此链接一份**完整注册表**时，部分编码器和
@@ -444,3 +450,118 @@ CCoderMixer2::CMixerST::Code()                    ← Archive/Common/CoderMixer2
 这也说明：裁剪方案本身是安全的，改造的复杂度不在裁剪，而在
 **`CoderMixer2` 的 coder 装配 + `CFolderOutStream` 的 substream 切分**
 这两处的 COM 拆解。
+
+---
+
+## 11. 落地记录（链接来源替换里程碑）
+
+本轮目标刻意收窄为**纯链接来源替换**：把 7-Zip 源码正式接入项目构建，让
+`sunpack_sevenzip.dll` 与 `sunpack_sevenzip_worker.exe` 不再依赖 `7z.dll`。
+**不动** zero-copy、buffer 生命周期、`ComModule` 清理、汇编优化。
+
+### 11.1 逻辑关系
+
+```text
+之前：                                  之后：
+sunpack_sevenzip.dll / worker.exe       sunpack_sevenzip.dll / worker.exe
+        ↓                                        ↓
+LoadLibrary("7z.dll")                   进程内 CreateObject
+        ↓                                        ↓
+GetProcAddress("CreateObject")          IInArchive ...（以下全部不变）
+        ↓
+7-Zip CreateObject
+        ↓
+IInArchive ...
+```
+
+### 11.2 源码树裁剪结果
+
+`native/sevenzip_bridge/7z2603-src`：**1292 → 479 个文件**，删除 813 个。
+
+保留集 = 230 个编译单元 + 226 个被 `#include` 触达的头文件 + 12 个 `Asm/` + 11 个 `DOC/`。
+裁剪清单由脚本按 `#include` 闭包生成，不是手抄：任何"没人 include 的头文件"也被剔除。
+
+两处刻意保留：
+
+| 目录 | 理由 |
+|------|------|
+| `Asm/`（12 个） | `x86/LzmaDecOpt.asm`、`7zCrcOpt.asm` 等是官方 Release 版热点实现；本轮不启用，但删了就得从上游重新取。当前构建**不引用**它们 |
+| `DOC/`（11 个） | `DOC/unRarLicense.txt` 是 `Rar1/2/3Decoder.cpp` 头注释援引的强制许可条件；其余是 7-Zip 许可与来源说明 |
+
+删除范围覆盖：`CPP/7zip/UI/**`、`Bundles/**`、`Windows/Control/**`、`C/Util/**`、
+未使用的 archive handler、未使用的平台层、全部构建脚本（`.mak`/`.dsp`/`.vcxproj`）、
+以及 `C/7zDec.c` 那套独立极简 7z 解码 API（`7zArcIn.c`/`7zBuf.c`/`7zFile.c`/`LzmaLib.c`）。
+
+### 11.3 构建接入
+
+`native/sevenzip_bridge/CMakeLists.txt`：
+
+1. `project(... LANGUAGES C CXX)` —— 保留集里有大量 `.c`，必须真正按 C 编译
+2. 新增 `sunpack_7zip_objects` **OBJECT** library，源码用 `GLOB_RECURSE CONFIGURE_DEPENDS`
+   从已裁剪的树里取，并加 **sanity check：数量必须是 230**，否则 configure 阶段报错
+3. 对象直接进入最终 PE：
+   `target_sources(sunpack_sevenzip PRIVATE $<TARGET_OBJECTS:sunpack_7zip_objects>)`，
+   worker / smoke 通过 `sup7z_attach_bundled_7z()` 同样注入
+
+三个必须记住的约束：
+
+| 约束 | 原因 |
+|------|------|
+| 用 OBJECT library，不用 STATIC | handler/coder 靠文件内静态初始化注册，没有可引用符号；静态库的 `.obj` 会被链接器整体丢弃，表现是 `CreateObject()` 一律返回 `CLASS_E_CLASSNOTAVAILABLE` |
+| 7z 目标**不定义** `WIN32_LEAN_AND_MEAN` | 该宏让 `<Windows.h>` 不再带 `wtypes.h`/`oleauto.h`，`LPCOLESTR`/`IUnknown`/`PROPID` 全部未定义，`MyString.h(674)` 直接编译失败 |
+| 7z 的 include 根必须 `PRIVATE` | `PUBLIC` 会遮蔽 bridge 自己的 `internal/*.hpp`，产生一批假语法错误 |
+
+另外：凡链接 `sunpack_sevenzip_core` 的目标都需要 7z 对象——core 里的
+`sevenzip_sdk.obj` 无条件引用 `CreateObject`。所以四个纯 writer 单测也一并注入
+（`sup7z_attach_bundled_7z`），否则 `LNK2019`。
+
+### 11.4 C++ 侧改动
+
+| 文件 | 改动 |
+|------|------|
+| `src/internal/sevenzip_sdk.cpp` | `cached_create_object()` 由 `LoadLibraryW`+`GetProcAddress` 改为 `return &::CreateObject;`；`CreateObjectFunc` 类型**保留不动**，调用方无感 |
+| `archive_extract.cpp`（3 处）、`archive_open_probe.cpp`、`archive_resources.cpp`、`archive_crc_manifest.cpp` | 把绕开缓存的 `ComModule module(...)` + `module.create_object()` 全部统一为 `cached_create_object(seven_zip_dll_path)` |
+| `operation_dispatch.cpp`、`c_api_passwords.cpp`、`c_api_resources.cpp`、`c_api_crc_manifest.cpp`、`archive_test.cpp` | 去掉 `seven_zip_dll_path` 的必填校验（它是惰性字段），只保留 `archive_path` 必填 |
+
+`ComModule` 类、C ABI 里的 `seven_zip_dll_path` 参数、worker JSON 字段**本轮全部保留**，
+作为无语义兼容字段；删除留到后续 COM cleanup。
+
+### 11.5 Python / worker / 打包侧
+
+| 位置 | 改动 |
+|------|------|
+| `sunpack/support/resources.py` | `get_7z_dll_path()` 找不到时返回 `""` 而不是抛 `FileNotFoundError` |
+| `sunpack/support/sevenzip_bridge.py` | `available()` 不再要求 7z.dll；`_load()` 删掉 7z.dll 存在性检查 |
+| `sunpack/cli/commands/doctor.py` + i18n | 移除 `sevenzip_dll` 检查项（后端已内置，磁盘上无物可查） |
+| `scripts/build_windows.ps1`、`setup_windows_dev.ps1` | `Build-SevenZipWrapper` 不再要求 7z.dll；工具清单去掉 `7z.dll` |
+| `scripts/verify_windows_package_arch.ps1` | 打包校验**反向要求** `tools\7z.dll` 不存在 |
+
+worker 侧 `seven_zip_dll_path` 字段保留（默认值也不动），下层工厂忽略该参数。
+
+### 11.6 验证结果
+
+| 验证 | 结果 |
+|------|------|
+| x64 Release 编译 + 链接 | 通过；`sunpack_sevenzip.dll` 1.37 MB、worker 1.70 MB |
+| `ctest`（bridge 自带 4 个单测） | 4/4 通过 |
+| `pytest tests/unit tests/cli` | 1128 通过 |
+| `dumpbin /dependents` | dll 与 worker 的导入表均无 `7z.dll` |
+| **无 7z.dll 生存测试** | `tests/unit/test_embedded_7z_backend.py`：把产物放进空目录、确认目录内无 7z.dll 后，worker 真实解压 ZIP 成功、DLL 的 probe/resources 成功；该测试在 `tools\7z.dll` 存在与不存在两种情况下均通过 |
+| `run_acceptance_tests.ps1 -Arch x64` | 8/8 步骤全部 PASS |
+
+### 11.7 刻意没做的事
+
+- 不启用 `Asm/`（`ASM_MASM` / `LzmaDecOpt.asm` / CRC/AES/SHA 汇编）——本轮不求性能对齐，
+  等源码后端稳定后单独一个 PR 恢复，便于定位性能变化
+- 不引入 `SUP7Z_USE_BUNDLED_7Z` 双后端开关——embedded 是唯一后端
+- 不删 `seven_zip_dll_path`（C ABI / JSON / Python 字段）
+- 不删 `ComModule` / `DllExports2.cpp` / `CreateObjectFunc`
+- 不碰解码数据路径：prefetch、decoder、async writer、所有 memcpy、所有 COM callback 原样
+
+### 11.8 遗留说明
+
+- 仓库仍保留 `tools\7z.dll`。它属于 `tools\7z.exe`（测试套件用来**生成 fixture** 的
+  7-Zip CLI），是构建期工具而非产品运行时依赖；发布包已通过
+  `verify_windows_package_arch.ps1` 明确要求它不存在。
+- 仓库另有 `tools\7zxa.dll`（7-Zip 官方解压-only 变体），本轮未纳入处理范围。
+- ARM64 目标沿用同一套构建配置，但本机只有 x64 工具链，**ARM64 未实测**。

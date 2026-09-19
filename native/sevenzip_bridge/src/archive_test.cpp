@@ -122,7 +122,7 @@ SUP7Z_API int sup7z_test_archive(
     {
         *checksum_error = 0;
     }
-    if (!seven_zip_dll_path || !archive_path)
+    if (!archive_path)
     {
         copy_ascii(message, message_chars, "missing required path");
         return static_cast<int>(sunpack::sevenzip::PasswordTestStatus::Error);
@@ -180,7 +180,7 @@ SUP7Z_API int sup7z_test_archive_with_parts(
     {
         *checksum_error = 0;
     }
-    if (!seven_zip_dll_path || !archive_path)
+    if (!archive_path)
     {
         copy_ascii(message, message_chars, "missing required path");
         return static_cast<int>(sunpack::sevenzip::PasswordTestStatus::Error);

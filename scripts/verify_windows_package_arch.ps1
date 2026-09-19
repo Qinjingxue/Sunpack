@@ -32,7 +32,6 @@ function Assert-PathMissing {
 
 function Get-PackagedRuntimeToolNames {
     return @(
-        "7z.dll",
         "sunpack_sevenzip.dll",
         "sunpack_sevenzip_worker.exe",
         "sunpack_toast.dll"
@@ -172,7 +171,10 @@ Assert-PeSubsystem -LiteralPath (Join-Path $root "sunpack-runtime.exe") -Expecte
 Assert-PathMissing -LiteralPath (Join-Path $root "sunpack-watch.exe") -Description "retired duplicate watch executable"
 Assert-PeMachine -LiteralPath $nativeExtension.FullName -BuildArch $Arch -Description "sunpack_native extension"
 Assert-PackagedRuntimeTools -PackageRoot $root
-Assert-PeMachine -LiteralPath (Join-Path $root "tools\7z.dll") -BuildArch $Arch -Description "tools\7z.dll"
+# The 7-Zip backend is compiled into sunpack_sevenzip.dll and
+# sunpack_sevenzip_worker.exe. A leftover standalone 7z.dll would silently
+# re-introduce the external backend dependency this migration removed.
+Assert-PathMissing -LiteralPath (Join-Path $root "tools\7z.dll") -Description "retired standalone tools\7z.dll"
 Assert-PeMachine -LiteralPath (Join-Path $root "tools\sunpack_sevenzip.dll") -BuildArch $Arch -Description "tools\sunpack_sevenzip.dll"
 Assert-PeMachine -LiteralPath (Join-Path $root "tools\sunpack_sevenzip_worker.exe") -BuildArch $Arch -Description "tools\sunpack_sevenzip_worker.exe"
 Assert-PeMachine -LiteralPath (Join-Path $root "tools\sunpack_toast.dll") -BuildArch $Arch -Description "tools\sunpack_toast.dll"
