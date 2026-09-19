@@ -669,6 +669,7 @@ std::string input_trace_json(const sunpack::sevenzip::ExtractInputTrace& trace) 
         ",\"prefetch_consumer_wait_ns\":" + std::to_string(trace.prefetch_consumer_wait_ns) +
         ",\"prefetch_issued_count\":" + std::to_string(trace.prefetch_issued_count) +
         ",\"prefetch_issued_bytes\":" + std::to_string(trace.prefetch_issued_bytes) +
+        ",\"open_wall_ns\":" + std::to_string(trace.open_wall_ns) +
         ",\"open_read_file_call_count\":" + std::to_string(trace.open_read_file_call_count) +
         ",\"open_read_file_wall_ns\":" + std::to_string(trace.open_read_file_wall_ns) +
         ",\"open_logical_read_call_count\":" + std::to_string(trace.open_logical_read_call_count) +
