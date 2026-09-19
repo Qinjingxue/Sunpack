@@ -467,6 +467,16 @@ namespace sunpack::sevenzip
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
+#ifdef SUP7Z_USE_PLANNED_IO
+            // Sequential/container formats can use the entire logical input as an exact coverage plan.
+            // 7z and RAR replace this conservative plan with packed extents inside their handlers.
+            const std::wstring planned_format = format_name_for_guid(format);
+            if (planned_format != L"7z" && planned_format != L"rar4" && planned_format != L"rar5")
+            {
+                ::NSunpackReadPlan::PlanWhole(stream.Interface());
+            }
+#endif
+
             hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
 
             // Extraction success must not be published before every queued write and close
