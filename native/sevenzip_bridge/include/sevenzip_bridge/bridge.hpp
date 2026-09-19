@@ -88,6 +88,20 @@ struct ExtractInputTrace {
     unsigned long long prefetch_miss_count = 0;
     unsigned long long prefetch_invalidation_count = 0;
     unsigned long long prefetch_consumer_wait_ns = 0;
+    unsigned long long prefetch_issued_count = 0;
+    unsigned long long prefetch_issued_bytes = 0;
+    // Snapshot taken after archive Open() and before extraction starts, so Open-prefetch A/B
+    // can be measured independently from planned extraction I/O.
+    unsigned long long open_read_file_call_count = 0;
+    unsigned long long open_read_file_wall_ns = 0;
+    unsigned long long open_logical_read_call_count = 0;
+    unsigned long long open_seek_count = 0;
+    unsigned long long open_prefetch_hit_count = 0;
+    unsigned long long open_prefetch_miss_count = 0;
+    unsigned long long open_prefetch_invalidation_count = 0;
+    unsigned long long open_prefetch_consumer_wait_ns = 0;
+    unsigned long long open_prefetch_issued_count = 0;
+    unsigned long long open_prefetch_issued_bytes = 0;
     unsigned long long last_logical_read_end = 0;
     bool has_last_logical_read_end = false;
     unsigned long long last_read_virtual_offset = 0;
