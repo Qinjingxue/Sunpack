@@ -47,6 +47,15 @@ void Lzma2DecMtProps_Init(CLzma2DecMtProps *p)
 }
 
 
+#if SUP7Z_USE_SHARED_OUTPUT
+#define SUP7Z_SHARED_OUTPUT_TOKENS 16
+typedef struct
+{
+  UInt64 token;
+  size_t begin;
+  size_t end;
+} CSunpackSharedOutputRangeToken;
+#endif
 
 #ifndef Z7_ST
 
@@ -61,7 +70,7 @@ typedef struct
   Byte *outBuf;
   size_t outBufSize;
 #if SUP7Z_USE_SHARED_OUTPUT
-  UInt64 outTokens[16];
+  CSunpackSharedOutputRangeToken outTokens[SUP7Z_SHARED_OUTPUT_TOKENS];
   unsigned outTokenHead;
   unsigned outTokenCount;
 #endif
@@ -103,7 +112,7 @@ struct CLzma2DecMt
   ISeqOutStreamPtr outStream;
 #if SUP7Z_USE_SHARED_OUTPUT
   const CSunpackSharedOutput *sharedOutput;
-  UInt64 sharedOutputTokens[16];
+  CSunpackSharedOutputRangeToken sharedOutputTokens[SUP7Z_SHARED_OUTPUT_TOKENS];
   unsigned sharedOutputTokenHead;
   unsigned sharedOutputTokenCount;
 #endif
@@ -137,11 +146,9 @@ struct CLzma2DecMt
 
 #if SUP7Z_USE_SHARED_OUTPUT
 
-#define SUP7Z_SHARED_OUTPUT_TOKENS 16
-
 static SRes Lzma2Dec_RetireOutputToken(
     const CSunpackSharedOutput *output,
-    UInt64 *tokens,
+    CSunpackSharedOutputRangeToken *tokens,
     unsigned *head,
     unsigned *count)
 {
@@ -149,11 +156,13 @@ static SRes Lzma2Dec_RetireOutputToken(
   UInt64 token;
   if (*count == 0)
     return SZ_OK;
-  token = tokens[*head];
+  token = tokens[*head].token;
   res = output && output->WaitBorrowed
       ? output->WaitBorrowed(output->ctx, token)
       : SZ_ERROR_WRITE;
-  tokens[*head] = 0;
+  tokens[*head].token = 0;
+  tokens[*head].begin = 0;
+  tokens[*head].end = 0;
   *head = (*head + 1) & (SUP7Z_SHARED_OUTPUT_TOKENS - 1);
   (*count)--;
   return res;
@@ -161,27 +170,59 @@ static SRes Lzma2Dec_RetireOutputToken(
 
 static SRes Lzma2Dec_DrainOutputTokens(
     const CSunpackSharedOutput *output,
-    UInt64 *tokens,
+    CSunpackSharedOutputRangeToken *tokens,
     unsigned *head,
     unsigned *count)
 {
   SRes first = SZ_OK;
   while (*count != 0)
   {
-    const SRes res = Lzma2Dec_RetireOutputToken(
-        output, tokens, head, count);
+    const SRes res = Lzma2Dec_RetireOutputToken(output, tokens, head, count);
     if (first == SZ_OK && res != SZ_OK)
       first = res;
   }
   return first;
 }
 
-static SRes Lzma2Dec_PushOutputToken(
+/* Retire through the newest overlapping FIFO token. Older disjoint leases can
+   retire conservatively, while later disjoint writes remain asynchronous. */
+static SRes Lzma2Dec_RetireOutputRange(
     const CSunpackSharedOutput *output,
-    UInt64 *tokens,
+    CSunpackSharedOutputRangeToken *tokens,
     unsigned *head,
     unsigned *count,
-    UInt64 token)
+    size_t begin,
+    size_t end)
+{
+  unsigned retireCount = 0;
+  unsigned i;
+  if (begin >= end || *count == 0)
+    return SZ_OK;
+
+  for (i = 0; i < *count; ++i)
+  {
+    const unsigned index = (*head + i) & (SUP7Z_SHARED_OUTPUT_TOKENS - 1);
+    const CSunpackSharedOutputRangeToken *entry = &tokens[index];
+    if (entry->token != 0 && entry->begin < end && begin < entry->end)
+      retireCount = i + 1;
+  }
+
+  while (retireCount != 0)
+  {
+    RINOK(Lzma2Dec_RetireOutputToken(output, tokens, head, count))
+    --retireCount;
+  }
+  return SZ_OK;
+}
+
+static SRes Lzma2Dec_PushOutputToken(
+    const CSunpackSharedOutput *output,
+    CSunpackSharedOutputRangeToken *tokens,
+    unsigned *head,
+    unsigned *count,
+    UInt64 token,
+    size_t begin,
+    size_t end)
 {
   SRes result = SZ_OK;
   if (*count == SUP7Z_SHARED_OUTPUT_TOKENS)
@@ -189,7 +230,9 @@ static SRes Lzma2Dec_PushOutputToken(
 
   {
     const unsigned tail = (*head + *count) & (SUP7Z_SHARED_OUTPUT_TOKENS - 1);
-    tokens[tail] = token;
+    tokens[tail].token = token;
+    tokens[tail].begin = begin;
+    tokens[tail].end = end;
     (*count)++;
   }
   return result;
@@ -200,7 +243,8 @@ static SRes Lzma2Dec_WriteBorrowed(
     ISeqOutStreamPtr outStream,
     const Byte *data,
     size_t size,
-    UInt64 *tokens,
+    size_t rangeBegin,
+    CSunpackSharedOutputRangeToken *tokens,
     unsigned *head,
     unsigned *count)
 {
@@ -238,11 +282,13 @@ static SRes Lzma2Dec_WriteBorrowed(
 
     {
       const SRes pushRes = Lzma2Dec_PushOutputToken(
-          output, tokens, head, count, token);
+          output, tokens, head, count, token,
+          rangeBegin, rangeBegin + processed);
       if (pushRes != SZ_OK)
         return pushRes;
     }
     data += processed;
+    rangeBegin += processed;
     size -= processed;
   }
 
@@ -598,8 +644,9 @@ static SRes Lzma2DecMt_MtCallback_PreCode(void *pp, unsigned coderIndex)
   CLzma2DecMt *me = (CLzma2DecMt *)pp;
   CLzma2DecMtThread *t = &me->coders[coderIndex];
 #if SUP7Z_USE_SHARED_OUTPUT
-  RINOK(Lzma2Dec_DrainOutputTokens(
-      me->sharedOutput, t->outTokens, &t->outTokenHead, &t->outTokenCount))
+  RINOK(Lzma2Dec_RetireOutputRange(
+      me->sharedOutput, t->outTokens, &t->outTokenHead, &t->outTokenCount,
+      0, t->outBufSize))
 #endif
   Byte *dest = t->outBuf;
 
@@ -765,6 +812,7 @@ static SRes Lzma2DecMt_MtCallback_Write(void *pp, unsigned coderIndex,
       {
         RINOK(Lzma2Dec_WriteBorrowed(
             me->sharedOutput, me->outStream, data, cur,
+            (size_t)(data - t->outBuf),
             t->outTokens, &t->outTokenHead, &t->outTokenCount))
         written = cur;
       }
@@ -995,6 +1043,14 @@ static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
       }
     }
 
+#if SUP7Z_USE_SHARED_OUTPUT
+    if (p->sharedOutput && size != 0)
+      RINOK(Lzma2Dec_RetireOutputRange(
+          p->sharedOutput, p->sharedOutputTokens,
+          &p->sharedOutputTokenHead, &p->sharedOutputTokenCount,
+          (size_t)dicPos, (size_t)(dicPos + size)))
+#endif
+
     inProcessed = (SizeT)(inLim - inPos);
 
     res = Lzma2Dec_DecodeToDic(dec, dicPos + size, inData + inPos, &inProcessed, finishMode, &status);
@@ -1019,6 +1075,7 @@ static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
 #if SUP7Z_USE_SHARED_OUTPUT
         res2 = Lzma2Dec_WriteBorrowed(
             p->sharedOutput, p->outStream, dec->decoder.dic + wrPos, writeSize,
+            (size_t)wrPos,
             p->sharedOutputTokens, &p->sharedOutputTokenHead,
             &p->sharedOutputTokenCount);
 #else
@@ -1032,15 +1089,8 @@ static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
 
       if (dec->decoder.dicPos == dec->decoder.dicBufSize)
       {
-#if SUP7Z_USE_SHARED_OUTPUT
-        {
-          const SRes drainRes = Lzma2Dec_DrainOutputTokens(
-              p->sharedOutput, p->sharedOutputTokens,
-              &p->sharedOutputTokenHead, &p->sharedOutputTokenCount);
-          if (res2 == SZ_OK && drainRes != SZ_OK)
-            res2 = drainRes;
-        }
-#endif
+        /* Next ST decode starts at offset 0 and retires only the range it is
+           about to overwrite. Final/lifecycle boundaries still drain all. */
         dec->decoder.dicPos = 0;
       }
       wrPos = dec->decoder.dicPos;

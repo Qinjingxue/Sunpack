@@ -135,7 +135,7 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
   CMyComPtr<ISunpackSharedOutput> sharedOutput;
   if (outStream)
     outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&sharedOutput);
-  CSunpackSharedOutputLeaseRing<16> outputLeases;
+  CSunpackSharedOutputRangeLeaseRing<16> outputLeases;
 
   const auto writeOutput = [&](const Byte *data, size_t bytes) -> HRESULT
   {
@@ -168,7 +168,9 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
       if (accepted == 0 || accepted > request || token == 0)
         return E_FAIL;
 
-      const HRESULT retireRes = outputLeases.Push(token);
+      const UInt64 rangeBegin = (UInt64)(data - _state.dic);
+      const HRESULT retireRes = outputLeases.Push(
+          token, rangeBegin, rangeBegin + accepted);
       if (retireRes != S_OK)
         return retireRes;
       data += accepted;
@@ -263,6 +265,12 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
       }
     }
 
+#if SUP7Z_USE_SHARED_OUTPUT
+    if (sharedOutput && size != 0)
+      RINOK(outputLeases.RetireOverlapping(
+          (UInt64)dicPos, (UInt64)(dicPos + size)))
+#endif
+
     SizeT inProcessed = _inLim - _inPos;
     ELzmaStatus status;
 
@@ -300,11 +308,9 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
 
       if (_state.dicPos == _state.dicBufSize)
       {
-#if SUP7Z_USE_SHARED_OUTPUT
-        // The next decode wraps to dictionary offset 0. Every writer lease
-        // into the old dictionary generation must be retired first.
-        RINOK(outputLeases.Drain())
-#endif
+        // The next decode starts at dictionary offset 0. Its exact target
+        // range is retired at the top of the next iteration, so unrelated
+        // high-window writes can remain in flight.
         _state.dicPos = 0;
       }
       wrPos = _state.dicPos;

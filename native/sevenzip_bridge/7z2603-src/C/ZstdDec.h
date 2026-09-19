@@ -107,7 +107,7 @@ typedef struct CZstdDecState
   // Embedded SunPack hook: called immediately before the decoder reuses or
   // relocates its output window. NULL in normal upstream-style operation.
   void *sunpackOutputCtx;
-  SRes (*sunpackBeforeWindowReuse)(void *ctx);
+  SRes (*sunpackBeforeWindowReuse)(void *ctx, size_t begin, size_t end);
 #endif
 
   Byte *outBuf_fromCaller;

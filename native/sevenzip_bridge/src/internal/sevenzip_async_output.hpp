@@ -116,6 +116,9 @@ namespace sunpack::sevenzip
             enum class Kind
             {
                 Data,
+#if SUP7Z_USE_SHARED_OUTPUT
+                Borrowed,
+#endif
                 Close
             };
 
@@ -128,6 +131,25 @@ namespace sunpack::sevenzip
                 return item;
             }
 
+#if SUP7Z_USE_SHARED_OUTPUT
+            static WorkItem borrowed(
+                FileStatePtr value,
+                const unsigned char *data,
+                UInt32 size,
+                BorrowedLease *lease,
+                UInt64 offset)
+            {
+                WorkItem item;
+                item.kind = Kind::Borrowed;
+                item.file = std::move(value);
+                item.borrowed_data = data;
+                item.borrowed_size = size;
+                item.borrowed_lease = lease;
+                item.output_offset = offset;
+                return item;
+            }
+#endif
+
             static WorkItem close(FileStatePtr value)
             {
                 WorkItem item;
@@ -139,6 +161,11 @@ namespace sunpack::sevenzip
             Kind kind = Kind::Data;
             Buffer *buffer = nullptr;
             FileStatePtr file;
+#if SUP7Z_USE_SHARED_OUTPUT
+            const unsigned char *borrowed_data = nullptr;
+            UInt32 borrowed_size = 0;
+            BorrowedLease *borrowed_lease = nullptr;
+#endif
             UInt64 output_offset = 0;
         };
 
@@ -219,9 +246,23 @@ namespace sunpack::sevenzip
 
         struct BorrowedLease
         {
+            BorrowedLease()
+                : completion_event(CreateEventW(nullptr, TRUE, FALSE, nullptr))
+            {
+                if (completion_event == nullptr)
+                    throw std::bad_alloc();
+            }
+
+            ~BorrowedLease()
+            {
+                if (completion_event != nullptr)
+                    CloseHandle(completion_event);
+            }
+
             AsyncFileWriter *owner = nullptr;
             HRESULT result = S_OK;
             BorrowedLeaseState state = BorrowedLeaseState::Free;
+            HANDLE completion_event = nullptr;
             CSunpackSharedOutputLeaseToken token{};
         };
 #endif
@@ -805,7 +846,6 @@ namespace sunpack::sevenzip
             for (;;)
             {
                 bool queued_staging = false;
-                Buffer *buffer = nullptr;
                 BorrowedLease *lease = nullptr;
                 UInt32 chunk = 0;
                 {
@@ -819,14 +859,12 @@ namespace sunpack::sevenzip
                         if (file->staging_buffer && file->staging_buffer->size != 0)
                             return queued_jobs_ < queue_limit_;
 
-                        // Lease records are retired only by the decoder. If that
-                        // tiny pool is exhausted, return control so it can retire
-                        // its oldest token; writer buffers themselves are recycled
-                        // immediately on I/O completion.
+                        // Completed borrowed records are deliberately returned
+                        // only when the decoder retires their token. Let it do
+                        // that instead of blocking this producer indefinitely.
                         if (free_borrowed_leases_.empty() && borrowed_lease_count_ != 0)
                             return true;
                         if (queued_jobs_ >= queue_limit_ ||
-                            free_buffers_.empty() ||
                             free_borrowed_leases_.empty())
                             return false;
 
@@ -853,34 +891,15 @@ namespace sunpack::sevenzip
                             return S_FALSE;
 
                         chunk = static_cast<UInt32>(target_size);
-
-                        buffer = free_buffers_.back();
-                        free_buffers_.pop_back();
                         lease = free_borrowed_leases_.back();
                         free_borrowed_leases_.pop_back();
-
                         lease->result = S_OK;
                         lease->state = BorrowedLeaseState::InFlight;
-
-                        buffer->file = file;
-                        buffer->size = chunk;
-                        buffer->reserved_size = 0;
-                        buffer->borrowed_data = data;
-                        buffer->borrowed = true;
-                        buffer->borrowed_lease = lease;
-                        buffer->state = BufferState::Queued;
 
                         const UInt64 output_offset =
                             file->next_write_offset.load(std::memory_order_relaxed);
                         if (output_offset > (std::numeric_limits<UInt64>::max)() - chunk)
                         {
-                            buffer->file.reset();
-                            buffer->size = 0;
-                            buffer->borrowed_data = nullptr;
-                            buffer->borrowed = false;
-                            buffer->borrowed_lease = nullptr;
-                            buffer->state = BufferState::Free;
-                            free_buffers_.push_back(buffer);
                             lease->state = BorrowedLeaseState::Free;
                             free_borrowed_leases_.push_back(lease);
                             mark_file_failure_locked(file, E_FAIL, ERROR_ARITHMETIC_OVERFLOW);
@@ -891,17 +910,11 @@ namespace sunpack::sevenzip
 
                         try
                         {
-                            work_queue_.emplace_back(WorkItem::data(buffer, output_offset));
+                            work_queue_.emplace_back(WorkItem::borrowed(
+                                file, data, chunk, lease, output_offset));
                         }
                         catch (...)
                         {
-                            buffer->file.reset();
-                            buffer->size = 0;
-                            buffer->borrowed_data = nullptr;
-                            buffer->borrowed = false;
-                            buffer->borrowed_lease = nullptr;
-                            buffer->state = BufferState::Free;
-                            free_buffers_.push_back(buffer);
                             lease->state = BorrowedLeaseState::Free;
                             free_borrowed_leases_.push_back(lease);
                             mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
@@ -1664,7 +1677,8 @@ namespace sunpack::sevenzip
                     // 收尾记账：dequeue 的 buffer 剩余字节只在这里结算。
                     if (result.kind == AttemptResult::Kind::SpaceFailure)
                     {
-                        record_legacy_space_failure(file, buffer, transferred, result.win32_error);
+                        record_legacy_space_failure(
+                            file, buffer ? buffer->size : 0, transferred, result.win32_error);
                         release_buffer(buffer);
                         continue;
                     }
@@ -1683,6 +1697,46 @@ namespace sunpack::sevenzip
 
                     release_buffer(buffer);
                 }
+#if SUP7Z_USE_SHARED_OUTPUT
+                else if (item.kind == WorkItem::Kind::Borrowed)
+                {
+                    const FileStatePtr file = item.file;
+                    UInt32 transferred = 0;
+                    const AttemptResult result = retry_with_space_gate(
+                        file ? file->volume_space_gate() : nullptr,
+                        [this, &file] { return writer_terminal_predicate(file ? file->job : nullptr); },
+                        file ? std::wstring_view(file->path) : std::wstring_view{},
+                        [&] {
+                            return attempt_raw_write(
+                                file,
+                                item.borrowed_data,
+                                item.borrowed_size,
+                                item.borrowed_lease ? item.borrowed_lease->completion_event : nullptr,
+                                item.output_offset,
+                                transferred);
+                        });
+
+                    if (result.kind == AttemptResult::Kind::SpaceFailure)
+                    {
+                        record_legacy_space_failure(
+                            file, item.borrowed_size, transferred, result.win32_error);
+                        release_borrowed_work(file, item.borrowed_lease, item.borrowed_size);
+                        continue;
+                    }
+                    switch (result.kind)
+                    {
+                    case AttemptResult::Kind::Succeeded:
+                        break;
+                    case AttemptResult::Kind::PermanentFailure:
+                    case AttemptResult::Kind::Terminal:
+                        if (item.borrowed_size > transferred)
+                            account_discarded(item.borrowed_size - transferred);
+                        break;
+                    }
+
+                    release_borrowed_work(file, item.borrowed_lease, item.borrowed_size);
+                }
+#endif
                 else
                 {
                     process_close(item.file);
@@ -1852,56 +1906,40 @@ namespace sunpack::sevenzip
         // 只对新写入的字节调用，因此重试不会重复记账。
         // 不变量：所有失败路径都配对 end_data_write（active_data_writes 归零）；
         // 空间失败路径不调用 record_failure，否则记账与 job 终态都被破坏。
-        AttemptResult attempt_data_write(const FileStatePtr &file,
-                                         Buffer *buffer,
-                                         UInt64 output_offset,
-                                         UInt32 &transferred) noexcept
+        AttemptResult attempt_raw_write(
+            const FileStatePtr &file,
+            const unsigned char *source,
+            UInt32 size,
+            HANDLE completion_event,
+            UInt64 output_offset,
+            UInt32 &transferred) noexcept
         {
             // 绝不在这里重置 transferred：清零会把已落盘前缀从原始 offset 再写一遍，
             // add_written_bytes 二次记账 -> accepted = written + discarded + pending 被破坏。
-            if (!file || !buffer)
-            {
+            if (!file || !source || size == 0 || completion_event == nullptr)
                 return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
-            }
-#if SUP7Z_USE_SHARED_OUTPUT
-            const unsigned char *source = buffer->borrowed ? buffer->borrowed_data : buffer->data.get();
-#else
-            const unsigned char *source = buffer->data.get();
-#endif
-            if (!source)
-            {
-                return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
-            }
 
             const auto job = file->job;
             const HRESULT global_error = current_error(job);
             if (global_error != S_OK)
             {
-                // 已是终态：仍需标记本文件失败，否则 process_close 会把它计入 completed_files；
-                // 剩余字节的 discarded 由 writer_loop 收尾（此处传 0）。
                 record_failure(file, global_error, current_win32_error(job), 0);
                 return {AttemptResult::Kind::Terminal, 0};
             }
 
-            // 打开文件只做一次锁内尝试，绝不在这里嵌套 retry_with_space_gate：
-            // 外层可能正持有 probe 许可，内层 wait() 会在 Probing 上永久阻塞。
             const AttemptResult open_result = try_open_file_locked(file);
             if (open_result.kind != AttemptResult::Kind::Succeeded)
-            {
                 return open_result;
-            }
 
             if (!begin_data_write(file))
             {
                 const HRESULT error = current_error(job);
                 if (error != S_OK)
-                {
                     record_failure(file, error, current_win32_error(job), 0);
-                }
                 return {AttemptResult::Kind::Terminal, 0};
             }
 
-            while (transferred < buffer->size)
+            while (transferred < size)
             {
                 unsigned long injected_error = 0;
                 if (consume_injected_write_fault(&injected_error))
@@ -1914,16 +1952,15 @@ namespace sunpack::sevenzip
                 OVERLAPPED overlapped{};
                 overlapped.Offset = static_cast<DWORD>(request_offset);
                 overlapped.OffsetHigh = static_cast<DWORD>(request_offset >> 32U);
-                overlapped.hEvent = buffer->completion_event;
-                ResetEvent(buffer->completion_event);
+                overlapped.hEvent = completion_event;
+                ResetEvent(completion_event);
 
-                const DWORD request_size = buffer->size - transferred;
+                const DWORD request_size = size - transferred;
                 DWORD effective_size = request_size;
                 const UInt32 chunk_limit = max_write_chunk_.load(std::memory_order_relaxed);
                 if (chunk_limit != 0 && effective_size > chunk_limit)
-                {
-                    effective_size = chunk_limit; // 测试注入：强制制造 partial write
-                }
+                    effective_size = chunk_limit;
+
                 const BOOL started = WriteFile(
                     file->handle,
                     source + transferred,
@@ -1954,8 +1991,28 @@ namespace sunpack::sevenzip
                 transferred += written;
                 add_written_bytes(file, written);
             }
+
             end_data_write(file);
             return {AttemptResult::Kind::Succeeded, 0};
+        }
+
+        AttemptResult attempt_data_write(
+            const FileStatePtr &file,
+            Buffer *buffer,
+            UInt64 output_offset,
+            UInt32 &transferred) noexcept
+        {
+            if (!buffer)
+                return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
+#if SUP7Z_USE_SHARED_OUTPUT
+            const unsigned char *source =
+                buffer->borrowed ? buffer->borrowed_data : buffer->data.get();
+#else
+            const unsigned char *source = buffer->data.get();
+#endif
+            return attempt_raw_write(
+                file, source, buffer->size, buffer->completion_event,
+                output_offset, transferred);
         }
 
         // 空间类错误必须走 SpaceFailure 交给骨架重试，绝不能在这里调用 record_failure
@@ -2184,6 +2241,51 @@ namespace sunpack::sevenzip
         }
 
 #if SUP7Z_USE_SHARED_OUTPUT
+        void release_borrowed_work(
+            const FileStatePtr &file,
+            BorrowedLease *lease,
+            UInt32 size) noexcept
+        {
+            const auto job = file ? file->job : nullptr;
+            bool queued_close = false;
+            bool direct_close = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (file)
+                {
+                    file->inflight_bytes -= size;
+                    if (file->outstanding_data != 0)
+                        --file->outstanding_data;
+                }
+                if (job)
+                {
+                    job->inflight_bytes -= size;
+                    if (job->pending_jobs != 0)
+                        --job->pending_jobs;
+                }
+
+                HRESULT lease_result = S_OK;
+                if (file && file->failed)
+                    lease_result = file->hresult;
+                else if (job)
+                    lease_result = terminal_result_locked(job);
+
+                if (lease)
+                {
+                    lease->result = lease_result;
+                    lease->state = BorrowedLeaseState::Complete;
+                }
+
+                if (file && file->close_requested && file->outstanding_data == 0)
+                    queued_close = enqueue_close_locked(file, &direct_close);
+            }
+            if (queued_close)
+                work_cv_.notify_one();
+            if (direct_close)
+                process_close(file);
+            producer_cv_.notify_all();
+        }
+
         static HRESULT wait_borrowed_thunk(void *context) noexcept
         {
             auto *lease = static_cast<BorrowedLease *>(context);
@@ -2220,13 +2322,13 @@ namespace sunpack::sevenzip
         // gate == nullptr（功能关闭 / 无卷身份）时的永久失败收尾，只适用于 Data 路径：
         // account_discarded(remaining) + file 终局失败 + job 终局失败 + 唤醒 producer。
         void record_legacy_space_failure(const FileStatePtr &file,
-                                         const Buffer *buffer,
+                                         UInt32 size,
                                          UInt32 transferred,
                                          unsigned long win32_error) noexcept
         {
-            if (buffer && buffer->size > transferred)
+            if (size > transferred)
             {
-                account_discarded(buffer->size - transferred);
+                account_discarded(size - transferred);
             }
             {
                 std::lock_guard<std::mutex> lock(mutex_);
