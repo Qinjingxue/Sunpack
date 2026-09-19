@@ -129,27 +129,34 @@ function Assert-SevenZipAsmSelection {
         [string]$ExpectedSymbol = "LzmaDec_DecodeReal_3"
     )
 
-    if ($BuildArch -ne "x64") {
-        Write-Host "7-Zip asm check skipped: $BuildArch keeps the upstream C/intrinsics implementations." -ForegroundColor Yellow
+    if ($BuildArch -eq "x64") {
+        $optionName = "SUP7Z_USE_X64_ASM"
+        $sourceName = "LzmaDecOpt.asm"
+        $asmObject = Join-Path $BuildDir "sunpack_7zip_asm_objects.dir\Release\LzmaDecOpt.obj"
+    } elseif ($BuildArch -eq "arm64") {
+        $optionName = "SUP7Z_USE_ARM64_ASM"
+        $sourceName = "LzmaDecOpt.S"
+        $asmObject = Join-Path $BuildDir "sunpack_7zip_arm64_asm\LzmaDecOpt.obj"
+    } else {
+        Write-Host "7-Zip asm check skipped: unsupported target architecture '$BuildArch'." -ForegroundColor Yellow
         return
     }
 
-    if ((Get-CachedCMakeOption -BuildDir $BuildDir -Name "SUP7Z_USE_X64_ASM") -eq $false) {
-        Write-Host "7-Zip asm check skipped: $BuildDir was configured with SUP7Z_USE_X64_ASM=OFF." -ForegroundColor Yellow
+    if ((Get-CachedCMakeOption -BuildDir $BuildDir -Name $optionName) -eq $false) {
+        Write-Host "7-Zip asm check skipped: $BuildDir was configured with $optionName=OFF." -ForegroundColor Yellow
         return
     }
 
-    $asmObject = Join-Path $BuildDir "sunpack_7zip_asm_objects.dir\Release\LzmaDecOpt.obj"
     if (-not (Test-Path -LiteralPath $asmObject)) {
-        throw ("7-Zip asm check failed: $asmObject does not exist, so the x64 build did not " +
-               "assemble LzmaDecOpt.asm. Configure with -DSUP7Z_USE_X64_ASM=OFF to build " +
-               "without the assembly hot paths on purpose.")
+        throw ("7-Zip asm check failed: $asmObject does not exist, so the $BuildArch build did not " +
+               "assemble $sourceName. Configure with -D$optionName=OFF to build without that " +
+               "assembly hot path on purpose.")
     }
 
     $symbol = Get-CoffSymbol -ObjectPath $asmObject -SymbolName $ExpectedSymbol
     if ($null -eq $symbol) {
         throw ("7-Zip asm check failed: $asmObject does not define the external function " +
-               "$ExpectedSymbol, so the MASM object cannot be the source of that symbol.")
+               "$ExpectedSymbol, so the assembly object cannot be the source of that symbol.")
     }
 
     $targets = @(
@@ -164,7 +171,7 @@ function Assert-SevenZipAsmSelection {
         }
         $hits = Test-BytePatternInFile -Path $target -Pattern $symbol.Bytes
         if ($hits -lt 1) {
-            throw ("7-Zip asm check failed: $ExpectedSymbol from LzmaDecOpt.asm is not present " +
+            throw ("7-Zip asm check failed: $ExpectedSymbol from $sourceName is not present " +
                    "in $target. That binary fell back to the C LZMA decoder.")
         }
         Write-Host ("7-Zip asm check passed: $ExpectedSymbol present in " +
