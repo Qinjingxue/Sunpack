@@ -3,6 +3,9 @@
 #include "StdAfx.h"
 
 #include "../../../C/Alloc.h"
+#if SUP7Z_USE_SHARED_INPUT
+#include "../Common/SunpackSharedInput.h"
+#endif
 
 #include "CopyCoder.h"
 
@@ -25,51 +28,106 @@ Z7_COM7F_IMF(CCopyCoder::Code(ISequentialInStream *inStream,
     const UInt64 * /* inSize */, const UInt64 *outSize,
     ICompressProgressInfo *progress))
 {
+#if SUP7Z_USE_SHARED_INPUT
+  CMyComPtr<ISunpackSharedInput> sharedInput;
+  inStream->QueryInterface(IID_ISunpackSharedInput, (void **)&sharedInput);
+
+  struct CLeaseGuard
+  {
+    ISunpackSharedInput *Source;
+    UInt64 Token;
+    CLeaseGuard(): Source(NULL), Token(0) {}
+    ~CLeaseGuard()
+    {
+      if (Source && Token)
+        Source->ReleaseBorrowed(Token);
+    }
+  };
+#else
   if (!_buf)
   {
     _buf = (Byte *)::MidAlloc(kBufSize);
     if (!_buf)
       return E_OUTOFMEMORY;
   }
+#endif
 
   TotalSize = 0;
   
   for (;;)
   {
-    UInt32 size = kBufSize;
+    UInt32 request = kBufSize;
     if (outSize)
     {
       const UInt64 rem = *outSize - TotalSize;
-      if (size > rem)
+      if (request > rem)
       {
-        size = (UInt32)rem;
-        if (size == 0)
-        {
-          /* if we enable the following check,
-             we will make one call of Read(_buf, 0) for empty stream */
-          // if (TotalSize != 0)
+        request = (UInt32)rem;
+        if (request == 0)
           return S_OK;
-        }
       }
     }
-    
-    HRESULT readRes;
+
+    HRESULT readRes = S_OK;
+    UInt32 size = 0;
+    const Byte *source = NULL;
+#if SUP7Z_USE_SHARED_INPUT
+    bool borrowedInput = false;
+    CLeaseGuard lease;
+
+    if (sharedInput)
     {
-      UInt32 pos = 0;
-      do
+      UInt64 token = 0;
+      const Byte *borrowed = NULL;
+      UInt32 borrowedSize = 0;
+      const HRESULT borrowRes = sharedInput->Borrow(request, &borrowed, &borrowedSize, &token);
+      if (borrowRes == S_OK)
       {
-        const UInt32 curSize = size - pos;
-        UInt32 processed = 0;
-        readRes = inStream->Read(_buf + pos, curSize, &processed);
-        if (processed > curSize)
-          return E_FAIL; // internal code failure
-        pos += processed;
-        if (readRes != S_OK || processed == 0)
-          break;
+        if (!borrowed || borrowedSize == 0 || borrowedSize > request || token == 0)
+        {
+          if (token)
+            sharedInput->ReleaseBorrowed(token);
+          return E_FAIL;
+        }
+        lease.Source = sharedInput;
+        lease.Token = token;
+        source = borrowed;
+        size = borrowedSize;
+        borrowedInput = true;
       }
-      while (pos < kBufSize);
-      size = pos;
+      else if (borrowRes != S_FALSE)
+        return borrowRes;
     }
+
+    if (!borrowedInput)
+    {
+      if (!_buf)
+      {
+        _buf = (Byte *)::MidAlloc(kBufSize);
+        if (!_buf)
+          return E_OUTOFMEMORY;
+      }
+#endif
+      {
+        UInt32 pos = 0;
+        do
+        {
+          const UInt32 curSize = request - pos;
+          UInt32 processed = 0;
+          readRes = inStream->Read(_buf + pos, curSize, &processed);
+          if (processed > curSize)
+            return E_FAIL;
+          pos += processed;
+          if (readRes != S_OK || processed == 0)
+            break;
+        }
+        while (pos < request);
+        size = pos;
+        source = _buf;
+      }
+#if SUP7Z_USE_SHARED_INPUT
+    }
+#endif
 
     if (size == 0)
       return readRes;
@@ -81,9 +139,9 @@ Z7_COM7F_IMF(CCopyCoder::Code(ISequentialInStream *inStream,
       {
         const UInt32 curSize = size - pos;
         UInt32 processed = 0;
-        const HRESULT res = outStream->Write(_buf + pos, curSize, &processed);
+        const HRESULT res = outStream->Write(source + pos, curSize, &processed);
         if (processed > curSize)
-          return E_FAIL; // internal code failure
+          return E_FAIL;
         pos += processed;
         TotalSize += processed;
         RINOK(res)
@@ -97,8 +155,16 @@ Z7_COM7F_IMF(CCopyCoder::Code(ISequentialInStream *inStream,
 
     RINOK(readRes)
 
+    if (outSize && TotalSize == *outSize)
+      return S_OK;
+
+#if SUP7Z_USE_SHARED_INPUT
+    if (!borrowedInput && size != request)
+      return S_OK;
+#else
     if (size != kBufSize)
       return S_OK;
+#endif
 
     if (progress && (TotalSize & (((UInt32)1 << 22) - 1)) == 0)
     {
