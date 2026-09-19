@@ -14,6 +14,9 @@
 #endif
 
 #include "../ICoder.h"
+#if SUP7Z_USE_SHARED_INPUT
+#include "../Common/SunpackSharedInput.h"
+#endif
 
 #include "BZip2Const.h"
 #include "BZip2Crc.h"
@@ -316,6 +319,12 @@ public:
   #endif
 
   Byte *_inBuf;
+  const Byte *_inBase;
+#if SUP7Z_USE_SHARED_INPUT
+  CMyComPtr<ISunpackSharedInput> _sharedInput;
+  UInt64 _borrowToken;
+  void ReleaseBorrowed() throw();
+#endif
   UInt64 _inProcessed;
   bool _inputFinished;
   HRESULT _inputRes;
@@ -332,7 +341,11 @@ public:
   {
     // We use InitInputBuffer() before stream init.
     // So don't read from stream here
+#if SUP7Z_USE_SHARED_INPUT
+    ReleaseBorrowed();
+#endif
     _inProcessed = 0;
+    _inBase = _inBuf;
     Base._buf = _inBuf;
     Base._lim = _inBuf;
     Base.InitBitDecoder();
@@ -341,12 +354,12 @@ public:
   UInt64 GetInputProcessedSize() const
   {
     // for NSIS case : we need also look the number of bits in bitDecoder
-    return _inProcessed + (size_t)(Base._buf - _inBuf);
+    return _inProcessed + (size_t)(Base._buf - _inBase);
   }
 
   UInt64 GetInStreamSize() const
   {
-    return _inProcessed + (size_t)(Base._buf - _inBuf) - (Base._numBits >> 3);
+    return _inProcessed + (size_t)(Base._buf - _inBase) - (Base._numBits >> 3);
   }
 
   UInt64 GetOutProcessedSize() const { return _outWritten + _outPos; }
