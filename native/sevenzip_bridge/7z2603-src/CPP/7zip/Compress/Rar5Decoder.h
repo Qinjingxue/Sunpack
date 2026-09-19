@@ -104,7 +104,7 @@ Z7_CLASS_IMP_NOQIB_2(
   ISequentialOutStream *_outStream;
 #if SUP7Z_USE_SHARED_OUTPUT
   CMyComPtr<ISunpackSharedOutput> _sharedOutput;
-  CSunpackSharedOutputLeaseRing<16> _outputLeases;
+  CSunpackSharedOutputRangeLeaseRing<16> _outputLeases;
 #endif
   ICompressProgressInfo *_progress;
   Byte *_inputBuf;
