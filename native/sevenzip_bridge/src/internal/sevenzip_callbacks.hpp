@@ -106,8 +106,7 @@ namespace sunpack::sevenzip
             std::wstring archive_path = L"",
             std::vector<std::wstring> part_paths = {},
             std::vector<std::wstring> canonical_names = {},
-            InputPrefetchConfig volume_prefetch_config = input_prefetch_config(),
-            ExtractInputTrace *input_trace = nullptr)
+            InputPrefetchConfig volume_prefetch_config = input_prefetch_config())
 
             : password_(std::move(password)),
 
@@ -115,9 +114,7 @@ namespace sunpack::sevenzip
 
               part_paths_(std::move(part_paths)),
 
-              volume_prefetch_config_(volume_prefetch_config),
-
-              input_trace_(input_trace)
+              volume_prefetch_config_(volume_prefetch_config)
         {
 
             if (!canonical_names.empty() && canonical_names.size() == part_paths_.size())
@@ -228,7 +225,7 @@ namespace sunpack::sevenzip
             // CMyComPtr's raw-pointer constructor AddRefs, giving the object its
             // first reference. The holder also releases it on every early return.
             CMyComPtr<IInStream> stream_holder(
-                new FileInStream(found->second, input_trace_, L"file", volume_prefetch_config_));
+                new FileInStream(found->second, nullptr, L"file", volume_prefetch_config_));
             auto *stream = static_cast<FileInStream *>(stream_holder.Interface());
 
             if (!stream->is_open())
@@ -285,8 +282,6 @@ namespace sunpack::sevenzip
         std::vector<std::wstring> part_paths_;
 
         const InputPrefetchConfig volume_prefetch_config_;
-
-        ExtractInputTrace *input_trace_ = nullptr;
 
         std::map<std::wstring, std::wstring> volume_paths_;
 
