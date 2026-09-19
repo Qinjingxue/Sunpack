@@ -1571,7 +1571,7 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
   // The main logical stream is planned by SunPack before Extract(). Multi-volume ZIP
   // owns additional streams, so cover those here as well without reparsing local headers.
   FOR_VECTOR(volumeIndex, m_Archive.Vols.Streams)
-    NSunpackReadPlan::PlanWhole(m_Archive.Vols.Streams[volumeIndex].Stream);
+    NSunpackReadPlan::PlanWhole(m_Archive.Vols.Streams[volumeIndex].Stream.Interface());
 #endif
   UInt64 total = 0; // , totalPacked = 0;
   UInt32 i;
