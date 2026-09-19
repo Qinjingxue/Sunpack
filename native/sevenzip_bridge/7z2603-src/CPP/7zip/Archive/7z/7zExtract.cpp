@@ -7,6 +7,9 @@
 #include "../../../Common/ComTry.h"
 
 #include "../../Common/ProgressUtils.h"
+#if SUP7Z_USE_SHARED_OUTPUT
+#include "../../Common/SunpackSharedOutput.h"
+#endif
 
 #include "7zDecode.h"
 #include "7zHandler.h"
@@ -16,12 +19,25 @@
 namespace NArchive {
 namespace N7z {
 
+#if SUP7Z_USE_SHARED_OUTPUT
+Z7_CLASS_IMP_COM_2(
+  CFolderOutStream
+  , ISequentialOutStream
+  , ISunpackSharedOutput
+)
+#else
 Z7_CLASS_IMP_COM_1(
   CFolderOutStream
   , ISequentialOutStream
-  /* , ICompressGetSubStreamSize */
 )
+#endif
   CMyComPtr<ISequentialOutStream> _stream;
+#if SUP7Z_USE_SHARED_OUTPUT
+  CMyComPtr<ISunpackSharedOutput> _sharedOutput;
+  const Byte *_sharedLeaseData;
+  UInt32 _sharedLeaseCapacity;
+  UInt64 _sharedLeaseToken;
+#endif
 public:
   bool TestMode;
   bool CheckCrc;
@@ -50,6 +66,11 @@ public:
   CFolderOutStream():
       TestMode(false),
       CheckCrc(true)
+#if SUP7Z_USE_SHARED_OUTPUT
+      , _sharedLeaseData(NULL)
+      , _sharedLeaseCapacity(0)
+      , _sharedLeaseToken(0)
+#endif
       {}
 
   HRESULT Init(unsigned startIndex, const UInt32 *indexes, unsigned numFiles);
@@ -91,6 +112,11 @@ HRESULT CFolderOutStream::OpenFile(bool isCorrupted)
   RINOK(ExtractCallback->GetStream(_fileIndex, &realOutStream, askMode))
   
   _stream = realOutStream;
+#if SUP7Z_USE_SHARED_OUTPUT
+  _sharedOutput.Release();
+  if (realOutStream)
+    realOutStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&_sharedOutput);
+#endif
   _crc = CRC_INIT_VAL;
   _calcCrc = (CheckCrc && fi.CrcDefined && !fi.IsDir);
 
@@ -107,6 +133,18 @@ HRESULT CFolderOutStream::OpenFile(bool isCorrupted)
 
 HRESULT CFolderOutStream::CloseFile_and_SetResult(Int32 res)
 {
+#if SUP7Z_USE_SHARED_OUTPUT
+  if (_sharedLeaseToken)
+  {
+    UInt32 ignored = 0;
+    if (_sharedOutput)
+      _sharedOutput->Commit(_sharedLeaseToken, 0, &ignored);
+    _sharedLeaseData = NULL;
+    _sharedLeaseCapacity = 0;
+    _sharedLeaseToken = 0;
+  }
+  _sharedOutput.Release();
+#endif
   _stream.Release();
   _fileIsOpen = false;
   
@@ -195,6 +233,160 @@ Z7_COM7F_IMF(CFolderOutStream::Write(const void *data, UInt32 size, UInt32 *proc
   
   return S_OK;
 }
+
+#if SUP7Z_USE_SHARED_OUTPUT
+
+Z7_COM7F_IMF(CFolderOutStream::Acquire(
+    UInt32 desiredSize, Byte **data, UInt32 *capacity, UInt64 *token))
+{
+  if (data) *data = NULL;
+  if (capacity) *capacity = 0;
+  if (token) *token = 0;
+  if (!data || !capacity || !token || desiredSize == 0 || _sharedLeaseToken != 0)
+    return E_INVALIDARG;
+
+  for (;;)
+  {
+    if (!_fileIsOpen)
+    {
+      RINOK(ProcessEmptyFiles())
+      if (_numFiles == 0)
+      {
+        ExtraWriteWasCut = true;
+        return k_My_HRESULT_WritingWasCut;
+      }
+      RINOK(OpenFile())
+    }
+
+    if (!_sharedOutput)
+      return S_FALSE;
+
+    UInt32 request = desiredSize;
+    if ((UInt64)request > _rem)
+      request = (UInt32)_rem;
+    if (request == 0)
+    {
+      RINOK(CloseFile())
+      continue;
+    }
+
+    Byte *leased = NULL;
+    UInt32 leasedCapacity = 0;
+    UInt64 leasedToken = 0;
+    const HRESULT res = _sharedOutput->Acquire(
+        request, &leased, &leasedCapacity, &leasedToken);
+    if (res != S_OK)
+      return res;
+    if (!leased || leasedCapacity == 0 || leasedCapacity > request || leasedToken == 0)
+      return E_FAIL;
+
+    _sharedLeaseData = leased;
+    _sharedLeaseCapacity = leasedCapacity;
+    _sharedLeaseToken = leasedToken;
+    *data = leased;
+    *capacity = leasedCapacity;
+    *token = leasedToken;
+    return S_OK;
+  }
+}
+
+Z7_COM7F_IMF(CFolderOutStream::Commit(
+    UInt64 token, UInt32 size, UInt32 *processedSize))
+{
+  if (processedSize) *processedSize = 0;
+  if (!_sharedOutput || token == 0 || token != _sharedLeaseToken ||
+      !_sharedLeaseData || size > _sharedLeaseCapacity)
+    return E_INVALIDARG;
+
+  const UInt32 nextCrc = (_calcCrc && size)
+      ? CrcUpdate(_crc, _sharedLeaseData, size)
+      : _crc;
+
+  UInt32 committed = 0;
+  const HRESULT res = _sharedOutput->Commit(token, size, &committed);
+  _sharedLeaseData = NULL;
+  _sharedLeaseCapacity = 0;
+  _sharedLeaseToken = 0;
+
+  if (committed > size || (res == S_OK && committed != size))
+    return E_FAIL;
+  if (_calcCrc && committed == size)
+    _crc = nextCrc;
+  if (processedSize)
+    *processedSize = committed;
+  _rem -= committed;
+
+  if (_rem == 0)
+  {
+    RINOK(CloseFile())
+    RINOK(ProcessEmptyFiles())
+  }
+  return res;
+}
+
+Z7_COM7F_IMF(CFolderOutStream::SubmitBorrowed(
+    const Byte *data, UInt32 size, UInt32 *processedSize, UInt64 *token))
+{
+  if (processedSize) *processedSize = 0;
+  if (token) *token = 0;
+  if (!data || size == 0 || !processedSize || !token || _sharedLeaseToken != 0)
+    return E_INVALIDARG;
+
+  for (;;)
+  {
+    if (!_fileIsOpen)
+    {
+      RINOK(ProcessEmptyFiles())
+      if (_numFiles == 0)
+      {
+        ExtraWriteWasCut = true;
+        return k_My_HRESULT_WritingWasCut;
+      }
+      RINOK(OpenFile())
+    }
+
+    if (!_sharedOutput)
+      return S_FALSE;
+
+    UInt32 request = size;
+    if ((UInt64)request > _rem)
+      request = (UInt32)_rem;
+    if (request == 0)
+    {
+      RINOK(CloseFile())
+      continue;
+    }
+
+    UInt32 accepted = 0;
+    UInt64 lease = 0;
+    const HRESULT res = _sharedOutput->SubmitBorrowed(
+        data, request, &accepted, &lease);
+    if (res != S_OK)
+      return res;
+    if (accepted == 0 || accepted > request || lease == 0)
+      return E_FAIL;
+
+    if (_calcCrc)
+      _crc = CrcUpdate(_crc, data, accepted);
+
+    *processedSize = accepted;
+    *token = lease;
+    _rem -= accepted;
+    if (_rem == 0)
+    {
+      RINOK(CloseFile())
+      RINOK(ProcessEmptyFiles())
+    }
+    return S_OK;
+  }
+}
+
+Z7_COM7F_IMF(CFolderOutStream::WaitBorrowed(UInt64 token))
+{
+  return SunpackSharedOutput_WaitToken(token);
+}
+
+#endif
 
 HRESULT CFolderOutStream::FlushCorrupted(Int32 callbackOperationResult)
 {

@@ -809,13 +809,91 @@ Byte * CSpecState::Decode(Byte *data, size_t size) throw()
 }
 
 
+#if SUP7Z_USE_SHARED_OUTPUT
+void CDecoder::AbortOutputLease() throw()
+{
+  if (_outLeaseToken && _sharedOutput)
+  {
+    UInt32 ignored = 0;
+    _sharedOutput->Commit(_outLeaseToken, 0, &ignored);
+  }
+  _outLeaseToken = 0;
+  _outBuf = NULL;
+  _outCapacity = 0;
+  _outPos = 0;
+}
+#endif
+
+
+HRESULT CDecoder::AcquireOutputBuffer()
+{
+  if (_outBuf)
+    return S_OK;
+
+#if SUP7Z_USE_SHARED_OUTPUT
+  if (_sharedOutput)
+  {
+    Byte *data = NULL;
+    UInt32 capacity = 0;
+    UInt64 token = 0;
+    const HRESULT res = _sharedOutput->Acquire(
+        (UInt32)kOutBufSize, &data, &capacity, &token);
+    if (res == S_OK)
+    {
+      if (!data || capacity == 0 || capacity > kOutBufSize || token == 0)
+        return E_FAIL;
+      _outBuf = data;
+      _outCapacity = capacity;
+      _outLeaseToken = token;
+      return S_OK;
+    }
+    if (res != S_FALSE)
+      return res;
+  }
+#endif
+
+  if (!_outBufOwned)
+  {
+    _outBufOwned = (Byte *)MidAlloc(kOutBufSize);
+    if (!_outBufOwned)
+      return E_OUTOFMEMORY;
+  }
+  _outBuf = _outBufOwned;
+  _outCapacity = kOutBufSize;
+  return S_OK;
+}
+
+
 HRESULT CDecoder::Flush()
 {
   if (_writeRes == S_OK)
   {
-    _writeRes = WriteStream(_outStream, _outBuf, _outPos);
-    _outWritten += _outPos;
-    _outPos = 0;
+#if SUP7Z_USE_SHARED_OUTPUT
+    if (_outLeaseToken)
+    {
+      UInt32 processed = 0;
+      _writeRes = _sharedOutput->Commit(
+          _outLeaseToken, (UInt32)_outPos, &processed);
+      if (_writeRes == S_OK && processed != _outPos)
+        _writeRes = E_FAIL;
+      _outWritten += processed;
+      _outLeaseToken = 0;
+    }
+    else
+#endif
+    if (_outPos != 0)
+    {
+      _writeRes = WriteStream(_outStream, _outBuf, _outPos);
+      if (_writeRes == S_OK)
+        _outWritten += _outPos;
+    }
+
+    if (_outBuf)
+    {
+      _outPos = 0;
+      _outBuf = NULL;
+      _outCapacity = 0;
+    }
   }
   return _writeRes;
 }
@@ -836,8 +914,9 @@ HRESULT CDecoder::DecodeBlock(const CBlockProps &props)
 
   for (;;)
   {
+    RINOK(AcquireOutputBuffer())
     Byte *data = _outBuf + _outPos;
-    size_t size = kOutBufSize - _outPos;
+    size_t size = _outCapacity - _outPos;
     
     if (_outSizeDefined)
     {
@@ -874,6 +953,11 @@ HRESULT CDecoder::DecodeBlock(const CBlockProps &props)
 
 CDecoder::CDecoder():
     _outBuf(NULL),
+    _outBufOwned(NULL),
+    _outCapacity(0),
+#if SUP7Z_USE_SHARED_OUTPUT
+    _outLeaseToken(0),
+#endif
     FinishMode(false),
     _outSizeDefined(false),
     _counters(NULL),
@@ -919,8 +1003,11 @@ CDecoder::~CDecoder()
 #if SUP7Z_USE_SHARED_INPUT
   ReleaseBorrowed();
 #endif
+#if SUP7Z_USE_SHARED_OUTPUT
+  AbortOutputLease();
+#endif
   BigFree(_counters);
-  MidFree(_outBuf);
+  MidFree(_outBufOwned);
   MidFree(_inBuf);
 }
 
@@ -1343,12 +1430,17 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   if (!CreateInputBufer())
     return E_OUTOFMEMORY;
 
-  if (!_outBuf)
-  {
-    _outBuf = (Byte *)MidAlloc(kOutBufSize);
-    if (!_outBuf)
-      return E_OUTOFMEMORY;
-  }
+#if SUP7Z_USE_SHARED_OUTPUT
+  AbortOutputLease();
+  _sharedOutput.Release();
+  if (outStream)
+    outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&_sharedOutput);
+#endif
+  _outBuf = NULL;
+  _outCapacity = 0;
+#if SUP7Z_USE_SHARED_OUTPUT
+  _outLeaseToken = 0;
+#endif
 
   Base.InStream = inStream;
 #if SUP7Z_USE_SHARED_INPUT
@@ -1368,6 +1460,9 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 
   Base.InStream = NULL;
   _outStream = NULL;
+#if SUP7Z_USE_SHARED_OUTPUT
+  _sharedOutput.Release();
+#endif
 
   /*
   if (res == S_OK)
@@ -1378,7 +1473,16 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   if (res != S_OK)
     return res;
 
-  } catch(...) { return E_FAIL; }
+  } catch(...)
+  {
+#if SUP7Z_USE_SHARED_OUTPUT
+    AbortOutputLease();
+    _sharedOutput.Release();
+#endif
+    Base.InStream = NULL;
+    _outStream = NULL;
+    return E_FAIL;
+  }
 
   return _writeRes;
 }

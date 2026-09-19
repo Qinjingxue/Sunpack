@@ -8,6 +8,9 @@
 #if SUP7Z_USE_SHARED_INPUT
 #include "../Common/SunpackSharedInput.h"
 #endif
+#if SUP7Z_USE_SHARED_OUTPUT
+#include "../Common/SunpackSharedOutput.h"
+#endif
 
 #include "LzmaDecoder.h"
 
@@ -128,6 +131,53 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
   SizeT wrPos = _state.dicPos;
   HRESULT readRes = S_OK;
 
+#if SUP7Z_USE_SHARED_OUTPUT
+  CMyComPtr<ISunpackSharedOutput> sharedOutput;
+  if (outStream)
+    outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&sharedOutput);
+  CSunpackSharedOutputLeaseRing<16> outputLeases;
+
+  const auto writeOutput = [&](const Byte *data, size_t bytes) -> HRESULT
+  {
+    if (!sharedOutput)
+      return WriteStream(outStream, data, bytes);
+
+    while (bytes != 0)
+    {
+      const UInt32 request = bytes > (size_t)0xFFFFFFFFu
+          ? 0xFFFFFFFFu : (UInt32)bytes;
+      UInt32 accepted = 0;
+      UInt64 token = 0;
+      HRESULT submitRes = S_FALSE;
+      for (;;)
+      {
+        submitRes = sharedOutput->SubmitBorrowed(
+            data, request, &accepted, &token);
+        if (submitRes != S_FALSE || outputLeases.Empty())
+          break;
+        const HRESULT retireRes = outputLeases.RetireOne();
+        if (retireRes != S_OK)
+          return retireRes;
+        accepted = 0;
+        token = 0;
+      }
+      if (submitRes == S_FALSE)
+        return WriteStream(outStream, data, bytes);
+      if (submitRes != S_OK)
+        return submitRes;
+      if (accepted == 0 || accepted > request || token == 0)
+        return E_FAIL;
+
+      const HRESULT retireRes = outputLeases.Push(token);
+      if (retireRes != S_OK)
+        return retireRes;
+      data += accepted;
+      bytes -= accepted;
+    }
+    return S_OK;
+  };
+#endif
+
 #if SUP7Z_USE_SHARED_INPUT
   CMyComPtr<ISunpackSharedInput> sharedInput;
   inStream->QueryInterface(IID_ISunpackSharedInput, (void **)&sharedInput);
@@ -240,16 +290,32 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
 
     if (needStop || outProcessed >= size)
     {
-      const HRESULT res2 = WriteStream(outStream, _state.dic + wrPos, _state.dicPos - wrPos);
+#if SUP7Z_USE_SHARED_OUTPUT
+      const HRESULT res2 = writeOutput(
+          _state.dic + wrPos, _state.dicPos - wrPos);
+#else
+      const HRESULT res2 = WriteStream(
+          outStream, _state.dic + wrPos, _state.dicPos - wrPos);
+#endif
 
       if (_state.dicPos == _state.dicBufSize)
+      {
+#if SUP7Z_USE_SHARED_OUTPUT
+        // The next decode wraps to dictionary offset 0. Every writer lease
+        // into the old dictionary generation must be retired first.
+        RINOK(outputLeases.Drain())
+#endif
         _state.dicPos = 0;
+      }
       wrPos = _state.dicPos;
       
       RINOK(res2)
 
       if (needStop)
       {
+#if SUP7Z_USE_SHARED_OUTPUT
+        RINOK(outputLeases.Drain())
+#endif
         if (res != 0)
         {
           // return SResToHRESULT(res);

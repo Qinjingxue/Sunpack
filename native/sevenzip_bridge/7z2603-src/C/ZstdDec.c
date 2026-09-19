@@ -3629,6 +3629,14 @@ SRes ZstdDec_Decode(CZstdDecHandle dec, CZstdDecState *p)
           return SZ_ERROR_FAIL;
         }
         // (p->wrPos == dec->decoder.winPos), and we wrap to zero:
+#if SUP7Z_USE_SHARED_OUTPUT
+        if (p->sunpackBeforeWindowReuse)
+        {
+          const SRes sharedRes = p->sunpackBeforeWindowReuse(p->sunpackOutputCtx);
+          if (sharedRes != SZ_OK)
+            return sharedRes;
+        }
+#endif
         dec->decoder.winPos = 0;
         p->winPos = 0;
         p->wrPos = 0;
@@ -3669,6 +3677,14 @@ SRes ZstdDec_Decode(CZstdDecHandle dec, CZstdDecState *p)
           return SZ_ERROR_FAIL;
         }
         // p->wrPos >= decoder.cycSize
+#if SUP7Z_USE_SHARED_OUTPUT
+        if (p->sunpackBeforeWindowReuse)
+        {
+          const SRes sharedRes = p->sunpackBeforeWindowReuse(p->sunpackOutputCtx);
+          if (sharedRes != SZ_OK)
+            return sharedRes;
+        }
+#endif
         // we move extra data after (decoder.cycSize) to start of cyclic buffer:
         winPos -= delta;
         if (winPos)

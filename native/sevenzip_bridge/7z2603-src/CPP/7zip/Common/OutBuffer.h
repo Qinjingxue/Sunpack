@@ -6,6 +6,9 @@
 #include "../IStream.h"
 #include "../../Common/MyCom.h"
 #include "../../Common/MyException.h"
+#if SUP7Z_USE_SHARED_OUTPUT
+#include "SunpackSharedOutput.h"
+#endif
 
 #ifndef Z7_NO_EXCEPTIONS
 struct COutBufferException: public CSystemException
@@ -26,6 +29,11 @@ protected:
   UInt64 _processedSize;
   Byte  *_buf2;
   bool _overDict;
+#if SUP7Z_USE_SHARED_OUTPUT
+  UInt32 _sharedChunkSize;
+  CMyComPtr<ISunpackSharedOutput> _sharedOutput;
+  CSunpackSharedOutputLeaseRing<8> _outputLeases;
+#endif
 
   HRESULT FlushPart() throw();
 public:
@@ -33,14 +41,26 @@ public:
   HRESULT ErrorCode;
   #endif
 
-  COutBuffer(): _buf(NULL), _pos(0), _stream(NULL), _buf2(NULL) {}
+  COutBuffer(): _buf(NULL), _pos(0), _stream(NULL), _buf2(NULL)
+#if SUP7Z_USE_SHARED_OUTPUT
+    , _sharedChunkSize(0)
+#endif
+    {}
   ~COutBuffer() { Free(); }
   
   bool Create(UInt32 bufSize) throw();
   void Free() throw();
 
   void SetMemStream(Byte *buf) { _buf2 = buf; }
+#if SUP7Z_USE_SHARED_OUTPUT
+  void SetStream(ISequentialOutStream *stream);
+  void SetSharedOutputChunkSize(UInt32 size) { _sharedChunkSize = size; }
+  bool HasSharedOutput() const { return _sharedOutput.Interface() != NULL; }
+  UInt32 GetBufferSize() const { return _bufSize; }
+  HRESULT DrainSharedOutput() { return _outputLeases.Drain(); }
+#else
   void SetStream(ISequentialOutStream *stream) { _stream = stream; }
+#endif
   void Init() throw();
   HRESULT Flush() throw();
   void FlushWithCheck();

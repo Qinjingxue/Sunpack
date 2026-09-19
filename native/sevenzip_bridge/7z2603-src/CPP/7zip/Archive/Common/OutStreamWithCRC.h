@@ -8,18 +8,41 @@
 #include "../../../Common/MyCom.h"
 
 #include "../../IStream.h"
+#if SUP7Z_USE_SHARED_OUTPUT
+#include "../../Common/SunpackSharedOutput.h"
+#endif
 
+#if SUP7Z_USE_SHARED_OUTPUT
+Z7_CLASS_IMP_COM_2(
+  COutStreamWithCRC
+  , ISequentialOutStream
+  , ISunpackSharedOutput
+)
+#else
 Z7_CLASS_IMP_NOQIB_1(
   COutStreamWithCRC
   , ISequentialOutStream
 )
+#endif
   CMyComPtr<ISequentialOutStream> _stream;
+#if SUP7Z_USE_SHARED_OUTPUT
+  CMyComPtr<ISunpackSharedOutput> _sharedOutput;
+  const Byte *_leaseData;
+  UInt32 _leaseCapacity;
+  UInt64 _leaseToken;
+#endif
   UInt64 _size;
   UInt32 _crc;
   bool _calculate;
 public:
+#if SUP7Z_USE_SHARED_OUTPUT
+  COutStreamWithCRC(): _leaseData(NULL), _leaseCapacity(0), _leaseToken(0) {}
+  void SetStream(ISequentialOutStream *stream);
+  void ReleaseStream();
+#else
   void SetStream(ISequentialOutStream *stream) { _stream = stream; }
   void ReleaseStream() { _stream.Release(); }
+#endif
   void Init(bool calculate = true)
   {
     _size = 0;
