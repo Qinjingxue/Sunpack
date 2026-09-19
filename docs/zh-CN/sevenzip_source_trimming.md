@@ -236,9 +236,10 @@ bridge 自带一份 IID 常量（`sevenzip_sdk.cpp`）。本机逐条比对确�
 不启用汇编时 C 回退实现（`LzmaDec.c` / `7zCrcOpt.c` / `XzCrc64Opt.c` / `AesOpt.c` /
 `Sha1Opt.c` / `Sha256Opt.c`）保证功能正确，只是慢。启用汇编的落地细节见 **§17**。
 
-ARM64 这一轮**完全不碰汇编**：官方 Windows ARM64 makefile 对 CRC32/CRC64/AES/SHA1/SHA256
-本来就选 C/intrinsics 实现；上游唯一的 ARM64 汇编热点 `Asm/arm64/LzmaDecOpt.S` 是
-GNU assembler + 预处理器语法，接不进 MSVC `-A ARM64`。功能完全一致。
+ARM64 后续补齐了官方的 LZMA 解码汇编路径：CRC32/CRC64/AES/SHA1/SHA256
+仍按上游 Windows ARM64 规则使用 C/intrinsics，但 `Asm/arm64/LzmaDecOpt.S` 由
+`clang-cl --target=arm64-pc-windows-msvc` 单独预处理/汇编成 ARM64 COFF 对象，再交给
+现有 MSVC 链接。普通 C/C++ 编译器没有切换。实现与验证见 **§18**。
 
 ---
 
@@ -979,7 +980,8 @@ x64:
   LzFindOpt.asm       OFF  压缩侧（LzFindMt）
 
 ARM64:
-  保持 C/intrinsics，不引入新 assembler toolchain
+  LzmaDecOpt.S        见 §18，以 clang-cl 单独编译
+  CRC/AES/SHA         保持 C/intrinsics
 ```
 
 ### 17.2 两组 OBJECT library，不混
@@ -1244,8 +1246,72 @@ zero-copy → I/O 瓶颈` 这条迁移路径，而不是同时改两个变量。
 
 ```text
 Sort.asm / LzFindOpt.asm                  压缩侧，不解压热点
-ARM64 汇编（Asm/arm64/LzmaDecOpt.S）      GNU assembler 语法，接不进 MSVC -A ARM64
+ARM64 LzmaDecOpt.S                      已在 §18 单独接入 clang-cl；不混入 MSVC C/C++ 编译
 Sha512Opt.asm                            上游同样存在，但不在本批 6 个之内
 buffer ownership / prefetch / memcpy      阶段 3B/4
 COM 层任何改动                            已封板
 ```
+
+
+---
+
+## 18. 阶段 3A-2：恢复官方 Windows ARM64 LZMA 汇编
+
+7-Zip 从 24.03 起在 Windows ARM64 使用 `Asm/arm64/LzmaDecOpt.S` 加速
+LZMA/LZMA2 解码；上游明确要求用 `clang-cl` 编译这份 GNU assembler +
+preprocessor 语法的 `.S` 文件。SunPack 保持整个项目的 MSVC ARM64 构建不变，
+只对这一份文件复用上游的编译模型：
+
+```text
+MSVC ARM64:
+  228 个 C/C++ TU                         保持
+  C/LzmaDec.c + Z7_LZMA_DEC_OPT          保持控制逻辑，移除 C 内核定义
+
+clang-cl --target=arm64-pc-windows-msvc:
+  Asm/arm64/LzmaDecOpt.S                  → LzmaDecOpt.obj
+  Asm/arm64/7zAsm.S                       仅作为预处理/汇编宏 include
+
+最终：
+  228 C/C++ TU + 1 ARM64 assembly object
+```
+
+### 18.1 为什么不切整个工程到 clang-cl
+
+官方 ARM64 优化只需要 `LzmaDec_DecodeReal_3` 这一处汇编内核。为它切换 SunPack
+和整棵 7-Zip C/C++ 到 clang-cl 会放大变量与测试面，没有收益。CMake 因此使用
+`add_custom_command` 生成一个 ARM64 COFF `.obj`，随后由
+`sup7z_attach_bundled_7z()` 把同一个对象直接注入 DLL、worker 与 C++ 测试目标。
+
+### 18.2 工具发现与回退
+
+`SUP7Z_USE_ARM64_ASM=ON`（默认）只在目标架构为 `ARM64` 时生效。CMake 按以下顺序
+寻找 host `clang-cl`：
+
+1. 用户显式 `-DSUP7Z_CLANG_CL_EXECUTABLE=<path>`
+2. 当前 Visual Studio instance 的 `VC/Tools/Llvm/{x64,ARM64}/bin`
+3. `VCINSTALLDIR` 下对应 LLVM 目录
+4. `PATH`
+
+找不到时 ARM64 optimized build 直接报错并给出 Visual Studio
+“C++ Clang tools for Windows”安装提示；需要纯 C 对照或临时回退时显式：
+
+```powershell
+-DSUP7Z_USE_ARM64_ASM=OFF
+```
+
+x64 与 ARM64 分别维护自己的 selection guard。这样已有 `build-x64` 不需要迁移清理，
+旧 `build-arm64` 第一次启用新路径也能正常 configure；之后在同一目录翻转 ARM64
+ASM ON/OFF 会被拒绝，A/B 测试应使用独立目录。
+
+### 18.3 最终产物验证
+
+共享的 `scripts/sevenzip_asm_check.ps1` 现在按 `BuildArch` 选择对象：
+
+```text
+x64    sunpack_7zip_asm_objects.dir/Release/LzmaDecOpt.obj
+ARM64  sunpack_7zip_arm64_asm/LzmaDecOpt.obj
+```
+
+两者都精确解析 COFF 外部符号 `LzmaDec_DecodeReal_3`，取其函数开头机器码，并要求
+它出现在 build 与 `tools*` 下的 DLL / worker 四个最终二进制中。ARM64 因而与 x64
+拥有同等级别的“汇编对象真的进入产品 worker”断言，而不是只检查配置开关。
