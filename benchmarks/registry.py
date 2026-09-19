@@ -29,6 +29,7 @@ _ROWS = [
     ("watch", "split-arrival", "benchmarks.scenarios.watch_split_arrival", "Split-volume order and slow-arrival watch benchmark."),
     ("watch", "state-persistence", "benchmarks.scenarios.watch_state_persistence", "Incremental watch-state latency versus retained state size."),
     ("extraction", "format-matrix", "benchmarks.scenarios.extraction_format_matrix", "Format and workload matrix."),
+    ("extraction", "cli-format-matrix", "benchmarks.scenarios.extraction_cli_format_matrix", "Full CLI 300 MiB format matrix with coarse internal phase timings."),
     ("extraction", "real-archive", "benchmarks.scenarios.extraction_real_archive", "Fresh-process real archive baseline."),
     ("extraction", "large-archive-profile", "benchmarks.scenarios.extraction_large_archive", "Large archive pipeline profile."),
     ("extraction", "sevenzip-worker-matrix", "benchmarks.scenarios.sevenzip_worker_matrix", "Direct native 7z.dll worker format and size matrix."),
