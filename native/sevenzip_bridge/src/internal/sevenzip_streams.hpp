@@ -64,13 +64,11 @@ namespace sunpack::sevenzip
 
     inline InputPrefetchConfig input_prefetch_config() noexcept
     {
+        // These environment variables tune only the generic production default.
+        // Format-specific policies below intentionally take precedence.
         static const InputPrefetchConfig config = []
         {
             InputPrefetchConfig value;
-            if (const char *enabled = std::getenv("SUNPACK_SEVENZIP_PREFETCH"))
-            {
-                value.enabled = enabled[0] != '0';
-            }
             if (const char *window_kib = std::getenv("SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB"))
             {
                 const unsigned long parsed = std::strtoul(window_kib, nullptr, 10);
@@ -93,12 +91,42 @@ namespace sunpack::sevenzip
     }
 
     inline InputPrefetchConfig input_prefetch_config_for_archive(
-        const std::wstring & /* format_hint */,
-        bool /* native_volume_input */) noexcept
+        const std::wstring &format_hint,
+        bool native_volume_input) noexcept
     {
-        // Keep format policy neutral while tuning the new shared-input path.
-        // The global environment switch still disables prefetch explicitly;
-        // formats no longer override it behind the benchmark matrix.
+        std::wstring normalized = format_hint;
+        for (wchar_t &character : normalized)
+        {
+            if (character >= L'A' && character <= L'Z')
+            {
+                character = static_cast<wchar_t>(character - L'A' + L'a');
+            }
+        }
+
+        // Keep the policy deliberately small: only formats with a repeatable
+        // benchmark win override the generic 512 KiB x2 default. Environment
+        // tuning changes that default only; these measured overrides still win.
+        if (normalized == L"zip")
+        {
+            return {true, 128 * 1024, 2};
+        }
+        if (normalized == L"tar")
+        {
+            return {true, 2048 * 1024, 2};
+        }
+        if (native_volume_input &&
+            (normalized == L"rar" || normalized == L"rar4" || normalized == L"rar5"))
+        {
+            return {true, 256 * 1024, 4};
+        }
+        if (normalized == L"xz")
+        {
+            return {true, 1024 * 1024, 4};
+        }
+        if (normalized == L"tzst" || normalized == L"tar.zst")
+        {
+            return {true, 512 * 1024, 1};
+        }
         return input_prefetch_config();
     }
 
@@ -268,9 +296,8 @@ namespace sunpack::sevenzip
 
         bool enabled() const noexcept { return config_.enabled; }
 
-        // Compatibility path used by the strict A/B baseline and by any 7-Zip
-        // component that cannot borrow a span. It deliberately retains the
-        // old copy semantics.
+        // Compatibility path for 7-Zip components that cannot safely borrow
+        // a span. It deliberately retains copy semantics locally.
         bool consume(UInt64 offset, void *data, UInt32 size, ExtractInputTrace *trace)
         {
             if (!config_.enabled || size == 0)
