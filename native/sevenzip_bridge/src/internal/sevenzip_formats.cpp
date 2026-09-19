@@ -234,7 +234,14 @@ namespace sunpack::sevenzip
         {
             ids = {0x07};
         }
-        else if (hint == L"rar" || hint == L"rar4")
+        else if (hint == L"rar")
+        {
+            const auto detected_ids = rar_format_ids_for_paths(archive_path, part_paths);
+            ids = detected_ids.size() == 1
+                      ? detected_ids
+                      : std::vector<unsigned char>{0x03, 0xCC};
+        }
+        else if (hint == L"rar4")
         {
             ids = {0x03, 0xCC};
         }
