@@ -100,8 +100,9 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_USE_PLANNED_IO
     struct PlannedPrefetchConfig
     {
+        // Two large slabs by default: enough overlap for the decoder while keeping ReadFile count low.
         UInt64 buffer_bytes = 32ULL * 1024 * 1024;
-        UInt32 io_bytes = 8U * 1024 * 1024;
+        UInt32 io_bytes = 16U * 1024 * 1024;
     };
 
     inline PlannedPrefetchConfig planned_prefetch_config() noexcept
