@@ -236,12 +236,15 @@ namespace sunpack::sevenzip
     public:
         using Reader = std::function<HRESULT(UInt64, void *, UInt32, UInt32 *)>;
 
-        SequentialPrefetcher(InputPrefetchConfig config, UInt64 virtual_size, Reader reader)
+        SequentialPrefetcher(InputPrefetchConfig config, UInt64 virtual_size, Reader reader, bool start_immediately = true)
             : config_(config), virtual_size_(virtual_size), reader_(std::move(reader))
         {
             if (config_.enabled && virtual_size_)
             {
-                worker_ = std::thread(&SequentialPrefetcher::worker_loop, this);
+                if (start_immediately)
+                {
+                    worker_ = std::thread(&SequentialPrefetcher::worker_loop, this);
+                }
             }
             else
             {
@@ -332,14 +335,12 @@ namespace sunpack::sevenzip
             std::lock_guard lock(mutex_);
             building_plan_ = false;
             planned_mode_ = !plan_.empty();
-            active_ = planned_mode_;
+            // Keep the plan dormant until the decoder's first read. This prevents
+            // multi-volume archives from issuing read-ahead on every volume at once.
+            active_ = false;
             plan_index_ = 0;
             next_offset_ = planned_mode_ ? plan_[0].offset : 0;
             next_chunk_min_size_ = 0;
-            if (planned_mode_)
-            {
-                schedule_locked();
-            }
             ready_.notify_all();
         }
 #endif
@@ -356,6 +357,10 @@ namespace sunpack::sevenzip
             std::unique_lock lock(mutex_);
             auto chunk = find_chunk_locked(offset, size);
 #ifdef SUP7Z_USE_PLANNED_IO
+            if (planned_mode_ && !worker_.joinable())
+            {
+                worker_ = std::thread(&SequentialPrefetcher::worker_loop, this);
+            }
             if (chunk == chunks_.end() && planned_mode_ && rebase_plan_locked(offset, size))
             {
                 schedule_locked();
@@ -801,7 +806,7 @@ namespace sunpack::sevenzip
                 {
                     PathHandle *reader = prefetch_reader_.get();
                     prefetch_ = std::make_unique<SequentialPrefetcher>(worker_prefetch_config, size_, [reader](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
-                                                                       { return reader->read_at(offset, data, read_size, processed); });
+                                                                       { return reader->read_at(offset, data, read_size, processed); }, legacy_prefetch_enabled_);
                 }
                 else
                 {
@@ -1129,7 +1134,7 @@ namespace sunpack::sevenzip
             if (valid_ && total_size_ && worker_prefetch_config.enabled)
             {
                 prefetch_ = std::make_unique<SequentialPrefetcher>(worker_prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
-                                                                   { return read_prefetch_at(offset, data, read_size, processed); });
+                                                                   { return read_prefetch_at(offset, data, read_size, processed); }, legacy_prefetch_enabled_);
             }
             if (trace_ && read_file_timing_enabled())
             {
@@ -1674,7 +1679,7 @@ namespace sunpack::sevenzip
             if (valid_ && total_size_ && worker_prefetch_config.enabled)
             {
                 prefetch_ = std::make_unique<SequentialPrefetcher>(worker_prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
-                                                                   { return read_prefetch_at(offset, data, read_size, processed); });
+                                                                   { return read_prefetch_at(offset, data, read_size, processed); }, legacy_prefetch_enabled_);
             }
             if (trace_ && read_file_timing_enabled())
             {
