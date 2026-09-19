@@ -809,6 +809,22 @@ Byte * CSpecState::Decode(Byte *data, size_t size) throw()
 }
 
 
+#if SUP7Z_USE_SHARED_OUTPUT
+void CDecoder::AbortOutputLease() throw()
+{
+  if (_outLeaseToken && _sharedOutput)
+  {
+    UInt32 ignored = 0;
+    _sharedOutput->Commit(_outLeaseToken, 0, &ignored);
+  }
+  _outLeaseToken = 0;
+  _outBuf = NULL;
+  _outCapacity = 0;
+  _outPos = 0;
+}
+#endif
+
+
 HRESULT CDecoder::AcquireOutputBuffer()
 {
   if (_outBuf)
@@ -986,6 +1002,9 @@ CDecoder::~CDecoder()
 
 #if SUP7Z_USE_SHARED_INPUT
   ReleaseBorrowed();
+#endif
+#if SUP7Z_USE_SHARED_OUTPUT
+  AbortOutputLease();
 #endif
   BigFree(_counters);
   MidFree(_outBufOwned);
@@ -1412,6 +1431,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     return E_OUTOFMEMORY;
 
 #if SUP7Z_USE_SHARED_OUTPUT
+  AbortOutputLease();
   _sharedOutput.Release();
   if (outStream)
     outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&_sharedOutput);
@@ -1453,7 +1473,16 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   if (res != S_OK)
     return res;
 
-  } catch(...) { return E_FAIL; }
+  } catch(...)
+  {
+#if SUP7Z_USE_SHARED_OUTPUT
+    AbortOutputLease();
+    _sharedOutput.Release();
+#endif
+    Base.InStream = NULL;
+    _outStream = NULL;
+    return E_FAIL;
+  }
 
   return _writeRes;
 }
