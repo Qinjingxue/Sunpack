@@ -1354,6 +1354,25 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
+#if SUP7Z_USE_SHARED_INPUT
+            if (fallback_handle_needs_seek_)
+            {
+                LARGE_INTEGER logical_position{};
+                logical_position.QuadPart = static_cast<LONGLONG>(position_);
+                if (!SetFilePointerEx(handle_, logical_position, nullptr, FILE_BEGIN))
+                {
+                    const DWORD error = GetLastError();
+                    const HRESULT hr = HRESULT_FROM_WIN32(error);
+                    if (trace_)
+                    {
+                        trace_->last_hresult = hr;
+                        trace_->last_win32_error = static_cast<int>(error);
+                    }
+                    return hr;
+                }
+                fallback_handle_needs_seek_ = false;
+            }
+#endif
 
             LARGE_INTEGER distance{};
 
