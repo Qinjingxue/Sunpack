@@ -2055,9 +2055,6 @@ private:
     }
 
     void worker_loop() noexcept {
-#ifdef _WIN32
-        const HRESULT com_status = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-#endif
         for (;;) {
             Job job;
             std::size_t admitted_jobs = 0;
@@ -2130,11 +2127,6 @@ private:
             } catch (...) {
             }
         }
-#ifdef _WIN32
-        if (com_status == S_OK || com_status == S_FALSE) {
-            CoUninitialize();
-        }
-#endif
     }
 
     std::vector<std::thread> workers_;

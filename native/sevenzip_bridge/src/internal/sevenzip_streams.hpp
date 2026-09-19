@@ -536,8 +536,10 @@ namespace sunpack::sevenzip
         }
     }
 
-    class FileInStream final : public IInStream
+    class FileInStream final : public CMyUnknownImp, public IInStream
     {
+        Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+        
 
     public:
         explicit FileInStream(
@@ -619,45 +621,6 @@ namespace sunpack::sevenzip
 
         bool is_open() const { return handle_ != INVALID_HANDLE_VALUE; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
-        {
-
-            if (!object)
-            {
-
-                return E_POINTER;
-            }
-
-            *object = nullptr;
-
-            if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_ISequentialInStream) || IsEqualGUID(iid, IID_IInStream))
-            {
-
-                *object = static_cast<IInStream *>(this);
-
-                AddRef();
-
-                return S_OK;
-            }
-
-            return E_NOINTERFACE;
-        }
-
-        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
-
-        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
-        {
-
-            const ULONG refs = InterlockedDecrement(&refs_);
-
-            if (refs == 0)
-            {
-
-                delete this;
-            }
-
-            return refs;
-        }
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
@@ -853,7 +816,6 @@ namespace sunpack::sevenzip
         }
 
     private:
-        LONG refs_ = 1;
 
         std::wstring path_;
 
@@ -871,8 +833,10 @@ namespace sunpack::sevenzip
         std::unique_ptr<SequentialPrefetcher> prefetch_;
     };
 
-    class MultiFileInStream final : public IInStream
+    class MultiFileInStream final : public CMyUnknownImp, public IInStream
     {
+        Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+        
 
     public:
         explicit MultiFileInStream(
@@ -937,45 +901,6 @@ namespace sunpack::sevenzip
 
         bool is_open() const { return valid_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
-        {
-
-            if (!object)
-            {
-
-                return E_POINTER;
-            }
-
-            *object = nullptr;
-
-            if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_ISequentialInStream) || IsEqualGUID(iid, IID_IInStream))
-            {
-
-                *object = static_cast<IInStream *>(this);
-
-                AddRef();
-
-                return S_OK;
-            }
-
-            return E_NOINTERFACE;
-        }
-
-        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
-
-        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
-        {
-
-            const ULONG refs = InterlockedDecrement(&refs_);
-
-            if (refs == 0)
-            {
-
-                delete this;
-            }
-
-            return refs;
-        }
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
@@ -1355,7 +1280,6 @@ namespace sunpack::sevenzip
             cached_handle_position_ = 0;
         }
 
-        LONG refs_ = 1;
 
         std::vector<std::wstring> paths_;
 
@@ -1395,8 +1319,10 @@ namespace sunpack::sevenzip
         UInt64 virtual_offset = 0;
     };
 
-    class MultiRangeInStream final : public IInStream
+    class MultiRangeInStream final : public CMyUnknownImp, public IInStream
     {
+        Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+        
 
     public:
         explicit MultiRangeInStream(
@@ -1491,45 +1417,6 @@ namespace sunpack::sevenzip
 
         bool is_open() const { return valid_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
-        {
-
-            if (!object)
-            {
-
-                return E_POINTER;
-            }
-
-            *object = nullptr;
-
-            if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_ISequentialInStream) || IsEqualGUID(iid, IID_IInStream))
-            {
-
-                *object = static_cast<IInStream *>(this);
-
-                AddRef();
-
-                return S_OK;
-            }
-
-            return E_NOINTERFACE;
-        }
-
-        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
-
-        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
-        {
-
-            const ULONG refs = InterlockedDecrement(&refs_);
-
-            if (refs == 0)
-            {
-
-                delete this;
-            }
-
-            return refs;
-        }
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
@@ -1915,7 +1802,6 @@ namespace sunpack::sevenzip
             cached_handle_position_ = 0;
         }
 
-        LONG refs_ = 1;
 
         std::vector<NormalizedInputRange> ranges_;
 
@@ -1939,7 +1825,7 @@ namespace sunpack::sevenzip
         mutable PathHandleCache prefetch_handles_;
     };
 
-    ComPtr<IInStream> open_archive_stream(
+    CMyComPtr<IInStream> open_archive_stream(
 
         const std::wstring &archive_path,
 

@@ -5,7 +5,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-    ComPtr<IInStream> open_archive_stream(
+    CMyComPtr<IInStream> open_archive_stream(
 
         const std::wstring &archive_path,
 
@@ -42,7 +42,9 @@ namespace sunpack::sevenzip
 
                 opened = stream->is_open();
 
-                return ComPtr<IInStream>(stream);
+                CMyComPtr<IInStream> owner(stream);
+
+                return owner.Detach();
             }
 
             if (volumes.size() > 1)
@@ -52,7 +54,9 @@ namespace sunpack::sevenzip
 
                 opened = stream->is_open();
 
-                return ComPtr<IInStream>(stream);
+                CMyComPtr<IInStream> owner(stream);
+
+                return owner.Detach();
             }
 
             if (volumes.size() == 1)
@@ -62,14 +66,18 @@ namespace sunpack::sevenzip
 
                 opened = stream->is_open();
 
-                return ComPtr<IInStream>(stream);
+                CMyComPtr<IInStream> owner(stream);
+
+                return owner.Detach();
             }
 
             auto *stream = new FileInStream(archive_path, trace, L"file", prefetch_config);
 
             opened = stream->is_open();
 
-            return ComPtr<IInStream>(stream);
+            CMyComPtr<IInStream> owner(stream);
+
+            return owner.Detach();
         }
 
         std::vector<std::wstring> paths = unique_existing_paths(archive_path, part_paths);
@@ -93,14 +101,18 @@ namespace sunpack::sevenzip
 
             opened = stream->is_open();
 
-            return ComPtr<IInStream>(stream);
+            CMyComPtr<IInStream> owner(stream);
+
+            return owner.Detach();
         }
 
         auto *stream = new FileInStream(archive_path, trace, L"file", prefetch_config);
 
         opened = stream->is_open();
 
-        return ComPtr<IInStream>(stream);
+        CMyComPtr<IInStream> owner(stream);
+
+        return owner.Detach();
     }
 
     std::wstring callback_archive_path(const std::wstring &archive_path, const std::vector<std::wstring> &part_paths)

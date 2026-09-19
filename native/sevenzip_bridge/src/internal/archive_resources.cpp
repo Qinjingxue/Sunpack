@@ -36,9 +36,9 @@ namespace sunpack::sevenzip
         for (const GUID &format : candidate_formats(archive_path, part_paths))
         {
 
-            ComPtr<IInArchive> archive;
+            CMyComPtr<IInArchive> archive;
 
-            HRESULT hr = create_in_archive(format, archive.out());
+            HRESULT hr = create_in_archive(format, &archive);
 
             if (hr != S_OK || !archive)
             {
@@ -52,7 +52,7 @@ namespace sunpack::sevenzip
 
             bool stream_opened = false;
 
-            ComPtr<IInStream> stream = open_archive_stream(archive_path, part_paths, stream_opened);
+            CMyComPtr<IInStream> stream = open_archive_stream(archive_path, part_paths, stream_opened);
 
             if (!stream_opened)
             {
@@ -65,9 +65,9 @@ namespace sunpack::sevenzip
             }
 
             auto *raw_open_callback = new OpenCallback(password, callback_archive_path(archive_path, part_paths), part_paths);
-            ComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
+            CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
-            hr = archive->Open(stream.get(), nullptr, open_callback.get());
+            hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
             last_encryption_evidence = raw_open_callback->password_requested();
 
             if (hr != S_OK)
@@ -78,7 +78,7 @@ namespace sunpack::sevenzip
                 continue;
             }
 
-            const bool ok = fill_resource_analysis_from_open_archive(archive.get(), result);
+            const bool ok = fill_resource_analysis_from_open_archive(archive.Interface(), result);
 
             archive->Close();
 

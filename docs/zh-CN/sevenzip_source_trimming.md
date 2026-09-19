@@ -851,3 +851,91 @@ Ole32 链接依赖退出（OleAut32 要留：SysAllocString / PROPVARIANT / Vari
 ```
 
 本轮刻意停在这里：refcount 语义变更与类型迁移混在一起会让 refcount bug 难以定位。
+
+---
+
+## 16. 修复：IProgress 的 QueryInterface 语义回归
+
+### 16.1 问题
+
+§15.2 把 `ExtractCallback` 与 `ExtractToDiskCallback` 迁成宏时，QI 集合写成：
+
+```cpp
+Z7_COM_UNKNOWN_IMP_2(IArchiveExtractCallback, ICryptoGetTextPassword)
+```
+
+但重构前这两个类的 `QueryInterface` 明确接受 4 个 IID：
+
+```text
+IID_IUnknown                    ← Z7_COM_QI_ENTRY_UNKNOWN 覆盖
+IID_IProgress                   ← 丢了
+IID_IArchiveExtractCallback
+IID_ICryptoGetTextPassword
+```
+
+**`Z7_COM_UNKNOWN_IMP_N` 只为传入的 IID 生成 entry，不会沿 C++ 基类向上补全。**
+所以 `QI(IID_IProgress)` 由 `S_OK` 变成 `E_NOINTERFACE`。
+
+### 16.2 严重程度：语义回归，不是功能 bug
+
+已核实 **上游 7-Zip 源码中不存在任何针对 `IProgress` 的 `QueryInterface`**
+（`grep QueryInterface|IsEqualGUID|== IID_` + `IProgress` 命中 0）。
+handler 是通过 `IArchiveExtractCallback*` 的 vtable 直接调用 `SetTotal`/`SetCompleted` 的。
+所以 8/8 验收测不到这条路径，行为也没变。
+
+但**契约既然声明过就必须保住**：这类"恰好没人调用"的缺口一旦将来被调用方依赖，
+排查成本极高。所以按最小改动修复。
+
+### 16.3 修复
+
+```cpp
+Z7_COM_UNKNOWN_IMP_3(IArchiveExtractCallback, IProgress, ICryptoGetTextPassword)
+```
+
+两处（`ExtractCallback`、`ExtractToDiskCallback`）。
+`IProgress *ti = this;` 合法，因为 `IArchiveExtractCallback` 本身继承 `IProgress`。
+
+### 16.4 新增契约测试：`tests/com_contract.cpp`
+
+`ctest` 第 5 个用例 `sunpack_sevenzip_com_contract`，覆盖：
+
+```text
+ExtractCallback          QI(IUnknown/IProgress/IArchiveExtractCallback/ICryptoGetTextPassword) == S_OK
+                         QI(无关 IID) == E_NOINTERFACE
+                         QI(IProgress) 结果可调用 SetTotal
+ExtractToDiskCallback    同上
+OpenCallback             QI(IUnknown/IArchiveOpenCallback/IArchiveOpenVolumeCallback/ICryptoGetTextPassword) == S_OK
+FileInStream             QI(IUnknown/ISequentialInStream/IInStream) == S_OK
+MultiRangeInStream       QI(ISequentialInStream/IInStream) == S_OK
+```
+
+两点实现说明：
+
+- 生成的 `QueryInterface` 是 **private**（宏以 `private:` 开头），所以测试统一通过
+  `IUnknown*` 调用——这也正是 7-Zip handler 触达它的方式。
+- 测试**确实能抓到本次回归**：把宏退回 `_2` 并干净重建后，报 3 项失败
+  （`QI(IProgress) == S_OK` ×2 + `SetTotal callable`）。
+
+### 16.5 一个值得记住的构建陷阱
+
+验证过程中出现过"同一份代码，一个二进制通过、另一个失败"的假象，浪费了不少排查时间。
+根因是**增量构建没有重新编译 `sunpack_sevenzip_core` 里的 `sevenzip_callbacks.hpp` TU**，
+旧 `.obj` 被继续使用。删除整个 `build-x64` 从零重建后行为立刻一致。
+
+结论：**改了 bridge 头文件后，若要验证运行期行为，必须干净重建**，
+否则会看到与源码不符的结果。
+
+### 16.6 验证
+
+| 验证 | 结果 |
+|------|------|
+| 干净全量重建（删除 build-x64） | 通过 |
+| `ctest` | 5/5 通过（含新契约测试） |
+| `pytest tests/unit tests/cli` | 1128 通过 |
+| `run_acceptance_tests.ps1 -Arch x64` | 8/8 步骤全部 PASS |
+| 契约测试抓回归能力 | 回退宏后 3 项失败，符合预期 |
+
+> 附注：本轮验收第一次运行时有 1 个用例失败
+> （`test_watch_root_output_routing.py`，`.sunpack-partial-*` 目录缺失），
+> 单独与并行重跑均通过，第二次完整验收 8/8 通过——判定为既有竞态 flake，
+> 与本次改动无关。本次改动已核实为行为惰性（上游不 QI `IProgress`）。

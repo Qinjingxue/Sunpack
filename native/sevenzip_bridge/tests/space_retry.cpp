@@ -880,13 +880,14 @@ void r10_directory_retry_and_memo(const std::filesystem::path &directory) {
     check(std::filesystem::is_directory(blocked_path), "R-10: 目录必须真的被创建");
     set_directory_failure_classifier_for_test(nullptr);
 
-    // ③ memo 不投毒：一次失败的目录创建绝不能被 memo 记住。
-    //    用 dry_run 构造 callback（不触碰 writer / 归档），只驱动 ensure_directory。
     {
         ExtractOutputTrace trace;
-        auto* callback = new ExtractToDiskCallback(
+
+        auto *callback_raw = new ExtractToDiskCallback(
             nullptr, L"", directory.wstring(), std::vector<std::wstring>{},
             ExtractProgressCallback{}, true, &trace, 4);
+        CMyComPtr<IArchiveExtractCallback> callback_owner(callback_raw);
+        auto *callback = callback_raw;
         check(callback != nullptr, "R-10: callback 必须构造成功");
 
         const auto memo_path = (directory / L"r10-memo-dir").wstring();
@@ -912,7 +913,6 @@ void r10_directory_retry_and_memo(const std::filesystem::path &directory) {
         int third_code = 0;
         check(callback->ensure_directory_for_test(memo_path, &third_code),
               "R-10: 成功之后必须被 memo（幂等快路径）");
-        callback->Release();
     }
 }
 

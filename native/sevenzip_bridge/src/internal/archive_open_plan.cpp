@@ -81,7 +81,7 @@ std::vector<ArchiveOpenPlan> password_test_open_plans(
     return embedded;
 }
 
-ComPtr<IInStream> open_stream_for_plan(
+CMyComPtr<IInStream> open_stream_for_plan(
     const ArchiveOpenPlan& plan,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
@@ -90,7 +90,9 @@ ComPtr<IInStream> open_stream_for_plan(
     if (plan.uses_ranges()) {
         auto* range_stream = new MultiRangeInStream(plan.ranges);
         stream_opened = range_stream->is_open();
-        return ComPtr<IInStream>(range_stream);
+        CMyComPtr<IInStream> owner(range_stream);
+
+        return owner.Detach();
     }
     return open_archive_stream(archive_path, part_paths, stream_opened);
 }

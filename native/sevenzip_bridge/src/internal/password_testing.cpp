@@ -241,9 +241,9 @@ namespace sunpack::sevenzip
             for (const GUID &format : plan.formats)
             {
 
-                ComPtr<IInArchive> archive;
+                CMyComPtr<IInArchive> archive;
 
-                HRESULT hr = create_in_archive(format, archive.out());
+                HRESULT hr = create_in_archive(format, &archive);
 
                 if (hr != S_OK || !archive)
                 {
@@ -257,7 +257,7 @@ namespace sunpack::sevenzip
 
                 bool stream_opened = false;
 
-                ComPtr<IInStream> stream = open_stream_for_plan(plan, archive_path, part_paths, stream_opened);
+                CMyComPtr<IInStream> stream = open_stream_for_plan(plan, archive_path, part_paths, stream_opened);
 
                 if (!stream_opened)
                 {
@@ -282,9 +282,9 @@ namespace sunpack::sevenzip
 
                 const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
                 auto *raw_open_callback = new OpenCallback(password, callback_path, part_paths, canonical_names);
-                ComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
+                CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
-                hr = archive->Open(stream.get(), nullptr, open_callback.get());
+                hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
                 last_encryption_evidence = raw_open_callback->password_requested();
 
                 if (raw_open_callback->missing_volume_requested())
@@ -317,15 +317,15 @@ namespace sunpack::sevenzip
 
                 any_opened = true;
                 result.is_archive = true;
-                last_encryption_evidence = last_encryption_evidence || archive_has_encrypted_items(archive.get());
+                last_encryption_evidence = last_encryption_evidence || archive_has_encrypted_items(archive.Interface());
                 result.encrypted = result.encrypted || last_encryption_evidence;
                 result.password_required = result.password_required || last_encryption_evidence;
 
                 auto *raw_extract_callback = new ExtractCallback(password);
 
-                ComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
+                CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
-                const auto probe_selection = bounded_password_probe_selection(archive.get());
+                const auto probe_selection = bounded_password_probe_selection(archive.Interface());
 
                 if (bounded_password_probe && probe_selection.indices.empty())
                 {
@@ -350,7 +350,7 @@ namespace sunpack::sevenzip
                             nullptr,
                             static_cast<UInt32>(kAllItems),
                             kTestMode,
-                            extract_callback.get());
+                            extract_callback.Interface());
                         last_op_res = raw_extract_callback->operation_result();
                         result.operation_result = last_op_res;
                         last_encryption_evidence = last_encryption_evidence || raw_extract_callback->password_requested();
@@ -378,7 +378,7 @@ namespace sunpack::sevenzip
 
                         kTestMode,
 
-                        extract_callback.get());
+                        extract_callback.Interface());
 
                     last_op_res = raw_extract_callback->operation_result();
                     result.operation_result = last_op_res;
@@ -541,9 +541,9 @@ namespace sunpack::sevenzip
         for (const GUID &format : formats)
         {
 
-            ComPtr<IInArchive> archive;
+            CMyComPtr<IInArchive> archive;
 
-            HRESULT hr = create_in_archive(format, archive.out());
+            HRESULT hr = create_in_archive(format, &archive);
 
             if (hr != S_OK || !archive)
             {
@@ -556,9 +556,9 @@ namespace sunpack::sevenzip
             any_format_created = true;
 
             auto *raw_open_callback = new OpenCallback(password, callback_archive_path(archive_path, part_paths), part_paths);
-            ComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
+            CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
-            hr = archive->Open(stream, nullptr, open_callback.get());
+            hr = archive->Open(stream, nullptr, open_callback.Interface());
             last_encryption_evidence = raw_open_callback->password_requested();
 
             if (raw_open_callback->missing_volume_requested())
@@ -589,15 +589,15 @@ namespace sunpack::sevenzip
 
             any_opened = true;
             result.is_archive = true;
-            last_encryption_evidence = last_encryption_evidence || archive_has_encrypted_items(archive.get());
+            last_encryption_evidence = last_encryption_evidence || archive_has_encrypted_items(archive.Interface());
             result.encrypted = result.encrypted || last_encryption_evidence;
             result.password_required = result.password_required || last_encryption_evidence;
 
             auto *raw_extract_callback = new ExtractCallback(password);
 
-            ComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
+            CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
-            hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), kTestMode, extract_callback.get());
+            hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), kTestMode, extract_callback.Interface());
 
             last_hr = hr;
 

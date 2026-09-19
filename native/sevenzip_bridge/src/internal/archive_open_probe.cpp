@@ -65,8 +65,8 @@ ArchiveOpenProbeResult probe_archive_open_internal(
         {});
     for (const auto& plan : plans) {
         for (const GUID& format : plan.formats) {
-        ComPtr<IInArchive> archive;
-        HRESULT hr = create_in_archive(format, archive.out());
+        CMyComPtr<IInArchive> archive;
+        HRESULT hr = create_in_archive(format, &archive);
         if (hr != S_OK || !archive) {
             last_hr = hr;
             continue;
@@ -74,7 +74,7 @@ ArchiveOpenProbeResult probe_archive_open_internal(
         any_format_created = true;
 
         bool stream_opened = false;
-        ComPtr<IInStream> stream = open_stream_for_plan(plan, archive_path, part_paths, stream_opened);
+        CMyComPtr<IInStream> stream = open_stream_for_plan(plan, archive_path, part_paths, stream_opened);
         if (!stream_opened) {
             if (is_sfx_path(archive_path) && !sorted_data_volume_paths(part_paths).empty()) {
                 result.status = PasswordTestStatus::Damaged;
@@ -98,8 +98,8 @@ ArchiveOpenProbeResult probe_archive_open_internal(
             password,
             callback_archive_path(archive_path, part_paths),
             part_paths);
-        ComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
-        hr = archive->Open(stream.get(), nullptr, open_callback.get());
+        CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
+        hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
         last_encryption_evidence = raw_open_callback->password_requested();
 
         if (raw_open_callback->missing_volume_requested()) {
@@ -137,7 +137,7 @@ ArchiveOpenProbeResult probe_archive_open_internal(
 
         result.is_archive = true;
         result.operation_result = kOpOk;
-        const bool opened_as_encrypted = archive_has_encrypted_items(archive.get());
+        const bool opened_as_encrypted = archive_has_encrypted_items(archive.Interface());
         last_encryption_evidence = last_encryption_evidence || opened_as_encrypted;
         result.encrypted = opened_as_encrypted || raw_open_callback->password_requested();
         result.password_required = result.encrypted;

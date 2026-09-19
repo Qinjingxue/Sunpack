@@ -1,6 +1,9 @@
 #pragma once
 
+
 #define SUP7Z_NOEXCEPT noexcept
+
+#define Z7_COM_USE_ATOMIC
 
 #include "archive_operations.hpp"
 
@@ -19,6 +22,9 @@
 #include "7zip/IProgress.h"
 #include "7zip/IStream.h"
 #include "7zip/PropID.h"
+
+
+#include "Common/MyCom.h"
 
 #endif
 
@@ -98,56 +104,7 @@ namespace sunpack::sevenzip
     using ::ISequentialInStream;
     using ::ISequentialOutStream;
 
-    template <typename T>
 
-    class ComPtr
-    {
-
-    public:
-        ComPtr() = default;
-
-        explicit ComPtr(T *ptr) : ptr_(ptr) {}
-
-        ~ComPtr() { reset(); }
-
-        ComPtr(const ComPtr &) = delete;
-
-        ComPtr &operator=(const ComPtr &) = delete;
-
-        T *get() const { return ptr_; }
-
-        T **out()
-        {
-
-            reset();
-
-            return &ptr_;
-        }
-
-        T *operator->() const { return ptr_; }
-
-        explicit operator bool() const { return ptr_ != nullptr; }
-
-        void reset()
-        {
-
-            if (ptr_)
-            {
-
-                ptr_->Release();
-
-                ptr_ = nullptr;
-            }
-        }
-
-    private:
-        T *ptr_ = nullptr;
-    };
-
-    // Upstream's archive factory, taken straight from the bundled sources
-    // (CPP/7zip/Archive/ArchiveExports.cpp). SunPack only ever creates
-    // IInArchive, so the old CreateObject() DLL entry point — which also
-    // dispatched coder and hasher requests — is not needed.
     HRESULT create_in_archive(const GUID &format, IInArchive **archive);
 
 #endif

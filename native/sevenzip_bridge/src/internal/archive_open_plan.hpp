@@ -39,7 +39,7 @@ std::vector<ArchiveOpenPlan> password_test_open_plans(
     const std::vector<ExtractInputRange>& input_ranges
 );
 
-ComPtr<IInStream> open_stream_for_plan(
+CMyComPtr<IInStream> open_stream_for_plan(
     const ArchiveOpenPlan& plan,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,

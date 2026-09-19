@@ -324,9 +324,9 @@ namespace sunpack::sevenzip
 
             attempt.format = format_name_for_guid(format);
 
-            ComPtr<IInArchive> archive;
+            CMyComPtr<IInArchive> archive;
 
-            HRESULT hr = create_in_archive(format, archive.out());
+            HRESULT hr = create_in_archive(format, &archive);
 
             attempt.create_hresult = static_cast<int>(hr);
 
@@ -346,7 +346,7 @@ namespace sunpack::sevenzip
 
             bool stream_opened = false;
 
-            ComPtr<IInStream> stream = [&]()
+            CMyComPtr<IInStream> stream = [&]() -> CMyComPtr<IInStream>
             {
                 if (!input_ranges.empty())
                 {
@@ -355,7 +355,9 @@ namespace sunpack::sevenzip
 
                     stream_opened = range_stream->is_open();
 
-                    return ComPtr<IInStream>(range_stream);
+                    // CMyComPtr's raw-pointer constructor performs the AddRef
+                    // that gives the object its first reference.
+                    return CMyComPtr<IInStream>(range_stream);
                 }
 
                 return open_archive_stream(
@@ -383,9 +385,9 @@ namespace sunpack::sevenzip
 
             const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
             auto *raw_open_callback = new OpenCallback(password, callback_path, part_paths, canonical_names);
-            ComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
+            CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
-            hr = archive->Open(stream.get(), nullptr, open_callback.get());
+            hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
             last_encryption_evidence = raw_open_callback->password_requested();
 
             if (raw_open_callback->missing_volume_requested())
@@ -445,7 +447,7 @@ namespace sunpack::sevenzip
             result.archive_type = !format_hint.empty() ? format_hint : archive_type_for_path(archive_path);
 
             auto *raw_extract_callback = new ExtractToDiskCallback(
-                archive.get(),
+                archive.Interface(),
                 password,
                 output_dir,
                 decoded_names,
@@ -457,9 +459,9 @@ namespace sunpack::sevenzip
                 job_buffer_budget,
                 std::move(cancel_token));
 
-            ComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
+            CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
-            hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.get());
+            hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
 
             // Extraction success must not be published before every queued write and close
             // has finished and any delayed filesystem error has been folded back in.

@@ -95,8 +95,10 @@ namespace sunpack::sevenzip
         return crc;
     }
 
-    class OpenCallback final : public IArchiveOpenCallback, public IArchiveOpenVolumeCallback, public ICryptoGetTextPassword
+    class OpenCallback final : public CMyUnknownImp, public IArchiveOpenCallback, public IArchiveOpenVolumeCallback, public ICryptoGetTextPassword
     {
+        Z7_COM_UNKNOWN_IMP_3(IArchiveOpenCallback, IArchiveOpenVolumeCallback, ICryptoGetTextPassword)
+        
 
     public:
         explicit OpenCallback(std::wstring password, std::wstring archive_path = L"", std::vector<std::wstring> part_paths = {}, std::vector<std::wstring> canonical_names = {})
@@ -148,58 +150,6 @@ namespace sunpack::sevenzip
             }
         }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
-        {
-
-            if (!object)
-            {
-
-                return E_POINTER;
-            }
-
-            *object = nullptr;
-
-            if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_IArchiveOpenCallback))
-            {
-
-                *object = static_cast<IArchiveOpenCallback *>(this);
-            }
-            else if (IsEqualGUID(iid, IID_IArchiveOpenVolumeCallback))
-            {
-
-                *object = static_cast<IArchiveOpenVolumeCallback *>(this);
-            }
-            else if (IsEqualGUID(iid, IID_ICryptoGetTextPassword))
-            {
-
-                *object = static_cast<ICryptoGetTextPassword *>(this);
-            }
-            else
-            {
-
-                return E_NOINTERFACE;
-            }
-
-            AddRef();
-
-            return S_OK;
-        }
-
-        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
-
-        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
-        {
-
-            const ULONG refs = InterlockedDecrement(&refs_);
-
-            if (refs == 0)
-            {
-
-                delete this;
-            }
-
-            return refs;
-        }
 
         HRESULT STDMETHODCALLTYPE SetTotal(const UInt64 *, const UInt64 *) SUP7Z_NOEXCEPT override { return S_OK; }
 
@@ -265,18 +215,22 @@ namespace sunpack::sevenzip
                 return E_FAIL;
             }
 
-            auto *stream = new FileInStream(found->second);
+            // CMyComPtr's raw-pointer constructor AddRefs, giving the object its
+            // first reference. The holder also releases it on every early return.
+            CMyComPtr<IInStream> stream_holder(new FileInStream(found->second));
+            auto *stream = static_cast<FileInStream *>(stream_holder.Interface());
 
             if (!stream->is_open())
             {
                 volume_open_failed_ = true;
                 failed_volume_name_ = std::filesystem::path(found->second).filename().wstring();
-                stream->Release();
 
                 return E_FAIL;
             }
 
-            *inStream = stream;
+            // The holder's reference is the one being handed over, so Detach
+            // instead of AddRef: ownership moves to the caller untouched.
+            *inStream = stream_holder.Detach();
 
             return S_OK;
         }
@@ -312,7 +266,6 @@ namespace sunpack::sevenzip
             return value;
         }
 
-        LONG refs_ = 1;
 
         std::wstring password_;
 
@@ -329,8 +282,10 @@ namespace sunpack::sevenzip
         std::wstring failed_volume_name_;
     };
 
-    class ExtractCallback final : public IArchiveExtractCallback, public ICryptoGetTextPassword
+    class ExtractCallback final : public CMyUnknownImp, public IArchiveExtractCallback, public ICryptoGetTextPassword
     {
+        Z7_COM_UNKNOWN_IMP_3(IArchiveExtractCallback, IProgress, ICryptoGetTextPassword)
+        
 
     public:
         explicit ExtractCallback(std::wstring password) : password_(std::move(password)) {}
@@ -338,53 +293,6 @@ namespace sunpack::sevenzip
         Int32 operation_result() const { return operation_result_; }
         bool password_requested() const { return password_requested_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
-        {
-
-            if (!object)
-            {
-
-                return E_POINTER;
-            }
-
-            *object = nullptr;
-
-            if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_IProgress) || IsEqualGUID(iid, IID_IArchiveExtractCallback))
-            {
-
-                *object = static_cast<IArchiveExtractCallback *>(this);
-            }
-            else if (IsEqualGUID(iid, IID_ICryptoGetTextPassword))
-            {
-
-                *object = static_cast<ICryptoGetTextPassword *>(this);
-            }
-            else
-            {
-
-                return E_NOINTERFACE;
-            }
-
-            AddRef();
-
-            return S_OK;
-        }
-
-        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
-
-        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
-        {
-
-            const ULONG refs = InterlockedDecrement(&refs_);
-
-            if (refs == 0)
-            {
-
-                delete this;
-            }
-
-            return refs;
-        }
 
         HRESULT STDMETHODCALLTYPE SetTotal(UInt64) SUP7Z_NOEXCEPT override { return S_OK; }
 
@@ -430,7 +338,6 @@ namespace sunpack::sevenzip
         }
 
     private:
-        LONG refs_ = 1;
 
         std::wstring password_;
 
@@ -438,8 +345,10 @@ namespace sunpack::sevenzip
         bool password_requested_ = false;
     };
 
-    class SynchronousFileOutStream final : public ISequentialOutStream
+    class SynchronousFileOutStream final : public CMyUnknownImp, public ISequentialOutStream
     {
+        Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+        
 
     public:
         explicit SynchronousFileOutStream(const std::wstring &path, ExtractOutputTrace *trace = nullptr, std::size_t item_trace_index = 0)
@@ -481,48 +390,6 @@ namespace sunpack::sevenzip
 
         UInt64 bytes_written() const { return bytes_written_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
-        {
-
-            if (!object)
-            {
-
-                return E_POINTER;
-            }
-
-            *object = nullptr;
-
-            if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_ISequentialOutStream))
-            {
-
-                *object = static_cast<IUnknown *>(this);
-            }
-            else
-            {
-
-                return E_NOINTERFACE;
-            }
-
-            AddRef();
-
-            return S_OK;
-        }
-
-        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
-
-        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
-        {
-
-            const ULONG refs = InterlockedDecrement(&refs_);
-
-            if (refs == 0)
-            {
-
-                delete this;
-            }
-
-            return refs;
-        }
 
         HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
@@ -632,7 +499,6 @@ namespace sunpack::sevenzip
             item.win32_error = win32_error;
         }
 
-        LONG refs_ = 1;
 
         ExtractOutputTrace *trace_ = nullptr;
 
@@ -647,8 +513,10 @@ namespace sunpack::sevenzip
         UInt32 crc32_ = 0xFFFFFFFFU;
     };
 
-    class AsyncFileOutStream final : public ISequentialOutStream
+    class AsyncFileOutStream final : public CMyUnknownImp, public ISequentialOutStream
     {
+        Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+        
 
     public:
         AsyncFileOutStream(
@@ -670,36 +538,6 @@ namespace sunpack::sevenzip
             }
         }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
-        {
-            if (!object)
-            {
-                return E_POINTER;
-            }
-            *object = nullptr;
-            if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_ISequentialOutStream))
-            {
-                *object = static_cast<IUnknown *>(this);
-            }
-            else
-            {
-                return E_NOINTERFACE;
-            }
-            AddRef();
-            return S_OK;
-        }
-
-        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
-
-        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
-        {
-            const ULONG refs = InterlockedDecrement(&refs_);
-            if (refs == 0)
-            {
-                delete this;
-            }
-            return refs;
-        }
 
         HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
@@ -732,7 +570,6 @@ namespace sunpack::sevenzip
         }
 
     private:
-        LONG refs_ = 1;
         std::shared_ptr<AsyncFileWriter> writer_;
         AsyncFileWriter::FileStatePtr file_;
         bool compute_crc_ = false;
@@ -741,8 +578,10 @@ namespace sunpack::sevenzip
         std::mutex mutex_;
     };
 
-    class TraceOutStream final : public ISequentialOutStream
+    class TraceOutStream final : public CMyUnknownImp, public ISequentialOutStream
     {
+        Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+        
 
     public:
         explicit TraceOutStream(ExtractOutputTrace *trace = nullptr, std::size_t item_trace_index = 0)
@@ -756,48 +595,6 @@ namespace sunpack::sevenzip
 
         UInt64 bytes_written() const { return bytes_written_; }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
-        {
-
-            if (!object)
-            {
-
-                return E_POINTER;
-            }
-
-            *object = nullptr;
-
-            if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_ISequentialOutStream))
-            {
-
-                *object = static_cast<IUnknown *>(this);
-            }
-            else
-            {
-
-                return E_NOINTERFACE;
-            }
-
-            AddRef();
-
-            return S_OK;
-        }
-
-        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
-
-        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
-        {
-
-            const ULONG refs = InterlockedDecrement(&refs_);
-
-            if (refs == 0)
-            {
-
-                delete this;
-            }
-
-            return refs;
-        }
 
         HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
@@ -847,7 +644,6 @@ namespace sunpack::sevenzip
         }
 
     private:
-        LONG refs_ = 1;
 
         ExtractOutputTrace *trace_ = nullptr;
 
@@ -949,8 +745,10 @@ namespace sunpack::sevenzip
         return normalized;
     }
 
-    class ExtractToDiskCallback final : public IArchiveExtractCallback, public ICryptoGetTextPassword
+    class ExtractToDiskCallback final : public CMyUnknownImp, public IArchiveExtractCallback, public ICryptoGetTextPassword
     {
+        Z7_COM_UNKNOWN_IMP_3(IArchiveExtractCallback, IProgress, ICryptoGetTextPassword)
+        
 
     public:
         ExtractToDiskCallback(
@@ -1154,53 +952,6 @@ namespace sunpack::sevenzip
             }
         }
 
-        HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, void **object) SUP7Z_NOEXCEPT override
-        {
-
-            if (!object)
-            {
-
-                return E_POINTER;
-            }
-
-            *object = nullptr;
-
-            if (IsEqualGUID(iid, IID_IUnknown) || IsEqualGUID(iid, IID_IProgress) || IsEqualGUID(iid, IID_IArchiveExtractCallback))
-            {
-
-                *object = static_cast<IArchiveExtractCallback *>(this);
-            }
-            else if (IsEqualGUID(iid, IID_ICryptoGetTextPassword))
-            {
-
-                *object = static_cast<ICryptoGetTextPassword *>(this);
-            }
-            else
-            {
-
-                return E_NOINTERFACE;
-            }
-
-            AddRef();
-
-            return S_OK;
-        }
-
-        ULONG STDMETHODCALLTYPE AddRef() SUP7Z_NOEXCEPT override { return InterlockedIncrement(&refs_); }
-
-        ULONG STDMETHODCALLTYPE Release() SUP7Z_NOEXCEPT override
-        {
-
-            const ULONG refs = InterlockedDecrement(&refs_);
-
-            if (refs == 0)
-            {
-
-                delete this;
-            }
-
-            return refs;
-        }
 
         HRESULT STDMETHODCALLTYPE SetTotal(UInt64 total) SUP7Z_NOEXCEPT override
         {
@@ -1468,7 +1219,11 @@ namespace sunpack::sevenzip
             if (dry_run_)
             {
 
-                *outStream = new TraceOutStream(output_trace_, current_trace_index_);
+                // Objects start at refcount 0, so the CMyComPtr constructor
+                // performs the first AddRef and Detach hands that single owned
+                // reference to 7-Zip, which will Release it.
+                CMyComPtr<ISequentialOutStream> stream_owner(new TraceOutStream(output_trace_, current_trace_index_));
+                *outStream = stream_owner.Detach();
 
                 return S_OK;
             }
@@ -1484,7 +1239,9 @@ namespace sunpack::sevenzip
             current_async_file_ = async_writer_->make_file(async_job_,
                                                            target.wstring(), name, index, current_trace_index_);
             async_files_.push_back(current_async_file_);
-            *outStream = new AsyncFileOutStream(async_writer_, current_async_file_, compute_crc);
+
+            CMyComPtr<ISequentialOutStream> stream_owner(new AsyncFileOutStream(async_writer_, current_async_file_, compute_crc));
+            *outStream = stream_owner.Detach();
 
             return S_OK;
         }
@@ -1848,7 +1605,6 @@ namespace sunpack::sevenzip
             progress_(progress);
         }
 
-        LONG refs_ = 1;
 
         IInArchive *archive_ = nullptr;
 
