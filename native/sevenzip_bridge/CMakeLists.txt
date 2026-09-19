@@ -42,33 +42,10 @@ option(SUP7Z_USE_X64_ASM
 option(SUP7Z_USE_ARM64_ASM
     "Use upstream 7-Zip ARM64 LZMA decoder assembly hot path"
     ON)
-option(SUP7Z_USE_SHARED_INPUT
-    "Let embedded 7-Zip decoders borrow SunPack prefetch buffers instead of copying them"
-    ON)
-
-if(SUP7Z_USE_SHARED_INPUT)
-    add_compile_definitions(SUP7Z_USE_SHARED_INPUT=1)
-else()
-    add_compile_definitions(SUP7Z_USE_SHARED_INPUT=0)
-endif()
-
-# Strict A/B: the compile-time switch removes the borrowed-input hot path
-# entirely when OFF. Keep ON/OFF builds in different directories so benchmark
-# results can never reuse objects produced with the other code path.
-set(SUP7Z_SHARED_INPUT_LAST_SELECTION_FILE
-    "${CMAKE_BINARY_DIR}/sup7z_shared_input_last_selection.txt")
-if(EXISTS "${SUP7Z_SHARED_INPUT_LAST_SELECTION_FILE}")
-    file(READ "${SUP7Z_SHARED_INPUT_LAST_SELECTION_FILE}" SUP7Z_SHARED_INPUT_LAST_SELECTION)
-    string(STRIP "${SUP7Z_SHARED_INPUT_LAST_SELECTION}" SUP7Z_SHARED_INPUT_LAST_SELECTION)
-    if(NOT SUP7Z_SHARED_INPUT_LAST_SELECTION STREQUAL "${SUP7Z_USE_SHARED_INPUT}")
-        message(FATAL_ERROR
-            "SUP7Z_USE_SHARED_INPUT changed from '${SUP7Z_SHARED_INPUT_LAST_SELECTION}' to "
-            "'${SUP7Z_USE_SHARED_INPUT}' in the same build directory. Use separate "
-            "build-shared-input-on / build-shared-input-off directories for strict A/B.")
-    endif()
-endif()
-file(WRITE "${SUP7Z_SHARED_INPUT_LAST_SELECTION_FILE}" "${SUP7Z_USE_SHARED_INPUT}")
-message(STATUS "7-Zip shared input buffers: ${SUP7Z_USE_SHARED_INPUT}")
+# Shared input is a fixed part of the worker architecture. Decoder-specific
+# copy fallbacks remain where borrowed spans are not safe, but there is no
+# whole-build switch back to the pre-optimization memcpy baseline.
+add_compile_definitions(SUP7Z_USE_SHARED_INPUT=1)
 
 set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)
@@ -513,6 +490,22 @@ if(WIN32)
     target_link_libraries(sunpack_launcher PRIVATE Shell32)
 endif()
 
+# Lock the measured production prefetch policy and the rule that environment
+# overrides tune only the generic default.
+if(WIN32)
+    add_executable(sunpack_sevenzip_prefetch_policy
+        tests/prefetch_policy.cpp
+    )
+    apply_release_optimizations(sunpack_sevenzip_prefetch_policy)
+    apply_source_charset(sunpack_sevenzip_prefetch_policy)
+    target_include_directories(sunpack_sevenzip_prefetch_policy
+        PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/src
+            ${SUP7Z_7Z_ROOT}/CPP
+    )
+    target_compile_definitions(sunpack_sevenzip_prefetch_policy PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
 # QueryInterface contract for the callback/stream objects handed to 7-Zip.
 # Upstream's Z7_COM_UNKNOWN_IMP_N macro emits an entry only for the IIDs it is
 # given -- it does not walk the C++ base classes -- so a parent interface such
@@ -537,3 +530,6 @@ add_test(NAME sunpack_sevenzip_async_output COMMAND sunpack_sevenzip_async_outpu
 add_test(NAME sunpack_sevenzip_space_gate COMMAND sunpack_sevenzip_space_gate)
 add_test(NAME sunpack_sevenzip_space_retry COMMAND sunpack_sevenzip_space_retry)
 add_test(NAME sunpack_sevenzip_com_contract COMMAND sunpack_sevenzip_com_contract)
+if(WIN32)
+    add_test(NAME sunpack_sevenzip_prefetch_policy COMMAND sunpack_sevenzip_prefetch_policy)
+endif()
