@@ -4,6 +4,10 @@
 
 #include "sevenzip_sdk.hpp"
 
+#if SUP7Z_USE_SHARED_INPUT
+#include "7zip/Common/SunpackSharedInput.h"
+#endif
+
 #ifdef _WIN32
 
 #include <algorithm>
@@ -1045,8 +1049,15 @@ namespace sunpack::sevenzip
     }
 
     class FileInStream final : public CMyUnknownImp, public IInStream
+#if SUP7Z_USE_SHARED_INPUT
+        , public ISunpackSharedInput
+#endif
     {
+#if SUP7Z_USE_SHARED_INPUT
+        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, ISunpackSharedInput)
+#else
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+#endif
         
 
     public:
@@ -1255,6 +1266,80 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
+#if SUP7Z_USE_SHARED_INPUT
+        HRESULT STDMETHODCALLTYPE Borrow(
+            UInt32 maxSize,
+            const Byte **data,
+            UInt32 *borrowedSize,
+            UInt64 *token) SUP7Z_NOEXCEPT override
+        {
+            if (!data || !borrowedSize || !token)
+            {
+                return E_INVALIDARG;
+            }
+            *data = nullptr;
+            *borrowedSize = 0;
+            *token = 0;
+            if (!prefetch_ || maxSize == 0)
+            {
+                return S_FALSE;
+            }
+
+            const UInt64 read_start = position_;
+            SequentialPrefetcher::BorrowedSpan span;
+            if (!prefetch_->borrow(position_, maxSize, span, trace_))
+            {
+                return S_FALSE;
+            }
+
+            LARGE_INTEGER cached_position{};
+            cached_position.QuadPart = static_cast<LONGLONG>(position_ + span.size);
+            if (!SetFilePointerEx(handle_, cached_position, nullptr, FILE_BEGIN))
+            {
+                const DWORD error = GetLastError();
+                prefetch_->release_borrowed(span.token);
+                const HRESULT hr = HRESULT_FROM_WIN32(error);
+                if (trace_)
+                {
+                    trace_->read_error = true;
+                    trace_->last_hresult = hr;
+                    trace_->last_win32_error = static_cast<int>(error);
+                }
+                return hr;
+            }
+
+            position_ += span.size;
+            record_logical_read(trace_, read_start, span.size);
+            if (trace_)
+            {
+                trace_->position = position_;
+                trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
+                trace_->total_bytes_returned += span.size;
+                trace_->last_read_virtual_offset = read_start;
+                trace_->last_read_source_offset = read_start;
+                trace_->last_read_requested = maxSize;
+                trace_->last_read_returned = span.size;
+                trace_->last_source_path = path_;
+                trace_->last_range_index = 0;
+                trace_->last_hresult = S_OK;
+                trace_->last_win32_error = 0;
+            }
+            *data = span.data;
+            *borrowedSize = span.size;
+            *token = span.token;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE ReleaseBorrowed(UInt64 token) SUP7Z_NOEXCEPT override
+        {
+            if (prefetch_)
+            {
+                prefetch_->release_borrowed(token);
+            }
+            return S_OK;
+        }
+#endif
+
         HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
 
@@ -1342,8 +1427,15 @@ namespace sunpack::sevenzip
     };
 
     class MultiFileInStream final : public CMyUnknownImp, public IInStream
+#if SUP7Z_USE_SHARED_INPUT
+        , public ISunpackSharedInput
+#endif
     {
+#if SUP7Z_USE_SHARED_INPUT
+        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, ISunpackSharedInput)
+#else
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+#endif
         
 
     public:
@@ -1628,6 +1720,66 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
+#if SUP7Z_USE_SHARED_INPUT
+        HRESULT STDMETHODCALLTYPE Borrow(
+            UInt32 maxSize,
+            const Byte **data,
+            UInt32 *borrowedSize,
+            UInt64 *token) SUP7Z_NOEXCEPT override
+        {
+            if (!data || !borrowedSize || !token)
+            {
+                return E_INVALIDARG;
+            }
+            *data = nullptr;
+            *borrowedSize = 0;
+            *token = 0;
+            if (!valid_ || !prefetch_ || maxSize == 0)
+            {
+                return S_FALSE;
+            }
+
+            const UInt64 read_start = position_;
+            SequentialPrefetcher::BorrowedSpan span;
+            if (!prefetch_->borrow(position_, maxSize, span, trace_))
+            {
+                return S_FALSE;
+            }
+
+            position_ += span.size;
+            record_logical_read(trace_, read_start, span.size);
+            if (trace_)
+            {
+                const std::size_t index = find_part_index(read_start);
+                trace_->position = position_;
+                trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
+                trace_->total_bytes_returned += span.size;
+                trace_->last_read_virtual_offset = read_start;
+                trace_->last_read_source_offset =
+                    index < offsets_.size() ? read_start - offsets_[index] : 0;
+                trace_->last_read_requested = maxSize;
+                trace_->last_read_returned = span.size;
+                trace_->last_source_path = index < paths_.size() ? paths_[index] : L"";
+                trace_->last_range_index = static_cast<UInt32>(index);
+                trace_->last_hresult = S_OK;
+                trace_->last_win32_error = 0;
+            }
+            *data = span.data;
+            *borrowedSize = span.size;
+            *token = span.token;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE ReleaseBorrowed(UInt64 token) SUP7Z_NOEXCEPT override
+        {
+            if (prefetch_)
+            {
+                prefetch_->release_borrowed(token);
+            }
+            return S_OK;
+        }
+#endif
+
         HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
 
@@ -1828,8 +1980,15 @@ namespace sunpack::sevenzip
     };
 
     class MultiRangeInStream final : public CMyUnknownImp, public IInStream
+#if SUP7Z_USE_SHARED_INPUT
+        , public ISunpackSharedInput
+#endif
     {
+#if SUP7Z_USE_SHARED_INPUT
+        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, ISunpackSharedInput)
+#else
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+#endif
         
 
     public:
@@ -2143,6 +2302,70 @@ namespace sunpack::sevenzip
 
             return S_OK;
         }
+
+#if SUP7Z_USE_SHARED_INPUT
+        HRESULT STDMETHODCALLTYPE Borrow(
+            UInt32 maxSize,
+            const Byte **data,
+            UInt32 *borrowedSize,
+            UInt64 *token) SUP7Z_NOEXCEPT override
+        {
+            if (!data || !borrowedSize || !token)
+            {
+                return E_INVALIDARG;
+            }
+            *data = nullptr;
+            *borrowedSize = 0;
+            *token = 0;
+            if (!valid_ || !prefetch_ || maxSize == 0)
+            {
+                return S_FALSE;
+            }
+
+            const UInt64 read_start = position_;
+            SequentialPrefetcher::BorrowedSpan span;
+            if (!prefetch_->borrow(position_, maxSize, span, trace_))
+            {
+                return S_FALSE;
+            }
+
+            position_ += span.size;
+            record_logical_read(trace_, read_start, span.size);
+            if (trace_)
+            {
+                const std::size_t index = find_range_index(read_start);
+                trace_->position = position_;
+                trace_->max_position_seen = std::max<UInt64>(trace_->max_position_seen, position_);
+                trace_->total_bytes_returned += span.size;
+                trace_->last_read_virtual_offset = read_start;
+                trace_->last_read_requested = maxSize;
+                trace_->last_read_returned = span.size;
+                if (index < ranges_.size())
+                {
+                    const auto &range = ranges_[index];
+                    trace_->last_read_source_offset =
+                        range.start + (read_start - range.virtual_offset);
+                    trace_->last_source_path = range.path;
+                }
+                trace_->last_range_index = static_cast<UInt32>(index);
+                trace_->last_hresult = S_OK;
+                trace_->last_win32_error = 0;
+            }
+            *data = span.data;
+            *borrowedSize = span.size;
+            *token = span.token;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE ReleaseBorrowed(UInt64 token) SUP7Z_NOEXCEPT override
+        {
+            if (prefetch_)
+            {
+                prefetch_->release_borrowed(token);
+            }
+            return S_OK;
+        }
+#endif
 
         HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
