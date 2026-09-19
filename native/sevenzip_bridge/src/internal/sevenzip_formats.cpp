@@ -40,13 +40,27 @@ namespace sunpack::sevenzip
         return L"";
     }
 
-    std::vector<unsigned char> format_ids_for_signature(const std::wstring &archive_path, bool scan_prefix = false)
+    std::vector<unsigned char> format_ids_for_signature_at(
+        const std::wstring &archive_path,
+        UInt64 start_offset,
+        bool scan_prefix = false)
     {
         HANDLE handle = CreateFileW(win32_extended_path(archive_path).c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                     nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (handle == INVALID_HANDLE_VALUE)
         {
             return {};
+        }
+
+        if (start_offset != 0)
+        {
+            LARGE_INTEGER distance{};
+            distance.QuadPart = static_cast<LONGLONG>(start_offset);
+            if (!SetFilePointerEx(handle, distance, nullptr, FILE_BEGIN))
+            {
+                CloseHandle(handle);
+                return {};
+            }
         }
 
         const DWORD bytes_to_read = scan_prefix ? 1024 * 1024 : 8;
@@ -108,6 +122,11 @@ namespace sunpack::sevenzip
             }
         }
         return {};
+    }
+
+    std::vector<unsigned char> format_ids_for_signature(const std::wstring &archive_path, bool scan_prefix = false)
+    {
+        return format_ids_for_signature_at(archive_path, 0, scan_prefix);
     }
 
     std::vector<unsigned char> rar_format_ids_for_paths(
@@ -218,7 +237,12 @@ namespace sunpack::sevenzip
         return formats;
     }
 
-    std::vector<GUID> candidate_formats_for_hint(const std::wstring &format_hint, const std::wstring &archive_path, const std::vector<std::wstring> &part_paths)
+    std::vector<GUID> candidate_formats_for_hint(
+        const std::wstring &format_hint,
+        const std::wstring &archive_path,
+        const std::vector<std::wstring> &part_paths,
+        const std::wstring &signature_path,
+        UInt64 signature_offset)
     {
         std::wstring hint = lower_text(format_hint);
         if (!hint.empty() && hint.front() == L'.')
@@ -236,7 +260,15 @@ namespace sunpack::sevenzip
         }
         else if (hint == L"rar")
         {
-            const auto detected_ids = rar_format_ids_for_paths(archive_path, part_paths);
+            std::vector<unsigned char> detected_ids;
+            if (!signature_path.empty())
+            {
+                detected_ids = format_ids_for_signature_at(signature_path, signature_offset);
+            }
+            if (detected_ids.size() != 1)
+            {
+                detected_ids = rar_format_ids_for_paths(archive_path, part_paths);
+            }
             ids = detected_ids.size() == 1
                       ? detected_ids
                       : std::vector<unsigned char>{0x03, 0xCC};
