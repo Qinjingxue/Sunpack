@@ -5,6 +5,10 @@
 
 #include "../../Common/MyException.h"
 #include "../IStream.h"
+#if SUP7Z_USE_SHARED_INPUT
+#include "../../Common/MyCom.h"
+#include "SunpackSharedInput.h"
+#endif
 
 #ifndef Z7_NO_EXCEPTIONS
 struct CInBufferException: public CSystemException
@@ -19,6 +23,12 @@ protected:
   Byte *_buf;
   Byte *_bufLim;
   Byte *_bufBase;
+#if SUP7Z_USE_SHARED_INPUT
+  Byte *_ownedBuf;
+  CMyComPtr<ISunpackSharedInput> _sharedInput;
+  UInt64 _borrowToken;
+  void ReleaseBorrowed() throw();
+#endif
 
   ISequentialInStream *_stream;
   UInt64 _processedSize;
@@ -50,8 +60,24 @@ public:
 
   bool WasFinished() const { return _wasFinished; }
 
-  void SetStream(ISequentialInStream *stream) { _stream = stream; }
-  void ClearStreamPtr() { _stream = NULL; }
+  void SetStream(ISequentialInStream *stream)
+  {
+    _stream = stream;
+#if SUP7Z_USE_SHARED_INPUT
+    ReleaseBorrowed();
+    _sharedInput.Release();
+    if (stream)
+      stream->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
+#endif
+  }
+  void ClearStreamPtr()
+  {
+#if SUP7Z_USE_SHARED_INPUT
+    ReleaseBorrowed();
+    _sharedInput.Release();
+#endif
+    _stream = NULL;
+  }
   
   void SetBuf(Byte *buf, size_t bufSize, size_t end, size_t pos)
   {
