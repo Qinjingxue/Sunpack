@@ -970,6 +970,14 @@ HRESULT CDecoder::CodeReal(ICompressProgressInfo *progress)
 Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream *outStream,
     const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
+#if SUP7Z_USE_SHARED_OUTPUT
+  {
+    const HRESULT priorRes = DrainOutputLeases();
+    _sharedOutput.Release();
+    if (priorRes != S_OK)
+      return priorRes;
+  }
+#endif
   try
   {
     if (!inSize)
@@ -1003,18 +1011,41 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     m_InBitStream.BitDecoder.Init();
     _outStream = outStream;
 #if SUP7Z_USE_SHARED_OUTPUT
-    RINOK(DrainOutputLeases())
-    _sharedOutput.Release();
     if (outStream)
       outStream->QueryInterface(IID_ISunpackSharedOutput, (void **)&_sharedOutput);
 #endif
    
     // CCoderReleaser coderReleaser(this);
     _unpackSize = outSize ? *outSize : (UInt64)(Int64)-1;
-    return CodeReal(progress);
+    HRESULT res = CodeReal(progress);
+#if SUP7Z_USE_SHARED_OUTPUT
+    {
+      const HRESULT drainRes = DrainOutputLeases();
+      _sharedOutput.Release();
+      if (res == S_OK)
+        res = drainRes;
+    }
+#endif
+    return res;
   }
-  catch(const CInBufferException &e)  { /* _errorMode = true; */ return e.ErrorCode; }
-  catch(...) { /* _errorMode = true; */ return S_FALSE; }
+  catch(const CInBufferException &e)
+  {
+#if SUP7Z_USE_SHARED_OUTPUT
+    DrainOutputLeases();
+    _sharedOutput.Release();
+#endif
+    /* _errorMode = true; */
+    return e.ErrorCode;
+  }
+  catch(...)
+  {
+#if SUP7Z_USE_SHARED_OUTPUT
+    DrainOutputLeases();
+    _sharedOutput.Release();
+#endif
+    /* _errorMode = true; */
+    return S_FALSE;
+  }
   // CNewException is possible here. But probably CNewException is caused
   // by error in data stream.
 }
