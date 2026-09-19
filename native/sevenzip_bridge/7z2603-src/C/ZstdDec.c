@@ -3644,8 +3644,17 @@ SRes ZstdDec_Decode(CZstdDecHandle dec, CZstdDecState *p)
           return SZ_ERROR_FAIL;
         }
         // (p->wrPos == dec->decoder.winPos), and we wrap to zero.
-        // Resetting positions doesn't overwrite memory; the next DATA block
-        // retires leases for the exact physical range it will write.
+        // A following frame can resize/free the current window before its first
+        // DATA block, so frame boundaries still retire the active old window.
+#if SUP7Z_USE_SHARED_OUTPUT
+        if (p->sunpackBeforeWindowReuse && dec->decoder.winPos != 0)
+        {
+          const SRes sharedRes = p->sunpackBeforeWindowReuse(
+              p->sunpackOutputCtx, 0, dec->decoder.winPos);
+          if (sharedRes != SZ_OK)
+            return sharedRes;
+        }
+#endif
         dec->decoder.winPos = 0;
         p->winPos = 0;
         p->wrPos = 0;
