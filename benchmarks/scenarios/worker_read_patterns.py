@@ -314,7 +314,8 @@ def _mib(value: int | float | None) -> str:
 
 def _pattern_table(rows: list[dict[str, Any]]) -> str:
     columns = [
-        "format", "archive MiB", "stream", "seeks", "forward MiB", "backward MiB", "logical reads",
+        "format", "archive MiB", "stream", "open h/m", "open issued", "open ReadFile ms",
+        "seeks", "forward MiB", "backward MiB", "logical reads",
         "sequential %", "runs", "max run MiB", "hits", "misses", "invalidations", "miss %",
         "prefetch wait ms", "ReadFile ms", "ReadFile wall %", "decoder verdict",
     ]
@@ -334,6 +335,9 @@ def _pattern_table(rows: list[dict[str, Any]]) -> str:
             name,
             _mib(row.get("archive_bytes")),
             str(row.get("input_stream_mode") or "-"),
+            f"{int(row.get('input_open_prefetch_hit_count') or 0)}/{int(row.get('input_open_prefetch_miss_count') or 0)}",
+            str(int(row.get("input_open_prefetch_issued_count") or 0)),
+            f"{float(row.get('input_open_read_file_wall_ms') or 0):.3f}",
             str(row.get("input_seek_count") or 0),
             _mib(row.get("input_seek_forward_bytes")),
             _mib(row.get("input_seek_backward_bytes")),
@@ -446,7 +450,12 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "input_read_file_call_count", "input_read_file_wall_ms", "input_read_file_max_wall_ms",
         "input_read_file_wall_ratio", "input_prefetch_enabled", "input_prefetch_hit_count",
         "input_prefetch_miss_count", "input_prefetch_invalidation_count", "input_prefetch_consumer_wait_ms",
-        "input_prefetch_issued_count", "input_prefetch_published_count", "input_prefetch_orphaned_count",
+        "input_prefetch_issued_count", "input_prefetch_issued_bytes",
+        "input_open_read_file_call_count", "input_open_read_file_wall_ms", "input_open_logical_read_call_count",
+        "input_open_seek_count", "input_open_prefetch_hit_count", "input_open_prefetch_miss_count",
+        "input_open_prefetch_invalidation_count", "input_open_prefetch_consumer_wait_ms",
+        "input_open_prefetch_issued_count", "input_open_prefetch_issued_bytes",
+        "input_prefetch_published_count", "input_prefetch_orphaned_count",
         "input_consumer_read_blocking_ms", "prefetch_recommendation", "decoder_verdict",
     ]
     with path.open("w", encoding="utf-8", newline="") as stream:
