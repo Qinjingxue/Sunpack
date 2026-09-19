@@ -891,7 +891,9 @@ $sevenZipWrapperDllPath = Join-Path $toolsRoot "sunpack_sevenzip.dll"
 $sevenZipWorkerPath = Join-Path $toolsRoot "sunpack_sevenzip_worker.exe"
 $toastHostPath = Join-Path $toolsRoot "sunpack_toast.dll"
 $launcherBuildPath = Join-Path $sevenZipWrapperBuildDir "Release\sunpack_launcher.exe"
+$mitLicensePath = Join-Path $repoRoot "LICENSE"
 $sevenZipLicensePath = Join-Path $repoRoot "licenses\7zip-license.txt"
+$sevenZipSourceLicensePath = Join-Path $repoRoot "licenses\7zip-source-license.txt"
 $lgplLicensePath = Join-Path $repoRoot "licenses\LGPL-2.1.txt"
 $thirdPartyNoticesPath = Join-Path $repoRoot "THIRD_PARTY_NOTICES.md"
 $distRoot = Join-Path $repoRoot "dist"
@@ -933,7 +935,9 @@ Assert-PathExists -LiteralPath (Join-Path $sevenZipWrapperRoot "CMakeLists.txt")
 Assert-PathExists -LiteralPath (Join-Path $toastHostRoot "CMakeLists.txt") -Description "toast CMake project"
 Assert-PathExists -LiteralPath $sevenZipPath -Description "Bundled 7-Zip executable"
 Assert-PathExists -LiteralPath $sevenZipDllPath -Description "Bundled 7-Zip runtime DLL"
-Assert-PathExists -LiteralPath $sevenZipLicensePath -Description "7-Zip license file"
+Assert-PathExists -LiteralPath $mitLicensePath -Description "SunPack MIT license file"
+Assert-PathExists -LiteralPath $sevenZipLicensePath -Description "7-Zip binary license file"
+Assert-PathExists -LiteralPath $sevenZipSourceLicensePath -Description "7-Zip source license file"
 Assert-PathExists -LiteralPath $lgplLicensePath -Description "GNU LGPL 2.1 license file"
 Assert-PathExists -LiteralPath $thirdPartyNoticesPath -Description "Third-party notices file"
 Assert-CommandExists -Command "cargo" -Description "Rust toolchain"
@@ -1089,7 +1093,9 @@ Copy-IfExists -Source (Join-Path $repoRoot "sunpack_advanced_config.json") -Dest
 Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot
 
 New-Item -ItemType Directory -Path $distLicensesRoot -Force | Out-Null
+Copy-Item -LiteralPath $mitLicensePath -Destination (Join-Path $distLicensesRoot "SunPack-MIT.txt") -Force
 Copy-Item -LiteralPath $sevenZipLicensePath -Destination (Join-Path $distLicensesRoot "7zip-license.txt") -Force
+Copy-Item -LiteralPath $sevenZipSourceLicensePath -Destination (Join-Path $distLicensesRoot "7zip-source-license.txt") -Force
 Copy-Item -LiteralPath $lgplLicensePath -Destination (Join-Path $distLicensesRoot "LGPL-2.1.txt") -Force
 Copy-Item -LiteralPath $thirdPartyNoticesPath -Destination $distThirdPartyNoticesPath -Force
 
@@ -1102,7 +1108,9 @@ Assert-PathExists -LiteralPath $distPasswordPath -Description "External password
 Assert-PathExists -LiteralPath $distConfigPath -Description "External config file"
 Assert-PathExists -LiteralPath $distIconPath -Description "External icon file"
 Assert-PackagedRuntimeTools -PackageRoot $distAppRoot
-Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "7zip-license.txt") -Description "External 7-Zip license file"
+Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "SunPack-MIT.txt") -Description "Packaged SunPack MIT license file"
+Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "7zip-license.txt") -Description "Packaged 7-Zip binary license file"
+Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "7zip-source-license.txt") -Description "Packaged 7-Zip source license file"
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "LGPL-2.1.txt") -Description "Packaged GNU LGPL 2.1 license file"
 Assert-PathExists -LiteralPath $distThirdPartyNoticesPath -Description "Packaged third-party notices file"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "7z.dll") -BuildArch $buildArch -Description "Packaged tools/7z.dll"
