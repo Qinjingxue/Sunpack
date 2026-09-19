@@ -28,6 +28,9 @@ CDecoder::CDecoder():
     , _inProcessed(0)
     , _inBufSize(1u << 19) // larger value will reduce the number of memcpy() calls in CZstdDec code
     , _inBuf(NULL)
+#if SUP7Z_USE_SHARED_INPUT
+    , _borrowToken(0)
+#endif
     , FinishMode(false)
     , DisableHash(False)
     // , DisableHash(True) // for debug : fast decoding without hash calculation
@@ -37,10 +40,25 @@ CDecoder::CDecoder():
 
 CDecoder::~CDecoder()
 {
+#if SUP7Z_USE_SHARED_INPUT
+  ReleaseBorrowed();
+#endif
   if (_dec)
     ZstdDec_Destroy(_dec);
   MidFree(_inBuf);
 }
+
+#if SUP7Z_USE_SHARED_INPUT
+void CDecoder::ReleaseBorrowed() throw()
+{
+  if (_borrowToken)
+  {
+    if (_sharedInput)
+      _sharedInput->ReleaseBorrowed(_borrowToken);
+    _borrowToken = 0;
+  }
+}
+#endif
 
 
 Z7_COM7F_IMF(CDecoder::SetInBufSize(UInt32 , UInt32 size))
@@ -91,6 +109,10 @@ Z7_COM7F_IMF(CDecoder::ReadUnusedFromInBuf(void *data, UInt32 size, UInt32 *proc
     }
   }
   *processedSize = (UInt32)cur;
+#if SUP7Z_USE_SHARED_INPUT
+  if (_borrowToken && _state.inPos == _state.inLim)
+    ReleaseBorrowed();
+#endif
   return S_OK;
 }
 
@@ -98,6 +120,10 @@ Z7_COM7F_IMF(CDecoder::ReadUnusedFromInBuf(void *data, UInt32 size, UInt32 *proc
 
 HRESULT CDecoder::Prepare(const UInt64 *outSize)
 {
+#if SUP7Z_USE_SHARED_INPUT
+  ReleaseBorrowed();
+  _sharedInput.Release();
+#endif
   _inProcessed = 0;
   _afterDecoding_tempPos = 0;
   ZstdDecState_Clear(&_state);
@@ -136,6 +162,9 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
   RINOK(Prepare(outSize))
+#if SUP7Z_USE_SHARED_INPUT
+  inStream->QueryInterface(IID_ISunpackSharedInput, (void **)&_sharedInput);
+#endif
   
   UInt64 inPrev = 0;
   UInt64 outPrev = 0;
@@ -150,14 +179,55 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     if (_state.inPos == _state.inLim && !readWasFinished)
     {
       _state.inPos = 0;
+#if SUP7Z_USE_SHARED_INPUT
+      ReleaseBorrowed();
+      bool borrowedInput = false;
+      if (_sharedInput)
+      {
+        const Byte *borrowed = NULL;
+        UInt32 borrowedSize = 0;
+        UInt64 token = 0;
+        const HRESULT borrowRes = _sharedInput->Borrow(_inBufSize, &borrowed, &borrowedSize, &token);
+        if (borrowRes == S_OK)
+        {
+          if (!borrowed || borrowedSize == 0 || token == 0)
+          {
+            if (token)
+              _sharedInput->ReleaseBorrowed(token);
+            hres_Read = E_FAIL;
+            readWasFinished = true;
+          }
+          else
+          {
+            _borrowToken = token;
+            _state.inBuf = borrowed;
+            _state.inLim = borrowedSize;
+            borrowedInput = true;
+            hres_Read = S_OK;
+          }
+        }
+        else if (borrowRes != S_FALSE)
+        {
+          hres_Read = borrowRes;
+          readWasFinished = true;
+        }
+      }
+      if (!borrowedInput && hres_Read == S_OK)
+      {
+        _state.inBuf = _inBuf;
+        _state.inLim = _inBufSize;
+        hres_Read = ReadStream(inStream, _inBuf, &_state.inLim);
+        if (_state.inLim != _inBufSize || hres_Read != S_OK)
+          readWasFinished = true;
+      }
+#else
       _state.inLim = _inBufSize;
       hres_Read = ReadStream(inStream, _inBuf, &_state.inLim);
-      // _state.inLim -= 5; readWasFinished = True; // for debug
       if (_state.inLim != _inBufSize || hres_Read != S_OK)
       {
-        // hres_Read = 99; // for debug
-        readWasFinished = True;
+        readWasFinished = true;
       }
+#endif
     }
     {
       const size_t inPos_Start = _state.inPos;
@@ -262,6 +332,10 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
       }
     }
   }
+#if SUP7Z_USE_SHARED_INPUT
+  if (_borrowToken && _state.inPos == _state.inLim)
+    ReleaseBorrowed();
+#endif
   return hres;
 }
 
