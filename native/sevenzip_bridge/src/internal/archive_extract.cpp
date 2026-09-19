@@ -22,6 +22,7 @@
 #ifdef _WIN32
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 #endif
@@ -393,7 +394,14 @@ namespace sunpack::sevenzip
                 password, callback_path, part_paths, canonical_names, prefetch_config, &result.input_trace);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
+            const auto open_started = std::chrono::steady_clock::now();
             hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
+            const auto open_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - open_started).count();
+            if (open_elapsed > 0)
+            {
+                result.input_trace.open_wall_ns += static_cast<unsigned long long>(open_elapsed);
+            }
             last_encryption_evidence = raw_open_callback->password_requested();
 
             if (raw_open_callback->missing_volume_requested())
