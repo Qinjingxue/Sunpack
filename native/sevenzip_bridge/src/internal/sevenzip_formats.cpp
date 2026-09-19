@@ -264,6 +264,11 @@ namespace sunpack::sevenzip
             if (!signature_path.empty())
             {
                 detected_ids = format_ids_for_signature_at(signature_path, signature_offset);
+                if (detected_ids != std::vector<unsigned char>{0x03} &&
+                    detected_ids != std::vector<unsigned char>{0xCC})
+                {
+                    detected_ids.clear();
+                }
             }
             if (detected_ids.size() != 1)
             {
