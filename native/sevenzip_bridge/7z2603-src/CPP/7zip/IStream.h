@@ -112,7 +112,8 @@ Z7_IFACE_CONSTR_STREAM(IStreamGetSize, 0x06)
   x(BeginReadPlan()) \
   x(AddReadPlan(UInt64 offset, UInt64 size)) \
   x(EndReadPlan()) \
-  x(SetLegacyPrefetchActive(Int32 active))
+  x(SetLegacyPrefetchActive(Int32 active)) \
+  x(SyncPrefetchTrace())
 Z7_IFACE_CONSTR_STREAM(IStreamSetReadPlan, 0x7e)
 
 namespace NSunpackReadPlan
@@ -134,6 +135,14 @@ namespace NSunpackReadPlan
     IStreamSetReadPlan *plan = Query(stream);
     if (!plan) return;
     plan->SetLegacyPrefetchActive(active ? 1 : 0);
+    plan->Release();
+  }
+
+  inline void Sync(IUnknown *stream)
+  {
+    IStreamSetReadPlan *plan = Query(stream);
+    if (!plan) return;
+    plan->SyncPrefetchTrace();
     plan->Release();
   }
 
