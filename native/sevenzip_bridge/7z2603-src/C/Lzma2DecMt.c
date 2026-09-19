@@ -695,6 +695,17 @@ static SRes Lzma2Dec_Prepare_ST(CLzma2DecMt *p)
 }
 
 
+static SRes Lzma2Dec_Return_ST(CLzma2DecMt *p, SRes res)
+{
+#if SUP7Z_USE_SHARED_INPUT
+  Lzma2Dec_ReleaseSharedInput(p);
+#else
+  UNUSED_VAR(p)
+#endif
+  return res;
+}
+
+
 static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
     #ifndef Z7_ST
     , BoolInt tMode
@@ -716,7 +727,11 @@ static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
   }
   #endif
 
-  RINOK(Lzma2Dec_Prepare_ST(p))
+  {
+    const SRes prepareRes = Lzma2Dec_Prepare_ST(p);
+    if (prepareRes != SZ_OK)
+      return Lzma2Dec_Return_ST(p, prepareRes);
+  }
 
   dec = &p->dec;
 
@@ -754,7 +769,7 @@ static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
         inLim = 0;
       }
       #endif
-      
+
       if (!p->readWasFinished)
       {
         inPos = 0;
@@ -765,8 +780,6 @@ static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
         inData = p->inBuf;
         p->readRes = ISeqInStream_Read(p->inStream, (void *)(p->inBuf), &inLim);
 #endif
-        // p->readProcessed += inLim;
-        // inLim -= 5; p->readWasFinished = True; // for test
         if (inLim == 0 || p->readRes != SZ_OK)
           p->readWasFinished = True;
       }
@@ -793,7 +806,7 @@ static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
     }
 
     inProcessed = (SizeT)(inLim - inPos);
-    
+
     res = Lzma2Dec_DecodeToDic(dec, dicPos + size, inData + inPos, &inProcessed, finishMode, &status);
 
     inPos += inProcessed;
@@ -822,72 +835,40 @@ static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
       wrPos = dec->decoder.dicPos;
 
       if (res2 != SZ_OK)
-      {
-#if SUP7Z_USE_SHARED_INPUT
-        Lzma2Dec_ReleaseSharedInput(p);
-#endif
-        return res2;
-      }
+        return Lzma2Dec_Return_ST(p, res2);
 
       if (needStop)
       {
         if (res != SZ_OK)
-#if SUP7Z_USE_SHARED_INPUT
-          Lzma2Dec_ReleaseSharedInput(p);
-#endif
-          return res;
+          return Lzma2Dec_Return_ST(p, res);
 
         if (status == LZMA_STATUS_FINISHED_WITH_MARK)
         {
           if (p->finishMode)
-          {
             if (p->outSize_Defined && p->outSize != p->outProcessed)
-      #if SUP7Z_USE_SHARED_INPUT
-        Lzma2Dec_ReleaseSharedInput(p);
-#endif
-        return SZ_ERROR_DATA;
-          }
-#if SUP7Z_USE_SHARED_INPUT
-          Lzma2Dec_ReleaseSharedInput(p);
-#endif
-          return SZ_OK;
+              return Lzma2Dec_Return_ST(p, SZ_ERROR_DATA);
+          return Lzma2Dec_Return_ST(p, SZ_OK);
         }
 
         if (!p->finishMode && outFinished)
-#if SUP7Z_USE_SHARED_INPUT
-          Lzma2Dec_ReleaseSharedInput(p);
-#endif
-          return SZ_OK;
+          return Lzma2Dec_Return_ST(p, SZ_OK);
 
         if (status == LZMA_STATUS_NEEDS_MORE_INPUT)
-#if SUP7Z_USE_SHARED_INPUT
-          Lzma2Dec_ReleaseSharedInput(p);
-#endif
-          return SZ_ERROR_INPUT_EOF;
-        
-#if SUP7Z_USE_SHARED_INPUT
-        Lzma2Dec_ReleaseSharedInput(p);
-#endif
-        return SZ_ERROR_DATA;
+          return Lzma2Dec_Return_ST(p, SZ_ERROR_INPUT_EOF);
+
+        return Lzma2Dec_Return_ST(p, SZ_ERROR_DATA);
       }
     }
-    
+
     if (p->progress)
     {
-      UInt64 inDelta = p->inProcessed - inPrev;
-      UInt64 outDelta = p->outProcessed - outPrev;
+      const UInt64 inDelta = p->inProcessed - inPrev;
+      const UInt64 outDelta = p->outProcessed - outPrev;
       if (inDelta >= (1 << 22) || outDelta >= (1 << 22))
       {
-        {
         const SRes progressRes = ICompressProgress_Progress(p->progress, p->inProcessed, p->outProcessed);
         if (progressRes != SZ_OK)
-        {
-#if SUP7Z_USE_SHARED_INPUT
-          Lzma2Dec_ReleaseSharedInput(p);
-#endif
-          return progressRes;
-        }
-      }
+          return Lzma2Dec_Return_ST(p, progressRes);
         inPrev = p->inProcessed;
         outPrev = p->outProcessed;
       }
@@ -1166,26 +1147,7 @@ SRes Lzma2DecMt_Read(CLzma2DecMtHandle p,
     {
       p->inPos = 0;
       p->inLim = p->props.inBufSize_ST;
-#if SUP7Z_USE_SHARED_INPUT
-      {
-        const Byte *borrowedData = NULL;
-        size_t borrowedSize = p->inLim;
-        const SRes sharedRes = Lzma2Dec_ReadInput_ST(p, &borrowedData, &borrowedSize);
-        if (sharedRes != SZ_OK)
-          return sharedRes;
-        p->inLim = borrowedSize;
-        /* Pull mode still decodes below from p->inBuf, so only use the
-           shared hook when it returned the fallback buffer. */
-        if (borrowedData != p->inBuf)
-        {
-          memcpy(p->inBuf, borrowedData, borrowedSize);
-          Lzma2Dec_ReleaseSharedInput(p);
-        }
-        readRes = SZ_OK;
-      }
-#else
       readRes = ISeqInStream_Read(p->inStream, p->inBuf, &p->inLim);
-#endif
     }
 
     inCur = (SizeT)(p->inLim - p->inPos);
