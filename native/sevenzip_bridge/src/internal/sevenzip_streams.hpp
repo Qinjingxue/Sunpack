@@ -1355,7 +1355,10 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE Seek(Int64 offset, UInt32 seekOrigin, UInt64 *newPosition) SUP7Z_NOEXCEPT override
         {
 #if SUP7Z_USE_SHARED_INPUT
-            if (fallback_handle_needs_seek_)
+            // FILE_BEGIN / FILE_END are absolute with respect to current file
+            // position, so a stale fallback handle can be overwritten directly.
+            // Only FILE_CURRENT needs the handle synchronized first.
+            if (fallback_handle_needs_seek_ && seekOrigin == FILE_CURRENT)
             {
                 LARGE_INTEGER logical_position{};
                 logical_position.QuadPart = static_cast<LONGLONG>(position_);
