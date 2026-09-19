@@ -341,11 +341,11 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
         // Borrowed output should normally reach the writer's 1 MiB work-item
         // size instead of emitting one async WriteFile per 128 KiB Zstd block.
         // 1 MiB is still a multiple of Zstd's required 128 KiB alignment.
-        const size_t sharedStepMask = sharedOutput
-            ? (((size_t)1 << 20) - 1) : (size_t)_outStepMask;
-        const size_t effectiveStepMask =
-            sharedStepMask > (size_t)_outStepMask
-                ? sharedStepMask : (size_t)_outStepMask;
+        size_t effectiveStepMask = (size_t)_outStepMask;
+#if SUP7Z_USE_SHARED_OUTPUT
+        if (sharedOutput && effectiveStepMask < (((size_t)1 << 20) - 1))
+          effectiveStepMask = ((size_t)1 << 20) - 1;
+#endif
         const size_t alignedPos = _state.winPos & ~effectiveStepMask;
         if (alignedPos > _state.wrPos)
         {
