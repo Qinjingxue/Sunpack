@@ -1,0 +1,59 @@
+name: Shared output regression
+
+on:
+  pull_request:
+    paths:
+      - "native/sevenzip_bridge/**"
+      - ".github/workflows/shared-output-regression.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "native/sevenzip_bridge/**"
+      - ".github/workflows/shared-output-regression.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native bridge (shared output ${{ matrix.shared_output }})
+    runs-on: windows-2022
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shared_output: [ON, OFF]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Configure
+        shell: pwsh
+        run: >
+          cmake
+          -S native/sevenzip_bridge
+          -B "build-shared-output-${{ matrix.shared_output }}"
+          -A x64
+          -DSUP7Z_USE_SHARED_OUTPUT=${{ matrix.shared_output }}
+
+      - name: Build focused native checks
+        shell: pwsh
+        run: >
+          cmake
+          --build "build-shared-output-${{ matrix.shared_output }}"
+          --config Release
+          --target
+          sunpack_sevenzip_async_output
+          sunpack_sevenzip_com_contract
+          sunpack_sevenzip_smoke
+
+      - name: Run focused native checks
+        shell: pwsh
+        run: >
+          ctest
+          --test-dir "build-shared-output-${{ matrix.shared_output }}"
+          -C Release
+          --output-on-failure
+          -R "sunpack_sevenzip_(async_output|com_contract|smoke)"
