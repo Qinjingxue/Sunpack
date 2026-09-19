@@ -667,6 +667,18 @@ std::string input_trace_json(const sunpack::sevenzip::ExtractInputTrace& trace) 
         ",\"prefetch_miss_count\":" + std::to_string(trace.prefetch_miss_count) +
         ",\"prefetch_invalidation_count\":" + std::to_string(trace.prefetch_invalidation_count) +
         ",\"prefetch_consumer_wait_ns\":" + std::to_string(trace.prefetch_consumer_wait_ns) +
+        ",\"prefetch_issued_count\":" + std::to_string(trace.prefetch_issued_count) +
+        ",\"prefetch_issued_bytes\":" + std::to_string(trace.prefetch_issued_bytes) +
+        ",\"open_read_file_call_count\":" + std::to_string(trace.open_read_file_call_count) +
+        ",\"open_read_file_wall_ns\":" + std::to_string(trace.open_read_file_wall_ns) +
+        ",\"open_logical_read_call_count\":" + std::to_string(trace.open_logical_read_call_count) +
+        ",\"open_seek_count\":" + std::to_string(trace.open_seek_count) +
+        ",\"open_prefetch_hit_count\":" + std::to_string(trace.open_prefetch_hit_count) +
+        ",\"open_prefetch_miss_count\":" + std::to_string(trace.open_prefetch_miss_count) +
+        ",\"open_prefetch_invalidation_count\":" + std::to_string(trace.open_prefetch_invalidation_count) +
+        ",\"open_prefetch_consumer_wait_ns\":" + std::to_string(trace.open_prefetch_consumer_wait_ns) +
+        ",\"open_prefetch_issued_count\":" + std::to_string(trace.open_prefetch_issued_count) +
+        ",\"open_prefetch_issued_bytes\":" + std::to_string(trace.open_prefetch_issued_bytes) +
         ",\"read_error\":" + std::string(trace.read_error ? "true" : "false") +
         ",\"last_hresult\":" + std::to_string(trace.last_hresult) +
         ",\"last_hresult_hex\":\"" + hresult_hex(trace.last_hresult) +
