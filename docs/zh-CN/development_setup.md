@@ -12,6 +12,7 @@ SunPack 是 Windows-only 项目。Python 依赖统一声明在根目录 `pyproje
 - `uv` 0.12 或更新版本
 - Rust MSVC toolchain，提供 `cargo`
 - Visual Studio Build Tools 2022，包含 C++17 编译器
+- ARM64 优化构建还需要 Visual Studio **C++ Clang tools for Windows** 组件（`clang-cl`），仅用于上游 7-Zip `LzmaDecOpt.S`
 - 首次安装依赖和准备 7-Zip 测试文件所需的网络连接
 
 项目主要目录：

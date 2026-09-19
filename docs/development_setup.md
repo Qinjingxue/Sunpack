@@ -12,6 +12,7 @@ SunPack is a Windows-only project. Python dependencies are declared uniformly in
 - `uv` 0.12 or newer
 - Rust MSVC toolchain, providing `cargo`
 - Visual Studio Build Tools 2022, including a C++17 compiler
+- ARM64 optimized builds additionally require the Visual Studio **C++ Clang tools for Windows** component (`clang-cl`), used only for upstream 7-Zip `LzmaDecOpt.S`
 - Network access for the first dependency install and for preparing the 7-Zip test files
 
 Main project directories:
