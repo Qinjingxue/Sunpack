@@ -384,7 +384,10 @@ sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
         archive_input.part_paths,
         password_ptrs.data(),
         static_cast<int>(password_ptrs.size()),
-        archive_input.canonical_names);
+        archive_input.canonical_names,
+        archive_input.format_hint,
+        archive_input.signature_path,
+        archive_input.signature_offset);
 }
 
 sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
