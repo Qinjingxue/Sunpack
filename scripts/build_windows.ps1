@@ -17,6 +17,8 @@ $ErrorActionPreference = "Stop"
 $interactivePrompting = -not $NoPause -and -not [Console]::IsInputRedirected
 $promptForAcceptanceTests = ($PSBoundParameters.Count -eq 0) -and $interactivePrompting
 
+. (Join-Path $PSScriptRoot "sevenzip_asm_check.ps1")
+
 function Write-Step {
     param([string]$Message)
     Write-Host ""
@@ -566,14 +568,17 @@ function Build-SevenZipWrapper {
     Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
-    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release")
+    # Upstream x64 assembly hot paths are ON by default and are requested explicitly here so
+    # product builds never silently fall back to the C implementations. CMake still ignores
+    # this on non-x64 targets (ARM64 keeps upstream C/intrinsics) and refuses to configure a
+    # half-swapped tree. Pass -DSUP7Z_USE_X64_ASM=OFF by hand only for A/B benchmarking.
+    Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON")
     Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release")
     if ((Get-ProcessBuildArch) -eq $BuildArch) {
         Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
     } else {
         Write-Host "Skipping C++ smoke test because $BuildArch binaries cannot run in the current process architecture." -ForegroundColor Yellow
     }
-
     $wrapperDll = Join-Path $BuildDir "Release\sunpack_sevenzip.dll"
     $workerExe = Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe"
     $launcherExe = Join-Path $BuildDir "Release\sunpack_launcher.exe"
@@ -585,6 +590,11 @@ function Build-SevenZipWrapper {
     Assert-PeMachine -LiteralPath $launcherExe -BuildArch $BuildArch -Description "Built SunPack launcher executable"
     Copy-Item -LiteralPath $wrapperDll -Destination (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force
     Copy-Item -LiteralPath $workerExe -Destination (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe") -Force
+
+    Assert-SevenZipAsmSelection -BuildDir $BuildDir -BuildArch $BuildArch -ArtifactPaths @(
+        (Join-Path $ToolsRoot "sunpack_sevenzip.dll"),
+        (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe")
+    )
 }
 
 function Build-ToastLibrary {

@@ -36,6 +36,57 @@ endfunction()
 
 set(SUP7Z_7Z_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/7z2603-src")
 
+option(SUP7Z_USE_X64_ASM
+    "Use upstream 7-Zip x64 assembly hot paths (LZMA decoder, CRC32/CRC64, AES, SHA)"
+    ON)
+
+if(MSVC)
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
+        set(SUP7Z_TARGET_UARCH "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
+    elseif(CMAKE_C_COMPILER_ARCHITECTURE_ID)
+        set(SUP7Z_TARGET_UARCH "${CMAKE_C_COMPILER_ARCHITECTURE_ID}")
+    elseif(CMAKE_GENERATOR_PLATFORM)
+        set(SUP7Z_TARGET_UARCH "${CMAKE_GENERATOR_PLATFORM}")
+    else()
+        set(SUP7Z_TARGET_UARCH "unknown")
+    endif()
+endif()
+
+if(SUP7Z_USE_X64_ASM)
+    if(SUP7Z_TARGET_UARCH STREQUAL "x64" OR SUP7Z_TARGET_UARCH STREQUAL "AMD64")
+        set(SUP7Z_X64_ASM_ENABLED ON)
+    else()
+        set(SUP7Z_X64_ASM_ENABLED OFF)
+    endif()
+else()
+    set(SUP7Z_X64_ASM_ENABLED OFF)
+endif()
+
+set(SUP7Z_ASM_LAST_SELECTION_FILE "${CMAKE_BINARY_DIR}/sup7z_asm_last_selection.txt")
+if(EXISTS "${SUP7Z_ASM_LAST_SELECTION_FILE}")
+    file(READ "${SUP7Z_ASM_LAST_SELECTION_FILE}" SUP7Z_ASM_LAST_SELECTION)
+    string(STRIP "${SUP7Z_ASM_LAST_SELECTION}" SUP7Z_ASM_LAST_SELECTION)
+    if(NOT SUP7Z_ASM_LAST_SELECTION STREQUAL "${SUP7Z_X64_ASM_ENABLED}")
+        message(FATAL_ERROR
+            "SUP7Z_USE_X64_ASM changed from "
+            "'${SUP7Z_ASM_LAST_SELECTION}' to '${SUP7Z_X64_ASM_ENABLED}' in the same build "
+            "directory (${CMAKE_BINARY_DIR}). Delete that directory, or configure the other "
+            "setting into its own build directory (e.g. build-asm-off), so objects left over "
+            "from the previous run cannot be reused.")
+    endif()
+endif()
+file(WRITE "${SUP7Z_ASM_LAST_SELECTION_FILE}" "${SUP7Z_X64_ASM_ENABLED}")
+
+set(SUP7Z_X64_ASM_SOURCES
+    "${SUP7Z_7Z_ROOT}/Asm/x86/LzmaDecOpt.asm"
+    "${SUP7Z_7Z_ROOT}/Asm/x86/7zCrcOpt.asm"
+    "${SUP7Z_7Z_ROOT}/Asm/x86/XzCrc64Opt.asm"
+    "${SUP7Z_7Z_ROOT}/Asm/x86/AesOpt.asm"
+    "${SUP7Z_7Z_ROOT}/Asm/x86/Sha1Opt.asm"
+    "${SUP7Z_7Z_ROOT}/Asm/x86/Sha256Opt.asm"
+)
+
+
 file(GLOB_RECURSE SUP7Z_BUNDLED_7Z_SOURCES CONFIGURE_DEPENDS
     "${SUP7Z_7Z_ROOT}/C/*.c"
     "${SUP7Z_7Z_ROOT}/CPP/*.cpp"
@@ -48,6 +99,51 @@ if(NOT SUP7Z_BUNDLED_7Z_SOURCE_COUNT EQUAL 228)
         "${SUP7Z_BUNDLED_7Z_SOURCE_COUNT}. Re-derive the keep set (regenerate "
         "docs/zh-CN/sevenzip_retained_sources.txt) or fix the tree.")
 endif()
+
+
+if(SUP7Z_X64_ASM_ENABLED)
+    set(SUP7Z_C_IMPLEMENTATIONS_REPLACED_BY_ASM
+        7zCrcOpt.c
+        XzCrc64Opt.c
+        AesOpt.c
+        Sha1Opt.c
+        Sha256Opt.c)
+
+    set(SUP7Z_BUNDLED_7Z_SOURCES_WITHOUT_ASM_TWINS ${SUP7Z_BUNDLED_7Z_SOURCES})
+    foreach(SUP7Z_C_NAME IN LISTS SUP7Z_C_IMPLEMENTATIONS_REPLACED_BY_ASM)
+        list(FILTER SUP7Z_BUNDLED_7Z_SOURCES_WITHOUT_ASM_TWINS
+            EXCLUDE REGEX "/C/${SUP7Z_C_NAME}$")
+    endforeach()
+
+    list(LENGTH SUP7Z_BUNDLED_7Z_SOURCES_WITHOUT_ASM_TWINS
+        SUP7Z_BUNDLED_7Z_SOURCE_COUNT_WITHOUT_ASM_TWINS)
+    math(EXPR SUP7Z_BUNDLED_7Z_ASM_SWAP_REMOVED
+        "${SUP7Z_BUNDLED_7Z_SOURCE_COUNT} - ${SUP7Z_BUNDLED_7Z_SOURCE_COUNT_WITHOUT_ASM_TWINS}")
+    if(NOT SUP7Z_BUNDLED_7Z_SOURCE_COUNT_WITHOUT_ASM_TWINS EQUAL 223)
+        message(FATAL_ERROR
+            "x64 assembly swap must remove exactly 5 C fallbacks "
+            "(7zCrcOpt.c, XzCrc64Opt.c, AesOpt.c, Sha1Opt.c, Sha256Opt.c), but "
+            "removed ${SUP7Z_BUNDLED_7Z_ASM_SWAP_REMOVED} and left "
+            "${SUP7Z_BUNDLED_7Z_SOURCE_COUNT_WITHOUT_ASM_TWINS} translation units. "
+            "Leaving a C twin in place would link-fail on duplicate symbols.")
+    endif()
+
+    set(SUP7Z_BUNDLED_7Z_SOURCES ${SUP7Z_BUNDLED_7Z_SOURCES_WITHOUT_ASM_TWINS})
+
+    set_source_files_properties(
+        "${SUP7Z_7Z_ROOT}/C/LzmaDec.c"
+        PROPERTIES
+        COMPILE_DEFINITIONS Z7_LZMA_DEC_OPT)
+
+    message(STATUS
+        "7-Zip asm: enabled (x64 MASM) - LzmaDecOpt, 7zCrcOpt, XzCrc64Opt, "
+        "AesOpt, Sha1Opt, Sha256Opt; Sort/LzFindOpt intentionally omitted")
+else()
+    message(STATUS
+        "7-Zip asm: disabled (target arch '${SUP7Z_TARGET_UARCH}', "
+        "SUP7Z_USE_X64_ASM=${SUP7Z_USE_X64_ASM}) - using upstream C/intrinsics")
+endif()
+
 
 add_library(sunpack_7zip_objects OBJECT ${SUP7Z_BUNDLED_7Z_SOURCES})
 
@@ -63,11 +159,36 @@ if(WIN32)
     target_link_libraries(sunpack_7zip_objects PUBLIC OleAut32 User32 AdvApi32)
 endif()
 
+
+if(SUP7Z_X64_ASM_ENABLED)
+
+    foreach(SUP7Z_ASM_SOURCE IN LISTS SUP7Z_X64_ASM_SOURCES)
+        if(NOT EXISTS "${SUP7Z_ASM_SOURCE}")
+            message(FATAL_ERROR
+                "x64 assembly is enabled but ${SUP7Z_ASM_SOURCE} is missing. "
+                "Either restore it from upstream or configure with "
+                "-DSUP7Z_USE_X64_ASM=OFF - do not build a half-swapped tree.")
+        endif()
+    endforeach()
+
+    enable_language(ASM_MASM)
+
+    add_library(sunpack_7zip_asm_objects OBJECT ${SUP7Z_X64_ASM_SOURCES})
+
+    target_include_directories(sunpack_7zip_asm_objects
+        PRIVATE ${SUP7Z_7Z_ROOT}/Asm/x86)
+endif()
+
+
 function(sup7z_attach_bundled_7z target_name)
     if(WIN32 AND TARGET sunpack_7zip_objects)
         target_sources(${target_name} PRIVATE
             $<TARGET_OBJECTS:sunpack_7zip_objects>)
         target_include_directories(${target_name} PRIVATE ${SUP7Z_7Z_ROOT}/CPP)
+    endif()
+    if(WIN32 AND TARGET sunpack_7zip_asm_objects)
+        target_sources(${target_name} PRIVATE
+            $<TARGET_OBJECTS:sunpack_7zip_asm_objects>)
     endif()
 endfunction()
 
@@ -272,6 +393,7 @@ target_include_directories(sunpack_sevenzip_com_contract
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip_com_contract PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
+
 enable_testing()
 add_test(NAME sunpack_sevenzip_smoke COMMAND sunpack_sevenzip_smoke)
 add_test(NAME sunpack_sevenzip_async_output COMMAND sunpack_sevenzip_async_output)

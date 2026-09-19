@@ -29,6 +29,27 @@ cmake --build native\sevenzip_bridge\build-x64 --config Release
 ctest --test-dir native\sevenzip_bridge\build-x64 -C Release --output-on-failure
 ```
 
+On x64 the build also assembles the upstream 7-Zip hot paths
+(`Asm/x86/{LzmaDecOpt,7zCrcOpt,XzCrc64Opt,AesOpt,Sha1Opt,Sha256Opt}.asm`) with
+`ml64.exe`. Those replace the matching C fallbacks, so the x64 build compiles
+**223 C/C++ translation units + 6 MASM** instead of 228 C/C++.
+`Sort.asm` and `LzFindOpt.asm` are compression-side and stay disabled, and
+ARM64 keeps the upstream C / intrinsics implementations.
+
+`SUP7Z_USE_X64_ASM` (default `ON`) is a benchmark/rollback switch, not a user
+setting — use it to compare both implementations from the same commit:
+
+```powershell
+cmake -S native\sevenzip_bridge -B native\sevenzip_bridge\build-c-only -A x64 -DSUP7Z_USE_X64_ASM=OFF
+```
+
+Give each setting its own build directory: the two builds compile different
+source sets, and CMake refuses to flip the option inside one build directory
+(previously produced objects would sit in the intermediate directory unused).
+Builds are incremental and Release-only (`/O2 /Oi /Ot /Gy /Gw /GF` + `/GL` /
+`/LTCG /OPT:REF /OPT:ICF`); the MASM objects carry no C/C++ optimization flags
+by design, since `ml64.exe` has none.
+
 Release outputs:
 
 ```text
@@ -57,4 +78,4 @@ The Python binding owns library loading, typed result conversion and caches. The
 
 ## Runtime Contract
 
-`sunpack_sevenzip.dll`, `sunpack_sevenzip_worker.exe` and the architecture-matching `7z.dll` must be available in the same SunPack tool directory. Do not add a `7z.exe x` fallback to the product extraction path; failures must remain explicit and structured.
+`sunpack_sevenzip.dll`, `sunpack_sevenzip_worker.exe` must be available in the same SunPack tool directory. Do not add a `7z.exe x` fallback to the product extraction path; failures must remain explicit and structured.

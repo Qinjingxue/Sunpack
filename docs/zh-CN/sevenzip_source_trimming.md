@@ -209,20 +209,36 @@ bridge 自带一份 IID 常量（`sevenzip_sdk.cpp`）。本机逐条比对确�
 
 ## 5. 关于汇编与性能
 
-`Asm/x86/*.asm` 是官方 Release 版 `7z.dll` 用的热点实现，其中对解压最重要的：
+`Asm/x86/*.asm` 是官方 Release 版 `7z.dll` 用的热点实现。**不是 12 个全部启用**——官方
+26.03 自身的构建也是按用途和架构挑实现，SunPack 只解压，所以范围比官方完整 `7z.exe`
+更窄。x64 下真正值得恢复的是 6 个：
 
-| 文件 | 作用 | 项目是否需要 |
-|------|------|--------------|
-| `LzmaDecOpt.asm` | `LzmaDec_DecodeReal_3()`，LZMA/LZMA2 主解码循环 | **建议启用**（配合 `-DZ7_LZMA_DEC_OPT`），7z/zip/xz 解压热点 |
-| `7zCrcOpt.asm` | CRC32 分片计算 | 建议启用 |
-| `Sha256Opt.asm` / `Sha1Opt.asm` | RAR5 / XZ 校验 | 可选 |
-| `Sort.asm` / `BwtSort` | bzip2 块排序 | 可选 |
-| `AesOpt.asm` | AES-CTR | 可选（加密包解压热点） |
+| 文件 | 提供的符号 | 作用 | 项目是否需要 |
+|------|------------|------|--------------|
+| `LzmaDecOpt.asm` | `LzmaDec_DecodeReal_3` | LZMA/LZMA2 主解码循环 | **启用**（配合 `LzmaDec.c` 的 `Z7_LZMA_DEC_OPT`），7z/zip/xz 解压最热的一段 |
+| `7zCrcOpt.asm` | `CrcUpdateT12` | CRC32 分片计算 | **启用**，ZIP/7z 等大量使用 |
+| `XzCrc64Opt.asm` | `XzCrc64UpdateT12` | CRC64 分片计算 | **启用**，XZ |
+| `AesOpt.asm` | `AesCbc_{Decode,Encode}_HW[_256]`、`AesCtr_Code_HW[_256]` | AES-NI / VAES 硬件路径 | **启用**，加密 7z/ZIP |
+| `Sha1Opt.asm` | `Sha1_UpdateBlocks_HW` | SHA-1 硬件路径 | **启用** |
+| `Sha256Opt.asm` | `Sha256_UpdateBlocks_HW` | SHA-256 硬件路径 | **启用** |
+| `Sort.asm` | `HeapSort` | 堆排序 | **不启用**，只被 `HuffEnc.c` / `BwtSort.c` 引用，属压缩侧 |
+| `LzFindOpt.asm` | `GetMatchesSpecN_2` | LZ match finder | **不启用**，只被 `LzFindMt.c` 引用，属压缩侧 |
 
-不启用汇编时 C 回退实现（`LzmaDec.c` / `7zCrcOpt.c` / `AesOpt.c` / `Sha256Opt.c` /
-`Sha1Opt.c`）保证功能正确，只是慢；本机验证就是走 C 回退路径。
-启用汇编需要在 CMake 里 `enable_language(ASM_MASM)` 并加入 `Asm/x86/7zAsm.asm`
-作为 include 依赖，`ml64.exe` 在 VS BuildTools 里已存在。
+上游没启用的两个并非"可选的解压热点"：`GetMatchesSpecN_2` **只**被 `LzFindMt.c`
+（LZMA 编码器的多线程 match finder）调用，`HeapSort` **只**被 `HuffEnc.c`（Huffman
+编码）与 `BwtSort.c`（BWT 排序）调用，全在压缩路径上。SunPack 因为 handler 注册依赖
+仍然保留这些编码器源码，但产品路径是解压，启用它们只会增加构建复杂度、MASM 攻击面
+和测试面积，几乎不带来运行收益。
+
+`Sort.asm` 也**不是** bzip2 热点：bzip2 解码走 `BZip2Decoder.cpp` / `Bz2Handler.cpp`，
+`BwtSort.c` 是编码侧的 BWT 排序。文档早期版本把它写成"bzip2 可选热点"是错的，已订正。
+
+不启用汇编时 C 回退实现（`LzmaDec.c` / `7zCrcOpt.c` / `XzCrc64Opt.c` / `AesOpt.c` /
+`Sha1Opt.c` / `Sha256Opt.c`）保证功能正确，只是慢。启用汇编的落地细节见 **§17**。
+
+ARM64 这一轮**完全不碰汇编**：官方 Windows ARM64 makefile 对 CRC32/CRC64/AES/SHA1/SHA256
+本来就选 C/intrinsics 实现；上游唯一的 ARM64 汇编热点 `Asm/arm64/LzmaDecOpt.S` 是
+GNU assembler + 预处理器语法，接不进 MSVC `-A ARM64`。功能完全一致。
 
 ---
 
@@ -939,3 +955,297 @@ MultiRangeInStream       QI(ISequentialInStream/IInStream) == S_OK
 > （`test_watch_root_output_routing.py`，`.sunpack-partial-*` 目录缺失），
 > 单独与并行重跑均通过，第二次完整验收 8/8 通过——判定为既有竞态 flake，
 > 与本次改动无关。本次改动已核实为行为惰性（上游不 QI `IProgress`）。
+
+---
+
+## 17. 阶段 3A：恢复官方 x64 解压汇编
+
+本轮只做一件事：让 x64 构建使用上游 7-Zip 的汇编热点实现。原则与 COM 阶段相同——
+**纯性能实现替换，不碰算法语义和数据通路**：archive / buffer / callback / worker
+代码零改动，五个 C 回退文件被同符号的 `.asm` 替换，`LzmaDec.c` 只把内核函数外包。
+
+### 17.1 启用集
+
+```text
+x64:
+  LzmaDecOpt.asm      ON   LzmaDec_DecodeReal_3
+  7zCrcOpt.asm        ON   CrcUpdateT12
+  XzCrc64Opt.asm      ON   XzCrc64UpdateT12
+  AesOpt.asm          ON   AesCbc_{Decode,Encode}_HW[_256] / AesCtr_Code_HW[_256]
+  Sha1Opt.asm         ON   Sha1_UpdateBlocks_HW
+  Sha256Opt.asm       ON   Sha256_UpdateBlocks_HW
+
+  Sort.asm            OFF  压缩侧（HuffEnc / BwtSort）
+  LzFindOpt.asm       OFF  压缩侧（LzFindMt）
+
+ARM64:
+  保持 C/intrinsics，不引入新 assembler toolchain
+```
+
+### 17.2 两组 OBJECT library，不混
+
+```text
+sunpack_7zip_objects        7-Zip C/C++    /O2 /Oi /Ot /GL /Gy /Gw /GF
+sunpack_7zip_asm_objects    x64 MASM only  无任何 C/C++ flag
+```
+
+`sup7z_attach_bundled_7z(target)` 同时注入两组。汇编单独成库的理由很实际：
+`/GL`、`/Oi`、`/Gy` 这些都不是 `ml64.exe` 的合法开关，混进同一个 target 会让 MASM
+收到一堆 C/C++ flag。
+
+`7zAsm.asm` **不是编译单元**，它是每个 `.asm` 顶部 `include` 的宏头文件，靠
+`target_include_directories(... Asm/x86)` 找到。
+
+### 17.3 两种替换模型
+
+**① 整文件替换（5 个）** —— `.asm` 与 `.c` 提供**完全相同的外部符号**，必须二选一：
+
+| C 回退 | 被替换为 | 符号 |
+|--------|----------|------|
+| `C/7zCrcOpt.c` | `Asm/x86/7zCrcOpt.asm` | `CrcUpdateT12` |
+| `C/XzCrc64Opt.c` | `Asm/x86/XzCrc64Opt.asm` | `XzCrc64UpdateT12` |
+| `C/AesOpt.c` | `Asm/x86/AesOpt.asm` | `AesCbc_Decode_HW` / `AesCbc_Decode_HW_256` / `AesCbc_Encode_HW` / `AesCtr_Code_HW` / `AesCtr_Code_HW_256` |
+| `C/Sha1Opt.c` | `Asm/x86/Sha1Opt.asm` | `Sha1_UpdateBlocks_HW` |
+| `C/Sha256Opt.c` | `Asm/x86/Sha256Opt.asm` | `Sha256_UpdateBlocks_HW` |
+
+**"ASM + C 一起编"不是保守选择，是直接不可行**：两套定义同名外部符号，链接期
+`LNK2005`。所以 x64 是**移除** C 回退，不是"加上"汇编。
+
+判定用 `list(FILTER ... EXCLUDE REGEX "/C/<name>$")` 而不是绝对路径 `REMOVE_ITEM`：
+`GLOB_RECURSE` 返回的路径分隔符跟随 `SUP7Z_7Z_ROOT` 的写法，精确字符串匹配可能静默
+不命中，然后在链接期才以 `LNK2005` 暴露。
+
+**② 部分替换（1 个）** —— `LzmaDec.c` **必须继续编译**，只把内核外包：
+
+```cpp
+# 未定义 Z7_LZMA_DEC_OPT        # 定义 Z7_LZMA_DEC_OPT
+static int LzmaDec_DecodeReal_3(...)   int LzmaDec_DecodeReal_3(...)   ← 外部 ASM
+{ /* C 实现 */ }
+```
+
+CMake 用 `set_source_files_properties` 把宏**只**给这一个 TU，不给整个 7-Zip target。
+
+### 17.4 两个数字分开，不合并
+
+configure 期的物理裁剪 sanity check 仍然是 **228**，而且**刻意放在架构选择之前**：
+
+```text
+check 1（先执行）  源码树 = 228 个 .c/.cpp           ← "树有没有被意外加删"
+check 2（后执行）  x64: 228 - 5 = 223               ← "本架构选中哪个实现"
+```
+
+合并成一个数就会把"源码树变了"和"x64 选了 ASM 还是 C"混成同一个症状。
+x64 最终实际编译量是 **223 个 C/C++ + 6 个 ASM**，而不是保留集从 228 变成 229。
+
+第三个检查：`SUP7Z_X64_ASM_ENABLED` 时逐个断言 6 个 `.asm` 都存在，避免"半个树
++ 汇编开关"这种最难查的组合。
+
+### 17.5 开关与构建脚本
+
+```cmake
+option(SUP7Z_USE_X64_ASM
+       "Use upstream 7-Zip x64 assembly hot paths (...)"
+       ON)
+```
+
+这不是用户功能配置，而是 **benchmark / 回退 / 排障开关**。它的价值在于让
+"ASM ON vs OFF"可以落在**同一个 commit**上比较，而不是拿"旧 7z.dll vs 新源码版"
+去比——后者因为中间已经改过 COM、factory、source linking、QoS，变量太多。
+
+能生效的前提是目标架构确实是 x64。判定用**编译器上报的架构**，
+不是生成器平台名，更不是指针宽度：
+
+```cmake
+if(MSVC)
+    if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)      # 权威来源，任何生成器都正确
+        set(SUP7Z_TARGET_UARCH "${CMAKE_CXX_COMPILER_ARCHITECTURE_ID}")
+    elseif(CMAKE_C_COMPILER_ARCHITECTURE_ID)
+        ...
+    elseif(CMAKE_GENERATOR_PLATFORM)            # 仅 VS 生成器会设置
+        ...
+    else()
+        set(SUP7Z_TARGET_UARCH "unknown")
+    endif()
+endif()
+
+# 白名单：只有精确等于 x64 / AMD64 才启用，其余一律 OFF
+if(SUP7Z_TARGET_UARCH STREQUAL "x64" OR SUP7Z_TARGET_UARCH STREQUAL "AMD64")
+```
+
+两个曾经的坑，都记在这里以免回退：
+
+| 写法 | 问题 |
+|------|------|
+| `CMAKE_GENERATOR_PLATFORM` 优先 | **MSVC + Ninja 下为空**，ARM64 会落到下一步 |
+| 回退 `CMAKE_SIZEOF_VOID_P EQUAL 8` | **64 位不等于 x64**。ARM64 也是 64 位，于是 MSVC + Ninja ARM64 会被误判成 x64，去 `enable_language(ASM_MASM)` 并编译 `Asm/x86/*.asm` |
+
+`CMAKE_CXX_COMPILER_ARCHITECTURE_ID` 在 MSVC ABI 下区分 `x64` / `ARM64` / `ARM64EC` /
+`X86`，对 Visual Studio 与 Ninja 都给得出正确答案（本机 VS `-A x64` 实测为 `x64`）。
+**无法确定的架构一律记作 `unknown` 并关闭汇编**——这是架构特定代码，
+宁可少启用，也绝不猜。
+
+判定逻辑做过 12 组真值表验证（用真实 CMake 跑，只喂变量不依赖工具链）：
+
+```text
+VS -A x64            → x64      ON     VS -A ARM64        → ARM64    OFF
+VS -A ARM64EC        → ARM64EC  OFF    VS -A Win32        → X86      OFF
+Ninja x64            → x64      ON     Ninja ARM64        → ARM64    OFF   ← 曾经的 bug
+id/plat 都为空       → unknown  OFF    AMD64 拼写         → AMD64    ON
+只有 C id            → ARM64    OFF    未知架构串         → RISCV64  OFF
+非 MSVC              → unknown  OFF
+```
+
+`scripts/build_windows.ps1` 与 `scripts/setup_windows_dev.ps1` 都**显式传**
+`-DSUP7Z_USE_X64_ASM=ON`，并在构建后调用共享的
+
+```text
+scripts/sevenzip_asm_check.ps1  →  Assert-SevenZipAsmSelection
+```
+
+它做三件事：
+
+```text
+① 从 sunpack_7zip_asm_objects.dir\Release\LzmaDecOpt.obj 精确解析
+   LzmaDec_DecodeReal_3 这个符号（名字必须完全一致，找不到就报错）
+② 取它所在的 32 字节 ml64 序言（读 COFF 节表 + 符号表，不依赖 dumpbin，不硬编码字节）
+③ 在四个二进制里按字节搜索：
+       build\Release\sunpack_sevenzip.dll
+       build\Release\sunpack_sevenzip_worker.exe  ← 大文件解压真正跑的进程
+       tools\sunpack_sevenzip.dll
+       tools\sunpack_sevenzip_worker.exe
+```
+
+判定：
+
+```text
+x64 且缓存里 SUP7Z_USE_X64_ASM=ON（默认）     → 任一命中 < 1 就 throw，构建失败
+x64 且缓存里显式 SUP7Z_USE_X64_ASM=OFF       → 跳过（这是合法的 A/B 配置）
+ARM64 / 非 x64                               → 跳过
+```
+
+为什么 build 目录和 `tools\` 都要查：`tools\` 那两份才是产品真正加载的，
+只查 build 目录会在拷贝步骤出问题时漏检；而 worker 才是大文件解压的执行者，
+"只证明 DLL 带汇编"不是完整结论。
+
+COFF 解析里有两个容易写错的地方，已在注释里标明：
+
+| 错误写法 | 真相 |
+|----------|------|
+| `$bytes[$entryOffset + 17]` 当 name length | 那是 **NumberOfAuxSymbols**。section symbol 都带 1 个 aux，而"取第一个 external function 就返回"恰好因为目标符号排在最后且 `naux=0` 才碰巧正确 |
+| aux entry 当普通 symbol 解析 | 索引必须前进 `1 + NumberOfAuxSymbols` |
+| 名字 union 判断 | 前 4 字节全 0 → bytes 4..7 是 string table 偏移；否则 0..7 是内联名字、NUL 截断 |
+| 循环变量命名 `$symbolName` | **PowerShell 变量名大小写不敏感**，会覆盖 `$SymbolName` 参数，使每次比较都对着刚解析出的名字，等于永远匹配。已改名 `$candidateName` |
+
+成功时输出（四行，对应四个二进制）：
+
+```text
+7-Zip asm check passed: LzmaDec_DecodeReal_3 present in sunpack_sevenzip.dll (1 match(es), 32 byte prologue).
+7-Zip asm check passed: LzmaDec_DecodeReal_3 present in sunpack_sevenzip_worker.exe (1 match(es), 32 byte prologue).
+```
+
+校验强度刻意停在这里：**LZMA 一处代表性最终链接证明已经足够**，再叠加六个符号各一套
+PE 扫描只会增加测试复杂度。已有的证据组合（6 个 `.obj` 必须存在 + C twin 必须消失 +
+无 LNK2005 + 代表符号在四个产物里命中）覆盖面已经充分。
+
+### 17.6 增量构建与 Release 配置
+
+**构建是增量的。** `Reset-StaleCMakeBuildDir` 只在缓存里的 `CMAKE_HOME_DIRECTORY`
+指向别的源码树时才删整个 `build-*` 目录；平台不匹配时只删 `CMakeCache.txt` +
+`CMakeFiles`。没有任何 `--clean-first` / `Rebuild` 调用。依赖跟踪交给 MSBuild/Ninja，
+源码发现交给 `GLOB_RECURSE ... CONFIGURE_DEPENDS`（每次构建重新 glob 并自动重跑
+configure）。实测重复 `cmake --build` 的输出只有 target 名，没有 `Assembling`、
+`正在编译`、`正在生成代码`，即全部判定为最新。
+
+**是 Release 优化。** 两个脚本都传 `--config Release`，全部产物落在 `Release\`：
+
+```text
+CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON
+  → /GL（编译期）+ WholeProgramOptimization
+  → /LTCG + /OPT:REF + /OPT:ICF（链接期）
+apply_release_optimizations() 按目标再加
+  → /O2 /Oi /Ot /Gy /Gw /GF
+```
+
+生成的 vcxproj 已核对：`sunpack_7zip_objects`（Release）为
+`<Optimization>MaxSpeed</Optimization>` + `<IntrinsicFunctions>true</IntrinsicFunctions>`
++ `<WholeProgramOptimization>true</WholeProgramOptimization>`；`sunpack_sevenzip.dll`
+为 `LinkTimeCodeGeneration=UseLinkTimeCodeGeneration` +
+`OptimizeReferences=true` + `EnableCOMDATFolding=true`。（`Debug|x64` 下这些位是
+`<Optimization>Disabled</Optimization>`，所以别用 Debug 做性能判断。）
+
+**唯一没有 Release 优化位的是 `sunpack_7zip_asm_objects`**，这是刻意的：那是手写汇编，
+MASM 没有优化开关，而 C/C++ 的 `/O2 /Oi /Ot /GL /Gy /Gw /GF` 会被 ml64 拒绝。
+生成的 vcxproj 里它的 Release `<MASM>` 组只有 include 路径、`CMAKE_INTDIR` 和
+`GenerateDebugInformation=false` —— 这正是把汇编拆成独立 OBJECT library 的目的。
+
+**切换 `SUP7Z_USE_X64_ASM` 必须换构建目录**，CMake 现在会强制这一点：
+
+```text
+build-x64\sup7z_asm_last_selection.txt  记录上次的 SUP7Z_X64_ASM_ENABLED
+  同目录下再次 configure 且取值变化 → FATAL_ERROR，提示删除目录或另开 build-asm-off
+```
+
+理由：翻转选项会换掉源文件列表，上一次运行的 `.obj` 会留在 `sunpack_7zip_objects.dir`
+里。它们不会被链接（列表已重新生成），但 A/B 对比恰恰是最不能容忍"某个对象被悄悄复用"
+的场景，所以宁可拒绝配置。本文件 §17.6 的 `build-asm-on` / `build-asm-off` 就是这么做的。
+
+### 17.7 验证
+
+| 验证 | 结果 |
+|------|------|
+| x64 配置（ASM ON） | 通过；`Found assembler: ml64.exe`，检查 1/2/3 全部通过 |
+| x64 Release 编译 + 链接 | 通过，**无 LNK2005**（否则说明某个 C 回退没被移掉） |
+| x64 配置（`-DSUP7Z_USE_X64_ASM=OFF`） | 通过；提示 `using upstream C/intrinsics` |
+| 两组 ABI 产物 | `sunpack_sevenzip.dll` / worker 均生成 |
+| `ctest` ASM ON | 5/5 通过 |
+| `ctest` ASM OFF | 5/5 通过 |
+| `pytest tests/unit tests/cli` | 1132 通过 |
+| `run_acceptance_tests.ps1 -Arch x64` | 8/8 步骤全部 PASS |
+| `setup_windows_dev.ps1 -Arch x64` | 通过（含四行 `7-Zip asm check passed`） |
+| 架构判定真值表（真实 CMake 跑，12 组） | 12/12 符合预期，仅 `x64` / `AMD64` 为 ON |
+| 构建期 asm 断言的分支覆盖 | ON→四个二进制全通过；ARM64→跳过；显式 OFF→跳过；x64 无 MASM 对象→throw；符号名不匹配→throw；产物缺失→throw |
+| 符号解析反例 | 请求 `HeapSort` / `CrcUpdateT12` / `AesCbc_Decode_HW` / `LZMADEC_DECODEREAL_3`（大小写不同）一律返回"未找到"，不返回任何随机符号 |
+| 负对照（ASM=OFF 的 worker/DLL） | MASM 序言命中 **0**；把它换进 `tools\sunpack_sevenzip_worker.exe` 后断言按预期 throw |
+
+**"汇编真的进去了"的证据链**（不是"配置说要启用"）：
+
+| 环节 | 证据 |
+|------|------|
+| MASM 真的跑了 | 构建日志 6 条 `Assembling ...Asm\x86\*.asm` |
+| 汇编对象真的提供符号 | `dumpbin /symbols` 每个 `.obj` 的 External 表：`LzmaDec_DecodeReal_3`、`CrcUpdateT12`、`XzCrc64UpdateT12`、`AesCbc_Decode_HW[_256]`、`AesCbc_Encode_HW`、`AesCtr_Code_HW[_256]`、`Sha1_UpdateBlocks_HW`、`Sha256_UpdateBlocks_HW` |
+| C 回退真的被移掉 | ASM ON 的 obj 目录里 5 个 C 回退 `.obj` **不存在**，C TU 计数 = **223**；ASM OFF 时 228 个全在 |
+| **MASM 代码真的在最终产物里** | 在 `LzmaDecOpt.obj` 的 `LzmaDec_DecodeReal_3` 序言中取 32 字节机器码（`53 55 56 57 41 54 41 55 41 56 41 57 48 8D 44 24 80 …`），在 ASM ON 的 **四个**产物里各命中 **1 次**：`sunpack_sevenzip.dll`、`sunpack_sevenzip_worker.exe`（build 目录）与 `tools\` 下同名的两份；在 ASM OFF 的 DLL / worker 里命中 **0 次** |
+| 这四条现在是**构建期强制**的 | `scripts/sevenzip_asm_check.ps1` 在两个构建脚本里执行同一套检查，任一产物未命中即 `throw` |
+
+最后一条是决定性的：符号表会被 LTCG 吃掉、section 名会被合并进 `.text`，但编译器
+生成的 MASM 序言字节序列不会凭空出现。取 0 次的那两个是负对照。
+worker 必须一起查——它是大文件解压真正跑的进程，"只证明 DLL 带汇编"不是完整结论。
+
+### 17.8 预期收益怎么看
+
+不要期望"所有解压 +30%"。更现实的分布：
+
+```text
+LZMA decoder core（LzmaDec_DecodeReal_3）  最大提升，官方历史数据约 +30%（仅 decoder core）
+端到端 LZMA2                              取决于 I/O、async writer、prefetch，必然低于纯 core
+XZ LZMA2                                  LZMA + CRC64
+ZIP Deflate                               主 decoder 没换，只得到 CRC32 加速
+stored ZIP / TAR                          CRC/IO 可能受益，没有 LZMA ASM 收益
+加密包                                     AES 路径可能有较明显提升
+Zstd / Bzip2                              基本不受这批 ASM 影响
+```
+
+SunPack 已经把读/解码/写重叠得比较激进，decoder 加速后瓶颈很可能进一步往
+writer / memcpy / storage 移动——这反而是好事：汇编恢复单变量做完，再做 buffer
+ownership 时才能清楚看到 `CPU decoder 瓶颈 → ASM → memory copy/writer 瓶颈 →
+zero-copy → I/O 瓶颈` 这条迁移路径，而不是同时改两个变量。
+
+### 17.9 本轮刻意没做
+
+```text
+Sort.asm / LzFindOpt.asm                  压缩侧，不解压热点
+ARM64 汇编（Asm/arm64/LzmaDecOpt.S）      GNU assembler 语法，接不进 MSVC -A ARM64
+Sha512Opt.asm                            上游同样存在，但不在本批 6 个之内
+buffer ownership / prefetch / memcpy      阶段 3B/4
+COM 层任何改动                            已封板
+```
