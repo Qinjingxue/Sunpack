@@ -14,7 +14,6 @@ namespace sunpack::sevenzip
 
     ResourceAnalysisResult analyze_archive_resources_internal(
 
-        CreateObjectFunc create_object,
 
         const std::wstring &archive_path,
 
@@ -39,7 +38,7 @@ namespace sunpack::sevenzip
 
             ComPtr<IInArchive> archive;
 
-            HRESULT hr = create_object(&format, &IID_IInArchive, reinterpret_cast<void **>(archive.out()));
+            HRESULT hr = create_in_archive(format, archive.out());
 
             if (hr != S_OK || !archive)
             {
@@ -135,21 +134,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        const CreateObjectFunc create_object = embedded_create_object();
-
-        if (!create_object)
-        {
-
-            ResourceAnalysisResult result;
-
-            result.status = PasswordTestStatus::BackendUnavailable;
-
-            result.message = "7z backend could not be loaded";
-
-            return result;
-        }
-
-        return analyze_archive_resources_internal(create_object, archive_path, password, part_paths);
+        return analyze_archive_resources_internal(archive_path, password, part_paths);
 
 #else
 

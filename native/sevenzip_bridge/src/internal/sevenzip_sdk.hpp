@@ -12,6 +12,17 @@
 
 #include <windows.h>
 
+// The bridge is now a source-level consumer of the bundled 7-Zip rather than a
+// 7z.dll client, so it uses upstream's declarations instead of a hand-copied
+// ABI mirror. These must come after the Windows COM headers above: the SunPack
+// targets build with WIN32_LEAN_AND_MEAN, which leaves <Windows.h> without the
+// COM/ole types 7-Zip's headers rely on.
+#include "7zip/Archive/IArchive.h"
+#include "7zip/IPassword.h"
+#include "7zip/IProgress.h"
+#include "7zip/IStream.h"
+#include "7zip/PropID.h"
+
 #endif
 
 #include <cstdint>
@@ -23,73 +34,63 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
+    // The declared signature is the same one the external 7z.dll exposed, and
+    // the bridge keeps its own mirror of the archive interfaces so that the
+    // implementation files stay unchanged. What matters for correctness is the
+    // IIDs, property ids and operation-result codes below: those now come from
+    // upstream, so they can no longer drift from the handler implementation.
+    using ::IID_IArchiveExtractCallback;
+    using ::IID_IArchiveOpenCallback;
+    using ::IID_IArchiveOpenVolumeCallback;
+    using ::IID_ICryptoGetTextPassword;
+    using ::IID_IInArchive;
+    using ::IID_IInStream;
+    using ::IID_IProgress;
+    using ::IID_ISequentialInStream;
+    using ::IID_ISequentialOutStream;
+
     using UInt16 = std::uint16_t;
 
     using Int64 = std::int64_t;
 
+    using ::kpidCRC;
+    using ::kpidDictionarySize;
+    using ::kpidEncrypted;
+    using ::kpidIsDir;
+    using ::kpidMethod;
+    using ::kpidName;
+    using ::kpidPackSize;
+    using ::kpidPath;
+    using ::kpidSize;
+    using ::kpidSolid;
+
     inline constexpr Int32 kAllItems = -1;
 
-    inline constexpr Int32 kTestMode = 1;
+    // Ask modes and operation results are upstream enums; the bridge keeps the
+    // short spellings so the extraction logic reads the same way it always did.
+    inline constexpr Int32 kExtractMode = NArchive::NExtract::NAskMode::kExtract;
 
-    inline constexpr Int32 kExtractMode = 0;
+    inline constexpr Int32 kTestMode = NArchive::NExtract::NAskMode::kTest;
 
-    inline constexpr Int32 kOpOk = 0;
+    inline constexpr Int32 kOpOk = NArchive::NExtract::NOperationResult::kOK;
 
-    inline constexpr Int32 kOpUnsupportedMethod = 1;
+    inline constexpr Int32 kOpUnsupportedMethod = NArchive::NExtract::NOperationResult::kUnsupportedMethod;
 
-    inline constexpr Int32 kOpDataError = 2;
+    inline constexpr Int32 kOpDataError = NArchive::NExtract::NOperationResult::kDataError;
 
-    inline constexpr Int32 kOpCrcError = 3;
+    inline constexpr Int32 kOpCrcError = NArchive::NExtract::NOperationResult::kCRCError;
 
-    inline constexpr Int32 kOpUnavailable = 4;
+    inline constexpr Int32 kOpUnavailable = NArchive::NExtract::NOperationResult::kUnavailable;
 
-    inline constexpr Int32 kOpUnexpectedEnd = 5;
+    inline constexpr Int32 kOpUnexpectedEnd = NArchive::NExtract::NOperationResult::kUnexpectedEnd;
 
-    inline constexpr Int32 kOpDataAfterEnd = 6;
+    inline constexpr Int32 kOpDataAfterEnd = NArchive::NExtract::NOperationResult::kDataAfterEnd;
 
-    inline constexpr Int32 kOpIsNotArc = 7;
+    inline constexpr Int32 kOpIsNotArc = NArchive::NExtract::NOperationResult::kIsNotArc;
 
-    inline constexpr Int32 kOpHeadersError = 8;
+    inline constexpr Int32 kOpHeadersError = NArchive::NExtract::NOperationResult::kHeadersError;
 
-    inline constexpr Int32 kOpWrongPassword = 9;
-
-    inline constexpr UInt32 kpidPath = 3;
-
-    inline constexpr UInt32 kpidName = 4;
-
-    inline constexpr UInt32 kpidIsDir = 6;
-
-    inline constexpr UInt32 kpidSize = 7;
-
-    inline constexpr UInt32 kpidPackSize = 8;
-
-    inline constexpr UInt32 kpidSolid = 13;
-
-    inline constexpr UInt32 kpidEncrypted = 15;
-
-    inline constexpr UInt32 kpidDictionarySize = 18;
-
-    inline constexpr UInt32 kpidCRC = 19;
-
-    inline constexpr UInt32 kpidMethod = 22;
-
-    extern const GUID IID_ISequentialInStream;
-
-    extern const GUID IID_ISequentialOutStream;
-
-    extern const GUID IID_IInStream;
-
-    extern const GUID IID_IProgress;
-
-    extern const GUID IID_ICryptoGetTextPassword;
-
-    extern const GUID IID_IArchiveOpenCallback;
-
-    extern const GUID IID_IArchiveExtractCallback;
-
-    extern const GUID IID_IArchiveOpenVolumeCallback;
-
-    extern const GUID IID_IInArchive;
+    inline constexpr Int32 kOpWrongPassword = NArchive::NExtract::NOperationResult::kWrongPassword;
 
     GUID format_guid(unsigned char format_id);
 
@@ -177,8 +178,6 @@ namespace sunpack::sevenzip
         virtual HRESULT STDMETHODCALLTYPE GetArchivePropertyInfo(UInt32 index, BSTR *name, UInt32 *propID, VARTYPE *varType) = 0;
     };
 
-    using CreateObjectFunc = HRESULT(WINAPI *)(const GUID *clsid, const GUID *iid, void **outObject);
-
     template <typename T>
 
     class ComPtr
@@ -225,7 +224,11 @@ namespace sunpack::sevenzip
         T *ptr_ = nullptr;
     };
 
-    CreateObjectFunc embedded_create_object();
+    // Upstream's archive factory, taken straight from the bundled sources
+    // (CPP/7zip/Archive/ArchiveExports.cpp). SunPack only ever creates
+    // IInArchive, so the old CreateObject() DLL entry point — which also
+    // dispatched coder and hasher requests — is not needed.
+    HRESULT create_in_archive(const GUID &format, IInArchive **archive);
 
 #endif
 

@@ -657,3 +657,77 @@ tools\7z.exe / tools\7z.dll（测试 fixture 生成链）
 
 前一组属于阶段 3/4 的性能与架构改造；后两项按 §12.1 的不变量明确保留。
 
+
+---
+
+## 13. 阶段 2 第一步：源码 API 迁移
+
+目标是把"为了调用 7z.dll 而复制出来的 COM ABI 层"换成**直接作为 7-Zip 源码的调用者**。
+边界很明确：删 SunPack 自己复制的壳，保留 7-Zip 内部真正的 COM-like 对象协议。
+
+### 13.1 改了什么
+
+| 对象 | 迁移前 | 迁移后 |
+|------|--------|--------|
+| 头文件 | bridge 手抄 `IInArchive` / `IInStream` / `IArchiveExtractCallback` / … 九套接口 | 直接 `#include "7zip/Archive/IArchive.h"` 等官方头 |
+| IID | `sevenzip_sdk.cpp` 里手写 9 个 `const GUID IID_*` | `using ::IID_*`，定义来自上游（`CPP/7zip/Guid.txt` 经接口头） |
+| PropID | `kpidPath = 3` 等 10 个手抄数字 | `using ::kpid*`，来自上游 `PropID.h` |
+| AskMode | `kTestMode = 1` / `kExtractMode = 0` | `NArchive::NExtract::NAskMode::kTest` / `kExtract` |
+| OperationResult | `kOpOk = 0` … `kOpWrongPassword = 9` 手抄 10 个 | `NArchive::NExtract::NOperationResult::*` |
+| 工厂 | `CreateObjectFunc` 函数指针 + `embedded_create_object()`，逐层透传 8 个函数签名 | `HRESULT create_in_archive(const GUID&, IInArchive**)` 直调上游 `CreateArchiver` |
+| 工厂守卫 | 每层 `if (!create_object) { … BackendUnavailable … }` | 删除（内置于本镜像，必存在；具体格式能否创建由 open 路径汇报） |
+| `is_backend_available()` | 探测工厂指针是否为空 | 直接 `true`（Windows） |
+
+`CreateObjectFunc`、`embedded_create_object()`、`create_object` 在 bridge 内已 **0 处残留**。
+
+### 13.2 CMake
+
+`sup7z_attach_bundled_7z(target)` 现在同时做两件事：挂 OBJECT 文件 + 加官方头 include。
+include 路径是 **PRIVATE 且只给 `CPP` 子树**：
+
+```cmake
+target_include_directories(${target_name} PRIVATE ${SUP7Z_7Z_ROOT}/CPP)
+```
+
+不能把 `${SUP7Z_7Z_ROOT}` PUBLIC 出去——会遮蔽 bridge 自己的 `internal/*.hpp`。
+`sunpack_sevenzip_core` 只加 include 不加 OBJECT 文件（它是 STATIC，会把注册对象吞掉）。
+
+### 13.3 三个实测确认的前提
+
+| 前提 | 结论 |
+|------|------|
+| 官方头能否在 `WIN32_LEAN_AND_MEAN` 下编译 | **能**。`sevenzip_sdk.hpp` 先 include `<objbase.h>` / `<oleauto.h>`，再 include 7-Zip 头即可，无需去掉目标上的 `WIN32_LEAN_AND_MEAN` |
+| 官方接口带 `throw()` 会不会破坏 override | **不会**。7-Zip 用 `COM_DECLSPEC_NOTHROW`（MSVC 下是 `__declspec(nothrow)`），它不参与重写匹配；bridge 现有 `HRESULT STDMETHODCALLTYPE X(...) override` 全部原样编译通过 |
+| `IArchiveOpenVolumeCallback::GetStream` 签名 | 上游也是 `const wchar_t*`，与 bridge 手抄**一致**，无隐藏 bug |
+
+### 13.4 本轮刻意没做（留给后续小步）
+
+**`DllExports2.cpp` 暂时必须留在构建里。** 它虽然不再被调用，但它是**唯一** `#include
+"Common/MyInitGuid.h"` 从而定义 `INITGUID` 的编译单元，也就是唯一真正定义 `IID_*`
+符号的地方。删掉它必须在自己的某个 TU 里接管 `INITGUID`。这一条已写进
+`sevenzip_sdk.cpp` 的注释，避免下次有人直接删了它然后撞上 LNK2001。
+
+其余未做项：
+
+```text
+DllExports2.cpp / CodecExports.cpp 裁剪（230 → 228）  → 第二步
+ComPtr → CMyComPtr（refcount 语义不同，需同批迁移）    → 第三步
+手写 QueryInterface/AddRef/Release → CMyUnknownImp      → 第三步
+CoInitializeEx / CoUninitialize / Ole32 退出             → 第三步
+IInArchive/ICoder/CoderMixer2/FilterCoder 内部结构       → 不在本阶段范围
+buffer ownership / prefetch / async writer / memcpy      → 阶段 3/4
+```
+
+### 13.5 验证
+
+| 验证 | 结果 |
+|------|------|
+| x64 Release 编译 + 链接 | 通过 |
+| `ctest`（bridge 4 个单测） | 4/4 通过 |
+| `pytest tests/unit tests/cli` | 1128 通过 |
+| `run_acceptance_tests.ps1 -Arch x64` | 8/8 步骤全部 PASS |
+| bridge 内 `create_object` / `CreateObjectFunc` / `embedded_create_object` 残留 | 0 处 |
+| `sunpack_sevenzip.dll` 导出表 | 9 个 `sup7z_*` 全部在位 |
+
+改动 8 个文件，**业务行为零变化**：解压数据路径、prefetch、async writer、所有 memcpy、
+所有 COM callback 语义均未触碰。

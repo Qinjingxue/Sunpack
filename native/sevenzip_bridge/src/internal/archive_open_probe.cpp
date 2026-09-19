@@ -30,7 +30,6 @@ ArchiveOpenProbeResult missing_tail_result(const char* evidence, const char* mes
 }  // namespace
 
 ArchiveOpenProbeResult probe_archive_open_internal(
-    CreateObjectFunc create_object,
     const std::wstring& archive_path,
     const std::wstring& password,
     const std::vector<std::wstring>& part_paths
@@ -67,7 +66,7 @@ ArchiveOpenProbeResult probe_archive_open_internal(
     for (const auto& plan : plans) {
         for (const GUID& format : plan.formats) {
         ComPtr<IInArchive> archive;
-        HRESULT hr = create_object(&format, &IID_IInArchive, reinterpret_cast<void**>(archive.out()));
+        HRESULT hr = create_in_archive(format, archive.out());
         if (hr != S_OK || !archive) {
             last_hr = hr;
             continue;
@@ -188,14 +187,7 @@ ArchiveOpenProbeResult probe_archive_open_with_parts(
     const std::wstring& password
 ) {
 #ifdef _WIN32
-    const CreateObjectFunc create_object = embedded_create_object();
-    if (!create_object) {
-        ArchiveOpenProbeResult result;
-        result.status = PasswordTestStatus::BackendUnavailable;
-        result.message = "7z backend could not be loaded";
-        return result;
-    }
-    return probe_archive_open_internal(create_object, archive_path, password, part_paths);
+    return probe_archive_open_internal(archive_path, password, part_paths);
 #else
     (void)archive_path;
     (void)part_paths;

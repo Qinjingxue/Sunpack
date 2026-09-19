@@ -2,10 +2,15 @@
 
 #ifdef _WIN32
 
-// Supplied by the bundled 7-Zip sources (CPP/7zip/Archive/DllExports2.cpp) that
-// are linked into the same image. The signature is the same one the historical
-// external backend exposed, so every call site below this one is unchanged.
-STDAPI CreateObject(const GUID *clsid, const GUID *iid, void **outObject);
+// Upstream's archive factory, provided by the bundled sources
+// (CPP/7zip/Archive/ArchiveExports.cpp) linked into the same image.
+//
+// NOTE: DllExports2.cpp must stay in the build for now even though nothing here
+// calls CreateObject() any more — it pulls in Common/MyInitGuid.h, which is the
+// only place that defines INITGUID, and therefore the only translation unit
+// that actually defines the IID_* symbols. Dropping it would leave them
+// undefined. Removing it means moving INITGUID into one of our own TUs.
+STDAPI CreateArchiver(const GUID *clsid, const GUID *iid, void **outObject);
 
 #endif
 
@@ -14,46 +19,32 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-    const GUID IID_ISequentialInStream = {
-
-        0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x00, 0x00}};
-
-    const GUID IID_ISequentialOutStream = {
-
-        0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x03, 0x00, 0x02, 0x00, 0x00}};
-
-    const GUID IID_IInStream = {
-
-        0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x03, 0x00, 0x03, 0x00, 0x00}};
-
-    const GUID IID_IProgress = {
-
-        0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x00, 0x00}};
-
-    const GUID IID_ICryptoGetTextPassword = {
-
-        0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x05, 0x00, 0x10, 0x00, 0x00}};
-
-    const GUID IID_IArchiveOpenCallback = {
-
-        0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x06, 0x00, 0x10, 0x00, 0x00}};
-
-    const GUID IID_IArchiveExtractCallback = {
-
-        0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x06, 0x00, 0x20, 0x00, 0x00}};
-
-    const GUID IID_IArchiveOpenVolumeCallback = {
-
-        0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x06, 0x00, 0x30, 0x00, 0x00}};
-
-    const GUID IID_IInArchive = {
-
-        0x23170F69, 0x40C1, 0x278A, {0x00, 0x00, 0x00, 0x06, 0x00, 0x60, 0x00, 0x00}};
+    // The IID definitions that used to live here — a hand-copied mirror of
+    // 7-Zip's interface identities — are gone. They now come from upstream
+    // (CPP/7zip/Guid.txt via the interface headers), so they cannot drift from
+    // the handler implementation they are matched against.
 
     GUID format_guid(unsigned char format_id)
     {
 
         return {0x23170F69, 0x40C1, 0x278A, {0x10, 0x00, 0x00, 0x01, 0x10, format_id, 0x00, 0x00}};
+    }
+
+    HRESULT create_in_archive(const GUID &format, IInArchive **archive)
+    {
+
+        if (!archive)
+        {
+
+            return E_POINTER;
+        }
+
+        *archive = nullptr;
+
+        // CreateArchiver is upstream's real entry point; the old CreateObject()
+        // wrapper additionally dispatched coder and hasher requests that SunPack
+        // never made.
+        return ::CreateArchiver(&format, &IID_IInArchive, reinterpret_cast<void **>(archive));
     }
 
     std::wstring win32_extended_path(const std::wstring &path)
@@ -84,14 +75,6 @@ namespace sunpack::sevenzip
         }
 
         return path;
-    }
-
-    CreateObjectFunc embedded_create_object()
-    {
-
-        // The bundled 7-Zip backend replaced the external module loader, so there
-        // is exactly one factory and no module lookup left to perform.
-        return &::CreateObject;
     }
 
 #endif

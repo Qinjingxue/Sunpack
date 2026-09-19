@@ -14,7 +14,6 @@ namespace sunpack::sevenzip {
 
 CrcManifestResult read_archive_crc_manifest_internal(
 
-    CreateObjectFunc create_object,
 
     const std::wstring& archive_path,
 
@@ -41,7 +40,7 @@ CrcManifestResult read_archive_crc_manifest_internal(
 
         ComPtr<IInArchive> archive;
 
-        HRESULT hr = create_object(&format, &IID_IInArchive, reinterpret_cast<void**>(archive.out()));
+        HRESULT hr = create_in_archive(format, archive.out());
 
         if (hr != S_OK || !archive) {
 
@@ -296,21 +295,7 @@ CrcManifestResult read_archive_crc_manifest_with_parts(
 
 #ifdef _WIN32
 
-    const CreateObjectFunc create_object = embedded_create_object();
-
-    if (!create_object) {
-
-        CrcManifestResult result;
-
-        result.status = PasswordTestStatus::BackendUnavailable;
-
-        result.message = "7z backend could not be loaded";
-
-        return result;
-
-    }
-
-    return read_archive_crc_manifest_internal(create_object, archive_path, password, part_paths, max_items);
+    return read_archive_crc_manifest_internal(archive_path, password, part_paths, max_items);
 
 #else
 

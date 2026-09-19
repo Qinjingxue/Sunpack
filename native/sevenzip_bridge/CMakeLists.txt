@@ -89,16 +89,24 @@ endif()
 # only swaps the backend's link origin, so the portable C/C++ paths are used
 # first; restoring the arch-optimised assembly is a separate change.
 
-# Every target that links sunpack_sevenzip_core needs these objects too: core
-# contains sevenzip_sdk.obj, which references CreateObject unconditionally. Only
-# smoke.cpp exercises the archive backend itself, but the symbol has to resolve
-# for the remaining tests as well.
+# Attaches the bundled 7-Zip to a target that needs it.
+#
+#   * the OBJECT files must go into the final PE (see the note above), and
+#   * the bridge is now a source-level consumer of 7-Zip, so it also needs the
+#     official headers that declare the interfaces, IIDs, property ids and
+#     operation-result codes it used to hand-copy.
+#
+# The include directory is PRIVATE and scoped to the CPP subtree: exporting
+# ${SUP7Z_7Z_ROOT} publicly would shadow the bridge's own internal/*.hpp
+# headers, and nothing outside the bridge should see 7-Zip's headers at all.
 function(sup7z_attach_bundled_7z target_name)
     if(WIN32 AND TARGET sunpack_7zip_objects)
         target_sources(${target_name} PRIVATE
             $<TARGET_OBJECTS:sunpack_7zip_objects>)
+        target_include_directories(${target_name} PRIVATE ${SUP7Z_7Z_ROOT}/CPP)
     endif()
 endfunction()
+
 
 set(SUP7Z_INTERNAL_SOURCES
     src/internal/archive_extract.cpp
@@ -133,6 +141,13 @@ target_include_directories(sunpack_sevenzip_core
 )
 
 if(WIN32)
+    # Headers only: the 7-Zip OBJECT files are deliberately NOT attached here.
+    # core is a STATIC library, so archiving them would re-introduce the
+    # "registrar object dropped" failure. Callers attach the objects themselves.
+    target_include_directories(sunpack_sevenzip_core PRIVATE ${SUP7Z_7Z_ROOT}/CPP)
+endif()
+
+if(WIN32)
     target_compile_definitions(sunpack_sevenzip_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX SUP7Z_BUILD_DLL)
     target_link_libraries(sunpack_sevenzip_core PUBLIC OleAut32 Ole32)
 endif()
@@ -157,12 +172,11 @@ if(WIN32)
     target_compile_definitions(sunpack_sevenzip PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX SUP7Z_BUILD_DLL)
     target_link_libraries(sunpack_sevenzip PRIVATE OleAut32 Ole32)
 
-    # The bundled 7-Zip objects go straight into the DLL image. They are NOT
-    # routed through sunpack_sevenzip_core: that is a STATIC library, and its
-    # archive members would be dropped again for the same "no referenced
-    # symbol" reason the OBJECT library exists to avoid.
-    target_sources(sunpack_sevenzip PRIVATE
-        $<TARGET_OBJECTS:sunpack_7zip_objects>)
+    # Bundled 7-Zip objects plus the official headers the bridge now includes.
+    # The objects are NOT routed through sunpack_sevenzip_core: that is a STATIC
+    # library, and its archive members would be dropped again for the same
+    # "no referenced symbol" reason the OBJECT library exists to avoid.
+    sup7z_attach_bundled_7z(sunpack_sevenzip)
 endif()
 
 add_executable(sunpack_sevenzip_smoke

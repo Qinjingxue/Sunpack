@@ -209,7 +209,6 @@ namespace sunpack::sevenzip
 
     ExtractArchiveResult extract_archive_internal(
 
-        CreateObjectFunc create_object,
 
         const std::wstring &archive_path,
 
@@ -327,7 +326,7 @@ namespace sunpack::sevenzip
 
             ComPtr<IInArchive> archive;
 
-            HRESULT hr = create_object(&format, &IID_IInArchive, reinterpret_cast<void **>(archive.out()));
+            HRESULT hr = create_in_archive(format, archive.out());
 
             attempt.create_hresult = static_cast<int>(hr);
 
@@ -684,12 +683,12 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        const CreateObjectFunc create_object = embedded_create_object();
-
-        return create_object != nullptr;
+        // The 7-Zip backend is part of this image, so it is always present.
+        // Whether a specific format handler can be created is reported by the
+        // open path itself.
+        return true;
 
 #else
-
 
         return false;
 
@@ -732,29 +731,13 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        const CreateObjectFunc create_object = embedded_create_object();
-
-        if (!create_object)
-        {
-
-            ExtractArchiveResult result;
-
-            result.status = PasswordTestStatus::BackendUnavailable;
-
-            set_failure(result, "backend_load", "backend_unavailable");
-
-            result.message = "7z backend could not be loaded";
-
-            return result;
-        }
-
+        
         const std::vector<std::wstring> effective_part_paths =
 
             part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
 
         return extract_archive_internal(
 
-            create_object,
 
             archive_path,
 
@@ -850,25 +833,9 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        const CreateObjectFunc create_object = embedded_create_object();
-
-        if (!create_object)
-        {
-
-            ExtractArchiveResult result;
-
-            result.status = PasswordTestStatus::BackendUnavailable;
-
-            set_failure(result, "backend_load", "backend_unavailable");
-
-            result.message = "7z backend could not be loaded";
-
-            return result;
-        }
-
+        
         return extract_archive_internal(
 
-            create_object,
 
             archive_path,
 

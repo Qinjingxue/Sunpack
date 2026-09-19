@@ -149,7 +149,6 @@ namespace sunpack::sevenzip
 
     PasswordTestResult test_one_password(
 
-        CreateObjectFunc create_object,
 
         const std::wstring &archive_path,
 
@@ -168,7 +167,6 @@ namespace sunpack::sevenzip
 
     PasswordTestResult test_one_password(
 
-        CreateObjectFunc create_object,
 
         const std::wstring &archive_path,
 
@@ -181,7 +179,6 @@ namespace sunpack::sevenzip
 
         return test_one_password(
 
-            create_object,
 
             archive_path,
 
@@ -198,7 +195,6 @@ namespace sunpack::sevenzip
 
     PasswordTestResult test_one_password(
 
-        CreateObjectFunc create_object,
 
         const std::wstring &archive_path,
 
@@ -247,7 +243,7 @@ namespace sunpack::sevenzip
 
                 ComPtr<IInArchive> archive;
 
-                HRESULT hr = create_object(&format, &IID_IInArchive, reinterpret_cast<void **>(archive.out()));
+                HRESULT hr = create_in_archive(format, archive.out());
 
                 if (hr != S_OK || !archive)
                 {
@@ -511,7 +507,6 @@ namespace sunpack::sevenzip
 
     PasswordTestResult test_one_password_reuse_stream(
 
-        CreateObjectFunc create_object,
 
         const std::wstring &archive_path,
 
@@ -548,7 +543,7 @@ namespace sunpack::sevenzip
 
             ComPtr<IInArchive> archive;
 
-            HRESULT hr = create_object(&format, &IID_IInArchive, reinterpret_cast<void **>(archive.out()));
+            HRESULT hr = create_in_archive(format, archive.out());
 
             if (hr != S_OK || !archive)
             {
@@ -751,23 +746,10 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        CreateObjectFunc create_object = embedded_create_object();
-
-        if (!create_object)
-        {
-
-            PasswordTestResult result;
-
-            result.status = PasswordTestStatus::BackendUnavailable;
-
-            result.message = "the embedded 7-Zip backend is unavailable";
-
-            return result;
-        }
-
+        
         const auto effective_parts = part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
         PasswordTestResult result = test_one_password(
-            create_object, archive_path, password, effective_parts,
+            archive_path, password, effective_parts,
             candidate_formats(archive_path, effective_parts), {}, false, canonical_names);
 
         result.attempts = 1;
@@ -827,20 +809,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        CreateObjectFunc create_object = embedded_create_object();
-
-        if (!create_object)
-        {
-
-            PasswordTestResult result;
-
-            result.status = PasswordTestStatus::BackendUnavailable;
-
-            result.message = "the embedded 7-Zip backend is unavailable";
-
-            return result;
-        }
-
+        
         PasswordTestResult last;
 
         last.backend_available = true;
@@ -903,7 +872,6 @@ namespace sunpack::sevenzip
 
             PasswordTestResult current = test_one_password(
 
-                create_object,
 
                 archive_path,
 
@@ -1009,20 +977,7 @@ namespace sunpack::sevenzip
 
 #ifdef _WIN32
 
-        CreateObjectFunc create_object = embedded_create_object();
-
-        if (!create_object)
-        {
-
-            PasswordTestResult result;
-
-            result.status = PasswordTestStatus::BackendUnavailable;
-
-            result.message = "the embedded 7-Zip backend is unavailable";
-
-            return result;
-        }
-
+        
         PasswordTestResult last;
 
         last.backend_available = true;
@@ -1048,7 +1003,6 @@ namespace sunpack::sevenzip
 
             PasswordTestResult current = test_one_password(
 
-                create_object,
 
                 archive_path,
 
