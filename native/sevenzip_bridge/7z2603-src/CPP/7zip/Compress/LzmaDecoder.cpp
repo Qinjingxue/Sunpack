@@ -5,6 +5,9 @@
 #include "../../../C/Alloc.h"
 
 #include "../Common/StreamUtils.h"
+#if SUP7Z_USE_SHARED_INPUT
+#include "../Common/SunpackSharedInput.h"
+#endif
 
 #include "LzmaDecoder.h"
 
@@ -125,12 +128,68 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
   SizeT wrPos = _state.dicPos;
   HRESULT readRes = S_OK;
 
+#if SUP7Z_USE_SHARED_INPUT
+  CMyComPtr<ISunpackSharedInput> sharedInput;
+  inStream->QueryInterface(IID_ISunpackSharedInput, (void **)&sharedInput);
+  UInt64 borrowToken = 0;
+  const Byte *inData = _inBuf;
+  struct CLeaseGuard
+  {
+    ISunpackSharedInput *Source;
+    UInt64 *Token;
+    ~CLeaseGuard()
+    {
+      if (Source && *Token)
+        Source->ReleaseBorrowed(*Token);
+    }
+  } leaseGuard = { sharedInput, &borrowToken };
+#endif
+
   for (;;)
   {
     if (_inPos == _inLim && readRes == S_OK)
     {
       _inPos = _inLim = 0;
+#if SUP7Z_USE_SHARED_INPUT
+      if (borrowToken)
+      {
+        sharedInput->ReleaseBorrowed(borrowToken);
+        borrowToken = 0;
+      }
+
+      HRESULT borrowRes = S_FALSE;
+      if (sharedInput)
+      {
+        const Byte *borrowed = NULL;
+        UInt32 borrowedSize = 0;
+        UInt64 token = 0;
+        borrowRes = sharedInput->Borrow(_inBufSize, &borrowed, &borrowedSize, &token);
+        if (borrowRes == S_OK)
+        {
+          if (!borrowed || borrowedSize == 0 || token == 0)
+          {
+            if (token)
+              sharedInput->ReleaseBorrowed(token);
+            borrowRes = E_FAIL;
+          }
+          else
+          {
+            inData = borrowed;
+            _inLim = borrowedSize;
+            borrowToken = token;
+          }
+        }
+      }
+      if (borrowRes == S_FALSE)
+      {
+        inData = _inBuf;
+        readRes = inStream->Read(_inBuf, _inBufSize, &_inLim);
+      }
+      else if (borrowRes != S_OK)
+        readRes = borrowRes;
+#else
       readRes = inStream->Read(_inBuf, _inBufSize, &_inLim);
+#endif
     }
 
     const SizeT dicPos = _state.dicPos;
@@ -157,7 +216,13 @@ HRESULT CDecoder::CodeSpec(ISequentialInStream *inStream, ISequentialOutStream *
     SizeT inProcessed = _inLim - _inPos;
     ELzmaStatus status;
 
-    const SRes res = LzmaDec_DecodeToDic(&_state, dicPos + size, _inBuf + _inPos, &inProcessed, finishMode, &status);
+    const SRes res = LzmaDec_DecodeToDic(&_state, dicPos + size,
+#if SUP7Z_USE_SHARED_INPUT
+        inData + _inPos,
+#else
+        _inBuf + _inPos,
+#endif
+        &inProcessed, finishMode, &status);
 
     _lzmaStatus = status;
     _inPos += (UInt32)inProcessed;
