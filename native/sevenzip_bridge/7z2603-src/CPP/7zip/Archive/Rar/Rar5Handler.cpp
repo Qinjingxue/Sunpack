@@ -545,7 +545,6 @@ public:
 #if SUP7Z_USE_SHARED_OUTPUT
   void SetStream(ISequentialOutStream *stream);
   void ReleaseStream();
-  Z7_IFACE_COM7_IMP(ISunpackSharedOutput)
 #else
   void SetStream(ISequentialOutStream *stream) { _stream = stream; }
 #endif
@@ -662,18 +661,21 @@ Z7_COM7F_IMF(COutStreamWithHash::Commit(
       !_leaseData || size > _leaseCapacity)
     return E_INVALIDARG;
 
+  // Hash/copy while the direct lease is still exclusively owned by us.
+  // Commit transfers the writer buffer and it can be recycled immediately.
+  if (size)
+  {
+    if (_destBuf)
+      memcpy(_destBuf + (size_t)_pos, _leaseData, size);
+    _hash.Update(_leaseData, size);
+  }
+
   UInt32 committed = 0;
   const HRESULT res = _sharedOutput->Commit(token, size, &committed);
   if (res == S_OK && committed != size)
     return E_FAIL;
-
   if (committed)
-  {
-    if (_destBuf)
-      memcpy(_destBuf + (size_t)_pos, _leaseData, committed);
-    _hash.Update(_leaseData, committed);
     _pos += committed;
-  }
 
   _leaseData = NULL;
   _leaseCapacity = 0;
