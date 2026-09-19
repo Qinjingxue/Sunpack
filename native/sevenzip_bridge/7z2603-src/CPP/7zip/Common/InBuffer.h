@@ -72,10 +72,13 @@ public:
   }
   void ClearStreamPtr()
   {
-#if SUP7Z_USE_SHARED_INPUT
-    ReleaseBorrowed();
-    _sharedInput.Release();
-#endif
+    /*
+      Do not release a borrowed span here. Some decoders (notably Deflate)
+      clear the input stream at the end of Code() and then expose
+      ReadUnusedFromInBuf() over the still-buffered tail. The old owned
+      buffer stayed valid across ClearStreamPtr(), so the leased view must
+      preserve the same lifetime. SetStream(), Init() and Free() retire it.
+    */
     _stream = NULL;
   }
   
