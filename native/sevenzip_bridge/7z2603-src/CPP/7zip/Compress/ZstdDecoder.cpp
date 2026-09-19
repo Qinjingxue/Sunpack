@@ -18,13 +18,14 @@ namespace NCompress {
 namespace NZstd {
 
 #if SUP7Z_USE_SHARED_OUTPUT
-using CZstdSharedOutputLeases = CSunpackSharedOutputLeaseRing<32>;
+using CZstdSharedOutputLeases = CSunpackSharedOutputRangeLeaseRing<32>;
 
-static SRes SharedOutput_BeforeWindowReuse(void *ctx)
+static SRes SharedOutput_BeforeWindowReuse(void *ctx, size_t begin, size_t end)
 {
   if (!ctx)
     return SZ_OK;
-  const HRESULT res = ((CZstdSharedOutputLeases *)ctx)->Drain();
+  const HRESULT res = ((CZstdSharedOutputLeases *)ctx)->RetireOverlapping(
+      (UInt64)begin, (UInt64)end);
   return res == S_OK ? SZ_OK : SZ_ERROR_WRITE;
 }
 
@@ -240,7 +241,9 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
       if (accepted == 0 || accepted > request || token == 0)
         return E_FAIL;
 
-      const HRESULT retireRes = outputLeases.Push(token);
+      const UInt64 rangeBegin = (UInt64)(data - _state.win);
+      const HRESULT retireRes = outputLeases.Push(
+          token, rangeBegin, rangeBegin + accepted);
       if (retireRes != S_OK)
         return retireRes;
       data += accepted;
@@ -335,7 +338,15 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
       {
         // we try to flush on aligned positions, if possible
         size = _state.needWrite_Size; // minimal required write size
-        const size_t alignedPos = _state.winPos & ~(size_t)_outStepMask;
+        // Borrowed output should normally reach the writer's 1 MiB work-item
+        // size instead of emitting one async WriteFile per 128 KiB Zstd block.
+        // 1 MiB is still a multiple of Zstd's required 128 KiB alignment.
+        const size_t sharedStepMask = sharedOutput
+            ? (((size_t)1 << 20) - 1) : (size_t)_outStepMask;
+        const size_t effectiveStepMask =
+            sharedStepMask > (size_t)_outStepMask
+                ? sharedStepMask : (size_t)_outStepMask;
+        const size_t alignedPos = _state.winPos & ~effectiveStepMask;
         if (alignedPos > _state.wrPos)
         {
           const size_t size2 = alignedPos - _state.wrPos;  // optimized aligned size
