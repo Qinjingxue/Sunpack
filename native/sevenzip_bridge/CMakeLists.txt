@@ -2,8 +2,6 @@ cmake_minimum_required(VERSION 3.20)
 
 project(sunpack_sevenzip LANGUAGES C CXX)
 
-include(FetchContent)
-
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -38,10 +36,13 @@ endfunction()
 
 set(SUP7Z_7Z_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/7z2603-src")
 
-# zlib-ng is used only for selected ZIP Deflate entries. Pin the exact upstream
-# commit used by the benchmark and production adapter so decoder behavior cannot
-# drift between builds.
-set(SUP7Z_ZLIB_NG_COMMIT "12731092979c6d07f42da27da673a9f6c7b13586")
+# zlib-ng is used only for selected ZIP Deflate entries. Keep the exact
+# benchmarked 2.3.3 sources in-tree so native builds remain deterministic and
+# fully offline, like the bundled 7-Zip backend.
+set(SUP7Z_ZLIB_NG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/zlib-ng-2.3.3")
+if(NOT EXISTS "${SUP7Z_ZLIB_NG_ROOT}/CMakeLists.txt")
+    message(FATAL_ERROR "Vendored zlib-ng 2.3.3 source tree is missing")
+endif()
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "Build static third-party libraries" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "Disable third-party tests" FORCE)
 set(WITH_GTEST OFF CACHE BOOL "Disable zlib-ng gtest targets" FORCE)
@@ -55,15 +56,11 @@ set(WITH_OPTIM ON CACHE BOOL "Enable zlib-ng optimized inflate paths" FORCE)
 set(WITH_RUNTIME_CPU_DETECTION ON CACHE BOOL "Dispatch zlib-ng SIMD at runtime" FORCE)
 set(WITH_NATIVE_INSTRUCTIONS OFF CACHE BOOL "Keep release binaries CPU-portable" FORCE)
 set(INSTALL_UTILS OFF CACHE BOOL "Do not build zlib-ng utilities" FORCE)
-
-FetchContent_Declare(
-    sup7z_zlib_ng
-    GIT_REPOSITORY https://github.com/zlib-ng/zlib-ng.git
-    GIT_TAG ${SUP7Z_ZLIB_NG_COMMIT}
-    GIT_SHALLOW FALSE
-    GIT_PROGRESS FALSE
-)
-FetchContent_MakeAvailable(sup7z_zlib_ng)
+set(SKIP_INSTALL_ALL ON CACHE BOOL "Do not install embedded zlib-ng separately" FORCE)
+add_subdirectory(
+    "${SUP7Z_ZLIB_NG_ROOT}"
+    "${CMAKE_CURRENT_BINARY_DIR}/zlib-ng"
+    EXCLUDE_FROM_ALL)
 
 option(SUP7Z_USE_X64_ASM
     "Use upstream 7-Zip x64 assembly hot paths (LZMA decoder, CRC32/CRC64, AES, SHA)"
@@ -624,9 +621,27 @@ if(WIN32)
     target_compile_definitions(sunpack_sevenzip_com_contract PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
+# Contract test for the selected ZIP Deflate decoder. Strong Encryption relies
+# on retrieving bytes that inflate prefetched past the raw Deflate end marker so
+# the existing 7-Zip path can validate PKCS#7 padding.
+add_executable(sunpack_zlib_ng_deflate_contract
+    tests/zlib_ng_deflate_decoder.cpp
+)
+apply_release_optimizations(sunpack_zlib_ng_deflate_contract)
+apply_source_charset(sunpack_zlib_ng_deflate_contract)
+target_link_libraries(sunpack_zlib_ng_deflate_contract
+    PRIVATE sunpack_sevenzip_core)
+sup7z_attach_bundled_7z(sunpack_zlib_ng_deflate_contract)
+target_include_directories(sunpack_zlib_ng_deflate_contract
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+if(WIN32)
+    target_compile_definitions(sunpack_zlib_ng_deflate_contract PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+endif()
+
 enable_testing()
 add_test(NAME sunpack_sevenzip_smoke COMMAND sunpack_sevenzip_smoke)
 add_test(NAME sunpack_sevenzip_async_output COMMAND sunpack_sevenzip_async_output)
 add_test(NAME sunpack_sevenzip_space_gate COMMAND sunpack_sevenzip_space_gate)
 add_test(NAME sunpack_sevenzip_space_retry COMMAND sunpack_sevenzip_space_retry)
 add_test(NAME sunpack_sevenzip_com_contract COMMAND sunpack_sevenzip_com_contract)
+add_test(NAME sunpack_zlib_ng_deflate_contract COMMAND sunpack_zlib_ng_deflate_contract)

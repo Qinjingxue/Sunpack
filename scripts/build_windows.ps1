@@ -1132,6 +1132,7 @@ Copy-Item -LiteralPath $mitLicensePath -Destination (Join-Path $distLicensesRoot
 Copy-Item -LiteralPath $sevenZipLicensePath -Destination (Join-Path $distLicensesRoot "7zip-license.txt") -Force
 Copy-Item -LiteralPath $sevenZipSourceLicensePath -Destination (Join-Path $distLicensesRoot "7zip-source-license.txt") -Force
 Copy-Item -LiteralPath $lgplLicensePath -Destination (Join-Path $distLicensesRoot "LGPL-2.1.txt") -Force
+Copy-Item -LiteralPath $zlibNgLicensePath -Destination (Join-Path $distLicensesRoot "zlib-ng-license.txt") -Force
 Copy-Item -LiteralPath $thirdPartyNoticesPath -Destination $distThirdPartyNoticesPath -Force
 
 $distScriptsRoot = Join-Path $distAppRoot "scripts"
@@ -1147,6 +1148,7 @@ Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "SunPack-MIT.txt") -
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "7zip-license.txt") -Description "Packaged 7-Zip binary license file"
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "7zip-source-license.txt") -Description "Packaged 7-Zip source license file"
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "LGPL-2.1.txt") -Description "Packaged GNU LGPL 2.1 license file"
+Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "zlib-ng-license.txt") -Description "Packaged zlib-ng license file"
 Assert-PathExists -LiteralPath $distThirdPartyNoticesPath -Description "Packaged third-party notices file"
 Assert-PathMissing -LiteralPath (Join-Path $distToolsRoot "7z.dll") -Description "Legacy standalone tools/7z.dll (the 7-Zip backend is embedded)"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "sunpack_sevenzip.dll") -BuildArch $buildArch -Description "Packaged tools/sunpack_sevenzip.dll"
