@@ -75,6 +75,16 @@ namespace sunpack::sevenzip
                                                    static_cast<std::uint64_t>((std::numeric_limits<std::size_t>::max)())));
     }
 
+    inline std::size_t native_decoder_thread_budget(
+        std::size_t thread_capacity,
+        std::size_t active_jobs) noexcept
+    {
+        thread_capacity = (std::max)(std::size_t{1}, thread_capacity);
+        active_jobs = (std::max)(std::size_t{1}, active_jobs);
+        return (std::min)(std::size_t{8},
+                          (std::max)(std::size_t{1}, thread_capacity / active_jobs));
+    }
+
     inline NativeSizingPlan derive_native_sizing_plan(
         NativeMachineResources resources,
         const NativeSizingOverrides &overrides,
