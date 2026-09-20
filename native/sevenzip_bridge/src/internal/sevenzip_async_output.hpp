@@ -76,12 +76,10 @@ namespace sunpack::sevenzip
         {
             UInt64 accepted_bytes = 0;
             UInt64 written_bytes = 0;
-            UInt32 output_crc32 = 0;
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
             int win32_error = 0;
             bool operation_result_set = false;
-            bool has_output_crc32 = false;
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
             std::vector<unsigned char> magic;
@@ -187,12 +185,10 @@ namespace sunpack::sevenzip
             std::size_t active_data_writes = 0;
             std::size_t peak_active_data_writes = 0;
             UInt64 written_bytes = 0;
-            UInt32 output_crc32 = 0;
             Int32 operation_result = 0;
             HRESULT hresult = S_OK;
             int win32_error = 0;
             bool operation_result_set = false;
-            bool has_output_crc32 = false;
             bool has_mtime_ns = false;
             UInt64 mtime_ns = 0;
             std::vector<unsigned char> magic;
@@ -523,8 +519,6 @@ namespace sunpack::sevenzip
 
         void close_file(
             const FileStatePtr &file,
-            UInt32 output_crc32,
-            bool has_output_crc32,
             std::vector<unsigned char> magic) noexcept
         {
             if (!file)
@@ -544,8 +538,6 @@ namespace sunpack::sevenzip
                 }
                 synchronize_cancellation_locked(file->job);
                 file->close_requested = true;
-                file->output_crc32 = output_crc32;
-                file->has_output_crc32 = has_output_crc32;
                 file->magic = std::move(magic);
                 if (file->job)
                 {
@@ -746,12 +738,10 @@ namespace sunpack::sevenzip
             std::lock_guard<std::mutex> lock(mutex_);
             snapshot.accepted_bytes = file->accepted_bytes.load(std::memory_order_relaxed);
             snapshot.written_bytes = file->written_bytes;
-            snapshot.output_crc32 = file->output_crc32;
             snapshot.operation_result = file->operation_result;
             snapshot.hresult = file->hresult;
             snapshot.win32_error = file->win32_error;
             snapshot.operation_result_set = file->operation_result_set;
-            snapshot.has_output_crc32 = file->has_output_crc32;
             snapshot.has_mtime_ns = file->has_mtime_ns;
             snapshot.mtime_ns = file->mtime_ns;
             snapshot.magic = file->magic;
