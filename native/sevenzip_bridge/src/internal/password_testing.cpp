@@ -170,34 +170,6 @@ namespace sunpack::sevenzip
 
         const std::wstring &password,
 
-        const std::vector<std::wstring> &part_paths
-
-    )
-    {
-
-        return test_one_password(
-
-
-            archive_path,
-
-            password,
-
-            part_paths,
-
-            candidate_formats(archive_path, part_paths),
-
-            {},
-
-            false);
-    }
-
-    PasswordTestResult test_one_password(
-
-
-        const std::wstring &archive_path,
-
-        const std::wstring &password,
-
         const std::vector<std::wstring> &part_paths,
 
         const std::vector<GUID> &formats,
