@@ -24,7 +24,6 @@ struct ExtractPipelineTiming {
     unsigned long long all_overlap_ns = 0;
     unsigned long long any_overlap_ns = 0;
     unsigned long long idle_ns = 0;
-    unsigned long long prepare_preflight_ns = 0;
     unsigned long long prepare_output_directory_ns = 0;
     unsigned long long prepare_format_candidates_ns = 0;
     unsigned long long prepare_handler_create_ns = 0;
