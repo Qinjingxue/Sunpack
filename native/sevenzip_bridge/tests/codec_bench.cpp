@@ -479,13 +479,22 @@ DecodeResult decode_backend(
     size_t remaining = 1;
 
     while (remaining != 0) {
-        if (in_buffer.pos == in_buffer.size && input_pos < input.size()) {
-            const std::size_t amount =
-                std::min(options.chunk_size, input.size() - input_pos);
-            in_buffer.src = input.data() + input_pos;
-            in_buffer.size = amount;
-            in_buffer.pos = 0;
-            input_pos += amount;
+        if (in_buffer.pos == in_buffer.size) {
+            if (input_pos < input.size()) {
+                const std::size_t amount =
+                    std::min(options.chunk_size, input.size() - input_pos);
+                in_buffer.src = input.data() + input_pos;
+                in_buffer.size = amount;
+                in_buffer.pos = 0;
+                input_pos += amount;
+            } else {
+                // A streaming decoder can still have buffered output after the
+                // final input byte. Keep calling it with an explicit empty
+                // buffer until it reports the terminator or makes no progress.
+                in_buffer.src = nullptr;
+                in_buffer.size = 0;
+                in_buffer.pos = 0;
+            }
         }
 
         ZSTD_outBuffer out_buffer{output.data(), output.size(), 0};
@@ -561,9 +570,7 @@ DecodeResult decode_backend(
         stream.avail_out = output.size();
         const std::size_t before_in = stream.avail_in;
         const lzma_action action =
-            (input_pos == input.size() && stream.avail_in == 0)
-                ? LZMA_FINISH
-                : LZMA_RUN;
+            input_pos == input.size() ? LZMA_FINISH : LZMA_RUN;
         code = lzma_code(&stream, action);
         const std::size_t produced = output.size() - stream.avail_out;
         sink.consume(output.data(), produced);
