@@ -1,6 +1,8 @@
 // Rar5Decoder.h
 // According to unRAR license, this code may not be used to develop
 // a program that creates RAR archives
+// Modified for SunPack on 2026-09-20: add an optional parallel RAR5/RAR7
+// Huffman-decode path while retaining the upstream serial decoder unchanged.
 
 #ifndef ZIP7_INC_COMPRESS_RAR5_DECODER_H
 #define ZIP7_INC_COMPRESS_RAR5_DECODER_H
@@ -44,11 +46,20 @@ const unsigned k_NumHufTableBits_Align = 6;
 
 const unsigned DICT_SIZE_BITS_MAX = 40;
 
+#ifndef Z7_ST
+Z7_CLASS_IMP_NOQIB_3(
+  CDecoder
+  , ICompressCoder
+  , ICompressSetDecoderProperties2
+  , ICompressSetCoderMt
+)
+#else
 Z7_CLASS_IMP_NOQIB_2(
   CDecoder
   , ICompressCoder
   , ICompressSetDecoderProperties2
 )
+#endif
   bool _useAlignBits;
   bool _isLastBlock;
   bool _unpackSize_Defined;
@@ -102,6 +113,10 @@ Z7_CLASS_IMP_NOQIB_2(
   ICompressProgressInfo *_progress;
   Byte *_inputBuf;
 
+#ifndef Z7_ST
+  UInt32 _numThreads;
+#endif
+
   NHuffman::CDecoder<kNumHufBits, kMainTableSize,  k_NumHufTableBits_Main>  m_MainDecoder;
   NHuffman::CDecoder256<kNumHufBits, kDistTableSize_MAX,  k_NumHufTableBits_Dist>  m_DistDecoder;
   NHuffman::CDecoder256<kNumHufBits, kAlignTableSize,     k_NumHufTableBits_Align> m_AlignDecoder;
@@ -122,6 +137,10 @@ Z7_CLASS_IMP_NOQIB_2(
   HRESULT DecodeLZ2(const CBitDecoder &_bitStream) throw();
   HRESULT DecodeLZ();
   HRESULT CodeReal();
+#ifndef Z7_ST
+  HRESULT DecodeLZParallel();
+  HRESULT CodeRealParallel();
+#endif
 public:
   CDecoder();
   ~CDecoder();
