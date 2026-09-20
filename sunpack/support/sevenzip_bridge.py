@@ -80,7 +80,7 @@ class _Sup7zArchiveResourceAnalysis(ctypes.Structure):
     ]
 
 
-class NativePasswordTester:
+class NativeSevenZipBridge:
     def __init__(self, wrapper_path: str | None = None):
         self.wrapper_path = wrapper_path or self._default_wrapper_path()
         self._library = None
@@ -236,21 +236,21 @@ class NativePasswordTester:
         raise FileNotFoundError("Required sunpack_sevenzip.dll was not found under tools\\ or the application root.")
 
 
-_DEFAULT_TESTER: NativePasswordTester | None = None
+_DEFAULT_TESTER: NativeSevenZipBridge | None = None
 _DEFAULT_TESTER_LOCK = threading.Lock()
 
 
-def get_native_password_tester() -> NativePasswordTester:
+def get_native_sevenzip_bridge() -> NativeSevenZipBridge:
     global _DEFAULT_TESTER
     if _DEFAULT_TESTER is not None:
         return _DEFAULT_TESTER
     with _DEFAULT_TESTER_LOCK:
         if _DEFAULT_TESTER is None:
-            _DEFAULT_TESTER = NativePasswordTester()
+            _DEFAULT_TESTER = NativeSevenZipBridge()
         return _DEFAULT_TESTER
 
 
-def _cache_key(tester: NativePasswordTester, archive_path: str, part_paths: list[str] | None = None) -> tuple:
+def _cache_key(tester: NativeSevenZipBridge, archive_path: str, part_paths: list[str] | None = None) -> tuple:
     parts = tuple(file_identity(path) for path in list(dict.fromkeys(part_paths or [archive_path])))
     return (
         str(tester.wrapper_path),
@@ -276,7 +276,7 @@ def _manifest_buffer_chars(max_items: int) -> int:
 
 
 def cached_analyze_archive_resources(archive_path: str, password: str = "", part_paths: list[str] | None = None) -> NativeArchiveResourceAnalysis:
-    tester = get_native_password_tester()
+    tester = get_native_sevenzip_bridge()
     password = password or ""
     return cached_value(
         "native_7z_resources",
@@ -291,7 +291,7 @@ def cached_read_archive_crc_manifest(
     part_paths: list[str] | None = None,
     max_items: int = 200000,
 ) -> NativeArchiveCrcManifest:
-    tester = get_native_password_tester()
+    tester = get_native_sevenzip_bridge()
     password = password or ""
     max_items = max(0, int(max_items or 0))
     return cached_value(
