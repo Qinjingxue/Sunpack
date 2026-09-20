@@ -2918,7 +2918,7 @@ error_dist:
   {
     if (submitted - retired >= ringSize)
     {
-      CRar5ParallelBlockJob &job = *ring[(size_t)(retired % ringSize)];
+      CRar5ParallelBlockJob &job = _mtPool->JobAt((size_t)(retired % ringSize));
       RINOK(retireOne(job))
       retired++;
       continue;
