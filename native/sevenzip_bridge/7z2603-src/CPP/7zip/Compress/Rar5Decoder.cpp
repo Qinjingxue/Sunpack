@@ -2915,10 +2915,6 @@ error_dist:
       lastTableJob.reset();
     }
 
-    if (!rawHeader.TablePresent && !inheritedTableWasFilled &&
-        (rawHeader.BlockSize != 0 || (rawHeader.Bytes[0] & 7) != 7))
-      return S_FALSE;
-
     try
     {
       const size_t logicalSize = (size_t)rawHeader.HeaderSize + rawHeader.BlockSize;
