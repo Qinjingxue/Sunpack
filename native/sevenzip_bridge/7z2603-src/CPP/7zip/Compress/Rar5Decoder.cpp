@@ -1450,6 +1450,193 @@ struct CRar5ParallelTables
   CRar5ParallelTables(): UseAlignBits(false) {}
 };
 
+
+static HRESULT ReadRar5ParallelTables(
+    CBitDecoder &bitStream,
+    bool isV7,
+    bool &tableWasFilled,
+    CRar5ParallelTables &tables,
+    bool &isLastBlock)
+{
+  bitStream.Prepare();
+
+  const unsigned flags = bitStream.ReadByte_InAligned();
+  unsigned checkSum = bitStream.ReadByte_InAligned();
+  checkSum ^= flags;
+
+  const unsigned num = (flags >> 3) & 3;
+  if (num >= 3)
+    return S_FALSE;
+
+  UInt32 blockSize = bitStream.ReadByte_InAligned();
+  checkSum ^= blockSize;
+  if (num != 0)
+  {
+    const unsigned b = bitStream.ReadByte_InAligned();
+    checkSum ^= b;
+    blockSize += (UInt32)b << 8;
+    if (num > 1)
+    {
+      const unsigned b2 = bitStream.ReadByte_InAligned();
+      checkSum ^= b2;
+      blockSize += (UInt32)b2 << 16;
+    }
+  }
+
+  if (checkSum != 0x5A)
+    return S_FALSE;
+
+  unsigned blockSizeBits7 = (flags & 7) + 1;
+  blockSize += (UInt32)(blockSizeBits7 >> 3);
+  if (blockSize == 0)
+  {
+    bitStream._minorError = true;
+    blockSizeBits7 = 0;
+    blockSize = 1;
+  }
+  blockSize--;
+  blockSizeBits7 &= 7;
+
+  bitStream._blockEndBits7 = blockSizeBits7;
+  bitStream._blockEnd = bitStream.GetProcessedSize_Round() + blockSize;
+  bitStream.SetCheck_forBlock();
+
+  isLastBlock = (flags & 0x40) != 0;
+  if ((flags & 0x80) == 0)
+  {
+    if (!tableWasFilled && blockSize + blockSizeBits7 != 0)
+      return S_FALSE;
+    return S_OK;
+  }
+
+  tableWasFilled = false;
+
+  const unsigned kLevelTableSize = 20;
+  const unsigned k_NumHufTableBits_Level = 6;
+  NHuffman::CDecoder256<kNumHufBits, kLevelTableSize, k_NumHufTableBits_Level> levelDecoder;
+  const unsigned kTablesSizesSum_MAX =
+      kMainTableSize + kDistTableSize_MAX + kAlignTableSize + kLenTableSize;
+  Byte lens[kTablesSizesSum_MAX];
+
+  unsigned i = 0;
+  do
+  {
+    if (bitStream._buf >= bitStream._bufCheck_Block)
+    {
+      bitStream.Prepare();
+      if (bitStream.IsBlockOverRead())
+        return S_FALSE;
+    }
+
+    const unsigned len = (unsigned)bitStream.ReadBits_9fix(4);
+    if (len == 15)
+    {
+      unsigned count = (unsigned)bitStream.ReadBits_9fix(4);
+      if (count != 0)
+      {
+        count += 2;
+        count += i;
+        do
+          lens[i++] = 0;
+        while (i < count);
+        continue;
+      }
+    }
+    lens[i++] = (Byte)len;
+  }
+  while (i < kLevelTableSize);
+
+  if (bitStream.IsBlockOverRead())
+    return S_FALSE;
+  if (!levelDecoder.Build(lens, NHuffman::k_BuildMode_Full))
+    return S_FALSE;
+
+  i = 0;
+  const unsigned tableSize = isV7
+      ? kTablesSizesSum_MAX
+      : kTablesSizesSum_MAX - kExtraDistSymbols_v7;
+
+  do
+  {
+    if (bitStream._buf >= bitStream._bufCheck_Block)
+    {
+      bitStream.Prepare();
+      if (bitStream.IsBlockOverRead())
+        return S_FALSE;
+    }
+
+    const unsigned sym = levelDecoder.DecodeFull(&bitStream);
+    if (sym < 16)
+      lens[i++] = (Byte)sym;
+    else
+    {
+      unsigned count = (sym & 1) * 4;
+      count += count + 3 + (unsigned)bitStream.ReadBits9(count + 3);
+      count += i;
+      if (count > tableSize)
+        count = tableSize;
+
+      unsigned value = 0;
+      if (sym < 18)
+      {
+        if (i == 0)
+          return S_FALSE;
+        value = lens[(size_t)i - 1];
+      }
+      do
+        lens[i++] = (Byte)value;
+      while (i < count);
+    }
+  }
+  while (i < tableSize);
+
+  if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
+    return S_FALSE;
+
+  const NHuffman::enum_BuildMode buildMode = NHuffman::k_BuildMode_Full_or_Empty;
+  if (!tables.Main.Build(&lens[0], buildMode))
+    return S_FALSE;
+
+  if (!isV7)
+  {
+    Byte *dest = lens + kMainTableSize + kDistTableSize_v6 +
+                   kAlignTableSize + kLenTableSize - 1;
+    unsigned count = kAlignTableSize + kLenTableSize;
+    do
+    {
+      dest[kExtraDistSymbols_v7] = dest[0];
+      dest--;
+    }
+    while (--count);
+
+    memset(lens + kMainTableSize + kDistTableSize_v6, 0, kExtraDistSymbols_v7);
+  }
+
+  if (!tables.Dist.Build(&lens[kMainTableSize], buildMode))
+    return S_FALSE;
+  if (!tables.Len.Build(
+          &lens[kMainTableSize + kDistTableSize_MAX + kAlignTableSize],
+          buildMode))
+    return S_FALSE;
+
+  tables.UseAlignBits = false;
+  for (i = 0; i < kAlignTableSize; i++)
+  {
+    if (lens[kMainTableSize + kDistTableSize_MAX + (size_t)i] != kNumAlignBits)
+    {
+      if (!tables.Align.Build(
+              &lens[kMainTableSize + kDistTableSize_MAX],
+              buildMode))
+        return S_FALSE;
+      tables.UseAlignBits = true;
+      break;
+    }
+  }
+
+  tableWasFilled = true;
+  return S_OK;
+}
+
 struct CRar5ParallelBlockJob
 {
   std::vector<Byte> Data;
@@ -1458,18 +1645,26 @@ struct CRar5ParallelBlockJob
   std::vector<CRar5ParallelDecodedItem> Decoded;
   UInt64 PackPos;
   bool LastBlock;
+  bool TablePresent;
+  bool InitialTablesValid;
+  bool IsV7;
   bool MinorError;
   HRESULT Result;
 
   std::mutex Mutex;
   std::condition_variable FinishedEvent;
+  bool TablesReady;
   bool Done;
 
   CRar5ParallelBlockJob():
       PackPos(0),
       LastBlock(false),
+      TablePresent(false),
+      InitialTablesValid(false),
+      IsV7(false),
       MinorError(false),
       Result(S_OK),
+      TablesReady(false),
       Done(false)
   {}
 
@@ -1479,9 +1674,13 @@ struct CRar5ParallelBlockJob
     Decoded.clear();
     PackPos = 0;
     LastBlock = false;
+    TablePresent = false;
+    InitialTablesValid = false;
+    IsV7 = false;
     MinorError = false;
     Result = S_OK;
     std::lock_guard<std::mutex> lock(Mutex);
+    TablesReady = false;
     Done = false;
   }
 
@@ -1495,6 +1694,27 @@ struct CRar5ParallelBlockJob
       Decoded.reserve(0x4100);
 
       CBitDecoder bitStream = BitState;
+      bool tableWasFilled = InitialTablesValid;
+      bool workerLastBlock = false;
+      result = ReadRar5ParallelTables(
+          bitStream,
+          IsV7,
+          tableWasFilled,
+          Tables,
+          workerLastBlock);
+
+      if (result == S_OK && tableWasFilled)
+      {
+        {
+          std::lock_guard<std::mutex> lock(Mutex);
+          TablesReady = true;
+          LastBlock = workerLastBlock;
+        }
+        FinishedEvent.notify_all();
+      }
+
+      if (result != S_OK)
+        throw result;
 
       for (;;)
       {
@@ -1658,6 +1878,10 @@ struct CRar5ParallelBlockJob
     {
       result = E_OUTOFMEMORY;
     }
+    catch (HRESULT hres)
+    {
+      result = hres;
+    }
     catch (...)
     {
       result = E_FAIL;
@@ -1669,6 +1893,16 @@ struct CRar5ParallelBlockJob
       Done = true;
     }
     FinishedEvent.notify_one();
+  }
+
+  HRESULT WaitTables(CRar5ParallelTables &tables)
+  {
+    std::unique_lock<std::mutex> lock(Mutex);
+    FinishedEvent.wait(lock, [this] { return TablesReady || Done; });
+    if (!TablesReady)
+      return Result == S_OK ? S_FALSE : Result;
+    tables = Tables;
+    return S_OK;
   }
 
   HRESULT Wait()
@@ -1885,12 +2119,14 @@ struct CRar5RawBlockHeader
   unsigned HeaderSize;
   UInt32 BlockSize;
   bool LastBlock;
+  bool TablePresent;
   bool UseSerial;
 
   CRar5RawBlockHeader():
       HeaderSize(0),
       BlockSize(0),
       LastBlock(false),
+      TablePresent(false),
       UseSerial(false)
   {}
 };
@@ -1930,6 +2166,7 @@ static HRESULT ReadRar5RawBlockHeader(
 
   header.BlockSize = blockSize;
   header.LastBlock = (flags & 0x40) != 0;
+  header.TablePresent = (flags & 0x80) != 0;
 
   // UnRAR switches oversized compressed blocks back to its serial path to
   // bound decoded-event memory. Do the same, but replay the already consumed
