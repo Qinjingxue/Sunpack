@@ -330,6 +330,16 @@ bool check_native_sizing_scales_linearly_with_cpu() {
     return true;
 }
 
+bool check_native_decoder_thread_budget_scales_with_outer_jobs() {
+    using namespace sunpack::sevenzip;
+    return native_decoder_thread_budget(16, 1) == 8 &&
+        native_decoder_thread_budget(16, 2) == 8 &&
+        native_decoder_thread_budget(16, 4) == 4 &&
+        native_decoder_thread_budget(16, 8) == 2 &&
+        native_decoder_thread_budget(8, 4) == 2 &&
+        native_decoder_thread_budget(2, 0) == 2;
+}
+
 bool check_native_sizing_respects_memory_and_overrides() {
     using namespace sunpack::sevenzip;
     const NativeMachineResources resources{32, 8ULL << 30, 4ULL << 30};
@@ -416,6 +426,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_native_sizing_respects_memory_and_overrides()) {
         std::cerr << "native sizing hard-memory/override check failed\n";
         return 14;
+    }
+    if (!check_native_decoder_thread_budget_scales_with_outer_jobs()) {
+        std::cerr << "native decoder thread budget check failed\n";
+        return 18;
     }
 #endif
 
