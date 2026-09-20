@@ -116,17 +116,6 @@ def _path_ext(path: str) -> str:
     return suffixes[-1] if suffixes else "<none>"
 
 
-def _password_try_detail(args, kwargs, result) -> str:
-    archive = args[0] if args else kwargs.get("archive_path", "")
-    passwords = args[1] if len(args) > 1 else kwargs.get("passwords", [])
-    return (
-        f"ext={_path_ext(archive)}|status={getattr(result, 'status', '')}"
-        f"|attempts={getattr(result, 'attempts', '')}"
-        f"|matched={getattr(result, 'matched_index', '')}"
-        f"|candidates={len(passwords or [])}"
-    )
-
-
 def _task_path_from_arg(value) -> str:
     return str(getattr(value, "main_path", value) or "")
 
@@ -211,9 +200,8 @@ class PipelineTimingProbe:
         password_resolver = getattr(extractor, "password_resolver", None)
         self._wrap(password_resolver, "resolve", "password_resolve", detail=_password_resolve_detail)
         password_tester = getattr(extractor, "password_tester", None)
-        self._wrap(password_tester, "test_password", "password_native_test_archive")
-        native_tester = getattr(password_tester, "native_password_tester", None) if password_tester is not None else None
-        self._wrap(native_tester, "try_passwords", "password_native_try", detail=_password_try_detail)
+        password_scheduler = getattr(password_tester, "password_scheduler", None) if password_tester is not None else None
+        self._wrap(password_scheduler, "plan_for_extraction", "password_bounded_verify")
         resource_inspector = getattr(batch, "resource_inspector", None)
         self._wrap(resource_inspector, "inspect", "resource_preflight")
         self._wrap(resource_inspector, "record_estimated_single_task_profile", "resource_estimate")
@@ -232,7 +220,7 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
             "execute_all_wall_ms": 0.0,
             "preflight_ms": 0.0,
             "password_resolve_ms": 0.0,
-            "password_native_test_ms": 0.0,
+            "password_verify_ms": 0.0,
             "resource_ms": 0.0,
             "extract_ms": 0.0,
             "verify_ms": 0.0,
@@ -261,8 +249,7 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
         + batch_execute_ms
         + recorder.ms("password_preflight")
         + recorder.ms("password_resolve")
-        + recorder.ms("password_native_test_archive")
-        + recorder.ms("password_native_try")
+        + recorder.ms("password_bounded_verify")
         + recorder.ms("resource_preflight")
         + recorder.ms("resource_estimate")
         + recorder.ms("verify")
@@ -281,10 +268,7 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
         "execute_all_wall_ms": round(pipeline_ms, 2),
         "preflight_ms": recorder.ms("password_preflight"),
         "password_resolve_ms": recorder.ms("password_resolve"),
-        "password_native_test_ms": round(
-            recorder.ms("password_native_test_archive") + recorder.ms("password_native_try"),
-            2,
-        ),
+        "password_verify_ms": recorder.ms("password_bounded_verify"),
         "resource_ms": recorder.ms("resource_preflight") + recorder.ms("resource_estimate"),
         "extract_ms": extract_ms,
         "verify_ms": recorder.ms("verify"),
@@ -789,7 +773,7 @@ def print_table(rows: list[dict]):
         "execute_all_wall_ms",
         "preflight_ms",
         "password_resolve_ms",
-        "password_native_test_ms",
+        "password_verify_ms",
         "resource_ms",
         "extract_ms",
         "verify_ms",
