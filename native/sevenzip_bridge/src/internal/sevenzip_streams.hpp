@@ -8,6 +8,8 @@
 
 #include <algorithm>
 
+#include <atomic>
+
 #include <chrono>
 
 #include <condition_variable>
@@ -350,11 +352,10 @@ namespace sunpack::sevenzip
             sync_trace_locked();
         }
 
-        void set_consumer_hint(UInt64 consumer_id)
+        void set_consumer_hint(UInt64 consumer_id) noexcept
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            std::lock_guard lock(mutex_);
-            planned_consumer_hint_ = consumer_id;
+            planned_consumer_hint_.store(consumer_id, std::memory_order_release);
 #else
             (void)consumer_id;
 #endif
@@ -381,7 +382,7 @@ namespace sunpack::sevenzip
             next_planned_cursor_id_ = 0;
             planned_schedule_cursor_ = 0;
             planned_touch_clock_ = 0;
-            planned_consumer_hint_ = 0;
+            planned_consumer_hint_.store(0, std::memory_order_relaxed);
             next_offset_ = 0;
             active_ = false;
             planned_mode_ = false;
@@ -440,7 +441,7 @@ namespace sunpack::sevenzip
             planned_cursors_.clear();
             next_planned_cursor_id_ = 0;
             planned_schedule_cursor_ = 0;
-            planned_consumer_hint_ = 0;
+            planned_consumer_hint_.store(0, std::memory_order_relaxed);
             ready_.notify_all();
         }
 #endif
@@ -744,7 +745,7 @@ namespace sunpack::sevenzip
 
         UInt64 touch_planned_cursor_locked(std::size_t plan_index, UInt64 end)
         {
-            const UInt64 consumer_id = planned_consumer_hint_;
+            const UInt64 consumer_id = planned_consumer_hint_.load(std::memory_order_acquire);
             PlannedCursor *cursor = nullptr;
 
             if (consumer_id != 0)
@@ -1364,7 +1365,7 @@ namespace sunpack::sevenzip
         UInt64 next_planned_cursor_id_ = 0;
         std::size_t planned_schedule_cursor_ = 0;
         UInt64 planned_touch_clock_ = 0;
-        UInt64 planned_consumer_hint_ = 0;
+        std::atomic<UInt64> planned_consumer_hint_{0};
         unsigned long long planned_cursor_peak_ = 0;
         unsigned long long planned_cache_eviction_count_ = 0;
         unsigned long long planned_demand_issued_count_ = 0;
