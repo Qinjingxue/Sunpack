@@ -69,7 +69,6 @@ class PasswordScheduler:
     def with_fast_verifiers(cls) -> "PasswordScheduler":
         registry = PasswordVerifierRegistry(
             fast_verifiers=[ZipFastVerifier(), RarFastVerifier(), SevenZipFastVerifier()],
-            final_verifier=None,
         )
         return cls(registry.build())
 
