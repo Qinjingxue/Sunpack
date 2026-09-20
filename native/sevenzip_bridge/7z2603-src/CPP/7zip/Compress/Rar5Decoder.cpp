@@ -725,12 +725,12 @@ CDecoder::CDecoder():
     _lzSize(0),
     _lzEnd(0),
     _writtenFileSize(0),
-#ifndef Z7_ST
-    _numThreads(1),
-#endif
     _filters(NULL),
     _winSize_Allocated(0),
     _inputBuf(NULL)
+#ifndef Z7_ST
+    , _numThreads(1)
+#endif
 #ifndef Z7_ST
     , _numThreads(1)
 #endif
