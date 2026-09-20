@@ -867,16 +867,10 @@ struct CMethodItem
 // toward 7-Zip; it cannot make an incompressible entry select zlib-ng.
 static const unsigned kSunpackZlibNgDeflateCacheKey = 0x10000u |
     NFileHeader::NCompressionMethod::kDeflate;
-static const UInt64 kSunpackZlibNgMinUnpackSize = (UInt64)64 << 10;
-
 static bool UseSunpackZlibNgDeflate(unsigned id, const CItemEx &item)
 {
-  if (id != NFileHeader::NCompressionMethod::kDeflate ||
-      item.Size < kSunpackZlibNgMinUnpackSize)
-    return false;
-
-  const UInt64 minSavings = item.Size / 10;
-  return item.PackSize <= item.Size - minSavings;
+  return id == NFileHeader::NCompressionMethod::kDeflate &&
+      SunpackShouldUseZlibNgDeflate(item.PackSize, item.Size);
 }
 
 
