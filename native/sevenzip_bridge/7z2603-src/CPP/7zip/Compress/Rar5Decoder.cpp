@@ -3006,9 +3006,9 @@ error_dist:
 
       job.BitState = bitStream;
       job.TablePresent = rawHeader.TablePresent;
-      job.InitialTablesValid = inheritedTablesValid;
+      job.InitialTablesValid = !rawHeader.TablePresent && inheritedTablesValid;
       job.IsV7 = _is_v7;
-      if (inheritedTablesValid)
+      if (!rawHeader.TablePresent && inheritedTablesValid)
         job.Tables = inheritedTables;
       job.PackPos = packedRead;
       job.LastBlock = rawHeader.LastBlock;
