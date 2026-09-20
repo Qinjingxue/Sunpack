@@ -1685,12 +1685,18 @@ struct CRar5ParallelBlockJob
 
   void PublishTableResult(HRESULT result)
   {
+    bool notify = false;
     {
       std::lock_guard<std::mutex> lock(Mutex);
-      TableResult = result;
-      TableReady = true;
+      if (!TableReady)
+      {
+        TableResult = result;
+        TableReady = true;
+        notify = true;
+      }
     }
-    TableEvent.notify_all();
+    if (notify)
+      TableEvent.notify_all();
   }
 
   void Process()
@@ -2077,12 +2083,14 @@ struct CRar5RawBlockHeader
   unsigned HeaderSize;
   UInt32 BlockSize;
   bool LastBlock;
+  bool TablePresent;
   bool UseSerial;
 
   CRar5RawBlockHeader():
       HeaderSize(0),
       BlockSize(0),
       LastBlock(false),
+      TablePresent(false),
       UseSerial(false)
   {}
 };
@@ -2122,6 +2130,7 @@ static HRESULT ReadRar5RawBlockHeader(
 
   header.BlockSize = blockSize;
   header.LastBlock = (flags & 0x40) != 0;
+  header.TablePresent = (flags & 0x80) != 0;
 
   // UnRAR switches oversized compressed blocks back to its serial path to
   // bound decoded-event memory. Do the same, but replay the already consumed
@@ -2611,6 +2620,15 @@ HRESULT CDecoder::DecodeLZParallel()
   UInt64 packedRead = 0;
   bool minorError = false;
 
+  CRar5ParallelTables inheritedTables;
+  inheritedTables.Main = m_MainDecoder;
+  inheritedTables.Dist = m_DistDecoder;
+  inheritedTables.Align = m_AlignDecoder;
+  inheritedTables.Len = m_LenDecoder;
+  inheritedTables.UseAlignBits = _useAlignBits;
+  bool inheritedTableWasFilled = _tableWasFilled;
+  std::shared_ptr<CRar5ParallelBlockJob> lastTableJob;
+
   size_t winPos = _winPos;
   size_t limit;
   {
@@ -2796,6 +2814,14 @@ error_dist:
 
     _winPos = winPos;
 
+    m_MainDecoder = job.Tables.Main;
+    m_DistDecoder = job.Tables.Dist;
+    m_AlignDecoder = job.Tables.Align;
+    m_LenDecoder = job.Tables.Len;
+    _useAlignBits = job.Tables.UseAlignBits;
+    _tableWasFilled = job.TableWasFilled;
+    _isLastBlock = job.LastBlock;
+
     if (_progress)
     {
       if (job.PackPos - _progress_Pack >= (1u << 24) ||
@@ -2876,8 +2902,22 @@ error_dist:
       return res;
     }
 
-    CRar5ParallelBlockJob &job = *ring[(size_t)(submitted % ringSize)];
+    const std::shared_ptr<CRar5ParallelBlockJob> jobPtr =
+        ring[(size_t)(submitted % ringSize)];
+    CRar5ParallelBlockJob &job = *jobPtr;
     job.Reset();
+
+    if (!rawHeader.TablePresent && lastTableJob)
+    {
+      RINOK(lastTableJob->WaitTables())
+      inheritedTables = lastTableJob->Tables;
+      inheritedTableWasFilled = lastTableJob->TableWasFilled;
+      lastTableJob.reset();
+    }
+
+    if (!rawHeader.TablePresent && !inheritedTableWasFilled &&
+        (rawHeader.BlockSize != 0 || (rawHeader.Bytes[0] & 7) != 7))
+      return S_FALSE;
 
     try
     {
@@ -2891,41 +2931,26 @@ error_dist:
       memset(job.Data.data() + logicalSize, 0xFF, kInputBufferPadZone);
       packedRead += rawHeader.BlockSize;
 
-      CBitDecoder bitStream;
-      bitStream._stream = NULL;
-      bitStream._bufBase = job.Data.data();
-      bitStream.Init();
-      bitStream._bufLim = job.Data.data() + logicalSize;
-      bitStream._bufCheck = bitStream._bufLim;
-      bitStream._bufCheck_Block = bitStream._bufCheck;
-      bitStream._wasFinished = true;
-      bitStream._hres = S_OK;
-
-      ICompressProgressInfo *savedProgress = _progress;
-      _progress = NULL;
-      const HRESULT tableRes = ReadTables(bitStream);
-      _progress = savedProgress;
-      RINOK(tableRes)
-
-      job.BitState = bitStream;
-      job.Tables.Main = m_MainDecoder;
-      job.Tables.Dist = m_DistDecoder;
-      job.Tables.Align = m_AlignDecoder;
-      job.Tables.Len = m_LenDecoder;
-      job.Tables.UseAlignBits = _useAlignBits;
+      job.LogicalSize = logicalSize;
+      job.Tables = inheritedTables;
+      job.IsV7 = _is_v7;
+      job.TablePresent = rawHeader.TablePresent;
+      job.TableWasFilled = inheritedTableWasFilled;
       job.PackPos = packedRead;
-      job.LastBlock = _isLastBlock;
-      job.MinorError = bitStream._minorError;
+      job.LastBlock = rawHeader.LastBlock;
     }
     catch (const std::bad_alloc &)
     {
       return E_OUTOFMEMORY;
     }
 
-    pool.Submit(ring[(size_t)(submitted % ringSize)]);
+    pool.Submit(jobPtr);
     submitted++;
 
-    if (job.LastBlock)
+    if (rawHeader.TablePresent)
+      lastTableJob = jobPtr;
+
+    if (rawHeader.LastBlock)
       break;
   }
 
