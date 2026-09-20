@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -23,7 +24,15 @@ def test_real_7z_sfx_missing_tail_reports_missing_volume_not_partial_payload(tmp
     parts = _case_parts(case)
     scheduler = ExtractionScheduler(max_retries=1)
     try:
-        result = scheduler.extract(_task(case.entry_path, parts=parts, detected_ext="7z"), str(tmp_path / "out"))
+        result = scheduler.extract(
+            _task(
+                case.entry_path,
+                parts=parts,
+                detected_ext="7z",
+                missing_volume_evidence="seven_zip_start_header_length",
+            ),
+            str(tmp_path / "out"),
+        )
     finally:
         scheduler.close()
 
@@ -52,7 +61,12 @@ def test_real_7z_header_encrypted_with_known_password_extracts(tmp_path):
 def test_real_7z_missing_volume_priority_survives_irrelevant_wrong_password(tmp_path):
     case = _create_real_case_or_skip(tmp_path, "seven_missing_tail_with_wrong_password", "7z", split=True, split_issue="missing_last")
     parts = _case_parts(case)
-    task = _task(case.entry_path, parts=parts, detected_ext="7z")
+    task = _task(
+        case.entry_path,
+        parts=parts,
+        detected_ext="7z",
+        missing_volume_evidence="seven_zip_start_header_length",
+    )
     task.fact_bag.set("archive.password", "wrong")
     scheduler = ExtractionScheduler(max_retries=1)
     try:
@@ -107,9 +121,25 @@ def _remove_current_tail_volume(case):
     parts[-1].unlink()
 
 
-def _task(path: Path, *, parts: list[Path] | None = None, detected_ext: str = "") -> ArchiveTask:
+def _task(
+    path: Path,
+    *,
+    parts: list[Path] | None = None,
+    detected_ext: str = "",
+    missing_volume_evidence: str = "",
+) -> ArchiveTask:
     all_parts = [str(item) for item in (parts or [path])]
     task = direct_file_task(str(path), all_parts=all_parts)
     task.detected_ext = detected_ext
     task.fact_bag.set("file.detected_ext", detected_ext)
-    return task.ensure_archive_state()
+    task.ensure_archive_state()
+    if missing_volume_evidence:
+        state = task.archive_state()
+        task.set_archive_state(replace(
+            state,
+            analysis={
+                **state.analysis,
+                "execution": {"missing_volume_evidence": missing_volume_evidence},
+            },
+        ))
+    return task

@@ -123,7 +123,6 @@ def assert_failure_contains(
 
 def assert_wrong_password_then_success(
     case: ArchiveCase,
-    expected_options: set[str],
     run_root: Path,
     output_root: Path,
 ) -> None:
@@ -134,7 +133,7 @@ def assert_wrong_password_then_success(
 
     assert without_password.success_count == 0
     assert without_password.failed_tasks
-    assert _failure_contains(without_password, expected_options)
+    assert any(failure.is_password_failure for failure in without_password.failures)
     assert not marker_was_extracted(output_root / "without-password", case.marker_name, case.marker_text)
 
     with_password = run_pipeline_in_fresh_workspace(
@@ -210,7 +209,6 @@ def test_real_archive_edge_prefixed_password_carrier_archives_require_matching_p
 
     assert_wrong_password_then_success(
         case,
-        {"密码错误", "压缩包损坏", "致命错误"},
         tmp_path / "runs",
         tmp_path / "runs-out",
     )
