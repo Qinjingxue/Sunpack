@@ -20,6 +20,7 @@
 #ifdef _WIN32
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 #endif
@@ -236,7 +237,9 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget = 0,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+
+        std::size_t decoder_thread_budget = 0
 
     )
     {
@@ -381,6 +384,29 @@ namespace sunpack::sevenzip
             attempt.created = true;
 
             any_format_created = true;
+
+            if (decoder_thread_budget != 0 && attempt.format == L"rar5")
+            {
+                CMyComPtr<ISetProperties> set_properties;
+                const HRESULT prop_qi = archive.QueryInterface(IID_ISetProperties, &set_properties);
+                if (prop_qi == S_OK && set_properties)
+                {
+                    const wchar_t *names[1] = { L"mt" };
+                    PROPVARIANT value = {};
+                    value.vt = VT_UI4;
+                    value.ulVal = (ULONG)(std::min)(
+                        decoder_thread_budget,
+                        (std::size_t)(std::numeric_limits<UInt32>::max)());
+                    hr = set_properties->SetProperties(names, &value, 1);
+                    if (hr != S_OK)
+                    {
+                        last_hr = hr;
+                        attempt.open_hresult = static_cast<int>(hr);
+                        result.handler_attempts.push_back(attempt);
+                        continue;
+                    }
+                }
+            }
 
             bool stream_opened = false;
 
@@ -872,7 +898,9 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token
+        std::shared_ptr<std::atomic<bool>> cancel_token,
+
+        std::size_t decoder_thread_budget
 
     )
     {
@@ -911,7 +939,8 @@ namespace sunpack::sevenzip
             native_volume_input,
             std::move(shared_writer),
             job_buffer_budget,
-            std::move(cancel_token));
+            std::move(cancel_token),
+            decoder_thread_budget);
 
 #else
 
@@ -933,6 +962,7 @@ namespace sunpack::sevenzip
         (void)progress;
 
         (void)dry_run;
+        (void)decoder_thread_budget;
 
         ExtractArchiveResult result;
 
@@ -974,7 +1004,9 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token
+        std::shared_ptr<std::atomic<bool>> cancel_token,
+
+        std::size_t decoder_thread_budget
 
     )
     {
@@ -1008,7 +1040,8 @@ namespace sunpack::sevenzip
             false,
             std::move(shared_writer),
             job_buffer_budget,
-            std::move(cancel_token));
+            std::move(cancel_token),
+            decoder_thread_budget);
 
 #else
 
@@ -1030,6 +1063,7 @@ namespace sunpack::sevenzip
         (void)progress;
 
         (void)dry_run;
+        (void)decoder_thread_budget;
 
         ExtractArchiveResult result;
 
