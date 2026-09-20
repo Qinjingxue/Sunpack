@@ -308,6 +308,42 @@ class ArchiveInputPlanningStage:
             with _phase(phase_timer, f"{phase_prefix}_record_report_state_analysis"):
                 self._record_planning_state(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
 
+    @staticmethod
+    def _execution_analysis_for_report(
+        state: ArchiveState,
+        report: ArchiveAnalysisReport,
+    ) -> dict[str, Any]:
+        """Project only analysis facts that the extraction worker can consume.
+
+        These facts are advisory execution metadata, not a second preflight
+        decision. The worker still opens and extracts the current files, so a
+        stale analysis result cannot reject a volume that arrived later.
+        """
+        if state.source.open_mode not in {"native_volumes", "sfx_with_volumes"}:
+            return {}
+        if len(state.source.parts) <= 1:
+            return {}
+
+        # This mirrors the old native 7z split-tail proof without rereading the
+        # volumes in the extraction worker: a CRC-valid start header declares a
+        # next-header end beyond the logical bytes Python already analyzed.
+        for evidence in sorted(report.evidences, key=lambda item: item.confidence, reverse=True):
+            if str(evidence.format or "").lower() != "7z":
+                continue
+            details = evidence.details if isinstance(evidence.details, dict) else {}
+            if not bool(details.get("start_header_crc_ok")):
+                continue
+            try:
+                archive_offset = max(0, int(details.get("archive_offset") or 0))
+                next_offset = max(0, int(details.get("next_header_offset") or 0))
+                next_size = max(0, int(details.get("next_header_size") or 0))
+                expected_end = archive_offset + 32 + next_offset + next_size
+            except (TypeError, ValueError):
+                continue
+            if expected_end > int(report.size):
+                return {"missing_volume_evidence": "seven_zip_start_header_length"}
+        return {}
+
     def _record_planning_state(self, task: ArchiveTask, report: ArchiveAnalysisReport, *, phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "input_planning") -> None:
         with _phase(phase_timer, f"{phase_prefix}_record_state_get_archive_state"):
             state = task.archive_state()
@@ -324,6 +360,9 @@ class ArchiveInputPlanningStage:
                     "selected_format": selected.format,
                     "confidence": float(selected.confidence),
                 })
+            execution_analysis = self._execution_analysis_for_report(state, report)
+            if execution_analysis:
+                analysis["execution"] = execution_analysis
             selected_format = str(getattr(selected, "format", "") or "")
             source = replace(state.source, format_hint=selected_format) if selected_format else state.source
             new_state = ArchiveState(

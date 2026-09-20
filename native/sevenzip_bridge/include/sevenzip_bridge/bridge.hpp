@@ -24,7 +24,6 @@ struct ExtractPipelineTiming {
     unsigned long long all_overlap_ns = 0;
     unsigned long long any_overlap_ns = 0;
     unsigned long long idle_ns = 0;
-    unsigned long long prepare_preflight_ns = 0;
     unsigned long long prepare_output_directory_ns = 0;
     unsigned long long prepare_format_candidates_ns = 0;
     unsigned long long prepare_handler_create_ns = 0;
@@ -281,9 +280,7 @@ ExtractArchiveResult extract_archive_with_parts(
     bool native_volume_input = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
     std::size_t job_buffer_budget = 0,
-    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
-    const std::wstring& signature_path = L"",
-    unsigned long long signature_offset = 0
+    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
 );
 
 ExtractArchiveResult extract_archive_with_ranges(

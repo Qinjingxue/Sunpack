@@ -360,6 +360,7 @@ struct WorkerArchiveInput {
     std::vector<int> volume_numbers;
     std::wstring signature_path;
     unsigned long long signature_offset = 0;
+    std::string analyzed_missing_volume_evidence;
     std::string validation_error;
     std::vector<sunpack::sevenzip::ExtractInputRange> ranges;
 };
@@ -534,6 +535,11 @@ WorkerArchiveInput parse_archive_input_descriptor(
     input.open_mode = utf8_to_wide(mode.empty() ? "file" : mode);
     const std::string format_hint = json_string_field(descriptor, "format_hint", json_string_field(request, "format_hint", ""));
     input.format_hint = utf8_to_wide(format_hint);
+
+    const std::string analysis = json_object_field(descriptor, "analysis");
+    const std::string execution_analysis = json_object_field(analysis, "execution");
+    input.analyzed_missing_volume_evidence =
+        json_string_field(execution_analysis, "missing_volume_evidence", "");
 
     struct ParsedPart {
         int number;
@@ -747,7 +753,6 @@ std::string pipeline_timing_json(const sunpack::sevenzip::ExtractPipelineTiming&
         ",\"all_overlap_ns\":" + std::to_string(timing.all_overlap_ns) +
         ",\"any_overlap_ns\":" + std::to_string(timing.any_overlap_ns) +
         ",\"idle_ns\":" + std::to_string(timing.idle_ns) +
-         ",\"prepare_preflight_ns\":" + std::to_string(timing.prepare_preflight_ns) +
         ",\"prepare_output_directory_ns\":" + std::to_string(timing.prepare_output_directory_ns) +
         ",\"prepare_format_candidates_ns\":" + std::to_string(timing.prepare_format_candidates_ns) +
          ",\"prepare_handler_create_ns\":" + std::to_string(timing.prepare_handler_create_ns) +
@@ -974,7 +979,7 @@ int run_request(
     }
     auto extract_with_password = [&](const std::wstring& selected_password) {
         return archive_input.ranges.empty()
-            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token, archive_input.signature_path, archive_input.signature_offset)
+            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
             : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
     };
 
@@ -1017,6 +1022,35 @@ int run_request(
             result.password_candidate_count = static_cast<unsigned int>(password_candidates.size());
             result.password_attempts = probe.attempts;
             result.matched_index = probe.matched_index;
+        }
+    }
+
+    if (!archive_input.analyzed_missing_volume_evidence.empty()) {
+        if (result.missing_volume && result.missing_volume_evidence.empty()) {
+            result.missing_volume_evidence = archive_input.analyzed_missing_volume_evidence;
+        }
+
+        const bool execution_input_failure =
+            (result.failure_stage == "archive_open" || result.failure_stage == "item_extract") &&
+            !result.wrong_password &&
+            !result.password_rejected &&
+            !result.unsupported_method &&
+            result.status != PasswordTestStatus::BackendUnavailable &&
+            result.status != PasswordTestStatus::Error &&
+            !(result.status == PasswordTestStatus::Ok && result.command_ok);
+        if (execution_input_failure) {
+            // Python already proved this split tail from the same structural
+            // analysis that produced ArchiveInputDescriptor. Do not perform a
+            // second native scan: execute first, then use the analysis fact only
+            // to classify a real backend failure. A later-completed archive can
+            // therefore still succeed.
+            result.status = PasswordTestStatus::Damaged;
+            result.damaged = true;
+            result.missing_volume = true;
+            result.missing_volume_suspected = false;
+            result.missing_volume_evidence = archive_input.analyzed_missing_volume_evidence;
+            result.failure_kind = "missing_volume";
+            result.message = "archive split volume appears incomplete";
         }
     }
 

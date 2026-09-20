@@ -138,7 +138,13 @@ class ArchiveState:
 
     def to_archive_input_descriptor(self) -> ArchiveInputDescriptor:
         descriptor = self.source.to_archive_input_descriptor()
-        if not self.format_hint and not self.logical_name:
+        analysis = dict(descriptor.analysis)
+        analysis.update(self.analysis)
+        if (
+            not self.format_hint
+            and not self.logical_name
+            and analysis == descriptor.analysis
+        ):
             return descriptor
         return ArchiveInputDescriptor(
             entry_path=descriptor.entry_path,
@@ -150,7 +156,7 @@ class ArchiveState:
             parts=list(descriptor.parts),
             ranges=list(descriptor.ranges),
             segment=descriptor.segment,
-            analysis=dict(descriptor.analysis),
+            analysis=analysis,
         )
 
     def with_path_mapping(self, mapper) -> "ArchiveState":

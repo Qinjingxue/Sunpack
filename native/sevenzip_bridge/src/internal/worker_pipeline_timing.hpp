@@ -26,16 +26,15 @@ enum class PipelineStage : unsigned char
 
 enum class PipelinePreparePhase : unsigned char
 {
-    Preflight = 0,
-    OutputDirectory = 1,
-    FormatCandidates = 2,
-    HandlerCreate = 3,
-    StreamOpen = 4,
-    ArchiveOpen = 5,
-    ItemProbe = 6,
-    CallbackSetup = 7,
-    OutputFinalize = 8,
-    ArchiveClose = 9,
+    OutputDirectory = 0,
+    FormatCandidates = 1,
+    HandlerCreate = 2,
+    StreamOpen = 3,
+    ArchiveOpen = 4,
+    ItemProbe = 5,
+    CallbackSetup = 6,
+    OutputFinalize = 7,
+    ArchiveClose = 8,
 };
 
 bool pipeline_timing_enabled() noexcept;
@@ -73,7 +72,7 @@ private:
     Clock::time_point ended_at_{};
     std::array<unsigned int, 3> active_counts_{};
     std::array<unsigned long long, 8> mask_ns_{};
-    std::array<unsigned long long, 10> prepare_ns_{};
+    std::array<unsigned long long, 9> prepare_ns_{};
     unsigned long long compute_cpu_ns_ = 0;
 };
 
@@ -158,7 +157,7 @@ public:
 
 private:
     PipelineTiming *timing_ = nullptr;
-    PipelinePreparePhase phase_ = PipelinePreparePhase::Preflight;
+    PipelinePreparePhase phase_ = PipelinePreparePhase::OutputDirectory;
     PipelineTiming::Clock::time_point started_at_{};
     bool active_ = false;
 };
