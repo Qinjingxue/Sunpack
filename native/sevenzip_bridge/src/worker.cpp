@@ -672,6 +672,9 @@ std::string input_trace_json(const sunpack::sevenzip::ExtractInputTrace& trace) 
         ",\"planned_cursor_peak\":" + std::to_string(trace.planned_cursor_peak) +
         ",\"planned_cache_eviction_count\":" + std::to_string(trace.planned_cache_eviction_count) +
         ",\"planned_demand_issued_count\":" + std::to_string(trace.planned_demand_issued_count) +
+        ",\"planned_hint_count\":" + std::to_string(trace.planned_hint_count) +
+        ",\"planned_hint_bytes\":" + std::to_string(trace.planned_hint_bytes) +
+        ",\"planned_hint_failure_count\":" + std::to_string(trace.planned_hint_failure_count) +
         ",\"open_wall_ns\":" + std::to_string(trace.open_wall_ns) +
         ",\"open_read_file_call_count\":" + std::to_string(trace.open_read_file_call_count) +
         ",\"open_read_file_wall_ns\":" + std::to_string(trace.open_read_file_wall_ns) +
