@@ -515,9 +515,6 @@ private:
   UString _missingVolName;
 
   UInt64 _memUsage_Decompress;
-#ifndef Z7_ST
-  UInt32 _numThreads;
-#endif
 
   DECL_EXTERNAL_CODECS_VARS
 
