@@ -70,7 +70,6 @@ class RelationsPasswordProber:
                 # "needs_volume_or_tail_damaged" verdict for renamed/non-ZIP
                 # inputs, which would otherwise shadow the RAR password check.
                 fast_verifiers=[RarFastVerifier(), ZipFastVerifier(), SevenZipFastVerifier()],
-                final_verifier=None,
             ).build(),
             cache=_shared_attempt_cache(),
         )
