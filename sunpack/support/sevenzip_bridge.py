@@ -236,24 +236,24 @@ class NativeSevenZipBridge:
         raise FileNotFoundError("Required sunpack_sevenzip.dll was not found under tools\\ or the application root.")
 
 
-_DEFAULT_TESTER: NativeSevenZipBridge | None = None
-_DEFAULT_TESTER_LOCK = threading.Lock()
+_DEFAULT_BRIDGE: NativeSevenZipBridge | None = None
+_DEFAULT_BRIDGE_LOCK = threading.Lock()
 
 
 def get_native_sevenzip_bridge() -> NativeSevenZipBridge:
-    global _DEFAULT_TESTER
-    if _DEFAULT_TESTER is not None:
-        return _DEFAULT_TESTER
-    with _DEFAULT_TESTER_LOCK:
-        if _DEFAULT_TESTER is None:
-            _DEFAULT_TESTER = NativeSevenZipBridge()
-        return _DEFAULT_TESTER
+    global _DEFAULT_BRIDGE
+    if _DEFAULT_BRIDGE is not None:
+        return _DEFAULT_BRIDGE
+    with _DEFAULT_BRIDGE_LOCK:
+        if _DEFAULT_BRIDGE is None:
+            _DEFAULT_BRIDGE = NativeSevenZipBridge()
+        return _DEFAULT_BRIDGE
 
 
-def _cache_key(tester: NativeSevenZipBridge, archive_path: str, part_paths: list[str] | None = None) -> tuple:
+def _cache_key(bridge: NativeSevenZipBridge, archive_path: str, part_paths: list[str] | None = None) -> tuple:
     parts = tuple(file_identity(path) for path in list(dict.fromkeys(part_paths or [archive_path])))
     return (
-        str(tester.wrapper_path),
+        str(bridge.wrapper_path),
         file_identity(archive_path),
         parts,
     )
@@ -276,12 +276,12 @@ def _manifest_buffer_chars(max_items: int) -> int:
 
 
 def cached_analyze_archive_resources(archive_path: str, password: str = "", part_paths: list[str] | None = None) -> NativeArchiveResourceAnalysis:
-    tester = get_native_sevenzip_bridge()
+    bridge = get_native_sevenzip_bridge()
     password = password or ""
     return cached_value(
         "native_7z_resources",
-        _cache_key(tester, archive_path, part_paths) + (password,),
-        lambda: tester.analyze_archive_resources(archive_path, password=password, part_paths=part_paths),
+        _cache_key(bridge, archive_path, part_paths) + (password,),
+        lambda: bridge.analyze_archive_resources(archive_path, password=password, part_paths=part_paths),
     )
 
 
@@ -291,13 +291,13 @@ def cached_read_archive_crc_manifest(
     part_paths: list[str] | None = None,
     max_items: int = 200000,
 ) -> NativeArchiveCrcManifest:
-    tester = get_native_sevenzip_bridge()
+    bridge = get_native_sevenzip_bridge()
     password = password or ""
     max_items = max(0, int(max_items or 0))
     return cached_value(
         "native_7z_crc_manifest",
-        _cache_key(tester, archive_path, part_paths) + (password, max_items),
-        lambda: tester.read_archive_crc_manifest(
+        _cache_key(bridge, archive_path, part_paths) + (password, max_items),
+        lambda: bridge.read_archive_crc_manifest(
             archive_path,
             password=password,
             part_paths=part_paths,
