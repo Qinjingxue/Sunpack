@@ -9,7 +9,7 @@ from sunpack.passwords.cache import PasswordAttemptCache
 from sunpack.passwords.candidates import PasswordCandidate
 from sunpack.passwords.fingerprint import build_archive_fingerprint
 from sunpack.passwords.job import PasswordJob
-from sunpack.passwords.verifier import PasswordBatchVerification, PasswordVerifier, PasswordVerifierRegistry, SevenZipDllVerifier
+from sunpack.passwords.verifier import PasswordBatchVerification, PasswordVerifier, PasswordVerifierRegistry
 from sunpack.passwords.verifier.rar_fast import RarFastVerifier
 from sunpack.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
 from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
@@ -66,11 +66,10 @@ class PasswordScheduler:
         self.default_batch_size = max(1, int(default_batch_size))
 
     @classmethod
-    def from_archive_password_tester(cls, password_tester: object) -> "PasswordScheduler":
-        final_verifier = SevenZipDllVerifier.from_archive_password_tester(password_tester)
+    def with_fast_verifiers(cls) -> "PasswordScheduler":
         registry = PasswordVerifierRegistry(
             fast_verifiers=[ZipFastVerifier(), RarFastVerifier(), SevenZipFastVerifier()],
-            final_verifier=final_verifier,
+            final_verifier=None,
         )
         return cls(registry.build())
 
