@@ -33,6 +33,9 @@
 #include "internal/sevenzip_sdk.hpp"
 #include "internal/native_runtime_control.hpp"
 #include "internal/native_worker_sizing.hpp"
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#include "internal/worker_pipeline_timing.hpp"
+#endif
 #ifdef _WIN32
 #include "internal/sevenzip_async_output.hpp"
 #include "internal/sevenzip_space_monitor.hpp"
@@ -730,6 +733,24 @@ std::string output_trace_json(const sunpack::sevenzip::ExtractOutputTrace& trace
         "}";
 }
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+std::string pipeline_timing_json(const sunpack::sevenzip::ExtractPipelineTiming& timing) {
+    return std::string("{") +
+        "\"pipeline_wall_ns\":" + std::to_string(timing.pipeline_wall_ns) +
+        ",\"input_active_ns\":" + std::to_string(timing.input_active_ns) +
+        ",\"compute_active_ns\":" + std::to_string(timing.compute_active_ns) +
+        ",\"compute_cpu_ns\":" + std::to_string(timing.compute_cpu_ns) +
+        ",\"output_active_ns\":" + std::to_string(timing.output_active_ns) +
+        ",\"input_compute_overlap_ns\":" + std::to_string(timing.input_compute_overlap_ns) +
+        ",\"input_output_overlap_ns\":" + std::to_string(timing.input_output_overlap_ns) +
+        ",\"compute_output_overlap_ns\":" + std::to_string(timing.compute_output_overlap_ns) +
+        ",\"all_overlap_ns\":" + std::to_string(timing.all_overlap_ns) +
+        ",\"any_overlap_ns\":" + std::to_string(timing.any_overlap_ns) +
+        ",\"idle_ns\":" + std::to_string(timing.idle_ns) +
+        "}";
+}
+#endif
+
 std::string verified_manifest_json(const sunpack::sevenzip::ExtractArchiveResult& result, bool validated) {
     std::string rows = "[";
     rows.reserve(result.output_trace.items.size() * 96);
@@ -999,6 +1020,10 @@ int run_request(
         ",\"diagnostics\":" + diagnostics_json(result) : "";
     const std::string input_trace_field = read_file_timing_enabled() ?
         ",\"input_trace\":" + input_trace_json(result.input_trace) : "";
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+    const std::string pipeline_timing_field = pipeline_timing_enabled() ?
+        ",\"pipeline_timing\":" + pipeline_timing_json(result.pipeline_timing) : "";
+#endif
     print_json_line(
         "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
         "\",\"status\":\"" + std::string(ok ? "ok" : "failed") +
@@ -1037,7 +1062,11 @@ int run_request(
         "\",\"verified_manifest\":" + verified_manifest_json(result, ok && !dry_run) +
         ",\"failed_item\":\"" + json_escape(wide_to_utf8(result.failed_item)) +
         "\",\"message\":\"" + json_escape(result.message) + "\"" +
-        failure_fields + input_trace_field + diagnostic_fields + "}");
+        failure_fields + input_trace_field
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        + pipeline_timing_field
+#endif
+        + diagnostic_fields + "}");
     return ok ? 0 : 1;
 }
 

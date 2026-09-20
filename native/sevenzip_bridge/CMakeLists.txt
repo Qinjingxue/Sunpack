@@ -42,6 +42,9 @@ option(SUP7Z_USE_X64_ASM
 option(SUP7Z_USE_ARM64_ASM
     "Use upstream 7-Zip ARM64 LZMA decoder assembly hot path"
     ON)
+option(SUP7Z_ENABLE_PIPELINE_TIMING
+    "Build the benchmark-only worker pipeline timing instrumentation"
+    OFF)
 
 set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)
@@ -325,6 +328,11 @@ set(SUP7Z_INTERNAL_SOURCES
     src/internal/strict_archive_validation.cpp
 )
 
+if(SUP7Z_ENABLE_PIPELINE_TIMING)
+    list(APPEND SUP7Z_INTERNAL_SOURCES
+        src/worker_pipeline_timing.cpp)
+endif()
+
 add_library(sunpack_sevenzip_core STATIC
     ${SUP7Z_INTERNAL_SOURCES}
 )
@@ -346,6 +354,9 @@ endif()
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX SUP7Z_BUILD_DLL)
     target_link_libraries(sunpack_sevenzip_core PUBLIC OleAut32)
+endif()
+if(SUP7Z_ENABLE_PIPELINE_TIMING)
+    target_compile_definitions(sunpack_sevenzip_core PRIVATE SUP7Z_ENABLE_PIPELINE_TIMING=1)
 endif()
 
 add_library(sunpack_sevenzip SHARED
@@ -369,6 +380,9 @@ if(WIN32)
     target_link_libraries(sunpack_sevenzip PRIVATE OleAut32)
 
     sup7z_attach_bundled_7z(sunpack_sevenzip)
+endif()
+if(SUP7Z_ENABLE_PIPELINE_TIMING)
+    target_compile_definitions(sunpack_sevenzip PRIVATE SUP7Z_ENABLE_PIPELINE_TIMING=1)
 endif()
 
 add_executable(sunpack_sevenzip_smoke
@@ -478,6 +492,9 @@ sup7z_attach_bundled_7z(sunpack_sevenzip_worker)
 
 if(WIN32)
     target_compile_definitions(sunpack_sevenzip_worker PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    if(SUP7Z_ENABLE_PIPELINE_TIMING)
+        target_compile_definitions(sunpack_sevenzip_worker PRIVATE SUP7Z_ENABLE_PIPELINE_TIMING=1)
+    endif()
 
     add_executable(sunpack_launcher src/launcher.cpp)
     apply_release_optimizations(sunpack_launcher)

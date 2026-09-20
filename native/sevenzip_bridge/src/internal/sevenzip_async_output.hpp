@@ -4,6 +4,9 @@
 #include "sevenzip_space_retry.hpp"
 #include "sevenzip_volume_state.hpp"
 #include "sevenzip_writer_meters.hpp"
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#include "worker_pipeline_timing.hpp"
+#endif
 
 #ifdef _WIN32
 
@@ -34,9 +37,17 @@ namespace sunpack::sevenzip
         {
             explicit JobState(
                 std::size_t budget,
-                std::shared_ptr<std::atomic<bool>> external_cancel = nullptr)
+                std::shared_ptr<std::atomic<bool>> external_cancel = nullptr
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                , PipelineTiming *pipeline_timing = nullptr
+#endif
+                )
                 : max_inflight_bytes(budget),
-                  cancel_token(std::move(external_cancel)) {}
+                  cancel_token(std::move(external_cancel))
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                  , pipeline_timing(pipeline_timing)
+#endif
+                  {}
 
             // 必须是 atomic：gate 的 wait() 在 writer mutex_ 之外无锁读它。
             // 每个令本 job 终局的地方都要同步置 true；空间错误不得置位（那是暂停语义的前提）。
@@ -50,6 +61,9 @@ namespace sunpack::sevenzip
             bool cancelled = false;
             const std::size_t max_inflight_bytes;
             std::shared_ptr<std::atomic<bool>> cancel_token;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            PipelineTiming *pipeline_timing = nullptr;
+#endif
         };
 
         using JobStatePtr = std::shared_ptr<JobState>;
@@ -249,13 +263,23 @@ namespace sunpack::sevenzip
 
         JobStatePtr make_job(
             std::size_t max_inflight_bytes = 0,
-            std::shared_ptr<std::atomic<bool>> cancel_token = nullptr)
+            std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            , PipelineTiming *pipeline_timing = nullptr
+#endif
+            )
         {
             if (max_inflight_bytes == 0)
             {
                 max_inflight_bytes = kDefaultJobInFlightBytes;
             }
-            auto job = std::make_shared<JobState>(max_inflight_bytes, std::move(cancel_token));
+            auto job = std::make_shared<JobState>(
+                max_inflight_bytes,
+                std::move(cancel_token)
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                , pipeline_timing
+#endif
+                );
             std::lock_guard<std::mutex> lock(mutex_);
             synchronize_cancellation_locked(job);
             active_jobs_.push_back(job);
@@ -1438,6 +1462,9 @@ namespace sunpack::sevenzip
                 {
                     effective_size = chunk_limit; // 测试注入：强制制造 partial write
                 }
+                #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                PipelineStageScope pipeline_scope(job->pipeline_timing, PipelineStage::Output);
+                #endif
                 const BOOL started = WriteFile(
                     file->handle,
                     buffer->data.get() + transferred,

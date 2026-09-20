@@ -9,6 +9,23 @@
 namespace sunpack::sevenzip {
 
 class AsyncFileWriter;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+class PipelineTiming;
+
+struct ExtractPipelineTiming {
+    unsigned long long pipeline_wall_ns = 0;
+    unsigned long long input_active_ns = 0;
+    unsigned long long compute_active_ns = 0;
+    unsigned long long compute_cpu_ns = 0;
+    unsigned long long output_active_ns = 0;
+    unsigned long long input_compute_overlap_ns = 0;
+    unsigned long long input_output_overlap_ns = 0;
+    unsigned long long compute_output_overlap_ns = 0;
+    unsigned long long all_overlap_ns = 0;
+    unsigned long long any_overlap_ns = 0;
+    unsigned long long idle_ns = 0;
+};
+#endif
 
 enum class PasswordTestStatus {
     Ok,
@@ -59,6 +76,9 @@ struct ExtractHandlerAttempt {
 };
 
 struct ExtractInputTrace {
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+    PipelineTiming *pipeline_timing = nullptr;
+#endif
     std::wstring mode;
     unsigned long long virtual_size = 0;
     unsigned long long position = 0;
@@ -129,6 +149,9 @@ struct ExtractOutputItemTrace {
 };
 
 struct ExtractOutputTrace {
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+    PipelineTiming *pipeline_timing = nullptr;
+#endif
     unsigned long long total_bytes_written = 0;
     unsigned long long current_item_bytes_written = 0;
     unsigned long long last_write_size = 0;
@@ -140,6 +163,9 @@ struct ExtractOutputTrace {
 };
 
 struct ExtractArchiveResult {
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+    ExtractPipelineTiming pipeline_timing;
+#endif
     PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
     bool backend_available = false;
     bool command_ok = false;

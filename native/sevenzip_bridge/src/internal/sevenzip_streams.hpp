@@ -2,6 +2,10 @@
 
 #include "sevenzip_paths.hpp"
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+#include "worker_pipeline_timing.hpp"
+#endif
+
 #include "sevenzip_sdk.hpp"
 
 #ifdef _WIN32
@@ -141,7 +145,15 @@ namespace sunpack::sevenzip
         DWORD open_error() const noexcept { return open_error_; }
 
         // Reads directly at the requested offset; the caller's own position is not part of the contract.
-        HRESULT read_at(UInt64 offset, void *data, UInt32 size, UInt32 *processed) noexcept
+        HRESULT read_at(
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            UInt32 *processed
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            , PipelineTiming *pipeline_timing = nullptr
+#endif
+            ) noexcept
         {
             if (processed)
             {
@@ -158,6 +170,9 @@ namespace sunpack::sevenzip
                 return HRESULT_FROM_WIN32(GetLastError());
             }
             DWORD read = 0;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            PipelineStageScope pipeline_scope(pipeline_timing, PipelineStage::Input);
+#endif
             const BOOL ok = ReadFile(handle_, data, size, &read, nullptr);
             if (!ok)
             {
@@ -193,7 +208,16 @@ namespace sunpack::sevenzip
         PathHandleCache(const PathHandleCache &) = delete;
         PathHandleCache &operator=(const PathHandleCache &) = delete;
 
-        HRESULT read_at(const std::wstring &path, UInt64 offset, void *data, UInt32 size, UInt32 *processed) noexcept
+        HRESULT read_at(
+            const std::wstring &path,
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            UInt32 *processed
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            , PipelineTiming *pipeline_timing = nullptr
+#endif
+            ) noexcept
         {
             if (processed)
             {
@@ -202,7 +226,11 @@ namespace sunpack::sevenzip
             const auto found = handles_.find(path);
             if (found != handles_.end())
             {
-                return found->second->read_at(offset, data, size, processed);
+                return found->second->read_at(offset, data, size, processed
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                                              , pipeline_timing
+#endif
+                );
             }
             auto handle = std::make_unique<PathHandle>(path);
             if (!handle->valid())
@@ -211,7 +239,11 @@ namespace sunpack::sevenzip
             }
             PathHandle *raw = handle.get();
             handles_.emplace(path, std::move(handle));
-            return raw->read_at(offset, data, size, processed);
+            return raw->read_at(offset, data, size, processed
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                                , pipeline_timing
+#endif
+            );
         }
 
     private:
@@ -464,6 +496,9 @@ namespace sunpack::sevenzip
     public:
         explicit ReadFileWallTimer(ExtractInputTrace *trace) noexcept
             : trace_(read_file_timing_enabled() ? trace : nullptr)
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+              , pipeline_scope_(trace ? trace->pipeline_timing : nullptr, PipelineStage::Input)
+#endif
         {
             if (trace_)
             {
@@ -489,6 +524,9 @@ namespace sunpack::sevenzip
     private:
         ExtractInputTrace *trace_ = nullptr;
         std::chrono::steady_clock::time_point started_{};
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        PipelineStageScope pipeline_scope_;
+#endif
     };
 
     inline void record_logical_read(ExtractInputTrace *trace, UInt64 start, UInt32 returned) noexcept
@@ -595,8 +633,14 @@ namespace sunpack::sevenzip
                 if (prefetch_reader_->valid())
                 {
                     PathHandle *reader = prefetch_reader_.get();
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                    PipelineTiming *pipeline_timing = trace_ ? trace_->pipeline_timing : nullptr;
+                    prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, size_, [reader, pipeline_timing](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
+                                                                       { return reader->read_at(offset, data, read_size, processed, pipeline_timing); });
+#else
                     prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, size_, [reader](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
                                                                        { return reader->read_at(offset, data, read_size, processed); });
+#endif
                 }
                 else
                 {
@@ -1247,7 +1291,16 @@ namespace sunpack::sevenzip
                 const UInt64 remaining = sizes_[index] - part_offset;
                 const UInt32 want = static_cast<UInt32>(std::min<UInt64>(size - total_read, remaining));
                 UInt32 read = 0;
-                const HRESULT result = prefetch_handles_.read_at(paths_[index], part_offset, out + total_read, want, &read);
+                const HRESULT result = prefetch_handles_.read_at(
+                    paths_[index],
+                    part_offset,
+                    out + total_read,
+                    want,
+                    &read
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                    , trace_ ? trace_->pipeline_timing : nullptr
+#endif
+                    );
                 if (result != S_OK)
                 {
                     return result;
@@ -1720,7 +1773,16 @@ namespace sunpack::sevenzip
                 const UInt64 remaining = range.length - offset_in_range;
                 const UInt32 want = static_cast<UInt32>(std::min<UInt64>(size - total_read, remaining));
                 UInt32 read = 0;
-                const HRESULT result = prefetch_handles_.read_at(range.path, range.start + offset_in_range, out + total_read, want, &read);
+                const HRESULT result = prefetch_handles_.read_at(
+                    range.path,
+                    range.start + offset_in_range,
+                    out + total_read,
+                    want,
+                    &read
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                    , trace_ ? trace_->pipeline_timing : nullptr
+#endif
+                    );
                 if (result != S_OK)
                 {
                     return result;

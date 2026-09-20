@@ -391,6 +391,7 @@ def _run_case(
         name: os.environ.get(name)
         for name in (
             "SUNPACK_SEVENZIP_PROFILE_READS",
+            "SUNPACK_SEVENZIP_PROFILE_PIPELINE",
             "SUNPACK_SEVENZIP_PREFETCH",
             "SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB",
             "SUNPACK_SEVENZIP_PREFETCH_DEPTH",
@@ -402,6 +403,7 @@ def _run_case(
     rows: list[dict[str, Any]] = []
     try:
         os.environ["SUNPACK_SEVENZIP_PROFILE_READS"] = "1"
+        os.environ["SUNPACK_SEVENZIP_PROFILE_PIPELINE"] = "1"
         os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if prefetch_enabled else "0"
         os.environ["SUNPACK_SEVENZIP_PREFETCH_WINDOW_KIB"] = str(prefetch_window_kib)
         os.environ["SUNPACK_SEVENZIP_PREFETCH_DEPTH"] = str(prefetch_depth)
@@ -448,6 +450,9 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         "input_prefetch_miss_count", "input_prefetch_invalidation_count", "input_prefetch_consumer_wait_ms",
         "input_prefetch_issued_count", "input_prefetch_published_count", "input_prefetch_orphaned_count",
         "input_consumer_read_blocking_ms", "prefetch_recommendation", "decoder_verdict",
+        "pipeline_wall_ms", "pipeline_input_active_ms", "pipeline_compute_active_ms", "pipeline_compute_cpu_ms",
+        "pipeline_output_active_ms", "pipeline_input_compute_overlap_ms", "pipeline_input_output_overlap_ms",
+        "pipeline_compute_output_overlap_ms", "pipeline_all_overlap_ms", "pipeline_any_overlap_ms", "pipeline_idle_ms",
     ]
     with path.open("w", encoding="utf-8", newline="") as stream:
         writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore")

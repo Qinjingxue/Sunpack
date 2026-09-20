@@ -172,6 +172,16 @@ def _run_job(
     input_trace = result.get("input_trace")
     if not isinstance(input_trace, dict):
         input_trace = {}
+    pipeline_timing = result.get("pipeline_timing")
+    if not isinstance(pipeline_timing, dict):
+        pipeline_timing = {}
+
+    def pipeline_ms(name: str) -> float | None:
+        value = pipeline_timing.get(name)
+        if value is None:
+            return None
+        return round(float(value or 0) / 1_000_000.0, 3)
+
     read_file_wall_ms = round(float(input_trace.get("read_file_wall_ns", 0) or 0) / 1_000_000.0, 3)
     prefetch_wait_ms = round(float(input_trace.get("prefetch_consumer_wait_ns", 0) or 0) / 1_000_000.0, 3)
     sequential_read_bytes = int(input_trace.get("sequential_read_bytes", 0) or 0)
@@ -206,6 +216,17 @@ def _run_job(
         "input_prefetch_orphaned_count": int(input_trace.get("prefetch_orphaned_count", 0) or 0),
         "input_prefetch_consumer_wait_ms": prefetch_wait_ms,
         "input_consumer_read_blocking_ms": round(read_file_wall_ms + prefetch_wait_ms, 3),
+        "pipeline_wall_ms": pipeline_ms("pipeline_wall_ns"),
+        "pipeline_input_active_ms": pipeline_ms("input_active_ns"),
+        "pipeline_compute_active_ms": pipeline_ms("compute_active_ns"),
+        "pipeline_compute_cpu_ms": pipeline_ms("compute_cpu_ns"),
+        "pipeline_output_active_ms": pipeline_ms("output_active_ns"),
+        "pipeline_input_compute_overlap_ms": pipeline_ms("input_compute_overlap_ns"),
+        "pipeline_input_output_overlap_ms": pipeline_ms("input_output_overlap_ns"),
+        "pipeline_compute_output_overlap_ms": pipeline_ms("compute_output_overlap_ns"),
+        "pipeline_all_overlap_ms": pipeline_ms("all_overlap_ns"),
+        "pipeline_any_overlap_ms": pipeline_ms("any_overlap_ns"),
+        "pipeline_idle_ms": pipeline_ms("idle_ns"),
         "worker_rss_before_mib": round(child_rss[0], 3) if child_rss else None,
         "worker_rss_peak_mib": round(max(child_rss), 3) if child_rss else None,
         "worker_rss_after_mib": round(child_rss[-1], 3) if child_rss else None,

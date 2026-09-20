@@ -252,6 +252,24 @@ namespace sunpack::sevenzip
         result.backend_available = true;
         result.requested_codepage = codepage;
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        auto pipeline_timing = std::make_shared<PipelineTiming>(pipeline_timing_enabled());
+        result.input_trace.pipeline_timing = pipeline_timing.get();
+        result.output_trace.pipeline_timing = pipeline_timing.get();
+        struct PipelineTimingCapture final
+        {
+            ExtractArchiveResult &result;
+            std::shared_ptr<PipelineTiming> timing;
+
+            ~PipelineTimingCapture() noexcept
+            {
+                result.pipeline_timing = timing->snapshot();
+                result.input_trace.pipeline_timing = nullptr;
+                result.output_trace.pipeline_timing = nullptr;
+            }
+        } pipeline_capture{result, pipeline_timing};
+#endif
+
         if (seven_zip_parts_prove_missing_tail(part_paths, !canonical_names.empty()))
         {
             set_missing_volume_failure(result, "input_preflight", "seven_zip_start_header_length");
@@ -463,11 +481,26 @@ namespace sunpack::sevenzip
                 num_items,
                 std::move(shared_writer),
                 job_buffer_budget,
-                std::move(cancel_token));
+                std::move(cancel_token)
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                ,
+                pipeline_timing.get());
+#else
+                );
+#endif
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            pipeline_timing->start_pipeline();
+            {
+                PipelineStageScope compute_scope(pipeline_timing.get(), PipelineStage::Compute);
+                PipelineThreadCpuScope compute_cpu_scope(pipeline_timing.get());
+                hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
+            }
+#else
             hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
+#endif
 
             // Extraction success must not be published before every queued write and close
             // has finished and any delayed filesystem error has been folded back in.

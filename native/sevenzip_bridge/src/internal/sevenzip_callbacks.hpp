@@ -784,6 +784,9 @@ namespace sunpack::sevenzip
             std::size_t job_buffer_budget = 0,
 
             std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            , PipelineTiming *pipeline_timing = nullptr
+#endif
 
             ) : archive_(archive),
 
@@ -797,13 +800,20 @@ namespace sunpack::sevenzip
 
                 dry_run_(dry_run),
 
-                output_trace_(output_trace),
-
+                output_trace_(output_trace)
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                , pipeline_timing_(pipeline_timing)
+#endif
+                ,
                 async_writer_(dry_run ? nullptr : (shared_writer ? std::move(shared_writer) : std::make_shared<AsyncFileWriter>())),
 
                 cancel_token_(std::move(cancel_token)),
 
-                async_job_(async_writer_ ? async_writer_->make_job(job_buffer_budget, cancel_token_) : nullptr),
+                async_job_(async_writer_ ? async_writer_->make_job(job_buffer_budget, cancel_token_
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                    , pipeline_timing_
+#endif
+                    ) : nullptr),
 
                 output_root_(win32_extended_path(output_dir_)),
 
@@ -1629,6 +1639,10 @@ namespace sunpack::sevenzip
         bool dry_run_ = false;
 
         ExtractOutputTrace *output_trace_ = nullptr;
+
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        PipelineTiming *pipeline_timing_ = nullptr;
+#endif
 
         std::shared_ptr<AsyncFileWriter> async_writer_;
 
