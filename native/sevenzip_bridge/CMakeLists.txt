@@ -43,7 +43,7 @@ option(SUP7Z_USE_ARM64_ASM
     "Use upstream 7-Zip ARM64 LZMA decoder assembly hot path"
     ON)
 option(SUP7Z_USE_PLANNED_IO
-    "Use SunPack planned archive input I/O instead of decoder-driven sequential prefetch during extraction"
+    "Use semantic archive read plans to issue Windows page-cache prefetch hints during extraction"
     ON)
 option(SUP7Z_USE_OPEN_PREFETCH
     "Use legacy sequential prefetch while 7-Zip opens/parses archive metadata"
