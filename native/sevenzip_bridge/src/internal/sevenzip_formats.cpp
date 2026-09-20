@@ -316,45 +316,6 @@ namespace sunpack::sevenzip
         return formats;
     }
 
-    std::vector<GUID> candidate_formats_for_hint(
-        const std::wstring &format_hint,
-        const std::wstring &archive_path,
-        const std::vector<std::wstring> &part_paths,
-        const std::wstring &signature_path,
-        UInt64 signature_offset)
-    {
-        const std::wstring hint = normalized_format_hint(format_hint);
-        std::vector<unsigned char> ids;
-        if (hint == L"rar")
-        {
-            std::vector<unsigned char> detected_ids;
-            if (!signature_path.empty())
-            {
-                detected_ids = format_ids_for_signature_at(signature_path, signature_offset);
-                if (detected_ids != std::vector<unsigned char>{0x03} &&
-                    detected_ids != std::vector<unsigned char>{0xCC})
-                {
-                    detected_ids.clear();
-                }
-            }
-            if (detected_ids.size() != 1)
-            {
-                detected_ids = rar_format_ids_for_paths(archive_path, part_paths);
-            }
-            ids = detected_ids.size() == 1
-                      ? detected_ids
-                      : std::vector<unsigned char>{0x03, 0xCC};
-        }
-        else
-        {
-            ids = known_format_ids_for_hint(hint);
-        }
-
-        return ids.empty()
-                   ? candidate_formats(archive_path, part_paths)
-                   : format_guids(ids);
-    }
-
     std::vector<GUID> extraction_formats_for_hint(
         const std::wstring &format_hint,
         const std::wstring &archive_path)
