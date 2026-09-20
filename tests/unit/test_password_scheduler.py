@@ -216,55 +216,7 @@ def test_password_scheduler_does_not_cache_weak_fast_match_as_success(tmp_path):
     assert scheduler.cache.get_success(build_archive_fingerprint(str(archive)).key) is None
 
 
-def test_verifier_chain_confirms_fast_match_with_final_verifier():
-    fast = StaticVerifier(PasswordBatchVerification(
-        ok=True,
-        status="match",
-        matched_index=1,
-        attempts=2,
-    ))
-    final = StaticVerifier(PasswordBatchVerification(
-        ok=True,
-        status="match",
-        matched_index=0,
-        attempts=1,
-        test_result=SimpleNamespace(returncode=0),
-        terminal=True,
-    ))
-    chain = PasswordVerifierChain([fast], final)
-
-    outcome = chain.verify_batch("sample.zip", ["bad", "secret", "unused"])
-
-    assert outcome.ok is True
-    assert outcome.matched_index == 1
-    assert fast.batches == [["bad", "secret", "unused"]]
-    assert final.batches == [["secret"]]
-
-
-def test_verifier_chain_falls_back_when_fast_verifier_is_unknown():
-    fast = StaticVerifier(PasswordBatchVerification(
-        ok=False,
-        status="unknown_needs_final_verifier",
-        attempts=0,
-    ))
-    final = StaticVerifier(PasswordBatchVerification(
-        ok=True,
-        status="match",
-        matched_index=2,
-        attempts=3,
-        test_result=SimpleNamespace(returncode=0),
-        terminal=True,
-    ))
-    chain = PasswordVerifierChain([fast], final)
-
-    outcome = chain.verify_batch("sample.rar", ["bad1", "bad2", "secret"])
-
-    assert outcome.ok is True
-    assert outcome.matched_index == 2
-    assert final.batches == [["bad1", "bad2", "secret"]]
-
-
-def test_verifier_chain_without_final_verifier_preserves_all_weak_matches():
+def test_verifier_chain_preserves_weak_candidate_evidence():
     fast = StaticVerifier(PasswordBatchVerification(
         ok=True,
         status="match",
@@ -274,12 +226,13 @@ def test_verifier_chain_without_final_verifier_preserves_all_weak_matches():
         final_confirmation_required=True,
         match_evidence="zipcrypto_header_byte",
     ))
-    chain = PasswordVerifierChain([fast], None)
+    chain = PasswordVerifierChain([fast])
 
     outcome = chain.verify_batch("sample.zip", ["collision", "rejected", "secret"])
 
-    assert outcome.ok is False
-    assert outcome.status == "unknown_needs_final_verifier"
+    assert outcome.ok is True
+    assert outcome.status == "match"
+    assert outcome.final_confirmation_required is True
     assert outcome.matched_indices == (0, 2)
     assert outcome.match_evidence == "zipcrypto_header_byte"
 
@@ -322,7 +275,6 @@ def test_production_scheduler_uses_only_bounded_fast_verifiers(
     assert result.password is None
     assert result.extraction_candidates == ("one", "two", "three")
     assert isinstance(scheduler.verifier, PasswordVerifierChain)
-    assert scheduler.verifier.final_verifier is None
     assert zip_fast.batches == []
     assert rar_fast.batches == [["one", "two", "three"]]
     assert seven_zip_fast.batches == []
@@ -355,7 +307,7 @@ def test_extraction_plan_accepts_strong_fast_proof_and_caches_it(tmp_path):
     assert fast.batches == [["bad", "secret"]]
 
 
-def test_extraction_plan_accepts_not_required_fast_result_and_never_calls_final(tmp_path):
+def test_extraction_plan_accepts_not_required_fast_result(tmp_path):
     archive = tmp_path / "plain.embedded"
     archive.write_bytes(b"archive")
     fast = StaticVerifier(PasswordBatchVerification(
@@ -365,13 +317,7 @@ def test_extraction_plan_accepts_not_required_fast_result_and_never_calls_final(
         attempts=0,
         final_confirmation_required=False,
     ))
-    final = StaticVerifier(PasswordBatchVerification(
-        ok=True,
-        status="match",
-        matched_index=0,
-        attempts=1,
-    ))
-    scheduler = PasswordScheduler(PasswordVerifierChain([fast], final))
+    scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
     job = PasswordJob(
         archive_path=str(archive),
         archive_input={"open_mode": "file_range", "format_hint": "zip"},
@@ -391,7 +337,6 @@ def test_extraction_plan_accepts_not_required_fast_result_and_never_calls_final(
         str(archive), archive_input=job.archive_input,
     ).key) == ""
     assert fast.batches == [["", "secret"]]
-    assert final.batches == []
 
 
 def test_extraction_plan_preserves_zipcrypto_candidate_evidence(tmp_path):
@@ -429,7 +374,7 @@ def test_verifier_chain_prioritizes_fast_verifier_from_extension():
         attempts=2,
         error_text="wrong password",
     ))
-    chain = PasswordVerifierChain([zip_fast, rar_fast, seven_zip_fast], None)
+    chain = PasswordVerifierChain([zip_fast, rar_fast, seven_zip_fast])
 
     outcome = chain.verify_batch("sample.7z", ["bad1", "bad2"])
 
