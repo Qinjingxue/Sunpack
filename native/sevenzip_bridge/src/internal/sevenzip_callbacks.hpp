@@ -12,11 +12,7 @@
 
 #include <algorithm>
 
-#include <array>
-
 #include <cstddef>
-
-#include <cstring>
 
 #include <cwctype>
 
@@ -42,58 +38,6 @@ namespace sunpack::sevenzip
 {
 
 #ifdef _WIN32
-
-    inline UInt32 update_crc32(UInt32 crc, const void *data, std::size_t size)
-    {
-        using RtlComputeCrc32Fn = ULONG(WINAPI *)(ULONG, const void *, SIZE_T);
-        static const auto system_crc32 = []() -> RtlComputeCrc32Fn
-        {
-            const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
-            return ntdll ? reinterpret_cast<RtlComputeCrc32Fn>(GetProcAddress(ntdll, "RtlComputeCrc32")) : nullptr;
-        }();
-        if (system_crc32 != nullptr)
-        {
-            const UInt32 finalized = system_crc32(crc ^ 0xFFFFFFFFU, data, size);
-            return finalized ^ 0xFFFFFFFFU;
-        }
-        static const std::array<std::array<UInt32, 256>, 16> tables = []
-        {
-            std::array<std::array<UInt32, 256>, 16> values{};
-            for (UInt32 index = 0; index < 256; ++index)
-            {
-                UInt32 value = index;
-                for (int bit = 0; bit < 8; ++bit)
-                {
-                    value = (value >> 1) ^ ((value & 1) ? 0xEDB88320U : 0U);
-                }
-                values[0][index] = value;
-            }
-            for (std::size_t slice = 1; slice < values.size(); ++slice)
-            {
-                for (std::size_t index = 0; index < 256; ++index)
-                {
-                    const UInt32 previous = values[slice - 1][index];
-                    values[slice][index] = values[0][previous & 0xFFU] ^ (previous >> 8);
-                }
-            }
-            return values;
-        }();
-        const auto *bytes = static_cast<const unsigned char *>(data);
-        while (size >= 16)
-        {
-            UInt32 first = 0;
-            std::memcpy(&first, bytes, sizeof(first));
-            first ^= crc;
-            crc = tables[15][first & 0xFFU] ^ tables[14][(first >> 8) & 0xFFU] ^ tables[13][(first >> 16) & 0xFFU] ^ tables[12][(first >> 24) & 0xFFU] ^ tables[11][bytes[4]] ^ tables[10][bytes[5]] ^ tables[9][bytes[6]] ^ tables[8][bytes[7]] ^ tables[7][bytes[8]] ^ tables[6][bytes[9]] ^ tables[5][bytes[10]] ^ tables[4][bytes[11]] ^ tables[3][bytes[12]] ^ tables[2][bytes[13]] ^ tables[1][bytes[14]] ^ tables[0][bytes[15]];
-            bytes += 16;
-            size -= 16;
-        }
-        while (size-- > 0)
-        {
-            crc = tables[0][(crc ^ *bytes++) & 0xFFU] ^ (crc >> 8);
-        }
-        return crc;
-    }
 
     class OpenCallback final : public CMyUnknownImp, public IArchiveOpenCallback, public IArchiveOpenVolumeCallback, public ICryptoGetTextPassword
     {
@@ -366,9 +310,6 @@ namespace sunpack::sevenzip
             : trace_(trace),
               item_trace_index_(item_trace_index),
 
-              compute_crc_(trace_ && item_trace_index_ < trace_->items.size() &&
-                           !trace_->items[item_trace_index_].has_source_crc32),
-
               handle_(CreateFileW(win32_extended_path(path).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
                                   FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr))
         {
@@ -447,10 +388,6 @@ namespace sunpack::sevenzip
             }
 
             bytes_written_ += written;
-            if (compute_crc_)
-            {
-                crc32_ = update_crc32(crc32_, data, written);
-            }
 
             if (trace_)
             {
@@ -469,11 +406,6 @@ namespace sunpack::sevenzip
                 {
 
                     trace_->items[item_trace_index_].bytes_written += written;
-                    if (compute_crc_)
-                    {
-                        trace_->items[item_trace_index_].output_crc32 = crc32_ ^ 0xFFFFFFFFU;
-                        trace_->items[item_trace_index_].has_output_crc32 = true;
-                    }
 
                     trace_->items[item_trace_index_].hresult = S_OK;
 
@@ -514,13 +446,9 @@ namespace sunpack::sevenzip
 
         std::size_t item_trace_index_ = 0;
 
-        bool compute_crc_ = false;
-
         HANDLE handle_ = INVALID_HANDLE_VALUE;
 
         UInt64 bytes_written_ = 0;
-
-        UInt32 crc32_ = 0xFFFFFFFFU;
     };
 
     class AsyncFileOutStream final : public CMyUnknownImp, public ISequentialOutStream
@@ -531,10 +459,8 @@ namespace sunpack::sevenzip
     public:
         AsyncFileOutStream(
             std::shared_ptr<AsyncFileWriter> writer,
-            AsyncFileWriter::FileStatePtr file,
-            bool compute_crc) : writer_(std::move(writer)),
-                                file_(std::move(file)),
-                                compute_crc_(compute_crc)
+            AsyncFileWriter::FileStatePtr file) : writer_(std::move(writer)),
+                                                  file_(std::move(file))
         {
             magic_.reserve(512);
         }
@@ -544,7 +470,7 @@ namespace sunpack::sevenzip
             if (writer_ && file_)
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                writer_->close_file(file_, crc32_ ^ 0xFFFFFFFFU, compute_crc_, std::move(magic_));
+                writer_->close_file(file_, std::move(magic_));
             }
         }
 
@@ -562,10 +488,6 @@ namespace sunpack::sevenzip
             }
             UInt32 consumed = 0;
             const HRESULT hr = writer_->write(file_, data, size, &consumed);
-            if (compute_crc_ && consumed != 0)
-            {
-                crc32_ = update_crc32(crc32_, data, consumed);
-            }
             if (consumed != 0 && magic_.size() < 512)
             {
                 const auto *bytes = static_cast<const unsigned char *>(data);
@@ -582,8 +504,6 @@ namespace sunpack::sevenzip
     private:
         std::shared_ptr<AsyncFileWriter> writer_;
         AsyncFileWriter::FileStatePtr file_;
-        bool compute_crc_ = false;
-        UInt32 crc32_ = 0xFFFFFFFFU;
         std::vector<unsigned char> magic_;
         std::mutex mutex_;
     };
@@ -597,23 +517,17 @@ namespace sunpack::sevenzip
         explicit TraceOutStream(ExtractOutputTrace *trace = nullptr, std::size_t item_trace_index = 0)
 
             : trace_(trace),
-              item_trace_index_(item_trace_index),
-              compute_crc_(trace_ && item_trace_index_ < trace_->items.size() &&
-                           !trace_->items[item_trace_index_].has_source_crc32)
+              item_trace_index_(item_trace_index)
         {
         }
 
         UInt64 bytes_written() const { return bytes_written_; }
 
 
-        HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
+        HRESULT STDMETHODCALLTYPE Write(const void *, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
 
             bytes_written_ += size;
-            if (compute_crc_)
-            {
-                crc32_ = update_crc32(crc32_, data, size);
-            }
 
             if (trace_)
             {
@@ -632,11 +546,6 @@ namespace sunpack::sevenzip
                 {
 
                     trace_->items[item_trace_index_].bytes_written += size;
-                    if (compute_crc_)
-                    {
-                        trace_->items[item_trace_index_].output_crc32 = crc32_ ^ 0xFFFFFFFFU;
-                        trace_->items[item_trace_index_].has_output_crc32 = true;
-                    }
 
                     trace_->items[item_trace_index_].hresult = S_OK;
 
@@ -659,11 +568,7 @@ namespace sunpack::sevenzip
 
         std::size_t item_trace_index_ = 0;
 
-        bool compute_crc_ = false;
-
         UInt64 bytes_written_ = 0;
-
-        UInt32 crc32_ = 0xFFFFFFFFU;
     };
 
     inline std::filesystem::path browser_style_available_path(const std::filesystem::path &requested)
@@ -908,11 +813,6 @@ namespace sunpack::sevenzip
                     if (item.done && item.has_source_crc32)
                     {
                         item.output_crc32 = item.source_crc32;
-                        item.has_output_crc32 = true;
-                    }
-                    else if (snapshot.has_output_crc32)
-                    {
-                        item.output_crc32 = snapshot.output_crc32;
                         item.has_output_crc32 = true;
                     }
                     item.crc_verified = item.done && (!item.has_source_crc32 ||
@@ -1254,13 +1154,11 @@ namespace sunpack::sevenzip
                 output_error_ = true;
                 return E_FAIL;
             }
-            const bool compute_crc = output_trace_ && current_trace_index_ < output_trace_->items.size() &&
-                                     !output_trace_->items[current_trace_index_].has_source_crc32;
             current_async_file_ = async_writer_->make_file(async_job_,
                                                            target.wstring(), name, index, current_trace_index_);
             async_files_.push_back(current_async_file_);
 
-            CMyComPtr<ISequentialOutStream> stream_owner(new AsyncFileOutStream(async_writer_, current_async_file_, compute_crc));
+            CMyComPtr<ISequentialOutStream> stream_owner(new AsyncFileOutStream(async_writer_, current_async_file_));
             *outStream = stream_owner.Detach();
 
             return S_OK;
@@ -1523,14 +1421,6 @@ namespace sunpack::sevenzip
             item.source_crc32 = source_crc32;
 
             item.has_source_crc32 = has_source_crc32;
-
-            if (!is_dir)
-            {
-
-                item.output_crc32 = 0;
-
-                item.has_output_crc32 = true;
-            }
 
             item.operation_result = kOpOk;
 

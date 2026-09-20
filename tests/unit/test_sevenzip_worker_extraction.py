@@ -809,7 +809,8 @@ def test_worker_dry_run_reports_success_diagnostics_without_writing(tmp_path):
     assert not dry_output.exists()
 
 
-def test_worker_dry_run_hashes_output_when_source_crc_is_missing(tmp_path):
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_worker_skips_output_crc_when_source_crc_is_missing(tmp_path, dry_run):
     worker = _require_worker_or_skip()
     payload = b"tar payload without an archive CRC"
     source = tmp_path / "payload.bin"
@@ -817,14 +818,15 @@ def test_worker_dry_run_hashes_output_when_source_crc_is_missing(tmp_path):
     archive = tmp_path / "payload.tar"
     with tarfile.open(archive, "w") as handle:
         handle.add(source, arcname=source.name)
+    output_dir = tmp_path / ("dry-output" if dry_run else "out")
     result = subprocess.run(
         [worker],
         input=json.dumps({
-            "job_id": "dry-run-no-source-crc",
+            "job_id": f"{'dry-run' if dry_run else 'extract'}-no-source-crc",
             "archive_path": str(archive),
-            "output_dir": "",
+            "output_dir": str(output_dir),
             "format_hint": "tar",
-            "dry_run": True,
+            "dry_run": dry_run,
         }),
         capture_output=True,
         text=True,
@@ -838,9 +840,12 @@ def test_worker_dry_run_hashes_output_when_source_crc_is_missing(tmp_path):
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert item["has_source_crc32"] is False
-    assert item["has_output_crc32"] is True
-    assert item["output_crc32"] == (binascii.crc32(payload) & 0xFFFFFFFF)
+    assert item["has_output_crc32"] is False
     assert item["crc_verified"] is True
+    if dry_run:
+        assert not output_dir.exists()
+    else:
+        assert (output_dir / source.name).read_bytes() == payload
 
 
 @pytest.mark.parametrize(
