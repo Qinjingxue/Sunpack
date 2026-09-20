@@ -11,6 +11,7 @@
 
 #include "Common/MyCom.h"
 #include "7zip/Common/StreamUtils.h"
+#include "7zip/Compress/DeflateDecoder.h"
 
 namespace {
 
@@ -297,6 +298,227 @@ Z7_COM7F_IMF(CZlibNgDeflateDecoder::Code(
     }
 }
 
+
+constexpr UInt64 kAdaptiveMinUnpackSize = (UInt64)64 << 10;
+
+bool ShouldUseZlibNgAdaptive(const UInt64 *inSize, const UInt64 *outSize)
+{
+    if (!inSize || !outSize || *outSize < kAdaptiveMinUnpackSize)
+        return false;
+    const UInt64 minSavings = *outSize / 10;
+    return *inSize <= *outSize - minSavings;
+}
+
+class CAdaptiveDeflateDecoder final:
+    public ICompressCoder,
+    public ICompressSetFinishMode,
+    public ICompressGetInStreamProcessedSize,
+    public ICompressReadUnusedFromInBuf,
+    public ICompressSetInStream,
+    public ICompressSetOutStreamSize,
+#ifndef Z7_NO_READ_FROM_CODER
+    public ISequentialInStream,
+#endif
+    public CMyUnknownImp
+{
+    Z7_COM_QI_BEGIN2(ICompressCoder)
+    Z7_COM_QI_ENTRY(ICompressSetFinishMode)
+    Z7_COM_QI_ENTRY(ICompressGetInStreamProcessedSize)
+    Z7_COM_QI_ENTRY(ICompressReadUnusedFromInBuf)
+    Z7_COM_QI_ENTRY(ICompressSetInStream)
+    Z7_COM_QI_ENTRY(ICompressSetOutStreamSize)
+#ifndef Z7_NO_READ_FROM_CODER
+    Z7_COM_QI_ENTRY(ISequentialInStream)
+#endif
+    Z7_COM_QI_END
+    Z7_COM_ADDREF_RELEASE
+
+    Z7_IFACE_COM7_IMP(ICompressCoder)
+    Z7_IFACE_COM7_IMP(ICompressSetFinishMode)
+    Z7_IFACE_COM7_IMP(ICompressGetInStreamProcessedSize)
+    Z7_IFACE_COM7_IMP(ICompressReadUnusedFromInBuf)
+    Z7_IFACE_COM7_IMP(ICompressSetInStream)
+    Z7_IFACE_COM7_IMP(ICompressSetOutStreamSize)
+#ifndef Z7_NO_READ_FROM_CODER
+    Z7_IFACE_COM7_IMP(ISequentialInStream)
+#endif
+
+    CMyComPtr2<ICompressCoder, NCompress::NDeflate::NDecoder::CCOMCoder> _sevenZip;
+    CMyComPtr<ICompressCoder> _zlibNg;
+    ICompressCoder *_activeCoder = nullptr;
+    UInt32 _finishMode = 0;
+
+    HRESULT EnsureSevenZip()
+    {
+        try
+        {
+            _sevenZip.Create_if_Empty();
+        }
+        catch (const std::bad_alloc &)
+        {
+            return E_OUTOFMEMORY;
+        }
+        return S_OK;
+    }
+
+    HRESULT EnsureZlibNg()
+    {
+        if (_zlibNg)
+            return S_OK;
+        ICompressCoder *coder = SunpackCreateZlibNgDeflateDecoder();
+        if (!coder)
+            return E_OUTOFMEMORY;
+        _zlibNg = coder;
+        return S_OK;
+    }
+
+    HRESULT ApplyFinishMode(ICompressCoder *coder)
+    {
+        if (!coder)
+            return E_FAIL;
+        CMyComPtr<ICompressSetFinishMode> finish;
+        coder->QueryInterface(IID_ICompressSetFinishMode, (void **)&finish);
+        return finish ? finish->SetFinishMode(_finishMode) : S_OK;
+    }
+
+    HRESULT ActivateSevenZip()
+    {
+        RINOK(EnsureSevenZip())
+        _activeCoder = _sevenZip.Interface();
+        return ApplyFinishMode(_activeCoder);
+    }
+
+    IUnknown *ActiveUnknown() const
+    {
+        return _activeCoder;
+    }
+
+public:
+    CAdaptiveDeflateDecoder() = default;
+};
+
+Z7_COM7F_IMF(CAdaptiveDeflateDecoder::SetFinishMode(UInt32 finishMode))
+{
+    _finishMode = finishMode;
+
+    if (_sevenZip.IsDefined())
+    {
+        RINOK(_sevenZip->SetFinishMode(finishMode))
+    }
+
+    if (_zlibNg)
+    {
+        CMyComPtr<ICompressSetFinishMode> finish;
+        _zlibNg.QueryInterface(IID_ICompressSetFinishMode, &finish);
+        if (finish)
+            RINOK(finish->SetFinishMode(finishMode))
+    }
+
+    return S_OK;
+}
+
+Z7_COM7F_IMF(CAdaptiveDeflateDecoder::Code(
+    ISequentialInStream *inStream,
+    ISequentialOutStream *outStream,
+    const UInt64 *inSize,
+    const UInt64 *outSize,
+    ICompressProgressInfo *progress))
+{
+    if (ShouldUseZlibNgAdaptive(inSize, outSize))
+    {
+        HRESULT hres = EnsureZlibNg();
+        if (hres == S_OK)
+        {
+            _activeCoder = _zlibNg;
+            RINOK(ApplyFinishMode(_activeCoder))
+            return _activeCoder->Code(inStream, outStream, inSize, outSize, progress);
+        }
+
+        // The routing optimization is optional. If its decoder cannot even be
+        // allocated before consuming input, preserve functionality by using the
+        // upstream decoder instead.
+        if (hres != E_OUTOFMEMORY)
+            return hres;
+    }
+
+    RINOK(ActivateSevenZip())
+    return _activeCoder->Code(inStream, outStream, inSize, outSize, progress);
+}
+
+Z7_COM7F_IMF(CAdaptiveDeflateDecoder::GetInStreamProcessedSize(UInt64 *value))
+{
+    if (!value)
+        return E_INVALIDARG;
+    if (!_activeCoder)
+    {
+        *value = (UInt64)(Int64)-1;
+        return S_OK;
+    }
+
+    CMyComPtr<ICompressGetInStreamProcessedSize> processed;
+    ActiveUnknown()->QueryInterface(
+        IID_ICompressGetInStreamProcessedSize, (void **)&processed);
+    if (!processed)
+    {
+        *value = (UInt64)(Int64)-1;
+        return S_OK;
+    }
+    return processed->GetInStreamProcessedSize(value);
+}
+
+Z7_COM7F_IMF(CAdaptiveDeflateDecoder::ReadUnusedFromInBuf(
+    void *data, UInt32 size, UInt32 *processedSize))
+{
+    if (processedSize)
+        *processedSize = 0;
+    if (!_activeCoder)
+        return S_OK;
+
+    CMyComPtr<ICompressReadUnusedFromInBuf> unused;
+    ActiveUnknown()->QueryInterface(
+        IID_ICompressReadUnusedFromInBuf, (void **)&unused);
+    if (!unused)
+        return S_OK;
+    return unused->ReadUnusedFromInBuf(data, size, processedSize);
+}
+
+Z7_COM7F_IMF(CAdaptiveDeflateDecoder::SetInStream(ISequentialInStream *inStream))
+{
+    RINOK(ActivateSevenZip())
+    CMyComPtr<ICompressSetInStream> setStream;
+    _activeCoder->QueryInterface(IID_ICompressSetInStream, (void **)&setStream);
+    return setStream ? setStream->SetInStream(inStream) : E_NOTIMPL;
+}
+
+Z7_COM7F_IMF(CAdaptiveDeflateDecoder::ReleaseInStream())
+{
+    if (!_sevenZip.IsDefined())
+        return S_OK;
+    _activeCoder = _sevenZip.Interface();
+    CMyComPtr<ICompressSetInStream> setStream;
+    _activeCoder->QueryInterface(IID_ICompressSetInStream, (void **)&setStream);
+    return setStream ? setStream->ReleaseInStream() : E_NOTIMPL;
+}
+
+Z7_COM7F_IMF(CAdaptiveDeflateDecoder::SetOutStreamSize(const UInt64 *outSize))
+{
+    RINOK(ActivateSevenZip())
+    CMyComPtr<ICompressSetOutStreamSize> setSize;
+    _activeCoder->QueryInterface(IID_ICompressSetOutStreamSize, (void **)&setSize);
+    return setSize ? setSize->SetOutStreamSize(outSize) : E_NOTIMPL;
+}
+
+#ifndef Z7_NO_READ_FROM_CODER
+Z7_COM7F_IMF(CAdaptiveDeflateDecoder::Read(
+    void *data, UInt32 size, UInt32 *processedSize))
+{
+    RINOK(ActivateSevenZip())
+    CMyComPtr<ISequentialInStream> stream;
+    _activeCoder->QueryInterface(IID_ISequentialInStream, (void **)&stream);
+    return stream ? stream->Read(data, size, processedSize) : E_NOTIMPL;
+}
+#endif
+
 }  // namespace
 
 ICompressCoder *SunpackCreateZlibNgDeflateDecoder()
@@ -310,3 +532,16 @@ ICompressCoder *SunpackCreateZlibNgDeflateDecoder()
         return nullptr;
     }
 }
+
+ICompressCoder *SunpackCreateAdaptiveDeflateDecoder()
+{
+    try
+    {
+        return new CAdaptiveDeflateDecoder();
+    }
+    catch (const std::bad_alloc &)
+    {
+        return nullptr;
+    }
+}
+
