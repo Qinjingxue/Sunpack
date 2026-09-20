@@ -12,26 +12,6 @@ using UInt32 = std::uint32_t;
 using UInt64 = std::uint64_t;
 using Int32 = std::int32_t;
 
-struct ArchiveOpenProbeResult {
-    PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
-    bool backend_available = false;
-    bool is_archive = false;
-    bool encrypted = false;
-    bool password_required = false;
-    bool damaged = false;
-    bool missing_volume = false;
-    bool missing_volume_suspected = false;
-    bool missing_stub = false;
-    bool volume_open_failed = false;
-    bool wrong_password = false;
-    Int32 operation_result = 0;
-    UInt64 archive_offset = 0;
-    std::wstring archive_type;
-    std::wstring missing_volume_name;
-    std::string missing_volume_evidence;
-    std::string message;
-};
-
 struct ResourceAnalysisResult {
     PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
     bool is_archive = false;
@@ -68,12 +48,6 @@ struct CrcManifestResult {
     std::vector<CrcManifestItem> files;
     std::string message;
 };
-
-ArchiveOpenProbeResult probe_archive_open_with_parts(
-    const std::wstring& archive_path,
-    const std::vector<std::wstring>& part_paths,
-    const std::wstring& password
-);
 
 ResourceAnalysisResult analyze_archive_resources_with_parts(
     const std::wstring& archive_path,
