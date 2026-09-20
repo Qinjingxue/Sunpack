@@ -1,4 +1,6 @@
 // Rar5Handler.h
+// Modified for SunPack on 2026-09-20: forward the existing RAR5 "mt"
+// property to the RAR5/RAR7 decoder's optional parallel decode path.
 
 #ifndef ZIP7_INC_RAR5_HANDLER_H
 #define ZIP7_INC_RAR5_HANDLER_H
@@ -488,6 +490,9 @@ class CHandler Z7_final:
   bool _acl_Used;
   bool _error_in_ACL;
   bool _split_Error;
+#ifndef Z7_ST
+  UInt32 _numThreads;
+#endif
 public:
   CRecordVector<CRefItem> _refs;
   CObjectVector<CItem> _items;
