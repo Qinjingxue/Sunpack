@@ -2655,6 +2655,18 @@ HRESULT CDecoder::DecodeLZParallel()
   UInt64 packedRead = 0;
   bool minorError = false;
 
+  CRar5ParallelTables inheritedTables;
+  bool inheritedTablesValid = _tableWasFilled;
+  CRar5ParallelBlockJob *pendingTableJob = NULL;
+  if (inheritedTablesValid)
+  {
+    inheritedTables.Main = m_MainDecoder;
+    inheritedTables.Dist = m_DistDecoder;
+    inheritedTables.Align = m_AlignDecoder;
+    inheritedTables.Len = m_LenDecoder;
+    inheritedTables.UseAlignBits = _useAlignBits;
+  }
+
   size_t winPos = _winPos;
   size_t limit;
   {
@@ -2785,6 +2797,17 @@ error_dist:
   auto retireOne = [&](CRar5ParallelBlockJob &job) -> HRESULT
   {
     RINOK(job.Wait())
+
+    if (job.TablePresent)
+    {
+      m_MainDecoder = job.Tables.Main;
+      m_DistDecoder = job.Tables.Dist;
+      m_AlignDecoder = job.Tables.Align;
+      m_LenDecoder = job.Tables.Len;
+      _useAlignBits = job.Tables.UseAlignBits;
+      _tableWasFilled = true;
+    }
+    _isLastBlock = job.LastBlock;
 
     for (const CRar5ParallelDecodedItem &item: job.Decoded)
     {
@@ -2925,6 +2948,15 @@ error_dist:
 
     try
     {
+      if (!rawHeader.TablePresent && !inheritedTablesValid)
+      {
+        if (!pendingTableJob)
+          return S_FALSE;
+        RINOK(pendingTableJob->WaitTables(inheritedTables))
+        inheritedTablesValid = true;
+        pendingTableJob = NULL;
+      }
+
       const size_t logicalSize = (size_t)rawHeader.HeaderSize + rawHeader.BlockSize;
       job.Data.resize(logicalSize + kInputBufferPadZone);
       memcpy(job.Data.data(), rawHeader.Bytes, rawHeader.HeaderSize);
@@ -2945,21 +2977,15 @@ error_dist:
       bitStream._wasFinished = true;
       bitStream._hres = S_OK;
 
-      ICompressProgressInfo *savedProgress = _progress;
-      _progress = NULL;
-      const HRESULT tableRes = ReadTables(bitStream);
-      _progress = savedProgress;
-      RINOK(tableRes)
-
       job.BitState = bitStream;
-      job.Tables.Main = m_MainDecoder;
-      job.Tables.Dist = m_DistDecoder;
-      job.Tables.Align = m_AlignDecoder;
-      job.Tables.Len = m_LenDecoder;
-      job.Tables.UseAlignBits = _useAlignBits;
+      job.TablePresent = rawHeader.TablePresent;
+      job.InitialTablesValid = inheritedTablesValid;
+      job.IsV7 = _is_v7;
+      if (inheritedTablesValid)
+        job.Tables = inheritedTables;
       job.PackPos = packedRead;
-      job.LastBlock = _isLastBlock;
-      job.MinorError = bitStream._minorError;
+      job.LastBlock = rawHeader.LastBlock;
+      job.MinorError = false;
     }
     catch (const std::bad_alloc &)
     {
@@ -2969,7 +2995,13 @@ error_dist:
     _mtPool->Submit(&job);
     submitted++;
 
-    if (job.LastBlock)
+    if (rawHeader.TablePresent)
+    {
+      pendingTableJob = &job;
+      inheritedTablesValid = false;
+    }
+
+    if (rawHeader.LastBlock)
       break;
   }
 
