@@ -123,7 +123,6 @@ Z7_CLASS_IMP_COM_0(
 )
 public:
   CMyComPtr<IInStream> Stream;
-  CMyComPtr<IStreamSetReadPlan> SunpackPlan;
   UInt64 Pos;
 
   #ifdef USE_MIXER_MT
@@ -140,24 +139,19 @@ Z7_CLASS_IMP_COM_1(
 )
   CLockedInStream *_glob;
   UInt64 _pos;
-  UInt64 _consumerId;
   CMyComPtr<IUnknown> _globRef;
 public:
-  void Init(CLockedInStream *lockedInStream, UInt64 startPos, UInt64 consumerId)
+  void Init(CLockedInStream *lockedInStream, UInt64 startPos)
   {
     _globRef = lockedInStream;
     _glob = lockedInStream;
     _pos = startPos;
-    _consumerId = consumerId;
   }
 };
 
 Z7_COM7F_IMF(CLockedSequentialInStreamMT::Read(void *data, UInt32 size, UInt32 *processedSize))
 {
   NWindows::NSynchronization::CCriticalSectionLock lock(_glob->CriticalSection);
-
-  if (_glob->SunpackPlan)
-    RINOK(_glob->SunpackPlan->SetReadPlanConsumer(_consumerId))
 
   if (_pos != _glob->Pos)
   {
@@ -185,23 +179,18 @@ Z7_CLASS_IMP_COM_1(
 )
   CLockedInStream *_glob;
   UInt64 _pos;
-  UInt64 _consumerId;
   CMyComPtr<IUnknown> _globRef;
 public:
-  void Init(CLockedInStream *lockedInStream, UInt64 startPos, UInt64 consumerId)
+  void Init(CLockedInStream *lockedInStream, UInt64 startPos)
   {
     _globRef = lockedInStream;
     _glob = lockedInStream;
     _pos = startPos;
-    _consumerId = consumerId;
   }
 };
 
 Z7_COM7F_IMF(CLockedSequentialInStreamST::Read(void *data, UInt32 size, UInt32 *processedSize))
 {
-  if (_glob->SunpackPlan)
-    RINOK(_glob->SunpackPlan->SetReadPlanConsumer(_consumerId))
-
   if (_pos != _glob->Pos)
   {
     RINOK(InStream_SeekSet(_glob->Stream, _pos))
@@ -247,10 +236,6 @@ HRESULT CDecoder::Decode(
 {
   dataAfterEnd_Error = false;
 
-  // Single-stream decoders use the default consumer. Multi-pack-stream wrappers
-  // below replace this with a stable per-folder/per-pack-stream identity before
-  // every underlying Read(), so SunPack can retain independent planned windows.
-  NSunpackReadPlan::SetConsumer(inStream, 0);
 
   const UInt64 *packPositions = &folders.PackPositions[folders.FoStartPackStreamIndex[folderIndex]];
   CFolderEx folderInfo;
@@ -532,7 +517,6 @@ HRESULT CDecoder::Decode(
     // RINOK(InStream_GetPos(inStream, lockedInStream.Pos))
     RINOK(inStream->Seek((Int64)(startPos + packPositions[0]), STREAM_SEEK_SET, &lockedInStream->Pos))
     lockedInStream->Stream = inStream;
-    inStream->QueryInterface(IID_IStreamSetReadPlan, (void **)&lockedInStream->SunpackPlan);
 
     #ifdef USE_MIXER_MT
     #ifdef USE_MIXER_ST
@@ -553,9 +537,6 @@ HRESULT CDecoder::Decode(
   {
     CMyComPtr<ISequentialInStream> packStream;
     const UInt64 packPos = startPos + packPositions[j];
-    const UInt64 sunpackConsumerId =
-        ((static_cast<UInt64>(folderIndex) + 1) << 32) | (static_cast<UInt64>(j) + 1);
-
     if (folderInfo.PackStreams.Size() == 1)
     {
       RINOK(InStream_SeekSet(inStream, packPos))
@@ -570,7 +551,7 @@ HRESULT CDecoder::Decode(
       {
         CLockedSequentialInStreamMT *lockedStreamImpSpec = new CLockedSequentialInStreamMT;
         packStream = lockedStreamImpSpec;
-        lockedStreamImpSpec->Init(lockedInStream.ClsPtr(), packPos, sunpackConsumerId);
+        lockedStreamImpSpec->Init(lockedInStream.ClsPtr(), packPos);
       }
       #ifdef USE_MIXER_ST
       else
@@ -580,7 +561,7 @@ HRESULT CDecoder::Decode(
         #ifdef USE_MIXER_ST
         CLockedSequentialInStreamST *lockedStreamImpSpec = new CLockedSequentialInStreamST;
         packStream = lockedStreamImpSpec;
-        lockedStreamImpSpec->Init(lockedInStream.ClsPtr(), packPos, sunpackConsumerId);
+        lockedStreamImpSpec->Init(lockedInStream.ClsPtr(), packPos);
         #endif
       }
     }
