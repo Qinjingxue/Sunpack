@@ -179,6 +179,6 @@ uv run --locked pytest
 
 SunPack 原创源代码采用 MIT 许可证，详见 [LICENSE](LICENSE)。
 
-仓库同时包含第三方源码，其中包括位于 `native/sevenzip_bridge/7z2603-src/` 的 7-Zip 26.03 源码。第三方源码和二进制继续受各自原始许可证约束，不因进入 SunPack 仓库而改为 MIT。许可证边界和发布合规要求详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/licensing.md)。
+仓库同时包含第三方源码，其中包括位于 `native/sevenzip_bridge/7z2603-src/` 的 7-Zip 26.03 源码，以及位于 `native/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3 源码。第三方源码和二进制继续受各自原始许可证约束，不因进入 SunPack 仓库而改为 MIT。许可证边界和发布合规要求详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/licensing.md)。
 
-7-Zip 源码许可证副本位于 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt)，GNU LGPL 2.1 完整文本位于 [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt)。
+7-Zip 源码许可证副本位于 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt)，GNU LGPL 2.1 完整文本位于 [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt)，zlib-ng 许可证副本位于 [licenses/zlib-ng-license.txt](licenses/zlib-ng-license.txt)。

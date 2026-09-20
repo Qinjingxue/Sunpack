@@ -42,6 +42,20 @@ The unRAR-restricted source code may not be used to recreate the proprietary
 RAR compression algorithm. The exact restriction and redistribution terms are
 reproduced in the 7-Zip source license file referenced above.
 
+## zlib-ng 2.3.3
+
+SunPack vendors the runtime build subset of zlib-ng 2.3.3 at:
+
+`native/sevenzip_bridge/zlib-ng-2.3.3/`
+
+The imported files are pinned to upstream commit
+`12731092979c6d07f42da27da673a9f6c7b13586` and are used for selected ZIP
+Deflate decoding paths. They remain under the upstream zlib license. A copy is
+distributed at [licenses/zlib-ng-license.txt](licenses/zlib-ng-license.txt).
+
+zlib-ng source and releases are available from
+[github.com/zlib-ng/zlib-ng](https://github.com/zlib-ng/zlib-ng/).
+
 ## 7-Zip runtime binaries and development assets
 
 Depending on the build context, SunPack can also stage or redistribute 7-Zip

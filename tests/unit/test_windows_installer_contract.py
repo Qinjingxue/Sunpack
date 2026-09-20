@@ -538,16 +538,19 @@ def test_release_package_includes_complete_license_material():
         ROOT / "native" / "sevenzip_bridge" / "7z2603-src" / "DOC" / "License.txt"
     ).read_text(encoding="utf-8")
     lgpl = (ROOT / "licenses" / "LGPL-2.1.txt").read_text(encoding="utf-8")
+    zlib_ng = (ROOT / "licenses" / "zlib-ng-license.txt").read_text(encoding="utf-8")
 
     assert "$mitLicensePath" in build_script
     assert "$sevenZipLicensePath" in build_script
     assert "$sevenZipSourceLicensePath" in build_script
     assert "$lgplLicensePath" in build_script
+    assert "$zlibNgLicensePath" in build_script
     assert "$thirdPartyNoticesPath" in build_script
     assert 'Join-Path $distLicensesRoot "SunPack-MIT.txt"' in build_script
     assert 'Join-Path $distLicensesRoot "7zip-license.txt"' in build_script
     assert 'Join-Path $distLicensesRoot "7zip-source-license.txt"' in build_script
     assert 'Join-Path $distLicensesRoot "LGPL-2.1.txt"' in build_script
+    assert 'Join-Path $distLicensesRoot "zlib-ng-license.txt"' in build_script
     assert "$distThirdPartyNoticesPath" in build_script
 
     assert "MIT License" in mit
@@ -563,6 +566,9 @@ def test_release_package_includes_complete_license_material():
     assert "https://www.7-zip.org/" in notices
     assert "GNU LESSER GENERAL PUBLIC LICENSE" in lgpl
     assert "Version 2.1, February 1999" in lgpl
+    assert "zlib-ng-2.3.3" in notices
+    assert "12731092979c6d07f42da27da673a9f6c7b13586" in notices
+    assert "Permission is granted to anyone to use this software for any purpose" in zlib_ng
 
 
 def test_acceptance_setup_bootstraps_and_checks_real_archive_generators():

@@ -179,6 +179,6 @@ Acceptance tests:
 
 SunPack-original source code is licensed under the MIT License; see [LICENSE](LICENSE).
 
-The repository also vendors third-party source code, including 7-Zip 26.03 under `native/sevenzip_bridge/7z2603-src/`. Third-party source and binaries remain subject to their original licenses and are not relicensed under MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md) for the exact license scope and release-compliance information.
+The repository also vendors third-party source code, including 7-Zip 26.03 under `native/sevenzip_bridge/7z2603-src/` and zlib-ng 2.3.3 under `native/sevenzip_bridge/zlib-ng-2.3.3/`. Third-party source and binaries remain subject to their original licenses and are not relicensed under MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md) for the exact license scope and release-compliance information.
 
-The 7-Zip source license is copied at [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt), and the full GNU LGPL 2.1 text is available at [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt).
+The 7-Zip source license is copied at [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt), the full GNU LGPL 2.1 text is available at [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt), and the zlib-ng license is copied at [licenses/zlib-ng-license.txt](licenses/zlib-ng-license.txt).

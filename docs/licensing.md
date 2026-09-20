@@ -55,6 +55,22 @@ Prefer keeping SunPack-specific integration code outside the vendored
 `7z2603-src/` tree where practical. This keeps upstream provenance and license
 boundaries easy to audit and reduces merge friction when updating 7-Zip.
 
+## Vendored zlib-ng 2.3.3 source
+
+The native ZIP Deflate fast path vendors the required zlib-ng 2.3.3 build
+sources at:
+
+`native/sevenzip_bridge/zlib-ng-2.3.3/`
+
+Those files are pinned to upstream commit
+`12731092979c6d07f42da27da673a9f6c7b13586` and remain under the upstream
+zlib license. The release copy is stored at:
+
+`licenses/zlib-ng-license.txt`
+
+Keep the upstream copyright and permission notice with redistributed source and
+binary packages.
+
 ## 7-Zip runtime binaries and development assets
 
 Some development or release workflows can also stage or redistribute 7-Zip
@@ -71,6 +87,7 @@ Windows release packages must include the following license material:
 - `licenses/7zip-license.txt`.
 - `licenses/7zip-source-license.txt`.
 - `licenses/LGPL-2.1.txt`.
+- `licenses/zlib-ng-license.txt`.
 
 If a release compiles or links LGPL-covered 7-Zip source into a SunPack binary,
 the release process must also satisfy the applicable LGPL requirements for the
