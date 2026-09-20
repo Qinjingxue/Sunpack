@@ -229,24 +229,6 @@ struct ExtractInputRange {
 
 bool is_backend_available();
 
-PasswordTestResult test_password(
-    const std::wstring& archive_path,
-    const std::wstring& password
-);
-
-PasswordTestResult test_password_with_parts(
-    const std::wstring& archive_path,
-    const std::vector<std::wstring>& part_paths,
-    const std::wstring& password,
-    const std::vector<std::wstring>& canonical_names = {}
-);
-
-PasswordTestResult test_passwords(
-    const std::wstring& archive_path,
-    const wchar_t* const* passwords,
-    int password_count
-);
-
 PasswordTestResult test_passwords_with_parts(
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
@@ -309,54 +291,6 @@ const char* status_name(PasswordTestStatus status);
 #define SUP7Z_API extern "C" __declspec(dllimport)
 #endif
 
-SUP7Z_API int sup7z_try_passwords(
-    const wchar_t* archive_path,
-    const wchar_t* const* passwords,
-    int password_count,
-    int* matched_index,
-    int* attempts,
-    wchar_t* message,
-    int message_chars
-);
-
-SUP7Z_API int sup7z_try_passwords_with_parts(
-    const wchar_t* archive_path,
-    const wchar_t* const* part_paths,
-    int part_count,
-    const wchar_t* const* passwords,
-    int password_count,
-    int* matched_index,
-    int* attempts,
-    wchar_t* message,
-    int message_chars
-);
-
-SUP7Z_API int sup7z_test_archive(
-    const wchar_t* archive_path,
-    const wchar_t* password,
-    int* command_ok,
-    int* encrypted,
-    int* checksum_error,
-    wchar_t* archive_type,
-    int archive_type_chars,
-    wchar_t* message,
-    int message_chars
-);
-
-SUP7Z_API int sup7z_test_archive_with_parts(
-    const wchar_t* archive_path,
-    const wchar_t* const* part_paths,
-    int part_count,
-    const wchar_t* password,
-    int* command_ok,
-    int* encrypted,
-    int* checksum_error,
-    wchar_t* archive_type,
-    int archive_type_chars,
-    wchar_t* message,
-    int message_chars
-);
-
 struct Sup7zArchiveResourceAnalysis {
     int status;
     int is_archive;
@@ -374,62 +308,6 @@ struct Sup7zArchiveResourceAnalysis {
     wchar_t archive_type[32];
     wchar_t dominant_method[128];
 };
-
-enum Sup7zOperationKind {
-    SUP7Z_OPERATION_PROBE = 1,
-    SUP7Z_OPERATION_TEST = 2,
-    SUP7Z_OPERATION_TRY_PASSWORDS = 3,
-};
-
-struct Sup7zInputRange {
-    const wchar_t* path;
-    unsigned long long start;
-    unsigned long long end;
-    int has_end;
-};
-
-struct Sup7zOperationRequest {
-    int operation;
-    const wchar_t* archive_path;
-    const wchar_t* const* part_paths;
-    int part_count;
-    const wchar_t* const* canonical_names;
-    const int* volume_numbers;
-    const Sup7zInputRange* ranges;
-    int range_count;
-    const wchar_t* format_hint;
-    const wchar_t* password;
-    const wchar_t* const* passwords;
-    int password_count;
-};
-
-struct Sup7zOperationResult {
-    int status;
-    int command_ok;
-    int is_archive;
-    int is_encrypted;
-    int is_broken;
-    int checksum_error;
-    int matched_index;
-    int attempts;
-    unsigned long long archive_offset;
-    int item_count;
-    int operation_result;
-    int password_required;
-    int missing_volume;
-    int missing_volume_suspected;
-    int missing_stub;
-    int volume_open_failed;
-    wchar_t archive_type[64];
-    wchar_t missing_volume_name[260];
-    wchar_t missing_volume_evidence[64];
-    wchar_t message[512];
-};
-
-SUP7Z_API int sup7z_run_operation(
-    const Sup7zOperationRequest* request,
-    Sup7zOperationResult* result
-);
 
 SUP7Z_API int sup7z_analyze_archive_resources(
     const wchar_t* archive_path,
