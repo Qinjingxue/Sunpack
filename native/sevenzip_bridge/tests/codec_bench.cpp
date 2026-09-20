@@ -206,6 +206,10 @@ std::vector<std::uint8_t> load_file(const std::string& path) {
 const char* backend_name() {
 #if defined(SUP7Z_CODEC_BENCH_7Z)
     return "7z";
+#elif defined(SUP7Z_CODEC_BENCH_ZLIB_RS)
+    return "zlib-rs";
+#elif defined(SUP7Z_CODEC_BENCH_ZLIB_NG)
+    return "zlib-ng";
 #elif defined(SUP7Z_CODEC_BENCH_ZLIB)
     return "zlib-compatible";
 #elif defined(SUP7Z_CODEC_BENCH_ISAL)
