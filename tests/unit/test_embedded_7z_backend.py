@@ -113,19 +113,15 @@ def test_worker_extracts_zip_without_7z_dll(tmp_path):
         assert extracted.read_bytes() == data
 
 
-def test_dll_serves_probe_and_resources_without_7z_dll(tmp_path):
+def test_dll_serves_resources_without_7z_dll(tmp_path):
     staging = _stage_without_7z_dll(tmp_path, "sunpack_sevenzip.dll")
     archive = tmp_path / "carrier.zip"
     _make_zip(archive)
 
-    from sunpack.support.sevenzip_bridge import NativePasswordTester
+    from sunpack.support.sevenzip_bridge import NativeSevenZipBridge
 
-    tester = NativePasswordTester(wrapper_path=str(staging / "sunpack_sevenzip.dll"))
+    tester = NativeSevenZipBridge(wrapper_path=str(staging / "sunpack_sevenzip.dll"))
     assert tester.available() is True
-
-    probe = tester.probe_archive(str(archive))
-    assert probe.ok is True, probe
-    assert probe.is_archive is True
 
     analysis = tester.analyze_archive_resources(str(archive))
     assert analysis.ok is True, analysis
@@ -137,9 +133,9 @@ def test_dll_loads_with_no_7z_dll_on_disk(tmp_path):
     """_load() must not require 7z.dll to exist anywhere."""
     staging = _stage_without_7z_dll(tmp_path, "sunpack_sevenzip.dll")
 
-    from sunpack.support.sevenzip_bridge import NativePasswordTester
+    from sunpack.support.sevenzip_bridge import NativeSevenZipBridge
 
-    tester = NativePasswordTester(wrapper_path=str(staging / "sunpack_sevenzip.dll"))
+    tester = NativeSevenZipBridge(wrapper_path=str(staging / "sunpack_sevenzip.dll"))
     library = tester._load()
     assert library is not None
     assert (staging / "sunpack_sevenzip.dll").is_file()
