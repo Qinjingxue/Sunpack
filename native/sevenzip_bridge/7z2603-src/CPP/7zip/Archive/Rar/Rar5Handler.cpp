@@ -2275,9 +2275,6 @@ HRESULT CHandler::Open2(IInStream *stream,
   NRar::CVolumeName seqName;
   CTempBuf tempBuf;
   CUnpacker unpacker;
-#ifndef Z7_ST
-  unpacker.NumThreads = _numThreads;
-#endif
   
   if (openCallback)
   {
@@ -3067,9 +3064,6 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
 
   CUnpacker unpacker;
   unpacker.NeedCrc = _needChecksumCheck;
-#ifndef Z7_ST
-  unpacker.NumThreads = _numThreads;
-#endif
 #ifndef Z7_ST
   unpacker.NumThreads = _numThreads;
 #endif
