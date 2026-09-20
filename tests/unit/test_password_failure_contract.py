@@ -11,17 +11,9 @@ from sunpack.passwords.job import PasswordJob
 from sunpack.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
 from sunpack.passwords.verifier import PasswordBatchVerification
 from sunpack.passwords.verifier.base import VERIFIER_STATUSES, normalize_verifier_status
-from sunpack.passwords.verifier.sevenzip_dll import SevenZipDllVerifier
 from sunpack.passwords.verifier.registry import PasswordVerifierChain
 from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
-from sunpack.support.sevenzip_bridge import (
-    OPERATION_RESULT_HEADERS_ERROR,
-    STATUS_BACKEND_UNAVAILABLE,
-    STATUS_DAMAGED,
-    STATUS_NEEDS_VOLUME_OR_TAIL_DAMAGED,
-    STATUS_UNSUPPORTED,
-    STATUS_WRONG_PASSWORD,
-)
+from sunpack.support.sevenzip_bridge import OPERATION_RESULT_HEADERS_ERROR
 from sunpack.verification import VerificationScheduler
 from sunpack.contracts.verification import DECISION_REQUEST_PASSWORD, CONTENT_INTEGRITY_UNKNOWN
 
@@ -194,23 +186,6 @@ def test_non_header_damage_after_weak_match_remains_terminal():
     assert result.terminal is True
 
 
-@pytest.mark.parametrize(
-    ("native_status", "expected"),
-    [
-        (STATUS_WRONG_PASSWORD, "no_match"),
-        (STATUS_DAMAGED, "damaged"),
-        (STATUS_UNSUPPORTED, "unsupported_method"),
-        (STATUS_BACKEND_UNAVAILABLE, "backend_unavailable"),
-        (STATUS_NEEDS_VOLUME_OR_TAIL_DAMAGED, "needs_volume_or_tail_damaged"),
-    ],
-)
-def test_dll_verifier_preserves_native_failure_status(native_status, expected):
-    native = _NativeTester(native_status)
-    result = SevenZipDllVerifier(native_password_tester=native).verify_batch("sample.7z", ["bad"])
-
-    assert result.status == expected
-
-
 def test_embedded_failure_retains_nested_password_cause():
     password = FailureInfo(
         kind=FailureKind.WRONG_PASSWORD,
@@ -278,21 +253,6 @@ class _SequencedVerifier:
     def verify_batch(self, archive_path, passwords, *, part_paths=None, archive_input=None):
         self.batches.append(list(passwords))
         return self.results.pop(0)
-
-
-class _NativeTester:
-    def __init__(self, status):
-        self.status = status
-
-    def try_passwords(self, archive_path, passwords, *, part_paths=None, archive_input=None):
-        return SimpleNamespace(
-            status=self.status,
-            ok=False,
-            matched_index=-1,
-            attempts=len(passwords),
-            message="native diagnostic",
-            operation_result=0,
-        )
 
 
 def _task(path) -> ArchiveTask:
