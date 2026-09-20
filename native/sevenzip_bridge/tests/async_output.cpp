@@ -47,7 +47,7 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
         return false;
     }
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     if (writer.finish_job(job) != S_OK) {
         return false;
     }
@@ -76,7 +76,7 @@ bool write_zero_length_file(const std::filesystem::path& directory) {
     const auto file = writer.make_file(
         job, (directory / L"empty.bin").wstring(), L"empty.bin", 1, 1);
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     if (writer.finish_job(job) != S_OK) {
         return false;
     }
@@ -102,7 +102,7 @@ bool closes_after_delayed_open_failure(const std::filesystem::path& directory) {
         return false;
     }
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     if (writer.finish_job(job) == S_OK) {
         return false;
     }
@@ -188,7 +188,7 @@ bool successful_job_leaves_pending_at_zero(const std::filesystem::path& director
         return false;
     }
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     if (writer.finish_job(job) != S_OK) {
         return false;
     }
@@ -236,7 +236,7 @@ bool meters_separate_volumes_but_share_the_global_sink(const std::filesystem::pa
             return false;
         }
         writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
+        writer.close_file(file, {});
         if (writer.finish_job(job) != S_OK) {
             return false;
         }
@@ -285,7 +285,7 @@ bool quiescence_tracks_jobs_and_files(const std::filesystem::path& directory) {
         return false;
     }
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     if (writer.finish_job(job) != S_OK) {
         return false;
     }
@@ -319,7 +319,7 @@ bool configuration_is_snapshotted_not_reread(const std::filesystem::path& direct
         return false;
     }
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     return writer.finish_job(job) == S_OK && writer.is_quiescent();
 }
 
@@ -393,7 +393,7 @@ bool registry_routes_by_volume_and_releases_leases(const std::filesystem::path& 
             return false;
         }
         lease.writer().record_operation_result(file, 0);
-        lease.writer().close_file(file, 0, false, {});
+        lease.writer().close_file(file, {});
         if (lease.writer().finish_job(job) != S_OK) {
             return false;
         }
