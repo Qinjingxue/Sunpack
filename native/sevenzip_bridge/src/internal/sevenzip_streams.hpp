@@ -151,24 +151,6 @@ namespace sunpack::sevenzip
         return config;
     }
 
-    // Transitional compile-only shape for the legacy user-space planned-cache code
-    // that remains unreachable while this PR switches stream plan methods to
-    // PlannedPageHint. It will be removed once the new path is validated.
-    struct PlannedPrefetchConfig
-    {
-        UInt64 buffer_bytes = 32ULL * 1024 * 1024;
-        UInt32 io_bytes = 16U * 1024 * 1024;
-    };
-
-    inline PlannedPrefetchConfig planned_prefetch_config() noexcept
-    {
-        const PlannedHintConfig hint = planned_hint_config();
-        PlannedPrefetchConfig value;
-        value.buffer_bytes = hint.horizon_bytes;
-        value.io_bytes = static_cast<UInt32>(std::min<UInt64>(
-            hint.refill_bytes, static_cast<UInt64>((std::numeric_limits<UInt32>::max)())));
-        return value;
-    }
 #endif
 
     inline void capture_open_input_trace(ExtractInputTrace &trace) noexcept
@@ -635,11 +617,16 @@ namespace sunpack::sevenzip
     public:
         using Reader = std::function<HRESULT(UInt64, void *, UInt32, UInt32 *)>;
 
-        SequentialPrefetcher(InputPrefetchConfig config, UInt64 virtual_size, Reader reader, bool start_immediately = true, ExtractInputTrace *trace = nullptr)
-            : config_(config), virtual_size_(virtual_size), reader_(std::move(reader)), trace_(trace)
-#ifdef SUP7Z_USE_PLANNED_IO
-              , planned_config_(planned_prefetch_config())
-#endif
+        SequentialPrefetcher(
+            InputPrefetchConfig config,
+            UInt64 virtual_size,
+            Reader reader,
+            bool start_immediately = true,
+            ExtractInputTrace *trace = nullptr)
+            : config_(config),
+              virtual_size_(virtual_size),
+              reader_(std::move(reader)),
+              trace_(trace)
         {
             if (config_.enabled && virtual_size_)
             {
@@ -683,101 +670,6 @@ namespace sunpack::sevenzip
             sync_trace_locked();
         }
 
-        void set_consumer_hint(UInt64 consumer_id) noexcept
-        {
-#ifdef SUP7Z_USE_PLANNED_IO
-            planned_consumer_hint_.store(consumer_id, std::memory_order_release);
-#else
-            (void)consumer_id;
-#endif
-        }
-
-        bool planned_mode()
-        {
-#ifdef SUP7Z_USE_PLANNED_IO
-            std::lock_guard lock(mutex_);
-            return planned_mode_;
-#else
-            return false;
-#endif
-        }
-
-#ifdef SUP7Z_USE_PLANNED_IO
-        void begin_plan()
-        {
-            std::lock_guard lock(mutex_);
-            ++epoch_;
-            recycle_all_planned_buffers_locked();
-            chunks_.clear();
-            plan_.clear();
-            planned_cursors_.clear();
-            next_planned_cursor_id_ = 0;
-            planned_schedule_cursor_ = 0;
-            planned_touch_clock_ = 0;
-            planned_consumer_hint_.store(0, std::memory_order_relaxed);
-            next_offset_ = 0;
-            active_ = false;
-            planned_mode_ = false;
-            building_plan_ = true;
-            ready_.notify_all();
-        }
-
-        void add_plan(UInt64 offset, UInt64 size)
-        {
-            std::lock_guard lock(mutex_);
-            if (!building_plan_ || offset >= virtual_size_ || size == 0)
-            {
-                return;
-            }
-
-            UInt64 end = virtual_size_;
-            if (size != (UInt64)(Int64)-1 && size < virtual_size_ - offset)
-            {
-                end = offset + size;
-            }
-            if (end <= offset)
-            {
-                return;
-            }
-
-            if (!plan_.empty())
-            {
-                PlannedRange &last = plan_.back();
-                const UInt64 last_end = last.offset + last.size;
-                const UInt64 merge_limit = last_end > (UInt64)(Int64)-1 - kPlanMergeGap
-                                               ? (UInt64)(Int64)-1
-                                               : last_end + kPlanMergeGap;
-                // Absorb tiny headers/padding into the same physical extent. Parallel
-                // consumers are tracked independently at runtime, so merging does not
-                // collapse their resident cursors.
-                if (offset >= last.offset && offset <= merge_limit)
-                {
-                    if (end > last_end)
-                    {
-                        last.size = end - last.offset;
-                    }
-                    return;
-                }
-            }
-            plan_.push_back(PlannedRange{offset, end - offset});
-        }
-
-        void end_plan()
-        {
-            std::lock_guard lock(mutex_);
-            building_plan_ = false;
-            planned_mode_ = !plan_.empty();
-            // Keep all plans dormant until a decoder asks for data. Multi-volume
-            // archives therefore do not start one worker/pump per volume at plan seal.
-            active_ = false;
-            planned_cursors_.clear();
-            next_planned_cursor_id_ = 0;
-            planned_schedule_cursor_ = 0;
-            planned_consumer_hint_.store(0, std::memory_order_relaxed);
-            ready_.notify_all();
-        }
-#endif
-
         bool consume(UInt64 offset, void *data, UInt32 size, ExtractInputTrace *trace)
         {
             if (!config_.enabled || size == 0)
@@ -785,23 +677,13 @@ namespace sunpack::sevenzip
                 return false;
             }
 
-            // 7-Zip's multi-pack-stream path already serializes Seek+Read on its shared
-            // IInStream. Keep the same contract here as a defensive boundary so the
-            // planned cache can support interleaved consumers without two callers
-            // mutating one logical stream position concurrently.
             std::lock_guard consume_guard(consume_mutex_);
 
             const bool profiling = trace && read_file_timing_enabled();
-            const auto wait_started = profiling ? std::chrono::steady_clock::now()
-                                                : std::chrono::steady_clock::time_point{};
+            const auto wait_started =
+                profiling ? std::chrono::steady_clock::now()
+                          : std::chrono::steady_clock::time_point{};
             std::unique_lock lock(mutex_);
-
-#ifdef SUP7Z_USE_PLANNED_IO
-            if (planned_mode_)
-            {
-                return consume_planned_locked(offset, data, size, trace, profiling, lock);
-            }
-#endif
 
             auto chunk = find_chunk_locked(offset, size);
             if (chunk == chunks_.end())
@@ -812,8 +694,11 @@ namespace sunpack::sevenzip
                 }
                 return false;
             }
+
             const UInt64 epoch = chunk->epoch;
-            while ((chunk->state == ChunkState::Queued || chunk->state == ChunkState::Reading) && !stopping_ && epoch == epoch_)
+            while ((chunk->state == ChunkState::Queued ||
+                    chunk->state == ChunkState::Reading) &&
+                   !stopping_ && epoch == epoch_)
             {
                 ready_.wait(lock);
                 chunk = find_chunk_locked(offset, size);
@@ -827,6 +712,7 @@ namespace sunpack::sevenzip
                     return false;
                 }
             }
+
             if (chunk->state != ChunkState::Ready || epoch != epoch_)
             {
                 if (profiling)
@@ -836,7 +722,12 @@ namespace sunpack::sevenzip
                 }
                 return false;
             }
-            std::memcpy(data, chunk->bytes.data() + static_cast<std::size_t>(offset - chunk->offset), size);
+
+            std::memcpy(
+                data,
+                chunk->bytes.data() +
+                    static_cast<std::size_t>(offset - chunk->offset),
+                size);
             if (profiling)
             {
                 ++trace->prefetch_hit_count;
@@ -851,46 +742,15 @@ namespace sunpack::sevenzip
             {
                 return;
             }
-#ifdef SUP7Z_USE_PLANNED_IO
-            {
-                std::lock_guard lock(mutex_);
-                if (planned_mode_)
-                {
-                    const UInt64 consumer_id = planned_consumer_hint_.load(std::memory_order_acquire);
-                    PlannedCursor *cursor = nullptr;
-                    for (PlannedCursor &candidate : planned_cursors_)
-                    {
-                        if (candidate.consumer_id == consumer_id)
-                        {
-                            cursor = &candidate;
-                            break;
-                        }
-                    }
-                    if (cursor)
-                    {
-                        cursor->next_offset = std::max(cursor->next_offset, end);
-                        cursor->last_touch = ++planned_touch_clock_;
 
-                        // The decoder already obtained these bytes directly. Drop only
-                        // fully covered slabs owned by this consumer; an in-flight slab
-                        // extending past end remains useful as future speculative data.
-                        erase_planned_chunks_if_locked(
-                            [cursor_id = cursor->id, end](const Chunk &chunk)
-                            {
-                                return chunk.owner_cursor == cursor_id &&
-                                       chunk.offset + chunk.size <= end;
-                            });
-                    }
-                    schedule_plan_locked();
-                    ready_.notify_all();
-                    return;
-                }
-            }
-#endif
             std::lock_guard lock(mutex_);
-            chunks_.erase(std::remove_if(chunks_.begin(), chunks_.end(), [end](const Chunk &chunk)
-                                         { return chunk.offset + chunk.size <= end; }),
-                          chunks_.end());
+            chunks_.erase(
+                std::remove_if(
+                    chunks_.begin(),
+                    chunks_.end(),
+                    [end](const Chunk &chunk)
+                    { return chunk.offset + chunk.size <= end; }),
+                chunks_.end());
             if (chunks_.empty())
             {
                 next_offset_ = end;
@@ -907,22 +767,15 @@ namespace sunpack::sevenzip
             {
                 return;
             }
+
             std::lock_guard lock(mutex_);
-#ifdef SUP7Z_USE_PLANNED_IO
-            if (planned_mode_)
-            {
-                // Planned consumption retires only chunks that belong to the cursor
-                // that just consumed them. Never apply the old global "everything
-                // before end" rule: another parallel pack stream may still need a
-                // lower offset.
-                schedule_plan_locked();
-                ready_.notify_all();
-                return;
-            }
-#endif
-            chunks_.erase(std::remove_if(chunks_.begin(), chunks_.end(), [end](const Chunk &chunk)
-                                         { return chunk.offset + chunk.size <= end; }),
-                          chunks_.end());
+            chunks_.erase(
+                std::remove_if(
+                    chunks_.begin(),
+                    chunks_.end(),
+                    [end](const Chunk &chunk)
+                    { return chunk.offset + chunk.size <= end; }),
+                chunks_.end());
             schedule_locked();
             ready_.notify_all();
         }
@@ -933,14 +786,7 @@ namespace sunpack::sevenzip
             {
                 return;
             }
-#ifdef SUP7Z_USE_PLANNED_IO
-            if (planned_mode())
-            {
-                // A decoder seek can simply select another resident/planned demand.
-                // Do not invalidate unrelated pack-stream buffers.
-                return;
-            }
-#endif
+
             std::lock_guard lock(mutex_);
             if (!chunks_.empty() && trace && read_file_timing_enabled())
             {
@@ -962,14 +808,6 @@ namespace sunpack::sevenzip
             Failed
         };
 
-#ifdef SUP7Z_USE_PLANNED_IO
-        struct PlannedBuffer
-        {
-            std::shared_ptr<unsigned char[]> data;
-            UInt32 capacity = 0;
-        };
-#endif
-
         struct Chunk
         {
             UInt64 epoch = 0;
@@ -977,17 +815,18 @@ namespace sunpack::sevenzip
             UInt32 size = 0;
             ChunkState state = ChunkState::Queued;
             std::vector<unsigned char> bytes;
-#ifdef SUP7Z_USE_PLANNED_IO
-            PlannedBuffer planned_buffer;
-            UInt64 owner_cursor = 0;
-            UInt64 last_use = 0;
-#endif
         };
 
-        static unsigned long long elapsed_ns(std::chrono::steady_clock::time_point started) noexcept
+        static unsigned long long elapsed_ns(
+            std::chrono::steady_clock::time_point started) noexcept
         {
-            const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count();
-            return elapsed > 0 ? static_cast<unsigned long long>(elapsed) : 0ULL;
+            const auto elapsed =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - started)
+                    .count();
+            return elapsed > 0
+                       ? static_cast<unsigned long long>(elapsed)
+                       : 0ULL;
         }
 
         void ensure_worker_locked()
@@ -1004,542 +843,21 @@ namespace sunpack::sevenzip
             {
                 trace_->prefetch_issued_count = prefetch_issued_count_;
                 trace_->prefetch_issued_bytes = prefetch_issued_bytes_;
-#ifdef SUP7Z_USE_PLANNED_IO
-                trace_->planned_cursor_peak = planned_cursor_peak_;
-                trace_->planned_cache_eviction_count = planned_cache_eviction_count_;
-                trace_->planned_demand_issued_count = 0;
-#endif
             }
         }
 
-        std::vector<Chunk>::iterator find_chunk_locked(UInt64 offset, UInt32 size)
+        std::vector<Chunk>::iterator find_chunk_locked(
+            UInt64 offset, UInt32 size)
         {
-            return std::find_if(chunks_.begin(), chunks_.end(), [offset, size](const Chunk &chunk)
-                                { return chunk.offset <= offset && offset + size <= chunk.offset + chunk.size; });
-        }
-
-#ifdef SUP7Z_USE_PLANNED_IO
-        struct PlannedRange
-        {
-            UInt64 offset = 0;
-            UInt64 size = 0;
-        };
-
-        struct PlannedCursor
-        {
-            UInt64 id = 0;
-            UInt64 consumer_id = 0;
-            std::size_t plan_index = 0;
-            UInt64 next_offset = 0;
-            UInt64 last_touch = 0;
-            bool active = true;
-        };
-
-        enum class PlannedRequestState
-        {
-            Missing,
-            Pending,
-            Ready,
-            Failed
-        };
-
-        static constexpr UInt64 kPlanMergeGap = 64 * 1024;
-
-        UInt64 planned_reserved_bytes_locked() const
-        {
-            UInt64 total = 0;
-            for (const Chunk &chunk : chunks_)
-            {
-                total += chunk.size;
-            }
-            return total;
-        }
-
-        PlannedBuffer acquire_planned_buffer_locked(UInt32 size)
-        {
-            const auto found = std::find_if(
-                planned_free_buffers_.begin(), planned_free_buffers_.end(),
-                [size](const PlannedBuffer &buffer)
-                { return buffer.data && buffer.capacity >= size; });
-            if (found != planned_free_buffers_.end())
-            {
-                PlannedBuffer buffer = std::move(*found);
-                planned_free_buffers_.erase(found);
-                return buffer;
-            }
-
-            PlannedBuffer buffer;
-            buffer.capacity = std::max<UInt32>(size, planned_config_.io_bytes);
-            return buffer;
-        }
-
-        void recycle_planned_buffer_locked(PlannedBuffer &&buffer)
-        {
-            if (buffer.data)
-            {
-                planned_free_buffers_.push_back(std::move(buffer));
-            }
-        }
-
-        void recycle_chunk_planned_buffer_locked(Chunk &chunk)
-        {
-            recycle_planned_buffer_locked(std::move(chunk.planned_buffer));
-        }
-
-        void recycle_all_planned_buffers_locked()
-        {
-            for (Chunk &chunk : chunks_)
-            {
-                recycle_chunk_planned_buffer_locked(chunk);
-            }
-        }
-
-        template <typename Predicate>
-        void erase_planned_chunks_if_locked(Predicate predicate)
-        {
-            auto it = chunks_.begin();
-            while (it != chunks_.end())
-            {
-                if (predicate(*it))
+            return std::find_if(
+                chunks_.begin(),
+                chunks_.end(),
+                [offset, size](const Chunk &chunk)
                 {
-                    recycle_chunk_planned_buffer_locked(*it);
-                    it = chunks_.erase(it);
-                }
-                else
-                {
-                    ++it;
-                }
-            }
-        }
-
-        static bool ranges_overlap(UInt64 a_offset, UInt64 a_size, UInt64 b_offset, UInt64 b_end) noexcept
-        {
-            const UInt64 a_end = a_offset + a_size;
-            return a_offset < b_end && b_offset < a_end;
-        }
-
-        std::vector<Chunk>::iterator find_chunk_containing_locked(UInt64 offset)
-        {
-            return std::find_if(chunks_.begin(), chunks_.end(), [offset](const Chunk &chunk)
-                                { return chunk.offset <= offset && offset < chunk.offset + chunk.size; });
-        }
-
-        std::vector<Chunk>::const_iterator find_chunk_containing_locked(UInt64 offset) const
-        {
-            return std::find_if(chunks_.cbegin(), chunks_.cend(), [offset](const Chunk &chunk)
-                                { return chunk.offset <= offset && offset < chunk.offset + chunk.size; });
-        }
-
-        UInt64 next_chunk_offset_locked(UInt64 offset, UInt64 limit) const
-        {
-            UInt64 next = limit;
-            for (const Chunk &chunk : chunks_)
-            {
-                if (chunk.offset > offset && chunk.offset < next)
-                {
-                    next = chunk.offset;
-                }
-            }
-            return next;
-        }
-
-        bool find_plan_range_locked(UInt64 offset, UInt32 size, std::size_t &index) const
-        {
-            if (offset > virtual_size_ || size > virtual_size_ - offset)
-            {
-                return false;
-            }
-            const UInt64 end = offset + size;
-            for (std::size_t i = 0; i < plan_.size(); ++i)
-            {
-                const PlannedRange &range = plan_[i];
-                if (range.offset <= offset && end <= range.offset + range.size)
-                {
-                    index = i;
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        PlannedCursor *find_planned_cursor_locked(UInt64 id)
-        {
-            const auto cursor = std::find_if(planned_cursors_.begin(), planned_cursors_.end(),
-                                             [id](const PlannedCursor &candidate)
-                                             { return candidate.id == id; });
-            return cursor == planned_cursors_.end() ? nullptr : &*cursor;
-        }
-
-        bool planned_cursor_active_locked(UInt64 id) const
-        {
-            const auto cursor = std::find_if(
-                planned_cursors_.cbegin(), planned_cursors_.cend(),
-                [id](const PlannedCursor &candidate)
-                { return candidate.id == id; });
-            return cursor != planned_cursors_.cend() && cursor->active;
-        }
-
-        void reclaim_inactive_planned_chunks_locked()
-        {
-            const std::size_t before = chunks_.size();
-            erase_planned_chunks_if_locked(
-                [this](const Chunk &chunk)
-                {
-                    return chunk.owner_cursor != 0 &&
-                           chunk.state != ChunkState::Reading &&
-                           !planned_cursor_active_locked(chunk.owner_cursor);
-                });
-            planned_cache_eviction_count_ +=
-                static_cast<unsigned long long>(before - chunks_.size());
-        }
-
-        UInt64 touch_planned_cursor_locked(std::size_t plan_index, UInt64 end)
-        {
-            const UInt64 consumer_id = planned_consumer_hint_.load(std::memory_order_acquire);
-            PlannedCursor *cursor = nullptr;
-
-            if (consumer_id != 0)
-            {
-                const auto found = std::find_if(
-                    planned_cursors_.begin(), planned_cursors_.end(),
-                    [consumer_id](const PlannedCursor &candidate)
-                    { return candidate.consumer_id == consumer_id; });
-                if (found != planned_cursors_.end())
-                {
-                    cursor = &*found;
-                }
-            }
-            else
-            {
-                // Formats with a single sequential input keep one default cursor even
-                // across ordinary Seek calls (ZIP item transitions, headers, etc.).
-                const auto found = std::find_if(
-                    planned_cursors_.begin(), planned_cursors_.end(),
-                    [](const PlannedCursor &candidate)
-                    { return candidate.consumer_id == 0; });
-                if (found != planned_cursors_.end())
-                {
-                    cursor = &*found;
-                }
-            }
-
-            if (!cursor)
-            {
-                PlannedCursor created;
-                created.id = ++next_planned_cursor_id_;
-                created.consumer_id = consumer_id;
-                created.plan_index = plan_index;
-                created.next_offset = end;
-                created.last_touch = ++planned_touch_clock_;
-                created.active = true;
-                planned_cursors_.push_back(created);
-                cursor = &planned_cursors_.back();
-                planned_cursor_peak_ = std::max<unsigned long long>(
-                    planned_cursor_peak_, static_cast<unsigned long long>(planned_cursors_.size()));
-            }
-            else
-            {
-                cursor->plan_index = plan_index;
-                if (end > cursor->next_offset || consumer_id == 0)
-                {
-                    // The default serial cursor is allowed to jump on Seek. Explicit
-                    // parallel consumers preserve their ahead position unless the
-                    // demand advances beyond it.
-                    cursor->next_offset = consumer_id == 0 ? end : std::max(cursor->next_offset, end);
-                }
-                cursor->last_touch = ++planned_touch_clock_;
-                cursor->active = true;
-            }
-
-            // We only keep as many speculative consumers active as can receive at
-            // least one normal slab from the resident budget. Dormant cursors retain
-            // already-resident data and are instantly reactivated by their next read.
-            const std::size_t max_active = std::max<std::size_t>(
-                1,
-                static_cast<std::size_t>(planned_config_.buffer_bytes /
-                                         std::max<UInt32>(1, planned_config_.io_bytes)));
-            while (std::count_if(planned_cursors_.begin(), planned_cursors_.end(),
-                                 [](const PlannedCursor &candidate) { return candidate.active; }) > max_active)
-            {
-                auto victim = planned_cursors_.end();
-                for (auto it = planned_cursors_.begin(); it != planned_cursors_.end(); ++it)
-                {
-                    if (!it->active || it->id == cursor->id)
-                    {
-                        continue;
-                    }
-                    if (victim == planned_cursors_.end() || it->last_touch < victim->last_touch)
-                    {
-                        victim = it;
-                    }
-                }
-                if (victim == planned_cursors_.end())
-                {
-                    break;
-                }
-                victim->active = false;
-            }
-
-            reclaim_inactive_planned_chunks_locked();
-            active_ = true;
-            return cursor->id;
-        }
-
-        PlannedRequestState planned_request_state_locked(UInt64 offset, UInt32 size)
-        {
-            UInt64 cursor = offset;
-            const UInt64 end = offset + size;
-            bool pending = false;
-            while (cursor < end)
-            {
-                const auto chunk = find_chunk_containing_locked(cursor);
-                if (chunk == chunks_.end())
-                {
-                    return PlannedRequestState::Missing;
-                }
-                if (chunk->state == ChunkState::Failed)
-                {
-                    return PlannedRequestState::Failed;
-                }
-                if (chunk->state != ChunkState::Ready)
-                {
-                    pending = true;
-                }
-                cursor = std::min<UInt64>(end, chunk->offset + chunk->size);
-            }
-            return pending ? PlannedRequestState::Pending : PlannedRequestState::Ready;
-        }
-
-        void copy_planned_outside_lock(
-            UInt64 offset,
-            void *data,
-            UInt32 size,
-            std::unique_lock<std::mutex> &lock)
-        {
-            UInt64 cursor = offset;
-            const UInt64 end = offset + size;
-            auto *out = static_cast<unsigned char *>(data);
-
-            // consume_mutex_ serializes decoder consumers for this stream. The worker
-            // can publish other chunks while this copy runs, but it never erases ready
-            // chunks. That lets the potentially large memcpy run without holding the
-            // scheduler mutex.
-            while (cursor < end)
-            {
-                auto chunk = find_chunk_containing_locked(cursor);
-                const UInt64 chunk_end = chunk->offset + chunk->size;
-                const UInt64 take = std::min<UInt64>(end, chunk_end) - cursor;
-                const std::shared_ptr<unsigned char[]> source_buffer = chunk->planned_buffer.data;
-                const unsigned char *source =
-                    source_buffer.get() + static_cast<std::size_t>(cursor - chunk->offset);
-                const std::size_t output_offset = static_cast<std::size_t>(cursor - offset);
-                chunk->last_use = ++planned_touch_clock_;
-
-                lock.unlock();
-                std::memcpy(out + output_offset, source, static_cast<std::size_t>(take));
-                lock.lock();
-
-                cursor += take;
-            }
-        }
-
-        void retire_consumed_chunks_locked(UInt64 cursor_id, UInt64 end)
-        {
-            erase_planned_chunks_if_locked(
-                [cursor_id, end](const Chunk &chunk)
-                {
-                    return chunk.owner_cursor == cursor_id &&
-                           chunk.state == ChunkState::Ready &&
-                           chunk.offset + chunk.size <= end;
+                    return chunk.offset <= offset &&
+                           offset + size <= chunk.offset + chunk.size;
                 });
         }
-
-        void advance_planned_cursor_locked(PlannedCursor &cursor)
-        {
-            const PlannedRange &range = plan_[cursor.plan_index];
-            if (cursor.next_offset < range.offset)
-            {
-                cursor.next_offset = range.offset;
-            }
-            while (cursor.next_offset < range.offset + range.size)
-            {
-                const auto resident = find_chunk_containing_locked(cursor.next_offset);
-                if (resident == chunks_.end())
-                {
-                    break;
-                }
-                cursor.next_offset = resident->offset + resident->size;
-            }
-        }
-
-        bool queue_planned_ahead_for_cursor_locked(PlannedCursor &cursor, UInt64 &reserved)
-        {
-            advance_planned_cursor_locked(cursor);
-            const PlannedRange &range = plan_[cursor.plan_index];
-            const UInt64 range_end = range.offset + range.size;
-            if (cursor.next_offset >= range_end || reserved >= planned_config_.buffer_bytes)
-            {
-                return false;
-            }
-
-            const UInt64 next_existing = next_chunk_offset_locked(cursor.next_offset, range_end);
-            const UInt64 free_bytes = planned_config_.buffer_bytes - reserved;
-            UInt64 read_end = std::min<UInt64>(
-                range_end,
-                cursor.next_offset + std::min<UInt64>(planned_config_.io_bytes, free_bytes));
-            if (next_existing < read_end)
-            {
-                read_end = next_existing;
-            }
-            if (read_end <= cursor.next_offset)
-            {
-                return false;
-            }
-
-            Chunk chunk;
-            chunk.epoch = epoch_;
-            chunk.offset = cursor.next_offset;
-            chunk.size = static_cast<UInt32>(read_end - cursor.next_offset);
-            chunk.owner_cursor = cursor.id;
-            chunks_.push_back(std::move(chunk));
-
-            reserved += static_cast<UInt32>(read_end - cursor.next_offset);
-            cursor.next_offset = read_end;
-            return true;
-        }
-
-        bool consume_planned_locked(
-            UInt64 offset,
-            void *data,
-            UInt32 size,
-            ExtractInputTrace *trace,
-            bool profiling,
-            std::unique_lock<std::mutex> &lock)
-        {
-            std::size_t plan_index = 0;
-            if (!find_plan_range_locked(offset, size, plan_index))
-            {
-                if (profiling)
-                {
-                    ++trace->prefetch_miss_count;
-                }
-                return false;
-            }
-
-            ensure_worker_locked();
-            const UInt64 request_end = offset + size;
-            const UInt64 cursor_id = touch_planned_cursor_locked(plan_index, request_end);
-            const PlannedRequestState state = planned_request_state_locked(offset, size);
-
-            if (state == PlannedRequestState::Ready)
-            {
-                copy_planned_outside_lock(offset, data, size, lock);
-                retire_consumed_chunks_locked(cursor_id, request_end);
-                if (PlannedCursor *cursor = find_planned_cursor_locked(cursor_id))
-                {
-                    cursor->last_touch = ++planned_touch_clock_;
-                }
-                schedule_plan_locked();
-                ready_.notify_all();
-                if (profiling)
-                {
-                    ++trace->prefetch_hit_count;
-                }
-                return true;
-            }
-
-            // Planned I/O is speculative only. If the requested bytes are missing,
-            // queued, currently reading, or failed, never make the decoder wait for
-            // the producer. The caller immediately falls back to direct ReadFile().
-            //
-            // touch_planned_cursor_locked() already advanced this consumer to
-            // request_end, so speculative scheduling starts *after* the direct read
-            // instead of redundantly queueing the same bytes.
-            if (state == PlannedRequestState::Missing ||
-                state == PlannedRequestState::Failed)
-            {
-                if (PlannedCursor *cursor = find_planned_cursor_locked(cursor_id))
-                {
-                    cursor->next_offset = request_end;
-                }
-            }
-
-            if (state == PlannedRequestState::Failed)
-            {
-                erase_planned_chunks_if_locked(
-                    [offset, request_end](const Chunk &chunk)
-                    {
-                        return chunk.state == ChunkState::Failed &&
-                               ranges_overlap(chunk.offset, chunk.size, offset, request_end);
-                    });
-            }
-
-            schedule_plan_locked();
-            ready_.notify_all();
-            if (profiling)
-            {
-                ++trace->prefetch_miss_count;
-            }
-            return false;
-        }
-
-        void schedule_plan_locked()
-        {
-            if (planned_cursors_.empty())
-            {
-                active_ = false;
-                return;
-            }
-
-            UInt64 reserved = planned_reserved_bytes_locked();
-            if (reserved >= planned_config_.buffer_bytes)
-            {
-                active_ = true;
-                return;
-            }
-
-            bool any_progress = true;
-            while (reserved < planned_config_.buffer_bytes && any_progress)
-            {
-                any_progress = false;
-                const std::size_t count = planned_cursors_.size();
-                for (std::size_t n = 0; n < count && reserved < planned_config_.buffer_bytes; ++n)
-                {
-                    const std::size_t index = planned_schedule_cursor_++ % count;
-                    if (!planned_cursors_[index].active)
-                    {
-                        continue;
-                    }
-                    if (queue_planned_ahead_for_cursor_locked(planned_cursors_[index], reserved))
-                    {
-                        any_progress = true;
-                    }
-                }
-            }
-
-            active_ = false;
-            for (PlannedCursor &cursor : planned_cursors_)
-            {
-                if (!cursor.active)
-                {
-                    continue;
-                }
-                advance_planned_cursor_locked(cursor);
-                const PlannedRange &range = plan_[cursor.plan_index];
-                if (cursor.next_offset < range.offset + range.size)
-                {
-                    active_ = true;
-                    break;
-                }
-            }
-            if (!active_)
-            {
-                // Do not retain a 32+ MiB high-water pool after this stream's plan
-                // is exhausted (important for multi-volume archives).
-                planned_free_buffers_.clear();
-            }
-        }
-#endif
 
         void schedule_locked()
         {
@@ -1547,17 +865,13 @@ namespace sunpack::sevenzip
             {
                 return;
             }
-#ifdef SUP7Z_USE_PLANNED_IO
-            if (planned_mode_)
-            {
-                schedule_plan_locked();
-                return;
-            }
-#endif
-            while (chunks_.size() < config_.depth && next_offset_ < virtual_size_)
+
+            while (chunks_.size() < config_.depth &&
+                   next_offset_ < virtual_size_)
             {
                 const UInt64 remaining = virtual_size_ - next_offset_;
-                const UInt32 size = static_cast<UInt32>(std::min<UInt64>(remaining, config_.window_bytes));
+                const UInt32 size = static_cast<UInt32>(
+                    std::min<UInt64>(remaining, config_.window_bytes));
                 chunks_.push_back(Chunk{epoch_, next_offset_, size});
                 next_offset_ += size;
             }
@@ -1570,115 +884,70 @@ namespace sunpack::sevenzip
                 UInt64 epoch = 0;
                 UInt64 offset = 0;
                 UInt32 size = 0;
-#ifdef SUP7Z_USE_PLANNED_IO
-                PlannedBuffer planned_buffer;
-                bool planned_read = false;
-#endif
-
                 {
                     std::unique_lock lock(mutex_);
-                    ready_.wait(lock, [this]
-                                { return stopping_ || std::any_of(chunks_.begin(), chunks_.end(), [](const Chunk &chunk)
-                                                                  { return chunk.state == ChunkState::Queued; }); });
+                    ready_.wait(
+                        lock,
+                        [this]
+                        {
+                            return stopping_ ||
+                                   std::any_of(
+                                       chunks_.begin(),
+                                       chunks_.end(),
+                                       [](const Chunk &chunk)
+                                       {
+                                           return chunk.state ==
+                                                  ChunkState::Queued;
+                                       });
+                        });
                     if (stopping_)
                     {
                         return;
                     }
 
                     const auto chunk = std::find_if(
-                        chunks_.begin(), chunks_.end(),
+                        chunks_.begin(),
+                        chunks_.end(),
                         [](const Chunk &candidate)
-                        { return candidate.state == ChunkState::Queued; });
+                        {
+                            return candidate.state == ChunkState::Queued;
+                        });
 
                     epoch = chunk->epoch;
                     offset = chunk->offset;
                     size = chunk->size;
-#ifdef SUP7Z_USE_PLANNED_IO
-                    planned_read = planned_mode_;
-                    if (planned_read)
-                    {
-                        planned_buffer = acquire_planned_buffer_locked(size);
-                    }
-#endif
                     chunk->state = ChunkState::Reading;
                     ++prefetch_issued_count_;
                     prefetch_issued_bytes_ += size;
                 }
 
-                std::vector<unsigned char> bytes;
-                void *read_buffer = nullptr;
-#ifdef SUP7Z_USE_PLANNED_IO
-                if (planned_read)
-                {
-                    if (!planned_buffer.data)
-                    {
-                        // Fundamental array default-initialization performs no
-                        // user-space zero fill. ReadFile overwrites the slab directly.
-                        planned_buffer.data = std::shared_ptr<unsigned char[]>(
-                            new unsigned char[planned_buffer.capacity],
-                            std::default_delete<unsigned char[]>());
-                    }
-                    read_buffer = planned_buffer.data.get();
-                }
-                else
-#endif
-                {
-                    bytes.resize(size);
-                    read_buffer = bytes.data();
-                }
-
+                std::vector<unsigned char> bytes(size);
                 UInt32 read = 0;
-                const HRESULT result = reader_(offset, read_buffer, size, &read);
+                const HRESULT result =
+                    reader_(offset, bytes.data(), size, &read);
 
                 {
                     std::lock_guard lock(mutex_);
                     const auto chunk = std::find_if(
-                        chunks_.begin(), chunks_.end(),
+                        chunks_.begin(),
+                        chunks_.end(),
                         [epoch, offset](const Chunk &candidate)
-                        { return candidate.epoch == epoch && candidate.offset == offset; });
-
+                        {
+                            return candidate.epoch == epoch &&
+                                   candidate.offset == offset;
+                        });
                     if (chunk != chunks_.end() && epoch == epoch_)
                     {
                         if (result == S_OK && read == size)
                         {
-#ifdef SUP7Z_USE_PLANNED_IO
-                            if (planned_read)
-                            {
-                                chunk->planned_buffer = std::move(planned_buffer);
-                            }
-                            else
-#endif
-                            {
-                                chunk->bytes = std::move(bytes);
-                            }
+                            chunk->bytes = std::move(bytes);
                             chunk->state = ChunkState::Ready;
                         }
                         else
                         {
-#ifdef SUP7Z_USE_PLANNED_IO
-                            if (planned_read)
-                            {
-                                recycle_planned_buffer_locked(std::move(planned_buffer));
-                            }
-#endif
                             chunk->state = ChunkState::Failed;
                         }
                     }
-#ifdef SUP7Z_USE_PLANNED_IO
-                    else if (planned_read)
-                    {
-                        recycle_planned_buffer_locked(std::move(planned_buffer));
-                    }
-
-                    if (planned_mode_)
-                    {
-                        // A cursor can become dormant while its single outstanding
-                        // read is in flight. Reclaim the completed slab immediately so
-                        // a newly active consumer is not blocked by stale residency.
-                        reclaim_inactive_planned_chunks_locked();
-                        schedule_plan_locked();
-                    }
-#endif
                 }
                 ready_.notify_all();
             }
@@ -1697,20 +966,6 @@ namespace sunpack::sevenzip
         std::vector<Chunk> chunks_;
         UInt64 epoch_ = 0;
         UInt64 next_offset_ = 0;
-#ifdef SUP7Z_USE_PLANNED_IO
-        PlannedPrefetchConfig planned_config_;
-        std::vector<PlannedBuffer> planned_free_buffers_;
-        std::vector<PlannedRange> plan_;
-        std::vector<PlannedCursor> planned_cursors_;
-        UInt64 next_planned_cursor_id_ = 0;
-        std::size_t planned_schedule_cursor_ = 0;
-        UInt64 planned_touch_clock_ = 0;
-        std::atomic<UInt64> planned_consumer_hint_{0};
-        unsigned long long planned_cursor_peak_ = 0;
-        unsigned long long planned_cache_eviction_count_ = 0;
-        bool planned_mode_ = false;
-        bool building_plan_ = false;
-#endif
         bool active_ = false;
         bool stopping_ = false;
     };
