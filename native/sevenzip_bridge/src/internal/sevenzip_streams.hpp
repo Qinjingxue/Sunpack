@@ -506,11 +506,15 @@ namespace sunpack::sevenzip
             active_ = !ranges_.empty() && static_cast<bool>(sink_) &&
                       input_prefetch_config().enabled &&
                       prefetch_virtual_memory_fn() != nullptr;
-            if (active_)
+            return active_;
+        }
+
+        void prime()
+        {
+            if (active_ && !ranges_.empty())
             {
                 refill_from(ranges_.front().offset, config_.horizon_bytes);
             }
-            return active_;
         }
 
         bool active() const noexcept { return active_; }
@@ -1189,6 +1193,7 @@ namespace sunpack::sevenzip
                 {
                     prefetch_->invalidate(position_, trace_);
                 }
+                planned_hint_->prime();
             }
             return S_OK;
 #else
@@ -1572,6 +1577,7 @@ namespace sunpack::sevenzip
                 {
                     prefetch_->invalidate(position_, trace_);
                 }
+                planned_hint_->prime();
             }
             return S_OK;
 #else
@@ -2216,6 +2222,7 @@ namespace sunpack::sevenzip
                 {
                     prefetch_->invalidate(position_, trace_);
                 }
+                planned_hint_->prime();
             }
             return S_OK;
 #else
