@@ -1,4 +1,8 @@
 // ZipHandler.cpp
+//
+// Modified by SunPack, 2026-09-20:
+// route selected ZIP Deflate entries through the external zlib-ng decoder while
+// preserving the upstream 7-Zip decoder for near-store streams.
 
 #include "StdAfx.h"
 
@@ -37,6 +41,8 @@
 
 
 #include "ZipHandler.h"
+
+#include "internal/zlib_ng_deflate_decoder.h"
 
 using namespace NWindows;
 
@@ -852,6 +858,28 @@ struct CMethodItem
 };
 
 
+// Keep the routing decision metadata-only: no probe read, no Deflate predecode,
+// and no prefix replay.  The 64 KiB floor avoids paying a second decoder's
+// setup cost where the absolute saving is negligible.  A 10% size reduction is
+// deliberately conservative: benchmark data shows zlib-ng dominating highly
+// compressible streams while upstream 7-Zip wins on effectively stored/random
+// Deflate data.  Encryption overhead only biases small/borderline entries back
+// toward 7-Zip; it cannot make an incompressible entry select zlib-ng.
+static const unsigned kSunpackZlibNgDeflateCacheKey = 0x10000u |
+    NFileHeader::NCompressionMethod::kDeflate;
+static const UInt64 kSunpackZlibNgMinUnpackSize = (UInt64)64 << 10;
+
+static bool UseSunpackZlibNgDeflate(unsigned id, const CItemEx &item)
+{
+  if (id != NFileHeader::NCompressionMethod::kDeflate ||
+      item.Size < kSunpackZlibNgMinUnpackSize)
+    return false;
+
+  const UInt64 minSavings = item.Size / 10;
+  return item.PackSize <= item.Size - minSavings;
+}
+
+
 
 class CZipDecoder
 {
@@ -1142,16 +1170,27 @@ HRESULT CZipDecoder::Decode(
     }
   }
   
+  const bool useSunpackZlibNg = UseSunpackZlibNgDeflate(id, item);
+  const unsigned methodCacheKey = useSunpackZlibNg
+      ? kSunpackZlibNgDeflateCacheKey
+      : id;
+
   unsigned m;
   for (m = 0; m < methodItems.Size(); m++)
-    if (methodItems[m].ZipMethod == id)
+    if (methodItems[m].ZipMethod == methodCacheKey)
       break;
 
   if (m == methodItems.Size())
   {
     CMethodItem mi;
-    mi.ZipMethod = id;
-    if (id == NFileHeader::NCompressionMethod::kStore)
+    mi.ZipMethod = methodCacheKey;
+    if (useSunpackZlibNg)
+    {
+      mi.Coder = SunpackCreateZlibNgDeflateDecoder();
+      if (!mi.Coder)
+        return E_OUTOFMEMORY;
+    }
+    else if (id == NFileHeader::NCompressionMethod::kStore)
       mi.Coder = new NCompress::CCopyCoder;
     else if (id == NFileHeader::NCompressionMethod::kShrink)
       mi.Coder = new NCompress::NShrink::CDecoder;
