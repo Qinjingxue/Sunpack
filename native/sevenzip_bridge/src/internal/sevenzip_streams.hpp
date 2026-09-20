@@ -508,7 +508,7 @@ namespace sunpack::sevenzip
                       prefetch_virtual_memory_fn() != nullptr;
             if (active_)
             {
-                refill_from(ranges_.front().offset);
+                refill_from(ranges_.front().offset, config_.horizon_bytes);
             }
             return active_;
         }
@@ -537,7 +537,7 @@ namespace sunpack::sevenzip
             {
                 return;
             }
-            refill_from(offset);
+            refill_from(offset, config_.refill_bytes);
         }
 
     private:
@@ -564,9 +564,8 @@ namespace sunpack::sevenzip
             return ranges_.size();
         }
 
-        void refill_from(UInt64 offset)
+        void refill_from(UInt64 offset, UInt64 budget)
         {
-            UInt64 budget = config_.horizon_bytes;
             std::size_t index = find_range(offset);
             while (index < ranges_.size() && budget)
             {
