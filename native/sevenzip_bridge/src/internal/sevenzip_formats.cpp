@@ -318,6 +318,129 @@ namespace sunpack::sevenzip
         return formats;
     }
 
+    std::vector<GUID> extraction_formats_for_hint(
+        const std::wstring &format_hint,
+        const std::wstring &archive_path)
+    {
+        std::wstring hint = lower_text(format_hint);
+        if (!hint.empty() && hint.front() == L'.')
+        {
+            hint.erase(hint.begin());
+        }
+
+        std::vector<unsigned char> ids;
+        if (hint == L"zip")
+        {
+            ids = {0x01};
+        }
+        else if (hint == L"7z" || hint == L"sevenzip" || hint == L"seven_zip")
+        {
+            ids = {0x07};
+        }
+        else if (hint == L"rar")
+        {
+            // Modern RAR is the common case; trying the alternate handler is
+            // far cheaper than reopening archive data just to identify it.
+            ids = {0xCC, 0x03};
+        }
+        else if (hint == L"rar4")
+        {
+            ids = {0x03, 0xCC};
+        }
+        else if (hint == L"rar5")
+        {
+            ids = {0xCC, 0x03};
+        }
+        else if (hint == L"tar")
+        {
+            ids = {0xEE};
+        }
+        else if (hint == L"gz" || hint == L"gzip" || hint == L"tar.gz" || hint == L"tgz")
+        {
+            ids = {0xEF, 0xEE};
+        }
+        else if (hint == L"bz2" || hint == L"bzip2" || hint == L"tar.bz2" || hint == L"tbz2" || hint == L"tbz")
+        {
+            ids = {0x02, 0xEE};
+        }
+        else if (hint == L"xz" || hint == L"tar.xz" || hint == L"txz")
+        {
+            ids = {0x0C, 0xEE};
+        }
+        else if (hint == L"zst" || hint == L"zstd" || hint == L"tar.zst" || hint == L"tzst")
+        {
+            ids = {0x0E, 0xEE};
+        }
+
+        if (ids.empty())
+        {
+            const std::wstring ext = lower_extension(archive_path);
+            std::wstring name = std::filesystem::path(archive_path).filename().wstring();
+            std::transform(name.begin(), name.end(), name.begin(), [](wchar_t ch)
+                           { return static_cast<wchar_t>(::towlower(ch)); });
+
+            if (ext == L".zip" || ext == L".jar" || ext == L".docx" || ext == L".xlsx" || ext == L".apk")
+            {
+                ids = {0x01};
+            }
+            else if (name.size() >= 8 && name.compare(name.size() - 8, 8, L".zip.001") == 0)
+            {
+                ids = {0x01, 0x07};
+            }
+            else if (name.size() >= 7 && name.compare(name.size() - 7, 7, L".7z.001") == 0)
+            {
+                ids = {0x07, 0x01};
+            }
+            else if (ext == L".7z")
+            {
+                ids = {0x07};
+            }
+            else if (ext == L".rar" || ext == L".r00")
+            {
+                ids = {0xCC, 0x03};
+            }
+            else if (ext == L".tar")
+            {
+                ids = {0xEE};
+            }
+            else if (ext == L".gz" || ext == L".tgz")
+            {
+                ids = {0xEF, 0xEE};
+            }
+            else if (ext == L".bz2" || ext == L".tbz2" || ext == L".tbz")
+            {
+                ids = {0x02, 0xEE};
+            }
+            else if (ext == L".xz" || ext == L".txz")
+            {
+                ids = {0x0C, 0xEE};
+            }
+            else if (ext == L".zst" || ext == L".tzst")
+            {
+                ids = {0x0E, 0xEE};
+            }
+            else if (ext == L".001")
+            {
+                // Without a Python hint, keep direct/native callers functional
+                // by trying plausible split handlers instead of reading a
+                // signature in a separate pre-extraction pass.
+                ids = {0x07, 0x01, 0xCC, 0x03};
+            }
+            else
+            {
+                ids = {0x07, 0x01, 0xCC, 0x03, 0xEE, 0xEF, 0x02, 0x0C, 0x0E};
+            }
+        }
+
+        std::vector<GUID> formats;
+        formats.reserve(ids.size());
+        for (const unsigned char id : ids)
+        {
+            formats.push_back(format_guid(id));
+        }
+        return formats;
+    }
+
     std::wstring archive_type_for_path(const std::wstring &path)
     {
         const std::wstring ext = lower_extension(path);
