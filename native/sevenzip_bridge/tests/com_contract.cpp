@@ -175,7 +175,7 @@ void check_streams()
         CMyComPtr<IStreamSetReadPlan> plan;
         const HRESULT hr = as_unknown(file_raw)->QueryInterface(IID_IStreamSetReadPlan, (void **)&plan);
         check(hr == S_OK && plan && plan->SetReadPlanConsumer(0x100000001ULL) == S_OK,
-              "FileInStream accepts planned consumer identity");
+              "FileInStream preserves private planned-I/O interface compatibility");
     }
     check(rejects(as_unknown(file_raw), IID_IProgress), "FileInStream QI(foreign IID) == E_NOINTERFACE");
 
