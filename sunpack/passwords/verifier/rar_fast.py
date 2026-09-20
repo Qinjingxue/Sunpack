@@ -84,10 +84,7 @@ class RarFastVerifier:
         attempts = int(outcome.get("attempts", 0))
         message = str(outcome.get("message") or "")
         final_confirmation_required = bool(
-            outcome.get(
-                "final_confirmation_required",
-                "rar5 password check matched" not in message.lower(),
-            )
+            outcome.get("final_confirmation_required", status == "match")
         )
         return PasswordBatchVerification(
             ok=(status == "match" and matched_index >= 0) or status == "not_required",
