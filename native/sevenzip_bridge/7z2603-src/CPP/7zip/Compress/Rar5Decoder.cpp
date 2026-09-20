@@ -1449,7 +1449,6 @@ struct CRar5ParallelBlockJob
   CRar5ParallelTables Tables;
   std::vector<CRar5ParallelDecodedItem> Decoded;
   UInt64 PackPos;
-  bool IsV7;
   bool LastBlock;
   bool MinorError;
   HRESULT Result;
@@ -1460,7 +1459,6 @@ struct CRar5ParallelBlockJob
 
   CRar5ParallelBlockJob():
       PackPos(0),
-      IsV7(false),
       LastBlock(false),
       MinorError(false),
       Result(S_OK),
@@ -1472,7 +1470,6 @@ struct CRar5ParallelBlockJob
     Data.clear();
     Decoded.clear();
     PackPos = 0;
-    IsV7 = false;
     LastBlock = false;
     MinorError = false;
     Result = S_OK;
@@ -2585,7 +2582,6 @@ error_dist:
       job.Tables.Len = m_LenDecoder;
       job.Tables.UseAlignBits = _useAlignBits;
       job.PackPos = packedRead;
-      job.IsV7 = _is_v7;
       job.LastBlock = _isLastBlock;
       job.MinorError = bitStream._minorError;
     }
@@ -2689,7 +2685,7 @@ HRESULT CDecoder::CodeReal()
 
 
 Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream *outStream,
-    const UInt64 * /* inSize */, const UInt64 *outSize, ICompressProgressInfo *progress))
+    const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
   _lzError = LZ_ERROR_TYPE_NO;
 /*
