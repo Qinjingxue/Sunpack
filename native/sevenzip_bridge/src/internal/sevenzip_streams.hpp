@@ -1843,9 +1843,27 @@ namespace sunpack::sevenzip
                     prefetch_reader_.reset();
                 }
             }
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (size_ && input_prefetch_config().enabled)
+            {
+                planned_mapping_ = std::make_unique<MappedFilePageHint>(path_);
+                planned_hint_ = std::make_unique<PlannedPageHint>(
+                    size_,
+                    [this](UInt64 offset, UInt64 hint_size)
+                    {
+                        return planned_mapping_ && planned_mapping_->hint(offset, hint_size);
+                    },
+                    trace_);
+            }
+#endif
             if (trace_ && read_file_timing_enabled())
             {
-                trace_->prefetch_enabled = prefetch_ && prefetch_->enabled();
+                trace_->prefetch_enabled =
+                    (prefetch_ && prefetch_->enabled())
+#ifdef SUP7Z_USE_PLANNED_IO
+                    || static_cast<bool>(planned_hint_)
+#endif
+                    ;
             }
         }
 
@@ -1866,8 +1884,8 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE BeginReadPlan() SUP7Z_NOEXCEPT override
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (!prefetch_) return S_FALSE;
-            prefetch_->begin_plan();
+            if (!planned_hint_) return S_FALSE;
+            planned_hint_->begin_plan();
             return S_OK;
 #else
             return S_FALSE;
@@ -1877,8 +1895,8 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE AddReadPlan(UInt64 offset, UInt64 size) SUP7Z_NOEXCEPT override
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (!prefetch_) return S_FALSE;
-            prefetch_->add_plan(offset, size);
+            if (!planned_hint_) return S_FALSE;
+            planned_hint_->add_plan(offset, size);
             return S_OK;
 #else
             (void)offset;
@@ -1890,8 +1908,15 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE EndReadPlan() SUP7Z_NOEXCEPT override
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (!prefetch_) return S_FALSE;
-            prefetch_->end_plan();
+            if (!planned_hint_) return S_FALSE;
+            if (planned_hint_->end_plan())
+            {
+                legacy_prefetch_active_ = false;
+                if (prefetch_)
+                {
+                    prefetch_->invalidate(position_, trace_);
+                }
+            }
             return S_OK;
 #else
             return S_FALSE;
@@ -1910,10 +1935,9 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE SetReadPlanConsumer(UInt64 consumerId) SUP7Z_NOEXCEPT override
         {
-            if (prefetch_)
-            {
-                prefetch_->set_consumer_hint(consumerId);
-            }
+            // OS page-cache hints are keyed by future file ranges, not decoder
+            // consumer identity. Keep the private interface contract as a no-op.
+            (void)consumerId;
             return S_OK;
         }
 
@@ -1953,7 +1977,7 @@ namespace sunpack::sevenzip
                 trace_->last_range_index = 0;
             }
 
-            if (prefetch_ && (legacy_prefetch_active_ || prefetch_->planned_mode()) && prefetch_->consume(position_, data, size, trace_))
+            if (prefetch_ && legacy_prefetch_active_ && prefetch_->consume(position_, data, size, trace_))
             {
                 position_ += size;
                 LARGE_INTEGER cached_position{};
@@ -1988,6 +2012,13 @@ namespace sunpack::sevenzip
                 return S_OK;
             }
 
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (planned_hint_)
+            {
+                planned_hint_->observe(position_);
+            }
+#endif
+
             DWORD read = 0;
 
             BOOL ok = FALSE;
@@ -2020,7 +2051,7 @@ namespace sunpack::sevenzip
 
             position_ += read;
 
-            if (prefetch_ && (legacy_prefetch_active_ || prefetch_->planned_mode()) && read)
+            if (prefetch_ && legacy_prefetch_active_ && read)
             {
                 prefetch_->after_sync_read(position_);
             }
@@ -2136,6 +2167,10 @@ namespace sunpack::sevenzip
         std::unique_ptr<PathHandle> prefetch_reader_;
 
         std::unique_ptr<SequentialPrefetcher> prefetch_;
+#ifdef SUP7Z_USE_PLANNED_IO
+        std::unique_ptr<MappedFilePageHint> planned_mapping_;
+        std::unique_ptr<PlannedPageHint> planned_hint_;
+#endif
         bool legacy_prefetch_enabled_ = false;
         bool legacy_prefetch_active_ = false;
     };
@@ -2201,9 +2236,27 @@ namespace sunpack::sevenzip
                 prefetch_ = std::make_unique<SequentialPrefetcher>(worker_prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
                                                                    { return read_prefetch_at(offset, data, read_size, processed); }, legacy_prefetch_active_, trace_);
             }
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (valid_ && total_size_ && input_prefetch_config().enabled)
+            {
+                planned_mappings_.resize(paths_.size());
+                planned_hint_ = std::make_unique<PlannedPageHint>(
+                    total_size_,
+                    [this](UInt64 offset, UInt64 hint_size)
+                    {
+                        return hint_planned_range(offset, hint_size);
+                    },
+                    trace_);
+            }
+#endif
             if (trace_ && read_file_timing_enabled())
             {
-                trace_->prefetch_enabled = prefetch_ && prefetch_->enabled();
+                trace_->prefetch_enabled =
+                    (prefetch_ && prefetch_->enabled())
+#ifdef SUP7Z_USE_PLANNED_IO
+                    || static_cast<bool>(planned_hint_)
+#endif
+                    ;
             }
         }
 
@@ -2214,8 +2267,8 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE BeginReadPlan() SUP7Z_NOEXCEPT override
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (!prefetch_) return S_FALSE;
-            prefetch_->begin_plan();
+            if (!planned_hint_) return S_FALSE;
+            planned_hint_->begin_plan();
             return S_OK;
 #else
             return S_FALSE;
@@ -2225,8 +2278,8 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE AddReadPlan(UInt64 offset, UInt64 size) SUP7Z_NOEXCEPT override
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (!prefetch_) return S_FALSE;
-            prefetch_->add_plan(offset, size);
+            if (!planned_hint_) return S_FALSE;
+            planned_hint_->add_plan(offset, size);
             return S_OK;
 #else
             (void)offset;
@@ -2238,8 +2291,15 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE EndReadPlan() SUP7Z_NOEXCEPT override
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (!prefetch_) return S_FALSE;
-            prefetch_->end_plan();
+            if (!planned_hint_) return S_FALSE;
+            if (planned_hint_->end_plan())
+            {
+                legacy_prefetch_active_ = false;
+                if (prefetch_)
+                {
+                    prefetch_->invalidate(position_, trace_);
+                }
+            }
             return S_OK;
 #else
             return S_FALSE;
@@ -2258,10 +2318,7 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE SetReadPlanConsumer(UInt64 consumerId) SUP7Z_NOEXCEPT override
         {
-            if (prefetch_)
-            {
-                prefetch_->set_consumer_hint(consumerId);
-            }
+            (void)consumerId;
             return S_OK;
         }
 
@@ -2293,7 +2350,7 @@ namespace sunpack::sevenzip
             const UInt64 read_start = position_;
             auto *out = static_cast<unsigned char *>(data);
 
-            if (prefetch_ && (legacy_prefetch_active_ || prefetch_->planned_mode()) && prefetch_->consume(position_, data, size, trace_))
+            if (prefetch_ && legacy_prefetch_active_ && prefetch_->consume(position_, data, size, trace_))
             {
                 position_ += size;
                 record_logical_read(trace_, read_start, size);
@@ -2319,6 +2376,13 @@ namespace sunpack::sevenzip
                 }
                 return S_OK;
             }
+
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (planned_hint_)
+            {
+                planned_hint_->observe(position_);
+            }
+#endif
 
             UInt32 total_read = 0;
 
@@ -2479,7 +2543,7 @@ namespace sunpack::sevenzip
 
             record_logical_read(trace_, read_start, total_read);
 
-            if (prefetch_ && (legacy_prefetch_active_ || prefetch_->planned_mode()) && total_read)
+            if (prefetch_ && legacy_prefetch_active_ && total_read)
             {
                 prefetch_->after_sync_read(position_);
             }
@@ -2637,6 +2701,34 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
+#ifdef SUP7Z_USE_PLANNED_IO
+        bool hint_planned_range(UInt64 offset, UInt64 size)
+        {
+            bool ok = true;
+            UInt64 remaining = size;
+            while (remaining && offset < total_size_)
+            {
+                const std::size_t index = find_part_index(offset);
+                if (index >= paths_.size())
+                {
+                    return false;
+                }
+                const UInt64 part_offset = offset - offsets_[index];
+                const UInt64 amount = std::min<UInt64>(
+                    remaining, sizes_[index] - part_offset);
+                if (!planned_mappings_[index])
+                {
+                    planned_mappings_[index] =
+                        std::make_unique<MappedFilePageHint>(paths_[index]);
+                }
+                ok = planned_mappings_[index]->hint(part_offset, amount) && ok;
+                offset += amount;
+                remaining -= amount;
+            }
+            return ok && remaining == 0;
+        }
+#endif
+
         void close_cached_handle()
         {
 
@@ -2678,6 +2770,10 @@ namespace sunpack::sevenzip
         mutable PathHandleCache prefetch_handles_;
 
         std::unique_ptr<SequentialPrefetcher> prefetch_;
+#ifdef SUP7Z_USE_PLANNED_IO
+        std::vector<std::unique_ptr<MappedFilePageHint>> planned_mappings_;
+        std::unique_ptr<PlannedPageHint> planned_hint_;
+#endif
         bool legacy_prefetch_enabled_ = false;
         bool legacy_prefetch_active_ = false;
     };
@@ -2781,9 +2877,26 @@ namespace sunpack::sevenzip
                 prefetch_ = std::make_unique<SequentialPrefetcher>(worker_prefetch_config, total_size_, [this](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
                                                                    { return read_prefetch_at(offset, data, read_size, processed); }, legacy_prefetch_active_, trace_);
             }
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (valid_ && total_size_ && input_prefetch_config().enabled)
+            {
+                planned_hint_ = std::make_unique<PlannedPageHint>(
+                    total_size_,
+                    [this](UInt64 offset, UInt64 hint_size)
+                    {
+                        return hint_planned_range(offset, hint_size);
+                    },
+                    trace_);
+            }
+#endif
             if (trace_ && read_file_timing_enabled())
             {
-                trace_->prefetch_enabled = prefetch_ && prefetch_->enabled();
+                trace_->prefetch_enabled =
+                    (prefetch_ && prefetch_->enabled())
+#ifdef SUP7Z_USE_PLANNED_IO
+                    || static_cast<bool>(planned_hint_)
+#endif
+                    ;
             }
         }
 
@@ -2798,8 +2911,8 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE BeginReadPlan() SUP7Z_NOEXCEPT override
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (!prefetch_) return S_FALSE;
-            prefetch_->begin_plan();
+            if (!planned_hint_) return S_FALSE;
+            planned_hint_->begin_plan();
             return S_OK;
 #else
             return S_FALSE;
@@ -2809,8 +2922,8 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE AddReadPlan(UInt64 offset, UInt64 size) SUP7Z_NOEXCEPT override
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (!prefetch_) return S_FALSE;
-            prefetch_->add_plan(offset, size);
+            if (!planned_hint_) return S_FALSE;
+            planned_hint_->add_plan(offset, size);
             return S_OK;
 #else
             (void)offset;
@@ -2822,8 +2935,15 @@ namespace sunpack::sevenzip
         HRESULT STDMETHODCALLTYPE EndReadPlan() SUP7Z_NOEXCEPT override
         {
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (!prefetch_) return S_FALSE;
-            prefetch_->end_plan();
+            if (!planned_hint_) return S_FALSE;
+            if (planned_hint_->end_plan())
+            {
+                legacy_prefetch_active_ = false;
+                if (prefetch_)
+                {
+                    prefetch_->invalidate(position_, trace_);
+                }
+            }
             return S_OK;
 #else
             return S_FALSE;
@@ -2842,10 +2962,7 @@ namespace sunpack::sevenzip
 
         HRESULT STDMETHODCALLTYPE SetReadPlanConsumer(UInt64 consumerId) SUP7Z_NOEXCEPT override
         {
-            if (prefetch_)
-            {
-                prefetch_->set_consumer_hint(consumerId);
-            }
+            (void)consumerId;
             return S_OK;
         }
 
@@ -2877,7 +2994,7 @@ namespace sunpack::sevenzip
             const UInt64 read_start = position_;
             auto *out = static_cast<unsigned char *>(data);
 
-            if (prefetch_ && (legacy_prefetch_active_ || prefetch_->planned_mode()) && prefetch_->consume(position_, data, size, trace_))
+            if (prefetch_ && legacy_prefetch_active_ && prefetch_->consume(position_, data, size, trace_))
             {
                 position_ += size;
                 record_logical_read(trace_, read_start, size);
@@ -2905,6 +3022,13 @@ namespace sunpack::sevenzip
                 }
                 return S_OK;
             }
+
+#ifdef SUP7Z_USE_PLANNED_IO
+            if (planned_hint_)
+            {
+                planned_hint_->observe(position_);
+            }
+#endif
 
             UInt32 total_read = 0;
 
@@ -3063,7 +3187,7 @@ namespace sunpack::sevenzip
 
             record_logical_read(trace_, read_start, total_read);
 
-            if (prefetch_ && (legacy_prefetch_active_ || prefetch_->planned_mode()) && total_read)
+            if (prefetch_ && legacy_prefetch_active_ && total_read)
             {
                 prefetch_->after_sync_read(position_);
             }
@@ -3139,6 +3263,38 @@ namespace sunpack::sevenzip
         }
 
     private:
+#ifdef SUP7Z_USE_PLANNED_IO
+        bool hint_planned_range(UInt64 offset, UInt64 size)
+        {
+            bool ok = true;
+            UInt64 remaining = size;
+            while (remaining && offset < total_size_)
+            {
+                const std::size_t index = find_range_index(offset);
+                if (index >= ranges_.size())
+                {
+                    return false;
+                }
+                const auto &range = ranges_[index];
+                const UInt64 offset_in_range = offset - range.virtual_offset;
+                const UInt64 amount = std::min<UInt64>(
+                    remaining, range.length - offset_in_range);
+
+                auto &mapping = planned_mappings_[range.path];
+                if (!mapping)
+                {
+                    mapping = std::make_unique<MappedFilePageHint>(range.path);
+                }
+                ok = mapping->hint(
+                         range.start + offset_in_range, amount) &&
+                     ok;
+                offset += amount;
+                remaining -= amount;
+            }
+            return ok && remaining == 0;
+        }
+#endif
+
         HRESULT read_prefetch_at(UInt64 offset, void *data, UInt32 size, UInt32 *processed) const
         {
             if (processed)
@@ -3259,6 +3415,10 @@ namespace sunpack::sevenzip
         UInt64 cached_handle_position_ = 0;
 
         std::unique_ptr<SequentialPrefetcher> prefetch_;
+#ifdef SUP7Z_USE_PLANNED_IO
+        std::map<std::wstring, std::unique_ptr<MappedFilePageHint>> planned_mappings_;
+        std::unique_ptr<PlannedPageHint> planned_hint_;
+#endif
         bool legacy_prefetch_enabled_ = false;
         bool legacy_prefetch_active_ = false;
 
