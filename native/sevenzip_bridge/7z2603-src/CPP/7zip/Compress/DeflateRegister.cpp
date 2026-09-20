@@ -1,4 +1,7 @@
 // DeflateRegister.cpp
+//
+// Modified by SunPack, 2026-09-20:
+// route generic RFC1951 decoder creation through the adaptive SunPack backend.
 
 #include "StdAfx.h"
 
