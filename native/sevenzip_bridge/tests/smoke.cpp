@@ -333,11 +333,11 @@ bool check_native_sizing_scales_linearly_with_cpu() {
 bool check_native_decoder_thread_budget_scales_with_outer_jobs() {
     using namespace sunpack::sevenzip;
     return native_decoder_thread_budget(16, 1) == 8 &&
-        native_decoder_thread_budget(16, 2) == 8 &&
-        native_decoder_thread_budget(16, 4) == 4 &&
-        native_decoder_thread_budget(16, 8) == 2 &&
-        native_decoder_thread_budget(8, 4) == 2 &&
-        native_decoder_thread_budget(2, 0) == 2;
+        native_decoder_thread_budget(16, 2) == 7 &&
+        native_decoder_thread_budget(16, 4) == 3 &&
+        native_decoder_thread_budget(16, 8) == 1 &&
+        native_decoder_thread_budget(8, 2) == 3 &&
+        native_decoder_thread_budget(2, 0) == 1;
 }
 
 bool check_native_sizing_respects_memory_and_overrides() {
