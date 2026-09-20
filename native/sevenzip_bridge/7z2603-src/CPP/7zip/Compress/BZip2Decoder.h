@@ -283,6 +283,7 @@ public:
 
   bool NeedWaitScout;
   bool MtMode;
+  UInt32 NumThreads;
 
   NWindows::CThread Thread;
   NWindows::NSynchronization::CAutoResetEvent DecoderEvent;
@@ -364,6 +365,9 @@ public:
   HRESULT Flush();
   HRESULT DecodeBlock(const CBlockProps &props);
   HRESULT DecodeStreams(ICompressProgressInfo *progress);
+#ifndef Z7_ST
+  HRESULT DecodeStreamsParallel(ICompressProgressInfo *progress);
+#endif
 
   UInt64 GetNumStreams() const { return Base.NumStreams; }
   UInt64 GetNumBlocks() const { return Base.NumBlocks; }
