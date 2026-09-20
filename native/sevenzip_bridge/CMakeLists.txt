@@ -72,18 +72,6 @@ option(SUP7Z_ENABLE_PIPELINE_TIMING
     "Build the benchmark-only worker pipeline timing instrumentation"
     OFF)
 
-# Decoder microbenchmark: empty backend keeps the target completely out of
-# normal builds. Build one backend per build directory so competing zlib ABIs
-# (for example zlib-ng and zlib-rs) never collide in one executable.
-set(SUP7Z_CODEC_BENCH_BACKEND "" CACHE STRING
-    "Streaming decoder microbenchmark backend: 7z, zlib-ng, zlib-rs, isal, zstd, lzma, or fastlzma2")
-set_property(CACHE SUP7Z_CODEC_BENCH_BACKEND PROPERTY STRINGS
-    "" 7z zlib-ng zlib-rs isal zstd lzma fastlzma2)
-set(SUP7Z_CODEC_BENCH_INCLUDE_DIRS "" CACHE STRING
-    "Semicolon-separated include directories for the selected external codec benchmark backend")
-set(SUP7Z_CODEC_BENCH_LIBRARIES "" CACHE STRING
-    "Semicolon-separated libraries or full library paths for the selected external codec benchmark backend")
-
 set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)
     if(CMAKE_CXX_COMPILER_ARCHITECTURE_ID)
@@ -515,68 +503,6 @@ target_include_directories(sunpack_sevenzip_writer_cost
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/src
 )
-
-# Pure decoder microbenchmark. It intentionally bypasses archive parsing,
-# prefetch, filesystem I/O, and AsyncFileWriter so the first A/B decision is
-# about decoder throughput only. It is not registered with ctest.
-if(NOT SUP7Z_CODEC_BENCH_BACKEND STREQUAL "")
-    string(TOLOWER "${SUP7Z_CODEC_BENCH_BACKEND}" SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED)
-    set(SUP7Z_CODEC_BENCH_VALID_BACKENDS
-        7z zlib-ng zlib-rs isal zstd lzma fastlzma2)
-    if(NOT SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED IN_LIST SUP7Z_CODEC_BENCH_VALID_BACKENDS)
-        message(FATAL_ERROR
-            "Unsupported SUP7Z_CODEC_BENCH_BACKEND='${SUP7Z_CODEC_BENCH_BACKEND}'. "
-            "Choose one of: 7z, zlib-ng, zlib-rs, isal, zstd, lzma, fastlzma2.")
-    endif()
-
-    add_executable(sunpack_codec_bench
-        tests/codec_bench.cpp
-    )
-    apply_release_optimizations(sunpack_codec_bench)
-    apply_source_charset(sunpack_codec_bench)
-
-    if(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "7z")
-        target_compile_definitions(sunpack_codec_bench PRIVATE SUP7Z_CODEC_BENCH_7Z=1)
-        target_link_libraries(sunpack_codec_bench PRIVATE sunpack_sevenzip_core)
-        sup7z_attach_bundled_7z(sunpack_codec_bench)
-        target_include_directories(sunpack_codec_bench PRIVATE
-            ${CMAKE_CURRENT_SOURCE_DIR}/src)
-    else()
-        if(SUP7Z_CODEC_BENCH_INCLUDE_DIRS)
-            target_include_directories(sunpack_codec_bench PRIVATE
-                ${SUP7Z_CODEC_BENCH_INCLUDE_DIRS})
-        endif()
-        if(NOT SUP7Z_CODEC_BENCH_LIBRARIES)
-            message(FATAL_ERROR
-                "SUP7Z_CODEC_BENCH_LIBRARIES is required for external backend "
-                "'${SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED}'.")
-        endif()
-        target_link_libraries(sunpack_codec_bench PRIVATE
-            ${SUP7Z_CODEC_BENCH_LIBRARIES})
-
-        if(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "zlib-ng")
-            target_compile_definitions(sunpack_codec_bench PRIVATE
-                SUP7Z_CODEC_BENCH_ZLIB=1
-                SUP7Z_CODEC_BENCH_ZLIB_NG=1)
-        elseif(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "zlib-rs")
-            target_compile_definitions(sunpack_codec_bench PRIVATE
-                SUP7Z_CODEC_BENCH_ZLIB=1
-                SUP7Z_CODEC_BENCH_ZLIB_RS=1)
-        elseif(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "isal")
-            target_compile_definitions(sunpack_codec_bench PRIVATE SUP7Z_CODEC_BENCH_ISAL=1)
-        elseif(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "zstd")
-            target_compile_definitions(sunpack_codec_bench PRIVATE SUP7Z_CODEC_BENCH_ZSTD=1)
-        elseif(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "lzma")
-            target_compile_definitions(sunpack_codec_bench PRIVATE SUP7Z_CODEC_BENCH_LZMA=1)
-        elseif(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "fastlzma2")
-            target_compile_definitions(sunpack_codec_bench PRIVATE SUP7Z_CODEC_BENCH_FASTLZMA2=1)
-        endif()
-    endif()
-
-    if(WIN32)
-        target_compile_definitions(sunpack_codec_bench PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
-    endif()
-endif()
 
 add_executable(sunpack_sevenzip_worker
     src/worker.cpp
