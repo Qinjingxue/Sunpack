@@ -1218,11 +1218,12 @@ namespace sunpack::sevenzip
                         return;
                     }
 
+                    auto chunk = chunks_.end();
 #ifdef SUP7Z_USE_PLANNED_IO
-                    auto chunk = std::find_if(chunks_.begin(), chunks_.end(), [](const Chunk &candidate)
-                                              { return candidate.state == ChunkState::Queued && candidate.demand; });
-                    if (chunk == chunks_.end())
+                    chunk = std::find_if(chunks_.begin(), chunks_.end(), [](const Chunk &candidate)
+                                         { return candidate.state == ChunkState::Queued && candidate.demand; });
 #endif
+                    if (chunk == chunks_.end())
                     {
                         chunk = std::find_if(chunks_.begin(), chunks_.end(), [](const Chunk &candidate)
                                              { return candidate.state == ChunkState::Queued; });
