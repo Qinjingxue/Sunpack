@@ -2,6 +2,17 @@
 
 #include "StdAfx.h"
 
+#ifndef Z7_ST
+#include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <thread>
+#include <vector>
+#endif
+
 // #include "CopyCoder.h"
 
 /*
@@ -809,6 +820,227 @@ Byte * CSpecState::Decode(Byte *data, size_t size) throw()
 }
 
 
+#ifndef Z7_ST
+
+static unsigned GetParallelBlockWorkerCount(UInt32 numThreads)
+{
+  if (numThreads < 4)
+    return 0;
+  return (unsigned)std::min<UInt32>(numThreads, 8);
+}
+
+
+struct CParallelOutputChunk
+{
+  std::unique_ptr<Byte[]> Data;
+  size_t Size;
+
+  CParallelOutputChunk(): Size(0) {}
+};
+
+
+struct CParallelBlockJob
+{
+  UInt32 *Counters;
+  CBlockProps Props;
+  UInt32 ExpectedCrc;
+  UInt32 CalculatedCrc;
+  UInt64 PackPos;
+  UInt64 Sequence;
+  HRESULT Result;
+
+  std::vector<CParallelOutputChunk> Output;
+
+  std::mutex Mutex;
+  std::condition_variable FinishedEvent;
+  bool Done;
+
+  CParallelBlockJob():
+      Counters(NULL),
+      ExpectedCrc(0),
+      CalculatedCrc(0),
+      PackPos(0),
+      Sequence(0),
+      Result(S_OK),
+      Done(false)
+  {}
+
+  ~CParallelBlockJob()
+  {
+    BigFree(Counters);
+  }
+
+  bool Allocate()
+  {
+    if (Counters)
+      return true;
+
+    const size_t size = (256 + kBlockSizeMax) * sizeof(UInt32)
+      #ifdef BZIP2_BYTE_MODE
+        + kBlockSizeMax
+      #endif
+        + 256;
+
+    Counters = (UInt32 *)::BigAlloc(size);
+    return Counters != NULL;
+  }
+
+  void Reset(UInt64 sequence)
+  {
+    Props = CBlockProps();
+    ExpectedCrc = 0;
+    CalculatedCrc = 0;
+    PackPos = 0;
+    Sequence = sequence;
+    Result = S_OK;
+    Output.clear();
+
+    std::lock_guard<std::mutex> lock(Mutex);
+    Done = false;
+  }
+
+  void Process()
+  {
+    HRESULT result = S_OK;
+
+    try
+    {
+      DecodeBlock1(Counters, Props.blockSize);
+
+      CSpecState block;
+      block._blockSize = Props.blockSize;
+      block._tt = Counters + 256;
+      block.Init(Props.origPtr, Props.randMode);
+
+      while (!block.Finished())
+      {
+        CParallelOutputChunk chunk;
+        chunk.Data.reset(new (std::nothrow) Byte[kOutBufSize]);
+        if (!chunk.Data)
+        {
+          result = E_OUTOFMEMORY;
+          break;
+        }
+
+        Byte * const begin = chunk.Data.get();
+        Byte * const end = block.Decode(begin, kOutBufSize);
+        chunk.Size = (size_t)(end - begin);
+
+        if (chunk.Size != 0)
+          Output.push_back(std::move(chunk));
+        else if (!block.Finished())
+        {
+          result = E_FAIL;
+          break;
+        }
+      }
+
+      if (result == S_OK)
+        CalculatedCrc = block._crc.GetDigest();
+    }
+    catch (const std::bad_alloc &)
+    {
+      result = E_OUTOFMEMORY;
+    }
+    catch (...)
+    {
+      result = E_FAIL;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(Mutex);
+      Result = result;
+      Done = true;
+    }
+    FinishedEvent.notify_one();
+  }
+
+  HRESULT Wait()
+  {
+    std::unique_lock<std::mutex> lock(Mutex);
+    FinishedEvent.wait(lock, [this] { return Done; });
+    return Result;
+  }
+};
+
+
+class CParallelBlockPool
+{
+  std::vector<std::thread> _threads;
+  std::deque<CParallelBlockJob *> _queue;
+  std::mutex _mutex;
+  std::condition_variable _workEvent;
+  bool _stop;
+
+  void WorkerLoop()
+  {
+    for (;;)
+    {
+      CParallelBlockJob *job = NULL;
+      {
+        std::unique_lock<std::mutex> lock(_mutex);
+        _workEvent.wait(lock, [this] { return _stop || !_queue.empty(); });
+        if (_stop && _queue.empty())
+          return;
+        job = _queue.front();
+        _queue.pop_front();
+      }
+
+      job->Process();
+    }
+  }
+
+public:
+  CParallelBlockPool(): _stop(false) {}
+
+  ~CParallelBlockPool()
+  {
+    Stop();
+  }
+
+  bool Start(unsigned numWorkers)
+  {
+    try
+    {
+      _threads.reserve(numWorkers);
+      for (unsigned i = 0; i < numWorkers; i++)
+        _threads.emplace_back([this] { WorkerLoop(); });
+    }
+    catch (...)
+    {
+      Stop();
+      return false;
+    }
+    return true;
+  }
+
+  void Stop()
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _stop = true;
+    }
+    _workEvent.notify_all();
+
+    for (std::thread &thread: _threads)
+      if (thread.joinable())
+        thread.join();
+
+    _threads.clear();
+  }
+
+  void Submit(CParallelBlockJob *job)
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _queue.push_back(job);
+    }
+    _workEvent.notify_one();
+  }
+};
+
+#endif
+
 HRESULT CDecoder::Flush()
 {
   if (_writeRes == S_OK)
@@ -876,8 +1108,11 @@ CDecoder::CDecoder():
     _outBuf(NULL),
     FinishMode(false),
     _outSizeDefined(false),
-    _counters(NULL),
-    _inBuf(NULL),
+    _counters(NULL)
+  #ifndef Z7_ST
+    , NumThreads(1)
+  #endif
+    , _inBuf(NULL),
     _inProcessed(0)
 {
   #ifndef Z7_ST
@@ -1213,6 +1448,180 @@ HRESULT CDecoder::DecodeStreams(ICompressProgressInfo *progress)
 
 
 
+#ifndef Z7_ST
+
+HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
+{
+  const unsigned numWorkers = GetParallelBlockWorkerCount(NumThreads);
+  if (numWorkers == 0)
+    return DecodeStreams(progress);
+
+  RINOK(StartRead())
+
+  // One workspace per worker bounds both the inverse-BWT state and the
+  // out-of-order output retained by the ordered retire ring.
+  const size_t ringSize = numWorkers;
+  std::vector<std::unique_ptr<CParallelBlockJob>> ring;
+  try
+  {
+    ring.reserve(ringSize);
+    for (size_t i = 0; i < ringSize; i++)
+    {
+      std::unique_ptr<CParallelBlockJob> job(new CParallelBlockJob());
+      if (!job->Allocate())
+        return E_OUTOFMEMORY;
+      ring.push_back(std::move(job));
+    }
+  }
+  catch (const std::bad_alloc &)
+  {
+    return E_OUTOFMEMORY;
+  }
+
+  CParallelBlockPool pool;
+  if (!pool.Start(numWorkers))
+    return E_FAIL;
+
+  struct CCountersRestore
+  {
+    CBase &BaseRef;
+    UInt32 *Counters;
+    ~CCountersRestore() { BaseRef.Counters = Counters; }
+  } countersRestore = { Base, _counters };
+
+  UInt64 submitted = 0;
+  UInt64 retired = 0;
+  UInt64 inPrev = 0;
+  UInt64 outPrev = 0;
+
+  auto retireOne = [&](CParallelBlockJob &job) -> HRESULT
+  {
+    const HRESULT jobRes = job.Wait();
+    if (jobRes != S_OK)
+      return jobRes;
+
+    for (const CParallelOutputChunk &chunk: job.Output)
+    {
+      if (chunk.Size == 0)
+        continue;
+
+      const HRESULT writeRes = WriteStream(_outStream, chunk.Data.get(), chunk.Size);
+      _outWritten += chunk.Size;
+      _outPosTotal += chunk.Size;
+      if (writeRes != S_OK)
+      {
+        _writeRes = writeRes;
+        return writeRes;
+      }
+
+      if (progress)
+      {
+        const UInt64 outCur = GetOutProcessedSize();
+        if (job.PackPos - inPrev >= kProgressStep || outCur - outPrev >= kProgressStep)
+        {
+          RINOK(progress->SetRatioInfo(&job.PackPos, &outCur))
+          inPrev = job.PackPos;
+          outPrev = outCur;
+        }
+      }
+    }
+
+    if (job.CalculatedCrc != job.ExpectedCrc)
+    {
+      BlockCrcError = true;
+      return S_FALSE;
+    }
+
+    return S_OK;
+  };
+
+  HRESULT parseRes = S_OK;
+  HRESULT retireRes = S_OK;
+  bool parserDone = false;
+
+  while (!parserDone && retireRes == S_OK)
+  {
+    // Keep the producer bounded. Reusing a slot is legal only after the
+    // corresponding earlier block has been retired in stream order.
+    if (submitted - retired >= ringSize)
+    {
+      CParallelBlockJob &job = *ring[(size_t)(retired % ringSize)];
+      retireRes = retireOne(job);
+      retired++;
+      continue;
+    }
+
+    if (Base.state == STATE_BLOCK_SIGNATURE)
+    {
+      parseRes = ReadBlockSignature();
+      if (parseRes != S_OK)
+        break;
+    }
+
+    if (Base.state == STATE_STREAM_FINISHED)
+    {
+      if (!Base.DecodeAllStreams)
+      {
+        parserDone = true;
+        break;
+      }
+
+      parseRes = StartRead();
+
+      if (Base.NeedMoreInput)
+      {
+        if (Base.state2 == 0)
+          Base.NeedMoreInput = false;
+        parseRes = S_OK;
+        parserDone = true;
+        break;
+      }
+
+      if (parseRes != S_OK)
+        break;
+
+      continue;
+    }
+
+    if (Base.state != STATE_BLOCK_START)
+    {
+      parseRes = E_FAIL;
+      break;
+    }
+
+    CParallelBlockJob &job = *ring[(size_t)(submitted % ringSize)];
+    job.Reset(submitted);
+
+    Base.Counters = job.Counters;
+    job.ExpectedCrc = Base.crc;
+
+    Base.Props.randMode = 1;
+    parseRes = ReadBlock();
+    if (parseRes != S_OK)
+      break;
+
+    job.Props = Base.Props;
+    job.PackPos = GetInputProcessedSize();
+
+    pool.Submit(&job);
+    submitted++;
+  }
+
+  // A parser error can be discovered after earlier blocks were already
+  // submitted. Match the serial decoder: publish those earlier blocks first,
+  // but stop at the first ordered block/write failure.
+  while (retireRes == S_OK && retired < submitted)
+  {
+    CParallelBlockJob &job = *ring[(size_t)(retired % ringSize)];
+    retireRes = retireOne(job);
+    retired++;
+  }
+
+  return retireRes != S_OK ? retireRes : parseRes;
+}
+
+#endif
+
 
 bool CDecoder::CreateInputBufer()
 {
@@ -1287,7 +1696,16 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   if (!CreateInputBufer())
     return E_OUTOFMEMORY;
 
-  if (!_outBuf)
+  #ifndef Z7_ST
+  const bool useParallelBlocks =
+      GetParallelBlockWorkerCount(NumThreads) != 0 &&
+      !_outSizeDefined &&
+      Base.DecodeAllStreams;
+  #else
+  const bool useParallelBlocks = false;
+  #endif
+
+  if (!useParallelBlocks && !_outBuf)
   {
     _outBuf = (Byte *)MidAlloc(kOutBufSize);
     if (!_outBuf)
@@ -1302,9 +1720,16 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   _outWritten = 0;
   _outPos = 0;
 
-  HRESULT res = DecodeStreams(progress);
+  HRESULT res;
+  #ifndef Z7_ST
+  if (useParallelBlocks)
+    res = DecodeStreamsParallel(progress);
+  else
+  #endif
+    res = DecodeStreams(progress);
 
-  Flush();
+  if (!useParallelBlocks)
+    Flush();
 
   Base.InStream = NULL;
   _outStream = NULL;
@@ -1504,7 +1929,8 @@ void CDecoder::RunScout()
 
 Z7_COM7F_IMF(CDecoder::SetNumberOfThreads(UInt32 numThreads))
 {
-  MtMode = (numThreads > 1);
+  NumThreads = numThreads == 0 ? 1 : numThreads;
+  MtMode = (NumThreads > 1);
 
   #ifndef BZIP2_BYTE_MODE
   MtMode = false;
