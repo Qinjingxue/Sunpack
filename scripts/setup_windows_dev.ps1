@@ -201,8 +201,12 @@ function Ensure-Bundled7ZipAssets {
         [string]$BuildArch
     )
 
+    # SunPack's embedded 7-Zip backend no longer needs 7z.dll at runtime,
+    # but tools\7z.exe is still used by tests/benchmarks as a fixture tool and
+    # requires its companion codec module beside the executable.
     $requiredToolFiles = @(
         "7z.exe",
+        "7z.dll",
         "7z.sfx",
         "7zCon.sfx",
         "7-zip.dll"
@@ -423,7 +427,9 @@ function Ensure-AcceptanceTestTools {
                 -Sha256 $zstdArchiveSha256
 
             $sevenZipPath = Join-Path $ToolsRoot "7z.exe"
+            $sevenZipCliDllPath = Join-Path $ToolsRoot "7z.dll"
             Assert-PathExists -LiteralPath $sevenZipPath -Description "7-Zip extractor for acceptance test tools"
+            Assert-PathExists -LiteralPath $sevenZipCliDllPath -Description "7-Zip CLI companion DLL for acceptance test tools"
             Remove-IfExists -LiteralPath $zstdRoot
             New-Item -ItemType Directory -Path $zstdExtractRoot -Force | Out-Null
             Invoke-Native -FilePath $sevenZipPath -Arguments @(
