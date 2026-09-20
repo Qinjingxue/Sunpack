@@ -1,5 +1,16 @@
 #pragma once
 
+#ifdef _WIN32
+// The SunPack bridge targets intentionally use WIN32_LEAN_AND_MEAN, while
+// upstream 7-Zip's COM interface headers normally get these declarations
+// transitively from the full Windows.h include set. Pull in the required COM,
+// stream, property, and BSTR declarations explicitly before ICoder.h.
+#include <Unknwn.h>
+#include <wtypes.h>
+#include <objidl.h>
+#include <OleAuto.h>
+#endif
+
 #include "7zip/ICoder.h"
 
 // Shared metadata-only routing policy used by ZIP and generic method 0x40108.
