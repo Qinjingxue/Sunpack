@@ -309,11 +309,9 @@ endfunction()
 set(SUP7Z_INTERNAL_SOURCES
     src/internal/archive_extract.cpp
     src/internal/archive_crc_manifest.cpp
-    src/internal/archive_open_probe.cpp
     src/internal/archive_open_plan.cpp
     src/internal/archive_resources.cpp
     src/internal/embedded_7z.cpp
-    src/internal/operation_dispatch.cpp
     src/internal/password_testing.cpp
     src/internal/sevenzip_engine.cpp
     src/internal/sevenzip_formats.cpp
@@ -360,9 +358,6 @@ if(SUP7Z_ENABLE_PIPELINE_TIMING)
 endif()
 
 add_library(sunpack_sevenzip SHARED
-    src/archive_test.cpp
-    src/c_api_operation.cpp
-    src/c_api_passwords.cpp
     src/c_api_crc_manifest.cpp
     src/c_api_resources.cpp
     ${SUP7Z_INTERNAL_SOURCES}
