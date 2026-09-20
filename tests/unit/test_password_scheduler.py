@@ -290,7 +290,7 @@ def test_extraction_plan_accepts_strong_fast_proof_and_caches_it(tmp_path):
         attempts=2,
         final_confirmation_required=False,
     ))
-    scheduler = PasswordScheduler(PasswordVerifierChain([fast], None))
+    scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
     job = PasswordJob(
         archive_path=str(archive),
         archive_input={"format_hint": "7z"},
@@ -351,7 +351,7 @@ def test_extraction_plan_preserves_zipcrypto_candidate_evidence(tmp_path):
         final_confirmation_required=True,
         match_evidence="zipcrypto_header_byte",
     ))
-    scheduler = PasswordScheduler(PasswordVerifierChain([fast], None))
+    scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
 
     result = scheduler.plan_for_extraction(PasswordJob(
         archive_path=str(archive),
@@ -392,7 +392,7 @@ def test_verifier_chain_prioritizes_fast_verifier_from_archive_input():
         attempts=1,
         error_text="wrong password",
     ))
-    chain = PasswordVerifierChain([zip_fast, rar_fast], None)
+    chain = PasswordVerifierChain([zip_fast, rar_fast])
 
     outcome = chain.verify_batch(
         "carrier.jpg",
