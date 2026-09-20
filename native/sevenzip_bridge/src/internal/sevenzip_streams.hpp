@@ -150,6 +150,25 @@ namespace sunpack::sevenzip
         }();
         return config;
     }
+
+    // Transitional compile-only shape for the legacy user-space planned-cache code
+    // that remains unreachable while this PR switches stream plan methods to
+    // PlannedPageHint. It will be removed once the new path is validated.
+    struct PlannedPrefetchConfig
+    {
+        UInt64 buffer_bytes = 32ULL * 1024 * 1024;
+        UInt32 io_bytes = 16U * 1024 * 1024;
+    };
+
+    inline PlannedPrefetchConfig planned_prefetch_config() noexcept
+    {
+        const PlannedHintConfig hint = planned_hint_config();
+        PlannedPrefetchConfig value;
+        value.buffer_bytes = hint.horizon_bytes;
+        value.io_bytes = static_cast<UInt32>(std::min<UInt64>(
+            hint.refill_bytes, static_cast<UInt64>((std::numeric_limits<UInt32>::max)())));
+        return value;
+    }
 #endif
 
     inline void capture_open_input_trace(ExtractInputTrace &trace) noexcept
