@@ -1456,23 +1456,35 @@ struct CRar5ParallelTables
 struct CRar5ParallelBlockJob
 {
   std::vector<Byte> Data;
-  CBitDecoder BitState;
+  size_t LogicalSize;
   CRar5ParallelTables Tables;
   std::vector<CRar5ParallelDecodedItem> Decoded;
   UInt64 PackPos;
+  bool IsV7;
+  bool TablePresent;
+  bool TableWasFilled;
   bool LastBlock;
   bool MinorError;
+  HRESULT TableResult;
   HRESULT Result;
 
   std::mutex Mutex;
+  std::condition_variable TableEvent;
   std::condition_variable FinishedEvent;
+  bool TableReady;
   bool Done;
 
   CRar5ParallelBlockJob():
+      LogicalSize(0),
       PackPos(0),
+      IsV7(false),
+      TablePresent(false),
+      TableWasFilled(false),
       LastBlock(false),
       MinorError(false),
+      TableResult(S_OK),
       Result(S_OK),
+      TableReady(false),
       Done(false)
   {}
 
@@ -1480,12 +1492,205 @@ struct CRar5ParallelBlockJob
   {
     Data.clear();
     Decoded.clear();
+    LogicalSize = 0;
     PackPos = 0;
+    IsV7 = false;
+    TablePresent = false;
+    TableWasFilled = false;
     LastBlock = false;
     MinorError = false;
+    TableResult = S_OK;
     Result = S_OK;
     std::lock_guard<std::mutex> lock(Mutex);
+    TableReady = false;
     Done = false;
+  }
+
+  HRESULT ReadTablesParallel(CBitDecoder &bitStream)
+  {
+    bitStream.Prepare();
+
+    const unsigned flags = bitStream.ReadByte_InAligned();
+    unsigned checkSum = bitStream.ReadByte_InAligned();
+    checkSum ^= flags;
+    const unsigned num = (flags >> 3) & 3;
+    if (num >= 3)
+      return S_FALSE;
+
+    UInt32 blockSize = bitStream.ReadByte_InAligned();
+    checkSum ^= blockSize;
+    if (num != 0)
+    {
+      const unsigned b = bitStream.ReadByte_InAligned();
+      checkSum ^= b;
+      blockSize += (UInt32)b << 8;
+      if (num > 1)
+      {
+        const unsigned b2 = bitStream.ReadByte_InAligned();
+        checkSum ^= b2;
+        blockSize += (UInt32)b2 << 16;
+      }
+    }
+
+    if (checkSum != 0x5A)
+      return S_FALSE;
+
+    unsigned blockSizeBits7 = (flags & 7) + 1;
+    blockSize += (UInt32)(blockSizeBits7 >> 3);
+    if (blockSize == 0)
+    {
+      bitStream._minorError = true;
+      blockSizeBits7 = 0;
+      blockSize = 1;
+    }
+
+    blockSize--;
+    blockSizeBits7 &= 7;
+    bitStream._blockEndBits7 = blockSizeBits7;
+    bitStream._blockEnd = bitStream.GetProcessedSize_Round() + blockSize;
+    bitStream.SetCheck_forBlock();
+    LastBlock = (flags & 0x40) != 0;
+    TablePresent = (flags & 0x80) != 0;
+
+    if (!TablePresent)
+    {
+      if (!TableWasFilled && blockSize + blockSizeBits7 != 0)
+        return S_FALSE;
+      return S_OK;
+    }
+
+    TableWasFilled = false;
+
+    const unsigned kLevelTableSize = 20;
+    const unsigned k_NumHufTableBits_Level = 6;
+    NHuffman::CDecoder256<kNumHufBits, kLevelTableSize, k_NumHufTableBits_Level> levelDecoder;
+    const unsigned kTablesSizesSum_MAX =
+        kMainTableSize + kDistTableSize_MAX + kAlignTableSize + kLenTableSize;
+    Byte lens[kTablesSizesSum_MAX];
+
+    {
+      unsigned i = 0;
+      do
+      {
+        if (bitStream._buf >= bitStream._bufCheck_Block)
+        {
+          bitStream.Prepare();
+          if (bitStream.IsBlockOverRead())
+            return S_FALSE;
+        }
+
+        const unsigned len = (unsigned)bitStream.ReadBits_9fix(4);
+        if (len == 15)
+        {
+          unsigned count = (unsigned)bitStream.ReadBits_9fix(4);
+          if (count != 0)
+          {
+            count += 2 + i;
+            do
+              lens[i++] = 0;
+            while (i < count);
+            continue;
+          }
+        }
+        lens[i++] = (Byte)len;
+      }
+      while (i < kLevelTableSize);
+
+      if (bitStream.IsBlockOverRead())
+        return S_FALSE;
+      if (!levelDecoder.Build(lens, NHuffman::k_BuildMode_Full))
+        return S_FALSE;
+    }
+
+    unsigned i = 0;
+    const unsigned tableSize = IsV7 ?
+        kTablesSizesSum_MAX :
+        kTablesSizesSum_MAX - kExtraDistSymbols_v7;
+
+    do
+    {
+      if (bitStream._buf >= bitStream._bufCheck_Block)
+      {
+        bitStream.Prepare();
+        if (bitStream.IsBlockOverRead())
+          return S_FALSE;
+      }
+
+      const unsigned sym = levelDecoder.DecodeFull(&bitStream);
+      if (sym < 16)
+        lens[i++] = (Byte)sym;
+      else
+      {
+        unsigned count = (sym & 1) * 4;
+        count += count + 3 + (unsigned)bitStream.ReadBits9(count + 3);
+        count += i;
+        if (count > tableSize)
+          count = tableSize;
+
+        unsigned value = 0;
+        if (sym < 18)
+        {
+          if (i == 0)
+            return S_FALSE;
+          value = lens[(size_t)i - 1];
+        }
+
+        do
+          lens[i++] = (Byte)value;
+        while (i < count);
+      }
+    }
+    while (i < tableSize);
+
+    if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
+      return S_FALSE;
+
+    const NHuffman::enum_BuildMode buildMode = NHuffman::k_BuildMode_Full_or_Empty;
+    if (!Tables.Main.Build(&lens[0], buildMode))
+      return S_FALSE;
+
+    if (!IsV7)
+    {
+      Byte *dest = lens + kMainTableSize + kDistTableSize_v6 +
+                     kAlignTableSize + kLenTableSize - 1;
+      unsigned count = kAlignTableSize + kLenTableSize;
+      do
+      {
+        dest[kExtraDistSymbols_v7] = dest[0];
+        dest--;
+      }
+      while (--count);
+      memset(lens + kMainTableSize + kDistTableSize_v6, 0, kExtraDistSymbols_v7);
+    }
+
+    if (!Tables.Dist.Build(&lens[kMainTableSize], buildMode))
+      return S_FALSE;
+    if (!Tables.Len.Build(&lens[kMainTableSize +
+          kDistTableSize_MAX + kAlignTableSize], buildMode))
+      return S_FALSE;
+
+    Tables.UseAlignBits = false;
+    for (i = 0; i < kAlignTableSize; i++)
+      if (lens[kMainTableSize + kDistTableSize_MAX + (size_t)i] != kNumAlignBits)
+      {
+        if (!Tables.Align.Build(&lens[kMainTableSize + kDistTableSize_MAX], buildMode))
+          return S_FALSE;
+        Tables.UseAlignBits = true;
+        break;
+      }
+
+    TableWasFilled = true;
+    return S_OK;
+  }
+
+  void PublishTableResult(HRESULT result)
+  {
+    {
+      std::lock_guard<std::mutex> lock(Mutex);
+      TableResult = result;
+      TableReady = true;
+    }
+    TableEvent.notify_all();
   }
 
   void Process()
@@ -1497,181 +1702,208 @@ struct CRar5ParallelBlockJob
       Decoded.clear();
       Decoded.reserve(0x4100);
 
-      CBitDecoder bitStream = BitState;
+      CBitDecoder bitStream;
+      bitStream._stream = NULL;
+      bitStream._bufBase = Data.data();
+      bitStream.Init();
+      bitStream._bufLim = Data.data() + LogicalSize;
+      bitStream._bufCheck = bitStream._bufLim;
+      bitStream._bufCheck_Block = bitStream._bufCheck;
+      bitStream._wasFinished = true;
+      bitStream._hres = S_OK;
 
-      for (;;)
-      {
-        const UInt64 processed = bitStream.GetProcessedSize_Round();
-        if (processed > bitStream._blockEnd ||
-            (processed == bitStream._blockEnd &&
-             bitStream.GetProcessedBits7() >= bitStream._blockEndBits7))
-          break;
-
-        unsigned sym;
-        if (!Tables.Main.Decode2(&bitStream, sym))
-        {
-          result = S_FALSE;
-          break;
-        }
-
-        if (sym < 256)
-        {
-          if (!Decoded.empty())
-          {
-            CRar5ParallelDecodedItem &prev = Decoded.back();
-            if (prev.Type == RAR5_MT_LITERAL && prev.LiteralSize < sizeof(prev.Literal))
-            {
-              prev.Literal[prev.LiteralSize++] = (Byte)sym;
-              continue;
-            }
-          }
-
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_LITERAL;
-          item.LiteralSize = 1;
-          item.Literal[0] = (Byte)sym;
-          Decoded.push_back(item);
-          continue;
-        }
-
-        if (sym == 256)
-        {
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_FILTER;
-          item.Distance = ReadUInt32(bitStream);
-          item.FilterSize = ReadUInt32(bitStream);
-          item.FilterType = (Byte)bitStream.ReadBits_9fix(3);
-          if (item.FilterType == FILTER_DELTA)
-            item.FilterChannels = (Byte)(bitStream.ReadBits_9fix(5) + 1);
-          Decoded.push_back(item);
-        }
-        else if (sym == 257)
-        {
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_FULLREP;
-          Decoded.push_back(item);
-        }
-        else if (sym < kSymbolRep + kNumReps)
-        {
-          CLenType len;
-          if (!Tables.Len.Decode2(&bitStream, len))
-          {
-            result = S_FALSE;
-            break;
-          }
-          if (len >= 8)
-            len = SlotToLen(bitStream, len);
-          len += 2;
-
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_REP;
-          item.Distance = (size_t)sym - kSymbolRep;
-          item.Length = (UInt16)len;
-          Decoded.push_back(item);
-        }
-        else
-        {
-          CLenType len = sym - (kSymbolRep + kNumReps);
-          if (len >= 8)
-            len = SlotToLen(bitStream, len);
-          len += 2;
-
-          size_t distance;
-          unsigned distSlot;
-          if (!Tables.Dist.Decode2(&bitStream, distSlot))
-          {
-            result = S_FALSE;
-            break;
-          }
-          distance = distSlot;
-
-          if (distance >= 4)
-          {
-            const unsigned numBits = ((unsigned)distance - 2) >> 1;
-            distance = (2 | (distance & 1)) << numBits;
-
-            const Byte *buf = bitStream._buf;
-#ifdef Z7_RAR5_USE_64BIT
-            const UInt64 v = GetBe64(buf);
-#else
-            const UInt32 v = GetBe32(buf);
-#endif
-
-            if (numBits < kNumAlignBits)
-            {
-              distance += bitStream.ReadBits_Big25(numBits, v);
-            }
-            else
-            {
-              len += k_LenPlusTable[numBits];
-              if (Tables.UseAlignBits)
-              {
-                distance +=
-                    (bitStream.ReadBits_Big25(numBits - kNumAlignBits, v) << kNumAlignBits);
-                unsigned align;
-                if (!Tables.Align.Decode2(&bitStream, align))
-                {
-                  result = S_FALSE;
-                  break;
-                }
-                distance += align;
-              }
-              else
-                distance += bitStream.ReadBits_Big(numBits, v);
-#ifndef Z7_RAR5_USE_64BIT
-              if (numBits >= 30)
-                distance = (size_t)0 - 1 - 1;
-#endif
-            }
-          }
-          distance++;
-
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_MATCH;
-          item.Distance = distance;
-          item.Length = (UInt16)len;
-          Decoded.push_back(item);
-        }
-
-        if (bitStream.IsBlockOverRead())
-        {
-          result = S_FALSE;
-          break;
-        }
-      }
+      result = ReadTablesParallel(bitStream);
+      MinorError = bitStream._minorError;
+      PublishTableResult(result);
 
       if (result == S_OK)
       {
-        if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
-          result = S_FALSE;
-        else if (bitStream.GetProcessedSize_Round() == bitStream._blockEnd &&
-                 bitStream.GetProcessedBits7() == bitStream._blockEndBits7 &&
-                 bitStream._blockEndBits7 != 0)
+        for (;;)
         {
-          // Match CBitDecoder::AlignToByte(): RAR requires the unused low
-          // bits in the final partial byte to be zero.  The worker does not
-          // call AlignToByte() because it never advances to the next block.
-          const unsigned b = (unsigned)*bitStream._buf << bitStream._blockEndBits7;
-          if (b & 0xff)
-            MinorError = true;
+          const UInt64 processed = bitStream.GetProcessedSize_Round();
+          if (processed > bitStream._blockEnd ||
+              (processed == bitStream._blockEnd &&
+               bitStream.GetProcessedBits7() >= bitStream._blockEndBits7))
+            break;
+
+          unsigned sym;
+          if (!Tables.Main.Decode2(&bitStream, sym))
+          {
+            result = S_FALSE;
+            break;
+          }
+
+          if (sym < 256)
+          {
+            if (!Decoded.empty())
+            {
+              CRar5ParallelDecodedItem &prev = Decoded.back();
+              if (prev.Type == RAR5_MT_LITERAL && prev.LiteralSize < sizeof(prev.Literal))
+              {
+                prev.Literal[prev.LiteralSize++] = (Byte)sym;
+                continue;
+              }
+            }
+
+            CRar5ParallelDecodedItem item;
+            item.Type = RAR5_MT_LITERAL;
+            item.LiteralSize = 1;
+            item.Literal[0] = (Byte)sym;
+            Decoded.push_back(item);
+            continue;
+          }
+
+          if (sym == 256)
+          {
+            CRar5ParallelDecodedItem item;
+            item.Type = RAR5_MT_FILTER;
+            item.Distance = ReadUInt32(bitStream);
+            item.FilterSize = ReadUInt32(bitStream);
+            item.FilterType = (Byte)bitStream.ReadBits_9fix(3);
+            if (item.FilterType == FILTER_DELTA)
+              item.FilterChannels = (Byte)(bitStream.ReadBits_9fix(5) + 1);
+            Decoded.push_back(item);
+          }
+          else if (sym == 257)
+          {
+            CRar5ParallelDecodedItem item;
+            item.Type = RAR5_MT_FULLREP;
+            Decoded.push_back(item);
+          }
+          else if (sym < kSymbolRep + kNumReps)
+          {
+            CLenType len;
+            if (!Tables.Len.Decode2(&bitStream, len))
+            {
+              result = S_FALSE;
+              break;
+            }
+            if (len >= 8)
+              len = SlotToLen(bitStream, len);
+            len += 2;
+
+            CRar5ParallelDecodedItem item;
+            item.Type = RAR5_MT_REP;
+            item.Distance = (size_t)sym - kSymbolRep;
+            item.Length = (UInt16)len;
+            Decoded.push_back(item);
+          }
+          else
+          {
+            CLenType len = sym - (kSymbolRep + kNumReps);
+            if (len >= 8)
+              len = SlotToLen(bitStream, len);
+            len += 2;
+
+            size_t distance;
+            unsigned distSlot;
+            if (!Tables.Dist.Decode2(&bitStream, distSlot))
+            {
+              result = S_FALSE;
+              break;
+            }
+            distance = distSlot;
+
+            if (distance >= 4)
+            {
+              const unsigned numBits = ((unsigned)distance - 2) >> 1;
+              distance = (2 | (distance & 1)) << numBits;
+
+              const Byte *buf = bitStream._buf;
+#ifdef Z7_RAR5_USE_64BIT
+              const UInt64 v = GetBe64(buf);
+#else
+              const UInt32 v = GetBe32(buf);
+#endif
+
+              if (numBits < kNumAlignBits)
+              {
+                distance += bitStream.ReadBits_Big25(numBits, v);
+              }
+              else
+              {
+                len += k_LenPlusTable[numBits];
+                if (Tables.UseAlignBits)
+                {
+                  distance +=
+                      (bitStream.ReadBits_Big25(numBits - kNumAlignBits, v) << kNumAlignBits);
+                  unsigned align;
+                  if (!Tables.Align.Decode2(&bitStream, align))
+                  {
+                    result = S_FALSE;
+                    break;
+                  }
+                  distance += align;
+                }
+                else
+                  distance += bitStream.ReadBits_Big(numBits, v);
+#ifndef Z7_RAR5_USE_64BIT
+                if (numBits >= 30)
+                  distance = (size_t)0 - 1 - 1;
+#endif
+              }
+            }
+            distance++;
+
+            CRar5ParallelDecodedItem item;
+            item.Type = RAR5_MT_MATCH;
+            item.Distance = distance;
+            item.Length = (UInt16)len;
+            Decoded.push_back(item);
+          }
+
+          if (bitStream.IsBlockOverRead())
+          {
+            result = S_FALSE;
+            break;
+          }
+        }
+
+        if (result == S_OK)
+        {
+          if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
+            result = S_FALSE;
+          else if (bitStream.GetProcessedSize_Round() == bitStream._blockEnd &&
+                   bitStream.GetProcessedBits7() == bitStream._blockEndBits7 &&
+                   bitStream._blockEndBits7 != 0)
+          {
+            const unsigned b = (unsigned)*bitStream._buf << bitStream._blockEndBits7;
+            if (b & 0xff)
+              MinorError = true;
+          }
         }
       }
     }
     catch (const std::bad_alloc &)
     {
       result = E_OUTOFMEMORY;
+      PublishTableResult(result);
     }
     catch (...)
     {
       result = E_FAIL;
+      PublishTableResult(result);
     }
 
     {
       std::lock_guard<std::mutex> lock(Mutex);
+      if (!TableReady)
+      {
+        TableResult = result;
+        TableReady = true;
+        TableEvent.notify_all();
+      }
       Result = result;
       Done = true;
     }
     FinishedEvent.notify_one();
+  }
+
+  HRESULT WaitTables()
+  {
+    std::unique_lock<std::mutex> lock(Mutex);
+    TableEvent.wait(lock, [this] { return TableReady; });
+    return TableResult;
   }
 
   HRESULT Wait()
