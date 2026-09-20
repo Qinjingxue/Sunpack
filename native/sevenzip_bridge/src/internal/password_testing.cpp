@@ -689,19 +689,6 @@ namespace sunpack::sevenzip
 
 #endif
 
-    PasswordTestResult test_password_with_parts(
-
-    
-        const std::wstring &archive_path,
-
-        const std::vector<std::wstring> &part_paths,
-
-        const std::wstring &password,
-
-        const std::vector<std::wstring> &canonical_names
-
-    );
-
     PasswordTestResult test_passwords_with_parts(
 
     
