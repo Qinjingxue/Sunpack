@@ -673,7 +673,7 @@ function Test-SevenZipWrapper {
 
     Invoke-Native -FilePath $PythonPath -Arguments @(
         "-c",
-        "from sunpack.support.sevenzip_bridge import NativePasswordTester; tester = NativePasswordTester(); assert tester.available(), tester.wrapper_path"
+        "from sunpack.support.sevenzip_bridge import NativeSevenZipBridge; tester = NativeSevenZipBridge(); assert tester.available(), tester.wrapper_path"
     )
 }
 
