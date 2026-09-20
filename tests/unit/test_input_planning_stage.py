@@ -360,6 +360,7 @@ def test_input_planning_stage_uses_range_input_for_embedded_password_required_ar
             "status": "damaged",
             "confidence": 0.72,
             "damage_flags": ["valid_encrypted_but_unwalkable"],
+            "password_required": True,
         },
     }
     assert knowledge_view.source_password_probe_input(task) == segments[0]["archive_input"]
