@@ -24,6 +24,8 @@
 
 #include <map>
 
+#include <limits>
+
 #include <memory>
 
 #include <mutex>
@@ -100,38 +102,50 @@ namespace sunpack::sevenzip
     }
 
 #ifdef SUP7Z_USE_PLANNED_IO
-    struct PlannedPrefetchConfig
+    struct PlannedHintConfig
     {
-        // Two large slabs by default: enough overlap for the decoder while keeping ReadFile count low.
-        UInt64 buffer_bytes = 32ULL * 1024 * 1024;
-        UInt32 io_bytes = 16U * 1024 * 1024;
+        // Keep a bounded future horizon in the OS page cache. The refill threshold
+        // limits PrefetchVirtualMemory calls without storing a second user-space copy.
+        UInt64 horizon_bytes = 32ULL * 1024 * 1024;
+        UInt64 refill_bytes = 16ULL * 1024 * 1024;
     };
 
-    inline PlannedPrefetchConfig planned_prefetch_config() noexcept
+    inline PlannedHintConfig planned_hint_config() noexcept
     {
-        static const PlannedPrefetchConfig config = []
+        static const PlannedHintConfig config = []
         {
-            PlannedPrefetchConfig value;
-            if (const char *buffer_mib = std::getenv("SUNPACK_SEVENZIP_PLANNED_BUFFER_MIB"))
+            PlannedHintConfig value;
+
+            const char *horizon = std::getenv("SUNPACK_SEVENZIP_PLANNED_HINT_MIB");
+            if (!horizon)
             {
-                const unsigned long parsed = std::strtoul(buffer_mib, nullptr, 10);
+                // Compatibility with the previous planned-cache tuning variable.
+                horizon = std::getenv("SUNPACK_SEVENZIP_PLANNED_BUFFER_MIB");
+            }
+            if (horizon)
+            {
+                const unsigned long parsed = std::strtoul(horizon, nullptr, 10);
                 if (parsed >= 4 && parsed <= 512)
                 {
-                    value.buffer_bytes = static_cast<UInt64>(parsed) * 1024 * 1024;
+                    value.horizon_bytes = static_cast<UInt64>(parsed) * 1024 * 1024;
                 }
             }
-            if (const char *io_mib = std::getenv("SUNPACK_SEVENZIP_PLANNED_IO_MIB"))
+
+            const char *refill = std::getenv("SUNPACK_SEVENZIP_PLANNED_REFILL_MIB");
+            if (!refill)
             {
-                const unsigned long parsed = std::strtoul(io_mib, nullptr, 10);
+                // Compatibility with the previous planned-cache I/O-size variable.
+                refill = std::getenv("SUNPACK_SEVENZIP_PLANNED_IO_MIB");
+            }
+            if (refill)
+            {
+                const unsigned long parsed = std::strtoul(refill, nullptr, 10);
                 if (parsed >= 1 && parsed <= 128)
                 {
-                    value.io_bytes = static_cast<UInt32>(parsed * 1024 * 1024);
+                    value.refill_bytes = static_cast<UInt64>(parsed) * 1024 * 1024;
                 }
             }
-            if (value.io_bytes > value.buffer_bytes)
-            {
-                value.io_bytes = static_cast<UInt32>(std::min<UInt64>(value.buffer_bytes, (UInt64)(UInt32)(Int32)-1));
-            }
+            value.refill_bytes = std::min(value.refill_bytes, value.horizon_bytes);
             return value;
         }();
         return config;
@@ -186,14 +200,8 @@ namespace sunpack::sevenzip
 
     inline InputPrefetchConfig prefetch_worker_config(InputPrefetchConfig config) noexcept
     {
-#ifdef SUP7Z_USE_PLANNED_IO
-        // Preserve the global runtime off switch. Only bypass format-specific legacy disables
-        // (TAR and native RAR volumes) so they can still execute an explicit read plan.
-        if (!config.enabled && input_prefetch_config().enabled)
-        {
-            config.enabled = true;
-        }
-#endif
+        // Planned extraction hints are independent of the legacy user-space prefetch
+        // worker, so format-specific legacy disables must remain disabled here.
         return config;
     }
 
@@ -298,6 +306,310 @@ namespace sunpack::sevenzip
     private:
         std::map<std::wstring, std::unique_ptr<PathHandle>> handles_;
     };
+
+#ifdef SUP7Z_USE_PLANNED_IO
+    struct PlannedMemoryRangeEntry
+    {
+        PVOID virtual_address = nullptr;
+        SIZE_T number_of_bytes = 0;
+    };
+
+    using PrefetchVirtualMemoryFn = BOOL(WINAPI *)(
+        HANDLE,
+        ULONG_PTR,
+        PlannedMemoryRangeEntry *,
+        ULONG);
+
+    inline PrefetchVirtualMemoryFn prefetch_virtual_memory_fn() noexcept
+    {
+        static const PrefetchVirtualMemoryFn function = []
+        {
+            const HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+            return kernel32
+                       ? reinterpret_cast<PrefetchVirtualMemoryFn>(
+                             GetProcAddress(kernel32, "PrefetchVirtualMemory"))
+                       : nullptr;
+        }();
+        return function;
+    }
+
+    class MappedFilePageHint final
+    {
+    public:
+        explicit MappedFilePageHint(std::wstring path)
+            : path_(std::move(path)) {}
+
+        MappedFilePageHint(const MappedFilePageHint &) = delete;
+        MappedFilePageHint &operator=(const MappedFilePageHint &) = delete;
+
+        ~MappedFilePageHint()
+        {
+            if (view_)
+            {
+                UnmapViewOfFile(view_);
+            }
+            if (mapping_)
+            {
+                CloseHandle(mapping_);
+            }
+            if (file_ != INVALID_HANDLE_VALUE)
+            {
+                CloseHandle(file_);
+            }
+        }
+
+        bool hint(UInt64 offset, UInt64 size) noexcept
+        {
+            if (size == 0 || !ensure_mapping() || offset >= size_)
+            {
+                return false;
+            }
+
+            const UInt64 available = size_ - offset;
+            const UInt64 clamped = std::min(size, available);
+            if (clamped == 0 ||
+                offset > static_cast<UInt64>((std::numeric_limits<SIZE_T>::max)()) ||
+                clamped > static_cast<UInt64>((std::numeric_limits<SIZE_T>::max)()) - offset)
+            {
+                return false;
+            }
+
+            PrefetchVirtualMemoryFn function = prefetch_virtual_memory_fn();
+            if (!function)
+            {
+                return false;
+            }
+
+            PlannedMemoryRangeEntry entry;
+            entry.virtual_address =
+                static_cast<unsigned char *>(view_) + static_cast<SIZE_T>(offset);
+            entry.number_of_bytes = static_cast<SIZE_T>(clamped);
+            return function(GetCurrentProcess(), 1, &entry, 0) != FALSE;
+        }
+
+    private:
+        bool ensure_mapping() noexcept
+        {
+            if (view_)
+            {
+                return true;
+            }
+            if (mapping_attempted_)
+            {
+                return false;
+            }
+            mapping_attempted_ = true;
+
+            file_ = CreateFileW(
+                win32_extended_path(path_).c_str(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (file_ == INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+
+            LARGE_INTEGER file_size{};
+            if (!GetFileSizeEx(file_, &file_size) || file_size.QuadPart <= 0)
+            {
+                return false;
+            }
+            size_ = static_cast<UInt64>(file_size.QuadPart);
+            if (size_ > static_cast<UInt64>((std::numeric_limits<SIZE_T>::max)()))
+            {
+                return false;
+            }
+
+            mapping_ = CreateFileMappingW(
+                file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
+            if (!mapping_)
+            {
+                return false;
+            }
+
+            view_ = MapViewOfFile(mapping_, FILE_MAP_READ, 0, 0, 0);
+            return view_ != nullptr;
+        }
+
+        std::wstring path_;
+        HANDLE file_ = INVALID_HANDLE_VALUE;
+        HANDLE mapping_ = nullptr;
+        void *view_ = nullptr;
+        UInt64 size_ = 0;
+        bool mapping_attempted_ = false;
+    };
+
+    class PlannedPageHint final
+    {
+    public:
+        using HintSink = std::function<bool(UInt64, UInt64)>;
+
+        PlannedPageHint(UInt64 virtual_size, HintSink sink, ExtractInputTrace *trace)
+            : virtual_size_(virtual_size),
+              sink_(std::move(sink)),
+              trace_(trace),
+              config_(planned_hint_config()) {}
+
+        void begin_plan()
+        {
+            ranges_.clear();
+            active_ = false;
+            building_ = true;
+        }
+
+        void add_plan(UInt64 offset, UInt64 size)
+        {
+            if (!building_ || offset >= virtual_size_ || size == 0)
+            {
+                return;
+            }
+
+            UInt64 end = virtual_size_;
+            if (size != (UInt64)(Int64)-1 && size < virtual_size_ - offset)
+            {
+                end = offset + size;
+            }
+            if (end <= offset)
+            {
+                return;
+            }
+
+            if (!ranges_.empty())
+            {
+                Range &last = ranges_.back();
+                const UInt64 last_end = last.offset + last.size;
+                const UInt64 merge_limit =
+                    last_end > (UInt64)(Int64)-1 - kMergeGap
+                        ? (UInt64)(Int64)-1
+                        : last_end + kMergeGap;
+                if (offset >= last.offset && offset <= merge_limit)
+                {
+                    if (end > last_end)
+                    {
+                        last.size = end - last.offset;
+                    }
+                    return;
+                }
+            }
+
+            ranges_.push_back(Range{offset, end - offset, offset});
+        }
+
+        bool end_plan()
+        {
+            building_ = false;
+            active_ = !ranges_.empty() && static_cast<bool>(sink_) &&
+                      input_prefetch_config().enabled &&
+                      prefetch_virtual_memory_fn() != nullptr;
+            if (active_)
+            {
+                refill_from(ranges_.front().offset);
+            }
+            return active_;
+        }
+
+        bool active() const noexcept { return active_; }
+
+        void observe(UInt64 offset)
+        {
+            if (!active_)
+            {
+                return;
+            }
+
+            const std::size_t index = find_range(offset);
+            if (index >= ranges_.size())
+            {
+                return;
+            }
+
+            Range &range = ranges_[index];
+            const UInt64 threshold =
+                range.hinted_until > config_.refill_bytes
+                    ? range.hinted_until - config_.refill_bytes
+                    : range.offset;
+            if (offset < threshold)
+            {
+                return;
+            }
+            refill_from(offset);
+        }
+
+    private:
+        struct Range
+        {
+            UInt64 offset = 0;
+            UInt64 size = 0;
+            UInt64 hinted_until = 0;
+        };
+
+        static constexpr UInt64 kMergeGap = 64 * 1024;
+
+        std::size_t find_range(UInt64 offset) const noexcept
+        {
+            for (std::size_t index = 0; index < ranges_.size(); ++index)
+            {
+                const Range &range = ranges_[index];
+                const UInt64 end = range.offset + range.size;
+                if (offset < end)
+                {
+                    return index;
+                }
+            }
+            return ranges_.size();
+        }
+
+        void refill_from(UInt64 offset)
+        {
+            UInt64 budget = config_.horizon_bytes;
+            std::size_t index = find_range(offset);
+            while (index < ranges_.size() && budget)
+            {
+                Range &range = ranges_[index];
+                const UInt64 end = range.offset + range.size;
+                UInt64 start = std::max(range.hinted_until, range.offset);
+                if (offset > start && offset < end)
+                {
+                    start = offset;
+                }
+                if (start >= end)
+                {
+                    ++index;
+                    continue;
+                }
+
+                const UInt64 amount = std::min(end - start, budget);
+                const bool ok = sink_(start, amount);
+                range.hinted_until = start + amount;
+                if (trace_ && read_file_timing_enabled())
+                {
+                    ++trace_->planned_hint_count;
+                    trace_->planned_hint_bytes += amount;
+                    if (!ok)
+                    {
+                        ++trace_->planned_hint_failure_count;
+                    }
+                }
+
+                budget -= amount;
+                offset = end;
+                ++index;
+            }
+        }
+
+        UInt64 virtual_size_ = 0;
+        HintSink sink_;
+        ExtractInputTrace *trace_ = nullptr;
+        PlannedHintConfig config_;
+        std::vector<Range> ranges_;
+        bool active_ = false;
+        bool building_ = false;
+    };
+#endif
 
     class SequentialPrefetcher final
     {
