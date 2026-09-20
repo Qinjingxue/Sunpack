@@ -105,6 +105,9 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 
 - Processes large numbers of archives concurrently, and has a concurrency algorithm that distributes work sensibly. In multi-file scenarios there is no need to extract files one by one — just drop them into a directory and they are all extracted quickly and automatically.
 - Handles the high-performance computation and I/O paths in Rust and C++ native code, using overlapped I/O to overlap the read, compute, and output stages of 7z extraction. Resource utilization is good, the output path is tuned separately for mechanical and NVMe drives, and cross-drive writes are direct writes with no staging copy.
+
+* For the 7-Zip backend decoders, zlib-ng was used to accelerate Deflate decompression, while parallel decoding was implemented to improve RAR and BZip2 decompression performance.
+
 - Has a rich set of benchmark cases for various scenarios, and is optimized for those benchmarks close to the maintainability limit.
 
 ### Low background resource usage

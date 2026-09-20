@@ -48,508 +48,500 @@ Note: original-unrar claims that encoder has limitation for Distance:
   MAX_INC_LZ_MATCH = 0x1001 + 3;
 */
 
-#define LZ_ERROR_TYPE_NO      0
-#define LZ_ERROR_TYPE_HEADER  1
+#define LZ_ERROR_TYPE_NO 0
+#define LZ_ERROR_TYPE_HEADER 1
 // #define LZ_ERROR_TYPE_SYM     1
-#define LZ_ERROR_TYPE_DIST    2
+#define LZ_ERROR_TYPE_DIST 2
 
-static
-void My_ZeroMemory(void *p, size_t size)
+static void My_ZeroMemory(void *p, size_t size)
 {
-  #if defined(MY_CPU_AMD64) && !defined(_M_ARM64EC) \
-    && defined(Z7_MSC_VER_ORIGINAL) && (Z7_MSC_VER_ORIGINAL <= 1400)
-      // __stosq((UInt64 *)(void *)win, 0, size / 8);
-      /*
-      printf("\n__stosb \n");
-      #define STEP_BIG (1 << 28)
-      for (size_t i = 0; i < ((UInt64)1 << 50); i += STEP_BIG)
-      {
-        printf("\n__stosb end %p\n", (void *)i);
-        __stosb((Byte *)p + i, 0, STEP_BIG);
-      }
-      */
-      // __stosb((Byte *)p, 0, 0);
-      __stosb((Byte *)p, 0, size);
-  #else
-    // SecureZeroMemory (win, STEP);
-    // ZeroMemory(win, STEP);
-    // memset(win, 0, STEP);
-    memset(p, 0, size);
-  #endif
+#if defined(MY_CPU_AMD64) && !defined(_M_ARM64EC) && defined(Z7_MSC_VER_ORIGINAL) && (Z7_MSC_VER_ORIGINAL <= 1400)
+  // __stosq((UInt64 *)(void *)win, 0, size / 8);
+  /*
+  printf("\n__stosb \n");
+  #define STEP_BIG (1 << 28)
+  for (size_t i = 0; i < ((UInt64)1 << 50); i += STEP_BIG)
+  {
+    printf("\n__stosb end %p\n", (void *)i);
+    __stosb((Byte *)p + i, 0, STEP_BIG);
+  }
+  */
+  // __stosb((Byte *)p, 0, 0);
+  __stosb((Byte *)p, 0, size);
+#else
+  // SecureZeroMemory (win, STEP);
+  // ZeroMemory(win, STEP);
+  // memset(win, 0, STEP);
+  memset(p, 0, size);
+#endif
 }
 
-
-
 #ifdef MY_CPU_LE_UNALIGN
-  #define Z7_RAR5_DEC_USE_UNALIGNED_COPY
+#define Z7_RAR5_DEC_USE_UNALIGNED_COPY
 #endif
 
 #ifdef Z7_RAR5_DEC_USE_UNALIGNED_COPY
 
-  #define COPY_CHUNK_SIZE 16
+#define COPY_CHUNK_SIZE 16
 
-    #define COPY_CHUNK_4_2(dest, src) \
-    { \
-      ((UInt32 *)(void *)dest)[0] = ((const UInt32 *)(const void *)src)[0]; \
-      ((UInt32 *)(void *)dest)[1] = ((const UInt32 *)(const void *)src)[1]; \
-      src  += 4 * 2; \
-      dest += 4 * 2; \
-    }
+#define COPY_CHUNK_4_2(dest, src)                                         \
+  {                                                                       \
+    ((UInt32 *)(void *)dest)[0] = ((const UInt32 *)(const void *)src)[0]; \
+    ((UInt32 *)(void *)dest)[1] = ((const UInt32 *)(const void *)src)[1]; \
+    src += 4 * 2;                                                         \
+    dest += 4 * 2;                                                        \
+  }
 
-  /* sse2 doesn't help here in GCC and CLANG.
-     so we disabled sse2 here */
+/* sse2 doesn't help here in GCC and CLANG.
+   so we disabled sse2 here */
 #if 0
-  #if defined(MY_CPU_AMD64)
-    #define Z7_RAR5_DEC_USE_SSE2
-  #elif defined(MY_CPU_X86)
-    #if defined(_MSC_VER) && _MSC_VER >= 1300 && defined(_M_IX86_FP) && (_M_IX86_FP >= 2) \
-      || defined(__SSE2__) \
-      // || 1 == 1  // for debug only
-      #define Z7_RAR5_DEC_USE_SSE2
-    #endif
-  #endif
+#if defined(MY_CPU_AMD64)
+#define Z7_RAR5_DEC_USE_SSE2
+#elif defined(MY_CPU_X86)
+#if defined(_MSC_VER) && _MSC_VER >= 1300 && defined(_M_IX86_FP) && (_M_IX86_FP >= 2) || defined(__SSE2__)
+// || 1 == 1  // for debug only
+#define Z7_RAR5_DEC_USE_SSE2
+#endif
+#endif
 #endif
 
-  #if defined(MY_CPU_ARM64)
+#if defined(MY_CPU_ARM64)
 
-    #define COPY_OFFSET_MIN  16
-    #define COPY_CHUNK1(dest, src) \
-    { \
-      vst1q_u8((uint8_t *)(void *)dest, \
-      vld1q_u8((const uint8_t *)(const void *)src)); \
-      src += 16; \
-      dest += 16; \
-    }
-    
-    #define COPY_CHUNK(dest, src) \
-    { \
-      COPY_CHUNK1(dest, src) \
-      if (dest >= lim) break; \
-      COPY_CHUNK1(dest, src) \
-    }
+#define COPY_OFFSET_MIN 16
+#define COPY_CHUNK1(dest, src)                              \
+  {                                                         \
+    vst1q_u8((uint8_t *)(void *)dest,                       \
+             vld1q_u8((const uint8_t *)(const void *)src)); \
+    src += 16;                                              \
+    dest += 16;                                             \
+  }
 
-  #elif defined(Z7_RAR5_DEC_USE_SSE2)
-    #include <emmintrin.h> // sse2
-    #define COPY_OFFSET_MIN  16
+#define COPY_CHUNK(dest, src) \
+  {                           \
+    COPY_CHUNK1(dest, src)    \
+    if (dest >= lim)          \
+      break;                  \
+    COPY_CHUNK1(dest, src)    \
+  }
 
-    #define COPY_CHUNK1(dest, src) \
-    { \
-      _mm_storeu_si128((__m128i *)(void *)dest, \
-      _mm_loadu_si128((const __m128i *)(const void *)src)); \
-      src += 16; \
-      dest += 16; \
-    }
+#elif defined(Z7_RAR5_DEC_USE_SSE2)
+#include <emmintrin.h> // sse2
+#define COPY_OFFSET_MIN 16
 
-    #define COPY_CHUNK(dest, src) \
-    { \
-      COPY_CHUNK1(dest, src) \
-      if (dest >= lim) break; \
-      COPY_CHUNK1(dest, src) \
-    }
+#define COPY_CHUNK1(dest, src)                                             \
+  {                                                                        \
+    _mm_storeu_si128((__m128i *)(void *)dest,                              \
+                     _mm_loadu_si128((const __m128i *)(const void *)src)); \
+    src += 16;                                                             \
+    dest += 16;                                                            \
+  }
 
-  #elif defined(MY_CPU_64BIT)
-    #define COPY_OFFSET_MIN  8
+#define COPY_CHUNK(dest, src) \
+  {                           \
+    COPY_CHUNK1(dest, src)    \
+    if (dest >= lim)          \
+      break;                  \
+    COPY_CHUNK1(dest, src)    \
+  }
 
-    #define COPY_CHUNK(dest, src) \
-    { \
-      ((UInt64 *)(void *)dest)[0] = ((const UInt64 *)(const void *)src)[0]; \
-      src  += 8 * 1; dest += 8 * 1; \
-      ((UInt64 *)(void *)dest)[0] = ((const UInt64 *)(const void *)src)[0]; \
-      src  += 8 * 1; dest += 8 * 1; \
-    }
+#elif defined(MY_CPU_64BIT)
+#define COPY_OFFSET_MIN 8
 
-  #else
-    #define COPY_OFFSET_MIN  4
+#define COPY_CHUNK(dest, src)                                             \
+  {                                                                       \
+    ((UInt64 *)(void *)dest)[0] = ((const UInt64 *)(const void *)src)[0]; \
+    src += 8 * 1;                                                         \
+    dest += 8 * 1;                                                        \
+    ((UInt64 *)(void *)dest)[0] = ((const UInt64 *)(const void *)src)[0]; \
+    src += 8 * 1;                                                         \
+    dest += 8 * 1;                                                        \
+  }
 
-    #define COPY_CHUNK(dest, src) \
-    { \
-      COPY_CHUNK_4_2(dest, src); \
-      COPY_CHUNK_4_2(dest, src); \
-    }
+#else
+#define COPY_OFFSET_MIN 4
 
-  #endif
+#define COPY_CHUNK(dest, src)  \
+  {                            \
+    COPY_CHUNK_4_2(dest, src); \
+    COPY_CHUNK_4_2(dest, src); \
+  }
+
 #endif
-
+#endif
 
 #ifndef COPY_CHUNK_SIZE
-    #define COPY_OFFSET_MIN  4
-    #define COPY_CHUNK_SIZE  8
-    #define COPY_CHUNK_2(dest, src) \
-    { \
-      const Byte a0 = src[0]; \
-      const Byte a1 = src[1]; \
-      dest[0] = a0; \
-      dest[1] = a1; \
-      src += 2; \
-      dest += 2; \
-    }
-    #define COPY_CHUNK(dest, src) \
-    { \
-      COPY_CHUNK_2(dest, src) \
-      COPY_CHUNK_2(dest, src) \
-      COPY_CHUNK_2(dest, src) \
-      COPY_CHUNK_2(dest, src) \
-    }
+#define COPY_OFFSET_MIN 4
+#define COPY_CHUNK_SIZE 8
+#define COPY_CHUNK_2(dest, src) \
+  {                             \
+    const Byte a0 = src[0];     \
+    const Byte a1 = src[1];     \
+    dest[0] = a0;               \
+    dest[1] = a1;               \
+    src += 2;                   \
+    dest += 2;                  \
+  }
+#define COPY_CHUNK(dest, src)         \
+  {                                   \
+      COPY_CHUNK_2(dest, src)         \
+          COPY_CHUNK_2(dest, src)     \
+              COPY_CHUNK_2(dest, src) \
+                  COPY_CHUNK_2(dest, src)}
 #endif
 
+#define COPY_CHUNKS                             \
+  {                                             \
+    Z7_PRAGMA_OPT_DISABLE_LOOP_UNROLL_VECTORIZE \
+    do                                          \
+    {                                           \
+      COPY_CHUNK(dest, src)                     \
+    } while (dest < lim);                       \
+  }
 
-#define COPY_CHUNKS \
-{ \
-  Z7_PRAGMA_OPT_DISABLE_LOOP_UNROLL_VECTORIZE \
-  do { COPY_CHUNK(dest, src) } \
-  while (dest < lim); \
-}
-
-namespace NCompress {
-namespace NRar5 {
-
-typedef
-#if 1
-  unsigned
-#else
-  size_t
-#endif
-  CLenType;
-
-// (len != 0)
-static
-Z7_FORCE_INLINE
-// Z7_ATTRIB_NO_VECTOR
-void CopyMatch(size_t offset, Byte *dest, const Byte *src, const Byte *lim)
+namespace NCompress
 {
+  namespace NRar5
   {
-    // (COPY_OFFSET_MIN >= 4)
-    if (offset >= COPY_OFFSET_MIN)
+
+    typedef
+#if 1
+        unsigned
+#else
+        size_t
+#endif
+            CLenType;
+
+    // (len != 0)
+    static Z7_FORCE_INLINE
+        // Z7_ATTRIB_NO_VECTOR
+        void CopyMatch(size_t offset, Byte *dest, const Byte *src, const Byte *lim)
     {
-      COPY_CHUNKS
-      // return;
-    }
-    else
-  #if (COPY_OFFSET_MIN > 4)
-    #if COPY_CHUNK_SIZE < 8
-      #error Stop_Compiling_Bad_COPY_CHUNK_SIZE
-    #endif
-    if (offset >= 4)
-    {
-      Z7_PRAGMA_OPT_DISABLE_LOOP_UNROLL_VECTORIZE
-      do
       {
-        COPY_CHUNK_4_2(dest, src)
-        #if COPY_CHUNK_SIZE < 16
-          if (dest >= lim) break;
-        #endif
-        COPY_CHUNK_4_2(dest, src)
-      }
-      while (dest < lim);
-      // return;
-    }
-    else
-  #endif
-    {
-      // (offset < 4)
-      const unsigned b0 = src[0];
-      if (offset < 2)
-      {
-      #if defined(Z7_RAR5_DEC_USE_UNALIGNED_COPY) && (COPY_CHUNK_SIZE == 16)
-        #if defined(MY_CPU_64BIT)
+        // (COPY_OFFSET_MIN >= 4)
+        if (offset >= COPY_OFFSET_MIN)
         {
-          const UInt64 v64 = (UInt64)b0 * 0x0101010101010101;
+          COPY_CHUNKS
+          // return;
+        }
+        else
+#if (COPY_OFFSET_MIN > 4)
+#if COPY_CHUNK_SIZE < 8
+#error Stop_Compiling_Bad_COPY_CHUNK_SIZE
+#endif
+            if (offset >= 4)
+        {
           Z7_PRAGMA_OPT_DISABLE_LOOP_UNROLL_VECTORIZE
           do
           {
-            ((UInt64 *)(void *)dest)[0] = v64;
-            ((UInt64 *)(void *)dest)[1] = v64;
-            dest += 16;
-          }
-          while (dest < lim);
+            COPY_CHUNK_4_2(dest, src)
+#if COPY_CHUNK_SIZE < 16
+            if (dest >= lim)
+              break;
+#endif
+            COPY_CHUNK_4_2(dest, src)
+          } while (dest < lim);
+          // return;
         }
-        #else
+        else
+#endif
         {
-          UInt32 v = b0;
-          v |= v << 8;
-          v |= v << 16;
-          do
+          // (offset < 4)
+          const unsigned b0 = src[0];
+          if (offset < 2)
           {
-            ((UInt32 *)(void *)dest)[0] = v;
-            ((UInt32 *)(void *)dest)[1] = v;
-            dest += 8;
-            ((UInt32 *)(void *)dest)[0] = v;
-            ((UInt32 *)(void *)dest)[1] = v;
-            dest += 8;
+#if defined(Z7_RAR5_DEC_USE_UNALIGNED_COPY) && (COPY_CHUNK_SIZE == 16)
+#if defined(MY_CPU_64BIT)
+            {
+              const UInt64 v64 = (UInt64)b0 * 0x0101010101010101;
+              Z7_PRAGMA_OPT_DISABLE_LOOP_UNROLL_VECTORIZE
+              do
+              {
+                ((UInt64 *)(void *)dest)[0] = v64;
+                ((UInt64 *)(void *)dest)[1] = v64;
+                dest += 16;
+              } while (dest < lim);
+            }
+#else
+            {
+              UInt32 v = b0;
+              v |= v << 8;
+              v |= v << 16;
+              do
+              {
+                ((UInt32 *)(void *)dest)[0] = v;
+                ((UInt32 *)(void *)dest)[1] = v;
+                dest += 8;
+                ((UInt32 *)(void *)dest)[0] = v;
+                ((UInt32 *)(void *)dest)[1] = v;
+                dest += 8;
+              } while (dest < lim);
+            }
+#endif
+#else
+            do
+            {
+              dest[0] = (Byte)b0;
+              dest[1] = (Byte)b0;
+              dest += 2;
+              dest[0] = (Byte)b0;
+              dest[1] = (Byte)b0;
+              dest += 2;
+            } while (dest < lim);
+#endif
           }
-          while (dest < lim);
-        }
-        #endif
-      #else
-        do
-        {
-          dest[0] = (Byte)b0;
-          dest[1] = (Byte)b0;
-          dest += 2;
-          dest[0] = (Byte)b0;
-          dest[1] = (Byte)b0;
-          dest += 2;
-        }
-        while (dest < lim);
-      #endif
-      }
-      else if (offset == 2)
-      {
-        const Byte b1 = src[1];
-        {
-          do
+          else if (offset == 2)
           {
-            dest[0] = (Byte)b0;
-            dest[1] = b1;
-            dest += 2;
+            const Byte b1 = src[1];
+            {
+              do
+              {
+                dest[0] = (Byte)b0;
+                dest[1] = b1;
+                dest += 2;
+              } while (dest < lim);
+            }
           }
-          while (dest < lim);
+          else // (offset == 3)
+          {
+            const Byte b1 = src[1];
+            const Byte b2 = src[2];
+            do
+            {
+              dest[0] = (Byte)b0;
+              dest[1] = b1;
+              dest[2] = b2;
+              dest += 3;
+            } while (dest < lim);
+          }
         }
-      }
-      else // (offset == 3)
-      {
-        const Byte b1 = src[1];
-        const Byte b2 = src[2];
-        do
-        {
-          dest[0] = (Byte)b0;
-          dest[1] = b1;
-          dest[2] = b2;
-          dest += 3;
-        }
-        while (dest < lim);
       }
     }
-  }
-}
 
-static const size_t kInputBufSize = 1 << 20;
-static const UInt32   k_Filter_BlockSize_MAX = 1 << 22;
-static const unsigned k_Filter_AfterPad_Size = 64;
+    static const size_t kInputBufSize = 1 << 20;
+    static const UInt32 k_Filter_BlockSize_MAX = 1 << 22;
+    static const unsigned k_Filter_AfterPad_Size = 64;
 
 #ifdef Z7_RAR5_SHOW_STAT
-static const unsigned kNumStats1 = 10;
-static const unsigned kNumStats2 = (1 << 12) + 16;
-static UInt32 g_stats1[kNumStats1];
-static UInt32 g_stats2[kNumStats1][kNumStats2];
+    static const unsigned kNumStats1 = 10;
+    static const unsigned kNumStats2 = (1 << 12) + 16;
+    static UInt32 g_stats1[kNumStats1];
+    static UInt32 g_stats2[kNumStats1][kNumStats2];
 #endif
 
 #if 1
-MY_ALIGN(32)
-// DICT_SIZE_BITS_MAX-1 are required
-static const Byte k_LenPlusTable[DICT_SIZE_BITS_MAX] =
-  { 0,0,0,0,0,0,0,1,1,1,1,1,2,2,2,2,2,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3 };
+    MY_ALIGN(32)
+    // DICT_SIZE_BITS_MAX-1 are required
+    static const Byte k_LenPlusTable[DICT_SIZE_BITS_MAX] =
+        {0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3};
 #endif
 
-
-
-class CBitDecoder
-{
-public:
-  const Byte *_buf;
-  const Byte *_bufCheck_Block;  // min(ptr for _blockEnd, _bufCheck)
-  unsigned _bitPos;             // = [0 ... 7]
-  bool _wasFinished;
-  bool _minorError;
-  unsigned _blockEndBits7;      // = [0 ... 7] : the number of additional bits in (_blockEnd) poisition.
-  HRESULT _hres;
-  const Byte *_bufCheck;        // relaxed limit (16 bytes before real end of input data in buffer)
-  Byte *_bufLim;                // end if input data
-  Byte *_bufBase;
-  ISequentialInStream *_stream;
-
-  UInt64 _processedSize;
-  UInt64 _blockEnd;     // absolute end of current block
-      // but it doesn't include additional _blockEndBits7 [0 ... 7] bits
-
-  Z7_FORCE_INLINE
-  void CopyFrom(const CBitDecoder &a)
-  {
-    _buf = a._buf;
-    _bufCheck_Block = a._bufCheck_Block;
-    _bitPos = a._bitPos;
-    _wasFinished = a._wasFinished;
-    _blockEndBits7 = a._blockEndBits7;
-    _bufCheck = a._bufCheck;
-    _bufLim = a._bufLim;
-    _bufBase = a._bufBase;
-    
-    _processedSize = a._processedSize;
-    _blockEnd = a._blockEnd;
-  }
-
-  Z7_FORCE_INLINE
-  void RestoreFrom2(const CBitDecoder &a)
-  {
-    _buf = a._buf;
-    _bitPos = a._bitPos;
-  }
-
-  Z7_FORCE_INLINE
-  void SetCheck_forBlock()
-  {
-    _bufCheck_Block = _bufCheck;
-    if (_bufCheck > _buf)
+    class CBitDecoder
     {
-      const UInt64 processed = GetProcessedSize_Round();
-      if (_blockEnd < processed)
-        _bufCheck_Block = _buf;
-      else
+    public:
+      const Byte *_buf;
+      const Byte *_bufCheck_Block; // min(ptr for _blockEnd, _bufCheck)
+      unsigned _bitPos;            // = [0 ... 7]
+      bool _wasFinished;
+      bool _minorError;
+      unsigned _blockEndBits7; // = [0 ... 7] : the number of additional bits in (_blockEnd) poisition.
+      HRESULT _hres;
+      const Byte *_bufCheck; // relaxed limit (16 bytes before real end of input data in buffer)
+      Byte *_bufLim;         // end if input data
+      Byte *_bufBase;
+      ISequentialInStream *_stream;
+
+      UInt64 _processedSize;
+      UInt64 _blockEnd; // absolute end of current block
+                        // but it doesn't include additional _blockEndBits7 [0 ... 7] bits
+
+      Z7_FORCE_INLINE
+      void CopyFrom(const CBitDecoder &a)
       {
-        const UInt64 delta = _blockEnd - processed;
-        if ((size_t)(_bufCheck - _buf) > delta)
-          _bufCheck_Block = _buf + (size_t)delta;
+        _buf = a._buf;
+        _bufCheck_Block = a._bufCheck_Block;
+        _bitPos = a._bitPos;
+        _wasFinished = a._wasFinished;
+        _blockEndBits7 = a._blockEndBits7;
+        _bufCheck = a._bufCheck;
+        _bufLim = a._bufLim;
+        _bufBase = a._bufBase;
+
+        _processedSize = a._processedSize;
+        _blockEnd = a._blockEnd;
       }
-    }
-  }
 
-  Z7_FORCE_INLINE
-  bool IsBlockOverRead() const
-  {
-    const UInt64 v = GetProcessedSize_Round();
-    if (v < _blockEnd) return false;
-    if (v > _blockEnd) return true;
-    return _bitPos > _blockEndBits7;
-  }
+      Z7_FORCE_INLINE
+      void RestoreFrom2(const CBitDecoder &a)
+      {
+        _buf = a._buf;
+        _bitPos = a._bitPos;
+      }
 
-  /*
-  CBitDecoder() throw():
-      _buf(0),
-      _bufLim(0),
-      _bufBase(0),
-      _stream(0),
-      _processedSize(0),
-      _wasFinished(false)
-      {}
-  */
+      Z7_FORCE_INLINE
+      void SetCheck_forBlock()
+      {
+        _bufCheck_Block = _bufCheck;
+        if (_bufCheck > _buf)
+        {
+          const UInt64 processed = GetProcessedSize_Round();
+          if (_blockEnd < processed)
+            _bufCheck_Block = _buf;
+          else
+          {
+            const UInt64 delta = _blockEnd - processed;
+            if ((size_t)(_bufCheck - _buf) > delta)
+              _bufCheck_Block = _buf + (size_t)delta;
+          }
+        }
+      }
 
-  Z7_FORCE_INLINE
-  void Init() throw()
-  {
-    _blockEnd = 0;
-    _blockEndBits7 = 0;
+      Z7_FORCE_INLINE
+      bool IsBlockOverRead() const
+      {
+        const UInt64 v = GetProcessedSize_Round();
+        if (v < _blockEnd)
+          return false;
+        if (v > _blockEnd)
+          return true;
+        return _bitPos > _blockEndBits7;
+      }
 
-    _bitPos = 0;
-    _processedSize = 0;
-    _buf = _bufBase;
-    _bufLim = _bufBase;
-    _bufCheck = _buf;
-    _bufCheck_Block = _buf;
-    _wasFinished = false;
-    _minorError = false;
-  }
+      /*
+      CBitDecoder() throw():
+          _buf(0),
+          _bufLim(0),
+          _bufBase(0),
+          _stream(0),
+          _processedSize(0),
+          _wasFinished(false)
+          {}
+      */
 
-  void Prepare2() throw();
+      Z7_FORCE_INLINE
+      void Init() throw()
+      {
+        _blockEnd = 0;
+        _blockEndBits7 = 0;
 
-  Z7_FORCE_INLINE
-  void Prepare() throw()
-  {
-    if (_buf >= _bufCheck)
-      Prepare2();
-  }
+        _bitPos = 0;
+        _processedSize = 0;
+        _buf = _bufBase;
+        _bufLim = _bufBase;
+        _bufCheck = _buf;
+        _bufCheck_Block = _buf;
+        _wasFinished = false;
+        _minorError = false;
+      }
 
-  Z7_FORCE_INLINE
-  bool ExtraBitsWereRead() const
-  {
-    return _buf >= _bufLim && (_buf > _bufLim || _bitPos != 0);
-  }
+      void Prepare2() throw();
 
-  Z7_FORCE_INLINE bool InputEofError() const { return ExtraBitsWereRead(); }
+      Z7_FORCE_INLINE
+      void Prepare() throw()
+      {
+        if (_buf >= _bufCheck)
+          Prepare2();
+      }
 
-  Z7_FORCE_INLINE unsigned GetProcessedBits7() const { return _bitPos; }
-  Z7_FORCE_INLINE UInt64 GetProcessedSize_Round() const { return _processedSize + (size_t)(_buf - _bufBase); }
-  Z7_FORCE_INLINE UInt64 GetProcessedSize() const { return _processedSize + (size_t)(_buf - _bufBase) + ((_bitPos + 7) >> 3); }
+      Z7_FORCE_INLINE
+      bool ExtraBitsWereRead() const
+      {
+        return _buf >= _bufLim && (_buf > _bufLim || _bitPos != 0);
+      }
 
-  Z7_FORCE_INLINE
-  void AlignToByte()
-  {
-    if (_bitPos != 0)
-    {
+      Z7_FORCE_INLINE bool InputEofError() const { return ExtraBitsWereRead(); }
+
+      Z7_FORCE_INLINE unsigned GetProcessedBits7() const { return _bitPos; }
+      Z7_FORCE_INLINE UInt64 GetProcessedSize_Round() const { return _processedSize + (size_t)(_buf - _bufBase); }
+      Z7_FORCE_INLINE UInt64 GetProcessedSize() const { return _processedSize + (size_t)(_buf - _bufBase) + ((_bitPos + 7) >> 3); }
+
+      Z7_FORCE_INLINE
+      void AlignToByte()
+      {
+        if (_bitPos != 0)
+        {
 #if 1
-      // optional check of unused bits for strict checking:
-      // original-unrar doesn't check it:
-      const unsigned b = (unsigned)*_buf << _bitPos;
-      if (b & 0xff)
-        _minorError = true;
+          // optional check of unused bits for strict checking:
+          // original-unrar doesn't check it:
+          const unsigned b = (unsigned)*_buf << _bitPos;
+          if (b & 0xff)
+            _minorError = true;
 #endif
-      _buf++;
-      _bitPos = 0;
-    }
-    // _buf += (_bitPos + 7) >> 3;
-    // _bitPos = 0;
-  }
+          _buf++;
+          _bitPos = 0;
+        }
+        // _buf += (_bitPos + 7) >> 3;
+        // _bitPos = 0;
+      }
 
-  Z7_FORCE_INLINE
-  Byte ReadByte_InAligned()
-  {
-    return *_buf++;
-  }
+      Z7_FORCE_INLINE
+      Byte ReadByte_InAligned()
+      {
+        return *_buf++;
+      }
 
-  Z7_FORCE_INLINE
-  UInt32 GetValue(unsigned numBits) const
-  {
-    // 0 < numBits <= 17 : supported values
+      Z7_FORCE_INLINE
+      UInt32 GetValue(unsigned numBits) const
+      {
+        // 0 < numBits <= 17 : supported values
 #if defined(Z7_CPU_FAST_BSWAP_SUPPORTED) && defined(MY_CPU_LE_UNALIGN)
-    UInt32 v = GetBe32(_buf);
+        UInt32 v = GetBe32(_buf);
 #if 1
-    return (v >> (32 - numBits - _bitPos)) & ((1u << numBits) - 1);
+        return (v >> (32 - numBits - _bitPos)) & ((1u << numBits) - 1);
 #else
-    return (v << _bitPos) >> (32 - numBits);
+        return (v << _bitPos) >> (32 - numBits);
 #endif
 #else
-    UInt32 v = ((UInt32)_buf[0] << 16) | ((UInt32)_buf[1] << 8) | (UInt32)_buf[2];
-    v >>= 24 - numBits - _bitPos;
-    return v & ((1 << numBits) - 1);
+        UInt32 v = ((UInt32)_buf[0] << 16) | ((UInt32)_buf[1] << 8) | (UInt32)_buf[2];
+        v >>= 24 - numBits - _bitPos;
+        return v & ((1 << numBits) - 1);
 #endif
-  }
+      }
 
-  Z7_FORCE_INLINE
-  UInt32 GetValue_InHigh32bits() const
-  {
-    // 0 < numBits <= 17 : supported vales
+      Z7_FORCE_INLINE
+      UInt32 GetValue_InHigh32bits() const
+      {
+        // 0 < numBits <= 17 : supported vales
 #if defined(Z7_CPU_FAST_BSWAP_SUPPORTED) && defined(MY_CPU_LE_UNALIGN)
-    return GetBe32(_buf) << _bitPos;
+        return GetBe32(_buf) << _bitPos;
 #else
-    const UInt32 v = ((UInt32)_buf[0] << 16) | ((UInt32)_buf[1] << 8) | (UInt32)_buf[2];
-    return v << (_bitPos + 8);
+        const UInt32 v = ((UInt32)_buf[0] << 16) | ((UInt32)_buf[1] << 8) | (UInt32)_buf[2];
+        return v << (_bitPos + 8);
 #endif
-  }
-  
+      }
 
-  Z7_FORCE_INLINE
-  void MovePos(unsigned numBits)
-  {
-    numBits += _bitPos;
-    _buf += numBits >> 3;
-    _bitPos = numBits & 7;
-  }
-    
+      Z7_FORCE_INLINE
+      void MovePos(unsigned numBits)
+      {
+        numBits += _bitPos;
+        _buf += numBits >> 3;
+        _bitPos = numBits & 7;
+      }
 
-  Z7_FORCE_INLINE
-  UInt32 ReadBits9(unsigned numBits)
-  {
-    const Byte *buf = _buf;
-    UInt32 v = ((UInt32)buf[0] << 8) | (UInt32)buf[1];
-    v &= (UInt32)0xFFFF >> _bitPos;
-    numBits += _bitPos;
-    v >>= 16 - numBits;
-    _buf = buf + (numBits >> 3);
-    _bitPos = numBits & 7;
-    return v;
-  }
+      Z7_FORCE_INLINE
+      UInt32 ReadBits9(unsigned numBits)
+      {
+        const Byte *buf = _buf;
+        UInt32 v = ((UInt32)buf[0] << 8) | (UInt32)buf[1];
+        v &= (UInt32)0xFFFF >> _bitPos;
+        numBits += _bitPos;
+        v >>= 16 - numBits;
+        _buf = buf + (numBits >> 3);
+        _bitPos = numBits & 7;
+        return v;
+      }
 
-  Z7_FORCE_INLINE
-  UInt32 ReadBits_9fix(unsigned numBits)
-  {
-    const Byte *buf = _buf;
-    UInt32 v = ((UInt32)buf[0] << 8) | (UInt32)buf[1];
-    const UInt32 mask = (1u << numBits) - 1;
-    numBits += _bitPos;
-    v >>= 16 - numBits;
-    _buf = buf + (numBits >> 3);
-    _bitPos = numBits & 7;
-    return v & mask;
-  }
+      Z7_FORCE_INLINE
+      UInt32 ReadBits_9fix(unsigned numBits)
+      {
+        const Byte *buf = _buf;
+        UInt32 v = ((UInt32)buf[0] << 8) | (UInt32)buf[1];
+        const UInt32 mask = (1u << numBits) - 1;
+        numBits += _bitPos;
+        v >>= 16 - numBits;
+        _buf = buf + (numBits >> 3);
+        _bitPos = numBits & 7;
+        return v & mask;
+      }
 
 #if 1 && defined(MY_CPU_SIZEOF_POINTER) && (MY_CPU_SIZEOF_POINTER == 8)
 #define Z7_RAR5_USE_64BIT
@@ -563,40 +555,40 @@ public:
 
 #ifdef Z7_RAR5_USE_64BIT
 
-  Z7_FORCE_INLINE
-  size_t ReadBits_Big(unsigned numBits, UInt64 v)
-  {
-    const UInt64 mask = ((UInt64)1 << numBits) - 1;
-    numBits += _bitPos;
-    const Byte *buf = _buf;
-    // UInt64 v = GetBe64(buf);
-    v >>= 64 - numBits;
-    _buf = buf + (numBits >> 3);
-    _bitPos = numBits & 7;
-    return (size_t)(v & mask);
-  }
-  #define ReadBits_Big25 ReadBits_Big
+      Z7_FORCE_INLINE
+      size_t ReadBits_Big(unsigned numBits, UInt64 v)
+      {
+        const UInt64 mask = ((UInt64)1 << numBits) - 1;
+        numBits += _bitPos;
+        const Byte *buf = _buf;
+        // UInt64 v = GetBe64(buf);
+        v >>= 64 - numBits;
+        _buf = buf + (numBits >> 3);
+        _bitPos = numBits & 7;
+        return (size_t)(v & mask);
+      }
+#define ReadBits_Big25 ReadBits_Big
 
 #else
 
-  // (numBits <= 25) for 32-bit mode
-  Z7_FORCE_INLINE
-  size_t ReadBits_Big25(unsigned numBits, UInt32 v)
-  {
-    const UInt32 mask = ((UInt32)1 << numBits) - 1;
-    numBits += _bitPos;
-    v >>= 32 - numBits;
-    _buf += numBits >> 3;
-    _bitPos = numBits & 7;
-    return v & mask;
-  }
+      // (numBits <= 25) for 32-bit mode
+      Z7_FORCE_INLINE
+      size_t ReadBits_Big25(unsigned numBits, UInt32 v)
+      {
+        const UInt32 mask = ((UInt32)1 << numBits) - 1;
+        numBits += _bitPos;
+        v >>= 32 - numBits;
+        _buf += numBits >> 3;
+        _bitPos = numBits & 7;
+        return v & mask;
+      }
 
-  // numBits != 0
-  Z7_FORCE_INLINE
-  size_t ReadBits_Big(unsigned numBits, UInt32 v)
-  {
-    const Byte *buf = _buf;
-    // UInt32 v = GetBe32(buf);
+      // numBits != 0
+      Z7_FORCE_INLINE
+      size_t ReadBits_Big(unsigned numBits, UInt32 v)
+      {
+        const Byte *buf = _buf;
+        // UInt32 v = GetBe32(buf);
 #if 0
     const UInt32 mask = ((UInt32)1 << numBits) - 1;
     numBits += _bitPos;
@@ -611,201 +603,193 @@ public:
     _bitPos = numBits & 7;
     return v & mask;
 #else
-    v <<= _bitPos;
-    v |= (UInt32)buf[4] >> (8 - _bitPos);
-    v >>= 32 - numBits;
-    numBits += _bitPos;
-    _buf = buf + (numBits >> 3);
-    _bitPos = numBits & 7;
-    return v;
+        v <<= _bitPos;
+        v |= (UInt32)buf[4] >> (8 - _bitPos);
+        v >>= 32 - numBits;
+        numBits += _bitPos;
+        _buf = buf + (numBits >> 3);
+        _bitPos = numBits & 7;
+        return v;
 #endif
-  }
-#endif
-};
-
-
-static const unsigned kLookaheadSize = 16;
-static const unsigned kInputBufferPadZone = kLookaheadSize;
-
-Z7_NO_INLINE
-void CBitDecoder::Prepare2() throw()
-{
-  if (_buf > _bufLim)
-    return;
-
-  size_t rem = (size_t)(_bufLim - _buf);
-  if (rem != 0)
-    memmove(_bufBase, _buf, rem);
-
-  _bufLim = _bufBase + rem;
-  _processedSize += (size_t)(_buf - _bufBase);
-  _buf = _bufBase;
-
-  // we do not look ahead more than 16 bytes before limit checks.
-
-  if (!_wasFinished)
-  {
-    while (rem <= kLookaheadSize)
-    {
-      UInt32 processed = (UInt32)(kInputBufSize - rem);
-      // processed = 33; // for debug
-      _hres = _stream->Read(_bufLim, processed, &processed);
-      _bufLim += processed;
-      rem += processed;
-      if (processed == 0 || _hres != S_OK)
-      {
-        _wasFinished = true;
-        // if (_hres != S_OK) throw CInBufferException(result);
-        break;
       }
+#endif
+    };
+
+    static const unsigned kLookaheadSize = 16;
+    static const unsigned kInputBufferPadZone = kLookaheadSize;
+
+    Z7_NO_INLINE
+    void CBitDecoder::Prepare2() throw()
+    {
+      if (_buf > _bufLim)
+        return;
+
+      size_t rem = (size_t)(_bufLim - _buf);
+      if (rem != 0)
+        memmove(_bufBase, _buf, rem);
+
+      _bufLim = _bufBase + rem;
+      _processedSize += (size_t)(_buf - _bufBase);
+      _buf = _bufBase;
+
+      // we do not look ahead more than 16 bytes before limit checks.
+
+      if (!_wasFinished)
+      {
+        while (rem <= kLookaheadSize)
+        {
+          UInt32 processed = (UInt32)(kInputBufSize - rem);
+          // processed = 33; // for debug
+          _hres = _stream->Read(_bufLim, processed, &processed);
+          _bufLim += processed;
+          rem += processed;
+          if (processed == 0 || _hres != S_OK)
+          {
+            _wasFinished = true;
+            // if (_hres != S_OK) throw CInBufferException(result);
+            break;
+          }
+        }
+      }
+
+      // we always fill pad zone here.
+      // so we don't need to call Prepare2() if (_wasFinished == true)
+      memset(_bufLim, 0xFF, kLookaheadSize);
+
+      if (rem < kLookaheadSize)
+      {
+        _bufCheck = _buf;
+        // memset(_bufLim, 0xFF, kLookaheadSize - rem);
+      }
+      else
+        _bufCheck = _bufLim - kLookaheadSize;
+
+      SetCheck_forBlock();
     }
-  }
 
-  // we always fill pad zone here.
-  // so we don't need to call Prepare2() if (_wasFinished == true)
-  memset(_bufLim, 0xFF, kLookaheadSize);
+    enum FilterType
+    {
+      FILTER_DELTA = 0,
+      FILTER_E8,
+      FILTER_E8E9,
+      FILTER_ARM
+    };
 
-  if (rem < kLookaheadSize)
-  {
-    _bufCheck = _buf;
-    // memset(_bufLim, 0xFF, kLookaheadSize - rem);
-  }
-  else
-    _bufCheck = _bufLim - kLookaheadSize;
+    static const size_t kWriteStep = (size_t)1 << 18;
+    // (size_t)1 << 22; // original-unrar
 
-  SetCheck_forBlock();
-}
+    // Original unRAR claims that maximum possible filter block size is (1 << 16) now,
+    // and (1 << 17) is minimum win size required to support filter.
+    // Original unRAR uses (1u << 18) for "extra safety and possible filter area size expansion"
+    // We can use any win size, but we use same (1u << 18) for compatibility
+    // with WinRar
 
-
-enum FilterType
-{
-  FILTER_DELTA = 0,
-  FILTER_E8,
-  FILTER_E8E9,
-  FILTER_ARM
-};
-
-static const size_t kWriteStep = (size_t)1 << 18;
-      // (size_t)1 << 22; // original-unrar
-
-// Original unRAR claims that maximum possible filter block size is (1 << 16) now,
-// and (1 << 17) is minimum win size required to support filter.
-// Original unRAR uses (1u << 18) for "extra safety and possible filter area size expansion"
-// We can use any win size, but we use same (1u << 18) for compatibility
-// with WinRar
-
-// static const unsigned kWinSize_Log_Min = 17;
-static const size_t kWinSize_Min = 1u << 18;
+    // static const unsigned kWinSize_Log_Min = 17;
+    static const size_t kWinSize_Min = 1u << 18;
 
 #ifndef Z7_ST
-static void DestroyRar5ParallelBlockPool(CRar5ParallelBlockPool *pool);
+    static void DestroyRar5ParallelBlockPool(CRar5ParallelBlockPool *pool);
 #endif
 
-CDecoder::CDecoder():
-    _isSolid(false),
-    _is_v7(false),
-    _wasInit(false),
-    // _dictSizeLog(0),
-    _dictSize(kWinSize_Min),
-    _window(NULL),
-    _winPos(0),
-    _winSize(0),
-    _dictSize_forCheck(0),
-    _lzSize(0),
-    _lzEnd(0),
-    _writtenFileSize(0),
-    _filters(NULL),
-    _winSize_Allocated(0),
-    _inputBuf(NULL)
+    CDecoder::CDecoder() : _isSolid(false),
+                           _is_v7(false),
+                           _wasInit(false),
+                           // _dictSizeLog(0),
+                           _dictSize(kWinSize_Min),
+                           _window(NULL),
+                           _winPos(0),
+                           _winSize(0),
+                           _dictSize_forCheck(0),
+                           _lzSize(0),
+                           _lzEnd(0),
+                           _writtenFileSize(0),
+                           _filters(NULL),
+                           _winSize_Allocated(0),
+                           _inputBuf(NULL)
 #ifndef Z7_ST
-    , _numThreads(1)
-    , _mtPool(NULL)
-    , _mtPoolWorkers(0)
+                           ,
+                           _numThreads(1), _mtPool(NULL), _mtPoolWorkers(0)
 #endif
-{
+    {
 #if 1
-  memcpy(m_LenPlusTable, k_LenPlusTable, sizeof(k_LenPlusTable));
+      memcpy(m_LenPlusTable, k_LenPlusTable, sizeof(k_LenPlusTable));
 #endif
-  // printf("\nsizeof(CDecoder) == %d\n", sizeof(CDecoder));
-}
+      // printf("\nsizeof(CDecoder) == %d\n", sizeof(CDecoder));
+    }
 
-CDecoder::~CDecoder()
-{
+    CDecoder::~CDecoder()
+    {
 #ifdef Z7_RAR5_SHOW_STAT
-  printf("\n%4d :", 0);
-  for (unsigned k = 0; k < kNumStats1; k++)
-    printf(" %8u", (unsigned)g_stats1[k]);
-  printf("\n");
-  for (unsigned i = 0; i < kNumStats2; i++)
-  {
-    printf("\n%4d :", i);
-    for (unsigned k = 0; k < kNumStats1; k++)
-      printf(" %8u", (unsigned)g_stats2[k][i]);
-  }
-  printf("\n");
+      printf("\n%4d :", 0);
+      for (unsigned k = 0; k < kNumStats1; k++)
+        printf(" %8u", (unsigned)g_stats1[k]);
+      printf("\n");
+      for (unsigned i = 0; i < kNumStats2; i++)
+      {
+        printf("\n%4d :", i);
+        for (unsigned k = 0; k < kNumStats1; k++)
+          printf(" %8u", (unsigned)g_stats2[k][i]);
+      }
+      printf("\n");
 #endif
 
 #define Z7_RAR_FREE_WINDOW ::BigFree(_window);
 
 #ifndef Z7_ST
-  DestroyRar5ParallelBlockPool(_mtPool);
-  _mtPool = NULL;
-  _mtPoolWorkers = 0;
+      DestroyRar5ParallelBlockPool(_mtPool);
+      _mtPool = NULL;
+      _mtPoolWorkers = 0;
 #endif
 
-  Z7_RAR_FREE_WINDOW
-  z7_AlignedFree(_inputBuf);
-  z7_AlignedFree(_filters);
-}
-
-Z7_NO_INLINE
-void CDecoder::DeleteUnusedFilters()
-{
-  if (_numUnusedFilters != 0)
-  {
-    // printf("\nDeleteUnusedFilters _numFilters = %6u\n", _numFilters);
-    const unsigned n = _numFilters - _numUnusedFilters;
-    _numFilters = n;
-    memmove(_filters, _filters + _numUnusedFilters, n * sizeof(CFilter));
-    _numUnusedFilters = 0;
-  }
-}
-
-
-Z7_NO_INLINE
-HRESULT CDecoder::WriteData(const Byte *data, size_t size)
-{
-  HRESULT res = S_OK;
-  if (!_unpackSize_Defined || _writtenFileSize < _unpackSize)
-  {
-    size_t cur = size;
-    if (_unpackSize_Defined)
-    {
-      const UInt64 rem = _unpackSize - _writtenFileSize;
-      if (cur > rem)
-        cur = (size_t)rem;
+      Z7_RAR_FREE_WINDOW
+      z7_AlignedFree(_inputBuf);
+      z7_AlignedFree(_filters);
     }
-    res = WriteStream(_outStream, data, cur);
-    if (res != S_OK)
-      _writeError = true;
-  }
-  _writtenFileSize += size;
-  return res;
-}
 
+    Z7_NO_INLINE
+    void CDecoder::DeleteUnusedFilters()
+    {
+      if (_numUnusedFilters != 0)
+      {
+        // printf("\nDeleteUnusedFilters _numFilters = %6u\n", _numFilters);
+        const unsigned n = _numFilters - _numUnusedFilters;
+        _numFilters = n;
+        memmove(_filters, _filters + _numUnusedFilters, n * sizeof(CFilter));
+        _numUnusedFilters = 0;
+      }
+    }
 
-#if defined(MY_CPU_SIZEOF_POINTER) \
-    && ( MY_CPU_SIZEOF_POINTER == 4 \
-      || MY_CPU_SIZEOF_POINTER == 8)
-  #define BR_CONV_USE_OPT_PC_PTR
+    Z7_NO_INLINE
+    HRESULT CDecoder::WriteData(const Byte *data, size_t size)
+    {
+      HRESULT res = S_OK;
+      if (!_unpackSize_Defined || _writtenFileSize < _unpackSize)
+      {
+        size_t cur = size;
+        if (_unpackSize_Defined)
+        {
+          const UInt64 rem = _unpackSize - _writtenFileSize;
+          if (cur > rem)
+            cur = (size_t)rem;
+        }
+        res = WriteStream(_outStream, data, cur);
+        if (res != S_OK)
+          _writeError = true;
+      }
+      _writtenFileSize += size;
+      return res;
+    }
+
+#if defined(MY_CPU_SIZEOF_POINTER) && (MY_CPU_SIZEOF_POINTER == 4 || MY_CPU_SIZEOF_POINTER == 8)
+#define BR_CONV_USE_OPT_PC_PTR
 #endif
 
 #ifdef BR_CONV_USE_OPT_PC_PTR
-#define BR_PC_INIT(lim_back)  pc -= (UInt32)(SizeT)data;
-#define BR_PC_GET        (pc + (UInt32)(SizeT)data)
+#define BR_PC_INIT(lim_back) pc -= (UInt32)(SizeT)data;
+#define BR_PC_GET (pc + (UInt32)(SizeT)data)
 #else
-#define BR_PC_INIT(lim_back)  pc += (UInt32)dataSize - (lim_back);
-#define BR_PC_GET        (pc - (UInt32)(SizeT)(data_lim - data))
+#define BR_PC_INIT(lim_back) pc += (UInt32)dataSize - (lim_back);
+#define BR_PC_GET (pc - (UInt32)(SizeT)(data_lim - data))
 #endif
 
 #ifdef MY_CPU_LE_UNALIGN
@@ -813,267 +797,277 @@ HRESULT CDecoder::WriteData(const Byte *data, size_t size)
 #endif
 
 #ifdef Z7_RAR5_FILTER_USE_LE_UNALIGN
-#define RAR_E8_FILT(mask) \
-{ \
-  for (;;) \
-  { UInt32 v; \
-    do { \
-      v = GetUi32(data) ^ (UInt32)0xe8e8e8e8; \
-      data += 4; \
-      if ((v & ((UInt32)(mask) << (8 * 0))) == 0) { data -= 3; break; } \
-      if ((v & ((UInt32)(mask) << (8 * 1))) == 0) { data -= 2; break; } \
-      if ((v & ((UInt32)(mask) << (8 * 2))) == 0) { data -= 1; break; } } \
-    while((v & ((UInt32)(mask) << (8 * 3)))); \
-    if (data > data_lim) break; \
-    const UInt32 offset = BR_PC_GET & (kFileSize - 1); \
-    const UInt32 addr = GetUi32(data); \
-    data += 4; \
-    if (addr < kFileSize) \
-      SetUi32(data - 4, addr - offset) \
-    else if (addr > ~offset) /* if (addr > ((UInt32)0xFFFFFFFF - offset)) */ \
-      SetUi32(data - 4, addr + kFileSize) \
-  } \
-}
+#define RAR_E8_FILT(mask)                                                                                         \
+  {                                                                                                               \
+    for (;;)                                                                                                      \
+    {                                                                                                             \
+      UInt32 v;                                                                                                   \
+      do                                                                                                          \
+      {                                                                                                           \
+        v = GetUi32(data) ^ (UInt32)0xe8e8e8e8;                                                                   \
+        data += 4;                                                                                                \
+        if ((v & ((UInt32)(mask) << (8 * 0))) == 0)                                                               \
+        {                                                                                                         \
+          data -= 3;                                                                                              \
+          break;                                                                                                  \
+        }                                                                                                         \
+        if ((v & ((UInt32)(mask) << (8 * 1))) == 0)                                                               \
+        {                                                                                                         \
+          data -= 2;                                                                                              \
+          break;                                                                                                  \
+        }                                                                                                         \
+        if ((v & ((UInt32)(mask) << (8 * 2))) == 0)                                                               \
+        {                                                                                                         \
+          data -= 1;                                                                                              \
+          break;                                                                                                  \
+        }                                                                                                         \
+      } while ((v & ((UInt32)(mask) << (8 * 3))));                                                                \
+      if (data > data_lim)                                                                                        \
+        break;                                                                                                    \
+      const UInt32 offset = BR_PC_GET & (kFileSize - 1);                                                          \
+      const UInt32 addr = GetUi32(data);                                                                          \
+      data += 4;                                                                                                  \
+      if (addr < kFileSize)                                                                                       \
+        SetUi32(data - 4, addr - offset) else if (addr > ~offset) /* if (addr > ((UInt32)0xFFFFFFFF - offset)) */ \
+            SetUi32(data - 4, addr + kFileSize)                                                                   \
+    }                                                                                                             \
+  }
 #else
-#define RAR_E8_FILT(get_byte) \
-{ \
-  for (;;) \
-  { \
-    if ((get_byte) != 0xe8) \
-    if ((get_byte) != 0xe8) \
-    if ((get_byte) != 0xe8) \
-    if ((get_byte) != 0xe8) \
-      continue; \
-    { if (data > data_lim) break; \
-    const UInt32 offset = BR_PC_GET & (kFileSize - 1); \
-    const UInt32 addr = GetUi32(data); \
-    data += 4; \
-    if (addr < kFileSize) \
-      SetUi32(data - 4, addr - offset) \
-      else if (addr > ~offset) /* if (addr > ((UInt32)0xFFFFFFFF - offset)) */ \
-      SetUi32(data - 4, addr + kFileSize) \
-    } \
-  } \
-}
+#define RAR_E8_FILT(get_byte)                                                                                       \
+  {                                                                                                                 \
+    for (;;)                                                                                                        \
+    {                                                                                                               \
+      if ((get_byte) != 0xe8)                                                                                       \
+        if ((get_byte) != 0xe8)                                                                                     \
+          if ((get_byte) != 0xe8)                                                                                   \
+            if ((get_byte) != 0xe8)                                                                                 \
+              continue;                                                                                             \
+      {                                                                                                             \
+        if (data > data_lim)                                                                                        \
+          break;                                                                                                    \
+        const UInt32 offset = BR_PC_GET & (kFileSize - 1);                                                          \
+        const UInt32 addr = GetUi32(data);                                                                          \
+        data += 4;                                                                                                  \
+        if (addr < kFileSize)                                                                                       \
+          SetUi32(data - 4, addr - offset) else if (addr > ~offset) /* if (addr > ((UInt32)0xFFFFFFFF - offset)) */ \
+              SetUi32(data - 4, addr + kFileSize)                                                                   \
+      }                                                                                                             \
+    }                                                                                                               \
+  }
 #endif
 
-HRESULT CDecoder::ExecuteFilter(const CFilter &f)
-{
-  Byte *data = _filterSrc;
-  UInt32 dataSize = f.Size;
-  // printf("\nType = %d offset = %9d  size = %5d", f.Type, (unsigned)(f.Start - _lzFileStart), dataSize);
+    HRESULT CDecoder::ExecuteFilter(const CFilter &f)
+    {
+      Byte *data = _filterSrc;
+      UInt32 dataSize = f.Size;
+      // printf("\nType = %d offset = %9d  size = %5d", f.Type, (unsigned)(f.Start - _lzFileStart), dataSize);
 
-  if (f.Type == FILTER_DELTA)
-  {
-    // static unsigned g1 = 0, g2 = 0; g1 += dataSize;
-    // if (g2++ % 100 == 0) printf("DELTA  num %8u, size %8u MiB, channels = %2u curSize=%8u\n", g2, (g1 >> 20), f.Channels, dataSize);
-    _filterDst.AllocAtLeast_max((size_t)dataSize, k_Filter_BlockSize_MAX);
-    if (!_filterDst.IsAllocated())
-      return E_OUTOFMEMORY;
-    
-    Byte *dest = _filterDst;
-    const unsigned numChannels = f.Channels;
-    unsigned curChannel = 0;
-    do
-    {
-      Byte prevByte = 0;
-      Byte *dest2 = dest + curChannel;
-      const Byte *dest_lim = dest + dataSize;
-      for (; dest2 < dest_lim; dest2 += numChannels)
-        *dest2 = (prevByte = (Byte)(prevByte - *data++));
-    }
-    while (++curChannel != numChannels);
-    // return WriteData(dest, dataSize);
-    data = dest;
-  }
-  else if (f.Type < FILTER_ARM)
-  {
-    // FILTER_E8 or FILTER_E8E9
-    if (dataSize > 4)
-    {
-      UInt32 pc = (UInt32)(f.Start - _lzFileStart);
-      const UInt32 kFileSize = (UInt32)1 << 24;
-      const Byte *data_lim = data + dataSize - 4;
-      BR_PC_INIT(4) // because (data_lim) was moved back for 4 bytes
-      data[dataSize] = 0xe8;
-      if (f.Type == FILTER_E8)
+      if (f.Type == FILTER_DELTA)
       {
-        // static unsigned g1 = 0; g1 += dataSize; printf("\n  FILTER_E8   %u", (g1 >> 20));
-#ifdef Z7_RAR5_FILTER_USE_LE_UNALIGN
-        RAR_E8_FILT (0xff)
-#else
-        RAR_E8_FILT (*data++)
-#endif
+        // static unsigned g1 = 0, g2 = 0; g1 += dataSize;
+        // if (g2++ % 100 == 0) printf("DELTA  num %8u, size %8u MiB, channels = %2u curSize=%8u\n", g2, (g1 >> 20), f.Channels, dataSize);
+        _filterDst.AllocAtLeast_max((size_t)dataSize, k_Filter_BlockSize_MAX);
+        if (!_filterDst.IsAllocated())
+          return E_OUTOFMEMORY;
+
+        Byte *dest = _filterDst;
+        const unsigned numChannels = f.Channels;
+        unsigned curChannel = 0;
+        do
+        {
+          Byte prevByte = 0;
+          Byte *dest2 = dest + curChannel;
+          const Byte *dest_lim = dest + dataSize;
+          for (; dest2 < dest_lim; dest2 += numChannels)
+            *dest2 = (prevByte = (Byte)(prevByte - *data++));
+        } while (++curChannel != numChannels);
+        // return WriteData(dest, dataSize);
+        data = dest;
       }
-      else
+      else if (f.Type < FILTER_ARM)
       {
-        // static unsigned g1 = 0; g1 += dataSize; printf("\n  FILTER_E8_E9 %u", (g1 >> 20));
+        // FILTER_E8 or FILTER_E8E9
+        if (dataSize > 4)
+        {
+          UInt32 pc = (UInt32)(f.Start - _lzFileStart);
+          const UInt32 kFileSize = (UInt32)1 << 24;
+          const Byte *data_lim = data + dataSize - 4;
+          BR_PC_INIT(4) // because (data_lim) was moved back for 4 bytes
+          data[dataSize] = 0xe8;
+          if (f.Type == FILTER_E8)
+          {
+            // static unsigned g1 = 0; g1 += dataSize; printf("\n  FILTER_E8   %u", (g1 >> 20));
 #ifdef Z7_RAR5_FILTER_USE_LE_UNALIGN
-        RAR_E8_FILT (0xfe)
+            RAR_E8_FILT(0xff)
 #else
-        RAR_E8_FILT (*data++ & 0xfe)
+            RAR_E8_FILT(*data++)
 #endif
+          }
+          else
+          {
+            // static unsigned g1 = 0; g1 += dataSize; printf("\n  FILTER_E8_E9 %u", (g1 >> 20));
+#ifdef Z7_RAR5_FILTER_USE_LE_UNALIGN
+            RAR_E8_FILT(0xfe)
+#else
+            RAR_E8_FILT(*data++ & 0xfe)
+#endif
+          }
+        }
+        data = _filterSrc;
       }
-    }
-    data = _filterSrc;
-  }
-  else if (f.Type == FILTER_ARM)
-  {
-    UInt32 pc = (UInt32)(f.Start - _lzFileStart);
+      else if (f.Type == FILTER_ARM)
+      {
+        UInt32 pc = (UInt32)(f.Start - _lzFileStart);
 #if 0
     // z7_BranchConv_ARM_Dec expects that (fileOffset & 3) == 0;
     // but even if (fileOffset & 3) then current code
     // in z7_BranchConv_ARM_Dec works same way as unrar's code still.
     z7_BranchConv_ARM_Dec(data, dataSize, pc - 8);
 #else
-    dataSize &= ~(UInt32)3;
-    if (dataSize)
-    {
-      Byte *data_lim = data + dataSize;
-      data_lim[3] = 0xeb;
-      BR_PC_INIT(0)
-      pc -= 4;  // because (data) will point to next instruction
-      for (;;) // do
-      {
-        data += 4;
-        if (data[-1] != 0xeb)
-          continue;
-        if (data > data_lim)
-          break;
+        dataSize &= ~(UInt32)3;
+        if (dataSize)
         {
-          UInt32 v = GetUi32a(data - 4) - (BR_PC_GET >> 2);
-          v &= 0x00ffffff;
-          v |= 0xeb000000;
-          SetUi32a(data - 4, v)
+          Byte *data_lim = data + dataSize;
+          data_lim[3] = 0xeb;
+          BR_PC_INIT(0)
+          pc -= 4; // because (data) will point to next instruction
+          for (;;) // do
+          {
+            data += 4;
+            if (data[-1] != 0xeb)
+              continue;
+            if (data > data_lim)
+              break;
+            {
+              UInt32 v = GetUi32a(data - 4) - (BR_PC_GET >> 2);
+              v &= 0x00ffffff;
+              v |= 0xeb000000;
+              SetUi32a(data - 4, v)
+            }
+          }
+        }
+#endif
+        data = _filterSrc;
+      }
+      else
+      {
+        _unsupportedFilter = true;
+        My_ZeroMemory(data, dataSize);
+        // return S_OK;  // unrar
+      }
+      // return WriteData(_filterSrc, (size_t)f.Size);
+      return WriteData(data, (size_t)f.Size);
+    }
+
+    HRESULT CDecoder::WriteBuf()
+    {
+      DeleteUnusedFilters();
+      const UInt64 lzSize = _lzSize + _winPos;
+
+      for (unsigned i = 0; i < _numFilters;)
+      {
+        const size_t lzAvail = (size_t)(lzSize - _lzWritten);
+        if (lzAvail == 0)
+          break;
+        // (lzAvail != 0)
+        const CFilter &f = _filters[i];
+        const UInt64 blockStart = f.Start;
+        if (blockStart > _lzWritten)
+        {
+          const UInt64 rem = blockStart - _lzWritten;
+          // (rem != 0)
+          size_t size = lzAvail;
+          if (size > rem)
+            size = (size_t)rem;
+          // (size != 0)
+          RINOK(WriteData(_window + _winPos - lzAvail, size))
+          _lzWritten += size;
+          continue;
+        }
+
+        // (blockStart <= _lzWritten)
+        const UInt32 blockSize = f.Size;
+        size_t offset = (size_t)(_lzWritten - blockStart);
+        if (offset == 0)
+        {
+          _filterSrc.AllocAtLeast_max(
+              (size_t)blockSize + k_Filter_AfterPad_Size,
+              k_Filter_BlockSize_MAX + k_Filter_AfterPad_Size);
+          if (!_filterSrc.IsAllocated())
+            return E_OUTOFMEMORY;
+        }
+
+        const size_t blockRem = (size_t)blockSize - offset;
+        size_t size = lzAvail;
+        if (size > blockRem)
+          size = blockRem;
+        memcpy(_filterSrc + offset, _window + _winPos - lzAvail, size);
+        _lzWritten += size;
+        offset += size;
+        if (offset != blockSize)
+          return S_OK;
+
+        _numUnusedFilters = ++i;
+        RINOK(ExecuteFilter(f))
+      }
+
+      DeleteUnusedFilters();
+      if (_numFilters)
+        return S_OK;
+      const size_t lzAvail = (size_t)(lzSize - _lzWritten);
+      RINOK(WriteData(_window + _winPos - lzAvail, lzAvail))
+      _lzWritten += lzAvail;
+      return S_OK;
+    }
+
+    Z7_NO_INLINE
+    static UInt32 ReadUInt32(CBitDecoder &bi)
+    {
+      const unsigned numBits = (unsigned)bi.ReadBits_9fix(2) * 8 + 8;
+      UInt32 v = 0;
+      unsigned i = 0;
+      do
+      {
+        v += (UInt32)bi.ReadBits_9fix(8) << i;
+        i += 8;
+      } while (i != numBits);
+      return v;
+    }
+
+    static const unsigned MAX_UNPACK_FILTERS = 8192;
+
+    HRESULT CDecoder::AddFilter(CBitDecoder &_bitStream)
+    {
+      DeleteUnusedFilters();
+
+      if (_numFilters >= MAX_UNPACK_FILTERS)
+      {
+        RINOK(WriteBuf())
+        DeleteUnusedFilters();
+        if (_numFilters >= MAX_UNPACK_FILTERS)
+        {
+          _unsupportedFilter = true;
+          InitFilters();
         }
       }
-    }
-#endif
-    data = _filterSrc;
-  }
-  else
-  {
-    _unsupportedFilter = true;
-    My_ZeroMemory(data, dataSize);
-    // return S_OK;  // unrar
-  }
-  // return WriteData(_filterSrc, (size_t)f.Size);
-  return WriteData(data, (size_t)f.Size);
-}
 
+      _bitStream.Prepare();
 
-HRESULT CDecoder::WriteBuf()
-{
-  DeleteUnusedFilters();
-  const UInt64 lzSize = _lzSize + _winPos;
+      CFilter f;
+      const UInt32 blockStart = ReadUInt32(_bitStream);
+      f.Size = ReadUInt32(_bitStream);
 
-  for (unsigned i = 0; i < _numFilters;)
-  {
-    const size_t lzAvail = (size_t)(lzSize - _lzWritten);
-    if (lzAvail == 0)
-      break;
-    // (lzAvail != 0)
-    const CFilter &f = _filters[i];
-    const UInt64 blockStart = f.Start;
-    if (blockStart > _lzWritten)
-    {
-      const UInt64 rem = blockStart - _lzWritten;
-      // (rem != 0)
-      size_t size = lzAvail;
-      if (size > rem)
-        size = (size_t)rem;
-      // (size != 0)
-      RINOK(WriteData(_window + _winPos - lzAvail, size))
-      _lzWritten += size;
-      continue;
-    }
+      if (f.Size > k_Filter_BlockSize_MAX)
+      {
+        _unsupportedFilter = true;
+        f.Size = 0; // unrar 5.5.5
+      }
 
-    // (blockStart <= _lzWritten)
-    const UInt32 blockSize = f.Size;
-    size_t offset = (size_t)(_lzWritten - blockStart);
-    if (offset == 0)
-    {
-      _filterSrc.AllocAtLeast_max(
-          (size_t)blockSize      + k_Filter_AfterPad_Size,
-          k_Filter_BlockSize_MAX + k_Filter_AfterPad_Size);
-      if (!_filterSrc.IsAllocated())
-        return E_OUTOFMEMORY;
-    }
-    
-    const size_t blockRem = (size_t)blockSize - offset;
-    size_t size = lzAvail;
-    if (size > blockRem)
-        size = blockRem;
-    memcpy(_filterSrc + offset, _window + _winPos - lzAvail, size);
-    _lzWritten += size;
-    offset += size;
-    if (offset != blockSize)
-      return S_OK;
-
-    _numUnusedFilters = ++i;
-    RINOK(ExecuteFilter(f))
-  }
-      
-  DeleteUnusedFilters();
-  if (_numFilters)
-    return S_OK;
-  const size_t lzAvail = (size_t)(lzSize - _lzWritten);
-  RINOK(WriteData(_window + _winPos - lzAvail, lzAvail))
-  _lzWritten += lzAvail;
-  return S_OK;
-}
-
-
-Z7_NO_INLINE
-static UInt32 ReadUInt32(CBitDecoder &bi)
-{
-  const unsigned numBits = (unsigned)bi.ReadBits_9fix(2) * 8 + 8;
-  UInt32 v = 0;
-  unsigned i = 0;
-  do
-  {
-    v += (UInt32)bi.ReadBits_9fix(8) << i;
-    i += 8;
-  }
-  while (i != numBits);
-  return v;
-}
-
-
-static const unsigned MAX_UNPACK_FILTERS = 8192;
-
-HRESULT CDecoder::AddFilter(CBitDecoder &_bitStream)
-{
-  DeleteUnusedFilters();
-
-  if (_numFilters >= MAX_UNPACK_FILTERS)
-  {
-    RINOK(WriteBuf())
-    DeleteUnusedFilters();
-    if (_numFilters >= MAX_UNPACK_FILTERS)
-    {
-      _unsupportedFilter = true;
-      InitFilters();
-    }
-  }
-
-  _bitStream.Prepare();
-
-  CFilter f;
-  const UInt32 blockStart = ReadUInt32(_bitStream);
-  f.Size = ReadUInt32(_bitStream);
-
-  if (f.Size > k_Filter_BlockSize_MAX)
-  {
-    _unsupportedFilter = true;
-    f.Size = 0;  // unrar 5.5.5
-  }
-
-  f.Type = (Byte)_bitStream.ReadBits_9fix(3);
-  f.Channels = 0;
-  if (f.Type == FILTER_DELTA)
-    f.Channels = (Byte)(_bitStream.ReadBits_9fix(5) + 1);
-  f.Start = _lzSize + _winPos + blockStart;
+      f.Type = (Byte)_bitStream.ReadBits_9fix(3);
+      f.Channels = 0;
+      if (f.Type == FILTER_DELTA)
+        f.Channels = (Byte)(_bitStream.ReadBits_9fix(5) + 1);
+      f.Start = _lzSize + _winPos + blockStart;
 
 #if 0
   static unsigned z_cnt = 0; if (z_cnt++ % 100 == 0)
@@ -1082,155 +1076,161 @@ HRESULT CDecoder::AddFilter(CBitDecoder &_bitStream)
       (unsigned)blockStart, (unsigned)f.Size, (unsigned)f.Type, (unsigned)f.Channels);
 #endif
 
-  if (f.Start < _filterEnd)
-    _unsupportedFilter = true;
-  else
-  {
-    _filterEnd = f.Start + f.Size;
-    if (f.Size != 0)
-    {
-      if (!_filters)
+      if (f.Start < _filterEnd)
+        _unsupportedFilter = true;
+      else
       {
-        _filters = (CFilter *)z7_AlignedAlloc(MAX_UNPACK_FILTERS * sizeof(CFilter));
-        if (!_filters)
-          return E_OUTOFMEMORY;
+        _filterEnd = f.Start + f.Size;
+        if (f.Size != 0)
+        {
+          if (!_filters)
+          {
+            _filters = (CFilter *)z7_AlignedAlloc(MAX_UNPACK_FILTERS * sizeof(CFilter));
+            if (!_filters)
+              return E_OUTOFMEMORY;
+          }
+          // printf("\n_numFilters = %6u\n", _numFilters);
+          const unsigned i = _numFilters++;
+          _filters[i] = f;
+        }
       }
-      // printf("\n_numFilters = %6u\n", _numFilters);
-      const unsigned i = _numFilters++;
-      _filters[i] = f;
+
+      return S_OK;
     }
+
+#define RIF(x)        \
+  {                   \
+    if (!(x))         \
+      return S_FALSE; \
   }
-
-  return S_OK;
-}
-
-
-#define RIF(x) { if (!(x)) return S_FALSE; }
 
 #if 1
 #define PRINT_CNT(name, skip)
 #else
-#define PRINT_CNT(name, skip) \
-  { static unsigned g_cnt = 0; if (g_cnt++ % skip == 0) printf("\n%16s:  %8u", name, g_cnt); }
+#define PRINT_CNT(name, skip)              \
+  {                                        \
+    static unsigned g_cnt = 0;             \
+    if (g_cnt++ % skip == 0)               \
+      printf("\n%16s:  %8u", name, g_cnt); \
+  }
 #endif
 
-HRESULT CDecoder::ReadTables(CBitDecoder &_bitStream)
-{
-  if (_progress)
-  {
-    const UInt64 packSize = _bitStream.GetProcessedSize();
-    if (packSize - _progress_Pack >= (1u << 24)
-        || _writtenFileSize - _progress_Unpack >= (1u << 26))
+    HRESULT CDecoder::ReadTables(CBitDecoder &_bitStream)
     {
-      _progress_Pack = packSize;
-      _progress_Unpack = _writtenFileSize;
-      RINOK(_progress->SetRatioInfo(&_progress_Pack, &_writtenFileSize))
-    }
-    // printf("\ntable read pos=%p packSize=%p _writtenFileSize = %p\n", (size_t)_winPos, (size_t)packSize, (size_t)_writtenFileSize);
-  }
+      if (_progress)
+      {
+        const UInt64 packSize = _bitStream.GetProcessedSize();
+        if (packSize - _progress_Pack >= (1u << 24) || _writtenFileSize - _progress_Unpack >= (1u << 26))
+        {
+          _progress_Pack = packSize;
+          _progress_Unpack = _writtenFileSize;
+          RINOK(_progress->SetRatioInfo(&_progress_Pack, &_writtenFileSize))
+        }
+        // printf("\ntable read pos=%p packSize=%p _writtenFileSize = %p\n", (size_t)_winPos, (size_t)packSize, (size_t)_writtenFileSize);
+      }
 
-  // _bitStream is aligned already
-  _bitStream.Prepare();
-  {
-    const unsigned flags = _bitStream.ReadByte_InAligned();
-    /* ((flags & 20) == 0) in all rar archives now,
-       but (flags & 20) flag can be used as some decoding hint in future versions of original rar.
-       So we ignore that bit here. */
-    unsigned checkSum = _bitStream.ReadByte_InAligned();
-    checkSum ^= flags;
-    const unsigned num = (flags >> 3) & 3;
-    if (num >= 3)
-      return S_FALSE;
-    UInt32 blockSize = _bitStream.ReadByte_InAligned();
-    checkSum ^= blockSize;
-    if (num != 0)
-    {
+      // _bitStream is aligned already
+      _bitStream.Prepare();
       {
-        const unsigned b = _bitStream.ReadByte_InAligned();
-        checkSum ^= b;
-        blockSize += (UInt32)b << 8;
-      }
-      if (num > 1)
-      {
-        const unsigned b = _bitStream.ReadByte_InAligned();
-        checkSum ^= b;
-        blockSize += (UInt32)b << 16;
-      }
-    }
-    if (checkSum != 0x5A)
-      return S_FALSE;
-    unsigned blockSizeBits7 = (flags & 7) + 1;
-    blockSize += (UInt32)(blockSizeBits7 >> 3);
-    if (blockSize == 0)
-    {
-      // it's error in data stream
-      // but original-unrar ignores that error
-      _bitStream._minorError = true;
-#if 1
-      // we ignore that error as original-unrar:
-      blockSizeBits7 = 0;
-      blockSize = 1;
-#else
-      // we can stop decoding:
-      return S_FALSE;
-#endif
-    }
-    blockSize--;
-    blockSizeBits7 &= 7;
-    PRINT_CNT("Blocks", 100)
-    /*
-    {
-      static unsigned g_prev = 0;
-      static unsigned g_cnt = 0;
-      unsigned proc = unsigned(_winPos);
-      if (g_cnt++ % 100 == 0) printf("  c_size = %8u  ", blockSize);
-      if (g_cnt++ % 100 == 1) printf("  unp_size = %8u", proc - g_prev);
-      g_prev = proc;
-    }
-    */
-    _bitStream._blockEndBits7 = blockSizeBits7;
-    _bitStream._blockEnd = _bitStream.GetProcessedSize_Round() + blockSize;
-    _bitStream.SetCheck_forBlock();
-    _isLastBlock = ((flags & 0x40) != 0);
-    if ((flags & 0x80) == 0)
-    {
-      if (!_tableWasFilled)
-        // if (blockSize != 0 || blockSizeBits7 != 0)
-        if (blockSize + blockSizeBits7 != 0)
+        const unsigned flags = _bitStream.ReadByte_InAligned();
+        /* ((flags & 20) == 0) in all rar archives now,
+           but (flags & 20) flag can be used as some decoding hint in future versions of original rar.
+           So we ignore that bit here. */
+        unsigned checkSum = _bitStream.ReadByte_InAligned();
+        checkSum ^= flags;
+        const unsigned num = (flags >> 3) & 3;
+        if (num >= 3)
           return S_FALSE;
-      return S_OK;
-    }
-    _tableWasFilled = false;
-  }
-
-  PRINT_CNT("Tables", 100);
-
-  const unsigned kLevelTableSize = 20;
-  const unsigned k_NumHufTableBits_Level = 6;
-  NHuffman::CDecoder256<kNumHufBits, kLevelTableSize, k_NumHufTableBits_Level> m_LevelDecoder;
-  const unsigned kTablesSizesSum_MAX = kMainTableSize + kDistTableSize_MAX + kAlignTableSize + kLenTableSize;
-  Byte lens[kTablesSizesSum_MAX];
-  {
-    // (kLevelTableSize + 16 < kTablesSizesSum). So we use lens[] array for (Level) table
-    // Byte lens2[kLevelTableSize + 16];
-    unsigned i = 0;
-    do
-    {
-      if (_bitStream._buf >= _bitStream._bufCheck_Block)
-      {
-        _bitStream.Prepare();
-        if (_bitStream.IsBlockOverRead())
-          return S_FALSE;
-      }
-      const unsigned len = (unsigned)_bitStream.ReadBits_9fix(4);
-      if (len == 15)
-      {
-        unsigned num = (unsigned)_bitStream.ReadBits_9fix(4);
+        UInt32 blockSize = _bitStream.ReadByte_InAligned();
+        checkSum ^= blockSize;
         if (num != 0)
         {
-          num += 2;
-          num += i;
-          // we are allowed to overwrite to lens[] for extra 16 bytes after kLevelTableSize
+          {
+            const unsigned b = _bitStream.ReadByte_InAligned();
+            checkSum ^= b;
+            blockSize += (UInt32)b << 8;
+          }
+          if (num > 1)
+          {
+            const unsigned b = _bitStream.ReadByte_InAligned();
+            checkSum ^= b;
+            blockSize += (UInt32)b << 16;
+          }
+        }
+        if (checkSum != 0x5A)
+          return S_FALSE;
+        unsigned blockSizeBits7 = (flags & 7) + 1;
+        blockSize += (UInt32)(blockSizeBits7 >> 3);
+        if (blockSize == 0)
+        {
+          // it's error in data stream
+          // but original-unrar ignores that error
+          _bitStream._minorError = true;
+#if 1
+          // we ignore that error as original-unrar:
+          blockSizeBits7 = 0;
+          blockSize = 1;
+#else
+          // we can stop decoding:
+          return S_FALSE;
+#endif
+        }
+        blockSize--;
+        blockSizeBits7 &= 7;
+        PRINT_CNT("Blocks", 100)
+        /*
+        {
+          static unsigned g_prev = 0;
+          static unsigned g_cnt = 0;
+          unsigned proc = unsigned(_winPos);
+          if (g_cnt++ % 100 == 0) printf("  c_size = %8u  ", blockSize);
+          if (g_cnt++ % 100 == 1) printf("  unp_size = %8u", proc - g_prev);
+          g_prev = proc;
+        }
+        */
+        _bitStream._blockEndBits7 = blockSizeBits7;
+        _bitStream._blockEnd = _bitStream.GetProcessedSize_Round() + blockSize;
+        _bitStream.SetCheck_forBlock();
+        _isLastBlock = ((flags & 0x40) != 0);
+        if ((flags & 0x80) == 0)
+        {
+          if (!_tableWasFilled)
+            // if (blockSize != 0 || blockSizeBits7 != 0)
+            if (blockSize + blockSizeBits7 != 0)
+              return S_FALSE;
+          return S_OK;
+        }
+        _tableWasFilled = false;
+      }
+
+      PRINT_CNT("Tables", 100);
+
+      const unsigned kLevelTableSize = 20;
+      const unsigned k_NumHufTableBits_Level = 6;
+      NHuffman::CDecoder256<kNumHufBits, kLevelTableSize, k_NumHufTableBits_Level> m_LevelDecoder;
+      const unsigned kTablesSizesSum_MAX = kMainTableSize + kDistTableSize_MAX + kAlignTableSize + kLenTableSize;
+      Byte lens[kTablesSizesSum_MAX];
+      {
+        // (kLevelTableSize + 16 < kTablesSizesSum). So we use lens[] array for (Level) table
+        // Byte lens2[kLevelTableSize + 16];
+        unsigned i = 0;
+        do
+        {
+          if (_bitStream._buf >= _bitStream._bufCheck_Block)
+          {
+            _bitStream.Prepare();
+            if (_bitStream.IsBlockOverRead())
+              return S_FALSE;
+          }
+          const unsigned len = (unsigned)_bitStream.ReadBits_9fix(4);
+          if (len == 15)
+          {
+            unsigned num = (unsigned)_bitStream.ReadBits_9fix(4);
+            if (num != 0)
+            {
+              num += 2;
+              num += i;
+              // we are allowed to overwrite to lens[] for extra 16 bytes after kLevelTableSize
 #if 0
           if (num > kLevelTableSize)
           {
@@ -1239,870 +1239,861 @@ HRESULT CDecoder::ReadTables(CBitDecoder &_bitStream)
             // return S_FALSE;
           }
 #endif
-          do
-            lens[i++] = 0;
-          while (i < num);
-          continue;
-        }
+              do
+                lens[i++] = 0;
+              while (i < num);
+              continue;
+            }
+          }
+          lens[i++] = (Byte)len;
+        } while (i < kLevelTableSize);
+        if (_bitStream.IsBlockOverRead())
+          return S_FALSE;
+        RIF(m_LevelDecoder.Build(lens, NHuffman::k_BuildMode_Full))
       }
-      lens[i++] = (Byte)len;
-    }
-    while (i < kLevelTableSize);
-    if (_bitStream.IsBlockOverRead())
-      return S_FALSE;
-    RIF(m_LevelDecoder.Build(lens, NHuffman::k_BuildMode_Full))
-  }
 
-  unsigned i = 0;
-  const unsigned tableSize = _is_v7 ?
-      kTablesSizesSum_MAX :
-      kTablesSizesSum_MAX - kExtraDistSymbols_v7;
-  do
-  {
-    if (_bitStream._buf >= _bitStream._bufCheck_Block)
-    {
-      // if (_bitStream._buf >= _bitStream._bufCheck)
-      _bitStream.Prepare();
-      if (_bitStream.IsBlockOverRead())
-        return S_FALSE;
-    }
-    const unsigned sym = m_LevelDecoder.DecodeFull(&_bitStream);
-    if (sym < 16)
-      lens[i++] = (Byte)sym;
+      unsigned i = 0;
+      const unsigned tableSize = _is_v7 ? kTablesSizesSum_MAX : kTablesSizesSum_MAX - kExtraDistSymbols_v7;
+      do
+      {
+        if (_bitStream._buf >= _bitStream._bufCheck_Block)
+        {
+          // if (_bitStream._buf >= _bitStream._bufCheck)
+          _bitStream.Prepare();
+          if (_bitStream.IsBlockOverRead())
+            return S_FALSE;
+        }
+        const unsigned sym = m_LevelDecoder.DecodeFull(&_bitStream);
+        if (sym < 16)
+          lens[i++] = (Byte)sym;
 #if 0
     else if (sym > kLevelTableSize)
       return S_FALSE;
 #endif
-    else
-    {
-      unsigned num = ((sym /* - 16 */) & 1) * 4;
-      num += num + 3 + (unsigned)_bitStream.ReadBits9(num + 3);
-      num += i;
-      if (num > tableSize)
+        else
+        {
+          unsigned num = ((sym /* - 16 */) & 1) * 4;
+          num += num + 3 + (unsigned)_bitStream.ReadBits9(num + 3);
+          num += i;
+          if (num > tableSize)
+          {
+            // we ignore this error as original-unrar
+            num = tableSize;
+            // return S_FALSE;
+          }
+          unsigned v = 0;
+          if (sym < 16 + 2)
+          {
+            if (i == 0)
+              return S_FALSE;
+            v = lens[(size_t)i - 1];
+          }
+          do
+            lens[i++] = (Byte)v;
+          while (i < num);
+        }
+      } while (i < tableSize);
+
+      if (_bitStream.IsBlockOverRead())
+        return S_FALSE;
+      if (_bitStream.InputEofError())
+        return S_FALSE;
+
+      /* We suppose that original-rar encoder can create only two cases for Huffman:
+          1) Empty Huffman tree (if num_used_symbols == 0)
+          2) Full  Huffman tree (if num_used_symbols != 0)
+         Usually the block contains at least one symbol for m_MainDecoder.
+         So original-rar-encoder creates full Huffman tree for m_MainDecoder.
+         But we suppose that (num_used_symbols == 0) is possible for m_MainDecoder,
+         because file must be finished with (_isLastBlock) flag,
+         even if there are no symbols in m_MainDecoder.
+         So we use k_BuildMode_Full_or_Empty for m_MainDecoder.
+      */
+      const NHuffman::enum_BuildMode buildMode = NHuffman::
+          k_BuildMode_Full_or_Empty; // strict check
+                                     // k_BuildMode_Partial;    // non-strict check (ignore errors)
+
+      RIF(m_MainDecoder.Build(&lens[0], buildMode))
+      if (!_is_v7)
       {
-        // we ignore this error as original-unrar
-        num = tableSize;
-        // return S_FALSE;
-      }
-      unsigned v = 0;
-      if (sym < 16 + 2)
-      {
-        if (i == 0)
-          return S_FALSE;
-        v = lens[(size_t)i - 1];
-      }
-      do
-        lens[i++] = (Byte)v;
-      while (i < num);
-    }
-  }
-  while (i < tableSize);
-
-  if (_bitStream.IsBlockOverRead())
-    return S_FALSE;
-  if (_bitStream.InputEofError())
-    return S_FALSE;
-
-  /* We suppose that original-rar encoder can create only two cases for Huffman:
-      1) Empty Huffman tree (if num_used_symbols == 0)
-      2) Full  Huffman tree (if num_used_symbols != 0)
-     Usually the block contains at least one symbol for m_MainDecoder.
-     So original-rar-encoder creates full Huffman tree for m_MainDecoder.
-     But we suppose that (num_used_symbols == 0) is possible for m_MainDecoder,
-     because file must be finished with (_isLastBlock) flag,
-     even if there are no symbols in m_MainDecoder.
-     So we use k_BuildMode_Full_or_Empty for m_MainDecoder.
-  */
-  const NHuffman::enum_BuildMode buildMode = NHuffman::
-      k_BuildMode_Full_or_Empty; // strict check
-      // k_BuildMode_Partial;    // non-strict check (ignore errors)
-
-  RIF(m_MainDecoder.Build(&lens[0], buildMode))
-  if (!_is_v7)
-  {
 #if 1
-    /* we use this manual loop to avoid compiler BUG.
-       GCC 4.9.2 compiler has BUG with overlapping memmove() to right in local array. */
-    Byte *dest = lens + kMainTableSize + kDistTableSize_v6 +
-                   kAlignTableSize + kLenTableSize - 1;
-    unsigned num = kAlignTableSize + kLenTableSize;
-    do
-    {
-      dest[kExtraDistSymbols_v7] = dest[0];
-      dest--;
-    }
-    while (--num);
+        /* we use this manual loop to avoid compiler BUG.
+           GCC 4.9.2 compiler has BUG with overlapping memmove() to right in local array. */
+        Byte *dest = lens + kMainTableSize + kDistTableSize_v6 +
+                     kAlignTableSize + kLenTableSize - 1;
+        unsigned num = kAlignTableSize + kLenTableSize;
+        do
+        {
+          dest[kExtraDistSymbols_v7] = dest[0];
+          dest--;
+        } while (--num);
 #else
-    memmove(lens + kMainTableSize + kDistTableSize_v6 + kExtraDistSymbols_v7,
-            lens + kMainTableSize + kDistTableSize_v6,
-            kAlignTableSize + kLenTableSize);
+        memmove(lens + kMainTableSize + kDistTableSize_v6 + kExtraDistSymbols_v7,
+                lens + kMainTableSize + kDistTableSize_v6,
+                kAlignTableSize + kLenTableSize);
 #endif
-    memset(lens + kMainTableSize + kDistTableSize_v6, 0, kExtraDistSymbols_v7);
+        memset(lens + kMainTableSize + kDistTableSize_v6, 0, kExtraDistSymbols_v7);
+      }
+
+      RIF(m_DistDecoder.Build(&lens[kMainTableSize], buildMode))
+      RIF(m_LenDecoder.Build(&lens[kMainTableSize + kDistTableSize_MAX + kAlignTableSize], buildMode))
+
+      _useAlignBits = false;
+      for (i = 0; i < kAlignTableSize; i++)
+        if (lens[kMainTableSize + kDistTableSize_MAX + (size_t)i] != kNumAlignBits)
+        {
+          RIF(m_AlignDecoder.Build(&lens[kMainTableSize + kDistTableSize_MAX], buildMode))
+          _useAlignBits = true;
+          break;
+        }
+
+      _tableWasFilled = true;
+      return S_OK;
+    }
+
+    static inline CLenType SlotToLen(CBitDecoder &_bitStream, CLenType slot)
+    {
+      const unsigned numBits = ((unsigned)slot >> 2) - 1;
+      return ((4 | (slot & 3)) << numBits) + (CLenType)_bitStream.ReadBits9(numBits);
+    }
+
+    static const unsigned kSymbolRep = 258;
+    static const unsigned kMaxMatchLen = 0x1001 + 3;
+
+    enum enum_exit_type
+    {
+      Z7_RAR_EXIT_TYPE_NONE,
+      Z7_RAR_EXIT_TYPE_ADD_FILTER
+    };
+
+#define LZ_RESTORE                        \
+  {                                       \
+    _reps[0] = rep0;                      \
+    _winPos = (size_t)(winPos - _window); \
+    _buf_Res = _bitStream._buf;           \
+    _bitPos_Res = _bitStream._bitPos;     \
   }
 
-  RIF(m_DistDecoder.Build(&lens[kMainTableSize], buildMode))
-  RIF( m_LenDecoder.Build(&lens[kMainTableSize
-        + kDistTableSize_MAX + kAlignTableSize], buildMode))
-
-  _useAlignBits = false;
-  for (i = 0; i < kAlignTableSize; i++)
-    if (lens[kMainTableSize + kDistTableSize_MAX + (size_t)i] != kNumAlignBits)
-    {
-      RIF(m_AlignDecoder.Build(&lens[kMainTableSize + kDistTableSize_MAX], buildMode))
-      _useAlignBits = true;
-      break;
-    }
-
-  _tableWasFilled = true;
-  return S_OK;
-}
-
-static inline CLenType SlotToLen(CBitDecoder &_bitStream, CLenType slot)
-{
-  const unsigned numBits = ((unsigned)slot >> 2) - 1;
-  return ((4 | (slot & 3)) << numBits) + (CLenType)_bitStream.ReadBits9(numBits);
-}
-
-
-static const unsigned kSymbolRep = 258;
-static const unsigned kMaxMatchLen = 0x1001 + 3;
-
-enum enum_exit_type
-{
-  Z7_RAR_EXIT_TYPE_NONE,
-  Z7_RAR_EXIT_TYPE_ADD_FILTER
-};
-
-
-#define LZ_RESTORE \
-{ \
-  _reps[0] = rep0; \
-  _winPos = (size_t)(winPos - _window); \
-  _buf_Res = _bitStream._buf; \
-  _bitPos_Res = _bitStream._bitPos; \
-}
-
-#define LZ_LOOP_BREAK_OK { break; }
+#define LZ_LOOP_BREAK_OK \
+  {                      \
+    break;               \
+  }
 // #define LZ_LOOP_BREAK_ERROR { _lzError = LZ_ERROR_TYPE_SYM; break; }
 // #define LZ_LOOP_BREAK_ERROR { LZ_RESTORE; return S_FALSE; }
-#define LZ_LOOP_BREAK_ERROR { goto decode_error; }
-// goto decode_error; }
-// #define LZ_LOOP_BREAK_ERROR { break; }
+#define LZ_LOOP_BREAK_ERROR \
+  {                         \
+    goto decode_error;      \
+  }
+    // goto decode_error; }
+    // #define LZ_LOOP_BREAK_ERROR { break; }
 
 #define Z7_RAR_HUFF_DECODE_CHECK_break(sym, huf, kNumTableBits, bitStream) \
-  Z7_HUFF_DECODE_CHECK(sym, huf, kNumHufBits, kNumTableBits, bitStream, { LZ_LOOP_BREAK_ERROR })
-
-
+  Z7_HUFF_DECODE_CHECK(sym, huf, kNumHufBits, kNumTableBits, bitStream, {LZ_LOOP_BREAK_ERROR})
 
 #ifndef Z7_ST
 
-// Keep the same conservative thread policy as SunPack's BZip2 block pipeline.
-// RAR5 retirement is dictionary-ordered, so extra workers beyond 8 mostly add
-// memory pressure rather than useful decode overlap.
-static unsigned GetRar5ParallelWorkerCount(UInt32 numThreads)
-{
-  if (numThreads < 4)
-    return 0;
-  return (unsigned)std::min<UInt32>(numThreads, 8);
-}
-
-static const UInt64 kRar5MtInputThreshold = (UInt64)1 << 20;
-static const UInt32 kRar5MtLargeBlockSize = 0x20000;
-static const unsigned kRar5MtBlocksPerWorker = 2;
-
-enum ERar5ParallelDecodedType
-{
-  RAR5_MT_LITERAL = 0,
-  RAR5_MT_MATCH,
-  RAR5_MT_REP,
-  RAR5_MT_FULLREP,
-  RAR5_MT_FILTER
-};
-
-struct CRar5ParallelDecodedItem
-{
-  Byte Type;
-  Byte LiteralSize;
-  Byte FilterType;
-  Byte FilterChannels;
-  UInt16 Length;
-  UInt32 FilterSize;
-  size_t Distance;
-  Byte Literal[8];
-
-  CRar5ParallelDecodedItem():
-      Type(RAR5_MT_LITERAL),
-      LiteralSize(0),
-      FilterType(0),
-      FilterChannels(0),
-      Length(0),
-      FilterSize(0),
-      Distance(0)
-  {
-    memset(Literal, 0, sizeof(Literal));
-  }
-};
-
-struct CRar5ParallelTables
-{
-  NHuffman::CDecoder<kNumHufBits, kMainTableSize, k_NumHufTableBits_Main> Main;
-  NHuffman::CDecoder256<kNumHufBits, kDistTableSize_MAX, k_NumHufTableBits_Dist> Dist;
-  NHuffman::CDecoder256<kNumHufBits, kAlignTableSize, k_NumHufTableBits_Align> Align;
-  NHuffman::CDecoder256<kNumHufBits, kLenTableSize, k_NumHufTableBits_Len> Len;
-  bool UseAlignBits;
-
-  CRar5ParallelTables(): UseAlignBits(false) {}
-};
-
-
-static HRESULT ReadRar5ParallelTables(
-    CBitDecoder &bitStream,
-    bool isV7,
-    bool &tableWasFilled,
-    CRar5ParallelTables &tables,
-    bool &isLastBlock)
-{
-  bitStream.Prepare();
-
-  const unsigned flags = bitStream.ReadByte_InAligned();
-  unsigned checkSum = bitStream.ReadByte_InAligned();
-  checkSum ^= flags;
-
-  const unsigned num = (flags >> 3) & 3;
-  if (num >= 3)
-    return S_FALSE;
-
-  UInt32 blockSize = bitStream.ReadByte_InAligned();
-  checkSum ^= blockSize;
-  if (num != 0)
-  {
-    const unsigned b = bitStream.ReadByte_InAligned();
-    checkSum ^= b;
-    blockSize += (UInt32)b << 8;
-    if (num > 1)
+    // Keep the same conservative thread policy as SunPack's BZip2 block pipeline.
+    // RAR5 retirement is dictionary-ordered, so extra workers beyond 8 mostly add
+    // memory pressure rather than useful decode overlap.
+    static unsigned GetRar5ParallelWorkerCount(UInt32 numThreads)
     {
-      const unsigned b2 = bitStream.ReadByte_InAligned();
-      checkSum ^= b2;
-      blockSize += (UInt32)b2 << 16;
-    }
-  }
-
-  if (checkSum != 0x5A)
-    return S_FALSE;
-
-  unsigned blockSizeBits7 = (flags & 7) + 1;
-  blockSize += (UInt32)(blockSizeBits7 >> 3);
-  if (blockSize == 0)
-  {
-    bitStream._minorError = true;
-    blockSizeBits7 = 0;
-    blockSize = 1;
-  }
-  blockSize--;
-  blockSizeBits7 &= 7;
-
-  bitStream._blockEndBits7 = blockSizeBits7;
-  bitStream._blockEnd = bitStream.GetProcessedSize_Round() + blockSize;
-  bitStream.SetCheck_forBlock();
-
-  isLastBlock = (flags & 0x40) != 0;
-  if ((flags & 0x80) == 0)
-  {
-    if (!tableWasFilled && blockSize + blockSizeBits7 != 0)
-      return S_FALSE;
-    return S_OK;
-  }
-
-  tableWasFilled = false;
-
-  const unsigned kLevelTableSize = 20;
-  const unsigned k_NumHufTableBits_Level = 6;
-  NHuffman::CDecoder256<kNumHufBits, kLevelTableSize, k_NumHufTableBits_Level> levelDecoder;
-  const unsigned kTablesSizesSum_MAX =
-      kMainTableSize + kDistTableSize_MAX + kAlignTableSize + kLenTableSize;
-  Byte lens[kTablesSizesSum_MAX];
-
-  unsigned i = 0;
-  do
-  {
-    if (bitStream._buf >= bitStream._bufCheck_Block)
-    {
-      bitStream.Prepare();
-      if (bitStream.IsBlockOverRead())
-        return S_FALSE;
+      if (numThreads < 4)
+        return 0;
+      return (unsigned)std::min<UInt32>(numThreads, 8);
     }
 
-    const unsigned len = (unsigned)bitStream.ReadBits_9fix(4);
-    if (len == 15)
+    static const UInt64 kRar5MtInputThreshold = (UInt64)1 << 20;
+    static const UInt32 kRar5MtLargeBlockSize = 0x20000;
+    static const unsigned kRar5MtBlocksPerWorker = 2;
+
+    enum ERar5ParallelDecodedType
     {
-      unsigned count = (unsigned)bitStream.ReadBits_9fix(4);
-      if (count != 0)
+      RAR5_MT_LITERAL = 0,
+      RAR5_MT_MATCH,
+      RAR5_MT_REP,
+      RAR5_MT_FULLREP,
+      RAR5_MT_FILTER
+    };
+
+    struct CRar5ParallelDecodedItem
+    {
+      Byte Type;
+      Byte LiteralSize;
+      Byte FilterType;
+      Byte FilterChannels;
+      UInt16 Length;
+      UInt32 FilterSize;
+      size_t Distance;
+      Byte Literal[16];
+
+      CRar5ParallelDecodedItem() : Type(RAR5_MT_LITERAL),
+                                   LiteralSize(0),
+                                   FilterType(0),
+                                   FilterChannels(0),
+                                   Length(0),
+                                   FilterSize(0),
+                                   Distance(0)
       {
-        count += 2;
-        count += i;
-        do
-          lens[i++] = 0;
-        while (i < count);
-        continue;
+        memset(Literal, 0, sizeof(Literal));
       }
-    }
-    lens[i++] = (Byte)len;
-  }
-  while (i < kLevelTableSize);
+    };
 
-  if (bitStream.IsBlockOverRead())
-    return S_FALSE;
-  if (!levelDecoder.Build(lens, NHuffman::k_BuildMode_Full))
-    return S_FALSE;
+    struct CRar5ParallelTables
+    {
+      NHuffman::CDecoder<kNumHufBits, kMainTableSize, k_NumHufTableBits_Main> Main;
+      NHuffman::CDecoder256<kNumHufBits, kDistTableSize_MAX, k_NumHufTableBits_Dist> Dist;
+      NHuffman::CDecoder256<kNumHufBits, kAlignTableSize, k_NumHufTableBits_Align> Align;
+      NHuffman::CDecoder256<kNumHufBits, kLenTableSize, k_NumHufTableBits_Len> Len;
+      bool UseAlignBits;
 
-  i = 0;
-  const unsigned tableSize = isV7
-      ? kTablesSizesSum_MAX
-      : kTablesSizesSum_MAX - kExtraDistSymbols_v7;
+      CRar5ParallelTables() : UseAlignBits(false) {}
+    };
 
-  do
-  {
-    if (bitStream._buf >= bitStream._bufCheck_Block)
+    static HRESULT ReadRar5ParallelTables(
+        CBitDecoder &bitStream,
+        bool isV7,
+        bool &tableWasFilled,
+        CRar5ParallelTables &tables,
+        bool &isLastBlock)
     {
       bitStream.Prepare();
-      if (bitStream.IsBlockOverRead())
+
+      const unsigned flags = bitStream.ReadByte_InAligned();
+      unsigned checkSum = bitStream.ReadByte_InAligned();
+      checkSum ^= flags;
+
+      const unsigned num = (flags >> 3) & 3;
+      if (num >= 3)
         return S_FALSE;
-    }
 
-    const unsigned sym = levelDecoder.DecodeFull(&bitStream);
-    if (sym < 16)
-      lens[i++] = (Byte)sym;
-    else
-    {
-      unsigned count = (sym & 1) * 4;
-      count += count + 3 + (unsigned)bitStream.ReadBits9(count + 3);
-      count += i;
-      if (count > tableSize)
-        count = tableSize;
-
-      unsigned value = 0;
-      if (sym < 18)
+      UInt32 blockSize = bitStream.ReadByte_InAligned();
+      checkSum ^= blockSize;
+      if (num != 0)
       {
-        if (i == 0)
+        const unsigned b = bitStream.ReadByte_InAligned();
+        checkSum ^= b;
+        blockSize += (UInt32)b << 8;
+        if (num > 1)
+        {
+          const unsigned b2 = bitStream.ReadByte_InAligned();
+          checkSum ^= b2;
+          blockSize += (UInt32)b2 << 16;
+        }
+      }
+
+      if (checkSum != 0x5A)
+        return S_FALSE;
+
+      unsigned blockSizeBits7 = (flags & 7) + 1;
+      blockSize += (UInt32)(blockSizeBits7 >> 3);
+      if (blockSize == 0)
+      {
+        bitStream._minorError = true;
+        blockSizeBits7 = 0;
+        blockSize = 1;
+      }
+      blockSize--;
+      blockSizeBits7 &= 7;
+
+      bitStream._blockEndBits7 = blockSizeBits7;
+      bitStream._blockEnd = bitStream.GetProcessedSize_Round() + blockSize;
+      bitStream.SetCheck_forBlock();
+
+      isLastBlock = (flags & 0x40) != 0;
+      if ((flags & 0x80) == 0)
+      {
+        if (!tableWasFilled && blockSize + blockSizeBits7 != 0)
           return S_FALSE;
-        value = lens[(size_t)i - 1];
+        return S_OK;
       }
+
+      tableWasFilled = false;
+
+      const unsigned kLevelTableSize = 20;
+      const unsigned k_NumHufTableBits_Level = 6;
+      NHuffman::CDecoder256<kNumHufBits, kLevelTableSize, k_NumHufTableBits_Level> levelDecoder;
+      const unsigned kTablesSizesSum_MAX =
+          kMainTableSize + kDistTableSize_MAX + kAlignTableSize + kLenTableSize;
+      Byte lens[kTablesSizesSum_MAX];
+
+      unsigned i = 0;
       do
-        lens[i++] = (Byte)value;
-      while (i < count);
-    }
-  }
-  while (i < tableSize);
+      {
+        if (bitStream._buf >= bitStream._bufCheck_Block)
+        {
+          bitStream.Prepare();
+          if (bitStream.IsBlockOverRead())
+            return S_FALSE;
+        }
 
-  if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
-    return S_FALSE;
+        const unsigned len = (unsigned)bitStream.ReadBits_9fix(4);
+        if (len == 15)
+        {
+          unsigned count = (unsigned)bitStream.ReadBits_9fix(4);
+          if (count != 0)
+          {
+            count += 2;
+            count += i;
+            do
+              lens[i++] = 0;
+            while (i < count);
+            continue;
+          }
+        }
+        lens[i++] = (Byte)len;
+      } while (i < kLevelTableSize);
 
-  const NHuffman::enum_BuildMode buildMode = NHuffman::k_BuildMode_Full_or_Empty;
-  if (!tables.Main.Build(&lens[0], buildMode))
-    return S_FALSE;
+      if (bitStream.IsBlockOverRead())
+        return S_FALSE;
+      if (!levelDecoder.Build(lens, NHuffman::k_BuildMode_Full))
+        return S_FALSE;
 
-  if (!isV7)
-  {
-    Byte *dest = lens + kMainTableSize + kDistTableSize_v6 +
-                   kAlignTableSize + kLenTableSize - 1;
-    unsigned count = kAlignTableSize + kLenTableSize;
-    do
-    {
-      dest[kExtraDistSymbols_v7] = dest[0];
-      dest--;
-    }
-    while (--count);
+      i = 0;
+      const unsigned tableSize = isV7
+                                     ? kTablesSizesSum_MAX
+                                     : kTablesSizesSum_MAX - kExtraDistSymbols_v7;
 
-    memset(lens + kMainTableSize + kDistTableSize_v6, 0, kExtraDistSymbols_v7);
-  }
+      do
+      {
+        if (bitStream._buf >= bitStream._bufCheck_Block)
+        {
+          bitStream.Prepare();
+          if (bitStream.IsBlockOverRead())
+            return S_FALSE;
+        }
 
-  if (!tables.Dist.Build(&lens[kMainTableSize], buildMode))
-    return S_FALSE;
-  if (!tables.Len.Build(
-          &lens[kMainTableSize + kDistTableSize_MAX + kAlignTableSize],
-          buildMode))
-    return S_FALSE;
+        const unsigned sym = levelDecoder.DecodeFull(&bitStream);
+        if (sym < 16)
+          lens[i++] = (Byte)sym;
+        else
+        {
+          unsigned count = (sym & 1) * 4;
+          count += count + 3 + (unsigned)bitStream.ReadBits9(count + 3);
+          count += i;
+          if (count > tableSize)
+            count = tableSize;
 
-  tables.UseAlignBits = false;
-  for (i = 0; i < kAlignTableSize; i++)
-  {
-    if (lens[kMainTableSize + kDistTableSize_MAX + (size_t)i] != kNumAlignBits)
-    {
-      if (!tables.Align.Build(
-              &lens[kMainTableSize + kDistTableSize_MAX],
+          unsigned value = 0;
+          if (sym < 18)
+          {
+            if (i == 0)
+              return S_FALSE;
+            value = lens[(size_t)i - 1];
+          }
+          do
+            lens[i++] = (Byte)value;
+          while (i < count);
+        }
+      } while (i < tableSize);
+
+      if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
+        return S_FALSE;
+
+      const NHuffman::enum_BuildMode buildMode = NHuffman::k_BuildMode_Full_or_Empty;
+      if (!tables.Main.Build(&lens[0], buildMode))
+        return S_FALSE;
+
+      if (!isV7)
+      {
+        Byte *dest = lens + kMainTableSize + kDistTableSize_v6 +
+                     kAlignTableSize + kLenTableSize - 1;
+        unsigned count = kAlignTableSize + kLenTableSize;
+        do
+        {
+          dest[kExtraDistSymbols_v7] = dest[0];
+          dest--;
+        } while (--count);
+
+        memset(lens + kMainTableSize + kDistTableSize_v6, 0, kExtraDistSymbols_v7);
+      }
+
+      if (!tables.Dist.Build(&lens[kMainTableSize], buildMode))
+        return S_FALSE;
+      if (!tables.Len.Build(
+              &lens[kMainTableSize + kDistTableSize_MAX + kAlignTableSize],
               buildMode))
         return S_FALSE;
-      tables.UseAlignBits = true;
-      break;
-    }
-  }
 
-  tableWasFilled = true;
-  return S_OK;
-}
-
-struct CRar5ParallelBlockJob
-{
-  std::vector<Byte> Data;
-  CBitDecoder BitState;
-  CRar5ParallelTables Tables;
-  std::vector<CRar5ParallelDecodedItem> Decoded;
-  UInt64 PackPos;
-  bool LastBlock;
-  bool TablePresent;
-  bool InitialTablesValid;
-  bool IsV7;
-  bool MinorError;
-  HRESULT Result;
-
-  std::mutex Mutex;
-  std::condition_variable FinishedEvent;
-  bool TablesReady;
-  bool Done;
-
-  CRar5ParallelBlockJob():
-      PackPos(0),
-      LastBlock(false),
-      TablePresent(false),
-      InitialTablesValid(false),
-      IsV7(false),
-      MinorError(false),
-      Result(S_OK),
-      TablesReady(false),
-      Done(false)
-  {}
-
-  void Reset()
-  {
-    Data.clear();
-    Decoded.clear();
-    PackPos = 0;
-    LastBlock = false;
-    TablePresent = false;
-    InitialTablesValid = false;
-    IsV7 = false;
-    MinorError = false;
-    Result = S_OK;
-    std::lock_guard<std::mutex> lock(Mutex);
-    TablesReady = false;
-    Done = false;
-  }
-
-  void Process()
-  {
-    HRESULT result = S_OK;
-
-    try
-    {
-      Decoded.clear();
-      Decoded.reserve(0x4100);
-
-      CBitDecoder bitStream = BitState;
-      bool tableWasFilled = InitialTablesValid;
-      bool workerLastBlock = false;
-      result = ReadRar5ParallelTables(
-          bitStream,
-          IsV7,
-          tableWasFilled,
-          Tables,
-          workerLastBlock);
-
-      if (result == S_OK && tableWasFilled)
+      tables.UseAlignBits = false;
+      for (i = 0; i < kAlignTableSize; i++)
       {
+        if (lens[kMainTableSize + kDistTableSize_MAX + (size_t)i] != kNumAlignBits)
         {
-          std::lock_guard<std::mutex> lock(Mutex);
-          TablesReady = true;
-          LastBlock = workerLastBlock;
+          if (!tables.Align.Build(
+                  &lens[kMainTableSize + kDistTableSize_MAX],
+                  buildMode))
+            return S_FALSE;
+          tables.UseAlignBits = true;
+          break;
         }
-        FinishedEvent.notify_all();
       }
 
-      if (result != S_OK)
+      tableWasFilled = true;
+      return S_OK;
+    }
+
+    struct CRar5ParallelBlockJob
+    {
+      std::vector<Byte> Data;
+      CBitDecoder BitState;
+      CRar5ParallelTables Tables;
+      std::vector<CRar5ParallelDecodedItem> Decoded;
+      UInt64 PackPos;
+      bool LastBlock;
+      bool TablePresent;
+      bool InitialTablesValid;
+      bool IsV7;
+      bool MinorError;
+      HRESULT Result;
+
+      std::mutex Mutex;
+      std::condition_variable FinishedEvent;
+      bool TablesReady;
+      bool Done;
+
+      CRar5ParallelBlockJob() : PackPos(0),
+                                LastBlock(false),
+                                TablePresent(false),
+                                InitialTablesValid(false),
+                                IsV7(false),
+                                MinorError(false),
+                                Result(S_OK),
+                                TablesReady(false),
+                                Done(false)
       {
+      }
+
+      void Reset()
+      {
+        Data.clear();
+        Decoded.clear();
+        PackPos = 0;
+        LastBlock = false;
+        TablePresent = false;
+        InitialTablesValid = false;
+        IsV7 = false;
+        MinorError = false;
+        Result = S_OK;
+        std::lock_guard<std::mutex> lock(Mutex);
+        TablesReady = false;
+        Done = false;
+      }
+
+      void Process()
+      {
+        HRESULT result = S_OK;
+
+        try
+        {
+          Decoded.clear();
+          Decoded.reserve(0x4100);
+
+          CBitDecoder bitStream = BitState;
+          bool tableWasFilled = InitialTablesValid;
+          bool workerLastBlock = false;
+          result = ReadRar5ParallelTables(
+              bitStream,
+              IsV7,
+              tableWasFilled,
+              Tables,
+              workerLastBlock);
+
+          if (result == S_OK && tableWasFilled)
+          {
+            {
+              std::lock_guard<std::mutex> lock(Mutex);
+              TablesReady = true;
+              LastBlock = workerLastBlock;
+            }
+            FinishedEvent.notify_all();
+          }
+
+          if (result != S_OK)
+          {
+            {
+              std::lock_guard<std::mutex> lock(Mutex);
+              Result = result;
+              Done = true;
+            }
+            FinishedEvent.notify_all();
+            return;
+          }
+
+          for (;;)
+          {
+            const UInt64 processed = bitStream.GetProcessedSize_Round();
+            if (processed > bitStream._blockEnd ||
+                (processed == bitStream._blockEnd &&
+                 bitStream.GetProcessedBits7() >= bitStream._blockEndBits7))
+              break;
+
+            unsigned sym;
+            if (!Tables.Main.Decode2(&bitStream, sym))
+            {
+              result = S_FALSE;
+              break;
+            }
+
+            if (sym < 256)
+            {
+              if (!Decoded.empty())
+              {
+                CRar5ParallelDecodedItem &prev = Decoded.back();
+                if (prev.Type == RAR5_MT_LITERAL && prev.LiteralSize < sizeof(prev.Literal))
+                {
+                  prev.Literal[prev.LiteralSize++] = (Byte)sym;
+                  continue;
+                }
+              }
+
+              CRar5ParallelDecodedItem item;
+              item.Type = RAR5_MT_LITERAL;
+              item.LiteralSize = 1;
+              item.Literal[0] = (Byte)sym;
+              Decoded.push_back(item);
+              continue;
+            }
+
+            if (sym == 256)
+            {
+              CRar5ParallelDecodedItem item;
+              item.Type = RAR5_MT_FILTER;
+              item.Distance = ReadUInt32(bitStream);
+              item.FilterSize = ReadUInt32(bitStream);
+              item.FilterType = (Byte)bitStream.ReadBits_9fix(3);
+              if (item.FilterType == FILTER_DELTA)
+                item.FilterChannels = (Byte)(bitStream.ReadBits_9fix(5) + 1);
+              Decoded.push_back(item);
+            }
+            else if (sym == 257)
+            {
+              CRar5ParallelDecodedItem item;
+              item.Type = RAR5_MT_FULLREP;
+              Decoded.push_back(item);
+            }
+            else if (sym < kSymbolRep + kNumReps)
+            {
+              CLenType len;
+              if (!Tables.Len.Decode2(&bitStream, len))
+              {
+                result = S_FALSE;
+                break;
+              }
+              if (len >= 8)
+                len = SlotToLen(bitStream, len);
+              len += 2;
+
+              CRar5ParallelDecodedItem item;
+              item.Type = RAR5_MT_REP;
+              item.Distance = (size_t)sym - kSymbolRep;
+              item.Length = (UInt16)len;
+              Decoded.push_back(item);
+            }
+            else
+            {
+              CLenType len = sym - (kSymbolRep + kNumReps);
+              if (len >= 8)
+                len = SlotToLen(bitStream, len);
+              len += 2;
+
+              size_t distance;
+              unsigned distSlot;
+              if (!Tables.Dist.Decode2(&bitStream, distSlot))
+              {
+                result = S_FALSE;
+                break;
+              }
+              distance = distSlot;
+
+              if (distance >= 4)
+              {
+                const unsigned numBits = ((unsigned)distance - 2) >> 1;
+                distance = (2 | (distance & 1)) << numBits;
+
+                const Byte *buf = bitStream._buf;
+#ifdef Z7_RAR5_USE_64BIT
+                const UInt64 v = GetBe64(buf);
+#else
+                const UInt32 v = GetBe32(buf);
+#endif
+
+                if (numBits < kNumAlignBits)
+                {
+                  distance += bitStream.ReadBits_Big25(numBits, v);
+                }
+                else
+                {
+                  len += k_LenPlusTable[numBits];
+                  if (Tables.UseAlignBits)
+                  {
+                    distance +=
+                        (bitStream.ReadBits_Big25(numBits - kNumAlignBits, v) << kNumAlignBits);
+                    unsigned align;
+                    if (!Tables.Align.Decode2(&bitStream, align))
+                    {
+                      result = S_FALSE;
+                      break;
+                    }
+                    distance += align;
+                  }
+                  else
+                    distance += bitStream.ReadBits_Big(numBits, v);
+#ifndef Z7_RAR5_USE_64BIT
+                  if (numBits >= 30)
+                    distance = (size_t)0 - 1 - 1;
+#endif
+                }
+              }
+              distance++;
+
+              CRar5ParallelDecodedItem item;
+              item.Type = RAR5_MT_MATCH;
+              item.Distance = distance;
+              item.Length = (UInt16)len;
+              Decoded.push_back(item);
+            }
+
+            if (bitStream.IsBlockOverRead())
+            {
+              result = S_FALSE;
+              break;
+            }
+          }
+
+          if (result == S_OK)
+          {
+            if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
+              result = S_FALSE;
+            else if (bitStream.GetProcessedSize_Round() == bitStream._blockEnd &&
+                     bitStream.GetProcessedBits7() == bitStream._blockEndBits7 &&
+                     bitStream._blockEndBits7 != 0)
+            {
+              // Match CBitDecoder::AlignToByte(): RAR requires the unused low
+              // bits in the final partial byte to be zero.  The worker does not
+              // call AlignToByte() because it never advances to the next block.
+              const unsigned b = (unsigned)*bitStream._buf << bitStream._blockEndBits7;
+              if (b & 0xff)
+                MinorError = true;
+            }
+          }
+
+          MinorError = MinorError || bitStream._minorError;
+        }
+        catch (const std::bad_alloc &)
+        {
+          result = E_OUTOFMEMORY;
+        }
+        catch (...)
+        {
+          result = E_FAIL;
+        }
+
         {
           std::lock_guard<std::mutex> lock(Mutex);
           Result = result;
           Done = true;
         }
         FinishedEvent.notify_all();
-        return;
       }
 
-      for (;;)
+      HRESULT WaitTables(CRar5ParallelTables &tables)
       {
-        const UInt64 processed = bitStream.GetProcessedSize_Round();
-        if (processed > bitStream._blockEnd ||
-            (processed == bitStream._blockEnd &&
-             bitStream.GetProcessedBits7() >= bitStream._blockEndBits7))
-          break;
-
-        unsigned sym;
-        if (!Tables.Main.Decode2(&bitStream, sym))
-        {
-          result = S_FALSE;
-          break;
-        }
-
-        if (sym < 256)
-        {
-          if (!Decoded.empty())
-          {
-            CRar5ParallelDecodedItem &prev = Decoded.back();
-            if (prev.Type == RAR5_MT_LITERAL && prev.LiteralSize < sizeof(prev.Literal))
-            {
-              prev.Literal[prev.LiteralSize++] = (Byte)sym;
-              continue;
-            }
-          }
-
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_LITERAL;
-          item.LiteralSize = 1;
-          item.Literal[0] = (Byte)sym;
-          Decoded.push_back(item);
-          continue;
-        }
-
-        if (sym == 256)
-        {
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_FILTER;
-          item.Distance = ReadUInt32(bitStream);
-          item.FilterSize = ReadUInt32(bitStream);
-          item.FilterType = (Byte)bitStream.ReadBits_9fix(3);
-          if (item.FilterType == FILTER_DELTA)
-            item.FilterChannels = (Byte)(bitStream.ReadBits_9fix(5) + 1);
-          Decoded.push_back(item);
-        }
-        else if (sym == 257)
-        {
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_FULLREP;
-          Decoded.push_back(item);
-        }
-        else if (sym < kSymbolRep + kNumReps)
-        {
-          CLenType len;
-          if (!Tables.Len.Decode2(&bitStream, len))
-          {
-            result = S_FALSE;
-            break;
-          }
-          if (len >= 8)
-            len = SlotToLen(bitStream, len);
-          len += 2;
-
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_REP;
-          item.Distance = (size_t)sym - kSymbolRep;
-          item.Length = (UInt16)len;
-          Decoded.push_back(item);
-        }
-        else
-        {
-          CLenType len = sym - (kSymbolRep + kNumReps);
-          if (len >= 8)
-            len = SlotToLen(bitStream, len);
-          len += 2;
-
-          size_t distance;
-          unsigned distSlot;
-          if (!Tables.Dist.Decode2(&bitStream, distSlot))
-          {
-            result = S_FALSE;
-            break;
-          }
-          distance = distSlot;
-
-          if (distance >= 4)
-          {
-            const unsigned numBits = ((unsigned)distance - 2) >> 1;
-            distance = (2 | (distance & 1)) << numBits;
-
-            const Byte *buf = bitStream._buf;
-#ifdef Z7_RAR5_USE_64BIT
-            const UInt64 v = GetBe64(buf);
-#else
-            const UInt32 v = GetBe32(buf);
-#endif
-
-            if (numBits < kNumAlignBits)
-            {
-              distance += bitStream.ReadBits_Big25(numBits, v);
-            }
-            else
-            {
-              len += k_LenPlusTable[numBits];
-              if (Tables.UseAlignBits)
-              {
-                distance +=
-                    (bitStream.ReadBits_Big25(numBits - kNumAlignBits, v) << kNumAlignBits);
-                unsigned align;
-                if (!Tables.Align.Decode2(&bitStream, align))
-                {
-                  result = S_FALSE;
-                  break;
-                }
-                distance += align;
-              }
-              else
-                distance += bitStream.ReadBits_Big(numBits, v);
-#ifndef Z7_RAR5_USE_64BIT
-              if (numBits >= 30)
-                distance = (size_t)0 - 1 - 1;
-#endif
-            }
-          }
-          distance++;
-
-          CRar5ParallelDecodedItem item;
-          item.Type = RAR5_MT_MATCH;
-          item.Distance = distance;
-          item.Length = (UInt16)len;
-          Decoded.push_back(item);
-        }
-
-        if (bitStream.IsBlockOverRead())
-        {
-          result = S_FALSE;
-          break;
-        }
+        std::unique_lock<std::mutex> lock(Mutex);
+        FinishedEvent.wait(lock, [this]
+                           { return TablesReady || Done; });
+        if (!TablesReady)
+          return Result == S_OK ? S_FALSE : Result;
+        tables = Tables;
+        return S_OK;
       }
 
-      if (result == S_OK)
+      HRESULT Wait()
       {
-        if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
-          result = S_FALSE;
-        else if (bitStream.GetProcessedSize_Round() == bitStream._blockEnd &&
-                 bitStream.GetProcessedBits7() == bitStream._blockEndBits7 &&
-                 bitStream._blockEndBits7 != 0)
+        std::unique_lock<std::mutex> lock(Mutex);
+        FinishedEvent.wait(lock, [this]
+                           { return Done; });
+        return Result;
+      }
+    };
+
+    class CRar5ParallelBlockPool
+    {
+      std::vector<std::thread> _threads;
+      std::vector<std::unique_ptr<CRar5ParallelBlockJob>> _jobs;
+      std::deque<CRar5ParallelBlockJob *> _queue;
+      std::mutex _mutex;
+      std::condition_variable _workEvent;
+      std::condition_variable _idleEvent;
+      size_t _pending;
+      bool _stop;
+
+      void WorkerLoop()
+      {
+        for (;;)
         {
-          // Match CBitDecoder::AlignToByte(): RAR requires the unused low
-          // bits in the final partial byte to be zero.  The worker does not
-          // call AlignToByte() because it never advances to the next block.
-          const unsigned b = (unsigned)*bitStream._buf << bitStream._blockEndBits7;
-          if (b & 0xff)
-            MinorError = true;
+          CRar5ParallelBlockJob *job = NULL;
+          {
+            std::unique_lock<std::mutex> lock(_mutex);
+            _workEvent.wait(lock, [this]
+                            { return _stop || !_queue.empty(); });
+            if (_stop && _queue.empty())
+              return;
+            job = _queue.front();
+            _queue.pop_front();
+          }
+
+          job->Process();
+
+          {
+            std::lock_guard<std::mutex> lock(_mutex);
+            if (_pending != 0)
+              --_pending;
+            if (_pending == 0)
+              _idleEvent.notify_all();
+          }
         }
       }
 
-      MinorError = MinorError || bitStream._minorError;
-    }
-    catch (const std::bad_alloc &)
-    {
-      result = E_OUTOFMEMORY;
-    }
-    catch (...)
-    {
-      result = E_FAIL;
-    }
+    public:
+      CRar5ParallelBlockPool() : _pending(0), _stop(false) {}
 
-    {
-      std::lock_guard<std::mutex> lock(Mutex);
-      Result = result;
-      Done = true;
-    }
-    FinishedEvent.notify_all();
-  }
+      ~CRar5ParallelBlockPool()
+      {
+        Stop();
+      }
 
-  HRESULT WaitTables(CRar5ParallelTables &tables)
-  {
-    std::unique_lock<std::mutex> lock(Mutex);
-    FinishedEvent.wait(lock, [this] { return TablesReady || Done; });
-    if (!TablesReady)
-      return Result == S_OK ? S_FALSE : Result;
-    tables = Tables;
-    return S_OK;
-  }
+      bool Start(unsigned numWorkers, size_t ringSize)
+      {
+        try
+        {
+          _jobs.reserve(ringSize);
+          for (size_t i = 0; i < ringSize; ++i)
+            _jobs.push_back(std::unique_ptr<CRar5ParallelBlockJob>(new CRar5ParallelBlockJob()));
 
-  HRESULT Wait()
-  {
-    std::unique_lock<std::mutex> lock(Mutex);
-    FinishedEvent.wait(lock, [this] { return Done; });
-    return Result;
-  }
-};
+          _threads.reserve(numWorkers);
+          for (unsigned i = 0; i < numWorkers; i++)
+            _threads.emplace_back([this]
+                                  { WorkerLoop(); });
+        }
+        catch (...)
+        {
+          Stop();
+          return false;
+        }
+        return true;
+      }
 
-class CRar5ParallelBlockPool
-{
-  std::vector<std::thread> _threads;
-  std::vector<std::unique_ptr<CRar5ParallelBlockJob>> _jobs;
-  std::deque<CRar5ParallelBlockJob *> _queue;
-  std::mutex _mutex;
-  std::condition_variable _workEvent;
-  std::condition_variable _idleEvent;
-  size_t _pending;
-  bool _stop;
-
-  void WorkerLoop()
-  {
-    for (;;)
-    {
-      CRar5ParallelBlockJob *job = NULL;
+      void WaitIdle()
       {
         std::unique_lock<std::mutex> lock(_mutex);
-        _workEvent.wait(lock, [this] { return _stop || !_queue.empty(); });
-        if (_stop && _queue.empty())
-          return;
-        job = _queue.front();
-        _queue.pop_front();
+        _idleEvent.wait(lock, [this]
+                        { return _pending == 0; });
       }
 
-      job->Process();
-
+      void Stop()
       {
-        std::lock_guard<std::mutex> lock(_mutex);
-        if (_pending != 0)
-          --_pending;
-        if (_pending == 0)
-          _idleEvent.notify_all();
+        WaitIdle();
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          _stop = true;
+        }
+        _workEvent.notify_all();
+
+        for (std::thread &thread : _threads)
+          if (thread.joinable())
+            thread.join();
+
+        _threads.clear();
+        _queue.clear();
+        _jobs.clear();
       }
-    }
-  }
 
-public:
-  CRar5ParallelBlockPool(): _pending(0), _stop(false) {}
+      size_t JobCount() const
+      {
+        return _jobs.size();
+      }
 
-  ~CRar5ParallelBlockPool()
-  {
-    Stop();
-  }
+      CRar5ParallelBlockJob &JobAt(size_t index)
+      {
+        return *_jobs[index];
+      }
 
-  bool Start(unsigned numWorkers, size_t ringSize)
-  {
-    try
+      void Submit(CRar5ParallelBlockJob *job)
+      {
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          ++_pending;
+          _queue.push_back(job);
+        }
+        _workEvent.notify_one();
+      }
+    };
+
+    static void DestroyRar5ParallelBlockPool(CRar5ParallelBlockPool *pool)
     {
-      _jobs.reserve(ringSize);
-      for (size_t i = 0; i < ringSize; ++i)
-        _jobs.push_back(std::unique_ptr<CRar5ParallelBlockJob>(new CRar5ParallelBlockJob()));
-
-      _threads.reserve(numWorkers);
-      for (unsigned i = 0; i < numWorkers; i++)
-        _threads.emplace_back([this] { WorkerLoop(); });
+      delete pool;
     }
-    catch (...)
+
+    class CRar5ParallelPoolRunScope
     {
-      Stop();
-      return false;
-    }
-    return true;
-  }
+      CRar5ParallelBlockPool &_pool;
 
-  void WaitIdle()
-  {
-    std::unique_lock<std::mutex> lock(_mutex);
-    _idleEvent.wait(lock, [this] { return _pending == 0; });
-  }
+    public:
+      explicit CRar5ParallelPoolRunScope(CRar5ParallelBlockPool &pool) : _pool(pool) {}
+      ~CRar5ParallelPoolRunScope() { _pool.WaitIdle(); }
+    };
 
-  void Stop()
-  {
-    WaitIdle();
+    Z7_CLASS_IMP_NOQIB_1(
+        CRar5ReplayInStream, ISequentialInStream)
+    CMyComPtr<ISequentialInStream> _stream;
+    Byte _prefix[5];
+    unsigned _prefixSize;
+    unsigned _prefixPos;
+
+  public:
+    CRar5ReplayInStream() : _prefixSize(0), _prefixPos(0) {}
+    void Init(const Byte *prefix, unsigned prefixSize, ISequentialInStream *stream)
     {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _stop = true;
+      _prefixSize = prefixSize;
+      _prefixPos = 0;
+      memcpy(_prefix, prefix, prefixSize);
+      _stream = stream;
     }
-    _workEvent.notify_all();
+  };
 
-    for (std::thread &thread: _threads)
-      if (thread.joinable())
-        thread.join();
-
-    _threads.clear();
-    _queue.clear();
-    _jobs.clear();
-  }
-
-  size_t JobCount() const
+  Z7_COM7F_IMF(CRar5ReplayInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
   {
-    return _jobs.size();
-  }
+    *processedSize = 0;
+    Byte *dest = (Byte *)data;
 
-  CRar5ParallelBlockJob &JobAt(size_t index)
-  {
-    return *_jobs[index];
-  }
-
-  void Submit(CRar5ParallelBlockJob *job)
-  {
+    if (_prefixPos < _prefixSize && size != 0)
     {
-      std::lock_guard<std::mutex> lock(_mutex);
-      ++_pending;
-      _queue.push_back(job);
+      UInt32 cur = (UInt32)(_prefixSize - _prefixPos);
+      if (cur > size)
+        cur = size;
+      memcpy(dest, _prefix + _prefixPos, cur);
+      _prefixPos += cur;
+      dest += cur;
+      size -= cur;
+      *processedSize += cur;
     }
-    _workEvent.notify_one();
-  }
-};
 
+    if (size == 0)
+      return S_OK;
 
-static void DestroyRar5ParallelBlockPool(CRar5ParallelBlockPool *pool)
-{
-  delete pool;
-}
-
-
-class CRar5ParallelPoolRunScope
-{
-  CRar5ParallelBlockPool &_pool;
-
-public:
-  explicit CRar5ParallelPoolRunScope(CRar5ParallelBlockPool &pool): _pool(pool) {}
-  ~CRar5ParallelPoolRunScope() { _pool.WaitIdle(); }
-};
-
-Z7_CLASS_IMP_NOQIB_1(
-  CRar5ReplayInStream
-  , ISequentialInStream
-)
-  CMyComPtr<ISequentialInStream> _stream;
-  Byte _prefix[5];
-  unsigned _prefixSize;
-  unsigned _prefixPos;
-public:
-  CRar5ReplayInStream(): _prefixSize(0), _prefixPos(0) {}
-  void Init(const Byte *prefix, unsigned prefixSize, ISequentialInStream *stream)
-  {
-    _prefixSize = prefixSize;
-    _prefixPos = 0;
-    memcpy(_prefix, prefix, prefixSize);
-    _stream = stream;
-  }
-};
-
-Z7_COM7F_IMF(CRar5ReplayInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
-{
-  *processedSize = 0;
-  Byte *dest = (Byte *)data;
-
-  if (_prefixPos < _prefixSize && size != 0)
-  {
-    UInt32 cur = (UInt32)(_prefixSize - _prefixPos);
-    if (cur > size)
-      cur = size;
-    memcpy(dest, _prefix + _prefixPos, cur);
-    _prefixPos += cur;
-    dest += cur;
-    size -= cur;
-    *processedSize += cur;
+    UInt32 processed = 0;
+    const HRESULT res = _stream->Read(dest, size, &processed);
+    *processedSize += processed;
+    return res;
   }
 
-  if (size == 0)
-    return S_OK;
-
-  UInt32 processed = 0;
-  const HRESULT res = _stream->Read(dest, size, &processed);
-  *processedSize += processed;
-  return res;
-}
-
-
-Z7_CLASS_IMP_NOQIB_1(
-  CRar5ProgressOffset
-  , ICompressProgressInfo
-)
+  Z7_CLASS_IMP_NOQIB_1(
+      CRar5ProgressOffset, ICompressProgressInfo)
   CMyComPtr<ICompressProgressInfo> _progress;
   UInt64 _inOffset;
+
 public:
-  CRar5ProgressOffset(): _inOffset(0) {}
+  CRar5ProgressOffset() : _inOffset(0) {}
 
   void Init(ICompressProgressInfo *progress, UInt64 inOffset)
   {
@@ -2138,13 +2129,13 @@ struct CRar5RawBlockHeader
   bool TablePresent;
   bool UseSerial;
 
-  CRar5RawBlockHeader():
-      HeaderSize(0),
-      BlockSize(0),
-      LastBlock(false),
-      TablePresent(false),
-      UseSerial(false)
-  {}
+  CRar5RawBlockHeader() : HeaderSize(0),
+                          BlockSize(0),
+                          LastBlock(false),
+                          TablePresent(false),
+                          UseSerial(false)
+  {
+  }
 };
 
 static HRESULT ReadRar5RawBlockHeader(
@@ -2192,7 +2183,6 @@ static HRESULT ReadRar5RawBlockHeader(
 }
 
 #endif // !Z7_ST
-
 
 /*
   DecodeLZ2() will stop decoding if it reaches limit when (_winPos >= _limit)
@@ -2243,28 +2233,27 @@ HRESULT CDecoder::DecodeLZ2(const CBitDecoder &bitStream) throw()
       const UInt64 processed = _bitStream.GetProcessedSize_Round();
       // some cases are error, but the caller will process such error cases.
       if (processed >= _bitStream._blockEnd &&
-          (processed > _bitStream._blockEnd
-            || _bitStream.GetProcessedBits7() >= _bitStream._blockEndBits7))
-          LZ_LOOP_BREAK_OK
+          (processed > _bitStream._blockEnd || _bitStream.GetProcessedBits7() >= _bitStream._blockEndBits7))
+        LZ_LOOP_BREAK_OK
       // that check is not required, but it can help, if there is BUG in another code
       if (!_tableWasFilled)
         LZ_LOOP_BREAK_ERROR
     }
-    
+
 #if 0
     const unsigned sym = m_MainDecoder.Decode(&_bitStream);
 #else
     unsigned sym;
     Z7_RAR_HUFF_DECODE_CHECK_break(sym, &m_MainDecoder, k_NumHufTableBits_Main, &_bitStream)
 #endif
-    
-    if (sym < 256)
+
+        if (sym < 256)
     {
       *winPos++ = (Byte)sym;
       // _lzSize++;
       continue;
     }
-   
+
     CLenType len;
 
     if (sym < kSymbolRep + kNumReps)
@@ -2278,23 +2267,23 @@ HRESULT CDecoder::DecodeLZ2(const CBitDecoder &bitStream) throw()
           rep0 = dist;
           if (sym >= kSymbolRep + 2)
           {
-            #if 1
-              rep0 = _reps[(size_t)sym - kSymbolRep];
-              _reps[(size_t)sym - kSymbolRep] = _reps[2];
-              _reps[2] = dist;
-            #else
-              if (sym != kSymbolRep + 2)
-              {
-                rep0 = _reps[3];
-                _reps[3] = _reps[2];
-                _reps[2] = dist;
-              }
-              else
-              {
-                rep0 = _reps[2];
-                _reps[2] = dist;
-              }
-            #endif
+#if 1
+            rep0 = _reps[(size_t)sym - kSymbolRep];
+            _reps[(size_t)sym - kSymbolRep] = _reps[2];
+            _reps[2] = dist;
+#else
+                if (sym != kSymbolRep + 2)
+                {
+                  rep0 = _reps[3];
+                  _reps[3] = _reps[2];
+                  _reps[2] = dist;
+                }
+                else
+                {
+                  rep0 = _reps[2];
+                  _reps[2] = dist;
+                }
+#endif
           }
         }
 #if 0
@@ -2304,8 +2293,8 @@ HRESULT CDecoder::DecodeLZ2(const CBitDecoder &bitStream) throw()
 #else
         Z7_RAR_HUFF_DECODE_CHECK_break(len, &m_LenDecoder, k_NumHufTableBits_Len, &_bitStream)
 #endif
-        if (len >= 8)
-          len = SlotToLen(_bitStream, len);
+            if (len >= 8)
+                len = SlotToLen(_bitStream, len);
         len += 2;
         // _lastLen = (UInt32)len;
       }
@@ -2341,14 +2330,14 @@ HRESULT CDecoder::DecodeLZ2(const CBitDecoder &bitStream) throw()
         len = SlotToLen(_bitStream, len);
       len += 2;
       // _lastLen = (UInt32)len;
-      
+
 #if 0
       rep0 = (UInt32)m_DistDecoder.Decode(&_bitStream);
 #else
       Z7_RAR_HUFF_DECODE_CHECK_break(rep0, &m_DistDecoder, k_NumHufTableBits_Dist, &_bitStream)
 #endif
 
-      if (rep0 >= 4)
+          if (rep0 >= 4)
       {
 #if 0
         if (rep0 >= kDistTableSize_MAX)
@@ -2361,39 +2350,39 @@ HRESULT CDecoder::DecodeLZ2(const CBitDecoder &bitStream) throw()
 #ifdef Z7_RAR5_USE_64BIT
         const UInt64 v = GetBe64(buf);
 #else
-        const UInt32 v = GetBe32(buf);
+            const UInt32 v = GetBe32(buf);
 #endif
 
         // _lastLen = (UInt32)len;
         if (numBits < kNumAlignBits)
         {
           rep0 += // _bitStream.ReadBits9(numBits);
-            _bitStream.ReadBits_Big25(numBits, v);
+              _bitStream.ReadBits_Big25(numBits, v);
         }
         else
         {
-          #if !defined(MY_CPU_AMD64)
-            len += k_LenPlusTable[numBits];
-          #elif 0
-            len += k_LenPlusTable_LOC[numBits];
-          #elif 1
-            len += m_LenPlusTable[numBits];
-          #elif 1 && defined(MY_CPU_64BIT) && defined(MY_CPU_AMD64)
-            // len += (unsigned)((UInt64)0xfffffffeaa554000 >> (numBits * 2)) & 3;
-            len += (unsigned)((UInt64)0xfffffffffeaa5540 >> (numBits * 2 - 8)) & 3;
-          #elif 1
-            len += 3;
-            len -= (unsigned)(numBits -  7) >> (sizeof(unsigned) * 8 - 1);
-            len -= (unsigned)(numBits - 12) >> (sizeof(unsigned) * 8 - 1);
-            len -= (unsigned)(numBits - 17) >> (sizeof(unsigned) * 8 - 1);
-          #elif 1
-            len += 3;
-            len -= (0x155aabf >> (numBits - 4) >> (numBits - 4)) & 3;
-          #elif 1
-            len += (numBits >= 7);
-            len += (numBits >= 12);
-            len += (numBits >= 17);
-          #endif
+#if !defined(MY_CPU_AMD64)
+          len += k_LenPlusTable[numBits];
+#elif 0
+              len += k_LenPlusTable_LOC[numBits];
+#elif 1
+              len += m_LenPlusTable[numBits];
+#elif 1 && defined(MY_CPU_64BIT) && defined(MY_CPU_AMD64)
+              // len += (unsigned)((UInt64)0xfffffffeaa554000 >> (numBits * 2)) & 3;
+              len += (unsigned)((UInt64)0xfffffffffeaa5540 >> (numBits * 2 - 8)) & 3;
+#elif 1
+              len += 3;
+              len -= (unsigned)(numBits - 7) >> (sizeof(unsigned) * 8 - 1);
+              len -= (unsigned)(numBits - 12) >> (sizeof(unsigned) * 8 - 1);
+              len -= (unsigned)(numBits - 17) >> (sizeof(unsigned) * 8 - 1);
+#elif 1
+              len += 3;
+              len -= (0x155aabf >> (numBits - 4) >> (numBits - 4)) & 3;
+#elif 1
+              len += (numBits >= 7);
+              len += (numBits >= 12);
+              len += (numBits >= 17);
+#endif
           // _lastLen = (UInt32)len;
           if (_useAlignBits)
           {
@@ -2407,7 +2396,7 @@ HRESULT CDecoder::DecodeLZ2(const CBitDecoder &bitStream) throw()
             unsigned a;
             Z7_RAR_HUFF_DECODE_CHECK_break(a, &m_AlignDecoder, k_NumHufTableBits_Align, &_bitStream)
 #endif
-            rep0 += a;
+                rep0 += a;
           }
           else
             rep0 += _bitStream.ReadBits_Big(numBits, v);
@@ -2463,7 +2452,7 @@ HRESULT CDecoder::DecodeLZ2(const CBitDecoder &bitStream) throw()
         continue;
       }
 
-error_dist:
+    error_dist:
       // LZ_LOOP_BREAK_ERROR;
       _lzError = LZ_ERROR_TYPE_DIST;
       do
@@ -2487,8 +2476,6 @@ decode_error:
 #endif
 }
 
-
-
 /*
 input conditions:
   _winPos < _winSize
@@ -2510,10 +2497,10 @@ HRESULT CDecoder::DecodeLZ()
   {
     size_t rem = _winSize - winPos;
     if (rem > kWriteStep)
-        rem = kWriteStep;
+      rem = kWriteStep;
     limit = winPos + rem;
   }
-  
+
   for (;;)
   {
     if (winPos >= limit)
@@ -2543,7 +2530,7 @@ HRESULT CDecoder::DecodeLZ()
         rem = _winSize - winPos;
       }
       if (rem > kWriteStep)
-          rem = kWriteStep;
+        rem = kWriteStep;
       limit = winPos + rem;
       continue;
     }
@@ -2572,7 +2559,7 @@ HRESULT CDecoder::DecodeLZ()
               // we ignore thar error as original unrar
               _bitStream._minorError = true;
 #else
-              break; // return S_FALSE;
+                  break; // return S_FALSE;
 #endif
             }
             _bitStream.AlignToByte();
@@ -2619,15 +2606,12 @@ HRESULT CDecoder::DecodeLZ()
   }
 
   _winPos = winPos;
-  
+
   if (_bitStream._hres != S_OK)
     return _bitStream._hres;
 
   return S_FALSE;
 }
-
-
-
 
 #ifndef Z7_ST
 
@@ -2755,7 +2739,7 @@ HRESULT CDecoder::DecodeLZParallel()
       return S_OK;
     }
 
-error_dist:
+  error_dist:
     _lzError = LZ_ERROR_TYPE_DIST;
     do
       *dest++ = 0;
@@ -2831,55 +2815,55 @@ error_dist:
     }
     _isLastBlock = job.LastBlock;
 
-    for (const CRar5ParallelDecodedItem &item: job.Decoded)
+    for (const CRar5ParallelDecodedItem &item : job.Decoded)
     {
       RINOK(normalizeWindow())
 
       switch (item.Type)
       {
-        case RAR5_MT_LITERAL:
-          memcpy(_window + winPos, item.Literal, item.LiteralSize);
-          winPos += item.LiteralSize;
-          break;
+      case RAR5_MT_LITERAL:
+        memcpy(_window + winPos, item.Literal, item.LiteralSize);
+        winPos += item.LiteralSize;
+        break;
 
-        case RAR5_MT_MATCH:
-        {
-          const size_t distance = item.Distance;
-          _reps[3] = _reps[2];
-          _reps[2] = _reps[1];
-          _reps[1] = _reps[0];
-          _reps[0] = distance;
-          _lastLen = item.Length;
-          RINOK(copyMatchRetired(distance, item.Length))
-          break;
-        }
+      case RAR5_MT_MATCH:
+      {
+        const size_t distance = item.Distance;
+        _reps[3] = _reps[2];
+        _reps[2] = _reps[1];
+        _reps[1] = _reps[0];
+        _reps[0] = distance;
+        _lastLen = item.Length;
+        RINOK(copyMatchRetired(distance, item.Length))
+        break;
+      }
 
-        case RAR5_MT_REP:
-        {
-          const unsigned repIndex = (unsigned)item.Distance;
-          if (repIndex >= kNumReps)
-            return S_FALSE;
-          const size_t distance = _reps[repIndex];
-          for (unsigned i = repIndex; i > 0; i--)
-            _reps[i] = _reps[i - 1];
-          _reps[0] = distance;
-          _lastLen = item.Length;
-          RINOK(copyMatchRetired(distance, item.Length))
-          break;
-        }
+      case RAR5_MT_REP:
+      {
+        const unsigned repIndex = (unsigned)item.Distance;
+        if (repIndex >= kNumReps)
+          return S_FALSE;
+        const size_t distance = _reps[repIndex];
+        for (unsigned i = repIndex; i > 0; i--)
+          _reps[i] = _reps[i - 1];
+        _reps[0] = distance;
+        _lastLen = item.Length;
+        RINOK(copyMatchRetired(distance, item.Length))
+        break;
+      }
 
-        case RAR5_MT_FULLREP:
-          if (_lastLen != 0)
-            RINOK(copyMatchRetired(_reps[0], _lastLen))
-          break;
+      case RAR5_MT_FULLREP:
+        if (_lastLen != 0)
+          RINOK(copyMatchRetired(_reps[0], _lastLen))
+        break;
 
-        case RAR5_MT_FILTER:
-          _winPos = winPos;
-          RINOK(addFilterRetired(item))
-          break;
+      case RAR5_MT_FILTER:
+        _winPos = winPos;
+        RINOK(addFilterRetired(item))
+        break;
 
-        default:
-          return E_FAIL;
+      default:
+        return E_FAIL;
       }
     }
 
@@ -3037,7 +3021,6 @@ error_dist:
   return S_OK;
 }
 
-
 HRESULT CDecoder::CodeRealParallel()
 {
   _unsupportedFilter = false;
@@ -3069,7 +3052,6 @@ HRESULT CDecoder::CodeRealParallel()
 
 #endif // !Z7_ST
 
-
 HRESULT CDecoder::CodeReal()
 {
   _unsupportedFilter = false;
@@ -3096,7 +3078,7 @@ HRESULT CDecoder::CodeReal()
   const UInt64 lzSize = _lzSize + _winPos;
   _lzFileStart = lzSize;
   _lzWritten = lzSize;
-  
+
   HRESULT res = DecodeLZ();
 
   HRESULT res2 = S_OK;
@@ -3117,41 +3099,36 @@ HRESULT CDecoder::CodeReal()
   return res;
 }
 
-
-
 Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream *outStream,
-    const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
+                            const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
   _lzError = LZ_ERROR_TYPE_NO;
-/*
-  if file is soild, but decoding of previous file was not finished,
-  we still try to decode new file.
-  We need correct huffman table at starting block.
-  And rar encoder probably writes huffman table at start block, if file is big.
-  So we have good chance to get correct huffman table in some file after corruption.
-  Also we try to recover window by filling zeros, if previous file
-  was decoded to smaller size than required.
-  But if filling size is big, we do full reset of window instead.
-*/
-  #define Z7_RAR_RECOVER_SOLID_LIMIT (1 << 20)
+  /*
+    if file is soild, but decoding of previous file was not finished,
+    we still try to decode new file.
+    We need correct huffman table at starting block.
+    And rar encoder probably writes huffman table at start block, if file is big.
+    So we have good chance to get correct huffman table in some file after corruption.
+    Also we try to recover window by filling zeros, if previous file
+    was decoded to smaller size than required.
+    But if filling size is big, we do full reset of window instead.
+  */
+#define Z7_RAR_RECOVER_SOLID_LIMIT (1 << 20)
   // #define Z7_RAR_RECOVER_SOLID_LIMIT 0 // do not fill zeros
   {
     // if (_winPos > 100) _winPos -= 100; // for debug: corruption
     const UInt64 lzSize = _lzSize + _winPos;
-/*
-    if previous file was decoded with error or for some another cases, then
-        (lzSize > _lzEnd)    is possible
-        (_winPos > _winSize) is possible
-        (_winPos < _winSize + kMaxMatchLen)
-*/
-    if (!_window
-        || !_isSolid
-        || !_wasInit
-        || (lzSize < _lzEnd
+    /*
+        if previous file was decoded with error or for some another cases, then
+            (lzSize > _lzEnd)    is possible
+            (_winPos > _winSize) is possible
+            (_winPos < _winSize + kMaxMatchLen)
+    */
+    if (!_window || !_isSolid || !_wasInit || (lzSize < _lzEnd
 #if Z7_RAR_RECOVER_SOLID_LIMIT != 0
-         && lzSize + Z7_RAR_RECOVER_SOLID_LIMIT < _lzEnd
+                                               && lzSize + Z7_RAR_RECOVER_SOLID_LIMIT < _lzEnd
 #endif
-        ))
+                                               ))
     {
       if (_isSolid)
         _lzError = LZ_ERROR_TYPE_HEADER;
@@ -3175,7 +3152,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
         _lzSize += ws;
         // (_winPos < kMaxMatchLen < _winSize)
         // if (_window)
-          memcpy(_window, _window + ws, _winPos); // memmove is not required here
+        memcpy(_window, _window + ws, _winPos); // memmove is not required here
       }
 
 #if Z7_RAR_RECOVER_SOLID_LIMIT != 0
@@ -3222,25 +3199,25 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   // _winPos < _winSize
   // we don't want _lzSize overflow
   if (_lzSize >= DICT_SIZE_MAX)
-      _lzSize  = DICT_SIZE_MAX;
+    _lzSize = DICT_SIZE_MAX;
   _lzEnd = _lzSize + _winPos;
   // _lzSize <= DICT_SIZE_MAX
   // _lzEnd  <  DICT_SIZE_MAX + _winSize
 
   size_t newSize = _dictSize;
   if (newSize < kWinSize_Min)
-      newSize = kWinSize_Min;
-  
+    newSize = kWinSize_Min;
+
   _unpackSize = 0;
   _unpackSize_Defined = (outSize != NULL);
   if (_unpackSize_Defined)
     _unpackSize = *outSize;
-  
+
   if ((Int64)_unpackSize >= 0)
     _lzEnd += _unpackSize; // known end after current file
   else
     _lzEnd = 0; // unknown end
-  
+
   if (_isSolid && _window)
   {
     // If dictionary was decreased in solid, we use old dictionary.
@@ -3283,30 +3260,28 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     }
     _winSize = newSize;
   }
-  
+
   if (!_inputBuf)
   {
     _inputBuf = (Byte *)z7_AlignedAlloc(kInputBufSize + kInputBufferPadZone);
     if (!_inputBuf)
       return E_OUTOFMEMORY;
   }
-  
+
   _inStream = inStream;
   _outStream = outStream;
   _progress = progress;
   _progress_Pack = 0;
   _progress_Unpack = 0;
-  
+
   HRESULT res;
 #ifndef Z7_ST
-  if (GetRar5ParallelWorkerCount(_numThreads) != 0
-      && inSize
-      && *inSize >= kRar5MtInputThreshold)
+  if (GetRar5ParallelWorkerCount(_numThreads) != 0 && inSize && *inSize >= kRar5MtInputThreshold)
     res = CodeRealParallel();
   else
 #endif
     res = CodeReal();
-  
+
   if (res != S_OK)
     return res;
   // _lzError = LZ_ERROR_TYPE_HEADER; // for debug
@@ -3316,9 +3291,6 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     return E_NOTIMPL;
   return S_OK;
 }
-
-
-
 
 #ifndef Z7_ST
 Z7_COM7F_IMF(CDecoder::SetNumberOfThreads(UInt32 numThreads))
@@ -3338,13 +3310,13 @@ Z7_COM7F_IMF(CDecoder::SetDecoderProperties2(const Byte *data, UInt32 size))
   // unsigned pow = 15 + 8;
   // unsigned frac = 1;
   if (pow + ((frac + 31) >> 5) > MAX_DICT_LOG - 17)
-  // if (frac + (pow << 8) >= ((8 * 2 + 7) << 5) + 8 / 8)
+    // if (frac + (pow << 8) >= ((8 * 2 + 7) << 5) + 8 / 8)
     return E_NOTIMPL;
   _dictSize = (size_t)(frac + 32) << (pow + 12);
   _isSolid = (b1 & 1) != 0;
-  _is_v7   = (b1 & 2) != 0;
+  _is_v7 = (b1 & 2) != 0;
   // printf("\ndict size = %p\n", (void *)(size_t)_dictSize);
   return S_OK;
 }
-
-}}
+}
+}
