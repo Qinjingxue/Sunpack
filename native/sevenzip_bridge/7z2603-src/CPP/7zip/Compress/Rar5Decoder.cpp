@@ -1633,6 +1633,17 @@ struct CRar5ParallelBlockJob
       {
         if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
           result = S_FALSE;
+        else if (bitStream.GetProcessedSize_Round() == bitStream._blockEnd &&
+                 bitStream.GetProcessedBits7() == bitStream._blockEndBits7 &&
+                 bitStream._blockEndBits7 != 0)
+        {
+          // Match CBitDecoder::AlignToByte(): RAR requires the unused low
+          // bits in the final partial byte to be zero.  The worker does not
+          // call AlignToByte() because it never advances to the next block.
+          const unsigned b = (unsigned)*bitStream._buf << bitStream._blockEndBits7;
+          if (b & 0xff)
+            MinorError = true;
+        }
       }
     }
     catch (const std::bad_alloc &)
@@ -2302,6 +2313,7 @@ HRESULT CDecoder::DecodeLZParallel()
   UInt64 submitted = 0;
   UInt64 retired = 0;
   UInt64 packedRead = 0;
+  bool minorError = false;
 
   size_t winPos = _winPos;
   size_t limit;
@@ -2499,7 +2511,8 @@ error_dist:
       }
     }
 
-    if (job.LastBlock && job.MinorError)
+    minorError = minorError || job.MinorError;
+    if (job.LastBlock && minorError)
       return S_FALSE;
 
     return S_OK;
