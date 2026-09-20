@@ -1587,6 +1587,15 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
+        HRESULT STDMETHODCALLTYPE SetReadPlanConsumer(UInt64 consumerId) SUP7Z_NOEXCEPT override
+        {
+            if (prefetch_)
+            {
+                prefetch_->set_consumer_hint(consumerId);
+            }
+            return S_OK;
+        }
+
         HRESULT STDMETHODCALLTYPE SyncPrefetchTrace() SUP7Z_NOEXCEPT override
         {
             if (prefetch_)
@@ -1922,6 +1931,15 @@ namespace sunpack::sevenzip
             if (legacy_prefetch_active_ && prefetch_)
             {
                 prefetch_->ensure_worker();
+            }
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE SetReadPlanConsumer(UInt64 consumerId) SUP7Z_NOEXCEPT override
+        {
+            if (prefetch_)
+            {
+                prefetch_->set_consumer_hint(consumerId);
             }
             return S_OK;
         }
@@ -2497,6 +2515,15 @@ namespace sunpack::sevenzip
             if (legacy_prefetch_active_ && prefetch_)
             {
                 prefetch_->ensure_worker();
+            }
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE SetReadPlanConsumer(UInt64 consumerId) SUP7Z_NOEXCEPT override
+        {
+            if (prefetch_)
+            {
+                prefetch_->set_consumer_hint(consumerId);
             }
             return S_OK;
         }
