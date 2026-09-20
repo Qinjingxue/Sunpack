@@ -1,4 +1,7 @@
 // GzHandler.cpp
+//
+// Modified by SunPack, 2026-09-20:
+// add a metadata-routed zlib-ng fast path for seekable gzip extraction.
 
 #include "StdAfx.h"
 
