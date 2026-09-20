@@ -697,6 +697,10 @@ static const size_t kWriteStep = (size_t)1 << 18;
 // static const unsigned kWinSize_Log_Min = 17;
 static const size_t kWinSize_Min = 1u << 18;
 
+#ifndef Z7_ST
+static void DestroyRar5ParallelPool(CRar5ParallelBlockPool *pool);
+#endif
+
 CDecoder::CDecoder():
     _isSolid(false),
     _is_v7(false),
@@ -715,6 +719,8 @@ CDecoder::CDecoder():
     _inputBuf(NULL)
 #ifndef Z7_ST
     , _numThreads(1)
+    , _mtPoolWorkers(0)
+    , _mtPool(NULL)
 #endif
 {
 #if 1
@@ -725,6 +731,11 @@ CDecoder::CDecoder():
 
 CDecoder::~CDecoder()
 {
+#ifndef Z7_ST
+  DestroyRar5ParallelPool(_mtPool);
+  _mtPool = NULL;
+  _mtPoolWorkers = 0;
+#endif
 #ifdef Z7_RAR5_SHOW_STAT
   printf("\n%4d :", 0);
   for (unsigned k = 0; k < kNumStats1; k++)
@@ -1674,7 +1685,7 @@ struct CRar5ParallelBlockJob
 class CRar5ParallelBlockPool
 {
   std::vector<std::thread> _threads;
-  std::deque<CRar5ParallelBlockJob *> _queue;
+  std::deque<std::shared_ptr<CRar5ParallelBlockJob>> _queue;
   std::mutex _mutex;
   std::condition_variable _workEvent;
   bool _stop;
@@ -1683,7 +1694,7 @@ class CRar5ParallelBlockPool
   {
     for (;;)
     {
-      CRar5ParallelBlockJob *job = NULL;
+      std::shared_ptr<CRar5ParallelBlockJob> job;
       {
         std::unique_lock<std::mutex> lock(_mutex);
         _workEvent.wait(lock, [this] { return _stop || !_queue.empty(); });
@@ -1733,7 +1744,7 @@ public:
     _threads.clear();
   }
 
-  void Submit(CRar5ParallelBlockJob *job)
+  void Submit(const std::shared_ptr<CRar5ParallelBlockJob> &job)
   {
     {
       std::lock_guard<std::mutex> lock(_mutex);
@@ -1742,6 +1753,11 @@ public:
     _workEvent.notify_one();
   }
 };
+
+static void DestroyRar5ParallelPool(CRar5ParallelBlockPool *pool)
+{
+  delete pool;
+}
 
 Z7_CLASS_IMP_NOQIB_1(
   CRar5ReplayInStream
@@ -2329,21 +2345,34 @@ HRESULT CDecoder::DecodeLZParallel()
     return DecodeLZ();
 
   const size_t ringSize = (size_t)numWorkers * kRar5MtBlocksPerWorker;
-  std::vector<std::unique_ptr<CRar5ParallelBlockJob>> ring;
+  std::vector<std::shared_ptr<CRar5ParallelBlockJob>> ring;
   try
   {
     ring.reserve(ringSize);
     for (size_t i = 0; i < ringSize; i++)
-      ring.push_back(std::unique_ptr<CRar5ParallelBlockJob>(new CRar5ParallelBlockJob()));
+      ring.push_back(std::shared_ptr<CRar5ParallelBlockJob>(new CRar5ParallelBlockJob()));
   }
   catch (const std::bad_alloc &)
   {
     return E_OUTOFMEMORY;
   }
 
-  CRar5ParallelBlockPool pool;
-  if (!pool.Start(numWorkers))
-    return E_FAIL;
+  if (!_mtPool || _mtPoolWorkers != numWorkers)
+  {
+    DestroyRar5ParallelPool(_mtPool);
+    _mtPool = new (std::nothrow) CRar5ParallelBlockPool();
+    _mtPoolWorkers = 0;
+    if (!_mtPool)
+      return E_OUTOFMEMORY;
+    if (!_mtPool->Start(numWorkers))
+    {
+      DestroyRar5ParallelPool(_mtPool);
+      _mtPool = NULL;
+      return E_FAIL;
+    }
+    _mtPoolWorkers = numWorkers;
+  }
+  CRar5ParallelBlockPool &pool = *_mtPool;
 
   UInt64 submitted = 0;
   UInt64 retired = 0;
@@ -2661,7 +2690,7 @@ error_dist:
       return E_OUTOFMEMORY;
     }
 
-    pool.Submit(&job);
+    pool.Submit(ring[(size_t)(submitted % ringSize)]);
     submitted++;
 
     if (job.LastBlock)
