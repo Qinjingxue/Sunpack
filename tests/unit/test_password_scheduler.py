@@ -284,7 +284,7 @@ def test_verifier_chain_without_final_verifier_preserves_all_weak_matches():
     assert outcome.match_evidence == "zipcrypto_header_byte"
 
 
-def test_production_extraction_plan_never_invokes_full_payload_final_verifier(
+def test_production_scheduler_uses_only_bounded_fast_verifiers(
     tmp_path,
     monkeypatch,
 ):
@@ -306,24 +306,12 @@ def test_production_extraction_plan_never_invokes_full_payload_final_verifier(
         status="unsupported_method",
         attempts=0,
     ))
-    final = StaticVerifier(PasswordBatchVerification(
-        ok=True,
-        status="match",
-        matched_index=2,
-        attempts=3,
-    ))
-
-    class FinalVerifierFactory:
-        @classmethod
-        def from_archive_password_tester(cls, password_tester):
-            return final
 
     monkeypatch.setattr(password_scheduler_module, "ZipFastVerifier", lambda: zip_fast)
     monkeypatch.setattr(password_scheduler_module, "RarFastVerifier", lambda: rar_fast)
     monkeypatch.setattr(password_scheduler_module, "SevenZipFastVerifier", lambda: seven_zip_fast)
-    monkeypatch.setattr(password_scheduler_module, "SevenZipDllVerifier", FinalVerifierFactory)
 
-    scheduler = PasswordScheduler.from_archive_password_tester(object())
+    scheduler = PasswordScheduler.with_fast_verifiers()
 
     result = scheduler.plan_for_extraction(PasswordJob(
         archive_path=str(archive),
@@ -334,14 +322,10 @@ def test_production_extraction_plan_never_invokes_full_payload_final_verifier(
     assert result.password is None
     assert result.extraction_candidates == ("one", "two", "three")
     assert isinstance(scheduler.verifier, PasswordVerifierChain)
-    assert all(
-        verifier is not scheduler.verifier.final_verifier
-        for verifier in scheduler.verifier.fast_verifiers
-    )
+    assert scheduler.verifier.final_verifier is None
     assert zip_fast.batches == []
     assert rar_fast.batches == [["one", "two", "three"]]
     assert seven_zip_fast.batches == []
-    assert final.batches == []
 
 
 def test_extraction_plan_accepts_strong_fast_proof_and_caches_it(tmp_path):
