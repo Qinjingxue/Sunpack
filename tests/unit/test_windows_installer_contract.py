@@ -625,15 +625,16 @@ def test_installer_compile_regression_runs_real_iscc_on_pull_requests():
 def test_windows_native_probe_shuts_down_source_persistent_runtime():
     for relative in ("scripts/setup_windows_dev.ps1", "scripts/build_windows.ps1"):
         script = (ROOT / relative).read_text(encoding="utf-8")
-        probe = script[script.index("function Test-SevenZipWorker"):]
-        probe = probe[:probe.index("\nfunction ", 1)]
+        probe_start = script.index("function Test-SevenZipWorker")
         inspect_call = '"sunpack.py", "inspect", "--analyze", "--no-pause", "-q", $fixture'
         shutdown_call = '"sunpack.py", "--persistent-shutdown"'
-        assert inspect_call in probe
-        assert shutdown_call in probe
-        assert "Wait-ExecutableExit -ExecutablePath $PythonPath" in probe
-        assert probe.index(inspect_call) < probe.index(shutdown_call)
-        assert probe.index(shutdown_call) < probe.index("Wait-ExecutableExit -ExecutablePath $PythonPath")
+        wait_call = "Wait-ExecutableExit -ExecutablePath $PythonPath"
+
+        inspect = script.index(inspect_call, probe_start)
+        shutdown = script.index(shutdown_call, inspect)
+        wait = script.index(wait_call, shutdown)
+
+        assert probe_start < inspect < shutdown < wait
 
 
 def test_acceptance_shutdowns_source_persistent_runtime_after_cli_smokes():
