@@ -350,6 +350,16 @@ namespace sunpack::sevenzip
             sync_trace_locked();
         }
 
+        void set_consumer_hint(UInt64 consumer_id)
+        {
+#ifdef SUP7Z_USE_PLANNED_IO
+            std::lock_guard lock(mutex_);
+            planned_consumer_hint_ = consumer_id;
+#else
+            (void)consumer_id;
+#endif
+        }
+
         bool planned_mode()
         {
 #ifdef SUP7Z_USE_PLANNED_IO
@@ -371,6 +381,7 @@ namespace sunpack::sevenzip
             next_planned_cursor_id_ = 0;
             planned_schedule_cursor_ = 0;
             planned_touch_clock_ = 0;
+            planned_consumer_hint_ = 0;
             next_offset_ = 0;
             active_ = false;
             planned_mode_ = false;
@@ -429,6 +440,7 @@ namespace sunpack::sevenzip
             planned_cursors_.clear();
             next_planned_cursor_id_ = 0;
             planned_schedule_cursor_ = 0;
+            planned_consumer_hint_ = 0;
             ready_.notify_all();
         }
 #endif
@@ -645,9 +657,11 @@ namespace sunpack::sevenzip
         struct PlannedCursor
         {
             UInt64 id = 0;
+            UInt64 consumer_id = 0;
             std::size_t plan_index = 0;
             UInt64 next_offset = 0;
             UInt64 last_touch = 0;
+            bool active = true;
         };
 
         enum class PlannedRequestState
@@ -728,69 +742,95 @@ namespace sunpack::sevenzip
             return cursor == planned_cursors_.end() ? nullptr : &*cursor;
         }
 
-        UInt64 touch_planned_cursor_locked(std::size_t plan_index, UInt64 offset, UInt64 end)
+        UInt64 touch_planned_cursor_locked(std::size_t plan_index, UInt64 end)
         {
-            // If the requested byte is already resident, inherit that slab's cursor.
-            // This naturally treats close/interleaved reads as one stream while distant
-            // 7z PackStreams obtain independent cursors.
-            const auto resident = find_chunk_containing_locked(offset);
-            if (resident != chunks_.end() && resident->owner_cursor != 0)
+            const UInt64 consumer_id = planned_consumer_hint_;
+            PlannedCursor *cursor = nullptr;
+
+            if (consumer_id != 0)
             {
-                if (PlannedCursor *cursor = find_planned_cursor_locked(resident->owner_cursor))
+                const auto found = std::find_if(
+                    planned_cursors_.begin(), planned_cursors_.end(),
+                    [consumer_id](const PlannedCursor &candidate)
+                    { return candidate.consumer_id == consumer_id; });
+                if (found != planned_cursors_.end())
                 {
-                    cursor->last_touch = ++planned_touch_clock_;
-                    if (end > cursor->next_offset)
-                    {
-                        cursor->next_offset = end;
-                    }
-                    active_ = true;
-                    return cursor->id;
+                    cursor = &*found;
+                }
+            }
+            else
+            {
+                // Formats with a single sequential input keep one default cursor even
+                // across ordinary Seek calls (ZIP item transitions, headers, etc.).
+                const auto found = std::find_if(
+                    planned_cursors_.begin(), planned_cursors_.end(),
+                    [](const PlannedCursor &candidate)
+                    { return candidate.consumer_id == 0; });
+                if (found != planned_cursors_.end())
+                {
+                    cursor = &*found;
                 }
             }
 
-            PlannedCursor *best = nullptr;
-            UInt64 best_distance = (UInt64)(Int64)-1;
-            const UInt64 attach_distance = std::max<UInt64>(
-                planned_config_.buffer_bytes,
-                static_cast<UInt64>(planned_config_.io_bytes) * 2);
-
-            for (PlannedCursor &cursor : planned_cursors_)
+            if (!cursor)
             {
-                if (cursor.plan_index != plan_index)
-                {
-                    continue;
-                }
-                const UInt64 distance = cursor.next_offset >= offset
-                                            ? cursor.next_offset - offset
-                                            : offset - cursor.next_offset;
-                if (distance <= attach_distance && distance < best_distance)
-                {
-                    best = &cursor;
-                    best_distance = distance;
-                }
-            }
-
-            if (!best)
-            {
-                PlannedCursor cursor;
-                cursor.id = ++next_planned_cursor_id_;
-                cursor.plan_index = plan_index;
-                cursor.next_offset = end;
-                cursor.last_touch = ++planned_touch_clock_;
-                planned_cursors_.push_back(cursor);
+                PlannedCursor created;
+                created.id = ++next_planned_cursor_id_;
+                created.consumer_id = consumer_id;
+                created.plan_index = plan_index;
+                created.next_offset = end;
+                created.last_touch = ++planned_touch_clock_;
+                created.active = true;
+                planned_cursors_.push_back(created);
+                cursor = &planned_cursors_.back();
                 planned_cursor_peak_ = std::max<unsigned long long>(
                     planned_cursor_peak_, static_cast<unsigned long long>(planned_cursors_.size()));
-                active_ = true;
-                return cursor.id;
+            }
+            else
+            {
+                cursor->plan_index = plan_index;
+                if (end > cursor->next_offset || consumer_id == 0)
+                {
+                    // The default serial cursor is allowed to jump on Seek. Explicit
+                    // parallel consumers preserve their ahead position unless the
+                    // demand advances beyond it.
+                    cursor->next_offset = consumer_id == 0 ? end : std::max(cursor->next_offset, end);
+                }
+                cursor->last_touch = ++planned_touch_clock_;
+                cursor->active = true;
             }
 
-            if (end > best->next_offset)
+            // We only keep as many speculative consumers active as can receive at
+            // least one normal slab from the resident budget. Dormant cursors retain
+            // already-resident data and are instantly reactivated by their next read.
+            const std::size_t max_active = std::max<std::size_t>(
+                1,
+                static_cast<std::size_t>(planned_config_.buffer_bytes /
+                                         std::max<UInt32>(1, planned_config_.io_bytes)));
+            while (std::count_if(planned_cursors_.begin(), planned_cursors_.end(),
+                                 [](const PlannedCursor &candidate) { return candidate.active; }) > max_active)
             {
-                best->next_offset = end;
+                auto victim = planned_cursors_.end();
+                for (auto it = planned_cursors_.begin(); it != planned_cursors_.end(); ++it)
+                {
+                    if (!it->active || it->id == cursor->id)
+                    {
+                        continue;
+                    }
+                    if (victim == planned_cursors_.end() || it->last_touch < victim->last_touch)
+                    {
+                        victim = it;
+                    }
+                }
+                if (victim == planned_cursors_.end())
+                {
+                    break;
+                }
+                victim->active = false;
             }
-            best->last_touch = ++planned_touch_clock_;
+
             active_ = true;
-            return best->id;
+            return cursor->id;
         }
 
         PlannedRequestState planned_request_state_locked(UInt64 offset, UInt32 size)
@@ -1101,7 +1141,7 @@ namespace sunpack::sevenzip
 
             ensure_worker_locked();
             const UInt64 request_end = offset + size;
-            const UInt64 cursor_id = touch_planned_cursor_locked(plan_index, offset, request_end);
+            const UInt64 cursor_id = touch_planned_cursor_locked(plan_index, request_end);
 
             while (!stopping_)
             {
@@ -1183,6 +1223,10 @@ namespace sunpack::sevenzip
                 for (std::size_t n = 0; n < count && reserved < planned_config_.buffer_bytes; ++n)
                 {
                     const std::size_t index = planned_schedule_cursor_++ % count;
+                    if (!planned_cursors_[index].active)
+                    {
+                        continue;
+                    }
                     if (queue_planned_ahead_for_cursor_locked(planned_cursors_[index], reserved))
                     {
                         any_progress = true;
@@ -1193,6 +1237,10 @@ namespace sunpack::sevenzip
             active_ = false;
             for (PlannedCursor &cursor : planned_cursors_)
             {
+                if (!cursor.active)
+                {
+                    continue;
+                }
                 advance_planned_cursor_locked(cursor);
                 const PlannedRange &range = plan_[cursor.plan_index];
                 if (cursor.next_offset < range.offset + range.size)
@@ -1316,6 +1364,7 @@ namespace sunpack::sevenzip
         UInt64 next_planned_cursor_id_ = 0;
         std::size_t planned_schedule_cursor_ = 0;
         UInt64 planned_touch_clock_ = 0;
+        UInt64 planned_consumer_hint_ = 0;
         unsigned long long planned_cursor_peak_ = 0;
         unsigned long long planned_cache_eviction_count_ = 0;
         unsigned long long planned_demand_issued_count_ = 0;
