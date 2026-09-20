@@ -583,6 +583,7 @@ HRESULT SunpackDecodeGzipWithZlibNg(
     };
 
     bool inputFinished = false;
+    bool memberStarted = false;
     UInt64 completedInput = 0;
     UInt64 totalOutput = 0;
     UInt64 lastProgressInput = 0;
@@ -627,6 +628,12 @@ HRESULT SunpackDecodeGzipWithZlibNg(
             return finish(S_OK);
         }
 
+        if (!memberStarted)
+        {
+            ++result.numStreams;
+            memberStarted = true;
+        }
+
         stream.next_out = reinterpret_cast<uint8_t *>(output.data());
         stream.avail_out = static_cast<uint32_t>(output.size());
 
@@ -655,7 +662,6 @@ HRESULT SunpackDecodeGzipWithZlibNg(
         if (code == Z_STREAM_END)
         {
             completedInput += static_cast<UInt64>(stream.total_in);
-            ++result.numStreams;
 
             std::size_t pending = static_cast<std::size_t>(stream.avail_in);
             if (pending != 0)
@@ -699,6 +705,7 @@ HRESULT SunpackDecodeGzipWithZlibNg(
             // bytes that were already read beyond the previous member.
             stream.next_in = reinterpret_cast<const uint8_t *>(input.data());
             stream.avail_in = static_cast<uint32_t>(pending);
+            memberStarted = false;
             stream.next_out = nullptr;
             stream.avail_out = 0;
             continue;
