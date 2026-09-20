@@ -270,21 +270,6 @@ namespace sunpack::sevenzip
         } pipeline_capture{result, pipeline_timing};
 #endif
 
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-        bool missing_tail = false;
-        {
-            PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::Preflight);
-            missing_tail = seven_zip_parts_prove_missing_tail(part_paths, !canonical_names.empty());
-        }
-        if (missing_tail)
-#else
-        if (seven_zip_parts_prove_missing_tail(part_paths, !canonical_names.empty()))
-#endif
-        {
-            set_missing_volume_failure(result, "input_preflight", "seven_zip_start_header_length");
-            return result;
-        }
-
         bool any_format_created = false;
 
         bool any_opened = false;
