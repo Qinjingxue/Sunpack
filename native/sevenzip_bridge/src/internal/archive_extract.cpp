@@ -270,7 +270,16 @@ namespace sunpack::sevenzip
         } pipeline_capture{result, pipeline_timing};
 #endif
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        bool missing_tail = false;
+        {
+            PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::Preflight);
+            missing_tail = seven_zip_parts_prove_missing_tail(part_paths, !canonical_names.empty());
+        }
+        if (missing_tail)
+#else
         if (seven_zip_parts_prove_missing_tail(part_paths, !canonical_names.empty()))
+#endif
         {
             set_missing_volume_failure(result, "input_preflight", "seven_zip_start_header_length");
             return result;
@@ -312,11 +321,23 @@ namespace sunpack::sevenzip
             };
 
             std::error_code prepare_error;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            bool directory_ready = false;
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::OutputDirectory);
+                directory_ready = create_directories_with_space_gate(
+                    std::filesystem::path(win32_extended_path(output_dir)),
+                    space_gate,
+                    space_terminal,
+                    &prepare_error);
+            }
+#else
             const bool directory_ready = create_directories_with_space_gate(
                 std::filesystem::path(win32_extended_path(output_dir)),
                 space_gate,
                 space_terminal,
                 &prepare_error);
+#endif
 
             if (!directory_ready)
             {
@@ -336,8 +357,17 @@ namespace sunpack::sevenzip
             }
         }
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        const auto formats = [&]()
+        {
+            PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::FormatCandidates);
+            return candidate_formats_for_hint(
+                format_hint, archive_path, part_paths, signature_path, signature_offset);
+        }();
+#else
         const auto formats = candidate_formats_for_hint(
             format_hint, archive_path, part_paths, signature_path, signature_offset);
+#endif
         const auto prefetch_config = input_prefetch_config_for_archive(format_hint, native_volume_input);
 
         for (const GUID &format : formats)
@@ -349,7 +379,15 @@ namespace sunpack::sevenzip
 
             CMyComPtr<IInArchive> archive;
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            HRESULT hr = E_FAIL;
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::HandlerCreate);
+                hr = create_in_archive(format, &archive);
+            }
+#else
             HRESULT hr = create_in_archive(format, &archive);
+#endif
 
             attempt.create_hresult = static_cast<int>(hr);
 
@@ -369,6 +407,34 @@ namespace sunpack::sevenzip
 
             bool stream_opened = false;
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            CMyComPtr<IInStream> stream;
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::StreamOpen);
+                stream = [&]() -> CMyComPtr<IInStream>
+                {
+                    if (!input_ranges.empty())
+                    {
+
+                        auto *range_stream = new MultiRangeInStream(input_ranges, &result.input_trace, prefetch_config);
+
+                        stream_opened = range_stream->is_open();
+
+                        // CMyComPtr's raw-pointer constructor performs the AddRef
+                        // that gives the object its first reference.
+                        return CMyComPtr<IInStream>(range_stream);
+                    }
+
+                    return open_archive_stream(
+                        archive_path,
+                        part_paths,
+                        stream_opened,
+                        &result.input_trace,
+                        !canonical_names.empty(),
+                        prefetch_config);
+                }();
+            }
+#else
             CMyComPtr<IInStream> stream = [&]() -> CMyComPtr<IInStream>
             {
                 if (!input_ranges.empty())
@@ -391,6 +457,7 @@ namespace sunpack::sevenzip
                     !canonical_names.empty(),
                     prefetch_config);
             }();
+#endif
 
             if (!stream_opened)
             {
@@ -406,12 +473,31 @@ namespace sunpack::sevenzip
                 return result;
             }
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            CMyComPtr<IArchiveOpenCallback> open_callback;
+            OpenCallback *raw_open_callback = nullptr;
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
+                const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
+                raw_open_callback = new OpenCallback(
+                    password, callback_path, part_paths, canonical_names, prefetch_config);
+                open_callback = CMyComPtr<IArchiveOpenCallback>(raw_open_callback);
+            }
+#else
             const std::wstring callback_path = canonical_names.empty() ? callback_archive_path(archive_path, part_paths) : canonical_names.front();
             auto *raw_open_callback = new OpenCallback(
                 password, callback_path, part_paths, canonical_names, prefetch_config);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
+#endif
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveOpen);
+                hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
+            }
+#else
             hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
+#endif
             last_encryption_evidence = raw_open_callback->password_requested();
 
             if (raw_open_callback->missing_volume_requested())
@@ -446,7 +532,15 @@ namespace sunpack::sevenzip
 
             UInt32 num_items = 0;
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            bool item_count_read = false;
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ItemProbe);
+                item_count_read = archive->GetNumberOfItems(&num_items) == S_OK;
+            }
+#else
             if (archive->GetNumberOfItems(&num_items) == S_OK)
+#endif
             {
 
                 result.item_count = num_items;
@@ -458,7 +552,14 @@ namespace sunpack::sevenzip
             {
                 if (decoded_names.size() != num_items)
                 {
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                    {
+                        PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveClose);
+                        archive->Close();
+                    }
+#else
                     archive->Close();
+#endif
                     result.status = PasswordTestStatus::Error;
                     set_failure(result, "filename_encoding", "decoded_name_count_mismatch");
                     result.message = "decoded ZIP filename count does not match archive item count";
@@ -470,7 +571,11 @@ namespace sunpack::sevenzip
 
             result.archive_type = !format_hint.empty() ? format_hint : archive_type_for_path(archive_path);
 
-            auto *raw_extract_callback = new ExtractToDiskCallback(
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            ExtractToDiskCallback *raw_extract_callback = nullptr;
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::CallbackSetup);
+                raw_extract_callback = new ExtractToDiskCallback(
                 archive.Interface(),
                 password,
                 output_dir,
@@ -482,11 +587,22 @@ namespace sunpack::sevenzip
                 std::move(shared_writer),
                 job_buffer_budget,
                 std::move(cancel_token)
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
                 ,
                 pipeline_timing.get());
+            }
 #else
-                );
+            auto *raw_extract_callback = new ExtractToDiskCallback(
+                archive.Interface(),
+                password,
+                output_dir,
+                decoded_names,
+                std::move(progress),
+                dry_run,
+                &result.output_trace,
+                num_items,
+                std::move(shared_writer),
+                job_buffer_budget,
+                std::move(cancel_token));
 #endif
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
@@ -504,7 +620,14 @@ namespace sunpack::sevenzip
 
             // Extraction success must not be published before every queued write and close
             // has finished and any delayed filesystem error has been folded back in.
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::OutputFinalize);
+                raw_extract_callback->finalize_output();
+            }
+#else
             raw_extract_callback->finalize_output();
+#endif
 
             last_hr = hr;
 
@@ -540,7 +663,14 @@ namespace sunpack::sevenzip
 
             result.hresult = static_cast<int>(hr);
 
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            {
+                PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveClose);
+                archive->Close();
+            }
+#else
             archive->Close();
+#endif
 
             if (hr == S_OK && last_op_res == kOpOk)
             {

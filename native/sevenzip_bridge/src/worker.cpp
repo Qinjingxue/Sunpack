@@ -747,6 +747,16 @@ std::string pipeline_timing_json(const sunpack::sevenzip::ExtractPipelineTiming&
         ",\"all_overlap_ns\":" + std::to_string(timing.all_overlap_ns) +
         ",\"any_overlap_ns\":" + std::to_string(timing.any_overlap_ns) +
         ",\"idle_ns\":" + std::to_string(timing.idle_ns) +
+         ",\"prepare_preflight_ns\":" + std::to_string(timing.prepare_preflight_ns) +
+        ",\"prepare_output_directory_ns\":" + std::to_string(timing.prepare_output_directory_ns) +
+        ",\"prepare_format_candidates_ns\":" + std::to_string(timing.prepare_format_candidates_ns) +
+         ",\"prepare_handler_create_ns\":" + std::to_string(timing.prepare_handler_create_ns) +
+        ",\"prepare_stream_open_ns\":" + std::to_string(timing.prepare_stream_open_ns) +
+        ",\"prepare_archive_open_ns\":" + std::to_string(timing.prepare_archive_open_ns) +
+        ",\"prepare_item_probe_ns\":" + std::to_string(timing.prepare_item_probe_ns) +
+        ",\"prepare_callback_setup_ns\":" + std::to_string(timing.prepare_callback_setup_ns) +
+        ",\"prepare_output_finalize_ns\":" + std::to_string(timing.prepare_output_finalize_ns) +
+        ",\"prepare_archive_close_ns\":" + std::to_string(timing.prepare_archive_close_ns) +
         "}";
 }
 #endif

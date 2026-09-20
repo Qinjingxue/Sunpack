@@ -126,6 +126,16 @@ void PipelineTiming::add_compute_cpu_ns(unsigned long long elapsed) noexcept
     compute_cpu_ns_ += elapsed;
 }
 
+void PipelineTiming::add_prepare_ns(PipelinePreparePhase phase, unsigned long long elapsed) noexcept
+{
+    if (!enabled_)
+    {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    prepare_ns_[static_cast<std::size_t>(phase)] += elapsed;
+}
+
 ExtractPipelineTiming PipelineTiming::snapshot() const noexcept
 {
     ExtractPipelineTiming result;
@@ -161,6 +171,16 @@ ExtractPipelineTiming PipelineTiming::snapshot() const noexcept
     result.any_overlap_ns = masks[3] + masks[5] + masks[6] + masks[7];
     result.idle_ns = masks[0];
     result.compute_cpu_ns = compute_cpu_ns_;
+    result.prepare_preflight_ns = prepare_ns_[0];
+    result.prepare_output_directory_ns = prepare_ns_[1];
+    result.prepare_format_candidates_ns = prepare_ns_[2];
+    result.prepare_handler_create_ns = prepare_ns_[3];
+    result.prepare_stream_open_ns = prepare_ns_[4];
+    result.prepare_archive_open_ns = prepare_ns_[5];
+    result.prepare_item_probe_ns = prepare_ns_[6];
+    result.prepare_callback_setup_ns = prepare_ns_[7];
+    result.prepare_output_finalize_ns = prepare_ns_[8];
+    result.prepare_archive_close_ns = prepare_ns_[9];
     return result;
 }
 
