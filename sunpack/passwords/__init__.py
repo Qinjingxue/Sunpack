@@ -19,7 +19,6 @@ from sunpack.passwords.verifier import (
     PasswordVerifierRegistry,
     RarFastVerifier,
     SevenZipFastVerifier,
-    SevenZipDllVerifier,
     VerifierStatus,
     ZipFastVerifier,
 )
@@ -58,7 +57,6 @@ __all__ = [
     "discover_directory_passwords_for_archive",
     "is_directory_password_file",
     "SevenZipFastVerifier",
-    "SevenZipDllVerifier",
     "VerifierStatus",
     "ZipFastVerifier",
 ]
