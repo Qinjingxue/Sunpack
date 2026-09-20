@@ -85,6 +85,16 @@ bool Check(bool condition, const char *message)
 
 int main()
 {
+    if (!Check(!SunpackShouldUseZlibNgDeflate(32 * 1024, 63 * 1024),
+               "adaptive policy keeps small streams on 7-Zip"))
+        return 1;
+    if (!Check(SunpackShouldUseZlibNgDeflate(90 * 1024, 100 * 1024),
+               "adaptive policy accepts 10 percent savings"))
+        return 1;
+    if (!Check(!SunpackShouldUseZlibNgDeflate(91 * 1024, 100 * 1024),
+               "adaptive policy rejects near-store streams"))
+        return 1;
+
     const std::string unit = "sunpack-zlib-ng-strong-aes-test\n";
     std::vector<Byte> expected;
     expected.reserve(unit.size() * 2048);
