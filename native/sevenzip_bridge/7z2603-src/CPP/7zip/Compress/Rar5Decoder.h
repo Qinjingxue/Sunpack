@@ -143,6 +143,9 @@ Z7_CLASS_IMP_NOQIB_2(
   HRESULT DecodeLZParallel();
 #endif
   HRESULT CodeReal();
+#ifndef Z7_ST
+  HRESULT CodeRealParallel();
+#endif
 public:
   CDecoder();
   ~CDecoder();
