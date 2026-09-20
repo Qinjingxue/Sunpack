@@ -150,5 +150,19 @@ int main()
                "unused bytes drain exactly once"))
         return 1;
 
+    // ZipHandler caches the coder by method, so the same zlib-ng instance can
+    // decode the next entry immediately after a Strong Encryption entry.  The
+    // previous stream's prefetched padding must not survive inflateReset2().
+    std::vector<Byte> packedAgain(std::begin(kRawDeflate), std::end(kRawDeflate));
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> inStreamAgain(packedAgain);
+    CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> outStreamAgain;
+    const UInt64 inSizeAgain = static_cast<UInt64>(packedAgain.size());
+    if (!Check(
+            coder->Code(inStreamAgain, outStreamAgain, &inSizeAgain, &outSize, nullptr) == S_OK,
+            "cached coder reuse after trailing padding"))
+        return 1;
+    if (!Check(outStreamAgain->Data == expected, "cached coder reuse decoded bytes"))
+        return 1;
+
     return 0;
 }
