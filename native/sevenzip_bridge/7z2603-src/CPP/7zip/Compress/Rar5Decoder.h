@@ -19,7 +19,7 @@ namespace NRar5 {
 
 class CBitDecoder;
 #ifndef Z7_ST
-class CRar5MtContext;
+class CRar5ParallelBlockPool;
 #endif
 
 struct CFilter
@@ -117,7 +117,8 @@ Z7_CLASS_IMP_NOQIB_2(
   Byte *_inputBuf;
 #ifndef Z7_ST
   UInt32 _numThreads;
-  friend class CRar5MtContext;
+  CRar5ParallelBlockPool *_mtPool;
+  unsigned _mtPoolWorkers;
 #endif
 
   NHuffman::CDecoder<kNumHufBits, kMainTableSize,  k_NumHufTableBits_Main>  m_MainDecoder;
