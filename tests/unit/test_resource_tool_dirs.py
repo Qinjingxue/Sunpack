@@ -18,6 +18,6 @@ def test_native_wrapper_path_uses_arch_specific_tool_dir(tmp_path, monkeypatch):
     monkeypatch.setattr(resources.platform, "machine", lambda: "ARM64")
     monkeypatch.setattr(sevenzip_bridge, "candidate_resource_roots", lambda: [tmp_path])
 
-    tester = sevenzip_bridge.NativePasswordTester.__new__(sevenzip_bridge.NativePasswordTester)
+    tester = sevenzip_bridge.NativeSevenZipBridge.__new__(sevenzip_bridge.NativeSevenZipBridge)
 
     assert tester._default_wrapper_path() == str(wrapper)
