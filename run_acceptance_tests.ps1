@@ -308,6 +308,76 @@ function Invoke-Native {
         throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $joined"
     }
 }
+function ConvertTo-NormalizedFullPath {
+    param([Parameter(Mandatory = $true)][string]$Path)
+    return ([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') -replace '/', '\').ToLowerInvariant()
+}
+
+function Wait-ExecutableExit {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExecutablePath,
+        [int]$TimeoutSeconds = 15
+    )
+
+    $expectedPath = ConvertTo-NormalizedFullPath -Path $ExecutablePath
+    $executableName = [System.IO.Path]::GetFileName($ExecutablePath).Replace("'", "''")
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    do {
+        $matching = @(
+            Get-CimInstance Win32_Process -Filter "Name='$executableName'" -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.ExecutablePath -and
+                    (ConvertTo-NormalizedFullPath -Path $_.ExecutablePath) -eq $expectedPath
+                }
+        )
+        if ($matching.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $deadline)
+
+    $processIds = ($matching | ForEach-Object ProcessId) -join ", "
+    throw "Executable did not exit within $TimeoutSeconds seconds: $ExecutablePath (PID: $processIds)"
+}
+
+function Stop-SourcePersistentRuntime {
+    param(
+        [Parameter(Mandatory = $true)][string]$PythonPath,
+        [Parameter(Mandatory = $true)][string]$RepoRoot
+    )
+
+    if (-not (Test-Path -LiteralPath $PythonPath -PathType Leaf)) {
+        return
+    }
+
+    # Match normal acceptance commands: when this script is elevated, send the
+    # shutdown request with the interactive user token so it reaches the same
+    # source-runtime pipe that the CLI smoke tests used.
+    $runnerArguments = @(
+        $unelevatedRunner,
+        "--cwd", $RepoRoot,
+        "--timeout-seconds", "15",
+        "--",
+        $PythonPath,
+        "sunpack.py", "--persistent-shutdown"
+    )
+    $previousErrorActionPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = "Continue"
+        & $PythonPath @runnerArguments *> $null
+        $shutdownExitCode = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    if ($shutdownExitCode -ne 0) {
+        throw "Source persistent runtime shutdown returned exit code $shutdownExitCode"
+    }
+
+    # The server acknowledges shutdown before all runtime cleanup has finished.
+    # Wait for the exact venv interpreter to leave so CI cannot retain a locked
+    # .venv or report an orphan Python process.
+    Wait-ExecutableExit -ExecutablePath $PythonPath
+}
 
 function Get-NativeSmokeCode {
     return @"
@@ -722,6 +792,7 @@ foreach ($name in $watchEnvironmentNames) {
 }
 $watchServiceInstalled = $false
 $watchServiceCleanupFailed = $false
+$persistentRuntimeCleanupFailed = $false
 
 try {
     $env:SUNPACK_WATCH_BROKER_SERVICE_NAME = $watchServiceName
@@ -771,6 +842,15 @@ try {
     Invoke-TestStep -Label "CLI inspect smoke test" -Command @($python, "sunpack.py", "inspect", (Join-Path $repoRoot "tests"), "--json") -QuietOutput
     Invoke-TestStep -Label "CLI config smoke test" -Command @($python, "sunpack.py", "config", "--json", "show") -QuietOutput
 } finally {
+    Write-Host ""
+    Write-Host "==> Stopping source persistent runtime" -ForegroundColor Cyan
+    try {
+        Stop-SourcePersistentRuntime -PythonPath $python -RepoRoot $repoRoot
+    } catch {
+        $persistentRuntimeCleanupFailed = $true
+        Write-Host ("    FAIL - could not stop source persistent runtime: " + $_.Exception.Message) -ForegroundColor Red
+    }
+
     if ($watchServiceInstalled) {
         Write-Host ""
         Write-Host "==> Uninstalling temporary Watch Broker service" -ForegroundColor Cyan
@@ -810,6 +890,9 @@ Write-Host ""
 $failedResults = @($script:StepResults | Where-Object { $_.ExitCode -ne 0 })
 if ($watchServiceCleanupFailed) {
     $failedResults += [pscustomobject]@{ Label = "Temporary Watch Broker service cleanup"; ExitCode = -1; DurationSeconds = 0 }
+}
+if ($persistentRuntimeCleanupFailed) {
+    $failedResults += [pscustomobject]@{ Label = "Source persistent runtime cleanup"; ExitCode = -1; DurationSeconds = 0 }
 }
 if ($failedResults.Count -gt 0) {
     Write-Host ("{0} acceptance test step(s) failed; all scheduled steps have completed." -f $failedResults.Count) -ForegroundColor Red

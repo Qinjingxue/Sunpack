@@ -633,3 +633,28 @@ def test_windows_native_probe_shuts_down_source_persistent_runtime():
         assert "Wait-ExecutableExit -ExecutablePath $PythonPath" in probe
         assert probe.index(inspect_call) < probe.index(shutdown_call)
         assert probe.index(shutdown_call) < probe.index("Wait-ExecutableExit -ExecutablePath $PythonPath")
+
+
+def test_acceptance_shutdowns_source_persistent_runtime_after_cli_smokes():
+    acceptance = (ROOT / "run_acceptance_tests.ps1").read_text(encoding="utf-8")
+
+    assert "function Stop-SourcePersistentRuntime {" in acceptance
+    cleanup = acceptance[acceptance.index("function Stop-SourcePersistentRuntime {"): ]
+    cleanup = cleanup[:cleanup.index("\nfunction ", 1)]
+    assert '"sunpack.py", "--persistent-shutdown"' in cleanup
+    assert "$unelevatedRunner" in cleanup
+    assert "Wait-ExecutableExit -ExecutablePath $PythonPath" in cleanup
+
+    last_smoke = acceptance.index('Invoke-TestStep -Label "CLI config smoke test"')
+    finally_block = acceptance.index("} finally {", last_smoke)
+    shutdown = acceptance.index(
+        "Stop-SourcePersistentRuntime -PythonPath $python -RepoRoot $repoRoot",
+        finally_block,
+    )
+    broker_cleanup = acceptance.index(
+        'Write-Host "==> Uninstalling temporary Watch Broker service"',
+        shutdown,
+    )
+    assert last_smoke < finally_block < shutdown < broker_cleanup
+    assert "$persistentRuntimeCleanupFailed = $true" in acceptance
+    assert 'Label = "Source persistent runtime cleanup"' in acceptance

@@ -833,18 +833,24 @@ def test_worker_skips_output_crc_when_source_crc_is_missing(tmp_path, dry_run):
         encoding="utf-8",
     )
     worker_result = _worker_result(result.stdout)
-    item = next(
-        row for row in worker_result["diagnostics"]["output_trace"]["items"]
-        if not row["is_dir"]
-    )
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert item["has_source_crc32"] is False
-    assert item["has_output_crc32"] is False
-    assert item["crc_verified"] is True
+    assert worker_result["status"] == "ok"
+    assert worker_result["dry_run"] is dry_run
     if dry_run:
+        item = next(
+            row for row in worker_result["diagnostics"]["output_trace"]["items"]
+            if not row["is_dir"]
+        )
+        assert item["has_source_crc32"] is False
+        assert item["has_output_crc32"] is False
+        assert item["crc_verified"] is True
         assert not output_dir.exists()
     else:
+        # Successful real extraction intentionally omits verbose diagnostics.
+        # The dry-run branch above verifies the no-output-CRC trace contract;
+        # this branch verifies that the same path still writes correct bytes.
+        assert "diagnostics" not in worker_result
         assert (output_dir / source.name).read_bytes() == payload
 
 
