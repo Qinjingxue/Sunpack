@@ -171,6 +171,12 @@ void check_streams()
     check(queries_as(as_unknown(file_raw), IID_ISequentialInStream), "FileInStream QI(ISequentialInStream) == S_OK");
     check(queries_as(as_unknown(file_raw), IID_IInStream), "FileInStream QI(IInStream) == S_OK");
     check(queries_as(as_unknown(file_raw), IID_IStreamSetReadPlan), "FileInStream QI(IStreamSetReadPlan) == S_OK");
+    {
+        CMyComPtr<IStreamSetReadPlan> plan;
+        const HRESULT hr = as_unknown(file_raw)->QueryInterface(IID_IStreamSetReadPlan, (void **)&plan);
+        check(hr == S_OK && plan && plan->SetReadPlanConsumer(0x100000001ULL) == S_OK,
+              "FileInStream accepts planned consumer identity");
+    }
     check(rejects(as_unknown(file_raw), IID_IProgress), "FileInStream QI(foreign IID) == E_NOINTERFACE");
 
     auto *multi_raw = new MultiRangeInStream(std::vector<ExtractInputRange>{});
