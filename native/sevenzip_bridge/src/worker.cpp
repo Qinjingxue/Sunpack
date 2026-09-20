@@ -875,7 +875,8 @@ int run_request(
     const std::string& request,
     // The job's output-volume write facility, borrowed from the registry lease held by worker_loop; null for dry runs.
     const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer = nullptr,
-    const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr
+    const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr,
+    std::size_t decoder_thread_budget = 0
 ) {
     using namespace sunpack::sevenzip;
 
@@ -971,8 +972,8 @@ int run_request(
     }
     auto extract_with_password = [&](const std::wstring& selected_password) {
         return archive_input.ranges.empty()
-            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
-            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
+            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token, decoder_thread_budget)
+            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token, decoder_thread_budget);
     };
 
     ExtractArchiveResult result;
@@ -2149,6 +2150,7 @@ private:
             Job job;
             std::size_t admitted_jobs = 0;
             std::size_t admitted_memory = 0;
+            std::size_t decoder_thread_budget = 1;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 condition_.wait(lock, [this] {
@@ -2168,6 +2170,8 @@ private:
                 active_memory_ += job.metadata.memory_reserve;
                 admitted_jobs = active_jobs_;
                 admitted_memory = active_memory_;
+                decoder_thread_budget = sunpack::sevenzip::native_decoder_thread_budget(
+                    worker_count_, admitted_jobs);
             }
             print_active_event(job, "job_admitted", admitted_jobs, admitted_memory);
             print_active_event(job, "job_started", admitted_jobs, admitted_memory);
@@ -2186,9 +2190,9 @@ private:
                     // Registered inside the volume lease scope and declared after it: root output dir creation can fill the disk before make_job, and reverse destruction must deregister before the lease is released.
                     const std::string scope_job_id = json_string_field(job.request, "job_id", "");
                     sunpack::sevenzip::SpaceJobRegistration space_registration(lease, scope_job_id);
-                    code = run_request(job.request, lease.writer_pointer(), job.cancel_token);
+                    code = run_request(job.request, lease.writer_pointer(), job.cancel_token, decoder_thread_budget);
                 } else {
-                    code = run_request(job.request, nullptr, job.cancel_token);
+                    code = run_request(job.request, nullptr, job.cancel_token, decoder_thread_budget);
                 }
             } catch (...) {
                 code = -100;
