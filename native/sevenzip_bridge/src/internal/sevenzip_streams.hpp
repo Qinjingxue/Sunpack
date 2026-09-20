@@ -520,9 +520,42 @@ namespace sunpack::sevenzip
                 return;
             }
 #ifdef SUP7Z_USE_PLANNED_IO
-            if (planned_mode())
             {
-                return;
+                std::lock_guard lock(mutex_);
+                if (planned_mode_)
+                {
+                    const UInt64 consumer_id = planned_consumer_hint_.load(std::memory_order_acquire);
+                    PlannedCursor *cursor = nullptr;
+                    for (PlannedCursor &candidate : planned_cursors_)
+                    {
+                        if (candidate.consumer_id == consumer_id)
+                        {
+                            cursor = &candidate;
+                            break;
+                        }
+                    }
+                    if (cursor)
+                    {
+                        cursor->next_offset = std::max(cursor->next_offset, end);
+                        cursor->last_touch = ++planned_touch_clock_;
+
+                        // The decoder already obtained these bytes directly. Drop only
+                        // fully covered slabs owned by this consumer; an in-flight slab
+                        // extending past end remains useful as future speculative data.
+                        chunks_.erase(
+                            std::remove_if(
+                                chunks_.begin(), chunks_.end(),
+                                [cursor_id = cursor->id, end](const Chunk &chunk)
+                                {
+                                    return chunk.owner_cursor == cursor_id &&
+                                           chunk.offset + chunk.size <= end;
+                                }),
+                            chunks_.end());
+                    }
+                    schedule_plan_locked();
+                    ready_.notify_all();
+                    return;
+                }
             }
 #endif
             std::lock_guard lock(mutex_);
@@ -872,20 +905,34 @@ namespace sunpack::sevenzip
             }
         }
 
-        void copy_planned_locked(UInt64 offset, void *data, UInt32 size)
+        void copy_planned_outside_lock(
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            std::unique_lock<std::mutex> &lock)
         {
             UInt64 cursor = offset;
             const UInt64 end = offset + size;
             auto *out = static_cast<unsigned char *>(data);
+
+            // consume_mutex_ serializes decoder consumers for this stream. The worker
+            // can publish other chunks while this copy runs, but it never erases ready
+            // chunks. That lets the potentially large memcpy run without holding the
+            // scheduler mutex.
             while (cursor < end)
             {
                 auto chunk = find_chunk_containing_locked(cursor);
                 const UInt64 chunk_end = chunk->offset + chunk->size;
                 const UInt64 take = std::min<UInt64>(end, chunk_end) - cursor;
-                std::memcpy(out + static_cast<std::size_t>(cursor - offset),
-                            chunk->bytes.data() + static_cast<std::size_t>(cursor - chunk->offset),
-                            static_cast<std::size_t>(take));
+                const unsigned char *source =
+                    chunk->bytes.data() + static_cast<std::size_t>(cursor - chunk->offset);
+                const std::size_t output_offset = static_cast<std::size_t>(cursor - offset);
                 chunk->last_use = ++planned_touch_clock_;
+
+                lock.unlock();
+                std::memcpy(out + output_offset, source, static_cast<std::size_t>(take));
+                lock.lock();
+
                 cursor += take;
             }
         }
@@ -1143,60 +1190,51 @@ namespace sunpack::sevenzip
             ensure_worker_locked();
             const UInt64 request_end = offset + size;
             const UInt64 cursor_id = touch_planned_cursor_locked(plan_index, request_end);
+            const PlannedRequestState state = planned_request_state_locked(offset, size);
 
-            while (!stopping_)
+            if (state == PlannedRequestState::Ready)
             {
-                promote_request_chunks_locked(offset, size);
-                PlannedRequestState state = planned_request_state_locked(offset, size);
-
-                if (state == PlannedRequestState::Ready)
+                copy_planned_outside_lock(offset, data, size, lock);
+                retire_consumed_chunks_locked(cursor_id, request_end);
+                if (PlannedCursor *cursor = find_planned_cursor_locked(cursor_id))
                 {
-                    copy_planned_locked(offset, data, size);
-                    retire_consumed_chunks_locked(cursor_id, request_end);
-                    if (PlannedCursor *cursor = find_planned_cursor_locked(cursor_id))
-                    {
-                        cursor->last_touch = ++planned_touch_clock_;
-                    }
-                    schedule_plan_locked();
-                    ready_.notify_all();
-                    if (profiling)
-                    {
-                        ++trace->prefetch_hit_count;
-                        trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-                    }
-                    return true;
+                    cursor->last_touch = ++planned_touch_clock_;
                 }
-
-                if (state == PlannedRequestState::Failed)
+                schedule_plan_locked();
+                ready_.notify_all();
+                if (profiling)
                 {
-                    if (profiling)
-                    {
-                        ++trace->prefetch_miss_count;
-                        trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
-                    }
-                    return false;
+                    ++trace->prefetch_hit_count;
+                    trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
                 }
+                return true;
+            }
 
-                if (state == PlannedRequestState::Missing)
-                {
-                    if (!ensure_planned_request_locked(plan_index, cursor_id, offset, size))
-                    {
-                        // Usually this means one old speculative slab is currently
-                        // Reading and therefore cannot be evicted yet. Wait for the
-                        // worker publication rather than dropping every other cursor.
-                        ready_.wait(lock);
-                        continue;
-                    }
-                    schedule_plan_locked();
-                    ready_.notify_all();
-                    state = planned_request_state_locked(offset, size);
-                    if (state == PlannedRequestState::Ready)
-                    {
-                        continue;
-                    }
-                }
+            // Planned I/O is speculative only. If the requested bytes are missing,
+            // queued, currently reading, or failed, never make the decoder wait for
+            // the producer. The caller immediately falls back to direct ReadFile().
+            //
+            // touch_planned_cursor_locked() already advanced this consumer to
+            // request_end, so speculative scheduling starts *after* the direct read
+            // instead of redundantly queueing the same bytes.
+            if (state == PlannedRequestState::Failed)
+            {
+                chunks_.erase(
+                    std::remove_if(
+                        chunks_.begin(), chunks_.end(),
+                        [offset, request_end](const Chunk &chunk)
+                        {
+                            return chunk.state == ChunkState::Failed &&
+                                   ranges_overlap(chunk.offset, chunk.size, offset, request_end);
+                        }),
+                    chunks_.end());
+            }
 
-                ready_.wait(lock);
+            schedule_plan_locked();
+            ready_.notify_all();
+            if (profiling)
+            {
+                ++trace->prefetch_miss_count;
             }
             return false;
         }
@@ -1700,7 +1738,7 @@ namespace sunpack::sevenzip
 
             position_ += read;
 
-            if (prefetch_ && legacy_prefetch_active_ && read)
+            if (prefetch_ && (legacy_prefetch_active_ || prefetch_->planned_mode()) && read)
             {
                 prefetch_->after_sync_read(position_);
             }
@@ -2159,7 +2197,7 @@ namespace sunpack::sevenzip
 
             record_logical_read(trace_, read_start, total_read);
 
-            if (prefetch_ && legacy_prefetch_active_ && total_read)
+            if (prefetch_ && (legacy_prefetch_active_ || prefetch_->planned_mode()) && total_read)
             {
                 prefetch_->after_sync_read(position_);
             }
@@ -2743,7 +2781,7 @@ namespace sunpack::sevenzip
 
             record_logical_read(trace_, read_start, total_read);
 
-            if (prefetch_ && legacy_prefetch_active_ && total_read)
+            if (prefetch_ && (legacy_prefetch_active_ || prefetch_->planned_mode()) && total_read)
             {
                 prefetch_->after_sync_read(position_);
             }
