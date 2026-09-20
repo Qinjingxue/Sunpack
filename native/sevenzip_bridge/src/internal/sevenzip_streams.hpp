@@ -850,6 +850,7 @@ namespace sunpack::sevenzip
 
         void reclaim_inactive_planned_chunks_locked()
         {
+            const std::size_t before = chunks_.size();
             erase_planned_chunks_if_locked(
                 [this](const Chunk &chunk)
                 {
@@ -857,6 +858,8 @@ namespace sunpack::sevenzip
                            chunk.state != ChunkState::Reading &&
                            !planned_cursor_active_locked(chunk.owner_cursor);
                 });
+            planned_cache_eviction_count_ +=
+                static_cast<unsigned long long>(before - chunks_.size());
         }
 
         UInt64 touch_planned_cursor_locked(std::size_t plan_index, UInt64 end)
@@ -1123,6 +1126,15 @@ namespace sunpack::sevenzip
             // touch_planned_cursor_locked() already advanced this consumer to
             // request_end, so speculative scheduling starts *after* the direct read
             // instead of redundantly queueing the same bytes.
+            if (state == PlannedRequestState::Missing ||
+                state == PlannedRequestState::Failed)
+            {
+                if (PlannedCursor *cursor = find_planned_cursor_locked(cursor_id))
+                {
+                    cursor->next_offset = request_end;
+                }
+            }
+
             if (state == PlannedRequestState::Failed)
             {
                 erase_planned_chunks_if_locked(
@@ -1190,6 +1202,12 @@ namespace sunpack::sevenzip
                     active_ = true;
                     break;
                 }
+            }
+            if (!active_)
+            {
+                // Do not retain a 32+ MiB high-water pool after this stream's plan
+                // is exhausted (important for multi-volume archives).
+                planned_free_buffers_.clear();
             }
         }
 #endif
