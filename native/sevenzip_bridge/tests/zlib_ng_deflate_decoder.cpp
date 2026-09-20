@@ -6,8 +6,8 @@
 #include <string>
 #include <vector>
 
-#include "Common/MyCom.h"
 #include "internal/zlib_ng_deflate_decoder.h"
+#include "Common/MyCom.h"
 
 namespace {
 
@@ -48,20 +48,24 @@ Z7_CLASS_IMP_COM_1(
     CMemoryInStream
     , ISequentialInStream
 )
-    const std::vector<Byte> &_data;
+    const std::vector<Byte> *_data = nullptr;
     std::size_t _pos = 0;
 public:
-    explicit CMemoryInStream(const std::vector<Byte> &data): _data(data) {}
+    void Init(const std::vector<Byte> &data)
+    {
+        _data = &data;
+        _pos = 0;
+    }
 };
 
 Z7_COM7F_IMF(CMemoryInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
 {
     if (processedSize)
         *processedSize = 0;
-    if (size == 0 || _pos >= _data.size())
+    if (size == 0 || !_data || _pos >= _data->size())
         return S_OK;
-    const std::size_t amount = std::min<std::size_t>(size, _data.size() - _pos);
-    std::memcpy(data, _data.data() + _pos, amount);
+    const std::size_t amount = std::min<std::size_t>(size, _data->size() - _pos);
+    std::memcpy(data, _data->data() + _pos, amount);
     _pos += amount;
     if (processedSize)
         *processedSize = static_cast<UInt32>(amount);
@@ -128,7 +132,8 @@ int main()
     if (!Check(finishMode->SetFinishMode(1) == S_OK, "SetFinishMode"))
         return 1;
 
-    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> inStream(packed);
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> inStream;
+    inStream->Init(packed);
     CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> outStream;
 
     const UInt64 inSize = static_cast<UInt64>(packed.size());
@@ -177,7 +182,8 @@ int main()
     // decode the next entry immediately after a Strong Encryption entry.  The
     // previous stream's prefetched padding must not survive inflateReset2().
     std::vector<Byte> packedAgain(std::begin(kRawDeflate), std::end(kRawDeflate));
-    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> inStreamAgain(packedAgain);
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> inStreamAgain;
+    inStreamAgain->Init(packedAgain);
     CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> outStreamAgain;
     const UInt64 inSizeAgain = static_cast<UInt64>(packedAgain.size());
     if (!Check(
@@ -225,7 +231,8 @@ int main()
         return 1;
 #endif
 
-    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> adaptiveIn(packedAgain);
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> adaptiveIn;
+    adaptiveIn->Init(packedAgain);
     CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> adaptiveOut;
     if (!Check(
             adaptive->Code(adaptiveIn, adaptiveOut, &inSizeAgain, &outSize, nullptr) == S_OK,
@@ -244,7 +251,8 @@ int main()
 
     std::vector<Byte> gzipConcat(std::begin(kGzipMemberA), std::end(kGzipMemberA));
     gzipConcat.insert(gzipConcat.end(), std::begin(kGzipMemberB), std::end(kGzipMemberB));
-    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipIn(gzipConcat);
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipIn;
+    gzipIn->Init(gzipConcat);
     CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> gzipOut;
     SunpackGzipDecodeResult gzipResult;
     if (!Check(
@@ -261,7 +269,8 @@ int main()
 
     std::vector<Byte> gzipBadCrc(std::begin(kGzipMemberA), std::end(kGzipMemberA));
     gzipBadCrc[gzipBadCrc.size() - 8] ^= 0x01;
-    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipBadCrcIn(gzipBadCrc);
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipBadCrcIn;
+    gzipBadCrcIn->Init(gzipBadCrc);
     CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> gzipBadCrcOut;
     SunpackGzipDecodeResult gzipBadCrcResult;
     if (!Check(
@@ -274,7 +283,8 @@ int main()
         return 1;
 
     std::vector<Byte> gzipTruncated(std::begin(kGzipMemberA), std::end(kGzipMemberA) - 3);
-    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipTruncatedIn(gzipTruncated);
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipTruncatedIn;
+    gzipTruncatedIn->Init(gzipTruncated);
     CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> gzipTruncatedOut;
     SunpackGzipDecodeResult gzipTruncatedResult;
     if (!Check(
@@ -289,7 +299,8 @@ int main()
     std::vector<Byte> gzipTrailing(std::begin(kGzipMemberA), std::end(kGzipMemberA));
     gzipTrailing.push_back(0x42);
     gzipTrailing.push_back(0x43);
-    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipTrailingIn(gzipTrailing);
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipTrailingIn;
+    gzipTrailingIn->Init(gzipTrailing);
     CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> gzipTrailingOut;
     SunpackGzipDecodeResult gzipTrailingResult;
     if (!Check(
