@@ -697,6 +697,10 @@ static const size_t kWriteStep = (size_t)1 << 18;
 // static const unsigned kWinSize_Log_Min = 17;
 static const size_t kWinSize_Min = 1u << 18;
 
+#ifndef Z7_ST
+static void DestroyRar5ParallelBlockPool(CRar5ParallelBlockPool *pool);
+#endif
+
 CDecoder::CDecoder():
     _isSolid(false),
     _is_v7(false),
@@ -744,7 +748,7 @@ CDecoder::~CDecoder()
 #define Z7_RAR_FREE_WINDOW ::BigFree(_window);
 
 #ifndef Z7_ST
-  delete _mtPool;
+  DestroyRar5ParallelBlockPool(_mtPool);
   _mtPool = NULL;
   _mtPoolWorkers = 0;
 #endif
@@ -1714,7 +1718,15 @@ struct CRar5ParallelBlockJob
       }
 
       if (result != S_OK)
-        throw result;
+      {
+        {
+          std::lock_guard<std::mutex> lock(Mutex);
+          Result = result;
+          Done = true;
+        }
+        FinishedEvent.notify_all();
+        return;
+      }
 
       for (;;)
       {
@@ -1873,14 +1885,12 @@ struct CRar5ParallelBlockJob
             MinorError = true;
         }
       }
+
+      MinorError = MinorError || bitStream._minorError;
     }
     catch (const std::bad_alloc &)
     {
       result = E_OUTOFMEMORY;
-    }
-    catch (HRESULT hres)
-    {
-      result = hres;
     }
     catch (...)
     {
@@ -1892,7 +1902,7 @@ struct CRar5ParallelBlockJob
       Result = result;
       Done = true;
     }
-    FinishedEvent.notify_one();
+    FinishedEvent.notify_all();
   }
 
   HRESULT WaitTables(CRar5ParallelTables &tables)
@@ -2022,6 +2032,12 @@ public:
     _workEvent.notify_one();
   }
 };
+
+
+static void DestroyRar5ParallelBlockPool(CRar5ParallelBlockPool *pool)
+{
+  delete pool;
+}
 
 
 class CRar5ParallelPoolRunScope
@@ -2796,7 +2812,13 @@ error_dist:
 
   auto retireOne = [&](CRar5ParallelBlockJob &job) -> HRESULT
   {
-    RINOK(job.Wait())
+    const HRESULT waitRes = job.Wait();
+    if (waitRes != S_OK)
+    {
+      if (job.TablePresent)
+        _tableWasFilled = false;
+      return waitRes;
+    }
 
     if (job.TablePresent)
     {
@@ -2952,7 +2974,12 @@ error_dist:
       {
         if (!pendingTableJob)
           return S_FALSE;
-        RINOK(pendingTableJob->WaitTables(inheritedTables))
+        const HRESULT tableWaitRes = pendingTableJob->WaitTables(inheritedTables);
+        if (tableWaitRes != S_OK)
+        {
+          _tableWasFilled = false;
+          return tableWaitRes;
+        }
         inheritedTablesValid = true;
         pendingTableJob = NULL;
       }
