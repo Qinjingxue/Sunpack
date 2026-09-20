@@ -1788,6 +1788,41 @@ Z7_COM7F_IMF(CRar5ReplayInStream::Read(void *data, UInt32 size, UInt32 *processe
   return res;
 }
 
+
+Z7_CLASS_IMP_NOQIB_1(
+  CRar5ProgressOffset
+  , ICompressProgressInfo
+)
+  CMyComPtr<ICompressProgressInfo> _progress;
+  UInt64 _inOffset;
+public:
+  CRar5ProgressOffset(): _inOffset(0) {}
+
+  void Init(ICompressProgressInfo *progress, UInt64 inOffset)
+  {
+    _progress = progress;
+    _inOffset = inOffset;
+  }
+};
+
+Z7_COM7F_IMF(CRar5ProgressOffset::SetRatioInfo(
+    const UInt64 *inSize, const UInt64 *outSize))
+{
+  if (!_progress)
+    return S_OK;
+
+  if (!inSize)
+    return _progress->SetRatioInfo(NULL, outSize);
+
+  UInt64 adjusted = *inSize;
+  if (adjusted > (UInt64)(Int64)-1 - _inOffset)
+    adjusted = (UInt64)(Int64)-1;
+  else
+    adjusted += _inOffset;
+
+  return _progress->SetRatioInfo(&adjusted, outSize);
+}
+
 struct CRar5RawBlockHeader
 {
   Byte Bytes[5];
@@ -2550,10 +2585,33 @@ error_dist:
 
       CMyComPtr2_Create<ISequentialInStream, CRar5ReplayInStream> replay;
       replay->Init(rawHeader.Bytes, rawHeader.HeaderSize, _inStream);
+
+      // DecodeLZ() reports packed progress relative to the replay stream.
+      // Offset that value by the bytes already consumed by the parallel
+      // producer so the handler observes one monotonic packed position.
+      const UInt64 serialBase = packedRead - rawHeader.HeaderSize;
+      CMyComPtr2_Create<ICompressProgressInfo, CRar5ProgressOffset> progressOffset;
+      progressOffset->Init(_progress, serialBase);
+
       ISequentialInStream *savedStream = _inStream;
+      ICompressProgressInfo *savedProgress = _progress;
+      const UInt64 savedProgressPack = _progress_Pack;
       _inStream = replay;
+      _progress = progressOffset;
+      _progress_Pack = 0;
+
       const HRESULT res = DecodeLZ();
+
+      const UInt64 serialProgressPack = _progress_Pack;
       _inStream = savedStream;
+      _progress = savedProgress;
+      if (serialProgressPack > (UInt64)(Int64)-1 - serialBase)
+        _progress_Pack = (UInt64)(Int64)-1;
+      else
+        _progress_Pack = serialBase + serialProgressPack;
+      if (_progress_Pack < savedProgressPack)
+        _progress_Pack = savedProgressPack;
+
       return res;
     }
 
