@@ -663,13 +663,15 @@ fn verify_rar4(py: Python<'_>, data: &[u8], candidates: &[String]) -> PyResult<P
             }
         });
         if let Some(index) = matched_index {
-            return status(
+            return status_with_details(
                 py,
                 "match",
                 index as i32,
                 (index + 1) as i32,
                 "rar3/rar4 -hp encrypted header matched",
-            );
+                Some(true),
+                Some("rar4_hp_header_crc16"),
+                );
         }
         return status(
             py,
@@ -727,13 +729,15 @@ fn verify_rar4(py: Python<'_>, data: &[u8], candidates: &[String]) -> PyResult<P
         }
     });
     if let Some(index) = matched_index {
-        return status(
+        return status_with_details(
             py,
             "match",
             index as i32,
             (index + 1) as i32,
             "rar3/rar4 -hp encrypted header matched",
-        );
+            Some(true),
+            Some("rar4_hp_header_crc16"),
+            );
     }
     status(
         py,
@@ -838,13 +842,15 @@ fn verify_rar5(py: Python<'_>, data: &[u8], candidates: &[String]) -> PyResult<P
     }
     let matched_index = py.detach(|| find_rar5_password_match(candidates, &header));
     if let Some(index) = matched_index {
-        return status(
+        return status_with_details(
             py,
             "match",
             index as i32,
             (index + 1) as i32,
             "rar5 password check matched",
-        );
+            Some(false),
+            Some("rar5_password_check"),
+            );
     }
     status(
         py,
