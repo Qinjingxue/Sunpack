@@ -22,6 +22,7 @@
 #ifdef _WIN32
 
 #include <algorithm>
+#include <chrono>
 #include <utility>
 
 #endif
@@ -393,7 +394,14 @@ namespace sunpack::sevenzip
                 password, callback_path, part_paths, canonical_names, prefetch_config);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
+            const auto open_started = std::chrono::steady_clock::now();
             hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
+            const auto open_elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - open_started).count();
+            if (open_elapsed > 0)
+            {
+                result.input_trace.open_wall_ns += static_cast<unsigned long long>(open_elapsed);
+            }
             last_encryption_evidence = raw_open_callback->password_requested();
 
             if (raw_open_callback->missing_volume_requested())
@@ -467,7 +475,29 @@ namespace sunpack::sevenzip
 
             CMyComPtr<IArchiveExtractCallback> extract_callback(raw_extract_callback);
 
+            // Flush actual worker-issued read counters before taking the Open snapshot.
+            ::NSunpackReadPlan::Sync(stream.Interface());
+
+            // Snapshot Open() before extraction changes the prefetch phase, so A/B runs can
+            // distinguish metadata parsing behavior from planned payload reads.
+            capture_open_input_trace(result.input_trace);
+
+            // Open is complete. If legacy prefetch is part of this build/config, enable it
+            // only for extraction; planned I/O will supersede it after a plan is installed.
+            ::NSunpackReadPlan::SetLegacyPrefetchActive(stream.Interface(), true);
+
+#ifdef SUP7Z_USE_PLANNED_IO
+            // Sequential/container formats can use the entire logical input as an exact coverage plan.
+            // 7z and RAR replace this conservative plan with packed extents inside their handlers.
+            const std::wstring planned_format = format_name_for_guid(format);
+            if (planned_format != L"7z" && planned_format != L"rar4" && planned_format != L"rar5")
+            {
+                ::NSunpackReadPlan::PlanWhole(stream.Interface());
+            }
+#endif
+
             hr = archive->Extract(nullptr, static_cast<UInt32>(kAllItems), 0, extract_callback.Interface());
+            ::NSunpackReadPlan::Sync(stream.Interface());
 
             // Extraction success must not be published before every queued write and close
             // has finished and any delayed filesystem error has been folded back in.

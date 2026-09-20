@@ -2947,6 +2947,36 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
 
 
   
+  for (unsigned volumeIndex = 0; volumeIndex < _arcs.Size(); ++volumeIndex)
+    NSunpackReadPlan::SetLegacyPrefetchActive(_arcs[volumeIndex].Stream.Interface(), true);
+
+#ifdef SUP7Z_USE_PLANNED_IO
+  for (unsigned volumeIndex = 0; volumeIndex < _arcs.Size(); ++volumeIndex)
+    NSunpackReadPlan::Begin(_arcs[volumeIndex].Stream.Interface());
+
+  FOR_VECTOR(planRefIndex, _refs)
+  {
+    if (extractStatuses[planRefIndex] == 0)
+      continue;
+    const CRefItem &planRef = _refs[planRefIndex];
+    int itemIndex = (int)planRef.Item;
+    for (;;)
+    {
+      if (itemIndex < 0 || (unsigned)itemIndex >= _items.Size())
+        break;
+      const CItem &planItem = _items[(unsigned)itemIndex];
+      if (planItem.VolIndex < _arcs.Size() && planItem.PackSize != 0)
+        NSunpackReadPlan::Add(_arcs[planItem.VolIndex].Stream.Interface(), planItem.GetDataPosition(), planItem.PackSize);
+      if ((unsigned)itemIndex == planRef.Last || planItem.NextItem < 0)
+        break;
+      itemIndex = planItem.NextItem;
+    }
+  }
+
+  for (unsigned volumeIndex = 0; volumeIndex < _arcs.Size(); ++volumeIndex)
+    NSunpackReadPlan::End(_arcs[volumeIndex].Stream.Interface());
+#endif
+
   // ---------- MEMORY REQUEST ----------
   {
     UInt64 dictMaxSize = 0;
