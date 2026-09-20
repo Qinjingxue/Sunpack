@@ -18,8 +18,6 @@
 
 #include "sevenzip_streams.hpp"
 
-#include "strict_archive_validation.hpp"
-
 namespace sunpack::sevenzip
 {
 
@@ -702,11 +700,7 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> &canonical_names,
 
-        const std::wstring &format_hint,
-
-        const std::wstring &signature_path,
-
-        unsigned long long signature_offset
+        const std::wstring &format_hint
 
     );
 
@@ -853,23 +847,9 @@ namespace sunpack::sevenzip
 
             part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
 
-        if (seven_zip_parts_prove_missing_tail(effective_part_paths, !canonical_names.empty()))
-        {
-            return needs_volume_or_tail_damaged_result("seven_zip_start_header_length");
-        }
-        if (zip_parts_require_unavailable_tail(effective_part_paths, !canonical_names.empty()))
-        {
-            return needs_volume_or_tail_damaged_result("zip_eocd_unavailable");
-        }
-
-        const std::vector<GUID> formats = format_hint.empty()
-            ? candidate_formats(archive_path, effective_part_paths)
-            : candidate_formats_for_hint(
-                  format_hint,
-                  archive_path,
-                  effective_part_paths,
-                  signature_path,
-                  signature_offset);
+        const std::vector<GUID> formats = extraction_formats_for_hint(
+            format_hint,
+            archive_path);
 
         for (int i = 0; i < password_count; ++i)
         {
@@ -1000,12 +980,9 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> part_paths{archive_path};
 
-        const std::vector<GUID> formats = candidate_formats_for_hint(
+        const std::vector<GUID> formats = extraction_formats_for_hint(
             format_hint,
-            archive_path,
-            part_paths,
-            ranges.empty() ? L"" : ranges.front().path,
-            ranges.empty() ? 0 : ranges.front().start);
+            archive_path);
 
         for (int i = 0; i < password_count; ++i)
         {
