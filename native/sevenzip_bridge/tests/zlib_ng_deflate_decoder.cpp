@@ -164,5 +164,52 @@ int main()
     if (!Check(outStreamAgain->Data == expected, "cached coder reuse decoded bytes"))
         return 1;
 
+    // The generic 0x40108 registry decoder uses the same fast backend when
+    // packed/unpacked sizes clearly indicate useful compression.
+    CMyComPtr<ICompressCoder> adaptive = SunpackCreateAdaptiveDeflateDecoder();
+    if (!Check(!!adaptive, "adaptive decoder allocation"))
+        return 1;
+
+    CMyComPtr<ICompressSetFinishMode> adaptiveFinish;
+    if (!Check(
+            adaptive.QueryInterface(IID_ICompressSetFinishMode, &adaptiveFinish) == S_OK &&
+                !!adaptiveFinish,
+            "adaptive ICompressSetFinishMode"))
+        return 1;
+    if (!Check(adaptiveFinish->SetFinishMode(1) == S_OK, "adaptive SetFinishMode"))
+        return 1;
+
+    CMyComPtr<ICompressSetInStream> adaptiveSetIn;
+    if (!Check(
+            adaptive.QueryInterface(IID_ICompressSetInStream, &adaptiveSetIn) == S_OK &&
+                !!adaptiveSetIn,
+            "adaptive ICompressSetInStream"))
+        return 1;
+
+    CMyComPtr<ICompressSetOutStreamSize> adaptiveSetOutSize;
+    if (!Check(
+            adaptive.QueryInterface(IID_ICompressSetOutStreamSize, &adaptiveSetOutSize) == S_OK &&
+                !!adaptiveSetOutSize,
+            "adaptive ICompressSetOutStreamSize"))
+        return 1;
+
+#ifndef Z7_NO_READ_FROM_CODER
+    CMyComPtr<ISequentialInStream> adaptiveRead;
+    if (!Check(
+            adaptive.QueryInterface(IID_ISequentialInStream, &adaptiveRead) == S_OK &&
+                !!adaptiveRead,
+            "adaptive ISequentialInStream"))
+        return 1;
+#endif
+
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> adaptiveIn(packedAgain);
+    CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> adaptiveOut;
+    if (!Check(
+            adaptive->Code(adaptiveIn, adaptiveOut, &inSizeAgain, &outSize, nullptr) == S_OK,
+            "adaptive Code"))
+        return 1;
+    if (!Check(adaptiveOut->Data == expected, "adaptive decoded bytes"))
+        return 1;
+
     return 0;
 }
