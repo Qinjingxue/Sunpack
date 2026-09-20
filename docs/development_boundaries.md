@@ -145,7 +145,7 @@ The rule layer must not depend on processor implementation details; shared defau
 
 ### passwords
 
-`passwords` manages candidate passwords, batch scheduling, caching, fast verifiers, and the final 7z.dll confirmation. A fast verifier only makes a low-cost judgement; once it hits, `SevenZipDllVerifier` still gives the final confirmation. The password layer does not perform extraction and does not decide whether a candidate should be extracted.
+`passwords` manages candidate passwords, batch scheduling, caching, and bounded Rust fast verifiers. Strong ZIP/RAR/7z proofs resolve a password directly; weak matches are passed to the extraction worker as candidates for bounded backend confirmation during the extraction transaction. The password layer does not perform full-payload 7-Zip probe/test calls.
 
 ### extraction
 
