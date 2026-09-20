@@ -2,8 +2,6 @@
 
 #include "archive_operations.hpp"
 
-#include "strict_archive_validation.hpp"
-
 #include "sevenzip_callbacks.hpp"
 
 #include "sevenzip_formats.hpp"
@@ -238,11 +236,7 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget = 0,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
-
-        const std::wstring &signature_path = L"",
-
-        UInt64 signature_offset = 0
+        std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
 
     )
     {
@@ -346,12 +340,10 @@ namespace sunpack::sevenzip
         const auto formats = [&]()
         {
             PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::FormatCandidates);
-            return candidate_formats_for_hint(
-                format_hint, archive_path, part_paths, signature_path, signature_offset);
+            return extraction_formats_for_hint(format_hint, archive_path);
         }();
 #else
-        const auto formats = candidate_formats_for_hint(
-            format_hint, archive_path, part_paths, signature_path, signature_offset);
+        const auto formats = extraction_formats_for_hint(format_hint, archive_path);
 #endif
         const auto prefetch_config = input_prefetch_config_for_archive(format_hint, native_volume_input);
 
@@ -880,11 +872,7 @@ namespace sunpack::sevenzip
 
         std::size_t job_buffer_budget,
 
-        std::shared_ptr<std::atomic<bool>> cancel_token,
-
-        const std::wstring &signature_path,
-
-        UInt64 signature_offset
+        std::shared_ptr<std::atomic<bool>> cancel_token
 
     )
     {
@@ -923,9 +911,7 @@ namespace sunpack::sevenzip
             native_volume_input,
             std::move(shared_writer),
             job_buffer_budget,
-            std::move(cancel_token),
-            signature_path,
-            signature_offset);
+            std::move(cancel_token));
 
 #else
 
@@ -1022,9 +1008,7 @@ namespace sunpack::sevenzip
             false,
             std::move(shared_writer),
             job_buffer_budget,
-            std::move(cancel_token),
-            ranges.empty() ? L"" : ranges.front().path,
-            ranges.empty() ? 0 : ranges.front().start);
+            std::move(cancel_token));
 
 #else
 
