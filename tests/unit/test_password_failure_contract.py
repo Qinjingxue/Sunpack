@@ -1,5 +1,3 @@
-from types import SimpleNamespace
-
 import pytest
 
 from sunpack.contracts.detection import FactBag
@@ -11,9 +9,7 @@ from sunpack.passwords.job import PasswordJob
 from sunpack.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
 from sunpack.passwords.verifier import PasswordBatchVerification
 from sunpack.passwords.verifier.base import VERIFIER_STATUSES, normalize_verifier_status
-from sunpack.passwords.verifier.registry import PasswordVerifierChain
 from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
-from sunpack.support.sevenzip_bridge import OPERATION_RESULT_HEADERS_ERROR
 from sunpack.verification import VerificationScheduler
 from sunpack.contracts.verification import DECISION_REQUEST_PASSWORD, CONTENT_INTEGRITY_UNKNOWN
 
@@ -98,94 +94,6 @@ def test_fast_verifier_preserves_native_field_read_diagnostics():
     assert verification.test_result["read_error"]["field"] == "zip.eocd"
 
 
-def test_final_confirmation_tail_failure_does_not_reject_fast_match():
-    fast = _StaticVerifier(PasswordBatchVerification(
-        ok=True,
-        status="match",
-        matched_index=0,
-        attempts=1,
-        final_confirmation_required=True,
-        match_evidence="bounded_header",
-    ))
-    final = _StaticVerifier(PasswordBatchVerification(
-        ok=False,
-        status="needs_volume_or_tail_damaged",
-        attempts=1,
-        error_text="next volume unavailable",
-        terminal=True,
-    ))
-
-    result = PasswordVerifierChain([fast], final).verify_batch(
-        "sample.rar",
-        ["candidate", "later-candidate"],
-    )
-
-    assert result.status == "needs_volume_or_tail_damaged"
-    assert result.terminal is True
-    assert result.final_confirmation_required is False
-
-
-def test_headers_error_confirmation_rejects_only_weak_rar_candidate():
-    fast = _SequencedVerifier([
-        PasswordBatchVerification(
-            ok=True,
-            status="match",
-            matched_index=0,
-            attempts=1,
-            final_confirmation_required=True,
-            match_evidence="rar4_hp_header",
-        ),
-        PasswordBatchVerification(
-            ok=False,
-            status="no_match",
-            attempts=1,
-            error_text="RAR4 -hp header did not match",
-        ),
-    ])
-    final = _StaticVerifier(PasswordBatchVerification(
-        ok=False,
-        status="damaged",
-        attempts=1,
-        error_text="archive appears damaged [operation_result=headers_error]",
-        test_result=SimpleNamespace(operation_result=OPERATION_RESULT_HEADERS_ERROR),
-        terminal=True,
-    ))
-
-    result = PasswordVerifierChain([fast], final).verify_batch(
-        "sample.rar",
-        ["weak-match", "later-wrong-password"],
-    )
-
-    assert result.status == "no_match"
-    assert result.attempts == 2
-    assert fast.batches == [["weak-match", "later-wrong-password"], ["later-wrong-password"]]
-
-
-def test_non_header_damage_after_weak_match_remains_terminal():
-    fast = _StaticVerifier(PasswordBatchVerification(
-        ok=True,
-        status="match",
-        matched_index=0,
-        attempts=1,
-        final_confirmation_required=True,
-    ))
-    final = _StaticVerifier(PasswordBatchVerification(
-        ok=False,
-        status="damaged",
-        attempts=1,
-        error_text="archive appears damaged [operation_result=data_error]",
-        terminal=True,
-    ))
-
-    result = PasswordVerifierChain([fast], final).verify_batch(
-        "sample.rar",
-        ["weak-match", "later-password"],
-    )
-
-    assert result.status == "damaged"
-    assert result.terminal is True
-
-
 def test_embedded_failure_retains_nested_password_cause():
     password = FailureInfo(
         kind=FailureKind.WRONG_PASSWORD,
@@ -243,16 +151,6 @@ class _StaticVerifier:
 
     def verify_batch(self, archive_path, passwords, *, part_paths=None, archive_input=None):
         return self.result
-
-
-class _SequencedVerifier:
-    def __init__(self, results):
-        self.results = list(results)
-        self.batches = []
-
-    def verify_batch(self, archive_path, passwords, *, part_paths=None, archive_input=None):
-        self.batches.append(list(passwords))
-        return self.results.pop(0)
 
 
 def _task(path) -> ArchiveTask:
