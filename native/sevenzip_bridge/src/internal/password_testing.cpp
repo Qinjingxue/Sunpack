@@ -18,8 +18,6 @@
 
 #include "sevenzip_streams.hpp"
 
-#include "strict_archive_validation.hpp"
-
 namespace sunpack::sevenzip
 {
 
@@ -164,34 +162,6 @@ namespace sunpack::sevenzip
         const std::vector<std::wstring> &canonical_names = {}
 
     );
-
-    PasswordTestResult test_one_password(
-
-
-        const std::wstring &archive_path,
-
-        const std::wstring &password,
-
-        const std::vector<std::wstring> &part_paths
-
-    )
-    {
-
-        return test_one_password(
-
-
-            archive_path,
-
-            password,
-
-            part_paths,
-
-            candidate_formats(archive_path, part_paths),
-
-            {},
-
-            false);
-    }
 
     PasswordTestResult test_one_password(
 
@@ -689,19 +659,6 @@ namespace sunpack::sevenzip
 
 #endif
 
-    PasswordTestResult test_password_with_parts(
-
-    
-        const std::wstring &archive_path,
-
-        const std::vector<std::wstring> &part_paths,
-
-        const std::wstring &password,
-
-        const std::vector<std::wstring> &canonical_names
-
-    );
-
     PasswordTestResult test_passwords_with_parts(
 
     
@@ -715,106 +672,7 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> &canonical_names,
 
-        const std::wstring &format_hint,
-
-        const std::wstring &signature_path,
-
-        unsigned long long signature_offset
-
-    );
-
-    PasswordTestResult test_password(
-
-    
-        const std::wstring &archive_path,
-
-        const std::wstring &password
-
-    )
-    {
-
-        return test_password_with_parts(archive_path, {archive_path}, password);
-    }
-
-    PasswordTestResult test_password_with_parts(
-
-    
-        const std::wstring &archive_path,
-
-        const std::vector<std::wstring> &part_paths,
-
-        const std::wstring &password,
-
-        const std::vector<std::wstring> &canonical_names
-
-    )
-    {
-
-#ifdef _WIN32
-
-        
-        const auto effective_parts = part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
-        PasswordTestResult result = test_one_password(
-            archive_path, password, effective_parts,
-            candidate_formats(archive_path, effective_parts), {}, false, canonical_names);
-
-        result.attempts = 1;
-
-        result.matched_index = result.status == PasswordTestStatus::Ok ? 0 : -1;
-
-        return result;
-
-#else
-
-    
-        (void)archive_path;
-
-        (void)password;
-
-        PasswordTestResult result;
-
-        result.status = PasswordTestStatus::BackendUnavailable;
-
-        result.message = "native password testing is only implemented on Windows";
-
-        return result;
-
-#endif
-    }
-
-    PasswordTestResult test_passwords(
-
-    
-        const std::wstring &archive_path,
-
-        const wchar_t *const *passwords,
-
-        int password_count
-
-    )
-    {
-
-        return test_passwords_with_parts(archive_path, {archive_path}, passwords, password_count);
-    }
-
-    PasswordTestResult test_passwords_with_parts(
-
-    
-        const std::wstring &archive_path,
-
-        const std::vector<std::wstring> &part_paths,
-
-        const wchar_t *const *passwords,
-
-        int password_count,
-
-        const std::vector<std::wstring> &canonical_names,
-
-        const std::wstring &format_hint,
-
-        const std::wstring &signature_path,
-
-        unsigned long long signature_offset
+        const std::wstring &format_hint
 
     )
     {
@@ -866,23 +724,9 @@ namespace sunpack::sevenzip
 
             part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
 
-        if (seven_zip_parts_prove_missing_tail(effective_part_paths, !canonical_names.empty()))
-        {
-            return needs_volume_or_tail_damaged_result("seven_zip_start_header_length");
-        }
-        if (zip_parts_require_unavailable_tail(effective_part_paths, !canonical_names.empty()))
-        {
-            return needs_volume_or_tail_damaged_result("zip_eocd_unavailable");
-        }
-
-        const std::vector<GUID> formats = format_hint.empty()
-            ? candidate_formats(archive_path, effective_part_paths)
-            : candidate_formats_for_hint(
-                  format_hint,
-                  archive_path,
-                  effective_part_paths,
-                  signature_path,
-                  signature_offset);
+        const std::vector<GUID> formats = extraction_formats_for_hint(
+            format_hint,
+            archive_path);
 
         for (int i = 0; i < password_count; ++i)
         {
@@ -1013,12 +857,9 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> part_paths{archive_path};
 
-        const std::vector<GUID> formats = candidate_formats_for_hint(
+        const std::vector<GUID> formats = extraction_formats_for_hint(
             format_hint,
-            archive_path,
-            part_paths,
-            ranges.empty() ? L"" : ranges.front().path,
-            ranges.empty() ? 0 : ranges.front().start);
+            archive_path);
 
         for (int i = 0; i < password_count; ++i)
         {

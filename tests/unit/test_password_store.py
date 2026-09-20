@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 from sunpack.contracts.detection import FactBag
 from sunpack.passwords.job import PasswordJob
-from sunpack.passwords.result import PasswordProbeResult, PasswordResolutionStatus
+from sunpack.passwords.result import PasswordResolutionStatus
 from sunpack.passwords.scheduler import PasswordScheduler, PasswordSearchResult, PasswordSearchStatus
 from sunpack.passwords import PasswordResolver, PasswordSession, PasswordStore
 from sunpack.passwords.internal.store import MAX_RECENT_PASSWORDS
@@ -90,7 +90,7 @@ class FakePasswordTester:
 
     def test_without_password(self, archive_path, part_paths=None):
         self.test_without_password_calls += 1
-        return PasswordProbeResult(status="no_match", message="encrypted")
+        return SimpleNamespace(status="no_match", message="encrypted")
 
     def search_passwords(self, job: PasswordJob):
         self.search_calls += 1
@@ -100,7 +100,7 @@ class FakePasswordTester:
 class FakeFailingPasswordTester(FakePasswordTester):
     def test_without_password(self, archive_path, part_paths=None):
         self.test_without_password_calls += 1
-        return PasswordProbeResult(status="damaged", message="headers error")
+        return SimpleNamespace(status="damaged", message="headers error")
 
     def search_passwords(self, job: PasswordJob):
         self.search_calls += 1
@@ -354,7 +354,7 @@ def test_password_resolver_routes_unknown_embedded_range_through_normal_schedule
         builtin_passwords=[],
     )
     fast = RecordingNotRequiredFastVerifier()
-    scheduler = PasswordScheduler(PasswordVerifierChain([fast], None))
+    scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
     resolver = PasswordResolver(tester, PasswordSession(), scheduler)
     bag = FactBag()
     bag.set("archive.knowledge", {

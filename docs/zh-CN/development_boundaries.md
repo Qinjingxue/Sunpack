@@ -145,7 +145,7 @@ contracts
 
 ### passwords
 
-`passwords` 管理候选密码、批量调度、缓存、fast verifier 和最终 7z.dll 确认。fast verifier 只做低成本判断；命中后仍由 `SevenZipDllVerifier` 最终确认。密码层不执行解压，不判断候选是否应解压。
+`passwords` 管理候选密码、批量调度、缓存和 Rust bounded fast verifier。ZIP/RAR/7z 的强证据可直接确定密码；弱匹配只作为候选交给 extraction worker，在真实解压事务中做 bounded backend confirmation。密码层不再调用独立的 7-Zip full-payload probe/test。
 
 ### extraction
 
@@ -173,7 +173,7 @@ contracts
 
 `native/sunpack_native` 承接跨平台热点：目录扫描、二进制视图、signature prepass、格式 probe、carrier scan、输出 CRC/readability、输出文件索引匹配、密码 fast verifier 等。
 
-`native/sevenzip_bridge` 承接 Windows 7z.dll ABI：archive probe/test、密码数组尝试、archive state manifest 和 `sunpack_sevenzip_worker.exe` 解压。
+`native/sevenzip_bridge` 承接 Windows embedded 7-Zip 执行能力：资源/manifest 查询、worker 内部的 bounded 密码候选确认，以及 `sunpack_sevenzip_worker.exe` 解压。格式/结构/加密分析由 Python/Rust analysis 层完成，不在这里维护第二套 archive probe/test。
 
 ### Windows Watch Broker / USN
 

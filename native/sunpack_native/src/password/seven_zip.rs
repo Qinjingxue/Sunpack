@@ -377,12 +377,14 @@ fn read_predecoded_header_with_original_parser(decoded_header: &[u8]) -> HeaderR
 
 fn conclusive_status(py: Python<'_>, index: usize, outcome: HeaderRead) -> PyResult<Py<PyAny>> {
     match outcome {
-        HeaderRead::Ok { .. } => status(
+        HeaderRead::Ok { .. } => status_with_details(
             py,
             "match",
             index as i32,
             (index + 1) as i32,
             "7z encrypted header opened",
+            Some(false),
+            Some("7z_encrypted_header"),
         ),
         HeaderRead::Unsupported(message) => {
             status(py, "unknown_needs_final_verifier", -1, index as i32, &message)
@@ -430,11 +432,29 @@ fn status(
     attempts: i32,
     message: &str,
 ) -> PyResult<Py<PyAny>> {
+    status_with_details(py, status, matched_index, attempts, message, None, None)
+}
+
+fn status_with_details(
+    py: Python<'_>,
+    status: &str,
+    matched_index: i32,
+    attempts: i32,
+    message: &str,
+    final_confirmation_required: Option<bool>,
+    match_evidence: Option<&str>,
+) -> PyResult<Py<PyAny>> {
     let result = PyDict::new(py);
     result.set_item("status", status)?;
     result.set_item("matched_index", matched_index)?;
     result.set_item("attempts", attempts)?;
     result.set_item("message", message)?;
+    if let Some(value) = final_confirmation_required {
+        result.set_item("final_confirmation_required", value)?;
+    }
+    if let Some(value) = match_evidence {
+        result.set_item("match_evidence", value)?;
+    }
     Ok(result.into())
 }
 

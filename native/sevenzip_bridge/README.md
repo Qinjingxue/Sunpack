@@ -76,15 +76,9 @@ tools\sunpack_sevenzip_worker.exe
 
 ## C API
 
-The DLL exports a narrow C ABI including:
+The DLL exports a narrow C ABI for archive resource analysis and manifest queries. Password candidate confirmation is an internal worker capability, not a public Python/DLL probe API.
 
-- `sup7z_try_passwords`
-- `sup7z_test_archive`
-- `sup7z_run_operation` (open probe, test, and password attempts)
-- `sup7z_analyze_archive_resources`
-- archive manifest and operation entry points
-
-The Python binding owns library loading, typed result conversion and caches. The worker owns process isolation, JSON job handling and progress output.
+The Python binding owns library loading, typed result conversion and caches for those resource queries. The worker owns extraction, bounded confirmation of weak password candidates, process isolation, JSON job handling and progress output.
 
 ## Runtime Contract
 

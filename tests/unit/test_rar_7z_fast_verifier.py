@@ -132,6 +132,8 @@ def test_rar_fast_verifier_matches_rar3_hp_encrypted_header(tmp_path):
     assert outcome.status == "match"
     assert outcome.matched_index == 1
     assert outcome.attempts == 2
+    assert outcome.final_confirmation_required is True
+    assert outcome.match_evidence == "rar4_hp_header_crc16"
 
 
 def test_rar_fast_verifier_rejects_wrong_rar3_hp_encrypted_header(tmp_path):
@@ -155,6 +157,8 @@ def test_rar_fast_verifier_matches_rar5_password_check(tmp_path):
     assert outcome.status == "match"
     assert outcome.matched_index == 1
     assert outcome.attempts == 2
+    assert outcome.final_confirmation_required is False
+    assert outcome.match_evidence == "rar5_password_check"
 
 
 def test_rar_fast_verifier_rejects_wrong_rar5_password_check(tmp_path):
@@ -345,6 +349,8 @@ def test_seven_zip_fast_verifier_matches_encrypted_header_password(tmp_path):
     assert outcome.status == "match"
     assert outcome.matched_index == 1
     assert outcome.attempts == 2
+    assert outcome.final_confirmation_required is False
+    assert outcome.match_evidence == "7z_encrypted_header"
 
 
 def test_seven_zip_fast_verifier_rejects_wrong_encrypted_header_passwords(tmp_path):

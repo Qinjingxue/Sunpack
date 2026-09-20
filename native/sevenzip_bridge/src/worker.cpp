@@ -358,8 +358,6 @@ struct WorkerArchiveInput {
     std::vector<std::wstring> part_paths;
     std::vector<std::wstring> canonical_names;
     std::vector<int> volume_numbers;
-    std::wstring signature_path;
-    unsigned long long signature_offset = 0;
     std::string analyzed_missing_volume_evidence;
     std::string validation_error;
     std::vector<sunpack::sevenzip::ExtractInputRange> ranges;
@@ -389,9 +387,7 @@ sunpack::sevenzip::PasswordTestResult run_password_candidate_probe(
         password_ptrs.data(),
         static_cast<int>(password_ptrs.size()),
         archive_input.canonical_names,
-        archive_input.format_hint,
-        archive_input.signature_path,
-        archive_input.signature_offset);
+        archive_input.format_hint);
 }
 
 sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
@@ -588,10 +584,6 @@ WorkerArchiveInput parse_archive_input_descriptor(
             parts.push_back(structured_parts[index].path);
             input.canonical_names.push_back(structured_parts[index].canonical_name);
             input.volume_numbers.push_back(structured_parts[index].number);
-            if (index == 0 && structured_parts[index].has_start && structured_parts[index].start > 0) {
-                input.signature_path = structured_parts[index].path;
-                input.signature_offset = structured_parts[index].start;
-            }
         }
         if (parts.empty()) input.validation_error = "structured volume descriptor has no parts";
     }

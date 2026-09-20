@@ -54,7 +54,8 @@ class SevenZipFastVerifier:
             test_result=outcome,
             error_text=message.lower(),
             terminal=status in {"damaged", "needs_volume_or_tail_damaged"},
-            final_confirmation_required=(
-                False if status == "not_required" else "7z encrypted header opened" not in message.lower()
-            ),
+            final_confirmation_required=bool(
+                outcome.get("final_confirmation_required", status == "match")
+            ) if status != "not_required" else False,
+            match_evidence=str(outcome.get("match_evidence") or ""),
         )
