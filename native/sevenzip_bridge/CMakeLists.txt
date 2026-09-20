@@ -621,9 +621,9 @@ if(WIN32)
     target_compile_definitions(sunpack_sevenzip_com_contract PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
 endif()
 
-# Contract test for the selected ZIP Deflate decoder. Strong Encryption relies
-# on retrieving bytes that inflate prefetched past the raw Deflate end marker so
-# the existing 7-Zip path can validate PKCS#7 padding.
+# Contract tests for SunPack's zlib-ng decode paths. This covers the raw
+# Deflate adapter (including Strong Encryption unused-input semantics), the
+# generic adaptive registry decoder, and the seekable gzip wrapper fast path.
 add_executable(sunpack_zlib_ng_deflate_contract
     tests/zlib_ng_deflate_decoder.cpp
 )

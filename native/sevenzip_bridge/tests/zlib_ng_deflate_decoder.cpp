@@ -31,6 +31,19 @@ static const Byte kTrailingPadding[] = {
     0x09,0x0a,0x0b,0x0c,0x0d,0x0e,0x0f,0x10
 };
 
+
+static const Byte kGzipMemberA[] = {
+    0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x02,0xff,0x2b,0x2e,0xcd,0x2b,0x48,0x4c,
+    0xce,0xd6,0x4d,0xaf,0xca,0x2c,0xd0,0xcd,0x4d,0xcd,0x4d,0x4a,0x2d,0xd2,0x4d,0xe4,
+    0x2a,0x1e,0xb4,0xa2,0x00,0x5f,0x1f,0x8f,0xbd,0xb0,0x00,0x00,0x00
+};
+
+static const Byte kGzipMemberB[] = {
+    0x1f,0x8b,0x08,0x00,0x00,0x00,0x00,0x00,0x02,0xff,0x2b,0x2e,0xcd,0x2b,0x48,0x4c,
+    0xce,0xd6,0x4d,0xaf,0xca,0x2c,0xd0,0xcd,0x4d,0xcd,0x4d,0x4a,0x2d,0xd2,0x4d,0xe2,
+    0x2a,0xa6,0x91,0x28,0x00,0xa3,0xc5,0x54,0x7f,0x6e,0x00,0x00,0x00
+};
+
 Z7_CLASS_IMP_COM_1(
     CMemoryInStream
     , ISequentialInStream
@@ -219,6 +232,73 @@ int main()
             "adaptive Code"))
         return 1;
     if (!Check(adaptiveOut->Data == expected, "adaptive decoded bytes"))
+        return 1;
+
+    const std::string gzipUnitA = "sunpack-gzip-member-a\n";
+    const std::string gzipUnitB = "sunpack-gzip-member-b\n";
+    std::vector<Byte> gzipExpected;
+    for (unsigned i = 0; i < 8; ++i)
+        gzipExpected.insert(gzipExpected.end(), gzipUnitA.begin(), gzipUnitA.end());
+    for (unsigned i = 0; i < 5; ++i)
+        gzipExpected.insert(gzipExpected.end(), gzipUnitB.begin(), gzipUnitB.end());
+
+    std::vector<Byte> gzipConcat(std::begin(kGzipMemberA), std::end(kGzipMemberA));
+    gzipConcat.insert(gzipConcat.end(), std::begin(kGzipMemberB), std::end(kGzipMemberB));
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipIn(gzipConcat);
+    CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> gzipOut;
+    SunpackGzipDecodeResult gzipResult;
+    if (!Check(
+            SunpackDecodeGzipWithZlibNg(gzipIn, gzipOut, nullptr, gzipResult) == S_OK,
+            "gzip helper call"))
+        return 1;
+    if (!Check(gzipResult.status == SunpackGzipDecodeStatus::kOk,
+               "concatenated gzip status"))
+        return 1;
+    if (!Check(gzipResult.numStreams == 2, "concatenated gzip member count"))
+        return 1;
+    if (!Check(gzipOut->Data == gzipExpected, "concatenated gzip decoded bytes"))
+        return 1;
+
+    std::vector<Byte> gzipBadCrc(std::begin(kGzipMemberA), std::end(kGzipMemberA));
+    gzipBadCrc[gzipBadCrc.size() - 8] ^= 0x01;
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipBadCrcIn(gzipBadCrc);
+    CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> gzipBadCrcOut;
+    SunpackGzipDecodeResult gzipBadCrcResult;
+    if (!Check(
+            SunpackDecodeGzipWithZlibNg(
+                gzipBadCrcIn, gzipBadCrcOut, nullptr, gzipBadCrcResult) == S_OK,
+            "gzip CRC helper call"))
+        return 1;
+    if (!Check(gzipBadCrcResult.status == SunpackGzipDecodeStatus::kCrcError,
+               "gzip CRC mismatch classification"))
+        return 1;
+
+    std::vector<Byte> gzipTruncated(std::begin(kGzipMemberA), std::end(kGzipMemberA) - 3);
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipTruncatedIn(gzipTruncated);
+    CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> gzipTruncatedOut;
+    SunpackGzipDecodeResult gzipTruncatedResult;
+    if (!Check(
+            SunpackDecodeGzipWithZlibNg(
+                gzipTruncatedIn, gzipTruncatedOut, nullptr, gzipTruncatedResult) == S_OK,
+            "gzip truncated helper call"))
+        return 1;
+    if (!Check(gzipTruncatedResult.status == SunpackGzipDecodeStatus::kUnexpectedEnd,
+               "gzip truncated classification"))
+        return 1;
+
+    std::vector<Byte> gzipTrailing(std::begin(kGzipMemberA), std::end(kGzipMemberA));
+    gzipTrailing.push_back(0x42);
+    gzipTrailing.push_back(0x43);
+    CMyComPtr2_Create<ISequentialInStream, CMemoryInStream> gzipTrailingIn(gzipTrailing);
+    CMyComPtr2_Create<ISequentialOutStream, CVectorOutStream> gzipTrailingOut;
+    SunpackGzipDecodeResult gzipTrailingResult;
+    if (!Check(
+            SunpackDecodeGzipWithZlibNg(
+                gzipTrailingIn, gzipTrailingOut, nullptr, gzipTrailingResult) == S_OK,
+            "gzip trailing helper call"))
+        return 1;
+    if (!Check(gzipTrailingResult.status == SunpackGzipDecodeStatus::kDataAfterEnd,
+               "gzip trailing-data classification"))
         return 1;
 
     return 0;

@@ -17,3 +17,28 @@ ICompressCoder *SunpackCreateZlibNgDeflateDecoder();
 // clearly compressible; streaming/read interfaces remain backed by upstream
 // 7-Zip so partial 7z decoding keeps the original state-machine semantics.
 ICompressCoder *SunpackCreateAdaptiveDeflateDecoder();
+
+
+enum class SunpackGzipDecodeStatus
+{
+    kOk,
+    kUnexpectedEnd,
+    kDataError,
+    kCrcError,
+    kDataAfterEnd
+};
+
+struct SunpackGzipDecodeResult
+{
+    SunpackGzipDecodeStatus status = SunpackGzipDecodeStatus::kDataError;
+    UInt64 numStreams = 0;
+};
+
+// Decode a complete seekable gzip stream, including concatenated members.
+// zlib-ng validates each member's gzip header, CRC32, and ISIZE. The caller
+// keeps sequential/non-seekable inputs on the upstream 7-Zip GZip state machine.
+HRESULT SunpackDecodeGzipWithZlibNg(
+    ISequentialInStream *inStream,
+    ISequentialOutStream *outStream,
+    ICompressProgressInfo *progress,
+    SunpackGzipDecodeResult &result);

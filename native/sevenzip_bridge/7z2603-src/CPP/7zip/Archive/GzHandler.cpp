@@ -1,4 +1,7 @@
 // GzHandler.cpp
+//
+// Modified by SunPack, 2026-09-20:
+// add a metadata-routed zlib-ng fast path for seekable gzip extraction.
 
 #include "StdAfx.h"
 
@@ -20,6 +23,7 @@
 #include "../Compress/CopyCoder.h"
 #include "../Compress/DeflateDecoder.h"
 #include "../Compress/DeflateEncoder.h"
+#include "internal/zlib_ng_deflate_decoder.h"
 
 #include "Common/HandlerOut.h"
 #include "Common/InStreamWithCRC.h"
@@ -703,6 +707,57 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
 
   CMyComPtr2_Create<ICompressProgressInfo, CLocalProgress> lps;
   lps->Init(extractCallback, true);
+
+  // Fast path only for seekable gzip opened through Open(). Sequential/stream
+  // inputs keep the mature 7-Zip CodeResume state machine below.  We also
+  // retain 7-Zip for FHCRC archives because its historical handler accepts
+  // header-CRC mismatches that zlib-ng intentionally rejects.
+  if (_stream &&
+      !_item.HeaderCrcIsPresent() &&
+      SunpackShouldUseZlibNgDeflate(_packSize, _item.Size32))
+  {
+    RINOK(InStream_SeekToBegin(_stream))
+
+    // zlib-ng validates CRC32 and ISIZE for every gzip member itself. Keep this
+    // wrapper only for output forwarding and total-size accounting.
+    outStream->Init(false);
+
+    SunpackGzipDecodeResult fastResult;
+    RINOK(SunpackDecodeGzipWithZlibNg(
+        _stream, outStream, lps, fastResult))
+
+    _unpackSize = outStream->GetSize();
+    _numStreams = fastResult.numStreams;
+    _packSize_Defined = true;
+    _unpackSize_Defined = true;
+    _numStreams_Defined = true;
+    _needSeekToStart = true;
+    _needMoreInput =
+        fastResult.status == SunpackGzipDecodeStatus::kUnexpectedEnd;
+    _dataAfterEnd =
+        fastResult.status == SunpackGzipDecodeStatus::kDataAfterEnd;
+
+    switch (fastResult.status)
+    {
+      case SunpackGzipDecodeStatus::kOk:
+        retResult = NExtract::NOperationResult::kOK;
+        break;
+      case SunpackGzipDecodeStatus::kUnexpectedEnd:
+        retResult = NExtract::NOperationResult::kUnexpectedEnd;
+        break;
+      case SunpackGzipDecodeStatus::kCrcError:
+        retResult = NExtract::NOperationResult::kCRCError;
+        break;
+      case SunpackGzipDecodeStatus::kDataAfterEnd:
+        retResult = NExtract::NOperationResult::kDataAfterEnd;
+        break;
+      default:
+        retResult = NExtract::NOperationResult::kDataError;
+        break;
+    }
+
+    return extractCallback->SetOperationResult(retResult);
+  }
 
   bool needReadFirstItem = _needSeekToStart;
   
