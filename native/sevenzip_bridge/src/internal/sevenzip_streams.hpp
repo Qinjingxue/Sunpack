@@ -621,6 +621,11 @@ namespace sunpack::sevenzip
             {
                 trace_->prefetch_issued_count = prefetch_issued_count_;
                 trace_->prefetch_issued_bytes = prefetch_issued_bytes_;
+#ifdef SUP7Z_USE_PLANNED_IO
+                trace_->planned_cursor_peak = planned_cursor_peak_;
+                trace_->planned_cache_eviction_count = planned_cache_eviction_count_;
+                trace_->planned_demand_issued_count = planned_demand_issued_count_;
+#endif
             }
         }
 
@@ -773,6 +778,8 @@ namespace sunpack::sevenzip
                 cursor.next_offset = end;
                 cursor.last_touch = ++planned_touch_clock_;
                 planned_cursors_.push_back(cursor);
+                planned_cursor_peak_ = std::max<unsigned long long>(
+                    planned_cursor_peak_, static_cast<unsigned long long>(planned_cursors_.size()));
                 active_ = true;
                 return cursor.id;
             }
@@ -930,6 +937,7 @@ namespace sunpack::sevenzip
 
                 reserved -= victim->size;
                 chunks_.erase(victim);
+                ++planned_cache_eviction_count_;
             }
             return true;
         }
@@ -1249,9 +1257,18 @@ namespace sunpack::sevenzip
                     epoch = chunk->epoch;
                     offset = chunk->offset;
                     size = chunk->size;
+#ifdef SUP7Z_USE_PLANNED_IO
+                    const bool planned_demand = planned_mode_ && chunk->demand;
+#endif
                     chunk->state = ChunkState::Reading;
                     ++prefetch_issued_count_;
                     prefetch_issued_bytes_ += size;
+#ifdef SUP7Z_USE_PLANNED_IO
+                    if (planned_demand)
+                    {
+                        ++planned_demand_issued_count_;
+                    }
+#endif
                 }
 
                 std::vector<unsigned char> bytes(size);
@@ -1299,6 +1316,9 @@ namespace sunpack::sevenzip
         UInt64 next_planned_cursor_id_ = 0;
         std::size_t planned_schedule_cursor_ = 0;
         UInt64 planned_touch_clock_ = 0;
+        unsigned long long planned_cursor_peak_ = 0;
+        unsigned long long planned_cache_eviction_count_ = 0;
+        unsigned long long planned_demand_issued_count_ = 0;
         bool planned_mode_ = false;
         bool building_plan_ = false;
 #endif
