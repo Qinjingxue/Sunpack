@@ -524,7 +524,7 @@ namespace sunpack::sevenzip
         UInt64 bytes_written() const { return bytes_written_; }
 
 
-        HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
+        HRESULT STDMETHODCALLTYPE Write(const void *, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
         {
 
             bytes_written_ += size;
