@@ -173,7 +173,7 @@ Packages in the flow domains must not import `coordinator` in reverse. Detection
 
 `native/sunpack_native` takes on cross-platform hotspots: directory scanning, binary views, signature prepass, format probes, carrier scan, output CRC/readability, output file index matching, password fast verifiers, and so on.
 
-`native/sevenzip_bridge` takes on the Windows 7z.dll ABI: archive probe/test, password array attempts, archive state manifests, and extraction through `sunpack_sevenzip_worker.exe`.
+`native/sevenzip_bridge` takes on Windows embedded 7-Zip execution: resource/manifest queries, worker-internal bounded password candidate confirmation, and extraction through `sunpack_sevenzip_worker.exe`. Format, structure, and encryption analysis belong to the Python/Rust analysis layer rather than a second native probe/test stack.
 
 ### Windows Watch Broker / USN
 
