@@ -548,3 +548,188 @@ ICompressCoder *SunpackCreateAdaptiveDeflateDecoder()
     }
 }
 
+
+
+HRESULT SunpackDecodeGzipWithZlibNg(
+    ISequentialInStream *inStream,
+    ISequentialOutStream *outStream,
+    ICompressProgressInfo *progress,
+    SunpackGzipDecodeResult &result)
+{
+    result = SunpackGzipDecodeResult{};
+    if (!inStream || !outStream)
+        return E_INVALIDARG;
+
+    std::vector<Byte> input;
+    std::vector<Byte> output;
+    try
+    {
+        input.resize(kBufferSize);
+        output.resize(kBufferSize);
+    }
+    catch (const std::bad_alloc &)
+    {
+        return E_OUTOFMEMORY;
+    }
+
+    zng_stream stream{};
+    int code = zng_inflateInit2(&stream, 31);
+    if (code != Z_OK)
+        return MapZlibNgError(code);
+
+    const auto finish = [&](HRESULT hres) -> HRESULT {
+        zng_inflateEnd(&stream);
+        return hres;
+    };
+
+    bool inputFinished = false;
+    UInt64 completedInput = 0;
+    UInt64 totalOutput = 0;
+    UInt64 lastProgressInput = 0;
+    UInt64 lastProgressOutput = 0;
+
+    const auto reportProgress = [&]() -> HRESULT {
+        if (!progress)
+            return S_OK;
+        const UInt64 currentInput =
+            completedInput + static_cast<UInt64>(stream.total_in);
+        if ((currentInput - lastProgressInput) < (1u << 21) &&
+            (totalOutput - lastProgressOutput) < (1u << 21))
+            return S_OK;
+        const HRESULT hres = progress->SetRatioInfo(&currentInput, &totalOutput);
+        if (hres == S_OK)
+        {
+            lastProgressInput = currentInput;
+            lastProgressOutput = totalOutput;
+        }
+        return hres;
+    };
+
+    for (;;)
+    {
+        if (stream.avail_in == 0 && !inputFinished)
+        {
+            UInt32 readSize = 0;
+            const HRESULT hres = inStream->Read(
+                input.data(),
+                static_cast<UInt32>(input.size()),
+                &readSize);
+            if (hres != S_OK)
+                return finish(hres);
+            stream.next_in = reinterpret_cast<const uint8_t *>(input.data());
+            stream.avail_in = readSize;
+            inputFinished = readSize == 0;
+        }
+
+        if (stream.avail_in == 0 && inputFinished)
+        {
+            result.status = SunpackGzipDecodeStatus::kUnexpectedEnd;
+            return finish(S_OK);
+        }
+
+        stream.next_out = reinterpret_cast<uint8_t *>(output.data());
+        stream.avail_out = static_cast<uint32_t>(output.size());
+
+        const uint32_t beforeIn = stream.avail_in;
+        const uint32_t beforeOut = stream.avail_out;
+        code = zng_inflate(&stream, Z_NO_FLUSH);
+        const std::size_t consumed =
+            static_cast<std::size_t>(beforeIn - stream.avail_in);
+        const std::size_t produced =
+            static_cast<std::size_t>(beforeOut - stream.avail_out);
+
+        if (produced != 0)
+        {
+            const HRESULT hres = WriteStream(outStream, output.data(), produced);
+            if (hres != S_OK)
+                return finish(hres);
+            totalOutput += static_cast<UInt64>(produced);
+        }
+
+        {
+            const HRESULT hres = reportProgress();
+            if (hres != S_OK)
+                return finish(hres);
+        }
+
+        if (code == Z_STREAM_END)
+        {
+            completedInput += static_cast<UInt64>(stream.total_in);
+            ++result.numStreams;
+
+            std::size_t pending = static_cast<std::size_t>(stream.avail_in);
+            if (pending != 0)
+                std::memmove(input.data(), stream.next_in, pending);
+
+            // A gzip member can end exactly at our input-buffer boundary.
+            // Read only enough to decide whether another member follows.
+            while (pending < 2 && !inputFinished)
+            {
+                UInt32 readSize = 0;
+                const HRESULT hres = inStream->Read(
+                    input.data() + pending,
+                    static_cast<UInt32>(input.size() - pending),
+                    &readSize);
+                if (hres != S_OK)
+                    return finish(hres);
+                pending += readSize;
+                if (readSize == 0)
+                    inputFinished = true;
+            }
+
+            if (pending == 0 && inputFinished)
+            {
+                result.status = SunpackGzipDecodeStatus::kOk;
+                return finish(S_OK);
+            }
+
+            if (pending < 2 ||
+                input[0] != 0x1f ||
+                input[1] != 0x8b)
+            {
+                result.status = SunpackGzipDecodeStatus::kDataAfterEnd;
+                return finish(S_OK);
+            }
+
+            code = zng_inflateReset2(&stream, 31);
+            if (code != Z_OK)
+                return finish(MapZlibNgError(code));
+
+            // inflateReset2() does not own these caller buffers. Restore the
+            // bytes that were already read beyond the previous member.
+            stream.next_in = reinterpret_cast<const uint8_t *>(input.data());
+            stream.avail_in = static_cast<uint32_t>(pending);
+            stream.next_out = nullptr;
+            stream.avail_out = 0;
+            continue;
+        }
+
+        if (code == Z_DATA_ERROR || code == Z_NEED_DICT)
+        {
+            const char *msg = stream.msg;
+            if (msg &&
+                (std::strcmp(msg, "incorrect data check") == 0 ||
+                 std::strcmp(msg, "incorrect length check") == 0))
+                result.status = SunpackGzipDecodeStatus::kCrcError;
+            else
+                result.status = SunpackGzipDecodeStatus::kDataError;
+            return finish(S_OK);
+        }
+
+        if (code != Z_OK && code != Z_BUF_ERROR)
+            return finish(MapZlibNgError(code));
+
+        if (consumed == 0 && produced == 0)
+        {
+            if (stream.avail_in == 0 && !inputFinished)
+                continue;
+            if (stream.avail_in == 0 && inputFinished)
+            {
+                result.status = SunpackGzipDecodeStatus::kUnexpectedEnd;
+                return finish(S_OK);
+            }
+            result.status = SunpackGzipDecodeStatus::kDataError;
+            return finish(S_OK);
+        }
+    }
+}
