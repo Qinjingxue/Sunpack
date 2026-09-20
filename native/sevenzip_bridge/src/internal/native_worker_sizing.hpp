@@ -81,8 +81,10 @@ namespace sunpack::sevenzip
     {
         thread_capacity = (std::max)(std::size_t{1}, thread_capacity);
         active_jobs = (std::max)(std::size_t{1}, active_jobs);
-        return (std::min)(std::size_t{8},
-                          (std::max)(std::size_t{1}, thread_capacity / active_jobs));
+        const std::size_t cpu_slots_per_job = thread_capacity / active_jobs;
+        const std::size_t inner_workers =
+            cpu_slots_per_job > 1 ? cpu_slots_per_job - 1 : 1;
+        return (std::min)(std::size_t{8}, inner_workers);
     }
 
     inline NativeSizingPlan derive_native_sizing_plan(
