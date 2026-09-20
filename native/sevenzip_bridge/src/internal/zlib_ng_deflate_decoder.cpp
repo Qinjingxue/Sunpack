@@ -83,7 +83,19 @@ private:
             if (code == Z_OK)
                 _initialized = true;
         }
-        return code == Z_OK ? S_OK : MapZlibNgError(code);
+        if (code != Z_OK)
+            return MapZlibNgError(code);
+
+        // inflateReset2() resets decoder state and counters, but it does not
+        // promise to clear the caller-owned input/output pointers.  This coder
+        // is cached and reused across ZIP entries, so trailing bytes retained
+        // for Strong Encryption padding validation must never become the next
+        // entry's initial Deflate input.
+        _stream.next_in = nullptr;
+        _stream.avail_in = 0;
+        _stream.next_out = nullptr;
+        _stream.avail_out = 0;
+        return S_OK;
     }
 
     void SaveUnused()
