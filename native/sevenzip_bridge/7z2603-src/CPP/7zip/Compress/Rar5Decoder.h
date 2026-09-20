@@ -1,6 +1,8 @@
 // Rar5Decoder.h
 // According to unRAR license, this code may not be used to develop
 // a program that creates RAR archives
+// Modified for SunPack on 2026-09-20: add an optional UnRAR-style parallel
+// entropy-decode / ordered-retire path without changing the serial decoder.
 
 #ifndef ZIP7_INC_COMPRESS_RAR5_DECODER_H
 #define ZIP7_INC_COMPRESS_RAR5_DECODER_H
@@ -16,6 +18,9 @@ namespace NCompress {
 namespace NRar5 {
 
 class CBitDecoder;
+#ifndef Z7_ST
+class CRar5MtContext;
+#endif
 
 struct CFilter
 {
@@ -44,11 +49,20 @@ const unsigned k_NumHufTableBits_Align = 6;
 
 const unsigned DICT_SIZE_BITS_MAX = 40;
 
+#ifndef Z7_ST
+Z7_CLASS_IMP_NOQIB_3(
+  CDecoder
+  , ICompressCoder
+  , ICompressSetDecoderProperties2
+  , ICompressSetCoderMt
+)
+#else
 Z7_CLASS_IMP_NOQIB_2(
   CDecoder
   , ICompressCoder
   , ICompressSetDecoderProperties2
 )
+#endif
   bool _useAlignBits;
   bool _isLastBlock;
   bool _unpackSize_Defined;
@@ -101,6 +115,10 @@ Z7_CLASS_IMP_NOQIB_2(
   ISequentialOutStream *_outStream;
   ICompressProgressInfo *_progress;
   Byte *_inputBuf;
+#ifndef Z7_ST
+  UInt32 _numThreads;
+  friend class CRar5MtContext;
+#endif
 
   NHuffman::CDecoder<kNumHufBits, kMainTableSize,  k_NumHufTableBits_Main>  m_MainDecoder;
   NHuffman::CDecoder256<kNumHufBits, kDistTableSize_MAX,  k_NumHufTableBits_Dist>  m_DistDecoder;
@@ -121,6 +139,9 @@ Z7_CLASS_IMP_NOQIB_2(
   HRESULT ReadTables(CBitDecoder &_bitStream);
   HRESULT DecodeLZ2(const CBitDecoder &_bitStream) throw();
   HRESULT DecodeLZ();
+#ifndef Z7_ST
+  HRESULT DecodeLZParallel();
+#endif
   HRESULT CodeReal();
 public:
   CDecoder();

@@ -1,8 +1,22 @@
 // Rar5Decoder.cpp
 // According to unRAR license, this code may not be used to develop
 // a program that creates RAR archives
+// Modified for SunPack on 2026-09-20: add an optional RAR5/RAR7 parallel
+// Huffman-decode path modeled on UnRAR Unpack5MT/UnpackDecode/ProcessDecoded.
+// The upstream 7-Zip serial DecodeLZ/DecodeLZ2/CopyMatch path is retained.
 
 #include "StdAfx.h"
+
+#ifndef Z7_ST
+#include <algorithm>
+#include <condition_variable>
+#include <deque>
+#include <memory>
+#include <mutex>
+#include <new>
+#include <thread>
+#include <vector>
+#endif
 
 #define DICT_SIZE_MAX ((UInt64)1 << DICT_SIZE_BITS_MAX)
 
@@ -699,6 +713,9 @@ CDecoder::CDecoder():
     _filters(NULL),
     _winSize_Allocated(0),
     _inputBuf(NULL)
+#ifndef Z7_ST
+    , _numThreads(1)
+#endif
 {
 #if 1
   memcpy(m_LenPlusTable, k_LenPlusTable, sizeof(k_LenPlusTable));
@@ -1364,6 +1381,475 @@ enum enum_exit_type
   Z7_HUFF_DECODE_CHECK(sym, huf, kNumHufBits, kNumTableBits, bitStream, { LZ_LOOP_BREAK_ERROR })
 
 
+
+#ifndef Z7_ST
+
+// Keep the same conservative thread policy as SunPack's BZip2 block pipeline.
+// RAR5 retirement is dictionary-ordered, so extra workers beyond 8 mostly add
+// memory pressure rather than useful decode overlap.
+static unsigned GetRar5ParallelWorkerCount(UInt32 numThreads)
+{
+  if (numThreads < 4)
+    return 0;
+  return (unsigned)std::min<UInt32>(numThreads, 8);
+}
+
+static const UInt64 kRar5MtInputThreshold = (UInt64)1 << 20;
+static const UInt32 kRar5MtLargeBlockSize = 0x20000;
+static const unsigned kRar5MtBlocksPerWorker = 2;
+
+enum ERar5ParallelDecodedType
+{
+  RAR5_MT_LITERAL = 0,
+  RAR5_MT_MATCH,
+  RAR5_MT_REP,
+  RAR5_MT_FULLREP,
+  RAR5_MT_FILTER
+};
+
+struct CRar5ParallelDecodedItem
+{
+  Byte Type;
+  Byte LiteralSize;
+  Byte FilterType;
+  Byte FilterChannels;
+  UInt16 Length;
+  UInt32 FilterSize;
+  size_t Distance;
+  Byte Literal[8];
+
+  CRar5ParallelDecodedItem():
+      Type(RAR5_MT_LITERAL),
+      LiteralSize(0),
+      FilterType(0),
+      FilterChannels(0),
+      Length(0),
+      FilterSize(0),
+      Distance(0)
+  {
+    memset(Literal, 0, sizeof(Literal));
+  }
+};
+
+struct CRar5ParallelTables
+{
+  NHuffman::CDecoder<kNumHufBits, kMainTableSize, k_NumHufTableBits_Main> Main;
+  NHuffman::CDecoder256<kNumHufBits, kDistTableSize_MAX, k_NumHufTableBits_Dist> Dist;
+  NHuffman::CDecoder256<kNumHufBits, kAlignTableSize, k_NumHufTableBits_Align> Align;
+  NHuffman::CDecoder256<kNumHufBits, kLenTableSize, k_NumHufTableBits_Len> Len;
+  bool UseAlignBits;
+
+  CRar5ParallelTables(): UseAlignBits(false) {}
+};
+
+struct CRar5ParallelBlockJob
+{
+  std::vector<Byte> Data;
+  CBitDecoder BitState;
+  CRar5ParallelTables Tables;
+  std::vector<CRar5ParallelDecodedItem> Decoded;
+  UInt64 PackPos;
+  bool LastBlock;
+  bool MinorError;
+  HRESULT Result;
+
+  std::mutex Mutex;
+  std::condition_variable FinishedEvent;
+  bool Done;
+
+  CRar5ParallelBlockJob():
+      PackPos(0),
+      LastBlock(false),
+      MinorError(false),
+      Result(S_OK),
+      Done(false)
+  {}
+
+  void Reset()
+  {
+    Data.clear();
+    Decoded.clear();
+    PackPos = 0;
+    LastBlock = false;
+    MinorError = false;
+    Result = S_OK;
+    std::lock_guard<std::mutex> lock(Mutex);
+    Done = false;
+  }
+
+  void Process()
+  {
+    HRESULT result = S_OK;
+
+    try
+    {
+      Decoded.clear();
+      Decoded.reserve(0x4100);
+
+      CBitDecoder bitStream = BitState;
+
+      for (;;)
+      {
+        const UInt64 processed = bitStream.GetProcessedSize_Round();
+        if (processed > bitStream._blockEnd ||
+            (processed == bitStream._blockEnd &&
+             bitStream.GetProcessedBits7() >= bitStream._blockEndBits7))
+          break;
+
+        unsigned sym;
+        if (!Tables.Main.Decode2(&bitStream, sym))
+        {
+          result = S_FALSE;
+          break;
+        }
+
+        if (sym < 256)
+        {
+          if (!Decoded.empty())
+          {
+            CRar5ParallelDecodedItem &prev = Decoded.back();
+            if (prev.Type == RAR5_MT_LITERAL && prev.LiteralSize < sizeof(prev.Literal))
+            {
+              prev.Literal[prev.LiteralSize++] = (Byte)sym;
+              continue;
+            }
+          }
+
+          CRar5ParallelDecodedItem item;
+          item.Type = RAR5_MT_LITERAL;
+          item.LiteralSize = 1;
+          item.Literal[0] = (Byte)sym;
+          Decoded.push_back(item);
+          continue;
+        }
+
+        if (sym == 256)
+        {
+          CRar5ParallelDecodedItem item;
+          item.Type = RAR5_MT_FILTER;
+          item.Distance = ReadUInt32(bitStream);
+          item.FilterSize = ReadUInt32(bitStream);
+          item.FilterType = (Byte)bitStream.ReadBits_9fix(3);
+          if (item.FilterType == FILTER_DELTA)
+            item.FilterChannels = (Byte)(bitStream.ReadBits_9fix(5) + 1);
+          Decoded.push_back(item);
+        }
+        else if (sym == 257)
+        {
+          CRar5ParallelDecodedItem item;
+          item.Type = RAR5_MT_FULLREP;
+          Decoded.push_back(item);
+        }
+        else if (sym < kSymbolRep + kNumReps)
+        {
+          CLenType len;
+          if (!Tables.Len.Decode2(&bitStream, len))
+          {
+            result = S_FALSE;
+            break;
+          }
+          if (len >= 8)
+            len = SlotToLen(bitStream, len);
+          len += 2;
+
+          CRar5ParallelDecodedItem item;
+          item.Type = RAR5_MT_REP;
+          item.Distance = (size_t)sym - kSymbolRep;
+          item.Length = (UInt16)len;
+          Decoded.push_back(item);
+        }
+        else
+        {
+          CLenType len = sym - (kSymbolRep + kNumReps);
+          if (len >= 8)
+            len = SlotToLen(bitStream, len);
+          len += 2;
+
+          size_t distance;
+          unsigned distSlot;
+          if (!Tables.Dist.Decode2(&bitStream, distSlot))
+          {
+            result = S_FALSE;
+            break;
+          }
+          distance = distSlot;
+
+          if (distance >= 4)
+          {
+            const unsigned numBits = ((unsigned)distance - 2) >> 1;
+            distance = (2 | (distance & 1)) << numBits;
+
+            const Byte *buf = bitStream._buf;
+#ifdef Z7_RAR5_USE_64BIT
+            const UInt64 v = GetBe64(buf);
+#else
+            const UInt32 v = GetBe32(buf);
+#endif
+
+            if (numBits < kNumAlignBits)
+            {
+              distance += bitStream.ReadBits_Big25(numBits, v);
+            }
+            else
+            {
+              len += k_LenPlusTable[numBits];
+              if (Tables.UseAlignBits)
+              {
+                distance +=
+                    (bitStream.ReadBits_Big25(numBits - kNumAlignBits, v) << kNumAlignBits);
+                unsigned align;
+                if (!Tables.Align.Decode2(&bitStream, align))
+                {
+                  result = S_FALSE;
+                  break;
+                }
+                distance += align;
+              }
+              else
+                distance += bitStream.ReadBits_Big(numBits, v);
+#ifndef Z7_RAR5_USE_64BIT
+              if (numBits >= 30)
+                distance = (size_t)0 - 1 - 1;
+#endif
+            }
+          }
+          distance++;
+
+          CRar5ParallelDecodedItem item;
+          item.Type = RAR5_MT_MATCH;
+          item.Distance = distance;
+          item.Length = (UInt16)len;
+          Decoded.push_back(item);
+        }
+
+        if (bitStream.IsBlockOverRead())
+        {
+          result = S_FALSE;
+          break;
+        }
+      }
+
+      if (result == S_OK)
+      {
+        if (bitStream.IsBlockOverRead() || bitStream.InputEofError())
+          result = S_FALSE;
+        else if (bitStream.GetProcessedSize_Round() == bitStream._blockEnd &&
+                 bitStream.GetProcessedBits7() == bitStream._blockEndBits7 &&
+                 bitStream._blockEndBits7 != 0)
+        {
+          // Match CBitDecoder::AlignToByte(): RAR requires the unused low
+          // bits in the final partial byte to be zero.  The worker does not
+          // call AlignToByte() because it never advances to the next block.
+          const unsigned b = (unsigned)*bitStream._buf << bitStream._blockEndBits7;
+          if (b & 0xff)
+            MinorError = true;
+        }
+      }
+    }
+    catch (const std::bad_alloc &)
+    {
+      result = E_OUTOFMEMORY;
+    }
+    catch (...)
+    {
+      result = E_FAIL;
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(Mutex);
+      Result = result;
+      Done = true;
+    }
+    FinishedEvent.notify_one();
+  }
+
+  HRESULT Wait()
+  {
+    std::unique_lock<std::mutex> lock(Mutex);
+    FinishedEvent.wait(lock, [this] { return Done; });
+    return Result;
+  }
+};
+
+class CRar5ParallelBlockPool
+{
+  std::vector<std::thread> _threads;
+  std::deque<CRar5ParallelBlockJob *> _queue;
+  std::mutex _mutex;
+  std::condition_variable _workEvent;
+  bool _stop;
+
+  void WorkerLoop()
+  {
+    for (;;)
+    {
+      CRar5ParallelBlockJob *job = NULL;
+      {
+        std::unique_lock<std::mutex> lock(_mutex);
+        _workEvent.wait(lock, [this] { return _stop || !_queue.empty(); });
+        if (_stop && _queue.empty())
+          return;
+        job = _queue.front();
+        _queue.pop_front();
+      }
+      job->Process();
+    }
+  }
+
+public:
+  CRar5ParallelBlockPool(): _stop(false) {}
+
+  ~CRar5ParallelBlockPool()
+  {
+    Stop();
+  }
+
+  bool Start(unsigned numWorkers)
+  {
+    try
+    {
+      _threads.reserve(numWorkers);
+      for (unsigned i = 0; i < numWorkers; i++)
+        _threads.emplace_back([this] { WorkerLoop(); });
+    }
+    catch (...)
+    {
+      Stop();
+      return false;
+    }
+    return true;
+  }
+
+  void Stop()
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _stop = true;
+    }
+    _workEvent.notify_all();
+    for (std::thread &thread: _threads)
+      if (thread.joinable())
+        thread.join();
+    _threads.clear();
+  }
+
+  void Submit(CRar5ParallelBlockJob *job)
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _queue.push_back(job);
+    }
+    _workEvent.notify_one();
+  }
+};
+
+Z7_CLASS_IMP_NOQIB_1(
+  CRar5ReplayInStream
+  , ISequentialInStream
+)
+  CMyComPtr<ISequentialInStream> _stream;
+  Byte _prefix[5];
+  unsigned _prefixSize;
+  unsigned _prefixPos;
+public:
+  CRar5ReplayInStream(): _prefixSize(0), _prefixPos(0) {}
+  void Init(const Byte *prefix, unsigned prefixSize, ISequentialInStream *stream)
+  {
+    _prefixSize = prefixSize;
+    _prefixPos = 0;
+    memcpy(_prefix, prefix, prefixSize);
+    _stream = stream;
+  }
+};
+
+Z7_COM7F_IMF(CRar5ReplayInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
+{
+  *processedSize = 0;
+  Byte *dest = (Byte *)data;
+
+  if (_prefixPos < _prefixSize && size != 0)
+  {
+    UInt32 cur = (UInt32)(_prefixSize - _prefixPos);
+    if (cur > size)
+      cur = size;
+    memcpy(dest, _prefix + _prefixPos, cur);
+    _prefixPos += cur;
+    dest += cur;
+    size -= cur;
+    *processedSize += cur;
+  }
+
+  if (size == 0)
+    return S_OK;
+
+  UInt32 processed = 0;
+  const HRESULT res = _stream->Read(dest, size, &processed);
+  *processedSize += processed;
+  return res;
+}
+
+struct CRar5RawBlockHeader
+{
+  Byte Bytes[5];
+  unsigned HeaderSize;
+  UInt32 BlockSize;
+  bool LastBlock;
+  bool UseSerial;
+
+  CRar5RawBlockHeader():
+      HeaderSize(0),
+      BlockSize(0),
+      LastBlock(false),
+      UseSerial(false)
+  {}
+};
+
+static HRESULT ReadRar5RawBlockHeader(
+    ISequentialInStream *stream,
+    CRar5RawBlockHeader &header)
+{
+  RINOK(ReadStream_FALSE(stream, header.Bytes, 3))
+
+  const unsigned flags = header.Bytes[0];
+  const unsigned num = (flags >> 3) & 3;
+  if (num >= 3)
+    return S_FALSE;
+
+  header.HeaderSize = 3 + num;
+  if (num != 0)
+    RINOK(ReadStream_FALSE(stream, header.Bytes + 3, num))
+
+  unsigned checkSum = flags ^ header.Bytes[1];
+  UInt32 blockSize = header.Bytes[2];
+  checkSum ^= header.Bytes[2];
+
+  if (num >= 1)
+  {
+    blockSize |= (UInt32)header.Bytes[3] << 8;
+    checkSum ^= header.Bytes[3];
+  }
+  if (num >= 2)
+  {
+    blockSize |= (UInt32)header.Bytes[4] << 16;
+    checkSum ^= header.Bytes[4];
+  }
+
+  if (checkSum != 0x5A)
+    return S_FALSE;
+
+  header.BlockSize = blockSize;
+  header.LastBlock = (flags & 0x40) != 0;
+
+  // UnRAR switches oversized compressed blocks back to its serial path to
+  // bound decoded-event memory. Do the same, but replay the already consumed
+  // header into the untouched 7-Zip DecodeLZ implementation.
+  header.UseSerial = (blockSize == 0 || blockSize > kRar5MtLargeBlockSize);
+  return S_OK;
+}
+
+#endif // !Z7_ST
+
+
 /*
   DecodeLZ2() will stop decoding if it reaches limit when (_winPos >= _limit)
   at return:
@@ -1798,6 +2284,370 @@ HRESULT CDecoder::DecodeLZ()
 
 
 
+
+#ifndef Z7_ST
+
+HRESULT CDecoder::DecodeLZParallel()
+{
+  const unsigned numWorkers = GetRar5ParallelWorkerCount(_numThreads);
+  if (numWorkers == 0)
+    return DecodeLZ();
+
+  const size_t ringSize = (size_t)numWorkers * kRar5MtBlocksPerWorker;
+  std::vector<std::unique_ptr<CRar5ParallelBlockJob>> ring;
+  try
+  {
+    ring.reserve(ringSize);
+    for (size_t i = 0; i < ringSize; i++)
+      ring.push_back(std::unique_ptr<CRar5ParallelBlockJob>(new CRar5ParallelBlockJob()));
+  }
+  catch (const std::bad_alloc &)
+  {
+    return E_OUTOFMEMORY;
+  }
+
+  CRar5ParallelBlockPool pool;
+  if (!pool.Start(numWorkers))
+    return E_FAIL;
+
+  UInt64 submitted = 0;
+  UInt64 retired = 0;
+  UInt64 packedRead = 0;
+  bool minorError = false;
+
+  size_t winPos = _winPos;
+  size_t limit;
+  {
+    size_t rem = _winSize - winPos;
+    if (rem > kWriteStep)
+      rem = kWriteStep;
+    limit = winPos + rem;
+  }
+
+  auto normalizeWindow = [&]() -> HRESULT
+  {
+    while (winPos >= limit)
+    {
+      _winPos = winPos < _winSize ? winPos : _winSize;
+      RINOK(WriteBuf())
+      if (_unpackSize_Defined && _writtenFileSize > _unpackSize)
+        return S_FALSE;
+
+      const size_t wp = _winPos;
+      size_t rem = _winSize - wp;
+      if (rem == 0)
+      {
+        _lzSize += wp;
+        winPos -= wp;
+        if (winPos)
+          memcpy(_window, _window + _winSize, winPos);
+        limit = _winSize;
+        if (limit >= kWriteStep)
+        {
+          limit = kWriteStep;
+          continue;
+        }
+        rem = _winSize - winPos;
+      }
+      if (rem > kWriteStep)
+        rem = kWriteStep;
+      limit = winPos + rem;
+    }
+    _winPos = winPos;
+    return S_OK;
+  };
+
+  auto copyMatchRetired = [&](size_t distance, UInt32 len) -> HRESULT
+  {
+    Byte *dest = _window + winPos;
+    winPos += len;
+
+    if (distance <= _dictSize_forCheck)
+    {
+      const Byte *src;
+      const size_t winPosTemp = (size_t)(dest - _window);
+      if (distance > winPosTemp)
+      {
+        if (_lzSize == 0)
+          goto error_dist;
+        size_t back = distance - winPosTemp;
+        src = dest + (_winSize - distance);
+        if (back < len)
+        {
+          do
+            *dest++ = *src++;
+          while (--back);
+          src = dest - distance;
+        }
+      }
+      else
+        src = dest - distance;
+
+      CopyMatch(distance, dest, src, _window + winPos);
+      return S_OK;
+    }
+
+error_dist:
+    _lzError = LZ_ERROR_TYPE_DIST;
+    do
+      *dest++ = 0;
+    while (dest < _window + winPos);
+    return S_OK;
+  };
+
+  auto addFilterRetired = [&](const CRar5ParallelDecodedItem &item) -> HRESULT
+  {
+    DeleteUnusedFilters();
+
+    if (_numFilters >= MAX_UNPACK_FILTERS)
+    {
+      _winPos = winPos;
+      RINOK(WriteBuf())
+      DeleteUnusedFilters();
+      if (_numFilters >= MAX_UNPACK_FILTERS)
+      {
+        _unsupportedFilter = true;
+        InitFilters();
+      }
+    }
+
+    CFilter f;
+    f.Size = item.FilterSize;
+    if (f.Size > k_Filter_BlockSize_MAX)
+    {
+      _unsupportedFilter = true;
+      f.Size = 0;
+    }
+
+    f.Type = item.FilterType;
+    f.Channels = item.FilterChannels;
+    f.Start = _lzSize + winPos + item.Distance;
+
+    if (f.Start < _filterEnd)
+      _unsupportedFilter = true;
+    else
+    {
+      _filterEnd = f.Start + f.Size;
+      if (f.Size != 0)
+      {
+        if (!_filters)
+        {
+          _filters = (CFilter *)z7_AlignedAlloc(MAX_UNPACK_FILTERS * sizeof(CFilter));
+          if (!_filters)
+            return E_OUTOFMEMORY;
+        }
+        _filters[_numFilters++] = f;
+      }
+    }
+    return S_OK;
+  };
+
+  auto retireOne = [&](CRar5ParallelBlockJob &job) -> HRESULT
+  {
+    RINOK(job.Wait())
+
+    for (const CRar5ParallelDecodedItem &item: job.Decoded)
+    {
+      RINOK(normalizeWindow())
+
+      switch (item.Type)
+      {
+        case RAR5_MT_LITERAL:
+          memcpy(_window + winPos, item.Literal, item.LiteralSize);
+          winPos += item.LiteralSize;
+          break;
+
+        case RAR5_MT_MATCH:
+        {
+          const size_t distance = item.Distance;
+          _reps[3] = _reps[2];
+          _reps[2] = _reps[1];
+          _reps[1] = _reps[0];
+          _reps[0] = distance;
+          _lastLen = item.Length;
+          RINOK(copyMatchRetired(distance, item.Length))
+          break;
+        }
+
+        case RAR5_MT_REP:
+        {
+          const unsigned repIndex = (unsigned)item.Distance;
+          if (repIndex >= kNumReps)
+            return S_FALSE;
+          const size_t distance = _reps[repIndex];
+          for (unsigned i = repIndex; i > 0; i--)
+            _reps[i] = _reps[i - 1];
+          _reps[0] = distance;
+          _lastLen = item.Length;
+          RINOK(copyMatchRetired(distance, item.Length))
+          break;
+        }
+
+        case RAR5_MT_FULLREP:
+          if (_lastLen != 0)
+            RINOK(copyMatchRetired(_reps[0], _lastLen))
+          break;
+
+        case RAR5_MT_FILTER:
+          _winPos = winPos;
+          RINOK(addFilterRetired(item))
+          break;
+
+        default:
+          return E_FAIL;
+      }
+    }
+
+    _winPos = winPos;
+
+    if (_progress)
+    {
+      if (job.PackPos - _progress_Pack >= (1u << 24) ||
+          _writtenFileSize - _progress_Unpack >= (1u << 26))
+      {
+        _progress_Pack = job.PackPos;
+        _progress_Unpack = _writtenFileSize;
+        RINOK(_progress->SetRatioInfo(&_progress_Pack, &_writtenFileSize))
+      }
+    }
+
+    minorError = minorError || job.MinorError;
+    if (job.LastBlock && minorError)
+      return S_FALSE;
+
+    return S_OK;
+  };
+
+  auto retireUntilEmpty = [&]() -> HRESULT
+  {
+    while (retired < submitted)
+    {
+      CRar5ParallelBlockJob &job = *ring[(size_t)(retired % ringSize)];
+      RINOK(retireOne(job))
+      retired++;
+    }
+    return S_OK;
+  };
+
+  for (;;)
+  {
+    if (submitted - retired >= ringSize)
+    {
+      CRar5ParallelBlockJob &job = *ring[(size_t)(retired % ringSize)];
+      RINOK(retireOne(job))
+      retired++;
+      continue;
+    }
+
+    CRar5RawBlockHeader rawHeader;
+    RINOK(ReadRar5RawBlockHeader(_inStream, rawHeader))
+    packedRead += rawHeader.HeaderSize;
+
+    if (rawHeader.UseSerial)
+    {
+      RINOK(retireUntilEmpty())
+      RINOK(normalizeWindow())
+
+      CMyComPtr2_Create<ISequentialInStream, CRar5ReplayInStream> replay;
+      replay->Init(rawHeader.Bytes, rawHeader.HeaderSize, _inStream);
+      ISequentialInStream *savedStream = _inStream;
+      _inStream = replay;
+      const HRESULT res = DecodeLZ();
+      _inStream = savedStream;
+      return res;
+    }
+
+    CRar5ParallelBlockJob &job = *ring[(size_t)(submitted % ringSize)];
+    job.Reset();
+
+    try
+    {
+      const size_t logicalSize = (size_t)rawHeader.HeaderSize + rawHeader.BlockSize;
+      job.Data.resize(logicalSize + kInputBufferPadZone);
+      memcpy(job.Data.data(), rawHeader.Bytes, rawHeader.HeaderSize);
+      RINOK(ReadStream_FALSE(
+          _inStream,
+          job.Data.data() + rawHeader.HeaderSize,
+          rawHeader.BlockSize))
+      memset(job.Data.data() + logicalSize, 0xFF, kInputBufferPadZone);
+      packedRead += rawHeader.BlockSize;
+
+      CBitDecoder bitStream;
+      bitStream._stream = NULL;
+      bitStream._bufBase = job.Data.data();
+      bitStream.Init();
+      bitStream._bufLim = job.Data.data() + logicalSize;
+      bitStream._bufCheck = bitStream._bufLim;
+      bitStream._bufCheck_Block = bitStream._bufCheck;
+      bitStream._wasFinished = true;
+      bitStream._hres = S_OK;
+
+      ICompressProgressInfo *savedProgress = _progress;
+      _progress = NULL;
+      const HRESULT tableRes = ReadTables(bitStream);
+      _progress = savedProgress;
+      RINOK(tableRes)
+
+      job.BitState = bitStream;
+      job.Tables.Main = m_MainDecoder;
+      job.Tables.Dist = m_DistDecoder;
+      job.Tables.Align = m_AlignDecoder;
+      job.Tables.Len = m_LenDecoder;
+      job.Tables.UseAlignBits = _useAlignBits;
+      job.PackPos = packedRead;
+      job.LastBlock = _isLastBlock;
+      job.MinorError = bitStream._minorError;
+    }
+    catch (const std::bad_alloc &)
+    {
+      return E_OUTOFMEMORY;
+    }
+
+    pool.Submit(&job);
+    submitted++;
+
+    if (job.LastBlock)
+      break;
+  }
+
+  RINOK(retireUntilEmpty())
+  RINOK(normalizeWindow())
+  return S_OK;
+}
+
+
+HRESULT CDecoder::CodeRealParallel()
+{
+  _unsupportedFilter = false;
+  _writeError = false;
+  _isLastBlock = false;
+
+  InitFilters();
+
+  _filterEnd = 0;
+  _writtenFileSize = 0;
+  const UInt64 lzSize = _lzSize + _winPos;
+  _lzFileStart = lzSize;
+  _lzWritten = lzSize;
+
+  HRESULT res = DecodeLZParallel();
+
+  HRESULT res2 = S_OK;
+  if (!_writeError && res != E_OUTOFMEMORY)
+    res2 = WriteBuf();
+
+  if (res == S_OK)
+    res = res2;
+
+  if (res == S_OK && _unpackSize_Defined && _writtenFileSize != _unpackSize)
+    return S_FALSE;
+
+  return res;
+}
+
+#endif // !Z7_ST
+
+
 HRESULT CDecoder::CodeReal()
 {
   _unsupportedFilter = false;
@@ -1848,7 +2698,7 @@ HRESULT CDecoder::CodeReal()
 
 
 Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream *outStream,
-    const UInt64 * /* inSize */, const UInt64 *outSize, ICompressProgressInfo *progress))
+    const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
   _lzError = LZ_ERROR_TYPE_NO;
 /*
@@ -2025,7 +2875,15 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   _progress_Pack = 0;
   _progress_Unpack = 0;
   
-  const HRESULT res = CodeReal();
+  HRESULT res;
+#ifndef Z7_ST
+  if (GetRar5ParallelWorkerCount(_numThreads) != 0
+      && inSize
+      && *inSize >= kRar5MtInputThreshold)
+    res = CodeRealParallel();
+  else
+#endif
+    res = CodeReal();
   
   if (res != S_OK)
     return res;
@@ -2037,6 +2895,16 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   return S_OK;
 }
 
+
+
+
+#ifndef Z7_ST
+Z7_COM7F_IMF(CDecoder::SetNumberOfThreads(UInt32 numThreads))
+{
+  _numThreads = numThreads == 0 ? 1 : numThreads;
+  return S_OK;
+}
+#endif
 
 Z7_COM7F_IMF(CDecoder::SetDecoderProperties2(const Byte *data, UInt32 size))
 {

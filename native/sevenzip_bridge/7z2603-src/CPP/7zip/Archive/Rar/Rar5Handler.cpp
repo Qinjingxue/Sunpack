@@ -1,4 +1,6 @@
 // Rar5Handler.cpp
+// Modified for SunPack on 2026-09-20: forward RAR5 "mt" settings to the
+// decoder while preserving the upstream archive/volume/extraction machinery.
 
 #include "StdAfx.h"
 
@@ -1031,8 +1033,18 @@ struct CUnpacker
 
   CByteBuffer _tempBuf;
   CLinkFile *linkFile;
+#ifndef Z7_ST
+  UInt32 NumThreads;
+#endif
 
-  CUnpacker(): linkFile(NULL) { SolidAllowed = false; NeedCrc = true; }
+  CUnpacker(): linkFile(NULL)
+  {
+    SolidAllowed = false;
+    NeedCrc = true;
+#ifndef Z7_ST
+    NumThreads = 1;
+#endif
+  }
 
   HRESULT Create(DECL_EXTERNAL_CODECS_LOC_VARS
       const CItem &item, bool isSolid, bool &wrongPassword);
@@ -1079,6 +1091,15 @@ HRESULT CUnpacker::Create(DECL_EXTERNAL_CODECS_LOC_VARS
       if (!lzCoder)
         return E_NOTIMPL;
     }
+
+#ifndef Z7_ST
+    {
+      CMyComPtr<ICompressSetCoderMt> setCoderMt;
+      lzCoder.QueryInterface(IID_ICompressSetCoderMt, &setCoderMt);
+      if (setCoderMt)
+        RINOK(setCoderMt->SetNumberOfThreads(NumThreads))
+    }
+#endif
 
     CMyComPtr<ICompressSetDecoderProperties2> csdp;
     RINOK(lzCoder.QueryInterface(IID_ICompressSetDecoderProperties2, &csdp))
@@ -3043,6 +3064,9 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
 
   CUnpacker unpacker;
   unpacker.NeedCrc = _needChecksumCheck;
+#ifndef Z7_ST
+  unpacker.NumThreads = _numThreads;
+#endif
   CMyComPtr2_Create<ISequentialInStream, CVolsInStream> volsInStream;
   CMyComPtr2_Create<ICompressProgressInfo, CLocalProgress> lps;
   lps->Init(extractCallback, false);
@@ -3349,6 +3373,16 @@ void CHandler::InitDefaults()
   _needChecksumCheck = true;
   _memUsage_WasSet = false;
   _memUsage_Decompress = (UInt64)1 << 32;
+#ifndef Z7_ST
+#ifdef _WIN32
+  NWindows::NSystem::CProcessAffinity affinity;
+  _numThreads = affinity.Load_and_GetNumberOfThreads();
+#else
+  _numThreads = NWindows::NSystem::GetNumberOfProcessors();
+#endif
+  if (_numThreads == 0)
+    _numThreads = 1;
+#endif
 }
 
 Z7_COM7F_IMF(CHandler::SetProperties(const wchar_t * const *names, const PROPVARIANT *values, UInt32 numProps))
@@ -3366,6 +3400,10 @@ Z7_COM7F_IMF(CHandler::SetProperties(const wchar_t * const *names, const PROPVAR
 
     if (name.IsPrefixedBy_Ascii_NoCase("mt"))
     {
+#ifndef Z7_ST
+      bool forced = false;
+      RINOK(ParseMtProp2(name.Ptr(2), prop, _numThreads, forced))
+#endif
     }
     else if (name.IsPrefixedBy_Ascii_NoCase("memx"))
     {
