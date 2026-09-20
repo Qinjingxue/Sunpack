@@ -299,16 +299,6 @@ Z7_COM7F_IMF(CZlibNgDeflateDecoder::Code(
 }
 
 
-constexpr UInt64 kAdaptiveMinUnpackSize = (UInt64)64 << 10;
-
-bool ShouldUseZlibNgAdaptive(const UInt64 *inSize, const UInt64 *outSize)
-{
-    if (!inSize || !outSize || *outSize < kAdaptiveMinUnpackSize)
-        return false;
-    const UInt64 minSavings = *outSize / 10;
-    return *inSize <= *outSize - minSavings;
-}
-
 class CAdaptiveDeflateDecoder final:
     public ICompressCoder,
     public ICompressSetFinishMode,
@@ -427,7 +417,8 @@ Z7_COM7F_IMF(CAdaptiveDeflateDecoder::Code(
     // Keep partial/resumable decoding on upstream 7-Zip. In that mode
     // outSize can describe only the requested prefix of a larger 7z coder
     // stream, so it is not a valid whole-stream compression-ratio signal.
-    if (_finishMode != 0 && ShouldUseZlibNgAdaptive(inSize, outSize))
+    if (_finishMode != 0 && inSize && outSize &&
+        SunpackShouldUseZlibNgDeflate(*inSize, *outSize))
     {
         HRESULT hres = EnsureZlibNg();
         if (hres == S_OK)
@@ -523,6 +514,15 @@ Z7_COM7F_IMF(CAdaptiveDeflateDecoder::Read(
 #endif
 
 }  // namespace
+
+bool SunpackShouldUseZlibNgDeflate(UInt64 packedSize, UInt64 unpackedSize)
+{
+    const UInt64 kMinUnpackSize = (UInt64)64 << 10;
+    if (unpackedSize < kMinUnpackSize)
+        return false;
+    const UInt64 minSavings = unpackedSize / 10;
+    return packedSize <= unpackedSize - minSavings;
+}
 
 ICompressCoder *SunpackCreateZlibNgDeflateDecoder()
 {
