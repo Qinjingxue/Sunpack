@@ -94,7 +94,7 @@ function Wait-ExecutableExit {
     } while ((Get-Date) -lt $deadline)
 
     $processIds = ($matching | ForEach-Object ProcessId) -join ", "
-    throw "Packaged runtime did not exit within $TimeoutSeconds seconds: $ExecutablePath (PID: $processIds)"
+    throw "Executable did not exit within $TimeoutSeconds seconds: $ExecutablePath (PID: $processIds)"
 }
 
 function Wait-FileReadyForPromotion {
@@ -541,7 +541,17 @@ assert os.path.getsize(target) > 0
                 "sunpack.py", "inspect", "--analyze", "--no-pause", "-q", $fixture
             )
         } finally {
-            Pop-Location
+            try {
+                # The source CLI uses the persistent server for non-help
+                # commands. Do not leave the venv Python alive while the build
+                # later mutates or packages files from the same environment.
+                Invoke-Native -FilePath $PythonPath -Arguments @(
+                    "sunpack.py", "--persistent-shutdown"
+                )
+                Wait-ExecutableExit -ExecutablePath $PythonPath
+            } finally {
+                Pop-Location
+            }
         }
     } finally {
         Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue

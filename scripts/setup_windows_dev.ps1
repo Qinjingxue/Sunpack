@@ -42,6 +42,33 @@ function ConvertTo-NormalizedFullPath {
     return ([System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') -replace '/', '\').ToLowerInvariant()
 }
 
+function Wait-ExecutableExit {
+    param(
+        [Parameter(Mandatory = $true)][string]$ExecutablePath,
+        [int]$TimeoutSeconds = 15
+    )
+
+    $expectedPath = ConvertTo-NormalizedFullPath -Path $ExecutablePath
+    $executableName = [System.IO.Path]::GetFileName($ExecutablePath).Replace("'", "''")
+    $deadline = (Get-Date).AddSeconds([Math]::Max(1, $TimeoutSeconds))
+    do {
+        $matching = @(
+            Get-CimInstance Win32_Process -Filter "Name='$executableName'" -ErrorAction SilentlyContinue |
+                Where-Object {
+                    $_.ExecutablePath -and
+                    (ConvertTo-NormalizedFullPath -Path $_.ExecutablePath) -eq $expectedPath
+                }
+        )
+        if ($matching.Count -eq 0) {
+            return
+        }
+        Start-Sleep -Milliseconds 100
+    } while ((Get-Date) -lt $deadline)
+
+    $processIds = ($matching | ForEach-Object ProcessId) -join ", "
+    throw "Executable did not exit within $TimeoutSeconds seconds: $ExecutablePath (PID: $processIds)"
+}
+
 function Reset-StaleCMakeBuildDir {
     param(
         [Parameter(Mandatory = $true)]
@@ -718,7 +745,17 @@ assert os.path.getsize(target) > 0
                 "sunpack.py", "inspect", "--analyze", "--no-pause", "-q", $fixture
             )
         } finally {
-            Pop-Location
+            try {
+                # Any real source CLI request starts the persistent runtime. Stop
+                # the exact venv-backed server before a later uv sync tries to
+                # replace .venv\Scripts on Windows.
+                Invoke-Native -FilePath $PythonPath -Arguments @(
+                    "sunpack.py", "--persistent-shutdown"
+                )
+                Wait-ExecutableExit -ExecutablePath $PythonPath
+            } finally {
+                Pop-Location
+            }
         }
     } finally {
         Remove-Item -LiteralPath $fixtureRoot -Recurse -Force -ErrorAction SilentlyContinue
