@@ -60,7 +60,7 @@ def test_input_planned_sfx_uses_rust_password_verifier(tmp_path, archive_format)
     if archive_format == "zip":
         assert outcome.match_evidence == "zipcrypto_header_byte", outcome
         assert outcome.final_confirmation_required is True, outcome
-    else:
+    elif archive_format == "7z":
         assert outcome.final_confirmation_required is False, outcome
 
 
