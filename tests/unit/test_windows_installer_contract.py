@@ -544,7 +544,8 @@ def test_release_package_includes_complete_license_material():
     assert "$sevenZipLicensePath" in build_script
     assert "$sevenZipSourceLicensePath" in build_script
     assert "$lgplLicensePath" in build_script
-    assert "$zlibNgLicensePath" in build_script
+    assert '$zlibNgLicensePath = Join-Path $repoRoot "licenses\\zlib-ng-license.txt"' in build_script
+    assert 'Assert-PathExists -LiteralPath $zlibNgLicensePath -Description "zlib-ng license file"' in build_script
     assert "$thirdPartyNoticesPath" in build_script
     assert 'Join-Path $distLicensesRoot "SunPack-MIT.txt"' in build_script
     assert 'Join-Path $distLicensesRoot "7zip-license.txt"' in build_script
