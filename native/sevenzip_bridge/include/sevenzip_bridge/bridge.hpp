@@ -260,7 +260,8 @@ ExtractArchiveResult extract_archive_with_parts(
     bool native_volume_input = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
     std::size_t job_buffer_budget = 0,
-    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+    std::size_t decoder_thread_budget = 0
 );
 
 ExtractArchiveResult extract_archive_with_ranges(
@@ -275,7 +276,8 @@ ExtractArchiveResult extract_archive_with_ranges(
     bool dry_run = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
     std::size_t job_buffer_budget = 0,
-    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+    std::size_t decoder_thread_budget = 0
 );
 
 const char* status_name(PasswordTestStatus status);
