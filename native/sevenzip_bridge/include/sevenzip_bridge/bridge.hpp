@@ -235,9 +235,7 @@ PasswordTestResult test_passwords_with_parts(
     const wchar_t* const* passwords,
     int password_count,
     const std::vector<std::wstring>& canonical_names = {},
-    const std::wstring& format_hint = L"",
-    const std::wstring& signature_path = L"",
-    unsigned long long signature_offset = 0
+    const std::wstring& format_hint = L""
 );
 
 PasswordTestResult test_passwords_with_ranges(
