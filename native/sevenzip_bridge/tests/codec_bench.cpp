@@ -83,6 +83,31 @@ private:
     std::uint64_t hash_ = kFnvOffset;
 };
 
+class ChunkReader {
+public:
+    ChunkReader(const std::vector<std::uint8_t>& input, std::size_t chunk_size)
+        : input_(input), chunk_size_(chunk_size) {}
+
+    std::size_t read(std::uint8_t* destination, std::size_t capacity) {
+        if (pos_ >= input_.size() || capacity == 0) {
+            return 0;
+        }
+        const std::size_t amount = std::min(
+            std::min(chunk_size_, capacity),
+            input_.size() - pos_);
+        std::memcpy(destination, input_.data() + pos_, amount);
+        pos_ += amount;
+        return amount;
+    }
+
+    bool eof() const noexcept { return pos_ == input_.size(); }
+
+private:
+    const std::vector<std::uint8_t>& input_;
+    std::size_t chunk_size_;
+    std::size_t pos_ = 0;
+};
+
 [[noreturn]] void fail(const std::string& message) {
     throw std::runtime_error(message);
 }
@@ -362,18 +387,17 @@ DecodeResult decode_backend(
     }
 
     Sink sink(hash_enabled);
+    ChunkReader reader(input, options.chunk_size);
+    std::vector<std::uint8_t> input_chunk(options.chunk_size);
     std::vector<std::uint8_t> output(options.chunk_size);
-    std::size_t input_pos = 0;
     int code = Z_OK;
 
     while (code != Z_STREAM_END) {
-        if (stream.avail_in == 0 && input_pos < input.size()) {
+        if (stream.avail_in == 0 && !reader.eof()) {
             const std::size_t amount =
-                std::min(options.chunk_size, input.size() - input_pos);
-            stream.next_in = const_cast<Bytef*>(
-                reinterpret_cast<const Bytef*>(input.data() + input_pos));
+                reader.read(input_chunk.data(), input_chunk.size());
+            stream.next_in = reinterpret_cast<Bytef*>(input_chunk.data());
             stream.avail_in = static_cast<uInt>(amount);
-            input_pos += amount;
         }
 
         stream.next_out = reinterpret_cast<Bytef*>(output.data());
@@ -388,7 +412,7 @@ DecodeResult decode_backend(
             fail("inflate failed: " + std::to_string(code));
         }
         if (code != Z_STREAM_END &&
-            input_pos == input.size() &&
+            reader.eof() &&
             stream.avail_in == 0 &&
             before_in == 0 &&
             produced == 0) {
@@ -397,9 +421,9 @@ DecodeResult decode_backend(
         }
     }
 
-    const std::size_t consumed = input_pos - stream.avail_in;
+    const bool trailing = stream.avail_in != 0 || !reader.eof();
     inflateEnd(&stream);
-    if (consumed != input.size()) {
+    if (trailing) {
         fail("deflate decoder left trailing input");
     }
     return sink.result();
@@ -417,16 +441,16 @@ DecodeResult decode_backend(
     state.crc_flag = ISAL_DEFLATE;
 
     Sink sink(hash_enabled);
+    ChunkReader reader(input, options.chunk_size);
+    std::vector<std::uint8_t> input_chunk(options.chunk_size);
     std::vector<std::uint8_t> output(options.chunk_size);
-    std::size_t input_pos = 0;
 
     while (state.block_state != ISAL_BLOCK_FINISH) {
-        if (state.avail_in == 0 && input_pos < input.size()) {
+        if (state.avail_in == 0 && !reader.eof()) {
             const std::size_t amount =
-                std::min(options.chunk_size, input.size() - input_pos);
-            state.next_in = const_cast<std::uint8_t*>(input.data() + input_pos);
+                reader.read(input_chunk.data(), input_chunk.size());
+            state.next_in = input_chunk.data();
             state.avail_in = static_cast<std::uint32_t>(amount);
-            input_pos += amount;
         }
 
         state.next_out = output.data();
@@ -440,7 +464,7 @@ DecodeResult decode_backend(
             fail("isal_inflate failed: " + std::to_string(code));
         }
         if (state.block_state != ISAL_BLOCK_FINISH &&
-            input_pos == input.size() &&
+            reader.eof() &&
             state.avail_in == 0 &&
             before_in == 0 &&
             produced == 0) {
@@ -448,8 +472,7 @@ DecodeResult decode_backend(
         }
     }
 
-    const std::size_t consumed = input_pos - state.avail_in;
-    if (consumed != input.size()) {
+    if (state.avail_in != 0 || !reader.eof()) {
         fail("ISA-L decoder left trailing input");
     }
     return sink.result();
@@ -473,20 +496,20 @@ DecodeResult decode_backend(
     }
 
     Sink sink(hash_enabled);
+    ChunkReader reader(input, options.chunk_size);
+    std::vector<std::uint8_t> input_chunk(options.chunk_size);
     std::vector<std::uint8_t> output(options.chunk_size);
-    std::size_t input_pos = 0;
     ZSTD_inBuffer in_buffer{nullptr, 0, 0};
     size_t remaining = 1;
 
     while (remaining != 0) {
         if (in_buffer.pos == in_buffer.size) {
-            if (input_pos < input.size()) {
+            if (!reader.eof()) {
                 const std::size_t amount =
-                    std::min(options.chunk_size, input.size() - input_pos);
-                in_buffer.src = input.data() + input_pos;
+                    reader.read(input_chunk.data(), input_chunk.size());
+                in_buffer.src = input_chunk.data();
                 in_buffer.size = amount;
                 in_buffer.pos = 0;
-                input_pos += amount;
             } else {
                 // A streaming decoder can still have buffered output after the
                 // final input byte. Keep calling it with an explicit empty
@@ -511,7 +534,7 @@ DecodeResult decode_backend(
             before_in == in_buffer.pos &&
             out_buffer.pos == 0) {
             const bool no_more_input =
-                input_pos == input.size() && in_buffer.pos == in_buffer.size;
+                reader.eof() && in_buffer.pos == in_buffer.size;
             ZSTD_freeDStream(stream);
             fail(no_more_input
                      ? "zstd frame ended before decoder reached frame end"
@@ -519,10 +542,9 @@ DecodeResult decode_backend(
         }
     }
 
-    const std::size_t consumed =
-        input_pos - (in_buffer.size - in_buffer.pos);
+    const bool trailing = in_buffer.pos != in_buffer.size || !reader.eof();
     ZSTD_freeDStream(stream);
-    if (consumed != input.size()) {
+    if (trailing) {
         fail("zstd decoder left trailing input");
     }
     return sink.result();
@@ -554,23 +576,23 @@ DecodeResult decode_backend(
     }
 
     Sink sink(hash_enabled);
+    ChunkReader reader(input, options.chunk_size);
+    std::vector<std::uint8_t> input_chunk(options.chunk_size);
     std::vector<std::uint8_t> output(options.chunk_size);
-    std::size_t input_pos = 0;
 
     while (code != LZMA_STREAM_END) {
-        if (stream.avail_in == 0 && input_pos < input.size()) {
+        if (stream.avail_in == 0 && !reader.eof()) {
             const std::size_t amount =
-                std::min(options.chunk_size, input.size() - input_pos);
-            stream.next_in = input.data() + input_pos;
+                reader.read(input_chunk.data(), input_chunk.size());
+            stream.next_in = input_chunk.data();
             stream.avail_in = amount;
-            input_pos += amount;
         }
 
         stream.next_out = output.data();
         stream.avail_out = output.size();
         const std::size_t before_in = stream.avail_in;
         const lzma_action action =
-            input_pos == input.size() ? LZMA_FINISH : LZMA_RUN;
+            reader.eof() ? LZMA_FINISH : LZMA_RUN;
         code = lzma_code(&stream, action);
         const std::size_t produced = output.size() - stream.avail_out;
         sink.consume(output.data(), produced);
@@ -581,7 +603,7 @@ DecodeResult decode_backend(
             fail("lzma_code failed: " + std::to_string(code));
         }
         if (code != LZMA_STREAM_END &&
-            input_pos == input.size() &&
+            reader.eof() &&
             stream.avail_in == 0 &&
             before_in == 0 &&
             produced == 0) {
@@ -591,10 +613,10 @@ DecodeResult decode_backend(
         }
     }
 
-    const std::size_t consumed = input_pos - stream.avail_in;
+    const bool trailing = stream.avail_in != 0 || !reader.eof();
     lzma_end(&stream);
     lzma_filters_free(filters, nullptr);
-    if (consumed != input.size()) {
+    if (trailing) {
         fail("liblzma decoder left trailing input");
     }
     return sink.result();
@@ -624,19 +646,19 @@ DecodeResult decode_backend(
     }
 
     Sink sink(hash_enabled);
+    ChunkReader reader(input, options.chunk_size);
+    std::vector<std::uint8_t> input_chunk(options.chunk_size);
     std::vector<std::uint8_t> output(options.chunk_size);
-    std::size_t input_pos = 0;
     FL2_inBuffer in_buffer{nullptr, 0, 0};
     code = 1;
 
     while (code != 0) {
-        if (in_buffer.pos == in_buffer.size && input_pos < input.size()) {
+        if (in_buffer.pos == in_buffer.size && !reader.eof()) {
             const std::size_t amount =
-                std::min(options.chunk_size, input.size() - input_pos);
-            in_buffer.src = input.data() + input_pos;
+                reader.read(input_chunk.data(), input_chunk.size());
+            in_buffer.src = input_chunk.data();
             in_buffer.size = amount;
             in_buffer.pos = 0;
-            input_pos += amount;
         }
 
         FL2_outBuffer out_buffer{output.data(), output.size(), 0};
@@ -653,7 +675,7 @@ DecodeResult decode_backend(
             before_in == in_buffer.pos &&
             out_buffer.pos == 0) {
             const bool no_more_input =
-                input_pos == input.size() && in_buffer.pos == in_buffer.size;
+                reader.eof() && in_buffer.pos == in_buffer.size;
             FL2_freeDStream(stream);
             fail(no_more_input
                      ? "LZMA2 stream ended before Fast LZMA2 reached terminator"
@@ -661,10 +683,9 @@ DecodeResult decode_backend(
         }
     }
 
-    const std::size_t consumed =
-        input_pos - (in_buffer.size - in_buffer.pos);
+    const bool trailing = in_buffer.pos != in_buffer.size || !reader.eof();
     FL2_freeDStream(stream);
-    if (consumed != input.size()) {
+    if (trailing) {
         fail("Fast LZMA2 decoder left trailing input");
     }
     return sink.result();
