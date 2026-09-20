@@ -468,7 +468,7 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_USE_PLANNED_IO
             if (planned_mode_)
             {
-                return consume_planned_locked(offset, data, size, trace, profiling, wait_started, lock);
+                return consume_planned_locked(offset, data, size, trace, profiling, lock);
             }
 #endif
 
@@ -1083,7 +1083,6 @@ namespace sunpack::sevenzip
             UInt32 size,
             ExtractInputTrace *trace,
             bool profiling,
-            std::chrono::steady_clock::time_point wait_started,
             std::unique_lock<std::mutex> &lock)
         {
             std::size_t plan_index = 0;
@@ -1114,7 +1113,6 @@ namespace sunpack::sevenzip
                 if (profiling)
                 {
                     ++trace->prefetch_hit_count;
-                    trace->prefetch_consumer_wait_ns += elapsed_ns(wait_started);
                 }
                 return true;
             }
