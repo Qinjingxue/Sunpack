@@ -354,7 +354,7 @@ def test_password_resolver_routes_unknown_embedded_range_through_normal_schedule
         builtin_passwords=[],
     )
     fast = RecordingNotRequiredFastVerifier()
-    scheduler = PasswordScheduler(PasswordVerifierChain([fast], None))
+    scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
     resolver = PasswordResolver(tester, PasswordSession(), scheduler)
     bag = FactBag()
     bag.set("archive.knowledge", {
