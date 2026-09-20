@@ -2,8 +2,6 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from sunpack.passwords.verifier.base import VerifierStatus
-
 
 class PasswordResolutionStatus(str, Enum):
     RESOLVED = "resolved"
@@ -15,21 +13,6 @@ class PasswordResolutionStatus(str, Enum):
     UNSUPPORTED = "unsupported"
     BACKEND_ERROR = "backend_error"
     NEEDS_VOLUME_OR_TAIL_DAMAGED = "needs_volume_or_tail_damaged"
-
-
-@dataclass(frozen=True)
-class PasswordProbeResult:
-    status: VerifierStatus
-    message: str = ""
-    backend_result: object = None
-
-    @property
-    def ok(self) -> bool:
-        return self.status in {"match", "not_required"}
-
-    @property
-    def returncode(self) -> int:
-        return 0 if self.ok else 2
 
 
 @dataclass
