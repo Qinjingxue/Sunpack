@@ -2362,8 +2362,14 @@ HRESULT CDecoder::DecodeLZParallel()
         src = dest + (_winSize - distance);
         if (back < len)
         {
+          // Keep the upstream 7-Zip wrap copy exactly: it deliberately copies
+          // two bytes per iteration into the decoder's padded window.
+          Z7_PRAGMA_OPT_DISABLE_LOOP_UNROLL_VECTORIZE
           do
+          {
             *dest++ = *src++;
+            *dest++ = *src++;
+          }
           while (--back);
           src = dest - distance;
         }
