@@ -50,9 +50,9 @@ option(SUP7Z_ENABLE_PIPELINE_TIMING
 # normal builds. Build one backend per build directory so competing zlib ABIs
 # (for example zlib-ng and zlib-rs) never collide in one executable.
 set(SUP7Z_CODEC_BENCH_BACKEND "" CACHE STRING
-    "Streaming decoder microbenchmark backend: 7z, zlib, isal, zstd, lzma, or fastlzma2")
+    "Streaming decoder microbenchmark backend: 7z, zlib-ng, zlib-rs, isal, zstd, lzma, or fastlzma2")
 set_property(CACHE SUP7Z_CODEC_BENCH_BACKEND PROPERTY STRINGS
-    "" 7z zlib isal zstd lzma fastlzma2)
+    "" 7z zlib-ng zlib-rs isal zstd lzma fastlzma2)
 set(SUP7Z_CODEC_BENCH_INCLUDE_DIRS "" CACHE STRING
     "Semicolon-separated include directories for the selected external codec benchmark backend")
 set(SUP7Z_CODEC_BENCH_LIBRARIES "" CACHE STRING
@@ -490,11 +490,11 @@ target_include_directories(sunpack_sevenzip_writer_cost
 if(NOT SUP7Z_CODEC_BENCH_BACKEND STREQUAL "")
     string(TOLOWER "${SUP7Z_CODEC_BENCH_BACKEND}" SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED)
     set(SUP7Z_CODEC_BENCH_VALID_BACKENDS
-        7z zlib isal zstd lzma fastlzma2)
+        7z zlib-ng zlib-rs isal zstd lzma fastlzma2)
     if(NOT SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED IN_LIST SUP7Z_CODEC_BENCH_VALID_BACKENDS)
         message(FATAL_ERROR
             "Unsupported SUP7Z_CODEC_BENCH_BACKEND='${SUP7Z_CODEC_BENCH_BACKEND}'. "
-            "Choose one of: 7z, zlib, isal, zstd, lzma, fastlzma2.")
+            "Choose one of: 7z, zlib-ng, zlib-rs, isal, zstd, lzma, fastlzma2.")
     endif()
 
     add_executable(sunpack_codec_bench
@@ -522,8 +522,14 @@ if(NOT SUP7Z_CODEC_BENCH_BACKEND STREQUAL "")
         target_link_libraries(sunpack_codec_bench PRIVATE
             ${SUP7Z_CODEC_BENCH_LIBRARIES})
 
-        if(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "zlib")
-            target_compile_definitions(sunpack_codec_bench PRIVATE SUP7Z_CODEC_BENCH_ZLIB=1)
+        if(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "zlib-ng")
+            target_compile_definitions(sunpack_codec_bench PRIVATE
+                SUP7Z_CODEC_BENCH_ZLIB=1
+                SUP7Z_CODEC_BENCH_ZLIB_NG=1)
+        elseif(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "zlib-rs")
+            target_compile_definitions(sunpack_codec_bench PRIVATE
+                SUP7Z_CODEC_BENCH_ZLIB=1
+                SUP7Z_CODEC_BENCH_ZLIB_RS=1)
         elseif(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "isal")
             target_compile_definitions(sunpack_codec_bench PRIVATE SUP7Z_CODEC_BENCH_ISAL=1)
         elseif(SUP7Z_CODEC_BENCH_BACKEND_NORMALIZED STREQUAL "zstd")
