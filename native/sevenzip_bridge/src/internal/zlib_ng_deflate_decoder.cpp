@@ -424,7 +424,10 @@ Z7_COM7F_IMF(CAdaptiveDeflateDecoder::Code(
     const UInt64 *outSize,
     ICompressProgressInfo *progress))
 {
-    if (ShouldUseZlibNgAdaptive(inSize, outSize))
+    // Keep partial/resumable decoding on upstream 7-Zip. In that mode
+    // outSize can describe only the requested prefix of a larger 7z coder
+    // stream, so it is not a valid whole-stream compression-ratio signal.
+    if (_finishMode != 0 && ShouldUseZlibNgAdaptive(inSize, outSize))
     {
         HRESULT hres = EnsureZlibNg();
         if (hres == S_OK)
