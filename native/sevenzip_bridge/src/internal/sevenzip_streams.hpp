@@ -878,6 +878,23 @@ namespace sunpack::sevenzip
 
                 if (victim == chunks_.end())
                 {
+                    // If a speculative slab is already in flight, waiting for that
+                    // single ReadFile to publish is better than evicting a recently
+                    // consumed slab from another active cursor. Once published it has
+                    // last_use==0 and becomes the preferred LRU victim.
+                    const bool speculative_read_in_flight = std::any_of(
+                        chunks_.begin(), chunks_.end(),
+                        [protect_offset, protect_end](const Chunk &chunk)
+                        {
+                            return chunk.state == ChunkState::Reading &&
+                                   !chunk.demand &&
+                                   !ranges_overlap(chunk.offset, chunk.size, protect_offset, protect_end);
+                        });
+                    if (speculative_read_in_flight)
+                    {
+                        return false;
+                    }
+
                     // Then evict the least recently used completed slab. Never evict
                     // bytes that overlap the demand currently blocking the decoder.
                     for (auto it = chunks_.begin(); it != chunks_.end(); ++it)
