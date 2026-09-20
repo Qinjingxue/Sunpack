@@ -528,6 +528,13 @@ class ArchiveInputPlanningStage:
         parts = self._ordered_parts(task)
         if not parts:
             return None
+        segment_analysis = {
+            "status": evidence.status,
+            "confidence": float(evidence.confidence),
+            "damage_flags": list(segment.damage_flags),
+        }
+        if evidence.details.get("password_required"):
+            segment_analysis["password_required"] = True
         if len(parts) == 1:
             if int(segment.start_offset) <= 0:
                 return None
@@ -547,11 +554,7 @@ class ArchiveInputPlanningStage:
                     end=int(segment.end_offset) if segment.end_offset is not None else None,
                     confidence=float(segment.confidence),
                 ),
-                analysis={
-                    "status": evidence.status,
-                    "confidence": float(evidence.confidence),
-                    "damage_flags": list(segment.damage_flags),
-                },
+                analysis=dict(segment_analysis),
             )
         if int(segment.start_offset) <= 0:
             return None
@@ -575,11 +578,7 @@ class ArchiveInputPlanningStage:
                 end=int(segment.end_offset) if segment.end_offset is not None else None,
                 confidence=float(segment.confidence),
             ),
-            analysis={
-                "status": evidence.status,
-                "confidence": float(evidence.confidence),
-                "damage_flags": list(segment.damage_flags),
-            },
+            analysis=dict(segment_analysis),
         )
 
     def _password_probe_input_for_segment(
