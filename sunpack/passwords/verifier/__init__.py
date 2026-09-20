@@ -2,7 +2,6 @@ from sunpack.passwords.verifier.base import PasswordBatchVerification, PasswordV
 from sunpack.passwords.verifier.rar_fast import RarFastVerifier
 from sunpack.passwords.verifier.registry import PasswordVerifierChain, PasswordVerifierRegistry
 from sunpack.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
-from sunpack.passwords.verifier.sevenzip_dll import SevenZipDllVerifier
 from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
 
 __all__ = [
@@ -12,7 +11,6 @@ __all__ = [
     "PasswordVerifier",
     "RarFastVerifier",
     "SevenZipFastVerifier",
-    "SevenZipDllVerifier",
     "VerifierStatus",
     "normalize_verifier_status",
     "ZipFastVerifier",
