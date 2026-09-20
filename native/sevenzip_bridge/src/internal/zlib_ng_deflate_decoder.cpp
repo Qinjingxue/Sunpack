@@ -403,7 +403,7 @@ Z7_COM7F_IMF(CAdaptiveDeflateDecoder::SetFinishMode(UInt32 finishMode))
 
     if (_sevenZip.IsDefined())
     {
-        RINOK(_sevenZip->SetFinishMode(finishMode))
+        RINOK(ApplyFinishMode(_sevenZip.Interface()))
     }
 
     if (_zlibNg)
