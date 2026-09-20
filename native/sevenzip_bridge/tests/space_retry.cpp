@@ -257,7 +257,7 @@ void r1_to_r6_and_r20_pause_and_resume(const std::filesystem::path &directory) {
     }
     // 关闭文件（真实调用方在解压结束时一定会做这一步）。
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     check(writer.finish_job(job) == S_OK, "R-5: 恢复后 job 必须成功完成");
 
     // R-5 恢复后数据完整
@@ -326,7 +326,7 @@ void r4_producer_backpressure(const std::filesystem::path &directory) {
     check(producer_returned.load(), "R-4: 恢复后 producer 必须被唤醒并返回");
     check(produced.load() == kPayload, "R-4: producer 必须写完全部 payload");
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     check(writer.finish_job(job) == S_OK, "R-4: 恢复后 job 必须成功");
     const auto metrics = writer.snapshot_metrics();
     check(metrics.written_bytes == kPayload && metrics.pending_bytes == 0,
@@ -594,7 +594,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
         check(wait_until([&] { return gate->phase() == VolumeSpacePhase::Ready; }, 5s),
               "R-16: 第一次必须能恢复");
         writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
+        writer.close_file(file, {});
         check(writer.finish_job(job) == S_OK, "R-16: 第一次 job 必须成功");
     }
 
@@ -640,7 +640,7 @@ void r16_reaped_writer_does_not_poison_gate(const std::filesystem::path &directo
             return;
         }
         writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
+        writer.close_file(file, {});
         check(writer.finish_job(job) == S_OK, "R-16: 回收后 job 必须成功");
         check(read_file(path) == payload, "R-16: 回收后数据必须完整");
     }
@@ -665,7 +665,7 @@ void r17_concurrent_open_is_serialized(const std::filesystem::path &directory) {
                        &processed) == S_OK,
           "R-17: 写入必须被接受");
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     check(writer.finish_job(job) == S_OK, "R-17: 并发写同一文件必须成功");
 
     const auto snapshot = writer.snapshot_file(file);
@@ -805,7 +805,7 @@ void r9_flush_space_error(const std::filesystem::path &directory) {
                        &processed) == S_OK,
           "R-9: 写入必须被接受");
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
 
     check(wait_until([&] { return harness.gate->blocked(); }, 5s),
           "R-9: flush 的空间错误必须让卷进入暂停");
@@ -945,7 +945,7 @@ void r11b_flag_off_open_and_flush(const std::filesystem::path &directory) {
         std::uint32_t processed = 0;
         writer.write(file, &byte, 1, &processed);
         writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
+        writer.close_file(file, {});
         check(writer.finish_job(job) != S_OK, "R-11b: open 失败必须让 job 失败");
 
         const auto snapshot = writer.snapshot_file(file);
@@ -983,7 +983,7 @@ void r11b_flag_off_open_and_flush(const std::filesystem::path &directory) {
         writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()),
                      &processed);
         writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
+        writer.close_file(file, {});
         check(writer.finish_job(job) != S_OK, "R-11b: ② flush 空间错误必须让 job 失败");
 
         const auto snapshot = writer.snapshot_file(file);
@@ -1087,7 +1087,7 @@ void r21_open_space_error_is_retryable(const std::filesystem::path &directory) {
     std::filesystem::remove(path, remove_error);
     check(harness.release_probe_and_wait_ready(), "R-21: 恢复后必须回到 Ready");
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     check(writer.finish_job(job) == S_OK, "R-21: 恢复后 job 必须成功");
     check(read_file(path) == payload, "R-21: 数据必须完整");
 }
@@ -1130,7 +1130,7 @@ void r22_partial_write_then_space_failure(const std::filesystem::path &directory
 
     check(harness.release_probe_and_wait_ready(), "R-22: 恢复后必须回到 Ready");
     writer.record_operation_result(file, 0);
-    writer.close_file(file, 0, false, {});
+    writer.close_file(file, {});
     check(writer.finish_job(job) == S_OK, "R-22: 恢复后 job 必须成功");
 
     const auto metrics = writer.snapshot_metrics();
@@ -1169,7 +1169,7 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
         // 必须先 close_file 再 finish_job：pending_jobs 是在 close_file 里递增的，
         // 漏掉它 finish_job 会立刻返回（还没 drain），内容比对必然失败。
         writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
+        writer.close_file(file, {});
         check(writer.finish_job(job) == S_OK, "R-23: ① 干净写入必须成功");
 
         check(harness.gate->wait_call_count() == 0,
@@ -1203,7 +1203,7 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
 
         check(harness.release_probe_and_wait_ready(), "R-23: ② 恢复后必须回到 Ready");
         writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
+        writer.close_file(file, {});
         check(writer.finish_job(job) == S_OK, "R-23: ② 恢复后 job 必须成功");
         check(read_file(path) == payload, "R-23: ② 数据必须完整");
     }
@@ -1226,7 +1226,7 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
         check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-23: ③ 必须进入暂停");
         check(harness.release_probe_and_wait_ready(), "R-23: ③ 恢复后必须回到 Ready");
         writer.record_operation_result(file, 0);
-        writer.close_file(file, 0, false, {});
+        writer.close_file(file, {});
         check(writer.finish_job(job) == S_OK, "R-23: ③ 恢复后 job 必须成功");
 
         const std::uint64_t calls_after_recovery = harness.gate->wait_call_count();
@@ -1241,7 +1241,7 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
                   second_processed == payload.size(),
               "R-23: ③ 恢复后的写入必须全部被接受");
         writer.record_operation_result(second_file, 0);
-        writer.close_file(second_file, 0, false, {});
+        writer.close_file(second_file, {});
         check(writer.finish_job(second_job) == S_OK, "R-23: ③ 恢复后的 job 必须成功");
         check(harness.gate->wait_call_count() == calls_after_recovery,
               "R-23: ★ 恢复之后的正常写入同样不得再进入 gate（回到零开销）");
