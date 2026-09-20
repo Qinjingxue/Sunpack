@@ -376,6 +376,7 @@ namespace sunpack::sevenzip
         {
             std::lock_guard lock(mutex_);
             ++epoch_;
+            recycle_all_planned_buffers_locked();
             chunks_.clear();
             plan_.clear();
             planned_cursors_.clear();
@@ -542,15 +543,12 @@ namespace sunpack::sevenzip
                         // The decoder already obtained these bytes directly. Drop only
                         // fully covered slabs owned by this consumer; an in-flight slab
                         // extending past end remains useful as future speculative data.
-                        chunks_.erase(
-                            std::remove_if(
-                                chunks_.begin(), chunks_.end(),
-                                [cursor_id = cursor->id, end](const Chunk &chunk)
-                                {
-                                    return chunk.owner_cursor == cursor_id &&
-                                           chunk.offset + chunk.size <= end;
-                                }),
-                            chunks_.end());
+                        erase_planned_chunks_if_locked(
+                            [cursor_id = cursor->id, end](const Chunk &chunk)
+                            {
+                                return chunk.owner_cursor == cursor_id &&
+                                       chunk.offset + chunk.size <= end;
+                            });
                     }
                     schedule_plan_locked();
                     ready_.notify_all();
@@ -633,6 +631,14 @@ namespace sunpack::sevenzip
             Failed
         };
 
+#ifdef SUP7Z_USE_PLANNED_IO
+        struct PlannedBuffer
+        {
+            std::shared_ptr<unsigned char[]> data;
+            UInt32 capacity = 0;
+        };
+#endif
+
         struct Chunk
         {
             UInt64 epoch = 0;
@@ -641,6 +647,7 @@ namespace sunpack::sevenzip
             ChunkState state = ChunkState::Queued;
             std::vector<unsigned char> bytes;
 #ifdef SUP7Z_USE_PLANNED_IO
+            PlannedBuffer planned_buffer;
             UInt64 owner_cursor = 0;
             UInt64 last_use = 0;
             bool demand = false;
@@ -716,6 +723,63 @@ namespace sunpack::sevenzip
                 total += chunk.size;
             }
             return total;
+        }
+
+        PlannedBuffer acquire_planned_buffer_locked(UInt32 size)
+        {
+            const auto found = std::find_if(
+                planned_free_buffers_.begin(), planned_free_buffers_.end(),
+                [size](const PlannedBuffer &buffer)
+                { return buffer.data && buffer.capacity >= size; });
+            if (found != planned_free_buffers_.end())
+            {
+                PlannedBuffer buffer = std::move(*found);
+                planned_free_buffers_.erase(found);
+                return buffer;
+            }
+
+            PlannedBuffer buffer;
+            buffer.capacity = std::max<UInt32>(size, planned_config_.io_bytes);
+            return buffer;
+        }
+
+        void recycle_planned_buffer_locked(PlannedBuffer &&buffer)
+        {
+            if (buffer.data)
+            {
+                planned_free_buffers_.push_back(std::move(buffer));
+            }
+        }
+
+        void recycle_chunk_planned_buffer_locked(Chunk &chunk)
+        {
+            recycle_planned_buffer_locked(std::move(chunk.planned_buffer));
+        }
+
+        void recycle_all_planned_buffers_locked()
+        {
+            for (Chunk &chunk : chunks_)
+            {
+                recycle_chunk_planned_buffer_locked(chunk);
+            }
+        }
+
+        template <typename Predicate>
+        void erase_planned_chunks_if_locked(Predicate predicate)
+        {
+            auto it = chunks_.begin();
+            while (it != chunks_.end())
+            {
+                if (predicate(*it))
+                {
+                    recycle_chunk_planned_buffer_locked(*it);
+                    it = chunks_.erase(it);
+                }
+                else
+                {
+                    ++it;
+                }
+            }
         }
 
         static bool ranges_overlap(UInt64 a_offset, UInt64 a_size, UInt64 b_offset, UInt64 b_end) noexcept
@@ -924,8 +988,9 @@ namespace sunpack::sevenzip
                 auto chunk = find_chunk_containing_locked(cursor);
                 const UInt64 chunk_end = chunk->offset + chunk->size;
                 const UInt64 take = std::min<UInt64>(end, chunk_end) - cursor;
+                const std::shared_ptr<unsigned char[]> source_buffer = chunk->planned_buffer.data;
                 const unsigned char *source =
-                    chunk->bytes.data() + static_cast<std::size_t>(cursor - chunk->offset);
+                    source_buffer.get() + static_cast<std::size_t>(cursor - chunk->offset);
                 const std::size_t output_offset = static_cast<std::size_t>(cursor - offset);
                 chunk->last_use = ++planned_touch_clock_;
 
@@ -1024,6 +1089,7 @@ namespace sunpack::sevenzip
                 }
 
                 reserved -= victim->size;
+                recycle_chunk_planned_buffer_locked(*victim);
                 chunks_.erase(victim);
                 ++planned_cache_eviction_count_;
             }
@@ -1100,17 +1166,13 @@ namespace sunpack::sevenzip
 
         void retire_consumed_chunks_locked(UInt64 cursor_id, UInt64 end)
         {
-            chunks_.erase(
-                std::remove_if(
-                    chunks_.begin(),
-                    chunks_.end(),
-                    [cursor_id, end](const Chunk &chunk)
-                    {
-                        return chunk.owner_cursor == cursor_id &&
-                               chunk.state == ChunkState::Ready &&
-                               chunk.offset + chunk.size <= end;
-                    }),
-                chunks_.end());
+            erase_planned_chunks_if_locked(
+                [cursor_id, end](const Chunk &chunk)
+                {
+                    return chunk.owner_cursor == cursor_id &&
+                           chunk.state == ChunkState::Ready &&
+                           chunk.offset + chunk.size <= end;
+                });
         }
 
         void advance_planned_cursor_locked(PlannedCursor &cursor)
@@ -1219,15 +1281,12 @@ namespace sunpack::sevenzip
             // instead of redundantly queueing the same bytes.
             if (state == PlannedRequestState::Failed)
             {
-                chunks_.erase(
-                    std::remove_if(
-                        chunks_.begin(), chunks_.end(),
-                        [offset, request_end](const Chunk &chunk)
-                        {
-                            return chunk.state == ChunkState::Failed &&
-                                   ranges_overlap(chunk.offset, chunk.size, offset, request_end);
-                        }),
-                    chunks_.end());
+                erase_planned_chunks_if_locked(
+                    [offset, request_end](const Chunk &chunk)
+                    {
+                        return chunk.state == ChunkState::Failed &&
+                               ranges_overlap(chunk.offset, chunk.size, offset, request_end);
+                    });
             }
 
             schedule_plan_locked();
@@ -1358,9 +1417,42 @@ namespace sunpack::sevenzip
 #endif
                 }
 
-                std::vector<unsigned char> bytes(size);
+#ifdef SUP7Z_USE_PLANNED_IO
+                PlannedBuffer planned_buffer;
+                bool planned_read = false;
+                {
+                    std::lock_guard lock(mutex_);
+                    planned_read = planned_mode_;
+                    if (planned_read)
+                    {
+                        planned_buffer = acquire_planned_buffer_locked(size);
+                    }
+                }
+#endif
+                std::vector<unsigned char> bytes;
+                void *read_buffer = nullptr;
+#ifdef SUP7Z_USE_PLANNED_IO
+                if (planned_read)
+                {
+                    if (!planned_buffer.data)
+                    {
+                        // new unsigned char[] default-initializes fundamental bytes:
+                        // no user-space zero-fill pass before ReadFile overwrites them.
+                        planned_buffer.data = std::shared_ptr<unsigned char[]>(
+                            new unsigned char[planned_buffer.capacity],
+                            std::default_delete<unsigned char[]>());
+                    }
+                    read_buffer = planned_buffer.data.get();
+                }
+                else
+#endif
+                {
+                    bytes.resize(size);
+                    read_buffer = bytes.data();
+                }
+
                 UInt32 read = 0;
-                const HRESULT result = reader_(offset, bytes.data(), size, &read);
+                const HRESULT result = reader_(offset, read_buffer, size, &read);
 
                 {
                     std::lock_guard lock(mutex_);
@@ -1370,14 +1462,35 @@ namespace sunpack::sevenzip
                     {
                         if (result == S_OK && read == size)
                         {
-                            chunk->bytes = std::move(bytes);
+#ifdef SUP7Z_USE_PLANNED_IO
+                            if (planned_read)
+                            {
+                                chunk->planned_buffer = std::move(planned_buffer);
+                            }
+                            else
+#endif
+                            {
+                                chunk->bytes = std::move(bytes);
+                            }
                             chunk->state = ChunkState::Ready;
                         }
                         else
                         {
+#ifdef SUP7Z_USE_PLANNED_IO
+                            if (planned_read)
+                            {
+                                recycle_planned_buffer_locked(std::move(planned_buffer));
+                            }
+#endif
                             chunk->state = ChunkState::Failed;
                         }
                     }
+#ifdef SUP7Z_USE_PLANNED_IO
+                    else if (planned_read)
+                    {
+                        recycle_planned_buffer_locked(std::move(planned_buffer));
+                    }
+#endif
                 }
                 ready_.notify_all();
             }
@@ -1398,6 +1511,7 @@ namespace sunpack::sevenzip
         UInt64 next_offset_ = 0;
 #ifdef SUP7Z_USE_PLANNED_IO
         PlannedPrefetchConfig planned_config_;
+        std::vector<PlannedBuffer> planned_free_buffers_;
         std::vector<PlannedRange> plan_;
         std::vector<PlannedCursor> planned_cursors_;
         UInt64 next_planned_cursor_id_ = 0;
