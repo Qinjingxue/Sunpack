@@ -18,9 +18,6 @@ namespace NCompress {
 namespace NRar5 {
 
 class CBitDecoder;
-#ifndef Z7_ST
-class CRar5MtContext;
-#endif
 
 struct CFilter
 {
@@ -57,20 +54,11 @@ Z7_CLASS_IMP_NOQIB_3(
   , ICompressSetCoderMt
 )
 #else
-#ifndef Z7_ST
-Z7_CLASS_IMP_NOQIB_3(
-  CDecoder
-  , ICompressCoder
-  , ICompressSetDecoderProperties2
-  , ICompressSetCoderMt
-)
-#else
 Z7_CLASS_IMP_NOQIB_2(
   CDecoder
   , ICompressCoder
   , ICompressSetDecoderProperties2
 )
-#endif
 #endif
   bool _useAlignBits;
   bool _isLastBlock;
@@ -124,10 +112,6 @@ Z7_CLASS_IMP_NOQIB_2(
   ISequentialOutStream *_outStream;
   ICompressProgressInfo *_progress;
   Byte *_inputBuf;
-#ifndef Z7_ST
-  UInt32 _numThreads;
-  friend class CRar5MtContext;
-#endif
 
 #ifndef Z7_ST
   UInt32 _numThreads;
@@ -152,9 +136,6 @@ Z7_CLASS_IMP_NOQIB_2(
   HRESULT ReadTables(CBitDecoder &_bitStream);
   HRESULT DecodeLZ2(const CBitDecoder &_bitStream) throw();
   HRESULT DecodeLZ();
-#ifndef Z7_ST
-  HRESULT DecodeLZParallel();
-#endif
   HRESULT CodeReal();
 #ifndef Z7_ST
   HRESULT DecodeLZParallel();
