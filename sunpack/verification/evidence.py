@@ -23,7 +23,6 @@ class VerificationEvidence:
     output_dir: str
     password: str | None
     fact_bag: Any
-    analysis: dict[str, Any]
     analysis_facts: dict[str, Any] = field(default_factory=dict)
     archive_state_analysis: dict[str, Any] = field(default_factory=dict)
     extraction_diagnostics: dict[str, Any] = field(default_factory=dict)
@@ -80,7 +79,6 @@ def build_verification_evidence(
         output_dir=extraction_result.out_dir,
         password=password,
         fact_bag=fact_bag,
-        analysis=knowledge_view.resource_analysis(task),
         analysis_facts=analysis_facts,
         archive_state_analysis=dict(archive_state.analysis or {}),
         extraction_diagnostics=extraction_diagnostics,

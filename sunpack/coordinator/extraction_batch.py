@@ -266,13 +266,11 @@ class ExtractionBatchRunner:
             _index, _task, out_dir, result = inspected
             if result.skip_result is not None:
                 return out_dir, BatchExtractionOutcome(result.skip_result)
-            guard_enabled = bool(self._resource_guard_config().get("enabled", False))
-            if guard_enabled or knowledge_view.resource_analysis(task):
+            if knowledge_view.resource_analysis(task):
                 self.resource_inspector.inspect(task)
             else:
                 self.resource_inspector.record_estimated_single_task_profile(task)
-            guarded = self._resource_guard_results([task], output_dir_resolver)
-            return out_dir, guarded[0][1] if guarded else None
+            return out_dir, None
 
         retried_missing_volume = False
         while True:
@@ -437,55 +435,6 @@ class ExtractionBatchRunner:
 
         return resolve
 
-    def _resource_guard_results(self, tasks: list[ArchiveTask], output_dir_resolver) -> list[tuple[ArchiveTask, BatchExtractionOutcome]]:
-        guard = self._resource_guard_config()
-        if not guard or not bool(guard.get("enabled", False)):
-            return []
-        results: list[tuple[ArchiveTask, BatchExtractionOutcome]] = []
-        for task in tasks:
-            analysis = knowledge_view.resource_analysis(task)
-            if not isinstance(analysis, dict):
-                continue
-            violations = _resource_guard_violations(analysis, guard)
-            if not violations:
-                continue
-            guard_payload = {
-                "status": "guarded",
-                "violations": violations,
-                "policy": {
-                    "max_file_count": guard.get("max_file_count"),
-                    "max_total_unpacked_size": guard.get("max_total_unpacked_size"),
-                    "max_largest_item_size": guard.get("max_largest_item_size"),
-                    "max_compression_ratio": guard.get("max_compression_ratio"),
-                },
-            }
-            task.fact_bag.set("resource.guard", guard_payload)
-            out_dir = output_dir_resolver(task)
-            result = ExtractionResult(
-                success=False,
-                archive=task.main_path,
-                out_dir=out_dir,
-                all_parts=task.all_parts,
-                error="resource_guard",
-                diagnostics={
-                    "result": {
-                        "status": "failed",
-                        "native_status": "guarded",
-                        "failure_stage": "preflight",
-                        "failure_kind": "resource_guard",
-                        "guard_status": "guarded",
-                        "resource_guard": guard_payload,
-                    }
-                },
-            )
-            results.append((task, BatchExtractionOutcome(result=result)))
-        return results
-
-    def _resource_guard_config(self) -> dict:
-        performance = self.config.get("performance") if isinstance(self.config.get("performance"), dict) else {}
-        guard = performance.get("resource_guard") if isinstance(performance.get("resource_guard"), dict) else {}
-        return dict(guard)
-
     def _inspect_tasks_before_extract(self, tasks: list[ArchiveTask], output_dir_resolver) -> list[tuple[int, ArchiveTask, str, Any]]:
         results = []
         for index, task in enumerate(tasks):
@@ -493,10 +442,6 @@ class ExtractionBatchRunner:
             out_dir = output_dir_resolver(task)
             results.append((index, task, out_dir, self.extractor.inspect(task, out_dir)))
         return results
-
-    def _inspect_resource_profiles(self, tasks: list[ArchiveTask]) -> None:
-        for task in tasks:
-            self.resource_inspector.inspect(task)
 
     def _extract_verify_state_machine(
         self,
@@ -796,55 +741,6 @@ def _nested_diagnostic_payloads(result: ExtractionResult):
         seen.add(marker)
         yield payload
         pending.extend(value for value in payload.values() if isinstance(value, dict))
-
-
-def _resource_guard_violations(analysis: dict[str, Any], guard: dict[str, Any]) -> list[dict[str, Any]]:
-    checks = [
-        ("file_count", "max_file_count"),
-        ("item_count", "max_item_count"),
-        ("total_unpacked_size", "max_total_unpacked_size"),
-        ("largest_item_size", "max_largest_item_size"),
-    ]
-    violations: list[dict[str, Any]] = []
-    for field, limit_key in checks:
-        limit = _optional_positive_int(guard.get(limit_key))
-        if limit is None:
-            continue
-        actual = _safe_int(analysis.get(field))
-        if actual > limit:
-            violations.append({"field": field, "limit": limit, "actual": actual})
-    ratio_limit = _optional_positive_float(guard.get("max_compression_ratio"))
-    if ratio_limit is not None:
-        unpacked = _safe_int(analysis.get("total_unpacked_size"))
-        packed = _safe_int(analysis.get("total_packed_size") or analysis.get("archive_size"))
-        if packed > 0:
-            ratio = unpacked / packed
-            if ratio > ratio_limit:
-                violations.append({"field": "compression_ratio", "limit": ratio_limit, "actual": ratio})
-    return violations
-
-
-def _optional_positive_int(value: Any) -> int | None:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _optional_positive_float(value: Any) -> float | None:
-    try:
-        parsed = float(value)
-    except (TypeError, ValueError):
-        return None
-    return parsed if parsed > 0 else None
-
-
-def _safe_int(value: Any) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
 
 
 def _coverage_payload(verification: VerificationResult) -> dict[str, Any]:

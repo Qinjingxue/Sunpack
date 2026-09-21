@@ -2,7 +2,6 @@ import os
 from typing import Any
 
 from sunpack.config.advanced_defaults import advanced_named_config
-from sunpack.support.sevenzip_bridge import STATUS_DAMAGED, STATUS_OK
 from sunpack.verification.archive_state_manifest import ArchiveStateManifest, archive_state_manifest_for_evidence
 from sunpack.verification.evidence import VerificationEvidence
 from sunpack.verification.methods._archive_output_match import (
@@ -28,18 +27,9 @@ from sunpack.contracts.verification import (
     VerificationIssue,
     VerificationStepResult,
 )
-from sunpack.support import archive_knowledge_projection as knowledge_view
 from sunpack.support.path_names import clean_relative_archive_path, normalize_match_name, normalize_match_path
 
 
-NAME_FIELDS = (
-    "expected_names",
-    "manifest_names",
-    "item_names",
-    "file_names",
-    "path_samples",
-    "paths",
-)
 
 
 @register_verification_method("expected_name_presence")
@@ -52,7 +42,7 @@ class ExpectedNamePresenceMethod:
             evidence,
             max_items=max(1, int(config.get("max_expected_names", 50) or 50)),
         )
-        expected_names = self._expected_names(evidence, config, state_manifest)
+        expected_names = self._expected_names(config, state_manifest)
         if not expected_names:
             return VerificationStepResult(method=self.name, status="skipped")
 
@@ -107,7 +97,7 @@ class ExpectedNamePresenceMethod:
                     message="Expected archive names were matched against extraction output",
                     path=evidence.output_dir,
                     expected=len(expected_names),
-                    actual=_coverage_actual(coverage, state_manifest, evidence),
+                    actual=_coverage_actual(coverage, state_manifest),
                 )],
             )
 
@@ -136,7 +126,7 @@ class ExpectedNamePresenceMethod:
                 "matched": matched,
                 "missing": missing,
                 "missing_ratio": round(missing_ratio, 3),
-                "coverage": _coverage_actual(coverage, state_manifest, evidence),
+                "coverage": _coverage_actual(coverage, state_manifest),
             },
         )
         content_integrity = _content_integrity_hint(state_manifest)
@@ -148,20 +138,19 @@ class ExpectedNamePresenceMethod:
             recoverable_upper_bound_hint=coverage.completeness,
             content_integrity_hint=(
                 CONTENT_INTEGRITY_VERIFIED_PARTIAL
-                if _expected_names_are_strong(evidence, config, content_integrity, state_manifest)
+                if _expected_names_are_strong(config, content_integrity, state_manifest)
                 else content_integrity
             ),
             verification_strength=VERIFICATION_STRENGTH_MANIFEST,
             total_item_count=int(getattr(state_manifest, "item_count", 0) or 0),
             verified_item_count=int(getattr(state_manifest, "verified_item_count", 0) or 0),
             archive_walk_complete=bool(getattr(state_manifest, "archive_walk_complete", False)),
-            decision_hint=DECISION_RETRY_EXTRACT if _expected_names_are_strong(evidence, config, content_integrity, state_manifest) else DECISION_NONE,
+            decision_hint=DECISION_RETRY_EXTRACT if _expected_names_are_strong(config, content_integrity, state_manifest) else DECISION_NONE,
             file_observations=coverage.observations,
         )
 
     def _expected_names(
         self,
-        evidence: VerificationEvidence,
         config: dict,
         state_manifest: ArchiveStateManifest | None = None,
     ) -> list[str]:
@@ -169,12 +158,6 @@ class ExpectedNamePresenceMethod:
         candidates = list(_iter_name_values(configured))
         if not candidates and state_manifest is not None and state_manifest.ok:
             candidates.extend(state_manifest.expected_names)
-        if not candidates:
-            analysis = _merged_analysis(evidence)
-            for field in NAME_FIELDS:
-                candidates.extend(_iter_name_values(analysis.get(field)))
-        if not candidates:
-            candidates.extend(_iter_name_values(knowledge_view.get(evidence.task, "verification.expected_names", [])))
 
         max_names = max(1, int(config.get("max_expected_names", 50) or 50))
         names = []
@@ -225,7 +208,6 @@ def _content_integrity_hint(state_manifest: ArchiveStateManifest | None = None) 
 
 
 def _expected_names_are_strong(
-    evidence: VerificationEvidence,
     config: dict,
     content_integrity: str,
     state_manifest: ArchiveStateManifest | None = None,
@@ -234,25 +216,14 @@ def _expected_names_are_strong(
         return True
     if state_manifest is not None and state_manifest.ok and state_manifest.expected_names:
         return True
-    source = str(config.get("expected_names_source") or _merged_analysis(evidence).get("expected_names_source") or "")
-    if source in {"user", "central_directory", "manifest"}:
-        return True
     return content_integrity == CONTENT_INTEGRITY_VERIFIED_COMPLETE
 
 
-def _merged_analysis(evidence: VerificationEvidence) -> dict[str, Any]:
-    merged: dict[str, Any] = {}
-    for payload in (evidence.archive_state_analysis, evidence.analysis_facts, evidence.analysis):
-        if isinstance(payload, dict):
-            merged.update(payload)
-    return merged
-
-
-def _coverage_actual(coverage, state_manifest: ArchiveStateManifest | None, evidence: VerificationEvidence) -> dict[str, Any]:
+def _coverage_actual(coverage, state_manifest: ArchiveStateManifest | None) -> dict[str, Any]:
     actual = coverage_details(coverage)
     actual.update({
         "source_manifest": True,
         "archive_type": state_manifest.archive_type if state_manifest is not None else "",
-        "manifest_source": state_manifest.source if state_manifest is not None and state_manifest.ok else "analysis_or_config",
+        "manifest_source": state_manifest.source if state_manifest is not None and state_manifest.ok else "configured",
     })
     return actual

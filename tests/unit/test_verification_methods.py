@@ -61,10 +61,10 @@ def test_output_presence_reports_missing_or_empty_output_as_unusable(tmp_path):
 
 
 def test_manifest_size_match_reports_complete_when_expected_size_matches(tmp_path):
+    task = _zip_task(tmp_path, {"a.txt": "hello"})
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     (out_dir / "a.txt").write_text("hello", encoding="utf-8")
-    task = _task(tmp_path, {"file_count": 1, "total_unpacked_size": 5})
     result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
 
     verification = _scheduler([{"name": "manifest_size_match"}]).verify(task, result)
@@ -75,13 +75,19 @@ def test_manifest_size_match_reports_complete_when_expected_size_matches(tmp_pat
 
 
 def test_manifest_size_match_reports_retry_for_large_manifest_gap(tmp_path):
+    task = _zip_task(tmp_path, {f"file-{index}.txt": "x" * 10 for index in range(10)})
     out_dir = tmp_path / "out"
     out_dir.mkdir()
-    (out_dir / "a.txt").write_text("hello", encoding="utf-8")
-    task = _task(tmp_path, {"file_count": 10, "total_unpacked_size": 10 * 1024 * 1024})
+    (out_dir / "file-0.txt").write_text("x", encoding="utf-8")
     result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
 
-    verification = _scheduler([{"name": "manifest_size_match"}]).verify(task, result)
+    verification = _scheduler([{
+        "name": "manifest_size_match",
+        "file_count_abs_tolerance": 0,
+        "file_count_ratio_tolerance": 0.0,
+        "size_abs_tolerance_bytes": 0,
+        "size_ratio_tolerance": 0.0,
+    }]).verify(task, result)
 
     assert verification.decision_hint == "retry_extract"
     assert verification.assessment_status == "partial"
@@ -93,13 +99,10 @@ def test_manifest_size_match_reports_retry_for_large_manifest_gap(tmp_path):
 
 
 def test_expected_name_presence_reports_missing_entries(tmp_path):
+    task = _zip_task(tmp_path, {"expected.txt": "one", "missing.bin": "two"})
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     (out_dir / "actual.txt").write_text("hello", encoding="utf-8")
-    task = _task(tmp_path, {
-        "expected_names": ["expected.txt", "missing.bin"],
-        "expected_names_source": "manifest",
-    })
     result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
 
     verification = _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
@@ -176,25 +179,6 @@ def test_oracle_expected_output_match_skips_without_oracle_expected_files(tmp_pa
     assert verification.methods_run == ["oracle_expected_output_match"]
     assert verification.archive_coverage.expected_files == 0
     assert verification.steps[0].status == "skipped"
-
-
-def test_expected_name_presence_weak_damaged_source_sets_recoverable_upper_bound(tmp_path):
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    (out_dir / "present.txt").write_text("hello", encoding="utf-8")
-    task = _task(tmp_path, {
-        "status": "damaged",
-        "expected_names": ["present.txt", "maybe-missing.bin"],
-        "expected_names_source": "local_header_recovery",
-    })
-    result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
-
-    verification = _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
-
-    assert verification.content_integrity == "unknown"
-    assert verification.completeness == 0.5
-    assert verification.recoverable_upper_bound == 0.5
-    assert verification.decision_hint == "accept_partial"
 
 
 def test_archive_test_crc_compares_archive_state_manifest_to_output_files(tmp_path):
@@ -331,17 +315,12 @@ def test_output_presence_uses_worker_manifest_progress_as_completeness(tmp_path)
     assert round(verification.archive_coverage.completeness, 3) == 0.5
 
 
-def _task(tmp_path, analysis=None, oracle=None):
+def _task(tmp_path, oracle=None):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"zip")
     bag = FactBag()
     task = ArchiveTask(fact_bag=bag, key="sample", main_path=str(archive), all_parts=[str(archive)])
     knowledge = task.knowledge()
-    if analysis is not None:
-        knowledge.set("resource.analysis", analysis, source_layer="test", source_module="fixture")
-        knowledge.set("inspection.prepass", analysis, source_layer="test", source_module="fixture")
-        if analysis.get("expected_names"):
-            knowledge.set("verification.expected_names", analysis["expected_names"], source_layer="test", source_module="fixture")
     if oracle is not None:
         knowledge.set("verification.oracle", oracle, source_layer="test", source_module="fixture")
     task.set_knowledge(knowledge)
@@ -355,3 +334,17 @@ def _scheduler(methods):
             "methods": methods,
         }
     })
+
+
+def _zip_task(tmp_path, entries):
+    archive = tmp_path / "sample.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        for name, payload in entries.items():
+            zf.writestr(name, payload)
+    return ArchiveTask(
+        fact_bag=FactBag(),
+        key="sample",
+        main_path=str(archive),
+        all_parts=[str(archive)],
+        detected_ext="zip",
+    )

@@ -844,8 +844,8 @@ def _coverage_confidence(source: dict) -> float:
     if source.get("code") == "info.archive_output_coverage":
         return 0.95
     if source.get("code") == "info.expected_name_coverage":
-        manifest_source = str(source.get("manifest_source") or source.get("expected_names_source") or "")
-        if manifest_source in {"analysis_or_config", "damaged_scan"}:
+        manifest_source = str(source.get("manifest_source") or "")
+        if manifest_source == "configured":
             return 0.6
         return 0.8
     if source.get("code") == "info.output_progress_coverage":
