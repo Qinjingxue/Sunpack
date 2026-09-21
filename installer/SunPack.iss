@@ -131,6 +131,8 @@ Name: "{autoprograms}\SunPack\Uninstall SunPack"; Filename: "{uninstallexe}"
 [UninstallRun]
 Filename: "{app}\sunpack-runtime.exe"; Parameters: "--configure-startup-current-user disable"; RunOnceId: "SunPackStartup"; Flags: runhidden waituntilterminated skipifdoesntexist
 Filename: "{app}\sunpack-runtime.exe"; Parameters: "--unregister-toast"; RunOnceId: "SunPackToast"; Flags: runhidden waituntilterminated skipifdoesntexist
+Filename: "{app}\sunpack.exe"; Parameters: "--persistent-shutdown"; RunOnceId: "SunPackFinalRuntimeShutdown"; Flags: runhidden waituntilterminated skipifdoesntexist
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\wait_sunpack_runtime_exit.ps1"" -CliAppPath ""{app}\sunpack.exe"" -RuntimeAppPath ""{app}\sunpack-runtime.exe"" -TimeoutSeconds 20"; RunOnceId: "SunPackFinalRuntimeWait"; Flags: runhidden waituntilterminated
 
 [Code]
 const

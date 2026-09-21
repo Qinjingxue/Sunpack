@@ -277,6 +277,8 @@ def test_optional_component_failures_abort_the_install():
 
 def test_uninstaller_stops_running_watch_before_removing_files():
     script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
+    build = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+    wait_script = (ROOT / "scripts" / "wait_sunpack_runtime_exit.ps1").read_text(encoding="utf-8")
 
     assert "function InitializeUninstall(): Boolean" in script
     assert "function WaitForExistingRuntimesToExit: Boolean" in script
@@ -293,6 +295,25 @@ def test_uninstaller_stops_running_watch_before_removing_files():
     assert "ExpandConstant('{app}\\sunpack.exe')" in script
     assert "$deadline = (Get-Date).AddSeconds(20)" in script
     assert "Start-Sleep -Milliseconds 250" in script
+
+    uninstall_run = script[script.index("[UninstallRun]"):]
+    uninstall_run = uninstall_run[:uninstall_run.index("\n[Code]")]
+    startup = uninstall_run.index('Parameters: "--configure-startup-current-user disable"')
+    toast = uninstall_run.index('Parameters: "--unregister-toast"')
+    shutdown = uninstall_run.index('Parameters: "--persistent-shutdown"')
+    wait = uninstall_run.index("wait_sunpack_runtime_exit.ps1")
+    assert startup < toast < shutdown < wait
+    assert 'RunOnceId: "SunPackFinalRuntimeShutdown"' in uninstall_run
+    assert 'RunOnceId: "SunPackFinalRuntimeWait"' in uninstall_run
+
+    assert (
+        'Copy-Item -LiteralPath (Join-Path $repoRoot "scripts\\wait_sunpack_runtime_exit.ps1") '
+        '-Destination (Join-Path $distScriptsRoot "wait_sunpack_runtime_exit.ps1") -Force'
+    ) in build
+    assert "Get-Process -ErrorAction SilentlyContinue" in wait_script
+    assert "[System.StringComparison]::OrdinalIgnoreCase" in wait_script
+    assert "(Get-Date).AddSeconds($TimeoutSeconds)" in wait_script
+    assert "Start-Sleep -Milliseconds 250" in wait_script
 
 
 def test_uninstaller_removes_all_program_data():
