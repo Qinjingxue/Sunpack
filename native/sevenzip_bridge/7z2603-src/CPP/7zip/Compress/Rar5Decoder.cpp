@@ -2815,8 +2815,9 @@ HRESULT CDecoder::DecodeLZParallel()
     }
     _isLastBlock = job.LastBlock;
 
+    const size_t decodedSize = job.Decoded.size();
     size_t decodedIndex = 0;
-    while (decodedIndex < job.Decoded.size())
+    while (decodedIndex < decodedSize)
     {
       // Normalize once per boundary segment. Tokens inside the segment only
       // pay the cheap winPos/limit check until one reaches the write boundary.
@@ -2873,7 +2874,7 @@ HRESULT CDecoder::DecodeLZParallel()
         return E_FAIL;
       }
       }
-      while (decodedIndex < job.Decoded.size() && winPos < limit);
+      while (decodedIndex < decodedSize && winPos < limit);
     }
 
     _winPos = winPos;
