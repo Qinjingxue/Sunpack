@@ -25,6 +25,7 @@ sunpack.exe <command> [options] [paths...]
 | `passwords` | 查看当前命令可用的密码来源汇总。 |
 | `config` | 查看或校验合并后的有效配置。 |
 | `doctor` | 只读检查配置和运行环境。 |
+| `version` | 输出当前安装的 SunPack 版本号。 |
 
 ## 通用输出参数
 
@@ -253,6 +254,16 @@ python sunpack.py doctor [--json] [--quiet]
 ```
 
 `doctor` 只读检查配置、原生扩展、`7z.dll`、SevenZip worker、Windows 通知能力以及已配置的监控根。不存在的监控根报告为警告；命令不会启动持续监控或真实解压，也不会修改注册表。存在失败项时退出码为 `1`，只有警告或跳过项时退出码为 `0`。
+
+## version
+
+用法：
+
+```powershell
+python sunpack.py version
+```
+
+`version` 读取当前运行的 SunPack 可执行文件同目录下的 `VERSION.txt`，并输出 `version=` 后的版本号。打包后的程序也可直接使用 `sunpack.exe version`。
 
 ## Windows 右键菜单
 

@@ -25,6 +25,7 @@ Top-level commands:
 | `passwords` | Show a summary of the password sources available to the current command. |
 | `config` | Show or validate the merged effective configuration. |
 | `doctor` | Read-only check of configuration and runtime environment. |
+| `version` | Print the installed SunPack version. |
 
 ## Common output options
 
@@ -253,6 +254,16 @@ python sunpack.py doctor [--json] [--quiet]
 ```
 
 `doctor` performs a read-only check of the configuration, the native extension, `7z.dll`, the SevenZip worker, Windows notification capability, and the configured monitored roots. A monitored root that does not exist is reported as a warning; the command never starts continuous monitoring or a real extraction, and never modifies the registry. The exit code is `1` when any check fails, and `0` when there are only warnings or skipped items.
+
+## version
+
+Usage:
+
+```powershell
+python sunpack.py version
+```
+
+`version` reads `VERSION.txt` next to the running SunPack executable and prints the value after `version=`. The packaged executable can also be invoked as `sunpack.exe version`.
 
 ## Windows context menu
 
