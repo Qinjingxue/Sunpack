@@ -85,6 +85,7 @@ namespace sunpack::sevenzip
         std::uint64_t activity_session = 0;
         std::uint64_t saturated_segment = 0;
         bool warm_start_used = false;
+        bool accepted_probe = false;
         bool resource_diagnostics_enabled = false;
         bool cpu_percent_valid = false;
         double cpu_percent = 0.0;
@@ -207,6 +208,7 @@ namespace sunpack::sevenzip
             double elapsed_seconds = 0.0) noexcept
         {
             decision_ = NativeControllerDecision::None;
+            accepted_probe_ = false;
             bool changed = false;
             if (load_state_ == NativeLoadState::Idle)
             {
@@ -310,6 +312,7 @@ namespace sunpack::sevenzip
                 activity_session_,
                 saturated_segment_,
                 warm_start_used_,
+                accepted_probe_,
                 resource_diagnostics_enabled_,
                 diagnostic_cpu_valid_,
                 diagnostic_cpu_percent_,
@@ -378,6 +381,7 @@ namespace sunpack::sevenzip
             }
             load_state_ = NativeLoadState::Idle;
             warm_start_used_ = false;
+            accepted_probe_ = false;
             prime_counters(counters);
             reset_learning_state();
             decision_ = NativeControllerDecision::ActivityEnded;
@@ -799,6 +803,7 @@ namespace sunpack::sevenzip
                 best_limit_ = probe_limit_;
                 active_limit_ = best_limit_;
                 remember_confirmed_limit(best_limit_);
+                accepted_probe_ = true;
                 anchor_ = probe_measurement_;
                 reset_stable_trend();
                 decision_ = NativeControllerDecision::Accepted;
@@ -816,6 +821,7 @@ namespace sunpack::sevenzip
                 best_limit_ = probe_limit_;
                 active_limit_ = best_limit_;
                 remember_confirmed_limit(best_limit_);
+                accepted_probe_ = true;
                 anchor_ = probe_measurement_;
                 reset_stable_trend();
                 decision_ = NativeControllerDecision::Accepted;
@@ -978,6 +984,7 @@ namespace sunpack::sevenzip
         std::size_t last_good_limit_ = 1;
         std::size_t confirmed_limit_samples_ = 0;
         bool warm_start_used_ = false;
+        bool accepted_probe_ = false;
 
         NativeThroughputMode stable_trend_mode_ = NativeThroughputMode::None;
         double stable_fast_log_rate_ = 0.0;
