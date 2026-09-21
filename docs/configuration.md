@@ -237,6 +237,7 @@ Automatic concurrency is driven mainly by the throughput of actual writes, compl
 | `runtime_cache_cleanup_idle_seconds` | `10.0` | Shared idle-maintenance delay. At this deadline a CLI process-mode override expires; runtime caches are also cleared when `runtime_cache_cleanup_enabled` is true. |
 | `password_retry_debounce_seconds` | `0.5` | Wait time before triggering a retry of failed jobs after the password file or clipboard changes. |
 | `password_retry_include_subtree` | `true` | Whether a password source change retries the subtree tasks of the corresponding directory. |
+| `directory_password_file_auto_create` | `true` | Whether Watch automatically creates `sunpack-passwords.txt` in each monitored directory. Existing files are still used when this is `false`. |
 | `clipboard_monitor_enabled` | `true` | Whether to monitor clipboard password changes. |
 | `clipboard_builtin_max_entries` | `30` | Number of clipboard passwords to keep. |
 | `enabled` | `false` | Configuration-layer marker; the actual running state of the CLI service is managed by `watch start` and `watch stop`. |
@@ -268,7 +269,7 @@ The output root may be on a different drive. Complete output, partial output, an
 | `directory_passwords_max_file_bytes` | `1048576` | Maximum read size of the per-directory password file. |
 | `directory_passwords_max_password_length` | `512` | Maximum length of a single password. |
 
-The per-directory password file is named `.sunpack-passwords.txt`, one password per line. During archive extraction, candidate sources are merged and deduplicated in the order "most recent successful password → per-directory passwords → CLI arguments and password files → clipboard → built-in passwords"; while the archive's encryption state is still undetermined, the empty password may also be tried as the first candidate. `--no-builtin-pw` and `--no-dir-pw` disable built-in passwords and per-directory passwords respectively.
+The per-directory password file is named `sunpack-passwords.txt`, one password per line. During archive extraction, candidate sources are merged and deduplicated in the order "most recent successful password → per-directory passwords → CLI arguments and password files → clipboard → built-in passwords"; while the archive's encryption state is still undetermined, the empty password may also be tried as the first candidate. `--no-builtin-pw` and `--no-dir-pw` disable built-in passwords and per-directory passwords respectively.
 
 ## extraction
 
@@ -387,7 +388,7 @@ Default rules:
 
 ## Password table and password files
 
-`builtin_passwords.txt` stores one built-in password per line; when the file is missing, the program tries to create a default file. The per-directory password file is `.sunpack-passwords.txt`, subject to the size and length limits of the `passwords` configuration section.
+`builtin_passwords.txt` stores one built-in password per line; when the file is missing, the program tries to create a default file. The per-directory password file is `sunpack-passwords.txt`, subject to the size and length limits of the `passwords` configuration section.
 
 ## Tuning suggestions
 
