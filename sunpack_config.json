@@ -5,6 +5,9 @@
   "runtime": {
     "process_mode": "high"
   },
+  "watch": {
+    "directory_password_file_auto_create": true
+  },
   "recursive_extract": "*",
   "nested_extraction_policy": {
     "enabled": true,
