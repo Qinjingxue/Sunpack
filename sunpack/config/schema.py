@@ -81,7 +81,7 @@ def validate_external_config(payload: dict[str, Any]) -> list[str]:
     worker = performance.get("worker") if isinstance(performance, dict) else None
     if isinstance(worker, dict) and "profile" in worker:
         errors.append(
-            "performance.worker.profile was removed; native worker sizing is derived from CPU and available memory"
+            "performance.worker.profile was removed; native worker sizing is derived from CPU capacity"
         )
     for field in config_fields().values():
         try:

@@ -175,7 +175,7 @@ Foreground `extract`, `scan`, and `inspect` requests temporarily override this b
 
 ## performance
 
-Both resource analysis and worker parameters live under `performance`. Defaults are:
+Runtime and worker parameters live under `performance`. Defaults are:
 
 | Field | Default | Description |
 | --- | ---: | --- |
