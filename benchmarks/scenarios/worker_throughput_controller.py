@@ -693,7 +693,7 @@ def main() -> int:
                 "rows": len(rows),
                 "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
                 "controller_implementation": {
-                    "window": "minimum/maximum window with small job/file readiness",
+                    "window": "three native measurement windows aggregated per control observation",
                     "change_detector": "fast/slow log EWMA plus CUSUM inside native controller",
                     "probe_verification": "A-B-A with contamination gate",
                 },
