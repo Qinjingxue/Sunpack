@@ -13,7 +13,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -149,6 +149,8 @@ def _run_batch(
     submission_offsets_seconds: list[float] | None = None,
     idle_before_indices: dict[int, float] | None = None,
     worker_config_overrides: dict[str, Any] | None = None,
+    controller_event_hook: Callable[[dict[str, Any]], None] | None = None,
+    controller_event_poll_seconds: float = 0.01,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     jobs = int(corpus["jobs"])
     jobs_per_client = jobs // client_count
@@ -179,6 +181,32 @@ def _run_batch(
         None,
         worker_config,
     )
+    controller_hook_stop = threading.Event()
+    controller_hook_thread: threading.Thread | None = None
+    delivered_controller_events = 0
+
+    def drain_controller_events() -> None:
+        nonlocal delivered_controller_events
+        if controller_event_hook is None:
+            return
+        current = worker.controller_events()
+        pending = current[delivered_controller_events:]
+        delivered_controller_events = len(current)
+        for event in pending:
+            controller_event_hook(event)
+
+    if controller_event_hook is not None:
+        def poll_controller_events() -> None:
+            while not controller_hook_stop.wait(max(0.001, float(controller_event_poll_seconds))):
+                drain_controller_events()
+            drain_controller_events()
+
+        controller_hook_thread = threading.Thread(
+            target=poll_controller_events,
+            name=f"controller-hook-{label}",
+            daemon=True,
+        )
+        controller_hook_thread.start()
     worker_process = psutil.Process(worker.process.pid) if worker.process is not None else None
     sampler = ProcessSampler(interval_seconds=0.01)
     sampler.start()
@@ -287,6 +315,10 @@ def _run_batch(
                     raise RuntimeError(f"native worker exited with {jobs - len(completed)} incomplete jobs")
         finished_at = time.perf_counter()
     finally:
+        controller_hook_stop.set()
+        if controller_hook_thread is not None:
+            controller_hook_thread.join(timeout=1.0)
+        drain_controller_events()
         controller_events = worker.controller_events()
         resource_after = process_counters(worker_process)
         sampler.stop()

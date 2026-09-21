@@ -42,6 +42,7 @@ _ROWS = [
     ("extraction", "worker-multi-volume-write", "benchmarks.scenarios.worker_multi_volume_write", "Per-volume writer scheduling across two real physical disks."),
     ("extraction", "worker-volume-writer-scheduling", "benchmarks.scenarios.worker_volume_writer_scheduling", "Cross-volume versus same-volume writer scheduling with a paired control."),
     ("extraction", "worker-resource-pressure", "benchmarks.scenarios.worker_resource_pressure", "Real 7z CPU and IO contention."),
+    ("extraction", "worker-throughput-controller", "benchmarks.scenarios.worker_throughput_controller", "Oracle, adaptive, disturbance, and event-level probe-collision experiments."),
     ("extraction", "split-pressure", "benchmarks.scenarios.extraction_split_pressure", "Split and carrier archive matrix."),
 ]
 
