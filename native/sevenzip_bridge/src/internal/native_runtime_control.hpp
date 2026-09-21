@@ -230,6 +230,15 @@ namespace sunpack::sevenzip
             {
                 return changed;
             }
+            // Probe/verify samples are causal experiments: do not measure until the
+            // executor has actually reached the requested admission limit.
+            if ((phase_ == NativeControllerPhase::Probe ||
+                 phase_ == NativeControllerPhase::Verify) &&
+                active_jobs != active_limit_)
+            {
+                window_.clear();
+                return changed;
+            }
             if (settle_remaining_seconds_ > 0.0)
             {
                 settle_remaining_seconds_ = (std::max)(0.0, settle_remaining_seconds_ - elapsed_seconds);
@@ -587,8 +596,8 @@ namespace sunpack::sevenzip
             constexpr double slow_alpha = 0.125;
             stable_fast_log_rate_ += fast_alpha * (log_rate - stable_fast_log_rate_);
             stable_slow_log_rate_ += slow_alpha * (log_rate - stable_slow_log_rate_);
-            const double deadband = (std::max)(
-                std::log(improvement_ratio_), -std::log(regression_ratio_));
+            const double deadband = (std::max)(0.01, (std::max)(
+                std::log(improvement_ratio_), -std::log(regression_ratio_)));
             const double evidence = std::abs(stable_fast_log_rate_ - stable_slow_log_rate_) - deadband;
             stable_change_cusum_ = (std::max)(0.0, stable_change_cusum_ + evidence);
             return stable_change_cusum_ >= deadband * 3.0;
