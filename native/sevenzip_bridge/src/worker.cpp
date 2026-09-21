@@ -936,10 +936,22 @@ int run_request(
 
     auto last_progress_emit = std::chrono::steady_clock::now() - std::chrono::seconds(1);
     unsigned int coalesced_progress_events = 0;
+    bool extract_started = false;
     auto progress_mutex = std::make_shared<std::mutex>();
-    auto progress = [job_id, last_progress_emit, coalesced_progress_events, progress_mutex](const ExtractProgressEvent& event) mutable {
+    auto progress = [job_id, last_progress_emit, coalesced_progress_events, extract_started, progress_mutex](const ExtractProgressEvent& event) mutable {
             std::lock_guard<std::mutex> lock(*progress_mutex);
             const auto now = std::chrono::steady_clock::now();
+            if (!extract_started && event.completed_bytes > 0) {
+                extract_started = true;
+                print_json_line(
+                    "{\"type\":\"progress\",\"job_id\":\"" + json_escape(job_id) +
+                    "\",\"event\":\"extract_started\"" +
+                    ",\"completed_bytes\":" + std::to_string(event.completed_bytes) +
+                    ",\"total_bytes\":" + std::to_string(event.total_bytes) +
+                    ",\"item_index\":" + std::to_string(event.item_index) +
+                    ",\"item_path\":\"" + json_escape(wide_to_utf8(event.item_path)) +
+                    "\",\"coalesced_events\":" + std::to_string(coalesced_progress_events) + "}");
+            }
             const bool failure = event.event == "item_failed";
             const bool boundary = event.event == "total" ||
                 (event.event == "item_start" && event.item_index == 0) ||

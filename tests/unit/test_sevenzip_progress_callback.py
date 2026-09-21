@@ -37,4 +37,7 @@ def test_native_worker_progress_event_is_forwarded_to_task_callback(tmp_path):
     assert worker_result_payload(completed)["status"] == "ok"
     progress_events = completed.worker_diagnostics["progress_events"]
     assert progress_events
+    started = [event for event in progress_events if event.get("event") == "extract_started"]
+    assert len(started) == 1
+    assert int(started[0].get("completed_bytes") or 0) > 0
     assert events == [(task, event) for event in progress_events]

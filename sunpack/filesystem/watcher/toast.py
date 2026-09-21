@@ -207,9 +207,9 @@ class WatchToastCoordinator:
             if space_event in _SPACE_EVENTS:
                 self._space_progress_locked(request, task, space_event, event)
                 return
-            semantic_ready = event.get("type") == "semantic" and event.get("event") == "extract_ready"
+            extract_started = event.get("type") == "progress" and event.get("event") == "extract_started"
             task_id = id(task)
-            if semantic_ready:
+            if extract_started:
                 request.visible = True
                 request.tasks.setdefault(task_id, _TaskProgress(name=_task_name(task, request.source_path)))
                 self._ensure_batch_locked()

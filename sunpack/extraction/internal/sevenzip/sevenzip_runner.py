@@ -114,6 +114,7 @@ _KNOWN_JOB_EVENTS = frozenset(
         "job_admitted",
         "job_started",
         "job_finished",
+        "extract_started",
         "result",
         *_SPACE_EVENTS,
     }
