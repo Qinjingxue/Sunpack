@@ -268,6 +268,9 @@ Z7_CLASS_IMP_NOQIB_2(
 #endif
       {
         // Preserve forward-copy semantics for overlapping LZ matches.
+        // Prevent auto-vectorization from turning the ordered stores into an
+        // overlap-unsafe wide copy.
+        Z7_PRAGMA_OPT_DISABLE_LOOP_UNROLL_VECTORIZE
         while (len >= 8)
         {
           dest[0] = src[0];
