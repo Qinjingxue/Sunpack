@@ -7,6 +7,7 @@
 #ifndef ZIP7_INC_COMPRESS_RAR3_DECODER_H
 #define ZIP7_INC_COMPRESS_RAR3_DECODER_H
 
+#include "../../../C/CpuArch.h"
 #include "../../../C/Ppmd7.h"
 
 #include "../../Common/MyCom.h"
@@ -249,10 +250,48 @@ Z7_CLASS_IMP_NOQIB_2(
     {
       const Byte *src = window + pos;
       Byte *dest = window + winPos;
+      const UInt32 distance = dist + 1;
       _winPos += len;
-      do
+
+#ifdef MY_CPU_LE_UNALIGN_64
+      if (distance >= len)
+      {
+        while (len >= 8)
+        {
+          SetUi64(dest, GetUi64(src))
+          dest += 8;
+          src += 8;
+          len -= 8;
+        }
+      }
+      else
+#endif
+      {
+        // Preserve forward-copy semantics for overlapping LZ matches.
+        // Prevent auto-vectorization from turning the ordered stores into an
+        // overlap-unsafe wide copy.
+        Z7_PRAGMA_OPT_DISABLE_LOOP_UNROLL_VECTORIZE
+        while (len >= 8)
+        {
+          dest[0] = src[0];
+          dest[1] = src[1];
+          dest[2] = src[2];
+          dest[3] = src[3];
+          dest[4] = src[4];
+          dest[5] = src[5];
+          dest[6] = src[6];
+          dest[7] = src[7];
+          dest += 8;
+          src += 8;
+          len -= 8;
+        }
+      }
+
+      while (len != 0)
+      {
         *dest++ = *src++;
-      while (--len != 0);
+        len--;
+      }
       return;
     }
     do
