@@ -71,10 +71,10 @@ def _ready(coordinator, request_id, task):
         request_id,
         task,
         {
-            "type": "semantic",
-            "event": "extract_ready",
-            "completed_bytes": 0,
-            "total_bytes": 0,
+            "type": "progress",
+            "event": "extract_started",
+            "completed_bytes": 1,
+            "total_bytes": 100,
         },
     )
 
@@ -230,6 +230,30 @@ def test_failure_toast_does_not_interpret_nested_scope(tmp_path):
     report = Path(terminal[0].actions[-1].target).read_text(encoding="utf-8")
     assert "nested-inner.7z.001" in report
     assert "原因：内层归档缺少分卷" not in report
+    coordinator.stop()
+
+
+def test_extract_ready_stays_invisible_until_native_extract_started(tmp_path):
+    host = _Host()
+    coordinator = WatchToastCoordinator(host, _config(debounce_ms=0), str(tmp_path / "state"))
+    task = _task(tmp_path / "archive.zip")
+    coordinator.submitted("request", str(task.main_path))
+
+    coordinator.progress(
+        "request",
+        task,
+        {
+            "type": "semantic",
+            "event": "extract_ready",
+            "completed_bytes": 0,
+            "total_bytes": 0,
+        },
+    )
+    assert host.snapshots == []
+
+    _ready(coordinator, "request", task)
+    assert host.snapshots
+    assert host.snapshots[-1].kind == ToastSnapshotKind.PROGRESS
     coordinator.stop()
 
 
