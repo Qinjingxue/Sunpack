@@ -87,3 +87,127 @@ pressure_duration_seconds ≈ 0.735–0.739
 python -m benchmarks extraction worker-throughput-controller --capacities 1,2,4,8,16 --oracle-runs 5 --adaptive-runs 3
 ```
 
+## 6. 继续实验：细粒度 oracle、长时噪声与 Hold 被动注入
+
+本节是同一工作日对上面结论的追加实验。所有追加批次均为 `all_passed=true`，没有发现解压正确性回归。
+
+### 6.1 细粒度固定并发 oracle
+
+CPU 扫描了 N=1..12、16；IO 扫描了 N=1..12、16，每点 5 次。局部梯度按 `g_N = T(N+1)/T(N)-1` 计算。中位吞吐如下，单位 MiB/s：
+
+| workload | N=1 | N=2 | N=3 | N=4 | N=5 | N=6 | N=7 | N=8 | N=9 | N=10 | N=11 | N=12 | N=16 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| CPU-heavy | 1359.7 | 2150.7 | 2291.6 | 2325.8 | 2392.9 | 2340.2 | 2363.6 | 2379.0 | 2390.2 | 2396.6 | 2409.9 | 2402.4 | 2403.1 |
+| IO-heavy | 2251.4 | 2578.7 | 2420.8 | 2438.3 | 2448.2 | 2716.2 | 2860.3 | 2459.8 | 2469.5 | 2467.8 | 2719.9 | 2648.2 | 2453.3 |
+
+CPU 的梯度在 N=2 后迅速下降：`g_2≈+6.5%`、`g_3≈+1.5%`、`g_4≈+2.9%`，N=7 之后大多是 ±1% 级。IO 的 N=6、7、11 出现不连续跃升，且 N=7 之后又回落；这不符合平滑的并发收益曲线，更像缓存、后台负载或存储状态污染。因此这轮细扫得到的 CPU 98% 平台 `{5,7,8,9,10,11,12,16}` 和 IO 单点平台 `{7}` 不能替代上一轮 formal oracle，只能证明当前实验环境的固定点噪声足以改变平台判定。
+
+### 6.2 固定 N 的窗口噪声
+
+使用 512 个 job 把 CPU N=4/N=8 和 IO N=4 拉长到约 10–28 秒，并打开 native resource diagnostics。固定模式下 controller trace 的 `throughput_mode` 不会填充完整 throughput 窗口值，因此本节使用同一事件采样流中的 `io_write_bytes_per_second` 作为写入吞吐代理；这是一项明确的测量限制，不把它冒充为正式 controller throughput。
+
+相邻采样的 `log(T_t/T_{t-1})` 绝对值分位数为：
+
+| workload / N | p50 | p90 | p95 | p99 |
+|---|---:|---:|---:|---:|
+| CPU / 4 | 0.080 | 0.284 | 0.342 | 0.450 |
+| CPU / 8 | 0.145 | 0.318 | 0.447 | 0.642 |
+| IO / 4 | 0.407 | 1.052 | 1.124 | 2.083 |
+
+结论很直接：IO 的窗口级波动远大于 3% improvement/regression 比例；CPU N=8 也比 N=4 更噪。当前 `Contaminated` 高频出现并非偶然，先扩大阈值或直接改变接受规则都缺少统计基础，必须先把测量窗口改成能稳定估计分布的形式。
+
+### 6.3 长时 adaptive 与初始 N=2/N=4
+
+在 512-job、约 12–17 秒的 CPU 批次中，初始 N=2 的 adaptive 三轮吞吐为 2139.5、2081.9、2023.3 MiB/s；每轮约 10–12 次 Probe、10–12 次 Verify、6–9 次 Contaminated，Accepted=0，并有 1 次无外部压力的 `EnvironmentChanged`。初始 N=4 的三轮为 1941.0、2211.3、1863.0 MiB/s，同样 Accepted=0，且主要落在 Contaminated/RolledBack 路径。
+
+这不是“初始 N=4 一定更差”的严格 paired 证明，因为两批次受主机热状态和缓存影响；但至少没有观察到从 N=2 改为 N=4 能降低探索成本或提升稳定接受率。当前主要瓶颈仍是 controller 在短 finite backlog 内不断重启 probe/verify，而不是初始并发单点。
+
+### 6.4 Hold-phase 被动压力与误报
+
+追加驱动只在 trace 首次出现 `phase=hold`/`decision=holding` 后启动 workload-matched pressure，检测到 `EnvironmentChanged` 立即停止，否则 5 秒超时停止。
+
+- CPU：3 轮无扰动 stationary 中有 2 次 `EnvironmentChanged`；3 轮被动实验中仅 1 轮进入 Hold 并启动压力，约 0.79 秒后检测到 `EnvironmentChanged`，另外 2 轮在 15 秒窗口内没有进入 Hold，未注入压力。
+- IO：2 轮无扰动 stationary 中有 2 次 `EnvironmentChanged`，其中 1 次还出现 Accepted；2 轮被动实验均未进入 Hold，因此没有实际压力注入。
+
+因此目前可以确认“进入 Hold 后的事件级注入和停止链路”可工作，但不能确认 Hold detector 的可靠性：Hold 到达率低，且无扰动误报已经在 CPU/IO 两类 workload 中出现。应先以 stable/noise 长跑估计 ARL0，再讨论 detection delay；当前的 `EnvironmentChanged=0` 或偶发 `EnvironmentChanged=1` 都不能单独作为 detector 成功/失败结论。
+
+追加结果文件：
+
+- [fine oracle](../../benchmarks/results/controller_experiment_fine_oracle.json)
+- [CPU window noise](../../benchmarks/results/controller_experiment_noise_cpu.json)
+- [IO window noise](../../benchmarks/results/controller_experiment_noise_io.json)
+- [long CPU, initial N=2](../../benchmarks/results/controller_experiment_long_cpu_n2.json)
+- [CPU passive Hold v2](../../benchmarks/results/controller_experiment_passive_cpu_v2.json)
+- [IO passive Hold](../../benchmarks/results/controller_experiment_passive_io.json)
+- [CPU initial N=4](../../benchmarks/results/controller_experiment_initial_n4_cpu.json)
+
+### 6.5 更新后的结论与下一步
+
+当前实现已经具备可复现实验所需的 oracle、扰动进程、事件级 trace 和 Hold 后注入能力；但控制性能仍不能判定为达标。证据优先级如下：
+
+1. 先修测量：固定并发模式也应输出与 adaptive 相同定义的窗口 throughput，或明确提供 benchmark-only 的固定窗口观测接口；否则 IO 噪声只能通过系统写入代理估计。
+2. 在 controller 参数不变的情况下做更长 stable/noise 批次，至少按 workload/N 重复多个 10–20 秒窗口，报告 false-positive rate、ARL0、p95/p99 和 Hold 到达率。
+3. 重新做严格的 step-change：必须保证 pressure 在 Hold 后启动，并记录从 `pressure_started` 到 `EnvironmentChanged` 的延迟；未进入 Hold 的批次应单独记为 censoring，不能与“未检测到变化”混为一类。
+4. 在误报和窗口估计稳定前，不调整 improvement threshold，也不把当前细 oracle 的单个峰值用于改默认 active limit。
+
+## 7. 继续实验：native 固定窗口测量与账本闭合
+
+本轮按上一节的优先级先补测量，不改 controller 的 improvement/regression threshold、EWMA/CUSUM、cooldown、hold 或 Probe/Verify 策略。新增 fixed-mode 的 native measurement diagnostics：固定并发也使用 native window 产生 `accepted/written/completed` 窗口增量，同时输出真实 writer pending gauge、累计 counters、window 秒数和吞吐。事件类型仍为 `native_controller`，事件名为 `measurement`。
+
+### 7.1 测量实现校正
+
+首次 v2 分析发现 `Window::clear()` 漏清 `accepted_bytes`，导致 accepted 在事件中跨窗口累加；这会把“窗口接收量”误读成累计量。已修复，并增加 native smoke 检查：
+
+- fixed diagnostics 只产生观测，不改变 `active_limit`；
+- 连续两个窗口的 accepted/written/jobs/files 都是窗口增量；
+- 每个 measurement 事件同时保留真实 pending 和累计计数器。
+
+修复后的 v3 trace 中，所有 workload/N 的累计账本残差均为 0：
+
+```text
+counter_accepted - counter_written - discarded - writer_pending = 0
+```
+
+这说明当前这批数据的 writer 账本是闭合的；此前 v2 的异常主要是观测窗口清零 bug，而不是可以直接归因给压缩器吞吐的“巨大积压”。
+
+### 7.2 v3 native exact-window 结果
+
+CPU 使用 N=2/3/4/5/8，IO 使用 N=2/4/6/8，每点 768 个 64 MiB job、单次 oracle、窗口目标约 0.25–1.5 秒。所有 9 个配置均 `all_passed=true`。下表的吞吐是 measurement window 的中位数，噪声列是相邻窗口 `|Δlog(T)|` 的 p95，pending 是真实 writer pending 的 p95。
+
+| workload | N | windows | median T (MiB/s) | `|Δlog T|` p95 | pending p95 (MiB) |
+|---|---:|---:|---:|---:|---:|
+| CPU | 2 | 187 | 735.5 | 0.284 | 3.7 |
+| CPU | 3 | 118 | 1142.7 | 0.233 | 8.9 |
+| CPU | 4 | 80 | 1587.7 | 0.186 | 4.2 |
+| CPU | 5 | 69 | 1980.7 | 0.407 | 30.8 |
+| CPU | 8 | 66 | 2123.2 | 0.257 | 56.0 |
+| IO | 2 | 155 | 981.1 | 1.003 | 2.7 |
+| IO | 4 | 122 | 1039.6 | 1.046 | 17.9 |
+| IO | 6 | 133 | 981.4 | 0.743 | 30.0 |
+| IO | 8 | 141 | 941.0 | 0.776 | 51.5 |
+
+吞吐量随时间图：
+
+- [CPU exact-window throughput](../../benchmarks/results/controller_native_measurement_plots_v3/cpu-throughput-vs-time.png)
+- [IO exact-window throughput](../../benchmarks/results/controller_native_measurement_plots_v3/io-throughput-vs-time.png)
+
+图中 CPU 的初始窗口存在明显瞬态，随后 N=5/N=8 大致进入 2.0–2.1 GiB/s 区间；N=8 的 pending 长时间接近 64 MiB 上限，说明提高并发主要换来更大的写入队列，而不是稳定的窗口吞吐增益。IO 在所有并发下都呈强烈突发，N=4 的单次总吞吐最高，但窗口 p95 的相邻 log 变化仍约为 1.046，约等于一个窗口内出现 2.85 倍量级的跳变，不能作为当前 controller 的平稳反馈信号。
+
+本轮总 wall-time oracle 的单次 sweep 结果是 CPU 最高点 N=8、IO 最高点 N=4；CPU N=2–N=8 的总吞吐从约 838 增至 2226 MiB/s，主机状态漂移明显，因此这只是本机单次 sweep 估计，不足以修改默认 active limit。IO N=4 约 1184 MiB/s，高于 N=6/N=8，但同样需要重复批次确认。
+
+### 7.3 当前结论
+
+这一轮把问题进一步收敛为：
+
+1. native exact-window measurement、真实 pending 和累计账本已经可以同时观测，且账本闭合；
+2. CPU 的主要不确定性是起始瞬态、主机漂移和高并发 pending 增长；
+3. IO 的主要问题是窗口级 burst/noise，而不是 controller 探索动作本身；
+4. 以当前 3% improvement/regression 比例直接做严格因果判断仍不成立，尤其不能把 IO 的单窗口跃迁判成环境变化或候选优劣。
+
+因此下一步仍不调控制参数。应先在固定并发下重复多个较长 stable/noise 批次，分别报告 median/MAD、p95/p99、lag-1 autocorrelation、pending 分布和主机温度/频率；之后再用事件同步的 step-change 重新估计 false-positive、ARL0 和 detection delay。
+
+本轮追加结果：
+
+- [CPU v3 report](../../benchmarks/results/controller_native_measurement_cpu_v3.json)
+- [IO v3 report](../../benchmarks/results/controller_native_measurement_io_v3.json)
+- [v3 event-level analysis](../../benchmarks/results/controller_native_measurement_analysis_v3.json)

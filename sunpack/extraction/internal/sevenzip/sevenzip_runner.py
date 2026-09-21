@@ -75,6 +75,10 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
     if diagnostics is not None:
         enabled = str(diagnostics).strip().lower() not in {"0", "false", "no", "off"}
         environment["SUNPACK_NATIVE_RESOURCE_DIAGNOSTICS"] = "1" if enabled else "0"
+    measurement_diagnostics = process_config.get("measurement_diagnostics_enabled")
+    if measurement_diagnostics is not None:
+        enabled = str(measurement_diagnostics).strip().lower() not in {"0", "false", "no", "off"}
+        environment["SUNPACK_NATIVE_MEASUREMENT_DIAGNOSTICS"] = "1" if enabled else "0"
     set_float("minimum_window_seconds", "SUNPACK_NATIVE_MINIMUM_WINDOW_SECONDS")
     set_float("maximum_window_seconds", "SUNPACK_NATIVE_MAXIMUM_WINDOW_SECONDS")
     set_float("settle_seconds", "SUNPACK_NATIVE_SETTLE_SECONDS")

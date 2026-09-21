@@ -1251,6 +1251,8 @@ sunpack::sevenzip::NativeRuntimeConfig configured_native_runtime_config(
     config.adaptive_enabled = configured_native_bool("SUNPACK_NATIVE_ADAPTIVE_ENABLED", true);
     config.resource_diagnostics_enabled = configured_native_bool(
         "SUNPACK_NATIVE_RESOURCE_DIAGNOSTICS", false);
+    config.measurement_diagnostics_enabled = configured_native_bool(
+        "SUNPACK_NATIVE_MEASUREMENT_DIAGNOSTICS", false);
     config.initial_active_jobs = sizing.initial_active_jobs;
     config.exploration_strategy = configured_native_exploration_strategy();
     if (config.exploration_strategy == sunpack::sevenzip::NativeExplorationStrategy::Full) {
@@ -1639,6 +1641,46 @@ private:
             ",\"next_sample_interval_ms\":" + std::to_string(next_interval_ms) + "}");
     }
 
+    static void print_controller_measurement_event(
+        const sunpack::sevenzip::NativeRuntimeSnapshot& snapshot,
+        std::size_t queued_jobs,
+        unsigned sampled_interval_ms,
+        std::uint64_t discarded_write_bytes = 0,
+        std::uint64_t writer_pending_bytes = 0,
+        std::uint64_t accepted_bytes_total = 0,
+        std::uint64_t written_bytes_total = 0,
+        std::uint64_t completed_jobs_total = 0,
+        std::uint64_t completed_files_total = 0,
+        bool writer_idle = true
+    ) noexcept {
+        print_json_line(
+            "{\"type\":\"native_controller\",\"event\":\"measurement\"" +
+            std::string(",\"measurement_sequence\":") + std::to_string(snapshot.measurement_sequence) +
+            ",\"queued_jobs\":" + std::to_string(queued_jobs) +
+            ",\"active_limit\":" + std::to_string(snapshot.active_limit) +
+            ",\"active_jobs\":" + std::to_string(snapshot.active_jobs) +
+            ",\"phase\":\"" + controller_phase_name(snapshot.phase) + "\"" +
+            ",\"load_state\":\"" + controller_load_state_name(snapshot.load_state) + "\"" +
+            ",\"mode\":\"" + throughput_mode_name(snapshot.measurement_mode) + "\"" +
+            ",\"window_seconds\":" + std::to_string(snapshot.measurement_window_seconds) +
+            ",\"accepted_bytes\":" + std::to_string(snapshot.measurement_accepted_bytes) +
+            ",\"written_bytes\":" + std::to_string(snapshot.measurement_written_bytes) +
+            ",\"completed_jobs\":" + std::to_string(snapshot.measurement_completed_jobs) +
+            ",\"completed_files\":" + std::to_string(snapshot.measurement_completed_files) +
+            ",\"bytes_per_second\":" + std::to_string(snapshot.measurement_bytes_per_second) +
+            ",\"jobs_per_second\":" + std::to_string(snapshot.measurement_jobs_per_second) +
+            ",\"files_per_second\":" + std::to_string(snapshot.measurement_files_per_second) +
+            ",\"pending_write_bytes\":" + std::to_string(writer_pending_bytes) +
+            ",\"controller_pending_write_bytes\":" + std::to_string(snapshot.pending_write_bytes) +
+            ",\"counter_accepted_bytes\":" + std::to_string(accepted_bytes_total) +
+            ",\"counter_written_bytes\":" + std::to_string(written_bytes_total) +
+            ",\"counter_completed_jobs\":" + std::to_string(completed_jobs_total) +
+            ",\"counter_completed_files\":" + std::to_string(completed_files_total) +
+            ",\"discarded_write_bytes\":" + std::to_string(discarded_write_bytes) +
+            ",\"writer_idle\":" + std::string(writer_idle ? "true" : "false") +
+            ",\"sampled_interval_ms\":" + std::to_string(sampled_interval_ms) + "}");
+    }
+
     static void print_controller_lifecycle_event(const char* event) noexcept {
         print_json_line(
             "{\"type\":\"native_controller\",\"event\":\"" +
@@ -1869,6 +1911,7 @@ private:
         auto last_sample_at = std::chrono::steady_clock::now();
         auto idle_since = last_sample_at;
         bool monitor_parked = true;
+        std::uint64_t printed_measurement_sequence = 0;
         while (true) {
             std::unique_lock<std::mutex> wait_lock(mutex_);
             if (monitor_parked) {
@@ -2048,6 +2091,20 @@ private:
             if (changed || snapshot.resource_diagnostics_enabled) {
                 print_controller_event(snapshot, queued_jobs, sampled_interval_ms, next_interval_ms,
                     discarded_write_bytes, writer_idle);
+            }
+            if (snapshot.measurement_sequence != printed_measurement_sequence) {
+                print_controller_measurement_event(
+                    snapshot,
+                    queued_jobs,
+                    sampled_interval_ms,
+                    discarded_write_bytes,
+                    pending_write_bytes,
+                    throughput.accepted_bytes,
+                    throughput.written_bytes,
+                    throughput.completed_jobs,
+                    throughput.completed_files,
+                    writer_idle);
+                printed_measurement_sequence = snapshot.measurement_sequence;
             }
             if (changed) {
                 condition_.notify_all();
@@ -2235,6 +2292,8 @@ int main() {
         ",\"exploration_strategy\":\"" + exploration_strategy + "\"" +
         ",\"resource_diagnostics_enabled\":" +
             std::string(runtime_config.resource_diagnostics_enabled ? "true" : "false") +
+        ",\"measurement_diagnostics_enabled\":" +
+            std::string(runtime_config.measurement_diagnostics_enabled ? "true" : "false") +
         ",\"process_mode\":\"" + requested_process_mode +
         "\",\"process_mode_applied\":" + (process_mode_applied ? "true" : "false") + "}");
     std::string line;

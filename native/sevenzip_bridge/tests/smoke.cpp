@@ -151,6 +151,46 @@ bool check_runtime_control_rolls_back_large_window_regression() {
         snapshot.throughput_mode == NativeThroughputMode::Bytes;
 }
 
+bool check_runtime_control_emits_fixed_measurement_windows() {
+    using namespace sunpack::sevenzip;
+    auto config = deterministic_runtime_config(4);
+    config.adaptive_enabled = false;
+    config.measurement_diagnostics_enabled = true;
+    NativeRuntimeControl controller(8, config);
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    counters.accepted_bytes = 1'000;
+    counters.written_bytes = 700;
+    counters.completed_jobs = 2;
+    counters.completed_files = 2;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    auto snapshot = controller.snapshot(4);
+    if (snapshot.active_limit != 4 ||
+        snapshot.measurement_sequence != 1 ||
+        snapshot.measurement_mode != NativeThroughputMode::Bytes ||
+        snapshot.measurement_accepted_bytes != 1'000 ||
+        snapshot.measurement_written_bytes != 700 ||
+        snapshot.measurement_completed_jobs != 2 ||
+        snapshot.measurement_completed_files != 2) {
+        return false;
+    }
+
+    counters.accepted_bytes = 1'500;
+    counters.written_bytes = 1'200;
+    counters.completed_jobs = 3;
+    counters.completed_files = 3;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    snapshot = controller.snapshot(4);
+    return snapshot.active_limit == 4 &&
+        snapshot.measurement_sequence == 2 &&
+        snapshot.measurement_accepted_bytes == 500 &&
+        snapshot.measurement_written_bytes == 500 &&
+        snapshot.measurement_completed_jobs == 1 &&
+        snapshot.measurement_completed_files == 1;
+}
+
 bool check_runtime_control_accepts_large_window_improvement() {
     using namespace sunpack::sevenzip;
     NativeRuntimeControl controller(8, deterministic_runtime_config(4));
@@ -471,6 +511,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_runtime_control_rolls_back_large_window_regression()) {
         std::cerr << "runtime control large-window rollback check failed\n";
         return 6;
+    }
+    if (!check_runtime_control_emits_fixed_measurement_windows()) {
+        std::cerr << "runtime control fixed measurement window check failed\n";
+        return 22;
     }
     if (!check_runtime_control_accepts_large_window_improvement()) {
         std::cerr << "runtime control large-window improvement check failed\n";

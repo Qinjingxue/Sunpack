@@ -168,6 +168,7 @@ def _controller_config(args: argparse.Namespace) -> dict[str, Any]:
         "cooldown_windows": args.cooldown_windows,
         "hold_windows": args.hold_windows,
         "resource_diagnostics_enabled": True,
+        "measurement_diagnostics_enabled": args.measurement_diagnostics,
     }
 
 
@@ -291,7 +292,13 @@ def _run_adaptive(
     collision: str = "none",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     timers: list[threading.Timer] = []
-    hook_state = {"probe_seen": False, "pressure_started": False, "pressure_stopped": False}
+    hook_state = {
+        "probe_seen": False,
+        "hold_seen": False,
+        "environment_changed": False,
+        "pressure_started": False,
+        "pressure_stopped": False,
+    }
 
     def start_pressure() -> None:
         if pressure is not None:
@@ -323,8 +330,22 @@ def _run_adaptive(
             stop_timer.daemon = True
             stop_timer.start()
             timers.append(stop_timer)
+        elif pressure_mode == "hold-passive" and pressure is not None:
+            phase = str(event.get("phase") or "")
+            if not hook_state["hold_seen"] and (phase == "hold" or decision == "holding"):
+                hook_state["hold_seen"] = True
+                start_pressure()
+                stop_timer = threading.Timer(args.disturbance_seconds, stop_pressure)
+                stop_timer.daemon = True
+                stop_timer.start()
+                timers.append(stop_timer)
+            if hook_state["pressure_started"] and decision == "environment_changed":
+                hook_state["environment_changed"] = True
+                stop_pressure()
 
     try:
+        adaptive_case = dict(ADAPTIVE_CASE)
+        adaptive_case["initial_active_jobs"] = args.initial_active_jobs
         summary, trace = _run_batch(
             workspace=workspace,
             worker_path=worker_path,
@@ -333,7 +354,7 @@ def _run_adaptive(
             client_count=1,
             timeout_seconds=args.timeout_seconds,
             sample_interval_ms=args.sample_interval_ms,
-            admission_case=dict(ADAPTIVE_CASE),
+            admission_case=adaptive_case,
             label=f"{workload}-{pressure_mode}-{collision}-capacity-{capacity}-run-{run}",
             worker_config_overrides=_controller_config(args),
             controller_event_hook=hook,
@@ -358,6 +379,8 @@ def _run_adaptive(
         "pressure_mode": pressure_mode,
         "collision": collision,
         "probe_seen": hook_state["probe_seen"],
+        "hold_seen": hook_state["hold_seen"],
+        "environment_changed": hook_state["environment_changed"],
         "pressure_started": hook_state["pressure_started"],
         "pressure_stopped": hook_state["pressure_stopped"],
         "pressure_duration_seconds": (
@@ -394,10 +417,37 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--disturbance-delay-seconds", type=float, default=1.0)
     parser.add_argument("--disturbance-seconds", type=float, default=10.0)
     parser.add_argument("--transient-seconds", type=float, default=0.75)
+    parser.add_argument("--initial-active-jobs", type=int, default=2)
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--keep-workdir", action="store_true")
     parser.add_argument("--skip-collisions", action="store_true")
+    parser.add_argument(
+        "--stationary-only",
+        action="store_true",
+        help="Run the fixed oracle and stationary adaptive cases only; omit scheduled pressure and collisions.",
+    )
+    parser.add_argument(
+        "--passive-hold-runs",
+        type=int,
+        default=0,
+        help="After stationary runs, inject workload-matched pressure only after Hold is observed.",
+    )
+    parser.add_argument(
+        "--fixed-diagnostics",
+        action="store_true",
+        help="Enable native controller diagnostics for fixed-capacity runs so window samples are traced.",
+    )
+    parser.add_argument(
+        "--measurement-diagnostics",
+        action="store_true",
+        help="Emit native controller window measurements for fixed and adaptive runs.",
+    )
+    parser.add_argument(
+        "--oracle-only",
+        action="store_true",
+        help="Run only the fixed-capacity oracle sweep and omit adaptive/disturbance cases.",
+    )
     return parser
 
 
@@ -410,7 +460,13 @@ def main() -> int:
         _parser().error(str(exc))
     if set(workloads) - {"cpu", "io"} or not workloads:
         _parser().error("workloads must be a non-empty subset of cpu,io")
-    if args.jobs < max(capacities) or args.oracle_runs < 1 or args.adaptive_runs < 1:
+    if (
+        args.jobs < max(capacities)
+        or args.oracle_runs < 1
+        or args.adaptive_runs < 1
+        or args.initial_active_jobs < 1
+        or args.passive_hold_runs < 0
+    ):
         _parser().error("jobs must cover the largest capacity and run counts must be positive")
     if args.sample_interval_ms < 100 or args.timeout_seconds <= 0:
         _parser().error("sample interval must be at least 100 ms and timeout must be positive")
@@ -450,7 +506,10 @@ def main() -> int:
                         sample_interval_ms=args.sample_interval_ms,
                         admission_case=dict(FIXED_CASE),
                         label=f"oracle-{workload}-fixed-capacity-{capacity}-run-{run}",
-                        worker_config_overrides={"resource_diagnostics_enabled": False},
+                        worker_config_overrides={
+                            "resource_diagnostics_enabled": args.fixed_diagnostics,
+                            "measurement_diagnostics_enabled": args.measurement_diagnostics,
+                        },
                     )
                     row, trace_payload = _row(
                         summary,
@@ -471,6 +530,37 @@ def main() -> int:
                     shutil.rmtree(workspace.outputs / trace["label"], ignore_errors=True)
         oracle = _oracle_summary(oracle_rows, int(next(iter(corpora.values()))["payload_bytes_per_job"]))
 
+        if args.oracle_only:
+            report = {
+                "parameters": vars(args) | {"workloads": workloads, "capacities": capacities},
+                "environment": {
+                    "worker_path": str(worker_path),
+                    "seven_zip_path": str(seven_zip),
+                    "cpu_count": os.cpu_count(),
+                    "python": sys.version,
+                },
+                "corpus": {workload: value["case"] for workload, value in corpora.items()},
+                "oracle": oracle,
+                "results": rows,
+                "summary": {
+                    "rows": len(rows),
+                    "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
+                    "controller_implementation": {
+                        "window": "minimum/maximum window with small job/file readiness",
+                        "change_detector": "fast/slow log EWMA plus CUSUM inside native controller",
+                        "probe_verification": "A-B-A with contamination gate",
+                    },
+                },
+                "artifacts": {"result_dir": str(workspace.result_dir), "traces": trace_paths},
+            }
+            rendered = render_report(report_from_payload(SCENARIO, report))
+            workspace.write_result_text("report.json", rendered)
+            if args.json_out:
+                args.json_out.parent.mkdir(parents=True, exist_ok=True)
+                args.json_out.write_text(rendered, encoding="utf-8")
+            print(rendered)
+            return 0 if report["summary"]["all_passed"] else 1
+
         for workload in workloads:
             corpus = corpora[workload]
             target_capacity = max(capacities)
@@ -484,7 +574,7 @@ def main() -> int:
                     client_count=1,
                     timeout_seconds=args.timeout_seconds,
                     sample_interval_ms=args.sample_interval_ms,
-                    admission_case=dict(ADAPTIVE_CASE),
+                    admission_case=(dict(ADAPTIVE_CASE) | {"initial_active_jobs": args.initial_active_jobs}),
                     label=f"adaptive-{workload}-stationary-capacity-{target_capacity}-run-{run}",
                     worker_config_overrides=_controller_config(args),
                 )
@@ -503,6 +593,40 @@ def main() -> int:
                     f"traces/{workload}-adaptive-stationary-{run}.json", trace_payload
                 )))
                 shutil.rmtree(workspace.outputs / trace["label"], ignore_errors=True)
+
+            if args.passive_hold_runs:
+                for run in range(args.passive_hold_runs):
+                    pressure = _Pressure(
+                        workload,
+                        workspace.corpus,
+                        workers=max(1, min(8, (os.cpu_count() or 2) // 4)),
+                    )
+                    print(f"adaptive {workload} passive-hold run={run}", flush=True)
+                    summary_row, trace_payload = _run_adaptive(
+                        workspace=workspace,
+                        worker_path=worker_path,
+                        corpus=corpus,
+                        workload=workload,
+                        capacity=target_capacity,
+                        run=run,
+                        args=args,
+                        pressure=pressure,
+                        pressure_mode="hold-passive",
+                        pressure_name=workload,
+                    )
+                    summary_row.update(_trace_metrics(
+                        trace_payload,
+                        oracle=oracle[workload],
+                        payload_bytes=int(corpus["payload_bytes_per_job"]),
+                    ))
+                    rows.append(summary_row)
+                    trace_paths.append(str(workspace.write_result_json(
+                        f"traces/{workload}-passive-hold-{run}.json", trace_payload
+                    )))
+                    shutil.rmtree(workspace.outputs / trace_payload["label"], ignore_errors=True)
+
+            if args.stationary_only:
+                continue
 
             for disturbance in ("cpu", "io"):
                 pressure = _Pressure(disturbance, workspace.corpus, workers=max(1, min(8, (os.cpu_count() or 2) // 4)))

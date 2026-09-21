@@ -90,12 +90,23 @@ namespace sunpack::sevenzip
         double cpu_percent = 0.0;
         double io_read_bytes_per_second = 0.0;
         double io_write_bytes_per_second = 0.0;
+        std::uint64_t measurement_sequence = 0;
+        double measurement_window_seconds = 0.0;
+        NativeThroughputMode measurement_mode = NativeThroughputMode::None;
+        std::uint64_t measurement_accepted_bytes = 0;
+        std::uint64_t measurement_written_bytes = 0;
+        std::uint64_t measurement_completed_jobs = 0;
+        std::uint64_t measurement_completed_files = 0;
+        double measurement_bytes_per_second = 0.0;
+        double measurement_jobs_per_second = 0.0;
+        double measurement_files_per_second = 0.0;
     };
 
     struct NativeRuntimeConfig
     {
         bool adaptive_enabled = true;
         bool resource_diagnostics_enabled = false;
+        bool measurement_diagnostics_enabled = false;
         std::size_t initial_active_jobs = 0;
         NativeExplorationStrategy exploration_strategy = NativeExplorationStrategy::Calibrated;
         double minimum_window_seconds = 0.25;
@@ -122,7 +133,7 @@ namespace sunpack::sevenzip
             std::size_t initial_active_jobs = 0)
             : NativeRuntimeControl(
                   max_active_jobs,
-                  NativeRuntimeConfig{adaptive_enabled, false, initial_active_jobs}) {}
+                  NativeRuntimeConfig{adaptive_enabled, false, false, initial_active_jobs}) {}
 
         NativeRuntimeControl(
             std::size_t max_active_jobs,
@@ -130,6 +141,7 @@ namespace sunpack::sevenzip
             : max_active_jobs_((std::max)(std::size_t{1}, max_active_jobs)),
               adaptive_enabled_(config.adaptive_enabled),
               resource_diagnostics_enabled_(config.resource_diagnostics_enabled),
+              measurement_diagnostics_enabled_(config.measurement_diagnostics_enabled),
               exploration_strategy_(config.exploration_strategy),
               minimum_window_seconds_((std::max)(0.05, config.minimum_window_seconds)),
               maximum_window_seconds_((std::max)(minimum_window_seconds_, config.maximum_window_seconds)),
@@ -226,24 +238,27 @@ namespace sunpack::sevenzip
                 begin_saturated_segment();
                 return true;
             }
-            if (!adaptive_enabled_ || elapsed_seconds <= 0.0)
+            if ((!adaptive_enabled_ && !measurement_diagnostics_enabled_) || elapsed_seconds <= 0.0)
             {
                 return changed;
             }
-            // Probe/verify samples are causal experiments: do not measure until the
-            // executor has actually reached the requested admission limit.
-            if ((phase_ == NativeControllerPhase::Probe ||
-                 phase_ == NativeControllerPhase::Verify) &&
-                active_jobs != active_limit_)
+            if (adaptive_enabled_)
             {
-                window_.clear();
-                return changed;
-            }
-            if (settle_remaining_seconds_ > 0.0)
-            {
-                settle_remaining_seconds_ = (std::max)(0.0, settle_remaining_seconds_ - elapsed_seconds);
-                window_.clear();
-                return changed;
+                // Probe/verify samples are causal experiments: do not measure until the
+                // executor has actually reached the requested admission limit.
+                if ((phase_ == NativeControllerPhase::Probe ||
+                     phase_ == NativeControllerPhase::Verify) &&
+                    active_jobs != active_limit_)
+                {
+                    window_.clear();
+                    return changed;
+                }
+                if (settle_remaining_seconds_ > 0.0)
+                {
+                    settle_remaining_seconds_ = (std::max)(0.0, settle_remaining_seconds_ - elapsed_seconds);
+                    window_.clear();
+                    return changed;
+                }
             }
             window_.add(delta, elapsed_seconds);
             if (!window_ready(window_))
@@ -253,6 +268,12 @@ namespace sunpack::sevenzip
             const Measurement measurement = window_.measurement(large_window_bytes_);
             window_.clear();
             last_measurement_ = measurement;
+            measurement_diagnostic_ = measurement;
+            ++measurement_sequence_;
+            if (!adaptive_enabled_)
+            {
+                return changed;
+            }
             return process_measurement(measurement) || changed;
         }
 
@@ -277,6 +298,16 @@ namespace sunpack::sevenzip
                 diagnostic_cpu_percent_,
                 diagnostic_io_read_rate_,
                 diagnostic_io_write_rate_,
+                measurement_sequence_,
+                measurement_diagnostic_.seconds,
+                measurement_diagnostic_.mode,
+                measurement_diagnostic_.accepted_bytes,
+                measurement_diagnostic_.written_bytes,
+                measurement_diagnostic_.completed_jobs,
+                measurement_diagnostic_.completed_files,
+                measurement_diagnostic_.bytes_per_second,
+                measurement_diagnostic_.jobs_per_second,
+                measurement_diagnostic_.files_per_second,
             };
         }
 
@@ -349,9 +380,11 @@ namespace sunpack::sevenzip
         struct Measurement
         {
             NativeThroughputMode mode = NativeThroughputMode::None;
+            double seconds = 0.0;
             double bytes_per_second = 0.0;
             double jobs_per_second = 0.0;
             double files_per_second = 0.0;
+            std::uint64_t accepted_bytes = 0;
             std::uint64_t written_bytes = 0;
             std::uint64_t completed_jobs = 0;
             std::uint64_t completed_files = 0;
@@ -360,6 +393,7 @@ namespace sunpack::sevenzip
         struct Window
         {
             double seconds = 0.0;
+            std::uint64_t accepted_bytes = 0;
             std::uint64_t written_bytes = 0;
             std::uint64_t completed_jobs = 0;
             std::uint64_t completed_files = 0;
@@ -367,6 +401,7 @@ namespace sunpack::sevenzip
             void add(const CounterDelta &delta, double elapsed) noexcept
             {
                 seconds += elapsed;
+                accepted_bytes += delta.accepted_bytes;
                 written_bytes += delta.written_bytes;
                 completed_jobs += delta.completed_jobs;
                 completed_files += delta.completed_files;
@@ -375,6 +410,7 @@ namespace sunpack::sevenzip
             void clear() noexcept
             {
                 seconds = 0.0;
+                accepted_bytes = 0;
                 written_bytes = 0;
                 completed_jobs = 0;
                 completed_files = 0;
@@ -387,6 +423,8 @@ namespace sunpack::sevenzip
                 {
                     return result;
                 }
+                result.seconds = seconds;
+                result.accepted_bytes = accepted_bytes;
                 result.written_bytes = written_bytes;
                 result.completed_jobs = completed_jobs;
                 result.completed_files = completed_files;
@@ -845,6 +883,7 @@ namespace sunpack::sevenzip
         const std::size_t max_active_jobs_;
         const bool adaptive_enabled_;
         const bool resource_diagnostics_enabled_;
+        const bool measurement_diagnostics_enabled_;
         const NativeExplorationStrategy exploration_strategy_;
         const double minimum_window_seconds_;
         const double maximum_window_seconds_;
@@ -867,6 +906,8 @@ namespace sunpack::sevenzip
         NativeLoadState load_state_ = NativeLoadState::Idle;
         NativeControllerDecision decision_ = NativeControllerDecision::None;
         Measurement last_measurement_;
+        Measurement measurement_diagnostic_;
+        std::uint64_t measurement_sequence_ = 0;
         Measurement anchor_;
         Measurement probe_measurement_;
         std::size_t probe_limit_ = 1;
