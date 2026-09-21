@@ -325,25 +325,4 @@ SUP7Z_API int sup7z_analyze_archive_resources_with_parts(
     int message_chars
 );
 
-SUP7Z_API int sup7z_read_archive_crc_manifest(
-    const wchar_t* archive_path,
-    const wchar_t* password,
-    int max_items,
-    wchar_t* manifest_json,
-    int manifest_json_chars,
-    wchar_t* message,
-    int message_chars
-);
-
-SUP7Z_API int sup7z_read_archive_crc_manifest_with_parts(
-    const wchar_t* archive_path,
-    const wchar_t* const* part_paths,
-    int part_count,
-    const wchar_t* password,
-    int max_items,
-    wchar_t* manifest_json,
-    int manifest_json_chars,
-    wchar_t* message,
-    int message_chars
-);
 #endif

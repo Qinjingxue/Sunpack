@@ -1493,12 +1493,8 @@ class SevenZipRunner:
         Throughput owns concurrency. This estimate is used only by the hard
         memory admission budget.
         """
-        tokens = knowledge_view.resource_tokens(task)
+        memory_weight = min(8, knowledge_view.resource_memory_weight(task))
         analysis = knowledge_view.resource_analysis(task)
-        try:
-            memory_weight = max(1, min(8, int(tokens.get("memory", 1) or 1)))
-        except (TypeError, ValueError):
-            memory_weight = 1
         try:
             dictionary_bytes = max(0, int(analysis.get("largest_dictionary_size", 0) or 0))
         except (TypeError, ValueError):

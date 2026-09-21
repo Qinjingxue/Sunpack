@@ -100,19 +100,11 @@ def resource_analysis(task: Any) -> dict[str, Any]:
     return _dict(get(task, "resource.analysis", {}))
 
 
-def resource_tokens(task: Any) -> dict[str, Any]:
-    return _dict(get(task, "resource.tokens", {}))
-
-
-def resource_token_cost(task: Any) -> int:
+def resource_memory_weight(task: Any) -> int:
     try:
-        return int(get(task, "resource.token_cost", 0) or 0)
+        return max(1, int(get(task, "resource.memory_weight", 1) or 1))
     except (TypeError, ValueError):
-        return 0
-
-
-def resource_profile_key(task: Any) -> str:
-    return str(get(task, "resource.profile_key", "") or "")
+        return 1
 
 
 def projection_cache_stats() -> dict[str, Any]:
