@@ -573,6 +573,10 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "empty bounded password probe evidence check failed\n";
         return 15;
     }
+    if (!check_runtime_control_waits_for_three_window_observation()) {
+        std::cerr << "runtime control observation aggregation check failed\n";
+        return 23;
+    }
     if (!check_runtime_control_rolls_back_large_window_regression()) {
         std::cerr << "runtime control large-window rollback check failed\n";
         return 6;
