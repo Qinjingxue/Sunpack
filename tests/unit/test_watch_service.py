@@ -861,16 +861,16 @@ def test_remove_watch_root_cleans_service_owned_artifacts(tmp_path, monkeypatch)
     other_root = tmp_path / "other"
     watched.mkdir()
     other_root.mkdir()
-    (watched / ".sunpack-passwords.txt").write_text("watch-password\n", encoding="utf-8")
-    (other_root / ".sunpack-passwords.txt").write_text("keep-me\n", encoding="utf-8")
+    (watched / "sunpack-passwords.txt").write_text("watch-password\n", encoding="utf-8")
+    (other_root / "sunpack-passwords.txt").write_text("keep-me\n", encoding="utf-8")
     roots_path.write_text(f"{watched}\n{other_root}\n", encoding="utf-8")
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
 
     _, removed = service_module.remove_watch_roots([str(watched)])
 
     assert removed == [str(watched.resolve())]
-    assert not (watched / ".sunpack-passwords.txt").exists()
-    assert (other_root / ".sunpack-passwords.txt").read_text(encoding="utf-8") == "keep-me\n"
+    assert not (watched / "sunpack-passwords.txt").exists()
+    assert (other_root / "sunpack-passwords.txt").read_text(encoding="utf-8") == "keep-me\n"
 
 
 def test_watch_roots_file_gives_every_root_its_own_output_root(tmp_path, monkeypatch):
@@ -1020,7 +1020,7 @@ def test_remove_unmonitored_root_skips_artifact_cleanup(tmp_path, monkeypatch):
     roots_path = tmp_path / "sunpack_watch_roots.txt"
     target = tmp_path / "not-watched"
     target.mkdir()
-    password_file = target / ".sunpack-passwords.txt"
+    password_file = target / "sunpack-passwords.txt"
     password_file.write_text("", encoding="utf-8")
     roots_path.write_text("", encoding="utf-8")
     monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
