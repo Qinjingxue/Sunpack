@@ -181,7 +181,7 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 ## Smoke Checks
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import sunpack_native as n; print(n.native_available(), n.scanner_version())"
+.\.venv\Scripts\python.exe -c "import sunpack_native as n; print(n.native_available())"
 .\.venv\Scripts\python.exe -c "from sunpack.support.sevenzip_bridge import get_native_sevenzip_bridge; print(get_native_sevenzip_bridge().available())"
 .\.venv\Scripts\python.exe -m pytest tests\unit\test_config_loader.py
 ```

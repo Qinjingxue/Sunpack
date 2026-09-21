@@ -418,7 +418,7 @@ function Test-NativeImport {
     $code = @"
 import sunpack_native as n
 required = [
-    'native_available', 'scanner_version',
+    'native_available',
     'scan_directory_snapshot', 'scan_directory_snapshots',
     'directory_snapshot_from_columns', 'filter_inventory_file_indices',
     'batch_file_head_facts', 'authorize_nested_candidates',

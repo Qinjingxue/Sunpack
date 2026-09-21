@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "sunpack-native"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Native byte scanning helpers for SunPack."
 requires-python = ">=3.10"
 

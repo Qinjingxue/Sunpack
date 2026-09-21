@@ -34,15 +34,9 @@ fn native_available() -> bool {
     true
 }
 
-#[pyfunction]
-fn scanner_version() -> &'static str {
-    env!("CARGO_PKG_VERSION")
-}
-
 #[pymodule]
 fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
-    m.add_function(wrap_pyfunction!(scanner_version, m)?)?;
     m.add_function(wrap_pyfunction!(watch_state::write_watch_state_snapshot_native, m)?)?;
     m.add_class::<watch_journal::NativeJournalTicket>()?;
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_submit_append, m)?)?;
