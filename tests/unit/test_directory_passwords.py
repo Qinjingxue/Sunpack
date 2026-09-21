@@ -13,7 +13,7 @@ from sunpack.passwords.internal.local_files import (
 def test_discovers_same_directory_sunpack_passwords(tmp_path):
     archive = tmp_path / "archive.zip"
     archive.write_bytes(b"not really an archive")
-    (tmp_path / ".sunpack-passwords.txt").write_text("#secret\nouter-secret\n password \n\n", encoding="utf-8")
+    (tmp_path / "sunpack-passwords.txt").write_text("#secret\nouter-secret\n password \n\n", encoding="utf-8")
 
     assert discover_directory_passwords_for_archive(str(archive), {}) == ["#secret", "outer-secret", " password "]
 
@@ -25,7 +25,7 @@ def test_ignores_other_same_directory_txt_files(tmp_path):
     (tmp_path / "notes.txt").write_text("also-wrong\n", encoding="utf-8")
 
     assert discover_directory_passwords_for_archive(str(archive), {}) == []
-    assert is_directory_password_file(str(tmp_path / ".sunpack-passwords.txt"), {})
+    assert is_directory_password_file(str(tmp_path / "sunpack-passwords.txt"), {})
     assert not is_directory_password_file(str(tmp_path / "passwords.txt"), {})
 
 
@@ -36,7 +36,7 @@ def test_directory_password_context_inherits_and_extends(tmp_path):
     child.mkdir()
     archive = child / "nested.zip"
     archive.write_bytes(b"not really an archive")
-    (child / ".sunpack-passwords.txt").write_text("inner-secret\nouter-secret\n", encoding="utf-8")
+    (child / "sunpack-passwords.txt").write_text("inner-secret\nouter-secret\n", encoding="utf-8")
 
     store = DirectoryPasswordContextStore({})
     parent_task = SimpleNamespace(fact_bag=FactBag())
