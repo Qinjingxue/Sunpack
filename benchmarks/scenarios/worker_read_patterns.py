@@ -37,6 +37,7 @@ MIB = 1024 * 1024
 DEFAULT_SMALL_FILES = 8
 DEFAULT_LARGE_FILES = 2
 DEFAULT_LARGE_FILE_MIB = 32
+WORKER_FORMATS = (*GENERATED_FORMATS, "rar4")
 
 
 def _solid_variants(
@@ -56,6 +57,8 @@ def _solid_variants(
         ("7z", "non-solid", ["a", "-y", "-t7z", "-ms=off"]),
         ("rar", "solid", ["a", "-idq", "-r", "-ep1", "-s"]),
         ("rar", "non-solid", ["a", "-idq", "-r", "-ep1", "-s-"]),
+        ("rar4", "solid", ["a", "-idq", "-r", "-ep1", "-ma4", "-s"]),
+        ("rar4", "non-solid", ["a", "-idq", "-r", "-ep1", "-ma4", "-s-"]),
     )
     for archive_format, variant, command in commands:
         if only_variants is not None and variant not in only_variants:
@@ -98,12 +101,17 @@ def _focused_corpus(
     else:
         source = payload_root / "few-large"
         source.mkdir(parents=True)
-        rng = random.Random(20260817)
         chunk_size = MIB
+        compressible_chunk = (b"sunpack-highly-compressible\n" * ((chunk_size // 28) + 1))[:chunk_size]
         for index in range(large_files):
             with (source / f"large-{index:02d}.bin").open("wb") as stream:
-                for _ in range(large_file_mib):
-                    stream.write(rng.randbytes(chunk_size))
+                if large_content == "random":
+                    rng = random.Random(20260817 + index)
+                    for _ in range(large_file_mib):
+                        stream.write(rng.randbytes(chunk_size))
+                else:
+                    for _ in range(large_file_mib):
+                        stream.write(compressible_chunk)
     payload_bytes = large_files * large_file_mib * MIB
     corpus: dict[str, dict[str, Any]] = {}
     skipped: dict[str, str] = {}
@@ -148,7 +156,7 @@ def _build_cases(
     cached_corpus: dict[str, dict[str, Any]] | None = None,
     cache_info: dict[str, Any] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    targeted_formats = {"7z", "rar-split", "tar"}
+    targeted_formats = {"7z", "rar4", "rar-split", "tar"}
     requested = set(formats)
     if cached_corpus is not None:
         # The cache already holds the payload tree; rebuild only missing solid variants.
@@ -179,7 +187,7 @@ def _build_cases(
     cases: list[dict[str, Any]] = []
     for name, item in sorted(corpus.items()):
         archive_format = str(item["format"])
-        if item.get("workload") != "few_large" or archive_format not in requested or archive_format in {"7z", "rar"}:
+        if item.get("workload") != "few_large" or archive_format not in requested or archive_format in {"7z", "rar", "rar4"}:
             continue
         archive = Path(item["path"])
         cases.append({
@@ -226,6 +234,7 @@ def _archive_format(path: Path) -> str:
     for suffix, archive_format in (
         (".zip", "zip"),
         (".7z", "7z"),
+        (".rar4", "rar4"),
         (".rar", "rar"),
         (".tar", "tar"),
         (".tgz", "tgz"),
@@ -462,12 +471,12 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Profile native worker input read/seek patterns for generated archives.")
-    parser.add_argument("--format", action="append", choices=GENERATED_FORMATS, dest="formats")
+    parser.add_argument("--format", action="append", choices=WORKER_FORMATS, dest="formats")
     parser.add_argument("--runs", type=int, default=1)
     parser.add_argument("--small-files", type=int, default=DEFAULT_SMALL_FILES)
     parser.add_argument("--large-files", type=int, default=DEFAULT_LARGE_FILES)
     parser.add_argument("--large-file-mib", type=int, default=DEFAULT_LARGE_FILE_MIB)
-    parser.add_argument("--large-content", choices=("mixed", "random"), default="mixed")
+    parser.add_argument("--large-content", choices=("mixed", "random", "highly-compressible"), default="mixed")
     parser.add_argument(
         "--archive",
         action="append",
@@ -527,8 +536,8 @@ def main() -> int:
         parser.error("--prefetch-window-kib must be 64..16384 and --prefetch-depth must be 1..8")
     formats = list(dict.fromkeys(args.formats)) if args.formats else list(GENERATED_FORMATS)
     seven_zip_variants = set(args.seven_zip_variants or ("solid", "non-solid"))
-    if args.large_content != "mixed" and not args.archive and not set(formats) <= {"7z", "rar-split", "tar"}:
-        parser.error("--large-content random is currently supported only with --format 7z, --format rar-split, and --format tar")
+    if args.large_content != "mixed" and not args.archive and not set(formats) <= {"7z", "rar4", "rar-split", "tar"}:
+        parser.error("--large-content random/highly-compressible is currently supported only with --format 7z, --format rar4, --format rar-split, and --format tar")
     worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
     dll_path = Path(get_7z_cli_dll_path()).resolve()
     if not worker_path.is_file() or not dll_path.is_file():
@@ -554,14 +563,25 @@ def main() -> int:
                     ],
                 }
             else:
-                corpus, skipped, cache_info = _cached_corpus(
-                    workspace.corpus,
-                    cache_root=args.corpus_cache_root,
-                    small_files=args.small_files,
-                    large_files=args.large_files,
-                    large_file_mib=args.large_file_mib,
-                    rebuild=args.rebuild_corpus,
-                )
+                if args.large_content == "mixed":
+                    corpus, skipped, cache_info = _cached_corpus(
+                        workspace.corpus,
+                        cache_root=args.corpus_cache_root,
+                        small_files=args.small_files,
+                        large_files=args.large_files,
+                        large_file_mib=args.large_file_mib,
+                        rebuild=args.rebuild_corpus,
+                    )
+                else:
+                    corpus, skipped = _focused_corpus(
+                        workspace.corpus,
+                        set(formats),
+                        small_files=args.small_files,
+                        large_files=args.large_files,
+                        large_file_mib=args.large_file_mib,
+                        large_content=args.large_content,
+                    )
+                    cache_info = {"enabled": False, "hit": False, "content": args.large_content}
                 cases, corpus_info = _build_cases(
                     workspace,
                     formats,

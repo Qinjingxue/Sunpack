@@ -254,6 +254,8 @@ def _case_job(
     volumes = _volume_paths(case)
     archive_format = str(case["format"])
     format_hint = archive_format.removesuffix("-split")
+    if format_hint == "rar4":
+        format_hint = "rar"
     job = {
         "job_id": job_id,
         "archive_path": str(volumes[0]),
