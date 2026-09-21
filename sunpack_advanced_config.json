@@ -121,6 +121,7 @@
     "runtime_cache_cleanup_idle_seconds": 10.0,
     "password_retry_debounce_seconds": 0.5,
     "password_retry_include_subtree": true,
+    "directory_password_file_auto_create": true,
     "clipboard_monitor_enabled": true,
     "clipboard_builtin_max_entries": 30,
     "enabled": false,
