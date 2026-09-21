@@ -61,7 +61,7 @@ Options:
 | `--pw-file PASSWORD_FILE` | Read passwords from a text file, one per line. |
 | `--ask-pw` | Prompt for passwords interactively in the terminal; an empty line ends input. |
 | `--no-builtin-pw` | Disable the built-in password table. |
-| `--no-dir-pw` | Disable `.sunpack-passwords.txt` from the archive's own directory. |
+| `--no-dir-pw` | Disable `sunpack-passwords.txt` from the archive's own directory. |
 | `--deep-detect` | Enable a full embedded scan for candidates that detection did not resolve. |
 | `--recur VALUE` | Override the number of nested extraction rounds; accepts a positive integer, `*`, or `?`. |
 | `--cleanup VALUE` | Override how the original archive is handled on success: `d` delete, `r` Recycle Bin, `k` keep. |
@@ -206,7 +206,7 @@ Options:
 | `--no-builtin-pw` | Do not use the built-in password table. |
 | `--no-dir-pw` | This command has no target archive and will not read a per-directory password file; in `extract` it disables per-directory passwords. |
 
-Because `passwords` has no archive path, it outputs a summary of command-line input, the most recent successful password, clipboard passwords, and built-in passwords; it does not load `.sunpack-passwords.txt` for any directory. During archive extraction, the candidate order is "most recent successful password → per-directory passwords → CLI arguments and password files → clipboard → built-in passwords". Duplicates are removed, and the empty password is tried first when necessary.
+Because `passwords` has no archive path, it outputs a summary of command-line input, the most recent successful password, clipboard passwords, and built-in passwords; it does not load `sunpack-passwords.txt` for any directory. During archive extraction, the candidate order is "most recent successful password → per-directory passwords → CLI arguments and password files → clipboard → built-in passwords". Duplicates are removed, and the empty password is tried first when necessary.
 
 Examples:
 
