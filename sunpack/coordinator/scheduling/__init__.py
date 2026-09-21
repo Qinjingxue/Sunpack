@@ -1,11 +1,3 @@
-from sunpack.coordinator.scheduling.resource_model import (
-    ResourceDemand,
-    build_resource_profile_key,
-    estimate_resource_demand,
-)
+from sunpack.coordinator.scheduling.resource_model import estimate_memory_weight
 
-__all__ = [
-    "ResourceDemand",
-    "build_resource_profile_key",
-    "estimate_resource_demand",
-]
+__all__ = ["estimate_memory_weight"]

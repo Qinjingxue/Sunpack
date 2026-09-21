@@ -173,7 +173,7 @@ contracts
 
 `native/sunpack_native` 承接跨平台热点：目录扫描、二进制视图、signature prepass、格式 probe、carrier scan、输出 CRC/readability、输出文件索引匹配、密码 fast verifier 等。
 
-`native/sevenzip_bridge` 承接 Windows embedded 7-Zip 执行能力：资源/manifest 查询、worker 内部的 bounded 密码候选确认，以及 `sunpack_sevenzip_worker.exe` 解压。格式/结构/加密分析由 Python/Rust analysis 层完成，不在这里维护第二套 archive probe/test。
+`native/sevenzip_bridge` 承接 Windows embedded 7-Zip 执行能力：资源查询、worker 内部的 bounded 密码候选确认，以及 `sunpack_sevenzip_worker.exe` 解压。格式/结构/加密分析由 Python/Rust analysis 层完成，不在这里维护第二套 archive probe/test。
 
 ### Windows Watch Broker / USN
 

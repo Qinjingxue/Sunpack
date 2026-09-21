@@ -338,7 +338,6 @@ endfunction()
 
 set(SUP7Z_INTERNAL_SOURCES
     src/internal/archive_extract.cpp
-    src/internal/archive_crc_manifest.cpp
     src/internal/archive_open_plan.cpp
     src/internal/archive_resources.cpp
     src/internal/embedded_7z.cpp
@@ -389,7 +388,6 @@ if(SUP7Z_ENABLE_PIPELINE_TIMING)
 endif()
 
 add_library(sunpack_sevenzip SHARED
-    src/c_api_crc_manifest.cpp
     src/c_api_resources.cpp
     ${SUP7Z_INTERNAL_SOURCES}
 )

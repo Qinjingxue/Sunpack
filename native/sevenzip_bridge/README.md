@@ -9,7 +9,6 @@ It provides SunPack's in-process archive inspection ABI and the out-of-process e
 - archive probe and test
 - password array attempts
 - open-only archive probing and resource analysis
-- archive CRC/state manifest collection
 - extraction from files, volume sets, file ranges, concatenated ranges and patch-plan inputs
 
 Business decisions remain in Python. The bridge reports structured facts and operation results.

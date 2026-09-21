@@ -2,7 +2,7 @@ import os
 from types import SimpleNamespace
 
 from sunpack.contracts.tasks import ArchiveTask
-from sunpack.coordinator.scheduling.resource_model import build_resource_profile_key, estimate_resource_demand
+from sunpack.coordinator.scheduling.resource_model import estimate_memory_weight
 from sunpack.passwords import PasswordSession
 from sunpack.passwords.resolver import archive_structure_password_state, archive_structure_requires_password
 from sunpack.rename.scheduler import RenameScheduler
@@ -37,14 +37,14 @@ class ResourcePreflightInspector:
         existing_analysis = knowledge_view.resource_analysis(task)
         if isinstance(existing_analysis, dict) and existing_analysis:
             analysis = SimpleNamespace(ok=not bool(existing_analysis.get("is_broken")), **existing_analysis)
-            self.record_resource_demand(task, analysis)
+            self.record_memory_demand(task, analysis)
             return task
         precise_analysis = self._precise_resource_analysis(task, archive_size)
         if precise_analysis is not None:
             task.fact_bag.set("resource.analysis", precise_analysis)
             self._write_resource_payload(task, analysis=precise_analysis)
             analysis = SimpleNamespace(ok=not bool(precise_analysis.get("is_broken")), **precise_analysis)
-            self.record_resource_demand(task, analysis)
+            self.record_memory_demand(task, analysis)
             return task
         reason = (
             "estimated small-archive resource profile"
@@ -53,18 +53,10 @@ class ResourcePreflightInspector:
         )
         return self.record_estimated_profile(task, reason=reason, archive_size=archive_size)
 
-    def record_resource_demand(self, task: ArchiveTask, analysis) -> None:
-        demand = estimate_resource_demand(analysis)
-        profile_key = build_resource_profile_key(analysis)
-        task.fact_bag.set("resource.tokens", demand.as_dict())
-        task.fact_bag.set("resource.token_cost", demand.scalar_cost)
-        task.fact_bag.set("resource.profile_key", profile_key)
-        self._write_resource_payload(
-            task,
-            tokens=demand.as_dict(),
-            token_cost=demand.scalar_cost,
-            profile_key=profile_key,
-        )
+    def record_memory_demand(self, task: ArchiveTask, analysis) -> None:
+        memory_weight = estimate_memory_weight(analysis)
+        task.fact_bag.set("resource.memory_weight", memory_weight)
+        self._write_resource_payload(task, memory_weight=memory_weight)
 
     def record_estimated_profile(
         self,
@@ -72,7 +64,6 @@ class ResourcePreflightInspector:
         *,
         reason: str = "estimated resource profile",
         archive_size: int | None = None,
-        profile_suffix: str = "estimated",
     ) -> ArchiveTask:
         archive_size = self._archive_size(task) if archive_size is None else archive_size
         archive_type = self._archive_type_for(task)
@@ -96,20 +87,14 @@ class ResourcePreflightInspector:
         }
         task.fact_bag.set("resource.analysis", analysis)
         self._write_resource_payload(task, analysis=analysis)
-        tokens = self._estimated_tokens_for_size(archive_size)
-        token_cost = max(tokens.values())
-        profile_key = f"{archive_type or 'unknown'}|{profile_suffix}|size<{self.precise_resource_min_size_bytes // (1024 * 1024)}m"
-        task.fact_bag.set("resource.tokens", tokens)
-        task.fact_bag.set("resource.token_cost", token_cost)
-        task.fact_bag.set("resource.profile_key", profile_key)
-        self._write_resource_payload(task, tokens=tokens, token_cost=token_cost, profile_key=profile_key)
+        task.fact_bag.set("resource.memory_weight", 1)
+        self._write_resource_payload(task, memory_weight=1)
         return task
 
     def record_estimated_single_task_profile(self, task: ArchiveTask) -> ArchiveTask:
         return self.record_estimated_profile(
             task,
             reason="estimated single-task resource profile",
-            profile_suffix="estimated|single",
         )
 
     def _precise_resource_analysis(self, task: ArchiveTask, archive_size: int) -> dict | None:
@@ -160,13 +145,6 @@ class ResourcePreflightInspector:
             return ""
         return self.password_session.get_resolved(task.key) or ""
 
-    def _record_unknown(self, task: ArchiveTask) -> ArchiveTask:
-        task.fact_bag.set("resource.tokens", {"cpu": 1, "io": 1, "memory": 1})
-        task.fact_bag.set("resource.token_cost", 1)
-        task.fact_bag.set("resource.profile_key", "unknown")
-        self._write_resource_payload(task, tokens={"cpu": 1, "io": 1, "memory": 1}, token_cost=1, profile_key="unknown")
-        return task
-
     def _archive_type_for(self, task: ArchiveTask) -> str:
         archive_type = str(knowledge_view.selected_format(task) or "").strip().lower().lstrip(".")
         if archive_type in {"seven_zip", "7zip"}:
@@ -193,33 +171,22 @@ class ResourcePreflightInspector:
                 pass
         return archive_size
 
-    def _estimated_tokens_for_size(self, archive_size: int) -> dict[str, int]:
-        archive_mb = max(0, int(archive_size or 0)) / (1024 * 1024)
-        io = 1
-        if archive_mb >= 4096:
-            io = 4
-        elif archive_mb >= 1024:
-            io = 3
-        elif archive_mb >= 256:
-            io = 2
-        return {"cpu": 1, "io": io, "memory": 1}
-
     def _write_resource_payload(
         self,
         task: ArchiveTask,
         *,
         analysis: dict | None = None,
-        tokens: dict | None = None,
-        token_cost: int | None = None,
-        profile_key: str = "",
+        memory_weight: int | None = None,
     ) -> None:
         knowledge = ensure_knowledge(task)
         if analysis:
             write_payload(knowledge, "resource.analysis", dict(analysis), source_layer="resource", source_module="preflight")
-        if tokens:
-            write_payload(knowledge, "resource.tokens", dict(tokens), source_layer="resource", source_module="preflight")
-        if token_cost is not None:
-            write_payload(knowledge, "resource", {"token_cost": int(token_cost or 0)}, source_layer="resource", source_module="preflight")
-        if profile_key:
-            write_payload(knowledge, "resource", {"profile_key": profile_key}, source_layer="resource", source_module="preflight")
+        if memory_weight is not None:
+            write_payload(
+                knowledge,
+                "resource",
+                {"memory_weight": max(1, int(memory_weight or 1))},
+                source_layer="resource",
+                source_module="preflight",
+            )
         commit_task_knowledge(task, knowledge)

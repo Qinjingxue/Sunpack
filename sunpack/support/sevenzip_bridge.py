@@ -1,5 +1,4 @@
 import ctypes
-import json
 import sys
 import threading
 from dataclasses import dataclass
@@ -42,22 +41,6 @@ class NativeArchiveResourceAnalysis:
     def ok(self) -> bool:
         return self.status == STATUS_OK and self.is_archive and not self.is_broken
 
-
-@dataclass(frozen=True)
-class NativeArchiveCrcManifest:
-    status: int
-    is_archive: bool
-    encrypted: bool
-    damaged: bool
-    checksum_error: bool
-    item_count: int
-    file_count: int
-    files: list[dict]
-    message: str
-
-    @property
-    def ok(self) -> bool:
-        return self.status == STATUS_OK and self.is_archive and not self.damaged and not self.checksum_error
 
 
 class _Sup7zArchiveResourceAnalysis(ctypes.Structure):
@@ -129,43 +112,6 @@ class NativeSevenZipBridge:
             message=message.value,
         )
 
-    def read_archive_crc_manifest(
-        self,
-        archive_path: str,
-        password: str = "",
-        part_paths: list[str] | None = None,
-        max_items: int = 200000,
-    ) -> NativeArchiveCrcManifest:
-        library = self._load()
-
-        normalized_parts, part_array = self._part_array(archive_path, part_paths)
-        manifest_json = ctypes.create_unicode_buffer(_manifest_buffer_chars(max_items))
-        message = ctypes.create_unicode_buffer(512)
-
-        status = library.sup7z_read_archive_crc_manifest_with_parts(
-            ctypes.c_wchar_p(str(archive_path)),
-            part_array,
-            ctypes.c_int(len(normalized_parts)),
-            ctypes.c_wchar_p(str(password or "")),
-            ctypes.c_int(max(0, int(max_items or 0))),
-            manifest_json,
-            ctypes.c_int(len(manifest_json)),
-            message,
-            ctypes.c_int(len(message)),
-        )
-        payload = _parse_manifest_json(manifest_json.value)
-        return NativeArchiveCrcManifest(
-            status=int(status),
-            is_archive=bool(payload.get("is_archive", False)),
-            encrypted=bool(payload.get("encrypted", False)),
-            damaged=bool(payload.get("damaged", False)),
-            checksum_error=bool(payload.get("checksum_error", False)),
-            item_count=int(payload.get("item_count", 0) or 0),
-            file_count=int(payload.get("file_count", 0) or 0),
-            files=list(payload.get("files") or []),
-            message=message.value,
-        )
-
     def _load(self):
         if self._library is not None:
             return self._library
@@ -194,33 +140,8 @@ class NativeSevenZipBridge:
                 ctypes.c_int,
             ]
             library.sup7z_analyze_archive_resources_with_parts.restype = ctypes.c_int
-            self._bind_optional_crc_manifest_api(library)
             self._library = library
             return library
-
-    def _bind_optional_crc_manifest_api(self, library) -> None:
-        library.sup7z_read_archive_crc_manifest.argtypes = [
-            ctypes.c_wchar_p,
-            ctypes.c_wchar_p,
-            ctypes.c_int,
-            ctypes.c_wchar_p,
-            ctypes.c_int,
-            ctypes.c_wchar_p,
-            ctypes.c_int,
-        ]
-        library.sup7z_read_archive_crc_manifest.restype = ctypes.c_int
-        library.sup7z_read_archive_crc_manifest_with_parts.argtypes = [
-            ctypes.c_wchar_p,
-            ctypes.POINTER(ctypes.c_wchar_p),
-            ctypes.c_int,
-            ctypes.c_wchar_p,
-            ctypes.c_int,
-            ctypes.c_wchar_p,
-            ctypes.c_int,
-            ctypes.c_wchar_p,
-            ctypes.c_int,
-        ]
-        library.sup7z_read_archive_crc_manifest_with_parts.restype = ctypes.c_int
 
     def _default_wrapper_path(self) -> str:
         candidates: list[Path] = []
@@ -259,22 +180,6 @@ def _cache_key(bridge: NativeSevenZipBridge, archive_path: str, part_paths: list
     )
 
 
-def _parse_manifest_json(value: str) -> dict:
-    try:
-        parsed = json.loads(value or "{}")
-    except json.JSONDecodeError:
-        return {}
-    return parsed if isinstance(parsed, dict) else {}
-
-
-def _manifest_buffer_chars(max_items: int) -> int:
-    try:
-        item_count = max(1, int(max_items or 0))
-    except (TypeError, ValueError):
-        item_count = 1
-    return min(max(1024 * 1024, item_count * 256), 16 * 1024 * 1024)
-
-
 def cached_analyze_archive_resources(archive_path: str, password: str = "", part_paths: list[str] | None = None) -> NativeArchiveResourceAnalysis:
     bridge = get_native_sevenzip_bridge()
     password = password or ""
@@ -284,23 +189,3 @@ def cached_analyze_archive_resources(archive_path: str, password: str = "", part
         lambda: bridge.analyze_archive_resources(archive_path, password=password, part_paths=part_paths),
     )
 
-
-def cached_read_archive_crc_manifest(
-    archive_path: str,
-    password: str = "",
-    part_paths: list[str] | None = None,
-    max_items: int = 200000,
-) -> NativeArchiveCrcManifest:
-    bridge = get_native_sevenzip_bridge()
-    password = password or ""
-    max_items = max(0, int(max_items or 0))
-    return cached_value(
-        "native_7z_crc_manifest",
-        _cache_key(bridge, archive_path, part_paths) + (password, max_items),
-        lambda: bridge.read_archive_crc_manifest(
-            archive_path,
-            password=password,
-            part_paths=part_paths,
-            max_items=max_items,
-        ),
-    )
