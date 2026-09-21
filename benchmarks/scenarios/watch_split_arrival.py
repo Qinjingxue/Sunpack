@@ -67,7 +67,7 @@ def _arrival_order(sources: list[Path], policy: str) -> list[Path]:
 
 
 def _manifest(root: Path, source_names: set[str]) -> list[dict[str, Any]]:
-    excluded = source_names | {"state.json", "events.jsonl", ".sunpack-passwords.txt"}
+    excluded = source_names | {"state.json", "events.jsonl", "sunpack-passwords.txt"}
     rows: list[dict[str, Any]] = []
     for path in sorted(root.rglob("*")):
         if not path.is_file() or path.name in excluded:
