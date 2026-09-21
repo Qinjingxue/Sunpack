@@ -72,7 +72,7 @@ Sunpack为达到最大方便性，在使用时会尝试从各处获取密码，�
 - 内置密码文件：每次解压均使用，可在watch模式下使用托盘右键菜单打开修改，安装版位于%ProgramData%\SunPack\builtin_passwords.txt。其中watch模式会自动收集剪贴板历史记录写入该文件，上限配置默认30条
 - 用户输入：右键菜单，CLI调出的交互输入密码模式的输入
 - 剪贴板：解压前自动读取剪贴板文本作为密码
-- 目录下的密码记录文件：自动寻找目录下的.sunpack-passwords.txt，读取每行作为一个密码，watch模式会自动创建
+- 目录下的密码记录文件：自动寻找目录下的sunpack-passwords.txt，读取每行作为一个密码；watch模式默认会自动创建，可将 `watch.directory_password_file_auto_create` 设为 `false` 关闭自动创建
 
 ---
 

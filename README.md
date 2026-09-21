@@ -72,7 +72,7 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 - Built-in password file: used on every extraction. It can be opened and edited from the tray context menu in watch mode, and lives at `%ProgramData%\SunPack\builtin_passwords.txt` in the installed version. Watch mode automatically collects clipboard history into this file, with a default limit of 30 entries.
 - User input: the context menu, and the interactive password prompt launched from the CLI.
 - Clipboard: the clipboard text is read as a password before extraction.
-- Per-directory password file: SunPack automatically looks for `.sunpack-passwords.txt` in the directory and reads each line as one password; watch mode creates it automatically.
+- Per-directory password file: SunPack automatically looks for `sunpack-passwords.txt` in the directory and reads each line as one password; watch mode creates it automatically by default. Set `watch.directory_password_file_auto_create` to `false` to disable automatic creation.
 
 ---
 

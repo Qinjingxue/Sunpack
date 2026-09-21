@@ -541,7 +541,7 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
         passwords["sfxrar"],
         passwords["sfxzip"],
     ]
-    (mixed / ".sunpack-passwords.txt").write_text(
+    (mixed / "sunpack-passwords.txt").write_text(
         "\n".join(password_candidates) + "\n",
         encoding="utf-8",
     )

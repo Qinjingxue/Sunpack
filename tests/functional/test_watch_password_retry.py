@@ -71,7 +71,7 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
 
     builtin_path = tmp_path / "builtin_passwords.txt"
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-    directory_password_file = watch_root / ".sunpack-passwords.txt"
+    directory_password_file = watch_root / "sunpack-passwords.txt"
     if source == "directory":
         wrong_password = "wrong-password"
         while zip_fast_verify_passwords(str(archive), [wrong_password]).get("status") != "no_match":
@@ -175,7 +175,7 @@ def test_watch_aggregates_all_zipcrypto_fast_matches(tmp_path, monkeypatch, incl
 
     builtin_path = tmp_path / "builtin_passwords.txt"
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-    (watch_root / ".sunpack-passwords.txt").write_text(
+    (watch_root / "sunpack-passwords.txt").write_text(
         "".join(f"{candidate}\n" for candidate in supplied_passwords),
         encoding="utf-8",
     )

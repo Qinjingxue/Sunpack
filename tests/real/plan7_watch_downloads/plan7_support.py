@@ -496,7 +496,7 @@ def start_watch(
     output_root = tmp_path / label / "out"
     watch_root.mkdir(parents=True, exist_ok=True)
     output_root.mkdir(parents=True, exist_ok=True)
-    (watch_root / ".sunpack-passwords.txt").write_text(
+    (watch_root / "sunpack-passwords.txt").write_text(
         "\n".join(passwords) + "\n",
         encoding="utf-8",
     )

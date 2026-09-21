@@ -237,6 +237,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `runtime_cache_cleanup_idle_seconds` | `10.0` | 共享空闲维护等待时间。到期时 CLI process-mode override 失效；`runtime_cache_cleanup_enabled` 为 true 时同时清理运行缓存。 |
 | `password_retry_debounce_seconds` | `0.5` | 密码文件或剪贴板变化后，触发失败任务重试前的等待时间。 |
 | `password_retry_include_subtree` | `true` | 密码来源变化时是否重试对应目录的子树任务。 |
+| `directory_password_file_auto_create` | `true` | Watch 是否在每个监控目录下自动创建 `sunpack-passwords.txt`；设为 `false` 时仍会读取已有文件。 |
 | `clipboard_monitor_enabled` | `true` | 是否监控剪贴板密码变化。 |
 | `clipboard_builtin_max_entries` | `30` | 保留的剪贴板密码数量。 |
 | `enabled` | `false` | 配置层标记；CLI 服务实际运行状态由 `watch start` 和 `watch stop` 管理。 |
@@ -268,7 +269,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `directory_passwords_max_file_bytes` | `1048576` | 同目录密码文件的最大读取大小。 |
 | `directory_passwords_max_password_length` | `512` | 单条密码的最大长度。 |
 
-同目录密码文件名为 `.sunpack-passwords.txt`，一行一个密码。归档解压时，候选来源按“最近成功密码 → 同目录密码 → CLI 参数和密码文件 → 剪贴板 → 内置密码”合并并去重；在归档加密状态尚未确定时，空密码也可能作为首个候选尝试。`--no-builtin-pw` 和 `--no-dir-pw` 可以分别关闭内置密码和同目录密码。
+同目录密码文件名为 `sunpack-passwords.txt`，一行一个密码。归档解压时，候选来源按“最近成功密码 → 同目录密码 → CLI 参数和密码文件 → 剪贴板 → 内置密码”合并并去重；在归档加密状态尚未确定时，空密码也可能作为首个候选尝试。`--no-builtin-pw` 和 `--no-dir-pw` 可以分别关闭内置密码和同目录密码。
 
 ## extraction
 
@@ -387,7 +388,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 
 ## 密码表和密码文件
 
-`builtin_passwords.txt` 每行保存一个内置密码；文件缺失时程序会尝试创建默认文件。同目录密码文件为 `.sunpack-passwords.txt`，受 `passwords` 配置节的大小和长度限制。
+`builtin_passwords.txt` 每行保存一个内置密码；文件缺失时程序会尝试创建默认文件。同目录密码文件为 `sunpack-passwords.txt`，受 `passwords` 配置节的大小和长度限制。
 
 ## 修改建议
 

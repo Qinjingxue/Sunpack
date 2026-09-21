@@ -277,6 +277,7 @@ class WatchScheduler:
         )
         self.password_retry_debounce_seconds = max(0.0, float(watch_config["password_retry_debounce_seconds"]))
         self.password_retry_include_subtree = bool(watch_config["password_retry_include_subtree"])
+        self.directory_password_file_auto_create = bool(watch_config["directory_password_file_auto_create"])
         self._configured_user_passwords = dedupe_passwords(list(config.get("user_passwords") or []))
         self._configured_builtin_passwords = dedupe_passwords(list(config.get("builtin_passwords") or []))
         self.builtin_password_file = os.path.abspath(str(builtin_passwords_module.builtin_password_path()))
@@ -710,6 +711,8 @@ class WatchScheduler:
                 )
 
     def _ensure_directory_password_files(self) -> None:
+        if not self.directory_password_file_auto_create:
+            return
         for root in self.watch_roots:
             if not os.path.isdir(root):
                 continue

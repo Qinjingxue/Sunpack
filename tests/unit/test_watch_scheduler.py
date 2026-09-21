@@ -829,7 +829,7 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
 
     assert watcher.pending_count == 1
     assert FakeObserver.started_count == 1
-    assert (watch_root / ".sunpack-passwords.txt").read_text(encoding="utf-8") == ""
+    assert (watch_root / "sunpack-passwords.txt").read_text(encoding="utf-8") == ""
 
     _await(watcher.stop())
     assert FakeObserver.stopped_count == 1
@@ -887,7 +887,7 @@ def test_watch_scheduler_preserves_existing_directory_password_file(tmp_path, mo
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     watch_root = tmp_path / "in"
     watch_root.mkdir()
-    password_file = watch_root / ".sunpack-passwords.txt"
+    password_file = watch_root / "sunpack-passwords.txt"
     password_file.write_text("existing-secret\n", encoding="utf-8")
 
     watcher = WatchScheduler(
@@ -2741,7 +2741,7 @@ def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path,
     watch_root = tmp_path / "in"
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
-    password_table = watch_root / ".sunpack-passwords.txt"
+    password_table = watch_root / "sunpack-passwords.txt"
     archive_path.write_bytes(b"PK\x03\x04payload")
     password_table.write_text("secret\n", encoding="utf-8")
 
@@ -2768,7 +2768,7 @@ def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path,
 
     assert result.succeeded == 1
     assert attempts["count"] == 2
-    assert not any(path.endswith(".sunpack-passwords.txt") for path in watcher._pending)
+    assert not any(path.endswith("sunpack-passwords.txt") for path in watcher._pending)
 
 
 def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):

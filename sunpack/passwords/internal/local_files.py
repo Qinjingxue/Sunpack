@@ -9,7 +9,7 @@ from sunpack.passwords.internal.lists import dedupe_passwords, read_password_fil
 
 
 DIRECTORY_PASSWORD_CONTEXT_FACT = "passwords.directory_context"
-DIRECTORY_PASSWORD_FILE_NAME = ".sunpack-passwords.txt"
+DIRECTORY_PASSWORD_FILE_NAME = "sunpack-passwords.txt"
 def discover_directory_passwords_for_archive(archive_path: str, config: dict | None = None) -> list[str]:
     directory = os.path.dirname(os.path.abspath(archive_path or ""))
     if not directory or not os.path.isdir(directory):
