@@ -956,6 +956,7 @@ namespace sunpack::sevenzip
             phase_ = NativeControllerPhase::Baseline;
             decision_ = NativeControllerDecision::None;
             last_measurement_ = {};
+            accepted_probe_ = false;
             anchor_ = {};
             probe_measurement_ = {};
             probe_limit_ = active_limit_;
