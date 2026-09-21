@@ -28,6 +28,7 @@ SunPack identifies archives by binary signatures rather than file extensions, an
   - [Development](#development)
   - [Architecture at a glance](#architecture-at-a-glance)
   - [Testing](#testing)
+  - [Reproducible worker vs. 7-Zip benchmark](#reproducible-worker-vs-7-zip-benchmark)
 - [License](#license)
 
 ## Installation
@@ -175,6 +176,33 @@ Acceptance tests:
 ```powershell
 .\run_acceptance_tests.ps1
 ```
+
+### Reproducible worker vs. 7-Zip benchmark
+
+Detailed machine identity, archive construction, compression methods, and
+reproduction instructions are in [the benchmark document](docs/benchmark_worker_vs_7z_300m.md).
+Times are per-case medians in milliseconds.
+
+| Format / variant | SunPack worker | `7z.exe` | worker / `7z.exe` |
+| ---------------- | -------------: | -------: | ----------------: |
+| 7z split         |        152.350 |  209.230 |             0.728 |
+| 7z non-solid     |        207.955 |  252.429 |             0.824 |
+| 7z solid         |        161.992 |  207.314 |             0.781 |
+| BZip2            |       2661.051 | 2992.485 |             0.889 |
+| Gzip             |         84.008 |  204.110 |             0.412 |
+| RAR5 split       |        231.310 |  780.304 |             0.296 |
+| RAR4 non-solid   |        170.658 |  183.902 |             0.928 |
+| RAR4 solid       |        645.206 |  659.011 |             0.979 |
+| RAR5 non-solid   |        126.918 |  184.521 |             0.688 |
+| RAR5 solid       |        212.166 |  759.690 |             0.279 |
+| TAR              |         86.768 |  123.733 |             0.701 |
+| TBZ2             |       2533.095 | 2975.355 |             0.851 |
+| TGZ              |         84.924 |  201.506 |             0.421 |
+| TXZ              |        177.336 |  179.254 |             0.989 |
+| TZST             |         89.280 |  154.064 |             0.579 |
+| XZ               |        178.589 |  182.980 |             0.976 |
+| ZIP              |         94.941 |  197.796 |             0.480 |
+| ZST              |         96.481 |  155.547 |             0.620 |
 
 ---
 

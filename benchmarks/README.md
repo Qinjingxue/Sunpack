@@ -28,6 +28,7 @@ python -m benchmarks reader embedded-scan --generate-plan5-mib 500 --rounds 3 --
 python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
 python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
 python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
+python -m benchmarks extraction worker-vs-7z-300m --small-files 8 --large-files 2 --large-file-mib 150 --runs 5 --warmups 0 --worker-source-commit 86587874 --sunpack-version v0.6.2 --json-out benchmarks/results/worker-vs-7z-300m.json
 python -m benchmarks extraction worker-read-blocking --runs 1 --payload-gib 1 --json-out benchmarks/results/worker-read-blocking.json
 python -m benchmarks extraction worker-read-patterns --runs 1 --json-out benchmarks/results/worker-read-patterns.json
 # Enable the production format-aware prefetch policy while tuning its defaults (512 KiB x 2).
@@ -155,6 +156,20 @@ generates tiny/small/medium/large profiles by default, and records per-run worke
 worker CPU time, child-process RSS peak, output statistics, native status, and failures.
 Use repeated or comma-separated `--profile` values and repeated `--format` values to
 focus the matrix. Durable results contain both `report.json` and `results.csv`.
+
+`extraction worker-vs-7z-300m` is the standalone reproduction of the documented
+300 MiB end-to-end comparison. It builds the deterministic `few_large` corpus
+(one repeated-text 150 MiB member plus one fixed-seed random 150 MiB member),
+adds explicit 7z/RAR5/RAR4 solid and non-solid variants, and covers 7z split,
+RAR split, ZIP, TAR, Gzip, BZip2, XZ, Zstandard, and their compressed-TAR
+aliases. Each case reuses one persistent native worker for its measured runs;
+each reference run starts a new `7z.exe` process. The result records the exact
+archive volume sizes, archive-listing method/solid fields, payload-to-archive
+ratio, CPU/memory/disk inventory, active power scheme, tool hashes, all raw
+samples, and per-case medians. `--metadata-only` generates only the corpus
+catalog. The full interpretation, machine identity, and recorded v0.6.2 result
+are documented in [English](../docs/benchmark_worker_vs_7z_300m.md) and
+[简体中文](../docs/zh-CN/benchmark_worker_vs_7z_300m.md).
 
 `extraction worker-small-file-scheduling` measures the worker-internal thread
 scheduler under a deliberately adversarial many-small-file workload. It creates
