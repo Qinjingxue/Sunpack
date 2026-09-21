@@ -26,7 +26,7 @@ uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
 Smoke test:
 
 ```powershell
-.\.venv\Scripts\python.exe -c "import sunpack_native; print(sunpack_native.native_available(), sunpack_native.scanner_version())"
+.\.venv\Scripts\python.exe -c "import sunpack_native; print(sunpack_native.native_available())"
 ```
 
 ## API
@@ -34,7 +34,6 @@ Smoke test:
 `native_available()` returns `True` from the native module and is used by smoke
 tests to confirm the extension was imported.
 
-`scanner_version()` returns the crate package version.
 
 `scan_directory_snapshot(...)` walks a directory tree, applies every built-in
 filesystem filter, and returns one `NativeDirectorySnapshot`. Entry data stays
