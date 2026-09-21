@@ -359,7 +359,9 @@ bool check_runtime_control_marks_probe_contaminated_on_environment_shift() {
 
 bool check_runtime_control_detects_passive_environment_change() {
     using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    auto config = deterministic_runtime_config(4);
+    config.hold_windows = 9;
+    NativeRuntimeControl controller(8, config);
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
