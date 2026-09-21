@@ -2815,11 +2815,18 @@ HRESULT CDecoder::DecodeLZParallel()
     }
     _isLastBlock = job.LastBlock;
 
-    for (const CRar5ParallelDecodedItem &item : job.Decoded)
+    size_t decodedIndex = 0;
+    while (decodedIndex < job.Decoded.size())
     {
+      // Most decoded tokens are far from a write boundary. Normalize once per
+      // boundary segment instead of running the full slow path for every token.
       RINOK(normalizeWindow())
 
-      switch (item.Type)
+      do
+      {
+        const CRar5ParallelDecodedItem &item = job.Decoded[decodedIndex++];
+
+        switch (item.Type)
       {
       case RAR5_MT_LITERAL:
         memcpy(_window + winPos, item.Literal, item.LiteralSize);
@@ -2862,9 +2869,11 @@ HRESULT CDecoder::DecodeLZParallel()
         RINOK(addFilterRetired(item))
         break;
 
-      default:
-        return E_FAIL;
+        default:
+          return E_FAIL;
+        }
       }
+      while (decodedIndex < job.Decoded.size() && winPos < limit);
     }
 
     _winPos = winPos;
