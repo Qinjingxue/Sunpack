@@ -269,5 +269,5 @@ The following obsolete probes were intentionally removed during consolidation:
 - the separate SunPack-versus-7-Zip runner, subsumed by the format matrix baseline.
 
 Use pytest only for stable product contracts. Opt-in timing/resource assertions are
-marked `performance` and run with `pytest --run-performance`; multi-GB resource-guard
+marked `performance` and run with `pytest --run-performance`; multi-GB large-archive
 tests additionally require `--run-large-archive-performance`.

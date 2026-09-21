@@ -1,3 +1,5 @@
+import zipfile
+
 from sunpack.contracts.detection import FactBag
 from sunpack.contracts.tasks import ArchiveTask
 from sunpack.contracts.extraction import ExtractionResult
@@ -6,14 +8,13 @@ from sunpack.verification import VerificationScheduler
 
 def test_expected_name_matching_is_case_and_path_normalized(tmp_path):
     archive = tmp_path / "sample.zip"
-    archive.write_bytes(b"zip")
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("docs/readme.txt", "hello")
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     (out_dir / "Docs").mkdir()
     (out_dir / "Docs" / "Readme.TXT").write_text("hello", encoding="utf-8")
-    bag = FactBag()
-    bag.set("resource.analysis", {"expected_names": ["docs/readme.txt"]})
-    task = ArchiveTask(fact_bag=bag, key="sample", main_path=str(archive), all_parts=[str(archive)])
+    task = ArchiveTask(fact_bag=FactBag(), key="sample", main_path=str(archive), all_parts=[str(archive)], detected_ext="zip")
     result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
 
     verification = VerificationScheduler({

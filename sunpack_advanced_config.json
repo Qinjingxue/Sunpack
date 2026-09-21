@@ -98,13 +98,6 @@
       "space_gate_enabled": true,
       "space_poll_interval_ms": 1000,
       "space_status_report_interval_ms": 15000
-    },
-    "resource_guard": {
-      "enabled": false,
-      "max_file_count": 0,
-      "max_total_unpacked_size": 0,
-      "max_largest_item_size": 0,
-      "max_compression_ratio": 0
     }
   },
   "runtime": {

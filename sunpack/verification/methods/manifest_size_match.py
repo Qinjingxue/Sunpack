@@ -1,5 +1,4 @@
 from sunpack.config.advanced_defaults import advanced_named_config
-from sunpack.support.sevenzip_bridge import STATUS_DAMAGED, STATUS_OK
 from sunpack.verification.archive_state_manifest import ArchiveStateManifest, archive_state_manifest_for_evidence
 from sunpack.verification.evidence import VerificationEvidence
 from sunpack.verification.methods._archive_output_match import (
@@ -37,9 +36,9 @@ class ManifestSizeMatchMethod:
             evidence,
             max_items=max(1, int(config.get("max_expected_names", 2000) or 2000)),
         )
-        expected_files = _expected_file_count(evidence, state_manifest)
-        expected_size = _expected_total_size(evidence, state_manifest)
-        expected_names = _expected_names(evidence, state_manifest)
+        expected_files = _expected_file_count(state_manifest)
+        expected_size = _expected_total_size(state_manifest)
+        expected_names = _expected_names(state_manifest)
         if expected_files <= 0 and expected_size <= 0:
             return VerificationStepResult(method=self.name, status="skipped")
 
@@ -75,7 +74,7 @@ class ManifestSizeMatchMethod:
                     message="Some manifest-named files were not found in extraction output",
                     path=evidence.output_dir,
                     expected=len(expected_names),
-                    actual=_coverage_actual(name_coverage, state_manifest, evidence),
+                    actual=_coverage_actual(name_coverage, state_manifest),
                 ))
 
         if expected_files > 0:
@@ -165,13 +164,6 @@ class ManifestSizeMatchMethod:
         )
 
 
-def _as_int(value) -> int:
-    try:
-        return max(0, int(value or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
 def _identity_worker_inventory(evidence) -> dict | None:
     worker = evidence.worker_result if isinstance(evidence.worker_result, dict) else {}
     manifest = worker.get("verified_manifest") if isinstance(worker.get("verified_manifest"), dict) else {}
@@ -208,62 +200,26 @@ def _content_integrity_hint(state_manifest: ArchiveStateManifest | None = None) 
     return CONTENT_INTEGRITY_UNKNOWN
 
 
-def _expected_names(evidence: VerificationEvidence, state_manifest: ArchiveStateManifest | None = None) -> list[str]:
-    names = list(state_manifest.expected_names) if state_manifest is not None and state_manifest.ok else []
-    analysis = _merged_analysis(evidence)
-    for field in ("expected_names", "manifest_names", "item_names", "file_names", "paths"):
-        names.extend(_iter_names(analysis.get(field)))
-    result = []
-    seen = set()
-    for name in names:
-        if name in seen:
-            continue
-        seen.add(name)
-        result.append(name)
-    return result[:2000]
+def _expected_names(state_manifest: ArchiveStateManifest | None = None) -> list[str]:
+    if state_manifest is None or not state_manifest.ok:
+        return []
+    return list(state_manifest.expected_names)[:2000]
 
 
-def _expected_file_count(evidence: VerificationEvidence, state_manifest: ArchiveStateManifest) -> int:
-    if state_manifest.ok and state_manifest.file_count > 0:
-        return state_manifest.file_count
-    return _as_int(_merged_analysis(evidence).get("file_count"))
+def _expected_file_count(state_manifest: ArchiveStateManifest) -> int:
+    return int(state_manifest.file_count or 0) if state_manifest.ok else 0
 
 
-def _expected_total_size(evidence: VerificationEvidence, state_manifest: ArchiveStateManifest) -> int:
-    if state_manifest.ok and state_manifest.total_unpacked_size > 0:
-        return state_manifest.total_unpacked_size
-    return _as_int(_merged_analysis(evidence).get("total_unpacked_size"))
+def _expected_total_size(state_manifest: ArchiveStateManifest) -> int:
+    return int(state_manifest.total_unpacked_size or 0) if state_manifest.ok else 0
 
 
-def _merged_analysis(evidence: VerificationEvidence) -> dict:
-    merged = {}
-    for payload in (evidence.archive_state_analysis, evidence.analysis_facts, evidence.analysis):
-        if isinstance(payload, dict):
-            merged.update(payload)
-    return merged
-
-
-def _coverage_actual(coverage, state_manifest: ArchiveStateManifest, evidence: VerificationEvidence) -> dict:
+def _coverage_actual(coverage, state_manifest: ArchiveStateManifest) -> dict:
     actual = coverage_details(coverage)
     actual.update({
         "source_manifest": True,
         "archive_type": state_manifest.archive_type,
-        "manifest_source": state_manifest.source if state_manifest.ok else "analysis_estimate",
+        "manifest_source": state_manifest.source,
     })
     return actual
 
-
-def _iter_names(value):
-    if value is None:
-        return
-    if isinstance(value, str):
-        yield value
-        return
-    if isinstance(value, dict):
-        for key in ("path", "name", "file", "filename"):
-            if key in value:
-                yield from _iter_names(value.get(key))
-        return
-    if isinstance(value, (list, tuple, set)):
-        for item in value:
-            yield from _iter_names(item)

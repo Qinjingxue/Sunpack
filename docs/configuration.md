@@ -211,16 +211,6 @@ Both resource analysis and worker parameters live under `performance`. Defaults 
 
 Automatic concurrency is driven mainly by the throughput of actual writes, completed jobs, and completed files. Large tasks compare bytes/second, small tasks compare jobs/second or files/second; when throughput drops, the system returns to the stable concurrency and enters cooldown. Format, algorithm, solid state, and file count are not used as extra CPU weights. Resource diagnostics are sampled only when explicitly enabled.
 
-### resource_guard
-
-| Field | Default | Description |
-| --- | ---: | --- |
-| `enabled` | `false` | Whether the resource guard is enabled. |
-| `max_file_count` | `0` | Entry count limit; `0` means unlimited. |
-| `max_total_unpacked_size` | `0` | Total unpacked size limit, in bytes; `0` means unlimited. |
-| `max_largest_item_size` | `0` | Single largest entry limit, in bytes; `0` means unlimited. |
-| `max_compression_ratio` | `0` | Compression ratio limit; `0` means unlimited. |
-
 ## watch
 
 `watch` controls the waiting, output, clipboard, and notification behavior of the monitoring service. CLI monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory; each line may hold `input directory` or `input directory | output root`.

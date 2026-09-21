@@ -60,7 +60,6 @@ _EXECUTION = {
     "process_stall",
     "process_start",
     "process_timeout",
-    "resource_guard",
     "unsupported",
     "unsupported_method",
 }
