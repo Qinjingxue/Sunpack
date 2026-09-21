@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 
 namespace sunpack::sevenzip
 {
@@ -41,6 +42,7 @@ namespace sunpack::sevenzip
     {
         Baseline,
         Probe,
+        Verify,
         Cooldown,
         Hold
     };
@@ -60,8 +62,11 @@ namespace sunpack::sevenzip
         BaselineReady,
         ProbeUp,
         ProbeDown,
+        VerifyStarted,
         Accepted,
         RolledBack,
+        Contaminated,
+        EnvironmentChanged,
         Holding,
     };
 
@@ -165,6 +170,11 @@ namespace sunpack::sevenzip
             if (load_state_ == NativeLoadState::Idle)
             {
                 return false;
+            }
+            if (phase_ == NativeControllerPhase::Probe ||
+                phase_ == NativeControllerPhase::Verify)
+            {
+                active_limit_ = best_limit_;
             }
             prime_counters(current_counters);
             reset_learning_state();
@@ -434,7 +444,8 @@ namespace sunpack::sevenzip
 
         void begin_saturated_segment() noexcept
         {
-            if (phase_ == NativeControllerPhase::Probe)
+            if (phase_ == NativeControllerPhase::Probe ||
+                phase_ == NativeControllerPhase::Verify)
             {
                 active_limit_ = best_limit_;
             }
@@ -446,7 +457,8 @@ namespace sunpack::sevenzip
 
         bool interrupt_saturated_segment() noexcept
         {
-            if (phase_ == NativeControllerPhase::Probe)
+            if (phase_ == NativeControllerPhase::Probe ||
+                phase_ == NativeControllerPhase::Verify)
             {
                 active_limit_ = best_limit_;
             }
@@ -526,25 +538,77 @@ namespace sunpack::sevenzip
         }
 
         NativeThroughputMode comparable_mode(
-            const Measurement &baseline,
-            const Measurement &probe) const noexcept
+            const Measurement &first,
+            const Measurement &second,
+            const Measurement *third = nullptr) const noexcept
         {
-            if (baseline.written_bytes >= large_window_bytes_ &&
-                probe.written_bytes >= large_window_bytes_)
+            const bool bytes_ready = first.written_bytes >= large_window_bytes_ &&
+                                     second.written_bytes >= large_window_bytes_ &&
+                                     (!third || third->written_bytes >= large_window_bytes_);
+            if (bytes_ready)
             {
                 return NativeThroughputMode::Bytes;
             }
-            if (baseline.completed_jobs >= small_window_jobs_ &&
-                probe.completed_jobs >= small_window_jobs_)
+            const bool jobs_ready = first.completed_jobs >= small_window_jobs_ &&
+                                    second.completed_jobs >= small_window_jobs_ &&
+                                    (!third || third->completed_jobs >= small_window_jobs_);
+            if (jobs_ready)
             {
                 return NativeThroughputMode::Jobs;
             }
-            if (baseline.completed_files >= small_window_files_ &&
-                probe.completed_files >= small_window_files_)
+            const bool files_ready = first.completed_files >= small_window_files_ &&
+                                     second.completed_files >= small_window_files_ &&
+                                     (!third || third->completed_files >= small_window_files_);
+            if (files_ready)
             {
                 return NativeThroughputMode::Files;
             }
             return NativeThroughputMode::None;
+        }
+
+        bool observe_stable_trend(const Measurement &measurement) noexcept
+        {
+            const double rate = measurement_rate(measurement, measurement.mode);
+            if (measurement.mode == NativeThroughputMode::None || rate <= 0.0)
+            {
+                return false;
+            }
+            const double log_rate = std::log(rate);
+            if (!stable_trend_primed_ || stable_trend_mode_ != measurement.mode)
+            {
+                stable_trend_mode_ = measurement.mode;
+                stable_fast_log_rate_ = log_rate;
+                stable_slow_log_rate_ = log_rate;
+                stable_change_cusum_ = 0.0;
+                stable_trend_primed_ = true;
+                return false;
+            }
+            constexpr double fast_alpha = 0.50;
+            constexpr double slow_alpha = 0.125;
+            stable_fast_log_rate_ += fast_alpha * (log_rate - stable_fast_log_rate_);
+            stable_slow_log_rate_ += slow_alpha * (log_rate - stable_slow_log_rate_);
+            const double deadband = (std::max)(
+                std::log(improvement_ratio_), -std::log(regression_ratio_));
+            const double evidence = std::abs(stable_fast_log_rate_ - stable_slow_log_rate_) - deadband;
+            stable_change_cusum_ = (std::max)(0.0, stable_change_cusum_ + evidence);
+            return stable_change_cusum_ >= deadband * 3.0;
+        }
+
+        void reset_stable_trend() noexcept
+        {
+            stable_trend_mode_ = NativeThroughputMode::None;
+            stable_fast_log_rate_ = 0.0;
+            stable_slow_log_rate_ = 0.0;
+            stable_change_cusum_ = 0.0;
+            stable_trend_primed_ = false;
+        }
+
+        bool mark_environment_changed() noexcept
+        {
+            reset_learning_state();
+            settle_remaining_seconds_ = settle_seconds_;
+            decision_ = NativeControllerDecision::EnvironmentChanged;
+            return true;
         }
 
         bool process_measurement(const Measurement &measurement) noexcept
@@ -552,6 +616,13 @@ namespace sunpack::sevenzip
             if (measurement.mode == NativeThroughputMode::None)
             {
                 return false;
+            }
+            if (phase_ != NativeControllerPhase::Probe &&
+                phase_ != NativeControllerPhase::Verify &&
+                active_limit_ == best_limit_ &&
+                observe_stable_trend(measurement))
+            {
+                return mark_environment_changed();
             }
             switch (phase_)
             {
@@ -561,8 +632,17 @@ namespace sunpack::sevenzip
                 decision_ = NativeControllerDecision::BaselineReady;
                 return launch_next_probe();
             case NativeControllerPhase::Probe:
-                return evaluate_probe(measurement);
+                probe_measurement_ = measurement;
+                probe_limit_ = active_limit_;
+                active_limit_ = best_limit_;
+                phase_ = NativeControllerPhase::Verify;
+                settle_remaining_seconds_ = settle_seconds_;
+                decision_ = NativeControllerDecision::VerifyStarted;
+                return true;
+            case NativeControllerPhase::Verify:
+                return evaluate_verified_probe(measurement);
             case NativeControllerPhase::Cooldown:
+                anchor_ = measurement;
                 if (++phase_windows_ >= cooldown_windows_)
                 {
                     phase_windows_ = 0;
@@ -574,6 +654,7 @@ namespace sunpack::sevenzip
                 }
                 return false;
             case NativeControllerPhase::Hold:
+                anchor_ = measurement;
                 if (++phase_windows_ >= hold_windows_)
                 {
                     phase_windows_ = 0;
@@ -581,7 +662,6 @@ namespace sunpack::sevenzip
                     tried_down_ = false;
                     probe_step_ = 1;
                     phase_ = NativeControllerPhase::Baseline;
-                    anchor_ = measurement;
                     decision_ = NativeControllerDecision::BaselineReady;
                     return launch_next_probe();
                 }
@@ -590,22 +670,43 @@ namespace sunpack::sevenzip
             return false;
         }
 
-        bool evaluate_probe(const Measurement &measurement) noexcept
+        bool evaluate_verified_probe(const Measurement &verification) noexcept
         {
-            const NativeThroughputMode mode = comparable_mode(anchor_, measurement);
+            const NativeThroughputMode mode = comparable_mode(anchor_, probe_measurement_, &verification);
             const double baseline_rate = measurement_rate(anchor_, mode);
-            const double probe_rate = measurement_rate(measurement, mode);
-            if (mode == NativeThroughputMode::None || baseline_rate <= 0.0 || probe_rate <= 0.0)
+            const double probe_rate = measurement_rate(probe_measurement_, mode);
+            const double verification_rate = measurement_rate(verification, mode);
+            if (mode == NativeThroughputMode::None || baseline_rate <= 0.0 ||
+                probe_rate <= 0.0 || verification_rate <= 0.0)
             {
                 rollback_probe();
                 return true;
             }
-            const double ratio = probe_rate / baseline_rate;
+
+            const double drift_limit = (std::max)(
+                improvement_ratio_ * improvement_ratio_,
+                1.0 / (regression_ratio_ * regression_ratio_));
+            const double environment_ratio = verification_rate / baseline_rate;
+            if (environment_ratio > drift_limit || environment_ratio < 1.0 / drift_limit)
+            {
+                active_limit_ = best_limit_;
+                reset_learning_state();
+                settle_remaining_seconds_ = settle_seconds_;
+                decision_ = NativeControllerDecision::Contaminated;
+                return true;
+            }
+
+            // A-B-A verification removes first-order environment drift from the probe comparison.
+            const double verified_baseline_rate = std::sqrt(baseline_rate * verification_rate);
+            const double ratio = probe_rate / verified_baseline_rate;
+            observe_stable_trend(verification);
             if (ratio >= improvement_ratio_)
             {
-                best_limit_ = active_limit_;
+                best_limit_ = probe_limit_;
+                active_limit_ = best_limit_;
                 remember_confirmed_limit(best_limit_);
-                anchor_ = measurement;
+                anchor_ = probe_measurement_;
+                reset_stable_trend();
                 decision_ = NativeControllerDecision::Accepted;
                 tried_up_ = false;
                 tried_down_ = false;
@@ -618,8 +719,11 @@ namespace sunpack::sevenzip
             if (probe_direction_ < 0 && ratio >= regression_ratio_)
             {
                 // Equal throughput at lower concurrency is a better operating point.
-                best_limit_ = active_limit_;
+                best_limit_ = probe_limit_;
+                active_limit_ = best_limit_;
                 remember_confirmed_limit(best_limit_);
+                anchor_ = probe_measurement_;
+                reset_stable_trend();
                 decision_ = NativeControllerDecision::Accepted;
                 tried_up_ = true;
                 tried_down_ = false;
@@ -717,7 +821,10 @@ namespace sunpack::sevenzip
             decision_ = NativeControllerDecision::None;
             last_measurement_ = {};
             anchor_ = {};
+            probe_measurement_ = {};
+            probe_limit_ = active_limit_;
             window_.clear();
+            reset_stable_trend();
             phase_windows_ = 0;
             tried_up_ = false;
             tried_down_ = false;
@@ -752,6 +859,8 @@ namespace sunpack::sevenzip
         NativeControllerDecision decision_ = NativeControllerDecision::None;
         Measurement last_measurement_;
         Measurement anchor_;
+        Measurement probe_measurement_;
+        std::size_t probe_limit_ = 1;
         Window window_;
         bool counters_primed_ = false;
         NativeThroughputCounters previous_counters_;
@@ -768,6 +877,12 @@ namespace sunpack::sevenzip
         std::size_t last_good_limit_ = 1;
         std::size_t confirmed_limit_samples_ = 0;
         bool warm_start_used_ = false;
+
+        NativeThroughputMode stable_trend_mode_ = NativeThroughputMode::None;
+        double stable_fast_log_rate_ = 0.0;
+        double stable_slow_log_rate_ = 0.0;
+        double stable_change_cusum_ = 0.0;
+        bool stable_trend_primed_ = false;
 
         bool diagnostic_cpu_valid_ = false;
         double diagnostic_cpu_percent_ = 0.0;
