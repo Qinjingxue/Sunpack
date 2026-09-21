@@ -22,7 +22,6 @@ if str(ROOT) not in sys.path:
 from benchmarks.harness import BenchmarkWorkspace, ProcessSampler, render_report, report_from_payload
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
 from sunpack.support.resources import get_sevenzip_bridge_worker_path
-from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
 SCENARIO = "extraction.worker-small-file-scheduling"
@@ -119,7 +118,6 @@ def _job_payload(
     request_id: str,
     archive: Path,
     output_dir: Path,
-    dll_path: Path,
     format_hint: str = "zip",
 ) -> str:
     return json.dumps(
@@ -141,7 +139,6 @@ def _run_batch(
     *,
     workspace: BenchmarkWorkspace,
     worker_path: Path,
-    dll_path: Path,
     corpus: dict[str, Any],
     capacity: int,
     client_count: int,
@@ -270,7 +267,6 @@ def _run_batch(
                     request_id=request_id,
                     archive=archive_paths[index],
                     output_dir=workspace.outputs / label / job_id,
-                    dll_path=dll_path,
                     format_hint=(
                         str(format_hints[index])
                         if format_hints
@@ -554,7 +550,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark native worker parallelism and resource admission for many small ZIP jobs.")
+    parser = argparse.ArgumentParser(description="Benchmark native worker throughput control for many small ZIP jobs.")
     parser.add_argument("--jobs", type=int, default=256)
     parser.add_argument("--clients", type=int, default=4)
     parser.add_argument("--capacities", default="1,2,4,8", help="Comma-separated native worker thread capacities.")
@@ -594,11 +590,10 @@ def main() -> int:
         parser.error("--sample-interval-ms must be between 100 and 5000")
     try:
         worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
-        dll_path = Path(get_7z_cli_dll_path()).resolve()
     except FileNotFoundError as exc:
         parser.error(str(exc))
-    if not worker_path.is_file() or not dll_path.is_file():
-        parser.error("native worker or 7z.dll is unavailable")
+    if not worker_path.is_file():
+        parser.error("native worker is unavailable")
 
     with BenchmarkWorkspace(SCENARIO, results_root=args.results_root, keep_workdir=args.keep_workdir) as workspace:
         corpus = _create_corpus(
@@ -618,8 +613,7 @@ def main() -> int:
                     row, trace = _run_batch(
                         workspace=workspace,
                         worker_path=worker_path,
-                        dll_path=dll_path,
-                        corpus=corpus,
+                            corpus=corpus,
                         capacity=capacity,
                         client_count=args.clients,
                         timeout_seconds=args.timeout_seconds,

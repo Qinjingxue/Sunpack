@@ -1,4 +1,4 @@
-"""Measure real 7z worker CPU, IO, and decoder-memory contention."""
+"""Measure real 7z worker CPU and IO contention."""
 from __future__ import annotations
 
 import argparse

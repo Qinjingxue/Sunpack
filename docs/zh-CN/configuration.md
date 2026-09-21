@@ -175,7 +175,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 
 ## performance
 
-资源分析和 worker 参数都位于 `performance`。默认值如下：
+运行时和 worker 参数都位于 `performance`。默认值如下：
 
 | 字段 | 默认 | 说明 |
 | --- | ---: | --- |
