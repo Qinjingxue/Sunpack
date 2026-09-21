@@ -1,3 +1,4 @@
+from sunpack.cli.cli_parsers import CliHelpFormatter, localize_help_action
 from sunpack.cli.cli_types import CliCommandResult
 from sunpack.support.process_executable import current_process_executable
 
@@ -7,11 +8,13 @@ ORDER = 70
 
 
 def register(subparsers, ctx):
-    subparsers.add_parser(
+    parser = subparsers.add_parser(
         COMMAND,
-        help="Print the installed SunPack version.",
+        help=ctx.t("cli.version.help"),
         usage="sunpack version",
+        formatter_class=CliHelpFormatter,
     )
+    localize_help_action(parser, ctx)
 
 
 def handle(args, ctx):
