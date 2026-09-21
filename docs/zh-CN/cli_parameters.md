@@ -61,7 +61,7 @@ python sunpack.py extract [options] <paths...>
 | `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
 | `--ask-pw` | 在终端交互输入密码，空行结束。 |
 | `--no-builtin-pw` | 禁用内置密码表。 |
-| `--no-dir-pw` | 禁用归档同目录的 `.sunpack-passwords.txt`。 |
+| `--no-dir-pw` | 禁用归档同目录的 `sunpack-passwords.txt`。 |
 | `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
 | `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
 | `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
@@ -206,7 +206,7 @@ python sunpack.py passwords [options]
 | `--no-builtin-pw` | 不使用内置密码表。 |
 | `--no-dir-pw` | 该命令没有目标归档，不会读取同目录密码文件；在 `extract` 中用于关闭同目录密码。 |
 
-`passwords` 没有归档路径，因此输出命令行输入、最近成功密码、剪贴板密码和内置密码的汇总；它不会为某个目录加载 `.sunpack-passwords.txt`。归档解压时的候选顺序是“最近成功密码 → 同目录密码 → CLI 参数和密码文件 → 剪贴板 → 内置密码”，重复项会去重，必要时会先尝试空密码。
+`passwords` 没有归档路径，因此输出命令行输入、最近成功密码、剪贴板密码和内置密码的汇总；它不会为某个目录加载 `sunpack-passwords.txt`。归档解压时的候选顺序是“最近成功密码 → 同目录密码 → CLI 参数和密码文件 → 剪贴板 → 内置密码”，重复项会去重，必要时会先尝试空密码。
 
 示例：
 
