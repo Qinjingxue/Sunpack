@@ -339,7 +339,6 @@ endfunction()
 set(SUP7Z_INTERNAL_SOURCES
     src/internal/archive_extract.cpp
     src/internal/archive_open_plan.cpp
-    src/internal/archive_resources.cpp
     src/internal/embedded_7z.cpp
     src/internal/password_testing.cpp
     src/internal/sevenzip_engine.cpp
@@ -379,34 +378,12 @@ if(WIN32)
 endif()
 
 if(WIN32)
-    target_compile_definitions(sunpack_sevenzip_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX SUP7Z_BUILD_DLL)
+    target_compile_definitions(sunpack_sevenzip_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(sunpack_sevenzip_core PUBLIC OleAut32)
 endif()
 target_link_libraries(sunpack_sevenzip_core PRIVATE zlib-ng::zlibstatic)
 if(SUP7Z_ENABLE_PIPELINE_TIMING)
     target_compile_definitions(sunpack_sevenzip_core PRIVATE SUP7Z_ENABLE_PIPELINE_TIMING=1)
-endif()
-
-add_library(sunpack_sevenzip SHARED
-    src/c_api_resources.cpp
-    ${SUP7Z_INTERNAL_SOURCES}
-)
-apply_release_optimizations(sunpack_sevenzip)
-apply_source_charset(sunpack_sevenzip)
-
-target_include_directories(sunpack_sevenzip
-    PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/include
-)
-
-if(WIN32)
-    target_compile_definitions(sunpack_sevenzip PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX SUP7Z_BUILD_DLL)
-    target_link_libraries(sunpack_sevenzip PRIVATE OleAut32 zlib-ng::zlibstatic)
-
-    sup7z_attach_bundled_7z(sunpack_sevenzip)
-endif()
-if(SUP7Z_ENABLE_PIPELINE_TIMING)
-    target_compile_definitions(sunpack_sevenzip PRIVATE SUP7Z_ENABLE_PIPELINE_TIMING=1)
 endif()
 
 add_executable(sunpack_sevenzip_smoke

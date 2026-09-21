@@ -498,22 +498,17 @@ def test_native_worker_starts_in_neutral_working_directory(tmp_path, monkeypatch
     assert captured["cwd"] == str(tmp_path)
 
 
-def test_native_environment_zero_memory_budget_uses_native_auto_budget():
-    environment = {
-        "SUNPACK_NATIVE_MEMORY_BUDGET_BYTES": "1",
-        "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "8",
-    }
+def test_native_environment_zero_thread_capacity_uses_native_auto_capacity():
+    environment = {"SUNPACK_NATIVE_WORKER_THREAD_CAPACITY": "8"}
 
     _apply_native_environment(
         environment,
         {
             "thread_capacity": 0,
-            "memory_budget_bytes": 0,
             "adaptive_enabled": True,
         },
     )
 
-    assert "SUNPACK_NATIVE_MEMORY_BUDGET_BYTES" not in environment
     assert "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY" not in environment
     assert environment["SUNPACK_NATIVE_ADAPTIVE_ENABLED"] == "1"
 
@@ -573,7 +568,6 @@ def test_native_worker_reports_locally_calibrated_sizing_plan():
     for key in (
         "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY",
         "SUNPACK_NATIVE_INITIAL_ACTIVE_JOBS",
-        "SUNPACK_NATIVE_MEMORY_BUDGET_BYTES",
         "SUNPACK_NATIVE_PROCESS_MODE",
         "SUNPACK_NATIVE_WORKER_PROFILE",
     ):
@@ -592,14 +586,11 @@ def test_native_worker_reports_locally_calibrated_sizing_plan():
     handshake = json.loads(completed.stdout.splitlines()[0])
 
     logical_processors = max(1, int(handshake["logical_processors"]))
-    available_memory = int(handshake["available_memory_bytes"])
-    expected_budget = available_memory * 7 // 10 if available_memory else 0
     expected_capacity = logical_processors
     expected_initial = max(1, min((logical_processors + 1) // 2, expected_capacity))
 
     assert handshake["type"] == "worker_ready"
     assert handshake["sizing_mode"] == "dynamic"
-    assert int(handshake["memory_budget_bytes"]) == expected_budget
     assert int(handshake["thread_capacity"]) == expected_capacity
     assert int(handshake["initial_active_limit"]) == expected_initial
     assert handshake["exploration_strategy"] == "calibrated"

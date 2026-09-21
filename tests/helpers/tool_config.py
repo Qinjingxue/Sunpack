@@ -112,7 +112,7 @@ def get_7z_cli_dll_path() -> str:
 
     This is part of the fixture-generator toolchain, not of the SunPack
     runtime: the product's 7-Zip backend is compiled into
-    sunpack_sevenzip.dll / sunpack_sevenzip_worker.exe and never loads 7z.dll.
+    sunpack_sevenzip_worker.exe and never loads 7z.dll.
     It exists so tests and benchmarks that generate archives with tools\\7z.exe
     can assert its companion module is present.
     """

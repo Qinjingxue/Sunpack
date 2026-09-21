@@ -61,7 +61,6 @@ filesystem / relations / rename
   -> sunpack_native narrow helpers
 
 passwords
-  -> support.sevenzip_bridge
   -> native/Rust fast verifiers
 
 config
@@ -91,7 +90,6 @@ contracts
 | Verification | `verification.VerificationScheduler` | Extraction result completeness, source integrity, and the next-step decision. |
 | Post-processing | `postprocess.actions.PostProcessActions` | Cleanup and flattening after success. |
 | Filesystem monitoring | `coordinator.watch_runtime.run_watch_service` / `filesystem.watcher.WatchScheduler` | Shared CLI/GUI service entry point, watchdog events, the active-to-quiet state machine, and automatic processing. |
-| Native ABI | `support.sevenzip_bridge` | C++ 7z.dll bridge bindings and caching. |
 
 ## Domain boundaries
 
@@ -167,13 +165,13 @@ Packages in the flow domains must not import `coordinator` in reverse. Detection
 
 ### support
 
-`support` holds resource lookup, JSON, caching, path helpers, and 7z.dll wrapper bindings. Do not stuff detection policy, output directory policy, password resolution, or cleanup policy into support.
+`support` holds resource lookup, JSON, caching, and path helpers. Do not stuff detection policy, output directory policy, password resolution, or cleanup policy into support.
 
 ### native
 
 `native/sunpack_native` takes on cross-platform hotspots: directory scanning, binary views, signature prepass, format probes, carrier scan, output CRC/readability, output file index matching, password fast verifiers, and so on.
 
-`native/sevenzip_bridge` takes on Windows embedded 7-Zip execution: resource queries, worker-internal bounded password candidate confirmation, and extraction through `sunpack_sevenzip_worker.exe`. Format, structure, and encryption analysis belong to the Python/Rust analysis layer rather than a second native probe/test stack.
+`native/sevenzip_bridge` takes on Windows embedded 7-Zip execution: worker-internal bounded password candidate confirmation and extraction through `sunpack_sevenzip_worker.exe`. Format, structure, and encryption analysis belong to the Python/Rust analysis layer rather than a second native probe/test stack.
 
 ### Windows Watch Broker / USN
 
@@ -263,5 +261,5 @@ Repository-level directories:
 native/sunpack_native/  Rust/PyO3 hot paths
 native/sunpack_usn_core/ Windows USN core and client protocol
 native/sunpack_watch_broker/ Windows Watch Broker service
-native/sevenzip_bridge/ Windows 7z.dll bridge and worker
+native/sevenzip_bridge/ Windows embedded 7-Zip worker
 ```

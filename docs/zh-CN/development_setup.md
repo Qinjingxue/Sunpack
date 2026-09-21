@@ -61,7 +61,7 @@ uv sync --locked --extra dev
 2. 构建并安装当前架构的 Rust/PyO3 wheel
 3. 构建 `sunpack-watch-broker.exe`
 4. 准备对应架构的 `7z.exe`、`7z.dll` 和 license
-5. 构建 `sunpack_sevenzip.dll`、`sunpack_sevenzip_worker.exe` 和 `sunpack_toast.dll`
+5. 构建 `sunpack_sevenzip_worker.exe` 和 `sunpack_toast.dll`
 6. 把原生产物复制到工具目录
 7. 运行 Python、Rust、C++ 和 CLI smoke checks
 
@@ -155,17 +155,16 @@ uv pip uninstall --python .\.venv\Scripts\python.exe sunpack-native
 uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
 ```
 
-### C++ 7-Zip bridge
+### C++ 内嵌 7-Zip worker
 
 ```powershell
 cmake -S native\sevenzip_bridge -B native\sevenzip_bridge\build-x64 -A x64
 cmake --build native\sevenzip_bridge\build-x64 --config Release
 ctest --test-dir native\sevenzip_bridge\build-x64 -C Release --output-on-failure
-Copy-Item native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip.dll tools\sunpack_sevenzip.dll -Force
 Copy-Item native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe tools\sunpack_sevenzip_worker.exe -Force
 ```
 
-bridge 运行时还需要同一工具目录中的 `7z.dll`。
+产品 worker 内嵌保留的 7-Zip 源码，运行时不加载 `7z.dll`。
 
 ### Windows toast
 
@@ -182,11 +181,11 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 
 ```powershell
 .\.venv\Scripts\python.exe -c "import sunpack_native as n; print(n.native_available())"
-.\.venv\Scripts\python.exe -c "from sunpack.support.sevenzip_bridge import get_native_sevenzip_bridge; print(get_native_sevenzip_bridge().available())"
+.\.venv\Scripts\python.exe -c "from sunpack.support.resources import get_sevenzip_bridge_worker_path; print(get_sevenzip_bridge_worker_path())"
 .\.venv\Scripts\python.exe -m pytest tests\unit\test_config_loader.py
 ```
 
-前两个命令分别验证 Rust 扩展和 C++ bridge；第三个命令验证配置加载。
+前两个命令分别验证 Rust 扩展和 C++ worker 路径；第三个命令验证配置加载。
 
 ## 测试
 
@@ -269,7 +268,6 @@ x64 开发环境默认使用：
 ```text
 tools\7z.exe
 tools\7z.dll
-tools\sunpack_sevenzip.dll
 tools\sunpack_sevenzip_worker.exe
 tools\sunpack_toast.dll
 ```
@@ -280,4 +278,4 @@ tools\sunpack_toast.dll
 service\sunpack-watch-broker.exe
 ```
 
-`sunpack_sevenzip.dll` 提供 probe、test、密码尝试、健康检查、资源分析和 manifest C ABI。`sunpack_sevenzip_worker.exe` 读取 JSON job，通过 `7z.dll` 解压文件、分卷和虚拟输入。`7z.exe` 用于开发 fixture、手工诊断、文件来源和发布资源准备。
+`sunpack_sevenzip_worker.exe` 读取 JSON job，通过内嵌 7-Zip 后端解压文件、分卷和虚拟输入。`7z.exe` 及其开发环境中的相邻 `7z.dll` 用于 fixture、手工诊断、文件来源和发布资源准备，不属于产品解压运行时依赖。

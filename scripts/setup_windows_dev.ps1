@@ -608,7 +608,7 @@ function Get-CTestCommand {
     throw "ctest executable not found. Install CMake or make CTest available in PATH."
 }
 
-function Build-SevenZipWrapper {
+function Build-SevenZipWorker {
     param(
         [Parameter(Mandatory = $true)]
         [string]$CMakeCommand,
@@ -624,11 +624,13 @@ function Build-SevenZipWrapper {
         [string]$BuildArch
     )
 
-    Write-Step "Building embedded 7-Zip bridge"
+    Write-Step "Building embedded 7-Zip worker"
     Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
     Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON")
+    Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
     Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release")
     if ((Get-ProcessBuildArch) -eq $BuildArch) {
         Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
@@ -636,15 +638,11 @@ function Build-SevenZipWrapper {
         Write-Host "Skipping C++ smoke test because $BuildArch binaries cannot run in the current process architecture." -ForegroundColor Yellow
     }
 
-    $wrapperDll = Join-Path $BuildDir "Release\sunpack_sevenzip.dll"
     $workerExe = Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe"
-    Assert-PathExists -LiteralPath $wrapperDll -Description "Built 7z wrapper DLL"
     Assert-PathExists -LiteralPath $workerExe -Description "Built 7z worker executable"
-    Copy-Item -LiteralPath $wrapperDll -Destination (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force
     Copy-Item -LiteralPath $workerExe -Destination (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe") -Force
 
     Assert-SevenZipAsmSelection -BuildDir $BuildDir -BuildArch $BuildArch -ArtifactPaths @(
-        (Join-Path $ToolsRoot "sunpack_sevenzip.dll"),
         (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe")
     )
 }
@@ -701,19 +699,10 @@ assert not missing, missing
     )
 }
 
-function Test-SevenZipWrapper {
-    param([string]$PythonPath)
-
-    Invoke-Native -FilePath $PythonPath -Arguments @(
-        "-c",
-        "from sunpack.support.sevenzip_bridge import NativeSevenZipBridge; tester = NativeSevenZipBridge(); assert tester.available(), tester.wrapper_path"
-    )
-}
-
 function Test-SevenZipWorker {
     param([string]$PythonPath, [string]$RepoRoot)
 
-    # The 7-Zip backend is compiled into the bridge, so the old
+    # The 7-Zip backend is compiled into the worker, so the old
     # "assert tools\7z.dll exists" probe is gone. What still has to hold is that
     # the worker binary is present AND that the embedded backend can open a real
     # archive end to end.
@@ -859,9 +848,8 @@ if ($buildArch -eq "x64" -and -not $SkipAcceptanceTestTools) {
 }
 $cmakeCommand = Get-CMakeCommand -VenvScripts $venvScripts
 $ctestCommand = Get-CTestCommand -VenvScripts $venvScripts
-Build-SevenZipWrapper -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
+Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
 Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
-Test-SevenZipWrapper -PythonPath $venvPython
 Test-SevenZipWorker -PythonPath $venvPython -RepoRoot $repoRoot
 Invoke-Native -FilePath $venvPython -Arguments @(
     "-c",

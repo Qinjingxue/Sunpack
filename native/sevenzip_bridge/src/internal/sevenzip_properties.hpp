@@ -25,8 +25,6 @@ namespace sunpack::sevenzip
 
     bool archive_has_encrypted_items(IInArchive *archive);
 
-    bool fill_resource_analysis_from_open_archive(IInArchive *archive, ResourceAnalysisResult &result);
-
 #endif
 
 } // namespace sunpack::sevenzip

@@ -179,7 +179,6 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 
 | 字段 | 默认 | 说明 |
 | --- | ---: | --- |
-| `precise_resource_min_size_mb` | `256` | 达到该大小且条件满足时执行更精确的资源评估。 |
 | `persistent_server_idle_seconds` | `15` | 常驻服务空闲多久后退出。 |
 | `worker.watchdog_no_progress_timeout_seconds` | `180` | 没有进展达到该时长时报告停滞；`0` 表示不限。 |
 | `worker.thread_capacity` | `0` | 解压线程容量；`0` 自动按机器能力选择。 |
@@ -202,9 +201,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `worker.priority_aging_quantum` | `32` | 优先级老化步长。 |
 | `worker.backpressure_retries` | `120` | 遇到队列背压时的重试次数。 |
 | `worker.writer_threads` | `4` | 写出线程数。 |
-| `worker.memory_budget_bytes` | `0` | 内存准入预算；`0` 自动按可用内存选择。 |
 | `worker.job_buffer_budget_bytes` | `33554432` | 单任务输出缓冲上限。 |
-| `worker.memory_pause_available_mb` / `memory_resume_available_mb` | `1024` / `2048` | 内存紧张时暂停和恢复任务准入的阈值。 |
 | `worker.space_gate_enabled` | `true` | 是否在任务进入写出阶段前检查磁盘空间。 |
 | `worker.space_poll_interval_ms` | `1000` | 磁盘空间检查间隔。 |
 | `worker.space_status_report_interval_ms` | `15000` | 磁盘空间状态报告间隔。 |

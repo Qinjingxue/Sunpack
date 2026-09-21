@@ -610,7 +610,6 @@ function Get-EnvironmentRefreshReasons {
     # Runtime artifacts SunPack ships and needs. These must never gain a
     # standalone 7z.dll: the 7-Zip backend is compiled into the two binaries.
     $runtimeArtifacts = @(
-        (Join-Path $toolsRoot "sunpack_sevenzip.dll"),
         (Join-Path $toolsRoot "sunpack_sevenzip_worker.exe")
     )
     foreach ($artifactPath in $runtimeArtifacts) {

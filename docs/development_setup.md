@@ -61,7 +61,7 @@ The script will:
 2. Build and install the Rust/PyO3 wheel for the current architecture
 3. Build `sunpack-watch-broker.exe`
 4. Prepare `7z.exe`, `7z.dll`, and the license for the matching architecture
-5. Build `sunpack_sevenzip.dll`, `sunpack_sevenzip_worker.exe`, and `sunpack_toast.dll`
+5. Build `sunpack_sevenzip_worker.exe` and `sunpack_toast.dll`
 6. Copy the native artifacts into the tools directory
 7. Run Python, Rust, C++, and CLI smoke checks
 
@@ -155,17 +155,16 @@ uv pip uninstall --python .\.venv\Scripts\python.exe sunpack-native
 uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
 ```
 
-### C++ 7-Zip bridge
+### C++ embedded 7-Zip worker
 
 ```powershell
 cmake -S native\sevenzip_bridge -B native\sevenzip_bridge\build-x64 -A x64
 cmake --build native\sevenzip_bridge\build-x64 --config Release
 ctest --test-dir native\sevenzip_bridge\build-x64 -C Release --output-on-failure
-Copy-Item native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip.dll tools\sunpack_sevenzip.dll -Force
 Copy-Item native\sevenzip_bridge\build-x64\Release\sunpack_sevenzip_worker.exe tools\sunpack_sevenzip_worker.exe -Force
 ```
 
-The bridge also needs `7z.dll` in the same tools directory at run time.
+The product worker embeds the retained 7-Zip sources and does not load `7z.dll` at run time.
 
 ### Windows toast
 
@@ -182,11 +181,11 @@ A continuously running watch creates Windows notification capability according t
 
 ```powershell
 .\.venv\Scripts\python.exe -c "import sunpack_native as n; print(n.native_available())"
-.\.venv\Scripts\python.exe -c "from sunpack.support.sevenzip_bridge import get_native_sevenzip_bridge; print(get_native_sevenzip_bridge().available())"
+.\.venv\Scripts\python.exe -c "from sunpack.support.resources import get_sevenzip_bridge_worker_path; print(get_sevenzip_bridge_worker_path())"
 .\.venv\Scripts\python.exe -m pytest tests\unit\test_config_loader.py
 ```
 
-The first two commands verify the Rust extension and the C++ bridge respectively; the third verifies configuration loading.
+The first two commands verify the Rust extension and the C++ worker path respectively; the third verifies configuration loading.
 
 ## Testing
 
@@ -269,7 +268,6 @@ The x64 development environment uses the following by default:
 ```text
 tools\7z.exe
 tools\7z.dll
-tools\sunpack_sevenzip.dll
 tools\sunpack_sevenzip_worker.exe
 tools\sunpack_toast.dll
 ```
@@ -280,4 +278,4 @@ The installer package additionally contains:
 service\sunpack-watch-broker.exe
 ```
 
-`sunpack_sevenzip.dll` provides the C ABI for probe, test, password attempts, health checks, resource analysis, and manifests. `sunpack_sevenzip_worker.exe` reads JSON jobs and extracts files, volumes, and virtual inputs through `7z.dll`. `7z.exe` is used for development fixtures, manual diagnostics, file provenance, and preparing release resources.
+`sunpack_sevenzip_worker.exe` reads JSON jobs and extracts files, volumes, and virtual inputs through the embedded 7-Zip backend. `7z.exe` and its adjacent development `7z.dll` are used for fixtures, manual diagnostics, file provenance, and preparing release resources; they are not product extraction runtime dependencies.

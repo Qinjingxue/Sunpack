@@ -1,13 +1,13 @@
 from typing import Any, Sequence
 
-from sunpack.support.sevenzip_bridge import (
+from sunpack.verification.archive_state_manifest import (
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_DAMAGED,
     STATUS_OK,
     STATUS_UNSUPPORTED,
     STATUS_WRONG_PASSWORD,
+    archive_state_manifest_for_evidence,
 )
-from sunpack.verification.archive_state_manifest import archive_state_manifest_for_evidence
 from sunpack.verification.evidence import VerificationEvidence
 from sunpack.verification.error_classification import classify_verification_error
 from sunpack.verification.methods._archive_output_match import ArchiveOutputCoverage, coverage_details, coverage_from_archive_and_output

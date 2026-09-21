@@ -383,7 +383,6 @@ class RequestRuntimeProfiler:
             ("_skip_tasks_inside_batch_outputs", "batch_skip_inside_outputs"),
             ("collect_result", "batch_collect_result"),
             ("_inspect_tasks_before_extract", "batch_password_preflight"),
-            ("_inspect_resource_profiles", "batch_resource_profiles"),
         ):
             _wrap(batch, name, timings, label)
         _wrap(_child(batch, "relation_stage"), "resolve_tasks", timings, "batch_relation_resolve")
@@ -391,9 +390,6 @@ class RequestRuntimeProfiler:
         password_contexts = _child(batch, "directory_password_contexts")
         _wrap(password_contexts, "annotate", timings, "batch_directory_password_annotate")
         _wrap(password_contexts, "remember", timings, "batch_directory_password_remember")
-        resource_inspector = _child(batch, "resource_inspector")
-        _wrap(resource_inspector, "inspect", timings, "batch_resource_inspect")
-        _wrap(resource_inspector, "record_estimated_single_task_profile", timings, "batch_resource_record")
         reporter = runtime.reporter
         _wrap(reporter, "begin_round", timings, "batch_report_begin_round")
         _wrap(reporter, "task_finished", timings, "batch_report_task_finished")
@@ -467,7 +463,6 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         "batch_collect_result",
         "batch_directory_password_remember",
         "batch_password_preflight",
-        "batch_resource_profiles",
         "batch_report_task_finished",
         "batch_cleanup_task",
         "output_scan",

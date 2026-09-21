@@ -40,7 +40,7 @@ def test_doctor_reports_checks_and_missing_watch_roots_as_warnings(tmp_path, mon
 
     assert code == 0
     # The 7z.dll resource check is gone: the 7-Zip backend is compiled into
-    # sunpack_sevenzip.dll, so there is no separate file left on disk to verify.
+    # the worker, so there is no separate backend DLL left on disk to verify.
     assert [check["status"] for check in result.items] == ["ok", "ok", "ok", "skip", "warn"]
     assert result.summary == {"checks": 5, "ok": 3, "warnings": 1, "skipped": 1, "failed": 0}
     assert "[WARN] Watch root" in stdout.getvalue()

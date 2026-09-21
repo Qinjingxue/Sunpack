@@ -179,7 +179,6 @@ Both resource analysis and worker parameters live under `performance`. Defaults 
 
 | Field | Default | Description |
 | --- | ---: | --- |
-| `precise_resource_min_size_mb` | `256` | Perform a more precise resource assessment at or above this size when the conditions hold. |
 | `persistent_server_idle_seconds` | `15` | How long the persistent server stays idle before exiting. |
 | `worker.watchdog_no_progress_timeout_seconds` | `180` | Report a stall when there has been no progress for this long; `0` means unlimited. |
 | `worker.thread_capacity` | `0` | Extraction thread capacity; `0` selects automatically based on machine capability. |
@@ -202,9 +201,7 @@ Both resource analysis and worker parameters live under `performance`. Defaults 
 | `worker.priority_aging_quantum` | `32` | Priority aging step. |
 | `worker.backpressure_retries` | `120` | Number of retries on queue backpressure. |
 | `worker.writer_threads` | `4` | Number of writer threads. |
-| `worker.memory_budget_bytes` | `0` | Memory admission budget; `0` selects automatically from available memory. |
 | `worker.job_buffer_budget_bytes` | `33554432` | Output buffer limit per job. |
-| `worker.memory_pause_available_mb` / `memory_resume_available_mb` | `1024` / `2048` | Thresholds at which job admission is paused and resumed under memory pressure. |
 | `worker.space_gate_enabled` | `true` | Whether to check disk space before a job enters the write-out stage. |
 | `worker.space_poll_interval_ms` | `1000` | Disk space check interval. |
 | `worker.space_status_report_interval_ms` | `15000` | Disk space status report interval. |

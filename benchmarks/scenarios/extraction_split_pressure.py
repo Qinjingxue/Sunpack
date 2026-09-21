@@ -188,7 +188,6 @@ class PipelineTimingProbe:
         self._wrap(batch, "prepare_tasks", "batch_prepare")
         self._wrap(batch, "_skip_tasks_inside_batch_outputs", "batch_skip_inside_outputs")
         self._wrap(batch, "_inspect_tasks_before_extract", "batch_password_preflight")
-        self._wrap(batch, "_inspect_resource_profiles", "batch_resource_profiles")
         self._wrap(batch, "collect_result", "batch_collect_result")
         self._wrap(batch, "_report_task_started", "batch_report_task_started")
         self._wrap(batch, "_report_task_finished", "batch_report_task_finished")
@@ -202,9 +201,6 @@ class PipelineTimingProbe:
         password_tester = getattr(extractor, "password_tester", None)
         password_scheduler = getattr(password_tester, "password_scheduler", None) if password_tester is not None else None
         self._wrap(password_scheduler, "plan_for_extraction", "password_bounded_verify")
-        resource_inspector = getattr(batch, "resource_inspector", None)
-        self._wrap(resource_inspector, "inspect", "resource_preflight")
-        self._wrap(resource_inspector, "record_estimated_single_task_profile", "resource_estimate")
         verifier = getattr(batch, "verifier", None)
         self._wrap(verifier, "verify", "verify")
 
@@ -221,7 +217,6 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
             "preflight_ms": 0.0,
             "password_resolve_ms": 0.0,
             "password_verify_ms": 0.0,
-            "resource_ms": 0.0,
             "extract_ms": 0.0,
             "verify_ms": 0.0,
             "collect_result_ms": 0.0,
@@ -235,7 +230,6 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
         recorder.ms("batch_prepare")
         + recorder.ms("batch_skip_inside_outputs")
         + recorder.ms("batch_password_preflight")
-        + recorder.ms("batch_resource_profiles")
         + recorder.ms("batch_collect_result")
         + recorder.ms("batch_report_task_started")
         + recorder.ms("batch_report_task_finished")
@@ -250,8 +244,6 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
         + recorder.ms("password_preflight")
         + recorder.ms("password_resolve")
         + recorder.ms("password_bounded_verify")
-        + recorder.ms("resource_preflight")
-        + recorder.ms("resource_estimate")
         + recorder.ms("verify")
         + recorder.ms("extractor_close")
     )
@@ -269,7 +261,6 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
         "preflight_ms": recorder.ms("password_preflight"),
         "password_resolve_ms": recorder.ms("password_resolve"),
         "password_verify_ms": recorder.ms("password_bounded_verify"),
-        "resource_ms": recorder.ms("resource_preflight") + recorder.ms("resource_estimate"),
         "extract_ms": extract_ms,
         "verify_ms": recorder.ms("verify"),
         "collect_result_ms": recorder.ms("batch_collect_result"),
@@ -774,7 +765,6 @@ def print_table(rows: list[dict]):
         "preflight_ms",
         "password_resolve_ms",
         "password_verify_ms",
-        "resource_ms",
         "extract_ms",
         "verify_ms",
         "collect_result_ms",

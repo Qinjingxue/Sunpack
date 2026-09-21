@@ -535,13 +535,12 @@ def test_release_packages_copy_only_runtime_tool_files():
     for script in (build_script, verifier):
         assert "function Get-PackagedRuntimeToolNames" in script
         packaged = _packaged_runtime_tool_names_block(script)
-        assert '"sunpack_sevenzip.dll"' in packaged
+        assert '"sunpack_sevenzip.dll"' not in packaged
         assert '"sunpack_sevenzip_worker.exe"' in packaged
         assert '"sunpack_toast.dll"' in packaged
         assert "Assert-PackagedRuntimeTools" in script
-        # The 7-Zip backend is compiled into sunpack_sevenzip.dll and
-        # sunpack_sevenzip_worker.exe, so a packaged tools\7z.dll would only
-        # re-introduce the external backend dependency.
+        # The 7-Zip backend is compiled into sunpack_sevenzip_worker.exe, so a
+        # packaged tools\7z.dll would only re-introduce the external dependency.
         assert '"7z.dll"' not in packaged
     assert "Copy-PackagedRuntimeTools -Source $toolsRoot -Destination $distToolsRoot" in build_script
     assert 'Copy-Item -LiteralPath $toolsRoot -Destination $distToolsRoot -Recurse -Force' not in build_script

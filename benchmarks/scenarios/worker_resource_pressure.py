@@ -25,7 +25,7 @@ from sunpack.support.resources import get_7z_path, get_sevenzip_bridge_worker_pa
 from tests.helpers.tool_config import get_7z_cli_dll_path
 
 SCENARIO = "extraction.worker-resource-pressure"
-MODES = ("cpu", "io", "memory")
+MODES = ("cpu", "io")
 CONTROLLERS = ("adaptive", "fixed")
 
 
@@ -72,7 +72,7 @@ def _write_payload(path: Path, size_mib: int, *, repetitive: bool) -> int:
 
 def _create_archive(root: Path, mode: str, *, source_mib: int, dictionary_mib: int, seven_zip: Path) -> dict[str, Any]:
     source = root / f"{mode}-payload.bin"
-    payload_bytes = _write_payload(source, source_mib, repetitive=mode in {"cpu", "memory"})
+    payload_bytes = _write_payload(source, source_mib, repetitive=mode == "cpu")
     archive = root / f"{mode}-template.7z"
     command = [str(seven_zip), "a", "-y", "-bd", "-bso0", "-bse0", "-t7z", str(archive), str(source)]
     if mode == "io":
@@ -90,7 +90,7 @@ def _create_archive(root: Path, mode: str, *, source_mib: int, dictionary_mib: i
         "archive_bytes": archive_bytes,
         "compression_ratio": round(payload_bytes / max(1, archive_bytes), 3),
         "dictionary_bytes": dictionary_mib << 20 if mode != "io" else 0,
-        "repetitive_payload": mode in {"cpu", "memory"},
+        "repetitive_payload": mode == "cpu",
     }
 
 
@@ -119,8 +119,7 @@ def _counters(process: psutil.Process | None) -> dict[str, float | int | None]:
         return {"cpu_ms": None, "read_bytes": None, "write_bytes": None}
 
 
-def _job_payload(*, job_id: str, archive: Path, output: Path, dll: Path,
-                 memory_reserve_bytes: int, dictionary_bytes: int, include_dictionary_hint: bool) -> str:
+def _job_payload(*, job_id: str, archive: Path, output: Path) -> str:
     item: dict[str, Any] = {
         "job_id": job_id,
         "request_id": job_id,
@@ -129,24 +128,19 @@ def _job_payload(*, job_id: str, archive: Path, output: Path, dll: Path,
         "output_dir": str(output),
         "password": "",
         "format_hint": "7z",
-        "native_memory_reserve_bytes": memory_reserve_bytes,
     }
-    if include_dictionary_hint and dictionary_bytes:
-        item["native_dictionary_reserve_bytes"] = dictionary_bytes
     return json.dumps(item, ensure_ascii=False, separators=(",", ":"))
 
 
-def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, dll: Path, archives: list[Path],
+def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: list[Path],
               case: dict[str, Any], capacity: int, controller: str, jobs: int,
-              timeout_seconds: float, sample_interval: float, memory_budget_bytes: int,
-              memory_reserve_bytes: int, include_dictionary_hint: bool) -> dict[str, Any]:
+              timeout_seconds: float, sample_interval: float) -> dict[str, Any]:
     label = f"{case['mode']}-{controller}-cap{capacity}"
     worker = _NativeWorkerProcess(str(worker_path), None, {
         "thread_capacity": capacity,
         "adaptive_enabled": controller == "adaptive",
         "initial_active_jobs": 0 if controller == "adaptive" else capacity,
         "sample_interval_ms": max(100, int(sample_interval * 1000)),
-        "memory_budget_bytes": memory_budget_bytes,
     })
     process = psutil.Process(worker.process.pid) if worker.process is not None else None
     sampler = ProcessSampler(interval_seconds=0.02)
@@ -197,9 +191,6 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, dll: Path, ar
             worker.submit_async(
                 _job_payload(
                     job_id=job_id, archive=archives[index], output=workspace.outputs / label / job_id,
-                    dll=dll,
-                    memory_reserve_bytes=memory_reserve_bytes, dictionary_bytes=int(case["dictionary_bytes"]),
-                    include_dictionary_hint=include_dictionary_hint,
                 ),
                 job_id, on_line=callback(job_id), on_timeout=timeout(job_id),
             )
@@ -226,7 +217,6 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, dll: Path, ar
     read_bytes = None if before["read_bytes"] is None or after["read_bytes"] is None else int(after["read_bytes"]) - int(before["read_bytes"])
     write_bytes = None if before["write_bytes"] is None or after["write_bytes"] is None else int(after["write_bytes"]) - int(before["write_bytes"])
     active_values = [int(event.get("active_jobs", 0) or 0) for event in events if event.get("event") in {"job_admitted", "job_started", "job_finished"}]
-    memory_values = [int(event.get("active_memory_bytes", 0) or 0) for event in events]
     successful = sum(result.get("status") == "ok" for result in results.values())
     return {
         "label": label, "mode": case["mode"], "controller": controller, "capacity": capacity, "jobs": jobs,
@@ -241,20 +231,13 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, dll: Path, ar
         "write_bytes": write_bytes,
         "worker_rss_peak_mib": round(max((sample.children_rss_mib for sample in sampler.samples), default=0.0), 3),
         "observed_peak_active_jobs": max(active_values, default=0),
-        "observed_peak_active_memory_bytes": max(memory_values, default=0),
         "controller_sample_count": len(controller_events),
         "controller_adjustment_count": sum(
             "decision" not in item or str(item.get("decision") or "none") != "none"
             for item in controller_events
         ),
-        "controller_memory_pause_count": sum(
-            str(item.get("decision") or "") == "memory_paused" for item in controller_events
-        ),
         "successful_jobs": successful, "failed_jobs": jobs - successful, "failures": failures,
         "result_statuses": [result.get("status") for result in results.values()],
-        "dictionary_hint": include_dictionary_hint,
-        "memory_budget_mib": round(memory_budget_bytes / 1024 / 1024, 3) if memory_budget_bytes else None,
-        "memory_reserve_mib": round(memory_reserve_bytes / 1024 / 1024, 3),
         "dictionary_mib": round(int(case["dictionary_bytes"]) / 1024 / 1024, 3),
     }
 
@@ -268,18 +251,14 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Stress native 7z worker CPU, IO, and decoder-memory scheduling.")
+    parser = argparse.ArgumentParser(description="Stress native 7z worker CPU and IO scheduling.")
     parser.add_argument("--modes", default=",".join(MODES))
     parser.add_argument("--controllers", default=",".join(CONTROLLERS))
     parser.add_argument("--capacities", default="1,2,4,8")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--cpu-source-mib", type=int, default=64)
     parser.add_argument("--io-source-mib", type=int, default=128)
-    parser.add_argument("--memory-source-mib", type=int, default=128)
-    parser.add_argument("--memory-dictionary-mib", type=int, default=64)
-    parser.add_argument("--memory-budget-mib", type=int, default=256)
-    parser.add_argument("--memory-reserve-mib", type=int, default=64)
-    parser.add_argument("--dictionary-hint", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--dictionary-mib", type=int, default=64)
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     parser.add_argument("--sample-interval", type=float, default=0.02)
     parser.add_argument("--results-root", type=Path)
@@ -292,7 +271,7 @@ def main() -> int:
         capacities = _capacities(args.capacities)
     except (ValueError, TypeError) as exc:
         parser.error(str(exc))
-    sizes = (args.cpu_source_mib, args.io_source_mib, args.memory_source_mib, args.memory_dictionary_mib, args.memory_budget_mib, args.memory_reserve_mib)
+    sizes = (args.cpu_source_mib, args.io_source_mib, args.dictionary_mib)
     if args.jobs < 1 or args.timeout_seconds <= 0 or args.sample_interval <= 0 or min(sizes) < 1:
         parser.error("jobs, timeouts, intervals, and size parameters must be positive")
     try:
@@ -306,7 +285,7 @@ def main() -> int:
 
     with BenchmarkWorkspace(SCENARIO, results_root=args.results_root, keep_workdir=args.keep_workdir) as workspace:
         cases: dict[str, dict[str, Any]] = {}
-        settings = {"cpu": (args.cpu_source_mib, args.memory_dictionary_mib), "io": (args.io_source_mib, 0), "memory": (args.memory_source_mib, args.memory_dictionary_mib)}
+        settings = {"cpu": (args.cpu_source_mib, args.dictionary_mib), "io": (args.io_source_mib, 0)}
         for mode in modes:
             print(f"building {mode} archive ...", flush=True)
             cases[mode] = _create_archive(workspace.corpus, mode, source_mib=settings[mode][0], dictionary_mib=settings[mode][1], seven_zip=seven_zip)
@@ -320,12 +299,10 @@ def main() -> int:
             for controller in controllers:
                 for capacity in capacities:
                     print(f"running {mode}/{controller}/capacity={capacity} ...", flush=True)
-                    reserve_mib = args.memory_reserve_mib if mode == "memory" else 64
                     row = _run_case(
-                        workspace=workspace, worker_path=worker_path, dll=dll, archives=archives, case=case,
+                        workspace=workspace, worker_path=worker_path, archives=archives, case=case,
                         capacity=capacity, controller=controller, jobs=args.jobs, timeout_seconds=args.timeout_seconds,
-                        sample_interval=args.sample_interval, memory_budget_bytes=args.memory_budget_mib << 20 if mode == "memory" else 0,
-                        memory_reserve_bytes=reserve_mib << 20, include_dictionary_hint=args.dictionary_hint if mode == "memory" else False,
+                        sample_interval=args.sample_interval,
                     )
                     rows.append(row)
                     print(f"  elapsed={row['elapsed_seconds']:.2f}s host_cpu={row['host_cpu_utilization']} read={row['read_mib_per_second']}MiB/s rss={row['worker_rss_peak_mib']}MiB active={row['observed_peak_active_jobs']} passed={row['successful_jobs']}/{args.jobs}", flush=True)

@@ -1,10 +1,5 @@
 #include "sevenzip_properties.hpp"
 
-#ifdef _WIN32
-#include <algorithm>
-#include <map>
-#endif
-
 namespace sunpack::sevenzip
 {
 
@@ -124,95 +119,6 @@ namespace sunpack::sevenzip
         return false;
     }
 
-    bool fill_resource_analysis_from_open_archive(IInArchive *archive, ResourceAnalysisResult &result)
-    {
-        result.is_archive = true;
-        result.solid = get_archive_property_bool(archive, kpidSolid);
-        UInt32 num_items = 0;
-        if (archive->GetNumberOfItems(&num_items) != S_OK)
-        {
-            result.status = PasswordTestStatus::Error;
-            result.message = "archive item list could not be read";
-            return false;
-        }
-
-        std::map<std::wstring, UInt64> method_sizes;
-        for (UInt32 index = 0; index < num_items; ++index)
-        {
-            PROPVARIANT value{};
-            const bool is_dir = get_item_property(archive, index, kpidIsDir, value) ? prop_bool(value) : false;
-            clear_prop(value);
-
-            UInt64 unpacked_size = 0;
-            if (get_item_property(archive, index, kpidSize, value))
-            {
-                unpacked_size = prop_u64(value);
-            }
-            clear_prop(value);
-
-            UInt64 packed_size = 0;
-            if (get_item_property(archive, index, kpidPackSize, value))
-            {
-                packed_size = prop_u64(value);
-            }
-            clear_prop(value);
-
-            UInt64 dictionary_size = 0;
-            if (get_item_property(archive, index, kpidDictionarySize, value))
-            {
-                dictionary_size = prop_u64(value);
-            }
-            clear_prop(value);
-
-            bool encrypted = false;
-            if (get_item_property(archive, index, kpidEncrypted, value))
-            {
-                encrypted = prop_bool(value);
-            }
-            clear_prop(value);
-            result.encrypted = result.encrypted || encrypted;
-
-            std::wstring method;
-            if (get_item_property(archive, index, kpidMethod, value))
-            {
-                method = prop_text(value);
-            }
-            clear_prop(value);
-
-            result.item_count += 1;
-            if (is_dir)
-            {
-                result.dir_count += 1;
-                continue;
-            }
-            result.file_count += 1;
-            result.total_unpacked_size += unpacked_size;
-            result.total_packed_size += packed_size;
-            result.largest_item_size = std::max(result.largest_item_size, unpacked_size);
-            result.largest_dictionary_size = std::max(result.largest_dictionary_size, dictionary_size);
-            if (!method.empty())
-            {
-                method_sizes[method] += unpacked_size ? unpacked_size : 1;
-            }
-        }
-
-        if (result.total_packed_size == 0)
-        {
-            result.total_packed_size = result.archive_size;
-        }
-        UInt64 best_size = 0;
-        for (const auto &item : method_sizes)
-        {
-            if (item.second > best_size)
-            {
-                best_size = item.second;
-                result.dominant_method = item.first;
-            }
-        }
-        result.status = PasswordTestStatus::Ok;
-        result.message = "archive resources analyzed";
-        return true;
-    }
 
 #endif
 

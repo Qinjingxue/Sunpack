@@ -498,19 +498,10 @@ function Get-InnoSetupCompiler {
 }
 
 
-function Test-SevenZipWrapper {
-    param([string]$PythonPath)
-
-    Invoke-Native -FilePath $PythonPath -Arguments @(
-        "-c",
-        "from sunpack.support.sevenzip_bridge import NativeSevenZipBridge; tester = NativeSevenZipBridge(); assert tester.available(), tester.wrapper_path"
-    )
-}
-
 function Test-SevenZipWorker {
     param([string]$PythonPath, [string]$RepoRoot)
 
-    # The 7-Zip backend is compiled into the bridge, so the old
+    # The 7-Zip backend is compiled into the worker, so the old
     # "assert tools\7z.dll exists" probe is gone. What still has to hold is that
     # the worker binary is present AND that the embedded backend can open a real
     # archive end to end.
@@ -558,7 +549,7 @@ assert os.path.getsize(target) > 0
     }
 }
 
-function Build-SevenZipWrapper {
+function Build-SevenZipWorker {
     param(
         [Parameter(Mandatory = $true)]
         [string]$CMakeCommand,
@@ -574,7 +565,7 @@ function Build-SevenZipWrapper {
         [string]$BuildArch
     )
 
-    Write-Step "Building embedded 7-Zip bridge"
+    Write-Step "Building embedded 7-Zip worker"
     Assert-PathExists -LiteralPath (Join-Path $WrapperRoot "CMakeLists.txt") -Description "7z wrapper CMake project"
     $cmakePlatform = Get-CMakePlatform -BuildArch $BuildArch
     Reset-StaleCMakeBuildDir -SourceDir $WrapperRoot -BuildDir $BuildDir -CMakePlatform $cmakePlatform
@@ -583,26 +574,25 @@ function Build-SevenZipWrapper {
     # CRC/AES/SHA keep the upstream C/intrinsics implementations. Each architecture has an
     # explicit OFF switch for same-commit A/B benchmarking and rollback.
     Invoke-Native -FilePath $CMakeCommand -Arguments @("-S", $WrapperRoot, "-B", $BuildDir, "-A", $cmakePlatform, "-DCMAKE_BUILD_TYPE=Release", "-DSUP7Z_USE_X64_ASM=ON", "-DSUP7Z_USE_ARM64_ASM=ON")
+    # The old in-process wrapper DLL target is gone. Remove stale incremental-build artifacts
+    # so a previous sunpack_sevenzip.dll cannot be mistaken for a current output.
+    Remove-Item -LiteralPath (Join-Path $BuildDir "Release\sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force -ErrorAction SilentlyContinue
     Invoke-Native -FilePath $CMakeCommand -Arguments @("--build", $BuildDir, "--config", "Release")
     if ((Get-ProcessBuildArch) -eq $BuildArch) {
         Invoke-Native -FilePath $CTestCommand -Arguments @("--test-dir", $BuildDir, "-C", "Release", "--output-on-failure")
     } else {
         Write-Host "Skipping C++ smoke test because $BuildArch binaries cannot run in the current process architecture." -ForegroundColor Yellow
     }
-    $wrapperDll = Join-Path $BuildDir "Release\sunpack_sevenzip.dll"
     $workerExe = Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe"
     $launcherExe = Join-Path $BuildDir "Release\sunpack_launcher.exe"
-    Assert-PathExists -LiteralPath $wrapperDll -Description "Built 7z wrapper DLL"
     Assert-PathExists -LiteralPath $workerExe -Description "Built 7z worker executable"
     Assert-PathExists -LiteralPath $launcherExe -Description "Built SunPack launcher executable"
-    Assert-PeMachine -LiteralPath $wrapperDll -BuildArch $BuildArch -Description "Built 7z wrapper DLL"
     Assert-PeMachine -LiteralPath $workerExe -BuildArch $BuildArch -Description "Built 7z worker executable"
     Assert-PeMachine -LiteralPath $launcherExe -BuildArch $BuildArch -Description "Built SunPack launcher executable"
-    Copy-Item -LiteralPath $wrapperDll -Destination (Join-Path $ToolsRoot "sunpack_sevenzip.dll") -Force
     Copy-Item -LiteralPath $workerExe -Destination (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe") -Force
 
     Assert-SevenZipAsmSelection -BuildDir $BuildDir -BuildArch $BuildArch -ArtifactPaths @(
-        (Join-Path $ToolsRoot "sunpack_sevenzip.dll"),
         (Join-Path $ToolsRoot "sunpack_sevenzip_worker.exe")
     )
 }
@@ -858,7 +848,6 @@ function Copy-IfExists {
 
 function Get-PackagedRuntimeToolNames {
     return @(
-        "sunpack_sevenzip.dll",
         "sunpack_sevenzip_worker.exe",
         "sunpack_toast.dll"
     )
@@ -934,7 +923,6 @@ $toastHostRoot = Join-Path $repoRoot "native\toast_host"
 $toastHostBuildDir = Join-Path $toastHostRoot ("build-" + $buildArch)
 $toolsRoot = if ($buildArch -eq "x64") { Join-Path $repoRoot "tools" } else { Join-Path $repoRoot ("tools-" + $buildArch) }
 $sevenZipPath = Join-Path $toolsRoot "7z.exe"
-$sevenZipWrapperDllPath = Join-Path $toolsRoot "sunpack_sevenzip.dll"
 $sevenZipWorkerPath = Join-Path $toolsRoot "sunpack_sevenzip_worker.exe"
 $toastHostPath = Join-Path $toolsRoot "sunpack_toast.dll"
 $launcherBuildPath = Join-Path $sevenZipWrapperBuildDir "Release\sunpack_launcher.exe"
@@ -1049,12 +1037,10 @@ Invoke-Native -FilePath "cargo" -Arguments @(
 Assert-PathExists -LiteralPath $watchBrokerBuildPath -Description "SunPack Watch Broker executable"
 Assert-PeMachine -LiteralPath $watchBrokerBuildPath -BuildArch $buildArch -Description "SunPack Watch Broker executable"
 
-Build-SevenZipWrapper -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
+Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
 Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
-Assert-PathExists -LiteralPath $sevenZipWrapperDllPath -Description "Bundled 7z wrapper DLL"
 Assert-PathExists -LiteralPath $sevenZipWorkerPath -Description "Bundled 7z worker executable"
 Assert-PathExists -LiteralPath $toastHostPath -Description "Bundled toast DLL"
-Test-SevenZipWrapper -PythonPath $venvPython
 Test-SevenZipWorker -PythonPath $venvPython -RepoRoot $repoRoot
 Invoke-Native -FilePath $venvPython -Arguments @(
     "-c",
@@ -1164,7 +1150,6 @@ Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "LGPL-2.1.txt") -Des
 Assert-PathExists -LiteralPath (Join-Path $distLicensesRoot "zlib-ng-license.txt") -Description "Packaged zlib-ng license file"
 Assert-PathExists -LiteralPath $distThirdPartyNoticesPath -Description "Packaged third-party notices file"
 Assert-PathMissing -LiteralPath (Join-Path $distToolsRoot "7z.dll") -Description "Legacy standalone tools/7z.dll (the 7-Zip backend is embedded)"
-Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "sunpack_sevenzip.dll") -BuildArch $buildArch -Description "Packaged tools/sunpack_sevenzip.dll"
 Assert-PeMachine -LiteralPath (Join-Path $distToolsRoot "sunpack_sevenzip_worker.exe") -BuildArch $buildArch -Description "Packaged tools/sunpack_sevenzip_worker.exe"
 
 $versionFilePath = Join-Path $distAppRoot "VERSION.txt"

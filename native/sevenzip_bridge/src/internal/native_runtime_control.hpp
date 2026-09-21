@@ -9,7 +9,6 @@ namespace sunpack::sevenzip
 
     struct NativeRuntimeSample
     {
-        std::size_t available_memory = 0;
         double cpu_percent = 0.0;
         bool cpu_percent_valid = false;
         std::uint64_t io_read_bytes = 0;
@@ -64,17 +63,12 @@ namespace sunpack::sevenzip
         Accepted,
         RolledBack,
         Holding,
-        MemoryPaused,
-        MemoryResumed,
     };
 
     struct NativeRuntimeSnapshot
     {
         std::size_t active_limit = 1;
-        std::size_t memory_budget = 0;
         std::size_t active_jobs = 0;
-        std::size_t active_memory = 0;
-        bool memory_admission_paused = false;
         NativeControllerPhase phase = NativeControllerPhase::Baseline;
         NativeLoadState load_state = NativeLoadState::Idle;
         NativeControllerDecision decision = NativeControllerDecision::None;
@@ -110,8 +104,6 @@ namespace sunpack::sevenzip
         std::size_t aggressive_step = 4;
         std::size_t cooldown_windows = 2;
         std::size_t hold_windows = 8;
-        std::size_t memory_pause_available = 1ULL << 30;
-        std::size_t memory_resume_available = 2ULL << 30;
         double warm_start_decay_seconds = 0.0;
         std::size_t warm_start_confirmations = 2;
     };
@@ -121,20 +113,16 @@ namespace sunpack::sevenzip
     public:
         NativeRuntimeControl(
             std::size_t max_active_jobs,
-            std::size_t memory_budget,
             bool adaptive_enabled = true,
             std::size_t initial_active_jobs = 0)
             : NativeRuntimeControl(
                   max_active_jobs,
-                  memory_budget,
                   NativeRuntimeConfig{adaptive_enabled, false, initial_active_jobs}) {}
 
         NativeRuntimeControl(
             std::size_t max_active_jobs,
-            std::size_t memory_budget,
             NativeRuntimeConfig config)
             : max_active_jobs_((std::max)(std::size_t{1}, max_active_jobs)),
-              memory_budget_(memory_budget),
               adaptive_enabled_(config.adaptive_enabled),
               resource_diagnostics_enabled_(config.resource_diagnostics_enabled),
               exploration_strategy_(config.exploration_strategy),
@@ -149,8 +137,6 @@ namespace sunpack::sevenzip
               configured_aggressive_step_((std::max)(std::size_t{1}, config.aggressive_step)),
               cooldown_windows_((std::max)(std::size_t{1}, config.cooldown_windows)),
               hold_windows_((std::max)(std::size_t{1}, config.hold_windows)),
-              memory_pause_available_(config.memory_pause_available),
-              memory_resume_available_((std::max)(config.memory_pause_available, config.memory_resume_available)),
               warm_start_decay_seconds_((std::max)(0.0, config.warm_start_decay_seconds)),
               warm_start_confirmations_((std::max)(std::size_t{1}, config.warm_start_confirmations))
         {
@@ -186,25 +172,9 @@ namespace sunpack::sevenzip
             decision_ = NativeControllerDecision::SegmentInterrupted;
             return true;
         }
-        bool can_admit(
-            std::size_t active_jobs,
-            std::size_t active_memory,
-            std::size_t memory_reserve) const noexcept
+        bool can_admit(std::size_t active_jobs) const noexcept
         {
-            if (active_jobs >= active_limit_)
-            {
-                return false;
-            }
-            if (memory_admission_paused_ && active_jobs != 0)
-            {
-                return false;
-            }
-            if (memory_budget_ == 0)
-            {
-                return true;
-            }
-            return active_memory <= memory_budget_ &&
-                   memory_reserve <= memory_budget_ - (std::min)(active_memory, memory_budget_);
+            return active_jobs < active_limit_;
         }
 
         bool observe(
@@ -212,7 +182,6 @@ namespace sunpack::sevenzip
             const NativeThroughputCounters &counters,
             std::size_t queued_jobs,
             std::size_t active_jobs,
-            std::size_t active_memory,
             double elapsed_seconds = 0.0) noexcept
         {
             decision_ = NativeControllerDecision::None;
@@ -221,7 +190,6 @@ namespace sunpack::sevenzip
             {
                 changed = begin_activity(counters, 0.0);
             }
-            changed = observe_memory(runtime) || changed;
             observe_diagnostics(runtime, elapsed_seconds);
             const CounterDelta delta = counter_delta(counters);
             pending_write_bytes_ = counters.accepted_bytes >= counters.written_bytes
@@ -229,7 +197,7 @@ namespace sunpack::sevenzip
                                        : 0;
 
             const bool concurrency_exposed = queued_jobs != 0 && active_jobs != 0 &&
-                                             active_jobs + 1 >= active_limit_ && !memory_admission_paused_;
+                                             active_jobs + 1 >= active_limit_;
             if (!concurrency_exposed)
             {
                 if (load_state_ == NativeLoadState::Saturated)
@@ -269,16 +237,11 @@ namespace sunpack::sevenzip
             return process_measurement(measurement) || changed;
         }
 
-        NativeRuntimeSnapshot snapshot(
-            std::size_t active_jobs,
-            std::size_t active_memory) const noexcept
+        NativeRuntimeSnapshot snapshot(std::size_t active_jobs) const noexcept
         {
             return NativeRuntimeSnapshot{
                 active_limit_,
-                memory_budget_,
                 active_jobs,
-                active_memory,
-                memory_admission_paused_,
                 phase_,
                 load_state_,
                 decision_,
@@ -504,29 +467,6 @@ namespace sunpack::sevenzip
                 last_good_limit_ = limit;
                 confirmed_limit_samples_ = 1;
             }
-        }
-
-        bool observe_memory(const NativeRuntimeSample &runtime) noexcept
-        {
-            if (memory_budget_ == 0 || runtime.available_memory == 0)
-            {
-                return false;
-            }
-            if (!memory_admission_paused_ && runtime.available_memory < memory_pause_available_)
-            {
-                memory_admission_paused_ = true;
-                decision_ = NativeControllerDecision::MemoryPaused;
-                window_.clear();
-                return true;
-            }
-            if (memory_admission_paused_ && runtime.available_memory > memory_resume_available_)
-            {
-                memory_admission_paused_ = false;
-                decision_ = NativeControllerDecision::MemoryResumed;
-                settle_remaining_seconds_ = settle_seconds_;
-                return true;
-            }
-            return false;
         }
 
         void observe_diagnostics(const NativeRuntimeSample &runtime, double elapsed_seconds) noexcept
@@ -787,7 +727,6 @@ namespace sunpack::sevenzip
         }
 
         const std::size_t max_active_jobs_;
-        const std::size_t memory_budget_;
         const bool adaptive_enabled_;
         const bool resource_diagnostics_enabled_;
         const NativeExplorationStrategy exploration_strategy_;
@@ -802,15 +741,12 @@ namespace sunpack::sevenzip
         const std::size_t configured_aggressive_step_;
         const std::size_t cooldown_windows_;
         const std::size_t hold_windows_;
-        const std::size_t memory_pause_available_;
-        const std::size_t memory_resume_available_;
         const double warm_start_decay_seconds_;
         const std::size_t warm_start_confirmations_;
 
         std::size_t initial_active_jobs_ = 1;
         std::size_t active_limit_ = 1;
         std::size_t best_limit_ = 1;
-        bool memory_admission_paused_ = false;
         NativeControllerPhase phase_ = NativeControllerPhase::Baseline;
         NativeLoadState load_state_ = NativeLoadState::Idle;
         NativeControllerDecision decision_ = NativeControllerDecision::None;

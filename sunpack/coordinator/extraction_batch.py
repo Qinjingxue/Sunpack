@@ -10,7 +10,6 @@ from sunpack.contracts.content_recovery import (
 )
 from sunpack.contracts.tasks import ArchiveTask
 from sunpack.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
-from sunpack.coordinator.resource_preflight import ResourcePreflightInspector
 from sunpack.relations.stage import ArchiveRelationStage
 from sunpack.coordinator.verification_stage import verify_and_project
 from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy
@@ -50,7 +49,6 @@ from sunpack.contracts.verification import (
 from sunpack.support.path_keys import absolute_path_key
 from sunpack.support import archive_knowledge_projection as knowledge_view
 from sunpack.i18n import I18nContext
-from sunpack.config.advanced_defaults import advanced_config_value
 
 
 @dataclass
@@ -126,14 +124,6 @@ class ExtractionBatchRunner:
         self.relation_stage = ArchiveRelationStage()
         self.verifier = VerificationScheduler(self.config, password_session=self.extractor.password_session)
         self.directory_password_contexts = DirectoryPasswordContextStore(self.config)
-        performance = advanced_config_value(("performance",))
-        if isinstance(self.config.get("performance"), dict):
-            performance.update(self.config["performance"])
-        self.resource_inspector = ResourcePreflightInspector(
-            password_session=self.extractor.password_session,
-            rename_scheduler=self.rename_scheduler,
-            precise_resource_min_size_mb=performance["precise_resource_min_size_mb"],
-        )
 
     def set_progress_round(self, round_index: int, *, direct: bool = False) -> None:
         self.progress_round_index = max(1, int(round_index or 1))
@@ -214,7 +204,7 @@ class ExtractionBatchRunner:
 
         # Python only bounds blocking preparation through the broker. Every
         # extraction-ready task is submitted to the native worker, where
-        # fairness and resource admission are centralized.
+        # fairness and throughput-based concurrency control are centralized.
         try:
             outcomes = await map_unbounded(prepared_tasks, execute_one)
         finally:
@@ -266,10 +256,6 @@ class ExtractionBatchRunner:
             _index, _task, out_dir, result = inspected
             if result.skip_result is not None:
                 return out_dir, BatchExtractionOutcome(result.skip_result)
-            if knowledge_view.resource_analysis(task):
-                self.resource_inspector.inspect(task)
-            else:
-                self.resource_inspector.record_estimated_single_task_profile(task)
             return out_dir, None
 
         retried_missing_volume = False

@@ -140,7 +140,6 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
             call_order.append("close")
 
         monkeypatch.setattr(runtime.extractor, "inspect", lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})())
-        monkeypatch.setattr(runtime.batch_runner.resource_inspector, "inspect", lambda task: task)
         monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
         monkeypatch.setattr(runtime.extractor, "close", tracked_close)
@@ -214,7 +213,6 @@ def test_batch_does_not_treat_existing_same_name_directory_as_output(tmp_path, m
     def configure(runtime):
         captured["runtime"] = runtime
         monkeypatch.setattr(runtime.extractor, "inspect", lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})())
-        monkeypatch.setattr(runtime.batch_runner.resource_inspector, "inspect", lambda task: task)
         monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
 
@@ -267,7 +265,6 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
     def configure(runtime):
         captured["runtime"] = runtime
         monkeypatch.setattr(runtime.extractor, "inspect", lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})())
-        monkeypatch.setattr(runtime.batch_runner.resource_inspector, "inspect", lambda item: item)
         monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
 
