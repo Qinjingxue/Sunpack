@@ -354,7 +354,7 @@ def _attempt_outcome(response: Any) -> dict[str, Any]:
 
 
 def _output_summary(root: Path, fed_names: set[str]) -> dict[str, Any]:
-    excluded = fed_names | {"state.json", "events.jsonl", ".sunpack-passwords.txt"}
+    excluded = fed_names | {"state.json", "events.jsonl", "sunpack-passwords.txt"}
     files = [
         path for path in root.rglob("*")
         if path.is_file() and path.name not in excluded
