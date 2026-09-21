@@ -136,7 +136,16 @@ bool check_runtime_control_rolls_back_large_window_regression() {
     counters.accepted_bytes = counters.written_bytes = 1'800;
     counters.completed_jobs = 4;
     controller.observe(runtime, counters, 100, 5, 0.1);
-    const auto snapshot = controller.snapshot(5);
+    auto snapshot = controller.snapshot(5);
+    if (snapshot.active_limit != 4 ||
+        snapshot.phase != NativeControllerPhase::Verify ||
+        snapshot.decision != NativeControllerDecision::VerifyStarted) {
+        return false;
+    }
+    counters.accepted_bytes = counters.written_bytes = 2'800;
+    counters.completed_jobs = 6;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    snapshot = controller.snapshot(4);
     return snapshot.active_limit == 4 &&
         snapshot.decision == NativeControllerDecision::RolledBack &&
         snapshot.throughput_mode == NativeThroughputMode::Bytes;
@@ -154,7 +163,14 @@ bool check_runtime_control_accepts_large_window_improvement() {
     counters.accepted_bytes = counters.written_bytes = 2'200;
     counters.completed_jobs = 4;
     controller.observe(runtime, counters, 100, 5, 0.1);
-    return controller.snapshot(5).active_limit == 6;
+    if (controller.snapshot(5).phase != NativeControllerPhase::Verify ||
+        controller.snapshot(5).active_limit != 4) {
+        return false;
+    }
+    counters.accepted_bytes = counters.written_bytes = 3'200;
+    counters.completed_jobs = 6;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    return controller.snapshot(4).active_limit == 6;
 }
 
 bool check_runtime_control_uses_small_job_window() {
@@ -169,9 +185,115 @@ bool check_runtime_control_uses_small_job_window() {
     controller.observe(runtime, counters, 100, 4, 0.1);
     counters.completed_jobs = 7;
     controller.observe(runtime, counters, 100, 5, 0.1);
-    const auto snapshot = controller.snapshot(5);
+    if (controller.snapshot(5).phase != NativeControllerPhase::Verify) {
+        return false;
+    }
+    counters.completed_jobs = 11;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    const auto snapshot = controller.snapshot(4);
     return snapshot.active_limit == 4 &&
         snapshot.throughput_mode == NativeThroughputMode::Jobs;
+}
+
+bool check_runtime_control_rebases_external_discontinuity_at_stable_limit() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    counters.accepted_bytes = counters.written_bytes = 1'000;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    if (controller.snapshot(4).active_limit != 5 ||
+        controller.snapshot(4).phase != NativeControllerPhase::Probe) {
+        return false;
+    }
+    if (!controller.rebase_after_external_discontinuity(counters)) {
+        return false;
+    }
+    const auto snapshot = controller.snapshot(4);
+    return snapshot.active_limit == 4 &&
+        snapshot.phase == NativeControllerPhase::Baseline &&
+        snapshot.decision == NativeControllerDecision::SegmentInterrupted;
+}
+
+bool check_runtime_control_waits_for_realized_experimental_concurrency() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+
+    counters.accepted_bytes = counters.written_bytes = 1'000;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    if (controller.snapshot(4).active_limit != 5) {
+        return false;
+    }
+
+    counters.accepted_bytes = counters.written_bytes = 2'200;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    auto snapshot = controller.snapshot(4);
+    if (snapshot.phase != NativeControllerPhase::Probe || snapshot.active_limit != 5) {
+        return false;
+    }
+
+    counters.accepted_bytes = counters.written_bytes = 3'400;
+    controller.observe(runtime, counters, 100, 5, 0.1);
+    snapshot = controller.snapshot(5);
+    if (snapshot.phase != NativeControllerPhase::Verify || snapshot.active_limit != 4) {
+        return false;
+    }
+
+    counters.accepted_bytes = counters.written_bytes = 4'400;
+    controller.observe(runtime, counters, 100, 5, 0.1);
+    snapshot = controller.snapshot(5);
+    if (snapshot.phase != NativeControllerPhase::Verify || snapshot.active_limit != 4) {
+        return false;
+    }
+
+    counters.accepted_bytes = counters.written_bytes = 5'400;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    return controller.snapshot(4).active_limit == 6;
+}
+
+bool check_runtime_control_marks_probe_contaminated_on_environment_shift() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    counters.accepted_bytes = counters.written_bytes = 1'000;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    counters.accepted_bytes = counters.written_bytes = 2'200;
+    controller.observe(runtime, counters, 100, 5, 0.1);
+    counters.accepted_bytes = counters.written_bytes = 2'800;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    const auto snapshot = controller.snapshot(4);
+    return snapshot.active_limit == 4 &&
+        snapshot.phase == NativeControllerPhase::Baseline &&
+        snapshot.decision == NativeControllerDecision::Contaminated;
+}
+
+bool check_runtime_control_detects_passive_environment_change() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    counters.accepted_bytes = counters.written_bytes = 1'000;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    counters.accepted_bytes = counters.written_bytes = 1'800;
+    controller.observe(runtime, counters, 100, 5, 0.1);
+    counters.accepted_bytes = counters.written_bytes = 2'800;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    if (controller.snapshot(4).phase != NativeControllerPhase::Cooldown) {
+        return false;
+    }
+    counters.accepted_bytes = counters.written_bytes = 3'300;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    const auto snapshot = controller.snapshot(4);
+    return snapshot.active_limit == 4 &&
+        snapshot.phase == NativeControllerPhase::Baseline &&
+        snapshot.decision == NativeControllerDecision::EnvironmentChanged;
 }
 
 bool check_runtime_control_interrupts_probe_when_backlog_disappears() {
@@ -238,17 +360,27 @@ bool check_runtime_control_warm_start_decays_without_reusing_measurements() {
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
+
     counters.written_bytes = counters.accepted_bytes = 1'000;
     controller.observe(runtime, counters, 100, 4, 0.1);
     counters.written_bytes = counters.accepted_bytes = 2'200;
     controller.observe(runtime, counters, 100, 5, 0.1);
-    counters.written_bytes = counters.accepted_bytes = 3'600;
-    controller.observe(runtime, counters, 100, 6, 0.1);
+    counters.written_bytes = counters.accepted_bytes = 3'200;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+
     counters.written_bytes = counters.accepted_bytes = 4'600;
+    controller.observe(runtime, counters, 100, 6, 0.1);
+    counters.written_bytes = counters.accepted_bytes = 5'800;
+    controller.observe(runtime, counters, 100, 5, 0.1);
+
+    counters.written_bytes = counters.accepted_bytes = 6'800;
     controller.observe(runtime, counters, 100, 7, 0.1);
-    if (controller.snapshot(7).active_limit != 6) {
+    counters.written_bytes = counters.accepted_bytes = 8'200;
+    controller.observe(runtime, counters, 100, 6, 0.1);
+    if (controller.snapshot(6).active_limit != 6) {
         return false;
     }
+
     controller.end_activity(counters);
     controller.begin_activity(counters, 0.0);
     auto snapshot = controller.snapshot(0);
@@ -347,6 +479,22 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_runtime_control_uses_small_job_window()) {
         std::cerr << "runtime control small-job window check failed\n";
         return 8;
+    }
+    if (!check_runtime_control_rebases_external_discontinuity_at_stable_limit()) {
+        std::cerr << "runtime control external-discontinuity rebase check failed\n";
+        return 21;
+    }
+    if (!check_runtime_control_waits_for_realized_experimental_concurrency()) {
+        std::cerr << "runtime control realized-concurrency check failed\n";
+        return 20;
+    }
+    if (!check_runtime_control_marks_probe_contaminated_on_environment_shift()) {
+        std::cerr << "runtime control contaminated-probe check failed\n";
+        return 18;
+    }
+    if (!check_runtime_control_detects_passive_environment_change()) {
+        std::cerr << "runtime control passive environment-change check failed\n";
+        return 19;
     }
     if (!check_runtime_control_interrupts_probe_when_backlog_disappears()) {
         std::cerr << "runtime control saturated-segment interruption check failed\n";

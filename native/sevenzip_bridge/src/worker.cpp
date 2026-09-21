@@ -1537,6 +1537,7 @@ private:
         switch (phase) {
         case NativeControllerPhase::Baseline: return "baseline";
         case NativeControllerPhase::Probe: return "probe";
+        case NativeControllerPhase::Verify: return "verify";
         case NativeControllerPhase::Cooldown: return "cooldown";
         case NativeControllerPhase::Hold: return "hold";
         }
@@ -1556,8 +1557,11 @@ private:
         case NativeControllerDecision::BaselineReady: return "baseline_ready";
         case NativeControllerDecision::ProbeUp: return "probe_up";
         case NativeControllerDecision::ProbeDown: return "probe_down";
+        case NativeControllerDecision::VerifyStarted: return "verify_started";
         case NativeControllerDecision::Accepted: return "accepted";
         case NativeControllerDecision::RolledBack: return "rolled_back";
+        case NativeControllerDecision::Contaminated: return "contaminated";
+        case NativeControllerDecision::EnvironmentChanged: return "environment_changed";
         case NativeControllerDecision::Holding: return "holding";
         }
         return "none";
