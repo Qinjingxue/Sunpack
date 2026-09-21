@@ -35,6 +35,7 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
     )
     config["password_retry_debounce_seconds"] = max(0.0, _float_field(config, "password_retry_debounce_seconds"))
     config["password_retry_include_subtree"] = bool(config["password_retry_include_subtree"])
+    config["directory_password_file_auto_create"] = bool(config["directory_password_file_auto_create"])
     config["clipboard_monitor_enabled"] = bool(config["clipboard_monitor_enabled"])
     config["clipboard_builtin_max_entries"] = max(1, _int_field(config, "clipboard_builtin_max_entries"))
     roots = config["roots"]
