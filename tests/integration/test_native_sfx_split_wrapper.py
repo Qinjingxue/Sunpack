@@ -7,7 +7,6 @@ from sunpack.passwords.verifier.rar_fast import RarFastVerifier
 from sunpack.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
 from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
 from sunpack.support import archive_knowledge_projection as knowledge_view
-from sunpack.support.sevenzip_bridge import get_native_sevenzip_bridge
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar_sfx, require_7z
 
@@ -62,38 +61,3 @@ def test_input_planned_sfx_uses_rust_password_verifier(tmp_path, archive_format)
         assert outcome.final_confirmation_required is True, outcome
     elif archive_format == "7z":
         assert outcome.final_confirmation_required is False, outcome
-
-
-@pytest.mark.parametrize(
-    ("archive_format", "password"),
-    [
-        ("7z", None),
-        ("7z", PASSWORD),
-        ("zip", None),
-        ("zip", PASSWORD),
-        ("rar", None),
-        ("rar", PASSWORD),
-    ],
-)
-def test_native_resource_bridge_handles_sfx_split(tmp_path, archive_format, password):
-    require_7z()
-    if archive_format == "rar" and not get_optional_rar_sfx():
-        pytest.skip("RAR SFX generator is not configured")
-
-    case = ArchiveFixtureFactory().create(
-        tmp_path,
-        f"native_resources_{archive_format}_{bool(password)}",
-        archive_format,
-        split=True,
-        sfx=True,
-        password=password,
-    )
-    bridge = get_native_sevenzip_bridge()
-    analysis = bridge.analyze_archive_resources(
-        str(case.entry_path),
-        password=password or "",
-        part_paths=_parts(case),
-    )
-
-    assert analysis.ok, analysis
-    assert analysis.file_count >= 1

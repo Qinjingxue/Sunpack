@@ -1193,12 +1193,6 @@ sunpack::sevenzip::NativeMachineResources native_machine_resources() noexcept {
     if (active_processors != 0) {
         resources.logical_processors = static_cast<std::size_t>(active_processors);
     }
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    if (GlobalMemoryStatusEx(&status)) {
-        resources.total_memory_bytes = status.ullTotalPhys;
-        resources.available_memory_bytes = status.ullAvailPhys;
-    }
 #endif
     return resources;
 }
@@ -1215,8 +1209,6 @@ sunpack::sevenzip::NativeSizingOverrides configured_native_sizing_overrides() no
         "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY", 0, 0, 32);
     overrides.initial_active_jobs = configured_native_size(
         "SUNPACK_NATIVE_INITIAL_ACTIVE_JOBS", 0, 0, 32);
-    overrides.memory_budget_bytes = configured_native_size(
-        "SUNPACK_NATIVE_MEMORY_BUDGET_BYTES", 0, 0);
     return overrides;
 }
 
@@ -1284,10 +1276,6 @@ sunpack::sevenzip::NativeRuntimeConfig configured_native_runtime_config(
         config.warm_start_confirmations,
         1,
         64);
-    config.memory_pause_available = configured_native_size(
-        "SUNPACK_NATIVE_MEMORY_PAUSE_AVAILABLE_BYTES", config.memory_pause_available);
-    config.memory_resume_available = configured_native_size(
-        "SUNPACK_NATIVE_MEMORY_RESUME_AVAILABLE_BYTES", config.memory_resume_available);
     return config;
 }
 
@@ -1311,11 +1299,9 @@ public:
               writer_config_,
               space_change_sink_)),
           worker_count_((std::max)(std::size_t{1}, sizing.thread_capacity)),
-          memory_budget_(sizing.memory_budget_bytes),
           queue_capacity_(configured_native_queue_capacity()),
           runtime_controller_(
               worker_count_,
-              memory_budget_,
               std::move(runtime_config)) {
         // tick() must be called with the executor mutex_ released; the monitor keeps no membership and pulls blocked volumes from the registry.
         space_monitor_ = std::make_unique<sunpack::sevenzip::VolumeSpaceMonitor>(
@@ -1352,17 +1338,6 @@ public:
             std::lock_guard<std::mutex> lock(mutex_);
             if (stopping_) {
                 promise->set_value(-100);
-                return future;
-            }
-            if (memory_budget_ != 0 && metadata.memory_reserve > memory_budget_) {
-                any_job_failed_ = true;
-                promise->set_value(-1);
-                print_json_line(
-                    "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-                    "\",\"status\":\"failed\",\"native_status\":\"resource_limit\","
-                    "\"failure_stage\":\"native_admission\",\"failure_kind\":\"memory_budget\","
-                    "\"message\":\"job memory reservation exceeds native hard budget\"}");
-                print_worker_event(job_id, "job_finished", metadata);
                 return future;
             }
             if (queue_capacity_ != 0 && queue_.size() >= queue_capacity_) {
@@ -1474,8 +1449,6 @@ private:
     struct JobMetadata {
         std::string request_id;
         bool foreground = true;
-        std::size_t memory_reserve = 64U << 20;
-        std::size_t dictionary_reserve = 0;
         // Routing key for the per-volume write facility, resolved by the caller before submission; never empty in practice.
         std::string volume_key;
         // False only for dry runs, which write nothing and need no facility, writer threads or readiness gate.
@@ -1503,7 +1476,6 @@ private:
 
     static JobMetadata metadata_from_request(const std::string& request) noexcept {
         JobMetadata metadata;
-        unsigned long long value = 0;
         metadata.request_id = json_string_field(request, "request_id", "");
         if (metadata.request_id.empty()) {
             metadata.request_id = json_string_field(request, "job_id", "");
@@ -1511,56 +1483,26 @@ private:
         metadata.foreground = json_string_field(request, "origin", "foreground") != "watch";
         metadata.volume_key = json_string_field(request, "output_volume_key", "");
         metadata.requires_writer = !json_bool_field(request, "dry_run", false);
-        if (json_uint_field_in_object(request, "native_memory_reserve_bytes", &value)) {
-            metadata.memory_reserve = (std::max)(
-                std::size_t{1}, static_cast<std::size_t>((std::min)(
-                    value,
-                    static_cast<unsigned long long>((std::numeric_limits<std::size_t>::max)()))));
-        }
-        if (json_uint_field_in_object(request, "native_dictionary_reserve_bytes", &value)) {
-            metadata.dictionary_reserve = static_cast<std::size_t>((std::min)(
-                value,
-                static_cast<unsigned long long>((std::numeric_limits<std::size_t>::max)())));
-            constexpr std::size_t decoder_scratch = 32U << 20;
-            const std::size_t dictionary_memory = metadata.dictionary_reserve >
-                    (std::numeric_limits<std::size_t>::max)() - decoder_scratch
-                ? (std::numeric_limits<std::size_t>::max)()
-                : metadata.dictionary_reserve + decoder_scratch;
-            metadata.memory_reserve = (std::max)(metadata.memory_reserve, dictionary_memory);
-        }
         return metadata;
     }
 
-    bool can_admit_locked(const Job& job) const noexcept {
-        if (!runtime_controller_.can_admit(
-                active_jobs_,
-                active_memory_,
-                job.metadata.memory_reserve)) {
-            return false;
-        }
-        return true;
-    }
-
     std::size_t select_job_locked() const noexcept {
+        if (!runtime_controller_.can_admit(active_jobs_)) {
+            return queue_.size();
+        }
         for (std::size_t index = 0; index < queue_.size(); ++index) {
-            if (queue_[index].metadata.foreground && can_admit_locked(queue_[index])) {
+            if (queue_[index].metadata.foreground) {
                 return index;
             }
         }
-        for (std::size_t index = 0; index < queue_.size(); ++index) {
-            if (can_admit_locked(queue_[index])) {
-                return index;
-            }
-        }
-        return queue_.size();
+        return queue_.empty() ? queue_.size() : 0;
     }
 
     void print_worker_event(
         const std::string& job_id,
         const char* event,
         const JobMetadata& metadata,
-        std::size_t active_jobs = 0,
-        std::size_t active_memory = 0
+        std::size_t active_jobs = 0
     ) const noexcept {
         if (job_id.empty()) {
             return;
@@ -1572,25 +1514,20 @@ private:
             "\",\"origin\":\"" + std::string(metadata.foreground ? "foreground" : "watch") +
             "\",\"output_volume_key\":\"" + json_escape(metadata.volume_key) +
             "\",\"requires_writer\":" + std::string(metadata.requires_writer ? "true" : "false") +
-            ",\"memory_reserve_bytes\":" + std::to_string(metadata.memory_reserve) +
-            ",\"dictionary_reserve_bytes\":" + std::to_string(metadata.dictionary_reserve) +
             ",\"active_jobs\":" + std::to_string(active_jobs) +
-            ",\"active_memory_bytes\":" + std::to_string(active_memory) +
             "}");
     }
 
     void print_active_event(
         const Job& job,
         const char* event,
-        std::size_t active_jobs,
-        std::size_t active_memory
+        std::size_t active_jobs
     ) const noexcept {
         print_worker_event(
             json_string_field(job.request, "job_id", ""),
             event,
             job.metadata,
-            active_jobs,
-            active_memory);
+            active_jobs);
     }
 
     static const char* controller_phase_name(
@@ -1622,8 +1559,6 @@ private:
         case NativeControllerDecision::Accepted: return "accepted";
         case NativeControllerDecision::RolledBack: return "rolled_back";
         case NativeControllerDecision::Holding: return "holding";
-        case NativeControllerDecision::MemoryPaused: return "memory_paused";
-        case NativeControllerDecision::MemoryResumed: return "memory_resumed";
         }
         return "none";
     }
@@ -1665,10 +1600,6 @@ private:
             "{\"type\":\"native_controller\",\"queued_jobs\":" + std::to_string(queued_jobs) +
             ",\"active_limit\":" + std::to_string(snapshot.active_limit) +
             ",\"active_jobs\":" + std::to_string(snapshot.active_jobs) +
-            ",\"active_memory_bytes\":" + std::to_string(snapshot.active_memory) +
-            ",\"memory_budget_bytes\":" + std::to_string(snapshot.memory_budget) +
-            ",\"memory_admission_paused\":" +
-                std::string(snapshot.memory_admission_paused ? "true" : "false") +
             ",\"load_state\":\"" + controller_load_state_name(snapshot.load_state) + "\"" +
             ",\"phase\":\"" + controller_phase_name(snapshot.phase) + "\"" +
             ",\"decision\":\"" + controller_decision_name(snapshot.decision) + "\"" +
@@ -1857,15 +1788,6 @@ private:
     ) noexcept {
         sunpack::sevenzip::NativeRuntimeSample sample;
 #ifdef _WIN32
-        MEMORYSTATUSEX memory_status{};
-        memory_status.dwLength = sizeof(memory_status);
-        if (GlobalMemoryStatusEx(&memory_status)) {
-            sample.available_memory = static_cast<std::size_t>(
-                (std::min)(
-                    memory_status.ullAvailPhys,
-                    static_cast<unsigned long long>((std::numeric_limits<std::size_t>::max)())));
-        }
-
         FILETIME idle_time{}, kernel_time{}, user_time{};
         if (include_resource_diagnostics &&
             GetSystemTimes(&idle_time, &kernel_time, &user_time)) {
@@ -2011,7 +1933,7 @@ private:
                 monitor_parked = false;
                 last_sample_at = now - std::chrono::milliseconds(minimum_sample_interval_ms);
                 reset_system_cpu_sample();
-                const auto snapshot = runtime_controller_.snapshot(active_jobs_, active_memory_);
+                const auto snapshot = runtime_controller_.snapshot(active_jobs_);
                 const std::size_t queued_jobs = queue_.size();
                 wait_lock.unlock();
                 print_controller_lifecycle_event("activity_started");
@@ -2068,7 +1990,7 @@ private:
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (queue_.empty() && active_jobs_ == 0 && writer_idle) {
                     runtime_controller_.end_activity(throughput);
-                    parked_snapshot = runtime_controller_.snapshot(0, 0);
+                    parked_snapshot = runtime_controller_.snapshot(0);
                     controller_recheck_ = false;
                     monitor_parked = true;
                     idle_since = now;
@@ -2102,11 +2024,9 @@ private:
                                 throughput,
                                 queued_jobs,
                                 active_jobs_,
-                                active_memory_,
                                 elapsed_seconds) ||
                           changed;
-                snapshot = runtime_controller_.snapshot(
-                    active_jobs_, active_memory_);
+                snapshot = runtime_controller_.snapshot(active_jobs_);
             }
             next_interval_ms = controller_interval_ms(snapshot, queued_jobs);
             if (changed || snapshot.resource_diagnostics_enabled) {
@@ -2148,7 +2068,6 @@ private:
         for (;;) {
             Job job;
             std::size_t admitted_jobs = 0;
-            std::size_t admitted_memory = 0;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 condition_.wait(lock, [this] {
@@ -2165,12 +2084,10 @@ private:
                 job = std::move(*iterator);
                 queue_.erase(iterator);
                 active_jobs_ += 1;
-                active_memory_ += job.metadata.memory_reserve;
                 admitted_jobs = active_jobs_;
-                admitted_memory = active_memory_;
             }
-            print_active_event(job, "job_admitted", admitted_jobs, admitted_memory);
-            print_active_event(job, "job_started", admitted_jobs, admitted_memory);
+            print_active_event(job, "job_admitted", admitted_jobs);
+            print_active_event(job, "job_started", admitted_jobs);
             int code = -100;
             try {
                 if (job.metadata.requires_writer) {
@@ -2195,23 +2112,19 @@ private:
             }
             const std::string job_id = json_string_field(job.request, "job_id", "");
             std::size_t remaining_jobs = 0;
-            std::size_t remaining_memory = 0;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!job_id.empty()) {
                     cancel_tokens_.erase(job_id);
                 }
                 active_jobs_ = active_jobs_ > 0 ? active_jobs_ - 1 : 0;
-                active_memory_ = active_memory_ >= job.metadata.memory_reserve
-                    ? active_memory_ - job.metadata.memory_reserve : 0;
                 remaining_jobs = active_jobs_;
-                remaining_memory = active_memory_;
                 any_job_failed_ = any_job_failed_ || code != 0;
                 controller_recheck_ = true;
             }
             condition_.notify_all();
             controller_condition_.notify_one();
-            print_active_event(job, "job_finished", remaining_jobs, remaining_memory);
+            print_active_event(job, "job_finished", remaining_jobs);
             try {
                 job.promise->set_value(code);
             } catch (...) {
@@ -2236,11 +2149,9 @@ private:
     std::condition_variable condition_;
     std::condition_variable controller_condition_;
     const std::size_t worker_count_;
-    const std::size_t memory_budget_;
     const std::size_t queue_capacity_;
     sunpack::sevenzip::NativeRuntimeControl runtime_controller_;
     std::size_t active_jobs_ = 0;
-    std::size_t active_memory_ = 0;
     bool controller_recheck_ = false;
     bool any_job_failed_ = false;
     bool stopping_ = false;
@@ -2292,7 +2203,7 @@ int main() {
     const auto runtime_config = configured_native_runtime_config(sizing);
     NativeJobExecutor executor(sizing, runtime_config);
     const bool sizing_overridden = sizing.thread_capacity_overridden ||
-        sizing.initial_active_jobs_overridden || sizing.memory_budget_overridden;
+        sizing.initial_active_jobs_overridden;
     const char* exploration_strategy = runtime_config.exploration_strategy ==
             sunpack::sevenzip::NativeExplorationStrategy::Calibrated
         ? "calibrated"
@@ -2303,9 +2214,6 @@ int main() {
         "{\"type\":\"worker_ready\",\"sizing_mode\":\"" +
         std::string(sizing_overridden ? "overridden" : "dynamic") +
         "\",\"logical_processors\":" + std::to_string(resources.logical_processors) +
-        ",\"total_memory_bytes\":" + std::to_string(resources.total_memory_bytes) +
-        ",\"available_memory_bytes\":" + std::to_string(resources.available_memory_bytes) +
-        ",\"memory_budget_bytes\":" + std::to_string(sizing.memory_budget_bytes) +
         ",\"thread_capacity\":" + std::to_string(sizing.thread_capacity) +
         ",\"initial_active_limit\":" + std::to_string(runtime_config.initial_active_jobs) +
         ",\"exploration_strategy\":\"" + exploration_strategy + "\"" +

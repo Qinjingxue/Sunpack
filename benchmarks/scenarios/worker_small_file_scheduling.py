@@ -1,4 +1,4 @@
-"""Stress native worker parallelism and resource admission with small archive jobs."""
+"""Stress native worker parallelism with small archive jobs."""
 from __future__ import annotations
 
 import argparse
@@ -30,12 +30,10 @@ SCENARIO = "extraction.worker-small-file-scheduling"
 
 ADMISSION_CASES: dict[str, dict[str, Any]] = {
     "adaptive-baseline": {
-        "description": "Throughput controller with hard memory admission.",
+        "description": "Adaptive throughput controller.",
         "blocker": "adaptive-controller",
         "adaptive_enabled": None,
         "initial_active_jobs": 0,
-        "memory_reserve_bytes": 8 << 20,
-        "memory_budget_bytes": 0,
         "expected_max_active": None,
     },
     "fixed-capacity": {
@@ -43,18 +41,7 @@ ADMISSION_CASES: dict[str, dict[str, Any]] = {
         "blocker": "none-fixed-capacity",
         "adaptive_enabled": False,
         "initial_active_jobs": -1,
-        "memory_reserve_bytes": 8 << 20,
-        "memory_budget_bytes": 0,
         "expected_max_active": None,
-    },
-    "memory-bound": {
-        "description": "A two-job memory budget blocks the third admission.",
-        "blocker": "memory-budget",
-        "adaptive_enabled": False,
-        "initial_active_jobs": -1,
-        "memory_reserve_bytes": 16 << 20,
-        "memory_budget_bytes": 32 << 20,
-        "expected_max_active": 2,
     },
 }
 
@@ -133,7 +120,6 @@ def _job_payload(
     archive: Path,
     output_dir: Path,
     dll_path: Path,
-    memory_reserve_bytes: int,
     format_hint: str = "zip",
 ) -> str:
     return json.dumps(
@@ -145,7 +131,6 @@ def _job_payload(
             "output_dir": str(output_dir),
             "password": "",
             "format_hint": format_hint,
-            "native_memory_reserve_bytes": memory_reserve_bytes,
         },
         ensure_ascii=False,
         separators=(",", ":"),
@@ -190,7 +175,6 @@ def _run_batch(
         "adaptive_enabled": admission_case["adaptive_enabled"],
         "initial_active_jobs": initial_active_jobs,
         "sample_interval_ms": sample_interval_ms,
-        "memory_budget_bytes": admission_case["memory_budget_bytes"],
     }
     worker_config.update(worker_config_overrides or {})
     worker = _NativeWorkerProcess(
@@ -287,7 +271,6 @@ def _run_batch(
                     archive=archive_paths[index],
                     output_dir=workspace.outputs / label / job_id,
                     dll_path=dll_path,
-                    memory_reserve_bytes=int(admission_case["memory_reserve_bytes"]),
                     format_hint=(
                         str(format_hints[index])
                         if format_hints
@@ -385,7 +368,6 @@ def _summarize_batch(
     queued_jobs = 0
     previous_at = started_at
     active = 0
-    peak_memory = 0
     for event in ordered_events:
         received_at = float(event["received_at"])
         active_area += max(0.0, received_at - previous_at) * active
@@ -402,7 +384,6 @@ def _summarize_batch(
             queued_jobs = max(0, queued_jobs - 1) if event_name == "job_admitted" else queued_jobs
         active = int(event.get("active_jobs", active) or 0)
         peak_active = max(peak_active, active)
-        peak_memory = max(peak_memory, int(event.get("active_memory_bytes", 0) or 0))
         job_id = str(event.get("job_id") or "")
         by_job.setdefault(job_id, {})[event_name] = received_at
         if event_name == "job_admitted":
@@ -484,7 +465,6 @@ def _summarize_batch(
         "thread_capacity_utilization": round(active_area / (elapsed * capacity), 6),
         "queued_underutilized_thread_ms": round(queued_underutilized_area * 1000.0, 3),
         "queued_underutilization_ratio": round(queued_underutilized_area / (elapsed * capacity), 6),
-        "peak_active_memory_bytes": peak_memory,
         "queue_latency_p50_ms": _percentile(queue_ms, 50),
         "queue_latency_p95_ms": _percentile(queue_ms, 95),
         "service_p50_ms": _percentile(service_ms, 50),

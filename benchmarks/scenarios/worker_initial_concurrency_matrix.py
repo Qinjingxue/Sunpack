@@ -11,8 +11,6 @@ import zipfile
 from pathlib import Path
 from typing import Any
 
-import psutil
-
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -85,14 +83,7 @@ def _parse_variants(values: list[str]) -> list[str]:
 
 def _automatic_capacity() -> tuple[int, dict[str, int]]:
     logical_processors = max(1, os.cpu_count() or 1)
-    available_memory_bytes = int(psutil.virtual_memory().available)
-    memory_budget_bytes = available_memory_bytes * 7 // 10
-    capacity = logical_processors
-    return capacity, {
-        "logical_processors": logical_processors,
-        "available_memory_bytes": available_memory_bytes,
-        "memory_budget_bytes": memory_budget_bytes,
-    }
+    return logical_processors, {"logical_processors": logical_processors}
 
 
 def _write_payloads(root: Path, *, file_count: int, file_size_bytes: int) -> int:
@@ -321,7 +312,6 @@ def main() -> int:
                         "name": "adaptive-baseline",
                         "adaptive_enabled": True,
                         "initial_active_jobs": initial,
-                        "memory_reserve_bytes": 64 << 20,
                         "cpu_weight": archive["cpu_weight"],
                     })
                     measured = run >= args.warmups

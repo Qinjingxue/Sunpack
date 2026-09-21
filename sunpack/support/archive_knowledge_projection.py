@@ -96,17 +96,6 @@ def archive_password(task: Any) -> str | None:
     return str(value) if value is not None else None
 
 
-def resource_analysis(task: Any) -> dict[str, Any]:
-    return _dict(get(task, "resource.analysis", {}))
-
-
-def resource_memory_weight(task: Any) -> int:
-    try:
-        return max(1, int(get(task, "resource.memory_weight", 1) or 1))
-    except (TypeError, ValueError):
-        return 1
-
-
 def projection_cache_stats() -> dict[str, Any]:
     with _PROJECTION_CACHE_LOCK:
         hits = dict(_PROJECTION_HITS)

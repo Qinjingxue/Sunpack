@@ -4,9 +4,8 @@ Rust/PyO3 extension module for narrow native helpers used by SunPack.
 
 This crate should stay focused on cross-platform filesystem and byte-structure
 hot paths. Python remains responsible for configuration, rule decisions,
-task orchestration, and error reporting. 7-Zip archive probing/password testing
-lives in the separate C++ `native/sevenzip_bridge` component because it
-is Windows/COM/7z.dll-specific.
+task orchestration, and error reporting. Embedded 7-Zip extraction lives in the
+separate C++ `native/sevenzip_bridge` worker component.
 
 ## Build
 

@@ -37,17 +37,6 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
         if value >= minimum:
             environment[environment_key] = str(value)
 
-    def set_bytes_from_mb(config_key: str, environment_key: str) -> None:
-        value = process_config.get(config_key)
-        if value is None:
-            return
-        try:
-            value = float(value)
-        except (TypeError, ValueError):
-            return
-        if value > 0:
-            environment[environment_key] = str(max(1, int(value * 1024 * 1024)))
-
     def set_float(config_key: str, environment_key: str) -> None:
         value = process_config.get(config_key)
         if value is None:
@@ -70,16 +59,6 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
     set_int("writer_threads", "SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME")
     set_int("sample_interval_ms", "SUNPACK_NATIVE_SAMPLE_INTERVAL_MS", minimum=100)
     set_int("initial_active_jobs", "SUNPACK_NATIVE_INITIAL_ACTIVE_JOBS", minimum=0)
-
-    memory_budget = process_config.get("memory_budget_bytes")
-    try:
-        memory_budget = int(memory_budget) if memory_budget is not None else 0
-    except (TypeError, ValueError):
-        memory_budget = 0
-    if process_config.get("memory_budget_bytes") is not None:
-        environment.pop("SUNPACK_NATIVE_MEMORY_BUDGET_BYTES", None)
-    if memory_budget > 0:
-        environment["SUNPACK_NATIVE_MEMORY_BUDGET_BYTES"] = str(memory_budget)
 
     native_adaptive = process_config.get("adaptive_enabled")
     if native_adaptive is not None:
@@ -109,14 +88,6 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
     set_int("hold_windows", "SUNPACK_NATIVE_HOLD_WINDOWS")
     set_float("warm_start_decay_seconds", "SUNPACK_NATIVE_WARM_START_DECAY_SECONDS")
     set_int("warm_start_confirmations", "SUNPACK_NATIVE_WARM_START_CONFIRMATIONS")
-    set_bytes_from_mb(
-        "memory_pause_available_mb",
-        "SUNPACK_NATIVE_MEMORY_PAUSE_AVAILABLE_BYTES",
-    )
-    set_bytes_from_mb(
-        "memory_resume_available_mb",
-        "SUNPACK_NATIVE_MEMORY_RESUME_AVAILABLE_BYTES",
-    )
     set_int("max_queue_jobs", "SUNPACK_NATIVE_MAX_QUEUE_JOBS")
     # 空间不足自动暂停/恢复（卷级 gate）的唯一总开关。
     space_gate = process_config.get("space_gate_enabled")
@@ -1358,7 +1329,6 @@ class SevenZipRunner:
             "password": password or "",
         }
         self._apply_native_job_budget(job)
-        self._apply_native_admission_hints(job, task)
         candidates = tuple(dict.fromkeys(str(item) for item in (password_candidates or ()) if item is not None))
         if candidates:
             job["password_candidates"] = list(candidates)
@@ -1486,22 +1456,6 @@ class SevenZipRunner:
             return
         if budget > 0:
             job["job_buffer_budget_bytes"] = budget
-
-    def _apply_native_admission_hints(self, job: dict, task: ArchiveTask) -> None:
-        """Translate Python inspection facts into a native memory reservation.
-
-        Throughput owns concurrency. This estimate is used only by the hard
-        memory admission budget.
-        """
-        memory_weight = min(8, knowledge_view.resource_memory_weight(task))
-        analysis = knowledge_view.resource_analysis(task)
-        try:
-            dictionary_bytes = max(0, int(analysis.get("largest_dictionary_size", 0) or 0))
-        except (TypeError, ValueError):
-            dictionary_bytes = 0
-        native_memory = max(64 << 20, memory_weight * (32 << 20), dictionary_bytes + (32 << 20))
-        job["native_memory_reserve_bytes"] = native_memory
-        job["native_dictionary_reserve_bytes"] = dictionary_bytes
 
     def _emit_progress(self, task: ArchiveTask, event: dict[str, Any]) -> None:
         callback = self.progress_callback

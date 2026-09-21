@@ -168,7 +168,6 @@ function Assert-SevenZipAsmSelection {
     }
 
     $targets = @(
-        (Join-Path $BuildDir "Release\sunpack_sevenzip.dll"),
         (Join-Path $BuildDir "Release\sunpack_sevenzip_worker.exe")
     )
     if ($ArtifactPaths) { $targets += $ArtifactPaths }

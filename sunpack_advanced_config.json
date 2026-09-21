@@ -61,7 +61,6 @@
     ]
   },
   "performance": {
-    "precise_resource_min_size_mb": 256,
     "persistent_server_idle_seconds": 15,
     "worker": {
       "exploration_strategy": "calibrated",
@@ -91,10 +90,7 @@
       "priority_aging_quantum": 32,
       "backpressure_retries": 120,
       "writer_threads": 4,
-      "memory_budget_bytes": 0,
       "job_buffer_budget_bytes": 33554432,
-      "memory_pause_available_mb": 1024,
-      "memory_resume_available_mb": 2048,
       "space_gate_enabled": true,
       "space_poll_interval_ms": 1000,
       "space_status_report_interval_ms": 15000

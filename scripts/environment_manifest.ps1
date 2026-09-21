@@ -66,7 +66,6 @@ $artifacts = [ordered]@{
     seven_zip_exe = Get-FileDigest (Join-Path $toolsRoot "7z.exe")
     seven_zip_sfx = Get-FileDigest (Join-Path $toolsRoot "7zCon.sfx")
     seven_zip_dll = Get-FileDigest (Join-Path $toolsRoot "7z.dll")
-    wrapper_dll = Get-FileDigest (Join-Path $toolsRoot "sunpack_sevenzip.dll")
     wrapper_worker = Get-FileDigest (Join-Path $toolsRoot "sunpack_sevenzip_worker.exe")
     toast_dll = Get-FileDigest (Join-Path $toolsRoot "sunpack_toast.dll")
 }

@@ -37,7 +37,7 @@ python -m benchmarks extraction worker-read-patterns --runs 2 --prefetch on --pr
 python -m benchmarks extraction worker-read-patterns --format tar --format rar-split --format 7z --7z-variant solid --large-files 2 --large-file-mib 512 --large-content random --runs 5 --prefetch compare
 python -m benchmarks extraction worker-small-file-scheduling --jobs 256 --clients 4 --capacities 1,2,4,8 --runs 3
 python -m benchmarks extraction worker-single-file-write --baseline-worker-path C:\path\to\before\sunpack_sevenzip_worker.exe --candidate-worker-path C:\path\to\after\sunpack_sevenzip_worker.exe --payload-gib 1 --writer-threads 4 --runs 3 --warmups 1
-python -m benchmarks extraction worker-resource-pressure --modes cpu,io,memory --controllers adaptive,fixed --capacities 1,2,4 --jobs 4
+python -m benchmarks extraction worker-resource-pressure --modes cpu,io --controllers adaptive,fixed --capacities 1,2,4 --jobs 4
 python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
 python -m benchmarks watch arrival-matrix C:\path\to\sample.jpg --quiet-values 0,1.25 --runs 2 --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-arrival-matrix.json
 python -m benchmarks watch split-arrival C:\path\to\archive.7z.001 C:\path\to\archive.7z.002 C:\path\to\archive.7z.003 C:\path\to\archive.7z.004 --quiet-values 0,1.25 --chunk-mib 4 --chunk-delay-ms 50 --json-out benchmarks/results/watch-split-arrival.json
@@ -184,25 +184,20 @@ whether requests receive equal admission counts by the end of the batch.
 
 `extraction worker-initial-concurrency-matrix` calibrates the startup admission
 limit against real ZIP stored/deflate, 7z solid/non-solid, and RAR solid/non-solid
-archives. It sweeps `--initial-active-jobs` while holding the detected CPU/RAM
+archives. It sweeps `--initial-active-jobs` while holding the detected CPU
 capacity constant, and reports median throughput, p95 queue latency, peak active
 jobs, worker RSS, and normalized cross-format recommendations with and without
 solid formats. Candidate order is alternated between rounds to reduce thermal and
 ordering bias. Production uses one CPU token per job; `--cpu-weight-mode legacy`
-replays the former format-dependent CPU weights for A/B comparison. Solid and
-large-dictionary cases remain bounded by memory admission without a separate global mutex.
+replays the former format-dependent CPU weights for A/B comparison. Solid and large-dictionary cases use the same throughput-driven concurrency controller.
 
 `extraction worker-resource-pressure` uses real 7z archives and the native worker
 to measure resource contention rather than synthetic weights. `cpu` uses highly
 compressible LZMA2 data with a large dictionary to stress decoding; `io` uses
-random data with `-mx=0` to stress archive reads and output writes; `memory` uses
-LZMA2 decoder dictionaries with a deliberately small worker memory budget. It
-compares the adaptive controller with a fixed active-job limit and records worker
-CPU, host CPU, read throughput, worker RSS, admitted jobs, reservation totals,
-timeouts, and result failures. Repeat the memory case with `--dictionary-hint` and
-`--no-dictionary-hint` to distinguish accurate decoder reservations from
-underestimated reservations. These are pressure probes, not a hard RSS limit or a
-proof that arbitrary archives cannot exhaust system memory.
+random data with `-mx=0` to stress archive reads and output writes. It compares
+the adaptive controller with a fixed active-job limit and records worker CPU,
+host CPU, read throughput, worker RSS, admitted jobs, timeouts, and result
+failures.
 
 `memory many-tasks` measures memory *growth* (not peak) of the two long-lived
 components under a large task count across every format: the Python pipeline and
@@ -256,7 +251,7 @@ async `PipelineEngine` (one event loop per submission) and instrument the
 per-request runtime through the private runtime-factory seam. Timing columns
 reflect the current pipeline stages: `pipeline_scan`, `input_planning`,
 `batch_prepare`/`batch_execute`/`batch_collect_result`, `output_scan`,
-`password_resolve`, `verify`, `resource`, and `extract_ms` (the pipeline wall
+`password_resolve`, `verify`, and `extract_ms` (the pipeline wall
 minus every measured stage, since native extraction runs asynchronously
 through the worker). Stages removed by the refactor report 0.0.
 

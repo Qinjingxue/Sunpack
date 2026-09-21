@@ -6,7 +6,12 @@ from pathlib import Path
 from typing import Any
 
 from sunpack.contracts.archive_state import ArchiveState
-from sunpack.support.sevenzip_bridge import STATUS_DAMAGED, STATUS_OK, STATUS_UNSUPPORTED
+STATUS_OK = 0
+STATUS_WRONG_PASSWORD = 1
+STATUS_DAMAGED = 2
+STATUS_UNSUPPORTED = 3
+STATUS_BACKEND_UNAVAILABLE = 4
+
 from sunpack_native import (
     archive_state_tar_manifest_native as _native_archive_state_tar_manifest,
     archive_state_zip_manifest_native as _native_archive_state_zip_manifest,

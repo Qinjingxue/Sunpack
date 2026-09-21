@@ -12,32 +12,6 @@ using UInt32 = std::uint32_t;
 using UInt64 = std::uint64_t;
 using Int32 = std::int32_t;
 
-struct ResourceAnalysisResult {
-    PasswordTestStatus status = PasswordTestStatus::BackendUnavailable;
-    bool is_archive = false;
-    bool encrypted = false;
-    bool damaged = false;
-    bool solid = false;
-    UInt32 item_count = 0;
-    UInt32 file_count = 0;
-    UInt32 dir_count = 0;
-    UInt64 archive_size = 0;
-    UInt64 total_unpacked_size = 0;
-    UInt64 total_packed_size = 0;
-    UInt64 largest_item_size = 0;
-    UInt64 largest_dictionary_size = 0;
-    std::wstring dominant_method;
-    std::string message;
-};
-
-
-ResourceAnalysisResult analyze_archive_resources_with_parts(
-    const std::wstring& archive_path,
-    const std::vector<std::wstring>& part_paths,
-    const std::wstring& password
-);
-
-
 std::wstring archive_type_for_path(const std::wstring& path);
 
 }  // namespace sunpack::sevenzip
