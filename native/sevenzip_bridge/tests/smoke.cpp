@@ -195,6 +195,27 @@ bool check_runtime_control_uses_small_job_window() {
         snapshot.throughput_mode == NativeThroughputMode::Jobs;
 }
 
+bool check_runtime_control_rebases_external_discontinuity_at_stable_limit() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    counters.accepted_bytes = counters.written_bytes = 1'000;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    if (controller.snapshot(4).active_limit != 5 ||
+        controller.snapshot(4).phase != NativeControllerPhase::Probe) {
+        return false;
+    }
+    if (!controller.rebase_after_external_discontinuity(counters)) {
+        return false;
+    }
+    const auto snapshot = controller.snapshot(4);
+    return snapshot.active_limit == 4 &&
+        snapshot.phase == NativeControllerPhase::Baseline &&
+        snapshot.decision == NativeControllerDecision::SegmentInterrupted;
+}
+
 bool check_runtime_control_waits_for_realized_experimental_concurrency() {
     using namespace sunpack::sevenzip;
     NativeRuntimeControl controller(8, deterministic_runtime_config(4));
@@ -458,6 +479,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_runtime_control_uses_small_job_window()) {
         std::cerr << "runtime control small-job window check failed\n";
         return 8;
+    }
+    if (!check_runtime_control_rebases_external_discontinuity_at_stable_limit()) {
+        std::cerr << "runtime control external-discontinuity rebase check failed\n";
+        return 21;
     }
     if (!check_runtime_control_waits_for_realized_experimental_concurrency()) {
         std::cerr << "runtime control realized-concurrency check failed\n";
