@@ -195,6 +195,45 @@ bool check_runtime_control_uses_small_job_window() {
         snapshot.throughput_mode == NativeThroughputMode::Jobs;
 }
 
+bool check_runtime_control_waits_for_realized_experimental_concurrency() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+
+    counters.accepted_bytes = counters.written_bytes = 1'000;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    if (controller.snapshot(4).active_limit != 5) {
+        return false;
+    }
+
+    counters.accepted_bytes = counters.written_bytes = 2'200;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    auto snapshot = controller.snapshot(4);
+    if (snapshot.phase != NativeControllerPhase::Probe || snapshot.active_limit != 5) {
+        return false;
+    }
+
+    counters.accepted_bytes = counters.written_bytes = 3'400;
+    controller.observe(runtime, counters, 100, 5, 0.1);
+    snapshot = controller.snapshot(5);
+    if (snapshot.phase != NativeControllerPhase::Verify || snapshot.active_limit != 4) {
+        return false;
+    }
+
+    counters.accepted_bytes = counters.written_bytes = 4'400;
+    controller.observe(runtime, counters, 100, 5, 0.1);
+    snapshot = controller.snapshot(5);
+    if (snapshot.phase != NativeControllerPhase::Verify || snapshot.active_limit != 4) {
+        return false;
+    }
+
+    counters.accepted_bytes = counters.written_bytes = 5'400;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    return controller.snapshot(4).active_limit == 6;
+}
+
 bool check_runtime_control_marks_probe_contaminated_on_environment_shift() {
     using namespace sunpack::sevenzip;
     NativeRuntimeControl controller(8, deterministic_runtime_config(4));
@@ -419,6 +458,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_runtime_control_uses_small_job_window()) {
         std::cerr << "runtime control small-job window check failed\n";
         return 8;
+    }
+    if (!check_runtime_control_waits_for_realized_experimental_concurrency()) {
+        std::cerr << "runtime control realized-concurrency check failed\n";
+        return 20;
     }
     if (!check_runtime_control_marks_probe_contaminated_on_environment_shift()) {
         std::cerr << "runtime control contaminated-probe check failed\n";
