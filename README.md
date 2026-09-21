@@ -29,6 +29,7 @@ SunPack identifies archives by binary signatures rather than file extensions, an
   - [Architecture at a glance](#architecture-at-a-glance)
   - [Testing](#testing)
   - [Reproducible worker vs. 7-Zip benchmark](#reproducible-worker-vs-7-zip-benchmark)
+- [Notice](#notice)
 - [License](#license)
 
 ## Installation
@@ -205,6 +206,12 @@ Times are per-case medians in milliseconds.
 | ZST              |         96.481 |  155.547 |             0.620 |
 
 ---
+
+## Notice
+
+Some executable installers legitimately contain standard archive payloads and can be structurally indistinguishable from self-extracting archives. SunPack prioritizes archive detection and therefore may identify or extract such custom installers as archives. Known common runtime bundles may be excluded, but exhaustive installer detection is intentionally out of scope.
+
+SunPack is not yet mature, and its handling of uncontrolled inputs is limited. It is not guaranteed to be safe. If you have concerns, use it only in a trusted environment.
 
 ## License
 
