@@ -112,7 +112,7 @@ def test_watch_single_hp_rar_extracts_with_correct_password(tmp_path):
     output_root = tmp_path / "out"
     watch_root.mkdir()
     output_root.mkdir()
-    (watch_root / ".sunpack-passwords.txt").write_text("single-hp-ok\n", encoding="utf-8")
+    (watch_root / "sunpack-passwords.txt").write_text("single-hp-ok\n", encoding="utf-8")
 
     config = _watch_config()
     async def scenario():
@@ -139,7 +139,7 @@ def test_watch_single_hp_rar_reports_wrong_password_without_hanging(tmp_path):
     output_root = tmp_path / "out"
     watch_root.mkdir()
     output_root.mkdir()
-    (watch_root / ".sunpack-passwords.txt").write_text("wrong-password\n", encoding="utf-8")
+    (watch_root / "sunpack-passwords.txt").write_text("wrong-password\n", encoding="utf-8")
 
     config = _watch_config()
     async def scenario():
@@ -168,7 +168,7 @@ def test_watch_split_hp_rar_extracts_with_correct_password(tmp_path):
     output_root = tmp_path / "out"
     watch_root.mkdir()
     output_root.mkdir()
-    (watch_root / ".sunpack-passwords.txt").write_text("split-hp-ok\n", encoding="utf-8")
+    (watch_root / "sunpack-passwords.txt").write_text("split-hp-ok\n", encoding="utf-8")
 
     config = _watch_config()
     async def scenario():
@@ -198,7 +198,7 @@ def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path)
     output_root = tmp_path / "out"
     watch_root.mkdir()
     output_root.mkdir()
-    password_file = watch_root / ".sunpack-passwords.txt"
+    password_file = watch_root / "sunpack-passwords.txt"
     password_file.write_text("wrong-password\n", encoding="utf-8")
 
     config = _watch_config()
