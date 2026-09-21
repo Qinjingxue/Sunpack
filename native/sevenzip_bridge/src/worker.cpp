@@ -1631,6 +1631,7 @@ private:
             ",\"activity_session\":" + std::to_string(snapshot.activity_session) +
             ",\"saturated_segment\":" + std::to_string(snapshot.saturated_segment) +
             ",\"warm_start_used\":" + std::string(snapshot.warm_start_used ? "true" : "false") +
+            ",\"accepted_probe\":" + std::string(snapshot.accepted_probe ? "true" : "false") +
             ",\"resource_diagnostics_enabled\":" +
                 std::string(snapshot.resource_diagnostics_enabled ? "true" : "false") +
             ",\"cpu_percent_valid\":" + std::string(snapshot.cpu_percent_valid ? "true" : "false") +

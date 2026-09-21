@@ -224,7 +224,10 @@ def _trace_metrics(trace: dict[str, Any], *, oracle: dict[str, Any], payload_byt
         "controller_decisions": decisions,
         "probe_count": sum(decision in {"probe_up", "probe_down"} for decision in decisions),
         "verify_count": sum(decision == "verify_started" for decision in decisions),
-        "accepted_count": sum(decision == "accepted" for decision in decisions),
+        "accepted_count": sum(
+            str(event.get("decision") or "none") == "accepted" or bool(event.get("accepted_probe"))
+            for event in events
+        ),
         "rolled_back_count": sum(decision == "rolled_back" for decision in decisions),
         "contaminated_count": sum(decision == "contaminated" for decision in decisions),
         "environment_changed_count": sum(decision == "environment_changed" for decision in decisions),
@@ -546,7 +549,7 @@ def main() -> int:
                     "rows": len(rows),
                     "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
                     "controller_implementation": {
-                        "window": "minimum/maximum window with small job/file readiness",
+                        "window": "three native measurement windows aggregated per control observation",
                         "change_detector": "fast/slow log EWMA plus CUSUM inside native controller",
                         "probe_verification": "A-B-A with contamination gate",
                     },
@@ -690,7 +693,7 @@ def main() -> int:
                 "rows": len(rows),
                 "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
                 "controller_implementation": {
-                    "window": "minimum/maximum window with small job/file readiness",
+                    "window": "three native measurement windows aggregated per control observation",
                     "change_detector": "fast/slow log EWMA plus CUSUM inside native controller",
                     "probe_verification": "A-B-A with contamination gate",
                 },
