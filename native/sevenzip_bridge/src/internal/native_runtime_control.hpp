@@ -282,9 +282,18 @@ namespace sunpack::sevenzip
 
             // A single native measurement window is intentionally only a diagnostic
             // sample. Real workloads, especially IO-bound extraction, are bursty at
-            // this timescale. Aggregate three consecutive windows before making any
-            // control decision so A-B-A compares short observations rather than
-            // individual writer bursts.
+            // this timescale. Aggregate three consecutive windows for causal
+            // Baseline/Probe/Verify decisions. Cooldown keeps its existing raw-window
+            // cadence while still building a clean aggregate anchor, and Hold feeds
+            // only aggregated observations to the passive detector.
+            if (phase_ == NativeControllerPhase::Cooldown)
+            {
+                return process_cooldown_window(measurement) || changed;
+            }
+            if (phase_ == NativeControllerPhase::Hold)
+            {
+                return process_hold_window(measurement) || changed;
+            }
             observation_.add(measurement);
             if (!observation_.ready())
             {
@@ -711,17 +720,62 @@ namespace sunpack::sevenzip
             return true;
         }
 
+        bool process_cooldown_window(const Measurement &measurement) noexcept
+        {
+            observation_.add(measurement);
+            ++phase_windows_;
+            if (phase_windows_ < cooldown_windows_ || !observation_.ready())
+            {
+                return false;
+            }
+            anchor_ = observation_.measurement(large_window_bytes_);
+            last_measurement_ = anchor_;
+            observation_.clear();
+            phase_windows_ = 0;
+            if (!launch_next_probe())
+            {
+                enter_hold();
+            }
+            return true;
+        }
+
+        bool process_hold_window(const Measurement &measurement) noexcept
+        {
+            observation_.add(measurement);
+            if (observation_.ready())
+            {
+                const Measurement stable_observation = observation_.measurement(large_window_bytes_);
+                observation_.clear();
+                last_measurement_ = stable_observation;
+                anchor_ = stable_observation;
+                if (stable_observation.mode != NativeThroughputMode::None &&
+                    active_limit_ == best_limit_ &&
+                    observe_stable_trend(stable_observation))
+                {
+                    return mark_environment_changed();
+                }
+            }
+
+            if (++phase_windows_ >= hold_windows_)
+            {
+                phase_windows_ = 0;
+                observation_.clear();
+                reset_stable_trend();
+                tried_up_ = false;
+                tried_down_ = false;
+                probe_step_ = 1;
+                phase_ = NativeControllerPhase::Baseline;
+                decision_ = NativeControllerDecision::BaselineReady;
+                return launch_next_probe();
+            }
+            return false;
+        }
+
         bool process_measurement(const Measurement &measurement) noexcept
         {
             if (measurement.mode == NativeThroughputMode::None)
             {
                 return false;
-            }
-            if (phase_ == NativeControllerPhase::Hold &&
-                active_limit_ == best_limit_ &&
-                observe_stable_trend(measurement))
-            {
-                return mark_environment_changed();
             }
             switch (phase_)
             {
@@ -741,29 +795,7 @@ namespace sunpack::sevenzip
             case NativeControllerPhase::Verify:
                 return evaluate_verified_probe(measurement);
             case NativeControllerPhase::Cooldown:
-                anchor_ = measurement;
-                if (++phase_windows_ >= cooldown_windows_)
-                {
-                    phase_windows_ = 0;
-                    if (!launch_next_probe())
-                    {
-                        enter_hold();
-                    }
-                    return true;
-                }
-                return false;
             case NativeControllerPhase::Hold:
-                anchor_ = measurement;
-                if (++phase_windows_ >= hold_windows_)
-                {
-                    phase_windows_ = 0;
-                    tried_up_ = false;
-                    tried_down_ = false;
-                    probe_step_ = 1;
-                    phase_ = NativeControllerPhase::Baseline;
-                    decision_ = NativeControllerDecision::BaselineReady;
-                    return launch_next_probe();
-                }
                 return false;
             }
             return false;
@@ -888,6 +920,7 @@ namespace sunpack::sevenzip
                 return false;
             }
             active_limit_ = target;
+            observation_.clear();
             reset_stable_trend();
             probe_direction_ = direction;
             next_direction_ = direction;
@@ -902,6 +935,7 @@ namespace sunpack::sevenzip
         void enter_hold() noexcept
         {
             active_limit_ = best_limit_;
+            observation_.clear();
             reset_stable_trend();
             phase_ = NativeControllerPhase::Hold;
             phase_windows_ = 0;
