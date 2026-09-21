@@ -941,14 +941,19 @@ int run_request(
     auto progress = [job_id, last_progress_emit, coalesced_progress_events, extract_started, progress_mutex](const ExtractProgressEvent& event) mutable {
             std::lock_guard<std::mutex> lock(*progress_mutex);
             const auto now = std::chrono::steady_clock::now();
-            std::string event_name = event.event;
             if (!extract_started && event.completed_bytes > 0) {
                 extract_started = true;
-                event_name = "extract_started";
+                print_json_line(
+                    "{\"type\":\"progress\",\"job_id\":\"" + json_escape(job_id) +
+                    "\",\"event\":\"extract_started\"" +
+                    ",\"completed_bytes\":" + std::to_string(event.completed_bytes) +
+                    ",\"total_bytes\":" + std::to_string(event.total_bytes) +
+                    ",\"item_index\":" + std::to_string(event.item_index) +
+                    ",\"item_path\":\"" + json_escape(wide_to_utf8(event.item_path)) +
+                    "\",\"coalesced_events\":" + std::to_string(coalesced_progress_events) + "}");
             }
             const bool failure = event.event == "item_failed";
-            const bool boundary = event_name == "extract_started" ||
-                event.event == "total" ||
+            const bool boundary = event.event == "total" ||
                 (event.event == "item_start" && event.item_index == 0) ||
                 (event.event == "item_done" && event.item_index % 128 == 0);
             const bool interval_elapsed = now - last_progress_emit >= std::chrono::milliseconds(100);
@@ -958,7 +963,7 @@ int run_request(
             }
             print_json_line(
                 "{\"type\":\"progress\",\"job_id\":\"" + json_escape(job_id) +
-                "\",\"event\":\"" + json_escape(event_name) +
+                "\",\"event\":\"" + json_escape(event.event) +
                 "\",\"completed_bytes\":" + std::to_string(event.completed_bytes) +
                 ",\"total_bytes\":" + std::to_string(event.total_bytes) +
                 ",\"item_index\":" + std::to_string(event.item_index) +
