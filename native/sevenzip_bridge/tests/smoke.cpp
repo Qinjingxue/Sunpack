@@ -118,8 +118,7 @@ void observe_runtime(
     const sunpack::sevenzip::NativeRuntimeSample& runtime,
     sunpack::sevenzip::NativeThroughputCounters& counters,
     std::uint64_t written_bytes,
-    double seconds,
-    std::size_t active_jobs = 4
+    double seconds
 ) {
     counters.accepted_bytes += written_bytes;
     counters.written_bytes += written_bytes;
