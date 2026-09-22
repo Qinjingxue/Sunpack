@@ -195,8 +195,9 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `worker.small_window_jobs` / `small_window_files` | `4` / `16` | 小任务窗口的任务数和文件数。 |
 | `worker.improvement_ratio` / `regression_ratio` | `1.03` / `0.97` | 接受提升和判定下降的阈值。 |
 | `worker.aggressive_step` | `4` | 快速探索时的步长。 |
-| `worker.cooldown_windows` / `hold_windows` | `2` / `8` | 回退冷却和稳定保持的窗口数。 |
 | `worker.warm_start_decay_seconds` / `warm_start_confirmations` | `0` / `2` | 温启动提示的衰减时长和确认次数。 |
+
+吞吐量控制器内部使用乐观重复试探：初次 probe 聚合 2 个 native measurement window；同一 frontier 每发生一次上探回退，后续 probe 的 observation 依次增长为 3、4、5，最多 6 个 window。连续 3 次上探失败后会插入向下 probe；该策略为内部控制逻辑，不提供额外配置项。
 | `worker.max_queue_jobs` | `4096` | 原生任务队列上限。 |
 | `worker.priority_aging_quantum` | `32` | 优先级老化步长。 |
 | `worker.backpressure_retries` | `120` | 遇到队列背压时的重试次数。 |
