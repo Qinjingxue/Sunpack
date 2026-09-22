@@ -74,8 +74,6 @@
       "improvement_ratio": 1.03,
       "regression_ratio": 0.97,
       "aggressive_step": 4,
-      "cooldown_windows": 2,
-      "hold_windows": 8,
       "warm_start_decay_seconds": 0.0,
       "warm_start_confirmations": 2,
       "watchdog_no_progress_timeout_seconds": 180,
