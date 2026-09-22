@@ -29,17 +29,15 @@ SCENARIO = "extraction.worker-small-file-scheduling"
 
 ADMISSION_CASES: dict[str, dict[str, Any]] = {
     "adaptive-baseline": {
-        "description": "Adaptive throughput controller.",
-        "blocker": "adaptive-controller",
+        "description": "Passive CPU-budget derating enabled.",
+        "blocker": "passive-budget-controller",
         "adaptive_enabled": None,
-        "initial_active_jobs": 0,
         "expected_max_active": None,
     },
     "fixed-capacity": {
-        "description": "Adaptive control disabled and all configured worker slots enabled.",
+        "description": "Passive derating disabled; the configured CPU-credit budget stays fixed.",
         "blocker": "none-fixed-capacity",
         "adaptive_enabled": False,
-        "initial_active_jobs": -1,
         "expected_max_active": None,
     },
 }
@@ -168,11 +166,9 @@ def _run_batch(
     lock = threading.Lock()
     done = threading.Condition(lock)
     started_at = time.perf_counter()
-    initial_active_jobs = capacity if admission_case["initial_active_jobs"] == -1 else int(admission_case["initial_active_jobs"])
     worker_config = {
         "thread_capacity": capacity,
         "adaptive_enabled": admission_case["adaptive_enabled"],
-        "initial_active_jobs": initial_active_jobs,
         "sample_interval_ms": sample_interval_ms,
     }
     worker_config.update(worker_config_overrides or {})
