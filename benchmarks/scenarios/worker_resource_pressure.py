@@ -26,7 +26,6 @@ from tests.helpers.tool_config import get_7z_cli_dll_path
 
 SCENARIO = "extraction.worker-resource-pressure"
 MODES = ("cpu", "io")
-CONTROLLERS = ("adaptive", "fixed")
 
 
 def _csv_values(value: str, allowed: tuple[str, ...], label: str) -> list[str]:
@@ -133,13 +132,11 @@ def _job_payload(*, job_id: str, archive: Path, output: Path) -> str:
 
 
 def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: list[Path],
-              case: dict[str, Any], capacity: int, controller: str, jobs: int,
-              timeout_seconds: float, sample_interval: float) -> dict[str, Any]:
-    label = f"{case['mode']}-{controller}-cap{capacity}"
+              case: dict[str, Any], capacity: int, jobs: int,
+              timeout_seconds: float) -> dict[str, Any]:
+    label = f"{case['mode']}-cap{capacity}"
     worker = _NativeWorkerProcess(str(worker_path), None, {
         "thread_capacity": capacity,
-        "adaptive_enabled": controller == "adaptive",
-        "sample_interval_ms": max(100, int(sample_interval * 1000)),
     })
     process = psutil.Process(worker.process.pid) if worker.process is not None else None
     sampler = ProcessSampler(interval_seconds=0.02)
@@ -208,7 +205,6 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
     finally:
         after = _counters(process)
         sampler.stop()
-        controller_events = worker.controller_events()
         worker.close()
 
     elapsed = max(1e-6, finished - started)
@@ -218,7 +214,7 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
     active_values = [int(event.get("active_jobs", 0) or 0) for event in events if event.get("event") in {"job_admitted", "job_started", "job_finished"}]
     successful = sum(result.get("status") == "ok" for result in results.values())
     return {
-        "label": label, "mode": case["mode"], "controller": controller, "capacity": capacity, "jobs": jobs,
+        "label": label, "mode": case["mode"], "capacity": capacity, "jobs": jobs,
         "payload_mib_total": round(int(case["payload_bytes"]) * jobs / 1024 / 1024, 3),
         "archive_mib_total": round(sum(path.stat().st_size for path in archives) / 1024 / 1024, 3),
         "compression_ratio": case["compression_ratio"], "elapsed_seconds": round(elapsed, 3),
@@ -230,11 +226,6 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
         "write_bytes": write_bytes,
         "worker_rss_peak_mib": round(max((sample.children_rss_mib for sample in sampler.samples), default=0.0), 3),
         "observed_peak_active_jobs": max(active_values, default=0),
-        "controller_sample_count": len(controller_events),
-        "controller_adjustment_count": sum(
-            "decision" not in item or str(item.get("decision") or "none") != "none"
-            for item in controller_events
-        ),
         "successful_jobs": successful, "failed_jobs": jobs - successful, "failures": failures,
         "result_statuses": [result.get("status") for result in results.values()],
         "dictionary_mib": round(int(case["dictionary_bytes"]) / 1024 / 1024, 3),
@@ -252,27 +243,24 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stress native 7z worker CPU and IO scheduling.")
     parser.add_argument("--modes", default=",".join(MODES))
-    parser.add_argument("--controllers", default=",".join(CONTROLLERS))
     parser.add_argument("--capacities", default="1,2,4,8")
     parser.add_argument("--jobs", type=int, default=4)
     parser.add_argument("--cpu-source-mib", type=int, default=64)
     parser.add_argument("--io-source-mib", type=int, default=128)
     parser.add_argument("--dictionary-mib", type=int, default=64)
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
-    parser.add_argument("--sample-interval", type=float, default=0.02)
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--keep-workdir", action="store_true")
     args = parser.parse_args()
     try:
         modes = _csv_values(args.modes, MODES, "mode")
-        controllers = _csv_values(args.controllers, CONTROLLERS, "controller")
         capacities = _capacities(args.capacities)
     except (ValueError, TypeError) as exc:
         parser.error(str(exc))
     sizes = (args.cpu_source_mib, args.io_source_mib, args.dictionary_mib)
-    if args.jobs < 1 or args.timeout_seconds <= 0 or args.sample_interval <= 0 or min(sizes) < 1:
-        parser.error("jobs, timeouts, intervals, and size parameters must be positive")
+    if args.jobs < 1 or args.timeout_seconds <= 0 or min(sizes) < 1:
+        parser.error("jobs, timeouts, and size parameters must be positive")
     try:
         worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
         dll = Path(get_7z_cli_dll_path()).resolve()
@@ -295,22 +283,20 @@ def main() -> int:
         for mode in modes:
             case = cases[mode]
             archives = _copy_jobs(workspace.corpus / "jobs", case, args.jobs)
-            for controller in controllers:
-                for capacity in capacities:
-                    print(f"running {mode}/{controller}/capacity={capacity} ...", flush=True)
-                    row = _run_case(
-                        workspace=workspace, worker_path=worker_path, archives=archives, case=case,
-                        capacity=capacity, controller=controller, jobs=args.jobs, timeout_seconds=args.timeout_seconds,
-                        sample_interval=args.sample_interval,
-                    )
-                    rows.append(row)
-                    print(f"  elapsed={row['elapsed_seconds']:.2f}s host_cpu={row['host_cpu_utilization']} read={row['read_mib_per_second']}MiB/s rss={row['worker_rss_peak_mib']}MiB active={row['observed_peak_active_jobs']} passed={row['successful_jobs']}/{args.jobs}", flush=True)
+            for capacity in capacities:
+                print(f"running {mode}/capacity={capacity} ...", flush=True)
+                row = _run_case(
+                    workspace=workspace, worker_path=worker_path, archives=archives, case=case,
+                    capacity=capacity, jobs=args.jobs, timeout_seconds=args.timeout_seconds,
+                )
+                rows.append(row)
+                print(f"  elapsed={row['elapsed_seconds']:.2f}s host_cpu={row['host_cpu_utilization']} read={row['read_mib_per_second']}MiB/s rss={row['worker_rss_peak_mib']}MiB active={row['observed_peak_active_jobs']} passed={row['successful_jobs']}/{args.jobs}", flush=True)
             if not workspace.keep_workdir:
                 for path in archives:
                     path.unlink(missing_ok=True)
 
         report = {
-            "parameters": vars(args) | {"modes": modes, "controllers": controllers, "capacities": capacities},
+            "parameters": vars(args) | {"modes": modes, "capacities": capacities},
             "environment": {"worker_path": str(worker_path), "seven_zip_path": str(seven_zip), "cpu_count": os.cpu_count(), "python": sys.version},
             "corpus": {mode: {key: value for key, value in case.items() if key != "template"} for mode, case in cases.items()},
             "results": rows,
