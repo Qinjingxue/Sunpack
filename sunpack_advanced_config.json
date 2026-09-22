@@ -151,7 +151,7 @@
       "space_poll_interval_ms": 1000,
       "space_status_report_interval_ms": 15000,
       "observation_window_seconds": 1,
-      "throughput_change_ratio": 0.2
+      "throughput_change_ratio": 0.4
     }
   },
   "runtime": {
