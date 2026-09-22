@@ -939,7 +939,8 @@ int run_request(
     unsigned int coalesced_progress_events = 0;
     bool extract_started = false;
     auto progress_mutex = std::make_shared<std::mutex>();
-    auto progress = [job_id, last_progress_emit, coalesced_progress_events, extract_started, progress_mutex](const ExtractProgressEvent& event) mutable {
+    auto *cpu_job_context = sunpack::sevenzip::current_native_cpu_job_context();
+    auto progress = [job_id, last_progress_emit, coalesced_progress_events, extract_started, progress_mutex, cpu_job_context](const ExtractProgressEvent& event) mutable {
             std::lock_guard<std::mutex> lock(*progress_mutex);
             const auto now = std::chrono::steady_clock::now();
             if (!extract_started && event.completed_bytes > 0) {
@@ -952,6 +953,17 @@ int run_request(
                     ",\"item_index\":" + std::to_string(event.item_index) +
                     ",\"item_path\":\"" + json_escape(wide_to_utf8(event.item_path)) +
                     "\",\"coalesced_events\":" + std::to_string(coalesced_progress_events) + "}");
+                const auto cpu = cpu_job_context
+                    ? cpu_job_context->snapshot()
+                    : sunpack::sevenzip::NativeCpuJobSnapshot{};
+                print_json_line(
+                    "{\"type\":\"native_cpu\",\"job_id\":\"" + json_escape(job_id) +
+                    "\",\"event\":\"decoder_started\"" +
+                    ",\"decoder_cpu_credits\":" + std::to_string(1 + cpu.current_extra_credits) +
+                    ",\"current_decoder_extra_credits\":" + std::to_string(cpu.current_extra_credits) +
+                    ",\"peak_decoder_extra_credits\":" + std::to_string(cpu.peak_extra_credits) +
+                    ",\"decoder_parallel\":" + std::string(cpu.current_extra_credits ? "true" : "false") +
+                    "}");
             }
             const bool failure = event.event == "item_failed";
             const bool boundary = event.event == "total" ||
@@ -1531,6 +1543,8 @@ private:
         print_json_line(
             "{\"type\":\"native_cpu\",\"job_id\":\"" + json_escape(job_id) +
             "\",\"event\":\"decoder_parallelism\""
+            ",\"decoder_cpu_credits\":" + std::to_string(1 + job_cpu.current_extra_credits) +
+            ",\"decoder_parallel\":" + std::string(job_cpu.current_extra_credits ? "true" : "false") +
             ",\"current_decoder_extra_credits\":" + std::to_string(job_cpu.current_extra_credits) +
             ",\"peak_decoder_extra_credits\":" + std::to_string(job_cpu.peak_extra_credits) +
             ",\"total_decoder_extra_credits_granted\":" + std::to_string(job_cpu.total_extra_credits_granted) +
