@@ -9,7 +9,6 @@
 #include "../../Common/ProgressUtils.h"
 
 #include "7zDecode.h"
-#include "internal/decoder_cpu_budget.h"
 #include "7zHandler.h"
 
 // EXTERN_g_ExternalCodecs
@@ -275,29 +274,21 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
   CMyComPtr2_Create<ICompressProgressInfo, CLocalProgress> lps;
   lps->Init(extractCallback, false);
 
-  bool useMixerMt =
+  CDecoder decoder(
     #if !defined(USE_MIXER_MT)
-      false;
+      false
     #elif !defined(USE_MIXER_ST)
-      true;
+      true
     #elif !defined(Z7_7Z_SET_PROPERTIES)
       #ifdef Z7_ST
-        false;
+        false
       #else
-        true;
+        true
       #endif
     #else
-      _useMultiThreadMixer;
+      _useMultiThreadMixer
     #endif
-
-  // SunPack's persistent worker accounts real decoder worker lanes through
-  // the shared CPU-credit broker. CMixerMT creates additional pipeline
-  // threads outside those decoders, so keep the mixer serial while a worker
-  // job context is active. Standalone bridge use retains upstream behavior.
-  if (sunpack_cpu_current_job_context())
-    useMixerMt = false;
-
-  CDecoder decoder(useMixerMt);
+    );
 
   UInt64 curPacked, curUnpacked;
 
