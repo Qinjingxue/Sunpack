@@ -13,6 +13,7 @@
 #endif
 
 #include "MtDec.h"
+#include "internal/decoder_cpu_budget.h"
 
 #ifndef Z7_ST
 
@@ -553,24 +554,43 @@ static WRes MtDec_ThreadFunc2(CMtDecThread *t)
     {
       if (p->numStartedThreads < p->numStartedThreads_Limit && canCreateNewThread)
       {
-        SRes res2 = MtDecThread_CreateAndStart(&p->threads[p->numStartedThreads]);
-        if (res2 == SZ_OK)
+        CMtDecThread *candidate = &p->threads[p->numStartedThreads];
+        const BoolInt needsCpuCredit = !Thread_WasCreated(&candidate->thread);
+        unsigned granted = 1;
+        if (needsCpuCredit)
+          granted = sunpack_cpu_acquire_extra_for_context(
+              p->sunpackCpuContext, 1, 1);
+
+        if (granted == 0)
         {
-          // if (p->numStartedThreads % 1000 == 0) PRF(printf("\n numStartedThreads=%d\n", p->numStartedThreads));
-          p->numStartedThreads++;
+          p->numStartedThreads_Limit = p->numStartedThreads;
         }
         else
         {
-          PRF(printf("\nERROR: numStartedThreads=%d\n", p->numStartedThreads));
-          if (p->numStartedThreads == 1)
+          SRes res2 = MtDecThread_CreateAndStart(candidate);
+          if (res2 == SZ_OK)
           {
-            // if only one thread is possible, we leave muti-threading code
-            finish = True;
-            needCode = False;
-            threadingErrorSRes = res2;
+            if (needsCpuCredit && p->sunpackCpuContext)
+              p->sunpackCpuExtraCredits++;
+            // if (p->numStartedThreads % 1000 == 0) PRF(printf("\n numStartedThreads=%d\n", p->numStartedThreads));
+            p->numStartedThreads++;
           }
           else
-            p->numStartedThreads_Limit = p->numStartedThreads;
+          {
+            if (needsCpuCredit && p->sunpackCpuContext)
+              sunpack_cpu_release_extra_for_context(
+                  p->sunpackCpuContext, 1);
+            PRF(printf("\nERROR: numStartedThreads=%d\n", p->numStartedThreads));
+            if (p->numStartedThreads == 1)
+            {
+              // if only one thread is possible, we leave muti-threading code
+              finish = True;
+              needCode = False;
+              threadingErrorSRes = res2;
+            }
+            else
+              p->numStartedThreads_Limit = p->numStartedThreads;
+          }
         }
       }
       
@@ -950,6 +970,8 @@ void MtDec_Construct(CMtDec *p)
   p->inBufSize = (size_t)1 << 18;
 
   p->numThreadsMax = 0;
+  p->sunpackCpuContext = NULL;
+  p->sunpackCpuExtraCredits = 0;
 
   p->inStream = NULL;
   
@@ -996,6 +1018,14 @@ static void MtDec_Free(CMtDec *p)
   for (i = 0; i < MTDEC_THREADS_MAX; i++)
     MtDecThread_Destruct(&p->threads[i]);
 
+  if (p->sunpackCpuContext && p->sunpackCpuExtraCredits)
+  {
+    sunpack_cpu_release_extra_for_context(
+        p->sunpackCpuContext, p->sunpackCpuExtraCredits);
+    p->sunpackCpuExtraCredits = 0;
+  }
+  p->sunpackCpuContext = NULL;
+
   // Event_Close(&p->finishedEvent);
 
   if (p->crossBlock)
@@ -1017,6 +1047,9 @@ void MtDec_Destruct(CMtDec *p)
 SRes MtDec_Code(CMtDec *p)
 {
   unsigned i;
+
+  if (!p->sunpackCpuContext)
+    p->sunpackCpuContext = sunpack_cpu_current_job_context();
 
   p->inProcessed = 0;
 
