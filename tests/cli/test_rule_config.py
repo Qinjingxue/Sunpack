@@ -117,8 +117,7 @@ def test_effective_config_includes_native_worker_and_rule_pipeline():
     config["performance"] = {
         "worker": {
             "thread_capacity": 0,
-            "observation_window_seconds": 1.0,
-            "throughput_change_ratio": 0.4,
+            "minimum_available_memory_ratio": 0.1,
         }
     }
 
