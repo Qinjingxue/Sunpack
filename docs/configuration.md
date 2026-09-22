@@ -185,17 +185,10 @@ Runtime and worker parameters live under `performance`. Defaults are:
 | `worker.stage_thread_capacity` | `0` | Thread capacity for scanning, analysis, verification, and post-processing; `0` selects automatically. |
 | `worker.max_inflight_files` | `0` | File-level concurrency limit; `0` selects automatically, in the automatic range 64–512. |
 | `worker.max_pending_stage_jobs` | `4096` | Upper limit of waiting stage jobs. |
-| `worker.adaptive_enabled` | `true` | Whether to adjust extraction concurrency dynamically according to actual throughput. |
-| `worker.initial_active_jobs` | `0` | Initial number of active jobs; `0` selects automatically. |
-| `worker.exploration_strategy` | `calibrated` | Concurrency exploration strategy; one of `calibrated`, `rapid`, `full`. |
-| `worker.resource_diagnostics_enabled` | `false` | Whether to sample CPU and process I/O diagnostic data. |
-| `worker.minimum_window_seconds` / `maximum_window_seconds` | `0.25` / `1.5` | Shortest and longest duration of a throughput observation window. |
-| `worker.settle_seconds` | `0.1` | Settling time after a concurrency adjustment. |
-| `worker.large_window_bytes` | `33554432` | Actual written bytes for a large-task window. |
-| `worker.small_window_jobs` / `small_window_files` | `4` / `16` | Job count and file count for a small-task window. |
-| `worker.improvement_ratio` / `regression_ratio` | `1.03` / `0.97` | Thresholds for accepting an improvement and for declaring a regression. |
-| `worker.aggressive_step` | `4` | Step size during rapid exploration. |
-| `worker.warm_start_decay_seconds` / `warm_start_confirmations` | `0` / `2` | Decay duration and confirmation count for warm-start hints. |
+| `worker.adaptive_enabled` | `true` | Whether the passive throughput controller may derate or restore CPU credits after a large external throughput change. |
+| `worker.resource_diagnostics_enabled` | `false` | Whether to sample CPU diagnostics; diagnostics do not drive CPU-credit decisions. |
+| `worker.observation_window_seconds` | `1.0` | Passive throughput observation window in seconds. |
+| `worker.throughput_change_ratio` | `0.20` | Relative throughput change from the current baseline that triggers a CPU-budget adjustment. |
 | `worker.max_queue_jobs` | `4096` | Upper limit of the native job queue. |
 | `worker.priority_aging_quantum` | `32` | Priority aging step. |
 | `worker.backpressure_retries` | `120` | Number of retries on queue backpressure. |
@@ -205,9 +198,9 @@ Runtime and worker parameters live under `performance`. Defaults are:
 | `worker.space_poll_interval_ms` | `1000` | Disk space check interval. |
 | `worker.space_status_report_interval_ms` | `15000` | Disk space status report interval. |
 
-The throughput controller uses optimistic repeated probes internally. A fresh probe aggregates 2 native measurement windows; repeated upward rollbacks at the same frontier grow later observations to 3, 4, 5, and at most 6 windows. After 3 upward failures it inserts a downward probe. This is internal controller policy and adds no configuration knobs.
+The native worker uses CPU credits as the single extraction-concurrency budget. By default the nominal budget equals the logical processor count and every admitted archive job reserves one base credit; formats have no fixed CPU weights. A bundled 7-Zip decoder requests extra credits from the same budget only immediately before it actually creates additional parallel execution threads. If credits are unavailable, it uses fewer workers or falls back to a serial path, so outer jobs and inner decoders no longer form independent concurrency layers.
 
-Automatic concurrency is driven only by repeated throughput probes over actual writes, completed jobs, and completed files. Large tasks compare bytes/second; small tasks compare jobs/second or files/second. A single upward regression rolls back and strengthens the local failure evidence, but does not stop future upward retries; repeated failures eventually insert a downward probe. Format, algorithm, solid state, and file count are not used as extra CPU weights. Resource diagnostics are sampled only when explicitly enabled.
+The throughput controller no longer searches for an optimum. It only reacts passively to large external throughput changes using actual written throughput: by default one observation is formed every 1 second; a drop of at least 20% from the current stable baseline reduces the effective CPU budget by `max(1, logical_processors / 8)`. The next window after an adjustment establishes a fresh baseline. A later increase of at least 20% restores the same number of credits, capped at the nominal budget. Stable fluctuations do not change the budget.
 
 ## watch
 
