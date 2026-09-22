@@ -57,26 +57,10 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
             if thread_capacity > 0:
                 environment["SUNPACK_NATIVE_WORKER_THREAD_CAPACITY"] = str(thread_capacity)
     set_int("writer_threads", "SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME")
-    set_int("sample_interval_ms", "SUNPACK_NATIVE_SAMPLE_INTERVAL_MS", minimum=100)
-
-    native_adaptive = process_config.get("adaptive_enabled")
-    if native_adaptive is not None:
-        if isinstance(native_adaptive, str):
-            enabled = native_adaptive.strip().lower() not in {"0", "false", "no", "off"}
-        else:
-            enabled = bool(native_adaptive)
-        environment["SUNPACK_NATIVE_ADAPTIVE_ENABLED"] = "1" if enabled else "0"
-
-    diagnostics = process_config.get("resource_diagnostics_enabled")
-    if diagnostics is not None:
-        enabled = str(diagnostics).strip().lower() not in {"0", "false", "no", "off"}
-        environment["SUNPACK_NATIVE_RESOURCE_DIAGNOSTICS"] = "1" if enabled else "0"
-    measurement_diagnostics = process_config.get("measurement_diagnostics_enabled")
-    if measurement_diagnostics is not None:
-        enabled = str(measurement_diagnostics).strip().lower() not in {"0", "false", "no", "off"}
-        environment["SUNPACK_NATIVE_MEASUREMENT_DIAGNOSTICS"] = "1" if enabled else "0"
-    set_float("observation_window_seconds", "SUNPACK_NATIVE_OBSERVATION_WINDOW_SECONDS")
-    set_float("throughput_change_ratio", "SUNPACK_NATIVE_THROUGHPUT_CHANGE_RATIO")
+    set_float(
+        "minimum_available_memory_ratio",
+        "SUNPACK_NATIVE_MIN_AVAILABLE_MEMORY_RATIO",
+    )
     set_int("max_queue_jobs", "SUNPACK_NATIVE_MAX_QUEUE_JOBS")
     # 空间不足自动暂停/恢复（卷级 gate）的唯一总开关。
     space_gate = process_config.get("space_gate_enabled")
@@ -215,7 +199,6 @@ class _NativeWorkerProcess:
         self.process: subprocess.Popen | None = None
         self.worker_epoch = ""
         self.stderr_queue: queue.Queue[str | None] = queue.Queue()
-        self._controller_events: deque[dict[str, Any]] = deque(maxlen=4096)
         self._job_states: dict[str, dict[str, Any]] = {}
         self._async_jobs: dict[str, dict[str, Any]] = {}
         self._dispatch_lock = threading.Lock()
@@ -256,10 +239,6 @@ class _NativeWorkerProcess:
                 "state": "submitted",
                 "worker_epoch": self.worker_epoch,
             }
-
-    def controller_events(self) -> list[dict[str, Any]]:
-        with self._dispatch_lock:
-            return list(self._controller_events)
 
     def submit_async(
         self,
@@ -332,8 +311,6 @@ class _NativeWorkerProcess:
                     payload = {}
                 job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
                 with self._dispatch_lock:
-                    if isinstance(payload, dict) and payload.get("type") == "native_controller":
-                        self._controller_events.append({"received_at": time.perf_counter(), **payload})
                     async_state = self._async_jobs.get(job_id) if job_id else None
                     job_state = self._job_states.get(job_id) if job_id else None
                     forward = True
