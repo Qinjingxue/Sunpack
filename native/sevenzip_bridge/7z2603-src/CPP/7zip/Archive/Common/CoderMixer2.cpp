@@ -1081,10 +1081,10 @@ HRESULT CMixerMT::Code(
 
   Init(inStreams, outStreams);
 
-  const void *sunpackCpuContext = sunpack_cpu_current_job_context();
+  void *sunpackCpuContext = sunpack_cpu_current_job_context();
   unsigned i;
   for (i = 0; i < _coders.Size(); i++)
-    _coders[i].SunpackCpuContext = const_cast<void *>(sunpackCpuContext);
+    _coders[i].SunpackCpuContext = sunpackCpuContext;
 
   for (i = 0; i < _coders.Size(); i++)
     if (i != MainCoderIndex)
