@@ -1276,10 +1276,6 @@ sunpack::sevenzip::NativeRuntimeConfig configured_native_runtime_config(
         "SUNPACK_NATIVE_REGRESSION_RATIO", config.regression_ratio, 0.01, 1.0);
     config.aggressive_step = configured_native_size(
         "SUNPACK_NATIVE_AGGRESSIVE_STEP", config.aggressive_step, 1, 32);
-    config.cooldown_windows = configured_native_size(
-        "SUNPACK_NATIVE_COOLDOWN_WINDOWS", config.cooldown_windows);
-    config.hold_windows = configured_native_size(
-        "SUNPACK_NATIVE_HOLD_WINDOWS", config.hold_windows);
     config.warm_start_decay_seconds = configured_native_double(
         "SUNPACK_NATIVE_WARM_START_DECAY_SECONDS",
         config.warm_start_decay_seconds,
@@ -1551,9 +1547,7 @@ private:
         switch (phase) {
         case NativeControllerPhase::Baseline: return "baseline";
         case NativeControllerPhase::Probe: return "probe";
-        case NativeControllerPhase::Verify: return "verify";
-        case NativeControllerPhase::Cooldown: return "cooldown";
-        case NativeControllerPhase::Hold: return "hold";
+        case NativeControllerPhase::Cruise: return "cruise";
         }
         return "baseline";
     }
@@ -1571,12 +1565,9 @@ private:
         case NativeControllerDecision::BaselineReady: return "baseline_ready";
         case NativeControllerDecision::ProbeUp: return "probe_up";
         case NativeControllerDecision::ProbeDown: return "probe_down";
-        case NativeControllerDecision::VerifyStarted: return "verify_started";
         case NativeControllerDecision::Accepted: return "accepted";
         case NativeControllerDecision::RolledBack: return "rolled_back";
-        case NativeControllerDecision::Contaminated: return "contaminated";
-        case NativeControllerDecision::EnvironmentChanged: return "environment_changed";
-        case NativeControllerDecision::Holding: return "holding";
+        case NativeControllerDecision::Cruising: return "cruising";
         }
         return "none";
     }
@@ -1632,6 +1623,9 @@ private:
             ",\"saturated_segment\":" + std::to_string(snapshot.saturated_segment) +
             ",\"warm_start_used\":" + std::string(snapshot.warm_start_used ? "true" : "false") +
             ",\"accepted_probe\":" + std::string(snapshot.accepted_probe ? "true" : "false") +
+            ",\"probe_failures\":" + std::to_string(snapshot.probe_failures) +
+            ",\"observation_target_windows\":" + std::to_string(snapshot.observation_target_windows) +
+            ",\"probe_direction\":" + std::to_string(snapshot.probe_direction) +
             ",\"resource_diagnostics_enabled\":" +
                 std::string(snapshot.resource_diagnostics_enabled ? "true" : "false") +
             ",\"cpu_percent_valid\":" + std::string(snapshot.cpu_percent_valid ? "true" : "false") +
