@@ -125,6 +125,14 @@ NativeCpuJobContext::NativeCpuJobContext(
 {
 }
 
+NativeCpuJobContext::~NativeCpuJobContext()
+{
+    const std::size_t remaining =
+        current_extra_.exchange(0, std::memory_order_acq_rel);
+    if (remaining != 0 && budget_)
+        budget_->release(remaining);
+}
+
 std::size_t NativeCpuJobContext::acquire_extra(
     std::size_t wanted,
     std::size_t minimum_grant) noexcept
