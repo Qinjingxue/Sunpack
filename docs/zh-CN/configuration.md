@@ -195,7 +195,6 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `worker.small_window_jobs` / `small_window_files` | `4` / `16` | 小任务窗口的任务数和文件数。 |
 | `worker.improvement_ratio` / `regression_ratio` | `1.03` / `0.97` | 接受提升和判定下降的阈值。 |
 | `worker.aggressive_step` | `4` | 快速探索时的步长。 |
-| `worker.cooldown_windows` / `hold_windows` | `2` / `8` | 回退冷却和稳定保持的窗口数。 |
 | `worker.warm_start_decay_seconds` / `warm_start_confirmations` | `0` / `2` | 温启动提示的衰减时长和确认次数。 |
 | `worker.max_queue_jobs` | `4096` | 原生任务队列上限。 |
 | `worker.priority_aging_quantum` | `32` | 优先级老化步长。 |
@@ -206,7 +205,9 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `worker.space_poll_interval_ms` | `1000` | 磁盘空间检查间隔。 |
 | `worker.space_status_report_interval_ms` | `15000` | 磁盘空间状态报告间隔。 |
 
-自动并发以实际写入、完成任务和完成文件的吞吐为主要依据。大任务比较字节/秒，小任务比较任务/秒或文件/秒；吞吐下降时回到稳定并发并进入冷却。格式、算法、solid 状态和文件数量不作为额外 CPU 权重。资源诊断只在显式开启时采样。
+吞吐量控制器内部使用乐观重复试探：初次 probe 聚合 2 个 native measurement window；同一 frontier 每发生一次上探回退，后续 probe 的 observation 依次增长为 3、4、5，最多 6 个 window。连续 3 次上探失败后会插入向下 probe；该策略为内部控制逻辑，不提供额外配置项。
+
+自动并发只根据实际写入、完成任务和完成文件的吞吐反复试探。大任务比较字节/秒，小任务比较任务/秒或文件/秒；单次上探失败只回退并增加该 frontier 的失败证据，之后仍会重新尝试，上探连续失败后才插入向下探测。格式、算法、solid 状态和文件数量不作为额外 CPU 权重。资源诊断只在显式开启时采样。
 
 ## watch
 

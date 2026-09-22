@@ -195,7 +195,6 @@ Runtime and worker parameters live under `performance`. Defaults are:
 | `worker.small_window_jobs` / `small_window_files` | `4` / `16` | Job count and file count for a small-task window. |
 | `worker.improvement_ratio` / `regression_ratio` | `1.03` / `0.97` | Thresholds for accepting an improvement and for declaring a regression. |
 | `worker.aggressive_step` | `4` | Step size during rapid exploration. |
-| `worker.cooldown_windows` / `hold_windows` | `2` / `8` | Number of windows for backoff cooldown and steady hold. |
 | `worker.warm_start_decay_seconds` / `warm_start_confirmations` | `0` / `2` | Decay duration and confirmation count for warm-start hints. |
 | `worker.max_queue_jobs` | `4096` | Upper limit of the native job queue. |
 | `worker.priority_aging_quantum` | `32` | Priority aging step. |
@@ -206,7 +205,9 @@ Runtime and worker parameters live under `performance`. Defaults are:
 | `worker.space_poll_interval_ms` | `1000` | Disk space check interval. |
 | `worker.space_status_report_interval_ms` | `15000` | Disk space status report interval. |
 
-Automatic concurrency is driven mainly by the throughput of actual writes, completed jobs, and completed files. Large tasks compare bytes/second, small tasks compare jobs/second or files/second; when throughput drops, the system returns to the stable concurrency and enters cooldown. Format, algorithm, solid state, and file count are not used as extra CPU weights. Resource diagnostics are sampled only when explicitly enabled.
+The throughput controller uses optimistic repeated probes internally. A fresh probe aggregates 2 native measurement windows; repeated upward rollbacks at the same frontier grow later observations to 3, 4, 5, and at most 6 windows. After 3 upward failures it inserts a downward probe. This is internal controller policy and adds no configuration knobs.
+
+Automatic concurrency is driven only by repeated throughput probes over actual writes, completed jobs, and completed files. Large tasks compare bytes/second; small tasks compare jobs/second or files/second. A single upward regression rolls back and strengthens the local failure evidence, but does not stop future upward retries; repeated failures eventually insert a downward probe. Format, algorithm, solid state, and file count are not used as extra CPU weights. Resource diagnostics are sampled only when explicitly enabled.
 
 ## watch
 

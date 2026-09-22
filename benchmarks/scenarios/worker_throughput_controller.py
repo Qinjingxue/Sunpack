@@ -165,8 +165,6 @@ def _controller_config(args: argparse.Namespace) -> dict[str, Any]:
         "small_window_files": args.small_window_files,
         "improvement_ratio": args.improvement_ratio,
         "regression_ratio": args.regression_ratio,
-        "cooldown_windows": args.cooldown_windows,
-        "hold_windows": args.hold_windows,
         "resource_diagnostics_enabled": True,
         "measurement_diagnostics_enabled": args.measurement_diagnostics,
     }
@@ -202,7 +200,6 @@ def _trace_metrics(trace: dict[str, Any], *, oracle: dict[str, Any], payload_byt
     timed.sort(key=lambda event: float(event["received_at"]))
     plateau = set(int(value) for value in oracle["plateau_98_percent"])
     decisions = [str(event.get("decision") or "none") for event in events]
-    changes = [event for event in events if str(event.get("decision") or "none") not in {"none", "activity_started"}]
     first_at = float(timed[0]["received_at"]) if timed else None
     outside_seconds = 0.0
     plateau_run = 0
@@ -223,14 +220,22 @@ def _trace_metrics(trace: dict[str, Any], *, oracle: dict[str, Any], payload_byt
     return {
         "controller_decisions": decisions,
         "probe_count": sum(decision in {"probe_up", "probe_down"} for decision in decisions),
-        "verify_count": sum(decision == "verify_started" for decision in decisions),
+        "up_probe_count": sum(decision == "probe_up" for decision in decisions),
+        "down_probe_count": sum(decision == "probe_down" for decision in decisions),
         "accepted_count": sum(
             str(event.get("decision") or "none") == "accepted" or bool(event.get("accepted_probe"))
             for event in events
         ),
         "rolled_back_count": sum(decision == "rolled_back" for decision in decisions),
-        "contaminated_count": sum(decision == "contaminated" for decision in decisions),
-        "environment_changed_count": sum(decision == "environment_changed" for decision in decisions),
+        "cruising_count": sum(decision == "cruising" for decision in decisions),
+        "peak_probe_failures": max(
+            (int(event.get("probe_failures", 0) or 0) for event in events),
+            default=0,
+        ),
+        "max_observation_target_windows": max(
+            (int(event.get("observation_target_windows", 0) or 0) for event in events),
+            default=0,
+        ),
         "active_limit_change_count": sum(
             int(current.get("active_limit", 0)) != int(previous.get("active_limit", 0))
             for previous, current in zip(timed, timed[1:])
@@ -297,8 +302,6 @@ def _run_adaptive(
     timers: list[threading.Timer] = []
     hook_state = {
         "probe_seen": False,
-        "hold_seen": False,
-        "environment_changed": False,
         "pressure_started": False,
         "pressure_stopped": False,
     }
@@ -333,19 +336,6 @@ def _run_adaptive(
             stop_timer.daemon = True
             stop_timer.start()
             timers.append(stop_timer)
-        elif pressure_mode == "hold-passive" and pressure is not None:
-            phase = str(event.get("phase") or "")
-            if not hook_state["hold_seen"] and (phase == "hold" or decision == "holding"):
-                hook_state["hold_seen"] = True
-                start_pressure()
-                stop_timer = threading.Timer(args.disturbance_seconds, stop_pressure)
-                stop_timer.daemon = True
-                stop_timer.start()
-                timers.append(stop_timer)
-            if hook_state["pressure_started"] and decision == "environment_changed":
-                hook_state["environment_changed"] = True
-                stop_pressure()
-
     try:
         adaptive_case = dict(ADAPTIVE_CASE)
         adaptive_case["initial_active_jobs"] = args.initial_active_jobs
@@ -382,8 +372,6 @@ def _run_adaptive(
         "pressure_mode": pressure_mode,
         "collision": collision,
         "probe_seen": hook_state["probe_seen"],
-        "hold_seen": hook_state["hold_seen"],
-        "environment_changed": hook_state["environment_changed"],
         "pressure_started": hook_state["pressure_started"],
         "pressure_stopped": hook_state["pressure_stopped"],
         "pressure_duration_seconds": (
@@ -415,8 +403,6 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--small-window-files", type=int, default=16)
     parser.add_argument("--improvement-ratio", type=float, default=1.03)
     parser.add_argument("--regression-ratio", type=float, default=0.97)
-    parser.add_argument("--cooldown-windows", type=int, default=2)
-    parser.add_argument("--hold-windows", type=int, default=8)
     parser.add_argument("--disturbance-delay-seconds", type=float, default=1.0)
     parser.add_argument("--disturbance-seconds", type=float, default=10.0)
     parser.add_argument("--transient-seconds", type=float, default=0.75)
@@ -429,12 +415,6 @@ def _parser() -> argparse.ArgumentParser:
         "--stationary-only",
         action="store_true",
         help="Run the fixed oracle and stationary adaptive cases only; omit scheduled pressure and collisions.",
-    )
-    parser.add_argument(
-        "--passive-hold-runs",
-        type=int,
-        default=0,
-        help="After stationary runs, inject workload-matched pressure only after Hold is observed.",
     )
     parser.add_argument(
         "--fixed-diagnostics",
@@ -468,7 +448,6 @@ def main() -> int:
         or args.oracle_runs < 1
         or args.adaptive_runs < 1
         or args.initial_active_jobs < 1
-        or args.passive_hold_runs < 0
     ):
         _parser().error("jobs must cover the largest capacity and run counts must be positive")
     if args.sample_interval_ms < 100 or args.timeout_seconds <= 0:
@@ -549,9 +528,9 @@ def main() -> int:
                     "rows": len(rows),
                     "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
                     "controller_implementation": {
-                        "window": "three native measurement windows aggregated per control observation",
-                        "change_detector": "fast/slow log EWMA plus CUSUM inside native controller",
-                        "probe_verification": "A-B-A with contamination gate",
+                        "window": "2-window optimistic probes growing to 6 windows after repeated rollbacks",
+                        "exploration": "forward speculative climb with rollback and retry",
+                        "downward_correction": "down probe after repeated upward failures",
                     },
                 },
                 "artifacts": {"result_dir": str(workspace.result_dir), "traces": trace_paths},
@@ -596,37 +575,6 @@ def main() -> int:
                     f"traces/{workload}-adaptive-stationary-{run}.json", trace_payload
                 )))
                 shutil.rmtree(workspace.outputs / trace["label"], ignore_errors=True)
-
-            if args.passive_hold_runs:
-                for run in range(args.passive_hold_runs):
-                    pressure = _Pressure(
-                        workload,
-                        workspace.corpus,
-                        workers=max(1, min(8, (os.cpu_count() or 2) // 4)),
-                    )
-                    print(f"adaptive {workload} passive-hold run={run}", flush=True)
-                    summary_row, trace_payload = _run_adaptive(
-                        workspace=workspace,
-                        worker_path=worker_path,
-                        corpus=corpus,
-                        workload=workload,
-                        capacity=target_capacity,
-                        run=run,
-                        args=args,
-                        pressure=pressure,
-                        pressure_mode="hold-passive",
-                        pressure_name=workload,
-                    )
-                    summary_row.update(_trace_metrics(
-                        trace_payload,
-                        oracle=oracle[workload],
-                        payload_bytes=int(corpus["payload_bytes_per_job"]),
-                    ))
-                    rows.append(summary_row)
-                    trace_paths.append(str(workspace.write_result_json(
-                        f"traces/{workload}-passive-hold-{run}.json", trace_payload
-                    )))
-                    shutil.rmtree(workspace.outputs / trace_payload["label"], ignore_errors=True)
 
             if args.stationary_only:
                 continue
@@ -693,10 +641,10 @@ def main() -> int:
                 "rows": len(rows),
                 "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
                 "controller_implementation": {
-                    "window": "three native measurement windows aggregated per control observation",
-                    "change_detector": "fast/slow log EWMA plus CUSUM inside native controller",
-                    "probe_verification": "A-B-A with contamination gate",
-                },
+                        "window": "2-window optimistic probes growing to 6 windows after repeated rollbacks",
+                        "exploration": "forward speculative climb with rollback and retry",
+                        "downward_correction": "down probe after repeated upward failures",
+                    },
             },
             "artifacts": {"result_dir": str(workspace.result_dir), "traces": trace_paths},
         }

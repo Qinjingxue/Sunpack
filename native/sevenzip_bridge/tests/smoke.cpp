@@ -102,8 +102,6 @@ sunpack::sevenzip::NativeRuntimeConfig deterministic_runtime_config(std::size_t 
     config.large_window_bytes = 500;
     config.small_window_jobs = 2;
     config.small_window_files = 2;
-    config.cooldown_windows = 1;
-    config.hold_windows = 2;
     return config;
 }
 
@@ -121,16 +119,17 @@ bool check_empty_bounded_password_probe_requires_positive_evidence() {
             EmptyBoundedPasswordProbeDisposition::TestAllItems;
 }
 
-void observe_control_observation(
+void observe_runtime_windows(
     sunpack::sevenzip::NativeRuntimeControl& controller,
     const sunpack::sevenzip::NativeRuntimeSample& runtime,
     sunpack::sevenzip::NativeThroughputCounters& counters,
     std::size_t active_jobs,
+    std::size_t window_count,
     std::uint64_t bytes_per_window,
     std::uint64_t jobs_per_window = 2,
     std::uint64_t files_per_window = 2
 ) {
-    for (int window = 0; window < 3; ++window) {
+    for (std::size_t window = 0; window < window_count; ++window) {
         counters.accepted_bytes += bytes_per_window;
         counters.written_bytes += bytes_per_window;
         counters.completed_jobs += jobs_per_window;
@@ -139,65 +138,28 @@ void observe_control_observation(
     }
 }
 
-bool check_runtime_control_waits_for_three_window_observation() {
+bool check_runtime_control_starts_after_two_windows() {
     using namespace sunpack::sevenzip;
     NativeRuntimeControl controller(8, deterministic_runtime_config(4));
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
 
-    for (int window = 0; window < 2; ++window) {
-        counters.accepted_bytes += 1'000;
-        counters.written_bytes += 1'000;
-        counters.completed_jobs += 2;
-        counters.completed_files += 2;
-        controller.observe(runtime, counters, 100, 4, 0.1);
-        const auto partial = controller.snapshot(4);
-        if (partial.active_limit != 4 ||
-            partial.phase != NativeControllerPhase::Baseline ||
-            partial.measurement_sequence != static_cast<std::uint64_t>(window + 1) ||
-            partial.throughput_mode != NativeThroughputMode::None) {
-            return false;
-        }
+    observe_runtime_windows(controller, runtime, counters, 4, 1, 1'000);
+    auto snapshot = controller.snapshot(4);
+    if (snapshot.active_limit != 4 ||
+        snapshot.phase != NativeControllerPhase::Baseline ||
+        snapshot.observation_target_windows != 2 ||
+        snapshot.throughput_mode != NativeThroughputMode::None) {
+        return false;
     }
 
-    counters.accepted_bytes += 1'000;
-    counters.written_bytes += 1'000;
-    counters.completed_jobs += 2;
-    counters.completed_files += 2;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    const auto snapshot = controller.snapshot(4);
+    observe_runtime_windows(controller, runtime, counters, 4, 1, 1'000);
+    snapshot = controller.snapshot(4);
     return snapshot.active_limit == 5 &&
         snapshot.phase == NativeControllerPhase::Probe &&
-        snapshot.measurement_sequence == 3 &&
-        snapshot.throughput_mode == NativeThroughputMode::Bytes;
-}
-
-bool check_runtime_control_rolls_back_large_window_regression() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    if (controller.snapshot(4).active_limit != 5) {
-        return false;
-    }
-
-    observe_control_observation(controller, runtime, counters, 5, 800);
-    auto snapshot = controller.snapshot(5);
-    if (snapshot.active_limit != 4 ||
-        snapshot.phase != NativeControllerPhase::Verify ||
-        snapshot.decision != NativeControllerDecision::VerifyStarted) {
-        return false;
-    }
-
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 4 &&
-        snapshot.decision == NativeControllerDecision::RolledBack &&
-        snapshot.throughput_mode == NativeThroughputMode::Bytes;
+        snapshot.decision == NativeControllerDecision::ProbeUp &&
+        snapshot.observation_target_windows == 2;
 }
 
 bool check_runtime_control_emits_fixed_measurement_windows() {
@@ -240,23 +202,183 @@ bool check_runtime_control_emits_fixed_measurement_windows() {
         snapshot.measurement_completed_files == 1;
 }
 
-bool check_runtime_control_accepts_large_window_improvement() {
+bool check_runtime_control_accepts_improvement_without_verify() {
     using namespace sunpack::sevenzip;
     NativeRuntimeControl controller(8, deterministic_runtime_config(4));
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
 
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    observe_control_observation(controller, runtime, counters, 5, 1'200);
-    if (controller.snapshot(5).phase != NativeControllerPhase::Verify ||
-        controller.snapshot(5).active_limit != 4) {
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+    observe_runtime_windows(controller, runtime, counters, 5, 2, 1'200);
+    const auto snapshot = controller.snapshot(5);
+    return snapshot.active_limit == 6 &&
+        snapshot.phase == NativeControllerPhase::Probe &&
+        snapshot.accepted_probe &&
+        snapshot.probe_failures == 0 &&
+        snapshot.observation_target_windows == 2 &&
+        snapshot.probe_direction == 1;
+}
+
+bool check_runtime_control_accumulates_ambiguous_upward_gain() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+    observe_runtime_windows(controller, runtime, counters, 5, 2, 1'010);
+    auto snapshot = controller.snapshot(5);
+    if (snapshot.active_limit != 6 ||
+        snapshot.phase != NativeControllerPhase::Probe ||
+        snapshot.accepted_probe) {
         return false;
     }
 
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
+    observe_runtime_windows(controller, runtime, counters, 6, 2, 1'040);
+    snapshot = controller.snapshot(6);
+    return snapshot.active_limit == 7 &&
+        snapshot.accepted_probe &&
+        snapshot.probe_failures == 0;
+}
+
+bool check_runtime_control_grows_probe_window_after_rollback() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+    observe_runtime_windows(controller, runtime, counters, 5, 2, 700);
+    auto snapshot = controller.snapshot(5);
+    if (snapshot.active_limit != 4 ||
+        snapshot.phase != NativeControllerPhase::Cruise ||
+        snapshot.decision != NativeControllerDecision::RolledBack ||
+        snapshot.probe_failures != 1) {
+        return false;
+    }
+
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+    snapshot = controller.snapshot(4);
+    if (snapshot.active_limit != 5 ||
+        snapshot.phase != NativeControllerPhase::Probe ||
+        snapshot.observation_target_windows != 3) {
+        return false;
+    }
+
+    observe_runtime_windows(controller, runtime, counters, 5, 2, 1'200);
+    snapshot = controller.snapshot(5);
+    if (snapshot.active_limit != 5 ||
+        snapshot.phase != NativeControllerPhase::Probe) {
+        return false;
+    }
+
+    observe_runtime_windows(controller, runtime, counters, 5, 1, 1'200);
+    snapshot = controller.snapshot(5);
+    return snapshot.active_limit == 6 &&
+        snapshot.accepted_probe &&
+        snapshot.probe_failures == 0 &&
+        snapshot.observation_target_windows == 2;
+}
+
+bool drive_three_upward_rollbacks(
+    sunpack::sevenzip::NativeRuntimeControl& controller,
+    const sunpack::sevenzip::NativeRuntimeSample& runtime,
+    sunpack::sevenzip::NativeThroughputCounters& counters
+) {
+    using namespace sunpack::sevenzip;
+    controller.observe(runtime, counters, 100, 4, 0.1);
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+
+    for (std::size_t failure = 0; failure < 3; ++failure) {
+        const std::size_t target_windows = 2 + failure;
+        observe_runtime_windows(
+            controller, runtime, counters, 5, target_windows, 600);
+        auto snapshot = controller.snapshot(5);
+        if (snapshot.active_limit != 4 ||
+            snapshot.phase != NativeControllerPhase::Cruise ||
+            snapshot.probe_failures != failure + 1) {
+            return false;
+        }
+        if (failure != 2) {
+            observe_runtime_windows(
+                controller, runtime, counters, 4, 2, 1'000);
+            snapshot = controller.snapshot(4);
+            if (snapshot.active_limit != 5 ||
+                snapshot.phase != NativeControllerPhase::Probe ||
+                snapshot.observation_target_windows != 3 + failure) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool check_runtime_control_probes_down_after_repeated_up_failures() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    if (!drive_three_upward_rollbacks(controller, runtime, counters)) {
+        return false;
+    }
+
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
     const auto snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 6 && snapshot.accepted_probe;
+    return snapshot.active_limit == 3 &&
+        snapshot.phase == NativeControllerPhase::Probe &&
+        snapshot.decision == NativeControllerDecision::ProbeDown &&
+        snapshot.probe_direction == -1 &&
+        snapshot.probe_failures == 3 &&
+        snapshot.observation_target_windows == 5;
+}
+
+bool check_runtime_control_retries_up_after_failed_down_probe() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    if (!drive_three_upward_rollbacks(controller, runtime, counters)) {
+        return false;
+    }
+
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+    observe_runtime_windows(controller, runtime, counters, 3, 5, 500);
+    auto snapshot = controller.snapshot(3);
+    if (snapshot.active_limit != 4 ||
+        snapshot.phase != NativeControllerPhase::Cruise ||
+        snapshot.probe_failures != 3) {
+        return false;
+    }
+
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+    snapshot = controller.snapshot(4);
+    return snapshot.active_limit == 5 &&
+        snapshot.phase == NativeControllerPhase::Probe &&
+        snapshot.probe_direction == 1 &&
+        snapshot.observation_target_windows == 5;
+}
+
+bool check_runtime_control_descends_when_lower_limit_is_not_worse() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    if (!drive_three_upward_rollbacks(controller, runtime, counters)) {
+        return false;
+    }
+
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+    observe_runtime_windows(controller, runtime, counters, 3, 5, 1'000);
+    const auto snapshot = controller.snapshot(3);
+    return snapshot.active_limit == 2 &&
+        snapshot.phase == NativeControllerPhase::Probe &&
+        snapshot.probe_direction == -1 &&
+        snapshot.accepted_probe &&
+        snapshot.probe_failures == 0 &&
+        snapshot.observation_target_windows == 2;
 }
 
 bool check_runtime_control_uses_small_job_window() {
@@ -268,14 +390,9 @@ bool check_runtime_control_uses_small_job_window() {
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
 
-    observe_control_observation(controller, runtime, counters, 4, 0, 2, 2);
-    observe_control_observation(controller, runtime, counters, 5, 0, 3, 3);
-    if (controller.snapshot(5).phase != NativeControllerPhase::Verify) {
-        return false;
-    }
-
-    observe_control_observation(controller, runtime, counters, 4, 0, 2, 2);
-    const auto snapshot = controller.snapshot(4);
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 0, 2, 2);
+    observe_runtime_windows(controller, runtime, counters, 5, 2, 0, 3, 3);
+    const auto snapshot = controller.snapshot(5);
     return snapshot.active_limit == 6 &&
         snapshot.throughput_mode == NativeThroughputMode::Jobs &&
         snapshot.accepted_probe;
@@ -287,9 +404,8 @@ bool check_runtime_control_rebases_external_discontinuity_at_stable_limit() {
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    if (controller.snapshot(4).active_limit != 5 ||
-        controller.snapshot(4).phase != NativeControllerPhase::Probe) {
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+    if (controller.snapshot(4).active_limit != 5) {
         return false;
     }
     if (!controller.rebase_after_external_discontinuity(counters)) {
@@ -298,7 +414,8 @@ bool check_runtime_control_rebases_external_discontinuity_at_stable_limit() {
     const auto snapshot = controller.snapshot(4);
     return snapshot.active_limit == 4 &&
         snapshot.phase == NativeControllerPhase::Baseline &&
-        snapshot.decision == NativeControllerDecision::SegmentInterrupted;
+        snapshot.decision == NativeControllerDecision::SegmentInterrupted &&
+        snapshot.probe_failures == 0;
 }
 
 bool check_runtime_control_waits_for_realized_experimental_concurrency() {
@@ -308,100 +425,28 @@ bool check_runtime_control_waits_for_realized_experimental_concurrency() {
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
 
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    if (controller.snapshot(4).active_limit != 5) {
-        return false;
-    }
-
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
     counters.accepted_bytes += 1'200;
     counters.written_bytes += 1'200;
+    counters.completed_jobs += 2;
+    counters.completed_files += 2;
     controller.observe(runtime, counters, 100, 4, 0.1);
     auto snapshot = controller.snapshot(4);
-    if (snapshot.phase != NativeControllerPhase::Probe || snapshot.active_limit != 5) {
+    if (snapshot.active_limit != 5 ||
+        snapshot.phase != NativeControllerPhase::Probe) {
         return false;
     }
 
-    observe_control_observation(controller, runtime, counters, 5, 1'200);
+    observe_runtime_windows(controller, runtime, counters, 5, 1, 1'200);
     snapshot = controller.snapshot(5);
-    if (snapshot.phase != NativeControllerPhase::Verify || snapshot.active_limit != 4) {
+    if (snapshot.accepted_probe) {
         return false;
     }
 
-    counters.accepted_bytes += 1'000;
-    counters.written_bytes += 1'000;
-    controller.observe(runtime, counters, 100, 5, 0.1);
+    observe_runtime_windows(controller, runtime, counters, 5, 1, 1'200);
     snapshot = controller.snapshot(5);
-    if (snapshot.phase != NativeControllerPhase::Verify || snapshot.active_limit != 4) {
-        return false;
-    }
-
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 6 && snapshot.accepted_probe;
-}
-
-bool check_runtime_control_marks_probe_contaminated_on_environment_shift() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    observe_control_observation(controller, runtime, counters, 5, 1'200);
-    observe_control_observation(controller, runtime, counters, 4, 600);
-    const auto snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 4 &&
-        snapshot.phase == NativeControllerPhase::Baseline &&
-        snapshot.decision == NativeControllerDecision::Contaminated &&
-        !snapshot.accepted_probe;
-}
-
-bool check_runtime_control_detects_passive_environment_change() {
-    using namespace sunpack::sevenzip;
-    auto config = deterministic_runtime_config(4);
-    config.hold_windows = 9;
-    NativeRuntimeControl controller(8, config);
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-
-    // Reject an up probe, then a down probe, so the controller reaches Hold.
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    observe_control_observation(controller, runtime, counters, 5, 800);
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    if (controller.snapshot(4).phase != NativeControllerPhase::Cooldown) {
-        return false;
-    }
-
-    // Cooldown is deliberately not part of the passive trend detector.
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    if (controller.snapshot(4).phase != NativeControllerPhase::Probe ||
-        controller.snapshot(4).active_limit != 3) {
-        return false;
-    }
-
-    observe_control_observation(controller, runtime, counters, 3, 500);
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    if (controller.snapshot(4).phase != NativeControllerPhase::Cooldown) {
-        return false;
-    }
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    if (controller.snapshot(4).phase != NativeControllerPhase::Hold) {
-        return false;
-    }
-
-    // The first Hold observation primes the detector. A large persistent shift in
-    // the second one must then be classified as an environment change.
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    if (controller.snapshot(4).decision == NativeControllerDecision::EnvironmentChanged) {
-        return false;
-    }
-    observe_control_observation(controller, runtime, counters, 4, 200);
-    const auto snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 4 &&
-        snapshot.phase == NativeControllerPhase::Baseline &&
-        snapshot.decision == NativeControllerDecision::EnvironmentChanged;
+    return snapshot.active_limit == 6 &&
+        snapshot.accepted_probe;
 }
 
 bool check_runtime_control_interrupts_probe_when_backlog_disappears() {
@@ -410,10 +455,11 @@ bool check_runtime_control_interrupts_probe_when_backlog_disappears() {
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
     if (controller.snapshot(4).active_limit != 5) {
         return false;
     }
+
     controller.observe(runtime, counters, 0, 5, 0.1);
     auto snapshot = controller.snapshot(5);
     if (snapshot.active_limit != 4 ||
@@ -421,6 +467,7 @@ bool check_runtime_control_interrupts_probe_when_backlog_disappears() {
         snapshot.decision != NativeControllerDecision::SegmentInterrupted) {
         return false;
     }
+
     counters.written_bytes += 1'000;
     counters.accepted_bytes += 1'000;
     controller.observe(runtime, counters, 100, 4, 0.1);
@@ -433,13 +480,12 @@ bool check_runtime_control_interrupts_probe_when_backlog_disappears() {
 
 bool check_runtime_control_parks_and_rebases_activity() {
     using namespace sunpack::sevenzip;
-    auto config = deterministic_runtime_config(4);
-    config.warm_start_confirmations = 2;
-    NativeRuntimeControl controller(8, config);
+    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+
     controller.end_activity(counters);
     auto snapshot = controller.snapshot(0);
     if (snapshot.active_limit != 4 ||
@@ -447,6 +493,7 @@ bool check_runtime_control_parks_and_rebases_activity() {
         snapshot.decision != NativeControllerDecision::ActivityEnded) {
         return false;
     }
+
     controller.begin_activity(counters, 1.0);
     counters.written_bytes += 1'000;
     counters.accepted_bytes += 1'000;
@@ -469,38 +516,32 @@ bool check_runtime_control_warm_start_decays_without_reusing_measurements() {
     NativeThroughputCounters counters;
     controller.observe(runtime, counters, 100, 4, 0.1);
 
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    observe_control_observation(controller, runtime, counters, 5, 1'200);
-    observe_control_observation(controller, runtime, counters, 4, 1'000);
-    if (controller.snapshot(4).active_limit != 6) {
-        return false;
-    }
-
-    observe_control_observation(controller, runtime, counters, 6, 1'400);
-    observe_control_observation(controller, runtime, counters, 5, 1'200);
-    if (controller.snapshot(5).active_limit != 7) {
-        return false;
-    }
-
-    observe_control_observation(controller, runtime, counters, 7, 1'000);
-    observe_control_observation(controller, runtime, counters, 6, 1'400);
-    if (controller.snapshot(6).active_limit != 6) {
+    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
+    observe_runtime_windows(controller, runtime, counters, 5, 2, 1'200);
+    observe_runtime_windows(controller, runtime, counters, 6, 2, 1'400);
+    observe_runtime_windows(controller, runtime, counters, 7, 2, 800);
+    auto snapshot = controller.snapshot(7);
+    if (snapshot.active_limit != 6 ||
+        snapshot.phase != NativeControllerPhase::Cruise) {
         return false;
     }
 
     controller.end_activity(counters);
     controller.begin_activity(counters, 0.0);
-    auto snapshot = controller.snapshot(0);
-    if (snapshot.active_limit != 6 || !snapshot.warm_start_used ||
+    snapshot = controller.snapshot(0);
+    if (snapshot.active_limit != 6 ||
+        !snapshot.warm_start_used ||
         snapshot.throughput_mode != NativeThroughputMode::None) {
         return false;
     }
+
     controller.end_activity(counters);
     controller.begin_activity(counters, 15.0);
     snapshot = controller.snapshot(0);
     if (snapshot.active_limit != 5 || !snapshot.warm_start_used) {
         return false;
     }
+
     controller.end_activity(counters);
     controller.begin_activity(counters, 30.0);
     snapshot = controller.snapshot(0);
@@ -575,21 +616,37 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "empty bounded password probe evidence check failed\n";
         return 15;
     }
-    if (!check_runtime_control_waits_for_three_window_observation()) {
-        std::cerr << "runtime control observation aggregation check failed\n";
+    if (!check_runtime_control_starts_after_two_windows()) {
+        std::cerr << "runtime control two-window startup check failed\n";
         return 23;
-    }
-    if (!check_runtime_control_rolls_back_large_window_regression()) {
-        std::cerr << "runtime control large-window rollback check failed\n";
-        return 6;
     }
     if (!check_runtime_control_emits_fixed_measurement_windows()) {
         std::cerr << "runtime control fixed measurement window check failed\n";
         return 22;
     }
-    if (!check_runtime_control_accepts_large_window_improvement()) {
-        std::cerr << "runtime control large-window improvement check failed\n";
+    if (!check_runtime_control_accepts_improvement_without_verify()) {
+        std::cerr << "runtime control direct improvement check failed\n";
         return 7;
+    }
+    if (!check_runtime_control_accumulates_ambiguous_upward_gain()) {
+        std::cerr << "runtime control ambiguous upward accumulation check failed\n";
+        return 24;
+    }
+    if (!check_runtime_control_grows_probe_window_after_rollback()) {
+        std::cerr << "runtime control progressive observation check failed\n";
+        return 6;
+    }
+    if (!check_runtime_control_probes_down_after_repeated_up_failures()) {
+        std::cerr << "runtime control downward correction trigger check failed\n";
+        return 18;
+    }
+    if (!check_runtime_control_retries_up_after_failed_down_probe()) {
+        std::cerr << "runtime control upward retry check failed\n";
+        return 19;
+    }
+    if (!check_runtime_control_descends_when_lower_limit_is_not_worse()) {
+        std::cerr << "runtime control downward acceptance check failed\n";
+        return 25;
     }
     if (!check_runtime_control_uses_small_job_window()) {
         std::cerr << "runtime control small-job window check failed\n";
@@ -602,14 +659,6 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_runtime_control_waits_for_realized_experimental_concurrency()) {
         std::cerr << "runtime control realized-concurrency check failed\n";
         return 20;
-    }
-    if (!check_runtime_control_marks_probe_contaminated_on_environment_shift()) {
-        std::cerr << "runtime control contaminated-probe check failed\n";
-        return 18;
-    }
-    if (!check_runtime_control_detects_passive_environment_change()) {
-        std::cerr << "runtime control passive environment-change check failed\n";
-        return 19;
     }
     if (!check_runtime_control_interrupts_probe_when_backlog_disappears()) {
         std::cerr << "runtime control saturated-segment interruption check failed\n";
