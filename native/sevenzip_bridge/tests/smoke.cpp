@@ -3,7 +3,7 @@
 #include "internal/sevenzip_formats.hpp"
 #include "internal/password_probe_policy.hpp"
 #include "internal/sevenzip_status.hpp"
-#include "internal/native_runtime_control.hpp"
+#include "internal/native_memory_guard.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/decoder_cpu_budget.h"
 #include "internal/native_worker_sizing.hpp"
@@ -93,13 +93,6 @@ bool check_password_probe_status_names() {
     )) == "needs_volume_or_tail_damaged";
 }
 
-sunpack::sevenzip::NativeRuntimeConfig deterministic_runtime_config() {
-    sunpack::sevenzip::NativeRuntimeConfig config;
-    config.observation_window_seconds = 1.0;
-    config.throughput_change_ratio = 0.40;
-    return config;
-}
-
 bool check_empty_bounded_password_probe_requires_positive_evidence() {
     using sunpack::sevenzip::EmptyBoundedPasswordProbeDisposition;
     using sunpack::sevenzip::empty_bounded_password_probe_disposition;
@@ -112,23 +105,6 @@ bool check_empty_bounded_password_probe_requires_positive_evidence() {
             EmptyBoundedPasswordProbeDisposition::AcceptOpenProof &&
         empty_bounded_password_probe_disposition(true, 3, false) ==
             EmptyBoundedPasswordProbeDisposition::TestAllItems;
-}
-
-void observe_runtime(
-    sunpack::sevenzip::NativeRuntimeControl& controller,
-    const sunpack::sevenzip::NativeRuntimeSample& runtime,
-    sunpack::sevenzip::NativeThroughputCounters& counters,
-    std::uint64_t written_bytes,
-    double seconds,
-    std::size_t reserved_cpu_credits
-) {
-    counters.accepted_bytes += written_bytes;
-    counters.written_bytes += written_bytes;
-    controller.observe(
-        runtime,
-        counters,
-        reserved_cpu_credits,
-        seconds);
 }
 
 bool check_cpu_budget_accounts_base_and_decoder_credits() {
@@ -283,291 +259,83 @@ bool check_cpu_budget_acquire_all_available() {
     return budget.reserved_credits() == 0;
 }
 
-bool check_runtime_control_establishes_one_second_baseline() {
+bool check_memory_guard_reduces_below_ten_percent() {
     using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(16, deterministic_runtime_config());
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-
-    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
-    auto snapshot = controller.snapshot(16);
-    if (snapshot.measurement_sequence != 0 ||
-        snapshot.effective_cpu_budget != 16) {
+    NativeMemoryGuard guard(16);
+    if (!guard.observe(1000, 99)) {
         return false;
     }
-
-    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
-    snapshot = controller.snapshot(16);
-    if (snapshot.measurement_sequence != 0) {
-        return false;
-    }
-
-    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
-    snapshot = controller.snapshot(16);
-    return snapshot.measurement_sequence == 1 &&
-        snapshot.decision == NativeControllerDecision::BaselineEstablished &&
-        snapshot.nominal_cpu_budget == 16 &&
-        snapshot.effective_cpu_budget == 16 &&
+    const auto snapshot = guard.snapshot();
+    return snapshot.nominal_cpu_budget == 16 &&
+        snapshot.effective_cpu_budget == 14 &&
         snapshot.budget_step == 2 &&
-        snapshot.written_bytes_per_second == 1000.0 &&
-        snapshot.reference_bytes_per_second == 1000.0;
+        snapshot.total_physical_bytes == 1000 &&
+        snapshot.available_physical_bytes == 99 &&
+        snapshot.available_ratio == 0.099 &&
+        snapshot.minimum_available_ratio == 0.10 &&
+        snapshot.under_pressure;
 }
 
-bool check_runtime_control_ignores_unsaturated_windows() {
+bool check_memory_guard_keeps_budget_at_threshold() {
     using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(16, deterministic_runtime_config());
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-
-    observe_runtime(controller, runtime, counters, 500, 0.5, 15);
-    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
-    auto snapshot = controller.snapshot(16);
-    if (snapshot.measurement_sequence != 0) {
+    NativeMemoryGuard guard(16);
+    if (guard.observe(1000, 100)) {
         return false;
     }
-
-    observe_runtime(controller, runtime, counters, 500, 0.5, 17);
-    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
-    snapshot = controller.snapshot(16);
-    if (snapshot.measurement_sequence != 0) {
-        return false;
-    }
-
-    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
-    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
-    snapshot = controller.snapshot(16);
-    return snapshot.measurement_sequence == 1 &&
-        snapshot.decision == NativeControllerDecision::BaselineEstablished &&
-        snapshot.reference_bytes_per_second == 1000.0;
-}
-
-bool check_runtime_control_requires_forty_percent_change() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(16, deterministic_runtime_config());
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
-
-    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
-    observe_runtime(controller, runtime, counters, 650, 1.0, 16);
-    auto snapshot = controller.snapshot(16);
-    if (snapshot.decision != NativeControllerDecision::None ||
-        snapshot.effective_cpu_budget != 16) {
-        return false;
-    }
-
-    observe_runtime(controller, runtime, counters, 590, 1.0, 16);
-    snapshot = controller.snapshot(16);
-    return snapshot.decision == NativeControllerDecision::BudgetReduced &&
-        snapshot.effective_cpu_budget == 14 &&
-        snapshot.reference_bytes_per_second == 0.0;
-}
-
-bool check_runtime_control_stays_stable_inside_change_band() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(16, deterministic_runtime_config());
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
-    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
-
-    // Repeated saturated windows on either side of the reference, but still
-    // inside the configured +/-40% band, must not churn the budget.
-    for (const std::uint64_t bytes : {650ULL, 700ULL, 1399ULL, 800ULL}) {
-        observe_runtime(controller, runtime, counters, bytes, 1.0, 16);
-        const auto snapshot = controller.snapshot(16);
-        if (snapshot.effective_cpu_budget != 16 ||
-            snapshot.decision != NativeControllerDecision::None) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool check_runtime_control_reobserves_after_budget_change() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(16, deterministic_runtime_config());
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
-
-    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
-    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
-    auto snapshot = controller.snapshot(16);
-    if (snapshot.decision != NativeControllerDecision::BudgetReduced ||
-        snapshot.effective_cpu_budget != 14) {
-        return false;
-    }
-
-    // Non-preemptive excess use must not establish the new-tier baseline.
-    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
-    snapshot = controller.snapshot(16);
-    if (snapshot.measurement_sequence != 2 ||
-        snapshot.reference_bytes_per_second != 0.0) {
-        return false;
-    }
-
-    observe_runtime(controller, runtime, counters, 0, 0.1, 14);
-    snapshot = controller.snapshot(14);
-    if (snapshot.measurement_sequence != 2) {
-        return false;
-    }
-
-    observe_runtime(controller, runtime, counters, 500, 1.0, 14);
-    snapshot = controller.snapshot(14);
-    return snapshot.measurement_sequence == 3 &&
-        snapshot.decision == NativeControllerDecision::BaselineEstablished &&
-        snapshot.effective_cpu_budget == 14 &&
-        snapshot.reference_bytes_per_second == 500.0;
-}
-
-bool check_runtime_control_restores_after_recovery() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(16, deterministic_runtime_config());
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
-
-    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
-    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
-    observe_runtime(controller, runtime, counters, 0, 0.1, 14);
-    observe_runtime(controller, runtime, counters, 500, 1.0, 14);
-    observe_runtime(controller, runtime, counters, 710, 1.0, 14);
-    auto snapshot = controller.snapshot(14);
-    if (snapshot.decision != NativeControllerDecision::BudgetRestored ||
-        snapshot.effective_cpu_budget != 16 ||
-        snapshot.reference_bytes_per_second != 0.0) {
-        return false;
-    }
-
-    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
-    observe_runtime(controller, runtime, counters, 710, 1.0, 16);
-    snapshot = controller.snapshot(16);
-    return snapshot.decision == NativeControllerDecision::BaselineEstablished &&
-        snapshot.effective_cpu_budget == 16 &&
-        snapshot.reference_bytes_per_second == 710.0;
-}
-
-bool check_runtime_control_restoration_requires_saturation() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(16, deterministic_runtime_config());
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
-    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
-    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
-    if (controller.snapshot(16).effective_cpu_budget != 14) {
-        return false;
-    }
-
-    // Recovery evidence while the budget is under-filled is discarded and
-    // cannot restore the nominal concurrency.
-    observe_runtime(controller, runtime, counters, 701, 1.0, 13);
-    if (controller.snapshot(13).effective_cpu_budget != 14) {
-        return false;
-    }
-
-    // Re-prime, establish the reduced-tier baseline, then recover only on a
-    // later exact-saturation window.
-    observe_runtime(controller, runtime, counters, 0, 0.1, 14);
-    observe_runtime(controller, runtime, counters, 500, 1.0, 14);
-    if (controller.snapshot(14).effective_cpu_budget != 14) {
-        return false;
-    }
-    observe_runtime(controller, runtime, counters, 701, 1.0, 14);
-    const auto snapshot = controller.snapshot(14);
-    return snapshot.decision == NativeControllerDecision::BudgetRestored &&
-        snapshot.effective_cpu_budget == 16;
-}
-
-bool check_runtime_control_uses_core_eighth_step() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(32, deterministic_runtime_config());
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-    observe_runtime(controller, runtime, counters, 0, 0.1, 32);
-
-    observe_runtime(controller, runtime, counters, 1000, 1.0, 32);
-    observe_runtime(controller, runtime, counters, 500, 1.0, 32);
-    auto snapshot = controller.snapshot(32);
-    if (snapshot.effective_cpu_budget != 28 ||
-        snapshot.budget_step != 4 ||
-        snapshot.decision != NativeControllerDecision::BudgetReduced) {
-        return false;
-    }
-
-    observe_runtime(controller, runtime, counters, 0, 0.1, 28);
-    observe_runtime(controller, runtime, counters, 500, 1.0, 28);
-    snapshot = controller.snapshot(28);
-    if (snapshot.decision != NativeControllerDecision::BaselineEstablished ||
-        snapshot.reference_bytes_per_second != 500.0) {
-        return false;
-    }
-
-    observe_runtime(controller, runtime, counters, 250, 1.0, 28);
-    snapshot = controller.snapshot(28);
-    return snapshot.effective_cpu_budget == 24 &&
-        snapshot.budget_step == 4 &&
-        snapshot.decision == NativeControllerDecision::BudgetReduced;
-}
-
-bool check_runtime_control_fixed_mode_only_observes_when_saturated() {
-    using namespace sunpack::sevenzip;
-    auto config = deterministic_runtime_config();
-    config.adaptive_enabled = false;
-    config.measurement_diagnostics_enabled = true;
-    NativeRuntimeControl controller(8, config);
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-    observe_runtime(controller, runtime, counters, 0, 0.1, 8);
-
-    observe_runtime(controller, runtime, counters, 1000, 1.0, 8);
-    observe_runtime(controller, runtime, counters, 300, 1.0, 7);
-    auto snapshot = controller.snapshot(7);
-    if (snapshot.measurement_sequence != 1 ||
-        snapshot.effective_cpu_budget != 8 ||
-        snapshot.reference_bytes_per_second != 1000.0) {
-        return false;
-    }
-
-    observe_runtime(controller, runtime, counters, 300, 1.0, 8);
-    observe_runtime(controller, runtime, counters, 300, 1.0, 8);
-    snapshot = controller.snapshot(8);
-    return snapshot.measurement_sequence == 2 &&
-        snapshot.effective_cpu_budget == 8 &&
-        snapshot.reference_bytes_per_second == 1000.0 &&
-        snapshot.written_bytes_per_second == 300.0;
-}
-
-bool check_runtime_control_activity_reset_restores_nominal_budget() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(16, deterministic_runtime_config());
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.begin_activity(counters);
-    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
-    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
-    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
-    if (controller.snapshot(16).effective_cpu_budget != 14) {
-        return false;
-    }
-
-    controller.end_activity(counters);
-    controller.begin_activity(counters);
-    const auto snapshot = controller.snapshot(0);
+    const auto snapshot = guard.snapshot();
     return snapshot.effective_cpu_budget == 16 &&
-        snapshot.reference_bytes_per_second == 0.0 &&
-        snapshot.measurement_sequence == 2 &&
-        snapshot.decision == NativeControllerDecision::ActivityStarted;
+        !snapshot.under_pressure;
+}
+
+bool check_memory_guard_reduces_and_restores_by_core_eighth() {
+    using namespace sunpack::sevenzip;
+    NativeMemoryGuard guard(32);
+
+    if (!guard.observe(1000, 50) ||
+        guard.snapshot().effective_cpu_budget != 28) {
+        return false;
+    }
+    if (!guard.observe(1000, 50) ||
+        guard.snapshot().effective_cpu_budget != 24) {
+        return false;
+    }
+    if (!guard.observe(1000, 200) ||
+        guard.snapshot().effective_cpu_budget != 28) {
+        return false;
+    }
+    if (!guard.observe(1000, 200) ||
+        guard.snapshot().effective_cpu_budget != 32) {
+        return false;
+    }
+    return !guard.observe(1000, 200) &&
+        guard.snapshot().effective_cpu_budget == 32;
+}
+
+bool check_memory_guard_never_drops_below_one() {
+    using namespace sunpack::sevenzip;
+    NativeMemoryGuard guard(4);
+    for (int i = 0; i < 16; ++i) {
+        guard.observe(1000, 1);
+    }
+    return guard.snapshot().effective_cpu_budget == 1;
+}
+
+bool check_memory_guard_custom_ratio() {
+    using namespace sunpack::sevenzip;
+    NativeMemoryGuardConfig config;
+    config.minimum_available_ratio = 0.20;
+    NativeMemoryGuard guard(8, config);
+
+    if (guard.observe(1000, 200)) {
+        return false;
+    }
+    if (!guard.observe(1000, 199)) {
+        return false;
+    }
+    const auto snapshot = guard.snapshot();
+    return snapshot.effective_cpu_budget == 7 &&
+        snapshot.minimum_available_ratio == 0.20 &&
+        snapshot.under_pressure;
 }
 
 bool check_native_sizing_tracks_logical_processors() {
@@ -641,44 +409,24 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "CPU acquire-all credit check failed\n";
         return 31;
     }
-    if (!check_runtime_control_establishes_one_second_baseline()) {
-        std::cerr << "runtime one-second baseline check failed\n";
+    if (!check_memory_guard_reduces_below_ten_percent()) {
+        std::cerr << "memory guard pressure threshold check failed\n";
         return 7;
     }
-    if (!check_runtime_control_ignores_unsaturated_windows()) {
-        std::cerr << "runtime saturation-gating check failed\n";
+    if (!check_memory_guard_keeps_budget_at_threshold()) {
+        std::cerr << "memory guard threshold boundary check failed\n";
         return 26;
     }
-    if (!check_runtime_control_reobserves_after_budget_change()) {
-        std::cerr << "runtime budget re-observation check failed\n";
-        return 27;
-    }
-    if (!check_runtime_control_requires_forty_percent_change()) {
-        std::cerr << "runtime passive derating check failed\n";
-        return 24;
-    }
-    if (!check_runtime_control_stays_stable_inside_change_band()) {
-        std::cerr << "runtime stable-band check failed\n";
-        return 29;
-    }
-    if (!check_runtime_control_restores_after_recovery()) {
-        std::cerr << "runtime budget restoration check failed\n";
-        return 6;
-    }
-    if (!check_runtime_control_restoration_requires_saturation()) {
-        std::cerr << "runtime saturated-restoration check failed\n";
-        return 30;
-    }
-    if (!check_runtime_control_uses_core_eighth_step()) {
-        std::cerr << "runtime CPU eighth-step check failed\n";
+    if (!check_memory_guard_reduces_and_restores_by_core_eighth()) {
+        std::cerr << "memory guard CPU eighth-step check failed\n";
         return 18;
     }
-    if (!check_runtime_control_fixed_mode_only_observes_when_saturated()) {
-        std::cerr << "runtime fixed observation check failed\n";
-        return 19;
+    if (!check_memory_guard_never_drops_below_one()) {
+        std::cerr << "memory guard minimum budget check failed\n";
+        return 24;
     }
-    if (!check_runtime_control_activity_reset_restores_nominal_budget()) {
-        std::cerr << "runtime activity reset check failed\n";
+    if (!check_memory_guard_custom_ratio()) {
+        std::cerr << "memory guard custom ratio check failed\n";
         return 25;
     }
     if (!check_native_sizing_tracks_logical_processors()) {
