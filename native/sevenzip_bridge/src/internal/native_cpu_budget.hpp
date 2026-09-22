@@ -55,6 +55,7 @@ public:
     explicit NativeCpuJobContext(
         NativeCpuBudget &budget,
         std::function<void(NativeCpuJobSnapshot)> change_sink = {}) noexcept;
+    ~NativeCpuJobContext();
 
     std::size_t acquire_extra(
         std::size_t wanted,
