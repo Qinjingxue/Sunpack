@@ -2619,12 +2619,14 @@ HRESULT CDecoder::DecodeLZParallel()
     if (!_sunpackCpuContext)
       _sunpackCpuContext = sunpack_cpu_current_job_context();
 
+    static const unsigned kMaxRar5ParallelWorkers = 8;
     unsigned grantedWorkers = 0;
     if (_sunpackCpuContext)
-      grantedWorkers =
-          sunpack_cpu_acquire_all_available_for_context(_sunpackCpuContext);
+      grantedWorkers = sunpack_cpu_acquire_extra_for_context(
+          _sunpackCpuContext, kMaxRar5ParallelWorkers, 1);
     else if (_numThreads > 1)
-      grantedWorkers = _numThreads - 1;
+      grantedWorkers =
+          (std::min)(_numThreads - 1, kMaxRar5ParallelWorkers);
 
     if (grantedWorkers == 0)
       return DecodeLZ();
