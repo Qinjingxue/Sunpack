@@ -8,6 +8,9 @@ extern "C" {
 
 void *sunpack_cpu_current_job_context(void);
 
+/* Installs context on the calling thread and returns the previous context. */
+void *sunpack_cpu_exchange_current_job_context(void *context);
+
 unsigned sunpack_cpu_acquire_extra_for_context(
     void *context,
     unsigned wanted,
