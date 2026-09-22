@@ -1363,7 +1363,7 @@ public:
 
     bool had_job_failure() const noexcept { return any_job_failed_; }
 
-    // Waits for the queue and all active jobs to finish; only used on the stdin EOF drain path, where the controller and space monitor must still be alive.
+    // Waits for the queue and all active jobs to finish; only used on the stdin EOF drain path, where the monitor and space gate must still be alive.
     void wait_for_pending_jobs_to_drain() noexcept {
         std::unique_lock<std::mutex> lock(mutex_);
         condition_.wait(lock, [this] { return queue_.empty() && active_jobs_ == 0; });
@@ -1622,7 +1622,7 @@ private:
         return state ? state->key : std::string{};
     }
 
-    // ChangeSink landing: drives the controller's discontinuity generation and fans the event out to affected jobs.
+    // ChangeSink landing: keeps the volume-space monitor active and fans the event out to affected jobs.
     void on_space_transition(
         const sunpack::sevenzip::VolumeSpaceTransition& transition
     ) noexcept {
@@ -1802,7 +1802,11 @@ private:
                 queue_.erase(iterator);
                 active_jobs_ += 1;
                 admitted_jobs = active_jobs_;
+                // Admission, not submission, is the authoritative point at
+                // which memory polling becomes active.
+                monitor_recheck_ = true;
             }
+            monitor_condition_.notify_one();
             print_active_event(job, "job_admitted", admitted_jobs);
             print_active_event(job, "job_started", admitted_jobs);
             int code = -100;
