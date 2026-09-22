@@ -25,6 +25,7 @@ public:
     std::size_t acquire_up_to(
         std::size_t wanted,
         std::size_t minimum_grant = 1) noexcept;
+    std::size_t acquire_all_available() noexcept;
     void release(std::size_t count) noexcept;
 
     void set_effective_capacity(std::size_t capacity) noexcept;
@@ -60,6 +61,7 @@ public:
     std::size_t acquire_extra(
         std::size_t wanted,
         std::size_t minimum_grant = 1) noexcept;
+    std::size_t acquire_all_available() noexcept;
     void release_extra(std::size_t count) noexcept;
     NativeCpuJobSnapshot snapshot() const noexcept;
 
