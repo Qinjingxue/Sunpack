@@ -2074,15 +2074,6 @@ namespace NCompress
       delete pool;
     }
 
-    class CRar5ParallelPoolRunScope
-    {
-      CRar5ParallelBlockPool &_pool;
-
-    public:
-      explicit CRar5ParallelPoolRunScope(CRar5ParallelBlockPool &pool) : _pool(pool) {}
-      ~CRar5ParallelPoolRunScope() { _pool.WaitIdle(); }
-    };
-
 struct CRar5RawBlockHeader
 {
   Byte Bytes[5];
@@ -2573,59 +2564,96 @@ HRESULT CDecoder::DecodeLZ()
 
 HRESULT CDecoder::DecodeLZParallel()
 {
+  void *cpuContext = sunpack_cpu_current_job_context();
+  const unsigned maxWorkers = cpuContext
+      ? kMaxRar5ParallelWorkers
+      : (_numThreads > 1
+          ? (unsigned)(std::min<UInt32>(
+              _numThreads - 1, kMaxRar5ParallelWorkers))
+          : 0);
+  if (maxWorkers == 0)
+    return DecodeLZ();
+
+  const size_t ringSize =
+      (size_t)kMaxRar5ParallelWorkers * kRar5MtBlocksPerWorker;
+
   if (!_mtPool)
   {
-    if (!_sunpackCpuContext)
-      _sunpackCpuContext = sunpack_cpu_current_job_context();
-
-    static const unsigned kMaxRar5ParallelWorkers = 8;
-    unsigned grantedWorkers = 0;
-    if (_sunpackCpuContext)
-      grantedWorkers = sunpack_cpu_acquire_extra_for_context(
-          _sunpackCpuContext, kMaxRar5ParallelWorkers, 1);
-    else if (_numThreads > 1)
-      grantedWorkers =
-          (std::min)(_numThreads - 1, kMaxRar5ParallelWorkers);
-
-    if (grantedWorkers == 0)
-      return DecodeLZ();
-
-    const size_t requestedRingSize =
-        (size_t)grantedWorkers * kRar5MtBlocksPerWorker;
-
     try
     {
       _mtPool = new CRar5ParallelBlockPool();
     }
     catch (const std::bad_alloc &)
     {
-      if (_sunpackCpuContext)
-        sunpack_cpu_release_extra_for_context(
-            _sunpackCpuContext, grantedWorkers);
       return E_OUTOFMEMORY;
     }
-
-    if (!_mtPool->Start(grantedWorkers, requestedRingSize))
-    {
-      delete _mtPool;
-      _mtPool = NULL;
-      if (_sunpackCpuContext)
-        sunpack_cpu_release_extra_for_context(
-            _sunpackCpuContext, grantedWorkers);
-      return E_FAIL;
-    }
-    _mtPoolWorkers = grantedWorkers;
-    if (_sunpackCpuContext)
-      _sunpackCpuCredits = grantedWorkers;
   }
 
-  CRar5ParallelPoolRunScope poolScope(*_mtPool);
-  const size_t ringSize = _mtPool->JobCount();
+  if (!_mtPool->PrepareJobs(ringSize))
+    return E_OUTOFMEMORY;
 
-  UInt64 submitted = 0;
+  struct CRar5ParallelSessionScope
+  {
+    CRar5ParallelBlockPool &Pool;
+    void *CpuContext;
+    unsigned Credits;
+    unsigned ActiveWorkers;
+
+    CRar5ParallelSessionScope(
+        CRar5ParallelBlockPool &pool,
+        void *cpuContext)
+        : Pool(pool),
+          CpuContext(cpuContext),
+          Credits(0),
+          ActiveWorkers(0)
+    {
+    }
+
+    ~CRar5ParallelSessionScope()
+    {
+      Pool.WaitIdle();
+      Pool.SetActiveWorkers(0);
+      if (CpuContext && Credits)
+        sunpack_cpu_release_extra_for_context(
+            CpuContext, Credits);
+    }
+  } session(*_mtPool, cpuContext);
+
+  auto growWorker = [&]() -> bool
+  {
+    if (session.ActiveWorkers >= maxWorkers)
+      return false;
+
+    unsigned granted = 1;
+    if (cpuContext)
+      granted =
+          sunpack_cpu_acquire_extra_for_context(
+              cpuContext, 1, 1);
+    if (granted == 0)
+      return false;
+
+    const unsigned nextWorkers = session.ActiveWorkers + 1;
+    if (!_mtPool->EnsureWorkerCount(nextWorkers))
+    {
+      if (cpuContext)
+        sunpack_cpu_release_extra_for_context(
+            cpuContext, granted);
+      return false;
+    }
+
+    session.ActiveWorkers = nextWorkers;
+    if (cpuContext)
+      session.Credits += granted;
+    _mtPool->SetActiveWorkers(session.ActiveWorkers);
+    return true;
+  };
+
+  UInt64 prepared = 0;
   UInt64 retired = 0;
   UInt64 packedRead = 0;
   bool minorError = false;
+  bool parallelActive = false;
+  CRar5ParallelBlockJob *stagedJob = NULL;
 
   CRar5ParallelTables inheritedTables;
   bool inheritedTablesValid = _tableWasFilled;
@@ -2861,67 +2889,63 @@ HRESULT CDecoder::DecodeLZParallel()
 
   auto retireUntilEmpty = [&]() -> HRESULT
   {
-    while (retired < submitted)
+    while (retired < prepared)
     {
-      CRar5ParallelBlockJob &job = _mtPool->JobAt((size_t)(retired % ringSize));
+      CRar5ParallelBlockJob &job =
+          _mtPool->JobAt((size_t)(retired % ringSize));
       RINOK(retireOne(job))
       retired++;
     }
     return S_OK;
   };
 
+  auto growForBacklog = [&]()
+  {
+    while (parallelActive &&
+           prepared - retired > session.ActiveWorkers &&
+           session.ActiveWorkers < maxWorkers)
+    {
+      CRar5ParallelBlockJob &oldest =
+          _mtPool->JobAt((size_t)(retired % ringSize));
+      if (oldest.IsDone() || !growWorker())
+        break;
+    }
+  };
+
   for (;;)
   {
-    if (submitted - retired >= ringSize)
+    if (parallelActive)
     {
-      CRar5ParallelBlockJob &job = _mtPool->JobAt((size_t)(retired % ringSize));
-      RINOK(retireOne(job))
-      retired++;
-      continue;
+      growForBacklog();
+
+      const UInt64 inFlight = prepared - retired;
+      const UInt64 inFlightLimit =
+          (UInt64)(std::max)(1u, session.ActiveWorkers) *
+          kRar5MtBlocksPerWorker;
+      if (inFlight >= inFlightLimit)
+      {
+        CRar5ParallelBlockJob &oldest =
+            _mtPool->JobAt((size_t)(retired % ringSize));
+
+        // If work is really backlogged, prefer adding one worker before
+        // blocking on ordered retirement. Otherwise retire completed work.
+        if (!oldest.IsDone() &&
+            prepared - retired > session.ActiveWorkers &&
+            growWorker())
+          continue;
+
+        RINOK(retireOne(oldest))
+        retired++;
+        continue;
+      }
     }
 
     CRar5RawBlockHeader rawHeader;
     RINOK(ReadRar5RawBlockHeader(_inStream, rawHeader))
     packedRead += rawHeader.HeaderSize;
 
-    if (rawHeader.UseSerial)
-    {
-      RINOK(retireUntilEmpty())
-      RINOK(normalizeWindow())
-
-      CMyComPtr2_Create<ISequentialInStream, CRar5ReplayInStream> replay;
-      replay->Init(rawHeader.Bytes, rawHeader.HeaderSize, _inStream);
-
-      // DecodeLZ() reports packed progress relative to the replay stream.
-      // Offset that value by the bytes already consumed by the parallel
-      // producer so the handler observes one monotonic packed position.
-      const UInt64 serialBase = packedRead - rawHeader.HeaderSize;
-      CMyComPtr2_Create<ICompressProgressInfo, CRar5ProgressOffset> progressOffset;
-      progressOffset->Init(_progress, serialBase);
-
-      ISequentialInStream *savedStream = _inStream;
-      ICompressProgressInfo *savedProgress = _progress;
-      const UInt64 savedProgressPack = _progress_Pack;
-      _inStream = replay;
-      _progress = progressOffset;
-      _progress_Pack = 0;
-
-      const HRESULT res = DecodeLZ();
-
-      const UInt64 serialProgressPack = _progress_Pack;
-      _inStream = savedStream;
-      _progress = savedProgress;
-      if (serialProgressPack > (UInt64)(Int64)-1 - serialBase)
-        _progress_Pack = (UInt64)(Int64)-1;
-      else
-        _progress_Pack = serialBase + serialProgressPack;
-      if (_progress_Pack < savedProgressPack)
-        _progress_Pack = savedProgressPack;
-
-      return res;
-    }
-
-    CRar5ParallelBlockJob &job = _mtPool->JobAt((size_t)(submitted % ringSize));
+    CRar5ParallelBlockJob &job =
+        _mtPool->JobAt((size_t)(prepared % ringSize));
     job.Reset();
 
     try
@@ -2930,24 +2954,44 @@ HRESULT CDecoder::DecodeLZParallel()
       {
         if (!pendingTableJob)
           return S_FALSE;
-        const HRESULT tableWaitRes = pendingTableJob->WaitTables(inheritedTables);
+
+        // Before a pool exists, a table dependency proves that the staged
+        // block and the current block cannot be entropy-decoded in parallel.
+        // Decode that staged block on the caller instead of starting a worker.
+        if (!parallelActive && stagedJob == pendingTableJob)
+          stagedJob->Process();
+
+        const HRESULT tableWaitRes =
+            pendingTableJob->WaitTables(inheritedTables);
         if (tableWaitRes != S_OK)
         {
           _tableWasFilled = false;
           return tableWaitRes;
         }
         inheritedTablesValid = true;
+
+        if (!parallelActive && stagedJob == pendingTableJob)
+        {
+          RINOK(retireOne(*stagedJob))
+          retired++;
+          stagedJob = NULL;
+        }
+
         pendingTableJob = NULL;
       }
 
-      const size_t logicalSize = (size_t)rawHeader.HeaderSize + rawHeader.BlockSize;
+      const size_t logicalSize =
+          (size_t)rawHeader.HeaderSize + rawHeader.BlockSize;
       job.Data.resize(logicalSize + kInputBufferPadZone);
       memcpy(job.Data.data(), rawHeader.Bytes, rawHeader.HeaderSize);
       RINOK(ReadStream_FALSE(
           _inStream,
           job.Data.data() + rawHeader.HeaderSize,
           rawHeader.BlockSize))
-      memset(job.Data.data() + logicalSize, 0xFF, kInputBufferPadZone);
+      memset(
+          job.Data.data() + logicalSize,
+          0xFF,
+          kInputBufferPadZone);
       packedRead += rawHeader.BlockSize;
 
       CBitDecoder bitStream;
@@ -2962,7 +3006,8 @@ HRESULT CDecoder::DecodeLZParallel()
 
       job.BitState = bitStream;
       job.TablePresent = rawHeader.TablePresent;
-      job.InitialTablesValid = !rawHeader.TablePresent && inheritedTablesValid;
+      job.InitialTablesValid =
+          !rawHeader.TablePresent && inheritedTablesValid;
       job.IsV7 = _is_v7;
       if (!rawHeader.TablePresent && inheritedTablesValid)
         job.Tables = inheritedTables;
@@ -2975,8 +3020,7 @@ HRESULT CDecoder::DecodeLZParallel()
       return E_OUTOFMEMORY;
     }
 
-    _mtPool->Submit(&job);
-    submitted++;
+    prepared++;
 
     if (rawHeader.TablePresent)
     {
@@ -2984,8 +3028,66 @@ HRESULT CDecoder::DecodeLZParallel()
       inheritedTablesValid = false;
     }
 
+    if (!parallelActive)
+    {
+      if (!stagedJob)
+      {
+        stagedJob = &job;
+
+        // A single RAR5 block never starts an extra worker.
+        if (rawHeader.LastBlock)
+        {
+          stagedJob->Process();
+          RINOK(retireOne(*stagedJob))
+          retired++;
+          stagedJob = NULL;
+          break;
+        }
+        continue;
+      }
+
+      // Two independent parsed blocks establish real parallel backlog.
+      // Only now do we request the first extra execution lane.
+      if (!growWorker())
+      {
+        stagedJob->Process();
+        RINOK(retireOne(*stagedJob))
+        retired++;
+        stagedJob = &job;
+
+        if (rawHeader.LastBlock)
+        {
+          stagedJob->Process();
+          RINOK(retireOne(*stagedJob))
+          retired++;
+          stagedJob = NULL;
+          break;
+        }
+        continue;
+      }
+
+      _mtPool->Submit(stagedJob);
+      _mtPool->Submit(&job);
+      stagedJob = NULL;
+      parallelActive = true;
+      growForBacklog();
+    }
+    else
+    {
+      _mtPool->Submit(&job);
+      growForBacklog();
+    }
+
     if (rawHeader.LastBlock)
       break;
+  }
+
+  if (stagedJob)
+  {
+    stagedJob->Process();
+    RINOK(retireOne(*stagedJob))
+    retired++;
+    stagedJob = NULL;
   }
 
   RINOK(retireUntilEmpty())
