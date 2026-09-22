@@ -229,7 +229,7 @@ unsigned sunpack_cpu_acquire_extra_for_context(
 {
     auto *job = static_cast<sunpack::sevenzip::NativeCpuJobContext *>(context);
     if (!job)
-        return 0;
+        return wanted;
     return static_cast<unsigned>(
         job->acquire_extra(wanted, minimum_grant));
 }
