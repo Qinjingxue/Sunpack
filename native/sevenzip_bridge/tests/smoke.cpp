@@ -349,7 +349,7 @@ bool check_runtime_control_uses_core_eighth_step() {
         snapshot.decision == NativeControllerDecision::BudgetReduced;
 }
 
-bool check_runtime_control_fixed_mode_only_observes_when_saturated_when_saturated() {
+bool check_runtime_control_fixed_mode_only_observes_when_saturated() {
     using namespace sunpack::sevenzip;
     auto config = deterministic_runtime_config();
     config.adaptive_enabled = false;
