@@ -369,6 +369,7 @@ private:
 public:
   bool EncodeMode;
   HRESULT Result;
+  void *SunpackCpuContext;
   CObjectVector< CMyComPtr<ISequentialInStream> > InStreams;
   CObjectVector< CMyComPtr<ISequentialOutStream> > OutStreams;
 
@@ -392,7 +393,7 @@ public:
     ~CReleaser() { _c.Release(); }
   };
 
-  CCoderMT(): EncodeMode(false) {}
+  CCoderMT(): EncodeMode(false), SunpackCpuContext(NULL) {}
   ~CCoderMT() Z7_DESTRUCTOR_override
   {
     /* WaitThreadFinish() will be called in ~CVirtThread().
