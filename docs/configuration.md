@@ -185,10 +185,7 @@ Runtime and worker parameters live under `performance`. Defaults are:
 | `worker.stage_thread_capacity` | `0` | Thread capacity for scanning, analysis, verification, and post-processing; `0` selects automatically. |
 | `worker.max_inflight_files` | `0` | File-level concurrency limit; `0` selects automatically, in the automatic range 64–512. |
 | `worker.max_pending_stage_jobs` | `4096` | Upper limit of waiting stage jobs. |
-| `worker.adaptive_enabled` | `true` | Whether the passive throughput controller may derate or restore CPU credits after a large external throughput change. |
-| `worker.resource_diagnostics_enabled` | `false` | Whether to sample CPU diagnostics; diagnostics do not drive CPU-credit decisions. |
-| `worker.observation_window_seconds` | `1.0` | Passive throughput observation window in seconds. |
-| `worker.throughput_change_ratio` | `0.40` | Relative throughput change from the current baseline that triggers a CPU-budget adjustment. |
+| `worker.minimum_available_memory_ratio` | `0.10` | Start reducing the native CPU-credit budget when available physical memory falls below this fraction of total physical memory. |
 | `worker.max_queue_jobs` | `4096` | Upper limit of the native job queue. |
 | `worker.priority_aging_quantum` | `32` | Priority aging step. |
 | `worker.backpressure_retries` | `120` | Number of retries on queue backpressure. |
@@ -200,7 +197,7 @@ Runtime and worker parameters live under `performance`. Defaults are:
 
 The native worker uses CPU credits as the sole extraction-concurrency authority. By default the nominal budget equals the logical processor count and every admitted archive job reserves one base credit; formats have no fixed CPU weights. In a SunPack worker context, archive handlers no longer derive decoder concurrency from CPU affinity/core count, LZMA2/XZ no longer reduce thread counts from RAM budgets, and the SunPack RAR5/BZip2 parallel paths no longer keep `<4`, `max 8`, or `NumThreads` policies. Decoders retain only archive/algorithm inherent parallelism constraints and acquire execution lanes from the shared budget when work can actually run: RAR5/BZip2 atomically take all currently available extra credits, while LZMA2/XZ MtDec grows one credited thread at a time.
 
-The throughput controller no longer searches for an optimum. It observes written throughput only while the CPU-credit budget is exactly saturated (`reserved_cpu_credits == effective_cpu_budget`). Under-filled intervals can reflect too few runnable jobs, while over-filled intervals occur only during the non-preemptive transition after a derate; both invalidate the current partial window. The default observation window is 1 second. A drop of at least 40% from the current stable baseline reduces the effective CPU budget by `max(1, logical_processors / 8)`; an increase of at least 40% restores the same step, capped at the nominal budget. After every budget change, the old baseline is discarded. The first sample that observes exact saturation only establishes the window start boundary; its preceding interval is excluded. A new window is formed only after the following continuously saturated samples accumulate a full second. Any loss of exact saturation invalidates the partial window and requires a fresh saturation start.
+Throughput statistics no longer participate in concurrency control. The native worker reads system physical-memory availability once per second only while at least one extraction job is active; it does not poll memory while idle. If `available_physical / total_physical < worker.minimum_available_memory_ratio`, the effective CPU budget is reduced by `max(1, logical_processors / 8)` per poll, down to 1. When available memory is back at or above the threshold, the same step restores the budget toward the nominal logical-processor capacity. Derating is non-preemptive: existing credit holders keep their lanes, while new jobs and decoder lanes are prevented from acquiring credits until usage falls within the lower budget.
 
 ## watch
 
