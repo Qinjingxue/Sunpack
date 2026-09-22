@@ -663,7 +663,6 @@ def run_batch_cases(pressure_cases: list[PressureCase]) -> list[dict]:
         {
             "thread_capacity": 1,
             "max_inflight_files": 1,
-            "initial_active_jobs": 1,
         }
     )
     started = time.perf_counter()
