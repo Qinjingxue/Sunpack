@@ -86,7 +86,7 @@ public:
         window_written_bytes_ = 0;
         reference_bytes_per_second_ = 0.0;
         written_bytes_per_second_ = 0.0;
-        rebase_next_window_ = false;
+        recovering_budget_ = false;
         decision_ = NativeControllerDecision::ActivityStarted;
         active_ = true;
         return true;
@@ -100,7 +100,7 @@ public:
         window_written_bytes_ = 0;
         reference_bytes_per_second_ = 0.0;
         written_bytes_per_second_ = 0.0;
-        rebase_next_window_ = false;
+        recovering_budget_ = false;
         decision_ = NativeControllerDecision::ActivityEnded;
         active_ = false;
         return true;
@@ -153,10 +153,10 @@ public:
         if (written_bytes_per_second_ <= 0.0)
             return false;
 
-        if (reference_bytes_per_second_ <= 0.0 || rebase_next_window_)
+        if (reference_bytes_per_second_ <= 0.0)
         {
             reference_bytes_per_second_ = written_bytes_per_second_;
-            rebase_next_window_ = false;
+            recovering_budget_ = false;
             decision_ = NativeControllerDecision::BaselineEstablished;
             return true;
         }
@@ -173,7 +173,11 @@ public:
                 effective_cpu_budget_ > budget_step_
                     ? effective_cpu_budget_ - budget_step_
                     : std::size_t{1};
-            rebase_next_window_ = true;
+            // The low-throughput window that justified derating is the stable
+            // reference for this tier. A stable next window therefore holds the
+            // budget, while a further 20% drop can derate again immediately.
+            reference_bytes_per_second_ = written_bytes_per_second_;
+            recovering_budget_ = false;
             decision_ = NativeControllerDecision::BudgetReduced;
             return true;
         }
@@ -185,8 +189,23 @@ public:
                 (std::min)(
                     nominal_cpu_budget_,
                     effective_cpu_budget_ + budget_step_);
-            rebase_next_window_ = true;
+            recovering_budget_ =
+                effective_cpu_budget_ < nominal_cpu_budget_;
+            if (!recovering_budget_)
+                reference_bytes_per_second_ = written_bytes_per_second_;
             decision_ = NativeControllerDecision::BudgetRestored;
+            return true;
+        }
+
+        if (recovering_budget_)
+        {
+            // Recovery was inferred from a >=20% jump. Keep restoring one
+            // credit step per observation only while that recovered level is
+            // sustained. If it falls back into the stable band, stop here and
+            // use the observed level as the new baseline.
+            recovering_budget_ = false;
+            reference_bytes_per_second_ = written_bytes_per_second_;
+            decision_ = NativeControllerDecision::BaselineEstablished;
             return true;
         }
 
@@ -241,7 +260,7 @@ private:
     NativeThroughputCounters previous_counters_{};
     bool counters_primed_ = false;
     bool active_ = false;
-    bool rebase_next_window_ = false;
+    bool recovering_budget_ = false;
     double window_seconds_ = 0.0;
     std::uint64_t window_written_bytes_ = 0;
     double written_bytes_per_second_ = 0.0;
