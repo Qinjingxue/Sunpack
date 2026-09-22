@@ -1815,11 +1815,7 @@ private:
             int code = -100;
             const std::string job_id = json_string_field(job.request, "job_id", "");
             {
-                sunpack::sevenzip::NativeCpuJobContext cpu_job_context(
-                    cpu_budget_,
-                    [this, job_id](const sunpack::sevenzip::NativeCpuJobSnapshot& snapshot) {
-                        print_job_cpu_event(job_id, snapshot);
-                    });
+                sunpack::sevenzip::NativeCpuJobContext cpu_job_context(cpu_budget_);
                 sunpack::sevenzip::NativeCpuContextScope cpu_scope(&cpu_job_context);
                 try {
                 if (job.metadata.requires_writer) {

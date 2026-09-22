@@ -5,7 +5,6 @@
 // #include <stdio.h>
 
 #include "../../../C/Alloc.h"
-#include "../../../C/MtDec.h"
 #include "internal/decoder_cpu_budget.h"
 // #include "../../../C/CpuTicks.h"
 
@@ -110,7 +109,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     const bool creditManaged =
         sunpack_cpu_current_job_context() != NULL;
     UInt32 numThreads =
-        creditManaged ? MTDEC_THREADS_MAX : _numThreads;
+        creditManaged ? SUNPACK_CPU_MANAGED_THREAD_HINT : _numThreads;
 
     if (creditManaged || (_tryMt && numThreads >= 1))
     {
@@ -155,7 +154,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   int isMT = False;
 
   #ifndef Z7_ST
-  isMT = _tryMt;
+  isMT = sunpack_cpu_current_job_context() ? True : _tryMt;
   #endif
 
   // UInt64 cpuTicks = GetCpuTicks();

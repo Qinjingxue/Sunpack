@@ -3,6 +3,7 @@
 #include "StdAfx.h"
 
 #include "../../../C/Alloc.h"
+#include "internal/decoder_cpu_budget.h"
 
 #include "../Common/CWrappers.h"
 
@@ -56,7 +57,7 @@ HRESULT CDecoder::Decode(ISequentialInStream *seqInStream, ISequentialOutStream 
     const bool creditManaged =
         sunpack_cpu_current_job_context() != NULL;
     const UInt32 numThreads =
-        creditManaged ? MTDEC_THREADS_MAX : _numThreads;
+        creditManaged ? SUNPACK_CPU_MANAGED_THREAD_HINT : _numThreads;
 
     props.numThreads = numThreads;
 
