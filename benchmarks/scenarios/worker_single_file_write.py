@@ -149,7 +149,6 @@ def _run_worker(
         {
             "thread_capacity": 1,
             "adaptive_enabled": False,
-            "initial_active_jobs": 1,
             "writer_threads": writer_threads,
         },
     )
