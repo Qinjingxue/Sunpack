@@ -52,7 +52,9 @@ struct NativeCpuJobSnapshot
 class NativeCpuJobContext final
 {
 public:
-    explicit NativeCpuJobContext(NativeCpuBudget &budget) noexcept;
+    explicit NativeCpuJobContext(
+        NativeCpuBudget &budget,
+        std::function<void(NativeCpuJobSnapshot)> change_sink = {}) noexcept;
 
     std::size_t acquire_extra(
         std::size_t wanted,
@@ -65,6 +67,7 @@ private:
     std::atomic<std::size_t> current_extra_{0};
     std::atomic<std::size_t> peak_extra_{0};
     std::atomic<std::size_t> total_extra_granted_{0};
+    std::function<void(NativeCpuJobSnapshot)> change_sink_;
 };
 
 class NativeCpuContextScope final
