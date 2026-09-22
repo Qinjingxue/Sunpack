@@ -288,6 +288,8 @@ public:
   NWindows::CThread Thread;
   NWindows::NSynchronization::CAutoResetEvent DecoderEvent;
   NWindows::NSynchronization::CAutoResetEvent ScoutEvent;
+  void *_sunpackScoutCpuContext;
+  unsigned _sunpackScoutCpuCredit;
   // HRESULT ScoutRes;
   
   Byte MtPad[1 << 7]; // It's pad for Multi-Threading. Must be >= Cache_Line_Size.
