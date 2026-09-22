@@ -1927,7 +1927,7 @@ private:
             const auto sample = read_runtime_sample(
                 runtime_controller_.resource_diagnostics_enabled());
             const bool changed = runtime_controller_.observe(
-                sample, throughput, active_jobs, elapsed_seconds);
+                sample, throughput, elapsed_seconds);
             const auto snapshot = runtime_controller_.snapshot(active_jobs);
 
             if (changed) {
