@@ -41,7 +41,7 @@ def _advanced_payload(precheck=None):
         "recursive_extract": "*",
         "post_extract": {"archive_cleanup_mode": "r", "flatten_single_directory": True},
         "filesystem": {"directory_scan_mode": "*", "scan_filters_enabled": True, "scan_filters": []},
-        "performance": {"worker": {"observation_window_seconds": 1.0, "throughput_change_ratio": 0.4, "watchdog_no_progress_timeout_seconds": 180}},
+        "performance": {"worker": {"minimum_available_memory_ratio": 0.1, "watchdog_no_progress_timeout_seconds": 180}},
         "verification": _verification_config(),
         "detection": {
             "enabled": True,
@@ -65,7 +65,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
         "cli": {"language": "zh"},
         "runtime": {"process_mode": "high"},
         "filesystem": {"scan_filters": [{"name": "size_range", "enabled": True, "range": "r >= 2 MB"}]},
-        "performance": {"worker": {"throughput_change_ratio": 0.25}},
+        "performance": {"worker": {"minimum_available_memory_ratio": 0.2}},
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     config = loader.load_config()
@@ -74,7 +74,7 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["filesystem"]["directory_scan_mode"] == "recursive"
     assert config["filesystem"]["scan_filters"][0]["range"] == "r >= 2 MB"
     assert config["performance"]["worker"]["watchdog_no_progress_timeout_seconds"] == 180
-    assert config["performance"]["worker"]["throughput_change_ratio"] == 0.45
+    assert config["performance"]["worker"]["minimum_available_memory_ratio"] == 0.2
 
 
 def test_load_config_rejects_invalid_runtime_process_mode(tmp_path, monkeypatch):

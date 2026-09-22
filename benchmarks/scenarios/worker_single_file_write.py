@@ -148,7 +148,6 @@ def _run_worker(
         None,
         {
             "thread_capacity": 1,
-            "adaptive_enabled": False,
             "writer_threads": writer_threads,
         },
     )

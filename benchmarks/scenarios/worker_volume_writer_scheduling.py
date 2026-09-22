@@ -219,7 +219,6 @@ def _run_configuration(
         None,
         {
             "thread_capacity": thread_capacity,
-            "adaptive_enabled": False,
             "writer_threads": writer_threads,
         },
     )

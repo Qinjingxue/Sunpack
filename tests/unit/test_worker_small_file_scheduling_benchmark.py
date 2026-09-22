@@ -39,73 +39,10 @@ def test_batch_summary_uses_native_events_for_utilization():
         started_at=0.0,
         submission_finished_at=0.5,
         finished_at=6.0,
-        admission_case={"name": "fixed-capacity", "blocker": "none", "description": "test", "expected_max_active": 2},
+        admission_case={"name": "credit-budget", "blocker": "cpu-credit-budget", "description": "test", "expected_max_active": 2},
         resource_metrics={},
-        controller_events=[],
-        sample_interval_ms=500,
     )
 
     assert summary["all_passed"] is True
     assert summary["observed_peak_active_jobs"] == 2
     assert summary["thread_capacity_utilization"] == 0.666667
-    assert summary["controller_adjustment_count"] == 0
-
-
-def test_batch_summary_reports_controller_adjustment_latency():
-    summary = _summarize_batch(
-        capacity=4,
-        submitted_at={"job-1": 0.0},
-        events=[
-            {"received_at": 0.0, "event": "job_queued", "job_id": "job-1", "request_id": "request-00", "active_jobs": 0},
-            {"received_at": 0.0, "event": "job_admitted", "job_id": "job-1", "request_id": "request-00", "active_jobs": 1},
-            {"received_at": 1.0, "event": "job_finished", "job_id": "job-1", "request_id": "request-00", "active_jobs": 0},
-        ],
-        results={"job-1": {"status": "ok"}},
-        failures={},
-        started_at=0.0,
-        submission_finished_at=0.1,
-        finished_at=1.0,
-        admission_case={"name": "adaptive-baseline", "blocker": "adaptive", "description": "test", "expected_max_active": None},
-        resource_metrics={},
-        controller_events=[
-            {"received_at": 0.6, "decision": "probe_up", "active_limit": 4},
-            {"received_at": 1.1, "decision": "accepted", "active_limit": 6},
-        ],
-        sample_interval_ms=500,
-    )
-
-    assert summary["sample_interval_ms"] == 500
-    assert summary["controller_adjustment_count"] == 2
-    assert summary["controller_first_adjustment_after_enqueue_ms"] == 600.0
-    assert summary["controller_peak_active_limit"] == 6
-
-
-def test_batch_summary_separates_lifecycle_events_from_limit_adjustments():
-    summary = _summarize_batch(
-        capacity=8,
-        submitted_at={"job-1": 0.0},
-        events=[
-            {"received_at": 0.0, "event": "job_queued", "job_id": "job-1", "active_jobs": 0},
-            {"received_at": 0.1, "event": "job_admitted", "job_id": "job-1", "active_jobs": 1},
-            {"received_at": 0.5, "event": "job_finished", "job_id": "job-1", "active_jobs": 0},
-        ],
-        results={"job-1": {"status": "ok"}},
-        failures={},
-        started_at=0.0,
-        submission_finished_at=0.1,
-        finished_at=0.5,
-        admission_case={"name": "adaptive-baseline", "blocker": "adaptive", "description": "test", "expected_max_active": None},
-        resource_metrics={},
-        controller_events=[
-            {"received_at": 0.0, "decision": "activity_started", "active_limit": 4, "activity_session": 1},
-            {"received_at": 0.1, "decision": "segment_started", "active_limit": 4, "activity_session": 1, "saturated_segment": 1},
-            {"received_at": 0.2, "decision": "probe_up", "active_limit": 6, "activity_session": 1, "saturated_segment": 1},
-            {"received_at": 0.5, "decision": "activity_ended", "active_limit": 6, "activity_session": 1, "saturated_segment": 1},
-        ],
-        sample_interval_ms=100,
-    )
-
-    assert summary["controller_adjustment_count"] == 1
-    assert summary["controller_lifecycle_event_count"] == 3
-    assert summary["controller_activity_session_count"] == 1
-    assert summary["controller_saturated_segment_count"] == 1

@@ -505,30 +505,22 @@ def test_native_environment_zero_thread_capacity_uses_native_auto_capacity():
         environment,
         {
             "thread_capacity": 0,
-            "adaptive_enabled": True,
         },
     )
 
     assert "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY" not in environment
-    assert environment["SUNPACK_NATIVE_ADAPTIVE_ENABLED"] == "1"
 
 
-def test_native_environment_configures_passive_budget_controller():
+def test_native_environment_configures_memory_guard():
     environment = {}
     _apply_native_environment(
         environment,
         {
-            "resource_diagnostics_enabled": False,
-            "measurement_diagnostics_enabled": True,
-            "observation_window_seconds": 1.0,
-            "throughput_change_ratio": 0.40,
+            "minimum_available_memory_ratio": 0.10,
         },
     )
 
-    assert environment["SUNPACK_NATIVE_RESOURCE_DIAGNOSTICS"] == "0"
-    assert environment["SUNPACK_NATIVE_MEASUREMENT_DIAGNOSTICS"] == "1"
-    assert environment["SUNPACK_NATIVE_OBSERVATION_WINDOW_SECONDS"] == "1.0"
-    assert environment["SUNPACK_NATIVE_THROUGHPUT_CHANGE_RATIO"] == "0.4"
+    assert environment["SUNPACK_NATIVE_MIN_AVAILABLE_MEMORY_RATIO"] == "0.1"
 
 
 def test_native_environment_does_not_freeze_worker_process_mode_at_startup():
@@ -570,9 +562,8 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
     assert handshake["sizing_mode"] == "dynamic"
     assert int(handshake["thread_capacity"]) == logical_processors
     assert int(handshake["nominal_cpu_budget"]) == logical_processors
-    assert float(handshake["observation_window_seconds"]) == 1.0
-    assert float(handshake["throughput_change_ratio"]) == 0.4
-    assert handshake["resource_diagnostics_enabled"] is False
+    assert int(handshake["memory_poll_interval_ms"]) == 1000
+    assert float(handshake["minimum_available_memory_ratio"]) == 0.1
 
 
 def test_compact_worker_manifest_is_parsed_into_native_storage():

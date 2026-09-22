@@ -13,7 +13,7 @@ import threading
 import time
 import zipfile
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
@@ -27,37 +27,12 @@ from sunpack.support.resources import get_sevenzip_bridge_worker_path
 SCENARIO = "extraction.worker-small-file-scheduling"
 
 
-ADMISSION_CASES: dict[str, dict[str, Any]] = {
-    "adaptive-baseline": {
-        "description": "Passive CPU-budget derating enabled.",
-        "blocker": "passive-budget-controller",
-        "adaptive_enabled": None,
-        "expected_max_active": None,
-    },
-    "fixed-capacity": {
-        "description": "Passive derating disabled; the configured CPU-credit budget stays fixed.",
-        "blocker": "none-fixed-capacity",
-        "adaptive_enabled": False,
-        "expected_max_active": None,
-    },
+ADMISSION_CASE = {
+    "name": "credit-budget",
+    "description": "Unified native CPU-credit scheduler.",
+    "blocker": "cpu-credit-budget",
+    "expected_max_active": None,
 }
-
-
-def _parse_admission_cases(value: str, adaptive_enabled: bool) -> list[dict[str, Any]]:
-    selected: list[dict[str, Any]] = []
-    for item in value.split(","):
-        name = item.strip()
-        if not name:
-            continue
-        if name not in ADMISSION_CASES:
-            raise ValueError(f"unknown admission case {name!r}; choose from {', '.join(ADMISSION_CASES)}")
-        case = dict(ADMISSION_CASES[name])
-        case["name"] = name
-        case["adaptive_enabled"] = adaptive_enabled if case["adaptive_enabled"] is None else case["adaptive_enabled"]
-        selected.append(case)
-    if not selected:
-        raise ValueError("at least one admission case is required")
-    return selected
 
 
 def _parse_capacities(value: str) -> list[int]:
@@ -141,14 +116,11 @@ def _run_batch(
     capacity: int,
     client_count: int,
     timeout_seconds: float,
-    sample_interval_ms: int,
     admission_case: dict[str, Any],
     label: str,
     submission_offsets_seconds: list[float] | None = None,
     idle_before_indices: dict[int, float] | None = None,
     worker_config_overrides: dict[str, Any] | None = None,
-    controller_event_hook: Callable[[dict[str, Any]], None] | None = None,
-    controller_event_poll_seconds: float = 0.01,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     jobs = int(corpus["jobs"])
     jobs_per_client = jobs // client_count
@@ -169,8 +141,6 @@ def _run_batch(
     started_at = time.perf_counter()
     worker_config = {
         "thread_capacity": capacity,
-        "adaptive_enabled": admission_case["adaptive_enabled"],
-        "sample_interval_ms": sample_interval_ms,
     }
     worker_config.update(worker_config_overrides or {})
     worker = _NativeWorkerProcess(
@@ -178,32 +148,6 @@ def _run_batch(
         None,
         worker_config,
     )
-    controller_hook_stop = threading.Event()
-    controller_hook_thread: threading.Thread | None = None
-    delivered_controller_events = 0
-
-    def drain_controller_events() -> None:
-        nonlocal delivered_controller_events
-        if controller_event_hook is None:
-            return
-        current = worker.controller_events()
-        pending = current[delivered_controller_events:]
-        delivered_controller_events = len(current)
-        for event in pending:
-            controller_event_hook(event)
-
-    if controller_event_hook is not None:
-        def poll_controller_events() -> None:
-            while not controller_hook_stop.wait(max(0.001, float(controller_event_poll_seconds))):
-                drain_controller_events()
-            drain_controller_events()
-
-        controller_hook_thread = threading.Thread(
-            target=poll_controller_events,
-            name=f"controller-hook-{label}",
-            daemon=True,
-        )
-        controller_hook_thread.start()
     worker_process = psutil.Process(worker.process.pid) if worker.process is not None else None
     sampler = ProcessSampler(interval_seconds=0.01)
     sampler.start()
@@ -314,11 +258,6 @@ def _run_batch(
                     raise RuntimeError(f"native worker exited with {jobs - len(completed)} incomplete jobs")
         finished_at = time.perf_counter()
     finally:
-        controller_hook_stop.set()
-        if controller_hook_thread is not None:
-            controller_hook_thread.join(timeout=1.0)
-        drain_controller_events()
-        controller_events = worker.controller_events()
         resource_after = process_counters(worker_process)
         sampler.stop()
         worker.close()
@@ -354,8 +293,6 @@ def _run_batch(
         finished_at=finished_at,
         admission_case=admission_case,
         resource_metrics=resource_metrics,
-        controller_events=controller_events,
-        sample_interval_ms=sample_interval_ms,
     )
     trace = {
         "label": label,
@@ -364,7 +301,6 @@ def _run_batch(
         "cpu_events": cpu_events,
         "results": results,
         "failures": failures,
-        "controller_events": controller_events,
         "submission_offsets_seconds": submission_offsets_seconds,
         "idle_before_indices": idle_before_indices,
         "worker_config_overrides": worker_config_overrides,
@@ -384,8 +320,6 @@ def _summarize_batch(
     finished_at: float,
     admission_case: dict[str, Any],
     resource_metrics: dict[str, Any],
-    controller_events: list[dict[str, Any]],
-    sample_interval_ms: int,
 ) -> dict[str, Any]:
     ordered_events = sorted(events, key=lambda event: (int(event.get("sequence", 0)), float(event["received_at"])))
     by_job: dict[str, dict[str, float]] = {}
@@ -434,52 +368,14 @@ def _summarize_batch(
     passed = sum(result.get("status") == "ok" for result in results.values())
     expected_jobs = len(submitted_at)
     expected_max_active = admission_case["expected_max_active"]
-    if expected_max_active is None and admission_case["name"] != "adaptive-baseline":
+    if expected_max_active is None:
         expected_max_active = capacity
-    first_enqueue_at = min(
-        (float(event["received_at"]) for event in ordered_events if event.get("event") == "job_queued"),
-        default=None,
-    )
-    lifecycle_decisions = {
-        "activity_started",
-        "activity_ended",
-        "segment_started",
-        "segment_interrupted",
-    }
-    non_empty_controller_events = [
-        event for event in controller_events
-        if str(event.get("decision") or "none") != "none"
-    ]
-    adjustment_events = [
-        event for event in non_empty_controller_events
-        if str(event.get("decision") or "none") not in lifecycle_decisions
-    ]
-    lifecycle_events = [
-        event for event in non_empty_controller_events
-        if str(event.get("decision") or "none") in lifecycle_decisions
-    ]
-    controller_offsets_ms = [
-        max(0.0, (float(event["received_at"]) - first_enqueue_at) * 1000.0)
-        for event in adjustment_events
-        if first_enqueue_at is not None and "received_at" in event
-    ]
-    controller_limits = [
-        int(event["active_limit"])
-        for event in controller_events
-        if event.get("active_limit") is not None
-    ]
-    controller_decisions = [
-        str(event.get("decision") or "none")
-        for event in adjustment_events
-        if event.get("decision")
-    ]
     return {
         "admission_case": admission_case["name"],
         "admission_blocker": admission_case["blocker"],
         "admission_description": admission_case["description"],
         "expected_max_active_jobs": expected_max_active,
         "capacity": capacity,
-        "sample_interval_ms": sample_interval_ms,
         "job_count": expected_jobs,
         "passed_jobs": passed,
         "failed_jobs": expected_jobs - passed,
@@ -498,31 +394,6 @@ def _summarize_batch(
         "service_p50_ms": _percentile(service_ms, 50),
         "service_p95_ms": _percentile(service_ms, 95),
         "admitted_jobs": len(admissions),
-        "controller_sample_count": len(controller_events),
-        "controller_adjustment_count": len(adjustment_events),
-        "controller_lifecycle_event_count": len(lifecycle_events),
-        "controller_activity_session_count": max(
-            (int(event.get("activity_session", 0) or 0) for event in controller_events),
-            default=0,
-        ),
-        "controller_saturated_segment_count": max(
-            (int(event.get("saturated_segment", 0) or 0) for event in controller_events),
-            default=0,
-        ),
-        "controller_warm_start_count": sum(
-            bool(event.get("warm_start_used"))
-            for event in controller_events
-            if str(event.get("decision") or "") == "activity_started"
-        ),
-        "controller_first_adjustment_after_enqueue_ms": min(controller_offsets_ms) if controller_offsets_ms else None,
-        "controller_last_adjustment_after_enqueue_ms": max(controller_offsets_ms) if controller_offsets_ms else None,
-        "controller_min_active_limit": min(controller_limits, default=None),
-        "controller_peak_active_limit": max(controller_limits, default=None),
-        "controller_final_active_limit": controller_limits[-1] if controller_limits else None,
-        "controller_decisions": controller_decisions,
-        "controller_throughput_modes": [
-            str(event.get("throughput_mode") or "none") for event in controller_events
-        ],
         **resource_metrics,
     }
 
@@ -538,9 +409,6 @@ def _aggregate(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "queue_latency_p95_ms",
         "service_p95_ms",
         "observed_peak_active_jobs",
-        "controller_adjustment_count",
-        "controller_first_adjustment_after_enqueue_ms",
-        "controller_peak_active_limit",
         "worker_cpu_core_utilization",
         "host_cpu_utilization",
         "worker_rss_peak_mib",
@@ -582,7 +450,7 @@ def _write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Benchmark native worker throughput control for many small ZIP jobs.")
+    parser = argparse.ArgumentParser(description="Benchmark native worker scheduling for many small ZIP jobs.")
     parser.add_argument("--jobs", type=int, default=256)
     parser.add_argument("--clients", type=int, default=4)
     parser.add_argument("--capacities", default="1,2,4,8", help="Comma-separated native worker thread capacities.")
@@ -591,25 +459,13 @@ def main() -> int:
     parser.add_argument("--files-per-archive", type=int, default=8)
     parser.add_argument("--file-size-bytes", type=int, default=8192)
     parser.add_argument("--timeout-seconds", type=float, default=120.0)
-    parser.add_argument(
-        "--sample-interval-ms",
-        type=int,
-        default=500,
-        help="Native adaptive-controller sample interval (100-5000 ms).",
-    )
-    parser.add_argument("--adaptive-enabled", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument(
-        "--admission-cases",
-        default=",".join(ADMISSION_CASES),
-        help="Comma-separated admission cases: " + ", ".join(ADMISSION_CASES),
-    )
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--keep-workdir", action="store_true")
     args = parser.parse_args()
     try:
         capacities = _parse_capacities(args.capacities)
-        admission_cases = _parse_admission_cases(args.admission_cases, bool(args.adaptive_enabled))
+        admission_cases = [dict(ADMISSION_CASE)]
     except ValueError as exc:
         parser.error(str(exc))
     if args.jobs < 1 or args.clients < 1 or args.jobs % args.clients:
@@ -618,8 +474,6 @@ def main() -> int:
         parser.error("runs, files per archive, and file size must be positive; warmups must be non-negative")
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
-    if not 100 <= args.sample_interval_ms <= 5000:
-        parser.error("--sample-interval-ms must be between 100 and 5000")
     try:
         worker_path = Path(get_sevenzip_bridge_worker_path()).resolve()
     except FileNotFoundError as exc:
@@ -649,13 +503,11 @@ def main() -> int:
                         capacity=capacity,
                         client_count=args.clients,
                         timeout_seconds=args.timeout_seconds,
-                        sample_interval_ms=args.sample_interval_ms,
                         admission_case=admission_case,
                         label=label,
                     )
                     if measured:
                         row["run"] = run - args.warmups
-                        row["adaptive_enabled"] = admission_case["adaptive_enabled"]
                         rows.append(row)
                         trace_path = workspace.write_result_json(f"traces/{label}.json", trace)
                         trace_paths.append(str(trace_path))
@@ -678,8 +530,6 @@ def main() -> int:
                 "warmups": args.warmups,
                 "files_per_archive": args.files_per_archive,
                 "file_size_bytes": args.file_size_bytes,
-                "adaptive_enabled": bool(args.adaptive_enabled),
-                "sample_interval_ms": args.sample_interval_ms,
             },
             "environment": {
                 "worker_path": str(worker_path),
