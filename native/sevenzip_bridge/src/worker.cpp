@@ -1368,7 +1368,9 @@ public:
     // Waits for the queue and all active jobs to finish; only used on the stdin EOF drain path, where the monitor and space gate must still be alive.
     void wait_for_pending_jobs_to_drain() noexcept {
         std::unique_lock<std::mutex> lock(mutex_);
-        condition_.wait(lock, [this] { return queue_.empty() && active_jobs_ == 0; });
+        drain_condition_.wait(
+            lock,
+            [this] { return queue_.empty() && active_jobs_ == 0; });
     }
 
     // cancel_pending_jobs: true (explicit shutdown) cancels every unfinished job, false (stdin EOF) drains first.
@@ -1750,7 +1752,9 @@ private:
                     const auto snapshot = memory_guard_.snapshot();
                     cpu_budget_.set_effective_capacity(
                         snapshot.effective_cpu_budget);
-                    condition_.notify_all();
+                    // Capacity increases already wake one admission waiter
+                    // through the CPU-budget callback; baton passing wakes any
+                    // additional jobs. Capacity reductions need no wakeup.
                     print_memory_guard_event(snapshot);
                 }
             }
@@ -1851,6 +1855,7 @@ private:
             }
             cpu_budget_.release(1);
             std::size_t remaining_jobs = 0;
+            bool drained = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 if (!job_id.empty()) {
@@ -1858,10 +1863,16 @@ private:
                 }
                 active_jobs_ = active_jobs_ > 0 ? active_jobs_ - 1 : 0;
                 remaining_jobs = active_jobs_;
+                drained = queue_.empty() && active_jobs_ == 0;
                 any_job_failed_ = any_job_failed_ || code != 0;
                 monitor_recheck_ = true;
             }
             // cpu_budget_.release(1) already wakes one admission waiter.
+            // Drain waiters use a separate condition variable so completing a
+            // short job never broadcasts to the entire worker pool.
+            if (drained) {
+                drain_condition_.notify_all();
+            }
             monitor_condition_.notify_one();
             print_active_event(job, "job_finished", remaining_jobs);
             try {
@@ -1883,6 +1894,7 @@ private:
     std::unordered_map<std::string, std::shared_ptr<JobControl>> cancel_tokens_;
     std::mutex mutex_;
     std::condition_variable condition_;
+    std::condition_variable drain_condition_;
     std::condition_variable monitor_condition_;
     const std::size_t worker_count_;
     const std::size_t queue_capacity_;
