@@ -3307,7 +3307,8 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 #ifndef Z7_ST
 Z7_COM7F_IMF(CDecoder::SetNumberOfThreads(UInt32 numThreads))
 {
-  _numThreads = numThreads == 0 ? 1 : numThreads;
+  if (!sunpack_cpu_current_job_context())
+    _numThreads = numThreads == 0 ? 1 : numThreads;
   return S_OK;
 }
 #endif
