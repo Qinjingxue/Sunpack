@@ -348,7 +348,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--disturbance-delay-seconds", type=float, default=1.0)
     parser.add_argument("--disturbance-seconds", type=float, default=10.0)
     parser.add_argument("--observation-window-seconds", type=float, default=1.0)
-    parser.add_argument("--throughput-change-ratio", type=float, default=0.20)
+    parser.add_argument("--throughput-change-ratio", type=float, default=0.40)
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--keep-workdir", action="store_true")
@@ -469,7 +469,7 @@ def main() -> int:
                     "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
                     "controller_implementation": {
                         "window": "1-second written-throughput observation by default",
-                        "threshold": "20% change from current stable baseline",
+                        "threshold": "40% change from saturated stable baseline",
                         "policy": "passive CPU-budget derating/restoration only",
                     },
                 },
