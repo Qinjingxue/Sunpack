@@ -6,6 +6,7 @@
 #include "../../../Windows/System.h"
 
 #include "../../Common/MethodProps.h"
+#include "internal/decoder_cpu_budget.h"
 
 namespace NArchive {
 
@@ -21,13 +22,26 @@ protected:
 #ifndef Z7_ST
       _numThreads_WasForced = false;
       UInt32 numThreads;
+      if (sunpack_cpu_current_job_context())
+      {
+        // In the persistent SunPack worker this value is only a compatibility
+        // hint for ICompressSetCoderMt. The shared CPU-credit broker is the
+        // sole resource authority.
+        numThreads = SUNPACK_CPU_MANAGED_THREAD_HINT;
 #ifdef _WIN32
-      NWindows::NSystem::CProcessAffinity aff;
-      numThreads = aff.Load_and_GetNumberOfThreads();
-      _numThreadGroups = aff.IsGroupMode ? aff.Groups.GroupSizes.Size() : 0;
+        _numThreadGroups = 0;
+#endif
+      }
+      else
+      {
+#ifdef _WIN32
+        NWindows::NSystem::CProcessAffinity aff;
+        numThreads = aff.Load_and_GetNumberOfThreads();
+        _numThreadGroups = aff.IsGroupMode ? aff.Groups.GroupSizes.Size() : 0;
 #else
-      numThreads = NWindows::NSystem::GetNumberOfProcessors();
+        numThreads = NWindows::NSystem::GetNumberOfProcessors();
 #endif // _WIN32
+      }
       _numProcessors = _numThreads = numThreads;
 #endif // Z7_ST
     }
