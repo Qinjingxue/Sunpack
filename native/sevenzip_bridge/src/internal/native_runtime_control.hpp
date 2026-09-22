@@ -851,7 +851,6 @@ namespace sunpack::sevenzip
                 up_failures_ = 0;
                 down_checked_for_failures_ = false;
                 descending_ = false;
-                ambiguous_up_steps_ = 0;
                 cruise_rounds_ = 0;
                 accepted_probe_ = true;
                 remember_confirmed_limit(best_limit_);
@@ -877,7 +876,6 @@ namespace sunpack::sevenzip
             // speculative concurrency, but do not move the confirmed baseline. A
             // later step must either accumulate a >= improvement_ratio gain versus
             // the same anchor or regress enough to roll the entire speculation back.
-            ++ambiguous_up_steps_;
             if (active_limit_ < max_active_jobs_)
             {
                 return launch_probe(1);
@@ -900,7 +898,6 @@ namespace sunpack::sevenzip
                 anchor_ = trial;
                 up_failures_ = 0;
                 down_checked_for_failures_ = false;
-                ambiguous_up_steps_ = 0;
                 cruise_rounds_ = 0;
                 accepted_probe_ = true;
                 remember_confirmed_limit(best_limit_);
@@ -918,7 +915,6 @@ namespace sunpack::sevenzip
             active_limit_ = best_limit_;
             down_checked_for_failures_ = true;
             descending_ = false;
-            ambiguous_up_steps_ = 0;
             phase_ = NativeControllerPhase::Cruise;
             observation_.clear();
             settle_remaining_seconds_ = settle_seconds_;
@@ -940,8 +936,6 @@ namespace sunpack::sevenzip
                 down_checked_for_failures_ = true;
                 descending_ = false;
             }
-
-            ambiguous_up_steps_ = 0;
             phase_ = NativeControllerPhase::Cruise;
             observation_.clear();
             settle_remaining_seconds_ = settle_seconds_;
@@ -1010,7 +1004,6 @@ namespace sunpack::sevenzip
             up_failures_ = 0;
             down_checked_for_failures_ = false;
             descending_ = false;
-            ambiguous_up_steps_ = 0;
             cruise_rounds_ = 0;
             settle_remaining_seconds_ = 0.0;
         }
@@ -1056,7 +1049,7 @@ namespace sunpack::sevenzip
         std::size_t up_failures_ = 0;
         bool down_checked_for_failures_ = false;
         bool descending_ = false;
-        std::size_t ambiguous_up_steps_ = 0;
+        std::size_t
         std::size_t cruise_rounds_ = 0;
         double settle_remaining_seconds_ = 0.0;
 
