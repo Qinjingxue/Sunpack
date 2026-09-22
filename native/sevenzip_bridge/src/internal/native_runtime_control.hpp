@@ -87,6 +87,7 @@ public:
         reference_bytes_per_second_ = 0.0;
         written_bytes_per_second_ = 0.0;
         reobserve_after_budget_change_ = false;
+        saturation_primed_ = false;
         decision_ = NativeControllerDecision::ActivityStarted;
         active_ = true;
         return true;
@@ -101,6 +102,7 @@ public:
         reference_bytes_per_second_ = 0.0;
         written_bytes_per_second_ = 0.0;
         reobserve_after_budget_change_ = false;
+        saturation_primed_ = false;
         decision_ = NativeControllerDecision::ActivityEnded;
         active_ = false;
         return true;
@@ -143,6 +145,20 @@ public:
         // are discarded so every learned window belongs to one exact budget.
         if (reserved_cpu_credits != effective_cpu_budget_)
         {
+            window_seconds_ = 0.0;
+            window_written_bytes_ = 0;
+            saturation_primed_ = false;
+            return false;
+        }
+
+        // The first sample that observes exact saturation only establishes the
+        // start boundary. Its elapsed interval may include time before the
+        // budget became full, so neither its duration nor byte delta belongs
+        // to the observation window. Only subsequent continuously saturated
+        // samples are accumulated.
+        if (!saturation_primed_)
+        {
+            saturation_primed_ = true;
             window_seconds_ = 0.0;
             window_written_bytes_ = 0;
             return false;
@@ -188,6 +204,7 @@ public:
                     : std::size_t{1};
             reobserve_after_budget_change_ = true;
             reference_bytes_per_second_ = 0.0;
+            saturation_primed_ = false;
             decision_ = NativeControllerDecision::BudgetReduced;
             return true;
         }
@@ -201,6 +218,7 @@ public:
                     effective_cpu_budget_ + budget_step_);
             reobserve_after_budget_change_ = true;
             reference_bytes_per_second_ = 0.0;
+            saturation_primed_ = false;
             decision_ = NativeControllerDecision::BudgetRestored;
             return true;
         }
@@ -257,6 +275,7 @@ private:
     bool counters_primed_ = false;
     bool active_ = false;
     bool reobserve_after_budget_change_ = false;
+    bool saturation_primed_ = false;
     double window_seconds_ = 0.0;
     std::uint64_t window_written_bytes_ = 0;
     double written_bytes_per_second_ = 0.0;
