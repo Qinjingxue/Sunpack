@@ -220,13 +220,13 @@ bool check_runtime_control_reduces_and_rebases_after_drop() {
     auto snapshot = controller.snapshot(4);
     if (snapshot.decision != NativeControllerDecision::BudgetReduced ||
         snapshot.effective_cpu_budget != 14 ||
-        snapshot.reference_bytes_per_second != 1000.0) {
+        snapshot.reference_bytes_per_second != 700.0) {
         return false;
     }
 
     observe_runtime(controller, runtime, counters, 700, 1.0);
     snapshot = controller.snapshot(4);
-    if (snapshot.decision != NativeControllerDecision::BaselineEstablished ||
+    if (snapshot.decision != NativeControllerDecision::None ||
         snapshot.effective_cpu_budget != 14 ||
         snapshot.reference_bytes_per_second != 700.0) {
         return false;
@@ -253,6 +253,7 @@ bool check_runtime_control_restores_budget_after_recovery() {
     const auto snapshot = controller.snapshot(4);
     return snapshot.decision == NativeControllerDecision::BudgetRestored &&
         snapshot.effective_cpu_budget == 16 &&
+        snapshot.reference_bytes_per_second == 910.0 &&
         snapshot.budget_step == 2;
 }
 
@@ -273,8 +274,24 @@ bool check_runtime_control_uses_core_eighth_step() {
     observe_runtime(controller, runtime, counters, 700, 1.0);
     observe_runtime(controller, runtime, counters, 400, 1.0);
     snapshot = controller.snapshot(8);
-    return snapshot.effective_cpu_budget == 24 &&
-        snapshot.decision == NativeControllerDecision::BudgetReduced;
+    if (snapshot.effective_cpu_budget != 24 ||
+        snapshot.decision != NativeControllerDecision::BudgetReduced ||
+        snapshot.reference_bytes_per_second != 400.0) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 520, 1.0);
+    snapshot = controller.snapshot(8);
+    if (snapshot.effective_cpu_budget != 28 ||
+        snapshot.decision != NativeControllerDecision::BudgetRestored) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 520, 1.0);
+    snapshot = controller.snapshot(8);
+    return snapshot.effective_cpu_budget == 32 &&
+        snapshot.decision == NativeControllerDecision::BudgetRestored &&
+        snapshot.reference_bytes_per_second == 520.0;
 }
 
 bool check_runtime_control_fixed_mode_only_observes() {
