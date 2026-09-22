@@ -32,6 +32,7 @@
 #include "internal/sevenzip_formats.hpp"
 #include "internal/sevenzip_sdk.hpp"
 #include "internal/native_runtime_control.hpp"
+#include "internal/native_cpu_budget.hpp"
 #include "internal/native_worker_sizing.hpp"
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
 #include "internal/worker_pipeline_timing.hpp"
@@ -1139,24 +1140,6 @@ bool configured_native_bool(const char* name, bool fallback) noexcept {
     return std::string(value) != "0" && std::string(value) != "false" && std::string(value) != "False";
 }
 
-sunpack::sevenzip::NativeExplorationStrategy configured_native_exploration_strategy() noexcept {
-    const char* value = std::getenv("SUNPACK_NATIVE_EXPLORATION_STRATEGY");
-    if (!value) {
-        return sunpack::sevenzip::NativeExplorationStrategy::Calibrated;
-    }
-    const std::string strategy(value);
-    if (strategy == "calibrated") {
-        return sunpack::sevenzip::NativeExplorationStrategy::Calibrated;
-    }
-    if (strategy == "full") {
-        return sunpack::sevenzip::NativeExplorationStrategy::Full;
-    }
-    if (strategy == "rapid") {
-        return sunpack::sevenzip::NativeExplorationStrategy::Rapid;
-    }
-    return sunpack::sevenzip::NativeExplorationStrategy::Calibrated;
-}
-
 std::size_t configured_native_size(
     const char* name,
     std::size_t fallback,
@@ -1219,8 +1202,6 @@ sunpack::sevenzip::NativeSizingOverrides configured_native_sizing_overrides() no
     sunpack::sevenzip::NativeSizingOverrides overrides;
     overrides.thread_capacity = configured_native_size(
         "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY", 0, 0, 32);
-    overrides.initial_active_jobs = configured_native_size(
-        "SUNPACK_NATIVE_INITIAL_ACTIVE_JOBS", 0, 0, 32);
     return overrides;
 }
 
@@ -1245,47 +1226,25 @@ bool apply_native_process_mode(const std::string& mode) noexcept {
 }
 
 sunpack::sevenzip::NativeRuntimeConfig configured_native_runtime_config(
-    const sunpack::sevenzip::NativeSizingPlan& sizing
+    const sunpack::sevenzip::NativeSizingPlan&
 ) noexcept {
     sunpack::sevenzip::NativeRuntimeConfig config;
-    config.adaptive_enabled = configured_native_bool("SUNPACK_NATIVE_ADAPTIVE_ENABLED", true);
+    config.adaptive_enabled = configured_native_bool(
+        "SUNPACK_NATIVE_ADAPTIVE_ENABLED", true);
     config.resource_diagnostics_enabled = configured_native_bool(
         "SUNPACK_NATIVE_RESOURCE_DIAGNOSTICS", false);
     config.measurement_diagnostics_enabled = configured_native_bool(
         "SUNPACK_NATIVE_MEASUREMENT_DIAGNOSTICS", false);
-    config.initial_active_jobs = sizing.initial_active_jobs;
-    config.exploration_strategy = configured_native_exploration_strategy();
-    if (config.exploration_strategy == sunpack::sevenzip::NativeExplorationStrategy::Full) {
-        config.initial_active_jobs = sizing.thread_capacity;
-    }
-    config.minimum_window_seconds = configured_native_double(
-        "SUNPACK_NATIVE_MINIMUM_WINDOW_SECONDS", config.minimum_window_seconds, 0.05, 60.0);
-    config.maximum_window_seconds = configured_native_double(
-        "SUNPACK_NATIVE_MAXIMUM_WINDOW_SECONDS", config.maximum_window_seconds, 0.05, 60.0);
-    config.settle_seconds = configured_native_double(
-        "SUNPACK_NATIVE_SETTLE_SECONDS", config.settle_seconds, 0.0, 10.0);
-    config.large_window_bytes = configured_native_size(
-        "SUNPACK_NATIVE_LARGE_WINDOW_BYTES", config.large_window_bytes);
-    config.small_window_jobs = configured_native_size(
-        "SUNPACK_NATIVE_SMALL_WINDOW_JOBS", config.small_window_jobs);
-    config.small_window_files = configured_native_size(
-        "SUNPACK_NATIVE_SMALL_WINDOW_FILES", config.small_window_files);
-    config.improvement_ratio = configured_native_double(
-        "SUNPACK_NATIVE_IMPROVEMENT_RATIO", config.improvement_ratio, 1.0, 2.0);
-    config.regression_ratio = configured_native_double(
-        "SUNPACK_NATIVE_REGRESSION_RATIO", config.regression_ratio, 0.01, 1.0);
-    config.aggressive_step = configured_native_size(
-        "SUNPACK_NATIVE_AGGRESSIVE_STEP", config.aggressive_step, 1, 32);
-    config.warm_start_decay_seconds = configured_native_double(
-        "SUNPACK_NATIVE_WARM_START_DECAY_SECONDS",
-        config.warm_start_decay_seconds,
-        0.0,
-        86400.0);
-    config.warm_start_confirmations = configured_native_size(
-        "SUNPACK_NATIVE_WARM_START_CONFIRMATIONS",
-        config.warm_start_confirmations,
-        1,
-        64);
+    config.observation_window_seconds = configured_native_double(
+        "SUNPACK_NATIVE_OBSERVATION_WINDOW_SECONDS",
+        config.observation_window_seconds,
+        0.1,
+        60.0);
+    config.throughput_change_ratio = configured_native_double(
+        "SUNPACK_NATIVE_THROUGHPUT_CHANGE_RATIO",
+        config.throughput_change_ratio,
+        0.01,
+        0.95);
     return config;
 }
 
@@ -1310,6 +1269,12 @@ public:
               space_change_sink_)),
           worker_count_((std::max)(std::size_t{1}, sizing.thread_capacity)),
           queue_capacity_(configured_native_queue_capacity()),
+          cpu_budget_(
+              worker_count_,
+              [this] {
+                  condition_.notify_all();
+                  controller_condition_.notify_one();
+              }),
           runtime_controller_(
               worker_count_,
               std::move(runtime_config)) {
@@ -1497,7 +1462,7 @@ private:
     }
 
     std::size_t select_job_locked() const noexcept {
-        if (!runtime_controller_.can_admit(active_jobs_)) {
+        if (!cpu_budget_.can_acquire_base()) {
             return queue_.size();
         }
         for (std::size_t index = 0; index < queue_.size(); ++index) {
