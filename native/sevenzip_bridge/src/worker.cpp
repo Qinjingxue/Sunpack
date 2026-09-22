@@ -1263,8 +1263,10 @@ public:
           cpu_budget_(
               worker_count_,
               [this] {
-                  condition_.notify_all();
-                  monitor_condition_.notify_one();
+                  // A newly available CPU credit can admit at most one new
+                  // base job immediately. Waking every worker only creates
+                  // scheduler and mutex contention on short jobs.
+                  condition_.notify_one();
               }),
           memory_guard_(
               worker_count_,
@@ -1785,6 +1787,7 @@ private:
         for (;;) {
             Job job;
             std::size_t admitted_jobs = 0;
+            bool wake_next_job = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 condition_.wait(lock, [this] {
@@ -1805,9 +1808,16 @@ private:
                 queue_.erase(iterator);
                 active_jobs_ += 1;
                 admitted_jobs = active_jobs_;
+                wake_next_job =
+                    !queue_.empty() && cpu_budget_.can_acquire_base();
                 // Admission, not submission, is the authoritative point at
                 // which memory polling becomes active.
                 monitor_recheck_ = true;
+            }
+            // Hand admission forward one worker at a time when multiple
+            // credits are available, avoiding a notify-all thundering herd.
+            if (wake_next_job) {
+                condition_.notify_one();
             }
             monitor_condition_.notify_one();
             print_active_event(job, "job_admitted", admitted_jobs);
@@ -1851,7 +1861,7 @@ private:
                 any_job_failed_ = any_job_failed_ || code != 0;
                 monitor_recheck_ = true;
             }
-            condition_.notify_all();
+            // cpu_budget_.release(1) already wakes one admission waiter.
             monitor_condition_.notify_one();
             print_active_event(job, "job_finished", remaining_jobs);
             try {
