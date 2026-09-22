@@ -1,5 +1,7 @@
 #pragma once
 
+#define SUNPACK_CPU_MANAGED_THREAD_HINT 32u
+
 #ifdef __cplusplus
 extern "C" {
 #endif
