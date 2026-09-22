@@ -109,7 +109,6 @@ public:
     bool observe(
         const NativeRuntimeSample &sample,
         const NativeThroughputCounters &counters,
-        std::size_t active_jobs,
         double elapsed_seconds) noexcept
     {
         decision_ = NativeControllerDecision::None;
@@ -138,7 +137,6 @@ public:
 
         window_seconds_ += elapsed_seconds;
         window_written_bytes_ += written_delta;
-        last_active_jobs_ = active_jobs;
 
         if (window_seconds_ < observation_window_seconds_)
             return false;
@@ -249,7 +247,6 @@ private:
     double written_bytes_per_second_ = 0.0;
     double reference_bytes_per_second_ = 0.0;
     std::uint64_t measurement_sequence_ = 0;
-    std::size_t last_active_jobs_ = 0;
     bool cpu_percent_valid_ = false;
     double cpu_percent_ = 0.0;
 };
