@@ -161,6 +161,10 @@ typedef struct CMtDec_
   unsigned numStartedThreads_Limit;
   unsigned numStartedThreads;
 
+  /* SunPack worker CPU-credit context. Null keeps upstream standalone behavior. */
+  void *sunpackCpuContext;
+  unsigned sunpackCpuExtraCredits;
+
   Byte *crossBlock;
   size_t crossStart;
   size_t crossEnd;
