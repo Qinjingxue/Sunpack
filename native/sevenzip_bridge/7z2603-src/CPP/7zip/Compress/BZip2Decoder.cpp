@@ -823,14 +823,6 @@ Byte * CSpecState::Decode(Byte *data, size_t size) throw()
 
 #ifndef Z7_ST
 
-static unsigned GetParallelBlockWorkerCount(UInt32 numThreads)
-{
-  if (numThreads < 4)
-    return 0;
-  return (unsigned)std::min<UInt32>(numThreads, 8);
-}
-
-
 struct CParallelOutputChunk
 {
   std::unique_ptr<Byte[]> Data;
@@ -1465,17 +1457,12 @@ HRESULT CDecoder::DecodeStreams(ICompressProgressInfo *progress)
 
 HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 {
-  const unsigned requestedWorkers = GetParallelBlockWorkerCount(NumThreads);
-  if (requestedWorkers == 0)
-    return DecodeStreams(progress);
-
   void *cpuContext = sunpack_cpu_current_job_context();
-  unsigned numWorkers = requestedWorkers;
+  unsigned numWorkers = 0;
   if (cpuContext)
-    numWorkers = sunpack_cpu_acquire_extra_for_context(
-        cpuContext,
-        requestedWorkers,
-        (std::min)(requestedWorkers, 4u));
+    numWorkers = sunpack_cpu_acquire_all_available_for_context(cpuContext);
+  else if (NumThreads > 1)
+    numWorkers = NumThreads - 1;
   if (numWorkers == 0)
     return DecodeStreams(progress);
 
@@ -1732,7 +1719,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 
   #ifndef Z7_ST
   const bool useParallelBlocks =
-      GetParallelBlockWorkerCount(NumThreads) != 0 &&
+      (sunpack_cpu_current_job_context() || NumThreads > 1) &&
       !_outSizeDefined &&
       Base.DecodeAllStreams;
   #else
@@ -1987,7 +1974,7 @@ void CDecoder::RunScout()
 Z7_COM7F_IMF(CDecoder::SetNumberOfThreads(UInt32 numThreads))
 {
   NumThreads = numThreads == 0 ? 1 : numThreads;
-  MtMode = (NumThreads > 1);
+  MtMode = sunpack_cpu_current_job_context() != NULL || NumThreads > 1;
 
   #ifndef BZIP2_BYTE_MODE
   MtMode = false;
