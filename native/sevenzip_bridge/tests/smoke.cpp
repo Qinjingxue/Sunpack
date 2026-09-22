@@ -204,6 +204,12 @@ bool check_runtime_control_establishes_one_second_baseline() {
 
     observe_runtime(controller, runtime, counters, 500, 0.5, 16);
     snapshot = controller.snapshot(16);
+    if (snapshot.measurement_sequence != 0) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
+    snapshot = controller.snapshot(16);
     return snapshot.measurement_sequence == 1 &&
         snapshot.decision == NativeControllerDecision::BaselineEstablished &&
         snapshot.nominal_cpu_budget == 16 &&
@@ -235,6 +241,7 @@ bool check_runtime_control_ignores_unsaturated_windows() {
     }
 
     observe_runtime(controller, runtime, counters, 500, 0.5, 16);
+    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
     snapshot = controller.snapshot(16);
     return snapshot.measurement_sequence == 1 &&
         snapshot.decision == NativeControllerDecision::BaselineEstablished &&
@@ -247,6 +254,7 @@ bool check_runtime_control_requires_forty_percent_change() {
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
 
     observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
     observe_runtime(controller, runtime, counters, 650, 1.0, 16);
@@ -269,6 +277,7 @@ bool check_runtime_control_reobserves_after_budget_change() {
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
 
     observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
     observe_runtime(controller, runtime, counters, 500, 1.0, 16);
@@ -286,6 +295,12 @@ bool check_runtime_control_reobserves_after_budget_change() {
         return false;
     }
 
+    observe_runtime(controller, runtime, counters, 0, 0.1, 14);
+    snapshot = controller.snapshot(14);
+    if (snapshot.measurement_sequence != 2) {
+        return false;
+    }
+
     observe_runtime(controller, runtime, counters, 500, 1.0, 14);
     snapshot = controller.snapshot(14);
     return snapshot.measurement_sequence == 3 &&
@@ -300,9 +315,11 @@ bool check_runtime_control_restores_after_recovery() {
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
 
     observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
     observe_runtime(controller, runtime, counters, 500, 1.0, 16);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 14);
     observe_runtime(controller, runtime, counters, 500, 1.0, 14);
     observe_runtime(controller, runtime, counters, 710, 1.0, 14);
     auto snapshot = controller.snapshot(14);
@@ -312,6 +329,7 @@ bool check_runtime_control_restores_after_recovery() {
         return false;
     }
 
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
     observe_runtime(controller, runtime, counters, 710, 1.0, 16);
     snapshot = controller.snapshot(16);
     return snapshot.decision == NativeControllerDecision::BaselineEstablished &&
@@ -325,6 +343,7 @@ bool check_runtime_control_uses_core_eighth_step() {
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 32);
 
     observe_runtime(controller, runtime, counters, 1000, 1.0, 32);
     observe_runtime(controller, runtime, counters, 500, 1.0, 32);
@@ -335,6 +354,7 @@ bool check_runtime_control_uses_core_eighth_step() {
         return false;
     }
 
+    observe_runtime(controller, runtime, counters, 0, 0.1, 28);
     observe_runtime(controller, runtime, counters, 500, 1.0, 28);
     snapshot = controller.snapshot(28);
     if (snapshot.decision != NativeControllerDecision::BaselineEstablished ||
@@ -358,6 +378,7 @@ bool check_runtime_control_fixed_mode_only_observes_when_saturated() {
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 8);
 
     observe_runtime(controller, runtime, counters, 1000, 1.0, 8);
     observe_runtime(controller, runtime, counters, 300, 1.0, 7);
@@ -382,6 +403,7 @@ bool check_runtime_control_activity_reset_restores_nominal_budget() {
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
     controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
     observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
     observe_runtime(controller, runtime, counters, 500, 1.0, 16);
     if (controller.snapshot(16).effective_cpu_budget != 14) {
