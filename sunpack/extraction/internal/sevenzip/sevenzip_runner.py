@@ -1030,6 +1030,9 @@ class SevenZipRunner:
                     progress_events.append(value)
                     self._emit_progress(task, value)
                     return False
+                if value and value.get("type") == "native_cpu":
+                    self._emit_native_event(task, value)
+                    return False
                 if value and value.get("type") == "native_event":
                     self._emit_native_event(task, value)
                     if value.get("event") != "job_finished" or pending_result is None:
@@ -1175,6 +1178,9 @@ class SevenZipRunner:
                 if payload_value and payload_value.get("type") == "progress":
                     progress_events.append(payload_value)
                     self._emit_progress(task, payload_value)
+                    return False
+                if payload_value and payload_value.get("type") == "native_cpu":
+                    self._emit_native_event(task, payload_value)
                     return False
                 if payload_value and payload_value.get("type") == "native_event":
                     self._emit_native_event(task, payload_value)
