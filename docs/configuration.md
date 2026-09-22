@@ -188,7 +188,7 @@ Runtime and worker parameters live under `performance`. Defaults are:
 | `worker.adaptive_enabled` | `true` | Whether the passive throughput controller may derate or restore CPU credits after a large external throughput change. |
 | `worker.resource_diagnostics_enabled` | `false` | Whether to sample CPU diagnostics; diagnostics do not drive CPU-credit decisions. |
 | `worker.observation_window_seconds` | `1.0` | Passive throughput observation window in seconds. |
-| `worker.throughput_change_ratio` | `0.20` | Relative throughput change from the current baseline that triggers a CPU-budget adjustment. |
+| `worker.throughput_change_ratio` | `0.40` | Relative throughput change from the current baseline that triggers a CPU-budget adjustment. |
 | `worker.max_queue_jobs` | `4096` | Upper limit of the native job queue. |
 | `worker.priority_aging_quantum` | `32` | Priority aging step. |
 | `worker.backpressure_retries` | `120` | Number of retries on queue backpressure. |
@@ -200,7 +200,7 @@ Runtime and worker parameters live under `performance`. Defaults are:
 
 The native worker uses CPU credits as the single extraction-concurrency budget. By default the nominal budget equals the logical processor count and every admitted archive job reserves one base credit; formats have no fixed CPU weights. A bundled 7-Zip decoder requests extra credits from the same budget only immediately before it actually creates additional parallel execution threads. If credits are unavailable, it uses fewer workers or falls back to a serial path, so outer jobs and inner decoders no longer form independent concurrency layers.
 
-The throughput controller no longer searches for an optimum. It only reacts passively to large external throughput changes using actual written throughput: by default one observation is formed every 1 second; a drop of at least 20% from the current stable baseline reduces the effective CPU budget by `max(1, logical_processors / 8)` and immediately makes that low-throughput window the stable baseline for the new tier. A later increase of at least 20% is treated as environmental recovery and restores the same number of credits each observation while the recovered level is sustained, capped at the nominal budget. If recovery falls back into the stable band, restoration stops at that tier and the observed rate becomes the new baseline. Stable fluctuations otherwise do not change the budget.
+The throughput controller no longer searches for an optimum. It observes written throughput only while the CPU-credit budget is exactly saturated (`reserved_cpu_credits == effective_cpu_budget`). Under-filled intervals can reflect too few runnable jobs, while over-filled intervals occur only during the non-preemptive transition after a derate; both invalidate the current partial window. The default observation window is 1 second. A drop of at least 40% from the current stable baseline reduces the effective CPU budget by `max(1, logical_processors / 8)`; an increase of at least 40% restores the same step, capped at the nominal budget. After every budget change, the old baseline is discarded and a fresh baseline is established only after the new budget is again exactly saturated for a complete observation window.
 
 ## watch
 
