@@ -557,7 +557,7 @@ def main() -> int:
                 "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
                 "controller_implementation": {
                         "window": "1-second written-throughput observation by default",
-                        "threshold": "20% change from current stable baseline",
+                        "threshold": "40% change from saturated stable baseline",
                         "policy": "passive CPU-budget derating/restoration only",
                     },
             },
