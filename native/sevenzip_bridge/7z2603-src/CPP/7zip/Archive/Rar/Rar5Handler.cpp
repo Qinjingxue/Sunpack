@@ -1,6 +1,6 @@
 // Rar5Handler.cpp
-// Modified for SunPack on 2026-09-20: forward RAR5 "mt" settings to the
-// decoder while preserving the upstream archive/volume/extraction machinery.
+// Modified for SunPack: preserve upstream archive/volume/extraction machinery
+// while delegating worker decoder concurrency exclusively to the CPU-credit broker.
 
 #include "StdAfx.h"
 
