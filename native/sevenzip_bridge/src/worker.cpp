@@ -1505,18 +1505,6 @@ private:
             active_jobs);
     }
 
-    static const char* controller_phase_name(
-        sunpack::sevenzip::NativeControllerPhase phase
-    ) noexcept {
-        using sunpack::sevenzip::NativeControllerPhase;
-        switch (phase) {
-        case NativeControllerPhase::Baseline: return "baseline";
-        case NativeControllerPhase::Probe: return "probe";
-        case NativeControllerPhase::Cruise: return "cruise";
-        }
-        return "baseline";
-    }
-
     static const char* controller_decision_name(
         sunpack::sevenzip::NativeControllerDecision decision
     ) noexcept {
@@ -1525,118 +1513,82 @@ private:
         case NativeControllerDecision::None: return "none";
         case NativeControllerDecision::ActivityStarted: return "activity_started";
         case NativeControllerDecision::ActivityEnded: return "activity_ended";
-        case NativeControllerDecision::SegmentStarted: return "segment_started";
-        case NativeControllerDecision::SegmentInterrupted: return "segment_interrupted";
-        case NativeControllerDecision::BaselineReady: return "baseline_ready";
-        case NativeControllerDecision::ProbeUp: return "probe_up";
-        case NativeControllerDecision::ProbeDown: return "probe_down";
-        case NativeControllerDecision::Accepted: return "accepted";
-        case NativeControllerDecision::RolledBack: return "rolled_back";
-        case NativeControllerDecision::Cruising: return "cruising";
+        case NativeControllerDecision::BaselineEstablished: return "baseline_established";
+        case NativeControllerDecision::BudgetReduced: return "budget_reduced";
+        case NativeControllerDecision::BudgetRestored: return "budget_restored";
         }
         return "none";
     }
 
-    static const char* controller_load_state_name(
-        sunpack::sevenzip::NativeLoadState state
-    ) noexcept {
-        using sunpack::sevenzip::NativeLoadState;
-        switch (state) {
-        case NativeLoadState::Idle: return "idle";
-        case NativeLoadState::Unsaturated: return "unsaturated";
-        case NativeLoadState::Saturated: return "saturated";
+    void print_job_cpu_event(
+        const std::string& job_id,
+        const sunpack::sevenzip::NativeCpuJobSnapshot& job_cpu
+    ) const noexcept {
+        if (job_id.empty()) {
+            return;
         }
-        return "idle";
+        const auto budget = cpu_budget_.snapshot();
+        print_json_line(
+            "{\"type\":\"native_cpu\",\"job_id\":\"" + json_escape(job_id) +
+            "\",\"event\":\"decoder_parallelism\""
+            ",\"current_decoder_extra_credits\":" + std::to_string(job_cpu.current_extra_credits) +
+            ",\"peak_decoder_extra_credits\":" + std::to_string(job_cpu.peak_extra_credits) +
+            ",\"total_decoder_extra_credits_granted\":" + std::to_string(job_cpu.total_extra_credits_granted) +
+            ",\"reserved_cpu_credits\":" + std::to_string(budget.reserved_credits) +
+            ",\"effective_cpu_budget\":" + std::to_string(budget.effective_capacity) +
+            ",\"nominal_cpu_budget\":" + std::to_string(budget.nominal_capacity) +
+            "}");
     }
 
-    static const char* throughput_mode_name(
-        sunpack::sevenzip::NativeThroughputMode mode
-    ) noexcept {
-        using sunpack::sevenzip::NativeThroughputMode;
-        switch (mode) {
-        case NativeThroughputMode::None: return "none";
-        case NativeThroughputMode::Bytes: return "bytes";
-        case NativeThroughputMode::Jobs: return "jobs";
-        case NativeThroughputMode::Files: return "files";
-        }
-        return "none";
-    }
-
-    static void print_controller_event(
+    void print_controller_event(
         const sunpack::sevenzip::NativeRuntimeSnapshot& snapshot,
         std::size_t queued_jobs,
         unsigned sampled_interval_ms,
         unsigned next_interval_ms,
         std::uint64_t discarded_write_bytes = 0,
         bool writer_idle = true
-    ) noexcept {
+    ) const noexcept {
+        const auto budget = cpu_budget_.snapshot();
         print_json_line(
             "{\"type\":\"native_controller\",\"queued_jobs\":" + std::to_string(queued_jobs) +
-            ",\"active_limit\":" + std::to_string(snapshot.active_limit) +
             ",\"active_jobs\":" + std::to_string(snapshot.active_jobs) +
-            ",\"load_state\":\"" + controller_load_state_name(snapshot.load_state) + "\"" +
-            ",\"phase\":\"" + controller_phase_name(snapshot.phase) + "\"" +
             ",\"decision\":\"" + controller_decision_name(snapshot.decision) + "\"" +
-            ",\"throughput_mode\":\"" + throughput_mode_name(snapshot.throughput_mode) + "\"" +
+            ",\"nominal_cpu_budget\":" + std::to_string(snapshot.nominal_cpu_budget) +
+            ",\"effective_cpu_budget\":" + std::to_string(snapshot.effective_cpu_budget) +
+            ",\"budget_step\":" + std::to_string(snapshot.budget_step) +
+            ",\"reserved_cpu_credits\":" + std::to_string(budget.reserved_credits) +
             ",\"written_bytes_per_second\":" + std::to_string(snapshot.written_bytes_per_second) +
-            ",\"completed_jobs_per_second\":" + std::to_string(snapshot.completed_jobs_per_second) +
-            ",\"completed_files_per_second\":" + std::to_string(snapshot.completed_files_per_second) +
-            ",\"pending_write_bytes\":" + std::to_string(snapshot.pending_write_bytes) +
+            ",\"reference_bytes_per_second\":" + std::to_string(snapshot.reference_bytes_per_second) +
+            ",\"observation_window_seconds\":" + std::to_string(snapshot.observation_window_seconds) +
             ",\"discarded_write_bytes\":" + std::to_string(discarded_write_bytes) +
             ",\"writer_idle\":" + std::string(writer_idle ? "true" : "false") +
-            ",\"activity_session\":" + std::to_string(snapshot.activity_session) +
-            ",\"saturated_segment\":" + std::to_string(snapshot.saturated_segment) +
-            ",\"warm_start_used\":" + std::string(snapshot.warm_start_used ? "true" : "false") +
-            ",\"accepted_probe\":" + std::string(snapshot.accepted_probe ? "true" : "false") +
-            ",\"probe_failures\":" + std::to_string(snapshot.probe_failures) +
-            ",\"observation_target_windows\":" + std::to_string(snapshot.observation_target_windows) +
-            ",\"probe_direction\":" + std::to_string(snapshot.probe_direction) +
             ",\"resource_diagnostics_enabled\":" +
                 std::string(snapshot.resource_diagnostics_enabled ? "true" : "false") +
             ",\"cpu_percent_valid\":" + std::string(snapshot.cpu_percent_valid ? "true" : "false") +
             ",\"cpu_percent\":" + std::to_string(snapshot.cpu_percent) +
-            ",\"io_read_bytes_per_second\":" + std::to_string(snapshot.io_read_bytes_per_second) +
-            ",\"io_write_bytes_per_second\":" + std::to_string(snapshot.io_write_bytes_per_second) +
             ",\"sampled_interval_ms\":" + std::to_string(sampled_interval_ms) +
             ",\"next_sample_interval_ms\":" + std::to_string(next_interval_ms) + "}");
     }
 
-    static void print_controller_measurement_event(
+    void print_controller_measurement_event(
         const sunpack::sevenzip::NativeRuntimeSnapshot& snapshot,
         std::size_t queued_jobs,
         unsigned sampled_interval_ms,
-        std::uint64_t discarded_write_bytes = 0,
-        std::uint64_t writer_pending_bytes = 0,
-        std::uint64_t accepted_bytes_total = 0,
-        std::uint64_t written_bytes_total = 0,
-        std::uint64_t completed_jobs_total = 0,
-        std::uint64_t completed_files_total = 0,
-        bool writer_idle = true
-    ) noexcept {
+        std::uint64_t pending_write_bytes,
+        bool writer_idle
+    ) const noexcept {
+        const auto budget = cpu_budget_.snapshot();
         print_json_line(
-            "{\"type\":\"native_controller\",\"event\":\"measurement\"" +
-            std::string(",\"measurement_sequence\":") + std::to_string(snapshot.measurement_sequence) +
+            "{\"type\":\"native_controller\",\"event\":\"measurement\""
+            ",\"measurement_sequence\":" + std::to_string(snapshot.measurement_sequence) +
             ",\"queued_jobs\":" + std::to_string(queued_jobs) +
-            ",\"active_limit\":" + std::to_string(snapshot.active_limit) +
             ",\"active_jobs\":" + std::to_string(snapshot.active_jobs) +
-            ",\"phase\":\"" + controller_phase_name(snapshot.phase) + "\"" +
-            ",\"load_state\":\"" + controller_load_state_name(snapshot.load_state) + "\"" +
-            ",\"mode\":\"" + throughput_mode_name(snapshot.measurement_mode) + "\"" +
-            ",\"window_seconds\":" + std::to_string(snapshot.measurement_window_seconds) +
-            ",\"accepted_bytes\":" + std::to_string(snapshot.measurement_accepted_bytes) +
-            ",\"written_bytes\":" + std::to_string(snapshot.measurement_written_bytes) +
-            ",\"completed_jobs\":" + std::to_string(snapshot.measurement_completed_jobs) +
-            ",\"completed_files\":" + std::to_string(snapshot.measurement_completed_files) +
-            ",\"bytes_per_second\":" + std::to_string(snapshot.measurement_bytes_per_second) +
-            ",\"jobs_per_second\":" + std::to_string(snapshot.measurement_jobs_per_second) +
-            ",\"files_per_second\":" + std::to_string(snapshot.measurement_files_per_second) +
-            ",\"pending_write_bytes\":" + std::to_string(writer_pending_bytes) +
-            ",\"controller_pending_write_bytes\":" + std::to_string(snapshot.pending_write_bytes) +
-            ",\"counter_accepted_bytes\":" + std::to_string(accepted_bytes_total) +
-            ",\"counter_written_bytes\":" + std::to_string(written_bytes_total) +
-            ",\"counter_completed_jobs\":" + std::to_string(completed_jobs_total) +
-            ",\"counter_completed_files\":" + std::to_string(completed_files_total) +
-            ",\"discarded_write_bytes\":" + std::to_string(discarded_write_bytes) +
+            ",\"effective_cpu_budget\":" + std::to_string(snapshot.effective_cpu_budget) +
+            ",\"reserved_cpu_credits\":" + std::to_string(budget.reserved_credits) +
+            ",\"window_seconds\":" + std::to_string(snapshot.observation_window_seconds) +
+            ",\"bytes_per_second\":" + std::to_string(snapshot.written_bytes_per_second) +
+            ",\"reference_bytes_per_second\":" + std::to_string(snapshot.reference_bytes_per_second) +
+            ",\"pending_write_bytes\":" + std::to_string(pending_write_bytes) +
             ",\"writer_idle\":" + std::string(writer_idle ? "true" : "false") +
             ",\"sampled_interval_ms\":" + std::to_string(sampled_interval_ms) + "}");
     }
@@ -1763,10 +1715,6 @@ private:
         switch (transition.kind) {
             case Kind::Blocked:
             case Kind::Resumed:
-                // Only a real volume writability change advances the generation; register_job() catch-up notifications are Blocked too but are not a discontinuity.
-                if (transition.discontinuity) {
-                    space_epoch_.fetch_add(1, std::memory_order_acq_rel);
-                }
                 if (transition.kind == Kind::Blocked) {
                     // The only driver that starts sampling a blocked volume; without it a tick takes no registry lock.
                     space_monitor_->note_blocked();
@@ -1830,13 +1778,6 @@ private:
             has_system_cpu_sample_ = true;
         }
 
-        IO_COUNTERS io_counters{};
-        if (include_resource_diagnostics &&
-            GetProcessIoCounters(GetCurrentProcess(), &io_counters)) {
-            sample.io_read_bytes = io_counters.ReadTransferCount;
-            sample.io_write_bytes = io_counters.WriteTransferCount;
-            sample.io_counters_valid = true;
-        }
 #endif
         return sample;
     }
@@ -1850,36 +1791,24 @@ private:
 #endif
     }
 
-    unsigned controller_interval_ms(
-        const sunpack::sevenzip::NativeRuntimeSnapshot& snapshot,
-        std::size_t queued_jobs
-    ) const noexcept {
+    unsigned controller_interval_ms(bool active) const noexcept {
         const unsigned configured = native_sample_interval_ms();
-        if (queued_jobs == 0) {
-            return (std::min)(5000U, (std::max)(1000U, configured));
-        }
-        if (queued_jobs > (std::max)(std::size_t{1}, snapshot.active_limit) * 2 &&
-            snapshot.active_limit < worker_count_) {
-            return 100;
-        }
-        return (std::min)(configured, 250U);
+        return active ? configured : (std::min)(5000U, (std::max)(1000U, configured));
     }
 
     void controller_loop() noexcept {
         constexpr unsigned minimum_sample_interval_ms = 100;
         unsigned next_interval_ms = native_sample_interval_ms();
         auto last_sample_at = std::chrono::steady_clock::now();
-        auto idle_since = last_sample_at;
         bool monitor_parked = true;
         std::uint64_t printed_measurement_sequence = 0;
+
         while (true) {
             std::unique_lock<std::mutex> wait_lock(mutex_);
             if (monitor_parked) {
 #ifdef _WIN32
                 std::optional<std::chrono::steady_clock::time_point> parked_deadline;
                 const auto deadline_now = std::chrono::steady_clock::now();
-                // Normal idle has no timeout.  Sampling is armed only for the
-                // full-disk recovery path, and writer reaping has an exact deadline.
                 if (space_monitor_->sampling() &&
                     writer_config_.space_poll_interval > std::chrono::milliseconds::zero()) {
                     parked_deadline = deadline_now + writer_config_.space_poll_interval;
@@ -1891,8 +1820,7 @@ private:
                 }
                 if (parked_deadline) {
                     controller_condition_.wait_until(
-                        wait_lock,
-                        *parked_deadline,
+                        wait_lock, *parked_deadline,
                         [this] { return stopping_ || controller_recheck_; });
                 } else {
                     controller_condition_.wait(
@@ -1915,10 +1843,8 @@ private:
             }
             controller_recheck_ = false;
             const auto now = std::chrono::steady_clock::now();
-            // reap and space monitor run outside the executor mutex_: taking it would invert the executor -> registry -> gate lock order against gate -> executor callbacks.
             wait_lock.unlock();
 #ifdef _WIN32
-            // Driven from this thread: the parked path above already wakes on the earliest reclaim deadline.
             for (const auto& volume : writer_registry_->reap_idle()) {
                 print_writer_facility_event("writer_facility_reaped", volume);
             }
@@ -1929,62 +1855,7 @@ private:
             if (monitor_parked && queue_.empty() && active_jobs_ == 0) {
                 continue;
             }
-            if (monitor_parked) {
-                sunpack::sevenzip::NativeThroughputCounters counters;
-                std::uint64_t discarded_write_bytes = 0;
-                bool writer_idle = true;
-#ifdef _WIN32
-                {
-                    const auto metrics = writer_registry_->snapshot();
-                    counters.accepted_bytes = metrics.meters.accepted_bytes;
-                    counters.written_bytes = metrics.meters.written_bytes;
-                    counters.completed_files = metrics.meters.completed_files;
-                    counters.completed_jobs = metrics.meters.completed_jobs;
-                    discarded_write_bytes = metrics.meters.discarded_bytes;
-                    writer_idle = metrics.meters.pending_bytes == 0 && !metrics.any_active_jobs;
-                }
-#endif
-                const double idle_seconds = std::chrono::duration<double>(
-                    now - idle_since).count();
-                runtime_controller_.begin_activity(counters, idle_seconds);
-                // begin_activity already primed and reset the learning state, so align the generation baseline to avoid a redundant rebase.
-                last_seen_space_epoch_ = space_epoch_.load(std::memory_order_acquire);
-                monitor_parked = false;
-                last_sample_at = now - std::chrono::milliseconds(minimum_sample_interval_ms);
-                reset_system_cpu_sample();
-                const auto snapshot = runtime_controller_.snapshot(active_jobs_);
-                const std::size_t queued_jobs = queue_.size();
-                wait_lock.unlock();
-                print_controller_lifecycle_event("activity_started");
-                print_controller_event(
-                    snapshot,
-                    queued_jobs,
-                    0,
-                    controller_interval_ms(snapshot, queued_jobs),
-                    discarded_write_bytes,
-                    writer_idle);
-            } else {
-                wait_lock.unlock();
-            }
 
-            const double elapsed_seconds = std::chrono::duration<double>(now - last_sample_at).count();
-            if (elapsed_seconds * 1000.0 < minimum_sample_interval_ms) {
-                next_interval_ms = (std::max)(
-                    1U,
-                    minimum_sample_interval_ms - static_cast<unsigned>(elapsed_seconds * 1000.0));
-                std::unique_lock<std::mutex> cooldown_lock(mutex_);
-                if (controller_condition_.wait_for(
-                        cooldown_lock,
-                        std::chrono::milliseconds(next_interval_ms),
-                        [this] { return stopping_; })) {
-                    break;
-                }
-                continue;
-            }
-            const unsigned sampled_interval_ms = static_cast<unsigned>(elapsed_seconds * 1000.0);
-            last_sample_at = now;
-            const auto sample = read_runtime_sample(
-                runtime_controller_.resource_diagnostics_enabled());
             sunpack::sevenzip::NativeThroughputCounters throughput;
             std::uint64_t discarded_write_bytes = 0;
             std::uint64_t pending_write_bytes = 0;
@@ -2001,73 +1872,82 @@ private:
                 writer_has_active_jobs = metrics.any_active_jobs;
             }
 #endif
-            // accepted == written is not an idle signal (a cancelled buffer leaves a permanent gap) and the pending gauge can read zero between chunks, so a writer is idle only when no job is registered either.
-            const bool writer_idle = pending_write_bytes == 0 && !writer_has_active_jobs;
-            bool parked = false;
-            sunpack::sevenzip::NativeRuntimeSnapshot parked_snapshot;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (queue_.empty() && active_jobs_ == 0 && writer_idle) {
-                    runtime_controller_.end_activity(throughput);
-                    parked_snapshot = runtime_controller_.snapshot(0);
-                    controller_recheck_ = false;
-                    monitor_parked = true;
-                    idle_since = now;
-                    parked = true;
-                }
-            }
-            if (parked) {
+            const bool writer_idle =
+                pending_write_bytes == 0 && !writer_has_active_jobs;
+
+            if (monitor_parked) {
+                runtime_controller_.begin_activity(throughput);
+                auto snapshot = runtime_controller_.snapshot(active_jobs_);
+                cpu_budget_.set_effective_capacity(snapshot.effective_cpu_budget);
+                monitor_parked = false;
+                last_sample_at = now;
                 reset_system_cpu_sample();
+                const std::size_t queued_jobs = queue_.size();
+                wait_lock.unlock();
+                print_controller_lifecycle_event("activity_started");
                 print_controller_event(
-                    parked_snapshot, 0, sampled_interval_ms, 0, discarded_write_bytes, writer_idle);
+                    snapshot, queued_jobs, 0,
+                    controller_interval_ms(true),
+                    discarded_write_bytes, writer_idle);
+                condition_.notify_all();
+                next_interval_ms = controller_interval_ms(true);
+                continue;
+            }
+
+            const double elapsed_seconds =
+                std::chrono::duration<double>(now - last_sample_at).count();
+            if (elapsed_seconds * 1000.0 < minimum_sample_interval_ms) {
+                next_interval_ms = minimum_sample_interval_ms;
+                wait_lock.unlock();
+                continue;
+            }
+            last_sample_at = now;
+            const unsigned sampled_interval_ms =
+                static_cast<unsigned>(elapsed_seconds * 1000.0);
+
+            if (queue_.empty() && active_jobs_ == 0 && writer_idle) {
+                runtime_controller_.end_activity(throughput);
+                const auto snapshot = runtime_controller_.snapshot(0);
+                cpu_budget_.set_effective_capacity(snapshot.effective_cpu_budget);
+                monitor_parked = true;
+                reset_system_cpu_sample();
+                wait_lock.unlock();
+                print_controller_event(
+                    snapshot, 0, sampled_interval_ms,
+                    controller_interval_ms(false),
+                    discarded_write_bytes, true);
                 print_controller_lifecycle_event("activity_parked");
                 continue;
             }
-            bool changed = false;
-            std::size_t queued_jobs = 0;
-            sunpack::sevenzip::NativeRuntimeSnapshot snapshot;
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (stopping_) {
-                    break;
-                }
-                // Rebuild the learning baseline before observe(): rebase_after_external_discontinuity must carry the current counters.
-                const std::uint64_t space_epoch = space_epoch_.load(std::memory_order_acquire);
-                if (space_epoch != last_seen_space_epoch_) {
-                    last_seen_space_epoch_ = space_epoch;
-                    changed = runtime_controller_.rebase_after_external_discontinuity(throughput);
-                }
-                queued_jobs = queue_.size();
-                changed = runtime_controller_.observe(
-                                sample,
-                                throughput,
-                                queued_jobs,
-                                active_jobs_,
-                                elapsed_seconds) ||
-                          changed;
-                snapshot = runtime_controller_.snapshot(active_jobs_);
-            }
-            next_interval_ms = controller_interval_ms(snapshot, queued_jobs);
-            if (changed || snapshot.resource_diagnostics_enabled) {
-                print_controller_event(snapshot, queued_jobs, sampled_interval_ms, next_interval_ms,
-                    discarded_write_bytes, writer_idle);
-            }
-            if (snapshot.measurement_sequence != printed_measurement_sequence) {
-                print_controller_measurement_event(
-                    snapshot,
-                    queued_jobs,
-                    sampled_interval_ms,
-                    discarded_write_bytes,
-                    pending_write_bytes,
-                    throughput.accepted_bytes,
-                    throughput.written_bytes,
-                    throughput.completed_jobs,
-                    throughput.completed_files,
-                    writer_idle);
-                printed_measurement_sequence = snapshot.measurement_sequence;
-            }
+
+            const std::size_t queued_jobs = queue_.size();
+            const std::size_t active_jobs = active_jobs_;
+            wait_lock.unlock();
+
+            const auto sample = read_runtime_sample(
+                runtime_controller_.resource_diagnostics_enabled());
+            const bool changed = runtime_controller_.observe(
+                sample, throughput, active_jobs, elapsed_seconds);
+            const auto snapshot = runtime_controller_.snapshot(active_jobs);
+
             if (changed) {
+                cpu_budget_.set_effective_capacity(
+                    snapshot.effective_cpu_budget);
                 condition_.notify_all();
+            }
+
+            next_interval_ms = controller_interval_ms(true);
+            if (changed || snapshot.resource_diagnostics_enabled) {
+                print_controller_event(
+                    snapshot, queued_jobs, sampled_interval_ms,
+                    next_interval_ms, discarded_write_bytes, writer_idle);
+            }
+            if (runtime_controller_.measurement_diagnostics_enabled() &&
+                snapshot.measurement_sequence != printed_measurement_sequence) {
+                print_controller_measurement_event(
+                    snapshot, queued_jobs, sampled_interval_ms,
+                    pending_write_bytes, writer_idle);
+                printed_measurement_sequence = snapshot.measurement_sequence;
             }
         }
     }
@@ -2113,6 +1993,9 @@ private:
                     }
                     continue;
                 }
+                if (!cpu_budget_.try_acquire_base()) {
+                    continue;
+                }
                 auto iterator = queue_.begin() + static_cast<std::ptrdiff_t>(selected);
                 job = std::move(*iterator);
                 queue_.erase(iterator);
@@ -2122,7 +2005,15 @@ private:
             print_active_event(job, "job_admitted", admitted_jobs);
             print_active_event(job, "job_started", admitted_jobs);
             int code = -100;
-            try {
+            const std::string job_id = json_string_field(job.request, "job_id", "");
+            {
+                sunpack::sevenzip::NativeCpuJobContext cpu_job_context(
+                    cpu_budget_,
+                    [this, job_id](const sunpack::sevenzip::NativeCpuJobSnapshot& snapshot) {
+                        print_job_cpu_event(job_id, snapshot);
+                    });
+                sunpack::sevenzip::NativeCpuContextScope cpu_scope(&cpu_job_context);
+                try {
                 if (job.metadata.requires_writer) {
                     // The lease is released before the job is reported finished, so active_jobs_ == 0 implies every finished job's lease is gone.
                     const std::string key = job.metadata.volume_key.empty()
@@ -2140,10 +2031,11 @@ private:
                 } else {
                     code = run_request(job.request, nullptr, job.cancel_token);
                 }
-            } catch (...) {
-                code = -100;
+                } catch (...) {
+                    code = -100;
+                }
             }
-            const std::string job_id = json_string_field(job.request, "job_id", "");
+            cpu_budget_.release(1);
             std::size_t remaining_jobs = 0;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -2173,9 +2065,6 @@ private:
     sunpack::sevenzip::AsyncWriterConfig writer_config_;
     sunpack::sevenzip::VolumeWriterRegistryPtr writer_registry_;
     std::unique_ptr<sunpack::sevenzip::VolumeSpaceMonitor> space_monitor_;
-    // Throughput-environment discontinuity generation: the controller only asks whether one happened since its last sample, so it assigns the value instead of accumulating.
-    std::atomic<std::uint64_t> space_epoch_{0};
-    std::uint64_t last_seen_space_epoch_ = 0;
     std::deque<Job> queue_;
     std::unordered_map<std::string, std::shared_ptr<JobControl>> cancel_tokens_;
     std::mutex mutex_;
@@ -2183,6 +2072,7 @@ private:
     std::condition_variable controller_condition_;
     const std::size_t worker_count_;
     const std::size_t queue_capacity_;
+    sunpack::sevenzip::NativeCpuBudget cpu_budget_;
     sunpack::sevenzip::NativeRuntimeControl runtime_controller_;
     std::size_t active_jobs_ = 0;
     bool controller_recheck_ = false;
@@ -2235,21 +2125,15 @@ int main() {
         configured_native_sizing_overrides());
     const auto runtime_config = configured_native_runtime_config(sizing);
     NativeJobExecutor executor(sizing, runtime_config);
-    const bool sizing_overridden = sizing.thread_capacity_overridden ||
-        sizing.initial_active_jobs_overridden;
-    const char* exploration_strategy = runtime_config.exploration_strategy ==
-            sunpack::sevenzip::NativeExplorationStrategy::Calibrated
-        ? "calibrated"
-        : runtime_config.exploration_strategy == sunpack::sevenzip::NativeExplorationStrategy::Full
-            ? "full"
-            : "rapid";
+    const bool sizing_overridden = sizing.thread_capacity_overridden;
     print_json_line(
         "{\"type\":\"worker_ready\",\"sizing_mode\":\"" +
         std::string(sizing_overridden ? "overridden" : "dynamic") +
         "\",\"logical_processors\":" + std::to_string(resources.logical_processors) +
         ",\"thread_capacity\":" + std::to_string(sizing.thread_capacity) +
-        ",\"initial_active_limit\":" + std::to_string(runtime_config.initial_active_jobs) +
-        ",\"exploration_strategy\":\"" + exploration_strategy + "\"" +
+        ",\"nominal_cpu_budget\":" + std::to_string(sizing.thread_capacity) +
+        ",\"observation_window_seconds\":" + std::to_string(runtime_config.observation_window_seconds) +
+        ",\"throughput_change_ratio\":" + std::to_string(runtime_config.throughput_change_ratio) +
         ",\"resource_diagnostics_enabled\":" +
             std::string(runtime_config.resource_diagnostics_enabled ? "true" : "false") +
         ",\"measurement_diagnostics_enabled\":" +
