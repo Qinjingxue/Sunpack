@@ -1669,7 +1669,10 @@ private:
 
             if (active_jobs_ > 0) {
                 if (!next_memory_poll) {
-                    next_memory_poll = now + kMemoryPollInterval;
+                    // The first active job samples immediately so a budget
+                    // left reduced by an earlier pressure episode is not stale
+                    // for a full polling interval.
+                    next_memory_poll = now;
                 }
             } else {
                 // No active extraction means no system-memory polling.
