@@ -117,8 +117,11 @@ NativeCpuBudgetSnapshot NativeCpuBudget::snapshot() const noexcept
     };
 }
 
-NativeCpuJobContext::NativeCpuJobContext(NativeCpuBudget &budget) noexcept
-    : budget_(&budget)
+NativeCpuJobContext::NativeCpuJobContext(
+    NativeCpuBudget &budget,
+    std::function<void(NativeCpuJobSnapshot)> change_sink) noexcept
+    : budget_(&budget),
+      change_sink_(std::move(change_sink))
 {
 }
 
@@ -147,6 +150,8 @@ std::size_t NativeCpuJobContext::acquire_extra(
                std::memory_order_acquire))
     {
     }
+    if (change_sink_)
+        change_sink_(snapshot());
     return granted;
 }
 
@@ -168,6 +173,8 @@ void NativeCpuJobContext::release_extra(std::size_t count) noexcept
             break;
     }
     budget_->release(released);
+    if (change_sink_)
+        change_sink_(snapshot());
 }
 
 NativeCpuJobSnapshot NativeCpuJobContext::snapshot() const noexcept
