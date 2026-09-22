@@ -37,6 +37,7 @@
 #include "../Common/StreamUtils.h"
 
 #include "BZip2Decoder.h"
+#include "internal/decoder_cpu_budget.h"
 
 
 namespace NCompress {
@@ -1110,7 +1111,9 @@ CDecoder::CDecoder():
     _outSizeDefined(false),
     _counters(NULL)
   #ifndef Z7_ST
-    , NumThreads(1)
+    , NumThreads(1),
+      _sunpackScoutCpuContext(NULL),
+      _sunpackScoutCpuCredit(0)
   #endif
     , _inBuf(NULL),
     _inProcessed(0)
@@ -1144,6 +1147,13 @@ CDecoder::~CDecoder()
 
     // if (ScoutRes != S_OK) throw ScoutRes;
   }
+  if (_sunpackScoutCpuContext && _sunpackScoutCpuCredit)
+  {
+    sunpack_cpu_release_extra_for_context(
+        _sunpackScoutCpuContext, _sunpackScoutCpuCredit);
+    _sunpackScoutCpuCredit = 0;
+  }
+  _sunpackScoutCpuContext = NULL;
   
   #endif
 
@@ -1351,9 +1361,12 @@ HRESULT CDecoder::DecodeStreams(ICompressProgressInfo *progress)
             if (!Thread.IsCreated())
             {
               PRIN("=== MT_MODE");
-              RINOK(CreateThread())
+              const HRESULT createRes = CreateThread();
+              if (createRes != S_OK && createRes != S_FALSE)
+                return createRes;
             }
-            useMt = true;
+            if (Thread.IsCreated())
+              useMt = true;
           }
         }
         #endif
@@ -1452,9 +1465,30 @@ HRESULT CDecoder::DecodeStreams(ICompressProgressInfo *progress)
 
 HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 {
-  const unsigned numWorkers = GetParallelBlockWorkerCount(NumThreads);
+  const unsigned requestedWorkers = GetParallelBlockWorkerCount(NumThreads);
+  if (requestedWorkers == 0)
+    return DecodeStreams(progress);
+
+  void *cpuContext = sunpack_cpu_current_job_context();
+  unsigned numWorkers = requestedWorkers;
+  if (cpuContext)
+    numWorkers = sunpack_cpu_acquire_extra_for_context(
+        cpuContext,
+        requestedWorkers,
+        (std::min)(requestedWorkers, 4u));
   if (numWorkers == 0)
     return DecodeStreams(progress);
+
+  struct CSunPackCpuCreditReleaser
+  {
+    void *Context;
+    unsigned Credits;
+    ~CSunPackCpuCreditReleaser()
+    {
+      if (Context && Credits)
+        sunpack_cpu_release_extra_for_context(Context, Credits);
+    }
+  } cpuCredits = { cpuContext, cpuContext ? numWorkers : 0 };
 
   RINOK(StartRead())
 
@@ -1791,10 +1825,33 @@ static THREAD_FUNC_DECL RunScout2(void *p) { ((CDecoder *)p)->RunScout(); return
 
 HRESULT CDecoder::CreateThread()
 {
-  WRes             wres = DecoderEvent.CreateIfNotCreated_Reset();
+  if (Thread.IsCreated())
+    return S_OK;
+
+  if (!_sunpackScoutCpuContext)
+    _sunpackScoutCpuContext = sunpack_cpu_current_job_context();
+
+  unsigned granted = 1;
+  if (_sunpackScoutCpuContext)
+    granted = sunpack_cpu_acquire_extra_for_context(
+        _sunpackScoutCpuContext, 1, 1);
+  if (granted == 0)
+    return S_FALSE;
+
+  WRes wres = DecoderEvent.CreateIfNotCreated_Reset();
   if (wres == 0) { wres = ScoutEvent.CreateIfNotCreated_Reset();
   if (wres == 0) { wres = Thread.Create(RunScout2, this); }}
-  return HRESULT_FROM_WIN32(wres);
+  if (wres != 0)
+  {
+    if (_sunpackScoutCpuContext)
+      sunpack_cpu_release_extra_for_context(
+          _sunpackScoutCpuContext, granted);
+    return HRESULT_FROM_WIN32(wres);
+  }
+
+  if (_sunpackScoutCpuContext)
+    _sunpackScoutCpuCredit = granted;
+  return S_OK;
 }
 
 void CDecoder::RunScout()

@@ -1,0 +1,26 @@
+#pragma once
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+void *sunpack_cpu_current_job_context(void);
+
+unsigned sunpack_cpu_acquire_extra_for_context(
+    void *context,
+    unsigned wanted,
+    unsigned minimum_grant);
+
+void sunpack_cpu_release_extra_for_context(
+    void *context,
+    unsigned count);
+
+unsigned sunpack_cpu_acquire_extra(
+    unsigned wanted,
+    unsigned minimum_grant);
+
+void sunpack_cpu_release_extra(unsigned count);
+
+#ifdef __cplusplus
+}
+#endif

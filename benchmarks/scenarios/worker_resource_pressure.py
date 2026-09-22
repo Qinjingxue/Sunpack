@@ -139,7 +139,6 @@ def _run_case(*, workspace: BenchmarkWorkspace, worker_path: Path, archives: lis
     worker = _NativeWorkerProcess(str(worker_path), None, {
         "thread_capacity": capacity,
         "adaptive_enabled": controller == "adaptive",
-        "initial_active_jobs": 0 if controller == "adaptive" else capacity,
         "sample_interval_ms": max(100, int(sample_interval * 1000)),
     })
     process = psutil.Process(worker.process.pid) if worker.process is not None else None

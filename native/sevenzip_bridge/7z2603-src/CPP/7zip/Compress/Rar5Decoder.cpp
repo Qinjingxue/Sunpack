@@ -41,6 +41,7 @@
 #include "../Common/StreamUtils.h"
 
 #include "Rar5Decoder.h"
+#include "internal/decoder_cpu_budget.h"
 
 /*
 Note: original-unrar claims that encoder has limitation for Distance:
@@ -708,7 +709,8 @@ namespace NCompress
                            _inputBuf(NULL)
 #ifndef Z7_ST
                            ,
-                           _numThreads(1), _mtPool(NULL), _mtPoolWorkers(0)
+                           _numThreads(1), _mtPool(NULL), _mtPoolWorkers(0),
+                           _sunpackCpuContext(NULL), _sunpackCpuCredits(0)
 #endif
     {
 #if 1
@@ -739,6 +741,11 @@ namespace NCompress
       DestroyRar5ParallelBlockPool(_mtPool);
       _mtPool = NULL;
       _mtPoolWorkers = 0;
+      if (_sunpackCpuContext && _sunpackCpuCredits)
+        sunpack_cpu_release_extra_for_context(
+            _sunpackCpuContext, _sunpackCpuCredits);
+      _sunpackCpuContext = NULL;
+      _sunpackCpuCredits = 0;
 #endif
 
       Z7_RAR_FREE_WINDOW
@@ -2617,17 +2624,27 @@ HRESULT CDecoder::DecodeLZ()
 
 HRESULT CDecoder::DecodeLZParallel()
 {
-  const unsigned numWorkers = GetRar5ParallelWorkerCount(_numThreads);
-  if (numWorkers == 0)
+  const unsigned requestedWorkers = GetRar5ParallelWorkerCount(_numThreads);
+  if (requestedWorkers == 0)
     return DecodeLZ();
 
-  const size_t requestedRingSize = (size_t)numWorkers * kRar5MtBlocksPerWorker;
-
-  if (!_mtPool || _mtPoolWorkers != numWorkers)
+  if (!_mtPool)
   {
-    delete _mtPool;
-    _mtPool = NULL;
-    _mtPoolWorkers = 0;
+    if (!_sunpackCpuContext)
+      _sunpackCpuContext = sunpack_cpu_current_job_context();
+
+    unsigned grantedWorkers = requestedWorkers;
+    if (_sunpackCpuContext)
+      grantedWorkers = sunpack_cpu_acquire_extra_for_context(
+          _sunpackCpuContext,
+          requestedWorkers,
+          (std::min)(requestedWorkers, 4u));
+
+    if (grantedWorkers == 0)
+      return DecodeLZ();
+
+    const size_t requestedRingSize =
+        (size_t)grantedWorkers * kRar5MtBlocksPerWorker;
 
     try
     {
@@ -2635,16 +2652,24 @@ HRESULT CDecoder::DecodeLZParallel()
     }
     catch (const std::bad_alloc &)
     {
+      if (_sunpackCpuContext)
+        sunpack_cpu_release_extra_for_context(
+            _sunpackCpuContext, grantedWorkers);
       return E_OUTOFMEMORY;
     }
 
-    if (!_mtPool->Start(numWorkers, requestedRingSize))
+    if (!_mtPool->Start(grantedWorkers, requestedRingSize))
     {
       delete _mtPool;
       _mtPool = NULL;
+      if (_sunpackCpuContext)
+        sunpack_cpu_release_extra_for_context(
+            _sunpackCpuContext, grantedWorkers);
       return E_FAIL;
     }
-    _mtPoolWorkers = numWorkers;
+    _mtPoolWorkers = grantedWorkers;
+    if (_sunpackCpuContext)
+      _sunpackCpuCredits = grantedWorkers;
   }
 
   CRar5ParallelPoolRunScope poolScope(*_mtPool);

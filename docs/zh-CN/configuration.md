@@ -185,17 +185,10 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `worker.stage_thread_capacity` | `0` | 扫描、分析、校验和后处理的线程容量；`0` 自动选择。 |
 | `worker.max_inflight_files` | `0` | 文件级并发上限；`0` 自动选择，自动范围为 64–512。 |
 | `worker.max_pending_stage_jobs` | `4096` | 阶段作业等待上限。 |
-| `worker.adaptive_enabled` | `true` | 是否按实际吞吐动态调整解压并发。 |
-| `worker.initial_active_jobs` | `0` | 初始活动任务数；`0` 自动选择。 |
-| `worker.exploration_strategy` | `calibrated` | 并发探索策略，可选 `calibrated`、`rapid`、`full`。 |
-| `worker.resource_diagnostics_enabled` | `false` | 是否采样 CPU 和进程 I/O 诊断数据。 |
-| `worker.minimum_window_seconds` / `maximum_window_seconds` | `0.25` / `1.5` | 吞吐观察窗口的最短和最长时长。 |
-| `worker.settle_seconds` | `0.1` | 调整并发后的稳定等待时间。 |
-| `worker.large_window_bytes` | `33554432` | 大任务窗口的实际写入字节数。 |
-| `worker.small_window_jobs` / `small_window_files` | `4` / `16` | 小任务窗口的任务数和文件数。 |
-| `worker.improvement_ratio` / `regression_ratio` | `1.03` / `0.97` | 接受提升和判定下降的阈值。 |
-| `worker.aggressive_step` | `4` | 快速探索时的步长。 |
-| `worker.warm_start_decay_seconds` / `warm_start_confirmations` | `0` / `2` | 温启动提示的衰减时长和确认次数。 |
+| `worker.adaptive_enabled` | `true` | 是否允许被动吞吐控制器在外部环境显著变化时降低或恢复 CPU 配额。 |
+| `worker.resource_diagnostics_enabled` | `false` | 是否采样 CPU 诊断数据；不参与配额决策。 |
+| `worker.observation_window_seconds` | `1.0` | 被动吞吐观察窗口，单位秒。 |
+| `worker.throughput_change_ratio` | `0.40` | 相对基线吞吐变化达到该比例时调整 CPU 配额。 |
 | `worker.max_queue_jobs` | `4096` | 原生任务队列上限。 |
 | `worker.priority_aging_quantum` | `32` | 优先级老化步长。 |
 | `worker.backpressure_retries` | `120` | 遇到队列背压时的重试次数。 |
@@ -205,9 +198,9 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `worker.space_poll_interval_ms` | `1000` | 磁盘空间检查间隔。 |
 | `worker.space_status_report_interval_ms` | `15000` | 磁盘空间状态报告间隔。 |
 
-吞吐量控制器内部使用乐观重复试探：初次 probe 聚合 2 个 native measurement window；同一 frontier 每发生一次上探回退，后续 probe 的 observation 依次增长为 3、4、5，最多 6 个 window。连续 3 次上探失败后会插入向下 probe；该策略为内部控制逻辑，不提供额外配置项。
+Native worker 以 CPU credit 作为唯一解压并发预算。默认 nominal budget 等于逻辑核心数，每个已准入归档任务先占 1 个 base credit；格式不分配固定权重。7-Zip 内部 decoder 只有在真正准备创建额外并行执行线程时，才同步向同一个 budget 申请 extra credits；申请不到就少开线程或退回串行路径，因此外层任务与内层 decoder 不会形成两个互不知情的并发层。
 
-自动并发只根据实际写入、完成任务和完成文件的吞吐反复试探。大任务比较字节/秒，小任务比较任务/秒或文件/秒；单次上探失败只回退并增加该 frontier 的失败证据，之后仍会重新尝试，上探连续失败后才插入向下探测。格式、算法、solid 状态和文件数量不作为额外 CPU 权重。资源诊断只在显式开启时采样。
+吞吐量控制器不再主动搜索最优并发。它只在 CPU credit 恰好打满（`reserved_cpu_credits == effective_cpu_budget`）时按实际写出吞吐被动观察；低于配额说明任务不足，高于配额只会出现在非抢占降档后的短暂过渡期，这两种情况都直接丢弃当前未完成窗口。默认观察窗口为 1 秒；相对当前稳定基线下降至少 40% 时，effective CPU budget 按 `max(1, logical_processors / 8)` 降低一级；相对基线提高至少 40% 时，按同样步长恢复，最高回到 nominal budget。每次配额变化后旧基线立即失效。第一次采样观察到新配额恰好打满时只确定窗口起点，不计入该次采样之前的时间和字节；从下一次采样起连续满配额累计满 1 秒后才形成新窗口并建立基线。期间一旦不再恰好打满，当前窗口立即作废并等待下一次满配额重新起点。
 
 ## watch
 

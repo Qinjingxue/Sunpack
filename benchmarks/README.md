@@ -183,23 +183,6 @@ the spread to each request's first admission, and the longest same-request admis
 run. The early index detects short-term monopolization; the overall index detects
 whether requests receive equal admission counts by the end of the batch.
 
-`extraction worker-initial-concurrency-matrix` calibrates the startup admission
-limit against real ZIP stored/deflate, 7z solid/non-solid, and RAR solid/non-solid
-archives. It sweeps `--initial-active-jobs` while holding the detected CPU
-capacity constant, and reports median throughput, p95 queue latency, peak active
-jobs, worker RSS, and normalized cross-format recommendations with and without
-solid formats. Candidate order is alternated between rounds to reduce thermal and
-ordering bias. Production uses one CPU token per job; `--cpu-weight-mode legacy`
-replays the former format-dependent CPU weights for A/B comparison. Solid and large-dictionary cases use the same throughput-driven concurrency controller.
-
-`extraction worker-resource-pressure` uses real 7z archives and the native worker
-to measure resource contention rather than synthetic weights. `cpu` uses highly
-compressible LZMA2 data with a large dictionary to stress decoding; `io` uses
-random data with `-mx=0` to stress archive reads and output writes. It compares
-the adaptive controller with a fixed active-job limit and records worker CPU,
-host CPU, read throughput, worker RSS, admitted jobs, timeouts, and result
-failures.
-
 `memory many-tasks` measures memory *growth* (not peak) of the two long-lived
 components under a large task count across every format: the Python pipeline and
 the native 7z worker. One mixed-format corpus is built with the format-matrix

@@ -24,28 +24,99 @@
         "name": "directory_prune",
         "enabled": true,
         "prune_dir_globs": [
-          ".git", ".vscode", "__pycache__", "node_modules", "site-packages", ".venv", "venv", "env", ".cache",
+          ".git",
+          ".vscode",
+          "__pycache__",
+          "node_modules",
+          "site-packages",
+          ".venv",
+          "venv",
+          "env",
+          ".cache",
           "repositories"
         ],
-        "path_globs": [".git/**", ".vscode/**", "$RECYCLE.BIN/**"]
+        "path_globs": [
+          ".git/**",
+          ".vscode/**",
+          "$RECYCLE.BIN/**"
+        ]
       },
       {
         "name": "whitelist",
         "enabled": false,
-        "path_globs": ["archives/**", "downloads/**"],
-        "prune_dir_globs": ["archives", "downloads"],
-        "allowed_files": ["sample.zip"],
-        "allowed_extensions": [".zip", ".7z", ".rar"]
+        "path_globs": [
+          "archives/**",
+          "downloads/**"
+        ],
+        "prune_dir_globs": [
+          "archives",
+          "downloads"
+        ],
+        "allowed_files": [
+          "sample.zip"
+        ],
+        "allowed_extensions": [
+          ".zip",
+          ".7z",
+          ".rar"
+        ]
       },
       {
         "name": "blacklist",
         "enabled": true,
-        "blocked_files": ["Thumbs.db", "desktop.ini"],
+        "blocked_files": [
+          "Thumbs.db",
+          "desktop.ini"
+        ],
         "blocked_extensions": [
-          ".dll", ".save", ".py", ".pyc", ".json", ".xml", ".cfg", ".ini", ".sys", ".db", ".msi", ".cur",
-          ".ani", ".ttf", ".woff", ".ico", ".pak", ".obb", ".unitypackage", ".jar", ".apk", ".ipa", ".epub",
-          ".odt", ".ods", ".odp", ".docx", ".xlsx", ".pptx", ".whl", ".xpi", ".war", ".ear", ".aab", ".ckpt",
-          ".pt", ".pth", ".safetensors", ".bin", ".dat", ".docm", ".xlsm", ".pptm", ".msix", ".msixbundle",".crdownload",".downloading",".part"
+          ".dll",
+          ".save",
+          ".py",
+          ".pyc",
+          ".json",
+          ".xml",
+          ".cfg",
+          ".ini",
+          ".sys",
+          ".db",
+          ".msi",
+          ".cur",
+          ".ani",
+          ".ttf",
+          ".woff",
+          ".ico",
+          ".pak",
+          ".obb",
+          ".unitypackage",
+          ".jar",
+          ".apk",
+          ".ipa",
+          ".epub",
+          ".odt",
+          ".ods",
+          ".odp",
+          ".docx",
+          ".xlsx",
+          ".pptx",
+          ".whl",
+          ".xpi",
+          ".war",
+          ".ear",
+          ".aab",
+          ".ckpt",
+          ".pt",
+          ".pth",
+          ".safetensors",
+          ".bin",
+          ".dat",
+          ".docm",
+          ".xlsm",
+          ".pptm",
+          ".msix",
+          ".msixbundle",
+          ".crdownload",
+          ".downloading",
+          ".part"
         ]
       },
       {
@@ -63,26 +134,13 @@
   "performance": {
     "persistent_server_idle_seconds": 15,
     "worker": {
-      "exploration_strategy": "calibrated",
       "resource_diagnostics_enabled": false,
-      "minimum_window_seconds": 0.25,
-      "maximum_window_seconds": 1.5,
-      "settle_seconds": 0.1,
-      "large_window_bytes": 33554432,
-      "small_window_jobs": 4,
-      "small_window_files": 16,
-      "improvement_ratio": 1.03,
-      "regression_ratio": 0.97,
-      "aggressive_step": 4,
-      "warm_start_decay_seconds": 0.0,
-      "warm_start_confirmations": 2,
       "watchdog_no_progress_timeout_seconds": 180,
       "thread_capacity": 0,
       "stage_thread_capacity": 0,
       "max_inflight_files": 0,
       "max_pending_stage_jobs": 4096,
       "adaptive_enabled": true,
-      "initial_active_jobs": 0,
       "sample_interval_ms": 500,
       "max_queue_jobs": 4096,
       "priority_aging_quantum": 32,
@@ -91,21 +149,23 @@
       "job_buffer_budget_bytes": 33554432,
       "space_gate_enabled": true,
       "space_poll_interval_ms": 1000,
-      "space_status_report_interval_ms": 15000
+      "space_status_report_interval_ms": 15000,
+      "observation_window_seconds": 1,
+      "throughput_change_ratio": 0.4
     }
   },
   "runtime": {
     "process_mode": "normal"
   },
   "watch": {
-    "cold_start_seconds": 0.0,
-    "quiet_min_seconds": 0.0,
-    "quiet_max_seconds": 180.0,
+    "cold_start_seconds": 0,
+    "quiet_min_seconds": 0,
+    "quiet_max_seconds": 180,
     "boundary_confirmation_seconds": 0.5,
     "max_folders": 16,
-    "observer_stop_timeout_seconds": 5.0,
+    "observer_stop_timeout_seconds": 5,
     "runtime_cache_cleanup_enabled": true,
-    "runtime_cache_cleanup_idle_seconds": 10.0,
+    "runtime_cache_cleanup_idle_seconds": 10,
     "password_retry_debounce_seconds": 0.5,
     "password_retry_include_subtree": true,
     "directory_password_file_auto_create": true,
@@ -118,8 +178,8 @@
     "toast_enabled": true,
     "toast_update_interval_ms": 50,
     "toast_completion_debounce_ms": 800,
-    "toast_success_ttl_seconds": 3.0,
-    "toast_failure_ttl_seconds": 5.0,
+    "toast_success_ttl_seconds": 3,
+    "toast_failure_ttl_seconds": 5,
     "toast_report_retention_days": 30,
     "toast_report_max_files": 16,
     "toast_report_max_bytes": 2097152,

@@ -114,7 +114,13 @@ def test_effective_config_includes_native_worker_and_rule_pipeline():
             {"name": "size_range", "enabled": True, "gte": 1048576}
         ]
     }
-    config["performance"] = {"worker": {"thread_capacity": 0, "initial_active_jobs": 0}}
+    config["performance"] = {
+        "worker": {
+            "thread_capacity": 0,
+            "observation_window_seconds": 1.0,
+            "throughput_change_ratio": 0.4,
+        }
+    }
 
     effective = build_effective_config(config)
 

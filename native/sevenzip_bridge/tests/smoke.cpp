@@ -4,6 +4,7 @@
 #include "internal/password_probe_policy.hpp"
 #include "internal/sevenzip_status.hpp"
 #include "internal/native_runtime_control.hpp"
+#include "internal/native_cpu_budget.hpp"
 #include "internal/native_worker_sizing.hpp"
 
 #include <filesystem>
@@ -91,17 +92,10 @@ bool check_password_probe_status_names() {
     )) == "needs_volume_or_tail_damaged";
 }
 
-sunpack::sevenzip::NativeRuntimeConfig deterministic_runtime_config(std::size_t initial) {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeConfig config;
-    config.initial_active_jobs = initial;
-    config.exploration_strategy = NativeExplorationStrategy::Calibrated;
-    config.minimum_window_seconds = 0.1;
-    config.maximum_window_seconds = 0.1;
-    config.settle_seconds = 0.0;
-    config.large_window_bytes = 500;
-    config.small_window_jobs = 2;
-    config.small_window_files = 2;
+sunpack::sevenzip::NativeRuntimeConfig deterministic_runtime_config() {
+    sunpack::sevenzip::NativeRuntimeConfig config;
+    config.observation_window_seconds = 1.0;
+    config.throughput_change_ratio = 0.40;
     return config;
 }
 
@@ -119,476 +113,340 @@ bool check_empty_bounded_password_probe_requires_positive_evidence() {
             EmptyBoundedPasswordProbeDisposition::TestAllItems;
 }
 
-void observe_runtime_windows(
+void observe_runtime(
     sunpack::sevenzip::NativeRuntimeControl& controller,
     const sunpack::sevenzip::NativeRuntimeSample& runtime,
     sunpack::sevenzip::NativeThroughputCounters& counters,
-    std::size_t active_jobs,
-    std::size_t window_count,
-    std::uint64_t bytes_per_window,
-    std::uint64_t jobs_per_window = 2,
-    std::uint64_t files_per_window = 2
+    std::uint64_t written_bytes,
+    double seconds,
+    std::size_t reserved_cpu_credits
 ) {
-    for (std::size_t window = 0; window < window_count; ++window) {
-        counters.accepted_bytes += bytes_per_window;
-        counters.written_bytes += bytes_per_window;
-        counters.completed_jobs += jobs_per_window;
-        counters.completed_files += files_per_window;
-        controller.observe(runtime, counters, 100, active_jobs, 0.1);
-    }
+    counters.accepted_bytes += written_bytes;
+    counters.written_bytes += written_bytes;
+    controller.observe(
+        runtime,
+        counters,
+        reserved_cpu_credits,
+        seconds);
 }
 
-bool check_runtime_control_starts_after_two_windows() {
+bool check_cpu_budget_accounts_base_and_decoder_credits() {
     using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
+    NativeCpuBudget budget(8);
+    if (!budget.try_acquire_base() || budget.reserved_credits() != 1) {
+        return false;
+    }
+    {
+        NativeCpuJobContext job(budget);
+        NativeCpuContextScope scope(&job);
+        if (job.acquire_extra(4, 4) != 4 ||
+            budget.reserved_credits() != 5) {
+            return false;
+        }
+        auto snapshot = job.snapshot();
+        if (snapshot.current_extra_credits != 4 ||
+            snapshot.peak_extra_credits != 4 ||
+            snapshot.total_extra_credits_granted != 4) {
+            return false;
+        }
+        job.release_extra(2);
+        if (budget.reserved_credits() != 3 ||
+            job.snapshot().current_extra_credits != 2) {
+            return false;
+        }
+    }
+    if (budget.reserved_credits() != 1) {
+        return false;
+    }
+    budget.release(1);
+    return budget.reserved_credits() == 0;
+}
+
+bool check_cpu_budget_honors_effective_capacity() {
+    using namespace sunpack::sevenzip;
+    NativeCpuBudget budget(8);
+    for (int i = 0; i < 4; ++i) {
+        if (!budget.try_acquire_base()) {
+            return false;
+        }
+    }
+    budget.set_effective_capacity(2);
+    if (budget.effective_capacity() != 2 ||
+        budget.can_acquire_base() ||
+        budget.acquire_up_to(1, 1) != 0) {
+        return false;
+    }
+    budget.release(3);
+    if (budget.reserved_credits() != 1 ||
+        !budget.can_acquire_base() ||
+        !budget.try_acquire_base()) {
+        return false;
+    }
+    budget.release(2);
+    budget.set_effective_capacity(8);
+    return budget.reserved_credits() == 0 &&
+        budget.effective_capacity() == 8;
+}
+
+bool check_runtime_control_establishes_one_second_baseline() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(16, deterministic_runtime_config());
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
+    controller.begin_activity(counters);
 
-    observe_runtime_windows(controller, runtime, counters, 4, 1, 1'000);
-    auto snapshot = controller.snapshot(4);
-    if (snapshot.active_limit != 4 ||
-        snapshot.phase != NativeControllerPhase::Baseline ||
-        snapshot.observation_target_windows != 2 ||
-        snapshot.throughput_mode != NativeThroughputMode::None) {
+    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
+    auto snapshot = controller.snapshot(16);
+    if (snapshot.measurement_sequence != 0 ||
+        snapshot.effective_cpu_budget != 16) {
         return false;
     }
 
-    observe_runtime_windows(controller, runtime, counters, 4, 1, 1'000);
-    snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 5 &&
-        snapshot.phase == NativeControllerPhase::Probe &&
-        snapshot.decision == NativeControllerDecision::ProbeUp &&
-        snapshot.observation_target_windows == 2;
+    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
+    snapshot = controller.snapshot(16);
+    if (snapshot.measurement_sequence != 0) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
+    snapshot = controller.snapshot(16);
+    return snapshot.measurement_sequence == 1 &&
+        snapshot.decision == NativeControllerDecision::BaselineEstablished &&
+        snapshot.nominal_cpu_budget == 16 &&
+        snapshot.effective_cpu_budget == 16 &&
+        snapshot.budget_step == 2 &&
+        snapshot.written_bytes_per_second == 1000.0 &&
+        snapshot.reference_bytes_per_second == 1000.0;
 }
 
-bool check_runtime_control_emits_fixed_measurement_windows() {
+bool check_runtime_control_ignores_unsaturated_windows() {
     using namespace sunpack::sevenzip;
-    auto config = deterministic_runtime_config(4);
+    NativeRuntimeControl controller(16, deterministic_runtime_config());
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.begin_activity(counters);
+
+    observe_runtime(controller, runtime, counters, 500, 0.5, 15);
+    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
+    auto snapshot = controller.snapshot(16);
+    if (snapshot.measurement_sequence != 0) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 500, 0.5, 17);
+    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
+    snapshot = controller.snapshot(16);
+    if (snapshot.measurement_sequence != 0) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
+    observe_runtime(controller, runtime, counters, 500, 0.5, 16);
+    snapshot = controller.snapshot(16);
+    return snapshot.measurement_sequence == 1 &&
+        snapshot.decision == NativeControllerDecision::BaselineEstablished &&
+        snapshot.reference_bytes_per_second == 1000.0;
+}
+
+bool check_runtime_control_requires_forty_percent_change() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(16, deterministic_runtime_config());
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
+
+    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
+    observe_runtime(controller, runtime, counters, 650, 1.0, 16);
+    auto snapshot = controller.snapshot(16);
+    if (snapshot.decision != NativeControllerDecision::None ||
+        snapshot.effective_cpu_budget != 16) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 590, 1.0, 16);
+    snapshot = controller.snapshot(16);
+    return snapshot.decision == NativeControllerDecision::BudgetReduced &&
+        snapshot.effective_cpu_budget == 14 &&
+        snapshot.reference_bytes_per_second == 0.0;
+}
+
+bool check_runtime_control_reobserves_after_budget_change() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(16, deterministic_runtime_config());
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
+
+    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
+    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
+    auto snapshot = controller.snapshot(16);
+    if (snapshot.decision != NativeControllerDecision::BudgetReduced ||
+        snapshot.effective_cpu_budget != 14) {
+        return false;
+    }
+
+    // Non-preemptive excess use must not establish the new-tier baseline.
+    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
+    snapshot = controller.snapshot(16);
+    if (snapshot.measurement_sequence != 2 ||
+        snapshot.reference_bytes_per_second != 0.0) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 0, 0.1, 14);
+    snapshot = controller.snapshot(14);
+    if (snapshot.measurement_sequence != 2) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 500, 1.0, 14);
+    snapshot = controller.snapshot(14);
+    return snapshot.measurement_sequence == 3 &&
+        snapshot.decision == NativeControllerDecision::BaselineEstablished &&
+        snapshot.effective_cpu_budget == 14 &&
+        snapshot.reference_bytes_per_second == 500.0;
+}
+
+bool check_runtime_control_restores_after_recovery() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(16, deterministic_runtime_config());
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
+
+    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
+    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 14);
+    observe_runtime(controller, runtime, counters, 500, 1.0, 14);
+    observe_runtime(controller, runtime, counters, 710, 1.0, 14);
+    auto snapshot = controller.snapshot(14);
+    if (snapshot.decision != NativeControllerDecision::BudgetRestored ||
+        snapshot.effective_cpu_budget != 16 ||
+        snapshot.reference_bytes_per_second != 0.0) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
+    observe_runtime(controller, runtime, counters, 710, 1.0, 16);
+    snapshot = controller.snapshot(16);
+    return snapshot.decision == NativeControllerDecision::BaselineEstablished &&
+        snapshot.effective_cpu_budget == 16 &&
+        snapshot.reference_bytes_per_second == 710.0;
+}
+
+bool check_runtime_control_uses_core_eighth_step() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(32, deterministic_runtime_config());
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 32);
+
+    observe_runtime(controller, runtime, counters, 1000, 1.0, 32);
+    observe_runtime(controller, runtime, counters, 500, 1.0, 32);
+    auto snapshot = controller.snapshot(32);
+    if (snapshot.effective_cpu_budget != 28 ||
+        snapshot.budget_step != 4 ||
+        snapshot.decision != NativeControllerDecision::BudgetReduced) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 0, 0.1, 28);
+    observe_runtime(controller, runtime, counters, 500, 1.0, 28);
+    snapshot = controller.snapshot(28);
+    if (snapshot.decision != NativeControllerDecision::BaselineEstablished ||
+        snapshot.reference_bytes_per_second != 500.0) {
+        return false;
+    }
+
+    observe_runtime(controller, runtime, counters, 250, 1.0, 28);
+    snapshot = controller.snapshot(28);
+    return snapshot.effective_cpu_budget == 24 &&
+        snapshot.budget_step == 4 &&
+        snapshot.decision == NativeControllerDecision::BudgetReduced;
+}
+
+bool check_runtime_control_fixed_mode_only_observes_when_saturated() {
+    using namespace sunpack::sevenzip;
+    auto config = deterministic_runtime_config();
     config.adaptive_enabled = false;
     config.measurement_diagnostics_enabled = true;
     NativeRuntimeControl controller(8, config);
     NativeRuntimeSample runtime;
     NativeThroughputCounters counters;
+    controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 8);
 
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    counters.accepted_bytes = 1'000;
-    counters.written_bytes = 700;
-    counters.completed_jobs = 2;
-    counters.completed_files = 2;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    auto snapshot = controller.snapshot(4);
-    if (snapshot.active_limit != 4 ||
-        snapshot.measurement_sequence != 1 ||
-        snapshot.measurement_mode != NativeThroughputMode::Bytes ||
-        snapshot.measurement_accepted_bytes != 1'000 ||
-        snapshot.measurement_written_bytes != 700 ||
-        snapshot.measurement_completed_jobs != 2 ||
-        snapshot.measurement_completed_files != 2) {
-        return false;
-    }
-
-    counters.accepted_bytes = 1'500;
-    counters.written_bytes = 1'200;
-    counters.completed_jobs = 3;
-    counters.completed_files = 3;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 4 &&
-        snapshot.measurement_sequence == 2 &&
-        snapshot.measurement_accepted_bytes == 500 &&
-        snapshot.measurement_written_bytes == 500 &&
-        snapshot.measurement_completed_jobs == 1 &&
-        snapshot.measurement_completed_files == 1;
-}
-
-bool check_runtime_control_accepts_improvement_without_verify() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    observe_runtime_windows(controller, runtime, counters, 5, 2, 1'200);
-    const auto snapshot = controller.snapshot(5);
-    return snapshot.active_limit == 6 &&
-        snapshot.phase == NativeControllerPhase::Probe &&
-        snapshot.accepted_probe &&
-        snapshot.probe_failures == 0 &&
-        snapshot.observation_target_windows == 2 &&
-        snapshot.probe_direction == 1;
-}
-
-bool check_runtime_control_accumulates_ambiguous_upward_gain() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    observe_runtime_windows(controller, runtime, counters, 5, 2, 1'010);
-    auto snapshot = controller.snapshot(5);
-    if (snapshot.active_limit != 6 ||
-        snapshot.phase != NativeControllerPhase::Probe ||
-        snapshot.accepted_probe) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 6, 2, 1'040);
-    snapshot = controller.snapshot(6);
-    return snapshot.active_limit == 7 &&
-        snapshot.accepted_probe &&
-        snapshot.probe_failures == 0;
-}
-
-bool check_runtime_control_grows_probe_window_after_rollback() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    observe_runtime_windows(controller, runtime, counters, 5, 2, 700);
-    auto snapshot = controller.snapshot(5);
-    if (snapshot.active_limit != 4 ||
-        snapshot.phase != NativeControllerPhase::Cruise ||
-        snapshot.decision != NativeControllerDecision::RolledBack ||
-        snapshot.probe_failures != 1) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    snapshot = controller.snapshot(4);
-    if (snapshot.active_limit != 5 ||
-        snapshot.phase != NativeControllerPhase::Probe ||
-        snapshot.observation_target_windows != 3) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 5, 2, 1'200);
-    snapshot = controller.snapshot(5);
-    if (snapshot.active_limit != 5 ||
-        snapshot.phase != NativeControllerPhase::Probe) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 5, 1, 1'200);
-    snapshot = controller.snapshot(5);
-    return snapshot.active_limit == 6 &&
-        snapshot.accepted_probe &&
-        snapshot.probe_failures == 0 &&
-        snapshot.observation_target_windows == 2;
-}
-
-bool drive_three_upward_rollbacks(
-    sunpack::sevenzip::NativeRuntimeControl& controller,
-    const sunpack::sevenzip::NativeRuntimeSample& runtime,
-    sunpack::sevenzip::NativeThroughputCounters& counters
-) {
-    using namespace sunpack::sevenzip;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-
-    for (std::size_t failure = 0; failure < 3; ++failure) {
-        const std::size_t target_windows = 2 + failure;
-        observe_runtime_windows(
-            controller, runtime, counters, 5, target_windows, 600);
-        auto snapshot = controller.snapshot(5);
-        if (snapshot.active_limit != 4 ||
-            snapshot.phase != NativeControllerPhase::Cruise ||
-            snapshot.probe_failures != failure + 1) {
-            return false;
-        }
-        if (failure != 2) {
-            observe_runtime_windows(
-                controller, runtime, counters, 4, 2, 1'000);
-            snapshot = controller.snapshot(4);
-            if (snapshot.active_limit != 5 ||
-                snapshot.phase != NativeControllerPhase::Probe ||
-                snapshot.observation_target_windows != 3 + failure) {
-                return false;
-            }
-        }
-    }
-    return true;
-}
-
-bool check_runtime_control_probes_down_after_repeated_up_failures() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    if (!drive_three_upward_rollbacks(controller, runtime, counters)) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    const auto snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 3 &&
-        snapshot.phase == NativeControllerPhase::Probe &&
-        snapshot.decision == NativeControllerDecision::ProbeDown &&
-        snapshot.probe_direction == -1 &&
-        snapshot.probe_failures == 3 &&
-        snapshot.observation_target_windows == 5;
-}
-
-bool check_runtime_control_retries_up_after_failed_down_probe() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    if (!drive_three_upward_rollbacks(controller, runtime, counters)) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    observe_runtime_windows(controller, runtime, counters, 3, 5, 500);
-    auto snapshot = controller.snapshot(3);
-    if (snapshot.active_limit != 4 ||
-        snapshot.phase != NativeControllerPhase::Cruise ||
-        snapshot.probe_failures != 3) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 5 &&
-        snapshot.phase == NativeControllerPhase::Probe &&
-        snapshot.probe_direction == 1 &&
-        snapshot.observation_target_windows == 5;
-}
-
-bool check_runtime_control_descends_when_lower_limit_is_not_worse() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    if (!drive_three_upward_rollbacks(controller, runtime, counters)) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    observe_runtime_windows(controller, runtime, counters, 3, 5, 1'000);
-    const auto snapshot = controller.snapshot(3);
-    return snapshot.active_limit == 2 &&
-        snapshot.phase == NativeControllerPhase::Probe &&
-        snapshot.probe_direction == -1 &&
-        snapshot.accepted_probe &&
-        snapshot.probe_failures == 0 &&
-        snapshot.observation_target_windows == 2;
-}
-
-bool check_runtime_control_uses_small_job_window() {
-    using namespace sunpack::sevenzip;
-    auto config = deterministic_runtime_config(4);
-    config.large_window_bytes = 1ULL << 30;
-    NativeRuntimeControl controller(8, config);
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 0, 2, 2);
-    observe_runtime_windows(controller, runtime, counters, 5, 2, 0, 3, 3);
-    const auto snapshot = controller.snapshot(5);
-    return snapshot.active_limit == 6 &&
-        snapshot.throughput_mode == NativeThroughputMode::Jobs &&
-        snapshot.accepted_probe;
-}
-
-bool check_runtime_control_rebases_external_discontinuity_at_stable_limit() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    if (controller.snapshot(4).active_limit != 5) {
-        return false;
-    }
-    if (!controller.rebase_after_external_discontinuity(counters)) {
-        return false;
-    }
-    const auto snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 4 &&
-        snapshot.phase == NativeControllerPhase::Baseline &&
-        snapshot.decision == NativeControllerDecision::SegmentInterrupted &&
-        snapshot.probe_failures == 0;
-}
-
-bool check_runtime_control_waits_for_realized_experimental_concurrency() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    counters.accepted_bytes += 1'200;
-    counters.written_bytes += 1'200;
-    counters.completed_jobs += 2;
-    counters.completed_files += 2;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    auto snapshot = controller.snapshot(4);
-    if (snapshot.active_limit != 5 ||
-        snapshot.phase != NativeControllerPhase::Probe) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 5, 1, 1'200);
-    snapshot = controller.snapshot(5);
-    if (snapshot.accepted_probe) {
-        return false;
-    }
-
-    observe_runtime_windows(controller, runtime, counters, 5, 1, 1'200);
-    snapshot = controller.snapshot(5);
-    return snapshot.active_limit == 6 &&
-        snapshot.accepted_probe;
-}
-
-bool check_runtime_control_interrupts_probe_when_backlog_disappears() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    if (controller.snapshot(4).active_limit != 5) {
-        return false;
-    }
-
-    controller.observe(runtime, counters, 0, 5, 0.1);
-    auto snapshot = controller.snapshot(5);
-    if (snapshot.active_limit != 4 ||
-        snapshot.load_state != NativeLoadState::Unsaturated ||
-        snapshot.decision != NativeControllerDecision::SegmentInterrupted) {
-        return false;
-    }
-
-    counters.written_bytes += 1'000;
-    counters.accepted_bytes += 1'000;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 4 &&
-        snapshot.load_state == NativeLoadState::Saturated &&
-        snapshot.phase == NativeControllerPhase::Baseline &&
-        snapshot.decision == NativeControllerDecision::SegmentStarted;
-}
-
-bool check_runtime_control_parks_and_rebases_activity() {
-    using namespace sunpack::sevenzip;
-    NativeRuntimeControl controller(8, deterministic_runtime_config(4));
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-
-    controller.end_activity(counters);
-    auto snapshot = controller.snapshot(0);
-    if (snapshot.active_limit != 4 ||
-        snapshot.load_state != NativeLoadState::Idle ||
-        snapshot.decision != NativeControllerDecision::ActivityEnded) {
-        return false;
-    }
-
-    controller.begin_activity(counters, 1.0);
-    counters.written_bytes += 1'000;
-    counters.accepted_bytes += 1'000;
-    controller.observe(runtime, counters, 0, 1, 0.1);
-    controller.observe(runtime, counters, 100, 4, 0.1);
-    snapshot = controller.snapshot(4);
-    return snapshot.active_limit == 4 &&
-        snapshot.activity_session == 2 &&
-        snapshot.saturated_segment == 2 &&
-        snapshot.throughput_mode == NativeThroughputMode::None;
-}
-
-bool check_runtime_control_warm_start_decays_without_reusing_measurements() {
-    using namespace sunpack::sevenzip;
-    auto config = deterministic_runtime_config(4);
-    config.warm_start_decay_seconds = 30.0;
-    config.warm_start_confirmations = 2;
-    NativeRuntimeControl controller(8, config);
-    NativeRuntimeSample runtime;
-    NativeThroughputCounters counters;
-    controller.observe(runtime, counters, 100, 4, 0.1);
-
-    observe_runtime_windows(controller, runtime, counters, 4, 2, 1'000);
-    observe_runtime_windows(controller, runtime, counters, 5, 2, 1'200);
-    observe_runtime_windows(controller, runtime, counters, 6, 2, 1'400);
-    observe_runtime_windows(controller, runtime, counters, 7, 2, 800);
+    observe_runtime(controller, runtime, counters, 1000, 1.0, 8);
+    observe_runtime(controller, runtime, counters, 300, 1.0, 7);
     auto snapshot = controller.snapshot(7);
-    if (snapshot.active_limit != 6 ||
-        snapshot.phase != NativeControllerPhase::Cruise) {
+    if (snapshot.measurement_sequence != 1 ||
+        snapshot.effective_cpu_budget != 8 ||
+        snapshot.reference_bytes_per_second != 1000.0) {
         return false;
     }
 
-    controller.end_activity(counters);
-    controller.begin_activity(counters, 0.0);
-    snapshot = controller.snapshot(0);
-    if (snapshot.active_limit != 6 ||
-        !snapshot.warm_start_used ||
-        snapshot.throughput_mode != NativeThroughputMode::None) {
-        return false;
-    }
-
-    controller.end_activity(counters);
-    controller.begin_activity(counters, 15.0);
-    snapshot = controller.snapshot(0);
-    if (snapshot.active_limit != 5 || !snapshot.warm_start_used) {
-        return false;
-    }
-
-    controller.end_activity(counters);
-    controller.begin_activity(counters, 30.0);
-    snapshot = controller.snapshot(0);
-    return snapshot.active_limit == 4 && !snapshot.warm_start_used;
+    observe_runtime(controller, runtime, counters, 300, 1.0, 8);
+    snapshot = controller.snapshot(8);
+    return snapshot.measurement_sequence == 2 &&
+        snapshot.effective_cpu_budget == 8 &&
+        snapshot.reference_bytes_per_second == 1000.0 &&
+        snapshot.written_bytes_per_second == 300.0;
 }
 
-bool check_native_sizing_scales_linearly_with_cpu() {
+bool check_runtime_control_activity_reset_restores_nominal_budget() {
     using namespace sunpack::sevenzip;
-    NativeSizingOverrides defaults;
-    struct Expected {
-        std::size_t logical_processors;
-        std::size_t foreground_jobs;
-    };
-    const Expected cases[] = {
-        {2, 1},
-        {4, 2},
-        {8, 4},
-        {16, 8},
-        {32, 16},
-        {64, 32},
-        {128, 64},
-    };
-    for (const auto& expected : cases) {
-        const NativeMachineResources resources{expected.logical_processors};
-        const auto plan = derive_native_sizing_plan(resources, defaults);
-        if (plan.initial_active_jobs != expected.foreground_jobs) {
+    NativeRuntimeControl controller(16, deterministic_runtime_config());
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
+    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
+    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
+    if (controller.snapshot(16).effective_cpu_budget != 14) {
+        return false;
+    }
+
+    controller.end_activity(counters);
+    controller.begin_activity(counters);
+    const auto snapshot = controller.snapshot(0);
+    return snapshot.effective_cpu_budget == 16 &&
+        snapshot.reference_bytes_per_second == 0.0 &&
+        snapshot.measurement_sequence == 2 &&
+        snapshot.decision == NativeControllerDecision::ActivityStarted;
+}
+
+bool check_native_sizing_tracks_logical_processors() {
+    using namespace sunpack::sevenzip;
+    const std::size_t cases[] = {1, 2, 4, 8, 16, 32, 64, 128};
+    for (const std::size_t logical_processors : cases) {
+        const NativeMachineResources resources{logical_processors};
+        const auto plan = derive_native_sizing_plan(resources, {});
+        if (plan.thread_capacity != logical_processors ||
+            plan.thread_capacity_overridden) {
             return false;
         }
     }
     return true;
 }
 
-bool check_native_sizing_respects_overrides() {
+bool check_native_sizing_respects_thread_override() {
     using namespace sunpack::sevenzip;
     const NativeMachineResources resources{32};
     const auto automatic = derive_native_sizing_plan(resources, {});
-    if (automatic.thread_capacity != 32 || automatic.initial_active_jobs != 16) {
+    if (automatic.thread_capacity != 32 ||
+        automatic.thread_capacity_overridden) {
         return false;
     }
 
     NativeSizingOverrides overrides;
     overrides.thread_capacity = 12;
-    overrides.initial_active_jobs = 10;
     const auto configured = derive_native_sizing_plan(resources, overrides);
-    return configured.thread_capacity == 12 && configured.initial_active_jobs == 10 &&
-        configured.thread_capacity_overridden &&
-        configured.initial_active_jobs_overridden;
+    return configured.thread_capacity == 12 &&
+        configured.thread_capacity_overridden;
 }
 
 }  // namespace
@@ -616,67 +474,51 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "empty bounded password probe evidence check failed\n";
         return 15;
     }
-    if (!check_runtime_control_starts_after_two_windows()) {
-        std::cerr << "runtime control two-window startup check failed\n";
+    if (!check_cpu_budget_accounts_base_and_decoder_credits()) {
+        std::cerr << "CPU credit accounting check failed\n";
         return 23;
     }
-    if (!check_runtime_control_emits_fixed_measurement_windows()) {
-        std::cerr << "runtime control fixed measurement window check failed\n";
+    if (!check_cpu_budget_honors_effective_capacity()) {
+        std::cerr << "CPU credit effective-capacity check failed\n";
         return 22;
     }
-    if (!check_runtime_control_accepts_improvement_without_verify()) {
-        std::cerr << "runtime control direct improvement check failed\n";
+    if (!check_runtime_control_establishes_one_second_baseline()) {
+        std::cerr << "runtime one-second baseline check failed\n";
         return 7;
     }
-    if (!check_runtime_control_accumulates_ambiguous_upward_gain()) {
-        std::cerr << "runtime control ambiguous upward accumulation check failed\n";
+    if (!check_runtime_control_ignores_unsaturated_windows()) {
+        std::cerr << "runtime saturation-gating check failed\n";
+        return 26;
+    }
+    if (!check_runtime_control_reobserves_after_budget_change()) {
+        std::cerr << "runtime budget re-observation check failed\n";
+        return 27;
+    }
+    if (!check_runtime_control_requires_forty_percent_change()) {
+        std::cerr << "runtime passive derating check failed\n";
         return 24;
     }
-    if (!check_runtime_control_grows_probe_window_after_rollback()) {
-        std::cerr << "runtime control progressive observation check failed\n";
+    if (!check_runtime_control_restores_after_recovery()) {
+        std::cerr << "runtime budget restoration check failed\n";
         return 6;
     }
-    if (!check_runtime_control_probes_down_after_repeated_up_failures()) {
-        std::cerr << "runtime control downward correction trigger check failed\n";
+    if (!check_runtime_control_uses_core_eighth_step()) {
+        std::cerr << "runtime CPU eighth-step check failed\n";
         return 18;
     }
-    if (!check_runtime_control_retries_up_after_failed_down_probe()) {
-        std::cerr << "runtime control upward retry check failed\n";
+    if (!check_runtime_control_fixed_mode_only_observes_when_saturated()) {
+        std::cerr << "runtime fixed observation check failed\n";
         return 19;
     }
-    if (!check_runtime_control_descends_when_lower_limit_is_not_worse()) {
-        std::cerr << "runtime control downward acceptance check failed\n";
+    if (!check_runtime_control_activity_reset_restores_nominal_budget()) {
+        std::cerr << "runtime activity reset check failed\n";
         return 25;
     }
-    if (!check_runtime_control_uses_small_job_window()) {
-        std::cerr << "runtime control small-job window check failed\n";
-        return 8;
-    }
-    if (!check_runtime_control_rebases_external_discontinuity_at_stable_limit()) {
-        std::cerr << "runtime control external-discontinuity rebase check failed\n";
-        return 21;
-    }
-    if (!check_runtime_control_waits_for_realized_experimental_concurrency()) {
-        std::cerr << "runtime control realized-concurrency check failed\n";
-        return 20;
-    }
-    if (!check_runtime_control_interrupts_probe_when_backlog_disappears()) {
-        std::cerr << "runtime control saturated-segment interruption check failed\n";
-        return 10;
-    }
-    if (!check_runtime_control_parks_and_rebases_activity()) {
-        std::cerr << "runtime control activity rebase check failed\n";
-        return 11;
-    }
-    if (!check_runtime_control_warm_start_decays_without_reusing_measurements()) {
-        std::cerr << "runtime control warm-start decay check failed\n";
-        return 12;
-    }
-    if (!check_native_sizing_scales_linearly_with_cpu()) {
-        std::cerr << "native sizing CPU extrapolation check failed\n";
+    if (!check_native_sizing_tracks_logical_processors()) {
+        std::cerr << "native sizing logical-processor check failed\n";
         return 13;
     }
-    if (!check_native_sizing_respects_overrides()) {
+    if (!check_native_sizing_respects_thread_override()) {
         std::cerr << "native sizing override check failed\n";
         return 14;
     }

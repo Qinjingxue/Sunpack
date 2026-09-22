@@ -119,6 +119,8 @@ Z7_CLASS_IMP_NOQIB_2(
   UInt32 _numThreads;
   CRar5ParallelBlockPool *_mtPool;
   unsigned _mtPoolWorkers;
+  void *_sunpackCpuContext;
+  unsigned _sunpackCpuCredits;
 #endif
 
   NHuffman::CDecoder<kNumHufBits, kMainTableSize,  k_NumHufTableBits_Main>  m_MainDecoder;

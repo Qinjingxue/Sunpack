@@ -7,1066 +7,282 @@
 namespace sunpack::sevenzip
 {
 
-    struct NativeRuntimeSample
+struct NativeRuntimeSample
+{
+    double cpu_percent = 0.0;
+    bool cpu_percent_valid = false;
+};
+
+struct NativeThroughputCounters
+{
+    std::uint64_t accepted_bytes = 0;
+    std::uint64_t written_bytes = 0;
+    std::uint64_t completed_files = 0;
+    std::uint64_t completed_jobs = 0;
+};
+
+enum class NativeControllerDecision
+{
+    None,
+    ActivityStarted,
+    ActivityEnded,
+    BaselineEstablished,
+    BudgetReduced,
+    BudgetRestored,
+};
+
+struct NativeRuntimeSnapshot
+{
+    std::size_t nominal_cpu_budget = 1;
+    std::size_t effective_cpu_budget = 1;
+    std::size_t budget_step = 1;
+    std::size_t active_jobs = 0;
+    NativeControllerDecision decision = NativeControllerDecision::None;
+    double written_bytes_per_second = 0.0;
+    double reference_bytes_per_second = 0.0;
+    double observation_window_seconds = 0.0;
+    std::uint64_t measurement_sequence = 0;
+    bool resource_diagnostics_enabled = false;
+    bool cpu_percent_valid = false;
+    double cpu_percent = 0.0;
+};
+
+struct NativeRuntimeConfig
+{
+    bool adaptive_enabled = true;
+    bool resource_diagnostics_enabled = false;
+    bool measurement_diagnostics_enabled = false;
+    double observation_window_seconds = 1.0;
+    double throughput_change_ratio = 0.40;
+};
+
+class NativeRuntimeControl final
+{
+public:
+    NativeRuntimeControl(
+        std::size_t nominal_cpu_budget,
+        NativeRuntimeConfig config = {})
+        : nominal_cpu_budget_((std::max)(std::size_t{1}, nominal_cpu_budget)),
+          effective_cpu_budget_(nominal_cpu_budget_),
+          budget_step_((std::max)(std::size_t{1}, nominal_cpu_budget_ / 8)),
+          adaptive_enabled_(config.adaptive_enabled),
+          resource_diagnostics_enabled_(config.resource_diagnostics_enabled),
+          measurement_diagnostics_enabled_(config.measurement_diagnostics_enabled),
+          observation_window_seconds_((std::max)(0.1, config.observation_window_seconds)),
+          lower_ratio_(1.0 - (std::min)(0.95, (std::max)(0.01, config.throughput_change_ratio))),
+          upper_ratio_(1.0 + (std::min)(0.95, (std::max)(0.01, config.throughput_change_ratio)))
     {
-        double cpu_percent = 0.0;
-        bool cpu_percent_valid = false;
-        std::uint64_t io_read_bytes = 0;
-        std::uint64_t io_write_bytes = 0;
-        bool io_counters_valid = false;
-    };
+    }
 
-    struct NativeThroughputCounters
+    NativeRuntimeControl(const NativeRuntimeControl &) = delete;
+    NativeRuntimeControl &operator=(const NativeRuntimeControl &) = delete;
+
+    bool begin_activity(const NativeThroughputCounters &counters) noexcept
     {
-        std::uint64_t accepted_bytes = 0;
-        std::uint64_t written_bytes = 0;
-        std::uint64_t completed_files = 0;
-        std::uint64_t completed_jobs = 0;
-    };
+        effective_cpu_budget_ = nominal_cpu_budget_;
+        previous_counters_ = counters;
+        counters_primed_ = true;
+        window_seconds_ = 0.0;
+        window_written_bytes_ = 0;
+        reference_bytes_per_second_ = 0.0;
+        written_bytes_per_second_ = 0.0;
+        reobserve_after_budget_change_ = false;
+        saturation_primed_ = false;
+        decision_ = NativeControllerDecision::ActivityStarted;
+        active_ = true;
+        return true;
+    }
 
-    enum class NativeExplorationStrategy
+    bool end_activity(const NativeThroughputCounters &counters) noexcept
     {
-        Calibrated,
-        Rapid,
-        Full
-    };
+        previous_counters_ = counters;
+        counters_primed_ = true;
+        window_seconds_ = 0.0;
+        window_written_bytes_ = 0;
+        reference_bytes_per_second_ = 0.0;
+        written_bytes_per_second_ = 0.0;
+        reobserve_after_budget_change_ = false;
+        saturation_primed_ = false;
+        decision_ = NativeControllerDecision::ActivityEnded;
+        active_ = false;
+        return true;
+    }
 
-    enum class NativeThroughputMode
+    bool observe(
+        const NativeRuntimeSample &sample,
+        const NativeThroughputCounters &counters,
+        std::size_t reserved_cpu_credits,
+        double elapsed_seconds) noexcept
     {
-        None,
-        Bytes,
-        Jobs,
-        Files
-    };
+        decision_ = NativeControllerDecision::None;
+        cpu_percent_valid_ = resource_diagnostics_enabled_ && sample.cpu_percent_valid;
+        cpu_percent_ = cpu_percent_valid_ ? sample.cpu_percent : 0.0;
 
-    enum class NativeControllerPhase
-    {
-        Baseline,
-        Probe,
-        Cruise
-    };
-
-    enum class NativeLoadState
-    {
-        Idle,
-        Unsaturated,
-        Saturated
-    };
-
-    enum class NativeControllerDecision
-    {
-        None,
-        ActivityStarted,
-        ActivityEnded,
-        SegmentStarted,
-        SegmentInterrupted,
-        BaselineReady,
-        ProbeUp,
-        ProbeDown,
-        Accepted,
-        RolledBack,
-        Cruising,
-    };
-
-    struct NativeRuntimeSnapshot
-    {
-        std::size_t active_limit = 1;
-        std::size_t active_jobs = 0;
-        NativeControllerPhase phase = NativeControllerPhase::Baseline;
-        NativeLoadState load_state = NativeLoadState::Idle;
-        NativeControllerDecision decision = NativeControllerDecision::None;
-        NativeThroughputMode throughput_mode = NativeThroughputMode::None;
-        double written_bytes_per_second = 0.0;
-        double completed_jobs_per_second = 0.0;
-        double completed_files_per_second = 0.0;
-        std::uint64_t pending_write_bytes = 0;
-        std::uint64_t activity_session = 0;
-        std::uint64_t saturated_segment = 0;
-        bool warm_start_used = false;
-        bool accepted_probe = false;
-        std::size_t probe_failures = 0;
-        std::size_t observation_target_windows = 2;
-        int probe_direction = 0;
-        bool resource_diagnostics_enabled = false;
-        bool cpu_percent_valid = false;
-        double cpu_percent = 0.0;
-        double io_read_bytes_per_second = 0.0;
-        double io_write_bytes_per_second = 0.0;
-        std::uint64_t measurement_sequence = 0;
-        double measurement_window_seconds = 0.0;
-        NativeThroughputMode measurement_mode = NativeThroughputMode::None;
-        std::uint64_t measurement_accepted_bytes = 0;
-        std::uint64_t measurement_written_bytes = 0;
-        std::uint64_t measurement_completed_jobs = 0;
-        std::uint64_t measurement_completed_files = 0;
-        double measurement_bytes_per_second = 0.0;
-        double measurement_jobs_per_second = 0.0;
-        double measurement_files_per_second = 0.0;
-    };
-
-    struct NativeRuntimeConfig
-    {
-        bool adaptive_enabled = true;
-        bool resource_diagnostics_enabled = false;
-        bool measurement_diagnostics_enabled = false;
-        std::size_t initial_active_jobs = 0;
-        NativeExplorationStrategy exploration_strategy = NativeExplorationStrategy::Calibrated;
-        double minimum_window_seconds = 0.25;
-        double maximum_window_seconds = 1.5;
-        double settle_seconds = 0.10;
-        std::uint64_t large_window_bytes = 32ULL << 20;
-        std::size_t small_window_jobs = 4;
-        std::size_t small_window_files = 16;
-        double improvement_ratio = 1.03;
-        double regression_ratio = 0.97;
-        std::size_t aggressive_step = 4;
-        double warm_start_decay_seconds = 0.0;
-        std::size_t warm_start_confirmations = 2;
-    };
-
-    class NativeRuntimeControl final
-    {
-    public:
-        NativeRuntimeControl(
-            std::size_t max_active_jobs,
-            bool adaptive_enabled = true,
-            std::size_t initial_active_jobs = 0)
-            : NativeRuntimeControl(
-                  max_active_jobs,
-                  NativeRuntimeConfig{adaptive_enabled, false, false, initial_active_jobs}) {}
-
-        NativeRuntimeControl(
-            std::size_t max_active_jobs,
-            NativeRuntimeConfig config)
-            : max_active_jobs_((std::max)(std::size_t{1}, max_active_jobs)),
-              adaptive_enabled_(config.adaptive_enabled),
-              resource_diagnostics_enabled_(config.resource_diagnostics_enabled),
-              measurement_diagnostics_enabled_(config.measurement_diagnostics_enabled),
-              exploration_strategy_(config.exploration_strategy),
-              minimum_window_seconds_((std::max)(0.05, config.minimum_window_seconds)),
-              maximum_window_seconds_((std::max)(minimum_window_seconds_, config.maximum_window_seconds)),
-              settle_seconds_((std::max)(0.0, config.settle_seconds)),
-              large_window_bytes_((std::max)(std::uint64_t{1}, config.large_window_bytes)),
-              small_window_jobs_((std::max)(std::size_t{1}, config.small_window_jobs)),
-              small_window_files_((std::max)(std::size_t{1}, config.small_window_files)),
-              improvement_ratio_((std::max)(1.0, config.improvement_ratio)),
-              regression_ratio_((std::min)(1.0, (std::max)(0.01, config.regression_ratio))),
-              configured_aggressive_step_((std::max)(std::size_t{1}, config.aggressive_step)),
-              warm_start_decay_seconds_((std::max)(0.0, config.warm_start_decay_seconds)),
-              warm_start_confirmations_((std::max)(std::size_t{1}, config.warm_start_confirmations))
-        {
-            const std::size_t configured_initial = config.initial_active_jobs == 0
-                                                       ? (std::min)(max_active_jobs_, std::size_t{2})
-                                                       : config.initial_active_jobs;
-            initial_active_jobs_ = (std::max)(
-                std::size_t{1},
-                (std::min)(configured_initial, max_active_jobs_));
-            if (exploration_strategy_ == NativeExplorationStrategy::Full)
-            {
-                initial_active_jobs_ = max_active_jobs_;
-            }
-            active_limit_ = initial_active_jobs_;
-            best_limit_ = active_limit_;
-            last_good_limit_ = active_limit_;
-        }
-
-        NativeRuntimeControl(const NativeRuntimeControl &) = delete;
-        NativeRuntimeControl &operator=(const NativeRuntimeControl &) = delete;
-
-        bool rebase_after_external_discontinuity(
-            const NativeThroughputCounters &current_counters) noexcept
-        {
-            if (load_state_ == NativeLoadState::Idle)
-            {
-                return false;
-            }
-            if (phase_ == NativeControllerPhase::Probe)
-            {
-                active_limit_ = best_limit_;
-            }
-            prime_counters(current_counters);
-            reset_learning_state();
-            settle_remaining_seconds_ = settle_seconds_;
-            decision_ = NativeControllerDecision::SegmentInterrupted;
-            return true;
-        }
-
-        bool can_admit(std::size_t active_jobs) const noexcept
-        {
-            return active_jobs < active_limit_;
-        }
-
-        bool observe(
-            const NativeRuntimeSample &runtime,
-            const NativeThroughputCounters &counters,
-            std::size_t queued_jobs,
-            std::size_t active_jobs,
-            double elapsed_seconds = 0.0) noexcept
-        {
-            decision_ = NativeControllerDecision::None;
-            accepted_probe_ = false;
-            bool changed = false;
-            if (load_state_ == NativeLoadState::Idle)
-            {
-                changed = begin_activity(counters, 0.0);
-            }
-
-            observe_diagnostics(runtime, elapsed_seconds);
-            const CounterDelta delta = counter_delta(counters);
-            pending_write_bytes_ = counters.accepted_bytes >= counters.written_bytes
-                                       ? counters.accepted_bytes - counters.written_bytes
-                                       : 0;
-
-            const bool concurrency_exposed =
-                queued_jobs != 0 && active_jobs != 0 &&
-                active_jobs + 1 >= active_limit_;
-            if (!concurrency_exposed)
-            {
-                if (load_state_ == NativeLoadState::Saturated)
-                {
-                    changed = interrupt_saturated_segment() || changed;
-                }
-                else
-                {
-                    load_state_ = NativeLoadState::Unsaturated;
-                    window_.clear();
-                    observation_.clear();
-                }
-                return changed;
-            }
-
-            if (load_state_ != NativeLoadState::Saturated)
-            {
-                begin_saturated_segment();
-                return true;
-            }
-
-            if ((!adaptive_enabled_ && !measurement_diagnostics_enabled_) ||
-                elapsed_seconds <= 0.0)
-            {
-                return changed;
-            }
-
-            if (adaptive_enabled_)
-            {
-                // A probe is only meaningful after the executor has actually reached
-                // the requested admission limit. Samples collected while jobs drain
-                // toward a lower target or ramp toward a higher target are discarded.
-                if (phase_ == NativeControllerPhase::Probe &&
-                    active_jobs != active_limit_)
-                {
-                    window_.clear();
-                    observation_.clear();
-                    return changed;
-                }
-                if (settle_remaining_seconds_ > 0.0)
-                {
-                    settle_remaining_seconds_ = (std::max)(
-                        0.0,
-                        settle_remaining_seconds_ - elapsed_seconds);
-                    window_.clear();
-                    observation_.clear();
-                    return changed;
-                }
-            }
-
-            window_.add(delta, elapsed_seconds);
-            if (!window_ready(window_))
-            {
-                return changed;
-            }
-
-            const Measurement measurement =
-                window_.measurement(large_window_bytes_);
-            window_.clear();
-            measurement_diagnostic_ = measurement;
-            ++measurement_sequence_;
-
-            if (!adaptive_enabled_)
-            {
-                last_measurement_ = measurement;
-                return changed;
-            }
-
-            observation_.add(measurement);
-            if (!observation_.ready(observation_target_windows()))
-            {
-                return changed;
-            }
-
-            const Measurement observation =
-                observation_.measurement(large_window_bytes_);
-            observation_.clear();
-            last_measurement_ = observation;
-            return process_observation(observation) || changed;
-        }
-
-        NativeRuntimeSnapshot snapshot(std::size_t active_jobs) const noexcept
-        {
-            return NativeRuntimeSnapshot{
-                active_limit_,
-                active_jobs,
-                phase_,
-                load_state_,
-                decision_,
-                last_measurement_.mode,
-                last_measurement_.bytes_per_second,
-                last_measurement_.jobs_per_second,
-                last_measurement_.files_per_second,
-                pending_write_bytes_,
-                activity_session_,
-                saturated_segment_,
-                warm_start_used_,
-                accepted_probe_,
-                up_failures_,
-                observation_target_windows(),
-                phase_ == NativeControllerPhase::Probe ? probe_direction_ : 0,
-                resource_diagnostics_enabled_,
-                diagnostic_cpu_valid_,
-                diagnostic_cpu_percent_,
-                diagnostic_io_read_rate_,
-                diagnostic_io_write_rate_,
-                measurement_sequence_,
-                measurement_diagnostic_.seconds,
-                measurement_diagnostic_.mode,
-                measurement_diagnostic_.accepted_bytes,
-                measurement_diagnostic_.written_bytes,
-                measurement_diagnostic_.completed_jobs,
-                measurement_diagnostic_.completed_files,
-                measurement_diagnostic_.bytes_per_second,
-                measurement_diagnostic_.jobs_per_second,
-                measurement_diagnostic_.files_per_second,
-            };
-        }
-
-        bool resource_diagnostics_enabled() const noexcept
-        {
-            return resource_diagnostics_enabled_;
-        }
-
-        bool begin_activity(
-            const NativeThroughputCounters &counters,
-            double idle_seconds) noexcept
-        {
-            if (load_state_ != NativeLoadState::Idle)
-            {
-                return false;
-            }
-
-            if (warm_start_decay_seconds_ <= 0.0 ||
-                idle_seconds >= warm_start_decay_seconds_)
-            {
-                confirmed_limit_samples_ = 0;
-                last_good_limit_ = initial_active_jobs_;
-            }
-
-            double retention =
-                warm_start_decay_seconds_ <= 0.0
-                    ? 0.0
-                    : 1.0 - (std::min)(
-                                1.0,
-                                (std::max)(0.0, idle_seconds) /
-                                    warm_start_decay_seconds_);
-            if (confirmed_limit_samples_ < warm_start_confirmations_)
-            {
-                retention = 0.0;
-            }
-
-            active_limit_ = interpolate_toward(
-                initial_active_jobs_,
-                last_good_limit_,
-                retention);
-            warm_start_used_ = active_limit_ != initial_active_jobs_;
-            load_state_ = NativeLoadState::Unsaturated;
-            ++activity_session_;
-            prime_counters(counters);
-            reset_learning_state();
-            decision_ = NativeControllerDecision::ActivityStarted;
-            return true;
-        }
-
-        bool end_activity(const NativeThroughputCounters &counters) noexcept
-        {
-            if (load_state_ == NativeLoadState::Idle)
-            {
-                prime_counters(counters);
-                return false;
-            }
-            if (load_state_ == NativeLoadState::Saturated)
-            {
-                interrupt_saturated_segment();
-            }
-
-            load_state_ = NativeLoadState::Idle;
-            warm_start_used_ = false;
-            accepted_probe_ = false;
-            prime_counters(counters);
-            reset_learning_state();
-            decision_ = NativeControllerDecision::ActivityEnded;
-            diagnostics_primed_ = false;
-            return true;
-        }
-
-    private:
-        static constexpr std::size_t kInitialObservationWindows = 2;
-        static constexpr std::size_t kMaximumObservationWindows = 6;
-        static constexpr std::size_t kDownProbeAfterFailures = 3;
-        static constexpr std::size_t kMaxCruiseRoundsAtCeiling = 3;
-
-        struct CounterDelta
-        {
-            std::uint64_t accepted_bytes = 0;
-            std::uint64_t written_bytes = 0;
-            std::uint64_t completed_files = 0;
-            std::uint64_t completed_jobs = 0;
-        };
-
-        struct Measurement
-        {
-            NativeThroughputMode mode = NativeThroughputMode::None;
-            double seconds = 0.0;
-            double bytes_per_second = 0.0;
-            double jobs_per_second = 0.0;
-            double files_per_second = 0.0;
-            std::uint64_t accepted_bytes = 0;
-            std::uint64_t written_bytes = 0;
-            std::uint64_t completed_jobs = 0;
-            std::uint64_t completed_files = 0;
-        };
-
-        struct Window
-        {
-            double seconds = 0.0;
-            std::uint64_t accepted_bytes = 0;
-            std::uint64_t written_bytes = 0;
-            std::uint64_t completed_jobs = 0;
-            std::uint64_t completed_files = 0;
-
-            void add(
-                const CounterDelta &delta,
-                double elapsed) noexcept
-            {
-                seconds += elapsed;
-                accepted_bytes += delta.accepted_bytes;
-                written_bytes += delta.written_bytes;
-                completed_jobs += delta.completed_jobs;
-                completed_files += delta.completed_files;
-            }
-
-            void clear() noexcept
-            {
-                seconds = 0.0;
-                accepted_bytes = 0;
-                written_bytes = 0;
-                completed_jobs = 0;
-                completed_files = 0;
-            }
-
-            Measurement measurement(
-                std::uint64_t large_bytes) const noexcept
-            {
-                Measurement result;
-                if (seconds <= 0.0)
-                {
-                    return result;
-                }
-
-                result.seconds = seconds;
-                result.accepted_bytes = accepted_bytes;
-                result.written_bytes = written_bytes;
-                result.completed_jobs = completed_jobs;
-                result.completed_files = completed_files;
-                result.bytes_per_second =
-                    static_cast<double>(written_bytes) / seconds;
-                result.jobs_per_second =
-                    static_cast<double>(completed_jobs) / seconds;
-                result.files_per_second =
-                    static_cast<double>(completed_files) / seconds;
-                result.mode =
-                    written_bytes >= large_bytes
-                        ? NativeThroughputMode::Bytes
-                    : completed_jobs != 0
-                        ? NativeThroughputMode::Jobs
-                    : completed_files != 0
-                        ? NativeThroughputMode::Files
-                        : NativeThroughputMode::None;
-                return result;
-            }
-        };
-
-        struct Observation
-        {
-            Window aggregate;
-            std::size_t windows = 0;
-
-            void add(const Measurement &measurement) noexcept
-            {
-                aggregate.seconds += measurement.seconds;
-                aggregate.accepted_bytes += measurement.accepted_bytes;
-                aggregate.written_bytes += measurement.written_bytes;
-                aggregate.completed_jobs += measurement.completed_jobs;
-                aggregate.completed_files += measurement.completed_files;
-                ++windows;
-            }
-
-            void clear() noexcept
-            {
-                aggregate.clear();
-                windows = 0;
-            }
-
-            bool ready(std::size_t target_windows) const noexcept
-            {
-                return windows >= target_windows;
-            }
-
-            Measurement measurement(
-                std::uint64_t large_bytes) const noexcept
-            {
-                return aggregate.measurement(large_bytes);
-            }
-        };
-
-        static std::size_t interpolate_toward(
-            std::size_t start,
-            std::size_t target,
-            double fraction) noexcept
-        {
-            const double clamped =
-                (std::min)(1.0, (std::max)(0.0, fraction));
-            if (start <= target)
-            {
-                return start + static_cast<std::size_t>(
-                                   static_cast<double>(target - start) *
-                                   clamped);
-            }
-            return start - static_cast<std::size_t>(
-                               static_cast<double>(start - target) *
-                               clamped);
-        }
-
-        static std::uint64_t monotonic_delta(
-            std::uint64_t now,
-            std::uint64_t before) noexcept
-        {
-            return now >= before ? now - before : 0;
-        }
-
-        CounterDelta counter_delta(
-            const NativeThroughputCounters &counters) noexcept
-        {
-            if (!counters_primed_)
-            {
-                previous_counters_ = counters;
-                counters_primed_ = true;
-                return {};
-            }
-
-            const CounterDelta delta{
-                monotonic_delta(
-                    counters.accepted_bytes,
-                    previous_counters_.accepted_bytes),
-                monotonic_delta(
-                    counters.written_bytes,
-                    previous_counters_.written_bytes),
-                monotonic_delta(
-                    counters.completed_files,
-                    previous_counters_.completed_files),
-                monotonic_delta(
-                    counters.completed_jobs,
-                    previous_counters_.completed_jobs),
-            };
-            previous_counters_ = counters;
-            return delta;
-        }
-
-        void prime_counters(
-            const NativeThroughputCounters &counters) noexcept
+        if (!active_ || elapsed_seconds <= 0.0)
         {
             previous_counters_ = counters;
             counters_primed_ = true;
-            pending_write_bytes_ =
-                counters.accepted_bytes >= counters.written_bytes
-                    ? counters.accepted_bytes - counters.written_bytes
-                    : 0;
-        }
-
-        void begin_saturated_segment() noexcept
-        {
-            if (phase_ == NativeControllerPhase::Probe)
-            {
-                active_limit_ = best_limit_;
-            }
-            load_state_ = NativeLoadState::Saturated;
-            ++saturated_segment_;
-            reset_learning_state();
-            decision_ = NativeControllerDecision::SegmentStarted;
-        }
-
-        bool interrupt_saturated_segment() noexcept
-        {
-            if (phase_ == NativeControllerPhase::Probe)
-            {
-                active_limit_ = best_limit_;
-            }
-            load_state_ = NativeLoadState::Unsaturated;
-            reset_learning_state();
-            decision_ = NativeControllerDecision::SegmentInterrupted;
-            return true;
-        }
-
-        void remember_confirmed_limit(std::size_t limit) noexcept
-        {
-            if (last_good_limit_ == limit)
-            {
-                confirmed_limit_samples_ =
-                    (std::min)(
-                        warm_start_confirmations_,
-                        confirmed_limit_samples_ + 1);
-            }
-            else
-            {
-                last_good_limit_ = limit;
-                confirmed_limit_samples_ = 1;
-            }
-        }
-
-        void observe_diagnostics(
-            const NativeRuntimeSample &runtime,
-            double elapsed_seconds) noexcept
-        {
-            if (!resource_diagnostics_enabled_)
-            {
-                diagnostic_cpu_valid_ = false;
-                diagnostic_cpu_percent_ = 0.0;
-                diagnostic_io_read_rate_ = 0.0;
-                diagnostic_io_write_rate_ = 0.0;
-                return;
-            }
-
-            diagnostic_cpu_valid_ = runtime.cpu_percent_valid;
-            diagnostic_cpu_percent_ = runtime.cpu_percent;
-            if (!runtime.io_counters_valid || elapsed_seconds <= 0.0)
-            {
-                return;
-            }
-
-            if (diagnostics_primed_)
-            {
-                diagnostic_io_read_rate_ =
-                    static_cast<double>(
-                        monotonic_delta(
-                            runtime.io_read_bytes,
-                            previous_io_read_bytes_)) /
-                    elapsed_seconds;
-                diagnostic_io_write_rate_ =
-                    static_cast<double>(
-                        monotonic_delta(
-                            runtime.io_write_bytes,
-                            previous_io_write_bytes_)) /
-                    elapsed_seconds;
-            }
-            previous_io_read_bytes_ = runtime.io_read_bytes;
-            previous_io_write_bytes_ = runtime.io_write_bytes;
-            diagnostics_primed_ = true;
-        }
-
-        bool window_ready(const Window &window) const noexcept
-        {
-            return window.seconds >= minimum_window_seconds_ &&
-                   (window.written_bytes >= large_window_bytes_ ||
-                    window.completed_jobs >= small_window_jobs_ ||
-                    window.completed_files >= small_window_files_ ||
-                    window.seconds >= maximum_window_seconds_);
-        }
-
-        static double measurement_rate(
-            const Measurement &measurement,
-            NativeThroughputMode mode) noexcept
-        {
-            switch (mode)
-            {
-            case NativeThroughputMode::Bytes:
-                return measurement.bytes_per_second;
-            case NativeThroughputMode::Jobs:
-                return measurement.jobs_per_second;
-            case NativeThroughputMode::Files:
-                return measurement.files_per_second;
-            default:
-                return 0.0;
-            }
-        }
-
-        NativeThroughputMode comparable_mode(
-            const Measurement &first,
-            const Measurement &second) const noexcept
-        {
-            if (first.written_bytes >= large_window_bytes_ &&
-                second.written_bytes >= large_window_bytes_)
-            {
-                return NativeThroughputMode::Bytes;
-            }
-            if (first.completed_jobs >= small_window_jobs_ &&
-                second.completed_jobs >= small_window_jobs_)
-            {
-                return NativeThroughputMode::Jobs;
-            }
-            if (first.completed_files >= small_window_files_ &&
-                second.completed_files >= small_window_files_)
-            {
-                return NativeThroughputMode::Files;
-            }
-            return NativeThroughputMode::None;
-        }
-
-        std::size_t probe_observation_windows() const noexcept
-        {
-            return (std::min)(
-                kMaximumObservationWindows,
-                kInitialObservationWindows + up_failures_);
-        }
-
-        std::size_t observation_target_windows() const noexcept
-        {
-            return phase_ == NativeControllerPhase::Probe
-                       ? probe_observation_windows()
-                       : kInitialObservationWindows;
-        }
-
-        std::size_t upward_step() const noexcept
-        {
-            if (exploration_strategy_ != NativeExplorationStrategy::Rapid)
-            {
-                return 1;
-            }
-            return (std::min)(
-                configured_aggressive_step_,
-                (std::max)(
-                    std::size_t{1},
-                    max_active_jobs_ / 4));
-        }
-
-        bool process_observation(
-            const Measurement &measurement) noexcept
-        {
-            if (measurement.mode == NativeThroughputMode::None)
-            {
-                return false;
-            }
-
-            switch (phase_)
-            {
-            case NativeControllerPhase::Baseline:
-                anchor_ = measurement;
-                best_limit_ = active_limit_;
-                decision_ = NativeControllerDecision::BaselineReady;
-                return choose_next_probe();
-            case NativeControllerPhase::Probe:
-                return evaluate_probe(measurement);
-            case NativeControllerPhase::Cruise:
-                anchor_ = measurement;
-                best_limit_ = active_limit_;
-                return leave_cruise();
-            }
             return false;
         }
 
-        bool choose_next_probe() noexcept
+        if (!counters_primed_)
         {
-            if (best_limit_ > 1 &&
-                up_failures_ >= kDownProbeAfterFailures &&
-                !down_checked_for_failures_)
-            {
-                descending_ = true;
-                return launch_probe(-1);
-            }
+            previous_counters_ = counters;
+            counters_primed_ = true;
+            return false;
+        }
 
-            if (best_limit_ < max_active_jobs_)
-            {
-                descending_ = false;
-                return launch_probe(1);
-            }
+        const std::uint64_t written_delta =
+            counters.written_bytes >= previous_counters_.written_bytes
+                ? counters.written_bytes - previous_counters_.written_bytes
+                : 0;
+        previous_counters_ = counters;
 
-            enter_cruise();
+        // Throughput is meaningful for concurrency control only when the CPU
+        // admission budget is exactly saturated. Under-filled intervals can
+        // reflect too few runnable jobs or task-shape changes; over-filled
+        // intervals can exist transiently after a non-preemptive derate. Both
+        // are discarded so every learned window belongs to one exact budget.
+        if (reserved_cpu_credits != effective_cpu_budget_)
+        {
+            window_seconds_ = 0.0;
+            window_written_bytes_ = 0;
+            saturation_primed_ = false;
+            return false;
+        }
+
+        // The first sample that observes exact saturation only establishes the
+        // start boundary. Its elapsed interval may include time before the
+        // budget became full, so neither its duration nor byte delta belongs
+        // to the observation window. Only subsequent continuously saturated
+        // samples are accumulated.
+        if (!saturation_primed_)
+        {
+            saturation_primed_ = true;
+            window_seconds_ = 0.0;
+            window_written_bytes_ = 0;
+            return false;
+        }
+
+        window_seconds_ += elapsed_seconds;
+        window_written_bytes_ += written_delta;
+
+        if (window_seconds_ < observation_window_seconds_)
+            return false;
+
+        const double measured_seconds = window_seconds_;
+        written_bytes_per_second_ =
+            measured_seconds > 0.0
+                ? static_cast<double>(window_written_bytes_) / measured_seconds
+                : 0.0;
+        window_seconds_ = 0.0;
+        window_written_bytes_ = 0;
+        ++measurement_sequence_;
+
+        if (written_bytes_per_second_ <= 0.0)
+            return false;
+
+        if (reference_bytes_per_second_ <= 0.0 || reobserve_after_budget_change_)
+        {
+            reference_bytes_per_second_ = written_bytes_per_second_;
+            reobserve_after_budget_change_ = false;
+            decision_ = NativeControllerDecision::BaselineEstablished;
             return true;
         }
 
-        bool leave_cruise() noexcept
+        if (!adaptive_enabled_)
+            return false;
+
+        const double ratio =
+            written_bytes_per_second_ / reference_bytes_per_second_;
+
+        if (ratio <= lower_ratio_ && effective_cpu_budget_ > 1)
         {
-            if (best_limit_ == max_active_jobs_)
-            {
-                if (++cruise_rounds_ < kMaxCruiseRoundsAtCeiling)
-                {
-                    decision_ = NativeControllerDecision::Cruising;
-                    return false;
-                }
-                cruise_rounds_ = 0;
-                if (best_limit_ > 1)
-                {
-                    descending_ = true;
-                    return launch_probe(-1);
-                }
-                decision_ = NativeControllerDecision::Cruising;
-                return false;
-            }
-
-            cruise_rounds_ = 0;
-            return choose_next_probe();
-        }
-
-        bool evaluate_probe(
-            const Measurement &trial) noexcept
-        {
-            const NativeThroughputMode mode =
-                comparable_mode(anchor_, trial);
-            const double baseline_rate =
-                measurement_rate(anchor_, mode);
-            const double trial_rate =
-                measurement_rate(trial, mode);
-
-            if (mode == NativeThroughputMode::None ||
-                baseline_rate <= 0.0 ||
-                trial_rate <= 0.0)
-            {
-                return rollback_probe();
-            }
-
-            const double ratio = trial_rate / baseline_rate;
-            if (probe_direction_ > 0)
-            {
-                return evaluate_up_probe(trial, ratio);
-            }
-            return evaluate_down_probe(trial, ratio);
-        }
-
-        bool evaluate_up_probe(
-            const Measurement &trial,
-            double ratio) noexcept
-        {
-            if (ratio >= improvement_ratio_)
-            {
-                best_limit_ = probe_limit_;
-                active_limit_ = best_limit_;
-                anchor_ = trial;
-                up_failures_ = 0;
-                down_checked_for_failures_ = false;
-                descending_ = false;
-                cruise_rounds_ = 0;
-                accepted_probe_ = true;
-                remember_confirmed_limit(best_limit_);
-
-                if (best_limit_ < max_active_jobs_)
-                {
-                    // Keep moving immediately. The accepted_probe flag preserves the
-                    // acceptance even though ProbeUp becomes the visible decision.
-                    return launch_probe(1);
-                }
-
-                decision_ = NativeControllerDecision::Accepted;
-                enter_cruise(false);
-                return true;
-            }
-
-            if (ratio < regression_ratio_)
-            {
-                return rollback_probe();
-            }
-
-            // Ambiguous evidence is deliberately treated optimistically. Keep the
-            // speculative concurrency, but do not move the confirmed baseline. A
-            // later step must either accumulate a >= improvement_ratio gain versus
-            // the same anchor or regress enough to roll the entire speculation back.
-            if (active_limit_ < max_active_jobs_)
-            {
-                return launch_probe(1);
-            }
-
-            return rollback_probe();
-        }
-
-        bool evaluate_down_probe(
-            const Measurement &trial,
-            double ratio) noexcept
-        {
-            if (ratio >= regression_ratio_)
-            {
-                // Equal throughput at lower concurrency is preferable. Once a
-                // downward correction is justified, continue descending until a
-                // lower point is measurably worse.
-                best_limit_ = probe_limit_;
-                active_limit_ = best_limit_;
-                anchor_ = trial;
-                up_failures_ = 0;
-                down_checked_for_failures_ = false;
-                cruise_rounds_ = 0;
-                accepted_probe_ = true;
-                remember_confirmed_limit(best_limit_);
-
-                if (best_limit_ > 1 && descending_)
-                {
-                    return launch_probe(-1);
-                }
-
-                decision_ = NativeControllerDecision::Accepted;
-                enter_cruise(false);
-                return true;
-            }
-
-            active_limit_ = best_limit_;
-            down_checked_for_failures_ = true;
-            descending_ = false;
-            phase_ = NativeControllerPhase::Cruise;
-            observation_.clear();
-            settle_remaining_seconds_ = settle_seconds_;
-            decision_ = NativeControllerDecision::RolledBack;
-            remember_confirmed_limit(best_limit_);
+            effective_cpu_budget_ =
+                effective_cpu_budget_ > budget_step_
+                    ? effective_cpu_budget_ - budget_step_
+                    : std::size_t{1};
+            reobserve_after_budget_change_ = true;
+            reference_bytes_per_second_ = 0.0;
+            saturation_primed_ = false;
+            decision_ = NativeControllerDecision::BudgetReduced;
             return true;
         }
 
-        bool rollback_probe() noexcept
+        if (ratio >= upper_ratio_ &&
+            effective_cpu_budget_ < nominal_cpu_budget_)
         {
-            active_limit_ = best_limit_;
-            if (probe_direction_ > 0)
-            {
-                ++up_failures_;
-                down_checked_for_failures_ = false;
-            }
-            else
-            {
-                down_checked_for_failures_ = true;
-                descending_ = false;
-            }
-            phase_ = NativeControllerPhase::Cruise;
-            observation_.clear();
-            settle_remaining_seconds_ = settle_seconds_;
-            decision_ = NativeControllerDecision::RolledBack;
-            remember_confirmed_limit(best_limit_);
+            effective_cpu_budget_ =
+                (std::min)(
+                    nominal_cpu_budget_,
+                    effective_cpu_budget_ + budget_step_);
+            reobserve_after_budget_change_ = true;
+            reference_bytes_per_second_ = 0.0;
+            saturation_primed_ = false;
+            decision_ = NativeControllerDecision::BudgetRestored;
             return true;
         }
 
-        bool launch_probe(int direction) noexcept
-        {
-            const std::size_t target =
-                direction > 0
-                    ? (std::min)(
-                          max_active_jobs_,
-                          active_limit_ +
-                              (std::min)(
-                                  upward_step(),
-                                  max_active_jobs_ - active_limit_))
-                    : active_limit_ > 1
-                          ? active_limit_ - 1
-                          : std::size_t{1};
+        return false;
+    }
 
-            if (target == active_limit_)
-            {
-                enter_cruise();
-                return false;
-            }
+    NativeRuntimeSnapshot snapshot(std::size_t active_jobs) const noexcept
+    {
+        return {
+            nominal_cpu_budget_,
+            effective_cpu_budget_,
+            budget_step_,
+            active_jobs,
+            decision_,
+            written_bytes_per_second_,
+            reference_bytes_per_second_,
+            observation_window_seconds_,
+            measurement_sequence_,
+            resource_diagnostics_enabled_,
+            cpu_percent_valid_,
+            cpu_percent_,
+        };
+    }
 
-            active_limit_ = target;
-            probe_limit_ = target;
-            probe_direction_ = direction;
-            phase_ = NativeControllerPhase::Probe;
-            observation_.clear();
-            settle_remaining_seconds_ = settle_seconds_;
-            decision_ =
-                direction > 0
-                    ? NativeControllerDecision::ProbeUp
-                    : NativeControllerDecision::ProbeDown;
-            return true;
-        }
+    std::size_t effective_cpu_budget() const noexcept
+    {
+        return effective_cpu_budget_;
+    }
 
-        void enter_cruise(bool announce = true) noexcept
-        {
-            active_limit_ = best_limit_;
-            phase_ = NativeControllerPhase::Cruise;
-            observation_.clear();
-            settle_remaining_seconds_ = settle_seconds_;
-            if (announce)
-            {
-                decision_ = NativeControllerDecision::Cruising;
-            }
-        }
+    bool resource_diagnostics_enabled() const noexcept
+    {
+        return resource_diagnostics_enabled_;
+    }
 
-        void reset_learning_state() noexcept
-        {
-            best_limit_ = active_limit_;
-            phase_ = NativeControllerPhase::Baseline;
-            decision_ = NativeControllerDecision::None;
-            last_measurement_ = {};
-            accepted_probe_ = false;
-            anchor_ = {};
-            probe_limit_ = active_limit_;
-            probe_direction_ = 0;
-            window_.clear();
-            observation_.clear();
-            up_failures_ = 0;
-            down_checked_for_failures_ = false;
-            descending_ = false;
-            cruise_rounds_ = 0;
-            settle_remaining_seconds_ = 0.0;
-        }
+    bool measurement_diagnostics_enabled() const noexcept
+    {
+        return measurement_diagnostics_enabled_;
+    }
 
-        const std::size_t max_active_jobs_;
-        const bool adaptive_enabled_;
-        const bool resource_diagnostics_enabled_;
-        const bool measurement_diagnostics_enabled_;
-        const NativeExplorationStrategy exploration_strategy_;
-        const double minimum_window_seconds_;
-        const double maximum_window_seconds_;
-        const double settle_seconds_;
-        const std::uint64_t large_window_bytes_;
-        const std::size_t small_window_jobs_;
-        const std::size_t small_window_files_;
-        const double improvement_ratio_;
-        const double regression_ratio_;
-        const std::size_t configured_aggressive_step_;
-        const double warm_start_decay_seconds_;
-        const std::size_t warm_start_confirmations_;
+private:
+    const std::size_t nominal_cpu_budget_;
+    std::size_t effective_cpu_budget_;
+    const std::size_t budget_step_;
+    const bool adaptive_enabled_;
+    const bool resource_diagnostics_enabled_;
+    const bool measurement_diagnostics_enabled_;
+    const double observation_window_seconds_;
+    const double lower_ratio_;
+    const double upper_ratio_;
 
-        std::size_t initial_active_jobs_ = 1;
-        std::size_t active_limit_ = 1;
-        std::size_t best_limit_ = 1;
-        NativeControllerPhase phase_ = NativeControllerPhase::Baseline;
-        NativeLoadState load_state_ = NativeLoadState::Idle;
-        NativeControllerDecision decision_ = NativeControllerDecision::None;
-
-        Measurement last_measurement_;
-        Measurement measurement_diagnostic_;
-        std::uint64_t measurement_sequence_ = 0;
-        Measurement anchor_;
-
-        std::size_t probe_limit_ = 1;
-        int probe_direction_ = 0;
-        Window window_;
-        Observation observation_;
-
-        bool counters_primed_ = false;
-        NativeThroughputCounters previous_counters_;
-        std::uint64_t pending_write_bytes_ = 0;
-
-        std::size_t up_failures_ = 0;
-        bool down_checked_for_failures_ = false;
-        bool descending_ = false;
-        std::size_t
-        std::size_t cruise_rounds_ = 0;
-        double settle_remaining_seconds_ = 0.0;
-
-        std::uint64_t activity_session_ = 0;
-        std::uint64_t saturated_segment_ = 0;
-        std::size_t last_good_limit_ = 1;
-        std::size_t confirmed_limit_samples_ = 0;
-        bool warm_start_used_ = false;
-        bool accepted_probe_ = false;
-
-        bool diagnostic_cpu_valid_ = false;
-        double diagnostic_cpu_percent_ = 0.0;
-        bool diagnostics_primed_ = false;
-        std::uint64_t previous_io_read_bytes_ = 0;
-        std::uint64_t previous_io_write_bytes_ = 0;
-        double diagnostic_io_read_rate_ = 0.0;
-        double diagnostic_io_write_rate_ = 0.0;
-    };
+    NativeControllerDecision decision_ = NativeControllerDecision::None;
+    NativeThroughputCounters previous_counters_{};
+    bool counters_primed_ = false;
+    bool active_ = false;
+    bool reobserve_after_budget_change_ = false;
+    bool saturation_primed_ = false;
+    double window_seconds_ = 0.0;
+    std::uint64_t window_written_bytes_ = 0;
+    double written_bytes_per_second_ = 0.0;
+    double reference_bytes_per_second_ = 0.0;
+    std::uint64_t measurement_sequence_ = 0;
+    bool cpu_percent_valid_ = false;
+    double cpu_percent_ = 0.0;
+};
 
 } // namespace sunpack::sevenzip
