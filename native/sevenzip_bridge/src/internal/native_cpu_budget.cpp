@@ -227,16 +227,23 @@ NativeCpuJobSnapshot NativeCpuJobContext::snapshot() const noexcept
     };
 }
 
+NativeCpuJobContext *exchange_native_cpu_job_context(
+    NativeCpuJobContext *context) noexcept
+{
+    NativeCpuJobContext *previous = g_current_cpu_context;
+    g_current_cpu_context = context;
+    return previous;
+}
+
 NativeCpuContextScope::NativeCpuContextScope(
     NativeCpuJobContext *context) noexcept
-    : previous_(g_current_cpu_context)
+    : previous_(exchange_native_cpu_job_context(context))
 {
-    g_current_cpu_context = context;
 }
 
 NativeCpuContextScope::~NativeCpuContextScope()
 {
-    g_current_cpu_context = previous_;
+    exchange_native_cpu_job_context(previous_);
 }
 
 NativeCpuJobContext *current_native_cpu_job_context() noexcept
@@ -253,6 +260,13 @@ void *sunpack_cpu_current_job_context(void)
 {
     return static_cast<void *>(
         sunpack::sevenzip::current_native_cpu_job_context());
+}
+
+void *sunpack_cpu_exchange_current_job_context(void *context)
+{
+    return static_cast<void *>(
+        sunpack::sevenzip::exchange_native_cpu_job_context(
+            static_cast<sunpack::sevenzip::NativeCpuJobContext *>(context)));
 }
 
 unsigned sunpack_cpu_acquire_extra_for_context(
