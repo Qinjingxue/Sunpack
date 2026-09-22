@@ -709,8 +709,7 @@ namespace NCompress
                            _inputBuf(NULL)
 #ifndef Z7_ST
                            ,
-                           _numThreads(1), _mtPool(NULL), _mtPoolWorkers(0),
-                           _sunpackCpuContext(NULL), _sunpackCpuCredits(0)
+                           _numThreads(1), _mtPool(NULL)
 #endif
     {
 #if 1
@@ -740,12 +739,6 @@ namespace NCompress
 #ifndef Z7_ST
       DestroyRar5ParallelBlockPool(_mtPool);
       _mtPool = NULL;
-      _mtPoolWorkers = 0;
-      if (_sunpackCpuContext && _sunpackCpuCredits)
-        sunpack_cpu_release_extra_for_context(
-            _sunpackCpuContext, _sunpackCpuCredits);
-      _sunpackCpuContext = NULL;
-      _sunpackCpuCredits = 0;
 #endif
 
       Z7_RAR_FREE_WINDOW
@@ -1399,8 +1392,7 @@ namespace NCompress
 
 #ifndef Z7_ST
 
-    static const UInt64 kRar5MtInputThreshold = (UInt64)1 << 20;
-    static const UInt32 kRar5MtLargeBlockSize = 0x20000;
+    static const unsigned kMaxRar5ParallelWorkers = 8;
     static const unsigned kRar5MtBlocksPerWorker = 2;
 
     enum ERar5ParallelDecodedType
@@ -1904,6 +1896,12 @@ namespace NCompress
         return S_OK;
       }
 
+      bool IsDone()
+      {
+        std::lock_guard<std::mutex> lock(Mutex);
+        return Done;
+      }
+
       HRESULT Wait()
       {
         std::unique_lock<std::mutex> lock(Mutex);
@@ -1922,6 +1920,8 @@ namespace NCompress
       std::condition_variable _workEvent;
       std::condition_variable _idleEvent;
       size_t _pending;
+      unsigned _activeWorkers;
+      unsigned _runningWorkers;
       bool _stop;
 
       void WorkerLoop()
@@ -1932,52 +1932,94 @@ namespace NCompress
           {
             std::unique_lock<std::mutex> lock(_mutex);
             _workEvent.wait(lock, [this]
-                            { return _stop || !_queue.empty(); });
+                            {
+                              return _stop ||
+                                  (!_queue.empty() &&
+                                   _runningWorkers < _activeWorkers);
+                            });
             if (_stop && _queue.empty())
               return;
+            if (_queue.empty() || _runningWorkers >= _activeWorkers)
+              continue;
             job = _queue.front();
             _queue.pop_front();
+            ++_runningWorkers;
           }
 
           job->Process();
 
           {
             std::lock_guard<std::mutex> lock(_mutex);
+            if (_runningWorkers != 0)
+              --_runningWorkers;
             if (_pending != 0)
               --_pending;
             if (_pending == 0)
               _idleEvent.notify_all();
+            else if (!_queue.empty() && _runningWorkers < _activeWorkers)
+              _workEvent.notify_one();
           }
         }
       }
 
     public:
-      CRar5ParallelBlockPool() : _pending(0), _stop(false) {}
+      CRar5ParallelBlockPool()
+          : _pending(0),
+            _activeWorkers(0),
+            _runningWorkers(0),
+            _stop(false)
+      {
+      }
 
       ~CRar5ParallelBlockPool()
       {
         Stop();
       }
 
-      bool Start(unsigned numWorkers, size_t ringSize)
+      bool PrepareJobs(size_t ringSize)
       {
+        if (_jobs.size() >= ringSize)
+          return true;
+
         try
         {
           _jobs.reserve(ringSize);
-          for (size_t i = 0; i < ringSize; ++i)
-            _jobs.push_back(std::unique_ptr<CRar5ParallelBlockJob>(new CRar5ParallelBlockJob()));
+          while (_jobs.size() < ringSize)
+            _jobs.push_back(
+                std::unique_ptr<CRar5ParallelBlockJob>(
+                    new CRar5ParallelBlockJob()));
+        }
+        catch (...)
+        {
+          return false;
+        }
+        return true;
+      }
 
+      bool EnsureWorkerCount(unsigned numWorkers)
+      {
+        try
+        {
           _threads.reserve(numWorkers);
-          for (unsigned i = 0; i < numWorkers; i++)
+          while (_threads.size() < numWorkers)
             _threads.emplace_back([this]
                                   { WorkerLoop(); });
         }
         catch (...)
         {
-          Stop();
           return false;
         }
         return true;
+      }
+
+      void SetActiveWorkers(unsigned numWorkers)
+      {
+        {
+          std::lock_guard<std::mutex> lock(_mutex);
+          _activeWorkers =
+              (std::min)(numWorkers, (unsigned)_threads.size());
+        }
+        _workEvent.notify_all();
       }
 
       void WaitIdle()
@@ -1992,6 +2034,7 @@ namespace NCompress
         WaitIdle();
         {
           std::lock_guard<std::mutex> lock(_mutex);
+          _activeWorkers = 0;
           _stop = true;
         }
         _workEvent.notify_all();
@@ -2040,83 +2083,6 @@ namespace NCompress
       ~CRar5ParallelPoolRunScope() { _pool.WaitIdle(); }
     };
 
-    Z7_CLASS_IMP_NOQIB_1(
-        CRar5ReplayInStream, ISequentialInStream)
-    CMyComPtr<ISequentialInStream> _stream;
-    Byte _prefix[5];
-    unsigned _prefixSize;
-    unsigned _prefixPos;
-
-  public:
-    CRar5ReplayInStream() : _prefixSize(0), _prefixPos(0) {}
-    void Init(const Byte *prefix, unsigned prefixSize, ISequentialInStream *stream)
-    {
-      _prefixSize = prefixSize;
-      _prefixPos = 0;
-      memcpy(_prefix, prefix, prefixSize);
-      _stream = stream;
-    }
-  };
-
-  Z7_COM7F_IMF(CRar5ReplayInStream::Read(void *data, UInt32 size, UInt32 *processedSize))
-  {
-    *processedSize = 0;
-    Byte *dest = (Byte *)data;
-
-    if (_prefixPos < _prefixSize && size != 0)
-    {
-      UInt32 cur = (UInt32)(_prefixSize - _prefixPos);
-      if (cur > size)
-        cur = size;
-      memcpy(dest, _prefix + _prefixPos, cur);
-      _prefixPos += cur;
-      dest += cur;
-      size -= cur;
-      *processedSize += cur;
-    }
-
-    if (size == 0)
-      return S_OK;
-
-    UInt32 processed = 0;
-    const HRESULT res = _stream->Read(dest, size, &processed);
-    *processedSize += processed;
-    return res;
-  }
-
-  Z7_CLASS_IMP_NOQIB_1(
-      CRar5ProgressOffset, ICompressProgressInfo)
-  CMyComPtr<ICompressProgressInfo> _progress;
-  UInt64 _inOffset;
-
-public:
-  CRar5ProgressOffset() : _inOffset(0) {}
-
-  void Init(ICompressProgressInfo *progress, UInt64 inOffset)
-  {
-    _progress = progress;
-    _inOffset = inOffset;
-  }
-};
-
-Z7_COM7F_IMF(CRar5ProgressOffset::SetRatioInfo(
-    const UInt64 *inSize, const UInt64 *outSize))
-{
-  if (!_progress)
-    return S_OK;
-
-  if (!inSize)
-    return _progress->SetRatioInfo(NULL, outSize);
-
-  UInt64 adjusted = *inSize;
-  if (adjusted > (UInt64)(Int64)-1 - _inOffset)
-    adjusted = (UInt64)(Int64)-1;
-  else
-    adjusted += _inOffset;
-
-  return _progress->SetRatioInfo(&adjusted, outSize);
-}
-
 struct CRar5RawBlockHeader
 {
   Byte Bytes[5];
@@ -2124,13 +2090,11 @@ struct CRar5RawBlockHeader
   UInt32 BlockSize;
   bool LastBlock;
   bool TablePresent;
-  bool UseSerial;
 
   CRar5RawBlockHeader() : HeaderSize(0),
                           BlockSize(0),
                           LastBlock(false),
-                          TablePresent(false),
-                          UseSerial(false)
+                          TablePresent(false)
   {
   }
 };
@@ -2171,11 +2135,6 @@ static HRESULT ReadRar5RawBlockHeader(
   header.BlockSize = blockSize;
   header.LastBlock = (flags & 0x40) != 0;
   header.TablePresent = (flags & 0x80) != 0;
-
-  // UnRAR switches oversized compressed blocks back to its serial path to
-  // bound decoded-event memory. Do the same, but replay the already consumed
-  // header into the untouched 7-Zip DecodeLZ implementation.
-  header.UseSerial = (blockSize == 0 || blockSize > kRar5MtLargeBlockSize);
   return S_OK;
 }
 
@@ -3289,8 +3248,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 
   HRESULT res;
 #ifndef Z7_ST
-  if (inSize && *inSize >= kRar5MtInputThreshold &&
-      (sunpack_cpu_current_job_context() || _numThreads > 1))
+  if (sunpack_cpu_current_job_context() || _numThreads > 1)
     res = CodeRealParallel();
   else
 #endif
