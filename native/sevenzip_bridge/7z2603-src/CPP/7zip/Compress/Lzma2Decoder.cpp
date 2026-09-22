@@ -5,6 +5,8 @@
 // #include <stdio.h>
 
 #include "../../../C/Alloc.h"
+#include "../../../C/MtDec.h"
+#include "internal/decoder_cpu_budget.h"
 // #include "../../../C/CpuTicks.h"
 
 #include "../Common/StreamUtils.h"
@@ -105,11 +107,13 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   #ifndef Z7_ST
   {
     props.numThreads = 1;
-    UInt32 numThreads = _numThreads;
+    const bool creditManaged =
+        sunpack_cpu_current_job_context() != NULL;
+    UInt32 numThreads =
+        creditManaged ? MTDEC_THREADS_MAX : _numThreads;
 
-    if (_tryMt && numThreads >= 1)
+    if (creditManaged || (_tryMt && numThreads >= 1))
     {
-      const UInt64 useLimit = _memUsage;
       const UInt32 dictSize = LZMA2_DIC_SIZE_FROM_PROP_FULL(_prop);
       const UInt64 expectedBlockSize64 = Get_ExpectedBlockSize_From_Dict(dictSize);
       const size_t expectedBlockSize = (size_t)expectedBlockSize64;
@@ -118,12 +122,19 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
       {
         props.outBlockMax = expectedBlockSize;
         props.inBlockMax = inBlockMax;
-        const size_t kOverheadSize = props.inBufSize_MT + (1 << 16);
-        const UInt64 okThreads = useLimit / (props.outBlockMax + props.inBlockMax + kOverheadSize);
-        if (numThreads > okThreads)
-          numThreads = (UInt32)okThreads;
-        if (numThreads == 0)
-          numThreads = 1;
+
+        if (!creditManaged)
+        {
+          const UInt64 useLimit = _memUsage;
+          const size_t kOverheadSize = props.inBufSize_MT + (1 << 16);
+          const UInt64 okThreads =
+              useLimit / (props.outBlockMax + props.inBlockMax + kOverheadSize);
+          if (numThreads > okThreads)
+            numThreads = (UInt32)okThreads;
+          if (numThreads == 0)
+            numThreads = 1;
+        }
+
         props.numThreads = numThreads;
       }
     }

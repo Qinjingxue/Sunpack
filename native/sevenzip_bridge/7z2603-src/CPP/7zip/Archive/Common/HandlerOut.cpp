@@ -88,10 +88,21 @@ bool CCommonMethodProps::SetCommonProperty(const UString &name, const PROPVARIAN
   if (name.IsPrefixedBy_Ascii_NoCase("mt"))
   {
     #ifndef Z7_ST
-    _numThreads = _numProcessors;
-    _numThreads_WasForced = false;
-    hres = ParseMtProp2(name.Ptr(2), value, _numThreads, _numThreads_WasForced);
-    // "mt" means "_numThreads_WasForced = false" here
+    if (sunpack_cpu_current_job_context())
+    {
+      // CPU credits are the sole worker concurrency authority. Keep accepting
+      // the legacy property for compatibility, but do not let it constrain
+      // decoder parallelism inside a SunPack job.
+      _numThreads = SUNPACK_CPU_MANAGED_THREAD_HINT;
+      _numThreads_WasForced = false;
+    }
+    else
+    {
+      _numThreads = _numProcessors;
+      _numThreads_WasForced = false;
+      hres = ParseMtProp2(name.Ptr(2), value, _numThreads, _numThreads_WasForced);
+      // "mt" means "_numThreads_WasForced = false" here
+    }
     #endif
     return true;
   }

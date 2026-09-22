@@ -253,6 +253,36 @@ bool check_cpu_budget_tracks_decoder_thread_lifetimes() {
     return budget.reserved_credits() == 0;
 }
 
+bool check_cpu_budget_acquire_all_available() {
+    using namespace sunpack::sevenzip;
+    NativeCpuBudget budget(8);
+    if (!budget.try_acquire_base() || !budget.try_acquire_base()) {
+        return false;
+    }
+
+    NativeCpuJobContext first(budget);
+    NativeCpuJobContext second(budget);
+
+    if (sunpack_cpu_acquire_all_available_for_context(&first) != 6 ||
+        budget.reserved_credits() != 8 ||
+        first.snapshot().current_extra_credits != 6) {
+        return false;
+    }
+
+    first.release_extra(2);
+    if (budget.reserved_credits() != 6 ||
+        sunpack_cpu_acquire_all_available_for_context(&second) != 2 ||
+        budget.reserved_credits() != 8 ||
+        second.snapshot().current_extra_credits != 2) {
+        return false;
+    }
+
+    first.release_extra(4);
+    second.release_extra(2);
+    budget.release(2);
+    return budget.reserved_credits() == 0;
+}
+
 bool check_runtime_control_establishes_one_second_baseline() {
     using namespace sunpack::sevenzip;
     NativeRuntimeControl controller(16, deterministic_runtime_config());
@@ -606,6 +636,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_cpu_budget_tracks_decoder_thread_lifetimes()) {
         std::cerr << "CPU decoder-thread lifetime credit check failed\n";
         return 28;
+    }
+    if (!check_cpu_budget_acquire_all_available()) {
+        std::cerr << "CPU acquire-all credit check failed\n";
+        return 31;
     }
     if (!check_runtime_control_establishes_one_second_baseline()) {
         std::cerr << "runtime one-second baseline check failed\n";

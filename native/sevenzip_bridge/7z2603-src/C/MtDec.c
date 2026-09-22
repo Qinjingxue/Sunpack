@@ -563,7 +563,8 @@ static WRes MtDec_ThreadFunc2(CMtDecThread *t)
 
         if (granted == 0)
         {
-          p->numStartedThreads_Limit = p->numStartedThreads;
+          // Credits can become available later as other decoder lanes finish.
+          // Keep the codec hard ceiling intact and retry on a later block.
         }
         else
         {
@@ -1076,7 +1077,8 @@ SRes MtDec_Code(CMtDec *p)
   p->numFilledThreads = 0;
 
   {
-    unsigned numThreads = p->numThreadsMax;
+    unsigned numThreads =
+        p->sunpackCpuContext ? MTDEC_THREADS_MAX : p->numThreadsMax;
     if (numThreads > MTDEC_THREADS_MAX)
       numThreads = MTDEC_THREADS_MAX;
     p->numStartedThreads_Limit = numThreads;

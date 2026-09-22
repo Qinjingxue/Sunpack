@@ -53,19 +53,26 @@ HRESULT CDecoder::Decode(ISequentialInStream *seqInStream, ISequentialOutStream 
 
   #ifndef Z7_ST
   {
-    props.numThreads = 1;
-    const UInt32 numThreads = _numThreads;
+    const bool creditManaged =
+        sunpack_cpu_current_job_context() != NULL;
+    const UInt32 numThreads =
+        creditManaged ? MTDEC_THREADS_MAX : _numThreads;
 
-    if (_tryMt && numThreads > 1)
+    props.numThreads = numThreads;
+
+    if (creditManaged)
+    {
+      props.memUseMax = (size_t)0 - 1;
+      isMT = True;
+    }
+    else if (_tryMt && numThreads > 1)
     {
       size_t memUsage = (size_t)_memUsage;
       if (memUsage != _memUsage)
         memUsage = (size_t)0 - 1;
       props.memUseMax = memUsage;
-      isMT = (numThreads > 1);
+      isMT = True;
     }
-
-    props.numThreads = numThreads;
   }
   #endif
 

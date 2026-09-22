@@ -1,6 +1,6 @@
 // Rar5Handler.cpp
-// Modified for SunPack on 2026-09-20: forward RAR5 "mt" settings to the
-// decoder while preserving the upstream archive/volume/extraction machinery.
+// Modified for SunPack: preserve upstream archive/volume/extraction machinery
+// while delegating worker decoder concurrency exclusively to the CPU-credit broker.
 
 #include "StdAfx.h"
 
@@ -40,6 +40,7 @@
 
 #include "../../Archive/Rar/RarVol.h"
 #include "Rar5Handler.h"
+#include "internal/decoder_cpu_budget.h"
 
 using namespace NWindows;
 
@@ -3374,14 +3375,21 @@ void CHandler::InitDefaults()
   _memUsage_WasSet = false;
   _memUsage_Decompress = (UInt64)1 << 32;
 #ifndef Z7_ST
+  if (sunpack_cpu_current_job_context())
+  {
+    _numThreads = SUNPACK_CPU_MANAGED_THREAD_HINT;
+  }
+  else
+  {
 #ifdef _WIN32
-  NWindows::NSystem::CProcessAffinity affinity;
-  _numThreads = affinity.Load_and_GetNumberOfThreads();
+    NWindows::NSystem::CProcessAffinity affinity;
+    _numThreads = affinity.Load_and_GetNumberOfThreads();
 #else
-  _numThreads = NWindows::NSystem::GetNumberOfProcessors();
+    _numThreads = NWindows::NSystem::GetNumberOfProcessors();
 #endif
-  if (_numThreads == 0)
-    _numThreads = 1;
+    if (_numThreads == 0)
+      _numThreads = 1;
+  }
 #endif
 }
 
@@ -3401,8 +3409,15 @@ Z7_COM7F_IMF(CHandler::SetProperties(const wchar_t * const *names, const PROPVAR
     if (name.IsPrefixedBy_Ascii_NoCase("mt"))
     {
 #ifndef Z7_ST
-      bool forced = false;
-      RINOK(ParseMtProp2(name.Ptr(2), prop, _numThreads, forced))
+      if (sunpack_cpu_current_job_context())
+      {
+        _numThreads = SUNPACK_CPU_MANAGED_THREAD_HINT;
+      }
+      else
+      {
+        bool forced = false;
+        RINOK(ParseMtProp2(name.Ptr(2), prop, _numThreads, forced))
+      }
 #endif
     }
     else if (name.IsPrefixedBy_Ascii_NoCase("memx"))

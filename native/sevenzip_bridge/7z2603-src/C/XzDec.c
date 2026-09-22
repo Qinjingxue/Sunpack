@@ -1754,7 +1754,8 @@ static void XzDecMt_Callback_Parse(void *obj, unsigned coderIndex, CMtDecCallbac
           && XzBlock_HasPackSize(block))
       {
         {
-          if (block->unpackSize * 2 * me->mtc.numStartedThreads > me->props.memUseMax)
+          if (!me->mtc.sunpackCpuContext &&
+              block->unpackSize * 2 * me->mtc.numStartedThreads > me->props.memUseMax)
           {
             cc->state = MTDEC_PARSE_OVERFLOW;
             return; // SZ_OK;
@@ -1822,7 +1823,8 @@ static void XzDecMt_Callback_Parse(void *obj, unsigned coderIndex, CMtDecCallbac
             blockMax = coder->outPreSize;
           {
             UInt64 required = (UInt64)blockMax * (me->mtc.numStartedThreads + 1) * 2;
-            if (me->props.memUseMax < required)
+            if (!me->mtc.sunpackCpuContext &&
+                me->props.memUseMax < required)
               cc->canCreateNewThread = False;
           }
         }

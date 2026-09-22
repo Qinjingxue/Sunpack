@@ -1399,16 +1399,6 @@ namespace NCompress
 
 #ifndef Z7_ST
 
-    // Keep the same conservative thread policy as SunPack's BZip2 block pipeline.
-    // RAR5 retirement is dictionary-ordered, so extra workers beyond 8 mostly add
-    // memory pressure rather than useful decode overlap.
-    static unsigned GetRar5ParallelWorkerCount(UInt32 numThreads)
-    {
-      if (numThreads < 4)
-        return 0;
-      return (unsigned)std::min<UInt32>(numThreads, 8);
-    }
-
     static const UInt64 kRar5MtInputThreshold = (UInt64)1 << 20;
     static const UInt32 kRar5MtLargeBlockSize = 0x20000;
     static const unsigned kRar5MtBlocksPerWorker = 2;
@@ -2624,21 +2614,17 @@ HRESULT CDecoder::DecodeLZ()
 
 HRESULT CDecoder::DecodeLZParallel()
 {
-  const unsigned requestedWorkers = GetRar5ParallelWorkerCount(_numThreads);
-  if (requestedWorkers == 0)
-    return DecodeLZ();
-
   if (!_mtPool)
   {
     if (!_sunpackCpuContext)
       _sunpackCpuContext = sunpack_cpu_current_job_context();
 
-    unsigned grantedWorkers = requestedWorkers;
+    unsigned grantedWorkers = 0;
     if (_sunpackCpuContext)
-      grantedWorkers = sunpack_cpu_acquire_extra_for_context(
-          _sunpackCpuContext,
-          requestedWorkers,
-          (std::min)(requestedWorkers, 4u));
+      grantedWorkers =
+          sunpack_cpu_acquire_all_available_for_context(_sunpackCpuContext);
+    else if (_numThreads > 1)
+      grantedWorkers = _numThreads - 1;
 
     if (grantedWorkers == 0)
       return DecodeLZ();
@@ -3301,7 +3287,8 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 
   HRESULT res;
 #ifndef Z7_ST
-  if (GetRar5ParallelWorkerCount(_numThreads) != 0 && inSize && *inSize >= kRar5MtInputThreshold)
+  if (inSize && *inSize >= kRar5MtInputThreshold &&
+      (sunpack_cpu_current_job_context() || _numThreads > 1))
     res = CodeRealParallel();
   else
 #endif
@@ -3320,7 +3307,8 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 #ifndef Z7_ST
 Z7_COM7F_IMF(CDecoder::SetNumberOfThreads(UInt32 numThreads))
 {
-  _numThreads = numThreads == 0 ? 1 : numThreads;
+  if (!sunpack_cpu_current_job_context())
+    _numThreads = numThreads == 0 ? 1 : numThreads;
   return S_OK;
 }
 #endif
