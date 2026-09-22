@@ -137,10 +137,11 @@ public:
         previous_counters_ = counters;
 
         // Throughput is meaningful for concurrency control only when the CPU
-        // admission budget is actually the binding constraint. Any unsaturated
-        // interval can reflect too few runnable jobs or task-shape changes, so
-        // discard the partial window instead of learning from it.
-        if (reserved_cpu_credits < effective_cpu_budget_)
+        // admission budget is exactly saturated. Under-filled intervals can
+        // reflect too few runnable jobs or task-shape changes; over-filled
+        // intervals can exist transiently after a non-preemptive derate. Both
+        // are discarded so every learned window belongs to one exact budget.
+        if (reserved_cpu_credits != effective_cpu_budget_)
         {
             window_seconds_ = 0.0;
             window_written_bytes_ = 0;
