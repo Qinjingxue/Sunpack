@@ -2,6 +2,7 @@
 #include "decoder_cpu_budget.h"
 
 #include <algorithm>
+#include <limits>
 #include <utility>
 
 namespace sunpack::sevenzip
@@ -55,6 +56,11 @@ std::size_t NativeCpuBudget::acquire_up_to(
                 std::memory_order_acquire))
             return grant;
     }
+}
+
+std::size_t NativeCpuBudget::acquire_all_available() noexcept
+{
+    return acquire_up_to((std::numeric_limits<std::size_t>::max)(), 1);
 }
 
 void NativeCpuBudget::release(std::size_t count) noexcept
@@ -163,6 +169,33 @@ std::size_t NativeCpuJobContext::acquire_extra(
     return granted;
 }
 
+std::size_t NativeCpuJobContext::acquire_all_available() noexcept
+{
+    if (!budget_)
+        return 0;
+
+    const std::size_t granted = budget_->acquire_all_available();
+    if (granted == 0)
+        return 0;
+
+    const std::size_t current =
+        current_extra_.fetch_add(granted, std::memory_order_acq_rel) + granted;
+    total_extra_granted_.fetch_add(granted, std::memory_order_relaxed);
+
+    std::size_t peak = peak_extra_.load(std::memory_order_acquire);
+    while (peak < current &&
+           !peak_extra_.compare_exchange_weak(
+               peak,
+               current,
+               std::memory_order_acq_rel,
+               std::memory_order_acquire))
+    {
+    }
+    if (change_sink_)
+        change_sink_(snapshot());
+    return granted;
+}
+
 void NativeCpuJobContext::release_extra(std::size_t count) noexcept
 {
     if (count == 0 || !budget_)
@@ -234,6 +267,15 @@ unsigned sunpack_cpu_acquire_extra_for_context(
         job->acquire_extra(wanted, minimum_grant));
 }
 
+unsigned sunpack_cpu_acquire_all_available_for_context(
+    void *context)
+{
+    auto *job = static_cast<sunpack::sevenzip::NativeCpuJobContext *>(context);
+    if (!job)
+        return 0;
+    return static_cast<unsigned>(job->acquire_all_available());
+}
+
 void sunpack_cpu_release_extra_for_context(
     void *context,
     unsigned count)
@@ -251,6 +293,12 @@ unsigned sunpack_cpu_acquire_extra(
         sunpack_cpu_current_job_context(),
         wanted,
         minimum_grant);
+}
+
+unsigned sunpack_cpu_acquire_all_available(void)
+{
+    return sunpack_cpu_acquire_all_available_for_context(
+        sunpack_cpu_current_job_context());
 }
 
 void sunpack_cpu_release_extra(unsigned count)
