@@ -1973,8 +1973,11 @@ void CDecoder::RunScout()
 
 Z7_COM7F_IMF(CDecoder::SetNumberOfThreads(UInt32 numThreads))
 {
-  NumThreads = numThreads == 0 ? 1 : numThreads;
-  MtMode = sunpack_cpu_current_job_context() != NULL || NumThreads > 1;
+  const bool creditManaged =
+      sunpack_cpu_current_job_context() != NULL;
+  if (!creditManaged)
+    NumThreads = numThreads == 0 ? 1 : numThreads;
+  MtMode = creditManaged || NumThreads > 1;
 
   #ifndef BZIP2_BYTE_MODE
   MtMode = false;
