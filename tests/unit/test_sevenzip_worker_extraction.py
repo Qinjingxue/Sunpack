@@ -521,14 +521,14 @@ def test_native_environment_configures_passive_budget_controller():
             "resource_diagnostics_enabled": False,
             "measurement_diagnostics_enabled": True,
             "observation_window_seconds": 1.0,
-            "throughput_change_ratio": 0.20,
+            "throughput_change_ratio": 0.40,
         },
     )
 
     assert environment["SUNPACK_NATIVE_RESOURCE_DIAGNOSTICS"] == "0"
     assert environment["SUNPACK_NATIVE_MEASUREMENT_DIAGNOSTICS"] == "1"
     assert environment["SUNPACK_NATIVE_OBSERVATION_WINDOW_SECONDS"] == "1.0"
-    assert environment["SUNPACK_NATIVE_THROUGHPUT_CHANGE_RATIO"] == "0.2"
+    assert environment["SUNPACK_NATIVE_THROUGHPUT_CHANGE_RATIO"] == "0.4"
 
 
 def test_native_environment_does_not_freeze_worker_process_mode_at_startup():
@@ -571,7 +571,7 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
     assert int(handshake["thread_capacity"]) == logical_processors
     assert int(handshake["nominal_cpu_budget"]) == logical_processors
     assert float(handshake["observation_window_seconds"]) == 1.0
-    assert float(handshake["throughput_change_ratio"]) == 0.2
+    assert float(handshake["throughput_change_ratio"]) == 0.4
     assert handshake["resource_diagnostics_enabled"] is False
 
 
