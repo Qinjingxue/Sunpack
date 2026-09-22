@@ -160,6 +160,7 @@ def _run_batch(
         raise ValueError("corpus format_hints must contain one hint per job")
     submitted_at: dict[str, float] = {}
     events: list[dict[str, Any]] = []
+    cpu_events: list[dict[str, Any]] = []
     results: dict[str, dict[str, Any]] = {}
     failures: dict[str, str] = {}
     completed: set[str] = set()
@@ -237,6 +238,8 @@ def _run_batch(
             with done:
                 if payload.get("type") == "native_event":
                     events.append({"received_at": now, "sequence": len(events), **payload})
+                elif payload.get("type") == "native_cpu":
+                    cpu_events.append({"received_at": now, "sequence": len(cpu_events), **payload})
                 elif payload.get("type") == "result":
                     results[job_id] = payload
                 has_finished = any(
@@ -358,6 +361,7 @@ def _run_batch(
         "label": label,
         "submitted_at_seconds": submitted_at,
         "events": events,
+        "cpu_events": cpu_events,
         "results": results,
         "failures": failures,
         "controller_events": controller_events,

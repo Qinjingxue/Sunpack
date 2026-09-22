@@ -5,6 +5,7 @@
 #include "internal/sevenzip_status.hpp"
 #include "internal/native_runtime_control.hpp"
 #include "internal/native_cpu_budget.hpp"
+#include "internal/decoder_cpu_budget.h"
 #include "internal/native_worker_sizing.hpp"
 
 #include <filesystem>
@@ -188,6 +189,70 @@ bool check_cpu_budget_honors_effective_capacity() {
         budget.effective_capacity() == 8;
 }
 
+bool check_cpu_budget_tracks_decoder_thread_lifetimes() {
+    using namespace sunpack::sevenzip;
+    NativeCpuBudget budget(8);
+    budget.set_effective_capacity(4);
+    if (!budget.try_acquire_base() || budget.reserved_credits() != 1) {
+        return false;
+    }
+
+    {
+        NativeCpuJobContext job(budget);
+        NativeCpuContextScope scope(&job);
+        if (sunpack_cpu_current_job_context() != &job) {
+            return false;
+        }
+
+        // Each successful internal decoder-thread admission consumes one
+        // credit. Exercise both C ABI entry points used by the decoders.
+        if (sunpack_cpu_acquire_extra_for_context(&job, 1, 1) != 1 ||
+            sunpack_cpu_acquire_extra(1, 1) != 1 ||
+            sunpack_cpu_acquire_extra_for_context(&job, 1, 1) != 1 ||
+            budget.reserved_credits() != 4 ||
+            job.snapshot().current_extra_credits != 3 ||
+            job.snapshot().peak_extra_credits != 3 ||
+            job.snapshot().total_extra_credits_granted != 3) {
+            return false;
+        }
+
+        // A fourth decoder thread cannot start without an uncharged credit.
+        if (sunpack_cpu_acquire_extra(1, 1) != 0 ||
+            budget.reserved_credits() != 4 ||
+            job.snapshot().current_extra_credits != 3) {
+            return false;
+        }
+
+        // Ending each decoder thread returns exactly its credit.
+        sunpack_cpu_release_extra(1);
+        if (budget.reserved_credits() != 3 ||
+            job.snapshot().current_extra_credits != 2) {
+            return false;
+        }
+        sunpack_cpu_release_extra_for_context(&job, 1);
+        if (budget.reserved_credits() != 2 ||
+            job.snapshot().current_extra_credits != 1) {
+            return false;
+        }
+        sunpack_cpu_release_extra_for_context(&job, 1);
+        if (budget.reserved_credits() != 1 ||
+            job.snapshot().current_extra_credits != 0) {
+            return false;
+        }
+
+        // Cleanup is idempotent with respect to the job-owned balance and
+        // must not release the base job credit.
+        sunpack_cpu_release_extra_for_context(&job, 99);
+        if (budget.reserved_credits() != 1 ||
+            job.snapshot().current_extra_credits != 0) {
+            return false;
+        }
+    }
+
+    budget.release(1);
+    return budget.reserved_credits() == 0;
+}
+
 bool check_runtime_control_establishes_one_second_baseline() {
     using namespace sunpack::sevenzip;
     NativeRuntimeControl controller(16, deterministic_runtime_config());
@@ -271,6 +336,28 @@ bool check_runtime_control_requires_forty_percent_change() {
         snapshot.reference_bytes_per_second == 0.0;
 }
 
+bool check_runtime_control_stays_stable_inside_change_band() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(16, deterministic_runtime_config());
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
+    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
+
+    // Repeated saturated windows on either side of the reference, but still
+    // inside the configured +/-40% band, must not churn the budget.
+    for (const std::uint64_t bytes : {650ULL, 700ULL, 1399ULL, 800ULL}) {
+        observe_runtime(controller, runtime, counters, bytes, 1.0, 16);
+        const auto snapshot = controller.snapshot(16);
+        if (snapshot.effective_cpu_budget != 16 ||
+            snapshot.decision != NativeControllerDecision::None) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool check_runtime_control_reobserves_after_budget_change() {
     using namespace sunpack::sevenzip;
     NativeRuntimeControl controller(16, deterministic_runtime_config());
@@ -337,6 +424,39 @@ bool check_runtime_control_restores_after_recovery() {
         snapshot.reference_bytes_per_second == 710.0;
 }
 
+bool check_runtime_control_restoration_requires_saturation() {
+    using namespace sunpack::sevenzip;
+    NativeRuntimeControl controller(16, deterministic_runtime_config());
+    NativeRuntimeSample runtime;
+    NativeThroughputCounters counters;
+    controller.begin_activity(counters);
+    observe_runtime(controller, runtime, counters, 0, 0.1, 16);
+    observe_runtime(controller, runtime, counters, 1000, 1.0, 16);
+    observe_runtime(controller, runtime, counters, 500, 1.0, 16);
+    if (controller.snapshot(16).effective_cpu_budget != 14) {
+        return false;
+    }
+
+    // Recovery evidence while the budget is under-filled is discarded and
+    // cannot restore the nominal concurrency.
+    observe_runtime(controller, runtime, counters, 701, 1.0, 13);
+    if (controller.snapshot(13).effective_cpu_budget != 14) {
+        return false;
+    }
+
+    // Re-prime, establish the reduced-tier baseline, then recover only on a
+    // later exact-saturation window.
+    observe_runtime(controller, runtime, counters, 0, 0.1, 14);
+    observe_runtime(controller, runtime, counters, 500, 1.0, 14);
+    if (controller.snapshot(14).effective_cpu_budget != 14) {
+        return false;
+    }
+    observe_runtime(controller, runtime, counters, 701, 1.0, 14);
+    const auto snapshot = controller.snapshot(14);
+    return snapshot.decision == NativeControllerDecision::BudgetRestored &&
+        snapshot.effective_cpu_budget == 16;
+}
+
 bool check_runtime_control_uses_core_eighth_step() {
     using namespace sunpack::sevenzip;
     NativeRuntimeControl controller(32, deterministic_runtime_config());
@@ -389,6 +509,7 @@ bool check_runtime_control_fixed_mode_only_observes_when_saturated() {
         return false;
     }
 
+    observe_runtime(controller, runtime, counters, 300, 1.0, 8);
     observe_runtime(controller, runtime, counters, 300, 1.0, 8);
     snapshot = controller.snapshot(8);
     return snapshot.measurement_sequence == 2 &&
@@ -482,6 +603,10 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "CPU credit effective-capacity check failed\n";
         return 22;
     }
+    if (!check_cpu_budget_tracks_decoder_thread_lifetimes()) {
+        std::cerr << "CPU decoder-thread lifetime credit check failed\n";
+        return 28;
+    }
     if (!check_runtime_control_establishes_one_second_baseline()) {
         std::cerr << "runtime one-second baseline check failed\n";
         return 7;
@@ -498,9 +623,17 @@ int wmain(int argc, wchar_t** argv) {
         std::cerr << "runtime passive derating check failed\n";
         return 24;
     }
+    if (!check_runtime_control_stays_stable_inside_change_band()) {
+        std::cerr << "runtime stable-band check failed\n";
+        return 29;
+    }
     if (!check_runtime_control_restores_after_recovery()) {
         std::cerr << "runtime budget restoration check failed\n";
         return 6;
+    }
+    if (!check_runtime_control_restoration_requires_saturation()) {
+        std::cerr << "runtime saturated-restoration check failed\n";
+        return 30;
     }
     if (!check_runtime_control_uses_core_eighth_step()) {
         std::cerr << "runtime CPU eighth-step check failed\n";
