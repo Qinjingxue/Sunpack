@@ -34,6 +34,7 @@ ADMISSION_CASE = {
     "expected_max_active": None,
 }
 
+
 def _parse_capacities(value: str) -> list[int]:
     capacities: list[int] = []
     for item in value.split(","):
@@ -392,7 +393,8 @@ def _summarize_batch(
         "queue_latency_p95_ms": _percentile(queue_ms, 95),
         "service_p50_ms": _percentile(service_ms, 50),
         "service_p95_ms": _percentile(service_ms, 95),
-        "admitted_jobs": len(admissions),        **resource_metrics,
+        "admitted_jobs": len(admissions),
+        **resource_metrics,
     }
 
 
