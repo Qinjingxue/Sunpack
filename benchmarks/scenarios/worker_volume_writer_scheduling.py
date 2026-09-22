@@ -220,7 +220,6 @@ def _run_configuration(
         {
             "thread_capacity": thread_capacity,
             "adaptive_enabled": False,
-            "initial_active_jobs": len(jobs),
             "writer_threads": writer_threads,
         },
     )
