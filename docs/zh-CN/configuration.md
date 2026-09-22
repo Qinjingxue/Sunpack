@@ -185,10 +185,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 | `worker.stage_thread_capacity` | `0` | 扫描、分析、校验和后处理的线程容量；`0` 自动选择。 |
 | `worker.max_inflight_files` | `0` | 文件级并发上限；`0` 自动选择，自动范围为 64–512。 |
 | `worker.max_pending_stage_jobs` | `4096` | 阶段作业等待上限。 |
-| `worker.adaptive_enabled` | `true` | 是否允许被动吞吐控制器在外部环境显著变化时降低或恢复 CPU 配额。 |
-| `worker.resource_diagnostics_enabled` | `false` | 是否采样 CPU 诊断数据；不参与配额决策。 |
-| `worker.observation_window_seconds` | `1.0` | 被动吞吐观察窗口，单位秒。 |
-| `worker.throughput_change_ratio` | `0.40` | 相对基线吞吐变化达到该比例时调整 CPU 配额。 |
+| `worker.minimum_available_memory_ratio` | `0.10` | 系统可用物理内存低于总物理内存的该比例时，native worker 开始降低 CPU credit 配额。 |
 | `worker.max_queue_jobs` | `4096` | 原生任务队列上限。 |
 | `worker.priority_aging_quantum` | `32` | 优先级老化步长。 |
 | `worker.backpressure_retries` | `120` | 遇到队列背压时的重试次数。 |
@@ -200,7 +197,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 
 Native worker 以 CPU credit 作为唯一解压并发预算。默认 nominal budget 等于逻辑核心数，每个已准入归档任务先占 1 个 base credit；格式不分配固定权重。SunPack worker context 下，handler 不再根据 CPU affinity/核心数决定 decoder 并发，LZMA2/XZ 也不再按 RAM 预算缩线程；RAR5/BZip2 不再保留 `<4`、`max 8` 或 `NumThreads` 并发策略。decoder 只保留由压缩流结构和算法本身决定的可并行性，并在真正需要额外执行 lane 时向同一个 budget 申请 credits；RAR5/BZip2 会原子取得当前全部可用 extra credits，LZMA2/XZ 的 MtDec 则逐线程申请。
 
-吞吐量控制器不再主动搜索最优并发。它只在 CPU credit 恰好打满（`reserved_cpu_credits == effective_cpu_budget`）时按实际写出吞吐被动观察；低于配额说明任务不足，高于配额只会出现在非抢占降档后的短暂过渡期，这两种情况都直接丢弃当前未完成窗口。默认观察窗口为 1 秒；相对当前稳定基线下降至少 40% 时，effective CPU budget 按 `max(1, logical_processors / 8)` 降低一级；相对基线提高至少 40% 时，按同样步长恢复，最高回到 nominal budget。每次配额变化后旧基线立即失效。第一次采样观察到新配额恰好打满时只确定窗口起点，不计入该次采样之前的时间和字节；从下一次采样起连续满配额累计满 1 秒后才形成新窗口并建立基线。期间一旦不再恰好打满，当前窗口立即作废并等待下一次满配额重新起点。
+不再使用吞吐量统计来寻找或修正并发。native worker 只在至少一个解压任务正在运行时，每 1 秒读取一次系统物理内存；worker 空闲时不轮询内存。若 `available_physical / total_physical < worker.minimum_available_memory_ratio`，effective CPU budget 每次按 `max(1, logical_processors / 8)` 降低一级，最低为 1；当可用内存回到阈值及以上时，按同样步长逐次恢复，最高回到 nominal budget。降档非抢占：已经持有的 credits 不会被撤销，只会阻止新的任务或 decoder lane 继续取得 credits。
 
 ## watch
 
