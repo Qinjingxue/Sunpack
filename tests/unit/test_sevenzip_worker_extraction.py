@@ -513,41 +513,22 @@ def test_native_environment_zero_thread_capacity_uses_native_auto_capacity():
     assert environment["SUNPACK_NATIVE_ADAPTIVE_ENABLED"] == "1"
 
 
-def test_native_environment_configures_throughput_controller():
+def test_native_environment_configures_passive_budget_controller():
     environment = {}
     _apply_native_environment(
         environment,
         {
-            "exploration_strategy": "rapid",
             "resource_diagnostics_enabled": False,
-            "minimum_window_seconds": 0.25,
-            "large_window_bytes": 32 << 20,
-            "small_window_jobs": 4,
-            "improvement_ratio": 1.03,
+            "measurement_diagnostics_enabled": True,
+            "observation_window_seconds": 1.0,
+            "throughput_change_ratio": 0.20,
         },
     )
 
-    assert environment["SUNPACK_NATIVE_EXPLORATION_STRATEGY"] == "rapid"
     assert environment["SUNPACK_NATIVE_RESOURCE_DIAGNOSTICS"] == "0"
-    assert environment["SUNPACK_NATIVE_MINIMUM_WINDOW_SECONDS"] == "0.25"
-    assert environment["SUNPACK_NATIVE_LARGE_WINDOW_BYTES"] == str(32 << 20)
-    assert environment["SUNPACK_NATIVE_SMALL_WINDOW_JOBS"] == "4"
-    assert environment["SUNPACK_NATIVE_IMPROVEMENT_RATIO"] == "1.03"
-
-
-def test_native_environment_configures_activity_warm_start():
-    environment = {}
-
-    _apply_native_environment(
-        environment,
-        {
-            "warm_start_decay_seconds": 30,
-            "warm_start_confirmations": 2,
-        },
-    )
-
-    assert environment["SUNPACK_NATIVE_WARM_START_DECAY_SECONDS"] == "30.0"
-    assert environment["SUNPACK_NATIVE_WARM_START_CONFIRMATIONS"] == "2"
+    assert environment["SUNPACK_NATIVE_MEASUREMENT_DIAGNOSTICS"] == "1"
+    assert environment["SUNPACK_NATIVE_OBSERVATION_WINDOW_SECONDS"] == "1.0"
+    assert environment["SUNPACK_NATIVE_THROUGHPUT_CHANGE_RATIO"] == "0.2"
 
 
 def test_native_environment_does_not_freeze_worker_process_mode_at_startup():
@@ -562,12 +543,11 @@ def test_native_environment_does_not_freeze_worker_process_mode_at_startup():
     assert "SUNPACK_NATIVE_PROCESS_MODE" not in environment
 
 
-def test_native_worker_reports_locally_calibrated_sizing_plan():
+def test_native_worker_reports_cpu_credit_sizing_plan():
     worker_path = _require_worker_or_skip()
     environment = os.environ.copy()
     for key in (
         "SUNPACK_NATIVE_WORKER_THREAD_CAPACITY",
-        "SUNPACK_NATIVE_INITIAL_ACTIVE_JOBS",
         "SUNPACK_NATIVE_PROCESS_MODE",
         "SUNPACK_NATIVE_WORKER_PROFILE",
     ):
@@ -586,14 +566,12 @@ def test_native_worker_reports_locally_calibrated_sizing_plan():
     handshake = json.loads(completed.stdout.splitlines()[0])
 
     logical_processors = max(1, int(handshake["logical_processors"]))
-    expected_capacity = logical_processors
-    expected_initial = max(1, min((logical_processors + 1) // 2, expected_capacity))
-
     assert handshake["type"] == "worker_ready"
     assert handshake["sizing_mode"] == "dynamic"
-    assert int(handshake["thread_capacity"]) == expected_capacity
-    assert int(handshake["initial_active_limit"]) == expected_initial
-    assert handshake["exploration_strategy"] == "calibrated"
+    assert int(handshake["thread_capacity"]) == logical_processors
+    assert int(handshake["nominal_cpu_budget"]) == logical_processors
+    assert float(handshake["observation_window_seconds"]) == 1.0
+    assert float(handshake["throughput_change_ratio"]) == 0.2
     assert handshake["resource_diagnostics_enabled"] is False
 
 
