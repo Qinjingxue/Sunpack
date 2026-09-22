@@ -11,6 +11,9 @@ unsigned sunpack_cpu_acquire_extra_for_context(
     unsigned wanted,
     unsigned minimum_grant);
 
+unsigned sunpack_cpu_acquire_all_available_for_context(
+    void *context);
+
 void sunpack_cpu_release_extra_for_context(
     void *context,
     unsigned count);
@@ -18,6 +21,8 @@ void sunpack_cpu_release_extra_for_context(
 unsigned sunpack_cpu_acquire_extra(
     unsigned wanted,
     unsigned minimum_grant);
+
+unsigned sunpack_cpu_acquire_all_available(void);
 
 void sunpack_cpu_release_extra(unsigned count);
 
