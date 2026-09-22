@@ -58,7 +58,6 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
                 environment["SUNPACK_NATIVE_WORKER_THREAD_CAPACITY"] = str(thread_capacity)
     set_int("writer_threads", "SUNPACK_ASYNC_WRITER_THREADS_PER_VOLUME")
     set_int("sample_interval_ms", "SUNPACK_NATIVE_SAMPLE_INTERVAL_MS", minimum=100)
-    set_int("initial_active_jobs", "SUNPACK_NATIVE_INITIAL_ACTIVE_JOBS", minimum=0)
 
     native_adaptive = process_config.get("adaptive_enabled")
     if native_adaptive is not None:
@@ -68,9 +67,6 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
             enabled = bool(native_adaptive)
         environment["SUNPACK_NATIVE_ADAPTIVE_ENABLED"] = "1" if enabled else "0"
 
-    strategy = str(process_config.get("exploration_strategy") or "").strip().lower()
-    if strategy in {"calibrated", "rapid", "full"}:
-        environment["SUNPACK_NATIVE_EXPLORATION_STRATEGY"] = strategy
     diagnostics = process_config.get("resource_diagnostics_enabled")
     if diagnostics is not None:
         enabled = str(diagnostics).strip().lower() not in {"0", "false", "no", "off"}
@@ -79,17 +75,8 @@ def _apply_native_environment(environment: dict[str, str], process_config: dict)
     if measurement_diagnostics is not None:
         enabled = str(measurement_diagnostics).strip().lower() not in {"0", "false", "no", "off"}
         environment["SUNPACK_NATIVE_MEASUREMENT_DIAGNOSTICS"] = "1" if enabled else "0"
-    set_float("minimum_window_seconds", "SUNPACK_NATIVE_MINIMUM_WINDOW_SECONDS")
-    set_float("maximum_window_seconds", "SUNPACK_NATIVE_MAXIMUM_WINDOW_SECONDS")
-    set_float("settle_seconds", "SUNPACK_NATIVE_SETTLE_SECONDS")
-    set_int("large_window_bytes", "SUNPACK_NATIVE_LARGE_WINDOW_BYTES")
-    set_int("small_window_jobs", "SUNPACK_NATIVE_SMALL_WINDOW_JOBS")
-    set_int("small_window_files", "SUNPACK_NATIVE_SMALL_WINDOW_FILES")
-    set_float("improvement_ratio", "SUNPACK_NATIVE_IMPROVEMENT_RATIO")
-    set_float("regression_ratio", "SUNPACK_NATIVE_REGRESSION_RATIO")
-    set_int("aggressive_step", "SUNPACK_NATIVE_AGGRESSIVE_STEP")
-    set_float("warm_start_decay_seconds", "SUNPACK_NATIVE_WARM_START_DECAY_SECONDS")
-    set_int("warm_start_confirmations", "SUNPACK_NATIVE_WARM_START_CONFIRMATIONS")
+    set_float("observation_window_seconds", "SUNPACK_NATIVE_OBSERVATION_WINDOW_SECONDS")
+    set_float("throughput_change_ratio", "SUNPACK_NATIVE_THROUGHPUT_CHANGE_RATIO")
     set_int("max_queue_jobs", "SUNPACK_NATIVE_MAX_QUEUE_JOBS")
     # 空间不足自动暂停/恢复（卷级 gate）的唯一总开关。
     space_gate = process_config.get("space_gate_enabled")
