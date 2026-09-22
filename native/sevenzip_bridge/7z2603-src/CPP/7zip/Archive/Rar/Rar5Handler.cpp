@@ -3409,8 +3409,15 @@ Z7_COM7F_IMF(CHandler::SetProperties(const wchar_t * const *names, const PROPVAR
     if (name.IsPrefixedBy_Ascii_NoCase("mt"))
     {
 #ifndef Z7_ST
-      bool forced = false;
-      RINOK(ParseMtProp2(name.Ptr(2), prop, _numThreads, forced))
+      if (sunpack_cpu_current_job_context())
+      {
+        _numThreads = SUNPACK_CPU_MANAGED_THREAD_HINT;
+      }
+      else
+      {
+        bool forced = false;
+        RINOK(ParseMtProp2(name.Ptr(2), prop, _numThreads, forced))
+      }
 #endif
     }
     else if (name.IsPrefixedBy_Ascii_NoCase("memx"))
