@@ -293,7 +293,6 @@ def _run_phase(
         {
             "thread_capacity": thread_capacity,
             "adaptive_enabled": False,
-            "initial_active_jobs": len(targets),
             "writer_threads": writer_threads,
         },
     )
