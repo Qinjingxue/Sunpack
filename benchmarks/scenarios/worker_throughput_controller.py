@@ -1,4 +1,4 @@
-"""Event-trace experiments for the native throughput controller."""
+"""Event-trace experiments for passive native CPU-budget derating."""
 from __future__ import annotations
 
 import argparse
@@ -26,19 +26,17 @@ from sunpack.support.resources import get_sevenzip_bridge_worker_path, get_7z_pa
 SCENARIO = "extraction.worker-throughput-controller"
 MI = 1 << 20
 ADAPTIVE_CASE = {
-    "name": "adaptive-baseline",
-    "description": "Adaptive throughput controller.",
-    "blocker": "adaptive-controller",
+    "name": "passive-budget",
+    "description": "Passive throughput-based CPU-budget derating.",
+    "blocker": "passive-budget-controller",
     "adaptive_enabled": True,
-    "initial_active_jobs": 2,
     "expected_max_active": None,
 }
 FIXED_CASE = {
-    "name": "fixed-capacity",
-    "description": "Fixed active-job limit used to build the oracle curve.",
-    "blocker": "none-fixed-capacity",
+    "name": "fixed-budget",
+    "description": "Fixed CPU-credit budget used to build the oracle curve.",
+    "blocker": "none-fixed-budget",
     "adaptive_enabled": False,
-    "initial_active_jobs": -1,
     "expected_max_active": None,
 }
 
@@ -157,18 +155,11 @@ def _corpus(
 
 def _controller_config(args: argparse.Namespace) -> dict[str, Any]:
     return {
-        "minimum_window_seconds": args.minimum_window_seconds,
-        "maximum_window_seconds": args.maximum_window_seconds,
-        "settle_seconds": args.settle_seconds,
-        "large_window_bytes": args.large_window_bytes,
-        "small_window_jobs": args.small_window_jobs,
-        "small_window_files": args.small_window_files,
-        "improvement_ratio": args.improvement_ratio,
-        "regression_ratio": args.regression_ratio,
+        "observation_window_seconds": args.observation_window_seconds,
+        "throughput_change_ratio": args.throughput_change_ratio,
         "resource_diagnostics_enabled": True,
         "measurement_diagnostics_enabled": args.measurement_diagnostics,
     }
-
 
 def _oracle_summary(rows: list[dict[str, Any]], payload_bytes: int) -> dict[str, Any]:
     grouped: dict[str, dict[int, list[dict[str, Any]]]] = {}
@@ -196,58 +187,27 @@ def _oracle_summary(rows: list[dict[str, Any]], payload_bytes: int) -> dict[str,
 
 def _trace_metrics(trace: dict[str, Any], *, oracle: dict[str, Any], payload_bytes: int) -> dict[str, Any]:
     events = list(trace.get("controller_events") or [])
-    timed = [event for event in events if event.get("active_limit") is not None and event.get("received_at") is not None]
-    timed.sort(key=lambda event: float(event["received_at"]))
-    plateau = set(int(value) for value in oracle["plateau_98_percent"])
     decisions = [str(event.get("decision") or "none") for event in events]
-    first_at = float(timed[0]["received_at"]) if timed else None
-    outside_seconds = 0.0
-    plateau_run = 0
-    settle_seconds: float | None = None
-    for previous, current in zip(timed, timed[1:]):
-        delta = max(0.0, float(current["received_at"]) - float(previous["received_at"]))
-        if int(previous["active_limit"]) not in plateau:
-            outside_seconds += delta
-        if int(current["active_limit"]) in plateau:
-            plateau_run += 1
-            if settle_seconds is None and plateau_run >= 3 and first_at is not None:
-                settle_seconds = max(0.0, float(current["received_at"]) - first_at)
-        else:
-            plateau_run = 0
+    budgets = [
+        int(event["effective_cpu_budget"])
+        for event in events
+        if event.get("effective_cpu_budget") is not None
+    ]
     wall_seconds = max(0.000001, float(trace.get("summary_wall_seconds", 0.0) or 0.0))
     throughput = float(trace.get("summary_throughput_bytes_per_second", 0.0) or 0.0)
     oracle_rate = float(oracle["oracle_throughput_bytes_per_second"])
     return {
         "controller_decisions": decisions,
-        "probe_count": sum(decision in {"probe_up", "probe_down"} for decision in decisions),
-        "up_probe_count": sum(decision == "probe_up" for decision in decisions),
-        "down_probe_count": sum(decision == "probe_down" for decision in decisions),
-        "accepted_count": sum(
-            str(event.get("decision") or "none") == "accepted" or bool(event.get("accepted_probe"))
-            for event in events
-        ),
-        "rolled_back_count": sum(decision == "rolled_back" for decision in decisions),
-        "cruising_count": sum(decision == "cruising" for decision in decisions),
-        "peak_probe_failures": max(
-            (int(event.get("probe_failures", 0) or 0) for event in events),
-            default=0,
-        ),
-        "max_observation_target_windows": max(
-            (int(event.get("observation_target_windows", 0) or 0) for event in events),
-            default=0,
-        ),
-        "active_limit_change_count": sum(
-            int(current.get("active_limit", 0)) != int(previous.get("active_limit", 0))
-            for previous, current in zip(timed, timed[1:])
-        ),
-        "time_outside_plateau_seconds": round(outside_seconds, 6),
-        "time_outside_plateau_ratio": round(outside_seconds / wall_seconds, 6),
-        "settling_time_seconds": None if settle_seconds is None else round(settle_seconds, 6),
+        "budget_reduced_count": sum(decision == "budget_reduced" for decision in decisions),
+        "budget_restored_count": sum(decision == "budget_restored" for decision in decisions),
+        "baseline_established_count": sum(decision == "baseline_established" for decision in decisions),
+        "minimum_effective_cpu_budget": min(budgets) if budgets else None,
+        "maximum_effective_cpu_budget": max(budgets) if budgets else None,
+        "cpu_budget_change_count": sum(a != b for a, b in zip(budgets, budgets[1:])),
         "oracle_efficiency": round(throughput / oracle_rate, 6) if oracle_rate > 0 else None,
         "cumulative_regret_bytes": round(max(0.0, oracle_rate - throughput) * wall_seconds, 3),
         "payload_bytes_per_job": payload_bytes,
     }
-
 
 def _row(
     summary: dict[str, Any],
@@ -295,50 +255,43 @@ def _run_adaptive(
     run: int,
     args: argparse.Namespace,
     pressure: _Pressure | None = None,
-    pressure_mode: str = "none",
     pressure_name: str = "none",
-    collision: str = "none",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     timers: list[threading.Timer] = []
-    hook_state = {
-        "probe_seen": False,
-        "pressure_started": False,
-        "pressure_stopped": False,
-    }
+    pressure_started = False
+    pressure_stopped = False
 
     def start_pressure() -> None:
+        nonlocal pressure_started
         if pressure is not None:
             pressure.start()
-            hook_state["pressure_started"] = True
+            pressure_started = True
 
     def stop_pressure() -> None:
+        nonlocal pressure_stopped
         if pressure is not None:
             pressure.stop()
-            hook_state["pressure_stopped"] = True
+            pressure_stopped = True
 
     def hook(event: dict[str, Any]) -> None:
-        decision = str(event.get("decision") or "")
-        if pressure_mode == "probe-collision" and decision == "probe_up" and not hook_state["probe_seen"]:
-            hook_state["probe_seen"] = True
-            if pressure is not None:
-                start_pressure()
-                if collision == "transient":
-                    timer = threading.Timer(args.transient_seconds, stop_pressure)
-                    timer.daemon = True
-                    timer.start()
-                    timers.append(timer)
-        elif pressure_mode == "scheduled" and decision == "activity_started" and pressure is not None:
+        if (
+            pressure is not None
+            and str(event.get("decision") or "") == "activity_started"
+            and not pressure_started
+        ):
             start_timer = threading.Timer(args.disturbance_delay_seconds, start_pressure)
             start_timer.daemon = True
             start_timer.start()
             timers.append(start_timer)
-            stop_timer = threading.Timer(args.disturbance_delay_seconds + args.disturbance_seconds, stop_pressure)
+            stop_timer = threading.Timer(
+                args.disturbance_delay_seconds + args.disturbance_seconds,
+                stop_pressure,
+            )
             stop_timer.daemon = True
             stop_timer.start()
             timers.append(stop_timer)
+
     try:
-        adaptive_case = dict(ADAPTIVE_CASE)
-        adaptive_case["initial_active_jobs"] = args.initial_active_jobs
         summary, trace = _run_batch(
             workspace=workspace,
             worker_path=worker_path,
@@ -347,8 +300,8 @@ def _run_adaptive(
             client_count=1,
             timeout_seconds=args.timeout_seconds,
             sample_interval_ms=args.sample_interval_ms,
-            admission_case=adaptive_case,
-            label=f"{workload}-{pressure_mode}-{collision}-capacity-{capacity}-run-{run}",
+            admission_case=dict(ADAPTIVE_CASE),
+            label=f"{workload}-passive-{pressure_name}-capacity-{capacity}-run-{run}",
             worker_config_overrides=_controller_config(args),
             controller_event_hook=hook,
         )
@@ -357,23 +310,21 @@ def _run_adaptive(
             timer.cancel()
         if pressure is not None:
             pressure.stop()
-            hook_state["pressure_stopped"] = pressure.stopped_at is not None
+            pressure_stopped = pressure.stopped_at is not None
+
     summary_row, trace_payload = _row(
         summary,
         trace,
         workload=workload,
-        controller=f"adaptive-{pressure_mode}-{pressure_name}-{collision}",
+        controller=f"passive-{pressure_name}",
         capacity=capacity,
         run=run,
         payload_bytes=int(corpus["payload_bytes_per_job"]),
     )
     trace_payload["injection"] = {
         "pressure_name": pressure_name,
-        "pressure_mode": pressure_mode,
-        "collision": collision,
-        "probe_seen": hook_state["probe_seen"],
-        "pressure_started": hook_state["pressure_started"],
-        "pressure_stopped": hook_state["pressure_stopped"],
+        "pressure_started": pressure_started,
+        "pressure_stopped": pressure_stopped,
         "pressure_duration_seconds": (
             None
             if pressure is None or pressure.started_at is None or pressure.stopped_at is None
@@ -382,9 +333,8 @@ def _run_adaptive(
     }
     return summary_row, trace_payload
 
-
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run oracle, adaptive, disturbance, and probe-collision experiments.")
+    parser = argparse.ArgumentParser(description="Run fixed-budget, passive-derating, and disturbance experiments.")
     parser.add_argument("--workloads", default="cpu,io")
     parser.add_argument("--capacities", default="1,2,4,8,16")
     parser.add_argument("--jobs", type=int, default=32)
@@ -395,26 +345,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dictionary-mib", type=int, default=64)
     parser.add_argument("--sample-interval-ms", type=int, default=250)
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
-    parser.add_argument("--minimum-window-seconds", type=float, default=0.25)
-    parser.add_argument("--maximum-window-seconds", type=float, default=1.5)
-    parser.add_argument("--settle-seconds", type=float, default=0.10)
-    parser.add_argument("--large-window-bytes", type=int, default=32 << 20)
-    parser.add_argument("--small-window-jobs", type=int, default=4)
-    parser.add_argument("--small-window-files", type=int, default=16)
-    parser.add_argument("--improvement-ratio", type=float, default=1.03)
-    parser.add_argument("--regression-ratio", type=float, default=0.97)
     parser.add_argument("--disturbance-delay-seconds", type=float, default=1.0)
     parser.add_argument("--disturbance-seconds", type=float, default=10.0)
-    parser.add_argument("--transient-seconds", type=float, default=0.75)
-    parser.add_argument("--initial-active-jobs", type=int, default=2)
+    parser.add_argument("--observation-window-seconds", type=float, default=1.0)
+    parser.add_argument("--throughput-change-ratio", type=float, default=0.20)
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--keep-workdir", action="store_true")
-    parser.add_argument("--skip-collisions", action="store_true")
     parser.add_argument(
         "--stationary-only",
         action="store_true",
-        help="Run the fixed oracle and stationary adaptive cases only; omit scheduled pressure and collisions.",
+        help="Run the fixed oracle and stationary passive-controller cases only; omit scheduled pressure.",
     )
     parser.add_argument(
         "--fixed-diagnostics",
@@ -447,7 +388,6 @@ def main() -> int:
         args.jobs < max(capacities)
         or args.oracle_runs < 1
         or args.adaptive_runs < 1
-        or args.initial_active_jobs < 1
     ):
         _parser().error("jobs must cover the largest capacity and run counts must be positive")
     if args.sample_interval_ms < 100 or args.timeout_seconds <= 0:
@@ -528,9 +468,9 @@ def main() -> int:
                     "rows": len(rows),
                     "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
                     "controller_implementation": {
-                        "window": "2-window optimistic probes growing to 6 windows after repeated rollbacks",
-                        "exploration": "forward speculative climb with rollback and retry",
-                        "downward_correction": "down probe after repeated upward failures",
+                        "window": "1-second written-throughput observation by default",
+                        "threshold": "20% change from current stable baseline",
+                        "policy": "passive CPU-budget derating/restoration only",
                     },
                 },
                 "artifacts": {"result_dir": str(workspace.result_dir), "traces": trace_paths},
@@ -556,7 +496,7 @@ def main() -> int:
                     client_count=1,
                     timeout_seconds=args.timeout_seconds,
                     sample_interval_ms=args.sample_interval_ms,
-                    admission_case=(dict(ADAPTIVE_CASE) | {"initial_active_jobs": args.initial_active_jobs}),
+                    admission_case=dict(ADAPTIVE_CASE),
                     label=f"adaptive-{workload}-stationary-capacity-{target_capacity}-run-{run}",
                     worker_config_overrides=_controller_config(args),
                 )
@@ -592,37 +532,12 @@ def main() -> int:
                         run=run,
                         args=args,
                         pressure=pressure,
-                        pressure_mode="scheduled",
                         pressure_name=disturbance,
                     )
                     summary_row.update(_trace_metrics(trace_payload, oracle=oracle[workload], payload_bytes=int(corpus["payload_bytes_per_job"])))
                     rows.append(summary_row)
                     trace_paths.append(str(workspace.write_result_json(
                         f"traces/{workload}-scheduled-{disturbance}-{run}.json", trace_payload
-                    )))
-                    shutil.rmtree(workspace.outputs / trace_payload["label"], ignore_errors=True)
-
-            if not args.skip_collisions:
-                for collision in ("persistent", "transient"):
-                    pressure = _Pressure("cpu", workspace.corpus, workers=max(1, min(8, (os.cpu_count() or 2) // 4)))
-                    print(f"adaptive {workload} probe-collision-{collision}", flush=True)
-                    summary_row, trace_payload = _run_adaptive(
-                        workspace=workspace,
-                        worker_path=worker_path,
-                        corpus=corpus,
-                        workload=workload,
-                        capacity=target_capacity,
-                        run=0,
-                        args=args,
-                        pressure=pressure,
-                        pressure_mode="probe-collision",
-                        pressure_name="cpu",
-                        collision=collision,
-                    )
-                    summary_row.update(_trace_metrics(trace_payload, oracle=oracle[workload], payload_bytes=int(corpus["payload_bytes_per_job"])))
-                    rows.append(summary_row)
-                    trace_paths.append(str(workspace.write_result_json(
-                        f"traces/{workload}-probe-collision-{collision}.json", trace_payload
                     )))
                     shutil.rmtree(workspace.outputs / trace_payload["label"], ignore_errors=True)
 
@@ -641,9 +556,9 @@ def main() -> int:
                 "rows": len(rows),
                 "all_passed": bool(rows) and all(bool(row.get("all_passed")) for row in rows),
                 "controller_implementation": {
-                        "window": "2-window optimistic probes growing to 6 windows after repeated rollbacks",
-                        "exploration": "forward speculative climb with rollback and retry",
-                        "downward_correction": "down probe after repeated upward failures",
+                        "window": "1-second written-throughput observation by default",
+                        "threshold": "20% change from current stable baseline",
+                        "policy": "passive CPU-budget derating/restoration only",
                     },
             },
             "artifacts": {"result_dir": str(workspace.result_dir), "traces": trace_paths},
