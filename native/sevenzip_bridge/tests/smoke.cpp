@@ -229,6 +229,41 @@ bool check_cpu_budget_tracks_decoder_thread_lifetimes() {
     return budget.reserved_credits() == 0;
 }
 
+bool check_cpu_context_exchange_propagates_and_restores() {
+    using namespace sunpack::sevenzip;
+
+    NativeCpuBudget budget(4);
+    NativeCpuJobContext first(budget);
+    NativeCpuJobContext second(budget);
+
+    if (sunpack_cpu_current_job_context() != nullptr) {
+        return false;
+    }
+
+    {
+        NativeCpuContextScope scope(&first);
+        if (sunpack_cpu_current_job_context() != &first) {
+            return false;
+        }
+
+        void* previous =
+            sunpack_cpu_exchange_current_job_context(&second);
+        if (previous != &first ||
+            sunpack_cpu_current_job_context() != &second) {
+            return false;
+        }
+
+        void* replaced =
+            sunpack_cpu_exchange_current_job_context(previous);
+        if (replaced != &second ||
+            sunpack_cpu_current_job_context() != &first) {
+            return false;
+        }
+    }
+
+    return sunpack_cpu_current_job_context() == nullptr;
+}
+
 bool check_cpu_budget_acquire_all_available() {
     using namespace sunpack::sevenzip;
     NativeCpuBudget budget(8);
@@ -408,6 +443,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_cpu_budget_acquire_all_available()) {
         std::cerr << "CPU acquire-all credit check failed\n";
         return 31;
+    }
+    if (!check_cpu_context_exchange_propagates_and_restores()) {
+        std::cerr << "CPU context exchange check failed\n";
+        return 32;
     }
     if (!check_memory_guard_reduces_below_ten_percent()) {
         std::cerr << "memory guard pressure threshold check failed\n";

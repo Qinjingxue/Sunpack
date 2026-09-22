@@ -3,6 +3,7 @@
 #include "StdAfx.h"
 
 #include "CoderMixer2.h"
+#include "internal/decoder_cpu_budget.h"
 
 #ifdef USE_MIXER_ST
 
@@ -865,6 +866,11 @@ UInt64 CMixerST::GetBondStreamSize(unsigned bondIndex) const
 
 void CCoderMT::Execute()
 {
+  // CMixerMT runs non-main coders on persistent virtual threads. Propagate
+  // SunPack's thread-local job context explicitly so nested managed decoders
+  // continue to acquire CPU credits from the parent archive job.
+  void *previousCpuContext =
+      sunpack_cpu_exchange_current_job_context(SunpackCpuContext);
   try
   {
     Code(NULL);
@@ -873,6 +879,7 @@ void CCoderMT::Execute()
   {
     Result = E_FAIL;
   }
+  sunpack_cpu_exchange_current_job_context(previousCpuContext);
 }
 
 void CCoderMT::Code(ICompressProgressInfo *progress)
@@ -1074,7 +1081,11 @@ HRESULT CMixerMT::Code(
 
   Init(inStreams, outStreams);
 
+  void *sunpackCpuContext = sunpack_cpu_current_job_context();
   unsigned i;
+  for (i = 0; i < _coders.Size(); i++)
+    _coders[i].SunpackCpuContext = sunpackCpuContext;
+
   for (i = 0; i < _coders.Size(); i++)
     if (i != MainCoderIndex)
     {

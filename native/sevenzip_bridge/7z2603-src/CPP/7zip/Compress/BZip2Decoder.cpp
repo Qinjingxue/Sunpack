@@ -948,6 +948,12 @@ struct CParallelBlockJob
     FinishedEvent.notify_one();
   }
 
+  bool IsDone()
+  {
+    std::lock_guard<std::mutex> lock(Mutex);
+    return Done;
+  }
+
   HRESULT Wait()
   {
     std::unique_lock<std::mutex> lock(Mutex);
@@ -991,17 +997,14 @@ public:
     Stop();
   }
 
-  bool Start(unsigned numWorkers)
+  bool AddWorker()
   {
     try
     {
-      _threads.reserve(numWorkers);
-      for (unsigned i = 0; i < numWorkers; i++)
-        _threads.emplace_back([this] { WorkerLoop(); });
+      _threads.emplace_back([this] { WorkerLoop(); });
     }
     catch (...)
     {
-      Stop();
       return false;
     }
     return true;
@@ -1457,13 +1460,26 @@ HRESULT CDecoder::DecodeStreams(ICompressProgressInfo *progress)
 
 HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 {
+  static const unsigned kMaxBZip2ParallelWorkers = 12;
+
   void *cpuContext = sunpack_cpu_current_job_context();
-  unsigned numWorkers = 0;
+  const unsigned maxWorkers = cpuContext
+      ? kMaxBZip2ParallelWorkers
+      : (NumThreads > 1
+          ? (unsigned)(std::min<UInt32>(
+              NumThreads - 1, kMaxBZip2ParallelWorkers))
+          : 0);
+  if (maxWorkers == 0)
+    return DecodeStreams(progress);
+
+  // Start with one real parallel block worker. Additional workers are added
+  // only when the current in-flight block set is still keeping every existing
+  // worker busy, up to the algorithm-specific speed cap.
+  unsigned initialCredit = 1;
   if (cpuContext)
-    numWorkers = sunpack_cpu_acquire_all_available_for_context(cpuContext);
-  else if (NumThreads > 1)
-    numWorkers = NumThreads - 1;
-  if (numWorkers == 0)
+    initialCredit =
+        sunpack_cpu_acquire_extra_for_context(cpuContext, 1, 1);
+  if (initialCredit == 0)
     return DecodeStreams(progress);
 
   struct CSunPackCpuCreditReleaser
@@ -1475,24 +1491,20 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       if (Context && Credits)
         sunpack_cpu_release_extra_for_context(Context, Credits);
     }
-  } cpuCredits = { cpuContext, cpuContext ? numWorkers : 0 };
+  } cpuCredits = { cpuContext, cpuContext ? initialCredit : 0 };
 
   RINOK(StartRead())
 
-  // One workspace per worker bounds both the inverse-BWT state and the
-  // out-of-order output retained by the ordered retire ring.
-  const size_t ringSize = numWorkers;
+  // The ring keeps ordered-retire state bounded by the maximum useful worker
+  // width. CPU credits and threads themselves are acquired lazily below.
+  const size_t ringSize = maxWorkers;
   std::vector<std::unique_ptr<CParallelBlockJob>> ring;
   try
   {
-    ring.reserve(ringSize);
-    for (size_t i = 0; i < ringSize; i++)
-    {
-      std::unique_ptr<CParallelBlockJob> job(new CParallelBlockJob());
-      if (!job->Allocate())
-        return E_OUTOFMEMORY;
-      ring.push_back(std::move(job));
-    }
+    // Slots are fixed so sequence-to-slot mapping stays stable while the
+    // worker width grows. Allocate the multi-megabyte block workspace only
+    // when a slot is actually reached.
+    ring.resize(ringSize);
   }
   catch (const std::bad_alloc &)
   {
@@ -1500,8 +1512,9 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
   }
 
   CParallelBlockPool pool;
-  if (!pool.Start(numWorkers))
+  if (!pool.AddWorker())
     return E_FAIL;
+  unsigned numWorkers = 1;
 
   struct CCountersRestore
   {
@@ -1562,13 +1575,50 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
   while (!parserDone && retireRes == S_OK)
   {
-    // Keep the producer bounded. Reusing a slot is legal only after the
-    // corresponding earlier block has been retired in stream order.
-    if (submitted - retired >= ringSize)
+    // Grow only when all current workers have outstanding work and the
+    // oldest block is still running. If the workers are already keeping up,
+    // retire completed work instead of consuming another CPU credit.
+    if (submitted - retired >= numWorkers)
     {
-      CParallelBlockJob &job = *ring[(size_t)(retired % ringSize)];
-      retireRes = retireOne(job);
-      retired++;
+      CParallelBlockJob &oldest =
+          *ring[(size_t)(retired % ringSize)];
+
+      if (oldest.IsDone())
+      {
+        retireRes = retireOne(oldest);
+        retired++;
+        continue;
+      }
+
+      bool grew = false;
+      if (numWorkers < maxWorkers)
+      {
+        unsigned granted = 1;
+        if (cpuContext)
+          granted =
+              sunpack_cpu_acquire_extra_for_context(cpuContext, 1, 1);
+
+        if (granted != 0)
+        {
+          if (pool.AddWorker())
+          {
+            numWorkers++;
+            if (cpuContext)
+              cpuCredits.Credits += granted;
+            grew = true;
+          }
+          else if (cpuContext)
+          {
+            sunpack_cpu_release_extra_for_context(cpuContext, granted);
+          }
+        }
+      }
+
+      if (!grew)
+      {
+        retireRes = retireOne(oldest);
+        retired++;
+      }
       continue;
     }
 
@@ -1610,7 +1660,23 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       break;
     }
 
-    CParallelBlockJob &job = *ring[(size_t)(submitted % ringSize)];
+    std::unique_ptr<CParallelBlockJob> &jobSlot =
+        ring[(size_t)(submitted % ringSize)];
+    if (!jobSlot)
+    {
+      try
+      {
+        jobSlot.reset(new CParallelBlockJob());
+      }
+      catch (const std::bad_alloc &)
+      {
+        return E_OUTOFMEMORY;
+      }
+      if (!jobSlot->Allocate())
+        return E_OUTOFMEMORY;
+    }
+
+    CParallelBlockJob &job = *jobSlot;
     job.Reset(submitted);
 
     Base.Counters = job.Counters;
