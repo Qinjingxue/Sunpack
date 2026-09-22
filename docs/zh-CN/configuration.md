@@ -200,7 +200,7 @@ S = sigmoid(c + a × logit(B) + b × logit(P))
 
 Native worker 以 CPU credit 作为唯一解压并发预算。默认 nominal budget 等于逻辑核心数，每个已准入归档任务先占 1 个 base credit；格式不分配固定权重。7-Zip 内部 decoder 只有在真正准备创建额外并行执行线程时，才同步向同一个 budget 申请 extra credits；申请不到就少开线程或退回串行路径，因此外层任务与内层 decoder 不会形成两个互不知情的并发层。
 
-吞吐量控制器不再主动搜索最优并发。它只在 CPU credit 恰好打满（`reserved_cpu_credits == effective_cpu_budget`）时按实际写出吞吐被动观察；低于配额说明任务不足，高于配额只会出现在非抢占降档后的短暂过渡期，这两种情况都直接丢弃当前未完成窗口。默认观察窗口为 1 秒；相对当前稳定基线下降至少 40% 时，effective CPU budget 按 `max(1, logical_processors / 8)` 降低一级；相对基线提高至少 40% 时，按同样步长恢复，最高回到 nominal budget。每次配额变化后旧基线立即失效，只有在新配额再次恰好打满并完成新的 1 秒窗口后才建立新基线，再继续判断。
+吞吐量控制器不再主动搜索最优并发。它只在 CPU credit 恰好打满（`reserved_cpu_credits == effective_cpu_budget`）时按实际写出吞吐被动观察；低于配额说明任务不足，高于配额只会出现在非抢占降档后的短暂过渡期，这两种情况都直接丢弃当前未完成窗口。默认观察窗口为 1 秒；相对当前稳定基线下降至少 40% 时，effective CPU budget 按 `max(1, logical_processors / 8)` 降低一级；相对基线提高至少 40% 时，按同样步长恢复，最高回到 nominal budget。每次配额变化后旧基线立即失效。第一次采样观察到新配额恰好打满时只确定窗口起点，不计入该次采样之前的时间和字节；从下一次采样起连续满配额累计满 1 秒后才形成新窗口并建立基线。期间一旦不再恰好打满，当前窗口立即作废并等待下一次满配额重新起点。
 
 ## watch
 
