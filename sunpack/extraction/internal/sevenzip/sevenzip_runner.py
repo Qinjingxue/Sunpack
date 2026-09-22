@@ -7,7 +7,6 @@ import subprocess
 import threading
 import time
 import uuid
-from collections import deque
 from concurrent.futures import Future
 from contextlib import nullcontext
 from typing import Any, Callable
