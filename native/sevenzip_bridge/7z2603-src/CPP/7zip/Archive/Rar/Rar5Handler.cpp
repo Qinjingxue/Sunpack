@@ -40,6 +40,7 @@
 
 #include "../../Archive/Rar/RarVol.h"
 #include "Rar5Handler.h"
+#include "internal/decoder_cpu_budget.h"
 
 using namespace NWindows;
 
@@ -3374,14 +3375,21 @@ void CHandler::InitDefaults()
   _memUsage_WasSet = false;
   _memUsage_Decompress = (UInt64)1 << 32;
 #ifndef Z7_ST
+  if (sunpack_cpu_current_job_context())
+  {
+    _numThreads = SUNPACK_CPU_MANAGED_THREAD_HINT;
+  }
+  else
+  {
 #ifdef _WIN32
-  NWindows::NSystem::CProcessAffinity affinity;
-  _numThreads = affinity.Load_and_GetNumberOfThreads();
+    NWindows::NSystem::CProcessAffinity affinity;
+    _numThreads = affinity.Load_and_GetNumberOfThreads();
 #else
-  _numThreads = NWindows::NSystem::GetNumberOfProcessors();
+    _numThreads = NWindows::NSystem::GetNumberOfProcessors();
 #endif
-  if (_numThreads == 0)
-    _numThreads = 1;
+    if (_numThreads == 0)
+      _numThreads = 1;
+  }
 #endif
 }
 
