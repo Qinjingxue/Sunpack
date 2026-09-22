@@ -2048,11 +2048,6 @@ namespace NCompress
         _jobs.clear();
       }
 
-      size_t JobCount() const
-      {
-        return _jobs.size();
-      }
-
       CRar5ParallelBlockJob &JobAt(size_t index)
       {
         return *_jobs[index];
@@ -3174,7 +3169,7 @@ HRESULT CDecoder::CodeReal()
 }
 
 Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream *outStream,
-                            const UInt64 *inSize, const UInt64 *outSize, ICompressProgressInfo *progress))
+                            const UInt64 * /* inSize */, const UInt64 *outSize, ICompressProgressInfo *progress))
 {
   _lzError = LZ_ERROR_TYPE_NO;
   /*
