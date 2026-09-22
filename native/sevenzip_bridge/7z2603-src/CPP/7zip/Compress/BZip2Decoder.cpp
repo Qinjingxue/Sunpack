@@ -1501,14 +1501,10 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
   std::vector<std::unique_ptr<CParallelBlockJob>> ring;
   try
   {
-    ring.reserve(ringSize);
-    for (size_t i = 0; i < ringSize; i++)
-    {
-      std::unique_ptr<CParallelBlockJob> job(new CParallelBlockJob());
-      if (!job->Allocate())
-        return E_OUTOFMEMORY;
-      ring.push_back(std::move(job));
-    }
+    // Slots are fixed so sequence-to-slot mapping stays stable while the
+    // worker width grows. Allocate the multi-megabyte block workspace only
+    // when a slot is actually reached.
+    ring.resize(ringSize);
   }
   catch (const std::bad_alloc &)
   {
@@ -1664,7 +1660,23 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       break;
     }
 
-    CParallelBlockJob &job = *ring[(size_t)(submitted % ringSize)];
+    std::unique_ptr<CParallelBlockJob> &jobSlot =
+        ring[(size_t)(submitted % ringSize)];
+    if (!jobSlot)
+    {
+      try
+      {
+        jobSlot.reset(new CParallelBlockJob());
+      }
+      catch (const std::bad_alloc &)
+      {
+        return E_OUTOFMEMORY;
+      }
+      if (!jobSlot->Allocate())
+        return E_OUTOFMEMORY;
+    }
+
+    CParallelBlockJob &job = *jobSlot;
     job.Reset(submitted);
 
     Base.Counters = job.Counters;
