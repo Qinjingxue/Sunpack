@@ -134,14 +134,11 @@
   "performance": {
     "persistent_server_idle_seconds": 15,
     "worker": {
-      "resource_diagnostics_enabled": false,
       "watchdog_no_progress_timeout_seconds": 180,
       "thread_capacity": 0,
       "stage_thread_capacity": 0,
       "max_inflight_files": 0,
       "max_pending_stage_jobs": 4096,
-      "adaptive_enabled": true,
-      "sample_interval_ms": 500,
       "max_queue_jobs": 4096,
       "priority_aging_quantum": 32,
       "backpressure_retries": 120,
@@ -150,8 +147,7 @@
       "space_gate_enabled": true,
       "space_poll_interval_ms": 1000,
       "space_status_report_interval_ms": 15000,
-      "observation_window_seconds": 1,
-      "throughput_change_ratio": 0.4
+      "minimum_available_memory_ratio": 0.1
     }
   },
   "runtime": {
