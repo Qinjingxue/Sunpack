@@ -133,6 +133,7 @@ void MtDecThread_FreeInBufs(CMtDecThread *t)
   {
     void *link = t->inBuf;
     t->inBuf = NULL;
+    t->inBufCount = 0;
     do
     {
       void *next = ((CMtDecBufLink *)link)->next;
@@ -154,18 +155,18 @@ static void MtDecThread_TrimInBufs(CMtDecThread *t, unsigned keepCount)
 {
   CMtDecBufLink *link = (CMtDecBufLink *)t->inBuf;
   CMtDecBufLink *tail;
+  unsigned left;
 
-  if (!link || keepCount == 0)
+  if (!link || keepCount == 0 || t->inBufCount <= keepCount)
     return;
 
-  while (--keepCount != 0 && link->next)
+  left = keepCount;
+  while (--left != 0)
     link = link->next;
 
   tail = link->next;
-  if (!tail)
-    return;
-
   link->next = NULL;
+  t->inBufCount = keepCount;
   do
   {
     CMtDecBufLink *next = tail->next;
@@ -359,6 +360,7 @@ static WRes MtDec_ThreadFunc2(CMtDecThread *t)
             }
             else
               t->inBuf = (void *)link;
+            t->inBufCount++;
           }
 
           {
@@ -967,6 +969,8 @@ const Byte *MtDec_Read(CMtDec *p, size_t *inLim)
         void *next = ((CMtDecBufLink *)link)->next;
         ISzAlloc_Free(p->alloc, link);
         t->inBuf = next;
+        if (t->inBufCount != 0)
+          t->inBufCount--;
       }
       
       if (t->inDataSize == 0)
@@ -1053,6 +1057,7 @@ void MtDec_Construct(CMtDec *p)
     t->mtDec = p;
     t->index = i;
     t->inBuf = NULL;
+    t->inBufCount = 0;
     Event_Construct(&t->canRead);
     Event_Construct(&t->canWrite);
     Thread_CONSTRUCT(&t->thread)
