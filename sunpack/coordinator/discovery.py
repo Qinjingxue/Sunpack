@@ -1,6 +1,6 @@
-"""Compose the filesystem, relation, format, and embedded stages."""
+"""Compose filesystem routing, Relations, format confirmation, and embedded discovery."""
 
-from sunpack.contracts.discovery import DiscoveryCandidate, StageResult, candidate_paths
+from sunpack.contracts.discovery import DiscoveryCandidate, StageResult
 from sunpack.detection.confirmation import FormatConfirmation
 from sunpack.detection.scheduler import DetectionScheduler
 from sunpack.embedded.discovery import EmbeddedDiscovery
@@ -19,14 +19,13 @@ class ArchiveDiscoveryPipeline:
         self,
         candidates: list[DiscoveryCandidate],
         *,
-        scan_session=None,
         is_recursive_scan: bool = False,
-    ) -> tuple[StageResult, list]:
+    ) -> StageResult:
         relations = [item for item in candidates if item.route == "relations"]
         formats = [item for item in candidates if item.route == "detection"]
         residual = [item for item in candidates if item.route == "residual"]
 
-        relation_result, relation_decisions = self.relations.resolve(relations)
+        relation_result = self.relations.resolve(relations)
         claimed = set(relation_result.claimed_paths)
         blocked = set(relation_result.blocked_paths)
 
@@ -34,38 +33,41 @@ class ArchiveDiscoveryPipeline:
             eligible = [
                 item
                 for item in formats
-                if not candidate_paths(item) & (claimed | blocked)
+                if not item.path_keys & (claimed | blocked)
             ]
-            format_result, format_decisions = self.detection.confirm(
-                eligible,
-                scan_session=scan_session,
-            )
+            format_result = self.detection.confirm(eligible)
         else:
-            format_result, format_decisions = StageResult(), []
-            residual.extend(formats)
+            format_result = StageResult()
+            for item in formats:
+                format_result.add_residual(
+                    item,
+                    source="detection",
+                    reason="detection_disabled",
+                )
 
         claimed.update(format_result.claimed_paths)
         blocked.update(format_result.blocked_paths)
+
         residual.extend(
             item
             for item in relations
-            if candidate_paths(item) & relation_result.residual_paths
+            if item.path_keys & relation_result.residual_paths
         )
         residual.extend(
             item
             for item in formats
-            if candidate_paths(item) & format_result.residual_paths
+            if item.path_keys & format_result.residual_paths
         )
 
         unclaimed: list[DiscoveryCandidate] = []
-        seen_ids: set[int] = set()
+        seen: set[int] = set()
         for item in residual:
-            if id(item) in seen_ids or candidate_paths(item) & (claimed | blocked):
+            if id(item) in seen or item.path_keys & (claimed | blocked):
                 continue
+            seen.add(id(item))
             unclaimed.append(item)
-            seen_ids.add(id(item))
 
-        embedded_result, embedded_decisions = self.embedded.discover(
+        embedded_result = self.embedded.discover(
             unclaimed,
             is_recursive_scan=is_recursive_scan,
         )
@@ -77,11 +79,12 @@ class ArchiveDiscoveryPipeline:
             ],
             claimed_paths=claimed | embedded_result.claimed_paths,
             blocked_paths=blocked | embedded_result.blocked_paths,
-            residual_paths=embedded_result.residual_paths,
+            residual_paths=set(embedded_result.residual_paths),
+            traces=[
+                *relation_result.traces,
+                *format_result.traces,
+                *embedded_result.traces,
+            ],
         )
         result.validate()
-        return result, [
-            *relation_decisions,
-            *format_decisions,
-            *embedded_decisions,
-        ]
+        return result
