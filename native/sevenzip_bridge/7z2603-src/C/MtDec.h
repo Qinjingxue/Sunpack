@@ -43,6 +43,7 @@ typedef struct
   struct CMtDec_ *mtDec;
   unsigned index;
   void *inBuf;
+  unsigned inBufCount;
 
   size_t inDataSize_Start; // size of input data in start block
   UInt64 inDataSize;       // total size of input data in all blocks
