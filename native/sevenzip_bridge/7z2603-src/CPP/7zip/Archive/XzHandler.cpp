@@ -1207,7 +1207,7 @@ static HRESULT DecodeBlocks_Positioned(
     }
   };
 
-  auto worker = [&]()
+  auto worker = [&](bool ownsCredit)
   {
     void *previousContext = NULL;
     if (cpuContext)
@@ -1220,7 +1220,11 @@ static HRESULT DecodeBlocks_Positioned(
     {
       publishFailure(E_FAIL, SZ_OK);
       if (cpuContext)
+      {
         sunpack_cpu_exchange_current_job_context(previousContext);
+        if (ownsCredit)
+          sunpack_cpu_release_extra_for_context(cpuContext, 1);
+      }
       return;
     }
 
@@ -1267,7 +1271,11 @@ static HRESULT DecodeBlocks_Positioned(
     }
 
     if (cpuContext)
+    {
       sunpack_cpu_exchange_current_job_context(previousContext);
+      if (ownsCredit)
+        sunpack_cpu_release_extra_for_context(cpuContext, 1);
+    }
   };
 
   std::vector<std::thread> threads;
@@ -1277,10 +1285,10 @@ static HRESULT DecodeBlocks_Positioned(
     {
       threads.reserve(desiredThreads - 1);
       for (unsigned i = 1; i < desiredThreads; ++i)
-        threads.emplace_back(worker);
+        threads.emplace_back(worker, true);
     }
 
-    worker();
+    worker(false);
 
     for (auto &thread : threads)
       thread.join();
@@ -1291,13 +1299,11 @@ static HRESULT DecodeBlocks_Positioned(
     for (auto &thread : threads)
       if (thread.joinable())
         thread.join();
-    if (cpuContext && extraCredits)
-      sunpack_cpu_release_extra_for_context(cpuContext, extraCredits);
+    if (cpuContext && extraCredits > threads.size())
+      sunpack_cpu_release_extra_for_context(
+          cpuContext, extraCredits - (unsigned)threads.size());
     return E_OUTOFMEMORY;
   }
-
-  if (cpuContext && extraCredits)
-    sunpack_cpu_release_extra_for_context(cpuContext, extraCredits);
 
   {
     std::lock_guard<std::mutex> lock(resultMutex);
