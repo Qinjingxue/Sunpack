@@ -140,9 +140,12 @@ def test_missing_middle_split_volume_is_not_emitted_as_a_relation_group(tmp_path
     _write_files(root, ["gap.7z.001", "gap.7z.002", "gap.7z.004"])
 
     bags = build_fact_bags_for_targets([str(root)], config=SCAN_CONFIG)
-    gap = [bag for bag in bags if bag.get("candidate.logical_name") == "gap"]
+    gap = [
+        bag for bag in bags
+        if Path(bag.get("candidate.entry_path") or "").name.startswith("gap.7z.")
+    ]
 
-    assert gap
+    assert len(gap) == 3
     assert all(not bag.get("relation.is_split_related") for bag in gap)
     assert all(len(bag.get("candidate.member_paths") or []) == 1 for bag in gap)
 
@@ -152,9 +155,12 @@ def test_missing_head_split_volume_is_not_emitted_as_a_relation_group(tmp_path):
     _write_files(root, ["lost.7z.002", "lost.7z.003"])
 
     bags = build_fact_bags_for_targets([str(root)], config=SCAN_CONFIG)
-    lost = [bag for bag in bags if bag.get("candidate.logical_name") == "lost"]
+    lost = [
+        bag for bag in bags
+        if Path(bag.get("candidate.entry_path") or "").name.startswith("lost.7z.")
+    ]
 
-    assert lost
+    assert len(lost) == 2
     assert all(not bag.get("relation.is_split_related") for bag in lost)
     assert all(len(bag.get("candidate.member_paths") or []) == 1 for bag in lost)
 
