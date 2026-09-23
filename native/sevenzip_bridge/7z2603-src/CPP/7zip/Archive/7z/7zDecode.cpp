@@ -9,11 +9,568 @@
 #include "../../Common/ProgressUtils.h"
 #include "../../Common/StreamObjects.h"
 #include "../../Common/StreamUtils.h"
+#include "../../Compress/Lzma2Decoder.h"
+
+#include "../../../../C/Bra.h"
+#include "../../../../C/SwapBytes.h"
+#include "internal/positioned_output.hpp"
+
+#include <algorithm>
+#include <array>
+#include <map>
+#include <mutex>
+#include <vector>
 
 #include "7zDecode.h"
 
 namespace NArchive {
 namespace N7z {
+
+namespace {
+
+static unsigned PositionedFilterAlignment(CMethodId method)
+{
+  switch (method)
+  {
+    case k_ARM64:
+    case k_ARM:
+    case k_PPC:
+    case k_SPARC:
+      return 4;
+    case k_IA64:
+      return 16;
+    case k_SWAP2:
+      return 2;
+    case k_SWAP4:
+      return 4;
+    default:
+      return 0;
+  }
+}
+
+static bool PositionedFilterProps(
+    const CCoderInfo &coder,
+    UInt32 &pcInit)
+{
+  pcInit = 0;
+  const CMethodId method = coder.MethodID;
+  const unsigned alignment = PositionedFilterAlignment(method);
+  if (alignment == 0)
+    return false;
+
+  if (method == k_ARM64)
+  {
+    if (coder.Props.Size() == 0)
+      return true;
+    if (coder.Props.Size() != 4)
+      return false;
+    pcInit = GetUi32((const Byte *)coder.Props);
+    return (pcInit & (alignment - 1)) == 0;
+  }
+
+  return coder.Props.Size() == 0;
+}
+
+static bool ApplyPositionedFilter(
+    CMethodId method,
+    Byte *data,
+    size_t size,
+    UInt32 pc)
+{
+  if (size == 0)
+    return true;
+
+  switch (method)
+  {
+    case k_ARM64:
+      return Z7_BRANCH_CONV_DEC(ARM64)(data, size, pc) == data + size;
+    case k_ARM:
+      return Z7_BRANCH_CONV_DEC(ARM)(data, size, pc) == data + size;
+    case k_PPC:
+      return Z7_BRANCH_CONV_DEC(PPC)(data, size, pc) == data + size;
+    case k_SPARC:
+      return Z7_BRANCH_CONV_DEC(SPARC)(data, size, pc) == data + size;
+    case k_IA64:
+      return Z7_BRANCH_CONV_DEC(IA64)(data, size, pc) == data + size;
+    case k_SWAP2:
+      z7_SwapBytes2((UInt16 *)(void *)data, size >> 1);
+      return true;
+    case k_SWAP4:
+      z7_SwapBytes4((UInt32 *)(void *)data, size >> 2);
+      return true;
+    default:
+      return false;
+  }
+}
+
+class CPositionedAlignedFilterOutStream final :
+  public CMyUnknownImp,
+  public ISequentialOutStream,
+  public sunpack::sevenzip::PositionedOutStream
+{
+  Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+
+  struct CPartialCell
+  {
+    std::array<Byte, 16> Bytes{};
+    UInt32 Mask = 0;
+  };
+
+  CMyComPtr<ISequentialOutStream> _sequential;
+  sunpack::sevenzip::PositionedOutStream *_positioned;
+  CMethodId _method;
+  UInt32 _pcInit;
+  UInt64 _totalSize;
+  unsigned _alignment;
+
+  std::mutex _partialMutex;
+  std::map<UInt64, CPartialCell> _partials;
+
+  std::mutex _sequentialMutex;
+  std::vector<Byte> _sequentialPending;
+  UInt64 _sequentialPos;
+  bool _sequentialUsed;
+
+  HRESULT WriteFilteredAt(UInt64 offset, const Byte *data, UInt32 size)
+  {
+    if (size == 0)
+      return S_OK;
+
+    thread_local std::vector<Byte> scratch;
+    try
+    {
+      scratch.assign(data, data + size);
+    }
+    catch (...)
+    {
+      return E_OUTOFMEMORY;
+    }
+
+    if (!ApplyPositionedFilter(
+            _method,
+            scratch.data(),
+            scratch.size(),
+            _pcInit + (UInt32)offset))
+      return E_FAIL;
+
+    UInt32 written = 0;
+    const HRESULT hres = _positioned->write_at(
+        offset, scratch.data(), size, &written);
+    return hres == S_OK && written == size ? S_OK :
+        (hres != S_OK ? hres : E_FAIL);
+  }
+
+  HRESULT AddPartial(
+      UInt64 cellStart,
+      unsigned cellOffset,
+      const Byte *data,
+      unsigned size)
+  {
+    std::array<Byte, 16> completed{};
+    bool ready = false;
+
+    {
+      std::lock_guard<std::mutex> lock(_partialMutex);
+      CPartialCell &cell = _partials[cellStart];
+      for (unsigned i = 0; i < size; ++i)
+      {
+        const unsigned index = cellOffset + i;
+        if (index >= _alignment)
+          return E_FAIL;
+        cell.Bytes[index] = data[i];
+        cell.Mask |= (UInt32)1 << index;
+      }
+
+      const UInt32 completeMask =
+          _alignment == 32 ? 0xFFFFFFFFu :
+          (((UInt32)1 << _alignment) - 1);
+      if (cell.Mask == completeMask)
+      {
+        completed = cell.Bytes;
+        _partials.erase(cellStart);
+        ready = true;
+      }
+    }
+
+    if (!ready)
+      return S_OK;
+
+    return WriteFilteredAt(
+        cellStart, completed.data(), (UInt32)_alignment);
+  }
+
+public:
+  CPositionedAlignedFilterOutStream(
+      ISequentialOutStream *stream,
+      CMethodId method,
+      UInt32 pcInit,
+      UInt64 totalSize):
+      _sequential(stream),
+      _positioned(sunpack::sevenzip::positioned_out_stream(stream)),
+      _method(method),
+      _pcInit(pcInit),
+      _totalSize(totalSize),
+      _alignment(PositionedFilterAlignment(method)),
+      _sequentialPos(0),
+      _sequentialUsed(false)
+  {}
+
+  bool IsUsable() const
+  {
+    return _positioned && _positioned->positioned_available() &&
+        _alignment != 0 && _alignment <= 16;
+  }
+
+  bool positioned_available() const noexcept override
+  {
+    return !_sequentialUsed && _positioned &&
+        _positioned->positioned_available();
+  }
+
+  HRESULT write_at(
+      UInt64 offset,
+      const void *data,
+      UInt32 size,
+      UInt32 *processedSize) noexcept override
+  {
+    if (processedSize)
+      *processedSize = 0;
+    if (_sequentialUsed || !IsUsable() ||
+        (size != 0 && !data) ||
+        offset > _totalSize ||
+        size > _totalSize - offset)
+      return E_FAIL;
+    if (size == 0)
+      return S_OK;
+
+    const Byte *src = (const Byte *)data;
+    UInt32 consumed = 0;
+
+    try
+    {
+      const UInt64 firstAligned =
+          (offset + (_alignment - 1)) & ~(UInt64)(_alignment - 1);
+      const UInt64 end = offset + size;
+      const UInt64 alignedEnd = end & ~(UInt64)(_alignment - 1);
+
+      if (offset < firstAligned)
+      {
+        const UInt32 cur = (UInt32)(std::min<UInt64>)(
+            end - offset, firstAligned - offset);
+        RINOK(AddPartial(
+            offset & ~(UInt64)(_alignment - 1),
+            (unsigned)(offset & (_alignment - 1)),
+            src, cur))
+        consumed += cur;
+      }
+
+      const UInt64 middleStart = offset + consumed;
+      if (middleStart < alignedEnd)
+      {
+        UInt64 middle = alignedEnd - middleStart;
+        while (middle != 0)
+        {
+          const UInt32 cur = (UInt32)(std::min<UInt64>)(
+              middle, (UInt64)1 << 20);
+          RINOK(WriteFilteredAt(
+              middleStart + (alignedEnd - middleStart - middle),
+              src + consumed,
+              cur))
+          consumed += cur;
+          middle -= cur;
+        }
+      }
+
+      if (consumed < size)
+      {
+        const UInt64 pos = offset + consumed;
+        const UInt32 cur = size - consumed;
+        RINOK(AddPartial(
+            pos & ~(UInt64)(_alignment - 1),
+            (unsigned)(pos & (_alignment - 1)),
+            src + consumed, cur))
+        consumed += cur;
+      }
+    }
+    catch (...)
+    {
+      if (processedSize)
+        *processedSize = consumed;
+      return E_OUTOFMEMORY;
+    }
+
+    if (processedSize)
+      *processedSize = consumed;
+    return S_OK;
+  }
+
+  Z7_COM7F_IMF(Write(
+      const void *data,
+      UInt32 size,
+      UInt32 *processedSize))
+  {
+    if (processedSize)
+      *processedSize = 0;
+    if (size != 0 && !data)
+      return E_POINTER;
+
+    std::lock_guard<std::mutex> lock(_sequentialMutex);
+
+    if (!_sequentialUsed)
+    {
+      _sequentialUsed = true;
+      {
+        std::lock_guard<std::mutex> partialLock(_partialMutex);
+        _partials.clear();
+      }
+      _sequentialPending.clear();
+      _sequentialPos = 0;
+    }
+
+    const Byte *src = (const Byte *)data;
+    try
+    {
+      _sequentialPending.insert(
+          _sequentialPending.end(), src, src + size);
+    }
+    catch (...)
+    {
+      return E_OUTOFMEMORY;
+    }
+
+    const size_t processSize =
+        _sequentialPending.size() & ~(size_t)(_alignment - 1);
+    if (processSize != 0)
+    {
+      std::vector<Byte> converted(
+          _sequentialPending.begin(),
+          _sequentialPending.begin() + processSize);
+      if (!ApplyPositionedFilter(
+              _method, converted.data(), converted.size(),
+              _pcInit + (UInt32)_sequentialPos))
+        return E_FAIL;
+
+      UInt32 written = 0;
+      const HRESULT hres = _sequential->Write(
+          converted.data(), (UInt32)converted.size(), &written);
+      if (hres != S_OK || written != converted.size())
+        return hres != S_OK ? hres : E_FAIL;
+
+      _sequentialPos += written;
+      _sequentialPending.erase(
+          _sequentialPending.begin(),
+          _sequentialPending.begin() + processSize);
+    }
+
+    if (processedSize)
+      *processedSize = size;
+    return S_OK;
+  }
+
+  HRESULT Finish()
+  {
+    std::lock_guard<std::mutex> seqLock(_sequentialMutex);
+
+    if (_sequentialUsed)
+    {
+      if (!_sequentialPending.empty())
+      {
+        UInt32 written = 0;
+        const HRESULT hres = _sequential->Write(
+            _sequentialPending.data(),
+            (UInt32)_sequentialPending.size(),
+            &written);
+        if (hres != S_OK || written != _sequentialPending.size())
+          return hres != S_OK ? hres : E_FAIL;
+        _sequentialPos += written;
+        _sequentialPending.clear();
+      }
+      return _sequentialPos == _totalSize ? S_OK : E_FAIL;
+    }
+
+    std::array<Byte, 16> tail{};
+    UInt32 tailSize = 0;
+    UInt64 tailStart = 0;
+
+    {
+      std::lock_guard<std::mutex> lock(_partialMutex);
+      if (!_partials.empty())
+      {
+        if (_partials.size() != 1)
+          return E_FAIL;
+
+        const auto &entry = *_partials.begin();
+        tailStart = entry.first;
+        if (tailStart >= _totalSize ||
+            tailStart + _alignment <= _totalSize)
+          return E_FAIL;
+
+        tailSize = (UInt32)(_totalSize - tailStart);
+        const UInt32 expectedMask =
+            ((UInt32)1 << tailSize) - 1;
+        if ((entry.second.Mask & expectedMask) != expectedMask ||
+            (entry.second.Mask & ~expectedMask) != 0)
+          return E_FAIL;
+        tail = entry.second.Bytes;
+        _partials.clear();
+      }
+    }
+
+    if (tailSize != 0)
+    {
+      UInt32 written = 0;
+      const HRESULT hres = _positioned->write_at(
+          tailStart, tail.data(), tailSize, &written);
+      if (hres != S_OK || written != tailSize)
+        return hres != S_OK ? hres : E_FAIL;
+    }
+
+    return S_OK;
+  }
+};
+
+
+static bool GetSimplePositionedFilterChain(
+    const CFolderEx &folder,
+    unsigned &lzma2Index,
+    unsigned &filterIndex,
+    UInt32 &filterPc)
+{
+  if (folder.Coders.Size() != 2 ||
+      folder.Bonds.Size() != 1 ||
+      folder.PackStreams.Size() != 1)
+    return false;
+
+  filterIndex = folder.UnpackCoder;
+  if (filterIndex >= folder.Coders.Size())
+    return false;
+
+  lzma2Index = filterIndex == 0 ? 1 : 0;
+
+  const CCoderInfo &lzma = folder.Coders[lzma2Index];
+  const CCoderInfo &filter = folder.Coders[filterIndex];
+
+  if (!lzma.IsSimpleCoder() ||
+      !filter.IsSimpleCoder() ||
+      lzma.MethodID != k_LZMA2 ||
+      !PositionedFilterProps(filter, filterPc))
+    return false;
+
+  /*
+    For two one-input/one-output coders, input stream indexes and output coder
+    indexes are both 0/1. Require the exact LZMA2 -> filter topology and one
+    external packed stream feeding LZMA2.
+  */
+  const CBond &bond = folder.Bonds[0];
+  if (bond.UnpackIndex != lzma2Index ||
+      bond.PackIndex != filterIndex ||
+      folder.PackStreams[0] != lzma2Index)
+    return false;
+
+  return true;
+}
+
+
+static HRESULT TryDecodeSimplePositionedFilter(
+    IInStream *inStream,
+    UInt64 startPos,
+    const UInt64 *packPositions,
+    const CFolderEx &folder,
+    const UInt64 *coderUnpackSizes,
+    ISequentialOutStream *outStream,
+    ICompressProgressInfo *progress
+    #if !defined(Z7_ST)
+    , bool mtMode, UInt32 numThreads, UInt64 memUsage
+    #endif
+    )
+{
+  if (!inStream || !outStream)
+    return E_NOTIMPL;
+
+  sunpack::sevenzip::PositionedOutStream *positioned =
+      sunpack::sevenzip::positioned_out_stream(outStream);
+  if (!positioned || !positioned->positioned_available())
+    return E_NOTIMPL;
+
+  unsigned lzmaIndex = 0;
+  unsigned filterIndex = 0;
+  UInt32 filterPc = 0;
+  if (!GetSimplePositionedFilterChain(
+          folder, lzmaIndex, filterIndex, filterPc))
+    return E_NOTIMPL;
+
+  const CCoderInfo &lzma = folder.Coders[lzmaIndex];
+  if (lzma.Props.Size() != 1)
+    return E_NOTIMPL;
+
+  const UInt64 packSize = packPositions[1] - packPositions[0];
+  const UInt64 outSize = coderUnpackSizes[lzmaIndex];
+
+  RINOK(InStream_SeekSet(
+      inStream, startPos + packPositions[0]))
+
+  CMyComPtr2_Create<ISequentialInStream, CLimitedSequentialInStream> limited;
+  limited->SetStream(inStream);
+  limited->Init(packSize);
+
+  CMyComPtr<ICompressCoder> coder =
+      new NCompress::NLzma2::CDecoder;
+
+  {
+    Z7_DECL_CMyComPtr_QI_FROM(
+        ICompressSetDecoderProperties2,
+        setProps, coder)
+    if (!setProps)
+      return E_NOTIMPL;
+    RINOK(setProps->SetDecoderProperties2(
+        (const Byte *)lzma.Props, (UInt32)lzma.Props.Size()))
+  }
+
+  {
+    Z7_DECL_CMyComPtr_QI_FROM(
+        ICompressSetFinishMode,
+        setFinish, coder)
+    if (setFinish)
+      RINOK(setFinish->SetFinishMode(1))
+  }
+
+  #if !defined(Z7_ST)
+  if (mtMode)
+  {
+    Z7_DECL_CMyComPtr_QI_FROM(
+        ICompressSetCoderMt,
+        setMt, coder)
+    if (setMt)
+      RINOK(setMt->SetNumberOfThreads(numThreads))
+
+    Z7_DECL_CMyComPtr_QI_FROM(
+        ICompressSetMemLimit,
+        setMemLimit, coder)
+    if (setMemLimit)
+      RINOK(setMemLimit->SetMemLimit(memUsage))
+  }
+  #endif
+
+  CMyComPtr2<ISequentialOutStream, CPositionedAlignedFilterOutStream>
+      filtered;
+  filtered.Create_if_Empty(
+      outStream,
+      folder.Coders[filterIndex].MethodID,
+      filterPc,
+      outSize);
+  if (!filtered->IsUsable())
+    return E_NOTIMPL;
+
+  const HRESULT hres = coder->Code(
+      limited, filtered, &packSize, &outSize, progress);
+  if (hres != S_OK)
+    return hres;
+
+  return filtered->Finish();
+}
+
+} // namespace
+
 
 namespace {
 
@@ -380,6 +937,34 @@ HRESULT CDecoder::Decode(
     if (*unpackSize > folderUnpackSize)
       return E_FAIL;
     fullUnpack = (*unpackSize == folderUnpackSize);
+  }
+
+  /*
+    Simple LZMA2 -> position-only filters can stay fully parallel without an
+    intermediate full run buffer. The filter is applied to independently
+    addressable aligned cells and the final bytes are committed by logical
+    offset. Stateful/look-ahead filters (x86 BCJ, Delta, BCJ2, ARMT, RISCV)
+    deliberately remain on the legacy mixer path.
+  */
+  if (fullUnpack && outStream && !folderInfo.IsEncrypted())
+  {
+    const UInt32 unpackStreamIndexStart =
+        folders.FoToCoderUnpackSizes[folderIndex];
+    const HRESULT positionedFilterResult =
+        TryDecodeSimplePositionedFilter(
+            inStream,
+            startPos,
+            packPositions,
+            folderInfo,
+            &folders.CoderUnpackSizes[unpackStreamIndexStart],
+            outStream,
+            compressProgress
+            #if !defined(Z7_ST)
+            , mtMode, numThreads, memUsage
+            #endif
+            );
+    if (positionedFilterResult != E_NOTIMPL)
+      return positionedFilterResult;
   }
 
   /*
