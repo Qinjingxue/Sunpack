@@ -24,62 +24,6 @@
 namespace NCompress {
 namespace NLzma2 {
 
-namespace {
-
-struct CPositionedOutWrap
-{
-  ISunpackPositionedOutStream vt;
-  sunpack::sevenzip::PositionedOutStream *stream;
-  std::atomic<HRESULT> res;
-  std::atomic<UInt64> processed;
-
-  static size_t WriteAt(void *context, UInt64 offset, const void *data, size_t size)
-  {
-    CPositionedOutWrap *p = static_cast<CPositionedOutWrap *>(context);
-    if (!p || !p->stream)
-      return 0;
-    if (p->res.load(std::memory_order_acquire) != S_OK)
-      return 0;
-
-    const Byte *src = static_cast<const Byte *>(data);
-    size_t total = 0;
-    while (total < size)
-    {
-      const size_t rem = size - total;
-      const UInt32 chunk =
-          rem > (size_t)0xFFFFFFFF ? 0xFFFFFFFFu : (UInt32)rem;
-      UInt32 written = 0;
-      const HRESULT hres = p->stream->write_at(
-          offset + total, src + total, chunk, &written);
-      total += written;
-      if (hres != S_OK || written != chunk)
-      {
-        HRESULT expected = S_OK;
-        const HRESULT error = hres != S_OK ? hres : E_FAIL;
-        p->res.compare_exchange_strong(
-            expected, error,
-            std::memory_order_acq_rel,
-            std::memory_order_acquire);
-        break;
-      }
-    }
-
-    p->processed.fetch_add(total, std::memory_order_relaxed);
-    return total;
-  }
-
-  void Init(sunpack::sevenzip::PositionedOutStream *value)
-  {
-    stream = value;
-    res.store(S_OK, std::memory_order_relaxed);
-    processed.store(0, std::memory_order_relaxed);
-    vt.context = this;
-    vt.WriteAt = WriteAt;
-  }
-};
-
-} // namespace
-
 CDecoder::CDecoder():
       _dec(NULL)
     , _inProcessed(0)
@@ -790,7 +734,6 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
   CSeqInStreamWrap inWrap;
   CSeqOutStreamWrap outWrap;
   CCompressProgressWrap progressWrap;
-  CPositionedOutWrap positionedWrap;
 
   inWrap.Init(inStream);
   outWrap.Init(outStream);
@@ -800,7 +743,6 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
       sunpack::sevenzip::positioned_out_stream(outStream);
   if (positionedOut && !positionedOut->positioned_available())
     positionedOut = NULL;
-  positionedWrap.Init(positionedOut);
 
   /*
     Preferred SunPack path: discover LZMA2 dictionary-reset runs by reading
@@ -840,21 +782,6 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     }
   }
 
-  #ifndef Z7_ST
-  /*
-    Full-output buffering used outBlockMax as a memory bound. Positioned mode
-    only keeps the real LZMA dictionary, so a long reset-run must not trigger
-    MtDec's legacy ST fallback after earlier runs have already been committed.
-    Let the parser reach the next dictionary reset (or end of coder output).
-  */
-  if (positionedOut && outSize &&
-      *outSize != 0 &&
-      *outSize <= (UInt64)(size_t)-1)
-  {
-    props.outBlockMax = (size_t)*outSize;
-  }
-  #endif
-
   SRes res;
 
   UInt64 inProcessed = 0;
@@ -866,21 +793,12 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 
   // UInt64 cpuTicks = GetCpuTicks();
 
-  if (positionedOut && outSize && props.numThreads > 1)
-    res = Lzma2DecMt_DecodePositioned(_dec, _prop, &props,
-        &outWrap.vt, &positionedWrap.vt,
-        outSize, _finishMode,
-        &inWrap.vt,
-        &inProcessed,
-        &isMT,
-        progress ? &progressWrap.vt : NULL);
-  else
-    res = Lzma2DecMt_Decode(_dec, _prop, &props,
-        &outWrap.vt, outSize, _finishMode,
-        &inWrap.vt,
-        &inProcessed,
-        &isMT,
-        progress ? &progressWrap.vt : NULL);
+  res = Lzma2DecMt_Decode(_dec, _prop, &props,
+      &outWrap.vt, outSize, _finishMode,
+      &inWrap.vt,
+      &inProcessed,
+      &isMT,
+      progress ? &progressWrap.vt : NULL);
 
   /*
   cpuTicks = GetCpuTicks() - cpuTicks;
@@ -898,27 +816,14 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 
   RET_IF_WRAP_ERROR(progressWrap.Res, res, SZ_ERROR_PROGRESS)
   RET_IF_WRAP_ERROR(outWrap.Res, res, SZ_ERROR_WRITE)
-  {
-    const HRESULT positionedRes =
-        positionedWrap.res.load(std::memory_order_acquire);
-    if (positionedRes != S_OK)
-      return positionedRes;
-  }
   RET_IF_WRAP_ERROR_CONFIRMED(inWrap.Res, res, SZ_ERROR_READ)
 
   if (res == SZ_OK && _finishMode)
   {
     if (inSize && *inSize != inProcessed)
       res = SZ_ERROR_DATA;
-    if (outSize)
-    {
-      const UInt64 written =
-          positionedOut && outSize && isMT ?
-              positionedWrap.processed.load(std::memory_order_relaxed) :
-              outWrap.Processed;
-      if (*outSize != written)
-        res = SZ_ERROR_DATA;
-    }
+    if (outSize && *outSize != outWrap.Processed)
+      res = SZ_ERROR_DATA;
   }
 
   return SResToHRESULT(res);
