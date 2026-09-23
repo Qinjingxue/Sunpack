@@ -1161,7 +1161,12 @@ static HRESULT DecodeBlocks_Positioned(
     return E_NOTIMPL;
 
   const size_t numBlocks = handler._blocksArraySize - 1;
-  if (numBlocks == 0)
+  /*
+    A single XZ block has no inter-block reorder buffer to eliminate. Keep the
+    upstream streaming decoder for that case so the low-memory MT1/control path
+    retains its exact hot path and startup cost.
+  */
+  if (numBlocks < 2)
     return E_NOTIMPL;
 
   unsigned desiredThreads =
