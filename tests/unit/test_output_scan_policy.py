@@ -1,6 +1,6 @@
 from sunpack.contracts.extraction import ExtractionResult
 from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
-from sunpack.coordinator.target_scan import build_fact_bags_for_targets
+from sunpack.coordinator.target_scan import build_candidates_for_targets
 from sunpack.support.output_inventory import collect_output_inventory
 from tests.helpers.detection_config import with_detection_pipeline
 from sunpack_native import worker_manifest_from_rows
@@ -117,8 +117,8 @@ def test_output_scan_policy_scans_projected_embedded_roots_with_their_inventorie
     assert roots == [str(segment_one.resolve()), str(segment_two.resolve())]
     session = policy.take_scan_session(roots)
     assert session is not None
-    bags = build_fact_bags_for_targets(roots, session=session, config=_config())
-    assert {bag.get("candidate.entry_path") for bag in bags} == {str(first.resolve()), str(second.resolve())}
+    candidates = build_candidates_for_targets(roots, session=session, config=_config())
+    assert {candidate.entry_path for candidate in candidates} == {str(first.resolve()), str(second.resolve())}
 
 
 def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch):
@@ -143,8 +143,8 @@ def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch):
     session = policy.take_scan_session(roots)
     assert session is not None
     assert session.include_raw_snapshots is True
-    bags = build_fact_bags_for_targets(roots, session=session, config=_config())
-    assert [bag.get("candidate.entry_path") for bag in bags] == [str(nested.resolve())]
+    candidates = build_candidates_for_targets(roots, session=session, config=_config())
+    assert [candidate.entry_path for candidate in candidates] == [str(nested.resolve())]
 
 
 def test_output_scan_policy_inventory_batch_primes_file_heads(tmp_path, monkeypatch):
