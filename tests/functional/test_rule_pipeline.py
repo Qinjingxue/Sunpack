@@ -1,7 +1,7 @@
 import io
 import tarfile
 
-from sunpack.contracts.detection import FactBag
+from sunpack.contracts.discovery import DiscoveryCandidate
 from sunpack.detection.scheduler import DetectionScheduler
 from sunpack.detection.validation import validate_detection_contracts
 
@@ -15,24 +15,37 @@ def _tar_bytes() -> bytes:
     return output.getvalue()
 
 
+def _candidate(path, format_hint: str) -> DiscoveryCandidate:
+    value = str(path)
+    return DiscoveryCandidate(
+        entry_path=value,
+        member_paths=(value,),
+        logical_name=path.name,
+        carrier_path=value,
+        cleanup_paths=(value,),
+        route="detection",
+        format_hint=format_hint,
+        size=path.stat().st_size,
+    )
+
+
 def test_routed_tar_is_confirmed_with_disguised_extension(tmp_path):
     target = tmp_path / "random.bin"
     target.write_bytes(_tar_bytes())
-    bag = FactBag()
-    bag.set("file.path", str(target))
-    bag.set("filesystem.format_hint", "tar")
-    decision = DetectionScheduler({}).evaluate_bag(bag)
-    assert decision.should_extract is True
-    assert bag.get("file.detected_ext") == ".tar"
+
+    accepted, reason = DetectionScheduler({}).confirm(_candidate(target, "tar"))
+
+    assert accepted is True
+    assert reason == "Confirmed tar structure"
 
 
 def test_tar_extension_does_not_establish_format(tmp_path):
     target = tmp_path / "archive.tar"
     target.write_bytes(b"plain text")
-    bag = FactBag()
-    bag.set("file.path", str(target))
-    bag.set("filesystem.format_hint", "tar")
-    assert DetectionScheduler({}).evaluate_bag(bag).should_extract is False
+
+    accepted, _ = DetectionScheduler({}).confirm(_candidate(target, "tar"))
+
+    assert accepted is False
 
 
 def test_removed_pipeline_schema_is_rejected():
