@@ -3,12 +3,12 @@ from typing import Any, List
 
 from sunpack_native import batch_file_head_facts as _native_batch_file_head_facts
 
-from sunpack.contracts.detection import FactBag
+from sunpack.contracts.discovery import DiscoveryCandidate
 from sunpack.contracts.filesystem import (
     DirectorySnapshot,
     FILESYSTEM_ROUTE_RELATIONS,
 )
-from sunpack.coordinator.target_groups import relation_group_to_fact_bag
+from sunpack.coordinator.target_groups import relation_group_to_candidate
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.relations import CandidateGroup, RelationsScheduler
 from sunpack.support.path_keys import normalized_path, path_key, safe_relative_path
@@ -30,7 +30,7 @@ class DetectionScanSession:
         self._snapshots: dict[str, DirectorySnapshot] = {}
         self._relation_groups: dict[str, List[CandidateGroup]] = {}
         self._relation_group_signatures: dict[str, str] = {}
-        self._fact_bags: dict[str, List[FactBag]] = {}
+        self._candidates: dict[str, List[DiscoveryCandidate]] = {}
         self._file_head_facts: dict[str, dict[str, Any]] = {}
         self._directory_identities: dict[str, tuple[str, int, tuple]] = {}
         self._scan_roots: list[str] = []
@@ -131,31 +131,25 @@ class DetectionScanSession:
             self._relation_group_signatures[cache_key] = signature
         return self._relation_groups[cache_key]
 
-    def fact_bags_for_directory(self, directory: str) -> List[FactBag]:
+    def candidates_for_directory(self, directory: str) -> List[DiscoveryCandidate]:
         key = self._directory_key(directory)
-        if key not in self._fact_bags:
+        if key not in self._candidates:
             snapshot = self.snapshot_for_directory(directory)
             groups = self.relation_groups_for_directory(
                 directory,
                 filesystem_routed=True,
             )
-            bags = [relation_group_to_fact_bag(group) for group in groups]
-            for bag in bags:
-                bag.set("filesystem.route", "relations")
-                anchor = bag.get("relation.volume_anchor")
-                if isinstance(anchor, dict) and anchor.get("format"):
-                    bag.set("filesystem.format_hint", str(anchor["format"]).lower())
-
+            candidates = [relation_group_to_candidate(group) for group in groups]
             for path, size, route, format_hint, reject_mask in snapshot.non_relation_file_routing_rows():
-                bags.append(_filesystem_candidate_bag(
+                candidates.append(_filesystem_candidate(
                     path,
                     size=size,
                     route=route,
                     format_hint=format_hint,
                     reject_mask=reject_mask,
                 ))
-            self._fact_bags[key] = bags
-        return self._fact_bags[key]
+            self._candidates[key] = candidates
+        return self._candidates[key]
 
     def logical_name_for_archive(self, filename: str) -> str:
         return self.relations.logical_name_for_archive(filename)
@@ -243,34 +237,27 @@ class DetectionScanSession:
 
 
 
-def _filesystem_candidate_bag(
+def _filesystem_candidate(
     path: str,
     *,
     size: int | None,
     route: str,
     format_hint: str,
     reject_mask: int,
-) -> FactBag:
+) -> DiscoveryCandidate:
     path = normalized_path(path)
     name = os.path.basename(path)
-    logical_name = name
-    bag = FactBag()
-    bag.update({
-        "file.path": path,
-        "file.logical_name": logical_name,
-        "candidate.kind": "file",
-        "candidate.entry_path": path,
-        "candidate.member_paths": [path],
-        "candidate.logical_name": logical_name,
-        "candidate.carrier_path": path,
-        "candidate.cleanup_paths": [path],
-        "candidate.format_reject_mask": int(reject_mask or 0),
-        "filesystem.route": route,
-        "filesystem.format_hint": str(format_hint or "").lower(),
-    })
-    if isinstance(size, int):
-        bag.set("file.size", size)
-    return bag
+    return DiscoveryCandidate(
+        route=str(route or "residual"),
+        entry_path=path,
+        member_paths=(path,),
+        logical_name=name,
+        carrier_path=path,
+        cleanup_paths=(path,),
+        size=size if isinstance(size, int) else None,
+        format_hint=str(format_hint or "").lower(),
+        format_reject_mask=int(reject_mask or 0),
+    )
 
 
 def _password_signature(path_passwords: dict[str, str] | None) -> str:
