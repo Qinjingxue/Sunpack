@@ -588,9 +588,9 @@ namespace sunpack::sevenzip
         }
     }
 
-    class FileInStream final : public CMyUnknownImp, public IInStream, public RandomAccessInStream
+    class FileInStream final : public CMyUnknownImp, public IInStream, public ISunpackRandomAccessInStream
     {
-        Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
+        Z7_COM_UNKNOWN_IMP_3(ISequentialInStream, IInStream, ISunpackRandomAccessInStream)
         
 
     public:
