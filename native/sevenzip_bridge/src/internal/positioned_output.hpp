@@ -2,8 +2,33 @@
 
 #include "../../7z2603-src/CPP/7zip/IStream.h"
 
+#include <memory>
+
 namespace sunpack::sevenzip
 {
+
+class RandomAccessReader
+{
+public:
+    virtual ~RandomAccessReader() = default;
+    virtual HRESULT read_at(
+        UInt64 offset,
+        void *data,
+        UInt32 size,
+        UInt32 *processed_size) noexcept = 0;
+};
+
+class RandomAccessInStream
+{
+public:
+    virtual ~RandomAccessInStream() = default;
+    virtual std::unique_ptr<RandomAccessReader> open_random_reader() noexcept = 0;
+};
+
+inline RandomAccessInStream *random_access_in_stream(IInStream *stream) noexcept
+{
+    return dynamic_cast<RandomAccessInStream *>(stream);
+}
 
 class PositionedOutStream
 {
