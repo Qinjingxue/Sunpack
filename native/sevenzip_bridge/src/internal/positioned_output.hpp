@@ -35,6 +35,8 @@ class PositionedOutStream
 public:
     virtual ~PositionedOutStream() = default;
 
+    virtual bool positioned_available() const noexcept = 0;
+
     virtual HRESULT write_at(
         UInt64 offset,
         const void *data,
