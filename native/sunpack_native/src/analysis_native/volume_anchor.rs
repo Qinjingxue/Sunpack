@@ -383,6 +383,9 @@ fn probe_cheap_prefix(
     if probe_zip_local_head(prefix, &mut result) {
         return result;
     }
+    if probe_zip_eocd_head(prefix, &mut result) {
+        return result;
+    }
     if prefix.starts_with(b"MZ") {
         // An MZ header is only a weak SFX/carrier seed.  Do not scan a
         // larger prefix here: the relation layer may use the filename
@@ -455,6 +458,18 @@ fn probe_zip_local_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
     out.evidence.push("zip:local_header");
     true
 }
+
+fn probe_zip_eocd_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
+    if !prefix.starts_with(ZIP_EOCD) || prefix.len() < 22 {
+        return false;
+    }
+    out.format = "zip".to_string();
+    out.confidence = "weak".to_string();
+    out.structure_offset = Some(0);
+    out.evidence.push("zip:eocd_head");
+    true
+}
+
 
 fn probe_rar(
     prefix: &[u8],

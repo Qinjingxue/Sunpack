@@ -32,7 +32,13 @@ struct DirectorySnapshotTable {
     mtimes_ns: Vec<Option<u64>>,
     relation_member_eligible: Vec<bool>,
     relation_anchors: Vec<Option<VolumeAnchor>>,
+    file_routes: Vec<u8>,
 }
+
+const FILE_ROUTE_RELATIONS: u8 = 1;
+const FILE_ROUTE_DETECTION: u8 = 2;
+const FILE_ROUTE_RESIDUAL: u8 = 3;
+const FORMAT_REJECT_TAR: u32 = 1 << 3;
 
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeDirectorySnapshot {
@@ -83,8 +89,13 @@ impl NativeDirectorySnapshot {
             mtimes_ns: Vec::with_capacity(records.len()),
             relation_member_eligible: Vec::with_capacity(records.len()),
             relation_anchors: Vec::with_capacity(records.len()),
+            file_routes: Vec::with_capacity(records.len()),
         };
         for record in records {
+            let route = filesystem_file_route(
+                record.is_dir,
+                record.relation_anchor.as_ref(),
+            );
             table.paths.push(record.path);
             table.is_dirs.push(record.is_dir);
             table.sizes.push(record.size);
@@ -93,6 +104,7 @@ impl NativeDirectorySnapshot {
                 .relation_member_eligible
                 .push(record.relation_member_eligible);
             table.relation_anchors.push(record.relation_anchor);
+            table.file_routes.push(route);
         }
         table
     }
@@ -120,6 +132,32 @@ impl NativeDirectorySnapshot {
             )
         })
     }
+}
+
+
+fn filesystem_file_route(
+    is_dir: bool,
+    anchor: Option<&VolumeAnchor>,
+) -> u8 {
+    if is_dir {
+        return 0;
+    }
+    let Some(anchor) = anchor else {
+        return FILE_ROUTE_RESIDUAL;
+    };
+    if anchor.sfx || matches!(anchor.format.as_str(), "rar" | "7z" | "zip") {
+        return FILE_ROUTE_RELATIONS;
+    }
+    if matches!(
+        anchor.format.as_str(),
+        "tar" | "gzip" | "bzip2" | "xz" | "zstd"
+    ) {
+        return FILE_ROUTE_DETECTION;
+    }
+    if anchor.bytes_read >= 512 && anchor.format_reject_mask & FORMAT_REJECT_TAR == 0 {
+        return FILE_ROUTE_DETECTION;
+    }
+    FILE_ROUTE_RESIDUAL
 }
 
 struct DirectoryScanRecords {
@@ -514,6 +552,60 @@ impl NativeDirectorySnapshot {
             mtimes_ns.push(self.table.mtimes_ns[row]);
         }
         (paths, sizes, mtimes_ns)
+    }
+
+
+    fn file_route_view(&self, route: u8) -> Self {
+        Self {
+            table: Arc::clone(&self.table),
+            rows: self
+                .rows
+                .iter()
+                .copied()
+                .filter(|&row| {
+                    !self.table.is_dirs[row] && self.table.file_routes[row] == route
+                })
+                .collect(),
+        }
+    }
+
+    fn non_relation_file_routing_columns(
+        &self,
+    ) -> (
+        Vec<String>,
+        Vec<Option<u64>>,
+        Vec<u8>,
+        Vec<String>,
+        Vec<u32>,
+    ) {
+        let estimated = self.rows.len();
+        let mut paths = Vec::with_capacity(estimated);
+        let mut sizes = Vec::with_capacity(estimated);
+        let mut routes = Vec::with_capacity(estimated);
+        let mut formats = Vec::with_capacity(estimated);
+        let mut reject_masks = Vec::with_capacity(estimated);
+        for &row in &self.rows {
+            if self.table.is_dirs[row]
+                || self.table.file_routes[row] == FILE_ROUTE_RELATIONS
+            {
+                continue;
+            }
+            let anchor = self.table.relation_anchors[row].as_ref();
+            paths.push(self.table.paths[row].clone());
+            sizes.push(self.table.sizes[row]);
+            routes.push(self.table.file_routes[row]);
+            formats.push(
+                anchor
+                    .map(|value| value.format.clone())
+                    .unwrap_or_default(),
+            );
+            reject_masks.push(
+                anchor
+                    .map(|value| value.format_reject_mask)
+                    .unwrap_or(0),
+            );
+        }
+        (paths, sizes, routes, formats, reject_masks)
     }
 
     fn identity_rows(&self) -> Vec<(String, bool, u64, u64)> {

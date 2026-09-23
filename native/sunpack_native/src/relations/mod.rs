@@ -191,6 +191,9 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
         .relation_file_records()
         .map(|(path, _, _, _)| path.to_ascii_lowercase())
         .collect();
+    if filtered_keys.is_empty() {
+        return Ok(Vec::new());
+    }
     let raw_rows: Vec<RelationInput> = raw_snapshot
         .relation_file_records()
         .map(|(path, size, relation_member_eligible, anchor)| {

@@ -24,7 +24,7 @@ def test_selected_split_member_without_structural_proof_stays_single_candidate(t
 
     assert len(bags) == 1
     assert bags[0].get("file.path") == str(second)
-    assert bags[0].get("file.split_members") == []
+    assert (bags[0].get("file.split_members") or []) == []
     assert bags[0].get("candidate.kind") == "file"
     assert bags[0].get("candidate.entry_path") == str(second)
     assert bags[0].get("candidate.member_paths") == [str(second)]
