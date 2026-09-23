@@ -541,6 +541,11 @@ fn build_candidate_groups_from_physical(
 }
 
 fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
+    // A structure-proven standalone archive is already a complete logical
+    // input.  SFX is a carrier/layout property, not split evidence by itself.
+    if anchor.standalone {
+        return None;
+    }
     if anchor.format.is_empty() && anchor.sfx {
         return Some("weak");
     }
