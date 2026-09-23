@@ -502,6 +502,11 @@ namespace sunpack::sevenzip
             return hr;
         }
 
+        bool positioned_available() const noexcept override
+        {
+            return writer_ && file_;
+        }
+
         HRESULT write_at(
             UInt64 offset,
             const void *data,
