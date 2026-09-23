@@ -1436,8 +1436,7 @@ void XzDecMtProps_Init(CXzDecMtProps *p)
 
 typedef struct
 {
-  Byte *outBuf;
-  size_t outBufSize;
+  CSunpackVmBuffer outBuf;
   size_t outPreSize;
   size_t inPreSize;
   size_t inPreHeaderSize;
@@ -1563,8 +1562,7 @@ CXzDecMtHandle XzDecMt_Create(ISzAllocPtr alloc, ISzAllocPtr allocMid)
     {
       CXzDecMtThread *coder = &p->coders[i];
       coder->dec_created = False;
-      coder->outBuf = NULL;
-      coder->outBufSize = 0;
+      SunpackVmBuffer_Construct(&coder->outBuf);
     }
   }
   #endif
@@ -1581,12 +1579,7 @@ static void XzDecMt_FreeOutBufs(CXzDecMt *p)
   for (i = 0; i < MTDEC_THREADS_MAX; i++)
   {
     CXzDecMtThread *coder = &p->coders[i];
-    if (coder->outBuf)
-    {
-      ISzAlloc_Free(p->allocMid, coder->outBuf);
-      coder->outBuf = NULL;
-      coder->outBufSize = 0;
-    }
+    SunpackVmBuffer_Release(&coder->outBuf);
   }
   p->unpackBlockMaxSize = 0;
 }
@@ -1867,37 +1860,20 @@ static SRes XzDecMt_Callback_PreCode(void *pp, unsigned coderIndex)
   if (!coder->dec.headerParsedOk)
     return SZ_OK;
 
-  dest = coder->outBuf;
+  if (!SunpackVmBuffer_Ensure(&coder->outBuf, coder->outPreSize))
+    return SZ_ERROR_MEM;
 
-  if (!dest || coder->outBufSize < coder->outPreSize)
-  {
-    if (dest)
-    {
-      ISzAlloc_Free(me->allocMid, dest);
-      coder->outBuf = NULL;
-      coder->outBufSize = 0;
-    }
-    {
-      size_t outPreSize = coder->outPreSize;
-      if (outPreSize == 0)
-        outPreSize = 1;
-      dest = (Byte *)ISzAlloc_Alloc(me->allocMid, outPreSize);
-    }
-    if (!dest)
-      return SZ_ERROR_MEM;
-    coder->outBuf = dest;
-    coder->outBufSize = coder->outPreSize;
+  dest = coder->outBuf.data;
 
-    if (coder->outBufSize > me->unpackBlockMaxSize)
-      me->unpackBlockMaxSize = coder->outBufSize;
-  }
+  if (coder->outPreSize > me->unpackBlockMaxSize)
+    me->unpackBlockMaxSize = coder->outPreSize;
 
   // return SZ_ERROR_MEM;
 
-  XzUnpacker_SetOutBuf(&coder->dec, coder->outBuf, coder->outBufSize);
+  XzUnpacker_SetOutBuf(&coder->dec, coder->outBuf.data, coder->outPreSize);
 
   {
-    SRes res = XzDecMix_Init(&coder->dec.decoder, &coder->dec.block, coder->outBuf, coder->outBufSize);
+    SRes res = XzDecMix_Init(&coder->dec.decoder, &coder->dec.block, coder->outBuf.data, coder->outPreSize);
     // res = SZ_ERROR_UNSUPPORTED; // to test
     coder->codeRes = res;
     if (res != SZ_OK)
@@ -1946,7 +1922,7 @@ static SRes XzDecMt_Callback_Code(void *pp, unsigned coderIndex,
 
   if (!coder->dec.headerParsedOk)
     return SZ_OK;
-  if (!coder->outBuf)
+  if (!coder->outBuf.data)
     return SZ_OK;
 
   if (coder->codeRes == SZ_OK)
@@ -2012,7 +1988,7 @@ static SRes XzDecMt_Callback_Write(void *pp, unsigned coderIndex,
   if (!needWriteToStream)
     return SZ_OK;
 
-  if (!coder->dec.headerParsedOk || !coder->outBuf)
+  if (!coder->dec.headerParsedOk || !coder->outBuf.data)
   {
     if (me->finishedDecoderIndex < 0)
       me->finishedDecoderIndex = (int)coderIndex;
@@ -2029,7 +2005,7 @@ static SRes XzDecMt_Callback_Write(void *pp, unsigned coderIndex,
   {
     SRes res;
     size_t size = coder->outCodeSize;
-    Byte *data = coder->outBuf;
+    Byte *data = coder->outBuf.data;
     
     // we use in me->dec: sha, numBlocks, indexSize
 
