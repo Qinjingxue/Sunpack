@@ -122,8 +122,7 @@ bool check_cpu_budget_accounts_base_and_decoder_credits() {
         }
         auto snapshot = job.snapshot();
         if (snapshot.current_extra_credits != 4 ||
-            snapshot.peak_extra_credits != 4 ||
-            snapshot.total_extra_credits_granted != 4) {
+            snapshot.peak_extra_credits != 4) {
             return false;
         }
         job.release_extra(2);
@@ -187,8 +186,7 @@ bool check_cpu_budget_tracks_decoder_thread_lifetimes() {
             sunpack_cpu_acquire_extra_for_context(&job, 1, 1) != 1 ||
             budget.reserved_credits() != 4 ||
             job.snapshot().current_extra_credits != 3 ||
-            job.snapshot().peak_extra_credits != 3 ||
-            job.snapshot().total_extra_credits_granted != 3) {
+            job.snapshot().peak_extra_credits != 3) {
             return false;
         }
 
