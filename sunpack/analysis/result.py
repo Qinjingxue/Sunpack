@@ -32,7 +32,6 @@ class ArchiveAnalysisReport:
     evidences: list[ArchiveFormatEvidence]
     selected: list[ArchiveFormatEvidence]
     prepass: dict[str, Any] = field(default_factory=dict)
-    fuzzy: dict[str, Any] = field(default_factory=dict)
     read_bytes: int = 0
     cache_hits: int = 0
 

@@ -35,7 +35,7 @@ def _advance_batch_state(state, sent, *, first: bool):
     except StopIteration as completed:
         return True, completed.value
 from sunpack.passwords.directory_context import DirectoryPasswordContextStore
-from sunpack.rename.scheduler import RenameScheduler
+from sunpack.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
 from sunpack.verification import VerificationResult, VerificationScheduler
 from sunpack.verification.error_classification import classify_verification_error
 from sunpack.contracts.verification import (
@@ -102,8 +102,10 @@ class ExtractionBatchRunner:
         context: RunContext,
         extractor: ExtractionScheduler,
         output_scan_policy: NestedOutputScanPolicy,
-        rename_scheduler: RenameScheduler | None = None,
         config: dict | None = None,
+        *,
+        output_reservations: OutputReservationRegistry | None = None,
+        reservation_owner: str = "",
         progress_reporter: Any | None = None,
         request_id: str = "",
         origin: str = "",
@@ -111,7 +113,8 @@ class ExtractionBatchRunner:
         self.context = context
         self.extractor = extractor
         self.output_scan_policy = output_scan_policy
-        self.rename_scheduler = rename_scheduler or RenameScheduler()
+        self.output_reservations = output_reservations
+        self.reservation_owner = str(reservation_owner or "")
         self.config = config or {}
         self.content_policy = ContentRecoveryPolicy.from_config(self.config)
         cli_config = self.config.get("cli") if isinstance(self.config.get("cli"), dict) else {}
@@ -155,9 +158,11 @@ class ExtractionBatchRunner:
         def prepare_batch():
             self.prepare_tasks(tasks)
             self.directory_password_contexts.annotate(tasks)
-            resolver = self.rename_scheduler.build_output_dir_resolver(
+            resolver = build_output_dir_resolver(
                 tasks,
                 default_output_dir_for_task or self.extractor.default_output_dir_for_task,
+                reservation_registry=self.output_reservations,
+                owner=self.reservation_owner,
             )
             resolver = self._cached_output_dir_resolver(resolver)
             prepared = self._skip_tasks_inside_batch_outputs(tasks, resolver)

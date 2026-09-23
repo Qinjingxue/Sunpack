@@ -1,6 +1,5 @@
 from sunpack.analysis.structure_pipeline.module import AnalysisModuleSpec
 from sunpack.analysis.structure_pipeline.registry import register_analysis_module
-from sunpack.analysis.structure_pipeline.modules._fuzzy import apply_fuzzy_routes
 from sunpack.analysis.structure_pipeline.modules._read_fault import read_fault_damage_flags
 from sunpack.analysis.result import ArchiveFormatEvidence, ArchiveSegment
 from sunpack.analysis.structure_pipeline.modules._combine import combine_format_candidates
@@ -58,16 +57,6 @@ class SevenZipAnalysisModule:
         end_offset = int(native.get("segment_end") or 0) or (start + 32 + next_header_offset + next_header_size if next_header_size else None)
         if boundary_unreliable:
             end_offset = None
-        apply_fuzzy_routes(
-            native,
-            evidence,
-            damage_flags,
-            prepass,
-            start_offset=start,
-            end_offset=end_offset,
-            file_size=file_size,
-            format_hint="7z",
-        )
         return ArchiveFormatEvidence(
             format="7z",
             confidence=confidence,

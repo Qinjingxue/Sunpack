@@ -30,7 +30,6 @@ coordinator
   -> extraction
   -> verification
   -> postprocess
-  -> rename
   -> contracts
 
 detection
@@ -45,7 +44,6 @@ analysis
 extraction
   -> contracts
   -> passwords
-  -> rename public API
   -> sevenzip worker
 
 verification
@@ -56,7 +54,7 @@ postprocess
   -> contracts.RunContext
   -> postprocess internal actions
 
-filesystem / relations / rename
+filesystem / relations
   -> contracts
   -> sunpack_native narrow helpers
 
@@ -83,7 +81,7 @@ contracts
 | Detection | `detection.DetectionScheduler` | Rule decisions over the candidate facts provided by the Coordinator. |
 | Candidate orchestration | `coordinator.task_provider.ArchiveTaskProvider` | Chains filesystem, relations, detection, and structural rescue. |
 | Recursion policy | `coordinator.output_scan_policy.NestedOutputScanPolicy` | Decides whether an output directory enters the next scan round. |
-| General archive analysis | `analysis.ArchiveAnalyzer` | Provides format, structure, boundary, fuzzy, and embedded analysis without business scheduling. |
+| General archive analysis | `analysis.ArchiveAnalyzer` | Provides format, structure, boundary, and embedded analysis without business scheduling. |
 | Input planning | `detection.input_planning.ArchiveInputPlanningStage` | Converts neutral analysis reports into main-pipeline archive inputs and embedded subtasks. |
 | Passwords | `sunpack.passwords` | Password candidates, scheduling, fast verifiers, final 7z.dll confirmation. |
 | Extraction | `extraction.scheduler.ExtractionScheduler` | Per-archive output directory, password resolution, worker extraction. |
@@ -139,7 +137,7 @@ The rule layer must not depend on processor implementation details; shared defau
 
 ### analysis
 
-`analysis` is the general archive analysis capability layer without business policy. The public entry point `ArchiveAnalyzer` accepts a file, multi-volume, range, or segment source plus an `AnalysisRequest`, and outputs format evidence, fragment boundaries, confidence, and damage markers; `probe_volume_anchor_paths` provides Relations with batched, bounded, read-only native volume structural evidence. Internally it may run signature prepass, fuzzy, format probes, and embedded fallback, but it must not depend on `ArchiveTask`, Detection, or the Coordinator, and must not write business knowledge.
+`analysis` is the general archive analysis capability layer without business policy. The public entry point `ArchiveAnalyzer` accepts a file, multi-volume, range, or segment source plus an `AnalysisRequest`, and outputs format evidence, fragment boundaries, confidence, and damage markers; `analysis.embedded` owns embedded full-stream scanning, result normalization, and executable carrier inspection; `probe_volume_anchor_paths` provides Relations with batched, bounded, read-only native volume structural evidence. Analysis must not depend on `ArchiveTask`, Detection, or the Coordinator, and must not write business knowledge.
 
 ### passwords
 
@@ -165,7 +163,7 @@ Packages in the flow domains must not import `coordinator` in reverse. Detection
 
 ### support
 
-`support` holds resource lookup, JSON, caching, and path helpers. Do not stuff detection policy, output directory policy, password resolution, or cleanup policy into support.
+`support` holds cross-domain infrastructure such as resource lookup, JSON, caching, path helpers, and collision-free output path reservation. It may allocate output path names, but must not own extraction or post-processing policy.
 
 ### native
 
@@ -248,7 +246,6 @@ sunpack/
   passwords/    Password candidates, scheduling, and verifiers
   postprocess/  Cleanup and flattening after successful extraction
   relations/    File relationships, volumes, and candidate groups
-  rename/       Output naming and temporary volume staging
   support/      Infrastructure such as resources, JSON, caching, and 7z.dll ABI bindings
   verification/ Extraction result verification pipeline
 ```

@@ -18,13 +18,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sunpack.coordinator.engine import PipelineEngine
 import sunpack.coordinator.engine as engine_module
+import sunpack.coordinator.extraction_batch as extraction_batch_module
 import sunpack.analysis.engine as analysis_engine_module
-import sunpack.analysis.fuzzy_pipeline.modules.binary_profile as binary_profile_module
 import sunpack.analysis.structure_pipeline.modules.compression_streams as compression_streams_module
 import sunpack.analysis.structure_pipeline.modules.rar as rar_analysis_module
 import sunpack.coordinator.scan_session as scan_session_module
-from sunpack.analysis.config import enabled_fuzzy_module_configs
-from sunpack.analysis.fuzzy_pipeline.registry import get_fuzzy_analysis_module_registry
 from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.analysis.view import SharedBinaryView
@@ -137,6 +135,11 @@ class RequestRuntimeProfiler:
             "output_native_batch_file_head_facts",
         )
         self._install_global_callable(
+            extraction_batch_module,
+            "build_output_dir_resolver",
+            "batch_output_dir_resolver",
+        )
+        self._install_global_callable(
             analysis_engine_module,
             "run_signature_prepass",
             "planning_signature_prepass",
@@ -156,8 +159,6 @@ class RequestRuntimeProfiler:
             "probe_compressed_tar",
             lambda _view, **kwargs: f"planning_compressed_tar_probe_{kwargs.get('format', 'unknown')}",
         )
-        self._install_global_method(SharedBinaryView, "fuzzy_binary_profile", "planning_fuzzy_native_profile")
-        self._install_global_callable(binary_profile_module, "_complete_profile", "planning_fuzzy_complete_profile")
 
     def restore(self) -> None:
         if self._factory_restore is not None:
@@ -344,23 +345,12 @@ class RequestRuntimeProfiler:
             ("analyze_path", "planning_engine_analyze_path"),
             ("analyze_view", "planning_engine_analyze_view"),
             ("_build_single_view", "planning_engine_build_view"),
-            ("_run_fuzzy_pipeline", "planning_fuzzy_pipeline"),
             ("_selected_structure_modules", "planning_select_structure_modules"),
             ("_run_structure_modules", "planning_structure_modules"),
             ("_selected_evidences", "planning_select_evidences"),
             ("_embedded_scan_enabled", "planning_embedded_scan_check"),
         ):
             _wrap(analysis_engine, name, timings, label)
-        if analysis_engine is not None:
-            fuzzy_registry = get_fuzzy_analysis_module_registry()
-            for module_name in enabled_fuzzy_module_configs(analysis_engine.config):
-                module = fuzzy_registry.get(module_name)
-                if module is not None:
-                    self._install_global_callable(
-                        module,
-                        "analyze",
-                        f"planning_fuzzy_module_{module_name}",
-                    )
         if analysis_engine is not None and hasattr(analysis_engine, "_run_module"):
             original_run_module = analysis_engine._run_module
 
@@ -386,7 +376,6 @@ class RequestRuntimeProfiler:
         ):
             _wrap(batch, name, timings, label)
         _wrap(_child(batch, "relation_stage"), "resolve_tasks", timings, "batch_relation_resolve")
-        _wrap(runtime.rename_scheduler, "build_output_dir_resolver", timings, "batch_output_dir_resolver")
         password_contexts = _child(batch, "directory_password_contexts")
         _wrap(password_contexts, "annotate", timings, "batch_directory_password_annotate")
         _wrap(password_contexts, "remember", timings, "batch_directory_password_remember")

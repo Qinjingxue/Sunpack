@@ -1,7 +1,9 @@
 import os
+import re
+from collections.abc import MutableSet
 
 from sunpack.contracts.tasks import ArchiveTask
-from sunpack.support.path_keys import normalized_path
+from sunpack.support.path_keys import absolute_path_key
 
 
 def default_output_dir_for_task(task: ArchiveTask, output_config: dict | None = None) -> str:
@@ -19,10 +21,8 @@ def default_output_dir_for_task(task: ArchiveTask, output_config: dict | None = 
         out_dir = os.path.join(output_root, relative_parent, os.path.basename(out_name))
     else:
         out_dir = os.path.join(os.path.dirname(path), os.path.basename(out_name))
-    if normalized_path(out_dir) == normalized_path(path):
-        out_dir += "_extracted"
     # Absolute normalized path: the write-routing key and the extraction request must come from the identical string.
-    return normalized_output_dir(_non_existing_output_dir(out_dir))
+    return normalized_output_dir(next_available_path(out_dir))
 
 
 def _relative_parent(path: str, common_root: str | None) -> str:
@@ -78,17 +78,35 @@ def resolve_output_volume_key(path: str) -> str:
         return ""
 
 
-def _non_existing_output_dir(path: str) -> str:
-    if not os.path.exists(path):
-        return path
+def next_available_path(path: str, reserved: MutableSet[str] | None = None) -> str:
+    """Return the path or the first browser-style numbered alternative."""
+    candidate = os.path.normpath(path)
+    if not _path_is_occupied(candidate, reserved):
+        if reserved is not None:
+            reserved.add(absolute_path_key(candidate))
+        return candidate
 
-    base = f"{path}_extracted"
-    if not os.path.exists(base):
-        return base
+    parent = os.path.dirname(candidate)
+    filename = os.path.basename(candidate)
+    stem, extension = os.path.splitext(filename)
+    match = re.fullmatch(r"(.*)\((\d+)\)", stem)
+    if match is None:
+        base_stem = stem
+        index = 1
+    else:
+        base_stem = match.group(1)
+        index = int(match.group(2)) + 1
 
-    index = 2
     while True:
-        candidate = f"{base}_{index}"
-        if not os.path.exists(candidate):
+        candidate = os.path.join(parent, f"{base_stem}({index}){extension}")
+        if not _path_is_occupied(candidate, reserved):
+            if reserved is not None:
+                reserved.add(absolute_path_key(candidate))
             return candidate
         index += 1
+
+
+def _path_is_occupied(path: str, reserved: MutableSet[str] | None) -> bool:
+    return os.path.exists(path) or (
+        reserved is not None and absolute_path_key(path) in reserved
+    )

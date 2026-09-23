@@ -46,14 +46,6 @@ class _RecordingPasswordResolver:
         )
 
 
-class _FakeRenameScheduler:
-    def normalize_archive_paths(self, archive, all_parts, **_kwargs):
-        return SimpleNamespace(archive=archive, run_parts=list(all_parts), cleanup_parts=list(all_parts))
-
-    def cleanup_normalized_split_group(self, _staged):
-        return None
-
-
 class _FakeRetryPolicy:
     max_retries = 1
 
@@ -162,7 +154,6 @@ def test_extractor_runs_analysis_segments_inside_same_task_and_restores_source(t
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
-        rename_scheduler=_FakeRenameScheduler(),
         retry_policy=_FakeRetryPolicy(),
         split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=runner,
@@ -206,7 +197,6 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
         password_store=_CandidatePasswordStore(),
         password_resolver=resolver,
         metadata_scanner=ArchiveMetadataScanner(),
-        rename_scheduler=_FakeRenameScheduler(),
         retry_policy=_FakeRetryPolicy(),
         split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=_FakeSevenZipRunner(),
@@ -257,7 +247,6 @@ def test_verifier_accepts_carrier_when_every_embedded_payload_is_complete(tmp_pa
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
-        rename_scheduler=_FakeRenameScheduler(),
         retry_policy=_FakeRetryPolicy(),
         split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=_FakeSevenZipRunner(),
@@ -304,7 +293,6 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
-        rename_scheduler=_FakeRenameScheduler(),
         retry_policy=_FakeRetryPolicy(),
         split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=_FakeSevenZipRunner(),
@@ -334,7 +322,6 @@ def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
-        rename_scheduler=_FakeRenameScheduler(),
         retry_policy=_FakeRetryPolicy(),
         split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=runner,

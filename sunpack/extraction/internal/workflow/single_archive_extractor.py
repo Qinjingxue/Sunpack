@@ -41,7 +41,6 @@ class SingleArchiveExtractor:
         password_store,
         password_resolver,
         metadata_scanner,
-        rename_scheduler,
         retry_policy: ExtractRetryPolicy,
         split_entry_resolver: SplitEntryResolver,
         sevenzip_runner: SevenZipRunner,
@@ -55,7 +54,6 @@ class SingleArchiveExtractor:
         self.password_store = password_store
         self.password_resolver = password_resolver
         self.metadata_scanner = metadata_scanner
-        self.rename_scheduler = rename_scheduler
         self.retry_policy = retry_policy
         self.split_entry_resolver = split_entry_resolver
         self.sevenzip_runner = sevenzip_runner

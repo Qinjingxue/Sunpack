@@ -296,7 +296,7 @@ def _zip_structure_feature_dicts(payload: dict[str, Any]) -> list[dict[str, Any]
             zip_payload = format_payload.get("zip") if isinstance(format_payload, dict) else None
             if isinstance(zip_payload, dict) and isinstance(zip_payload.get("structure"), dict):
                 output.append(dict(zip_payload["structure"]))
-            for key in ("archive_knowledge", "knowledge", "source", "format", "source_derivation", "inspection_prepass", "inspection_evidence", "extraction_failure", "extraction_diagnostics", "source_input", "damaged_input", "fuzzy"):
+            for key in ("archive_knowledge", "knowledge", "source", "format", "source_derivation", "inspection_prepass", "inspection_evidence", "extraction_failure", "extraction_diagnostics", "source_input", "damaged_input"):
                 nested = value.get(key)
                 if isinstance(nested, dict):
                     visit(nested)
@@ -330,7 +330,7 @@ def _seven_zip_structure_feature_dicts(payload: dict[str, Any]) -> list[dict[str
                 seven_payload = format_payload.get("7z") or format_payload.get("seven_zip")
             if isinstance(seven_payload, dict) and isinstance(seven_payload.get("structure"), dict):
                 output.append(dict(seven_payload["structure"]))
-            for key in ("archive_knowledge", "knowledge", "source", "format", "source_derivation", "inspection_prepass", "inspection_evidence", "extraction_failure", "extraction_diagnostics", "source_input", "damaged_input", "fuzzy"):
+            for key in ("archive_knowledge", "knowledge", "source", "format", "source_derivation", "inspection_prepass", "inspection_evidence", "extraction_failure", "extraction_diagnostics", "source_input", "damaged_input"):
                 nested = value.get(key)
                 if isinstance(nested, dict):
                     visit(nested)
@@ -459,7 +459,7 @@ def _zip_analysis_detail_dicts(payload: dict[str, Any]) -> list[dict[str, Any]]:
             output.append(dict(details))
         inspection_evidence = value.get("inspection_evidence")
         if isinstance(inspection_evidence, dict):
-            if any(key in inspection_evidence for key in ("central_directory_present", "central_directory_walk_ok", "error", "fuzzy", "routes")):
+            if any(key in inspection_evidence for key in ("central_directory_present", "central_directory_walk_ok", "error", "routes")):
                 output.append(dict(inspection_evidence))
             nested_details = inspection_evidence.get("details")
             if isinstance(nested_details, dict):
@@ -475,14 +475,10 @@ def _zip_analysis_detail_dicts(payload: dict[str, Any]) -> list[dict[str, Any]]:
 def _zip_analysis_detail_route_flags(details: dict[str, Any]) -> list[str]:
     flags: list[str] = []
     routes = {str(item).lower() for item in details.get("routes") or []}
-    fuzzy = details.get("fuzzy") if isinstance(details.get("fuzzy"), dict) else {}
-    fuzzy_hints = {str(item).lower() for item in fuzzy.get("hints") or []}
     prefix_context = str(details.get("prefix_context") or "").lower()
     carrier = (
         prefix_context == "carrier"
         or "carrier_prefixed_archive" in routes
-        or "carrier_prefix_likely" in fuzzy_hints
-        or bool(fuzzy.get("carrier_prefix_likely"))
     )
     if carrier:
         flags.extend(["sfx", "carrier_prefix", "carrier_archive"])

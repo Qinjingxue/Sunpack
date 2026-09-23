@@ -57,15 +57,6 @@ class FakeFailingMetadataScanner:
         return result
 
 
-class FakeStager:
-    def normalize_archive_paths(self, archive, all_parts, startupinfo=None, volume_entries=None):
-        parts = list(all_parts)
-        return SimpleNamespace(archive=archive, run_parts=parts, cleanup_parts=parts)
-
-    def cleanup_normalized_split_group(self, staged):
-        return None
-
-
 class ExtractionExecutionTests(unittest.TestCase):
     def test_metadata_detection_failure_falls_back_to_archive_backend(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -75,7 +66,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor = ExtractionScheduler(max_retries=1)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeFailingMetadataScanner()
-            extractor.rename_scheduler = FakeStager()
             calls = []
             extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
                 calls.append(kwargs) or SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -98,21 +88,9 @@ class ExtractionExecutionTests(unittest.TestCase):
             launcher_path.write_bytes(b"MZ")
             out_dir = Path(tmp) / "sample_out"
 
-            class CandidateStager:
-                def normalize_archive_paths(self, archive, all_parts, startupinfo=None, volume_entries=None):
-                    return SimpleNamespace(
-                        archive=archive,
-                        run_parts=[str(archive_path), str(candidate_path)],
-                        cleanup_parts=[str(archive_path)],
-                    )
-
-                def cleanup_normalized_split_group(self, staged):
-                    return None
-
             extractor = ExtractionScheduler(max_retries=1)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-            extractor.rename_scheduler = CandidateStager()
 
             task = make_archive_task(archive_path)
             task.carrier_path = str(launcher_path)
@@ -134,7 +112,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor = ExtractionScheduler(max_retries=2)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-            extractor.rename_scheduler = FakeStager()
 
             failed = SimpleNamespace(returncode=8, stdout="", stderr="write error")
             succeeded = SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -158,7 +135,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor = ExtractionScheduler(max_retries=2)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-            extractor.rename_scheduler = FakeStager()
 
             failed = SimpleNamespace(returncode=-102, stdout="", stderr="7z process made no observable progress")
             succeeded = SimpleNamespace(returncode=0, stdout="", stderr="")
@@ -191,7 +167,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor = ExtractionScheduler(max_retries=3)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-            extractor.rename_scheduler = FakeStager()
 
             failed = SimpleNamespace(returncode=2, stdout="", stderr="Headers Error")
             task = make_archive_task(archive_path)
@@ -221,7 +196,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor = ExtractionScheduler(max_retries=1)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-            extractor.rename_scheduler = FakeStager()
 
             def fake_extract(**_kwargs):
                 good_path.parent.mkdir(parents=True, exist_ok=True)
@@ -298,7 +272,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor = ExtractionScheduler(max_retries=1, extraction_config={"write_progress_manifest": True})
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-            extractor.rename_scheduler = FakeStager()
 
             def fake_extract(**_kwargs):
                 good_path.parent.mkdir(parents=True, exist_ok=True)
@@ -341,7 +314,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor = ExtractionScheduler(max_retries=2)
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
-            extractor.rename_scheduler = FakeStager()
 
             failed = SimpleNamespace(returncode=-100, stdout="", stderr="7z process failed to start")
             task = make_archive_task(archive_path)

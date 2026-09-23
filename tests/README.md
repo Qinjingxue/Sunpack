@@ -75,7 +75,7 @@ pytest tests/real -q
 
 ## 公共接口边界
 
-测试默认不直接导入 `*/internal/*`、`detection.pipeline.*`，也不调用下划线私有方法或 monkeypatch 私有实现。黑箱模块只通过公开入口测试行为，例如 `DetectionScheduler`、`ExtractionScheduler`、`PostProcessActions`、`DirectoryScanner`、`RelationsScheduler`、`RenameScheduler`、CLI 和 coordinator 编排入口。
+测试默认不直接导入 `*/internal/*`、`detection.pipeline.*`，也不调用下划线私有方法或 monkeypatch 私有实现。黑箱模块只通过公开入口测试行为，例如 `DetectionScheduler`、`ExtractionScheduler`、`PostProcessActions`、`DirectoryScanner`、`RelationsScheduler`、CLI 和 coordinator 编排入口。
 
 确实需要覆盖新规则或检测场景时，优先使用 functional 或 integration 测试，并从 `DetectionScheduler` 等公开入口进入，而不是直接测试 rule、processor、collector 的内部方法。
 

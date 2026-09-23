@@ -283,7 +283,6 @@ Native worker 以 CPU credit 作为解压并发预算。默认 nominal budget �
 | `max_read_mb_per_archive` | `256` | 单个归档的读取上限；`null` 表示不限。 |
 | `prepass.enabled` | `true` | 是否读取头尾区域进行快速预检。 |
 | `prepass.head_bytes` / `tail_bytes` | `1048576` / `1048576` | 头部和尾部预检大小。 |
-| `fuzzy.enabled` | `true` | 是否启用二进制特征分析。 |
 | `thresholds.extractable_confidence` | `0.85` | 可直接抽取的最低置信度。 |
 
 默认结构模块及主要上限：
@@ -295,8 +294,6 @@ Native worker 以 CPU credit 作为解压并发预算。默认 nominal budget �
 | `seven_zip` | `max_next_header_check_bytes = 1048576` |
 | `tar` | `max_entries_to_walk = 64` |
 | `gzip`、`bzip2`、`xz`、`zstd`、`tar_gz`、`tar_bz2`、`tar_xz`、`tar_zst` | `max_probe_bytes = 4194304` |
-
-`fuzzy.modules.binary_profile` 默认使用 65536 字节窗口、最多 8 个窗口、最多 1048576 字节样本；熵阈值为高 `6.8`、低 `3.5`、跳变 `1.25`，ngram top-k 为 `8`，ngram 样本上限为 `262144` 字节。
 
 ## verification
 

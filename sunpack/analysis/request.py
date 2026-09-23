@@ -13,7 +13,6 @@ class AnalysisCost(IntEnum):
 
 class AnalysisCapability(str, Enum):
     SIGNATURE_PREPASS = "signature_prepass"
-    FUZZY_PROFILE = "fuzzy_profile"
     FORMAT_STRUCTURE = "format_structure"
 
     @property
@@ -23,7 +22,6 @@ class AnalysisCapability(str, Enum):
 
 _CAPABILITY_COSTS = {
     AnalysisCapability.SIGNATURE_PREPASS: AnalysisCost.CHEAP,
-    AnalysisCapability.FUZZY_PROFILE: AnalysisCost.STANDARD,
     AnalysisCapability.FORMAT_STRUCTURE: AnalysisCost.EXPENSIVE,
 }
 

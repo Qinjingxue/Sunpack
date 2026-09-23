@@ -208,23 +208,6 @@
       "head_bytes": 1048576,
       "tail_bytes": 1048576
     },
-    "fuzzy": {
-      "enabled": true,
-      "modules": [
-        {
-          "name": "binary_profile",
-          "enabled": true,
-          "window_bytes": 65536,
-          "max_windows": 8,
-          "max_sample_bytes": 1048576,
-          "entropy_high_threshold": 6.8,
-          "entropy_low_threshold": 3.5,
-          "entropy_jump_threshold": 1.25,
-          "ngram_top_k": 8,
-          "max_ngram_sample_bytes": 262144
-        }
-      ]
-    },
     "thresholds": {
       "extractable_confidence": 0.85
     },

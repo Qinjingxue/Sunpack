@@ -17,7 +17,7 @@ def _task(tmp_path, *, status: str, confidence: str):
 def test_complete_mode_ignores_removed_scan_time_missing_volume_facts(tmp_path):
     task = _task(tmp_path, status="middle_gap", confidence="proven")
 
-    result = PreExtractInspector(None, None, {"content_requirement": "complete"}).inspect(
+    result = PreExtractInspector(None).inspect(
         task,
         str(tmp_path / "out"),
     )
@@ -28,7 +28,7 @@ def test_complete_mode_ignores_removed_scan_time_missing_volume_facts(tmp_path):
 def test_complete_mode_does_not_convict_from_strong_name_evidence_alone(tmp_path):
     task = _task(tmp_path, status="tail_missing", confidence="strong")
 
-    result = PreExtractInspector(None, None, {"content_requirement": "complete"}).inspect(
+    result = PreExtractInspector(None).inspect(
         task,
         str(tmp_path / "out"),
     )
@@ -39,7 +39,7 @@ def test_complete_mode_does_not_convict_from_strong_name_evidence_alone(tmp_path
 def test_allow_partial_mode_does_not_preflight_reject_proven_missing_volume(tmp_path):
     task = _task(tmp_path, status="middle_gap", confidence="proven")
 
-    result = PreExtractInspector(None, None, {"content_requirement": "allow_partial"}).inspect(
+    result = PreExtractInspector(None).inspect(
         task,
         str(tmp_path / "out"),
     )

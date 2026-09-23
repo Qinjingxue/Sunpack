@@ -18,15 +18,10 @@ def test_successful_first_attempt_does_not_query_python_free_space(tmp_path):
         ),
         emit_semantic_event=lambda *_args, **_kwargs: None,
     )
-    rename = SimpleNamespace(
-        normalize_archive_paths=lambda archive, parts, **_kwargs: SimpleNamespace(archive=archive, run_parts=parts, cleanup_parts=parts),
-        cleanup_normalized_split_group=lambda _staged: None,
-    )
     extractor = SingleArchiveExtractor(
         seven_z_path="", password_store=SimpleNamespace(has_candidates=lambda: False),
         password_resolver=SimpleNamespace(password_tester=SimpleNamespace(passwords=[])),
         metadata_scanner=SimpleNamespace(scan_for_task=lambda *_args, **_kwargs: SimpleNamespace(selected_codepage=None, decoded_names=[], error=None)),
-        rename_scheduler=rename,
         retry_policy=SimpleNamespace(max_retries=1),
         split_entry_resolver=SimpleNamespace(resolve=lambda archive, parts, split: (archive, parts, split)),
         sevenzip_runner=runner,
@@ -92,7 +87,6 @@ def test_crc_proven_zipcrypto_password_is_confirmed_before_reporting_later_damag
             decoded_names=[],
             error=None,
         )),
-        rename_scheduler=SimpleNamespace(),
         retry_policy=SimpleNamespace(
             max_retries=1,
             can_retry=lambda *_args: False,
