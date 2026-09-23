@@ -4,6 +4,13 @@
 
 #include "../../../../C/7zCrc.h"
 
+#include "internal/positioned_output.hpp"
+
+#include <algorithm>
+#include <memory>
+#include <mutex>
+#include <vector>
+
 #include "../../../Common/ComTry.h"
 
 #include "../../Common/ProgressUtils.h"
@@ -15,6 +22,74 @@
 
 namespace NArchive {
 namespace N7z {
+
+namespace {
+
+struct CPositionedCrcSegment
+{
+  UInt64 Offset;
+  UInt32 Size;
+  UInt32 Crc;
+};
+
+static UInt32 CrcGf2MatrixTimes(const UInt32 *matrix, UInt32 vector)
+{
+  UInt32 sum = 0;
+  while (vector)
+  {
+    if (vector & 1)
+      sum ^= *matrix;
+    vector >>= 1;
+    matrix++;
+  }
+  return sum;
+}
+
+static void CrcGf2MatrixSquare(UInt32 *square, const UInt32 *matrix)
+{
+  for (unsigned i = 0; i < 32; ++i)
+    square[i] = CrcGf2MatrixTimes(matrix, matrix[i]);
+}
+
+static UInt32 CrcCombine(UInt32 crc1, UInt32 crc2, UInt64 len2)
+{
+  if (len2 == 0)
+    return crc1;
+
+  UInt32 even[32];
+  UInt32 odd[32];
+
+  odd[0] = 0xEDB88320;
+  UInt32 row = 1;
+  for (unsigned i = 1; i < 32; ++i)
+  {
+    odd[i] = row;
+    row <<= 1;
+  }
+
+  CrcGf2MatrixSquare(even, odd);
+  CrcGf2MatrixSquare(odd, even);
+
+  do
+  {
+    CrcGf2MatrixSquare(even, odd);
+    if (len2 & 1)
+      crc1 = CrcGf2MatrixTimes(even, crc1);
+    len2 >>= 1;
+    if (len2 == 0)
+      break;
+
+    CrcGf2MatrixSquare(odd, even);
+    if (len2 & 1)
+      crc1 = CrcGf2MatrixTimes(odd, crc1);
+    len2 >>= 1;
+  }
+  while (len2 != 0);
+
+  return crc1 ^ crc2;
+}
+
+} // namespace
 
 Z7_CLASS_IMP_COM_1(
   CFolderOutStream
@@ -31,6 +106,23 @@ private:
   UInt32 _crc;
   UInt64 _rem;
 
+  struct CPositionedFile
+  {
+    UInt32 Index = 0;
+    UInt64 Start = 0;
+    UInt64 Size = 0;
+    CMyComPtr<ISequentialOutStream> Stream;
+    sunpack::sevenzip::PositionedOutStream *Positioned = NULL;
+    std::mutex CrcMutex;
+    std::vector<CPositionedCrcSegment> CrcSegments;
+  };
+
+  bool _positionedMode;
+  UInt64 _positionedSize;
+  sunpack::sevenzip::PositionedExtractCallback *_positionedCallback;
+  std::vector<std::unique_ptr<CPositionedFile> > _positionedFiles;
+  std::vector<CPositionedFile *> _positionedRanges;
+
   const UInt32 *_indexes;
   // unsigned _startIndex;
   unsigned _numFiles;
@@ -40,6 +132,8 @@ private:
   HRESULT CloseFile_and_SetResult(Int32 res);
   HRESULT CloseFile();
   HRESULT ProcessEmptyFiles();
+  HRESULT InitPositioned(unsigned startIndex, unsigned numFiles);
+  HRESULT FinishPositioned(Int32 callbackOperationResult);
 
 public:
   const CDbEx *_db;
@@ -49,28 +143,274 @@ public:
 
   CFolderOutStream():
       TestMode(false),
-      CheckCrc(true)
+      CheckCrc(true),
+      _positionedMode(false),
+      _positionedSize(0),
+      _positionedCallback(NULL)
       {}
 
-  HRESULT Init(unsigned startIndex, const UInt32 *indexes, unsigned numFiles);
+  HRESULT Init(unsigned startIndex, const UInt32 *indexes, unsigned numFiles, bool allowPositioned);
+  HRESULT WriteAt(UInt64 offset, const void *data, UInt32 size, UInt32 *processedSize);
+  bool IsPositionedMode() const { return _positionedMode; }
   HRESULT FlushCorrupted(Int32 callbackOperationResult);
 
   bool WasWritingFinished() const { return _numFiles == 0; }
 };
 
 
-HRESULT CFolderOutStream::Init(unsigned startIndex, const UInt32 *indexes, unsigned numFiles)
+HRESULT CFolderOutStream::Init(
+    unsigned startIndex,
+    const UInt32 *indexes,
+    unsigned numFiles,
+    bool allowPositioned)
 {
-  // _startIndex = startIndex;
   _fileIndex = startIndex;
   _indexes = indexes;
   _numFiles = numFiles;
-  
+
   _fileIsOpen = false;
   ExtraWriteWasCut = false;
-  
+
+  _positionedMode = false;
+  _positionedSize = 0;
+  _positionedCallback = NULL;
+  _positionedRanges.clear();
+  _positionedFiles.clear();
+
+  if (allowPositioned && !indexes && !TestMode)
+  {
+    const HRESULT positionedResult = InitPositioned(startIndex, numFiles);
+    if (positionedResult == S_OK && _positionedMode)
+      return S_OK;
+    if (positionedResult != E_NOTIMPL)
+      return positionedResult;
+  }
+
   return ProcessEmptyFiles();
 }
+
+HRESULT CFolderOutStream::InitPositioned(unsigned startIndex, unsigned numFiles)
+{
+  _positionedCallback =
+      dynamic_cast<sunpack::sevenzip::PositionedExtractCallback *>(
+          ExtractCallback.Interface());
+
+  if (!_positionedCallback ||
+      !_positionedCallback->positioned_extract_available())
+  {
+    _positionedCallback = NULL;
+    return E_NOTIMPL;
+  }
+
+  UInt64 logicalPos = 0;
+
+  try
+  {
+    _positionedFiles.reserve(numFiles);
+    _positionedRanges.reserve(numFiles);
+
+    for (unsigned k = 0; k < numFiles; ++k)
+    {
+      const UInt32 index = startIndex + k;
+      const CFileItem &fi = _db->Files[index];
+
+      std::unique_ptr<CPositionedFile> state(new CPositionedFile);
+      state->Index = index;
+      state->Start = logicalPos;
+      state->Size = fi.Size;
+
+      CMyComPtr<ISequentialOutStream> realOutStream;
+      const HRESULT getResult = _positionedCallback->get_positioned_stream(
+          index,
+          &realOutStream,
+          NExtract::NAskMode::kExtract);
+      if (getResult != S_OK)
+        return getResult;
+
+      state->Stream = realOutStream;
+
+      if (fi.Size != 0 && !fi.IsDir)
+      {
+        state->Positioned =
+            sunpack::sevenzip::positioned_out_stream(realOutStream);
+        if (!state->Positioned)
+          return E_NOINTERFACE;
+        _positionedRanges.push_back(state.get());
+      }
+
+      if (logicalPos > (UInt64)(Int64)-1 - fi.Size)
+        return E_FAIL;
+      logicalPos += fi.Size;
+      _positionedFiles.push_back(std::move(state));
+    }
+  }
+  catch (...)
+  {
+    return E_OUTOFMEMORY;
+  }
+
+  _positionedSize = logicalPos;
+  _positionedMode = true;
+  return S_OK;
+}
+
+
+HRESULT CFolderOutStream::WriteAt(
+    UInt64 offset,
+    const void *data,
+    UInt32 size,
+    UInt32 *processedSize)
+{
+  if (processedSize)
+    *processedSize = 0;
+
+  if (!_positionedMode || (size != 0 && !data))
+    return E_FAIL;
+  if (size == 0)
+    return S_OK;
+  if (offset > _positionedSize || size > _positionedSize - offset)
+    return E_FAIL;
+
+  const Byte *src = (const Byte *)data;
+  UInt32 total = 0;
+
+  while (total < size)
+  {
+    const UInt64 pos = offset + total;
+    const auto it = std::lower_bound(
+        _positionedRanges.begin(),
+        _positionedRanges.end(),
+        pos,
+        [](const CPositionedFile *state, UInt64 value)
+        {
+          return state->Start + state->Size <= value;
+        });
+
+    if (it == _positionedRanges.end())
+      return E_FAIL;
+
+    CPositionedFile *state = *it;
+    if (pos < state->Start || pos >= state->Start + state->Size ||
+        !state->Positioned)
+      return E_FAIL;
+
+    const UInt64 fileOffset = pos - state->Start;
+    const UInt64 fileRem = state->Size - fileOffset;
+    UInt32 cur = size - total;
+    if (cur > fileRem)
+      cur = (UInt32)fileRem;
+
+    UInt32 written = 0;
+    const HRESULT result = state->Positioned->write_at(
+        fileOffset, src + total, cur, &written);
+
+    if (written != 0 && CheckCrc)
+    {
+      CPositionedCrcSegment segment;
+      segment.Offset = fileOffset;
+      segment.Size = written;
+      segment.Crc = CrcCalc(src + total, written);
+      std::lock_guard<std::mutex> lock(state->CrcMutex);
+      state->CrcSegments.push_back(segment);
+    }
+
+    total += written;
+    if (result != S_OK || written != cur)
+    {
+      if (processedSize)
+        *processedSize = total;
+      return result != S_OK ? result : E_FAIL;
+    }
+  }
+
+  if (processedSize)
+    *processedSize = total;
+  return S_OK;
+}
+
+
+HRESULT CFolderOutStream::FinishPositioned(Int32 callbackOperationResult)
+{
+  if (!_positionedMode)
+    return S_OK;
+
+  HRESULT firstError = S_OK;
+
+  for (const auto &holder : _positionedFiles)
+  {
+    CPositionedFile &state = *holder;
+    const CFileItem &fi = _db->Files[state.Index];
+    Int32 result = callbackOperationResult;
+
+    if (result == NExtract::NOperationResult::kOK &&
+        CheckCrc && fi.CrcDefined && !fi.IsDir)
+    {
+      bool coverageOk = true;
+      UInt32 combined = 0;
+      UInt64 cursor = 0;
+
+      {
+        std::lock_guard<std::mutex> lock(state.CrcMutex);
+        std::sort(
+            state.CrcSegments.begin(),
+            state.CrcSegments.end(),
+            [](const CPositionedCrcSegment &a, const CPositionedCrcSegment &b)
+            {
+              return a.Offset < b.Offset;
+            });
+
+        bool haveCrc = false;
+        for (const CPositionedCrcSegment &segment : state.CrcSegments)
+        {
+          if (segment.Offset != cursor)
+          {
+            coverageOk = false;
+            break;
+          }
+
+          if (!haveCrc)
+          {
+            combined = segment.Crc;
+            haveCrc = true;
+          }
+          else
+            combined = CrcCombine(combined, segment.Crc, segment.Size);
+
+          cursor += segment.Size;
+        }
+
+        if (cursor != state.Size)
+          coverageOk = false;
+        if (!haveCrc)
+          combined = 0;
+      }
+
+      if (!coverageOk)
+        result = NExtract::NOperationResult::kDataError;
+      else if (combined != fi.Crc)
+        result = NExtract::NOperationResult::kCRCError;
+    }
+
+    state.Stream.Release();
+
+    const HRESULT callbackResult =
+        _positionedCallback->set_positioned_operation_result(
+            state.Index, result);
+    if (firstError == S_OK && callbackResult != S_OK)
+      firstError = callbackResult;
+  }
+
+  _positionedRanges.clear();
+  _positionedFiles.clear();
+  _positionedCallback = NULL;
+  _positionedMode = false;
+  _positionedSize = 0;
+  _numFiles = 0;
+  _fileIsOpen = false;
+
+  return firstError;
+}
+
 
 HRESULT CFolderOutStream::OpenFile(bool isCorrupted)
 {
@@ -198,6 +538,9 @@ Z7_COM7F_IMF(CFolderOutStream::Write(const void *data, UInt32 size, UInt32 *proc
 
 HRESULT CFolderOutStream::FlushCorrupted(Int32 callbackOperationResult)
 {
+  if (_positionedMode)
+    return FinishPositioned(callbackOperationResult);
+
   while (_numFiles != 0)
   {
     if (_fileIsOpen)
@@ -211,6 +554,40 @@ HRESULT CFolderOutStream::FlushCorrupted(Int32 callbackOperationResult)
   }
   return S_OK;
 }
+
+class CFolderPositionedOutStream final :
+  public CMyUnknownImp,
+  public ISequentialOutStream,
+  public sunpack::sevenzip::PositionedOutStream
+{
+  Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+
+  CMyComPtr<ISequentialOutStream> _sequential;
+  CFolderOutStream *_folder;
+
+public:
+  CFolderPositionedOutStream(
+      ISequentialOutStream *sequential,
+      CFolderOutStream *folder):
+      _sequential(sequential),
+      _folder(folder)
+  {}
+
+  Z7_COM7F_IMF(Write(const void *data, UInt32 size, UInt32 *processedSize))
+  {
+    return _sequential->Write(data, size, processedSize);
+  }
+
+  HRESULT write_at(
+      UInt64 offset,
+      const void *data,
+      UInt32 size,
+      UInt32 *processedSize) noexcept override
+  {
+    return _folder->WriteAt(offset, data, size, processedSize);
+  }
+};
+
 
 /*
 Z7_COM7F_IMF(CFolderOutStream::GetSubStreamSize(UInt64 subStream, UInt64 *value))
@@ -341,9 +718,11 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
     }
 
     {
-      const HRESULT result = folderOutStream->Init(fileIndex,
+      const HRESULT result = folderOutStream->Init(
+          fileIndex,
           allFilesMode ? NULL : indices + i,
-          numSolidFiles);
+          numSolidFiles,
+          allFilesMode && testModeSpec == 0);
 
       i += numSolidFiles;
 
@@ -376,6 +755,14 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
 
       bool dataAfterEnd_Error = false;
 
+      CMyComPtr<ISequentialOutStream> decoderOutStream = outStream;
+      if (folderOutStream->IsPositionedMode())
+      {
+        CFolderPositionedOutStream *positionedSpec =
+            new CFolderPositionedOutStream(outStream, folderOutStream);
+        decoderOutStream = positionedSpec;
+      }
+
       const HRESULT result = decoder.Decode(
           EXTERNAL_CODECS_VARS
           _inStream,
@@ -383,7 +770,7 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
           _db, folderIndex,
           &curUnpacked,
 
-          outStream,
+          decoderOutStream,
           lps,
           NULL // *inStreamMainRes
           , dataAfterEnd_Error
@@ -423,6 +810,9 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
       
       if (result != S_OK)
         return result;
+
+      if (folderOutStream->IsPositionedMode())
+        RINOK(folderOutStream->FinishPositioned(NExtract::NOperationResult::kOK))
 
       RINOK(folderOutStream->FlushCorrupted(NExtract::NOperationResult::kDataError))
       continue;
