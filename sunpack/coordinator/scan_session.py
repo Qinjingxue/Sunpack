@@ -4,7 +4,10 @@ from typing import Any, List
 from sunpack_native import batch_file_head_facts as _native_batch_file_head_facts
 
 from sunpack.contracts.detection import FactBag
-from sunpack.contracts.filesystem import DirectorySnapshot
+from sunpack.contracts.filesystem import (
+    DirectorySnapshot,
+    FILESYSTEM_ROUTE_RELATIONS,
+)
 from sunpack.coordinator.target_groups import relation_group_to_fact_bag
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.relations import CandidateGroup, RelationsScheduler
@@ -106,27 +109,56 @@ class DetectionScanSession:
         path_passwords: dict[str, str] | None = None,
         *,
         refresh: bool = False,
+        filesystem_routed: bool = False,
     ) -> List[CandidateGroup]:
         key = self._directory_key(directory)
+        cache_key = f"{key}::relations" if filesystem_routed else key
         signature = _password_signature(path_passwords)
-        cached_signature = self._relation_group_signatures.get(key)
-        if refresh or key not in self._relation_groups or cached_signature != signature:
+        cached_signature = self._relation_group_signatures.get(cache_key)
+        if refresh or cache_key not in self._relation_groups or cached_signature != signature:
             snapshot = self.snapshot_for_directory(directory)
+            if filesystem_routed:
+                snapshot = snapshot.file_route_view(FILESYSTEM_ROUTE_RELATIONS)
             groups = self.relations.build_candidate_groups(
                 snapshot,
                 path_passwords=path_passwords,
             )
-            self._relation_groups[key] = groups
-            self._relation_group_signatures[key] = signature
-        return self._relation_groups[key]
+            self._relation_groups[cache_key] = groups
+            self._relation_group_signatures[cache_key] = signature
+        return self._relation_groups[cache_key]
 
     def fact_bags_for_directory(self, directory: str) -> List[FactBag]:
         key = self._directory_key(directory)
         if key not in self._fact_bags:
-            self._fact_bags[key] = [
-                relation_group_to_fact_bag(group)
-                for group in self.relation_groups_for_directory(directory)
-            ]
+            snapshot = self.snapshot_for_directory(directory)
+            groups = self.relation_groups_for_directory(
+                directory,
+                filesystem_routed=True,
+            )
+            bags = [relation_group_to_fact_bag(group) for group in groups]
+            claimed_paths = {
+                path_key(path)
+                for group in groups
+                for path in group.owned_paths
+                if path
+            }
+            for bag in bags:
+                bag.set("filesystem.route", "relations")
+                anchor = bag.get("relation.volume_anchor")
+                if isinstance(anchor, dict) and anchor.get("format"):
+                    bag.set("filesystem.format_hint", str(anchor["format"]).lower())
+
+            for path, size, route, format_hint, reject_mask in snapshot.file_routing_rows():
+                if route == "relations" or path_key(path) in claimed_paths:
+                    continue
+                bags.append(_filesystem_candidate_bag(
+                    path,
+                    size=size,
+                    route=route,
+                    format_hint=format_hint,
+                    reject_mask=reject_mask,
+                ))
+            self._fact_bags[key] = bags
         return self._fact_bags[key]
 
     def logical_name_for_archive(self, filename: str) -> str:
@@ -212,6 +244,65 @@ class DetectionScanSession:
         if facts is None:
             return True
         return bool(magic_size > 0 and facts.get("is_file") and not facts.get("magic_complete"))
+
+
+
+def _filesystem_candidate_bag(
+    path: str,
+    *,
+    size: int | None,
+    route: str,
+    format_hint: str,
+    reject_mask: int,
+) -> FactBag:
+    path = normalized_path(path)
+    name = os.path.basename(path)
+    logical_name = _filesystem_logical_name(name, format_hint)
+    bag = FactBag()
+    bag.update({
+        "file.path": path,
+        "file.logical_name": logical_name,
+        "candidate.kind": "file",
+        "candidate.entry_path": path,
+        "candidate.member_paths": [path],
+        "candidate.logical_name": logical_name,
+        "candidate.carrier_path": path,
+        "candidate.companion_paths": [],
+        "candidate.cleanup_paths": [path],
+        "candidate.format_reject_mask": int(reject_mask or 0),
+        "filesystem.route": route,
+        "filesystem.format_hint": str(format_hint or "").lower(),
+        "relation.format_hint": "",
+        "relation.format_hint_confidence": "none",
+        "file.split_members": [],
+        "file.split_role": None,
+        "file.is_split_candidate": False,
+        "relation.is_split_related": False,
+        "relation.is_split_member": False,
+        "relation.has_split_companions": False,
+        "relation.is_split_exe_companion": False,
+        "relation.is_disguised_split_exe_companion": False,
+        "relation.has_generic_001_head": False,
+        "relation.is_plain_numeric_member": False,
+        "relation.match_rar_disguised": False,
+        "relation.match_rar_head": False,
+        "relation.match_001_head": False,
+        "relation.split_entry_path": path,
+        "relation.split_member_count": 0,
+        "relation.split_family": "",
+        "relation.split_index": 0,
+        "relation.split_is_first": False,
+    })
+    if isinstance(size, int):
+        bag.set("file.size", size)
+    return bag
+
+
+def _filesystem_logical_name(name: str, format_hint: str) -> str:
+    extension = os.path.splitext(name)[1].lower()
+    if extension in {".7z", ".rar", ".zip", ".gz", ".bz2", ".xz", ".exe"}:
+        return os.path.splitext(name)[0] or name
+    return name
 
 
 def _password_signature(path_passwords: dict[str, str] | None) -> str:
