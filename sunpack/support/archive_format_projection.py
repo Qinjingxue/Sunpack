@@ -44,7 +44,7 @@ def write_inspection_report(task: ArchiveTask, report: ArchiveAnalysisReport) ->
             source_layer="inspection",
             source_module="inspection_projector",
         )
-        _write_format_evidence(knowledge, selected, task=task)
+        _write_format_evidence(knowledge, selected)
     commit_task_knowledge(task, knowledge)
 
 
@@ -83,7 +83,7 @@ def write_inspection_refresh(
             source_layer="inspection",
             source_module="inspection_projector",
         )
-        _write_format_evidence(knowledge, selected, task=task)
+        _write_format_evidence(knowledge, selected)
     commit_task_knowledge(task, knowledge)
 
 
@@ -97,22 +97,6 @@ def write_inspection_error(task: ArchiveTask, error: str) -> None:
         source_module="inspection_projector",
     )
     commit_task_knowledge(task, knowledge)
-
-
-def write_zip_structure_facts(task: ArchiveTask) -> dict[str, Any]:
-    structure = _merge_zip_structure_facts({}, task)
-    if not structure:
-        return {}
-    knowledge = ensure_knowledge(task)
-    write_payload(
-        knowledge,
-        "format.zip",
-        {"structure": structure},
-        source_layer="inspection",
-        source_module="zip_structure_facts",
-    )
-    commit_task_knowledge(task, knowledge)
-    return structure
 
 
 def write_zip_runtime_evidence_facts(task: ArchiveTask) -> dict[str, Any]:
@@ -137,7 +121,7 @@ def write_zip_runtime_evidence_facts(task: ArchiveTask) -> dict[str, Any]:
     return merged["runtime"]
 
 
-def _write_format_evidence(knowledge: Any, evidence: ArchiveFormatEvidence, *, task: ArchiveTask | None = None) -> None:
+def _write_format_evidence(knowledge: Any, evidence: ArchiveFormatEvidence) -> None:
     details = dict(evidence.details or {})
     format_key = "7z" if evidence.format in {"7z", "seven_zip"} else evidence.format
     write_payload(
@@ -145,7 +129,7 @@ def _write_format_evidence(knowledge: Any, evidence: ArchiveFormatEvidence, *, t
         f"format.{format_key}",
         {
             "evidence": _evidence_payload(evidence),
-            "structure": _format_structure_payload(evidence.format, details, task=task),
+            "structure": _format_structure_payload(evidence.format, details),
             "container_tags": _format_container_tags(evidence.format, details),
         },
         source_layer="inspection",
@@ -177,7 +161,7 @@ def _write_format_evidence(knowledge: Any, evidence: ArchiveFormatEvidence, *, t
         "format": evidence.format,
         "inspection_evidence": {"details": details},
         "source_derivation": {
-            "zip_structure_features": _format_structure_payload(evidence.format, details, task=task),
+            "zip_structure_features": _format_structure_payload(evidence.format, details),
             "zip_container_tags": details.get("zip_container_tags") or [],
         },
     })
@@ -200,7 +184,7 @@ def _write_format_evidence(knowledge: Any, evidence: ArchiveFormatEvidence, *, t
         )
 
 
-def _format_structure_payload(fmt: str, details: dict[str, Any], *, task: ArchiveTask | None = None) -> dict[str, Any]:
+def _format_structure_payload(fmt: str, details: dict[str, Any]) -> dict[str, Any]:
     if fmt in {"7z", "seven_zip"}:
         return dict(details.get("seven_zip_structure") or details.get("7z_structure") or details.get("structure") or {})
     if fmt != "zip":
@@ -216,24 +200,7 @@ def _format_structure_payload(fmt: str, details: dict[str, Any], *, task: Archiv
             if key not in {"format", "suggested_extension"}
         }
     structure = dict(details.get("zip_structure_features") or details.get("structure") or {})
-    if task is not None:
-        structure = _merge_zip_structure_facts(structure, task)
-    return structure
-
-
-def _merge_zip_structure_facts(structure: dict[str, Any], task: ArchiveTask) -> dict[str, Any]:
-    output = _dedup_zip_structure(dict(structure or {}))
-    fact_bag = getattr(task, "fact_bag", None)
-    get = getattr(fact_bag, "get", None)
-    if not callable(get):
-        return output
-    graph = get("zip.structure_graph")
-    if isinstance(graph, dict) and graph:
-        graph_payload = dict(graph)
-        summary = graph_payload.get("summary") if isinstance(graph_payload.get("summary"), dict) else {}
-        output["graph"] = graph_payload
-        output["summary"] = dict(summary or {})
-    return output
+    return _dedup_zip_structure(structure)
 
 
 def _dedup_zip_structure(structure: dict[str, Any]) -> dict[str, Any]:

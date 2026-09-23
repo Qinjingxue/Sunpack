@@ -289,7 +289,7 @@ class ArchiveInputPlanningStage:
         write_knowledge: bool = True,
     ) -> None:
         selected = _best_selected(report)
-        with _phase(phase_timer, f"{phase_prefix}_record_report_fact_bag_basic"):
+        with _phase(phase_timer, f"{phase_prefix}_record_report_runtime_basic"):
             task.runtime["input_planning.status"] = "extractable" if report.has_extractable else "not_extractable"
             task.runtime["input_planning.read_bytes"] = report.read_bytes
             task.runtime["input_planning.cache_hits"] = report.cache_hits
@@ -308,7 +308,7 @@ class ArchiveInputPlanningStage:
                 }
                 for evidence in report.evidences
             ]
-        with _phase(phase_timer, f"{phase_prefix}_record_report_fact_bag_evidences"):
+        with _phase(phase_timer, f"{phase_prefix}_record_report_runtime_evidences"):
             task.runtime["input_planning.evidences"] = evidences
         if write_knowledge:
             with _phase(phase_timer, f"{phase_prefix}_record_report_write_knowledge"):

@@ -60,11 +60,15 @@ class CliBasicTests(unittest.TestCase):
         self.assertGreaterEqual(payload["summary"]["total_items"], 1)
         self.assertIn("items", payload)
         first_item = payload["items"][0]
-        self.assertIn("decision_stage", first_item)
-        self.assertIn("discarded_at", first_item)
-        self.assertIn("deciding_rule", first_item)
-        self.assertIn("stop_reason", first_item)
-        self.assertNotIn("confirmation", first_item)
+        self.assertIn("path", first_item)
+        self.assertIn("status", first_item)
+        self.assertIn("should_extract", first_item)
+        self.assertIn("format", first_item)
+        self.assertIn("discovery_source", first_item)
+        self.assertIn("reason", first_item)
+        self.assertIn("archive_input", first_item)
+        self.assertNotIn("decision_stage", first_item)
+        self.assertNotIn("deciding_rule", first_item)
 
     def test_inspect_analyze_json_shape_is_compact(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -98,7 +102,8 @@ class CliBasicTests(unittest.TestCase):
         self.assertGreaterEqual(payload["summary"]["total_items"], payload["summary"]["displayed_items"])
         self.assertGreaterEqual(payload["summary"]["displayed_items"], 1)
         self.assertTrue(all(item["should_extract"] for item in payload["items"]))
-        self.assertTrue(all(item["decision"] == "archive" for item in payload["items"]))
+        self.assertTrue(all(item["status"] == "resolved" for item in payload["items"]))
+        self.assertTrue(all(item["archive_input"] for item in payload["items"]))
 
     def test_passwords_json_shape(self):
         result = run_cli("passwords", "--json", "-p", "secret", "--no-builtin-pw")
