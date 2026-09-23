@@ -3,6 +3,9 @@
 #include "StdAfx.h"
 
 #include "../../Common/LimitedStreams.h"
+#include "internal/positioned_output.hpp"
+
+#include <memory>
 #include "../../Common/ProgressUtils.h"
 #include "../../Common/StreamObjects.h"
 #include "../../Common/StreamUtils.h"
@@ -11,6 +14,128 @@
 
 namespace NArchive {
 namespace N7z {
+
+namespace {
+
+class CLimitedRandomReader final : public sunpack::sevenzip::RandomAccessReader
+{
+  std::unique_ptr<sunpack::sevenzip::RandomAccessReader> _base;
+  UInt64 _start;
+  UInt64 _size;
+
+public:
+  CLimitedRandomReader(
+      std::unique_ptr<sunpack::sevenzip::RandomAccessReader> base,
+      UInt64 start,
+      UInt64 size):
+      _base(std::move(base)),
+      _start(start),
+      _size(size)
+  {}
+
+  HRESULT read_at(
+      UInt64 offset,
+      void *data,
+      UInt32 size,
+      UInt32 *processedSize) noexcept override
+  {
+    if (processedSize)
+      *processedSize = 0;
+    if (!_base || (size != 0 && !data))
+      return E_POINTER;
+    if (offset >= _size || size == 0)
+      return S_OK;
+
+    const UInt64 rem = _size - offset;
+    if (size > rem)
+      size = (UInt32)rem;
+    if (_start > (UInt64)(Int64)-1 - offset)
+      return E_FAIL;
+    return _base->read_at(_start + offset, data, size, processedSize);
+  }
+};
+
+
+class CRandomLimitedSequentialInStream final :
+  public CMyUnknownImp,
+  public ISequentialInStream,
+  public sunpack::sevenzip::RandomAccessInStream
+{
+  Z7_COM_UNKNOWN_IMP_1(ISequentialInStream)
+
+  CMyComPtr<ISequentialInStream> _stream;
+  CMyComPtr<IInStream> _randomOwner;
+  sunpack::sevenzip::RandomAccessInStream *_random = NULL;
+  UInt64 _start = 0;
+  UInt64 _size = 0;
+  UInt64 _pos = 0;
+  bool _wasFinished = false;
+
+public:
+  void Init(
+      ISequentialInStream *stream,
+      IInStream *randomOwner,
+      UInt64 start,
+      UInt64 size)
+  {
+    _stream = stream;
+    _randomOwner = randomOwner;
+    _random = sunpack::sevenzip::random_access_in_stream(randomOwner);
+    _start = start;
+    _size = size;
+    _pos = 0;
+    _wasFinished = false;
+  }
+
+  Z7_COM7F_IMF(Read(void *data, UInt32 size, UInt32 *processedSize))
+  {
+    UInt32 realProcessedSize = 0;
+    if (_pos < _size)
+    {
+      const UInt64 rem = _size - _pos;
+      if (size > rem)
+        size = (UInt32)rem;
+    }
+    else
+      size = 0;
+
+    HRESULT result = S_OK;
+    if (size != 0)
+    {
+      result = _stream->Read(data, size, &realProcessedSize);
+      _pos += realProcessedSize;
+      if (realProcessedSize == 0)
+        _wasFinished = true;
+    }
+
+    if (processedSize)
+      *processedSize = realProcessedSize;
+    return result;
+  }
+
+  std::unique_ptr<sunpack::sevenzip::RandomAccessReader>
+  open_random_reader() noexcept override
+  {
+    if (!_random)
+      return {};
+
+    try
+    {
+      std::unique_ptr<sunpack::sevenzip::RandomAccessReader> base =
+          _random->open_random_reader();
+      if (!base)
+        return {};
+      return std::make_unique<CLimitedRandomReader>(
+          std::move(base), _start, _size);
+    }
+    catch (...)
+    {
+      return {};
+    }
+  }
+};
+
+} // namespace
 
 Z7_CLASS_IMP_COM_1(
   CDecProgress
@@ -566,10 +691,21 @@ HRESULT CDecoder::Decode(
       }
     }
 
-    CLimitedSequentialInStream *streamSpec = new CLimitedSequentialInStream;
-    inStreams.AddNew() = streamSpec;
-    streamSpec->SetStream(packStream);
-    streamSpec->Init(packPositions[j + 1] - packPositions[j]);
+    const UInt64 packSize = packPositions[j + 1] - packPositions[j];
+    if (sunpack::sevenzip::random_access_in_stream(inStream))
+    {
+      CRandomLimitedSequentialInStream *streamSpec =
+          new CRandomLimitedSequentialInStream;
+      inStreams.AddNew() = streamSpec;
+      streamSpec->Init(packStream, inStream, packPos, packSize);
+    }
+    else
+    {
+      CLimitedSequentialInStream *streamSpec = new CLimitedSequentialInStream;
+      inStreams.AddNew() = streamSpec;
+      streamSpec->SetStream(packStream);
+      streamSpec->Init(packSize);
+    }
   }
   
   const unsigned num = inStreams.Size();
