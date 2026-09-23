@@ -229,59 +229,60 @@ def result_for_missing(command: str, args, missing_paths: list[str], ctx) -> tup
     )
 
 
-def _fact_dict(res) -> dict:
-    facts = getattr(res, "facts", None)
-    if isinstance(facts, dict):
-        return facts
-    bag = getattr(res, "fact_bag", None)
-    if bag is not None and hasattr(bag, "to_dict"):
-        result = bag.to_dict()
-        errors = bag.get_errors() if hasattr(bag, "get_errors") else {}
-        if errors:
-            result["_fact_errors"] = errors
-        return result
-    return {}
-
-
 def scan_result_to_item(res) -> dict[str, Any]:
-    facts = _fact_dict(res)
-    main_path = res.main_path
-    all_parts = list(res.all_parts or [])
     return {
-        "main_path": main_path,
-        "all_parts": all_parts,
+        "main_path": res.main_path,
+        "all_parts": list(res.all_parts or []),
         "decision": res.decision,
-        "detected_ext": res.detected_ext,
-        "split_role": getattr(res, "split_role", facts.get("file.split_role")),
+        "format": str(res.format or ""),
+        "discovery_source": str(res.discovery_source or ""),
+        "archive_input": dict(res.archive_input or {}),
+        "split_role": "first" if len(res.all_parts or []) > 1 else "",
         "reasons": list(res.matched_rules or []),
-        "facts": facts,
     }
 
 
 def inspect_result_to_item(res) -> dict[str, Any]:
-    facts = _fact_dict(res)
-    path_info = facts.get("path") or {}
-    size = facts.get("file.size", 0)
-    ext = facts.get("file.ext") or path_info.get("ext") or ""
-    fact_errors = facts.get("_fact_errors") or []
+    candidate = res.candidate
+    resolved = res.resolved
+    archive_input = (
+        resolved.archive_input.to_dict()
+        if resolved is not None
+        else candidate.archive_input.to_dict()
+        if candidate.archive_input is not None
+        else None
+    )
+    identity_offset = 0
+    if archive_input:
+        segment = archive_input.get("segment")
+        if isinstance(segment, dict):
+            identity_offset = int(segment.get("start") or 0)
+        elif isinstance(candidate.relation_anchor, dict):
+            identity_offset = int(candidate.relation_anchor.get("structure_offset") or 0)
     return {
         "path": res.path,
-        "decision": getattr(res, "decision", "archive" if res.should_extract else "not_archive"),
+        "decision": getattr(
+            res,
+            "decision",
+            "archive" if res.should_extract else "not_archive",
+        ),
         "decision_stage": getattr(res, "decision_stage", ""),
         "discarded_at": getattr(res, "discarded_at", "") or None,
         "deciding_rule": getattr(res, "deciding_rule", "") or None,
         "stop_reason": getattr(res, "stop_reason", "") or None,
         "should_extract": res.should_extract,
-        "size": facts.get("file.size", size),
-        "ext": ext,
-        "detected_ext": res.detected_ext or facts.get("file.detected_ext") or None,
-        "container_type": facts.get("file.container_type") or "unknown",
-        "identity_confirmed": bool(facts.get("file.probe_detected_archive")),
-        "identity_offset": int(facts.get("file.probe_offset") or 0),
-        "is_split_candidate": bool(res.split_role or facts.get("file.is_split_candidate")),
-        "skipped_by_size_limit": bool(res.stop_reason and "size below" in res.stop_reason.lower()),
+        "size": int(candidate.size or 0),
+        "format": str(res.format or ""),
+        "discovery_source": str(res.discovery_source or ""),
+        "archive_input": archive_input,
+        "container_type": "pe" if candidate.is_sfx else "unknown",
+        "identity_confirmed": bool(resolved is not None),
+        "identity_offset": identity_offset,
+        "is_split_candidate": bool(candidate.is_split),
+        "skipped_by_size_limit": bool(
+            res.stop_reason and "size below" in res.stop_reason.lower()
+        ),
         "reasons": list(res.matched_rules or []),
-        "fact_errors": fact_errors,
     }
 
 
