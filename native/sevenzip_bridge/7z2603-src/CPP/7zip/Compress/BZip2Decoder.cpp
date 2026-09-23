@@ -948,12 +948,6 @@ struct CParallelBlockJob
     FinishedEvent.notify_one();
   }
 
-  bool IsDone()
-  {
-    std::lock_guard<std::mutex> lock(Mutex);
-    return Done;
-  }
-
   HRESULT Wait()
   {
     std::unique_lock<std::mutex> lock(Mutex);
