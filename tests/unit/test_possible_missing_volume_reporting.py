@@ -2,25 +2,32 @@ from __future__ import annotations
 
 import pytest
 
-from sunpack.contracts.detection import FactBag
+from sunpack.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.contracts.failures import FailureInfo, FailureKind
 from sunpack.contracts.results import OutcomeKind
-from sunpack.contracts.tasks import ArchiveTask, SplitArchiveInfo
 from sunpack.coordinator.extraction_batch import _possible_missing_volume_failure
 from sunpack.i18n import I18nContext
+from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 
 
-def _task(*, split: bool = True, missing_indices=()) -> ArchiveTask:
-    bag = FactBag()
-    bag.set("relation.is_split_related", split)
-    if missing_indices:
-        bag.set("relation.split_missing_indices", list(missing_indices))
-    return ArchiveTask(
-        fact_bag=bag,
-        main_path="sample.7z.001" if split else "sample.7z",
-        all_parts=["sample.7z.001"] if split else ["sample.7z"],
-        split_info=SplitArchiveInfo(is_split=split),
+def _task(*, split: bool = True, missing_indices=()):
+    del missing_indices
+    if not split:
+        return make_archive_task("sample.7z", format_hint="7z")
+    descriptor = ArchiveInputDescriptor.from_split_volumes(
+        archive_path="sample.7z.001",
+        volumes=[{
+            "path": "sample.7z.001",
+            "number": 1,
+            "style": "numeric_suffix",
+            "prefix": "sample.7z.",
+            "width": 3,
+            "role": "first",
+        }],
+        format_hint="7z",
+        logical_name="sample",
     )
+    return make_task_from_descriptor(descriptor, relation_kind="split_archive")
 
 
 def _failure(kind: FailureKind, *, details=None) -> FailureInfo:
@@ -52,7 +59,7 @@ def test_actual_archive_failure_plus_observed_gap_reports_possible_missing_and_k
         I18nContext("en"),
     )
 
-    # Relation no longer manufactures a scan-time gap.  A missing-volume
+    # Relation no longer manufactures a scan-time gap. A missing-volume
     # failure is emitted only when the extraction/backend path proves it.
     assert warning is None
 
