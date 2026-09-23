@@ -1913,6 +1913,15 @@ namespace NCompress
 
     class CRar5ParallelBlockPool
     {
+    public:
+      struct CSnapshot
+      {
+        size_t Queued;
+        unsigned Running;
+        unsigned ActiveWorkers;
+      };
+
+    private:
       std::vector<std::thread> _threads;
       std::vector<std::unique_ptr<CRar5ParallelBlockJob>> _jobs;
       std::deque<CRar5ParallelBlockJob *> _queue;
@@ -2020,6 +2029,12 @@ namespace NCompress
               (std::min)(numWorkers, (unsigned)_threads.size());
         }
         _workEvent.notify_all();
+      }
+
+      CSnapshot Snapshot()
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        return { _queue.size(), _runningWorkers, _activeWorkers };
       }
 
       void WaitIdle()
@@ -2614,20 +2629,25 @@ HRESULT CDecoder::DecodeLZParallel()
     }
   } session(*_mtPool, cpuContext);
 
-  auto growWorker = [&]() -> bool
+  auto scaleToReadyCount = [&](size_t readyCount) -> bool
   {
-    if (session.ActiveWorkers >= maxWorkers)
-      return false;
+    const unsigned target =
+        (unsigned)(std::min<size_t>(readyCount, maxWorkers));
+    if (target <= session.ActiveWorkers)
+      return true;
 
-    unsigned granted = 1;
+    const unsigned wanted =
+        target - session.ActiveWorkers;
+    unsigned granted = wanted;
     if (cpuContext)
       granted =
           sunpack_cpu_acquire_extra_for_context(
-              cpuContext, 1, 1);
+              cpuContext, wanted, 1);
     if (granted == 0)
-      return false;
+      return true;
 
-    const unsigned nextWorkers = session.ActiveWorkers + 1;
+    const unsigned nextWorkers =
+        session.ActiveWorkers + granted;
     if (!_mtPool->EnsureWorkerCount(nextWorkers))
     {
       if (cpuContext)
@@ -2641,6 +2661,14 @@ HRESULT CDecoder::DecodeLZParallel()
       session.Credits += granted;
     _mtPool->SetActiveWorkers(session.ActiveWorkers);
     return true;
+  };
+
+  auto scaleFromReadyQueue = [&]() -> bool
+  {
+    const CRar5ParallelBlockPool::CSnapshot snapshot =
+        _mtPool->Snapshot();
+    return scaleToReadyCount(
+        snapshot.Queued + snapshot.Running);
   };
 
   UInt64 prepared = 0;
@@ -2894,45 +2922,18 @@ HRESULT CDecoder::DecodeLZParallel()
     return S_OK;
   };
 
-  auto growForBacklog = [&]()
+  for (;;)
   {
-    while (parallelActive &&
-           prepared - retired > session.ActiveWorkers &&
-           session.ActiveWorkers < maxWorkers)
+    // Keep a fixed parsed-block lookahead window independent of the current
+    // active worker width. Ordered retirement only throttles the parser when
+    // the algorithm-level ring is actually full.
+    if (prepared - retired >= ringSize)
     {
       CRar5ParallelBlockJob &oldest =
           _mtPool->JobAt((size_t)(retired % ringSize));
-      if (oldest.IsDone() || !growWorker())
-        break;
-    }
-  };
-
-  for (;;)
-  {
-    if (parallelActive)
-    {
-      growForBacklog();
-
-      const UInt64 inFlight = prepared - retired;
-      const UInt64 inFlightLimit =
-          (UInt64)(std::max)(1u, session.ActiveWorkers) *
-          kRar5MtBlocksPerWorker;
-      if (inFlight >= inFlightLimit)
-      {
-        CRar5ParallelBlockJob &oldest =
-            _mtPool->JobAt((size_t)(retired % ringSize));
-
-        // If work is really backlogged, prefer adding one worker before
-        // blocking on ordered retirement. Otherwise retire completed work.
-        if (!oldest.IsDone() &&
-            prepared - retired > session.ActiveWorkers &&
-            growWorker())
-          continue;
-
-        RINOK(retireOne(oldest))
-        retired++;
-        continue;
-      }
+      RINOK(retireOne(oldest))
+      retired++;
+      continue;
     }
 
     CRar5RawBlockHeader rawHeader;
@@ -2950,9 +2951,9 @@ HRESULT CDecoder::DecodeLZParallel()
         if (!pendingTableJob)
           return S_FALSE;
 
-        // Before a pool exists, a table dependency proves that the staged
-        // block and the current block cannot be entropy-decoded in parallel.
-        // Decode that staged block on the caller instead of starting a worker.
+        // A table dependency is a real dependency, not queueable parallel
+        // work. Before parallel activation, resolve it on the caller rather
+        // than manufacturing an extra worker.
         if (!parallelActive && stagedJob == pendingTableJob)
           stagedJob->Process();
 
@@ -3029,7 +3030,7 @@ HRESULT CDecoder::DecodeLZParallel()
       {
         stagedJob = &job;
 
-        // A single RAR5 block never starts an extra worker.
+        // One ready block has no block-level parallelism.
         if (rawHeader.LastBlock)
         {
           stagedJob->Process();
@@ -3041,9 +3042,13 @@ HRESULT CDecoder::DecodeLZParallel()
         continue;
       }
 
-      // Two independent parsed blocks establish real parallel backlog.
-      // Only now do we request the first extra execution lane.
-      if (!growWorker())
+      // Two independent ready blocks establish real parallel work. Size the
+      // worker set directly from that ready count instead of ramping one
+      // worker per producer loop iteration.
+      if (!scaleToReadyCount(2))
+        return E_FAIL;
+
+      if (session.ActiveWorkers == 0)
       {
         stagedJob->Process();
         RINOK(retireOne(*stagedJob))
@@ -3065,12 +3070,14 @@ HRESULT CDecoder::DecodeLZParallel()
       _mtPool->Submit(&job);
       stagedJob = NULL;
       parallelActive = true;
-      growForBacklog();
+      if (!scaleFromReadyQueue())
+        return E_FAIL;
     }
     else
     {
       _mtPool->Submit(&job);
-      growForBacklog();
+      if (!scaleFromReadyQueue())
+        return E_FAIL;
     }
 
     if (rawHeader.LastBlock)
