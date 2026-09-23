@@ -25,7 +25,7 @@ import sunpack.analysis.structure_pipeline.modules.rar as rar_analysis_module
 import sunpack.coordinator.scan_session as scan_session_module
 from sunpack.analysis.config import enabled_fuzzy_module_configs
 from sunpack.analysis.fuzzy_pipeline.registry import get_fuzzy_analysis_module_registry
-from sunpack.coordinator.scan_session import DetectionScanSession
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.analysis.view import SharedBinaryView
 from sunpack.support.output_inventory import OutputInventory
@@ -128,8 +128,8 @@ class RequestRuntimeProfiler:
             "snapshot_from_output_inventory",
             "output_inventory_snapshot_fused",
         )
-        self._install_global_method(DetectionScanSession, "file_head_facts_for_paths", "output_file_head_facts")
-        self._install_global_method(DetectionScanSession, "prime_snapshot", "output_prime_snapshot")
+        self._install_global_method(DiscoveryScanSession, "file_head_facts_for_paths", "output_file_head_facts")
+        self._install_global_method(DiscoveryScanSession, "prime_snapshot", "output_prime_snapshot")
         self._install_global_method(OutputInventory, "from_value", "output_inventory_from_value")
         self._install_global_callable(
             scan_session_module,
