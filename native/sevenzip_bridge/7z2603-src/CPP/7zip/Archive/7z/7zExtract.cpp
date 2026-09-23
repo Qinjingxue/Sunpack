@@ -764,9 +764,36 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
       {
         CFolderEx folderInfo;
         _db.ParseFolderEx(folderIndex, folderInfo);
-        allowPositioned =
-            folderInfo.UnpackCoder < folderInfo.Coders.Size() &&
-            folderInfo.Coders[folderInfo.UnpackCoder].MethodID == k_LZMA2;
+        if (folderInfo.UnpackCoder < folderInfo.Coders.Size())
+        {
+          const CMethodId finalMethod =
+              folderInfo.Coders[folderInfo.UnpackCoder].MethodID;
+          allowPositioned = (finalMethod == k_LZMA2);
+
+          if (!allowPositioned &&
+              !folderInfo.IsEncrypted() &&
+              folderInfo.Coders.Size() == 2 &&
+              folderInfo.Bonds.Size() == 1 &&
+              folderInfo.PackStreams.Size() == 1)
+          {
+            unsigned lzmaIndex =
+                folderInfo.UnpackCoder == 0 ? 1 : 0;
+            const CMethodId filterMethod = finalMethod;
+            const bool positionedFilter =
+                filterMethod == k_ARM64 ||
+                filterMethod == k_ARM ||
+                filterMethod == k_PPC ||
+                filterMethod == k_SPARC ||
+                filterMethod == k_IA64 ||
+                filterMethod == k_SWAP2 ||
+                filterMethod == k_SWAP4;
+
+            allowPositioned =
+                positionedFilter &&
+                folderInfo.Coders[lzmaIndex].IsSimpleCoder() &&
+                folderInfo.Coders[lzmaIndex].MethodID == k_LZMA2;
+          }
+        }
 
         /*
           Direct run output is valid only when LZMA2 is the final coder in the
