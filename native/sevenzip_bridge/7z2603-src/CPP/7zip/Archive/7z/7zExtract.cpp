@@ -798,11 +798,11 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
         }
 
         /*
-          Direct run output is valid only when LZMA2 is the final coder in the
-          folder graph. Filters such as Delta/BCJ/BCJ2 remain on the original
-          CoderMixer path, because their continuous state spans LZMA2 reset
-          boundaries. Also keep anti-item handling on the legacy path so the
-          established callback semantics are unchanged.
+          Positioned output is enabled for plain LZMA2 and for the explicitly
+          supported branch/swap filters above. Stateful 7z filters (x86 BCJ,
+          Delta and BCJ2) remain on the original CoderMixer path because their
+          state crosses LZMA2 reset-run boundaries. Keep anti-item handling on
+          the legacy path so established callback semantics stay unchanged.
         */
         if (allowPositioned)
         {
