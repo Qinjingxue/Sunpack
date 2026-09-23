@@ -15,7 +15,7 @@ from sunpack_native import (
 )
 
 from sunpack.contracts.filesystem import DirectorySnapshot
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, ArchiveInputRange, ArchiveInputSegment
 from sunpack.passwords.internal.local_files import discover_directory_passwords_for_archive
 from sunpack.passwords.internal.store import PasswordStore
 from sunpack.passwords.relation_prober import RelationsPasswordProber
@@ -341,17 +341,62 @@ def _native_password_pairs(path_passwords: dict[str, str] | None) -> list[tuple[
 
 def _relation_archive_input(group: CandidateGroup) -> dict | None:
     volumes = list(group.split_volumes or [])
-    if not volumes:
+    if volumes:
+        first = volumes[0]
+        format_hint = _format_hint(
+            group.relation.split_family,
+            first.style,
+            first.prefix,
+        )
+        return ArchiveInputDescriptor.from_split_volumes(
+            archive_path=group.head_path,
+            volumes=volumes,
+            format_hint=format_hint,
+            logical_name=group.logical_name,
+        ).to_dict()
+
+    metadata = group.head_metadata if isinstance(group.head_metadata, dict) else {}
+    if not metadata.get("relation_confirmed"):
         return None
-    first = volumes[0]
-    format_hint = _format_hint(
-        group.relation.split_family,
-        first.style,
-        first.prefix,
-    )
-    return ArchiveInputDescriptor.from_split_volumes(
+    format_hint = str(metadata.get("format") or "").lower().lstrip(".")
+    if format_hint not in {"rar", "7z", "zip"}:
+        return None
+
+    structure_offset = int(metadata.get("structure_offset") or 0)
+    if structure_offset > 0 and bool(metadata.get("sfx")):
+        range_end = (
+            int(metadata["expected_logical_size"])
+            if isinstance(metadata.get("expected_logical_size"), int)
+            and int(metadata["expected_logical_size"]) > structure_offset
+            else None
+        )
+        archive_range = ArchiveInputRange(
+            path=group.head_path,
+            start=structure_offset,
+            end=range_end,
+        )
+        return ArchiveInputDescriptor(
+            entry_path=group.head_path,
+            open_mode="file_range",
+            format_hint=format_hint,
+            logical_name=group.logical_name,
+            parts=[
+                ArchiveInputPart(
+                    path=group.head_path,
+                    role="main",
+                    range=archive_range,
+                )
+            ],
+            segment=ArchiveInputSegment(
+                start=structure_offset,
+                end=range_end,
+                source="relations",
+            ),
+        ).to_dict()
+
+    return ArchiveInputDescriptor.from_parts(
         archive_path=group.head_path,
-        volumes=volumes,
+        part_paths=[group.head_path],
         format_hint=format_hint,
         logical_name=group.logical_name,
     ).to_dict()
