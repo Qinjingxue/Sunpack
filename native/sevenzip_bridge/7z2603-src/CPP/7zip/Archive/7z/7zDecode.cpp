@@ -12,6 +12,7 @@
 #include "../../Compress/Lzma2Decoder.h"
 
 #include "../../../../C/Bra.h"
+#include "../../../../C/CpuArch.h"
 #include "../../../../C/SwapBytes.h"
 #include "internal/positioned_output.hpp"
 
@@ -551,14 +552,14 @@ static HRESULT TryDecodeSimplePositionedFilter(
   }
   #endif
 
-  CMyComPtr2<ISequentialOutStream, CPositionedAlignedFilterOutStream>
-      filtered;
-  filtered.Create_if_Empty(
-      outStream,
-      folder.Coders[filterIndex].MethodID,
-      filterPc,
-      outSize);
-  if (!filtered->IsUsable())
+  CPositionedAlignedFilterOutStream *filteredSpec =
+      new CPositionedAlignedFilterOutStream(
+          outStream,
+          folder.Coders[filterIndex].MethodID,
+          filterPc,
+          outSize);
+  CMyComPtr<ISequentialOutStream> filtered = filteredSpec;
+  if (!filteredSpec->IsUsable())
     return E_NOTIMPL;
 
   const HRESULT hres = coder->Code(
@@ -566,7 +567,7 @@ static HRESULT TryDecodeSimplePositionedFilter(
   if (hres != S_OK)
     return hres;
 
-  return filtered->Finish();
+  return filteredSpec->Finish();
 }
 
 } // namespace
