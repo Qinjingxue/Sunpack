@@ -1,6 +1,6 @@
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.rename.scheduler import OutputReservationRegistry, RenameScheduler
-from sunpack.rename.conflicts import next_available_path
+from sunpack.support.output_paths import next_available_path
+from sunpack.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
 
 
 def test_detected_extensions_do_not_rename_source_files(tmp_path):
@@ -54,7 +54,7 @@ def test_output_dir_resolver_disambiguates_duplicate_task_outputs(tmp_path):
     def default_output_dir(task):
         return str(tmp_path / task.logical_name)
 
-    resolver = RenameScheduler().build_output_dir_resolver([first, second], default_output_dir)
+    resolver = build_output_dir_resolver([first, second], default_output_dir)
 
     assert resolver(first) == str(tmp_path / "collision")
     assert resolver(second) == str(tmp_path / "collision(1)")
@@ -76,7 +76,7 @@ def test_output_dir_resolver_avoids_existing_output_directory(tmp_path):
     (tmp_path / "photos(1)").mkdir()
     task = make_archive_task(archive, logical_name="photos", format_hint="zip")
 
-    resolver = RenameScheduler().build_output_dir_resolver([task], lambda item: str(tmp_path / item.logical_name))
+    resolver = build_output_dir_resolver([task], lambda item: str(tmp_path / item.logical_name))
 
     assert resolver(task) == str(tmp_path / "photos(2)")
 
@@ -87,12 +87,12 @@ def test_output_reservations_disambiguate_concurrent_requests_before_directories
     second_task = make_archive_task(tmp_path / "b.zip", format_hint="zip")
     default = lambda _task: str(tmp_path / "shared")
 
-    first = RenameScheduler(registry, "first").build_output_dir_resolver([first_task], default)
-    second = RenameScheduler(registry, "second").build_output_dir_resolver([second_task], default)
+    first = build_output_dir_resolver([first_task], default, reservation_registry=registry, owner="first")
+    second = build_output_dir_resolver([second_task], default, reservation_registry=registry, owner="second")
 
     assert first(first_task) == str(tmp_path / "shared")
     assert second(second_task) == str(tmp_path / "shared(1)")
     registry.release("first")
-    third = RenameScheduler(registry, "third").build_output_dir_resolver([first_task], default)
+    third = build_output_dir_resolver([first_task], default, reservation_registry=registry, owner="third")
     assert third(first_task) == str(tmp_path / "shared")
 

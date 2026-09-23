@@ -11,9 +11,8 @@ class PreflightResult:
 
 
 class PreExtractInspector:
-    def __init__(self, password_resolver, rename_scheduler, extraction_config: dict | None = None):
+    def __init__(self, password_resolver):
         self.password_resolver = password_resolver
-        self.rename_scheduler = rename_scheduler
 
     def inspect(self, task: ArchiveTask, output_dir: str) -> PreflightResult:
         # Relation only decides whether a validated proposal exists.  It does

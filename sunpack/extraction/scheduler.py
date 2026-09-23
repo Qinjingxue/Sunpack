@@ -9,7 +9,6 @@ from sunpack.extraction.internal.workflow.single_archive_extractor import Single
 from sunpack.extraction.internal.workflow.split_entry import SplitEntryResolver
 from sunpack.contracts.extraction import ExtractionResult
 from sunpack.contracts.tasks import ArchiveTask, SplitArchiveInfo
-from sunpack.rename.scheduler import RenameScheduler
 from sunpack.passwords import ArchivePasswordTester, PasswordResolver, PasswordSession, PasswordStore
 
 
@@ -35,7 +34,6 @@ class ExtractionScheduler:
         extraction_config = extraction_config if isinstance(extraction_config, dict) else {}
         self.metadata_scanner = ArchiveMetadataScanner(language=str(extraction_config.get("language") or "en"))
         self.seven_z_path = ""
-        self.rename_scheduler = RenameScheduler()
         self.split_entry_resolver = SplitEntryResolver()
         self.max_retries = max(1, max_retries)
         self.output_config = output_config if isinstance(output_config, dict) else None
@@ -75,11 +73,7 @@ class ExtractionScheduler:
         return default_output_dir_for_task(task, self.output_config)
 
     def inspect(self, task: ArchiveTask, out_dir: str):
-        return PreExtractInspector(
-            self.password_resolver,
-            self.rename_scheduler,
-            self.extraction_config,
-        ).inspect(task, out_dir)
+        return PreExtractInspector(self.password_resolver).inspect(task, out_dir)
 
     def extract(
         self,
@@ -140,7 +134,6 @@ class ExtractionScheduler:
             password_store=self.password_store,
             password_resolver=self.password_resolver,
             metadata_scanner=self.metadata_scanner,
-            rename_scheduler=self.rename_scheduler,
             retry_policy=self.retry_policy,
             split_entry_resolver=self.split_entry_resolver,
             sevenzip_runner=self.sevenzip_runner,

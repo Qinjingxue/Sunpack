@@ -18,16 +18,16 @@ def test_default_output_dir_avoids_existing_same_name_directory(tmp_path):
     archive.write_bytes(b"zip")
     (tmp_path / "sample").mkdir()
 
-    assert default_output_dir_for_task(_task(archive)) == str(tmp_path / "sample_extracted")
+    assert default_output_dir_for_task(_task(archive)) == str(tmp_path / "sample(1)")
 
 
 def test_default_output_dir_increments_when_extracted_directory_exists(tmp_path):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"zip")
     (tmp_path / "sample").mkdir()
-    (tmp_path / "sample_extracted").mkdir()
+    (tmp_path / "sample(1)").mkdir()
 
-    assert default_output_dir_for_task(_task(archive)) == str(tmp_path / "sample_extracted_2")
+    assert default_output_dir_for_task(_task(archive)) == str(tmp_path / "sample(2)")
 
 
 def test_default_output_dir_avoids_existing_same_name_file(tmp_path):
@@ -35,7 +35,7 @@ def test_default_output_dir_avoids_existing_same_name_file(tmp_path):
     archive.write_bytes(b"zip")
     (tmp_path / "sample").write_text("existing", encoding="utf-8")
 
-    assert default_output_dir_for_task(_task(archive)) == str(tmp_path / "sample_extracted")
+    assert default_output_dir_for_task(_task(archive)) == str(tmp_path / "sample(1)")
 
 
 def test_nested_archive_under_output_root_keeps_generated_parent(tmp_path):

@@ -30,7 +30,6 @@ coordinator
   -> extraction
   -> verification
   -> postprocess
-  -> rename
   -> contracts
 
 detection
@@ -56,7 +55,7 @@ postprocess
   -> contracts.RunContext
   -> postprocess internal actions
 
-filesystem / relations / rename
+filesystem / relations
   -> contracts
   -> sunpack_native narrow helpers
 
@@ -251,7 +250,6 @@ sunpack/
   passwords/    密码候选、调度和 verifier
   postprocess/  解压成功后的清理和扁平化
   relations/    文件关系、分卷和候选组
-  rename/       输出命名和临时分卷 staging
   support/      资源、JSON、缓存、7z.dll ABI 绑定等基础设施
   verification/ 解压结果校验流水线
 ```

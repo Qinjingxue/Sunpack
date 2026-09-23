@@ -25,7 +25,7 @@ from sunpack.i18n import I18nContext
 from sunpack.postprocess.actions import PostProcessActions
 from sunpack.passwords.internal.store import MAX_RECENT_PASSWORDS
 from sunpack.platform.windows.shell_notify import notify_shell_directories_updated
-from sunpack.rename.scheduler import OutputReservationRegistry, RenameScheduler
+from sunpack.support.output_reservation import OutputReservationRegistry
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.support.output_paths import default_output_dir_for_task
 from sunpack.support.path_keys import path_key
@@ -685,10 +685,6 @@ class _RequestRuntime:
         )
         self.output_scan_policy = NestedOutputScanPolicy(self.config)
         self.recursive_authorization = RecursiveAuthorization(self.config)
-        self.rename_scheduler = RenameScheduler(
-            services.output_reservations,
-            submission.request_id,
-        )
         performance = self.config.get("performance", {}) if isinstance(self.config.get("performance"), dict) else {}
         worker_config = dict(
             performance.get("worker", {})
@@ -716,8 +712,9 @@ class _RequestRuntime:
             self.context,
             self.extractor,
             self.output_scan_policy,
-            self.rename_scheduler,
             self.config,
+            output_reservations=services.output_reservations,
+            reservation_owner=submission.request_id,
             progress_reporter=self.reporter,
             request_id=submission.request_id,
             origin=submission.origin,

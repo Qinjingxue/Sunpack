@@ -30,7 +30,6 @@ coordinator
   -> extraction
   -> verification
   -> postprocess
-  -> rename
   -> contracts
 
 detection
@@ -45,7 +44,6 @@ analysis
 extraction
   -> contracts
   -> passwords
-  -> rename public API
   -> sevenzip worker
 
 verification
@@ -56,7 +54,7 @@ postprocess
   -> contracts.RunContext
   -> postprocess internal actions
 
-filesystem / relations / rename
+filesystem / relations
   -> contracts
   -> sunpack_native narrow helpers
 
@@ -165,7 +163,7 @@ Packages in the flow domains must not import `coordinator` in reverse. Detection
 
 ### support
 
-`support` holds resource lookup, JSON, caching, and path helpers. Do not stuff detection policy, output directory policy, password resolution, or cleanup policy into support.
+`support` holds cross-domain infrastructure such as resource lookup, JSON, caching, path helpers, and collision-free output path reservation. It may allocate output path names, but must not own extraction or post-processing policy.
 
 ### native
 
@@ -248,7 +246,6 @@ sunpack/
   passwords/    Password candidates, scheduling, and verifiers
   postprocess/  Cleanup and flattening after successful extraction
   relations/    File relationships, volumes, and candidate groups
-  rename/       Output naming and temporary volume staging
   support/      Infrastructure such as resources, JSON, caching, and 7z.dll ABI bindings
   verification/ Extraction result verification pipeline
 ```

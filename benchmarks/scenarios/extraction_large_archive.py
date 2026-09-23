@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sunpack.coordinator.engine import PipelineEngine
 import sunpack.coordinator.engine as engine_module
+import sunpack.coordinator.extraction_batch as extraction_batch_module
 import sunpack.analysis.engine as analysis_engine_module
 import sunpack.analysis.fuzzy_pipeline.modules.binary_profile as binary_profile_module
 import sunpack.analysis.structure_pipeline.modules.compression_streams as compression_streams_module
@@ -135,6 +136,11 @@ class RequestRuntimeProfiler:
             scan_session_module,
             "_native_batch_file_head_facts",
             "output_native_batch_file_head_facts",
+        )
+        self._install_global_callable(
+            extraction_batch_module,
+            "build_output_dir_resolver",
+            "batch_output_dir_resolver",
         )
         self._install_global_callable(
             analysis_engine_module,
@@ -386,7 +392,6 @@ class RequestRuntimeProfiler:
         ):
             _wrap(batch, name, timings, label)
         _wrap(_child(batch, "relation_stage"), "resolve_tasks", timings, "batch_relation_resolve")
-        _wrap(runtime.rename_scheduler, "build_output_dir_resolver", timings, "batch_output_dir_resolver")
         password_contexts = _child(batch, "directory_password_contexts")
         _wrap(password_contexts, "annotate", timings, "batch_directory_password_annotate")
         _wrap(password_contexts, "remember", timings, "batch_directory_password_remember")

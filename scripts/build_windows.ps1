@@ -1082,7 +1082,6 @@ Write-Step "Building Windows release with Nuitka"
     "sunpack.analysis.fuzzy_pipeline.modules",
     "sunpack.passwords.candidates",
         "sunpack.extraction.internal",
-        "sunpack.rename.internal",
         "sunpack.relations.internal",
         "sunpack.postprocess.internal",
         "sunpack.verification.methods"
