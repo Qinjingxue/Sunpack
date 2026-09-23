@@ -30,6 +30,11 @@ inline RandomAccessInStream *random_access_in_stream(IInStream *stream) noexcept
     return dynamic_cast<RandomAccessInStream *>(stream);
 }
 
+inline RandomAccessInStream *random_access_in_stream(ISequentialInStream *stream) noexcept
+{
+    return dynamic_cast<RandomAccessInStream *>(stream);
+}
+
 class PositionedOutStream
 {
 public:
