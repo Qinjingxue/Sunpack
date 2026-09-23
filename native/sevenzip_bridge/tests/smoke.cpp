@@ -7,6 +7,7 @@
 #include "internal/native_cpu_budget.hpp"
 #include "internal/decoder_cpu_budget.h"
 #include "internal/native_worker_sizing.hpp"
+#include "internal/sevenzip_streams.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -40,6 +41,79 @@ bool check_numbered_volume_paths() {
     return seven_zip_sorted.size() == 2 &&
         std::filesystem::path(seven_zip_sorted[0]).filename() == L"payload.7z.001" &&
         std::filesystem::path(seven_zip_sorted[1]).filename() == L"payload.7z.002";
+}
+
+bool check_mapped_random_access_inputs() {
+    using namespace sunpack::sevenzip;
+
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-random-access-" + std::to_wstring(GetCurrentProcessId()) +
+         L"-" + std::to_wstring(GetTickCount64()));
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    error.clear();
+    std::filesystem::create_directories(root, error);
+    if (error) {
+        return false;
+    }
+
+    const auto first = root / L"part-1.bin";
+    const auto second = root / L"part-2.bin";
+    {
+        std::ofstream stream(first, std::ios::binary | std::ios::trunc);
+        stream.write("abcd", 4);
+    }
+    {
+        std::ofstream stream(second, std::ios::binary | std::ios::trunc);
+        stream.write("EFGH", 4);
+    }
+
+    bool ok = true;
+    InputPrefetchConfig no_prefetch;
+    no_prefetch.enabled = false;
+
+    {
+        auto *stream_spec = new MultiFileInStream(
+            {first.wstring(), second.wstring()}, nullptr, no_prefetch);
+        CMyComPtr<IInStream> stream = stream_spec;
+        auto reader = stream_spec->open_random_reader();
+
+        char data[6] = {};
+        UInt32 processed = 0;
+        ok = stream_spec->is_open() && reader &&
+            reader->read_at(2, data, sizeof(data), &processed) == S_OK &&
+            processed == sizeof(data) &&
+            std::string(data, data + sizeof(data)) == "cdEFGH";
+    }
+
+    if (ok) {
+        ExtractInputRange first_range;
+        first_range.path = first.wstring();
+        first_range.start = 1;
+        first_range.end = 4;
+        first_range.has_end = true;
+
+        ExtractInputRange second_range;
+        second_range.path = second.wstring();
+        second_range.start = 0;
+        second_range.end = 3;
+        second_range.has_end = true;
+
+        auto *stream_spec = new MultiRangeInStream(
+            {first_range, second_range}, nullptr, no_prefetch);
+        CMyComPtr<IInStream> stream = stream_spec;
+        auto reader = stream_spec->open_random_reader();
+
+        char data[4] = {};
+        UInt32 processed = 0;
+        ok = stream_spec->is_open() && reader &&
+            reader->read_at(2, data, sizeof(data), &processed) == S_OK &&
+            processed == sizeof(data) &&
+            std::string(data, data + sizeof(data)) == "dEFG";
+    }
+
+    std::filesystem::remove_all(root, error);
+    return ok;
 }
 
 bool check_extraction_handler_selection_is_read_free() {
@@ -465,6 +539,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_numbered_volume_paths()) {
         std::cerr << "numbered volume path check failed\n";
         return 2;
+    }
+    if (!check_mapped_random_access_inputs()) {
+        std::cerr << "mapped random-access input check failed\n";
+        return 34;
     }
     if (!check_wrong_password_evidence()) {
         std::cerr << "wrong password evidence check failed\n";
