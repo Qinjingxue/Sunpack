@@ -138,6 +138,62 @@ bool check_cpu_budget_accounts_base_and_decoder_credits() {
     return budget.reserved_credits() == 0;
 }
 
+struct CpuBudgetCallbackProbe {
+    std::size_t calls = 0;
+
+    static void on_available(void* context) noexcept {
+        auto* probe = static_cast<CpuBudgetCallbackProbe*>(context);
+        if (probe) {
+            ++probe->calls;
+        }
+    }
+};
+
+bool check_cpu_budget_notifies_only_availability_edges() {
+    using namespace sunpack::sevenzip;
+
+    CpuBudgetCallbackProbe probe;
+    NativeCpuBudget budget(
+        4,
+        &CpuBudgetCallbackProbe::on_available,
+        &probe);
+
+    if (budget.acquire_up_to(4, 4) != 4 || probe.calls != 0) {
+        return false;
+    }
+
+    // Saturated -> available wakes exactly once.
+    budget.release(1);
+    if (probe.calls != 1 || budget.reserved_credits() != 3) {
+        return false;
+    }
+
+    // Already-available releases do not create redundant wakeups.
+    budget.release(1);
+    if (probe.calls != 1 || budget.reserved_credits() != 2) {
+        return false;
+    }
+
+    // Re-saturate, shrink capacity, and release while still saturated.
+    if (budget.acquire_up_to(2, 2) != 2) {
+        return false;
+    }
+    budget.set_effective_capacity(2);
+    budget.release(2);
+    if (probe.calls != 1 || budget.reserved_credits() != 2) {
+        return false;
+    }
+
+    // Raising the cap from saturated to available is also one edge.
+    budget.set_effective_capacity(4);
+    if (probe.calls != 2) {
+        return false;
+    }
+
+    budget.release(2);
+    return probe.calls == 2 && budget.reserved_credits() == 0;
+}
+
 bool check_cpu_budget_honors_effective_capacity() {
     using namespace sunpack::sevenzip;
     NativeCpuBudget budget(8);
@@ -433,6 +489,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_cpu_budget_honors_effective_capacity()) {
         std::cerr << "CPU credit effective-capacity check failed\n";
         return 22;
+    }
+    if (!check_cpu_budget_notifies_only_availability_edges()) {
+        std::cerr << "CPU credit availability-edge callback check failed\n";
+        return 33;
     }
     if (!check_cpu_budget_tracks_decoder_thread_lifetimes()) {
         std::cerr << "CPU decoder-thread lifetime credit check failed\n";
