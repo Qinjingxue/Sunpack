@@ -117,8 +117,8 @@ class DirectorySnapshot:
             self._raw_native_snapshot,
         )
 
-    def file_routing_rows(self) -> Iterator[tuple[str, int | None, str, str, int]]:
-        paths, sizes, routes, formats, reject_masks = self._native_snapshot.file_routing_columns()
+    def non_relation_file_routing_rows(self) -> Iterator[tuple[str, int | None, str, str, int]]:
+        paths, sizes, routes, formats, reject_masks = self._native_snapshot.non_relation_file_routing_columns()
         return iter(zip(
             paths,
             sizes,
