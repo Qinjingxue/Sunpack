@@ -1,10 +1,9 @@
 from sunpack.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
 from sunpack.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask, SplitArchiveInfo
 from sunpack.coordinator.task_scan import direct_file_task
 from sunpack.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.support import archive_knowledge_projection as knowledge_view
+from tests.helpers.archive_tasks import make_archive_task
 
 
 class _FakeAnalyzer:
@@ -20,11 +19,7 @@ class _FakeAnalyzer:
 def _task(path, *, parts=None, volumes=None):
     if parts and len(parts) > 1:
         return direct_file_task(str(path), all_parts=[str(item) for item in parts])
-    descriptor = ArchiveInputDescriptor.from_parts(archive_path=str(path), logical_name="case")
-    return ArchiveTask(
-        fact_bag=FactBag(), main_path=str(path), all_parts=[str(path)], logical_name="case",
-        split_info=SplitArchiveInfo(archive_input=descriptor),
-    )
+    return make_archive_task(path, logical_name="case")
 
 
 def _report(path, evidence, *, prepass=None):
@@ -67,8 +62,8 @@ def test_input_planning_stage_writes_extractable_segment_without_switching_task_
 
     stage.plan_task(task)
 
-    assert task.fact_bag.get("archive.format_hint") == "zip"
-    assert task.fact_bag.get("source.segment")["start_offset"] == 4
+    assert task.archive_input().format_hint == "zip"
+    assert knowledge_view.source_selected_segment(task)["segment"]["start_offset"] == 4
     segments = knowledge_view.source_extractable_segments(task)
     assert len(segments) == 1
     assert segments[0]["archive_input"] == {
@@ -83,9 +78,9 @@ def test_input_planning_stage_writes_extractable_segment_without_switching_task_
     }
     assert task.archive_input().open_mode == "file"
     assert task.archive_input().format_hint == "zip"
-    state = task.fact_bag.get("archive.state")
-    assert state["source"]["open_mode"] == "file"
-    assert state["source"]["format_hint"] == "zip"
+    state = task.archive_state()
+    assert state.source.open_mode == "file"
+    assert state.source.format_hint == "zip"
 
 
 def test_input_planning_stage_keeps_sfx_segment_for_standard_archive_extension(tmp_path):
@@ -145,7 +140,7 @@ def test_input_planning_stage_does_not_treat_native_zip_recovery_fragments_as_em
 
     stage.plan_task(task)
 
-    assert task.fact_bag.get("archive.format_hint") == "zip"
+    assert task.archive_input().format_hint == "zip"
     assert knowledge_view.source_extractable_segments(task) == []
 
 
@@ -196,7 +191,7 @@ def test_input_planning_stage_records_multiple_segments_on_original_task(tmp_pat
     tasks = stage.plan_tasks([task])
 
     assert tasks == [task]
-    assert task.fact_bag.get("archive.format_hint") == "rar"
+    assert task.archive_input().format_hint == "rar"
     segments = knowledge_view.source_extractable_segments(task)
     assert [item["logical_name"] for item in segments] == ["case_01_rar", "case_02_7z"]
     assert segments[0]["archive_input"] == {
@@ -233,9 +228,9 @@ def test_input_planning_stage_reuses_batch_report_for_equivalent_inputs(tmp_path
 
     assert tasks == [first, second]
     assert stage.analyzer.calls == 1
-    assert first.fact_bag.get("archive.format_hint") == "zip"
-    assert second.fact_bag.get("archive.format_hint") == "zip"
-    assert second.fact_bag.get("input_planning.cache_hits") == 2
+    assert first.archive_input().format_hint == "zip"
+    assert second.archive_input().format_hint == "zip"
+    assert second.archive_state().analysis["cache_hits"] == 2
 
 
 def test_input_planning_stage_does_not_treat_primary_multipart_archive_as_embedded_segment(tmp_path):
@@ -256,7 +251,7 @@ def test_input_planning_stage_does_not_treat_primary_multipart_archive_as_embedd
 
     stage.plan_task(task)
 
-    assert task.fact_bag.get("archive.format_hint") == "7z"
+    assert task.archive_input().format_hint == "7z"
     assert knowledge_view.source_extractable_segments(task) == []
 
 
@@ -283,7 +278,7 @@ def test_input_planning_stage_prefers_compressed_tar_over_stream_for_same_range(
     tasks = stage.plan_tasks([task])
 
     assert tasks == [task]
-    assert task.fact_bag.get("archive.format_hint") == "tar.gz"
+    assert task.archive_input().format_hint == "tar.gz"
 
 
 def test_input_planning_stage_suppresses_inner_tar_shadowed_by_whole_compressed_tar(tmp_path):
@@ -317,7 +312,7 @@ def test_input_planning_stage_suppresses_inner_tar_shadowed_by_whole_compressed_
     tasks = stage.plan_tasks([task])
 
     assert tasks == [task]
-    assert task.fact_bag.get("archive.format_hint") == "tar.zst"
+    assert task.archive_input().format_hint == "tar.zst"
     assert knowledge_view.source_extractable_segments(task) == []
 
 
@@ -345,7 +340,7 @@ def test_input_planning_stage_uses_range_input_for_embedded_password_required_ar
 
     stage.plan_task(task)
 
-    assert task.fact_bag.get("archive.format_hint") == "rar"
+    assert task.archive_input().format_hint == "rar"
     segments = knowledge_view.source_extractable_segments(task)
     assert len(segments) == 1
     assert segments[0]["archive_input"] == {
@@ -475,5 +470,4 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
         "segment": {"start": 8, "source": "analysis", "end": 24, "confidence": 0.97},
         "analysis": {"status": "extractable", "confidence": 0.97, "damage_flags": []},
     }
-    state = task.fact_bag.get("archive.state")
-    assert state["source"]["open_mode"] == "native_volumes"
+    assert task.archive_state().source.open_mode == "native_volumes"
