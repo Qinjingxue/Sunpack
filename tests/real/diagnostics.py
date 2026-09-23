@@ -13,13 +13,13 @@ from typing import Any, Iterable
 
 
 _MAX_SNAPSHOT_ENTRIES = 2048
-_FACT_KEYS = (
-    "candidate.",
-    "file.",
-    "relation.",
-    "archive.input",
-    "archive.state",
-    "archive.source",
+_KNOWLEDGE_ROOTS = (
+    "source",
+    "relations",
+    "inspection",
+    "format",
+    "verification",
+    "extraction",
 )
 
 
@@ -201,13 +201,20 @@ def case_snapshot(case: Any) -> dict[str, Any]:
 
 
 def task_snapshot(task: Any) -> dict[str, Any]:
-    fact_bag = getattr(task, "fact_bag", None)
-    raw_facts = fact_bag.to_dict() if fact_bag is not None else {}
-    selected_facts = {
+    archive_input_fn = getattr(task, "archive_input", None)
+    archive_state_fn = getattr(task, "archive_state", None)
+    knowledge_fn = getattr(task, "knowledge", None)
+
+    archive_input = archive_input_fn() if callable(archive_input_fn) else None
+    archive_state = archive_state_fn() if callable(archive_state_fn) else None
+    knowledge = knowledge_fn() if callable(knowledge_fn) else None
+    knowledge_payload = knowledge.to_dict() if hasattr(knowledge, "to_dict") else {}
+    selected_knowledge = {
         key: value
-        for key, value in raw_facts.items()
-        if key.startswith(_FACT_KEYS)
+        for key, value in knowledge_payload.items()
+        if key in _KNOWLEDGE_ROOTS or key.startswith("_")
     }
+
     split_info = getattr(task, "split_info", None)
     return {
         "main_path": getattr(task, "main_path", ""),
@@ -216,11 +223,17 @@ def task_snapshot(task: Any) -> dict[str, Any]:
         "carrier_path": getattr(task, "carrier_path", ""),
         "logical_name": getattr(task, "logical_name", ""),
         "key": getattr(task, "key", ""),
-        "score": getattr(task, "score", None),
-        "decision": getattr(task, "decision", ""),
-        "detected_ext": getattr(task, "detected_ext", ""),
+        "format": getattr(archive_input, "format_hint", "") if archive_input is not None else "",
+        "discovery_source": getattr(task, "discovery_source", ""),
+        "discovery_reason": getattr(task, "discovery_reason", ""),
+        "relation_kind": getattr(task, "relation_kind", ""),
         "split_info": jsonable(split_info),
-        "facts": jsonable(selected_facts),
+        "archive_input": jsonable(archive_input),
+        "archive_state": jsonable(archive_state),
+        "discovery_evidence": jsonable(getattr(task, "discovery_evidence", {})),
+        "discovery_segments": jsonable(getattr(task, "discovery_segments", ())),
+        "knowledge": jsonable(selected_knowledge),
+        "runtime": jsonable(getattr(task, "runtime", {})),
     }
 
 
