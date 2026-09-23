@@ -147,6 +147,11 @@ NativeCpuJobContext::NativeCpuJobContext(
 
 NativeCpuJobContext::~NativeCpuJobContext()
 {
+    // Most jobs never borrow an internal decoder credit. Avoid an atomic RMW
+    // on that overwhelmingly common zero-balance path.
+    if (current_extra_.load(std::memory_order_relaxed) == 0)
+        return;
+
     const std::size_t remaining =
         current_extra_.exchange(0, std::memory_order_relaxed);
     if (remaining != 0 && budget_)
