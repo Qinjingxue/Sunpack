@@ -60,7 +60,8 @@ typedef struct
   
   Byte *outBuf;
   size_t outBufSize;
-  BoolInt ownsDic;
+  Byte *dictBuf;
+  size_t dictBufSize;
   UInt64 outStart;
 
   EMtDecParseState state;
@@ -155,7 +156,8 @@ CLzma2DecMtHandle Lzma2DecMt_Create(ISzAllocPtr alloc, ISzAllocPtr allocMid)
       t->dec_created = False;
       t->outBuf = NULL;
       t->outBufSize = 0;
-      t->ownsDic = False;
+      t->dictBuf = NULL;
+      t->dictBufSize = 0;
       t->outStart = 0;
     }
   }
@@ -178,6 +180,12 @@ static void Lzma2DecMt_FreeOutBufs(CLzma2DecMt *p)
       ISzAlloc_Free(p->allocMid, t->outBuf);
       t->outBuf = NULL;
       t->outBufSize = 0;
+    }
+    if (t->dictBuf)
+    {
+      ISzAlloc_Free(p->allocMid, t->dictBuf);
+      t->dictBuf = NULL;
+      t->dictBufSize = 0;
     }
   }
 }
@@ -223,11 +231,9 @@ void Lzma2DecMt_Destroy(CLzma2DecMtHandle p)
       CLzma2DecMtThread *t = &p->coders[i];
       if (t->dec_created)
       {
-        if (t->ownsDic)
-          Lzma2Dec_Free(&t->dec, &t->alloc.vt);
-        else
-          Lzma2Dec_FreeProbs(&t->dec, &t->alloc.vt);
-        t->ownsDic = False;
+        Lzma2Dec_FreeProbs(&t->dec, &t->alloc.vt);
+        t->dec.decoder.dic = NULL;
+        t->dec.decoder.dicBufSize = 0;
         t->dec_created = False;
       }
     }
@@ -436,6 +442,11 @@ static SRes Lzma2DecMt_MtCallback_PreCode(void *pp, unsigned coderIndex)
 
   if (me->positionedOutStream)
   {
+    SRes res;
+    UInt32 dictSize;
+    size_t dictBufSize;
+    size_t mask;
+
     if (t->outBuf)
     {
       ISzAlloc_Free(me->allocMid, t->outBuf);
@@ -443,26 +454,49 @@ static SRes Lzma2DecMt_MtCallback_PreCode(void *pp, unsigned coderIndex)
       t->outBufSize = 0;
     }
 
-    if (!t->ownsDic)
+    res = Lzma2Dec_AllocateProbs(&t->dec, me->prop, &t->alloc.vt);
+    if (res != SZ_OK)
+      return res;
+
+    dictSize = t->dec.decoder.prop.dicSize;
+    mask = ((size_t)1 << 12) - 1;
+    if (dictSize >= ((UInt32)1 << 30))
+      mask = ((size_t)1 << 22) - 1;
+    else if (dictSize >= ((UInt32)1 << 22))
+      mask = ((size_t)1 << 20) - 1;
+    dictBufSize = ((size_t)dictSize + mask) & ~mask;
+    if (dictBufSize < dictSize)
+      dictBufSize = dictSize;
+
+    if (!t->dictBuf || t->dictBufSize != dictBufSize)
     {
-      Lzma2Dec_FreeProbs(&t->dec, &t->alloc.vt);
-      t->dec.decoder.dic = NULL;
-      t->dec.decoder.dicBufSize = 0;
-      t->ownsDic = True;
+      if (t->dictBuf)
+        ISzAlloc_Free(me->allocMid, t->dictBuf);
+      t->dictBuf = (Byte *)ISzAlloc_Alloc(me->allocMid, dictBufSize);
+      if (!t->dictBuf)
+      {
+        t->dictBufSize = 0;
+        return SZ_ERROR_MEM;
+      }
+      t->dictBufSize = dictBufSize;
     }
 
+    t->dec.decoder.dic = t->dictBuf;
+    t->dec.decoder.dicBufSize = (SizeT)t->dictBufSize;
     t->needInit = True;
-    return Lzma2Dec_Allocate(&t->dec, me->prop, &t->alloc.vt);
+    return SZ_OK;
   }
   else
   {
     Byte *dest;
 
-    if (t->ownsDic)
+    if (t->dictBuf)
     {
-      Lzma2Dec_Free(&t->dec, &t->alloc.vt);
-      Lzma2Dec_CONSTRUCT(&t->dec)
-      t->ownsDic = False;
+      ISzAlloc_Free(me->allocMid, t->dictBuf);
+      t->dictBuf = NULL;
+      t->dictBufSize = 0;
+      t->dec.decoder.dic = NULL;
+      t->dec.decoder.dicBufSize = 0;
     }
 
     dest = t->outBuf;
