@@ -965,10 +965,21 @@ struct CParallelBlockJob
 
 class CParallelBlockPool
 {
+public:
+  struct CSnapshot
+  {
+    size_t Queued;
+    unsigned Running;
+    unsigned ActiveWorkers;
+  };
+
+private:
   std::vector<std::thread> _threads;
   std::deque<CParallelBlockJob *> _queue;
   std::mutex _mutex;
   std::condition_variable _workEvent;
+  unsigned _activeWorkers;
+  unsigned _runningWorkers;
   bool _stop;
 
   void WorkerLoop()
@@ -978,36 +989,79 @@ class CParallelBlockPool
       CParallelBlockJob *job = NULL;
       {
         std::unique_lock<std::mutex> lock(_mutex);
-        _workEvent.wait(lock, [this] { return _stop || !_queue.empty(); });
+        _workEvent.wait(lock, [this]
+                        {
+                          return _stop ||
+                              (!_queue.empty() &&
+                               _runningWorkers < _activeWorkers);
+                        });
         if (_stop && _queue.empty())
           return;
+        if (_queue.empty())
+          continue;
+        if (!_stop && _runningWorkers >= _activeWorkers)
+          continue;
+
         job = _queue.front();
         _queue.pop_front();
+        ++_runningWorkers;
       }
 
       job->Process();
+
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_runningWorkers != 0)
+          --_runningWorkers;
+        if (!_queue.empty() &&
+            (_stop || _runningWorkers < _activeWorkers))
+          _workEvent.notify_one();
+      }
     }
   }
 
 public:
-  CParallelBlockPool(): _stop(false) {}
+  CParallelBlockPool()
+      : _activeWorkers(0),
+        _runningWorkers(0),
+        _stop(false)
+  {
+  }
 
   ~CParallelBlockPool()
   {
     Stop();
   }
 
-  bool AddWorker()
+  bool EnsureWorkerCount(unsigned numWorkers)
   {
     try
     {
-      _threads.emplace_back([this] { WorkerLoop(); });
+      _threads.reserve(numWorkers);
+      while (_threads.size() < numWorkers)
+        _threads.emplace_back([this] { WorkerLoop(); });
     }
     catch (...)
     {
       return false;
     }
     return true;
+  }
+
+  void SetActiveWorkers(unsigned numWorkers)
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _activeWorkers =
+          (std::min)(numWorkers, (unsigned)_threads.size());
+    }
+    _workEvent.notify_all();
+  }
+
+  CSnapshot Snapshot()
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    return { _queue.size(), _runningWorkers, _activeWorkers };
   }
 
   void Stop()
@@ -1461,6 +1515,7 @@ HRESULT CDecoder::DecodeStreams(ICompressProgressInfo *progress)
 HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 {
   static const unsigned kMaxBZip2ParallelWorkers = 12;
+  static const unsigned kBZip2ReadyBlocksPerWorker = 2;
 
   void *cpuContext = sunpack_cpu_current_job_context();
   const unsigned maxWorkers = cpuContext
@@ -1472,38 +1527,16 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
   if (maxWorkers == 0)
     return DecodeStreams(progress);
 
-  // Start with one real parallel block worker. Additional workers are added
-  // only when the current in-flight block set is still keeping every existing
-  // worker busy, up to the algorithm-specific speed cap.
-  unsigned initialCredit = 1;
-  if (cpuContext)
-    initialCredit =
-        sunpack_cpu_acquire_extra_for_context(cpuContext, 1, 1);
-  if (initialCredit == 0)
-    return DecodeStreams(progress);
-
-  struct CSunPackCpuCreditReleaser
-  {
-    void *Context;
-    unsigned Credits;
-    ~CSunPackCpuCreditReleaser()
-    {
-      if (Context && Credits)
-        sunpack_cpu_release_extra_for_context(Context, Credits);
-    }
-  } cpuCredits = { cpuContext, cpuContext ? initialCredit : 0 };
-
   RINOK(StartRead())
 
-  // The ring keeps ordered-retire state bounded by the maximum useful worker
-  // width. CPU credits and threads themselves are acquired lazily below.
-  const size_t ringSize = maxWorkers;
+  // Parsing is deliberately allowed to run ahead of the current active
+  // worker width. That makes the ready queue, rather than ordered retirement,
+  // the authoritative signal for useful decoder parallelism.
+  const size_t ringSize =
+      (size_t)maxWorkers * kBZip2ReadyBlocksPerWorker;
   std::vector<std::unique_ptr<CParallelBlockJob>> ring;
   try
   {
-    // Slots are fixed so sequence-to-slot mapping stays stable while the
-    // worker width grows. Allocate the multi-megabyte block workspace only
-    // when a slot is actually reached.
     ring.resize(ringSize);
   }
   catch (const std::bad_alloc &)
@@ -1512,9 +1545,71 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
   }
 
   CParallelBlockPool pool;
-  if (!pool.AddWorker())
-    return E_FAIL;
-  unsigned numWorkers = 1;
+
+  struct CParallelSession
+  {
+    CParallelBlockPool &Pool;
+    void *CpuContext;
+    unsigned Credits;
+    unsigned ActiveWorkers;
+
+    CParallelSession(CParallelBlockPool &pool, void *cpuContext)
+        : Pool(pool),
+          CpuContext(cpuContext),
+          Credits(0),
+          ActiveWorkers(0)
+    {
+    }
+
+    ~CParallelSession()
+    {
+      Pool.SetActiveWorkers(0);
+      if (CpuContext && Credits)
+        sunpack_cpu_release_extra_for_context(
+            CpuContext, Credits);
+    }
+  } session(pool, cpuContext);
+
+  auto scaleToReadyCount = [&](size_t readyCount) -> bool
+  {
+    const unsigned target =
+        (unsigned)(std::min<size_t>(readyCount, maxWorkers));
+    if (target <= session.ActiveWorkers)
+      return true;
+
+    const unsigned wanted = target - session.ActiveWorkers;
+    unsigned granted = wanted;
+    if (cpuContext)
+      granted =
+          sunpack_cpu_acquire_extra_for_context(
+              cpuContext, wanted, 1);
+    if (granted == 0)
+      return true;
+
+    const unsigned nextWorkers =
+        session.ActiveWorkers + granted;
+    if (!pool.EnsureWorkerCount(nextWorkers))
+    {
+      if (cpuContext)
+        sunpack_cpu_release_extra_for_context(
+            cpuContext, granted);
+      return false;
+    }
+
+    session.ActiveWorkers = nextWorkers;
+    if (cpuContext)
+      session.Credits += granted;
+    pool.SetActiveWorkers(session.ActiveWorkers);
+    return true;
+  };
+
+  auto scaleFromReadyQueue = [&]() -> bool
+  {
+    const CParallelBlockPool::CSnapshot snapshot =
+        pool.Snapshot();
+    return scaleToReadyCount(
+        snapshot.Queued + snapshot.Running);
+  };
 
   struct CCountersRestore
   {
@@ -1523,10 +1618,12 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
     ~CCountersRestore() { BaseRef.Counters = Counters; }
   } countersRestore = { Base, _counters };
 
-  UInt64 submitted = 0;
+  UInt64 prepared = 0;
   UInt64 retired = 0;
   UInt64 inPrev = 0;
   UInt64 outPrev = 0;
+  CParallelBlockJob *stagedJob = NULL;
+  bool parallelActive = false;
 
   auto retireOne = [&](CParallelBlockJob &job) -> HRESULT
   {
@@ -1539,7 +1636,8 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       if (chunk.Size == 0)
         continue;
 
-      const HRESULT writeRes = WriteStream(_outStream, chunk.Data.get(), chunk.Size);
+      const HRESULT writeRes =
+          WriteStream(_outStream, chunk.Data.get(), chunk.Size);
       _outWritten += chunk.Size;
       _outPosTotal += chunk.Size;
       if (writeRes != S_OK)
@@ -1551,9 +1649,11 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       if (progress)
       {
         const UInt64 outCur = GetOutProcessedSize();
-        if (job.PackPos - inPrev >= kProgressStep || outCur - outPrev >= kProgressStep)
+        if (job.PackPos - inPrev >= kProgressStep ||
+            outCur - outPrev >= kProgressStep)
         {
-          RINOK(progress->SetRatioInfo(&job.PackPos, &outCur))
+          RINOK(progress->SetRatioInfo(
+              &job.PackPos, &outCur))
           inPrev = job.PackPos;
           outPrev = outCur;
         }
@@ -1575,50 +1675,14 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
   while (!parserDone && retireRes == S_OK)
   {
-    // Grow only when all current workers have outstanding work and the
-    // oldest block is still running. If the workers are already keeping up,
-    // retire completed work instead of consuming another CPU credit.
-    if (submitted - retired >= numWorkers)
+    // The lookahead window is tied to the algorithm cap, not the current
+    // worker count. Only a full ring forces ordered retirement.
+    if (prepared - retired >= ringSize)
     {
       CParallelBlockJob &oldest =
           *ring[(size_t)(retired % ringSize)];
-
-      if (oldest.IsDone())
-      {
-        retireRes = retireOne(oldest);
-        retired++;
-        continue;
-      }
-
-      bool grew = false;
-      if (numWorkers < maxWorkers)
-      {
-        unsigned granted = 1;
-        if (cpuContext)
-          granted =
-              sunpack_cpu_acquire_extra_for_context(cpuContext, 1, 1);
-
-        if (granted != 0)
-        {
-          if (pool.AddWorker())
-          {
-            numWorkers++;
-            if (cpuContext)
-              cpuCredits.Credits += granted;
-            grew = true;
-          }
-          else if (cpuContext)
-          {
-            sunpack_cpu_release_extra_for_context(cpuContext, granted);
-          }
-        }
-      }
-
-      if (!grew)
-      {
-        retireRes = retireOne(oldest);
-        retired++;
-      }
+      retireRes = retireOne(oldest);
+      retired++;
       continue;
     }
 
@@ -1661,7 +1725,7 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
     }
 
     std::unique_ptr<CParallelBlockJob> &jobSlot =
-        ring[(size_t)(submitted % ringSize)];
+        ring[(size_t)(prepared % ringSize)];
     if (!jobSlot)
     {
       try
@@ -1677,7 +1741,7 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
     }
 
     CParallelBlockJob &job = *jobSlot;
-    job.Reset(submitted);
+    job.Reset(prepared);
 
     Base.Counters = job.Counters;
     job.ExpectedCrc = Base.crc;
@@ -1689,17 +1753,63 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
     job.Props = Base.Props;
     job.PackPos = GetInputProcessedSize();
+    prepared++;
 
-    pool.Submit(&job);
-    submitted++;
+    if (!parallelActive)
+    {
+      if (!stagedJob)
+      {
+        // Keep the first ready block on the caller until a second block
+        // proves that useful block-level parallelism actually exists.
+        stagedJob = &job;
+        continue;
+      }
+
+      if (!scaleToReadyCount(2))
+        return E_FAIL;
+
+      if (session.ActiveWorkers == 0)
+      {
+        // No extra CPU lane is currently available. Make forward progress on
+        // the caller and keep one-block lookahead without reserving a credit.
+        stagedJob->Process();
+        retireRes = retireOne(*stagedJob);
+        if (retireRes != S_OK)
+          break;
+        retired++;
+        stagedJob = &job;
+        continue;
+      }
+
+      pool.Submit(stagedJob);
+      pool.Submit(&job);
+      stagedJob = NULL;
+      parallelActive = true;
+      if (!scaleFromReadyQueue())
+        return E_FAIL;
+    }
+    else
+    {
+      pool.Submit(&job);
+      if (!scaleFromReadyQueue())
+        return E_FAIL;
+    }
   }
 
-  // A parser error can be discovered after earlier blocks were already
-  // submitted. Match the serial decoder: publish those earlier blocks first,
-  // but stop at the first ordered block/write failure.
-  while (retireRes == S_OK && retired < submitted)
+  // A parser error can be discovered after earlier blocks were prepared.
+  // Publish all valid earlier blocks in order, matching the serial decoder.
+  if (stagedJob && retireRes == S_OK)
   {
-    CParallelBlockJob &job = *ring[(size_t)(retired % ringSize)];
+    stagedJob->Process();
+    retireRes = retireOne(*stagedJob);
+    retired++;
+    stagedJob = NULL;
+  }
+
+  while (retireRes == S_OK && retired < prepared)
+  {
+    CParallelBlockJob &job =
+        *ring[(size_t)(retired % ringSize)];
     retireRes = retireOne(job);
     retired++;
   }
