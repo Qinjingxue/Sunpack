@@ -42,6 +42,10 @@ def test_watch_layer_does_not_import_archive_discovery_internals():
     assert all(token not in source for token in forbidden)
 
 
-def test_filesystem_has_no_legacy_watch_namespace():
+def test_watch_namespace_is_runtime_only():
     project_root = Path(__file__).resolve().parents[2]
+    assert (project_root / "sunpack" / "runtime" / "watch").is_dir()
     assert not (project_root / "sunpack" / "filesystem" / "watcher").exists()
+    assert not (
+        project_root / "sunpack" / "pipeline" / "discovery" / "filesystem" / "watcher"
+    ).exists()
