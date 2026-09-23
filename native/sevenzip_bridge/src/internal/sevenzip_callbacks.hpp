@@ -698,7 +698,7 @@ namespace sunpack::sevenzip
         return normalized;
     }
 
-    class ExtractToDiskCallback final : public CMyUnknownImp, public IArchiveExtractCallback, public ICryptoGetTextPassword
+    class ExtractToDiskCallback final : public CMyUnknownImp, public IArchiveExtractCallback, public ICryptoGetTextPassword, public PositionedExtractCallback
     {
         Z7_COM_UNKNOWN_IMP_3(IArchiveExtractCallback, IProgress, ICryptoGetTextPassword)
         
@@ -788,6 +788,98 @@ namespace sunpack::sevenzip
         bool output_error() const { return output_error_; }
 
         bool output_root_initially_empty() const { return output_root_initially_empty_; }
+
+        bool positioned_extract_available() const noexcept override
+        {
+            return !dry_run_ && async_writer_ != nullptr;
+        }
+
+        HRESULT get_positioned_stream(
+            UInt32 index,
+            ISequentialOutStream **stream,
+            Int32 ask_mode) noexcept override
+        {
+            if (!positioned_extract_available())
+                return E_NOTIMPL;
+
+            const HRESULT hr = GetStream(index, stream, ask_mode);
+            if (hr != S_OK)
+                return hr;
+
+            std::lock_guard<std::recursive_mutex> lock(state_mutex_);
+            PositionedItemState state;
+            state.async_file = current_async_file_;
+            state.trace_index = current_trace_index_;
+            state.item = current_item_;
+            state.is_dir = current_item_is_dir_;
+            state.trace_active = current_trace_active_;
+            positioned_items_[index] = std::move(state);
+            return S_OK;
+        }
+
+        HRESULT set_positioned_operation_result(
+            UInt32 index,
+            Int32 opRes) noexcept override
+        {
+            std::lock_guard<std::recursive_mutex> lock(state_mutex_);
+
+            if (is_cancelled())
+                return E_ABORT;
+
+            auto it = positioned_items_.find(index);
+            if (it == positioned_items_.end())
+                return E_INVALIDARG;
+
+            PositionedItemState state = std::move(it->second);
+            positioned_items_.erase(it);
+
+            UInt64 item_bytes = 0;
+            if (state.async_file)
+            {
+                async_writer_->record_operation_result(state.async_file, opRes);
+                item_bytes = async_writer_->accepted_bytes(state.async_file);
+            }
+
+            if (opRes != kOpOk || operation_result_ == kOpOk)
+                operation_result_ = opRes;
+
+            if (output_trace_ && state.trace_active &&
+                state.trace_index < output_trace_->items.size())
+            {
+                auto &item = output_trace_->items[state.trace_index];
+                item.bytes_written = item_bytes;
+                item.operation_result = opRes;
+                item.done = opRes == kOpOk && !item.failed;
+                item.failed = item.failed || opRes != kOpOk;
+                if (item.done && item.has_source_crc32)
+                {
+                    item.output_crc32 = item.source_crc32;
+                    item.has_output_crc32 = true;
+                }
+                item.crc_verified = item.done && (!item.has_source_crc32 ||
+                    (item.has_output_crc32 && item.source_crc32 == item.output_crc32));
+            }
+
+            if (opRes != kOpOk && failed_item_.empty())
+            {
+                failed_item_ = state.item;
+                failed_item_index_ = index;
+                failed_item_bytes_written_ = item_bytes;
+            }
+
+            emit(opRes == kOpOk ? "item_done" : "item_failed", index, state.item);
+
+            if (async_writer_)
+            {
+                const HRESULT writer_error = async_writer_->current_error(async_job_);
+                if (writer_error != S_OK)
+                {
+                    output_error_ = true;
+                    return writer_error;
+                }
+            }
+            return S_OK;
+        }
 
 #ifdef _WIN32
         // 直接驱动条目目录创建（ensure_directory 本身是 private），生产代码不调用。
@@ -1286,6 +1378,15 @@ namespace sunpack::sevenzip
         }
 
     private:
+        struct PositionedItemState
+        {
+            AsyncFileWriter::FileStatePtr async_file;
+            std::size_t trace_index = 0;
+            std::wstring item;
+            bool is_dir = false;
+            bool trace_active = false;
+        };
+
         // 本 callback 所属卷的空间 gate，可能为 nullptr（功能关闭 / 无卷身份）。
         VolumeSpaceGate *volume_space_gate() const noexcept
         {
@@ -1581,6 +1682,8 @@ namespace sunpack::sevenzip
         mutable std::recursive_mutex state_mutex_;
 
         std::vector<AsyncFileWriter::FileStatePtr> async_files_;
+
+        std::map<UInt32, PositionedItemState> positioned_items_;
 
         AsyncFileWriter::FileStatePtr current_async_file_;
 
