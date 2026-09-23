@@ -5,7 +5,7 @@ import pytest
 from tests.helpers.detection_probe import detect_archive_hits
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar
-from tests.real.plan1_real_archives.plan1_support import assert_plan1_success
+from tests.real.plan1_real_archives.plan1_support import assert_plan1_success, detected_ext
 from tests.real.split_cases import SPLIT_NAMING_CASES, rename_split_parts
 
 
