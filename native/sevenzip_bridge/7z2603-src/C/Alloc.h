@@ -78,6 +78,7 @@ typedef struct
 
 void SunpackFileBuffer_Construct(CSunpackFileBuffer *p);
 BoolInt SunpackFileBuffer_Ensure(CSunpackFileBuffer *p, size_t size);
+void SunpackFileBuffer_Unmap(CSunpackFileBuffer *p);
 void SunpackFileBuffer_Release(CSunpackFileBuffer *p);
 
 typedef struct
