@@ -215,7 +215,6 @@ def task_snapshot(task: Any) -> dict[str, Any]:
         if key in _KNOWLEDGE_ROOTS or key.startswith("_")
     }
 
-    split_info = getattr(task, "split_info", None)
     return {
         "main_path": getattr(task, "main_path", ""),
         "all_parts": list(getattr(task, "all_parts", []) or []),
@@ -227,7 +226,6 @@ def task_snapshot(task: Any) -> dict[str, Any]:
         "discovery_source": getattr(task, "discovery_source", ""),
         "discovery_reason": getattr(task, "discovery_reason", ""),
         "relation_kind": getattr(task, "relation_kind", ""),
-        "split_info": jsonable(split_info),
         "archive_input": jsonable(archive_input),
         "archive_state": jsonable(archive_state),
         "discovery_evidence": jsonable(getattr(task, "discovery_evidence", {})),

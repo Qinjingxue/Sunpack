@@ -131,7 +131,6 @@ def _task(
 ) -> ArchiveTask:
     all_parts = [str(item) for item in (parts or [path])]
     task = direct_file_task(str(path), all_parts=all_parts)
-    task.ensure_archive_state()
     state = task.archive_state()
     source = replace(state.source, format_hint=detected_ext) if detected_ext else state.source
     analysis = dict(state.analysis)
