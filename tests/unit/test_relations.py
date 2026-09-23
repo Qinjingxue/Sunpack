@@ -1,5 +1,6 @@
 from pathlib import Path
 from io import BytesIO
+from binascii import crc32
 import struct
 import zipfile
 
@@ -9,6 +10,7 @@ from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.coordinator.target_scan import build_fact_bags_for_target
 from sunpack.coordinator.target_groups import relation_group_to_fact_bag
 from sunpack.relations import RelationsScheduler
+from tests.helpers.fs_builder import make_minimal_7z
 
 
 def _groups(tmp_path: Path):
@@ -23,6 +25,36 @@ def test_plain_file_relation_omits_empty_volume_anchor(tmp_path):
 
     assert bags
     assert all(bag.get("relation.volume_anchor") is None for bag in bags)
+
+
+def _minimal_rar4_single() -> bytes:
+    header = bytearray(13)
+    header[2] = 0x73
+    header[3:5] = (0).to_bytes(2, "little")
+    header[5:7] = len(header).to_bytes(2, "little")
+    header[0:2] = (crc32(header[2:]) & 0xFFFF).to_bytes(2, "little")
+    return b"Rar!\x1a\x07\x00" + bytes(header)
+
+
+@pytest.mark.parametrize(
+    ("filename", "content", "archive_format"),
+    [
+        ("ordinary.7z", make_minimal_7z(), "7z"),
+        ("ordinary.rar", _minimal_rar4_single(), "rar"),
+    ],
+)
+def test_standalone_rar_and_7z_are_confirmed_by_relations(
+    tmp_path, filename, content, archive_format
+):
+    path = tmp_path / filename
+    path.write_bytes(content)
+
+    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
+
+    assert group.input_paths == [str(path)]
+    assert group.head_metadata["format"] == archive_format
+    assert group.head_metadata["standalone"] is True
+    assert group.head_metadata["relation_confirmed"] is True
 
 
 def test_standalone_zip_is_confirmed_by_relations(tmp_path):
