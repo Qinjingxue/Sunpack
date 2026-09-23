@@ -1307,7 +1307,7 @@ public:
             } else {
                 if (!job_id.empty()) {
                     std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
-                    cancel_tokens_.emplace(
+                    cancel_tokens_.insert_or_assign(
                         job_id,
                         JobControl{cancel_token});
                 }
