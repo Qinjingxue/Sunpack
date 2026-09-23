@@ -6,7 +6,7 @@ from typing import Any
 
 from sunpack_native import authorize_nested_candidates as _NATIVE_AUTHORIZE_NESTED_CANDIDATES
 
-from sunpack.coordinator.scan_session import DetectionScanSession
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.support.path_keys import normalized_path, safe_relative_path
 
 @dataclass(frozen=True)
@@ -25,7 +25,7 @@ class RecursiveAuthorization:
         self,
         tasks: list[Any],
         scan_roots: list[str],
-        scan_session: DetectionScanSession | None,
+        scan_session: DiscoveryScanSession | None,
         *,
         round_index: int,
     ) -> AuthorizationBatch:
