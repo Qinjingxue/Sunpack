@@ -791,120 +791,6 @@ static bool GetSimplePositionedFilterChain(
 }
 
 
-static HRESULT TryDecodeSimplePositionedFilter(
-    IInStream *inStream,
-    UInt64 startPos,
-    const UInt64 *packPositions,
-    const CFolderEx &folder,
-    const UInt64 *coderUnpackSizes,
-    ISequentialOutStream *outStream,
-    ICompressProgressInfo *progress
-    #if !defined(Z7_ST)
-    , bool mtMode, UInt32 numThreads, UInt64 memUsage
-    #endif
-    )
-{
-  if (!inStream || !outStream)
-    return E_NOTIMPL;
-
-  sunpack::sevenzip::PositionedOutStream *positioned =
-      sunpack::sevenzip::positioned_out_stream(outStream);
-  if (!positioned || !positioned->positioned_available())
-    return E_NOTIMPL;
-
-  unsigned lzmaIndex = 0;
-  unsigned filterIndex = 0;
-  UInt32 filterPc = 0;
-  if (!GetSimplePositionedFilterChain(
-          folder, lzmaIndex, filterIndex, filterPc))
-    return E_NOTIMPL;
-
-  const CCoderInfo &lzma = folder.Coders[lzmaIndex];
-  if (lzma.Props.Size() != 1)
-    return E_NOTIMPL;
-
-  const UInt64 packSize = packPositions[1] - packPositions[0];
-  const UInt64 outSize = coderUnpackSizes[lzmaIndex];
-
-  RINOK(InStream_SeekSet(
-      inStream, startPos + packPositions[0]))
-
-  CMyComPtr2_Create<ISequentialInStream, CLimitedSequentialInStream> limited;
-  limited->SetStream(inStream);
-  limited->Init(packSize);
-
-  CMyComPtr<ICompressCoder> coder =
-      new NCompress::NLzma2::CDecoder;
-
-  {
-    Z7_DECL_CMyComPtr_QI_FROM(
-        ICompressSetDecoderProperties2,
-        setProps, coder)
-    if (!setProps)
-      return E_NOTIMPL;
-    RINOK(setProps->SetDecoderProperties2(
-        (const Byte *)lzma.Props, (UInt32)lzma.Props.Size()))
-  }
-
-  {
-    Z7_DECL_CMyComPtr_QI_FROM(
-        ICompressSetFinishMode,
-        setFinish, coder)
-    if (setFinish)
-      RINOK(setFinish->SetFinishMode(1))
-  }
-
-  #if !defined(Z7_ST)
-  if (mtMode)
-  {
-    Z7_DECL_CMyComPtr_QI_FROM(
-        ICompressSetCoderMt,
-        setMt, coder)
-    if (setMt)
-      RINOK(setMt->SetNumberOfThreads(numThreads))
-
-    Z7_DECL_CMyComPtr_QI_FROM(
-        ICompressSetMemLimit,
-        setMemLimit, coder)
-    if (setMemLimit)
-      RINOK(setMemLimit->SetMemLimit(memUsage))
-  }
-  #endif
-
-  const CMethodId filterMethod =
-      folder.Coders[filterIndex].MethodID;
-  CMyComPtr<ISequentialOutStream> filtered;
-  CPositionedAlignedFilterOutStream *alignedSpec = NULL;
-  CPositionedLookAheadFilterOutStream *lookAheadSpec = NULL;
-
-  if (PositionedFilterLookAhead(filterMethod) != 0)
-  {
-    lookAheadSpec = new CPositionedLookAheadFilterOutStream(
-        outStream, filterMethod, filterPc, outSize);
-    filtered = lookAheadSpec;
-    if (!lookAheadSpec->IsUsable())
-      return E_NOTIMPL;
-  }
-  else
-  {
-    alignedSpec = new CPositionedAlignedFilterOutStream(
-        outStream, filterMethod, filterPc, outSize);
-    filtered = alignedSpec;
-    if (!alignedSpec->IsUsable())
-      return E_NOTIMPL;
-  }
-
-  const HRESULT hres = coder->Code(
-      limited, filtered, &packSize, &outSize, progress);
-  if (hres != S_OK)
-    return hres;
-
-  return lookAheadSpec ? lookAheadSpec->Finish() : alignedSpec->Finish();
-}
-
-} // namespace
-
-
 namespace {
 
 class CLimitedRandomReader final : public sunpack::sevenzip::RandomAccessReader
@@ -1026,6 +912,134 @@ public:
 };
 
 } // namespace
+
+static HRESULT TryDecodeSimplePositionedFilter(
+    IInStream *inStream,
+    UInt64 startPos,
+    const UInt64 *packPositions,
+    const CFolderEx &folder,
+    const UInt64 *coderUnpackSizes,
+    ISequentialOutStream *outStream,
+    ICompressProgressInfo *progress
+    #if !defined(Z7_ST)
+    , bool mtMode, UInt32 numThreads, UInt64 memUsage
+    #endif
+    )
+{
+  if (!inStream || !outStream)
+    return E_NOTIMPL;
+
+  sunpack::sevenzip::PositionedOutStream *positioned =
+      sunpack::sevenzip::positioned_out_stream(outStream);
+  if (!positioned || !positioned->positioned_available())
+    return E_NOTIMPL;
+
+  unsigned lzmaIndex = 0;
+  unsigned filterIndex = 0;
+  UInt32 filterPc = 0;
+  if (!GetSimplePositionedFilterChain(
+          folder, lzmaIndex, filterIndex, filterPc))
+    return E_NOTIMPL;
+
+  const CCoderInfo &lzma = folder.Coders[lzmaIndex];
+  if (lzma.Props.Size() != 1)
+    return E_NOTIMPL;
+
+  const UInt64 packSize = packPositions[1] - packPositions[0];
+  const UInt64 outSize = coderUnpackSizes[lzmaIndex];
+
+  const UInt64 packedStart = startPos + packPositions[0];
+  RINOK(InStream_SeekSet(inStream, packedStart))
+
+  CMyComPtr<ISequentialInStream> limited;
+  if (sunpack::sevenzip::random_access_in_stream(inStream))
+  {
+    CRandomLimitedSequentialInStream *spec =
+        new CRandomLimitedSequentialInStream;
+    spec->Init(inStream, inStream, packedStart, packSize);
+    limited = spec;
+  }
+  else
+  {
+    CLimitedSequentialInStream *spec =
+        new CLimitedSequentialInStream;
+    spec->SetStream(inStream);
+    spec->Init(packSize);
+    limited = spec;
+  }
+
+  CMyComPtr<ICompressCoder> coder =
+      new NCompress::NLzma2::CDecoder;
+
+  {
+    Z7_DECL_CMyComPtr_QI_FROM(
+        ICompressSetDecoderProperties2,
+        setProps, coder)
+    if (!setProps)
+      return E_NOTIMPL;
+    RINOK(setProps->SetDecoderProperties2(
+        (const Byte *)lzma.Props, (UInt32)lzma.Props.Size()))
+  }
+
+  {
+    Z7_DECL_CMyComPtr_QI_FROM(
+        ICompressSetFinishMode,
+        setFinish, coder)
+    if (setFinish)
+      RINOK(setFinish->SetFinishMode(1))
+  }
+
+  #if !defined(Z7_ST)
+  if (mtMode)
+  {
+    Z7_DECL_CMyComPtr_QI_FROM(
+        ICompressSetCoderMt,
+        setMt, coder)
+    if (setMt)
+      RINOK(setMt->SetNumberOfThreads(numThreads))
+
+    Z7_DECL_CMyComPtr_QI_FROM(
+        ICompressSetMemLimit,
+        setMemLimit, coder)
+    if (setMemLimit)
+      RINOK(setMemLimit->SetMemLimit(memUsage))
+  }
+  #endif
+
+  const CMethodId filterMethod =
+      folder.Coders[filterIndex].MethodID;
+  CMyComPtr<ISequentialOutStream> filtered;
+  CPositionedAlignedFilterOutStream *alignedSpec = NULL;
+  CPositionedLookAheadFilterOutStream *lookAheadSpec = NULL;
+
+  if (PositionedFilterLookAhead(filterMethod) != 0)
+  {
+    lookAheadSpec = new CPositionedLookAheadFilterOutStream(
+        outStream, filterMethod, filterPc, outSize);
+    filtered = lookAheadSpec;
+    if (!lookAheadSpec->IsUsable())
+      return E_NOTIMPL;
+  }
+  else
+  {
+    alignedSpec = new CPositionedAlignedFilterOutStream(
+        outStream, filterMethod, filterPc, outSize);
+    filtered = alignedSpec;
+    if (!alignedSpec->IsUsable())
+      return E_NOTIMPL;
+  }
+
+  const HRESULT hres = coder->Code(
+      limited, filtered, &packSize, &outSize, progress);
+  if (hres != S_OK)
+    return hres;
+
+  return lookAheadSpec ? lookAheadSpec->Finish() : alignedSpec->Finish();
+}
+
+} // namespace
+
+
 
 Z7_CLASS_IMP_COM_1(
   CDecProgress
