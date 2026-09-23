@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from sunpack.contracts.filesystem import DirectorySnapshot, FileEntry
-from sunpack.coordinator.scan_session import DetectionScanSession
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.support.output_inventory import OutputInventory
 from sunpack.support.path_keys import normalized_path, path_key
@@ -16,7 +16,7 @@ class NestedOutputScanPolicy:
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self._output_scan_config = self._build_recursive_output_scan_config()
-        self._pending_scan_session: DetectionScanSession | None = None
+        self._pending_scan_session: DiscoveryScanSession | None = None
 
     def should_scan_output_dir(self, target_dir: str) -> bool:
         return bool(self._candidate_parent_roots(target_dir))
@@ -75,7 +75,7 @@ class NestedOutputScanPolicy:
         # each confirmed segment directory independently.  Ordinary archives
         # continue to use their output directory as their single logical root.
         scan_dirs = logical_roots if logical_roots is not None else output_dirs
-        scan_session = DetectionScanSession(
+        scan_session = DiscoveryScanSession(
             config=self.config,
             include_raw_snapshots=True,
         )
@@ -157,7 +157,7 @@ class NestedOutputScanPolicy:
             inventory = getattr(extraction_result, "output_inventory_payload", None)
         return [(output_dir, inventory)]
 
-    def take_scan_session(self, scan_roots: Iterable[str]) -> DetectionScanSession | None:
+    def take_scan_session(self, scan_roots: Iterable[str]) -> DiscoveryScanSession | None:
         """Consume the inventory-backed session prepared for the next recursive round."""
         session = self._pending_scan_session
         self._pending_scan_session = None
@@ -169,7 +169,7 @@ class NestedOutputScanPolicy:
     def _snapshot_from_inventory(
         self,
         inventory: OutputInventory | None,
-        scan_session: DetectionScanSession,
+        scan_session: DiscoveryScanSession,
     ) -> DirectorySnapshot | None:
         if inventory is None or not inventory.stats.exists or not inventory.stats.is_dir:
             return None
