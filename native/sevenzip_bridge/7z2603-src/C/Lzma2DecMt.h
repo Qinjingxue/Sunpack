@@ -18,18 +18,6 @@ typedef struct
   size_t inBufSize_MT;
   size_t outBlockMax;
   size_t inBlockMax;
-
-  /*
-    Optional SunPack fast path. When set, independent LZMA2 blocks are decoded
-    into their real dictionary ring and emitted directly at logical offsets,
-    instead of allocating one full unpacked block per MT lane.
-  */
-  void *positionedWriteObject;
-  SRes (*positionedWrite)(
-      void *object,
-      UInt64 offset,
-      const Byte *data,
-      size_t size);
   #endif
 } CLzma2DecMtProps;
 
