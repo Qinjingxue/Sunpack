@@ -1,7 +1,11 @@
 """Confirm one routed TAR or compression stream at a time."""
 
-from sunpack.contracts.discovery import ResolvedArchiveInput, StageResult, candidate_paths
-from sunpack.contracts.detection import FactBag
+from sunpack.contracts.discovery import (
+    DiscoveryCandidate,
+    ResolvedArchiveInput,
+    StageResult,
+    candidate_paths,
+)
 from sunpack.detection.scheduler import DetectionResult, DetectionScheduler
 
 
@@ -9,17 +13,28 @@ class FormatConfirmation:
     def __init__(self, detector: DetectionScheduler):
         self.detector = detector
 
-    def confirm(self, bags: list[FactBag], *, scan_session=None) -> tuple[StageResult, list[DetectionResult]]:
+    def confirm(
+        self,
+        candidates: list[DiscoveryCandidate],
+        *,
+        scan_session=None,
+    ) -> tuple[StageResult, list[DetectionResult]]:
+        del scan_session
         result = StageResult()
-        decisions = self.detector.evaluate_bags(bags, scan_session=scan_session)
+        decisions = self.detector.evaluate_candidates(candidates)
         for item in decisions:
-            bag = item.fact_bag
+            candidate = item.candidate
             if item.decision.should_extract:
-                result.add_resolved(ResolvedArchiveInput.from_bag(bag, "detection", {
-                    "format": bag.get("filesystem.format_hint"),
-                    "reason": item.decision.stop_reason,
-                }))
+                result.add_resolved(ResolvedArchiveInput.from_candidate(
+                    candidate,
+                    "detection",
+                    {
+                        "format": item.format,
+                        "reason": item.decision.stop_reason,
+                    },
+                    reasons=(item.decision.stop_reason or "",),
+                ))
             else:
-                result.residual_paths.update(candidate_paths(bag))
+                result.residual_paths.update(candidate_paths(candidate))
         result.validate()
         return result, decisions
