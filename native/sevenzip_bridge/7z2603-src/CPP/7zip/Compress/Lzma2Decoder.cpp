@@ -490,7 +490,11 @@ static HRESULT TryDecodePositionedLzma2Runs(
       ScanPositionedLzma2Runs(*scanner, *inSize, *outSize, runs);
   if (scanRes != S_OK)
     return scanRes;
-  if (runs.empty() && *outSize != 0)
+  /*
+    The canonical empty stream is just the 0x00 end marker. There is no run to
+    assign to a worker, so keep that tiny case on the upstream sequential path.
+  */
+  if (runs.empty())
     return E_NOTIMPL;
 
   unsigned desiredThreads =
