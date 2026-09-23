@@ -121,7 +121,7 @@ CATALOG = {
         "cli.scan.paths": "Files or directories to scan.",
         "cli.scan.identified": "[CLI] Identified {count} extractable task(s).",
         "cli.scan.details": "  Decision={decision} Parts={parts}",
-        "cli.scan.detected_ext": "  Detected Extension: {ext}",
+        "cli.scan.format": "  Detected Format: {format}",
         "cli.scan.matched_rules": "  Matched Rules: {rules}",
         "cli.inspect.help": "Show file inspection details without changing files.",
         "cli.inspect.paths": "Files or directories to inspect.",
