@@ -268,16 +268,17 @@ def load_runtime_config() -> dict:
 
 def install_wrappers(recorder: HotspotRecorder) -> None:
     import sunpack.filesystem.directory_scanner as directory_scanner
+    import sunpack.coordinator.discovery as discovery
     import sunpack.coordinator.scan_session as scan_session
     import sunpack.coordinator.target_scan as target_scan
+    import sunpack.detection.confirmation as detection_confirmation
     import sunpack.detection.scheduler as detection_scheduler
+    import sunpack.embedded.discovery as embedded_discovery
     import sunpack.coordinator.task_provider as task_provider
     import sunpack.coordinator.task_scan as task_scan
     import sunpack.relations.scheduler as relations_scheduler
     import sunpack.relations.internal.group_builder as group_builder
-    import sunpack.detection.pipeline.facts.batch_provider as batch_provider
-    import sunpack.detection.pipeline.processors.runner as processor_runner
-    import sunpack.detection.pipeline.rules.manager as rule_manager
+    import sunpack.relations.resolver as relation_resolver
 
     recorder.wrap(directory_scanner, "_NATIVE_SCAN_DIRECTORY_SNAPSHOT", "native.scan_directory_snapshot")
     recorder.wrap(directory_scanner.DirectoryScanner, "scan", "filesystem.DirectoryScanner.scan")
@@ -287,30 +288,26 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
 
     recorder.wrap(relations_scheduler.RelationsScheduler, "build_candidate_groups", "relations.build_candidate_groups")
     recorder.wrap(group_builder.RelationsGroupBuilder, "build_candidate_groups", "relations.builder.build_candidate_groups")
+    recorder.wrap(relation_resolver.RelationResolver, "resolve", "relations.resolve")
 
     recorder.wrap(scan_session, "_native_batch_file_head_facts", "native.batch_file_head_facts")
-    recorder.wrap(scan_session.DetectionScanSession, "snapshot_for_directory", "session.snapshot_for_directory")
-    recorder.wrap(scan_session.DetectionScanSession, "shallow_snapshot_for_directory", "session.shallow_snapshot_for_directory")
-    recorder.wrap(scan_session.DetectionScanSession, "relation_groups_for_directory", "session.relation_groups_for_directory")
-    recorder.wrap(scan_session.DetectionScanSession, "fact_bags_for_directory", "session.fact_bags_for_directory")
-    recorder.wrap(scan_session.DetectionScanSession, "file_head_facts_for_paths", "session.file_head_facts_for_paths")
-    recorder.wrap(scan_session.DetectionScanSession, "directory_identity_for_path", "session.directory_identity_for_path")
+    recorder.wrap(scan_session.DiscoveryScanSession, "snapshot_for_directory", "session.snapshot_for_directory")
+    recorder.wrap(scan_session.DiscoveryScanSession, "shallow_snapshot_for_directory", "session.shallow_snapshot_for_directory")
+    recorder.wrap(scan_session.DiscoveryScanSession, "relation_groups_for_directory", "session.relation_groups_for_directory")
+    recorder.wrap(scan_session.DiscoveryScanSession, "candidates_for_directory", "session.candidates_for_directory")
+    recorder.wrap(scan_session.DiscoveryScanSession, "file_head_facts_for_paths", "session.file_head_facts_for_paths")
+    recorder.wrap(scan_session.DiscoveryScanSession, "directory_identity_for_path", "session.directory_identity_for_path")
 
-    recorder.wrap(target_scan, "build_fact_bags_for_targets", "coordinator.build_candidate_fact_bags")
-    recorder.wrap(detection_scheduler.DetectionScheduler, "evaluate_pool", "detection.evaluate_pool")
-    recorder.wrap(detection_scheduler.DetectionScheduler, "evaluate_bags", "detection.evaluate_bags")
-    recorder.wrap(detection_scheduler.DetectionScheduler, "_ensure_pool_facts", "detection.ensure_pool_facts")
+    recorder.wrap(target_scan, "build_candidates_for_targets", "coordinator.build_candidates")
+    recorder.wrap(detection_scheduler.DetectionScheduler, "confirm", "detection.confirm_candidate")
+    recorder.wrap(detection_confirmation.FormatConfirmation, "confirm", "detection.confirm_stage")
+    recorder.wrap(embedded_discovery.EmbeddedDiscovery, "discover", "embedded.discover")
+    recorder.wrap(discovery.ArchiveDiscoveryPipeline, "discover", "discovery.compose")
 
+    recorder.wrap(task_provider.ArchiveTaskProvider, "discover_targets", "task_provider.discover_targets")
     recorder.wrap(task_provider.ArchiveTaskProvider, "scan_targets", "task_provider.scan_targets")
+    recorder.wrap(task_scan.ArchiveTaskScanner, "discover_targets", "task_scanner.discover_targets")
     recorder.wrap(task_scan.ArchiveTaskScanner, "scan_targets", "task_scanner.scan_targets")
-
-    recorder.wrap(batch_provider.BatchFactProvider, "_prefetch_file_head_facts", "facts.prefetch_file_head_facts")
-    recorder.wrap(batch_provider.BatchFactProvider, "prefill_facts", "facts.prefill_facts")
-    recorder.wrap(batch_provider.BatchFactProvider, "prefill_fact", "facts.prefill_fact")
-    recorder.wrap(processor_runner.ProcessingCoordinator, "ensure_facts", "processors.ensure_facts")
-    recorder.wrap(processor_runner.ProcessingCoordinator, "ensure_fact", "processors.ensure_fact")
-    recorder.wrap(rule_manager.RuleManager, "evaluate_pool", "rules.evaluate_pool")
-    recorder.wrap(rule_manager.RuleManager, "_run_precheck", "rules.run_precheck")
 
 
 def summarize_scan_session(session: Any | None) -> dict[str, Any]:
@@ -318,9 +315,11 @@ def summarize_scan_session(session: Any | None) -> dict[str, Any]:
         return {}
     return {
         "snapshots": len(getattr(session, "_snapshots", {}) or {}),
-        "scene_snapshots": len(getattr(session, "_scene_snapshots", {}) or {}),
         "relation_groups": len(getattr(session, "_relation_groups", {}) or {}),
-        "fact_bags": len(getattr(session, "_fact_bags", {}) or {}),
+        "candidates": sum(
+            len(items)
+            for items in (getattr(session, "_candidates", {}) or {}).values()
+        ),
         "file_head_facts": len(getattr(session, "_file_head_facts", {}) or {}),
         "scan_roots": list(getattr(session, "_scan_roots", []) or []),
     }
@@ -343,32 +342,31 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
         return result, extra
 
     if mode in {"candidates", "evaluate"}:
-        from sunpack.detection.scheduler import DetectionScheduler
-        from sunpack.coordinator.scan_session import DetectionScanSession
-        from sunpack.coordinator.target_scan import build_fact_bags_for_targets
+        from sunpack.coordinator.scan_session import DiscoveryScanSession
+        from sunpack.coordinator.target_scan import build_candidates_for_targets
+        from sunpack.coordinator.task_provider import ArchiveTaskProvider
 
-        scheduler = DetectionScheduler(config)
-        session = DetectionScanSession(config=config)
-        bags = build_fact_bags_for_targets([target_path], session=session, config=config)
-        extra["candidate_bags"] = len(bags)
+        session = DiscoveryScanSession(config=config)
+        candidates = build_candidates_for_targets([target_path], session=session, config=config)
+        extra["candidates"] = len(candidates)
         if mode == "candidates":
             extra["scan_session"] = summarize_scan_session(session)
-            return bags, extra
-        detections = scheduler.evaluate_bags(bags, scan_session=session)
-        extra["detections"] = len(detections)
-        extra["extractable"] = sum(1 for item in detections if item.decision.should_extract)
+            return candidates, extra
+
+        provider = ArchiveTaskProvider(config)
+        discovery_result = provider.discovery.discover(candidates)
+        extra["resolved_inputs"] = len(discovery_result.resolved_inputs)
+        extra["blocked_paths"] = len(discovery_result.blocked_paths)
+        extra["residual_paths"] = len(discovery_result.residual_paths)
         extra["scan_session"] = summarize_scan_session(session)
-        return detections, extra
+        return discovery_result.resolved_inputs, extra
 
     if mode == "full":
         from sunpack.coordinator.scanner import ScanOrchestrator
 
         orchestrator = ScanOrchestrator(config)
         result = orchestrator.scan_targets([target_path])
-        provider = orchestrator.task_scanner.provider
         session = getattr(orchestrator.task_scanner, "last_scan_session", None)
-        if session is None:
-            session = getattr(provider.detector, "_active_scan_session", None)
         extra["tasks"] = len(result)
         extra["scan_session"] = summarize_scan_session(session)
         return result, extra
