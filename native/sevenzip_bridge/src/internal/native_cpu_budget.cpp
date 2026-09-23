@@ -71,9 +71,10 @@ void NativeCpuBudget::release(std::size_t count) noexcept
         return;
 
     std::size_t reserved = reserved_credits_.load(std::memory_order_acquire);
+    std::size_t next = 0;
     for (;;)
     {
-        const std::size_t next = count >= reserved ? 0 : reserved - count;
+        next = count >= reserved ? 0 : reserved - count;
         if (reserved_credits_.compare_exchange_weak(
                 reserved,
                 next,
@@ -82,8 +83,16 @@ void NativeCpuBudget::release(std::size_t count) noexcept
             break;
     }
 
+    // Wake outer admission only when this release actually changes the
+    // budget from saturated to available. If capacity was already available,
+    // submission/baton passing already owns the wakeup chain.
     if (capacity_available_)
-        capacity_available_(capacity_available_context_);
+    {
+        const std::size_t effective =
+            effective_capacity_.load(std::memory_order_acquire);
+        if (reserved >= effective && next < effective)
+            capacity_available_(capacity_available_context_);
+    }
 }
 
 void NativeCpuBudget::set_effective_capacity(std::size_t capacity) noexcept
@@ -93,7 +102,12 @@ void NativeCpuBudget::set_effective_capacity(std::size_t capacity) noexcept
     const std::size_t previous =
         effective_capacity_.exchange(next, std::memory_order_acq_rel);
     if (next > previous && capacity_available_)
-        capacity_available_(capacity_available_context_);
+    {
+        const std::size_t reserved =
+            reserved_credits_.load(std::memory_order_acquire);
+        if (reserved >= previous && reserved < next)
+            capacity_available_(capacity_available_context_);
+    }
 }
 
 std::size_t NativeCpuBudget::nominal_capacity() const noexcept
