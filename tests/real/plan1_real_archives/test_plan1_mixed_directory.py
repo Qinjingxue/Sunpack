@@ -11,6 +11,7 @@ from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar, get_test_tools
 from tests.real.plan1_real_archives.plan1_support import (
     assert_expected_files_extracted,
+    detected_ext,
     run_plan1_pipeline,
 )
 
@@ -53,11 +54,11 @@ def test_plan1_mixed_same_name_plain_formats_in_one_directory(tmp_path, plan1_er
         hits = detect_archive_hits(target)
         plan1_error[f"detect_{archive_format}"] = {
             "expected": expected_ext[archive_format],
-            "actual": hits[0].fact_bag.get("file.detected_ext") if hits else None,
+            "actual": detected_ext(hits[0]) if hits else None,
             "hit_count": len(hits),
         }
         assert len(hits) == 1, f"{target.name}: expected one hit, got {len(hits)}"
-        assert hits[0].fact_bag.get("file.detected_ext") == expected_ext[archive_format]
+        assert detected_ext(hits[0]) == expected_ext[archive_format]
 
     # 目录扫描应得到 4 个逻辑归档。
     tasks = ArchiveTaskProvider(detection_pipeline_config()).scan_targets([str(common)])
@@ -71,7 +72,7 @@ def test_plan1_mixed_same_name_plain_formats_in_one_directory(tmp_path, plan1_er
         ("release.tar.gz", ".gz"),
     ):
         assert name in tasks_by_name
-        assert tasks_by_name[name].fact_bag.get("file.detected_ext") == expected
+        assert f".{tasks_by_name[name].archive_input().format_hint}" if tasks_by_name[name].archive_input().format_hint not in {"gzip", "bzip2", "zstd"} else {"gzip": ".gz", "bzip2": ".bz2", "zstd": ".zst"}[tasks_by_name[name].archive_input().format_hint] == expected
 
     # 目录整体解压，每个 marker 都要出现。
     summary = run_plan1_pipeline(common)
@@ -119,7 +120,7 @@ def test_plan1_mixed_compressed_formats_in_one_directory(tmp_path, plan1_error):
     assert len(tasks_by_name) == 3, f"expected 3 logical archives, got {sorted(tasks_by_name)}"
     for archive_format, expected in (("7z", ".7z"), ("zip", ".zip"), ("rar", ".rar")):
         name = f"release{suffixes[archive_format]}"
-        assert tasks_by_name[name].fact_bag.get("file.detected_ext") == expected
+        assert f".{tasks_by_name[name].archive_input().format_hint}" if tasks_by_name[name].archive_input().format_hint not in {"gzip", "bzip2", "zstd"} else {"gzip": ".gz", "bzip2": ".bz2", "zstd": ".zst"}[tasks_by_name[name].archive_input().format_hint] == expected
 
     summary = run_plan1_pipeline(common)
     plan1_error["pipeline_success_count"] = summary.success_count
@@ -170,7 +171,7 @@ def test_plan1_mixed_same_stem_split_formats_in_one_directory(tmp_path, plan1_er
         ("bundle.part1.rar", ".rar"),
     ):
         assert name in tasks_by_name, f"missing head {name}"
-        assert tasks_by_name[name].fact_bag.get("file.detected_ext") == expected
+        assert f".{tasks_by_name[name].archive_input().format_hint}" if tasks_by_name[name].archive_input().format_hint not in {"gzip", "bzip2", "zstd"} else {"gzip": ".gz", "bzip2": ".bz2", "zstd": ".zst"}[tasks_by_name[name].archive_input().format_hint] == expected
 
     summary = run_plan1_pipeline(common)
     plan1_error["pipeline_success_count"] = summary.success_count
