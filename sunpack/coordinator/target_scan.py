@@ -1,5 +1,6 @@
+from __future__ import annotations
+
 import os
-from typing import List
 
 from sunpack.contracts.discovery import DiscoveryCandidate
 from sunpack.coordinator.scan_session import DiscoveryScanSession
@@ -10,54 +11,18 @@ from sunpack.support.path_keys import normalized_path, path_key, safe_relative_p
 RELATIONS = RelationsScheduler()
 
 
-def _candidate_key(candidate: DiscoveryCandidate) -> str:
-    if not candidate.is_split:
-        return path_key(candidate.entry_path)
-    parent = os.path.dirname(normalized_path(candidate.entry_path)) if candidate.entry_path else ""
-    logical_name = candidate.logical_name or os.path.basename(candidate.entry_path)
-    family = str(candidate.relation_family or candidate.format_hint or "unknown").lower()
-    return path_key(os.path.join(parent, f"{logical_name.lower()}\x1f{family}"))
-
-
-def _add_unique(
-    target: List[DiscoveryCandidate],
-    seen_keys: set[str],
-    candidates: List[DiscoveryCandidate],
-) -> None:
-    for candidate in candidates:
-        key = _candidate_key(candidate)
-        if key in seen_keys:
-            for index, current in enumerate(target):
-                if _candidate_key(current) == key and _candidate_rank(candidate) > _candidate_rank(current):
-                    target[index] = candidate
-                    break
-            continue
-        seen_keys.add(key)
-        target.append(candidate)
-
-
-def _candidate_rank(candidate: DiscoveryCandidate) -> tuple[int, int, int]:
-    anchor = candidate.relation_anchor
-    relation_strength = 2 if candidate.is_split else 1
-    if anchor.get("needs_password"):
-        relation_strength = 1
-    volumes = len(candidate.archive_input.parts) if candidate.archive_input is not None else 0
-    members = len(candidate.member_paths)
-    return relation_strength, volumes, members
-
-
-def build_discovery_candidates_for_target(
+def build_candidates_for_target(
     target_path: str,
     session: DiscoveryScanSession | None = None,
-) -> List[DiscoveryCandidate]:
-    return build_discovery_candidates_for_targets([target_path], session=session)
+) -> list[DiscoveryCandidate]:
+    return build_candidates_for_targets([target_path], session=session)
 
 
-def build_discovery_candidates_for_targets(
-    target_paths: List[str],
+def build_candidates_for_targets(
+    target_paths: list[str],
     session: DiscoveryScanSession | None = None,
     config: dict | None = None,
-) -> List[DiscoveryCandidate]:
+) -> list[DiscoveryCandidate]:
     session = session or DiscoveryScanSession(RELATIONS, config=config)
     selected_dirs: list[str] = []
     selected_files: list[str] = []
@@ -73,10 +38,9 @@ def build_discovery_candidates_for_targets(
     for file_path in selected_files:
         if not any(safe_relative_path(file_path, directory) is not None for directory in selected_dirs):
             scan_roots.append(_context_root_for_file(file_path, config or {}))
-    if hasattr(session, "set_scan_roots"):
-        session.set_scan_roots(scan_roots)
+    session.set_scan_roots(scan_roots)
 
-    candidates: List[DiscoveryCandidate] = []
+    candidates: list[DiscoveryCandidate] = []
     seen_keys: set[str] = set()
 
     for directory in selected_dirs:
@@ -85,7 +49,6 @@ def build_discovery_candidates_for_targets(
     for file_path in selected_files:
         if any(safe_relative_path(file_path, directory) is not None for directory in selected_dirs):
             continue
-
         parent = _context_root_for_file(file_path, config or {})
         parent_candidates = session.candidates_for_directory(parent)
         selected_key = path_key(file_path)
@@ -105,6 +68,44 @@ def build_discovery_candidates_for_targets(
         _add_unique(candidates, seen_keys, matched)
 
     return candidates
+
+
+def _candidate_key(candidate: DiscoveryCandidate) -> str:
+    if not candidate.is_split:
+        return path_key(candidate.entry_path)
+    parent = os.path.dirname(normalized_path(candidate.entry_path))
+    family = str(
+        candidate.relation_metadata.get("split_family")
+        or candidate.format_hint
+        or "unknown"
+    ).lower()
+    return path_key(os.path.join(parent, f"{candidate.logical_name.lower()}\x1f{family}"))
+
+
+def _candidate_rank(candidate: DiscoveryCandidate) -> tuple[int, int, int]:
+    relation_strength = 2 if candidate.is_split else 1
+    if candidate.relation_anchor.get("needs_password"):
+        relation_strength = 1
+    volumes = int(candidate.relation_metadata.get("split_member_count") or 0)
+    members = len(candidate.member_paths)
+    return relation_strength, volumes, members
+
+
+def _add_unique(
+    target: list[DiscoveryCandidate],
+    seen_keys: set[str],
+    values: list[DiscoveryCandidate],
+) -> None:
+    for candidate in values:
+        key = _candidate_key(candidate)
+        if key in seen_keys:
+            for index, current in enumerate(target):
+                if _candidate_key(current) == key and _candidate_rank(candidate) > _candidate_rank(current):
+                    target[index] = candidate
+                    break
+            continue
+        seen_keys.add(key)
+        target.append(candidate)
 
 
 def _context_root_for_file(file_path: str, config: dict) -> str:
