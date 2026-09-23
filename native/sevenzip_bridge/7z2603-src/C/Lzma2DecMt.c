@@ -186,6 +186,8 @@ static void Lzma2DecMt_FreeOutBufs(CLzma2DecMt *p)
       ISzAlloc_Free(p->allocMid, t->dictBuf);
       t->dictBuf = NULL;
       t->dictBufSize = 0;
+      t->dec.decoder.dic = NULL;
+      t->dec.decoder.dicBufSize = 0;
     }
   }
 }
