@@ -552,9 +552,7 @@ def test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffix
             },
             precheck=[
                 {"name": "size_range", "enabled": True, "gte": 0},
-                {"name": "seven_zip_structure_accept", "enabled": True},
-                {"name": "zip_structure_accept", "enabled": True},
-                {"name": "rar_structure_accept", "enabled": True},
+                {"name": "relation_archive_accept", "enabled": True},
                 {"name": "embedded_payload_identity", "enabled": True},
             ],
         )
