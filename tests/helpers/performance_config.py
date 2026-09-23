@@ -13,7 +13,6 @@ def archive_pressure_config(passwords: list[str] | None = None) -> dict:
         "builtin_passwords": [],
         "max_retries": 1,
     }, precheck=[
-        {"name": "relation_archive_accept", "enabled": True},
         {"name": "size_range", "enabled": True, "gte": 0},
         {"name": "relation_archive_accept", "enabled": True},
         {"name": "embedded_payload_identity", "enabled": True},
