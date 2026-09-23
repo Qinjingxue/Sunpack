@@ -383,7 +383,7 @@ fn probe_cheap_prefix(
     if probe_zip_local_head(prefix, &mut result) {
         return result;
     }
-    if probe_embedded_zip_local_head(prefix, &mut result) {
+    if prefix.starts_with(b"MZ") && probe_embedded_zip_local_head(prefix, &mut result) {
         return result;
     }
     if prefix.starts_with(b"MZ") {
@@ -469,6 +469,7 @@ fn probe_embedded_zip_local_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool 
     out.format = "zip".to_string();
     out.confidence = "strong".to_string();
     out.standalone = true;
+    out.sfx = true;
     out.structure_offset = Some(offset as u64);
     out.internal_volume_number = Some(1);
     out.anchor_roles.push("standalone");
