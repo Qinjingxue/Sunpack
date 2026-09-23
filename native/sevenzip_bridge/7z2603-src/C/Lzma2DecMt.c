@@ -58,8 +58,7 @@ typedef struct
   Byte dec_created;
   Byte needInit;
   
-  Byte *outBuf;
-  size_t outBufSize;
+  CSunpackVmBuffer outBuf;
 
   EMtDecParseState state;
   ELzma2ParseStatus parseStatus;
@@ -149,8 +148,7 @@ CLzma2DecMtHandle Lzma2DecMt_Create(ISzAllocPtr alloc, ISzAllocPtr allocMid)
     {
       CLzma2DecMtThread *t = &p->coders[i];
       t->dec_created = False;
-      t->outBuf = NULL;
-      t->outBufSize = 0;
+      SunpackVmBuffer_Construct(&t->outBuf);
     }
   }
   #endif
@@ -167,12 +165,7 @@ static void Lzma2DecMt_FreeOutBufs(CLzma2DecMt *p)
   for (i = 0; i < MTDEC_THREADS_MAX; i++)
   {
     CLzma2DecMtThread *t = &p->coders[i];
-    if (t->outBuf)
-    {
-      ISzAlloc_Free(p->allocMid, t->outBuf);
-      t->outBuf = NULL;
-      t->outBufSize = 0;
-    }
+    SunpackVmBuffer_Release(&t->outBuf);
   }
 }
 
@@ -417,7 +410,7 @@ static SRes Lzma2DecMt_MtCallback_PreCode(void *pp, unsigned coderIndex)
 {
   CLzma2DecMt *me = (CLzma2DecMt *)pp;
   CLzma2DecMtThread *t = &me->coders[coderIndex];
-  Byte *dest = t->outBuf;
+  Byte *dest;
 
   if (t->inPreSize == 0)
   {
@@ -425,24 +418,10 @@ static SRes Lzma2DecMt_MtCallback_PreCode(void *pp, unsigned coderIndex)
     return t->codeRes;
   }
 
-  if (!dest || t->outBufSize < t->outPreSize)
-  {
-    if (dest)
-    {
-      ISzAlloc_Free(me->allocMid, dest);
-      t->outBuf = NULL;
-      t->outBufSize = 0;
-    }
+  if (!SunpackVmBuffer_Ensure(&t->outBuf, t->outPreSize))
+    return SZ_ERROR_MEM;
 
-    dest = (Byte *)ISzAlloc_Alloc(me->allocMid, t->outPreSize
-        // + (1 << 28)
-        );
-    // Sleep(200);
-    if (!dest)
-      return SZ_ERROR_MEM;
-    t->outBuf = dest;
-    t->outBufSize = t->outPreSize;
-  }
+  dest = t->outBuf.data;
 
   t->dec.decoder.dic = dest;
   t->dec.decoder.dicBufSize = (SizeT)t->outPreSize;
@@ -534,7 +513,7 @@ static SRes Lzma2DecMt_MtCallback_Write(void *pp, unsigned coderIndex,
   CLzma2DecMt *me = (CLzma2DecMt *)pp;
   const CLzma2DecMtThread *t = &me->coders[coderIndex];
   size_t size = t->outCodeSize;
-  const Byte *data = t->outBuf;
+  const Byte *data = t->outBuf.data;
   BoolInt needContinue2 = True;
 
   UNUSED_VAR(src)
