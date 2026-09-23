@@ -194,10 +194,10 @@ from sunpack.some_domain.internal import ...
 跨领域不要依赖 internal。补 public facade 或把共享契约移到 `contracts`。
 
 ```python
-facts = bag._facts
+knowledge = task.knowledge()
 ```
 
-不要读取私有状态。使用 `FactBag.to_dict()` 或补公开方法。
+不要读取任务私有状态。使用 `ArchiveTask.knowledge()` / 类型化 contract，或补公开方法。
 
 ```python
 from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler
