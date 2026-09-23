@@ -12,7 +12,6 @@
 #include <cstdlib>
 #include <cmath>
 #include <filesystem>
-#include <future>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -621,6 +620,15 @@ std::mutex g_output_mutex;
 void print_json_line(const std::string& json) {
     std::lock_guard<std::mutex> lock(g_output_mutex);
     std::cout << json << "\n";
+    std::cout.flush();
+}
+
+void print_json_lines(
+    const std::string& first,
+    const std::string& second
+) {
+    std::lock_guard<std::mutex> lock(g_output_mutex);
+    std::cout << first << "\n" << second << "\n";
     std::cout.flush();
 }
 
@@ -1262,12 +1270,8 @@ public:
           queue_capacity_(configured_native_queue_capacity()),
           cpu_budget_(
               worker_count_,
-              [this] {
-                  // A newly available CPU credit can admit at most one new
-                  // base job immediately. Waking every worker only creates
-                  // scheduler and mutex contention on short jobs.
-                  condition_.notify_one();
-              }),
+              &NativeJobExecutor::on_cpu_capacity_available,
+              this),
           memory_guard_(
               worker_count_,
               memory_guard_config) {
@@ -1296,58 +1300,71 @@ public:
     NativeJobExecutor(const NativeJobExecutor&) = delete;
     NativeJobExecutor& operator=(const NativeJobExecutor&) = delete;
 
-    std::future<int> submit(std::string request) {
-        auto promise = std::make_shared<std::promise<int>>();
-        auto future = promise->get_future();
+    void submit(std::string request) {
         auto cancel_token = std::make_shared<std::atomic<bool>>(false);
-        const std::string job_id = json_string_field(request, "job_id", "");
         JobMetadata metadata = metadata_from_request(request);
+        const std::string queued_event =
+            metadata.job_id.empty()
+                ? std::string{}
+                : worker_event_json("job_queued", metadata, 0);
+        const std::string job_id = metadata.job_id;
+        bool rejected_for_capacity = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (stopping_) {
-                promise->set_value(-100);
-                return future;
+                return;
             }
-            if (queue_capacity_ != 0 && queue_.size() >= queue_capacity_) {
+            if (queue_capacity_ != 0 && queued_job_count_locked() >= queue_capacity_) {
                 any_job_failed_ = true;
-                promise->set_value(-2);
-                print_json_line(
-                    "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-                    "\",\"status\":\"failed\",\"native_status\":\"backpressure\","
-                    "\"retryable\":true,\"failure_stage\":\"native_admission\","
-                    "\"failure_kind\":\"queue_capacity\",\"message\":\"native job queue is full\"}");
-                print_worker_event(job_id, "job_finished", metadata);
-                return future;
+                rejected_for_capacity = true;
+            } else {
+                if (!job_id.empty()) {
+                    std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
+                    cancel_tokens_.insert_or_assign(
+                        job_id,
+                        JobControl{cancel_token});
+                }
+                Job job{
+                    std::move(request),
+                    std::move(cancel_token),
+                    std::move(metadata),
+                };
+                if (metadata.foreground) {
+                    foreground_queue_.push_back(std::move(job));
+                } else {
+                    background_queue_.push_back(std::move(job));
+                }
             }
-            if (!job_id.empty()) {
-                cancel_tokens_[job_id] = std::make_shared<JobControl>(cancel_token, nullptr);
-            }
-            queue_.push_back(Job{
-                std::move(request),
-                std::move(promise),
-                std::move(cancel_token),
-                metadata,
-            });
-            monitor_recheck_ = true;
         }
-        print_worker_event(job_id, "job_queued", metadata);
+
+        if (rejected_for_capacity) {
+            print_json_line(
+                "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
+                "\",\"status\":\"failed\",\"native_status\":\"backpressure\","
+                "\"retryable\":true,\"failure_stage\":\"native_admission\","
+                "\"failure_kind\":\"queue_capacity\",\"message\":\"native job queue is full\"}");
+            print_worker_event(job_id, "job_finished", metadata);
+            return;
+        }
+
+        if (!queued_event.empty()) {
+            print_json_line(queued_event);
+        }
         condition_.notify_one();
-        monitor_condition_.notify_one();
-        return future;
     }
 
     bool cancel(const std::string& job_id) noexcept {
         std::shared_ptr<std::atomic<bool>> token;
         std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> writer_to_wake;
         {
-            std::lock_guard<std::mutex> lock(mutex_);
+            std::lock_guard<std::mutex> lock(cancel_mutex_);
             const auto found = cancel_tokens_.find(job_id);
             if (found == cancel_tokens_.end()) {
                 return false;
             }
-            token = found->second->cancel_token;
+            token = found->second.cancel_token;
             // Locked only for this call: the token carries the cancel, the writer is just the thing to wake.
-            writer_to_wake = found->second->writer.lock();
+            writer_to_wake = found->second.writer.lock();
         }
         if (!token) {
             return false;
@@ -1359,7 +1376,9 @@ public:
             writer_to_wake->wake_waiters();
         }
 #endif
-        condition_.notify_all();
+        // One canceled queued job needs at most one execution lane. Baton
+        // passing handles any additional ready work without a wake-all storm.
+        condition_.notify_one();
         return true;
     }
 
@@ -1370,7 +1389,7 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         drain_condition_.wait(
             lock,
-            [this] { return queue_.empty() && active_jobs_ == 0; });
+            [this] { return queues_empty_locked() && active_jobs_ == 0; });
     }
 
     // cancel_pending_jobs: true (explicit shutdown) cancels every unfinished job, false (stdin EOF) drains first.
@@ -1386,13 +1405,19 @@ public:
                 return;
             }
             stopping_ = true;
-            if (cancel_pending_jobs) {
-                for (auto& entry : cancel_tokens_) {
-                    if (entry.second && entry.second->cancel_token) {
-                        entry.second->cancel_token->store(true, std::memory_order_release);
-                    }
+        }
+        if (cancel_pending_jobs) {
+            std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
+            for (auto& entry : cancel_tokens_) {
+                if (entry.second.cancel_token) {
+                    entry.second.cancel_token->store(true, std::memory_order_release);
                 }
             }
+        }
+        {
+            std::lock_guard<std::mutex> monitor_lock(monitor_mutex_);
+            monitor_stopping_ = true;
+            monitor_recheck_ = true;
         }
         condition_.notify_all();
         monitor_condition_.notify_all();
@@ -1417,28 +1442,31 @@ public:
 
 private:
     struct JobMetadata {
+        std::string job_id;
         std::string request_id;
         bool foreground = true;
         // Routing key for the per-volume write facility, resolved by the caller before submission; never empty in practice.
         std::string volume_key;
         // False only for dry runs, which write nothing and need no facility, writer threads or readiness gate.
         bool requires_writer = true;
+
+        // Lifecycle events reuse these fields four times per job. Escaping them
+        // once at submission avoids repeated allocations/string walks on the
+        // admission and completion hot paths.
+        std::string escaped_job_id;
+        std::string lifecycle_context_json;
     };
 
     struct Job {
         std::string request;
-        std::shared_ptr<std::promise<int>> promise;
         std::shared_ptr<std::atomic<bool>> cancel_token;
         JobMetadata metadata;
     };
 
     // The writer reference is deliberately weak: a strong one would keep a facility alive past its lease and could run ~AsyncFileWriter under the executor mutex.
     struct JobControl {
-        JobControl() = default;
-        JobControl(
-            std::shared_ptr<std::atomic<bool>> token,
-            std::shared_ptr<sunpack::sevenzip::AsyncFileWriter> bound_writer)
-            : cancel_token(std::move(token)), writer(std::move(bound_writer)) {}
+        explicit JobControl(std::shared_ptr<std::atomic<bool>> token)
+            : cancel_token(std::move(token)) {}
 
         std::shared_ptr<std::atomic<bool>> cancel_token;
         std::weak_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
@@ -1446,26 +1474,67 @@ private:
 
     static JobMetadata metadata_from_request(const std::string& request) noexcept {
         JobMetadata metadata;
+        metadata.job_id = json_string_field(request, "job_id", "");
         metadata.request_id = json_string_field(request, "request_id", "");
         if (metadata.request_id.empty()) {
-            metadata.request_id = json_string_field(request, "job_id", "");
+            metadata.request_id = metadata.job_id;
         }
         metadata.foreground = json_string_field(request, "origin", "foreground") != "watch";
         metadata.volume_key = json_string_field(request, "output_volume_key", "");
         metadata.requires_writer = !json_bool_field(request, "dry_run", false);
+        metadata.escaped_job_id = json_escape(metadata.job_id);
+        metadata.lifecycle_context_json =
+            ",\"request_id\":\"" + json_escape(metadata.request_id) +
+            "\",\"origin\":\"" + std::string(metadata.foreground ? "foreground" : "watch") +
+            "\",\"output_volume_key\":\"" + json_escape(metadata.volume_key) +
+            "\",\"requires_writer\":" + std::string(metadata.requires_writer ? "true" : "false");
         return metadata;
     }
 
-    std::size_t select_job_locked() const noexcept {
-        if (!cpu_budget_.can_acquire_base()) {
-            return queue_.size();
+    bool queues_empty_locked() const noexcept {
+        return foreground_queue_.empty() && background_queue_.empty();
+    }
+
+    std::size_t queued_job_count_locked() const noexcept {
+        return foreground_queue_.size() + background_queue_.size();
+    }
+
+    Job pop_next_job_locked() {
+        std::deque<Job>& selected =
+            foreground_queue_.empty() ? background_queue_ : foreground_queue_;
+        Job job = std::move(selected.front());
+        selected.pop_front();
+        return job;
+    }
+
+    static void on_cpu_capacity_available(void *context) noexcept {
+        auto *self = static_cast<NativeJobExecutor *>(context);
+        if (self) {
+            // NativeCpuBudget calls this only on a saturated->available edge,
+            // so no per-release queue hint is needed here.
+            self->condition_.notify_one();
         }
-        for (std::size_t index = 0; index < queue_.size(); ++index) {
-            if (queue_[index].metadata.foreground) {
-                return index;
-            }
+    }
+
+    void request_monitor_recheck() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(monitor_mutex_);
+            monitor_recheck_ = true;
         }
-        return queue_.empty() ? queue_.size() : 0;
+        monitor_condition_.notify_one();
+    }
+
+    std::string worker_event_json(
+        const char* event,
+        const JobMetadata& metadata,
+        std::size_t active_jobs = 0
+    ) const {
+        return
+            "{\"type\":\"native_event\",\"job_id\":\"" + metadata.escaped_job_id +
+            "\",\"event\":\"" + event +
+            "\"" + metadata.lifecycle_context_json +
+            ",\"active_jobs\":" + std::to_string(active_jobs) +
+            "}";
     }
 
     void print_worker_event(
@@ -1477,15 +1546,26 @@ private:
         if (job_id.empty()) {
             return;
         }
-        print_json_line(
-            "{\"type\":\"native_event\",\"job_id\":\"" + json_escape(job_id) +
-            "\",\"event\":\"" + event +
-            "\",\"request_id\":\"" + json_escape(metadata.request_id) +
-            "\",\"origin\":\"" + std::string(metadata.foreground ? "foreground" : "watch") +
-            "\",\"output_volume_key\":\"" + json_escape(metadata.volume_key) +
-            "\",\"requires_writer\":" + std::string(metadata.requires_writer ? "true" : "false") +
-            ",\"active_jobs\":" + std::to_string(active_jobs) +
-            "}");
+        print_json_line(worker_event_json(
+            event, metadata, active_jobs));
+    }
+
+    void print_job_start_events(
+        const Job& job,
+        std::size_t active_jobs
+    ) const noexcept {
+        if (job.metadata.job_id.empty()) {
+            return;
+        }
+        print_json_lines(
+            worker_event_json(
+                "job_admitted",
+                job.metadata,
+                active_jobs),
+            worker_event_json(
+                "job_started",
+                job.metadata,
+                active_jobs));
     }
 
     void print_active_event(
@@ -1494,7 +1574,7 @@ private:
         std::size_t active_jobs
     ) const noexcept {
         print_worker_event(
-            json_string_field(job.request, "job_id", ""),
+            job.metadata.job_id,
             event,
             job.metadata,
             active_jobs);
@@ -1635,8 +1715,11 @@ private:
             case Kind::Blocked:
             case Kind::Resumed:
                 if (transition.kind == Kind::Blocked) {
-                    // The only driver that starts sampling a blocked volume; without it a tick takes no registry lock.
+                    // A blocked volume is itself a controller event. Wake the
+                    // monitor directly instead of relying on unrelated job
+                    // admission/completion notifications.
                     space_monitor_->note_blocked();
+                    request_monitor_recheck();
                 }
                 break;
             case Kind::Status:
@@ -1666,16 +1749,24 @@ private:
 
     void monitor_loop() noexcept {
         std::optional<std::chrono::steady_clock::time_point> next_memory_poll;
+        std::uint64_t observed_activity_epoch = 0;
 
         while (true) {
-            std::unique_lock<std::mutex> wait_lock(mutex_);
+            std::unique_lock<std::mutex> wait_lock(monitor_mutex_);
             const auto now = std::chrono::steady_clock::now();
+            const bool has_active_jobs =
+                monitor_has_active_jobs_.load(std::memory_order_acquire);
+            const std::uint64_t activity_epoch =
+                monitor_activity_epoch_.load(std::memory_order_acquire);
 
-            if (active_jobs_ > 0) {
-                if (!next_memory_poll) {
-                    // The first active job samples immediately so a budget
-                    // left reduced by an earlier pressure episode is not stale
-                    // for a full polling interval.
+            if (has_active_jobs) {
+                if (activity_epoch != observed_activity_epoch) {
+                    // Every 0->1 active transition is a new activity episode.
+                    // Force its first memory sample immediately even if the
+                    // previous episode ended less than one poll interval ago.
+                    observed_activity_epoch = activity_epoch;
+                    next_memory_poll = now;
+                } else if (!next_memory_poll) {
                     next_memory_poll = now;
                 }
             } else {
@@ -1700,18 +1791,18 @@ private:
             }
 #endif
 
-            if (deadline) {
+            if (deadline && *deadline > now) {
                 monitor_condition_.wait_until(
                     wait_lock,
                     *deadline,
-                    [this] { return stopping_ || monitor_recheck_; });
-            } else {
+                    [this] { return monitor_stopping_ || monitor_recheck_; });
+            } else if (!deadline) {
                 monitor_condition_.wait(
                     wait_lock,
-                    [this] { return stopping_ || monitor_recheck_; });
+                    [this] { return monitor_stopping_ || monitor_recheck_; });
             }
 
-            if (stopping_) {
+            if (monitor_stopping_) {
                 break;
             }
 
@@ -1726,17 +1817,17 @@ private:
             space_monitor_->tick(wake_time);
 #endif
 
-            wait_lock.lock();
+            const bool active_after_tick =
+                monitor_has_active_jobs_.load(std::memory_order_acquire);
             const bool should_poll_memory =
-                active_jobs_ > 0 &&
+                active_after_tick &&
                 next_memory_poll &&
                 wake_time >= *next_memory_poll;
-            if (active_jobs_ == 0) {
+            if (!active_after_tick) {
                 next_memory_poll.reset();
             } else if (should_poll_memory) {
                 next_memory_poll = wake_time + kMemoryPollInterval;
             }
-            wait_lock.unlock();
 
             if (!should_poll_memory) {
                 continue;
@@ -1752,9 +1843,9 @@ private:
                     const auto snapshot = memory_guard_.snapshot();
                     cpu_budget_.set_effective_capacity(
                         snapshot.effective_cpu_budget);
-                    // Capacity increases already wake one admission waiter
-                    // through the CPU-budget callback; baton passing wakes any
-                    // additional jobs. Capacity reductions need no wakeup.
+                    // NativeCpuBudget emits at most one admission wake when
+                    // an effective-capacity increase changes the budget from
+                    // saturated to available; reductions need no wakeup.
                     print_memory_guard_event(snapshot);
                 }
             }
@@ -1763,27 +1854,22 @@ private:
     }
 
     // Fallback routing key: an unknown volume gets its own isolated facility rather than sharing another volume's writer.
-    static std::string synthetic_volume_key(const std::string& request) {
-        const std::string job_id = json_string_field(request, "job_id", "");
+    static std::string synthetic_volume_key(const std::string& job_id) {
         return job_id.empty() ? std::string("job:unidentified") : "job:" + job_id;
     }
 
     // Binds the facility so a cancel wakes only that volume's writer; the lease held by worker_loop stays the only owner.
     void register_cancel_writer(
-        const std::string& request,
+        const std::string& job_id,
         const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& writer
     ) noexcept {
-        if (!writer) {
+        if (!writer || job_id.empty()) {
             return;
         }
-        const std::string job_id = json_string_field(request, "job_id", "");
-        if (job_id.empty()) {
-            return;
-        }
-        std::lock_guard<std::mutex> lock(mutex_);
+        std::lock_guard<std::mutex> lock(cancel_mutex_);
         const auto found = cancel_tokens_.find(job_id);
         if (found != cancel_tokens_.end()) {
-            found->second->writer = writer;
+            found->second.writer = writer;
         }
     }
 
@@ -1792,42 +1878,47 @@ private:
             Job job;
             std::size_t admitted_jobs = 0;
             bool wake_next_job = false;
+            bool monitor_became_active = false;
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 condition_.wait(lock, [this] {
-                    return select_job_locked() < queue_.size() || (stopping_ && queue_.empty());
+                    const bool empty = queues_empty_locked();
+                    return (!empty && cpu_budget_.can_acquire_base()) ||
+                        (stopping_ && empty);
                 });
-                const std::size_t selected = select_job_locked();
-                if (selected == queue_.size()) {
-                    if (stopping_ && queue_.empty()) {
-                        break;
-                    }
-                    continue;
+                if (stopping_ && queues_empty_locked()) {
+                    break;
                 }
                 if (!cpu_budget_.try_acquire_base()) {
                     continue;
                 }
-                auto iterator = queue_.begin() + static_cast<std::ptrdiff_t>(selected);
-                job = std::move(*iterator);
-                queue_.erase(iterator);
+
+                job = pop_next_job_locked();
                 active_jobs_ += 1;
                 admitted_jobs = active_jobs_;
+                monitor_became_active = active_jobs_ == 1;
+                if (monitor_became_active) {
+                    monitor_has_active_jobs_.store(
+                        true, std::memory_order_release);
+                    monitor_activity_epoch_.fetch_add(
+                        1, std::memory_order_release);
+                }
                 wake_next_job =
-                    !queue_.empty() && cpu_budget_.can_acquire_base();
-                // Admission, not submission, is the authoritative point at
-                // which memory polling becomes active.
-                monitor_recheck_ = true;
+                    !queues_empty_locked() && cpu_budget_.can_acquire_base();
             }
+
             // Hand admission forward one worker at a time when multiple
             // credits are available, avoiding a notify-all thundering herd.
             if (wake_next_job) {
                 condition_.notify_one();
             }
-            monitor_condition_.notify_one();
-            print_active_event(job, "job_admitted", admitted_jobs);
-            print_active_event(job, "job_started", admitted_jobs);
+            if (monitor_became_active) {
+                request_monitor_recheck();
+            }
+
+            print_job_start_events(job, admitted_jobs);
             int code = -100;
-            const std::string job_id = json_string_field(job.request, "job_id", "");
+            const std::string& job_id = job.metadata.job_id;
             {
                 sunpack::sevenzip::NativeCpuJobContext cpu_job_context(cpu_budget_);
                 sunpack::sevenzip::NativeCpuContextScope cpu_scope(&cpu_job_context);
@@ -1835,16 +1926,15 @@ private:
                 if (job.metadata.requires_writer) {
                     // The lease is released before the job is reported finished, so active_jobs_ == 0 implies every finished job's lease is gone.
                     const std::string key = job.metadata.volume_key.empty()
-                        ? synthetic_volume_key(job.request)
+                        ? synthetic_volume_key(job_id)
                         : job.metadata.volume_key;
                     auto lease = writer_registry_->acquire(key);
                     if (lease.created_facility()) {
                         print_writer_facility_event("writer_facility_created", key);
                     }
-                    register_cancel_writer(job.request, lease.writer_pointer());
+                    register_cancel_writer(job_id, lease.writer_pointer());
                     // Registered inside the volume lease scope and declared after it: root output dir creation can fill the disk before make_job, and reverse destruction must deregister before the lease is released.
-                    const std::string scope_job_id = json_string_field(job.request, "job_id", "");
-                    sunpack::sevenzip::SpaceJobRegistration space_registration(lease, scope_job_id);
+                    sunpack::sevenzip::SpaceJobRegistration space_registration(lease, job_id);
                     code = run_request(job.request, lease.writer_pointer(), job.cancel_token);
                 } else {
                     code = run_request(job.request, nullptr, job.cancel_token);
@@ -1854,31 +1944,32 @@ private:
                 }
             }
             cpu_budget_.release(1);
+
             std::size_t remaining_jobs = 0;
             bool drained = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                if (!job_id.empty()) {
-                    cancel_tokens_.erase(job_id);
-                }
                 active_jobs_ = active_jobs_ > 0 ? active_jobs_ - 1 : 0;
                 remaining_jobs = active_jobs_;
-                drained = queue_.empty() && active_jobs_ == 0;
+                if (active_jobs_ == 0) {
+                    monitor_has_active_jobs_.store(
+                        false, std::memory_order_release);
+                }
+                drained = queues_empty_locked() && active_jobs_ == 0;
                 any_job_failed_ = any_job_failed_ || code != 0;
-                monitor_recheck_ = true;
             }
-            // cpu_budget_.release(1) already wakes one admission waiter.
-            // Drain waiters use a separate condition variable so completing a
-            // short job never broadcasts to the entire worker pool.
+            if (!job_id.empty()) {
+                std::lock_guard<std::mutex> cancel_lock(cancel_mutex_);
+                cancel_tokens_.erase(job_id);
+            }
+
+            // cpu_budget_.release(1) wakes at most one queued admission waiter.
+            // Drain waiters use a separate condition variable, while the
+            // low-frequency monitor is touched only on active/idle edges.
             if (drained) {
                 drain_condition_.notify_all();
             }
-            monitor_condition_.notify_one();
             print_active_event(job, "job_finished", remaining_jobs);
-            try {
-                job.promise->set_value(code);
-            } catch (...) {
-            }
         }
     }
 
@@ -1890,18 +1981,34 @@ private:
     sunpack::sevenzip::AsyncWriterConfig writer_config_;
     sunpack::sevenzip::VolumeWriterRegistryPtr writer_registry_;
     std::unique_ptr<sunpack::sevenzip::VolumeSpaceMonitor> space_monitor_;
-    std::deque<Job> queue_;
-    std::unordered_map<std::string, std::shared_ptr<JobControl>> cancel_tokens_;
+
+    // Scheduler hot state: foreground/background queues preserve the existing
+    // foreground-first policy without an O(n) scan or middle erase.
+    std::deque<Job> foreground_queue_;
+    std::deque<Job> background_queue_;
     std::mutex mutex_;
     std::condition_variable condition_;
     std::condition_variable drain_condition_;
+
+    // Cancellation bookkeeping is not scheduler state and must not contend
+    // with admission or queue selection.
+    std::unordered_map<std::string, JobControl> cancel_tokens_;
+    std::mutex cancel_mutex_;
+
+    // The controller has its own wait domain. Worker admission never takes
+    // this mutex except on the 0->1 / 1->0 activity edges.
+    std::mutex monitor_mutex_;
     std::condition_variable monitor_condition_;
+    std::atomic<bool> monitor_has_active_jobs_{false};
+    std::atomic<std::uint64_t> monitor_activity_epoch_{0};
+    bool monitor_recheck_ = false;
+    bool monitor_stopping_ = false;
+
     const std::size_t worker_count_;
     const std::size_t queue_capacity_;
     sunpack::sevenzip::NativeCpuBudget cpu_budget_;
     sunpack::sevenzip::NativeMemoryGuard memory_guard_;
     std::size_t active_jobs_ = 0;
-    bool monitor_recheck_ = false;
     bool any_job_failed_ = false;
     bool stopping_ = false;
 };
@@ -1931,7 +2038,7 @@ int run_message(
     if (command == "shutdown") {
         return 0;
     }
-    // Native owns queued work; keeping a future per message here would reintroduce a caller-side queue in the worker main.
+    // Native owns queued work and completion is reported through native events/results.
     executor.submit(request);
     return 0;
 }

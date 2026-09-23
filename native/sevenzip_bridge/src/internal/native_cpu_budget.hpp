@@ -2,7 +2,6 @@
 
 #include <atomic>
 #include <cstddef>
-#include <functional>
 
 namespace sunpack::sevenzip
 {
@@ -17,9 +16,12 @@ struct NativeCpuBudgetSnapshot
 class NativeCpuBudget final
 {
 public:
+    using CapacityAvailableCallback = void (*)(void *) noexcept;
+
     explicit NativeCpuBudget(
         std::size_t nominal_capacity,
-        std::function<void()> capacity_available = {});
+        CapacityAvailableCallback capacity_available = nullptr,
+        void *capacity_available_context = nullptr) noexcept;
 
     bool try_acquire_base() noexcept;
     std::size_t acquire_up_to(
@@ -40,22 +42,21 @@ private:
     const std::size_t nominal_capacity_;
     std::atomic<std::size_t> effective_capacity_;
     std::atomic<std::size_t> reserved_credits_{0};
-    std::function<void()> capacity_available_;
+    CapacityAvailableCallback capacity_available_;
+    void *capacity_available_context_;
 };
 
 struct NativeCpuJobSnapshot
 {
     std::size_t current_extra_credits = 0;
     std::size_t peak_extra_credits = 0;
-    std::size_t total_extra_credits_granted = 0;
 };
 
 class NativeCpuJobContext final
 {
 public:
     explicit NativeCpuJobContext(
-        NativeCpuBudget &budget,
-        std::function<void(NativeCpuJobSnapshot)> change_sink = {}) noexcept;
+        NativeCpuBudget &budget) noexcept;
     ~NativeCpuJobContext();
 
     std::size_t acquire_extra(
@@ -69,8 +70,6 @@ private:
     NativeCpuBudget *budget_;
     std::atomic<std::size_t> current_extra_{0};
     std::atomic<std::size_t> peak_extra_{0};
-    std::atomic<std::size_t> total_extra_granted_{0};
-    std::function<void(NativeCpuJobSnapshot)> change_sink_;
 };
 
 class NativeCpuContextScope final
