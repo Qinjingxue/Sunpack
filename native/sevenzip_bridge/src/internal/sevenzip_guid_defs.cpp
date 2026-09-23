@@ -29,6 +29,8 @@
 #include "7zip/IProgress.h"
 #include "7zip/IStream.h"
 
+#include "internal/positioned_output.hpp"
+
 Z7_DEFINE_GUID(CLSID_CArchiveHandler,
                k_7zip_GUID_Data1,
                k_7zip_GUID_Data2,
