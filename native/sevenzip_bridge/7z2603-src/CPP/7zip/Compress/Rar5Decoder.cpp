@@ -1896,12 +1896,6 @@ namespace NCompress
         return S_OK;
       }
 
-      bool IsDone()
-      {
-        std::lock_guard<std::mutex> lock(Mutex);
-        return Done;
-      }
-
       HRESULT Wait()
       {
         std::unique_lock<std::mutex> lock(Mutex);
