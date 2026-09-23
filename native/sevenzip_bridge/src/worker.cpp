@@ -623,6 +623,15 @@ void print_json_line(const std::string& json) {
     std::cout.flush();
 }
 
+void print_json_lines(
+    const std::string& first,
+    const std::string& second
+) {
+    std::lock_guard<std::mutex> lock(g_output_mutex);
+    std::cout << first << "\n" << second << "\n";
+    std::cout.flush();
+}
+
 std::string status_to_string(sunpack::sevenzip::PasswordTestStatus status) {
     return sunpack::sevenzip::status_name(status);
 }
@@ -1501,6 +1510,23 @@ private:
         monitor_condition_.notify_one();
     }
 
+    std::string worker_event_json(
+        const std::string& job_id,
+        const char* event,
+        const JobMetadata& metadata,
+        std::size_t active_jobs = 0
+    ) const {
+        return
+            "{\"type\":\"native_event\",\"job_id\":\"" + json_escape(job_id) +
+            "\",\"event\":\"" + event +
+            "\",\"request_id\":\"" + json_escape(metadata.request_id) +
+            "\",\"origin\":\"" + std::string(metadata.foreground ? "foreground" : "watch") +
+            "\",\"output_volume_key\":\"" + json_escape(metadata.volume_key) +
+            "\",\"requires_writer\":" + std::string(metadata.requires_writer ? "true" : "false") +
+            ",\"active_jobs\":" + std::to_string(active_jobs) +
+            "}";
+    }
+
     void print_worker_event(
         const std::string& job_id,
         const char* event,
@@ -1510,15 +1536,28 @@ private:
         if (job_id.empty()) {
             return;
         }
-        print_json_line(
-            "{\"type\":\"native_event\",\"job_id\":\"" + json_escape(job_id) +
-            "\",\"event\":\"" + event +
-            "\",\"request_id\":\"" + json_escape(metadata.request_id) +
-            "\",\"origin\":\"" + std::string(metadata.foreground ? "foreground" : "watch") +
-            "\",\"output_volume_key\":\"" + json_escape(metadata.volume_key) +
-            "\",\"requires_writer\":" + std::string(metadata.requires_writer ? "true" : "false") +
-            ",\"active_jobs\":" + std::to_string(active_jobs) +
-            "}");
+        print_json_line(worker_event_json(
+            job_id, event, metadata, active_jobs));
+    }
+
+    void print_job_start_events(
+        const Job& job,
+        std::size_t active_jobs
+    ) const noexcept {
+        if (job.metadata.job_id.empty()) {
+            return;
+        }
+        print_json_lines(
+            worker_event_json(
+                job.metadata.job_id,
+                "job_admitted",
+                job.metadata,
+                active_jobs),
+            worker_event_json(
+                job.metadata.job_id,
+                "job_started",
+                job.metadata,
+                active_jobs));
     }
 
     void print_active_event(
@@ -1707,7 +1746,7 @@ private:
             std::unique_lock<std::mutex> wait_lock(monitor_mutex_);
             const auto now = std::chrono::steady_clock::now();
             const bool has_active_jobs =
-                monitor_active_jobs_.load(std::memory_order_acquire) != 0;
+                monitor_has_active_jobs_.load(std::memory_order_acquire);
 
             if (has_active_jobs) {
                 if (!next_memory_poll) {
@@ -1765,7 +1804,7 @@ private:
 #endif
 
             const bool active_after_tick =
-                monitor_active_jobs_.load(std::memory_order_acquire) != 0;
+                monitor_has_active_jobs_.load(std::memory_order_acquire);
             const bool should_poll_memory =
                 active_after_tick &&
                 next_memory_poll &&
@@ -1842,9 +1881,11 @@ private:
                 job = pop_next_job_locked();
                 active_jobs_ += 1;
                 admitted_jobs = active_jobs_;
-                monitor_became_active =
-                    monitor_active_jobs_.fetch_add(
-                        1, std::memory_order_acq_rel) == 0;
+                monitor_became_active = active_jobs_ == 1;
+                if (monitor_became_active) {
+                    monitor_has_active_jobs_.store(
+                        true, std::memory_order_release);
+                }
                 wake_next_job =
                     !queues_empty_locked() && cpu_budget_.can_acquire_base();
             }
@@ -1858,8 +1899,7 @@ private:
                 request_monitor_recheck();
             }
 
-            print_active_event(job, "job_admitted", admitted_jobs);
-            print_active_event(job, "job_started", admitted_jobs);
+            print_job_start_events(job, admitted_jobs);
             int code = -100;
             const std::string& job_id = job.metadata.job_id;
             {
@@ -1888,15 +1928,16 @@ private:
             }
             cpu_budget_.release(1);
 
-            const bool monitor_became_idle =
-                monitor_active_jobs_.fetch_sub(
-                    1, std::memory_order_acq_rel) == 1;
             std::size_t remaining_jobs = 0;
             bool drained = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 active_jobs_ = active_jobs_ > 0 ? active_jobs_ - 1 : 0;
                 remaining_jobs = active_jobs_;
+                if (active_jobs_ == 0) {
+                    monitor_has_active_jobs_.store(
+                        false, std::memory_order_release);
+                }
                 drained = queues_empty_locked() && active_jobs_ == 0;
                 any_job_failed_ = any_job_failed_ || code != 0;
             }
@@ -1910,9 +1951,6 @@ private:
             // low-frequency monitor is touched only on active/idle edges.
             if (drained) {
                 drain_condition_.notify_all();
-            }
-            if (monitor_became_idle) {
-                request_monitor_recheck();
             }
             print_active_event(job, "job_finished", remaining_jobs);
         }
@@ -1945,7 +1983,7 @@ private:
     // this mutex except on the 0->1 / 1->0 activity edges.
     std::mutex monitor_mutex_;
     std::condition_variable monitor_condition_;
-    std::atomic<std::size_t> monitor_active_jobs_{0};
+    std::atomic<bool> monitor_has_active_jobs_{false};
     bool monitor_recheck_ = false;
     bool monitor_stopping_ = false;
 
