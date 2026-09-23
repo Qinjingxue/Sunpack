@@ -119,6 +119,10 @@ class DetectionScanSession:
             snapshot = self.snapshot_for_directory(directory)
             if filesystem_routed:
                 snapshot = snapshot.file_route_view(FILESYSTEM_ROUTE_RELATIONS)
+                if len(snapshot) == 0:
+                    self._relation_groups[cache_key] = []
+                    self._relation_group_signatures[cache_key] = signature
+                    return []
             groups = self.relations.build_candidate_groups(
                 snapshot,
                 path_passwords=path_passwords,
