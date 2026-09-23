@@ -2,7 +2,7 @@
 
 [English](../development_boundaries.md) | **简体中文**
 
-本文档是 SunPack 当前架构的边界约定。项目采用 native-first、verification-driven 流水线：文件系统扫描/监控、关系、检测、结构分析、密码、解压、校验、后处理和 CLI 都应保持清晰职责。
+本文档是 SunPack 当前架构的边界约定。项目采用 native-first、verification-driven 流水线：文件系统扫描、Watch 监控、关系、检测、结构分析、密码、解压、校验、后处理和 CLI 都应保持清晰职责。
 
 ## 总原则
 
@@ -89,7 +89,7 @@ contracts
 | 解压 | `extraction.scheduler.ExtractionScheduler` | 单归档输出目录、密码解析、worker 解压。 |
 | 校验 | `verification.VerificationScheduler` | 解压结果完整度、来源完整性和下一步决策。 |
 | 后处理 | `postprocess.actions.PostProcessActions` | 成功后清理和扁平化。 |
-| 文件系统监控 | `watch.runtime.run_watch_service` / `watch.WatchScheduler` | CLI/GUI 共用服务入口、watchdog 事件、活跃到静默状态机和自动处理。 |
+| Watch | `watch.runtime.run_watch_service` / `watch.WatchScheduler` | CLI/GUI 共用服务入口、watchdog 事件、活跃到静默状态机和自动处理。 |
 | Native ABI | `support.sevenzip_bridge` | C++ 7z.dll bridge 绑定和缓存。 |
 
 ## 领域边界
@@ -199,7 +199,7 @@ knowledge = task.knowledge()
 不要读取任务私有状态。使用 `ArchiveTask.knowledge()` / 类型化 contract，或补公开方法。
 
 ```python
-from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler
+from sunpack.coordinator.engine import PipelineEngine  # inside watch scheduler
 ```
 
 `watch` 不直接构造 coordinator engine。应用组合层创建并启动进程级
@@ -246,7 +246,8 @@ sunpack/
   coordinator/  pipeline 编排、批量调度和递归
   detection/    候选检测、fact 采集、结构规则判断
   extraction/   worker 解压黑盒和解压结果
-  filesystem/   通用目录扫描、过滤和 watcher 监控能力
+  filesystem/   通用目录扫描和过滤
+  watch/         OS 监控、文件稳定性判断、持久 Watch 状态和 pipeline 提交
   passwords/    密码候选、调度和 verifier
   postprocess/  解压成功后的清理和扁平化
   relations/    文件关系、分卷和候选组

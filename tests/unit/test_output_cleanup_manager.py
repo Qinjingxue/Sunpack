@@ -107,9 +107,8 @@ def test_output_deletion_primitives_are_confined_to_approved_infrastructure():
         Path("sunpack/support/output_cleanup.py"),
         Path("sunpack/cli/persistent_process.py"),
         Path("sunpack/coordinator/reporting.py"),
-        Path("sunpack/filesystem/watcher/scheduler.py"),
-        Path("sunpack/filesystem/watcher/service.py"),
-        Path("sunpack/filesystem/watcher/state.py"),
+        Path("sunpack/watch/service.py"),
+        Path("sunpack/watch/state.py"),
         Path("sunpack/support/resource_lifecycle.py"),
     }
     violations: list[str] = []

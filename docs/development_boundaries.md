@@ -2,7 +2,7 @@
 
 **English** | [简体中文](zh-CN/development_boundaries.md)
 
-This document defines the boundary conventions of the current SunPack architecture. The project uses a native-first, verification-driven pipeline: filesystem scanning/monitoring, relations, detection, structural analysis, passwords, extraction, verification, post-processing, and the CLI all keep clear responsibilities.
+This document defines the boundary conventions of the current SunPack architecture. The project uses a native-first, verification-driven pipeline: filesystem scanning, Watch monitoring, relations, detection, structural analysis, passwords, extraction, verification, post-processing, and the CLI all keep clear responsibilities.
 
 ## General principles
 
@@ -87,7 +87,7 @@ contracts
 | Extraction | `extraction.scheduler.ExtractionScheduler` | Per-archive output directory, password resolution, worker extraction. |
 | Verification | `verification.VerificationScheduler` | Extraction result completeness, source integrity, and the next-step decision. |
 | Post-processing | `postprocess.actions.PostProcessActions` | Cleanup and flattening after success. |
-| Filesystem monitoring | `watch.runtime.run_watch_service` / `watch.WatchScheduler` | Shared CLI/GUI service entry point, watchdog events, the active-to-quiet state machine, and automatic processing. |
+| Watch | `watch.runtime.run_watch_service` / `watch.WatchScheduler` | Shared CLI/GUI service entry point, watchdog events, the active-to-quiet state machine, and automatic processing. |
 
 ## Domain boundaries
 
@@ -196,7 +196,7 @@ knowledge = task.knowledge()
 Do not read private task state. Use `ArchiveTask.knowledge()` / typed contracts, or add a public method.
 
 ```python
-from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler
+from sunpack.coordinator.engine import PipelineEngine  # inside watch scheduler
 ```
 
 `watch` does not construct the coordinator engine directly. The application composition layer creates and starts the process-level
@@ -242,7 +242,8 @@ sunpack/
   coordinator/  Pipeline orchestration, batch scheduling, and recursion
   detection/    Candidate detection, fact collection, structural rule decisions
   extraction/   Worker extraction black box and extraction results
-  filesystem/   General directory scanning, filtering, and watcher monitoring capability
+  filesystem/   General directory scanning and filtering
+  watch/         OS monitoring, readiness tracking, durable watch state, and pipeline submission
   passwords/    Password candidates, scheduling, and verifiers
   postprocess/  Cleanup and flattening after successful extraction
   relations/    File relationships, volumes, and candidate groups
