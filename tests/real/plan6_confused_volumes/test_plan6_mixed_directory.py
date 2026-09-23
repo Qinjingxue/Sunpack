@@ -1,4 +1,3 @@
-from tests.real.plan1_real_archives.plan1_support import detected_ext
 from __future__ import annotations
 
 import pytest
@@ -7,7 +6,7 @@ from tests.helpers.detection_probe import detect_archive_hits
 from tests.helpers.marker_utils import marker_was_extracted
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar
-from tests.real.plan1_real_archives.plan1_support import run_plan1_pipeline
+from tests.real.plan1_real_archives.plan1_support import detected_ext, run_plan1_pipeline
 from tests.real.plan6_confused_volumes.plan6_support import (
     SCENARIOS,
     apply_volume_confusion,
