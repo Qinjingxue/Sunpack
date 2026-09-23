@@ -802,6 +802,44 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     positionedOut = NULL;
   positionedWrap.Init(positionedOut);
 
+  /*
+    Preferred SunPack path: discover LZMA2 dictionary-reset runs by reading
+    only their headers, then let each lane read its own packed range. This
+    avoids both legacy full decoded-run buffers and MtDec's compressed-run
+    staging lists. Nothing is committed until the complete run plan has been
+    validated against the coder's packed/unpacked sizes.
+  */
+  if (positionedOut && inSize && outSize && _finishMode)
+  {
+    UInt64 directIn = 0;
+    UInt64 directOut = 0;
+    int directIsMT = False;
+    UInt32 directThreads = 1;
+    #ifndef Z7_ST
+    directThreads = props.numThreads;
+    #endif
+
+    const HRESULT directRes = TryDecodePositionedLzma2Runs(
+        inStream,
+        positionedOut,
+        _prop,
+        directThreads,
+        _inBufSize,
+        _outStep,
+        inSize,
+        outSize,
+        progress,
+        directIn,
+        directOut,
+        directIsMT);
+
+    if (directRes != E_NOTIMPL)
+    {
+      _inProcessed = directIn;
+      return directRes;
+    }
+  }
+
   #ifndef Z7_ST
   /*
     Full-output buffering used outBlockMax as a memory bound. Positioned mode
