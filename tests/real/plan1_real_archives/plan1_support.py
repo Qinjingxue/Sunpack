@@ -42,8 +42,13 @@ _FORMAT_TO_EXT = {
 }
 
 
+def detected_ext_from_format(format_hint: str) -> str:
+    normalized = str(format_hint or "").lower().lstrip(".")
+    return _FORMAT_TO_EXT.get(normalized, f".{normalized}" if normalized else "")
+
+
 def detected_ext(hit) -> str:
-    return _FORMAT_TO_EXT.get(str(hit.format or "").lower(), f".{hit.format}" if hit.format else "")
+    return detected_ext_from_format(hit.format)
 
 
 def container_type(hit) -> str:
