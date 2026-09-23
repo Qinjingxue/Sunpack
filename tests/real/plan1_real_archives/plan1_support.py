@@ -30,6 +30,33 @@ EXPECTED_DETECTED_EXT = {
 
 PLAIN_FORMATS = list(EXPECTED_DETECTED_EXT)
 
+_FORMAT_TO_EXT = {
+    "zip": ".zip",
+    "rar": ".rar",
+    "7z": ".7z",
+    "tar": ".tar",
+    "gzip": ".gz",
+    "bzip2": ".bz2",
+    "xz": ".xz",
+    "zstd": ".zst",
+}
+
+
+def detected_ext(hit) -> str:
+    return _FORMAT_TO_EXT.get(str(hit.format or "").lower(), f".{hit.format}" if hit.format else "")
+
+
+def container_type(hit) -> str:
+    return str(hit.format or "")
+
+
+def probe_offset(hit) -> int:
+    if hit.segments:
+        return int(hit.segments[0].start_offset or 0)
+    segment = hit.archive_input.segment
+    return int(segment.start or 0) if segment is not None else 0
+
+
 
 def plan1_config(passwords: list[str] | None = None) -> dict:
     """第 1 条测试统一配置：所有 tar 递归使用 recur=*。
@@ -143,17 +170,17 @@ def assert_plan1_success(
     passwords: list[str] | None = None,
 ) -> None:
     hits = detect_archive_hits(case.entry_path)
-    actual_ext = hits[0].fact_bag.get("file.detected_ext") if hits else None
+    actual_ext = detected_ext(hits[0]) if hits else None
     if error_info is not None:
         error_info["expected_detected_ext"] = expected_ext
         error_info["actual_detected_ext"] = actual_ext
         error_info["detection_hit_count"] = len(hits)
         error_info["detection_hits"] = [
             {
-                "detected_ext": hit.fact_bag.get("file.detected_ext"),
-                "container_type": hit.fact_bag.get("file.container_type"),
-                "member_paths": len(hit.fact_bag.get("candidate.member_paths") or []),
-                "probe_offset": hit.fact_bag.get("file.probe_offset"),
+                "detected_ext": detected_ext(hit),
+                "container_type": container_type(hit),
+                "member_paths": len(hit.member_paths),
+                "probe_offset": probe_offset(hit),
             }
             for hit in hits
         ]
@@ -164,7 +191,7 @@ def assert_plan1_success(
         f"detected format mismatch: expected {expected_ext}, got {actual_ext}"
     )
     if expected_container is not None:
-        actual_container = hits[0].fact_bag.get("file.container_type")
+        actual_container = container_type(hits[0])
         if error_info is not None:
             error_info["expected_container_type"] = expected_container
             error_info["actual_container_type"] = actual_container
@@ -172,7 +199,7 @@ def assert_plan1_success(
             f"container type mismatch: expected {expected_container}, got {actual_container}"
         )
     if expected_member_count is not None:
-        actual_members = len(hits[0].fact_bag.get("candidate.member_paths") or [])
+        actual_members = len(hits[0].member_paths)
         if error_info is not None:
             error_info["expected_member_count"] = expected_member_count
             error_info["actual_member_count"] = actual_members
