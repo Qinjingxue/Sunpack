@@ -1,6 +1,6 @@
 import pytest
 
-from sunpack.analysis import (
+from sunpack.core.analysis import (
     AnalysisBudget,
     AnalysisCapability,
     AnalysisCost,
@@ -9,7 +9,7 @@ from sunpack.analysis import (
     FileAnalysisSource,
     MultiVolumeAnalysisSource,
 )
-from sunpack.analysis.result import ArchiveAnalysisReport
+from sunpack.core.analysis.result import ArchiveAnalysisReport
 
 
 class _RecordingScheduler:

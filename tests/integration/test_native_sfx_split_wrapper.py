@@ -1,12 +1,12 @@
 import pytest
 
-from sunpack.config.loader import load_config
-from sunpack.coordinator.task_scan import direct_file_task
-from sunpack.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.passwords.verifier.rar_fast import RarFastVerifier
-from sunpack.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
-from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
-from sunpack.support import archive_knowledge_projection as knowledge_view
+from sunpack.core.config.loader import load_config
+from sunpack.pipeline.coordinator.task_scan import direct_file_task
+from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
+from sunpack.core.passwords.verifier.rar_fast import RarFastVerifier
+from sunpack.core.passwords.verifier.seven_zip_fast import SevenZipFastVerifier
+from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
+from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar_sfx, require_7z
 

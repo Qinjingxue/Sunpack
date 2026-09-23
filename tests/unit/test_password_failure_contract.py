@@ -1,16 +1,16 @@
 import pytest
 
-from sunpack.contracts.failures import FailureInfo, FailureKind
-from sunpack.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.extraction import ExtractionResult
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.passwords.candidates import PasswordCandidatePipeline
-from sunpack.passwords.job import PasswordJob
-from sunpack.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
-from sunpack.passwords.verifier import PasswordBatchVerification
-from sunpack.passwords.verifier.base import VERIFIER_STATUSES, normalize_verifier_status
-from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
-from sunpack.verification import VerificationScheduler
-from sunpack.contracts.verification import DECISION_REQUEST_PASSWORD, CONTENT_INTEGRITY_UNKNOWN
+from sunpack.core.passwords.candidates import PasswordCandidatePipeline
+from sunpack.core.passwords.job import PasswordJob
+from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
+from sunpack.core.passwords.verifier import PasswordBatchVerification
+from sunpack.core.passwords.verifier.base import VERIFIER_STATUSES, normalize_verifier_status
+from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
+from sunpack.pipeline.verification import VerificationScheduler
+from sunpack.core.contracts.verification import DECISION_REQUEST_PASSWORD, CONTENT_INTEGRITY_UNKNOWN
 
 
 @pytest.mark.parametrize("status", sorted(VERIFIER_STATUSES))

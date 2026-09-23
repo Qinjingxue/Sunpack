@@ -3,8 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.contracts.tasks import ArchiveTask
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.tasks import ArchiveTask
 
 
 def make_archive_task(

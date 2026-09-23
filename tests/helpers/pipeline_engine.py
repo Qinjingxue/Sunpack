@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 import asyncio
 
-from sunpack.coordinator.engine import PipelineEngine
+from sunpack.pipeline.coordinator.engine import PipelineEngine
 
 
 def execute_pipeline(config: dict, targets: str | Iterable[str], *, direct: bool = False):

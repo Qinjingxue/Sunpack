@@ -14,8 +14,8 @@ from typing import Any, Callable
 
 import pytest
 
-from sunpack.coordinator.engine import PipelineEngine
-from sunpack.watch.scheduler import WatchRunResult, WatchScheduler
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.scheduler import WatchRunResult, WatchScheduler
 from tests.helpers.watch_memory import WatchMemorySampler as MemorySampler
 from tests.helpers.marker_utils import marker_scan_state
 from tests.helpers.real_archives import (

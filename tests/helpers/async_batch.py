@@ -1,6 +1,6 @@
 import asyncio
 
-from sunpack.coordinator.async_work import AsyncWorkBroker
+from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
 
 
 def _send(state, result):

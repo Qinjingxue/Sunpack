@@ -1,5 +1,5 @@
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.support.output_paths import default_output_dir_for_task
+from sunpack.core.support.output_paths import default_output_dir_for_task
 
 
 def _task(path):

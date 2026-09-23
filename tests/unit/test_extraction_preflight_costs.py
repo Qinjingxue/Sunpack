@@ -1,10 +1,10 @@
 import json
 from types import SimpleNamespace
 
-from sunpack.contracts.failures import FailureKind
+from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.archive_tasks import make_archive_task, merge_task_knowledge
-from sunpack.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
-from sunpack.passwords.result import PasswordResolution, PasswordResolutionStatus
+from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
+from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 
 
 def test_successful_first_attempt_does_not_query_python_free_space(tmp_path):

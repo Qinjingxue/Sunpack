@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sunpack.platform.windows.toast_host import _check_hresult, _load_library, self_test_toast
+from sunpack.core.platform.windows.toast_host import _check_hresult, _load_library, self_test_toast
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -14,7 +14,7 @@ def test_toast_self_test_wrapper_checks_native_hresult(monkeypatch):
             calls.append(True)
             return 0
 
-    monkeypatch.setattr("sunpack.platform.windows.toast_host._load_library", lambda: Library())
+    monkeypatch.setattr("sunpack.core.platform.windows.toast_host._load_library", lambda: Library())
 
     self_test_toast()
 

@@ -2,8 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from sunpack.watch.scanner import WatchCandidate
-from sunpack.watch.state import WatchStateStore
+from sunpack.runtime.watch.scanner import WatchCandidate
+from sunpack.runtime.watch.state import WatchStateStore
 
 
 def _candidate(path, *, size=10, mtime=1.0):
@@ -81,7 +81,7 @@ def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
 
 def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     import threading
-    import sunpack.watch.scheduler as scheduler_module
+    import sunpack.runtime.watch.scheduler as scheduler_module
 
     source = tmp_path / "queued.zip"
     source.write_bytes(b"payload")
@@ -124,7 +124,7 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
 
 
 def test_noncritical_attempt_refresh_does_not_force_an_extra_fsync(tmp_path, monkeypatch):
-    import sunpack.watch.state as state_module
+    import sunpack.runtime.watch.state as state_module
 
     state = WatchStateStore(str(tmp_path / "state.json"))
     source = tmp_path / "queued.zip"
@@ -137,7 +137,7 @@ def test_noncritical_attempt_refresh_does_not_force_an_extra_fsync(tmp_path, mon
 
 
 def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
-    import sunpack.watch.scheduler as scheduler_module
+    import sunpack.runtime.watch.scheduler as scheduler_module
 
     scheduler = object.__new__(scheduler_module.WatchScheduler)
     password_archive = tmp_path / "password.zip"
@@ -189,7 +189,7 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
 
 def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
     import threading
-    import sunpack.watch.scheduler as scheduler_module
+    import sunpack.runtime.watch.scheduler as scheduler_module
 
     source = tmp_path / "outer.zip"
     source.write_bytes(b"x")
@@ -214,7 +214,7 @@ def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
 
 def test_departed_unowned_path_is_still_forgotten(tmp_path):
     import threading
-    import sunpack.watch.scheduler as scheduler_module
+    import sunpack.runtime.watch.scheduler as scheduler_module
 
     source = tmp_path / "gone.zip"
     source.write_bytes(b"x")
@@ -239,7 +239,7 @@ def test_departed_unowned_path_is_still_forgotten(tmp_path):
 
 def test_critical_semantic_event_propagates_callback_failure():
     import pytest
-    from sunpack.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
+    from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 
     runner = SevenZipRunner({})
     runner.progress_callback = lambda *_args: (_ for _ in ()).throw(RuntimeError("state write failed"))
@@ -274,7 +274,7 @@ def test_committed_roots_collapse_nested_outputs(tmp_path):
 def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path):
     import threading
     import pytest
-    import sunpack.watch.scheduler as scheduler_module
+    import sunpack.runtime.watch.scheduler as scheduler_module
 
     source = tmp_path / "archive.zip"
     source.write_bytes(b"payload")
@@ -327,7 +327,7 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
 
 
 def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):
-    import sunpack.watch.scheduler as scheduler_module
+    import sunpack.runtime.watch.scheduler as scheduler_module
 
     state = WatchStateStore(str(tmp_path / "state.json"))
     archive = tmp_path / "inner.zip"
@@ -353,8 +353,8 @@ def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):
 
 def test_committed_publication_recovers_namespace_rollback_after_source_cleanup(tmp_path):
     """Durable publication intent makes the rename safely replayable after power loss."""
-    import sunpack.watch.scheduler as scheduler_module
-    from sunpack.support.watch_staging import publish_staging_output
+    import sunpack.runtime.watch.scheduler as scheduler_module
+    from sunpack.pipeline.coordinator.watch_staging import publish_staging_output
 
     state_path = tmp_path / "state.json"
     source = tmp_path / "outer.zip"

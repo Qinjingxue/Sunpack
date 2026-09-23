@@ -69,8 +69,8 @@ def sample(label: str) -> dict:
 
 def main() -> int:
     tracemalloc.start(10)
-    from sunpack.cli.cli import async_main
-    from sunpack.cli import persistent_runtime
+    from sunpack.runtime.cli.cli import async_main
+    from sunpack.runtime.cli import persistent_runtime
 
     root = benchmark_temp_dir("sunpack-residual-rss-")
     rows = []

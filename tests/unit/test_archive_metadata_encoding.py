@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sunpack.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
+from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 
 
 @pytest.mark.parametrize(

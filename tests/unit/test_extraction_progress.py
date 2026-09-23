@@ -1,6 +1,6 @@
 import json
 
-from sunpack.extraction.progress import build_extraction_progress_manifest, filter_extraction_manifest_payload, filter_extraction_outputs
+from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, filter_extraction_manifest_payload, filter_extraction_outputs
 
 
 def test_progress_manifest_preserves_archive_path_and_numbered_output_path(tmp_path):

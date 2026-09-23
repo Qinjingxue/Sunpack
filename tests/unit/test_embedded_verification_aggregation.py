@@ -1,4 +1,4 @@
-from sunpack.contracts.verification import (
+from sunpack.core.contracts.verification import (
     ASSESSMENT_COMPLETE,
     ASSESSMENT_PARTIAL,
     CONTENT_INTEGRITY_PAYLOAD_DAMAGED,
@@ -11,7 +11,7 @@ from sunpack.contracts.verification import (
     ArchiveCoverageSummary,
     VerificationResult,
 )
-from sunpack.verification.pipeline import aggregate_payload_verifications
+from sunpack.pipeline.verification.pipeline import aggregate_payload_verifications
 
 
 def _verification(*, decision, integrity, completeness, complete=0, failed=0):

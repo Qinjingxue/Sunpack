@@ -4,15 +4,15 @@ from dataclasses import asdict
 
 import pytest
 
-import sunpack.coordinator.engine as engine_module
-import sunpack.support.resource_lifecycle as resource_lifecycle
-from sunpack.contracts.pipeline import PipelineArtifacts, PipelineResponse
-from sunpack.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary
-from sunpack.contracts.run_context import RunContext
-from sunpack.coordinator.cleanup_refs import CleanupRefTable
-from sunpack.coordinator.engine import _CleanupRefScope, _commit_response
-from sunpack.postprocess.actions import PostProcessActions
-import sunpack.postprocess.internal.cleanup as cleanup
+import sunpack.pipeline.coordinator.engine as engine_module
+import sunpack.core.support.resource_lifecycle as resource_lifecycle
+from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineResponse
+from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary
+from sunpack.core.contracts.run_context import RunContext
+from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
+from sunpack.pipeline.coordinator.engine import _CleanupRefScope, _commit_response
+from sunpack.pipeline.postprocess.actions import PostProcessActions
+import sunpack.pipeline.postprocess.internal.cleanup as cleanup
 from tests.helpers.fake_pipeline_engine import _InlineBroker
 
 

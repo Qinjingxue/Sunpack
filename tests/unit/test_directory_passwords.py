@@ -1,8 +1,8 @@
 from types import SimpleNamespace
 
-from sunpack.passwords.directory_context import DirectoryPasswordContextStore
-from sunpack.passwords.internal.clipboard import _plausible_passwords
-from sunpack.passwords.internal.local_files import (
+from sunpack.core.passwords.directory_context import DirectoryPasswordContextStore
+from sunpack.core.passwords.internal.clipboard import _plausible_passwords
+from sunpack.core.passwords.internal.local_files import (
     DIRECTORY_PASSWORD_CONTEXT_KEY,
     discover_directory_passwords_for_archive,
     is_directory_password_file,

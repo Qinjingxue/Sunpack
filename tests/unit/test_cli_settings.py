@@ -1,6 +1,6 @@
 import json
 
-from sunpack.config import cli_settings, loader
+from sunpack.core.config import cli_settings, loader
 
 
 def _write_json(path, payload):

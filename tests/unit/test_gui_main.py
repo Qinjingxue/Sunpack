@@ -1,6 +1,6 @@
 import json
 
-import sunpack.gui.main as gui_main
+import sunpack.runtime.gui.main as gui_main
 
 
 def test_gui_main_runs_shared_watch_service(monkeypatch):

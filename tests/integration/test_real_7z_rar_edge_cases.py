@@ -3,9 +3,9 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.contracts.tasks import ArchiveTask
-from sunpack.coordinator.task_scan import direct_file_task
-from sunpack.extraction.scheduler import ExtractionScheduler
+from sunpack.core.contracts.tasks import ArchiveTask
+from sunpack.pipeline.coordinator.task_scan import direct_file_task
+from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar
 

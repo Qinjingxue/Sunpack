@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-from sunpack.coordinator.engine import _RequestRuntime
+from sunpack.pipeline.coordinator.engine import _RequestRuntime
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 
 
 class _Reporter:

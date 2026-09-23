@@ -4,7 +4,7 @@ import bz2
 import struct
 import zipfile
 
-from sunpack.analysis.volume_anchor import probe_volume_anchor_paths
+from sunpack.core.analysis.volume_anchor import probe_volume_anchor_paths
 
 
 def test_large_ordinary_candidate_uses_bounded_head_and_tail_reads(tmp_path):

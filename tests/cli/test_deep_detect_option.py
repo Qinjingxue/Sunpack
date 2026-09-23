@@ -1,7 +1,7 @@
 import pytest
 
-from sunpack.cli.cli import build_cli_parser
-from sunpack.cli.cli_context import CliContext
+from sunpack.runtime.cli.cli import build_cli_parser
+from sunpack.runtime.cli.cli_context import CliContext
 
 
 @pytest.mark.parametrize("command", ["extract", "scan", "inspect"])

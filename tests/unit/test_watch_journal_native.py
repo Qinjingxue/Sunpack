@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
-from sunpack.watch.journal_commit import journal_stats
-from sunpack.watch.state import WatchStateStore
+from sunpack.runtime.watch.journal_commit import journal_stats
+from sunpack.runtime.watch.state import WatchStateStore
 
 
 def _candidate(path, index):

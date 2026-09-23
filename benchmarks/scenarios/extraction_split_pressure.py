@@ -14,8 +14,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from sunpack.coordinator.engine import PipelineEngine
-from sunpack.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
 from tests.helpers.performance_config import archive_pressure_config
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory, normalize_archive_format

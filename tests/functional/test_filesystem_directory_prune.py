@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from sunpack.contracts.filesystem import FileEntry
-from sunpack.filesystem.directory_scanner import DirectoryScanner
+from sunpack.core.contracts.filesystem import FileEntry
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack_native import profile_directory_scan
 
 

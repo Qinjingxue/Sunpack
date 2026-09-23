@@ -2,9 +2,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from sunpack.verification.output_quality import compute_output_quality
-from sunpack.verification.pipeline import _decision_hint
-from sunpack.contracts.verification import (
+from sunpack.pipeline.verification.output_quality import compute_output_quality
+from sunpack.pipeline.verification.pipeline import _decision_hint
+from sunpack.core.contracts.verification import (
     ASSESSMENT_COMPLETE,
     DECISION_ACCEPT,
     DECISION_ACCEPT_PARTIAL,

@@ -224,7 +224,7 @@ std::wstring first_existing_config(const std::vector<std::wstring>& roots, const
     return {};
 }
 
-// Mirrors sunpack.i18n.context.normalize_language: only "zh" selects Chinese.
+// Mirrors sunpack.core.i18n.context.normalize_language: only "zh" selects Chinese.
 std::string normalize_language(const std::string& raw) {
     const std::size_t begin = raw.find_first_not_of(" \t\r\n");
     const std::size_t end = raw.find_last_not_of(" \t\r\n");
@@ -506,7 +506,7 @@ void write_stream(DWORD handle_id, const std::string& text) {
 }
 
 // Localized strings printed directly by this launcher. Keep in sync with the
-// sunpack/i18n/catalog.py keys cli.press_enter, cli.persistent_start_timeout,
+// sunpack/core/i18n/catalog.py keys cli.press_enter, cli.persistent_start_timeout,
 // cli.native_runtime_launch_failed, and cli.native_runtime_exited.
 constexpr wchar_t kPressEnterEn[] = L"Press Enter to continue...";
 constexpr wchar_t kPressEnterZh[] = L"按回车键继续...";

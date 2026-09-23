@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 
 
 def detection_pipeline_config() -> dict:

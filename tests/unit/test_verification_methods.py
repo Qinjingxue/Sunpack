@@ -5,9 +5,9 @@ import zipfile
 import pytest
 
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.contracts.extraction import ExtractionResult
-from sunpack.verification import VerificationScheduler
-from sunpack.verification import archive_state_manifest as archive_state_manifest_module
+from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.pipeline.verification import VerificationScheduler
+from sunpack.pipeline.verification import archive_state_manifest as archive_state_manifest_module
 
 
 @pytest.mark.parametrize(

@@ -1,9 +1,9 @@
 from io import StringIO
 from types import SimpleNamespace
 
-import sunpack.cli.commands.doctor as doctor
-from sunpack.cli.cli_context import CliContext
-from sunpack.cli.cli_reporter import CliReporter
+import sunpack.runtime.cli.commands.doctor as doctor
+from sunpack.runtime.cli.cli_context import CliContext
+from sunpack.runtime.cli.cli_reporter import CliReporter
 
 
 def _context(tmp_path):

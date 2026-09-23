@@ -716,7 +716,7 @@ import os
 import sys
 import zipfile
 
-from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 
 worker = get_sevenzip_bridge_worker_path()
 assert os.path.exists(worker), worker
@@ -853,7 +853,7 @@ Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -Sour
 Test-SevenZipWorker -PythonPath $venvPython -RepoRoot $repoRoot
 Invoke-Native -FilePath $venvPython -Arguments @(
     "-c",
-    "from sunpack.support.resources import get_toast_library_path; import os; assert os.path.exists(get_toast_library_path())"
+    "from sunpack.core.support.resources import get_toast_library_path; import os; assert os.path.exists(get_toast_library_path())"
 )
 
 Write-Step "Writing environment manifest"

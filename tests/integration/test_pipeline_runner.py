@@ -1,11 +1,11 @@
 from pathlib import Path
 import asyncio
 
-import sunpack.coordinator.engine as engine_module
-from sunpack.coordinator.engine import PipelineEngine
-from sunpack.coordinator.async_work import CancellationToken
-from sunpack.config.schema import normalize_config
-from sunpack.contracts.extraction import ExtractionResult
+import sunpack.pipeline.coordinator.engine as engine_module
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.pipeline.coordinator.async_work import CancellationToken
+from sunpack.core.config.schema import normalize_config
+from sunpack.core.contracts.extraction import ExtractionResult
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.fs_builder import make_zip

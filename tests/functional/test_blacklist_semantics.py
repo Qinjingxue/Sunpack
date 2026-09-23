@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
-from sunpack.coordinator.scanner import ScanOrchestrator
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
+from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.fs_builder import make_zip
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-import sunpack.watch.scanner as scanner
+import sunpack.runtime.watch.scanner as scanner
 
 
 def test_validate_ntfs_watch_roots_propagates_non_ntfs_error(monkeypatch, tmp_path):

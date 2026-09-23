@@ -16,17 +16,17 @@ from typing import Any, Callable
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from sunpack.coordinator.engine import PipelineEngine
-import sunpack.coordinator.engine as engine_module
-import sunpack.coordinator.extraction_batch as extraction_batch_module
-import sunpack.analysis.engine as analysis_engine_module
-import sunpack.analysis.structure_pipeline.modules.compression_streams as compression_streams_module
-import sunpack.analysis.structure_pipeline.modules.rar as rar_analysis_module
-import sunpack.coordinator.scan_session as scan_session_module
-from sunpack.coordinator.scan_session import DiscoveryScanSession
-from sunpack.filesystem.directory_scanner import DirectoryScanner
-from sunpack.analysis.view import SharedBinaryView
-from sunpack.support.output_inventory import OutputInventory
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+import sunpack.pipeline.coordinator.engine as engine_module
+import sunpack.pipeline.coordinator.extraction_batch as extraction_batch_module
+import sunpack.core.analysis.engine as analysis_engine_module
+import sunpack.core.analysis.structure_pipeline.modules.compression_streams as compression_streams_module
+import sunpack.core.analysis.structure_pipeline.modules.rar as rar_analysis_module
+import sunpack.pipeline.coordinator.scan_session as scan_session_module
+from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from sunpack.core.analysis.view import SharedBinaryView
+from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from tests.helpers.performance_config import archive_pressure_config
 from benchmarks.harness import render_report, report_from_payload
 

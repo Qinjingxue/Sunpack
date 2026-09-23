@@ -7,8 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
-import sunpack.watch.state as watch_state_module
-from sunpack.watch.state import (
+import sunpack.runtime.watch.state as watch_state_module
+from sunpack.runtime.watch.state import (
     WatchStateJournalError,
     WatchStateStore,
 )

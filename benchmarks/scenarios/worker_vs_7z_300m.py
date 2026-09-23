@@ -36,8 +36,8 @@ from benchmarks.scenarios.sevenzip_worker_matrix import (
     _volume_paths,
 )
 from benchmarks.scenarios.worker_read_patterns import _build_cases
-from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
-from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path, require_7z
 
 

@@ -4,10 +4,10 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
-from sunpack.config.schema import normalize_config
-from sunpack.extraction.scheduler import ExtractionScheduler
-from sunpack.extraction.internal.sevenzip.metadata import ArchiveMetadataScanResult
+from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
+from sunpack.core.config.schema import normalize_config
+from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanResult
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
 

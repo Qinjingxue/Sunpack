@@ -472,7 +472,7 @@ class WorkerSession:
 
 
 def _worker_path() -> Path:
-    from sunpack.support.resources import get_sevenzip_bridge_worker_path
+    from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 
     path = Path(get_sevenzip_bridge_worker_path())
     if not path.exists():
@@ -510,7 +510,7 @@ def _physical_volume_key(path: Path) -> str:
     """
 
     try:
-        from sunpack.support.output_paths import resolve_output_volume_key
+        from sunpack.core.support.output_paths import resolve_output_volume_key
 
         return str(resolve_output_volume_key(str(path)) or "")
     except Exception:

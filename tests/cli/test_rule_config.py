@@ -1,10 +1,10 @@
 import pytest
 
-from sunpack.cli.cli_runtime import (
+from sunpack.runtime.cli.cli_runtime import (
     apply_runtime_config_overrides,
     build_effective_config,
 )
-from sunpack.config.config_validator import validate_config_payload
+from sunpack.runtime.config_validation import validate_config_payload
 from tests.helpers.detection_config import with_detection_pipeline
 
 

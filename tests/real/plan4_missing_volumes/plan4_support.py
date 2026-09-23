@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from sunpack.contracts.failures import FailureKind
+from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.marker_utils import marker_was_extracted
 from tests.real.plan1_real_archives.plan1_support import run_plan1_pipeline
 

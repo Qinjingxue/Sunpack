@@ -1,7 +1,7 @@
 import struct
 import zipfile
 
-from sunpack.analysis import ArchiveAnalyzer, ZipDeepProbeOptions, ZipEocdProbeOptions
+from sunpack.core.analysis import ArchiveAnalyzer, ZipDeepProbeOptions, ZipEocdProbeOptions
 
 
 def _zip_path(tmp_path):

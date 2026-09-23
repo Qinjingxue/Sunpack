@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from sunpack.contracts.failures import FailureInfo, FailureKind
-from sunpack.contracts.results import OutcomeKind, RunSummary, TargetRunResult
-from sunpack.contracts.retry_targets import merge_latest_results, password_retry_paths, result_outcome
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
+from sunpack.core.contracts.retry_targets import merge_latest_results, password_retry_paths, result_outcome
 
 
 def _summary(*results):

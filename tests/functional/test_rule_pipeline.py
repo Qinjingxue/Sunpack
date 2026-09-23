@@ -1,9 +1,9 @@
 import io
 import tarfile
 
-from sunpack.contracts.discovery import DiscoveryCandidate
-from sunpack.detection.scheduler import DetectionScheduler
-from sunpack.detection.validation import validate_detection_contracts
+from sunpack.core.contracts.discovery import DiscoveryCandidate
+from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
+from sunpack.pipeline.discovery.detection.validation import validate_detection_contracts
 
 
 def _tar_bytes() -> bytes:

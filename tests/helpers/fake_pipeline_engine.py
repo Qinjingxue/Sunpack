@@ -3,7 +3,7 @@ from __future__ import annotations
 import uuid
 from types import SimpleNamespace
 
-from sunpack.contracts.pipeline import PipelineArtifacts, PipelineResponse
+from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineResponse
 
 
 class FakePipelineEngine:

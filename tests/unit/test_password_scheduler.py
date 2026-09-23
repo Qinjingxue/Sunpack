@@ -1,16 +1,16 @@
 from types import SimpleNamespace
 
-import sunpack.passwords.scheduler as password_scheduler_module
-from sunpack.passwords.cache import (
+import sunpack.core.passwords.scheduler as password_scheduler_module
+from sunpack.core.passwords.cache import (
     MAX_CACHED_NEGATIVE_ATTEMPTS,
     MAX_CACHED_SUCCESSES,
     PasswordAttemptCache,
 )
-from sunpack.passwords.candidates import PasswordCandidatePipeline
-from sunpack.passwords.fingerprint import build_archive_fingerprint
-from sunpack.passwords.job import PasswordJob
-from sunpack.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
-from sunpack.passwords.verifier import PasswordBatchVerification, PasswordVerifierChain
+from sunpack.core.passwords.candidates import PasswordCandidatePipeline
+from sunpack.core.passwords.fingerprint import build_archive_fingerprint
+from sunpack.core.passwords.job import PasswordJob
+from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
+from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordVerifierChain
 
 
 class FakeVerifier:

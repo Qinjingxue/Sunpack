@@ -2,11 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.config.fields.coordinator import normalize_recursive_authorization
-from sunpack.contracts.filesystem import DirectorySnapshot, FileEntry
-from sunpack.coordinator.recursive_authorization import RecursiveAuthorization
-from sunpack.coordinator.scan_session import DiscoveryScanSession
-from sunpack.coordinator.task_scan import direct_file_task
+from sunpack.core.config.fields.coordinator import normalize_recursive_authorization
+from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
+from sunpack.pipeline.coordinator.recursive_authorization import RecursiveAuthorization
+from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
+from sunpack.pipeline.coordinator.task_scan import direct_file_task
 
 
 def _config(**overrides):

@@ -261,24 +261,24 @@ def summarize_args(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
 
 
 def load_runtime_config() -> dict:
-    from sunpack.config.loader import load_config
+    from sunpack.core.config.loader import load_config
 
     return load_config()
 
 
 def install_wrappers(recorder: HotspotRecorder) -> None:
-    import sunpack.filesystem.directory_scanner as directory_scanner
-    import sunpack.coordinator.discovery as discovery
-    import sunpack.coordinator.scan_session as scan_session
-    import sunpack.coordinator.target_scan as target_scan
-    import sunpack.detection.confirmation as detection_confirmation
-    import sunpack.detection.scheduler as detection_scheduler
-    import sunpack.embedded.discovery as embedded_discovery
-    import sunpack.coordinator.task_provider as task_provider
-    import sunpack.coordinator.task_scan as task_scan
-    import sunpack.relations.scheduler as relations_scheduler
-    import sunpack.relations.internal.group_builder as group_builder
-    import sunpack.relations.resolver as relation_resolver
+    import sunpack.pipeline.discovery.filesystem.directory_scanner as directory_scanner
+    import sunpack.pipeline.coordinator.discovery as discovery
+    import sunpack.pipeline.coordinator.scan_session as scan_session
+    import sunpack.pipeline.coordinator.target_scan as target_scan
+    import sunpack.pipeline.discovery.detection.confirmation as detection_confirmation
+    import sunpack.pipeline.discovery.detection.scheduler as detection_scheduler
+    import sunpack.pipeline.discovery.embedded.discovery as embedded_discovery
+    import sunpack.pipeline.coordinator.task_provider as task_provider
+    import sunpack.pipeline.coordinator.task_scan as task_scan
+    import sunpack.pipeline.discovery.relations.scheduler as relations_scheduler
+    import sunpack.pipeline.discovery.relations.internal.group_builder as group_builder
+    import sunpack.pipeline.discovery.relations.resolver as relation_resolver
 
     recorder.wrap(directory_scanner, "_NATIVE_SCAN_DIRECTORY_SNAPSHOT", "native.scan_directory_snapshot")
     recorder.wrap(directory_scanner.DirectoryScanner, "scan", "filesystem.DirectoryScanner.scan")
@@ -331,7 +331,7 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
     extra: dict[str, Any] = {}
 
     if mode == "filesystem":
-        from sunpack.filesystem.directory_scanner import DirectoryScanner
+        from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 
         result = DirectoryScanner(target_path, max_depth=max_depth, config=config).scan()
         columns = list(result.iter_columns())
@@ -342,9 +342,9 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
         return result, extra
 
     if mode in {"candidates", "evaluate"}:
-        from sunpack.coordinator.scan_session import DiscoveryScanSession
-        from sunpack.coordinator.target_scan import build_candidates_for_targets
-        from sunpack.coordinator.task_provider import ArchiveTaskProvider
+        from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
+        from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+        from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 
         session = DiscoveryScanSession(config=config)
         candidates = build_candidates_for_targets([target_path], session=session, config=config)
@@ -362,7 +362,7 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
         return discovery_result.resolved_inputs, extra
 
     if mode == "full":
-        from sunpack.coordinator.scanner import ScanOrchestrator
+        from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
 
         orchestrator = ScanOrchestrator(config)
         result = orchestrator.scan_targets([target_path])

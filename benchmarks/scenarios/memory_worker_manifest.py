@@ -41,11 +41,11 @@ def compact_rows(count: int) -> list[list[object]]:
 
 
 def run_native(count: int) -> dict[str, object]:
-    from sunpack.extraction.internal.sevenzip.worker_diagnostics import (
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
         compact_success_worker_diagnostics,
     )
-    from sunpack.support.output_inventory import collect_output_inventory
+    from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 
     process = psutil.Process()
     initial_rss = process.memory_info().rss

@@ -4,7 +4,7 @@ from binascii import crc32
 
 import pytest
 
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from tests.helpers.detection_probe import detect_archive_hits, detection_pipeline_config
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar

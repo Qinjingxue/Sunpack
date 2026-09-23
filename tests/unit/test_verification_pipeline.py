@@ -1,17 +1,17 @@
 import zipfile
 
-from sunpack.config.schema import normalize_config
+from sunpack.core.config.schema import normalize_config
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.contracts.extraction import ExtractionResult
-from sunpack.passwords import PasswordSession
-from sunpack.verification import (
+from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.passwords import PasswordSession
+from sunpack.pipeline.verification import (
     FileVerificationObservation,
     VerificationScheduler,
     VerificationStepResult,
     register_verification_method,
 )
-from sunpack.contracts.verification import VerificationIssue
-from sunpack.contracts.verification import (
+from sunpack.core.contracts.verification import VerificationIssue
+from sunpack.core.contracts.verification import (
     CONTAINER_INTEGRITY_NONCANONICAL,
     CONTENT_INTEGRITY_VERIFIED_COMPLETE,
     VERIFICATION_STRENGTH_CRC,

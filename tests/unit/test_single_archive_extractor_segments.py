@@ -1,11 +1,11 @@
 from types import SimpleNamespace
 
-from sunpack.support.archive_input_projection import write_source_extractable_segments
-from sunpack.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
-from sunpack.passwords.result import PasswordResolution, PasswordResolutionStatus
-from sunpack.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
-from sunpack.verification.scheduler import VerificationScheduler
-from sunpack.contracts.verification import (
+from sunpack.core.support.archive_input_projection import write_source_extractable_segments
+from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
+from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
+from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
+from sunpack.pipeline.verification.scheduler import VerificationScheduler
+from sunpack.core.contracts.verification import (
     ASSESSMENT_COMPLETE,
     CONTENT_INTEGRITY_VERIFIED_COMPLETE,
     CONTAINER_INTEGRITY_UNKNOWN,

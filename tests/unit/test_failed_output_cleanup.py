@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import pytest
 
-from sunpack.contracts.extraction import ExtractionResult
-from sunpack.contracts.failures import FailureInfo, FailureKind
-from sunpack.contracts.run_context import RunContext
-from sunpack.contracts.verification import VerificationResult
-from sunpack.coordinator.extraction_batch import BatchExtractionOutcome, ExtractionBatchRunner
-from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy
-from sunpack.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
+from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.run_context import RunContext
+from sunpack.core.contracts.verification import VerificationResult
+from sunpack.pipeline.coordinator.extraction_batch import BatchExtractionOutcome, ExtractionBatchRunner
+from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
+from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
 from tests.helpers.archive_tasks import make_archive_task
 
 

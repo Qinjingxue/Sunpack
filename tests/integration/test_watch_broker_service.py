@@ -18,7 +18,7 @@ pytestmark = [
 
 def test_installed_broker_lifecycle_usn_roundtrip_and_hot_ipc(tmp_path):
     import sunpack_native
-    from sunpack.platform.windows.elevation import is_process_elevated
+    from sunpack.core.platform.windows.elevation import is_process_elevated
 
     is_elevated = is_process_elevated()
 

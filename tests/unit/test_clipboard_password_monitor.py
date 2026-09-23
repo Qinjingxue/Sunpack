@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-import sunpack.passwords.internal.builtin as builtin_module
-import sunpack.passwords.internal.clipboard_monitor as clipboard_monitor_module
-from sunpack.passwords.internal.clipboard_monitor import ClipboardPasswordMonitor
-from sunpack.passwords.internal.clipboard_monitor import _WindowsClipboardLoop
+import sunpack.core.passwords.internal.builtin as builtin_module
+import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
+from sunpack.core.passwords.internal.clipboard_monitor import ClipboardPasswordMonitor
+from sunpack.core.passwords.internal.clipboard_monitor import _WindowsClipboardLoop
 
 
 def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, monkeypatch):
@@ -156,7 +156,7 @@ def test_windows_clipboard_loop_unregisters_class_before_releasing_wndproc():
 
 
 def test_clipboard_monitor_rejects_internal_multiline_text(tmp_path, monkeypatch):
-    import sunpack.passwords.internal.clipboard as clipboard_module
+    import sunpack.core.passwords.internal.clipboard as clipboard_module
 
     builtin_path = tmp_path / "builtin_passwords.txt"
     original = (

@@ -32,9 +32,9 @@ if str(_REPO_ROOT) not in sys.path:
 
 import psutil
 
-import sunpack.watch.scheduler as scheduler_module
-from sunpack.watch.scheduler import WatchScheduler
-from sunpack.platform.windows.elevation import is_process_elevated
+import sunpack.runtime.watch.scheduler as scheduler_module
+from sunpack.runtime.watch.scheduler import WatchScheduler
+from sunpack.core.platform.windows.elevation import is_process_elevated
 
 
 CONTENT_REASON_MASK = 0x00000001 | 0x00000002 | 0x00000004

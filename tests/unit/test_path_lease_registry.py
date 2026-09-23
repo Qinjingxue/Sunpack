@@ -1,6 +1,6 @@
 import asyncio
 
-from sunpack.coordinator.engine import _PathLeaseRegistry
+from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry
 
 
 def test_conflicting_path_lease_is_woken_by_release(tmp_path):

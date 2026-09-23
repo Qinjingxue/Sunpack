@@ -3,7 +3,7 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.config import loader
+from sunpack.core.config import loader
 
 
 def _write_json(path, payload):

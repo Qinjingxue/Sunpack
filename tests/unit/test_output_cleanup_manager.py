@@ -3,7 +3,7 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
-from sunpack.support.output_cleanup import (
+from sunpack.pipeline.postprocess.output_cleanup import (
     OutputCleanupEvent,
     OutputCleanupExecutor,
     OutputCleanupManager,
@@ -104,13 +104,13 @@ def test_executor_failure_is_reported_without_claiming_cleanup(tmp_path):
 def test_output_deletion_primitives_are_confined_to_approved_infrastructure():
     project_root = Path(__file__).resolve().parents[2]
     allowed = {
-        Path("sunpack/support/output_cleanup.py"),
-        Path("sunpack/cli/persistent_process.py"),
-        Path("sunpack/coordinator/reporting.py"),
-        Path("sunpack/filesystem/watcher/scheduler.py"),
-        Path("sunpack/filesystem/watcher/service.py"),
-        Path("sunpack/filesystem/watcher/state.py"),
-        Path("sunpack/support/resource_lifecycle.py"),
+        Path("sunpack/pipeline/postprocess/output_cleanup.py"),
+        Path("sunpack/runtime/cli/persistent_process.py"),
+        Path("sunpack/pipeline/coordinator/reporting.py"),
+        Path("sunpack/pipeline/discovery/filesystem/watcher/scheduler.py"),
+        Path("sunpack/pipeline/discovery/filesystem/watcher/service.py"),
+        Path("sunpack/pipeline/discovery/filesystem/watcher/state.py"),
+        Path("sunpack/core/support/resource_lifecycle.py"),
     }
     violations: list[str] = []
     for path in (project_root / "sunpack").rglob("*.py"):

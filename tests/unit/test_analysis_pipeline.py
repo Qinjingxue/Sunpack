@@ -11,12 +11,12 @@ from io import BytesIO
 
 import pytest
 
-from sunpack.analysis.embedded import scan_embedded_archives
-from sunpack.analysis.result import ArchiveFormatEvidence
-from sunpack.analysis.engine import AnalysisEngine
-from sunpack.analysis.structure_pipeline.module import AnalysisModuleSpec
-from sunpack.analysis.structure_pipeline.registry import get_analysis_module_registry
-from sunpack.analysis.view import SharedBinaryView
+from sunpack.core.analysis.embedded import scan_embedded_archives
+from sunpack.core.analysis.result import ArchiveFormatEvidence
+from sunpack.core.analysis.engine import AnalysisEngine
+from sunpack.core.analysis.structure_pipeline.module import AnalysisModuleSpec
+from sunpack.core.analysis.structure_pipeline.registry import get_analysis_module_registry
+from sunpack.core.analysis.view import SharedBinaryView
 
 
 def _zip_bytes(tmp_path):
@@ -169,7 +169,7 @@ def test_analysis_requires_candidate_embedded_scan_authorization(tmp_path, monke
     def unexpected_scan(*args, **kwargs):
         raise AssertionError("unauthorized candidates must not enter the embedded scanner")
 
-    monkeypatch.setattr("sunpack.analysis.engine.scan_embedded_archives", unexpected_scan)
+    monkeypatch.setattr("sunpack.core.analysis.engine.scan_embedded_archives", unexpected_scan)
     report = AnalysisEngine().analyze_path(str(path), embedded_scan_allowed=False)
 
     assert report.selected == []
@@ -187,7 +187,7 @@ def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_pa
     def unexpected_scan(*args, **kwargs):
         raise AssertionError("complete detection prepass must bypass the shared scanner")
 
-    monkeypatch.setattr("sunpack.analysis.engine.scan_embedded_archives", unexpected_scan)
+    monkeypatch.setattr("sunpack.core.analysis.engine.scan_embedded_archives", unexpected_scan)
     reused = scheduler.analyze_path(str(path), initial_prepass=first.prepass)
     assert reused.prepass == first.prepass
 

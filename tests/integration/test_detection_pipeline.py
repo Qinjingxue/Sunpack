@@ -6,9 +6,9 @@ import zipfile
 from pathlib import Path
 
 from tests.helpers.pipeline_engine import execute_pipeline
-from sunpack.config.schema import normalize_config
+from sunpack.core.config.schema import normalize_config
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from tests.helpers.detection_config import with_detection_pipeline
 
 

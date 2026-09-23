@@ -7,10 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import sunpack.watch.service as service_module
-import sunpack.watch.runtime as watch_runtime
-import sunpack.cli.commands.watch as watch_command
-from sunpack.watch.service import (
+import sunpack.runtime.watch.service as service_module
+import sunpack.runtime.watch.runtime as watch_runtime
+import sunpack.runtime.cli.commands.watch as watch_command
+from sunpack.runtime.watch.service import (
     CONTROL_SCHEDULER_WAKEUP,
     CONTROL_STOP,
     WatchService,
@@ -226,7 +226,7 @@ def test_watch_runtime_does_not_change_process_cwd(tmp_path, monkeypatch):
             observed["run"] = (__import__("os").getcwd(), initial_scan)
             return 7
 
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli import runtime_state
 
     monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
 
@@ -242,7 +242,7 @@ def test_watch_runtime_delegates_start_to_runtime_host(monkeypatch):
         async def start_watch(self, *, tray_enabled=True, initial_scan=False):
             captured.update(tray_enabled=tray_enabled, initial_scan=initial_scan)
 
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli import runtime_state
 
     monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
 
@@ -260,7 +260,7 @@ def test_watch_add_reports_start_request_without_creating_watch_process(tmp_path
             assert initial_scan_roots == ["C:/downloads"]
             return {"started": True, "running": True}
 
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli import runtime_state
 
     monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
 
@@ -290,7 +290,7 @@ def test_watch_add_applies_directly_to_running_service(tmp_path, monkeypatch):
                 "running": True,
             }
 
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli import runtime_state
 
     monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
     monkeypatch.setattr(
@@ -1285,9 +1285,9 @@ def test_watch_service_waits_indefinitely_when_scheduler_is_idle(tmp_path, monke
 
 
 def test_watch_add_writes_a_plain_root_and_list_shows_it(tmp_path, monkeypatch):
-    from sunpack.cli.cli import build_cli_parser
-    from sunpack.cli.cli_context import CliContext
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli.cli import build_cli_parser
+    from sunpack.runtime.cli.cli_context import CliContext
+    from sunpack.runtime.cli import runtime_state
 
     roots_path = tmp_path / "sunpack_watch_roots.txt"
     watch_root = tmp_path / "downloads"
@@ -1313,9 +1313,9 @@ def test_watch_add_writes_a_plain_root_and_list_shows_it(tmp_path, monkeypatch):
 
 
 def test_watch_add_accepts_one_output_dir_and_persists_absolute_mapping(tmp_path, monkeypatch):
-    from sunpack.cli.cli import build_cli_parser
-    from sunpack.cli.cli_context import CliContext
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli.cli import build_cli_parser
+    from sunpack.runtime.cli.cli_context import CliContext
+    from sunpack.runtime.cli import runtime_state
 
     roots_path = tmp_path / "sunpack_watch_roots.txt"
     watch_root = tmp_path / "downloads"
@@ -1344,7 +1344,7 @@ def test_watch_add_accepts_one_output_dir_and_persists_absolute_mapping(tmp_path
 
 
 def test_watch_add_rejects_shared_output_for_multiple_paths(monkeypatch):
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli import runtime_state
 
     monkeypatch.setattr(
         runtime_state,
@@ -1378,7 +1378,7 @@ def test_running_watch_add_forwards_output_dir(tmp_path, monkeypatch):
                 "running": True,
             }
 
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli import runtime_state
 
     monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
     code, result = _await(

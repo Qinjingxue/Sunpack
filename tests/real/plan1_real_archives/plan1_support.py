@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 
-from sunpack.config.schema import normalize_config
+from sunpack.core.config.schema import normalize_config
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.detection_probe import detect_archive_hits
 from tests.helpers.marker_utils import marker_was_extracted

@@ -5,9 +5,9 @@ from pathlib import Path
 
 
 FORBIDDEN_PREFIXES = (
-    "sunpack.coordinator",
-    "sunpack.detection",
-    "sunpack.contracts.tasks",
+    "sunpack.pipeline.coordinator",
+    "sunpack.pipeline.discovery.detection",
+    "sunpack.core.contracts.tasks",
 )
 
 
@@ -29,7 +29,7 @@ def test_analysis_has_no_application_dependencies():
 
 
 def test_analysis_no_longer_exposes_a_business_scheduler():
-    import sunpack.analysis as analysis
+    import sunpack.core.analysis as analysis
 
     assert not hasattr(analysis, "ArchiveAnalysisScheduler")
 

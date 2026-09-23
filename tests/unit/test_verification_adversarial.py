@@ -1,8 +1,8 @@
 import zipfile
 
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.contracts.extraction import ExtractionResult
-from sunpack.verification import VerificationScheduler
+from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.pipeline.verification import VerificationScheduler
 
 
 def test_expected_name_matching_is_case_and_path_normalized(tmp_path):

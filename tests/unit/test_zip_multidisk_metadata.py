@@ -1,6 +1,6 @@
 import struct
 
-from sunpack.analysis.view import MultiVolumeBinaryView, _probe_zip_view
+from sunpack.core.analysis.view import MultiVolumeBinaryView, _probe_zip_view
 
 
 def _local(name=b"a"):

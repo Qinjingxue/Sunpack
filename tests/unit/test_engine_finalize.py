@@ -4,9 +4,9 @@ import contextlib
 
 import pytest
 
-import sunpack.coordinator.engine as engine_module
-from sunpack.contracts.pipeline import PipelineArtifacts, PipelineResponse
-from sunpack.contracts.results import ArchiveCleanupResult, RunSummary
+import sunpack.pipeline.coordinator.engine as engine_module
+from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineResponse
+from sunpack.core.contracts.results import ArchiveCleanupResult, RunSummary
 
 
 def _recording(monkeypatch, barrier_calls, apply_calls):

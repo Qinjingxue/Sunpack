@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from sunpack.watch.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
+from sunpack.runtime.watch.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
 from tests.helpers.watch_write_simulator import WriteScenario, representative_write_scenarios, simulate_writes
 
 

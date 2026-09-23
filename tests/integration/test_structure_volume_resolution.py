@@ -8,19 +8,19 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.config.loader import load_config
-from sunpack.config.schema import normalize_config
-from sunpack.contracts.tasks import ArchiveTask
-from sunpack.contracts.filesystem import DirectorySnapshot, FileEntry
-from sunpack.coordinator.engine import PipelineEngine
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.coordinator.target_groups import relation_group_to_candidate
-from sunpack.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.extraction.scheduler import ExtractionScheduler
-from sunpack.filesystem.directory_scanner import DirectoryScanner
-from sunpack.passwords.directory_context import DirectoryPasswordContextStore
-from sunpack.relations import RelationsScheduler
-from sunpack.relations.resolver import RelationResolver
+from sunpack.core.config.loader import load_config
+from sunpack.core.config.schema import normalize_config
+from sunpack.core.contracts.tasks import ArchiveTask
+from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
+from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
+from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from sunpack.core.passwords.directory_context import DirectoryPasswordContextStore
+from sunpack.pipeline.discovery.relations import RelationsScheduler
+from sunpack.pipeline.discovery.relations.resolver import RelationResolver
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_winrar, get_test_tools

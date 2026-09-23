@@ -2,11 +2,11 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.contracts.filesystem import FileEntry
-from sunpack.filesystem.directory_scanner import DirectoryScanner
-from sunpack.detection import DetectionScheduler
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.coordinator.target_scan import build_candidates_for_targets
+from sunpack.core.contracts.filesystem import FileEntry
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from sunpack.pipeline.discovery.detection import DetectionScheduler
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from tests.helpers.detection_config import with_detection_pipeline
 
 
@@ -310,7 +310,7 @@ def test_directory_scanner_custom_filters_fail_without_native_mapping(tmp_path):
         stage = "path"
 
         def evaluate(self, candidate):
-            from sunpack.filesystem.filters.base import keep
+            from sunpack.pipeline.discovery.filesystem.filters.base import keep
             return keep()
 
     with pytest.raises(RuntimeError, match="Native directory scan requires"):
@@ -403,10 +403,10 @@ def test_directory_scanner_executes_built_in_filters_natively(tmp_path, monkeypa
     target.write_bytes(b"PK\x03\x04payload")
     observed = []
 
-    from sunpack.filesystem.filters.modules.blacklist import BlacklistScanFilter
-    from sunpack.filesystem.filters.modules.mtime_range import MtimeRangeScanFilter
-    from sunpack.filesystem.filters.modules.size_range import SizeRangeScanFilter
-    from sunpack.filesystem.filters.modules.whitelist import WhitelistScanFilter
+    from sunpack.pipeline.discovery.filesystem.filters.modules.blacklist import BlacklistScanFilter
+    from sunpack.pipeline.discovery.filesystem.filters.modules.mtime_range import MtimeRangeScanFilter
+    from sunpack.pipeline.discovery.filesystem.filters.modules.size_range import SizeRangeScanFilter
+    from sunpack.pipeline.discovery.filesystem.filters.modules.whitelist import WhitelistScanFilter
 
     originals = {
         "whitelist": WhitelistScanFilter.evaluate,
@@ -517,7 +517,7 @@ def test_directory_scanner_pushes_whitelist_directory_rules_to_native(tmp_path, 
         return object(), object()
 
     monkeypatch.setattr(
-        "sunpack.filesystem.directory_scanner._NATIVE_SCAN_DIRECTORY_SNAPSHOTS",
+        "sunpack.pipeline.discovery.filesystem.directory_scanner._NATIVE_SCAN_DIRECTORY_SNAPSHOTS",
         fake_scan,
     )
 
@@ -745,7 +745,7 @@ def test_target_scan_reuses_session_for_duplicate_directories(tmp_path, monkeypa
 
 
 def test_archive_task_provider_detection_disabled_does_not_use_extension_fallback(tmp_path):
-    from sunpack.coordinator.task_provider import ArchiveTaskProvider
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 
     path = tmp_path / "fake.zip"
     path.write_bytes(b"not an archive")

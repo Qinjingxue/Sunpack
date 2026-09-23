@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sunpack.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
 from tests.helpers.performance_fixtures import build_pressure_corpus, pressure_scan_config
 
 

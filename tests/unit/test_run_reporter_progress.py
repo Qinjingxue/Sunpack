@@ -2,9 +2,9 @@ import io
 import re
 from types import SimpleNamespace
 
-import sunpack.coordinator.reporting as reporting
-from sunpack.contracts.failures import FailureInfo, FailureKind
-from sunpack.coordinator.reporting import RunReporter
+import sunpack.pipeline.coordinator.reporting as reporting
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.pipeline.coordinator.reporting import RunReporter
 
 
 def _task(path):

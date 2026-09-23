@@ -1,4 +1,4 @@
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from tests.helpers.archive_tasks import make_task_from_descriptor
 
 

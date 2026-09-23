@@ -1,7 +1,7 @@
-import sunpack.postprocess.internal.flatten as flatten_module
-from sunpack.config.schema import normalize_config
-from sunpack.postprocess.actions import PostProcessActions
-from sunpack.postprocess.internal.flatten import DirectoryFlattener
+import sunpack.pipeline.postprocess.internal.flatten as flatten_module
+from sunpack.core.config.schema import normalize_config
+from sunpack.pipeline.postprocess.actions import PostProcessActions
+from sunpack.pipeline.postprocess.internal.flatten import DirectoryFlattener
 
 
 def test_flatten_reports_native_errors(monkeypatch, capsys):

@@ -1,8 +1,8 @@
 import json
 from pathlib import Path
 
-from sunpack.config.advanced_defaults import advanced_config_value
-from sunpack.config.schema import config_fields, get_config_value
+from sunpack.core.config.advanced_defaults import advanced_config_value
+from sunpack.core.config.schema import config_fields, get_config_value
 
 
 ROOT = Path(__file__).resolve().parents[2]

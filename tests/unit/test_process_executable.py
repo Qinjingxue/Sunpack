@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sunpack.support import process_executable
+from sunpack.core.support import process_executable
 
 
 def test_compiled_process_uses_invoked_binary_instead_of_nuitka_python_path(tmp_path, monkeypatch):

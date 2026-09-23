@@ -6,8 +6,8 @@ import struct
 import threading
 import time
 
-from sunpack.cli import persistent_process
-from sunpack.support import runtime_identity
+from sunpack.runtime.cli import persistent_process
+from sunpack.core.support import runtime_identity
 
 
 def _enable_test_runtime_identity(monkeypatch):
@@ -30,7 +30,7 @@ class _AsyncWriter:
 
 
 def test_streaming_execute_uses_request_local_cwd_and_streams(tmp_path, monkeypatch):
-    from sunpack.cli import cli
+    from sunpack.runtime.cli import cli
 
     async def fake_main(argv, **context):
         assert argv == ["config", "validate"]
@@ -99,8 +99,8 @@ def test_submit_request_does_not_claim_unverified_terminal_updates(tmp_path, mon
 
 
 def test_extract_is_submitted_to_persistent_server_by_default(monkeypatch):
-    from sunpack.cli import cli
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli import cli
+    from sunpack.runtime.cli import runtime_state
 
     _enable_test_runtime_identity(monkeypatch)
     submitted = []
@@ -112,8 +112,8 @@ def test_extract_is_submitted_to_persistent_server_by_default(monkeypatch):
 
 
 def test_all_short_commands_are_submitted_to_persistent_server(monkeypatch):
-    from sunpack.cli import cli
-    from sunpack.cli import runtime_state
+    from sunpack.runtime.cli import cli
+    from sunpack.runtime.cli import runtime_state
 
     _enable_test_runtime_identity(monkeypatch)
     submitted = []
@@ -131,7 +131,7 @@ def test_all_short_commands_are_submitted_to_persistent_server(monkeypatch):
 
 
 def test_extract_help_stays_local_and_does_not_start_server(monkeypatch):
-    from sunpack.cli import cli
+    from sunpack.runtime.cli import cli
 
     monkeypatch.setattr(persistent_process, "submit_request", lambda _argv: (_ for _ in ()).throw(AssertionError()))
 
@@ -185,7 +185,7 @@ def test_connection_stream_preserves_client_tty_capability():
 
 
 def test_streaming_request_strips_terminal_columns_metadata(monkeypatch):
-    from sunpack.cli import cli
+    from sunpack.runtime.cli import cli
 
     async def fake_main(argv, **context):
         assert argv == ["extract", "sample.zip"]
@@ -223,7 +223,7 @@ def test_streaming_request_returns_help_through_the_request_stream():
 
 
 def test_streaming_request_round_trips_interactive_input(monkeypatch):
-    from sunpack.cli import cli
+    from sunpack.runtime.cli import cli
 
     async def fake_main(_argv, **context):
         return 0 if (await context["input_reader"]("password: ")).strip() == "secret" else 1
@@ -483,7 +483,7 @@ def test_protocol_rejects_a_different_runtime_build_id():
 
 
 def test_persistent_config_snapshot_reuses_a_source_without_mtime_checks(tmp_path, monkeypatch):
-    from sunpack.cli import persistent_runtime
+    from sunpack.runtime.cli import persistent_runtime
 
     calls = []
     sources = {
@@ -533,7 +533,7 @@ def test_server_process_starts_in_neutral_working_directory(tmp_path, monkeypatc
 
 
 def test_persistent_runtime_reuses_engine_for_request_only_config(monkeypatch):
-    from sunpack.cli import persistent_runtime
+    from sunpack.runtime.cli import persistent_runtime
 
     events = []
     callbacks = []

@@ -1,9 +1,9 @@
 from pathlib import Path
 
-from sunpack.contracts.archive_knowledge import ArchiveKnowledge
+from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.support import archive_knowledge_projection as knowledge_view
-from sunpack.support.archive_knowledge_writer import commit_task_knowledge
+from sunpack.core.support import archive_knowledge_projection as knowledge_view
+from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge
 
 
 def test_archive_knowledge_namespace_merge_flags_and_roundtrip():

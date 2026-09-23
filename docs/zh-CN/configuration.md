@@ -253,7 +253,7 @@ Native worker 以 CPU credit 作为解压并发预算。默认 nominal budget �
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `write_progress_manifest` | `bool` | `false` | 是否把进度清单写入输出目录的 `.sunpack/extraction_manifest.json`。 |
+| `write_progress_manifest` | `bool` | `false` | 是否把进度清单写入输出目录的 `.sunpack/pipeline/extraction_manifest.json`。 |
 | `content_requirement` | `str` | `complete` | 内容要求，可选 `complete` 或 `allow_partial`。 |
 
 ## embedded_scan
@@ -326,7 +326,7 @@ Native worker 以 CPU credit 作为解压并发预算。默认 nominal budget �
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `true` | 是否确认由原生文件系统探测路由的 TAR、gzip、bzip2、xz、zstd 单文件输入。 |
 
-RAR、7z、ZIP（包括单卷和分卷）由 Relations 解析。未被前两层确认的物理文件进入独立的 Embedded 层。格式确认模块位于 `sunpack/detection/formats`；新增格式时在该目录添加确认模块并注册到 `CONFIRMERS`。格式判别以内容探测为准，文件扩展名只用于扫描过滤及分卷成员关系推断。
+RAR、7z、ZIP（包括单卷和分卷）由 Relations 解析。未被前两层确认的物理文件进入独立的 Embedded 层。格式确认模块位于 `sunpack/pipeline/discovery/detection/formats`；新增格式时在该目录添加确认模块并注册到 `CONFIRMERS`。格式判别以内容探测为准，文件扩展名只用于扫描过滤及分卷成员关系推断。
 
 ## 密码表和密码文件
 
@@ -334,7 +334,7 @@ RAR、7z、ZIP（包括单卷和分卷）由 Relations 解析。未被前两层�
 
 ## 修改建议
 
-- 想减少误解压：调整 `filesystem.scan_filters`；各格式的确认逻辑位于 `sunpack/detection/formats`。
+- 想减少误解压：调整 `filesystem.scan_filters`；各格式的确认逻辑位于 `sunpack/pipeline/discovery/detection/formats`。
 - 想提高伪装归档和载体的召回率：检查 `embedded_scan` 与原生扫描器。
 - 想分析一次输入的判定过程：使用 `inspect --analyze -v`。
 - 修改后运行 `python sunpack.py config validate`。

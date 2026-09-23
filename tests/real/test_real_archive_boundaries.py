@@ -8,8 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.coordinator.task_scan import direct_file_task
-from sunpack.extraction.scheduler import ExtractionScheduler
+from sunpack.pipeline.coordinator.task_scan import direct_file_task
+from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from tests.helpers.detection_probe import detect_archive_hits
 from tests.helpers.real_archives import ArchiveFixtureFactory, corrupt_file
 

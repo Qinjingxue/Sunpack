@@ -5,13 +5,13 @@ import threading
 
 import pytest
 
-from sunpack.support.archive_sessions import (
+from sunpack.core.support.archive_sessions import (
     clear_archive_sessions,
     get_archive_session,
     release_archive_sessions_under,
 )
-from sunpack.analysis.view import MultiVolumeBinaryView, SharedBinaryView
-from sunpack.support.resource_lifecycle import TaskResourceScope, promotion_barrier
+from sunpack.core.analysis.view import MultiVolumeBinaryView, SharedBinaryView
+from sunpack.core.support.resource_lifecycle import TaskResourceScope, promotion_barrier
 from sunpack_native import (
     NativeArchiveSession,
     native_begin_promotion,

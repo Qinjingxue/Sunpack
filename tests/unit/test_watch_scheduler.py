@@ -12,16 +12,16 @@ from types import SimpleNamespace
 
 import pytest
 
-import sunpack.watch.scheduler as scheduler_module
-import sunpack.passwords.internal.builtin as builtin_module
-import sunpack.passwords.internal.clipboard_monitor as clipboard_monitor_module
-from sunpack.contracts.failures import FailureInfo, FailureKind
-from sunpack.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse
-from sunpack.contracts.results import OutcomeKind, TargetRunResult
-from sunpack.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
-from sunpack.watch.scanner import WatchCandidate
-from sunpack.watch.state import WatchStateStore
-from sunpack.support.path_keys import path_key
+import sunpack.runtime.watch.scheduler as scheduler_module
+import sunpack.core.passwords.internal.builtin as builtin_module
+import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse
+from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
+from sunpack.runtime.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
+from sunpack.runtime.watch.scanner import WatchCandidate
+from sunpack.runtime.watch.state import WatchStateStore
+from sunpack.core.support.path_keys import path_key
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 

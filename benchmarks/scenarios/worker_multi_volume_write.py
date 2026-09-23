@@ -25,9 +25,9 @@ from benchmarks.scenarios.worker_single_file_write import (
     _prefetch_archive,
     _worker_counters,
 )
-from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
-from sunpack.support.output_paths import normalized_output_dir, resolve_output_volume_key
-from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from sunpack.core.support.output_paths import normalized_output_dir, resolve_output_volume_key
+from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path
 
 

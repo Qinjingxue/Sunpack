@@ -32,7 +32,7 @@ dev = [
 ]
 
 [project.scripts]
-sunpack = "sunpack.cli.cli:main"
+sunpack = "sunpack.runtime.cli.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["sunpack*"]

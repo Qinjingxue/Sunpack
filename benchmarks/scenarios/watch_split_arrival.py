@@ -21,9 +21,9 @@ from benchmarks.harness.reporting import report_from_payload, render_report
 from benchmarks.harness.workspace import BenchmarkWorkspace
 from benchmarks.watch_broker import watch_broker_lease
 from benchmarks.scenarios.extraction_large_archive import RequestRuntimeProfiler, _timing_totals
-from sunpack.config.loader import load_config
-from sunpack.coordinator.engine import PipelineEngine
-from sunpack.watch.scheduler import WatchScheduler
+from sunpack.core.config.loader import load_config
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.scheduler import WatchScheduler
 
 
 TESTFILES_ROOT = Path(__file__).resolve().parents[2] / "testfiles"

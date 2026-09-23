@@ -4,11 +4,11 @@ import os
 
 import pytest
 
-from sunpack.analysis.volume_anchor import probe_volume_anchor_paths
-from sunpack.contracts.filesystem import DirectorySnapshot, FileEntry
-from sunpack.passwords.internal.store import PasswordStore
-from sunpack.passwords.relation_prober import RelationsPasswordProber
-from sunpack.relations.scheduler import RelationsScheduler
+from sunpack.core.analysis.volume_anchor import probe_volume_anchor_paths
+from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
+from sunpack.core.passwords.internal.store import PasswordStore
+from sunpack.core.passwords.relation_prober import RelationsPasswordProber
+from sunpack.pipeline.discovery.relations.scheduler import RelationsScheduler
 from tests.helpers.real_archives import create_encrypted_rar_archive
 
 

@@ -1,4 +1,4 @@
-from sunpack.support.json_format import (
+from sunpack.core.support.json_format import (
     json_safe,
     load_json_file,
     parse_jsonish,

@@ -46,8 +46,8 @@ if str(ROOT) not in sys.path:
 
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
 from benchmarks.scenarios.extraction_format_matrix import GENERATED_FORMATS, create_corpus
-from sunpack.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
-from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _NativeWorkerProcess
+from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_7z_cli_dll_path
 
 
@@ -219,8 +219,8 @@ def _run_python_phase(
     rounds: int,
 ) -> list[dict[str, Any]]:
     """Extract the whole corpus repeatedly through the persistent pipeline."""
-    from sunpack.cli import persistent_runtime
-    from sunpack.cli.cli import async_main
+    from sunpack.runtime.cli import persistent_runtime
+    from sunpack.runtime.cli.cli import async_main
 
     tracemalloc.start(10)
     rows: list[dict[str, Any]] = []

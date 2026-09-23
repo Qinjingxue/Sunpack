@@ -253,7 +253,7 @@ The per-directory password file is named `sunpack-passwords.txt`, one password p
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `write_progress_manifest` | `bool` | `false` | Whether to write a progress manifest to `.sunpack/extraction_manifest.json` in the output directory. |
+| `write_progress_manifest` | `bool` | `false` | Whether to write a progress manifest to `.sunpack/pipeline/extraction_manifest.json` in the output directory. |
 | `content_requirement` | `str` | `complete` | Content requirement; one of `complete` or `allow_partial`. |
 
 ## embedded_scan
@@ -326,7 +326,7 @@ Default methods and key parameters:
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `true` | Confirm TAR, gzip, bzip2, xz, and zstd single-file inputs routed by the native filesystem probe. |
 
-Relations resolves RAR, 7z, and ZIP, including standalone and split inputs. Unclaimed, unblocked physical files go to the separate Embedded layer. Format confirmation plugins live in `sunpack/detection/formats`; add a module there and register it in `CONFIRMERS` to extend supported formats. Content probes determine formats. Extensions are used only by scan filters and to infer volume membership.
+Relations resolves RAR, 7z, and ZIP, including standalone and split inputs. Unclaimed, unblocked physical files go to the separate Embedded layer. Format confirmation plugins live in `sunpack/pipeline/discovery/detection/formats`; add a module there and register it in `CONFIRMERS` to extend supported formats. Content probes determine formats. Extensions are used only by scan filters and to infer volume membership.
 
 ## Password table and password files
 
@@ -334,7 +334,7 @@ Relations resolves RAR, 7z, and ZIP, including standalone and split inputs. Uncl
 
 ## Tuning suggestions
 
-- To reduce wrong extractions: adjust `filesystem.scan_filters`; format confirmation lives in `sunpack/detection/formats`.
+- To reduce wrong extractions: adjust `filesystem.scan_filters`; format confirmation lives in `sunpack/pipeline/discovery/detection/formats`.
 - To improve recall for disguised archives and carriers: review `embedded_scan` and the native scanner.
 - To analyze the decision process of a single input: use `inspect --analyze -v`.
 - After changes, run `python sunpack.py config validate`.

@@ -1,4 +1,4 @@
-from sunpack.cli.cli_runtime import prompt_for_passwords
+from sunpack.runtime.cli.cli_runtime import prompt_for_passwords
 
 
 def test_password_prompt_stops_on_empty_line(monkeypatch):

@@ -24,8 +24,8 @@ from typing import Any, Callable, Iterable
 
 import psutil
 
-from sunpack.coordinator.engine import PipelineEngine
-from sunpack.watch.scheduler import WatchRunResult, WatchScheduler
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.scheduler import WatchRunResult, WatchScheduler
 
 
 def _mib(value: int | float) -> float:
@@ -233,7 +233,7 @@ def _memory_info(process: psutil.Process) -> tuple[int, int]:
 
 def _cache_stats() -> dict[str, Any]:
     try:
-        from sunpack.support.global_cache_manager import GLOBAL_CACHE
+        from sunpack.core.support.global_cache_manager import GLOBAL_CACHE
 
         with GLOBAL_CACHE._lock:
             namespaces = {
@@ -257,7 +257,7 @@ def _cache_stats() -> dict[str, Any]:
 
 def _archive_session_count() -> int:
     try:
-        from sunpack.support import archive_sessions
+        from sunpack.core.support import archive_sessions
 
         with archive_sessions._LOCK:
             return len(archive_sessions._SESSIONS)
@@ -280,7 +280,7 @@ def _reader_stats() -> dict[str, Any]:
 
 def _projection_stats() -> dict[str, Any]:
     try:
-        from sunpack.support.archive_knowledge_projection import projection_cache_stats
+        from sunpack.core.support.archive_knowledge_projection import projection_cache_stats
 
         return dict(projection_cache_stats())
     except (ImportError, AttributeError, TypeError):
@@ -289,7 +289,7 @@ def _projection_stats() -> dict[str, Any]:
 
 def _relation_password_cache_stats() -> dict[str, int]:
     try:
-        from sunpack.passwords import relation_prober
+        from sunpack.core.passwords import relation_prober
 
         cache = relation_prober._RELATION_PROBE_CACHE
         if cache is None:

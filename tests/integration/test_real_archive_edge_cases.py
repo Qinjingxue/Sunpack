@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 
 from tests.helpers.pipeline_engine import execute_pipeline
-from sunpack.config.schema import normalize_config
+from sunpack.core.config.schema import normalize_config
 from tests.helpers.marker_utils import marker_was_extracted
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory
 from tests.helpers.detection_config import with_detection_pipeline

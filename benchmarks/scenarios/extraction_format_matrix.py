@@ -455,8 +455,8 @@ def _worker_detection(
     reporter: PhaseReporter | None = None,
 ) -> int:
     """Run detection in-process; imports and CLI startup are outside samples."""
-    from sunpack.config.loader import load_config
-    from sunpack.coordinator.scanner import ScanOrchestrator
+    from sunpack.core.config.loader import load_config
+    from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
 
     config = load_config()
     rows: dict[str, dict[str, Any]] = {}

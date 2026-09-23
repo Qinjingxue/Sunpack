@@ -181,7 +181,7 @@ Copy-Item native\toast_host\build-x64\Release\sunpack_toast.dll tools\sunpack_to
 
 ```powershell
 .\.venv\Scripts\python.exe -c "import sunpack_native as n; print(n.native_available())"
-.\.venv\Scripts\python.exe -c "from sunpack.support.resources import get_sevenzip_bridge_worker_path; print(get_sevenzip_bridge_worker_path())"
+.\.venv\Scripts\python.exe -c "from sunpack.core.support.resources import get_sevenzip_bridge_worker_path; print(get_sevenzip_bridge_worker_path())"
 .\.venv\Scripts\python.exe -m pytest tests\unit\test_config_loader.py
 ```
 

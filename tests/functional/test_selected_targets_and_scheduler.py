@@ -1,7 +1,7 @@
 from pathlib import Path
 
-from sunpack.coordinator.task_scan import direct_file_task
-from sunpack.coordinator.target_scan import build_candidates_for_targets
+from sunpack.pipeline.coordinator.task_scan import direct_file_task
+from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 
 
 def test_selected_directory_and_file_inside_it_are_deduped(tmp_path):

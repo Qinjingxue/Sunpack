@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import sunpack.passwords.internal.builtin as builtin_module
+import sunpack.core.passwords.internal.builtin as builtin_module
 
 
 def _seed_builtin_file(path, *passwords: str) -> None:

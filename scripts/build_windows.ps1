@@ -515,7 +515,7 @@ import os
 import sys
 import zipfile
 
-from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 
 worker = get_sevenzip_bridge_worker_path()
 assert os.path.exists(worker), worker
@@ -742,7 +742,7 @@ function New-NuitkaEntrypoint {
     )
 
     $content = @(
-        "from sunpack.support.entrypoint import main",
+        "from sunpack.runtime.entrypoint import main",
         "raise SystemExit(main())",
         ""
     )
@@ -1044,7 +1044,7 @@ Assert-PathExists -LiteralPath $toastHostPath -Description "Bundled toast DLL"
 Test-SevenZipWorker -PythonPath $venvPython -RepoRoot $repoRoot
 Invoke-Native -FilePath $venvPython -Arguments @(
     "-c",
-    "from sunpack.support.resources import get_toast_library_path; import os; assert os.path.exists(get_toast_library_path())"
+    "from sunpack.core.support.resources import get_toast_library_path; import os; assert os.path.exists(get_toast_library_path())"
 )
 
 Write-Step "Writing environment manifest"
@@ -1073,17 +1073,17 @@ Write-Step "Building Windows release with Nuitka"
     $nuitkaRuntimeDist = Join-Path $nuitkaBuildRoot ([System.IO.Path]::GetFileNameWithoutExtension($runtimeExeName) + ".dist")
     $nuitkaDynamicPackages = @(
     "watchdog",
-        "sunpack.cli.commands",
-        "sunpack.config.fields",
-        "sunpack.filesystem.filters.modules",
-    "sunpack.detection.formats",
-    "sunpack.embedded",
-    "sunpack.analysis.structure_pipeline.modules",
-    "sunpack.passwords.candidates",
-        "sunpack.extraction.internal",
-        "sunpack.relations.internal",
-        "sunpack.postprocess.internal",
-        "sunpack.verification.methods"
+        "sunpack.runtime.cli.commands",
+        "sunpack.core.config.fields",
+        "sunpack.pipeline.discovery.filesystem.filters.modules",
+    "sunpack.pipeline.discovery.detection.formats",
+    "sunpack.pipeline.discovery.embedded",
+    "sunpack.core.analysis.structure_pipeline.modules",
+    "sunpack.core.passwords.candidates",
+        "sunpack.pipeline.extraction.internal",
+        "sunpack.pipeline.discovery.relations.internal",
+        "sunpack.pipeline.postprocess.internal",
+        "sunpack.pipeline.verification.methods"
     )
 
     New-Item -ItemType Directory -Path $nuitkaEntryRoot -Force | Out-Null

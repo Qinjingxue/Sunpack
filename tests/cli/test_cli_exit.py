@@ -1,10 +1,10 @@
 from argparse import Namespace
 import asyncio
 
-from sunpack.cli.cli import maybe_pause
-from sunpack.cli.cli_constants import EXIT_OK, EXIT_TASK_FAILED
-from sunpack.cli.cli_context import CliContext
-from sunpack.cli.cli_types import CliCommandResult
+from sunpack.runtime.cli.cli import maybe_pause
+from sunpack.runtime.cli.cli_constants import EXIT_OK, EXIT_TASK_FAILED
+from sunpack.runtime.cli.cli_context import CliContext
+from sunpack.runtime.cli.cli_types import CliCommandResult
 
 
 def _result(errors=None):
@@ -13,7 +13,7 @@ def _result(errors=None):
 
 def test_successful_extract_does_not_pause(monkeypatch, capsys):
     pause_calls = []
-    monkeypatch.setattr("sunpack.cli.cli.os.system", pause_calls.append)
+    monkeypatch.setattr("sunpack.runtime.cli.cli.os.system", pause_calls.append)
 
     asyncio.run(maybe_pause(Namespace(command="extract", pause_on_exit=True), CliContext(), EXIT_OK, _result()))
 

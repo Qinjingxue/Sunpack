@@ -1,6 +1,6 @@
 """Configuration shared by integration tests and opt-in benchmark scenarios."""
 
-from sunpack.config.schema import normalize_config
+from sunpack.core.config.schema import normalize_config
 from tests.helpers.detection_config import with_detection_pipeline
 
 

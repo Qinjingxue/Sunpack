@@ -238,7 +238,7 @@ def task_snapshot(task: Any) -> dict[str, Any]:
 
 
 def scan_tasks_snapshot(directory: Path | str, *, passwords: list[str] | None = None) -> dict[str, Any]:
-    from sunpack.coordinator.task_provider import ArchiveTaskProvider
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
     from tests.real.plan1_real_archives.plan1_support import plan1_config
 
     provider = ArchiveTaskProvider(plan1_config(passwords=passwords))

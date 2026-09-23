@@ -1,7 +1,7 @@
 import math
 import struct
 import pytest
-from sunpack.platform.windows.toast_protocol import (
+from sunpack.core.platform.windows.toast_protocol import (
     MAX_SNAPSHOT_BYTES, ToastAction, ToastActionKind, ToastProgressMode,
     ToastSnapshot, ToastSnapshotKind, encode_snapshot,
 )

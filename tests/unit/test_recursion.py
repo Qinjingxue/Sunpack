@@ -1,5 +1,5 @@
-from sunpack.config.fields.coordinator import normalize_recursive_extract
-from sunpack.coordinator.recursion import RecursionController
+from sunpack.core.config.fields.coordinator import normalize_recursive_extract
+from sunpack.pipeline.coordinator.recursion import RecursionController
 
 
 def test_unbounded_recursion_modes_do_not_store_or_apply_round_limit():

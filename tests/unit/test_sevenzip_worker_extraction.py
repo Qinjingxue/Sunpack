@@ -9,16 +9,16 @@ import zipfile
 
 import pytest
 
-from sunpack.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, ArchiveInputRange
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, ArchiveInputRange
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
-from sunpack.extraction.internal.sevenzip.sevenzip_runner import (
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
     _NativeWorkerProcess,
     _apply_native_environment,
 )
-from sunpack.extraction.internal.sevenzip.worker_diagnostics import worker_result_payload
-from sunpack.extraction.scheduler import ExtractionScheduler
-from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import worker_result_payload
+from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from tests.helpers.tool_config import get_test_tools
 
 
@@ -194,7 +194,7 @@ def test_worker_does_not_classify_unencrypted_open_failure_as_wrong_password(tmp
 def test_worker_candidate_batch_probes_then_extracts_with_selected_password(tmp_path):
     worker = _require_worker_or_skip()
     archive, filename = _create_encrypted_zip(tmp_path)
-    from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
+    from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
 
     weak_candidates = [f"weak-collision-{index}" for index in range(1024)]
     weak_match = ZipFastVerifier().verify_batch(str(archive), [*weak_candidates, "secret"])
@@ -272,7 +272,7 @@ def test_worker_single_candidate_skips_probe_and_extracts_directly(tmp_path):
 def test_worker_single_zipcrypto_collision_probes_only_after_direct_failure(tmp_path):
     worker = _require_worker_or_skip()
     archive, _filename = _create_encrypted_zip(tmp_path)
-    from sunpack.passwords.verifier.zip_fast import ZipFastVerifier
+    from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
 
     weak_candidates = [f"weak-collision-{index}" for index in range(4096)]
     weak_match = ZipFastVerifier().verify_batch(str(archive), weak_candidates)
@@ -486,10 +486,10 @@ def test_native_worker_starts_in_neutral_working_directory(tmp_path, monkeypatch
         raise StartObserved
 
     monkeypatch.setattr(
-        "sunpack.extraction.internal.sevenzip.sevenzip_runner.runtime_working_directory",
+        "sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner.runtime_working_directory",
         lambda: str(tmp_path),
     )
-    monkeypatch.setattr("sunpack.extraction.internal.sevenzip.sevenzip_runner.subprocess.Popen", fake_popen)
+    monkeypatch.setattr("sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner.subprocess.Popen", fake_popen)
 
     with pytest.raises(StartObserved):
         _NativeWorkerProcess("worker.exe", None)
@@ -566,7 +566,7 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
 
 
 def test_compact_worker_manifest_is_parsed_into_native_storage():
-    from sunpack.extraction.internal.sevenzip.worker_diagnostics import (
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
         worker_manifest_files,
     )
@@ -594,7 +594,7 @@ def test_compact_worker_manifest_is_parsed_into_native_storage():
 
 
 def test_worker_manifest_v2_is_not_accepted():
-    from sunpack.extraction.internal.sevenzip.worker_diagnostics import build_worker_diagnostics
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import build_worker_diagnostics
 
     payload = {
         "type": "result",
@@ -607,7 +607,7 @@ def test_worker_manifest_v2_is_not_accepted():
 
 
 def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
-    from sunpack.extraction.internal.sevenzip.worker_diagnostics import (
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
         worker_manifest_files,
     )
@@ -639,7 +639,7 @@ def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
 
 
 def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace():
-    from sunpack.extraction.internal.sevenzip.worker_diagnostics import (
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
         compact_success_worker_diagnostics,
     )

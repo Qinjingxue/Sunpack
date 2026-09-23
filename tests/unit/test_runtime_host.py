@@ -4,8 +4,8 @@ import asyncio
 import os
 from types import SimpleNamespace
 
-from sunpack.cli.runtime_host import RuntimeHost
-from sunpack.coordinator.archive_registry import ActiveArchiveRegistry
+from sunpack.runtime.cli.runtime_host import RuntimeHost
+from sunpack.pipeline.coordinator.archive_registry import ActiveArchiveRegistry
 
 
 def test_archive_registry_detects_watch_owner_by_file_identity(tmp_path):
@@ -25,8 +25,8 @@ def test_archive_registry_detects_watch_owner_by_file_identity(tmp_path):
 
 
 def test_extract_reports_watch_busy_without_starting_another_task(tmp_path):
-    from sunpack.cli.commands import extract
-    from sunpack.cli.runtime_state import set_runtime_host
+    from sunpack.runtime.cli.commands import extract
+    from sunpack.runtime.cli.runtime_state import set_runtime_host
 
     archive = tmp_path / "archive.zip"
     archive.write_bytes(b"zip")
@@ -53,9 +53,9 @@ def test_extract_reports_watch_busy_without_starting_another_task(tmp_path):
 
 
 def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
-    import sunpack.cli.runtime_host as runtime_host_module
-    import sunpack.cli.persistent_runtime as persistent_runtime
-    import sunpack.platform.windows.process_qos as process_qos
+    import sunpack.runtime.cli.runtime_host as runtime_host_module
+    import sunpack.runtime.cli.persistent_runtime as persistent_runtime
+    import sunpack.core.platform.windows.process_qos as process_qos
 
     events = []
 
@@ -163,8 +163,8 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
     ]
 
 def test_runtime_host_without_watch_scheduler_expires_cli_override_on_foreground_finish(monkeypatch):
-    import sunpack.cli.persistent_runtime as persistent_runtime
-    import sunpack.platform.windows.process_qos as process_qos
+    import sunpack.runtime.cli.persistent_runtime as persistent_runtime
+    import sunpack.core.platform.windows.process_qos as process_qos
 
     modes = []
 
@@ -269,8 +269,8 @@ def test_runtime_host_does_not_bypass_a_waiting_first_foreground():
 
 
 def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_path):
-    import sunpack.cli.runtime_host as module
-    import sunpack.platform.windows.toast_host as toast
+    import sunpack.runtime.cli.runtime_host as module
+    import sunpack.core.platform.windows.toast_host as toast
 
     managers = []
     services = []

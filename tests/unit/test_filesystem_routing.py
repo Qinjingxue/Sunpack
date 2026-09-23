@@ -7,13 +7,13 @@ import tarfile
 import zipfile
 from binascii import crc32
 
-from sunpack.contracts.filesystem import (
+from sunpack.core.contracts.filesystem import (
     FILESYSTEM_ROUTE_DETECTION,
     FILESYSTEM_ROUTE_RELATIONS,
     FILESYSTEM_ROUTE_RESIDUAL,
 )
-from sunpack.coordinator.scan_session import DiscoveryScanSession
-from sunpack.filesystem.directory_scanner import DirectoryScanner
+from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 
 
 def _basename(path: str) -> str:

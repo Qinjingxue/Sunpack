@@ -17,7 +17,7 @@ from pathlib import Path
 import pytest
 
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.extraction.internal.sevenzip.sevenzip_runner import (
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
     _apply_native_environment,
     _apply_native_event_to_job_state,
@@ -120,7 +120,7 @@ def _write_python_worker(tmp_path: Path, events: list[dict], name: str = "space_
 
 
 def test_space_event_reaches_callback_without_polluting_job_state():
-    from sunpack.extraction.internal.sevenzip.sevenzip_runner import _SPACE_ACCEPTED
+    from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import _SPACE_ACCEPTED
 
     for event in ("space_blocked", "space_status", "space_resumed"):
         state = _running_state()
@@ -318,7 +318,7 @@ def test_new_episode_resets_resumed_seen():
 def test_on_space_event_reports_acceptance():
     """`_on_space_event` 的返回值是全系统唯一的 stale 判定。"""
 
-    from sunpack.extraction.internal.sevenzip.sevenzip_runner import (
+    from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
         _SPACE_ACCEPTED,
         _SPACE_NOT_APPLICABLE,
         _SPACE_STALE,

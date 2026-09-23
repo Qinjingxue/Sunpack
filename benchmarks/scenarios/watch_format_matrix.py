@@ -51,9 +51,9 @@ from benchmarks.scenarios.extraction_format_matrix import (
     _run_rar,
 )
 from benchmarks.scenarios.extraction_large_archive import RequestRuntimeProfiler, _timing_totals
-from sunpack.config.loader import load_config
-from sunpack.coordinator.engine import PipelineEngine
-from sunpack.watch.scheduler import WatchScheduler
+from sunpack.core.config.loader import load_config
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.scheduler import WatchScheduler
 
 
 SCENARIO = "watch.format-matrix"

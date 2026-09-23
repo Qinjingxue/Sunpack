@@ -19,7 +19,7 @@ def apply_default_test_config_overrides():
     if "SUNPACK_CONFIG_OVERRIDES" not in os.environ:
         os.environ["SUNPACK_CONFIG_OVERRIDES"] = DEFAULT_TEST_CONFIG_OVERRIDES
     try:
-        from sunpack.config.loader import clear_config_cache
+        from sunpack.core.config.loader import clear_config_cache
     except Exception:
         pass
     else:
@@ -32,7 +32,7 @@ def apply_default_test_config_overrides():
 @pytest.fixture(scope="session", autouse=True)
 def isolate_builtin_password_file(tmp_path_factory):
     """Prevent watch tests from persisting clipboard contents into the checkout."""
-    import sunpack.passwords.internal.builtin as builtin_module
+    import sunpack.core.passwords.internal.builtin as builtin_module
 
     builtin_path = tmp_path_factory.mktemp("sunpack-resources") / "builtin_passwords.txt"
     monkeypatch = pytest.MonkeyPatch()

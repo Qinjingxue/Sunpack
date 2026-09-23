@@ -1,10 +1,10 @@
 import io
 import tarfile
 
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.contracts.archive_state import ArchiveState
-from sunpack.verification.archive_state_manifest import archive_state_manifest
-from sunpack.verification.methods._archive_output_match import coverage_from_archive_and_output
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.archive_state import ArchiveState
+from sunpack.pipeline.verification.archive_state_manifest import archive_state_manifest
+from sunpack.pipeline.verification.methods._archive_output_match import coverage_from_archive_and_output
 
 
 def _state(path):

@@ -1,6 +1,6 @@
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.support.output_paths import next_available_path
-from sunpack.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
+from sunpack.core.support.output_paths import next_available_path
+from sunpack.core.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
 
 
 def test_detected_extensions_do_not_rename_source_files(tmp_path):

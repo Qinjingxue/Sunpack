@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import sunpack.platform.windows.shell_notify as shell_notify
+import sunpack.core.platform.windows.shell_notify as shell_notify
 
 
 def test_unique_directories_include_parent_of_files_and_output_dirs(tmp_path):

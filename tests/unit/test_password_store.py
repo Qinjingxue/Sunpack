@@ -1,13 +1,13 @@
 from types import SimpleNamespace
 
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.passwords.job import PasswordJob
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.passwords.job import PasswordJob
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
-from sunpack.passwords.result import PasswordResolutionStatus
-from sunpack.passwords.scheduler import PasswordScheduler, PasswordSearchResult, PasswordSearchStatus
-from sunpack.passwords import PasswordResolver, PasswordSession, PasswordStore
-from sunpack.passwords.internal.store import MAX_RECENT_PASSWORDS
-from sunpack.passwords.verifier import PasswordBatchVerification, PasswordVerifierChain
+from sunpack.core.passwords.result import PasswordResolutionStatus
+from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchResult, PasswordSearchStatus
+from sunpack.core.passwords import PasswordResolver, PasswordSession, PasswordStore
+from sunpack.core.passwords.internal.store import MAX_RECENT_PASSWORDS
+from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordVerifierChain
 
 
 def _task_with_structure(format_hint: str, structure: dict, *, path: str | None = None):

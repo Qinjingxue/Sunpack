@@ -2,7 +2,7 @@ import asyncio
 import threading
 import time
 
-from sunpack.coordinator.async_work import AsyncWorkBroker, CURRENT_WORK, map_unbounded
+from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CURRENT_WORK, map_unbounded
 
 
 def test_broker_uses_fixed_workers_and_returns_on_owner_loop():

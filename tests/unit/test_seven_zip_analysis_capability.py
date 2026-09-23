@@ -1,7 +1,7 @@
 import struct
 from binascii import crc32
 
-from sunpack.analysis import ArchiveAnalyzer, SevenZipProbeOptions
+from sunpack.core.analysis import ArchiveAnalyzer, SevenZipProbeOptions
 
 
 def _seven_zip_bytes(version_major=0):

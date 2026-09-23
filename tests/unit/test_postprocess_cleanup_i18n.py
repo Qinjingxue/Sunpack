@@ -1,6 +1,6 @@
-from sunpack.config.schema import normalize_config
-from sunpack.postprocess.actions import PostProcessActions
-import sunpack.postprocess.internal.cleanup as cleanup_module
+from sunpack.core.config.schema import normalize_config
+from sunpack.pipeline.postprocess.actions import PostProcessActions
+import sunpack.pipeline.postprocess.internal.cleanup as cleanup_module
 
 
 def test_cleanup_defaults_to_config_language_and_localized_label(tmp_path, monkeypatch, capsys):

@@ -1,5 +1,5 @@
-from sunpack.contracts.discovery import DiscoveryCandidate
-from sunpack.detection.scheduler import DetectionScheduler
+from sunpack.core.contracts.discovery import DiscoveryCandidate
+from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
 
 
 def _candidate(path: str, format_hint: str = "") -> DiscoveryCandidate:

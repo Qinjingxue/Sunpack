@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-import sunpack.platform.windows.process_qos as process_qos
+import sunpack.core.platform.windows.process_qos as process_qos
 
 
 class _FakeFunction:

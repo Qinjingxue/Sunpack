@@ -1,7 +1,7 @@
-from sunpack.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
-from sunpack.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart
-from sunpack.contracts.archive_state import ArchiveState
-from sunpack.detection.input_planning import ArchiveInputPlanningStage
+from sunpack.core.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart
+from sunpack.core.contracts.archive_state import ArchiveState
+from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 
 
 def test_archive_state_projects_analysis_into_execution_descriptor():

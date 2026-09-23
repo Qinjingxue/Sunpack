@@ -21,8 +21,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from sunpack.contracts.filesystem import FileEntry
-from sunpack.filesystem.directory_scanner import DirectoryScanner
+from sunpack.core.contracts.filesystem import FileEntry
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from benchmarks.harness import render_report, report_from_payload
 from sunpack_native import profile_directory_scan
 

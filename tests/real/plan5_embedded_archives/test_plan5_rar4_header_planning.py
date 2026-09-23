@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.support.archive_knowledge_projection import source_extractable_segments
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
+from sunpack.core.support.archive_knowledge_projection import source_extractable_segments
 from tests.helpers.real_archives import create_encrypted_rar_archive
 from tests.helpers.tool_config import get_optional_rar
 from tests.real.plan1_real_archives.plan1_support import plan1_config

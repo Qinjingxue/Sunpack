@@ -1,4 +1,4 @@
-import sunpack.platform.windows.startup as startup_module
+import sunpack.runtime.watch.startup as startup_module
 
 
 def test_startup_command_launches_packaged_runtime_with_runtime_identity(tmp_path, monkeypatch):

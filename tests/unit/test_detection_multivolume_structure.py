@@ -1,7 +1,7 @@
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.contracts.discovery import DiscoveryCandidate
-from sunpack.relations.resolver import RelationResolver
-from sunpack.support.path_keys import path_key
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.discovery import DiscoveryCandidate
+from sunpack.pipeline.discovery.relations.resolver import RelationResolver
+from sunpack.core.support.path_keys import path_key
 
 
 def _candidate(path, metadata, members=None):

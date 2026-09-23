@@ -9,8 +9,8 @@ from pathlib import Path
 import pytest
 import sunpack_native
 
-from sunpack.watch.scheduler import WatchScheduler
-from sunpack.watch.scanner import _candidate_for
+from sunpack.runtime.watch.scheduler import WatchScheduler
+from sunpack.runtime.watch.scanner import _candidate_for
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 

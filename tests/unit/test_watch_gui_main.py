@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import sunpack.gui.main as gui_main
+import sunpack.runtime.gui.main as gui_main
 
 
 def test_watch_gui_main_forwards_to_the_shared_runtime_host(monkeypatch, tmp_path):

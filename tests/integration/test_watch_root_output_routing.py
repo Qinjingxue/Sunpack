@@ -7,9 +7,9 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.config.loader import load_config
-from sunpack.coordinator.engine import PipelineEngine
-from sunpack.watch.scheduler import WatchRunResult, WatchScheduler
+from sunpack.core.config.loader import load_config
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.runtime.watch.scheduler import WatchRunResult, WatchScheduler
 from tests.helpers.marker_utils import marker_present
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory
 

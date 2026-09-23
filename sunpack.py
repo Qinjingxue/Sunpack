@@ -6,8 +6,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import sys
 
-from sunpack.support.entrypoint import main
-from sunpack.support.runtime_identity import ensure_source_runtime_id
+from sunpack.runtime.entrypoint import main
+from sunpack.core.support.runtime_identity import ensure_source_runtime_id
 
 
 sys.argv[:] = [sys.argv[0], *ensure_source_runtime_id(sys.argv[1:])]

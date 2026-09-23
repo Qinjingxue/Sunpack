@@ -1,8 +1,8 @@
-from sunpack.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.coordinator.task_scan import direct_file_task
-from sunpack.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.support import archive_knowledge_projection as knowledge_view
+from sunpack.core.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.pipeline.coordinator.task_scan import direct_file_task
+from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
+from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from tests.helpers.archive_tasks import make_archive_task
 
 

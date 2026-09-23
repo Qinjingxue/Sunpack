@@ -1,10 +1,10 @@
 import io
 import zipfile
 
-from sunpack.contracts.discovery import DiscoveryCandidate
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.detection.scheduler import DetectionScheduler
-from sunpack.embedded.discovery import select_single_candidate_ratio
+from sunpack.core.contracts.discovery import DiscoveryCandidate
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
+from sunpack.pipeline.discovery.embedded.discovery import select_single_candidate_ratio
 
 
 def _zip_bytes() -> bytes:

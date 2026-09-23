@@ -5,9 +5,9 @@ import sys
 import textwrap
 from types import SimpleNamespace
 
-import sunpack.watch.service as service_module
-import sunpack.gui.tray as tray_module
-from sunpack.gui.tray import WindowsTrayIcon, _tray_language_from_service
+import sunpack.runtime.watch.service as service_module
+import sunpack.runtime.gui.tray as tray_module
+from sunpack.runtime.gui.tray import WindowsTrayIcon, _tray_language_from_service
 
 
 def test_tray_open_watch_roots_file_creates_and_opens_txt(tmp_path, monkeypatch):
@@ -383,7 +383,7 @@ def test_tray_window_can_be_recreated_without_stale_callback_crash():
         """
         import gc
         from types import SimpleNamespace
-        from sunpack.gui.tray import WindowsTrayIcon
+        from sunpack.runtime.gui.tray import WindowsTrayIcon
 
         WindowsTrayIcon._add_icon = lambda self, hwnd: None
         service = SimpleNamespace(config={"cli": {"language": "en"}}, log=None)

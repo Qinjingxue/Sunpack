@@ -1,6 +1,6 @@
-import sunpack.support.entrypoint as entrypoint
-import sunpack.support.resources as resources
-from sunpack.support import runtime_identity
+import sunpack.runtime.entrypoint as entrypoint
+import sunpack.core.support.resources as resources
+from sunpack.core.support import runtime_identity
 
 
 def test_entrypoint_consumes_private_runtime_identity_before_cli(monkeypatch):
@@ -21,7 +21,7 @@ def test_entrypoint_consumes_private_runtime_identity_before_cli(monkeypatch):
         assert runtime_identity.runtime_id() == "v2-0123456789abcdef"
         return 19
 
-    import sunpack.cli.cli as cli
+    import sunpack.runtime.cli.cli as cli
 
     monkeypatch.setattr(cli, "main", fake_main)
 
@@ -41,8 +41,8 @@ def test_entrypoint_launches_watch_unelevated_for_installer(tmp_path, monkeypatc
         def close(self):
             captured["closed"] = True
 
-    import sunpack.platform.windows.process_launch as process_launch
-    import sunpack.support.process_executable as process_executable
+    import sunpack.core.platform.windows.process_launch as process_launch
+    import sunpack.core.support.process_executable as process_executable
 
     monkeypatch.setattr(entrypoint.sys, "argv", [str(runtime), "--launch-watch-unelevated"])
     monkeypatch.setattr(process_executable, "current_process_executable", lambda: runtime)
@@ -65,8 +65,8 @@ def test_entrypoint_launches_watch_unelevated_for_installer(tmp_path, monkeypatc
 
 def test_shared_runtime_uses_cli_lifecycle(monkeypatch):
     captured = {}
-    import sunpack.cli.cli as cli
-    import sunpack.cli.persistent_process as persistent_process
+    import sunpack.runtime.cli.cli as cli
+    import sunpack.runtime.cli.persistent_process as persistent_process
 
     monkeypatch.setattr(entrypoint.sys, "executable", r"C:\\package\\sunpack-runtime.exe")
     monkeypatch.setattr(entrypoint.sys, "argv", [r"C:\\package\\sunpack-runtime.exe", "--help"])

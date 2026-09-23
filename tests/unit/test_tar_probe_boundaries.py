@@ -3,8 +3,8 @@ import tarfile
 
 import sunpack_native
 
-from sunpack.analysis.structure_pipeline.modules.tar import TarAnalysisModule
-from sunpack.analysis.view import _probe_tar_view
+from sunpack.core.analysis.structure_pipeline.modules.tar import TarAnalysisModule
+from sunpack.core.analysis.view import _probe_tar_view
 
 
 class BytesView:

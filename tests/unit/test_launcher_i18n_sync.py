@@ -1,7 +1,7 @@
 import re
 from pathlib import Path
 
-from sunpack.i18n.catalog import CATALOG
+from sunpack.core.i18n.catalog import CATALOG
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]

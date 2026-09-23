@@ -1,4 +1,4 @@
-from sunpack.support.module_discovery import discover_package_modules, import_static_modules
+from sunpack.core.support.module_discovery import discover_package_modules, import_static_modules
 
 
 def test_module_discovery_caches_are_bounded():

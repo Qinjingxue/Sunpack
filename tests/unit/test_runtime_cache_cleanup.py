@@ -4,16 +4,16 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from sunpack.cli.runtime_host import RuntimeHost
-from sunpack.contracts.archive_knowledge import ArchiveKnowledge
-from sunpack.watch.scheduler import WatchScheduler
-from sunpack.passwords.relation_prober import _shared_attempt_cache, clear_relation_probe_cache
-from sunpack.support.archive_knowledge_projection import (
+from sunpack.runtime.cli.runtime_host import RuntimeHost
+from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
+from sunpack.runtime.watch.scheduler import WatchScheduler
+from sunpack.core.passwords.relation_prober import _shared_attempt_cache, clear_relation_probe_cache
+from sunpack.core.support.archive_knowledge_projection import (
     clear_projection_cache,
     source_fingerprint,
 )
-from sunpack.support.global_cache_manager import GLOBAL_CACHE
-from sunpack.support.runtime_cache_cleanup import clear_all_runtime_caches, runtime_cache_stats
+from sunpack.core.support.global_cache_manager import GLOBAL_CACHE
+from sunpack.core.support.runtime_cache_cleanup import clear_all_runtime_caches, runtime_cache_stats
 
 
 _TEST_LOOP = asyncio.new_event_loop()
@@ -156,7 +156,7 @@ def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
 
 
 def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_path):
-    from sunpack.cli.runtime_state import set_runtime_host
+    from sunpack.runtime.cli.runtime_state import set_runtime_host
 
     async def scenario():
         engine = _CleanupOnlyEngine()

@@ -4,9 +4,9 @@ import time
 
 import pytest
 
-from sunpack.platform.windows import toast_host as module
-from sunpack.platform.windows.toast_host import ToastManager
-from sunpack.platform.windows.toast_protocol import ToastSnapshot, ToastSnapshotKind
+from sunpack.core.platform.windows import toast_host as module
+from sunpack.core.platform.windows.toast_host import ToastManager
+from sunpack.core.platform.windows.toast_protocol import ToastSnapshot, ToastSnapshotKind
 
 
 def snapshot(kind=ToastSnapshotKind.SUCCESS, *, title='done', ttl_ms=0):
@@ -278,8 +278,8 @@ def test_show_failure_recreates_presenter_on_owner_thread(monkeypatch):
 def test_main_runtime_handles_toast_bootstrap_without_starting_engine(monkeypatch, argument, native_method):
     import sys
     from types import SimpleNamespace
-    from sunpack.support import entrypoint
-    from sunpack.support import runtime_identity
+    from sunpack.core.support import entrypoint
+    from sunpack.core.support import runtime_identity
 
     calls = []
     library = SimpleNamespace(**{
@@ -295,7 +295,7 @@ def test_main_runtime_handles_toast_bootstrap_without_starting_engine(monkeypatc
 
 
 def test_unregister_toast_unelevated_removes_current_user_identity_without_native(monkeypatch):
-    from sunpack.platform.windows import elevation
+    from sunpack.core.platform.windows import elevation
 
     calls = []
     monkeypatch.setattr(elevation, 'is_process_elevated', lambda: False)
@@ -310,7 +310,7 @@ def test_unregister_toast_elevated_removes_machine_registration_then_delegates_u
     tmp_path, monkeypatch,
 ):
     from types import SimpleNamespace
-    from sunpack.platform.windows import elevation, process_launch
+    from sunpack.core.platform.windows import elevation, process_launch
 
     calls = []
     library = SimpleNamespace(
@@ -347,7 +347,7 @@ def test_unregister_toast_elevated_removes_machine_registration_then_delegates_u
 
 def test_unregister_toast_elevated_bounds_current_user_cleanup_wait(tmp_path, monkeypatch):
     from types import SimpleNamespace
-    from sunpack.platform.windows import elevation, process_launch
+    from sunpack.core.platform.windows import elevation, process_launch
 
     calls = []
     library = SimpleNamespace(sunpack_toast_unregister=lambda: 0)
@@ -376,7 +376,7 @@ def test_unregister_toast_elevated_bounds_current_user_cleanup_wait(tmp_path, mo
 
 
 def test_unregister_toast_current_user_helper_never_relaunches_when_still_elevated(monkeypatch):
-    from sunpack.platform.windows import elevation, process_launch
+    from sunpack.core.platform.windows import elevation, process_launch
 
     calls = []
     monkeypatch.setattr(elevation, 'is_process_elevated', lambda: True)
@@ -390,8 +390,8 @@ def test_unregister_toast_current_user_helper_never_relaunches_when_still_elevat
 
 def test_unregister_toast_current_user_helper_is_dispatched_before_normal_runtime(monkeypatch):
     import sys
-    from sunpack.support import entrypoint
-    from sunpack.support import runtime_identity
+    from sunpack.core.support import entrypoint
+    from sunpack.core.support import runtime_identity
 
     calls = []
     monkeypatch.setattr(sys, 'argv', ['sunpack-runtime.exe', '--unregister-toast-current-user'])
@@ -421,7 +421,7 @@ def test_current_user_toast_identity_cleanup_targets_hkcu(monkeypatch):
 
 
 def test_resource_lookup_selects_current_architecture(tmp_path, monkeypatch):
-    from sunpack.support import resources
+    from sunpack.core.support import resources
 
     for arch in ('x64', 'arm64'):
         directory = tmp_path / 'native' / 'toast_host' / f'build-{arch}' / 'Release'

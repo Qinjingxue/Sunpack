@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from sunpack.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
 from tests.helpers.performance_fixtures import build_pressure_corpus, pressure_scan_config
 
 
@@ -55,15 +55,15 @@ def timed_calls(specs: list[tuple[str, object, str]]):
 
 
 def layer_specs():
-    from sunpack.coordinator.discovery import ArchiveDiscoveryPipeline
-    from sunpack.coordinator.scan_session import DiscoveryScanSession
-    from sunpack.coordinator.task_provider import ArchiveTaskProvider
-    from sunpack.detection.confirmation import FormatConfirmation
-    from sunpack.detection.scheduler import DetectionScheduler
-    from sunpack.embedded.discovery import EmbeddedDiscovery
-    from sunpack.filesystem.directory_scanner import DirectoryScanner
-    from sunpack.relations.internal.group_builder import RelationsGroupBuilder
-    from sunpack.relations.resolver import RelationResolver
+    from sunpack.pipeline.coordinator.discovery import ArchiveDiscoveryPipeline
+    from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+    from sunpack.pipeline.discovery.detection.confirmation import FormatConfirmation
+    from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
+    from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
+    from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+    from sunpack.pipeline.discovery.relations.internal.group_builder import RelationsGroupBuilder
+    from sunpack.pipeline.discovery.relations.resolver import RelationResolver
 
     return [
         ("provider.discover_targets", ArchiveTaskProvider, "discover_targets"),

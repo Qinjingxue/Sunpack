@@ -3,12 +3,12 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
-from sunpack.cli.cli_context import CliContext
-from sunpack.cli.cli_reporter import CliReporter
-from sunpack.cli.commands import extract
-from sunpack.contracts.failures import FailureInfo, FailureKind
-from sunpack.contracts.results import OutcomeKind, TargetRunResult
-from sunpack.cli.cli_runtime import build_password_summary
+from sunpack.runtime.cli.cli_context import CliContext
+from sunpack.runtime.cli.cli_reporter import CliReporter
+from sunpack.runtime.cli.commands import extract
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
+from sunpack.runtime.cli.cli_runtime import build_password_summary
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 

@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from sunpack.cli.cli import build_cli_parser
-from sunpack.cli.cli_commands import discover_command_modules
-from sunpack.cli.cli_context import CliContext
+from sunpack.runtime.cli.cli import build_cli_parser
+from sunpack.runtime.cli.cli_commands import discover_command_modules
+from sunpack.runtime.cli.cli_context import CliContext
 
 
 def test_cli_and_gui_packages_have_explicit_boundaries():
@@ -11,8 +11,8 @@ def test_cli_and_gui_packages_have_explicit_boundaries():
     assert (package_root / "cli" / "__init__.py").is_file()
     assert (package_root / "gui" / "__init__.py").is_file()
     assert not (package_root / "app").exists()
-from sunpack.i18n.catalog import CATALOG
-from sunpack.i18n.context import validate_catalog
+from sunpack.core.i18n.catalog import CATALOG
+from sunpack.core.i18n.context import validate_catalog
 
 
 def test_i18n_catalogs_have_matching_keys_and_placeholders():

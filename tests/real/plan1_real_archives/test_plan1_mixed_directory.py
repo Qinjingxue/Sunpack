@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from tests.helpers.detection_probe import detect_archive_hits, detection_pipeline_config
 from tests.helpers.marker_utils import marker_was_extracted
 from tests.helpers.real_archives import ArchiveFixtureFactory

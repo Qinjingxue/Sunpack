@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
-from sunpack.watch.state import (
+from sunpack.runtime.watch.state import (
     WatchPendingWork,
     WatchStateEntry,
     WatchStateStore,

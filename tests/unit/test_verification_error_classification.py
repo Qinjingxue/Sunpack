@@ -1,4 +1,4 @@
-from sunpack.verification.error_classification import classify_verification_error
+from sunpack.pipeline.verification.error_classification import classify_verification_error
 
 
 def test_payload_failures_are_not_confused_with_container_damage():

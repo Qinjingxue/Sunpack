@@ -1,6 +1,6 @@
 import json
 
-from sunpack.watch.state import WatchStateStore
+from sunpack.runtime.watch.state import WatchStateStore
 
 
 def test_native_checkpoint_persists_only_declared_dataclass_fields(tmp_path):

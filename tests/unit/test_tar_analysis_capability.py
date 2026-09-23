@@ -1,8 +1,8 @@
 import io
 import tarfile
 
-from sunpack.analysis import ArchiveAnalyzer, MultiVolumeAnalysisSource, TarProbeOptions
-from sunpack.detection.formats.tar import confirm as confirm_tar
+from sunpack.core.analysis import ArchiveAnalyzer, MultiVolumeAnalysisSource, TarProbeOptions
+from sunpack.pipeline.discovery.detection.formats.tar import confirm as confirm_tar
 
 
 def _tar_bytes(payload: bytes = b"payload") -> bytes:

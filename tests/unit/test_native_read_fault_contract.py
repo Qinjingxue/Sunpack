@@ -1,7 +1,7 @@
 import struct
 import zlib
 
-from sunpack.analysis.structure_pipeline.modules._read_fault import read_fault_damage_flags
+from sunpack.core.analysis.structure_pipeline.modules._read_fault import read_fault_damage_flags
 from sunpack_native import AnalysisBinaryView
 
 

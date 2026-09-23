@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import sunpack.passwords.internal.clipboard as clipboard_module
+import sunpack.core.passwords.internal.clipboard as clipboard_module
 
 
 class _FakeFunction:

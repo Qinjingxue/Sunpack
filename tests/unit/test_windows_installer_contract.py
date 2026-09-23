@@ -449,8 +449,8 @@ def test_build_uses_nuitka_only():
     assert 'Embed-WindowsApplicationManifest -PythonPath $venvPython' in build_script
     assert '"scripts\\embed_windows_manifest.py"' in build_script
     assert "Invoke-NuitkaStandaloneBuild" in build_script
-    assert "sunpack.detection.pipeline.rules.hard_stop" not in build_script
-    assert "sunpack.detection.pipeline.rules.confirmation" not in build_script
+    assert "sunpack.pipeline.discovery.detection.pipeline.rules.hard_stop" not in build_script
+    assert "sunpack.pipeline.discovery.detection.pipeline.rules.confirmation" not in build_script
     assert '"nuitka>=2"' in project
     assert "pyinstaller" not in project.lower()
 

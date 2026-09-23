@@ -1,5 +1,5 @@
-from sunpack.cli.cli import build_cli_parser
-from sunpack.cli.cli_context import CliContext
+from sunpack.runtime.cli.cli import build_cli_parser
+from sunpack.runtime.cli.cli_context import CliContext
 
 
 def test_workload_process_mode_defaults_to_high():

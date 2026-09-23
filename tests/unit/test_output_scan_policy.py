@@ -1,7 +1,7 @@
-from sunpack.contracts.extraction import ExtractionResult
-from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
-from sunpack.coordinator.target_scan import build_candidates_for_targets
-from sunpack.support.output_inventory import collect_output_inventory
+from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
+from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 from tests.helpers.detection_config import with_detection_pipeline
 from sunpack_native import worker_manifest_from_rows
 
@@ -130,7 +130,7 @@ def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch):
     inventory = collect_output_inventory(str(tmp_path))
 
     monkeypatch.setattr(
-        "sunpack.coordinator.output_scan_policy.DirectoryScanner.scan",
+        "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.scan",
         lambda _self: (_ for _ in ()).throw(AssertionError("directory must not be rescanned")),
     )
     policy = OutputScanPolicy(_config())
@@ -160,7 +160,7 @@ def test_output_scan_policy_inventory_batch_primes_file_heads(tmp_path, monkeypa
     assert session is not None
 
     monkeypatch.setattr(
-        "sunpack.coordinator.scan_session._native_batch_file_head_facts",
+        "sunpack.pipeline.coordinator.scan_session._native_batch_file_head_facts",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("file heads must be cached")),
     )
     facts = session.file_head_facts_for_paths([str(archive)], magic_size=16)
@@ -196,15 +196,15 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
     }
     inventory = collect_output_inventory(str(tmp_path), worker_result)
     monkeypatch.setattr(
-        "sunpack.coordinator.scan_session._native_batch_file_head_facts",
+        "sunpack.pipeline.coordinator.scan_session._native_batch_file_head_facts",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker facts must avoid reopen")),
     )
     monkeypatch.setattr(
-        "sunpack.coordinator.output_scan_policy.DirectoryScanner.inventory_file_indices",
+        "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.inventory_file_indices",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Python inventory filtering must be bypassed")),
     )
     monkeypatch.setattr(
-        "sunpack.coordinator.output_scan_policy.DirectoryScanner.snapshot_from_entries",
+        "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.snapshot_from_entries",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Python snapshot rebuilding must be bypassed")),
     )
 

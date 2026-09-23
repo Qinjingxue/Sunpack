@@ -1,4 +1,4 @@
-from sunpack.support import runtime_identity
+from sunpack.core.support import runtime_identity
 
 
 def test_consume_runtime_id_strips_only_the_private_launcher_argument(monkeypatch):
@@ -42,7 +42,7 @@ def test_source_bootstrap_uses_reserved_namespace_without_path_calculation():
 
 
 def test_packaged_server_command_reexecutes_runtime_and_forwards_identity(tmp_path, monkeypatch):
-    from sunpack.cli import persistent_process
+    from sunpack.runtime.cli import persistent_process
 
     runtime = tmp_path / "sunpack-runtime.exe"
     monkeypatch.setattr(persistent_process, "is_packaged_process", lambda: True)

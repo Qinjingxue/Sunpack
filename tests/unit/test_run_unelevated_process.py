@@ -5,7 +5,7 @@ import os
 import pytest
 
 from scripts import run_unelevated_process
-from sunpack.platform.windows import process_launch
+from sunpack.core.platform.windows import process_launch
 
 
 def test_explicit_environment_overrides_are_forwarded_to_child(monkeypatch):

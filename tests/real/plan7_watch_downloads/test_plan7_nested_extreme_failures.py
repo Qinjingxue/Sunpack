@@ -4,9 +4,9 @@ import time
 import zipfile
 from pathlib import Path
 
-from sunpack.contracts.failures import FailureKind
-from sunpack.watch.toast import WatchToastCoordinator
-from sunpack.platform.windows.toast_protocol import ToastSnapshotKind
+from sunpack.core.contracts.failures import FailureKind
+from sunpack.runtime.watch.toast import WatchToastCoordinator
+from sunpack.core.platform.windows.toast_protocol import ToastSnapshotKind
 from tests.helpers.real_archives import (
     ArchiveFixtureFactory,
     create_encrypted_zip_archive,

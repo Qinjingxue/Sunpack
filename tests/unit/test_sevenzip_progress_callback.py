@@ -1,9 +1,9 @@
 import zipfile
 
 from tests.helpers.archive_tasks import make_archive_task
-from sunpack.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
-from sunpack.extraction.internal.sevenzip.worker_diagnostics import worker_result_payload
-from sunpack.support.resources import get_sevenzip_bridge_worker_path
+from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import worker_result_payload
+from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 
 
 def test_native_worker_progress_event_is_forwarded_to_task_callback(tmp_path):

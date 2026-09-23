@@ -6,12 +6,12 @@ import zipfile
 
 import pytest
 
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.filesystem.directory_scanner import DirectoryScanner
-from sunpack.coordinator.target_scan import build_candidates_for_target
-from sunpack.coordinator.target_groups import relation_group_to_candidate
-from sunpack.relations import RelationsScheduler
-from sunpack.relations.internal.group_builder import _relation_archive_input
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from sunpack.pipeline.coordinator.target_scan import build_candidates_for_target
+from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
+from sunpack.pipeline.discovery.relations import RelationsScheduler
+from sunpack.pipeline.discovery.relations.internal.group_builder import _relation_archive_input
 from tests.helpers.fs_builder import make_minimal_7z
 
 

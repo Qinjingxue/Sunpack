@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sunpack.analysis.embedded import scan_embedded_archives
+from sunpack.core.analysis.embedded import scan_embedded_archives
 from tests.real.diagnostics import (
     case_snapshot,
     environment_snapshot,
@@ -525,7 +525,7 @@ def assert_plan5_single_task_scan(
     error_info: dict[str, Any] | None = None,
 ) -> None:
     """整个混合文件在扫描阶段必须恰好成为一个待处理任务。"""
-    from sunpack.coordinator.task_provider import ArchiveTaskProvider
+    from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
     from tests.real.plan1_real_archives.plan1_support import plan1_config
 
     provider = ArchiveTaskProvider(plan1_config())

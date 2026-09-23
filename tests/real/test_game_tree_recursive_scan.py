@@ -3,10 +3,10 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.config.loader import clear_config_cache, load_config
-from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy
-from sunpack.coordinator.recursive_authorization import RecursiveAuthorization
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.core.config.loader import clear_config_cache, load_config
+from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
+from sunpack.pipeline.coordinator.recursive_authorization import RecursiveAuthorization
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 
 
 GAME_TREE_ROOT = Path(os.environ.get("SUNPACK_GAME_TREE_ROOT", r"D:\game"))

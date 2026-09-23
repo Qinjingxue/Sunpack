@@ -2,7 +2,7 @@
 
 This scenario deliberately uses the fixed 300 MiB ``few_large`` corpus and
 the same non-direct-file CLI command as ``extraction.format-matrix``.  The
-command is dispatched through :func:`sunpack.cli.cli.async_main`, so parsing,
+command is dispatched through :func:`sunpack.runtime.cli.cli.async_main`, so parsing,
 configuration, planning, extraction, output handling, and CLI reporting are
 all included in the measured wall time.  ``RequestRuntimeProfiler`` adds the
 coarse internal phase breakdown to each measured request.
@@ -96,8 +96,8 @@ def _validate_corpus(selected_formats: tuple[str, ...]) -> dict[str, Path]:
 
 def _patch_worker_path(worker_path: Path):
     """Force the runner and resource helper to use the freshly built worker."""
-    import sunpack.extraction.internal.sevenzip.sevenzip_runner as runner_module
-    import sunpack.support.resources as resources_module
+    import sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner as runner_module
+    import sunpack.core.support.resources as resources_module
 
     original_runner = runner_module.get_sevenzip_bridge_worker_path
     original_resources = resources_module.get_sevenzip_bridge_worker_path
@@ -165,7 +165,7 @@ async def _run_cli_once(
     profiler: RequestRuntimeProfiler,
     timeout_seconds: float,
 ) -> dict[str, Any]:
-    from sunpack.cli.cli import async_main
+    from sunpack.runtime.cli.cli import async_main
 
     argv = [
         "extract",
@@ -237,7 +237,7 @@ async def _run(args: argparse.Namespace) -> int:
     warmup_rows: list[dict[str, Any]] = []
     profiler: RequestRuntimeProfiler | None = None
     restore_worker = _patch_worker_path(worker_path)
-    from sunpack.cli import persistent_runtime
+    from sunpack.runtime.cli import persistent_runtime
 
     try:
         persistent_runtime.enable_persistent_runtime()
@@ -260,7 +260,7 @@ async def _run(args: argparse.Namespace) -> int:
                     try:
                         if profiler is None:
                             # The first warmup creates the persistent engine.
-                            from sunpack.cli.cli import async_main
+                            from sunpack.runtime.cli.cli import async_main
 
                             started = time.perf_counter()
                             stdout = io.StringIO()

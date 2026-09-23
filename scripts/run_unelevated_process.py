@@ -7,8 +7,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from sunpack.platform.windows.elevation import is_process_elevated
-from sunpack.platform.windows.process_launch import launch_unelevated
+from sunpack.core.platform.windows.elevation import is_process_elevated
+from sunpack.core.platform.windows.process_launch import launch_unelevated
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

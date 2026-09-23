@@ -4,9 +4,9 @@ import zlib
 
 import pytest
 
-from sunpack.config.schema import normalize_config
-from sunpack.coordinator.scanner import ScanOrchestrator
-from sunpack.coordinator.target_scan import build_candidates_for_targets
+from sunpack.core.config.schema import normalize_config
+from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
+from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from tests.helpers.detection_config import with_detection_pipeline
 
 

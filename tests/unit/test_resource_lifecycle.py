@@ -9,9 +9,9 @@ import time
 
 import pytest
 
-import sunpack.support.archive_sessions as archive_sessions
-import sunpack.support.resource_lifecycle as lifecycle
-from sunpack.support.resource_lifecycle import (
+import sunpack.core.support.archive_sessions as archive_sessions
+import sunpack.core.support.resource_lifecycle as lifecycle
+from sunpack.core.support.resource_lifecycle import (
     ResourceBusyError,
     ResourceKind,
     TaskResourceScope,
@@ -23,7 +23,7 @@ from sunpack.support.resource_lifecycle import (
     reset_resource_lifecycle_for_tests,
     resource_snapshot,
 )
-from sunpack.coordinator.async_work import AsyncWorkBroker
+from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker
 
 
 @pytest.fixture(autouse=True)

@@ -1,4 +1,4 @@
-from sunpack.extraction.internal.workflow.preflight import PreExtractInspector
+from sunpack.pipeline.extraction.internal.workflow.preflight import PreExtractInspector
 from tests.helpers.archive_tasks import make_archive_task
 
 

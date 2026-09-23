@@ -1,7 +1,7 @@
 import gzip
 
-from sunpack.contracts.discovery import DiscoveryCandidate
-from sunpack.embedded.discovery import EmbeddedDiscovery
+from sunpack.core.contracts.discovery import DiscoveryCandidate
+from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 
 
 def _candidate(path):

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from sunpack.support import resources
+from sunpack.core.support import resources
 
 
 def test_arm64_tool_dir_candidates_prefer_arm64(monkeypatch):
