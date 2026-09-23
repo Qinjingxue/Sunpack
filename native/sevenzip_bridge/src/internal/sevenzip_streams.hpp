@@ -1,6 +1,7 @@
 #pragma once
 
 #include "sevenzip_paths.hpp"
+#include "positioned_output.hpp"
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
 #include "worker_pipeline_timing.hpp"
@@ -123,7 +124,7 @@ namespace sunpack::sevenzip
     // Opened once per file and reused; the handle carries its own file cursor and is owned by exactly one thread that reads sequentially.
     // Streams that also serve the embedded 7-Zip decoder keep a second,
     // independent handle for decoder driven Seek/Read calls.
-    class [[nodiscard]] PathHandle final
+    class [[nodiscard]] PathHandle final : public RandomAccessReader
     {
     public:
         explicit PathHandle(const std::wstring &path) noexcept
@@ -146,6 +147,19 @@ namespace sunpack::sevenzip
 
         // Reads directly at the requested offset; the caller's own position is not part of the contract.
         HRESULT read_at(
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            UInt32 *processed) noexcept override
+        {
+            return read_at_profiled(offset, data, size, processed
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                                    , nullptr
+#endif
+            );
+        }
+
+        HRESULT read_at_profiled(
             UInt64 offset,
             void *data,
             UInt32 size,
@@ -226,9 +240,9 @@ namespace sunpack::sevenzip
             const auto found = handles_.find(path);
             if (found != handles_.end())
             {
-                return found->second->read_at(offset, data, size, processed
+                return found->second->read_at_profiled(offset, data, size, processed
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-                                              , pipeline_timing
+                                                       , pipeline_timing
 #endif
                 );
             }
@@ -239,9 +253,9 @@ namespace sunpack::sevenzip
             }
             PathHandle *raw = handle.get();
             handles_.emplace(path, std::move(handle));
-            return raw->read_at(offset, data, size, processed
+            return raw->read_at_profiled(offset, data, size, processed
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-                                , pipeline_timing
+                                         , pipeline_timing
 #endif
             );
         }
@@ -574,7 +588,7 @@ namespace sunpack::sevenzip
         }
     }
 
-    class FileInStream final : public CMyUnknownImp, public IInStream
+    class FileInStream final : public CMyUnknownImp, public IInStream, public RandomAccessInStream
     {
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
         
@@ -636,7 +650,7 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
                     PipelineTiming *pipeline_timing = trace_ ? trace_->pipeline_timing : nullptr;
                     prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, size_, [reader, pipeline_timing](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
-                                                                       { return reader->read_at(offset, data, read_size, processed, pipeline_timing); });
+                                                                       { return reader->read_at_profiled(offset, data, read_size, processed, pipeline_timing); });
 #else
                     prefetch_ = std::make_unique<SequentialPrefetcher>(prefetch_config, size_, [reader](UInt64 offset, void *data, UInt32 read_size, UInt32 *processed)
                                                                        { return reader->read_at(offset, data, read_size, processed); });
@@ -666,6 +680,21 @@ namespace sunpack::sevenzip
         bool is_open() const { return handle_ != INVALID_HANDLE_VALUE; }
 
         bool prefetch_enabled() const noexcept { return prefetch_ && prefetch_->enabled(); }
+
+        std::unique_ptr<RandomAccessReader> open_random_reader() noexcept override
+        {
+            try
+            {
+                auto reader = std::make_unique<PathHandle>(path_);
+                if (!reader->valid())
+                    return {};
+                return reader;
+            }
+            catch (...)
+            {
+                return {};
+            }
+        }
 
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
