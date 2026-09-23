@@ -517,6 +517,211 @@ namespace sunpack::sevenzip
             return S_OK;
         }
 
+        HRESULT write_at(
+            const FileStatePtr &file,
+            UInt64 output_offset,
+            const void *data,
+            UInt32 size,
+            UInt32 *processed_size)
+        {
+            if (processed_size)
+            {
+                *processed_size = 0;
+            }
+            if (!file || (size != 0 && data == nullptr))
+            {
+                return E_POINTER;
+            }
+            if (size == 0)
+            {
+                return S_OK;
+            }
+            if (output_offset > (std::numeric_limits<UInt64>::max)() - size)
+            {
+                return E_INVALIDARG;
+            }
+
+            const auto job = file->job;
+            if (!job)
+            {
+                return E_FAIL;
+            }
+
+            const auto *source = static_cast<const unsigned char *>(data);
+            UInt32 consumed = 0;
+
+            while (consumed < size)
+            {
+                Buffer *buffer = nullptr;
+                UInt32 chunk = 0;
+                HRESULT setup_error = S_OK;
+
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    producer_cv_.wait(lock, [this, &job, &file]
+                                      {
+                                          if (terminal_result_locked(job) != S_OK || file->close_requested)
+                                          {
+                                              return true;
+                                          }
+                                          if (queued_jobs_ >= queue_limit_ || free_buffers_.empty())
+                                          {
+                                              return false;
+                                          }
+                                          return job->inflight_bytes < job->max_inflight_bytes &&
+                                                 file->inflight_bytes < kDefaultFileInFlightBytes;
+                                      });
+
+                    const HRESULT error = terminal_result_locked(job);
+                    if (error != S_OK || file->close_requested)
+                    {
+                        if (processed_size)
+                        {
+                            *processed_size = consumed;
+                        }
+                        return error == S_OK ? E_ABORT : error;
+                    }
+
+                    const std::size_t job_available = job->max_inflight_bytes -
+                        (std::min)(job->inflight_bytes, job->max_inflight_bytes);
+                    const std::size_t file_available = kDefaultFileInFlightBytes -
+                        (std::min)(file->inflight_bytes, kDefaultFileInFlightBytes);
+                    const std::size_t chunk_size = (std::min)({
+                        static_cast<std::size_t>(size - consumed),
+                        kBufferSize,
+                        job_available,
+                        file_available,
+                    });
+                    if (chunk_size == 0)
+                    {
+                        continue;
+                    }
+
+                    buffer = free_buffers_.back();
+                    free_buffers_.pop_back();
+                    try
+                    {
+                        if (!buffer->data)
+                        {
+                            buffer->data = std::make_unique<unsigned char[]>(kBufferSize);
+                        }
+                        buffer->file = file;
+                        buffer->size = static_cast<UInt32>(chunk_size);
+                    }
+                    catch (...)
+                    {
+                        buffer->file.reset();
+                        buffer->size = 0;
+                        free_buffers_.push_back(buffer);
+                        mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                        set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                        setup_error = E_OUTOFMEMORY;
+                    }
+
+                    if (setup_error == S_OK)
+                    {
+                        chunk = static_cast<UInt32>(chunk_size);
+                        job->inflight_bytes += chunk_size;
+                        file->inflight_bytes += chunk_size;
+                        ++job->pending_jobs;
+                        ++file->outstanding_data;
+                    }
+                }
+
+                if (setup_error != S_OK)
+                {
+                    producer_cv_.notify_all();
+                    if (processed_size)
+                    {
+                        *processed_size = consumed;
+                    }
+                    return setup_error;
+                }
+
+                std::memcpy(buffer->data.get(), source + consumed, chunk);
+
+                HRESULT enqueue_error = S_OK;
+                bool queued = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    const HRESULT error = terminal_result_locked(job);
+                    if (error != S_OK || file->close_requested)
+                    {
+                        if (job->inflight_bytes >= chunk)
+                            job->inflight_bytes -= chunk;
+                        else
+                            job->inflight_bytes = 0;
+                        if (file->inflight_bytes >= chunk)
+                            file->inflight_bytes -= chunk;
+                        else
+                            file->inflight_bytes = 0;
+                        if (job->pending_jobs != 0)
+                            --job->pending_jobs;
+                        if (file->outstanding_data != 0)
+                            --file->outstanding_data;
+                        buffer->file.reset();
+                        buffer->size = 0;
+                        free_buffers_.push_back(buffer);
+                        enqueue_error = error == S_OK ? E_ABORT : error;
+                    }
+                    else
+                    {
+                        try
+                        {
+                            work_queue_.emplace_back(
+                                WorkItem::data(buffer, output_offset + consumed));
+                            ++queued_jobs_;
+                            queued = true;
+                            file->accepted_bytes.fetch_add(chunk, std::memory_order_relaxed);
+                            account_accepted(chunk);
+                            consumed += chunk;
+                        }
+                        catch (...)
+                        {
+                            if (job->inflight_bytes >= chunk)
+                                job->inflight_bytes -= chunk;
+                            else
+                                job->inflight_bytes = 0;
+                            if (file->inflight_bytes >= chunk)
+                                file->inflight_bytes -= chunk;
+                            else
+                                file->inflight_bytes = 0;
+                            if (job->pending_jobs != 0)
+                                --job->pending_jobs;
+                            if (file->outstanding_data != 0)
+                                --file->outstanding_data;
+                            buffer->file.reset();
+                            buffer->size = 0;
+                            free_buffers_.push_back(buffer);
+                            mark_file_failure_locked(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                            set_job_error_locked(job, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                            enqueue_error = E_OUTOFMEMORY;
+                        }
+                    }
+                }
+
+                producer_cv_.notify_all();
+                if (queued)
+                {
+                    work_cv_.notify_one();
+                }
+                if (enqueue_error != S_OK)
+                {
+                    if (processed_size)
+                    {
+                        *processed_size = consumed;
+                    }
+                    return enqueue_error;
+                }
+            }
+
+            if (processed_size)
+            {
+                *processed_size = consumed;
+            }
+            return S_OK;
+        }
+
         void close_file(
             const FileStatePtr &file,
             std::vector<unsigned char> magic) noexcept
