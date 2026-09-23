@@ -782,9 +782,11 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
             const bool positionedFilter =
                 filterMethod == k_ARM64 ||
                 filterMethod == k_ARM ||
+                filterMethod == k_ARMT ||
                 filterMethod == k_PPC ||
                 filterMethod == k_SPARC ||
                 filterMethod == k_IA64 ||
+                filterMethod == k_RISCV ||
                 filterMethod == k_SWAP2 ||
                 filterMethod == k_SWAP4;
 
