@@ -6,7 +6,7 @@ from sunpack.contracts.discovery import ResolvedArchiveInput
 from sunpack.contracts.run_context import RunContext
 from sunpack.contracts.tasks import ArchiveTask
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.coordinator.scan_session import DetectionScanSession
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.embedded.options import EmbeddedOptions
 from sunpack.relations.internal.group_builder import RelationsGroupBuilder
 from sunpack.support.path_keys import path_key
@@ -23,7 +23,7 @@ class ArchiveTaskScanner:
         self.context = context
         self.provider = ArchiveTaskProvider(config, detection_options=detection_options)
         self.detector = self.provider.detector
-        self.last_scan_session: DetectionScanSession | None = None
+        self.last_scan_session: DiscoveryScanSession | None = None
 
     def scan_root(self, scan_root: str) -> list[ArchiveTask]:
         return self.scan_targets([scan_root])
@@ -32,10 +32,10 @@ class ArchiveTaskScanner:
         self,
         scan_roots: list[str],
         *,
-        scan_session: DetectionScanSession | None = None,
+        scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
     ) -> list[ArchiveTask]:
-        scan_session = scan_session or DetectionScanSession(config=self.config)
+        scan_session = scan_session or DiscoveryScanSession(config=self.config)
         self.last_scan_session = scan_session
         tasks = self.provider.scan_targets(
             scan_roots,
@@ -55,10 +55,10 @@ class ArchiveTaskScanner:
         self,
         scan_roots: list[str],
         *,
-        scan_session: DetectionScanSession | None = None,
+        scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
     ) -> list[ResolvedArchiveInput]:
-        scan_session = scan_session or DetectionScanSession(config=self.config)
+        scan_session = scan_session or DiscoveryScanSession(config=self.config)
         self.last_scan_session = scan_session
         result = self.provider.discover_targets(
             scan_roots,
