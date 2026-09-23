@@ -87,6 +87,53 @@ def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp
     }
 
 
+def test_filesystem_routes_by_structure_not_extension(tmp_path):
+    disguised_zip = tmp_path / "movie.ISO"
+    with zipfile.ZipFile(disguised_zip, "w") as archive:
+        archive.writestr("inside.txt", "hello")
+
+    disguised_gzip = tmp_path / "payload.random"
+    disguised_gzip.write_bytes(gzip.compress(b"payload"))
+
+    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True).scan()
+    routes = _routing_by_name(snapshot)
+
+    assert routes[disguised_zip.name] == ("relations", "zip")
+    assert routes[disguised_gzip.name] == ("detection", "gzip")
+
+
+def test_prefixed_and_suffixed_archive_carrier_stays_residual_for_embedded_scan(tmp_path):
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w") as archive:
+        archive.writestr("inside.txt", "hello")
+
+    carrier = tmp_path / "carrier.data"
+    carrier.write_bytes(b"invalid-prefix" + zip_buffer.getvalue() + b"invalid-suffix")
+
+    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True).scan()
+    routes = _routing_by_name(snapshot)
+
+    assert routes[carrier.name][0] == "residual"
+
+
+def test_directory_without_relation_anchor_skips_relations_entirely(tmp_path, monkeypatch):
+    (tmp_path / "payload.gz").write_bytes(gzip.compress(b"payload"))
+    (tmp_path / "plain.bin").write_bytes(b"ordinary")
+
+    session = DetectionScanSession(config={})
+    monkeypatch.setattr(
+        session.relations,
+        "build_candidate_groups",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Relations must not run without a routed anchor")
+        ),
+    )
+
+    bags = session.fact_bags_for_directory(str(tmp_path))
+
+    assert {bag.get("filesystem.route") for bag in bags} == {"detection", "residual"}
+
+
 def _split_7z_bytes() -> bytes:
     next_header = b"\x01\x00"
     start_header = struct.pack("<QQI", 0, len(next_header), crc32(next_header) & 0xFFFFFFFF)
