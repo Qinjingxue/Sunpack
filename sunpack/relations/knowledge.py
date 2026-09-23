@@ -10,13 +10,12 @@ def write_relation_task(task: ArchiveTask) -> None:
     knowledge = ensure_knowledge(task)
     split_info = task.split_info
     relation_payload: dict[str, Any] = {
-        "kind": str(task.fact_bag.get("candidate.kind") or ("split_archive" if split_info.is_split else "file")),
+        "kind": str(task.relation_kind or ("split_archive" if split_info.is_split else "file")),
         "is_split": bool(split_info.is_split),
         "is_sfx_stub": bool(split_info.is_sfx_stub),
         "archive_input": task.archive_input().to_dict(),
         "source": str(split_info.source or ""),
         "carrier_path": str(task.carrier_path or ""),
-        "companion_paths": list(task.fact_bag.get("candidate.companion_paths") or []),
         "cleanup_paths": list(task.cleanup_parts or []),
     }
     write_payload(knowledge, "relations", relation_payload, source_layer="relations", source_module="task")
@@ -46,5 +45,4 @@ def _source_derivation_payload(task: ArchiveTask, relation_payload: dict[str, An
         "parts": list(task.all_parts or []),
         "cleanup_parts": list(task.cleanup_parts or []),
         "carrier_path": str(task.carrier_path or ""),
-        "companion_paths": list(task.fact_bag.get("candidate.companion_paths") or []),
     }
