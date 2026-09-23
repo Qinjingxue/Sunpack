@@ -571,23 +571,38 @@ static SRes Lzma2DecMt_MtCallback_Code(void *pp, unsigned coderIndex,
 
       dicPos = t->dec.decoder.dicPos;
       remOut = (SizeT)(t->outPreSize - t->outCodeSize);
-      if (remOut == 0)
-        break;
 
-      step = t->dec.decoder.dicBufSize - dicPos;
-      if (me->props.outStep_ST != 0 && step > me->props.outStep_ST)
-        step = me->props.outStep_ST;
-      if (step > remOut)
-        step = remOut;
-      if (step == 0)
-        return SZ_ERROR_FAIL;
+      if (remOut != 0)
+      {
+        step = t->dec.decoder.dicBufSize - dicPos;
+        if (me->props.outStep_ST != 0 && step > me->props.outStep_ST)
+          step = me->props.outStep_ST;
+        if (step > remOut)
+          step = remOut;
+        if (step == 0)
+          return SZ_ERROR_FAIL;
 
-      finishMode =
-          (blockWasFinished && step == remOut) ?
-              LZMA_FINISH_END : LZMA_FINISH_ANY;
+        finishMode =
+            (blockWasFinished && step == remOut) ?
+                LZMA_FINISH_END : LZMA_FINISH_ANY;
+        dicLimit = dicPos + step;
+      }
+      else
+      {
+        /*
+          A reset-run can have trailing range-coder/control bytes after the
+          final output byte. The legacy full-buffer decoder consumes those
+          bytes with FINISH_END. Keep doing that even though no more output
+          space is required, otherwise MtDec observes an input-size mismatch.
+        */
+        if (!blockWasFinished)
+          break;
+        step = 0;
+        finishMode = LZMA_FINISH_END;
+        dicLimit = dicPos;
+      }
 
       srcProcessed = (SizeT)(srcSize - srcOffset);
-      dicLimit = dicPos + step;
 
       res = Lzma2Dec_DecodeToDic(
           &t->dec,
@@ -637,10 +652,20 @@ static SRes Lzma2DecMt_MtCallback_Code(void *pp, unsigned coderIndex,
     if (t->inCodeSize > t->inPreSize || t->outCodeSize > t->outPreSize)
       return SZ_ERROR_FAIL;
 
-    if (blockWasFinished &&
-        t->inCodeSize == t->inPreSize &&
-        t->outCodeSize == t->outPreSize)
+    if (blockWasFinished)
+    {
+      if (t->inCodeSize == t->inPreSize &&
+          t->outCodeSize == t->outPreSize)
+        return SZ_OK;
+
+      /*
+        More compressed bytes can still be supplied by the next MtDec input
+        link even after all output bytes have been emitted.
+      */
+      if (srcOffset == srcSize)
+        *stop = False;
       return SZ_OK;
+    }
 
     if (t->outCodeSize == t->outPreSize)
       return SZ_OK;
