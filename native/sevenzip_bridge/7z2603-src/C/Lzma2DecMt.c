@@ -1141,6 +1141,21 @@ SRes Lzma2DecMt_Decode(CLzma2DecMtHandle p,
         return res;
       }
 
+      /*
+        Positioned MT output is committed as soon as each independent reset-run
+        produces final bytes. We must never continue the same decoder with the
+        legacy sequential ST replay path after any such commit, because that
+        path has no logical output-offset contract. Fail the optimized path
+        instead of risking a shifted overwrite. Normal sequential decoding is
+        unchanged when positioned output isn't active.
+      */
+      if (p->positionedOutStream)
+      {
+        if (res != SZ_OK)
+          return res;
+        return SZ_ERROR_FAIL;
+      }
+
       tMode = True;
       p->readRes = p->mtc.readRes;
       p->readWasFinished = p->mtc.readWasFinished;
