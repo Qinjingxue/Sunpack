@@ -139,7 +139,6 @@ class ArchiveInputPlanningStage:
             return None, [task]
         if self.analyzer is None:
             return None, [task]
-        task.ensure_archive_state()
         try:
             report = self._get_or_create_report(task)
         except Exception as exc:
