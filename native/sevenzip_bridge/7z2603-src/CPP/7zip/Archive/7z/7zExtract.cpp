@@ -134,6 +134,7 @@ private:
   HRESULT ProcessEmptyFiles();
   HRESULT InitPositioned(unsigned startIndex, unsigned numFiles);
   HRESULT FinishPositioned(Int32 callbackOperationResult);
+  void ResetPositionedCrcForReplay();
 
 public:
   const CDbEx *_db;
@@ -326,6 +327,20 @@ HRESULT CFolderOutStream::WriteAt(
   if (processedSize)
     *processedSize = total;
   return S_OK;
+}
+
+
+void CFolderOutStream::ResetPositionedCrcForReplay()
+{
+  if (!_positionedMode)
+    return;
+
+  for (const auto &holder : _positionedFiles)
+  {
+    CPositionedFile &state = *holder;
+    std::lock_guard<std::mutex> lock(state.CrcMutex);
+    state.CrcSegments.clear();
+  }
 }
 
 
@@ -564,18 +579,35 @@ class CFolderPositionedOutStream final :
 
   CMyComPtr<ISequentialOutStream> _sequential;
   CFolderOutStream *_folder;
+  UInt64 _sequentialPos;
+  bool _replayStarted;
 
 public:
   CFolderPositionedOutStream(
       ISequentialOutStream *sequential,
       CFolderOutStream *folder):
       _sequential(sequential),
-      _folder(folder)
+      _folder(folder),
+      _sequentialPos(0),
+      _replayStarted(false)
   {}
 
   Z7_COM7F_IMF(Write(const void *data, UInt32 size, UInt32 *processedSize))
   {
-    return _sequential->Write(data, size, processedSize);
+    if (!_replayStarted)
+    {
+      _folder->ResetPositionedCrcForReplay();
+      _replayStarted = true;
+      _sequentialPos = 0;
+    }
+
+    UInt32 processed = 0;
+    const HRESULT result =
+        _folder->WriteAt(_sequentialPos, data, size, &processed);
+    _sequentialPos += processed;
+    if (processedSize)
+      *processedSize = processed;
+    return result;
   }
 
   HRESULT write_at(
