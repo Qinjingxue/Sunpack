@@ -5,8 +5,7 @@ from binascii import crc32
 import pytest
 
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from tests.helpers.detection_probe import detect_archive_hits
-from tests.helpers.detection_probe import detection_pipeline_config
+from tests.helpers.detection_probe import detect_archive_hits, detection_pipeline_config
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar
 
@@ -23,11 +22,11 @@ def test_archive_embedded_in_middle_is_found_by_selected_embedded_deep_scan(tmp_
     detected = detect_archive_hits(carrier)
 
     assert len(detected) == 1
-    bag = detected[0].fact_bag
-    embedded = bag.get("embedded_archive.analysis")
-    assert embedded["complete"] is True
-    assert embedded["candidates"][0]["format"] == archive_format
-    assert embedded["candidates"][0]["offset"] == len(prefix)
+    resolved = detected[0]
+    assert resolved.source == "embedded"
+    assert resolved.format == archive_format
+    assert resolved.segments[0].format == archive_format
+    assert resolved.segments[0].start_offset == len(prefix)
 
 
 @pytest.mark.skipif(get_optional_rar() is None, reason="RAR generator is not configured")
@@ -43,12 +42,14 @@ def test_header_encrypted_rar_is_confirmed_from_crc_valid_encryption_header(tmp_
     detected = detect_archive_hits(case.entry_path)
 
     assert len(detected) == 1
-    bag = detected[0].fact_bag
-    assert bag.get("file.detected_ext") == ".rar"
-    assert bag.get("rar.structure", {}).get("magic_matched") is True
+    resolved = detected[0]
+    assert resolved.source == "relations"
+    assert resolved.format == "rar"
+    assert resolved.evidence.get("relation_confirmed") is True
+    assert resolved.evidence.get("needs_password") is True
 
 
-def test_header_encrypted_rar4_primary_uses_normal_precheck(tmp_path):
+def test_header_encrypted_rar4_primary_uses_relations_identity(tmp_path):
     body = bytes([0x73]) + struct.pack("<HH", 0x0080, 7)
     main_header = struct.pack("<H", crc32(body) & 0xFFFF) + body
     path = tmp_path / "header_encrypted_rar4.rar"
@@ -58,16 +59,14 @@ def test_header_encrypted_rar4_primary_uses_normal_precheck(tmp_path):
         + b"\xd6\xd3\x77\xb9\xf7\x5d\xe8"
     )
 
-    detections = ArchiveTaskProvider(detection_pipeline_config()).detect_targets([str(path)])
+    result = ArchiveTaskProvider(detection_pipeline_config()).discover_targets([str(path)])
 
-    assert len(detections) == 1
-    detection = detections[0]
-    assert detection.decision.should_extract is True
-    assert detection.decision.deciding_rule == "rar_structure_accept"
-    structure = detection.fact_bag.get("rar.structure") or {}
-    assert structure["header_encrypted"] is True
-    assert structure["password_required"] is True
-    assert structure["strong_accept"] is True
+    assert len(result.resolved_inputs) == 1
+    resolved = result.resolved_inputs[0]
+    assert resolved.source == "relations"
+    assert resolved.format == "rar"
+    assert resolved.evidence.get("needs_password") is True
+    assert resolved.evidence.get("relation_confirmed") is True
 
 
 def test_signature_bytes_without_valid_structure_are_not_accepted(tmp_path):
