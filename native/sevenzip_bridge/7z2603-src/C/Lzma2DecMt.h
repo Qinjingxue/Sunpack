@@ -8,17 +8,6 @@
 
 EXTERN_C_BEGIN
 
-/*
-  Optional random-access output callback used by SunPack's MT fast path.
-  The callback receives final logical offsets for independently decodable
-  LZMA2 reset-runs. A NULL callback preserves the upstream ordered stream path.
-*/
-typedef SRes (*Lzma2DecMt_WriteAt_Func)(
-    void *opaque,
-    UInt64 offset,
-    const Byte *data,
-    size_t size);
-
 typedef struct
 {
   size_t inBufSize_ST;
@@ -29,10 +18,6 @@ typedef struct
   size_t inBufSize_MT;
   size_t outBlockMax;
   size_t inBlockMax;
-
-  Lzma2DecMt_WriteAt_Func writeAt;
-  void *writeAtOpaque;
-  size_t writeAtStep;
   #endif
 } CLzma2DecMtProps;
 
