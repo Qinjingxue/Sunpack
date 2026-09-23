@@ -647,7 +647,11 @@ static HRESULT TryDecodePositionedLzma2Runs(
 
     #ifndef Z7_ST
     if (cpuContext)
+    {
       sunpack_cpu_exchange_current_job_context(previousContext);
+      if (workerIndex != 0)
+        sunpack_cpu_release_extra_for_context(cpuContext, 1);
+    }
     #endif
   };
 
@@ -669,13 +673,13 @@ static HRESULT TryDecodePositionedLzma2Runs(
     for (auto &thread : threads)
       if (thread.joinable())
         thread.join();
+    #ifndef Z7_ST
+    if (cpuContext && extraCredits > threads.size())
+      sunpack_cpu_release_extra_for_context(
+          cpuContext, extraCredits - (unsigned)threads.size());
+    #endif
     publishError(E_OUTOFMEMORY);
   }
-
-  #ifndef Z7_ST
-  if (cpuContext && extraCredits)
-    sunpack_cpu_release_extra_for_context(cpuContext, extraCredits);
-  #endif
 
   {
     std::lock_guard<std::mutex> lock(resultMutex);
