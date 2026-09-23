@@ -264,6 +264,113 @@ namespace sunpack::sevenzip
         std::map<std::wstring, std::unique_ptr<PathHandle>> handles_;
     };
 
+    struct RandomAccessSpan
+    {
+        std::wstring path;
+        UInt64 source_offset = 0;
+        UInt64 length = 0;
+        UInt64 virtual_offset = 0;
+    };
+
+    class MappedRandomAccessReader final : public RandomAccessReader
+    {
+    public:
+        MappedRandomAccessReader(std::vector<RandomAccessSpan> spans, UInt64 total_size)
+            : spans_(std::move(spans)), total_size_(total_size) {}
+
+        HRESULT read_at(
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            UInt32 *processed) noexcept override
+        {
+            if (processed)
+            {
+                *processed = 0;
+            }
+            if (size != 0 && !data)
+            {
+                return E_POINTER;
+            }
+            if (size == 0 || offset >= total_size_)
+            {
+                return S_OK;
+            }
+
+            auto *out = static_cast<unsigned char *>(data);
+            UInt32 total_read = 0;
+
+            while (total_read < size && offset < total_size_)
+            {
+                const std::size_t index = find_span_index(offset);
+                if (index >= spans_.size())
+                {
+                    break;
+                }
+
+                const auto &span = spans_[index];
+                const UInt64 offset_in_span = offset - span.virtual_offset;
+                const UInt64 remaining = span.length - offset_in_span;
+                const UInt32 want = static_cast<UInt32>(
+                    std::min<UInt64>(size - total_read, remaining));
+
+                UInt32 read = 0;
+                const HRESULT result = handles_.read_at(
+                    span.path,
+                    span.source_offset + offset_in_span,
+                    out + total_read,
+                    want,
+                    &read);
+                if (result != S_OK)
+                {
+                    return result;
+                }
+
+                total_read += read;
+                offset += read;
+                if (read != want)
+                {
+                    break;
+                }
+            }
+
+            if (processed)
+            {
+                *processed = total_read;
+            }
+            return S_OK;
+        }
+
+    private:
+        std::size_t find_span_index(UInt64 position) const noexcept
+        {
+            const auto upper = std::upper_bound(
+                spans_.begin(),
+                spans_.end(),
+                position,
+                [](UInt64 value, const RandomAccessSpan &span)
+                {
+                    return value < span.virtual_offset;
+                });
+
+            if (upper == spans_.begin())
+            {
+                return spans_.size();
+            }
+
+            const std::size_t index =
+                static_cast<std::size_t>(std::distance(spans_.begin(), upper) - 1);
+            const auto &span = spans_[index];
+            return position - span.virtual_offset < span.length
+                ? index
+                : spans_.size();
+        }
+
+        std::vector<RandomAccessSpan> spans_;
+        UInt64 total_size_ = 0;
+        PathHandleCache handles_;
+    };
+
     class SequentialPrefetcher final
     {
     public:
@@ -908,7 +1015,7 @@ namespace sunpack::sevenzip
         std::unique_ptr<SequentialPrefetcher> prefetch_;
     };
 
-    class MultiFileInStream final : public CMyUnknownImp, public IInStream
+    class MultiFileInStream final : public CMyUnknownImp, public IInStream, public RandomAccessInStream
     {
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
         
@@ -975,6 +1082,43 @@ namespace sunpack::sevenzip
         ~MultiFileInStream() { close_cached_handle(); }
 
         bool is_open() const { return valid_; }
+
+        std::unique_ptr<RandomAccessReader> open_random_reader() noexcept override
+        {
+            if (!valid_)
+            {
+                return {};
+            }
+
+            try
+            {
+                std::vector<RandomAccessSpan> spans;
+                spans.reserve(paths_.size());
+                for (std::size_t i = 0; i < paths_.size(); ++i)
+                {
+                    if (sizes_[i] == 0)
+                    {
+                        continue;
+                    }
+                    spans.push_back(RandomAccessSpan{
+                        paths_[i],
+                        0,
+                        sizes_[i],
+                        offsets_[i],
+                    });
+                }
+                if (spans.empty())
+                {
+                    return {};
+                }
+                return std::make_unique<MappedRandomAccessReader>(
+                    std::move(spans), total_size_);
+            }
+            catch (...)
+            {
+                return {};
+            }
+        }
 
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
@@ -1403,7 +1547,7 @@ namespace sunpack::sevenzip
         UInt64 virtual_offset = 0;
     };
 
-    class MultiRangeInStream final : public CMyUnknownImp, public IInStream
+    class MultiRangeInStream final : public CMyUnknownImp, public IInStream, public RandomAccessInStream
     {
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
         
@@ -1500,6 +1644,39 @@ namespace sunpack::sevenzip
         }
 
         bool is_open() const { return valid_; }
+
+        std::unique_ptr<RandomAccessReader> open_random_reader() noexcept override
+        {
+            if (!valid_)
+            {
+                return {};
+            }
+
+            try
+            {
+                std::vector<RandomAccessSpan> spans;
+                spans.reserve(ranges_.size());
+                for (const auto &range : ranges_)
+                {
+                    spans.push_back(RandomAccessSpan{
+                        range.path,
+                        range.start,
+                        range.length,
+                        range.virtual_offset,
+                    });
+                }
+                if (spans.empty())
+                {
+                    return {};
+                }
+                return std::make_unique<MappedRandomAccessReader>(
+                    std::move(spans), total_size_);
+            }
+            catch (...)
+            {
+                return {};
+            }
+        }
 
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
