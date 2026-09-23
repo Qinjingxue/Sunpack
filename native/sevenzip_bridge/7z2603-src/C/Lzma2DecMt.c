@@ -60,6 +60,8 @@ typedef struct
   
   Byte *outBuf;
   size_t outBufSize;
+  BoolInt ownsDic;
+  UInt64 outStart;
 
   EMtDecParseState state;
   ELzma2ParseStatus parseStatus;
@@ -92,6 +94,7 @@ struct CLzma2DecMt
   
   ISeqInStreamPtr inStream;
   ISeqOutStreamPtr outStream;
+  const ISunpackPositionedOutStream *positionedOutStream;
   ICompressProgressPtr progress;
 
   BoolInt finishMode;
@@ -138,6 +141,7 @@ CLzma2DecMtHandle Lzma2DecMt_Create(ISzAllocPtr alloc, ISzAllocPtr allocMid)
   p->inBuf = NULL;
   p->inBufSize = 0;
   p->dec_created = False;
+  p->positionedOutStream = NULL;
 
   // Lzma2DecMtProps_Init(&p->props);
 
@@ -151,6 +155,8 @@ CLzma2DecMtHandle Lzma2DecMt_Create(ISzAllocPtr alloc, ISzAllocPtr allocMid)
       t->dec_created = False;
       t->outBuf = NULL;
       t->outBufSize = 0;
+      t->ownsDic = False;
+      t->outStart = 0;
     }
   }
   #endif
@@ -217,8 +223,11 @@ void Lzma2DecMt_Destroy(CLzma2DecMtHandle p)
       CLzma2DecMtThread *t = &p->coders[i];
       if (t->dec_created)
       {
-        // we don't need to free dict here
-        Lzma2Dec_FreeProbs(&t->dec, &t->alloc.vt); // p->alloc !!!
+        if (t->ownsDic)
+          Lzma2Dec_Free(&t->dec, &t->alloc.vt);
+        else
+          Lzma2Dec_FreeProbs(&t->dec, &t->alloc.vt);
+        t->ownsDic = False;
         t->dec_created = False;
       }
     }
@@ -264,6 +273,7 @@ static void Lzma2DecMt_MtCallback_Parse(void *obj, unsigned coderIndex, CMtDecCa
     
     t->inPreSize = 0;
     t->outPreSize = 0;
+    t->outStart = me->outProcessed_Parse;
     // t->blockWasFinished = False;
     // t->finishedWithMark = False;
     t->parseStatus = (ELzma2ParseStatus)LZMA_STATUS_NOT_SPECIFIED;
@@ -417,7 +427,6 @@ static SRes Lzma2DecMt_MtCallback_PreCode(void *pp, unsigned coderIndex)
 {
   CLzma2DecMt *me = (CLzma2DecMt *)pp;
   CLzma2DecMtThread *t = &me->coders[coderIndex];
-  Byte *dest = t->outBuf;
 
   if (t->inPreSize == 0)
   {
@@ -425,31 +434,60 @@ static SRes Lzma2DecMt_MtCallback_PreCode(void *pp, unsigned coderIndex)
     return t->codeRes;
   }
 
-  if (!dest || t->outBufSize < t->outPreSize)
+  if (me->positionedOutStream)
   {
-    if (dest)
+    if (t->outBuf)
     {
-      ISzAlloc_Free(me->allocMid, dest);
+      ISzAlloc_Free(me->allocMid, t->outBuf);
       t->outBuf = NULL;
       t->outBufSize = 0;
     }
 
-    dest = (Byte *)ISzAlloc_Alloc(me->allocMid, t->outPreSize
-        // + (1 << 28)
-        );
-    // Sleep(200);
-    if (!dest)
-      return SZ_ERROR_MEM;
-    t->outBuf = dest;
-    t->outBufSize = t->outPreSize;
+    if (!t->ownsDic)
+    {
+      Lzma2Dec_FreeProbs(&t->dec, &t->alloc.vt);
+      t->dec.decoder.dic = NULL;
+      t->dec.decoder.dicBufSize = 0;
+      t->ownsDic = True;
+    }
+
+    t->needInit = True;
+    return Lzma2Dec_Allocate(&t->dec, me->prop, &t->alloc.vt);
   }
+  else
+  {
+    Byte *dest;
 
-  t->dec.decoder.dic = dest;
-  t->dec.decoder.dicBufSize = (SizeT)t->outPreSize;
+    if (t->ownsDic)
+    {
+      Lzma2Dec_Free(&t->dec, &t->alloc.vt);
+      Lzma2Dec_CONSTRUCT(&t->dec)
+      t->ownsDic = False;
+    }
 
-  t->needInit = True;
+    dest = t->outBuf;
+    if (!dest || t->outBufSize < t->outPreSize)
+    {
+      if (dest)
+      {
+        ISzAlloc_Free(me->allocMid, dest);
+        t->outBuf = NULL;
+        t->outBufSize = 0;
+      }
 
-  return Lzma2Dec_AllocateProbs(&t->dec, me->prop, &t->alloc.vt); // alloc.vt
+      dest = (Byte *)ISzAlloc_Alloc(me->allocMid, t->outPreSize);
+      if (!dest)
+        return SZ_ERROR_MEM;
+      t->outBuf = dest;
+      t->outBufSize = t->outPreSize;
+    }
+
+    t->dec.decoder.dic = dest;
+    t->dec.decoder.dicBufSize = (SizeT)t->outPreSize;
+
+    t->needInit = True;
+    return Lzma2Dec_AllocateProbs(&t->dec, me->prop, &t->alloc.vt);
+  }
 }
 
 
@@ -473,6 +511,109 @@ static SRes Lzma2DecMt_MtCallback_Code(void *pp, unsigned coderIndex,
   {
     Lzma2Dec_Init(&t->dec);
     t->needInit = False;
+  }
+
+  if (me->positionedOutStream)
+  {
+    BoolInt blockWasFinished =
+        ((int)t->parseStatus == LZMA_STATUS_FINISHED_WITH_MARK
+        || t->parseStatus == LZMA2_PARSE_STATUS_NEW_BLOCK);
+    size_t srcOffset = 0;
+
+    while (srcOffset < srcSize || t->outCodeSize < t->outPreSize)
+    {
+      SizeT dicPos;
+      SizeT dicLimit;
+      SizeT srcProcessed;
+      SizeT produced;
+      SizeT step;
+      SizeT remOut;
+      ELzmaFinishMode finishMode;
+      ELzmaStatus status;
+      SRes res;
+
+      if (t->dec.decoder.dicPos == t->dec.decoder.dicBufSize)
+        t->dec.decoder.dicPos = 0;
+
+      dicPos = t->dec.decoder.dicPos;
+      remOut = (SizeT)(t->outPreSize - t->outCodeSize);
+      if (remOut == 0)
+        break;
+
+      step = t->dec.decoder.dicBufSize - dicPos;
+      if (step > me->props.outStep_ST)
+        step = me->props.outStep_ST;
+      if (step > remOut)
+        step = remOut;
+      if (step == 0)
+        return SZ_ERROR_FAIL;
+
+      finishMode =
+          (blockWasFinished && step == remOut) ?
+              LZMA_FINISH_END : LZMA_FINISH_ANY;
+
+      srcProcessed = (SizeT)(srcSize - srcOffset);
+      dicLimit = dicPos + step;
+
+      res = Lzma2Dec_DecodeToDic(
+          &t->dec,
+          dicLimit,
+          src + srcOffset,
+          &srcProcessed,
+          finishMode,
+          &status);
+
+      produced = t->dec.decoder.dicPos - dicPos;
+      srcOffset += srcProcessed;
+      t->inCodeSize += srcProcessed;
+
+      if (produced != 0)
+      {
+        size_t written = me->positionedOutStream->WriteAt(
+            me->positionedOutStream->context,
+            t->outStart + t->outCodeSize,
+            t->dec.decoder.dic + dicPos,
+            produced);
+        if (written != produced)
+        {
+          t->codeRes = SZ_ERROR_WRITE;
+          return t->codeRes;
+        }
+        t->outCodeSize += produced;
+      }
+
+      if (res != SZ_OK)
+      {
+        t->codeRes = res;
+        return res;
+      }
+
+      if (srcProcessed == 0 && produced == 0)
+        break;
+
+      if (srcOffset == srcSize && t->outCodeSize < t->outPreSize)
+        break;
+    }
+
+    *inCodePos = t->inCodeSize;
+    *outCodePos = t->outCodeSize;
+    *stop = True;
+
+    if (t->inCodeSize > t->inPreSize || t->outCodeSize > t->outPreSize)
+      return SZ_ERROR_FAIL;
+
+    if (blockWasFinished &&
+        t->inCodeSize == t->inPreSize &&
+        t->outCodeSize == t->outPreSize)
+      return SZ_OK;
+
+    if (t->outCodeSize == t->outPreSize)
+      return SZ_OK;
+
+    if (srcOffset == srcSize)
+      *stop = False;
+
+    return SZ_OK;
   }
 
   {
@@ -566,6 +707,13 @@ static SRes Lzma2DecMt_MtCallback_Write(void *pp, unsigned coderIndex,
     return SZ_ERROR_FAIL;
 
   *canRecode = False;
+
+  if (me->positionedOutStream)
+  {
+    me->outProcessed += t->outCodeSize;
+    *needContinue = needContinue2;
+    return SZ_OK;
+  }
     
   if (me->outStream)
   {
@@ -797,6 +945,29 @@ static SRes Lzma2Dec_Decode_ST(CLzma2DecMt *p
   }
 }
 
+
+
+SRes Lzma2DecMt_DecodePositioned(CLzma2DecMtHandle p,
+    Byte prop,
+    const CLzma2DecMtProps *props,
+    ISeqOutStreamPtr outStream,
+    const ISunpackPositionedOutStream *positionedOutStream,
+    const UInt64 *outDataSize,
+    int finishMode,
+    ISeqInStreamPtr inStream,
+    UInt64 *inProcessed,
+    int *isMT,
+    ICompressProgressPtr progress)
+{
+  SRes res;
+  p->positionedOutStream = positionedOutStream;
+  res = Lzma2DecMt_Decode(
+      p, prop, props,
+      outStream, outDataSize, finishMode,
+      inStream, inProcessed, isMT, progress);
+  p->positionedOutStream = NULL;
+  return res;
+}
 
 
 SRes Lzma2DecMt_Decode(CLzma2DecMtHandle p,
