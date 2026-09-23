@@ -1,11 +1,14 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_paths_cheap, probe_volume_anchor_paths_deep, VolumeAnchor,
+    probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap,
+    probe_volume_anchor_paths_deep, VolumeAnchor,
 };
 use crate::analysis_native::{
     probe_rar_path, probe_rar_terminal_with_password, probe_rar_volume_paths,
     probe_zip_volume_paths,
 };
 use crate::scan::directory::NativeDirectorySnapshot;
+use crate::scan::executable_carrier::executable_runtime_bundle_profile;
+use crate::scan::pe_overlay::inspect_pe_overlay_structure;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use regex::{Regex, RegexBuilder};
@@ -237,6 +240,84 @@ fn build_candidate_groups_from_physical(
         let Some(mut directory_rows) = by_directory.remove(&directory) else {
             continue;
         };
+        if path_passwords.is_some() {
+            let encrypted_rar_paths: Vec<String> = directory_rows
+                .iter()
+                .filter(|row| {
+                    row.anchor.as_ref().is_some_and(|anchor| {
+                        anchor.format == "rar"
+                            && anchor.needs_password
+                            && anchor.structure_offset.unwrap_or(0) == 0
+                    })
+                })
+                .map(|row| row.path.clone())
+                .collect();
+            if !encrypted_rar_paths.is_empty() {
+                let refreshed = py.detach(|| {
+                    probe_volume_anchor_paths_cheap(&encrypted_rar_paths, path_passwords)
+                });
+                let refreshed: HashMap<String, VolumeAnchor> = refreshed
+                    .into_iter()
+                    .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
+                    .collect();
+                for row in &mut directory_rows {
+                    if let Some(anchor) = refreshed.get(&row.path.to_ascii_lowercase()) {
+                        row.anchor = Some(anchor.clone());
+                    }
+                }
+            }
+        }
+
+        let sfx_indexes: Vec<usize> = directory_rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let eligible = filtered_keys.contains(&row.path.to_ascii_lowercase());
+                let sfx_seed = row.anchor.as_ref().is_some_and(|anchor| {
+                    anchor.sfx
+                        && !anchor.pe_structure
+                        && anchor.evidence.iter().any(|item| *item == "sfx:pe_header")
+                });
+                (eligible && sfx_seed).then_some(index)
+            })
+            .collect();
+        for index in sfx_indexes {
+            if let Some(anchor) = promote_sfx_archive_anchor(
+                py,
+                &directory_rows[index],
+                path_passwords,
+            )? {
+                directory_rows[index].anchor = Some(anchor);
+            }
+        }
+
+        let zip_candidates: Vec<String> = directory_rows
+            .iter()
+            .filter(|row| filtered_keys.contains(&row.path.to_ascii_lowercase()))
+            .filter(|row| should_upgrade_zip_anchor(row))
+            .map(|row| row.path.clone())
+            .collect();
+        if !zip_candidates.is_empty() {
+            let upgraded = py.detach(|| {
+                probe_volume_anchor_paths_deep(
+                    &zip_candidates,
+                    512,
+                    22 + 65_535,
+                    path_passwords,
+                )
+            });
+            let upgraded: HashMap<String, VolumeAnchor> = upgraded
+                .into_iter()
+                .filter(|anchor| anchor.format == "zip" && anchor.confidence == "strong")
+                .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
+                .collect();
+            for row in &mut directory_rows {
+                if let Some(anchor) = upgraded.get(&row.path.to_ascii_lowercase()) {
+                    row.anchor = Some(anchor.clone());
+                }
+            }
+        }
+
         let mut name_index = DirectoryNameIndex::build(&directory_rows);
         let sfx_split_heads: Vec<String> = directory_rows
             .iter()
@@ -276,12 +357,12 @@ fn build_candidate_groups_from_physical(
         let mut proposal_keys = HashSet::new();
 
         for seed in directory_rows.iter().filter(|row| {
-            seed_strength_for_row(row, &name_index).is_some()
+            seed_strength_for_row(row, &directory_rows, &name_index).is_some()
         }) {
             let Some(anchor) = seed.anchor.as_ref() else {
                 continue;
             };
-            let Some(strength) = seed_strength_for_row(seed, &name_index) else {
+            let Some(strength) = seed_strength_for_row(seed, &directory_rows, &name_index) else {
                 continue;
             };
             if strength == "strong" {
@@ -443,13 +524,22 @@ fn build_candidate_groups_from_physical(
                 && !password_paths.contains(&row.path.to_ascii_lowercase())
                 && !strong_suppressed_paths.contains(&row.path.to_ascii_lowercase())
         }) {
-            output.push(ordinary_file_group_to_dict(py, row)?);
+            let confirmed = row
+                .anchor
+                .as_ref()
+                .is_some_and(anchor_is_relation_archive);
+            output.push(ordinary_file_group_to_dict(py, row, confirmed)?);
         }
     }
     Ok(output)
 }
 
 fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
+    // A structure-proven standalone archive is already a complete logical
+    // input.  SFX is a carrier/layout property, not split evidence by itself.
+    if anchor.standalone {
+        return None;
+    }
     if anchor.format.is_empty() && anchor.sfx {
         return Some("weak");
     }
@@ -483,6 +573,7 @@ fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
 
 fn seed_strength_for_row(
     row: &RelationInput,
+    rows: &[RelationInput],
     name_index: &DirectoryNameIndex,
 ) -> Option<&'static str> {
     let anchor = row.anchor.as_ref()?;
@@ -502,10 +593,105 @@ fn seed_strength_for_row(
                     .and_then(|value| value.to_str())
                     .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
         })
+        && strong_seed_related_paths(row, rows, name_index, anchor).len() >= 2
     {
         return Some("strong");
     }
     Some(strength)
+}
+
+
+fn should_upgrade_zip_anchor(row: &RelationInput) -> bool {
+    let extension_is_zip = Path::new(&row.name)
+        .extension()
+        .and_then(|value| value.to_str())
+        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "zip" | "zipx"));
+    row.anchor.as_ref().is_some_and(|anchor| {
+        anchor.format == "zip"
+            && anchor.confidence == "weak"
+            && anchor.structure_offset.unwrap_or(0) == 0
+    }) || extension_is_zip
+}
+
+fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
+    if !matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
+        || anchor.confidence != "strong"
+        || !(anchor.standalone || anchor.needs_password)
+    {
+        return false;
+    }
+    let offset = anchor.structure_offset.unwrap_or(0);
+    offset == 0 || (anchor.sfx && anchor.pe_structure)
+}
+
+fn promote_sfx_archive_anchor(
+    py: Python<'_>,
+    row: &RelationInput,
+    path_passwords: Option<&[(String, String)]>,
+) -> PyResult<Option<VolumeAnchor>> {
+    let overlay = inspect_pe_overlay_structure(
+        py,
+        &row.path,
+        row.size.and_then(|size| i64::try_from(size).ok()),
+        None,
+    )?;
+    let overlay = overlay.bind(py);
+    let is_pe = overlay
+        .get_item("is_pe")?
+        .and_then(|value| value.extract::<bool>().ok())
+        .unwrap_or(false);
+    let archive_like = overlay
+        .get_item("archive_like")?
+        .and_then(|value| value.extract::<bool>().ok())
+        .unwrap_or(false);
+    if !is_pe || !archive_like {
+        return Ok(None);
+    }
+
+    let format = overlay
+        .get_item("format")?
+        .and_then(|value| value.extract::<String>().ok())
+        .unwrap_or_default();
+    if !matches!(format.as_str(), "rar" | "7z" | "zip") {
+        return Ok(None);
+    }
+    let image_end = overlay
+        .get_item("overlay_offset")?
+        .and_then(|value| value.extract::<u64>().ok())
+        .unwrap_or(0);
+    if !executable_runtime_bundle_profile(py, &row.path, 8 * 1024 * 1024, image_end).is_empty() {
+        return Ok(None);
+    }
+    let archive_offset = overlay
+        .get_item("archive_offset")?
+        .and_then(|value| value.extract::<u64>().ok())
+        .unwrap_or(0);
+    if archive_offset == 0 {
+        return Ok(None);
+    }
+
+    let path = row.path.clone();
+    let password = path_passwords
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&path))
+                .map(|(_, password)| password.clone())
+        });
+    let format_for_probe = format.clone();
+    let mut anchor = py.detach(move || {
+        probe_volume_anchor_at_offset(
+            &path,
+            archive_offset,
+            &format_for_probe,
+            password.as_deref(),
+        )
+    });
+    if anchor.format != format || anchor.confidence != "strong" {
+        return Ok(None);
+    }
+    anchor.pe_structure = true;
+    Ok(Some(anchor))
 }
 
 fn is_weak_sfx_split_head(row: &RelationInput, name_index: &DirectoryNameIndex) -> bool {
@@ -936,11 +1122,7 @@ fn is_possible_sfx_launcher(anchor: &VolumeAnchor) -> bool {
             .iter()
             .any(|item| *item == "sfx:pe_header");
     let cheap_embedded_archive = matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
-        && (anchor.sfx
-            || anchor
-                .evidence
-                .iter()
-                .any(|item| *item == "zip:embedded_local_head"))
+        && anchor.sfx
         && anchor.standalone
         && anchor.structure_offset.is_some_and(|offset| offset > 0)
         && anchor.anchor_roles.iter().any(|role| *role == "first");
@@ -1442,6 +1624,7 @@ fn validate_zip_proposal(
 fn ordinary_file_group_to_dict(
     py: Python<'_>,
     row: &RelationInput,
+    relation_confirmed: bool,
 ) -> PyResult<Py<PyDict>> {
     let relation = FileRelationNative {
         filename: row.name.clone(),
@@ -1473,7 +1656,13 @@ fn ordinary_file_group_to_dict(
         .anchor
         .as_ref()
         .filter(|anchor| anchor_has_relation_evidence(anchor))
-        .map(|anchor| volume_anchor_to_dict(py, anchor))
+        .map(|anchor| {
+            if relation_confirmed {
+                relation_confirmed_anchor_to_dict(py, anchor)
+            } else {
+                volume_anchor_to_dict(py, anchor)
+            }
+        })
         .transpose()?;
     dict.set_item("head_metadata", head_metadata)?;
     dict.set_item(
@@ -1535,10 +1724,16 @@ fn validated_proposal_to_dict(
     dict.set_item("is_split_candidate", true)?;
     dict.set_item("head_size", head_anchor.map(|anchor| anchor.size))?;
     dict.set_item("split_volumes", PyList::new(py, &volume_dicts)?)?;
-    dict.set_item(
-        "head_metadata",
-        head_anchor.map(|anchor| volume_anchor_to_dict(py, anchor)).transpose()?,
-    )?;
+    let metadata = if let Some(anchor) = head_anchor {
+        relation_confirmed_anchor_to_dict(py, anchor)?
+    } else {
+        let metadata = PyDict::new(py);
+        metadata.set_item("format", &proposal.format)?;
+        metadata.set_item("confidence", "strong")?;
+        metadata.set_item("relation_confirmed", true)?;
+        metadata.unbind()
+    };
+    dict.set_item("head_metadata", metadata)?;
     dict.set_item("companion_paths", &proposal.companions)?;
     dict.set_item("carrier_path", &carrier)?;
     dict.set_item("carrier_size", carrier_size)?;
@@ -1600,14 +1795,19 @@ fn password_error_proposal_to_dict(
     dict.set_item("is_split_candidate", true)?;
     dict.set_item("head_size", anchor.map(|value| value.size))?;
     dict.set_item("split_volumes", PyList::new(py, &volume_dicts)?)?;
-    let mut metadata = anchor.map(|value| volume_anchor_to_dict(py, value)).transpose()?;
+    let mut metadata = anchor
+        .map(|value| relation_confirmed_anchor_to_dict(py, value))
+        .transpose()?;
     if metadata.is_none() {
         metadata = Some(PyDict::new(py).unbind());
     }
     if let Some(metadata) = metadata.as_ref() {
-        metadata.bind(py).set_item("needs_password", true)?;
-        metadata.bind(py).set_item("proposal_paths", proposal_owned_paths(proposal))?;
-        metadata.bind(py).set_item("password_scope", &proposal.logical_name)?;
+        let metadata = metadata.bind(py);
+        metadata.set_item("format", &proposal.format)?;
+        metadata.set_item("relation_confirmed", true)?;
+        metadata.set_item("needs_password", true)?;
+        metadata.set_item("proposal_paths", proposal_owned_paths(proposal))?;
+        metadata.set_item("password_scope", &proposal.logical_name)?;
     }
     dict.set_item("head_metadata", metadata)?;
     dict.set_item("companion_paths", &proposal.companions)?;
@@ -1851,6 +2051,16 @@ fn volume_anchor_to_dict(py: Python<'_>, anchor: &VolumeAnchor) -> PyResult<Py<P
     dict.set_item("error", &anchor.error)?;
     dict.set_item("bytes_read", anchor.bytes_read)?;
     Ok(dict.unbind())
+}
+
+
+fn relation_confirmed_anchor_to_dict(
+    py: Python<'_>,
+    anchor: &VolumeAnchor,
+) -> PyResult<Py<PyDict>> {
+    let dict = volume_anchor_to_dict(py, anchor)?;
+    dict.bind(py).set_item("relation_confirmed", true)?;
+    Ok(dict)
 }
 
 fn relation_to_dict(py: Python<'_>, relation: &FileRelationNative) -> PyResult<Py<PyDict>> {

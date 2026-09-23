@@ -357,14 +357,6 @@
         "enabled": true
       },
       {
-        "name": "zip_structure",
-        "enabled": true
-      },
-      {
-        "name": "zip_eocd_structure",
-        "enabled": true
-      },
-      {
         "name": "tar_header_structure",
         "enabled": true
       },
@@ -380,36 +372,17 @@
         "name": "executable_carrier",
         "enabled": true,
         "scan_limit_bytes": 8388608
-      },
-      {
-        "name": "seven_zip_structure",
-        "enabled": true
-      },
-      {
-        "name": "rar_structure",
-        "enabled": true
       }
     ],
     "rule_pipeline": {
       "precheck": [
         {
-          "name": "zip_structure_accept",
-          "enabled": true,
-          "accept_empty_zip": true
+          "name": "relation_archive_accept",
+          "enabled": true
         },
         {
           "name": "tar_structure_accept",
           "enabled": true
-        },
-        {
-          "name": "seven_zip_structure_accept",
-          "enabled": true,
-          "max_next_header_check_bytes": 1048576
-        },
-        {
-          "name": "rar_structure_accept",
-          "enabled": true,
-          "max_first_header_check_bytes": 1048576
         },
         {
           "name": "compression_stream_accept",

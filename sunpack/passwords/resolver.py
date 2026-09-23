@@ -23,10 +23,18 @@ def _selected_structure_format(fact_bag: FactBag | None) -> str:
     if fact_bag is None:
         return ""
     knowledge = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge"))
+    direct_input = fact_bag.get("archive.input")
+    direct_format = (
+        direct_input.get("format_hint")
+        if isinstance(direct_input, dict)
+        else ""
+    )
     values = (
         knowledge.get("source.password_probe_input.format_hint"),
         knowledge.get("source.input.format_hint"),
         knowledge.get("inspection.summary.format"),
+        direct_format,
+        fact_bag.get("relation.format_hint"),
         fact_bag.get("archive.format_hint"),
     )
     hint = next((str(value or "").strip().lower().lstrip(".") for value in values if str(value or "").strip()), "")
@@ -157,6 +165,14 @@ def _validated_format_password_state(fmt: str, structure: dict) -> str:
 def archive_structure_password_state(fact_bag: FactBag | None) -> str:
     """Return the bounded structural password fact without running extraction."""
     if fact_bag is not None:
+        relation_anchor = fact_bag.get("relation.volume_anchor")
+        if (
+            isinstance(relation_anchor, dict)
+            and relation_anchor.get("relation_confirmed")
+            and str(relation_anchor.get("format") or "").lower() == "rar"
+            and relation_anchor.get("needs_password")
+        ):
+            return "required"
         source_input = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge")).get("source.input")
         source_analysis = source_input.get("analysis") if isinstance(source_input, dict) else None
         if isinstance(source_analysis, dict) and source_analysis.get("password_required"):
@@ -351,12 +367,16 @@ class PasswordResolver:
         knowledge_input = knowledge.get("source.password_probe_input")
         if not isinstance(knowledge_input, dict) or not knowledge_input:
             knowledge_input = knowledge.get("source.input")
+        if not isinstance(knowledge_input, dict) or not knowledge_input:
+            direct_input = fact_bag.get("archive.input")
+            knowledge_input = direct_input if isinstance(direct_input, dict) else None
         if not isinstance(knowledge_input, dict):
             return None
         selected_format = str(
             knowledge.get("inspection.summary.format", "")
             or knowledge_input.get("format_hint", "")
             or knowledge.get("source.input.format_hint", "")
+            or fact_bag.get("relation.format_hint")
             or fact_bag.get("archive.format_hint")
             or ""
         ).strip().lower().lstrip(".")
@@ -426,4 +446,15 @@ class PasswordResolver:
         if isinstance(source_derivation, dict):
             return str(source_derivation.get("candidate_logical_name") or source_derivation.get("candidate_entry_path") or "")
         source_input = knowledge.get("source.input") or {}
-        return str(source_input.get("logical_name") or source_input.get("entry_path") or "") if isinstance(source_input, dict) else ""
+        if isinstance(source_input, dict):
+            value = str(source_input.get("logical_name") or source_input.get("entry_path") or "")
+            if value:
+                return value
+        direct_input = fact_bag.get("archive.input")
+        if isinstance(direct_input, dict):
+            return str(
+                direct_input.get("logical_name")
+                or direct_input.get("entry_path")
+                or ""
+            )
+        return ""

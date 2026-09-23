@@ -4,6 +4,7 @@ from sunpack.detection.pipeline.rules.base import RuleBase
 from sunpack.support.module_discovery import import_static_modules
 
 _PRECHECK_RULE_MODULES = (
+    "sunpack.detection.pipeline.rules.precheck.relation_archive_accept",
     "sunpack.detection.pipeline.rules.precheck.compression_stream_accept",
     "sunpack.detection.pipeline.rules.precheck.rar_structure_accept",
     "sunpack.detection.pipeline.rules.precheck.seven_zip_structure_accept",

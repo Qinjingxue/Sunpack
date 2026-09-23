@@ -73,6 +73,10 @@
     "rule_pipeline": {
       "precheck": [
         {
+          "name": "relation_archive_accept",
+          "enabled": true
+        },
+        {
           "name": "embedded_payload_identity",
           "deep_scan_single_candidate_ratio": 0.3
         }

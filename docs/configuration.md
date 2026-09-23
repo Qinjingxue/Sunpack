@@ -340,14 +340,14 @@ Default methods and key parameters:
 | Name | Purpose |
 | --- | --- |
 | `embedded_archive` | Handle files that plain archive identification did not resolve and that are authorized for embedded scanning. |
-| `zip_structure` | Check the ZIP local header. |
-| `zip_eocd_structure` | Check the ZIP EOCD and central directory. |
+| `zip_structure` | Optional ZIP structural analysis processor; the default archive-discovery path resolves ZIP identity and topology in Relations. |
+| `zip_eocd_structure` | Optional ZIP EOCD/central-directory analysis processor; it is no longer on the default detection hot path. |
 | `tar_header_structure` | Check the TAR header checksum and ustar marker. |
 | `compression_stream_structure` | Check the lightweight stream structure of gzip, bzip2, xz, and zstd. |
 | `pe_overlay_structure` | Check archive payloads in the PE overlay. |
 | `executable_carrier` | Check executable carriers and their archive regions; the default read limit is `8388608` bytes. |
-| `seven_zip_structure` | Check the 7z signature, start header CRC, next header range, and NID. |
-| `rar_structure` | Check the RAR4/RAR5 signature, main header, and block/header walk. |
+| `seven_zip_structure` | Optional 7z structural analysis processor; ordinary, SFX, and split 7z identity is resolved in Relations by default. |
+| `rar_structure` | Optional RAR structural analysis processor; ordinary, SFX, and split RAR identity is resolved in Relations by default. |
 
 ### rule_pipeline.precheck
 
@@ -355,12 +355,12 @@ Default rules:
 
 | Rule | Purpose |
 | --- | --- |
-| `zip_structure_accept` | Fast accept for structurally trustworthy ZIP files; empty ZIP files are allowed by default. |
+| `relation_archive_accept` | Zero-I/O accept for RAR, 7z, and ZIP logical inputs already confirmed by Relations, including standalone, SFX, and split inputs. |
 | `tar_structure_accept` | Fast accept for structurally trustworthy TAR files. |
-| `seven_zip_structure_accept` | Fast accept for 7z files with a trustworthy start/next header; the next header check limit is `1048576` bytes. |
-| `rar_structure_accept` | Accept when the RAR main header/block walk is trustworthy; the first header check limit is `1048576` bytes. |
 | `compression_stream_accept` | Fully validate gzip, bzip2, xz, and zstd streams. |
 | `embedded_payload_identity` | Identify an executable carrier first, then accept files that are authorized and contain a reliable embedded archive. |
+
+RAR, 7z, and ZIP are resolved by Relations before the default detection rules run; the legacy format-specific structure rules remain available only for explicit configurations and diagnostics.
 
 `embedded_payload_identity.deep_scan_single_candidate_ratio` defaults to `0.3`: a full embedded scan is performed when a single logical candidate accounts for 30% or more of the total unresolved candidate bytes. `0` disables that stage, and `1` selects only candidates that account for the entire size. A volume set counts as one logical candidate, and member volumes are not counted repeatedly.
 

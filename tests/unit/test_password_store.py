@@ -50,6 +50,26 @@ def test_password_store_bounds_initial_recent_success_history():
     assert len(store.recent_passwords) == MAX_RECENT_PASSWORDS
 
 
+def test_password_resolver_falls_back_to_relations_archive_input_before_analysis():
+    bag = FactBag()
+    bag.set("archive.input", {
+        "kind": "archive_input",
+        "entry_path": "carrier.exe",
+        "open_mode": "file_range",
+        "format_hint": "rar",
+        "logical_name": "carrier",
+        "parts": [{"path": "carrier.exe", "start": 8192}],
+        "segment": {"start": 8192, "source": "relations"},
+    })
+    bag.set("relation.format_hint", "rar")
+
+    selected = PasswordResolver._archive_input_for_password_probe(bag)
+
+    assert selected["open_mode"] == "file_range"
+    assert selected["parts"][0]["start"] == 8192
+    assert PasswordResolver._archive_key_from_fact_bag(bag) == "carrier"
+
+
 def test_password_resolver_prefers_formal_password_probe_input():
     bag = FactBag()
     bag.set("archive.knowledge", {

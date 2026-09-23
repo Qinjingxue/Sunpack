@@ -69,6 +69,33 @@ def test_logical_extension_promotes_matching_precheck_ahead_of_config_order(tmp_
     assert decision.deciding_rule == "zip_structure_accept"
 
 
+def test_relation_archive_accept_uses_existing_evidence_without_file_io():
+    config = with_detection_pipeline(precheck=[
+        {"name": "relation_archive_accept", "enabled": True},
+    ])
+    bag = FactBag()
+    bag.set("archive.input", {
+        "kind": "archive_input",
+        "entry_path": "missing.7z",
+        "open_mode": "file",
+        "format_hint": "7z",
+    })
+    bag.set("relation.volume_anchor", {
+        "format": "7z",
+        "confidence": "strong",
+        "standalone": True,
+        "structure_offset": 0,
+        "relation_confirmed": True,
+    })
+
+    decision = DetectionScheduler(config).evaluate_bag(bag)
+
+    assert decision.should_extract is True
+    assert decision.deciding_rule == "relation_archive_accept"
+    assert bag.get("file.detected_ext") == ".7z"
+    assert bag.get("file.probe_offset") == 0
+
+
 def test_removed_confirmation_layer_is_rejected():
     result = validate_detection_contracts({
         "detection": {

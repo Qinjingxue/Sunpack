@@ -11,10 +11,8 @@ def detection_pipeline_config() -> dict:
     return with_detection_pipeline(
         {"thresholds": {"archive_score_threshold": 6, "maybe_archive_threshold": 3}},
         precheck=[
-            {"name": "zip_structure_accept", "enabled": True},
+            {"name": "relation_archive_accept", "enabled": True},
             {"name": "tar_structure_accept", "enabled": True},
-            {"name": "seven_zip_structure_accept", "enabled": True},
-            {"name": "rar_structure_accept", "enabled": True},
             {"name": "compression_stream_accept", "enabled": True},
             {
                 "name": "embedded_payload_identity",
