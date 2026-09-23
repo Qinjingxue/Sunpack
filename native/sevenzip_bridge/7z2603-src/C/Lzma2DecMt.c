@@ -541,7 +541,7 @@ static SRes Lzma2DecMt_MtCallback_Code(void *pp, unsigned coderIndex,
         break;
 
       step = t->dec.decoder.dicBufSize - dicPos;
-      if (step > me->props.outStep_ST)
+      if (me->props.outStep_ST != 0 && step > me->props.outStep_ST)
         step = me->props.outStep_ST;
       if (step > remOut)
         step = remOut;
