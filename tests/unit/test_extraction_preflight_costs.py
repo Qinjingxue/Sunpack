@@ -78,7 +78,6 @@ def test_crc_proven_zipcrypto_password_is_confirmed_before_reporting_later_damag
             confirmed.append(resolution.password)
 
     extractor = SingleArchiveExtractor(
-        seven_z_path="",
         password_store=SimpleNamespace(has_candidates=lambda **_kwargs: True),
         password_resolver=Resolver(),
         metadata_scanner=SimpleNamespace(scan_for_task=lambda *_args, **_kwargs: SimpleNamespace(
