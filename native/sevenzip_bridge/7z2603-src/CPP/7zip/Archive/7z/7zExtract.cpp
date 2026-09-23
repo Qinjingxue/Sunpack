@@ -193,7 +193,7 @@ HRESULT CFolderOutStream::Init(
 HRESULT CFolderOutStream::InitPositioned(unsigned startIndex, unsigned numFiles)
 {
   _positionedCallback =
-      dynamic_cast<sunpack::sevenzip::PositionedExtractCallback *>(
+      sunpack::sevenzip::positioned_extract_callback(
           ExtractCallback.Interface());
 
   if (!_positionedCallback ||
@@ -577,9 +577,9 @@ HRESULT CFolderOutStream::FlushCorrupted(Int32 callbackOperationResult)
 class CFolderPositionedOutStream final :
   public CMyUnknownImp,
   public ISequentialOutStream,
-  public sunpack::sevenzip::PositionedOutStream
+  public ISunpackPositionedOutStream
 {
-  Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+  Z7_COM_UNKNOWN_IMP_2(ISequentialOutStream, ISunpackPositionedOutStream)
 
   CMyComPtr<ISequentialOutStream> _sequential;
   CFolderOutStream *_folder;
