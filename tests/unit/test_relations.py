@@ -1,4 +1,5 @@
 from pathlib import Path
+from io import BytesIO
 import struct
 import zipfile
 
@@ -6,6 +7,7 @@ import pytest
 
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.coordinator.target_scan import build_fact_bags_for_target
+from sunpack.coordinator.target_groups import relation_group_to_fact_bag
 from sunpack.relations import RelationsScheduler
 
 
@@ -47,6 +49,43 @@ def test_empty_zip_is_confirmed_by_relations(tmp_path):
     assert group.head_metadata["format"] == "zip"
     assert group.head_metadata["standalone"] is True
     assert group.head_metadata["relation_confirmed"] is True
+
+
+def test_pe_zip_sfx_is_confirmed_and_projected_as_file_range(tmp_path):
+    zip_buffer = BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", compression=zipfile.ZIP_STORED) as stream:
+        stream.writestr("inside.txt", "hello")
+
+    pe_end = 0xE0
+    image = bytearray(pe_end)
+    image[0:2] = b"MZ"
+    image[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    image[0x80:0x84] = b"PE\x00\x00"
+    image[0x86:0x88] = (1).to_bytes(2, "little")
+    image[0x94:0x96] = (0).to_bytes(2, "little")
+    section = 0x98
+    image[section + 16:section + 20] = (0x20).to_bytes(4, "little")
+    image[section + 20:section + 24] = (0xC0).to_bytes(4, "little")
+
+    path = tmp_path / "payload.exe"
+    path.write_bytes(bytes(image) + zip_buffer.getvalue())
+
+    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
+    metadata = group.head_metadata
+
+    assert metadata["format"] == "zip"
+    assert metadata["relation_confirmed"] is True
+    assert metadata["sfx"] is True
+    assert metadata["pe_structure"] is True
+    assert metadata["structure_offset"] == pe_end
+
+    bag = relation_group_to_fact_bag(group)
+    archive_input = bag.get("archive.input")
+    assert archive_input["open_mode"] == "file_range"
+    assert archive_input["format_hint"] == "zip"
+    assert archive_input["ranges"][0]["start"] == pe_end
+    assert bag.get("file.container_type") == "pe"
+    assert bag.get("file.probe_offset") == pe_end
 
 
 def test_filename_numbered_7z_without_structural_seed_is_not_grouped(tmp_path):
