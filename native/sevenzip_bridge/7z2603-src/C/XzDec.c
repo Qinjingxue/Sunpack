@@ -1977,7 +1977,7 @@ static SRes XzDecMt_Callback_Write(void *pp, unsigned coderIndex,
     BoolInt *canRecode)
 {
   CXzDecMt *me = (CXzDecMt *)pp;
-  const CXzDecMtThread *coder = &me->coders[coderIndex];
+  CXzDecMtThread *coder = &me->coders[coderIndex];
 
   // PRF(printf("\nWrite processed = %d srcSize = %d\n", (unsigned)me->mtc.inProcessed, (unsigned)srcSize));
   
@@ -2094,6 +2094,8 @@ static SRes XzDecMt_Callback_Write(void *pp, unsigned coderIndex,
       me->finishedDecoderIndex = (int)coderIndex;
       return SZ_OK;
     }
+
+    SunpackFileBuffer_Unmap(&coder->outBuf);
 
     if (coder->parseState != MTDEC_PARSE_END)
     {
