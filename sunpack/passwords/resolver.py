@@ -157,6 +157,14 @@ def _validated_format_password_state(fmt: str, structure: dict) -> str:
 def archive_structure_password_state(fact_bag: FactBag | None) -> str:
     """Return the bounded structural password fact without running extraction."""
     if fact_bag is not None:
+        relation_anchor = fact_bag.get("relation.volume_anchor")
+        if (
+            isinstance(relation_anchor, dict)
+            and relation_anchor.get("relation_confirmed")
+            and str(relation_anchor.get("format") or "").lower() == "rar"
+            and relation_anchor.get("needs_password")
+        ):
+            return "required"
         source_input = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge")).get("source.input")
         source_analysis = source_input.get("analysis") if isinstance(source_input, dict) else None
         if isinstance(source_analysis, dict) and source_analysis.get("password_required"):
