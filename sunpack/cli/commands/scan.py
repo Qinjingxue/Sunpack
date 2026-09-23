@@ -45,11 +45,14 @@ def handle(args, ctx):
         reporter.info(ctx.t("cli.scan.identified", count=summary["task_count"]))
         for item in task_items:
             reporter.info(ctx.t("cli.item_path", path=item["main_path"]))
-            reporter.info(ctx.t("cli.scan.details", decision=item["decision"], parts=len(item["all_parts"])))
-            if item["format"]:
-                reporter.info(ctx.t("cli.scan.format", format=item["format"]))
-            if reporter.verbose and item["reasons"]:
-                reporter.info(ctx.t("cli.scan.matched_rules", rules=", ".join(item["reasons"])))
+            reporter.info(ctx.t(
+                "cli.scan.details",
+                source=item["discovery_source"] or "-",
+                format=item["format"] or "-",
+                parts=len(item["all_parts"]),
+            ))
+            if reporter.verbose and item["discovery_reason"]:
+                reporter.info(ctx.t("cli.scan.reason", reason=item["discovery_reason"]))
 
     return 0, CliCommandResult(
         command=COMMAND,
