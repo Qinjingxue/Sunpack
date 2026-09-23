@@ -29,8 +29,6 @@ class ArchiveRelationStage:
             is_sfx_stub=bool(
                 descriptor.open_mode == "sfx_with_volumes"
                 or info.is_sfx_stub
-                or task.fact_bag.get("relation.has_split_companions")
-                or task.fact_bag.get("candidate.companion_paths")
             ),
             archive_input=descriptor,
             source=info.source or "relations",
