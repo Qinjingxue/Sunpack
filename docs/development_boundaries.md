@@ -192,10 +192,10 @@ from sunpack.some_domain.internal import ...
 Do not depend on `internal` across domains. Add a public facade, or move the shared contract into `contracts`.
 
 ```python
-facts = bag._facts
+knowledge = task.knowledge()
 ```
 
-Do not read private state. Use `FactBag.to_dict()`, or add a public method.
+Do not read private task state. Use `ArchiveTask.knowledge()` / typed contracts, or add a public method.
 
 ```python
 from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler
