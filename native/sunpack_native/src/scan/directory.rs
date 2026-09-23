@@ -92,7 +92,6 @@ impl NativeDirectorySnapshot {
         };
         for record in records {
             let route = filesystem_file_route(
-                &record.path,
                 record.is_dir,
                 record.relation_anchor.as_ref(),
             );
@@ -136,7 +135,6 @@ impl NativeDirectorySnapshot {
 
 
 fn filesystem_file_route(
-    _path: &str,
     is_dir: bool,
     anchor: Option<&VolumeAnchor>,
 ) -> u8 {
@@ -567,7 +565,7 @@ impl NativeDirectorySnapshot {
         }
     }
 
-    fn file_routing_columns(
+    fn non_relation_file_routing_columns(
         &self,
     ) -> (
         Vec<String>,
@@ -576,13 +574,16 @@ impl NativeDirectorySnapshot {
         Vec<String>,
         Vec<u32>,
     ) {
-        let mut paths = Vec::new();
-        let mut sizes = Vec::new();
-        let mut routes = Vec::new();
-        let mut formats = Vec::new();
-        let mut reject_masks = Vec::new();
+        let estimated = self.rows.len();
+        let mut paths = Vec::with_capacity(estimated);
+        let mut sizes = Vec::with_capacity(estimated);
+        let mut routes = Vec::with_capacity(estimated);
+        let mut formats = Vec::with_capacity(estimated);
+        let mut reject_masks = Vec::with_capacity(estimated);
         for &row in &self.rows {
-            if self.table.is_dirs[row] {
+            if self.table.is_dirs[row]
+                || self.table.file_routes[row] == FILE_ROUTE_RELATIONS
+            {
                 continue;
             }
             let anchor = self.table.relation_anchors[row].as_ref();
