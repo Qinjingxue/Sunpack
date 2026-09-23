@@ -2,7 +2,6 @@ from sunpack.detection.formats._stream import confirmed_stream
 
 
 FORMAT = "gzip"
-EXTENSION = ".gz"
 
 
 def confirm(path: str, analyzer) -> bool:
