@@ -288,7 +288,7 @@ class ExtractionBatchRunner:
             if not isinstance(replacement, ArchiveTask):
                 break
             task.adopt_detection_plan(replacement)
-            task.fact_bag.set("relation.volume_retry_attempted", True)
+            task.runtime["volume_retry_attempted"] = True
             await broker.run(
                 "relation",
                 file_id,
@@ -440,7 +440,7 @@ class ExtractionBatchRunner:
         max_verification_retries = max(0, int(verification_config.get("max_retries", 0) or 0))
         cleanup_failed_output = bool(verification_config.get("cleanup_failed_output", True))
         attempts = max_verification_retries + 1
-        volume_retry_attempted = bool(task.fact_bag.get("relation.volume_retry_attempted"))
+        volume_retry_attempted = bool(task.runtime.get("volume_retry_attempted"))
 
         attempt_index = 0
         while attempt_index < attempts:
@@ -473,11 +473,11 @@ class ExtractionBatchRunner:
                             planned_output_dir=out_dir,
                         )
                         task.adopt_detection_plan(replacement)
-                        task.fact_bag.set("relation.volume_retry_attempted", True)
-                        task.fact_bag.set(
-                            "relation.volume_retry_basis",
-                            ["confirmed_structure", "anchor_constrained_filename"],
-                        )
+                        task.runtime["volume_retry_attempted"] = True
+                        task.runtime["volume_retry_basis"] = [
+                            "confirmed_structure",
+                            "anchor_constrained_filename",
+                        ]
                         self.prepare_tasks([task])
                         self.directory_password_contexts.annotate([task])
                         continue
@@ -863,7 +863,6 @@ def _possible_missing_volume_failure(
 def _task_is_split_input(task: ArchiveTask) -> bool:
     return bool(
         task.split_info.is_split
-        or task.fact_bag.get("relation.is_split_related")
         or len(task.all_parts or []) > 1
     )
 
@@ -877,8 +876,7 @@ def _is_unresolved_encrypted_rar_member(task: ArchiveTask) -> bool:
     stand alone, report the bounded missing-volume diagnosis here instead of
     inventing a filename-based relation or relabeling it as generic damage.
     """
-    bag = task.fact_bag
-    anchor = bag.get("relation.volume_anchor")
+    anchor = task.knowledge().get("discovery.evidence", {})
     if not isinstance(anchor, dict):
         return False
     if str(anchor.get("format") or "").casefold() != "rar":
@@ -890,7 +888,7 @@ def _is_unresolved_encrypted_rar_member(task: ArchiveTask) -> bool:
         for item in (anchor.get("evidence") or [])
     ):
         return False
-    name = os.path.basename(str(bag.get("file.path") or task.main_path or "")).casefold()
+    name = os.path.basename(str(task.main_path or "")).casefold()
     # This is intentionally only a classification hint, never a relation
     # builder.  The standard RAR spelling is the only form needed here; all
     # disguised/ambiguous forms remain visible as ordinary candidates and
