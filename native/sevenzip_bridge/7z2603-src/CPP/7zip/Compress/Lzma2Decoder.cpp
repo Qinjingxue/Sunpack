@@ -212,6 +212,21 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
       sunpack::sevenzip::positioned_out_stream(outStream);
   positionedWrap.Init(positionedOut);
 
+  #ifndef Z7_ST
+  /*
+    Full-output buffering used outBlockMax as a memory bound. Positioned mode
+    only keeps the real LZMA dictionary, so a long reset-run must not trigger
+    MtDec's legacy ST fallback after earlier runs have already been committed.
+    Let the parser reach the next dictionary reset (or end of coder output).
+  */
+  if (positionedOut && outSize &&
+      *outSize != 0 &&
+      *outSize <= (UInt64)(size_t)-1)
+  {
+    props.outBlockMax = (size_t)*outSize;
+  }
+  #endif
+
   SRes res;
 
   UInt64 inProcessed = 0;
