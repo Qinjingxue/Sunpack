@@ -1303,6 +1303,10 @@ public:
     void submit(std::string request) {
         auto cancel_token = std::make_shared<std::atomic<bool>>(false);
         JobMetadata metadata = metadata_from_request(request);
+        const std::string queued_event =
+            metadata.job_id.empty()
+                ? std::string{}
+                : worker_event_json("job_queued", metadata, 0);
         const std::string job_id = metadata.job_id;
         bool rejected_for_capacity = false;
         {
@@ -1323,7 +1327,7 @@ public:
                 Job job{
                     std::move(request),
                     std::move(cancel_token),
-                    metadata,
+                    std::move(metadata),
                 };
                 if (metadata.foreground) {
                     foreground_queue_.push_back(std::move(job));
@@ -1343,7 +1347,9 @@ public:
             return;
         }
 
-        print_worker_event(job_id, "job_queued", metadata);
+        if (!queued_event.empty()) {
+            print_json_line(queued_event);
+        }
         condition_.notify_one();
     }
 
@@ -1443,6 +1449,12 @@ private:
         std::string volume_key;
         // False only for dry runs, which write nothing and need no facility, writer threads or readiness gate.
         bool requires_writer = true;
+
+        // Lifecycle events reuse these fields four times per job. Escaping them
+        // once at submission avoids repeated allocations/string walks on the
+        // admission and completion hot paths.
+        std::string escaped_job_id;
+        std::string lifecycle_context_json;
     };
 
     struct Job {
@@ -1470,6 +1482,12 @@ private:
         metadata.foreground = json_string_field(request, "origin", "foreground") != "watch";
         metadata.volume_key = json_string_field(request, "output_volume_key", "");
         metadata.requires_writer = !json_bool_field(request, "dry_run", false);
+        metadata.escaped_job_id = json_escape(metadata.job_id);
+        metadata.lifecycle_context_json =
+            ",\"request_id\":\"" + json_escape(metadata.request_id) +
+            "\",\"origin\":\"" + std::string(metadata.foreground ? "foreground" : "watch") +
+            "\",\"output_volume_key\":\"" + json_escape(metadata.volume_key) +
+            "\",\"requires_writer\":" + std::string(metadata.requires_writer ? "true" : "false");
         return metadata;
     }
 
@@ -1507,18 +1525,14 @@ private:
     }
 
     std::string worker_event_json(
-        const std::string& job_id,
         const char* event,
         const JobMetadata& metadata,
         std::size_t active_jobs = 0
     ) const {
         return
-            "{\"type\":\"native_event\",\"job_id\":\"" + json_escape(job_id) +
+            "{\"type\":\"native_event\",\"job_id\":\"" + metadata.escaped_job_id +
             "\",\"event\":\"" + event +
-            "\",\"request_id\":\"" + json_escape(metadata.request_id) +
-            "\",\"origin\":\"" + std::string(metadata.foreground ? "foreground" : "watch") +
-            "\",\"output_volume_key\":\"" + json_escape(metadata.volume_key) +
-            "\",\"requires_writer\":" + std::string(metadata.requires_writer ? "true" : "false") +
+            "\"" + metadata.lifecycle_context_json +
             ",\"active_jobs\":" + std::to_string(active_jobs) +
             "}";
     }
@@ -1533,7 +1547,7 @@ private:
             return;
         }
         print_json_line(worker_event_json(
-            job_id, event, metadata, active_jobs));
+            event, metadata, active_jobs));
     }
 
     void print_job_start_events(
@@ -1545,12 +1559,10 @@ private:
         }
         print_json_lines(
             worker_event_json(
-                job.metadata.job_id,
                 "job_admitted",
                 job.metadata,
                 active_jobs),
             worker_event_json(
-                job.metadata.job_id,
                 "job_started",
                 job.metadata,
                 active_jobs));
