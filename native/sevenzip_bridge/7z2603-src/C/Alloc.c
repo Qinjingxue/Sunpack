@@ -5,6 +5,7 @@
 
 #ifdef _WIN32
 #include "7zWindows.h"
+#include <winioctl.h>
 #endif
 #include <stdlib.h>
 
@@ -243,6 +244,146 @@ void MidFree(void *address)
   if (!address)
     return;
   VirtualFree(address, 0, MEM_RELEASE);
+}
+
+
+#define SUNPACK_FILE_BUFFER_THRESHOLD ((size_t)1 << 24)
+
+void SunpackFileBuffer_Construct(CSunpackFileBuffer *p)
+{
+  p->data = NULL;
+  p->capacity = 0;
+  p->fileHandle = NULL;
+  p->mappingHandle = NULL;
+  p->fileBacked = False;
+}
+
+static void SunpackFileBuffer_ReleaseWindows(CSunpackFileBuffer *p)
+{
+  if (p->data)
+    UnmapViewOfFile(p->data);
+  if (p->mappingHandle)
+    CloseHandle((HANDLE)p->mappingHandle);
+  if (p->fileHandle)
+    CloseHandle((HANDLE)p->fileHandle);
+  p->data = NULL;
+  p->capacity = 0;
+  p->fileHandle = NULL;
+  p->mappingHandle = NULL;
+  p->fileBacked = False;
+}
+
+void SunpackFileBuffer_Release(CSunpackFileBuffer *p)
+{
+  if (!p)
+    return;
+  if (p->fileBacked)
+  {
+    SunpackFileBuffer_ReleaseWindows(p);
+    return;
+  }
+  if (p->data)
+    MidFree(p->data);
+  SunpackFileBuffer_Construct(p);
+}
+
+static BoolInt SunpackFileBuffer_CreateMapped(CSunpackFileBuffer *p, size_t size)
+{
+  WCHAR tempPath[MAX_PATH + 1];
+  WCHAR tempName[MAX_PATH + 1];
+  DWORD pathLen;
+  HANDLE file;
+  HANDLE mapping;
+  void *view;
+  LARGE_INTEGER endPos;
+  DWORD sparseBytes = 0;
+  const UInt64 size64 = (UInt64)size;
+
+  pathLen = GetTempPathW((DWORD)Z7_ARRAY_SIZE(tempPath), tempPath);
+  if (pathLen == 0 || pathLen >= Z7_ARRAY_SIZE(tempPath))
+    return False;
+  if (!GetTempFileNameW(tempPath, L"spk", 0, tempName))
+    return False;
+
+  file = CreateFileW(
+      tempName,
+      GENERIC_READ | GENERIC_WRITE,
+      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+      NULL,
+      OPEN_EXISTING,
+      FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+      NULL);
+  if (file == INVALID_HANDLE_VALUE)
+  {
+    DeleteFileW(tempName);
+    return False;
+  }
+
+  /* Best effort: sparse backing avoids reserving physical disk clusters for
+     untouched portions of a large decoder run. Non-NTFS filesystems may reject
+     this request; the mapping remains correct without it. */
+  DeviceIoControl(file, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &sparseBytes, NULL);
+
+  endPos.QuadPart = (LONGLONG)size64;
+  if (!SetFilePointerEx(file, endPos, NULL, FILE_BEGIN) || !SetEndOfFile(file))
+  {
+    CloseHandle(file);
+    return False;
+  }
+
+  mapping = CreateFileMappingW(
+      file,
+      NULL,
+      PAGE_READWRITE,
+      (DWORD)(size64 >> 32),
+      (DWORD)size64,
+      NULL);
+  if (!mapping)
+  {
+    CloseHandle(file);
+    return False;
+  }
+
+  view = MapViewOfFile(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size);
+  if (!view)
+  {
+    CloseHandle(mapping);
+    CloseHandle(file);
+    return False;
+  }
+
+  p->data = (Byte *)view;
+  p->capacity = size;
+  p->fileHandle = file;
+  p->mappingHandle = mapping;
+  p->fileBacked = True;
+  return True;
+}
+
+BoolInt SunpackFileBuffer_Ensure(CSunpackFileBuffer *p, size_t size)
+{
+  Byte *data;
+
+  if (size == 0)
+    size = 1;
+  if (p->data && p->capacity >= size)
+    return True;
+
+  SunpackFileBuffer_Release(p);
+
+  if (size >= SUNPACK_FILE_BUFFER_THRESHOLD)
+  {
+    if (SunpackFileBuffer_CreateMapped(p, size))
+      return True;
+  }
+
+  data = (Byte *)MidAlloc(size);
+  if (!data)
+    return False;
+  p->data = data;
+  p->capacity = size;
+  p->fileBacked = False;
+  return True;
 }
 
 #ifdef Z7_LARGE_PAGES
@@ -518,257 +659,3 @@ static void SzAlignedFree(ISzAllocPtr pp, void *address)
 #endif
 
 extern
-size_t g_LargePageSize;
-size_t g_LargePageSize = LARGE_PAGE_SIZE_DEFAULT;
-extern
-size_t g_LargePageThresholdMin;
-size_t g_LargePageThresholdMin = LARGE_PAGE_SIZE_DEFAULT / 2;
-extern
-UInt32 g_LargePageFlags;
-UInt32 g_LargePageFlags = 0;
-
-void *BigAlloc(size_t size)
-{
-  if (size == 0)
-    return NULL;
-#ifdef USE_posix_memalign
-  {
-    const size_t pageSize = g_LargePageSize;
-    void *buf = NULL; // on Linux (and other systems), posix_memalign() does not modify memptr on failure (POSIX.1-2008 TC2).
-    PRF(printf("\nBigAlloc 0x%08x=%5uMB", (unsigned)(size), (unsigned)(size >> 20));)
-    if (pageSize && size > g_LargePageThresholdMin)
-    {
-      int res;
-      const size_t mask = pageSize - 1;
-      /* we can allocate aligned size, so data at the end of buffer also will use huge page
-         if (size2 for madvise() is not aligned for huge page size)
-           { Last data block will use small pages. It reduces memory allocation,
-             but last data block with small pages can work slower.
-             It's useful, if we have very large HUGE_PAGE: 32MB or 512MB. }
-      */
-      size_t size2 = (size + mask) & ~mask;
-      if (size2 < size || (size & mask) <= g_LargePageThresholdMin)
-        size2 = size;
-      res = posix_memalign(&buf, pageSize, size2);
-      PRF(printf(" posix_memalign size=0x%08x=%5uMB align=%u",
-          (unsigned)(size2), (unsigned)(size2 >> 20), (unsigned)pageSize);)
-      PRF(printf(" buf=%p", (void *)buf);)
-      if (res == 0)
-      {
-#ifdef Z7_USE_BIG_ALLOC_MADVISE
-        if ((g_LargePageFlags & Z7_LARGE_PAGES_FLAG_NO_MADVISE) == 0)
-        {
-          // Advise the kernel to use huge pages for this memory range
-          // MADV_HUGEPAGE / MADV_NOHUGEPAGE : since Linux 2.6.38
-          // madvise() only operates on whole pages, therefore addr must be page-aligned (4KB/8KB/16KB/64KB).
-          // The value of size is rounded up to a multiple of page size.
-          PRF(printf(" madvise g_LargePageFlags=%x", (unsigned)g_LargePageFlags);)
-          res = madvise(buf, size2, (g_LargePageFlags & Z7_LARGE_PAGES_FLAG_NO_HUGEPAGE) ? MADV_NOHUGEPAGE : MADV_HUGEPAGE);
-          if (res)
-          {
-            PRF(printf("\nERROR res=%d, errno=%d=%s\n", res, (int)errno, strerror(errno));)
-            if (g_LargePageFlags & Z7_LARGE_PAGES_FLAG_FAIL_STOP)
-            {
-              free(buf);
-              return NULL;
-            }
-          }
-        }
-#endif // Z7_USE_BIG_ALLOC_MADVISE
-        PRF(printf("\n");)
-        return buf;
-      }
-      PRF(printf("\nERROR res=%d=%s\n", res, strerror(res));)
-      if (g_LargePageFlags & Z7_LARGE_PAGES_FLAG_FAIL_STOP)
-        return NULL;
-      // (res == ENOMEM) "Out of memory" is possible, if pageSize is too big.
-      // so we do second attempt with smaller alignment
-    }
-  }
-#endif // !USE_posix_memalign
-  PRF(printf(" z7_AlignedAlloc size=0x%08x=%5uMB\n", (unsigned)(size), (unsigned)(size >> 20));)
-  return z7_AlignedAlloc(size);
-}
-
-
-void BigFree(void *address)
-{
-  z7_AlignedFree(address);
-}
-#endif // Z7_LARGE_PAGES
-#endif // !_WIN32
-
-
-#ifdef Z7_LARGE_PAGES
-void z7_LargePage_Set(UInt32 flags, size_t pageSize, size_t threshold)
-{
-  g_LargePageFlags = flags;
-
-#ifdef _WIN32
-  if ((flags & Z7_LARGE_PAGES_FLAG_USE_HUGEPAGE) == 0)
-  {
-    g_LargePageSize = 0;
-    g_LargePageThresholdMin = 0;
-  }
-  else
-  {
-    if ((flags & Z7_LARGE_PAGES_FLAG_DIRECT_PAGE_SIZE) == 0)
-    {
-#ifdef Z7_USE_DYN_GetLargePageMinimum
-      Z7_DIAGNOSTIC_IGNORE_CAST_FUNCTION
-typedef SIZE_T (WINAPI *Func_GetLargePageMinimum)(VOID);
-      const
-        Func_GetLargePageMinimum fn =
-       (Func_GetLargePageMinimum) Z7_CAST_FUNC_C GetProcAddress(GetModuleHandle(TEXT("kernel32.dll")),
-            "GetLargePageMinimum");
-      if (fn)
-        pageSize = fn();
-      else
-        pageSize = 0;
-#else
-      pageSize = GetLargePageMinimum();
-#endif
-      if (pageSize & (pageSize - 1))
-        pageSize = 0;
-    }
-    g_LargePageSize = pageSize;
-    if ((flags & Z7_LARGE_PAGES_FLAG_DIRECT_THRESHOLD) == 0)
-      threshold = pageSize / 2;
-    g_LargePageThresholdMin = threshold;
-  }
-
-#else // !_WIN32
-
-  if (flags & Z7_LARGE_PAGES_FLAG_NO_PAGECODE)
-  {
-    g_LargePageSize = 0;
-    g_LargePageThresholdMin = 0;
-  }
-  else
-  {
-    if ((flags & Z7_LARGE_PAGES_FLAG_DIRECT_PAGE_SIZE) == 0)
-      pageSize = LARGE_PAGE_SIZE_DEFAULT;
-    g_LargePageSize = pageSize;
-    if ((flags & Z7_LARGE_PAGES_FLAG_DIRECT_THRESHOLD) == 0)
-      threshold = pageSize / 2;
-    g_LargePageThresholdMin = threshold;
-  }
-  // PRF(printf("\ng_LargePageSize=%x g_LargePageThresholdMin = %x g_LargePageFlags = %x", (unsigned)g_LargePageSize, (unsigned)g_LargePageThresholdMin, (unsigned)g_LargePageFlags);)
-#endif // !_WIN32
-}
-#endif // Z7_LARGE_PAGES
-
-const ISzAlloc g_AlignedAlloc = { SzAlignedAlloc, SzAlignedFree };
-
-
-
-/* we align ptr to support cases where CAlignOffsetAlloc::offset is not multiply of sizeof(void *) */
-#ifndef Z7_ALLOC_NO_OFFSET_ALLOCATOR
-#if 1
-  #define MY_ALIGN_PTR_DOWN_1(p)  MY_ALIGN_PTR_DOWN(p, sizeof(void *))
-  #define REAL_BLOCK_PTR_VAR(p)  ((void **)MY_ALIGN_PTR_DOWN_1(p))[-1]
-#else
-  // we can use this simplified code,
-  // if (CAlignOffsetAlloc::offset == (k * sizeof(void *))
-  #define REAL_BLOCK_PTR_VAR(p)  (((void **)(p))[-1])
-#endif
-#endif
-
-
-#if 0
-#ifndef Z7_ALLOC_NO_OFFSET_ALLOCATOR
-#include <stdio.h>
-static void PrintPtr(const char *s, const void *p)
-{
-  const Byte *p2 = (const Byte *)&p;
-  unsigned i;
-  printf("%s %p ", s, p);
-  for (i = sizeof(p); i != 0;)
-  {
-    i--;
-    printf("%02x", p2[i]);
-  }
-  printf("\n");
-}
-#endif
-#endif
-
-
-static void *AlignOffsetAlloc_Alloc(ISzAllocPtr pp, size_t size)
-{
-#if defined(Z7_ALLOC_NO_OFFSET_ALLOCATOR)
-  UNUSED_VAR(pp)
-  return z7_AlignedAlloc(size);
-#else
-  const CAlignOffsetAlloc *p = Z7_CONTAINER_FROM_VTBL_CONST(pp, CAlignOffsetAlloc, vt);
-  void *adr;
-  void *pAligned;
-  size_t newSize;
-  size_t extra;
-  size_t alignSize = (size_t)1 << p->numAlignBits;
-
-  if (alignSize < sizeof(void *))
-    alignSize = sizeof(void *);
-  
-  if (p->offset >= alignSize)
-    return NULL;
-
-  /* also we can allocate additional dummy ALLOC_ALIGN_SIZE bytes after aligned
-     block to prevent cache line sharing with another allocated blocks */
-  extra = p->offset & (sizeof(void *) - 1);
-  newSize = size + alignSize + extra + ADJUST_ALLOC_SIZE;
-  if (newSize < size)
-    return NULL;
-
-  adr = ISzAlloc_Alloc(p->baseAlloc, newSize);
-  
-  if (!adr)
-    return NULL;
-
-  pAligned = (char *)MY_ALIGN_PTR_DOWN((char *)adr +
-      alignSize - p->offset + extra + ADJUST_ALLOC_SIZE, alignSize) + p->offset;
-
-#if 0
-  printf("\nalignSize = %6x, offset=%6x, size=%8x \n", (unsigned)alignSize, (unsigned)p->offset, (unsigned)size);
-  PrintPtr("base", adr);
-  PrintPtr("alig", pAligned);
-#endif
-
-  PrintLn();
-  Print("- Aligned: ");
-  Print(" size="); PrintHex(size, 8);
-  Print(" a_size="); PrintHex(newSize, 8);
-  Print(" ptr="); PrintAddr(adr);
-  Print(" a_ptr="); PrintAddr(pAligned);
-  PrintLn();
-
-  REAL_BLOCK_PTR_VAR(pAligned) = adr;
-
-  return pAligned;
-#endif
-}
-
-
-static void AlignOffsetAlloc_Free(ISzAllocPtr pp, void *address)
-{
-#if defined(Z7_ALLOC_NO_OFFSET_ALLOCATOR)
-  UNUSED_VAR(pp)
-  z7_AlignedFree(address);
-#else
-  if (address)
-  {
-    const CAlignOffsetAlloc *p = Z7_CONTAINER_FROM_VTBL_CONST(pp, CAlignOffsetAlloc, vt);
-    PrintLn();
-    Print("- Aligned Free: ");
-    PrintLn();
-    ISzAlloc_Free(p->baseAlloc, REAL_BLOCK_PTR_VAR(address));
-  }
-#endif
-}
-
-
-void AlignOffsetAlloc_CreateVTable(CAlignOffsetAlloc *p)
-{
-  p->vt.Alloc = AlignOffsetAlloc_Alloc;
-  p->vt.Free = AlignOffsetAlloc_Free;
-}
