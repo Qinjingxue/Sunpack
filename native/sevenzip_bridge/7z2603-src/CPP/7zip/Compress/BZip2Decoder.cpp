@@ -978,6 +978,8 @@ private:
   std::deque<CParallelBlockJob *> _queue;
   std::mutex _mutex;
   std::condition_variable _workEvent;
+  std::condition_variable _idleEvent;
+  size_t _pending;
   unsigned _activeWorkers;
   unsigned _runningWorkers;
   bool _stop;
@@ -1013,8 +1015,12 @@ private:
         std::lock_guard<std::mutex> lock(_mutex);
         if (_runningWorkers != 0)
           --_runningWorkers;
-        if (!_queue.empty() &&
-            (_stop || _runningWorkers < _activeWorkers))
+        if (_pending != 0)
+          --_pending;
+        if (_pending == 0)
+          _idleEvent.notify_all();
+        else if (!_queue.empty() &&
+                 (_stop || _runningWorkers < _activeWorkers))
           _workEvent.notify_one();
       }
     }
@@ -1022,7 +1028,8 @@ private:
 
 public:
   CParallelBlockPool()
-      : _activeWorkers(0),
+      : _pending(0),
+        _activeWorkers(0),
         _runningWorkers(0),
         _stop(false)
   {
@@ -1064,8 +1071,15 @@ public:
     return { _queue.size(), _runningWorkers, _activeWorkers };
   }
 
+  void WaitIdle()
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _idleEvent.wait(lock, [this] { return _pending == 0; });
+  }
+
   void Stop()
   {
+    WaitIdle();
     {
       std::lock_guard<std::mutex> lock(_mutex);
       _stop = true;
@@ -1083,6 +1097,7 @@ public:
   {
     {
       std::lock_guard<std::mutex> lock(_mutex);
+      ++_pending;
       _queue.push_back(job);
     }
     _workEvent.notify_one();
@@ -1563,6 +1578,7 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
     ~CParallelSession()
     {
+      Pool.WaitIdle();
       Pool.SetActiveWorkers(0);
       if (CpuContext && Credits)
         sunpack_cpu_release_extra_for_context(
