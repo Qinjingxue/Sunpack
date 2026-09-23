@@ -335,7 +335,35 @@ static HRESULT DecodePositionedLzma2Run(
 
     if (runOut == run.OutSize && readRem == 0 && inPos == inLim)
     {
-      if (run.Final && !finishedWithMark)
+      /*
+        Intermediate reset-runs end immediately before the next reset control,
+        so the archive doesn't contain an end marker for that independent unit.
+        Close it with a synthetic 0x00 control solely inside this worker and
+        require the decoder to accept the run as a complete LZMA2 stream. The
+        synthetic byte is never counted as packed input.
+      */
+      if (!finishedWithMark && !run.Final)
+      {
+        const Byte endMarker = 0;
+        SizeT endSize = 1;
+        const SizeT before = worker.Dec.decoder.dicPos;
+        ELzmaStatus endStatus = LZMA_STATUS_NOT_SPECIFIED;
+        const SRes endRes = Lzma2Dec_DecodeToDic(
+            &worker.Dec,
+            before,
+            &endMarker,
+            &endSize,
+            LZMA_FINISH_END,
+            &endStatus);
+        if (endRes != SZ_OK ||
+            endSize != 1 ||
+            worker.Dec.decoder.dicPos != before ||
+            endStatus != LZMA_STATUS_FINISHED_WITH_MARK)
+          return SResToHRESULT(SZ_ERROR_DATA);
+        finishedWithMark = true;
+      }
+
+      if (!finishedWithMark)
         return SResToHRESULT(SZ_ERROR_DATA);
       return S_OK;
     }
@@ -445,9 +473,13 @@ static HRESULT DecodePositionedLzma2Run(
         continue;
       if (runOut < run.OutSize)
         return SResToHRESULT(SZ_ERROR_INPUT_EOF);
-      if (run.Final && !finishedWithMark)
-        return SResToHRESULT(SZ_ERROR_DATA);
-      return (inPos == inLim && readRem == 0) ? S_OK : E_FAIL;
+      /*
+        Once output is complete, loop once more through the top-of-loop
+        completion path so intermediate runs receive their synthetic marker.
+      */
+      if (inPos == inLim && readRem == 0)
+        continue;
+      return E_FAIL;
     }
   }
 }
