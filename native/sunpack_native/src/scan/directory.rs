@@ -143,9 +143,6 @@ fn filesystem_file_route(
     if is_dir {
         return 0;
     }
-    if crate::relations::may_have_relation_filename(_path) {
-        return FILE_ROUTE_RELATIONS;
-    }
     let Some(anchor) = anchor else {
         return FILE_ROUTE_RESIDUAL;
     };
