@@ -6,6 +6,7 @@
 #include "internal/decoder_cpu_budget.h"
 #include "internal/positioned_output.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <mutex>
 #include <thread>
@@ -1096,7 +1097,7 @@ static HRESULT DecodeBlock_Positioned(
           &xzu.p,
           outBuf.data(), &destLen,
           inBuf.data() + inPos, &srcLen,
-          (readRem == 0),
+          (srcLen == 0 && readRem == 0),
           CODER_FINISH_END,
           &status);
 
