@@ -1,9 +1,9 @@
 import binascii
 import struct
+from types import SimpleNamespace
 
 import pytest
 
-from sunpack.contracts.detection import FactBag
 from sunpack.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 
 
@@ -92,7 +92,7 @@ def test_unicode_native_archive_formats_do_not_receive_zip_codepage_override():
 def test_task_metadata_cache_survives_scanner_instance_change(tmp_path):
     archive = tmp_path / "cached.zip"
     _write_stored_zip(archive, b"plain.txt", b"payload")
-    task = type("Task", (), {"fact_bag": FactBag()})()
+    task = SimpleNamespace(runtime={})
 
     first = ArchiveMetadataScanner().scan_for_task(task, str(archive), format_hint="zip")
     second_scanner = ArchiveMetadataScanner()
