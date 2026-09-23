@@ -3,6 +3,13 @@
 #include "StdAfx.h"
 
 #include "../../../C/Alloc.h"
+#include "internal/decoder_cpu_budget.h"
+#include "internal/positioned_output.hpp"
+
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
 
 #include "../../Common/ComTry.h"
 #include "../../Common/Defs.h"
@@ -993,6 +1000,323 @@ Z7_COM7F_IMF(CHandler::GetStream(UInt32 index, ISequentialInStream **stream))
 }
 
 
+
+class CParallelXzSource
+{
+public:
+  explicit CParallelXzSource(IInStream *stream):
+      _stream(stream),
+      _pos((UInt64)(Int64)-1)
+  {}
+
+  HRESULT ReadAt(UInt64 pos, void *data, UInt32 size, UInt32 *processed)
+  {
+    std::lock_guard<std::mutex> lock(_mutex);
+    if (processed)
+      *processed = 0;
+    if (!_stream)
+      return E_FAIL;
+    if (_pos != pos)
+    {
+      RINOK(_stream->Seek((Int64)pos, STREAM_SEEK_SET, &_pos))
+    }
+    UInt32 realProcessed = 0;
+    const HRESULT res = _stream->Read(data, size, &realProcessed);
+    _pos += realProcessed;
+    if (processed)
+      *processed = realProcessed;
+    return res;
+  }
+
+private:
+  IInStream *_stream;
+  UInt64 _pos;
+  std::mutex _mutex;
+};
+
+
+static HRESULT DecodeBlock_Positioned(
+    CXzUnpackerCPP2 &xzu,
+    CParallelXzSource &source,
+    const CBlockInfo &block,
+    UInt64 unpackSize,
+    sunpack::sevenzip::PositionedOutStream &outStream,
+    std::atomic<bool> &stop,
+    SRes &decodeRes)
+{
+  const size_t kInBufSize = (size_t)1 << 18;
+  const size_t kOutBufSize = (size_t)1 << 20;
+
+  decodeRes = SZ_OK;
+
+  try
+  {
+    std::vector<Byte> inBuf(kInBufSize);
+    std::vector<Byte> outBuf(kOutBufSize);
+
+    XzUnpacker_Init(&xzu.p);
+    xzu.p.streamFlags = (UInt16)block.StreamFlags;
+    XzUnpacker_PrepareToRandomBlockDecoding(&xzu.p);
+
+    const UInt64 packSizeAligned =
+        block.PackSize + ((0 - (unsigned)block.PackSize) & 3);
+    UInt64 readRem = packSizeAligned;
+    UInt64 readPos = block.PackPos;
+    UInt64 outPos = 0;
+
+    size_t inPos = 0;
+    size_t inSize = 0;
+
+    for (;;)
+    {
+      if (stop.load(std::memory_order_acquire))
+        return E_ABORT;
+
+      if (inPos == inSize && readRem != 0)
+      {
+        UInt32 ask = (UInt32)(std::min<UInt64>)(readRem, kInBufSize);
+        UInt32 got = 0;
+        RINOK(source.ReadAt(readPos, inBuf.data(), ask, &got))
+        if (got == 0)
+        {
+          decodeRes = SZ_ERROR_INPUT_EOF;
+          return S_OK;
+        }
+        readPos += got;
+        readRem -= got;
+        inPos = 0;
+        inSize = got;
+      }
+
+      SizeT srcLen = inSize - inPos;
+      SizeT destLen = kOutBufSize;
+      ECoderStatus status;
+
+      const SRes res = XzUnpacker_Code(
+          &xzu.p,
+          outBuf.data(), &destLen,
+          inBuf.data() + inPos, &srcLen,
+          (readRem == 0),
+          CODER_FINISH_END,
+          &status);
+
+      inPos += srcLen;
+
+      if (res != SZ_OK)
+      {
+        decodeRes = res;
+        return S_OK;
+      }
+
+      if (destLen != 0)
+      {
+        if (outPos > unpackSize || destLen > unpackSize - outPos)
+        {
+          decodeRes = SZ_ERROR_DATA;
+          return S_OK;
+        }
+
+        UInt32 written = 0;
+        const HRESULT writeRes = outStream.write_at(
+            block.UnpackPos + outPos,
+            outBuf.data(),
+            (UInt32)destLen,
+            &written);
+        if (writeRes != S_OK)
+          return writeRes;
+        if (written != destLen)
+          return E_FAIL;
+        outPos += destLen;
+      }
+
+      const BoolInt blockFinished = XzUnpacker_IsBlockFinished(&xzu.p);
+      if (blockFinished)
+      {
+        if (readRem != 0 || inPos != inSize ||
+            outPos != unpackSize ||
+            XzUnpacker_GetPackSizeForIndex(&xzu.p) != block.PackSize)
+        {
+          decodeRes = SZ_ERROR_DATA;
+        }
+        return S_OK;
+      }
+
+      if (srcLen == 0 && destLen == 0 && readRem == 0 && inPos == inSize)
+      {
+        decodeRes = SZ_ERROR_INPUT_EOF;
+        return S_OK;
+      }
+    }
+  }
+  catch (...)
+  {
+    return E_OUTOFMEMORY;
+  }
+}
+
+
+static HRESULT DecodeBlocks_Positioned(
+    CHandler &handler,
+    sunpack::sevenzip::PositionedOutStream &outStream,
+    UInt32 threadHint,
+    ICompressProgressInfo *progress,
+    SRes &decodeRes)
+{
+  decodeRes = SZ_OK;
+
+  if (!handler._stream || !handler._blocks || handler._blocksArraySize < 2)
+    return E_NOTIMPL;
+
+  const size_t numBlocks = handler._blocksArraySize - 1;
+  if (numBlocks == 0)
+    return E_NOTIMPL;
+
+  unsigned desiredThreads =
+      (unsigned)(std::min<size_t>)(numBlocks, threadHint ? threadHint : 1);
+  if (desiredThreads == 0)
+    desiredThreads = 1;
+
+  void *cpuContext = sunpack_cpu_current_job_context();
+  unsigned extraCredits = 0;
+  if (cpuContext)
+  {
+    desiredThreads =
+        (unsigned)(std::min<size_t>)(numBlocks, SUNPACK_CPU_MANAGED_THREAD_HINT);
+    if (desiredThreads > 1)
+      extraCredits = sunpack_cpu_acquire_extra_for_context(
+          cpuContext, desiredThreads - 1, 1);
+    desiredThreads = 1 + extraCredits;
+  }
+
+  CParallelXzSource source(handler._stream);
+  std::atomic<size_t> nextBlock(0);
+  std::atomic<bool> stop(false);
+  std::atomic<UInt64> inDone(0);
+  std::atomic<UInt64> outDone(0);
+
+  std::mutex resultMutex;
+  std::mutex progressMutex;
+  HRESULT firstHres = S_OK;
+  SRes firstSres = SZ_OK;
+
+  auto publishFailure = [&](HRESULT hres, SRes sres)
+  {
+    std::lock_guard<std::mutex> lock(resultMutex);
+    if (firstHres == S_OK && firstSres == SZ_OK)
+    {
+      firstHres = hres;
+      firstSres = sres;
+      stop.store(true, std::memory_order_release);
+    }
+  };
+
+  auto worker = [&]()
+  {
+    void *previousContext = NULL;
+    if (cpuContext)
+      previousContext = sunpack_cpu_exchange_current_job_context(cpuContext);
+
+    CXzUnpackerCPP2 xzu;
+
+    for (;;)
+    {
+      if (stop.load(std::memory_order_acquire))
+        break;
+
+      const size_t index = nextBlock.fetch_add(1, std::memory_order_relaxed);
+      if (index >= numBlocks)
+        break;
+
+      const CBlockInfo &block = handler._blocks[index];
+      const UInt64 unpackSize =
+          handler._blocks[index + 1].UnpackPos - block.UnpackPos;
+
+      SRes blockRes = SZ_OK;
+      const HRESULT hres = DecodeBlock_Positioned(
+          xzu, source, block, unpackSize, outStream, stop, blockRes);
+
+      if (hres != S_OK || blockRes != SZ_OK)
+      {
+        publishFailure(hres, blockRes);
+        break;
+      }
+
+      const UInt64 packAligned =
+          block.PackSize + ((0 - (unsigned)block.PackSize) & 3);
+      const UInt64 inNow =
+          inDone.fetch_add(packAligned, std::memory_order_relaxed) + packAligned;
+      const UInt64 outNow =
+          outDone.fetch_add(unpackSize, std::memory_order_relaxed) + unpackSize;
+
+      if (progress)
+      {
+        std::lock_guard<std::mutex> lock(progressMutex);
+        const HRESULT progressRes = progress->SetRatioInfo(&inNow, &outNow);
+        if (progressRes != S_OK)
+        {
+          publishFailure(progressRes, SZ_OK);
+          break;
+        }
+      }
+    }
+
+    if (cpuContext)
+      sunpack_cpu_exchange_current_job_context(previousContext);
+  };
+
+  std::vector<std::thread> threads;
+  try
+  {
+    if (desiredThreads > 1)
+    {
+      threads.reserve(desiredThreads - 1);
+      for (unsigned i = 1; i < desiredThreads; ++i)
+        threads.emplace_back(worker);
+    }
+
+    worker();
+
+    for (auto &thread : threads)
+      thread.join();
+  }
+  catch (...)
+  {
+    stop.store(true, std::memory_order_release);
+    for (auto &thread : threads)
+      if (thread.joinable())
+        thread.join();
+    if (cpuContext && extraCredits)
+      sunpack_cpu_release_extra_for_context(cpuContext, extraCredits);
+    return E_OUTOFMEMORY;
+  }
+
+  if (cpuContext && extraCredits)
+    sunpack_cpu_release_extra_for_context(cpuContext, extraCredits);
+
+  {
+    std::lock_guard<std::mutex> lock(resultMutex);
+    decodeRes = firstSres;
+    return firstHres;
+  }
+}
+
+
+static Int32 Get_Extract_OperationResult_From_SRes(SRes sres)
+{
+  if (sres == SZ_ERROR_NO_ARCHIVE)
+    return NExtract::NOperationResult::kIsNotArc;
+  if (sres == SZ_ERROR_INPUT_EOF)
+    return NExtract::NOperationResult::kUnexpectedEnd;
+  if (sres == SZ_ERROR_CRC)
+    return NExtract::NOperationResult::kCRCError;
+  if (sres == SZ_ERROR_UNSUPPORTED)
+    return NExtract::NOperationResult::kUnsupportedMethod;
+  if (sres == SZ_OK)
+    return NExtract::NOperationResult::kOK;
+  return NExtract::NOperationResult::kDataError;
+}
+
+
 static Int32 Get_Extract_OperationResult(const NCompress::NXz::CDecoder &decoder)
 {
   Int32 opRes;
@@ -1063,6 +1387,34 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
   else
     _needSeekToStart = true;
 
+
+  if (!testMode && _stream && _blocks && _blocksArraySize >= 2 &&
+      _stat_defined && _stat.NumBlocks_Defined &&
+      _blocksArraySize == (size_t)_stat.NumBlocks + 1)
+  {
+    sunpack::sevenzip::PositionedOutStream *positioned =
+        sunpack::sevenzip::positioned_out_stream(realOutStream);
+    if (positioned)
+    {
+      SRes positionedRes = SZ_OK;
+      const HRESULT positionedHres = DecodeBlocks_Positioned(
+          *this, *positioned,
+          #ifndef Z7_ST
+            _numThreads,
+          #else
+            1,
+          #endif
+          lps, positionedRes);
+
+      if (positionedHres != E_NOTIMPL)
+      {
+        if (positionedHres != S_OK)
+          return positionedHres;
+        opRes = Get_Extract_OperationResult_From_SRes(positionedRes);
+        return extractCallback->SetOperationResult(opRes);
+      }
+    }
+  }
 
   NCompress::NXz::CDecoder decoder;
 
