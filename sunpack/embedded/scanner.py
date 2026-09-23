@@ -24,7 +24,6 @@ _RESULT_FIELDS = frozenset({
 })
 _CANDIDATE_FIELDS = frozenset({
     "format",
-    "detected_ext",
     "offset",
     "end_offset",
     "confidence",
@@ -82,15 +81,13 @@ def _normalize_native_result(value: Any, expected_size: int) -> EmbeddedScanResu
             raise TypeError("Native scan_embedded_archives returned a non-dict candidate")
         _require_fields(row, _CANDIDATE_FIELDS, "Native scan_embedded_archives candidate")
         archive_format = str(row["format"] or "")
-        detected_ext = str(row["detected_ext"] or "")
         offset = int(row["offset"])
-        if not archive_format or not detected_ext or offset < 0:
+        if not archive_format or offset < 0:
             raise TypeError("Native scan_embedded_archives returned an invalid candidate")
         end_offset = row["end_offset"]
         range_end_offset = row["range_end_offset"]
         candidates.append(EmbeddedCandidate(
             format=archive_format,
-            detected_ext=detected_ext,
             offset=offset,
             end_offset=None if end_offset is None else int(end_offset),
             confidence=float(row["confidence"]),
@@ -154,7 +151,6 @@ def embedded_result_from_dict(value: dict[str, Any]) -> EmbeddedScanResult:
         candidates=tuple(
             EmbeddedCandidate(
                 format=str(item["format"]),
-                detected_ext=str(item["detected_ext"]),
                 offset=int(item["offset"]),
                 end_offset=None if item["end_offset"] is None else int(item["end_offset"]),
                 confidence=float(item["confidence"]),
