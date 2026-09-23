@@ -239,7 +239,7 @@ namespace sunpack::sevenzip
 
     class ExtractCallback final : public CMyUnknownImp, public IArchiveExtractCallback, public ICryptoGetTextPassword
     {
-        Z7_COM_UNKNOWN_IMP_4(IArchiveExtractCallback, IProgress, ICryptoGetTextPassword, ISunpackPositionedExtractCallback)
+        Z7_COM_UNKNOWN_IMP_3(IArchiveExtractCallback, IProgress, ICryptoGetTextPassword)
         
 
     public:
@@ -302,7 +302,7 @@ namespace sunpack::sevenzip
 
     class SynchronousFileOutStream final : public CMyUnknownImp, public ISequentialOutStream
     {
-        Z7_COM_UNKNOWN_IMP_2(ISequentialOutStream, ISunpackPositionedOutStream)
+        Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
         
 
     public:
@@ -454,7 +454,7 @@ namespace sunpack::sevenzip
 
     class AsyncFileOutStream final : public CMyUnknownImp, public ISequentialOutStream, public ISunpackPositionedOutStream
     {
-        Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+        Z7_COM_UNKNOWN_IMP_2(ISequentialOutStream, ISunpackPositionedOutStream)
         
 
     public:
@@ -705,7 +705,7 @@ namespace sunpack::sevenzip
 
     class ExtractToDiskCallback final : public CMyUnknownImp, public IArchiveExtractCallback, public ICryptoGetTextPassword, public ISunpackPositionedExtractCallback
     {
-        Z7_COM_UNKNOWN_IMP_3(IArchiveExtractCallback, IProgress, ICryptoGetTextPassword)
+        Z7_COM_UNKNOWN_IMP_4(IArchiveExtractCallback, IProgress, ICryptoGetTextPassword, ISunpackPositionedExtractCallback)
         
 
     public:
