@@ -23,6 +23,32 @@ def test_plain_file_relation_omits_empty_volume_anchor(tmp_path):
     assert all(bag.get("relation.volume_anchor") is None for bag in bags)
 
 
+def test_standalone_zip_is_confirmed_by_relations(tmp_path):
+    path = tmp_path / "ordinary.zip"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_STORED) as stream:
+        stream.writestr("inside.txt", "hello")
+
+    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
+
+    assert group.kind == "file"
+    assert group.input_paths == [str(path)]
+    assert group.head_metadata["format"] == "zip"
+    assert group.head_metadata["standalone"] is True
+    assert group.head_metadata["relation_confirmed"] is True
+
+
+def test_empty_zip_is_confirmed_by_relations(tmp_path):
+    path = tmp_path / "empty.zip"
+    with zipfile.ZipFile(path, "w"):
+        pass
+
+    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
+
+    assert group.head_metadata["format"] == "zip"
+    assert group.head_metadata["standalone"] is True
+    assert group.head_metadata["relation_confirmed"] is True
+
+
 def test_filename_numbered_7z_without_structural_seed_is_not_grouped(tmp_path):
     names = ["archive.7z.001", "archive.7z.002", "archive.7z.003"]
     for name in names:
