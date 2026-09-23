@@ -135,9 +135,9 @@ static bool ApplyPositionedFilter(
 class CPositionedAlignedFilterOutStream final :
   public CMyUnknownImp,
   public ISequentialOutStream,
-  public sunpack::sevenzip::PositionedOutStream
+  public ISunpackPositionedOutStream
 {
-  Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+  Z7_COM_UNKNOWN_IMP_2(ISequentialOutStream, ISunpackPositionedOutStream)
 
   struct CPartialCell
   {
@@ -462,9 +462,9 @@ public:
 class CPositionedLookAheadFilterOutStream final :
   public CMyUnknownImp,
   public ISequentialOutStream,
-  public sunpack::sevenzip::PositionedOutStream
+  public ISunpackPositionedOutStream
 {
-  Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
+  Z7_COM_UNKNOWN_IMP_2(ISequentialOutStream, ISunpackPositionedOutStream)
 
   static const UInt64 kTileSize = (UInt64)1 << 20;
 
@@ -835,9 +835,9 @@ public:
 class CRandomLimitedSequentialInStream final :
   public CMyUnknownImp,
   public ISequentialInStream,
-  public sunpack::sevenzip::RandomAccessInStream
+  public ISunpackRandomAccessInStream
 {
-  Z7_COM_UNKNOWN_IMP_1(ISequentialInStream)
+  Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, ISunpackRandomAccessInStream)
 
   CMyComPtr<ISequentialInStream> _stream;
   CMyComPtr<IInStream> _randomOwner;
