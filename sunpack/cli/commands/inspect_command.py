@@ -7,6 +7,7 @@ from sunpack.cli.cli_runtime import (
     result_for_missing,
 )
 from sunpack.cli.cli_types import CliCommandResult
+from sunpack.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.contracts.tasks import ArchiveTask
 from sunpack.cli.persistent_runtime import load_request_config
 from sunpack.analysis import ArchiveAnalyzer
@@ -54,11 +55,10 @@ def handle(args, ctx):
     summary = {
         "total_items": len(all_items),
         "displayed_items": len(items),
-        "archive_items": sum(1 for item in all_items if item["decision"] == "archive"),
-        "maybe_archive_items": sum(1 for item in all_items if item["decision"] == "maybe_archive"),
-        "not_archive_items": sum(1 for item in all_items if item["decision"] == "not_archive"),
+        "resolved_items": sum(1 for item in all_items if item["status"] == "resolved"),
+        "blocked_items": sum(1 for item in all_items if item["status"] == "blocked"),
+        "residual_items": sum(1 for item in all_items if item["status"] == "residual"),
         "extractable_items": sum(1 for item in all_items if item["should_extract"]),
-        "encrypted_items": 0,
         "archives_only": bool(args.archives_only),
         "analyze": bool(args.analyze),
         "analyzed_items": sum(1 for item in all_items if item.get("analysis")),
@@ -69,9 +69,9 @@ def handle(args, ctx):
             ctx.t(
                 "cli.inspect.complete",
                 total=summary["total_items"],
-                archive=summary["archive_items"],
-                maybe=summary["maybe_archive_items"],
-                not_archive=summary["not_archive_items"],
+                resolved=summary["resolved_items"],
+                blocked=summary["blocked_items"],
+                residual=summary["residual_items"],
             )
         )
         if reporter.verbose:
@@ -81,17 +81,13 @@ def handle(args, ctx):
             reporter.info(ctx.t("cli.item_path", path=item["path"]))
             reporter.info(ctx.t(
                 "cli.inspect.details",
-                decision=item["decision"],
+                status=item["status"],
+                source=item["discovery_source"] or "-",
+                format=item["format"] or "-",
                 extract=ctx.t("common.yes" if item["should_extract"] else "common.no"),
-                detected=item["format"] or "-",
             ))
-            reporter.info(ctx.t("cli.inspect.decision_trace",
-                stage=item.get("decision_stage") or "-",
-                discarded_at=item.get("discarded_at") or "-",
-                rule=item.get("deciding_rule") or "-",
-            ))
-            if item.get("stop_reason"):
-                reporter.info(ctx.t("cli.inspect.stop_reason", reason=item["stop_reason"]))
+            if item.get("reason"):
+                reporter.info(ctx.t("cli.inspect.reason", reason=item["reason"]))
             if args.analyze and item.get("analysis"):
                 analysis = item["analysis"]
                 reporter.info(ctx.t("cli.inspect.analysis",
@@ -104,10 +100,6 @@ def handle(args, ctx):
                 candidates = _candidate_label(analysis.get("candidates") or [])
                 if candidates:
                     reporter.info(ctx.t("cli.inspect.analysis_candidates", candidates=candidates))
-            if reporter.verbose and item["reasons"]:
-                reporter.info(ctx.t("cli.inspect.matched_rules", rules=", ".join(item["reasons"])))
-            if reporter.verbose and item.get("fact_errors"):
-                reporter.info(ctx.t("cli.inspect.fact_errors", errors=to_json_text(item["fact_errors"], pretty=False)))
 
     return 0, CliCommandResult(
         command=COMMAND,
@@ -166,28 +158,27 @@ def _analysis_preview_by_path(results, config: dict) -> dict[str, dict]:
 
 
 def _should_analyze_result(result) -> bool:
-    return bool(getattr(result, "should_extract", False) or getattr(result, "decision", "") == "maybe_archive")
+    return bool(getattr(result, "should_extract", False))
 
 
 def _task_from_inspect_result(result) -> ArchiveTask:
-    if result.resolved is not None:
-        return ArchiveTask.from_resolved_input(result.resolved)
-    candidate = result.candidate
-    descriptor = candidate.archive_input
-    if descriptor is None:
-        from sunpack.contracts.archive_input import ArchiveInputDescriptor
+    if isinstance(result.archive_input, dict):
+        descriptor = ArchiveInputDescriptor.from_any(
+            result.archive_input,
+            archive_path=result.path,
+            format_hint=result.format,
+        )
+    else:
         descriptor = ArchiveInputDescriptor.from_parts(
-            archive_path=candidate.entry_path,
-            part_paths=list(candidate.member_paths or (candidate.entry_path,)),
-            format_hint=candidate.format_hint,
-            logical_name=candidate.logical_name,
+            archive_path=result.path,
+            part_paths=[result.path],
+            format_hint=result.format,
+            logical_name=result.path,
         )
     return ArchiveTask.from_archive_input(
         descriptor,
-        carrier_path=candidate.carrier_path,
-        cleanup_paths=list(candidate.cleanup_paths),
-        discovery_source="inspect",
-        relation_kind=candidate.relation_kind,
+        discovery_source=result.source or "inspect",
+        discovery_reason=result.reason,
     )
 
 def _analysis_summary(task: ArchiveTask, report) -> dict:
