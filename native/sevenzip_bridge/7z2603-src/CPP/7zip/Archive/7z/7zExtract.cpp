@@ -754,11 +754,21 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
     }
 
     {
+      bool allowPositioned = false;
+      if (allFilesMode && testModeSpec == 0 && folderIndex != kNumNoIndex)
+      {
+        CFolderEx folderInfo;
+        _db.ParseFolderEx(folderIndex, folderInfo);
+        allowPositioned =
+            folderInfo.UnpackCoder < folderInfo.Coders.Size() &&
+            folderInfo.Coders[folderInfo.UnpackCoder].MethodID == k_LZMA2;
+      }
+
       const HRESULT result = folderOutStream->Init(
           fileIndex,
           allFilesMode ? NULL : indices + i,
           numSolidFiles,
-          allFilesMode && testModeSpec == 0);
+          allowPositioned);
 
       i += numSolidFiles;
 
