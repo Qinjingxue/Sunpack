@@ -614,6 +614,11 @@ public:
     return result;
   }
 
+  bool positioned_available() const noexcept override
+  {
+    return _folder && _folder->IsPositionedMode();
+  }
+
   HRESULT write_at(
       UInt64 offset,
       const void *data,
