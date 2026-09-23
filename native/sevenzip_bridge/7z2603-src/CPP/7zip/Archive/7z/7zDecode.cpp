@@ -90,6 +90,9 @@ static size_t ProcessPositionedFilter(
     size_t size,
     UInt32 pc)
 {
+  if (size == 0)
+    return 0;
+
   switch (method)
   {
     case k_ARM64:
