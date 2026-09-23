@@ -11,6 +11,7 @@ from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.coordinator.target_scan import build_fact_bags_for_target
 from sunpack.coordinator.target_groups import relation_group_to_fact_bag
 from sunpack.relations import RelationsScheduler
+from sunpack.relations.internal.group_builder import _relation_archive_input
 from tests.helpers.fs_builder import make_minimal_7z
 
 
@@ -125,6 +126,11 @@ def test_pe_zip_sfx_is_confirmed_and_projected_as_file_range(tmp_path):
     ).to_source_input()
     assert source_input["kind"] == "file_range"
     assert source_input["start"] == pe_end
+
+    password_input = _relation_archive_input(group)
+    assert password_input["open_mode"] == "file_range"
+    assert password_input["parts"][0]["start"] == pe_end
+    assert password_input["segment"]["start"] == pe_end
 
 
 def test_filename_numbered_7z_without_structural_seed_is_not_grouped(tmp_path):
