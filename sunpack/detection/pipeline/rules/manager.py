@@ -81,6 +81,7 @@ class RuleManager:
         archive_input = bag.get("archive.input") or {}
         for value in (
             archive_input.get("format_hint") if isinstance(archive_input, dict) else "",
+            bag.get("filesystem.format_hint"),
             bag.get("relation.format_hint"),
             bag.get("relation.split_family"),
         ):
