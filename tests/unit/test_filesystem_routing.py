@@ -16,11 +16,28 @@ from sunpack.coordinator.scan_session import DetectionScanSession
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 
 
+def _basename(path: str) -> str:
+    return path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+
+
 def _routing_by_name(snapshot):
-    return {
-        path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]: (route, format_hint)
+    routes = {
+        _basename(path): (route, format_hint)
         for path, _size, route, format_hint, _reject_mask in snapshot.non_relation_file_routing_rows()
     }
+    relation_names = {
+        _basename(path)
+        for path, _size, _mtime in snapshot.file_route_view(
+            FILESYSTEM_ROUTE_RELATIONS
+        ).iter_file_columns()
+    }
+    anchors = {
+        _basename(path): anchor
+        for path, _size, anchor in snapshot.iter_relation_anchor_rows()
+    }
+    for name in relation_names:
+        routes[name] = ("relations", str((anchors.get(name) or {}).get("format") or ""))
+    return routes
 
 
 def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp_path):
@@ -57,14 +74,14 @@ def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp
     detection_view = snapshot.file_route_view(FILESYSTEM_ROUTE_DETECTION)
     residual_view = snapshot.file_route_view(FILESYSTEM_ROUTE_RESIDUAL)
 
-    assert {path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] for path, _, _ in relation_view.iter_file_columns()} == {
+    assert {_basename(path) for path, _, _ in relation_view.iter_file_columns()} == {
         "empty.zip",
     }
-    assert {path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] for path, _, _ in detection_view.iter_file_columns()} == {
+    assert {_basename(path) for path, _, _ in detection_view.iter_file_columns()} == {
         "payload.gz",
         "payload.tar",
     }
-    assert {path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] for path, _, _ in residual_view.iter_file_columns()} == {
+    assert {_basename(path) for path, _, _ in residual_view.iter_file_columns()} == {
         "plain.bin",
         "payload.7z.002",
     }
