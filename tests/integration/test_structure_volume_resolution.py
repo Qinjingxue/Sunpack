@@ -79,9 +79,7 @@ def test_mixed_directory_schedules_only_one_structural_head_per_format(mixed_rea
             {},
             precheck=[
                 {"name": "size_range", "enabled": True, "gte": 0},
-                {"name": "seven_zip_structure_accept", "enabled": True},
-                {"name": "zip_structure_accept", "enabled": True},
-                {"name": "rar_structure_accept", "enabled": True},
+                {"name": "relation_archive_accept", "enabled": True},
             ],
         )
     )
@@ -116,7 +114,7 @@ def test_pipeline_uses_initial_structure_group_without_missing_volume_retry(
             },
             precheck=[
                 {"name": "size_range", "enabled": True, "gte": 0},
-                {"name": "seven_zip_structure_accept", "enabled": True},
+                {"name": "relation_archive_accept", "enabled": True},
             ],
         )
     )
@@ -321,14 +319,14 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path):
             },
             precheck=[
                 {"name": "size_range", "enabled": True, "gte": 0},
-                {"name": "zip_structure_accept", "enabled": True},
+                {"name": "relation_archive_accept", "enabled": True},
             ],
         )
     )
     tasks = ArchiveTaskProvider(config).scan_targets([str(mixed)])
 
     assert len(tasks) == 1
-    assert tasks[0].matched_rules == ["zip_structure_accept"]
+    assert tasks[0].matched_rules == ["relation_archive_accept"]
     descriptor = tasks[0].archive_input()
     assert descriptor.volume_style == "zip_spanned"
     assert [part.volume_number for part in descriptor.parts] == [1, 2, 3, 4]
@@ -380,7 +378,7 @@ def test_embedded_7z_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_
             },
             precheck=[
                 {"name": "size_range", "enabled": True, "gte": 0},
-                {"name": "seven_zip_structure_accept", "enabled": True},
+                {"name": "relation_archive_accept", "enabled": True},
                 {"name": "embedded_payload_identity", "enabled": True},
             ],
         )
@@ -449,7 +447,7 @@ def test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tm
             },
             precheck=[
                 {"name": "size_range", "enabled": True, "gte": 0},
-                {"name": "rar_structure_accept", "enabled": True},
+                {"name": "relation_archive_accept", "enabled": True},
                 {"name": "embedded_payload_identity", "enabled": True},
             ],
         )
