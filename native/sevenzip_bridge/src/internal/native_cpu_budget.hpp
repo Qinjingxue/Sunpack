@@ -50,7 +50,6 @@ struct NativeCpuJobSnapshot
 {
     std::size_t current_extra_credits = 0;
     std::size_t peak_extra_credits = 0;
-    std::size_t total_extra_credits_granted = 0;
 };
 
 class NativeCpuJobContext final
@@ -71,7 +70,6 @@ private:
     NativeCpuBudget *budget_;
     std::atomic<std::size_t> current_extra_{0};
     std::atomic<std::size_t> peak_extra_{0};
-    std::atomic<std::size_t> total_extra_granted_{0};
 };
 
 class NativeCpuContextScope final
