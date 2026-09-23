@@ -1811,12 +1811,7 @@ fn password_error_proposal_to_dict(
     }
     if let Some(metadata) = metadata.as_ref() {
         let metadata = metadata.bind(py);
-        if !metadata.contains("format")? {
-            metadata.set_item("format", &proposal.format)?;
-        }
-        if !metadata.contains("confidence")? {
-            metadata.set_item("confidence", "strong")?;
-        }
+        metadata.set_item("format", &proposal.format)?;
         metadata.set_item("relation_confirmed", true)?;
         metadata.set_item("needs_password", true)?;
         metadata.set_item("proposal_paths", proposal_owned_paths(proposal))?;
