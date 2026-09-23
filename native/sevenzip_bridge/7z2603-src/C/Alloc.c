@@ -381,7 +381,10 @@ BoolInt SunpackFileBuffer_Ensure(CSunpackFileBuffer *p, size_t size)
   if (p->data && p->capacity >= size)
     return True;
   if (p->fileBacked && p->capacity >= size)
-    return SunpackFileBuffer_MapExisting(p, size);
+  {
+    if (SunpackFileBuffer_MapExisting(p, size))
+      return True;
+  }
 
   SunpackFileBuffer_Release(p);
 
