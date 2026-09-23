@@ -4,8 +4,7 @@ import zipfile
 
 import pytest
 
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.contracts.extraction import ExtractionResult
 from sunpack.verification import VerificationScheduler
 from sunpack.verification import archive_state_manifest as archive_state_manifest_module
@@ -191,7 +190,7 @@ def test_archive_test_crc_compares_archive_state_manifest_to_output_files(tmp_pa
     out_dir.mkdir()
     (out_dir / "good.txt").write_text("hello", encoding="utf-8")
     (out_dir / "bad.txt").write_text("oops", encoding="utf-8")
-    task = ArchiveTask(fact_bag=FactBag(), key="sample", main_path=str(archive), all_parts=[str(archive)], detected_ext="zip")
+    task = make_archive_task(archive, key="sample", format_hint="zip")
     result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
 
     verification = _scheduler([{"name": "archive_test_crc"}]).verify(task, result)
@@ -222,10 +221,7 @@ def test_zip_verification_methods_share_one_full_archive_manifest(tmp_path, monk
     out_dir.mkdir()
     for name, payload in expected.items():
         (out_dir / name).write_bytes(payload)
-    task = ArchiveTask(
-        fact_bag=FactBag(), key="shared", main_path=str(archive),
-        all_parts=[str(archive)], detected_ext="zip",
-    )
+    task = make_archive_task(archive, key="shared", format_hint="zip")
     result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
     calls = []
     native_manifest = archive_state_manifest_module._native_archive_state_zip_manifest
@@ -249,13 +245,7 @@ def test_archive_test_crc_unsupported_empty_failed_extraction_is_not_complete(tm
     archive = tmp_path / "sample.7z"
     archive.write_bytes(b"7z damaged")
     out_dir = tmp_path / "missing-output"
-    task = ArchiveTask(
-        fact_bag=FactBag(),
-        key="sample-7z",
-        main_path=str(archive),
-        all_parts=[str(archive)],
-        detected_ext="7z",
-    )
+    task = make_archive_task(archive, key="sample-7z", format_hint="7z")
     result = ExtractionResult(
         success=False,
         archive=str(archive),
@@ -318,8 +308,7 @@ def test_output_presence_uses_worker_manifest_progress_as_completeness(tmp_path)
 def _task(tmp_path, oracle=None):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"zip")
-    bag = FactBag()
-    task = ArchiveTask(fact_bag=bag, key="sample", main_path=str(archive), all_parts=[str(archive)])
+    task = make_archive_task(archive, key="sample", format_hint="zip")
     knowledge = task.knowledge()
     if oracle is not None:
         knowledge.set("verification.oracle", oracle, source_layer="test", source_module="fixture")
@@ -341,10 +330,4 @@ def _zip_task(tmp_path, entries):
     with zipfile.ZipFile(archive, "w") as zf:
         for name, payload in entries.items():
             zf.writestr(name, payload)
-    return ArchiveTask(
-        fact_bag=FactBag(),
-        key="sample",
-        main_path=str(archive),
-        all_parts=[str(archive)],
-        detected_ext="zip",
-    )
+    return make_archive_task(archive, key="sample", format_hint="zip")
