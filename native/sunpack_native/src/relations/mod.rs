@@ -276,13 +276,7 @@ fn build_candidate_groups_from_physical(
                 let sfx_seed = row.anchor.as_ref().is_some_and(|anchor| {
                     anchor.sfx
                         && !anchor.pe_structure
-                        && (
-                            anchor.evidence.iter().any(|item| *item == "sfx:pe_header")
-                            || anchor
-                                .evidence
-                                .iter()
-                                .any(|item| *item == "zip:embedded_local_head")
-                        )
+                        && anchor.evidence.iter().any(|item| *item == "sfx:pe_header")
                 });
                 (eligible && sfx_seed).then_some(index)
             })
@@ -1128,11 +1122,7 @@ fn is_possible_sfx_launcher(anchor: &VolumeAnchor) -> bool {
             .iter()
             .any(|item| *item == "sfx:pe_header");
     let cheap_embedded_archive = matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
-        && (anchor.sfx
-            || anchor
-                .evidence
-                .iter()
-                .any(|item| *item == "zip:embedded_local_head"))
+        && anchor.sfx
         && anchor.standalone
         && anchor.structure_offset.is_some_and(|offset| offset > 0)
         && anchor.anchor_roles.iter().any(|role| *role == "first");
