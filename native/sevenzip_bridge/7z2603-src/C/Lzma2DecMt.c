@@ -589,10 +589,11 @@ static SRes Lzma2DecMt_MtCallback_Code(void *pp, unsigned coderIndex,
       }
 
       if (srcProcessed == 0 && produced == 0)
+      {
+        if (srcOffset < srcSize)
+          return SZ_ERROR_DATA;
         break;
-
-      if (srcOffset == srcSize && t->outCodeSize < t->outPreSize)
-        break;
+      }
     }
 
     *inCodePos = t->inCodeSize;
