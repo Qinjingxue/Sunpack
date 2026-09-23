@@ -273,12 +273,18 @@ fn build_candidate_groups_from_physical(
             .enumerate()
             .filter_map(|(index, row)| {
                 let eligible = filtered_keys.contains(&row.path.to_ascii_lowercase());
-                let weak_sfx = row.anchor.as_ref().is_some_and(|anchor| {
-                    anchor.format.is_empty()
-                        && anchor.sfx
-                        && anchor.evidence.iter().any(|item| *item == "sfx:pe_header")
+                let sfx_seed = row.anchor.as_ref().is_some_and(|anchor| {
+                    anchor.sfx
+                        && !anchor.pe_structure
+                        && (
+                            anchor.evidence.iter().any(|item| *item == "sfx:pe_header")
+                            || anchor
+                                .evidence
+                                .iter()
+                                .any(|item| *item == "zip:embedded_local_head")
+                        )
                 });
-                (eligible && weak_sfx).then_some(index)
+                (eligible && sfx_seed).then_some(index)
             })
             .collect();
         for index in sfx_indexes {
