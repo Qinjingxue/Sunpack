@@ -1,21 +1,19 @@
-import os
-from typing import Any, List
+from __future__ import annotations
+
+from typing import Any
 
 from sunpack_native import batch_file_head_facts as _native_batch_file_head_facts
 
 from sunpack.contracts.discovery import DiscoveryCandidate
-from sunpack.contracts.filesystem import (
-    DirectorySnapshot,
-    FILESYSTEM_ROUTE_RELATIONS,
-)
-from sunpack.coordinator.target_groups import relation_group_to_candidate
+from sunpack.contracts.filesystem import DirectorySnapshot, FILESYSTEM_ROUTE_RELATIONS
+from sunpack.coordinator.target_groups import filesystem_candidate, relation_group_to_candidate
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.relations import CandidateGroup, RelationsScheduler
 from sunpack.support.path_keys import normalized_path, path_key, safe_relative_path
 
 
 class DiscoveryScanSession:
-    """Directory-scoped cache for candidate construction."""
+    """Directory-scoped cache for filesystem discovery and Relations."""
 
     def __init__(
         self,
@@ -28,9 +26,9 @@ class DiscoveryScanSession:
         self.relations = relations or RelationsScheduler(self.config)
         self.include_raw_snapshots = include_raw_snapshots
         self._snapshots: dict[str, DirectorySnapshot] = {}
-        self._relation_groups: dict[str, List[CandidateGroup]] = {}
+        self._relation_groups: dict[str, list[CandidateGroup]] = {}
         self._relation_group_signatures: dict[str, str] = {}
-        self._candidates: dict[str, List[DiscoveryCandidate]] = {}
+        self._candidates: dict[str, list[DiscoveryCandidate]] = {}
         self._file_head_facts: dict[str, dict[str, Any]] = {}
         self._directory_identities: dict[str, tuple[str, int, tuple]] = {}
         self._scan_roots: list[str] = []
@@ -42,7 +40,7 @@ class DiscoveryScanSession:
             raw_root = str(root or "")
             if not raw_root:
                 continue
-            normalized = normalized_path(os.path.abspath(raw_root))
+            normalized = normalized_path(raw_root)
             key = path_key(normalized)
             if not normalized or key in seen:
                 continue
@@ -50,7 +48,6 @@ class DiscoveryScanSession:
             self._scan_roots.append(normalized)
 
     def prime_snapshot(self, directory: str, snapshot: DirectorySnapshot) -> None:
-        """Seed a complete recursive snapshot without touching the directory again."""
         self._snapshots[self._snapshot_key(directory, max_depth=None)] = snapshot
 
     def prime_file_head_columns(
@@ -60,7 +57,6 @@ class DiscoveryScanSession:
         mtimes_ns: list[int | None],
         magics: list[bytes],
     ) -> None:
-        """Seed trusted worker inventory without reopening extracted files."""
         for path, size, mtime_ns, magic in zip(paths, sizes, mtimes_ns, magics):
             normalized = normalized_path(path)
             self._file_head_facts[path_key(normalized)] = {
@@ -77,11 +73,11 @@ class DiscoveryScanSession:
         if not self._scan_roots:
             return True
         path = normalized_path(path)
-        path_scope_key = path_key(path)
-        for root in self._scan_roots:
-            if path_scope_key == path_key(root) or safe_relative_path(path, root) is not None:
-                return True
-        return False
+        key = path_key(path)
+        return any(
+            key == path_key(root) or safe_relative_path(path, root) is not None
+            for root in self._scan_roots
+        )
 
     def snapshot_for_directory(self, directory: str) -> DirectorySnapshot:
         return self._snapshot_for_directory(directory, max_depth=None)
@@ -110,7 +106,7 @@ class DiscoveryScanSession:
         *,
         refresh: bool = False,
         filesystem_routed: bool = False,
-    ) -> List[CandidateGroup]:
+    ) -> list[CandidateGroup]:
         key = self._directory_key(directory)
         cache_key = f"{key}::relations" if filesystem_routed else key
         signature = _password_signature(path_passwords)
@@ -131,7 +127,7 @@ class DiscoveryScanSession:
             self._relation_group_signatures[cache_key] = signature
         return self._relation_groups[cache_key]
 
-    def candidates_for_directory(self, directory: str) -> List[DiscoveryCandidate]:
+    def candidates_for_directory(self, directory: str) -> list[DiscoveryCandidate]:
         key = self._directory_key(directory)
         if key not in self._candidates:
             snapshot = self.snapshot_for_directory(directory)
@@ -140,14 +136,17 @@ class DiscoveryScanSession:
                 filesystem_routed=True,
             )
             candidates = [relation_group_to_candidate(group) for group in groups]
-            for path, size, route, format_hint, reject_mask in snapshot.non_relation_file_routing_rows():
-                candidates.append(_filesystem_candidate(
+            candidates.extend(
+                filesystem_candidate(
                     path,
                     size=size,
                     route=route,
                     format_hint=format_hint,
                     reject_mask=reject_mask,
-                ))
+                )
+                for path, size, route, format_hint, reject_mask
+                in snapshot.non_relation_file_routing_rows()
+            )
             self._candidates[key] = candidates
         return self._candidates[key]
 
@@ -164,7 +163,10 @@ class DiscoveryScanSession:
     ) -> dict[str, dict[str, Any]]:
         requested = [str(path) if paths_normalized else normalized_path(path) for path in paths if path]
         keyed = [(path, path_key(path)) for path in requested]
-        missing = [path for path, key in keyed if self._file_head_fetch_needed_key(key, magic_size=magic_size)]
+        missing = [
+            path for path, key in keyed
+            if self._file_head_fetch_needed_key(key, magic_size=magic_size)
+        ]
         if missing:
             rows = _native_batch_file_head_facts(missing, max(0, int(magic_size or 0)))
             seen = set()
@@ -226,38 +228,11 @@ class DiscoveryScanSession:
     def _snapshot_key(self, directory: str, max_depth: int | None) -> str:
         return f"{self._directory_key(directory)}::{max_depth}"
 
-    def _file_head_fetch_needed(self, path: str, *, magic_size: int) -> bool:
-        return self._file_head_fetch_needed_key(path_key(path), magic_size=magic_size)
-
     def _file_head_fetch_needed_key(self, key: str, *, magic_size: int) -> bool:
         facts = self._file_head_facts.get(key)
         if facts is None:
             return True
         return bool(magic_size > 0 and facts.get("is_file") and not facts.get("magic_complete"))
-
-
-
-def _filesystem_candidate(
-    path: str,
-    *,
-    size: int | None,
-    route: str,
-    format_hint: str,
-    reject_mask: int,
-) -> DiscoveryCandidate:
-    path = normalized_path(path)
-    name = os.path.basename(path)
-    return DiscoveryCandidate(
-        route=str(route or "residual"),
-        entry_path=path,
-        member_paths=(path,),
-        logical_name=name,
-        carrier_path=path,
-        cleanup_paths=(path,),
-        size=size if isinstance(size, int) else None,
-        format_hint=str(format_hint or "").lower(),
-        format_reject_mask=int(reject_mask or 0),
-    )
 
 
 def _password_signature(path_passwords: dict[str, str] | None) -> str:
