@@ -768,10 +768,11 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
         {
           const CMethodId finalMethod =
               folderInfo.Coders[folderInfo.UnpackCoder].MethodID;
-          allowPositioned = (finalMethod == k_LZMA2);
+          const bool unencrypted = !folderInfo.IsEncrypted();
+          allowPositioned = unencrypted && (finalMethod == k_LZMA2);
 
           if (!allowPositioned &&
-              !folderInfo.IsEncrypted() &&
+              unencrypted &&
               folderInfo.Coders.Size() == 2 &&
               folderInfo.Bonds.Size() == 1 &&
               folderInfo.PackStreams.Size() == 1)
