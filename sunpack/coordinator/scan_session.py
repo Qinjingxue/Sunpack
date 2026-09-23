@@ -14,7 +14,7 @@ from sunpack.relations import CandidateGroup, RelationsScheduler
 from sunpack.support.path_keys import normalized_path, path_key, safe_relative_path
 
 
-class DetectionScanSession:
+class DiscoveryScanSession:
     """Directory-scoped cache for candidate construction."""
 
     def __init__(
