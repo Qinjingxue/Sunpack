@@ -2,6 +2,7 @@
 #include "internal/sevenzip_volume_registry.hpp"
 #include "internal/sevenzip_volume_state.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
