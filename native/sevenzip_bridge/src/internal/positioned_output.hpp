@@ -1,6 +1,6 @@
 #pragma once
 
-#include "../../../7z2603-src/CPP/7zip/IStream.h"
+#include "../../7z2603-src/CPP/7zip/IStream.h"
 
 namespace sunpack::sevenzip
 {
