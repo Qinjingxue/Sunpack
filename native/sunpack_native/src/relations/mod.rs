@@ -1732,12 +1732,16 @@ fn validated_proposal_to_dict(
     dict.set_item("is_split_candidate", true)?;
     dict.set_item("head_size", head_anchor.map(|anchor| anchor.size))?;
     dict.set_item("split_volumes", PyList::new(py, &volume_dicts)?)?;
-    dict.set_item(
-        "head_metadata",
-        head_anchor
-            .map(|anchor| relation_confirmed_anchor_to_dict(py, anchor))
-            .transpose()?,
-    )?;
+    let metadata = if let Some(anchor) = head_anchor {
+        relation_confirmed_anchor_to_dict(py, anchor)?
+    } else {
+        let metadata = PyDict::new(py);
+        metadata.set_item("format", &proposal.format)?;
+        metadata.set_item("confidence", "strong")?;
+        metadata.set_item("relation_confirmed", true)?;
+        metadata.unbind()
+    };
+    dict.set_item("head_metadata", metadata)?;
     dict.set_item("companion_paths", &proposal.companions)?;
     dict.set_item("carrier_path", &carrier)?;
     dict.set_item("carrier_size", carrier_size)?;
@@ -1806,9 +1810,17 @@ fn password_error_proposal_to_dict(
         metadata = Some(PyDict::new(py).unbind());
     }
     if let Some(metadata) = metadata.as_ref() {
-        metadata.bind(py).set_item("needs_password", true)?;
-        metadata.bind(py).set_item("proposal_paths", proposal_owned_paths(proposal))?;
-        metadata.bind(py).set_item("password_scope", &proposal.logical_name)?;
+        let metadata = metadata.bind(py);
+        if !metadata.contains("format")? {
+            metadata.set_item("format", &proposal.format)?;
+        }
+        if !metadata.contains("confidence")? {
+            metadata.set_item("confidence", "strong")?;
+        }
+        metadata.set_item("relation_confirmed", true)?;
+        metadata.set_item("needs_password", true)?;
+        metadata.set_item("proposal_paths", proposal_owned_paths(proposal))?;
+        metadata.set_item("password_scope", &proposal.logical_name)?;
     }
     dict.set_item("head_metadata", metadata)?;
     dict.set_item("companion_paths", &proposal.companions)?;
