@@ -21,11 +21,11 @@ class FormatConfirmation:
     ) -> tuple[StageResult, list[DetectionResult]]:
         del scan_session
         result = StageResult()
-        decisions = self.detector.evaluate_candidates(candidates)
-        for item in decisions:
+        decisions: list[DetectionResult] = []
+        for item in self.detector.evaluate_candidates(candidates):
             candidate = item.candidate
             if item.decision.should_extract:
-                result.add_resolved(ResolvedArchiveInput.from_candidate(
+                resolved = ResolvedArchiveInput.from_candidate(
                     candidate,
                     "detection",
                     {
@@ -33,8 +33,16 @@ class FormatConfirmation:
                         "reason": item.decision.stop_reason,
                     },
                     reasons=(item.decision.stop_reason or "",),
+                )
+                result.add_resolved(resolved)
+                decisions.append(DetectionResult(
+                    candidate,
+                    item.decision,
+                    item.format,
+                    resolved,
                 ))
             else:
                 result.residual_paths.update(candidate_paths(candidate))
+                decisions.append(item)
         result.validate()
         return result, decisions
