@@ -2,7 +2,7 @@ from pathlib import Path
 
 from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
 from sunpack.coordinator.scanner import ScanOrchestrator
-from sunpack.detection import DetectionScheduler
+from sunpack.coordinator.task_provider import ArchiveTaskProvider
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.fs_builder import make_zip
 
@@ -27,11 +27,11 @@ def scan_config(blocked_files=None, blocked_extensions=None):
 
 
 def decisions_for(root: Path, config: dict):
-    detector = DetectionScheduler(config)
-    from sunpack.coordinator.target_scan import build_fact_bags_for_targets
-    bags = build_fact_bags_for_targets([str(root)], config=config)
-    decisions = detector.evaluate_pool(bags)
-    return {Path(bag.get("file.path")).relative_to(root).as_posix(): decisions[bag] for bag in bags}
+    result = ArchiveTaskProvider(config).discover_targets([str(root)])
+    return {
+        Path(item.entry_path).relative_to(root).as_posix(): item
+        for item in result.resolved_inputs
+    }
 
 
 def test_blacklist_does_not_filter_directories_or_paths(tmp_path):
@@ -42,8 +42,8 @@ def test_blacklist_does_not_filter_directories_or_paths(tmp_path):
 
     decisions = decisions_for(tmp_path, scan_config(blocked_files=["weapon"]))
 
-    assert decisions["keep.zip"].should_extract
-    assert decisions["FBX/weapon/payload.zip"].should_extract
+    assert "keep.zip" in decisions
+    assert "FBX/weapon/payload.zip" in decisions
 
 
 def test_blacklist_filters_exact_file_names_anywhere(tmp_path):
@@ -56,7 +56,7 @@ def test_blacklist_filters_exact_file_names_anywhere(tmp_path):
 
     decisions = decisions_for(tmp_path, scan_config(blocked_files=["demo.zip"]))
 
-    assert decisions["keep.zip"].should_extract
+    assert "keep.zip" in decisions
     assert "demo.zip" not in decisions
     assert "FBX/weapon/demo.zip" not in decisions
 
