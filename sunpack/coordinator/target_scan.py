@@ -2,7 +2,7 @@ import os
 from typing import List
 
 from sunpack.contracts.discovery import DiscoveryCandidate
-from sunpack.coordinator.scan_session import DetectionScanSession
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.relations.scheduler import RelationsScheduler
 from sunpack.support.path_keys import normalized_path, path_key, safe_relative_path
 
@@ -48,17 +48,17 @@ def _candidate_rank(candidate: DiscoveryCandidate) -> tuple[int, int, int]:
 
 def build_discovery_candidates_for_target(
     target_path: str,
-    session: DetectionScanSession | None = None,
+    session: DiscoveryScanSession | None = None,
 ) -> List[DiscoveryCandidate]:
     return build_discovery_candidates_for_targets([target_path], session=session)
 
 
 def build_discovery_candidates_for_targets(
     target_paths: List[str],
-    session: DetectionScanSession | None = None,
+    session: DiscoveryScanSession | None = None,
     config: dict | None = None,
 ) -> List[DiscoveryCandidate]:
-    session = session or DetectionScanSession(RELATIONS, config=config)
+    session = session or DiscoveryScanSession(RELATIONS, config=config)
     selected_dirs: list[str] = []
     selected_files: list[str] = []
 
