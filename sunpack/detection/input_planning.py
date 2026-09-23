@@ -83,7 +83,7 @@ class ArchiveInputPlanningStage:
             "source",
             json.dumps(knowledge_view.source_fingerprint(task), ensure_ascii=False, sort_keys=True, default=str),
             "discovery_confirmed",
-            bool(task.fact_bag.get("discovery.confirmed")),
+            _discovery_confirmed(task),
         )
 
     @staticmethod
@@ -113,7 +113,7 @@ class ArchiveInputPlanningStage:
     def _plan_task_group(self, group: list[tuple[int, ArchiveTask]]) -> list[tuple[int, list[ArchiveTask]]]:
         if not group:
             return []
-        if group[0][1].fact_bag.get("discovery.confirmed"):
+        if _discovery_confirmed(group[0][1]):
             return [
                 (index, self._plan_task_to_tasks(task)[1])
                 for index, task in group
@@ -127,7 +127,7 @@ class ArchiveInputPlanningStage:
         results = [(first_index, first_results)]
         if report is None:
             for index, task in group[1:]:
-                task.fact_bag.set("input_planning.status", "error")
+                task.runtime["input_planning.status"] = "error"
                 results.append((index, [task]))
             return results
         for index, task in group[1:]:
@@ -144,11 +144,11 @@ class ArchiveInputPlanningStage:
         return tasks
 
     def _plan_task_to_tasks(self, task: ArchiveTask) -> tuple[ArchiveAnalysisReport | None, list[ArchiveTask]]:
-        if task.fact_bag.get("discovery.confirmed"):
+        if _discovery_confirmed(task):
             # Discovery already supplied the exact native input descriptor.
             # The worker decides whether extraction actually succeeds.
             task.ensure_archive_state()
-            task.fact_bag.set("input_planning.status", "extractable")
+            task.runtime["input_planning.status"] = "extractable"
             return None, [task]
         if self.analyzer is None:
             return None, [task]
@@ -156,8 +156,8 @@ class ArchiveInputPlanningStage:
         try:
             report = self._get_or_create_report(task)
         except Exception as exc:
-            task.fact_bag.set("input_planning.status", "error")
-            task.fact_bag.set("input_planning.error", str(exc))
+            task.runtime["input_planning.status"] = "error"
+            task.runtime["input_planning.error"] = str(exc)
             _write_plan_error(task, str(exc))
             return None, [task]
 
@@ -183,7 +183,7 @@ class ArchiveInputPlanningStage:
             state.to_archive_input_descriptor(),
             report_path=task.main_path,
         )
-        prepass = task.fact_bag.get("analysis.signature_prepass")
+        prepass = knowledge_view.inspection_prepass(task)
         initial_prepass = (
             dict(prepass)
             if isinstance(prepass, dict) and prepass.get("full_scan_complete")
@@ -200,7 +200,7 @@ class ArchiveInputPlanningStage:
         with _phase(phase_timer, f"{phase_prefix}_record_report"):
             self._record_report(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix, record_state=False, write_knowledge=False)
         with _phase(phase_timer, f"{phase_prefix}_set_report_path"):
-            task.fact_bag.set("input_planning.report_path", report.path)
+            task.runtime["input_planning.report_path"] = report.path
         with _phase(phase_timer, f"{phase_prefix}_extractable_segments"):
             candidates = self._extractable_segments(report)
         with _phase(phase_timer, f"{phase_prefix}_write_segments_build_payload"):
@@ -271,10 +271,10 @@ class ArchiveInputPlanningStage:
         write_knowledge: bool = True,
     ) -> None:
         segment_payload = self._segment_payload(task, evidence, segment)
-        task.fact_bag.set("input_planning.status", evidence.status)
-        task.fact_bag.set("archive.format_hint", evidence.format)
-        task.fact_bag.set("source.segment_index", index)
-        task.fact_bag.set("source.segment", segment_payload)
+        task.runtime["input_planning.status"] = evidence.status
+        task.runtime["archive.format_hint"] = evidence.format
+        task.runtime["source.segment_index"] = index
+        task.runtime["source.segment"] = segment_payload
         if write_knowledge:
             write_source_selected_segment(task, evidence, segment, index=index)
 
@@ -290,12 +290,12 @@ class ArchiveInputPlanningStage:
     ) -> None:
         selected = _best_selected(report)
         with _phase(phase_timer, f"{phase_prefix}_record_report_fact_bag_basic"):
-            task.fact_bag.set("input_planning.status", "extractable" if report.has_extractable else "not_extractable")
-            task.fact_bag.set("input_planning.read_bytes", report.read_bytes)
-            task.fact_bag.set("input_planning.cache_hits", report.cache_hits)
+            task.runtime["input_planning.status"] = "extractable" if report.has_extractable else "not_extractable"
+            task.runtime["input_planning.read_bytes"] = report.read_bytes
+            task.runtime["input_planning.cache_hits"] = report.cache_hits
             if selected is not None:
-                task.fact_bag.set("archive.format_hint", selected.format)
-                task.fact_bag.set("input_planning.confidence", float(selected.confidence or 0.0))
+                task.runtime["archive.format_hint"] = selected.format
+                task.runtime["input_planning.confidence"] = float(selected.confidence or 0.0)
         with _phase(phase_timer, f"{phase_prefix}_record_report_evidence_payload"):
             evidences = [
                 {
@@ -309,7 +309,7 @@ class ArchiveInputPlanningStage:
                 for evidence in report.evidences
             ]
         with _phase(phase_timer, f"{phase_prefix}_record_report_fact_bag_evidences"):
-            task.fact_bag.set("input_planning.evidences", evidences)
+            task.runtime["input_planning.evidences"] = evidences
         if write_knowledge:
             with _phase(phase_timer, f"{phase_prefix}_record_report_write_knowledge"):
                 _write_plan_knowledge(task, report, [], None)
@@ -797,3 +797,11 @@ def _write_plan_error(task: ArchiveTask, error: str) -> None:
         source_module="archive_input_planner",
     )
     commit_task_knowledge(task, knowledge)
+
+
+def _discovery_confirmed(task: ArchiveTask) -> bool:
+    return str(getattr(task, "discovery_source", "") or "") in {
+        "relations",
+        "detection",
+        "embedded",
+    }
