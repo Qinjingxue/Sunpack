@@ -7,7 +7,6 @@ from sunpack.cli.cli_runtime import (
     result_for_missing,
 )
 from sunpack.cli.cli_types import CliCommandResult
-from sunpack.contracts.detection import FactBag
 from sunpack.contracts.tasks import ArchiveTask
 from sunpack.cli.persistent_runtime import load_request_config
 from sunpack.analysis import ArchiveAnalyzer
@@ -84,7 +83,7 @@ def handle(args, ctx):
                 "cli.inspect.details",
                 decision=item["decision"],
                 extract=ctx.t("common.yes" if item["should_extract"] else "common.no"),
-                detected=item["detected_ext"] or "-",
+                detected=item["format"] or "-",
             ))
             reporter.info(ctx.t("cli.inspect.decision_trace",
                 stage=item.get("decision_stage") or "-",
@@ -140,7 +139,7 @@ def _analysis_preview_by_path(results, config: dict) -> dict[str, dict]:
                 state.to_archive_input_descriptor(),
                 report_path=task.main_path,
             )
-            prepass = task.fact_bag.get("analysis.signature_prepass")
+            prepass = task.knowledge().get("inspection.prepass", {})
             report = analyzer.analyze(
                 source,
                 AnalysisRequest(
@@ -171,23 +170,31 @@ def _should_analyze_result(result) -> bool:
 
 
 def _task_from_inspect_result(result) -> ArchiveTask:
-    bag = _clone_fact_bag(result.fact_bag)
-    return ArchiveTask.from_fact_bag(bag)
-
-
-def _clone_fact_bag(source) -> FactBag:
-    cloned = FactBag()
-    if source is not None and hasattr(source, "to_dict"):
-        for key, value in source.to_dict().items():
-            cloned.set(key, value)
-    return cloned
-
+    if result.resolved is not None:
+        return ArchiveTask.from_resolved_input(result.resolved)
+    candidate = result.candidate
+    descriptor = candidate.archive_input
+    if descriptor is None:
+        from sunpack.contracts.archive_input import ArchiveInputDescriptor
+        descriptor = ArchiveInputDescriptor.from_parts(
+            archive_path=candidate.entry_path,
+            part_paths=list(candidate.member_paths or (candidate.entry_path,)),
+            format_hint=candidate.format_hint,
+            logical_name=candidate.logical_name,
+        )
+    return ArchiveTask.from_archive_input(
+        descriptor,
+        carrier_path=candidate.carrier_path,
+        cleanup_paths=list(candidate.cleanup_paths),
+        discovery_source="inspect",
+        relation_kind=candidate.relation_kind,
+    )
 
 def _analysis_summary(task: ArchiveTask, report) -> dict:
     if report is None:
         return {
             "status": "error",
-            "error": task.fact_bag.get("inspection.error") or "",
+            "error": str(task.knowledge().get("inspection.error", "") or ""),
             "has_extractable": False,
             "selected_format": "",
             "selected_confidence": 0.0,
