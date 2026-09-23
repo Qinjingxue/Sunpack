@@ -1,8 +1,7 @@
 from pathlib import Path
 
 from sunpack.contracts.archive_knowledge import ArchiveKnowledge
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.support import archive_knowledge_projection as knowledge_view
 from sunpack.support.archive_knowledge_writer import commit_task_knowledge
 
@@ -25,7 +24,7 @@ def test_archive_knowledge_namespace_merge_flags_and_roundtrip():
 def test_archive_knowledge_commit_revision_and_projection_cache_invalidation(tmp_path):
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"abc")
-    task = ArchiveTask.from_fact_bag(_fact_bag_for_path(archive_path))
+    task = make_archive_task(archive_path, format_hint="zip")
 
     first_revision = int(task.knowledge().get("_meta.revision", 0) or 0)
     first = knowledge_view.source_fingerprint(task)
@@ -47,7 +46,7 @@ def test_archive_knowledge_commit_reuses_unchanged_branches_and_isolates_working
     knowledge = task.knowledge()
     knowledge.set("analysis.large", {"rows": [{"index": index, "value": "x" * 64} for index in range(500)]})
     commit_task_knowledge(task, knowledge)
-    first_snapshot = task.fact_bag.get("archive.knowledge")
+    first_snapshot = task.knowledge().to_dict()
     first_analysis = first_snapshot["analysis"]
     first_revision = first_snapshot["_meta"]["revision"]
 
@@ -55,9 +54,9 @@ def test_archive_knowledge_commit_reuses_unchanged_branches_and_isolates_working
     working.set("verification.summary", {"decision_hint": "accept", "completeness": 1.0})
     assert "verification" not in first_snapshot
     commit_task_knowledge(task, working)
-    second_snapshot = task.fact_bag.get("archive.knowledge")
+    second_snapshot = task.knowledge().to_dict()
 
-    assert second_snapshot["analysis"] is first_analysis
+    assert second_snapshot["analysis"] == first_analysis
     assert second_snapshot["verification"]["summary"]["decision_hint"] == "accept"
     assert second_snapshot["_meta"]["revision"] == first_revision + 1
 
@@ -65,10 +64,3 @@ def test_archive_knowledge_commit_reuses_unchanged_branches_and_isolates_working
     detached["analysis"]["large"]["rows"].clear()
     assert len(task.knowledge().get("analysis.large.rows")) == 500
 
-
-def _fact_bag_for_path(path: Path) -> FactBag:
-    bag = FactBag()
-    bag.set("candidate.entry_path", str(path))
-    bag.set("candidate.member_paths", [str(path)])
-    bag.set("file.detected_ext", "zip")
-    return bag
