@@ -8,9 +8,8 @@ CONFIGS: dict[str, dict[str, Any]] = {
     "minimal": with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3},
     }, precheck=[
-        {"name": "relation_archive_accept", "enabled": True},
         {"name": "size_range", "enabled": True, "gte": 0},
-    {"name": "relation_archive_accept", "enabled": True},
+        {"name": "relation_archive_accept", "enabled": True},
     ]),
     "embedded_archive_loose": with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3},
@@ -36,10 +35,7 @@ CONFIGS: dict[str, dict[str, Any]] = {
         {"name": "embedded_archive", "enabled": True},
         {"name": "pe_overlay_structure", "enabled": True},
         {"name": "executable_carrier", "enabled": True},
-        {"name": "zip_eocd_structure", "enabled": True},
         {"name": "compression_stream_structure", "enabled": True},
-        {"name": "seven_zip_structure", "enabled": True},
-        {"name": "rar_structure", "enabled": True},
     ], precheck=[
         {"name": "size_range", "enabled": True, "gte": 0},
         {"name": "relation_archive_accept", "enabled": True},
@@ -52,10 +48,7 @@ CONFIGS: dict[str, dict[str, Any]] = {
         {"name": "embedded_archive", "enabled": True},
         {"name": "pe_overlay_structure", "enabled": True},
         {"name": "executable_carrier", "enabled": True},
-        {"name": "zip_eocd_structure", "enabled": True},
         {"name": "compression_stream_structure", "enabled": True},
-        {"name": "seven_zip_structure", "enabled": True},
-        {"name": "rar_structure", "enabled": True},
     ], precheck=[
         {"name": "size_range", "enabled": True, "gte": 0},
         {"name": "relation_archive_accept", "enabled": True},
@@ -78,4 +71,3 @@ def deep_merge(target: dict[str, Any], source: dict[str, Any]):
             deep_merge(target[key], value)
         else:
             target[key] = deepcopy(value)
-
