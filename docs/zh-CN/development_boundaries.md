@@ -105,7 +105,7 @@ contracts
 
 ### contracts
 
-`contracts` 是共享数据契约层。`FactBag`、`ArchiveTask`、`ExtractionResult`、`VerificationResult` 和 `RunContext` 应放这里。不要跨模块读取私有字段，例如 `FactBag._facts`。
+`contracts` 是共享数据契约层。`DiscoveryCandidate`、`ResolvedArchiveInput`、`StageResult`、`ArchiveTask`、`ExtractionResult`、`VerificationResult` 和 `RunContext` 应放这里。Discovery 阶段使用类型化契约交换数据，任务级可变知识统一封装在 `ArchiveTask` 内。
 
 ### filesystem
 
