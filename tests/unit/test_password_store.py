@@ -414,17 +414,20 @@ def test_password_resolver_scopes_structure_facts_to_active_embedded_format():
         "encryption_scan_complete": True,
         "password_required": True,
     })
-    bag.set("archive.knowledge", {
-        "source": {
-            "password_probe_input": {
-                "kind": "archive_input",
-                "entry_path": "carrier.bin",
-                "open_mode": "file_range",
-                "format_hint": "tar",
-                "parts": [{"path": "carrier.bin", "start": 100, "end": 200}],
-            },
+    knowledge = bag.knowledge()
+    knowledge.set(
+        "source.password_probe_input",
+        {
+            "kind": "archive_input",
+            "entry_path": "carrier.bin",
+            "open_mode": "file_range",
+            "format_hint": "tar",
+            "parts": [{"path": "carrier.bin", "start": 100, "end": 200}],
         },
-    })
+        source_layer="tests",
+        source_module="password_store",
+    )
+    bag.set_knowledge(knowledge)
 
     result = resolver.resolve("carrier.bin", task=bag, archive_key="carrier#tar")
 
