@@ -249,7 +249,7 @@ def _filesystem_candidate_bag(
 ) -> FactBag:
     path = normalized_path(path)
     name = os.path.basename(path)
-    logical_name = _filesystem_logical_name(name, format_hint)
+    logical_name = _filesystem_logical_name(name)
     bag = FactBag()
     bag.update({
         "file.path": path,
@@ -259,38 +259,17 @@ def _filesystem_candidate_bag(
         "candidate.member_paths": [path],
         "candidate.logical_name": logical_name,
         "candidate.carrier_path": path,
-        "candidate.companion_paths": [],
         "candidate.cleanup_paths": [path],
         "candidate.format_reject_mask": int(reject_mask or 0),
         "filesystem.route": route,
         "filesystem.format_hint": str(format_hint or "").lower(),
-        "relation.format_hint": "",
-        "relation.format_hint_confidence": "none",
-        "file.split_members": [],
-        "file.split_role": None,
-        "file.is_split_candidate": False,
-        "relation.is_split_related": False,
-        "relation.is_split_member": False,
-        "relation.has_split_companions": False,
-        "relation.is_split_exe_companion": False,
-        "relation.is_disguised_split_exe_companion": False,
-        "relation.has_generic_001_head": False,
-        "relation.is_plain_numeric_member": False,
-        "relation.match_rar_disguised": False,
-        "relation.match_rar_head": False,
-        "relation.match_001_head": False,
-        "relation.split_entry_path": path,
-        "relation.split_member_count": 0,
-        "relation.split_family": "",
-        "relation.split_index": 0,
-        "relation.split_is_first": False,
     })
     if isinstance(size, int):
         bag.set("file.size", size)
     return bag
 
 
-def _filesystem_logical_name(name: str, format_hint: str) -> str:
+def _filesystem_logical_name(name: str) -> str:
     extension = os.path.splitext(name)[1].lower()
     if extension in {".7z", ".rar", ".zip", ".gz", ".bz2", ".xz", ".exe"}:
         return os.path.splitext(name)[0] or name
