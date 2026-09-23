@@ -38,11 +38,11 @@ std::size_t NativeCpuBudget::acquire_up_to(
     if (minimum_grant > wanted)
         return 0;
 
-    std::size_t reserved = reserved_credits_.load(std::memory_order_relaxed);
+    std::size_t reserved = reserved_credits_.load(std::memory_order_acquire);
     for (;;)
     {
         const std::size_t effective =
-            effective_capacity_.load(std::memory_order_relaxed);
+            effective_capacity_.load(std::memory_order_acquire);
         if (reserved >= effective)
             return 0;
 
@@ -54,8 +54,8 @@ std::size_t NativeCpuBudget::acquire_up_to(
         if (reserved_credits_.compare_exchange_weak(
                 reserved,
                 reserved + grant,
-                std::memory_order_relaxed,
-                std::memory_order_relaxed))
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
             return grant;
     }
 }
@@ -70,15 +70,15 @@ void NativeCpuBudget::release(std::size_t count) noexcept
     if (count == 0)
         return;
 
-    std::size_t reserved = reserved_credits_.load(std::memory_order_relaxed);
+    std::size_t reserved = reserved_credits_.load(std::memory_order_acquire);
     for (;;)
     {
         const std::size_t next = count >= reserved ? 0 : reserved - count;
         if (reserved_credits_.compare_exchange_weak(
                 reserved,
                 next,
-                std::memory_order_relaxed,
-                std::memory_order_relaxed))
+                std::memory_order_acq_rel,
+                std::memory_order_acquire))
             break;
     }
 
@@ -91,7 +91,7 @@ void NativeCpuBudget::set_effective_capacity(std::size_t capacity) noexcept
     const std::size_t next =
         (std::max)(std::size_t{1}, (std::min)(capacity, nominal_capacity_));
     const std::size_t previous =
-        effective_capacity_.exchange(next, std::memory_order_relaxed);
+        effective_capacity_.exchange(next, std::memory_order_acq_rel);
     if (next > previous && capacity_available_)
         capacity_available_(capacity_available_context_);
 }
@@ -103,12 +103,12 @@ std::size_t NativeCpuBudget::nominal_capacity() const noexcept
 
 std::size_t NativeCpuBudget::effective_capacity() const noexcept
 {
-    return effective_capacity_.load(std::memory_order_relaxed);
+    return effective_capacity_.load(std::memory_order_acquire);
 }
 
 std::size_t NativeCpuBudget::reserved_credits() const noexcept
 {
-    return reserved_credits_.load(std::memory_order_relaxed);
+    return reserved_credits_.load(std::memory_order_acquire);
 }
 
 bool NativeCpuBudget::can_acquire_base() const noexcept
@@ -153,7 +153,6 @@ std::size_t NativeCpuJobContext::acquire_extra(
 
     const std::size_t current =
         current_extra_.fetch_add(granted, std::memory_order_relaxed) + granted;
-    total_extra_granted_.fetch_add(granted, std::memory_order_relaxed);
 
     std::size_t peak = peak_extra_.load(std::memory_order_relaxed);
     while (peak < current &&
@@ -178,7 +177,6 @@ std::size_t NativeCpuJobContext::acquire_all_available() noexcept
 
     const std::size_t current =
         current_extra_.fetch_add(granted, std::memory_order_relaxed) + granted;
-    total_extra_granted_.fetch_add(granted, std::memory_order_relaxed);
 
     std::size_t peak = peak_extra_.load(std::memory_order_relaxed);
     while (peak < current &&
@@ -217,7 +215,6 @@ NativeCpuJobSnapshot NativeCpuJobContext::snapshot() const noexcept
     return {
         current_extra_.load(std::memory_order_relaxed),
         peak_extra_.load(std::memory_order_relaxed),
-        total_extra_granted_.load(std::memory_order_relaxed),
     };
 }
 
