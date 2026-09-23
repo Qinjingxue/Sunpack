@@ -250,10 +250,7 @@ class SingleArchiveExtractor:
                 test_result = resolution.test_result
                 test_err = resolution.error_text
                 with _phase(phase_timer, f"{phase_prefix}_scan_filename_encoding"):
-                    try:
-                        format_hint = task.archive_input().format_hint
-                    except (TypeError, ValueError, AttributeError):
-                        format_hint = str(getattr(task, "detected_ext", "") or "").lstrip(".")
+                    format_hint = task.archive_input().format_hint
                     scan_for_task = getattr(self.metadata_scanner, "scan_for_task", None)
                     if scan_for_task is not None:
                         filename_encoding = scan_for_task(
@@ -487,7 +484,7 @@ class SingleArchiveExtractor:
             )
         return self.password_resolver.resolve(
             archive_path,
-            task.fact_bag,
+            task,
             part_paths=part_paths,
             archive_key=archive_key,
             directory_passwords=directory_passwords,
@@ -495,7 +492,7 @@ class SingleArchiveExtractor:
 
     @staticmethod
     def _task_requires_password(task: ArchiveTask) -> bool:
-        return archive_structure_requires_password(task.fact_bag)
+        return archive_structure_requires_password(task)
 
     def _password_store_has_candidates(self, directory_passwords: list[str]) -> bool:
         try:
@@ -763,12 +760,9 @@ class SingleArchiveExtractor:
                 diagnostics={"failure_stage": "preflight", "failure_kind": "output_filesystem", "message": str(exc)},
             )
 
-        with _phase(phase_timer, f"{phase_prefix}_save_archive_facts"):
-            saved_archive_facts = {
-                key: value
-                for key, value in task.fact_bag.to_dict().items()
-                if key.startswith("archive.")
-            }
+        with _phase(phase_timer, f"{phase_prefix}_save_archive_state"):
+            saved_archive_state = task.archive_state()
+            saved_knowledge = task.knowledge().to_dict()
         segment_results: list[dict[str, Any]] = []
         embedded_results: list[tuple[dict[str, Any], ExtractionResult]] = []
         password_used = None
@@ -799,12 +793,10 @@ class SingleArchiveExtractor:
                 )
             try:
                 with _phase(phase_timer, f"{phase_prefix}_segment_set_archive_state"):
-                    # Carrier-level archive knowledge (notably encryption and
-                    # a resolved password) is not valid for each independent
-                    # logical archive.  Start the segment with a fresh archive
-                    # namespace; non-archive task facts such as directory
-                    # password context remain available.
-                    self._restore_archive_facts(task, {})
+                    # Carrier archive knowledge is not valid for each
+                    # independent logical archive. Runtime-only context such as
+                    # inherited directory passwords lives outside ArchiveKnowledge.
+                    task.set_knowledge({})
                     task.set_archive_state(ArchiveState.from_archive_input(descriptor))
                     # The planner stores a task-level probe for compatibility,
                     # but extraction must always bind password verification to
@@ -823,8 +815,9 @@ class SingleArchiveExtractor:
                     "verification_archive_input": dict(segment.get("archive_input") or {}),
                 }
             finally:
-                with _phase(phase_timer, f"{phase_prefix}_segment_restore_archive_facts"):
-                    self._restore_archive_facts(task, saved_archive_facts)
+                with _phase(phase_timer, f"{phase_prefix}_segment_restore_archive_state"):
+                    task.set_knowledge(saved_knowledge)
+                    task.set_archive_state(saved_archive_state)
 
             if result.password_used is not None and password_used is None:
                 password_used = result.password_used
@@ -979,16 +972,6 @@ class SingleArchiveExtractor:
         safe = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in raw)
         return safe or f"embedded_{position:02d}_{fmt or 'archive'}"
 
-    @staticmethod
-    def _restore_archive_facts(task: ArchiveTask, saved: dict[str, Any]) -> None:
-        current_keys = [
-            key for key in task.fact_bag.to_dict()
-            if key.startswith("archive.")
-        ]
-        for key in current_keys:
-            task.fact_bag.unset(key)
-        for key, value in saved.items():
-            task.fact_bag.set(key, value)
 
     @staticmethod
     def _directory_stats(path: str) -> dict[str, int]:
