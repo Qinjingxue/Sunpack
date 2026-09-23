@@ -72,7 +72,10 @@ class RelationsGroupBuilder:
         encrypted_groups: list[tuple[list[str], list[str], dict | None]] = []
         for group in groups:
             metadata = group.head_metadata if isinstance(group.head_metadata, dict) else {}
-            if not group.is_split_candidate or not bool(metadata.get("needs_password")):
+            if (
+                str(metadata.get("format") or "").lower() != "rar"
+                or not bool(metadata.get("needs_password"))
+            ):
                 continue
             proposal_paths: set[str] = set()
             proposal_paths.add(os.path.abspath(str(group.head_path or "")))
