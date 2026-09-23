@@ -363,12 +363,12 @@ fn build_candidate_groups_from_physical(
         let mut proposal_keys = HashSet::new();
 
         for seed in directory_rows.iter().filter(|row| {
-            seed_strength_for_row(row, &name_index).is_some()
+            seed_strength_for_row(row, &directory_rows, &name_index).is_some()
         }) {
             let Some(anchor) = seed.anchor.as_ref() else {
                 continue;
             };
-            let Some(strength) = seed_strength_for_row(seed, &name_index) else {
+            let Some(strength) = seed_strength_for_row(seed, &directory_rows, &name_index) else {
                 continue;
             };
             if strength == "strong" {
@@ -579,6 +579,7 @@ fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
 
 fn seed_strength_for_row(
     row: &RelationInput,
+    rows: &[RelationInput],
     name_index: &DirectoryNameIndex,
 ) -> Option<&'static str> {
     let anchor = row.anchor.as_ref()?;
@@ -598,6 +599,7 @@ fn seed_strength_for_row(
                     .and_then(|value| value.to_str())
                     .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
         })
+        && strong_seed_related_paths(row, rows, name_index, anchor).len() >= 2
     {
         return Some("strong");
     }
