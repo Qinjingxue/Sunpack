@@ -1374,7 +1374,7 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
   {
     sunpack::sevenzip::PositionedOutStream *positioned =
         sunpack::sevenzip::positioned_out_stream(realOutStream);
-    if (positioned)
+    if (positioned && positioned->positioned_available())
     {
       SRes positionedRes = SZ_OK;
       const HRESULT positionedHres = DecodeBlocks_Positioned(
