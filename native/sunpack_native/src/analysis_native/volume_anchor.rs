@@ -813,6 +813,90 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
     true
 }
 
+
+pub(crate) fn probe_volume_anchor_at_offset(
+    path: &str,
+    offset: u64,
+    format: &str,
+    password: Option<&str>,
+) -> VolumeAnchor {
+    let mut result = VolumeAnchor {
+        path: path.to_string(),
+        ..VolumeAnchor::default()
+    };
+    let reader = match ManagedReader::open(path) {
+        Ok(reader) => reader,
+        Err(error) => {
+            result.error = error.to_string();
+            return result;
+        }
+    };
+    let size = reader.len();
+    result.size = size;
+    if offset >= size {
+        result.error = "archive_offset_out_of_range".to_string();
+        return result;
+    }
+
+    let remaining = size - offset;
+    let prefix_len = remaining.min(512) as usize;
+    let prefix = match reader.read_at(offset, prefix_len) {
+        Ok(value) => value,
+        Err(error) => {
+            result.error = error.to_string();
+            return result;
+        }
+    };
+    result.bytes_read += prefix.len() as u64;
+
+    let recognized = match format {
+        "rar" => probe_rar(&prefix, 0, &mut result, password),
+        "7z" => probe_seven_zip(&prefix, 0, remaining, &mut result),
+        "zip" => {
+            const ZIP_TAIL_MAX: u64 = 22 + 65_535;
+            let tail_len = remaining.min(ZIP_TAIL_MAX);
+            let tail_start = size - tail_len;
+            let tail = match reader.read_at(tail_start, tail_len as usize) {
+                Ok(value) => value,
+                Err(error) => {
+                    result.error = error.to_string();
+                    return result;
+                }
+            };
+            result.bytes_read += tail.len() as u64;
+            probe_zip(
+                &prefix,
+                &tail,
+                tail_start.saturating_sub(offset),
+                &mut result,
+            )
+        }
+        _ => false,
+    };
+    if !recognized {
+        result.error = "archive_structure_not_confirmed".to_string();
+        return result;
+    }
+
+    if offset > 0 {
+        if let Some(structure_offset) = result.structure_offset.as_mut() {
+            *structure_offset = structure_offset.saturating_add(offset);
+        } else {
+            result.structure_offset = Some(offset);
+        }
+        if let Some(expected_logical_size) = result.expected_logical_size.as_mut() {
+            *expected_logical_size = expected_logical_size.saturating_add(offset);
+        }
+        result.sfx = true;
+        result.pe_structure = true;
+        if !result.evidence.iter().any(|item| *item == "sfx:pe_overlay") {
+            result.evidence.push("sfx:pe_overlay");
+        }
+    }
+    result
+}
+
+
 fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor) {
     let format = if prefix.starts_with(b"\x1f\x8b") {
         "gzip"
