@@ -18,7 +18,7 @@ class ArchiveMetadataScanResult:
         self.sample_count: int = 0
 
 class ArchiveMetadataScanner:
-    TASK_CACHE_FACT = "extraction.filename_metadata"
+    TASK_CACHE_KEY = "filename_metadata"
     MAX_ZIP_SAMPLES = 200000
     MAX_FILENAME_BYTES = 64 * 1024 * 1024
     LIST_TIMEOUT_SECONDS = 5
@@ -75,16 +75,16 @@ class ArchiveMetadataScanner:
         """Reuse filename metadata across detection/extraction/worker retries."""
         normalized_hint = str(format_hint or "").lower().lstrip(".")
         signature = self._build_cache_key(os.path.normpath(archive_path), part_paths=part_paths)
-        cached = task.fact_bag.get(self.TASK_CACHE_FACT) if task is not None else None
+        cached = task.runtime.get(self.TASK_CACHE_KEY) if task is not None else None
         if isinstance(cached, dict) and cached.get("signature") == signature and cached.get("format_hint") == normalized_hint:
             return self._result_from_dict(cached.get("result"), archive_path)
         result = self.scan(archive_path, password=password, part_paths=part_paths, format_hint=normalized_hint)
         if task is not None:
-            task.fact_bag.set(self.TASK_CACHE_FACT, {
+            task.runtime[self.TASK_CACHE_KEY] = {
                 "signature": signature,
                 "format_hint": normalized_hint,
                 "result": self._result_to_dict(result),
-            })
+            }
         return result
 
     @staticmethod
@@ -129,18 +129,18 @@ class ArchiveMetadataScanner:
         part_paths: list[str] | None = None,
         format_hint: str = "",
     ) -> ArchiveMetadataScanResult:
-        ext = f".{format_hint}" if format_hint else ""
-        if ext == ".zip":
+        archive_type = str(format_hint or "").lower().lstrip(".")
+        if archive_type == "zip":
             return self._scan_zip_central_directory(archive_path)
-        if ext in {".7z", ".rar"}:
+        if archive_type in {"7z", "rar"}:
             return ArchiveMetadataScanResult(
                 archive_path=archive_path,
-                archive_type=ext.lstrip("."),
-                reasons=[self.i18n.t("metadata.no_correction_needed", archive_type=ext.lstrip(".").upper())],
+                archive_type=archive_type,
+                reasons=[self.i18n.t("metadata.no_correction_needed", archive_type=archive_type.upper())],
             )
         return ArchiveMetadataScanResult(
             archive_path=archive_path,
-            archive_type=ext.lstrip(".") or "unknown",
+            archive_type=archive_type or "unknown",
             reasons=[self.i18n.t("metadata.unsupported_type")],
         )
 
