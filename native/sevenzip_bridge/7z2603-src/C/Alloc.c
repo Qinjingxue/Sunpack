@@ -5,7 +5,6 @@
 
 #ifdef _WIN32
 #include "7zWindows.h"
-#include <winioctl.h>
 #endif
 #include <stdlib.h>
 
@@ -296,7 +295,6 @@ static BoolInt SunpackFileBuffer_CreateMapped(CSunpackFileBuffer *p, size_t size
   HANDLE mapping;
   void *view;
   LARGE_INTEGER endPos;
-  DWORD sparseBytes = 0;
   const UInt64 size64 = (UInt64)size;
 
   pathLen = GetTempPathW((DWORD)(sizeof(tempPath) / sizeof(tempPath[0])), tempPath);
@@ -318,11 +316,6 @@ static BoolInt SunpackFileBuffer_CreateMapped(CSunpackFileBuffer *p, size_t size
     DeleteFileW(tempName);
     return False;
   }
-
-  /* Best effort: sparse backing avoids reserving physical disk clusters for
-     untouched portions of a large decoder run. Non-NTFS filesystems may reject
-     this request; the mapping remains correct without it. */
-  DeviceIoControl(file, FSCTL_SET_SPARSE, NULL, 0, NULL, 0, &sparseBytes, NULL);
 
   endPos.QuadPart = (LONGLONG)size64;
   if (!SetFilePointerEx(file, endPos, NULL, FILE_BEGIN) || !SetEndOfFile(file))
