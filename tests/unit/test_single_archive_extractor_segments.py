@@ -1,12 +1,8 @@
 from types import SimpleNamespace
 
 from sunpack.support.archive_input_projection import write_source_extractable_segments
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask, SplitArchiveInfo
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
 from sunpack.passwords.result import PasswordResolution, PasswordResolutionStatus
-from sunpack.contracts.archive_knowledge import ArchiveKnowledge
 from sunpack.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 from sunpack.verification.scheduler import VerificationScheduler
 from sunpack.contracts.verification import (
@@ -16,6 +12,7 @@ from sunpack.contracts.verification import (
     DECISION_ACCEPT,
 )
 from sunpack_native import worker_manifest_from_rows
+from tests.helpers.archive_tasks import make_archive_task
 
 
 class _FakePasswordStore:
@@ -38,8 +35,8 @@ class _RecordingPasswordResolver:
     def __init__(self):
         self.calls = []
 
-    def resolve(self, _archive_path, fact_bag, *, archive_key, **_kwargs):
-        knowledge = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge"))
+    def resolve(self, _archive_path, task, *, archive_key, **_kwargs):
+        knowledge = task.knowledge()
         self.calls.append((archive_key, dict(knowledge.get("source.password_probe_input") or {})))
         return PasswordResolution(
             password="",
@@ -124,16 +121,7 @@ class _FakeSevenZipRunner:
 
 
 def _task(path):
-    bag = FactBag()
-    bag.set("candidate.entry_path", str(path))
-    bag.set("candidate.member_paths", [str(path)])
-    return ArchiveTask(
-        fact_bag=bag,
-        main_path=str(path),
-        all_parts=[str(path)],
-        logical_name="case",
-        split_info=SplitArchiveInfo(archive_input=ArchiveInputDescriptor.from_parts(archive_path=str(path))),
-    )
+    return make_archive_task(path, logical_name="case")
 
 
 def test_extractor_runs_analysis_segments_inside_same_task_and_restores_source(tmp_path):
