@@ -55,25 +55,29 @@ def timed_calls(specs: list[tuple[str, object, str]]):
 
 
 def layer_specs():
-    from sunpack.coordinator.scan_session import DetectionScanSession
+    from sunpack.coordinator.discovery import ArchiveDiscoveryPipeline
+    from sunpack.coordinator.scan_session import DiscoveryScanSession
     from sunpack.coordinator.task_provider import ArchiveTaskProvider
-    from sunpack.detection.pipeline.facts.batch_provider import BatchFactProvider
-    from sunpack.detection.pipeline.rules.manager import RuleManager
+    from sunpack.detection.confirmation import FormatConfirmation
     from sunpack.detection.scheduler import DetectionScheduler
+    from sunpack.embedded.discovery import EmbeddedDiscovery
     from sunpack.filesystem.directory_scanner import DirectoryScanner
     from sunpack.relations.internal.group_builder import RelationsGroupBuilder
+    from sunpack.relations.resolver import RelationResolver
 
     return [
-        ("provider.detect_targets", ArchiveTaskProvider, "detect_targets"),
-        ("session.snapshot", DetectionScanSession, "snapshot_for_directory"),
-        ("session.relations", DetectionScanSession, "relation_groups_for_directory"),
-        ("session.fact_bags", DetectionScanSession, "fact_bags_for_directory"),
+        ("provider.discover_targets", ArchiveTaskProvider, "discover_targets"),
+        ("provider.scan_targets", ArchiveTaskProvider, "scan_targets"),
+        ("session.snapshot", DiscoveryScanSession, "snapshot_for_directory"),
+        ("session.relations", DiscoveryScanSession, "relation_groups_for_directory"),
+        ("session.candidates", DiscoveryScanSession, "candidates_for_directory"),
         ("filesystem.scan", DirectoryScanner, "scan"),
         ("relations.build", RelationsGroupBuilder, "build_candidate_groups"),
-        ("detection.evaluate", DetectionScheduler, "evaluate_bags"),
-        ("rules.precheck", RuleManager, "_run_precheck"),
-        ("rules.total", RuleManager, "evaluate_pool"),
-        ("facts.prefill", BatchFactProvider, "prefill_facts"),
+        ("relations.resolve", RelationResolver, "resolve"),
+        ("detection.confirm_candidate", DetectionScheduler, "confirm"),
+        ("detection.confirm_stage", FormatConfirmation, "confirm"),
+        ("embedded.discover", EmbeddedDiscovery, "discover"),
+        ("discovery.compose", ArchiveDiscoveryPipeline, "discover"),
     ]
 
 
