@@ -60,6 +60,26 @@ void z7_LargePage_Set(UInt32 flags, size_t pageSize, size_t threshold);
 #endif
 
 
+
+/*
+  Large decoder output buffers can be backed by a temporary file on Windows.
+  The mapped view keeps the decoder's byte-addressable hot path unchanged while
+  moving reorder storage out of process-private commit. Small buffers and
+  non-Windows builds use the normal MidAlloc-compatible heap path.
+*/
+typedef struct
+{
+  Byte *data;
+  size_t capacity;
+  void *fileHandle;
+  void *mappingHandle;
+  BoolInt fileBacked;
+} CSunpackFileBuffer;
+
+void SunpackFileBuffer_Construct(CSunpackFileBuffer *p);
+BoolInt SunpackFileBuffer_Ensure(CSunpackFileBuffer *p, size_t size);
+void SunpackFileBuffer_Release(CSunpackFileBuffer *p);
+
 typedef struct
 {
   ISzAlloc vt;
