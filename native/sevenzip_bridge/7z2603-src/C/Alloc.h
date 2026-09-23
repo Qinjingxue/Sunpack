@@ -22,6 +22,24 @@ void *MyAlloc(size_t size);
 void MyFree(void *address);
 void *MyRealloc(void *address, size_t size);
 
+/*
+  SunPack decoder buffers reserve virtual address space separately from
+  committed physical memory. The decoder can therefore keep a stable base
+  address while trimming historical high-water commits between differently
+  sized MT blocks.
+*/
+typedef struct
+{
+  Byte *data;
+  size_t reservedSize;
+  size_t committedSize;
+} CSunpackVmBuffer;
+
+void SunpackVmBuffer_Construct(CSunpackVmBuffer *p);
+int SunpackVmBuffer_Ensure(CSunpackVmBuffer *p, size_t size);
+void SunpackVmBuffer_Decommit(CSunpackVmBuffer *p);
+void SunpackVmBuffer_Release(CSunpackVmBuffer *p);
+
 void *z7_AlignedAlloc(size_t size);
 void  z7_AlignedFree(void *p);
 
