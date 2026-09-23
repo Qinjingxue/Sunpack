@@ -383,9 +383,6 @@ fn probe_cheap_prefix(
     if probe_zip_local_head(prefix, &mut result) {
         return result;
     }
-    if prefix.starts_with(b"MZ") && probe_embedded_zip_local_head(prefix, &mut result) {
-        return result;
-    }
     if prefix.starts_with(b"MZ") {
         // An MZ header is only a weak SFX/carrier seed.  Do not scan a
         // larger prefix here: the relation layer may use the filename
@@ -456,25 +453,6 @@ fn probe_zip_local_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
     out.internal_volume_number = Some(1);
     out.anchor_roles.push("first");
     out.evidence.push("zip:local_header");
-    true
-}
-
-fn probe_embedded_zip_local_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
-    let Some(offset) = find_signature(prefix, ZIP_LOCAL).filter(|offset| *offset > 0) else {
-        return false;
-    };
-    if !plausible_zip_local(prefix, offset) {
-        return false;
-    }
-    out.format = "zip".to_string();
-    out.confidence = "strong".to_string();
-    out.standalone = true;
-    out.sfx = true;
-    out.structure_offset = Some(offset as u64);
-    out.internal_volume_number = Some(1);
-    out.anchor_roles.push("standalone");
-    out.anchor_roles.push("first");
-    out.evidence.push("zip:embedded_local_head");
     true
 }
 
