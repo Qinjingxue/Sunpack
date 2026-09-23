@@ -103,7 +103,7 @@ contracts
 
 ### contracts
 
-`contracts` is the shared data contract layer. `FactBag`, `ArchiveTask`, `ExtractionResult`, `VerificationResult`, and `RunContext` belong here. Do not read private fields across modules, for example `FactBag._facts`.
+`contracts` is the shared data contract layer. `DiscoveryCandidate`, `ResolvedArchiveInput`, `StageResult`, `ArchiveTask`, `ExtractionResult`, `VerificationResult`, and `RunContext` belong here. Discovery stages exchange typed contracts; task-local mutable knowledge stays behind `ArchiveTask`.
 
 ### filesystem
 
