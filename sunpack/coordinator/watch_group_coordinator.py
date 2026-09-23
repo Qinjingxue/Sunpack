@@ -5,7 +5,7 @@ import json
 import os
 from collections import defaultdict
 
-from sunpack.coordinator.scan_session import DetectionScanSession
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.passwords.internal.store import PasswordStore
 from sunpack.relations.scheduler import RelationsScheduler
 from sunpack.support.path_keys import path_key
@@ -40,7 +40,7 @@ class WatchGroupCoordinator:
 
         resolved: dict[str, WatchGroupSnapshot | None] = {}
         for directory, directory_paths in by_directory.items():
-            session = DetectionScanSession(self.relations, config=self.config)
+            session = DiscoveryScanSession(self.relations, config=self.config)
             groups = session.relation_groups_for_directory(directory)
             snapshots_by_path: dict[str, WatchGroupSnapshot] = {}
             ordinary_paths: set[str] = set()
