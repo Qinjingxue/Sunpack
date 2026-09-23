@@ -38,6 +38,7 @@ struct DirectorySnapshotTable {
 const FILE_ROUTE_RELATIONS: u8 = 1;
 const FILE_ROUTE_DETECTION: u8 = 2;
 const FILE_ROUTE_RESIDUAL: u8 = 3;
+const FORMAT_REJECT_TAR: u32 = 1 << 3;
 
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeDirectorySnapshot {
@@ -151,6 +152,9 @@ fn filesystem_file_route(
         anchor.format.as_str(),
         "tar" | "gzip" | "bzip2" | "xz" | "zstd"
     ) {
+        return FILE_ROUTE_DETECTION;
+    }
+    if anchor.bytes_read >= 512 && anchor.format_reject_mask & FORMAT_REJECT_TAR == 0 {
         return FILE_ROUTE_DETECTION;
     }
     FILE_ROUTE_RESIDUAL
