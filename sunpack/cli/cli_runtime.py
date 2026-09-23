@@ -233,58 +233,24 @@ def scan_result_to_item(res) -> dict[str, Any]:
     return {
         "main_path": res.main_path,
         "all_parts": list(res.all_parts or []),
-        "decision": res.decision,
         "format": str(res.format or ""),
         "discovery_source": str(res.discovery_source or ""),
+        "discovery_reason": str(res.discovery_reason or ""),
         "archive_input": dict(res.archive_input or {}),
         "split_role": "first" if len(res.all_parts or []) > 1 else "",
-        "reasons": list(res.matched_rules or []),
     }
 
 
 def inspect_result_to_item(res) -> dict[str, Any]:
-    candidate = res.candidate
-    resolved = res.resolved
-    archive_input = (
-        resolved.archive_input.to_dict()
-        if resolved is not None
-        else candidate.archive_input.to_dict()
-        if candidate.archive_input is not None
-        else None
-    )
-    identity_offset = 0
-    if archive_input:
-        segment = archive_input.get("segment")
-        if isinstance(segment, dict):
-            identity_offset = int(segment.get("start") or 0)
-        elif isinstance(candidate.relation_anchor, dict):
-            identity_offset = int(candidate.relation_anchor.get("structure_offset") or 0)
     return {
         "path": res.path,
-        "decision": getattr(
-            res,
-            "decision",
-            "archive" if res.should_extract else "not_archive",
-        ),
-        "decision_stage": getattr(res, "decision_stage", ""),
-        "discarded_at": getattr(res, "discarded_at", "") or None,
-        "deciding_rule": getattr(res, "deciding_rule", "") or None,
-        "stop_reason": getattr(res, "stop_reason", "") or None,
+        "status": res.status,
         "should_extract": res.should_extract,
-        "size": int(candidate.size or 0),
         "format": str(res.format or ""),
-        "discovery_source": str(res.discovery_source or ""),
-        "archive_input": archive_input,
-        "container_type": "pe" if candidate.is_sfx else "unknown",
-        "identity_confirmed": bool(resolved is not None),
-        "identity_offset": identity_offset,
-        "is_split_candidate": bool(candidate.is_split),
-        "skipped_by_size_limit": bool(
-            res.stop_reason and "size below" in res.stop_reason.lower()
-        ),
-        "reasons": list(res.matched_rules or []),
+        "discovery_source": str(res.source or ""),
+        "reason": str(res.reason or ""),
+        "archive_input": dict(res.archive_input or {}) if res.archive_input else None,
     }
-
 
 def password_summary_item(summary: CliPasswordSummary) -> dict[str, Any]:
     return asdict(summary)
