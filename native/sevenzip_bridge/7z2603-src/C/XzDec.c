@@ -1436,8 +1436,7 @@ void XzDecMtProps_Init(CXzDecMtProps *p)
 
 typedef struct
 {
-  Byte *outBuf;
-  size_t outBufSize;
+  CSunpackFileBuffer outBuf;
   size_t outPreSize;
   size_t inPreSize;
   size_t inPreHeaderSize;
@@ -1563,8 +1562,7 @@ CXzDecMtHandle XzDecMt_Create(ISzAllocPtr alloc, ISzAllocPtr allocMid)
     {
       CXzDecMtThread *coder = &p->coders[i];
       coder->dec_created = False;
-      coder->outBuf = NULL;
-      coder->outBufSize = 0;
+      SunpackFileBuffer_Construct(&coder->outBuf);
     }
   }
   #endif
@@ -1581,12 +1579,7 @@ static void XzDecMt_FreeOutBufs(CXzDecMt *p)
   for (i = 0; i < MTDEC_THREADS_MAX; i++)
   {
     CXzDecMtThread *coder = &p->coders[i];
-    if (coder->outBuf)
-    {
-      ISzAlloc_Free(p->allocMid, coder->outBuf);
-      coder->outBuf = NULL;
-      coder->outBufSize = 0;
-    }
+    SunpackFileBuffer_Release(&coder->outBuf);
   }
   p->unpackBlockMaxSize = 0;
 }
@@ -1867,37 +1860,19 @@ static SRes XzDecMt_Callback_PreCode(void *pp, unsigned coderIndex)
   if (!coder->dec.headerParsedOk)
     return SZ_OK;
 
-  dest = coder->outBuf;
+  if (!SunpackFileBuffer_Ensure(&coder->outBuf, coder->outPreSize))
+    return SZ_ERROR_MEM;
+  dest = coder->outBuf.data;
 
-  if (!dest || coder->outBufSize < coder->outPreSize)
-  {
-    if (dest)
-    {
-      ISzAlloc_Free(me->allocMid, dest);
-      coder->outBuf = NULL;
-      coder->outBufSize = 0;
-    }
-    {
-      size_t outPreSize = coder->outPreSize;
-      if (outPreSize == 0)
-        outPreSize = 1;
-      dest = (Byte *)ISzAlloc_Alloc(me->allocMid, outPreSize);
-    }
-    if (!dest)
-      return SZ_ERROR_MEM;
-    coder->outBuf = dest;
-    coder->outBufSize = coder->outPreSize;
-
-    if (coder->outBufSize > me->unpackBlockMaxSize)
-      me->unpackBlockMaxSize = coder->outBufSize;
-  }
+  if (coder->outPreSize > me->unpackBlockMaxSize)
+    me->unpackBlockMaxSize = coder->outPreSize;
 
   // return SZ_ERROR_MEM;
 
-  XzUnpacker_SetOutBuf(&coder->dec, coder->outBuf, coder->outBufSize);
+  XzUnpacker_SetOutBuf(&coder->dec, dest, coder->outPreSize);
 
   {
-    SRes res = XzDecMix_Init(&coder->dec.decoder, &coder->dec.block, coder->outBuf, coder->outBufSize);
+    SRes res = XzDecMix_Init(&coder->dec.decoder, &coder->dec.block, dest, coder->outPreSize);
     // res = SZ_ERROR_UNSUPPORTED; // to test
     coder->codeRes = res;
     if (res != SZ_OK)
@@ -1946,7 +1921,7 @@ static SRes XzDecMt_Callback_Code(void *pp, unsigned coderIndex,
 
   if (!coder->dec.headerParsedOk)
     return SZ_OK;
-  if (!coder->outBuf)
+  if (!coder->outBuf.data)
     return SZ_OK;
 
   if (coder->codeRes == SZ_OK)
@@ -2012,7 +1987,7 @@ static SRes XzDecMt_Callback_Write(void *pp, unsigned coderIndex,
   if (!needWriteToStream)
     return SZ_OK;
 
-  if (!coder->dec.headerParsedOk || !coder->outBuf)
+  if (!coder->dec.headerParsedOk || !coder->outBuf.data)
   {
     if (me->finishedDecoderIndex < 0)
       me->finishedDecoderIndex = (int)coderIndex;
@@ -2029,7 +2004,7 @@ static SRes XzDecMt_Callback_Write(void *pp, unsigned coderIndex,
   {
     SRes res;
     size_t size = coder->outCodeSize;
-    Byte *data = coder->outBuf;
+    Byte *data = coder->outBuf.data;
     
     // we use in me->dec: sha, numBlocks, indexSize
 
@@ -2598,268 +2573,3 @@ static void XzStatInfo_SetStat(const CXzUnpacker *dec,
 
   stat->InSize -= extraSize;
 }
-
-
-
-SRes XzDecMt_Decode(CXzDecMtHandle p,
-    const CXzDecMtProps *props,
-    const UInt64 *outDataSize, int finishMode,
-    ISeqOutStreamPtr outStream,
-    // Byte *outBuf, size_t *outBufSize,
-    ISeqInStreamPtr inStream,
-    // const Byte *inData, size_t inDataSize,
-    CXzStatInfo *stat,
-    int *isMT,
-    ICompressProgressPtr progress)
-{
-  // GET_CXzDecMt_p
-  #ifndef Z7_ST
-  BoolInt tMode;
-  #endif
-
-  XzStatInfo_Clear(stat);
-
-  p->props = *props;
-
-  p->inStream = inStream;
-  p->outStream = outStream;
-  p->progress = progress;
-  // p->stat = stat;
-
-  p->outSize = 0;
-  p->outSize_Defined = False;
-  if (outDataSize)
-  {
-    p->outSize_Defined = True;
-    p->outSize = *outDataSize;
-  }
-
-  p->finishMode = (BoolInt)finishMode;
-
-  // p->outSize = 457; p->outSize_Defined = True; p->finishMode = False; // for test
-
-  p->writeRes = SZ_OK;
-  p->outProcessed = 0;
-  p->inProcessed = 0;
-  p->readProcessed = 0;
-  p->readWasFinished = False;
-  p->readRes = SZ_OK;
-
-  p->codeRes = SZ_OK;
-  p->status = CODER_STATUS_NOT_SPECIFIED;
-
-  XzUnpacker_Init(&p->dec);
-
-  *isMT = False;
-
-    /*
-    p->outBuf = NULL;
-    p->outBufSize = 0;
-    if (!outStream)
-    {
-      p->outBuf = outBuf;
-      p->outBufSize = *outBufSize;
-      *outBufSize = 0;
-    }
-    */
-
-  
-  #ifndef Z7_ST
-
-  p->isBlockHeaderState_Parse = False;
-  p->isBlockHeaderState_Write = False;
-  // p->numBadBlocks = 0;
-  p->mainErrorCode = SZ_OK;
-  p->mainDecoderWasCalled = False;
-
-  tMode = False;
-
-  if (p->props.numThreads > 1)
-  {
-    IMtDecCallback2 vt;
-    BoolInt needContinue;
-    SRes res;
-    // we just free ST buffers here
-    // but we still keep state variables, that was set in XzUnpacker_Init()
-    XzDecMt_FreeSt(p);
-
-    p->outProcessed_Parse = 0;
-    p->parsing_Truncated = False;
-
-    p->numStreams = 0;
-    p->numTotalBlocks = 0;
-    p->numBlocks = 0;
-    p->finishedDecoderIndex = -1;
-
-    if (!p->mtc_WasConstructed)
-    {
-      p->mtc_WasConstructed = True;
-      MtDec_Construct(&p->mtc);
-    }
-    
-    p->mtc.mtCallback = &vt;
-    p->mtc.mtCallbackObject = p;
-
-    p->mtc.progress = progress;
-    p->mtc.inStream = inStream;
-    p->mtc.alloc = &p->alignOffsetAlloc.vt;
-    // p->mtc.inData = inData;
-    // p->mtc.inDataSize = inDataSize;
-    p->mtc.inBufSize = p->props.inBufSize_MT;
-    // p->mtc.inBlockMax = p->props.inBlockMax;
-    p->mtc.numThreadsMax = p->props.numThreads;
-
-    *isMT = True;
-
-    vt.Parse = XzDecMt_Callback_Parse;
-    vt.PreCode = XzDecMt_Callback_PreCode;
-    vt.Code = XzDecMt_Callback_Code;
-    vt.Write = XzDecMt_Callback_Write;
-
-
-    res = MtDec_Code(&p->mtc);
-
-
-    stat->InSize = p->mtc.inProcessed;
-    
-    p->inProcessed = p->mtc.inProcessed;
-    p->readRes = p->mtc.readRes;
-    p->readWasFinished = p->mtc.readWasFinished;
-    p->readProcessed = p->mtc.readProcessed;
-    
-    tMode = True;
-    needContinue = False;
-    
-    if (res == SZ_OK)
-    {
-      if (p->mtc.mtProgress.res != SZ_OK)
-      {
-        res = p->mtc.mtProgress.res;
-        stat->ProgressRes = res;
-        stat->CombinedRes_Type = SZ_ERROR_PROGRESS;
-      }
-      else
-        needContinue = p->mtc.needContinue;
-    }
-    
-    if (!needContinue)
-    {
-      {
-        SRes codeRes;
-        BoolInt truncated = False;
-        ECoderStatus status;
-        const CXzUnpacker *dec;
-
-        stat->OutSize = p->outProcessed;
-       
-        if (p->finishedDecoderIndex >= 0)
-        {
-          const CXzDecMtThread *coder = &p->coders[(unsigned)p->finishedDecoderIndex];
-          codeRes = coder->codeRes;
-          dec = &coder->dec;
-          status = coder->status;
-        }
-        else if (p->mainDecoderWasCalled)
-        {
-          codeRes = p->codeRes;
-          dec = &p->dec;
-          status = p->status;
-          truncated = p->parsing_Truncated;
-        }
-        else
-          return SZ_ERROR_FAIL;
-
-        if (p->mainErrorCode != SZ_OK)
-          stat->DecodeRes = p->mainErrorCode;
-
-        XzStatInfo_SetStat(dec, p->finishMode,
-            // p->mtc.readProcessed,
-            p->mtc.inProcessed,
-            codeRes, status,
-            truncated,
-            stat);
-      }
-
-      if (res == SZ_OK)
-      {
-        stat->ReadRes = p->mtc.readRes;
-
-        if (p->writeRes != SZ_OK)
-        {
-          res = p->writeRes;
-          stat->CombinedRes_Type = SZ_ERROR_WRITE;
-        }
-        else if (p->mtc.readRes != SZ_OK
-            // && p->mtc.inProcessed == p->mtc.readProcessed
-            && stat->DecodeRes == SZ_ERROR_INPUT_EOF)
-        {
-          res = p->mtc.readRes;
-          stat->CombinedRes_Type = SZ_ERROR_READ;
-        }
-        else if (stat->DecodeRes != SZ_OK)
-          res = stat->DecodeRes;
-      }
-      
-      stat->CombinedRes = res;
-      if (stat->CombinedRes_Type == SZ_OK)
-        stat->CombinedRes_Type = res;
-      return res;
-    }
-
-    PRF_STR("----- decoding ST -----")
-  }
-
-  #endif
-
-
-  *isMT = False;
-
-  {
-    SRes res = XzDecMt_Decode_ST(p
-        #ifndef Z7_ST
-        , tMode
-        #endif
-        , stat
-        );
-
-    #ifndef Z7_ST
-    // we must set error code from MT decoding at first
-    if (p->mainErrorCode != SZ_OK)
-      stat->DecodeRes = p->mainErrorCode;
-    #endif
-
-    XzStatInfo_SetStat(&p->dec,
-        p->finishMode,
-        // p->readProcessed,
-        p->inProcessed,
-        p->codeRes, p->status,
-        False, // truncated
-        stat);
-
-    stat->ReadRes = p->readRes;
-
-    if (res == SZ_OK)
-    {
-      if (p->readRes != SZ_OK
-          // && p->inProcessed == p->readProcessed
-          && stat->DecodeRes == SZ_ERROR_INPUT_EOF)
-      {
-        // we set read error as combined error, only if that error was the reason
-        // of decoding problem
-        res = p->readRes;
-        stat->CombinedRes_Type = SZ_ERROR_READ;
-      }
-      else if (stat->DecodeRes != SZ_OK)
-        res = stat->DecodeRes;
-    }
-
-    stat->CombinedRes = res;
-    if (stat->CombinedRes_Type == SZ_OK)
-      stat->CombinedRes_Type = res;
-    return res;
-  }
-}
-
-#undef PRF
-#undef PRF_STR
-#undef PRF_STR_INT_2
