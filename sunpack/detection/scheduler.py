@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sunpack.analysis import ArchiveAnalyzer
-from sunpack.contracts.discovery import DiscoveryCandidate
+from sunpack.contracts.discovery import DiscoveryCandidate, ResolvedArchiveInput
 from sunpack.contracts.rules import RuleDecision
 from sunpack.detection.formats import CONFIRMERS
 
@@ -14,6 +14,7 @@ class DetectionResult:
     candidate: DiscoveryCandidate
     decision: RuleDecision
     format: str = ""
+    resolved: ResolvedArchiveInput | None = None
 
 
 class DetectionScheduler:
