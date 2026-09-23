@@ -8,7 +8,7 @@ from sunpack.config.advanced_defaults import advanced_config_value
 from sunpack.passwords.internal.lists import dedupe_passwords, read_password_file
 
 
-DIRECTORY_PASSWORD_CONTEXT_FACT = "passwords.directory_context"
+DIRECTORY_PASSWORD_CONTEXT_KEY = "directory_password_context"
 DIRECTORY_PASSWORD_FILE_NAME = "sunpack-passwords.txt"
 def discover_directory_passwords_for_archive(archive_path: str, config: dict | None = None) -> list[str]:
     directory = os.path.dirname(os.path.abspath(archive_path or ""))
@@ -41,10 +41,10 @@ def is_directory_password_file(path: str, config: dict | None = None) -> bool:
 
 
 def directory_password_context_from_task(task: Any) -> list[str]:
-    fact_bag = getattr(task, "fact_bag", None)
-    if fact_bag is None:
+    runtime = getattr(task, "runtime", None)
+    if not isinstance(runtime, dict):
         return []
-    values = fact_bag.get(DIRECTORY_PASSWORD_CONTEXT_FACT)
+    values = runtime.get(DIRECTORY_PASSWORD_CONTEXT_KEY)
     if not isinstance(values, list):
         return []
     return [str(value) for value in values if isinstance(value, str)]
