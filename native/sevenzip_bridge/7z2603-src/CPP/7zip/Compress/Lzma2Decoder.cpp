@@ -240,7 +240,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 
   // UInt64 cpuTicks = GetCpuTicks();
 
-  if (positionedOut && props.numThreads > 1)
+  if (positionedOut && outSize && props.numThreads > 1)
     res = Lzma2DecMt_DecodePositioned(_dec, _prop, &props,
         &outWrap.vt, &positionedWrap.vt,
         outSize, _finishMode,
@@ -287,7 +287,7 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     if (outSize)
     {
       const UInt64 written =
-          positionedOut && isMT ?
+          positionedOut && outSize && isMT ?
               positionedWrap.processed.load(std::memory_order_relaxed) :
               outWrap.Processed;
       if (*outSize != written)
