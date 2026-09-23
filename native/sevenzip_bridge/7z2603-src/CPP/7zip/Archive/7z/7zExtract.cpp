@@ -133,8 +133,6 @@ private:
   HRESULT CloseFile();
   HRESULT ProcessEmptyFiles();
   HRESULT InitPositioned(unsigned startIndex, unsigned numFiles);
-  HRESULT FinishPositioned(Int32 callbackOperationResult);
-  void ResetPositionedCrcForReplay();
 
 public:
   const CDbEx *_db;
@@ -152,6 +150,8 @@ public:
 
   HRESULT Init(unsigned startIndex, const UInt32 *indexes, unsigned numFiles, bool allowPositioned);
   HRESULT WriteAt(UInt64 offset, const void *data, UInt32 size, UInt32 *processedSize);
+  HRESULT FinishPositioned(Int32 callbackOperationResult);
+  void ResetPositionedCrcForReplay();
   bool IsPositionedMode() const { return _positionedMode; }
   HRESULT FlushCorrupted(Int32 callbackOperationResult);
 
