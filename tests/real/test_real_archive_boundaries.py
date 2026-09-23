@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import shutil
+from dataclasses import replace
 import unicodedata
 import zipfile
 from pathlib import Path
@@ -123,8 +124,10 @@ def _extract_direct(
     parts: list[Path] | None = None,
 ):
     task = direct_file_task(str(archive), all_parts=[str(path) for path in (parts or [archive])])
-    task.detected_ext = detected_ext
-    task.fact_bag.set("file.detected_ext", detected_ext)
+    task.ensure_archive_state()
+    state = task.archive_state()
+    source = replace(state.source, format_hint=detected_ext)
+    task.set_archive_state(replace(state, source=source, format_hint=detected_ext))
     scheduler = ExtractionScheduler(max_retries=1)
     try:
         return scheduler.extract(task.ensure_archive_state(), str(output_dir))

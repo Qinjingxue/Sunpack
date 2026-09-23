@@ -1,23 +1,16 @@
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
 from sunpack.extraction.internal.workflow.preflight import PreExtractInspector
+from tests.helpers.archive_tasks import make_archive_task
 
 
-def _task(tmp_path, *, status: str, confidence: str) -> ArchiveTask:
+def _task(tmp_path, *, status: str, confidence: str):
+    del status, confidence
     archive = tmp_path / "sample.part1.123"
     archive.write_bytes(b"archive")
-    facts = FactBag()
-    facts.set("relation.split_completeness_status", status)
-    facts.set("relation.split_completeness_confidence", confidence)
-    facts.set("relation.split_completeness_basis", ["observed_number_gap"])
-    facts.set("relation.split_missing_indices", [2])
-    return ArchiveTask(
-        fact_bag=facts,
+    return make_archive_task(
+        archive,
         key=archive.name,
-        main_path=str(archive),
-        all_parts=[str(archive)],
         logical_name="sample",
-        detected_ext="7z",
+        format_hint="7z",
     )
 
 

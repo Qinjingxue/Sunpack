@@ -6,9 +6,7 @@ import pytest
 
 from sunpack.config.schema import normalize_config
 from sunpack.coordinator.scanner import ScanOrchestrator
-from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.coordinator.target_scan import build_fact_bags_for_targets
-from sunpack.detection.scheduler import DetectionScheduler
+from sunpack.coordinator.target_scan import build_candidates_for_targets
 from tests.helpers.detection_config import with_detection_pipeline
 
 
@@ -139,30 +137,30 @@ def test_missing_middle_split_volume_is_not_emitted_as_a_relation_group(tmp_path
     root = tmp_path / "missing_middle"
     _write_files(root, ["gap.7z.001", "gap.7z.002", "gap.7z.004"])
 
-    bags = build_fact_bags_for_targets([str(root)], config=SCAN_CONFIG)
+    candidates = build_candidates_for_targets([str(root)], config=SCAN_CONFIG)
     gap = [
-        bag for bag in bags
-        if Path(bag.get("candidate.entry_path") or "").name.startswith("gap.7z.")
+        candidate for candidate in candidates
+        if Path(candidate.entry_path).name.startswith("gap.7z.")
     ]
 
     assert len(gap) == 3
-    assert all(not bag.get("relation.is_split_related") for bag in gap)
-    assert all(len(bag.get("candidate.member_paths") or []) == 1 for bag in gap)
+    assert all(not candidate.is_split for candidate in gap)
+    assert all(len(candidate.member_paths) == 1 for candidate in gap)
 
 
 def test_missing_head_split_volume_is_not_emitted_as_a_relation_group(tmp_path):
     root = tmp_path / "missing_head"
     _write_files(root, ["lost.7z.002", "lost.7z.003"])
 
-    bags = build_fact_bags_for_targets([str(root)], config=SCAN_CONFIG)
+    candidates = build_candidates_for_targets([str(root)], config=SCAN_CONFIG)
     lost = [
-        bag for bag in bags
-        if Path(bag.get("candidate.entry_path") or "").name.startswith("lost.7z.")
+        candidate for candidate in candidates
+        if Path(candidate.entry_path).name.startswith("lost.7z.")
     ]
 
     assert len(lost) == 2
-    assert all(not bag.get("relation.is_split_related") for bag in lost)
-    assert all(len(bag.get("candidate.member_paths") or []) == 1 for bag in lost)
+    assert all(not candidate.is_split for candidate in lost)
+    assert all(len(candidate.member_paths) == 1 for candidate in lost)
 
 
 def test_missing_head_split_volume_is_not_recovered_by_filename_only_candidate(tmp_path):
@@ -171,14 +169,14 @@ def test_missing_head_split_volume_is_not_recovered_by_filename_only_candidate(t
     for path in root.iterdir():
         path.write_bytes(b"x" * (1024 * 1024))
 
-    bags = build_fact_bags_for_targets([str(root)], config=SCAN_CONFIG)
+    candidates = build_candidates_for_targets([str(root)], config=SCAN_CONFIG)
     recovered = [
-        bag for bag in bags
-        if str(root / "lost.7z.002") in (bag.get("candidate.member_paths") or [])
+        candidate for candidate in candidates
+        if str(root / "lost.7z.002") in candidate.member_paths
     ]
 
     assert len(recovered) == 1
-    assert [Path(path).name for path in recovered[0].get("candidate.member_paths")] == [
+    assert [Path(path).name for path in recovered[0].member_paths] == [
         "lost.7z.002",
     ]
-    assert not recovered[0].get("relation.is_split_related")
+    assert not recovered[0].is_split

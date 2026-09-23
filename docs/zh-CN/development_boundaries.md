@@ -105,7 +105,7 @@ contracts
 
 ### contracts
 
-`contracts` 是共享数据契约层。`FactBag`、`ArchiveTask`、`ExtractionResult`、`VerificationResult` 和 `RunContext` 应放这里。不要跨模块读取私有字段，例如 `FactBag._facts`。
+`contracts` 是共享数据契约层。`DiscoveryCandidate`、`ResolvedArchiveInput`、`StageResult`、`ArchiveTask`、`ExtractionResult`、`VerificationResult` 和 `RunContext` 应放这里。Discovery 阶段使用类型化契约交换数据，任务级可变知识统一封装在 `ArchiveTask` 内。
 
 ### filesystem
 
@@ -194,10 +194,10 @@ from sunpack.some_domain.internal import ...
 跨领域不要依赖 internal。补 public facade 或把共享契约移到 `contracts`。
 
 ```python
-facts = bag._facts
+knowledge = task.knowledge()
 ```
 
-不要读取私有状态。使用 `FactBag.to_dict()` 或补公开方法。
+不要读取任务私有状态。使用 `ArchiveTask.knowledge()` / 类型化 contract，或补公开方法。
 
 ```python
 from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler

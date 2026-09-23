@@ -6,7 +6,7 @@ from sunpack.contracts.filesystem import FileEntry
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.detection import DetectionScheduler
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.coordinator.target_scan import build_fact_bags_for_targets
+from sunpack.coordinator.target_scan import build_candidates_for_targets
 from tests.helpers.detection_config import with_detection_pipeline
 
 
@@ -738,9 +738,9 @@ def test_target_scan_reuses_session_for_duplicate_directories(tmp_path, monkeypa
 
     monkeypatch.setattr(DirectoryScanner, "scan", counting_scan)
 
-    bags = build_fact_bags_for_targets([str(tmp_path), str(tmp_path)])
+    candidates = build_candidates_for_targets([str(tmp_path), str(tmp_path)])
 
-    assert len([bag for bag in bags if bag.get("file.path") == str(tmp_path / "archive.zip")]) == 1
+    assert len([candidate for candidate in candidates if candidate.entry_path == str(tmp_path / "archive.zip")]) == 1
     assert scan_count == 1
 
 

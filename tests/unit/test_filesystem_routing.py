@@ -12,7 +12,7 @@ from sunpack.contracts.filesystem import (
     FILESYSTEM_ROUTE_RELATIONS,
     FILESYSTEM_ROUTE_RESIDUAL,
 )
-from sunpack.coordinator.scan_session import DetectionScanSession
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 
 
@@ -120,7 +120,7 @@ def test_directory_without_relation_anchor_skips_relations_entirely(tmp_path, mo
     (tmp_path / "payload.gz").write_bytes(gzip.compress(b"payload"))
     (tmp_path / "plain.bin").write_bytes(b"ordinary")
 
-    session = DetectionScanSession(config={})
+    session = DiscoveryScanSession(config={})
     monkeypatch.setattr(
         session.relations,
         "build_candidate_groups",
@@ -129,9 +129,9 @@ def test_directory_without_relation_anchor_skips_relations_entirely(tmp_path, mo
         ),
     )
 
-    bags = session.fact_bags_for_directory(str(tmp_path))
+    candidates = session.candidates_for_directory(str(tmp_path))
 
-    assert {bag.get("filesystem.route") for bag in bags} == {"detection", "residual"}
+    assert {candidate.route for candidate in candidates} == {"detection", "residual"}
 
 
 def _split_7z_bytes() -> bytes:
@@ -152,7 +152,7 @@ def test_relations_anchor_view_recovers_unrouted_split_members_from_raw_snapshot
     first.write_bytes(archive[:32])
     second.write_bytes(archive[32:])
 
-    session = DetectionScanSession(config={})
+    session = DiscoveryScanSession(config={})
     snapshot = session.snapshot_for_directory(str(tmp_path))
     routes = _routing_by_name(snapshot)
 
@@ -173,19 +173,19 @@ def test_main_scan_routes_only_native_container_candidates_through_relations(tmp
     (tmp_path / "payload.gz").write_bytes(gzip.compress(b"payload"))
     (tmp_path / "plain.bin").write_bytes(b"ordinary file")
 
-    session = DetectionScanSession(config={})
-    bags = session.fact_bags_for_directory(str(tmp_path))
+    session = DiscoveryScanSession(config={})
+    candidates = session.candidates_for_directory(str(tmp_path))
     by_name = {
         bag.get("candidate.entry_path").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]: bag
         for bag in bags
     }
 
-    assert by_name["archive.zip"].get("filesystem.route") == "relations"
-    assert by_name["archive.zip"].get("relation.volume_anchor", {}).get("relation_confirmed") is True
+    assert by_name["archive.zip"].route == "relations"
+    assert by_name["archive.zip"].relation_anchor.get("relation_confirmed") is True
 
-    assert by_name["payload.gz"].get("filesystem.route") == "detection"
-    assert by_name["payload.gz"].get("filesystem.format_hint") == "gzip"
-    assert by_name["payload.gz"].get("relation.volume_anchor") is None
+    assert by_name["payload.gz"].route == "detection"
+    assert by_name["payload.gz"].format_hint == "gzip"
+    assert by_name["payload.gz"].relation_anchor == {}
 
-    assert by_name["plain.bin"].get("filesystem.route") == "residual"
-    assert by_name["plain.bin"].get("relation.volume_anchor") is None
+    assert by_name["plain.bin"].route == "residual"
+    assert by_name["plain.bin"].relation_anchor == {}

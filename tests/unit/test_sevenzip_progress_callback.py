@@ -1,7 +1,6 @@
 import zipfile
 
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.extraction.internal.sevenzip.worker_diagnostics import worker_result_payload
 from sunpack.support.resources import get_sevenzip_bridge_worker_path
@@ -13,7 +12,7 @@ def test_native_worker_progress_event_is_forwarded_to_task_callback(tmp_path):
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as handle:
         handle.writestr("payload.bin", payload)
 
-    task = ArchiveTask(fact_bag=FactBag(), main_path=str(archive), all_parts=[str(archive)])
+    task = make_archive_task(archive, format_hint="zip")
     events = []
     runner = SevenZipRunner({})
     runner.worker_path = get_sevenzip_bridge_worker_path()

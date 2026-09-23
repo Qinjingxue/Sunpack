@@ -10,8 +10,7 @@ import zipfile
 import pytest
 
 from sunpack.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, ArchiveInputRange
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
     _NativeWorkerProcess,
@@ -1068,17 +1067,13 @@ def test_sevenzip_runner_observed_no_progress_reports_process_timeout(tmp_path):
 
 
 def _task(path, archive_input=None):
-    bag = FactBag()
-    bag.set("candidate.entry_path", str(path))
-    bag.set("candidate.member_paths", [str(path)])
     if archive_input:
-        bag.set("archive.input", archive_input)
-    return ArchiveTask(
-        fact_bag=bag,
-        main_path=str(path),
-        all_parts=[str(path)],
-        key=str(path),
-    )
+        descriptor = ArchiveInputDescriptor.from_any(
+            archive_input,
+            archive_path=str(path),
+        )
+        return make_task_from_descriptor(descriptor, key=str(path))
+    return make_archive_task(path, key=str(path))
 
 
 def _worker_result(stdout: str) -> dict:

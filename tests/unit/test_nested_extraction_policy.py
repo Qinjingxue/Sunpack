@@ -5,7 +5,7 @@ import pytest
 from sunpack.config.fields.coordinator import normalize_recursive_authorization
 from sunpack.contracts.filesystem import DirectorySnapshot, FileEntry
 from sunpack.coordinator.recursive_authorization import RecursiveAuthorization
-from sunpack.coordinator.scan_session import DetectionScanSession
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.coordinator.task_scan import direct_file_task
 
 
@@ -26,7 +26,7 @@ def _config(**overrides):
 
 def _authorize(root: Path, entries: list[FileEntry], archives: list[Path], *, round_index=2):
     snapshot = DirectorySnapshot.from_entries(root, entries, raw_entries=entries)
-    session = DetectionScanSession(config=_config())
+    session = DiscoveryScanSession(config=_config())
     session.prime_snapshot(str(root), snapshot)
     tasks = [direct_file_task(str(path)) for path in archives]
     return RecursiveAuthorization(_config()).authorize_batch(
@@ -84,7 +84,7 @@ def test_odds_fusion_settings_must_be_finite_and_in_range(field, value):
 
 
 def test_normal_detection_session_retains_raw_snapshots_for_relation_evidence():
-    assert DetectionScanSession(config=_config()).include_raw_snapshots is True
+    assert DiscoveryScanSession(config=_config()).include_raw_snapshots is True
 
 
 def test_second_round_root_child_has_no_special_privilege(tmp_path):

@@ -103,7 +103,7 @@ contracts
 
 ### contracts
 
-`contracts` is the shared data contract layer. `FactBag`, `ArchiveTask`, `ExtractionResult`, `VerificationResult`, and `RunContext` belong here. Do not read private fields across modules, for example `FactBag._facts`.
+`contracts` is the shared data contract layer. `DiscoveryCandidate`, `ResolvedArchiveInput`, `StageResult`, `ArchiveTask`, `ExtractionResult`, `VerificationResult`, and `RunContext` belong here. Discovery stages exchange typed contracts; task-local mutable knowledge stays behind `ArchiveTask`.
 
 ### filesystem
 
@@ -192,10 +192,10 @@ from sunpack.some_domain.internal import ...
 Do not depend on `internal` across domains. Add a public facade, or move the shared contract into `contracts`.
 
 ```python
-facts = bag._facts
+knowledge = task.knowledge()
 ```
 
-Do not read private state. Use `FactBag.to_dict()`, or add a public method.
+Do not read private task state. Use `ArchiveTask.knowledge()` / typed contracts, or add a public method.
 
 ```python
 from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler

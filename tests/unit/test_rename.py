@@ -1,8 +1,6 @@
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.rename.scheduler import OutputReservationRegistry, RenameScheduler
 from sunpack.rename.conflicts import next_available_path
-from sunpack.coordinator.task_scan import direct_file_task
 
 
 def test_detected_extensions_do_not_rename_source_files(tmp_path):
@@ -13,18 +11,9 @@ def test_detected_extensions_do_not_rename_source_files(tmp_path):
     split_second.touch()
     fake_doc.touch()
 
-    split_bag = FactBag()
-    split_bag.set("file.path", str(split_first))
-    split_bag.set("file.detected_ext", ".rar")
-    split_bag.set("file.split_role", "first")
-
-    single_bag = FactBag()
-    single_bag.set("file.path", str(fake_doc))
-    single_bag.set("file.detected_ext", ".zip")
-
     tasks = [
-        direct_file_task(str(split_first), all_parts=[str(split_first), str(split_second)]),
-        ArchiveTask(fact_bag=single_bag, main_path=str(fake_doc), all_parts=[str(fake_doc)]),
+        make_archive_task(split_first, format_hint="rar", logical_name="disguised"),
+        make_archive_task(fake_doc, format_hint="zip", logical_name="fake_doc"),
     ]
 
     assert split_first.exists()
@@ -40,13 +29,12 @@ def test_embedded_carrier_keeps_physical_extension_and_detected_format(tmp_path)
     carrier = tmp_path / "carrier.jpg"
     carrier.touch()
 
-    bag = FactBag()
-    bag.set("file.path", str(carrier))
-    bag.set("file.detected_ext", ".rar")
-    bag.set("file.embedded_archive_found", True)
-    bag.set("embedded_archive.analysis", {"found": True, "detected_ext": ".rar", "offset": 128})
-
-    task = ArchiveTask(fact_bag=bag, main_path=str(carrier), all_parts=[str(carrier)])
+    task = make_archive_task(
+        carrier,
+        format_hint="rar",
+        logical_name="carrier",
+        discovery_source="embedded",
+    )
     assert carrier.exists()
     assert task.main_path == str(carrier)
     assert task.archive_input().format_hint == "rar"
@@ -60,8 +48,8 @@ def test_output_dir_resolver_disambiguates_duplicate_task_outputs(tmp_path):
     zip_file.touch()
     existing_output.write_text("existing file", encoding="utf-8")
 
-    first = ArchiveTask(fact_bag=FactBag(), main_path=str(seven_zip), logical_name="collision")
-    second = ArchiveTask(fact_bag=FactBag(), main_path=str(zip_file), logical_name="collision")
+    first = make_archive_task(seven_zip, logical_name="collision", format_hint="7z")
+    second = make_archive_task(zip_file, logical_name="collision", format_hint="zip")
 
     def default_output_dir(task):
         return str(tmp_path / task.logical_name)
@@ -86,7 +74,7 @@ def test_output_dir_resolver_avoids_existing_output_directory(tmp_path):
     archive.touch()
     (tmp_path / "photos").mkdir()
     (tmp_path / "photos(1)").mkdir()
-    task = ArchiveTask(fact_bag=FactBag(), main_path=str(archive), logical_name="photos")
+    task = make_archive_task(archive, logical_name="photos", format_hint="zip")
 
     resolver = RenameScheduler().build_output_dir_resolver([task], lambda item: str(tmp_path / item.logical_name))
 
@@ -95,8 +83,8 @@ def test_output_dir_resolver_avoids_existing_output_directory(tmp_path):
 
 def test_output_reservations_disambiguate_concurrent_requests_before_directories_exist(tmp_path):
     registry = OutputReservationRegistry()
-    first_task = ArchiveTask(fact_bag=FactBag(), main_path=str(tmp_path / "a.zip"))
-    second_task = ArchiveTask(fact_bag=FactBag(), main_path=str(tmp_path / "b.zip"))
+    first_task = make_archive_task(tmp_path / "a.zip", format_hint="zip")
+    second_task = make_archive_task(tmp_path / "b.zip", format_hint="zip")
     default = lambda _task: str(tmp_path / "shared")
 
     first = RenameScheduler(registry, "first").build_output_dir_resolver([first_task], default)

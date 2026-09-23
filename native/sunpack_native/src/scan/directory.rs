@@ -711,7 +711,7 @@ struct DirectoryScanProfile {
     path_matching: Duration,
     record_building: Duration,
     traversal_overhead: Duration,
-    relation_anchor_population: Duration,
+    file_probe_population: Duration,
     scan_total: Duration,
     directories_opened: usize,
     entries_seen: usize,
@@ -763,8 +763,8 @@ impl DirectoryScanProfile {
             duration_ns(self.traversal_overhead),
         )?;
         dict.set_item(
-            "relation_anchor_population_ns",
-            duration_ns(self.relation_anchor_population),
+            "file_probe_population_ns",
+            duration_ns(self.file_probe_population),
         )?;
         dict.set_item("scan_total_ns", duration_ns(self.scan_total))?;
         dict.set_item("snapshot_building_ns", duration_ns(snapshot_building))?;
@@ -1008,7 +1008,7 @@ pub(crate) fn profile_directory_scan(
     if include_relation_anchors {
         let started = Instant::now();
         populate_relation_anchors(&mut entries.raw);
-        profile.relation_anchor_population = started.elapsed();
+        profile.file_probe_population = started.elapsed();
     }
 
     let snapshot_started = Instant::now();

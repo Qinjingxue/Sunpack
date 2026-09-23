@@ -17,6 +17,7 @@ from tests.helpers.tool_config import get_optional_rar, get_test_tools
 from tests.real.plan1_real_archives.plan1_support import (
     EXPECTED_DETECTED_EXT,
     assert_plan1_success,
+    detected_ext,
     marker_text_contained,
     run_plan1_pipeline,
 )
@@ -53,9 +54,9 @@ def test_plan1_zip64_archive_structural_and_detection(tmp_path, plan1_error):
 
     hits = detect_archive_hits(case.entry_path)
     plan1_error["detection_hit_count"] = len(hits)
-    plan1_error["detected_ext"] = hits[0].fact_bag.get("file.detected_ext") if hits else None
+    plan1_error["detected_ext"] = detected_ext(hits[0]) if hits else None
     assert len(hits) == 1
-    assert hits[0].fact_bag.get("file.detected_ext") == ".zip"
+    assert detected_ext(hits[0]) == ".zip"
 
 
 def test_plan1_zip64_archive_extracts_and_detects(tmp_path, plan1_error):
@@ -150,9 +151,9 @@ def test_plan1_multi_member_streams_extract_all_members(
 
     hits = detect_archive_hits(case.entry_path)
     plan1_error["detection_hit_count"] = len(hits)
-    plan1_error["detected_ext"] = hits[0].fact_bag.get("file.detected_ext") if hits else None
+    plan1_error["detected_ext"] = detected_ext(hits[0]) if hits else None
     assert len(hits) == 1
-    assert hits[0].fact_bag.get("file.detected_ext") == expected_ext
+    assert detected_ext(hits[0]) == expected_ext
 
     summary = run_plan1_pipeline(case.archive_dir)
     plan1_error["pipeline_success_count"] = summary.success_count

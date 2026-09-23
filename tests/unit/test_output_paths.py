@@ -1,15 +1,9 @@
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.support.output_paths import default_output_dir_for_task
 
 
 def _task(path):
-    return ArchiveTask(
-        fact_bag=FactBag(),
-        main_path=str(path),
-        all_parts=[str(path)],
-        logical_name=path.stem,
-    )
+    return make_archive_task(path, logical_name=path.stem)
 
 
 def test_default_output_dir_uses_archive_stem_when_available(tmp_path):

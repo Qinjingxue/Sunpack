@@ -8,8 +8,8 @@ import pytest
 
 from sunpack.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.filesystem.directory_scanner import DirectoryScanner
-from sunpack.coordinator.target_scan import build_fact_bags_for_target
-from sunpack.coordinator.target_groups import relation_group_to_fact_bag
+from sunpack.coordinator.target_scan import build_candidates_for_target
+from sunpack.coordinator.target_groups import relation_group_to_candidate
 from sunpack.relations import RelationsScheduler
 from sunpack.relations.internal.group_builder import _relation_archive_input
 from tests.helpers.fs_builder import make_minimal_7z
@@ -23,10 +23,10 @@ def test_plain_file_relation_omits_empty_volume_anchor(tmp_path):
     path = tmp_path / "ordinary.bin"
     path.write_bytes(b"ordinary data")
 
-    bags = build_fact_bags_for_target(str(path))
+    candidates = build_candidates_for_target(str(path))
 
-    assert bags
-    assert all(bag.get("relation.volume_anchor") is None for bag in bags)
+    assert candidates
+    assert all(candidate.relation_anchor == {} for candidate in candidates)
 
 
 def _minimal_rar4_single() -> bytes:
@@ -113,8 +113,9 @@ def test_pe_zip_sfx_is_confirmed_and_projected_as_file_range(tmp_path):
     assert metadata["pe_structure"] is True
     assert metadata["structure_offset"] == pe_end
 
-    bag = relation_group_to_fact_bag(group)
-    archive_input = bag.get("archive.input")
+    candidate = relation_group_to_candidate(group)
+    assert candidate.archive_input is not None
+    archive_input = candidate.archive_input.to_dict()
     assert archive_input["open_mode"] == "file_range"
     assert archive_input["format_hint"] == "zip"
     assert archive_input["parts"][0]["start"] == pe_end

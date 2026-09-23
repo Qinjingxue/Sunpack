@@ -1,7 +1,7 @@
 import io
 import zipfile
 
-from sunpack.contracts.detection import FactBag
+from sunpack.contracts.discovery import DiscoveryCandidate
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.detection.scheduler import DetectionScheduler
 from sunpack.embedded.discovery import select_single_candidate_ratio
@@ -14,11 +14,19 @@ def _zip_bytes() -> bytes:
     return output.getvalue()
 
 
-def _bag(path, size):
-    bag = FactBag()
-    bag.set("file.path", str(path))
-    bag.set("file.size", size)
-    return bag
+def _candidate(path, size: int, *, format_hint: str = "", route: str = "residual", relation_anchor=None):
+    value = str(path)
+    return DiscoveryCandidate(
+        entry_path=value,
+        member_paths=(value,),
+        logical_name=path.name,
+        carrier_path=value,
+        cleanup_paths=(value,),
+        route=route,
+        format_hint=format_hint,
+        size=size,
+        relation_anchor=dict(relation_anchor or {}),
+    )
 
 
 def test_disguised_zip_is_resolved_by_relations(tmp_path):
@@ -48,15 +56,26 @@ def test_embedded_switch_prevents_carrier_scan(tmp_path):
 def test_detection_does_not_accept_relation_metadata(tmp_path):
     path = tmp_path / "fake.zip"
     path.write_bytes(b"plain text")
-    bag = FactBag()
-    bag.set("file.path", str(path))
-    bag.set("relation.volume_anchor", {"format": "zip", "relation_confirmed": True})
-    assert DetectionScheduler({}).evaluate_bag(bag).should_extract is False
+    candidate = _candidate(
+        path,
+        path.stat().st_size,
+        format_hint="zip",
+        route="detection",
+        relation_anchor={"format": "zip", "relation_confirmed": True},
+    )
+
+    accepted, _ = DetectionScheduler({}).confirm(candidate)
+
+    assert accepted is False
 
 
 def test_recursive_embedded_ratio_uses_individual_candidate_share(tmp_path):
     paths = [tmp_path / name for name in ("large", "medium", "small")]
-    bags = [_bag(path, size) for path, size in zip(paths, (70, 25, 5))]
-    assert select_single_candidate_ratio(bags, 0.3) == [bags[0]]
-    assert select_single_candidate_ratio(bags, 0.05) == bags
-    assert select_single_candidate_ratio(bags, 0) == []
+    candidates = [
+        _candidate(path, size)
+        for path, size in zip(paths, (70, 25, 5))
+    ]
+
+    assert select_single_candidate_ratio(candidates, 0.3) == [candidates[0]]
+    assert select_single_candidate_ratio(candidates, 0.05) == candidates
+    assert select_single_candidate_ratio(candidates, 0) == []

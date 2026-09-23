@@ -16,8 +16,7 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
     _apply_native_environment,
@@ -62,13 +61,8 @@ def _running_state(**overrides) -> dict:
     return state
 
 
-def _task(archive: Path) -> ArchiveTask:
-    return ArchiveTask(
-        fact_bag=FactBag(),
-        main_path=str(archive),
-        all_parts=[str(archive)],
-        key=str(archive),
-    )
+def _task(archive: Path):
+    return make_archive_task(archive, key=str(archive))
 
 
 def _write_script(path: Path, lines: list[str], job_id: str = "event-job") -> Path:

@@ -2,7 +2,6 @@ import io
 import tarfile
 
 from sunpack.analysis import ArchiveAnalyzer, MultiVolumeAnalysisSource, TarProbeOptions
-from sunpack.contracts.detection import FactBag
 from sunpack.detection.formats.tar import confirm as confirm_tar
 
 

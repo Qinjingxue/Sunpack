@@ -177,12 +177,6 @@ class ArchiveKnowledge:
         raw = self.get(f"{namespace}.history" if namespace else "history", [])
         return [dict(item) for item in raw if isinstance(item, dict)] if isinstance(raw, list) else []
 
-    def mirror_fact_bag(self, facts: dict[str, Any], *, source_layer: str = "fact_bag") -> "ArchiveKnowledge":
-        for key, value in facts.items():
-            if key in {"archive.knowledge", "archive.state"}:
-                continue
-            self.set(key, value, source_layer=source_layer)
-        return self
 
     def _collect_flags(self, value: Any, output: list[str]) -> None:
         if isinstance(value, dict):

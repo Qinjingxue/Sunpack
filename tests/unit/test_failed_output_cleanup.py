@@ -2,15 +2,14 @@ from __future__ import annotations
 
 import pytest
 
-from sunpack.contracts.detection import FactBag
 from sunpack.contracts.extraction import ExtractionResult
 from sunpack.contracts.failures import FailureInfo, FailureKind
 from sunpack.contracts.run_context import RunContext
-from sunpack.contracts.tasks import ArchiveTask
 from sunpack.contracts.verification import VerificationResult
 from sunpack.coordinator.extraction_batch import BatchExtractionOutcome, ExtractionBatchRunner
 from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
+from tests.helpers.archive_tasks import make_archive_task
 
 
 @pytest.mark.parametrize("with_zero_file", [False, True])
@@ -100,12 +99,10 @@ def test_collect_result_applies_main_pipeline_cleanup_after_diagnostics(tmp_path
     output = tmp_path / "broken"
     output.mkdir()
     (output / "empty.txt").write_bytes(b"")
-    task = ArchiveTask(
-        fact_bag=FactBag(),
-        main_path=str(archive),
-        all_parts=[str(archive)],
+    task = make_archive_task(
+        archive,
         logical_name="broken",
-        detected_ext="zip",
+        format_hint="zip",
     )
     extraction = ExtractionResult(
         success=False,

@@ -1,9 +1,8 @@
 import pytest
 
-from sunpack.contracts.detection import FactBag
 from sunpack.contracts.failures import FailureInfo, FailureKind
-from sunpack.contracts.tasks import ArchiveTask
 from sunpack.contracts.extraction import ExtractionResult
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.passwords.candidates import PasswordCandidatePipeline
 from sunpack.passwords.job import PasswordJob
 from sunpack.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
@@ -153,11 +152,5 @@ class _StaticVerifier:
         return self.result
 
 
-def _task(path) -> ArchiveTask:
-    return ArchiveTask(
-        fact_bag=FactBag(),
-        key=str(path),
-        main_path=str(path),
-        all_parts=[str(path)],
-        decision="archive",
-    )
+def _task(path):
+    return make_archive_task(path, key=str(path))

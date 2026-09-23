@@ -1,8 +1,7 @@
 import zipfile
 
 from sunpack.config.schema import normalize_config
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.contracts.extraction import ExtractionResult
 from sunpack.passwords import PasswordSession
 from sunpack.verification import (
@@ -282,7 +281,6 @@ def _task_and_result(tmp_path):
     out_dir = tmp_path / "sample"
     out_dir.mkdir()
     (out_dir / "inside.txt").write_text("hello", encoding="utf-8")
-    bag = FactBag()
-    task = ArchiveTask(fact_bag=bag, key="sample-key", main_path=str(archive), all_parts=[str(archive)])
+    task = make_archive_task(archive, key="sample-key", format_hint="zip")
     result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
     return task, result

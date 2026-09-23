@@ -8,8 +8,7 @@ from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy as Out
 from sunpack.config.schema import normalize_config
 from sunpack.extraction.scheduler import ExtractionScheduler
 from sunpack.extraction.internal.sevenzip.metadata import ArchiveMetadataScanResult
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
 
 
@@ -32,7 +31,7 @@ def runner_config():
 class FakePasswordResolver:
     password_tester = SimpleNamespace(passwords=[])
 
-    def resolve(self, archive_path, fact_bag, part_paths=None):
+    def resolve(self, archive_path, task, part_paths=None, **_kwargs):
         return SimpleNamespace(password="", test_result=None, error_text="")
 
 
@@ -81,9 +80,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
                 calls.append(kwargs) or SimpleNamespace(returncode=0, stdout="", stderr="")
             )
-            task = ArchiveTask(
-                fact_bag=FactBag(), main_path=str(archive_path), all_parts=[str(archive_path)]
-            )
+            task = make_archive_task(archive_path)
 
             result = extractor.extract(task, str(out_dir))
 
@@ -117,14 +114,9 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.metadata_scanner = FakeMetadataScanner()
             extractor.rename_scheduler = CandidateStager()
 
-            bag = FactBag()
-            task = ArchiveTask(
-                fact_bag=bag,
-                main_path=str(archive_path),
-                all_parts=[str(archive_path)],
-                carrier_path=str(launcher_path),
-                cleanup_parts=[str(archive_path), str(launcher_path)],
-            )
+            task = make_archive_task(archive_path)
+            task.carrier_path = str(launcher_path)
+            task.cleanup_parts = [str(archive_path), str(launcher_path)]
 
             succeeded = SimpleNamespace(returncode=0, stdout="", stderr="")
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: succeeded
@@ -147,8 +139,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             failed = SimpleNamespace(returncode=8, stdout="", stderr="write error")
             succeeded = SimpleNamespace(returncode=0, stdout="", stderr="")
 
-            bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = make_archive_task(archive_path)
 
             attempts = iter([failed, succeeded])
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: next(attempts)
@@ -182,8 +173,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                     return failed
                 return succeeded
 
-            bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = make_archive_task(archive_path)
 
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: fake_run()
             extractor.retry_policy.backoff = lambda _retry_count: None
@@ -204,8 +194,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.rename_scheduler = FakeStager()
 
             failed = SimpleNamespace(returncode=2, stdout="", stderr="Headers Error")
-            bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = make_archive_task(archive_path)
 
             calls = 0
 
@@ -281,8 +270,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                 }
                 return SimpleNamespace(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
-            bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = make_archive_task(archive_path)
             extractor.sevenzip_runner.extract_attempt = fake_extract
 
             result = extractor.extract(task, str(out_dir))
@@ -335,8 +323,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                 }
                 return SimpleNamespace(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
-            bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = make_archive_task(archive_path)
             extractor.sevenzip_runner.extract_attempt = fake_extract
 
             result = extractor.extract(task, str(out_dir))
@@ -357,8 +344,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.rename_scheduler = FakeStager()
 
             failed = SimpleNamespace(returncode=-100, stdout="", stderr="7z process failed to start")
-            bag = FactBag()
-            task = ArchiveTask(fact_bag=bag, main_path=str(archive_path), all_parts=[str(archive_path)])
+            task = make_archive_task(archive_path)
 
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: failed
             extractor.retry_policy.backoff = lambda _retry_count: None

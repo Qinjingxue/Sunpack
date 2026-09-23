@@ -1,10 +1,9 @@
 from types import SimpleNamespace
 
-from sunpack.contracts.detection import FactBag
 from sunpack.passwords.directory_context import DirectoryPasswordContextStore
 from sunpack.passwords.internal.clipboard import _plausible_passwords
 from sunpack.passwords.internal.local_files import (
-    DIRECTORY_PASSWORD_CONTEXT_FACT,
+    DIRECTORY_PASSWORD_CONTEXT_KEY,
     discover_directory_passwords_for_archive,
     is_directory_password_file,
 )
@@ -32,21 +31,22 @@ def test_ignores_other_same_directory_txt_files(tmp_path):
 def test_directory_password_context_inherits_and_extends(tmp_path):
     parent = tmp_path / "parent"
     parent.mkdir()
-    child = tmp_path / "parent" / "child"
+    child = parent / "child"
     child.mkdir()
     archive = child / "nested.zip"
     archive.write_bytes(b"not really an archive")
     (child / "sunpack-passwords.txt").write_text("inner-secret\nouter-secret\n", encoding="utf-8")
 
     store = DirectoryPasswordContextStore({})
-    parent_task = SimpleNamespace(fact_bag=FactBag())
-    parent_task.fact_bag.set(DIRECTORY_PASSWORD_CONTEXT_FACT, ["outer-secret"])
+    parent_task = SimpleNamespace(runtime={
+        DIRECTORY_PASSWORD_CONTEXT_KEY: ["outer-secret"],
+    })
     store.remember(str(parent), parent_task)
-    task = SimpleNamespace(main_path=str(archive), fact_bag=FactBag())
+    task = SimpleNamespace(main_path=str(archive), runtime={})
 
     store.annotate([task])
 
-    assert task.fact_bag.get(DIRECTORY_PASSWORD_CONTEXT_FACT) == ["outer-secret", "inner-secret"]
+    assert task.runtime[DIRECTORY_PASSWORD_CONTEXT_KEY] == ["outer-secret", "inner-secret"]
 
 
 def test_clipboard_password_filter_rejects_obvious_non_text_payloads():

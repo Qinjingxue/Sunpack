@@ -1,12 +1,34 @@
 from types import SimpleNamespace
 
-from sunpack.contracts.detection import FactBag
+from sunpack.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.passwords.job import PasswordJob
+from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 from sunpack.passwords.result import PasswordResolutionStatus
 from sunpack.passwords.scheduler import PasswordScheduler, PasswordSearchResult, PasswordSearchStatus
 from sunpack.passwords import PasswordResolver, PasswordSession, PasswordStore
 from sunpack.passwords.internal.store import MAX_RECENT_PASSWORDS
 from sunpack.passwords.verifier import PasswordBatchVerification, PasswordVerifierChain
+
+
+def _task_with_structure(format_hint: str, structure: dict, *, path: str | None = None):
+    task = make_archive_task(path or f"sample.{format_hint}", format_hint=format_hint)
+    knowledge = task.knowledge()
+    knowledge.set(
+        f"format.{format_hint}.structure",
+        structure,
+        source_layer="tests",
+        source_module="password_store",
+    )
+    task.set_knowledge(knowledge)
+    return task
+
+
+def _task_with_knowledge(path: str, payload: dict, *, format_hint: str = ""):
+    task = make_archive_task(path, format_hint=format_hint)
+    knowledge = task.knowledge()
+    knowledge.merge(payload, source_layer="tests", source_module="password_store")
+    task.set_knowledge(knowledge)
+    return task
 
 
 def test_password_store_orders_user_recent_builtin_and_dedupes():
@@ -51,8 +73,7 @@ def test_password_store_bounds_initial_recent_success_history():
 
 
 def test_password_resolver_falls_back_to_relations_archive_input_before_analysis():
-    bag = FactBag()
-    bag.set("archive.input", {
+    descriptor = ArchiveInputDescriptor.from_dict({
         "kind": "archive_input",
         "entry_path": "carrier.exe",
         "open_mode": "file_range",
@@ -60,26 +81,19 @@ def test_password_resolver_falls_back_to_relations_archive_input_before_analysis
         "logical_name": "carrier",
         "parts": [{"path": "carrier.exe", "start": 8192}],
         "segment": {"start": 8192, "source": "relations"},
-    })
-    bag.set("relation.format_hint", "rar")
+    }, archive_path="carrier.exe")
+    task = make_task_from_descriptor(descriptor)
 
-    selected = PasswordResolver._archive_input_for_password_probe(bag)
+    selected = PasswordResolver._archive_input_for_password_probe(task)
 
     assert selected["open_mode"] == "file_range"
     assert selected["parts"][0]["start"] == 8192
-    assert PasswordResolver._archive_key_from_fact_bag(bag) == "carrier"
+    assert task.logical_name == "carrier"
 
 
 def test_password_resolver_prefers_formal_password_probe_input():
-    bag = FactBag()
-    bag.set("archive.knowledge", {
+    task = _task_with_knowledge("carrier.exe", {
         "source": {
-            "input": {
-                "kind": "archive_input",
-                "entry_path": "carrier.exe",
-                "open_mode": "sfx_with_volumes",
-                "format_hint": "rar",
-            },
             "password_probe_input": {
                 "kind": "archive_input",
                 "entry_path": "carrier.exe",
@@ -88,9 +102,9 @@ def test_password_resolver_prefers_formal_password_probe_input():
                 "parts": [{"path": "carrier.exe", "start": 4096}],
             },
         },
-    })
+    }, format_hint="rar")
 
-    selected = PasswordResolver._archive_input_for_password_probe(bag)
+    selected = PasswordResolver._archive_input_for_password_probe(task)
 
     assert selected["open_mode"] == "file_range"
     assert selected["parts"][0]["start"] == 4096
@@ -198,8 +212,7 @@ def test_password_resolver_records_archive_password_in_session():
 
 
 def test_password_resolver_trusts_validated_unencrypted_structure_without_retesting():
-    bag = FactBag()
-    bag.set("zip.eocd_structure", {
+    bag = _task_with_structure("zip", {
         "plausible": True,
         "central_directory_present": True,
         "central_directory_walk_ok": True,
@@ -211,7 +224,7 @@ def test_password_resolver_trusts_validated_unencrypted_structure_without_retest
     session = PasswordSession()
     resolver = PasswordResolver(tester, session)
 
-    result = resolver.resolve("sample.zip", fact_bag=bag, archive_key="archive-key")
+    result = resolver.resolve("sample.zip", task=bag, archive_key="archive-key")
 
     assert result.password == ""
     assert result.encrypted is False
@@ -222,8 +235,7 @@ def test_password_resolver_trusts_validated_unencrypted_structure_without_retest
 
 
 def test_password_resolver_trusts_validated_encrypted_structure_without_empty_password_test():
-    bag = FactBag()
-    bag.set("zip.eocd_structure", {
+    bag = _task_with_structure("zip", {
         "plausible": True,
         "central_directory_present": True,
         "central_directory_walk_ok": True,
@@ -235,7 +247,7 @@ def test_password_resolver_trusts_validated_encrypted_structure_without_empty_pa
     session = PasswordSession()
     resolver = PasswordResolver(tester, session)
 
-    result = resolver.resolve("sample.zip", fact_bag=bag, archive_key="archive-key")
+    result = resolver.resolve("sample.zip", task=bag, archive_key="archive-key")
 
     assert result.password == "secret"
     assert tester.test_without_password_calls == 0
@@ -243,8 +255,7 @@ def test_password_resolver_trusts_validated_encrypted_structure_without_empty_pa
 
 
 def test_password_resolver_uses_validated_rar_structure_password_marker():
-    bag = FactBag()
-    bag.set("rar.structure", {
+    bag = _task_with_structure("rar", {
         "plausible": True,
         "strong_accept": True,
         "header_crc_ok": True,
@@ -255,7 +266,7 @@ def test_password_resolver_uses_validated_rar_structure_password_marker():
     session = PasswordSession()
     resolver = PasswordResolver(tester, session)
 
-    result = resolver.resolve("sample.rar", fact_bag=bag, archive_key="archive-key")
+    result = resolver.resolve("sample.rar", task=bag, archive_key="archive-key")
 
     assert result.password == "secret"
     assert result.encrypted is True
@@ -264,8 +275,7 @@ def test_password_resolver_uses_validated_rar_structure_password_marker():
 
 
 def test_password_resolver_uses_validated_seven_zip_encryption_fact():
-    bag = FactBag()
-    bag.set("7z.structure", {
+    bag = _task_with_structure("7z", {
         "plausible": True,
         "strong_accept": True,
         "next_header_crc_ok": True,
@@ -277,7 +287,7 @@ def test_password_resolver_uses_validated_seven_zip_encryption_fact():
     tester = FakePasswordTester()
     resolver = PasswordResolver(tester, PasswordSession())
 
-    result = resolver.resolve("sample.7z", fact_bag=bag, archive_key="archive-key")
+    result = resolver.resolve("sample.7z", task=bag, archive_key="archive-key")
 
     assert result.password == "secret"
     assert result.encrypted is True
@@ -286,8 +296,7 @@ def test_password_resolver_uses_validated_seven_zip_encryption_fact():
 
 
 def test_password_resolver_does_not_recheck_clear_wrong_password_after_encrypted_search():
-    bag = FactBag()
-    bag.set("zip.eocd_structure", {
+    bag = _task_with_structure("zip", {
         "plausible": True,
         "central_directory_present": True,
         "central_directory_walk_ok": True,
@@ -299,7 +308,7 @@ def test_password_resolver_does_not_recheck_clear_wrong_password_after_encrypted
     session = PasswordSession()
     resolver = PasswordResolver(tester, session)
 
-    result = resolver.resolve("sample.zip", fact_bag=bag, archive_key="archive-key")
+    result = resolver.resolve("sample.zip", task=bag, archive_key="archive-key")
 
     assert result.password is None
     assert result.status == PasswordResolutionStatus.CANDIDATES_EXHAUSTED
@@ -308,8 +317,7 @@ def test_password_resolver_does_not_recheck_clear_wrong_password_after_encrypted
 
 
 def test_password_resolver_preserves_fast_damage_result_without_full_retest():
-    bag = FactBag()
-    bag.set("zip.eocd_structure", {
+    bag = _task_with_structure("zip", {
         "plausible": True,
         "central_directory_present": True,
         "central_directory_walk_ok": True,
@@ -321,7 +329,7 @@ def test_password_resolver_preserves_fast_damage_result_without_full_retest():
     session = PasswordSession()
     resolver = PasswordResolver(tester, session)
 
-    result = resolver.resolve("sample.zip", fact_bag=bag, archive_key="archive-key")
+    result = resolver.resolve("sample.zip", task=bag, archive_key="archive-key")
 
     assert result.password is None
     assert result.status == PasswordResolutionStatus.DAMAGED
@@ -376,8 +384,7 @@ def test_password_resolver_routes_unknown_embedded_range_through_normal_schedule
     fast = RecordingNotRequiredFastVerifier()
     scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
     resolver = PasswordResolver(tester, PasswordSession(), scheduler)
-    bag = FactBag()
-    bag.set("archive.knowledge", {
+    bag = _task_with_knowledge("carrier.bin", {
         "source": {
             "password_probe_input": {
                 "open_mode": "file_range",
@@ -387,7 +394,7 @@ def test_password_resolver_routes_unknown_embedded_range_through_normal_schedule
         },
     })
 
-    result = resolver.resolve("carrier.bin", fact_bag=bag, archive_key="carrier#segment-1")
+    result = resolver.resolve("carrier.bin", task=bag, archive_key="carrier#segment-1")
 
     assert fast.batches == [["", "wrong-password"]]
     assert result.password == ""
@@ -399,8 +406,7 @@ def test_password_resolver_scopes_structure_facts_to_active_embedded_format():
     tester = FakePasswordTester()
     scheduler = QueuePasswordScheduler()
     resolver = PasswordResolver(tester, PasswordSession(), scheduler)
-    bag = FactBag()
-    bag.set("zip.eocd_structure", {
+    bag = _task_with_structure("zip", {
         "plausible": True,
         "central_directory_present": True,
         "central_directory_walk_ok": True,
@@ -408,19 +414,22 @@ def test_password_resolver_scopes_structure_facts_to_active_embedded_format():
         "encryption_scan_complete": True,
         "password_required": True,
     })
-    bag.set("archive.knowledge", {
-        "source": {
-            "password_probe_input": {
-                "kind": "archive_input",
-                "entry_path": "carrier.bin",
-                "open_mode": "file_range",
-                "format_hint": "tar",
-                "parts": [{"path": "carrier.bin", "start": 100, "end": 200}],
-            },
+    knowledge = bag.knowledge()
+    knowledge.set(
+        "source.password_probe_input",
+        {
+            "kind": "archive_input",
+            "entry_path": "carrier.bin",
+            "open_mode": "file_range",
+            "format_hint": "tar",
+            "parts": [{"path": "carrier.bin", "start": 100, "end": 200}],
         },
-    })
+        source_layer="tests",
+        source_module="password_store",
+    )
+    bag.set_knowledge(knowledge)
 
-    result = resolver.resolve("carrier.bin", fact_bag=bag, archive_key="carrier#tar")
+    result = resolver.resolve("carrier.bin", task=bag, archive_key="carrier#tar")
 
     # The carrier's encrypted ZIP fact belongs to a different logical range.
     # The authoritative TAR descriptor proves that the active segment has no
@@ -436,8 +445,7 @@ def test_password_resolver_skips_candidates_for_intrinsically_unencrypted_format
         tester = FakePasswordTester()
         scheduler = QueuePasswordScheduler()
         resolver = PasswordResolver(tester, PasswordSession(), scheduler)
-        bag = FactBag()
-        bag.set("archive.knowledge", {
+        bag = _task_with_knowledge("carrier.bin", {
             "source": {
                 "password_probe_input": {
                     "kind": "archive_input",
@@ -451,7 +459,7 @@ def test_password_resolver_skips_candidates_for_intrinsically_unencrypted_format
 
         result = resolver.resolve(
             "carrier.bin",
-            fact_bag=bag,
+            task=bag,
             archive_key=f"carrier#{format_hint}",
         )
 
@@ -506,8 +514,7 @@ def test_confirmed_password_is_promoted_across_already_planned_archives():
     )
 
     resolver = PasswordResolver(tester, PasswordSession(), QueuePasswordScheduler())
-    required = FactBag()
-    required.set("zip.eocd_structure", {
+    required = _task_with_structure("zip", {
         "plausible": True,
         "central_directory_present": True,
         "central_directory_walk_ok": True,
@@ -515,11 +522,11 @@ def test_confirmed_password_is_promoted_across_already_planned_archives():
         "encryption_scan_complete": True,
         "password_required": True,
     })
-    archive_a = resolver.resolve("first.unknown", fact_bag=required, archive_key="first")
-    archive_b = resolver.resolve("second.unknown", fact_bag=required, archive_key="second")
+    archive_a = resolver.resolve("first.unknown", task=required, archive_key="first")
+    archive_b = resolver.resolve("second.unknown", task=required, archive_key="second")
 
     resolver.confirm_extraction(archive_a, password="shared-secret")
-    promoted_b = resolver.resolve("second.unknown", fact_bag=required, archive_key="second")
+    promoted_b = resolver.resolve("second.unknown", task=required, archive_key="second")
 
     assert archive_a.candidate_passwords == ("wrong-a", "wrong-b", "shared-secret")
     assert promoted_b.password == "shared-secret"
@@ -531,8 +538,7 @@ def test_hundreds_of_archives_reuse_confirmed_password_after_one_candidate_batch
     tester.password_store = PasswordStore.from_sources(cli_passwords=passwords, builtin_passwords=[])
 
     resolver = PasswordResolver(tester, PasswordSession(), QueuePasswordScheduler())
-    required = FactBag()
-    required.set("zip.eocd_structure", {
+    required = _task_with_structure("zip", {
         "plausible": True,
         "central_directory_present": True,
         "central_directory_walk_ok": True,
@@ -540,14 +546,14 @@ def test_hundreds_of_archives_reuse_confirmed_password_after_one_candidate_batch
         "encryption_scan_complete": True,
         "password_required": True,
     })
-    resolution = resolver.resolve("archive-0.mixed", fact_bag=required, archive_key="archive-0")
+    resolution = resolver.resolve("archive-0.mixed", task=required, archive_key="archive-0")
     assert resolution.candidate_passwords == tuple(passwords)
     resolver.confirm_extraction(resolution, password="shared-secret")
 
     for index in range(1, 100):
         resolution = resolver.resolve(
             f"archive-{index}.mixed",
-            fact_bag=required,
+            task=required,
             archive_key=f"archive-{index}",
         )
         assert resolution.password == "shared-secret"

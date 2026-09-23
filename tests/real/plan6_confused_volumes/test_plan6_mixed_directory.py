@@ -6,7 +6,7 @@ from tests.helpers.detection_probe import detect_archive_hits
 from tests.helpers.marker_utils import marker_was_extracted
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_rar
-from tests.real.plan1_real_archives.plan1_support import run_plan1_pipeline
+from tests.real.plan1_real_archives.plan1_support import detected_ext, run_plan1_pipeline
 from tests.real.plan6_confused_volumes.plan6_support import (
     SCENARIOS,
     apply_volume_confusion,
@@ -78,13 +78,13 @@ def test_plan6_confused_encrypted_groups_mixed_in_one_directory(tmp_path, plan6_
         hits = detect_archive_hits(case.entry_path)
         plan6_error[f"detect_{archive_format}"] = {
             "expected_ext": f".{archive_format}",
-            "actual_ext": hits[0].fact_bag.get("file.detected_ext") if hits else None,
+            "actual_ext": detected_ext(hits[0]) if hits else None,
             "hit_count": len(hits),
-            "member_count": len(hits[0].fact_bag.get("candidate.member_paths") or []) if hits else 0,
+            "member_count": len(hits[0].member_paths) if hits else 0,
         }
         assert len(hits) == 1, f"{archive_format}: expected one hit, got {len(hits)}"
-        assert hits[0].fact_bag.get("file.detected_ext") == f".{archive_format}"
-        assert len(hits[0].fact_bag.get("candidate.member_paths") or []) == expected_count[archive_format]
+        assert detected_ext(hits[0]) == f".{archive_format}"
+        assert len(hits[0].member_paths) == expected_count[archive_format]
 
     summary = run_plan1_pipeline(common, passwords=passwords)
     plan6_error["pipeline_success_count"] = summary.success_count
