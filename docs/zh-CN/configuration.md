@@ -340,14 +340,14 @@ Native worker 以 CPU credit 作为解压并发预算。默认 nominal budget �
 | 名称 | 作用 |
 | --- | --- |
 | `embedded_archive` | 处理普通归档识别未解决且获准进行嵌入扫描的文件。 |
-| `zip_structure` | 检查 ZIP local header。 |
-| `zip_eocd_structure` | 检查 ZIP EOCD 和 central directory。 |
+| `zip_structure` | 可选 ZIP 结构分析处理器；默认归档发现路径已由 Relations 解析 ZIP 身份与拓扑。 |
+| `zip_eocd_structure` | 可选 ZIP EOCD/central directory 分析处理器；已退出默认 detection 热路径。 |
 | `tar_header_structure` | 检查 TAR header checksum 和 ustar marker。 |
 | `compression_stream_structure` | 检查 gzip、bzip2、xz、zstd 轻量流结构。 |
 | `pe_overlay_structure` | 检查 PE overlay 中的归档载荷。 |
 | `executable_carrier` | 检查可执行载体及其归档区域，默认读取上限 `8388608` 字节。 |
-| `seven_zip_structure` | 检查 7z signature、start header CRC、next header 范围和 NID。 |
-| `rar_structure` | 检查 RAR4/RAR5 signature、main header 和 block/header walk。 |
+| `seven_zip_structure` | 可选 7z 结构分析处理器；普通、SFX 与分卷 7z 默认由 Relations 统一解析。 |
+| `rar_structure` | 可选 RAR 结构分析处理器；普通、SFX 与分卷 RAR 默认由 Relations 统一解析。 |
 
 ### rule_pipeline.precheck
 
@@ -355,12 +355,12 @@ Native worker 以 CPU credit 作为解压并发预算。默认 nominal budget �
 
 | 规则 | 作用 |
 | --- | --- |
-| `zip_structure_accept` | 结构可信的 ZIP 快速接受；默认允许空 ZIP。 |
+| `relation_archive_accept` | 对 Relations 已确认的 RAR、7z、ZIP 逻辑输入零 I/O 接受，覆盖普通单文件、SFX 与分卷。 |
 | `tar_structure_accept` | 结构可信的 TAR 快速接受。 |
-| `seven_zip_structure_accept` | start/next header 可信的 7z 快速接受，next header 检查上限 `1048576` 字节。 |
-| `rar_structure_accept` | RAR main header/block walk 可信时接受，首个 header 检查上限 `1048576` 字节。 |
 | `compression_stream_accept` | 完整校验 gzip、bzip2、xz、zstd 流。 |
 | `embedded_payload_identity` | 先识别可执行载体，再对获准且找到可靠嵌入归档的文件接受。 |
+
+RAR、7z、ZIP 会在默认 detection 规则运行前由 Relations 完成解析；旧的格式专用结构规则仍保留给显式配置和诊断使用。
 
 `embedded_payload_identity.deep_scan_single_candidate_ratio` 默认是 `0.3`：单个逻辑候选占未解决候选总字节数达到 30% 时执行完整嵌入扫描。`0` 关闭该阶段，`1` 只选择占全部大小的候选。分卷按一个逻辑候选计数，成员卷不会重复计算。
 
