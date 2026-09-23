@@ -817,6 +817,9 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
           #endif
           );
 
+      if (result == S_OK && folderOutStream->IsPositionedMode())
+        RINOK(folderOutStream->FinishPositioned(NExtract::NOperationResult::kOK))
+
       if (result == S_FALSE || result == E_NOTIMPL || dataAfterEnd_Error)
       {
         const bool wasFinished = folderOutStream->WasWritingFinished();
@@ -846,9 +849,6 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
       
       if (result != S_OK)
         return result;
-
-      if (folderOutStream->IsPositionedMode())
-        RINOK(folderOutStream->FinishPositioned(NExtract::NOperationResult::kOK))
 
       RINOK(folderOutStream->FlushCorrupted(NExtract::NOperationResult::kDataError))
       continue;
