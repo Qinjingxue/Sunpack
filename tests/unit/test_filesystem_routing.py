@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import gzip
 import io
+import struct
 import tarfile
 import zipfile
+from binascii import crc32
 
 from sunpack.contracts.filesystem import (
     FILESYSTEM_ROUTE_DETECTION,
@@ -17,7 +19,7 @@ from sunpack.filesystem.directory_scanner import DirectoryScanner
 def _routing_by_name(snapshot):
     return {
         path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]: (route, format_hint)
-        for path, _size, route, format_hint, _reject_mask in snapshot.file_routing_rows()
+        for path, _size, route, format_hint, _reject_mask in snapshot.non_relation_file_routing_rows()
     }
 
 
@@ -49,7 +51,7 @@ def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp
     assert routes["payload.gz"] == ("detection", "gzip")
     assert routes["payload.tar"] == ("detection", "tar")
     assert routes["plain.bin"] == ("residual", "")
-    assert routes["payload.7z.002"][0] == "relations"
+    assert routes["payload.7z.002"][0] == "residual"
 
     relation_view = snapshot.file_route_view(FILESYSTEM_ROUTE_RELATIONS)
     detection_view = snapshot.file_route_view(FILESYSTEM_ROUTE_DETECTION)
@@ -57,7 +59,6 @@ def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp
 
     assert {path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] for path, _, _ in relation_view.iter_file_columns()} == {
         "empty.zip",
-        "payload.7z.002",
     }
     assert {path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] for path, _, _ in detection_view.iter_file_columns()} == {
         "payload.gz",
@@ -65,7 +66,41 @@ def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp
     }
     assert {path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1] for path, _, _ in residual_view.iter_file_columns()} == {
         "plain.bin",
+        "payload.7z.002",
     }
+
+
+def _split_7z_bytes() -> bytes:
+    next_header = b"\x01\x00"
+    start_header = struct.pack("<QQI", 0, len(next_header), crc32(next_header) & 0xFFFFFFFF)
+    return (
+        b"7z\xbc\xaf\x27\x1c\x00\x04"
+        + struct.pack("<I", crc32(start_header) & 0xFFFFFFFF)
+        + start_header
+        + next_header
+    )
+
+
+def test_relations_anchor_view_recovers_unrouted_split_members_from_raw_snapshot(tmp_path):
+    archive = _split_7z_bytes()
+    first = tmp_path / "payload.7z.001"
+    second = tmp_path / "payload.7z.002"
+    first.write_bytes(archive[:32])
+    second.write_bytes(archive[32:])
+
+    session = DetectionScanSession(config={})
+    snapshot = session.snapshot_for_directory(str(tmp_path))
+    routes = _routing_by_name(snapshot)
+
+    assert routes[first.name][0] == "relations"
+    assert routes[second.name][0] == "residual"
+
+    groups = session.relation_groups_for_directory(
+        str(tmp_path),
+        filesystem_routed=True,
+    )
+    split = next(group for group in groups if group.kind == "split_archive")
+    assert split.input_paths == [str(first), str(second)]
 
 
 def test_main_scan_routes_only_native_container_candidates_through_relations(tmp_path):
