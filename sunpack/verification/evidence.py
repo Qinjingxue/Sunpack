@@ -22,7 +22,6 @@ class VerificationEvidence:
     archive_path: str
     output_dir: str
     password: str | None
-    fact_bag: Any
     analysis_facts: dict[str, Any] = field(default_factory=dict)
     archive_state_analysis: dict[str, Any] = field(default_factory=dict)
     extraction_diagnostics: dict[str, Any] = field(default_factory=dict)
@@ -40,8 +39,6 @@ def build_verification_evidence(
     phase_timer: Callable[..., Any] | None = None,
     phase_prefix: str = "verify_build_evidence",
 ) -> VerificationEvidence:
-    with _phase(phase_timer, f"{phase_prefix}_fact_bag"):
-        fact_bag = task.fact_bag
     with _phase(phase_timer, f"{phase_prefix}_password"):
         password = extraction_result.password_used
         if password is None and password_session is not None:
@@ -78,7 +75,6 @@ def build_verification_evidence(
         archive_path=archive_input.entry_path,
         output_dir=extraction_result.out_dir,
         password=password,
-        fact_bag=fact_bag,
         analysis_facts=analysis_facts,
         archive_state_analysis=dict(archive_state.analysis or {}),
         extraction_diagnostics=extraction_diagnostics,
