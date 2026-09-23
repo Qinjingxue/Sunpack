@@ -508,7 +508,6 @@ namespace sunpack::sevenzip
             UInt32 size,
             UInt32 *processed_size) noexcept override
         {
-            std::lock_guard<std::mutex> lock(mutex_);
             if (!writer_ || !file_)
             {
                 if (processed_size)
@@ -526,6 +525,7 @@ namespace sunpack::sevenzip
                 const UInt64 end64 = (std::min<UInt64>)(512, offset + consumed);
                 const std::size_t begin = static_cast<std::size_t>(offset);
                 const std::size_t end = static_cast<std::size_t>(end64);
+                std::lock_guard<std::mutex> lock(mutex_);
                 if (magic_.size() < end)
                 {
                     magic_.resize(end, 0);
