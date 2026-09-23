@@ -1,7 +1,6 @@
 """Compose the filesystem, relation, format, and embedded stages."""
 
-from sunpack.contracts.discovery import StageResult, candidate_paths
-from sunpack.contracts.detection import FactBag
+from sunpack.contracts.discovery import DiscoveryCandidate, StageResult, candidate_paths
 from sunpack.detection.confirmation import FormatConfirmation
 from sunpack.detection.scheduler import DetectionScheduler
 from sunpack.embedded.discovery import EmbeddedDiscovery
@@ -17,35 +16,58 @@ class ArchiveDiscoveryPipeline:
         self.embedded = EmbeddedDiscovery(config, options)
 
     def discover(
-        self, bags: list[FactBag], *, scan_session=None, is_recursive_scan: bool = False,
+        self,
+        candidates: list[DiscoveryCandidate],
+        *,
+        scan_session=None,
+        is_recursive_scan: bool = False,
     ) -> tuple[StageResult, list]:
-        relations = [bag for bag in bags if bag.get("filesystem.route") == "relations"]
-        formats = [bag for bag in bags if bag.get("filesystem.route") == "detection"]
-        residual = [bag for bag in bags if bag.get("filesystem.route") == "residual"]
+        relations = [item for item in candidates if item.route == "relations"]
+        formats = [item for item in candidates if item.route == "detection"]
+        residual = [item for item in candidates if item.route == "residual"]
 
         relation_result, relation_decisions = self.relations.resolve(relations)
         claimed = set(relation_result.claimed_paths)
         blocked = set(relation_result.blocked_paths)
 
         if self.config.get("detection", {}).get("enabled", True):
-            eligible = [bag for bag in formats if not candidate_paths(bag) & (claimed | blocked)]
-            format_result, format_decisions = self.detection.confirm(eligible, scan_session=scan_session)
+            eligible = [
+                item
+                for item in formats
+                if not candidate_paths(item) & (claimed | blocked)
+            ]
+            format_result, format_decisions = self.detection.confirm(
+                eligible,
+                scan_session=scan_session,
+            )
         else:
             format_result, format_decisions = StageResult(), []
             residual.extend(formats)
 
         claimed.update(format_result.claimed_paths)
         blocked.update(format_result.blocked_paths)
-        residual.extend(bag for bag in relations if candidate_paths(bag) & relation_result.residual_paths)
-        residual.extend(bag for bag in formats if candidate_paths(bag) & format_result.residual_paths)
-        unclaimed = []
-        seen_ids = set()
-        for bag in residual:
-            if id(bag) not in seen_ids and not candidate_paths(bag) & (claimed | blocked):
-                unclaimed.append(bag)
-                seen_ids.add(id(bag))
+        residual.extend(
+            item
+            for item in relations
+            if candidate_paths(item) & relation_result.residual_paths
+        )
+        residual.extend(
+            item
+            for item in formats
+            if candidate_paths(item) & format_result.residual_paths
+        )
+
+        unclaimed: list[DiscoveryCandidate] = []
+        seen_ids: set[int] = set()
+        for item in residual:
+            if id(item) in seen_ids or candidate_paths(item) & (claimed | blocked):
+                continue
+            unclaimed.append(item)
+            seen_ids.add(id(item))
+
         embedded_result, embedded_decisions = self.embedded.discover(
-            unclaimed, is_recursive_scan=is_recursive_scan,
+            unclaimed,
+            is_recursive_scan=is_recursive_scan,
         )
         result = StageResult(
             resolved_inputs=[
@@ -58,4 +80,8 @@ class ArchiveDiscoveryPipeline:
             residual_paths=embedded_result.residual_paths,
         )
         result.validate()
-        return result, [*relation_decisions, *format_decisions, *embedded_decisions]
+        return result, [
+            *relation_decisions,
+            *format_decisions,
+            *embedded_decisions,
+        ]
