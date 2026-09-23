@@ -5,6 +5,7 @@ from typing import Any
 
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.embedded.options import EmbeddedOptions
+from sunpack.support.path_keys import path_key
 
 
 @dataclass(frozen=True)
@@ -14,6 +15,7 @@ class DiscoveryDiagnostic:
     format: str
     source: str
     reason: str
+    archive_input: dict | None = None
 
     @property
     def should_extract(self) -> bool:
@@ -33,6 +35,10 @@ class DetectionDiagnostics:
 
     def collect(self, paths: list[str]) -> list[DiscoveryDiagnostic]:
         result = self.provider.discover_targets(paths)
+        resolved = {
+            path_key(item.entry_path): item
+            for item in result.resolved_inputs
+        }
         return [
             DiscoveryDiagnostic(
                 path=trace.entry_path,
@@ -40,6 +46,11 @@ class DetectionDiagnostics:
                 format=trace.format,
                 source=trace.source,
                 reason=trace.reason,
+                archive_input=(
+                    resolved[path_key(trace.entry_path)].archive_input.to_dict()
+                    if path_key(trace.entry_path) in resolved
+                    else None
+                ),
             )
             for trace in result.traces
         ]
