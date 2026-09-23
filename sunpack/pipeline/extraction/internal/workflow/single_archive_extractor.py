@@ -803,7 +803,7 @@ class SingleArchiveExtractor:
                 selected_codepage = result.selected_codepage
             with _phase(phase_timer, f"{phase_prefix}_segment_directory_stats"):
                 segment_inventory = OutputInventory.from_value(
-                    result.output_inventory or result.output_inventory_payload,
+                    result.output_inventory,
                     expected_root=segment_dir,
                 )
                 stats = {

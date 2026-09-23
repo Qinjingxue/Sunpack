@@ -83,29 +83,6 @@ def _rebase_path(path: str, old_root: str, new_root: str) -> str:
     return os.path.abspath(os.path.join(new_root, relative))
 
 
-def _rebase_inventory_payload(payload, old_root: str, new_root: str):
-    if not isinstance(payload, dict):
-        return payload
-    updated = dict(payload)
-    if updated.get("root"):
-        updated["root"] = _rebase_path(str(updated["root"]), old_root, new_root)
-    raw_files = updated.get("files")
-    if isinstance(raw_files, list):
-        files = []
-        for raw in raw_files:
-            if not isinstance(raw, dict):
-                files.append(raw)
-                continue
-            item = dict(raw)
-            for key in ("abs_path", "output_path"):
-                value = item.get(key)
-                if value and os.path.isabs(str(value)):
-                    item[key] = _rebase_path(str(value), old_root, new_root)
-            files.append(item)
-        updated["files"] = files
-    return updated
-
-
 def rebase_extraction_result(result, staging_root: str, final_root: str) -> None:
     """Retarget one verified result after the staging directory is renamed.
 
@@ -125,11 +102,6 @@ def rebase_extraction_result(result, staging_root: str, final_root: str) -> None
     if isinstance(inventory, OutputInventory):
         new_inventory_root = _rebase_path(inventory.root, staging_root, final_root)
         result.output_inventory = inventory.rebased_root(new_inventory_root)
-    payload = getattr(result, "output_inventory_payload", None)
-    if isinstance(payload, dict):
-        result.output_inventory_payload = _rebase_inventory_payload(
-            payload, staging_root, final_root
-        )
     embedded = list(getattr(result, "embedded_results", None) or [])
     for segment, child in embedded:
         if isinstance(segment, dict) and segment.get("out_dir"):
