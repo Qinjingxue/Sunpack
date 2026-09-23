@@ -7,6 +7,7 @@
 #include "internal/native_cpu_budget.hpp"
 #include "internal/decoder_cpu_budget.h"
 #include "internal/native_worker_sizing.hpp"
+#include "../7z2603-src/C/Alloc.h"
 
 #include <filesystem>
 #include <fstream>
@@ -16,6 +17,41 @@
 
 #ifdef _WIN32
 namespace {
+
+bool check_decoder_file_buffer_lifecycle() {
+    CSunpackFileBuffer buffer;
+    SunpackFileBuffer_Construct(&buffer);
+
+    const std::size_t size = static_cast<std::size_t>(1) << 24;
+    if (!SunpackFileBuffer_Ensure(&buffer, size) ||
+        !buffer.data ||
+        buffer.capacity < size) {
+        SunpackFileBuffer_Release(&buffer);
+        return false;
+    }
+
+    const bool file_backed = buffer.fileBacked != False;
+    buffer.data[0] = 0x5A;
+    buffer.data[size - 1] = 0xA5;
+
+    SunpackFileBuffer_Unmap(&buffer);
+    if (file_backed && buffer.data != nullptr) {
+        SunpackFileBuffer_Release(&buffer);
+        return false;
+    }
+
+    if (!SunpackFileBuffer_Ensure(&buffer, size) || !buffer.data) {
+        SunpackFileBuffer_Release(&buffer);
+        return false;
+    }
+    buffer.data[0] = 0x3C;
+
+    SunpackFileBuffer_Release(&buffer);
+    return buffer.data == nullptr &&
+        buffer.capacity == 0 &&
+        buffer.fileHandle == nullptr &&
+        buffer.mappingHandle == nullptr;
+}
 
 bool check_numbered_volume_paths() {
     const std::vector<std::wstring> zip_parts = {
@@ -462,6 +498,10 @@ bool check_native_sizing_respects_thread_override() {
 
 int wmain(int argc, wchar_t** argv) {
 #ifdef _WIN32
+    if (!check_decoder_file_buffer_lifecycle()) {
+        std::cerr << "decoder file-buffer lifecycle check failed\n";
+        return 34;
+    }
     if (!check_numbered_volume_paths()) {
         std::cerr << "numbered volume path check failed\n";
         return 2;
