@@ -144,6 +144,38 @@ void MtDecThread_FreeInBufs(CMtDecThread *t)
 }
 
 
+/*
+  Keep a little per-thread input slack for the next block, but do not retain an
+  arbitrarily long linked list just because one historical packed block was
+  large. The caller invokes this only after a block was successfully decoded
+  and the codec says it no longer needs the input for a possible recode.
+*/
+static void MtDecThread_TrimInBufs(CMtDecThread *t, unsigned keepCount)
+{
+  CMtDecBufLink *link = (CMtDecBufLink *)t->inBuf;
+  CMtDecBufLink *tail;
+
+  if (!link || keepCount == 0)
+    return;
+
+  while (--keepCount != 0 && link->next)
+    link = link->next;
+
+  tail = link->next;
+  if (!tail)
+    return;
+
+  link->next = NULL;
+  do
+  {
+    CMtDecBufLink *next = tail->next;
+    ISzAlloc_Free(t->mtDec->alloc, tail);
+    tail = next;
+  }
+  while (tail);
+}
+
+
 static void MtDecThread_CloseThread(CMtDecThread *t)
 {
   if (Thread_WasCreated(&t->thread))
@@ -260,6 +292,7 @@ static WRes MtDec_ThreadFunc2(CMtDecThread *t)
     UInt64 outPrev = 0;
     UInt64 inCodePos;
     UInt64 outCodePos;
+    unsigned inBufLinksUsed;
     
     Byte *afterEndData = NULL;
     size_t afterEndData_Size = 0;
@@ -620,6 +653,7 @@ static WRes MtDec_ThreadFunc2(CMtDecThread *t)
     outPrev = 0;
     inCodePos = 0;
     outCodePos = 0;
+    inBufLinksUsed = 0;
 
     if (res == SZ_OK && needCode && codeRes == SZ_OK)
     {
@@ -643,6 +677,7 @@ static WRes MtDec_ThreadFunc2(CMtDecThread *t)
 
         inCodePos += inSize;
         stop = True;
+        inBufLinksUsed++;
 
         codeRes = p->mtCallback->Code(p->mtCallbackObject, t->index,
             (const Byte *)MTDEC__DATA_PTR_FROM_LINK(link), inSize,
@@ -764,6 +799,25 @@ static WRes MtDec_ThreadFunc2(CMtDecThread *t)
         isErrorMode = True;
         p->wasInterrupted = True;
       }
+
+      if (!canRecode
+          && res == SZ_OK
+          && codeRes == SZ_OK
+          && !wasInterrupted
+          && inBufLinksUsed != 0)
+      {
+        /*
+          Stable large blocks keep their full chain because current use equals
+          the retained size. After a much smaller block, retain about 1.5x the
+          links it actually consumed so modest size oscillation does not cause
+          allocation churn, while historical high-water tails are returned.
+        */
+        unsigned keepLinks = inBufLinksUsed + (inBufLinksUsed >> 1) + 1;
+        if (keepLinks < 2)
+          keepLinks = 2;
+        MtDecThread_TrimInBufs(t, keepLinks);
+      }
+
       if (res != SZ_OK
           || (!needContinue && !finish))
       {
