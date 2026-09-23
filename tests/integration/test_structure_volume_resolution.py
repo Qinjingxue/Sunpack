@@ -14,13 +14,14 @@ from sunpack.contracts.tasks import ArchiveTask
 from sunpack.contracts.filesystem import DirectorySnapshot, FileEntry
 from sunpack.coordinator.engine import PipelineEngine
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.coordinator.target_groups import relation_group_to_fact_bag
+from sunpack.coordinator.target_groups import relation_group_to_candidate
 from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
 from sunpack.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.extraction.scheduler import ExtractionScheduler
 from sunpack.filesystem.directory_scanner import DirectoryScanner
 from sunpack.passwords.directory_context import DirectoryPasswordContextStore
 from sunpack.relations import RelationsScheduler
+from sunpack.relations.resolver import RelationResolver
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_winrar, get_test_tools
@@ -57,7 +58,10 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
         else:
             assert group.split_volumes[0].source == "structure"
 
-        task = ArchiveTask.from_fact_bag(relation_group_to_fact_bag(group))
+        candidate = relation_group_to_candidate(group)
+        resolved = RelationResolver().resolve([candidate]).resolved_inputs
+        assert len(resolved) == 1
+        task = ArchiveTask.from_resolved(resolved[0])
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(task)
         assert len(planned) == 1
         extractor = ExtractionScheduler(max_retries=1)
@@ -326,7 +330,7 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path):
     tasks = ArchiveTaskProvider(config).scan_targets([str(mixed)])
 
     assert len(tasks) == 1
-    assert tasks[0].matched_rules == ["relation_archive_accept"]
+    assert tasks[0].discovery_source == "relations"
     descriptor = tasks[0].archive_input()
     assert descriptor.volume_style == "zip_spanned"
     assert [part.volume_number for part in descriptor.parts] == [1, 2, 3, 4]
