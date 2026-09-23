@@ -58,8 +58,8 @@ def test_plan1_split_archives_detected_as_one_logical_stream_with_chaotic_names(
     )
 
     hits = detect_archive_hits(case.entry_path)
-    actual_ext = hits[0].fact_bag.get("file.detected_ext") if hits else None
-    member_count = len(hits[0].fact_bag.get("candidate.member_paths") or []) if hits else 0
+    actual_ext = detected_ext(hits[0]) if hits else None
+    member_count = len(hits[0].member_paths) if hits else 0
     plan1_error["detection_hit_count"] = len(hits)
     plan1_error["actual_detected_ext"] = actual_ext
     plan1_error["member_path_count"] = member_count
