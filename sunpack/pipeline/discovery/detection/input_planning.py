@@ -35,8 +35,6 @@ class ArchiveInputPlanningStage:
     def __init__(
         self,
         config: dict[str, Any] | None = None,
-        *,
-        module_executor_pool=None,
     ):
         self.config = config or {}
         planning_config = self.config.get("input_planning") if isinstance(self.config.get("input_planning"), dict) else {}
@@ -44,7 +42,7 @@ class ArchiveInputPlanningStage:
         self._report_cache: dict[tuple, ArchiveAnalysisReport] = {}
         self._report_cache_lock = threading.Lock()
         self.analyzer = (
-            ArchiveAnalyzer(self.config, executor_pool=module_executor_pool)
+            ArchiveAnalyzer(self.config)
             if self.enabled
             else None
         )
@@ -86,21 +84,11 @@ class ArchiveInputPlanningStage:
             _discovery_confirmed(task),
         )
 
-    @staticmethod
-    def _path_cache_fingerprint(path: str) -> tuple:
-        normalized = os.path.abspath(os.path.normpath(path))
-        try:
-            stat = os.stat(normalized)
-            return (normalized, int(stat.st_size), int(stat.st_mtime_ns))
-        except OSError:
-            return (normalized, -1, -1)
-
     def _planning_task_groups(self, tasks: list[ArchiveTask]) -> list[list[tuple[int, ArchiveTask]]]:
         grouped: dict[tuple, list[tuple[int, ArchiveTask]]] = {}
         order: list[tuple] = []
         for index, task in enumerate(tasks):
             try:
-                task.ensure_archive_state()
                 cache_key = self._report_cache_key(task)
             except Exception:
                 cache_key = ("task", id(task))
@@ -147,7 +135,6 @@ class ArchiveInputPlanningStage:
         if _discovery_confirmed(task):
             # Discovery already supplied the exact native input descriptor.
             # The worker decides whether extraction actually succeeds.
-            task.ensure_archive_state()
             task.runtime["input_planning.status"] = "extractable"
             return None, [task]
         if self.analyzer is None:
@@ -255,11 +242,8 @@ class ArchiveInputPlanningStage:
 
     @staticmethod
     def _structured_volume_source(task: ArchiveTask) -> ArchiveInputDescriptor | None:
-        split_info = getattr(task, "split_info", None)
-        source_input = getattr(split_info, "archive_input", None)
-        if isinstance(source_input, ArchiveInputDescriptor) and len(source_input.parts) > 1:
-            return source_input
-        return None
+        source_input = task.archive_input()
+        return source_input if len(source_input.parts) > 1 else None
 
     def _apply_selected_segment(
         self,
@@ -383,11 +367,7 @@ class ArchiveInputPlanningStage:
             )
         with _phase(phase_timer, f"{phase_prefix}_record_state_set_archive_state"):
             if dict(state.analysis) != analysis:
-                task.set_archive_state(
-                    new_state,
-                    phase_timer=phase_timer,
-                    phase_prefix=f"{phase_prefix}_record_state_set_archive_state",
-                )
+                task.set_archive_state(new_state)
 
     def _extractable_segments(self, report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:
         candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]] = []
@@ -607,9 +587,8 @@ class ArchiveInputPlanningStage:
         # loses the part table and makes encrypted split inputs unverifiable.
         parts = self._ordered_parts(task)
         if len(parts) > 1 and int(segment.start_offset) <= 0:
-            split_info = getattr(task, "split_info", None)
-            source_input = getattr(split_info, "archive_input", None)
-            if isinstance(source_input, ArchiveInputDescriptor) and len(source_input.parts) > 1:
+            source_input = task.archive_input()
+            if len(source_input.parts) > 1:
                 return source_input
 
         # RAR volumes are independent containers and cannot become one concat
@@ -646,17 +625,6 @@ class ArchiveInputPlanningStage:
         )
 
     def _ordered_parts(self, task: ArchiveTask) -> list[str]:
-        volumes = list(getattr(task.split_info, "volumes", None) or [])
-        if volumes:
-            numbered = [
-                (int(volume.get("number") or 0), str(volume.get("path") or ""))
-                for volume in volumes
-                if isinstance(volume, dict) and volume.get("path")
-            ]
-            numbered.sort(key=lambda item: item[0])
-            paths = [path for _, path in numbered]
-            if paths:
-                return paths
         return list(task.all_parts or [task.main_path])
 
     def _logical_range_to_file_ranges(self, parts: list[str], start: int, end: int | None) -> list[dict]:

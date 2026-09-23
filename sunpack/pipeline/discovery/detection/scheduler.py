@@ -12,9 +12,6 @@ class DetectionScheduler:
         self.config = config
         self.analyzer = ArchiveAnalyzer(config)
 
-    def validate_config(self) -> list[str]:
-        return []
-
     def confirm(self, candidate: DiscoveryCandidate) -> tuple[bool, str]:
         archive_format = str(candidate.format_hint or "").lower()
         confirmer = CONFIRMERS.get(archive_format)

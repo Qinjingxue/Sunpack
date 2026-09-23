@@ -10,7 +10,6 @@ from sunpack.core.contracts.content_recovery import (
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
-from sunpack.pipeline.discovery.relations.stage import ArchiveRelationStage
 from sunpack.pipeline.coordinator.verification_stage import verify_and_project
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
@@ -124,18 +123,12 @@ class ExtractionBatchRunner:
         self.origin = str(origin or "")
         self.progress_round_index = 1
         self.progress_direct_mode = False
-        self.relation_stage = ArchiveRelationStage()
         self.verifier = VerificationScheduler(self.config, password_session=self.extractor.password_session)
         self.directory_password_contexts = DirectoryPasswordContextStore(self.config)
 
     def set_progress_round(self, round_index: int, *, direct: bool = False) -> None:
         self.progress_round_index = max(1, int(round_index or 1))
         self.progress_direct_mode = bool(direct)
-
-    def prepare_tasks(self, tasks: List[ArchiveTask]):
-        self.relation_stage.resolve_tasks(tasks)
-        # Physical source paths are immutable. Detected formats and logical
-        # volume identities travel through ArchiveInputDescriptor/ArchiveState.
 
     async def execute_async(
         self,
@@ -156,7 +149,6 @@ class ExtractionBatchRunner:
             return []
 
         def prepare_batch():
-            self.prepare_tasks(tasks)
             self.directory_password_contexts.annotate(tasks)
             resolver = build_output_dir_resolver(
                 tasks,
@@ -294,14 +286,6 @@ class ExtractionBatchRunner:
                 break
             task.adopt_detection_plan(replacement)
             task.runtime["volume_retry_attempted"] = True
-            await broker.run(
-                "relation",
-                file_id,
-                self.prepare_tasks,
-                [task],
-                request_id=self.request_id,
-                cancellation=cancellation,
-            )
         if terminal is not None:
             terminal.planned_out_dir = planned_out_dir
             self._report_task_finished(task, terminal)
@@ -483,7 +467,6 @@ class ExtractionBatchRunner:
                             "confirmed_structure",
                             "anchor_constrained_filename",
                         ]
-                        self.prepare_tasks([task])
                         self.directory_password_contexts.annotate([task])
                         continue
                 if self._must_stop_for_proven_content_loss(task, result, verification):
@@ -866,9 +849,10 @@ def _possible_missing_volume_failure(
 
 
 def _task_is_split_input(task: ArchiveTask) -> bool:
+    descriptor = task.archive_input()
     return bool(
-        task.split_info.is_split
-        or len(task.all_parts or []) > 1
+        descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
+        or len(descriptor.part_paths()) > 1
     )
 
 

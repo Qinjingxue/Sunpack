@@ -1,4 +1,4 @@
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 from sunpack.core.support.output_paths import default_output_dir_for_task
@@ -6,9 +6,8 @@ from sunpack.pipeline.extraction.internal.workflow.preflight import PreExtractIn
 from sunpack.pipeline.extraction.internal.workflow.retry_policy import ExtractRetryPolicy
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
-from sunpack.pipeline.extraction.internal.workflow.split_entry import SplitEntryResolver
 from sunpack.core.contracts.extraction import ExtractionResult
-from sunpack.core.contracts.tasks import ArchiveTask, SplitArchiveInfo
+from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.passwords import ArchivePasswordTester, PasswordResolver, PasswordSession, PasswordStore
 
 
@@ -33,8 +32,6 @@ class ExtractionScheduler:
         self.password_resolver = PasswordResolver(self.password_tester, self.password_session)
         extraction_config = extraction_config if isinstance(extraction_config, dict) else {}
         self.metadata_scanner = ArchiveMetadataScanner(language=str(extraction_config.get("language") or "en"))
-        self.seven_z_path = ""
-        self.split_entry_resolver = SplitEntryResolver()
         self.max_retries = max(1, max_retries)
         self.output_config = output_config if isinstance(output_config, dict) else None
         self.extraction_config = extraction_config
@@ -79,14 +76,12 @@ class ExtractionScheduler:
         self,
         task: ArchiveTask,
         out_dir: str,
-        split_info: Optional[SplitArchiveInfo] = None,
         phase_timer: Any = None,
         phase_prefix: str = "extract",
     ) -> ExtractionResult:
         return self._single_archive_extractor().extract(
             task,
             out_dir,
-            split_info=split_info,
             phase_timer=phase_timer,
             phase_prefix=phase_prefix,
         )
@@ -96,7 +91,6 @@ class ExtractionScheduler:
         broker,
         task: ArchiveTask,
         out_dir: str,
-        split_info: Optional[SplitArchiveInfo] = None,
         *,
         request_id: str,
         file_id: str,
@@ -108,7 +102,6 @@ class ExtractionScheduler:
             broker,
             task,
             out_dir,
-            split_info=split_info,
             request_id=request_id,
             file_id=file_id,
             cancellation=cancellation,
@@ -119,23 +112,12 @@ class ExtractionScheduler:
     def close(self) -> None:
         self.sevenzip_runner.close()
 
-    def _failed(self, archive: str, out_dir: str, all_parts: list[str], error: str) -> ExtractionResult:
-        return ExtractionResult(
-            success=False,
-            archive=archive,
-            out_dir=out_dir,
-            all_parts=list(all_parts or []),
-            error=error,
-        )
-
     def _single_archive_extractor(self) -> SingleArchiveExtractor:
         return SingleArchiveExtractor(
-            seven_z_path=self.seven_z_path,
             password_store=self.password_store,
             password_resolver=self.password_resolver,
             metadata_scanner=self.metadata_scanner,
             retry_policy=self.retry_policy,
-            split_entry_resolver=self.split_entry_resolver,
             sevenzip_runner=self.sevenzip_runner,
             best_effort=True,
             write_progress_manifest=bool(self.extraction_config.get("write_progress_manifest", False)),
