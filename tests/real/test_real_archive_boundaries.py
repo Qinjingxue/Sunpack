@@ -124,12 +124,11 @@ def _extract_direct(
     parts: list[Path] | None = None,
 ):
     task = direct_file_task(str(archive), all_parts=[str(path) for path in (parts or [archive])])
-    task.ensure_archive_state()
     state = task.archive_state()
     source = replace(state.source, format_hint=detected_ext)
     task.set_archive_state(replace(state, source=source, format_hint=detected_ext))
     scheduler = ExtractionScheduler(max_retries=1)
     try:
-        return scheduler.extract(task.ensure_archive_state(), str(output_dir))
+        return scheduler.extract(task, str(output_dir))
     finally:
         scheduler.close()

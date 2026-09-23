@@ -19,21 +19,12 @@ from sunpack.core.support.path_keys import normalized_path, path_key
 
 
 @dataclass
-class SplitArchiveInfo:
-    is_split: bool = False
-    is_sfx_stub: bool = False
-    archive_input: ArchiveInputDescriptor | None = None
-    source: str = ""
-
-
-@dataclass
 class ArchiveTask:
     _archive_input: ArchiveInputDescriptor
     carrier_path: str = ""
     cleanup_parts: list[str] = field(default_factory=list)
     key: str = ""
     logical_name: str = ""
-    split_info: SplitArchiveInfo = field(default_factory=SplitArchiveInfo)
     discovery_source: str = ""
     discovery_evidence: dict[str, Any] = field(default_factory=dict)
     discovery_segments: tuple[ResolvedArchiveSegment, ...] = ()
@@ -62,15 +53,6 @@ class ArchiveTask:
                 if descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
                 else descriptor.entry_path
             )
-        self.split_info = SplitArchiveInfo(
-            is_split=descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
-            is_sfx_stub=bool(
-                descriptor.open_mode == "sfx_with_volumes"
-                or self.split_info.is_sfx_stub
-            ),
-            archive_input=descriptor,
-            source=self.split_info.source or self.discovery_source,
-        )
         self._knowledge = ArchiveKnowledge()
         self._state = ArchiveState.from_archive_input(descriptor)
         self._initialize_knowledge()
@@ -93,12 +75,6 @@ class ArchiveTask:
             carrier_path=carrier_path or descriptor.entry_path,
             cleanup_parts=list(cleanup_paths),
             logical_name=descriptor.logical_name,
-            split_info=SplitArchiveInfo(
-                is_split=descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
-                is_sfx_stub=descriptor.open_mode == "sfx_with_volumes",
-                archive_input=descriptor,
-                source=discovery_source,
-            ),
             discovery_source=discovery_source,
             discovery_evidence=dict(discovery_evidence or {}),
             discovery_segments=tuple(discovery_segments),
@@ -179,18 +155,7 @@ class ArchiveTask:
             knowledge=self._knowledge.to_dict(),
         )
 
-    def ensure_archive_state(self) -> "ArchiveTask":
-        return self
-
-    def set_archive_input(self, descriptor: ArchiveInputDescriptor | dict) -> None:
-        if isinstance(descriptor, dict):
-            descriptor = ArchiveInputDescriptor.from_any(
-                descriptor,
-                archive_path=self.main_path,
-                part_paths=self.all_parts,
-                format_hint=self.archive_input().format_hint,
-                logical_name=self.logical_name,
-            )
+    def set_archive_input(self, descriptor: ArchiveInputDescriptor) -> None:
         state = self._state
         self._archive_input = descriptor
         self.logical_name = descriptor.logical_name or self.logical_name
@@ -199,15 +164,6 @@ class ArchiveTask:
             *self.cleanup_parts,
             self.carrier_path,
         ]))
-        self.split_info = SplitArchiveInfo(
-            is_split=descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
-            is_sfx_stub=bool(
-                descriptor.open_mode == "sfx_with_volumes"
-                or self.split_info.is_sfx_stub
-            ),
-            archive_input=descriptor,
-            source=self.split_info.source or self.discovery_source,
-        )
         self._knowledge.set(
             "source.input",
             descriptor.to_dict(),
@@ -223,23 +179,7 @@ class ArchiveTask:
             knowledge=self._knowledge.to_dict(),
         )
 
-    def set_archive_state(
-        self,
-        state: ArchiveState | dict,
-        *,
-        phase_timer: Any | None = None,
-        phase_prefix: str = "set_archive_state",
-    ) -> None:
-        del phase_timer, phase_prefix
-        if isinstance(state, dict):
-            state = ArchiveState.from_any(
-                state,
-                archive_path=self.main_path,
-                part_paths=self.all_parts,
-                format_hint=self.archive_input().format_hint,
-                logical_name=self.logical_name,
-                archive_input=self.archive_input().to_dict(),
-            )
+    def set_archive_state(self, state: ArchiveState) -> None:
         descriptor = state.to_archive_input_descriptor()
         self._archive_input = descriptor
         self.logical_name = descriptor.logical_name or state.logical_name or self.logical_name
@@ -248,15 +188,6 @@ class ArchiveTask:
             *self.cleanup_parts,
             self.carrier_path,
         ]))
-        self.split_info = SplitArchiveInfo(
-            is_split=descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
-            is_sfx_stub=bool(
-                descriptor.open_mode == "sfx_with_volumes"
-                or self.split_info.is_sfx_stub
-            ),
-            archive_input=descriptor,
-            source=self.split_info.source or self.discovery_source,
-        )
         knowledge = ArchiveKnowledge.from_any(state.knowledge)
         knowledge.merge(self._knowledge)
         knowledge.set(
@@ -297,7 +228,6 @@ class ArchiveTask:
         self.cleanup_parts = list(replacement.cleanup_parts)
         self.key = replacement.key
         self.logical_name = replacement.logical_name
-        self.split_info = replacement.split_info
         self.discovery_source = replacement.discovery_source
         self.discovery_evidence = dict(replacement.discovery_evidence)
         self.discovery_segments = tuple(replacement.discovery_segments)
@@ -337,8 +267,8 @@ class ArchiveTask:
             ),
             relation=ArchiveRelationState(
                 kind=self.relation_kind,
-                is_split=bool(self.split_info.is_split),
-                is_sfx=bool(self.split_info.is_sfx_stub),
+                is_split=source.open_mode in {"native_volumes", "sfx_with_volumes"},
+                is_sfx=source.open_mode == "sfx_with_volumes",
             ),
             integrity=ArchiveIntegrityState(
                 damage_flags=list(dict.fromkeys(str(item) for item in damage_flags))
@@ -365,8 +295,8 @@ class ArchiveTask:
                 "evidence": dict(self.discovery_evidence),
             },
             "relations": {
-                "is_split": bool(self.split_info.is_split),
-                "is_sfx_stub": bool(self.split_info.is_sfx_stub),
+                "is_split": descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
+                "is_sfx_stub": descriptor.open_mode == "sfx_with_volumes",
                 "archive_input": descriptor.to_dict(),
             },
         }, source_layer="contracts", source_module="archive_task")

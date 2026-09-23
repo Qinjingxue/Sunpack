@@ -19,11 +19,10 @@ def test_successful_first_attempt_does_not_query_python_free_space(tmp_path):
         emit_semantic_event=lambda *_args, **_kwargs: None,
     )
     extractor = SingleArchiveExtractor(
-        seven_z_path="", password_store=SimpleNamespace(has_candidates=lambda: False),
+        password_store=SimpleNamespace(has_candidates=lambda: False),
         password_resolver=SimpleNamespace(password_tester=SimpleNamespace(passwords=[])),
         metadata_scanner=SimpleNamespace(scan_for_task=lambda *_args, **_kwargs: SimpleNamespace(selected_codepage=None, decoded_names=[], error=None)),
         retry_policy=SimpleNamespace(max_retries=1),
-        split_entry_resolver=SimpleNamespace(resolve=lambda archive, parts, split: (archive, parts, split)),
         sevenzip_runner=runner,
     )
     output.mkdir()
@@ -79,7 +78,6 @@ def test_crc_proven_zipcrypto_password_is_confirmed_before_reporting_later_damag
             confirmed.append(resolution.password)
 
     extractor = SingleArchiveExtractor(
-        seven_z_path="",
         password_store=SimpleNamespace(has_candidates=lambda **_kwargs: True),
         password_resolver=Resolver(),
         metadata_scanner=SimpleNamespace(scan_for_task=lambda *_args, **_kwargs: SimpleNamespace(
@@ -92,7 +90,6 @@ def test_crc_proven_zipcrypto_password_is_confirmed_before_reporting_later_damag
             can_retry=lambda *_args: False,
             append_retry_count=lambda error, *_args: error,
         ),
-        split_entry_resolver=SimpleNamespace(resolve=lambda selected, parts, split: (selected, parts, split)),
         sevenzip_runner=SimpleNamespace(
             extract_attempt=lambda **_kwargs: completed,
             emit_semantic_event=lambda *_args, **_kwargs: None,

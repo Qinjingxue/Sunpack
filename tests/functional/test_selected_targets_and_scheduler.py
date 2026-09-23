@@ -42,4 +42,4 @@ def test_direct_file_task_preserves_explicit_zero_based_split_volumes(tmp_path):
     task = direct_file_task(str(parts[0]), all_parts=[str(part) for part in parts])
     assert task.main_path == str(parts[0])
     assert task.all_parts == [str(part) for part in parts]
-    assert task.split_info.is_split
+    assert task.archive_input().open_mode == "native_volumes"

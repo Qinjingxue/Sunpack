@@ -37,10 +37,9 @@ class ArchiveAnalyzer:
         self,
         config: dict[str, Any] | None = None,
         *,
-        executor_pool=None,
         engine: AnalysisEngine | None = None,
     ):
-        self._engine = engine or AnalysisEngine(config, executor_pool=executor_pool)
+        self._engine = engine or AnalysisEngine(config)
 
     def analyze(
         self,

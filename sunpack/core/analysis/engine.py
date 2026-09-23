@@ -10,10 +10,9 @@ from sunpack.core.support.module_config import enabled_module_configs
 
 
 class AnalysisEngine:
-    def __init__(self, config: dict[str, Any] | None = None, *, executor_pool=None):
+    def __init__(self, config: dict[str, Any] | None = None):
         root_config = config or {}
         self.config = analysis_config(root_config)
-        self.executor_pool = executor_pool
         discover_analysis_modules()
 
     def analyze_path(

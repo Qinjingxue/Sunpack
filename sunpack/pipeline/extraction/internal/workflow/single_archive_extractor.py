@@ -2,19 +2,18 @@ import os
 import sys
 import subprocess
 from contextlib import nullcontext
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 
 from sunpack.core.support.resource_lifecycle import task_walk
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.archive_state import ArchiveState
-from sunpack.core.contracts.tasks import ArchiveTask, SplitArchiveInfo
+from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
 from sunpack.pipeline.extraction.internal.workflow.retry_policy import ExtractRetryPolicy
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import compact_success_worker_diagnostics, worker_result_payload
-from sunpack.pipeline.extraction.internal.workflow.split_entry import SplitEntryResolver
 from sunpack.pipeline.extraction.progress import has_recoverable_partial_outputs, write_extraction_progress_manifest_payload
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
@@ -37,12 +36,10 @@ def _advance_state(state, sent, *, first: bool):
 class SingleArchiveExtractor:
     def __init__(
         self,
-        seven_z_path: str,
         password_store,
         password_resolver,
         metadata_scanner,
         retry_policy: ExtractRetryPolicy,
-        split_entry_resolver: SplitEntryResolver,
         sevenzip_runner: SevenZipRunner,
         best_effort: bool = True,
         write_progress_manifest: bool = False,
@@ -50,12 +47,10 @@ class SingleArchiveExtractor:
         language: str = "en",
         output_stream=None,
     ):
-        self.seven_z_path = seven_z_path
         self.password_store = password_store
         self.password_resolver = password_resolver
         self.metadata_scanner = metadata_scanner
         self.retry_policy = retry_policy
-        self.split_entry_resolver = split_entry_resolver
         self.sevenzip_runner = sevenzip_runner
         self.best_effort = bool(best_effort)
         self.write_progress_manifest = bool(write_progress_manifest)
@@ -67,7 +62,6 @@ class SingleArchiveExtractor:
         self,
         task: ArchiveTask,
         out_dir: str,
-        split_info: Optional[SplitArchiveInfo] = None,
         *,
         allow_embedded_segments: bool = True,
         phase_timer: Callable[..., Any] | None = None,
@@ -76,7 +70,6 @@ class SingleArchiveExtractor:
         state = self._extract_state_machine(
             task,
             out_dir,
-            split_info=split_info,
             allow_embedded_segments=allow_embedded_segments,
             phase_timer=phase_timer,
             phase_prefix=phase_prefix,
@@ -97,7 +90,6 @@ class SingleArchiveExtractor:
         broker,
         task: ArchiveTask,
         out_dir: str,
-        split_info: Optional[SplitArchiveInfo] = None,
         *,
         request_id: str,
         file_id: str,
@@ -113,7 +105,6 @@ class SingleArchiveExtractor:
         state = self._extract_state_machine(
             task,
             out_dir,
-            split_info=split_info,
             allow_embedded_segments=allow_embedded_segments,
             phase_timer=phase_timer,
             phase_prefix=phase_prefix,
@@ -146,7 +137,6 @@ class SingleArchiveExtractor:
         self,
         task: ArchiveTask,
         out_dir: str,
-        split_info: Optional[SplitArchiveInfo] = None,
         *,
         allow_embedded_segments: bool = True,
         phase_timer: Callable[..., Any] | None = None,
@@ -164,20 +154,17 @@ class SingleArchiveExtractor:
                     task,
                     out_dir,
                     segments,
-                    split_info=split_info,
-                    phase_timer=phase_timer,
+                            phase_timer=phase_timer,
                     phase_prefix=f"{phase_prefix}_embedded",
                 ))
 
-        archive = task.main_path
-        split_info = split_info or task.split_info
-        with _phase(phase_timer, f"{phase_prefix}_resolve_split_entry"):
-            archive, all_parts, split_info = self.split_entry_resolver.resolve(
-                archive,
-                list(task.all_parts or [archive]),
-                split_info,
-            )
-        is_split = split_info.is_split or len(all_parts) > 1
+        descriptor = task.archive_input()
+        archive = descriptor.entry_path
+        all_parts = descriptor.part_paths() or [archive]
+        is_split = (
+            descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
+            or len(all_parts) > 1
+        )
 
         self._log(self.i18n.t("extract.log.start", archive=archive))
 
@@ -212,7 +199,7 @@ class SingleArchiveExtractor:
                     diagnostics={"failure_stage": "preflight", "failure_kind": "output_filesystem", "message": str(exc)},
                 )
 
-            descriptor = split_info.archive_input or task.archive_input()
+            descriptor = task.archive_input()
             run_archive = descriptor.entry_path
             run_parts = descriptor.part_paths()
             cleanup_parts = list(dict.fromkeys([
@@ -352,9 +339,6 @@ class SingleArchiveExtractor:
                         )
 
                     err = f"{run_result.stdout}\n{run_result.stderr}".lower()
-            finally:
-                pass
-
             if resolution.requires_extraction_confirmation and run_result is not None:
                 worker_result = worker_result_payload(run_result)
                 selected_password = self._worker_selected_password(resolution, run_result)
@@ -736,12 +720,10 @@ class SingleArchiveExtractor:
         out_dir: str,
         segments: list[dict[str, Any]],
         *,
-        split_info: Optional[SplitArchiveInfo] = None,
         phase_timer: Callable[..., Any] | None = None,
         phase_prefix: str = "extract_embedded",
     ) -> ExtractionResult:
         archive = task.main_path
-        split_info = split_info or task.split_info
         all_parts = list(task.all_parts or [archive])
         self._log(self.i18n.t("extract.log.embedded_start", archive=archive, count=len(segments)))
         try:
@@ -796,15 +778,13 @@ class SingleArchiveExtractor:
                     # inherited directory passwords lives outside ArchiveKnowledge.
                     task.set_knowledge({})
                     task.set_archive_state(ArchiveState.from_archive_input(descriptor))
-                    # The planner stores a task-level probe for compatibility,
-                    # but extraction must always bind password verification to
-                    # the currently active logical segment.
+                    # Password verification must bind to the currently active
+                    # logical segment.
                     write_source_password_probe_input(task, descriptor.to_dict())
                 result = yield from self._extract_state_machine(
                     task,
                     segment_dir,
-                    split_info=split_info,
-                    allow_embedded_segments=False,
+                            allow_embedded_segments=False,
                     phase_timer=phase_timer,
                     phase_prefix=f"{phase_prefix}_segment_extract",
                 )
@@ -823,7 +803,7 @@ class SingleArchiveExtractor:
                 selected_codepage = result.selected_codepage
             with _phase(phase_timer, f"{phase_prefix}_segment_directory_stats"):
                 segment_inventory = OutputInventory.from_value(
-                    result.output_inventory or result.output_inventory_payload,
+                    result.output_inventory,
                     expected_root=segment_dir,
                 )
                 stats = {

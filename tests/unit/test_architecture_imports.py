@@ -71,3 +71,25 @@ def test_imports_follow_runtime_pipeline_core_direction() -> None:
                     violations.append(f"{path}: pipeline imports {target}")
 
     assert not violations, "\n".join(violations)
+
+
+def test_removed_migration_adapters_do_not_return() -> None:
+    forbidden_paths = (
+        _PACKAGE_ROOT / "pipeline" / "discovery" / "relations" / "stage.py",
+        _PACKAGE_ROOT / "pipeline" / "extraction" / "internal" / "workflow" / "split_entry.py",
+    )
+    assert not any(path.exists() for path in forbidden_paths)
+
+    forbidden_tokens = (
+        "SplitArchiveInfo",
+        "ensure_archive_state",
+        "module_executor_pool",
+        "output_inventory_payload",
+    )
+    violations = []
+    for path in _PACKAGE_ROOT.rglob("*.py"):
+        source = path.read_text(encoding="utf-8")
+        for token in forbidden_tokens:
+            if token in source:
+                violations.append(f"{path}: retired adapter token {token}")
+    assert not violations, "\n".join(violations)

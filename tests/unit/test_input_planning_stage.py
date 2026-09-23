@@ -391,7 +391,7 @@ def test_input_planning_stage_projects_rar_sfx_volume_password_probe(tmp_path):
         "start": start,
         "end": first.stat().st_size,
     }]
-    assert task.split_info.archive_input.open_mode == "sfx_with_volumes"
+    assert task.archive_input().open_mode == "sfx_with_volumes"
 
 
 def test_input_planning_preserves_structured_password_probe_for_split_segment_at_zero(tmp_path):
@@ -416,7 +416,6 @@ def test_input_planning_preserves_structured_password_probe_for_split_segment_at
         format_hint="7z",
         logical_name="case",
     )
-    task.split_info.archive_input = descriptor
     task.set_archive_input(descriptor)
     stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
     stage.enabled = True

@@ -37,7 +37,7 @@ def build_candidates_for_targets(
     scan_roots = list(selected_dirs)
     for file_path in selected_files:
         if not any(safe_relative_path(file_path, directory) is not None for directory in selected_dirs):
-            scan_roots.append(_context_root_for_file(file_path, config or {}))
+            scan_roots.append(_context_root_for_file(file_path))
     session.set_scan_roots(scan_roots)
 
     candidates: list[DiscoveryCandidate] = []
@@ -49,7 +49,7 @@ def build_candidates_for_targets(
     for file_path in selected_files:
         if any(safe_relative_path(file_path, directory) is not None for directory in selected_dirs):
             continue
-        parent = _context_root_for_file(file_path, config or {})
+        parent = _context_root_for_file(file_path)
         parent_candidates = session.candidates_for_directory(parent)
         selected_key = path_key(file_path)
         matched = [
@@ -108,17 +108,5 @@ def _add_unique(
         target.append(candidate)
 
 
-def _context_root_for_file(file_path: str, config: dict) -> str:
-    current = os.path.dirname(file_path) or os.getcwd()
-    depth = _scene_context_parent_depth(config)
-    while depth > 0:
-        parent = os.path.dirname(current)
-        if not parent or parent == current:
-            break
-        current = parent
-        depth -= 1
-    return current
-
-
-def _scene_context_parent_depth(config: dict) -> int:
-    return 0
+def _context_root_for_file(file_path: str) -> str:
+    return os.path.dirname(file_path) or os.getcwd()

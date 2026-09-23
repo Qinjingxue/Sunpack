@@ -30,10 +30,10 @@ def output_inventory_for_evidence(evidence: Any) -> OutputInventory:
         return cached
     output_dir = getattr(evidence, "output_dir", "")
     extraction_result = getattr(evidence, "extraction_result", None)
-    value = getattr(extraction_result, "output_inventory", None)
-    if value is None:
-        value = getattr(extraction_result, "output_inventory_payload", None)
-    inventory = OutputInventory.from_value(value, expected_root=output_dir)
+    inventory = OutputInventory.from_value(
+        getattr(extraction_result, "output_inventory", None),
+        expected_root=output_dir,
+    )
     if inventory is None:
         inventory = collect_output_inventory(
             output_dir,

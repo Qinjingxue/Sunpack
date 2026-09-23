@@ -347,13 +347,12 @@ class ArchiveInputDescriptor:
         part_paths: list[str] | None = None,
         format_hint: str = "",
         logical_name: str = "",
-        open_mode: ArchiveOpenMode | None = None,
         password: str = "",
     ) -> "ArchiveInputDescriptor":
         paths = list(part_paths or [archive_path])
         if len(paths) > 1:
             raise ValueError("multi-volume inputs require structured parts with volume_number and canonical_name")
-        mode: ArchiveOpenMode = open_mode or ("file" if len(paths) <= 1 else "native_volumes")
+        mode: ArchiveOpenMode = "file"
         return cls(
             entry_path=archive_path,
             open_mode=mode,

@@ -10,7 +10,6 @@ from sunpack.core.contracts.content_recovery import (
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
-from sunpack.pipeline.discovery.relations.stage import ArchiveRelationStage
 from sunpack.pipeline.coordinator.verification_stage import verify_and_project
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
@@ -61,7 +60,7 @@ class BatchExtractionOutcome:
 
     @property
     def outcome_kind(self) -> OutcomeKind:
-        if self.result.success and _verification_accepts_complete_strict(self.verification):
+        if self.result.success and _verification_accepts_complete(self.verification):
             return OutcomeKind.COMPLETE_SUCCESS
         if (
             self.content_requirement != CONTENT_REQUIREMENT_COMPLETE
@@ -124,18 +123,12 @@ class ExtractionBatchRunner:
         self.origin = str(origin or "")
         self.progress_round_index = 1
         self.progress_direct_mode = False
-        self.relation_stage = ArchiveRelationStage()
         self.verifier = VerificationScheduler(self.config, password_session=self.extractor.password_session)
         self.directory_password_contexts = DirectoryPasswordContextStore(self.config)
 
     def set_progress_round(self, round_index: int, *, direct: bool = False) -> None:
         self.progress_round_index = max(1, int(round_index or 1))
         self.progress_direct_mode = bool(direct)
-
-    def prepare_tasks(self, tasks: List[ArchiveTask]):
-        self.relation_stage.resolve_tasks(tasks)
-        # Physical source paths are immutable. Detected formats and logical
-        # volume identities travel through ArchiveInputDescriptor/ArchiveState.
 
     async def execute_async(
         self,
@@ -156,7 +149,6 @@ class ExtractionBatchRunner:
             return []
 
         def prepare_batch():
-            self.prepare_tasks(tasks)
             self.directory_password_contexts.annotate(tasks)
             resolver = build_output_dir_resolver(
                 tasks,
@@ -227,22 +219,20 @@ class ExtractionBatchRunner:
                 continue
             output_dirs.append(output_dir)
             self.directory_password_contexts.remember(output_dir, task)
-            if isinstance(self.output_scan_policy, NestedOutputScanPolicy):
-                projected_roots = self.output_scan_policy.project_logical_scan_roots(output_dir, outcome.result)
-            else:
-                projected_roots = [(output_dir, None)]
+            projected_roots = self.output_scan_policy.project_logical_scan_roots(
+                output_dir,
+                outcome.result,
+            )
             for logical_root, projected_inventory in projected_roots:
                 logical_scan_roots.append(logical_root)
                 inventory = OutputInventory.from_value(projected_inventory, expected_root=logical_root)
                 if inventory is not None:
                     output_inventories[os.path.normcase(os.path.abspath(logical_root))] = inventory
-        if isinstance(self.output_scan_policy, NestedOutputScanPolicy):
-            return self.output_scan_policy.scan_roots_from_outputs(
-                output_dirs,
-                inventories=output_inventories,
-                logical_roots=logical_scan_roots,
-            )
-        return self.output_scan_policy.scan_roots_from_outputs(output_dirs)
+        return self.output_scan_policy.scan_roots_from_outputs(
+            output_dirs,
+            inventories=output_inventories,
+            logical_roots=logical_scan_roots,
+        )
 
     async def _execute_one_async(
         self,
@@ -294,14 +284,6 @@ class ExtractionBatchRunner:
                 break
             task.adopt_detection_plan(replacement)
             task.runtime["volume_retry_attempted"] = True
-            await broker.run(
-                "relation",
-                file_id,
-                self.prepare_tasks,
-                [task],
-                request_id=self.request_id,
-                cancellation=cancellation,
-            )
         if terminal is not None:
             terminal.planned_out_dir = planned_out_dir
             self._report_task_finished(task, terminal)
@@ -466,7 +448,7 @@ class ExtractionBatchRunner:
                 if (
                     not volume_retry_attempted
                     and callable(missing_volume_retry)
-                    and _should_retry_missing_volume_resolution(task, result)
+                    and _should_retry_missing_volume_resolution(result)
                 ):
                     volume_retry_attempted = True
                     self._report_task_status(task, "resolving_volumes")
@@ -483,7 +465,6 @@ class ExtractionBatchRunner:
                             "confirmed_structure",
                             "anchor_constrained_filename",
                         ]
-                        self.prepare_tasks([task])
                         self.directory_password_contexts.annotate([task])
                         continue
                 if self._must_stop_for_proven_content_loss(task, result, verification):
@@ -671,10 +652,6 @@ def _verification_accepts(verification: VerificationResult | Any) -> bool:
 
 
 def _verification_accepts_complete(verification: VerificationResult | Any) -> bool:
-    return _verification_accepts_complete_strict(verification)
-
-
-def _verification_accepts_complete_strict(verification: VerificationResult | Any) -> bool:
     if verification is None:
         return False
     # The verifier's decision is the contract boundary. Some extraction backends
@@ -755,16 +732,6 @@ def _coverage_payload(verification: VerificationResult) -> dict[str, Any]:
     }
 
 
-def _coverage_complete_files(payload: dict[str, Any]) -> int:
-    coverage = payload.get("archive_coverage") if isinstance(payload, dict) else {}
-    if not isinstance(coverage, dict):
-        return 0
-    try:
-        return max(0, int(coverage.get("complete_files") or 0))
-    except (TypeError, ValueError):
-        return 0
-
-
 def _verification_payload(verification: VerificationResult) -> dict[str, Any]:
     output_quality = _output_quality_payload(verification)
     return {
@@ -803,10 +770,8 @@ def _output_quality_payload(verification: VerificationResult | Any) -> dict[str,
 
 
 def _should_retry_missing_volume_resolution(
-    task: ArchiveTask,
     result: ExtractionResult,
 ) -> bool:
-    del task
     failure = result.failure
     return bool(failure is not None and failure.contains(FailureKind.MISSING_VOLUME))
 
@@ -866,9 +831,10 @@ def _possible_missing_volume_failure(
 
 
 def _task_is_split_input(task: ArchiveTask) -> bool:
+    descriptor = task.archive_input()
     return bool(
-        task.split_info.is_split
-        or len(task.all_parts or []) > 1
+        descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
+        or len(descriptor.part_paths()) > 1
     )
 
 

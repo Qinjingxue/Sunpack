@@ -56,11 +56,6 @@ class _FakeRetryPolicy:
         return error
 
 
-class _FakeSplitEntryResolver:
-    def resolve(self, archive, all_parts, split_info):
-        return archive, list(all_parts), split_info
-
-
 class _FakeSevenZipRunner:
     def __init__(self, *, include_output_counts: bool = True):
         self.sources = []
@@ -150,12 +145,10 @@ def test_extractor_runs_analysis_segments_inside_same_task_and_restores_source(t
     ])
     runner = _FakeSevenZipRunner()
     extractor = SingleArchiveExtractor(
-        seven_z_path="7z",
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
         retry_policy=_FakeRetryPolicy(),
-        split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=runner,
         best_effort=True,
     )
@@ -193,12 +186,10 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     write_source_extractable_segments(task, segments)
     resolver = _RecordingPasswordResolver()
     extractor = SingleArchiveExtractor(
-        seven_z_path="7z",
         password_store=_CandidatePasswordStore(),
         password_resolver=resolver,
         metadata_scanner=ArchiveMetadataScanner(),
         retry_policy=_FakeRetryPolicy(),
-        split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -243,12 +234,10 @@ def test_verifier_accepts_carrier_when_every_embedded_payload_is_complete(tmp_pa
         },
     ])
     extractor = SingleArchiveExtractor(
-        seven_z_path="7z",
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
         retry_policy=_FakeRetryPolicy(),
-        split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -289,12 +278,10 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
         "archive_input": archive_input,
     }])
     extractor = SingleArchiveExtractor(
-        seven_z_path="7z",
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
         retry_policy=_FakeRetryPolicy(),
-        split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
@@ -318,12 +305,10 @@ def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
     task = _task(archive)
     runner = _FakeSevenZipRunner(include_output_counts=False)
     extractor = SingleArchiveExtractor(
-        seven_z_path="7z",
         password_store=_FakePasswordStore(),
         password_resolver=_FakePasswordResolver(),
         metadata_scanner=ArchiveMetadataScanner(),
         retry_policy=_FakeRetryPolicy(),
-        split_entry_resolver=_FakeSplitEntryResolver(),
         sevenzip_runner=runner,
         best_effort=True,
         write_progress_manifest=True,

@@ -145,17 +145,12 @@ class NestedOutputScanPolicy:
             if not segment_dir:
                 continue
             child_inventory = getattr(child_result, "output_inventory", None)
-            if child_inventory is None:
-                child_inventory = getattr(child_result, "output_inventory_payload", None)
             projected.append((segment_dir, child_inventory))
 
         if projected:
             return projected
 
-        inventory = getattr(extraction_result, "output_inventory", None)
-        if inventory is None:
-            inventory = getattr(extraction_result, "output_inventory_payload", None)
-        return [(output_dir, inventory)]
+        return [(output_dir, getattr(extraction_result, "output_inventory", None))]
 
     def take_scan_session(self, scan_roots: Iterable[str]) -> DiscoveryScanSession | None:
         """Consume the inventory-backed session prepared for the next recursive round."""
