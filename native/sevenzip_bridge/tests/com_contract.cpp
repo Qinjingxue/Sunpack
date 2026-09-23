@@ -69,6 +69,8 @@ void check_extract_callback()
     check(queries_as(as_unknown(probe), IID_IProgress), "QI(IProgress) == S_OK");
     check(queries_as(as_unknown(probe), IID_IArchiveExtractCallback), "QI(IArchiveExtractCallback) == S_OK");
     check(queries_as(as_unknown(probe), IID_ICryptoGetTextPassword), "QI(ICryptoGetTextPassword) == S_OK");
+    check(rejects(as_unknown(probe), IID_ISunpackPositionedExtractCallback),
+          "plain ExtractCallback rejects positioned extraction capability");
     check(rejects(as_unknown(probe), IID_IInStream), "QI(foreign IID) == E_NOINTERFACE");
 
     // The IProgress pointer must be usable as the base of the callback.
@@ -98,6 +100,8 @@ void check_extract_to_disk_callback()
     check(queries_as(as_unknown(probe), IID_IProgress), "QI(IProgress) == S_OK");
     check(queries_as(as_unknown(probe), IID_IArchiveExtractCallback), "QI(IArchiveExtractCallback) == S_OK");
     check(queries_as(as_unknown(probe), IID_ICryptoGetTextPassword), "QI(ICryptoGetTextPassword) == S_OK");
+    check(queries_as(as_unknown(probe), IID_ISunpackPositionedExtractCallback),
+          "QI(ISunpackPositionedExtractCallback) == S_OK");
     check(rejects(as_unknown(probe), IID_IInStream), "QI(foreign IID) == E_NOINTERFACE");
 }
 
@@ -170,12 +174,16 @@ void check_streams()
     check(queries_as(as_unknown(file_raw), IID_IUnknown), "FileInStream QI(IUnknown) == S_OK");
     check(queries_as(as_unknown(file_raw), IID_ISequentialInStream), "FileInStream QI(ISequentialInStream) == S_OK");
     check(queries_as(as_unknown(file_raw), IID_IInStream), "FileInStream QI(IInStream) == S_OK");
+    check(queries_as(as_unknown(file_raw), IID_ISunpackRandomAccessInStream),
+          "FileInStream QI(ISunpackRandomAccessInStream) == S_OK");
     check(rejects(as_unknown(file_raw), IID_IProgress), "FileInStream QI(foreign IID) == E_NOINTERFACE");
 
     auto *multi_raw = new MultiRangeInStream(std::vector<ExtractInputRange>{});
     CMyComPtr<IInStream> multi(multi_raw);
     check(queries_as(as_unknown(multi_raw), IID_ISequentialInStream), "MultiRangeInStream QI(ISequentialInStream) == S_OK");
     check(queries_as(as_unknown(multi_raw), IID_IInStream), "MultiRangeInStream QI(IInStream) == S_OK");
+    check(rejects(as_unknown(multi_raw), IID_ISunpackRandomAccessInStream),
+          "MultiRangeInStream rejects random-access capability");
 }
 
 } // namespace
