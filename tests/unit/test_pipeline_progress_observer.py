@@ -3,8 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from sunpack.coordinator.engine import _RequestRuntime
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 
 
@@ -39,7 +38,7 @@ def test_pipeline_progress_observer_receives_a_copy_and_cannot_fail_pipeline(tmp
 
 def test_extract_ready_semantic_event_uses_ordered_progress_sink(tmp_path):
     archive = tmp_path / "ready.zip"
-    task = ArchiveTask(fact_bag=FactBag(), main_path=str(archive), all_parts=[str(archive)])
+    task = make_archive_task(archive, format_hint="zip")
     events = []
     runner = SevenZipRunner({})
     runner.progress_callback = lambda current_task, event: events.append((current_task, event))
