@@ -1737,18 +1737,24 @@ private:
 
     void monitor_loop() noexcept {
         std::optional<std::chrono::steady_clock::time_point> next_memory_poll;
+        std::uint64_t observed_activity_epoch = 0;
 
         while (true) {
             std::unique_lock<std::mutex> wait_lock(monitor_mutex_);
             const auto now = std::chrono::steady_clock::now();
             const bool has_active_jobs =
                 monitor_has_active_jobs_.load(std::memory_order_acquire);
+            const std::uint64_t activity_epoch =
+                monitor_activity_epoch_.load(std::memory_order_acquire);
 
             if (has_active_jobs) {
-                if (!next_memory_poll) {
-                    // The first active job samples immediately so a budget
-                    // left reduced by an earlier pressure episode is not stale
-                    // for a full polling interval.
+                if (activity_epoch != observed_activity_epoch) {
+                    // Every 0->1 active transition is a new activity episode.
+                    // Force its first memory sample immediately even if the
+                    // previous episode ended less than one poll interval ago.
+                    observed_activity_epoch = activity_epoch;
+                    next_memory_poll = now;
+                } else if (!next_memory_poll) {
                     next_memory_poll = now;
                 }
             } else {
@@ -1882,6 +1888,8 @@ private:
                 if (monitor_became_active) {
                     monitor_has_active_jobs_.store(
                         true, std::memory_order_release);
+                    monitor_activity_epoch_.fetch_add(
+                        1, std::memory_order_release);
                 }
                 wake_next_job =
                     !queues_empty_locked() && cpu_budget_.can_acquire_base();
@@ -1980,6 +1988,7 @@ private:
     std::mutex monitor_mutex_;
     std::condition_variable monitor_condition_;
     std::atomic<bool> monitor_has_active_jobs_{false};
+    std::atomic<std::uint64_t> monitor_activity_epoch_{0};
     bool monitor_recheck_ = false;
     bool monitor_stopping_ = false;
 
