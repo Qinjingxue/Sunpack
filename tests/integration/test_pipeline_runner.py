@@ -6,8 +6,7 @@ from sunpack.coordinator.engine import PipelineEngine
 from sunpack.coordinator.async_work import CancellationToken
 from sunpack.config.schema import normalize_config
 from sunpack.contracts.extraction import ExtractionResult
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
+from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.fs_builder import make_zip
 
@@ -199,8 +198,7 @@ def test_batch_does_not_treat_existing_same_name_directory_as_output(tmp_path, m
     extracted = []
 
     def task_for(path):
-        bag = FactBag()
-        return ArchiveTask(fact_bag=bag, main_path=str(path), all_parts=[str(path)])
+        return make_archive_task(path)
 
     def fake_extract(task, out_dir):
         extracted.append(task.main_path)
