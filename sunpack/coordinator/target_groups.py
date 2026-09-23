@@ -2,7 +2,7 @@ import os
 from typing import List
 
 from sunpack.contracts.detection import FactBag
-from sunpack.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputRange
 from sunpack.contracts.archive_state import ArchiveState
 from sunpack.contracts.filesystem import DirectorySnapshot
 from sunpack.relations.scheduler import CandidateGroup, RelationsScheduler
@@ -39,17 +39,17 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
         != os.path.normcase(os.path.abspath(group.head_path))
     ):
         bag.set("file.container_type", "pe")
+    metadata = group.head_metadata if isinstance(group.head_metadata, dict) else {}
+    relation_confirmed = bool(metadata.get("relation_confirmed"))
     needs_archive_metadata = bool(
-        group.split_volumes
+        relation_confirmed
+        or group.split_volumes
         or group.is_split_candidate
         or relation.is_split_related
         or group.companion_paths
         or group.carrier_path
     )
-    password_pending = bool(
-        isinstance(group.head_metadata, dict)
-        and group.head_metadata.get("needs_password")
-    )
+    password_pending = bool(metadata.get("needs_password"))
     if group.split_volumes:
         format_hint = _split_format_hint(
             relation.split_family,
@@ -68,14 +68,44 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
             format_hint=format_hint,
             logical_name=group.logical_name,
         )
+    elif relation_confirmed:
+        format_hint = str(metadata.get("format") or "").lower().lstrip(".")
+        bag.update({
+            "relation.format_hint": format_hint,
+            "relation.format_hint_confidence": (
+                "weak" if password_pending else "strong"
+            ) if format_hint else "none",
+        })
+        structure_offset = int(metadata.get("structure_offset") or 0)
+        if structure_offset > 0 and bool(metadata.get("sfx")):
+            source_descriptor = ArchiveInputDescriptor(
+                entry_path=group.entry_path,
+                open_mode="file_range",
+                format_hint=format_hint,
+                logical_name=group.logical_name,
+                ranges=[
+                    ArchiveInputRange(
+                        path=group.entry_path,
+                        start=structure_offset,
+                    )
+                ],
+            )
+        else:
+            source_descriptor = ArchiveInputDescriptor.from_parts(
+                archive_path=group.entry_path,
+                part_paths=list(input_paths or [group.entry_path]),
+                format_hint=format_hint,
+                logical_name=group.logical_name,
+            )
     else:
         format_hint = ""
         bag.update({
             "relation.format_hint": format_hint,
             "relation.format_hint_confidence": "none",
         })
+        source_descriptor = None
 
-    if needs_archive_metadata:
+    if needs_archive_metadata and source_descriptor is not None:
         state = ArchiveState.from_archive_input(source_descriptor)
         bag.update({
             "archive.input": source_descriptor.to_dict(),
@@ -123,6 +153,18 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
         bag.set("relation.member_paths", list(member_paths))
     if isinstance(group.head_metadata, dict) and group.head_metadata:
         bag.set("relation.volume_anchor", dict(group.head_metadata))
+    if relation_confirmed and format_hint in {"rar", "7z", "zip"}:
+        detected_ext = {"rar": ".rar", "7z": ".7z", "zip": ".zip"}[format_hint]
+        structure_offset = int(metadata.get("structure_offset") or 0)
+        bag.set("file.detected_ext", detected_ext)
+        bag.set("file.probe_detected_archive", True)
+        bag.set("file.probe_offset", structure_offset)
+        if structure_offset == 0:
+            bag.set("file.magic_matched", True)
+        if structure_offset > 0:
+            bag.set("file.embedded_archive_found", True)
+        if bool(metadata.get("sfx")) and bool(metadata.get("pe_structure")):
+            bag.set("file.container_type", "pe")
     return bag
 
 
