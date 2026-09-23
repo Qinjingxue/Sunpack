@@ -4,61 +4,47 @@ from sunpack.contracts.discovery import (
     DiscoveryCandidate,
     ResolvedArchiveInput,
     StageResult,
-    candidate_paths,
 )
-from sunpack.contracts.rules import RuleDecision
-from sunpack.detection.scheduler import DetectionResult
 
 
 _FORMATS = {"rar", "7z", "zip"}
 
 
 class RelationResolver:
-    def resolve(
-        self,
-        candidates: list[DiscoveryCandidate],
-    ) -> tuple[StageResult, list[DetectionResult]]:
+    def resolve(self, candidates: list[DiscoveryCandidate]) -> StageResult:
         result = StageResult()
-        decisions: list[DetectionResult] = []
         for candidate in candidates:
             anchor = candidate.relation_anchor
             archive_format = str(anchor.get("format") or candidate.format_hint or "").lower().lstrip(".")
-            paths = candidate_paths(candidate)
             if not anchor.get("relation_confirmed") and (
                 anchor.get("needs_password") or anchor.get("multivolume")
             ):
-                result.blocked_paths.update(paths)
+                result.add_blocked(
+                    candidate,
+                    source="relations",
+                    reason="Relations requires password or additional volume evidence",
+                )
                 continue
+
             if (
                 anchor.get("relation_confirmed")
                 and archive_format in _FORMATS
                 and candidate.archive_input is not None
             ):
-                reason = "Relations confirmed native archive identity"
-                resolved = ResolvedArchiveInput.from_candidate(
-                    candidate,
-                    "relations",
-                    dict(anchor),
-                    archive_input=candidate.archive_input,
-                    confidence=1.0 if str(anchor.get("confidence") or "") == "strong" else 0.8,
-                    reasons=(reason,),
-                )
-                result.add_resolved(resolved)
-                decisions.append(DetectionResult(
-                    candidate,
-                    RuleDecision(
-                        should_extract=True,
-                        matched_rules=["relations"],
-                        decision="archive",
-                        stop_reason=reason,
-                        decision_stage="relations",
-                        deciding_rule="relations",
+                result.add_resolved(
+                    ResolvedArchiveInput(
+                        archive_input=candidate.archive_input,
+                        source="relations",
+                        carrier_path=candidate.carrier_path,
+                        cleanup_paths=candidate.cleanup_paths,
+                        evidence=dict(anchor),
                     ),
-                    archive_format,
-                    resolved,
-                ))
-            else:
-                result.residual_paths.update(paths)
+                    reason="Relations confirmed native archive identity",
+                )
+                continue
+
+            result.add_residual(candidate, source="relations")
+
         result.residual_paths.difference_update(result.claimed_paths | result.blocked_paths)
         result.validate()
-        return result, decisions
+        return result
