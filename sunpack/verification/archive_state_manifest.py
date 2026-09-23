@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from dataclasses import replace
-from pathlib import Path
 from typing import Any
 
 from sunpack.contracts.archive_state import ArchiveState
@@ -166,9 +165,9 @@ def archive_state_manifest(
     codepage: str | None = None,
 ) -> ArchiveStateManifest:
     hint = _format_hint(state)
-    if hint == "tar" or (not hint and Path(state.source.entry_path).suffix.lower() == ".tar"):
+    if hint == "tar":
         return _tar_archive_state_manifest(state, max_items=max_items)
-    if hint and hint != "zip" and not Path(state.source.entry_path).suffix.lower() == ".zip":
+    if hint and hint != "zip":
         return ArchiveStateManifest(
             status=STATUS_UNSUPPORTED,
             is_archive=False,

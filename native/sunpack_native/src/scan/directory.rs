@@ -569,6 +569,27 @@ impl NativeDirectorySnapshot {
         }
     }
 
+    fn relation_anchor_rows(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Vec<(String, Option<u64>, Py<PyDict>)>> {
+        self.rows
+            .iter()
+            .filter_map(|&row| {
+                (!self.table.is_dirs[row] && self.table.file_routes[row] == FILE_ROUTE_RELATIONS)
+                    .then(|| (row, self.table.relation_anchors[row].as_ref()))
+            })
+            .filter_map(|(row, anchor)| anchor.map(|anchor| (row, anchor)))
+            .map(|(row, anchor)| {
+                Ok((
+                    self.table.paths[row].clone(),
+                    self.table.sizes[row],
+                    crate::relations::volume_anchor_to_dict(py, anchor)?,
+                ))
+            })
+            .collect()
+    }
+
     fn non_relation_file_routing_columns(
         &self,
     ) -> (

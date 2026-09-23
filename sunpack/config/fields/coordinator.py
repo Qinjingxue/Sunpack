@@ -20,21 +20,21 @@ def normalize_recursive_extract(value: Any) -> dict[str, Any]:
     return {"mode": "fixed", "max_rounds": rounds}
 
 
-DEFAULT_NESTED_EXTRACTION_POLICY = advanced_config_value(("nested_extraction_policy",))
+DEFAULT_RECURSIVE_AUTHORIZATION = advanced_config_value(("recursive_authorization",))
 
 
-def normalize_nested_extraction_policy(value: Any) -> dict[str, Any]:
+def normalize_recursive_authorization(value: Any) -> dict[str, Any]:
     if value is None:
         value = {}
     if not isinstance(value, dict):
-        raise ValueError("nested_extraction_policy must be an object")
-    unknown_fields = set(value) - set(DEFAULT_NESTED_EXTRACTION_POLICY)
+        raise ValueError("recursive_authorization must be an object")
+    unknown_fields = set(value) - set(DEFAULT_RECURSIVE_AUTHORIZATION)
     if unknown_fields:
         names = ", ".join(sorted(unknown_fields))
-        raise ValueError(f"nested_extraction_policy has unknown fields: {names}")
-    config = {**DEFAULT_NESTED_EXTRACTION_POLICY, **value}
+        raise ValueError(f"recursive_authorization has unknown fields: {names}")
+    config = {**DEFAULT_RECURSIVE_AUTHORIZATION, **value}
     if not isinstance(config.get("enabled"), bool):
-        raise ValueError("nested_extraction_policy.enabled must be boolean")
+        raise ValueError("recursive_authorization.enabled must be boolean")
     try:
         byte_ratio_exponent = float(config["byte_ratio_exponent"])
         project_ratio_exponent = float(config["project_ratio_exponent"])
@@ -42,33 +42,33 @@ def normalize_nested_extraction_policy(value: Any) -> dict[str, Any]:
         minimum_score = float(config["minimum_authorization_score"])
         minimum_ratio = float(config["minimum_archive_byte_ratio"])
     except (TypeError, ValueError) as exc:
-        raise ValueError("nested_extraction_policy thresholds must be numeric") from exc
+        raise ValueError("recursive_authorization thresholds must be numeric") from exc
     hard_maximum = config["hard_maximum_other_projects"]
     if isinstance(hard_maximum, bool) or not isinstance(hard_maximum, int):
         raise ValueError(
-            "nested_extraction_policy.hard_maximum_other_projects must be an integer"
+            "recursive_authorization.hard_maximum_other_projects must be an integer"
         )
     if not math.isfinite(byte_ratio_exponent) or byte_ratio_exponent <= 0.0:
         raise ValueError(
-            "nested_extraction_policy.byte_ratio_exponent must be positive"
+            "recursive_authorization.byte_ratio_exponent must be positive"
         )
     if not math.isfinite(project_ratio_exponent) or project_ratio_exponent <= 0.0:
         raise ValueError(
-            "nested_extraction_policy.project_ratio_exponent must be positive"
+            "recursive_authorization.project_ratio_exponent must be positive"
         )
     if not math.isfinite(authorization_bias):
-        raise ValueError("nested_extraction_policy.authorization_bias must be finite")
+        raise ValueError("recursive_authorization.authorization_bias must be finite")
     if not math.isfinite(minimum_score) or not 0.0 <= minimum_score <= 1.0:
         raise ValueError(
-            "nested_extraction_policy.minimum_authorization_score must be between 0 and 1"
+            "recursive_authorization.minimum_authorization_score must be between 0 and 1"
         )
     if not math.isfinite(minimum_ratio) or not 0.0 <= minimum_ratio <= 1.0:
         raise ValueError(
-            "nested_extraction_policy.minimum_archive_byte_ratio must be between 0 and 1"
+            "recursive_authorization.minimum_archive_byte_ratio must be between 0 and 1"
         )
     if hard_maximum < 0:
         raise ValueError(
-            "nested_extraction_policy.hard_maximum_other_projects must be non-negative"
+            "recursive_authorization.hard_maximum_other_projects must be non-negative"
         )
     config["byte_ratio_exponent"] = byte_ratio_exponent
     config["project_ratio_exponent"] = project_ratio_exponent
@@ -87,9 +87,9 @@ CONFIG_FIELDS = (
         owner=__name__,
     ),
     ConfigField(
-        path=("nested_extraction_policy",),
-        default=DEFAULT_NESTED_EXTRACTION_POLICY,
-        normalize=normalize_nested_extraction_policy,
+        path=("recursive_authorization",),
+        default=DEFAULT_RECURSIVE_AUTHORIZATION,
+        normalize=normalize_recursive_authorization,
         owner=__name__,
     ),
 )

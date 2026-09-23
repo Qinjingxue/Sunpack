@@ -15,7 +15,7 @@ from sunpack.analysis.request import AnalysisRequest
 from sunpack.analysis.source import analysis_source_for_descriptor
 from sunpack.coordinator.detection_diagnostics import DetectionDiagnostics
 from sunpack.support.json_format import to_json_text
-from sunpack.detection.options import DetectionOptions
+from sunpack.embedded.options import EmbeddedOptions
 
 COMMAND = "inspect"
 ORDER = 30
@@ -43,7 +43,7 @@ def handle(args, ctx):
 
     config = load_request_config(ctx.cwd)
     effective_config = build_effective_config(config)
-    detection_options = DetectionOptions(deep_scan=bool(args.deep_detect))
+    detection_options = EmbeddedOptions(force_scan=bool(args.deep_detect))
     results = DetectionDiagnostics(config, detection_options).collect(target_paths)
     all_items = [inspect_result_to_item(res) for res in results]
     if args.analyze:

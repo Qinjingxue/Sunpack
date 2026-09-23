@@ -605,15 +605,11 @@ fn seed_strength_for_row(
 
 
 fn should_upgrade_zip_anchor(row: &RelationInput) -> bool {
-    let extension_is_zip = Path::new(&row.name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| matches!(value.to_ascii_lowercase().as_str(), "zip" | "zipx"));
     row.anchor.as_ref().is_some_and(|anchor| {
         anchor.format == "zip"
             && anchor.confidence == "weak"
             && anchor.structure_offset.unwrap_or(0) == 0
-    }) || extension_is_zip
+    })
 }
 
 fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
@@ -2028,7 +2024,7 @@ fn normalize_retry_format(format_hint: &str) -> &str {
     }
 }
 
-fn volume_anchor_to_dict(py: Python<'_>, anchor: &VolumeAnchor) -> PyResult<Py<PyDict>> {
+pub(crate) fn volume_anchor_to_dict(py: Python<'_>, anchor: &VolumeAnchor) -> PyResult<Py<PyDict>> {
     let dict = PyDict::new(py);
     dict.set_item("path", &anchor.path)?;
     dict.set_item("size", anchor.size)?;

@@ -26,12 +26,7 @@ def write_filesystem_task(task: ArchiveTask) -> None:
     write_payload(
         knowledge,
         "source.input",
-        {
-            "kind": "file",
-            "path": main_path,
-            "format_hint": str(task.fact_bag.get("archive.format_hint") or task.detected_ext or task.fact_bag.get("file.detected_ext") or ""),
-            "parts": list(task.all_parts or []),
-        },
+        task.archive_input().to_dict(),
         source_layer="filesystem",
         source_module="task",
     )
@@ -49,5 +44,4 @@ def _stat_payload(path: str) -> dict[str, Any]:
         "exists": True,
         "size": int(stat.st_size),
         "mtime_ns": int(stat.st_mtime_ns),
-        "suffix": Path(path).suffix.lower(),
     }

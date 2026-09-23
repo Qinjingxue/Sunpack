@@ -4,7 +4,6 @@ from pathlib import Path
 import pytest
 
 from sunpack.config import loader
-from sunpack.detection.scheduler import DetectionScheduler
 
 
 def _write_json(path, payload):
@@ -26,15 +25,7 @@ def _layered_config_paths(simple, advanced):
     return candidate_paths
 
 
-def _prepared_precheck_config(config, name):
-    scheduler = DetectionScheduler(config)
-    for rule in scheduler.rule_manager._prepare_rules("precheck"):
-        if rule.name == name:
-            return rule.config
-    return None
-
-
-def _advanced_payload(precheck=None):
+def _advanced_payload():
     return {
         "cli": {"language": "en"},
         "thresholds": {"archive_score_threshold": 6, "maybe_archive_threshold": 3},
@@ -43,14 +34,7 @@ def _advanced_payload(precheck=None):
         "filesystem": {"directory_scan_mode": "*", "scan_filters_enabled": True, "scan_filters": []},
         "performance": {"worker": {"minimum_available_memory_ratio": 0.1, "watchdog_no_progress_timeout_seconds": 180}},
         "verification": _verification_config(),
-        "detection": {
-            "enabled": True,
-            "fact_collectors": [{"name": "file_facts", "enabled": True}],
-            "processors": [],
-            "rule_pipeline": {
-                "precheck": precheck or [],
-            },
-        },
+        "detection": {"enabled": True},
     }
 
 
@@ -163,28 +147,25 @@ def test_effective_config_payload_returns_merged_external_config(tmp_path, monke
     assert payload["filesystem"]["directory_scan_mode"] == "*"
 
 
-def test_embedded_single_candidate_ratio_simple_config_overrides_advanced(tmp_path, monkeypatch):
+def test_embedded_candidate_ratio_simple_config_overrides_advanced(tmp_path, monkeypatch):
     simple = tmp_path / "sunpack_config.json"
     advanced = tmp_path / "sunpack_advanced_config.json"
-    _write_json(advanced, _advanced_payload([{
-        "name": "embedded_payload_identity", "enabled": True,
-        "deep_scan_single_candidate_ratio": 0.3,
-    }]))
-    _write_json(simple, {"detection": {"rule_pipeline": {"precheck": [{
-        "name": "embedded_payload_identity", "deep_scan_single_candidate_ratio": 0.8,
-    }]}}})
+    payload = _advanced_payload()
+    payload["embedded_scan"] = {"enabled": True, "recursive_candidate_ratio": 0.3}
+    _write_json(advanced, payload)
+    _write_json(simple, {"embedded_scan": {"recursive_candidate_ratio": 0.8}})
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
-    prepared = _prepared_precheck_config(loader.load_config(), "embedded_payload_identity")
-    assert prepared["deep_scan_single_candidate_ratio"] == 0.8
+    assert loader.load_config()["embedded_scan"]["recursive_candidate_ratio"] == 0.8
 
 
-def test_obsolete_embedded_scan_configuration_is_rejected():
-    config = _advanced_payload([{
-        "name": "embedded_payload_identity", "enabled": True,
-        "embedded_payload_scan_level": "deep",
-    }])
-    with pytest.raises(ValueError, match="embedded_payload_scan_level"):
-        _prepared_precheck_config(config, "embedded_payload_identity")
+def test_removed_detection_pipeline_configuration_is_rejected(tmp_path, monkeypatch):
+    simple = tmp_path / "sunpack_config.json"
+    advanced = tmp_path / "sunpack_advanced_config.json"
+    _write_json(advanced, _advanced_payload())
+    _write_json(simple, {"detection": {"rule_pipeline": {"precheck": []}}})
+    monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
+    with pytest.raises(loader.ConfigError, match="rule_pipeline"):
+        loader.load_config()
 
 
 def test_removed_analysis_full_scan_configuration_is_rejected(tmp_path, monkeypatch):

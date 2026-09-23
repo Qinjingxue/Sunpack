@@ -51,14 +51,12 @@ class ArchiveAnalyzer:
         effective_request = request or AnalysisRequest()
         capabilities = effective_request.capabilities
         initial_prepass = effective_request.initial_prepass
-        embedded_scan_allowed = bool(effective_request.embedded_scan_allowed)
         if isinstance(resolved, FileAnalysisSource):
             return self._engine.analyze_path(
                 resolved.path,
                 report_path=resolved.report_path,
                 initial_prepass=initial_prepass,
                 capabilities=capabilities,
-                embedded_scan_allowed=embedded_scan_allowed,
             )
         if isinstance(resolved, MultiVolumeAnalysisSource):
             return self._engine.analyze_paths(
@@ -66,7 +64,6 @@ class ArchiveAnalyzer:
                 report_path=resolved.report_path or None,
                 initial_prepass=initial_prepass,
                 capabilities=capabilities,
-                embedded_scan_allowed=embedded_scan_allowed,
             )
         raise TypeError(f"unsupported analysis source: {type(resolved).__name__}")
 

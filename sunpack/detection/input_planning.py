@@ -7,7 +7,6 @@ from typing import Any, Callable
 
 from sunpack.analysis import ArchiveAnalysisReport, ArchiveAnalyzer
 from sunpack.analysis.request import AnalysisRequest
-from sunpack.coordinator.nested_extraction_policy import EMBEDDED_SCAN_ALLOWED_FACT
 from sunpack.analysis.source import analysis_source_for_descriptor
 from sunpack.support.archive_input_projection import (
     write_source_extractable_segments,
@@ -83,8 +82,8 @@ class ArchiveInputPlanningStage:
         return (
             "source",
             json.dumps(knowledge_view.source_fingerprint(task), ensure_ascii=False, sort_keys=True, default=str),
-            "embedded_scan_allowed",
-            bool(task.fact_bag.get(EMBEDDED_SCAN_ALLOWED_FACT)),
+            "discovery_confirmed",
+            bool(task.fact_bag.get("discovery.confirmed")),
         )
 
     @staticmethod
@@ -114,6 +113,11 @@ class ArchiveInputPlanningStage:
     def _plan_task_group(self, group: list[tuple[int, ArchiveTask]]) -> list[tuple[int, list[ArchiveTask]]]:
         if not group:
             return []
+        if group[0][1].fact_bag.get("discovery.confirmed"):
+            return [
+                (index, self._plan_task_to_tasks(task)[1])
+                for index, task in group
+            ]
         if len(group) == 1:
             index, task = group[0]
             _, task_results = self._plan_task_to_tasks(task)
@@ -140,6 +144,12 @@ class ArchiveInputPlanningStage:
         return tasks
 
     def _plan_task_to_tasks(self, task: ArchiveTask) -> tuple[ArchiveAnalysisReport | None, list[ArchiveTask]]:
+        if task.fact_bag.get("discovery.confirmed"):
+            # Discovery already supplied the exact native input descriptor.
+            # The worker decides whether extraction actually succeeds.
+            task.ensure_archive_state()
+            task.fact_bag.set("input_planning.status", "extractable")
+            return None, [task]
         if self.analyzer is None:
             return None, [task]
         task.ensure_archive_state()
@@ -183,7 +193,6 @@ class ArchiveInputPlanningStage:
             source,
             AnalysisRequest(
                 initial_prepass=initial_prepass,
-                embedded_scan_allowed=bool(task.fact_bag.get(EMBEDDED_SCAN_ALLOWED_FACT)),
             ),
         )
 
@@ -381,11 +390,6 @@ class ArchiveInputPlanningStage:
                 )
 
     def _extractable_segments(self, report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:
-        if _is_damaged_native_archive_fallback(report):
-            # The embedded scanner also acts as a last-resort ZIP local-header
-            # scanner. For a native archive, those ranges are malformed
-            # fragments, not independent embedded archives.
-            return []
         candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]] = []
         index = 1
         for evidence in sorted(report.selected, key=lambda item: item.confidence, reverse=True):
@@ -711,27 +715,6 @@ _COMPOSITE_INNER_FORMATS = {
     "tar.xz": {"tar", "xz"},
     "tar.zst": {"tar", "zstd"},
 }
-
-
-_NATIVE_ARCHIVE_EXTENSIONS = {
-    "zip": {".zip", ".zipx"},
-    "rar": {".rar"},
-    "7z": {".7z"},
-}
-
-
-def _is_damaged_native_archive_fallback(report: ArchiveAnalysisReport) -> bool:
-    prepass = report.prepass if isinstance(report.prepass, dict) else {}
-    if str(prepass.get("source") or "") != "embedded_scan":
-        return False
-    suffix = os.path.splitext(str(report.path or ""))[1].lower()
-    if not suffix:
-        return False
-    return any(
-        suffix in _NATIVE_ARCHIVE_EXTENSIONS.get(str(evidence.format or "").lower(), set())
-        and str((evidence.details or {}).get("source") or "") == "embedded_scan"
-        for evidence in report.selected
-    )
 
 
 def _whole_file_composite_segments(report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment]]:

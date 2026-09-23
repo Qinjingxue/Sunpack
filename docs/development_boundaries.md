@@ -208,10 +208,10 @@ from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watch
 7-Zip worker pool that persist across requests. `PipelineResponse`, the output policy, the post-processing manifest, and statistics belong to a request and must not be written back into the Engine's global accumulated state.
 
 ```python
-from sunpack.detection.pipeline.processors.modules... import SOME_RULE_DEFAULT
+from sunpack.detection.formats import CONFIRMERS
 ```
 
-The rule layer must not depend on processor implementation modules. Shared defaults belong in `detection.pipeline.format_defaults` or in configuration declarations.
+Detection confirms routed single-file formats through independent modules in `detection.formats`. Relations owns RAR, 7z, and ZIP identity; Embedded owns carrier scanning.
 
 ## Refactoring checklist
 

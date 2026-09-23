@@ -11,7 +11,7 @@ from io import BytesIO
 
 import pytest
 
-from sunpack.analysis.embedded import scan_embedded_archives
+from sunpack.embedded import scan_embedded_archives
 from sunpack.analysis.result import ArchiveFormatEvidence
 from sunpack.analysis.engine import AnalysisEngine
 from sunpack.analysis.structure_pipeline.module import AnalysisModuleSpec

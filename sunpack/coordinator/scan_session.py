@@ -253,7 +253,7 @@ def _filesystem_candidate_bag(
 ) -> FactBag:
     path = normalized_path(path)
     name = os.path.basename(path)
-    logical_name = _filesystem_logical_name(name)
+    logical_name = name
     bag = FactBag()
     bag.update({
         "file.path": path,
@@ -271,13 +271,6 @@ def _filesystem_candidate_bag(
     if isinstance(size, int):
         bag.set("file.size", size)
     return bag
-
-
-def _filesystem_logical_name(name: str) -> str:
-    extension = os.path.splitext(name)[1].lower()
-    if extension in {".7z", ".rar", ".zip", ".gz", ".bz2", ".xz", ".exe"}:
-        return os.path.splitext(name)[0] or name
-    return name
 
 
 def _password_signature(path_passwords: dict[str, str] | None) -> str:

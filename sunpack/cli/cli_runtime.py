@@ -6,7 +6,7 @@ from sunpack.cli.cli_constants import EXIT_USAGE
 from sunpack.cli.cli_types import CliCommandResult, CliPasswordSummary
 from sunpack.config.loader import apply_config_overrides
 from sunpack.config.schema import normalize_config_value
-from sunpack.config.detection_view import directory_scan_mode, rule_pipeline_config, scan_filter_config, scan_filters_enabled
+from sunpack.config.detection_view import directory_scan_mode, scan_filter_config, scan_filters_enabled
 from sunpack.config.cli_settings import load_cli_language_from_config
 from sunpack.i18n import I18nContext
 from sunpack.passwords import dedupe_passwords, get_builtin_passwords, PasswordStore, read_password_file
@@ -14,7 +14,6 @@ from sunpack.passwords.internal.clipboard import read_clipboard_passwords
 
 
 def build_effective_config(config: dict) -> dict[str, Any]:
-    pipeline_config = rule_pipeline_config(config)
     size_rule = scan_filter_config(config, "size_range")
     size_range_min_bytes = None
     if isinstance(size_rule, dict):
@@ -30,15 +29,8 @@ def build_effective_config(config: dict) -> dict[str, Any]:
         },
         "detection": {
             "enabled": bool(config.get("detection", {}).get("enabled", True)),
-            "rule_pipeline": {
-                layer: [
-                    {"name": rule.get("name"), "enabled": rule.get("enabled", False)}
-                    for rule in pipeline_config.get(layer, [])
-                    if isinstance(rule, dict)
-                ]
-                for layer in ("precheck",)
-            }
         },
+        "embedded_scan": dict(config.get("embedded_scan") or {}),
         "filesystem": {
             "directory_scan_mode": directory_scan_mode(config),
             "scan_filters_enabled": scan_filters_enabled(config),

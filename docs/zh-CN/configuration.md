@@ -17,7 +17,7 @@ python sunpack.py config show
 
 环境变量 `SUNPACK_CONFIG_OVERRIDES` 可以在启动前覆盖任意配置项。值可以是内联 JSON 对象，也可以是 JSON 文件路径。
 
-合并顺序为：`sunpack_advanced_config.json` → `sunpack_config.json` → 运行时覆盖。命名模块列表 `filesystem.scan_filters`、`detection.fact_collectors`、`detection.processors` 和 `detection.rule_pipeline.precheck` 按 `name` 合并，覆盖时只需写要改变的模块。
+合并顺序为：`sunpack_advanced_config.json` → `sunpack_config.json` → 运行时覆盖。`filesystem.scan_filters` 按 `name` 合并。
 
 例如临时关闭大小过滤：
 
@@ -37,7 +37,7 @@ python sunpack.py scan C:\Archives
   "cli": {},
   "runtime": {},
   "recursive_extract": "*",
-  "nested_extraction_policy": {},
+  "recursive_authorization": {},
   "post_extract": {},
   "filesystem": {},
   "performance": {},
@@ -66,11 +66,11 @@ python sunpack.py scan C:\Archives
 | 正整数 | 固定允许的递归轮数。 |
 | `?` | 每轮产生新的可处理嵌套归档后询问是否继续。 |
 
-第一轮完全按用户给出的文件或目录范围执行。后续轮次会对解压输出中的候选归档应用 `nested_extraction_policy`，再决定是否继续处理。
+第一轮完全按用户给出的文件或目录范围执行。后续轮次会对解压输出中的候选归档应用 `recursive_authorization`，再决定是否继续处理。
 
 CLI 可以用 `--recur` 临时覆盖该设置。
 
-## nested_extraction_policy
+## recursive_authorization
 
 该策略在嵌套归档进入密码处理和解压前，根据目录上下文批量判断它是否属于用户语义上的独立归档。第一轮用户明确指定的输入不受该策略影响；第二轮起，输出中发现的候选统一参与判断。
 
@@ -261,8 +261,9 @@ Native worker 以 CPU credit 作为解压并发预算。默认 nominal budget �
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `true` | 是否允许扫描文件载体中的嵌入归档。 |
+| `recursive_candidate_ratio` | `float` | `0.3` | 递归轮次中，单个残余候选至少占候选总字节数的比例。 |
 
-该设置不依赖扩展名。系统会优先使用低成本头尾信息；需要时对获准候选执行受边界约束的完整嵌入扫描。同一输入已经得到的嵌入扫描结果会在后续判断中复用。
+该层只扫描 Relations 和 Detection 未认领、未阻塞的物理文件。原生扫描器识别前后有任意无效数据的载体。
 
 ## input_planning
 
@@ -326,43 +327,9 @@ Native worker 以 CPU credit 作为解压并发预算。默认 nominal budget �
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `enabled` | `bool` | `true` | 检测总开关。关闭后仍会按常规归档扩展名和分卷入口生成任务；完全绕过初始扫描可使用 `extract --direct-file`。 |
+| `enabled` | `bool` | `true` | 是否确认由原生文件系统探测路由的 TAR、gzip、bzip2、xz、zstd 单文件输入。 |
 
-### fact_collectors
-
-| 名称 | 作用 |
-| --- | --- |
-| `file_facts` | 采集路径、名称、父目录、大小等基础信息。 |
-| `magic_bytes` | 读取文件头 magic bytes。 |
-
-### processors
-
-| 名称 | 作用 |
-| --- | --- |
-| `embedded_archive` | 处理普通归档识别未解决且获准进行嵌入扫描的文件。 |
-| `zip_structure` | 可选 ZIP 结构分析处理器；默认归档发现路径已由 Relations 解析 ZIP 身份与拓扑。 |
-| `zip_eocd_structure` | 可选 ZIP EOCD/central directory 分析处理器；已退出默认 detection 热路径。 |
-| `tar_header_structure` | 检查 TAR header checksum 和 ustar marker。 |
-| `compression_stream_structure` | 检查 gzip、bzip2、xz、zstd 轻量流结构。 |
-| `pe_overlay_structure` | 检查 PE overlay 中的归档载荷。 |
-| `executable_carrier` | 检查可执行载体及其归档区域，默认读取上限 `8388608` 字节。 |
-| `seven_zip_structure` | 可选 7z 结构分析处理器；普通、SFX 与分卷 7z 默认由 Relations 统一解析。 |
-| `rar_structure` | 可选 RAR 结构分析处理器；普通、SFX 与分卷 RAR 默认由 Relations 统一解析。 |
-
-### rule_pipeline.precheck
-
-默认规则：
-
-| 规则 | 作用 |
-| --- | --- |
-| `relation_archive_accept` | 对 Relations 已确认的 RAR、7z、ZIP 逻辑输入零 I/O 接受，覆盖普通单文件、SFX 与分卷。 |
-| `tar_structure_accept` | 结构可信的 TAR 快速接受。 |
-| `compression_stream_accept` | 完整校验 gzip、bzip2、xz、zstd 流。 |
-| `embedded_payload_identity` | 先识别可执行载体，再对获准且找到可靠嵌入归档的文件接受。 |
-
-RAR、7z、ZIP 会在默认 detection 规则运行前由 Relations 完成解析；旧的格式专用结构规则仍保留给显式配置和诊断使用。
-
-`embedded_payload_identity.deep_scan_single_candidate_ratio` 默认是 `0.3`：单个逻辑候选占未解决候选总字节数达到 30% 时执行完整嵌入扫描。`0` 关闭该阶段，`1` 只选择占全部大小的候选。分卷按一个逻辑候选计数，成员卷不会重复计算。
+RAR、7z、ZIP（包括单卷和分卷）由 Relations 解析。未被前两层确认的物理文件进入独立的 Embedded 层。格式确认模块位于 `sunpack/detection/formats`；新增格式时在该目录添加确认模块并注册到 `CONFIRMERS`。格式判别以内容探测为准，文件扩展名只用于扫描过滤及分卷成员关系推断。
 
 ## 密码表和密码文件
 
@@ -370,7 +337,7 @@ RAR、7z、ZIP 会在默认 detection 规则运行前由 Relations 完成解析�
 
 ## 修改建议
 
-- 想减少误解压：调整 `filesystem.scan_filters` 和 `detection.rule_pipeline.precheck`。
-- 想提高伪装归档和载体的召回率：检查 `embedded_scan`、`detection.processors` 和 `analysis`。
+- 想减少误解压：调整 `filesystem.scan_filters`；各格式的确认逻辑位于 `sunpack/detection/formats`。
+- 想提高伪装归档和载体的召回率：检查 `embedded_scan` 与原生扫描器。
 - 想分析一次输入的判定过程：使用 `inspect --analyze -v`。
 - 修改后运行 `python sunpack.py config validate`。

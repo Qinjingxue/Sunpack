@@ -127,5 +127,8 @@ class DirectorySnapshot:
             reject_masks,
         ))
 
+    def iter_relation_anchor_rows(self) -> Iterator[tuple[str, int | None, dict]]:
+        return iter(self._native_snapshot.relation_anchor_rows())
+
     def identity_rows(self) -> list[tuple[str, bool, int, int]]:
         return list(self._native_snapshot.identity_rows())

@@ -129,7 +129,7 @@ class ArchiveMetadataScanner:
         part_paths: list[str] | None = None,
         format_hint: str = "",
     ) -> ArchiveMetadataScanResult:
-        ext = f".{format_hint}" if format_hint else os.path.splitext(archive_path)[1].lower()
+        ext = f".{format_hint}" if format_hint else ""
         if ext == ".zip":
             return self._scan_zip_central_directory(archive_path)
         if ext in {".7z", ".rar"}:

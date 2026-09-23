@@ -342,12 +342,8 @@ def _native_password_pairs(path_passwords: dict[str, str] | None) -> list[tuple[
 def _relation_archive_input(group: CandidateGroup) -> dict | None:
     volumes = list(group.split_volumes or [])
     if volumes:
-        first = volumes[0]
-        format_hint = _format_hint(
-            group.relation.split_family,
-            first.style,
-            first.prefix,
-        )
+        metadata = group.head_metadata if isinstance(group.head_metadata, dict) else {}
+        format_hint = str(metadata.get("format") or "").lower().lstrip(".")
         return ArchiveInputDescriptor.from_split_volumes(
             archive_path=group.head_path,
             volumes=volumes,
@@ -402,12 +398,3 @@ def _relation_archive_input(group: CandidateGroup) -> dict | None:
     ).to_dict()
 
 
-def _format_hint(family: str, style: str, prefix: str) -> str:
-    value = f"{family} {style} {prefix}".lower()
-    if "rar" in value:
-        return "rar"
-    if "zip" in value:
-        return "zip"
-    if "7z" in value:
-        return "7z"
-    return ""

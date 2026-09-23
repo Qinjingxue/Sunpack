@@ -33,7 +33,7 @@ from sunpack.contracts.retry_targets import (
 from sunpack.contracts.results import OutcomeKind
 from sunpack.passwords import dedupe_passwords
 from sunpack.support.collections import dedupe_values
-from sunpack.detection.options import DetectionOptions
+from sunpack.embedded.options import EmbeddedOptions
 import asyncio
 import os
 import uuid
@@ -147,7 +147,7 @@ async def handle(args, ctx):
                 stdout=ctx.stderr if args.json else ctx.stdout,
                 stderr=ctx.stderr,
                 origin="foreground",
-                detection_options=DetectionOptions(deep_scan=deep_detect),
+                detection_options=EmbeddedOptions(force_scan=deep_detect),
             )
             summary = response.summary
             failed_tasks = list(summary.failed_tasks)

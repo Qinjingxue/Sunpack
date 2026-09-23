@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from sunpack.analysis import scan_embedded_archives
+from sunpack.embedded import scan_embedded_archives
 from tests.real.diagnostics import (
     case_snapshot,
     environment_snapshot,

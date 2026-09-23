@@ -9,7 +9,7 @@
     "directory_password_file_auto_create": true
   },
   "recursive_extract": "*",
-  "nested_extraction_policy": {
+  "recursive_authorization": {
     "enabled": true,
     "byte_ratio_exponent": 1,
     "project_ratio_exponent": 1,
@@ -19,7 +19,8 @@
     "hard_maximum_other_projects": 1000
   },
   "embedded_scan": {
-    "enabled": true
+    "enabled": true,
+    "recursive_candidate_ratio": 0.3
   },
   "post_extract": {
     "archive_cleanup_mode": "r",
@@ -33,28 +34,99 @@
         "name": "directory_prune",
         "enabled": true,
         "prune_dir_globs": [
-          ".git", ".vscode", "__pycache__", "node_modules", "site-packages", ".venv", "venv", "env", ".cache",
+          ".git",
+          ".vscode",
+          "__pycache__",
+          "node_modules",
+          "site-packages",
+          ".venv",
+          "venv",
+          "env",
+          ".cache",
           "repositories"
         ],
-        "path_globs": [".git/**", ".vscode/**", "$RECYCLE.BIN/**"]
+        "path_globs": [
+          ".git/**",
+          ".vscode/**",
+          "$RECYCLE.BIN/**"
+        ]
       },
       {
         "name": "whitelist",
         "enabled": false,
-        "path_globs": ["archives/**", "downloads/**"],
-        "prune_dir_globs": ["archives", "downloads"],
-        "allowed_files": ["sample.zip"],
-        "allowed_extensions": [".zip", ".7z", ".rar"]
+        "path_globs": [
+          "archives/**",
+          "downloads/**"
+        ],
+        "prune_dir_globs": [
+          "archives",
+          "downloads"
+        ],
+        "allowed_files": [
+          "sample.zip"
+        ],
+        "allowed_extensions": [
+          ".zip",
+          ".7z",
+          ".rar"
+        ]
       },
       {
         "name": "blacklist",
         "enabled": true,
-        "blocked_files": ["Thumbs.db", "desktop.ini"],
+        "blocked_files": [
+          "Thumbs.db",
+          "desktop.ini"
+        ],
         "blocked_extensions": [
-          ".dll", ".save", ".py", ".pyc", ".json", ".xml", ".cfg", ".ini", ".sys", ".db", ".msi", ".cur",
-          ".ani", ".ttf", ".woff", ".ico", ".pak", ".obb", ".unitypackage", ".jar", ".apk", ".ipa", ".epub",
-          ".odt", ".ods", ".odp", ".docx", ".xlsx", ".pptx", ".whl", ".xpi", ".war", ".ear", ".aab", ".ckpt",
-          ".pt", ".pth", ".safetensors", ".bin", ".dat", ".docm", ".xlsm", ".pptm", ".msix", ".msixbundle",".crdownload",".downloading",".part"
+          ".dll",
+          ".save",
+          ".py",
+          ".pyc",
+          ".json",
+          ".xml",
+          ".cfg",
+          ".ini",
+          ".sys",
+          ".db",
+          ".msi",
+          ".cur",
+          ".ani",
+          ".ttf",
+          ".woff",
+          ".ico",
+          ".pak",
+          ".obb",
+          ".unitypackage",
+          ".jar",
+          ".apk",
+          ".ipa",
+          ".epub",
+          ".odt",
+          ".ods",
+          ".odp",
+          ".docx",
+          ".xlsx",
+          ".pptx",
+          ".whl",
+          ".xpi",
+          ".war",
+          ".ear",
+          ".aab",
+          ".ckpt",
+          ".pt",
+          ".pth",
+          ".safetensors",
+          ".bin",
+          ".dat",
+          ".docm",
+          ".xlsm",
+          ".pptm",
+          ".msix",
+          ".msixbundle",
+          ".crdownload",
+          ".downloading",
+          ".part"
         ]
       },
       {
@@ -70,17 +142,6 @@
     ]
   },
   "detection": {
-    "rule_pipeline": {
-      "precheck": [
-        {
-          "name": "relation_archive_accept",
-          "enabled": true
-        },
-        {
-          "name": "embedded_payload_identity",
-          "deep_scan_single_candidate_ratio": 0.3
-        }
-      ]
-    }
+    "enabled": true
   }
 }

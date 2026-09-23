@@ -5,23 +5,19 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
-from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.fs_builder import make_minimal_7z, make_zip
 
 
 def pressure_scan_config() -> dict:
-    return with_detection_pipeline({
-        "thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3},
-    }, processors=[
-        {"name": "embedded_archive", "enabled": True},
-        {"name": "pe_overlay_structure", "enabled": True},
-        {"name": "executable_carrier", "enabled": True},
-    ], precheck=[
-        {"name": "size_range", "enabled": True, "gte": 0},
-        {"name": "blacklist", "enabled": True, "blocked_extensions": [".jar", ".docx", ".apk", ".xlsx"]},
-        {"name": "relation_archive_accept", "enabled": True},
-        {"name": "embedded_payload_identity", "enabled": True, "deep_scan_single_candidate_ratio": 1e-9},
-    ])
+    return {
+        "detection": {"enabled": True},
+        "embedded_scan": {"enabled": True, "recursive_candidate_ratio": 1e-9},
+        "filesystem": {"scan_filters": [
+            {"name": "size_range", "enabled": True, "gte": 0},
+            {"name": "blacklist", "enabled": True,
+             "blocked_extensions": [".jar", ".docx", ".apk", ".xlsx"]},
+        ]},
+    }
 
 
 def write_large_resource(path: Path, label: str, size: int = 128 * 1024) -> None:

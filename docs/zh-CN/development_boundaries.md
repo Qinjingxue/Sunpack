@@ -211,10 +211,10 @@ from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watch
 写回 Engine 的全局累计状态。
 
 ```python
-from sunpack.detection.pipeline.processors.modules... import SOME_RULE_DEFAULT
+from sunpack.detection.formats import CONFIRMERS
 ```
 
-规则层不要依赖 processor 实现模块。共享默认值放到 `detection.pipeline.format_defaults` 或配置声明。
+Detection 通过 `detection.formats` 中独立模块确认已路由的单文件格式。Relations 负责 RAR、7z、ZIP 身份，Embedded 负责载体扫描。
 
 ## 重构检查清单
 

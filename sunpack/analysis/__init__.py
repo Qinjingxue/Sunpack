@@ -23,13 +23,6 @@ from sunpack.analysis.result import (
     ArchiveFormatEvidence,
     ArchiveSegment,
 )
-from sunpack.analysis.embedded import (
-    EmbeddedCandidate,
-    EmbeddedScanResult,
-    SignatureHit,
-    embedded_result_from_dict,
-    scan_embedded_archives,
-)
 from sunpack.analysis.volume_anchor import VolumeAnchorEvidence, VolumeEvidenceIndex, probe_volume_anchor_paths
 
 __all__ = [
@@ -45,11 +38,6 @@ __all__ = [
     "ZipEocdProbeOptions",
     "ArchiveFormatEvidence",
     "ArchiveSegment",
-    "EmbeddedCandidate",
-    "EmbeddedScanResult",
-    "SignatureHit",
-    "embedded_result_from_dict",
-    "scan_embedded_archives",
     "AnalysisBudget",
     "AnalysisCapability",
     "AnalysisCost",

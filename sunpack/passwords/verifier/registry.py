@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass, field
 
 from sunpack.passwords.verifier.base import PasswordBatchVerification, PasswordVerifier
@@ -90,7 +89,7 @@ class PasswordVerifierChain:
         archive_path: str,
         archive_input: dict | None = None,
     ) -> list[PasswordVerifier]:
-        preferred = _preferred_archive_format(archive_path, archive_input)
+        preferred = _preferred_archive_format(archive_input)
         if not preferred:
             return list(self.fast_verifiers)
         matching = [
@@ -105,51 +104,17 @@ class PasswordVerifierChain:
         ]
         if not matching:
             return list(self.fast_verifiers)
-        if _explicit_archive_format(archive_input):
-            # Analysis-derived format is content evidence, unlike a filename
-            # suffix. Avoid probing unrelated parsers for renamed large files.
-            return matching + [verifier for verifier in generic if verifier not in matching]
-        return matching + [
-            verifier
-            for verifier in self.fast_verifiers
-            if verifier not in matching
-        ]
+        return matching + [verifier for verifier in generic if verifier not in matching]
 
 
-def _preferred_archive_format(archive_path: str, archive_input: dict | None = None) -> str:
+def _preferred_archive_format(archive_input: dict | None = None) -> str:
     if isinstance(archive_input, dict):
         hinted = _normalize_archive_format(
             str(archive_input.get("format_hint") or archive_input.get("format") or "")
         )
         if hinted:
             return hinted
-    return _format_from_path(archive_path)
-
-
-def _explicit_archive_format(archive_input: dict | None = None) -> str:
-    if not isinstance(archive_input, dict):
-        return ""
-    return _normalize_archive_format(
-        str(archive_input.get("format_hint") or archive_input.get("format") or "")
-    )
-
-
-def _format_from_path(archive_path: str) -> str:
-    name = os.path.basename(str(archive_path or "")).lower()
-    if name.endswith(".part1.rar") or name.endswith(".part01.rar"):
-        return "rar"
-    suffixes = []
-    root = name
-    while True:
-        root, ext = os.path.splitext(root)
-        if not ext:
-            break
-        suffixes.append(ext)
-    if not suffixes:
-        return ""
-    if suffixes[0] == ".001" and len(suffixes) > 1:
-        return _normalize_archive_format(suffixes[1].lstrip("."))
-    return _normalize_archive_format(suffixes[0].lstrip("."))
+    return ""
 
 
 def _normalize_archive_format(value: str) -> str:

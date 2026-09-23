@@ -3,8 +3,7 @@ import tarfile
 
 from sunpack.analysis import ArchiveAnalyzer, MultiVolumeAnalysisSource, TarProbeOptions
 from sunpack.contracts.detection import FactBag
-from sunpack.detection.pipeline.processors.context import FactProcessorContext
-from sunpack.detection.pipeline.processors.modules.format_structure.tar_header import process_tar_header_structure
+from sunpack.detection.formats.tar import confirm as confirm_tar
 
 
 def _tar_bytes(payload: bytes = b"payload") -> bytes:
@@ -38,20 +37,10 @@ def test_public_tar_capability_preserves_detection_fields(tmp_path):
     assert raw["end_zero_blocks"] is True
 
 
-def test_tar_detection_projects_public_analysis_observation(tmp_path):
-    path = tmp_path / "archive.tar"
+def test_tar_confirmation_uses_public_analysis_observation(tmp_path):
+    path = tmp_path / "disguised.bin"
     path.write_bytes(_tar_bytes())
-    facts = FactBag()
-    facts.set("file.path", str(path))
-    facts.set("file.size", path.stat().st_size)
-    context = FactProcessorContext(facts, "tar.header_structure", {}, {}, None)
-
-    raw = process_tar_header_structure(context)
-
-    assert raw["plausible"] is True
-    assert raw["ustar_magic"] is True
-    assert raw["fuzzy_numeric_fields_valid"] is True
-    assert raw["entry_walk_ok"] is True
+    assert confirm_tar(str(path), ArchiveAnalyzer()) is True
 
 
 def test_public_tar_capability_keeps_fuzzy_evidence_when_checksum_is_bad(tmp_path):

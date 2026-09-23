@@ -15,8 +15,7 @@ from sunpack.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSumm
 from sunpack.contracts.run_context import RunContext
 from sunpack.coordinator.extraction_batch import ExtractionBatchRunner
 from sunpack.coordinator.output_scan_policy import NestedOutputScanPolicy
-from sunpack.coordinator.nested_extraction_policy import NestedExtractionPolicy
-from sunpack.coordinator.nested_extraction_policy import EMBEDDED_SCAN_ALLOWED_FACT
+from sunpack.coordinator.recursive_authorization import RecursiveAuthorization
 from sunpack.coordinator.recursion import RecursionController
 from sunpack.coordinator.reporting import RunReporter
 from sunpack.coordinator.task_scan import ArchiveTaskScanner
@@ -32,7 +31,7 @@ from sunpack.support.output_paths import default_output_dir_for_task
 from sunpack.support.path_keys import path_key
 from sunpack.support.archive_sessions import release_archive_sessions_under
 from sunpack.support.resource_lifecycle import TaskResourceScope, promotion_barrier
-from sunpack.detection.options import DetectionOptions
+from sunpack.embedded.options import EmbeddedOptions
 from sunpack.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_ORIGIN, map_bounded
 
 
@@ -45,7 +44,7 @@ class _Submission:
     builtin_passwords: tuple[str, ...]
     config: dict
     origin: str = "foreground"
-    detection_options: DetectionOptions | None = None
+    detection_options: EmbeddedOptions | None = None
     stdout: TextIO | None = None
     stderr: TextIO | None = None
     progress_callback: Callable[[Any, dict[str, Any]], None] | None = None
@@ -84,9 +83,9 @@ async def _commit_response(broker, config, response, *, stdout=None, defer_flatt
 class PipelineEngine:
     """Single-event-loop owner for independently completing requests."""
 
-    def __init__(self, config: dict, detection_options: DetectionOptions | None = None):
+    def __init__(self, config: dict, detection_options: EmbeddedOptions | None = None):
         self.config = config
-        self.detection_options = detection_options or DetectionOptions()
+        self.detection_options = detection_options or EmbeddedOptions()
         worker_config = _worker_config(config)
         self._broker = AsyncWorkBroker(
             thread_capacity=int(worker_config.get("stage_thread_capacity", 0) or 0),
@@ -153,7 +152,7 @@ class PipelineEngine:
         stderr: TextIO | None = None,
         progress_callback: Callable[[Any, dict[str, Any]], None] | None = None,
         origin: str = "foreground",
-        detection_options: DetectionOptions | None = None,
+        detection_options: EmbeddedOptions | None = None,
     ) -> PipelineResponse:
         if not self._started or self._closed:
             raise RuntimeError("PipelineEngine must be entered before run")
@@ -380,7 +379,7 @@ class _PipelineServices:
         self,
         config: dict,
         broker: AsyncWorkBroker,
-        detection_options: DetectionOptions | None = None,
+        detection_options: EmbeddedOptions | None = None,
     ):
         self.config = config
         self.broker = broker
@@ -553,7 +552,7 @@ class _RequestRuntime:
         self,
         services: _PipelineServices,
         submission: _Submission,
-        detection_options: DetectionOptions,
+        detection_options: EmbeddedOptions,
         path_leases: _PathLeaseRegistry,
     ):
         self.services = services
@@ -587,7 +586,7 @@ class _RequestRuntime:
             self.config,
         )
         self.output_scan_policy = NestedOutputScanPolicy(self.config)
-        self.nested_extraction_policy = NestedExtractionPolicy(self.config)
+        self.recursive_authorization = RecursiveAuthorization(self.config)
         self.rename_scheduler = RenameScheduler(
             services.output_reservations,
             submission.request_id,
@@ -660,10 +659,6 @@ class _RequestRuntime:
             "relation.volume_retry_basis",
             ["confirmed_structure", "anchor_constrained_filename"],
         )
-        bag.set(
-            EMBEDDED_SCAN_ALLOWED_FACT,
-            bool(task.fact_bag.get(EMBEDDED_SCAN_ALLOWED_FACT)),
-        )
         replacement = self.task_scanner.provider.task_from_candidate_bag(bag)
         if replacement is None:
             return None
@@ -698,16 +693,17 @@ class _RequestRuntime:
             )
 
         try:
-            while current_tasks if submission.direct else current_roots:
+            while current_tasks if submission.direct and round_index == 1 else current_roots:
                 cancellation.raise_if_cancelled()
-                if submission.direct:
+                direct_round = submission.direct and round_index == 1
+                if direct_round:
                     tasks = current_tasks or []
                 else:
                     self.reporter.scan_started(round_index)
-                    tasks = await broker.run(
+                    discovered = await broker.run(
                         "discover_detect",
                         request_id,
-                        self.task_scanner.scan_targets,
+                        self.task_scanner.discover_targets,
                         current_roots,
                         scan_session=current_scan_session,
                         is_recursive_scan=(round_index > 1),
@@ -717,13 +713,18 @@ class _RequestRuntime:
                 authorization = await broker.run(
                     "nested_policy",
                     request_id,
-                    self.nested_extraction_policy.authorize_batch,
-                    tasks,
+                    self.recursive_authorization.authorize_batch,
+                    tasks if direct_round else discovered,
                     current_roots,
                     current_scan_session or self.task_scanner.last_scan_session,
                     round_index=round_index,
                     request_id=request_id,
                     cancellation=cancellation,
+                )
+                authorized_tasks = (
+                    authorization.allowed_inputs
+                    if direct_round
+                    else self.task_scanner.tasks_from_inputs(authorization.allowed_inputs)
                 )
                 async def plan_one(task):
                     return await broker.run(
@@ -736,7 +737,7 @@ class _RequestRuntime:
                     )
 
                 planned_groups = await map_bounded(
-                    authorization.allowed_tasks,
+                    authorized_tasks,
                     self.services.max_inflight_files,
                     plan_one,
                 )
@@ -781,17 +782,6 @@ class _RequestRuntime:
                 current_roots = new_roots
                 current_scan_session = next_scan_session
                 current_tasks = None
-                if submission.direct:
-                    current_tasks = await broker.run(
-                        "discover_detect",
-                        request_id,
-                        self.task_scanner.scan_targets,
-                        new_roots,
-                        scan_session=current_scan_session,
-                        is_recursive_scan=True,
-                        request_id=request_id,
-                        cancellation=cancellation,
-                    )
                 round_index += 1
 
             response = ownership.responses(

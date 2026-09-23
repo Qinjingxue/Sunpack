@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.detection.options import DetectionOptions
+from sunpack.embedded.options import EmbeddedOptions
 
 
 @dataclass
@@ -23,7 +23,7 @@ class DetectionDiagnostic:
 
 
 class DetectionDiagnostics:
-    def __init__(self, config: dict[str, Any], detection_options: DetectionOptions | None = None):
+    def __init__(self, config: dict[str, Any], detection_options: EmbeddedOptions | None = None):
         self.detector = ArchiveTaskProvider(config, detection_options=detection_options)
 
     def collect(self, paths: list[str]) -> list[DetectionDiagnostic]:

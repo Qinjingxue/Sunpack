@@ -8,7 +8,7 @@ from sunpack.cli.cli_runtime import (
 from sunpack.cli.cli_types import CliCommandResult
 from sunpack.cli.persistent_runtime import load_request_config
 from sunpack.coordinator.scanner import ScanOrchestrator
-from sunpack.detection.options import DetectionOptions
+from sunpack.embedded.options import EmbeddedOptions
 
 COMMAND = "scan"
 ORDER = 20
@@ -33,7 +33,7 @@ def handle(args, ctx):
         return result_for_missing(COMMAND, args, missing_paths, ctx)
 
     config = load_request_config(ctx.cwd)
-    orchestrator = ScanOrchestrator(config, DetectionOptions(deep_scan=bool(args.deep_detect)))
+    orchestrator = ScanOrchestrator(config, EmbeddedOptions(force_scan=bool(args.deep_detect)))
     task_items = [scan_result_to_item(res) for res in orchestrator.scan_targets(target_paths)]
     task_items.sort(key=lambda item: item["main_path"].lower())
 

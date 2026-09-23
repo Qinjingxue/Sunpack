@@ -3,7 +3,7 @@
     "language": "zh"
   },
   "recursive_extract": "*",
-  "nested_extraction_policy": {
+  "recursive_authorization": {
     "enabled": true,
     "byte_ratio_exponent": 1,
     "project_ratio_exponent": 1,
@@ -192,7 +192,8 @@
     "content_requirement": "complete"
   },
   "embedded_scan": {
-    "enabled": true
+    "enabled": true,
+    "recursive_candidate_ratio": 0.3
   },
   "input_planning": {
     "enabled": true,
@@ -340,60 +341,6 @@
     ]
   },
   "detection": {
-    "enabled": true,
-    "fact_collectors": [
-      {
-        "name": "file_facts",
-        "enabled": true
-      },
-      {
-        "name": "magic_bytes",
-        "enabled": true
-      }
-    ],
-    "processors": [
-      {
-        "name": "embedded_archive",
-        "enabled": true
-      },
-      {
-        "name": "tar_header_structure",
-        "enabled": true
-      },
-      {
-        "name": "compression_stream_structure",
-        "enabled": true
-      },
-      {
-        "name": "pe_overlay_structure",
-        "enabled": true
-      },
-      {
-        "name": "executable_carrier",
-        "enabled": true,
-        "scan_limit_bytes": 8388608
-      }
-    ],
-    "rule_pipeline": {
-      "precheck": [
-        {
-          "name": "relation_archive_accept",
-          "enabled": true
-        },
-        {
-          "name": "tar_structure_accept",
-          "enabled": true
-        },
-        {
-          "name": "compression_stream_accept",
-          "enabled": true
-        },
-        {
-          "name": "embedded_payload_identity",
-          "enabled": true,
-          "deep_scan_single_candidate_ratio": 0.3
-        }
-      ]
-    }
+    "enabled": true
   }
 }

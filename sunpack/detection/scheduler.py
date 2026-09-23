@@ -1,17 +1,12 @@
+"""Single-file TAR and compression-stream confirmation."""
+
 from dataclasses import dataclass
 from typing import Any
 
-from sunpack.config.detection_view import detection_config
-from sunpack.detection.pipeline.facts.provider import FactProvider
-from sunpack.detection.pipeline.facts.registry import discover_collectors, get_registry
-from sunpack.detection.pipeline.processors.registry import discover_processors
-from sunpack.detection.pipeline.processors.registry import get_processor_registry
-from sunpack.detection.pipeline.processors.runner import ProcessingCoordinator
-from sunpack.detection.pipeline.rules.manager import RuleManager
+from sunpack.analysis import ArchiveAnalyzer
 from sunpack.contracts.detection import FactBag
 from sunpack.contracts.rules import RuleDecision
-from sunpack.detection.deep_scan import evaluate_deep_bag
-from sunpack.detection.options import DetectionOptions
+from sunpack.detection.formats import CONFIRMERS
 
 
 @dataclass(frozen=True)
@@ -21,210 +16,51 @@ class DetectionResult:
 
 
 class DetectionScheduler:
-    """Coordinates fact collection, fact processing, and rule evaluation."""
-
-    def __init__(self, config: dict[str, Any], options: DetectionOptions | None = None):
+    def __init__(self, config: dict[str, Any]):
         self.config = config
-        self.options = options or DetectionOptions()
-        discover_collectors()
-        discover_processors()
-        detector_config = detection_config(config)
-        self.enabled_fact_modules = self._enabled_module_names(detector_config.get("fact_collectors"))
-        self.enabled_processors = self._enabled_module_names(detector_config.get("processors"))
-        self.fact_config_defaults = self._fact_config_defaults(
-            detector_config.get("fact_collectors"),
-            detector_config.get("processors"),
-        )
-        self.rule_manager = RuleManager(
-            config,
-            ensure_pool_facts=self._ensure_pool_facts,
-            fact_config_defaults=self.fact_config_defaults,
-        )
+        self.analyzer = ArchiveAnalyzer(config)
 
     def validate_config(self) -> list[str]:
-        return self.rule_manager.validate_config()
+        return []
 
-    def evaluate_bag(
-        self,
-        fact_bag: FactBag,
-        fact_provider: FactProvider | None = None,
-    ) -> RuleDecision:
+    def evaluate_bag(self, fact_bag: FactBag, fact_provider=None) -> RuleDecision:
         if fact_provider is not None and not fact_bag.has("file.path"):
             fact_bag.set("file.path", fact_provider.base_path)
         return self.evaluate_pool([fact_bag])[fact_bag]
 
-    def evaluate(
-        self,
-        fact_bag: FactBag,
-        fact_provider: FactProvider | None = None,
-    ) -> RuleDecision:
+    def evaluate(self, fact_bag: FactBag, fact_provider=None) -> RuleDecision:
         return self.evaluate_bag(fact_bag, fact_provider)
 
-    def evaluate_pool(
-        self,
-        fact_bags: list[FactBag],
-        scan_session: Any = None,
-    ) -> dict[FactBag, RuleDecision]:
-        if self.options.deep_scan:
-            return {fact_bag: evaluate_deep_bag(fact_bag) for fact_bag in fact_bags}
-        self._active_scan_session = scan_session
-        self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
+    def evaluate_pool(self, fact_bags: list[FactBag], scan_session=None) -> dict[FactBag, RuleDecision]:
+        return {bag: self._confirm(bag) for bag in fact_bags}
+
+    def evaluate_bags(self, fact_bags: list[FactBag], scan_session=None) -> list[DetectionResult]:
+        return [DetectionResult(bag, decision) for bag, decision in self.evaluate_pool(fact_bags, scan_session).items()]
+
+    def evaluate_extractable_bags(self, fact_bags: list[FactBag], scan_session=None) -> list[DetectionResult]:
+        return [result for result in self.evaluate_bags(fact_bags, scan_session) if result.decision.should_extract]
+
+    def _confirm(self, bag: FactBag) -> RuleDecision:
+        archive_format = str(bag.get("filesystem.format_hint") or "").lower()
+        path = str(bag.get("candidate.entry_path") or bag.get("file.path") or "")
+        confirmer = CONFIRMERS.get(archive_format)
+        if not path or confirmer is None:
+            return _not_archive()
         try:
-            return self.rule_manager.evaluate_pool(fact_bags)
-        finally:
-            self._active_scan_session = None
+            accepted = confirmer.confirm(path, self.analyzer)
+        except (OSError, ValueError):
+            return _not_archive()
+        if not accepted:
+            return _not_archive()
+        bag.set("file.detected_ext", confirmer.EXTENSION)
+        bag.set("file.probe_detected_archive", True)
+        bag.set("file.probe_offset", 0)
+        return RuleDecision(
+            should_extract=True, matched_rules=["single_file_format"],
+            stop_reason=f"Confirmed {archive_format} structure", decision="archive",
+            decision_stage="detection", deciding_rule="single_file_format",
+        )
 
-    def evaluate_precheck_pool(
-        self,
-        fact_bags: list[FactBag],
-        scan_session: Any = None,
-    ) -> tuple[dict[FactBag, RuleDecision], list[FactBag]]:
-        """Evaluate strict prechecks without finalizing ordinary candidates."""
-        self._active_scan_session = scan_session
-        self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
-        try:
-            return self.rule_manager.evaluate_precheck_pool(fact_bags)
-        finally:
-            self._active_scan_session = None
 
-    def evaluate_bags(
-        self,
-        fact_bags: list[FactBag],
-        scan_session: Any = None,
-    ) -> list[DetectionResult]:
-        decisions = self.evaluate_pool(fact_bags, scan_session=scan_session)
-        return [
-            DetectionResult(fact_bag=bag, decision=decision)
-            for bag in fact_bags
-            if (decision := decisions.get(bag)) is not None
-        ]
-
-    def evaluate_extractable_bags(
-        self,
-        fact_bags: list[FactBag],
-        scan_session: Any = None,
-    ) -> list[DetectionResult]:
-        """Build detection results only for candidates accepted for extraction."""
-        if self.options.deep_scan:
-            decisions = {
-                fact_bag: evaluate_deep_bag(fact_bag)
-                for fact_bag in fact_bags
-            }
-        else:
-            self._active_scan_session = scan_session
-            self.rule_manager.ensure_pool_facts = self._ensure_pool_facts
-            try:
-                decisions = self.rule_manager.evaluate_extractable_pool(fact_bags)
-            finally:
-                self._active_scan_session = None
-        return [
-            DetectionResult(fact_bag=bag, decision=decision)
-            for bag in fact_bags
-            if (decision := decisions.get(bag)) is not None and decision.should_extract
-        ]
-
-    def _ensure_pool_facts(
-        self,
-        fact_bags: list[FactBag],
-        required_facts: set[str],
-        fact_configs: dict[str, dict[str, Any]] | None = None,
-    ):
-        if not required_facts:
-            return
-        effective_fact_configs = self._merge_fact_configs(fact_configs)
-        for bag in fact_bags:
-            bag_fact_configs = {
-                fact_name: dict(config)
-                for fact_name, config in effective_fact_configs.items()
-            }
-            provider = FactProvider(
-                bag.get("file.path", ""),
-                config=self.config,
-                fact_configs=bag_fact_configs,
-                enabled_fact_modules=self.enabled_fact_modules,
-                scan_session=getattr(self, "_active_scan_session", None),
-            )
-            ProcessingCoordinator(
-                provider,
-                config=self.config,
-                fact_configs=provider.fact_configs,
-                enabled_processors=self.enabled_processors,
-            ).ensure_facts(bag, required_facts)
-
-    def _enabled_module_names(self, modules_config) -> set[str] | None:
-        if not isinstance(modules_config, list):
-            return None
-        enabled: set[str] = set()
-        for item in modules_config:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name")
-            if isinstance(name, str) and name.strip() and item.get("enabled", False):
-                enabled.add(name.strip())
-        return enabled
-
-    def _module_configs(self, modules_config) -> dict[str, dict[str, Any]]:
-        if not isinstance(modules_config, list):
-            return {}
-        configs: dict[str, dict[str, Any]] = {}
-        for item in modules_config:
-            if not isinstance(item, dict):
-                continue
-            name = item.get("name")
-            if not isinstance(name, str) or not name.strip() or not item.get("enabled", False):
-                continue
-            module_config = {
-                key: value
-                for key, value in item.items()
-                if key not in {"name", "enabled"}
-            }
-            if module_config:
-                configs[name.strip()] = module_config
-        return configs
-
-    def _fact_config_defaults(self, collector_modules_config, processor_modules_config) -> dict[str, dict[str, Any]]:
-        defaults: dict[str, dict[str, Any]] = {}
-        collector_configs = self._module_configs(collector_modules_config)
-        processor_configs = self._module_configs(processor_modules_config)
-
-        for fact_name, collector in get_registry().get_all_collectors().items():
-            module_name = collector.__module__.rsplit(".", 1)[-1]
-            if module_name in collector_configs:
-                defaults[fact_name] = dict(collector_configs[module_name])
-
-        for processor in get_processor_registry().all().values():
-            if processor.name not in processor_configs:
-                continue
-            for output_fact in processor.output_facts:
-                defaults[output_fact] = dict(processor_configs[processor.name])
-
-        if not defaults:
-            return {}
-
-        changed = True
-        while changed:
-            changed = False
-            for processor in get_processor_registry().all().values():
-                inherited: dict[str, Any] = {}
-                for input_fact in processor.input_facts:
-                    inherited.update(defaults.get(input_fact, {}))
-                if not inherited:
-                    continue
-                for output_fact in processor.output_facts:
-                    merged = dict(inherited)
-                    merged.update(defaults.get(output_fact, {}))
-                    if merged != defaults.get(output_fact):
-                        defaults[output_fact] = merged
-                        changed = True
-        return defaults
-
-    def _merge_fact_configs(
-        self,
-        fact_configs: dict[str, dict[str, Any]] | None,
-    ) -> dict[str, dict[str, Any]]:
-        merged = {fact_name: dict(config) for fact_name, config in self.fact_config_defaults.items()}
-        for fact_name, config in (fact_configs or {}).items():
-            effective = dict(merged.get(fact_name, {}))
-            effective.update(config)
-            merged[fact_name] = effective
-        return merged
+def _not_archive() -> RuleDecision:
+    return RuleDecision(False, [], decision="not_archive", decision_stage="detection")

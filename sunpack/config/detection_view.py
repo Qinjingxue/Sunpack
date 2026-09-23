@@ -17,21 +17,6 @@ def detection_config(config: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def rule_pipeline_config(config: dict[str, Any]) -> dict[str, Any]:
-    value = detection_config(config).get("rule_pipeline")
-    return value if isinstance(value, dict) else {}
-
-
-def module_config(config: dict[str, Any], section: str, name: str) -> dict[str, Any]:
-    modules = detection_config(config).get(section)
-    if not isinstance(modules, list):
-        return {}
-    for item in modules:
-        if isinstance(item, dict) and item.get("name") == name:
-            return item
-    return {}
-
-
 def filesystem_config(config: dict[str, Any]) -> dict[str, Any]:
     value = config.get("filesystem")
     return value if isinstance(value, dict) else {}

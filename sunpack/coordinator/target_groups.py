@@ -34,7 +34,6 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
     # allowed to accept the data volumes without entering embedded scanning.
     if (
         group.companion_paths
-        and os.path.splitext(carrier_path)[1].casefold() == ".exe"
         and os.path.normcase(os.path.abspath(carrier_path))
         != os.path.normcase(os.path.abspath(group.head_path))
     ):
@@ -51,11 +50,7 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
     )
     password_pending = bool(metadata.get("needs_password"))
     if group.split_volumes:
-        format_hint = _split_format_hint(
-            relation.split_family,
-            group.split_volumes[0].style,
-            group.split_volumes[0].prefix,
-        )
+        format_hint = str(metadata.get("format") or "").lower().lstrip(".")
         bag.update({
             "relation.format_hint": format_hint,
             "relation.format_hint_confidence": (
@@ -171,17 +166,6 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
     if isinstance(group.head_metadata, dict) and group.head_metadata:
         bag.set("relation.volume_anchor", dict(group.head_metadata))
     return bag
-
-
-def _split_format_hint(family: str, style: str, prefix: str = "") -> str:
-    value = f"{family} {style} {prefix}".lower()
-    if "rar" in value:
-        return "rar"
-    if "zip" in value:
-        return "zip"
-    if "7z" in value:
-        return "7z"
-    return ""
 
 
 def build_candidate_fact_bags(directory: str, relations: RelationsScheduler | None = None) -> List[FactBag]:

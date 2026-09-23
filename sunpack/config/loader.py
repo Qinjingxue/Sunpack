@@ -6,7 +6,7 @@ import threading
 from typing import Any
 
 from sunpack.config.advanced_defaults import _payload as _advanced_defaults_payload
-from sunpack.config.detection_view import DIRECTORY_SCAN_MODES, directory_scan_mode, rule_pipeline_config, scan_filters_config
+from sunpack.config.detection_view import DIRECTORY_SCAN_MODES, directory_scan_mode, scan_filters_config
 from sunpack.config.schema import ConfigSchemaError, config_fields, normalize_config, validate_external_config
 from sunpack.support.json_format import load_json_file
 from sunpack.support.resources import candidate_resource_paths, dedupe_paths, first_existing_path, program_data_dir
@@ -107,9 +107,6 @@ def _override_signature() -> tuple[str, int, int] | str | None:
 
 _NAMED_MODULE_LIST_PATHS = {
     ("filesystem", "scan_filters"),
-    ("detection", "fact_collectors"),
-    ("detection", "processors"),
-    ("detection", "rule_pipeline", "precheck"),
 }
 
 _OVERRIDE_ORDERED_NAMED_MODULE_LIST_PATHS = {
@@ -317,18 +314,8 @@ def _validate_pipeline(config: dict[str, Any]):
     detection = config.get("detection")
     if not isinstance(detection, dict):
         raise ConfigError("Missing required config object: detection")
-    pipeline = rule_pipeline_config(config)
-    if not isinstance(pipeline, dict):
-        raise ConfigError("Missing required config object: detection.rule_pipeline")
-    for layer in ("precheck",):
-        rules = pipeline.get(layer)
-        if not isinstance(rules, list):
-            raise ConfigError(f"Missing required detection.rule_pipeline list: {layer}")
-        for index, rule in enumerate(rules):
-            if not isinstance(rule, dict):
-                raise ConfigError(f"detection.rule_pipeline.{layer}[{index}] must be an object")
-            if not isinstance(rule.get("name"), str) or not rule["name"].strip():
-                raise ConfigError(f"detection.rule_pipeline.{layer}[{index}] must declare a rule name")
+    if unknown := set(detection) - {"enabled"}:
+        raise ConfigError(f"Unknown detection field(s): {', '.join(sorted(unknown))}")
 
 
 def load_config(request_cwd: str | Path | None = None) -> dict[str, Any]:

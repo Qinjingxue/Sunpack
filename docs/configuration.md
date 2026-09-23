@@ -17,7 +17,7 @@ python sunpack.py config show
 
 The `SUNPACK_CONFIG_OVERRIDES` environment variable can override any configuration item before startup. Its value may be an inline JSON object or a path to a JSON file.
 
-The merge order is: `sunpack_advanced_config.json` → `sunpack_config.json` → runtime overrides. The named module lists `filesystem.scan_filters`, `detection.fact_collectors`, `detection.processors`, and `detection.rule_pipeline.precheck` are merged by `name`, so an override only needs to contain the modules to be changed.
+The merge order is: `sunpack_advanced_config.json` → `sunpack_config.json` → runtime overrides. `filesystem.scan_filters` is merged by `name`.
 
 For example, to temporarily disable the size filter:
 
@@ -37,7 +37,7 @@ Test runs disable the `size_range` filter by default so that tests can use files
   "cli": {},
   "runtime": {},
   "recursive_extract": "*",
-  "nested_extraction_policy": {},
+  "recursive_authorization": {},
   "post_extract": {},
   "filesystem": {},
   "performance": {},
@@ -66,11 +66,11 @@ Test runs disable the `size_range` filter by default so that tests can use files
 | Positive integer | A fixed number of allowed recursive rounds. |
 | `?` | Ask whether to continue after each round that produces new processable archives. |
 
-The first round runs exactly over the file or directory scope the user gave. Subsequent rounds apply `nested_extraction_policy` to the candidate archives found in the extraction output, and then decide whether to continue processing.
+The first round runs exactly over the file or directory scope the user gave. Subsequent rounds apply `recursive_authorization` to the candidate archives found in the extraction output, and then decide whether to continue processing.
 
 The CLI can override this setting temporarily with `--recur`.
 
-## nested_extraction_policy
+## recursive_authorization
 
 Before a nested archive enters password handling and extraction, this policy decides in bulk, based on directory context, whether it is a standalone archive in the user's sense. Inputs explicitly specified by the user in the first round are not affected by this policy; from the second round on, all candidates found in the output take part in the decision.
 
@@ -261,8 +261,9 @@ The per-directory password file is named `sunpack-passwords.txt`, one password p
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
 | `enabled` | `bool` | `true` | Whether scanning for embedded archives in file carriers is allowed. |
+| `recursive_candidate_ratio` | `float` | `0.3` | In recursive rounds, the minimum share of unresolved bytes for an individual candidate. |
 
-This setting does not depend on file extensions. The system prefers low-cost head/tail information first; when needed, it performs a boundary-constrained full embedded scan on authorized candidates. Embedded scan results already obtained for the same input are reused in later decisions.
+This layer scans only physical files left unclaimed and unblocked by Relations and Detection. The native scanner handles carriers with arbitrary leading and trailing data.
 
 ## input_planning
 
@@ -326,43 +327,9 @@ Default methods and key parameters:
 
 | Field | Type | Default | Description |
 | --- | --- | --- | --- |
-| `enabled` | `bool` | `true` | Master detection switch. When disabled, tasks are still generated from conventional archive extensions and split-volume entry points; use `extract --direct-file` to bypass the initial scan entirely. |
+| `enabled` | `bool` | `true` | Confirm TAR, gzip, bzip2, xz, and zstd single-file inputs routed by the native filesystem probe. |
 
-### fact_collectors
-
-| Name | Purpose |
-| --- | --- |
-| `file_facts` | Collect basic information such as path, name, parent directory, and size. |
-| `magic_bytes` | Read the file header magic bytes. |
-
-### processors
-
-| Name | Purpose |
-| --- | --- |
-| `embedded_archive` | Handle files that plain archive identification did not resolve and that are authorized for embedded scanning. |
-| `zip_structure` | Optional ZIP structural analysis processor; the default archive-discovery path resolves ZIP identity and topology in Relations. |
-| `zip_eocd_structure` | Optional ZIP EOCD/central-directory analysis processor; it is no longer on the default detection hot path. |
-| `tar_header_structure` | Check the TAR header checksum and ustar marker. |
-| `compression_stream_structure` | Check the lightweight stream structure of gzip, bzip2, xz, and zstd. |
-| `pe_overlay_structure` | Check archive payloads in the PE overlay. |
-| `executable_carrier` | Check executable carriers and their archive regions; the default read limit is `8388608` bytes. |
-| `seven_zip_structure` | Optional 7z structural analysis processor; ordinary, SFX, and split 7z identity is resolved in Relations by default. |
-| `rar_structure` | Optional RAR structural analysis processor; ordinary, SFX, and split RAR identity is resolved in Relations by default. |
-
-### rule_pipeline.precheck
-
-Default rules:
-
-| Rule | Purpose |
-| --- | --- |
-| `relation_archive_accept` | Zero-I/O accept for RAR, 7z, and ZIP logical inputs already confirmed by Relations, including standalone, SFX, and split inputs. |
-| `tar_structure_accept` | Fast accept for structurally trustworthy TAR files. |
-| `compression_stream_accept` | Fully validate gzip, bzip2, xz, and zstd streams. |
-| `embedded_payload_identity` | Identify an executable carrier first, then accept files that are authorized and contain a reliable embedded archive. |
-
-RAR, 7z, and ZIP are resolved by Relations before the default detection rules run; the legacy format-specific structure rules remain available only for explicit configurations and diagnostics.
-
-`embedded_payload_identity.deep_scan_single_candidate_ratio` defaults to `0.3`: a full embedded scan is performed when a single logical candidate accounts for 30% or more of the total unresolved candidate bytes. `0` disables that stage, and `1` selects only candidates that account for the entire size. A volume set counts as one logical candidate, and member volumes are not counted repeatedly.
+Relations resolves RAR, 7z, and ZIP, including standalone and split inputs. Unclaimed, unblocked physical files go to the separate Embedded layer. Format confirmation plugins live in `sunpack/detection/formats`; add a module there and register it in `CONFIRMERS` to extend supported formats. Content probes determine formats. Extensions are used only by scan filters and to infer volume membership.
 
 ## Password table and password files
 
@@ -370,7 +337,7 @@ RAR, 7z, and ZIP are resolved by Relations before the default detection rules ru
 
 ## Tuning suggestions
 
-- To reduce wrong extractions: adjust `filesystem.scan_filters` and `detection.rule_pipeline.precheck`.
-- To improve recall for disguised archives and carriers: review `embedded_scan`, `detection.processors`, and `analysis`.
+- To reduce wrong extractions: adjust `filesystem.scan_filters`; format confirmation lives in `sunpack/detection/formats`.
+- To improve recall for disguised archives and carriers: review `embedded_scan` and the native scanner.
 - To analyze the decision process of a single input: use `inspect --analyze -v`.
 - After changes, run `python sunpack.py config validate`.

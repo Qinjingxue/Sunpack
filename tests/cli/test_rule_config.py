@@ -9,30 +9,23 @@ from tests.helpers.detection_config import with_detection_pipeline
 
 
 def _payload():
-    return with_detection_pipeline(
-        precheck=[{"name": "embedded_payload_identity", "enabled": True}],
-    )
+    return {"detection": {"enabled": True}}
 
 
-def test_config_validate_checks_rule_schema_types_even_when_disabled():
+def test_config_validate_checks_embedded_ratio_type():
     payload = _payload()
-    payload["detection"]["rule_pipeline"]["precheck"][0]["enabled"] = False
-    payload["detection"]["rule_pipeline"]["precheck"][0]["deep_scan_single_candidate_ratio"] = "many"
-
+    payload["embedded_scan"] = {"recursive_candidate_ratio": "many"}
     result = validate_config_payload(payload)
-
     assert not result["ok"]
-    assert any("Invalid type" in error for error in result["errors"])
+    assert any("recursive_candidate_ratio" in error for error in result["errors"])
 
 
-def test_config_validate_rejects_obsolete_cumulative_deep_scan_ratio():
+def test_config_validate_rejects_removed_rule_pipeline():
     payload = _payload()
-    payload["detection"]["rule_pipeline"]["precheck"][0]["deep_scan_size_coverage_ratio"] = 0.5
-
+    payload["detection"]["rule_pipeline"] = {"precheck": []}
     result = validate_config_payload(payload)
-
     assert not result["ok"]
-    assert any("deep_scan_size_coverage_ratio" in error for error in result["errors"])
+    assert any("rule_pipeline" in error for error in result["errors"])
 
 
 def test_config_validate_rejects_normalized_config_values_in_external_shorthand_fields():
@@ -106,7 +99,7 @@ def test_output_dir_override_is_relative_to_the_request_cwd(tmp_path):
     assert config["output"]["root"] == str(tmp_path / "output")
 
 
-def test_effective_config_includes_native_worker_and_rule_pipeline():
+def test_effective_config_includes_native_worker_and_format_switch():
     config = _payload()
     config["filesystem"] = {
         "directory_scan_mode": "-",
@@ -127,4 +120,4 @@ def test_effective_config_includes_native_worker_and_rule_pipeline():
     assert effective["filesystem"]["directory_scan_mode"] == "current_dir_only"
     assert effective["worker"]["controller"] == "native_worker"
     assert effective["worker"]["sizing"] == "selected_by_worker"
-    assert effective["detection"]["rule_pipeline"]["precheck"][0]["name"] == "embedded_payload_identity"
+    assert effective["detection"] == {"enabled": True}

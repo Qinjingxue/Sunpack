@@ -744,27 +744,10 @@ def test_target_scan_reuses_session_for_duplicate_directories(tmp_path, monkeypa
     assert scan_count == 1
 
 
-def test_archive_task_provider_detection_enabled_false_uses_standard_archive_fallback(tmp_path, monkeypatch):
-    target = tmp_path / "archive.zip"
-    target.write_bytes(b"PK\x03\x04payload")
+def test_archive_task_provider_detection_disabled_does_not_use_extension_fallback(tmp_path):
+    from sunpack.coordinator.task_provider import ArchiveTaskProvider
 
-    provider = ArchiveTaskProvider({
-        "detection": {
-            "enabled": False,
-            "fact_collectors": [{"name": "file_facts", "enabled": True}],
-            "processors": [{"name": "zip_structure", "enabled": True}],
-            "rule_pipeline": {
-                "precheck": [{"name": "zip_structure_accept", "enabled": True}],
-            },
-        },
-        "filesystem": {"scan_filters": []},
-    })
-
-    def fail_if_rules_run(*_args, **_kwargs):
-        raise AssertionError("detection.enabled=false should not evaluate detection rules")
-
-    monkeypatch.setattr(provider.detector, "evaluate_bags", fail_if_rules_run)
-
-    tasks = provider.scan_targets([str(tmp_path)])
-
-    assert [task.main_path for task in tasks] == [str(target)]
+    path = tmp_path / "fake.zip"
+    path.write_bytes(b"not an archive")
+    provider = ArchiveTaskProvider({"detection": {"enabled": False}})
+    assert provider.scan_targets([str(path)]) == []

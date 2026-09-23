@@ -10,7 +10,7 @@ from sunpack.config.schema import normalize_config
 from sunpack.contracts.detection import FactBag
 from sunpack.contracts.tasks import ArchiveTask
 from sunpack.rename.scheduler import RenameScheduler
-from sunpack.detection import DetectionScheduler
+from sunpack.coordinator.task_provider import ArchiveTaskProvider
 from tests.helpers.detection_config import with_detection_pipeline
 
 
@@ -30,18 +30,14 @@ def minimal_config():
 
 
 class DetectionPipelineTests(unittest.TestCase):
-    def test_rule_manager_discovers_rules_and_collectors(self):
+    def test_relations_confirms_zip_without_detection_rules(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "sample.zip"
             archive_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)
 
-            bag = FactBag()
-            bag.set("file.path", str(archive_path))
-            decision = DetectionScheduler(minimal_config()).evaluate_bag(bag)
-
-            self.assertTrue(decision.should_extract)
-            self.assertEqual(decision.deciding_rule, "zip_structure_accept")
-            self.assertEqual(bag.get("file.path"), str(archive_path))
+            result = ArchiveTaskProvider(minimal_config()).discover_targets([str(archive_path)])
+            self.assertEqual(len(result.resolved_inputs), 1)
+            self.assertEqual(result.resolved_inputs[0].source, "relations")
 
     def test_archive_task_keeps_physical_path_and_exposes_format_hint(self):
         with tempfile.TemporaryDirectory() as tmp:
