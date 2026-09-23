@@ -1330,7 +1330,6 @@ public:
                 } else {
                     background_queue_.push_back(std::move(job));
                 }
-                queued_jobs_hint_.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
@@ -1487,17 +1486,14 @@ private:
             foreground_queue_.empty() ? background_queue_ : foreground_queue_;
         Job job = std::move(selected.front());
         selected.pop_front();
-        queued_jobs_hint_.fetch_sub(1, std::memory_order_relaxed);
         return job;
     }
 
     static void on_cpu_capacity_available(void *context) noexcept {
         auto *self = static_cast<NativeJobExecutor *>(context);
-        if (self &&
-            self->queued_jobs_hint_.load(std::memory_order_relaxed) != 0) {
-            // A released credit matters to the outer pool only when queued
-            // base jobs actually exist. Submission itself handles the race
-            // where a job arrives after this check.
+        if (self) {
+            // NativeCpuBudget calls this only on a saturated->available edge,
+            // so no per-release queue hint is needed here.
             self->condition_.notify_one();
         }
     }
@@ -1972,7 +1968,6 @@ private:
     std::mutex mutex_;
     std::condition_variable condition_;
     std::condition_variable drain_condition_;
-    std::atomic<std::size_t> queued_jobs_hint_{0};
 
     // Cancellation bookkeeping is not scheduler state and must not contend
     // with admission or queue selection.
