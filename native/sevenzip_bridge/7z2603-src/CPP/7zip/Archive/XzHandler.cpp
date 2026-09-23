@@ -729,15 +729,20 @@ Z7_COM7F_IMF(CHandler::Close())
 struct CXzUnpackerCPP2
 {
   Byte *InBuf;
-  // Byte *OutBuf;
+  Byte *OutBuf;
+  size_t InBufSize;
+  size_t OutBufSize;
   CXzUnpacker p;
   
   CXzUnpackerCPP2();
   ~CXzUnpackerCPP2();
 };
 
-CXzUnpackerCPP2::CXzUnpackerCPP2(): InBuf(NULL)
-  // , OutBuf(NULL)
+CXzUnpackerCPP2::CXzUnpackerCPP2():
+    InBuf(NULL),
+    OutBuf(NULL),
+    InBufSize(0),
+    OutBufSize(0)
 {
   XzUnpacker_Construct(&p, &g_Alloc);
 }
@@ -746,7 +751,7 @@ CXzUnpackerCPP2::~CXzUnpackerCPP2()
 {
   XzUnpacker_Free(&p);
   MidFree(InBuf);
-  // MidFree(OutBuf);
+  MidFree(OutBuf);
 }
 
 
@@ -1016,10 +1021,30 @@ static HRESULT DecodeBlock_Positioned(
 
   decodeRes = SZ_OK;
 
-  try
   {
-    std::vector<Byte> inBuf(kInBufSize);
-    std::vector<Byte> outBuf(kOutBufSize);
+    if (!xzu.InBuf || xzu.InBufSize < kInBufSize)
+    {
+      MidFree(xzu.InBuf);
+      xzu.InBuf = (Byte *)MidAlloc(kInBufSize);
+      if (!xzu.InBuf)
+      {
+        xzu.InBufSize = 0;
+        return E_OUTOFMEMORY;
+      }
+      xzu.InBufSize = kInBufSize;
+    }
+
+    if (!xzu.OutBuf || xzu.OutBufSize < kOutBufSize)
+    {
+      MidFree(xzu.OutBuf);
+      xzu.OutBuf = (Byte *)MidAlloc(kOutBufSize);
+      if (!xzu.OutBuf)
+      {
+        xzu.OutBufSize = 0;
+        return E_OUTOFMEMORY;
+      }
+      xzu.OutBufSize = kOutBufSize;
+    }
 
     XzUnpacker_Init(&xzu.p);
     xzu.p.streamFlags = (UInt16)block.StreamFlags;
@@ -1043,7 +1068,7 @@ static HRESULT DecodeBlock_Positioned(
       {
         UInt32 ask = (UInt32)(std::min<UInt64>)(readRem, kInBufSize);
         UInt32 got = 0;
-        RINOK(source.read_at(readPos, inBuf.data(), ask, &got))
+        RINOK(source.read_at(readPos, xzu.InBuf, ask, &got))
         if (got == 0)
         {
           decodeRes = SZ_ERROR_INPUT_EOF;
@@ -1061,8 +1086,8 @@ static HRESULT DecodeBlock_Positioned(
 
       const SRes res = XzUnpacker_Code(
           &xzu.p,
-          outBuf.data(), &destLen,
-          inBuf.data() + inPos, &srcLen,
+          xzu.OutBuf, &destLen,
+          xzu.InBuf + inPos, &srcLen,
           (srcLen == 0 && readRem == 0),
           CODER_FINISH_END,
           &status);
@@ -1086,7 +1111,7 @@ static HRESULT DecodeBlock_Positioned(
         UInt32 written = 0;
         const HRESULT writeRes = outStream.write_at(
             block.UnpackPos + outPos,
-            outBuf.data(),
+            xzu.OutBuf,
             (UInt32)destLen,
             &written);
         if (writeRes != S_OK)
@@ -1114,10 +1139,6 @@ static HRESULT DecodeBlock_Positioned(
         return S_OK;
       }
     }
-  }
-  catch (...)
-  {
-    return E_OUTOFMEMORY;
   }
 }
 
