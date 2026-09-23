@@ -103,6 +103,7 @@ class EmbeddedDiscovery:
                 candidate,
                 decision,
                 resolved.format if resolved is not None else "",
+                resolved,
             ))
             if resolved is not None:
                 result.add_resolved(resolved)
