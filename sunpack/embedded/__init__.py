@@ -1,4 +1,4 @@
-from sunpack.embedded.result import EmbeddedCandidate, EmbeddedScanResult, SignatureHit
-from sunpack.embedded.scanner import embedded_result_from_dict, scan_embedded_archives
+from sunpack.embedded.options import EmbeddedOptions
+from sunpack.embedded.discovery import EmbeddedDiscovery, EmbeddedScanGate, EmbeddedScanPlan
 
-__all__ = ["EmbeddedCandidate", "EmbeddedScanResult", "SignatureHit", "embedded_result_from_dict", "scan_embedded_archives"]
+__all__ = ["EmbeddedDiscovery", "EmbeddedOptions", "EmbeddedScanGate", "EmbeddedScanPlan"]

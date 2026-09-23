@@ -140,7 +140,7 @@ contracts
 
 ### analysis
 
-`analysis` 是无业务策略的通用归档分析能力层。公共入口 `ArchiveAnalyzer` 接收 file、multi-volume、range 或 segment source 和 `AnalysisRequest`，输出格式证据、片段边界、置信度与损坏标记；`probe_volume_anchor_paths` 为 Relations 提供批量、有界、只读的原生分卷结构证据。它内部可以执行 signature prepass、格式 probe 和 embedded fallback，但不得依赖 `ArchiveTask`、Detection 或 Coordinator，也不得写业务 knowledge。
+`analysis` 是无业务策略的通用归档分析能力层。公共入口 `ArchiveAnalyzer` 接收 file、multi-volume、range 或 segment source 和 `AnalysisRequest`，输出格式证据、片段边界、置信度与损坏标记；`analysis.embedded` 负责 embedded 全流扫描、结果归一化和可执行载体检查；`probe_volume_anchor_paths` 为 Relations 提供批量、有界、只读的原生分卷结构证据。Analysis 不得依赖 `ArchiveTask`、Detection 或 Coordinator，也不得写业务 knowledge。
 
 ### passwords
 

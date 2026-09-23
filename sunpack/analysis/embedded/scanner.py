@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from sunpack.embedded.result import EmbeddedCandidate, EmbeddedScanResult, SignatureHit
+from sunpack.analysis.embedded.result import EmbeddedCandidate, EmbeddedScanResult, SignatureHit
 from sunpack.support.archive_sessions import get_archive_session
 from sunpack.support.global_cache_manager import GLOBAL_CACHE, file_identity
 

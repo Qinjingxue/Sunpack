@@ -6,8 +6,6 @@ from dataclasses import dataclass
 import os
 from typing import Any
 
-from sunpack_native import inspect_pe_overlay_structure, executable_runtime_bundle_profile
-
 from sunpack.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveInputPart,
@@ -20,8 +18,8 @@ from sunpack.contracts.discovery import (
     ResolvedArchiveSegment,
     StageResult,
 )
+from sunpack.analysis.embedded import inspect_runtime_bundle, scan_embedded_archives
 from sunpack.embedded.options import EmbeddedOptions
-from sunpack.embedded.scanner import scan_embedded_archives
 
 
 DEFAULT_DEEP_SCAN_SINGLE_CANDIDATE_RATIO = 0.3
@@ -110,15 +108,9 @@ class EmbeddedDiscovery:
             return None, "missing_or_empty_file"
 
         try:
-            overlay = dict(inspect_pe_overlay_structure(path, size, b""))
-            if overlay.get("is_pe"):
-                profile = executable_runtime_bundle_profile(
-                    path,
-                    8 * 1024 * 1024,
-                    int(overlay.get("overlay_offset") or 0),
-                )
-                if profile:
-                    return None, f"Runtime bundle: {profile}"
+            profile = inspect_runtime_bundle(path, size)
+            if profile:
+                return None, f"Runtime bundle: {profile}"
             scan = scan_embedded_archives(path, expected_size=size)
         except OSError:
             return None, "embedded_scan_io_error"

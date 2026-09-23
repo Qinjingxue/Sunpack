@@ -137,7 +137,7 @@ The rule layer must not depend on processor implementation details; shared defau
 
 ### analysis
 
-`analysis` is the general archive analysis capability layer without business policy. The public entry point `ArchiveAnalyzer` accepts a file, multi-volume, range, or segment source plus an `AnalysisRequest`, and outputs format evidence, fragment boundaries, confidence, and damage markers; `probe_volume_anchor_paths` provides Relations with batched, bounded, read-only native volume structural evidence. Internally it may run signature prepass, format probes, and embedded fallback, but it must not depend on `ArchiveTask`, Detection, or the Coordinator, and must not write business knowledge.
+`analysis` is the general archive analysis capability layer without business policy. The public entry point `ArchiveAnalyzer` accepts a file, multi-volume, range, or segment source plus an `AnalysisRequest`, and outputs format evidence, fragment boundaries, confidence, and damage markers; `analysis.embedded` owns embedded full-stream scanning, result normalization, and executable carrier inspection; `probe_volume_anchor_paths` provides Relations with batched, bounded, read-only native volume structural evidence. Analysis must not depend on `ArchiveTask`, Detection, or the Coordinator, and must not write business knowledge.
 
 ### passwords
 
