@@ -3,7 +3,7 @@ import re
 from collections.abc import MutableSet
 
 from sunpack.contracts.tasks import ArchiveTask
-from sunpack.support.path_keys import absolute_path_key, normalized_path
+from sunpack.support.path_keys import absolute_path_key
 
 
 def default_output_dir_for_task(task: ArchiveTask, output_config: dict | None = None) -> str:
@@ -21,8 +21,6 @@ def default_output_dir_for_task(task: ArchiveTask, output_config: dict | None = 
         out_dir = os.path.join(output_root, relative_parent, os.path.basename(out_name))
     else:
         out_dir = os.path.join(os.path.dirname(path), os.path.basename(out_name))
-    if normalized_path(out_dir) == normalized_path(path):
-        out_dir += "_extracted"
     # Absolute normalized path: the write-routing key and the extraction request must come from the identical string.
     return normalized_output_dir(next_available_path(out_dir))
 

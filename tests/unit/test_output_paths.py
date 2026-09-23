@@ -13,6 +13,13 @@ def test_default_output_dir_uses_archive_stem_when_available(tmp_path):
     assert default_output_dir_for_task(_task(archive)) == str(tmp_path / "sample")
 
 
+def test_default_output_dir_uses_browser_numbering_when_source_occupies_output_name(tmp_path):
+    archive = tmp_path / "sample"
+    archive.write_bytes(b"archive")
+
+    assert default_output_dir_for_task(_task(archive)) == str(tmp_path / "sample(1)")
+
+
 def test_default_output_dir_avoids_existing_same_name_directory(tmp_path):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"zip")
