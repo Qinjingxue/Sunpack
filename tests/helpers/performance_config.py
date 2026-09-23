@@ -13,11 +13,10 @@ def archive_pressure_config(passwords: list[str] | None = None) -> dict:
         "builtin_passwords": [],
         "max_retries": 1,
     }, precheck=[
+        {"name": "relation_archive_accept", "enabled": True},
         {"name": "size_range", "enabled": True, "gte": 0},
+        {"name": "relation_archive_accept", "enabled": True},
         {"name": "embedded_payload_identity", "enabled": True},
-        {"name": "zip_structure_accept", "enabled": True},
-        {"name": "seven_zip_structure_accept", "enabled": True},
-        {"name": "rar_structure_accept", "enabled": True},
         {"name": "tar_structure_accept", "enabled": True},
         {"name": "compression_stream_accept", "enabled": True},
     ]))
