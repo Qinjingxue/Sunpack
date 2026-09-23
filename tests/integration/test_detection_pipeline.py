@@ -7,9 +7,7 @@ from pathlib import Path
 
 from tests.helpers.pipeline_engine import execute_pipeline
 from sunpack.config.schema import normalize_config
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.tasks import ArchiveTask
-from sunpack.rename.scheduler import RenameScheduler
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
 from tests.helpers.detection_config import with_detection_pipeline
 
@@ -45,13 +43,12 @@ class DetectionPipelineTests(unittest.TestCase):
             source = root / "fake_doc.txt"
             source.write_text("not really a zip", encoding="utf-8")
 
-            bag = FactBag()
-            bag.set("file.path", str(source))
-            bag.set("candidate.entry_path", str(source))
-            bag.set("candidate.member_paths", [str(source)])
-            bag.set("candidate.logical_name", "fake_doc")
-            bag.set("file.detected_ext", ".zip")
-            task = ArchiveTask.from_fact_bag(bag)
+            task = make_archive_task(
+                source,
+                format_hint="zip",
+                logical_name="fake_doc",
+                discovery_source="detection",
+            )
 
             self.assertTrue(source.exists())
             self.assertEqual(os.path.normcase(task.main_path), os.path.normcase(str(source)))
