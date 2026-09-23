@@ -25,8 +25,7 @@ from typing import Any, Callable, Iterable
 import psutil
 
 from sunpack.coordinator.engine import PipelineEngine
-from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
-from sunpack.filesystem.watcher.scheduler import WatchRunResult, WatchScheduler
+from sunpack.watch.scheduler import WatchRunResult, WatchScheduler
 
 
 def _mib(value: int | float) -> float:
@@ -194,7 +193,6 @@ class WatchMemoryHarness:
             cold_start_seconds=cold_start_seconds,
             initial_scan=False,
             pipeline_engine=engine,
-            group_coordinator=WatchGroupCoordinator(config),
         )
         return cls(watch_root, output_root, state_path, config, engine, watcher)
 
@@ -349,7 +347,6 @@ def _state_stats(watcher: WatchScheduler, state_path: Path) -> dict[str, Any]:
     result = {
         "pending_work": len(state.pending_work),
         "entries": len(state.entries),
-        "groups": len(state.groups),
         "password_generation": int(state.password_generation),
     }
     try:

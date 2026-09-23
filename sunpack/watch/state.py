@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 from sunpack_native import write_watch_state_snapshot_native as _native_write_watch_state_snapshot
 
-from sunpack.filesystem.watcher.journal_commit import (
+from sunpack.watch.journal_commit import (
     JournalTicket,
     seed_state_stream,
     submit_segment_seal,
@@ -25,13 +25,6 @@ from sunpack.support.resource_lifecycle import (
     read_task_text,
     task_scandir,
 )
-
-from .group_models import (
-    BLOCKER_MISSING_VOLUME,
-    WatchGroupSnapshot,
-    WatchGroupState,
-)
-
 
 STATE_VERSION = 17
 DEFAULT_JOURNAL_COMPACT_RECORDS = 8192
@@ -180,7 +173,6 @@ class _SnapshotView:
     watch_cursors: dict[str, dict[str, int]]
     pending_work: dict[str, WatchPendingWork]
     entries: dict[str, WatchStateEntry]
-    groups: dict[str, WatchGroupState]
 
 
 class WatchStateStore:
@@ -204,7 +196,6 @@ class WatchStateStore:
 
         self.pending_work: dict[str, WatchPendingWork] = {}
         self.entries: dict[str, WatchStateEntry] = {}
-        self.groups: dict[str, WatchGroupState] = {}
         self.password_generation = 0
         self.password_source_signature = ""
         self.watch_cursors: dict[str, dict[str, int]] = {}
@@ -323,11 +314,9 @@ class WatchStateStore:
                         payload.get("entries"),
                         WatchStateEntry,
                     )
-                    self.groups = self._load_records(
-                        payload.get("groups"),
-                        WatchGroupState,
-                        normalize_keys=False,
-                    )
+                    # Version 17 snapshots may still contain the retired
+                    # Watch-owned split-group cache. Pipeline discovery is now
+                    # authoritative, so that legacy field is intentionally ignored.
 
             if incompatible:
                 self._discard_incompatible_state_locked()
@@ -502,7 +491,6 @@ class WatchStateStore:
     def _reset_memory_locked(self) -> None:
         self.pending_work = {}
         self.entries = {}
-        self.groups = {}
         self.password_generation = 0
         self.password_source_signature = ""
         self.watch_cursors = {}
@@ -528,7 +516,6 @@ class WatchStateStore:
             watch_cursors={key: dict(value) for key, value in self.watch_cursors.items()},
             pending_work=self.pending_work.copy(),
             entries=self.entries.copy(),
-            groups=self.groups.copy(),
         )
 
     def _write_snapshot_view(self, view: _SnapshotView) -> None:
@@ -554,7 +541,7 @@ class WatchStateStore:
                 view.watch_cursors,
                 view.pending_work,
                 view.entries,
-                view.groups,
+                {},
             )
             os.replace(temp_path, self.path)
             _sync_file_path(self.path)
@@ -855,10 +842,13 @@ class WatchStateStore:
             }
 
         collection = str(operation.get("collection") or "")
+        if collection == "groups":
+            # Replay and discard legacy group records so existing v17 WALs
+            # remain readable after Watch stops owning archive membership.
+            return "legacy_group", "", "", None
         record_types = {
             "pending_work": WatchPendingWork,
             "entries": WatchStateEntry,
-            "groups": WatchGroupState,
         }
         record_type = record_types.get(collection)
         if record_type is None:
@@ -880,6 +870,8 @@ class WatchStateStore:
 
     def _apply_decoded_operation_locked(self, operation) -> None:
         action, collection, key, value = operation
+        if action == "legacy_group":
+            return
         if action == "set_metadata":
             self.password_generation, self.password_source_signature = value
             return
@@ -1158,15 +1150,6 @@ class WatchStateStore:
                     for key in collection
                     if _path_matches(key, normalized, recursive=recursive)
                 )
-            operations.extend(
-                self._delete_operation("groups", group_id)
-                for group_id, group in self.groups.items()
-                if any(
-                    _path_matches(member, normalized, recursive=recursive)
-                    for member in [group.head_path, *group.owned_paths]
-                    if member
-                )
-            )
             self._commit_operations_locked(operations)
             return bool(operations)
 
@@ -1286,28 +1269,19 @@ class WatchStateStore:
                 for key in sorted(keys)
             ])
 
-    def prune_missing_records(self) -> tuple[int, int]:
-        """Remove state records whose concrete filesystem paths are gone."""
+    def prune_missing_records(self) -> int:
+        """Remove retry records whose concrete filesystem paths are gone."""
         with self._state_lock:
             entry_keys = [
                 key
                 for key, entry in self.entries.items()
                 if _recorded_file_presence(entry.path) is False
             ]
-            group_ids = []
-            for group_id, group in self.groups.items():
-                recorded_paths = _group_recorded_paths(group)
-                if not recorded_paths or any(
-                    _recorded_file_presence(path) is False
-                    for path in recorded_paths
-                ):
-                    group_ids.append(group_id)
-            operations = [
-                *(self._delete_operation("entries", key) for key in entry_keys),
-                *(self._delete_operation("groups", group_id) for group_id in group_ids),
-            ]
-            self._commit_operations_locked(operations)
-            return len(entry_keys), len(group_ids)
+            self._commit_operations_locked([
+                self._delete_operation("entries", key)
+                for key in entry_keys
+            ])
+            return len(entry_keys)
 
     def mark_password_source_changed(self, signature: str | None = None) -> int:
         with self._state_lock:
@@ -1399,149 +1373,6 @@ class WatchStateStore:
                 self._put_operation("entries", key, entry),
             ], durable=True)
 
-    def group_state(self, group_id: str) -> WatchGroupState | None:
-        with self._state_lock:
-            return self.groups.get(group_id)
-
-    def group_items(self) -> list[WatchGroupState]:
-        with self._state_lock:
-            return list(self.groups.values())
-
-    def record_group_waiting(self, snapshot: WatchGroupSnapshot) -> None:
-        with self._state_lock:
-            previous = self.groups.get(snapshot.group_id)
-            blockers = set(previous.blockers if previous else [])
-            blockers.discard(BLOCKER_MISSING_VOLUME)
-            record = self._group_record(
-                snapshot,
-                previous=previous,
-                status="waiting",
-                blockers=sorted(blockers),
-                last_attempted_input_fingerprint=snapshot.input_fingerprint,
-                password_generation=(
-                    previous.password_generation
-                    if previous
-                    else self.password_generation
-                ),
-                failure_payload={
-                    "kind": "relation_waiting",
-                    "stage": "relation",
-                    "message": "waiting for a dispatchable split candidate",
-                },
-            )
-            self._commit_operations_locked([
-                self._put_operation("groups", snapshot.group_id, record),
-            ], durable=True)
-
-    def record_group_attempt(self, snapshot: WatchGroupSnapshot) -> None:
-        with self._state_lock:
-            previous = self.groups.get(snapshot.group_id)
-            record = self._group_record(
-                snapshot,
-                previous=previous,
-                status="running",
-                blockers=list(previous.blockers if previous else []),
-                last_attempted_input_fingerprint=snapshot.input_fingerprint,
-                password_generation=(
-                    previous.password_generation
-                    if previous
-                    else self.password_generation
-                ),
-                failure_payload=dict(previous.failure_payload if previous else {}),
-                increment_attempt=True,
-            )
-            self._commit_operations_locked([
-                self._put_operation("groups", snapshot.group_id, record),
-            ])
-
-    def record_group_suspended(
-        self,
-        snapshot: WatchGroupSnapshot,
-        *,
-        blockers: list[str],
-        failure_payload: dict[str, Any] | None = None,
-    ) -> None:
-        with self._state_lock:
-            previous = self.groups.get(snapshot.group_id)
-            record = self._group_record(
-                snapshot,
-                previous=previous,
-                status="suspended",
-                blockers=sorted(set(blockers)),
-                last_attempted_input_fingerprint=snapshot.input_fingerprint,
-                password_generation=self.password_generation,
-                failure_payload=dict(failure_payload or {}),
-            )
-            self._commit_operations_locked([
-                self._put_operation("groups", snapshot.group_id, record),
-            ], durable=True)
-
-    def record_group_terminal(
-        self,
-        snapshot: WatchGroupSnapshot,
-        *,
-        status: str,
-        failure_payload: dict[str, Any] | None = None,
-    ) -> None:
-        with self._state_lock:
-            previous = self.groups.get(snapshot.group_id)
-            record = self._group_record(
-                snapshot,
-                previous=previous,
-                status=status,
-                blockers=[],
-                last_attempted_input_fingerprint=snapshot.input_fingerprint,
-                password_generation=self.password_generation,
-                failure_payload=dict(failure_payload or {}),
-            )
-            self._commit_operations_locked([
-                self._put_operation("groups", snapshot.group_id, record),
-            ], durable=True)
-
-    def record_group_done(self, snapshot: WatchGroupSnapshot) -> None:
-        self.record_group_terminal(snapshot, status="done")
-
-    def clear_group(self, group_id: str) -> bool:
-        with self._state_lock:
-            if group_id not in self.groups:
-                return False
-            self._commit_operations_locked([
-                self._delete_operation("groups", group_id),
-            ])
-            return True
-
-    def _group_record(
-        self,
-        snapshot: WatchGroupSnapshot,
-        *,
-        previous: WatchGroupState | None,
-        status: str,
-        blockers: list[str],
-        last_attempted_input_fingerprint: str,
-        password_generation: int,
-        failure_payload: dict[str, Any],
-        increment_attempt: bool = False,
-    ) -> WatchGroupState:
-        return WatchGroupState(
-            group_id=snapshot.group_id,
-            directory=snapshot.directory,
-            logical_name=snapshot.logical_name,
-            split_family=snapshot.split_family,
-            head_path=snapshot.head_path,
-            input_paths=list(snapshot.input_paths),
-            owned_paths=list(snapshot.owned_paths),
-            status=status,
-            blockers=list(blockers),
-            input_fingerprint=snapshot.input_fingerprint,
-            ownership_fingerprint=snapshot.ownership_fingerprint,
-            last_attempted_input_fingerprint=last_attempted_input_fingerprint,
-            password_generation=password_generation,
-            failure_payload=dict(failure_payload),
-            attempt_count=(previous.attempt_count if previous else 0) + (1 if increment_attempt else 0),
-            updated_at=time.time(),
-        )
-
-
 def _path_key(path: str) -> str:
     return os.path.normcase(os.path.abspath(path))
 
@@ -1557,26 +1388,6 @@ def _recorded_file_presence(path: str) -> bool | None:
         if exc.errno in {errno.ENOENT, errno.ENOTDIR} or getattr(exc, "winerror", None) in {2, 3}:
             return False
         return None
-
-
-def _group_recorded_paths(group: WatchGroupState) -> list[str]:
-    """Return the concrete paths currently represented by a persisted group."""
-
-    raw_paths: list[object] = [getattr(group, "head_path", "")]
-    for field_name in ("input_paths", "owned_paths"):
-        value = getattr(group, field_name, ())
-        if isinstance(value, str):
-            raw_paths.append(value)
-        elif value:
-            raw_paths.extend(value)
-
-    result: dict[str, str] = {}
-    for value in raw_paths:
-        path = str(value or "").strip()
-        if not path:
-            continue
-        result.setdefault(_path_key(path), os.path.abspath(path))
-    return list(result.values())
 
 
 def _path_matches(path: str, expected: str, *, recursive: bool) -> bool:

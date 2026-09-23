@@ -15,7 +15,6 @@ from sunpack.contracts.filesystem import DirectorySnapshot, FileEntry
 from sunpack.coordinator.engine import PipelineEngine
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.coordinator.target_groups import relation_group_to_candidate
-from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
 from sunpack.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.extraction.scheduler import ExtractionScheduler
 from sunpack.filesystem.directory_scanner import DirectoryScanner
@@ -153,6 +152,45 @@ def test_pipeline_uses_initial_structure_group_without_missing_volume_retry(
     assert marker.read_text(encoding="utf-8") == cases["7z"].marker_text
 
 
+def test_pipeline_middle_volume_target_exposes_resolved_physical_family(mixed_real_volumes):
+    tmp_path, common, _cases, paths_by_format = mixed_real_volumes
+    parts = paths_by_format["7z"]
+    assert len(parts) >= 2
+    selected = parts[1]
+    output_root = tmp_path / "pipeline_middle_volume_output"
+    config = normalize_config(
+        with_detection_pipeline(
+            {
+                "recursive_extract": "1",
+                "verification": {"enabled": False, "methods": []},
+                "post_extract": {
+                    "archive_cleanup_mode": "k",
+                    "flatten_single_directory": False,
+                },
+                "output": {
+                    "root": str(output_root),
+                    "common_root": str(common),
+                },
+            },
+            precheck=[
+                {"name": "size_range", "enabled": True, "gte": 0},
+                {"name": "relation_archive_accept", "enabled": True},
+            ],
+        )
+    )
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            return await asyncio.wait_for(engine.run([str(selected)]), 60)
+
+    response = asyncio.run(run())
+
+    assert response.summary.success_count == 1
+    assert response.discovery.entry_paths == (str(selected),)
+    assert set(response.discovery.claimed_paths) == {str(path) for path in parts}
+    assert response.discovery.blocked_paths == ()
+
+
 def test_real_strict_middle_gap_is_not_emitted_as_a_relation_group(tmp_path):
     case = ArchiveFixtureFactory().create(
         tmp_path,
@@ -171,9 +209,6 @@ def test_real_strict_middle_gap_is_not_emitted_as_a_relation_group(tmp_path):
     )
     assert all(group.kind == "file" for group in groups)
     assert all(len(group.input_paths) == 1 for group in groups)
-
-    snapshot = WatchGroupCoordinator({}).resolve_head(str(parts[0]))
-    assert snapshot is None
 
 
 def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):

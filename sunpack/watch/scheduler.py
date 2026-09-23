@@ -24,28 +24,11 @@ from sunpack.contracts.retry_targets import (
     result_path,
     target_results,
 )
-from sunpack.contracts.filesystem import FileEntry
 from sunpack.contracts.results import OutcomeKind
 from sunpack.contracts.pipeline import PipelineTarget
-from sunpack.filesystem.directory_scanner import (
-    apply_ordered_filters_to_entries,
-    rejected_only_by_size_range,
-    split_size_family_keys,
-)
-from sunpack.filesystem.filters import build_filters
-from sunpack.filesystem.watcher.log import WatchLogStore
-from sunpack.filesystem.watcher.group_dispatch import (
-    DeferredWatch,
-    NullWatchGroupResolver,
-    plan_watch_dispatches,
-)
-from sunpack.filesystem.watcher.group_models import (
-    BLOCKER_MISSING_VOLUME,
-    BLOCKER_PASSWORD,
-    WatchGroupSnapshot,
-)
-from sunpack.filesystem.watcher.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
-from sunpack.filesystem.watcher.scanner import (
+from sunpack.watch.log import WatchLogStore
+from sunpack.watch.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
+from sunpack.watch.scanner import (
     WatchCandidate,
     scan_watch_candidates,
     validate_ntfs_watch_roots,
@@ -54,9 +37,9 @@ from sunpack.filesystem.watcher.scanner import (
     watch_root_changes,
     watch_volume_cursor,
 )
-from sunpack.filesystem.watcher.scanner import _candidate_for as _watch_candidate_for_path
-from sunpack.filesystem.watcher.state import WatchStateEntry, WatchStateStore
-from sunpack.filesystem.watcher.toast import NullWatchNotificationSink
+from sunpack.watch.scanner import _candidate_for as _watch_candidate_for_path
+from sunpack.watch.state import WatchStateEntry, WatchStateStore
+from sunpack.watch.toast import NullWatchNotificationSink
 from sunpack.i18n import I18nContext
 from sunpack.passwords.internal import builtin as builtin_passwords_module
 from sunpack.passwords.internal.builtin import get_builtin_passwords
@@ -101,6 +84,8 @@ USN_CONTENT_REASON_MASK = (
     | USN_REASON_DATA_TRUNCATION
 )
 RESTORED_MTIME_MINIMUM_BACKSTEP_SECONDS = 2.0
+BLOCKER_MISSING_VOLUME = "missing_volume"
+BLOCKER_PASSWORD = "password"
 
 
 class _CandidateChangeKind(Enum):
@@ -122,18 +107,13 @@ class WatchRunResult:
 class _ActiveCandidateState:
     last_event_at: float
     quiet_seconds: float
-    filtered_size: int
-    filtered_mtime: float
     generation: int = 1
-    force: bool = False
-    filter_revision: int = 0
 
 
 @dataclass
 class _ActivePipelineRequest:
     notification_id: str
     candidate: WatchCandidate
-    group: WatchGroupSnapshot | None
     task: asyncio.Task
     registry_owner: str = ""
 
@@ -152,7 +132,6 @@ class WatchScheduler:
         initial_scan_roots: Iterable[str] | None = None,
         observer_stop_timeout_seconds: float | None = None,
         pipeline_engine=None,
-        group_coordinator=None,
         notification_sink=None,
         wake_callback: Callable[[], None] | None = None,
     ):
@@ -203,11 +182,7 @@ class WatchScheduler:
                 else observer_stop_timeout_seconds
             ),
         )
-        self._filter_revision = 0
-        self._filters = []
-        self.filters = build_filters(config)
         self.state = WatchStateStore(state_path)
-        self.group_coordinator = group_coordinator or NullWatchGroupResolver()
         log_path = Path(state_path).with_name("events.jsonl")
         self.log = WatchLogStore(str(log_path))
         state_parent = Path(state_path).parent
@@ -283,10 +258,6 @@ class WatchScheduler:
         self.builtin_password_file = os.path.abspath(str(builtin_passwords_module.builtin_password_path()))
         self._recent_passwords: list[str] = []
         self._password_source_signature = self._refresh_password_sources()
-        self._sync_group_coordinator_passwords()
-        set_password_callback = getattr(self.group_coordinator, "set_password_callback", None)
-        if callable(set_password_callback):
-            set_password_callback(self._remember_recent_passwords)
         if self.state.record_password_source_signature(self._password_source_signature):
             self._mark_all_password_failures_dirty()
         self._clipboard_monitor = ClipboardPasswordMonitor(
@@ -323,12 +294,11 @@ class WatchScheduler:
             return
         self._ensure_directory_password_files()
         self._prepare_usn_startup_baseline()
-        removed_entries, removed_groups = self.state.prune_missing_records()
-        if removed_entries or removed_groups:
+        removed_entries = self.state.prune_missing_records()
+        if removed_entries:
             self.log.write(
                 "state_pruned_on_start",
                 entries=removed_entries,
-                groups=removed_groups,
             )
         handler = _WatchEventHandler(self)
         scheduled_paths: set[str] = set()
@@ -678,36 +648,13 @@ class WatchScheduler:
                     )
                 continue
             if entry.status == "suspended_missing_volume":
-                # Re-resolving this one known input lets the existing group
-                # fingerprint gate decide whether an offline volume arrival made
-                # it retryable. Unchanged groups remain suspended without extract.
+                # Re-submit the observed physical file through the full pipeline.
+                # Relations may now discover additional volumes that arrived
+                # while Watch was offline.
                 self.enqueue(
                     entry.path,
                     force=True,
                     event_type="startup_missing_volume_reconcile",
-                )
-
-        for group in self.state.group_items():
-            if group.status != "waiting":
-                continue
-            # A pre-dispatch split group can be waiting before a canonical head
-            # exists, so there may be no failure entry to reconcile. Re-enqueue
-            # one persisted member only; the existing relation resolver scans
-            # that split family directory and sees any volumes that arrived while
-            # SunPack was offline. This is one startup event, not polling.
-            candidate_path = next(
-                (
-                    value
-                    for value in [group.head_path, *group.input_paths, *group.owned_paths]
-                    if value and os.path.isfile(value)
-                ),
-                "",
-            )
-            if candidate_path:
-                self.enqueue(
-                    candidate_path,
-                    force=True,
-                    event_type="startup_group_reconcile",
                 )
 
     def _ensure_directory_password_files(self) -> None:
@@ -767,38 +714,9 @@ class WatchScheduler:
         self._process_password_dirty_dirs(time.monotonic())
         result = await self._harvest_completed_requests()
         ready = self._pop_ready(time.time())
-        with self._lock:
-            active_paths = {
-                os.path.normcase(os.path.abspath(path))
-                for path in self._pending
-            } | self._inflight_path_keys_locked()
-        dispatches, waiting, deferred = plan_watch_dispatches(
-            ready,
-            active_paths=active_paths,
-            coordinator=self.group_coordinator,
-            state=self.state,
-            prepare_candidate=self._prepare_group_head,
-        )
-        for item in deferred:
-            if item.group is not None:
-                # A different member of this split group is still pending or
-                # in flight.  Keep the ready member pending with its quiet
-                # clock aligned to the group's latest pending member so the
-                # group dispatches together instead of deferring each other
-                # indefinitely one quiet window at a time.
-                self._defer_group_member(item.candidate, item.group)
-            else:
-                self.enqueue(item.candidate.path, force=True, event_type="modified")
-        for snapshot in waiting:
-            self.log.write(
-                "split_group_suspended",
-                group_id=snapshot.group_id,
-                head_path=snapshot.head_path,
-                input_paths=list(snapshot.input_paths),
-            )
         active_requests = []
-        for dispatch in dispatches:
-            request = await self._submit_candidate(dispatch.candidate, group=dispatch.group)
+        for candidate in ready:
+            request = await self._submit_candidate(candidate)
             if request is not None:
                 active_requests.append(request)
         with self._lock:
@@ -876,26 +794,12 @@ class WatchScheduler:
         paths: set[str] = set()
         for request in self._inflight_requests:
             paths.add(os.path.normcase(os.path.abspath(request.candidate.path)))
-            if request.group is not None:
-                paths.update(
-                    os.path.normcase(os.path.abspath(path))
-                    for path in request.group.owned_paths
-                )
         return paths
 
     @property
     def pending_count(self) -> int:
         with self._lock:
             return len(self._pending)
-
-    @property
-    def filters(self):
-        return self._filters
-
-    @filters.setter
-    def filters(self, value) -> None:
-        self._filters = list(value or [])
-        self._filter_revision += 1
 
     def next_delay_seconds(self) -> float | None:
         now = time.time()
@@ -1054,7 +958,6 @@ class WatchScheduler:
                 return
             state = self._active_states.get(candidate.path)
             if state is not None:
-                state.force = state.force or force
                 self._pending[candidate.path] = candidate
                 self._latest_observations[candidate.path] = candidate
                 quiet_seconds = self._observe_candidate_activity(
@@ -1065,14 +968,8 @@ class WatchScheduler:
                 state.last_event_at = now
                 state.quiet_seconds = quiet_seconds
                 state.generation += 1
-                state.filter_revision = self._filter_revision
-                state.filtered_size = candidate.size
-                state.filtered_mtime = candidate.mtime
                 self._wake_service()
                 return
-        if not password_retry and not internal_recovery and not self._passes_filesystem_filters(candidate):
-            self._log_candidate_ignored(candidate.path, "filtered_out")
-            return
         became_active = False
         active_quiet_seconds = self.cold_start_seconds
         with self._lock:
@@ -1111,13 +1008,8 @@ class WatchScheduler:
                 self._active_states[candidate.path] = _ActiveCandidateState(
                     last_event_at=now,
                     quiet_seconds=active_quiet_seconds,
-                    filtered_size=candidate.size,
-                    filtered_mtime=candidate.mtime,
-                    force=force,
-                    filter_revision=self._filter_revision,
                 )
             else:
-                state.force = state.force or force
                 self._pending[candidate.path] = candidate
                 self._latest_observations[candidate.path] = candidate
                 active_quiet_seconds = self._observe_candidate_activity(
@@ -1128,9 +1020,6 @@ class WatchScheduler:
                 state.last_event_at = now
                 state.quiet_seconds = active_quiet_seconds
                 state.generation += 1
-                state.filter_revision = self._filter_revision
-                state.filtered_size = candidate.size
-                state.filtered_mtime = candidate.mtime
         if became_active:
             self.log.write(
                 "candidate_active",
@@ -1174,7 +1063,6 @@ class WatchScheduler:
         with self._password_source_lock:
             previous_signature = self._password_source_signature
             signature = self._refresh_password_sources()
-            self._sync_group_coordinator_passwords()
             if reason in {"builtin_password_file", "clipboard"} and signature == previous_signature:
                 return
             self._password_source_signature = signature
@@ -1197,17 +1085,10 @@ class WatchScheduler:
     def notify_path_departed(self, path: str, *, recursive: bool = False) -> None:
         normalized = os.path.abspath(path)
         with self._lock:
-            # Task-level cleanup is allowed to delete an input before the whole
-            # recursive Watch request finishes. Those watcher delete events must
-            # not erase the durable crash owner while the request still owns the
-            # path/group; completion will retire it after all recovery anchors are
-            # committed.
+            # Watch owns only the submitted event path. Archive membership and
+            # physical ownership belong to PipelineEngine after discovery.
             inflight_owned = any(
                 _paths_match(request.candidate.path, normalized, recursive=recursive)
-                or any(
-                    _paths_match(member, normalized, recursive=recursive)
-                    for member in (request.group.owned_paths if request.group is not None else ())
-                )
                 for request in self._inflight_requests
             )
             pending_paths = [
@@ -1258,7 +1139,7 @@ class WatchScheduler:
 
     def _pop_ready(self, now: float) -> list[WatchCandidate]:
         ready: list[WatchCandidate] = []
-        due: list[tuple[str, WatchCandidate, int, bool, int, int, float, float]] = []
+        due: list[tuple[str, WatchCandidate, int, float]] = []
         with self._lock:
             inflight_paths = self._inflight_path_keys_locked()
             for path, candidate in self._pending.items():
@@ -1270,35 +1151,14 @@ class WatchScheduler:
                         path,
                         candidate,
                         state.generation,
-                        state.force,
-                        state.filter_revision,
-                        state.filtered_size,
-                        state.filtered_mtime,
                         state.quiet_seconds,
                     ))
 
-        for path, candidate, generation, force, filter_revision, filtered_size, filtered_mtime, quiet_seconds in due:
+        for path, candidate, generation, quiet_seconds in due:
             refreshed = _candidate_for_event_path(path, since_usn=candidate.change_usn)
             if refreshed is None:
                 self._drop_active(path, generation)
                 self.state.forget_path(path)
-                continue
-            filter_stale = (
-                filter_revision != self._filter_revision
-                or filtered_size != refreshed.size
-                or filtered_mtime != refreshed.mtime
-            )
-            pending_record = self.state.pending_work_for_path(path)
-            internal_recovery = bool(
-                pending_record is not None and pending_record.internal_recovery
-            )
-            if (
-                filter_stale
-                and not internal_recovery
-                and not self._passes_filesystem_filters(refreshed)
-            ):
-                self._drop_active(path, generation)
-                self.state.complete_work([path])
                 continue
             if _candidate_observation_changed(candidate, refreshed):
                 if _candidate_content_changed(candidate, refreshed):
@@ -1372,9 +1232,6 @@ class WatchScheduler:
             )
             state.quiet_seconds = min(learned_quiet_seconds, self.boundary_confirmation_seconds)
             state.generation += 1
-            state.filter_revision = self._filter_revision
-            state.filtered_size = candidate.size
-            state.filtered_mtime = candidate.mtime
 
     def _update_boundary_metadata(
         self,
@@ -1389,9 +1246,6 @@ class WatchScheduler:
             self._pending[path] = candidate
             self._latest_observations[path] = candidate
             self._observe_candidate_activity(candidate, time.time(), content_changed=False)
-            state.filter_revision = self._filter_revision
-            state.filtered_size = candidate.size
-            state.filtered_mtime = candidate.mtime
             return True
 
     def _candidate_baseline_locked(self, path: str) -> WatchCandidate | None:
@@ -1409,63 +1263,7 @@ class WatchScheduler:
         state = self._active_states.get(candidate.path)
         if state is not None:
             self._pending[candidate.path] = candidate
-            state.filter_revision = self._filter_revision
-            state.filtered_size = candidate.size
-            state.filtered_mtime = candidate.mtime
         self._observe_candidate_activity(candidate, now, content_changed=False)
-
-    def _defer_group_member(
-        self,
-        candidate: WatchCandidate,
-        snapshot: WatchGroupSnapshot,
-    ) -> None:
-        """Re-arm a ready split member without restarting its quiet clock.
-
-        The candidate already passed its quiet boundary, but another member of
-        the same split group is still pending (or in flight).  Re-enqueueing
-        through ``enqueue()`` restarts the quiet window, so members whose
-        deadlines differ by milliseconds can defer each other indefinitely.
-        Instead, keep the candidate pending and align its deadline with the
-        latest pending member so the whole group becomes ready in one tick and
-        dispatches together.  When only in-flight members remain, fall back to
-        the historical retry loop so the candidate is reconsidered after the
-        request is harvested.
-        """
-        with self._lock:
-            if candidate.path in self._pending or candidate.path in self._active_states:
-                # A newer event already re-armed this path after it was popped.
-                return
-            member_keys = {path_key(member) for member in snapshot.owned_paths}
-            own_key = path_key(candidate.path)
-            pending_deadlines = [
-                state.last_event_at + state.quiet_seconds
-                for path, state in self._active_states.items()
-                if path_key(path) in member_keys and path_key(path) != own_key
-            ]
-        if not pending_deadlines:
-            self.enqueue(candidate.path, force=True, event_type="modified")
-            return
-        tracker = self._quiet_trackers.get(candidate.path)
-        quiet_seconds = (
-            float(tracker.quiet_seconds) if tracker is not None else self.cold_start_seconds
-        )
-        aligned_deadline = max(pending_deadlines)
-        state = _ActiveCandidateState(
-            last_event_at=aligned_deadline - quiet_seconds,
-            quiet_seconds=quiet_seconds,
-            filtered_size=candidate.size,
-            filtered_mtime=candidate.mtime,
-            filter_revision=self._filter_revision,
-        )
-        with self._lock:
-            if candidate.path in self._pending or candidate.path in self._active_states:
-                return
-            # Same write-ahead rule as enqueue(): do not expose deferred work
-            # to memory until its crash queue record is durable.
-            self.state.queue_active(candidate, force=True)
-            self._pending[candidate.path] = candidate
-            self._active_states[candidate.path] = state
-        self._wake_service()
 
     def _observe_candidate_activity(
         self,
@@ -1510,17 +1308,9 @@ class WatchScheduler:
                         _password_retry_snapshot=entry,
                     )
 
-    def _prepare_group_head(self, path: str) -> WatchCandidate | None:
-        candidate = _candidate_for_event_path(path)
-        if candidate is None or not self._passes_filesystem_filters(candidate):
-            return None
-        return candidate
-
     async def _submit_candidate(
         self,
         candidate: WatchCandidate,
-        *,
-        group: WatchGroupSnapshot | None = None,
     ) -> _ActivePipelineRequest | None:
         notification_id = uuid.uuid4().hex
         with self._password_source_lock:
@@ -1554,7 +1344,7 @@ class WatchScheduler:
         from sunpack.cli.runtime_state import runtime_host
 
         host = runtime_host()
-        reservation_paths = [candidate.path, *(group.owned_paths if group is not None else ())]
+        reservation_paths = [candidate.path]
         if host is not None:
             conflict = host.archive_registry.reserve(notification_id, "watch", reservation_paths)
             if conflict is not None:
@@ -1589,7 +1379,6 @@ class WatchScheduler:
         return _ActivePipelineRequest(
             notification_id=notification_id,
             candidate=candidate,
-            group=group,
             task=task,
             registry_owner=notification_id if host is not None else "",
         )
@@ -1622,12 +1411,31 @@ class WatchScheduler:
 
     async def _complete_candidate(self, request: _ActivePipelineRequest) -> WatchRunResult:
         candidate = request.candidate
-        group = request.group
         response = await request.task
         summary = response.summary
         self._remember_recent_passwords(response.recent_passwords)
+        claimed_paths = _response_claimed_paths(response, candidate.path)
+        coalesced_from = str(
+            getattr(getattr(response, "discovery", None), "coalesced_from_request_id", "")
+            or ""
+        )
+        if coalesced_from:
+            self._retire_claimed_paths(claimed_paths, candidate)
+            self.log.write(
+                "pipeline_request_coalesced",
+                path=candidate.path,
+                owner_request_id=coalesced_from,
+                claimed_paths=claimed_paths,
+            )
+            self._notify("suppressed", request.notification_id)
+            return WatchRunResult(processed=1)
 
+        results = target_results(summary)
         target_result = _target_result_for_path(summary, candidate.path)
+        if target_result is None and len(results) == 1:
+            claimed_keys = {path_key(path) for path in claimed_paths}
+            if path_key(candidate.path) in claimed_keys:
+                target_result = results[0]
         outcome_kind = _summary_outcome_kind(summary, target_result)
         direct_outcome = result_outcome(target_result) or outcome_kind
         target_output_dir = (
@@ -1646,7 +1454,6 @@ class WatchScheduler:
             str(target_output_dir or ""),
         ])
 
-        results = target_results(summary)
         failures = list(getattr(summary, "failures", []) or [])
         for item in results:
             failure = result_failure(item)
@@ -1670,28 +1477,11 @@ class WatchScheduler:
         password_scope_signature = _directory_password_signature(password_scope_dir, self.config)
 
         # The watched input has its own lifecycle even when a recursively generated
-        # archive fails later. A successful direct task leaves group/state now;
-        # later recovery is anchored to the failed task itself.
+        # archive fails later. Later recovery is anchored to the failed task itself.
         if direct_outcome == OutcomeKind.COMPLETE_SUCCESS:
-            if group is not None:
-                completed_group = self._current_group_snapshot(group, candidate.path)
-                if completed_group is None:
-                    self.state.clear_group(group.group_id)
-                else:
-                    self.state.record_group_done(completed_group)
-                self.state.clear_entries(group.owned_paths)
-            self.state.mark(
-                candidate.path,
-                candidate.size,
-                candidate.mtime,
-                file_id=candidate.file_id,
-                change_usn=candidate.change_usn,
-                status="done",
-            )
-            # Directory-swap flatten changes the output root identity. Retire
-            # the durable Watch publication now; cosmetic flatten waits until all
-            # retryable nested blockers have been classified below.
-            self.state.complete_work_if_matches(request.candidate)
+            # Watch consumes pipeline ownership facts. It never reconstructs
+            # split/archive membership itself.
+            self._retire_claimed_paths(claimed_paths, request.candidate)
 
         waiting_failures: list = []
         if direct_missing:
@@ -1709,12 +1499,6 @@ class WatchScheduler:
                 direct_failure,
                 self.i18n.t("failure.possible_missing_volume"),
             )
-            if group is not None:
-                self.state.record_group_suspended(
-                    group,
-                    blockers=blockers,
-                    failure_payload=payload,
-                )
             self.state.mark(
                 candidate.path,
                 candidate.size,
@@ -1735,7 +1519,6 @@ class WatchScheduler:
             waiting_failures.append(direct_failure)
 
         recorded_password_failures: list = []
-        recorded_password_payloads: dict[str, dict] = {}
         retry_results = password_retry_results(summary)
         if not results and direct_failure is not None:
             if (
@@ -1782,29 +1565,6 @@ class WatchScheduler:
                 failures=[payload],
             )
             recorded_password_failures.append(failure)
-            recorded_password_payloads[path_key(retry_candidate.path)] = payload
-
-        direct_password_payload = recorded_password_payloads.get(path_key(candidate.path))
-        if (
-            group is not None
-            and not direct_missing
-            and direct_outcome != OutcomeKind.COMPLETE_SUCCESS
-        ):
-            if direct_password_payload is not None:
-                self.state.record_group_suspended(
-                    group,
-                    blockers=[BLOCKER_PASSWORD],
-                    failure_payload=direct_password_payload,
-                )
-            else:
-                self.state.record_group_terminal(
-                    group,
-                    status="failed_terminal",
-                    failure_payload=_failure_payload(
-                        direct_failure,
-                        path=candidate.path,
-                    ) if direct_failure is not None else None,
-                )
 
         terminal_failures = [
             failure
@@ -1877,15 +1637,11 @@ class WatchScheduler:
         if failed:
             # Unstructured failures cannot participate in an automatic wait.
             error = failed[0]
-            if group is not None and direct_outcome != OutcomeKind.COMPLETE_SUCCESS:
-                self.state.record_group_terminal(group, status="failed_terminal")
             self.log.write("failed_terminal", path=candidate.path, error=error, failures=[])
             self._notify("failed", request.notification_id, failed, [])
             return WatchRunResult(processed=1, failed=1, errors=failed)
 
         if _summary_processed_no_tasks(summary):
-            if group is not None:
-                self.state.record_group_terminal(group, status="ignored_no_tasks")
             self.state.mark(
                 candidate.path,
                 candidate.size,
@@ -1900,16 +1656,12 @@ class WatchScheduler:
 
         if direct_outcome == OutcomeKind.PARTIAL_SUCCESS:
             error = self.i18n.t("watch.failure.partial_rejected")
-            if group is not None:
-                self.state.record_group_terminal(group, status="failed_terminal")
             self.log.write("partial_rejected", path=candidate.path, error=error)
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
 
         if direct_outcome != OutcomeKind.COMPLETE_SUCCESS:
             error = self.i18n.t("watch.failure.no_complete_outcome")
-            if group is not None:
-                self.state.record_group_terminal(group, status="failed_terminal")
             self.log.write("failed_terminal", path=candidate.path, error=error, failures=[])
             self._notify("failed", request.notification_id, [error], [])
             return WatchRunResult(processed=1, failed=1, errors=[error])
@@ -1991,22 +1743,16 @@ class WatchScheduler:
                     error_type=type(exc).__name__,
                 )
 
-    def _current_group_snapshot(
-        self,
-        submitted: WatchGroupSnapshot,
-        candidate_path: str,
-    ) -> WatchGroupSnapshot | None:
-        """Return the still-present group only when it is the submitted input."""
-
-        resolved = self.group_coordinator.resolve_paths([candidate_path])
-        current = resolved.get(path_key(candidate_path))
-        if (
-            current is not None
-            and current.group_id == submitted.group_id
-            and current.input_fingerprint == submitted.input_fingerprint
-        ):
-            return current
-        return None
+    def _retire_claimed_paths(self, paths: Iterable[str], candidate: WatchCandidate) -> None:
+        normalized = dedupe_normalized_paths(paths)
+        with self._lock:
+            pending_keys = {path_key(path) for path in self._pending}
+        retired = [path for path in normalized if path_key(path) not in pending_keys]
+        if retired:
+            self.state.complete_work(retired)
+            self.state.clear_entries(retired)
+        if path_key(candidate.path) not in pending_keys:
+            self.state.complete_work_if_matches(candidate)
 
     def _common_root_for(self, path: str) -> str:
         path = os.path.abspath(path)
@@ -2044,22 +1790,6 @@ class WatchScheduler:
             return True
         return bool(self.metadata_dir and _is_relative_to(normalized, self.metadata_dir))
 
-    def _passes_filesystem_filters(self, candidate: WatchCandidate) -> bool:
-        if not self.filters:
-            return True
-        entry = _file_entry_from_watch_candidate(candidate)
-        if apply_ordered_filters_to_entries([entry], self.filters):
-            return True
-        if not rejected_only_by_size_range(entry, self.filters):
-            return False
-        if not split_size_family_keys(candidate.path):
-            return False
-        snapshot = self.group_coordinator.resolve_paths([candidate.path]).get(path_key(candidate.path))
-        if snapshot is None or not snapshot.head_path:
-            return False
-        member_keys = {path_key(path) for path in snapshot.input_paths}
-        return path_key(candidate.path) in member_keys
-
     def _refresh_password_sources(self) -> str:
         with self._password_source_lock:
             builtin_passwords = dedupe_passwords([*self._configured_builtin_passwords, *get_builtin_passwords()])
@@ -2071,11 +1801,6 @@ class WatchScheduler:
             self.config["user_passwords"] = user_passwords
             self.config["builtin_passwords"] = builtin_passwords
         return signature
-
-    def _sync_group_coordinator_passwords(self) -> None:
-        refresh = getattr(self.group_coordinator, "refresh_password_sources", None)
-        if callable(refresh):
-            refresh()
 
     def _remember_recent_passwords(self, passwords: Iterable[str] | None) -> None:
         incoming = dedupe_passwords([str(value) for value in list(passwords or []) if str(value)])
@@ -2242,15 +1967,6 @@ def _candidate_from_state_entry(entry: WatchStateEntry | None) -> WatchCandidate
     )
 
 
-def _file_entry_from_watch_candidate(candidate: WatchCandidate) -> FileEntry:
-    path = Path(candidate.path)
-    return FileEntry(
-        path=path,
-        is_dir=False,
-        size=int(candidate.size),
-        mtime_ns=int(candidate.mtime * 1_000_000_000),
-    )
-
 def _longest_matching_root(path: str, roots: list[str]) -> str | None:
     matches = [root for root in roots if _is_relative_to(path, root)]
     if not matches:
@@ -2272,6 +1988,12 @@ def _paths_match(path: str, expected: str, *, recursive: bool) -> bool:
     return os.path.normcase(normalized) == os.path.normcase(expected) or (
         recursive and _is_relative_to(normalized, expected)
     )
+
+
+def _response_claimed_paths(response, fallback_path: str) -> list[str]:
+    discovery = getattr(response, "discovery", None)
+    claimed = list(getattr(discovery, "claimed_paths", ()) or ())
+    return dedupe_normalized_paths([*claimed, fallback_path])
 
 
 def _target_result_for_path(summary, path: str):

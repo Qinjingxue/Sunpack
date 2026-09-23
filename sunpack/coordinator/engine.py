@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, TextIO
 
 from sunpack.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.contracts.pipeline import PipelineArtifacts, PipelineResponse, PipelineTarget
+from sunpack.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse, PipelineTarget
 from sunpack.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary
 from sunpack.contracts.run_context import RunContext
 from sunpack.coordinator.extraction_batch import ExtractionBatchRunner
@@ -191,9 +191,7 @@ class PipelineEngine:
         origin_marker = CURRENT_ORIGIN.set(submission.origin)
         try:
             with resource_scope.activate():
-                target_paths = [target.path for target in submission.targets]
                 cancellation.raise_if_cancelled()
-                await self._path_leases.acquire(submission.request_id, target_paths)
                 runtime = self._request_runtime_factory(
                     self._services,
                     submission,
@@ -201,7 +199,21 @@ class PipelineEngine:
                     self._path_leases,
                 )
                 start_time = time.time()
-                response = await runtime.execute_async(self._broker, cancellation)
+                try:
+                    response = await runtime.execute_async(self._broker, cancellation)
+                except _CoalescedWatchRequest as coalesced:
+                    owner_task = self._active_requests.get(coalesced.owner_request_id)
+                    if owner_task is None or owner_task is task:
+                        raise
+                    owner_response = await asyncio.shield(owner_task)
+                    return replace(
+                        owner_response,
+                        request_id=submission.request_id,
+                        discovery=replace(
+                            owner_response.discovery,
+                            coalesced_from_request_id=coalesced.owner_request_id,
+                        ),
+                    )
                 self._remember_recent_passwords(response.recent_passwords)
                 response = await _commit_response(
                     self._broker,
@@ -301,9 +313,16 @@ class PipelineEngine:
         return PipelineTarget(os.path.abspath(os.path.normpath(str(target))))
 
 
+class _CoalescedWatchRequest(RuntimeError):
+    def __init__(self, owner_request_id: str):
+        super().__init__(owner_request_id)
+        self.owner_request_id = owner_request_id
+
+
 class _PathLeaseRegistry:
     def __init__(self):
         self._owned: dict[str, set[str]] = {}
+        self._ownership_versions: dict[str, tuple[tuple[str, int, int, int, int], ...]] = {}
         self._changed = asyncio.Condition()
 
     async def acquire(self, owner: str, paths: Iterable[str]) -> None:
@@ -312,17 +331,68 @@ class _PathLeaseRegistry:
             await self._changed.wait_for(lambda: not self._conflicts(owner, normalized))
             self._owned.setdefault(owner, set()).update(normalized)
 
-    async def replace(self, owner: str, paths: Iterable[str]) -> None:
+    async def replace(
+        self,
+        owner: str,
+        paths: Iterable[str],
+        *,
+        coalesce_exact: bool = False,
+    ) -> str | None:
+        """Atomically claim a fully resolved physical input set.
+
+        Discovery is intentionally allowed to run without a lease. If a later
+        recursive round needs a different set, release the previous set before
+        waiting so two requests can never deadlock while upgrading partial
+        ownership.
+
+        Watch may submit two members of the same split family concurrently.
+        Once discovery proves that both requests resolve to the exact same
+        physical ownership, the later request can coalesce with the active one
+        instead of waiting and extracting the same logical archive twice.
+        """
         normalized = {os.path.abspath(os.path.normpath(path)) for path in paths if path}
+        ownership_version = _physical_ownership_version(normalized) if coalesce_exact else ()
         async with self._changed:
+            previous = self._owned.pop(owner, None)
+            self._ownership_versions.pop(owner, None)
+            if previous is not None:
+                self._changed.notify_all()
+            if coalesce_exact:
+                exact_owner = self._exact_owner(owner, normalized, ownership_version)
+                if exact_owner:
+                    return exact_owner
             await self._changed.wait_for(lambda: not self._conflicts(owner, normalized))
             self._owned[owner] = normalized
+            if coalesce_exact:
+                self._ownership_versions[owner] = ownership_version
             self._changed.notify_all()
+            return None
 
     async def release(self, owner: str) -> None:
         async with self._changed:
-            if self._owned.pop(owner, None) is not None:
+            released = self._owned.pop(owner, None)
+            self._ownership_versions.pop(owner, None)
+            if released is not None:
                 self._changed.notify_all()
+
+    def _exact_owner(
+        self,
+        owner: str,
+        candidates: set[str],
+        ownership_version: tuple[tuple[str, int, int, int, int], ...],
+    ) -> str:
+        if not candidates or not ownership_version:
+            return ""
+        candidate_keys = {path_key(path) for path in candidates}
+        for current_owner, current_paths in self._owned.items():
+            if current_owner == owner:
+                continue
+            if (
+                {path_key(path) for path in current_paths} == candidate_keys
+                and self._ownership_versions.get(current_owner) == ownership_version
+            ):
+                return current_owner
+        return ""
 
     def _conflicts(self, owner: str, candidates: set[str]) -> bool:
         for current_owner, current_paths in self._owned.items():
@@ -338,6 +408,34 @@ class _PathLeaseRegistry:
                         return True
         return False
 
+
+
+def _physical_ownership_version(
+    paths: Iterable[str],
+) -> tuple[tuple[str, int, int, int, int], ...]:
+    """Cheap byte-version identity for Watch request coalescing.
+
+    Paths alone are insufficient: a volume may receive new bytes while an
+    earlier request is still active. Size/mtime plus filesystem identity keeps
+    same-version duplicate events cheap without swallowing a newer arrival.
+    """
+
+    rows = []
+    for raw_path in paths:
+        normalized = os.path.abspath(os.path.normpath(raw_path))
+        try:
+            stat = os.stat(normalized)
+        except OSError:
+            return ()
+        rows.append((
+            path_key(normalized),
+            int(stat.st_dev),
+            int(stat.st_ino),
+            int(stat.st_size),
+            int(stat.st_mtime_ns),
+        ))
+    rows.sort(key=lambda row: row[0])
+    return tuple(rows)
 
 def _replace_mapping_in_place(target: dict, source: dict) -> None:
     for key in tuple(target):
@@ -747,9 +845,14 @@ class _RequestRuntime:
                     for task in tasks
                     for path in (task.all_parts or [task.main_path])
                 ]
-                lease_paths = [*all_targets, *member_paths]
                 cancellation.raise_if_cancelled()
-                await self.path_leases.replace(request_id, lease_paths)
+                coalesced_owner = await self.path_leases.replace(
+                    request_id,
+                    member_paths,
+                    coalesce_exact=submission.origin == "watch",
+                )
+                if coalesced_owner:
+                    raise _CoalescedWatchRequest(coalesced_owner)
                 self.batch_runner.set_progress_round(
                     round_index,
                     direct=submission.direct and round_index == 1,
@@ -874,13 +977,19 @@ class _RequestOwnership:
         self.config = config
         self._task_owner: dict[str, str] = {}
         self._task_keys: dict[str, list[str]] = {item.request_id: [] for item in submissions}
+        self._claimed_paths: dict[str, list[str]] = {item.request_id: [] for item in submissions}
+        self._task_paths: dict[str, dict[str, tuple[str, ...]]] = {item.request_id: {} for item in submissions}
         self._output_owner: dict[str, str] = {}
 
     def remember_tasks(self, tasks) -> None:
         for task in tasks:
             owner = self.owner_for_path(task.main_path)
-            self._task_owner[path_key(task.main_path)] = owner.request_id
-            self._task_keys[owner.request_id].append(task.key)
+            owner_id = owner.request_id
+            paths = tuple(dict.fromkeys(task.all_parts or [task.main_path]))
+            self._task_owner[path_key(task.main_path)] = owner_id
+            self._task_keys[owner_id].append(task.key)
+            self._claimed_paths[owner_id].extend(paths)
+            self._task_paths[owner_id][path_key(task.main_path)] = paths
 
     def remember_results(self, results) -> None:
         for result in results:
@@ -966,6 +1075,16 @@ class _RequestOwnership:
                     == submission.request_id
                 ],
             )
+            blocked_paths = []
+            for result in request_results:
+                if result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
+                    continue
+                blocked_paths.extend(
+                    self._task_paths[submission.request_id].get(
+                        path_key(result.input_path),
+                        (result.input_path,),
+                    )
+                )
             responses[submission.request_id] = PipelineResponse(
                 request_id=submission.request_id,
                 summary=summary,
@@ -984,6 +1103,11 @@ class _RequestOwnership:
                             if str(item.get("out_dir") or "")
                         ),
                     ])),
+                ),
+                discovery=PipelineDiscovery(
+                    entry_paths=tuple(target.path for target in submission.targets),
+                    claimed_paths=tuple(dict.fromkeys(self._claimed_paths[submission.request_id])),
+                    blocked_paths=tuple(dict.fromkeys(blocked_paths)),
                 ),
                 recent_passwords=tuple(recent_passwords),
             )

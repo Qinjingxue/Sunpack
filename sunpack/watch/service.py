@@ -13,10 +13,10 @@ from pathlib import Path
 from sunpack.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.config.loader import ADVANCED_CONFIG_FILENAME, SIMPLE_CONFIG_FILENAME, load_config
 from sunpack.contracts.content_recovery import require_complete_content
-from sunpack.filesystem.watcher.config_observer import ConfigFileObserver
-from sunpack.filesystem.watcher.log import WatchLogStore
-from sunpack.filesystem.watcher.scheduler import WatchScheduler
-from sunpack.filesystem.watcher.toast import WatchToastCoordinator
+from sunpack.watch.config_observer import ConfigFileObserver
+from sunpack.watch.log import WatchLogStore
+from sunpack.watch.scheduler import WatchScheduler
+from sunpack.watch.toast import WatchToastCoordinator
 from sunpack.passwords.internal.local_files import DIRECTORY_PASSWORD_FILE_NAME
 from sunpack.support.path_keys import path_key
 from sunpack.support.resources import get_resource_path
@@ -388,7 +388,6 @@ class WatchService:
         engine_factory=None,
         pipeline_engine=None,
         tray_factory=None,
-        group_coordinator_factory=None,
         toast_manager_factory=None,
         config_applied_callback=None,
     ):
@@ -396,7 +395,6 @@ class WatchService:
             raise ValueError("WatchService requires an engine_factory.")
         self.engine_factory = engine_factory
         self._owns_pipeline_engine = pipeline_engine is None
-        self.group_coordinator_factory = group_coordinator_factory
         self.tray_factory = tray_factory
         self.toast_manager_factory = toast_manager_factory
         self.config_applied_callback = config_applied_callback
@@ -687,7 +685,6 @@ class WatchService:
                 initial_scan_roots=requested_scan_roots or None,
                 observer_stop_timeout_seconds=float(watch_config.get("observer_stop_timeout_seconds", 5.0)),
                 pipeline_engine=pipeline_engine,
-                group_coordinator=(self.group_coordinator_factory(run_config) if self.group_coordinator_factory else None),
                 notification_sink=toast_coordinator,
                 wake_callback=self._wake_scheduler,
             )

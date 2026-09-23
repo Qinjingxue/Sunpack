@@ -9,9 +9,7 @@ import pytest
 
 from sunpack.config.loader import load_config
 from sunpack.coordinator.engine import PipelineEngine
-from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
-from sunpack.filesystem.watcher.group_models import BLOCKER_PASSWORD
-from sunpack.filesystem.watcher.scheduler import WatchRunResult, WatchScheduler
+from sunpack.watch.scheduler import WatchRunResult, WatchScheduler
 from tests.helpers.marker_utils import marker_present
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory
 
@@ -86,15 +84,12 @@ async def _drive_watch_until(
         await asyncio.sleep(0.01)
     pytest.fail(
         "watch condition did not settle before timeout: "
-        f"pending={watcher.pending_count}, entries={watcher.state.entries}, "
-        f"groups={watcher.state.groups}"
+        f"pending={watcher.pending_count}, entries={watcher.state.entries}"
     )
 
 
 def _password_blocked(watcher: WatchScheduler) -> bool:
-    return any(entry.status == "failed_password" for entry in watcher.state.entries.values()) or any(
-        BLOCKER_PASSWORD in group.blockers for group in watcher.state.groups.values()
-    )
+    return any(entry.status == "failed_password" for entry in watcher.state.entries.values())
 
 
 def _extracted(output_root: Path, case: ArchiveCase) -> bool:
@@ -117,7 +112,6 @@ def test_watch_single_hp_rar_extracts_with_correct_password(tmp_path):
                 config, [str(watch_root)], out_dir=str(output_root),
                 state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=delegate,
-                group_coordinator=WatchGroupCoordinator(config),
             )
             destination = watch_root / case.entry_path.name
             shutil.copy2(case.entry_path, destination); watcher.enqueue(str(destination))
@@ -144,7 +138,6 @@ def test_watch_single_hp_rar_reports_wrong_password_without_hanging(tmp_path):
                 config, [str(watch_root)], out_dir=str(output_root),
                 state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=delegate,
-                group_coordinator=WatchGroupCoordinator(config),
             )
             destination = watch_root / case.entry_path.name
             shutil.copy2(case.entry_path, destination); watcher.enqueue(str(destination))
@@ -173,7 +166,6 @@ def test_watch_split_hp_rar_extracts_with_correct_password(tmp_path):
                 config, [str(watch_root)], out_dir=str(output_root),
                 state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=delegate,
-                group_coordinator=WatchGroupCoordinator(config),
             )
             for source in sorted(case.archive_dir.iterdir(), key=lambda path: path.name.lower()):
                 destination = watch_root / source.name
@@ -204,7 +196,6 @@ def test_watch_split_hp_rar_recovers_after_wrong_then_correct_password(tmp_path)
                 config, [str(watch_root)], out_dir=str(output_root),
                 state_path=str(tmp_path / "state.json"), cold_start_seconds=0,
                 initial_scan=False, pipeline_engine=delegate,
-                group_coordinator=WatchGroupCoordinator(config),
             )
             for source in sorted(case.archive_dir.iterdir(), key=lambda path: path.name.lower()):
                 destination = watch_root / source.name

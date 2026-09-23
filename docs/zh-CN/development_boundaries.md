@@ -21,7 +21,7 @@ app
   -> config
   -> coordinator
   -> passwords
-  -> filesystem.watcher
+  -> watch
 
 coordinator
   -> filesystem
@@ -90,14 +90,14 @@ contracts
 | 解压 | `extraction.scheduler.ExtractionScheduler` | 单归档输出目录、密码解析、worker 解压。 |
 | 校验 | `verification.VerificationScheduler` | 解压结果完整度、来源完整性和下一步决策。 |
 | 后处理 | `postprocess.actions.PostProcessActions` | 成功后清理和扁平化。 |
-| 文件系统监控 | `coordinator.watch_runtime.run_watch_service` / `filesystem.watcher.WatchScheduler` | CLI/GUI 共用服务入口、watchdog 事件、活跃到静默状态机和自动处理。 |
+| 文件系统监控 | `watch.runtime.run_watch_service` / `watch.WatchScheduler` | CLI/GUI 共用服务入口、watchdog 事件、活跃到静默状态机和自动处理。 |
 | Native ABI | `support.sevenzip_bridge` | C++ 7z.dll bridge 绑定和缓存。 |
 
 ## 领域边界
 
 ### app
 
-`app` 只负责 CLI 适配：参数解析、密码交互、配置覆盖、结果输出和退出码。它可以调用 coordinator、filesystem.watcher、passwords 和 config 的公开入口，不直接导入 detection/extraction 的内部实现。
+`app` 只负责 CLI 适配：参数解析、密码交互、配置覆盖、结果输出和退出码。它可以调用 coordinator、watch、passwords 和 config 的公开入口，不直接导入 detection/extraction 的内部实现。
 
 ### config
 
@@ -109,7 +109,7 @@ contracts
 
 ### filesystem
 
-`filesystem` 负责目录遍历、过滤、`DirectorySnapshot` 构建，以及 watchdog 监控能力。watcher 复用 `filesystem.scan_filters`，输入从活跃态进入静默态时交给调用方注入的主流程 runner；它不按扩展名或处理结果自行推测重试时机。Windows watch 根的 NTFS/USN 校验和 USN reason 查询由专门的 native 组件负责，watcher 只消费观察结果。
+`filesystem` 只负责 pipeline discovery 所需的显式目录遍历、过滤与 `DirectorySnapshot` 构建，不再拥有长期运行的 Watch 服务。独立的 `watch` 领域负责 OS 通知、NTFS/USN 观察、文件 ready/quiet 状态，只判断物理文件何时稳定到可以进入 `PipelineEngine`；压缩包过滤与解释仍全部留在 pipeline 内。
 
 ### relations
 
@@ -203,7 +203,7 @@ knowledge = task.knowledge()
 from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler
 ```
 
-`filesystem.watcher` 不直接构造 coordinator engine。应用组合层创建并启动进程级
+`watch` 不直接构造 coordinator engine。应用组合层创建并启动进程级
 `PipelineEngine`，再把实例注入 watcher；watcher 只提交稳定输入和消费请求结果。
 
 `PipelineEngine` 拥有跨请求常驻的扫描器、分析器、验证组件、资源调度器和
@@ -266,3 +266,7 @@ native/sunpack_usn_core/ Windows USN 核心与客户端协议
 native/sunpack_watch_broker/ Windows Watch Broker 服务
 native/sevenzip_bridge/ Windows 7z.dll bridge 与 worker
 ```
+
+### Watch / Pipeline 边界
+
+Watch 是独立输入层，只负责 OS 事件、文件稳定性、quiet window、持久状态、重试与通知。Watch 不识别压缩格式、不解析分卷、不调用 Relations/Detection/Embedded/DiscoveryScanSession；稳定文件统一通过 `PipelineEngine.run()` 进入完整 pipeline，并仅消费 `PipelineResponse.discovery` 暴露的 `claimed_paths` / `blocked_paths` 等公开事实。CLI 与 Watch 从进入 pipeline 起共享完全相同的 discovery、planning、extraction 与 verification 路径。

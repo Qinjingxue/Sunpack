@@ -4,7 +4,7 @@ from sunpack.cli.cli_constants import EXIT_TASK_FAILED, EXIT_USAGE
 from sunpack.cli.cli_parsers import CliHelpFormatter, build_common_parser, localize_help_action
 from sunpack.cli.cli_types import CliCommandResult
 from sunpack.cli.persistent_runtime import load_request_config
-from sunpack.filesystem.watcher.service import (
+from sunpack.watch.service import (
     add_watch_roots,
     list_watch_roots,
     remove_watch_roots,

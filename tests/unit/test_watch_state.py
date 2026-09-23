@@ -7,27 +7,11 @@ from types import SimpleNamespace
 
 import pytest
 
-import sunpack.filesystem.watcher.state as watch_state_module
-from sunpack.filesystem.watcher.group_models import WatchGroupState
-from sunpack.filesystem.watcher.state import (
+import sunpack.watch.state as watch_state_module
+from sunpack.watch.state import (
     WatchStateJournalError,
     WatchStateStore,
 )
-
-
-def _group_state(tmp_path, name, paths, *, head_path=None, status="done"):
-    normalized = [str(path.resolve()) for path in paths]
-    selected_head = (paths[0] if head_path is None and paths else head_path)
-    return WatchGroupState(
-        group_id=f"group-{name}",
-        directory=str(tmp_path.resolve()),
-        logical_name=name,
-        split_family="7z",
-        head_path=str(Path(selected_head).resolve()) if selected_head else "",
-        input_paths=normalized,
-        owned_paths=normalized,
-        status=status,
-    )
 
 
 def _candidate(path: Path, index: int = 1):
@@ -377,13 +361,11 @@ def test_active_work_persists_force_cause_for_restart(tmp_path):
     assert pending.force is True
 
 
-def test_prune_missing_records_removes_stale_entries_and_groups(tmp_path):
+def test_prune_missing_records_removes_stale_entries(tmp_path):
     state = WatchStateStore(str(tmp_path / "state.json"))
     present = tmp_path / "present.zip"
-    partial_present = tmp_path / "partial.7z.001"
     missing = tmp_path / "missing.zip"
     present.write_bytes(b"present")
-    partial_present.write_bytes(b"partial")
 
     state.mark(
         str(present),
@@ -399,44 +381,12 @@ def test_prune_missing_records_removes_stale_entries_and_groups(tmp_path):
         status="failed_password",
         failure_payload={"blockers": ["password"]},
     )
-    state.groups["present"] = _group_state(tmp_path, "present", [present])
-    state.groups["missing"] = _group_state(tmp_path, "missing", [missing])
-    state.groups["partial"] = _group_state(tmp_path, "partial", [partial_present, missing])
 
-    removed_entries, removed_groups = state.prune_missing_records()
+    removed_entries = state.prune_missing_records()
 
-    assert (removed_entries, removed_groups) == (1, 2)
+    assert removed_entries == 1
     assert state.latest_entry_for_path(str(present)) is not None
     assert state.latest_entry_for_path(str(missing)) is None
-    assert set(state.groups) == {"present"}
-
-
-def test_prune_missing_records_keeps_group_with_missing_expected_volume(tmp_path):
-    state = WatchStateStore(str(tmp_path / "state.json"))
-    first = tmp_path / "split.7z.001"
-    third = tmp_path / "split.7z.003"
-    first.write_bytes(b"first")
-    third.write_bytes(b"third")
-    group = _group_state(tmp_path, "split", [first, third], status="waiting")
-    group.missing_indices = [2]
-    state.groups[group.group_id] = group
-    missing_head_member = tmp_path / "head-missing.7z.002"
-    missing_head_member.write_bytes(b"member")
-    missing_head_group = _group_state(
-        tmp_path,
-        "head-missing",
-        [missing_head_member],
-        head_path="",
-        status="waiting",
-    )
-    missing_head_group.missing_indices = [1]
-    state.groups[missing_head_group.group_id] = missing_head_group
-
-    removed_entries, removed_groups = state.prune_missing_records()
-
-    assert (removed_entries, removed_groups) == (0, 0)
-    assert state.group_state(group.group_id) is not None
-    assert state.group_state(missing_head_group.group_id) is not None
 
 
 def test_prune_missing_records_retains_records_when_presence_is_unknown(tmp_path, monkeypatch):
@@ -489,19 +439,6 @@ def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
     state.watch_cursors = {
         "volume:雪": {"journal_id": 2**63 + 17, "next_usn": 2**63 + 19}
     }
-    state.groups["group-雪"] = WatchGroupState(
-        group_id="group-雪",
-        directory=str(tmp_path),
-        logical_name="archive-雪",
-        split_family="7z",
-        head_path=str(archive),
-        input_paths=[str(archive)],
-        owned_paths=[str(archive)],
-        status="suspended",
-        blockers=["missing_volume"],
-        failure_payload={"message": "缺少分卷", "indices": [2, 3]},
-        updated_at=12.0,
-    )
     state.save()
 
     payload = json.loads(state_path.read_text(encoding="utf-8"))
@@ -511,7 +448,6 @@ def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
     assert entry["last_error"] == "bad\n\"password\\雪"
     assert entry["failure_payload"]["nested"]["unicode"] == "雪☃"
     assert entry["failure_payload"]["nested"]["tuple"] == ["a", "b"]
-    assert payload["groups"]["group-雪"]["failure_payload"]["message"] == "缺少分卷"
 
     reloaded = WatchStateStore(str(state_path))
     assert reloaded.latest_entry_for_path(str(archive)).failure_payload["nested"]["escaped"] == "line1\nline2\t\\\""

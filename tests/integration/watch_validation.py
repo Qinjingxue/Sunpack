@@ -32,8 +32,8 @@ if str(_REPO_ROOT) not in sys.path:
 
 import psutil
 
-import sunpack.filesystem.watcher.scheduler as scheduler_module
-from sunpack.filesystem.watcher.scheduler import WatchScheduler
+import sunpack.watch.scheduler as scheduler_module
+from sunpack.watch.scheduler import WatchScheduler
 from sunpack.platform.windows.elevation import is_process_elevated
 
 

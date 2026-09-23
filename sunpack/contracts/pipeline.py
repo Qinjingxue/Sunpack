@@ -19,8 +19,19 @@ class PipelineArtifacts:
 
 
 @dataclass(frozen=True)
+class PipelineDiscovery:
+    """Stable public discovery facts exposed to pipeline consumers."""
+
+    entry_paths: tuple[str, ...] = ()
+    claimed_paths: tuple[str, ...] = ()
+    blocked_paths: tuple[str, ...] = ()
+    coalesced_from_request_id: str = ""
+
+
+@dataclass(frozen=True)
 class PipelineResponse:
     request_id: str
     summary: RunSummary
     artifacts: PipelineArtifacts = field(default_factory=PipelineArtifacts)
+    discovery: PipelineDiscovery = field(default_factory=PipelineDiscovery)
     recent_passwords: tuple[str, ...] = ()

@@ -7,10 +7,10 @@ from types import SimpleNamespace
 
 import pytest
 
-import sunpack.filesystem.watcher.service as service_module
-import sunpack.coordinator.watch_runtime as watch_runtime
+import sunpack.watch.service as service_module
+import sunpack.watch.runtime as watch_runtime
 import sunpack.cli.commands.watch as watch_command
-from sunpack.filesystem.watcher.service import (
+from sunpack.watch.service import (
     CONTROL_SCHEDULER_WAKEUP,
     CONTROL_STOP,
     WatchService,

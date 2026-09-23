@@ -23,8 +23,7 @@ from benchmarks.watch_broker import watch_broker_lease
 from benchmarks.scenarios.extraction_large_archive import RequestRuntimeProfiler, _timing_totals
 from sunpack.config.loader import load_config
 from sunpack.coordinator.engine import PipelineEngine
-from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
-from sunpack.filesystem.watcher.scheduler import WatchScheduler
+from sunpack.watch.scheduler import WatchScheduler
 
 
 TESTFILES_ROOT = Path(__file__).resolve().parents[2] / "testfiles"
@@ -374,7 +373,6 @@ async def _run_case(
             cold_start_seconds=cold_start_seconds,
             initial_scan=False,
             pipeline_engine=engine,
-            group_coordinator=WatchGroupCoordinator(config),
         )
         _install_instrumentation(watcher, source_names, timings, attempts)
         await watcher.start()
