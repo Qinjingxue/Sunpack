@@ -35,14 +35,15 @@ class RelationResolver:
                 and candidate.archive_input is not None
             ):
                 reason = "Relations confirmed native archive identity"
-                result.add_resolved(ResolvedArchiveInput.from_candidate(
+                resolved = ResolvedArchiveInput.from_candidate(
                     candidate,
                     "relations",
                     dict(anchor),
                     archive_input=candidate.archive_input,
                     confidence=1.0 if str(anchor.get("confidence") or "") == "strong" else 0.8,
                     reasons=(reason,),
-                ))
+                )
+                result.add_resolved(resolved)
                 decisions.append(DetectionResult(
                     candidate,
                     RuleDecision(
@@ -54,6 +55,7 @@ class RelationResolver:
                         deciding_rule="relations",
                     ),
                     archive_format,
+                    resolved,
                 ))
             else:
                 result.residual_paths.update(paths)
