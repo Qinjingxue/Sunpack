@@ -767,6 +767,25 @@ Z7_COM7F_IMF(CHandler::Extract(const UInt32 *indices, UInt32 numItems,
         allowPositioned =
             folderInfo.UnpackCoder < folderInfo.Coders.Size() &&
             folderInfo.Coders[folderInfo.UnpackCoder].MethodID == k_LZMA2;
+
+        /*
+          Direct run output is valid only when LZMA2 is the final coder in the
+          folder graph. Filters such as Delta/BCJ/BCJ2 remain on the original
+          CoderMixer path, because their continuous state spans LZMA2 reset
+          boundaries. Also keep anti-item handling on the legacy path so the
+          established callback semantics are unchanged.
+        */
+        if (allowPositioned)
+        {
+          for (UInt32 p = 0; p < numSolidFiles; ++p)
+          {
+            if (_db.IsItemAnti(fileIndex + p))
+            {
+              allowPositioned = false;
+              break;
+            }
+          }
+        }
       }
 
       const HRESULT result = folderOutStream->Init(
