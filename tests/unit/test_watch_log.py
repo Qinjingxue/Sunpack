@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 
-from sunpack.filesystem.watcher.log import (
+from sunpack.watch.log import (
     DEFAULT_EVENTS_MAX_BYTES,
     WatchLogStore,
 )

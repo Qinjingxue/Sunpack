@@ -8,9 +8,8 @@ from typing import Callable
 
 from sunpack.cli.persistent_runtime import shared_pipeline_engine
 from sunpack.config.loader import load_config
-from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
 from sunpack.coordinator.archive_registry import ActiveArchiveRegistry
-from sunpack.filesystem.watcher.service import WatchService
+from sunpack.watch.service import WatchService
 
 
 _LOG = logging.getLogger(__name__)
@@ -45,7 +44,7 @@ class RuntimeHost:
         self.archive_registry = ActiveArchiveRegistry()
         self._event_log = None
         if log_path:
-            from sunpack.filesystem.watcher.log import WatchLogStore
+            from sunpack.watch.log import WatchLogStore
 
             self._event_log = WatchLogStore(log_path)
         self.log_event("host_started", host_pid=os.getpid())
@@ -102,7 +101,6 @@ class RuntimeHost:
             service = WatchService(
                 pipeline_engine=engine,
                 tray_factory=tray_factory,
-                group_coordinator_factory=WatchGroupCoordinator,
                 toast_manager_factory=toast_manager_factory,
                 config_applied_callback=self._watch_config_applied,
             )
@@ -156,7 +154,6 @@ class RuntimeHost:
         engine = await shared_pipeline_engine(config)
         service = WatchService(
             pipeline_engine=engine,
-            group_coordinator_factory=WatchGroupCoordinator,
         )
         return await service.run(once=True, initial_scan=bool(initial_scan))
 

@@ -7,7 +7,7 @@ from ctypes import wintypes
 from pathlib import Path
 
 from sunpack.config.payload_io import read_config_payload
-from sunpack.filesystem.watcher.service import watch_roots_path
+from sunpack.watch.service import watch_roots_path
 from sunpack.i18n import I18nContext
 from sunpack.passwords.internal.builtin import builtin_password_path, get_builtin_passwords
 from sunpack.platform.windows.startup import disable_startup, enable_startup, startup_status

@@ -53,8 +53,7 @@ from benchmarks.scenarios.extraction_format_matrix import (
 from benchmarks.scenarios.extraction_large_archive import RequestRuntimeProfiler, _timing_totals
 from sunpack.config.loader import load_config
 from sunpack.coordinator.engine import PipelineEngine
-from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
-from sunpack.filesystem.watcher.scheduler import WatchScheduler
+from sunpack.watch.scheduler import WatchScheduler
 
 
 SCENARIO = "watch.format-matrix"
@@ -448,7 +447,6 @@ async def _run_case(
             cold_start_seconds=cold_start_seconds,
             initial_scan=False,
             pipeline_engine=engine,
-            group_coordinator=WatchGroupCoordinator(config),
         )
         _install_watch_instrumentation(watcher, fed_keys, timings, attempts)
         await watcher.start()

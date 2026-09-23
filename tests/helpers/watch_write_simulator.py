@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sunpack.filesystem.watcher.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
+from sunpack.watch.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
 
 
 @dataclass(frozen=True)

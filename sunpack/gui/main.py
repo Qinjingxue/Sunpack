@@ -6,7 +6,7 @@ import sys
 import traceback
 from datetime import datetime, timezone
 
-from sunpack.filesystem.watcher.log import append_jsonl_record
+from sunpack.watch.log import append_jsonl_record
 from sunpack.support.resources import get_resource_path
 from sunpack.support.runtime_cwd import runtime_working_directory
 

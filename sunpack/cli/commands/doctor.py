@@ -8,7 +8,7 @@ from sunpack.cli.cli_parsers import CliHelpFormatter, build_config_output_parser
 from sunpack.cli.cli_types import CliCommandResult
 from sunpack.cli.persistent_runtime import load_request_config_payload
 from sunpack.config.config_validator import validate_config_payload
-from sunpack.filesystem.watcher.service import list_watch_roots
+from sunpack.watch.service import list_watch_roots
 from sunpack.support.process_executable import current_process_executable, is_packaged_process
 from sunpack.support.resources import get_sevenzip_bridge_worker_path, program_data_dir
 

@@ -1,12 +1,12 @@
 import asyncio
 import os
 
-import sunpack.filesystem.watcher.scheduler as scheduler_module
+import sunpack.watch.scheduler as scheduler_module
 from sunpack.contracts.failures import FailureInfo, FailureKind
 from sunpack.contracts.pipeline import PipelineArtifacts, PipelineResponse
 from sunpack.contracts.results import OutcomeKind, RunSummary, TargetRunResult
-from sunpack.filesystem.watcher.scanner import WatchCandidate
-from sunpack.filesystem.watcher.scheduler import WatchScheduler, _ActivePipelineRequest
+from sunpack.watch.scanner import WatchCandidate
+from sunpack.watch.scheduler import WatchScheduler, _ActivePipelineRequest
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 

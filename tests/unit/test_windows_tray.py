@@ -5,7 +5,7 @@ import sys
 import textwrap
 from types import SimpleNamespace
 
-import sunpack.filesystem.watcher.service as service_module
+import sunpack.watch.service as service_module
 import sunpack.gui.tray as tray_module
 from sunpack.gui.tray import WindowsTrayIcon, _tray_language_from_service
 

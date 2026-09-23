@@ -21,7 +21,7 @@ app
   -> config
   -> coordinator
   -> passwords
-  -> filesystem.watcher
+  -> watch
 
 coordinator
   -> filesystem
@@ -89,13 +89,13 @@ contracts
 | Extraction | `extraction.scheduler.ExtractionScheduler` | Per-archive output directory, password resolution, worker extraction. |
 | Verification | `verification.VerificationScheduler` | Extraction result completeness, source integrity, and the next-step decision. |
 | Post-processing | `postprocess.actions.PostProcessActions` | Cleanup and flattening after success. |
-| Filesystem monitoring | `coordinator.watch_runtime.run_watch_service` / `filesystem.watcher.WatchScheduler` | Shared CLI/GUI service entry point, watchdog events, the active-to-quiet state machine, and automatic processing. |
+| Filesystem monitoring | `watch.runtime.run_watch_service` / `watch.WatchScheduler` | Shared CLI/GUI service entry point, watchdog events, the active-to-quiet state machine, and automatic processing. |
 
 ## Domain boundaries
 
 ### app
 
-`app` is responsible only for CLI adaptation: argument parsing, password interaction, configuration overrides, result output, and exit codes. It may call the public entry points of coordinator, filesystem.watcher, passwords, and config, and must not import detection/extraction internals directly.
+`app` is responsible only for CLI adaptation: argument parsing, password interaction, configuration overrides, result output, and exit codes. It may call the public entry points of coordinator, watch, passwords, and config, and must not import detection/extraction internals directly.
 
 ### config
 
@@ -107,7 +107,7 @@ contracts
 
 ### filesystem
 
-`filesystem` handles directory traversal, filtering, `DirectorySnapshot` construction, and watchdog monitoring capability. The watcher reuses `filesystem.scan_filters` and hands input to the main-pipeline runner injected by the caller once it moves from active to quiet; it does not guess retry timing from extensions or processing results on its own. NTFS/USN validation of Windows watch roots and USN reason queries are handled by dedicated native components, and the watcher only consumes observation results.
+`filesystem` owns explicit directory traversal, filtering, and `DirectorySnapshot` construction for pipeline discovery. It does not own the long-running Watch service. The standalone `watch` domain owns OS notifications, NTFS/USN observations, readiness/quiet-state tracking, and decides only when a physical file is stable enough to enter `PipelineEngine`; archive filtering and interpretation remain inside the pipeline.
 
 ### relations
 
@@ -201,7 +201,7 @@ Do not read private task state. Use `ArchiveTask.knowledge()` / typed contracts,
 from sunpack.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler
 ```
 
-`filesystem.watcher` does not construct the coordinator engine directly. The application composition layer creates and starts the process-level
+`watch` does not construct the coordinator engine directly. The application composition layer creates and starts the process-level
 `PipelineEngine`, then injects the instance into the watcher; the watcher only submits stable inputs and consumes request results.
 
 `PipelineEngine` owns the scanner, analyzer, verification components, resource scheduler, and
@@ -263,3 +263,7 @@ native/sunpack_usn_core/ Windows USN core and client protocol
 native/sunpack_watch_broker/ Windows Watch Broker service
 native/sevenzip_bridge/ Windows embedded 7-Zip worker
 ```
+
+### Watch / Pipeline boundary
+
+Watch is an independent input layer responsible only for OS events, file readiness, quiet windows, durable state, retries, and notifications. It does not identify archive formats, resolve split families, or call Relations/Detection/Embedded/DiscoveryScanSession. Stable files enter the complete pipeline through `PipelineEngine.run()`, and Watch consumes only public `PipelineResponse.discovery` facts such as `claimed_paths` and `blocked_paths`. CLI and Watch therefore share the same discovery, planning, extraction, and verification path once a target enters the pipeline.

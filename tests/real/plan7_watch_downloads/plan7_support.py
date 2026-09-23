@@ -15,8 +15,7 @@ from typing import Any, Callable
 import pytest
 
 from sunpack.coordinator.engine import PipelineEngine
-from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
-from sunpack.filesystem.watcher.scheduler import WatchRunResult, WatchScheduler
+from sunpack.watch.scheduler import WatchRunResult, WatchScheduler
 from tests.helpers.watch_memory import WatchMemorySampler as MemorySampler
 from tests.helpers.marker_utils import marker_scan_state
 from tests.helpers.real_archives import (
@@ -520,7 +519,6 @@ def start_watch(
             cold_start_seconds=cold_start_seconds,
             initial_scan=initial_scan,
             pipeline_engine=engine,
-            group_coordinator=WatchGroupCoordinator(config),
             notification_sink=notification_sink,
         )
     async_run_once = watcher.run_once
@@ -783,8 +781,7 @@ def drive_watch_until(
         time.sleep(0.01)
     pytest.fail(
         "watch condition did not settle before timeout: "
-        f"pending={watcher.pending_count}, entries={watcher.state.entries}, "
-        f"groups={watcher.state.groups}"
+        f"pending={watcher.pending_count}, entries={watcher.state.entries}"
     )
 
 

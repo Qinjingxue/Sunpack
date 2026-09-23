@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from sunpack.cli.runtime_host import RuntimeHost
 from sunpack.contracts.archive_knowledge import ArchiveKnowledge
-from sunpack.filesystem.watcher.scheduler import WatchScheduler
+from sunpack.watch.scheduler import WatchScheduler
 from sunpack.passwords.relation_prober import _shared_attempt_cache, clear_relation_probe_cache
 from sunpack.support.archive_knowledge_projection import (
     clear_projection_cache,

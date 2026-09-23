@@ -10,8 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from benchmarks.harness import BenchmarkWorkspace, render_report, report_from_payload
-from sunpack.filesystem.watcher.group_models import WatchGroupState
-from sunpack.filesystem.watcher.state import (
+from sunpack.watch.state import (
     WatchPendingWork,
     WatchStateEntry,
     WatchStateStore,
@@ -39,9 +38,8 @@ def _summary(samples: list[float]) -> dict[str, float]:
 
 
 def _seed_state(state: WatchStateStore, total_records: int) -> None:
-    pending_count = total_records // 3
-    entry_count = total_records // 3
-    group_count = total_records - pending_count - entry_count
+    pending_count = total_records // 2
+    entry_count = total_records - pending_count
     state.pending_work = {
         f"pending-{index}": WatchPendingWork(
             path=f"C:\\downloads\\pending-{index}.7z",
@@ -73,32 +71,6 @@ def _seed_state(state: WatchStateStore, total_records: int) -> None:
             password_generation=2,
         )
         for index in range(entry_count)
-    }
-    state.groups = {
-        f"group-{index}": WatchGroupState(
-            group_id=f"group-{index}",
-            directory="C:\\downloads",
-            logical_name=f"archive-{index}",
-            split_family="7z",
-            head_path=f"C:\\downloads\\archive-{index}.7z.001",
-            input_paths=[f"C:\\downloads\\archive-{index}.7z.001"],
-            owned_paths=[f"C:\\downloads\\archive-{index}.7z.001"],
-            status="suspended",
-            blockers=["missing_volume"],
-            input_fingerprint=f"input-{index}",
-            ownership_fingerprint=f"owner-{index}",
-            last_attempted_input_fingerprint=f"input-{index}",
-            password_generation=2,
-            failure_payload={
-                "kind": "missing_volume",
-                "stage": "relation",
-                "missing_reason": "middle_gap",
-                "missing_indices": [2],
-            },
-            attempt_count=1,
-            updated_at=1720000200.0 + index,
-        )
-        for index in range(group_count)
     }
     state.save()
 

@@ -39,3 +39,90 @@ def test_replacing_path_lease_notifies_waiters_for_released_paths(tmp_path):
         }
 
     asyncio.run(scenario())
+
+
+def test_resolved_family_replace_cannot_deadlock_on_partial_owners(tmp_path):
+    async def scenario() -> None:
+        registry = _PathLeaseRegistry()
+        first_part = tmp_path / "archive.7z.001"
+        second_part = tmp_path / "archive.7z.002"
+        family = (first_part, second_part)
+
+        # Model the old Watch behaviour: each request owns one member before
+        # discovery expands both requests to the same physical family.
+        await registry.acquire("first", (first_part,))
+        await registry.acquire("second", (second_part,))
+
+        first = asyncio.create_task(registry.replace("first", family))
+        second = asyncio.create_task(registry.replace("second", family))
+        await asyncio.sleep(0)
+
+        done = [task for task in (first, second) if task.done()]
+        assert len(done) == 1
+
+        winner = "first" if first.done() else "second"
+        loser = second if first.done() else first
+        await registry.release(winner)
+        await asyncio.wait_for(loser, timeout=0.1)
+
+        assert registry._owned in (
+            {"first": {str(first_part), str(second_part)}},
+            {"second": {str(first_part), str(second_part)}},
+        )
+
+    asyncio.run(scenario())
+
+
+def test_watch_can_coalesce_exact_resolved_family_without_waiting(tmp_path):
+    async def scenario() -> None:
+        registry = _PathLeaseRegistry()
+        first_part = tmp_path / "archive.7z.001"
+        second_part = tmp_path / "archive.7z.002"
+        family = (first_part, second_part)
+        first_part.write_bytes(b"first")
+        second_part.write_bytes(b"second")
+
+        assert await registry.replace("first", family, coalesce_exact=True) is None
+        owner = await asyncio.wait_for(
+            registry.replace("second", family, coalesce_exact=True),
+            timeout=0.1,
+        )
+
+        assert owner == "first"
+        assert registry._owned == {
+            "first": {str(first_part), str(second_part)},
+        }
+
+    asyncio.run(scenario())
+
+
+
+def test_watch_does_not_coalesce_newer_resolved_family_version(tmp_path):
+    async def scenario() -> None:
+        registry = _PathLeaseRegistry()
+        first_part = tmp_path / "archive.7z.001"
+        second_part = tmp_path / "archive.7z.002"
+        family = (first_part, second_part)
+        first_part.write_bytes(b"first")
+        second_part.write_bytes(b"second")
+
+        assert await registry.replace("first", family, coalesce_exact=True) is None
+
+        # Same physical family, newer bytes. The later Watch request must not
+        # inherit the result produced for the previous version.
+        second_part.write_bytes(b"second-new-version")
+        waiting = asyncio.create_task(
+            registry.replace("second", family, coalesce_exact=True)
+        )
+        await asyncio.sleep(0)
+        assert not waiting.done()
+
+        await registry.release("first")
+        owner = await asyncio.wait_for(waiting, timeout=0.1)
+
+        assert owner is None
+        assert registry._owned == {
+            "second": {str(first_part), str(second_part)},
+        }
+
+    asyncio.run(scenario())

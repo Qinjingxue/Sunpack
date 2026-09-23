@@ -4,7 +4,7 @@ import asyncio
 
 from watchdog.events import FileCreatedEvent, FileDeletedEvent, FileModifiedEvent, FileMovedEvent
 
-from sunpack.filesystem.watcher.config_observer import ConfigFileObserver
+from sunpack.watch.config_observer import ConfigFileObserver
 
 
 class FakeObserver:

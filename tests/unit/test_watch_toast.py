@@ -7,7 +7,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from sunpack.filesystem.watcher.toast import WatchToastCoordinator
+from sunpack.watch.toast import WatchToastCoordinator
 from sunpack.platform.windows.toast_protocol import (
     ToastActionKind,
     ToastProgressMode,

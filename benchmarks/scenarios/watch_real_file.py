@@ -25,8 +25,7 @@ from benchmarks.scenarios.extraction_large_archive import (
 )
 from sunpack.config.loader import load_config
 from sunpack.coordinator.engine import PipelineEngine
-from sunpack.coordinator.watch_group_coordinator import WatchGroupCoordinator
-from sunpack.filesystem.watcher.scheduler import WatchScheduler
+from sunpack.watch.scheduler import WatchScheduler
 
 
 DEFAULT_SOURCE = Path(__file__).resolve().parents[2] / "testfiles" / "sample.jpg"
@@ -132,7 +131,6 @@ async def _run_once(
             cold_start_seconds=cold_start_seconds,
             initial_scan=False,
             pipeline_engine=engine,
-            group_coordinator=WatchGroupCoordinator(config),
         )
         _wrap_scheduler_timers(watcher, destination, timings)
         await watcher.start()

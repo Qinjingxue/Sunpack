@@ -10,10 +10,10 @@ from sunpack_native import zip_fast_verify_passwords
 
 import sunpack.passwords.internal.builtin as builtin_module
 import sunpack.passwords.internal.clipboard_monitor as clipboard_monitor_module
-import sunpack.filesystem.watcher.scheduler as scheduler_module
+import sunpack.watch.scheduler as scheduler_module
 from sunpack.config.loader import load_config
 from sunpack.coordinator.engine import PipelineEngine
-from sunpack.filesystem.watcher.scheduler import WatchScheduler
+from sunpack.watch.scheduler import WatchScheduler
 from tests.helpers.tool_config import get_test_tools
 
 

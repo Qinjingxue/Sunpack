@@ -5,7 +5,7 @@ import zipfile
 from pathlib import Path
 
 from sunpack.contracts.failures import FailureKind
-from sunpack.filesystem.watcher.toast import WatchToastCoordinator
+from sunpack.watch.toast import WatchToastCoordinator
 from sunpack.platform.windows.toast_protocol import ToastSnapshotKind
 from tests.helpers.real_archives import (
     ArchiveFixtureFactory,
@@ -228,7 +228,6 @@ def test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked(
             "case": "nested_outer_plain_inner_missing_volume_watch",
             "result": result.__dict__,
             "state_entries": list(harness.watcher.state.entries),
-            "state_groups": list(harness.watcher.state.groups),
             "failed_terminal_logged": '"event":"failed_terminal"' in events,
             "suspended_missing_volume_logged": '"event":"suspended_missing_volume"' in events,
             "missing_volume_reported": missing_volume_reported,
@@ -237,7 +236,6 @@ def test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked(
         })
         assert missing_volume_reported or ignored_at_scan
         assert not harness.watcher.state.entries
-        assert not harness.watcher.state.groups
         assert '"event":"suspended_missing_volume"' not in events
         assert terminal is not None
         if missing_volume_reported:
