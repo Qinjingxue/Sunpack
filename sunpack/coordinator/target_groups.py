@@ -87,6 +87,12 @@ def relation_group_to_fact_bag(group: CandidateGroup) -> FactBag:
                     ArchiveInputRange(
                         path=group.entry_path,
                         start=structure_offset,
+                        end=(
+                            int(metadata["expected_logical_size"])
+                            if isinstance(metadata.get("expected_logical_size"), int)
+                            and int(metadata["expected_logical_size"]) > structure_offset
+                            else None
+                        ),
                     )
                 ],
             )
