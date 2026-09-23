@@ -1825,8 +1825,9 @@ private:
                     const auto snapshot = memory_guard_.snapshot();
                     cpu_budget_.set_effective_capacity(
                         snapshot.effective_cpu_budget);
-                    // Capacity increases wake an admission waiter only when a
-                    // queued base job exists; capacity reductions need none.
+                    // NativeCpuBudget emits at most one admission wake when
+                    // an effective-capacity increase changes the budget from
+                    // saturated to available; reductions need no wakeup.
                     print_memory_guard_event(snapshot);
                 }
             }
