@@ -1,43 +1,50 @@
 """Resolve RAR, 7z and ZIP physical families into logical inputs."""
 
-from sunpack.contracts.discovery import ResolvedArchiveInput, StageResult, candidate_paths
-from sunpack.contracts.detection import FactBag
-from sunpack.contracts.rules import RuleDecision
-from sunpack.detection.scheduler import DetectionResult
+from sunpack.contracts.discovery import (
+    DiscoveryCandidate,
+    ResolvedArchiveInput,
+    StageResult,
+)
 
 
-_FORMATS = {"rar": ".rar", "7z": ".7z", "zip": ".zip"}
+_FORMATS = {"rar", "7z", "zip"}
 
 
 class RelationResolver:
-    def resolve(self, bags: list[FactBag]) -> tuple[StageResult, list[DetectionResult]]:
+    def resolve(self, candidates: list[DiscoveryCandidate]) -> StageResult:
         result = StageResult()
-        decisions = []
-        for bag in bags:
-            anchor = bag.get("relation.volume_anchor") or {}
-            archive_format = str(anchor.get("format") or "").lower().lstrip(".")
-            paths = candidate_paths(bag)
+        for candidate in candidates:
+            anchor = candidate.relation_anchor
+            archive_format = str(anchor.get("format") or candidate.format_hint or "").lower().lstrip(".")
             if not anchor.get("relation_confirmed") and (
                 anchor.get("needs_password") or anchor.get("multivolume")
             ):
-                result.blocked_paths.update(paths)
+                result.add_blocked(
+                    candidate,
+                    source="relations",
+                    reason="Relations requires password or additional volume evidence",
+                )
                 continue
-            if anchor.get("relation_confirmed") and archive_format in _FORMATS:
-                offset = int(anchor.get("structure_offset") or 0)
-                bag.set("file.detected_ext", _FORMATS[archive_format])
-                bag.set("file.probe_detected_archive", True)
-                bag.set("file.probe_offset", offset)
-                bag.set("file.magic_matched", offset == 0)
-                bag.set("file.embedded_archive_found", offset > 0)
-                if anchor.get("sfx") and anchor.get("pe_structure"):
-                    bag.set("file.container_type", "pe")
-                result.add_resolved(ResolvedArchiveInput.from_bag(bag, "relations", dict(anchor)))
-                decisions.append(DetectionResult(bag, RuleDecision(
-                    should_extract=True, matched_rules=["relations"],
-                    decision="archive", stop_reason="Relations confirmed native archive identity",
-                )))
-            else:
-                result.residual_paths.update(paths)
+
+            if (
+                anchor.get("relation_confirmed")
+                and archive_format in _FORMATS
+                and candidate.archive_input is not None
+            ):
+                result.add_resolved(
+                    ResolvedArchiveInput(
+                        archive_input=candidate.archive_input,
+                        source="relations",
+                        carrier_path=candidate.carrier_path,
+                        cleanup_paths=candidate.cleanup_paths,
+                        evidence=dict(anchor),
+                    ),
+                    reason="Relations confirmed native archive identity",
+                )
+                continue
+
+            result.add_residual(candidate, source="relations")
+
         result.residual_paths.difference_update(result.claimed_paths | result.blocked_paths)
         result.validate()
-        return result, decisions
+        return result

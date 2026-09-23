@@ -3,7 +3,6 @@ from sunpack.analysis.probes.tar import DEFAULT_DETECTION_ENTRIES_TO_WALK
 
 
 FORMAT = "tar"
-EXTENSION = ".tar"
 
 
 def confirm(path: str, analyzer) -> bool:

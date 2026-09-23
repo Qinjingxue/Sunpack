@@ -21,7 +21,6 @@ _HIT_FORMATS = {
 @dataclass(frozen=True, slots=True)
 class EmbeddedCandidate:
     format: str
-    detected_ext: str
     offset: int
     end_offset: int | None
     confidence: float
@@ -35,7 +34,6 @@ class EmbeddedCandidate:
     def to_dict(self) -> dict[str, Any]:
         return {
             "format": self.format,
-            "detected_ext": self.detected_ext,
             "offset": self.offset,
             "end_offset": self.end_offset,
             "confidence": self.confidence,

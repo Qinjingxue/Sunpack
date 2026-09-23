@@ -19,7 +19,7 @@ from sunpack.coordinator.recursive_authorization import RecursiveAuthorization
 from sunpack.coordinator.recursion import RecursionController
 from sunpack.coordinator.reporting import RunReporter
 from sunpack.coordinator.task_scan import ArchiveTaskScanner
-from sunpack.coordinator.target_groups import relation_group_to_fact_bag
+from sunpack.coordinator.target_groups import relation_group_to_candidate
 from sunpack.extraction.scheduler import ExtractionScheduler
 from sunpack.i18n import I18nContext
 from sunpack.postprocess.actions import PostProcessActions
@@ -643,23 +643,21 @@ class _RequestRuntime:
 
     def _resolve_missing_volume_once(self, task, _outcome):
         current_paths = list(task.all_parts or [task.main_path])
-        try:
-            format_hint = task.archive_input().format_hint
-        except (TypeError, ValueError, AttributeError):
-            format_hint = str(task.detected_ext or "").lstrip(".")
+        format_hint = task.archive_input().format_hint
         group = self.task_scanner.provider.resolve_volume_once_in_directory(
             current_paths,
             format_hint=format_hint,
         )
         if group is None:
             return None
-        bag = relation_group_to_fact_bag(group)
-        bag.set("relation.volume_retry_attempted", True)
-        bag.set(
-            "relation.volume_retry_basis",
-            ["confirmed_structure", "anchor_constrained_filename"],
-        )
-        replacement = self.task_scanner.provider.task_from_candidate_bag(bag)
+        candidate = relation_group_to_candidate(group)
+        replacement = self.task_scanner.provider.task_from_candidate(candidate)
+        if replacement is not None:
+            replacement.runtime["volume_retry_attempted"] = True
+            replacement.runtime["volume_retry_basis"] = [
+                "confirmed_structure",
+                "anchor_constrained_filename",
+            ]
         if replacement is None:
             return None
         planned = self.input_planning_stage.plan_task_to_tasks(replacement)

@@ -1,6 +1,8 @@
-from contextlib import nullcontext
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Any, Optional, List
+from typing import Any
+
 from sunpack.contracts.archive_input import (
     ArchiveDescriptor,
     ArchiveFormatState,
@@ -8,12 +10,12 @@ from sunpack.contracts.archive_input import (
     ArchiveIntegrityState,
     ArchiveRelationState,
 )
-from sunpack.contracts.archive_knowledge import ArchiveKnowledge, merge_knowledge
+from sunpack.contracts.archive_knowledge import ArchiveKnowledge
 from sunpack.contracts.archive_state import ArchiveState
-from sunpack.contracts.detection import FactBag
+from sunpack.contracts.discovery import ResolvedArchiveInput, ResolvedArchiveSegment
 from sunpack.support import archive_knowledge_projection as knowledge_view
-from sunpack.support.path_keys import normalized_path, path_key
 from sunpack.support.collections import dedupe_values
+from sunpack.support.path_keys import normalized_path, path_key
 
 
 @dataclass
@@ -26,224 +28,158 @@ class SplitArchiveInfo:
 
 @dataclass
 class ArchiveTask:
-    fact_bag: FactBag
-    key: str = ""
-    main_path: str = ""
-    all_parts: Optional[List[str]] = None
+    _archive_input: ArchiveInputDescriptor
     carrier_path: str = ""
-    cleanup_parts: Optional[List[str]] = None
+    cleanup_parts: list[str] = field(default_factory=list)
+    key: str = ""
     logical_name: str = ""
     split_info: SplitArchiveInfo = field(default_factory=SplitArchiveInfo)
-    decision: str = "archive"
-    stop_reason: str = ""
-    matched_rules: List[str] = field(default_factory=list)
-    detected_ext: str = ""
+    discovery_source: str = ""
+    discovery_evidence: dict[str, Any] = field(default_factory=dict)
+    discovery_segments: tuple[ResolvedArchiveSegment, ...] = ()
+    relation_kind: str = "file"
+    discovery_reason: str = ""
+    runtime: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self):
-        self._archive_knowledge_cache_raw = None
-        self._archive_knowledge_cache = None
-        self._archive_state_cache_raw = None
-        self._archive_state_cache_knowledge_raw = None
-        self._archive_state_cache = None
-        self.all_parts = list(self.all_parts or [])
-        if not self.main_path:
-            raise ValueError("ArchiveTask.main_path is required")
-        self.carrier_path = str(
-            self.carrier_path
-            or self.fact_bag.get("candidate.carrier_path")
-            or self.fact_bag.get("file.path")
-            or self.main_path
+    def __post_init__(self) -> None:
+        descriptor = self._archive_input
+        if not descriptor.entry_path:
+            raise ValueError("ArchiveTask requires an archive input entry path")
+        self.logical_name = str(
+            self.logical_name
+            or descriptor.logical_name
+            or descriptor.entry_path
         )
-        if self.cleanup_parts is None:
-            self.cleanup_parts = list(self.fact_bag.get("candidate.cleanup_paths") or [])
+        self.carrier_path = str(self.carrier_path or descriptor.entry_path)
         self.cleanup_parts = list(dedupe_values([
-            *self.all_parts,
+            *descriptor.part_paths(),
             *self.cleanup_parts,
             self.carrier_path,
         ]))
         if not self.key:
-            self.key = self.logical_name or self.main_path
-        if self.split_info is None:
-            self.split_info = SplitArchiveInfo()
-        if self.split_info.archive_input is not None:
-            self.all_parts = self.split_info.archive_input.part_paths()
-            self.main_path = self.split_info.archive_input.entry_path
-            self.cleanup_parts = list(dedupe_values([
-                *self.all_parts,
-                *(self.cleanup_parts or []),
-                self.carrier_path,
-            ]))
-            self.split_info.is_split = self.split_info.archive_input.open_mode in {"native_volumes", "sfx_with_volumes"}
-        if not isinstance(self.fact_bag.get("archive.knowledge"), dict):
-            self._write_detection_boundary_knowledge()
+            self.key = (
+                self.logical_name
+                if descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
+                else descriptor.entry_path
+            )
+        self.split_info = SplitArchiveInfo(
+            is_split=descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
+            is_sfx_stub=bool(
+                descriptor.open_mode == "sfx_with_volumes"
+                or self.split_info.is_sfx_stub
+            ),
+            archive_input=descriptor,
+            source=self.split_info.source or self.discovery_source,
+        )
+        self._knowledge = ArchiveKnowledge()
+        self._state = ArchiveState.from_archive_input(descriptor)
+        self._initialize_knowledge()
 
     @classmethod
-    def from_fact_bag(cls, fact_bag: FactBag, decision=None) -> "ArchiveTask":
-        main_path = fact_bag.get("candidate.entry_path") or ""
-        all_parts = list(fact_bag.get("candidate.member_paths") or [])
-        carrier_path = str(fact_bag.get("candidate.carrier_path") or fact_bag.get("file.path") or main_path)
-        cleanup_parts = list(fact_bag.get("candidate.cleanup_paths") or [])
-        cleanup_parts = list(dedupe_values([*all_parts, *cleanup_parts, carrier_path]))
-        logical_name = fact_bag.get("candidate.logical_name") or ""
-        is_split = bool(
-            fact_bag.get("relation.is_split_related")
-            or fact_bag.get("candidate.kind") == "split_archive"
-            or len(all_parts) > 1
+    def from_archive_input(
+        cls,
+        descriptor: ArchiveInputDescriptor,
+        *,
+        discovery_source: str,
+        carrier_path: str = "",
+        cleanup_paths: list[str] | tuple[str, ...] = (),
+        discovery_evidence: dict[str, Any] | None = None,
+        discovery_segments: tuple[ResolvedArchiveSegment, ...] = (),
+        relation_kind: str = "file",
+        discovery_reason: str = "",
+    ) -> "ArchiveTask":
+        return cls(
+            _archive_input=descriptor,
+            carrier_path=carrier_path or descriptor.entry_path,
+            cleanup_parts=list(cleanup_paths),
+            logical_name=descriptor.logical_name,
+            split_info=SplitArchiveInfo(
+                is_split=descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
+                is_sfx_stub=descriptor.open_mode == "sfx_with_volumes",
+                archive_input=descriptor,
+                source=discovery_source,
+            ),
+            discovery_source=discovery_source,
+            discovery_evidence=dict(discovery_evidence or {}),
+            discovery_segments=tuple(discovery_segments),
+            relation_kind=relation_kind,
+            discovery_reason=discovery_reason,
         )
-        key = logical_name if is_split else main_path
-        is_sfx_stub = bool(
-            fact_bag.get("relation.has_split_companions")
-            or fact_bag.get("relation.is_split_exe_companion")
-            or fact_bag.get("relation.is_disguised_split_exe_companion")
-            or fact_bag.get("candidate.companion_paths")
+
+    @classmethod
+    def from_resolved(
+        cls,
+        resolved: ResolvedArchiveInput,
+        *,
+        discovery_reason: str = "",
+    ) -> "ArchiveTask":
+        relation_kind = (
+            "split_archive"
+            if resolved.archive_input.open_mode in {"native_volumes", "sfx_with_volumes"}
+            else "file"
         )
-        state = ArchiveState.from_any(
-            fact_bag.get("archive.state"),
-            archive_path=main_path,
-            part_paths=all_parts,
-            logical_name=logical_name,
+        return cls.from_archive_input(
+            resolved.archive_input,
+            discovery_source=resolved.source,
+            carrier_path=resolved.carrier_path,
+            cleanup_paths=resolved.cleanup_paths,
+            discovery_evidence=resolved.evidence,
+            discovery_segments=resolved.segments,
+            relation_kind=relation_kind,
+            discovery_reason=discovery_reason,
         )
-        archive_input = state.to_archive_input_descriptor()
-        split_info = SplitArchiveInfo(
-            is_split=is_split or len(all_parts) > 1,
-            is_sfx_stub=is_sfx_stub,
-            archive_input=archive_input,
-            source="detection" if is_split or is_sfx_stub else "",
-        )
-        task = cls(
-            fact_bag=fact_bag,
-            key=key,
-            main_path=main_path,
-            all_parts=all_parts,
-            carrier_path=carrier_path,
-            cleanup_parts=cleanup_parts,
-            logical_name=logical_name,
-            split_info=split_info,
-            decision=getattr(decision, "decision", "archive"),
-            stop_reason=getattr(decision, "stop_reason", "") or "",
-            matched_rules=list(getattr(decision, "matched_rules", []) or []),
-            detected_ext=fact_bag.get("file.detected_ext", ""),
-        )
-        task._write_detection_boundary_knowledge()
-        return task.ensure_archive_state()
 
-    def apply_path_mapping(self, path_map: dict[str, str]):
-        if not path_map:
-            return
+    @property
+    def main_path(self) -> str:
+        return self.archive_input().entry_path
 
-        normalized_map = {
-            path_key(old): normalized_path(new)
-            for old, new in path_map.items()
-        }
-
-        def mapped(path: str) -> str:
-            return normalized_map.get(path_key(path), path)
-
-        self.main_path = mapped(self.main_path)
-        self.all_parts = [mapped(path) for path in self.all_parts]
-        self.carrier_path = mapped(self.carrier_path or self.main_path)
-        self.cleanup_parts = [mapped(path) for path in (self.cleanup_parts or [])]
-        if self.split_info.archive_input is not None:
-            self.split_info.archive_input = self.split_info.archive_input.with_path_mapping(mapped)
-        self.fact_bag.set("file.path", self.carrier_path or self.main_path)
-        self.fact_bag.set("candidate.entry_path", self.main_path)
-        self.fact_bag.set("candidate.member_paths", list(self.all_parts))
-        self.fact_bag.set("candidate.carrier_path", self.carrier_path or self.main_path)
-        self.fact_bag.set("candidate.cleanup_paths", list(self.cleanup_parts))
-        self.fact_bag.set("file.split_members", [path for path in self.all_parts if path != self.main_path])
-        try:
-            self.set_archive_state(self.archive_state().with_path_mapping(mapped))
-        except (TypeError, ValueError):
-            self.set_archive_input(self.archive_input().with_path_mapping(mapped))
-
-    def adopt_detection_plan(self, replacement: "ArchiveTask") -> None:
-        """Replace this task's detection/input plan while preserving its identity."""
-        self.fact_bag = replacement.fact_bag
-        self.key = replacement.key
-        self.main_path = replacement.main_path
-        self.all_parts = list(replacement.all_parts or [])
-        self.carrier_path = replacement.carrier_path
-        self.cleanup_parts = list(replacement.cleanup_parts or [])
-        self.logical_name = replacement.logical_name
-        self.split_info = replacement.split_info
-        self.decision = replacement.decision
-        self.stop_reason = replacement.stop_reason
-        self.matched_rules = list(replacement.matched_rules or [])
-        self.detected_ext = replacement.detected_ext
-        self._archive_knowledge_cache_raw = None
-        self._archive_knowledge_cache = None
-        self._archive_state_cache_raw = None
-        self._archive_state_cache_knowledge_raw = None
-        self._archive_state_cache = None
-        self.ensure_archive_state()
+    @property
+    def all_parts(self) -> list[str]:
+        return self.archive_input().part_paths()
 
     def archive_input(self) -> ArchiveInputDescriptor:
-        raw_state = self._raw_archive_state()
-        if isinstance(raw_state, dict):
-            return self.archive_state().to_archive_input_descriptor()
-        knowledge_input = self.knowledge().get("source.input")
-        if isinstance(knowledge_input, dict):
-            return ArchiveInputDescriptor.from_any(
-                knowledge_input,
-                archive_path=self.main_path,
-                part_paths=list(self.all_parts or [self.main_path]),
-                format_hint=self._format_hint(),
-                logical_name=str(self.logical_name or ""),
-            )
-        raise ValueError("ArchiveTask is missing ArchiveKnowledge source.input")
+        return self._state.to_archive_input_descriptor()
 
     def archive_state(self) -> ArchiveState:
-        raw_state = self._raw_archive_state()
-        knowledge_raw = self.fact_bag.get("archive.knowledge")
-        if (
-            raw_state is self._archive_state_cache_raw
-            and knowledge_raw is self._archive_state_cache_knowledge_raw
-            and isinstance(self._archive_state_cache, ArchiveState)
-        ):
-            return self._archive_state_cache
-        archive_input = self.knowledge().get("source.input")
-        state = ArchiveState.from_any(
-            self._raw_archive_state(),
-            archive_path=self.main_path,
-            part_paths=list(self.all_parts or [self.main_path]),
-            format_hint=self._format_hint(),
-            logical_name=str(self.logical_name or ""),
-            archive_input=archive_input,
-        )
-        self._archive_state_cache_raw = raw_state
-        self._archive_state_cache_knowledge_raw = knowledge_raw
-        self._archive_state_cache = state
-        return state
+        return self._state
 
     def knowledge(self) -> ArchiveKnowledge:
-        raw = self.fact_bag.get("archive.knowledge")
-        if raw is self._archive_knowledge_cache_raw and isinstance(self._archive_knowledge_cache, ArchiveKnowledge):
-            return self._archive_knowledge_cache
-        knowledge = ArchiveKnowledge.from_any(raw)
-        self._archive_knowledge_cache_raw = raw
-        self._archive_knowledge_cache = knowledge
-        return knowledge
+        return self._knowledge
 
     def set_knowledge(self, knowledge: ArchiveKnowledge | dict) -> None:
-        payload = ArchiveKnowledge.from_any(knowledge).to_dict()
-        self._replace_knowledge_payload(payload, knowledge_cache=ArchiveKnowledge(payload))
-        raw_state = self._raw_archive_state()
-        if isinstance(raw_state, dict):
-            state = self.archive_state()
-            self._store_archive_state(ArchiveState(
-                source=state.source,
-                logical_name=state.logical_name,
-                format_hint=state.format_hint,
-                analysis=dict(state.analysis),
-                verification=dict(state.verification),
-                knowledge=payload,
-            ))
+        self._knowledge = ArchiveKnowledge.from_any(knowledge)
+        state = self._state
+        self._state = ArchiveState(
+            source=state.source,
+            logical_name=state.logical_name,
+            format_hint=state.format_hint,
+            analysis=dict(state.analysis),
+            verification=dict(state.verification),
+            knowledge=self._knowledge.to_dict(),
+        )
+
+    def _replace_knowledge_payload(
+        self,
+        payload: dict[str, Any],
+        *,
+        knowledge_cache: ArchiveKnowledge | None = None,
+    ) -> None:
+        self._knowledge = (
+            knowledge_cache
+            if knowledge_cache is not None
+            else ArchiveKnowledge.from_any(payload)
+        )
+        state = self._state
+        self._state = ArchiveState(
+            source=state.source,
+            logical_name=state.logical_name,
+            format_hint=state.format_hint,
+            analysis=dict(state.analysis),
+            verification=dict(state.verification),
+            knowledge=self._knowledge.to_dict(),
+        )
 
     def ensure_archive_state(self) -> "ArchiveTask":
-        if not isinstance(self._raw_archive_state(), dict):
-            self.set_archive_state(self.archive_state())
-        elif not isinstance(self.fact_bag.get("archive.knowledge"), dict):
-            self.set_knowledge(self.knowledge())
         return self
 
     def set_archive_input(self, descriptor: ArchiveInputDescriptor | dict) -> None:
@@ -251,17 +187,41 @@ class ArchiveTask:
             descriptor = ArchiveInputDescriptor.from_any(
                 descriptor,
                 archive_path=self.main_path,
-                part_paths=list(self.all_parts or [self.main_path]),
-                format_hint=self._format_hint(),
-                logical_name=str(self.logical_name or ""),
+                part_paths=self.all_parts,
+                format_hint=self.archive_input().format_hint,
+                logical_name=self.logical_name,
             )
-        self.fact_bag.set("archive.input", descriptor.to_dict())
-        self.fact_bag.set("archive.descriptor.source", descriptor.to_dict())
-        knowledge = self.knowledge()
-        knowledge.set("source.input", descriptor.to_dict(), source_layer="contracts", source_module="archive_task")
-        payload = knowledge.to_dict()
-        self._replace_knowledge_payload(payload, knowledge_cache=ArchiveKnowledge(payload))
-        self._store_archive_state(ArchiveState.from_archive_input(descriptor))
+        state = self._state
+        self._archive_input = descriptor
+        self.logical_name = descriptor.logical_name or self.logical_name
+        self.cleanup_parts = list(dedupe_values([
+            *descriptor.part_paths(),
+            *self.cleanup_parts,
+            self.carrier_path,
+        ]))
+        self.split_info = SplitArchiveInfo(
+            is_split=descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
+            is_sfx_stub=bool(
+                descriptor.open_mode == "sfx_with_volumes"
+                or self.split_info.is_sfx_stub
+            ),
+            archive_input=descriptor,
+            source=self.split_info.source or self.discovery_source,
+        )
+        self._knowledge.set(
+            "source.input",
+            descriptor.to_dict(),
+            source_layer="contracts",
+            source_module="archive_task",
+        )
+        self._state = ArchiveState(
+            source=ArchiveState.from_archive_input(descriptor).source,
+            logical_name=descriptor.logical_name or self.logical_name,
+            format_hint=descriptor.format_hint,
+            analysis=dict(state.analysis),
+            verification=dict(state.verification),
+            knowledge=self._knowledge.to_dict(),
+        )
 
     def set_archive_state(
         self,
@@ -270,215 +230,191 @@ class ArchiveTask:
         phase_timer: Any | None = None,
         phase_prefix: str = "set_archive_state",
     ) -> None:
+        del phase_timer, phase_prefix
         if isinstance(state, dict):
-            with _phase(phase_timer, f"{phase_prefix}_from_any"):
-                state = ArchiveState.from_any(
-                    state,
-                    archive_path=self.main_path,
-                    part_paths=list(self.all_parts or [self.main_path]),
-                    format_hint=self._format_hint(),
-                    logical_name=str(self.logical_name or ""),
-                    archive_input=knowledge_view.source_input(self),
-                )
-        self._store_archive_state(state, phase_timer=phase_timer, phase_prefix=phase_prefix)
-
-    def _store_archive_state(
-        self,
-        state: ArchiveState,
-        *,
-        phase_timer: Any | None = None,
-        phase_prefix: str = "store_archive_state",
-    ) -> None:
-        with _phase(phase_timer, f"{phase_prefix}_source_input"):
-            source_descriptor = state.to_archive_input_descriptor()
-            source_input = source_descriptor.to_dict()
-            self.cleanup_parts = list(dedupe_values([
-                *(self.cleanup_parts or []),
-                *source_descriptor.part_paths(),
-                self.carrier_path,
-            ]))
-            self.split_info.archive_input = source_descriptor
-            self.split_info.is_split = source_descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
-            self.split_info.is_sfx_stub = bool(
-                source_descriptor.open_mode == "sfx_with_volumes"
-                or self.split_info.is_sfx_stub
-                or self.fact_bag.get("relation.has_split_companions")
-                or self.fact_bag.get("candidate.companion_paths")
+            state = ArchiveState.from_any(
+                state,
+                archive_path=self.main_path,
+                part_paths=self.all_parts,
+                format_hint=self.archive_input().format_hint,
+                logical_name=self.logical_name,
+                archive_input=self.archive_input().to_dict(),
             )
-        with _phase(phase_timer, f"{phase_prefix}_merge_knowledge"):
-            state_snapshot_for_knowledge = _archive_state_snapshot(state)
-            knowledge = self._merged_state_knowledge(state, source_input, state_snapshot_for_knowledge)
-        if knowledge:
-            with _phase(phase_timer, f"{phase_prefix}_rebuild_state_with_knowledge"):
-                state = ArchiveState(
-                    source=state.source,
-                    logical_name=state.logical_name,
-                    format_hint=state.format_hint,
-                    analysis=dict(state.analysis),
-                    verification=dict(state.verification),
-                    knowledge=knowledge,
-                )
-        with _phase(phase_timer, f"{phase_prefix}_snapshot"):
-            state_payload = _archive_state_snapshot(state)
-            source_payload = state.source.to_dict()
-        with _phase(phase_timer, f"{phase_prefix}_fact_bag_set"):
-            self.fact_bag.set("archive.state", state_payload)
-            self.fact_bag.set("archive.source", source_payload)
-        with _phase(phase_timer, f"{phase_prefix}_knowledge_payload"):
-            knowledge_payload = dict(state.knowledge)
-        with _phase(phase_timer, f"{phase_prefix}_replace_knowledge"):
-            self._replace_knowledge_payload(knowledge_payload, knowledge_cache=ArchiveKnowledge(knowledge_payload))
-        with _phase(phase_timer, f"{phase_prefix}_cache_update"):
-            self._archive_state_cache_raw = state_payload
-            self._archive_state_cache_knowledge_raw = knowledge_payload
-            self._archive_state_cache = state
+        descriptor = state.to_archive_input_descriptor()
+        self._archive_input = descriptor
+        self.logical_name = descriptor.logical_name or state.logical_name or self.logical_name
+        self.cleanup_parts = list(dedupe_values([
+            *descriptor.part_paths(),
+            *self.cleanup_parts,
+            self.carrier_path,
+        ]))
+        self.split_info = SplitArchiveInfo(
+            is_split=descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
+            is_sfx_stub=bool(
+                descriptor.open_mode == "sfx_with_volumes"
+                or self.split_info.is_sfx_stub
+            ),
+            archive_input=descriptor,
+            source=self.split_info.source or self.discovery_source,
+        )
+        knowledge = ArchiveKnowledge.from_any(state.knowledge)
+        knowledge.merge(self._knowledge)
+        knowledge.set(
+            "source.input",
+            descriptor.to_dict(),
+            source_layer="contracts",
+            source_module="archive_task",
+        )
+        self._knowledge = knowledge
+        self._state = ArchiveState(
+            source=state.source,
+            logical_name=state.logical_name or self.logical_name,
+            format_hint=state.format_hint or descriptor.format_hint,
+            analysis=dict(state.analysis),
+            verification=dict(state.verification),
+            knowledge=knowledge.to_dict(),
+        )
+
+    def apply_path_mapping(self, path_map: dict[str, str]) -> None:
+        if not path_map:
+            return
+        normalized_map = {
+            path_key(old): normalized_path(new)
+            for old, new in path_map.items()
+        }
+
+        def mapped(path: str) -> str:
+            return normalized_map.get(path_key(path), path)
+
+        self.carrier_path = mapped(self.carrier_path or self.main_path)
+        self.cleanup_parts = [mapped(path) for path in self.cleanup_parts]
+        self.set_archive_input(self.archive_input().with_path_mapping(mapped))
+
+    def adopt_detection_plan(self, replacement: "ArchiveTask") -> None:
+        runtime = dict(self.runtime)
+        self._archive_input = replacement.archive_input()
+        self.carrier_path = replacement.carrier_path
+        self.cleanup_parts = list(replacement.cleanup_parts)
+        self.key = replacement.key
+        self.logical_name = replacement.logical_name
+        self.split_info = replacement.split_info
+        self.discovery_source = replacement.discovery_source
+        self.discovery_evidence = dict(replacement.discovery_evidence)
+        self.discovery_segments = tuple(replacement.discovery_segments)
+        self.relation_kind = replacement.relation_kind
+        self.discovery_reason = replacement.discovery_reason
+        self._knowledge = ArchiveKnowledge.from_any(replacement.knowledge())
+        self._state = replacement.archive_state()
+        self.runtime = runtime
 
     def archive_descriptor(self) -> ArchiveDescriptor:
-        source = self.archive_state().to_archive_input_descriptor()
-        selected_format = knowledge_view.selected_format(self)
-        confidence = 0.0
+        source = self.archive_input()
+        selected_format = knowledge_view.selected_format(self) or source.format_hint
         selected_segment = knowledge_view.source_selected_segment(self)
-        evidence = selected_segment.get("segment") if isinstance(selected_segment.get("segment"), dict) else selected_segment
-        if isinstance(evidence, dict):
-            confidence = float(evidence.get("confidence", selected_segment.get("confidence", 0.0)) or 0.0)
-        damage_flags = []
-        if isinstance(evidence, dict):
-            damage_flags.extend(evidence.get("damage_flags") or [])
-        source_derivation = knowledge_view.source_derivation(self)
-        relation = ArchiveRelationState(
-            kind=str(source_derivation.get("kind") or ("split_archive" if self.split_info.is_split else "file")),
-            is_split=bool(self.split_info.is_split),
-            is_sfx=bool(self.split_info.is_sfx_stub),
+        evidence = (
+            selected_segment.get("segment")
+            if isinstance(selected_segment.get("segment"), dict)
+            else selected_segment
         )
+        confidence = 0.0
+        damage_flags: list[str] = []
+        if isinstance(evidence, dict):
+            confidence = float(
+                evidence.get("confidence", selected_segment.get("confidence", 0.0))
+                or 0.0
+            )
+            damage_flags.extend(evidence.get("damage_flags") or [])
         return ArchiveDescriptor(
             id=str(self.key or self.main_path),
             logical_name=str(self.logical_name or ""),
             source=source,
             format=ArchiveFormatState(
-                detected=str(self.detected_ext or ""),
+                detected=source.format_hint,
                 selected=selected_format,
                 hint=source.format_hint,
                 confidence=confidence,
                 status=knowledge_view.inspection_status(self),
             ),
-            relation=relation,
-            integrity=ArchiveIntegrityState(damage_flags=_dedupe([str(item) for item in damage_flags])),
+            relation=ArchiveRelationState(
+                kind=self.relation_kind,
+                is_split=bool(self.split_info.is_split),
+                is_sfx=bool(self.split_info.is_sfx_stub),
+            ),
+            integrity=ArchiveIntegrityState(
+                damage_flags=list(dict.fromkeys(str(item) for item in damage_flags))
+            ),
         )
 
-    def _format_hint(self) -> str:
-        knowledge = self.knowledge()
-        return str(
-            knowledge.get("inspection.summary.format", "")
-            or knowledge.get("archive.format_hint", "")
-            or knowledge.get("source.input.format_hint", "")
-            or self.detected_ext
-            or self.fact_bag.get("file.detected_ext")
-            or ""
-        ).lstrip(".")
-
-    def _raw_archive_state(self) -> dict | None:
-        raw = self.fact_bag.get("archive.state")
-        return raw if isinstance(raw, dict) else None
-
-    def _write_detection_boundary_knowledge(self) -> None:
-        knowledge = self.knowledge()
-        raw_source = self.fact_bag.get("archive.input")
-        source_descriptor = self.split_info.archive_input
-        if source_descriptor is None:
-            source_descriptor = ArchiveInputDescriptor.from_any(
-                raw_source if isinstance(raw_source, dict) else None,
-                archive_path=self.main_path,
-                part_paths=list(self.all_parts or [self.main_path]),
-                format_hint=self._format_hint(),
-                logical_name=str(self.logical_name or ""),
-            )
-        source_input = source_descriptor.to_dict()
-        knowledge.merge({
-            "filesystem": {
-                "path": self.carrier_path or self.main_path,
-                "carrier_path": self.carrier_path or self.main_path,
-                "detected_ext": self.detected_ext,
-            },
+    def _initialize_knowledge(self) -> None:
+        descriptor = self._archive_input
+        self._knowledge.merge({
             "source": {
-                "input": source_input,
+                "input": descriptor.to_dict(),
                 "derivation": {
-                    "kind": str(self.fact_bag.get("candidate.kind") or ("split_archive" if self.split_info.is_split else "file")),
-                    "candidate_entry_path": self.main_path,
-                    "candidate_member_paths": list(self.all_parts or []),
-                    "candidate_carrier_path": self.carrier_path or self.main_path,
-                    "candidate_cleanup_paths": list(self.cleanup_parts or []),
+                    "kind": self.relation_kind,
+                    "candidate_entry_path": descriptor.entry_path,
+                    "candidate_member_paths": descriptor.part_paths(),
+                    "candidate_carrier_path": self.carrier_path,
+                    "candidate_cleanup_paths": list(self.cleanup_parts),
                     "candidate_logical_name": self.logical_name,
                 },
+            },
+            "discovery": {
+                "source": self.discovery_source,
+                "reason": self.discovery_reason,
+                "evidence": dict(self.discovery_evidence),
             },
             "relations": {
                 "is_split": bool(self.split_info.is_split),
                 "is_sfx_stub": bool(self.split_info.is_sfx_stub),
-                "archive_input": source_input,
+                "archive_input": descriptor.to_dict(),
             },
-        }, source_layer="contracts", source_module="from_fact_bag")
-        payload = knowledge.to_dict()
-        self._replace_knowledge_payload(payload, knowledge_cache=ArchiveKnowledge(payload))
-
-    def _replace_knowledge_payload(
-        self,
-        payload: dict[str, Any],
-        *,
-        knowledge_cache: ArchiveKnowledge | None = None,
-    ) -> None:
-        current = self.fact_bag.get("archive.knowledge")
-        if current is payload:
-            self._archive_knowledge_cache_raw = current if isinstance(current, dict) else payload
-            if knowledge_cache is not None:
-                self._archive_knowledge_cache = knowledge_cache
-            elif isinstance(self._archive_knowledge_cache, ArchiveKnowledge) and self._archive_knowledge_cache_raw is current:
-                pass
-            else:
-                self._archive_knowledge_cache = ArchiveKnowledge.from_any(current if isinstance(current, dict) else payload)
-            return
-        self.fact_bag.set("archive.knowledge", payload)
-        self._archive_knowledge_cache_raw = payload
-        self._archive_knowledge_cache = knowledge_cache if knowledge_cache is not None else ArchiveKnowledge.from_any(payload)
-        self._archive_state_cache_raw = None
-        self._archive_state_cache_knowledge_raw = None
-        self._archive_state_cache = None
-
-    def _merged_state_knowledge(
-        self,
-        state: ArchiveState,
-        source_input: dict[str, Any],
-        state_snapshot: dict[str, Any],
-    ) -> dict[str, Any]:
-        """Merge state facts without deep-merging the whole knowledge tree when possible."""
-        existing = self.fact_bag.get("archive.knowledge")
-        additions = {
-            "source": {"input": source_input},
-            "archive": {"state": state_snapshot},
-        }
-        if state.knowledge:
-            return merge_knowledge(existing, state.knowledge, additions)
-        if not isinstance(existing, dict):
-            return merge_knowledge(existing, additions)
-        knowledge = dict(existing)
-        source = dict(knowledge.get("source") or {}) if isinstance(knowledge.get("source"), dict) else {}
-        source["input"] = source_input
-        archive = dict(knowledge.get("archive") or {}) if isinstance(knowledge.get("archive"), dict) else {}
-        archive["state"] = state_snapshot
-        knowledge["source"] = source
-        knowledge["archive"] = archive
-        return knowledge
+        }, source_layer="contracts", source_module="archive_task")
+        if self.discovery_segments:
+            self._knowledge.set(
+                "source.extractable_segments",
+                [
+                    _segment_payload(index, segment)
+                    for index, segment in enumerate(self.discovery_segments, start=1)
+                ],
+                source_layer="discovery",
+                source_module=self.discovery_source or "discovery",
+            )
+            self._knowledge.set(
+                "source.selected_segment",
+                _segment_payload(1, self.discovery_segments[0]),
+                source_layer="discovery",
+                source_module=self.discovery_source or "discovery",
+            )
+        prepass = self.discovery_evidence.get("scan")
+        if isinstance(prepass, dict):
+            self._knowledge.set(
+                "inspection.prepass",
+                prepass,
+                source_layer="embedded",
+                source_module="discovery",
+            )
+        self._state = ArchiveState(
+            source=self._state.source,
+            logical_name=self._state.logical_name,
+            format_hint=self._state.format_hint,
+            analysis=dict(self._state.analysis),
+            verification=dict(self._state.verification),
+            knowledge=self._knowledge.to_dict(),
+        )
 
 
-def _archive_state_snapshot(state: ArchiveState) -> dict[str, Any]:
-    """Return a JSON-safe state snapshot that cannot recursively embed ArchiveKnowledge."""
-    payload = state.to_dict()
-    payload.pop("knowledge", None)
-    return payload
-
-
-def _phase(timer: Any | None, name: str):
-    if timer is None:
-        return nullcontext()
-    return timer(name)
-
-
-_dedupe = dedupe_values
+def _segment_payload(index: int, segment: ResolvedArchiveSegment) -> dict[str, Any]:
+    descriptor = segment.archive_input
+    return {
+        "segment_id": f"embedded_{index:02d}_{segment.format.replace('/', '_')}",
+        "index": index,
+        "format": segment.format,
+        "start_offset": segment.start_offset,
+        "end_offset": segment.end_offset,
+        "confidence": segment.confidence,
+        "damage_flags": list(segment.damage_flags),
+        "logical_name": descriptor.logical_name,
+        "segment": dict(segment.evidence),
+        "archive_input": descriptor.to_dict(),
+    }

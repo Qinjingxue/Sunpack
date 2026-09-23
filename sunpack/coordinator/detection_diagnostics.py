@@ -1,55 +1,56 @@
-"""Read-only detection diagnostics for the CLI inspect command."""
+"""Read-only typed discovery diagnostics for the CLI inspect command."""
 
 from dataclasses import dataclass
 from typing import Any
 
 from sunpack.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.embedded.options import EmbeddedOptions
+from sunpack.support.path_keys import path_key
 
 
-@dataclass
-class DetectionDiagnostic:
+@dataclass(frozen=True)
+class DiscoveryDiagnostic:
     path: str
-    should_extract: bool
-    stop_reason: str
-    matched_rules: list[str]
-    detected_ext: str
-    split_role: str
-    fact_bag: object
-    decision: str
-    decision_stage: str
-    discarded_at: str
-    deciding_rule: str
+    status: str
+    format: str
+    source: str
+    reason: str
+    archive_input: dict | None = None
+
+    @property
+    def should_extract(self) -> bool:
+        return self.status == "resolved"
 
 
 class DetectionDiagnostics:
-    def __init__(self, config: dict[str, Any], detection_options: EmbeddedOptions | None = None):
-        self.detector = ArchiveTaskProvider(config, detection_options=detection_options)
+    def __init__(
+        self,
+        config: dict[str, Any],
+        detection_options: EmbeddedOptions | None = None,
+    ):
+        self.provider = ArchiveTaskProvider(
+            config,
+            detection_options=detection_options,
+        )
 
-    def collect(self, paths: list[str]) -> list[DetectionDiagnostic]:
-        results = []
-
-        for detection in self.detector.detect_targets(paths):
-            bag = detection.fact_bag
-            file_path_str = bag.get("file.path")
-            if not file_path_str:
-                continue
-            split_role = bag.get("file.split_role") or ""
-
-            decision = detection.decision
-
-            results.append(DetectionDiagnostic(
-                path=file_path_str,
-                should_extract=decision.should_extract,
-                stop_reason=decision.stop_reason or "",
-                matched_rules=decision.matched_rules,
-                detected_ext=bag.get("file.detected_ext", ""),
-                split_role=split_role or "",
-                fact_bag=bag,
-                decision=decision.decision,
-                decision_stage=decision.decision_stage,
-                discarded_at=decision.discarded_at or "",
-                deciding_rule=decision.deciding_rule or "",
-            ))
-
-        return results
+    def collect(self, paths: list[str]) -> list[DiscoveryDiagnostic]:
+        result = self.provider.discover_targets(paths)
+        resolved = {
+            path_key(item.entry_path): item
+            for item in result.resolved_inputs
+        }
+        return [
+            DiscoveryDiagnostic(
+                path=trace.entry_path,
+                status=trace.status,
+                format=trace.format,
+                source=trace.source,
+                reason=trace.reason,
+                archive_input=(
+                    resolved[path_key(trace.entry_path)].archive_input.to_dict()
+                    if path_key(trace.entry_path) in resolved
+                    else None
+                ),
+            )
+            for trace in result.traces
+        ]

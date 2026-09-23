@@ -2,7 +2,6 @@ from sunpack.detection.formats._stream import confirmed_stream
 
 
 FORMAT = "zstd"
-EXTENSION = ".zst"
 
 
 def confirm(path: str, analyzer) -> bool:

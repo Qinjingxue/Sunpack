@@ -1,8 +1,9 @@
-import os
-from typing import List
+from __future__ import annotations
 
-from sunpack.contracts.detection import FactBag
-from sunpack.coordinator.scan_session import DetectionScanSession
+import os
+
+from sunpack.contracts.discovery import DiscoveryCandidate
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.relations.scheduler import RelationsScheduler
 from sunpack.support.path_keys import normalized_path, path_key, safe_relative_path
 
@@ -10,73 +11,19 @@ from sunpack.support.path_keys import normalized_path, path_key, safe_relative_p
 RELATIONS = RelationsScheduler()
 
 
-def _bag_paths(bag: FactBag) -> list[str]:
-    paths = []
-    for key in (
-        "file.path",
-        "candidate.entry_path",
-        "candidate.carrier_path",
-        "file.split_members",
-        "candidate.member_paths",
-        "candidate.companion_paths",
-        "candidate.cleanup_paths",
-    ):
-        value = bag.get(key)
-        if isinstance(value, list):
-            paths.extend(value)
-        elif value:
-            paths.append(value)
-    return [path_key(path) for path in paths if path]
-
-def _bag_key(bag: FactBag) -> str:
-    path = bag.get("file.path", "")
-    if not bag.get("relation.is_split_related"):
-        return path_key(path)
-    parent = os.path.dirname(normalized_path(path)) if path else ""
-    logical_name = bag.get("file.logical_name") or os.path.basename(path)
-    family = str(
-        bag.get("relation.split_family")
-        or bag.get("relation.format_hint")
-        or "unknown"
-    ).lower()
-    return path_key(os.path.join(parent, f"{logical_name.lower()}\x1f{family}"))
+def build_candidates_for_target(
+    target_path: str,
+    session: DiscoveryScanSession | None = None,
+) -> list[DiscoveryCandidate]:
+    return build_candidates_for_targets([target_path], session=session)
 
 
-def _add_unique(target: List[FactBag], seen_keys: set[str], bags: List[FactBag]):
-    for bag in bags:
-        key = _bag_key(bag)
-        if key in seen_keys:
-            for index, current in enumerate(target):
-                if _bag_key(current) == key and _bag_rank(bag) > _bag_rank(current):
-                    target[index] = bag
-                    break
-            continue
-        seen_keys.add(key)
-        target.append(bag)
-
-
-def _bag_rank(bag: FactBag) -> tuple[int, int, int]:
-    """Prefer the best-supported representation of one logical candidate."""
-    relation_strength = 2 if bag.get("relation.is_split_related") else 1
-    anchor = bag.get("relation.volume_anchor")
-    if isinstance(anchor, dict) and anchor.get("needs_password"):
-        relation_strength = 1
-    volumes = len(bag.get("relation.split_volumes") or [])
-    members = len(bag.get("candidate.member_paths") or [])
-    return relation_strength, volumes, members
-
-
-def build_fact_bags_for_target(target_path: str, session: DetectionScanSession | None = None) -> List[FactBag]:
-    """Scan a selected file's parent so split-volume siblings remain visible."""
-    return build_fact_bags_for_targets([target_path], session=session)
-
-
-def build_fact_bags_for_targets(
-    target_paths: List[str],
-    session: DetectionScanSession | None = None,
+def build_candidates_for_targets(
+    target_paths: list[str],
+    session: DiscoveryScanSession | None = None,
     config: dict | None = None,
-) -> List[FactBag]:
-    session = session or DetectionScanSession(RELATIONS, config=config)
+) -> list[DiscoveryCandidate]:
+    session = session or DiscoveryScanSession(RELATIONS, config=config)
     selected_dirs: list[str] = []
     selected_files: list[str] = []
 
@@ -91,37 +38,74 @@ def build_fact_bags_for_targets(
     for file_path in selected_files:
         if not any(safe_relative_path(file_path, directory) is not None for directory in selected_dirs):
             scan_roots.append(_context_root_for_file(file_path, config or {}))
-    if hasattr(session, "set_scan_roots"):
-        session.set_scan_roots(scan_roots)
+    session.set_scan_roots(scan_roots)
 
-    fact_bags: List[FactBag] = []
+    candidates: list[DiscoveryCandidate] = []
     seen_keys: set[str] = set()
 
     for directory in selected_dirs:
-        _add_unique(fact_bags, seen_keys, session.fact_bags_for_directory(directory))
+        _add_unique(candidates, seen_keys, session.candidates_for_directory(directory))
 
     for file_path in selected_files:
         if any(safe_relative_path(file_path, directory) is not None for directory in selected_dirs):
             continue
-
         parent = _context_root_for_file(file_path, config or {})
-        parent_bags = session.fact_bags_for_directory(parent)
-
+        parent_candidates = session.candidates_for_directory(parent)
         selected_key = path_key(file_path)
         matched = [
-            bag for bag in parent_bags
-            if selected_key in _bag_paths(bag)
+            candidate
+            for candidate in parent_candidates
+            if selected_key in candidate.path_keys
         ]
         if not matched:
             expected_name = session.logical_name_for_archive(os.path.basename(file_path)).lower()
             matched = [
-                bag for bag in parent_bags
-                if bag.get("relation.is_split_related")
-                and os.path.basename(bag.get("file.logical_name", "")).lower() == expected_name
+                candidate
+                for candidate in parent_candidates
+                if candidate.is_split
+                and os.path.basename(candidate.logical_name).lower() == expected_name
             ]
-        _add_unique(fact_bags, seen_keys, matched)
+        _add_unique(candidates, seen_keys, matched)
 
-    return fact_bags
+    return candidates
+
+
+def _candidate_key(candidate: DiscoveryCandidate) -> str:
+    if not candidate.is_split:
+        return path_key(candidate.entry_path)
+    parent = os.path.dirname(normalized_path(candidate.entry_path))
+    family = str(
+        candidate.relation_metadata.get("split_family")
+        or candidate.format_hint
+        or "unknown"
+    ).lower()
+    return path_key(os.path.join(parent, f"{candidate.logical_name.lower()}\x1f{family}"))
+
+
+def _candidate_rank(candidate: DiscoveryCandidate) -> tuple[int, int, int]:
+    relation_strength = 2 if candidate.is_split else 1
+    if candidate.relation_anchor.get("needs_password"):
+        relation_strength = 1
+    volumes = int(candidate.relation_metadata.get("split_member_count") or 0)
+    members = len(candidate.member_paths)
+    return relation_strength, volumes, members
+
+
+def _add_unique(
+    target: list[DiscoveryCandidate],
+    seen_keys: set[str],
+    values: list[DiscoveryCandidate],
+) -> None:
+    for candidate in values:
+        key = _candidate_key(candidate)
+        if key in seen_keys:
+            for index, current in enumerate(target):
+                if _candidate_key(current) == key and _candidate_rank(candidate) > _candidate_rank(current):
+                    target[index] = candidate
+                    break
+            continue
+        seen_keys.add(key)
+        target.append(candidate)
 
 
 def _context_root_for_file(file_path: str, config: dict) -> str:
@@ -138,4 +122,3 @@ def _context_root_for_file(file_path: str, config: dict) -> str:
 
 def _scene_context_parent_depth(config: dict) -> int:
     return 0
-

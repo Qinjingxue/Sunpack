@@ -5,7 +5,7 @@ from typing import Any
 
 from sunpack.passwords.internal.lists import dedupe_passwords
 from sunpack.passwords.internal.local_files import (
-    DIRECTORY_PASSWORD_CONTEXT_FACT,
+    DIRECTORY_PASSWORD_CONTEXT_KEY,
     discover_directory_passwords_for_archive,
 )
 
@@ -21,12 +21,12 @@ class DirectoryPasswordContextStore:
         for task in tasks:
             inherited = self.inherited_for(task.main_path)
             local = discover_directory_passwords_for_archive(task.main_path, self.config)
-            task.fact_bag.set(DIRECTORY_PASSWORD_CONTEXT_FACT, dedupe_passwords([*inherited, *local]))
+            task.runtime[DIRECTORY_PASSWORD_CONTEXT_KEY] = dedupe_passwords([*inherited, *local])
 
     def remember(self, output_dir: str, task: Any) -> None:
         if not output_dir:
             return
-        values = task.fact_bag.get(DIRECTORY_PASSWORD_CONTEXT_FACT)
+        values = task.runtime.get(DIRECTORY_PASSWORD_CONTEXT_KEY)
         if not isinstance(values, list):
             return
         context = dedupe_passwords([str(value) for value in values if isinstance(value, str)])

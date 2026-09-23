@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from typing import Any
+
 from sunpack.contracts.archive_knowledge import ArchiveKnowledge
-from sunpack.contracts.detection import FactBag
 from sunpack.passwords.candidates import PasswordCandidatePipeline
 from sunpack.passwords.fingerprint import build_archive_fingerprint
 from sunpack.passwords.job import PasswordJob
@@ -10,34 +11,25 @@ from sunpack.passwords.scheduler import PasswordScheduler, PasswordSearchResult,
 from sunpack.passwords.session import PasswordSession
 
 
-def _selected_structure_format(fact_bag: FactBag | None) -> str:
-    """Return the format namespace belonging to the active logical input.
-
-    A carrier task can retain structural facts for several archives found in
-    the same byte stream.  Once extraction switches to one embedded range,
-    those carrier facts must not participate in that range's password
-    decision.  The archive input descriptor is the authoritative scope for
-    this lookup; an empty hint deliberately keeps the historical all-format
-    behavior for ordinary carrier tasks.
-    """
-    if fact_bag is None:
+def _selected_structure_format(task: Any | None) -> str:
+    if task is None:
         return ""
-    knowledge = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge"))
-    direct_input = fact_bag.get("archive.input")
-    direct_format = (
-        direct_input.get("format_hint")
-        if isinstance(direct_input, dict)
-        else ""
-    )
+    knowledge = _knowledge(task)
+    descriptor = _archive_input_descriptor(task)
     values = (
         knowledge.get("source.password_probe_input.format_hint"),
-        knowledge.get("source.input.format_hint"),
         knowledge.get("inspection.summary.format"),
-        direct_format,
-        fact_bag.get("relation.format_hint"),
-        fact_bag.get("archive.format_hint"),
+        descriptor.format_hint if descriptor is not None else "",
+        knowledge.get("source.input.format_hint"),
     )
-    hint = next((str(value or "").strip().lower().lstrip(".") for value in values if str(value or "").strip()), "")
+    hint = next(
+        (
+            str(value or "").strip().lower().lstrip(".")
+            for value in values
+            if str(value or "").strip()
+        ),
+        "",
+    )
     if hint in {"zip", "jar", "docx", "xlsx", "apk"}:
         return "zip"
     if hint in {"7z", "sevenzip", "seven_zip"}:
@@ -56,38 +48,27 @@ def _selected_structure_format(fact_bag: FactBag | None) -> str:
     return ""
 
 
-def _structure_facts(fact_bag: FactBag | None) -> list[tuple[str, dict]]:
-    if fact_bag is None:
+def _structure_facts(task: Any | None) -> list[tuple[str, dict]]:
+    if task is None:
         return []
-    knowledge = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge"))
-    selected_format = _selected_structure_format(fact_bag)
+    knowledge = _knowledge(task)
+    selected_format = _selected_structure_format(task)
     candidates = (
-        ("rar", ("rar.structure", "format.rar.structure")),
-        ("zip", ("zip.eocd_structure", "zip.structure", "format.zip.structure")),
-        ("7z", ("7z.structure", "seven_zip.structure", "format.7z.structure")),
-        ("tar", ("tar.header_structure", "format.tar.structure")),
-        ("compression", ("compression.stream_structure", "format.compression.structure")),
+        ("rar", ("format.rar.structure",)),
+        ("zip", ("format.zip.structure",)),
+        ("7z", ("format.7z.structure",)),
+        ("tar", ("format.tar.structure",)),
+        ("compression", ("format.compression.structure", "compression.stream_structure")),
     )
     output: list[tuple[str, dict]] = []
     for fmt, paths in candidates:
         if selected_format and fmt != selected_format:
             continue
-        seen: set[int] = set()
         for path in paths:
-            value = fact_bag.get(path)
-            if not isinstance(value, dict):
-                if path == "rar.structure":
-                    knowledge_path = "format.rar.structure"
-                elif path in {"zip.eocd_structure", "zip.structure"}:
-                    knowledge_path = "format.zip.structure"
-                elif path in {"7z.structure", "seven_zip.structure"}:
-                    knowledge_path = "format.7z.structure"
-                else:
-                    knowledge_path = path
-                value = knowledge.get(knowledge_path)
-            if isinstance(value, dict) and id(value) not in seen:
+            value = knowledge.get(path)
+            if isinstance(value, dict):
                 output.append((fmt, value))
-                seen.add(id(value))
+                break
     return output
 
 
@@ -111,9 +92,10 @@ def _validated_format_password_state(fmt: str, structure: dict) -> str:
         return "unknown"
 
     if fmt == "zip":
-        encrypted_entries = structure.get("central_directory_encrypted_entries")
         try:
-            encrypted_entries = int(encrypted_entries or 0)
+            encrypted_entries = int(
+                structure.get("central_directory_encrypted_entries") or 0
+            )
         except (TypeError, ValueError):
             encrypted_entries = 0
         structurally_valid = bool(
@@ -139,7 +121,11 @@ def _validated_format_password_state(fmt: str, structure: dict) -> str:
                 and structure.get("next_header_nid_valid")
             )
         )
-        if password_required and structurally_valid and structure.get("encryption_scan_complete", True):
+        if (
+            password_required
+            and structurally_valid
+            and structure.get("encryption_scan_complete", True)
+        ):
             return "required"
         if (
             not password_required
@@ -147,44 +133,35 @@ def _validated_format_password_state(fmt: str, structure: dict) -> str:
             and structurally_valid
         ):
             return "not_required"
-    if fmt == "tar":
-        # TAR has no archive-level password mechanism.  A valid header is
-        # sufficient to prevent a user password list from being sent to the
-        # generic archive backend.
-        if structure.get("plausible") and structure.get("entry_walk_ok"):
-            return "not_required"
-        return "unknown"
-    if fmt == "compression":
-        # gzip/bzip2/xz/zstd stream containers likewise do not carry archive
-        # passwords; the stream validator is the relevant structural proof.
-        if structure.get("plausible"):
-            return "not_required"
+
+    if fmt in {"tar", "compression"}:
+        return "not_required"
     return "unknown"
 
 
-def archive_structure_password_state(fact_bag: FactBag | None) -> str:
-    """Return the bounded structural password fact without running extraction."""
-    if fact_bag is not None:
-        relation_anchor = fact_bag.get("relation.volume_anchor")
-        if (
-            isinstance(relation_anchor, dict)
-            and relation_anchor.get("relation_confirmed")
-            and str(relation_anchor.get("format") or "").lower() == "rar"
-            and relation_anchor.get("needs_password")
-        ):
+def archive_structure_password_state(task: Any | None) -> str:
+    """Return the bounded password state for one structured archive input."""
+    if task is None:
+        return "unknown"
+
+    descriptor = _archive_input_descriptor(task)
+    if descriptor is not None:
+        analysis = descriptor.analysis if isinstance(descriptor.analysis, dict) else {}
+        if analysis.get("password_required"):
             return "required"
-        source_input = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge")).get("source.input")
-        source_analysis = source_input.get("analysis") if isinstance(source_input, dict) else None
-        if isinstance(source_analysis, dict) and source_analysis.get("password_required"):
-            return "required"
-    active_format = _selected_structure_format(fact_bag)
+
+    evidence = _knowledge(task).get("discovery.evidence", {})
+    if isinstance(evidence, dict) and evidence.get("needs_password"):
+        return "required"
+
+    active_format = _selected_structure_format(task)
     if active_format in {"tar", "compression"}:
-        # The active archive-input descriptor is content-derived and scopes this
-        # decision to one logical input.  These formats have no archive-level
-        # password mechanism, so user candidates must never reach ZIP/RAR/7z
-        # verifiers merely because the segment has no copied structure facts.
         return "not_required"
-    states = [_validated_format_password_state(fmt, value) for fmt, value in _structure_facts(fact_bag)]
+
+    states = [
+        _validated_format_password_state(fmt, value)
+        for fmt, value in _structure_facts(task)
+    ]
     if "required" in states:
         return "required"
     if "not_required" in states:
@@ -192,18 +169,12 @@ def archive_structure_password_state(fact_bag: FactBag | None) -> str:
     return "unknown"
 
 
-def archive_structure_requires_password(fact_bag: FactBag | None) -> bool:
-    return archive_structure_password_state(fact_bag) == "required"
+def archive_structure_requires_password(task: Any | None) -> bool:
+    return archive_structure_password_state(task) == "required"
 
 
 class PasswordResolver:
-    """Plan bounded password checks and hand ambiguous candidates to extraction.
-
-    Candidate origin never changes verification semantics.  Every password goes
-    through the same fast-verifier plan; candidates lacking a bounded proof are
-    submitted together to the SevenZip extraction worker, which performs a
-    bounded backend probe before the real extraction transaction.
-    """
+    """Plan bounded password checks from ArchiveTask/ArchiveInput state."""
 
     def __init__(
         self,
@@ -213,17 +184,19 @@ class PasswordResolver:
     ):
         self.password_tester = password_tester
         self.password_session = password_session or PasswordSession()
-        self.password_scheduler = password_scheduler or password_tester.password_scheduler
+        self.password_scheduler = (
+            password_scheduler or password_tester.password_scheduler
+        )
 
     def resolve(
         self,
         archive_path: str,
-        fact_bag: FactBag | None = None,
+        task: Any | None = None,
         part_paths: list[str] | None = None,
         archive_key: str = "",
         directory_passwords: list[str] | None = None,
     ) -> PasswordResolution:
-        archive_key = archive_key or self._archive_key_from_fact_bag(fact_bag) or archive_path
+        archive_key = archive_key or _archive_key(task) or archive_path
         if self.password_session.has_resolved(archive_key):
             return PasswordResolution(
                 password=self.password_session.get_resolved(archive_key),
@@ -231,7 +204,7 @@ class PasswordResolver:
                 archive_key=archive_key,
             )
 
-        password_state = archive_structure_password_state(fact_bag)
+        password_state = archive_structure_password_state(task)
         if password_state == "not_required":
             return self._remember(
                 archive_key,
@@ -240,7 +213,7 @@ class PasswordResolver:
                 encrypted=False,
             )
 
-        archive_input = self._archive_input_for_password_probe(fact_bag) or {}
+        archive_input = self._archive_input_for_password_probe(task) or {}
         fingerprint = build_archive_fingerprint(
             archive_path,
             part_paths,
@@ -248,7 +221,9 @@ class PasswordResolver:
         )
 
         directory_passwords = list(directory_passwords or [])
-        candidates = self.password_tester.password_store.candidates(directory_passwords=directory_passwords)
+        candidates = self.password_tester.password_store.candidates(
+            directory_passwords=directory_passwords
+        )
         if not candidates:
             if password_state == "required":
                 return PasswordResolution(
@@ -258,19 +233,25 @@ class PasswordResolver:
                     archive_key=archive_key,
                     encrypted=True,
                 )
-            # Unknown encryption state: let the real extraction prove the empty
-            # password instead of performing a complete preflight test pass.
-            return self._confirmation_resolution(archive_key, "", fingerprint.key, fact_bag)
+            return self._confirmation_resolution(
+                archive_key,
+                "",
+                fingerprint.key,
+                task,
+            )
 
         search = self._plan_password_search(
             archive_path,
-            fact_bag=fact_bag,
+            task=task,
             part_paths=part_paths,
             fingerprint=fingerprint,
             directory_passwords=directory_passwords,
             include_empty=password_state == "unknown",
         )
-        if search.status in {PasswordSearchStatus.FOUND, PasswordSearchStatus.UNENCRYPTED}:
+        if search.status in {
+            PasswordSearchStatus.FOUND,
+            PasswordSearchStatus.UNENCRYPTED,
+        }:
             resolution = self._remember_search(
                 archive_key,
                 search,
@@ -280,48 +261,62 @@ class PasswordResolver:
                 self._promote_success(resolution.password)
             return resolution
         if search.extraction_candidates:
-            candidates = tuple(dict.fromkeys(search.extraction_candidates))
+            candidate_passwords = tuple(
+                dict.fromkeys(search.extraction_candidates)
+            )
             return self._confirmation_resolution(
                 archive_key,
-                candidates[0],
+                candidate_passwords[0],
                 fingerprint.key,
-                fact_bag,
+                task,
                 candidate_evidence=search.extraction_candidate_evidence,
-                candidate_passwords=candidates,
+                candidate_passwords=candidate_passwords,
             )
         return self._remember_search(
             archive_key,
             search,
-            encrypted=True if self._facts_require_password(fact_bag) else None,
+            encrypted=True if archive_structure_requires_password(task) else None,
         )
 
-    def confirm_extraction(self, resolution: PasswordResolution, password: str | None = None) -> None:
+    def confirm_extraction(
+        self,
+        resolution: PasswordResolution,
+        password: str | None = None,
+    ) -> None:
         password = password if password is not None else resolution.password
         if not resolution.requires_extraction_confirmation or password is None:
             return
         self.password_session.set_resolved(resolution.archive_key, password)
-        self.password_scheduler.remember_extraction_success(resolution.fingerprint_key, password)
+        self.password_scheduler.remember_extraction_success(
+            resolution.fingerprint_key,
+            password,
+        )
         if password:
             self._promote_success(password)
 
     def reject_extraction_candidates(self, resolution: PasswordResolution) -> None:
         if not resolution.requires_extraction_confirmation:
             return
-        candidates = resolution.candidate_passwords or ((resolution.password,) if resolution.password is not None else ())
+        candidates = resolution.candidate_passwords or (
+            (resolution.password,) if resolution.password is not None else ()
+        )
         for password in candidates:
-            self.password_scheduler.remember_extraction_rejection(resolution.fingerprint_key, password)
+            self.password_scheduler.remember_extraction_rejection(
+                resolution.fingerprint_key,
+                password,
+            )
 
     def _plan_password_search(
         self,
         archive_path: str,
         *,
-        fact_bag: FactBag | None,
+        task: Any | None,
         part_paths: list[str] | None,
         fingerprint,
         directory_passwords: list[str] | None,
         include_empty: bool = False,
     ) -> PasswordSearchResult:
-        archive_input = self._archive_input_for_password_probe(fact_bag)
+        archive_input = self._archive_input_for_password_probe(task)
         candidates = PasswordCandidatePipeline.from_password_store(
             self.password_tester.password_store,
             directory_passwords=directory_passwords,
@@ -343,7 +338,7 @@ class PasswordResolver:
         archive_key: str,
         password: str,
         fingerprint_key: str,
-        fact_bag: FactBag | None,
+        task: Any | None,
         *,
         candidate_evidence: str = "",
         candidate_passwords: tuple[str, ...] = (),
@@ -352,7 +347,7 @@ class PasswordResolver:
             password=password,
             status=PasswordResolutionStatus.RESOLVED,
             archive_key=archive_key,
-            encrypted=True if PasswordResolver._facts_require_password(fact_bag) else None,
+            encrypted=True if archive_structure_requires_password(task) else None,
             requires_extraction_confirmation=True,
             candidate_passwords=candidate_passwords,
             fingerprint_key=fingerprint_key,
@@ -360,26 +355,17 @@ class PasswordResolver:
         )
 
     @staticmethod
-    def _archive_input_for_password_probe(fact_bag: FactBag | None) -> dict | None:
-        if fact_bag is None:
+    def _archive_input_for_password_probe(task: Any | None) -> dict | None:
+        if task is None:
             return None
-        knowledge = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge"))
+        knowledge = _knowledge(task)
         knowledge_input = knowledge.get("source.password_probe_input")
         if not isinstance(knowledge_input, dict) or not knowledge_input:
-            knowledge_input = knowledge.get("source.input")
-        if not isinstance(knowledge_input, dict) or not knowledge_input:
-            direct_input = fact_bag.get("archive.input")
-            knowledge_input = direct_input if isinstance(direct_input, dict) else None
+            descriptor = _archive_input_descriptor(task)
+            knowledge_input = descriptor.to_dict() if descriptor is not None else None
         if not isinstance(knowledge_input, dict):
             return None
-        selected_format = str(
-            knowledge.get("inspection.summary.format", "")
-            or knowledge_input.get("format_hint", "")
-            or knowledge.get("source.input.format_hint", "")
-            or fact_bag.get("relation.format_hint")
-            or fact_bag.get("archive.format_hint")
-            or ""
-        ).strip().lower().lstrip(".")
+        selected_format = _selected_structure_format(task)
         if selected_format in {"zip", "rar", "7z"}:
             return {**knowledge_input, "format_hint": selected_format}
         return knowledge_input
@@ -433,28 +419,29 @@ class PasswordResolver:
             remember_only_on_success=True,
         )
 
-    @staticmethod
-    def _facts_require_password(fact_bag: FactBag | None) -> bool:
-        return archive_structure_requires_password(fact_bag)
 
-    @staticmethod
-    def _archive_key_from_fact_bag(fact_bag: FactBag | None) -> str:
-        if fact_bag is None:
-            return ""
-        knowledge = ArchiveKnowledge.from_any(fact_bag.get("archive.knowledge"))
-        source_derivation = knowledge.get("source.derivation") or {}
-        if isinstance(source_derivation, dict):
-            return str(source_derivation.get("candidate_logical_name") or source_derivation.get("candidate_entry_path") or "")
-        source_input = knowledge.get("source.input") or {}
-        if isinstance(source_input, dict):
-            value = str(source_input.get("logical_name") or source_input.get("entry_path") or "")
-            if value:
-                return value
-        direct_input = fact_bag.get("archive.input")
-        if isinstance(direct_input, dict):
-            return str(
-                direct_input.get("logical_name")
-                or direct_input.get("entry_path")
-                or ""
-            )
+def _knowledge(task: Any) -> ArchiveKnowledge:
+    if hasattr(task, "knowledge") and callable(task.knowledge):
+        return task.knowledge()
+    return ArchiveKnowledge()
+
+
+def _archive_input_descriptor(task: Any):
+    if hasattr(task, "archive_input") and callable(task.archive_input):
+        try:
+            return task.archive_input()
+        except (TypeError, ValueError, AttributeError):
+            return None
+    return None
+
+
+def _archive_key(task: Any | None) -> str:
+    if task is None:
         return ""
+    value = str(getattr(task, "key", "") or "")
+    if value:
+        return value
+    descriptor = _archive_input_descriptor(task)
+    if descriptor is None:
+        return ""
+    return str(descriptor.logical_name or descriptor.entry_path or "")

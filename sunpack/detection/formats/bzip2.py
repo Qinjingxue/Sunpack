@@ -2,7 +2,6 @@ from sunpack.detection.formats._stream import confirmed_stream
 
 
 FORMAT = "bzip2"
-EXTENSION = ".bz2"
 
 
 def confirm(path: str, analyzer) -> bool:
