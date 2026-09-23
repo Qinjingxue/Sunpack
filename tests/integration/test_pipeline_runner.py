@@ -248,7 +248,7 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
         },
     }))
     engine = PipelineEngine(config)
-    task = ArchiveTask(fact_bag=FactBag(), main_path=str(archive), all_parts=[str(archive)], logical_name="payload")
+    task = make_archive_task(archive, logical_name="payload")
 
     def fake_extract(item, out_dir):
         nested = Path(out_dir) / "nested.zip"
