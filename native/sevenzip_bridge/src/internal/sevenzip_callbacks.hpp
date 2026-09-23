@@ -5,6 +5,7 @@
 #include "sevenzip_streams.hpp"
 
 #include "sevenzip_async_output.hpp"
+#include "positioned_output.hpp"
 
 #include "sevenzip_space_directory.hpp"
 
@@ -451,7 +452,7 @@ namespace sunpack::sevenzip
         UInt64 bytes_written_ = 0;
     };
 
-    class AsyncFileOutStream final : public CMyUnknownImp, public ISequentialOutStream
+    class AsyncFileOutStream final : public CMyUnknownImp, public ISequentialOutStream, public PositionedOutStream
     {
         Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
         
@@ -497,6 +498,43 @@ namespace sunpack::sevenzip
             if (processedSize)
             {
                 *processedSize = consumed;
+            }
+            return hr;
+        }
+
+        HRESULT write_at(
+            UInt64 offset,
+            const void *data,
+            UInt32 size,
+            UInt32 *processed_size) noexcept override
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!writer_ || !file_)
+            {
+                if (processed_size)
+                {
+                    *processed_size = 0;
+                }
+                return E_FAIL;
+            }
+
+            UInt32 consumed = 0;
+            const HRESULT hr = writer_->write_at(file_, offset, data, size, &consumed);
+            if (consumed != 0 && offset < 512)
+            {
+                const auto *bytes = static_cast<const unsigned char *>(data);
+                const UInt64 end64 = (std::min<UInt64>)(512, offset + consumed);
+                const std::size_t begin = static_cast<std::size_t>(offset);
+                const std::size_t end = static_cast<std::size_t>(end64);
+                if (magic_.size() < end)
+                {
+                    magic_.resize(end, 0);
+                }
+                std::copy(bytes, bytes + (end - begin), magic_.begin() + begin);
+            }
+            if (processed_size)
+            {
+                *processed_size = consumed;
             }
             return hr;
         }
