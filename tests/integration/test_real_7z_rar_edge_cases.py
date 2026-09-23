@@ -3,7 +3,6 @@ from pathlib import Path
 
 import pytest
 
-from sunpack.contracts.detection import FactBag
 from sunpack.contracts.tasks import ArchiveTask
 from sunpack.coordinator.task_scan import direct_file_task
 from sunpack.extraction.scheduler import ExtractionScheduler
@@ -67,7 +66,9 @@ def test_real_7z_missing_volume_priority_survives_irrelevant_wrong_password(tmp_
         detected_ext="7z",
         missing_volume_evidence="seven_zip_start_header_length",
     )
-    task.fact_bag.set("archive.password", "wrong")
+    knowledge = task.knowledge()
+    knowledge.set("archive.password", "wrong", source_layer="tests", source_module="real_edge_cases")
+    task.set_knowledge(knowledge)
     scheduler = ExtractionScheduler(max_retries=1)
     try:
         result = scheduler.extract(task, str(tmp_path / "out"))
@@ -130,16 +131,17 @@ def _task(
 ) -> ArchiveTask:
     all_parts = [str(item) for item in (parts or [path])]
     task = direct_file_task(str(path), all_parts=all_parts)
-    task.detected_ext = detected_ext
-    task.fact_bag.set("file.detected_ext", detected_ext)
     task.ensure_archive_state()
+    state = task.archive_state()
+    source = replace(state.source, format_hint=detected_ext) if detected_ext else state.source
+    analysis = dict(state.analysis)
     if missing_volume_evidence:
-        state = task.archive_state()
+        analysis["execution"] = {"missing_volume_evidence": missing_volume_evidence}
+    if source != state.source or analysis != state.analysis:
         task.set_archive_state(replace(
             state,
-            analysis={
-                **state.analysis,
-                "execution": {"missing_volume_evidence": missing_volume_evidence},
-            },
+            source=source,
+            format_hint=detected_ext or state.format_hint,
+            analysis=analysis,
         ))
     return task
