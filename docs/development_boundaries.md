@@ -81,7 +81,7 @@ contracts
 | Detection | `detection.DetectionScheduler` | Rule decisions over the candidate facts provided by the Coordinator. |
 | Candidate orchestration | `coordinator.task_provider.ArchiveTaskProvider` | Chains filesystem, relations, detection, and structural rescue. |
 | Recursion policy | `coordinator.output_scan_policy.NestedOutputScanPolicy` | Decides whether an output directory enters the next scan round. |
-| General archive analysis | `analysis.ArchiveAnalyzer` | Provides format, structure, boundary, fuzzy, and embedded analysis without business scheduling. |
+| General archive analysis | `analysis.ArchiveAnalyzer` | Provides format, structure, boundary, and embedded analysis without business scheduling. |
 | Input planning | `detection.input_planning.ArchiveInputPlanningStage` | Converts neutral analysis reports into main-pipeline archive inputs and embedded subtasks. |
 | Passwords | `sunpack.passwords` | Password candidates, scheduling, fast verifiers, final 7z.dll confirmation. |
 | Extraction | `extraction.scheduler.ExtractionScheduler` | Per-archive output directory, password resolution, worker extraction. |
@@ -137,7 +137,7 @@ The rule layer must not depend on processor implementation details; shared defau
 
 ### analysis
 
-`analysis` is the general archive analysis capability layer without business policy. The public entry point `ArchiveAnalyzer` accepts a file, multi-volume, range, or segment source plus an `AnalysisRequest`, and outputs format evidence, fragment boundaries, confidence, and damage markers; `probe_volume_anchor_paths` provides Relations with batched, bounded, read-only native volume structural evidence. Internally it may run signature prepass, fuzzy, format probes, and embedded fallback, but it must not depend on `ArchiveTask`, Detection, or the Coordinator, and must not write business knowledge.
+`analysis` is the general archive analysis capability layer without business policy. The public entry point `ArchiveAnalyzer` accepts a file, multi-volume, range, or segment source plus an `AnalysisRequest`, and outputs format evidence, fragment boundaries, confidence, and damage markers; `probe_volume_anchor_paths` provides Relations with batched, bounded, read-only native volume structural evidence. Internally it may run signature prepass, format probes, and embedded fallback, but it must not depend on `ArchiveTask`, Detection, or the Coordinator, and must not write business knowledge.
 
 ### passwords
 

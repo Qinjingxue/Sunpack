@@ -283,7 +283,6 @@ Input planning turns structural analysis results into plain archives, split volu
 | `max_read_mb_per_archive` | `256` | Read limit for a single archive; `null` means unlimited. |
 | `prepass.enabled` | `true` | Whether to read the head and tail regions for a quick pre-check. |
 | `prepass.head_bytes` / `tail_bytes` | `1048576` / `1048576` | Head and tail pre-check sizes. |
-| `fuzzy.enabled` | `true` | Whether binary signature analysis is enabled. |
 | `thresholds.extractable_confidence` | `0.85` | Minimum confidence for direct extraction. |
 
 Default structural modules and their main limits:
@@ -295,8 +294,6 @@ Default structural modules and their main limits:
 | `seven_zip` | `max_next_header_check_bytes = 1048576` |
 | `tar` | `max_entries_to_walk = 64` |
 | `gzip`, `bzip2`, `xz`, `zstd`, `tar_gz`, `tar_bz2`, `tar_xz`, `tar_zst` | `max_probe_bytes = 4194304` |
-
-`fuzzy.modules.binary_profile` uses a 65536-byte window by default, at most 8 windows, and at most 1048576 sampled bytes; the entropy thresholds are high `6.8`, low `3.5`, and delta `1.25`, the ngram top-k is `8`, and the ngram sample limit is `262144` bytes.
 
 ## verification
 

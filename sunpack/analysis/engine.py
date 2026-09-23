@@ -1,7 +1,6 @@
 from typing import Any
 
-from sunpack.analysis.config import analysis_config, enabled_fuzzy_module_configs
-from sunpack.analysis.fuzzy_pipeline.registry import discover_fuzzy_analysis_modules, get_fuzzy_analysis_module_registry
+from sunpack.analysis.config import analysis_config
 from sunpack.analysis.structure_pipeline.prepass import run_signature_prepass
 from sunpack.analysis.structure_pipeline.registry import discover_analysis_modules, get_analysis_module_registry
 from sunpack.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence
@@ -15,7 +14,6 @@ class AnalysisEngine:
         root_config = config or {}
         self.config = analysis_config(root_config)
         self.executor_pool = executor_pool
-        discover_fuzzy_analysis_modules()
         discover_analysis_modules()
 
     def analyze_path(
@@ -74,23 +72,9 @@ class AnalysisEngine:
         })
         if not prepass and needs_prepass and prepass_config.get("enabled", True):
             prepass = run_signature_prepass(view, prepass_config)
-        fuzzy_requested = AnalysisCapability.FUZZY_PROFILE in requested
-        # Structure modules already expose the information needed to decide
-        # whether fuzzy profiling can add anything: selected status, segment
-        # boundaries and damage flags.  Run those modules first and only pay
-        # for byte-distribution profiling when that shared evidence is not a
-        # complete, clean, whole-input archive proof.
-        fuzzy = {}
-        structure_context = dict(prepass)
-        modules = self._selected_structure_modules(structure_context) if AnalysisCapability.FORMAT_STRUCTURE in requested else []
-        evidences = self._run_structure_modules(view, structure_context, modules) if modules else []
+        modules = self._selected_structure_modules(prepass) if AnalysisCapability.FORMAT_STRUCTURE in requested else []
+        evidences = self._run_structure_modules(view, prepass, modules) if modules else []
         selected = self._selected_evidences(evidences)
-        if fuzzy_requested and self._structure_requires_fuzzy(selected, int(view.size)):
-            fuzzy = self._run_fuzzy_pipeline(view, prepass)
-            if fuzzy and modules and self._fuzzy_affects_structure(fuzzy) and any(item.segments for item in evidences):
-                structure_context = {**prepass, "fuzzy": fuzzy}
-                evidences = self._run_structure_modules(view, structure_context, modules)
-                selected = self._selected_evidences(evidences)
         stats = view.stats()
         return ArchiveAnalysisReport(
             path=report_path or view.path,
@@ -98,51 +82,8 @@ class AnalysisEngine:
             evidences=sorted(evidences, key=lambda item: item.confidence, reverse=True),
             selected=selected,
             prepass=prepass,
-            fuzzy=fuzzy,
             read_bytes=stats.read_bytes,
             cache_hits=stats.cache_hits,
-        )
-
-    @staticmethod
-    def _structure_requires_fuzzy(selected: list[ArchiveFormatEvidence], file_size: int) -> bool:
-        """Use format-module evidence; never perform an independent read/probe here."""
-        if len(selected) != 1:
-            return True
-        evidence = selected[0]
-        if evidence.status != "extractable" or len(evidence.segments) != 1:
-            return True
-        segment = evidence.segments[0]
-        if segment.role != "primary" or segment.start_offset != 0:
-            return True
-        if segment.end_offset is None or int(segment.end_offset) < file_size:
-            return True
-        if segment.damage_flags:
-            return True
-        boundary_confidence = str(evidence.details.get("boundary_confidence") or "").lower()
-        if boundary_confidence in {"none", "low", "unknown"}:
-            return True
-        return False
-
-    @staticmethod
-    def _fuzzy_affects_structure(fuzzy: dict[str, Any]) -> bool:
-        profile = fuzzy.get("binary_profile") if isinstance(fuzzy.get("binary_profile"), dict) else fuzzy
-        route_hints = {
-            "carrier_prefix_likely",
-            "trailing_text_junk_likely",
-            "trailing_padding_likely",
-            "entropy_boundary_shift",
-        }
-        if route_hints.intersection(str(item) for item in profile.get("hints") or []):
-            return True
-        return any(
-            isinstance(item, dict)
-            and item.get("kind") in {
-                "carrier_prefix_end",
-                "entropy_boundary",
-                "trailing_junk_start",
-                "tail_padding_start",
-            }
-            for item in profile.get("offset_hints") or []
         )
 
     def _build_single_view(self, path: str) -> SharedBinaryView:
@@ -166,27 +107,6 @@ class AnalysisEngine:
             max_read_bytes=max_read_bytes,
             max_concurrent_reads=int(self.config.get("max_concurrent_reads", 1) or 1),
         )
-
-    def _run_fuzzy_pipeline(self, view: SharedBinaryView | MultiVolumeBinaryView, prepass: dict) -> dict[str, Any]:
-        fuzzy_config = self.config.get("fuzzy") if isinstance(self.config.get("fuzzy"), dict) else {}
-        if not fuzzy_config.get("enabled", True):
-            return {}
-        module_configs = enabled_fuzzy_module_configs(self.config)
-        registry = get_fuzzy_analysis_module_registry()
-        results = {}
-        warnings = []
-        for name, module_config in module_configs.items():
-            module = registry.get(name)
-            if module is None:
-                warnings.append(f"{name}: fuzzy analysis module is not registered")
-                continue
-            try:
-                results[name] = module.analyze(view, prepass, module_config)
-            except Exception as exc:
-                warnings.append(f"{name}: {exc}")
-        if warnings:
-            results["warnings"] = warnings
-        return results
 
     def _selected_structure_modules(self, prepass: dict):
         enabled_configs = enabled_module_configs(self.config)

@@ -83,7 +83,7 @@ contracts
 | 检测 | `detection.DetectionScheduler` | 对 Coordinator 提供的候选 facts 做规则判断。 |
 | 候选编排 | `coordinator.task_provider.ArchiveTaskProvider` | 串联 filesystem、relations、detection 和结构救援。 |
 | 递归策略 | `coordinator.output_scan_policy.NestedOutputScanPolicy` | 判断输出目录是否进入下一轮扫描。 |
-| 通用归档分析 | `analysis.ArchiveAnalyzer` | 提供无业务调度的格式、结构、边界、fuzzy 和 embedded 分析能力。 |
+| 通用归档分析 | `analysis.ArchiveAnalyzer` | 提供无业务调度的格式、结构、边界和 embedded 分析能力。 |
 | 输入规划 | `detection.input_planning.ArchiveInputPlanningStage` | 把中立分析报告转换为主流程归档输入和 embedded 子任务。 |
 | 密码 | `sunpack.passwords` | 密码候选、调度、fast verifier、7z.dll 最终确认。 |
 | 解压 | `extraction.scheduler.ExtractionScheduler` | 单归档输出目录、密码解析、worker 解压。 |
@@ -140,7 +140,7 @@ contracts
 
 ### analysis
 
-`analysis` 是无业务策略的通用归档分析能力层。公共入口 `ArchiveAnalyzer` 接收 file、multi-volume、range 或 segment source 和 `AnalysisRequest`，输出格式证据、片段边界、置信度与损坏标记；`probe_volume_anchor_paths` 为 Relations 提供批量、有界、只读的原生分卷结构证据。它内部可以执行 signature prepass、fuzzy、格式 probe 和 embedded fallback，但不得依赖 `ArchiveTask`、Detection 或 Coordinator，也不得写业务 knowledge。
+`analysis` 是无业务策略的通用归档分析能力层。公共入口 `ArchiveAnalyzer` 接收 file、multi-volume、range 或 segment source 和 `AnalysisRequest`，输出格式证据、片段边界、置信度与损坏标记；`probe_volume_anchor_paths` 为 Relations 提供批量、有界、只读的原生分卷结构证据。它内部可以执行 signature prepass、格式 probe 和 embedded fallback，但不得依赖 `ArchiveTask`、Detection 或 Coordinator，也不得写业务 knowledge。
 
 ### passwords
 

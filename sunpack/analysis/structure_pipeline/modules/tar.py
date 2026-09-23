@@ -1,7 +1,6 @@
 from sunpack.analysis.structure_pipeline.module import AnalysisModuleSpec
 from sunpack.analysis.structure_pipeline.modules._read_fault import read_fault_damage_flags
 from sunpack.analysis.structure_pipeline.registry import register_analysis_module
-from sunpack.analysis.structure_pipeline.modules._fuzzy import apply_fuzzy_routes
 from sunpack.analysis.result import ArchiveFormatEvidence, ArchiveSegment
 from sunpack.analysis.structure_pipeline.modules._combine import combine_format_candidates
 from sunpack.analysis.probes.tar import TarProbeOptions, probe_tar_view
@@ -91,16 +90,6 @@ class TarAnalysisModule:
                 details = dict(result)
                 evidence = list(result.get("evidence") or [])
                 damage_flags = read_fault_damage_flags(result)
-                apply_fuzzy_routes(
-                    details,
-                    evidence,
-                    damage_flags,
-                    prepass,
-                    start_offset=start,
-                    end_offset=result.get("segment_end"),
-                    file_size=int(view.size),
-                    format_hint="tar",
-                )
                 return ArchiveFormatEvidence(
                     format="tar",
                     confidence=confidence,

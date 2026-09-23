@@ -1,6 +1,5 @@
 from sunpack.analysis.structure_pipeline.module import AnalysisModuleSpec
 from sunpack.analysis.structure_pipeline.registry import register_analysis_module
-from sunpack.analysis.structure_pipeline.modules._fuzzy import apply_fuzzy_routes
 from sunpack.analysis.structure_pipeline.modules._read_fault import read_fault_damage_flags
 from sunpack.analysis.result import ArchiveFormatEvidence, ArchiveSegment
 from sunpack.analysis.structure_pipeline.modules._combine import combine_format_candidates
@@ -112,16 +111,6 @@ class RarAnalysisModule:
             native["boundary_confidence"] = "low"
             native["password_required"] = True
             native["header_encrypted"] = True
-        apply_fuzzy_routes(
-            native,
-            evidence,
-            damage_flags,
-            prepass,
-            start_offset=start,
-            end_offset=segment_end,
-            file_size=file_size,
-            format_hint="rar",
-        )
         return ArchiveFormatEvidence(
             format="rar",
             confidence=confidence,

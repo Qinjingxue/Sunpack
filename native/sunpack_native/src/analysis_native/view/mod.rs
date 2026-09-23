@@ -1,4 +1,3 @@
-use super::profile::{fuzzy_binary_profile as build_fuzzy_binary_profile, BinaryProfileConfig};
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, ReaderConfig};
 use crate::password::rar::{probe_header_encrypted_terminal, RarTerminalProof};

@@ -86,7 +86,7 @@ def _tar_bytes() -> bytes:
     return buffer.getvalue()
 
 
-def test_clean_whole_input_formats_skip_fuzzy_from_shared_structure_evidence(tmp_path):
+def test_clean_whole_input_formats_use_structure_evidence(tmp_path):
     payload = b"clean payload" * 32
     cases = {
         "zip": _zip_bytes(tmp_path),
@@ -103,7 +103,6 @@ def test_clean_whole_input_formats_skip_fuzzy_from_shared_structure_evidence(tmp
         report = AnalysisEngine().analyze_path(str(path))
 
         assert report.selected, name
-        assert report.fuzzy == {}, name
 
 
 def test_analysis_scheduler_finds_embedded_archive_segments(tmp_path):
@@ -224,47 +223,6 @@ def test_analysis_reuses_detection_hit_map_and_preserves_same_format_segments(tm
         len(prefix), len(prefix) + len(first) + len(gap),
     ]
     assert report.prepass["source"] == "embedded_scan"
-
-
-def test_analysis_scheduler_runs_fuzzy_binary_profile_before_structure(tmp_path):
-    payload = b"MZ" + (b"A" * 8192) + _seven_zip_bytes() + b"\xff" * 8192
-    path = tmp_path / "profiled.bin"
-    path.write_bytes(payload)
-
-    report = AnalysisEngine({
-        "analysis": {
-            "fuzzy": {
-                "modules": [
-                    {
-                        "name": "binary_profile",
-                        "enabled": True,
-                        "window_bytes": 4096,
-                        "max_windows": 4,
-                        "max_sample_bytes": 16 * 1024,
-                    }
-                ]
-            }
-        }
-    }).analyze_path(str(path))
-
-    profile = report.fuzzy["binary_profile"]
-    assert profile["sampled"] is True
-    assert profile["sample_count"] >= 2
-    for key in (
-        "entropy_profile",
-        "byte_class_profile",
-        "window_anomalies",
-        "ngram_sketch",
-        "run_profile",
-        "offset_hints",
-    ):
-        assert key in profile
-    assert profile["ngram_sketch"]["byte_histogram_top"]
-    by_format = {item.format: item for item in report.evidences}
-    assert "7z" in by_format
-    assert "fuzzy" in by_format["7z"].details
-    assert "carrier_prefix" in by_format["7z"].segments[0].damage_flags
-    assert "fuzzy:carrier_prefix" in by_format["7z"].segments[0].evidence
 
 
 def test_zip_embedded_local_header_without_eocd_keeps_embedded_start(tmp_path):
@@ -500,7 +458,7 @@ def test_7z_next_header_crc_damage_keeps_boundary_but_lowers_integrity(tmp_path)
     ],
     ids=["zip", "seven-zip"],
 )
-def test_analysis_scheduler_skips_fuzzy_for_clean_archives_across_split_volumes(
+def test_analysis_scheduler_uses_structure_for_clean_archives_across_split_volumes(
     tmp_path, extension, build_data, split_at, expected_format, confidence
 ):
     data = build_data(tmp_path)
@@ -512,7 +470,6 @@ def test_analysis_scheduler_skips_fuzzy_for_clean_archives_across_split_volumes(
     report = AnalysisEngine().analyze_paths([str(first), str(second)])
     evidence = {item.format: item for item in report.evidences}[expected_format]
 
-    assert report.fuzzy == {}
     assert evidence.status == "extractable"
     assert evidence.confidence == confidence
     assert evidence.segments[0].start_offset == 0

@@ -1,6 +1,5 @@
 from sunpack.analysis.structure_pipeline.module import AnalysisModuleSpec
 from sunpack.analysis.structure_pipeline.registry import register_analysis_module
-from sunpack.analysis.structure_pipeline.modules._fuzzy import apply_fuzzy_routes
 from sunpack.analysis.structure_pipeline.modules._read_fault import read_fault_damage_flags
 from sunpack.analysis.result import ArchiveFormatEvidence, ArchiveSegment
 from sunpack.analysis.structure_pipeline.modules._combine import combine_format_candidates
@@ -129,16 +128,6 @@ class ZipAnalysisModule:
             native.setdefault("integrity_confidence", "unknown" if not plausible else "medium")
         native.setdefault("boundary_confidence", "high" if plausible and walk_ok else "low")
         segment_end = min(end_offset, int(view.size)) if end_offset is not None else None
-        apply_fuzzy_routes(
-            native,
-            evidence,
-            damage_flags,
-            prepass,
-            start_offset=archive_offset,
-            end_offset=segment_end,
-            file_size=int(view.size),
-            format_hint="zip",
-        )
         return ArchiveFormatEvidence(
             format="zip",
             confidence=confidence,
@@ -172,16 +161,6 @@ class ZipAnalysisModule:
         }
         evidence = ["zip:local_header"]
         damage_flags = ["central_directory_unreliable", "local_header_recovery"]
-        apply_fuzzy_routes(
-            details,
-            evidence,
-            damage_flags,
-            prepass,
-            start_offset=start,
-            end_offset=None,
-            file_size=int(view.size),
-            format_hint="zip",
-        )
         return ArchiveFormatEvidence(
             format="zip",
             confidence=0.70,

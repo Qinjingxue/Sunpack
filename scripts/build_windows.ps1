@@ -1079,7 +1079,6 @@ Write-Step "Building Windows release with Nuitka"
     "sunpack.detection.formats",
     "sunpack.embedded",
     "sunpack.analysis.structure_pipeline.modules",
-    "sunpack.analysis.fuzzy_pipeline.modules",
     "sunpack.passwords.candidates",
         "sunpack.extraction.internal",
         "sunpack.relations.internal",
