@@ -2196,7 +2196,7 @@ fn parse_relation_numbered_volume(path: &str) -> Option<ParsedVolume> {
 /// group is a valid archive.
 #[pyfunction]
 pub(crate) fn relations_size_filter_split_family_keys(path: &str) -> Vec<String> {
-    if !may_have_size_deferred_split_identity(path) {
+    if !may_have_relation_filename(path) {
         return Vec::new();
     }
     let mut keys = Vec::new();
@@ -2269,7 +2269,7 @@ pub(crate) fn relations_apply_split_size_anchors(
         .collect())
 }
 
-fn may_have_size_deferred_split_identity(path: &str) -> bool {
+pub(crate) fn may_have_relation_filename(path: &str) -> bool {
     let name = basename(path).to_ascii_lowercase();
     if parse_loose_rar_part_volume(&name).is_some() {
         return true;
