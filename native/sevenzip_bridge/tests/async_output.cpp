@@ -70,6 +70,62 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
     return actual == expected;
 }
 
+bool write_positioned_ranges_out_of_order(const std::filesystem::path& directory) {
+    constexpr std::size_t payload_size = 8U << 20;
+    constexpr std::size_t quarter = payload_size / 4;
+    std::vector<unsigned char> expected(payload_size);
+    for (std::size_t index = 0; index < expected.size(); ++index) {
+        expected[index] = static_cast<unsigned char>((index * 19U + index / 113U) & 0xFFU);
+    }
+
+    AsyncFileWriter writer;
+    const auto job = writer.make_job();
+    const auto file = writer.make_file(
+        job, (directory / L"positioned.bin").wstring(), L"positioned.bin", 10, 10);
+
+    std::atomic<bool> ok{true};
+    std::vector<std::thread> producers;
+    for (int part = 3; part >= 0; --part) {
+        producers.emplace_back([&, part] {
+            const std::size_t offset = static_cast<std::size_t>(part) * quarter;
+            std::uint32_t processed = 0;
+            const HRESULT hr = writer.write_at(
+                file,
+                static_cast<UInt64>(offset),
+                expected.data() + offset,
+                static_cast<std::uint32_t>(quarter),
+                &processed);
+            if (hr != S_OK || processed != quarter) {
+                ok.store(false, std::memory_order_release);
+            }
+        });
+    }
+    for (auto& producer : producers) {
+        producer.join();
+    }
+    if (!ok.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    writer.record_operation_result(file, 0);
+    writer.close_file(file, {});
+    if (writer.finish_job(job) != S_OK) {
+        return false;
+    }
+
+    const auto snapshot = writer.snapshot_file(file);
+    if (snapshot.failed || !snapshot.closed ||
+        snapshot.accepted_bytes != payload_size ||
+        snapshot.written_bytes != payload_size) {
+        return false;
+    }
+
+    std::ifstream input(directory / L"positioned.bin", std::ios::binary);
+    std::vector<unsigned char> actual(
+        (std::istreambuf_iterator<char>(input)), std::istreambuf_iterator<char>());
+    return actual == expected;
+}
+
 bool write_zero_length_file(const std::filesystem::path& directory) {
     AsyncFileWriter writer;
     const auto job = writer.make_job();
@@ -542,6 +598,7 @@ int main() {
 #ifdef _WIN32
     const auto directory = make_test_directory();
     const bool passed = write_same_file_concurrently(directory) &&
+        write_positioned_ranges_out_of_order(directory) &&
         write_zero_length_file(directory) &&
         closes_after_delayed_open_failure(directory) &&
         cancelled_job_returns_pending_to_zero(directory) &&
