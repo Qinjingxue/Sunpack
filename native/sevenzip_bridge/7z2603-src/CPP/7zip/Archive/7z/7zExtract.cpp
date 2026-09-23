@@ -252,6 +252,10 @@ HRESULT CFolderOutStream::InitPositioned(unsigned startIndex, unsigned numFiles)
 
   _positionedSize = logicalPos;
   _positionedMode = true;
+
+  if (_positionedSize == 0)
+    return FinishPositioned(NExtract::NOperationResult::kOK);
+
   return S_OK;
 }
 
