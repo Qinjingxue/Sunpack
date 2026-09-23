@@ -42,26 +42,8 @@ typedef struct CLzma2DecMt CLzma2DecMt;
 typedef CLzma2DecMt * CLzma2DecMtHandle;
 // Z7_DECLARE_HANDLE(CLzma2DecMtHandle)
 
-typedef struct
-{
-  void *context;
-  size_t (*WriteAt)(void *context, UInt64 offset, const void *data, size_t size);
-} ISunpackPositionedOutStream;
-
 CLzma2DecMtHandle Lzma2DecMt_Create(ISzAllocPtr alloc, ISzAllocPtr allocMid);
 void Lzma2DecMt_Destroy(CLzma2DecMtHandle p);
-
-SRes Lzma2DecMt_DecodePositioned(CLzma2DecMtHandle p,
-    Byte prop,
-    const CLzma2DecMtProps *props,
-    ISeqOutStreamPtr outStream,
-    const ISunpackPositionedOutStream *positionedOutStream,
-    const UInt64 *outDataSize,
-    int finishMode,
-    ISeqInStreamPtr inStream,
-    UInt64 *inProcessed,
-    int *isMT,
-    ICompressProgressPtr progress);
 
 SRes Lzma2DecMt_Decode(CLzma2DecMtHandle p,
     Byte prop,
