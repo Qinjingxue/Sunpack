@@ -176,7 +176,7 @@ knowledge = task.knowledge()
 Do not read private task state. Use `ArchiveTask.knowledge()` / typed contracts, or add a public method.
 
 ```python
-from sunpack.pipeline.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler
+from sunpack.pipeline.coordinator.engine import PipelineEngine  # inside runtime Watch scheduler
 ```
 
 `sunpack.runtime.watch` does not construct the coordinator engine directly. The application composition layer creates and starts the process-level

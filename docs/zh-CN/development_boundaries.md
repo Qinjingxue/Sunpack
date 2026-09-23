@@ -176,7 +176,7 @@ knowledge = task.knowledge()
 不要读取任务私有状态。使用 `ArchiveTask.knowledge()` / 类型化 contract，或补公开方法。
 
 ```python
-from sunpack.pipeline.coordinator.engine import PipelineEngine  # inside filesystem watcher scheduler
+from sunpack.pipeline.coordinator.engine import PipelineEngine  # inside runtime Watch scheduler
 ```
 
 `sunpack.runtime.watch` 不直接构造 coordinator engine。应用组合层创建并启动进程级
