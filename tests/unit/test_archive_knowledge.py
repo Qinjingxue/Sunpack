@@ -42,7 +42,7 @@ def test_archive_knowledge_commit_revision_and_projection_cache_invalidation(tmp
 def test_archive_knowledge_commit_reuses_unchanged_branches_and_isolates_working_copy(tmp_path):
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"abc")
-    task = ArchiveTask.from_fact_bag(_fact_bag_for_path(archive_path))
+    task = make_archive_task(archive_path, format_hint="zip")
     knowledge = task.knowledge()
     knowledge.set("analysis.large", {"rows": [{"index": index, "value": "x" * 64} for index in range(500)]})
     commit_task_knowledge(task, knowledge)
