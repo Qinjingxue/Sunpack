@@ -136,21 +136,13 @@ class DetectionScanSession:
                 filesystem_routed=True,
             )
             bags = [relation_group_to_fact_bag(group) for group in groups]
-            claimed_paths = {
-                path_key(path)
-                for group in groups
-                for path in group.owned_paths
-                if path
-            }
             for bag in bags:
                 bag.set("filesystem.route", "relations")
                 anchor = bag.get("relation.volume_anchor")
                 if isinstance(anchor, dict) and anchor.get("format"):
                     bag.set("filesystem.format_hint", str(anchor["format"]).lower())
 
-            for path, size, route, format_hint, reject_mask in snapshot.file_routing_rows():
-                if route == "relations" or path_key(path) in claimed_paths:
-                    continue
+            for path, size, route, format_hint, reject_mask in snapshot.non_relation_file_routing_rows():
                 bags.append(_filesystem_candidate_bag(
                     path,
                     size=size,
