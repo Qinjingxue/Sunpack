@@ -510,7 +510,7 @@ static SRes Lzma2DecMt_MtCallback_Write(void *pp, unsigned coderIndex,
     BoolInt *needContinue, BoolInt *canRecode)
 {
   CLzma2DecMt *me = (CLzma2DecMt *)pp;
-  const CLzma2DecMtThread *t = &me->coders[coderIndex];
+  CLzma2DecMtThread *t = &me->coders[coderIndex];
   size_t size = t->outCodeSize;
   const Byte *data = t->outBuf.data;
   BoolInt needContinue2 = True;
@@ -564,6 +564,7 @@ static SRes Lzma2DecMt_MtCallback_Write(void *pp, unsigned coderIndex,
       size -= cur;
       if (size == 0)
       {
+        SunpackFileBuffer_Unmap(&t->outBuf);
         *needContinue = needContinue2;
         return SZ_OK;
       }
