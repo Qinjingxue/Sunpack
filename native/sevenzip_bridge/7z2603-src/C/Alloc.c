@@ -299,8 +299,8 @@ static BoolInt SunpackFileBuffer_CreateMapped(CSunpackFileBuffer *p, size_t size
   DWORD sparseBytes = 0;
   const UInt64 size64 = (UInt64)size;
 
-  pathLen = GetTempPathW((DWORD)Z7_ARRAY_SIZE(tempPath), tempPath);
-  if (pathLen == 0 || pathLen >= Z7_ARRAY_SIZE(tempPath))
+  pathLen = GetTempPathW((DWORD)(sizeof(tempPath) / sizeof(tempPath[0])), tempPath);
+  if (pathLen == 0 || pathLen >= (DWORD)(sizeof(tempPath) / sizeof(tempPath[0])))
     return False;
   if (!GetTempFileNameW(tempPath, L"spk", 0, tempName))
     return False;
@@ -360,6 +360,18 @@ static BoolInt SunpackFileBuffer_CreateMapped(CSunpackFileBuffer *p, size_t size
   return True;
 }
 
+static BoolInt SunpackFileBuffer_MapExisting(CSunpackFileBuffer *p, size_t size)
+{
+  void *view;
+  if (!p->mappingHandle || p->capacity < size)
+    return False;
+  view = MapViewOfFile((HANDLE)p->mappingHandle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, size);
+  if (!view)
+    return False;
+  p->data = (Byte *)view;
+  return True;
+}
+
 BoolInt SunpackFileBuffer_Ensure(CSunpackFileBuffer *p, size_t size)
 {
   Byte *data;
@@ -368,6 +380,8 @@ BoolInt SunpackFileBuffer_Ensure(CSunpackFileBuffer *p, size_t size)
     size = 1;
   if (p->data && p->capacity >= size)
     return True;
+  if (p->fileBacked && p->capacity >= size)
+    return SunpackFileBuffer_MapExisting(p, size);
 
   SunpackFileBuffer_Release(p);
 
@@ -384,6 +398,14 @@ BoolInt SunpackFileBuffer_Ensure(CSunpackFileBuffer *p, size_t size)
   p->capacity = size;
   p->fileBacked = False;
   return True;
+}
+
+void SunpackFileBuffer_Unmap(CSunpackFileBuffer *p)
+{
+  if (!p || !p->fileBacked || !p->data)
+    return;
+  UnmapViewOfFile(p->data);
+  p->data = NULL;
 }
 
 #ifdef Z7_LARGE_PAGES
@@ -444,6 +466,49 @@ void BigFree(void *address)
 
 #endif // Z7_LARGE_PAGES
 #endif // _WIN32
+
+#ifndef _WIN32
+
+void SunpackFileBuffer_Construct(CSunpackFileBuffer *p)
+{
+  p->data = NULL;
+  p->capacity = 0;
+  p->fileHandle = NULL;
+  p->mappingHandle = NULL;
+  p->fileBacked = False;
+}
+
+void SunpackFileBuffer_Release(CSunpackFileBuffer *p)
+{
+  if (!p)
+    return;
+  if (p->data)
+    MidFree(p->data);
+  SunpackFileBuffer_Construct(p);
+}
+
+BoolInt SunpackFileBuffer_Ensure(CSunpackFileBuffer *p, size_t size)
+{
+  Byte *data;
+  if (size == 0)
+    size = 1;
+  if (p->data && p->capacity >= size)
+    return True;
+  SunpackFileBuffer_Release(p);
+  data = (Byte *)MidAlloc(size);
+  if (!data)
+    return False;
+  p->data = data;
+  p->capacity = size;
+  return True;
+}
+
+void SunpackFileBuffer_Unmap(CSunpackFileBuffer *p)
+{
+  UNUSED_VAR(p)
+}
+
+#endif
 
 
 static void *SzAlloc(ISzAllocPtr p, size_t size) { UNUSED_VAR(p)  return MyAlloc(size); }
@@ -518,144 +583,3 @@ typedef
 
 /*
   This posix_memalign() is for test purposes only.
-  We also need special Free() function instead of free(),
-  if this posix_memalign() is used.
-*/
-
-/*
-static int posix_memalign(void **ptr, size_t align, size_t size)
-{
-  size_t newSize = size + align;
-  void *p;
-  void *pAligned;
-  *ptr = NULL;
-  if (newSize < size)
-    return 12; // ENOMEM
-  p = MyAlloc(newSize);
-  if (!p)
-    return 12; // ENOMEM
-  pAligned = MY_ALIGN_PTR_UP_PLUS(p, align);
-  ((void **)pAligned)[-1] = p;
-  *ptr = pAligned;
-  return 0;
-}
-*/
-
-/*
-  ALLOC_ALIGN_SIZE >= sizeof(void *)
-  ALLOC_ALIGN_SIZE >= cache_line_size
-*/
-
-#define ALLOC_ALIGN_SIZE ((size_t)1 << 7)
-
-void *z7_AlignedAlloc(size_t size)
-{
-#ifndef USE_posix_memalign
-  
-  void *p;
-  void *pAligned;
-  size_t newSize;
-
-  /* also we can allocate additional dummy ALLOC_ALIGN_SIZE bytes after aligned
-     block to prevent cache line sharing with another allocated blocks */
-
-  newSize = size + ALLOC_ALIGN_SIZE * 1 + ADJUST_ALLOC_SIZE;
-  if (newSize < size)
-    return NULL;
-
-  p = MyAlloc(newSize);
-  
-  if (!p)
-    return NULL;
-  pAligned = MY_ALIGN_PTR_UP_PLUS(p, ALLOC_ALIGN_SIZE);
-
-  Print(" size="); PrintHex(size, 8);
-  Print(" a_size="); PrintHex(newSize, 8);
-  Print(" ptr="); PrintAddr(p);
-  Print(" a_ptr="); PrintAddr(pAligned);
-  PrintLn();
-
-  ((void **)pAligned)[-1] = p;
-
-  return pAligned;
-
-#else
-
-  void *p;
-  if (posix_memalign(&p, ALLOC_ALIGN_SIZE, size))
-    return NULL;
-
-  Print(" posix_memalign="); PrintAddr(p);
-  PrintLn();
-
-  return p;
-
-#endif
-}
-
-
-void z7_AlignedFree(void *address)
-{
-#ifndef USE_posix_memalign
-  if (address)
-    MyFree(((void **)address)[-1]);
-#else
-  free(address);
-#endif
-}
-
-
-static void *SzAlignedAlloc(ISzAllocPtr pp, size_t size)
-{
-  UNUSED_VAR(pp)
-  return z7_AlignedAlloc(size);
-}
-
-
-static void SzAlignedFree(ISzAllocPtr pp, void *address)
-{
-  UNUSED_VAR(pp)
-#ifndef USE_posix_memalign
-  if (address)
-    MyFree(((void **)address)[-1]);
-#else
-  free(address);
-#endif
-}
-
-#ifndef _WIN32
-
-#ifdef Z7_LARGE_PAGES
-
-#if 0 // 1 for debug
-  #include <stdio.h>
-  #include <string.h>  // for strerror()
-  #define PRF(x) x
-#else
-  #define PRF(x)
-#endif
-
-#ifdef USE_posix_memalign
-  /* madvise():
-     glibc <= 2.19 : _BSD_SOURCE
-     glibc  > 2.19 : _DEFAULT_SOURCE
-  */
-  /* && (defined(_DEFAULT_SOURCE) || defined(_BSD_SOURCE)) */
-#if 1 && !defined(Z7_NO_MADVISE) && \
-  (defined(__linux__) || defined(__unix__) || defined(__APPLE__))
-#include <sys/mman.h> // for madvise
-// #pragma message("sys/mman.h")
-#if (defined(MADV_HUGEPAGE) && defined(MADV_NOHUGEPAGE))
-  #define Z7_USE_BIG_ALLOC_MADVISE
-  // #pragma message("Z7_USE_BIG_ALLOC_MADVISE")
-#endif
-#endif
-#endif // USE_posix_memalign
-
-#ifdef Z7_USE_BIG_ALLOC_MADVISE
-#define LARGE_PAGE_SIZE_DEFAULT (1 << 21)
-#else
-#define LARGE_PAGE_SIZE_DEFAULT 0
-#endif
-
-extern
