@@ -193,6 +193,156 @@ void MyFree(void *address)
   free(address);
 }
 
+
+/*
+  Large MT decoder output buffers are frequently sized by the largest block
+  seen so far. On Windows, reserve address space once and commit only the
+  pages needed by the current block. A large historical commit is trimmed
+  when the new requirement falls to at most half of it and releases at least
+  16 MiB; this hysteresis avoids commit/decommit churn on similarly sized
+  blocks while returning genuine high-water excess to the system.
+*/
+#define SUNPACK_VM_TRIM_MIN ((size_t)1 << 24)
+#define SUNPACK_VM_RESERVE_STEP ((size_t)1 << 24)
+
+void SunpackVmBuffer_Construct(CSunpackVmBuffer *p)
+{
+  p->data = NULL;
+  p->reservedSize = 0;
+  p->committedSize = 0;
+}
+
+#ifdef _WIN32
+
+static size_t SunpackVmBuffer_RoundUp(size_t size, size_t alignment)
+{
+  const size_t mask = alignment - 1;
+  if (size > (size_t)-1 - mask)
+    return 0;
+  return (size + mask) & ~mask;
+}
+
+static size_t SunpackVmBuffer_PageSize(void)
+{
+  SYSTEM_INFO info;
+  GetSystemInfo(&info);
+  return (size_t)info.dwPageSize;
+}
+
+static size_t SunpackVmBuffer_ReserveSize(size_t size)
+{
+  SYSTEM_INFO info;
+  size_t step = SUNPACK_VM_RESERVE_STEP;
+  GetSystemInfo(&info);
+  if (step < (size_t)info.dwAllocationGranularity)
+    step = (size_t)info.dwAllocationGranularity;
+  return SunpackVmBuffer_RoundUp(size, step);
+}
+
+static void SunpackVmBuffer_TrimTo(CSunpackVmBuffer *p, size_t commitSize)
+{
+  if (!p->data || commitSize >= p->committedSize)
+    return;
+  if (VirtualFree(p->data + commitSize,
+        p->committedSize - commitSize, MEM_DECOMMIT))
+    p->committedSize = commitSize;
+}
+
+int SunpackVmBuffer_Ensure(CSunpackVmBuffer *p, size_t size)
+{
+  size_t pageSize;
+  size_t commitSize;
+
+  if (size == 0)
+    size = 1;
+
+  pageSize = SunpackVmBuffer_PageSize();
+  commitSize = SunpackVmBuffer_RoundUp(size, pageSize);
+  if (commitSize == 0)
+    return 0;
+
+  if (!p->data || p->reservedSize < commitSize)
+  {
+    const size_t reserveSize = SunpackVmBuffer_ReserveSize(commitSize);
+    Byte *data;
+    if (reserveSize == 0)
+      return 0;
+    SunpackVmBuffer_Release(p);
+    data = (Byte *)VirtualAlloc(NULL, reserveSize, MEM_RESERVE, PAGE_READWRITE);
+    if (!data)
+      return 0;
+    p->data = data;
+    p->reservedSize = reserveSize;
+  }
+
+  if (p->committedSize < commitSize)
+  {
+    void *result = VirtualAlloc(
+        p->data + p->committedSize,
+        commitSize - p->committedSize,
+        MEM_COMMIT,
+        PAGE_READWRITE);
+    if (!result)
+      return 0;
+    p->committedSize = commitSize;
+  }
+  else if (p->committedSize - commitSize >= SUNPACK_VM_TRIM_MIN
+      && commitSize <= p->committedSize / 2)
+  {
+    SunpackVmBuffer_TrimTo(p, commitSize);
+  }
+
+  return 1;
+}
+
+void SunpackVmBuffer_Decommit(CSunpackVmBuffer *p)
+{
+  if (!p->data || p->committedSize == 0)
+    return;
+  if (VirtualFree(p->data, p->committedSize, MEM_DECOMMIT))
+    p->committedSize = 0;
+}
+
+void SunpackVmBuffer_Release(CSunpackVmBuffer *p)
+{
+  if (p->data)
+    VirtualFree(p->data, 0, MEM_RELEASE);
+  SunpackVmBuffer_Construct(p);
+}
+
+#else
+
+int SunpackVmBuffer_Ensure(CSunpackVmBuffer *p, size_t size)
+{
+  Byte *data;
+  if (size == 0)
+    size = 1;
+  if (p->data && p->reservedSize >= size)
+    return 1;
+  data = (Byte *)MyAlloc(size);
+  if (!data)
+    return 0;
+  MyFree(p->data);
+  p->data = data;
+  p->reservedSize = size;
+  p->committedSize = size;
+  return 1;
+}
+
+void SunpackVmBuffer_Decommit(CSunpackVmBuffer *p)
+{
+  UNUSED_VAR(p)
+}
+
+void SunpackVmBuffer_Release(CSunpackVmBuffer *p)
+{
+  MyFree(p->data);
+  SunpackVmBuffer_Construct(p);
+}
+
+#endif
+
+
 void *MyRealloc(void *address, size_t size)
 {
   if (size == 0)
