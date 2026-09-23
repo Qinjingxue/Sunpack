@@ -1,4 +1,4 @@
-from sunpack.coordinator.target_scan import build_fact_bags_for_targets
+from sunpack.coordinator.target_scan import build_candidates_for_targets
 from tests.helpers.detection_config import with_detection_pipeline
 
 
@@ -16,13 +16,13 @@ def test_filename_only_scan_does_not_absorb_unmarked_fuzzy_parts(tmp_path):
         "thresholds": {"archive_score_threshold": 1, "maybe_archive_threshold": 1},
     })
 
-    bags = build_fact_bags_for_targets([str(tmp_path)], config=config)
-    grouped = next(bag for bag in bags if bag.get("file.path") == str(first))
+    candidates = build_candidates_for_targets([str(tmp_path)], config=config)
+    grouped = next(candidate for candidate in candidates if candidate.entry_path == str(first))
 
-    assert grouped.get("candidate.member_paths") == [str(first)]
-    assert grouped.get("relation.split_volumes") is None
-    assert not grouped.get("relation.is_split_related")
+    assert grouped.member_paths == (str(first),)
+    assert grouped.archive_input is None or grouped.archive_input.open_mode == "file"
+    assert not grouped.is_split
     assert all(
-        str(path) not in grouped.get("candidate.member_paths")
+        str(path) not in grouped.member_paths
         for path in (normal_2, normal_3, fuzzy_4, fuzzy_5)
     )
