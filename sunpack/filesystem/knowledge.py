@@ -17,7 +17,6 @@ def write_filesystem_task(task: ArchiveTask) -> None:
         "path": carrier_path,
         "absolute_path": os.path.abspath(carrier_path) if carrier_path else "",
         "carrier_path": carrier_path,
-        "detected_ext": str(task.detected_ext or task.fact_bag.get("file.detected_ext") or ""),
         "split_members": list(task.all_parts or []),
         "cleanup_paths": list(task.cleanup_parts or []),
         **stat,
