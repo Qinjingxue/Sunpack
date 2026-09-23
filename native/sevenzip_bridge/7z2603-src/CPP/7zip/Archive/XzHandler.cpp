@@ -1002,43 +1002,9 @@ Z7_COM7F_IMF(CHandler::GetStream(UInt32 index, ISequentialInStream **stream))
 
 
 
-class CParallelXzSource
-{
-public:
-  explicit CParallelXzSource(IInStream *stream):
-      _stream(stream),
-      _pos((UInt64)(Int64)-1)
-  {}
-
-  HRESULT ReadAt(UInt64 pos, void *data, UInt32 size, UInt32 *processed)
-  {
-    std::lock_guard<std::mutex> lock(_mutex);
-    if (processed)
-      *processed = 0;
-    if (!_stream)
-      return E_FAIL;
-    if (_pos != pos)
-    {
-      RINOK(_stream->Seek((Int64)pos, STREAM_SEEK_SET, &_pos))
-    }
-    UInt32 realProcessed = 0;
-    const HRESULT res = _stream->Read(data, size, &realProcessed);
-    _pos += realProcessed;
-    if (processed)
-      *processed = realProcessed;
-    return res;
-  }
-
-private:
-  IInStream *_stream;
-  UInt64 _pos;
-  std::mutex _mutex;
-};
-
-
 static HRESULT DecodeBlock_Positioned(
     CXzUnpackerCPP2 &xzu,
-    CParallelXzSource &source,
+    sunpack::sevenzip::RandomAccessReader &source,
     const CBlockInfo &block,
     UInt64 unpackSize,
     sunpack::sevenzip::PositionedOutStream &outStream,
@@ -1077,7 +1043,7 @@ static HRESULT DecodeBlock_Positioned(
       {
         UInt32 ask = (UInt32)(std::min<UInt64>)(readRem, kInBufSize);
         UInt32 got = 0;
-        RINOK(source.ReadAt(readPos, inBuf.data(), ask, &got))
+        RINOK(source.read_at(readPos, inBuf.data(), ask, &got))
         if (got == 0)
         {
           decodeRes = SZ_ERROR_INPUT_EOF;
@@ -1168,6 +1134,11 @@ static HRESULT DecodeBlocks_Positioned(
   if (!handler._stream || !handler._blocks || handler._blocksArraySize < 2)
     return E_NOTIMPL;
 
+  sunpack::sevenzip::RandomAccessInStream *randomSource =
+      sunpack::sevenzip::random_access_in_stream(handler._stream);
+  if (!randomSource)
+    return E_NOTIMPL;
+
   const size_t numBlocks = handler._blocksArraySize - 1;
   if (numBlocks == 0)
     return E_NOTIMPL;
@@ -1189,7 +1160,6 @@ static HRESULT DecodeBlocks_Positioned(
     desiredThreads = 1 + extraCredits;
   }
 
-  CParallelXzSource source(handler._stream);
   std::atomic<size_t> nextBlock(0);
   std::atomic<bool> stop(false);
   std::atomic<UInt64> inDone(0);
@@ -1218,6 +1188,15 @@ static HRESULT DecodeBlocks_Positioned(
       previousContext = sunpack_cpu_exchange_current_job_context(cpuContext);
 
     CXzUnpackerCPP2 xzu;
+    std::unique_ptr<sunpack::sevenzip::RandomAccessReader> source =
+        randomSource->open_random_reader();
+    if (!source)
+    {
+      publishFailure(E_FAIL, SZ_OK);
+      if (cpuContext)
+        sunpack_cpu_exchange_current_job_context(previousContext);
+      return;
+    }
 
     for (;;)
     {
@@ -1234,7 +1213,7 @@ static HRESULT DecodeBlocks_Positioned(
 
       SRes blockRes = SZ_OK;
       const HRESULT hres = DecodeBlock_Positioned(
-          xzu, source, block, unpackSize, outStream, stop, blockRes);
+          xzu, *source, block, unpackSize, outStream, stop, blockRes);
 
       if (hres != S_OK || blockRes != SZ_OK)
       {
