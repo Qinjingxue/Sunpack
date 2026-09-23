@@ -58,7 +58,6 @@ const TEST_IOCP_CHUNK_SIZE: usize = 1024 * 1024;
 #[derive(Debug, Clone, PartialEq)]
 struct EmbeddedCandidate {
     format: &'static str,
-    detected_ext: &'static str,
     offset: u64,
     end_offset: Option<u64>,
     confidence: f64,
@@ -156,7 +155,6 @@ pub(crate) fn scan_embedded_archives_with_reader(
     for candidate in scan.candidates {
         let row = PyDict::new(py);
         row.set_item("format", candidate.format)?;
-        row.set_item("detected_ext", candidate.detected_ext)?;
         row.set_item("offset", candidate.offset)?;
         row.set_item("end_offset", candidate.end_offset)?;
         row.set_item("confidence", candidate.confidence)?;
@@ -710,7 +708,6 @@ fn validate_zip_eocd(
     }
     Ok(Some(candidate(
         "zip",
-        ".zip",
         archive_offset,
         Some(end),
         1.0,
@@ -952,7 +949,7 @@ fn validate_zip(
         return Ok(None);
     }
     Ok(Some(candidate(
-        "zip", ".zip", offset, None, confidence, validation,
+        "zip", offset, None, confidence, validation,
     )))
 }
 
@@ -985,7 +982,6 @@ fn validate_seven_zip(
     }
     Ok(Some(candidate(
         "7z",
-        ".7z",
         offset,
         Some(end),
         1.0,
@@ -1027,7 +1023,6 @@ fn validate_rar4(
         if index == 0 && flags & 0x0080 != 0 {
             return Ok(Some(logical_candidate(
                 "rar",
-                ".rar",
                 offset,
                 None,
                 1.0,
@@ -1051,7 +1046,6 @@ fn validate_rar4(
         if header_type == 0x7b {
             return Ok(Some(candidate(
                 "rar",
-                ".rar",
                 offset,
                 Some(next),
                 1.0,
@@ -1062,7 +1056,6 @@ fn validate_rar4(
     }
     Ok(Some(logical_candidate(
         "rar",
-        ".rar",
         offset,
         None,
         0.90,
@@ -1139,7 +1132,6 @@ fn validate_rar5(
         if index == 0 && header_type == 4 {
             return Ok(Some(logical_candidate(
                 "rar",
-                ".rar",
                 offset,
                 None,
                 1.0,
@@ -1152,7 +1144,6 @@ fn validate_rar5(
         if header_type == 5 {
             return Ok(Some(candidate(
                 "rar",
-                ".rar",
                 offset,
                 Some(next),
                 1.0,
@@ -1163,7 +1154,6 @@ fn validate_rar5(
     }
     Ok(Some(logical_candidate(
         "rar",
-        ".rar",
         offset,
         None,
         0.90,
@@ -1183,7 +1173,6 @@ fn validate_gzip(
     };
     Ok(Some(candidate(
         "gzip",
-        ".gz",
         offset,
         Some(structure.end_offset),
         0.99,
@@ -1207,7 +1196,6 @@ fn validate_bzip2(
     };
     Ok(Some(candidate(
         "bzip2",
-        ".bz2",
         offset,
         Some(structure.end_offset),
         0.99,
@@ -1258,7 +1246,6 @@ fn validate_xz(
     };
     Ok(Some(candidate(
         "xz",
-        ".xz",
         offset,
         Some(structure.end_offset),
         0.99,
@@ -1278,7 +1265,6 @@ fn validate_zstd(
     };
     Ok(Some(candidate(
         "zstd",
-        ".zst",
         offset,
         Some(structure.end_offset),
         0.99,
@@ -1396,7 +1382,6 @@ fn validate_tar(
             }
             return Ok(Some(candidate(
                 "tar",
-                ".tar",
                 offset,
                 Some(cursor + 1024),
                 1.0,
@@ -1425,7 +1410,6 @@ fn validate_tar(
     }
     Ok(Some(logical_candidate(
         "tar",
-        ".tar",
         offset,
         None,
         0.90,
@@ -1471,7 +1455,6 @@ fn parse_tar_number(data: &[u8]) -> Option<u64> {
 
 fn candidate(
     format: &'static str,
-    ext: &'static str,
     offset: u64,
     end: Option<u64>,
     confidence: f64,
@@ -1480,7 +1463,6 @@ fn candidate(
     let exact = end.is_some();
     EmbeddedCandidate {
         format,
-        detected_ext: ext,
         offset,
         end_offset: end,
         confidence,
@@ -1495,13 +1477,12 @@ fn candidate(
 
 fn logical_candidate(
     format: &'static str,
-    ext: &'static str,
     offset: u64,
     end: Option<u64>,
     confidence: f64,
     validation: &'static str,
 ) -> EmbeddedCandidate {
-    let mut item = candidate(format, ext, offset, end, confidence, validation);
+    let mut item = candidate(format, offset, end, confidence, validation);
     item.candidate_kind = "logical_archive";
     item
 }
