@@ -819,7 +819,7 @@ namespace sunpack::sevenzip
             state.is_dir = current_item_is_dir_;
             state.trace_active = current_trace_active_;
             positioned_items_[index] = std::move(state);
-            return S_OK;
+            return PrepareOperation(ask_mode);
         }
 
         HRESULT set_positioned_operation_result(
