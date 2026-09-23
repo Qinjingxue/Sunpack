@@ -6,7 +6,7 @@ from sunpack.contracts.discovery import DiscoveryCandidate, ResolvedArchiveInput
 from sunpack.contracts.failures import FailureInfo
 from sunpack.contracts.tasks import ArchiveTask
 from sunpack.coordinator.discovery import ArchiveDiscoveryPipeline
-from sunpack.coordinator.scan_session import DetectionScanSession
+from sunpack.coordinator.scan_session import DiscoveryScanSession
 from sunpack.coordinator.target_scan import build_discovery_candidates_for_targets
 from sunpack.embedded.options import EmbeddedOptions
 from sunpack.detection.scheduler import DetectionScheduler
@@ -30,10 +30,10 @@ class ArchiveTaskProvider:
         self,
         scan_roots: list[str],
         *,
-        scan_session: DetectionScanSession | None = None,
+        scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
     ) -> StageResult:
-        session = scan_session or DetectionScanSession(config=self.config)
+        session = scan_session or DiscoveryScanSession(config=self.config)
         candidates = build_discovery_candidates_for_targets(
             scan_roots,
             session=session,
@@ -50,7 +50,7 @@ class ArchiveTaskProvider:
         self,
         scan_roots: list[str],
         processed_keys: set[str] | None = None,
-        scan_session: DetectionScanSession | None = None,
+        scan_session: DiscoveryScanSession | None = None,
         *,
         is_recursive_scan: bool = False,
     ) -> list[ArchiveTask]:
@@ -81,11 +81,11 @@ class ArchiveTaskProvider:
         self,
         scan_roots: list[str],
         *,
-        scan_session: DetectionScanSession | None = None,
+        scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
         accepted_only: bool = False,
     ):
-        session = scan_session or DetectionScanSession(config=self.config)
+        session = scan_session or DiscoveryScanSession(config=self.config)
         candidates = build_discovery_candidates_for_targets(
             scan_roots,
             session=session,
