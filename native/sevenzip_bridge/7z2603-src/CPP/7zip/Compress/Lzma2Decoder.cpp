@@ -210,6 +210,8 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
 
   sunpack::sevenzip::PositionedOutStream *positionedOut =
       sunpack::sevenzip::positioned_out_stream(outStream);
+  if (positionedOut && !positionedOut->positioned_available())
+    positionedOut = NULL;
   positionedWrap.Init(positionedOut);
 
   #ifndef Z7_ST
