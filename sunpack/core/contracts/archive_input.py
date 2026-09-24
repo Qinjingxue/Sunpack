@@ -111,19 +111,6 @@ class ArchiveInputDescriptor:
             payload["parts"] = [part.to_dict() for part in self.parts]
         if self.open_mode == "concat_ranges":
             payload["ranges"] = [item.to_dict() for item in self.extents]
-        if self.open_mode == "file_range":
-            extent = self.primary_extent
-            if extent is None:
-                raise ValueError("file_range requires a primary extent")
-            segment: dict[str, Any] = {
-                "start": int(extent.start),
-                "source": str(self.analysis.get("segment_source") or "analysis"),
-            }
-            if extent.end is not None:
-                segment["end"] = int(extent.end)
-            if self.analysis.get("segment_confidence") is not None:
-                segment["confidence"] = float(self.analysis["segment_confidence"])
-            payload["segment"] = segment
         analysis = {
             key: value
             for key, value in self.analysis.items()
@@ -180,6 +167,8 @@ class ArchiveInputDescriptor:
         kind = str(raw.get("kind") or "archive_input")
         if kind != "archive_input":
             raise ValueError(f"unsupported archive input kind: {kind}")
+        if "segment" in raw:
+            raise ValueError("legacy archive input segment field is not supported")
         open_mode = str(raw.get("open_mode") or "file")
         format_hint = str(raw.get("format_hint") or "")
         entry_path = str(raw.get("entry_path") or archive_path)
