@@ -152,8 +152,8 @@ fn inspect_compression_stream_identity_impl(
         }
     };
     let file_size = reader.len();
-    let read_size = file_size.min(IDENTITY_PROBE_MAX_BYTES) as usize;
-    let data = match reader.read_at(0, read_size) {
+    let read_size = file_size.min(32) as usize;
+    let mut data = match reader.read_at(0, read_size) {
         Ok(value) => value,
         Err(_) => {
             return compression_identity_result(
@@ -161,6 +161,22 @@ fn inspect_compression_stream_identity_impl(
             )
         }
     };
+
+    if data.starts_with(b"\x1f\x8b")
+        && data.get(3).is_some_and(|flags| flags & 0x1e != 0)
+        && file_size > data.len() as u64
+    {
+        let expanded = file_size.min(IDENTITY_PROBE_MAX_BYTES) as usize;
+        data = match reader.read_at(0, expanded) {
+            Ok(value) => value,
+            Err(_) => {
+                return compression_identity_result(
+                    py, "gzip", ".gz", true, file_size, data.len() as u64,
+                    false, "gzip_header_read_failed", &["gzip:magic"],
+                )
+            }
+        };
+    }
     let base_bytes_read = data.len() as u64;
 
     if data.starts_with(b"\x1f\x8b") {
