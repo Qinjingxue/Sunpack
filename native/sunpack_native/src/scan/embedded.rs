@@ -295,94 +295,55 @@ fn validate_raw_hits(
     raw_hits: &[RawHit],
     xz_footer_ends: &[u64],
 ) -> io::Result<Vec<EmbeddedCandidate>> {
-    let collect_parallel = |hits: Vec<&RawHit>| -> io::Result<Vec<EmbeddedCandidate>> {
-        hits.par_iter()
-            .map(|hit| validate_candidate(reader, file_size, hit.kind, hit.offset))
-            .collect::<io::Result<Vec<_>>>()
-            .map(|items| items.into_iter().flatten().collect())
-    };
-
-    // EOCD validation walks the central directory and links every member back
-    // to its local header.  Validate these logical roots first, then avoid
-    // repeating a local-header probe for every member they already cover.
-    let mut candidates = collect_parallel(
-        raw_hits
-            .iter()
-            .filter(|hit| hit.kind == "zip_eocd")
-            .collect(),
-    )?;
-    let zip_ranges = candidates
+    let zip_eocd_hits = raw_hits
         .iter()
-        .filter(|candidate| candidate.format == "zip" && candidate.boundary_kind == "exact")
-        .filter_map(|candidate| candidate.end_offset.map(|end| (candidate.offset, end)))
+        .filter(|hit| hit.kind == "zip_eocd")
+        .collect::<Vec<_>>();
+    let mut candidates = zip_eocd_hits
+        .par_iter()
+        .map(|hit| validate_candidate(reader, file_size, hit.kind, hit.offset))
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
 
-    let mut ordinary = collect_parallel(
-        raw_hits
-            .iter()
-            .filter(|hit| !matches!(hit.kind, "zip_eocd" | "zip" | "tar" | "bzip2" | "xz"))
-            .collect(),
-    )?;
-    candidates.append(&mut ordinary);
-
-    let xz_candidates = raw_hits
+    // ZIP EOCD geometry can prove a logical root before its local-header hit is
+    // visited. Seed exact ownership with those ranges, then process every other
+    // hit in physical order. Once a resolver proves [start,end), signatures
+    // inside that interval cannot add a peer carrier boundary and are skipped
+    // before invoking any potentially size-proportional parser.
+    let mut seeded_ranges = candidates
         .iter()
-        .filter(|hit| hit.kind == "xz")
-        .collect::<Vec<_>>()
-        .par_iter()
-        .map(|hit| validate_xz(reader, file_size, hit.offset, xz_footer_ends))
-        .collect::<io::Result<Vec<_>>>()?;
-    candidates.extend(xz_candidates.into_iter().flatten());
+        .filter(|candidate| candidate.boundary_kind == "exact")
+        .filter_map(|candidate| candidate.end_offset.map(|end| (candidate.offset, end)))
+        .collect::<Vec<_>>();
+    seeded_ranges.sort_unstable();
 
-    // A bzip2 file may be a concatenation of complete streams.  Validation
-    // from the first stream walks every immediately adjacent stream, so later
-    // BZh hits inside that exact range are member anchors rather than separate
-    // logical archives.  Process roots in order to avoid decoding the same
-    // suffix repeatedly for large concatenated files.
-    let mut bzip2_range_end = None::<u64>;
-    for hit in raw_hits.iter().filter(|hit| hit.kind == "bzip2") {
-        if bzip2_range_end.is_some_and(|end| hit.offset < end) {
+    let mut range_index = 0usize;
+    let mut covered_until = 0u64;
+    for hit in raw_hits.iter().filter(|hit| hit.kind != "zip_eocd") {
+        while range_index < seeded_ranges.len() && seeded_ranges[range_index].0 <= hit.offset {
+            covered_until = covered_until.max(seeded_ranges[range_index].1);
+            range_index += 1;
+        }
+        if hit.offset < covered_until {
             continue;
         }
-        if let Some(candidate) = validate_candidate(reader, file_size, hit.kind, hit.offset)? {
-            if let Some(end) = candidate.end_offset {
-                bzip2_range_end = Some(end);
-            }
-            candidates.push(candidate);
-        }
-    }
 
-    let mut orphan_zip_anchors = collect_parallel(
-        raw_hits
-            .iter()
-            .filter(|hit| {
-                hit.kind == "zip"
-                    && !zip_ranges
-                        .iter()
-                        .any(|(start, end)| hit.offset >= *start && hit.offset < *end)
-            })
-            .collect(),
-    )?;
-    candidates.append(&mut orphan_zip_anchors);
-
-    // Each TAR member contains another valid ustar signature.  Walking every
-    // member to the same double-zero terminator is quadratic.  A successful
-    // walk from the earliest uncovered header proves all later member anchors
-    // inside that exact archive range.
-    let mut tar_ranges = Vec::<(u64, u64)>::new();
-    for hit in raw_hits.iter().filter(|hit| hit.kind == "tar") {
-        if tar_ranges
-            .iter()
-            .any(|(start, end)| hit.offset >= *start && hit.offset < *end)
-        {
+        let resolved = if hit.kind == "xz" {
+            validate_xz(reader, file_size, hit.offset, xz_footer_ends)?
+        } else {
+            validate_candidate(reader, file_size, hit.kind, hit.offset)?
+        };
+        let Some(candidate) = resolved else {
             continue;
-        }
-        if let Some(candidate) = validate_candidate(reader, file_size, hit.kind, hit.offset)? {
-            if let Some(end) = candidate.end_offset {
-                tar_ranges.push((candidate.offset, end));
+        };
+        if let Some(end) = candidate.end_offset {
+            if candidate.boundary_kind == "exact" {
+                covered_until = covered_until.max(end);
             }
-            candidates.push(candidate);
         }
+        candidates.push(candidate);
     }
     Ok(candidates)
 }
