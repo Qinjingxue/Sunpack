@@ -6,7 +6,7 @@ from sunpack.core.analysis.observation import FormatObservation
 
 
 DEFAULT_MAX_ENTRIES_TO_WALK = 64
-DEFAULT_DETECTION_ENTRIES_TO_WALK = 8
+DEFAULT_DETECTION_ENTRIES_TO_WALK = 0
 
 
 @dataclass(frozen=True, slots=True)
