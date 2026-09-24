@@ -185,7 +185,6 @@ class PipelineTimingProbe:
         self._wrap(scanner, "scan_targets", "pipeline_scan")
         self._wrap(scanner, "direct_file_tasks", "pipeline_direct_scan")
         self._wrap(planning, "plan_tasks", "input_planning")
-        self._wrap(batch, "prepare_tasks", "batch_prepare")
         self._wrap(batch, "_skip_tasks_inside_batch_outputs", "batch_skip_inside_outputs")
         self._wrap(batch, "_inspect_tasks_before_extract", "batch_password_preflight")
         self._wrap(batch, "collect_result", "batch_collect_result")
