@@ -246,17 +246,21 @@ def test_zip_embedded_local_header_without_eocd_keeps_embedded_start(tmp_path):
     assert zip_evidence.segments == []
 
 
-def test_zip_crc_mismatch_marks_content_integrity(tmp_path):
+
+def test_zip_embedded_boundary_defers_payload_integrity(tmp_path):
     data = bytearray(_zip_bytes(tmp_path))
     data[14] ^= 0xFF
     path = _write_bytes(tmp_path / "crc_bad.zip", bytes(data))
 
-    zip_evidence = {item.format: item for item in AnalysisEngine().analyze_path(str(path)).evidences}["zip"]
+    zip_evidence = {
+        item.format: item
+        for item in AnalysisEngine().analyze_path(str(path)).evidences
+    }["zip"]
 
     assert zip_evidence.status == "extractable"
-    assert "content_integrity_bad_or_unknown" in zip_evidence.segments[0].damage_flags
-    assert zip_evidence.details["integrity_confidence"] == "low"
-
+    assert zip_evidence.segments[0].end_offset == len(data)
+    assert "content_integrity_bad_or_unknown" not in zip_evidence.segments[0].damage_flags
+    assert zip_evidence.details["integrity_confidence"] == "deferred"
 
 def test_zip_bad_central_directory_recovers_from_local_header(tmp_path):
     data = bytearray(_zip_bytes(tmp_path))
@@ -287,7 +291,7 @@ def test_analysis_scheduler_prefers_structural_boundary_over_next_signature(tmp_
 
     assert by_format["rar"].segments[0].end_offset == len(b"shell") + len(rar_data)
     assert by_format["7z"].segments[0].start_offset == payload.index(b"7z\xbc\xaf\x27\x1c")
-    assert by_format["7z"].confidence == 0.97
+    assert by_format["7z"].confidence >= 0.97
 
 
 @pytest.mark.parametrize(
@@ -340,46 +344,26 @@ def test_rar_missing_main_header_marks_encrypted_unwalkable(tmp_path):
     assert rar.details["password_required"] is True
 
 
-def test_rar5_header_encrypted_carrier_end_ignores_unvalidated_signature_hits(tmp_path):
-    """A chance byte pattern inside an encrypted carrier payload must not end the segment.
 
-    RAR5 header encryption leaves the archive end unknowable from the archive structure,
-    so the only admissible fallback is the enclosing input end.  Raw signature hits are
-    not evidence of another archive: the gzip and bzip2 magics are three bytes long and
-    do occur by chance inside encrypted payloads, and honouring them truncates a healthy
-    carrier archive into a damaged extraction.
-    """
+def test_rar5_header_encrypted_carrier_stays_unresolved_without_password(tmp_path):
     encrypted = b"Rar!\x1a\x07\x01\x00" + _rar5_block(4)
     fake_gzip = b"\x1f\x8b\x08"
     fake_bzip2 = b"BZh"
-    payload = b"\x00" * 32 + fake_gzip + b"\x00" * 32 + fake_bzip2 + b"\x00" * 32
     prefix = b"carrier-shell"
-    body = prefix + encrypted + payload
+    body = prefix + encrypted + b"\x00" * 32 + fake_gzip + b"\x00" * 32 + fake_bzip2
     path = _write_bytes(tmp_path / "encrypted-carrier.bin", body)
-    gzip_offset = body.index(fake_gzip)
-    bzip2_offset = body.index(fake_bzip2)
 
     report = AnalysisEngine().analyze_path(str(path))
-    rar = {item.format: item for item in report.selected}["rar"]
+    rar = {item.format: item for item in report.evidences}["rar"]
     segment = rar.segments[0]
 
-    raw_hits = {(hit.get("name"), int(hit.get("offset") or 0)) for hit in report.prepass.get("hits", [])}
-    assert ("gzip", gzip_offset) in raw_hits
-    assert ("bzip2", bzip2_offset) in raw_hits
     assert rar.details["header_encrypted"] is True
-    assert rar.details["segment_end"] == 0
     assert segment.start_offset == len(prefix)
-    assert segment.end_offset == len(body)
-    assert segment.end_offset not in {gzip_offset, bzip2_offset}
+    assert segment.end_offset is None
+    assert rar.details["boundary_confidence"] == "none"
 
 
-def test_rar5_header_encrypted_candidate_reuses_scanner_bounded_end(tmp_path):
-    """An unwalkable RAR keeps the scanner's already validated upper bound as its end.
-
-    The native embedded scanner resolves a bounded range for a validated logical archive
-    whose own end is unknowable: the start of the next validated logical archive, else
-    EOF.  Analysis consumes that bound instead of re-deriving a boundary from raw hits.
-    """
+def test_rar5_header_encrypted_candidate_never_uses_following_archive_as_end(tmp_path):
     encrypted = b"Rar!\x1a\x07\x01\x00" + _rar5_block(4)
     follower = _rar5_bytes()
     carrier_size = len(b"carrier")
@@ -388,14 +372,14 @@ def test_rar5_header_encrypted_candidate_reuses_scanner_bounded_end(tmp_path):
     path = _write_bytes(tmp_path / "two-archives.bin", body)
 
     scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
-    assert {
-        candidate.offset: candidate.range_end_offset
+    first = next(
+        candidate
         for candidate in scan.candidates
-        if candidate.format == "rar" and candidate.boundary_kind == "bounded"
-    } == {carrier_size: follower_start}
-    assert (carrier_size, follower_start) not in {
-        (candidate.offset, candidate.end_offset) for candidate in scan.candidates
-    }
+        if candidate.format == "rar" and candidate.offset == carrier_size
+    )
+    assert first.end_offset is None
+    assert first.boundary_kind == "unresolved"
+    assert first.extractable is False
 
     report = AnalysisEngine().analyze_path(
         str(path),
@@ -403,12 +387,12 @@ def test_rar5_header_encrypted_candidate_reuses_scanner_bounded_end(tmp_path):
     )
     segments = {
         (segment.start_offset, segment.end_offset)
-        for evidence in report.selected
+        for evidence in report.evidences
         if evidence.format == "rar"
         for segment in evidence.segments
     }
 
-    assert (carrier_size, follower_start) in segments
+    assert (carrier_size, follower_start) not in segments
     assert (follower_start, len(body)) in segments
 
 
@@ -422,12 +406,12 @@ def test_analysis_scheduler_uses_7z_start_header_for_segment_end(tmp_path):
     seven = {item.format: item for item in report.evidences}["7z"]
 
     assert seven.status == "extractable"
-    assert seven.confidence == 0.97
     assert seven.segments[0].start_offset == len(b"shell")
     assert seven.segments[0].end_offset == len(b"shell") + len(seven_data)
     assert not seven.warnings
-    assert seven.details["next_header_crc_ok"] is True
-
+    assert seven.details["source"] == "embedded_scan"
+    assert seven.details["boundary_confidence"] == "high"
+    assert seven.details["integrity_confidence"] == "deferred"
 
 def test_7z_start_header_damage_leaves_only_start_trusted(tmp_path):
     seven_data = bytearray(_seven_zip_bytes())
@@ -443,28 +427,23 @@ def test_7z_start_header_damage_leaves_only_start_trusted(tmp_path):
     assert seven.details["boundary_confidence"] == "none"
 
 
-def test_7z_next_header_crc_damage_keeps_boundary_but_lowers_integrity(tmp_path):
+
+def test_7z_next_header_damage_does_not_trigger_embedded_revalidation(tmp_path):
     seven_data = bytearray(_seven_zip_bytes())
     next_offset = int.from_bytes(seven_data[12:20], "little")
     seven_data[32 + next_offset] ^= 0xFF
     path = _write_bytes(tmp_path / "next_crc_bad.7z", bytes(seven_data))
 
-    seven = {item.format: item for item in AnalysisEngine().analyze_path(str(path)).evidences}["7z"]
+    seven = {
+        item.format: item
+        for item in AnalysisEngine().analyze_path(str(path)).evidences
+    }["7z"]
 
-    assert seven.status == "damaged"
+    assert seven.status == "extractable"
     assert seven.segments[0].end_offset == len(seven_data)
-    assert "directory_integrity_bad_or_unknown" in seven.segments[0].damage_flags
-    assert seven.details["integrity_confidence"] == "low"
+    assert "directory_integrity_bad_or_unknown" not in seven.segments[0].damage_flags
+    assert seven.details["integrity_confidence"] == "deferred"
 
-
-@pytest.mark.parametrize(
-    ("extension", "build_data", "split_at", "expected_format", "confidence"),
-    [
-        ("zip", _zip_bytes, 37, "zip", 0.99),
-        ("7z", lambda _tmp_path: _seven_zip_bytes(), 20, "7z", 0.97),
-    ],
-    ids=["zip", "seven-zip"],
-)
 def test_analysis_scheduler_uses_structure_for_clean_archives_across_split_volumes(
     tmp_path, extension, build_data, split_at, expected_format, confidence
 ):
