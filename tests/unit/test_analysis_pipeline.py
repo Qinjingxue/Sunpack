@@ -135,20 +135,23 @@ def test_analysis_scheduler_finds_embedded_archive_segments(tmp_path):
     assert {item.format for item in report.selected} == {"zip", "rar"}
 
 
-def test_analysis_defaults_to_shared_full_scan_when_head_and_tail_are_unresolved(tmp_path):
+def test_analysis_consumes_embedded_discovery_prepass_for_middle_payload(tmp_path):
     prefix = b"v" * (2 * 1024 * 1024)
     zip_data = _zip_bytes(tmp_path)
     suffix = b"v" * (2 * 1024 * 1024)
     path = tmp_path / "middle_payload.mp4"
     path.write_bytes(prefix + zip_data + suffix)
+    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
 
-    report = AnalysisEngine().analyze_path(str(path))
+    report = AnalysisEngine().analyze_path(
+        str(path),
+        initial_prepass=scan.to_prepass(),
+    )
 
     zip_evidence = next(item for item in report.selected if item.format == "zip")
     assert report.prepass["source"] == "embedded_scan"
     assert report.prepass["full_scan_complete"] is True
     assert zip_evidence.segments[0].start_offset == len(prefix)
-
 
 def test_analysis_respects_shared_embedded_scan_switch(tmp_path):
     prefix = b"v" * (2 * 1024 * 1024)
@@ -186,17 +189,16 @@ def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_pa
     path = tmp_path / "payload.bin"
     payload = b"p" * (2 * 1024 * 1024) + _zip_bytes(tmp_path) + b"s" * (2 * 1024 * 1024)
     path.write_bytes(payload)
-    scheduler = AnalysisEngine()
-    first = scheduler.analyze_path(str(path))
-    assert first.prepass["source"] == "embedded_scan"
+    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
+    prepass = scan.to_prepass()
+    assert prepass["source"] == "embedded_scan"
 
     def unexpected_scan(*args, **kwargs):
-        raise AssertionError("complete detection prepass must bypass the shared scanner")
+        raise AssertionError("complete discovery prepass must bypass analysis prepass scanning")
 
     monkeypatch.setattr(SharedBinaryView, "signature_prepass", unexpected_scan)
-    reused = scheduler.analyze_path(str(path), initial_prepass=first.prepass)
-    assert reused.prepass == first.prepass
-
+    reused = AnalysisEngine().analyze_path(str(path), initial_prepass=prepass)
+    assert reused.prepass == prepass
 
 def test_analysis_reuses_detection_hit_map_and_preserves_same_format_segments(tmp_path):
     first = _zip_bytes(tmp_path)
