@@ -1375,19 +1375,6 @@ fn validate_rar_proposal(
     Ok(ProposalStatus::Valid)
 }
 
-fn proposal_password<'a>(
-    proposal: &RelationProposal,
-    path_passwords: Option<&'a [(String, String)]>,
-) -> Option<&'a str> {
-    let path_passwords = path_passwords?;
-    path_passwords.iter().find_map(|(path, password)| {
-        proposal
-            .volumes
-            .iter()
-            .any(|(volume_path, _, _, _, _)| volume_path.eq_ignore_ascii_case(path))
-            .then_some(password.as_str())
-    })
-}
 
 fn validate_seven_zip_proposal(
     proposal: &RelationProposal,
