@@ -31,7 +31,7 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
 
     [before_finish] = WatchStateStore(str(state_path)).pending_work_items()
     assert before_finish.active_outputs[str(inner.resolve())] == str(output.resolve())
-    assert before_commit.password_scope_dir == str(tmp_path.resolve())
+    assert before_finish.password_scope_dir == str(tmp_path.resolve())
 
     assert state.record_task_output_finished(
         str(source),
@@ -326,3 +326,169 @@ def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):
         status="done",
     )
     assert scheduler_module._persisted_blocker_owns_retry(state, str(archive)) is False
+
+
+
+def test_watch_lifecycle_state_rejection_fails_closed():
+    import pytest
+    import sunpack.runtime.watch.scheduler as scheduler_module
+
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler.state = SimpleNamespace(
+        record_task_output_started=lambda *_args, **_kwargs: False,
+        record_task_output_finished=lambda *_args, **_kwargs: False,
+    )
+    task = SimpleNamespace(main_path="archive.zip")
+
+    with pytest.raises(RuntimeError, match="start state transition rejected"):
+        scheduler._handle_pipeline_progress(
+            "archive.zip",
+            "notification",
+            task,
+            {"event": "task_output_started", "output_dir": "out"},
+        )
+
+    with pytest.raises(RuntimeError, match="finish state transition rejected"):
+        scheduler._handle_pipeline_progress(
+            "archive.zip",
+            "notification",
+            task,
+            {
+                "event": "task_output_finished",
+                "output_dir": "out",
+                "keep_output": True,
+            },
+        )
+
+
+def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_path, monkeypatch):
+    import sunpack.runtime.watch.scheduler as scheduler_module
+
+    state_path = tmp_path / "state.json"
+    source = tmp_path / "outer.zip"
+    source.write_bytes(b"source")
+    output = tmp_path / "out" / "outer"
+    output.mkdir(parents=True)
+    (output / "partial.bin").write_bytes(b"partial")
+
+    state = WatchStateStore(str(state_path))
+    state.queue_active(
+        _candidate(source, size=len(b"source")),
+        durable_owner=True,
+        persist=True,
+        durable=True,
+    )
+    assert state.record_task_output_started(str(source), str(source), str(output))
+
+    restarted = WatchStateStore(str(state_path))
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler.state = restarted
+    scheduler.config = {}
+    scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
+    queued = []
+    scheduler.enqueue = lambda path, **kwargs: queued.append((path, kwargs))
+    monkeypatch.setattr(
+        scheduler_module,
+        "_candidate_for_event_path",
+        lambda path: _candidate(path, size=len(b"source")),
+    )
+
+    scheduler._recover_persisted_work()
+
+    assert not output.exists()
+    assert [item[0] for item in queued] == [str(source.resolve())]
+    assert queued[0][1]["event_type"] == "crash_recovery"
+    [pending] = restarted.pending_work_items()
+    assert pending.path == str(source.resolve())
+    assert pending.internal_recovery is True
+    assert pending.active_outputs == {}
+
+
+def test_missing_committed_output_requeues_surviving_source(tmp_path, monkeypatch):
+    import sunpack.runtime.watch.scheduler as scheduler_module
+
+    state_path = tmp_path / "state.json"
+    source = tmp_path / "outer.zip"
+    source.write_bytes(b"source")
+    output = tmp_path / "out" / "outer"
+
+    state = WatchStateStore(str(state_path))
+    state.queue_active(
+        _candidate(source, size=len(b"source")),
+        durable_owner=True,
+        persist=True,
+        durable=True,
+    )
+    assert state.record_task_output_started(str(source), str(source), str(output))
+    assert state.record_task_output_finished(
+        str(source),
+        str(source),
+        str(output),
+        keep_output=True,
+    )
+
+    restarted = WatchStateStore(str(state_path))
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler.state = restarted
+    scheduler.config = {}
+    events = []
+    scheduler.log = SimpleNamespace(
+        write=lambda name, **payload: events.append((name, payload))
+    )
+    queued = []
+    scheduler.enqueue = lambda path, **kwargs: queued.append((path, kwargs))
+    monkeypatch.setattr(
+        scheduler_module,
+        "_candidate_for_event_path",
+        lambda path: _candidate(path, size=len(b"source")) if path == str(source.resolve()) else None,
+    )
+
+    scheduler._recover_persisted_work()
+
+    assert [item[0] for item in queued] == [str(source.resolve())]
+    assert any(name == "crash_committed_output_requeued" for name, _ in events)
+
+
+def test_missing_committed_output_without_source_keeps_recovery_owner(tmp_path, monkeypatch):
+    import sunpack.runtime.watch.scheduler as scheduler_module
+
+    state_path = tmp_path / "state.json"
+    source = tmp_path / "outer.zip"
+    source.write_bytes(b"source")
+    output = tmp_path / "out" / "outer"
+
+    state = WatchStateStore(str(state_path))
+    state.queue_active(
+        _candidate(source, size=len(b"source")),
+        durable_owner=True,
+        persist=True,
+        durable=True,
+    )
+    assert state.record_task_output_started(str(source), str(source), str(output))
+    assert state.record_task_output_finished(
+        str(source),
+        str(source),
+        str(output),
+        keep_output=True,
+    )
+    source.unlink()
+
+    restarted = WatchStateStore(str(state_path))
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler.state = restarted
+    scheduler.config = {}
+    events = []
+    scheduler.log = SimpleNamespace(
+        write=lambda name, **payload: events.append((name, payload))
+    )
+    scheduler.enqueue = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("missing source must not be requeued")
+    )
+    monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", lambda _path: None)
+
+    scheduler._recover_persisted_work()
+
+    [pending] = restarted.pending_work_items()
+    assert pending.path == str(source.resolve())
+    assert pending.committed_roots == [str(output.resolve())]
+    assert any(name == "crash_committed_output_missing" for name, _ in events)
