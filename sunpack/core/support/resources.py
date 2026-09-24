@@ -44,7 +44,7 @@ def candidate_resource_roots(request_cwd: str | Path | None = None) -> list[Path
         if meipass:
             roots.append(Path(meipass).resolve())
 
-    module_root = Path(__file__).resolve().parents[2]
+    module_root = Path(__file__).resolve().parents[3]
     invocation_root = Path(request_cwd).resolve() if request_cwd is not None else Path.cwd().resolve()
     roots.extend([
         module_root,
