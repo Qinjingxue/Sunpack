@@ -1,26 +1,19 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import InitVar, dataclass, field
 from typing import Any
 
-from sunpack.core.contracts.archive_input import (
-    ArchiveDescriptor,
-    ArchiveFormatState,
-    ArchiveInputDescriptor,
-    ArchiveIntegrityState,
-    ArchiveRelationState,
-)
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from sunpack.core.contracts.archive_state import ArchiveState
 from sunpack.core.contracts.discovery import ResolvedArchiveInput, ResolvedArchiveSegment
-from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.support.collections import dedupe_values
 from sunpack.core.support.path_keys import normalized_path, path_key
 
 
 @dataclass
 class ArchiveTask:
-    _archive_input: ArchiveInputDescriptor
+    _archive_input: InitVar[ArchiveInputDescriptor]
     carrier_path: str = ""
     cleanup_parts: list[str] = field(default_factory=list)
     key: str = ""
@@ -32,8 +25,8 @@ class ArchiveTask:
     discovery_reason: str = ""
     runtime: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self) -> None:
-        descriptor = self._archive_input
+    def __post_init__(self, _archive_input: ArchiveInputDescriptor) -> None:
+        descriptor = _archive_input
         if not descriptor.entry_path:
             raise ValueError("ArchiveTask requires an archive input entry path")
         self.logical_name = str(
@@ -124,15 +117,6 @@ class ArchiveTask:
 
     def set_knowledge(self, knowledge: ArchiveKnowledge | dict) -> None:
         self._knowledge = ArchiveKnowledge.from_any(knowledge)
-        state = self._state
-        self._state = ArchiveState(
-            source=state.source,
-            logical_name=state.logical_name,
-            format_hint=state.format_hint,
-            analysis=dict(state.analysis),
-            verification=dict(state.verification),
-            knowledge=self._knowledge.to_dict(),
-        )
 
     def _replace_knowledge_payload(
         self,
@@ -145,19 +129,9 @@ class ArchiveTask:
             if knowledge_cache is not None
             else ArchiveKnowledge.from_any(payload)
         )
-        state = self._state
-        self._state = ArchiveState(
-            source=state.source,
-            logical_name=state.logical_name,
-            format_hint=state.format_hint,
-            analysis=dict(state.analysis),
-            verification=dict(state.verification),
-            knowledge=self._knowledge.to_dict(),
-        )
 
     def set_archive_input(self, descriptor: ArchiveInputDescriptor) -> None:
         state = self._state
-        self._archive_input = descriptor
         self.logical_name = descriptor.logical_name or self.logical_name
         self.cleanup_parts = list(dedupe_values([
             *descriptor.part_paths(),
@@ -170,41 +144,26 @@ class ArchiveTask:
             source_layer="contracts",
             source_module="archive_task",
         )
-        self._state = ArchiveState(
-            source=ArchiveState.from_archive_input(descriptor).source,
-            logical_name=descriptor.logical_name or self.logical_name,
-            format_hint=descriptor.format_hint,
-            analysis=dict(state.analysis),
-            verification=dict(state.verification),
-            knowledge=self._knowledge.to_dict(),
+        self._state = ArchiveState.from_archive_input(
+            descriptor,
+            planning_analysis=state.planning_analysis,
         )
 
     def set_archive_state(self, state: ArchiveState) -> None:
         descriptor = state.to_archive_input_descriptor()
-        self._archive_input = descriptor
-        self.logical_name = descriptor.logical_name or state.logical_name or self.logical_name
+        self.logical_name = descriptor.logical_name or self.logical_name
         self.cleanup_parts = list(dedupe_values([
             *descriptor.part_paths(),
             *self.cleanup_parts,
             self.carrier_path,
         ]))
-        knowledge = ArchiveKnowledge.from_any(state.knowledge)
-        knowledge.merge(self._knowledge)
-        knowledge.set(
+        self._knowledge.set(
             "source.input",
             descriptor.to_dict(),
             source_layer="contracts",
             source_module="archive_task",
         )
-        self._knowledge = knowledge
-        self._state = ArchiveState(
-            source=state.source,
-            logical_name=state.logical_name or self.logical_name,
-            format_hint=state.format_hint or descriptor.format_hint,
-            analysis=dict(state.analysis),
-            verification=dict(state.verification),
-            knowledge=knowledge.to_dict(),
-        )
+        self._state = state
 
     def apply_path_mapping(self, path_map: dict[str, str]) -> None:
         if not path_map:
@@ -223,7 +182,6 @@ class ArchiveTask:
 
     def adopt_detection_plan(self, replacement: "ArchiveTask") -> None:
         runtime = dict(self.runtime)
-        self._archive_input = replacement.archive_input()
         self.carrier_path = replacement.carrier_path
         self.cleanup_parts = list(replacement.cleanup_parts)
         self.key = replacement.key
@@ -237,46 +195,8 @@ class ArchiveTask:
         self._state = replacement.archive_state()
         self.runtime = runtime
 
-    def archive_descriptor(self) -> ArchiveDescriptor:
-        source = self.archive_input()
-        selected_format = knowledge_view.selected_format(self) or source.format_hint
-        selected_segment = knowledge_view.source_selected_segment(self)
-        evidence = (
-            selected_segment.get("segment")
-            if isinstance(selected_segment.get("segment"), dict)
-            else selected_segment
-        )
-        confidence = 0.0
-        damage_flags: list[str] = []
-        if isinstance(evidence, dict):
-            confidence = float(
-                evidence.get("confidence", selected_segment.get("confidence", 0.0))
-                or 0.0
-            )
-            damage_flags.extend(evidence.get("damage_flags") or [])
-        return ArchiveDescriptor(
-            id=str(self.key or self.main_path),
-            logical_name=str(self.logical_name or ""),
-            source=source,
-            format=ArchiveFormatState(
-                detected=source.format_hint,
-                selected=selected_format,
-                hint=source.format_hint,
-                confidence=confidence,
-                status=knowledge_view.inspection_status(self),
-            ),
-            relation=ArchiveRelationState(
-                kind=self.relation_kind,
-                is_split=source.open_mode in {"native_volumes", "sfx_with_volumes"},
-                is_sfx=source.open_mode == "sfx_with_volumes",
-            ),
-            integrity=ArchiveIntegrityState(
-                damage_flags=list(dict.fromkeys(str(item) for item in damage_flags))
-            ),
-        )
-
     def _initialize_knowledge(self) -> None:
-        descriptor = self._archive_input
+        descriptor = self.archive_input()
         self._knowledge.merge({
             "source": {
                 "input": descriptor.to_dict(),
@@ -293,11 +213,6 @@ class ArchiveTask:
                 "source": self.discovery_source,
                 "reason": self.discovery_reason,
                 "evidence": dict(self.discovery_evidence),
-            },
-            "relations": {
-                "is_split": descriptor.open_mode in {"native_volumes", "sfx_with_volumes"},
-                "is_sfx_stub": descriptor.open_mode == "sfx_with_volumes",
-                "archive_input": descriptor.to_dict(),
             },
         }, source_layer="contracts", source_module="archive_task")
         if self.discovery_segments:
@@ -324,14 +239,6 @@ class ArchiveTask:
                 source_layer="embedded",
                 source_module="discovery",
             )
-        self._state = ArchiveState(
-            source=self._state.source,
-            logical_name=self._state.logical_name,
-            format_hint=self._state.format_hint,
-            analysis=dict(self._state.analysis),
-            verification=dict(self._state.verification),
-            knowledge=self._knowledge.to_dict(),
-        )
 
 
 def _segment_payload(index: int, segment: ResolvedArchiveSegment) -> dict[str, Any]:

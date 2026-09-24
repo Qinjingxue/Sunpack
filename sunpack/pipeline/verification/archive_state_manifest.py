@@ -141,7 +141,7 @@ def _worker_verified_manifest(evidence) -> ArchiveStateManifest | None:
 
 def _evidence_manifest_identity(evidence, codepage: str) -> tuple:
     state = evidence.archive_state
-    source = state.source
+    source = state.archive_input
     return (
         repr(source.to_dict()),
         str(evidence.password or ""),
@@ -181,7 +181,7 @@ def archive_state_manifest(
 
     try:
         payload = dict(_native_archive_state_zip_manifest(
-            state.source.to_dict(),
+            state.archive_input.to_dict(),
             max_items,
             password,
             codepage,
@@ -232,7 +232,7 @@ def archive_state_manifest(
 
 
 def _format_hint(state: ArchiveState) -> str:
-    return str(state.format_hint or state.source.format_hint or "").strip().lower().lstrip(".")
+    return str(state.archive_input.format_hint or "").strip().lower().lstrip(".")
 
 
 def _tar_archive_state_manifest(

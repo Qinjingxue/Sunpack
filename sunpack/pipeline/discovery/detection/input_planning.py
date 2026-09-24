@@ -115,7 +115,6 @@ class ArchiveInputPlanningStage:
         results = [(first_index, first_results)]
         if report is None:
             for index, task in group[1:]:
-                task.runtime["input_planning.status"] = "error"
                 results.append((index, [task]))
             return results
         for index, task in group[1:]:
@@ -135,15 +134,12 @@ class ArchiveInputPlanningStage:
         if _discovery_confirmed(task):
             # Discovery already supplied the exact native input descriptor.
             # The worker decides whether extraction actually succeeds.
-            task.runtime["input_planning.status"] = "extractable"
             return None, [task]
         if self.analyzer is None:
             return None, [task]
         try:
             report = self._get_or_create_report(task)
         except Exception as exc:
-            task.runtime["input_planning.status"] = "error"
-            task.runtime["input_planning.error"] = str(exc)
             _write_plan_error(task, str(exc))
             return None, [task]
 
@@ -185,8 +181,6 @@ class ArchiveInputPlanningStage:
     def _tasks_from_report(self, task: ArchiveTask, report: ArchiveAnalysisReport, *, phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "input_planning") -> list[ArchiveTask]:
         with _phase(phase_timer, f"{phase_prefix}_record_report"):
             self._record_report(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix, record_state=False, write_knowledge=False)
-        with _phase(phase_timer, f"{phase_prefix}_set_report_path"):
-            task.runtime["input_planning.report_path"] = report.path
         with _phase(phase_timer, f"{phase_prefix}_extractable_segments"):
             candidates = self._extractable_segments(report)
         with _phase(phase_timer, f"{phase_prefix}_write_segments_build_payload"):
@@ -254,10 +248,6 @@ class ArchiveInputPlanningStage:
         write_knowledge: bool = True,
     ) -> None:
         segment_payload = self._segment_payload(task, evidence, segment)
-        task.runtime["input_planning.status"] = evidence.status
-        task.runtime["archive.format_hint"] = evidence.format
-        task.runtime["source.segment_index"] = index
-        task.runtime["source.segment"] = segment_payload
         if write_knowledge:
             write_source_selected_segment(task, evidence, segment, index=index)
 
@@ -272,13 +262,6 @@ class ArchiveInputPlanningStage:
         write_knowledge: bool = True,
     ) -> None:
         selected = _best_selected(report)
-        with _phase(phase_timer, f"{phase_prefix}_record_report_runtime_basic"):
-            task.runtime["input_planning.status"] = "extractable" if report.has_extractable else "not_extractable"
-            task.runtime["input_planning.read_bytes"] = report.read_bytes
-            task.runtime["input_planning.cache_hits"] = report.cache_hits
-            if selected is not None:
-                task.runtime["archive.format_hint"] = selected.format
-                task.runtime["input_planning.confidence"] = float(selected.confidence or 0.0)
         with _phase(phase_timer, f"{phase_prefix}_record_report_evidence_payload"):
             evidences = [
                 {
@@ -291,8 +274,6 @@ class ArchiveInputPlanningStage:
                 }
                 for evidence in report.evidences
             ]
-        with _phase(phase_timer, f"{phase_prefix}_record_report_runtime_evidences"):
-            task.runtime["input_planning.evidences"] = evidences
         if write_knowledge:
             with _phase(phase_timer, f"{phase_prefix}_record_report_write_knowledge"):
                 _write_plan_knowledge(task, report, [], None)
@@ -311,9 +292,9 @@ class ArchiveInputPlanningStage:
         decision. The worker still opens and extracts the current files, so a
         stale analysis result cannot reject a volume that arrived later.
         """
-        if state.source.open_mode not in {"native_volumes", "sfx_with_volumes"}:
+        if state.archive_input.open_mode not in {"native_volumes", "sfx_with_volumes"}:
             return {}
-        if len(state.source.parts) <= 1:
+        if len(state.archive_input.parts) <= 1:
             return {}
 
         # This mirrors the old native 7z split-tail proof without rereading the
@@ -356,16 +337,17 @@ class ArchiveInputPlanningStage:
             if execution_analysis:
                 analysis["execution"] = execution_analysis
             selected_format = str(getattr(selected, "format", "") or "")
-            source = replace(state.source, format_hint=selected_format) if selected_format else state.source
+            descriptor = (
+                replace(state.archive_input, format_hint=selected_format)
+                if selected_format
+                else state.archive_input
+            )
             new_state = ArchiveState(
-                source=source,
-                logical_name=state.logical_name,
-                format_hint=selected_format or state.format_hint,
-                analysis=analysis,
-                verification=dict(state.verification),
+                archive_input=descriptor,
+                planning_analysis=analysis,
             )
         with _phase(phase_timer, f"{phase_prefix}_record_state_set_archive_state"):
-            if dict(state.analysis) != analysis:
+            if dict(state.planning_analysis) != analysis or state.archive_input != descriptor:
                 task.set_archive_state(new_state)
 
     def _extractable_segments(self, report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:

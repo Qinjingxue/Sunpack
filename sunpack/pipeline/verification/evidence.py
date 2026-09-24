@@ -18,17 +18,25 @@ class VerificationEvidence:
     task: ArchiveTask
     extraction_result: ExtractionResult
     archive_state: ArchiveState
-    archive_source: dict[str, Any]
-    archive_path: str
-    output_dir: str
     password: str | None
     analysis_facts: dict[str, Any] = field(default_factory=dict)
-    archive_state_analysis: dict[str, Any] = field(default_factory=dict)
     extraction_diagnostics: dict[str, Any] = field(default_factory=dict)
     worker_result: dict[str, Any] = field(default_factory=dict)
     worker_native_diagnostics: dict[str, Any] = field(default_factory=dict)
     selected_codepage: str | None = None
     progress_manifest: dict[str, Any] | None = None
+
+    @property
+    def archive_path(self) -> str:
+        return self.archive_state.to_archive_input_descriptor().entry_path
+
+    @property
+    def output_dir(self) -> str:
+        return self.extraction_result.out_dir
+
+    @property
+    def archive_state_analysis(self) -> dict[str, Any]:
+        return dict(self.archive_state.planning_analysis)
 
 
 def build_verification_evidence(
@@ -71,12 +79,8 @@ def build_verification_evidence(
         task=task,
         extraction_result=extraction_result,
         archive_state=archive_state,
-        archive_source=archive_state.source.to_dict(),
-        archive_path=archive_input.entry_path,
-        output_dir=extraction_result.out_dir,
         password=password,
         analysis_facts=analysis_facts,
-        archive_state_analysis=dict(archive_state.analysis or {}),
         extraction_diagnostics=extraction_diagnostics,
         worker_result=worker_result,
         worker_native_diagnostics=worker_native_diagnostics,
