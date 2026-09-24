@@ -101,6 +101,8 @@ def classify_extract_failure(
                         "backend_operation_result": operation_result_name,
                     },
                 )
+        if _worker_reports_wrong_password(worker_result):
+            return _failure(FailureKind.WRONG_PASSWORD, "failure.wrong_password", user_action="request_password")
         if is_split_archive and _worker_reports_payload_damage(worker_result):
             return _failure(
                 FailureKind.DAMAGED,
@@ -111,8 +113,6 @@ def classify_extract_failure(
                     else None
                 ),
             )
-        if _worker_reports_wrong_password(worker_result):
-            return _failure(FailureKind.WRONG_PASSWORD, "failure.wrong_password", user_action="request_password")
         if worker_result.get("missing_volume_suspected"):
             return _failure(
                 FailureKind.DAMAGED,
