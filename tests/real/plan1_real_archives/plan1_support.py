@@ -48,18 +48,16 @@ def detected_ext_from_format(format_hint: str) -> str:
 
 
 def detected_ext(hit) -> str:
-    return detected_ext_from_format(hit.format)
+    return detected_ext_from_format(hit.archive_input().format_hint)
 
 
 def container_type(hit) -> str:
-    return str(hit.format or "")
+    return str(hit.archive_input().format_hint or "")
 
 
 def probe_offset(hit) -> int:
-    if hit.segments:
-        return int(hit.segments[0].start_offset or 0)
-    segment = hit.archive_input.segment
-    return int(segment.start or 0) if segment is not None else 0
+    extent = hit.archive_input().primary_extent
+    return int(extent.start or 0) if extent is not None else 0
 
 
 
