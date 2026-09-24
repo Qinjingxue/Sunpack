@@ -117,7 +117,7 @@ sunpack.runtime.watch
 
 ### core.analysis
 
-`sunpack.core.analysis` 是无业务策略的通用归档分析能力层。公共入口 `ArchiveAnalyzer` 接收 file、multi-volume、range 或 segment source 和 `AnalysisRequest`，输出格式证据、片段边界、置信度与损坏标记。`sunpack.core.analysis.embedded` 负责 embedded 全流扫描、结果归一化和可执行载体检查；`probe_volume_anchor_paths` 为 Relations 提供批量、有界、只读的原生分卷结构证据。Analysis 不得依赖 `ArchiveTask`、Detection 或 Coordinator，也不得写业务 knowledge。
+`sunpack.core.analysis` 是无业务策略的通用归档分析能力层。公共入口 `ArchiveAnalyzer` 接收 file、multi-volume、range 或 segment source 和 `AnalysisRequest`，输出格式证据、片段边界、置信度与损坏标记。`sunpack.core.analysis.embedded` 只允许一次全载体 signature scan，之后只做能够改变精确 `[start,end)` 结果的边界工作：7z 读取 Start Header，ZIP 使用末端几何和有界链接证据，XZ 使用 footer/index 几何，RAR/TAR/压缩流只遍历定位终止位置所必需的语法。禁止用下一个 signature 或 EOF 猜测边界，只有 exact range 才能成为 extraction 输入。RAR 头加密可使用当前密码源解密 header chain；密码相关边界解析不建立额外缓存，密码源变化后直接重新解析。`probe_volume_anchor_paths` 为 Relations 提供批量、有界、只读的原生分卷结构证据。Analysis 不得依赖 `ArchiveTask`、Detection 或 Coordinator，也不得写业务 knowledge。
 
 ### core.passwords
 
