@@ -52,7 +52,20 @@ def detected_ext(hit) -> str:
 
 
 def container_type(hit) -> str:
-    return str(hit.archive_input().format_hint or "")
+    """Project the retired PE-container assertion onto canonical input shape.
+
+    ArchiveInputDescriptor.format_hint describes the embedded archive format
+    (7z/zip/rar), not the outer executable carrier.  The canonical descriptor
+    represents an SFX carrier either as a carved non-zero range or as a
+    structured sfx_with_volumes input.
+    """
+    descriptor = hit.archive_input()
+    extent = descriptor.primary_extent
+    if descriptor.open_mode == "sfx_with_volumes":
+        return "pe"
+    if extent is not None and int(extent.start or 0) > 0:
+        return "pe"
+    return ""
 
 
 def probe_offset(hit) -> int:

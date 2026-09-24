@@ -19,7 +19,7 @@ def test_filename_only_scan_does_not_absorb_unmarked_fuzzy_parts(tmp_path):
     candidates = build_candidates_for_targets([str(tmp_path)], config=config)
     grouped = next(candidate for candidate in candidates if candidate.entry_path == str(first))
 
-    assert grouped.archive_input.part_paths() == (str(first),)
+    assert grouped.archive_input.part_paths() == [str(first)]
     assert grouped.archive_input is None or grouped.archive_input.open_mode == "file"
     assert not grouped.is_split
     assert all(
