@@ -227,7 +227,7 @@ class ArchiveInputPlanningStage:
                 password_probe_input,
             )
         with _phase(phase_timer, f"{phase_prefix}_state_update"):
-            self._record_planning_state(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
+            self._record_planning_input(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
         return [task]
 
     @staticmethod
@@ -262,7 +262,7 @@ class ArchiveInputPlanningStage:
                 _write_plan_knowledge(task, report, [], None)
         if record_state:
             with _phase(phase_timer, f"{phase_prefix}_record_report_state_analysis"):
-                self._record_planning_state(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
+                self._record_planning_input(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
 
     @staticmethod
     def _execution_analysis_for_report(
