@@ -86,6 +86,7 @@ class ZipAnalysisModule:
                 "candidate_kind": str(item.get("candidate_kind") or ""),
                 "boundary_kind": boundary_kind,
                 "boundary_confidence": "high" if boundary_kind == "exact" else "unresolved",
+                "integrity_confidence": "deferred" if boundary_kind == "exact" else "unknown",
             },
         )
 
