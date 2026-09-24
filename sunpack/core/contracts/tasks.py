@@ -17,8 +17,7 @@ class ArchiveTask:
     key: str = ""
     initial_discovery_source: InitVar[str] = ""
     discovery_evidence: InitVar[dict[str, Any] | None] = None
-    discovery_segments: InitVar[tuple[ArchiveInputDescriptor, ...]] = ()
-    discovery_segment_evidence: InitVar[tuple[dict[str, Any], ...]] = ()
+    discovery_segments: InitVar[tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...]] = ()
     initial_discovery_reason: InitVar[str] = ""
     runtime: dict[str, Any] = field(default_factory=dict)
 
@@ -27,15 +26,12 @@ class ArchiveTask:
         _archive_input: ArchiveInputDescriptor,
         initial_discovery_source: str,
         discovery_evidence: dict[str, Any] | None,
-        discovery_segments: tuple[ArchiveInputDescriptor, ...],
-        discovery_segment_evidence: tuple[dict[str, Any], ...],
+        discovery_segments: tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...],
         initial_discovery_reason: str,
     ) -> None:
         descriptor = _archive_input
         if not descriptor.entry_path:
             raise ValueError("ArchiveTask requires an archive input entry path")
-        if len(discovery_segments) != len(discovery_segment_evidence):
-            raise ValueError("discovery segment descriptors and evidence must align")
         logical_name = str(descriptor.logical_name or descriptor.entry_path)
         self.carrier_path = str(self.carrier_path or descriptor.entry_path)
         self.cleanup_parts = list(dedupe_values([
@@ -56,7 +52,6 @@ class ArchiveTask:
             discovery_reason=str(initial_discovery_reason or ""),
             discovery_evidence=dict(discovery_evidence or {}),
             discovery_segments=tuple(discovery_segments),
-            discovery_segment_evidence=tuple(discovery_segment_evidence),
         )
 
     @classmethod
@@ -68,8 +63,7 @@ class ArchiveTask:
         carrier_path: str = "",
         cleanup_paths: list[str] | tuple[str, ...] = (),
         discovery_evidence: dict[str, Any] | None = None,
-        discovery_segments: tuple[ArchiveInputDescriptor, ...] = (),
-        discovery_segment_evidence: tuple[dict[str, Any], ...] = (),
+        discovery_segments: tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...] = (),
         discovery_reason: str = "",
     ) -> "ArchiveTask":
         return cls(
@@ -79,7 +73,6 @@ class ArchiveTask:
             initial_discovery_source=discovery_source,
             discovery_evidence=dict(discovery_evidence or {}),
             discovery_segments=tuple(discovery_segments),
-            discovery_segment_evidence=tuple(discovery_segment_evidence),
             initial_discovery_reason=discovery_reason,
         )
 
@@ -163,8 +156,7 @@ class ArchiveTask:
         discovery_source: str,
         discovery_reason: str,
         discovery_evidence: dict[str, Any],
-        discovery_segments: tuple[ArchiveInputDescriptor, ...],
-        discovery_segment_evidence: tuple[dict[str, Any], ...],
+        discovery_segments: tuple[tuple[ArchiveInputDescriptor, dict[str, Any]], ...],
     ) -> None:
         prepass = discovery_evidence.pop("scan", None)
         self._knowledge.merge({
@@ -178,15 +170,15 @@ class ArchiveTask:
             self._knowledge.set(
                 "source.extractable_segments",
                 [
-                    _segment_payload(index, segment, evidence)
-                    for index, (segment, evidence) in enumerate(zip(discovery_segments, discovery_segment_evidence), start=1)
+                    _segment_payload(index, descriptor, evidence)
+                    for index, (descriptor, evidence) in enumerate(discovery_segments, start=1)
                 ],
                 source_layer="discovery",
                 source_module=discovery_source or "discovery",
             )
             self._knowledge.set(
                 "source.selected_segment",
-                _segment_payload(1, discovery_segments[0], discovery_segment_evidence[0]),
+                _segment_payload(1, *discovery_segments[0]),
                 source_layer="discovery",
                 source_module=self.discovery_source or "discovery",
             )
