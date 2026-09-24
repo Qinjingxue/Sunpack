@@ -10,7 +10,6 @@ pub(crate) use structure::{
 };
 pub(crate) use view::{
     probe_rar_bytes, probe_rar_path, probe_rar_terminal_with_password, probe_rar_volume_paths,
-    probe_zip_volume_paths,
     AnalysisBinaryView, AnalysisMultiVolumeView,
 };
 pub(crate) use volume_anchor::probe_volume_anchors;
