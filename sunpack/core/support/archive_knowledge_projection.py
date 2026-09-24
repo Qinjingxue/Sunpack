@@ -77,7 +77,6 @@ def selected_format(task: Any) -> str:
         get(task, "inspection.selected_format", "")
         or get(task, "inspection.summary.format", "")
         or get(task, "source.input.format_hint", "")
-        or get(task, "archive.format_hint", "")
         or ""
     )
 

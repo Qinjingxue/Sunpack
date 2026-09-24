@@ -203,21 +203,6 @@ def merge_knowledge(*payloads: Any) -> dict[str, Any]:
     return knowledge.to_dict()
 
 
-def project_knowledge_sources(knowledge: Any) -> list[dict[str, Any]]:
-    raw = ArchiveKnowledge.from_any(knowledge).to_dict()
-    if not raw:
-        return []
-    sources = [raw]
-    for key in ("filesystem", "relations", "detection", "analysis", "extraction", "verification", "policy", "format"):
-        value = raw.get(key)
-        if isinstance(value, dict):
-            sources.append(value)
-    zip_payload = raw.get("format", {}).get("zip") if isinstance(raw.get("format"), dict) else None
-    if isinstance(zip_payload, dict):
-        sources.append(zip_payload)
-    return sources
-
-
 def _parts(path: str) -> list[str]:
     return [part for part in str(path or "").split(".") if part]
 

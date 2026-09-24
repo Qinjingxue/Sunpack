@@ -22,9 +22,7 @@ class DiscoveryCandidate:
     format_reject_mask: int = 0
     archive_input: ArchiveInputDescriptor | None = None
     relation_anchor: dict[str, Any] = field(default_factory=dict)
-    relation_kind: str = "file"
     is_split: bool = False
-    is_sfx: bool = False
     companion_paths: tuple[str, ...] = ()
     relation_metadata: dict[str, Any] = field(default_factory=dict)
 

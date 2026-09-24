@@ -242,7 +242,7 @@ def _tar_archive_state_manifest(
 ) -> ArchiveStateManifest:
     try:
         payload = dict(_native_archive_state_tar_manifest(
-            state.source.to_dict(),
+            state.archive_input.to_dict(),
             max_items,
         ))
     except (OSError, ValueError) as exc:
