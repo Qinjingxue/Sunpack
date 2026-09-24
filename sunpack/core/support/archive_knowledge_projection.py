@@ -47,10 +47,6 @@ def source_fingerprint(task_or_knowledge: Any) -> dict[str, Any]:
     return _cached_projection(knowledge, "source_fingerprint", lambda: _source_fingerprint_uncached(knowledge))
 
 
-def source_derivation(task: Any) -> dict[str, Any]:
-    return _dict(get(task, "source.derivation", {}))
-
-
 def source_selected_segment(task: Any) -> dict[str, Any]:
     return _dict(get(task, "source.selected_segment", {}))
 

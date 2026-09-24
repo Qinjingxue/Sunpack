@@ -19,13 +19,17 @@ class ArchiveTask:
     key: str = ""
     logical_name: str = ""
     discovery_source: str = ""
-    discovery_evidence: dict[str, Any] = field(default_factory=dict)
-    discovery_segments: tuple[ResolvedArchiveSegment, ...] = ()
-    relation_kind: str = "file"
+    discovery_evidence: InitVar[dict[str, Any] | None] = None
+    discovery_segments: InitVar[tuple[ResolvedArchiveSegment, ...]] = ()
     discovery_reason: str = ""
     runtime: dict[str, Any] = field(default_factory=dict)
 
-    def __post_init__(self, _archive_input: ArchiveInputDescriptor) -> None:
+    def __post_init__(
+        self,
+        _archive_input: ArchiveInputDescriptor,
+        discovery_evidence: dict[str, Any] | None,
+        discovery_segments: tuple[ResolvedArchiveSegment, ...],
+    ) -> None:
         descriptor = _archive_input
         if not descriptor.entry_path:
             raise ValueError("ArchiveTask requires an archive input entry path")
@@ -48,7 +52,10 @@ class ArchiveTask:
             )
         self._knowledge = ArchiveKnowledge()
         self._state = ArchiveState.from_archive_input(descriptor)
-        self._initialize_knowledge()
+        self._initialize_knowledge(
+            discovery_evidence=dict(discovery_evidence or {}),
+            discovery_segments=tuple(discovery_segments),
+        )
 
     @classmethod
     def from_archive_input(
@@ -60,7 +67,6 @@ class ArchiveTask:
         cleanup_paths: list[str] | tuple[str, ...] = (),
         discovery_evidence: dict[str, Any] | None = None,
         discovery_segments: tuple[ResolvedArchiveSegment, ...] = (),
-        relation_kind: str = "file",
         discovery_reason: str = "",
     ) -> "ArchiveTask":
         return cls(
@@ -71,7 +77,6 @@ class ArchiveTask:
             discovery_source=discovery_source,
             discovery_evidence=dict(discovery_evidence or {}),
             discovery_segments=tuple(discovery_segments),
-            relation_kind=relation_kind,
             discovery_reason=discovery_reason,
         )
 
@@ -82,11 +87,6 @@ class ArchiveTask:
         *,
         discovery_reason: str = "",
     ) -> "ArchiveTask":
-        relation_kind = (
-            "split_archive"
-            if resolved.archive_input.open_mode in {"native_volumes", "sfx_with_volumes"}
-            else "file"
-        )
         return cls.from_archive_input(
             resolved.archive_input,
             discovery_source=resolved.source,
@@ -94,7 +94,6 @@ class ArchiveTask:
             cleanup_paths=resolved.cleanup_paths,
             discovery_evidence=resolved.evidence,
             discovery_segments=resolved.segments,
-            relation_kind=relation_kind,
             discovery_reason=discovery_reason,
         )
 
@@ -187,51 +186,45 @@ class ArchiveTask:
         self.key = replacement.key
         self.logical_name = replacement.logical_name
         self.discovery_source = replacement.discovery_source
-        self.discovery_evidence = dict(replacement.discovery_evidence)
-        self.discovery_segments = tuple(replacement.discovery_segments)
-        self.relation_kind = replacement.relation_kind
         self.discovery_reason = replacement.discovery_reason
         self._knowledge = ArchiveKnowledge.from_any(replacement.knowledge())
         self._state = replacement.archive_state()
         self.runtime = runtime
 
-    def _initialize_knowledge(self) -> None:
+    def _initialize_knowledge(
+        self,
+        *,
+        discovery_evidence: dict[str, Any],
+        discovery_segments: tuple[ResolvedArchiveSegment, ...],
+    ) -> None:
         descriptor = self.archive_input()
         self._knowledge.merge({
             "source": {
                 "input": descriptor.to_dict(),
-                "derivation": {
-                    "kind": self.relation_kind,
-                    "candidate_entry_path": descriptor.entry_path,
-                    "candidate_member_paths": descriptor.part_paths(),
-                    "candidate_carrier_path": self.carrier_path,
-                    "candidate_cleanup_paths": list(self.cleanup_parts),
-                    "candidate_logical_name": self.logical_name,
-                },
             },
             "discovery": {
                 "source": self.discovery_source,
                 "reason": self.discovery_reason,
-                "evidence": dict(self.discovery_evidence),
+                "evidence": dict(discovery_evidence),
             },
         }, source_layer="contracts", source_module="archive_task")
-        if self.discovery_segments:
+        if discovery_segments:
             self._knowledge.set(
                 "source.extractable_segments",
                 [
                     _segment_payload(index, segment)
-                    for index, segment in enumerate(self.discovery_segments, start=1)
+                    for index, segment in enumerate(discovery_segments, start=1)
                 ],
                 source_layer="discovery",
                 source_module=self.discovery_source or "discovery",
             )
             self._knowledge.set(
                 "source.selected_segment",
-                _segment_payload(1, self.discovery_segments[0]),
+                _segment_payload(1, discovery_segments[0]),
                 source_layer="discovery",
                 source_module=self.discovery_source or "discovery",
             )
-        prepass = self.discovery_evidence.get("scan")
+        prepass = discovery_evidence.get("scan")
         if isinstance(prepass, dict):
             self._knowledge.set(
                 "inspection.prepass",

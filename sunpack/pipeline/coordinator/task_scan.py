@@ -137,6 +137,5 @@ def direct_file_task(path: str, all_parts: list[str] | None = None) -> ArchiveTa
     return ArchiveTask.from_archive_input(
         descriptor,
         discovery_source="direct",
-        relation_kind="split_archive" if len(parts) > 1 else "direct_file",
         discovery_reason="cli_direct_file",
     )
