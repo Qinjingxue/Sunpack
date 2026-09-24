@@ -541,3 +541,97 @@ sunpack.py --help 通过。下面 4 个命令均退出码 1；重跑后每个命
 - 其余失败还覆盖模块导入、参数签名、数据模型字段、i18n key、路径和编码断言，逐项错误已列在上方。
 
 当前提交未通过正确性验收。本报告记录观察结果，没有修复或改写测试。
+
+## 最新提交复测（9503b7db）
+
+- 测试提交：`9503b7db8d94b265f58569def7816229bdb52bd4`（`fix: complete canonical contract migration after architecture refactor (#121)`）。本轮在上一轮被测提交 `7b5786c` 之后继续验证。
+- 工作区在测试前干净；没有修改程序代码或测试代码。本报告追加本轮结果。
+- 使用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_windows_dev.ps1 -Arch x64` 强制重建 `.venv`、Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL。worker 的 6 项 CTest 和 toast 的 1 项 CTest 均通过。
+- Rust 单元测试另执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：98 passed，0 failed。
+- 开发环境脚本最后的 CLI probe 没通过：`[CLI] 运行失败：'archive'`，退出码 3（`sunpack.py inspect --analyze --no-pause -q <probe.zip>`）。编译阶段和 CTest 已完成。为继续验收，随后执行 `run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh`；该 runner 后续 5 项 CLI smoke（help、passwords、scan、inspect、config）全部通过。因此，setup probe 的 `'archive'` 异常与 acceptance smoke 结果不一致，仍应单独追踪。
+
+### 本轮汇总
+
+| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| CLI、unit、functional | 1135 | 1129 | 6 | 0 | 0 |
+| integration、real | 347 | 309 | 37 | 0 | 1 |
+| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
+| **Python pytest 合计** | **1490** | **1438** | **43** | **0** | **9** |
+
+额外验证：Rust 单元测试 98 项全部通过；C++ worker/toast CTest 7 项全部通过；acceptance CLI smoke 5 项全部通过。Acceptance 的两个 pytest 阶段失败，disk-full 阶段因管理员权限条件跳过全部 8 项。
+
+### 本轮失败项与报错
+
+#### CLI、unit、functional：6 项
+
+- `tests.unit.test_runtime_cache_cleanup::test_clear_all_runtime_caches_clears_python_owned_caches` — `assert 0 >= 1`。`projection_cache.entries` 实际为 0。
+- `tests.unit.test_verification_methods::test_manifest_size_match_reports_retry_for_large_manifest_gap` — 实际 issue 集合比预期多 `fail.manifest_named_files_missing`；预期只有 `fail.manifest_file_count_under` 和 `fail.manifest_size_under`。
+- `tests.unit.test_input_planning_stage::test_input_planning_stage_does_not_treat_native_zip_recovery_fragments_as_embedded` — 预期 `knowledge_view.source_extractable_segments(task) == []`，实际仍得到 ZIP segment `embedded_01_zip`，`start_offset=13`。
+- `tests.unit.test_resource_lifecycle_static::test_python_business_code_cannot_bypass_tracked_file_entry_points` — 静态检查发现未跟踪入口 `sunpack\runtime\cli\commands\version.py:24:read_text`。
+- `tests.functional.test_misnamed_volume_consistency::test_filename_only_scan_does_not_absorb_unmarked_fuzzy_parts` — 预期 `archive_input.part_paths()` 为单元素 tuple，实际为单元素 list。
+- `tests.functional.test_selected_targets_and_scheduler::test_selected_split_member_without_structural_proof_stays_single_candidate` — 同样预期单元素 tuple，实际为单元素 list。
+
+#### integration、real：37 项
+
+下面 27 项的共同错误是 `AssertionError: container type mismatch: expected pe, got <7z|zip|rar>`。检测到了对应的压缩格式，但测试所构造的 SFX 应被识别为 PE 容器；相同错误横跨普通 SFX、分卷 SFX、加密 SFX 和混淆卷场景。
+
+- 7z（9 项）：
+  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-7z-lzma2]`
+  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-7z-lzma2]`
+  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_archives_extract_and_detect_format[7z]`
+  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[7z]`
+  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_find_correct_password[7z]`
+  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[7z]`
+  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-7z]`
+  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-7z]`
+  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-7z]`
+- ZIP（9 项）：
+  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-zip-deflate]`
+  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-zip-deflate]`
+  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_archives_extract_and_detect_format[zip]`
+  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[zip]`
+  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_find_correct_password[zip]`
+  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[zip]`
+  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-zip]`
+  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-zip]`
+  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-zip]`
+- RAR（9 项）：
+  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-rar-m5]`
+  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-rar-m5]`
+  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_archives_extract_and_detect_format[rar]`
+  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[rar]`
+  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_find_correct_password[rar]`
+  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[rar]`
+  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-rar]`
+  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-rar]`
+  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-rar]`
+
+另外 10 项：
+
+- `tests.integration.test_structure_volume_resolution::test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline` — 枚举值不符：实际 `file_range`，预期 `sfx_with_volumes`（`assert 'file_range' == 'sfx_with_volumes'`）。
+- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_do_not_resubmit[7z]` — 预期 launcher 到达后没有后续提交事件，实际又提交了 `p7_order_7z.exe`。
+- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_do_not_resubmit[zip]` — 同上，实际又提交了 `p7_order_zip.exe`。
+- `tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_multi_member_streams_extract_all_members[gzip]` — `ValueError: Native scan_embedded_archives file_size mismatch: expected 32, got 48`。
+- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[png-rar]` — `assert False`，wrong-password-then-success 的 `any(...)` 断言未成立。
+- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[gif-rar]` — 同一 `assert False`。
+- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[jpg-rar]` — 同一 `assert False`。
+- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[7z]` — 预期有失败任务，实际 `RunSummary(...).failed_tasks == []`。
+- `tests.integration.test_watch_rar_hp_encryption::test_watch_single_hp_rar_reports_wrong_password_without_hanging` — `NameError: name 'BLOCKER_PASSWORD' is not defined`。从异常看，这是测试执行路径引用了未定义名称，不能据此单独认定被测实现行为错误。
+- `tests.integration.test_watch_rar_hp_encryption::test_watch_split_hp_rar_recovers_after_wrong_then_correct_password` — `Failed: watch condition did not settle before timeout: pending=0, entries={}`。
+
+### 本轮理解
+
+- 最大的一组剩余问题是 SFX 外层容器类型：27 个 7z/ZIP/RAR 用例都将 PE SFX 报成内部格式。它同时影响检测、加密 SFX 和卷名混淆流程，较像共享的容器类型归一化/证据优先级问题，而不是 27 个互不相关的提取故障。
+- 分卷 SFX 的 `file_range`/`sfx_with_volumes` 差异和数据卷先到后 launcher 再到时的重复 watch 提交，分别指向输入关系分类和提交去重状态仍有缺口；目前结果不能证明二者根因相同。
+- gzip 用例直接暴露 Rust native 扫描调用的 `file_size` 参数与实际输入长度不一致（32 对 48）。另外，ZIP 恢复片段被报告成 embedded segment、以及两个 `part_paths()` 测试的 list/tuple 差异，显示输入规划/数据模型边界仍有行为或返回契约差异。
+- manifest 验证多报 named-files-missing、projection cache 为空、以及 `version.py` 的文件读取静态违规，是三个独立的剩余单测问题。
+- 3 个带 carrier 前缀的加密 RAR 用例未满足错误密码后再正确密码的断言；split HP RAR 在密码表更新后没有形成 watch entry。单个 HP RAR 用例则先被 `BLOCKER_PASSWORD` 未定义阻断，需将测试名称错误与实现问题区分。
+- 被测结果比上一轮记录的 349 个失败/收集错误少很多，但提交和用例集合都发生了变化，不能把总数差直接解释成逐项回归/修复对应关系。
+
+### 跳过与边界
+
+- disk-full 的 8 项因需要管理员权限执行 diskpart 而跳过。
+- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 未设置 `SUNPACK_RUN_GAME_TREE_TEST=1`，按测试文件要求跳过本机 `D:\game` 扫描。
+- `tests/memory/test_watch_growth.py` 是 opt-in performance 测试，默认 acceptance correctness 流程不执行。
+- 本轮报告基于完成的 Rust 单元测试、native CTest、Python acceptance 和 CLI smoke 结果；未修复失败项。
