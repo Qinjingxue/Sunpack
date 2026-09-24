@@ -1,5 +1,6 @@
 import gzip
 
+from sunpack.core.analysis.embedded.result import EmbeddedCandidate, EmbeddedScanResult
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
@@ -47,3 +48,93 @@ def test_recursive_gate_may_exclude_small_residual_candidate(tmp_path):
 
     assert result.resolved_tasks == []
     assert any(trace.entry_path == str(small) and trace.status == "residual" for trace in result.traces)
+
+
+def test_embedded_discovery_uses_current_identity_size_not_stale_candidate_size(tmp_path, monkeypatch):
+    path = tmp_path / "growing.gz"
+    path.write_bytes(b"x" * 48)
+    candidate = _candidate(path)
+    candidate = DiscoveryCandidate(
+        archive_input=candidate.archive_input,
+        carrier_path=candidate.carrier_path,
+        cleanup_paths=candidate.cleanup_paths,
+        route=candidate.route,
+        size=32,
+    )
+    observed = {}
+
+    def fake_scan(scan_path, *, expected_size=0, identity=None):
+        observed["path"] = scan_path
+        observed["expected_size"] = expected_size
+        observed["identity"] = identity
+        return EmbeddedScanResult(
+            complete=True,
+            candidates=(),
+            hits=(),
+            read_bytes=48,
+            file_size=48,
+            logical_resolution_complete=True,
+            raw_hit_count=0,
+            budget_exhausted=False,
+        )
+
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.file_identity",
+        lambda scan_path: (str(scan_path), 48, 123),
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
+        lambda _path, _size: None,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
+        fake_scan,
+    )
+
+    EmbeddedDiscovery({}).discover([candidate])
+
+    assert observed["expected_size"] == 48
+    assert observed["identity"] == (str(path), 48, 123)
+
+
+def test_embedded_rar_header_encryption_reaches_canonical_input(tmp_path, monkeypatch):
+    path = tmp_path / "carrier.bin"
+    path.write_bytes(b"x" * 128)
+    scan = EmbeddedScanResult(
+        complete=True,
+        candidates=(
+            EmbeddedCandidate(
+                format="rar",
+                offset=16,
+                end_offset=None,
+                confidence=1.0,
+                validation="rar5_encryption_header_crc",
+                candidate_kind="logical_archive",
+                boundary_kind="bounded",
+                range_end_offset=128,
+                extractable=True,
+                contained_anchor_count=1,
+            ),
+        ),
+        hits=(),
+        read_bytes=128,
+        file_size=128,
+        logical_resolution_complete=True,
+        raw_hit_count=1,
+        budget_exhausted=False,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
+        lambda _path, _size: None,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
+        lambda *_args, **_kwargs: scan,
+    )
+
+    result = EmbeddedDiscovery({}).discover([_candidate(path)])
+
+    assert len(result.resolved_tasks) == 1
+    descriptor = result.resolved_tasks[0].archive_input()
+    assert descriptor.open_mode == "file_range"
+    assert descriptor.analysis["password_required"] is True
