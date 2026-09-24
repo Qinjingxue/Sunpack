@@ -42,12 +42,7 @@ class ArchiveTaskScanner:
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
         )
-        for failure in self.provider.failed_candidates:
-            if failure not in self.context.scan_failed_tasks:
-                self.context.scan_failed_tasks.append(failure)
-        for failure in self.provider.failed_candidate_failures:
-            if failure not in self.context.scan_failures:
-                self.context.scan_failures.append(failure)
+        self._record_provider_failures()
         return tasks
 
     def discover_targets(
@@ -64,6 +59,7 @@ class ArchiveTaskScanner:
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
         )
+        self._record_provider_failures()
         return result.resolved_tasks
 
     def filter_processed_tasks(self, tasks: list[ArchiveTask]) -> list[ArchiveTask]:
@@ -71,6 +67,14 @@ class ArchiveTaskScanner:
             tasks,
             processed_keys=self.context.processed_keys,
         )
+
+    def _record_provider_failures(self) -> None:
+        for failure in self.provider.failed_candidates:
+            if failure not in self.context.scan_failed_tasks:
+                self.context.scan_failed_tasks.append(failure)
+        for failure in self.provider.failed_candidate_failures:
+            if failure not in self.context.scan_failures:
+                self.context.scan_failures.append(failure)
 
     def direct_file_tasks(self, file_paths: list[str]) -> list[ArchiveTask]:
         tasks: list[ArchiveTask] = []
@@ -83,6 +87,7 @@ class ArchiveTaskScanner:
             normalized_paths.append(path)
 
         discovered = self.provider.discover_targets(normalized_paths)
+        self._record_provider_failures()
         covered = set(discovered.claimed_paths | discovered.blocked_paths)
         tasks.extend(self.provider.filter_processed_tasks(
             discovered.resolved_tasks,
