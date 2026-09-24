@@ -65,6 +65,15 @@ def container_type(hit) -> str:
         return "pe"
     if extent is not None and int(extent.start or 0) > 0:
         return "pe"
+
+    # 7z/ZIP split SFX launchers are ownership companions rather than archive
+    # input volumes.  Relations has already structurally verified the PE
+    # companion before it becomes carrier_path, so project that canonical task
+    # fact instead of forcing launcher semantics back into the descriptor.
+    carrier = str(getattr(hit, "carrier_path", "") or "")
+    part_paths = {str(path) for path in descriptor.part_paths()}
+    if carrier and carrier not in part_paths and Path(carrier).suffix.casefold() == ".exe":
+        return "pe"
     return ""
 
 
