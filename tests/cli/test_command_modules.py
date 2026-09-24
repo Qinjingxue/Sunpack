@@ -8,8 +8,8 @@ from sunpack.runtime.cli.cli_context import CliContext
 def test_cli_and_gui_packages_have_explicit_boundaries():
     package_root = Path(__file__).resolve().parents[2] / "sunpack"
 
-    assert (package_root / "cli" / "__init__.py").is_file()
-    assert (package_root / "gui" / "__init__.py").is_file()
+    assert (package_root / "runtime" / "cli" / "__init__.py").is_file()
+    assert (package_root / "runtime" / "gui" / "__init__.py").is_file()
     assert not (package_root / "app").exists()
 from sunpack.core.i18n.catalog import CATALOG
 from sunpack.core.i18n.context import validate_catalog
