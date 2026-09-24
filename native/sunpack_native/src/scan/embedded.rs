@@ -1525,6 +1525,44 @@ mod tests {
     }
 
     #[test]
+    fn exact_7z_range_suppresses_valid_inner_stream_before_validation() {
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+        gzip.write_all(b"inner payload").unwrap();
+        let inner = gzip.finish().unwrap();
+        let next_header = b"\x01";
+
+        let mut start_header = Vec::new();
+        start_header.extend_from_slice(&(inner.len() as u64).to_le_bytes());
+        start_header.extend_from_slice(&(next_header.len() as u64).to_le_bytes());
+        start_header.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut data = b"carrier-prefix".to_vec();
+        let start = data.len() as u64;
+        data.extend_from_slice(SEVEN_ZIP);
+        data.extend_from_slice(&[0, 4]);
+        data.extend_from_slice(&crc32(&start_header).to_le_bytes());
+        data.extend_from_slice(&start_header);
+        data.extend_from_slice(&inner);
+        data.extend_from_slice(next_header);
+        let end = data.len() as u64;
+        let path = temp_file("embedded_7z_owns_inner_stream", &data);
+
+        let result = scan_embedded_archives_native(ManagedReader::open(&path).unwrap()).unwrap();
+        let logical = result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.candidate_kind == "logical_archive")
+            .collect::<Vec<_>>();
+
+        assert_eq!(logical.len(), 1);
+        assert_eq!(logical[0].format, "7z");
+        assert_eq!(logical[0].offset, start);
+        assert_eq!(logical[0].end_offset, Some(end));
+        assert!(!result.candidates.iter().any(|candidate| candidate.format == "gzip"));
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn aggregates_embedded_zip64_from_locator_eocd_and_local_links() {
         let mut data = b"sfx-prefix".to_vec();
         let (start, end) = append_zip64_archive(&mut data);
