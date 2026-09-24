@@ -78,7 +78,6 @@ async def _complete(watcher, candidate, response):
     request = _ActivePipelineRequest(
         notification_id="request",
         candidate=candidate,
-        group=None,
         task=asyncio.create_task(done()),
     )
     return await watcher._complete_candidate(request)
