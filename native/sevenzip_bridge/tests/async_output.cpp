@@ -37,7 +37,13 @@ bool write_same_file_concurrently(const std::filesystem::path& directory) {
         expected[index] = static_cast<unsigned char>((index * 37U + index / 257U) & 0xFFU);
     }
 
-    AsyncFileWriter writer;
+    // This test asserts actual parallel Data WorkItem execution, so it must not
+    // inherit the user's production writer-thread setting from the environment.
+    AsyncWriterConfig config;
+    config.threads_per_volume = 4;
+    config.buffer_count = 8;
+    AsyncFileWriter writer(
+        std::make_shared<WriterMeters>(), make_volume_state("test:parallel", false), config);
     const auto job = writer.make_job();
     const auto file = writer.make_file(
         job, (directory / L"parallel.bin").wstring(), L"parallel.bin", 0, 0);

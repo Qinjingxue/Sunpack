@@ -5,7 +5,6 @@ use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use memchr::memmem;
 use std::io::{self, Read};
 use xz2::read::XzDecoder;
 use zstd::stream::read::Decoder as ZstdDecoder;
@@ -94,34 +93,6 @@ pub(crate) fn probe_rar_terminal_with_password(
         )?
     };
     probe_header_encrypted_terminal(&reader, start_offset, password, max_blocks)
-}
-
-pub(crate) fn probe_zip_volume_paths(
-    py: Python<'_>,
-    paths: &[String],
-    max_cd_entries_to_walk: usize,
-) -> PyResult<Option<Py<PyDict>>> {
-    let view = AnalysisMultiVolumeView::new(paths.to_vec(), 64 * 1024 * 1024, None, 1)?;
-    let size = view.reader.len();
-    let tail_len = size.min(65_557) as usize;
-    let tail_start = size.saturating_sub(tail_len as u64);
-    let tail = view.read_at_bytes(tail_start, tail_len)?;
-    let eocd_offset = memmem::rfind(&tail, b"PK\x05\x06").and_then(|index| {
-        let comment_len = tail
-            .get(index + 20..index + 22)
-            .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize)?;
-        (index + 22 + comment_len == tail.len()).then_some(tail_start + index as u64)
-    });
-    let Some(eocd_offset) = eocd_offset else {
-        return Ok(None);
-    };
-    let result = AnalysisBinaryView {
-        path: view.path.clone(),
-        reader: view.reader.clone(),
-        closed: view.closed,
-    }
-    .probe_zip(py, eocd_offset, max_cd_entries_to_walk)?;
-    Ok(Some(result))
 }
 
 fn reader_error_to_py(error: std::io::Error) -> PyErr {
