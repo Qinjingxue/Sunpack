@@ -129,3 +129,30 @@ def test_tar_native_and_multi_volume_fallback_match_damage(tmp_path):
         assert {field: split_raw[field] for field in fields} == {
             field: file_raw[field] for field in fields
         }
+
+def test_tar_detection_uses_first_header_only_and_keeps_deep_analysis_separate(tmp_path):
+    data = bytearray(_tar_bytes(payload=b"A" * 32))
+    # The first member occupies header + one padded payload block. Corrupt
+    # later TAR metadata without touching the first header identity proof.
+    second_header = 1024
+    data[second_header] ^= 0x5A
+    path = tmp_path / "later-damaged.tar"
+    path.write_bytes(data)
+    analyzer = ArchiveAnalyzer()
+
+    identity = analyzer.probe_tar(
+        str(path),
+        TarProbeOptions(max_entries_to_walk=0),
+    ).to_raw_dict()
+
+    assert identity["plausible"] is True
+    assert identity["validation_scope"] == "format_identity"
+    assert identity["identity_strong"] is True
+    assert identity["entries_checked"] == 0
+    assert confirm_tar(str(path), analyzer) is True
+
+    deep = analyzer.probe_tar(
+        str(path),
+        TarProbeOptions(max_entries_to_walk=8),
+    ).to_raw_dict()
+    assert deep["entry_walk_ok"] is False
