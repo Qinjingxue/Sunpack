@@ -15,10 +15,14 @@ ArchiveOpenMode = Literal[
 
 
 @dataclass(frozen=True)
-class ArchiveInputRange:
+class InputExtent:
     path: str
     start: int = 0
     end: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.path or self.start < 0 or (self.end is not None and self.end < self.start):
+            raise ValueError("input extent requires a path and an ordered nonnegative range")
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -32,11 +36,14 @@ class ArchiveInputRange:
 
 @dataclass(frozen=True)
 class ArchiveInputPart:
-    path: str
+    extent: InputExtent
     role: str = "main"
     volume_number: int | None = None
     canonical_name: str = ""
-    range: ArchiveInputRange | None = None
+
+    @property
+    def path(self) -> str:
+        return self.extent.path
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -47,31 +54,10 @@ class ArchiveInputPart:
             payload["volume_number"] = int(self.volume_number)
         if self.canonical_name:
             payload["canonical_name"] = self.canonical_name
-        if self.range is not None:
-            payload.update({
-                "start": int(self.range.start),
-            })
-            if self.range.end is not None:
-                payload["end"] = int(self.range.end)
-        return payload
-
-
-@dataclass(frozen=True)
-class ArchiveInputSegment:
-    start: int = 0
-    end: int | None = None
-    confidence: float | None = None
-    source: str = "analysis"
-
-    def to_dict(self) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "start": int(self.start),
-            "source": self.source,
-        }
-        if self.end is not None:
-            payload["end"] = int(self.end)
-        if self.confidence is not None:
-            payload["confidence"] = float(self.confidence)
+        if self.extent.start:
+            payload["start"] = int(self.extent.start)
+        if self.extent.end is not None:
+            payload["end"] = int(self.extent.end)
         return payload
 
 
@@ -83,12 +69,15 @@ class ArchiveInputDescriptor:
     logical_name: str = ""
     volume_style: str = ""
     parts: list[ArchiveInputPart] = field(default_factory=list)
-    ranges: list[ArchiveInputRange] = field(default_factory=list)
-    segment: ArchiveInputSegment | None = None
+    extents: list[InputExtent] = field(default_factory=list)
     analysis: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "format_hint", str(self.format_hint or "").strip().lower().lstrip("."))
+        if self.open_mode == "concat_ranges" and not self.extents:
+            raise ValueError("concat_ranges requires input extents")
+        if self.open_mode == "file_range" and not self.parts:
+            raise ValueError("file_range requires an input part")
         if self.open_mode in {"native_volumes", "sfx_with_volumes"}:
             ordered = sorted(self.parts, key=lambda part: int(part.volume_number or 0))
             if not ordered:
@@ -120,17 +109,30 @@ class ArchiveInputDescriptor:
             payload["volume_style"] = self.volume_style
         if self.parts:
             payload["parts"] = [part.to_dict() for part in self.parts]
-        if self.ranges:
-            payload["ranges"] = [item.to_dict() for item in self.ranges]
-        if self.segment is not None:
-            payload["segment"] = self.segment.to_dict()
+        if self.open_mode == "concat_ranges":
+            payload["ranges"] = [item.to_dict() for item in self.extents]
+        if self.open_mode == "file_range" or (
+            self.open_mode == "concat_ranges" and "segment_start" in self.analysis
+        ):
+            extent = self.primary_extent
+            start = int(self.analysis.get("segment_start", extent.start if extent else 0))
+            end = self.analysis.get("segment_end", extent.end if extent else None)
+            segment: dict[str, Any] = {
+                "start": start,
+                "source": str(self.analysis.get("segment_source") or "analysis"),
+            }
+            if end is not None:
+                segment["end"] = int(end)
+            if self.analysis.get("segment_confidence") is not None:
+                segment["confidence"] = float(self.analysis["segment_confidence"])
+            payload["segment"] = segment
         if self.analysis:
             payload["analysis"] = dict(self.analysis)
         return payload
 
     def part_paths(self) -> list[str]:
-        if self.open_mode == "concat_ranges" and self.ranges:
-            return list(dict.fromkeys(item.path for item in self.ranges if item.path))
+        if self.open_mode == "concat_ranges" and self.extents:
+            return list(dict.fromkeys(item.path for item in self.extents if item.path))
         if self.parts:
             return list(dict.fromkeys(part.path for part in self.parts if part.path))
         return [self.entry_path] if self.entry_path else []
@@ -138,21 +140,20 @@ class ArchiveInputDescriptor:
     def with_path_mapping(self, mapper) -> "ArchiveInputDescriptor":
         parts = [
             ArchiveInputPart(
-                path=mapper(part.path),
+                extent=InputExtent(
+                    path=mapper(part.extent.path),
+                    start=part.extent.start,
+                    end=part.extent.end,
+                ),
                 role=part.role,
                 volume_number=part.volume_number,
                 canonical_name=part.canonical_name,
-                range=ArchiveInputRange(
-                    path=mapper(part.range.path),
-                    start=part.range.start,
-                    end=part.range.end,
-                ) if part.range is not None else None,
             )
             for part in self.parts
         ]
-        ranges = [
-            ArchiveInputRange(path=mapper(item.path), start=item.start, end=item.end)
-            for item in self.ranges
+        extents = [
+            InputExtent(path=mapper(item.path), start=item.start, end=item.end)
+            for item in self.extents
         ]
         return ArchiveInputDescriptor(
             entry_path=mapper(self.entry_path),
@@ -161,19 +162,15 @@ class ArchiveInputDescriptor:
             logical_name=self.logical_name,
             volume_style=self.volume_style,
             parts=parts,
-            ranges=ranges,
-            segment=self.segment,
+            extents=extents,
             analysis=dict(self.analysis),
         )
 
-    def _primary_range(self) -> ArchiveInputRange | None:
+    @property
+    def primary_extent(self) -> InputExtent | None:
         if self.parts:
-            part = self.parts[0]
-            if part.range is not None:
-                return part.range
-        if self.segment is not None:
-            return ArchiveInputRange(path=self.entry_path, start=self.segment.start, end=self.segment.end)
-        return None
+            return self.parts[0].extent
+        return self.extents[0] if self.extents else None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any], *, archive_path: str = "", part_paths: list[str] | None = None) -> "ArchiveInputDescriptor":
@@ -190,45 +187,41 @@ class ArchiveInputDescriptor:
             path = str(item.get("path") or entry_path)
             end_raw = item.get("end")
             start = int(item.get("start", 0) or 0)
-            part_range = None
-            if start or end_raw is not None:
-                part_range = ArchiveInputRange(
-                    path=path,
-                    start=start,
-                    end=int(end_raw) if end_raw is not None else None,
-                )
             parts.append(ArchiveInputPart(
-                path=path,
+                extent=InputExtent(path=path, start=start, end=int(end_raw) if end_raw is not None else None),
                 role=str(item.get("role") or "main"),
                 volume_number=int(item["volume_number"]) if item.get("volume_number") is not None else None,
                 canonical_name=str(item.get("canonical_name") or ""),
-                range=part_range,
             ))
-        ranges = []
+        extents = []
         for item in raw.get("ranges") or []:
             if not isinstance(item, dict):
                 continue
             end_raw = item.get("end")
-            ranges.append(ArchiveInputRange(
+            extents.append(InputExtent(
                 path=str(item.get("path") or entry_path),
                 start=int(item.get("start", 0) or 0),
                 end=int(end_raw) if end_raw is not None else None,
             ))
-        segment = None
+        analysis = dict(raw.get("analysis") or {}) if isinstance(raw.get("analysis"), dict) else {}
         segment_raw = raw.get("segment")
         if isinstance(segment_raw, dict):
-            end_raw = segment_raw.get("end")
-            confidence_raw = segment_raw.get("confidence")
-            segment = ArchiveInputSegment(
-                start=int(segment_raw.get("start", 0) or 0),
-                end=int(end_raw) if end_raw is not None else None,
-                confidence=float(confidence_raw) if confidence_raw is not None else None,
-                source=str(segment_raw.get("source") or "analysis"),
-            )
-        if not parts and not ranges and part_paths:
+            analysis["segment_start"] = int(segment_raw.get("start", 0) or 0)
+            if segment_raw.get("end") is not None:
+                analysis["segment_end"] = int(segment_raw["end"])
+            if segment_raw.get("confidence") is not None:
+                analysis["segment_confidence"] = float(segment_raw["confidence"])
+            analysis["segment_source"] = str(segment_raw.get("source") or "analysis")
+            if open_mode == "file_range" and not parts:
+                parts = [ArchiveInputPart(extent=InputExtent(
+                    path=entry_path,
+                    start=analysis["segment_start"],
+                    end=analysis.get("segment_end"),
+                ))]
+        if not parts and not extents and part_paths:
             if len(part_paths) > 1:
                 raise ValueError("multi-volume inputs require serialized structured parts")
-            parts = [ArchiveInputPart(path=str(part_paths[0]), role="main", volume_number=1)]
+            parts = [ArchiveInputPart(extent=InputExtent(path=str(part_paths[0])), role="main", volume_number=1)]
         return cls(
             entry_path=entry_path,
             open_mode=open_mode,  # type: ignore[arg-type]
@@ -236,9 +229,8 @@ class ArchiveInputDescriptor:
             logical_name=str(raw.get("logical_name") or ""),
             volume_style=str(raw.get("volume_style") or ""),
             parts=parts,
-            ranges=ranges,
-            segment=segment,
-            analysis=dict(raw.get("analysis") or {}) if isinstance(raw.get("analysis"), dict) else {},
+            extents=extents,
+            analysis=analysis,
         )
 
     @classmethod
@@ -260,7 +252,7 @@ class ArchiveInputDescriptor:
             format_hint=format_hint,
             logical_name=logical_name,
             parts=[
-                ArchiveInputPart(path=str(path), role="main", volume_number=1)
+                ArchiveInputPart(extent=InputExtent(path=str(path)), role="main", volume_number=1)
                 for index, path in enumerate(paths)
             ],
         )
@@ -305,7 +297,7 @@ class ArchiveInputDescriptor:
         style = normalized[0]["style"]
         parts = [
             ArchiveInputPart(
-                path=item["path"],
+                extent=InputExtent(path=item["path"], start=item["start"]),
                 role=item["role"],
                 volume_number=item["number"],
                 canonical_name=canonical_volume_name(
@@ -315,8 +307,6 @@ class ArchiveInputDescriptor:
                     width=item["width"],
                     role=item["role"],
                 ),
-                range=ArchiveInputRange(path=item["path"], start=item["start"])
-                if item["start"] > 0 else None,
             )
             for item in normalized
         ]
@@ -351,8 +341,7 @@ class ArchiveInputDescriptor:
                     logical_name=descriptor.logical_name or logical_name,
                     volume_style=descriptor.volume_style,
                     parts=list(descriptor.parts),
-                    ranges=list(descriptor.ranges),
-                    segment=descriptor.segment,
+                    extents=list(descriptor.extents),
                     analysis=dict(descriptor.analysis),
                 )
             return descriptor

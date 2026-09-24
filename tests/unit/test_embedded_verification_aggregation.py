@@ -8,7 +8,7 @@ from sunpack.core.contracts.verification import (
     DECISION_FAIL,
     DECISION_RETRY_EXTRACT,
     VERIFICATION_STRENGTH_CRC,
-    ArchiveCoverageSummary,
+    ArchiveCoverage,
     VerificationResult,
 )
 from sunpack.pipeline.verification.pipeline import aggregate_payload_verifications
@@ -22,13 +22,11 @@ def _verification(*, decision, integrity, completeness, complete=0, failed=0):
         content_integrity=integrity,
         verification_strength=VERIFICATION_STRENGTH_CRC,
         decision_hint=decision,
-        complete_files=complete,
-        failed_files=failed,
         output_file_count=complete,
         output_empty=complete == 0,
         output_quality_score=completeness,
         output_confidence=1.0,
-        archive_coverage=ArchiveCoverageSummary(
+        archive_coverage=ArchiveCoverage(
             completeness=completeness,
             expected_files=complete + failed,
             matched_files=complete,

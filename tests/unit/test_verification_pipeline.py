@@ -7,7 +7,7 @@ from sunpack.core.passwords import PasswordSession
 from sunpack.pipeline.verification import (
     FileVerificationObservation,
     VerificationScheduler,
-    VerificationStepResult,
+    VerificationStep,
     register_verification_method,
 )
 from sunpack.core.contracts.verification import VerificationIssue
@@ -25,7 +25,7 @@ CALLS = []
 class UnitCompleteObservationMethod:
     def verify(self, evidence, config):
         CALLS.append(config["name"])
-        return VerificationStepResult(
+        return VerificationStep(
             method=config["name"],
             completeness_hint=float(config.get("completeness", 1.0)),
             content_integrity_hint=config.get("content_integrity", "verified_complete"),
@@ -41,7 +41,7 @@ class UnitMissingObservationMethod:
     def verify(self, evidence, config):
         CALLS.append(config["name"])
         issue = VerificationIssue(method=config["name"], code="fail.unit_missing", message="missing", path="missing.bin")
-        return VerificationStepResult(
+        return VerificationStep(
             method=config["name"],
             status="warning",
             completeness_hint=0.5,
@@ -58,8 +58,8 @@ class UnitMissingObservationMethod:
 class UnitPasswordAssessmentMethod:
     def verify(self, evidence, config):
         if evidence.password == config.get("expected_password"):
-            return VerificationStepResult(method=config["name"], completeness_hint=1.0, decision_hint="accept")
-        return VerificationStepResult(
+            return VerificationStep(method=config["name"], completeness_hint=1.0, decision_hint="accept")
+        return VerificationStep(
             method=config["name"],
             completeness_hint=0.0,
             decision_hint="request_password",
@@ -78,7 +78,7 @@ class UnitPasswordAssessmentMethod:
 @register_verification_method("unit_warning_complete")
 class UnitWarningCompleteMethod:
     def verify(self, evidence, config):
-        return VerificationStepResult(
+        return VerificationStep(
             method=config["name"],
             status="warning",
             completeness_hint=1.0,
@@ -100,7 +100,7 @@ class UnitWarningCompleteMethod:
 @register_verification_method("unit_verified_carrier")
 class UnitVerifiedCarrierMethod:
     def verify(self, evidence, config):
-        return VerificationStepResult(
+        return VerificationStep(
             method=config["name"],
             completeness_hint=1.0,
             content_integrity_hint=CONTENT_INTEGRITY_VERIFIED_COMPLETE,
@@ -138,9 +138,9 @@ def test_verification_scheduler_disabled_routes_failed_extraction_to_failure(tmp
     task, result = _task_and_result(tmp_path)
     result = ExtractionResult(
         success=False,
-        archive=result.archive,
+
         out_dir=result.out_dir,
-        all_parts=result.all_parts,
+
         error="fatal archive damage",
     )
     scheduler = VerificationScheduler({
@@ -282,5 +282,5 @@ def _task_and_result(tmp_path):
     out_dir.mkdir()
     (out_dir / "inside.txt").write_text("hello", encoding="utf-8")
     task = make_archive_task(archive, key="sample-key", format_hint="zip")
-    result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
     return task, result

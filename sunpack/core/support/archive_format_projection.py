@@ -382,7 +382,7 @@ def _zip_runtime_public_payload(runtime: dict[str, Any], knowledge: Any) -> dict
         "no_payload_hash_crc_failure": bool(runtime.get("no_payload_hash_crc_failure")),
     }
     extraction = _dict_at(knowledge, "extraction.entry_outcomes")
-    coverage = _dict_at(knowledge, "verification.coverage_breakdown") or _dict_at(knowledge, "verification.summary.coverage_breakdown")
+    coverage = _dict_at(knowledge, "verification.coverage_breakdown")
     if extraction:
         payload["extraction_entry_outcomes"] = extraction
     if coverage:

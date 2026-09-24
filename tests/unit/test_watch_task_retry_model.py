@@ -38,7 +38,7 @@ class _Runner:
         pass
 
     def run_targets(self, _paths):
-        return RunSummary(1, [], [])
+        return RunSummary(target_results=[TargetRunResult('archive.zip', OutcomeKind.COMPLETE_SUCCESS)])
 
 
 def _candidate(path):
@@ -86,22 +86,9 @@ async def _complete(watcher, candidate, response):
 
 def _response(direct, nested=None):
     results = [direct, *([nested] if nested is not None else [])]
-    failures = [item.failure for item in results if item.failure is not None]
-    failed_tasks = [
-        f"{os.path.basename(item.input_path)} [{item.error or item.failure.message}]"
-        for item in results
-        if item.failure is not None
-    ]
     return PipelineResponse(
         "request",
-        RunSummary(
-            success_count=sum(item.outcome_kind == OutcomeKind.COMPLETE_SUCCESS for item in results),
-            failed_tasks=failed_tasks,
-            processed_keys=[],
-            partial_success_count=sum(item.outcome_kind == OutcomeKind.PARTIAL_SUCCESS for item in results),
-            failures=failures,
-            target_results=results,
-        ),
+        RunSummary(target_results=results),
         PipelineArtifacts(),
     )
 

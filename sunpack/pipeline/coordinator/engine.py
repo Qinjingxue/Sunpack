@@ -11,8 +11,8 @@ from typing import Any, Callable, Iterable, TextIO
 
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse, PipelineTarget
-from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary
-from sunpack.core.contracts.run_context import RunContext
+from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind
+from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.extraction_batch import ExtractionBatchRunner
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.pipeline.coordinator.recursive_authorization import RecursiveAuthorization
@@ -512,7 +512,7 @@ class _PipelineServices:
 
 
 class _CleanupRefScope:
-    def __init__(self, context: RunContext, config: dict, factory: Callable[..., Any]):
+    def __init__(self, context: RunState, config: dict, factory: Callable[..., Any]):
         from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
 
         self._context = context
@@ -662,7 +662,7 @@ class _RequestRuntime:
         self.language = self.i18n.language
         self.quiet = bool(cli_config.get("quiet", False))
         self.verbose = bool(cli_config.get("verbose", False))
-        self.context = RunContext()
+        self.context = RunState()
         self.reporter = RunReporter(
             language=self.language,
             quiet=self.quiet,
@@ -815,9 +815,9 @@ class _RequestRuntime:
                     cancellation=cancellation,
                 )
                 authorized_tasks = (
-                    authorization.allowed_inputs
+                    authorization.allowed_tasks
                     if direct_round
-                    else self.task_scanner.tasks_from_inputs(authorization.allowed_inputs)
+                    else self.task_scanner.filter_processed_tasks(authorization.allowed_tasks)
                 )
                 async def plan_one(task):
                     return await broker.run(
@@ -927,7 +927,7 @@ def _finalize_response(
     retry_results=None,
     defer_flatten: bool = False,
 ) -> PipelineResponse:
-    if getattr(response.summary, "_postprocess_completed", False) and retry_results is None:
+    if response.summary.postprocess_completed and retry_results is None:
         return response
     flatten_targets_all = list(response.artifacts.flatten_targets)
     shell_refresh_paths = list(response.artifacts.shell_refresh_paths)
@@ -963,9 +963,11 @@ def _finalize_response(
     notify_shell_directories_updated(shell_refresh_paths)
     merged = {path_key(item.path): item for item in response.summary.cleanup_results}
     merged.update({path_key(item.path): item for item in cleanup_results})
-    response.summary.cleanup_results = list(merged.values())
-    response.summary._postprocess_completed = True
-    return response
+    return replace(response, summary=replace(
+        response.summary,
+        cleanup_results=tuple(merged.values()),
+        postprocess_completed=True,
+    ))
 
 
 class _RequestOwnership:
@@ -973,7 +975,6 @@ class _RequestOwnership:
         self.submissions = submissions
         self.config = config
         self._task_owner: dict[str, str] = {}
-        self._task_keys: dict[str, list[str]] = {item.request_id: [] for item in submissions}
         self._claimed_paths: dict[str, list[str]] = {item.request_id: [] for item in submissions}
         self._task_paths: dict[str, dict[str, tuple[str, ...]]] = {item.request_id: {} for item in submissions}
         self._output_owner: dict[str, str] = {}
@@ -984,7 +985,6 @@ class _RequestOwnership:
             owner_id = owner.request_id
             paths = tuple(dict.fromkeys(task.all_parts or [task.main_path]))
             self._task_owner[path_key(task.main_path)] = owner_id
-            self._task_keys[owner_id].append(task.key)
             self._claimed_paths[owner_id].extend(paths)
             self._task_paths[owner_id][path_key(task.main_path)] = paths
 
@@ -1022,7 +1022,7 @@ class _RequestOwnership:
             return max(containing, key=lambda item: item[0])[1]
         return self.submissions[0]
 
-    def responses(self, context: RunContext, *, recent_passwords: Iterable[str]) -> dict[str, PipelineResponse]:
+    def responses(self, context: RunState, *, recent_passwords: Iterable[str]) -> dict[str, PipelineResponse]:
         results = {item.request_id: [] for item in self.submissions}
         for result in context.target_results:
             results[self.owner_for_path(result.input_path).request_id].append(result)
@@ -1034,37 +1034,20 @@ class _RequestOwnership:
         responses = {}
         for submission in self.submissions:
             request_results = results[submission.request_id]
-            failed = [
-                f"{os.path.basename(result.input_path)} [{result.error or getattr(result.failure, 'message', '')}]"
-                for result in request_results
-                if result.outcome_kind == OutcomeKind.FAILURE
-            ]
             if len(self.submissions) == 1:
-                failed = list(context.failed_tasks)
-                failures = list(context.failures)
+                scan_failed_tasks = list(context.scan_failed_tasks)
+                scan_failures = list(context.scan_failures)
             else:
-                failures = [
-                    result.failure
-                    for result in request_results
-                    if result.failure is not None
-                ]
-                failures.extend(
+                scan_failed_tasks = []
+                scan_failures = [
                     failure
-                    for failure in context.failures
-                    if failure not in failures and self._failure_owner(failure) == submission.request_id
-                )
-            recovered = [
-                item for item in context.recovered_outputs
-                if self.owner_for_path(str(item.get("out_dir") or item.get("archive") or "")).request_id == submission.request_id
-            ]
-            summary = RunSummary(
-                success_count=sum(result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS for result in request_results),
-                failed_tasks=failed,
-                processed_keys=list(dict.fromkeys(self._task_keys[submission.request_id])),
-                partial_success_count=sum(result.outcome_kind == OutcomeKind.PARTIAL_SUCCESS for result in request_results),
-                recovered_outputs=recovered,
-                failures=failures,
+                    for failure in context.scan_failures
+                    if self._failure_owner(failure) == submission.request_id
+                ]
+            summary = context.snapshot(
                 target_results=request_results,
+                scan_failed_tasks=scan_failed_tasks,
+                scan_failures=scan_failures,
                 policy_skips=[
                     item
                     for item in context.policy_skips

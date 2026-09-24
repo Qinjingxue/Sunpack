@@ -9,15 +9,13 @@ from typing import Any
 from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveInputPart,
-    ArchiveInputRange,
-    ArchiveInputSegment,
+    InputExtent,
 )
 from sunpack.core.contracts.discovery import (
     DiscoveryCandidate,
-    ResolvedArchiveInput,
-    ResolvedArchiveSegment,
     StageResult,
 )
+from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.analysis.embedded import inspect_runtime_bundle, scan_embedded_archives
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
@@ -101,7 +99,7 @@ class EmbeddedDiscovery:
     def _discover_candidate(
         self,
         candidate: DiscoveryCandidate,
-    ) -> tuple[ResolvedArchiveInput | None, str]:
+    ) -> tuple[ArchiveTask | None, str]:
         path = candidate.entry_path
         size = candidate.size
         if not path or not isinstance(size, int) or size <= 0:
@@ -124,7 +122,8 @@ class EmbeddedDiscovery:
             return None, "no_complete_embedded_archive"
 
         physical.sort(key=lambda item: (item.offset, -item.confidence, item.format))
-        segments: list[ResolvedArchiveSegment] = []
+        segments: list[ArchiveInputDescriptor] = []
+        segment_evidence: list[dict[str, Any]] = []
         base_name = candidate.logical_name or os.path.basename(path)
         for index, item in enumerate(physical, start=1):
             end = item.range_end_offset or item.end_offset
@@ -138,25 +137,23 @@ class EmbeddedDiscovery:
                 logical_name,
                 confidence=float(item.confidence),
             )
-            segments.append(ResolvedArchiveSegment(
-                archive_input=descriptor,
-                evidence=item.to_dict(),
-            ))
+            segments.append(descriptor)
+            segment_evidence.append(item.to_dict())
 
         primary = segments[0]
         return (
-            ResolvedArchiveInput(
-                archive_input=primary.archive_input,
-                source="embedded",
+            ArchiveTask.from_archive_input(
+                primary,
+                discovery_source="embedded",
                 carrier_path=candidate.carrier_path,
                 cleanup_paths=candidate.cleanup_paths,
-                evidence={
+                discovery_evidence={
                     "scan": scan.to_prepass(),
-                    "primary": dict(primary.evidence),
                 },
-                segments=tuple(segments),
+                discovery_segments=tuple(segments),
+                discovery_segment_evidence=tuple(segment_evidence),
             ),
-            f"Validated embedded {primary.format} at offset {primary.start_offset}",
+            f"Validated embedded {primary.format_hint} at offset {primary.primary_extent.start if primary.primary_extent else 0}",
         )
 
 
@@ -211,17 +208,12 @@ def _descriptor_for_candidate(
             format_hint=archive_format,
             logical_name=logical_name,
         )
-    archive_range = ArchiveInputRange(path=path, start=start, end=end)
+    extent = InputExtent(path=path, start=start, end=end)
     return ArchiveInputDescriptor(
         entry_path=path,
         open_mode="file_range",
         format_hint=archive_format,
         logical_name=logical_name,
-        parts=[ArchiveInputPart(path=path, role="main", range=archive_range)],
-        segment=ArchiveInputSegment(
-            start=start,
-            end=end,
-            confidence=confidence,
-            source="embedded",
-        ),
+        parts=[ArchiveInputPart(extent=extent, role="main")],
+        analysis={"segment_confidence": confidence, "segment_source": "embedded"},
     )

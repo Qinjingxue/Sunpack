@@ -7,9 +7,7 @@ from sunpack.core.contracts.failures import FailureInfo
 @dataclass
 class ExtractionResult:
     success: bool
-    archive: str
     out_dir: str
-    all_parts: list[str]
     error: str = ""
     failure: FailureInfo | None = None
     password_used: Optional[str] = None
@@ -19,6 +17,7 @@ class ExtractionResult:
     progress_manifest: str = ""
     progress_manifest_payload: dict[str, Any] | None = None
     output_inventory: Any = None
+    # Cached native counters; the output inventory is authoritative when present.
     files_written: int = 0
     bytes_written: int = 0
     # In-process child results for carriers containing independent archives.

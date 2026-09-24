@@ -6,14 +6,7 @@ from sunpack.core.contracts.retry_targets import merge_latest_results, password_
 
 
 def _summary(*results):
-    failures = [item.failure for item in results if item.failure is not None]
-    return RunSummary(
-        success_count=sum(item.outcome_kind == OutcomeKind.COMPLETE_SUCCESS for item in results),
-        failed_tasks=[item.error for item in results if item.failure is not None],
-        processed_keys=[],
-        failures=failures,
-        target_results=list(results),
-    )
+    return RunSummary(target_results=list(results))
 
 
 def test_password_retry_paths_are_task_scoped(tmp_path):

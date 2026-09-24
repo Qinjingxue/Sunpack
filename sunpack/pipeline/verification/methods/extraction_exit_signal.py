@@ -11,7 +11,7 @@ from sunpack.core.contracts.verification import (
     VERIFICATION_STRENGTH_EXTRACTION,
     FileVerificationObservation,
     VerificationIssue,
-    VerificationStepResult,
+    VerificationStep,
 )
 
 
@@ -19,11 +19,11 @@ from sunpack.core.contracts.verification import (
 class ExtractionExitSignalMethod:
     name = "extraction_exit_signal"
 
-    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStepResult:
+    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
         result = evidence.extraction_result
         if not result.success:
             if result.failure is not None and result.failure.is_password_failure:
-                return VerificationStepResult(
+                return VerificationStep(
                     method=self.name,
                     status="failed",
                     completeness_hint=0.0,
@@ -34,7 +34,7 @@ class ExtractionExitSignalMethod:
                             method=self.name,
                             code="fail.password_required",
                             message=result.failure.message,
-                            path=result.archive or evidence.archive_path,
+                            path=evidence.archive_path,
                             actual=result.failure.to_dict(),
                         )
                     ],
@@ -44,7 +44,7 @@ class ExtractionExitSignalMethod:
             error_class = _error_class(result.diagnostics, evidence.progress_manifest)
             content_integrity = error_class.content_integrity
             if partial_outputs:
-                return VerificationStepResult(
+                return VerificationStep(
                     method=self.name,
                     status="partial",
                     completeness_hint=_manifest_completeness(evidence.progress_manifest, observations),
@@ -62,7 +62,7 @@ class ExtractionExitSignalMethod:
                             method=self.name,
                             code="warning.partial_extraction_available",
                             message=result.error or "Extraction failed after producing partial output",
-                            path=result.archive or evidence.archive_path,
+                            path=evidence.archive_path,
                             actual={
                                 "partial_outputs": True,
                                 "progress_manifest": result.progress_manifest,
@@ -70,7 +70,7 @@ class ExtractionExitSignalMethod:
                         )
                     ],
                 )
-            return VerificationStepResult(
+            return VerificationStep(
                 method=self.name,
                 status="failed",
                 completeness_hint=0.0,
@@ -82,7 +82,7 @@ class ExtractionExitSignalMethod:
                         method=self.name,
                         code="fail.extraction_failed",
                         message=result.error or "Extraction result is not successful",
-                        path=result.archive or evidence.archive_path,
+                        path=evidence.archive_path,
                     )
                 ],
             )
@@ -93,13 +93,13 @@ class ExtractionExitSignalMethod:
                 method=self.name,
                 code="warning.success_with_error",
                 message=result.error,
-                path=result.archive or evidence.archive_path,
+                path=evidence.archive_path,
             ))
         manifest = evidence.progress_manifest or {}
         files_written = int(getattr(result, "files_written", 0) or manifest.get("files_written") or 0)
         bytes_written = int(getattr(result, "bytes_written", 0) or manifest.get("bytes_written") or 0)
         if files_written <= 0 and bytes_written <= 0 and not _observations_from_manifest(evidence):
-            return VerificationStepResult(
+            return VerificationStep(
                 method=self.name,
                 status="failed",
                 completeness_hint=0.0,
@@ -111,13 +111,13 @@ class ExtractionExitSignalMethod:
                         method=self.name,
                         code="fail.extraction_success_empty",
                         message="Extraction reported success but produced no output files",
-                        path=result.archive or evidence.archive_path,
+                        path=evidence.archive_path,
                         actual={"files_written": files_written, "bytes_written": bytes_written},
                     ),
                 ],
             )
 
-        return VerificationStepResult(
+        return VerificationStep(
             method=self.name,
             status="warning" if issues else "passed",
             issues=issues,

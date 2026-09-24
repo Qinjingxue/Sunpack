@@ -123,9 +123,9 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
         out_path.write_text("hello", encoding="utf-8")
         return ExtractionResult(
             success=True,
-            archive=task.main_path,
+
             out_dir=out_dir,
-            all_parts=task.all_parts,
+
         )
 
     async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
@@ -202,7 +202,7 @@ def test_batch_does_not_treat_existing_same_name_directory_as_output(tmp_path, m
 
     def fake_extract(task, out_dir):
         extracted.append(task.main_path)
-        return ExtractionResult(success=True, archive=task.main_path, out_dir=out_dir, all_parts=task.all_parts)
+        return ExtractionResult(success=True, out_dir=out_dir)
 
     async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
         return fake_extract(task, out_dir)
@@ -254,7 +254,7 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
         nested = Path(out_dir) / "nested.zip"
         nested.parent.mkdir(parents=True, exist_ok=True)
         nested.write_bytes(b"nested")
-        return ExtractionResult(success=True, archive=item.main_path, out_dir=out_dir, all_parts=item.all_parts)
+        return ExtractionResult(success=True, out_dir=out_dir)
 
     async def fake_extract_asyncio(_broker, item, out_dir, **_kwargs):
         return fake_extract(item, out_dir)

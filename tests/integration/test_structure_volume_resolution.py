@@ -58,9 +58,9 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
             assert group.split_volumes[0].source == "structure"
 
         candidate = relation_group_to_candidate(group)
-        resolved = RelationResolver().resolve([candidate]).resolved_inputs
+        resolved = RelationResolver().resolve([candidate]).resolved_tasks
         assert len(resolved) == 1
-        task = ArchiveTask.from_resolved(resolved[0])
+        task = resolved[0]
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(task)
         assert len(planned) == 1
         extractor = ExtractionScheduler(max_retries=1)

@@ -22,8 +22,7 @@ from sunpack.core.analysis.result import ArchiveFormatEvidence, ArchiveSegment
 from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveInputPart,
-    ArchiveInputRange,
-    ArchiveInputSegment,
+    InputExtent,
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
@@ -475,13 +474,15 @@ class ArchiveInputPlanningStage:
             "status": evidence.status,
             "confidence": float(evidence.confidence),
             "damage_flags": list(segment.damage_flags),
+            "segment_confidence": float(segment.confidence),
+            "segment_source": "analysis",
         }
         if evidence.details.get("password_required"):
             segment_analysis["password_required"] = True
         if len(parts) == 1:
             if int(segment.start_offset) <= 0:
                 return None
-            archive_range = ArchiveInputRange(
+            extent = InputExtent(
                 path=parts[0],
                 start=int(segment.start_offset),
                 end=int(segment.end_offset) if segment.end_offset is not None else None,
@@ -491,12 +492,7 @@ class ArchiveInputPlanningStage:
                 open_mode="file_range",
                 format_hint=evidence.format,
                 logical_name=self._segment_logical_name(task, evidence, index),
-                parts=[ArchiveInputPart(path=parts[0], range=archive_range)],
-                segment=ArchiveInputSegment(
-                    start=int(segment.start_offset),
-                    end=int(segment.end_offset) if segment.end_offset is not None else None,
-                    confidence=float(segment.confidence),
-                ),
+                parts=[ArchiveInputPart(extent=extent)],
                 analysis=dict(segment_analysis),
             )
         if int(segment.start_offset) <= 0:
@@ -515,13 +511,12 @@ class ArchiveInputPlanningStage:
             open_mode="concat_ranges",
             format_hint=evidence.format,
             logical_name=self._segment_logical_name(task, evidence, index),
-            ranges=[ArchiveInputRange(path=item["path"], start=item["start"], end=item.get("end")) for item in ranges],
-            segment=ArchiveInputSegment(
-                start=int(segment.start_offset),
-                end=int(segment.end_offset) if segment.end_offset is not None else None,
-                confidence=float(segment.confidence),
-            ),
-            analysis=dict(segment_analysis),
+            extents=[InputExtent(path=item["path"], start=item["start"], end=item.get("end")) for item in ranges],
+            analysis={
+                **segment_analysis,
+                "segment_start": int(segment.start_offset),
+                "segment_end": int(segment.end_offset) if segment.end_offset is not None else None,
+            },
         )
 
     def _password_probe_input_for_segment(
@@ -563,23 +558,20 @@ class ArchiveInputPlanningStage:
             return None
         if start >= first_size:
             return None
-        archive_range = ArchiveInputRange(path=first_part, start=start, end=first_size)
+        extent = InputExtent(path=first_part, start=start, end=first_size)
         return ArchiveInputDescriptor(
             entry_path=first_part,
             open_mode="file_range",
             format_hint="rar",
             logical_name=self._segment_logical_name(task, evidence, index),
-            parts=[ArchiveInputPart(path=first_part, role="main", range=archive_range)],
-            segment=ArchiveInputSegment(
-                start=start,
-                end=first_size,
-                confidence=float(segment.confidence),
-            ),
+            parts=[ArchiveInputPart(extent=extent, role="main")],
             analysis={
                 "status": evidence.status,
                 "confidence": float(evidence.confidence),
                 "damage_flags": list(segment.damage_flags),
                 "purpose": "password_probe",
+                "segment_confidence": float(segment.confidence),
+                "segment_source": "analysis",
             },
         )
 

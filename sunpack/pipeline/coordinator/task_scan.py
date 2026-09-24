@@ -2,8 +2,7 @@ import os
 from typing import Any
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.core.contracts.discovery import ResolvedArchiveInput
-from sunpack.core.contracts.run_context import RunContext
+from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
@@ -16,7 +15,7 @@ class ArchiveTaskScanner:
     def __init__(
         self,
         config: dict[str, Any],
-        context: RunContext,
+        context: RunState,
         detection_options: EmbeddedOptions | None = None,
     ):
         self.config = config
@@ -44,11 +43,11 @@ class ArchiveTaskScanner:
             is_recursive_scan=is_recursive_scan,
         )
         for failure in self.provider.failed_candidates:
-            if failure not in self.context.failed_tasks:
-                self.context.failed_tasks.append(failure)
+            if failure not in self.context.scan_failed_tasks:
+                self.context.scan_failed_tasks.append(failure)
         for failure in self.provider.failed_candidate_failures:
-            if failure not in self.context.failures:
-                self.context.failures.append(failure)
+            if failure not in self.context.scan_failures:
+                self.context.scan_failures.append(failure)
         return tasks
 
     def discover_targets(
@@ -57,7 +56,7 @@ class ArchiveTaskScanner:
         *,
         scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
-    ) -> list[ResolvedArchiveInput]:
+    ) -> list[ArchiveTask]:
         scan_session = scan_session or DiscoveryScanSession(config=self.config)
         self.last_scan_session = scan_session
         result = self.provider.discover_targets(
@@ -65,11 +64,11 @@ class ArchiveTaskScanner:
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
         )
-        return result.resolved_inputs
+        return result.resolved_tasks
 
-    def tasks_from_inputs(self, inputs: list[ResolvedArchiveInput]) -> list[ArchiveTask]:
-        return self.provider.tasks_from_inputs(
-            inputs,
+    def filter_processed_tasks(self, tasks: list[ArchiveTask]) -> list[ArchiveTask]:
+        return self.provider.filter_processed_tasks(
+            tasks,
             processed_keys=self.context.processed_keys,
         )
 
@@ -79,14 +78,14 @@ class ArchiveTaskScanner:
         for raw_path in file_paths:
             path = os.path.abspath(os.path.normpath(raw_path))
             if not os.path.isfile(path):
-                self.context.failed_tasks.append(f"{raw_path} [direct mode requires a file]")
+                self.context.scan_failed_tasks.append(f"{raw_path} [direct mode requires a file]")
                 continue
             normalized_paths.append(path)
 
         discovered = self.provider.discover_targets(normalized_paths)
         covered = set(discovered.claimed_paths | discovered.blocked_paths)
-        tasks.extend(self.provider.tasks_from_inputs(
-            discovered.resolved_inputs,
+        tasks.extend(self.provider.filter_processed_tasks(
+            discovered.resolved_tasks,
             processed_keys=self.context.processed_keys,
         ))
         for path in normalized_paths:

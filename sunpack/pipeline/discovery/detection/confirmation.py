@@ -1,11 +1,10 @@
 """Confirm routed TAR and compression streams."""
 
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import (
     DiscoveryCandidate,
-    ResolvedArchiveInput,
     StageResult,
 )
+from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
 
 
@@ -21,19 +20,14 @@ class FormatConfirmation:
                 result.add_residual(candidate, source="detection")
                 continue
 
-            descriptor = candidate.archive_input or ArchiveInputDescriptor.from_parts(
-                archive_path=candidate.entry_path,
-                part_paths=list(candidate.member_paths or (candidate.entry_path,)),
-                format_hint=candidate.format_hint,
-                logical_name=candidate.logical_name,
-            )
+            descriptor = candidate.archive_input
             result.add_resolved(
-                ResolvedArchiveInput(
-                    archive_input=descriptor,
-                    source="detection",
+                ArchiveTask.from_archive_input(
+                    descriptor,
+                    discovery_source="detection",
                     carrier_path=candidate.carrier_path,
                     cleanup_paths=candidate.cleanup_paths,
-                    evidence={"format": candidate.format_hint},
+                    discovery_evidence={"format": candidate.format_hint},
                 ),
                 reason=reason,
             )

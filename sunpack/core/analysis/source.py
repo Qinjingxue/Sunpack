@@ -63,17 +63,17 @@ def analysis_source_for_descriptor(
         )
         if volumes:
             return MultiVolumeAnalysisSource(volumes, report_path=report_path or descriptor.entry_path)
-    if descriptor.open_mode == "concat_ranges" and descriptor.ranges:
+    if descriptor.open_mode == "concat_ranges" and descriptor.extents:
         paths = tuple(
             item.path
-            for item in descriptor.ranges
+            for item in descriptor.extents
             if item.path and int(item.start) == 0 and item.end is None
         )
-        if paths and len(paths) == len(descriptor.ranges):
+        if paths and len(paths) == len(descriptor.extents):
             return MultiVolumeAnalysisSource(paths, report_path=report_path or descriptor.entry_path)
     if descriptor.open_mode == "file_range" and descriptor.parts:
         part = descriptor.parts[0]
-        item_range = part.range
-        if part.path and item_range is not None and int(item_range.start) == 0 and item_range.end is None:
+        extent = part.extent
+        if part.path and int(extent.start) == 0 and extent.end is None:
             return FileAnalysisSource(part.path, report_path=report_path or part.path)
     raise ValueError(f"unsupported archive input mode: {descriptor.open_mode}")

@@ -1,5 +1,5 @@
 from sunpack.core.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 
 
@@ -12,13 +12,13 @@ def test_planning_projects_proven_7z_split_tail_without_native_rescan():
         volume_style="numeric_suffix",
         parts=[
             ArchiveInputPart(
-                path="payload.7z.001",
+                extent=InputExtent("payload.7z.001"),
                 role="first",
                 volume_number=1,
                 canonical_name="payload.7z.001",
             ),
             ArchiveInputPart(
-                path="payload.7z.002",
+                extent=InputExtent("payload.7z.002"),
                 role="member",
                 volume_number=2,
                 canonical_name="payload.7z.002",

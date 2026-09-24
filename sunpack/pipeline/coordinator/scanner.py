@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from typing import Any, Dict, List
 
-from sunpack.core.contracts.run_context import RunContext
+from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
@@ -25,7 +25,7 @@ class ScanOrchestrator:
     ):
         self.task_scanner = ArchiveTaskScanner(
             config,
-            RunContext(),
+            RunState(),
             detection_options=detection_options,
         )
 

@@ -4,7 +4,7 @@ import pytest
 
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.run_context import RunContext
+from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.verification import VerificationResult
 from sunpack.pipeline.coordinator.extraction_batch import BatchExtractionOutcome, ExtractionBatchRunner
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
@@ -74,7 +74,7 @@ def test_cleanup_preserves_failed_output_with_nonzero_payload(tmp_path):
 
 
 def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings():
-    child = ExtractionResult(True, "carrier.bin", "child", ["carrier.bin"])
+    child = ExtractionResult(True, "child")
     failure = FailureInfo(
         kind=FailureKind.EMBEDDED_SEGMENTS_FAILED,
         stage="embedded_segments",
@@ -82,9 +82,9 @@ def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings
     )
     outer = ExtractionResult(
         success=False,
-        archive="carrier.bin",
+
         out_dir="output",
-        all_parts=["carrier.bin"],
+
         failure=failure,
         partial_outputs=True,
         embedded_results=[({"segment_id": "plain"}, child)],
@@ -106,14 +106,14 @@ def test_collect_result_applies_main_pipeline_cleanup_after_diagnostics(tmp_path
     )
     extraction = ExtractionResult(
         success=False,
-        archive=str(archive),
+
         out_dir=str(output),
-        all_parts=[str(archive)],
+
         error="damaged",
     )
     outcome = BatchExtractionOutcome(result=extraction, planned_out_dir=str(output))
     runner = object.__new__(ExtractionBatchRunner)
-    runner.context = RunContext()
+    runner.context = RunState()
     runner.config = {}
 
     returned = runner.collect_result(task, outcome)

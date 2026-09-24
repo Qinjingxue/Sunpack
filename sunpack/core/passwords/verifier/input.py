@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputRange
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, InputExtent
 
 
 # These are real multi-volume container families: concatenating their files does
@@ -82,7 +82,7 @@ def verifier_input(
         # complete logical stream to format-specific bounded verifiers instead
         # of accidentally probing only the first physical file.
         ranges = [
-            ArchiveInputRange(path=part.path, start=0, end=None)
+            InputExtent(path=part.path, start=0, end=None)
             for part in descriptor.parts
         ]
         return descriptor.entry_path or archive_path, [item.to_dict() for item in ranges]
@@ -95,13 +95,13 @@ def verifier_input(
     return descriptor.entry_path or archive_path, [item.to_dict() for item in ranges]
 
 
-def _descriptor_ranges(descriptor: ArchiveInputDescriptor) -> list[ArchiveInputRange]:
-    if descriptor.ranges:
-        return list(descriptor.ranges)
-    return [part.range for part in descriptor.parts if part.range is not None]
+def _descriptor_ranges(descriptor: ArchiveInputDescriptor) -> list[InputExtent]:
+    if descriptor.extents:
+        return list(descriptor.extents)
+    return [part.extent for part in descriptor.parts]
 
 
-def _is_whole_file_range(item: ArchiveInputRange) -> bool:
+def _is_whole_file_range(item: InputExtent) -> bool:
     if int(item.start or 0) != 0:
         return False
     if item.end is None:

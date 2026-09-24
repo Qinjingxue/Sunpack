@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from sunpack.pipeline.verification.methods._output_stats import output_stats_for_evidence
-from sunpack.core.contracts.verification import ArchiveCoverageSummary, FileVerificationObservation
+from sunpack.core.contracts.verification import ArchiveCoverage, FileVerificationObservation
 
 
 @dataclass(frozen=True)
@@ -27,7 +27,7 @@ def compute_output_quality(
     evidence: Any,
     file_observations: list[FileVerificationObservation],
     *,
-    archive_coverage: ArchiveCoverageSummary | None = None,
+    archive_coverage: ArchiveCoverage | None = None,
 ) -> OutputQuality:
     stats = output_stats_for_evidence(evidence)
     file_count = int(stats.file_count or 0)
@@ -97,7 +97,7 @@ def _observation_quality(
 
 
 def _coverage_quality(
-    archive_coverage: ArchiveCoverageSummary | None,
+    archive_coverage: ArchiveCoverage | None,
 ) -> tuple[float, float, float] | None:
     if archive_coverage is None or archive_coverage.confidence <= 0:
         return None

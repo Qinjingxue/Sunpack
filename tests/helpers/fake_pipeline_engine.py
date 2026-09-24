@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import uuid
+from dataclasses import replace
 from types import SimpleNamespace
 
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineResponse
+from sunpack.core.contracts.results import RunSummary
 
 
 class FakePipelineEngine:
@@ -65,7 +67,10 @@ class FakePipelineEngine:
         config.setdefault("builtin_passwords", list(self.builtin_passwords))
         runner = self.runner_factory(config)
         summary = runner.run_targets(paths)
-        summary.cleanup_results = []
+        if isinstance(summary, RunSummary):
+            summary = replace(summary, cleanup_results=())
+        else:
+            summary.cleanup_results = []
         self._recent_passwords = list(getattr(runner, "recent_passwords", ()) or ())
         context = getattr(runner, "context", SimpleNamespace(flatten_candidates=()))
         recovered_outputs = getattr(context, "recovered_outputs", ()) or ()

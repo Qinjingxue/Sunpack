@@ -40,26 +40,12 @@ def write_verification_result(
             "verified_item_count": int(result.verified_item_count),
             "archive_walk_complete": bool(result.archive_walk_complete),
             "decision_hint": result.decision_hint,
-            "complete_files": int(result.complete_files),
-            "partial_files": int(result.partial_files),
-            "failed_files": int(result.failed_files),
-            "missing_files": int(result.missing_files),
-            "unverified_files": int(result.unverified_files),
-            "output_quality_score": output_quality["score"],
-            "output_file_count": output_quality["file_count"],
-            "output_total_bytes": output_quality["total_bytes"],
-            "output_complete_ratio": output_quality["complete_ratio"],
-            "output_failed_ratio": output_quality["failed_ratio"],
-            "output_empty": output_quality["empty"],
-            "output_confidence": output_quality["confidence"],
             "output_quality": output_quality,
-            "archive_coverage": _archive_coverage_payload(result.archive_coverage),
-            "coverage_breakdown": _coverage_breakdown(result),
         }
     with _phase(phase_timer, f"{phase_prefix}_write_summary"):
         prepared_summary = prepare_knowledge_value(summary)
         write_prepared_payload(knowledge, "verification.summary", prepared_summary, source_layer="verification", source_module="scheduler")
-        write_prepared_payload(knowledge, "verification", {"coverage_breakdown": prepared_summary["coverage_breakdown"]}, source_layer="verification", source_module="scheduler")
+        write_payload(knowledge, "verification", {"coverage_breakdown": _coverage_breakdown(result)}, source_layer="verification", source_module="scheduler")
     with _phase(phase_timer, f"{phase_prefix}_write_observations"):
         write_prepared_payload(
             knowledge,
@@ -130,34 +116,14 @@ def _observation_payload(observation: Any) -> dict[str, Any]:
     }
 
 
-def _archive_coverage_payload(coverage: Any) -> dict[str, Any]:
-    return {
-        "completeness": coverage.completeness,
-        "file_coverage": coverage.file_coverage,
-        "byte_coverage": coverage.byte_coverage,
-        "expected_files": coverage.expected_files,
-        "matched_files": coverage.matched_files,
-        "complete_files": coverage.complete_files,
-        "partial_files": coverage.partial_files,
-        "failed_files": coverage.failed_files,
-        "missing_files": coverage.missing_files,
-        "unverified_files": coverage.unverified_files,
-        "expected_bytes": coverage.expected_bytes,
-        "matched_bytes": coverage.matched_bytes,
-        "complete_bytes": coverage.complete_bytes,
-        "confidence": coverage.confidence,
-        "sources": prepare_knowledge_value(coverage.sources),
-    }
-
-
 def _coverage_breakdown(result: VerificationResult) -> dict[str, Any]:
     coverage = result.archive_coverage
     expected_files = int(coverage.expected_files or result.output_file_count or 0)
-    complete_files = int(coverage.complete_files or result.complete_files or 0)
-    partial_files = int(coverage.partial_files or result.partial_files or 0)
-    failed_files = int(coverage.failed_files or result.failed_files or 0)
-    missing_files = int(coverage.missing_files or result.missing_files or 0)
-    unverified_files = int(coverage.unverified_files or result.unverified_files or 0)
+    complete_files = int(coverage.complete_files)
+    partial_files = int(coverage.partial_files)
+    failed_files = int(coverage.failed_files)
+    missing_files = int(coverage.missing_files)
+    unverified_files = int(coverage.unverified_files)
     observed_total = expected_files or complete_files + partial_files + failed_files + missing_files + unverified_files
     issue_counts = _issue_counts(result)
     observation_counts = _observation_counts(result)

@@ -72,10 +72,10 @@ class ArchiveDiscoveryPipeline:
             is_recursive_scan=is_recursive_scan,
         )
         result = StageResult(
-            resolved_inputs=[
-                *relation_result.resolved_inputs,
-                *format_result.resolved_inputs,
-                *embedded_result.resolved_inputs,
+            resolved_tasks=[
+                *relation_result.resolved_tasks,
+                *format_result.resolved_tasks,
+                *embedded_result.resolved_tasks,
             ],
             claimed_paths=claimed | embedded_result.claimed_paths,
             blocked_paths=blocked | embedded_result.blocked_paths,

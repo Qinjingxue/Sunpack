@@ -9,7 +9,7 @@ import zipfile
 
 import pytest
 
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, ArchiveInputRange
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
@@ -1162,8 +1162,7 @@ def test_extraction_scheduler_uses_worker_archive_input_descriptor(tmp_path):
         format_hint="7z",
         parts=[
             ArchiveInputPart(
-                path=str(mixed),
-                range=ArchiveInputRange(path=str(mixed), start=len(prefix), end=len(prefix) + len(data)),
+                extent=InputExtent(path=str(mixed), start=len(prefix), end=len(prefix) + len(data)),
             )
         ],
     )

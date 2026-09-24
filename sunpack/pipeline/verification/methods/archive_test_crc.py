@@ -22,7 +22,7 @@ from sunpack.core.contracts.verification import (
     CONTENT_INTEGRITY_VERIFIED_PARTIAL,
     VERIFICATION_STRENGTH_CRC,
     VerificationIssue,
-    VerificationStepResult,
+    VerificationStep,
 )
 
 from sunpack_native import match_archive_output_crc_coverage as _match_archive_output_crc_coverage
@@ -32,7 +32,7 @@ from sunpack_native import match_archive_output_crc_coverage as _match_archive_o
 class ArchiveTestCrcMethod:
     name = "archive_test_crc"
 
-    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStepResult:
+    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
         max_items = max(0, int(config.get("max_items", 200000) or 0))
         archive_manifest = archive_input_manifest_for_evidence(evidence, max_items=max_items)
 
@@ -49,7 +49,7 @@ class ArchiveTestCrcMethod:
         if not archive_files:
             if archive_manifest.archive_walk_complete and inventory.worker_inventory_complete:
                 return _verified_manifest_result(self.name, archive_manifest, inventory)
-            return VerificationStepResult(method=self.name, status="skipped")
+            return VerificationStep(method=self.name, status="skipped")
         if (
             inventory.worker_inventory_complete
             and inventory.identity_paths
@@ -80,7 +80,7 @@ class ArchiveTestCrcMethod:
 
         status = str(match_result.get("status") or "")
         if status != "ok":
-            return VerificationStepResult(method=self.name, status="skipped")
+            return VerificationStep(method=self.name, status="skipped")
 
         mismatches = list(match_result.get("mismatches") or [])
         missing = list(match_result.get("missing") or [])
@@ -136,7 +136,7 @@ class ArchiveTestCrcMethod:
         }
 
         if not issues:
-            return VerificationStepResult(
+            return VerificationStep(
                 method=self.name,
                 status="passed",
                 completeness_hint=completeness,
@@ -163,7 +163,7 @@ class ArchiveTestCrcMethod:
             expected=int(coverage.get("expected_files", len(archive_files)) or 0),
             actual={**_coverage_actual(coverage, archive_manifest, evidence), **summary},
         ))
-        return VerificationStepResult(
+        return VerificationStep(
             method=self.name,
             status="failed",
             issues=issues,
@@ -178,11 +178,11 @@ class ArchiveTestCrcMethod:
             file_observations=observations,
         )
 
-    def _archive_status_result(self, archive_manifest, evidence: VerificationEvidence) -> VerificationStepResult | None:
+    def _archive_status_result(self, archive_manifest, evidence: VerificationEvidence) -> VerificationStep | None:
         if archive_manifest.status == STATUS_OK and archive_manifest.ok:
             return None
         if archive_manifest.status in {STATUS_BACKEND_UNAVAILABLE, STATUS_UNSUPPORTED}:
-            return VerificationStepResult(
+            return VerificationStep(
                 method=self.name,
                 status="skipped",
                 issues=[VerificationIssue(
@@ -197,7 +197,7 @@ class ArchiveTestCrcMethod:
                 )],
             )
         if archive_manifest.status == STATUS_WRONG_PASSWORD:
-            return VerificationStepResult(
+            return VerificationStep(
                 method=self.name,
                 status="failed",
                 issues=[VerificationIssue(
@@ -210,7 +210,7 @@ class ArchiveTestCrcMethod:
         if (archive_manifest.status == STATUS_DAMAGED or archive_manifest.checksum_error or archive_manifest.damaged) and archive_manifest.files:
             return None
         if archive_manifest.status == STATUS_DAMAGED or archive_manifest.checksum_error or archive_manifest.damaged:
-            return VerificationStepResult(
+            return VerificationStep(
                 method=self.name,
                 status="failed",
                 completeness_hint=None,
@@ -228,7 +228,7 @@ class ArchiveTestCrcMethod:
                     path=evidence.archive_path,
                 )],
             )
-        return VerificationStepResult(
+        return VerificationStep(
             method=self.name,
             status="skipped",
             issues=[VerificationIssue(
@@ -264,10 +264,10 @@ def _coverage_actual(coverage: dict[str, Any], archive_manifest, evidence: Verif
     return actual
 
 
-def _verified_manifest_result(method: str, archive_manifest, inventory) -> VerificationStepResult:
+def _verified_manifest_result(method: str, archive_manifest, inventory) -> VerificationStep:
     file_count = int(archive_manifest.file_count or inventory.stats.file_count or 0)
     total_items = int(archive_manifest.item_count or file_count)
-    return VerificationStepResult(
+    return VerificationStep(
         method=method,
         status="passed",
         completeness_hint=1.0,

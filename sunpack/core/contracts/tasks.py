@@ -5,7 +5,6 @@ from typing import Any
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
-from sunpack.core.contracts.discovery import ResolvedArchiveInput, ResolvedArchiveSegment
 from sunpack.core.support.collections import dedupe_values
 from sunpack.core.support.path_keys import normalized_path, path_key
 
@@ -18,7 +17,8 @@ class ArchiveTask:
     key: str = ""
     initial_discovery_source: InitVar[str] = ""
     discovery_evidence: InitVar[dict[str, Any] | None] = None
-    discovery_segments: InitVar[tuple[ResolvedArchiveSegment, ...]] = ()
+    discovery_segments: InitVar[tuple[ArchiveInputDescriptor, ...]] = ()
+    discovery_segment_evidence: InitVar[tuple[dict[str, Any], ...]] = ()
     initial_discovery_reason: InitVar[str] = ""
     runtime: dict[str, Any] = field(default_factory=dict)
 
@@ -27,12 +27,15 @@ class ArchiveTask:
         _archive_input: ArchiveInputDescriptor,
         initial_discovery_source: str,
         discovery_evidence: dict[str, Any] | None,
-        discovery_segments: tuple[ResolvedArchiveSegment, ...],
+        discovery_segments: tuple[ArchiveInputDescriptor, ...],
+        discovery_segment_evidence: tuple[dict[str, Any], ...],
         initial_discovery_reason: str,
     ) -> None:
         descriptor = _archive_input
         if not descriptor.entry_path:
             raise ValueError("ArchiveTask requires an archive input entry path")
+        if len(discovery_segments) != len(discovery_segment_evidence):
+            raise ValueError("discovery segment descriptors and evidence must align")
         logical_name = str(descriptor.logical_name or descriptor.entry_path)
         self.carrier_path = str(self.carrier_path or descriptor.entry_path)
         self.cleanup_parts = list(dedupe_values([
@@ -53,6 +56,7 @@ class ArchiveTask:
             discovery_reason=str(initial_discovery_reason or ""),
             discovery_evidence=dict(discovery_evidence or {}),
             discovery_segments=tuple(discovery_segments),
+            discovery_segment_evidence=tuple(discovery_segment_evidence),
         )
 
     @classmethod
@@ -64,7 +68,8 @@ class ArchiveTask:
         carrier_path: str = "",
         cleanup_paths: list[str] | tuple[str, ...] = (),
         discovery_evidence: dict[str, Any] | None = None,
-        discovery_segments: tuple[ResolvedArchiveSegment, ...] = (),
+        discovery_segments: tuple[ArchiveInputDescriptor, ...] = (),
+        discovery_segment_evidence: tuple[dict[str, Any], ...] = (),
         discovery_reason: str = "",
     ) -> "ArchiveTask":
         return cls(
@@ -74,24 +79,8 @@ class ArchiveTask:
             initial_discovery_source=discovery_source,
             discovery_evidence=dict(discovery_evidence or {}),
             discovery_segments=tuple(discovery_segments),
+            discovery_segment_evidence=tuple(discovery_segment_evidence),
             initial_discovery_reason=discovery_reason,
-        )
-
-    @classmethod
-    def from_resolved(
-        cls,
-        resolved: ResolvedArchiveInput,
-        *,
-        discovery_reason: str = "",
-    ) -> "ArchiveTask":
-        return cls.from_archive_input(
-            resolved.archive_input,
-            discovery_source=resolved.source,
-            carrier_path=resolved.carrier_path,
-            cleanup_paths=resolved.cleanup_paths,
-            discovery_evidence=resolved.evidence,
-            discovery_segments=resolved.segments,
-            discovery_reason=discovery_reason,
         )
 
     @property
@@ -174,9 +163,10 @@ class ArchiveTask:
         discovery_source: str,
         discovery_reason: str,
         discovery_evidence: dict[str, Any],
-        discovery_segments: tuple[ResolvedArchiveSegment, ...],
+        discovery_segments: tuple[ArchiveInputDescriptor, ...],
+        discovery_segment_evidence: tuple[dict[str, Any], ...],
     ) -> None:
-        descriptor = self.archive_input()
+        prepass = discovery_evidence.pop("scan", None)
         self._knowledge.merge({
             "discovery": {
                 "source": discovery_source,
@@ -188,19 +178,18 @@ class ArchiveTask:
             self._knowledge.set(
                 "source.extractable_segments",
                 [
-                    _segment_payload(index, segment)
-                    for index, segment in enumerate(discovery_segments, start=1)
+                    _segment_payload(index, segment, evidence)
+                    for index, (segment, evidence) in enumerate(zip(discovery_segments, discovery_segment_evidence), start=1)
                 ],
                 source_layer="discovery",
                 source_module=discovery_source or "discovery",
             )
             self._knowledge.set(
                 "source.selected_segment",
-                _segment_payload(1, discovery_segments[0]),
+                _segment_payload(1, discovery_segments[0], discovery_segment_evidence[0]),
                 source_layer="discovery",
                 source_module=self.discovery_source or "discovery",
             )
-        prepass = discovery_evidence.get("scan")
         if isinstance(prepass, dict):
             self._knowledge.set(
                 "inspection.prepass",
@@ -210,17 +199,22 @@ class ArchiveTask:
             )
 
 
-def _segment_payload(index: int, segment: ResolvedArchiveSegment) -> dict[str, Any]:
-    descriptor = segment.archive_input
+def _segment_payload(index: int, descriptor: ArchiveInputDescriptor, evidence: dict[str, Any]) -> dict[str, Any]:
+    extent = descriptor.primary_extent
+    start_offset = extent.start if extent is not None else int(evidence.get("offset") or 0)
+    end_offset = (extent.end if extent is not None and extent.end is not None
+                  else evidence.get("range_end_offset") or evidence.get("end_offset"))
+    confidence = descriptor.analysis.get("segment_confidence", evidence.get("confidence"))
+    damage_flags = descriptor.analysis.get("damage_flags") or evidence.get("damage_flags") or ()
     return {
-        "segment_id": f"embedded_{index:02d}_{segment.format.replace('/', '_')}",
+        "segment_id": f"embedded_{index:02d}_{descriptor.format_hint.replace('/', '_')}",
         "index": index,
-        "format": segment.format,
-        "start_offset": segment.start_offset,
-        "end_offset": segment.end_offset,
-        "confidence": segment.confidence,
-        "damage_flags": list(segment.damage_flags),
+        "format": descriptor.format_hint,
+        "start_offset": int(start_offset),
+        "end_offset": int(end_offset) if end_offset is not None else None,
+        "confidence": float(confidence or 0.0),
+        "damage_flags": [str(item) for item in damage_flags if str(item)],
         "logical_name": descriptor.logical_name,
-        "segment": dict(segment.evidence),
+        "segment": evidence,
         "archive_input": descriptor.to_dict(),
     }

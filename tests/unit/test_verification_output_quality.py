@@ -9,7 +9,7 @@ from sunpack.core.contracts.verification import (
     DECISION_ACCEPT,
     DECISION_ACCEPT_PARTIAL,
     CONTENT_INTEGRITY_UNKNOWN,
-    ArchiveCoverageSummary,
+    ArchiveCoverage,
     FileVerificationObservation,
 )
 
@@ -45,7 +45,7 @@ def test_output_quality_empty_output_dir_is_zero(tmp_path):
 
 def test_output_quality_uses_archive_coverage_when_observations_missing(tmp_path):
     (tmp_path / "recovered.bin").write_bytes(b"x" * 10)
-    coverage = ArchiveCoverageSummary(
+    coverage = ArchiveCoverage(
         completeness=0.75,
         expected_files=4,
         matched_files=3,

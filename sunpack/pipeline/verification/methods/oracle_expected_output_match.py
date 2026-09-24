@@ -21,7 +21,7 @@ from sunpack.core.contracts.verification import (
     CONTENT_INTEGRITY_VERIFIED_PARTIAL,
     VERIFICATION_STRENGTH_ORACLE,
     VerificationIssue,
-    VerificationStepResult,
+    VerificationStep,
 )
 
 
@@ -29,10 +29,10 @@ from sunpack.core.contracts.verification import (
 class OracleExpectedOutputMatchMethod:
     name = "oracle_expected_output_match"
 
-    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStepResult:
+    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
         expected = _expected_files(evidence)
         if not expected:
-            return VerificationStepResult(method=self.name, status="skipped")
+            return VerificationStep(method=self.name, status="skipped")
         output_files = _output_files(evidence.output_dir)
         coverage = coverage_from_archive_and_output(expected, output_files, method=self.name)
         details = coverage_details(coverage)
@@ -46,7 +46,7 @@ class OracleExpectedOutputMatchMethod:
             expected=len(expected),
             actual={"coverage": details, "oracle_strength": knowledge_view.get(evidence.task, "verification.oracle.oracle_strength", "")},
         )
-        return VerificationStepResult(
+        return VerificationStep(
             method=self.name,
             status=status,
             issues=[issue],

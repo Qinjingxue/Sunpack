@@ -36,8 +36,8 @@ class DetectionDiagnostics:
     def collect(self, paths: list[str]) -> list[DiscoveryDiagnostic]:
         result = self.provider.discover_targets(paths)
         resolved = {
-            path_key(item.entry_path): item
-            for item in result.resolved_inputs
+            path_key(item.main_path): item
+            for item in result.resolved_tasks
         }
         return [
             DiscoveryDiagnostic(
@@ -47,7 +47,7 @@ class DetectionDiagnostics:
                 source=trace.source,
                 reason=trace.reason,
                 archive_input=(
-                    resolved[path_key(trace.entry_path)].archive_input.to_dict()
+                    resolved[path_key(trace.entry_path)].archive_input().to_dict()
                     if path_key(trace.entry_path) in resolved
                     else None
                 ),

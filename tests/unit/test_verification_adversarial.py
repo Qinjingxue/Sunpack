@@ -14,7 +14,7 @@ def test_expected_name_matching_is_case_and_path_normalized(tmp_path):
     (out_dir / "Docs").mkdir()
     (out_dir / "Docs" / "Readme.TXT").write_text("hello", encoding="utf-8")
     task = make_archive_task(archive, key="sample", format_hint="zip")
-    result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = VerificationScheduler({
         "verification": {

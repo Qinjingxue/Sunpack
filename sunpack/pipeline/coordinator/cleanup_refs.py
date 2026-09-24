@@ -40,11 +40,7 @@ class ReleaseOutcome:
 
 
 def cleanup_paths_for(task) -> list[str]:
-    result = getattr(task, "result", None)
-    candidates = [
-        *(getattr(result, "all_parts", None) or []),
-        *(getattr(task, "cleanup_parts", None) or getattr(task, "all_parts", None) or []),
-    ]
+    candidates = getattr(task, "cleanup_parts", None) or getattr(task, "all_parts", None) or []
     unique: dict[str, str] = {}
     for path in candidates:
         if path:

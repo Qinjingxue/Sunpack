@@ -1,4 +1,4 @@
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.discovery.relations.resolver import RelationResolver
 from sunpack.core.support.path_keys import path_key
@@ -6,24 +6,17 @@ from sunpack.core.support.path_keys import path_key
 
 def _candidate(path, metadata, members=None):
     member_paths = tuple(str(item) for item in (members or [path]))
-    confirmed = bool(metadata.get("relation_confirmed"))
-    archive_input = (
-        ArchiveInputDescriptor.from_parts(
-            archive_path=str(path),
-            format_hint=str(metadata.get("format") or ""),
-            logical_name=path.name,
-        )
-        if confirmed else None
+    archive_input = ArchiveInputDescriptor(
+        entry_path=str(path),
+        format_hint=str(metadata.get("format") or ""),
+        logical_name=path.name,
+        parts=[ArchiveInputPart(extent=InputExtent(str(item))) for item in member_paths],
     )
     return DiscoveryCandidate(
-        entry_path=str(path),
-        member_paths=member_paths,
-        logical_name=path.name,
+        archive_input=archive_input,
         carrier_path=str(path),
         cleanup_paths=member_paths,
         route="relations",
-        format_hint=str(metadata.get("format") or ""),
-        archive_input=archive_input,
         relation_anchor=dict(metadata),
         is_split=bool(metadata.get("multivolume")),
     )
@@ -39,7 +32,7 @@ def test_confirmed_disguised_split_family_is_one_input(tmp_path):
 
     result = RelationResolver().resolve([candidate])
 
-    assert len(result.resolved_inputs) == 1
+    assert len(result.resolved_tasks) == 1
     assert result.claimed_paths == {path_key(str(first)), path_key(str(second))}
 
 
@@ -64,7 +57,7 @@ def test_confirmed_password_required_family_reaches_password_planning(tmp_path):
 
     result = RelationResolver().resolve([candidate])
 
-    assert len(result.resolved_inputs) == 1
+    assert len(result.resolved_tasks) == 1
     assert result.blocked_paths == set()
 
 

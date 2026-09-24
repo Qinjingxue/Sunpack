@@ -125,9 +125,9 @@ def test_password_failure_bypasses_verification(tmp_path):
     )
     result = ExtractionResult(
         success=False,
-        archive=str(archive),
+
         out_dir=str(tmp_path / "out"),
-        all_parts=[str(archive)],
+
         error=failure.message,
         failure=failure,
     )

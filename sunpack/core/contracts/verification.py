@@ -59,7 +59,7 @@ class FileVerificationObservation:
 
 
 @dataclass(frozen=True)
-class ArchiveCoverageSummary:
+class ArchiveCoverage:
     completeness: float = -1.0
     file_coverage: float = -1.0
     byte_coverage: float = -1.0
@@ -78,26 +78,9 @@ class ArchiveCoverageSummary:
 
 
 @dataclass(frozen=True)
-class VerificationStepResult:
+class VerificationStep:
     method: str
     status: str = "passed"
-    issues: list[VerificationIssue] = field(default_factory=list)
-    completeness_hint: float | None = None
-    recoverable_upper_bound_hint: float | None = None
-    content_integrity_hint: str = CONTENT_INTEGRITY_UNKNOWN
-    container_integrity_hint: str = CONTAINER_INTEGRITY_UNKNOWN
-    verification_strength: str = VERIFICATION_STRENGTH_NONE
-    total_item_count: int = 0
-    verified_item_count: int = 0
-    archive_walk_complete: bool = False
-    decision_hint: str = DECISION_NONE
-    file_observations: list[FileVerificationObservation] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class VerificationStepRecord:
-    method: str
-    status: str
     issues: list[VerificationIssue] = field(default_factory=list)
     completeness_hint: float | None = None
     recoverable_upper_bound_hint: float | None = None
@@ -115,7 +98,7 @@ class VerificationStepRecord:
 class VerificationResult:
     methods_run: list[str] = field(default_factory=list)
     issues: list[VerificationIssue] = field(default_factory=list)
-    steps: list[VerificationStepRecord] = field(default_factory=list)
+    steps: list[VerificationStep] = field(default_factory=list)
     completeness: float = 1.0
     recoverable_upper_bound: float = 1.0
     assessment_status: str = ASSESSMENT_COMPLETE
@@ -126,11 +109,6 @@ class VerificationResult:
     verified_item_count: int = 0
     archive_walk_complete: bool = False
     decision_hint: str = DECISION_NONE
-    complete_files: int = 0
-    partial_files: int = 0
-    failed_files: int = 0
-    missing_files: int = 0
-    unverified_files: int = 0
     output_quality_score: float = 0.0
     output_file_count: int = 0
     output_total_bytes: int = 0
@@ -138,8 +116,28 @@ class VerificationResult:
     output_failed_ratio: float = 0.0
     output_empty: bool = True
     output_confidence: float = 0.0
-    archive_coverage: ArchiveCoverageSummary = field(default_factory=ArchiveCoverageSummary)
+    archive_coverage: ArchiveCoverage = field(default_factory=ArchiveCoverage)
     file_observations: list[FileVerificationObservation] = field(default_factory=list)
+
+    @property
+    def complete_files(self) -> int:
+        return self.archive_coverage.complete_files
+
+    @property
+    def partial_files(self) -> int:
+        return self.archive_coverage.partial_files
+
+    @property
+    def failed_files(self) -> int:
+        return self.archive_coverage.failed_files
+
+    @property
+    def missing_files(self) -> int:
+        return self.archive_coverage.missing_files
+
+    @property
+    def unverified_files(self) -> int:
+        return self.archive_coverage.unverified_files
 
     @property
     def failures(self) -> list[VerificationIssue]:

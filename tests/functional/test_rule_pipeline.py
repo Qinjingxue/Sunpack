@@ -1,6 +1,7 @@
 import io
 import tarfile
 
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
 from sunpack.pipeline.discovery.detection.validation import validate_detection_contracts
@@ -18,13 +19,12 @@ def _tar_bytes() -> bytes:
 def _candidate(path, format_hint: str) -> DiscoveryCandidate:
     value = str(path)
     return DiscoveryCandidate(
-        entry_path=value,
-        member_paths=(value,),
-        logical_name=path.name,
+        archive_input=ArchiveInputDescriptor.from_parts(
+            archive_path=value, logical_name=path.name, format_hint=format_hint,
+        ),
         carrier_path=value,
         cleanup_paths=(value,),
         route="detection",
-        format_hint=format_hint,
         size=path.stat().st_size,
     )
 

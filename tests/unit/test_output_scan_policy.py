@@ -41,9 +41,9 @@ def test_output_scan_policy_projects_normal_archive_as_one_logical_root(tmp_path
     archive.write_bytes(b"PK\x03\x04payload")
     result = ExtractionResult(
         success=True,
-        archive="normal.zip",
+
         out_dir=str(output_dir),
-        all_parts=["normal.zip"],
+
     )
 
     projected = OutputScanPolicy.project_logical_scan_roots(str(output_dir), result)
@@ -61,23 +61,23 @@ def test_output_scan_policy_projects_each_confirmed_embedded_segment(tmp_path):
     (segment_two / "two.tar").write_bytes(b"ustar" + b"x" * 512)
     child_one = ExtractionResult(
         success=True,
-        archive="one.zip",
+
         out_dir=str(segment_one),
-        all_parts=["one.zip"],
+
         output_inventory=collect_output_inventory(str(segment_one)),
     )
     child_two = ExtractionResult(
         success=True,
-        archive="two.tar",
+
         out_dir=str(segment_two),
-        all_parts=["two.tar"],
+
         output_inventory=collect_output_inventory(str(segment_two)),
     )
     result = ExtractionResult(
         success=True,
-        archive="carrier.bin",
+
         out_dir=str(carrier_dir),
-        all_parts=["carrier.bin"],
+
         embedded_results=[
             ({"segment_id": "embedded_00_zip"}, child_one),
             ({"segment_id": "embedded_01_tar"}, child_two),

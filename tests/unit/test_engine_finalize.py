@@ -46,7 +46,7 @@ def test_finalize_response_gates_only_flatten_targets(
     output = tmp_path / "output"
     response = PipelineResponse(
         request_id="finalize-roots",
-        summary=RunSummary(success_count=1, failed_tasks=[], processed_keys=[]),
+        summary=RunSummary(),
         artifacts=PipelineArtifacts(flatten_targets=(str(output),)),
     )
     barrier_calls: list[tuple[str, ...]] = []
@@ -77,7 +77,7 @@ def test_finalize_response_retries_only_failed_cleanups(tmp_path, monkeypatch):
     failed = ArchiveCleanupResult(str(archive), "recycle", "failed", 1, 32, "sharing violation")
     response = PipelineResponse(
         request_id="finalize-retry",
-        summary=RunSummary(success_count=1, failed_tasks=[], processed_keys=[]),
+        summary=RunSummary(),
         artifacts=PipelineArtifacts(flatten_targets=(str(output),)),
     )
     barrier_calls: list[tuple[str, ...]] = []

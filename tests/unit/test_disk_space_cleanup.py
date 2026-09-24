@@ -1,14 +1,14 @@
 import asyncio
 import os
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import pytest
 
 import sunpack.pipeline.coordinator.engine as engine_module
 import sunpack.core.support.resource_lifecycle as resource_lifecycle
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineResponse
-from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary
-from sunpack.core.contracts.run_context import RunContext
+from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary, TargetRunResult
+from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
 from sunpack.pipeline.coordinator.engine import _CleanupRefScope, _commit_response
 from sunpack.pipeline.postprocess.actions import PostProcessActions
@@ -26,7 +26,7 @@ class _Task:
 
 
 def response_for(paths=None):
-    return PipelineResponse('cleanup-test', RunSummary(1, [], []), PipelineArtifacts())
+    return PipelineResponse('cleanup-test', RunSummary(target_results=[TargetRunResult('archive.zip', OutcomeKind.COMPLETE_SUCCESS)]), PipelineArtifacts())
 
 
 def config(mode='recycle'):
@@ -49,7 +49,7 @@ def failed_result(path, error_code=32):
 
 
 def _scope(mode='recycle'):
-    context = RunContext()
+    context = RunState()
     return _CleanupRefScope(context, config(mode), engine_module.PostProcessActions).bind('request-1')
 
 
@@ -246,8 +246,8 @@ def test_postprocess_retries_only_the_failed_leftovers(tmp_path, monkeypatch):
         raise locked()
 
     monkeypatch.setattr(cleanup, 'send2trash', fail)
-    response = PipelineResponse('cleanup-retry', RunSummary(1, [], []), PipelineArtifacts())
-    response.summary.cleanup_results = [first, second]
+    response = PipelineResponse('cleanup-retry', RunSummary(target_results=[TargetRunResult('archive.zip', OutcomeKind.COMPLETE_SUCCESS)]), PipelineArtifacts())
+    response = replace(response, summary=replace(response.summary, cleanup_results=(first, second)))
     broker = _RecordingBroker()
 
     asyncio.run(_commit_response(broker, config(), response))
@@ -268,8 +268,8 @@ def test_postprocess_skips_the_retry_pass_when_nothing_is_retryable(tmp_path, mo
         raise error
 
     monkeypatch.setattr(cleanup, 'send2trash', deny)
-    response = PipelineResponse('cleanup-retry', RunSummary(1, [], []), PipelineArtifacts())
-    response.summary.cleanup_results = [failed_result(path, error_code=5)]
+    response = PipelineResponse('cleanup-retry', RunSummary(target_results=[TargetRunResult('archive.zip', OutcomeKind.COMPLETE_SUCCESS)]), PipelineArtifacts())
+    response = replace(response, summary=replace(response.summary, cleanup_results=(failed_result(path, error_code=5),)))
     broker = _RecordingBroker()
 
     asyncio.run(_commit_response(broker, config(), response))
@@ -286,8 +286,8 @@ def test_postprocess_stops_retrying_once_the_attempt_budget_is_spent(tmp_path, m
 
     monkeypatch.setattr(cleanup, 'send2trash', fail)
     exhausted = ArchiveCleanupResult(str(path), 'recycle', 'failed', 3, 32, 'busy')
-    response = PipelineResponse('cleanup-retry', RunSummary(1, [], []), PipelineArtifacts())
-    response.summary.cleanup_results = [exhausted]
+    response = PipelineResponse('cleanup-retry', RunSummary(target_results=[TargetRunResult('archive.zip', OutcomeKind.COMPLETE_SUCCESS)]), PipelineArtifacts())
+    response = replace(response, summary=replace(response.summary, cleanup_results=(exhausted,)))
     broker = _RecordingBroker()
 
     asyncio.run(_commit_response(broker, config(), response))
@@ -306,7 +306,7 @@ def test_retry_pass_deletes_the_failed_leftover(tmp_path, monkeypatch):
 
     monkeypatch.setattr(cleanup, 'send2trash', recycle)
     response = response_for()
-    response.summary.cleanup_results = [failed_result(path)]
+    response = replace(response, summary=replace(response.summary, cleanup_results=(failed_result(path),)))
 
     response = asyncio.run(_commit_response(_InlineBroker(), config(), response))
 
@@ -329,8 +329,7 @@ def test_failed_cleanup_is_bounded_and_repeat_commit_is_idempotent(tmp_path, mon
 
     def fresh_response():
         response = response_for()
-        response.summary.cleanup_results = [failed_result(path)]
-        return response
+        return replace(response, summary=replace(response.summary, cleanup_results=(failed_result(path),)))
 
     response = asyncio.run(_commit_response(broker, config(), fresh_response()))
     assert response.summary.cleanup_results[0].attempts == 3
@@ -358,8 +357,8 @@ def test_retry_only_touches_the_failed_leftovers(tmp_path, monkeypatch):
         raise locked()
 
     monkeypatch.setattr(cleanup, 'send2trash', fail)
-    response = PipelineResponse('cleanup-retry', RunSummary(1, [], []), PipelineArtifacts())
-    response.summary.cleanup_results = [failed_result(second_path)]
+    response = PipelineResponse('cleanup-retry', RunSummary(target_results=[TargetRunResult('archive.zip', OutcomeKind.COMPLETE_SUCCESS)]), PipelineArtifacts())
+    response = replace(response, summary=replace(response.summary, cleanup_results=(failed_result(second_path),)))
     broker = _RecordingBroker()
 
     asyncio.run(_commit_response(broker, config(), response))

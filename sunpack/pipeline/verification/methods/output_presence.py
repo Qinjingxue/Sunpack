@@ -1,14 +1,14 @@
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.methods._output_stats import output_stats_for_evidence, should_emit_file_observations
 from sunpack.pipeline.verification.registry import register_verification_method
-from sunpack.core.contracts.verification import FileVerificationObservation, VerificationIssue, VerificationStepResult
+from sunpack.core.contracts.verification import FileVerificationObservation, VerificationIssue, VerificationStep
 
 
 @register_verification_method("output_presence")
 class OutputPresenceMethod:
     name = "output_presence"
 
-    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStepResult:
+    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
         stats = output_stats_for_evidence(evidence)
         issues: list[VerificationIssue] = []
         if not stats.exists:
@@ -77,7 +77,7 @@ class OutputPresenceMethod:
                     "bytes_written": evidence.progress_manifest.get("bytes_written"),
                 },
             ))
-        return VerificationStepResult(
+        return VerificationStep(
             method=self.name,
             status="warning" if issues else "passed",
             issues=issues,
@@ -85,8 +85,8 @@ class OutputPresenceMethod:
             file_observations=observations,
         )
 
-    def _fail(self, code: str, message: str, path: str) -> VerificationStepResult:
-        return VerificationStepResult(
+    def _fail(self, code: str, message: str, path: str) -> VerificationStep:
+        return VerificationStep(
             method=self.name,
             status="failed",
             completeness_hint=0.0,

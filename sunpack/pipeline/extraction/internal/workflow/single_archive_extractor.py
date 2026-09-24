@@ -172,9 +172,7 @@ class SingleArchiveExtractor:
         except Exception as exc:
             failure = self._failure_info(FailureKind.FILESYSTEM_ERROR, "preflight", "extract.dir_create_failed", error=str(exc))
             return self._failed(
-                archive,
                 out_dir,
-                all_parts,
                 self._localized_failure(failure),
                 failure=failure,
                 diagnostics={"failure_stage": "preflight", "failure_kind": "output_filesystem", "message": str(exc)},
@@ -190,9 +188,7 @@ class SingleArchiveExtractor:
             except Exception as exc:
                 failure = self._failure_info(FailureKind.FILESYSTEM_ERROR, "preflight", "extract.dir_create_failed", error=str(exc))
                 return self._failed(
-                    archive,
                     out_dir,
-                    all_parts,
                     self._localized_failure(failure),
                     failure=failure,
                     diagnostics={"failure_stage": "preflight", "failure_kind": "output_filesystem", "message": str(exc)},
@@ -211,133 +207,128 @@ class SingleArchiveExtractor:
             correct_pwd = None
             selected_codepage = None
 
-            try:
-                with _phase(phase_timer, f"{phase_prefix}_resolve_password"):
-                    resolution = self._resolve_password(task, run_archive, run_parts)
-                resolution_failure = self._password_resolution_failure(resolution)
-                if resolution_failure is not None:
-                    self._cleanup_output(out_dir, OutputCleanupEvent.EXTRACTION_ABORT)
-                    self._log(self.i18n.t("extract.log.failed", archive=archive, error=self._localized_failure(resolution_failure)))
-                    return self._failed(
-                        archive,
-                        out_dir,
-                        run_parts,
-                        self._localized_failure(resolution_failure),
-                        failure=resolution_failure,
-                        diagnostics={
-                            "failure_stage": resolution_failure.stage,
-                            "failure_kind": resolution_failure.kind.value,
-                            "message": resolution.error_text,
-                        },
+            with _phase(phase_timer, f"{phase_prefix}_resolve_password"):
+                resolution = self._resolve_password(task, run_archive, run_parts)
+            resolution_failure = self._password_resolution_failure(resolution)
+            if resolution_failure is not None:
+                self._cleanup_output(out_dir, OutputCleanupEvent.EXTRACTION_ABORT)
+                self._log(self.i18n.t("extract.log.failed", archive=archive, error=self._localized_failure(resolution_failure)))
+                return self._failed(
+                    out_dir,
+                    self._localized_failure(resolution_failure),
+                    failure=resolution_failure,
+                    diagnostics={
+                        "failure_stage": resolution_failure.stage,
+                        "failure_kind": resolution_failure.kind.value,
+                        "message": resolution.error_text,
+                    },
+                )
+            correct_pwd = resolution.password
+            test_result = resolution.test_result
+            test_err = resolution.error_text
+            with _phase(phase_timer, f"{phase_prefix}_scan_filename_encoding"):
+                format_hint = task.archive_input().format_hint
+                scan_for_task = getattr(self.metadata_scanner, "scan_for_task", None)
+                if scan_for_task is not None:
+                    filename_encoding = scan_for_task(
+                        task, run_archive, password=correct_pwd,
+                        part_paths=run_parts, format_hint=format_hint,
                     )
-                correct_pwd = resolution.password
-                test_result = resolution.test_result
-                test_err = resolution.error_text
-                with _phase(phase_timer, f"{phase_prefix}_scan_filename_encoding"):
-                    format_hint = task.archive_input().format_hint
-                    scan_for_task = getattr(self.metadata_scanner, "scan_for_task", None)
-                    if scan_for_task is not None:
-                        filename_encoding = scan_for_task(
-                            task, run_archive, password=correct_pwd,
-                            part_paths=run_parts, format_hint=format_hint,
-                        )
-                    else:
-                        filename_encoding = self.metadata_scanner.scan(
-                            run_archive, password=correct_pwd,
-                            part_paths=run_parts, format_hint=format_hint,
-                        )
-                    selected_codepage = filename_encoding.selected_codepage
-                    if filename_encoding.error:
-                        # Filename detection is an optional override.  Failure or
-                        # ambiguity must not prevent the archive backend from
-                        # using UTF-8 flags / Unicode extra fields itself.
-                        self._log(
-                            self.i18n.t("extract.log.metadata_override_not_used", error=filename_encoding.error)
-                        )
-                        selected_codepage = None
-                        filename_encoding.decoded_names = []
-
-                if correct_pwd is None:
-                    err = test_err
                 else:
-                    self.sevenzip_runner.emit_semantic_event(
-                        task,
-                        "extract_ready",
-                        archive_path=run_archive,
-                        completed_bytes=0,
-                        total_bytes=0,
+                    filename_encoding = self.metadata_scanner.scan(
+                        run_archive, password=correct_pwd,
+                        part_paths=run_parts, format_hint=format_hint,
                     )
-                    with _phase(phase_timer, f"{phase_prefix}_sevenzip_attempt"):
-                        run_result = yield {
-                            "archive_path": run_archive,
-                            "part_paths": run_parts,
-                            "out_dir": out_dir,
-                            "password": correct_pwd,
-                            "password_candidates": list(resolution.candidate_passwords),
-                            "selected_codepage": selected_codepage,
-                            "decoded_names": filename_encoding.decoded_names,
-                            "startupinfo": startupinfo,
-                            "task": task,
-                            "phase_timer": phase_timer,
-                            "phase_prefix": f"{phase_prefix}_sevenzip",
-                        }
+                selected_codepage = filename_encoding.selected_codepage
+                if filename_encoding.error:
+                    # Filename detection is an optional override.  Failure or
+                    # ambiguity must not prevent the archive backend from
+                    # using UTF-8 flags / Unicode extra fields itself.
+                    self._log(
+                        self.i18n.t("extract.log.metadata_override_not_used", error=filename_encoding.error)
+                    )
+                    selected_codepage = None
+                    filename_encoding.decoded_names = []
 
-                    if run_result.returncode == 0:
-                        selected_password = self._worker_selected_password(resolution, run_result)
-                        if selected_password is not None:
-                            correct_pwd = selected_password
+            if correct_pwd is None:
+                err = test_err
+            else:
+                self.sevenzip_runner.emit_semantic_event(
+                    task,
+                    "extract_ready",
+                    archive_path=run_archive,
+                    completed_bytes=0,
+                    total_bytes=0,
+                )
+                with _phase(phase_timer, f"{phase_prefix}_sevenzip_attempt"):
+                    run_result = yield {
+                        "archive_path": run_archive,
+                        "part_paths": run_parts,
+                        "out_dir": out_dir,
+                        "password": correct_pwd,
+                        "password_candidates": list(resolution.candidate_passwords),
+                        "selected_codepage": selected_codepage,
+                        "decoded_names": filename_encoding.decoded_names,
+                        "startupinfo": startupinfo,
+                        "task": task,
+                        "phase_timer": phase_timer,
+                        "phase_prefix": f"{phase_prefix}_sevenzip",
+                    }
+
+                if run_result.returncode == 0:
+                    selected_password = self._worker_selected_password(resolution, run_result)
+                    if selected_password is not None:
+                        correct_pwd = selected_password
+                    if resolution.requires_extraction_confirmation:
+                        self.password_resolver.confirm_extraction(resolution, password=correct_pwd)
+                    with _phase(phase_timer, f"{phase_prefix}_diagnostics_success"):
+                        diagnostics = self._diagnostics_from(run_result)
                         if resolution.requires_extraction_confirmation:
-                            self.password_resolver.confirm_extraction(resolution, password=correct_pwd)
-                        with _phase(phase_timer, f"{phase_prefix}_diagnostics_success"):
-                            diagnostics = self._diagnostics_from(run_result)
-                            if resolution.requires_extraction_confirmation:
-                                worker_result = worker_result_payload(run_result)
-                                diagnostics["password_verification"] = self._password_verification_label(
-                                    resolution, worker_result
-                                )
-                                diagnostics["password_candidates_rejected"] = int(
-                                    worker_result.get("password_attempts") or 0
-                                ) if worker_result.get("password_candidates_all_rejected") else 0
-                                diagnostics["password_candidates_inconclusive"] = 0
-                        with _phase(phase_timer, f"{phase_prefix}_output_stats_success"):
-                            worker_result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
-                            output_inventory = collect_output_inventory(out_dir, worker_result)
-                            compact_success_worker_diagnostics(diagnostics)
-                            output_stats = {
-                                "file_count": output_inventory.stats.file_count,
-                                "total_bytes": output_inventory.stats.total_size,
-                            }
-                            self._fill_success_output_counts(diagnostics, output_stats)
-                        self._log(self.i18n.t("extract.log.success", archive=archive))
-                        manifest_path = ""
-                        manifest_payload = None
-                        if diagnostics.get("result"):
-                            with _phase(phase_timer, f"{phase_prefix}_write_success_manifest"):
-                                manifest_path, manifest_payload = write_extraction_progress_manifest_payload(
-                                    archive=archive,
-                                    out_dir=out_dir,
-                                    diagnostics=diagnostics,
-                                    round_index=retry_count + 1,
-                                    write_file=self.write_progress_manifest,
-                                )
-                            if manifest_path:
-                                diagnostics["progress_manifest"] = manifest_path
-                        return ExtractionResult(
-                            success=True,
-                            archive=archive,
-                            out_dir=out_dir,
-                            all_parts=cleanup_parts,
-                            password_used=correct_pwd,
-                            selected_codepage=selected_codepage,
-                            diagnostics=diagnostics,
-                            progress_manifest=manifest_path,
-                            progress_manifest_payload=manifest_payload,
-                            output_inventory=output_inventory,
-                            files_written=output_stats["file_count"],
-                            bytes_written=output_stats["total_bytes"],
-                        )
+                            worker_result = worker_result_payload(run_result)
+                            diagnostics["password_verification"] = self._password_verification_label(
+                                resolution, worker_result
+                            )
+                            diagnostics["password_candidates_rejected"] = int(
+                                worker_result.get("password_attempts") or 0
+                            ) if worker_result.get("password_candidates_all_rejected") else 0
+                            diagnostics["password_candidates_inconclusive"] = 0
+                    with _phase(phase_timer, f"{phase_prefix}_output_stats_success"):
+                        worker_result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
+                        output_inventory = collect_output_inventory(out_dir, worker_result)
+                        compact_success_worker_diagnostics(diagnostics)
+                        output_stats = {
+                            "file_count": output_inventory.stats.file_count,
+                            "total_bytes": output_inventory.stats.total_size,
+                        }
+                        self._fill_success_output_counts(diagnostics, output_stats)
+                    self._log(self.i18n.t("extract.log.success", archive=archive))
+                    manifest_path = ""
+                    manifest_payload = None
+                    if diagnostics.get("result"):
+                        with _phase(phase_timer, f"{phase_prefix}_write_success_manifest"):
+                            manifest_path, manifest_payload = write_extraction_progress_manifest_payload(
+                                archive=archive,
+                                out_dir=out_dir,
+                                diagnostics=diagnostics,
+                                round_index=retry_count + 1,
+                                write_file=self.write_progress_manifest,
+                            )
+                        if manifest_path:
+                            diagnostics["progress_manifest"] = manifest_path
+                    return ExtractionResult(
+                        success=True,
+                        out_dir=out_dir,
+                        password_used=correct_pwd,
+                        selected_codepage=selected_codepage,
+                        diagnostics=diagnostics,
+                        progress_manifest=manifest_path,
+                        progress_manifest_payload=manifest_payload,
+                        output_inventory=output_inventory,
+                        files_written=output_stats["file_count"],
+                        bytes_written=output_stats["total_bytes"],
+                    )
 
-                    err = f"{run_result.stdout}\n{run_result.stderr}".lower()
+                err = f"{run_result.stdout}\n{run_result.stderr}".lower()
             if resolution.requires_extraction_confirmation and run_result is not None:
                 worker_result = worker_result_payload(run_result)
                 selected_password = self._worker_selected_password(resolution, run_result)
@@ -411,9 +402,7 @@ class SingleArchiveExtractor:
                 if manifest_path:
                     diagnostics["progress_manifest"] = manifest_path
                 return self._failed(
-                    archive,
                     out_dir,
-                    run_parts,
                     error_msg,
                     failure=failure,
                     password_used=(None if failure.kind in {FailureKind.WRONG_PASSWORD, FailureKind.PASSWORD_INCONCLUSIVE} else correct_pwd),
@@ -425,9 +414,7 @@ class SingleArchiveExtractor:
                 )
             self._cleanup_output(out_dir, OutputCleanupEvent.UNRECOVERABLE_FAILURE)
             return self._failed(
-                archive,
                 out_dir,
-                run_parts,
                 error_msg,
                 failure=failure,
                 password_used=(None if failure.kind in {FailureKind.WRONG_PASSWORD, FailureKind.PASSWORD_INCONCLUSIVE} else correct_pwd),
@@ -438,9 +425,7 @@ class SingleArchiveExtractor:
         self._cleanup_output(out_dir, OutputCleanupEvent.RETRY_EXHAUSTED)
         failure = self._failure_info(FailureKind.PROCESS_ERROR, "retry_exhausted", "failure.retry_exhausted")
         return self._failed(
-            archive,
             out_dir,
-            all_parts,
             self._localized_failure(failure),
             failure=failure,
             diagnostics={"failure_stage": "retry_exhausted", "failure_kind": "unknown"},
@@ -511,16 +496,14 @@ class SingleArchiveExtractor:
         logical_name = str(descriptor.logical_name or "").strip()
         if logical_name:
             return f"{task.key}#{logical_name}"
-        segment = descriptor.segment
-        if segment is not None:
-            return f"{task.key}#range:{int(segment.start)}:{segment.end}"
+        extent = descriptor.primary_extent
+        if extent is not None:
+            return f"{task.key}#range:{int(extent.start)}:{extent.end}"
         return f"{task.key}#{descriptor.open_mode}:{descriptor.entry_path}"
 
     def _failed(
         self,
-        archive: str,
         out_dir: str,
-        all_parts: list[str],
         error: str,
         *,
         failure: FailureInfo | None = None,
@@ -538,9 +521,7 @@ class SingleArchiveExtractor:
             diagnostic_payload["failure"] = failure.to_dict()
         return ExtractionResult(
             success=False,
-            archive=archive,
             out_dir=out_dir,
-            all_parts=list(all_parts or []),
             error=error,
             failure=failure,
             password_used=password_used,
@@ -731,9 +712,7 @@ class SingleArchiveExtractor:
         except Exception as exc:
             failure = self._failure_info(FailureKind.FILESYSTEM_ERROR, "preflight", "extract.dir_create_failed", error=str(exc))
             return self._failed(
-                archive,
                 out_dir,
-                all_parts,
                 self._localized_failure(failure),
                 failure=failure,
                 diagnostics={"failure_stage": "preflight", "failure_kind": "output_filesystem", "message": str(exc)},
@@ -896,9 +875,7 @@ class SingleArchiveExtractor:
             ))
             return ExtractionResult(
                 success=all_success,
-                archive=archive,
                 out_dir=out_dir,
-                all_parts=all_parts,
                 error=aggregate_failure.message if aggregate_failure is not None else "",
                 failure=aggregate_failure,
                 password_used=password_used,
@@ -926,9 +903,7 @@ class SingleArchiveExtractor:
                 details={"segment_count": len(segment_results)},
             )
         failed_result = self._failed(
-            archive,
             out_dir,
-            all_parts,
             aggregate_failure.message,
             failure=aggregate_failure,
             password_used=password_used,

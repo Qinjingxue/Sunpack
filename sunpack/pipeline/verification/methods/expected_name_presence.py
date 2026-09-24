@@ -25,7 +25,7 @@ from sunpack.core.contracts.verification import (
     CONTENT_INTEGRITY_VERIFIED_PARTIAL,
     VERIFICATION_STRENGTH_MANIFEST,
     VerificationIssue,
-    VerificationStepResult,
+    VerificationStep,
 )
 from sunpack.core.support.path_names import clean_relative_archive_path, normalize_match_name, normalize_match_path
 
@@ -36,7 +36,7 @@ from sunpack.core.support.path_names import clean_relative_archive_path, normali
 class ExpectedNamePresenceMethod:
     name = "expected_name_presence"
 
-    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStepResult:
+    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
         config = {**advanced_named_config(("verification", "methods"), self.name), **config}
         input_manifest = archive_input_manifest_for_evidence(
             evidence,
@@ -44,12 +44,12 @@ class ExpectedNamePresenceMethod:
         )
         expected_names = self._expected_names(config, input_manifest)
         if not expected_names:
-            return VerificationStepResult(method=self.name, status="skipped")
+            return VerificationStep(method=self.name, status="skipped")
 
         inventory = output_inventory_for_evidence(evidence)
         stats = inventory.stats
         if not stats.exists or not stats.is_dir or stats.file_count <= 0:
-            return VerificationStepResult(method=self.name, status="skipped")
+            return VerificationStep(method=self.name, status="skipped")
 
         emit_observations = should_emit_file_observations(evidence, self.name)
         if inventory.worker_inventory_complete and inventory.identity_paths and not emit_observations:
@@ -81,7 +81,7 @@ class ExpectedNamePresenceMethod:
                 missing.append(expected)
 
         if not missing:
-            return VerificationStepResult(
+            return VerificationStep(
                 method=self.name,
                 status="passed",
                 completeness_hint=coverage.completeness,
@@ -130,7 +130,7 @@ class ExpectedNamePresenceMethod:
             },
         )
         content_integrity = _content_integrity_hint(input_manifest)
-        return VerificationStepResult(
+        return VerificationStep(
             method=self.name,
             status="warning",
             issues=[issue],

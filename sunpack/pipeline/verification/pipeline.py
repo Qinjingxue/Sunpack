@@ -32,11 +32,11 @@ from sunpack.core.contracts.verification import (
     VERIFICATION_STRENGTH_MANIFEST,
     VERIFICATION_STRENGTH_NONE,
     VERIFICATION_STRENGTH_ORACLE,
-    ArchiveCoverageSummary,
+    ArchiveCoverage,
     FileVerificationObservation,
     VerificationIssue,
     VerificationResult,
-    VerificationStepRecord,
+    VerificationStep,
 )
 
 
@@ -56,7 +56,7 @@ class VerificationPipeline:
     ) -> VerificationResult:
         issues: list[VerificationIssue] = []
         methods_run: list[str] = []
-        steps: list[VerificationStepRecord] = []
+        steps: list[VerificationStep] = []
         file_observations: list[FileVerificationObservation] = []
         completeness_hints: list[float] = []
         upper_bound_hints: list[float] = []
@@ -116,21 +116,7 @@ class VerificationPipeline:
                 verification_strengths.append(step.verification_strength)
             if step.decision_hint != DECISION_NONE:
                 decision_hints.append(step.decision_hint)
-            steps.append(VerificationStepRecord(
-                method=step.method or method_name,
-                status=step.status,
-                issues=list(step.issues),
-                completeness_hint=step.completeness_hint,
-                recoverable_upper_bound_hint=step.recoverable_upper_bound_hint,
-                content_integrity_hint=step.content_integrity_hint,
-                container_integrity_hint=step.container_integrity_hint,
-                verification_strength=step.verification_strength,
-                total_item_count=step.total_item_count,
-                verified_item_count=step.verified_item_count,
-                archive_walk_complete=step.archive_walk_complete,
-                decision_hint=step.decision_hint,
-                file_observations=list(step.file_observations),
-            ))
+            steps.append(step if step.method else replace(step, method=method_name))
 
         with _phase(phase_timer, f"{phase_prefix}_build_result"):
             return self._build_result(
@@ -151,7 +137,7 @@ class VerificationPipeline:
         *,
         methods_run: list[str],
         issues: list[VerificationIssue],
-        steps: list[VerificationStepRecord],
+        steps: list[VerificationStep],
         file_observations: list[FileVerificationObservation],
         completeness_hints: list[float],
         upper_bound_hints: list[float],
@@ -191,7 +177,13 @@ class VerificationPipeline:
         elif content_integrity == CONTENT_INTEGRITY_UNKNOWN and not extraction_failed and not output_quality.empty:
             verification_strength = _aggregate_verification_strength([verification_strength, VERIFICATION_STRENGTH_EXTRACTION])
         recoverable_upper_bound = _aggregate_upper_bound(content_integrity, upper_bound_hints)
-        counts = _file_counts(file_observations)
+        counts = {
+            "complete": archive_coverage.complete_files,
+            "partial": archive_coverage.partial_files,
+            "failed": archive_coverage.failed_files,
+            "missing": archive_coverage.missing_files,
+            "unverified": archive_coverage.unverified_files,
+        }
         total_item_count = max((step.total_item_count for step in steps), default=0)
         verified_item_count = max((step.verified_item_count for step in steps), default=0)
         archive_walk_complete = any(step.archive_walk_complete for step in steps)
@@ -228,11 +220,6 @@ class VerificationPipeline:
             verified_item_count=verified_item_count,
             archive_walk_complete=archive_walk_complete,
             decision_hint=decision_hint,
-            complete_files=counts["complete"],
-            partial_files=counts["partial"],
-            failed_files=counts["failed"],
-            missing_files=counts["missing"],
-            unverified_files=counts["unverified"],
             output_quality_score=output_quality.score,
             output_file_count=output_quality.file_count,
             output_total_bytes=output_quality.total_bytes,
@@ -365,11 +352,6 @@ def aggregate_payload_verifications(
         verified_item_count=sum(result.verified_item_count for result in results),
         archive_walk_complete=all(result.archive_walk_complete for result in results),
         decision_hint=decision_hint,
-        complete_files=sum(result.complete_files for result in results),
-        partial_files=sum(result.partial_files for result in results),
-        failed_files=sum(result.failed_files for result in results),
-        missing_files=sum(result.missing_files for result in results),
-        unverified_files=sum(result.unverified_files for result in results),
         output_quality_score=output_quality_score,
         output_file_count=output_file_count,
         output_total_bytes=output_total_bytes,
@@ -395,10 +377,10 @@ def _payload_verification_weight(result: VerificationResult) -> int:
 def _aggregate_payload_coverage(
     payloads: list[tuple[dict[str, Any], VerificationResult]],
     completeness: float,
-) -> ArchiveCoverageSummary:
+) -> ArchiveCoverage:
     results = [verification for _segment, verification in payloads]
     coverages = [result.archive_coverage for result in results]
-    return ArchiveCoverageSummary(
+    return ArchiveCoverage(
         completeness=completeness,
         file_coverage=completeness,
         byte_coverage=completeness,
@@ -480,7 +462,7 @@ def _has_direct_verification_signal(
     completeness_hints: list[float],
     content_hints: list[str],
     decision_hints: list[str],
-    archive_coverage: ArchiveCoverageSummary,
+    archive_coverage: ArchiveCoverage,
 ) -> bool:
     if file_observations or completeness_hints or content_hints or decision_hints:
         return True
@@ -512,7 +494,7 @@ def _aggregate_upper_bound(content_integrity: str, hints: list[float]) -> float:
     return 1.0
 
 
-def _aggregate_content_integrity(steps: list[VerificationStepRecord]) -> str:
+def _aggregate_content_integrity(steps: list[VerificationStep]) -> str:
     relevant = [step for step in steps if step.content_integrity_hint != CONTENT_INTEGRITY_UNKNOWN]
     if not relevant:
         return CONTENT_INTEGRITY_UNKNOWN
@@ -630,18 +612,10 @@ def _collect_container_flags(*values: Any) -> set[str]:
     return found
 
 
-def _file_counts(file_observations: list[FileVerificationObservation]) -> dict[str, int]:
-    counts = {"complete": 0, "partial": 0, "failed": 0, "missing": 0, "unverified": 0}
-    for item in file_observations:
-        state = item.state if item.state in counts else "unverified"
-        counts[state] += 1
-    return counts
-
-
 def _archive_coverage_summary(
     issues: list[VerificationIssue],
     file_observations: list[FileVerificationObservation],
-) -> ArchiveCoverageSummary:
+) -> ArchiveCoverage:
     sources = _coverage_sources_from_issues(issues)
     if sources:
         return _merge_coverage_sources(sources)
@@ -677,7 +651,7 @@ def _looks_like_coverage(value: dict) -> bool:
     )
 
 
-def _merge_coverage_sources(sources: list[dict]) -> ArchiveCoverageSummary:
+def _merge_coverage_sources(sources: list[dict]) -> ArchiveCoverage:
     strongest = _strongest_coverage_source(sources)
     expected_files = max(_as_int(item.get("expected_files")) for item in sources)
     expected_bytes = max(_as_int(item.get("expected_bytes")) for item in sources)
@@ -706,7 +680,7 @@ def _merge_coverage_sources(sources: list[dict]) -> ArchiveCoverageSummary:
         completeness = min(completeness, file_coverage)
     byte_coverage = _coverage_value(strongest, "byte_coverage", matched_bytes, expected_bytes)
     confidence = _coverage_confidence(strongest)
-    return ArchiveCoverageSummary(
+    return ArchiveCoverage(
         completeness=_clamp01(completeness),
         file_coverage=file_coverage,
         byte_coverage=byte_coverage,
@@ -733,9 +707,9 @@ def _strongest_coverage_source(sources: list[dict]) -> dict:
     ))
 
 
-def _coverage_from_observations(file_observations: list[FileVerificationObservation]) -> ArchiveCoverageSummary:
+def _coverage_from_observations(file_observations: list[FileVerificationObservation]) -> ArchiveCoverage:
     if not file_observations:
-        return ArchiveCoverageSummary(confidence=0.0)
+        return ArchiveCoverage(confidence=0.0)
     expected_files = len(file_observations)
     matched_files = sum(1 for item in file_observations if item.state != "missing")
     complete_files = sum(1 for item in file_observations if item.state == "complete")
@@ -756,7 +730,7 @@ def _coverage_from_observations(file_observations: list[FileVerificationObservat
             complete_bytes += expected or written
     file_coverage = matched_files / max(1, expected_files)
     byte_coverage = matched_bytes / expected_bytes if expected_bytes > 0 else file_coverage
-    return ArchiveCoverageSummary(
+    return ArchiveCoverage(
         completeness=_aggregate_completeness(file_observations, []),
         file_coverage=_clamp01(file_coverage),
         byte_coverage=_clamp01(byte_coverage),

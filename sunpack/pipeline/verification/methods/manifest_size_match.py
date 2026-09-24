@@ -22,7 +22,7 @@ from sunpack.core.contracts.verification import (
     CONTENT_INTEGRITY_VERIFIED_PARTIAL,
     VERIFICATION_STRENGTH_MANIFEST,
     VerificationIssue,
-    VerificationStepResult,
+    VerificationStep,
 )
 
 
@@ -30,7 +30,7 @@ from sunpack.core.contracts.verification import (
 class ManifestSizeMatchMethod:
     name = "manifest_size_match"
 
-    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStepResult:
+    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
         config = {**advanced_named_config(("verification", "methods"), self.name), **config}
         input_manifest = archive_input_manifest_for_evidence(
             evidence,
@@ -40,11 +40,11 @@ class ManifestSizeMatchMethod:
         expected_size = _expected_total_size(input_manifest)
         expected_names = _expected_names(input_manifest)
         if expected_files <= 0 and expected_size <= 0:
-            return VerificationStepResult(method=self.name, status="skipped")
+            return VerificationStep(method=self.name, status="skipped")
 
         stats = output_stats_for_evidence(evidence)
         if not stats.exists or not stats.is_dir:
-            return VerificationStepResult(method=self.name, status="skipped")
+            return VerificationStep(method=self.name, status="skipped")
 
         issues: list[VerificationIssue] = []
         content_integrity = _content_integrity_hint(input_manifest)
@@ -130,7 +130,7 @@ class ManifestSizeMatchMethod:
                 ))
 
         if not issues:
-            return VerificationStepResult(
+            return VerificationStep(
                 method=self.name,
                 status="passed",
                 completeness_hint=name_coverage.completeness if name_coverage is not None else 1.0,
@@ -144,7 +144,7 @@ class ManifestSizeMatchMethod:
         completeness = _manifest_completeness(stats.file_count, stats.total_size, expected_files, expected_size)
         if name_coverage is not None:
             completeness = min(completeness, name_coverage.completeness)
-        return VerificationStepResult(
+        return VerificationStep(
             method=self.name,
             status="warning",
             issues=issues,

@@ -2,9 +2,9 @@
 
 from sunpack.core.contracts.discovery import (
     DiscoveryCandidate,
-    ResolvedArchiveInput,
     StageResult,
 )
+from sunpack.core.contracts.tasks import ArchiveTask
 
 
 _FORMATS = {"rar", "7z", "zip"}
@@ -29,15 +29,14 @@ class RelationResolver:
             if (
                 anchor.get("relation_confirmed")
                 and archive_format in _FORMATS
-                and candidate.archive_input is not None
             ):
                 result.add_resolved(
-                    ResolvedArchiveInput(
-                        archive_input=candidate.archive_input,
-                        source="relations",
+                    ArchiveTask.from_archive_input(
+                        candidate.archive_input,
+                        discovery_source="relations",
                         carrier_path=candidate.carrier_path,
                         cleanup_paths=candidate.cleanup_paths,
-                        evidence=dict(anchor),
+                        discovery_evidence=dict(anchor),
                     ),
                     reason="Relations confirmed native archive identity",
                 )

@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from sunpack.core.contracts.discovery import DiscoveryCandidate, ResolvedArchiveInput, StageResult
+from sunpack.core.contracts.discovery import DiscoveryCandidate, StageResult
 from sunpack.core.contracts.failures import FailureInfo
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.discovery import ArchiveDiscoveryPipeline
@@ -58,30 +58,25 @@ class ArchiveTaskProvider:
     ) -> list[ArchiveTask]:
         self.failed_candidates = []
         self.failed_candidate_failures = []
-        inputs = self.discover_targets(
+        tasks = self.discover_targets(
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
-        ).resolved_inputs
-        return self.tasks_from_inputs(inputs, processed_keys=processed_keys)
+        ).resolved_tasks
+        return self.filter_processed_tasks(tasks, processed_keys=processed_keys)
 
-    def tasks_from_inputs(
+    def filter_processed_tasks(
         self,
-        inputs: list[ResolvedArchiveInput],
+        tasks: list[ArchiveTask],
         *,
         processed_keys: set[str] | None = None,
     ) -> list[ArchiveTask]:
         processed = processed_keys or set()
-        tasks: list[ArchiveTask] = []
-        for resolved in inputs:
-            task = ArchiveTask.from_resolved(resolved)
-            if task.key not in processed:
-                tasks.append(task)
-        return tasks
+        return [task for task in tasks if task.key not in processed]
 
     def task_from_candidate(self, candidate: DiscoveryCandidate) -> ArchiveTask | None:
         result = self.discovery.discover([candidate])
-        tasks = self.tasks_from_inputs(result.resolved_inputs)
+        tasks = self.filter_processed_tasks(result.resolved_tasks)
         return tasks[0] if tasks else None
 
     def resolve_volume_once_in_directory(

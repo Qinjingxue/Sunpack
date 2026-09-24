@@ -23,9 +23,9 @@ def test_extraction_exit_signal_reports_unusable_extraction(tmp_path, success, p
     out_dir = tmp_path / "out"
     result = ExtractionResult(
         success=success,
-        archive=task.main_path,
+
         out_dir=str(out_dir),
-        all_parts=task.all_parts,
+
         error="boom" if not success else None,
         progress_manifest_payload=progress,
     )
@@ -42,7 +42,7 @@ def test_extraction_exit_signal_reports_unusable_extraction(tmp_path, success, p
 
 def test_output_presence_reports_missing_or_empty_output_as_unusable(tmp_path):
     task = _task(tmp_path)
-    result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(tmp_path / "missing"), all_parts=task.all_parts)
+    result = ExtractionResult(success=True, out_dir=str(tmp_path / "missing"))
 
     missing = _scheduler([{"name": "output_presence"}]).verify(task, result)
 
@@ -64,7 +64,7 @@ def test_manifest_size_match_reports_complete_when_expected_size_matches(tmp_pat
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     (out_dir / "a.txt").write_text("hello", encoding="utf-8")
-    result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = _scheduler([{"name": "manifest_size_match"}]).verify(task, result)
 
@@ -78,7 +78,7 @@ def test_manifest_size_match_reports_retry_for_large_manifest_gap(tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     (out_dir / "file-0.txt").write_text("x", encoding="utf-8")
-    result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = _scheduler([{
         "name": "manifest_size_match",
@@ -102,7 +102,7 @@ def test_expected_name_presence_reports_missing_entries(tmp_path):
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     (out_dir / "actual.txt").write_text("hello", encoding="utf-8")
-    result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
 
@@ -116,7 +116,7 @@ def test_expected_name_presence_skips_without_manifest_names(tmp_path):
     out_dir.mkdir()
     (out_dir / "actual.txt").write_text("hello", encoding="utf-8")
     task = _task(tmp_path)
-    result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
 
@@ -136,7 +136,7 @@ def test_oracle_expected_output_match_reports_complete_crc_and_size_match(tmp_pa
         },
         "oracle_strength": "entry_hash",
     })
-    result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = _scheduler([{"name": "oracle_expected_output_match"}]).verify(task, result)
 
@@ -156,7 +156,7 @@ def test_oracle_expected_output_match_reports_missing_and_crc_failure(tmp_path):
             "missing.bin": {"name": "missing.bin", "size": 4, "crc32": 1234},
         }
     })
-    result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = _scheduler([{"name": "oracle_expected_output_match"}]).verify(task, result)
 
@@ -171,7 +171,7 @@ def test_oracle_expected_output_match_skips_without_oracle_expected_files(tmp_pa
     out_dir = tmp_path / "out"
     out_dir.mkdir()
     task = _task(tmp_path)
-    result = ExtractionResult(success=True, archive=task.main_path, out_dir=str(out_dir), all_parts=task.all_parts)
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = _scheduler([{"name": "oracle_expected_output_match"}]).verify(task, result)
 
@@ -191,7 +191,7 @@ def test_archive_test_crc_compares_archive_state_manifest_to_output_files(tmp_pa
     (out_dir / "good.txt").write_text("hello", encoding="utf-8")
     (out_dir / "bad.txt").write_text("oops", encoding="utf-8")
     task = make_archive_task(archive, key="sample", format_hint="zip")
-    result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification = _scheduler([{"name": "archive_test_crc"}]).verify(task, result)
 
@@ -222,7 +222,7 @@ def test_zip_verification_methods_share_one_full_archive_manifest(tmp_path, monk
     for name, payload in expected.items():
         (out_dir / name).write_bytes(payload)
     task = make_archive_task(archive, key="shared", format_hint="zip")
-    result = ExtractionResult(success=True, archive=str(archive), out_dir=str(out_dir), all_parts=[str(archive)])
+    result = ExtractionResult(success=True, out_dir=str(out_dir))
     calls = []
     native_manifest = archive_state_manifest_module._native_archive_state_zip_manifest
 
@@ -248,9 +248,9 @@ def test_archive_test_crc_unsupported_empty_failed_extraction_is_not_complete(tm
     task = make_archive_task(archive, key="sample-7z", format_hint="7z")
     result = ExtractionResult(
         success=False,
-        archive=str(archive),
+
         out_dir=str(out_dir),
-        all_parts=[str(archive)],
+
         error="extract failed",
     )
 
@@ -286,9 +286,9 @@ def test_output_presence_uses_worker_manifest_progress_as_completeness(tmp_path)
     task = _task(tmp_path)
     result = ExtractionResult(
         success=True,
-        archive=str(archive),
+
         out_dir=str(out_dir),
-        all_parts=[str(archive)],
+
         progress_manifest=str(manifest),
     )
 

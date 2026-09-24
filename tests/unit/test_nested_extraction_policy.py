@@ -48,7 +48,7 @@ def test_first_round_bypasses_policy_for_the_user_requested_scope(tmp_path):
         round_index=1,
     )
 
-    assert [task.main_path for task in result.allowed_inputs] == [str(archive)]
+    assert [task.main_path for task in result.allowed_tasks] == [str(archive)]
     assert result.skipped == []
 
 
@@ -96,7 +96,7 @@ def test_second_round_root_child_has_no_special_privilege(tmp_path):
 
     result = _authorize(tmp_path, entries, [archive], round_index=2)
 
-    assert result.allowed_inputs == []
+    assert result.allowed_tasks == []
     assert result.skipped[0]["reason"] == "archive_byte_ratio_below_floor"
 
 
@@ -153,7 +153,7 @@ def test_recursive_policy_rejects_game_dlc_payload_shape(tmp_path):
 
     result = _authorize(tmp_path, entries, [archive])
 
-    assert result.allowed_inputs == []
+    assert result.allowed_tasks == []
     assert result.skipped[0]["reason"] == "authorization_score_below_threshold"
     assert result.skipped[0]["local_other_file_count"] == 28
     assert result.skipped[0]["local_foreign_branch_count"] == 2
@@ -190,7 +190,7 @@ def test_recursive_policy_allows_dominant_release_archive_shape(tmp_path):
 
     result = _authorize(tmp_path, entries, [archive])
 
-    assert [task.main_path for task in result.allowed_inputs] == [str(archive)]
+    assert [task.main_path for task in result.allowed_tasks] == [str(archive)]
     assert result.skipped == []
 
 
@@ -205,7 +205,7 @@ def test_nested_archive_dominating_its_semantic_subtree_is_allowed(tmp_path):
 
     result = _authorize(tmp_path, entries, [archive])
 
-    assert [task.main_path for task in result.allowed_inputs] == [str(archive)]
+    assert [task.main_path for task in result.allowed_tasks] == [str(archive)]
     assert result.skipped == []
 
 
@@ -222,7 +222,7 @@ def test_candidates_in_same_scope_are_aggregated_once(tmp_path):
 
     result = _authorize(tmp_path, entries, [first, second])
 
-    assert [task.main_path for task in result.allowed_inputs] == [str(first), str(second)]
+    assert [task.main_path for task in result.allowed_tasks] == [str(first), str(second)]
     assert result.skipped == []
 
 
@@ -236,7 +236,7 @@ def test_large_game_resource_is_rejected_despite_dominating_bytes(tmp_path):
 
     result = _authorize(tmp_path, entries, [archive])
 
-    assert result.allowed_inputs == []
+    assert result.allowed_tasks == []
     row = result.skipped[0]
     assert row["local_candidate_byte_ratio"] == pytest.approx(0.9)
     assert row["local_other_project_count"] == 100
@@ -260,7 +260,7 @@ def test_repository_root_can_veto_clean_release_subdirectory(tmp_path):
 
     result = _authorize(tmp_path, entries, [archive])
 
-    assert result.allowed_inputs == []
+    assert result.allowed_tasks == []
     row = result.skipped[0]
     assert row["local_authorization_score"] == pytest.approx(1.0)
     assert row["limiting_context"] == "root"
@@ -285,7 +285,7 @@ def test_deep_single_directory_wrapper_does_not_add_project_burden(tmp_path):
 
     result = _authorize(tmp_path, entries, [archive])
 
-    assert [task.main_path for task in result.allowed_inputs] == [str(archive)]
+    assert [task.main_path for task in result.allowed_tasks] == [str(archive)]
     assert result.skipped == []
 
 
@@ -299,7 +299,7 @@ def test_extreme_byte_ratio_overcomes_a_few_other_files(tmp_path):
 
     result = _authorize(tmp_path, entries, [archive])
 
-    assert [task.main_path for task in result.allowed_inputs] == [str(archive)]
+    assert [task.main_path for task in result.allowed_tasks] == [str(archive)]
     assert result.skipped == []
 
 
@@ -327,10 +327,10 @@ def test_ninety_nine_percent_bytes_has_five_percent_project_boundary(
     result = _authorize(tmp_path, entries, [archive])
 
     if allowed:
-        assert [task.main_path for task in result.allowed_inputs] == [str(archive)]
+        assert [task.main_path for task in result.allowed_tasks] == [str(archive)]
         assert result.skipped == []
     else:
-        assert result.allowed_inputs == []
+        assert result.allowed_tasks == []
         row = result.skipped[0]
         assert row["reason"] == "authorization_score_below_threshold"
         assert row["local_candidate_byte_ratio"] == pytest.approx(0.99)

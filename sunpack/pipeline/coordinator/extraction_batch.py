@@ -2,7 +2,7 @@ import os
 from dataclasses import dataclass
 from typing import Any, List
 
-from sunpack.core.contracts.run_context import RunContext
+from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
 from sunpack.core.contracts.content_recovery import (
     CONTENT_REQUIREMENT_COMPLETE,
@@ -98,7 +98,7 @@ class BatchExtractionOutcome:
 class ExtractionBatchRunner:
     def __init__(
         self,
-        context: RunContext,
+        context: RunState,
         extractor: ExtractionScheduler,
         output_scan_policy: NestedOutputScanPolicy,
         config: dict | None = None,
@@ -492,8 +492,8 @@ class ExtractionBatchRunner:
             attempt_index += 1
         return BatchExtractionOutcome(
             result=ExtractionResult(
-                success=False, archive=task.main_path, out_dir=out_dir,
-                all_parts=task.all_parts, error=self.i18n.t("failure.verification_failed"),
+                success=False, out_dir=out_dir,
+                error=self.i18n.t("failure.verification_failed"),
             ), attempts=attempts,
         )
 
@@ -566,20 +566,20 @@ class ExtractionBatchRunner:
 
         with self.context.lock:
             if outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
-                self.context.success_count += 1
                 self.context.processed_keys.add(task.key)
                 self.context.flatten_candidates.add(out_dir)
                 self.context.target_results.append(TargetRunResult(
                     input_path=task.main_path,
                     outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
+                    task_key=task.key,
                     output_dir=out_dir,
                     verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
                 ))
                 return out_dir
             if outcome.outcome_kind == OutcomeKind.PARTIAL_SUCCESS:
+                recovery = None
                 if outcome.verification is not None:
-                    self.context.partial_success_count += 1
-                    self.context.recovered_outputs.append({
+                    recovery = {
                         "archive": task.main_path,
                         "out_dir": out_dir,
                         "completeness": outcome.verification.completeness,
@@ -594,13 +594,12 @@ class ExtractionBatchRunner:
                             if possible_missing_volume is not None
                             else {}
                         ),
-                    })
-                if possible_missing_volume is not None:
-                    self.context.failures.append(possible_missing_volume)
+                    }
                 self.context.processed_keys.add(task.key)
                 self.context.target_results.append(TargetRunResult(
                     input_path=task.main_path,
                     outcome_kind=OutcomeKind.PARTIAL_SUCCESS,
+                    task_key=task.key,
                     output_dir=out_dir,
                     verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
                     error=(
@@ -609,18 +608,18 @@ class ExtractionBatchRunner:
                         else str(res.error or "")
                     ),
                     failure=possible_missing_volume,
+                    recovery=recovery,
                 ))
                 return out_dir
-            self.context.failed_tasks.append(self._failure_message(task, outcome))
-            if outcome.result.failure is not None:
-                self.context.failures.append(outcome.result.failure)
             self.context.target_results.append(TargetRunResult(
                 input_path=task.main_path,
                 outcome_kind=OutcomeKind.FAILURE,
+                task_key=task.key,
                 output_dir=out_dir,
                 verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
                 error=str(res.error or ""),
                 failure=outcome.result.failure,
+                failure_message=self._failure_message(task, outcome),
             ))
             return None
 

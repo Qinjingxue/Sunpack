@@ -23,10 +23,11 @@ def test_archive_embedded_in_middle_is_found_by_selected_embedded_deep_scan(tmp_
 
     assert len(detected) == 1
     resolved = detected[0]
-    assert resolved.source == "embedded"
-    assert resolved.format == archive_format
-    assert resolved.segments[0].format == archive_format
-    assert resolved.segments[0].start_offset == len(prefix)
+    assert resolved.discovery_source == "embedded"
+    assert resolved.archive_input().format_hint == archive_format
+    segment = resolved.knowledge().get("source.selected_segment")
+    assert segment["format"] == archive_format
+    assert segment["start_offset"] == len(prefix)
 
 
 @pytest.mark.skipif(get_optional_rar() is None, reason="RAR generator is not configured")
@@ -43,10 +44,10 @@ def test_header_encrypted_rar_is_confirmed_from_crc_valid_encryption_header(tmp_
 
     assert len(detected) == 1
     resolved = detected[0]
-    assert resolved.source == "relations"
-    assert resolved.format == "rar"
-    assert resolved.evidence.get("relation_confirmed") is True
-    assert resolved.evidence.get("needs_password") is True
+    assert resolved.discovery_source == "relations"
+    assert resolved.archive_input().format_hint == "rar"
+    assert resolved.knowledge().get("discovery.evidence.relation_confirmed") is True
+    assert resolved.knowledge().get("discovery.evidence.needs_password") is True
 
 
 def test_header_encrypted_rar4_primary_uses_relations_identity(tmp_path):
@@ -61,12 +62,12 @@ def test_header_encrypted_rar4_primary_uses_relations_identity(tmp_path):
 
     result = ArchiveTaskProvider(detection_pipeline_config()).discover_targets([str(path)])
 
-    assert len(result.resolved_inputs) == 1
-    resolved = result.resolved_inputs[0]
-    assert resolved.source == "relations"
-    assert resolved.format == "rar"
-    assert resolved.evidence.get("needs_password") is True
-    assert resolved.evidence.get("relation_confirmed") is True
+    assert len(result.resolved_tasks) == 1
+    resolved = result.resolved_tasks[0]
+    assert resolved.discovery_source == "relations"
+    assert resolved.archive_input().format_hint == "rar"
+    assert resolved.knowledge().get("discovery.evidence.needs_password") is True
+    assert resolved.knowledge().get("discovery.evidence.relation_confirmed") is True
 
 
 def test_signature_bytes_without_valid_structure_are_not_accepted(tmp_path):

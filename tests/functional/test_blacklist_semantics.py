@@ -29,8 +29,8 @@ def scan_config(blocked_files=None, blocked_extensions=None):
 def decisions_for(root: Path, config: dict):
     result = ArchiveTaskProvider(config).discover_targets([str(root)])
     return {
-        Path(item.entry_path).relative_to(root).as_posix(): item
-        for item in result.resolved_inputs
+        Path(item.main_path).relative_to(root).as_posix(): item
+        for item in result.resolved_tasks
     }
 
 

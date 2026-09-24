@@ -15,7 +15,7 @@ def write_extraction_result(task: ArchiveTask, result: ExtractionResult, *, phas
         diagnostics = _compact_diagnostics(dict(result.diagnostics or {}))
         worker = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
         payload = {
-            "result": _result_payload(result),
+            "result": _result_payload(task, result),
             "diagnostics": diagnostics,
             "failure": _failure_payload(result, worker),
             "progress_manifest": _compact_progress_manifest(result.progress_manifest_payload or {}),
@@ -44,12 +44,12 @@ def write_extraction_result(task: ArchiveTask, result: ExtractionResult, *, phas
         commit_task_knowledge(task, knowledge, phase_timer=phase_timer, phase_prefix=f"{phase_prefix}_commit")
 
 
-def _result_payload(result: ExtractionResult) -> dict[str, Any]:
+def _result_payload(task: ArchiveTask, result: ExtractionResult) -> dict[str, Any]:
     return {
         "success": bool(result.success),
-        "archive": result.archive,
+        "archive": task.main_path,
         "out_dir": result.out_dir,
-        "all_parts": list(result.all_parts or []),
+        "all_parts": list(task.all_parts),
         "error": result.error,
         "password_used": result.password_used,
         "selected_codepage": result.selected_codepage,

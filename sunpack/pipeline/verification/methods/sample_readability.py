@@ -1,6 +1,6 @@
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.registry import register_verification_method
-from sunpack.core.contracts.verification import FileVerificationObservation, VerificationIssue, VerificationStepResult
+from sunpack.core.contracts.verification import FileVerificationObservation, VerificationIssue, VerificationStep
 
 from sunpack_native import sample_directory_readability as _sample_directory_readability
 from sunpack.pipeline.verification.methods._output_stats import output_inventory_for_evidence
@@ -10,14 +10,14 @@ from sunpack.pipeline.verification.methods._output_stats import output_inventory
 class SampleReadabilityMethod:
     name = "sample_readability"
 
-    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStepResult:
+    def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
         inventory = output_inventory_for_evidence(evidence)
         if (
             inventory.worker_inventory_complete and inventory.identity_paths
             and inventory.worker_crc_available
             and inventory.all_crc_ok()
         ):
-            return VerificationStepResult(method=self.name, status="skipped", issues=[VerificationIssue(
+            return VerificationStep(method=self.name, status="skipped", issues=[VerificationIssue(
                 method=self.name, code="info.worker_output_already_verified",
                 message="Complete worker CRC inventory makes sample rereads unnecessary",
                 path=evidence.output_dir,
@@ -28,7 +28,7 @@ class SampleReadabilityMethod:
 
         status = str(sample.get("status") or "")
         if status != "ok":
-            return VerificationStepResult(method=self.name, status="skipped")
+            return VerificationStep(method=self.name, status="skipped")
 
         total_files = int(sample.get("total_files", 0) or 0)
         sampled_files = int(sample.get("sampled_files", 0) or 0)
@@ -38,7 +38,7 @@ class SampleReadabilityMethod:
         errors = list(sample.get("errors") or [])
         samples = [item for item in sample.get("samples") or [] if isinstance(item, dict)]
         if total_files <= 0 or sampled_files <= 0:
-            return VerificationStepResult(method=self.name, status="skipped")
+            return VerificationStep(method=self.name, status="skipped")
 
         issues: list[VerificationIssue] = []
         if unreadable_files:
@@ -76,7 +76,7 @@ class SampleReadabilityMethod:
             ))
 
         if not issues:
-            return VerificationStepResult(
+            return VerificationStep(
                 method=self.name,
                 status="passed",
                 completeness_hint=1.0,
@@ -96,7 +96,7 @@ class SampleReadabilityMethod:
                     },
                 )],
             )
-        return VerificationStepResult(
+        return VerificationStep(
             method=self.name,
             status="warning",
             issues=issues,

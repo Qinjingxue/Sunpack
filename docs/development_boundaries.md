@@ -55,7 +55,7 @@ sunpack.runtime.watch
 | Watch | `sunpack.runtime.watch.runtime.run_watch_service` | Long-running Watch service entry point. |
 | Configuration | `sunpack.core.config.loader.load_config` / `sunpack.core.config.schema` | Configuration loading and normalization. |
 | Application configuration checks | `sunpack.runtime.config_validation.validate_config_payload` | Checks config against registered pipeline capabilities. |
-| Contracts | `sunpack.core.contracts.*` | Shared data structures, including `RunContext`. |
+| Contracts | `sunpack.core.contracts.*` | Shared data structures, including `RunState` and `RunSummary`. |
 | Filesystem discovery | `sunpack.pipeline.discovery.filesystem.directory_scanner.DirectoryScanner` | Directory scanning and filtering. |
 | Relations discovery | `sunpack.pipeline.discovery.relations.RelationsScheduler` | Volumes, candidate groups, logical names, and volume-member queries. |
 | Detection | `sunpack.pipeline.discovery.detection.DetectionScheduler` | Rule decisions over candidate facts. |
@@ -81,7 +81,7 @@ sunpack.runtime.watch
 
 ### core.contracts
 
-`sunpack.core.contracts` is the shared data contract layer. `DiscoveryCandidate`, `ResolvedArchiveInput`, `StageResult`, `ArchiveTask`, `ExtractionResult`, `VerificationResult`, and `RunContext` belong here. Discovery stages exchange typed contracts; task-local mutable knowledge stays behind `ArchiveTask`.
+`sunpack.core.contracts` is the shared data contract layer. Discovery produces `ArchiveTask` directly through `StageResult.resolved_tasks`; `DiscoveryCandidate` is a short-lived hint and `ArchiveInputDescriptor` owns the physical input. Parts and concatenated inputs use `InputExtent` for byte ranges. `ArchiveTask` owns archive knowledge and runtime state. Extraction and verification return `ExtractionResult` and `VerificationResult`, and verification methods return the same `VerificationStep` type stored in the result. `RunState.snapshot()` produces `RunSummary`, whose counts and failures come from `TargetRunResult` entries.
 
 ### pipeline.discovery.filesystem
 
@@ -133,7 +133,7 @@ The rule layer must not depend on processor implementation details; shared defau
 
 ### pipeline.postprocess
 
-`sunpack.pipeline.postprocess` only handles cleanup and flattening after success. It may accept `sunpack.core.contracts.RunContext` to consume successful archives and flattening candidates, but `sunpack.pipeline.postprocess.internal` does not depend on the coordinator.
+`sunpack.pipeline.postprocess` only handles cleanup and flattening after success. The coordinator passes explicit cleanup and flattening paths to its public actions; `sunpack.pipeline.postprocess.internal` does not depend on the coordinator.
 
 ### pipeline.coordinator
 

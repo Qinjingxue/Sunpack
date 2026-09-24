@@ -1,16 +1,16 @@
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
 
 
 def _candidate(path: str, format_hint: str = "") -> DiscoveryCandidate:
     return DiscoveryCandidate(
-        entry_path=path,
-        member_paths=(path,),
-        logical_name=path.rsplit("/", 1)[-1],
+        archive_input=ArchiveInputDescriptor.from_parts(
+            archive_path=path, logical_name=path.rsplit("/", 1)[-1], format_hint=format_hint,
+        ),
         carrier_path=path,
         cleanup_paths=(path,),
         route="detection",
-        format_hint=format_hint,
     )
 
 

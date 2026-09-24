@@ -3,8 +3,7 @@ from __future__ import annotations
 from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveInputPart,
-    ArchiveInputRange,
-    ArchiveInputSegment,
+    InputExtent,
 )
 from sunpack.pipeline.discovery.relations.internal.models import CandidateGroup
 
@@ -32,7 +31,7 @@ def archive_input_for_group(group: CandidateGroup) -> ArchiveInputDescriptor | N
             and int(metadata["expected_logical_size"]) > structure_offset
             else None
         )
-        archive_range = ArchiveInputRange(
+        extent = InputExtent(
             path=group.entry_path,
             start=structure_offset,
             end=range_end,
@@ -44,16 +43,11 @@ def archive_input_for_group(group: CandidateGroup) -> ArchiveInputDescriptor | N
             logical_name=group.logical_name,
             parts=[
                 ArchiveInputPart(
-                    path=group.entry_path,
+                    extent=extent,
                     role="main",
-                    range=archive_range,
                 )
             ],
-            segment=ArchiveInputSegment(
-                start=structure_offset,
-                end=range_end,
-                source="relations",
-            ),
+            analysis={"segment_source": "relations"},
         )
 
     return ArchiveInputDescriptor.from_parts(

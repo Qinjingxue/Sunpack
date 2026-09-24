@@ -1,24 +1,22 @@
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.registry import register_verification_method
 from sunpack.core.contracts.verification import (
-    ArchiveCoverageSummary,
+    ArchiveCoverage,
     FileVerificationObservation,
     VerificationIssue,
     VerificationResult,
-    VerificationStepRecord,
-    VerificationStepResult,
+    VerificationStep,
 )
 from sunpack.pipeline.verification.scheduler import VerificationScheduler
 
 
 __all__ = [
     "VerificationEvidence",
-    "ArchiveCoverageSummary",
+    "ArchiveCoverage",
     "FileVerificationObservation",
     "VerificationIssue",
     "VerificationResult",
     "VerificationScheduler",
-    "VerificationStepRecord",
-    "VerificationStepResult",
+    "VerificationStep",
     "register_verification_method",
 ]

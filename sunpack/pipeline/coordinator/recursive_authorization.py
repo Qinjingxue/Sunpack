@@ -6,16 +6,17 @@ from typing import Any
 
 from sunpack_native import authorize_nested_candidates as _NATIVE_AUTHORIZE_NESTED_CANDIDATES
 
+from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.core.support.path_keys import normalized_path, safe_relative_path
 
 @dataclass(frozen=True)
 class AuthorizationBatch:
-    allowed_inputs: list[Any]
+    allowed_tasks: list[ArchiveTask]
     skipped: list[dict[str, Any]]
 
 class RecursiveAuthorization:
-    """Authorize resolved archive inputs from raw filesystem context."""
+    """Authorize discovered archive tasks from raw filesystem context."""
 
     def __init__(self, config: dict[str, Any]):
         raw = config.get("recursive_authorization", {})
@@ -23,7 +24,7 @@ class RecursiveAuthorization:
 
     def authorize_batch(
         self,
-        tasks: list[Any],
+        tasks: list[ArchiveTask],
         scan_roots: list[str],
         scan_session: DiscoveryScanSession | None,
         *,
@@ -47,21 +48,21 @@ class RecursiveAuthorization:
         )
 
         allowed_ids: set[int] = set()
-        grouped: dict[str, list[Any]] = {}
+        grouped: dict[str, list[ArchiveTask]] = {}
         skipped: list[dict[str, Any]] = []
         for task in tasks:
             root = next(
                 (
                     candidate_root
                     for candidate_root in directory_roots
-                    if safe_relative_path(_entry_path(task), candidate_root) is not None
+                    if safe_relative_path(task.main_path, candidate_root) is not None
                 ),
                 None,
             )
             if root is None:
                 skipped.append({
-                    "path": _entry_path(task),
-                    "task_key": _item_key(task),
+                    "path": task.main_path,
+                    "task_key": task.key,
                     "round": round_index,
                     "policy": "recursive_authorization",
                     "allowed": False,
@@ -74,8 +75,8 @@ class RecursiveAuthorization:
             snapshot = scan_session.snapshot_for_directory(root)
             candidates = [
                 (
-                    _entry_path(task),
-                    _member_paths(task),
+                    task.main_path,
+                    task.all_parts,
                 )
                 for task in root_tasks
             ]
@@ -98,27 +99,14 @@ class RecursiveAuthorization:
                     allowed_ids.add(id(task))
                     continue
                 skipped.append({
-                    "path": _entry_path(task),
-                    "task_key": _item_key(task),
+                    "path": task.main_path,
+                    "task_key": task.key,
                     "round": round_index,
                     "policy": "recursive_authorization",
                     **row,
                 })
 
         return AuthorizationBatch(
-            allowed_inputs=[task for task in tasks if id(task) in allowed_ids],
+            allowed_tasks=[task for task in tasks if id(task) in allowed_ids],
             skipped=skipped,
         )
-
-
-def _entry_path(item: Any) -> str:
-    return str(getattr(item, "entry_path", None) or item.main_path)
-
-
-def _member_paths(item: Any) -> list[str]:
-    paths = getattr(item, "member_paths", None)
-    return list(paths if paths is not None else item.all_parts or [_entry_path(item)])
-
-
-def _item_key(item: Any) -> str:
-    return str(getattr(item, "key", None) or _entry_path(item))

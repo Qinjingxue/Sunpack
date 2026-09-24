@@ -34,8 +34,8 @@ class DetectionPipelineTests(unittest.TestCase):
             archive_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)
 
             result = ArchiveTaskProvider(minimal_config()).discover_targets([str(archive_path)])
-            self.assertEqual(len(result.resolved_inputs), 1)
-            self.assertEqual(result.resolved_inputs[0].source, "relations")
+            self.assertEqual(len(result.resolved_tasks), 1)
+            self.assertEqual(result.resolved_tasks[0].discovery_source, "relations")
 
     def test_archive_task_keeps_physical_path_and_exposes_format_hint(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -55,7 +55,7 @@ sunpack.runtime.watch
 | Watch | `sunpack.runtime.watch.runtime.run_watch_service` | 长期运行的 Watch 服务入口。 |
 | 配置 | `sunpack.core.config.loader.load_config` / `sunpack.core.config.schema` | 配置读取和归一化。 |
 | 应用配置校验 | `sunpack.runtime.config_validation.validate_config_payload` | 校验配置与 pipeline 注册能力是否匹配。 |
-| 契约 | `sunpack.core.contracts.*` | 共享数据结构，包括 `RunContext`。 |
+| 契约 | `sunpack.core.contracts.*` | 共享数据结构，包括 `RunState` 与 `RunSummary`。 |
 | 文件系统发现 | `sunpack.pipeline.discovery.filesystem.directory_scanner.DirectoryScanner` | 目录扫描和过滤。 |
 | 关系发现 | `sunpack.pipeline.discovery.relations.RelationsScheduler` | 分卷、候选组、逻辑名和分卷成员查询。 |
 | 检测 | `sunpack.pipeline.discovery.detection.DetectionScheduler` | 根据候选 facts 做规则判断。 |
@@ -81,7 +81,7 @@ sunpack.runtime.watch
 
 ### core.contracts
 
-`sunpack.core.contracts` 是共享数据契约层。`DiscoveryCandidate`、`ResolvedArchiveInput`、`StageResult`、`ArchiveTask`、`ExtractionResult`、`VerificationResult` 和 `RunContext` 放在这里。Discovery 阶段通过类型化契约交换数据，任务级可变知识封装在 `ArchiveTask` 内。
+`sunpack.core.contracts` 是共享数据契约层。Discovery 通过 `StageResult.resolved_tasks` 直接产出 `ArchiveTask`；`DiscoveryCandidate` 只保存短期线索，`ArchiveInputDescriptor` 拥有物理输入。分卷部件与拼接输入统一用 `InputExtent` 表示字节区间。`ArchiveTask` 拥有归档知识与运行时状态。解压、验证分别返回 `ExtractionResult`、`VerificationResult`，验证方法返回的 `VerificationStep` 直接保存在结果中。`RunState.snapshot()` 生成 `RunSummary`，计数与失败从 `TargetRunResult` 投影。
 
 ### pipeline.discovery.filesystem
 
@@ -133,7 +133,7 @@ sunpack.runtime.watch
 
 ### pipeline.postprocess
 
-`sunpack.pipeline.postprocess` 只处理成功后的清理和扁平化。它可以接收 `sunpack.core.contracts.RunContext` 来消费成功归档和扁平化候选，但 `sunpack.pipeline.postprocess.internal` 不依赖 coordinator。
+`sunpack.pipeline.postprocess` 只处理成功后的清理和扁平化。Coordinator 向公开动作显式传入清理和扁平化路径；`sunpack.pipeline.postprocess.internal` 不依赖 coordinator。
 
 ### pipeline.coordinator
 
