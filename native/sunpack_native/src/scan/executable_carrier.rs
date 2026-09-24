@@ -19,8 +19,9 @@ const SEVEN_ZIP_SFX_MARKERS: &[&[u8]] = &[
     b"7\0-\0Z\0i\0p\0 \0s\0e\0l\0f\0-\0e\0x\0t\0r\0a\0c\0t\0i\0n\0g\0 \0a\0r\0c\0h\0i\0v\0e\0",
 ];
 const WINRAR_SFX_MARKERS: &[&[u8]] = &[
-    b"WinRAR",
-    b"W\0i\0n\0R\0A\0R\0",
+    b"WinRAR SFX",
+    b"RAR decompression sfx archive",
+    b"W\0i\0n\0R\0A\0R\0 \0S\0F\0X\0",
 ];
 const SQUIRREL_AWARE_VERSION_UTF16: &[u8] =
     b"S\0q\0u\0i\0r\0r\0e\0l\0A\0w\0a\0r\0e\0V\0e\0r\0s\0i\0o\0n\0";
@@ -282,7 +283,7 @@ mod tests {
 
     #[test]
     fn identifies_winrar_sfx_stub_from_pe_image_marker() {
-        let mut data = b"MZ WinRAR".to_vec();
+        let mut data = b"MZ WinRAR SFX".to_vec();
         data.resize(256, 0);
         let path = temp_file("winrar_sfx_stub", &data);
         assert_eq!(
