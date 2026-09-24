@@ -62,7 +62,6 @@ def test_planning_does_not_label_single_truncated_7z_as_missing_volume():
         archive_path="payload.7z",
         format_hint="7z",
     )
-    state = ArchiveState.from_archive_input(descriptor)
     evidence = ArchiveFormatEvidence(
         format="7z",
         confidence=0.80,
@@ -82,4 +81,4 @@ def test_planning_does_not_label_single_truncated_7z_as_missing_volume():
         selected=[],
     )
 
-    assert ArchiveInputPlanningStage._execution_analysis_for_report(state, report) == {}
+    assert ArchiveInputPlanningStage._execution_analysis_for_report(descriptor, report) == {}

@@ -131,19 +131,13 @@ def _task(
 ) -> ArchiveTask:
     all_parts = [str(item) for item in (parts or [path])]
     task = direct_file_task(str(path), all_parts=all_parts)
-    state = task.archive_state()
-    descriptor = (
-        replace(state.archive_input, format_hint=detected_ext)
-        if detected_ext
-        else state.archive_input
-    )
-    planning_analysis = dict(state.planning_analysis)
+    descriptor = task.archive_input()
+    analysis = dict(descriptor.analysis)
     if missing_volume_evidence:
-        planning_analysis["execution"] = {"missing_volume_evidence": missing_volume_evidence}
-    if descriptor != state.archive_input or planning_analysis != state.planning_analysis:
-        task.set_archive_state(replace(
-            state,
-            archive_input=descriptor,
-            planning_analysis=planning_analysis,
-        ))
+        analysis["execution"] = {"missing_volume_evidence": missing_volume_evidence}
+    task.set_archive_input(replace(
+        descriptor,
+        format_hint=detected_ext or descriptor.format_hint,
+        analysis=analysis,
+    ))
     return task
