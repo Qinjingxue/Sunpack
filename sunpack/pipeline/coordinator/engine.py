@@ -11,7 +11,7 @@ from typing import Any, Callable, Iterable, TextIO
 
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse, PipelineTarget
-from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind
+from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, TargetRunResult
 from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.extraction_batch import ExtractionBatchRunner
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
@@ -320,9 +320,15 @@ class _CoalescedWatchRequest(RuntimeError):
 
 
 class _PathLeaseRegistry:
+    _COMPLETED_WATCH_LIMIT = 4096
+
     def __init__(self):
         self._owned: dict[str, set[str]] = {}
         self._ownership_versions: dict[str, tuple[tuple[str, int, int, int, int], ...]] = {}
+        self._completed_watch_generations: dict[
+            tuple[str, ...],
+            tuple[tuple[tuple[str, int, int, int, int], ...], str],
+        ] = {}
         self._changed = asyncio.Condition()
 
     async def acquire(self, owner: str, paths: Iterable[str]) -> None:
@@ -374,6 +380,60 @@ class _PathLeaseRegistry:
             self._ownership_versions.pop(owner, None)
             if released is not None:
                 self._changed.notify_all()
+
+    def ownership_version_for(
+        self,
+        owner: str,
+        paths: Iterable[str],
+    ) -> tuple[tuple[str, int, int, int, int], ...]:
+        """Project one task's byte generation from the already-computed Watch lease."""
+        owned_version = self._ownership_versions.get(owner, ())
+        if not owned_version:
+            return ()
+        keys = {
+            path_key(os.path.abspath(os.path.normpath(path)))
+            for path in paths
+            if path
+        }
+        if not keys:
+            return ()
+        selected = tuple(row for row in owned_version if row[0] in keys)
+        return selected if len(selected) == len(keys) else ()
+
+    def completed_watch_output(
+        self,
+        ownership_version: tuple[tuple[str, int, int, int, int], ...],
+    ) -> str:
+        """Return the prior output only for the exact unchanged physical generation."""
+        if not ownership_version:
+            return ""
+        key = tuple(row[0] for row in ownership_version)
+        record = self._completed_watch_generations.get(key)
+        if record is None:
+            return ""
+        recorded_version, output_dir = record
+        if recorded_version != ownership_version or not output_dir or not os.path.isdir(output_dir):
+            self._completed_watch_generations.pop(key, None)
+            return ""
+        # Refresh insertion order so the bounded map behaves as a tiny LRU.
+        self._completed_watch_generations.pop(key, None)
+        self._completed_watch_generations[key] = record
+        return output_dir
+
+    def remember_completed_watch(
+        self,
+        ownership_version: tuple[tuple[str, int, int, int, int], ...],
+        output_dir: str,
+    ) -> None:
+        if not ownership_version or not output_dir:
+            return
+        key = tuple(row[0] for row in ownership_version)
+        record = (ownership_version, os.path.abspath(os.path.normpath(output_dir)))
+        self._completed_watch_generations.pop(key, None)
+        self._completed_watch_generations[key] = record
+        while len(self._completed_watch_generations) > self._COMPLETED_WATCH_LIMIT:
+            oldest = next(iter(self._completed_watch_generations))
+            self._completed_watch_generations.pop(oldest, None)
 
     def _exact_owner(
         self,
@@ -850,6 +910,42 @@ class _RequestRuntime:
                 )
                 if coalesced_owner:
                     raise _CoalescedWatchRequest(coalesced_owner)
+
+                watch_versions: dict[str, tuple[tuple[str, int, int, int, int], ...]] = {}
+                if submission.origin == "watch":
+                    reusable_ids: set[int] = set()
+                    reusable_results: list[TargetRunResult] = []
+                    for task in tasks:
+                        part_paths = tuple(task.archive_input().part_paths())
+                        if len(part_paths) < 2:
+                            continue
+                        version = self.path_leases.ownership_version_for(request_id, part_paths)
+                        if not version:
+                            continue
+                        watch_versions[path_key(task.main_path)] = version
+                        carrier = str(task.carrier_path or "")
+                        part_keys = {path_key(path) for path in part_paths}
+                        if not carrier or path_key(carrier) in part_keys:
+                            continue
+                        completed_output = self.path_leases.completed_watch_output(version)
+                        if not completed_output:
+                            continue
+                        reusable_ids.add(id(task))
+                        reusable_results.append(TargetRunResult(
+                            input_path=task.main_path,
+                            outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
+                            task_key=task.key,
+                            output_dir=completed_output,
+                            verification={"reused_completed_generation": True},
+                        ))
+                    if reusable_results:
+                        with self.context.lock:
+                            self.context.target_results.extend(reusable_results)
+                            self.context.processed_keys.update(
+                                result.task_key for result in reusable_results if result.task_key
+                            )
+                        tasks = [task for task in tasks if id(task) not in reusable_ids]
+
                 self.batch_runner.set_progress_round(
                     round_index,
                     direct=submission.direct and round_index == 1,
@@ -864,8 +960,19 @@ class _RequestRuntime:
                     ensure_input_lease=self._ensure_task_lease,
                     cleanup_scope=self.cleanup_scope,
                 )
+                executed_results = self.context.target_results[before_results:]
+                if submission.origin == "watch" and watch_versions:
+                    for result in executed_results:
+                        if result.outcome_kind != OutcomeKind.COMPLETE_SUCCESS:
+                            continue
+                        version = watch_versions.get(path_key(result.input_path), ())
+                        if version:
+                            self.path_leases.remember_completed_watch(
+                                version,
+                                result.output_dir,
+                            )
                 next_scan_session = self.output_scan_policy.take_scan_session(new_roots)
-                ownership.remember_results(self.context.target_results[before_results:])
+                ownership.remember_results(executed_results)
                 if not recursion.should_continue(round_index, bool(new_roots)):
                     break
                 if recursion.mode == "prompt" and not await broker.run(
