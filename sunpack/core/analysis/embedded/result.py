@@ -27,9 +27,7 @@ class EmbeddedCandidate:
     validation: str
     candidate_kind: str
     boundary_kind: str
-    range_end_offset: int | None
     extractable: bool
-    contained_anchor_count: int
 
     @property
     def password_required(self) -> bool:
@@ -47,9 +45,7 @@ class EmbeddedCandidate:
             "validation": self.validation,
             "candidate_kind": self.candidate_kind,
             "boundary_kind": self.boundary_kind,
-            "range_end_offset": self.range_end_offset,
             "extractable": self.extractable,
-            "contained_anchor_count": self.contained_anchor_count,
         }
 
 
