@@ -43,10 +43,12 @@ class ArchiveTaskProvider:
             session=session,
             config=self.config,
         )
-        return self.discovery.discover(
+        result = self.discovery.discover(
             candidates,
             is_recursive_scan=is_recursive_scan,
         )
+        self._record_discovery_failures(result)
+        return result
 
     def scan_targets(
         self,
@@ -63,7 +65,6 @@ class ArchiveTaskProvider:
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
         )
-        self._record_discovery_failures(discovered)
         return self.filter_processed_tasks(
             discovered.resolved_tasks,
             processed_keys=processed_keys,
