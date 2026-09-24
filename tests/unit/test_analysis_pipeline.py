@@ -250,7 +250,8 @@ def test_zip_embedded_local_header_without_eocd_keeps_embedded_start(tmp_path):
 def test_zip_embedded_boundary_defers_payload_integrity(tmp_path):
     data = bytearray(_zip_bytes(tmp_path))
     data[14] ^= 0xFF
-    path = _write_bytes(tmp_path / "crc_bad.zip", bytes(data))
+    prefix = b"carrier-prefix"
+    path = _write_bytes(tmp_path / "crc_bad_carrier.bin", prefix + bytes(data))
 
     zip_evidence = {
         item.format: item
@@ -258,7 +259,8 @@ def test_zip_embedded_boundary_defers_payload_integrity(tmp_path):
     }["zip"]
 
     assert zip_evidence.status == "extractable"
-    assert zip_evidence.segments[0].end_offset == len(data)
+    assert zip_evidence.segments[0].start_offset == len(prefix)
+    assert zip_evidence.segments[0].end_offset == len(prefix) + len(data)
     assert "content_integrity_bad_or_unknown" not in zip_evidence.segments[0].damage_flags
     assert zip_evidence.details["integrity_confidence"] == "deferred"
 
@@ -444,6 +446,14 @@ def test_7z_next_header_damage_does_not_trigger_embedded_revalidation(tmp_path):
     assert "directory_integrity_bad_or_unknown" not in seven.segments[0].damage_flags
     assert seven.details["integrity_confidence"] == "deferred"
 
+@pytest.mark.parametrize(
+    ("extension", "build_data", "split_at", "expected_format", "confidence"),
+    [
+        ("zip", _zip_bytes, 37, "zip", 0.99),
+        ("7z", lambda _tmp_path: _seven_zip_bytes(), 20, "7z", 0.97),
+    ],
+    ids=["zip", "seven-zip"],
+)
 def test_analysis_scheduler_uses_structure_for_clean_archives_across_split_volumes(
     tmp_path, extension, build_data, split_at, expected_format, confidence
 ):
