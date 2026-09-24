@@ -1163,30 +1163,36 @@ $metadata = @(
 [System.IO.File]::WriteAllLines($versionFilePath, $metadata)
 
 if ($processArch -eq $buildArch) {
-    # The packaged runtime keeps its writable data under %ProgramData%\SunPack.
-    # The installer seeds the missing data files there, so a machine that never
-    # ran the installer needs the same seed before the smoke tests can execute
-    # the packaged build. Existing data is never overwritten.
-    $packagedDataRoot = Join-Path $env:ProgramData "SunPack"
-    New-Item -ItemType Directory -Path $packagedDataRoot -Force | Out-Null
-    foreach ($seedPath in @($distConfigPath, $distPasswordPath)) {
-        $dataPath = Join-Path $packagedDataRoot (Split-Path -Leaf $seedPath)
-        if (-not (Test-Path -LiteralPath $dataPath)) {
-            Copy-Item -LiteralPath $seedPath -Destination $dataPath
-        }
-    }
-
-    Write-Step "Running packaged smoke tests"
+    # Packaged smoke tests must not inherit a developer machine's persistent
+    # %ProgramData%\SunPack configuration. In particular, an older config can
+    # legitimately contain schema fields removed by the current build and must
+    # not turn a valid package into a false build failure.
+    $originalProgramData = $env:ProgramData
+    $smokeProgramDataRoot = Join-Path $buildRoot ("smoke-program-data-" + [guid]::NewGuid().ToString("N"))
+    $env:ProgramData = $smokeProgramDataRoot
     try {
-        Invoke-Native -FilePath $distExePath -Arguments @("--help")
-        Invoke-Native -FilePath $distExePath -Arguments @("passwords", "--json")
-        Invoke-Native -FilePath $distExePath -Arguments @("inspect", (Join-Path $repoRoot "tests"), "--json")
-        Invoke-Native -FilePath $distExePath -Arguments @("config", "validate", "--json")
+        $packagedDataRoot = Join-Path $env:ProgramData "SunPack"
+        New-Item -ItemType Directory -Path $packagedDataRoot -Force | Out-Null
+        foreach ($seedPath in @($distConfigPath, $distPasswordPath)) {
+            $dataPath = Join-Path $packagedDataRoot (Split-Path -Leaf $seedPath)
+            Copy-Item -LiteralPath $seedPath -Destination $dataPath -Force
+        }
+
+        Write-Step "Running packaged smoke tests"
+        try {
+            Invoke-Native -FilePath $distExePath -Arguments @("--help")
+            Invoke-Native -FilePath $distExePath -Arguments @("passwords", "--json")
+            Invoke-Native -FilePath $distExePath -Arguments @("inspect", (Join-Path $repoRoot "tests"), "--json")
+            Invoke-Native -FilePath $distExePath -Arguments @("config", "validate", "--json")
+        } finally {
+            # Every launcher request may start the packaged persistent runtime.
+            # Shut it down while PROGRAMDATA still points at the smoke sandbox.
+            Invoke-Native -FilePath $distExePath -Arguments @("--persistent-shutdown")
+            Wait-ExecutableExit -ExecutablePath $distRuntimeExePath
+        }
     } finally {
-        # Every launcher request may start the packaged persistent runtime.
-        # Shut it down so local builds do not leave a packaged background process behind.
-        Invoke-Native -FilePath $distExePath -Arguments @("--persistent-shutdown")
-        Wait-ExecutableExit -ExecutablePath $distRuntimeExePath
+        $env:ProgramData = $originalProgramData
+        Remove-Item -LiteralPath $smokeProgramDataRoot -Recurse -Force -ErrorAction SilentlyContinue
     }
 } else {
     Write-Step "Skipping packaged smoke tests"
