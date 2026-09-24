@@ -161,20 +161,26 @@ def test_analysis_respects_shared_embedded_scan_switch(tmp_path):
     assert report.prepass.get("source") != "embedded_scan"
 
 
-def test_analysis_requires_candidate_embedded_scan_authorization(tmp_path, monkeypatch):
+def test_analysis_reuses_explicit_prepass_without_shared_rescan(tmp_path, monkeypatch):
     prefix = b"v" * (2 * 1024 * 1024)
-    path = tmp_path / "unauthorized-middle-payload.mp4"
+    path = tmp_path / "prepassed-middle-payload.mp4"
     path.write_bytes(prefix + _zip_bytes(tmp_path) + prefix)
+    prepass = {
+        "hits": [],
+        "formats": [],
+        "full_scan_complete": True,
+        "full_scan_bytes": path.stat().st_size,
+        "source": "test_prepass",
+    }
 
     def unexpected_scan(*args, **kwargs):
-        raise AssertionError("unauthorized candidates must not enter the embedded scanner")
+        raise AssertionError("explicit complete prepass must bypass the shared scanner")
 
-    monkeypatch.setattr("sunpack.core.analysis.engine.scan_embedded_archives", unexpected_scan)
-    report = AnalysisEngine().analyze_path(str(path), embedded_scan_allowed=False)
+    monkeypatch.setattr(SharedBinaryView, "signature_prepass", unexpected_scan)
+    report = AnalysisEngine().analyze_path(str(path), initial_prepass=prepass)
 
+    assert report.prepass == prepass
     assert report.selected == []
-    assert report.prepass.get("source") != "embedded_scan"
-
 
 def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_path, monkeypatch):
     path = tmp_path / "payload.bin"
@@ -187,7 +193,7 @@ def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_pa
     def unexpected_scan(*args, **kwargs):
         raise AssertionError("complete detection prepass must bypass the shared scanner")
 
-    monkeypatch.setattr("sunpack.core.analysis.engine.scan_embedded_archives", unexpected_scan)
+    monkeypatch.setattr(SharedBinaryView, "signature_prepass", unexpected_scan)
     reused = scheduler.analyze_path(str(path), initial_prepass=first.prepass)
     assert reused.prepass == first.prepass
 
@@ -392,7 +398,6 @@ def test_rar5_header_encrypted_candidate_reuses_scanner_bounded_end(tmp_path):
     report = AnalysisEngine().analyze_path(
         str(path),
         initial_prepass=scan.to_prepass(),
-        embedded_scan_allowed=True,
     )
     segments = {
         (segment.start_offset, segment.end_offset)
