@@ -64,6 +64,23 @@ def test_unconfirmed_single_file_multivolume_hint_reaches_embedded(tmp_path):
     assert result.residual_paths == {path_key(str(first))}
 
 
+def test_unconfirmed_structural_rar_tail_member_is_blocked(tmp_path):
+    tail = tmp_path / "archive.part6.rar"
+    candidate = _candidate(tail, {
+        "format": "rar",
+        "relation_confirmed": False,
+        "multivolume": True,
+        "internal_volume_number": 6,
+        "continuation_from_previous": True,
+        "anchor_roles": ["any_volume", "member"],
+    }, is_split=False)
+
+    result = RelationResolver().resolve([candidate])
+
+    assert result.blocked_paths == {path_key(str(tail))}
+    assert result.residual_paths == set()
+
+
 def test_confirmed_password_required_family_reaches_password_planning(tmp_path):
     first = tmp_path / "encrypted.part1"
     candidate = _candidate(first, {
