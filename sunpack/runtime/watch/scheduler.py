@@ -1420,7 +1420,12 @@ class WatchScheduler:
             or ""
         )
         if coalesced_from:
-            self._retire_claimed_paths(claimed_paths, candidate)
+            # Coalescing transfers execution ownership to another pipeline
+            # request; it is not a terminal result.  In particular, a password
+            # retry may be coalesced with another member of the same split
+            # family.  Retiring claimed paths here would erase the durable
+            # failed_password blocker before the owner reports success or a
+            # replacement blocker.
             self.log.write(
                 "pipeline_request_coalesced",
                 path=candidate.path,
