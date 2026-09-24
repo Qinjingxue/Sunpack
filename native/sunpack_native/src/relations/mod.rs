@@ -1405,16 +1405,12 @@ fn validate_rar_proposal(
                 .and_then(|anchor| anchor.structure_offset)
         })
         .unwrap_or(0);
-    let password = proposal_password(proposal, path_passwords);
     let header_encrypted = proposal.volumes.iter().any(|(path, _, _, _, _)| {
         anchors
             .get(&path.to_ascii_lowercase())
             .is_some_and(|anchor| anchor.encrypted)
     });
     let terminal_proof = if header_encrypted {
-        let Some(password) = password else {
-            return Ok(ProposalStatus::NeedsPassword);
-        };
         let proof_paths = if raw_sfx {
             ordered_paths.clone()
         } else {
@@ -1422,6 +1418,18 @@ fn validate_rar_proposal(
                 return Ok(ProposalStatus::Inconclusive);
             };
             vec![path.clone()]
+        };
+        let password = path_passwords.and_then(|passwords| {
+            proof_paths.iter().find_map(|proof_path| {
+                passwords.iter().find_map(|(path, password)| {
+                    proof_path
+                        .eq_ignore_ascii_case(path)
+                        .then_some(password.as_str())
+                })
+            })
+        });
+        let Some(password) = password else {
+            return Ok(ProposalStatus::NeedsPassword);
         };
         let proof_offset = if raw_sfx { raw_sfx_start_offset } else {
             anchors
