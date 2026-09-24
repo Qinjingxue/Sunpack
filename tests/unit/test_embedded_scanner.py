@@ -31,16 +31,14 @@ def test_shared_embedded_scanner_is_single_flight_per_file_identity(monkeypatch)
                     "validation": "zip_structure",
                     "candidate_kind": "logical_archive",
                     "boundary_kind": "exact",
-                    "range_end_offset": 512,
                     "extractable": True,
-                    "contained_anchor_count": 0,
                 }],
                 "hits": [{"name": "zip_local", "offset": 128}],
                 "read_bytes": 1024,
                 "file_size": 1024,
             }
 
-    clear_cache_namespace("embedded_archive_scan_v3")
+    clear_cache_namespace("embedded_archive_scan_v4")
     monkeypatch.setattr("sunpack.core.analysis.embedded.scanner.get_archive_session", lambda path: Session())
     identity = ("same-file", 1024, 1)
     with ThreadPoolExecutor(max_workers=8) as executor:
