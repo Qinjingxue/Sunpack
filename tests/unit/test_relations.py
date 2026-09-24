@@ -420,3 +420,26 @@ def test_middle_gap_keeps_structured_missing_index(tmp_path):
 
     assert all(group.kind == "file" for group in groups)
     assert all(len(group.input_paths) == 1 for group in groups)
+
+def test_raw_zip_relation_uses_bounded_anchors_not_full_directory_revalidation(tmp_path):
+    archive = tmp_path / "source.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as stream:
+        stream.writestr("payload.txt", "hello")
+    data = bytearray(archive.read_bytes())
+    archive.unlink()
+
+    cd_offset = data.index(b"PK\\x01\\x02")
+    eocd_offset = data.index(b"PK\\x05\\x06")
+    data[cd_offset:cd_offset + 2] = b"XX"
+
+    first = tmp_path / "bounded.zip.001"
+    terminal = tmp_path / "bounded.zip.002"
+    first.write_bytes(data[:eocd_offset])
+    terminal.write_bytes(data[eocd_offset:])
+
+    group = next(group for group in _groups(tmp_path) if group.logical_name == "bounded")
+
+    assert group.kind == "split"
+    assert [Path(path).name for path in group.input_paths] == [first.name, terminal.name]
+    assert group.head_metadata["format"] == "zip"
+    assert group.head_metadata["relation_confirmed"] is True
