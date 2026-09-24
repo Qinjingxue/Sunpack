@@ -303,12 +303,12 @@ fn inspect_compression_stream_identity_impl(
             );
         }
         let evidence = if marker == BLOCK_MAGIC {
-            ["bzip2:magic", "bzip2:block_size", "bzip2:first_block_marker"].as_slice()
+            vec!["bzip2:magic", "bzip2:block_size", "bzip2:first_block_marker"]
         } else {
-            ["bzip2:magic", "bzip2:block_size", "bzip2:end_marker"].as_slice()
+            vec!["bzip2:magic", "bzip2:block_size", "bzip2:end_marker"]
         };
         return compression_identity_result(
-            py, "bzip2", ".bz2", true, file_size, base_bytes_read, true, "", evidence,
+            py, "bzip2", ".bz2", true, file_size, base_bytes_read, true, "", &evidence,
         );
     }
 
@@ -402,7 +402,7 @@ fn inspect_compression_stream_identity_impl(
         if (block_header_offset as u64)
             .checked_add(3)
             .and_then(|value| value.checked_add(stored_size))
-            .is_none_or(|end| end > file_size)
+            .map_or(true, |end| end > file_size)
         {
             return compression_identity_result(
                 py, "zstd", ".zst", true, file_size, base_bytes_read, false,
