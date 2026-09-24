@@ -601,7 +601,7 @@ fn validate_zip_eocd(
     if cd_size > 0 && cd_magic.as_slice() != b"PK\x01\x02" {
         return Ok(None);
     }
-    if !validate_zip_central_directory(
+    if !validate_zip_boundary_evidence(
         file,
         actual_cd_start,
         directory_end,
@@ -616,9 +616,9 @@ fn validate_zip_eocd(
         Some(end),
         1.0,
         if needs_zip64 {
-            "zip64_eocd_central_directory_and_local_links"
+            "zip64_eocd_geometry_and_first_local_link"
         } else {
-            "eocd_central_directory_and_local_links"
+            "eocd_geometry_and_first_local_link"
         },
     )))
 }
@@ -685,67 +685,59 @@ fn parse_zip64_end_records(
     }))
 }
 
-fn validate_zip_central_directory(
+fn validate_zip_boundary_evidence(
     file: &ManagedReader,
     start: u64,
     end: u64,
     archive_offset: u64,
     entries: usize,
 ) -> io::Result<bool> {
-    let mut cursor = start;
-    for _ in 0..entries {
-        let fixed = read_at(file, cursor, 46)?;
-        if fixed.len() != 46 || &fixed[..4] != b"PK\x01\x02" {
-            return Ok(false);
-        }
-        let name_len = u16::from_le_bytes(fixed[28..30].try_into().unwrap()) as u64;
-        let extra_len = u16::from_le_bytes(fixed[30..32].try_into().unwrap()) as u64;
-        let comment_len = u16::from_le_bytes(fixed[32..34].try_into().unwrap()) as u64;
-        let variable_len = name_len
-            .checked_add(extra_len)
-            .and_then(|value| value.checked_add(comment_len));
-        let Some(next) = variable_len.and_then(|value| cursor.checked_add(46 + value)) else {
-            return Ok(false);
-        };
-        if next > end || extra_len > usize::MAX as u64 {
-            return Ok(false);
-        }
-        let compressed = u32::from_le_bytes(fixed[20..24].try_into().unwrap());
-        let uncompressed = u32::from_le_bytes(fixed[24..28].try_into().unwrap());
-        let disk_start = u16::from_le_bytes(fixed[34..36].try_into().unwrap());
-        let local_32 = u32::from_le_bytes(fixed[42..46].try_into().unwrap());
-        let local_offset = if local_32 == u32::MAX {
-            let extra = read_at(file, cursor + 46 + name_len, extra_len as usize)?;
-            let Some(value) = zip64_central_local_offset(
-                &extra,
-                uncompressed == u32::MAX,
-                compressed == u32::MAX,
-                disk_start == u16::MAX,
-            ) else {
-                return Ok(false);
-            };
-            value
-        } else {
-            u64::from(local_32)
-        };
-        let Some(absolute_local) = archive_offset.checked_add(local_offset) else {
-            return Ok(false);
-        };
-        if absolute_local >= start || read_at(file, absolute_local, 4)?.as_slice() != ZIP_LOCAL {
-            return Ok(false);
-        }
-        cursor = next;
+    if entries == 0 {
+        return Ok(start == end);
     }
-    if cursor == end {
-        return Ok(true);
-    }
-    // Optional central-directory digital signature.
-    let signature = read_at(file, cursor, 6)?;
-    if signature.len() != 6 || &signature[..4] != b"PK\x05\x05" {
+    let fixed = read_at(file, start, 46)?;
+    if fixed.len() != 46 || &fixed[..4] != b"PK\x01\x02" {
         return Ok(false);
     }
-    let length = u16::from_le_bytes(signature[4..6].try_into().unwrap()) as u64;
-    Ok(cursor.checked_add(6 + length) == Some(end))
+    let name_len = u16::from_le_bytes(fixed[28..30].try_into().unwrap()) as u64;
+    let extra_len = u16::from_le_bytes(fixed[30..32].try_into().unwrap()) as u64;
+    let comment_len = u16::from_le_bytes(fixed[32..34].try_into().unwrap()) as u64;
+    let Some(first_end) = name_len
+        .checked_add(extra_len)
+        .and_then(|value| value.checked_add(comment_len))
+        .and_then(|value| start.checked_add(46 + value))
+    else {
+        return Ok(false);
+    };
+    if first_end > end || extra_len > usize::MAX as u64 {
+        return Ok(false);
+    }
+
+    let compressed = u32::from_le_bytes(fixed[20..24].try_into().unwrap());
+    let uncompressed = u32::from_le_bytes(fixed[24..28].try_into().unwrap());
+    let disk_start = u16::from_le_bytes(fixed[34..36].try_into().unwrap());
+    if disk_start != 0 && disk_start != u16::MAX {
+        return Ok(false);
+    }
+    let local_32 = u32::from_le_bytes(fixed[42..46].try_into().unwrap());
+    let local_offset = if local_32 == u32::MAX {
+        let extra = read_at(file, start + 46 + name_len, extra_len as usize)?;
+        let Some(value) = zip64_central_local_offset(
+            &extra,
+            uncompressed == u32::MAX,
+            compressed == u32::MAX,
+            disk_start == u16::MAX,
+        ) else {
+            return Ok(false);
+        };
+        value
+    } else {
+        u64::from(local_32)
+    };
+    let Some(absolute_local) = archive_offset.checked_add(local_offset) else {
+        return Ok(false);
+    };
+    Ok(absolute_local < start && read_at(file, absolute_local, 4)?.as_slice() == ZIP_LOCAL)
 }
 
 fn zip64_central_local_offset(
