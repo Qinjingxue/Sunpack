@@ -17,27 +17,24 @@ class ArchiveTask:
     carrier_path: str = ""
     cleanup_parts: list[str] = field(default_factory=list)
     key: str = ""
-    logical_name: str = ""
-    discovery_source: str = ""
+    initial_discovery_source: InitVar[str] = ""
     discovery_evidence: InitVar[dict[str, Any] | None] = None
     discovery_segments: InitVar[tuple[ResolvedArchiveSegment, ...]] = ()
-    discovery_reason: str = ""
+    initial_discovery_reason: InitVar[str] = ""
     runtime: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(
         self,
         _archive_input: ArchiveInputDescriptor,
+        initial_discovery_source: str,
         discovery_evidence: dict[str, Any] | None,
         discovery_segments: tuple[ResolvedArchiveSegment, ...],
+        initial_discovery_reason: str,
     ) -> None:
         descriptor = _archive_input
         if not descriptor.entry_path:
             raise ValueError("ArchiveTask requires an archive input entry path")
-        self.logical_name = str(
-            self.logical_name
-            or descriptor.logical_name
-            or descriptor.entry_path
-        )
+        logical_name = str(descriptor.logical_name or descriptor.entry_path)
         self.carrier_path = str(self.carrier_path or descriptor.entry_path)
         self.cleanup_parts = list(dedupe_values([
             *descriptor.part_paths(),
@@ -46,13 +43,15 @@ class ArchiveTask:
         ]))
         if not self.key:
             self.key = (
-                self.logical_name
+                logical_name
                 if descriptor.open_mode in {"native_volumes", "sfx_with_volumes"}
                 else descriptor.entry_path
             )
         self._knowledge = ArchiveKnowledge()
         self._state = ArchiveState.from_archive_input(descriptor)
         self._initialize_knowledge(
+            discovery_source=str(initial_discovery_source or ""),
+            discovery_reason=str(initial_discovery_reason or ""),
             discovery_evidence=dict(discovery_evidence or {}),
             discovery_segments=tuple(discovery_segments),
         )
@@ -73,11 +72,10 @@ class ArchiveTask:
             _archive_input=descriptor,
             carrier_path=carrier_path or descriptor.entry_path,
             cleanup_parts=list(cleanup_paths),
-            logical_name=descriptor.logical_name,
-            discovery_source=discovery_source,
+            initial_discovery_source=discovery_source,
             discovery_evidence=dict(discovery_evidence or {}),
             discovery_segments=tuple(discovery_segments),
-            discovery_reason=discovery_reason,
+            initial_discovery_reason=discovery_reason,
         )
 
     @classmethod
@@ -96,6 +94,19 @@ class ArchiveTask:
             discovery_segments=resolved.segments,
             discovery_reason=discovery_reason,
         )
+
+    @property
+    def logical_name(self) -> str:
+        descriptor = self.archive_input()
+        return str(descriptor.logical_name or descriptor.entry_path)
+
+    @property
+    def discovery_source(self) -> str:
+        return str(self._knowledge.get("discovery.source", "") or "")
+
+    @property
+    def discovery_reason(self) -> str:
+        return str(self._knowledge.get("discovery.reason", "") or "")
 
     @property
     def main_path(self) -> str:
@@ -131,7 +142,6 @@ class ArchiveTask:
 
     def set_archive_input(self, descriptor: ArchiveInputDescriptor) -> None:
         state = self._state
-        self.logical_name = descriptor.logical_name or self.logical_name
         self.cleanup_parts = list(dedupe_values([
             *descriptor.part_paths(),
             *self.cleanup_parts,
@@ -184,9 +194,6 @@ class ArchiveTask:
         self.carrier_path = replacement.carrier_path
         self.cleanup_parts = list(replacement.cleanup_parts)
         self.key = replacement.key
-        self.logical_name = replacement.logical_name
-        self.discovery_source = replacement.discovery_source
-        self.discovery_reason = replacement.discovery_reason
         self._knowledge = ArchiveKnowledge.from_any(replacement.knowledge())
         self._state = replacement.archive_state()
         self.runtime = runtime
@@ -194,6 +201,8 @@ class ArchiveTask:
     def _initialize_knowledge(
         self,
         *,
+        discovery_source: str,
+        discovery_reason: str,
         discovery_evidence: dict[str, Any],
         discovery_segments: tuple[ResolvedArchiveSegment, ...],
     ) -> None:
@@ -203,8 +212,8 @@ class ArchiveTask:
                 "input": descriptor.to_dict(),
             },
             "discovery": {
-                "source": self.discovery_source,
-                "reason": self.discovery_reason,
+                "source": discovery_source,
+                "reason": discovery_reason,
                 "evidence": dict(discovery_evidence),
             },
         }, source_layer="contracts", source_module="archive_task")
@@ -216,7 +225,7 @@ class ArchiveTask:
                     for index, segment in enumerate(discovery_segments, start=1)
                 ],
                 source_layer="discovery",
-                source_module=self.discovery_source or "discovery",
+                source_module=discovery_source or "discovery",
             )
             self._knowledge.set(
                 "source.selected_segment",

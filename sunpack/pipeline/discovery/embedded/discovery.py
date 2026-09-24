@@ -136,13 +136,10 @@ class EmbeddedDiscovery:
                 item.offset,
                 end,
                 logical_name,
+                confidence=float(item.confidence),
             )
             segments.append(ResolvedArchiveSegment(
                 archive_input=descriptor,
-                format=item.format,
-                confidence=float(item.confidence),
-                start_offset=int(item.offset),
-                end_offset=end,
                 evidence=item.to_dict(),
             ))
 
@@ -204,6 +201,8 @@ def _descriptor_for_candidate(
     start: int,
     end: int | None,
     logical_name: str,
+    *,
+    confidence: float,
 ) -> ArchiveInputDescriptor:
     if start == 0 and (end is None or end >= size):
         return ArchiveInputDescriptor.from_parts(
@@ -219,5 +218,10 @@ def _descriptor_for_candidate(
         format_hint=archive_format,
         logical_name=logical_name,
         parts=[ArchiveInputPart(path=path, role="main", range=archive_range)],
-        segment=ArchiveInputSegment(start=start, end=end, source="embedded"),
+        segment=ArchiveInputSegment(
+            start=start,
+            end=end,
+            confidence=confidence,
+            source="embedded",
+        ),
     )

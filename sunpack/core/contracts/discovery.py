@@ -45,12 +45,41 @@ class DiscoveryCandidate:
 @dataclass(frozen=True, slots=True)
 class ResolvedArchiveSegment:
     archive_input: ArchiveInputDescriptor
-    format: str
-    confidence: float = 0.0
-    start_offset: int = 0
-    end_offset: int | None = None
-    damage_flags: tuple[str, ...] = ()
     evidence: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def format(self) -> str:
+        return self.archive_input.format_hint
+
+    @property
+    def start_offset(self) -> int:
+        if self.archive_input.segment is not None:
+            return int(self.archive_input.segment.start)
+        return int(self.evidence.get("offset") or 0)
+
+    @property
+    def end_offset(self) -> int | None:
+        if self.archive_input.segment is not None:
+            return self.archive_input.segment.end
+        raw = self.evidence.get("range_end_offset")
+        if raw is None:
+            raw = self.evidence.get("end_offset")
+        return int(raw) if raw is not None else None
+
+    @property
+    def confidence(self) -> float:
+        if self.archive_input.segment is not None:
+            value = float(self.archive_input.segment.confidence or 0.0)
+            if value:
+                return value
+        return float(self.evidence.get("confidence") or 0.0)
+
+    @property
+    def damage_flags(self) -> tuple[str, ...]:
+        raw = self.archive_input.analysis.get("damage_flags")
+        if not raw:
+            raw = self.evidence.get("damage_flags")
+        return tuple(str(item) for item in (raw or ()) if str(item))
 
 
 @dataclass(frozen=True, slots=True)

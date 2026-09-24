@@ -247,7 +247,6 @@ class ArchiveInputPlanningStage:
         index: int,
         write_knowledge: bool = True,
     ) -> None:
-        segment_payload = self._segment_payload(task, evidence, segment)
         if write_knowledge:
             write_source_selected_segment(task, evidence, segment, index=index)
 
@@ -261,19 +260,6 @@ class ArchiveInputPlanningStage:
         record_state: bool = True,
         write_knowledge: bool = True,
     ) -> None:
-        selected = _best_selected(report)
-        with _phase(phase_timer, f"{phase_prefix}_record_report_evidence_payload"):
-            evidences = [
-                {
-                    "format": evidence.format,
-                    "confidence": evidence.confidence,
-                    "status": evidence.status,
-                    "warnings": list(evidence.warnings),
-                    "details": dict(evidence.details),
-                    "segments": [asdict(segment) for segment in evidence.segments],
-                }
-                for evidence in report.evidences
-            ]
         if write_knowledge:
             with _phase(phase_timer, f"{phase_prefix}_record_report_write_knowledge"):
                 _write_plan_knowledge(task, report, [], None)
