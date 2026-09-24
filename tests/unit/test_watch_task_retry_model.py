@@ -3,7 +3,7 @@ import os
 
 import sunpack.runtime.watch.scheduler as scheduler_module
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineResponse
+from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.scheduler import WatchScheduler, _ActivePipelineRequest
@@ -242,4 +242,40 @@ def test_direct_missing_volume_still_suspends_watch_input(tmp_path, monkeypatch)
     entry = watcher.state.latest_entry_for_path(str(archive))
     assert entry is not None and entry.status == "suspended_missing_volume"
     assert flatten_calls == []
+    assert [action for action, _ in sink.actions] == ["suppressed"]
+
+
+def test_coalesced_password_retry_preserves_blocker_until_owner_finishes(tmp_path, monkeypatch):
+    watcher, root, _output, sink = _watcher(tmp_path, monkeypatch)
+    archive = root / "archive.part1.rar"
+    archive.write_bytes(b"rar")
+    candidate = _candidate(archive)
+    watcher.state.mark(
+        str(archive),
+        candidate.size,
+        candidate.mtime,
+        status="failed_password",
+        error="wrong password",
+        failure_payload={
+            "kind": "wrong_password",
+            "blockers": ["password"],
+            "password_scope_dir": str(root),
+        },
+    )
+
+    response = PipelineResponse(
+        "retry",
+        RunSummary(),
+        PipelineArtifacts(),
+        PipelineDiscovery(
+            entry_paths=(str(archive),),
+            claimed_paths=(str(archive),),
+            coalesced_from_request_id="owner-request",
+        ),
+    )
+    result = asyncio.run(_complete(watcher, candidate, response))
+
+    assert result.processed == 1
+    entry = watcher.state.latest_entry_for_path(str(archive))
+    assert entry is not None and entry.status == "failed_password"
     assert [action for action, _ in sink.actions] == ["suppressed"]
