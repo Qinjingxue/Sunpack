@@ -122,3 +122,19 @@ def test_removed_descriptor_views_do_not_return() -> None:
         "ArchiveRuntimeState",
     ):
         assert not hasattr(contracts, name)
+
+
+def test_discovery_provenance_is_not_double_stored() -> None:
+    from dataclasses import fields
+    from sunpack.core.contracts.tasks import ArchiveTask
+
+    stored = {field.name for field in fields(ArchiveTask)}
+    assert "relation_kind" not in stored
+    assert "discovery_evidence" not in stored
+    assert "discovery_segments" not in stored
+
+
+def test_retired_runtime_route_evidence_module_is_absent() -> None:
+    assert not (
+        _PACKAGE_ROOT / "core" / "support" / "runtime_route_evidence.py"
+    ).exists()

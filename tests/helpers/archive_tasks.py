@@ -15,7 +15,6 @@ def make_archive_task(
     logical_name: str = "",
     key: str = "",
     discovery_source: str = "test",
-    relation_kind: str = "file",
     analysis: dict[str, Any] | None = None,
 ) -> ArchiveTask:
     entry_path = str(path)
@@ -33,7 +32,6 @@ def make_archive_task(
     task = ArchiveTask.from_archive_input(
         descriptor,
         discovery_source=discovery_source,
-        relation_kind=relation_kind,
         discovery_reason="test_fixture",
     )
     if key:
@@ -46,12 +44,10 @@ def make_task_from_descriptor(
     *,
     key: str = "",
     discovery_source: str = "test",
-    relation_kind: str = "file",
 ) -> ArchiveTask:
     task = ArchiveTask.from_archive_input(
         descriptor,
         discovery_source=discovery_source,
-        relation_kind=relation_kind,
         discovery_reason="test_fixture",
     )
     if key:

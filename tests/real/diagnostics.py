@@ -225,11 +225,8 @@ def task_snapshot(task: Any) -> dict[str, Any]:
         "format": getattr(archive_input, "format_hint", "") if archive_input is not None else "",
         "discovery_source": getattr(task, "discovery_source", ""),
         "discovery_reason": getattr(task, "discovery_reason", ""),
-        "relation_kind": getattr(task, "relation_kind", ""),
         "archive_input": jsonable(archive_input),
         "archive_state": jsonable(archive_state),
-        "discovery_evidence": jsonable(getattr(task, "discovery_evidence", {})),
-        "discovery_segments": jsonable(getattr(task, "discovery_segments", ())),
         "knowledge": jsonable(selected_knowledge),
         "runtime": jsonable(getattr(task, "runtime", {})),
     }

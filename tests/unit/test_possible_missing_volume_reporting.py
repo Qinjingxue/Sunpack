@@ -27,7 +27,7 @@ def _task(*, split: bool = True, missing_indices=()):
         format_hint="7z",
         logical_name="sample",
     )
-    return make_task_from_descriptor(descriptor, relation_kind="split_archive")
+    return make_task_from_descriptor(descriptor)
 
 
 def _failure(kind: FailureKind, *, details=None) -> FailureInfo:
