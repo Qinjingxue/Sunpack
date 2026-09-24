@@ -105,6 +105,330 @@ enum StructuralStreamKind {
     Zstd,
 }
 
+
+const IDENTITY_PROBE_MAX_BYTES: u64 = 64 * 1024;
+
+fn compression_identity_result(
+    py: Python<'_>,
+    format: &str,
+    ext: &str,
+    magic_matched: bool,
+    file_size: u64,
+    bytes_read: u64,
+    plausible: bool,
+    error: &str,
+    evidence: &[&str],
+) -> PyResult<Py<PyDict>> {
+    let d = compression_base(py, format, ext, magic_matched)?;
+    d.set_item("plausible", plausible)?;
+    d.set_item("confidence", if plausible { "strong" } else { "none" })?;
+    d.set_item("identity_strong", plausible)?;
+    d.set_item("validation_scope", "format_identity")?;
+    d.set_item("validation_cost", "bounded")?;
+    d.set_item("identity_bytes_read", bytes_read)?;
+    d.set_item("file_size", file_size)?;
+    d.set_item("structure_status", "incomplete")?;
+    d.set_item("structure_validation_complete", false)?;
+    d.set_item("boundary_exact", false)?;
+    d.set_item("integrity_status", "deferred")?;
+    d.set_item("integrity_validation_complete", false)?;
+    d.set_item("segment_end", Option::<u64>::None)?;
+    d.set_item("damage_flags", PyList::empty(py))?;
+    d.set_item("error", error)?;
+    d.set_item("evidence", PyList::new(py, evidence)?)?;
+    Ok(d.unbind())
+}
+
+fn inspect_compression_stream_identity_impl(
+    py: Python<'_>,
+    path: &str,
+) -> PyResult<Py<PyDict>> {
+    let reader = match ManagedReader::open(path) {
+        Ok(value) => value,
+        Err(_) => {
+            return compression_identity_result(
+                py, "", "", false, 0, 0, false, "os_error", &[],
+            )
+        }
+    };
+    let file_size = reader.len();
+    let read_size = file_size.min(IDENTITY_PROBE_MAX_BYTES) as usize;
+    let data = match reader.read_at(0, read_size) {
+        Ok(value) => value,
+        Err(_) => {
+            return compression_identity_result(
+                py, "", "", false, file_size, 0, false, "os_error", &[],
+            )
+        }
+    };
+    let base_bytes_read = data.len() as u64;
+
+    if data.starts_with(b"\x1f\x8b") {
+        let (payload_start, flags) = match parse_gzip_header(&data, 0) {
+            Ok(value) => value,
+            Err(error) => {
+                return compression_identity_result(
+                    py,
+                    "gzip",
+                    ".gz",
+                    true,
+                    file_size,
+                    base_bytes_read,
+                    false,
+                    error,
+                    &["gzip:magic"],
+                )
+            }
+        };
+        let mut evidence = vec!["gzip:magic", "gzip:header"];
+        if flags & 0x02 != 0 {
+            let Some(crc_offset) = payload_start.checked_sub(2) else {
+                return compression_identity_result(
+                    py, "gzip", ".gz", true, file_size, base_bytes_read, false,
+                    "gzip_header_crc_missing", &["gzip:magic"],
+                );
+            };
+            let Some(stored_bytes) = data.get(crc_offset..crc_offset + 2) else {
+                return compression_identity_result(
+                    py, "gzip", ".gz", true, file_size, base_bytes_read, false,
+                    "gzip_header_crc_missing", &["gzip:magic"],
+                );
+            };
+            let stored = u16::from_le_bytes([stored_bytes[0], stored_bytes[1]]);
+            let computed = (crc32(&data[..crc_offset]) & 0xffff) as u16;
+            if stored != computed {
+                return compression_identity_result(
+                    py, "gzip", ".gz", true, file_size, base_bytes_read, false,
+                    "gzip_header_crc_bad", &["gzip:magic", "gzip:header"],
+                );
+            }
+            evidence.push("gzip:header_crc16");
+        }
+        if payload_start as u64 >= file_size {
+            return compression_identity_result(
+                py, "gzip", ".gz", true, file_size, base_bytes_read, false,
+                "gzip_deflate_missing", &evidence,
+            );
+        }
+        let block_probe = reader
+            .read_at(
+                payload_start as u64,
+                file_size.saturating_sub(payload_start as u64).min(8) as usize,
+            )
+            .unwrap_or_default();
+        if block_probe.is_empty() {
+            return compression_identity_result(
+                py, "gzip", ".gz", true, file_size, base_bytes_read, false,
+                "gzip_deflate_missing", &evidence,
+            );
+        }
+        let block_type = (block_probe[0] >> 1) & 0x03;
+        if block_type == 3 {
+            return compression_identity_result(
+                py, "gzip", ".gz", true, file_size,
+                base_bytes_read + block_probe.len() as u64, false,
+                "gzip_deflate_reserved_block_type", &evidence,
+            );
+        }
+        if block_type == 0 {
+            if block_probe.len() < 5 {
+                return compression_identity_result(
+                    py, "gzip", ".gz", true, file_size,
+                    base_bytes_read + block_probe.len() as u64, false,
+                    "gzip_stored_block_header_short", &evidence,
+                );
+            }
+            let len = u16::from_le_bytes([block_probe[1], block_probe[2]]);
+            let nlen = u16::from_le_bytes([block_probe[3], block_probe[4]]);
+            if len ^ nlen != 0xffff {
+                return compression_identity_result(
+                    py, "gzip", ".gz", true, file_size,
+                    base_bytes_read + block_probe.len() as u64, false,
+                    "gzip_stored_block_length_mismatch", &evidence,
+                );
+            }
+            evidence.push("gzip:deflate_stored_length");
+        } else if block_type == 2 {
+            if block_probe.len() < 3 {
+                return compression_identity_result(
+                    py, "gzip", ".gz", true, file_size,
+                    base_bytes_read + block_probe.len() as u64, false,
+                    "gzip_dynamic_block_header_short", &evidence,
+                );
+            }
+            let bits = u32::from_le_bytes([
+                block_probe[0],
+                block_probe[1],
+                block_probe[2],
+                *block_probe.get(3).unwrap_or(&0),
+            ]) >> 3;
+            if bits & 0x1f > 29 {
+                return compression_identity_result(
+                    py, "gzip", ".gz", true, file_size,
+                    base_bytes_read + block_probe.len() as u64, false,
+                    "gzip_dynamic_hlit_invalid", &evidence,
+                );
+            }
+            evidence.push("gzip:deflate_dynamic_header");
+        } else {
+            evidence.push("gzip:deflate_fixed_header");
+        }
+        return compression_identity_result(
+            py,
+            "gzip",
+            ".gz",
+            true,
+            file_size,
+            base_bytes_read + block_probe.len() as u64,
+            true,
+            "",
+            &evidence,
+        );
+    }
+
+    if data.starts_with(b"BZh") {
+        if data.len() < 14 || !matches!(data[3], b'1'..=b'9') {
+            return compression_identity_result(
+                py, "bzip2", ".bz2", true, file_size, base_bytes_read, false,
+                "bzip2_header_invalid", &["bzip2:magic"],
+            );
+        }
+        const BLOCK_MAGIC: &[u8; 6] = b"\x31\x41\x59\x26\x53\x59";
+        const END_MAGIC: &[u8; 6] = b"\x17\x72\x45\x38\x50\x90";
+        let marker = &data[4..10];
+        if marker != BLOCK_MAGIC && marker != END_MAGIC {
+            return compression_identity_result(
+                py, "bzip2", ".bz2", true, file_size, base_bytes_read, false,
+                "bzip2_first_marker_invalid", &["bzip2:magic", "bzip2:block_size"],
+            );
+        }
+        let evidence = if marker == BLOCK_MAGIC {
+            ["bzip2:magic", "bzip2:block_size", "bzip2:first_block_marker"].as_slice()
+        } else {
+            ["bzip2:magic", "bzip2:block_size", "bzip2:end_marker"].as_slice()
+        };
+        return compression_identity_result(
+            py, "bzip2", ".bz2", true, file_size, base_bytes_read, true, "", evidence,
+        );
+    }
+
+    if data.starts_with(XZ_MAGIC) {
+        if data.len() < 12 || file_size < 24 {
+            return compression_identity_result(
+                py, "xz", ".xz", true, file_size, base_bytes_read, false,
+                "xz_header_or_footer_missing", &["xz:magic"],
+            );
+        }
+        let flags = [data[6], data[7]];
+        let check_id = flags[1] & 0x0f;
+        let stored = u32::from_le_bytes(data[8..12].try_into().unwrap());
+        if flags[0] != 0
+            || flags[1] & 0xf0 != 0
+            || !matches!(check_id, 0 | 1 | 4 | 10)
+            || stored != crc32(&flags)
+        {
+            return compression_identity_result(
+                py, "xz", ".xz", true, file_size, base_bytes_read, false,
+                "xz_stream_header_invalid", &["xz:magic"],
+            );
+        }
+        return compression_identity_result(
+            py, "xz", ".xz", true, file_size, base_bytes_read, true, "",
+            &["xz:magic", "xz:stream_flags", "xz:header_crc32"],
+        );
+    }
+
+    if data.starts_with(ZSTD_MAGIC) {
+        if data.len() < 8 {
+            return compression_identity_result(
+                py, "zstd", ".zst", true, file_size, base_bytes_read, false,
+                "zstd_frame_header_short", &["zstd:magic"],
+            );
+        }
+        let descriptor = data[4];
+        if descriptor & 0x18 != 0 {
+            return compression_identity_result(
+                py, "zstd", ".zst", true, file_size, base_bytes_read, false,
+                "zstd_reserved_or_unused_bit_set", &["zstd:magic"],
+            );
+        }
+        let single = descriptor & 0x20 != 0;
+        let dict_size = match descriptor & 0x03 {
+            0 => 0usize,
+            1 => 1,
+            2 => 2,
+            _ => 4,
+        };
+        let mut cursor = 5usize;
+        if !single {
+            if cursor >= data.len() {
+                return compression_identity_result(
+                    py, "zstd", ".zst", true, file_size, base_bytes_read, false,
+                    "zstd_window_descriptor_missing", &["zstd:magic", "zstd:frame_descriptor"],
+                );
+            }
+            cursor += 1;
+        }
+        let fcs_flag = descriptor >> 6;
+        let fcs_size = zstd_field_size(fcs_flag, single, single || fcs_flag != 0);
+        let Some(block_header_offset) = cursor
+            .checked_add(dict_size)
+            .and_then(|value| value.checked_add(fcs_size))
+        else {
+            return compression_identity_result(
+                py, "zstd", ".zst", true, file_size, base_bytes_read, false,
+                "zstd_frame_header_overflow", &["zstd:magic", "zstd:frame_descriptor"],
+            );
+        };
+        if block_header_offset + 3 > data.len() {
+            return compression_identity_result(
+                py, "zstd", ".zst", true, file_size, base_bytes_read, false,
+                "zstd_first_block_header_missing", &["zstd:magic", "zstd:frame_descriptor"],
+            );
+        }
+        let block_header = u32::from(data[block_header_offset])
+            | (u32::from(data[block_header_offset + 1]) << 8)
+            | (u32::from(data[block_header_offset + 2]) << 16);
+        let block_type = (block_header >> 1) & 0x03;
+        let block_size = u64::from(block_header >> 3);
+        if block_type == 3 || block_size > 128 * 1024 {
+            return compression_identity_result(
+                py, "zstd", ".zst", true, file_size, base_bytes_read, false,
+                "zstd_first_block_header_invalid",
+                &["zstd:magic", "zstd:frame_descriptor"],
+            );
+        }
+        let stored_size = if block_type == 1 { 1 } else { block_size };
+        if (block_header_offset as u64)
+            .checked_add(3)
+            .and_then(|value| value.checked_add(stored_size))
+            .is_none_or(|end| end > file_size)
+        {
+            return compression_identity_result(
+                py, "zstd", ".zst", true, file_size, base_bytes_read, false,
+                "zstd_first_block_out_of_range",
+                &["zstd:magic", "zstd:frame_descriptor"],
+            );
+        }
+        return compression_identity_result(
+            py, "zstd", ".zst", true, file_size, base_bytes_read, true, "",
+            &["zstd:magic", "zstd:frame_descriptor", "zstd:first_block_header"],
+        );
+    }
+
+    compression_identity_result(
+        py,
+        "",
+        "",
+        false,
+        file_size,
+        base_bytes_read,
+        false,
+        "compression_stream_magic_not_found",
+        &[],
+    )
+}
+
 fn inspect_large_structural_stream(
     py: Python<'_>,
     path: &str,
