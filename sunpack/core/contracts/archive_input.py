@@ -209,24 +209,8 @@ class ArchiveInputDescriptor:
         analysis = dict(raw.get("analysis") or {}) if isinstance(raw.get("analysis"), dict) else {}
         analysis.pop("segment_start", None)
         analysis.pop("segment_end", None)
-        segment_raw = raw.get("segment")
-        if isinstance(segment_raw, dict):
-            segment_start = int(segment_raw.get("start", 0) or 0)
-            segment_end = int(segment_raw["end"]) if segment_raw.get("end") is not None else None
-            if segment_raw.get("confidence") is not None:
-                analysis["segment_confidence"] = float(segment_raw["confidence"])
-            analysis["segment_source"] = str(segment_raw.get("source") or "analysis")
-            if open_mode == "file_range":
-                if not parts:
-                    parts = [ArchiveInputPart(extent=InputExtent(
-                        path=entry_path,
-                        start=segment_start,
-                        end=segment_end,
-                    ))]
-                else:
-                    extent = parts[0].extent
-                    if extent.start != segment_start or extent.end != segment_end:
-                        raise ValueError("file_range segment must match its primary extent")
+        if open_mode == "file_range" and not parts:
+            raise ValueError("file_range requires canonical parts with extent")
         if not parts and not extents and part_paths:
             if len(part_paths) > 1:
                 raise ValueError("multi-volume inputs require serialized structured parts")
