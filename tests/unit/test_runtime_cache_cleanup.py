@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 from sunpack.runtime.cli.runtime_host import RuntimeHost
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
-from tests.helpers.archive_tasks import make_archive_task, merge_task_knowledge
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from sunpack.core.passwords.relation_prober import _shared_attempt_cache, clear_relation_probe_cache
 from sunpack.core.support.archive_knowledge_projection import (
@@ -14,6 +14,7 @@ from sunpack.core.support.archive_knowledge_projection import (
     source_fingerprint,
 )
 from sunpack.core.support.global_cache_manager import GLOBAL_CACHE
+from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge
 from sunpack.core.support.runtime_cache_cleanup import clear_all_runtime_caches, runtime_cache_stats
 
 
@@ -36,7 +37,9 @@ def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
     archive_path = tmp_path / "archive.zip"
     archive_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)
     task = make_archive_task(archive_path, format_hint="zip")
-    merge_task_knowledge(task, {"source": {"cache_probe": True}})
+    knowledge = task.knowledge()
+    knowledge.merge({"source": {"cache_probe": True}})
+    commit_task_knowledge(task, knowledge)
     source_fingerprint(task)
     attempt_cache = _shared_attempt_cache()
     attempt_cache.remember_success("fingerprint", "password")
