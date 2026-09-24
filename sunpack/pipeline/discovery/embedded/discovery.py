@@ -17,6 +17,7 @@ from sunpack.core.contracts.discovery import (
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.analysis.embedded import inspect_runtime_bundle, scan_embedded_archives
+from sunpack.core.support.global_cache_manager import file_identity
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
 
@@ -101,15 +102,22 @@ class EmbeddedDiscovery:
         candidate: DiscoveryCandidate,
     ) -> tuple[ArchiveTask | None, str]:
         path = candidate.entry_path
-        size = candidate.size
-        if not path or not isinstance(size, int) or size <= 0:
+        if not path:
             return None, "missing_or_empty_file"
 
         try:
+            identity = file_identity(path)
+            size = int(identity[1])
+            if size <= 0:
+                return None, "missing_or_empty_file"
             profile = inspect_runtime_bundle(path, size)
             if profile:
                 return None, f"Runtime bundle: {profile}"
-            scan = scan_embedded_archives(path, expected_size=size)
+            scan = scan_embedded_archives(
+                path,
+                expected_size=size,
+                identity=identity,
+            )
         except OSError:
             return None, "embedded_scan_io_error"
 
