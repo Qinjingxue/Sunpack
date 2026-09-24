@@ -31,10 +31,12 @@ class EmbeddedCandidate:
 
     @property
     def password_required(self) -> bool:
-        return self.format == "rar" and self.validation in {
+        if self.format != "rar":
+            return False
+        return self.validation.startswith((
             "rar4_header_encrypted_main_header_crc",
             "rar5_encryption_header_crc",
-        }
+        ))
 
     def to_dict(self) -> dict[str, Any]:
         return {
