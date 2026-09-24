@@ -28,10 +28,6 @@ class DiscoveryCandidate:
         return self.archive_input.entry_path
 
     @property
-    def member_paths(self) -> tuple[str, ...]:
-        return tuple(self.archive_input.part_paths())
-
-    @property
     def logical_name(self) -> str:
         return self.archive_input.logical_name
 
@@ -42,7 +38,7 @@ class DiscoveryCandidate:
     @property
     def physical_paths(self) -> tuple[str, ...]:
         values = (
-            *self.member_paths,
+            *self.archive_input.part_paths(),
             *self.companion_paths,
             *self.cleanup_paths,
             self.carrier_path,
