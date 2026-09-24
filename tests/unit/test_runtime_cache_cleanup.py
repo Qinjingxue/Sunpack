@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 from sunpack.runtime.cli.runtime_host import RuntimeHost
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
+from tests.helpers.archive_tasks import make_archive_task
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from sunpack.core.passwords.relation_prober import _shared_attempt_cache, clear_relation_probe_cache
 from sunpack.core.support.archive_knowledge_projection import (
@@ -32,11 +33,10 @@ def _reset_process_caches():
 
 def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
     GLOBAL_CACHE.set("runtime-cache-test", ("key",), {"payload": "value"})
-    knowledge = ArchiveKnowledge({
-        "_meta": {"revision": 1},
-        "source": {"input": {"path": str(tmp_path / "archive.zip")}},
-    })
-    source_fingerprint(knowledge)
+    archive_path = tmp_path / "archive.zip"
+    archive_path.write_bytes(b"PK\x05\x06" + b"\0" * 18)
+    task = make_archive_task(archive_path, format_hint="zip")
+    source_fingerprint(task)
     attempt_cache = _shared_attempt_cache()
     attempt_cache.remember_success("fingerprint", "password")
     attempt_cache.remember_negative("fingerprint", "wrong")
@@ -54,7 +54,7 @@ def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
     assert report["relation_probe_cache"] == {"successes": 1, "negative": 1}
     assert "inspection" not in report
     assert GLOBAL_CACHE.stats()["entries"] == 0
-    assert source_fingerprint(knowledge)
+    assert source_fingerprint(task)
     assert report["errors"] == []
 
 

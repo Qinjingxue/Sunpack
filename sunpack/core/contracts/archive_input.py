@@ -82,7 +82,6 @@ class ArchiveInputDescriptor:
     format_hint: str = ""
     logical_name: str = ""
     volume_style: str = ""
-    password: str = ""
     parts: list[ArchiveInputPart] = field(default_factory=list)
     ranges: list[ArchiveInputRange] = field(default_factory=list)
     segment: ArchiveInputSegment | None = None
@@ -119,8 +118,6 @@ class ArchiveInputDescriptor:
             payload["logical_name"] = self.logical_name
         if self.volume_style:
             payload["volume_style"] = self.volume_style
-        if self.password:
-            payload["password"] = self.password
         if self.parts:
             payload["parts"] = [part.to_dict() for part in self.parts]
         if self.ranges:
@@ -136,15 +133,11 @@ class ArchiveInputDescriptor:
             return self.to_dict()
         if self.open_mode == "file":
             payload = {"kind": "file", "path": self.entry_path, "format_hint": self.format_hint}
-            if self.password:
-                payload["password"] = self.password
             return payload
         if self.open_mode == "file_range":
             item_range = self._primary_range()
             if item_range is None:
                 payload = {"kind": "file", "path": self.entry_path, "format_hint": self.format_hint}
-                if self.password:
-                    payload["password"] = self.password
                 return payload
             payload: dict[str, Any] = {
                 "kind": "file_range",
@@ -215,7 +208,6 @@ class ArchiveInputDescriptor:
             format_hint=self.format_hint,
             logical_name=self.logical_name,
             volume_style=self.volume_style,
-            password=self.password,
             parts=parts,
             ranges=ranges,
             segment=self.segment,
@@ -290,7 +282,6 @@ class ArchiveInputDescriptor:
             format_hint=format_hint,
             logical_name=str(raw.get("logical_name") or ""),
             volume_style=str(raw.get("volume_style") or ""),
-            password=str(raw.get("password") or ""),
             parts=parts,
             ranges=ranges,
             segment=segment,
@@ -304,7 +295,7 @@ class ArchiveInputDescriptor:
         if kind == "file":
             path = str(raw.get("path") or raw.get("archive_path") or archive_path)
             parts = [ArchiveInputPart(path=path, role="main", volume_number=1)]
-            return cls(entry_path=path, open_mode="file", format_hint=format_hint, password=str(raw.get("password") or ""), parts=parts)
+            return cls(entry_path=path, open_mode="file", format_hint=format_hint, parts=parts)
         if kind == "file_range":
             path = str(raw.get("path") or archive_path)
             start = int(raw.get("start", raw.get("start_offset", 0)) or 0)
@@ -314,7 +305,6 @@ class ArchiveInputDescriptor:
                 entry_path=path,
                 open_mode="file_range",
                 format_hint=format_hint,
-                password=str(raw.get("password") or ""),
                 parts=[ArchiveInputPart(path=path, range=ArchiveInputRange(path=path, start=start, end=end))],
                 segment=ArchiveInputSegment(start=start, end=end),
             )
@@ -347,7 +337,6 @@ class ArchiveInputDescriptor:
         part_paths: list[str] | None = None,
         format_hint: str = "",
         logical_name: str = "",
-        password: str = "",
     ) -> "ArchiveInputDescriptor":
         paths = list(part_paths or [archive_path])
         if len(paths) > 1:
@@ -358,7 +347,6 @@ class ArchiveInputDescriptor:
             open_mode=mode,
             format_hint=format_hint,
             logical_name=logical_name,
-            password=password,
             parts=[
                 ArchiveInputPart(path=str(path), role="main", volume_number=1)
                 for index, path in enumerate(paths)
@@ -451,7 +439,6 @@ class ArchiveInputDescriptor:
                     format_hint=format_hint,
                     logical_name=descriptor.logical_name or logical_name,
                     volume_style=descriptor.volume_style,
-                    password=descriptor.password,
                     parts=list(descriptor.parts),
                     ranges=list(descriptor.ranges),
                     segment=descriptor.segment,
