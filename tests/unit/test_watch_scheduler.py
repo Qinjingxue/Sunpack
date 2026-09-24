@@ -17,7 +17,7 @@ import sunpack.core.passwords.internal.builtin as builtin_module
 import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse
-from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
+from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
 from sunpack.runtime.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import WatchStateStore
@@ -483,14 +483,19 @@ def _watch_summary(
     *,
     recovered_outputs=(),
 ):
-    return SimpleNamespace(
-        success_count=1 if kind == OutcomeKind.COMPLETE_SUCCESS else 0,
-        partial_success_count=1 if kind == OutcomeKind.PARTIAL_SUCCESS else 0,
-        failed_tasks=[],
-        failures=[],
-        processed_keys=[path],
-        recovered_outputs=list(recovered_outputs),
-        target_results=[TargetRunResult(path, kind, verification=verification)],
+    recoveries = list(recovered_outputs)
+    if len(recoveries) > 1:
+        raise ValueError("one target may expose at most one recovery projection")
+    return RunSummary(
+        target_results=(
+            TargetRunResult(
+                path,
+                kind,
+                task_key=path,
+                verification=verification,
+                recovery=recoveries[0] if recoveries else None,
+            ),
+        ),
     )
 
 
