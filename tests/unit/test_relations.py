@@ -104,8 +104,10 @@ def _minimal_pe_image(marker: bytes = b"") -> tuple[bytes, int]:
 
 def _minimal_zip_single() -> bytes:
     buffer = BytesIO()
-    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as stream:
-        stream.writestr("inside.txt", "hello")
+    info = zipfile.ZipInfo("inside.txt", date_time=(1980, 1, 1, 0, 0, 0))
+    info.compress_type = zipfile.ZIP_STORED
+    with zipfile.ZipFile(buffer, "w") as stream:
+        stream.writestr(info, "hello")
     return buffer.getvalue()
 
 
