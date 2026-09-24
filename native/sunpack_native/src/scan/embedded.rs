@@ -1129,30 +1129,25 @@ fn validate_xz(
         return Ok(None);
     }
     let first_possible = footer_ends.partition_point(|end| *end < offset + 24);
-    let mut structure = None;
     for &end in &footer_ends[first_possible..] {
         if end > size {
             break;
         }
-        match validate_xz_structure_exact(file, offset, end) {
-            Ok(value) => {
-                structure = Some(value);
-                break;
+        match resolve_xz_boundary_exact(file, offset, end) {
+            Ok(structure) => {
+                return Ok(Some(candidate(
+                    "xz",
+                    offset,
+                    Some(structure.end_offset),
+                    0.99,
+                    "xz_header_index_footer_boundary",
+                )));
             }
             Err(ValidationError::Invalid(_)) => {}
             Err(ValidationError::Io(error)) => return Err(error),
         }
     }
-    let Some(structure) = structure else {
-        return Ok(None);
-    };
-    Ok(Some(candidate(
-        "xz",
-        offset,
-        Some(structure.end_offset),
-        0.99,
-        "xz_header_block_index_footer_structure_walk",
-    )))
+    Ok(None)
 }
 
 fn validate_zstd(
