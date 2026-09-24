@@ -761,6 +761,134 @@ fn xz_check_size(check_id: u8) -> ValidationResult<u64> {
     }
 }
 
+pub(crate) fn resolve_xz_boundary_exact(
+    reader: &ManagedReader,
+    offset: u64,
+    limit: u64,
+) -> ValidationResult<StructureValidation> {
+    if limit < offset + 24 {
+        return invalid("xz_header_or_footer_missing");
+    }
+    let mut reverse_end = limit;
+    let mut streams_reversed = 0usize;
+    let mut total_blocks = 0usize;
+    let mut checksum_present = false;
+    while reverse_end > offset {
+        while reverse_end >= offset + 4 {
+            let word = reader.read_at(reverse_end - 4, 4)?;
+            if word.as_slice() != [0, 0, 0, 0] {
+                break;
+            }
+            reverse_end -= 4;
+        }
+        if reverse_end < offset + 24 {
+            return invalid("xz_footer_missing");
+        }
+        let footer_start = reverse_end - 12;
+        let footer = reader.read_at(footer_start, 12)?;
+        if footer.len() != 12 || &footer[10..12] != b"YZ" {
+            return invalid("xz_footer_magic_invalid");
+        }
+        if u32::from_le_bytes(footer[0..4].try_into().unwrap()) != crc32(&footer[4..10]) {
+            return invalid("xz_footer_crc_bad");
+        }
+        let flags = [footer[8], footer[9]];
+        if flags[0] != 0 || flags[1] & 0xf0 != 0 {
+            return invalid("xz_stream_flags_invalid");
+        }
+        let check_size = xz_check_size(flags[1] & 0x0f)?;
+        checksum_present |= check_size != 0;
+
+        let index_size =
+            (u64::from(u32::from_le_bytes(footer[4..8].try_into().unwrap())) + 1) * 4;
+        let index_start = footer_start
+            .checked_sub(index_size)
+            .ok_or(ValidationError::Invalid("xz_backward_size_out_of_range"))?;
+        if index_size < 8 || index_start < offset {
+            return invalid("xz_backward_size_out_of_range");
+        }
+
+        let index_crc_pos = footer_start - 4;
+        let mut index_cursor = ByteCursor::new(reader, index_start, footer_start);
+        let mut index_hasher = Hasher::new();
+        let indicator = index_cursor.read_byte()?;
+        index_hasher.update(&[indicator]);
+        if indicator != 0 {
+            return invalid("xz_index_indicator_invalid");
+        }
+        let record_count = read_vli_index(&mut index_cursor, &mut index_hasher)? as usize;
+        if record_count > MAX_RECORDS {
+            return invalid("xz_index_record_count_exceeded");
+        }
+        let mut padded_blocks_size = 0u64;
+        for _ in 0..record_count {
+            let unpadded = read_vli_index(&mut index_cursor, &mut index_hasher)?;
+            let _uncompressed = read_vli_index(&mut index_cursor, &mut index_hasher)?;
+            if unpadded == 0 {
+                return invalid("xz_index_record_invalid");
+            }
+            let padded = unpadded
+                .checked_add((4 - unpadded % 4) % 4)
+                .ok_or(ValidationError::Invalid("xz_block_size_overflow"))?;
+            padded_blocks_size = padded_blocks_size
+                .checked_add(padded)
+                .ok_or(ValidationError::Invalid("xz_block_size_overflow"))?;
+        }
+        while index_cursor.position() < index_crc_pos {
+            let byte = index_cursor.read_byte()?;
+            index_hasher.update(&[byte]);
+            if byte != 0 {
+                return invalid("xz_index_padding_invalid");
+            }
+        }
+        if index_cursor.position() != index_crc_pos {
+            return invalid("xz_index_size_mismatch");
+        }
+        let stored_index_crc = index_cursor.read_exact(4)?;
+        if u32::from_le_bytes(stored_index_crc.try_into().unwrap()) != index_hasher.finalize() {
+            return invalid("xz_index_crc_bad");
+        }
+
+        let stream_start = index_start
+            .checked_sub(padded_blocks_size + 12)
+            .ok_or(ValidationError::Invalid("xz_stream_start_out_of_range"))?;
+        if stream_start < offset {
+            return invalid("xz_stream_start_out_of_range");
+        }
+        let header = reader.read_at(stream_start, 12)?;
+        if header.len() != 12 || !header.starts_with(XZ_MAGIC) {
+            return invalid("xz_header_magic_invalid");
+        }
+        if header[6..8] != flags {
+            return invalid("xz_stream_flags_mismatch");
+        }
+        if u32::from_le_bytes(header[8..12].try_into().unwrap()) != crc32(&header[6..8]) {
+            return invalid("xz_header_crc_bad");
+        }
+
+        total_blocks = total_blocks
+            .checked_add(record_count)
+            .ok_or(ValidationError::Invalid("xz_block_count_overflow"))?;
+        streams_reversed += 1;
+        reverse_end = stream_start;
+    }
+    if reverse_end != offset {
+        return invalid("xz_trailing_or_leading_data");
+    }
+    Ok(StructureValidation {
+        end_offset: limit,
+        stream_count: streams_reversed,
+        block_count: total_blocks,
+        decoded_size: None,
+        integrity: if checksum_present {
+            IntegrityStatus::Deferred
+        } else {
+            IntegrityStatus::NotPresent
+        },
+        checksum_present,
+    })
+}
+
 pub(crate) fn validate_xz_structure_exact(
     reader: &ManagedReader,
     offset: u64,
