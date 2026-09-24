@@ -493,6 +493,26 @@ def test_acceptance_test_steps_run_through_unelevated_runner():
     assert "run_unelevated_process.py" in acceptance
 
 
+def test_packaged_smoke_tests_isolate_program_data_from_machine_state():
+    build = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
+
+    isolate = build.index("$originalProgramData = $env:ProgramData")
+    redirect = build.index("$env:ProgramData = $smokeProgramDataRoot", isolate)
+    seed = build.index('$packagedDataRoot = Join-Path $env:ProgramData "SunPack"', redirect)
+    smoke = build.index('Write-Step "Running packaged smoke tests"', seed)
+    shutdown = build.index(
+        'Invoke-Native -FilePath $distExePath -Arguments @("--persistent-shutdown")',
+        smoke,
+    )
+    restore = build.index("$env:ProgramData = $originalProgramData", shutdown)
+    cleanup = build.index(
+        "Remove-Item -LiteralPath $smokeProgramDataRoot -Recurse -Force -ErrorAction SilentlyContinue",
+        restore,
+    )
+
+    assert isolate < redirect < seed < smoke < shutdown < restore < cleanup
+
+
 def test_packaged_smoke_tests_shutdown_the_persistent_runtime_after_checks():
     build = (ROOT / "scripts" / "build_windows.ps1").read_text(encoding="utf-8")
 
