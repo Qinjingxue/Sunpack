@@ -213,6 +213,49 @@ def test_embedded_rar_header_encryption_reaches_canonical_input(tmp_path, monkey
     assert result.resolved_tasks[0].runtime["embedded_segment_passwords"]["16"] == "secret"
 
 
+def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypatch):
+    path = tmp_path / "carrier.bin"
+    path.write_bytes(b"x" * 128)
+    scan = EmbeddedScanResult(
+        complete=True,
+        candidates=(
+            EmbeddedCandidate(
+                format="7z",
+                offset=16,
+                end_offset=None,
+                confidence=0.90,
+                validation="start_header_crc_truncated_declared_range",
+                candidate_kind="logical_archive",
+                boundary_kind="unresolved",
+                extractable=False,
+            ),
+        ),
+        hits=(),
+        read_bytes=128,
+        file_size=128,
+        logical_resolution_complete=False,
+        raw_hit_count=1,
+        budget_exhausted=False,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
+        lambda _path, _size: None,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
+        lambda *_args, **_kwargs: scan,
+    )
+
+    result = EmbeddedDiscovery({}).discover([_candidate(path)])
+
+    assert result.resolved_tasks == []
+    assert result.blocked_paths
+    assert any(
+        trace.reason == "embedded_truncated" and trace.status == "blocked"
+        for trace in result.traces
+    )
+
+
 def test_embedded_rar_wrong_password_blocks_whole_carrier(tmp_path, monkeypatch):
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"x" * 128)
