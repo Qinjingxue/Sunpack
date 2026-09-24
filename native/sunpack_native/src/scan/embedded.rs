@@ -2,7 +2,7 @@
 use crate::io::iocp;
 use crate::io::reader::ManagedReader;
 use crate::scan::compression_stream::{
-    validate_bzip2_structure, validate_gzip_structure, validate_xz_structure_exact,
+    resolve_xz_boundary_exact, validate_bzip2_structure, validate_gzip_structure,
     validate_zstd_structure, ValidationError,
 };
 use aho_corasick::{packed, AhoCorasick};
@@ -64,9 +64,7 @@ struct EmbeddedCandidate {
     validation: &'static str,
     candidate_kind: &'static str,
     boundary_kind: &'static str,
-    range_end_offset: Option<u64>,
     extractable: bool,
-    contained_anchor_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,9 +159,7 @@ pub(crate) fn scan_embedded_archives_with_reader(
         row.set_item("validation", candidate.validation)?;
         row.set_item("candidate_kind", candidate.candidate_kind)?;
         row.set_item("boundary_kind", candidate.boundary_kind)?;
-        row.set_item("range_end_offset", candidate.range_end_offset)?;
         row.set_item("extractable", candidate.extractable)?;
-        row.set_item("contained_anchor_count", candidate.contained_anchor_count)?;
         rows.append(row)?;
     }
     result.set_item("candidates", rows)?;
@@ -266,10 +262,11 @@ fn scan_embedded_archives_native_with_iocp(
         )
     });
     candidates.dedup_by_key(|candidate| (candidate.offset, candidate.format));
-    resolve_logical_candidates(&mut candidates, &raw_hits, file_size);
-    let logical_resolution_complete = candidates.iter().all(|candidate| {
-        candidate.candidate_kind == "logical_archive" && candidate.boundary_kind != "unresolved"
-    });
+    resolve_logical_candidates(&mut candidates);
+    let logical_resolution_complete = candidates
+        .iter()
+        .filter(|candidate| candidate.candidate_kind == "logical_archive")
+        .all(|candidate| candidate.boundary_kind == "exact");
 
     Ok(NativeScanResult {
         file_size,
@@ -398,113 +395,20 @@ fn candidate_rank(candidate: &EmbeddedCandidate) -> u8 {
     }
 }
 
-fn resolve_logical_candidates(
-    candidates: &mut Vec<EmbeddedCandidate>,
-    raw_hits: &[RawHit],
-    file_size: u64,
-) {
-    // TAR member headers independently validate from their own offset to the
-    // same end marker.  Only the earliest member is the logical archive start.
-    let mut tar_ends = std::collections::HashMap::<u64, u64>::new();
-    for item in candidates.iter().filter(|item| item.format == "tar") {
-        if let Some(end) = item.end_offset {
-            tar_ends
-                .entry(end)
-                .and_modify(|start| *start = (*start).min(item.offset))
-                .or_insert(item.offset);
-        }
-    }
-    candidates.retain(|item| {
-        item.format != "tar"
-            || item.end_offset.is_none()
-            || tar_ends.get(&item.end_offset.unwrap()).copied() == Some(item.offset)
-    });
-
+fn resolve_logical_candidates(candidates: &mut Vec<EmbeddedCandidate>) {
+    // Once an exact logical range is proven, every signature strictly inside
+    // that range belongs to the archive payload. Nested archives are discovered
+    // after extraction by the recursive pipeline, never as peer carrier slices.
     let exact_ranges = candidates
         .iter()
-        .filter_map(|item| item.end_offset.map(|end| (item.format, item.offset, end)))
-        .collect::<Vec<_>>();
-    let contained_counts = candidates
-        .iter()
-        .map(|item| {
-            item.end_offset.map(|end| {
-                candidates_contained_anchor_count(
-                    item.format,
-                    item.offset,
-                    end,
-                    candidates,
-                    raw_hits,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    for (item, count) in candidates.iter_mut().zip(contained_counts) {
-        if let Some(count) = count {
-            item.contained_anchor_count = count;
-        }
-    }
-    // Local ZIP headers referenced by an EOCD candidate are member anchors,
-    // not independent ZIP archives.
-    candidates.retain(|item| {
-        if item.format != "zip" || item.candidate_kind != "anchor" {
-            return true;
-        }
-        !exact_ranges.iter().any(|(format, start, end)| {
-            *format == "zip" && item.offset >= *start && item.offset < *end
-        })
-    });
-
-    let logical_starts = candidates
-        .iter()
         .filter(|item| item.candidate_kind == "logical_archive")
-        .map(|item| item.offset)
+        .filter_map(|item| item.end_offset.map(|end| (item.offset, end)))
         .collect::<Vec<_>>();
-    for item in candidates
-        .iter_mut()
-        .filter(|item| item.end_offset.is_none())
-    {
-        if item.candidate_kind != "logical_archive" {
-            continue;
-        }
-        item.range_end_offset = logical_starts
+    candidates.retain(|item| {
+        !exact_ranges
             .iter()
-            .copied()
-            .filter(|start| *start > item.offset)
-            .min()
-            .or(Some(file_size));
-        item.boundary_kind = "bounded";
-        item.extractable = item.range_end_offset.is_some_and(|end| end > item.offset);
-    }
-}
-
-fn candidates_contained_anchor_count(
-    format: &str,
-    start: u64,
-    end: u64,
-    candidates: &[EmbeddedCandidate],
-    raw_hits: &[RawHit],
-) -> usize {
-    let raw_kind = match format {
-        "zip" => Some("zip"),
-        "tar" => Some("tar"),
-        "bzip2" => Some("bzip2"),
-        _ => None,
-    };
-    if let Some(kind) = raw_kind {
-        return raw_hits
-            .iter()
-            .filter(|hit| hit.kind == kind && hit.offset >= start && hit.offset < end)
-            .count();
-    }
-    candidates
-        .iter()
-        .filter(|item| {
-            item.format == format
-                && item.candidate_kind == "anchor"
-                && item.offset >= start
-                && item.offset < end
-        })
-        .count()
+            .any(|(start, end)| *start < item.offset && item.offset < *end)
+    });
 }
 
 fn scan_sample(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit> {
@@ -1481,9 +1385,7 @@ fn candidate(
         validation,
         candidate_kind: if exact { "logical_archive" } else { "anchor" },
         boundary_kind: if exact { "exact" } else { "unresolved" },
-        range_end_offset: end,
         extractable: exact,
-        contained_anchor_count: 0,
     }
 }
 
