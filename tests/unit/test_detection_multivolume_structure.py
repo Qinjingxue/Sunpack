@@ -4,7 +4,7 @@ from sunpack.pipeline.discovery.relations.resolver import RelationResolver
 from sunpack.core.support.path_keys import path_key
 
 
-def _candidate(path, metadata, members=None):
+def _candidate(path, metadata, members=None, *, is_split=None):
     member_paths = tuple(str(item) for item in (members or [path]))
     archive_input = ArchiveInputDescriptor(
         entry_path=str(path),
@@ -18,7 +18,11 @@ def _candidate(path, metadata, members=None):
         cleanup_paths=member_paths,
         route="relations",
         relation_anchor=dict(metadata),
-        is_split=bool(metadata.get("multivolume")),
+        is_split=(
+            bool(metadata.get("multivolume"))
+            if is_split is None
+            else bool(is_split)
+        ),
     )
 
 
@@ -46,6 +50,18 @@ def test_incomplete_split_family_is_blocked_from_embedded(tmp_path):
 
     assert result.blocked_paths == {path_key(str(first))}
     assert result.residual_paths == set()
+
+
+def test_unconfirmed_single_file_multivolume_hint_reaches_embedded(tmp_path):
+    first = tmp_path / "truncated-sfx.exe"
+    candidate = _candidate(first, {
+        "format": "7z", "relation_confirmed": False, "multivolume": True,
+    }, is_split=False)
+
+    result = RelationResolver().resolve([candidate])
+
+    assert result.blocked_paths == set()
+    assert result.residual_paths == {path_key(str(first))}
 
 
 def test_confirmed_password_required_family_reaches_password_planning(tmp_path):

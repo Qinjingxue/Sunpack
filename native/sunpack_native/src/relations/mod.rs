@@ -369,17 +369,27 @@ fn build_candidate_groups_from_physical(
                 continue;
             };
             if strength == "strong" {
-                strong_suppressed_paths.insert(seed.path.to_ascii_lowercase());
-                strong_suppressed_paths.extend(
-                    strong_seed_related_paths(
-                        seed,
-                        &directory_rows,
-                        &name_index,
-                        anchor,
-                    )
-                    .into_iter()
-                    .map(|path| path.to_ascii_lowercase()),
+                let related = strong_seed_related_paths(
+                    seed,
+                    &directory_rows,
+                    &name_index,
+                    anchor,
                 );
+                // A strong structural seed alone is not proof of a physical
+                // relation.  In particular, a truncated standalone SFX may
+                // look like a first/multivolume input because its declared
+                // logical end lies beyond EOF.  Suppress ordinary fallback
+                // only when at least one distinct numbered sibling exists;
+                // otherwise Embedded/Extraction must get the file and make
+                // the authoritative damage/missing-volume decision.
+                if related.iter().any(|path| !path.eq_ignore_ascii_case(&seed.path)) {
+                    strong_suppressed_paths.insert(seed.path.to_ascii_lowercase());
+                    strong_suppressed_paths.extend(
+                        related
+                            .into_iter()
+                            .map(|path| path.to_ascii_lowercase()),
+                    );
+                }
             }
             for interpretation in name_index.interpretations(seed, &anchor.format) {
                 if !has_filtered_family_trigger(
