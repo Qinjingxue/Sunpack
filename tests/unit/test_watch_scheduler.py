@@ -31,15 +31,7 @@ def WatchScheduler(*args, pipeline_engine=None, **kwargs):
             lambda _config: SimpleNamespace(
                 recent_passwords=[],
                 context=SimpleNamespace(flatten_candidates=set()),
-                run_targets=lambda _paths: SimpleNamespace(
-                    success_count=0,
-                    partial_success_count=0,
-                    failed_tasks=[],
-                    failures=[],
-                    processed_keys=[],
-                    recovered_outputs=[],
-                    target_results=[],
-                ),
+                run_targets=lambda _paths: RunSummary(),
             )
         )
     return RuntimeWatchScheduler(*args, pipeline_engine=pipeline_engine, **kwargs)
@@ -330,14 +322,18 @@ def _write_zip(path: Path):
 
 
 def _nested_failure_summary(path: Path, failure: FailureInfo):
-    return SimpleNamespace(
-        success_count=1,
-        partial_success_count=0,
-        failed_tasks=[f"{path.parent / 'nested-inner.7z.001'}: {failure.message}"],
-        failures=[failure],
-        processed_keys=[str(path)],
-        recovered_outputs=[],
-        target_results=[TargetRunResult(str(path), OutcomeKind.COMPLETE_SUCCESS)],
+    return RunSummary(
+        target_results=(
+            TargetRunResult(
+                str(path),
+                OutcomeKind.COMPLETE_SUCCESS,
+                task_key=str(path),
+            ),
+        ),
+        scan_failed_tasks=(
+            f"{path.parent / 'nested-inner.7z.001'}: {failure.message}",
+        ),
+        scan_failures=(failure,),
     )
 
 
@@ -350,15 +346,7 @@ class _DeferredHandle:
         return self.future.done()
 
     def complete_no_tasks(self):
-        summary = SimpleNamespace(
-            success_count=0,
-            partial_success_count=0,
-            failed_tasks=[],
-            failures=[],
-            processed_keys=[],
-            target_results=[],
-            recovered_outputs=[],
-        )
+        summary = RunSummary()
         self.future.set_result(PipelineResponse(
             request_id=self.path,
             summary=summary,
@@ -1410,7 +1398,7 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
             self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
-            return SimpleNamespace(success_count=0, failed_tasks=[], processed_keys=[], recovered_outputs=[], failures=[])
+            return RunSummary()
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
