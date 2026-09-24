@@ -202,7 +202,7 @@ def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
     scheduler._active_states = {}
     scheduler._quiet_trackers = {}
     scheduler._latest_observations = {}
-    scheduler._inflight_requests = [SimpleNamespace(candidate=_candidate(source), group=None)]
+    scheduler._inflight_requests = [SimpleNamespace(candidate=_candidate(source))]
     scheduler.state = state
     scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
     scheduler._wake_callback = None
