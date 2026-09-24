@@ -84,7 +84,7 @@ def server_command() -> list[str]:
     if is_packaged_process():
         command = [str(current_process_executable()), SERVER_ARG]
     else:
-        entry = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "sunpack.py"))
+        entry = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "..", "sunpack.py"))
         if os.path.isfile(entry):
             command = [str(current_process_executable()), entry, SERVER_ARG]
         else:
