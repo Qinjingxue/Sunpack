@@ -23,7 +23,6 @@ class VerificationEvidence:
     extraction_diagnostics: dict[str, Any] = field(default_factory=dict)
     worker_result: dict[str, Any] = field(default_factory=dict)
     worker_native_diagnostics: dict[str, Any] = field(default_factory=dict)
-    selected_codepage: str | None = None
     progress_manifest: dict[str, Any] | None = None
 
     @property
@@ -37,6 +36,10 @@ class VerificationEvidence:
     @property
     def archive_state_analysis(self) -> dict[str, Any]:
         return dict(self.archive_state.planning_analysis)
+
+    @property
+    def selected_codepage(self) -> str | None:
+        return self.extraction_result.selected_codepage
 
 
 def build_verification_evidence(
@@ -67,7 +70,6 @@ def build_verification_evidence(
                 archive_state = ArchiveState.from_archive_input(descriptor)
             except (TypeError, ValueError, AttributeError):
                 pass
-        archive_input = archive_state.to_archive_input_descriptor()
     with _phase(phase_timer, f"{phase_prefix}_analysis_facts"):
         analysis_facts = _analysis_facts_from_task(task)
     with _phase(phase_timer, f"{phase_prefix}_diagnostics"):
@@ -84,7 +86,6 @@ def build_verification_evidence(
         extraction_diagnostics=extraction_diagnostics,
         worker_result=worker_result,
         worker_native_diagnostics=worker_native_diagnostics,
-        selected_codepage=extraction_result.selected_codepage,
         progress_manifest=progress_manifest,
     )
 
