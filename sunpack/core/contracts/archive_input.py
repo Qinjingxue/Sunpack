@@ -74,6 +74,8 @@ class ArchiveInputDescriptor:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "format_hint", str(self.format_hint or "").strip().lower().lstrip("."))
+        if "segment_start" in self.analysis or "segment_end" in self.analysis:
+            raise ValueError("archive input boundaries belong only to InputExtent")
         if self.open_mode == "concat_ranges" and not self.extents:
             raise ValueError("concat_ranges requires input extents")
         if self.open_mode == "file_range" and not self.parts:
@@ -114,7 +116,7 @@ class ArchiveInputDescriptor:
         analysis = {
             key: value
             for key, value in self.analysis.items()
-            if key not in {"segment_start", "segment_end", "segment_confidence", "segment_source"}
+            if key not in {"segment_confidence", "segment_source"}
         }
         if analysis:
             payload["analysis"] = analysis
@@ -196,8 +198,6 @@ class ArchiveInputDescriptor:
                 end=int(end_raw) if end_raw is not None else None,
             ))
         analysis = dict(raw.get("analysis") or {}) if isinstance(raw.get("analysis"), dict) else {}
-        analysis.pop("segment_start", None)
-        analysis.pop("segment_end", None)
         if open_mode == "file_range" and not parts:
             raise ValueError("file_range requires canonical parts with extent")
         if not parts and not extents and part_paths:
