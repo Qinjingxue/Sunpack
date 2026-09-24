@@ -203,7 +203,7 @@ def archive_input_manifest(
             checksum_error=False,
             item_count=0,
             file_count=0,
-            message="Archive-state manifest could not identify a supported archive format",
+            message="Archive-input manifest could not identify a supported archive format",
         )
     files = [dict(item) for item in payload.get("files") or [] if isinstance(item, dict)]
     file_count = int(payload.get("file_count", 0) or 0)
@@ -241,13 +241,13 @@ def _tar_archive_input_manifest(
 ) -> ArchiveInputManifest:
     try:
         payload = dict(_native_archive_state_tar_manifest(
-            state.archive_input.to_dict(),
+            archive_input.to_dict(),
             max_items,
         ))
     except (OSError, ValueError) as exc:
         return ArchiveInputManifest(
             status=STATUS_UNSUPPORTED, is_archive=False, damaged=False, checksum_error=False,
-            item_count=0, file_count=0, message=f"TAR state could not be read: {exc}",
+            item_count=0, file_count=0, message=f"TAR input could not be read: {exc}",
             archive_type="tar",
         )
     files = [dict(item) for item in payload.get("files") or [] if isinstance(item, dict)]
