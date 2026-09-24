@@ -129,7 +129,7 @@ The rule layer must not depend on processor implementation details; shared defau
 
 ### pipeline.verification
 
-`sunpack.pipeline.verification` is the source of truth for extraction result verification. It builds evidence from `ArchiveTask`, `ExtractionResult`, `ArchiveState`, and `PasswordSession`, runs methods according to the configuration, and returns completeness, file observations, source integrity, a recoverable upper bound, and a decision hint. Whether to retry normally and whether to clean up failed output is decided by the coordinator.
+`sunpack.pipeline.verification` is the source of truth for extraction result verification. It builds evidence from `ArchiveTask`, `ExtractionResult`, the canonical `ArchiveInputDescriptor`, and `PasswordSession`, runs methods according to the configuration, and returns completeness, file observations, source integrity, a recoverable upper bound, and a decision hint. Whether to retry normally and whether to clean up failed output is decided by the coordinator.
 
 ### pipeline.postprocess
 

@@ -2,16 +2,15 @@ import io
 import tarfile
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.core.contracts.archive_state import ArchiveState
-from sunpack.pipeline.verification.archive_state_manifest import archive_state_manifest
+from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
 from sunpack.pipeline.verification.methods._archive_output_match import coverage_from_archive_and_output
 
 
-def _state(path):
-    return ArchiveState.from_archive_input(ArchiveInputDescriptor(
+def _input(path):
+    return ArchiveInputDescriptor(
         entry_path=str(path),
         format_hint="tar",
-    ))
+    )
 
 
 def _pax_record(key: str, value: str) -> bytes:
@@ -33,7 +32,7 @@ def test_tar_source_manifest_walks_beyond_probe_budget(tmp_path):
             info.size = 1
             archive.addfile(info, io.BytesIO(payload))
 
-    manifest = archive_state_manifest(_state(path), max_items=1000)
+    manifest = archive_input_manifest(_input(path), max_items=1000)
 
     assert manifest.ok is True
     assert manifest.archive_walk_complete is True
@@ -49,7 +48,7 @@ def test_tar_duplicate_members_preserve_history_and_worker_output_names(tmp_path
             info.size = len(payload)
             archive.addfile(info, io.BytesIO(payload))
 
-    manifest = archive_state_manifest(_state(path), max_items=100)
+    manifest = archive_input_manifest(_input(path), max_items=100)
 
     assert manifest.ok is True
     assert manifest.item_count >= 2
@@ -85,7 +84,7 @@ def test_tar_pax_long_path_is_applied_to_target_member(tmp_path):
         second.size = 1
         archive.addfile(second, io.BytesIO(b"2"))
 
-    manifest = archive_state_manifest(_state(path), max_items=100)
+    manifest = archive_input_manifest(_input(path), max_items=100)
 
     assert manifest.ok is True
     assert manifest.expected_names == [long_path, "second.txt"]
@@ -112,7 +111,7 @@ def test_tar_manifest_rejects_overlapping_pax_sparse_extents(tmp_path):
     path = tmp_path / "bad-sparse.tar"
     path.write_bytes(data)
 
-    manifest = archive_state_manifest(_state(path), max_items=100)
+    manifest = archive_input_manifest(_input(path), max_items=100)
 
     assert manifest.damaged is True
     assert "sparse extent" in manifest.message
@@ -128,7 +127,7 @@ def test_tar_manifest_applies_gnu_longname_and_longlink_to_next_member(tmp_path)
         info.linkname = long_link
         archive.addfile(info)
 
-    manifest = archive_state_manifest(_state(path), max_items=100)
+    manifest = archive_input_manifest(_input(path), max_items=100)
 
     assert manifest.ok is True
     assert manifest.expected_names == [long_name]
