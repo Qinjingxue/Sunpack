@@ -182,7 +182,7 @@ def assert_plan1_success(
             {
                 "detected_ext": detected_ext(hit),
                 "container_type": container_type(hit),
-                "member_paths": len(hit.member_paths),
+                "member_paths": len(hit.all_parts),
                 "probe_offset": probe_offset(hit),
             }
             for hit in hits
