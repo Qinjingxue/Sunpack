@@ -31,6 +31,13 @@ class EmbeddedCandidate:
     extractable: bool
     contained_anchor_count: int
 
+    @property
+    def password_required(self) -> bool:
+        return self.format == "rar" and self.validation in {
+            "rar4_header_encrypted_main_header_crc",
+            "rar5_encryption_header_crc",
+        }
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "format": self.format,

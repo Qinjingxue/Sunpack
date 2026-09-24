@@ -81,6 +81,7 @@ class ZipAnalysisModule:
             details={
                 "source": "embedded_scan",
                 "validation": validation,
+                "candidate_kind": str(item.get("candidate_kind") or ""),
                 "boundary_kind": boundary_kind,
                 "boundary_confidence": "high" if boundary_kind == "exact" else "bounded_or_unresolved",
             },

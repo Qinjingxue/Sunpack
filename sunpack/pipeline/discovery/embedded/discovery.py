@@ -17,6 +17,7 @@ from sunpack.core.contracts.discovery import (
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.analysis.embedded import inspect_runtime_bundle, scan_embedded_archives
+from sunpack.core.support.global_cache_manager import file_identity
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
 
@@ -101,15 +102,22 @@ class EmbeddedDiscovery:
         candidate: DiscoveryCandidate,
     ) -> tuple[ArchiveTask | None, str]:
         path = candidate.entry_path
-        size = candidate.size
-        if not path or not isinstance(size, int) or size <= 0:
+        if not path:
             return None, "missing_or_empty_file"
 
         try:
+            identity = file_identity(path)
+            size = int(identity[1])
+            if size <= 0:
+                return None, "missing_or_empty_file"
             profile = inspect_runtime_bundle(path, size)
             if profile:
                 return None, f"Runtime bundle: {profile}"
-            scan = scan_embedded_archives(path, expected_size=size)
+            scan = scan_embedded_archives(
+                path,
+                expected_size=size,
+                identity=identity,
+            )
         except OSError:
             return None, "embedded_scan_io_error"
 
@@ -135,6 +143,7 @@ class EmbeddedDiscovery:
                 end,
                 logical_name,
                 confidence=float(item.confidence),
+                password_required=item.password_required,
             )
             segments.append((descriptor, item.to_dict()))
 
@@ -198,13 +207,21 @@ def _descriptor_for_candidate(
     logical_name: str,
     *,
     confidence: float,
+    password_required: bool = False,
 ) -> ArchiveInputDescriptor:
+    analysis = {
+        "segment_confidence": confidence,
+        "segment_source": "embedded",
+    }
+    if password_required:
+        analysis["password_required"] = True
     if start == 0 and (end is None or end >= size):
-        return ArchiveInputDescriptor.from_parts(
-            archive_path=path,
-            part_paths=[path],
+        return ArchiveInputDescriptor(
+            entry_path=path,
             format_hint=archive_format,
             logical_name=logical_name,
+            parts=[ArchiveInputPart(extent=InputExtent(path=path), role="main", volume_number=1)],
+            analysis=analysis,
         )
     extent = InputExtent(path=path, start=start, end=end)
     return ArchiveInputDescriptor(
@@ -213,5 +230,5 @@ def _descriptor_for_candidate(
         format_hint=archive_format,
         logical_name=logical_name,
         parts=[ArchiveInputPart(extent=extent, role="main")],
-        analysis={"segment_confidence": confidence, "segment_source": "embedded"},
+        analysis=analysis,
     )

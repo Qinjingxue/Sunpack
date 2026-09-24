@@ -274,9 +274,15 @@ class ArchiveInputDescriptor:
         if not numbers or any(number <= 0 for number in numbers) or len(set(numbers)) != len(numbers):
             raise ValueError("split volumes require unique positive numbers")
         styles = {item["style"] for item in normalized}
-        if len(styles) != 1:
-            raise ValueError("split volumes must use one naming style")
-        style = normalized[0]["style"]
+        if len(styles) == 1:
+            style = normalized[0]["style"]
+        elif styles == {"rar_sfx_part", "rar_part"}:
+            head = next((item for item in normalized if item["number"] == 1), normalized[0])
+            if head["style"] != "rar_sfx_part":
+                raise ValueError("RAR SFX split family requires the SFX naming style on volume 1")
+            style = "rar_sfx_part"
+        else:
+            raise ValueError("split volumes must use one compatible naming style")
         parts = [
             ArchiveInputPart(
                 extent=InputExtent(path=item["path"], start=item["start"]),

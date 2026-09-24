@@ -974,11 +974,23 @@ fn validate_seven_zip(
         return Ok(None);
     };
     if end > size || next_size > usize::MAX as u64 {
-        return Ok(None);
+        return Ok(Some(logical_candidate(
+            "7z",
+            offset,
+            None,
+            0.90,
+            "start_header_crc_truncated_next_header",
+        )));
     }
     let next = read_at(file, next_start, next_size as usize)?;
     if next.len() != next_size as usize || crc32(&next) != next_crc {
-        return Ok(None);
+        return Ok(Some(logical_candidate(
+            "7z",
+            offset,
+            None,
+            0.90,
+            "start_header_crc_damaged_next_header",
+        )));
     }
     Ok(Some(candidate(
         "7z",
@@ -1635,6 +1647,38 @@ mod tests {
         data.extend_from_slice(&u32::MAX.to_le_bytes());
         data.extend_from_slice(&0u16.to_le_bytes());
         (archive_start, data.len() as u64)
+    }
+
+    #[test]
+    fn keeps_crc_valid_truncated_7z_as_bounded_logical_candidate() {
+        let mut start_header = Vec::new();
+        start_header.extend_from_slice(&1024u64.to_le_bytes());
+        start_header.extend_from_slice(&16u64.to_le_bytes());
+        start_header.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut data = b"carrier-prefix".to_vec();
+        let start = data.len() as u64;
+        data.extend_from_slice(SEVEN_ZIP);
+        data.extend_from_slice(&[0, 4]);
+        data.extend_from_slice(&crc32(&start_header).to_le_bytes());
+        data.extend_from_slice(&start_header);
+        let path = temp_file("embedded_truncated_7z", &data);
+
+        let result = scan_embedded_archives_native(ManagedReader::open(&path).unwrap()).unwrap();
+        let seven = result
+            .candidates
+            .iter()
+            .find(|candidate| candidate.format == "7z")
+            .expect("CRC-valid truncated 7z must remain a logical candidate");
+
+        assert_eq!(seven.offset, start);
+        assert_eq!(seven.end_offset, None);
+        assert_eq!(seven.candidate_kind, "logical_archive");
+        assert_eq!(seven.boundary_kind, "bounded");
+        assert_eq!(seven.range_end_offset, Some(data.len() as u64));
+        assert!(seven.extractable);
+        assert_eq!(seven.validation, "start_header_crc_truncated_next_header");
+        let _ = fs::remove_file(path);
     }
 
     #[test]
