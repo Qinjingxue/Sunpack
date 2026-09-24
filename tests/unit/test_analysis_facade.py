@@ -45,7 +45,6 @@ def test_archive_analyzer_dispatches_file_source_and_request():
         "report_path": "logical.zip",
         "initial_prepass": {"hits": []},
         "capabilities": frozenset({AnalysisCapability.SIGNATURE_PREPASS}),
-        "embedded_scan_allowed": True,
     })]
 
 
@@ -61,6 +60,6 @@ def test_archive_analyzer_dispatches_multi_volume_source():
 def test_analysis_request_rejects_capability_over_budget():
     with pytest.raises(ValueError, match="exceed cheap budget"):
         AnalysisRequest(
-            capabilities=frozenset({AnalysisCapability.EMBEDDED_SCAN}),
+            capabilities=frozenset({AnalysisCapability.FORMAT_STRUCTURE}),
             budget=AnalysisBudget(max_cost=AnalysisCost.CHEAP),
         )
