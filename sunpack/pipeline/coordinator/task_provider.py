@@ -123,6 +123,7 @@ class ArchiveTaskProvider:
 
     def task_from_candidate(self, candidate: DiscoveryCandidate) -> ArchiveTask | None:
         result = self.discovery.discover([candidate])
+        self._record_discovery_failures(result)
         tasks = self.filter_processed_tasks(result.resolved_tasks)
         return tasks[0] if tasks else None
 
