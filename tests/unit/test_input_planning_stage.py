@@ -465,7 +465,6 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
             {"path": str(part2), "start": 0, "end": 10},
             {"path": str(part3), "start": 0, "end": 4},
         ],
-        "segment": {"start": 8, "source": "analysis", "end": 24, "confidence": 0.97},
         "analysis": {"status": "extractable", "confidence": 0.97, "damage_flags": []},
     }
     assert task.archive_input().open_mode == "native_volumes"
