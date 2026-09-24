@@ -222,7 +222,7 @@ class PipelineEngine:
                     stdout=stdout,
                     defer_flatten=submission.origin == "watch",
                 )
-                if getattr(response.summary, "_postprocess_completed", False):
+                if response.summary.postprocess_completed:
                     await self._broker.run(
                         "report",
                         submission.request_id,
