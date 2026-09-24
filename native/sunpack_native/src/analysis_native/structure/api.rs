@@ -890,6 +890,14 @@ pub(crate) fn unified_prefilter_mask_from_head(file_size: u64, head: &[u8]) -> u
 }
 
 #[pyfunction]
+pub(crate) fn inspect_compression_stream_identity(
+    py: Python<'_>,
+    path: &str,
+) -> PyResult<Py<PyDict>> {
+    inspect_compression_stream_identity_impl(py, path)
+}
+
+#[pyfunction]
 pub(crate) fn inspect_compression_stream_structure(
     py: Python<'_>,
     path: &str,
