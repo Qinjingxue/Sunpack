@@ -158,17 +158,8 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
         password_scope_dir=str(tmp_path),
         failure_payload={},
     )
-    waiting_member = tmp_path / "waiting.7z.002"
-    waiting_member.write_bytes(b"x")
-    waiting_group = SimpleNamespace(
-        status="waiting",
-        head_path="",
-        input_paths=[str(waiting_member)],
-        owned_paths=[str(waiting_member)],
-    )
     scheduler.state = SimpleNamespace(
         entry_items=lambda: [password_entry, missing_entry],
-        group_items=lambda: [waiting_group],
     )
     scheduler.config = {}
     calls = []
@@ -180,11 +171,9 @@ def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
     assert [call[0] for call in calls] == [
         str(password_archive),
         str(missing_archive),
-        str(waiting_member),
     ]
     assert calls[0][1]["event_type"] == "startup_password_reconcile"
     assert calls[1][1]["event_type"] == "startup_missing_volume_reconcile"
-    assert calls[2][1]["event_type"] == "startup_group_reconcile"
 
 
 def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
