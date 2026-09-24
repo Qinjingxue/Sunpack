@@ -160,7 +160,6 @@ class ArchiveTask:
 
     def set_archive_state(self, state: ArchiveState) -> None:
         descriptor = state.to_archive_input_descriptor()
-        self.logical_name = descriptor.logical_name or self.logical_name
         self.cleanup_parts = list(dedupe_values([
             *descriptor.part_paths(),
             *self.cleanup_parts,
