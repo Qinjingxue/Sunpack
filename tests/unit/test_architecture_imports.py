@@ -128,3 +128,10 @@ def test_retired_runtime_route_evidence_module_is_absent() -> None:
     assert not (
         _PACKAGE_ROOT / "core" / "support" / "runtime_route_evidence.py"
     ).exists()
+
+
+def test_archive_input_uses_one_serialization_schema() -> None:
+    from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+
+    assert not hasattr(ArchiveInputDescriptor, "to_source_input")
+    assert not hasattr(ArchiveInputDescriptor, "from_source_input")
