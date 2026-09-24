@@ -7,7 +7,7 @@ use crate::analysis_native::{
     probe_zip_volume_paths,
 };
 use crate::scan::directory::NativeDirectorySnapshot;
-use crate::scan::executable_carrier::executable_runtime_bundle_profile;
+use crate::scan::executable_carrier::executable_sfx_stub_profile;
 use crate::scan::pe_overlay::inspect_pe_overlay_structure;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -692,9 +692,26 @@ fn promote_sfx_archive_anchor(
         .get_item("overlay_offset")?
         .and_then(|value| value.extract::<u64>().ok())
         .unwrap_or(0);
-    if !executable_runtime_bundle_profile(py, &row.path, 8 * 1024 * 1024, image_end).is_empty() {
+    if image_end == 0 {
         return Ok(None);
     }
+
+    // Relations only owns genuine self-extracting archives.  A PE with an
+    // arbitrary archive overlay is an Embedded concern (games and application
+    // bundles commonly use that layout).  Prove the decompressor stub first,
+    // using a bounded image-only probe, then validate the archive at the
+    // overlay offset below.
+    let sfx_path = row.path.clone();
+    let sfx_profile = py.detach(move || executable_sfx_stub_profile(&sfx_path, image_end));
+    let sfx_matches_format = match sfx_profile.as_str() {
+        "seven_zip_sfx" => matches!(format.as_str(), "7z" | "zip"),
+        "winrar_sfx" => matches!(format.as_str(), "rar" | "zip"),
+        _ => false,
+    };
+    if !sfx_matches_format {
+        return Ok(None);
+    }
+
     let archive_offset = overlay
         .get_item("archive_offset")?
         .and_then(|value| value.extract::<u64>().ok())

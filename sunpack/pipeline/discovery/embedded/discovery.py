@@ -69,7 +69,8 @@ class EmbeddedDiscovery:
     """Confirm archive payloads only in unclaimed physical files."""
 
     def __init__(self, config: dict[str, Any], options: EmbeddedOptions | None = None):
-        self.gate = EmbeddedScanGate(config, options)
+        self.options = options or EmbeddedOptions()
+        self.gate = EmbeddedScanGate(config, self.options)
 
     def discover(
         self,
@@ -110,9 +111,10 @@ class EmbeddedDiscovery:
             size = int(identity[1])
             if size <= 0:
                 return None, "missing_or_empty_file"
-            profile = inspect_runtime_bundle(path, size)
-            if profile:
-                return None, f"Runtime bundle: {profile}"
+            if not self.options.force_scan:
+                profile = inspect_runtime_bundle(path, size)
+                if profile:
+                    return None, f"Runtime bundle: {profile}"
             scan = scan_embedded_archives(
                 path,
                 expected_size=size,

@@ -3,10 +3,26 @@ use pyo3::prelude::*;
 use std::io;
 
 const CHUNK_BYTES: usize = 1024 * 1024;
+const SFX_STUB_SCAN_BYTES: u64 = 1024 * 1024;
+const NSIS_OVERLAY_PROBE_BYTES: u64 = 64;
 const QT_IFW_TAIL_WINDOW_BYTES: u64 = 1024 * 1024;
 const QT_IFW_MAGIC_COOKIE: u64 = 0xC2630A1C99D668F8;
 const QT_IFW_MAGIC_MARKERS: [u64; 4] = [0x12023233, 0x12023234, 0x12023235, 0x12023236];
 const PYINSTALLER_COOKIE: &[u8] = b"MEI\x0c\x0b\x0a\x0b\x0e";
+const NSIS_FIRST_HEADER_SIGNATURE: &[u8] = b"\xef\xbe\xad\xdeNullsoftInst";
+const SEVEN_ZIP_SFX_MARKERS: &[&[u8]] = &[
+    b"7-Zip SFX",
+    b"7z SFX",
+    b"7-Zip self-extracting archive",
+    b"7\0-\0Z\0i\0p\0 \0S\0F\0X\0",
+    b"7\0z\0 \0S\0F\0X\0",
+    b"7\0-\0Z\0i\0p\0 \0s\0e\0l\0f\0-\0e\0x\0t\0r\0a\0c\0t\0i\0n\0g\0 \0a\0r\0c\0h\0i\0v\0e\0",
+];
+const WINRAR_SFX_MARKERS: &[&[u8]] = &[
+    b"WinRAR SFX",
+    b"RAR decompression sfx archive",
+    b"W\0i\0n\0R\0A\0R\0 \0S\0F\0X\0",
+];
 const SQUIRREL_AWARE_VERSION_UTF16: &[u8] =
     b"S\0q\0u\0i\0r\0r\0e\0l\0A\0w\0a\0r\0e\0V\0e\0r\0s\0i\0o\0n\0";
 const SQUIRREL_SETUP_LOG_UTF16: &[u8] = b"S\0q\0u\0i\0r\0r\0e\0l\0S\0e\0t\0u\0p\0.\0l\0o\0g\0";
@@ -57,6 +73,9 @@ fn runtime_bundle_profile_native(
     if let Some(profile) = scan_image_profiles(&reader, image_scan_limit)? {
         return Ok(profile.to_owned());
     }
+    if nsis_overlay_layout_matches(&reader, executable_image_end)? {
+        return Ok("nsis".to_owned());
+    }
     if qt_ifw_tail_layout_matches(&reader)? {
         return Ok("qt_installer_framework".to_owned());
     }
@@ -64,6 +83,53 @@ fn runtime_bundle_profile_native(
         return Ok("pyinstaller".to_owned());
     }
     Ok(String::new())
+}
+
+pub(crate) fn executable_sfx_stub_profile(path: &str, executable_image_end: u64) -> String {
+    sfx_stub_profile_native(path, executable_image_end).unwrap_or_default()
+}
+
+fn sfx_stub_profile_native(path: &str, executable_image_end: u64) -> io::Result<String> {
+    if path.is_empty() || executable_image_end == 0 {
+        return Ok(String::new());
+    }
+
+    let reader = ManagedReader::open(path)?;
+    let probe_size = reader
+        .len()
+        .min(executable_image_end)
+        .min(SFX_STUB_SCAN_BYTES);
+    if probe_size == 0 {
+        return Ok(String::new());
+    }
+    let image = reader.read_at(0, probe_size as usize)?;
+
+    if contains_any(&image, SEVEN_ZIP_SFX_MARKERS) {
+        return Ok("seven_zip_sfx".to_owned());
+    }
+    if contains_any(&image, WINRAR_SFX_MARKERS) {
+        return Ok("winrar_sfx".to_owned());
+    }
+    Ok(String::new())
+}
+
+fn contains_any(haystack: &[u8], patterns: &[&[u8]]) -> bool {
+    patterns
+        .iter()
+        .any(|pattern| find_subslice(haystack, pattern).is_some())
+}
+
+fn nsis_overlay_layout_matches(
+    reader: &ManagedReader,
+    executable_image_end: u64,
+) -> io::Result<bool> {
+    if executable_image_end == 0 || executable_image_end >= reader.len() {
+        return Ok(false);
+    }
+    let available = reader.len() - executable_image_end;
+    let probe_size = available.min(NSIS_OVERLAY_PROBE_BYTES) as usize;
+    let header = reader.read_at(executable_image_end, probe_size)?;
+    Ok(find_subslice(&header, NSIS_FIRST_HEADER_SIGNATURE).is_some())
 }
 
 fn scan_image_profiles(
@@ -187,6 +253,56 @@ mod tests {
         let profile =
             runtime_bundle_profile_native(path.to_str().unwrap(), data.len() as u64, 2).unwrap();
         assert!(profile.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn identifies_nsis_overlay_header_without_scanning_the_payload() {
+        let image_end = 64u64;
+        let mut data = vec![b'x'; image_end as usize];
+        data.extend_from_slice(b"\x04\x00\x00\x00\xef\xbe\xad\xdeNullsoftInst\x00\x00\x00\x00");
+        data.extend_from_slice(&vec![b'z'; 4096]);
+        let path = temp_file("runtime_profile_nsis", &data);
+        let profile =
+            runtime_bundle_profile_native(path.to_str().unwrap(), image_end, image_end).unwrap();
+        assert_eq!(profile, "nsis");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn identifies_seven_zip_sfx_stub_from_pe_image_marker() {
+        let mut data = b"MZ 7-Zip SFX".to_vec();
+        data.resize(256, 0);
+        let path = temp_file("seven_zip_sfx_stub", &data);
+        assert_eq!(
+            sfx_stub_profile_native(path.to_str().unwrap(), data.len() as u64).unwrap(),
+            "seven_zip_sfx"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn identifies_winrar_sfx_stub_from_pe_image_marker() {
+        let mut data = b"MZ WinRAR SFX".to_vec();
+        data.resize(256, 0);
+        let path = temp_file("winrar_sfx_stub", &data);
+        assert_eq!(
+            sfx_stub_profile_native(path.to_str().unwrap(), data.len() as u64).unwrap(),
+            "winrar_sfx"
+        );
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn arbitrary_pe_image_is_not_an_sfx_stub() {
+        let mut data = b"MZ ordinary application".to_vec();
+        data.resize(256, 0);
+        let path = temp_file("plain_pe_not_sfx", &data);
+        assert!(
+            sfx_stub_profile_native(path.to_str().unwrap(), data.len() as u64)
+                .unwrap()
+                .is_empty()
+        );
         let _ = fs::remove_file(path);
     }
 
