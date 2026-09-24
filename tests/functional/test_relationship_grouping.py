@@ -145,7 +145,7 @@ def test_missing_middle_split_volume_is_not_emitted_as_a_relation_group(tmp_path
 
     assert len(gap) == 3
     assert all(not candidate.is_split for candidate in gap)
-    assert all(len(candidate.member_paths) == 1 for candidate in gap)
+    assert all(len(candidate.archive_input.part_paths()) == 1 for candidate in gap)
 
 
 def test_missing_head_split_volume_is_not_emitted_as_a_relation_group(tmp_path):
@@ -160,7 +160,7 @@ def test_missing_head_split_volume_is_not_emitted_as_a_relation_group(tmp_path):
 
     assert len(lost) == 2
     assert all(not candidate.is_split for candidate in lost)
-    assert all(len(candidate.member_paths) == 1 for candidate in lost)
+    assert all(len(candidate.archive_input.part_paths()) == 1 for candidate in lost)
 
 
 def test_missing_head_split_volume_is_not_recovered_by_filename_only_candidate(tmp_path):
@@ -172,11 +172,11 @@ def test_missing_head_split_volume_is_not_recovered_by_filename_only_candidate(t
     candidates = build_candidates_for_targets([str(root)], config=SCAN_CONFIG)
     recovered = [
         candidate for candidate in candidates
-        if str(root / "lost.7z.002") in candidate.member_paths
+        if str(root / "lost.7z.002") in candidate.archive_input.part_paths()
     ]
 
     assert len(recovered) == 1
-    assert [Path(path).name for path in recovered[0].member_paths] == [
+    assert [Path(path).name for path in recovered[0].archive_input.part_paths()] == [
         "lost.7z.002",
     ]
     assert not recovered[0].is_split
