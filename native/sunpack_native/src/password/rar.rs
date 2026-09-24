@@ -44,8 +44,10 @@ type Aes256CbcDecryptor = Decryptor<Aes256>;
 /// the terminal proof after the password has already been confirmed.
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct RarTerminalProof {
+    pub(crate) password_matched: bool,
     pub(crate) end_block_found: bool,
     pub(crate) end_block_flags: u64,
+    pub(crate) end_offset: Option<u64>,
 }
 
 fn decrypt_cbc_block<C>(cipher: &C, previous: &mut [u8; 16], encrypted: &[u8]) -> [u8; 16]
@@ -1158,6 +1160,77 @@ pub(crate) fn probe_header_encrypted_terminal(
     Ok(None)
 }
 
+#[pyfunction]
+pub(crate) fn resolve_embedded_rar_boundaries(
+    py: Python<'_>,
+    archive_path: String,
+    offsets: Vec<u64>,
+    passwords: Vec<String>,
+) -> PyResult<Py<PyDict>> {
+    const MAX_EMBEDDED_RAR_BLOCKS: usize = 1_000_000;
+
+    let outcome = py.detach(move || -> io::Result<(String, Vec<(u64, u64, String)>, Option<u64>)> {
+        let reader = ManagedReader::open(&archive_path)?;
+        let mut resolved = Vec::with_capacity(offsets.len());
+        if offsets.is_empty() {
+            return Ok(("ok".to_string(), resolved, None));
+        }
+        if passwords.is_empty() {
+            return Ok(("password_required".to_string(), resolved, offsets.first().copied()));
+        }
+
+        for offset in offsets {
+            let mut matched_incomplete = false;
+            let mut exact = None;
+            for password in &passwords {
+                let Some(proof) = probe_header_encrypted_terminal(
+                    &reader,
+                    offset,
+                    password,
+                    MAX_EMBEDDED_RAR_BLOCKS,
+                )? else {
+                    continue;
+                };
+                if !proof.password_matched {
+                    continue;
+                }
+                if proof.end_block_found {
+                    if let Some(end_offset) = proof.end_offset.filter(|end| *end > offset) {
+                        exact = Some((end_offset, password.clone()));
+                        break;
+                    }
+                }
+                matched_incomplete = true;
+                break;
+            }
+            if let Some((end_offset, password)) = exact {
+                resolved.push((offset, end_offset, password));
+                continue;
+            }
+            if matched_incomplete {
+                return Ok(("truncated".to_string(), resolved, Some(offset)));
+            }
+            return Ok(("wrong_password".to_string(), resolved, Some(offset)));
+        }
+        Ok(("ok".to_string(), resolved, None))
+    })?;
+
+    let (status, resolved, failed_offset) = outcome;
+    let result = PyDict::new(py);
+    result.set_item("status", status)?;
+    result.set_item("failed_offset", failed_offset)?;
+    let rows = PyList::empty(py);
+    for (offset, end_offset, password) in resolved {
+        let row = PyDict::new(py);
+        row.set_item("offset", offset)?;
+        row.set_item("end_offset", end_offset)?;
+        row.set_item("password", password)?;
+        rows.append(row)?;
+    }
+    result.set_item("resolved", rows)?;
+    Ok(result.unbind())
+}
+
 fn probe_rar5_encrypted_terminal(
     reader: &ManagedReader,
     start_offset: u64,
@@ -1224,56 +1297,63 @@ fn walk_rar5_encrypted_headers(
     cipher: &Aes256,
     max_blocks: usize,
 ) -> io::Result<RarTerminalProof> {
+    let incomplete = || RarTerminalProof {
+        password_matched: true,
+        ..Default::default()
+    };
     for _ in 0..max_blocks {
         let Some((full, next_header_offset)) =
             read_rar5_encrypted_header(reader, block_offset, cipher)?
         else {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete());
         };
         let stored_crc = u32::from_le_bytes([full[0], full[1], full[2], full[3]]);
         let Some((_header_size, after_size)) = read_vint(&full, 4) else {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete());
         };
         if crc32(&full[4..]) != stored_crc {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete());
         }
         let Some((header_type, after_type)) = read_vint(&full, after_size) else {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete());
         };
         let Some((header_flags, mut field_cursor)) = read_vint(&full, after_type) else {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete());
         };
         if !matches!(header_type, 1..=5) && header_flags & 0x0004 == 0 {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete());
         }
         if header_flags & 0x0001 != 0 {
             let Some((_, after_extra)) = read_vint(&full, field_cursor) else {
-                return Ok(RarTerminalProof::default());
+                return Ok(incomplete());
             };
             field_cursor = after_extra;
         }
         let data_size = if header_flags & 0x0002 != 0 {
             let Some((value, _)) = read_vint(&full, field_cursor) else {
-                return Ok(RarTerminalProof::default());
+                return Ok(incomplete());
             };
             value
         } else {
             0
         };
+        let next = next_header_offset
+            .checked_add(data_size)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RAR5 data offset overflow"))?;
         if header_type == 5 {
             let end_flags = read_vint(&full, field_cursor)
                 .map(|(value, _)| value)
                 .unwrap_or(0);
             return Ok(RarTerminalProof {
+                password_matched: true,
                 end_block_found: true,
                 end_block_flags: end_flags,
+                end_offset: Some(next),
             });
         }
-        block_offset = next_header_offset
-            .checked_add(data_size)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RAR5 data offset overflow"))?;
+        block_offset = next;
     }
-    Ok(RarTerminalProof::default())
+    Ok(incomplete())
 }
 
 fn read_rar5_encrypted_header(
@@ -1376,10 +1456,15 @@ fn walk_rar4_encrypted_headers(
     password: &str,
     max_blocks: usize,
 ) -> io::Result<RarTerminalProof> {
+    let mut password_matched = false;
+    let incomplete = |matched| RarTerminalProof {
+        password_matched: matched,
+        ..Default::default()
+    };
     for _ in 0..max_blocks {
         let salt = reader.read_at(block_offset, 8)?;
         if salt.len() != 8 {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete(password_matched));
         }
         let salt: [u8; 8] = salt.try_into().expect("RAR4 salt length checked");
         let (key, iv) = derive_rar3_key_iv(password, Some(&salt));
@@ -1390,13 +1475,13 @@ fn walk_rar4_encrypted_headers(
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RAR4 encrypted offset overflow"))?;
         let first_ciphertext = reader.read_at(encrypted_offset, 16)?;
         if first_ciphertext.len() != 16 {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete(password_matched));
         }
         let mut previous = iv;
         let first_plaintext = decrypt_cbc_block(&cipher, &mut previous, &first_ciphertext);
         let header_size = u16::from_le_bytes([first_plaintext[5], first_plaintext[6]]) as usize;
         if !(RAR4_MIN_HEADER_SIZE..=2 * 1024 * 1024).contains(&header_size) {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete(password_matched));
         }
         let aligned_size = header_size
             .checked_add(15)
@@ -1404,7 +1489,7 @@ fn walk_rar4_encrypted_headers(
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RAR4 header size overflow"))?;
         let encrypted = reader.read_at(encrypted_offset, aligned_size)?;
         if encrypted.len() != aligned_size {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete(password_matched));
         }
         let plaintext = decrypt_cbc_bytes(&cipher, &iv, &encrypted);
         let full = &plaintext[..header_size];
@@ -1412,28 +1497,32 @@ fn walk_rar4_encrypted_headers(
         let header_type = full[2];
         let header_flags = u16::from_le_bytes([full[3], full[4]]);
         if crc32(&full[2..]) as u16 != stored_crc || !(0x72..=0x7b).contains(&header_type) {
-            return Ok(RarTerminalProof::default());
+            return Ok(incomplete(password_matched));
         }
+        password_matched = true;
         let data_size = if header_flags & RAR4_LONG_BLOCK != 0 {
             if full.len() < 11 {
-                return Ok(RarTerminalProof::default());
+                return Ok(incomplete(true));
             }
             u32::from_le_bytes([full[7], full[8], full[9], full[10]]) as u64
         } else {
             0
         };
-        if header_type == 0x7b {
-            return Ok(RarTerminalProof {
-                end_block_found: true,
-                end_block_flags: u64::from(header_flags),
-            });
-        }
-        block_offset = encrypted_offset
+        let next = encrypted_offset
             .checked_add(aligned_size as u64)
             .and_then(|value| value.checked_add(data_size))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "RAR4 data offset overflow"))?;
+        if header_type == 0x7b {
+            return Ok(RarTerminalProof {
+                password_matched: true,
+                end_block_found: true,
+                end_block_flags: u64::from(header_flags),
+                end_offset: Some(next),
+            });
+        }
+        block_offset = next;
     }
-    Ok(RarTerminalProof::default())
+    Ok(incomplete(password_matched))
 }
 
 fn status(
@@ -1550,13 +1639,27 @@ mod rar5_header_decryption_tests {
     }
 
     #[test]
+    fn encrypted_header_walker_returns_exact_end_for_complete_fixture() {
+        let data = hex_bytes(SINGLE_HP_HEX);
+        let reader = ManagedReader::from_bytes(data.clone(), Default::default());
+        let proof = probe_header_encrypted_terminal(&reader, 0, "secret", 4096)
+            .unwrap()
+            .unwrap();
+        assert!(proof.password_matched);
+        assert!(proof.end_block_found);
+        assert_eq!(proof.end_offset, Some(data.len() as u64));
+    }
+
+    #[test]
     fn encrypted_header_walker_fails_open_on_incomplete_fixture() {
         let data = hex_bytes(PART2_HP_HEX);
         let reader = ManagedReader::from_bytes(data, Default::default());
         let proof = probe_header_encrypted_terminal(&reader, 0, "secret", 4096)
             .unwrap()
             .unwrap();
+        assert!(proof.password_matched);
         assert!(!proof.end_block_found);
+        assert_eq!(proof.end_offset, None);
     }
 
 }

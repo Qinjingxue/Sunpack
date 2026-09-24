@@ -756,6 +756,19 @@ class SingleArchiveExtractor:
                     # inherited directory passwords lives outside ArchiveKnowledge.
                     task.set_knowledge({})
                     task.set_archive_input(descriptor)
+                    # Embedded boundary resolution may already have proven the
+                    # password for this exact logical range. Keep that proof in
+                    # runtime-only state so it is not serialized into manifests.
+                    segment_passwords = task.runtime.get("embedded_segment_passwords")
+                    if isinstance(segment_passwords, dict):
+                        known_password = segment_passwords.get(str(segment.get("start_offset")))
+                        if isinstance(known_password, str):
+                            task.knowledge().set(
+                                "archive.password",
+                                known_password,
+                                source_layer="embedded",
+                                source_module="boundary_resolver",
+                            )
                     # Password verification must bind to the currently active
                     # logical segment.
                     write_source_password_probe_input(task, descriptor.to_dict())

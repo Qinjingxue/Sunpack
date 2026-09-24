@@ -2,7 +2,7 @@
 use crate::io::iocp;
 use crate::io::reader::ManagedReader;
 use crate::scan::compression_stream::{
-    validate_bzip2_structure, validate_gzip_structure, validate_xz_structure_exact,
+    resolve_xz_boundary_exact, validate_bzip2_structure, validate_gzip_structure,
     validate_zstd_structure, ValidationError,
 };
 use aho_corasick::{packed, AhoCorasick};
@@ -64,9 +64,7 @@ struct EmbeddedCandidate {
     validation: &'static str,
     candidate_kind: &'static str,
     boundary_kind: &'static str,
-    range_end_offset: Option<u64>,
     extractable: bool,
-    contained_anchor_count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,9 +159,7 @@ pub(crate) fn scan_embedded_archives_with_reader(
         row.set_item("validation", candidate.validation)?;
         row.set_item("candidate_kind", candidate.candidate_kind)?;
         row.set_item("boundary_kind", candidate.boundary_kind)?;
-        row.set_item("range_end_offset", candidate.range_end_offset)?;
         row.set_item("extractable", candidate.extractable)?;
-        row.set_item("contained_anchor_count", candidate.contained_anchor_count)?;
         rows.append(row)?;
     }
     result.set_item("candidates", rows)?;
@@ -266,10 +262,11 @@ fn scan_embedded_archives_native_with_iocp(
         )
     });
     candidates.dedup_by_key(|candidate| (candidate.offset, candidate.format));
-    resolve_logical_candidates(&mut candidates, &raw_hits, file_size);
-    let logical_resolution_complete = candidates.iter().all(|candidate| {
-        candidate.candidate_kind == "logical_archive" && candidate.boundary_kind != "unresolved"
-    });
+    resolve_logical_candidates(&mut candidates);
+    let logical_resolution_complete = candidates
+        .iter()
+        .filter(|candidate| candidate.candidate_kind == "logical_archive")
+        .all(|candidate| candidate.boundary_kind == "exact");
 
     Ok(NativeScanResult {
         file_size,
@@ -298,94 +295,55 @@ fn validate_raw_hits(
     raw_hits: &[RawHit],
     xz_footer_ends: &[u64],
 ) -> io::Result<Vec<EmbeddedCandidate>> {
-    let collect_parallel = |hits: Vec<&RawHit>| -> io::Result<Vec<EmbeddedCandidate>> {
-        hits.par_iter()
-            .map(|hit| validate_candidate(reader, file_size, hit.kind, hit.offset))
-            .collect::<io::Result<Vec<_>>>()
-            .map(|items| items.into_iter().flatten().collect())
-    };
-
-    // EOCD validation walks the central directory and links every member back
-    // to its local header.  Validate these logical roots first, then avoid
-    // repeating a local-header probe for every member they already cover.
-    let mut candidates = collect_parallel(
-        raw_hits
-            .iter()
-            .filter(|hit| hit.kind == "zip_eocd")
-            .collect(),
-    )?;
-    let zip_ranges = candidates
+    let zip_eocd_hits = raw_hits
         .iter()
-        .filter(|candidate| candidate.format == "zip" && candidate.boundary_kind == "exact")
-        .filter_map(|candidate| candidate.end_offset.map(|end| (candidate.offset, end)))
+        .filter(|hit| hit.kind == "zip_eocd")
+        .collect::<Vec<_>>();
+    let mut candidates = zip_eocd_hits
+        .par_iter()
+        .map(|hit| validate_candidate(reader, file_size, hit.kind, hit.offset))
+        .collect::<io::Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
         .collect::<Vec<_>>();
 
-    let mut ordinary = collect_parallel(
-        raw_hits
-            .iter()
-            .filter(|hit| !matches!(hit.kind, "zip_eocd" | "zip" | "tar" | "bzip2" | "xz"))
-            .collect(),
-    )?;
-    candidates.append(&mut ordinary);
-
-    let xz_candidates = raw_hits
+    // ZIP EOCD geometry can prove a logical root before its local-header hit is
+    // visited. Seed exact ownership with those ranges, then process every other
+    // hit in physical order. Once a resolver proves [start,end), signatures
+    // inside that interval cannot add a peer carrier boundary and are skipped
+    // before invoking any potentially size-proportional parser.
+    let mut seeded_ranges = candidates
         .iter()
-        .filter(|hit| hit.kind == "xz")
-        .collect::<Vec<_>>()
-        .par_iter()
-        .map(|hit| validate_xz(reader, file_size, hit.offset, xz_footer_ends))
-        .collect::<io::Result<Vec<_>>>()?;
-    candidates.extend(xz_candidates.into_iter().flatten());
+        .filter(|candidate| candidate.boundary_kind == "exact")
+        .filter_map(|candidate| candidate.end_offset.map(|end| (candidate.offset, end)))
+        .collect::<Vec<_>>();
+    seeded_ranges.sort_unstable();
 
-    // A bzip2 file may be a concatenation of complete streams.  Validation
-    // from the first stream walks every immediately adjacent stream, so later
-    // BZh hits inside that exact range are member anchors rather than separate
-    // logical archives.  Process roots in order to avoid decoding the same
-    // suffix repeatedly for large concatenated files.
-    let mut bzip2_range_end = None::<u64>;
-    for hit in raw_hits.iter().filter(|hit| hit.kind == "bzip2") {
-        if bzip2_range_end.is_some_and(|end| hit.offset < end) {
+    let mut range_index = 0usize;
+    let mut covered_until = 0u64;
+    for hit in raw_hits.iter().filter(|hit| hit.kind != "zip_eocd") {
+        while range_index < seeded_ranges.len() && seeded_ranges[range_index].0 <= hit.offset {
+            covered_until = covered_until.max(seeded_ranges[range_index].1);
+            range_index += 1;
+        }
+        if hit.offset < covered_until {
             continue;
         }
-        if let Some(candidate) = validate_candidate(reader, file_size, hit.kind, hit.offset)? {
-            if let Some(end) = candidate.end_offset {
-                bzip2_range_end = Some(end);
-            }
-            candidates.push(candidate);
-        }
-    }
 
-    let mut orphan_zip_anchors = collect_parallel(
-        raw_hits
-            .iter()
-            .filter(|hit| {
-                hit.kind == "zip"
-                    && !zip_ranges
-                        .iter()
-                        .any(|(start, end)| hit.offset >= *start && hit.offset < *end)
-            })
-            .collect(),
-    )?;
-    candidates.append(&mut orphan_zip_anchors);
-
-    // Each TAR member contains another valid ustar signature.  Walking every
-    // member to the same double-zero terminator is quadratic.  A successful
-    // walk from the earliest uncovered header proves all later member anchors
-    // inside that exact archive range.
-    let mut tar_ranges = Vec::<(u64, u64)>::new();
-    for hit in raw_hits.iter().filter(|hit| hit.kind == "tar") {
-        if tar_ranges
-            .iter()
-            .any(|(start, end)| hit.offset >= *start && hit.offset < *end)
-        {
+        let resolved = if hit.kind == "xz" {
+            validate_xz(reader, file_size, hit.offset, xz_footer_ends)?
+        } else {
+            validate_candidate(reader, file_size, hit.kind, hit.offset)?
+        };
+        let Some(candidate) = resolved else {
             continue;
-        }
-        if let Some(candidate) = validate_candidate(reader, file_size, hit.kind, hit.offset)? {
-            if let Some(end) = candidate.end_offset {
-                tar_ranges.push((candidate.offset, end));
+        };
+        if let Some(end) = candidate.end_offset {
+            if candidate.boundary_kind == "exact" {
+                covered_until = covered_until.max(end);
             }
-            candidates.push(candidate);
         }
+        candidates.push(candidate);
     }
     Ok(candidates)
 }
@@ -398,113 +356,20 @@ fn candidate_rank(candidate: &EmbeddedCandidate) -> u8 {
     }
 }
 
-fn resolve_logical_candidates(
-    candidates: &mut Vec<EmbeddedCandidate>,
-    raw_hits: &[RawHit],
-    file_size: u64,
-) {
-    // TAR member headers independently validate from their own offset to the
-    // same end marker.  Only the earliest member is the logical archive start.
-    let mut tar_ends = std::collections::HashMap::<u64, u64>::new();
-    for item in candidates.iter().filter(|item| item.format == "tar") {
-        if let Some(end) = item.end_offset {
-            tar_ends
-                .entry(end)
-                .and_modify(|start| *start = (*start).min(item.offset))
-                .or_insert(item.offset);
-        }
-    }
-    candidates.retain(|item| {
-        item.format != "tar"
-            || item.end_offset.is_none()
-            || tar_ends.get(&item.end_offset.unwrap()).copied() == Some(item.offset)
-    });
-
+fn resolve_logical_candidates(candidates: &mut Vec<EmbeddedCandidate>) {
+    // Once an exact logical range is proven, every signature strictly inside
+    // that range belongs to the archive payload. Nested archives are discovered
+    // after extraction by the recursive pipeline, never as peer carrier slices.
     let exact_ranges = candidates
         .iter()
-        .filter_map(|item| item.end_offset.map(|end| (item.format, item.offset, end)))
-        .collect::<Vec<_>>();
-    let contained_counts = candidates
-        .iter()
-        .map(|item| {
-            item.end_offset.map(|end| {
-                candidates_contained_anchor_count(
-                    item.format,
-                    item.offset,
-                    end,
-                    candidates,
-                    raw_hits,
-                )
-            })
-        })
-        .collect::<Vec<_>>();
-    for (item, count) in candidates.iter_mut().zip(contained_counts) {
-        if let Some(count) = count {
-            item.contained_anchor_count = count;
-        }
-    }
-    // Local ZIP headers referenced by an EOCD candidate are member anchors,
-    // not independent ZIP archives.
-    candidates.retain(|item| {
-        if item.format != "zip" || item.candidate_kind != "anchor" {
-            return true;
-        }
-        !exact_ranges.iter().any(|(format, start, end)| {
-            *format == "zip" && item.offset >= *start && item.offset < *end
-        })
-    });
-
-    let logical_starts = candidates
-        .iter()
         .filter(|item| item.candidate_kind == "logical_archive")
-        .map(|item| item.offset)
+        .filter_map(|item| item.end_offset.map(|end| (item.offset, end)))
         .collect::<Vec<_>>();
-    for item in candidates
-        .iter_mut()
-        .filter(|item| item.end_offset.is_none())
-    {
-        if item.candidate_kind != "logical_archive" {
-            continue;
-        }
-        item.range_end_offset = logical_starts
+    candidates.retain(|item| {
+        !exact_ranges
             .iter()
-            .copied()
-            .filter(|start| *start > item.offset)
-            .min()
-            .or(Some(file_size));
-        item.boundary_kind = "bounded";
-        item.extractable = item.range_end_offset.is_some_and(|end| end > item.offset);
-    }
-}
-
-fn candidates_contained_anchor_count(
-    format: &str,
-    start: u64,
-    end: u64,
-    candidates: &[EmbeddedCandidate],
-    raw_hits: &[RawHit],
-) -> usize {
-    let raw_kind = match format {
-        "zip" => Some("zip"),
-        "tar" => Some("tar"),
-        "bzip2" => Some("bzip2"),
-        _ => None,
-    };
-    if let Some(kind) = raw_kind {
-        return raw_hits
-            .iter()
-            .filter(|hit| hit.kind == kind && hit.offset >= start && hit.offset < end)
-            .count();
-    }
-    candidates
-        .iter()
-        .filter(|item| {
-            item.format == format
-                && item.candidate_kind == "anchor"
-                && item.offset >= start
-                && item.offset < end
-        })
-        .count()
+            .any(|(start, end)| *start < item.offset && item.offset < *end)
+    });
 }
 
 fn scan_sample(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit> {
@@ -697,7 +562,7 @@ fn validate_zip_eocd(
     if cd_size > 0 && cd_magic.as_slice() != b"PK\x01\x02" {
         return Ok(None);
     }
-    if !validate_zip_central_directory(
+    if !validate_zip_boundary_evidence(
         file,
         actual_cd_start,
         directory_end,
@@ -712,9 +577,9 @@ fn validate_zip_eocd(
         Some(end),
         1.0,
         if needs_zip64 {
-            "zip64_eocd_central_directory_and_local_links"
+            "zip64_eocd_geometry_and_first_local_link"
         } else {
-            "eocd_central_directory_and_local_links"
+            "eocd_geometry_and_first_local_link"
         },
     )))
 }
@@ -781,67 +646,59 @@ fn parse_zip64_end_records(
     }))
 }
 
-fn validate_zip_central_directory(
+fn validate_zip_boundary_evidence(
     file: &ManagedReader,
     start: u64,
     end: u64,
     archive_offset: u64,
     entries: usize,
 ) -> io::Result<bool> {
-    let mut cursor = start;
-    for _ in 0..entries {
-        let fixed = read_at(file, cursor, 46)?;
-        if fixed.len() != 46 || &fixed[..4] != b"PK\x01\x02" {
-            return Ok(false);
-        }
-        let name_len = u16::from_le_bytes(fixed[28..30].try_into().unwrap()) as u64;
-        let extra_len = u16::from_le_bytes(fixed[30..32].try_into().unwrap()) as u64;
-        let comment_len = u16::from_le_bytes(fixed[32..34].try_into().unwrap()) as u64;
-        let variable_len = name_len
-            .checked_add(extra_len)
-            .and_then(|value| value.checked_add(comment_len));
-        let Some(next) = variable_len.and_then(|value| cursor.checked_add(46 + value)) else {
-            return Ok(false);
-        };
-        if next > end || extra_len > usize::MAX as u64 {
-            return Ok(false);
-        }
-        let compressed = u32::from_le_bytes(fixed[20..24].try_into().unwrap());
-        let uncompressed = u32::from_le_bytes(fixed[24..28].try_into().unwrap());
-        let disk_start = u16::from_le_bytes(fixed[34..36].try_into().unwrap());
-        let local_32 = u32::from_le_bytes(fixed[42..46].try_into().unwrap());
-        let local_offset = if local_32 == u32::MAX {
-            let extra = read_at(file, cursor + 46 + name_len, extra_len as usize)?;
-            let Some(value) = zip64_central_local_offset(
-                &extra,
-                uncompressed == u32::MAX,
-                compressed == u32::MAX,
-                disk_start == u16::MAX,
-            ) else {
-                return Ok(false);
-            };
-            value
-        } else {
-            u64::from(local_32)
-        };
-        let Some(absolute_local) = archive_offset.checked_add(local_offset) else {
-            return Ok(false);
-        };
-        if absolute_local >= start || read_at(file, absolute_local, 4)?.as_slice() != ZIP_LOCAL {
-            return Ok(false);
-        }
-        cursor = next;
+    if entries == 0 {
+        return Ok(start == end);
     }
-    if cursor == end {
-        return Ok(true);
-    }
-    // Optional central-directory digital signature.
-    let signature = read_at(file, cursor, 6)?;
-    if signature.len() != 6 || &signature[..4] != b"PK\x05\x05" {
+    let fixed = read_at(file, start, 46)?;
+    if fixed.len() != 46 || &fixed[..4] != b"PK\x01\x02" {
         return Ok(false);
     }
-    let length = u16::from_le_bytes(signature[4..6].try_into().unwrap()) as u64;
-    Ok(cursor.checked_add(6 + length) == Some(end))
+    let name_len = u16::from_le_bytes(fixed[28..30].try_into().unwrap()) as u64;
+    let extra_len = u16::from_le_bytes(fixed[30..32].try_into().unwrap()) as u64;
+    let comment_len = u16::from_le_bytes(fixed[32..34].try_into().unwrap()) as u64;
+    let Some(first_end) = name_len
+        .checked_add(extra_len)
+        .and_then(|value| value.checked_add(comment_len))
+        .and_then(|value| start.checked_add(46 + value))
+    else {
+        return Ok(false);
+    };
+    if first_end > end || extra_len > usize::MAX as u64 {
+        return Ok(false);
+    }
+
+    let compressed = u32::from_le_bytes(fixed[20..24].try_into().unwrap());
+    let uncompressed = u32::from_le_bytes(fixed[24..28].try_into().unwrap());
+    let disk_start = u16::from_le_bytes(fixed[34..36].try_into().unwrap());
+    if disk_start != 0 && disk_start != u16::MAX {
+        return Ok(false);
+    }
+    let local_32 = u32::from_le_bytes(fixed[42..46].try_into().unwrap());
+    let local_offset = if local_32 == u32::MAX {
+        let extra = read_at(file, start + 46 + name_len, extra_len as usize)?;
+        let Some(value) = zip64_central_local_offset(
+            &extra,
+            uncompressed == u32::MAX,
+            compressed == u32::MAX,
+            disk_start == u16::MAX,
+        ) else {
+            return Ok(false);
+        };
+        value
+    } else {
+        u64::from(local_32)
+    };
+    let Some(absolute_local) = archive_offset.checked_add(local_offset) else {
+        return Ok(false);
+    };
+    Ok(absolute_local < start && read_at(file, absolute_local, 4)?.as_slice() == ZIP_LOCAL)
 }
 
 fn zip64_central_local_offset(
@@ -968,28 +825,22 @@ fn validate_seven_zip(
     }
     let next_offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
     let next_size = u64::from_le_bytes(header[20..28].try_into().unwrap());
-    let next_crc = u32::from_le_bytes(header[28..32].try_into().unwrap());
-    let next_start = offset.saturating_add(32).saturating_add(next_offset);
+    let Some(next_start) = offset
+        .checked_add(32)
+        .and_then(|value| value.checked_add(next_offset))
+    else {
+        return Ok(None);
+    };
     let Some(end) = next_start.checked_add(next_size) else {
         return Ok(None);
     };
-    if end > size || next_size > usize::MAX as u64 {
+    if end > size {
         return Ok(Some(logical_candidate(
             "7z",
             offset,
             None,
             0.90,
-            "start_header_crc_truncated_next_header",
-        )));
-    }
-    let next = read_at(file, next_start, next_size as usize)?;
-    if next.len() != next_size as usize || crc32(&next) != next_crc {
-        return Ok(Some(logical_candidate(
-            "7z",
-            offset,
-            None,
-            0.90,
-            "start_header_crc_damaged_next_header",
+            "start_header_crc_truncated_declared_range",
         )));
     }
     Ok(Some(candidate(
@@ -997,7 +848,7 @@ fn validate_seven_zip(
         offset,
         Some(end),
         1.0,
-        "start_and_next_header_crc",
+        "start_header_crc_and_declared_end",
     )))
 }
 
@@ -1239,30 +1090,25 @@ fn validate_xz(
         return Ok(None);
     }
     let first_possible = footer_ends.partition_point(|end| *end < offset + 24);
-    let mut structure = None;
     for &end in &footer_ends[first_possible..] {
         if end > size {
             break;
         }
-        match validate_xz_structure_exact(file, offset, end) {
-            Ok(value) => {
-                structure = Some(value);
-                break;
+        match resolve_xz_boundary_exact(file, offset, end) {
+            Ok(structure) => {
+                return Ok(Some(candidate(
+                    "xz",
+                    offset,
+                    Some(structure.end_offset),
+                    0.99,
+                    "xz_header_index_footer_boundary",
+                )));
             }
             Err(ValidationError::Invalid(_)) => {}
             Err(ValidationError::Io(error)) => return Err(error),
         }
     }
-    let Some(structure) = structure else {
-        return Ok(None);
-    };
-    Ok(Some(candidate(
-        "xz",
-        offset,
-        Some(structure.end_offset),
-        0.99,
-        "xz_header_block_index_footer_structure_walk",
-    )))
+    Ok(None)
 }
 
 fn validate_zstd(
@@ -1481,9 +1327,7 @@ fn candidate(
         validation,
         candidate_kind: if exact { "logical_archive" } else { "anchor" },
         boundary_kind: if exact { "exact" } else { "unresolved" },
-        range_end_offset: end,
         extractable: exact,
-        contained_anchor_count: 0,
     }
 }
 
@@ -1650,7 +1494,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_crc_valid_truncated_7z_as_bounded_logical_candidate() {
+    fn keeps_crc_valid_truncated_7z_unresolved_and_unextractable() {
         let mut start_header = Vec::new();
         start_header.extend_from_slice(&1024u64.to_le_bytes());
         start_header.extend_from_slice(&16u64.to_le_bytes());
@@ -1674,10 +1518,47 @@ mod tests {
         assert_eq!(seven.offset, start);
         assert_eq!(seven.end_offset, None);
         assert_eq!(seven.candidate_kind, "logical_archive");
-        assert_eq!(seven.boundary_kind, "bounded");
-        assert_eq!(seven.range_end_offset, Some(data.len() as u64));
-        assert!(seven.extractable);
-        assert_eq!(seven.validation, "start_header_crc_truncated_next_header");
+        assert_eq!(seven.boundary_kind, "unresolved");
+        assert!(!seven.extractable);
+        assert_eq!(seven.validation, "start_header_crc_truncated_declared_range");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn exact_7z_range_suppresses_valid_inner_stream_before_validation() {
+        let mut gzip = GzEncoder::new(Vec::new(), Compression::fast());
+        gzip.write_all(b"inner payload").unwrap();
+        let inner = gzip.finish().unwrap();
+        let next_header = b"\x01";
+
+        let mut start_header = Vec::new();
+        start_header.extend_from_slice(&(inner.len() as u64).to_le_bytes());
+        start_header.extend_from_slice(&(next_header.len() as u64).to_le_bytes());
+        start_header.extend_from_slice(&0u32.to_le_bytes());
+
+        let mut data = b"carrier-prefix".to_vec();
+        let start = data.len() as u64;
+        data.extend_from_slice(SEVEN_ZIP);
+        data.extend_from_slice(&[0, 4]);
+        data.extend_from_slice(&crc32(&start_header).to_le_bytes());
+        data.extend_from_slice(&start_header);
+        data.extend_from_slice(&inner);
+        data.extend_from_slice(next_header);
+        let end = data.len() as u64;
+        let path = temp_file("embedded_7z_owns_inner_stream", &data);
+
+        let result = scan_embedded_archives_native(ManagedReader::open(&path).unwrap()).unwrap();
+        let logical = result
+            .candidates
+            .iter()
+            .filter(|candidate| candidate.candidate_kind == "logical_archive")
+            .collect::<Vec<_>>();
+
+        assert_eq!(logical.len(), 1);
+        assert_eq!(logical[0].format, "7z");
+        assert_eq!(logical[0].offset, start);
+        assert_eq!(logical[0].end_offset, Some(end));
+        assert!(!result.candidates.iter().any(|candidate| candidate.format == "gzip"));
         let _ = fs::remove_file(path);
     }
 
@@ -1698,9 +1579,8 @@ mod tests {
         assert_eq!(zip.end_offset, Some(end));
         assert_eq!(
             zip.validation,
-            "zip64_eocd_central_directory_and_local_links"
+            "zip64_eocd_geometry_and_first_local_link"
         );
-        assert_eq!(zip.contained_anchor_count, 1);
         let _ = fs::remove_file(path);
     }
 
@@ -1724,7 +1604,6 @@ mod tests {
         assert_eq!(tar.len(), 1);
         assert_eq!(tar[0].offset, start);
         assert_eq!(tar[0].end_offset, Some(end));
-        assert_eq!(tar[0].contained_anchor_count, 2);
         let _ = fs::remove_file(path);
     }
 
@@ -1751,7 +1630,6 @@ mod tests {
         assert_eq!(bzip2.len(), 1);
         assert_eq!(bzip2[0].offset, start);
         assert_eq!(bzip2[0].end_offset, Some(end));
-        assert_eq!(bzip2[0].contained_anchor_count, 2);
         assert_eq!(
             bzip2[0].validation,
             "bzip2_concatenated_streams_complete_huffman_walk"

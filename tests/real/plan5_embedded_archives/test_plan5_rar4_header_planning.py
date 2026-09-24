@@ -54,8 +54,8 @@ def test_plan5_planner_plans_header_encrypted_rar4_embedded_segment(tmp_path, pl
     segment = rar_segments[0]
     assert segment["start_offset"] == len(prefix), segment
     assert segment["end_offset"] is not None and segment["end_offset"] > segment["start_offset"], (
-        "rar4-header segment must keep a bounded end offset (regression: was None "
-        "after being misclassified as probably_truncated)"
+        "rar4-header segment must have an exact decrypted end offset "
+        "(regression: encrypted boundaries must never fall back to guessed ranges)"
     )
 
     if plan5_error is not None:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import os
 from typing import Any
 
@@ -16,7 +16,13 @@ from sunpack.core.contracts.discovery import (
     StageResult,
 )
 from sunpack.core.contracts.tasks import ArchiveTask
-from sunpack.core.analysis.embedded import inspect_runtime_bundle, scan_embedded_archives
+from sunpack.core.analysis.embedded import (
+    inspect_runtime_bundle,
+    resolve_encrypted_rar_boundaries,
+    scan_embedded_archives,
+)
+from sunpack.core.passwords.internal.lists import dedupe_passwords
+from sunpack.core.passwords.internal.local_files import discover_directory_passwords_for_archive
 from sunpack.core.support.global_cache_manager import file_identity
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
@@ -69,6 +75,7 @@ class EmbeddedDiscovery:
     """Confirm archive payloads only in unclaimed physical files."""
 
     def __init__(self, config: dict[str, Any], options: EmbeddedOptions | None = None):
+        self.config = config
         self.options = options or EmbeddedOptions()
         self.gate = EmbeddedScanGate(config, self.options)
 
@@ -91,7 +98,14 @@ class EmbeddedDiscovery:
 
             resolved, reason = self._discover_candidate(candidate)
             if resolved is None:
-                result.add_residual(candidate, source="embedded", reason=reason)
+                if reason in {
+                    "embedded_password_required",
+                    "embedded_wrong_password",
+                    "embedded_truncated",
+                }:
+                    result.add_blocked(candidate, source="embedded", reason=reason)
+                else:
+                    result.add_residual(candidate, source="embedded", reason=reason)
                 continue
             result.add_resolved(resolved, reason=reason)
 
@@ -123,10 +137,73 @@ class EmbeddedDiscovery:
         except OSError:
             return None, "embedded_scan_io_error"
 
+        password_by_offset: dict[int, str] = {}
+        encrypted_offsets = [
+            item.offset
+            for item in scan.candidates
+            if item.candidate_kind == "logical_archive"
+            and item.password_required
+            and item.end_offset is None
+        ]
+        if encrypted_offsets:
+            passwords = self._password_candidates(path)
+            try:
+                boundary = resolve_encrypted_rar_boundaries(
+                    path,
+                    encrypted_offsets,
+                    passwords,
+                )
+            except (OSError, RuntimeError, ValueError):
+                return None, "embedded_scan_io_error"
+            status = str(boundary.get("status") or "")
+            if status == "password_required":
+                return None, "embedded_password_required"
+            if status == "wrong_password":
+                return None, "embedded_wrong_password"
+            if status == "truncated":
+                return None, "embedded_truncated"
+            if status != "ok":
+                return None, "embedded_scan_io_error"
+
+            resolved_rows = {
+                int(row["offset"]): (int(row["end_offset"]), str(row["password"]))
+                for row in boundary.get("resolved") or []
+                if isinstance(row, dict)
+                and row.get("end_offset") is not None
+                and row.get("password") is not None
+            }
+            rewritten = []
+            for item in scan.candidates:
+                resolved = resolved_rows.get(item.offset)
+                if resolved is None:
+                    rewritten.append(item)
+                    continue
+                end_offset, password = resolved
+                password_by_offset[item.offset] = password
+                rewritten.append(replace(
+                    item,
+                    end_offset=end_offset,
+                    validation=f"{item.validation}_decrypted_end",
+                    boundary_kind="exact",
+                    extractable=True,
+                ))
+            scan = replace(
+                scan,
+                candidates=tuple(rewritten),
+                logical_resolution_complete=all(
+                    item.candidate_kind != "logical_archive"
+                    or item.boundary_kind == "exact"
+                    for item in rewritten
+                ),
+            )
+
         physical = [
             item
             for item in scan.candidates
-            if item.candidate_kind == "logical_archive" and item.extractable
+            if item.candidate_kind == "logical_archive"
+            and item.boundary_kind == "exact"
+            and item.extractable
+            and item.end_offset is not None
         ]
         if not scan.complete or not physical:
             return None, "no_complete_embedded_archive"
@@ -135,14 +212,13 @@ class EmbeddedDiscovery:
         segments: list[tuple[ArchiveInputDescriptor, dict[str, Any]]] = []
         base_name = candidate.logical_name or os.path.basename(path)
         for index, item in enumerate(physical, start=1):
-            end = item.range_end_offset or item.end_offset
             logical_name = f"{base_name}_{index:02d}_{item.format}"
             descriptor = _descriptor_for_candidate(
                 path,
                 size,
                 item.format,
                 item.offset,
-                end,
+                item.end_offset,
                 logical_name,
                 confidence=float(item.confidence),
                 password_required=item.password_required,
@@ -150,19 +226,32 @@ class EmbeddedDiscovery:
             segments.append((descriptor, item.to_dict()))
 
         primary = segments[0][0]
+        task = ArchiveTask.from_archive_input(
+            primary,
+            discovery_source="embedded",
+            carrier_path=candidate.carrier_path,
+            cleanup_paths=candidate.cleanup_paths,
+            discovery_evidence={
+                "scan": scan.to_prepass(),
+            },
+            discovery_segments=tuple(segments),
+        )
+        if password_by_offset:
+            task.runtime["embedded_segment_passwords"] = {
+                str(offset): password
+                for offset, password in password_by_offset.items()
+            }
         return (
-            ArchiveTask.from_archive_input(
-                primary,
-                discovery_source="embedded",
-                carrier_path=candidate.carrier_path,
-                cleanup_paths=candidate.cleanup_paths,
-                discovery_evidence={
-                    "scan": scan.to_prepass(),
-                },
-                discovery_segments=tuple(segments),
-            ),
+            task,
             f"Validated embedded {primary.format_hint} at offset {primary.primary_extent.start if primary.primary_extent else 0}",
         )
+
+    def _password_candidates(self, path: str) -> list[str]:
+        return dedupe_passwords([
+            *discover_directory_passwords_for_archive(path, self.config),
+            *list(self.config.get("user_passwords") or []),
+            *list(self.config.get("builtin_passwords") or []),
+        ])
 
 
 def select_single_candidate_ratio(

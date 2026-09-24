@@ -86,9 +86,7 @@ def test_force_scan_bypasses_all_runtime_bundle_guards(tmp_path, monkeypatch):
                 validation="start_header_crc",
                 candidate_kind="logical_archive",
                 boundary_kind="exact",
-                range_end_offset=128,
                 extractable=True,
-                contained_anchor_count=1,
             ),
         ),
         hits=(),
@@ -177,16 +175,14 @@ def test_embedded_rar_header_encryption_reaches_canonical_input(tmp_path, monkey
                 confidence=1.0,
                 validation="rar5_encryption_header_crc",
                 candidate_kind="logical_archive",
-                boundary_kind="bounded",
-                range_end_offset=128,
-                extractable=True,
-                contained_anchor_count=1,
+                boundary_kind="unresolved",
+                extractable=False,
             ),
         ),
         hits=(),
         read_bytes=128,
         file_size=128,
-        logical_resolution_complete=True,
+        logical_resolution_complete=False,
         raw_hit_count=1,
         budget_exhausted=False,
     )
@@ -198,10 +194,71 @@ def test_embedded_rar_header_encryption_reaches_canonical_input(tmp_path, monkey
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
         lambda *_args, **_kwargs: scan,
     )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.resolve_encrypted_rar_boundaries",
+        lambda _path, _offsets, _passwords: {
+            "status": "ok",
+            "failed_offset": None,
+            "resolved": [{"offset": 16, "end_offset": 128, "password": "secret"}],
+        },
+    )
 
-    result = EmbeddedDiscovery({}).discover([_candidate(path)])
+    result = EmbeddedDiscovery({"user_passwords": ["secret"]}).discover([_candidate(path)])
 
     assert len(result.resolved_tasks) == 1
     descriptor = result.resolved_tasks[0].archive_input()
     assert descriptor.open_mode == "file_range"
+    assert descriptor.primary_extent.end == 128
     assert descriptor.analysis["password_required"] is True
+    assert result.resolved_tasks[0].runtime["embedded_segment_passwords"]["16"] == "secret"
+
+
+def test_embedded_rar_wrong_password_blocks_whole_carrier(tmp_path, monkeypatch):
+    path = tmp_path / "carrier.bin"
+    path.write_bytes(b"x" * 128)
+    scan = EmbeddedScanResult(
+        complete=True,
+        candidates=(
+            EmbeddedCandidate(
+                format="rar",
+                offset=16,
+                end_offset=None,
+                confidence=1.0,
+                validation="rar5_encryption_header_crc",
+                candidate_kind="logical_archive",
+                boundary_kind="unresolved",
+                extractable=False,
+            ),
+        ),
+        hits=(),
+        read_bytes=128,
+        file_size=128,
+        logical_resolution_complete=False,
+        raw_hit_count=1,
+        budget_exhausted=False,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
+        lambda _path, _size: None,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
+        lambda *_args, **_kwargs: scan,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.resolve_encrypted_rar_boundaries",
+        lambda _path, _offsets, _passwords: {
+            "status": "wrong_password",
+            "failed_offset": 16,
+            "resolved": [],
+        },
+    )
+
+    result = EmbeddedDiscovery({"user_passwords": ["wrong"]}).discover([_candidate(path)])
+
+    assert result.resolved_tasks == []
+    assert result.blocked_paths
+    assert any(
+        trace.reason == "embedded_wrong_password" and trace.status == "blocked"
+        for trace in result.traces
+    )

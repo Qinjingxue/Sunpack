@@ -8,7 +8,7 @@ from sunpack.core.support.archive_sessions import get_archive_session
 from sunpack.core.support.global_cache_manager import GLOBAL_CACHE, file_identity
 
 
-_CACHE_NAMESPACE = "embedded_archive_scan_v3"
+_CACHE_NAMESPACE = "embedded_archive_scan_v4"
 _SCAN_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 _RESULT_FIELDS = frozenset({
@@ -30,9 +30,7 @@ _CANDIDATE_FIELDS = frozenset({
     "validation",
     "candidate_kind",
     "boundary_kind",
-    "range_end_offset",
     "extractable",
-    "contained_anchor_count",
 })
 _HIT_FIELDS = frozenset({"name", "offset"})
 
@@ -85,7 +83,6 @@ def _normalize_native_result(value: Any, expected_size: int) -> EmbeddedScanResu
         if not archive_format or offset < 0:
             raise TypeError("Native scan_embedded_archives returned an invalid candidate")
         end_offset = row["end_offset"]
-        range_end_offset = row["range_end_offset"]
         candidates.append(EmbeddedCandidate(
             format=archive_format,
             offset=offset,
@@ -94,9 +91,7 @@ def _normalize_native_result(value: Any, expected_size: int) -> EmbeddedScanResu
             validation=str(row["validation"]),
             candidate_kind=str(row["candidate_kind"]),
             boundary_kind=str(row["boundary_kind"]),
-            range_end_offset=None if range_end_offset is None else int(range_end_offset),
             extractable=bool(row["extractable"]),
-            contained_anchor_count=int(row["contained_anchor_count"]),
         ))
 
     raw_hits = value["hits"]
@@ -157,9 +152,7 @@ def embedded_result_from_dict(value: dict[str, Any]) -> EmbeddedScanResult:
                 validation=str(item["validation"]),
                 candidate_kind=str(item["candidate_kind"]),
                 boundary_kind=str(item["boundary_kind"]),
-                range_end_offset=None if item["range_end_offset"] is None else int(item["range_end_offset"]),
                 extractable=bool(item["extractable"]),
-                contained_anchor_count=int(item["contained_anchor_count"]),
             )
             for item in value["candidates"]
         ),
@@ -173,3 +166,25 @@ def embedded_result_from_dict(value: dict[str, Any]) -> EmbeddedScanResult:
         raw_hit_count=int(value["raw_hit_count"]),
         budget_exhausted=bool(value["budget_exhausted"]),
     )
+
+
+def resolve_encrypted_rar_boundaries(
+    path: str,
+    offsets: list[int],
+    passwords: list[str],
+) -> dict[str, Any]:
+    """Resolve header-encrypted RAR ends with the current password sources.
+
+    Password-dependent work is deliberately uncached. A password-source change
+    simply runs this bounded header walk again.
+    """
+    from sunpack_native import resolve_embedded_rar_boundaries
+
+    value = resolve_embedded_rar_boundaries(
+        str(path),
+        [int(offset) for offset in offsets],
+        [str(password) for password in passwords],
+    )
+    if not isinstance(value, dict):
+        raise TypeError("Native encrypted RAR boundary resolver returned a non-dict result")
+    return dict(value)

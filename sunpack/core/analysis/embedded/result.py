@@ -27,16 +27,16 @@ class EmbeddedCandidate:
     validation: str
     candidate_kind: str
     boundary_kind: str
-    range_end_offset: int | None
     extractable: bool
-    contained_anchor_count: int
 
     @property
     def password_required(self) -> bool:
-        return self.format == "rar" and self.validation in {
+        if self.format != "rar":
+            return False
+        return self.validation.startswith((
             "rar4_header_encrypted_main_header_crc",
             "rar5_encryption_header_crc",
-        }
+        ))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -47,9 +47,7 @@ class EmbeddedCandidate:
             "validation": self.validation,
             "candidate_kind": self.candidate_kind,
             "boundary_kind": self.boundary_kind,
-            "range_end_offset": self.range_end_offset,
             "extractable": self.extractable,
-            "contained_anchor_count": self.contained_anchor_count,
         }
 
 
