@@ -92,6 +92,7 @@ def test_manifest_size_match_reports_retry_for_large_manifest_gap(tmp_path):
     assert verification.assessment_status == "partial"
     assert verification.completeness < 1.0
     assert {issue.code for issue in verification.issues} == {
+        "fail.manifest_named_files_missing",
         "fail.manifest_file_count_under",
         "fail.manifest_size_under",
     }
