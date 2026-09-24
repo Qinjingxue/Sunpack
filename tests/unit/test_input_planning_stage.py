@@ -73,7 +73,6 @@ def test_input_planning_stage_writes_extractable_segment_without_switching_task_
         "format_hint": "zip",
         "logical_name": "case_01_zip",
         "parts": [{"path": str(archive), "role": "main", "start": 4, "end": 40}],
-        "segment": {"start": 4, "source": "analysis", "end": 40, "confidence": 0.99},
         "analysis": {"status": "extractable", "confidence": 0.99, "damage_flags": []},
     }
     assert task.archive_input().open_mode == "file"
@@ -200,7 +199,6 @@ def test_input_planning_stage_records_multiple_segments_on_original_task(tmp_pat
         "format_hint": "rar",
         "logical_name": "case_01_rar",
         "parts": [{"path": str(carrier), "role": "main", "start": 4, "end": 32}],
-        "segment": {"start": 4, "source": "analysis", "end": 32, "confidence": 0.97},
         "analysis": {"status": "extractable", "confidence": 0.97, "damage_flags": []},
     }
     assert segments[1]["archive_input"]["format_hint"] == "7z"
@@ -349,7 +347,6 @@ def test_input_planning_stage_uses_range_input_for_embedded_password_required_ar
         "format_hint": "rar",
         "logical_name": "case",
         "parts": [{"path": str(carrier), "role": "main", "start": 64}],
-        "segment": {"start": 64, "source": "analysis", "confidence": 0.72},
         "analysis": {
             "status": "damaged",
             "confidence": 0.72,
