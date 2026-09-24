@@ -149,7 +149,7 @@ Other pipeline stages must not import `sunpack.pipeline.coordinator` in reverse.
 
 `native/sunpack_native` takes on cross-platform hotspots: directory scanning, binary views, signature prepass, format probes, carrier scan, output CRC/readability, output file index matching, password fast verifiers, and so on.
 
-`native/sevenzip_bridge` takes on Windows embedded 7-Zip execution: worker-internal bounded password candidate confirmation and extraction through `sunpack_sevenzip_worker.exe`. Format, structure, and encryption analysis belong to the Python/Rust analysis layer rather than a second native probe/test stack.
+`native/sevenzip_bridge` takes on Windows embedded 7-Zip execution: worker-internal bounded password candidate confirmation and extraction through `sunpack_sevenzip_worker.exe`. Archive discovery is not a bridge responsibility: Python/Rust must provide the format and canonical whole-file/range input before the worker opens it. Format, structure, carrier scanning, boundary resolution, and encryption analysis belong to the Python/Rust analysis layer rather than a second native probe/test stack.
 
 ### Windows Watch Broker / USN
 
