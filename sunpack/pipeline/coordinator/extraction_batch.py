@@ -13,12 +13,6 @@ from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_ou
 from sunpack.pipeline.coordinator.verification_stage import verify_and_project
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
-from sunpack.pipeline.coordinator.watch_staging import (
-    prepare_staging_output,
-    publish_staging_output,
-    rebase_extraction_result,
-    staging_file_identity,
-)
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.pipeline.extraction.knowledge import write_extraction_result
@@ -187,6 +181,14 @@ class ExtractionBatchRunner:
                 ensure_input_lease=ensure_input_lease,
             )
             output_dir = self.collect_result(task, outcome)
+            if self.origin == "watch":
+                self.extractor.emit_semantic_event(
+                    task,
+                    "task_output_finished",
+                    critical=True,
+                    output_dir=outcome.planned_out_dir,
+                    keep_output=bool(output_dir),
+                )
             if cleanup_scope is not None and output_dir:
                 # Clean up as soon as extract and verification are both finished, because
                 # verification reads the source archive back to build its manifest.
@@ -288,32 +290,16 @@ class ExtractionBatchRunner:
             self._report_task_finished(task, terminal)
             return task, terminal
 
-        final_out_dir = planned_out_dir
-        execution_out_dir = planned_out_dir
-        staging_dir = ""
         if self.origin == "watch":
-            staging_dir = await broker.run(
-                "watch_staging_prepare",
-                file_id,
-                prepare_staging_output,
-                final_out_dir,
-                task.main_path,
-                request_id=self.request_id,
-                cancellation=cancellation,
-            )
-            execution_out_dir = staging_dir
-            # START is diagnostic only now.  Correctness comes from deterministic
-            # staging + the single commit-before-publish barrier.
             self.extractor.emit_semantic_event(
                 task,
                 "task_output_started",
-                critical=False,
-                output_dir=final_out_dir,
-                staging_dir=staging_dir,
+                critical=True,
+                output_dir=planned_out_dir,
             )
         state = self._extract_verify_state_machine(
             task,
-            execution_out_dir,
+            planned_out_dir,
             missing_volume_retry=missing_volume_retry,
         )
         sent = None
@@ -331,43 +317,7 @@ class ExtractionBatchRunner:
             )
             if done:
                 outcome = value
-                outcome.planned_out_dir = execution_out_dir
-                if (
-                    self.origin == "watch"
-                    and staging_dir
-                    and outcome.outcome_kind in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}
-                ):
-                    if outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
-                        staging_id = await broker.run(
-                            "watch_staging_identity",
-                            file_id,
-                            staging_file_identity,
-                            staging_dir,
-                            request_id=self.request_id,
-                            cancellation=cancellation,
-                        )
-                        # This is the only synchronous durability barrier on the
-                        # normal successful Watch ArchiveTask path.  Source cleanup
-                        # cannot run until this callback returns.
-                        self.extractor.emit_semantic_event(
-                            task,
-                            "task_output_committed",
-                            critical=True,
-                            output_dir=final_out_dir,
-                            staging_dir=staging_dir,
-                            staging_file_id=staging_id,
-                        )
-                    await broker.run(
-                        "watch_publish",
-                        file_id,
-                        publish_staging_output,
-                        staging_dir,
-                        final_out_dir,
-                        request_id=self.request_id,
-                        cancellation=cancellation,
-                    )
-                    rebase_extraction_result(outcome.result, staging_dir, final_out_dir)
-                    outcome.planned_out_dir = final_out_dir
+                outcome.planned_out_dir = planned_out_dir
                 self._report_task_finished(task, outcome)
                 return task, outcome
             request = value

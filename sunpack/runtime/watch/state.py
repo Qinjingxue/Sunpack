@@ -127,7 +127,6 @@ class WatchPendingWork:
     active_outputs: dict[str, str] = field(default_factory=dict)
     committed_roots: list[str] = field(default_factory=list)
     completed_sources: list[str] = field(default_factory=list)
-    publications: dict[str, dict[str, str]] = field(default_factory=dict)
 
     @property
     def fingerprint(self) -> str:
@@ -819,28 +818,6 @@ class WatchStateStore:
                 if isinstance(item, dict)
             }
             return action, "", "", normalized
-        if action == "task_commit":
-            value = operation.get("value")
-            if not isinstance(value, dict):
-                raise TypeError("task commit value must be an object")
-            owner = value.get("owner")
-            if not isinstance(owner, dict):
-                raise TypeError("task commit owner must be an object")
-            task_path = os.path.abspath(str(value.get("task_path") or ""))
-            output_dir = os.path.abspath(str(value.get("output_dir") or ""))
-            staging_dir = os.path.abspath(str(value.get("staging_dir") or "")) if value.get("staging_dir") else ""
-            staging_file_id = str(value.get("staging_file_id") or "")
-            if not task_path or not output_dir:
-                raise ValueError("task commit requires task/output paths")
-            owner_record = WatchPendingWork(**owner)
-            return action, "pending_work", _path_key(owner_record.path), {
-                "owner": owner_record,
-                "task_path": task_path,
-                "output_dir": output_dir,
-                "staging_dir": staging_dir,
-                "staging_file_id": staging_file_id,
-            }
-
         collection = str(operation.get("collection") or "")
         if collection == "groups":
             # Replay and discard legacy group records so existing v17 WALs
@@ -877,51 +854,6 @@ class WatchStateStore:
             return
         if action == "set_watch_cursors":
             self.watch_cursors = dict(value)
-            return
-        if action == "task_commit":
-            pending = self.pending_work.get(key)
-            if pending is None:
-                pending = value["owner"]
-            task_path = value["task_path"]
-            output_dir = value["output_dir"]
-            staging_dir = value["staging_dir"]
-            staging_file_id = value.get("staging_file_id", "")
-            active = dict(pending.active_outputs)
-            active.pop(task_path, None)
-            publications = dict(getattr(pending, "publications", {}) or {})
-            publications[_path_key(task_path)] = {
-                "task_path": task_path,
-                "staging_dir": staging_dir,
-                "staging_file_id": staging_file_id,
-                "output_dir": output_dir,
-            }
-            roots = list(pending.committed_roots)
-            root_key = _path_key(output_dir)
-            if not any(
-                root_key == _path_key(existing)
-                or _is_path_under(root_key, _path_key(existing))
-                for existing in roots
-            ):
-                roots = [
-                    existing
-                    for existing in roots
-                    if not _is_path_under(_path_key(existing), root_key)
-                ]
-                roots.append(output_dir)
-            completed = list(pending.completed_sources)
-            task_key = _path_key(task_path)
-            if (
-                task_key != _path_key(pending.path)
-                and not any(_path_key(existing) == task_key for existing in completed)
-            ):
-                completed.append(task_path)
-            self.pending_work[key] = replace(
-                pending,
-                active_outputs=active,
-                committed_roots=roots,
-                completed_sources=completed,
-                publications=publications,
-            )
             return
         records = getattr(self, collection)
         if action == "delete":
@@ -964,7 +896,6 @@ class WatchStateStore:
                 active_outputs=dict(previous.active_outputs if previous else {}),
                 committed_roots=list(previous.committed_roots if previous else []),
                 completed_sources=list(previous.completed_sources if previous else []),
-                publications=dict(getattr(previous, "publications", {}) if previous else {}),
             )
             if persist:
                 self._commit_operations_locked([
@@ -1001,7 +932,6 @@ class WatchStateStore:
                 active_outputs=dict(previous.active_outputs if previous else {}),
                 committed_roots=list(previous.committed_roots if previous else []),
                 completed_sources=list(previous.completed_sources if previous else []),
-                publications=dict(getattr(previous, "publications", {}) if previous else {}),
             )
             if previous is not None and not previous.durable_owner:
                 self.pending_work[key] = pending
@@ -1019,7 +949,6 @@ class WatchStateStore:
             return self.pending_work.get(_path_key(path))
 
     def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str) -> bool:
-        """Diagnostic observation; correctness no longer depends on START fsync."""
         if not task_path or not output_dir:
             return False
         with self._state_lock:
@@ -1030,18 +959,20 @@ class WatchStateStore:
             active = dict(pending.active_outputs)
             active[os.path.abspath(task_path)] = os.path.abspath(output_dir)
             updated = replace(pending, active_outputs=active)
-            self.pending_work[key] = updated
+            self._commit_operations_locked([
+                self._put_operation("pending_work", key, updated),
+            ], durable=True)
             return True
 
-    def record_task_output_committed(
+    def record_task_output_finished(
         self,
         owner_path: str,
         task_path: str,
         output_dir: str,
         *,
-        staging_dir: str = "",
-        staging_file_id: str = "",
+        keep_output: bool,
     ) -> bool:
+        """End the task's durable write record after verification."""
         if not task_path or not output_dir:
             return False
         with self._state_lock:
@@ -1049,29 +980,43 @@ class WatchStateStore:
             pending = self.pending_work.get(key)
             if pending is None:
                 return False
-            owner = WatchPendingWork(
-                path=pending.path,
-                size=pending.size,
-                mtime=pending.mtime,
-                file_id=pending.file_id,
-                change_usn=pending.change_usn,
-                force=pending.force,
-                password_scope_dir=pending.password_scope_dir,
-                internal_recovery=pending.internal_recovery,
-                durable_owner=pending.durable_owner,
+            task_path = os.path.abspath(task_path)
+            active = dict(pending.active_outputs)
+            if task_path not in active:
+                return False
+            active.pop(task_path)
+            roots = list(pending.committed_roots)
+            completed = list(pending.completed_sources)
+            if keep_output:
+                output_dir = os.path.abspath(output_dir)
+                root_key = _path_key(output_dir)
+                if not any(
+                    root_key == _path_key(existing)
+                    or _is_path_under(root_key, _path_key(existing))
+                    for existing in roots
+                ):
+                    roots = [
+                        existing
+                        for existing in roots
+                        if not _is_path_under(_path_key(existing), root_key)
+                    ]
+                    roots.append(output_dir)
+                task_key = _path_key(task_path)
+                if (
+                    task_key != _path_key(pending.path)
+                    and not any(_path_key(existing) == task_key for existing in completed)
+                ):
+                    completed.append(task_path)
+            updated = replace(
+                pending,
+                active_outputs=active,
+                committed_roots=roots,
+                completed_sources=completed,
             )
-        operation = {
-            "op": "task_commit",
-            "value": {
-                "owner": asdict(owner),
-                "task_path": os.path.abspath(task_path),
-                "output_dir": os.path.abspath(output_dir),
-                "staging_dir": os.path.abspath(staging_dir) if staging_dir else "",
-                "staging_file_id": str(staging_file_id or ""),
-            },
-        }
-        self._commit_operations_concurrent([operation], durable=True)
-        return True
+            self._commit_operations_locked([
+                self._put_operation("pending_work", key, updated),
+            ], durable=True)
+            return True
 
     def rebase_pending_work(
         self,
@@ -1175,16 +1120,10 @@ class WatchStateStore:
         self,
         candidates: Iterable,
         cursors: dict[str, dict[str, int]],
-        *,
-        retire_paths: Iterable[str] = (),
     ) -> None:
         """Atomically cover a USN range and retain every recovered candidate."""
         with self._state_lock:
             operations: list[dict[str, Any]] = []
-            for path in retire_paths:
-                key = _path_key(path)
-                if key in self.pending_work:
-                    operations.append(self._delete_operation("pending_work", key))
             for candidate in candidates:
                 key = _path_key(candidate.path)
                 previous = self.pending_work.get(key)
@@ -1204,7 +1143,6 @@ class WatchStateStore:
                     active_outputs=dict(previous.active_outputs if previous else {}),
                     committed_roots=list(previous.committed_roots if previous else []),
                     completed_sources=list(previous.completed_sources if previous else []),
-                    publications=dict(getattr(previous, "publications", {}) if previous else {}),
                 )
                 operations.append(self._put_operation("pending_work", key, pending))
             merged = {key: dict(value) for key, value in self.watch_cursors.items()}

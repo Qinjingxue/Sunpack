@@ -180,19 +180,6 @@ pub(crate) fn watch_root_changes(
 }
 
 #[pyfunction]
-pub(crate) fn publish_watch_staged_output(staging: &str, final_path: &str) -> PyResult<()> {
-    #[cfg(windows)]
-    {
-        return windows::publish_watch_staged_output(Path::new(staging), Path::new(final_path)).map_err(os_error);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = (staging, final_path);
-        Err(PyRuntimeError::new_err("Watch staging publish requires Windows NTFS"))
-    }
-}
-
-#[pyfunction]
 pub(crate) fn watch_volume_cursor(path: &str) -> PyResult<(String, u64, i64)> {
     #[cfg(windows)]
     {

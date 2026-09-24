@@ -32,7 +32,6 @@ class OutputCleanupEvent(str, Enum):
 class OutputRole(str, Enum):
     CANONICAL = "canonical"
     PARTIAL_FILE = "partial_file"
-    WATCH_STAGING = "watch_staging"
 
 
 @dataclass(frozen=True)
@@ -119,18 +118,6 @@ class OutputCleanupManager:
             ownership=OutputOwnership(workspace_root=workspace_root),
         ))
 
-    def cleanup_watch_staging(self, path: str) -> OutputCleanupResult:
-        # The deterministic staging path itself is the ownership token.  This
-        # role intentionally accepts a stale file/symlink as well as a directory
-        # so a crashed attempt cannot block the next extraction forever.
-        return self.handle(OutputCleanupRequest(
-            event=OutputCleanupEvent.EXTRACTION_ABORT,
-            role=OutputRole.WATCH_STAGING,
-            path=path,
-            ownership=OutputOwnership(planned_output_dir=path),
-            allow_nonempty=True,
-        ))
-
     def cleanup_partial_file(self, path: str, *, output_root: str) -> OutputCleanupResult:
         return self.handle(OutputCleanupRequest(
             event=OutputCleanupEvent.PARTIAL_FILE_DISCARD,
@@ -162,11 +149,11 @@ class OutputCleanupManager:
                 **base,
             )
         is_link = os.path.islink(path)
-        if is_link and request.role != OutputRole.WATCH_STAGING:
+        if is_link:
             return OutputCleanupResult(reason="symlink_refused", **base)
 
         is_directory = os.path.isdir(path) and not is_link
-        if request.role not in {OutputRole.PARTIAL_FILE, OutputRole.WATCH_STAGING} and not is_directory:
+        if request.role != OutputRole.PARTIAL_FILE and not is_directory:
             return OutputCleanupResult(reason="managed_directory_required", **base)
         if request.role == OutputRole.PARTIAL_FILE and not os.path.isfile(path):
             return OutputCleanupResult(reason="managed_file_required", **base)
@@ -232,9 +219,6 @@ class OutputCleanupManager:
         if role == OutputRole.PARTIAL_FILE:
             root = _absolute(ownership.planned_output_dir)
             return bool(root and _is_strict_descendant(path, root))
-        if role == OutputRole.WATCH_STAGING:
-            planned = _absolute(ownership.planned_output_dir)
-            return bool(planned and _same_path(path, planned))
         return False
 
 
@@ -252,10 +236,6 @@ def cleanup_output_for_retry(
     )
 
 DEFAULT_OUTPUT_CLEANUP_MANAGER = OutputCleanupManager()
-
-
-def cleanup_watch_staging_path(path: str) -> OutputCleanupResult:
-    return DEFAULT_OUTPUT_CLEANUP_MANAGER.cleanup_watch_staging(path)
 
 
 def _absolute(path: str) -> str:

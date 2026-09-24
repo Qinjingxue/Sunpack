@@ -787,11 +787,13 @@ class _RequestRuntime:
             try:
                 callback(task, dict(event))
             except Exception:
-                lifecycle_event = str(event.get("event") or "") == "task_output_committed"
+                lifecycle_event = str(event.get("event") or "") in {
+                    "task_output_started",
+                    "task_output_finished",
+                }
                 if getattr(self.submission, "origin", "") == "watch" and lifecycle_event:
-                    # These two events are the Watch write-ahead boundary. If the
-                    # durable state write fails, extraction/source cleanup must not
-                    # proceed as if crash recovery were armed.
+                    # A durable start protects direct output writes. The finish
+                    # event clears that record after verification.
                     raise
                 # Ordinary progress observers remain best-effort UI/reporting.
                 pass

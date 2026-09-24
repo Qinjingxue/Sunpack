@@ -54,7 +54,6 @@ extern "system" {
         volume_name: *mut u16,
         buffer_length: u32,
     ) -> i32;
-    fn MoveFileExW(existing_file_name: *const u16, new_file_name: *const u16, flags: u32) -> i32;
     fn GetVolumeInformationW(
         root_path_name: *const u16,
         volume_name: *mut u16,
@@ -161,51 +160,6 @@ pub(super) fn watch_path_identity(path: &Path) -> io::Result<(String, String, i6
         observation.file_id,
         observation.change_usn,
     ))
-}
-
-pub(super) fn publish_watch_staged_output(staging: &Path, final_path: &Path) -> io::Result<()> {
-    if !staging.is_dir() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "Watch staging directory is missing",
-        ));
-    }
-    if final_path.try_exists()? {
-        return Err(io::Error::new(
-            io::ErrorKind::AlreadyExists,
-            "Watch final output already exists",
-        ));
-    }
-    let source_volume = volume_device(staging)?;
-    let destination_volume = resolve_output_volume(final_path)?;
-    if !source_volume.eq_ignore_ascii_case(&destination_volume) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "Watch staging and final output must be on the same NTFS volume",
-        ));
-    }
-    let source = canonical_wide(staging)?;
-    let parent = final_path
-        .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "final output has no parent"))?;
-    let parent = std::fs::canonicalize(parent)?;
-    let name = final_path.file_name().ok_or_else(|| {
-        io::Error::new(io::ErrorKind::InvalidInput, "final output has no file name")
-    })?;
-    let destination_path = parent.join(name);
-    let destination: Vec<u16> = destination_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-    // The durable Watch WAL already records publication intent before this
-    // rename. If power loss rolls namespace metadata back to the staging
-    // name, startup recovery replays staging -> final by file identity. A
-    // second WRITE_THROUGH barrier here only duplicates durability latency.
-    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), 0) } == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
 }
 
 pub(super) fn watch_file_is_ready(path: &Path) -> io::Result<bool> {

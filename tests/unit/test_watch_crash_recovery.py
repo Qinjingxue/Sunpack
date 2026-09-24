@@ -16,7 +16,6 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
     source.write_bytes(b"x")
     inner = tmp_path / "out" / "inner.zip"
     output = tmp_path / "out" / "inner"
-    staging = tmp_path / "out" / ".sunpack-partial-test"
     state = WatchStateStore(str(state_path))
     state.queue_active(
         _candidate(source),
@@ -30,30 +29,20 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
     [live] = state.pending_work_items()
     assert live.active_outputs[str(inner.resolve())] == str(output.resolve())
 
-    # START is diagnostic only. A restart intentionally forgets it because
-    # deterministic staging can be rediscovered without a second fsync.
-    [before_commit] = WatchStateStore(str(state_path)).pending_work_items()
-    assert before_commit.active_outputs == {}
+    [before_finish] = WatchStateStore(str(state_path)).pending_work_items()
+    assert before_finish.active_outputs[str(inner.resolve())] == str(output.resolve())
     assert before_commit.password_scope_dir == str(tmp_path.resolve())
 
-    assert state.record_task_output_committed(
+    assert state.record_task_output_finished(
         str(source),
         str(inner),
         str(output),
-        staging_dir=str(staging),
-        staging_file_id="staging-id",
+        keep_output=True,
     )
-    [committed] = WatchStateStore(str(state_path)).pending_work_items()
-    assert committed.active_outputs == {}
-    assert committed.committed_roots == [str(output.resolve())]
-    assert committed.completed_sources == [str(inner.resolve())]
-    [publication] = committed.publications.values()
-    assert publication == {
-        "task_path": str(inner.resolve()),
-        "staging_dir": str(staging.resolve()),
-        "staging_file_id": "staging-id",
-        "output_dir": str(output.resolve()),
-    }
+    [finished] = WatchStateStore(str(state_path)).pending_work_items()
+    assert finished.active_outputs == {}
+    assert finished.committed_roots == [str(output.resolve())]
+    assert finished.completed_sources == [str(inner.resolve())]
 
 
 def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
@@ -251,9 +240,9 @@ def test_committed_roots_collapse_nested_outputs(tmp_path):
     child_output = root / "child"
 
     state.record_task_output_started(str(outer), str(outer), str(root))
-    state.record_task_output_committed(str(outer), str(outer), str(root))
+    state.record_task_output_finished(str(outer), str(outer), str(root), keep_output=True)
     state.record_task_output_started(str(outer), str(child_source), str(child_output))
-    state.record_task_output_committed(str(outer), str(child_source), str(child_output))
+    state.record_task_output_finished(str(outer), str(child_source), str(child_output), keep_output=True)
 
     [pending] = state.pending_work_items()
     assert pending.committed_roots == [str(root.resolve())]
@@ -337,54 +326,3 @@ def test_persisted_blocker_wins_over_stale_pending_recovery(tmp_path):
         status="done",
     )
     assert scheduler_module._persisted_blocker_owns_retry(state, str(archive)) is False
-
-
-
-def test_committed_publication_recovers_namespace_rollback_after_source_cleanup(tmp_path):
-    """Durable publication intent makes the rename safely replayable after power loss."""
-    import sunpack.runtime.watch.scheduler as scheduler_module
-    from sunpack.pipeline.coordinator.watch_staging import publish_staging_output
-
-    state_path = tmp_path / "state.json"
-    source = tmp_path / "outer.zip"
-    source.write_bytes(b"source")
-    staging = tmp_path / ".sunpack-partial-power-loss"
-    final = tmp_path / "published"
-    staging.mkdir()
-    (staging / "payload.bin").write_bytes(b"verified-output")
-
-    state = WatchStateStore(str(state_path))
-    state.queue_active(
-        _candidate(source, size=len(b"source")),
-        durable_owner=True,
-        persist=True,
-        durable=True,
-    )
-    assert state.record_task_output_committed(
-        str(source),
-        str(source),
-        str(final),
-        staging_dir=str(staging),
-        staging_file_id="",
-    )
-
-    # Normal success publishes with a same-volume atomic rename. Emulate the
-    # only power-loss state WRITE_THROUGH previously tried to prevent: the call
-    # returned, source cleanup ran, but NTFS namespace persistence rolls back to
-    # the durable staging name after reboot.
-    publish_staging_output(str(staging), str(final))
-    final.rename(staging)
-    source.unlink()
-
-    restarted = WatchStateStore(str(state_path))
-    [pending] = restarted.pending_work_items()
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
-    scheduler.state = restarted
-    scheduler.config = {}
-    scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
-    scheduler._startup_suppress_paths = set()
-
-    assert scheduler._recover_committed_publications(pending) is True
-    assert final.is_dir()
-    assert not staging.exists()
-    assert (final / "payload.bin").read_bytes() == b"verified-output"
