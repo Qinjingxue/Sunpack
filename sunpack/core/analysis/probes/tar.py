@@ -17,8 +17,8 @@ class TarProbeOptions:
     def __post_init__(self) -> None:
         if self.start_offset < 0:
             raise ValueError("TAR probe start_offset must be non-negative")
-        if self.max_entries_to_walk <= 0:
-            raise ValueError("TAR entry-walk budget must be positive")
+        if self.max_entries_to_walk < 0:
+            raise ValueError("TAR entry-walk budget must be non-negative")
 
 
 def probe_tar_view(view, options: TarProbeOptions | None = None) -> FormatObservation:
@@ -51,7 +51,11 @@ def probe_tar_view(view, options: TarProbeOptions | None = None) -> FormatObserv
         format="tar",
         start_offset=start,
         raw=raw,
-        capabilities=frozenset({"tar_header", "tar_entry_walk"}),
+        capabilities=frozenset(
+            {"tar_header", "tar_entry_walk"}
+            if options.max_entries_to_walk > 0
+            else {"tar_header"}
+        ),
         damage_flags=tuple(damage_flags),
         boundary_confidence=boundary_confidence,
         integrity_confidence=integrity_confidence,
