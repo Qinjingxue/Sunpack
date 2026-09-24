@@ -2,10 +2,6 @@ use crate::analysis_native::volume_anchor::{
     probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap,
     probe_volume_anchor_paths_deep, VolumeAnchor,
 };
-use crate::analysis_native::{
-    probe_rar_path, probe_rar_terminal_with_password, probe_rar_volume_paths,
-    probe_zip_volume_paths,
-};
 use crate::scan::directory::NativeDirectorySnapshot;
 use crate::scan::executable_carrier::executable_sfx_stub_profile;
 use crate::scan::pe_overlay::inspect_pe_overlay_structure;
@@ -1311,14 +1307,15 @@ fn validate_relation_proposal(
 }
 
 fn validate_rar_proposal(
-    py: Python<'_>,
+    _py: Python<'_>,
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
-    path_passwords: Option<&[(String, String)]>,
+    _path_passwords: Option<&[(String, String)]>,
 ) -> PyResult<ProposalStatus> {
     let mut first_count = 0usize;
     let mut raw_sfx_head = false;
     let mut known_numbers = HashSet::new();
+
     for (path, number, _, _, _) in &proposal.volumes {
         let Some(anchor) = anchors.get(&path.to_ascii_lowercase()) else {
             return Ok(ProposalStatus::Inconclusive);
@@ -1326,6 +1323,7 @@ fn validate_rar_proposal(
         if anchor.needs_password || anchor.wrong_password {
             return Ok(ProposalStatus::NeedsPassword);
         }
+
         let is_raw_sfx_head = *number == 1
             && anchor.format == "rar"
             && anchor.confidence == "strong"
@@ -1337,13 +1335,14 @@ fn validate_rar_proposal(
             first_count += 1;
             continue;
         }
+
         if raw_sfx_head && anchor.format.is_empty() {
-            // A raw SFX may be split at arbitrary byte boundaries, so later
-            // physical chunks have no independent RAR header.  The first
-            // deep probe is the structural proof; the bounded filename
-            // proposal supplies ordering for these opaque chunks.
+            // Raw SFX byte-split followers may be opaque. The strong first
+            // archive header plus the strict filename relation is sufficient
+            // to form the input; Open/Extract owns completeness validation.
             continue;
         }
+
         if anchor.format != "rar" || anchor.confidence != "strong" || !anchor.multivolume {
             return if anchor.format.is_empty() {
                 Ok(ProposalStatus::Inconclusive)
@@ -1360,131 +1359,20 @@ fn validate_rar_proposal(
             }
         }
     }
+
     if first_count != 1 {
         return Ok(ProposalStatus::Inconclusive);
     }
     if let Some(highest) = known_numbers.iter().copied().max() {
         if (1..=highest).any(|number| !known_numbers.contains(&number)) {
-            // Header-encrypted RAR proposals may be formed from a gapped
-            // filename family so that password discovery can run.  Once the
-            // password exposes internal volume numbers, a gap proves that
-            // the current physical set is incomplete; it must not validate
-            // as a complete relation.
             return Ok(ProposalStatus::Inconclusive);
         }
     }
 
-    let ordered_paths: Vec<String> = proposal
-        .volumes
-        .iter()
-        .map(|(path, _, _, _, _)| path.clone())
-        .collect();
-    // An SFX first volume does not by itself imply a raw byte-split stream.
-    // WinRAR commonly emits a normal RAR header at the start of every later
-    // volume, while other SFX producers split the payload into opaque chunks.
-    // Only the latter may be validated through one concatenated view; when a
-    // later member has its own RAR anchor, terminal proof must run against
-    // that physical last volume.
-    let raw_sfx = proposal
-        .volumes
-        .iter()
-        .find(|(_, number, _, _, _)| *number == 1)
-        .and_then(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()))
-        .is_some_and(|anchor| anchor.sfx && anchor.structure_offset.is_some_and(|offset| offset > 0))
-        && proposal.volumes.iter().skip(1).all(|(path, _, _, _, _)| {
-            anchors
-                .get(&path.to_ascii_lowercase())
-                .is_some_and(|anchor| anchor.format.is_empty())
-        });
-    let raw_sfx_start_offset = proposal
-        .volumes
-        .iter()
-        .find(|(_, number, _, _, _)| *number == 1)
-        .and_then(|(path, _, _, _, _)| {
-            anchors
-                .get(&path.to_ascii_lowercase())
-                .and_then(|anchor| anchor.structure_offset)
-        })
-        .unwrap_or(0);
-    let password = proposal_password(proposal, path_passwords);
-    let header_encrypted = proposal.volumes.iter().any(|(path, _, _, _, _)| {
-        anchors
-            .get(&path.to_ascii_lowercase())
-            .is_some_and(|anchor| anchor.encrypted)
-    });
-    let terminal_proof = if header_encrypted {
-        let Some(password) = password else {
-            return Ok(ProposalStatus::NeedsPassword);
-        };
-        let proof_paths = if raw_sfx {
-            ordered_paths.clone()
-        } else {
-            let Some((path, _, _, _, _)) = proposal.volumes.iter().max_by_key(|(_, number, _, _, _)| *number) else {
-                return Ok(ProposalStatus::Inconclusive);
-            };
-            vec![path.clone()]
-        };
-        let proof_offset = if raw_sfx { raw_sfx_start_offset } else {
-            anchors
-                .get(&proof_paths[0].to_ascii_lowercase())
-                .and_then(|anchor| anchor.structure_offset)
-                .unwrap_or(0)
-        };
-        match py.detach(|| {
-            probe_rar_terminal_with_password(&proof_paths, proof_offset, password, 4096)
-        }) {
-            Ok(Some(proof)) => Some((proof.end_block_found, proof.end_block_flags)),
-            Ok(None) | Err(_) => return Ok(ProposalStatus::Inconclusive),
-        }
-    } else {
-        None
-    };
-    if let Some((end_found, end_flags)) = terminal_proof {
-        return if end_found && end_flags & 0x01 == 0 {
-            Ok(ProposalStatus::Valid)
-        } else {
-            Ok(ProposalStatus::Inconclusive)
-        };
-    }
-    let terminal = if raw_sfx {
-        match probe_rar_volume_paths(py, &ordered_paths, raw_sfx_start_offset, 4096) {
-            Ok(result) => result,
-            Err(_) => return Ok(ProposalStatus::Inconclusive),
-        }
-    } else {
-        let Some((path, _, _, _, _)) = proposal.volumes.iter().max_by_key(|(_, number, _, _, _)| *number) else {
-            return Ok(ProposalStatus::Inconclusive);
-        };
-        let offset = anchors
-            .get(&path.to_ascii_lowercase())
-            .and_then(|anchor| anchor.structure_offset)
-            .unwrap_or(0);
-        match probe_rar_path(py, path, offset, 4096) {
-            Ok(result) => result,
-            Err(_) => return Ok(ProposalStatus::Inconclusive),
-        }
-    };
-    let terminal = terminal.bind(py);
-    if terminal
-        .get_item("password_required")?
-        .and_then(|value| value.extract::<bool>().ok())
-        .unwrap_or(false)
-    {
-        return Ok(ProposalStatus::NeedsPassword);
-    }
-    let end_found = terminal
-        .get_item("end_block_found")?
-        .and_then(|value| value.extract::<bool>().ok())
-        .unwrap_or(false);
-    let end_flags = terminal
-        .get_item("end_block_flags")?
-        .and_then(|value| value.extract::<u64>().ok())
-        .unwrap_or(0);
-    if end_found && end_flags & 0x01 == 0 {
-        Ok(ProposalStatus::Valid)
-    } else {
-        Ok(ProposalStatus::Inconclusive)
-    }
+    // Relation admission proves identity and ordering, not archive
+    // completeness. Walking up to thousands of RAR blocks here duplicated
+    // the parser work that 7-Zip Open/Extract performs immediately afterward.
+    Ok(ProposalStatus::Valid)
 }
 
 fn proposal_password<'a>(
@@ -1549,7 +1437,7 @@ fn validate_seven_zip_proposal(
 }
 
 fn validate_zip_proposal(
-    py: Python<'_>,
+    _py: Python<'_>,
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
 ) -> PyResult<ProposalStatus> {
@@ -1570,6 +1458,7 @@ fn validate_zip_proposal(
             Ok(ProposalStatus::Reject)
         };
     }
+
     let terminal_paths: Vec<&String> = proposal
         .volumes
         .iter()
@@ -1586,13 +1475,14 @@ fn validate_zip_proposal(
     let terminal = anchors
         .get(&terminal_paths[0].to_ascii_lowercase())
         .expect("terminal path was collected from anchor map");
-    let highest = proposal.volumes.iter().map(|(_, number, _, _, _)| *number).max().unwrap_or(0);
+    let highest = proposal
+        .volumes
+        .iter()
+        .map(|(_, number, _, _, _)| *number)
+        .max()
+        .unwrap_or(0);
+
     if proposal.style == "zip_spanned" {
-        // PKZIP multidisk files commonly begin with a local header and set
-        // the continuation bit; other producers put the explicit split
-        // marker before that local header.  Both are canonical zero-offset
-        // native-spanning starts.  The terminal EOCD/disk proof below is
-        // still mandatory.
         let first_is_spanned = first.evidence.iter().any(|item| *item == "zip:split_marker")
             || (first.evidence.iter().any(|item| *item == "zip:local_header")
                 && first.multivolume
@@ -1618,56 +1508,10 @@ fn validate_zip_proposal(
         }
     }
 
-    // A raw `.zip.001` family is a logical concatenation, not a ZIP
-    // multi-disk archive.  Re-run the canonical Rust ZIP view over the
-    // concatenated volumes so the EOCD, central directory and every sampled
-    // local-header link are proven against the same byte stream.  Spanned
-    // ZIPs have their own disk-number proof above and intentionally remain on
-    // that path because the strict single-disk ZIP view rejects multi-disk
-    // EOCDs by design.
-    if proposal.style != "zip_spanned" {
-        let ordered_paths: Vec<String> = proposal
-            .volumes
-            .iter()
-            .map(|(path, _, _, _, _)| path.clone())
-            .collect();
-        let Some(raw) = (match probe_zip_volume_paths(py, &ordered_paths, 4096) {
-            Ok(result) => result,
-            Err(_) => return Ok(ProposalStatus::Inconclusive),
-        }) else {
-            return Ok(ProposalStatus::Inconclusive);
-        };
-        let raw = raw.bind(py);
-        let plausible = raw
-            .get_item("plausible")?
-            .and_then(|value| value.extract::<bool>().ok())
-            .unwrap_or(false);
-        let archive_starts_at_expected_offset = raw
-            .get_item("archive_offset")?
-            .and_then(|value| value.extract::<u64>().ok())
-            .unwrap_or(u64::MAX)
-            == first.structure_offset.unwrap_or(0);
-        let central_directory_walk_ok = raw
-            .get_item("central_directory_walk_ok")?
-            .and_then(|value| value.extract::<bool>().ok())
-            .unwrap_or(false);
-        let local_header_links_ok = raw
-            .get_item("local_header_links_ok")?
-            .and_then(|value| value.extract::<bool>().ok())
-            .unwrap_or(false);
-        let error = raw
-            .get_item("error")?
-            .and_then(|value| value.extract::<String>().ok())
-            .unwrap_or_default();
-        if !plausible
-            || !archive_starts_at_expected_offset
-            || !central_directory_walk_ok
-            || !local_header_links_ok
-            || !error.is_empty()
-        {
-            return Ok(ProposalStatus::Inconclusive);
-        }
-    }
+    // The bounded first-header + terminal-EOCD anchors are independent strong
+    // evidence for the split relation. Do not concatenate the family and walk
+    // the whole central directory/local links a second time; Open/Extract is
+    // the canonical completeness and damage parser.
     Ok(ProposalStatus::Valid)
 }
 
