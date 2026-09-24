@@ -528,7 +528,7 @@ def assert_plan5_single_task_scan(
     from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
     from tests.real.plan1_real_archives.plan1_support import plan1_config
 
-    provider = ArchiveTaskProvider(plan1_config())
+    provider = ArchiveTaskProvider(plan1_config(passwords=[case.password]))
     tasks = provider.scan_targets([str(case.file_path.parent)])
     expected = os.path.normcase(os.path.abspath(str(case.file_path)))
     actual = [os.path.normcase(os.path.abspath(str(task.main_path))) for task in tasks]
@@ -687,22 +687,18 @@ def assert_plan5_success(
     )
 
 
-def assert_plan5_wrong_password_partial(
+def assert_plan5_wrong_password_blocks_carrier(
     case: EmbeddedMixedCase,
     *,
     error_info: dict[str, Any] | None = None,
 ) -> None:
-    """全错密码下：加密段必须失败并报密码错误，非加密段仍应解出。"""
+    """任一加密段密码无法确认时，整个 carrier 必须停止并报密码错误。"""
     wrong = [f"wrong-{index:03d}-plan5" for index in range(20)]
     summary = run_plan1_pipeline(case.file_path, passwords=wrong)
     marker_status = _marker_status(case, case.file_path.parent)
-    plain_extracted = [
+    extracted = [
         item for item in marker_status
-        if not item["encrypted"] and item["marker_extracted"]
-    ]
-    encrypted_leaked = [
-        item for item in marker_status
-        if item["encrypted"] and item["marker_extracted"]
+        if item["marker_extracted"]
     ]
     if error_info is not None:
         error_info.update({
@@ -720,13 +716,9 @@ def assert_plan5_wrong_password_partial(
     assert any(failure.is_password_failure for failure in summary.failures), (
         f"no password failure reported; kinds={[str(f.kind) for f in summary.failures]}"
     )
-    assert len(plain_extracted) == sum(1 for item in marker_status if not item["encrypted"]), (
-        "plain (non-encrypted) segments must still extract with wrong passwords; "
-        f"extracted={[item['variant'] for item in plain_extracted]}"
-    )
-    assert not encrypted_leaked, (
-        f"encrypted markers must not extract with wrong passwords: "
-        f"{[item['variant'] for item in encrypted_leaked]}"
+    assert not extracted, (
+        "a carrier with an unresolved encrypted segment must not be partially processed; "
+        f"extracted={[item['variant'] for item in extracted]}"
     )
 
 
@@ -748,6 +740,6 @@ __all__ = [
     "assert_plan5_native_scan_coverage",
     "assert_plan5_single_task_scan",
     "assert_plan5_success",
-    "assert_plan5_wrong_password_partial",
+    "assert_plan5_wrong_password_blocks_carrier",
     "_segment_table",
 ]
