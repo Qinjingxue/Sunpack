@@ -35,3 +35,36 @@ def test_archive_task_key_keeps_logical_name_for_split_archives():
     task = make_task_from_descriptor(descriptor)
 
     assert task.key == "game"
+
+
+def test_archive_input_normalizes_rar_sfx_head_with_rar_members():
+    descriptor = ArchiveInputDescriptor.from_split_volumes(
+        archive_path="C:/work/shared.bundle.exe.part1.fake",
+        volumes=[
+            {
+                "path": "C:/work/shared.bundle.exe.part1.fake",
+                "number": 1,
+                "style": "rar_sfx_part",
+                "prefix": "shared.bundle",
+                "role": "first",
+                "width": 1,
+            },
+            {
+                "path": "C:/work/shared.bundle.rar.part2.fake",
+                "number": 2,
+                "style": "rar_part",
+                "prefix": "shared.bundle",
+                "role": "member",
+                "width": 1,
+            },
+        ],
+        format_hint="rar",
+        logical_name="shared.bundle",
+    )
+
+    assert descriptor.open_mode == "sfx_with_volumes"
+    assert descriptor.volume_style == "rar_sfx_part"
+    assert [part.canonical_name for part in descriptor.parts] == [
+        "shared.bundle.part1.exe",
+        "shared.bundle.part2.rar",
+    ]
