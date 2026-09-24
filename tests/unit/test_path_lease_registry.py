@@ -126,3 +126,51 @@ def test_watch_does_not_coalesce_newer_resolved_family_version(tmp_path):
         }
 
     asyncio.run(scenario())
+
+def test_completed_watch_generation_reuses_only_the_exact_unchanged_family(tmp_path):
+    async def scenario() -> None:
+        registry = _PathLeaseRegistry()
+        first_part = tmp_path / "archive.7z.001"
+        second_part = tmp_path / "archive.7z.002"
+        output = tmp_path / "out" / "archive"
+        output.mkdir(parents=True)
+        first_part.write_bytes(b"first")
+        second_part.write_bytes(b"second")
+        family = (first_part, second_part)
+
+        assert await registry.replace("first", family, coalesce_exact=True) is None
+        version = registry.ownership_version_for("first", family)
+        assert version
+        registry.remember_completed_watch(version, str(output))
+        assert registry.completed_watch_output(version) == str(output)
+
+        await registry.release("first")
+        second_part.write_bytes(b"second-new-version")
+        assert await registry.replace("second", family, coalesce_exact=True) is None
+        newer = registry.ownership_version_for("second", family)
+        assert newer and newer != version
+        assert registry.completed_watch_output(newer) == ""
+
+    asyncio.run(scenario())
+
+
+def test_completed_watch_generation_is_not_reused_after_output_disappears(tmp_path):
+    async def scenario() -> None:
+        registry = _PathLeaseRegistry()
+        first_part = tmp_path / "archive.zip.001"
+        second_part = tmp_path / "archive.zip.002"
+        output = tmp_path / "out" / "archive"
+        output.mkdir(parents=True)
+        first_part.write_bytes(b"first")
+        second_part.write_bytes(b"second")
+        family = (first_part, second_part)
+
+        assert await registry.replace("first", family, coalesce_exact=True) is None
+        version = registry.ownership_version_for("first", family)
+        registry.remember_completed_watch(version, str(output))
+        output.rmdir()
+
+        assert registry.completed_watch_output(version) == ""
+
+    asyncio.run(scenario())
+
