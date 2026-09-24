@@ -759,3 +759,26 @@ sunpack.py --help 通过。下面 4 个命令均退出码 1；重跑后每个命
 - disk-full 8 项因需要管理员权限执行 diskpart 而跳过。
 - `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 因未设置 `SUNPACK_RUN_GAME_TREE_TEST=1` 跳过；`tests/memory/test_watch_growth.py` 是 opt-in performance 测试，不属于默认 correctness acceptance。
 - 本节只记录本轮结果，未修复失败项。
+## 最新修复复测（4baa3c02）
+
+- 被测提交：`4baa3c02af5f404dcc5897edc2b5cae68b975bc8`（`fix: preserve final archive failure semantics (#126)`）。
+- 本轮未修改程序或测试文件。使用 `scripts/setup_windows_dev.ps1 -Arch x64` 重建 Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL；构建成功，worker 6 项 CTest、toast 1 项 CTest、最终 CLI probe 均通过。
+- `run_acceptance_tests.ps1 -NoWait` 完整执行，环境预检为 current。Rust 单测另执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：100 passed，0 failed。
+
+### 本轮结果
+
+| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| CLI、unit、functional | 1146 | 1146 | 0 | 0 | 0 |
+| integration、real | 347 | 346 | 0 | 0 | 1 |
+| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
+| **Python pytest 合计** | **1501** | **1492** | **0** | **0** | **9** |
+
+额外验证：Rust 单测 100 项全部通过；native CTest 7 项全部通过；acceptance 的 5 项 CLI smoke 全部通过。Acceptance 所有步骤均通过。
+
+### 跳过与边界
+
+- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 未设置 `SUNPACK_RUN_GAME_TREE_TEST=1`，按测试要求跳过本机 `D:\game` 扫描。
+- Administrator VHD disk-full 8 项因需要管理员权限执行 diskpart 而跳过。
+- `tests/memory/test_watch_growth.py` 是 opt-in performance 测试，不属于默认 correctness acceptance。
+- 本轮 acceptance 与 Rust 单测无失败项。
