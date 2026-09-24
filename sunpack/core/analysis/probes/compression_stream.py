@@ -2,7 +2,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from sunpack_native import inspect_compression_stream_structure as _native_inspect_compression_stream
+from sunpack_native import (
+    inspect_compression_stream_identity as _native_inspect_compression_identity,
+    inspect_compression_stream_structure as _native_inspect_compression_stream,
+)
 
 from sunpack.core.analysis.observation import FormatObservation
 from sunpack.core.analysis.view import SharedBinaryView
@@ -15,6 +18,7 @@ SUPPORTED_COMPRESSION_FORMATS = frozenset({"gzip", "bzip2", "xz", "zstd"})
 @dataclass(frozen=True, slots=True)
 class CompressionStreamProbeOptions:
     format: str = ""
+    identity_only: bool = False
 
     def __post_init__(self) -> None:
         if self.format and self.format not in SUPPORTED_COMPRESSION_FORMATS:
@@ -90,10 +94,12 @@ def probe_compression_stream_path(
 ) -> FormatObservation:
     options = options or CompressionStreamProbeOptions()
     identity = file_identity(path)
+    namespace = "analysis_compression_stream_identity" if options.identity_only else "analysis_compression_stream"
+    probe = _native_inspect_compression_identity if options.identity_only else _native_inspect_compression_stream
     raw = cached_value(
-        "analysis_compression_stream",
+        namespace,
         (identity,),
-        lambda: dict(_native_inspect_compression_stream(path)),
+        lambda: dict(probe(path)),
     )
     return _observation(dict(raw), options.format)
 
