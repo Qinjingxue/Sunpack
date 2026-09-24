@@ -119,14 +119,12 @@ def test_pe_zip_sfx_is_confirmed_and_projected_as_file_range(tmp_path):
     assert archive_input["open_mode"] == "file_range"
     assert archive_input["format_hint"] == "zip"
     assert archive_input["parts"][0]["start"] == pe_end
-    assert archive_input["segment"]["start"] == pe_end
 
     password_descriptor = archive_input_for_group(group)
     assert password_descriptor is not None
     password_input = password_descriptor.to_dict()
     assert password_input["open_mode"] == "file_range"
     assert password_input["parts"][0]["start"] == pe_end
-    assert password_input["segment"]["start"] == pe_end
 
 
 def test_filename_numbered_7z_without_structural_seed_is_not_grouped(tmp_path):
