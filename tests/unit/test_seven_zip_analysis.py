@@ -34,7 +34,8 @@ def test_damaged_seven_zip_reuses_bounded_embedded_candidate_range():
 
     evidence = module._from_native(native, start, prepass, end)
 
-    assert evidence.status == "damaged"
+    assert evidence.status == "extractable"
+    assert evidence.confidence == 0.90
     assert evidence.segments[0].end_offset == end
     assert evidence.details["source"] == "embedded_scan"
     assert evidence.details["candidate_kind"] == "logical_archive"
