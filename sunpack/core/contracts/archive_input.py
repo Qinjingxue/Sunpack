@@ -147,8 +147,6 @@ class ArchiveInputDescriptor:
             }
             if item_range.end is not None:
                 payload["end"] = int(item_range.end)
-            if self.password:
-                payload["password"] = self.password
             return payload
         if self.open_mode == "concat_ranges" and self.ranges:
             payload = {
@@ -156,8 +154,6 @@ class ArchiveInputDescriptor:
                 "ranges": [item.to_dict() for item in self.ranges],
                 "format_hint": self.format_hint,
             }
-            if self.password:
-                payload["password"] = self.password
             return payload
         if self.parts:
             payload = {
@@ -168,12 +164,8 @@ class ArchiveInputDescriptor:
                 ],
                 "format_hint": self.format_hint,
             }
-            if self.password:
-                payload["password"] = self.password
             return payload
         payload = {"kind": "file", "path": self.entry_path, "format_hint": self.format_hint}
-        if self.password:
-            payload["password"] = self.password
         return payload
 
     def part_paths(self) -> list[str]:

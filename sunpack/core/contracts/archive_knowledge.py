@@ -155,7 +155,7 @@ class ArchiveKnowledge:
 
     def add_evidence(self, path: str, value: Any, *, provenance: dict[str, Any] | None = None) -> "ArchiveKnowledge":
         evidence = list(self.data.setdefault("_evidence", []))
-        item = {"path": str(path), "value": _compact_evidence_value(value)}
+        item = {"path": str(path), "value": compact_evidence_value(value)}
         if provenance:
             item["provenance"] = _jsonable(provenance)
         evidence.append(item)
@@ -270,7 +270,7 @@ def _dedupe(values: list[str]) -> list[str]:
     return output
 
 
-def _compact_evidence_value(value: Any) -> Any:
+def compact_evidence_value(value: Any) -> Any:
     if isinstance(value, ArchiveKnowledge):
         return {"kind": "archive_knowledge", "revision": value.revision()}
     if isinstance(value, dict):
@@ -282,11 +282,11 @@ def _compact_evidence_value(value: Any) -> Any:
             elif text_key in {"stdout", "stderr"} and isinstance(item, str):
                 output[text_key] = item[:4000]
             else:
-                output[text_key] = _compact_evidence_value(item)
+                output[text_key] = compact_evidence_value(item)
         return output
     if isinstance(value, (list, tuple, set)):
         values = list(value)
-        compacted = [_compact_evidence_value(item) for item in values[:50]]
+        compacted = [compact_evidence_value(item) for item in values[:50]]
         if len(values) > 50:
             compacted.append({"truncated_count": len(values) - 50})
         return compacted
