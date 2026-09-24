@@ -331,6 +331,13 @@ class ArchiveInputPlanningStage:
         candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]] = []
         index = 1
         for evidence in sorted(report.selected, key=lambda item: item.confidence, reverse=True):
+            details = evidence.details if isinstance(evidence.details, dict) else {}
+            if (
+                str(details.get("source") or "") == "embedded_scan"
+                and details.get("candidate_kind")
+                and str(details.get("candidate_kind")) != "logical_archive"
+            ):
+                continue
             for segment in evidence.segments:
                 if segment.end_offset is None:
                     continue
