@@ -1639,13 +1639,27 @@ mod rar5_header_decryption_tests {
     }
 
     #[test]
+    fn encrypted_header_walker_returns_exact_end_for_complete_fixture() {
+        let data = hex_bytes(SINGLE_HP_HEX);
+        let reader = ManagedReader::from_bytes(data.clone(), Default::default());
+        let proof = probe_header_encrypted_terminal(&reader, 0, "secret", 4096)
+            .unwrap()
+            .unwrap();
+        assert!(proof.password_matched);
+        assert!(proof.end_block_found);
+        assert_eq!(proof.end_offset, Some(data.len() as u64));
+    }
+
+    #[test]
     fn encrypted_header_walker_fails_open_on_incomplete_fixture() {
         let data = hex_bytes(PART2_HP_HEX);
         let reader = ManagedReader::from_bytes(data, Default::default());
         let proof = probe_header_encrypted_terminal(&reader, 0, "secret", 4096)
             .unwrap()
             .unwrap();
+        assert!(proof.password_matched);
         assert!(!proof.end_block_found);
+        assert_eq!(proof.end_offset, None);
     }
 
 }
