@@ -55,16 +55,6 @@ class ArchiveKnowledge:
         except (TypeError, ValueError):
             return 0
 
-    def source_identity(self) -> dict[str, Any]:
-        source = self.get("source.input", {})
-        if isinstance(source, dict):
-            return {
-                "kind": str(source.get("kind") or source.get("open_mode") or "file"),
-                "path": str(source.get("path") or source.get("entry_path") or ""),
-                "format_hint": source.get("format_hint") or source.get("format"),
-            }
-        return {}
-
     def get(self, path: str, default: Any = None) -> Any:
         current: Any = self.data
         for part in _parts(path):
@@ -282,7 +272,7 @@ def _dedupe(values: list[str]) -> list[str]:
 
 def _compact_evidence_value(value: Any) -> Any:
     if isinstance(value, ArchiveKnowledge):
-        return {"kind": "archive_knowledge", "revision": value.revision(), "source_identity": value.source_identity()}
+        return {"kind": "archive_knowledge", "revision": value.revision()}
     if isinstance(value, dict):
         output: dict[str, Any] = {}
         for key, item in value.items():

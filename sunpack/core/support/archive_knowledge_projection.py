@@ -34,17 +34,19 @@ def get(task_or_knowledge: Any, path: str, default: Any = None) -> Any:
     return default if value is None else value
 
 
-def source_input(task: Any) -> dict[str, Any]:
-    return _dict(get(task, "source.input", {}))
-
-
 def source_password_probe_input(task: Any) -> dict[str, Any]:
     return _dict(get(task, "source.password_probe_input", {}))
 
 
-def source_fingerprint(task_or_knowledge: Any) -> dict[str, Any]:
-    knowledge = task_knowledge(task_or_knowledge)
-    return _cached_projection(knowledge, "source_fingerprint", lambda: _source_fingerprint_uncached(knowledge))
+def source_fingerprint(task: Any) -> dict[str, Any]:
+    knowledge = task_knowledge(task)
+    identity = _task_source_fingerprint(task)
+    return _cached_projection(
+        knowledge,
+        "source_fingerprint",
+        lambda: identity,
+        identity=identity,
+    )
 
 
 def source_selected_segment(task: Any) -> dict[str, Any]:
@@ -69,10 +71,11 @@ def inspection_error(task: Any) -> str:
 
 
 def selected_format(task: Any) -> str:
+    descriptor = _task_archive_input(task)
     return str(
         get(task, "inspection.selected_format", "")
         or get(task, "inspection.summary.format", "")
-        or get(task, "source.input.format_hint", "")
+        or (getattr(descriptor, "format_hint", "") if descriptor is not None else "")
         or ""
     )
 
@@ -83,7 +86,13 @@ def verification_summary(task: Any) -> dict[str, Any]:
 
 def zip_runtime_facts(task: Any) -> dict[str, Any]:
     knowledge = task_knowledge(task)
-    return _cached_projection(knowledge, "zip_runtime_facts", lambda: _format_runtime_facts_uncached(knowledge, "zip"))
+    identity = _task_source_fingerprint(task)
+    return _cached_projection(
+        knowledge,
+        "zip_runtime_facts",
+        lambda: _format_runtime_facts_uncached(knowledge, "zip"),
+        identity=identity,
+    )
 
 
 def archive_password(task: Any) -> str | None:
@@ -121,13 +130,19 @@ def _dict(value: Any) -> dict[str, Any]:
     return dict(value) if isinstance(value, dict) else {}
 
 
-def _cached_projection(knowledge: ArchiveKnowledge, name: str, compute) -> Any:
+def _cached_projection(
+    knowledge: ArchiveKnowledge,
+    name: str,
+    compute,
+    *,
+    identity: dict[str, Any] | None = None,
+) -> Any:
     revision_value = knowledge.revision() if hasattr(knowledge, "revision") else int(knowledge.get("_meta.revision", 0) or 0)
     if revision_value <= 0:
         return compute()
     revision = str(revision_value)
-    identity = _stable_digest(_source_fingerprint_uncached(knowledge))
-    cache_key = (revision, str(name), identity)
+    identity_key = _stable_digest(identity or {})
+    cache_key = (revision, str(name), identity_key)
     with _PROJECTION_CACHE_LOCK:
         if cache_key in _PROJECTION_CACHE:
             value = _PROJECTION_CACHE.pop(cache_key)
@@ -156,9 +171,21 @@ def _format_runtime_facts_uncached(knowledge: ArchiveKnowledge, format_name: str
     }
 
 
-def _source_fingerprint_uncached(knowledge: ArchiveKnowledge) -> dict[str, Any]:
-    source = knowledge.get("source.input")
-    return _source_input_fingerprint(source if isinstance(source, dict) else {})
+def _task_archive_input(task: Any):
+    getter = getattr(task, "archive_input", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter()
+    except Exception:
+        return None
+
+
+def _task_source_fingerprint(task: Any) -> dict[str, Any]:
+    descriptor = _task_archive_input(task)
+    if descriptor is None or not hasattr(descriptor, "to_dict"):
+        return {}
+    return _source_input_fingerprint(descriptor.to_dict())
 
 
 def _source_input_fingerprint(source_input: dict[str, Any]) -> dict[str, Any]:

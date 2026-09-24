@@ -13,7 +13,11 @@ def write_zip_runtime_evidence_facts(task: ArchiveTask) -> dict[str, Any]:
     structure = _dict_at(knowledge, "format.zip.structure")
     if not structure:
         return {}
-    runtime_full = _zip_runtime_evidence_payload(knowledge, structure)
+    runtime_full = _zip_runtime_evidence_payload(
+        knowledge,
+        structure,
+        source_parts=list(task.all_parts),
+    )
     if not runtime_full:
         return {}
     merged = _dedup_zip_structure(dict(structure))
@@ -88,7 +92,12 @@ def _enrich_zip_directory_consistency(directory: dict[str, Any]) -> dict[str, An
     return directory
 
 
-def _zip_runtime_evidence_payload(knowledge: Any, structure: dict[str, Any]) -> dict[str, Any]:
+def _zip_runtime_evidence_payload(
+    knowledge: Any,
+    structure: dict[str, Any],
+    *,
+    source_parts: list[str],
+) -> dict[str, Any]:
     graph = structure.get("graph") if isinstance(structure.get("graph"), dict) else {}
     graph_summary = graph.get("summary") if isinstance(graph.get("summary"), dict) else {}
     structure_summary = structure.get("summary") if isinstance(structure.get("summary"), dict) else {}
@@ -115,10 +124,9 @@ def _zip_runtime_evidence_payload(knowledge: Any, structure: dict[str, Any]) -> 
         }
     extraction = _dict_at(knowledge, "extraction.entry_outcomes")
     coverage = _dict_at(knowledge, "verification.coverage_breakdown")
-    source = _dict_at(knowledge, "source.input")
     result = _dict_at(knowledge, "extraction.result")
 
-    split_parts = _source_parts(source, result)
+    split_parts = [str(path) for path in source_parts if str(path)]
     checked = max(1, _as_int(directory.get("cd_entries_checked")))
     cd_local_crc = _as_int(directory.get("central_local_crc_mismatch_count"))
     cd_local_size = max(
@@ -443,34 +451,6 @@ def _first_present(primary: dict[str, Any], secondary: dict[str, Any], *keys: st
             if key in payload and payload.get(key) not in (None, ""):
                 return payload.get(key)
     return None
-
-
-def _source_parts(source: dict[str, Any], extraction_result: dict[str, Any]) -> list[str]:
-    for key in ("part_paths", "parts", "all_parts"):
-        raw = source.get(key)
-        if isinstance(raw, list):
-            paths = _part_paths(raw)
-            if paths:
-                return paths
-    raw = extraction_result.get("all_parts")
-    if isinstance(raw, list):
-        return _part_paths(raw)
-    return []
-
-
-def _part_paths(raw: list[Any]) -> list[str]:
-    output: list[str] = []
-    seen: set[str] = set()
-    for item in raw:
-        if isinstance(item, dict):
-            path = str(item.get("path") or "")
-        else:
-            path = str(item or "")
-        key = _path_identity(path)
-        if path and key not in seen:
-            seen.add(key)
-            output.append(path)
-    return output
 
 
 def _path_identity(path: str) -> str:

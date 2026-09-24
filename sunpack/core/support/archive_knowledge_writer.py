@@ -196,7 +196,7 @@ def write_evidence(
 
 def _compact_evidence_value(value: Any) -> Any:
     if isinstance(value, ArchiveKnowledge):
-        return {"kind": "archive_knowledge", "revision": value.revision(), "source_identity": value.source_identity()}
+        return {"kind": "archive_knowledge", "revision": value.revision()}
     if isinstance(value, dict):
         output: dict[str, Any] = {}
         for key, item in value.items():

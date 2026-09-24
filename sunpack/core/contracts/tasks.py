@@ -142,12 +142,6 @@ class ArchiveTask:
             *self.cleanup_parts,
             self.carrier_path,
         ]))
-        self._knowledge.set(
-            "source.input",
-            descriptor.to_dict(),
-            source_layer="contracts",
-            source_module="archive_task",
-        )
         self._archive_input = descriptor
 
     def apply_path_mapping(self, path_map: dict[str, str]) -> None:
@@ -184,9 +178,6 @@ class ArchiveTask:
     ) -> None:
         descriptor = self.archive_input()
         self._knowledge.merge({
-            "source": {
-                "input": descriptor.to_dict(),
-            },
             "discovery": {
                 "source": discovery_source,
                 "reason": discovery_reason,
