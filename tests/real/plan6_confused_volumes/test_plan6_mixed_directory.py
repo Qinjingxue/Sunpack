@@ -80,11 +80,11 @@ def test_plan6_confused_encrypted_groups_mixed_in_one_directory(tmp_path, plan6_
             "expected_ext": f".{archive_format}",
             "actual_ext": detected_ext(hits[0]) if hits else None,
             "hit_count": len(hits),
-            "member_count": len(hits[0].member_paths) if hits else 0,
+            "member_count": len(hits[0].all_parts) if hits else 0,
         }
         assert len(hits) == 1, f"{archive_format}: expected one hit, got {len(hits)}"
         assert detected_ext(hits[0]) == f".{archive_format}"
-        assert len(hits[0].member_paths) == expected_count[archive_format]
+        assert len(hits[0].all_parts) == expected_count[archive_format]
 
     summary = run_plan1_pipeline(common, passwords=passwords)
     plan6_error["pipeline_success_count"] = summary.success_count
