@@ -24,10 +24,10 @@ def test_selected_split_member_without_structural_proof_stays_single_candidate(t
 
     assert len(candidates) == 1
     assert candidates[0].entry_path == str(second)
-    assert candidates[0].member_paths == (str(second),)
+    assert candidates[0].archive_input.part_paths() == (str(second),)
     assert candidates[0].is_split is False
     assert candidates[0].entry_path == str(second)
-    assert candidates[0].member_paths == (str(second),)
+    assert candidates[0].archive_input.part_paths() == (str(second),)
 
 
 def test_direct_file_task_preserves_explicit_zero_based_split_volumes(tmp_path):
