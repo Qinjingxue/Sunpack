@@ -17,7 +17,8 @@ class RelationResolver:
             anchor = candidate.relation_anchor
             archive_format = str(anchor.get("format") or candidate.format_hint or "").lower().lstrip(".")
             if not anchor.get("relation_confirmed") and (
-                anchor.get("needs_password") or anchor.get("multivolume")
+                anchor.get("needs_password")
+                or (anchor.get("multivolume") and candidate.is_split)
             ):
                 result.add_blocked(
                     candidate,
