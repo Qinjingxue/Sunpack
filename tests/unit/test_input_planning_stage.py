@@ -16,10 +16,10 @@ class _FakeAnalyzer:
         return self.report
 
 
-def _task(path, *, parts=None, volumes=None):
+def _task(path, *, parts=None, volumes=None, logical_name="case"):
     if parts and len(parts) > 1:
         return direct_file_task(str(path), all_parts=[str(item) for item in parts])
-    return make_archive_task(path, logical_name="case")
+    return make_archive_task(path, logical_name=logical_name)
 
 
 def _report(path, evidence, *, prepass=None):
@@ -215,8 +215,7 @@ def test_input_planning_stage_reuses_batch_report_for_equivalent_inputs(tmp_path
         segments=[ArchiveSegment(start_offset=0, end_offset=3, confidence=0.99)],
     )
     first = _task(archive)
-    second = _task(archive)
-    second.logical_name = "case_copy"
+    second = _task(archive, logical_name="case_copy")
     stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False, "task_parallel": False}})
     stage.enabled = True
     stage.analyzer = _FakeAnalyzer(_report(archive, evidence))
