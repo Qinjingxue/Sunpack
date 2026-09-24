@@ -38,7 +38,8 @@ def test_game_tree_resources_are_not_authorized_for_recursive_extraction(monkeyp
         result = RecursiveAuthorization(config).authorize_batch(
             inputs, roots, session, round_index=2,
         )
-        assert len(result.allowed_inputs) <= len(inputs)
-        assert all(item.entry_path for item in result.allowed_inputs)
+        assert result.allowed_tasks == [], [
+            item.main_path for item in result.allowed_tasks
+        ]
     finally:
         clear_config_cache()
