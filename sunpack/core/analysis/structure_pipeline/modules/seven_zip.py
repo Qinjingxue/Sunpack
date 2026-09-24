@@ -43,6 +43,12 @@ class SevenZipAnalysisModule:
             damage_flags.append(str(error))
         boundary_unreliable = error in {"start_header_crc_mismatch", "next_header_out_of_range", "invalid_next_header_range"}
         bounded_candidate = self._bounded_embedded_candidate(prepass, start) if boundary_unreliable else None
+        if bounded_candidate is not None:
+            # "extractable" here means there is a structurally bounded input
+            # the worker can attempt; damage remains explicit in the flags and
+            # is still decided authoritatively by extraction.
+            confidence = max(confidence, float(bounded_candidate.get("confidence") or 0.0))
+            status = "extractable"
         if boundary_unreliable:
             damage_flags.append("boundary_unreliable")
             native["boundary_confidence"] = "bounded" if bounded_candidate is not None else "none"
