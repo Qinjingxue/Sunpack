@@ -202,7 +202,7 @@ def assert_plan1_success(
             f"container type mismatch: expected {expected_container}, got {actual_container}"
         )
     if expected_member_count is not None:
-        actual_members = len(hits[0].member_paths)
+        actual_members = len(hits[0].all_parts)
         if error_info is not None:
             error_info["expected_member_count"] = expected_member_count
             error_info["actual_member_count"] = actual_members
