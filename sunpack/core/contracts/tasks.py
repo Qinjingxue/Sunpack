@@ -194,8 +194,11 @@ class ArchiveTask:
 def _segment_payload(index: int, descriptor: ArchiveInputDescriptor, evidence: dict[str, Any]) -> dict[str, Any]:
     extent = descriptor.primary_extent
     start_offset = extent.start if extent is not None else int(evidence.get("offset") or 0)
-    end_offset = (extent.end if extent is not None and extent.end is not None
-                  else evidence.get("range_end_offset") or evidence.get("end_offset"))
+    end_offset = (
+        extent.end
+        if extent is not None and extent.end is not None
+        else evidence.get("end_offset")
+    )
     confidence = descriptor.analysis.get("segment_confidence", evidence.get("confidence"))
     damage_flags = descriptor.analysis.get("damage_flags") or evidence.get("damage_flags") or ()
     return {
