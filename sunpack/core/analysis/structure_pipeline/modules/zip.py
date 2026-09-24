@@ -59,14 +59,16 @@ class ZipAnalysisModule:
         start = int(item.get("offset") or 0)
         del candidates
         explicit_end = item.get("end_offset")
-        range_end = item.get("range_end_offset")
-        end = int(explicit_end) if explicit_end is not None else (
-            int(range_end) if range_end is not None else None
-        )
+        end = int(explicit_end) if explicit_end is not None else None
         confidence = float(item.get("confidence") or 0.0)
         validation = str(item.get("validation") or "validated_structure")
         boundary_kind = str(item["boundary_kind"])
-        extractable = bool(item["extractable"]) and end is not None and end > start
+        extractable = (
+            boundary_kind == "exact"
+            and bool(item["extractable"])
+            and end is not None
+            and end > start
+        )
         status = "extractable" if confidence >= 0.85 and extractable else "damaged"
         return ArchiveFormatEvidence(
             format="zip",
@@ -83,7 +85,7 @@ class ZipAnalysisModule:
                 "validation": validation,
                 "candidate_kind": str(item.get("candidate_kind") or ""),
                 "boundary_kind": boundary_kind,
-                "boundary_confidence": "high" if boundary_kind == "exact" else "bounded_or_unresolved",
+                "boundary_confidence": "high" if boundary_kind == "exact" else "unresolved",
             },
         )
 
