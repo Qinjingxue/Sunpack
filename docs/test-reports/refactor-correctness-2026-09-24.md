@@ -635,3 +635,61 @@ sunpack.py --help 通过。下面 4 个命令均退出码 1；重跑后每个命
 - `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 未设置 `SUNPACK_RUN_GAME_TREE_TEST=1`，按测试文件要求跳过本机 `D:\game` 扫描。
 - `tests/memory/test_watch_growth.py` 是 opt-in performance 测试，默认 acceptance correctness 流程不执行。
 - 本轮报告基于完成的 Rust 单元测试、native CTest、Python acceptance 和 CLI smoke 结果；未修复失败项。
+## 修复后复测（1e30a31d）
+
+- 被测提交：`1e30a31d766a451978d41bb82c3fd32a15a1b554`（`Fix remaining post-refactor runtime regressions (#123)`）；包含前一提交 `f2d8be95` 的测试契约调整。
+- 本轮没有改程序或测试文件。使用 `scripts/setup_windows_dev.ps1 -Arch x64` 强制重建 Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL；C++ worker 的 6 项 CTest 与 toast 的 1 项 CTest 全部通过。
+- 环境脚本最后的 inspect probe 仍失败，错误已从上一轮的 `'archive'` 变为 `[CLI] 运行失败：'decision'`，退出码 3。随后用已重建的环境执行 `run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh`；其中 5 项 CLI smoke 全部通过。
+- Rust 单测执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：99 passed，0 failed。
+
+### 本轮汇总
+
+| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| CLI、unit、functional | 1139 | 1139 | 0 | 0 | 0 |
+| integration、real | 347 | 330 | 16 | 0 | 1 |
+| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
+| **Python pytest 合计** | **1494** | **1469** | **16** | **0** | **9** |
+
+额外验证：Rust 单元测试 99 项全部通过；native CTest 7 项全部通过；5 项 CLI smoke 全部通过。相比上一轮记录的 43 个 pytest 失败，本轮减少到 16 个；CLI/unit/functional 阶段现为全绿。
+
+### 本轮剩余失败项与报错
+
+#### 分卷 SFX 容器类型：12 项
+
+共同报错：`AssertionError: container type mismatch: expected pe, got ''`。这些用例均为 7z/ZIP 分卷 SFX；探测结果没有给出预期的 PE 外层容器类型。
+
+- `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-7z-lzma2]`
+- `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-zip-deflate]`
+- `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[7z]`
+- `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[zip]`
+- `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[7z]`
+- `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[zip]`
+- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-7z]`
+- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-zip]`
+- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-7z]`
+- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-zip]`
+- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-7z]`
+- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-zip]`
+
+#### 其他 4 项
+
+- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_routes_new_launcher_through_pipeline[7z]` — 期望只生成一个 marker，实际断言 `assert 2 == 1`；输出目录出现原目录和 `(1)` 目录两份提取结果。
+- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_routes_new_launcher_through_pipeline[zip]` — 同样生成两份结果，`assert 2 == 1`。
+- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[7z]` — 预期归档失败任务，实际 `RunSummary(...).failed_tasks == []`。
+- `tests.integration.test_structure_volume_resolution::test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline` — 输入类别不符：实际 `file_range`，预期 `sfx_with_volumes`（`assert 'file_range' == 'sfx_with_volumes'`）。
+
+### 本轮理解
+
+- 相比上一轮，原先的 6 个 CLI/unit/functional 失败全部通过；RAR 单卷/分卷 SFX 的 PE 识别、错误密码后更新候选、HP RAR watch 恢复及 gzip native 长度等失败也不再出现。
+- 剩余 12 项集中在 7z/ZIP 的分卷 SFX：单卷 SFX 场景已不在失败项中，但分卷时 PE 外层容器类型变成空值。说明修复缩小了问题面，分卷 SFX 的容器元数据仍未接通。
+- 7z/ZIP 数据卷先到、launcher 后到的两项均产生两份解压输出；这更像 launcher 重新入队后与已处理卷组重复触发。需要避免重复产出，同时保留测试要求的 launcher pipeline 路由。
+- RAR SFX 的 `file_range` 分类和截断 7z SFX 没有失败记录仍是两项独立输入/状态问题。
+- 环境脚本 smoke 的异常字段从 `'archive'` 变为 `'decision'`，而 acceptance 的 CLI smoke 通过。日志仅证明两个调用路径表现不同，暂不足以断定具体根因。
+
+### 跳过与边界
+
+- disk-full 8 项因需要管理员权限执行 diskpart 而跳过。
+- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 未设置 `SUNPACK_RUN_GAME_TREE_TEST=1`，按测试要求跳过本机 `D:\game` 扫描。
+- `tests/memory/test_watch_growth.py` 为 opt-in performance 测试，不在默认 correctness acceptance 范围内。
+- 本节记录修复后的测试结果；未修复剩余失败项。
