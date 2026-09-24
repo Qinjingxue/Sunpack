@@ -160,7 +160,7 @@ namespace sunpack::sevenzip
         bool bounded_password_probe = false,
 
         const std::vector<std::wstring> &canonical_names = {},
-        bool format_hint_known = false
+        const std::wstring &format_hint = L""
 
     );
 
@@ -179,7 +179,7 @@ namespace sunpack::sevenzip
         bool bounded_password_probe,
 
         const std::vector<std::wstring> &canonical_names,
-        bool format_hint_known
+        const std::wstring &format_hint
 
     )
     {
@@ -192,10 +192,9 @@ namespace sunpack::sevenzip
 
         const auto plans = password_test_open_plans(
             archive_path,
-            part_paths,
             formats,
             input_ranges,
-            format_hint_known);
+            format_hint);
 
         for (const auto &plan : plans)
         {
@@ -756,7 +755,7 @@ namespace sunpack::sevenzip
                 true,
 
                 canonical_names,
-                !format_hint.empty());
+                format_hint);
 
             current.attempts = i + 1;
 
@@ -890,7 +889,7 @@ namespace sunpack::sevenzip
                 true,
 
                 {},
-                !format_hint.empty());
+                format_hint);
 
             current.attempts = i + 1;
 
