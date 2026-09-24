@@ -82,14 +82,14 @@ def _install_instrumentation(
 
     original_submit = watcher._submit_candidate
 
-    async def submit(self, candidate, *, group=None):
+    async def submit(self, candidate):
         attempt = {
             "candidate": str(candidate.path),
             "candidate_name": Path(candidate.path).name,
             "processing_started": _now(),
         }
         attempts.append(attempt)
-        return await original_submit(candidate, group=group)
+        return await original_submit(candidate)
 
     watcher._submit_candidate = types.MethodType(submit, watcher)
 
