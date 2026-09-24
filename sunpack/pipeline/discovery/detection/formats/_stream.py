@@ -1,6 +1,6 @@
 """Bounded format-identity confirmation for standalone compression streams."""
 
-from sunpack.core.analysis import CompressionStreamProbeOptions
+from sunpack.core.analysis.probes.compression_stream import CompressionStreamProbeOptions
 
 
 def confirmed_stream(observation: dict, expected_format: str) -> bool:
