@@ -295,7 +295,7 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
     assert segment["archive_input"] == archive_input
     assert segment_result.diagnostics["verification_archive_input"] == archive_input
     assert segment_result.diagnostics["result"]["verified_manifest"]["validated"] is True
-    assert task.archive_state().to_archive_input_descriptor().open_mode == "file"
+    assert task.archive_input().open_mode == "file"
 
 
 def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
