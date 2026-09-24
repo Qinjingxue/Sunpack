@@ -114,7 +114,7 @@ def _minimal_zip_single() -> bytes:
     [
         (make_minimal_7z(), b"7-Zip SFX", "7z"),
         (_minimal_zip_single(), b"7-Zip SFX", "zip"),
-        (_minimal_rar4_single(), b"WinRAR", "rar"),
+        (_minimal_rar4_single(), b"WinRAR SFX", "rar"),
     ],
 )
 def test_known_sfx_stub_is_confirmed_and_projected_as_file_range(
