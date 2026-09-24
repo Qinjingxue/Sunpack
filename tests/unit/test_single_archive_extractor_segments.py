@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 
 from sunpack.core.support.archive_input_projection import write_source_extractable_segments
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
@@ -296,6 +297,65 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
     assert segment_result.diagnostics["verification_archive_input"] == archive_input
     assert segment_result.diagnostics["result"]["verified_manifest"]["validated"] is True
     assert task.archive_input().open_mode == "file"
+
+
+def test_single_embedded_failure_preserves_child_diagnosis():
+    extractor = SingleArchiveExtractor(
+        password_store=_FakePasswordStore(),
+        password_resolver=_FakePasswordResolver(),
+        metadata_scanner=ArchiveMetadataScanner(),
+        retry_policy=_FakeRetryPolicy(),
+        sevenzip_runner=_FakeSevenZipRunner(),
+        best_effort=True,
+        language="zh",
+    )
+    child = FailureInfo(
+        kind=FailureKind.DAMAGED,
+        stage="extraction",
+        message="Archive is damaged",
+        message_key="failure.damaged",
+    )
+
+    aggregate = extractor._aggregate_embedded_failure([child], segment_count=1)
+
+    assert aggregate.kind is FailureKind.EMBEDDED_SEGMENTS_FAILED
+    assert aggregate.causes == (child,)
+    assert aggregate.message_key == "failure.damaged"
+    assert aggregate.message == extractor.i18n.t("failure.damaged")
+    assert aggregate.contains(FailureKind.DAMAGED)
+
+
+def test_multiple_embedded_failures_keep_aggregate_diagnosis():
+    extractor = SingleArchiveExtractor(
+        password_store=_FakePasswordStore(),
+        password_resolver=_FakePasswordResolver(),
+        metadata_scanner=ArchiveMetadataScanner(),
+        retry_policy=_FakeRetryPolicy(),
+        sevenzip_runner=_FakeSevenZipRunner(),
+        best_effort=True,
+    )
+    failures = [
+        FailureInfo(
+            kind=FailureKind.DAMAGED,
+            stage="extraction",
+            message="damaged",
+            message_key="failure.damaged",
+        ),
+        FailureInfo(
+            kind=FailureKind.MISSING_VOLUME,
+            stage="extraction",
+            message="missing",
+            message_key="failure.missing_volume",
+        ),
+    ]
+
+    aggregate = extractor._aggregate_embedded_failure(failures, segment_count=2)
+
+    assert aggregate.kind is FailureKind.EMBEDDED_SEGMENTS_FAILED
+    assert aggregate.message_key == "failure.embedded_extract_failed"
+    assert aggregate.causes == tuple(failures)
+    assert aggregate.contains(FailureKind.DAMAGED)
+    assert aggregate.contains(FailureKind.MISSING_VOLUME)
 
 
 def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
