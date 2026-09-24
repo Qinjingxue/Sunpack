@@ -864,28 +864,22 @@ fn validate_seven_zip(
     }
     let next_offset = u64::from_le_bytes(header[12..20].try_into().unwrap());
     let next_size = u64::from_le_bytes(header[20..28].try_into().unwrap());
-    let next_crc = u32::from_le_bytes(header[28..32].try_into().unwrap());
-    let next_start = offset.saturating_add(32).saturating_add(next_offset);
+    let Some(next_start) = offset
+        .checked_add(32)
+        .and_then(|value| value.checked_add(next_offset))
+    else {
+        return Ok(None);
+    };
     let Some(end) = next_start.checked_add(next_size) else {
         return Ok(None);
     };
-    if end > size || next_size > usize::MAX as u64 {
+    if end > size {
         return Ok(Some(logical_candidate(
             "7z",
             offset,
             None,
             0.90,
-            "start_header_crc_truncated_next_header",
-        )));
-    }
-    let next = read_at(file, next_start, next_size as usize)?;
-    if next.len() != next_size as usize || crc32(&next) != next_crc {
-        return Ok(Some(logical_candidate(
-            "7z",
-            offset,
-            None,
-            0.90,
-            "start_header_crc_damaged_next_header",
+            "start_header_crc_truncated_declared_range",
         )));
     }
     Ok(Some(candidate(
@@ -893,7 +887,7 @@ fn validate_seven_zip(
         offset,
         Some(end),
         1.0,
-        "start_and_next_header_crc",
+        "start_header_crc_and_declared_end",
     )))
 }
 
