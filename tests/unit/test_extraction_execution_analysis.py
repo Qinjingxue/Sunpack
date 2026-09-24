@@ -11,7 +11,7 @@ def test_archive_state_projects_analysis_into_execution_descriptor():
     )
     state = ArchiveState.from_archive_input(
         descriptor,
-        analysis={
+        planning_analysis={
             "status": "extractable",
             "execution": {"missing_volume_evidence": "seven_zip_start_header_length"},
         },

@@ -79,8 +79,8 @@ def test_input_planning_stage_writes_extractable_segment_without_switching_task_
     assert task.archive_input().open_mode == "file"
     assert task.archive_input().format_hint == "zip"
     state = task.archive_state()
-    assert state.source.open_mode == "file"
-    assert state.source.format_hint == "zip"
+    assert state.archive_input.open_mode == "file"
+    assert state.archive_input.format_hint == "zip"
 
 
 def test_input_planning_stage_keeps_sfx_segment_for_standard_archive_extension(tmp_path):
@@ -230,7 +230,7 @@ def test_input_planning_stage_reuses_batch_report_for_equivalent_inputs(tmp_path
     assert stage.analyzer.calls == 1
     assert first.archive_input().format_hint == "zip"
     assert second.archive_input().format_hint == "zip"
-    assert second.archive_state().analysis["cache_hits"] == 2
+    assert second.archive_state().planning_analysis["cache_hits"] == 2
 
 
 def test_input_planning_stage_does_not_treat_primary_multipart_archive_as_embedded_segment(tmp_path):
