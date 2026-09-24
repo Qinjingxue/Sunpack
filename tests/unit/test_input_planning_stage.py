@@ -124,12 +124,13 @@ def test_input_planning_stage_does_not_treat_native_zip_recovery_fragments_as_em
         details={
             "source": "embedded_scan",
             "validation": "local_header_and_data_range",
+            "candidate_kind": "anchor",
         },
     )
     report = _report(archive, evidence, prepass={
         "source": "embedded_scan",
         "formats": ["zip"],
-        "embedded_candidates": [{"format": "zip", "offset": 13}],
+        "embedded_candidates": [{"format": "zip", "offset": 13, "candidate_kind": "anchor"}],
     })
     task = _task(archive)
     stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
@@ -153,6 +154,7 @@ def test_input_planning_stage_keeps_embedded_scan_ranges_for_neutral_carrier(tmp
         details={
             "source": "embedded_scan",
             "validation": "local_header_and_data_range",
+            "candidate_kind": "logical_archive",
         },
     )
     report = _report(carrier, evidence, prepass={"source": "embedded_scan", "formats": ["zip"]})
