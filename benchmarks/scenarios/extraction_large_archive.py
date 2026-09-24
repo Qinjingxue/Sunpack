@@ -334,7 +334,7 @@ class RequestRuntimeProfiler:
             ("_analyze_task", "planning_analyze_task"),
             ("_tasks_from_report", "planning_tasks_from_report"),
             ("_record_report", "planning_record_report"),
-            ("_record_planning_state", "planning_record_state"),
+            ("_record_planning_input", "planning_record_input"),
         ):
             _wrap(planning, name, timings, label)
         _wrap(_child(planning, "analyzer"), "analyze", timings, "planning_analyzer_analyze")
