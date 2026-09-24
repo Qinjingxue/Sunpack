@@ -476,13 +476,20 @@ def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_pa
     assert harvested.succeeded == 2
 
 
-def _watch_summary(path: str, kind: OutcomeKind, verification: dict):
+def _watch_summary(
+    path: str,
+    kind: OutcomeKind,
+    verification: dict,
+    *,
+    recovered_outputs=(),
+):
     return SimpleNamespace(
         success_count=1 if kind == OutcomeKind.COMPLETE_SUCCESS else 0,
         partial_success_count=1 if kind == OutcomeKind.PARTIAL_SUCCESS else 0,
         failed_tasks=[],
         failures=[],
         processed_keys=[path],
+        recovered_outputs=list(recovered_outputs),
         target_results=[TargetRunResult(path, kind, verification=verification)],
     )
 
@@ -583,12 +590,18 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
             self.output_dir.mkdir(parents=True, exist_ok=True)
             (self.output_dir / "payload.bin").write_bytes(b"payload")
             if kind == OutcomeKind.PARTIAL_SUCCESS:
-                self.context.recovered_outputs = [{"out_dir": str(self.output_dir)}]
                 verification = {"decision_hint": "accept_partial", "archive_coverage": {"complete_files": 1}}
+                recovered_outputs = [{"out_dir": str(self.output_dir)}]
             else:
                 self.context.flatten_candidates = {str(self.output_dir)}
                 verification = {"decision_hint": "accept"}
-            return _watch_summary(paths[0], kind, verification)
+                recovered_outputs = []
+            return _watch_summary(
+                paths[0],
+                kind,
+                verification,
+                recovered_outputs=recovered_outputs,
+            )
 
     watcher = WatchScheduler(
         {"watch": {"clipboard_monitor_enabled": False}},
@@ -627,11 +640,11 @@ def test_partial_result_is_rejected_but_direct_output_remains(tmp_path, monkeypa
         def run_targets(self, paths):
             self.output_dir.mkdir(parents=True)
             (self.output_dir / "recovered.bin").write_bytes(b"partial")
-            self.context.recovered_outputs = [{"out_dir": str(self.output_dir)}]
             return _watch_summary(
                 paths[0],
                 OutcomeKind.PARTIAL_SUCCESS,
                 {"decision_hint": "accept_partial", "archive_coverage": {"complete_files": 1}},
+                recovered_outputs=[{"out_dir": str(self.output_dir)}],
             )
 
     watcher = WatchScheduler(
