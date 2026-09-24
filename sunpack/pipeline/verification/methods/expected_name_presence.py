@@ -2,7 +2,7 @@ import os
 from typing import Any
 
 from sunpack.core.config.advanced_defaults import advanced_named_config
-from sunpack.pipeline.verification.archive_state_manifest import ArchiveStateManifest, archive_state_manifest_for_evidence
+from sunpack.pipeline.verification.archive_input_manifest import ArchiveInputManifest, archive_input_manifest_for_evidence
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.methods._archive_output_match import (
     ArchiveOutputCoverage,
@@ -38,11 +38,11 @@ class ExpectedNamePresenceMethod:
 
     def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStepResult:
         config = {**advanced_named_config(("verification", "methods"), self.name), **config}
-        state_manifest = archive_state_manifest_for_evidence(
+        input_manifest = archive_input_manifest_for_evidence(
             evidence,
             max_items=max(1, int(config.get("max_expected_names", 50) or 50)),
         )
-        expected_names = self._expected_names(config, state_manifest)
+        expected_names = self._expected_names(config, input_manifest)
         if not expected_names:
             return VerificationStepResult(method=self.name, status="skipped")
 
@@ -85,11 +85,11 @@ class ExpectedNamePresenceMethod:
                 method=self.name,
                 status="passed",
                 completeness_hint=coverage.completeness,
-                content_integrity_hint=_content_integrity_hint(state_manifest),
+                content_integrity_hint=_content_integrity_hint(input_manifest),
                 verification_strength=VERIFICATION_STRENGTH_MANIFEST,
-                total_item_count=int(getattr(state_manifest, "item_count", 0) or 0),
-                verified_item_count=int(getattr(state_manifest, "verified_item_count", 0) or 0),
-                archive_walk_complete=bool(getattr(state_manifest, "archive_walk_complete", False)),
+                total_item_count=int(getattr(input_manifest, "item_count", 0) or 0),
+                verified_item_count=int(getattr(input_manifest, "verified_item_count", 0) or 0),
+                archive_walk_complete=bool(getattr(input_manifest, "archive_walk_complete", False)),
                 file_observations=coverage.observations,
                 issues=[VerificationIssue(
                     method=self.name,
@@ -97,7 +97,7 @@ class ExpectedNamePresenceMethod:
                     message="Expected archive names were matched against extraction output",
                     path=evidence.output_dir,
                     expected=len(expected_names),
-                    actual=_coverage_actual(coverage, state_manifest),
+                    actual=_coverage_actual(coverage, input_manifest),
                 )],
             )
 
@@ -126,10 +126,10 @@ class ExpectedNamePresenceMethod:
                 "matched": matched,
                 "missing": missing,
                 "missing_ratio": round(missing_ratio, 3),
-                "coverage": _coverage_actual(coverage, state_manifest),
+                "coverage": _coverage_actual(coverage, input_manifest),
             },
         )
-        content_integrity = _content_integrity_hint(state_manifest)
+        content_integrity = _content_integrity_hint(input_manifest)
         return VerificationStepResult(
             method=self.name,
             status="warning",
@@ -138,26 +138,26 @@ class ExpectedNamePresenceMethod:
             recoverable_upper_bound_hint=coverage.completeness,
             content_integrity_hint=(
                 CONTENT_INTEGRITY_VERIFIED_PARTIAL
-                if _expected_names_are_strong(config, content_integrity, state_manifest)
+                if _expected_names_are_strong(config, content_integrity, input_manifest)
                 else content_integrity
             ),
             verification_strength=VERIFICATION_STRENGTH_MANIFEST,
-            total_item_count=int(getattr(state_manifest, "item_count", 0) or 0),
-            verified_item_count=int(getattr(state_manifest, "verified_item_count", 0) or 0),
-            archive_walk_complete=bool(getattr(state_manifest, "archive_walk_complete", False)),
-            decision_hint=DECISION_RETRY_EXTRACT if _expected_names_are_strong(config, content_integrity, state_manifest) else DECISION_NONE,
+            total_item_count=int(getattr(input_manifest, "item_count", 0) or 0),
+            verified_item_count=int(getattr(input_manifest, "verified_item_count", 0) or 0),
+            archive_walk_complete=bool(getattr(input_manifest, "archive_walk_complete", False)),
+            decision_hint=DECISION_RETRY_EXTRACT if _expected_names_are_strong(config, content_integrity, input_manifest) else DECISION_NONE,
             file_observations=coverage.observations,
         )
 
     def _expected_names(
         self,
         config: dict,
-        state_manifest: ArchiveStateManifest | None = None,
+        input_manifest: ArchiveInputManifest | None = None,
     ) -> list[str]:
         configured = config.get("expected_names")
         candidates = list(_iter_name_values(configured))
-        if not candidates and state_manifest is not None and state_manifest.ok:
-            candidates.extend(state_manifest.expected_names)
+        if not candidates and input_manifest is not None and input_manifest.ok:
+            candidates.extend(input_manifest.expected_names)
 
         max_names = max(1, int(config.get("max_expected_names", 50) or 50))
         names = []
@@ -197,12 +197,12 @@ def _iter_name_values(value: Any):
             yield from _iter_name_values(item)
 
 
-def _content_integrity_hint(state_manifest: ArchiveStateManifest | None = None) -> str:
-    if state_manifest is None:
+def _content_integrity_hint(input_manifest: ArchiveInputManifest | None = None) -> str:
+    if input_manifest is None:
         return CONTENT_INTEGRITY_UNKNOWN
-    if state_manifest.checksum_error:
+    if input_manifest.checksum_error:
         return CONTENT_INTEGRITY_PAYLOAD_DAMAGED
-    if state_manifest.archive_walk_complete and state_manifest.verified_item_count >= state_manifest.item_count:
+    if input_manifest.archive_walk_complete and input_manifest.verified_item_count >= input_manifest.item_count:
         return CONTENT_INTEGRITY_VERIFIED_COMPLETE
     return CONTENT_INTEGRITY_UNKNOWN
 
@@ -210,20 +210,20 @@ def _content_integrity_hint(state_manifest: ArchiveStateManifest | None = None) 
 def _expected_names_are_strong(
     config: dict,
     content_integrity: str,
-    state_manifest: ArchiveStateManifest | None = None,
+    input_manifest: ArchiveInputManifest | None = None,
 ) -> bool:
     if config.get("expected_names"):
         return True
-    if state_manifest is not None and state_manifest.ok and state_manifest.expected_names:
+    if input_manifest is not None and input_manifest.ok and input_manifest.expected_names:
         return True
     return content_integrity == CONTENT_INTEGRITY_VERIFIED_COMPLETE
 
 
-def _coverage_actual(coverage, state_manifest: ArchiveStateManifest | None) -> dict[str, Any]:
+def _coverage_actual(coverage, input_manifest: ArchiveInputManifest | None) -> dict[str, Any]:
     actual = coverage_details(coverage)
     actual.update({
         "source_manifest": True,
-        "archive_type": state_manifest.archive_type if state_manifest is not None else "",
-        "manifest_source": state_manifest.source if state_manifest is not None and state_manifest.ok else "configured",
+        "archive_type": input_manifest.archive_type if input_manifest is not None else "",
+        "manifest_source": input_manifest.source if input_manifest is not None and input_manifest.ok else "configured",
     })
     return actual
