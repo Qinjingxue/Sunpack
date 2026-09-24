@@ -42,9 +42,10 @@ class SevenZipAnalysisModule:
         if error:
             damage_flags.append(str(error))
         boundary_unreliable = error in {"start_header_crc_mismatch", "next_header_out_of_range", "invalid_next_header_range"}
+        bounded_candidate = self._bounded_embedded_candidate(prepass, start) if boundary_unreliable else None
         if boundary_unreliable:
             damage_flags.append("boundary_unreliable")
-            native["boundary_confidence"] = "none"
+            native["boundary_confidence"] = "bounded" if bounded_candidate is not None else "none"
         elif native.get("next_header_crc_checked") and not native.get("next_header_crc_ok"):
             damage_flags.append("directory_integrity_bad_or_unknown")
             native["boundary_confidence"] = "medium"
@@ -56,7 +57,18 @@ class SevenZipAnalysisModule:
         next_header_size = int(native.get("next_header_size") or 0)
         end_offset = int(native.get("segment_end") or 0) or (start + 32 + next_header_offset + next_header_size if next_header_size else None)
         if boundary_unreliable:
-            end_offset = None
+            end_offset = (
+                int(bounded_candidate["range_end_offset"])
+                if bounded_candidate is not None
+                else None
+            )
+            if bounded_candidate is not None:
+                native.update({
+                    "source": "embedded_scan",
+                    "validation": str(bounded_candidate.get("validation") or ""),
+                    "candidate_kind": "logical_archive",
+                    "boundary_kind": "bounded",
+                })
         return ArchiveFormatEvidence(
             format="7z",
             confidence=confidence,
@@ -65,6 +77,22 @@ class SevenZipAnalysisModule:
             warnings=[] if end_offset or boundary_unreliable else ["7z archive structure does not prove an end for this segment"],
             details=native,
         )
+
+    @staticmethod
+    def _bounded_embedded_candidate(prepass: dict, start: int) -> dict | None:
+        """Return an already-validated bounded 7z logical candidate for this start."""
+        for item in prepass.get("embedded_candidates", []):
+            if (
+                item.get("format") == "7z"
+                and int(item.get("offset") or 0) == int(start)
+                and item.get("candidate_kind") == "logical_archive"
+                and item.get("boundary_kind") == "bounded"
+                and bool(item.get("extractable"))
+            ):
+                range_end = item.get("range_end_offset")
+                if range_end is not None and int(range_end) > int(start):
+                    return item
+        return None
 
 
 register_analysis_module(SevenZipAnalysisModule())
