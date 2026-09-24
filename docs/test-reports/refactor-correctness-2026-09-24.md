@@ -693,3 +693,34 @@ sunpack.py --help 通过。下面 4 个命令均退出码 1；重跑后每个命
 - `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 未设置 `SUNPACK_RUN_GAME_TREE_TEST=1`，按测试要求跳过本机 `D:\game` 扫描。
 - `tests/memory/test_watch_growth.py` 为 opt-in performance 测试，不在默认 correctness acceptance 范围内。
 - 本节记录修复后的测试结果；未修复剩余失败项。
+## 再次修复后复测（741f9dec）
+
+- 被测提交：`741f9dec897f335c5cdfdca1cd274e01b77f234c`（`fix: close low-risk post-refactor regressions (#124)`）。
+- 本轮未修改程序或测试文件。执行 `scripts/setup_windows_dev.ps1 -Arch x64` 强制重建 Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL；worker 6 项 CTest 与 toast 1 项 CTest 全部通过。
+- 这次开发环境脚本的最终 CLI 检查成功，打印本地 CLI usage 和 `Local development environment is ready.`；acceptance 环境预检也判定环境为 current。
+- `run_acceptance_tests.ps1 -NoWait` 完整执行。Rust 单测另执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：100 passed，0 failed。
+
+### 本轮汇总
+
+| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| CLI、unit、functional | 1140 | 1140 | 0 | 0 | 0 |
+| integration、real | 347 | 343 | 3 | 0 | 1 |
+| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
+| **Python pytest 合计** | **1495** | **1483** | **3** | **0** | **9** |
+
+额外验证：Rust 单测 100 项全部通过；native CTest 7 项全部通过；5 项 acceptance CLI smoke 全部通过。与上一轮 16 个 pytest 失败相比，当前剩 3 项。
+
+### 本轮剩余失败项与报错
+
+- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[7z]` — 测试预期截断的 7z SFX 被登记为失败任务，但 `assert summary.failed_tasks` 失败，实际 `RunSummary(...).failed_tasks == []`。捕获输出显示扫描完成时 0 个候选归档、0 个失败任务；输入没有进入可报告的失败路径。
+- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_routes_new_launcher_through_pipeline[7z]` — 预期 marker 文件数为 1，实际 `assert 2 == 1`。数据卷先到、launcher 后到后，同一 marker 被解压到原输出目录和带 `(1)` 后缀的第二个输出目录；捕获日志显示同一个 `.7z.001` 被成功提取两次。
+- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_routes_new_launcher_through_pipeline[zip]` — 同样预期 1 个 marker，实际 2 个；同一 `.zip.001` 被成功提取两次并生成第二个输出目录。
+
+### 本轮理解
+
+- 上一轮剩余的 12 个 7z/ZIP 分卷 SFX PE 容器识别失败和 1 个 RAR SFX 输入类别失败，本轮均通过。错误范围继续缩小，构建 probe 也恢复正常。
+- 两个 watch 用例都证明 launcher 已进入 pipeline，但同组数据卷已先完成处理；后来重复提取同一数据卷并写出第二份结果。剩余重点是 launcher 到达时的同组任务去重/已完成状态复用。
+- 截断 7z SFX 仍未被登记为失败任务：扫描将其视作 0 个候选并正常结束。这与 watch 重复提取是独立问题。
+- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 因未设置 `SUNPACK_RUN_GAME_TREE_TEST=1` 跳过；disk-full 8 项因需要管理员权限执行 diskpart 而跳过。`tests/memory/test_watch_growth.py` 仍是 opt-in performance 测试，不属于默认 correctness acceptance。
+- 本轮只记录结果，未修复剩余失败项。
