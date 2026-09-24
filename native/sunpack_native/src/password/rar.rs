@@ -1160,6 +1160,77 @@ pub(crate) fn probe_header_encrypted_terminal(
     Ok(None)
 }
 
+#[pyfunction]
+pub(crate) fn resolve_embedded_rar_boundaries(
+    py: Python<'_>,
+    archive_path: String,
+    offsets: Vec<u64>,
+    passwords: Vec<String>,
+) -> PyResult<Py<PyDict>> {
+    const MAX_EMBEDDED_RAR_BLOCKS: usize = 1_000_000;
+
+    let outcome = py.detach(move || -> io::Result<(String, Vec<(u64, u64, String)>, Option<u64>)> {
+        let reader = ManagedReader::open(&archive_path)?;
+        let mut resolved = Vec::with_capacity(offsets.len());
+        if offsets.is_empty() {
+            return Ok(("ok".to_string(), resolved, None));
+        }
+        if passwords.is_empty() {
+            return Ok(("password_required".to_string(), resolved, offsets.first().copied()));
+        }
+
+        for offset in offsets {
+            let mut matched_incomplete = false;
+            let mut exact = None;
+            for password in &passwords {
+                let Some(proof) = probe_header_encrypted_terminal(
+                    &reader,
+                    offset,
+                    password,
+                    MAX_EMBEDDED_RAR_BLOCKS,
+                )? else {
+                    continue;
+                };
+                if !proof.password_matched {
+                    continue;
+                }
+                if proof.end_block_found {
+                    if let Some(end_offset) = proof.end_offset.filter(|end| *end > offset) {
+                        exact = Some((end_offset, password.clone()));
+                        break;
+                    }
+                }
+                matched_incomplete = true;
+                break;
+            }
+            if let Some((end_offset, password)) = exact {
+                resolved.push((offset, end_offset, password));
+                continue;
+            }
+            if matched_incomplete {
+                return Ok(("truncated".to_string(), resolved, Some(offset)));
+            }
+            return Ok(("wrong_password".to_string(), resolved, Some(offset)));
+        }
+        Ok(("ok".to_string(), resolved, None))
+    })?;
+
+    let (status, resolved, failed_offset) = outcome;
+    let result = PyDict::new(py);
+    result.set_item("status", status)?;
+    result.set_item("failed_offset", failed_offset)?;
+    let rows = PyList::empty(py);
+    for (offset, end_offset, password) in resolved {
+        let row = PyDict::new(py);
+        row.set_item("offset", offset)?;
+        row.set_item("end_offset", end_offset)?;
+        row.set_item("password", password)?;
+        rows.append(row)?;
+    }
+    result.set_item("resolved", rows)?;
+    Ok(result.unbind())
+}
+
 fn probe_rar5_encrypted_terminal(
     reader: &ManagedReader,
     start_offset: u64,
