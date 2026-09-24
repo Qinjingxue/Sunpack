@@ -3,7 +3,7 @@
 from typing import Any
 
 from sunpack.core.contracts.discovery import DiscoveryCandidate, StageResult
-from sunpack.core.contracts.failures import FailureInfo
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.discovery import ArchiveDiscoveryPipeline
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
@@ -58,12 +58,16 @@ class ArchiveTaskProvider:
     ) -> list[ArchiveTask]:
         self.failed_candidates = []
         self.failed_candidate_failures = []
-        tasks = self.discover_targets(
+        discovered = self.discover_targets(
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
-        ).resolved_tasks
-        return self.filter_processed_tasks(tasks, processed_keys=processed_keys)
+        )
+        self._record_discovery_failures(discovered)
+        return self.filter_processed_tasks(
+            discovered.resolved_tasks,
+            processed_keys=processed_keys,
+        )
 
     def filter_processed_tasks(
         self,
@@ -73,6 +77,48 @@ class ArchiveTaskProvider:
     ) -> list[ArchiveTask]:
         processed = processed_keys or set()
         return [task for task in tasks if task.key not in processed]
+
+    def _record_discovery_failures(self, result: StageResult) -> None:
+        mapping = {
+            "embedded_password_required": (
+                FailureKind.PASSWORD_REQUIRED,
+                "failure.password_required",
+                "Embedded archive requires a password",
+                "request_password",
+            ),
+            "embedded_wrong_password": (
+                FailureKind.WRONG_PASSWORD,
+                "failure.wrong_password",
+                "Embedded archive password is wrong",
+                "request_password",
+            ),
+            "embedded_truncated": (
+                FailureKind.DAMAGED,
+                "failure.damaged",
+                "Embedded archive is truncated before its terminal boundary",
+                "",
+            ),
+        }
+        for trace in result.traces:
+            failure = mapping.get(trace.reason)
+            if failure is None:
+                continue
+            kind, message_key, message, user_action = failure
+            if trace.entry_path not in self.failed_candidates:
+                self.failed_candidates.append(trace.entry_path)
+            info = FailureInfo(
+                kind=kind,
+                stage="embedded_boundary",
+                message=message,
+                message_key=message_key,
+                user_action=user_action,
+                details={
+                    "path": trace.entry_path,
+                    "reason": trace.reason,
+                },
+            )
+            if info not in self.failed_candidate_failures:
+                self.failed_candidate_failures.append(info)
 
     def task_from_candidate(self, candidate: DiscoveryCandidate) -> ArchiveTask | None:
         result = self.discovery.discover([candidate])
