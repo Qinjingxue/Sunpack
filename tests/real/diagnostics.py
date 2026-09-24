@@ -202,11 +202,9 @@ def case_snapshot(case: Any) -> dict[str, Any]:
 
 def task_snapshot(task: Any) -> dict[str, Any]:
     archive_input_fn = getattr(task, "archive_input", None)
-    archive_state_fn = getattr(task, "archive_state", None)
     knowledge_fn = getattr(task, "knowledge", None)
 
     archive_input = archive_input_fn() if callable(archive_input_fn) else None
-    archive_state = archive_state_fn() if callable(archive_state_fn) else None
     knowledge = knowledge_fn() if callable(knowledge_fn) else None
     knowledge_payload = knowledge.to_dict() if hasattr(knowledge, "to_dict") else {}
     selected_knowledge = {
@@ -226,7 +224,6 @@ def task_snapshot(task: Any) -> dict[str, Any]:
         "discovery_source": getattr(task, "discovery_source", ""),
         "discovery_reason": getattr(task, "discovery_reason", ""),
         "archive_input": jsonable(archive_input),
-        "archive_state": jsonable(archive_state),
         "knowledge": jsonable(selected_knowledge),
         "runtime": jsonable(getattr(task, "runtime", {})),
     }

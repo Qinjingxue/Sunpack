@@ -101,7 +101,8 @@ class ExtractionExecutionTests(unittest.TestCase):
             result = extractor.extract(task, str(out_dir))
 
             self.assertTrue(result.success)
-            self.assertEqual(result.all_parts, [str(archive_path), str(launcher_path)])
+            self.assertEqual(task.cleanup_parts, [str(archive_path), str(launcher_path)])
+            self.assertFalse(hasattr(result, "all_parts"))
 
     def test_extractor_retries_unclassified_process_failure(self):
         with tempfile.TemporaryDirectory() as tmp:

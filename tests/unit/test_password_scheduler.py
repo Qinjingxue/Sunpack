@@ -365,7 +365,7 @@ def test_extraction_plan_preserves_zipcrypto_candidate_evidence(tmp_path):
     assert scheduler.cache.has_negative(build_archive_fingerprint(str(archive)).key, "rejected") is True
 
 
-def test_verifier_chain_prioritizes_fast_verifier_from_extension():
+def test_verifier_chain_does_not_infer_format_from_extension():
     zip_fast = FormatVerifier("zip", PasswordBatchVerification(ok=False, status="unsupported_method"))
     rar_fast = FormatVerifier("rar", PasswordBatchVerification(ok=False, status="unsupported_method"))
     seven_zip_fast = FormatVerifier("7z", PasswordBatchVerification(
@@ -379,9 +379,9 @@ def test_verifier_chain_prioritizes_fast_verifier_from_extension():
     outcome = chain.verify_batch("sample.7z", ["bad1", "bad2"])
 
     assert outcome.status == "no_match"
+    assert zip_fast.batches == [["bad1", "bad2"]]
+    assert rar_fast.batches == [["bad1", "bad2"]]
     assert seven_zip_fast.batches == [["bad1", "bad2"]]
-    assert zip_fast.batches == []
-    assert rar_fast.batches == []
 
 
 def test_verifier_chain_prioritizes_fast_verifier_from_archive_input():

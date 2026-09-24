@@ -318,7 +318,7 @@ class RequestRuntimeProfiler:
 
         _wrap(runtime, "execute_async", timings, "pipeline_runtime_execute")
         _wrap(runtime, "_plan_task_isolated", timings, "pipeline_plan_task_isolated")
-        _wrap(_child(runtime, "nested_extraction_policy"), "authorize_batch", timings, "pipeline_nested_authorize")
+        _wrap(_child(runtime, "recursive_authorization"), "authorize_batch", timings, "pipeline_nested_authorize")
         self._install_cleanup_timer(_child(runtime, "cleanup_scope"))
 
         _wrap(scanner, "direct_file_tasks", timings, "pipeline_direct_scan")
@@ -334,7 +334,7 @@ class RequestRuntimeProfiler:
             ("_analyze_task", "planning_analyze_task"),
             ("_tasks_from_report", "planning_tasks_from_report"),
             ("_record_report", "planning_record_report"),
-            ("_record_planning_state", "planning_record_state"),
+            ("_record_planning_input", "planning_record_input"),
         ):
             _wrap(planning, name, timings, label)
         _wrap(_child(planning, "analyzer"), "analyze", timings, "planning_analyzer_analyze")
@@ -348,7 +348,6 @@ class RequestRuntimeProfiler:
             ("_selected_structure_modules", "planning_select_structure_modules"),
             ("_run_structure_modules", "planning_structure_modules"),
             ("_selected_evidences", "planning_select_evidences"),
-            ("_embedded_scan_enabled", "planning_embedded_scan_check"),
         ):
             _wrap(analysis_engine, name, timings, label)
         if analysis_engine is not None and hasattr(analysis_engine, "_run_module"):
@@ -369,13 +368,11 @@ class RequestRuntimeProfiler:
 
         _wrap(batch, "execute_async", timings, "batch_execute")
         for name, label in (
-            ("prepare_tasks", "batch_prepare"),
             ("_skip_tasks_inside_batch_outputs", "batch_skip_inside_outputs"),
             ("collect_result", "batch_collect_result"),
             ("_inspect_tasks_before_extract", "batch_password_preflight"),
         ):
             _wrap(batch, name, timings, label)
-        _wrap(_child(batch, "relation_stage"), "resolve_tasks", timings, "batch_relation_resolve")
         password_contexts = _child(batch, "directory_password_contexts")
         _wrap(password_contexts, "annotate", timings, "batch_directory_password_annotate")
         _wrap(password_contexts, "remember", timings, "batch_directory_password_remember")

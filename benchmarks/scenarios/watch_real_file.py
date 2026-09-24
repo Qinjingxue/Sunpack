@@ -47,10 +47,10 @@ def _wrap_scheduler_timers(watcher: WatchScheduler, destination: Path, timings: 
 
     original_submit = watcher._submit_candidate
 
-    async def submit(self, candidate, *, group=None):
+    async def submit(self, candidate):
         if Path(candidate.path).resolve() == destination.resolve():
             timings.setdefault("processing_started", _now())
-        return await original_submit(candidate, group=group)
+        return await original_submit(candidate)
 
     watcher._submit_candidate = types.MethodType(submit, watcher)
 

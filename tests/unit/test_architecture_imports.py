@@ -124,6 +124,12 @@ def test_discovery_provenance_is_not_double_stored() -> None:
     assert "discovery_segments" not in stored
 
 
+def test_discovery_candidate_has_no_member_path_compatibility_alias() -> None:
+    from sunpack.core.contracts.discovery import DiscoveryCandidate
+
+    assert not hasattr(DiscoveryCandidate, "member_paths")
+
+
 def test_retired_runtime_route_evidence_module_is_absent() -> None:
     assert not (
         _PACKAGE_ROOT / "core" / "support" / "runtime_route_evidence.py"

@@ -496,6 +496,8 @@ def test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tm
     assert len(tasks) == 1
     descriptor = tasks[0].archive_input()
     assert descriptor.format_hint == "rar"
+    assert descriptor.open_mode == "sfx_with_volumes"
+    assert descriptor.volume_style == "rar_sfx_part"
     assert descriptor.part_paths() == [str(path) for path in parts]
     assert [part.volume_number for part in descriptor.parts] == list(range(1, len(parts) + 1))
 

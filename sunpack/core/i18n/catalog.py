@@ -428,7 +428,7 @@ CATALOG = {
         "cli.scan.paths": "要扫描的文件或目录。",
         "cli.scan.identified": "[命令行] 识别到 {count} 个可解压任务。",
         "cli.scan.details": "  判定={decision} 分卷数={parts}",
-        "cli.scan.detected_ext": "  检测扩展名：{ext}",
+        "cli.scan.format": "  检测格式：{format}",
         "cli.scan.matched_rules": "  命中规则：{rules}",
         "cli.inspect.help": "输出文件检测详情，不修改文件系统。",
         "cli.inspect.paths": "要检测的文件或目录。",

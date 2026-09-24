@@ -118,7 +118,7 @@ def test_plan7_data_volumes_before_launcher_do_not_resubmit(
         harness.close()
 
 
-def test_plan7_rar_part1_exe_is_real_input_when_arriving_as_head(tmp_path):
+def test_plan7_rar_part1_exe_enters_pipeline_as_real_head_before_family_complete(tmp_path):
     case = _build_case(tmp_path, "rar")
     harness = start_watch(
         tmp_path,
@@ -128,15 +128,18 @@ def test_plan7_rar_part1_exe_is_real_input_when_arriving_as_head(tmp_path):
     try:
         plan_case = type("PlanCase", (), {"case": case, "archive_format": "rar", "sfx": True})()
         order = split_arrival_order(plan_case, random.Random(19), policy="head_first")
-        for index, volume in enumerate(order):
-            arrive_slowly(harness, volume)
-            if index < len(order) - 1:
-                assert not harness.submission_events
-        stable_at = harness.stable_at_by_name[order[0].name]
-        _finish_case(harness, case, stable_at)
+        head, *remaining = order
+        assert head.name == case.entry_path.name
+
+        arrive_slowly(harness, head)
         assert any(
             any(path.name == case.entry_path.name for path in map(Path, event.paths))
             for event in harness.submission_events
         )
+
+        for volume in remaining:
+            arrive_slowly(harness, volume)
+        stable_at = harness.stable_at_by_name[head.name]
+        _finish_case(harness, case, stable_at)
     finally:
         harness.close()

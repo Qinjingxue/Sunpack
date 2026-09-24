@@ -292,7 +292,7 @@ def _install_watch_instrumentation(
 
     original_submit = watcher._submit_candidate
 
-    async def submit(self, candidate, *, group=None):
+    async def submit(self, candidate):
         attempt = {
             "candidate": str(candidate.path),
             "candidate_name": Path(candidate.path).name,
@@ -300,7 +300,7 @@ def _install_watch_instrumentation(
             "input_paths": list(group.input_paths) if group is not None else [str(candidate.path)],
         }
         attempts.append(attempt)
-        return await original_submit(candidate, group=group)
+        return await original_submit(candidate)
 
     watcher._submit_candidate = types.MethodType(submit, watcher)
 

@@ -39,7 +39,7 @@ def test_machine_level_path_context_menu_startup_and_toast_registration():
     installer = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
     register = (ROOT / "scripts" / "register_context_menu.ps1").read_text(encoding="utf-8")
     unregister = (ROOT / "scripts" / "unregister_context_menu.ps1").read_text(encoding="utf-8")
-    startup = (ROOT / "sunpack" / "platform" / "windows" / "startup.py").read_text(encoding="utf-8")
+    startup = (ROOT / "sunpack" / "runtime" / "watch" / "startup.py").read_text(encoding="utf-8")
     toast = (ROOT / "native" / "toast_host" / "src" / "main.cpp").read_text(encoding="utf-8")
 
     assert "RegQueryStringValue(HKLM, EnvironmentRegistryKey, 'Path', CurrentPath)" in installer

@@ -21,7 +21,7 @@ def _runtime_argv(argument: str) -> list[str]:
     if getattr(sys, "frozen", False) or "__compiled__" in globals():
         return [str(current_process_executable()), argument]
     executable = current_process_executable().with_name("pythonw.exe")
-    script = Path(__file__).resolve().parents[3] / "sunpack.py"
+    script = Path(__file__).resolve().parents[4] / "sunpack.py"
     return [str(executable), str(script), argument]
 
 

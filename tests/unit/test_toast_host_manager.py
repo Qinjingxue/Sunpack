@@ -278,7 +278,7 @@ def test_show_failure_recreates_presenter_on_owner_thread(monkeypatch):
 def test_main_runtime_handles_toast_bootstrap_without_starting_engine(monkeypatch, argument, native_method):
     import sys
     from types import SimpleNamespace
-    from sunpack.core.support import entrypoint
+    import sunpack.runtime.entrypoint as entrypoint
     from sunpack.core.support import runtime_identity
 
     calls = []
@@ -390,7 +390,7 @@ def test_unregister_toast_current_user_helper_never_relaunches_when_still_elevat
 
 def test_unregister_toast_current_user_helper_is_dispatched_before_normal_runtime(monkeypatch):
     import sys
-    from sunpack.core.support import entrypoint
+    import sunpack.runtime.entrypoint as entrypoint
     from sunpack.core.support import runtime_identity
 
     calls = []

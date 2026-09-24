@@ -2500,9 +2500,14 @@ fn parse_marker_numbered_volume(path: &str) -> Option<ParsedVolume> {
     } else {
         "generic"
     };
-    let has_exe = tail
-        .split('.')
-        .any(|token| token.eq_ignore_ascii_case("exe"));
+    let prefix_has_exe = raw_prefix
+        .rsplit('.')
+        .next()
+        .is_some_and(|token| token.eq_ignore_ascii_case("exe"));
+    let has_exe = prefix_has_exe
+        || tail
+            .split('.')
+            .any(|token| token.eq_ignore_ascii_case("exe"));
     let style = if family == "rar" {
         if has_exe && number == 1 {
             "rar_sfx_part"
@@ -2893,6 +2898,21 @@ mod tests {
 
         assert!(first.iter().any(|key| tail.contains(key)));
         assert!(!first.iter().any(|key| other.contains(key)));
+    }
+
+    #[test]
+    fn decorated_rar_sfx_head_keeps_exe_token_before_part_marker() {
+        let first = parse_numbered_volume_name("shared.bundle.exe.part1.useless.fake").unwrap();
+        let second = parse_numbered_volume_name("shared.bundle.rar.part2.useless.fake").unwrap();
+
+        assert_eq!(first.family, "rar");
+        assert_eq!(first.style, "rar_sfx_part");
+        assert_eq!(first.prefix, "shared.bundle");
+        assert_eq!(first.number, 1);
+        assert_eq!(second.family, "rar");
+        assert_eq!(second.style, "rar_part");
+        assert_eq!(second.prefix, "shared.bundle");
+        assert_eq!(second.number, 2);
     }
 
     #[test]

@@ -171,10 +171,11 @@ def select_single_candidate_ratio(
 
 
 def logical_candidate_size(candidate: DiscoveryCandidate) -> int:
-    if len(candidate.member_paths) > 1:
+    part_paths = candidate.archive_input.part_paths()
+    if len(part_paths) > 1:
         total = 0
         seen: set[str] = set()
-        for raw_path in candidate.member_paths:
+        for raw_path in part_paths:
             normalized = os.path.normcase(os.path.normpath(raw_path))
             if normalized in seen:
                 continue

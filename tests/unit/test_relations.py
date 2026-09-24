@@ -8,6 +8,7 @@ import pytest
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_target
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.pipeline.discovery.relations import RelationsScheduler
@@ -344,7 +345,7 @@ def test_standalone_tbz2_cannot_become_zip_volume_two(tmp_path):
     assert by_name["payload.tbz2"].head_metadata["standalone"] is True
 
 
-def test_prefixed_single_disk_zip_carrier_is_not_waited_as_missing_tail(tmp_path):
+def test_prefixed_single_disk_zip_carrier_is_resolved_by_embedded_discovery(tmp_path):
     carrier = tmp_path / "cover.jpg"
     archive = tmp_path / "payload.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as stream:
@@ -352,12 +353,16 @@ def test_prefixed_single_disk_zip_carrier_is_not_waited_as_missing_tail(tmp_path
     carrier.write_bytes(b"fake-jpeg-prefix" + archive.read_bytes())
     archive.unlink()
 
-    group = _groups(tmp_path)[0]
+    result = ArchiveTaskProvider({
+        "detection": {"enabled": True},
+        "embedded_scan": {"enabled": True},
+    }).discover_targets([str(carrier)])
 
-    assert group.kind == "file"
-    assert group.split_volumes == []
-    assert group.head_metadata["format"] == "zip"
-
+    assert len(result.resolved_tasks) == 1
+    task = result.resolved_tasks[0]
+    assert task.discovery_source == "embedded"
+    assert task.archive_input().format_hint == "zip"
+    assert task.all_parts == [str(carrier)]
 
 def test_raw_zip_numeric_tail_name_stays_in_split_relation(tmp_path):
     first = tmp_path / "raw.zip.001"

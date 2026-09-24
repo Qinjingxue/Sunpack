@@ -135,20 +135,23 @@ def test_analysis_scheduler_finds_embedded_archive_segments(tmp_path):
     assert {item.format for item in report.selected} == {"zip", "rar"}
 
 
-def test_analysis_defaults_to_shared_full_scan_when_head_and_tail_are_unresolved(tmp_path):
+def test_analysis_consumes_embedded_discovery_prepass_for_middle_payload(tmp_path):
     prefix = b"v" * (2 * 1024 * 1024)
     zip_data = _zip_bytes(tmp_path)
     suffix = b"v" * (2 * 1024 * 1024)
     path = tmp_path / "middle_payload.mp4"
     path.write_bytes(prefix + zip_data + suffix)
+    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
 
-    report = AnalysisEngine().analyze_path(str(path))
+    report = AnalysisEngine().analyze_path(
+        str(path),
+        initial_prepass=scan.to_prepass(),
+    )
 
     zip_evidence = next(item for item in report.selected if item.format == "zip")
     assert report.prepass["source"] == "embedded_scan"
     assert report.prepass["full_scan_complete"] is True
     assert zip_evidence.segments[0].start_offset == len(prefix)
-
 
 def test_analysis_respects_shared_embedded_scan_switch(tmp_path):
     prefix = b"v" * (2 * 1024 * 1024)
@@ -161,36 +164,41 @@ def test_analysis_respects_shared_embedded_scan_switch(tmp_path):
     assert report.prepass.get("source") != "embedded_scan"
 
 
-def test_analysis_requires_candidate_embedded_scan_authorization(tmp_path, monkeypatch):
+def test_analysis_reuses_explicit_prepass_without_shared_rescan(tmp_path, monkeypatch):
     prefix = b"v" * (2 * 1024 * 1024)
-    path = tmp_path / "unauthorized-middle-payload.mp4"
+    path = tmp_path / "prepassed-middle-payload.mp4"
     path.write_bytes(prefix + _zip_bytes(tmp_path) + prefix)
+    prepass = {
+        "hits": [],
+        "formats": [],
+        "full_scan_complete": True,
+        "full_scan_bytes": path.stat().st_size,
+        "source": "test_prepass",
+    }
 
     def unexpected_scan(*args, **kwargs):
-        raise AssertionError("unauthorized candidates must not enter the embedded scanner")
+        raise AssertionError("explicit complete prepass must bypass the shared scanner")
 
-    monkeypatch.setattr("sunpack.core.analysis.engine.scan_embedded_archives", unexpected_scan)
-    report = AnalysisEngine().analyze_path(str(path), embedded_scan_allowed=False)
+    monkeypatch.setattr(SharedBinaryView, "signature_prepass", unexpected_scan)
+    report = AnalysisEngine().analyze_path(str(path), initial_prepass=prepass)
 
+    assert report.prepass == prepass
     assert report.selected == []
-    assert report.prepass.get("source") != "embedded_scan"
-
 
 def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_path, monkeypatch):
     path = tmp_path / "payload.bin"
     payload = b"p" * (2 * 1024 * 1024) + _zip_bytes(tmp_path) + b"s" * (2 * 1024 * 1024)
     path.write_bytes(payload)
-    scheduler = AnalysisEngine()
-    first = scheduler.analyze_path(str(path))
-    assert first.prepass["source"] == "embedded_scan"
+    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
+    prepass = scan.to_prepass()
+    assert prepass["source"] == "embedded_scan"
 
     def unexpected_scan(*args, **kwargs):
-        raise AssertionError("complete detection prepass must bypass the shared scanner")
+        raise AssertionError("complete discovery prepass must bypass analysis prepass scanning")
 
-    monkeypatch.setattr("sunpack.core.analysis.engine.scan_embedded_archives", unexpected_scan)
-    reused = scheduler.analyze_path(str(path), initial_prepass=first.prepass)
-    assert reused.prepass == first.prepass
-
+    monkeypatch.setattr(SharedBinaryView, "signature_prepass", unexpected_scan)
+    reused = AnalysisEngine().analyze_path(str(path), initial_prepass=prepass)
+    assert reused.prepass == prepass
 
 def test_analysis_reuses_detection_hit_map_and_preserves_same_format_segments(tmp_path):
     first = _zip_bytes(tmp_path)
@@ -392,7 +400,6 @@ def test_rar5_header_encrypted_candidate_reuses_scanner_bounded_end(tmp_path):
     report = AnalysisEngine().analyze_path(
         str(path),
         initial_prepass=scan.to_prepass(),
-        embedded_scan_allowed=True,
     )
     segments = {
         (segment.start_offset, segment.end_offset)

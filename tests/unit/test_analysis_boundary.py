@@ -12,7 +12,7 @@ FORBIDDEN_PREFIXES = (
 
 
 def test_analysis_has_no_application_dependencies():
-    root = Path(__file__).parents[2] / "sunpack" / "analysis"
+    root = Path(__file__).parents[2] / "sunpack" / "core" / "analysis"
     violations = []
     for path in root.rglob("*.py"):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
@@ -43,7 +43,7 @@ def test_segment_ends_never_come_from_raw_signature_hits():
     the helper and the raw-hit-as-boundary concept out of the analysis layer.
     """
     modules_root = (
-        Path(__file__).parents[2] / "sunpack" / "analysis" / "structure_pipeline" / "modules"
+        Path(__file__).parents[2] / "sunpack" / "core" / "analysis" / "structure_pipeline" / "modules"
     )
     assert not (modules_root / "_boundaries.py").exists()
 

@@ -17,7 +17,7 @@ import sunpack.core.passwords.internal.builtin as builtin_module
 import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse
-from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
+from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
 from sunpack.runtime.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import WatchStateStore
@@ -31,15 +31,7 @@ def WatchScheduler(*args, pipeline_engine=None, **kwargs):
             lambda _config: SimpleNamespace(
                 recent_passwords=[],
                 context=SimpleNamespace(flatten_candidates=set()),
-                run_targets=lambda _paths: SimpleNamespace(
-                    success_count=0,
-                    partial_success_count=0,
-                    failed_tasks=[],
-                    failures=[],
-                    processed_keys=[],
-                    recovered_outputs=[],
-                    target_results=[],
-                ),
+                run_targets=lambda _paths: RunSummary(),
             )
         )
     return RuntimeWatchScheduler(*args, pipeline_engine=pipeline_engine, **kwargs)
@@ -271,7 +263,7 @@ class CapturingNotificationSink:
 def _summary_pipeline_engine():
     return FakePipelineEngine(
         lambda _config: SimpleNamespace(
-            context=SimpleNamespace(flatten_candidates=set(), recovered_outputs=[]),
+            context=SimpleNamespace(flatten_candidates=set()),
             recent_passwords=[],
             run_targets=lambda _paths: FakeSummary(),
         )
@@ -330,14 +322,18 @@ def _write_zip(path: Path):
 
 
 def _nested_failure_summary(path: Path, failure: FailureInfo):
-    return SimpleNamespace(
-        success_count=1,
-        partial_success_count=0,
-        failed_tasks=[f"{path.parent / 'nested-inner.7z.001'}: {failure.message}"],
-        failures=[failure],
-        processed_keys=[str(path)],
-        recovered_outputs=[],
-        target_results=[TargetRunResult(str(path), OutcomeKind.COMPLETE_SUCCESS)],
+    return RunSummary(
+        target_results=(
+            TargetRunResult(
+                str(path),
+                OutcomeKind.COMPLETE_SUCCESS,
+                task_key=str(path),
+            ),
+        ),
+        scan_failed_tasks=(
+            f"{path.parent / 'nested-inner.7z.001'}: {failure.message}",
+        ),
+        scan_failures=(failure,),
     )
 
 
@@ -350,15 +346,7 @@ class _DeferredHandle:
         return self.future.done()
 
     def complete_no_tasks(self):
-        summary = SimpleNamespace(
-            success_count=0,
-            partial_success_count=0,
-            failed_tasks=[],
-            failures=[],
-            processed_keys=[],
-            target_results=[],
-            recovered_outputs=[],
-        )
+        summary = RunSummary()
         self.future.set_result(PipelineResponse(
             request_id=self.path,
             summary=summary,
@@ -444,7 +432,7 @@ def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_pa
 
         def __init__(self, config):
             self.output_root = Path(config["output"]["root"])
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
             self.path = ""
 
         def run_targets(self, paths):
@@ -476,14 +464,23 @@ def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_pa
     assert harvested.succeeded == 2
 
 
-def _watch_summary(path: str, kind: OutcomeKind, verification: dict):
-    return SimpleNamespace(
-        success_count=1 if kind == OutcomeKind.COMPLETE_SUCCESS else 0,
-        partial_success_count=1 if kind == OutcomeKind.PARTIAL_SUCCESS else 0,
-        failed_tasks=[],
-        failures=[],
-        processed_keys=[path],
-        target_results=[TargetRunResult(path, kind, verification=verification)],
+def _watch_summary(
+    path: str,
+    kind: OutcomeKind,
+    verification: dict,
+    *,
+    recovery=None,
+):
+    return RunSummary(
+        target_results=(
+            TargetRunResult(
+                path,
+                kind,
+                task_key=path,
+                verification=verification,
+                recovery=recovery,
+            ),
+        ),
     )
 
 
@@ -497,7 +494,7 @@ def test_successful_watch_task_uses_direct_output_root(tmp_path, monkeypatch):
 
         def __init__(self, config):
             self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)}, recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)})
 
         def run_targets(self, paths):
             self.output_dir.mkdir(parents=True)
@@ -530,7 +527,7 @@ def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
 
         def __init__(self, config):
             self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             self.output_dir.mkdir(parents=True)
@@ -575,7 +572,7 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
 
         def __init__(self, config):
             self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             kind = outcomes[len(calls)]
@@ -583,12 +580,18 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
             self.output_dir.mkdir(parents=True, exist_ok=True)
             (self.output_dir / "payload.bin").write_bytes(b"payload")
             if kind == OutcomeKind.PARTIAL_SUCCESS:
-                self.context.recovered_outputs = [{"out_dir": str(self.output_dir)}]
                 verification = {"decision_hint": "accept_partial", "archive_coverage": {"complete_files": 1}}
+                recovery = {"out_dir": str(self.output_dir)}
             else:
                 self.context.flatten_candidates = {str(self.output_dir)}
                 verification = {"decision_hint": "accept"}
-            return _watch_summary(paths[0], kind, verification)
+                recovery = None
+            return _watch_summary(
+                paths[0],
+                kind,
+                verification,
+                recovery=recovery,
+            )
 
     watcher = WatchScheduler(
         {"watch": {"clipboard_monitor_enabled": False}},
@@ -622,16 +625,16 @@ def test_partial_result_is_rejected_but_direct_output_remains(tmp_path, monkeypa
 
         def __init__(self, config):
             self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             self.output_dir.mkdir(parents=True)
             (self.output_dir / "recovered.bin").write_bytes(b"partial")
-            self.context.recovered_outputs = [{"out_dir": str(self.output_dir)}]
             return _watch_summary(
                 paths[0],
                 OutcomeKind.PARTIAL_SUCCESS,
                 {"decision_hint": "accept_partial", "archive_coverage": {"complete_files": 1}},
+                recovery={"out_dir": str(self.output_dir)},
             )
 
     watcher = WatchScheduler(
@@ -667,7 +670,7 @@ def test_content_event_during_processing_starts_a_new_active_epoch(tmp_path, mon
         recent_passwords = []
 
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             nonlocal attempts
@@ -1065,7 +1068,7 @@ def test_event_burst_with_unchanged_usn_does_not_restart_quiet_window(tmp_path, 
         cold_start_seconds=0,
         initial_scan=False,
         pipeline_engine=FakePipelineEngine(lambda _config: SimpleNamespace(
-            context=SimpleNamespace(flatten_candidates=set(), recovered_outputs=[]),
+            context=SimpleNamespace(flatten_candidates=set()),
             run_targets=lambda paths: _watch_summary(paths[0], OutcomeKind.PARTIAL_SUCCESS, {}),
             recent_passwords=[],
         )),
@@ -1188,7 +1191,7 @@ def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypat
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             return FakeSummary()
@@ -1222,7 +1225,7 @@ def test_watch_scheduler_timestamp_restore_does_not_reset_content_quiet_window(t
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             return FakeSummary()
@@ -1326,7 +1329,7 @@ def test_watch_scheduler_growth_resets_the_common_quiet_window(tmp_path, monkeyp
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             return FakeSummary()
@@ -1389,10 +1392,10 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
 
     class NoTasksRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
-            return SimpleNamespace(success_count=0, failed_tasks=[], processed_keys=[], recovered_outputs=[], failures=[])
+            return RunSummary()
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -1454,7 +1457,7 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
         def __init__(self, config):
             captured["config"] = config
             self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)}, recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)})
 
         def run_targets(self, paths):
             captured["paths"] = paths
@@ -1493,7 +1496,7 @@ def test_watch_scheduler_does_not_reprocess_unchanged_input_when_output_is_delet
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates={str(output_dir)}, recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates={str(output_dir)})
 
         def run_targets(self, paths):
             runs.append(list(paths))
@@ -1539,7 +1542,7 @@ def test_watch_scheduler_reprocesses_identical_archive_after_it_moves_out_and_ba
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates={str(output_dir)}, recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates={str(output_dir)})
 
         def run_targets(self, paths):
             runs.append(list(paths))
@@ -1605,7 +1608,7 @@ def test_watch_scheduler_processes_same_path_again_after_input_changes(tmp_path,
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             runs.append(list(paths))
@@ -1651,7 +1654,7 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             runs.append(list(paths))
@@ -1688,7 +1691,7 @@ def test_relative_output_directory_is_resolved_per_matching_watch_root(tmp_path,
         def __init__(self, config):
             captured["output"] = config["output"]
             self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)}, recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)})
 
         def run_targets(self, paths):
             self.output_dir.mkdir(parents=True)
@@ -1730,7 +1733,7 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
 
         def __init__(self, config):
             self.output_dir = Path(config["output"]["root"]) / "sample"
-            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)}, recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates={str(self.output_dir)})
 
         def run_targets(self, paths):
             captured["output_dir"] = self.output_dir
@@ -2739,7 +2742,7 @@ def test_watch_scheduler_same_stat_same_usn_event_does_not_reset_quiet_window(tm
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             return FakeSummary()
@@ -2771,7 +2774,7 @@ def test_modified_epoch_triggers_even_when_size_mtime_and_file_id_are_unchanged(
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             return FakeSummary()
@@ -2893,7 +2896,7 @@ def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):
 
     class FakePipelineRunner:
         def __init__(self, config):
-            self.context = SimpleNamespace(flatten_candidates=set(), recovered_outputs=[])
+            self.context = SimpleNamespace(flatten_candidates=set())
 
         def run_targets(self, paths):
             attempts.append(list(paths))

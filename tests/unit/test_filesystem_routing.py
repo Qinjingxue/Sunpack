@@ -176,8 +176,8 @@ def test_main_scan_routes_only_native_container_candidates_through_relations(tmp
     session = DiscoveryScanSession(config={})
     candidates = session.candidates_for_directory(str(tmp_path))
     by_name = {
-        bag.get("candidate.entry_path").rsplit("\\", 1)[-1].rsplit("/", 1)[-1]: bag
-        for bag in bags
+        _basename(candidate.entry_path): candidate
+        for candidate in candidates
     }
 
     assert by_name["archive.zip"].route == "relations"

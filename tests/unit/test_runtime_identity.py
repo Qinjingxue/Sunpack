@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from sunpack.core.support import runtime_identity
 
 
@@ -54,3 +56,18 @@ def test_packaged_server_command_reexecutes_runtime_and_forwards_identity(tmp_pa
         "--persistent-server",
         "--_sunpack-runtime-id=v2-0123456789abcdef",
     ]
+
+def test_source_server_command_reexecutes_repository_entrypoint(monkeypatch):
+    from sunpack.runtime.cli import persistent_process
+
+    monkeypatch.setattr(persistent_process, "is_packaged_process", lambda: False)
+    monkeypatch.setattr(runtime_identity, "_runtime_id", "v2-0123456789abcdef")
+
+    command = persistent_process.server_command()
+
+    assert Path(command[1]).resolve() == Path(__file__).resolve().parents[2] / "sunpack.py"
+    assert command[-2:] == [
+        "--persistent-server",
+        "--_sunpack-runtime-id=v2-0123456789abcdef",
+    ]
+

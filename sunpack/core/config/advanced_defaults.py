@@ -12,7 +12,7 @@ ADVANCED_CONFIG_FILENAME = "sunpack_advanced_config.json"
 
 @lru_cache(maxsize=1)
 def _payload() -> dict[str, Any]:
-    project_path = Path(__file__).resolve().parents[2] / ADVANCED_CONFIG_FILENAME
+    project_path = Path(__file__).resolve().parents[3] / ADVANCED_CONFIG_FILENAME
     path = first_existing_path([*candidate_resource_paths(ADVANCED_CONFIG_FILENAME), project_path])
     if path is None:
         raise RuntimeError(f"Missing canonical defaults file: {ADVANCED_CONFIG_FILENAME}")

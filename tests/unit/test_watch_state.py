@@ -409,7 +409,7 @@ def test_prune_missing_records_retains_records_when_presence_is_unknown(tmp_path
 
     monkeypatch.setattr(watch_state_module.os, "stat", blocked_stat)
 
-    assert state.prune_missing_records() == (0, 0)
+    assert state.prune_missing_records() == 0
     assert state.latest_entry_for_path(str(archive)) is not None
 
 

@@ -1079,7 +1079,7 @@ class _RequestOwnership:
                         ),
                         *(
                             str(item.get("out_dir") or "")
-                            for item in recovered
+                            for item in summary.recovered_outputs
                             if str(item.get("out_dir") or "")
                         ),
                     ])),

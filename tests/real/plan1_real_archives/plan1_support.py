@@ -48,18 +48,16 @@ def detected_ext_from_format(format_hint: str) -> str:
 
 
 def detected_ext(hit) -> str:
-    return detected_ext_from_format(hit.format)
+    return detected_ext_from_format(hit.archive_input().format_hint)
 
 
 def container_type(hit) -> str:
-    return str(hit.format or "")
+    return str(hit.archive_input().format_hint or "")
 
 
 def probe_offset(hit) -> int:
-    if hit.segments:
-        return int(hit.segments[0].start_offset or 0)
-    segment = hit.archive_input.segment
-    return int(segment.start or 0) if segment is not None else 0
+    extent = hit.archive_input().primary_extent
+    return int(extent.start or 0) if extent is not None else 0
 
 
 
@@ -184,7 +182,7 @@ def assert_plan1_success(
             {
                 "detected_ext": detected_ext(hit),
                 "container_type": container_type(hit),
-                "member_paths": len(hit.member_paths),
+                "input_part_count": len(hit.all_parts),
                 "probe_offset": probe_offset(hit),
             }
             for hit in hits
@@ -204,7 +202,7 @@ def assert_plan1_success(
             f"container type mismatch: expected {expected_container}, got {actual_container}"
         )
     if expected_member_count is not None:
-        actual_members = len(hits[0].member_paths)
+        actual_members = len(hits[0].all_parts)
         if error_info is not None:
             error_info["expected_member_count"] = expected_member_count
             error_info["actual_member_count"] = actual_members
