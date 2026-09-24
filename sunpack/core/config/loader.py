@@ -37,7 +37,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _candidate_config_paths(filename: str, request_cwd: str | Path | None = None) -> list[Path]:
-    project_root = Path(__file__).resolve().parents[2]
+    project_root = Path(__file__).resolve().parents[3]
     invocation_root = Path(request_cwd).resolve() if request_cwd is not None else Path.cwd()
     return dedupe_paths(
         candidate_resource_paths(filename, request_cwd=request_cwd)
