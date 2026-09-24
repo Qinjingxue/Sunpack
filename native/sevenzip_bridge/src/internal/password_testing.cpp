@@ -159,7 +159,8 @@ namespace sunpack::sevenzip
         const std::vector<ExtractInputRange> &input_ranges = {},
         bool bounded_password_probe = false,
 
-        const std::vector<std::wstring> &canonical_names = {}
+        const std::vector<std::wstring> &canonical_names = {},
+        bool format_hint_known = false
 
     );
 
@@ -177,7 +178,8 @@ namespace sunpack::sevenzip
         const std::vector<ExtractInputRange> &input_ranges,
         bool bounded_password_probe,
 
-        const std::vector<std::wstring> &canonical_names
+        const std::vector<std::wstring> &canonical_names,
+        bool format_hint_known
 
     )
     {
@@ -188,7 +190,12 @@ namespace sunpack::sevenzip
 
         bool has_fallback = false;
 
-        const auto plans = password_test_open_plans(archive_path, part_paths, formats, input_ranges);
+        const auto plans = password_test_open_plans(
+            archive_path,
+            part_paths,
+            formats,
+            input_ranges,
+            format_hint_known);
 
         for (const auto &plan : plans)
         {
@@ -748,7 +755,8 @@ namespace sunpack::sevenzip
 
                 true,
 
-                canonical_names);
+                canonical_names,
+                !format_hint.empty());
 
             current.attempts = i + 1;
 
@@ -879,7 +887,10 @@ namespace sunpack::sevenzip
 
                 ranges,
 
-                true);
+                true,
+
+                {},
+                !format_hint.empty());
 
             current.attempts = i + 1;
 
