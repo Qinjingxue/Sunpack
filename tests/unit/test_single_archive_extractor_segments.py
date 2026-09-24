@@ -30,6 +30,13 @@ class _CandidatePasswordStore:
         return True
 
 
+class _NeverPasswordResolver:
+    password_tester = SimpleNamespace(passwords=[])
+
+    def resolve(self, *_args, **_kwargs):
+        raise AssertionError("boundary-proven embedded password must not be searched again")
+
+
 class _RecordingPasswordResolver:
     password_tester = SimpleNamespace(passwords=[])
 
@@ -199,6 +206,44 @@ def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path)
     assert result.success is True
     assert [key for key, _ in resolver.calls] == [f"{task.key}#first", f"{task.key}#second"]
     assert [call[1]["parts"][0]["start"] for call in resolver.calls] == [7, 17]
+
+
+def test_embedded_boundary_password_is_reused_without_second_search(tmp_path):
+    carrier = tmp_path / "carrier.bin"
+    carrier.write_bytes(b"prefix-rar-tail")
+    task = _task(carrier)
+    task.runtime["embedded_segment_passwords"] = {"7": "segment-secret"}
+    write_source_extractable_segments(task, [{
+        "segment_id": "embedded_01_rar",
+        "index": 1,
+        "format": "rar",
+        "logical_name": "case_01_rar",
+        "start_offset": 7,
+        "end_offset": 10,
+        "archive_input": {
+            "kind": "archive_input",
+            "entry_path": str(carrier),
+            "open_mode": "file_range",
+            "format_hint": "rar",
+            "logical_name": "case_01_rar",
+            "parts": [{"path": str(carrier), "role": "main", "start": 7, "end": 10}],
+            "analysis": {"password_required": True},
+        },
+    }])
+    extractor = SingleArchiveExtractor(
+        password_store=_CandidatePasswordStore(),
+        password_resolver=_NeverPasswordResolver(),
+        metadata_scanner=ArchiveMetadataScanner(),
+        retry_policy=_FakeRetryPolicy(),
+        sevenzip_runner=_FakeSevenZipRunner(),
+        best_effort=True,
+    )
+
+    result = extractor.extract(task, str(tmp_path / "out"))
+
+    assert result.success is True
+    assert result.password_used == "segment-secret"
+    assert task.knowledge().get("archive.password") is None
 
 
 def test_verifier_accepts_carrier_when_every_embedded_payload_is_complete(tmp_path):
