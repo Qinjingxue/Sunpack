@@ -841,19 +841,9 @@ class SingleArchiveExtractor:
         }
         aggregate_failure = None
         if segment_failures:
-            password_failure = any(failure.is_password_failure for failure in segment_failures)
-            message_key = "failure.embedded_wrong_password" if password_failure else "failure.embedded_extract_failed"
-            aggregate_failure = FailureInfo(
-                kind=FailureKind.EMBEDDED_SEGMENTS_FAILED,
-                stage="embedded_segments",
-                message=self.i18n.t(message_key),
-                message_key=message_key,
-                user_action="request_password" if password_failure else "",
-                causes=tuple(segment_failures),
-                details={
-                    "segment_count": len(segment_results),
-                    "failed_segment_count": len(segment_failures),
-                },
+            aggregate_failure = self._aggregate_embedded_failure(
+                segment_failures,
+                segment_count=len(segment_results),
             )
         if any_success:
             manifest_path = ""
@@ -917,6 +907,41 @@ class SingleArchiveExtractor:
         )
         failed_result.embedded_results = embedded_results
         return failed_result
+
+    def _aggregate_embedded_failure(
+        self,
+        segment_failures: list[FailureInfo],
+        *,
+        segment_count: int,
+    ) -> FailureInfo:
+        details = {
+            "segment_count": int(segment_count),
+            "failed_segment_count": len(segment_failures),
+        }
+        if len(segment_failures) == 1 and segment_count == 1:
+            child = segment_failures[0]
+            return FailureInfo(
+                kind=FailureKind.EMBEDDED_SEGMENTS_FAILED,
+                stage="embedded_segments",
+                message=self._localized_failure(child),
+                message_key=child.message_key,
+                message_params=dict(child.message_params),
+                user_action=child.user_action,
+                causes=(child,),
+                details=details,
+            )
+
+        password_failure = any(failure.is_password_failure for failure in segment_failures)
+        message_key = "failure.embedded_wrong_password" if password_failure else "failure.embedded_extract_failed"
+        return FailureInfo(
+            kind=FailureKind.EMBEDDED_SEGMENTS_FAILED,
+            stage="embedded_segments",
+            message=self.i18n.t(message_key),
+            message_key=message_key,
+            user_action="request_password" if password_failure else "",
+            causes=tuple(segment_failures),
+            details=details,
+        )
 
     @staticmethod
     def _safe_segment_dir_name(segment_id: str, position: int, fmt: str) -> str:
