@@ -87,7 +87,7 @@ def _candidate_rank(candidate: DiscoveryCandidate) -> tuple[int, int, int]:
     if candidate.relation_anchor.get("needs_password"):
         relation_strength = 1
     volumes = int(candidate.relation_metadata.get("split_member_count") or 0)
-    members = len(candidate.member_paths)
+    members = len(candidate.archive_input.part_paths())
     return relation_strength, volumes, members
 
 
