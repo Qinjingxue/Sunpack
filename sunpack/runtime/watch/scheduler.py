@@ -480,6 +480,31 @@ class WatchScheduler:
                 ):
                     recovered.setdefault(path_key(candidate.path), candidate)
 
+            missing_committed_roots = [
+                root for root in committed_roots if not os.path.isdir(root)
+            ]
+            if missing_committed_roots:
+                candidate = _candidate_for_event_path(pending.path)
+                if (
+                    candidate is None
+                    or _persisted_blocker_owns_retry(self.state, candidate.path)
+                ):
+                    self.log.write(
+                        "crash_committed_output_missing",
+                        owner_path=pending.path,
+                        output_dirs=missing_committed_roots,
+                    )
+                    # The durable state says verified output existed, but neither
+                    # that output nor a source that can rebuild it is available.
+                    # Keep the owner record instead of silently retiring it.
+                    continue
+                recovered.setdefault(path_key(candidate.path), candidate)
+                self.log.write(
+                    "crash_committed_output_requeued",
+                    owner_path=pending.path,
+                    output_dirs=missing_committed_roots,
+                )
+
             scan_failed = False
             for root in committed_roots:
                 if not os.path.isdir(root):
@@ -1294,19 +1319,21 @@ class WatchScheduler:
     ) -> None:
         name = str(event.get("event") or "")
         if name == "task_output_started":
-            self.state.record_task_output_started(
+            if not self.state.record_task_output_started(
                 owner_path,
                 str(getattr(archive_task, "main_path", "") or ""),
                 str(event.get("output_dir") or ""),
-            )
+            ):
+                raise RuntimeError("watch output start state transition rejected")
             return
         if name == "task_output_finished":
-            self.state.record_task_output_finished(
+            if not self.state.record_task_output_finished(
                 owner_path,
                 str(getattr(archive_task, "main_path", "") or ""),
                 str(event.get("output_dir") or ""),
                 keep_output=bool(event.get("keep_output")),
-            )
+            ):
+                raise RuntimeError("watch output finish state transition rejected")
             return
         self._notify("progress", notification_id, archive_task, event)
 
