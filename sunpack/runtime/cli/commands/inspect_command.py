@@ -126,9 +126,8 @@ def _analysis_preview_by_path(results, config: dict) -> dict[str, dict]:
             continue
         task = _task_from_inspect_result(result)
         try:
-            state = task.archive_state()
             source = analysis_source_for_descriptor(
-                state.to_archive_input_descriptor(),
+                task.archive_input(),
                 report_path=task.main_path,
             )
             prepass = task.knowledge().get("inspection.prepass", {})

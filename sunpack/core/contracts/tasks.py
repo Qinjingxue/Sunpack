@@ -5,7 +5,6 @@ from typing import Any
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
-from sunpack.core.contracts.archive_state import ArchiveState
 from sunpack.core.contracts.discovery import ResolvedArchiveInput, ResolvedArchiveSegment
 from sunpack.core.support.collections import dedupe_values
 from sunpack.core.support.path_keys import normalized_path, path_key
@@ -48,7 +47,7 @@ class ArchiveTask:
                 else descriptor.entry_path
             )
         self._knowledge = ArchiveKnowledge()
-        self._state = ArchiveState.from_archive_input(descriptor)
+        self._archive_input = descriptor
         self._initialize_knowledge(
             discovery_source=str(initial_discovery_source or ""),
             discovery_reason=str(initial_discovery_reason or ""),
@@ -117,10 +116,7 @@ class ArchiveTask:
         return self.archive_input().part_paths()
 
     def archive_input(self) -> ArchiveInputDescriptor:
-        return self._state.to_archive_input_descriptor()
-
-    def archive_state(self) -> ArchiveState:
-        return self._state
+        return self._archive_input
 
     def knowledge(self) -> ArchiveKnowledge:
         return self._knowledge
@@ -141,7 +137,6 @@ class ArchiveTask:
         )
 
     def set_archive_input(self, descriptor: ArchiveInputDescriptor) -> None:
-        state = self._state
         self.cleanup_parts = list(dedupe_values([
             *descriptor.part_paths(),
             *self.cleanup_parts,
@@ -153,25 +148,7 @@ class ArchiveTask:
             source_layer="contracts",
             source_module="archive_task",
         )
-        self._state = ArchiveState.from_archive_input(
-            descriptor,
-            planning_analysis=state.planning_analysis,
-        )
-
-    def set_archive_state(self, state: ArchiveState) -> None:
-        descriptor = state.to_archive_input_descriptor()
-        self.cleanup_parts = list(dedupe_values([
-            *descriptor.part_paths(),
-            *self.cleanup_parts,
-            self.carrier_path,
-        ]))
-        self._knowledge.set(
-            "source.input",
-            descriptor.to_dict(),
-            source_layer="contracts",
-            source_module="archive_task",
-        )
-        self._state = state
+        self._archive_input = descriptor
 
     def apply_path_mapping(self, path_map: dict[str, str]) -> None:
         if not path_map:
@@ -194,7 +171,7 @@ class ArchiveTask:
         self.cleanup_parts = list(replacement.cleanup_parts)
         self.key = replacement.key
         self._knowledge = ArchiveKnowledge.from_any(replacement.knowledge())
-        self._state = replacement.archive_state()
+        self._archive_input = replacement.archive_input()
         self.runtime = runtime
 
     def _initialize_knowledge(

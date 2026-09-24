@@ -25,7 +25,6 @@ from sunpack.core.contracts.archive_input import (
     ArchiveInputRange,
     ArchiveInputSegment,
 )
-from sunpack.core.contracts.archive_state import ArchiveState
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
 
@@ -160,9 +159,8 @@ class ArchiveInputPlanningStage:
         return replace(report, cache_hits=report.cache_hits + 1)
 
     def _analyze_task(self, task: ArchiveTask) -> ArchiveAnalysisReport:
-        state = task.archive_state()
         source = analysis_source_for_descriptor(
-            state.to_archive_input_descriptor(),
+            task.archive_input(),
             report_path=task.main_path,
         )
         prepass = knowledge_view.inspection_prepass(task)
@@ -209,7 +207,7 @@ class ArchiveInputPlanningStage:
                     password_probe_input,
                 )
             with _phase(phase_timer, f"{phase_prefix}_state_update"):
-                self._record_planning_state(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
+                self._record_planning_input(task, report, phase_timer=phase_timer, phase_prefix=phase_prefix)
             return [task]
         evidence, segment, index = candidates[0]
         selected_segment = (evidence, segment, index)
@@ -269,7 +267,7 @@ class ArchiveInputPlanningStage:
 
     @staticmethod
     def _execution_analysis_for_report(
-        state: ArchiveState,
+        descriptor: ArchiveInputDescriptor,
         report: ArchiveAnalysisReport,
     ) -> dict[str, Any]:
         """Project only analysis facts that the extraction worker can consume.
@@ -278,9 +276,9 @@ class ArchiveInputPlanningStage:
         decision. The worker still opens and extracts the current files, so a
         stale analysis result cannot reject a volume that arrived later.
         """
-        if state.archive_input.open_mode not in {"native_volumes", "sfx_with_volumes"}:
+        if descriptor.open_mode not in {"native_volumes", "sfx_with_volumes"}:
             return {}
-        if len(state.archive_input.parts) <= 1:
+        if len(descriptor.parts) <= 1:
             return {}
 
         # This mirrors the old native 7z split-tail proof without rereading the
@@ -303,38 +301,32 @@ class ArchiveInputPlanningStage:
                 return {"missing_volume_evidence": "seven_zip_start_header_length"}
         return {}
 
-    def _record_planning_state(self, task: ArchiveTask, report: ArchiveAnalysisReport, *, phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "input_planning") -> None:
-        with _phase(phase_timer, f"{phase_prefix}_record_state_get_archive_state"):
-            state = task.archive_state()
-        with _phase(phase_timer, f"{phase_prefix}_record_state_build_payload"):
+    def _record_planning_input(
+        self,
+        task: ArchiveTask,
+        report: ArchiveAnalysisReport,
+        *,
+        phase_timer: Callable[..., Any] | None = None,
+        phase_prefix: str = "input_planning",
+    ) -> None:
+        with _phase(phase_timer, f"{phase_prefix}_record_input_get"):
+            descriptor = task.archive_input()
+        with _phase(phase_timer, f"{phase_prefix}_record_input_build"):
             selected = _best_selected(report)
-            analysis = {
-                "status": "extractable" if report.has_extractable else "not_extractable",
-                "report_path": report.path,
-                "read_bytes": report.read_bytes,
-                "cache_hits": report.cache_hits,
-            }
-            if selected is not None:
-                analysis.update({
-                    "selected_format": selected.format,
-                    "confidence": float(selected.confidence),
-                })
-            execution_analysis = self._execution_analysis_for_report(state, report)
+            analysis = dict(descriptor.analysis)
+            analysis.pop("execution", None)
+            execution_analysis = self._execution_analysis_for_report(descriptor, report)
             if execution_analysis:
                 analysis["execution"] = execution_analysis
             selected_format = str(getattr(selected, "format", "") or "")
-            descriptor = (
-                replace(state.archive_input, format_hint=selected_format)
-                if selected_format
-                else state.archive_input
+            updated = replace(
+                descriptor,
+                format_hint=selected_format or descriptor.format_hint,
+                analysis=analysis,
             )
-            new_state = ArchiveState(
-                archive_input=descriptor,
-                planning_analysis=analysis,
-            )
-        with _phase(phase_timer, f"{phase_prefix}_record_state_set_archive_state"):
-            if dict(state.planning_analysis) != analysis or state.archive_input != descriptor:
-                task.set_archive_state(new_state)
+        with _phase(phase_timer, f"{phase_prefix}_record_input_set"):
+            if updated != descriptor:
+                task.set_archive_input(updated)
 
     def _extractable_segments(self, report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:
         candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]] = []
