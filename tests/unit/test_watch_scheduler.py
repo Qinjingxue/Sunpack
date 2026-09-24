@@ -469,11 +469,8 @@ def _watch_summary(
     kind: OutcomeKind,
     verification: dict,
     *,
-    recovered_outputs=(),
+    recovery=None,
 ):
-    recoveries = list(recovered_outputs)
-    if len(recoveries) > 1:
-        raise ValueError("one target may expose at most one recovery projection")
     return RunSummary(
         target_results=(
             TargetRunResult(
@@ -481,7 +478,7 @@ def _watch_summary(
                 kind,
                 task_key=path,
                 verification=verification,
-                recovery=recoveries[0] if recoveries else None,
+                recovery=recovery,
             ),
         ),
     )
@@ -584,16 +581,16 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
             (self.output_dir / "payload.bin").write_bytes(b"payload")
             if kind == OutcomeKind.PARTIAL_SUCCESS:
                 verification = {"decision_hint": "accept_partial", "archive_coverage": {"complete_files": 1}}
-                recovered_outputs = [{"out_dir": str(self.output_dir)}]
+                recovery = {"out_dir": str(self.output_dir)}
             else:
                 self.context.flatten_candidates = {str(self.output_dir)}
                 verification = {"decision_hint": "accept"}
-                recovered_outputs = []
+                recovery = None
             return _watch_summary(
                 paths[0],
                 kind,
                 verification,
-                recovered_outputs=recovered_outputs,
+                recovery=recovery,
             )
 
     watcher = WatchScheduler(
@@ -637,7 +634,7 @@ def test_partial_result_is_rejected_but_direct_output_remains(tmp_path, monkeypa
                 paths[0],
                 OutcomeKind.PARTIAL_SUCCESS,
                 {"decision_hint": "accept_partial", "archive_coverage": {"complete_files": 1}},
-                recovered_outputs=[{"out_dir": str(self.output_dir)}],
+                recovery={"out_dir": str(self.output_dir)},
             )
 
     watcher = WatchScheduler(
