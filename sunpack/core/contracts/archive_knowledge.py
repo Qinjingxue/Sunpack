@@ -277,9 +277,7 @@ def compact_evidence_value(value: Any) -> Any:
         output: dict[str, Any] = {}
         for key, item in value.items():
             text_key = str(key)
-            if text_key == "archive_state":
-                output[text_key] = _compact_large_value(text_key, item)
-            elif text_key in {"stdout", "stderr"} and isinstance(item, str):
+            if text_key in {"stdout", "stderr"} and isinstance(item, str):
                 output[text_key] = item[:4000]
             else:
                 output[text_key] = compact_evidence_value(item)
