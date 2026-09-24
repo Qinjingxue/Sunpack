@@ -512,11 +512,7 @@ class ArchiveInputPlanningStage:
             format_hint=evidence.format,
             logical_name=self._segment_logical_name(task, evidence, index),
             extents=[InputExtent(path=item["path"], start=item["start"], end=item.get("end")) for item in ranges],
-            analysis={
-                **segment_analysis,
-                "segment_start": int(segment.start_offset),
-                "segment_end": int(segment.end_offset) if segment.end_offset is not None else None,
-            },
+            analysis=dict(segment_analysis),
         )
 
     def _password_probe_input_for_segment(

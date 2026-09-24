@@ -594,17 +594,7 @@ WorkerArchiveInput parse_archive_input_descriptor(
     if (mode == "file_range") {
         input.ranges = parse_ranges_from_objects(json_object_array_field(descriptor, "parts"), entry_path);
         if (input.ranges.empty()) {
-            const std::string segment = json_object_field(descriptor, "segment");
-            unsigned long long start = 0;
-            unsigned long long end = 0;
-            const bool has_start = json_uint_field_in_object(segment, "start", &start) || json_uint_field_in_object(segment, "start_offset", &start);
-            const bool has_end = json_uint_field_in_object(segment, "end", &end) || json_uint_field_in_object(segment, "end_offset", &end);
-            sunpack::sevenzip::ExtractInputRange range;
-            range.path = utf8_to_wide(entry_path.empty() ? json_string_field(request, "archive_path", "") : entry_path);
-            range.start = has_start ? start : 0;
-            range.end = end;
-            range.has_end = has_end;
-            input.ranges.push_back(range);
+            input.validation_error = "file_range descriptor requires canonical parts with extents";
         }
     } else if (mode == "concat_ranges") {
         input.ranges = parse_ranges_from_objects(json_object_array_field(descriptor, "ranges"), entry_path);

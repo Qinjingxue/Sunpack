@@ -80,7 +80,6 @@ def test_password_resolver_falls_back_to_relations_archive_input_before_analysis
         "format_hint": "rar",
         "logical_name": "carrier",
         "parts": [{"path": "carrier.exe", "start": 8192}],
-        "segment": {"start": 8192, "source": "relations"},
     }, archive_path="carrier.exe")
     task = make_task_from_descriptor(descriptor)
 

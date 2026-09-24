@@ -74,6 +74,8 @@ class ArchiveInputDescriptor:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "format_hint", str(self.format_hint or "").strip().lower().lstrip("."))
+        if "segment_start" in self.analysis or "segment_end" in self.analysis:
+            raise ValueError("archive input boundaries belong only to InputExtent")
         if self.open_mode == "concat_ranges" and not self.extents:
             raise ValueError("concat_ranges requires input extents")
         if self.open_mode == "file_range" and not self.parts:
@@ -111,23 +113,13 @@ class ArchiveInputDescriptor:
             payload["parts"] = [part.to_dict() for part in self.parts]
         if self.open_mode == "concat_ranges":
             payload["ranges"] = [item.to_dict() for item in self.extents]
-        if self.open_mode == "file_range" or (
-            self.open_mode == "concat_ranges" and "segment_start" in self.analysis
-        ):
-            extent = self.primary_extent
-            start = int(self.analysis.get("segment_start", extent.start if extent else 0))
-            end = self.analysis.get("segment_end", extent.end if extent else None)
-            segment: dict[str, Any] = {
-                "start": start,
-                "source": str(self.analysis.get("segment_source") or "analysis"),
-            }
-            if end is not None:
-                segment["end"] = int(end)
-            if self.analysis.get("segment_confidence") is not None:
-                segment["confidence"] = float(self.analysis["segment_confidence"])
-            payload["segment"] = segment
-        if self.analysis:
-            payload["analysis"] = dict(self.analysis)
+        analysis = {
+            key: value
+            for key, value in self.analysis.items()
+            if key not in {"segment_confidence", "segment_source"}
+        }
+        if analysis:
+            payload["analysis"] = analysis
         return payload
 
     def part_paths(self) -> list[str]:
@@ -177,6 +169,8 @@ class ArchiveInputDescriptor:
         kind = str(raw.get("kind") or "archive_input")
         if kind != "archive_input":
             raise ValueError(f"unsupported archive input kind: {kind}")
+        if "segment" in raw:
+            raise ValueError("legacy archive input segment field is not supported")
         open_mode = str(raw.get("open_mode") or "file")
         format_hint = str(raw.get("format_hint") or "")
         entry_path = str(raw.get("entry_path") or archive_path)
@@ -204,20 +198,8 @@ class ArchiveInputDescriptor:
                 end=int(end_raw) if end_raw is not None else None,
             ))
         analysis = dict(raw.get("analysis") or {}) if isinstance(raw.get("analysis"), dict) else {}
-        segment_raw = raw.get("segment")
-        if isinstance(segment_raw, dict):
-            analysis["segment_start"] = int(segment_raw.get("start", 0) or 0)
-            if segment_raw.get("end") is not None:
-                analysis["segment_end"] = int(segment_raw["end"])
-            if segment_raw.get("confidence") is not None:
-                analysis["segment_confidence"] = float(segment_raw["confidence"])
-            analysis["segment_source"] = str(segment_raw.get("source") or "analysis")
-            if open_mode == "file_range" and not parts:
-                parts = [ArchiveInputPart(extent=InputExtent(
-                    path=entry_path,
-                    start=analysis["segment_start"],
-                    end=analysis.get("segment_end"),
-                ))]
+        if open_mode == "file_range" and not parts:
+            raise ValueError("file_range requires canonical parts with extent")
         if not parts and not extents and part_paths:
             if len(part_paths) > 1:
                 raise ValueError("multi-volume inputs require serialized structured parts")

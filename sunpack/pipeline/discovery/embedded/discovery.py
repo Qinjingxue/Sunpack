@@ -122,8 +122,7 @@ class EmbeddedDiscovery:
             return None, "no_complete_embedded_archive"
 
         physical.sort(key=lambda item: (item.offset, -item.confidence, item.format))
-        segments: list[ArchiveInputDescriptor] = []
-        segment_evidence: list[dict[str, Any]] = []
+        segments: list[tuple[ArchiveInputDescriptor, dict[str, Any]]] = []
         base_name = candidate.logical_name or os.path.basename(path)
         for index, item in enumerate(physical, start=1):
             end = item.range_end_offset or item.end_offset
@@ -137,10 +136,9 @@ class EmbeddedDiscovery:
                 logical_name,
                 confidence=float(item.confidence),
             )
-            segments.append(descriptor)
-            segment_evidence.append(item.to_dict())
+            segments.append((descriptor, item.to_dict()))
 
-        primary = segments[0]
+        primary = segments[0][0]
         return (
             ArchiveTask.from_archive_input(
                 primary,
@@ -151,7 +149,6 @@ class EmbeddedDiscovery:
                     "scan": scan.to_prepass(),
                 },
                 discovery_segments=tuple(segments),
-                discovery_segment_evidence=tuple(segment_evidence),
             ),
             f"Validated embedded {primary.format_hint} at offset {primary.primary_extent.start if primary.primary_extent else 0}",
         )

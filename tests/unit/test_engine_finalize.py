@@ -53,11 +53,12 @@ def test_finalize_response_gates_only_flatten_targets(
     apply_calls: list[dict] = []
     _recording(monkeypatch, barrier_calls, apply_calls)
 
-    engine_module._finalize_response(
+    finalized = engine_module._finalize_response(
         {"post_extract": {"archive_cleanup_mode": "recycle", "flatten_single_directory": flatten_enabled}},
         response,
     )
 
+    assert finalized.summary.postprocess_completed is True
     expected = tuple(str(tmp_path / name) for name in expected_roots)
     assert barrier_calls == ([expected] if expected else [])
     assert apply_calls == [
@@ -84,12 +85,13 @@ def test_finalize_response_retries_only_failed_cleanups(tmp_path, monkeypatch):
     apply_calls: list[dict] = []
     _recording(monkeypatch, barrier_calls, apply_calls)
 
-    engine_module._finalize_response(
+    finalized = engine_module._finalize_response(
         {"post_extract": {"archive_cleanup_mode": "recycle", "flatten_single_directory": True}},
         response,
         retry_results=[failed],
     )
 
+    assert finalized.summary.postprocess_completed is True
     assert barrier_calls == [(str(archive),)]
     assert apply_calls == [
         {
