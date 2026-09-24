@@ -53,7 +53,8 @@ std::vector<ArchiveOpenPlan> password_test_open_plans(
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
     const std::vector<GUID>& formats,
-    const std::vector<ExtractInputRange>& input_ranges
+    const std::vector<ExtractInputRange>& input_ranges,
+    bool format_hint_known
 ) {
     ArchiveOpenPlan base;
     base.ranges = input_ranges;
@@ -62,7 +63,7 @@ std::vector<ArchiveOpenPlan> password_test_open_plans(
     base.archive_type = base_type;
     base.source = input_ranges.empty() ? "whole_file" : "provided_ranges";
 
-    if (!input_ranges.empty()) {
+    if (!input_ranges.empty() || format_hint_known) {
         return {base};
     }
     if (!base_type.empty() && base_type != L"pe") {
