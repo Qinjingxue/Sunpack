@@ -1,784 +1,1365 @@
-# 重构后正确性测试报告
-
-- 日期：2026-09-24（Asia/Shanghai）
-- 测试对象：594f4698226ffc45e2fd0b32fb1ec1593a70f707 之后的 16 个提交（当前工作树）。
-- 被测提交：7b5786c2718aeafbfb71f23131a5847d487633ee（Finalize canonical archive input data structures #120）。
-- 环境：Windows x64、Python 3.10.11、pytest 9.1.1、uv 0.12.5、8 个 xdist worker。
-- 程序代码和测试代码均未修改；本报告是唯一计划提交的文件。
-
-## 执行方式与环境
-
-先执行项目 acceptance runner：run_acceptance_tests.ps1 -NoWait -VerboseOutput。前置检查发现 .venv 无法导入 sunpack_native 且环境清单过期，runner 自动重建 .venv 并编译 Rust 扩展、嵌入式 7-Zip worker 和 toast library。worker 的 6 项 CTest、toast library 的 1 项 CTest 均通过。
-
-环境准备最后执行 sunpack.py inspect --analyze --no-pause -q <probe.zip> 失败，runner 在 pytest 开始前退出：
-
-    SunPack 持久进程未能及时启动。
-    运行时进程已退出，退出码为 1。
-
-随后执行 run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh，让已经重建的环境继续进入 pytest。归档生成器检查通过，临时 Watch Broker 服务成功安装和卸载。
-
-## 汇总
-
-| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
-|---|---:|---:|---:|---:|---:|
-| CLI、unit、functional | 1120 | 1065 | 54 | 1 | 0 |
-| integration、real | 347 | 52 | 294 | 0 | 1 |
-| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
-| **pytest 合计** | **1475** | **1117** | **348** | **1** | **9** |
-
-acceptance runner 汇总为 6 个失败步骤：CLI/unit/functional、integration/real，以及 4 个 CLI smoke。CLI help smoke 通过。Administrator VHD disk-full 步骤虽被标为通过，8 个用例实际全部跳过。
-
-### pytest 命令
-
-    python -m pytest -q -n 8 --dist worksteal tests/cli tests/unit tests/functional --durations=20
-    python -m pytest -q -n 8 --dist worksteal tests/integration tests/real --ignore tests/integration/test_disk_full_pause_resume.py --durations=20
-    python -m pytest -q -n 8 --dist worksteal tests/integration/test_disk_full_pause_resume.py --durations=20
-
-### CLI smoke
-
-sunpack.py --help 通过。下面 4 个命令均退出码 1；重跑后每个命令都输出相同错误：
-
-    SunPack 持久进程未能及时启动。
-    运行时进程已退出，退出码为 1。
-
-- sunpack.py passwords --json
-- sunpack.py scan <repo>\tests --json
-- sunpack.py inspect <repo>\tests --json
-- sunpack.py config --json show
-
-### 跳过与范围
-
-- disk-full 的 8 个用例因“需要管理员权限（diskpart 提权）”跳过。
-- tests/real/test_game_tree_recursive_scan.py::test_game_tree_resources_are_not_authorized_for_recursive_extraction 因未设置 SUNPACK_RUN_GAME_TREE_TEST=1 跳过；该用例扫描本机 D:\game，测试文件要求显式启用。
-- tests/memory/test_watch_growth.py 是 performance 内存稳定性测试，项目要求显式使用 --run-performance；不属于 correctness acceptance runner 默认范围。
-
-## 失败项与 pytest 报错信息
-
-以下按 JUnit 的首行错误信息分组；各失败项和收集错误的完整测试 ID 均列出。
-
-### CLI、unit、functional
-
-#### 7 项 — AssertionError: 1 != 0 : SunPack 持久进程未能及时启动。
-
-- tests.cli.test_cli_basic.CliBasicTests::test_config_show_json_shape (failure)
-- tests.cli.test_cli_basic.CliBasicTests::test_extract_direct_file_bypasses_initial_scan (failure)
-- tests.cli.test_cli_basic.CliBasicTests::test_extract_out_dir_places_output_below_the_given_root (failure)
-- tests.cli.test_cli_basic.CliBasicTests::test_inspect_analyze_json_shape_is_compact (failure)
-- tests.cli.test_cli_basic.CliBasicTests::test_inspect_archives_only_filters_output_items (failure)
-- tests.cli.test_cli_basic.CliBasicTests::test_scan_json_shape (failure)
-- tests.cli.test_cli_basic.CliBasicTests::test_inspect_json_shape (failure)
-
-#### 6 项 — AttributeError: 'ArchiveInputPlanningStage' object has no attribute '_record_planning_state'. Did you mean: '_record_planning_input'?
-
-- tests.unit.test_input_planning_stage::test_input_planning_stage_writes_extractable_segment_without_switching_task_source (failure)
-- tests.unit.test_input_planning_stage::test_input_planning_stage_keeps_sfx_segment_for_standard_archive_extension (failure)
-- tests.unit.test_input_planning_stage::test_input_planning_stage_does_not_treat_native_zip_recovery_fragments_as_embedded (failure)
-- tests.unit.test_input_planning_stage::test_input_planning_stage_keeps_embedded_scan_ranges_for_neutral_carrier (failure)
-- tests.unit.test_input_planning_stage::test_input_planning_stage_records_multiple_segments_on_original_task (failure)
-- tests.unit.test_input_planning_stage::test_input_planning_stage_maps_split_logical_segment_to_concat_ranges (failure)
-
-#### 5 项 — TypeError: _ActivePipelineRequest.__init__() got an unexpected keyword argument 'group'
-
-- tests.unit.test_watch_task_retry_model::test_generated_password_failure_defers_flatten_until_retry_completes (failure)
-- tests.unit.test_watch_task_retry_model::test_generated_password_failure_is_anchored_to_failed_task (failure)
-- tests.unit.test_watch_task_retry_model::test_password_retry_can_advance_to_the_next_generated_task (failure)
-- tests.unit.test_watch_task_retry_model::test_generated_missing_volume_is_terminal_and_not_suspended (failure)
-- tests.unit.test_watch_task_retry_model::test_direct_missing_volume_still_suspends_watch_input (failure)
-
-#### 4 项 — sunpack.core.config.loader.ConfigError: Missing required sunpack_config.json or sunpack_advanced_config.json. Searched: C:\Users\29402\Desktop\sunpack\sunpack\sunpack_config.json, C:\Users\29402\Desktop\sunpack\sunpack\runtime-cwd\direct\sunpack_config.json, C:\Users\29402\Desktop\sunpack\sunpack\runtime-cwd\direct\sunpack-2\sunpack_config.json, C:\Users\29402\Desktop\sunpack\sunpack\sunpack_advanced_config.json, C:\Users\29402\Desktop\sunpack\sunpack\runtime-cwd\direct\sunpack_advanced_config.json, C:\Users\29402\Desktop\sunpack\sunpack\runtime-cwd\direct\sunpack-2\sunpack_advanced_config.json
-
-- tests.functional.test_watch_password_retry::test_watch_retries_real_encrypted_zip_after_password_source_update[directory] (failure)
-- tests.functional.test_watch_password_retry::test_watch_retries_real_encrypted_zip_after_password_source_update[watch_clipboard] (failure)
-- tests.functional.test_watch_password_retry::test_watch_aggregates_all_zipcrypto_fast_matches[later-success] (failure)
-- tests.functional.test_watch_password_retry::test_watch_aggregates_all_zipcrypto_fast_matches[all-candidates-rejected] (failure)
-
-#### 3 项 — AttributeError: 'dict' object has no attribute 'add'
-
-- tests.unit.test_output_reservation::test_output_dir_resolver_disambiguates_duplicate_task_outputs (failure)
-- tests.unit.test_output_reservation::test_output_dir_resolver_avoids_existing_output_directory (failure)
-- tests.unit.test_output_reservation::test_output_reservations_disambiguate_concurrent_requests_before_directories_exist (failure)
-
-#### 3 项 — ImportError: cannot import name 'entrypoint' from 'sunpack.core.support' (C:\Users\29402\Desktop\sunpack\sunpack\core\support\__init__.py)
-
-- tests.unit.test_toast_host_manager::test_main_runtime_handles_toast_bootstrap_without_starting_engine[--register-toast-register] (failure)
-- tests.unit.test_toast_host_manager::test_main_runtime_handles_toast_bootstrap_without_starting_engine[--toast-activated-activate] (failure)
-- tests.unit.test_toast_host_manager::test_unregister_toast_current_user_helper_is_dispatched_before_normal_runtime (failure)
-
-#### 2 项 — AssertionError: assert None == '932'
-
-- tests.unit.test_archive_metadata_encoding::test_shift_jis_kanji_only_zip_scan_uses_cp932 (failure)
-- tests.unit.test_archive_metadata_encoding::test_shift_jis_zip_scan_returns_decoded_item_paths (failure)
-
-#### 2 项 — json.decoder.JSONDecodeError: Expecting value: line 1 column 1 (char 0)
-
-- tests.cli.test_cli_basic.CliBasicTests::test_extract_out_dir_is_resolved_to_an_absolute_path (failure)
-- tests.cli.test_cli_basic.CliBasicTests::test_json_mode_rejects_interactive_password_prompt_as_json (failure)
-
-#### 1 项 — AssertionError: 1 != 0
-
-- tests.cli.test_cli_basic.CliBasicTests::test_watch_help_documents_watchdog_options (failure)
-
-#### 1 项 — AssertionError: 1 != 0 : Traceback (most recent call last):
-
-- tests.cli.test_cli_basic.CliBasicTests::test_passwords_json_shape (failure)
-
-#### 1 项 — AssertionError: assert False
-
-- tests.cli.test_command_modules::test_cli_and_gui_packages_have_explicit_boundaries (failure)
-
-#### 1 项 — AssertionError: assert ['C:\\Users\\...ssing.7z.001'] == ['C:\\Users\\...iting.7z.002']
-
-- tests.unit.test_watch_crash_recovery::test_startup_blocker_reconciliation_is_targeted (failure)
-
-#### 1 项 — AssertionError: assert [('file', 'sa...prepass'>})})] == [('file', 'sa...owed': True})]
-
-- tests.unit.test_analysis_facade::test_archive_analyzer_dispatches_file_source_and_request (failure)
-
-#### 1 项 — AssertionError: assert [['bad1', 'bad2']] == []
-
-- tests.unit.test_password_scheduler::test_verifier_chain_prioritizes_fast_verifier_from_extension (failure)
-
-#### 1 项 — AssertionError: assert [] == ['【サンプル】テスト素材.psd']
-
-- tests.unit.test_archive_metadata_encoding::test_unicode_path_extra_field_takes_precedence_over_codepage_guess (failure)
-
-#### 1 项 — AssertionError: untracked file-handle entry points:
-
-- tests.unit.test_resource_lifecycle_static::test_python_business_code_cannot_bypass_tracked_file_entry_points (failure)
-
-#### 1 项 — AttributeError: 'RunState' object has no attribute 'failed_tasks'. Did you mean: 'scan_failed_tasks'?
-
-- tests.unit.test_failed_output_cleanup::test_collect_result_applies_main_pipeline_cleanup_after_diagnostics (failure)
-
-#### 1 项 — AttributeError: 'module' object at sunpack.core.analysis.engine has no attribute 'scan_embedded_archives'
-
-- tests.unit.test_analysis_pipeline::test_analysis_requires_candidate_embedded_scan_authorization (failure)
-
-#### 1 项 — AttributeError: EMBEDDED_SCAN
-
-- tests.unit.test_analysis_facade::test_analysis_request_rejects_capability_over_budget (failure)
-
-#### 1 项 — AttributeError: can't set attribute 'logical_name'
-
-- tests.unit.test_input_planning_stage::test_input_planning_stage_reuses_batch_report_for_equivalent_inputs (failure)
-
-#### 1 项 — E   ImportError: cannot import name 'archive_state_manifest' from 'sunpack.pipeline.verification' (C:\Users\29402\Desktop\sunpack\sunpack\pipeline\verification\__init__.py)
-
-- tests.unit.test_verification_methods (error)
-
-#### 1 项 — FileNotFoundError: [Errno 2] No such file or directory: 'C:\\Users\\29402\\Desktop\\sunpack\\sunpack\\platform\\windows\\startup.py'
-
-- tests.unit.test_windows_installer_contract::test_machine_level_path_context_menu_startup_and_toast_registration (failure)
-
-#### 1 项 — KeyError: 'format'
-
-- tests.unit.test_relations::test_prefixed_single_disk_zip_carrier_is_not_waited_as_missing_tail (failure)
-
-#### 1 项 — KeyError: 'source'
-
-- tests.unit.test_analysis_pipeline::test_analysis_reuses_complete_detection_prepass_without_shared_rescan (failure)
-
-#### 1 项 — NameError: name 'bags' is not defined
-
-- tests.unit.test_filesystem_routing::test_main_scan_routes_only_native_container_candidates_through_relations (failure)
-
-#### 1 项 — StopIteration
-
-- tests.unit.test_analysis_pipeline::test_analysis_defaults_to_shared_full_scan_when_head_and_tail_are_unresolved (failure)
-
-#### 1 项 — TypeError: 'NoneType' object is not subscriptable
-
-- tests.unit.test_real_diagnostics::test_task_snapshot_uses_typed_archive_state_and_knowledge (failure)
-
-#### 1 项 — TypeError: AnalysisEngine.analyze_path() got an unexpected keyword argument 'embedded_scan_allowed'
-
-- tests.unit.test_analysis_pipeline::test_rar5_header_encrypted_candidate_reuses_scanner_bounded_end (failure)
-
-#### 1 项 — ValueError: Catalog key mismatch for zh: missing=['cli.scan.format'] extra=['cli.scan.detected_ext']
-
-- tests.cli.test_command_modules::test_i18n_catalogs_have_matching_keys_and_placeholders (failure)
-
-#### 1 项 — assert 0 == (0, 0)
-
-- tests.unit.test_watch_state::test_prune_missing_records_retains_records_when_presence_is_unknown (failure)
-
-#### 1 项 — assert 0 >= 1
-
-- tests.unit.test_runtime_cache_cleanup::test_clear_all_runtime_caches_clears_python_owned_caches (failure)
-
-### integration、real
-
-#### 152 项 — AttributeError: 'ArchiveTask' object has no attribute 'format'
-
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_rar4_compressed_split_extracts_all_members (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_zip_find_correct_password[ppmd] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[bzip2] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[xz] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[zstd] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_rar_find_correct_password[rar5-header] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[zip] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[rar] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-7z-lzma2] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-zip-deflate] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[7z] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_rar_find_correct_password[rar5-data] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[tar] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[tar.gz] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-rar-m5] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[tar.bz2] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_rar_find_correct_password[rar4-header] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[tar.xz] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[tar.zst] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[gzip] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[split-7z-lzma2] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[bzip2] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[xz] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_rar_find_correct_password[rar4-data] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[split-zip-deflate] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_disguised_archives_extract_and_detect_format[zstd] (failure)
-- tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_archives_extract_and_detect_format[7z] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[split-rar-m5] (failure)
-- tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_archives_extract_and_detect_format[zip] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_7z_find_correct_password[header-on] (failure)
-- tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_archives_extract_and_detect_format[rar] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_7z_find_correct_password[header-off] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-7z-lzma2] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_7z_find_correct_password[nonsolid] (failure)
-- tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[7z] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-zip-deflate] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_7z_find_correct_password[lzma] (failure)
-- tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[zip] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-rar-m5] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_7z_find_correct_password[ppmd] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_7z_find_correct_password[bzip2] (failure)
-- tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[rar] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_streaming_zip_uses_data_descriptors_and_extracts (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_7z_find_correct_password[deflate] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_zip64_archive_structural_and_detection (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_zip64_archive_extracts_and_detects (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_real_pkzip_multidisk_archive_extracts_and_detects (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_find_correct_password[7z] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[7z-numbered] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_7z_nonsolid_archive_extracts_and_detects (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_find_correct_password[zip] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_rar4_legacy_archive_extracts_and_detects (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[7z-numbered-cjk] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_find_correct_password[rar] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_rar4_split_archive_extracts_and_detects (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[7z-numbered-long-name] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[7z-plain-numbered] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_multi_member_streams_extract_all_members[gzip] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[7z] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_multi_member_streams_extract_all_members[bzip2] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_multi_member_streams_extract_all_members[xz] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[7z-part-marker-camouflage] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_multi_member_streams_extract_all_members[zstd] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[zip] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_xz_sha256_check_archive_extracts_and_detects (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[7z-format-before-part-marker] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_stream_codec_headers_levels_and_checks_extract[gzip-level1-no-name] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_stream_codec_headers_levels_and_checks_extract[gzip-level9-name] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[rar] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_stream_codec_headers_levels_and_checks_extract[bzip2-level1] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[7z-format-after-part-marker] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_stream_codec_headers_levels_and_checks_extract[bzip2-level9] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_stream_codec_headers_levels_and_checks_extract[xz-crc32] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_stream_codec_headers_levels_and_checks_extract[xz-crc64] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[zip-numbered] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_stream_codec_headers_levels_and_checks_extract[xz-sha256] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_stream_codec_headers_levels_and_checks_extract[zstd-level1-no-check] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[zip-part-marker-camouflage] (failure)
-- tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_stream_codec_headers_levels_and_checks_extract[zstd-level19-check] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[7z-numbered] (failure)
-- tests.real.plan1_real_archives.test_plan1_mixed_directory::test_plan1_mixed_same_name_plain_formats_in_one_directory (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[zip-numbered-cjk] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[7z-numbered-cjk] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[rar-part-marker] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[7z-numbered-long-name] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[rar-part-marker-padded] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[7z-plain-numbered] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_extract_and_detect_format[rar-camouflaged] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[7z-part-marker-camouflage] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[7z-format-before-part-marker] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_detected_as_one_logical_stream_with_chaotic_names[7z] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_detected_as_one_logical_stream_with_chaotic_names[zip] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[7z-format-after-part-marker] (failure)
-- tests.real.plan1_real_archives.test_plan1_split_matrix::test_plan1_split_archives_detected_as_one_logical_stream_with_chaotic_names[rar] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[zip-numbered] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_zip_find_correct_password[zipcrypto] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_zip_find_correct_password[aes128] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[zip] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[zip-part-marker-camouflage] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[rar] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_zip_find_correct_password[aes256] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_zip_find_correct_password[deflate64] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[zip-numbered-cjk] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[7z] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_zip_find_correct_password[bzip2] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[tar] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[tar.gz] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[rar-part-marker] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[tar.bz2] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_plain_encrypted::test_plan2_encrypted_zip_find_correct_password[lzma] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[tar.xz] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[tar.zst] (failure)
-- tests.real.plan1_real_archives.test_plan1_plain_matrix::test_plan1_plain_single_archives_extract_and_detect_format[gzip] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[rar-part-marker-padded] (failure)
-- tests.real.plan2_encrypted_archives.test_plan2_split_encrypted::test_plan2_encrypted_split_find_correct_password[rar-camouflaged] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-zip] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-rar] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_split_confusion::test_plan6_encrypted_split_confused_volumes_extract[suffix-junk-some-7z] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_split_confusion::test_plan6_encrypted_split_confused_volumes_extract[suffix-junk-some-zip] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_split_confusion::test_plan6_encrypted_split_confused_volumes_extract[suffix-junk-some-rar] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_split_confusion::test_plan6_encrypted_split_confused_volumes_extract[suffix-junk-all-7z] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_split_confusion::test_plan6_encrypted_split_confused_volumes_extract[suffix-junk-all-zip] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_split_confusion::test_plan6_encrypted_split_confused_volumes_extract[suffix-junk-all-rar] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_split_confusion::test_plan6_encrypted_split_confused_volumes_extract[prefix-suffix-junk-all-7z] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_split_confusion::test_plan6_encrypted_split_confused_volumes_extract[prefix-suffix-junk-all-zip] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_split_confusion::test_plan6_encrypted_split_confused_volumes_extract[prefix-suffix-junk-all-rar] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_seven_zip_compression_methods_and_solid_modes_extract_all_members[lzma-solid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_seven_zip_compression_methods_and_solid_modes_extract_all_members[ppmd-solid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_seven_zip_compression_methods_and_solid_modes_extract_all_members[bzip2-solid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_seven_zip_compression_methods_and_solid_modes_extract_all_members[deflate-solid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_rar_compression_levels_and_solid_modes_extract_all_members[store-nonsolid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_rar_compression_levels_and_solid_modes_extract_all_members[maximum-nonsolid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_rar_compression_levels_and_solid_modes_extract_all_members[maximum-solid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_rar4_compression_modes_extract_all_members[rar4-compressed-nonsolid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_rar4_compression_modes_extract_all_members[rar4-compressed-solid] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_mixed_directory::test_plan6_confused_encrypted_groups_mixed_in_one_directory (failure)
-- tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-7z] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-zip] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-rar] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-7z] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-zip] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-rar] (failure)
-- tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-7z] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_zip_compression_methods_extract_all_members[copy] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_zip_compression_methods_extract_all_members[deflate] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_zip_compression_methods_extract_all_members[deflate64] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_zip_compression_methods_extract_all_members[bzip2] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_zip_compression_methods_extract_all_members[lzma] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_zip_compression_methods_extract_all_members[ppmd] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_seven_zip_compression_methods_and_solid_modes_extract_all_members[copy-nonsolid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_seven_zip_compression_methods_and_solid_modes_extract_all_members[lzma2-solid] (failure)
-- tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_seven_zip_compression_methods_and_solid_modes_extract_all_members[lzma2-nonsolid] (failure)
-
-#### 63 项 — AttributeError: 'dict' object has no attribute 'add'
-
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[missing_head-rar] (failure)
-- tests.integration.test_detection_pipeline.DetectionPipelineTests::test_pipeline_can_scan_and_extract_zip (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_7z_reports_password_error[header-off] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_7z_reports_password_error[nonsolid] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_7z_reports_password_error[lzma] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_7z_reports_password_error[ppmd] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_7z_reports_password_error[bzip2] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_7z_reports_password_error[deflate] (failure)
-- tests.integration.test_pipeline_runner::test_pipeline_progress_observer_receives_extract_ready_before_native_progress (failure)
-- tests.integration.test_pipeline_runner::test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_sfx_wrong_passwords::test_plan3_encrypted_sfx_reports_password_error[7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[missing_middle-rar] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_sfx_wrong_passwords::test_plan3_encrypted_sfx_reports_password_error[zip] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_sfx_wrong_passwords::test_plan3_encrypted_sfx_reports_password_error[rar] (failure)
-- tests.real.plan1_real_archives.test_plan1_mixed_directory::test_plan1_mixed_compressed_formats_in_one_directory (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_sfx_wrong_passwords::test_plan3_encrypted_sfx_split_reports_password_error[7z] (failure)
-- tests.integration.test_structure_volume_resolution::test_pipeline_uses_initial_structure_group_without_missing_volume_retry (failure)
-- tests.real.plan1_real_archives.test_plan1_mixed_directory::test_plan1_mixed_same_stem_split_formats_in_one_directory (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_sfx_wrong_passwords::test_plan3_encrypted_sfx_split_reports_password_error[zip] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_sfx_wrong_passwords::test_plan3_encrypted_sfx_split_reports_password_error[rar] (failure)
-- tests.integration.test_structure_volume_resolution::test_pipeline_middle_volume_target_exposes_resolved_physical_family (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[rar] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[7z-numbered] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_carrier_archives_extract[jpg] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_carrier_archives_extract[png] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[7z-numbered-cjk] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_zip_reports_password_error[zipcrypto] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_carrier_archives_extract[pdf] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_zip_reports_password_error[aes128] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[7z-numbered-long-name] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_carrier_archives_extract[gif] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_zip_reports_password_error[aes256] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_carrier_archives_extract[webp] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[7z-plain-numbered] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_zip_reports_password_error[deflate64] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[pdf-zip] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_zip_reports_password_error[bzip2] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[7z-part-marker-camouflage] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[webp-7z] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_zip_reports_password_error[lzma] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[jpg-rar] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[7z-format-before-part-marker] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_zip_reports_password_error[ppmd] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_rar_reports_password_error[rar5-header] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[7z-format-after-part-marker] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[png-rar] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_rar_reports_password_error[rar5-data] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[zip-numbered] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[gif-rar] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_rar_reports_password_error[rar4-header] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[zip-part-marker-camouflage] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_rar_reports_password_error[rar4-data] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[zip-numbered-cjk] (failure)
-- tests.real.plan5_embedded_archives.test_plan5_large_embedded::test_plan5_large_file_extracts_128_real_embedded_archives (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_plain_wrong_passwords::test_plan3_encrypted_7z_reports_password_error[header-on] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[rar-part-marker] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[rar-part-marker-padded] (failure)
-- tests.real.plan3_wrong_passwords.test_plan3_split_wrong_passwords::test_plan3_encrypted_split_reports_password_error[rar-camouflaged] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[missing_head-rar] (failure)
-- tests.real.plan5_embedded_archives.test_plan5_mixed_embedded::test_plan5_mixed_file_extracts_every_embedded_segment_with_correct_password (failure)
-- tests.real.plan5_embedded_archives.test_plan5_wrong_password_partial::test_plan5_wrong_passwords_extract_plain_segments_only (failure)
-- tests.real.plan7_watch_downloads.test_plan7_nested_extreme_failures::test_plan7_nested_inner_unknown_password_normal_mode (failure)
-- tests.real.plan7_watch_downloads.test_plan7_nested_extreme_failures::test_plan7_nested_inner_missing_volume_normal_mode (failure)
-
-#### 38 项 — NameError: name 'recovered' is not defined
-
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[missing_head-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[missing_tail-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[missing_tail-rar] (failure)
-- tests.integration.test_pipeline_runner::test_pipeline_runner_passes_native_worker_overrides (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[missing_tail-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[missing_middle-zip] (failure)
-- tests.integration.test_pipeline_runner::test_pipeline_runner_exposes_recent_passwords_without_password_manager (failure)
-- tests.integration.test_pipeline_runner::test_batch_does_not_treat_existing_same_name_directory_as_output (failure)
-- tests.integration.test_pipeline_runner::test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[missing_middle-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_middle-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_middle-rar] (failure)
-- tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_middle-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_head-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_head-rar] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_head-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_tail-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_tail-rar] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_tail-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[missing_middle-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_middle-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_middle-rar] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_middle-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_head-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[missing_head-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_head-rar] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_head-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[missing_head-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_tail-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[missing_tail-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_tail-rar] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[missing_tail-rar] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_tail-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[missing_tail-7z] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[missing_head-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[missing_middle-zip] (failure)
-- tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[missing_middle-rar] (failure)
-
-#### 34 项 — Failed: watch condition did not settle before timeout: pending=0, entries={}
-
-- tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_do_not_resubmit[7z] (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_stream_formats_direct_final_path_complete[xz] (failure)
-- tests.integration.test_watch_root_output_routing::test_watch_routes_each_root_to_its_output_root_without_input_tree_outputs (failure)
-- tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_launcher_first_then_data_volumes_reacts_after_group_completion[7z] (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_stale_downloading_file_does_not_block_final_file (failure)
-- tests.integration.test_watch_rar_hp_encryption::test_watch_single_hp_rar_extracts_with_correct_password (failure)
-- tests.real.plan7_watch_downloads.test_plan7_nested_extreme_failures::test_plan7_nested_inner_missing_volume_watch_is_not_outer_volume_blocked (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_stream_formats_direct_final_path_complete[tar.bz2] (failure)
-- tests.real.plan7_watch_downloads.test_plan7_download_modes::test_plan7_direct_final_path_download_does_not_stall_after_completion (failure)
-- tests.integration.test_watch_rar_hp_encryption::test_watch_single_hp_rar_reports_wrong_password_without_hanging (failure)
-- tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_do_not_resubmit[zip] (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_stream_formats_direct_final_path_complete[zstd] (failure)
-- tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_launcher_first_then_data_volumes_reacts_after_group_completion[zip] (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_split_recovers_when_missing_last_volume_arrives (failure)
-- tests.real.plan7_watch_downloads.test_plan7_plain_and_sfx_downloads::test_plan7_plain_and_sfx_downloads_complete_and_record_memory (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_stream_formats_direct_final_path_complete[tar.xz] (failure)
-- tests.integration.test_watch_rar_hp_encryption::test_watch_split_hp_rar_extracts_with_correct_password (failure)
-- tests.real.plan7_watch_downloads.test_plan7_download_modes::test_plan7_interrupted_download_resumes_after_watch_restart (failure)
-- tests.real.plan7_watch_downloads.test_plan7_cleanup::test_plan7_sfx_split_success_cleans_unique_validated_launcher (failure)
-- tests.real.plan7_watch_downloads.test_plan7_nested_extreme_failures::test_plan7_nested_inner_unknown_password_watch_is_password_blocked (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_same_stem_plain_and_sfx_arrive_interleaved (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_stream_formats_direct_final_path_complete[tar.zst] (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_incomplete_split_recovers_after_watcher_restart (failure)
-- tests.real.plan7_watch_downloads.test_plan7_split_downloads::test_plan7_split_downloads_out_of_order_complete_and_record_memory (failure)
-- tests.real.plan7_watch_downloads.test_plan7_embedded::test_plan7_single_format_embedded_downloads_react_for_7z_zip_and_rar (failure)
-- tests.real.plan7_watch_downloads.test_plan7_disguised::test_plan7_disguised_extensions_and_carrier_prefixes_react (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_replacement_and_reappearance_are_processed (failure)
-- tests.real.plan7_watch_downloads.test_plan7_variants::test_plan7_encryption_and_container_variants_are_processed (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_stream_formats_direct_final_path_complete[tar.gz] (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_stream_formats_direct_final_path_complete[gzip] (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_existing_file_initial_scan_and_quiet_window (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_deleted_partial_download_can_restart_from_scratch (failure)
-- tests.real.plan7_watch_downloads.test_plan7_download_modes::test_plan7_interleaved_downloads_react_for_every_final_path (failure)
-- tests.real.plan7_watch_downloads.test_plan7_lifecycle::test_plan7_stream_formats_direct_final_path_complete[bzip2] (failure)
-
-#### 3 项 — AttributeError: 'ArchiveInputPlanningStage' object has no attribute '_record_planning_state'. Did you mean: '_record_planning_input'?
-
-- tests.integration.test_native_sfx_split_wrapper::test_input_planned_sfx_uses_rust_password_verifier[7z] (failure)
-- tests.integration.test_native_sfx_split_wrapper::test_input_planned_sfx_uses_rust_password_verifier[zip] (failure)
-- tests.integration.test_native_sfx_split_wrapper::test_input_planned_sfx_uses_rust_password_verifier[rar] (failure)
-
-#### 1 项 — AssertionError: assert ['C:\\Users\\...useless.fake'] == ['C:\\Users\\...useless.fake']
-
-- tests.integration.test_structure_volume_resolution::test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline (failure)
-
-#### 1 项 — AssertionError: assert not [SubmissionEvent(at=3530.3068623, paths=('C:\\Users\\29402\\AppData\\Local\\Temp\\pytest-of-29402\\pytest-0\\popen-gw7\\test_plan7_rar_part1_exe_is_re0\\rar_part1\\watch\\p7_order_rar.part1.exe',))]
-
-- tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_rar_part1_exe_is_real_input_when_arriving_as_head (failure)
-
-#### 1 项 — AttributeError: 'ExtractionResult' object has no attribute 'all_parts'
-
-- tests.integration.test_extraction_execution.ExtractionExecutionTests::test_extractor_success_reports_cleanup_parts_not_candidate_run_parts (failure)
-
-#### 1 项 — Failed: watch condition did not settle before timeout: pending=1, entries={}
-
-- tests.integration.test_watch_rar_hp_encryption::test_watch_split_hp_rar_recovers_after_wrong_then_correct_password (failure)
-
-## 我的判断
-
-失败集中在多个跨层接口同时失配：
-
-- 152 项真实归档用例报 ArchiveTask 缺少 format 属性，说明仍有路径依赖旧归档状态字段。
-- 66 项输出目录预留调用对 dict 的 .add()，提取批次准备阶段会直接抛 AttributeError。
-- 38 项报 recovered 未定义；另有 9 项调用不存在的 _record_planning_state，显示缺失卷处理和输入规划仍有未接通路径。
-- 35 项 watch 用例以 pending=0/1、entries={} 超时。多个用例伴随异步 pipeline 异常，这些超时可能是处理崩溃的下游结果；测试结果不足以证明所有超时共享一个原因。
-- CLI pytest 中 7 项及 4 个 smoke 命令均遇到持久进程启动后以退出码 1 退出。日志没有揭示该进程更早退出的根因。
-- 其余失败还覆盖模块导入、参数签名、数据模型字段、i18n key、路径和编码断言，逐项错误已列在上方。
-
-当前提交未通过正确性验收。本报告记录观察结果，没有修复或改写测试。
-
-## 最新提交复测（9503b7db）
-
-- 测试提交：`9503b7db8d94b265f58569def7816229bdb52bd4`（`fix: complete canonical contract migration after architecture refactor (#121)`）。本轮在上一轮被测提交 `7b5786c` 之后继续验证。
-- 工作区在测试前干净；没有修改程序代码或测试代码。本报告追加本轮结果。
-- 使用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\setup_windows_dev.ps1 -Arch x64` 强制重建 `.venv`、Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL。worker 的 6 项 CTest 和 toast 的 1 项 CTest 均通过。
-- Rust 单元测试另执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：98 passed，0 failed。
-- 开发环境脚本最后的 CLI probe 没通过：`[CLI] 运行失败：'archive'`，退出码 3（`sunpack.py inspect --analyze --no-pause -q <probe.zip>`）。编译阶段和 CTest 已完成。为继续验收，随后执行 `run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh`；该 runner 后续 5 项 CLI smoke（help、passwords、scan、inspect、config）全部通过。因此，setup probe 的 `'archive'` 异常与 acceptance smoke 结果不一致，仍应单独追踪。
-
-### 本轮汇总
-
-| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
-|---|---:|---:|---:|---:|---:|
-| CLI、unit、functional | 1135 | 1129 | 6 | 0 | 0 |
-| integration、real | 347 | 309 | 37 | 0 | 1 |
-| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
-| **Python pytest 合计** | **1490** | **1438** | **43** | **0** | **9** |
-
-额外验证：Rust 单元测试 98 项全部通过；C++ worker/toast CTest 7 项全部通过；acceptance CLI smoke 5 项全部通过。Acceptance 的两个 pytest 阶段失败，disk-full 阶段因管理员权限条件跳过全部 8 项。
-
-### 本轮失败项与报错
-
-#### CLI、unit、functional：6 项
-
-- `tests.unit.test_runtime_cache_cleanup::test_clear_all_runtime_caches_clears_python_owned_caches` — `assert 0 >= 1`。`projection_cache.entries` 实际为 0。
-- `tests.unit.test_verification_methods::test_manifest_size_match_reports_retry_for_large_manifest_gap` — 实际 issue 集合比预期多 `fail.manifest_named_files_missing`；预期只有 `fail.manifest_file_count_under` 和 `fail.manifest_size_under`。
-- `tests.unit.test_input_planning_stage::test_input_planning_stage_does_not_treat_native_zip_recovery_fragments_as_embedded` — 预期 `knowledge_view.source_extractable_segments(task) == []`，实际仍得到 ZIP segment `embedded_01_zip`，`start_offset=13`。
-- `tests.unit.test_resource_lifecycle_static::test_python_business_code_cannot_bypass_tracked_file_entry_points` — 静态检查发现未跟踪入口 `sunpack\runtime\cli\commands\version.py:24:read_text`。
-- `tests.functional.test_misnamed_volume_consistency::test_filename_only_scan_does_not_absorb_unmarked_fuzzy_parts` — 预期 `archive_input.part_paths()` 为单元素 tuple，实际为单元素 list。
-- `tests.functional.test_selected_targets_and_scheduler::test_selected_split_member_without_structural_proof_stays_single_candidate` — 同样预期单元素 tuple，实际为单元素 list。
-
-#### integration、real：37 项
-
-下面 27 项的共同错误是 `AssertionError: container type mismatch: expected pe, got <7z|zip|rar>`。检测到了对应的压缩格式，但测试所构造的 SFX 应被识别为 PE 容器；相同错误横跨普通 SFX、分卷 SFX、加密 SFX 和混淆卷场景。
-
-- 7z（9 项）：
-  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-7z-lzma2]`
-  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-7z-lzma2]`
-  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_archives_extract_and_detect_format[7z]`
-  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[7z]`
-  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_find_correct_password[7z]`
-  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[7z]`
-  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-7z]`
-  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-7z]`
-  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-7z]`
-- ZIP（9 项）：
-  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-zip-deflate]`
-  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-zip-deflate]`
-  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_archives_extract_and_detect_format[zip]`
-  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[zip]`
-  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_find_correct_password[zip]`
-  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[zip]`
-  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-zip]`
-  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-zip]`
-  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-zip]`
-- RAR（9 项）：
-  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-rar-m5]`
-  - `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-rar-m5]`
-  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_archives_extract_and_detect_format[rar]`
-  - `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[rar]`
-  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_find_correct_password[rar]`
-  - `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[rar]`
-  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-rar]`
-  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-rar]`
-  - `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-rar]`
-
-另外 10 项：
-
-- `tests.integration.test_structure_volume_resolution::test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline` — 枚举值不符：实际 `file_range`，预期 `sfx_with_volumes`（`assert 'file_range' == 'sfx_with_volumes'`）。
-- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_do_not_resubmit[7z]` — 预期 launcher 到达后没有后续提交事件，实际又提交了 `p7_order_7z.exe`。
-- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_do_not_resubmit[zip]` — 同上，实际又提交了 `p7_order_zip.exe`。
-- `tests.real.plan1_real_archives.test_plan1_format_variants::test_plan1_multi_member_streams_extract_all_members[gzip]` — `ValueError: Native scan_embedded_archives file_size mismatch: expected 32, got 48`。
-- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[png-rar]` — `assert False`，wrong-password-then-success 的 `any(...)` 断言未成立。
-- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[gif-rar]` — 同一 `assert False`。
-- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[jpg-rar]` — 同一 `assert False`。
-- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[7z]` — 预期有失败任务，实际 `RunSummary(...).failed_tasks == []`。
-- `tests.integration.test_watch_rar_hp_encryption::test_watch_single_hp_rar_reports_wrong_password_without_hanging` — `NameError: name 'BLOCKER_PASSWORD' is not defined`。从异常看，这是测试执行路径引用了未定义名称，不能据此单独认定被测实现行为错误。
-- `tests.integration.test_watch_rar_hp_encryption::test_watch_split_hp_rar_recovers_after_wrong_then_correct_password` — `Failed: watch condition did not settle before timeout: pending=0, entries={}`。
-
-### 本轮理解
-
-- 最大的一组剩余问题是 SFX 外层容器类型：27 个 7z/ZIP/RAR 用例都将 PE SFX 报成内部格式。它同时影响检测、加密 SFX 和卷名混淆流程，较像共享的容器类型归一化/证据优先级问题，而不是 27 个互不相关的提取故障。
-- 分卷 SFX 的 `file_range`/`sfx_with_volumes` 差异和数据卷先到后 launcher 再到时的重复 watch 提交，分别指向输入关系分类和提交去重状态仍有缺口；目前结果不能证明二者根因相同。
-- gzip 用例直接暴露 Rust native 扫描调用的 `file_size` 参数与实际输入长度不一致（32 对 48）。另外，ZIP 恢复片段被报告成 embedded segment、以及两个 `part_paths()` 测试的 list/tuple 差异，显示输入规划/数据模型边界仍有行为或返回契约差异。
-- manifest 验证多报 named-files-missing、projection cache 为空、以及 `version.py` 的文件读取静态违规，是三个独立的剩余单测问题。
-- 3 个带 carrier 前缀的加密 RAR 用例未满足错误密码后再正确密码的断言；split HP RAR 在密码表更新后没有形成 watch entry。单个 HP RAR 用例则先被 `BLOCKER_PASSWORD` 未定义阻断，需将测试名称错误与实现问题区分。
-- 被测结果比上一轮记录的 349 个失败/收集错误少很多，但提交和用例集合都发生了变化，不能把总数差直接解释成逐项回归/修复对应关系。
-
-### 跳过与边界
-
-- disk-full 的 8 项因需要管理员权限执行 diskpart 而跳过。
-- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 未设置 `SUNPACK_RUN_GAME_TREE_TEST=1`，按测试文件要求跳过本机 `D:\game` 扫描。
-- `tests/memory/test_watch_growth.py` 是 opt-in performance 测试，默认 acceptance correctness 流程不执行。
-- 本轮报告基于完成的 Rust 单元测试、native CTest、Python acceptance 和 CLI smoke 结果；未修复失败项。
-## 修复后复测（1e30a31d）
-
-- 被测提交：`1e30a31d766a451978d41bb82c3fd32a15a1b554`（`Fix remaining post-refactor runtime regressions (#123)`）；包含前一提交 `f2d8be95` 的测试契约调整。
-- 本轮没有改程序或测试文件。使用 `scripts/setup_windows_dev.ps1 -Arch x64` 强制重建 Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL；C++ worker 的 6 项 CTest 与 toast 的 1 项 CTest 全部通过。
-- 环境脚本最后的 inspect probe 仍失败，错误已从上一轮的 `'archive'` 变为 `[CLI] 运行失败：'decision'`，退出码 3。随后用已重建的环境执行 `run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh`；其中 5 项 CLI smoke 全部通过。
-- Rust 单测执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：99 passed，0 failed。
-
-### 本轮汇总
-
-| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
-|---|---:|---:|---:|---:|---:|
-| CLI、unit、functional | 1139 | 1139 | 0 | 0 | 0 |
-| integration、real | 347 | 330 | 16 | 0 | 1 |
-| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
-| **Python pytest 合计** | **1494** | **1469** | **16** | **0** | **9** |
-
-额外验证：Rust 单元测试 99 项全部通过；native CTest 7 项全部通过；5 项 CLI smoke 全部通过。相比上一轮记录的 43 个 pytest 失败，本轮减少到 16 个；CLI/unit/functional 阶段现为全绿。
-
-### 本轮剩余失败项与报错
-
-#### 分卷 SFX 容器类型：12 项
-
-共同报错：`AssertionError: container type mismatch: expected pe, got ''`。这些用例均为 7z/ZIP 分卷 SFX；探测结果没有给出预期的 PE 外层容器类型。
-
-- `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-7z-lzma2]`
-- `tests.real.plan1_real_archives.test_plan1_compression_modes::test_plan1_compressed_sfx_and_split_combinations[sfx-split-zip-deflate]`
-- `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[7z]`
-- `tests.real.plan1_real_archives.test_plan1_sfx_matrix::test_plan1_sfx_split_archives_extract_and_detect_format[zip]`
-- `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[7z]`
-- `tests.real.plan2_encrypted_archives.test_plan2_sfx_encrypted::test_plan2_encrypted_sfx_split_find_correct_password[zip]`
-- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-7z]`
-- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-all-zip]`
-- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-7z]`
-- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[prefix-suffix-junk-all-zip]`
-- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-7z]`
-- `tests.real.plan6_confused_volumes.test_plan6_sfx_split_confusion::test_plan6_encrypted_sfx_split_confused_volumes_extract[suffix-junk-some-zip]`
-
-#### 其他 4 项
-
-- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_routes_new_launcher_through_pipeline[7z]` — 期望只生成一个 marker，实际断言 `assert 2 == 1`；输出目录出现原目录和 `(1)` 目录两份提取结果。
-- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_routes_new_launcher_through_pipeline[zip]` — 同样生成两份结果，`assert 2 == 1`。
-- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[7z]` — 预期归档失败任务，实际 `RunSummary(...).failed_tasks == []`。
-- `tests.integration.test_structure_volume_resolution::test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline` — 输入类别不符：实际 `file_range`，预期 `sfx_with_volumes`（`assert 'file_range' == 'sfx_with_volumes'`）。
-
-### 本轮理解
-
-- 相比上一轮，原先的 6 个 CLI/unit/functional 失败全部通过；RAR 单卷/分卷 SFX 的 PE 识别、错误密码后更新候选、HP RAR watch 恢复及 gzip native 长度等失败也不再出现。
-- 剩余 12 项集中在 7z/ZIP 的分卷 SFX：单卷 SFX 场景已不在失败项中，但分卷时 PE 外层容器类型变成空值。说明修复缩小了问题面，分卷 SFX 的容器元数据仍未接通。
-- 7z/ZIP 数据卷先到、launcher 后到的两项均产生两份解压输出；这更像 launcher 重新入队后与已处理卷组重复触发。需要避免重复产出，同时保留测试要求的 launcher pipeline 路由。
-- RAR SFX 的 `file_range` 分类和截断 7z SFX 没有失败记录仍是两项独立输入/状态问题。
-- 环境脚本 smoke 的异常字段从 `'archive'` 变为 `'decision'`，而 acceptance 的 CLI smoke 通过。日志仅证明两个调用路径表现不同，暂不足以断定具体根因。
-
-### 跳过与边界
-
-- disk-full 8 项因需要管理员权限执行 diskpart 而跳过。
-- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 未设置 `SUNPACK_RUN_GAME_TREE_TEST=1`，按测试要求跳过本机 `D:\game` 扫描。
-- `tests/memory/test_watch_growth.py` 为 opt-in performance 测试，不在默认 correctness acceptance 范围内。
-- 本节记录修复后的测试结果；未修复剩余失败项。
-## 再次修复后复测（741f9dec）
-
-- 被测提交：`741f9dec897f335c5cdfdca1cd274e01b77f234c`（`fix: close low-risk post-refactor regressions (#124)`）。
-- 本轮未修改程序或测试文件。执行 `scripts/setup_windows_dev.ps1 -Arch x64` 强制重建 Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL；worker 6 项 CTest 与 toast 1 项 CTest 全部通过。
-- 这次开发环境脚本的最终 CLI 检查成功，打印本地 CLI usage 和 `Local development environment is ready.`；acceptance 环境预检也判定环境为 current。
-- `run_acceptance_tests.ps1 -NoWait` 完整执行。Rust 单测另执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：100 passed，0 failed。
-
-### 本轮汇总
-
-| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
-|---|---:|---:|---:|---:|---:|
-| CLI、unit、functional | 1140 | 1140 | 0 | 0 | 0 |
-| integration、real | 347 | 343 | 3 | 0 | 1 |
-| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
-| **Python pytest 合计** | **1495** | **1483** | **3** | **0** | **9** |
-
-额外验证：Rust 单测 100 项全部通过；native CTest 7 项全部通过；5 项 acceptance CLI smoke 全部通过。与上一轮 16 个 pytest 失败相比，当前剩 3 项。
-
-### 本轮剩余失败项与报错
-
-- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[7z]` — 测试预期截断的 7z SFX 被登记为失败任务，但 `assert summary.failed_tasks` 失败，实际 `RunSummary(...).failed_tasks == []`。捕获输出显示扫描完成时 0 个候选归档、0 个失败任务；输入没有进入可报告的失败路径。
-- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_routes_new_launcher_through_pipeline[7z]` — 预期 marker 文件数为 1，实际 `assert 2 == 1`。数据卷先到、launcher 后到后，同一 marker 被解压到原输出目录和带 `(1)` 后缀的第二个输出目录；捕获日志显示同一个 `.7z.001` 被成功提取两次。
-- `tests.real.plan7_watch_downloads.test_plan7_arrival_orders::test_plan7_data_volumes_before_launcher_routes_new_launcher_through_pipeline[zip]` — 同样预期 1 个 marker，实际 2 个；同一 `.zip.001` 被成功提取两次并生成第二个输出目录。
-
-### 本轮理解
-
-- 上一轮剩余的 12 个 7z/ZIP 分卷 SFX PE 容器识别失败和 1 个 RAR SFX 输入类别失败，本轮均通过。错误范围继续缩小，构建 probe 也恢复正常。
-- 两个 watch 用例都证明 launcher 已进入 pipeline，但同组数据卷已先完成处理；后来重复提取同一数据卷并写出第二份结果。剩余重点是 launcher 到达时的同组任务去重/已完成状态复用。
-- 截断 7z SFX 仍未被登记为失败任务：扫描将其视作 0 个候选并正常结束。这与 watch 重复提取是独立问题。
-- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 因未设置 `SUNPACK_RUN_GAME_TREE_TEST=1` 跳过；disk-full 8 项因需要管理员权限执行 diskpart 而跳过。`tests/memory/test_watch_growth.py` 仍是 opt-in performance 测试，不属于默认 correctness acceptance。
-- 本轮只记录结果，未修复剩余失败项。
-## 后续修复复测（543c7af5）
-
-- 被测提交：`543c7af59ca0f51321b6cb0e50eee84c5da985ea`（`fix: close final post-refactor regressions (#125)`）。
-- 本轮未修改程序或测试文件。再次执行 `scripts/setup_windows_dev.ps1 -Arch x64`，成功重建 Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL；worker 6 项 CTest 与 toast 1 项 CTest 全部通过。最终 CLI probe 和 acceptance 环境预检均通过。
-- `run_acceptance_tests.ps1 -NoWait` 完整执行；Rust 单测另执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：100 passed，0 failed。
-
-### 本轮汇总
-
-| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
-|---|---:|---:|---:|---:|---:|
-| CLI、unit、functional | 1143 | 1143 | 0 | 0 | 0 |
-| integration、real | 347 | 343 | 3 | 0 | 1 |
-| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
-| **Python pytest 合计** | **1498** | **1486** | **3** | **0** | **9** |
-
-额外验证：Rust 单测 100 项全部通过；native CTest 7 项全部通过；5 项 CLI smoke 全部通过。
-
-### 本轮剩余失败项与报错
-
-- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[7z]` — `assert _failure_contains(summary, expected_options)` 失败。与上一轮相比，测试现在确实得到一个 failed task，错误种类为 embedded-segments extraction failure；但失败类别/诊断没有匹配该用例要求的损坏或解压失败选项。
-- `tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_tail-rar]` — `AssertionError: expected missing-volume error or scan-stage ignore; kinds=['FailureKind.EMBEDDED_SEGMENTS_FAILED']`。只保留 RAR 尾卷时，被识别为 embedded segment 并进入提取，最终给出通用 embedded extraction failure；测试预期缺卷诊断或扫描阶段忽略。
-- `tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_tail-rar]` — 同样报 `expected missing-volume error or scan-stage ignore; kinds=['FailureKind.EMBEDDED_SEGMENTS_FAILED']`，场景为带 SFX 的 RAR 分卷只剩尾卷。
-
-### 本轮理解
-
-- 上一轮两个“数据卷先到、launcher 后到”场景的重复解压失败本轮均通过，说明该修复覆盖了 7z 和 ZIP 两种 watch 输入顺序。
-- 截断 7z SFX 现在会产生 failed task，不再是上一轮的 `failed_tasks == []`；剩余差异在失败归类/诊断匹配，测试仍未得到它要求的失败类别。
-- 新暴露的两个 RAR `only_tail` 用例表现一致：尾卷被当成可尝试的嵌入归档，随后以 `EMBEDDED_SEGMENTS_FAILED` 结束，没有明确报告缺卷，也没有在扫描阶段忽略。普通 RAR 与 SFX RAR 共用这一失败模式。
-- 本轮 pytest 仍有 3 个失败，但失败构成与上一轮不同：两个重复提取问题已通过，截断 SFX 由“无失败任务”推进到“有失败任务但类别不匹配”，同时出现两个 RAR 尾卷缺失场景。
-
-### 跳过与边界
-
-- disk-full 8 项因需要管理员权限执行 diskpart 而跳过。
-- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 因未设置 `SUNPACK_RUN_GAME_TREE_TEST=1` 跳过；`tests/memory/test_watch_growth.py` 是 opt-in performance 测试，不属于默认 correctness acceptance。
-- 本节只记录本轮结果，未修复失败项。
-## 最新修复复测（4baa3c02）
-
-- 被测提交：`4baa3c02af5f404dcc5897edc2b5cae68b975bc8`（`fix: preserve final archive failure semantics (#126)`）。
-- 本轮未修改程序或测试文件。使用 `scripts/setup_windows_dev.ps1 -Arch x64` 重建 Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL；构建成功，worker 6 项 CTest、toast 1 项 CTest、最终 CLI probe 均通过。
-- `run_acceptance_tests.ps1 -NoWait` 完整执行，环境预检为 current。Rust 单测另执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：100 passed，0 failed。
-
-### 本轮结果
-
-| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
-|---|---:|---:|---:|---:|---:|
-| CLI、unit、functional | 1146 | 1146 | 0 | 0 | 0 |
-| integration、real | 347 | 346 | 0 | 0 | 1 |
-| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
-| **Python pytest 合计** | **1501** | **1492** | **0** | **0** | **9** |
-
-额外验证：Rust 单测 100 项全部通过；native CTest 7 项全部通过；acceptance 的 5 项 CLI smoke 全部通过。Acceptance 所有步骤均通过。
-
-### 跳过与边界
-
-- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 未设置 `SUNPACK_RUN_GAME_TREE_TEST=1`，按测试要求跳过本机 `D:\game` 扫描。
-- Administrator VHD disk-full 8 项因需要管理员权限执行 diskpart 而跳过。
-- `tests/memory/test_watch_growth.py` 是 opt-in performance 测试，不属于默认 correctness acceptance。
-- 本轮 acceptance 与 Rust 单测无失败项。
+==> Cleaning stale SunPack test artifacts
+
+==> Acceptance environment preflight
+Environment refresh required: - environment manifest is missing or does not match current sources/artifacts
+
+==> Environment preflight
+Requested architecture: x64
+Python/process architecture: x64
+
+==> Preparing local virtual environment
+Using CPython 3.10.11 interpreter at: C:\Users\29402\AppData\Local\Programs\Python\Python310\python.exe
+Removed virtual environment at: .venv
+Creating virtual environment at: .venv
+Resolved 19 packages in 0.90ms
+Installed 19 packages in 8.89s
+
+- cmake==4.4.2
+- colorama==0.4.6
+- exceptiongroup==1.3.1
+- execnet==2.1.2
+- iniconfig==2.3.0
+- maturin==1.14.1
+- nuitka==4.1.3
+- packaging==26.3
+- pluggy==1.6.0
+- psutil==7.2.2
+- pygments==2.21.0
+- pytest==9.1.1
+- pytest-xdist==3.8.0
+- send2trash==2.1.0
+- sunpack==1.0.0 (from file:///C:/Users/29402/Desktop/sunpack)
+- tomli==2.4.1
+- typing-extensions==4.16.0
+- watchdog==6.0.0
+- zstandard==0.25.0
+
+==> Building and installing Rust native extension
+warning: Skipping sunpack-native as it is not installed
+warning: No packages to uninstall
+cargo 1.94.1 (29ea6fb6a 2026-03-24)
+🐍 Found CPython 3.10 at C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe
+🔗 Found pyo3 bindings
+📡 Using build options bindings from pyproject.toml
+Compiling sunpack-native v0.0.0 (C:\Users\29402\Desktop\sunpack\native\sunpack_native)
+Finished `release` profile [optimized] target(s) in 55.18s
+📦 Built wheel for CPython 3.10 to C:\Users\29402\Desktop\sunpack\build\native-wheels-dev-x64\sunpack_native-0.0.0-cp310-cp310-win_amd64.whl
+Resolved 1 package in 8ms
+Prepared 1 package in 16ms
+Installed 1 package in 6ms
+
+- sunpack-native==0.0.0 (from file:///C:/Users/29402/Desktop/sunpack/build/native-wheels-dev-x64/sunpack_native-0.0.0-cp310-cp310-win_amd64.whl)
+
+==> Building minimal Windows Watch Broker service
+Finished `release` profile [optimized] target(s) in 0.02s
+Bundled 7-Zip files are already present.
+Acceptance archive generator tools are already present.
+
+==> Building embedded 7-Zip worker
+-- Using CMake version 4.4.2
+-- ZLIB_HEADER_VERSION: 1.3.1
+-- ZLIBNG_HEADER_VERSION: 2.3.3
+-- Arch detected: 'x86_64'
+-- Basearch of 'x86_64' has been detected as: 'x86'
+-- Architecture-specific source files: arch/x86/x86_features.c;arch/x86/chunkset_sse2.c;arch/x86/chorba_sse2.c;arch/x86/compare256_sse2.c;arch/x86/slide_hash_sse2.c;arch/x86/adler32_ssse3.c;arch/x86/chunkset_ssse3.c;arch/x86/chorba_sse41.c;arch/x86/adler32_sse42.c;arch/x86/crc32_pclmulqdq.c;arch/x86/slide_hash_avx2.c;arch/x86/chunkset_avx2.c;arch/x86/compare256_avx2.c;arch/x86/adler32_avx2.c;arch/x86/adler32_avx512.c;arch/x86/chunkset_avx512.c;arch/x86/compare256_avx512.c;arch/x86/adler32_avx512_vnni.c;arch/x86/crc32_vpclmulqdq.c
+-- The following features have been enabled:
+
+- XSAVE, Support XSAVE intrinsics using ""
+- SSSE3_ADLER32, Support SSSE3-accelerated adler32, using ""
+- SSE42_CRC, Support SSE4.2 optimized adler32 hash generation, using ""
+- PCLMUL_CRC, Support CRC hash generation using PCLMULQDQ, using " "
+- AVX2_SLIDEHASH, Support AVX2 optimized slide_hash, using "/arch:AVX2"
+- AVX2_CHUNKSET, Support AVX2 optimized chunkset, using "/arch:AVX2"
+- AVX2_COMPARE256, Support AVX2 optimized compare256, using "/arch:AVX2"
+- AVX2_ADLER32, Support AVX2-accelerated adler32, using "/arch:AVX2"
+- AVX512_ADLER32, Support AVX512-accelerated adler32, using "/arch:AVX512"
+- AVX512_CHUNKSET, Support AVX512 optimized chunkset, using "/arch:AVX512"
+- AVX512_COMPARE256, Support AVX512 optimized compare256, using "/arch:AVX512"
+- AVX512VNNI_ADLER32, Support AVX512VNNI adler32, using "/arch:AVX512"
+- VPCLMUL_CRC, Support CRC hash generation using VPCLMULQDQ, using " /arch:AVX512"
+- WITH_SANITIZER, Enable sanitizer testing support
+- WITH_OPTIM, Build with optimisation
+- WITH_NEW_STRATEGIES, Use new strategies
+- WITH_CRC32_CHORBA, Use optimized CRC32 algorithm Chorba
+- WITH_RUNTIME_CPU_DETECTION, Build with runtime CPU detection
+- WITH_SSE2, Build with SSE2
+- WITH_SSSE3, Build with SSSE3
+- WITH_SSE41, Build with SSE41
+- WITH_SSE42, Build with SSE42
+- WITH_PCLMULQDQ, Build with PCLMULQDQ
+- WITH_AVX2, Build with AVX2
+- WITH_AVX512, Build with AVX512
+- WITH_AVX512VNNI, Build with AVX512 VNNI
+- WITH_VPCLMULQDQ, Build with VPCLMULQDQ
+
+-- The following features have been disabled:
+
+- ZLIB_SYMBOL_PREFIX, Publicly exported symbols DO NOT have a custom prefix
+- WITH_GZFILEOP, Compile with support for gzFile related functions
+- ZLIB_COMPAT, Compile with zlib compatible API
+- ZLIB_ALIASES, Compile with zlib compatible CMake targets
+- BUILD_TESTING, Build test binaries
+- WITH_GTEST, Build tests using Gtest framework
+- WITH_FUZZERS, Build test/fuzz
+- WITH_BENCHMARKS, Build benchmarks using Google Benchmark framework
+- WITH_BENCHMARK_APPS, Build application benchmarks (currently libpng)
+- WITH_ALL_FALLBACKS, Build all generic fallback functions
+- WITH_NATIVE_INSTRUCTIONS, Instruct the compiler to use the full instruction set on this host (gcc/clang -march=native)
+- WITH_MAINTAINER_WARNINGS, Build with project maintainer warnings
+- WITH_CODE_COVERAGE, Enable code coverage reporting
+- WITH_INFLATE_STRICT, Build with strict inflate distance checking
+- WITH_INFLATE_ALLOW_INVALID_DIST, Build with zero fill for inflate invalid distances
+- INSTALL_UTILS, Copy minigzip and minideflate during install
+
+-- 7-Zip asm: enabled (x64 MASM) - LzmaDecOpt, 7zCrcOpt, XzCrc64Opt, AesOpt, Sha1Opt, Sha256Opt; Sort/LzFindOpt intentionally omitted
+-- Configuring done (0.1s)
+-- Generating done (0.2s)
+-- Build files have been written to: C:/Users/29402/Desktop/sunpack/native/sevenzip_bridge/build-x64
+适用于 .NET Framework MSBuild 版本 17.14.23+b0019275e
+
+Checking File Globs
+Assembling C:\Users\29402\Desktop\sunpack\native\sevenzip*bridge\7z2603-src\Asm\x86\LzmaDecOpt.asm...
+Assembling C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\7z2603-src\Asm\x86\7zCrcOpt.asm...
+Assembling C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\7z2603-src\Asm\x86\XzCrc64Opt.asm...
+Assembling C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\7z2603-src\Asm\x86\AesOpt.asm...
+Assembling C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\7z2603-src\Asm\x86\Sha1Opt.asm...
+Assembling C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\7z2603-src\Asm\x86\Sha256Opt.asm...
+sunpack_7zip_asm_objects.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\sunpack_7zip_asm*
+objects.dir\Release\sunpack_7zip_asm_objects.lib
+sunpack_7zip_objects.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\sunpack_7zip_objects.
+dir\Release\sunpack_7zip_objects.lib
+sunpack_launcher.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\sunpack_launcher.
+exe
+zlib-ng.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\zlib-ng\Release\zlibstatic-ng.lib
+sunpack_sevenzip_core.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\sunpack_seve
+nzip_core.lib
+async_output.cpp
+正在生成代码
+已完成代码的生成
+sunpack_sevenzip_async_output.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\sunp
+ack_sevenzip_async_output.exe
+正在生成代码
+已完成代码的生成
+sunpack_sevenzip_com_contract.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\sunp
+ack_sevenzip_com_contract.exe
+正在生成代码
+已完成代码的生成
+sunpack_sevenzip_smoke.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\sunpack_sev
+enzip_smoke.exe
+正在生成代码
+已完成代码的生成
+sunpack_sevenzip_space_gate.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\sunpac
+k_sevenzip_space_gate.exe
+正在生成代码
+已完成代码的生成
+sunpack_sevenzip_space_retry.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\sunpa
+ck_sevenzip_space_retry.exe
+正在生成代码
+已完成代码的生成
+sunpack_sevenzip_worker.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\sunpack_se
+venzip_worker.exe
+正在生成代码
+已完成代码的生成
+sunpack_sevenzip_writer_cost.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\sunpa
+ck_sevenzip_writer_cost.exe
+正在生成代码
+已完成代码的生成
+sunpack_zlib_ng_deflate_contract.vcxproj -> C:\Users\29402\Desktop\sunpack\native\sevenzip_bridge\build-x64\Release\s
+unpack_zlib_ng_deflate_contract.exe
+Test project C:/Users/29402/Desktop/sunpack/native/sevenzip_bridge/build-x64
+Start 1: sunpack_sevenzip_smoke
+1/6 Test #1: sunpack_sevenzip_smoke ............. Passed 0.01 sec
+Start 2: sunpack_sevenzip_async_output
+2/6 Test #2: sunpack_sevenzip_async_output ...... Passed 0.32 sec
+Start 3: sunpack_sevenzip_space_gate
+3/6 Test #3: sunpack_sevenzip_space_gate ........ Passed 0.28 sec
+Start 4: sunpack_sevenzip_space_retry
+4/6 Test #4: sunpack_sevenzip_space_retry ....... Passed 1.00 sec
+Start 5: sunpack_sevenzip_com_contract
+5/6 Test #5: sunpack_sevenzip_com_contract ...... Passed 0.01 sec
+Start 6: sunpack_zlib_ng_deflate_contract
+6/6 Test #6: sunpack_zlib_ng_deflate_contract ... Passed 0.01 sec
+
+100% tests passed out of 6
+
+Total Test time (real) = 1.64 sec
+7-Zip asm check passed: LzmaDec_DecodeReal_3 present in sunpack_sevenzip_worker.exe (1 match(es), 32 byte prologue).
+7-Zip asm check passed: LzmaDec_DecodeReal_3 present in sunpack_sevenzip_worker.exe (1 match(es), 32 byte prologue).
+
+==> Building in-process Windows toast library
+-- Configuring done (0.0s)
+-- Generating done (0.0s)
+-- Build files have been written to: C:/Users/29402/Desktop/sunpack/native/toast_host/build-x64
+适用于 .NET Framework MSBuild 版本 17.14.23+b0019275e
+
+sunpack_toast.vcxproj -> C:\Users\29402\Desktop\sunpack\native\toast_host\build-x64\Release\sunpack_toast.dll
+sunpack_toast_self_test.vcxproj -> C:\Users\29402\Desktop\sunpack\native\toast_host\build-x64\Release\sunpack_toast_s
+elf_test.exe
+Test project C:/Users/29402/Desktop/sunpack/native/toast_host/build-x64
+Start 1: sunpack_toast_self_test
+1/1 Test #1: sunpack_toast_self_test .......... Passed 0.05 sec
+
+100% tests passed out of 1
+
+Total Test time (real) = 0.05 sec
+
+==> Writing environment manifest
+
+==> Verifying local source execution
+用法: sunpack [-h] <command> [command options] [paths...]
+
+sunpack 命令行界面。
+
+位置参数:
+{extract,watch,scan,inspect,passwords,config,doctor,version}
+extract 执行预检查、扫描、解压和清理。
+watch 管理持久监控目录和后台监控服务。
+scan 只扫描候选归档，不修改文件系统。
+inspect 输出文件检测详情，不修改文件系统。
+passwords 查看当前会参与尝试的密码列表。
+config 查看或校验 SunPack 有效配置。
+doctor 检查当前 SunPack 安装是否具备正常运行的基本条件。
+version 输出当前安装的 SunPack 版本号。
+
+选项:
+-h, --help 显示此帮助信息并退出
+
+示例：
+sunpack extract C:\Archives
+sunpack inspect .\fixtures
+sunpack passwords --ask-pw
+pytest 9.1.1
+
+Local development environment is ready.
+Virtual env: C:\Users\29402\Desktop\sunpack\.venv
+Activate: C:\Users\29402\Desktop\sunpack\.venv\\Scripts\\Activate.ps1
+Acceptance generator tools are present and executable.
+
+==> Installing temporary Watch Broker service
+
+==> Parallel CLI, unit, and functional tests
+bringing up nodes...
+
+======================================================= ERRORS ========================================================
+**********\*\***********\_\_\_\_**********\*\*********** ERROR collecting gw6 **********\*\*\*\***********\_**********\*\*\*\***********
+Different tests were collected between gw1 and gw6. The difference is:
+--- gw1
+
++++ gw6
+
+@@ -530,7 +530,7 @@
+
+tests/unit/test_relations.py::test_standalone_zip_is_confirmed_by_relations
+tests/unit/test_relations.py::test_empty_zip_is_confirmed_by_relations
+tests/unit/test_relations.py::test_known_sfx_stub_is_confirmed_and_projected_as_file_range[7z\xbc\xaf'\x1c\x00\x04L\x06\xfce\x05\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x1b\xdf\x05\xa5abcde\x01-7-Zip SFX-7z]
+-tests/unit/test_relations.py::test_known_sfx_stub_is_confirmed_and_projected_as_file_range[PK\x03\x04\x14\x00\x00\x00\x00\x00\x07\x049]\x86\xa6\x106\x05\x00\x00\x00\x05\x00\x00\x00\n\x00\x00\x00inside.txthelloPK\x01\x02\x14\x00\x14\x00\x00\x00\x00\x00\x07\x049]\x86\xa6\x106\x05\x00\x00\x00\x05\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00inside.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x008\x00\x00\x00-\x00\x00\x00\x00\x00-7-Zip SFX-zip]
++tests/unit/test_relations.py::test_known_sfx_stub_is_confirmed_and_projected_as_file_range[PK\x03\x04\x14\x00\x00\x00\x00\x00\x08\x049]\x86\xa6\x106\x05\x00\x00\x00\x05\x00\x00\x00\n\x00\x00\x00inside.txthelloPK\x01\x02\x14\x00\x14\x00\x00\x00\x00\x00\x08\x049]\x86\xa6\x106\x05\x00\x00\x00\x05\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00inside.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x008\x00\x00\x00-\x00\x00\x00\x00\x00-7-Zip SFX-zip]
+tests/unit/test_relations.py::test_known_sfx_stub_is_confirmed_and_projected_as_file_range[Rar!\x1a\x07\x00\xcf\x90s\x00\x00\r\x00\x00\x00\x00\x00\x00\x00-WinRAR SFX-rar]
+tests/unit/test_relations.py::test_arbitrary_pe_zip_overlay_is_left_for_embedded_discovery
+tests/unit/test_relations.py::test_filename_numbered_7z_without_structural_seed_is_not_grouped
+To see why this happens see 'Known limitations' in documentation for pytest-xdist
+**********\*\***********\_\_\_\_**********\*\*********** ERROR collecting gw7 **********\*\*\*\***********\_**********\*\*\*\***********
+Different tests were collected between gw1 and gw7. The difference is:
+--- gw1
+
++++ gw7
+
+@@ -530,7 +530,7 @@
+
+tests/unit/test_relations.py::test_standalone_zip_is_confirmed_by_relations
+tests/unit/test_relations.py::test_empty_zip_is_confirmed_by_relations
+tests/unit/test_relations.py::test_known_sfx_stub_is_confirmed_and_projected_as_file_range[7z\xbc\xaf'\x1c\x00\x04L\x06\xfce\x05\x00\x00\x00\x00\x00\x00\x00\x01\x00\x00\x00\x00\x00\x00\x00\x1b\xdf\x05\xa5abcde\x01-7-Zip SFX-7z]
+-tests/unit/test_relations.py::test_known_sfx_stub_is_confirmed_and_projected_as_file_range[PK\x03\x04\x14\x00\x00\x00\x00\x00\x07\x049]\x86\xa6\x106\x05\x00\x00\x00\x05\x00\x00\x00\n\x00\x00\x00inside.txthelloPK\x01\x02\x14\x00\x14\x00\x00\x00\x00\x00\x07\x049]\x86\xa6\x106\x05\x00\x00\x00\x05\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00inside.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x008\x00\x00\x00-\x00\x00\x00\x00\x00-7-Zip SFX-zip]
++tests/unit/test_relations.py::test_known_sfx_stub_is_confirmed_and_projected_as_file_range[PK\x03\x04\x14\x00\x00\x00\x00\x00\x08\x049]\x86\xa6\x106\x05\x00\x00\x00\x05\x00\x00\x00\n\x00\x00\x00inside.txthelloPK\x01\x02\x14\x00\x14\x00\x00\x00\x00\x00\x08\x049]\x86\xa6\x106\x05\x00\x00\x00\x05\x00\x00\x00\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x80\x01\x00\x00\x00\x00inside.txtPK\x05\x06\x00\x00\x00\x00\x01\x00\x01\x008\x00\x00\x00-\x00\x00\x00\x00\x00-7-Zip SFX-zip]
+tests/unit/test_relations.py::test_known_sfx_stub_is_confirmed_and_projected_as_file_range[Rar!\x1a\x07\x00\xcf\x90s\x00\x00\r\x00\x00\x00\x00\x00\x00\x00-WinRAR SFX-rar]
+tests/unit/test_relations.py::test_arbitrary_pe_zip_overlay_is_left_for_embedded_discovery
+tests/unit/test_relations.py::test_filename_numbered_7z_without_structural_seed_is_not_grouped
+To see why this happens see 'Known limitations' in documentation for pytest-xdist
+=============================================== short test summary info ===============================================
+ERROR gw6 - Different tests were collected between gw1 and gw6. The difference is:
+ERROR gw7 - Different tests were collected between gw1 and gw7. The difference is:
+2 errors in 2.27s
+FAIL - pytest JUnit report contains 2 failure(s) or error(s)
+FAIL (2.66s)
+Command: C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe -m pytest -q -n 8 --dist worksteal tests/cli tests/unit tests/functional --durations=20
+
+==> Parallel integration and real tests
+bringing up nodes...
+.................................................................................F.............................. [ 32%]
+...............................F.....F.........F........................F....................................... [ 64%]
+............................................................................................................s... [ 96%]
+.....F..F.. [100%]
+====================================================== FAILURES =======================================================
+******\*\*******\_\_\_******\*\******* test_real_archive_edge_corrupted_sfx_archives_fail[7z] ******\*\*******\_\_\_\_******\*\*******
+[gw0] win32 -- Python 3.10.11 C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe
+
+tmp_path = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_corrupt0')
+archive_format = '7z'
+
+    @pytest.mark.parametrize("archive_format", sfx_format_params())
+    def test_real_archive_edge_corrupted_sfx_archives_fail(tmp_path, archive_format):
+        require_7z()
+        case = FACTORY.create(tmp_path, f"corrupted_sfx_{archive_format}", archive_format, sfx=True, corruption="truncate")
+
+>       assert_failure_contains(case, {"压缩包损坏", "致命错误"})
+
+tests\integration\test_real_archive_edge_cases.py:194:
+
+---
+
+case = ArchiveCase(case_id='corrupted_sfx_7z', archive_dir=WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pyt...6ddc454295d8e5'}}, 'payload_profile': 'default', 'compression_method': None, 'compression_level': None, 'solid': None})
+expected_options = {'压缩包损坏', '致命错误'}, passwords = None, allow_best_effort_outputs = False
+
+    def assert_failure_contains(
+        case: ArchiveCase,
+        expected_options: set[str],
+        passwords: list[str] | None = None,
+        *,
+        allow_best_effort_outputs: bool = False,
+    ):
+        summary = run_pipeline(case.archive_dir, passwords=passwords)
+
+        assert summary.success_count == 0
+
+>       assert summary.failed_tasks
+>
+> E assert []
+> E + where [] = RunSummary(target_results=(), scan_failed_tasks=(), scan_failures=(), policy_skips=(), cleanup_results=(), postprocess_completed=True).failed_tasks
+
+tests\integration\test_real_archive_edge_cases.py:114: AssertionError
+------------------------------------------------ Captured stdout call -------------------------------------------------
+[扫描中] 正在查找压缩包…
+[扫描完成] 发现 0 个待处理压缩包
+
+[清理] 任务完成，配置为保留成功解压的原压缩包。
+[清理] 没有需要清理的压缩包。
+
+## 处理完成
+
+耗时：0 秒
+完整成功：0 部分恢复：0 失败：0
+所有压缩包均已处理成功。
+
+---
+
+\***\*\_\_\_\_\*\*** test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[jpg-rar] **\*\***\_**\*\***
+[gw0] win32 -- Python 3.10.11 C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe
+
+tmp_path = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_prefixe7')
+carrier = 'jpg', archive_format = 'rar'
+
+    @pytest.mark.parametrize(("carrier", "archive_format"), carrier_archive_case_params())
+    def test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password(tmp_path, carrier, archive_format):
+        require_7z()
+        case = FACTORY.create(tmp_path, f"pwd_prefixed_{carrier}_{archive_format}", archive_format, password=PASSWORD, carrier=carrier)
+
+>       assert_wrong_password_then_success(
+
+            case,
+            tmp_path / "runs",
+            tmp_path / "runs-out",
+        )
+
+tests\integration\test_real_archive_edge_cases.py:210:
+
+---
+
+case = ArchiveCase(case_id='pwd_prefixed_jpg_rar', archive_dir=WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402...2c80e6c9ad0a5d'}}, 'payload_profile': 'default', 'compression_method': None, 'compression_level': None, 'solid': None})
+run_root = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_prefixe7/runs')
+output_root = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_prefixe7/runs-out')
+
+    def assert_wrong_password_then_success(
+        case: ArchiveCase,
+        run_root: Path,
+        output_root: Path,
+    ) -> None:
+        """Attempt without the password, then with it, in isolated workspaces."""
+        without_password = run_pipeline_in_fresh_workspace(
+            case, run_root / "without-password", output_root / "without-password"
+        )
+
+        assert without_password.success_count == 0
+
+>       assert without_password.failed_tasks
+>
+> E assert []
+> E + where [] = RunSummary(target_results=(), scan_failed_tasks=(), scan_failures=(), policy_skips=(), cleanup_results=(), postprocess_completed=True).failed_tasks
+
+tests\integration\test_real_archive_edge_cases.py:135: AssertionError
+------------------------------------------------ Captured stdout call -------------------------------------------------
+[扫描中] 正在查找压缩包…
+[扫描完成] 发现 0 个待处理压缩包
+
+[清理] 任务完成，配置为保留成功解压的原压缩包。
+[清理] 没有需要清理的压缩包。
+
+## 处理完成
+
+耗时：0 秒
+完整成功：0 部分恢复：0 失败：0
+所有压缩包均已处理成功。
+
+---
+
+\***\*\_\_\_\_\*\*** test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[png-rar] **\*\***\_**\*\***
+[gw0] win32 -- Python 3.10.11 C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe
+
+tmp_path = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_prefixe8')
+carrier = 'png', archive_format = 'rar'
+
+    @pytest.mark.parametrize(("carrier", "archive_format"), carrier_archive_case_params())
+    def test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password(tmp_path, carrier, archive_format):
+        require_7z()
+        case = FACTORY.create(tmp_path, f"pwd_prefixed_{carrier}_{archive_format}", archive_format, password=PASSWORD, carrier=carrier)
+
+>       assert_wrong_password_then_success(
+
+            case,
+            tmp_path / "runs",
+            tmp_path / "runs-out",
+        )
+
+tests\integration\test_real_archive_edge_cases.py:210:
+
+---
+
+case = ArchiveCase(case_id='pwd_prefixed_png_rar', archive_dir=WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402...9f12770b156fff'}}, 'payload_profile': 'default', 'compression_method': None, 'compression_level': None, 'solid': None})
+run_root = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_prefixe8/runs')
+output_root = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_prefixe8/runs-out')
+
+    def assert_wrong_password_then_success(
+        case: ArchiveCase,
+        run_root: Path,
+        output_root: Path,
+    ) -> None:
+        """Attempt without the password, then with it, in isolated workspaces."""
+        without_password = run_pipeline_in_fresh_workspace(
+            case, run_root / "without-password", output_root / "without-password"
+        )
+
+        assert without_password.success_count == 0
+
+>       assert without_password.failed_tasks
+>
+> E assert []
+> E + where [] = RunSummary(target_results=(), scan_failed_tasks=(), scan_failures=(), policy_skips=(), cleanup_results=(), postprocess_completed=True).failed_tasks
+
+tests\integration\test_real_archive_edge_cases.py:135: AssertionError
+------------------------------------------------ Captured stdout call -------------------------------------------------
+[扫描中] 正在查找压缩包…
+[扫描完成] 发现 0 个待处理压缩包
+
+[清理] 任务完成，配置为保留成功解压的原压缩包。
+[清理] 没有需要清理的压缩包。
+
+## 处理完成
+
+耗时：0 秒
+完整成功：0 部分恢复：0 失败：0
+所有压缩包均已处理成功。
+
+---
+
+\***\*\_\_\_\_\*\*** test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[gif-rar] **\*\***\_**\*\***
+[gw0] win32 -- Python 3.10.11 C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe
+
+tmp_path = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_prefixe9')
+carrier = 'gif', archive_format = 'rar'
+
+    @pytest.mark.parametrize(("carrier", "archive_format"), carrier_archive_case_params())
+    def test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password(tmp_path, carrier, archive_format):
+        require_7z()
+        case = FACTORY.create(tmp_path, f"pwd_prefixed_{carrier}_{archive_format}", archive_format, password=PASSWORD, carrier=carrier)
+
+>       assert_wrong_password_then_success(
+
+            case,
+            tmp_path / "runs",
+            tmp_path / "runs-out",
+        )
+
+tests\integration\test_real_archive_edge_cases.py:210:
+
+---
+
+case = ArchiveCase(case_id='pwd_prefixed_gif_rar', archive_dir=WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402...540d2b8529e309'}}, 'payload_profile': 'default', 'compression_method': None, 'compression_level': None, 'solid': None})
+run_root = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_prefixe9/runs')
+output_root = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw0/test_real_archive_edge_prefixe9/runs-out')
+
+    def assert_wrong_password_then_success(
+        case: ArchiveCase,
+        run_root: Path,
+        output_root: Path,
+    ) -> None:
+        """Attempt without the password, then with it, in isolated workspaces."""
+        without_password = run_pipeline_in_fresh_workspace(
+            case, run_root / "without-password", output_root / "without-password"
+        )
+
+        assert without_password.success_count == 0
+
+>       assert without_password.failed_tasks
+>
+> E assert []
+> E + where [] = RunSummary(target_results=(), scan_failed_tasks=(), scan_failures=(), policy_skips=(), cleanup_results=(), postprocess_completed=True).failed_tasks
+
+tests\integration\test_real_archive_edge_cases.py:135: AssertionError
+------------------------------------------------ Captured stdout call -------------------------------------------------
+[扫描中] 正在查找压缩包…
+[扫描完成] 发现 0 个待处理压缩包
+
+[清理] 任务完成，配置为保留成功解压的原压缩包。
+[清理] 没有需要清理的压缩包。
+
+## 处理完成
+
+耗时：0 秒
+完整成功：0 部分恢复：0 失败：0
+所有压缩包均已处理成功。
+
+---
+
+******\*\*\*\*******\_******\*\*\*\******* test_plan5_mixed_file_scans_as_single_archive_task ******\*\*\*\*******\_\_******\*\*\*\*******
+[gw6] win32 -- Python 3.10.11 C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe
+
+tmp_path = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw6/test_plan5_mixed_file_scans_as0')
+plan5_error = {'case_id': 'plan5_mixed', 'file_name': 'plan5_embedded.bin', 'segment_count': 13, 'segments': [{'position': 0, 'forma..., 'encrypted': False, ...}, {'position': 5, 'format': 'bzip2', 'variant': 'bzip2', 'encrypted': False, ...}, ...], ...}
+
+    def test_plan5_mixed_file_scans_as_single_archive_task(tmp_path, plan5_error):
+        """扫描层：整个混合文件必须恰好成为一个待处理压缩包任务。"""
+        case = build_embedded_mixed_case(tmp_path, error_info=plan5_error)
+        plan5_error["case_id"] = case.case_id
+        plan5_error["file_name"] = case.file_path.name
+        plan5_error["segment_count"] = len(case.segments)
+        plan5_error["segments"] = _segment_table(case)
+        plan5_error["skipped_formats"] = list(case.skipped_formats)
+
+>       assert_plan5_single_task_scan(case, error_info=plan5_error)
+
+tests\real\plan5_embedded_archives\test_plan5_embedded_detection.py:39:
+
+---
+
+case = EmbeddedMixedCase(case_id='plan5_mixed', file_path=WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pyte...0de814f458a45a40a1df'), (348, '07228a375f65eb67fe1ce727cd9d1d7ad986e5c6b30f3fa3e160bf2530abe45b')), skipped_formats=())
+error_info = {'case_id': 'plan5_mixed', 'file_name': 'plan5_embedded.bin', 'segment_count': 13, 'segments': [{'position': 0, 'forma..., 'encrypted': False, ...}, {'position': 5, 'format': 'bzip2', 'variant': 'bzip2', 'encrypted': False, ...}, ...], ...}
+
+    def assert_plan5_single_task_scan(
+        case: EmbeddedMixedCase,
+        *,
+        error_info: dict[str, Any] | None = None,
+    ) -> None:
+        """整个混合文件在扫描阶段必须恰好成为一个待处理任务。"""
+        from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+        from tests.real.plan1_real_archives.plan1_support import plan1_config
+
+        provider = ArchiveTaskProvider(plan1_config())
+        tasks = provider.scan_targets([str(case.file_path.parent)])
+        expected = os.path.normcase(os.path.abspath(str(case.file_path)))
+        actual = [os.path.normcase(os.path.abspath(str(task.main_path))) for task in tasks]
+        if error_info is not None:
+            error_info["scan_task_count"] = len(tasks)
+            error_info["scan_task_paths"] = actual
+            error_info["expected_task_path"] = expected
+
+>       assert actual == [expected], (
+
+            f"expected exactly one scan task for the mixed file, got {actual}"
+        )
+
+E AssertionError: expected exactly one scan task for the mixed file, got []
+
+tests\real\plan5_embedded_archives\plan5_support.py:539: AssertionError
+******\*\*******\_\_\_******\*\******* test_plan5_wrong_passwords_extract_plain_segments_only ******\*\*******\_\_\_\_******\*\*******
+[gw4] win32 -- Python 3.10.11 C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe
+
+tmp_path = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw4/test_plan5_wrong_passwords_ext0')
+plan5_error = {'case_id': 'plan5_mixed', 'file_size': 139380, 'segment_count': 13, 'segments': [{'position': 0, 'format': 'zip', 'va..., 'encrypted': False, ...}, {'position': 5, 'format': 'bzip2', 'variant': 'bzip2', 'encrypted': False, ...}, ...], ...}
+
+    def test_plan5_wrong_passwords_extract_plain_segments_only(tmp_path, plan5_error):
+        """密码全错时：加密段必须失败并报密码错误，非加密段仍应解出。"""
+        case = build_embedded_mixed_case(tmp_path, error_info=plan5_error)
+        plan5_error["case_id"] = case.case_id
+        plan5_error["file_size"] = case.file_path.stat().st_size
+        plan5_error["segment_count"] = len(case.segments)
+        plan5_error["segments"] = _segment_table(case)
+        plan5_error["skipped_formats"] = list(case.skipped_formats)
+
+>       assert_plan5_wrong_password_partial(case, error_info=plan5_error)
+
+tests\real\plan5_embedded_archives\test_plan5_wrong_password_partial.py:19:
+
+---
+
+case = EmbeddedMixedCase(case_id='plan5_mixed', file_path=WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pyte...0de814f458a45a40a1df'), (348, '07228a375f65eb67fe1ce727cd9d1d7ad986e5c6b30f3fa3e160bf2530abe45b')), skipped_formats=())
+error_info = {'case_id': 'plan5_mixed', 'file_size': 139380, 'segment_count': 13, 'segments': [{'position': 0, 'format': 'zip', 'va..., 'encrypted': False, ...}, {'position': 5, 'format': 'bzip2', 'variant': 'bzip2', 'encrypted': False, ...}, ...], ...}
+
+    def assert_plan5_wrong_password_partial(
+        case: EmbeddedMixedCase,
+        *,
+        error_info: dict[str, Any] | None = None,
+    ) -> None:
+        """全错密码下：加密段必须失败并报密码错误，非加密段仍应解出。"""
+        wrong = [f"wrong-{index:03d}-plan5" for index in range(20)]
+        summary = run_plan1_pipeline(case.file_path, passwords=wrong)
+        marker_status = _marker_status(case, case.file_path.parent)
+        plain_extracted = [
+            item for item in marker_status
+            if not item["encrypted"] and item["marker_extracted"]
+        ]
+        encrypted_leaked = [
+            item for item in marker_status
+            if item["encrypted"] and item["marker_extracted"]
+        ]
+        if error_info is not None:
+            error_info.update({
+                "password_list_size": len(wrong),
+                "pipeline_success_count": summary.success_count,
+                "pipeline_partial_success_count": summary.partial_success_count,
+                "pipeline_failed_tasks": [str(item) for item in summary.failed_tasks],
+                "failure_kinds": [str(failure.kind) for failure in summary.failures],
+                "password_failure_reported": any(
+                    failure.is_password_failure for failure in summary.failures
+                ),
+                "marker_status": marker_status,
+            })
+
+>       assert summary.failed_tasks, "all-wrong passwords must leave failed tasks"
+>
+> E AssertionError: all-wrong passwords must leave failed tasks
+
+tests\real\plan5_embedded_archives\plan5_support.py:719: AssertionError
+------------------------------------------------ Captured stdout call -------------------------------------------------
+[扫描中] 正在查找压缩包…
+[扫描完成] 发现 0 个待处理压缩包
+
+[清理] 任务完成，配置为保留成功解压的原压缩包。
+[清理] 没有需要清理的压缩包。
+
+## 处理完成
+
+耗时：0 秒
+完整成功：0 部分恢复：0 失败：0
+所有压缩包均已处理成功。
+
+---
+
+******\*\*******\_\_******\*\******* test_plan5_large_file_extracts_128_real_embedded_archives ******\*\*******\_\_******\*\*******
+[gw6] win32 -- Python 3.10.11 C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe
+
+tmp_path = WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/pytest-0/popen-gw6/test_plan5_large_file_extracts0')
+plan5_error = {'case_id': 'plan5_large_128', 'file_name': 'plan5_large_128.bin', 'file_size': 186765, 'segment_count': 128, ...}
+
+    def test_plan5_large_file_extracts_128_real_embedded_archives(tmp_path, plan5_error):
+        """一个文件中循环嵌入 128 个真实归档，给正确密码后全部可见地解出。"""
+        case = build_large_embedded_case(
+            tmp_path,
+            count=LARGE_SEGMENT_COUNT,
+            error_info=plan5_error,
+        )
+        plan5_error["case_id"] = case.case_id
+        plan5_error["file_name"] = case.file_path.name
+        plan5_error["file_size"] = case.file_path.stat().st_size
+        plan5_error["segment_count"] = len(case.segments)
+        plan5_error["format_counts"] = dict(Counter(segment.archive_format for segment in case.segments))
+        plan5_error["segments"] = _segment_table(case)
+
+        assert len(case.segments) == LARGE_SEGMENT_COUNT
+
+>       assert_plan5_success(
+
+            case,
+            passwords=[case.password],
+            error_info=plan5_error,
+        )
+
+tests\real\plan5_embedded_archives\test_plan5_large_embedded.py:28:
+
+---
+
+case = EmbeddedMixedCase(case_id='plan5_large_128', file_path=WindowsPath('C:/Users/29402/AppData/Local/Temp/pytest-of-29402/...11be7df1a8a371ee8ad9f'), (26, 'b9ba19aac4b052e3b8ce5dc697a2025417d023a6e0cc1afb5180fefa87927796')), skipped_formats=())
+passwords = ['sunpack-plan5-acceptance']
+error_info = {'case_id': 'plan5_large_128', 'file_name': 'plan5_large_128.bin', 'file_size': 186765, 'segment_count': 128, ...}
+detailed_diagnostics = False
+
+    def assert_plan5_success(
+        case: EmbeddedMixedCase,
+        *,
+        passwords: list[str] | None = None,
+        error_info: dict[str, Any] | None = None,
+        detailed_diagnostics: bool = False,
+    ) -> None:
+        """第 5 条主断言：给出正确密码后，所有嵌入压缩段分别解压成功。"""
+        effective = list(passwords) if passwords is not None else [case.password]
+        diagnostics = (
+            error_info.setdefault("diagnostics", {})
+            if error_info is not None and detailed_diagnostics
+            else None
+        )
+        if diagnostics is not None:
+            diagnostics["environment"] = environment_snapshot()
+            diagnostics["case"] = {
+                **case_snapshot(case),
+                "file_path": str(case.file_path),
+                "file_size": case.file_path.stat().st_size,
+                "segment_count": len(case.segments),
+            }
+            diagnostics["passwords"] = password_summary(effective)
+            diagnostics["input_before_pipeline"] = snapshot_path(case.file_path.parent)
+            try:
+                native_scan = scan_embedded_archives(
+                    str(case.file_path),
+                    expected_size=case.file_path.stat().st_size,
+                )
+                expected = {
+                    (segment.archive_format, segment.offset): segment.variant
+                    for segment in case.segments
+                }
+                diagnostics["native_scan_before_pipeline"] = {
+                    "candidate_count": len(native_scan.candidates),
+                    "candidates": [
+                        {
+                            "format": candidate.format,
+                            "offset": candidate.offset,
+                            "end_offset": candidate.end_offset,
+                            "confidence": candidate.confidence,
+                            "validation": candidate.validation,
+                        }
+                        for candidate in native_scan.candidates
+                    ],
+                    "expected_segments": [
+                        {
+                            "format": archive_format,
+                            "offset": offset,
+                            "variant": variant,
+                        }
+                        for (archive_format, offset), variant in expected.items()
+                    ],
+                    "missing_expected_segments": [
+                        {
+                            "format": archive_format,
+                            "offset": offset,
+                            "variant": variant,
+                        }
+                        for (archive_format, offset), variant in expected.items()
+                        if not any(
+                            candidate.format == archive_format
+                            and candidate.offset == offset
+                            for candidate in native_scan.candidates
+                        )
+                    ],
+                }
+            except BaseException as exc:
+                record_exception(error_info, "native_scan_before_pipeline", exc)
+                raise
+
+        summary = None
+        try:
+            summary = run_plan1_pipeline(case.file_path, passwords=effective)
+        except BaseException as exc:
+            if diagnostics is not None:
+                record_exception(error_info, "pipeline", exc)
+                pipeline_snapshot(
+                    error_info,
+                    phase="pipeline_exception",
+                    roots=(case.file_path.parent,),
+                )
+            raise
+
+        if diagnostics is not None:
+            pipeline_snapshot(
+                error_info,
+                phase="pipeline_returned",
+                summary=summary,
+                roots=(case.file_path.parent,),
+            )
+
+        try:
+            marker_status = _marker_status(
+                case,
+                case.file_path.parent,
+                include_locations=detailed_diagnostics,
+            )
+        except BaseException as exc:
+            if diagnostics is not None:
+                record_exception(error_info, "marker_scan", exc)
+                pipeline_snapshot(
+                    error_info,
+                    phase="marker_scan_exception",
+                    summary=summary,
+                    roots=(case.file_path.parent,),
+                )
+            raise
+
+        missing_markers = [
+            item
+            for item in marker_status
+            if not item["marker_extracted"]
+        ]
+        if error_info is not None:
+            error_info.update({
+                "password_list": effective,
+                "pipeline_success_count": summary.success_count,
+                "pipeline_partial_success_count": summary.partial_success_count,
+                "pipeline_failed_tasks": [str(item) for item in summary.failed_tasks],
+                "failure_kinds": [str(failure.kind) for failure in summary.failures],
+                "marker_status": marker_status,
+            })
+            if diagnostics is not None:
+                diagnostics["marker_status"] = marker_status
+                pipeline_snapshot(
+                    error_info,
+                    phase="before_assertions",
+                    summary=summary,
+                    roots=(case.file_path.parent,),
+                )
+        assert summary.failed_tasks == [], (
+            f"pipeline reported failures: {[str(item) for item in summary.failed_tasks]}"
+        )
+        # Recursive extraction reports independently successful nested archives as
+        # additional successes.  The user-visible contract here is that the
+        # carrier succeeds and every marker is present, not a fixed task count.
+        assert summary.success_count >= 1, (
+            f"expected at least the carrier success, got {summary.success_count}"
+        )
+
+>       assert not missing_markers, (
+
+            f"markers missing for segments: "
+            f"{[(item['position'], item['variant']) for item in missing_markers]}"
+        )
+
+E AssertionError: markers missing for segments: [(21, 'tar-gzip-021'), (22, 'tar-bzip2-022'), (23, 'tar-xz-023'), (24, 'tar-zstd-024'), (55, 'tar-gzip-055'), (56, 'tar-bzip2-056'), (57, 'tar-xz-057'), (58, 'tar-zstd-058'), (89, 'tar-gzip-089'), (90, 'tar-bzip2-090'), (91, 'tar-xz-091'), (92, 'tar-zstd-092'), (123, 'tar-gzip-123'), (124, 'tar-bzip2-124'), (125, 'tar-xz-125'), (126, 'tar-zstd-126')]
+
+tests\real\plan5_embedded_archives\plan5_support.py:684: AssertionError
+------------------------------------------------ Captured stdout call -------------------------------------------------
+[扫描中] 正在查找压缩包…
+[扫描完成] 发现 1 个待处理压缩包
+[处理中 0/1] plan5_large_128.bin
+
+[EXTRACT] 开始 embedded segments: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin (128 segments)
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [--------------------] 0% plan5_large_128.bin
+[ 正在解压 ] [###-----------------] 19% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[ 正在解压 ] [####################] 100% plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+
+[EXTRACT] 开始: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[EXTRACT] embedded segments 成功: C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin
+[成功 1/1] plan5_large_128.bin
+
+[清理] 任务完成，配置为保留成功解压的原压缩包。
+[递归扫描] 正在检查第 2 层…
+[递归扫描] 第 2 层发现 0 个嵌套压缩包
+
+[清理] 任务完成，配置为保留成功解压的原压缩包。
+[清理] 没有需要清理的压缩包。
+
+## 处理完成
+
+耗时：4 秒
+完整成功：1 部分恢复：0 失败：0
+输出位置：C:\Users\29402\AppData\Local\Temp\pytest-of-29402\pytest-0\popen-gw6\test_plan5_large_file_extracts0\plan5_large_mixed\plan5_large_128.bin_01_zip
+所有压缩包均已处理成功。
+
+---
+
+================================================ slowest 20 durations =================================================
+12.95s call tests/real/plan5_embedded_archives/test_plan5_large_embedded.py::test_plan5_large_file_extracts_128_real_embedded_archives
+6.03s call tests/real/plan7_watch_downloads/test_plan7_plain_and_sfx_downloads.py::test_plan7_plain_and_sfx_downloads_complete_and_record_memory
+5.76s call tests/integration/test_structure_volume_resolution.py::test_encrypted_plain_and_sfx_volume_matrix_with_shared_stem_and_noisy_suffixes
+5.13s call tests/real/plan7_watch_downloads/test_plan7_split_downloads.py::test_plan7_split_downloads_out_of_order_complete_and_record_memory
+3.83s call tests/real/plan7_watch_downloads/test_plan7_nested_extreme_failures.py::test_plan7_nested_inner_unknown_password_watch_is_password_blocked
+3.48s setup tests/integration/test_structure_volume_resolution.py::test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable
+2.63s call tests/real/plan3_wrong_passwords/test_plan3_plain_wrong_passwords.py::test_plan3_encrypted_7z_reports_password_error[header-off]
+2.12s call tests/real/plan7_watch_downloads/test_plan7_arrival_orders.py::test_plan7_rar_part1_exe_enters_pipeline_as_real_head_before_family_complete
+1.89s call tests/integration/test_structure_volume_resolution.py::test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline
+1.88s call tests/real/plan2_encrypted_archives/test_plan2_plain_encrypted.py::test_plan2_encrypted_7z_find_correct_password[header-off]
+1.88s call tests/real/plan7_watch_downloads/test_plan7_embedded.py::test_plan7_single_format_embedded_downloads_react_for_7z_zip_and_rar
+1.83s call tests/real/plan7_watch_downloads/test_plan7_disguised.py::test_plan7_disguised_extensions_and_carrier_prefixes_react
+1.69s call tests/integration/test_structure_volume_resolution.py::test_structure_resolution_recomputes_a_residual_middle_gap
+1.65s call tests/integration/test_structure_volume_resolution.py::test_modern_split_zip_with_camouflaged_names_runs_full_pipeline
+1.50s call tests/real/plan7_watch_downloads/test_plan7_cleanup.py::test_plan7_sfx_split_success_cleans_unique_validated_launcher
+1.49s call tests/real/plan7_watch_downloads/test_plan7_variants.py::test_plan7_encryption_and_container_variants_are_processed
+1.40s call tests/real/plan7_watch_downloads/test_plan7_lifecycle.py::test_plan7_replacement_and_reappearance_are_processed
+1.35s call tests/real/plan5_embedded_archives/test_plan5_embedded_detection.py::test_plan5_mixed_file_scans_as_single_archive_task
+1.34s call tests/integration/test_watch_rar_hp_encryption.py::test_watch_split_hp_rar_recovers_after_wrong_then_correct_password
+1.32s call tests/real/plan7_watch_downloads/test_plan7_download_modes.py::test_plan7_interleaved_downloads_react_for_every_final_path
+=============================================== short test summary info ===============================================
+FAILED tests/integration/test_real_archive_edge_cases.py::test_real_archive_edge_corrupted_sfx_archives_fail[7z] - assert []
+FAILED tests/integration/test_real_archive_edge_cases.py::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[jpg-rar] - assert []
+FAILED tests/integration/test_real_archive_edge_cases.py::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[png-rar] - assert []
+FAILED tests/integration/test_real_archive_edge_cases.py::test_real_archive_edge_prefixed_password_carrier_archives_require_matching_password[gif-rar] - assert []
+FAILED tests/real/plan5_embedded_archives/test_plan5_embedded_detection.py::test_plan5_mixed_file_scans_as_single_archive_task - AssertionError: expected exactly one scan task for the mixed file, got []
+FAILED tests/real/plan5_embedded_archives/test_plan5_wrong_password_partial.py::test_plan5_wrong_passwords_extract_plain_segments_only - AssertionError: all-wrong passwords must leave failed tasks
+FAILED tests/real/plan5_embedded_archives/test_plan5_large_embedded.py::test_plan5_large_file_extracts_128_real_embedded_archives - AssertionError: markers missing for segments: [(21, 'tar-gzip-021'), (22, 'tar-bzip2-022'), (23, 'tar-xz-023'), (24...
+7 failed, 339 passed, 1 skipped in 26.26s
+FAIL - pytest JUnit report contains 7 failure(s) or error(s)
+FAIL (26.54s)
+Command: C:\Users\29402\Desktop\sunpack\.venv\Scripts\python.exe -m pytest -q -n 8 --dist worksteal tests/integration tests/real --ignore tests/integration/test_disk_full_pause_resume.py --durations=20
+
+==> Parallel administrator VHD disk-full tests
+bringing up nodes...
+ssssssss [100%]
+================================================ slowest 20 durations =================================================
+
+(16 durations < 0.005s hidden. Use -vv to show these durations.)
+8 skipped in 0.85s
+PASS (1.12s)
+
+==> CLI help smoke test
+PASS (0.30s)
+
+==> CLI passwords smoke test
+PASS (0.40s)
+
+==> CLI scan smoke test
+PASS (0.19s)
+
+==> CLI inspect smoke test
+PASS (0.19s)
+
+==> CLI config smoke test
+PASS (0.21s)
+
+==> Stopping source persistent runtime
+
+==> Uninstalling temporary Watch Broker service
+
+Summary
+FAIL Parallel CLI, unit, and functional tests 2.66s (exit 1)
+FAIL Parallel integration and real tests 26.54s (exit 1)
+PASS Parallel administrator VHD disk-full tests 1.12s
+PASS CLI help smoke test 0.30s
+PASS CLI passwords smoke test 0.40s
+PASS CLI scan smoke test 0.19s
+PASS CLI inspect smoke test 0.19s
+PASS CLI config smoke test 0.21s
+
+2 acceptance test step(s) failed; all scheduled steps have completed.
+
+2 acceptance test step(s) failed. Press Enter to exit...
