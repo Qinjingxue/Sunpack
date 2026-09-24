@@ -88,7 +88,7 @@ def test_plan7_launcher_first_then_data_volumes_reacts_after_group_completion(
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
-def test_plan7_data_volumes_before_launcher_do_not_resubmit(
+def test_plan7_data_volumes_before_launcher_routes_new_launcher_through_pipeline(
     tmp_path, archive_format
 ):
     case = _build_case(tmp_path, archive_format)
@@ -110,10 +110,22 @@ def test_plan7_data_volumes_before_launcher_do_not_resubmit(
         submissions_before_launcher = len(harness.submission_events)
 
         arrive_slowly(harness, launcher)
-        for _ in range(3):
-            harness.watcher.run_once()
+        drive_watch_until(
+            harness.watcher,
+            lambda: marker_text_extracted(
+                harness.output_root,
+                case.marker_name,
+                case.marker_text,
+            ),
+        )
         later_submissions = harness.submission_events[submissions_before_launcher:]
-        assert not later_submissions
+        assert later_submissions
+        assert any(
+            any(Path(path).name == launcher.name for path in event.paths)
+            for event in later_submissions
+        )
+        assert not harness.watcher.state.entries
+        assert len(list(harness.output_root.rglob(case.marker_name))) == 1
     finally:
         harness.close()
 
