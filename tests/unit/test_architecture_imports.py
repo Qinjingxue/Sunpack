@@ -93,3 +93,32 @@ def test_removed_migration_adapters_do_not_return() -> None:
             if token in source:
                 violations.append(f"{path}: retired adapter token {token}")
     assert not violations, "\n".join(violations)
+
+
+def test_archive_state_has_one_input_representation() -> None:
+    from sunpack.core.contracts.archive_state import ArchiveState
+    from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+
+    descriptor = ArchiveInputDescriptor(entry_path="sample.zip", format_hint="zip")
+    state = ArchiveState.from_archive_input(descriptor)
+    assert state.archive_input is descriptor
+    assert not hasattr(state, "source")
+    assert not hasattr(state, "knowledge")
+    assert not hasattr(state, "verification")
+    assert not hasattr(state, "format_hint")
+    assert not hasattr(state, "logical_name")
+
+
+def test_removed_descriptor_views_do_not_return() -> None:
+    from sunpack.core.contracts import archive_input as contracts
+
+    for name in (
+        "ArchiveDescriptor",
+        "ArchiveFormatState",
+        "ArchiveRelationState",
+        "ArchiveLayoutState",
+        "ArchiveIntegrityState",
+        "ArchiveSecurityState",
+        "ArchiveRuntimeState",
+    ):
+        assert not hasattr(contracts, name)
