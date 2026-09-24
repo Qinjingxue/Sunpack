@@ -43,7 +43,6 @@ from sunpack.core.contracts.verification import (
     CONTENT_INTEGRITY_VERIFIED_PARTIAL,
     VERIFICATION_STRENGTH_CRC,
     VERIFICATION_STRENGTH_MANIFEST,
-    VERIFICATION_STRENGTH_ORACLE,
 )
 from sunpack.core.support.path_keys import absolute_path_key
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
@@ -690,7 +689,7 @@ def _proves_content_loss(result: ExtractionResult, verification: VerificationRes
         content_integrity
         in {CONTENT_INTEGRITY_VERIFIED_PARTIAL, CONTENT_INTEGRITY_PAYLOAD_DAMAGED}
         and strength
-        in {VERIFICATION_STRENGTH_MANIFEST, VERIFICATION_STRENGTH_CRC, VERIFICATION_STRENGTH_ORACLE}
+        in {VERIFICATION_STRENGTH_MANIFEST, VERIFICATION_STRENGTH_CRC}
     )
 
 

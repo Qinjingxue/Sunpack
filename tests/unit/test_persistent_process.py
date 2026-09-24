@@ -413,7 +413,7 @@ def test_protocol_incrementally_parses_a_fragmented_request(monkeypatch):
         cwd = b"C:\\work"
         argv = [b"scan", b"archive.zip"]
         wire = bytearray(persistent_process._REQUEST_MAGIC)
-        wire.extend(persistent_process._RUNTIME_BUILD_ID)
+        wire.extend(persistent_process._runtime_binary_build_id())
         wire.extend(token)
         wire.extend(struct.pack("!III", 6, len(cwd), len(argv)))
         wire.extend(cwd)
@@ -436,7 +436,7 @@ def test_protocol_incrementally_parses_a_fragmented_request(monkeypatch):
     }
     assert wire == (
         persistent_process._STREAM_MAGIC
-        + persistent_process._RUNTIME_BUILD_ID
+        + persistent_process._runtime_binary_build_id()
         + struct.pack("!BIi", 0, 4, 9)
     )
     assert completed == [True]
@@ -470,7 +470,7 @@ def test_protocol_rejects_a_different_runtime_build_id():
 
         transport = Transport()
         protocol.connection_made(transport)
-        build = b"X" * len(persistent_process._RUNTIME_BUILD_ID)
+        build = b"X" * len(persistent_process._runtime_binary_build_id())
         protocol.data_received(
             persistent_process._REQUEST_MAGIC + build + token + struct.pack("!III", 0, 0, 0)
         )

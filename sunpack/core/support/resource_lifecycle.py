@@ -1371,11 +1371,6 @@ def task_walk(
         yield top_path, directories, files
 
 
-def read_task_bytes(path: os.PathLike[str] | str) -> bytes:
-    with open_task_file(path, "rb") as handle:
-        return handle.read()
-
-
 def write_task_bytes(path: os.PathLike[str] | str, data: bytes) -> int:
     with open_task_file(path, "wb") as handle:
         return int(handle.write(data))

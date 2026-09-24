@@ -47,6 +47,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_stats, m)?)?;
     m.add_function(wrap_pyfunction!(io::reader::reader_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(io::reader::clear_reader_resources, m)?)?;
+    m.add_function(wrap_pyfunction!(io::runtime_binary::runtime_binary_build_id, m)?)?;
     m.add_function(wrap_pyfunction!(
         io::resource_lifecycle::native_resource_snapshot,
         m

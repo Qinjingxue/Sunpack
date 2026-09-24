@@ -4,6 +4,7 @@ import asyncio
 import os
 import struct
 import sys
+import threading
 import time
 from typing import Any, Callable
 
@@ -28,19 +29,25 @@ _STREAM_MAGIC = b"SPS2"
 
 
 def _runtime_binary_build_id() -> bytes:
-    value = 0xCBF29CE484222325
-    try:
-        with open_service_file(current_process_executable(), "rb") as stream:
-            while chunk := stream.read(1024 * 1024):
-                for byte in chunk:
-                    value ^= byte
-                    value = (value * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
-    except OSError:
-        return b"0000000000000000"
-    return f"{value:016x}".encode("ascii")
+    global _RUNTIME_BUILD_ID
+    build_id = _RUNTIME_BUILD_ID
+    if build_id is not None:
+        return build_id
+    with _RUNTIME_BUILD_ID_LOCK:
+        build_id = _RUNTIME_BUILD_ID
+        if build_id is None:
+            from sunpack_native import runtime_binary_build_id
+
+            try:
+                build_id = runtime_binary_build_id(os.fspath(current_process_executable())).encode("ascii")
+            except OSError:
+                build_id = b"0000000000000000"
+            _RUNTIME_BUILD_ID = build_id
+    return build_id
 
 
-_RUNTIME_BUILD_ID = _runtime_binary_build_id()
+_RUNTIME_BUILD_ID_LOCK = threading.Lock()
+_RUNTIME_BUILD_ID: bytes | None = None
 
 
 def _runtime_binary_stamp() -> str:
@@ -323,7 +330,7 @@ def _read_state() -> tuple[str, bytes] | None:
     if (
         len(token) != 32
         or not pipe.startswith(_PIPE_PREFIX)
-        or build_id != _RUNTIME_BUILD_ID.decode("ascii")
+        or build_id != _runtime_binary_build_id().decode("ascii")
         or binary_stamp != _RUNTIME_BINARY_STAMP
     ):
         return None
@@ -353,11 +360,12 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
         flags = ((1 if payload.get("shutdown") else 0)
                  | (2 if payload.get("stdout_tty") else 0)
                  | (4 if payload.get("stdin_tty") else 0))
-        body = [_RUNTIME_BUILD_ID, token, struct.pack("!III", flags, len(cwd), len(argv)), cwd]
+        build_id = _runtime_binary_build_id()
+        body = [build_id, token, struct.pack("!III", flags, len(cwd), len(argv)), cwd]
         for item in argv:
             body.extend((struct.pack("!I", len(item)), item))
         connection.sendall(_REQUEST_MAGIC + b"".join(body))
-        if _recv_exact(connection, 4) != _STREAM_MAGIC or _recv_exact(connection, len(_RUNTIME_BUILD_ID)) != _RUNTIME_BUILD_ID:
+        if _recv_exact(connection, 4) != _STREAM_MAGIC or _recv_exact(connection, len(build_id)) != build_id:
             return None
         return _recv_stream(connection)
     except (EOFError, OSError, ValueError):
@@ -448,14 +456,15 @@ class _PipeRequestProtocol(asyncio.Protocol):
 
     def _parse_request(self) -> dict[str, Any] | None:
         if self._stage == "header":
-            header_size = 4 + len(_RUNTIME_BUILD_ID) + len(self._token) + 12
+            build_id = _runtime_binary_build_id()
+            header_size = 4 + len(build_id) + len(self._token) + 12
             if len(self._buffer) < header_size:
                 return None
             if bytes(self._buffer[:4]) != _REQUEST_MAGIC:
                 raise ValueError("invalid persistent request magic")
             build_start = 4
-            build_end = build_start + len(_RUNTIME_BUILD_ID)
-            if bytes(self._buffer[build_start:build_end]) != _RUNTIME_BUILD_ID:
+            build_end = build_start + len(build_id)
+            if bytes(self._buffer[build_start:build_end]) != build_id:
                 raise ValueError("invalid persistent runtime build id")
             token_start = build_end
             token_end = token_start + len(self._token)
@@ -549,7 +558,7 @@ class _PipeRequestProtocol(asyncio.Protocol):
                     command=str(argv[0] if argv else ""),
                     queue_ms=max(0.0, (started_at - self._connected_at) * 1000.0),
                 )
-            await self.send_frame(_STREAM_MAGIC + _RUNTIME_BUILD_ID)
+            await self.send_frame(_STREAM_MAGIC + _runtime_binary_build_id())
             if payload.get("shutdown"):
                 await self.send_frame(struct.pack("!BIi", 0, 4, 0))
                 await self.flush_output()
@@ -835,9 +844,10 @@ def _recv_exact(connection, size: int) -> bytes:
 
 
 def _recv_request(connection, token: bytes) -> dict[str, Any] | None:
+    build_id = _runtime_binary_build_id()
     if (
         _recv_exact(connection, 4) != _REQUEST_MAGIC
-        or _recv_exact(connection, len(_RUNTIME_BUILD_ID)) != _RUNTIME_BUILD_ID
+        or _recv_exact(connection, len(build_id)) != build_id
         or _recv_exact(connection, len(token)) != token
     ):
         return None
@@ -1025,7 +1035,7 @@ def _write_state(name: str, token: bytes) -> None:
     temporary = f"{path}.{os.getpid()}.tmp"
     with open_service_file(temporary, "w", encoding="ascii", newline="\n") as stream:
         stream.write(
-            f"{name}\n{token.hex()}\n{_RUNTIME_BUILD_ID.decode('ascii')}\n"
+            f"{name}\n{token.hex()}\n{_runtime_binary_build_id().decode('ascii')}\n"
             f"{os.getpid()}\n{_RUNTIME_BINARY_STAMP}\n"
         )
     os.replace(temporary, path)
@@ -1039,7 +1049,7 @@ def _remove_state_if_owned(name: str, token: bytes) -> bool:
         if (
             state_name != name
             or bytes.fromhex(token_hex) != token
-            or build_id != _RUNTIME_BUILD_ID.decode("ascii")
+            or build_id != _runtime_binary_build_id().decode("ascii")
             or int(pid_text) != os.getpid()
             or binary_stamp != _RUNTIME_BINARY_STAMP
         ):

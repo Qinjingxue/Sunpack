@@ -31,7 +31,6 @@ from sunpack.core.contracts.verification import (
     VERIFICATION_STRENGTH_EXTRACTION,
     VERIFICATION_STRENGTH_MANIFEST,
     VERIFICATION_STRENGTH_NONE,
-    VERIFICATION_STRENGTH_ORACLE,
     ArchiveCoverage,
     FileVerificationObservation,
     VerificationIssue,
@@ -309,7 +308,6 @@ def aggregate_payload_verifications(
         VERIFICATION_STRENGTH_EXTRACTION: 1,
         VERIFICATION_STRENGTH_MANIFEST: 2,
         VERIFICATION_STRENGTH_CRC: 3,
-        VERIFICATION_STRENGTH_ORACLE: 4,
     }
     verification_strength = min(
         (result.verification_strength for result in results),
@@ -505,7 +503,6 @@ def _aggregate_content_integrity(steps: list[VerificationStep]) -> str:
         "extraction_success": 1,
         "manifest": 2,
         "crc": 3,
-        "oracle": 4,
     }
     strongest = max(strength_order.get(step.verification_strength, 0) for step in relevant)
     strongest_hints = {
@@ -538,7 +535,6 @@ def _aggregate_verification_strength(values: list[str]) -> str:
         "extraction_success": 1,
         "manifest": 2,
         "crc": 3,
-        "oracle": 4,
     }
     return max(values or [VERIFICATION_STRENGTH_NONE], key=lambda item: order.get(str(item), 0))
 
