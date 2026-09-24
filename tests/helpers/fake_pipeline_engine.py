@@ -73,7 +73,7 @@ class FakePipelineEngine:
             summary.cleanup_results = []
         self._recent_passwords = list(getattr(runner, "recent_passwords", ()) or ())
         context = getattr(runner, "context", SimpleNamespace(flatten_candidates=()))
-        recovered_outputs = getattr(context, "recovered_outputs", ()) or ()
+        recovered_outputs = getattr(summary, "recovered_outputs", ()) or ()
         generated_outputs = [
             str(item.get("out_dir") or "")
             for item in recovered_outputs
