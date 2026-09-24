@@ -4,7 +4,6 @@ from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
 
-from sunpack.core.contracts.archive_state import ArchiveState
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.extraction import ExtractionResult
@@ -17,7 +16,7 @@ from sunpack.core.support.resource_lifecycle import read_task_text
 class VerificationEvidence:
     task: ArchiveTask
     extraction_result: ExtractionResult
-    archive_state: ArchiveState
+    archive_input: ArchiveInputDescriptor
     password: str | None
     analysis_facts: dict[str, Any] = field(default_factory=dict)
     extraction_diagnostics: dict[str, Any] = field(default_factory=dict)
@@ -27,15 +26,15 @@ class VerificationEvidence:
 
     @property
     def archive_path(self) -> str:
-        return self.archive_state.to_archive_input_descriptor().entry_path
+        return self.archive_input.entry_path
 
     @property
     def output_dir(self) -> str:
         return self.extraction_result.out_dir
 
     @property
-    def archive_state_analysis(self) -> dict[str, Any]:
-        return dict(self.archive_state.planning_analysis)
+    def archive_input_analysis(self) -> dict[str, Any]:
+        return dict(self.archive_input.analysis)
 
     @property
     def selected_codepage(self) -> str | None:
@@ -56,18 +55,17 @@ def build_verification_evidence(
             password = password_session.get_resolved(task.key)
         if password is None:
             password = knowledge_view.archive_password(task)
-    with _phase(phase_timer, f"{phase_prefix}_archive_state"):
-        archive_state = task.archive_state()
+    with _phase(phase_timer, f"{phase_prefix}_archive_input"):
+        archive_input = task.archive_input()
         extraction_diagnostics = dict(extraction_result.diagnostics or {})
         verification_input = extraction_diagnostics.get("verification_archive_input")
         if isinstance(verification_input, dict):
             try:
-                descriptor = ArchiveInputDescriptor.from_any(
+                archive_input = ArchiveInputDescriptor.from_any(
                     verification_input,
                     archive_path=task.main_path,
                     part_paths=list(task.all_parts or [task.main_path]),
                 )
-                archive_state = ArchiveState.from_archive_input(descriptor)
             except (TypeError, ValueError, AttributeError):
                 pass
     with _phase(phase_timer, f"{phase_prefix}_analysis_facts"):
@@ -80,7 +78,7 @@ def build_verification_evidence(
     return VerificationEvidence(
         task=task,
         extraction_result=extraction_result,
-        archive_state=archive_state,
+        archive_input=archive_input,
         password=password,
         analysis_facts=analysis_facts,
         extraction_diagnostics=extraction_diagnostics,

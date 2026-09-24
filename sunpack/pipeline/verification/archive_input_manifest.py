@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from dataclasses import replace
 from typing import Any
 
-from sunpack.core.contracts.archive_state import ArchiveState
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 STATUS_OK = 0
 STATUS_WRONG_PASSWORD = 1
 STATUS_DAMAGED = 2
@@ -18,7 +18,7 @@ from sunpack_native import (
 
 
 @dataclass(frozen=True)
-class ArchiveStateManifest:
+class ArchiveInputManifest:
     status: int
     is_archive: bool
     damaged: bool
@@ -28,8 +28,8 @@ class ArchiveStateManifest:
     files: list[dict[str, Any]] = field(default_factory=list)
     message: str = ""
     archive_type: str = ""
-    source: str = "archive_state"
-    state_aware: bool = True
+    source: str = "archive_input"
+    input_aware: bool = True
     archive_walk_complete: bool = False
     verified_item_count: int = 0
     entries_truncated: bool = False
@@ -60,18 +60,18 @@ class ArchiveStateManifest:
         return sum(1 for item in self.files if not bool(item.get("shadowed")))
 
 
-_EVIDENCE_CACHE_ATTRIBUTE = "_archive_state_manifest_full_cache"
-_EVIDENCE_LIMIT_ATTRIBUTE = "_archive_state_manifest_full_max_items"
+_EVIDENCE_CACHE_ATTRIBUTE = "_archive_input_manifest_full_cache"
+_EVIDENCE_LIMIT_ATTRIBUTE = "_archive_input_manifest_full_max_items"
 
 
-def configure_archive_state_manifest_cache(evidence, *, max_items: int) -> None:
+def configure_archive_input_manifest_cache(evidence, *, max_items: int) -> None:
     """Declare the largest manifest view needed during this verification run."""
     requested = max(0, int(max_items or 0))
     current = max(0, int(getattr(evidence, _EVIDENCE_LIMIT_ATTRIBUTE, 0) or 0))
     object.__setattr__(evidence, _EVIDENCE_LIMIT_ATTRIBUTE, max(current, requested))
 
 
-def archive_state_manifest_for_evidence(evidence, *, max_items: int = 200000) -> ArchiveStateManifest:
+def archive_input_manifest_for_evidence(evidence, *, max_items: int = 200000) -> ArchiveInputManifest:
     requested = max(0, int(max_items or 0))
     codepage = str(evidence.selected_codepage or "")
     identity = _evidence_manifest_identity(evidence, codepage)
@@ -81,17 +81,17 @@ def archive_state_manifest_for_evidence(evidence, *, max_items: int = 200000) ->
     if not (
         isinstance(cached, dict)
         and cached.get("identity") == identity
-        and isinstance(cached.get("manifest"), ArchiveStateManifest)
+        and isinstance(cached.get("manifest"), ArchiveInputManifest)
         and int(cached.get("max_items", -1)) >= full_limit
     ):
-        hint = _format_hint(evidence.archive_state)
+        hint = _format_hint(evidence.archive_input)
         # TAR needs a source-side walk.  A worker manifest only proves that the
         # range it was handed extracted successfully; it cannot prove that an
         # incorrectly planned suffix range covered the source archive.
         full_manifest = None if hint == "tar" else _worker_verified_manifest(evidence)
         if full_manifest is None:
-            full_manifest = archive_state_manifest(
-                evidence.archive_state,
+            full_manifest = archive_input_manifest(
+                evidence.archive_input,
                 max_items=full_limit,
                 password=evidence.password,
                 codepage=codepage or None,
@@ -105,7 +105,7 @@ def archive_state_manifest_for_evidence(evidence, *, max_items: int = 200000) ->
     return _manifest_view(cached["manifest"], requested)
 
 
-def _worker_verified_manifest(evidence) -> ArchiveStateManifest | None:
+def _worker_verified_manifest(evidence) -> ArchiveInputManifest | None:
     result = evidence.worker_result if isinstance(evidence.worker_result, dict) else {}
     payload = result.get("verified_manifest") if isinstance(result.get("verified_manifest"), dict) else {}
     from sunpack.pipeline.extraction.output_inventory import OutputInventory
@@ -121,7 +121,7 @@ def _worker_verified_manifest(evidence) -> ArchiveStateManifest | None:
         or any(str(item.get("status") or "") != "complete" for item in files)
     ):
         return None
-    return ArchiveStateManifest(
+    return ArchiveInputManifest(
         status=STATUS_OK,
         is_archive=True,
         damaged=False,
@@ -132,7 +132,7 @@ def _worker_verified_manifest(evidence) -> ArchiveStateManifest | None:
         message="Archive payload was verified during extraction",
         archive_type=str(result.get("archive_type") or ""),
         source=str(payload.get("source") or "sevenzip_worker_extract"),
-        state_aware=True,
+        input_aware=True,
         archive_walk_complete=True,
         verified_item_count=int(payload.get("item_count", len(files)) or 0),
         entries_truncated=False,
@@ -140,8 +140,7 @@ def _worker_verified_manifest(evidence) -> ArchiveStateManifest | None:
 
 
 def _evidence_manifest_identity(evidence, codepage: str) -> tuple:
-    state = evidence.archive_state
-    source = state.archive_input
+    source = evidence.archive_input
     return (
         repr(source.to_dict()),
         str(evidence.password or ""),
@@ -149,7 +148,7 @@ def _evidence_manifest_identity(evidence, codepage: str) -> tuple:
     )
 
 
-def _manifest_view(manifest: ArchiveStateManifest, max_items: int) -> ArchiveStateManifest:
+def _manifest_view(manifest: ArchiveInputManifest, max_items: int) -> ArchiveInputManifest:
     limit = max(0, int(max_items or 0))
     if len(manifest.files) <= limit:
         return manifest
@@ -157,47 +156,47 @@ def _manifest_view(manifest: ArchiveStateManifest, max_items: int) -> ArchiveSta
     return replace(manifest, files=files, entries_truncated=True)
 
 
-def archive_state_manifest(
-    state: ArchiveState,
+def archive_input_manifest(
+    archive_input: ArchiveInputDescriptor,
     *,
     max_items: int = 200000,
     password: str | None = None,
     codepage: str | None = None,
-) -> ArchiveStateManifest:
-    hint = _format_hint(state)
+) -> ArchiveInputManifest:
+    hint = _format_hint(archive_input)
     if hint == "tar":
-        return _tar_archive_state_manifest(state, max_items=max_items)
+        return _tar_archive_input_manifest(archive_input, max_items=max_items)
     if hint and hint != "zip":
-        return ArchiveStateManifest(
+        return ArchiveInputManifest(
             status=STATUS_UNSUPPORTED,
             is_archive=False,
             damaged=False,
             checksum_error=False,
             item_count=0,
             file_count=0,
-            message=f"Archive-state manifest is not implemented for format: {hint}",
+            message=f"Archive-input manifest is not implemented for format: {hint}",
             archive_type=hint,
         )
 
     try:
         payload = dict(_native_archive_state_zip_manifest(
-            state.archive_input.to_dict(),
+            archive_input.to_dict(),
             max_items,
             password,
             codepage,
         ))
     except (OSError, ValueError) as exc:
-        return ArchiveStateManifest(
+        return ArchiveInputManifest(
             status=STATUS_UNSUPPORTED,
             is_archive=False,
             damaged=False,
             checksum_error=False,
             item_count=0,
             file_count=0,
-            message=f"Archive state cannot be opened as a verification byte view: {exc}",
+            message=f"Archive input cannot be opened as a verification byte view: {exc}",
         )
     if not bool(payload.get("is_archive")) and not hint:
-        return ArchiveStateManifest(
+        return ArchiveInputManifest(
             status=STATUS_UNSUPPORTED,
             is_archive=False,
             damaged=False,
@@ -208,7 +207,7 @@ def archive_state_manifest(
         )
     files = [dict(item) for item in payload.get("files") or [] if isinstance(item, dict)]
     file_count = int(payload.get("file_count", 0) or 0)
-    return ArchiveStateManifest(
+    return ArchiveInputManifest(
         status=int(payload["status"]) if payload.get("status") is not None else STATUS_DAMAGED,
         is_archive=bool(payload.get("is_archive", False)),
         damaged=bool(payload.get("damaged", False)),
@@ -219,7 +218,7 @@ def archive_state_manifest(
         message=str(payload.get("message") or ""),
         archive_type=str(payload.get("archive_type") or "zip"),
         source=str(payload.get("source") or "archive_state_native"),
-        state_aware=bool(payload.get("state_aware", True)),
+        input_aware=bool(payload.get("state_aware", True)),
         archive_walk_complete=(int(payload["status"]) if payload.get("status") is not None else STATUS_DAMAGED) == STATUS_OK,
         verified_item_count=(
             int(payload.get("item_count", 0) or 0)
@@ -231,22 +230,22 @@ def archive_state_manifest(
     )
 
 
-def _format_hint(state: ArchiveState) -> str:
-    return str(state.archive_input.format_hint or "").strip().lower().lstrip(".")
+def _format_hint(archive_input: ArchiveInputDescriptor) -> str:
+    return str(archive_input.format_hint or "").strip().lower().lstrip(".")
 
 
-def _tar_archive_state_manifest(
-    state: ArchiveState,
+def _tar_archive_input_manifest(
+    archive_input: ArchiveInputDescriptor,
     *,
     max_items: int,
-) -> ArchiveStateManifest:
+) -> ArchiveInputManifest:
     try:
         payload = dict(_native_archive_state_tar_manifest(
             state.archive_input.to_dict(),
             max_items,
         ))
     except (OSError, ValueError) as exc:
-        return ArchiveStateManifest(
+        return ArchiveInputManifest(
             status=STATUS_UNSUPPORTED, is_archive=False, damaged=False, checksum_error=False,
             item_count=0, file_count=0, message=f"TAR state could not be read: {exc}",
             archive_type="tar",
@@ -257,7 +256,7 @@ def _tar_archive_state_manifest(
     )
     damaged = bool(payload.get("damaged", False))
     file_count = int(payload.get("file_count", 0) or 0)
-    return ArchiveStateManifest(
+    return ArchiveInputManifest(
         status=status,
         is_archive=bool(payload.get("is_archive", False)),
         damaged=damaged,
