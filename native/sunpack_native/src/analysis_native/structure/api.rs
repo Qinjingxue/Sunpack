@@ -823,6 +823,16 @@ pub(crate) fn inspect_tar_header_structure(
             "tar"
         },
     )?;
+    if max_entries_to_walk == 0 {
+        result.set_item("validation_scope", "format_identity")?;
+        result.set_item("identity_strong", true)?;
+        result.set_item("entries_checked", 0usize)?;
+        result.set_item("entry_walk_ok", false)?;
+        result.set_item("end_zero_blocks", false)?;
+        result.set_item("damage_flags", PyList::empty(py))?;
+        finish_fields(&result, TAR_FIELDS)?;
+        return Ok(result.unbind());
+    }
     let walk = match walk_tar(&mut file, start_offset, archive_end, max_entries_to_walk) {
         Ok(walk) => walk,
         Err(fault) => {
@@ -887,6 +897,14 @@ pub(crate) fn unified_prefilter_mask_from_head(file_size: u64, head: &[u8]) -> u
         rejected |= UNIFIED_PREFILTER_TAR;
     }
     rejected
+}
+
+#[pyfunction]
+pub(crate) fn inspect_compression_stream_identity(
+    py: Python<'_>,
+    path: &str,
+) -> PyResult<Py<PyDict>> {
+    inspect_compression_stream_identity_impl(py, path)
 }
 
 #[pyfunction]

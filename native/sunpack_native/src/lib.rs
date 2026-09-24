@@ -198,6 +198,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
+        analysis_native::inspect_compression_stream_identity,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         analysis_native::inspect_compression_stream_structure,
         m
     )?)?;

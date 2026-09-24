@@ -55,6 +55,7 @@ def test_small_zip_tail_is_read_past_the_initial_prefix(tmp_path):
     assert evidence.structurally_confirmed
     assert evidence.format == "zip"
     assert evidence.standalone is True
+    assert evidence.bytes_read <= 512 + 22
     assert {"first", "terminal", "standalone"} <= set(evidence.anchor_roles)
 
 

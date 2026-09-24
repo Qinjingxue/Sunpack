@@ -4,7 +4,6 @@ use crate::analysis_native::volume_anchor::{
 };
 use crate::analysis_native::{
     probe_rar_path, probe_rar_terminal_with_password, probe_rar_volume_paths,
-    probe_zip_volume_paths,
 };
 use crate::scan::directory::NativeDirectorySnapshot;
 use crate::scan::executable_carrier::executable_sfx_stub_profile;
@@ -1487,20 +1486,6 @@ fn validate_rar_proposal(
     }
 }
 
-fn proposal_password<'a>(
-    proposal: &RelationProposal,
-    path_passwords: Option<&'a [(String, String)]>,
-) -> Option<&'a str> {
-    let path_passwords = path_passwords?;
-    path_passwords.iter().find_map(|(path, password)| {
-        proposal
-            .volumes
-            .iter()
-            .any(|(volume_path, _, _, _, _)| volume_path.eq_ignore_ascii_case(path))
-            .then_some(password.as_str())
-    })
-}
-
 fn validate_seven_zip_proposal(
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
@@ -1549,7 +1534,7 @@ fn validate_seven_zip_proposal(
 }
 
 fn validate_zip_proposal(
-    py: Python<'_>,
+    _py: Python<'_>,
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
 ) -> PyResult<ProposalStatus> {
@@ -1570,6 +1555,7 @@ fn validate_zip_proposal(
             Ok(ProposalStatus::Reject)
         };
     }
+
     let terminal_paths: Vec<&String> = proposal
         .volumes
         .iter()
@@ -1586,13 +1572,14 @@ fn validate_zip_proposal(
     let terminal = anchors
         .get(&terminal_paths[0].to_ascii_lowercase())
         .expect("terminal path was collected from anchor map");
-    let highest = proposal.volumes.iter().map(|(_, number, _, _, _)| *number).max().unwrap_or(0);
+    let highest = proposal
+        .volumes
+        .iter()
+        .map(|(_, number, _, _, _)| *number)
+        .max()
+        .unwrap_or(0);
+
     if proposal.style == "zip_spanned" {
-        // PKZIP multidisk files commonly begin with a local header and set
-        // the continuation bit; other producers put the explicit split
-        // marker before that local header.  Both are canonical zero-offset
-        // native-spanning starts.  The terminal EOCD/disk proof below is
-        // still mandatory.
         let first_is_spanned = first.evidence.iter().any(|item| *item == "zip:split_marker")
             || (first.evidence.iter().any(|item| *item == "zip:local_header")
                 && first.multivolume
@@ -1618,56 +1605,10 @@ fn validate_zip_proposal(
         }
     }
 
-    // A raw `.zip.001` family is a logical concatenation, not a ZIP
-    // multi-disk archive.  Re-run the canonical Rust ZIP view over the
-    // concatenated volumes so the EOCD, central directory and every sampled
-    // local-header link are proven against the same byte stream.  Spanned
-    // ZIPs have their own disk-number proof above and intentionally remain on
-    // that path because the strict single-disk ZIP view rejects multi-disk
-    // EOCDs by design.
-    if proposal.style != "zip_spanned" {
-        let ordered_paths: Vec<String> = proposal
-            .volumes
-            .iter()
-            .map(|(path, _, _, _, _)| path.clone())
-            .collect();
-        let Some(raw) = (match probe_zip_volume_paths(py, &ordered_paths, 4096) {
-            Ok(result) => result,
-            Err(_) => return Ok(ProposalStatus::Inconclusive),
-        }) else {
-            return Ok(ProposalStatus::Inconclusive);
-        };
-        let raw = raw.bind(py);
-        let plausible = raw
-            .get_item("plausible")?
-            .and_then(|value| value.extract::<bool>().ok())
-            .unwrap_or(false);
-        let archive_starts_at_expected_offset = raw
-            .get_item("archive_offset")?
-            .and_then(|value| value.extract::<u64>().ok())
-            .unwrap_or(u64::MAX)
-            == first.structure_offset.unwrap_or(0);
-        let central_directory_walk_ok = raw
-            .get_item("central_directory_walk_ok")?
-            .and_then(|value| value.extract::<bool>().ok())
-            .unwrap_or(false);
-        let local_header_links_ok = raw
-            .get_item("local_header_links_ok")?
-            .and_then(|value| value.extract::<bool>().ok())
-            .unwrap_or(false);
-        let error = raw
-            .get_item("error")?
-            .and_then(|value| value.extract::<String>().ok())
-            .unwrap_or_default();
-        if !plausible
-            || !archive_starts_at_expected_offset
-            || !central_directory_walk_ok
-            || !local_header_links_ok
-            || !error.is_empty()
-        {
-            return Ok(ProposalStatus::Inconclusive);
-        }
-    }
+    // The bounded first-header + terminal-EOCD anchors are independent strong
+    // evidence for the split relation. Do not concatenate the family and walk
+    // the whole central directory/local links a second time; Open/Extract is
+    // the canonical completeness and damage parser.
     Ok(ProposalStatus::Valid)
 }
 

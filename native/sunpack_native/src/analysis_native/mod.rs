@@ -3,7 +3,7 @@ pub(crate) mod view;
 pub(crate) mod volume_anchor;
 
 pub(crate) use structure::{
-    inspect_compression_stream_structure, inspect_rar_structure, inspect_seven_zip_structure,
+    inspect_compression_stream_identity, inspect_compression_stream_structure, inspect_rar_structure, inspect_seven_zip_structure,
     inspect_tar_header_structure, inspect_zip_directory_consistency,
     inspect_zip_eocd_structure,
     inspect_zip_local_header, inspect_zip_structure_graph,
