@@ -2,7 +2,7 @@ from tests.helpers.archive_tasks import make_archive_task
 from tests.real.diagnostics import task_snapshot
 
 
-def test_task_snapshot_uses_typed_archive_state_and_knowledge(tmp_path):
+def test_task_snapshot_uses_typed_archive_input_and_knowledge(tmp_path):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"zip")
     task = make_archive_task(
@@ -27,7 +27,7 @@ def test_task_snapshot_uses_typed_archive_state_and_knowledge(tmp_path):
     assert snapshot["format"] == "zip"
     assert snapshot["discovery_source"] == "relations"
     assert snapshot["archive_input"]["format_hint"] == "zip"
-    assert snapshot["archive_state"]["format_hint"] == "zip"
+    assert "archive_state" not in snapshot
     assert snapshot["knowledge"]["format"]["zip"]["structure"]["password_required"] is False
     assert snapshot["runtime"]["diagnostic.marker"] == "extractable"
     assert "facts" not in snapshot
