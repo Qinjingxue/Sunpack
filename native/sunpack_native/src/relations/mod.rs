@@ -580,6 +580,30 @@ fn seed_strength_for_row(
     name_index: &DirectoryNameIndex,
 ) -> Option<&'static str> {
     let anchor = row.anchor.as_ref()?;
+
+    // A physically byte-split RAR SFX can still carry a single-archive RAR
+    // header in its first chunk.  That header's standalone bit describes the
+    // logical RAR stream, not whether this physical file contains the whole
+    // stream.  Allow only a structurally confirmed, numbered SFX head with
+    // matching numbered siblings to reach the existing proposal validator.
+    // No extra probe is performed here; this uses only facts already present
+    // in the directory snapshot and anchor.
+    let raw_sfx_split_seed = anchor.format == "rar"
+        && anchor.confidence == "strong"
+        && anchor.sfx
+        && anchor.pe_structure
+        && anchor.standalone
+        && anchor.structure_offset.is_some_and(|offset| offset > 0)
+        && name_index.candidates(row).iter().any(|candidate| {
+            candidate.number == 1
+                && candidate.family == "rar"
+                && candidate.style == "rar_sfx_part"
+        })
+        && strong_seed_related_paths(row, rows, name_index, anchor).len() >= 2;
+    if raw_sfx_split_seed {
+        return Some("strong");
+    }
+
     let strength = cheap_seed_strength(anchor)?;
     if strength == "weak"
         && anchor.format == "rar"
@@ -2997,6 +3021,44 @@ mod tests {
         };
         let index = DirectoryNameIndex::build(std::slice::from_ref(&row));
         assert!(is_weak_sfx_split_head(&row, &index));
+    }
+
+    #[test]
+    fn structurally_confirmed_raw_rar_sfx_head_can_seed_numbered_siblings() {
+        let first_path = r"C:\watch\shared.bundle.exe.part1.useless.fake".to_string();
+        let second_path = r"C:\watch\shared.bundle.rar.part2.useless.fake".to_string();
+        let rows = vec![
+            RelationInput {
+                path: first_path.clone(),
+                path_key: first_path.to_ascii_lowercase(),
+                name: "shared.bundle.exe.part1.useless.fake".to_string(),
+                size: Some(1024),
+                relation_member_eligible: true,
+                anchor: Some(VolumeAnchor {
+                    format: "rar".to_string(),
+                    confidence: "strong".to_string(),
+                    standalone: true,
+                    structure_offset: Some(256),
+                    sfx: true,
+                    pe_structure: true,
+                    ..VolumeAnchor::default()
+                }),
+            },
+            RelationInput {
+                path: second_path.clone(),
+                path_key: second_path.to_ascii_lowercase(),
+                name: "shared.bundle.rar.part2.useless.fake".to_string(),
+                size: Some(1024),
+                relation_member_eligible: true,
+                anchor: None,
+            },
+        ];
+        let index = DirectoryNameIndex::build(&rows);
+
+        assert_eq!(
+            seed_strength_for_row(&rows[0], &rows, &index),
+            Some("strong")
+        );
     }
 
     #[test]
