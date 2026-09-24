@@ -22,22 +22,11 @@ struct ArchiveOpenPlan {
     bool uses_ranges() const { return !ranges.empty(); }
 };
 
-std::vector<ArchiveOpenPlan> embedded_archive_open_plans(
-    const std::wstring& archive_path,
-    const std::vector<std::wstring>& part_paths
-);
-
-std::vector<ArchiveOpenPlan> embedded_seven_zip_open_plans(
-    const std::wstring& archive_path,
-    const std::vector<std::wstring>& part_paths
-);
-
 std::vector<ArchiveOpenPlan> password_test_open_plans(
     const std::wstring& archive_path,
-    const std::vector<std::wstring>& part_paths,
     const std::vector<GUID>& formats,
     const std::vector<ExtractInputRange>& input_ranges,
-    bool format_hint_known = false
+    const std::wstring& format_hint
 );
 
 CMyComPtr<IInStream> open_stream_for_plan(
