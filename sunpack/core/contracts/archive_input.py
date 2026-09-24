@@ -82,7 +82,6 @@ class ArchiveInputDescriptor:
     format_hint: str = ""
     logical_name: str = ""
     volume_style: str = ""
-    password: str = ""
     parts: list[ArchiveInputPart] = field(default_factory=list)
     ranges: list[ArchiveInputRange] = field(default_factory=list)
     segment: ArchiveInputSegment | None = None
@@ -119,8 +118,6 @@ class ArchiveInputDescriptor:
             payload["logical_name"] = self.logical_name
         if self.volume_style:
             payload["volume_style"] = self.volume_style
-        if self.password:
-            payload["password"] = self.password
         if self.parts:
             payload["parts"] = [part.to_dict() for part in self.parts]
         if self.ranges:
@@ -129,58 +126,6 @@ class ArchiveInputDescriptor:
             payload["segment"] = self.segment.to_dict()
         if self.analysis:
             payload["analysis"] = dict(self.analysis)
-        return payload
-
-    def to_source_input(self) -> dict[str, Any]:
-        if self.open_mode in {"native_volumes", "sfx_with_volumes"}:
-            return self.to_dict()
-        if self.open_mode == "file":
-            payload = {"kind": "file", "path": self.entry_path, "format_hint": self.format_hint}
-            if self.password:
-                payload["password"] = self.password
-            return payload
-        if self.open_mode == "file_range":
-            item_range = self._primary_range()
-            if item_range is None:
-                payload = {"kind": "file", "path": self.entry_path, "format_hint": self.format_hint}
-                if self.password:
-                    payload["password"] = self.password
-                return payload
-            payload: dict[str, Any] = {
-                "kind": "file_range",
-                "path": item_range.path,
-                "start": int(item_range.start),
-                "format_hint": self.format_hint,
-            }
-            if item_range.end is not None:
-                payload["end"] = int(item_range.end)
-            if self.password:
-                payload["password"] = self.password
-            return payload
-        if self.open_mode == "concat_ranges" and self.ranges:
-            payload = {
-                "kind": "concat_ranges",
-                "ranges": [item.to_dict() for item in self.ranges],
-                "format_hint": self.format_hint,
-            }
-            if self.password:
-                payload["password"] = self.password
-            return payload
-        if self.parts:
-            payload = {
-                "kind": "concat_ranges",
-                "ranges": [
-                    {"path": part.path, "start": 0, "end": None}
-                    for part in self.parts
-                ],
-                "format_hint": self.format_hint,
-            }
-            if self.password:
-                payload["password"] = self.password
-            return payload
-        payload = {"kind": "file", "path": self.entry_path, "format_hint": self.format_hint}
-        if self.password:
-            payload["password"] = self.password
         return payload
 
     def part_paths(self) -> list[str]:
@@ -215,7 +160,6 @@ class ArchiveInputDescriptor:
             format_hint=self.format_hint,
             logical_name=self.logical_name,
             volume_style=self.volume_style,
-            password=self.password,
             parts=parts,
             ranges=ranges,
             segment=self.segment,
@@ -233,18 +177,19 @@ class ArchiveInputDescriptor:
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any], *, archive_path: str = "", part_paths: list[str] | None = None) -> "ArchiveInputDescriptor":
-        open_mode = str(raw.get("open_mode") or raw.get("kind") or "file")
-        if open_mode == "archive_input":
-            open_mode = "file"
-        format_hint = str(raw.get("format_hint") or raw.get("format") or "")
+        kind = str(raw.get("kind") or "archive_input")
+        if kind != "archive_input":
+            raise ValueError(f"unsupported archive input kind: {kind}")
+        open_mode = str(raw.get("open_mode") or "file")
+        format_hint = str(raw.get("format_hint") or "")
         entry_path = str(raw.get("entry_path") or archive_path)
         parts = []
         for item in raw.get("parts") or []:
             if not isinstance(item, dict):
                 continue
             path = str(item.get("path") or entry_path)
-            end_raw = item.get("end", item.get("end_offset"))
-            start = int(item.get("start", item.get("start_offset", 0)) or 0)
+            end_raw = item.get("end")
+            start = int(item.get("start", 0) or 0)
             part_range = None
             if start or end_raw is not None:
                 part_range = ArchiveInputRange(
@@ -263,19 +208,19 @@ class ArchiveInputDescriptor:
         for item in raw.get("ranges") or []:
             if not isinstance(item, dict):
                 continue
-            end_raw = item.get("end", item.get("end_offset"))
+            end_raw = item.get("end")
             ranges.append(ArchiveInputRange(
                 path=str(item.get("path") or entry_path),
-                start=int(item.get("start", item.get("start_offset", 0)) or 0),
+                start=int(item.get("start", 0) or 0),
                 end=int(end_raw) if end_raw is not None else None,
             ))
         segment = None
         segment_raw = raw.get("segment")
         if isinstance(segment_raw, dict):
-            end_raw = segment_raw.get("end", segment_raw.get("end_offset"))
+            end_raw = segment_raw.get("end")
             confidence_raw = segment_raw.get("confidence")
             segment = ArchiveInputSegment(
-                start=int(segment_raw.get("start", segment_raw.get("start_offset", 0)) or 0),
+                start=int(segment_raw.get("start", 0) or 0),
                 end=int(end_raw) if end_raw is not None else None,
                 confidence=float(confidence_raw) if confidence_raw is not None else None,
                 source=str(segment_raw.get("source") or "analysis"),
@@ -290,54 +235,11 @@ class ArchiveInputDescriptor:
             format_hint=format_hint,
             logical_name=str(raw.get("logical_name") or ""),
             volume_style=str(raw.get("volume_style") or ""),
-            password=str(raw.get("password") or ""),
             parts=parts,
             ranges=ranges,
             segment=segment,
             analysis=dict(raw.get("analysis") or {}) if isinstance(raw.get("analysis"), dict) else {},
         )
-
-    @classmethod
-    def from_source_input(cls, raw: dict[str, Any], *, archive_path: str, part_paths: list[str] | None = None) -> "ArchiveInputDescriptor":
-        kind = str(raw.get("kind") or "file").lower()
-        format_hint = str(raw.get("format_hint") or raw.get("format") or "")
-        if kind == "file":
-            path = str(raw.get("path") or raw.get("archive_path") or archive_path)
-            parts = [ArchiveInputPart(path=path, role="main", volume_number=1)]
-            return cls(entry_path=path, open_mode="file", format_hint=format_hint, password=str(raw.get("password") or ""), parts=parts)
-        if kind == "file_range":
-            path = str(raw.get("path") or archive_path)
-            start = int(raw.get("start", raw.get("start_offset", 0)) or 0)
-            end_raw = raw.get("end", raw.get("end_offset"))
-            end = int(end_raw) if end_raw is not None else None
-            return cls(
-                entry_path=path,
-                open_mode="file_range",
-                format_hint=format_hint,
-                password=str(raw.get("password") or ""),
-                parts=[ArchiveInputPart(path=path, range=ArchiveInputRange(path=path, start=start, end=end))],
-                segment=ArchiveInputSegment(start=start, end=end),
-            )
-        if kind == "concat_ranges":
-            ranges = []
-            for item in raw.get("ranges") or []:
-                if not isinstance(item, dict):
-                    continue
-                path = str(item.get("path") or archive_path)
-                end_raw = item.get("end", item.get("end_offset"))
-                ranges.append(ArchiveInputRange(
-                    path=path,
-                    start=int(item.get("start", item.get("start_offset", 0)) or 0),
-                    end=int(end_raw) if end_raw is not None else None,
-                ))
-            return cls(
-                entry_path=archive_path,
-                open_mode="concat_ranges",
-                format_hint=format_hint,
-                password=str(raw.get("password") or ""),
-                ranges=ranges,
-            )
-        raise ValueError(f"unsupported source input kind: {kind}")
 
     @classmethod
     def from_parts(
@@ -347,7 +249,6 @@ class ArchiveInputDescriptor:
         part_paths: list[str] | None = None,
         format_hint: str = "",
         logical_name: str = "",
-        password: str = "",
     ) -> "ArchiveInputDescriptor":
         paths = list(part_paths or [archive_path])
         if len(paths) > 1:
@@ -358,7 +259,6 @@ class ArchiveInputDescriptor:
             open_mode=mode,
             format_hint=format_hint,
             logical_name=logical_name,
-            password=password,
             parts=[
                 ArchiveInputPart(path=str(path), role="main", volume_number=1)
                 for index, path in enumerate(paths)
@@ -440,10 +340,9 @@ class ArchiveInputDescriptor:
         logical_name: str = "",
     ) -> "ArchiveInputDescriptor":
         if isinstance(raw, dict):
-            if raw.get("kind") == "archive_input" or raw.get("open_mode"):
-                descriptor = cls.from_dict(raw, archive_path=archive_path, part_paths=part_paths)
-            else:
-                descriptor = cls.from_source_input(raw, archive_path=archive_path, part_paths=part_paths)
+            if raw.get("kind") not in (None, "archive_input") and not raw.get("open_mode"):
+                raise ValueError("archive input must use the canonical archive_input schema")
+            descriptor = cls.from_dict(raw, archive_path=archive_path, part_paths=part_paths)
             if not descriptor.format_hint and format_hint:
                 return cls(
                     entry_path=descriptor.entry_path,
@@ -451,7 +350,6 @@ class ArchiveInputDescriptor:
                     format_hint=format_hint,
                     logical_name=descriptor.logical_name or logical_name,
                     volume_style=descriptor.volume_style,
-                    password=descriptor.password,
                     parts=list(descriptor.parts),
                     ranges=list(descriptor.ranges),
                     segment=descriptor.segment,
@@ -485,76 +383,3 @@ def canonical_volume_name(*, prefix: str, number: int, style: str, width: int, r
             return f"{stem}.exe"
         return f"{base}.{number - 1:0{width}d}"
     return f"{base}.{number:03d}"
-
-
-@dataclass(frozen=True)
-class ArchiveFormatState:
-    detected: str = ""
-    selected: str = ""
-    hint: str = ""
-    confidence: float = 0.0
-    status: str = ""
-
-
-@dataclass(frozen=True)
-class ArchiveRelationState:
-    kind: str = "file"
-    is_split: bool = False
-    is_sfx: bool = False
-
-
-@dataclass(frozen=True)
-class ArchiveLayoutState:
-    start_offset: int = 0
-    end_offset: int | None = None
-    has_prefix: bool = False
-    has_suffix: bool = False
-    embedded: bool = False
-
-
-@dataclass(frozen=True)
-class ArchiveIntegrityState:
-    damage_flags: list[str] = field(default_factory=list)
-    checksum_error: bool = False
-    payload_error: bool = False
-    partial: bool = False
-
-
-@dataclass(frozen=True)
-class ArchiveSecurityState:
-    encrypted: bool = False
-    password_required: bool = False
-    wrong_password: bool = False
-    password: str = ""
-
-
-@dataclass(frozen=True)
-class ArchiveRuntimeState:
-    output_dir: str = ""
-    diagnostics: dict[str, Any] = field(default_factory=dict)
-
-
-@dataclass(frozen=True)
-class ArchiveDescriptor:
-    id: str
-    logical_name: str
-    source: ArchiveInputDescriptor
-    format: ArchiveFormatState = field(default_factory=ArchiveFormatState)
-    relation: ArchiveRelationState = field(default_factory=ArchiveRelationState)
-    layout: ArchiveLayoutState = field(default_factory=ArchiveLayoutState)
-    integrity: ArchiveIntegrityState = field(default_factory=ArchiveIntegrityState)
-    security: ArchiveSecurityState = field(default_factory=ArchiveSecurityState)
-    runtime: ArchiveRuntimeState = field(default_factory=ArchiveRuntimeState)
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "id": self.id,
-            "logical_name": self.logical_name,
-            "source": self.source.to_dict(),
-            "format": self.format.__dict__,
-            "relation": self.relation.__dict__,
-            "layout": self.layout.__dict__,
-            "integrity": self.integrity.__dict__,
-            "security": self.security.__dict__,
-            "runtime": self.runtime.__dict__,
-        }

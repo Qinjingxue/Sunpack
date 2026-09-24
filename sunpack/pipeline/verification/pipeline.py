@@ -4,7 +4,7 @@ from dataclasses import replace
 from typing import Any, Callable
 
 from sunpack.pipeline.verification.evidence import VerificationEvidence
-from sunpack.pipeline.verification.archive_state_manifest import configure_archive_state_manifest_cache
+from sunpack.pipeline.verification.archive_input_manifest import configure_archive_input_manifest_cache
 from sunpack.pipeline.verification.output_quality import compute_output_quality
 from sunpack.pipeline.verification.registry import get_verification_method
 from sunpack.core.contracts.verification import (
@@ -71,7 +71,7 @@ class VerificationPipeline:
 
         manifest_limit = _configured_archive_manifest_limit(self.methods)
         if manifest_limit is not None:
-            configure_archive_state_manifest_cache(evidence, max_items=manifest_limit)
+            configure_archive_input_manifest_cache(evidence, max_items=manifest_limit)
 
         if not self.methods:
             return VerificationResult(
@@ -600,7 +600,7 @@ _STRUCTURAL_DAMAGE_FLAGS = {
 def _container_integrity_from_evidence(evidence: VerificationEvidence) -> str:
     flags = _collect_container_flags(
         evidence.analysis_facts,
-        evidence.archive_state_analysis,
+        evidence.archive_input_analysis,
     )
     if flags & _STRUCTURAL_DAMAGE_FLAGS:
         return CONTAINER_INTEGRITY_STRUCTURALLY_DAMAGED

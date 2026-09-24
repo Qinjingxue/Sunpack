@@ -14,7 +14,6 @@ from typing import Any, Callable
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import attach_worker_diagnostics
-from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.support.output_paths import normalized_output_dir, resolve_output_volume_key
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from sunpack.core.support.runtime_cwd import runtime_working_directory
@@ -1317,29 +1316,9 @@ class SevenZipRunner:
                 job["format_hint"] = descriptor_payload.get("format_hint")
         return job
 
-    def _archive_input(self, task: ArchiveTask, archive_path: str, part_paths: list[str]) -> ArchiveInputDescriptor | None:
-        if hasattr(task, "archive_input"):
-            raw = knowledge_view.source_input(task)
-            if isinstance(raw, dict):
-                return task.archive_input()
-        raw = knowledge_view.source_input(task)
-        if isinstance(raw, dict):
-            return self._normalize_archive_input(raw, archive_path, part_paths)
-        return None
-
-    def _normalize_archive_input(self, raw: dict, archive_path: str, part_paths: list[str]) -> ArchiveInputDescriptor:
-        if raw.get("kind") == "archive_input" or raw.get("open_mode"):
-            return ArchiveInputDescriptor.from_dict(raw, archive_path=archive_path, part_paths=part_paths)
-        kind = str(raw.get("kind") or "file").lower()
-        if kind == "file_range":
-            return ArchiveInputDescriptor.from_source_input(raw, archive_path=archive_path, part_paths=part_paths)
-        if kind == "concat_ranges":
-            return ArchiveInputDescriptor.from_source_input(raw, archive_path=archive_path, part_paths=part_paths)
-        return ArchiveInputDescriptor.from_parts(
-            archive_path=archive_path,
-            part_paths=list(part_paths or [archive_path]),
-            format_hint=str(raw.get("format_hint") or raw.get("format") or ""),
-        )
+    def _archive_input(self, task: ArchiveTask, archive_path: str, part_paths: list[str]) -> ArchiveInputDescriptor:
+        del archive_path, part_paths
+        return task.archive_input()
 
     @staticmethod
     def _completed_process(

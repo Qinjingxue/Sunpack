@@ -8,7 +8,6 @@ from sunpack.core.support.resource_lifecycle import task_walk
 
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.core.contracts.archive_state import ArchiveState
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
 from sunpack.pipeline.extraction.internal.workflow.retry_policy import ExtractRetryPolicy
@@ -740,8 +739,8 @@ class SingleArchiveExtractor:
                 diagnostics={"failure_stage": "preflight", "failure_kind": "output_filesystem", "message": str(exc)},
             )
 
-        with _phase(phase_timer, f"{phase_prefix}_save_archive_state"):
-            saved_archive_state = task.archive_state()
+        with _phase(phase_timer, f"{phase_prefix}_save_archive_input"):
+            saved_archive_input = task.archive_input()
             saved_knowledge = task.knowledge().to_dict()
         segment_results: list[dict[str, Any]] = []
         embedded_results: list[tuple[dict[str, Any], ExtractionResult]] = []
@@ -772,12 +771,12 @@ class SingleArchiveExtractor:
                     logical_name=str(segment.get("logical_name") or segment_id),
                 )
             try:
-                with _phase(phase_timer, f"{phase_prefix}_segment_set_archive_state"):
+                with _phase(phase_timer, f"{phase_prefix}_segment_set_archive_input"):
                     # Carrier archive knowledge is not valid for each
                     # independent logical archive. Runtime-only context such as
                     # inherited directory passwords lives outside ArchiveKnowledge.
                     task.set_knowledge({})
-                    task.set_archive_state(ArchiveState.from_archive_input(descriptor))
+                    task.set_archive_input(descriptor)
                     # Password verification must bind to the currently active
                     # logical segment.
                     write_source_password_probe_input(task, descriptor.to_dict())
@@ -793,9 +792,9 @@ class SingleArchiveExtractor:
                     "verification_archive_input": dict(segment.get("archive_input") or {}),
                 }
             finally:
-                with _phase(phase_timer, f"{phase_prefix}_segment_restore_archive_state"):
+                with _phase(phase_timer, f"{phase_prefix}_segment_restore_archive_input"):
                     task.set_knowledge(saved_knowledge)
-                    task.set_archive_state(saved_archive_state)
+                    task.set_archive_input(saved_archive_input)
 
             if result.password_used is not None and password_used is None:
                 password_used = result.password_used

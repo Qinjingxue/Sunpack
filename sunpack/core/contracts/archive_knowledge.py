@@ -55,16 +55,6 @@ class ArchiveKnowledge:
         except (TypeError, ValueError):
             return 0
 
-    def source_identity(self) -> dict[str, Any]:
-        source = self.get("source.input", {})
-        if isinstance(source, dict):
-            return {
-                "kind": str(source.get("kind") or source.get("open_mode") or "file"),
-                "path": str(source.get("path") or source.get("entry_path") or ""),
-                "format_hint": source.get("format_hint") or source.get("format"),
-            }
-        return {}
-
     def get(self, path: str, default: Any = None) -> Any:
         current: Any = self.data
         for part in _parts(path):
@@ -165,7 +155,7 @@ class ArchiveKnowledge:
 
     def add_evidence(self, path: str, value: Any, *, provenance: dict[str, Any] | None = None) -> "ArchiveKnowledge":
         evidence = list(self.data.setdefault("_evidence", []))
-        item = {"path": str(path), "value": _compact_evidence_value(value)}
+        item = {"path": str(path), "value": compact_evidence_value(value)}
         if provenance:
             item["provenance"] = _jsonable(provenance)
         evidence.append(item)
@@ -201,21 +191,6 @@ def merge_knowledge(*payloads: Any) -> dict[str, Any]:
         if payload:
             knowledge.merge(payload)
     return knowledge.to_dict()
-
-
-def project_knowledge_sources(knowledge: Any) -> list[dict[str, Any]]:
-    raw = ArchiveKnowledge.from_any(knowledge).to_dict()
-    if not raw:
-        return []
-    sources = [raw]
-    for key in ("filesystem", "relations", "detection", "analysis", "extraction", "verification", "policy", "format"):
-        value = raw.get(key)
-        if isinstance(value, dict):
-            sources.append(value)
-    zip_payload = raw.get("format", {}).get("zip") if isinstance(raw.get("format"), dict) else None
-    if isinstance(zip_payload, dict):
-        sources.append(zip_payload)
-    return sources
 
 
 def _parts(path: str) -> list[str]:
@@ -295,9 +270,9 @@ def _dedupe(values: list[str]) -> list[str]:
     return output
 
 
-def _compact_evidence_value(value: Any) -> Any:
+def compact_evidence_value(value: Any) -> Any:
     if isinstance(value, ArchiveKnowledge):
-        return {"kind": "archive_knowledge", "revision": value.revision(), "source_identity": value.source_identity()}
+        return {"kind": "archive_knowledge", "revision": value.revision()}
     if isinstance(value, dict):
         output: dict[str, Any] = {}
         for key, item in value.items():
@@ -307,11 +282,11 @@ def _compact_evidence_value(value: Any) -> Any:
             elif text_key in {"stdout", "stderr"} and isinstance(item, str):
                 output[text_key] = item[:4000]
             else:
-                output[text_key] = _compact_evidence_value(item)
+                output[text_key] = compact_evidence_value(item)
         return output
     if isinstance(value, (list, tuple, set)):
         values = list(value)
-        compacted = [_compact_evidence_value(item) for item in values[:50]]
+        compacted = [compact_evidence_value(item) for item in values[:50]]
         if len(values) > 50:
             compacted.append({"truncated_count": len(values) - 50})
         return compacted

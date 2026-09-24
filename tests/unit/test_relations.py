@@ -11,7 +11,7 @@ from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectorySca
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_target
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.pipeline.discovery.relations import RelationsScheduler
-from sunpack.pipeline.discovery.relations.internal.group_builder import _relation_archive_input
+from sunpack.pipeline.discovery.relations.internal.archive_input import archive_input_for_group
 from tests.helpers.fs_builder import make_minimal_7z
 
 
@@ -121,14 +121,9 @@ def test_pe_zip_sfx_is_confirmed_and_projected_as_file_range(tmp_path):
     assert archive_input["parts"][0]["start"] == pe_end
     assert archive_input["segment"]["start"] == pe_end
 
-    source_input = ArchiveInputDescriptor.from_dict(
-        archive_input,
-        archive_path=str(path),
-    ).to_source_input()
-    assert source_input["kind"] == "file_range"
-    assert source_input["start"] == pe_end
-
-    password_input = _relation_archive_input(group)
+    password_descriptor = archive_input_for_group(group)
+    assert password_descriptor is not None
+    password_input = password_descriptor.to_dict()
     assert password_input["open_mode"] == "file_range"
     assert password_input["parts"][0]["start"] == pe_end
     assert password_input["segment"]["start"] == pe_end

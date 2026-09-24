@@ -1,26 +1,6 @@
 from sunpack.core.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart
-from sunpack.core.contracts.archive_state import ArchiveState
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
-
-
-def test_archive_state_projects_analysis_into_execution_descriptor():
-    descriptor = ArchiveInputDescriptor.from_parts(
-        archive_path="payload.7z",
-        format_hint="7z",
-    )
-    state = ArchiveState.from_archive_input(
-        descriptor,
-        analysis={
-            "status": "extractable",
-            "execution": {"missing_volume_evidence": "seven_zip_start_header_length"},
-        },
-    )
-
-    projected = state.to_archive_input_descriptor()
-
-    assert projected.analysis["status"] == "extractable"
-    assert projected.analysis["execution"]["missing_volume_evidence"] == "seven_zip_start_header_length"
 
 
 def test_planning_projects_proven_7z_split_tail_without_native_rescan():
@@ -45,7 +25,6 @@ def test_planning_projects_proven_7z_split_tail_without_native_rescan():
             ),
         ],
     )
-    state = ArchiveState.from_archive_input(descriptor)
     evidence = ArchiveFormatEvidence(
         format="7z",
         confidence=0.80,
@@ -73,7 +52,7 @@ def test_planning_projects_proven_7z_split_tail_without_native_rescan():
         selected=[],
     )
 
-    execution = ArchiveInputPlanningStage._execution_analysis_for_report(state, report)
+    execution = ArchiveInputPlanningStage._execution_analysis_for_report(descriptor, report)
 
     assert execution == {"missing_volume_evidence": "seven_zip_start_header_length"}
 
@@ -83,7 +62,6 @@ def test_planning_does_not_label_single_truncated_7z_as_missing_volume():
         archive_path="payload.7z",
         format_hint="7z",
     )
-    state = ArchiveState.from_archive_input(descriptor)
     evidence = ArchiveFormatEvidence(
         format="7z",
         confidence=0.80,
@@ -103,4 +81,4 @@ def test_planning_does_not_label_single_truncated_7z_as_missing_volume():
         selected=[],
     )
 
-    assert ArchiveInputPlanningStage._execution_analysis_for_report(state, report) == {}
+    assert ArchiveInputPlanningStage._execution_analysis_for_report(descriptor, report) == {}

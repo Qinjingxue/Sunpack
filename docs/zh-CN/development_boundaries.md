@@ -129,7 +129,7 @@ sunpack.runtime.watch
 
 ### pipeline.verification
 
-`sunpack.pipeline.verification` 是解压结果校验的事实来源。它从 `ArchiveTask`、`ExtractionResult`、`ArchiveState` 和 `PasswordSession` 构建证据，按配置执行 method，返回完整度、文件观察、source integrity、recoverable upper bound 和 decision hint。是否普通重试、是否清理失败输出，由 coordinator 决定。
+`sunpack.pipeline.verification` 是解压结果校验的事实来源。它从 `ArchiveTask`、`ExtractionResult`、canonical `ArchiveInputDescriptor` 和 `PasswordSession` 构建证据，按配置执行 method，返回完整度、文件观察、source integrity、recoverable upper bound 和 decision hint。是否普通重试、是否清理失败输出，由 coordinator 决定。
 
 ### pipeline.postprocess
 

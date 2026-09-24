@@ -124,9 +124,8 @@ def _extract_direct(
     parts: list[Path] | None = None,
 ):
     task = direct_file_task(str(archive), all_parts=[str(path) for path in (parts or [archive])])
-    state = task.archive_state()
-    source = replace(state.source, format_hint=detected_ext)
-    task.set_archive_state(replace(state, source=source, format_hint=detected_ext))
+    descriptor = replace(task.archive_input(), format_hint=detected_ext)
+    task.set_archive_input(descriptor)
     scheduler = ExtractionScheduler(max_retries=1)
     try:
         return scheduler.extract(task, str(output_dir))

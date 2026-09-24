@@ -32,6 +32,6 @@ def test_archive_task_key_keeps_logical_name_for_split_archives():
         format_hint="7z",
         logical_name="game",
     )
-    task = make_task_from_descriptor(descriptor, relation_kind="split_archive")
+    task = make_task_from_descriptor(descriptor)
 
     assert task.key == "game"

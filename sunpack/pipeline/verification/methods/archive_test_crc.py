@@ -1,12 +1,12 @@
 from typing import Any, Sequence
 
-from sunpack.pipeline.verification.archive_state_manifest import (
+from sunpack.pipeline.verification.archive_input_manifest import (
     STATUS_BACKEND_UNAVAILABLE,
     STATUS_DAMAGED,
     STATUS_OK,
     STATUS_UNSUPPORTED,
     STATUS_WRONG_PASSWORD,
-    archive_state_manifest_for_evidence,
+    archive_input_manifest_for_evidence,
 )
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.error_classification import classify_verification_error
@@ -34,7 +34,7 @@ class ArchiveTestCrcMethod:
 
     def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStepResult:
         max_items = max(0, int(config.get("max_items", 200000) or 0))
-        archive_manifest = archive_state_manifest_for_evidence(evidence, max_items=max_items)
+        archive_manifest = archive_input_manifest_for_evidence(evidence, max_items=max_items)
 
         archive_status_result = self._archive_status_result(archive_manifest, evidence)
         if archive_status_result is not None:

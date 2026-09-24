@@ -20,7 +20,6 @@ def _selected_structure_format(task: Any | None) -> str:
         knowledge.get("source.password_probe_input.format_hint"),
         knowledge.get("inspection.summary.format"),
         descriptor.format_hint if descriptor is not None else "",
-        knowledge.get("source.input.format_hint"),
     )
     hint = next(
         (

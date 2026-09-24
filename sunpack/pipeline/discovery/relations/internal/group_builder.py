@@ -15,11 +15,11 @@ from sunpack_native import (
 )
 
 from sunpack.core.contracts.filesystem import DirectorySnapshot
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, ArchiveInputRange, ArchiveInputSegment
 from sunpack.core.passwords.internal.local_files import discover_directory_passwords_for_archive
 from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.core.passwords.relation_prober import RelationsPasswordProber
 from sunpack.pipeline.discovery.relations.internal.models import CandidateGroup, FileRelation, SplitVolumeEntry
+from sunpack.pipeline.discovery.relations.internal.archive_input import archive_input_for_group
 from sunpack.core.support.path_keys import path_key
 
 
@@ -90,7 +90,8 @@ class RelationsGroupBuilder:
                     for member in group.input_paths
                     if member
                 ))
-                archive_input = _relation_archive_input(group)
+                descriptor = archive_input_for_group(group)
+                archive_input = descriptor.to_dict() if descriptor is not None else None
                 encrypted_groups.append((sorted(proposal_paths), part_paths, archive_input))
         if not encrypted_groups:
             return None
@@ -337,64 +338,3 @@ def _native_password_pairs(path_passwords: dict[str, str] | None) -> list[tuple[
     if not path_passwords:
         return None
     return [(str(path), str(password)) for path, password in path_passwords.items() if str(password)]
-
-
-def _relation_archive_input(group: CandidateGroup) -> dict | None:
-    volumes = list(group.split_volumes or [])
-    if volumes:
-        metadata = group.head_metadata if isinstance(group.head_metadata, dict) else {}
-        format_hint = str(metadata.get("format") or "").lower().lstrip(".")
-        return ArchiveInputDescriptor.from_split_volumes(
-            archive_path=group.head_path,
-            volumes=volumes,
-            format_hint=format_hint,
-            logical_name=group.logical_name,
-        ).to_dict()
-
-    metadata = group.head_metadata if isinstance(group.head_metadata, dict) else {}
-    if not metadata.get("relation_confirmed"):
-        return None
-    format_hint = str(metadata.get("format") or "").lower().lstrip(".")
-    if format_hint not in {"rar", "7z", "zip"}:
-        return None
-
-    structure_offset = int(metadata.get("structure_offset") or 0)
-    if structure_offset > 0 and bool(metadata.get("sfx")):
-        range_end = (
-            int(metadata["expected_logical_size"])
-            if isinstance(metadata.get("expected_logical_size"), int)
-            and int(metadata["expected_logical_size"]) > structure_offset
-            else None
-        )
-        archive_range = ArchiveInputRange(
-            path=group.head_path,
-            start=structure_offset,
-            end=range_end,
-        )
-        return ArchiveInputDescriptor(
-            entry_path=group.head_path,
-            open_mode="file_range",
-            format_hint=format_hint,
-            logical_name=group.logical_name,
-            parts=[
-                ArchiveInputPart(
-                    path=group.head_path,
-                    role="main",
-                    range=archive_range,
-                )
-            ],
-            segment=ArchiveInputSegment(
-                start=structure_offset,
-                end=range_end,
-                source="relations",
-            ),
-        ).to_dict()
-
-    return ArchiveInputDescriptor.from_parts(
-        archive_path=group.head_path,
-        part_paths=[group.head_path],
-        format_hint=format_hint,
-        logical_name=group.logical_name,
-    ).to_dict()
-
-

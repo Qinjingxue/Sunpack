@@ -4,7 +4,7 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from typing import Any
 
-from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
+from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge, compact_evidence_value
 from sunpack.core.support.json_values import jsonable_value as _jsonable
 
 
@@ -189,40 +189,9 @@ def write_evidence(
         provenance["source_module"] = source_module
     if confidence is not None:
         provenance["confidence"] = float(confidence)
-    rows.append({"path": path, "value": _compact_evidence_value(value), "provenance": provenance})
+    rows.append({"path": path, "value": compact_evidence_value(value), "provenance": provenance})
     knowledge.set("_evidence", rows[-500:])
     return knowledge
-
-
-def _compact_evidence_value(value: Any) -> Any:
-    if isinstance(value, ArchiveKnowledge):
-        return {"kind": "archive_knowledge", "revision": value.revision(), "source_identity": value.source_identity()}
-    if isinstance(value, dict):
-        output: dict[str, Any] = {}
-        for key, item in value.items():
-            text_key = str(key)
-            if text_key == "archive_state":
-                output[text_key] = _compact_large_value(text_key, item)
-            elif text_key in {"stdout", "stderr"} and isinstance(item, str):
-                output[text_key] = item[:4000]
-            else:
-                output[text_key] = _compact_evidence_value(item)
-        return output
-    if isinstance(value, (list, tuple, set)):
-        values = list(value)
-        output = [_compact_evidence_value(item) for item in values[:50]]
-        if len(values) > 50:
-            output.append({"truncated_count": len(values) - 50})
-        return output
-    return _jsonable(value)
-
-
-def _compact_large_value(key: str, value: Any) -> Any:
-    if isinstance(value, dict):
-        return {"kind": key, "keys": sorted(str(item) for item in value.keys())[:50]}
-    if isinstance(value, list):
-        return {"kind": key, "count": len(value)}
-    return _jsonable(value)
 
 
 def _phase(timer: Any | None, name: str):

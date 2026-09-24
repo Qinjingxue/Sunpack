@@ -19,7 +19,7 @@ def test_task_snapshot_uses_typed_archive_state_and_knowledge(tmp_path):
         source_module="real_diagnostics",
     )
     task.set_knowledge(knowledge)
-    task.runtime["input_planning.status"] = "extractable"
+    task.runtime["diagnostic.marker"] = "extractable"
 
     snapshot = task_snapshot(task)
 
@@ -29,7 +29,7 @@ def test_task_snapshot_uses_typed_archive_state_and_knowledge(tmp_path):
     assert snapshot["archive_input"]["format_hint"] == "zip"
     assert snapshot["archive_state"]["format_hint"] == "zip"
     assert snapshot["knowledge"]["format"]["zip"]["structure"]["password_required"] is False
-    assert snapshot["runtime"]["input_planning.status"] == "extractable"
+    assert snapshot["runtime"]["diagnostic.marker"] == "extractable"
     assert "facts" not in snapshot
     assert "decision" not in snapshot
     assert "detected_ext" not in snapshot

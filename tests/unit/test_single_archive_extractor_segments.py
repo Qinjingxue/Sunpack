@@ -65,8 +65,7 @@ class _FakeSevenZipRunner:
         pass
 
     def extract_attempt(self, *, out_dir, task, **_kwargs):
-        state = task.archive_state()
-        source = state.to_archive_input_descriptor().to_dict()
+        source = task.archive_input().to_dict()
         self.sources.append(source)
         name = str(source.get("format_hint") or "archive")
         import os
@@ -161,7 +160,7 @@ def test_extractor_runs_analysis_segments_inside_same_task_and_restores_source(t
     assert (tmp_path / "out" / "embedded_01_zip" / "zip.txt").exists()
     assert (tmp_path / "out" / "embedded_02_rar" / "rar.txt").exists()
     assert len(result.diagnostics["embedded_segments"]) == 2
-    assert task.archive_state().to_archive_input_descriptor().open_mode == "file"
+    assert task.archive_input().open_mode == "file"
 
 
 def test_embedded_password_probe_and_session_key_follow_active_segment(tmp_path):
@@ -296,7 +295,7 @@ def test_single_embedded_segment_exposes_logical_input_for_verification(tmp_path
     assert segment["archive_input"] == archive_input
     assert segment_result.diagnostics["verification_archive_input"] == archive_input
     assert segment_result.diagnostics["result"]["verified_manifest"]["validated"] is True
-    assert task.archive_state().to_archive_input_descriptor().open_mode == "file"
+    assert task.archive_input().open_mode == "file"
 
 
 def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
