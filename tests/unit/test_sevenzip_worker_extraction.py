@@ -1090,11 +1090,16 @@ def test_extraction_scheduler_uses_worker_for_file_range(tmp_path, monkeypatch):
     mixed.write_bytes(prefix + data + b"TAIL")
 
     task = _task(mixed, {
-        "kind": "file_range",
-        "path": str(mixed),
-        "start": len(prefix),
-        "end": len(prefix) + len(data),
+        "kind": "archive_input",
+        "entry_path": str(mixed),
+        "open_mode": "file_range",
         "format_hint": "7z",
+        "parts": [{
+            "path": str(mixed),
+            "role": "main",
+            "start": len(prefix),
+            "end": len(prefix) + len(data),
+        }],
     })
     result = ExtractionScheduler(max_retries=1).extract(task, str(tmp_path / "out"))
 
@@ -1128,7 +1133,9 @@ def test_extraction_scheduler_uses_worker_for_concat_ranges(tmp_path, monkeypatc
     virtual = tmp_path / "payload.virtual"
     virtual.write_bytes(b"not used directly")
     task = _task(virtual, {
-        "kind": "concat_ranges",
+        "kind": "archive_input",
+        "entry_path": str(virtual),
+        "open_mode": "concat_ranges",
         "format_hint": "7z",
         "ranges": [
             {"path": str(part_a), "start": 0},
