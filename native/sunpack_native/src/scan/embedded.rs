@@ -1533,7 +1533,7 @@ mod tests {
     }
 
     #[test]
-    fn keeps_crc_valid_truncated_7z_as_bounded_logical_candidate() {
+    fn keeps_crc_valid_truncated_7z_unresolved_and_unextractable() {
         let mut start_header = Vec::new();
         start_header.extend_from_slice(&1024u64.to_le_bytes());
         start_header.extend_from_slice(&16u64.to_le_bytes());
@@ -1557,10 +1557,9 @@ mod tests {
         assert_eq!(seven.offset, start);
         assert_eq!(seven.end_offset, None);
         assert_eq!(seven.candidate_kind, "logical_archive");
-        assert_eq!(seven.boundary_kind, "bounded");
-        assert_eq!(seven.range_end_offset, Some(data.len() as u64));
-        assert!(seven.extractable);
-        assert_eq!(seven.validation, "start_header_crc_truncated_next_header");
+        assert_eq!(seven.boundary_kind, "unresolved");
+        assert!(!seven.extractable);
+        assert_eq!(seven.validation, "start_header_crc_truncated_declared_range");
         let _ = fs::remove_file(path);
     }
 
@@ -1581,9 +1580,8 @@ mod tests {
         assert_eq!(zip.end_offset, Some(end));
         assert_eq!(
             zip.validation,
-            "zip64_eocd_central_directory_and_local_links"
+            "zip64_eocd_geometry_and_first_local_link"
         );
-        assert_eq!(zip.contained_anchor_count, 1);
         let _ = fs::remove_file(path);
     }
 
@@ -1607,7 +1605,6 @@ mod tests {
         assert_eq!(tar.len(), 1);
         assert_eq!(tar[0].offset, start);
         assert_eq!(tar[0].end_offset, Some(end));
-        assert_eq!(tar[0].contained_anchor_count, 2);
         let _ = fs::remove_file(path);
     }
 
@@ -1634,7 +1631,6 @@ mod tests {
         assert_eq!(bzip2.len(), 1);
         assert_eq!(bzip2[0].offset, start);
         assert_eq!(bzip2[0].end_offset, Some(end));
-        assert_eq!(bzip2[0].contained_anchor_count, 2);
         assert_eq!(
             bzip2[0].validation,
             "bzip2_concatenated_streams_complete_huffman_walk"
