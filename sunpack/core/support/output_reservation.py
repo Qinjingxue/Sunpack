@@ -38,7 +38,7 @@ def build_output_dir_resolver(
 ) -> Callable[[ArchiveTask], str]:
     """Resolve one collision-free output path for every task in a batch."""
     resolved_dirs: dict[int, str] = {}
-    reserved: set[str] = {}
+    reserved: set[str] = set()
     for task in tasks:
         default_dir = default_output_dir_for_task(task)
         if reservation_registry is None:
