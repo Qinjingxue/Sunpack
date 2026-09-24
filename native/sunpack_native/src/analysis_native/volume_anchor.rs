@@ -312,7 +312,8 @@ fn probe_path(
         tail_limit as u64,
         &prefix,
         &mut result.bytes_read,
-    );
+    )
+    .unwrap_or_else(|_| (Vec::new(), size));
 
     if probe_zip(&prefix, &tail, tail_start, &mut result) {
         return result;
@@ -703,46 +704,40 @@ fn read_zip_tail_for_anchor(
     tail_limit: u64,
     prefix: &[u8],
     bytes_read: &mut u64,
-) -> (Vec<u8>, u64) {
+) -> std::io::Result<(Vec<u8>, u64)> {
     let remaining = file_size.saturating_sub(archive_start);
     let tail_len = remaining.min(tail_limit);
     if tail_len == 0 {
-        return (Vec::new(), remaining);
+        return Ok((Vec::new(), remaining));
     }
 
     if remaining <= prefix.len() as u64 {
         let start = (remaining - tail_len) as usize;
-        return (
+        return Ok((
             prefix[start..remaining as usize].to_vec(),
             remaining - tail_len,
-        );
+        ));
     }
 
     const EOCD_MIN_SIZE: u64 = 22;
     let fast_len = tail_len.min(EOCD_MIN_SIZE);
     let fast_start = file_size - fast_len;
-    let fast = match reader.read_at(fast_start, fast_len as usize) {
-        Ok(value) => value,
-        Err(_) => return (Vec::new(), remaining),
-    };
+    let fast = reader.read_at(fast_start, fast_len as usize)?;
     *bytes_read += fast.len() as u64;
 
     let exact_eocd = fast.len() == EOCD_MIN_SIZE as usize
         && fast.starts_with(ZIP_EOCD)
         && u16::from_le_bytes([fast[20], fast[21]]) == 0;
     if exact_eocd || tail_len == fast_len {
-        return (fast, remaining - fast_len);
+        return Ok((fast, remaining - fast_len));
     }
 
     let preceding_len = tail_len - fast_len;
     let full_start = file_size - tail_len;
-    let mut tail = match reader.read_at(full_start, preceding_len as usize) {
-        Ok(value) => value,
-        Err(_) => return (Vec::new(), remaining),
-    };
+    let mut tail = reader.read_at(full_start, preceding_len as usize)?;
     *bytes_read += tail.len() as u64;
     tail.extend_from_slice(&fast);
-    (tail, remaining - tail_len)
+    Ok((tail, remaining - tail_len))
 }
 
 fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor) -> bool {
@@ -878,14 +873,20 @@ pub(crate) fn probe_volume_anchor_at_offset(
         "7z" => probe_seven_zip(&prefix, 0, remaining, &mut result),
         "zip" => {
             const ZIP_TAIL_MAX: u64 = 22 + 65_535;
-            let (tail, tail_start) = read_zip_tail_for_anchor(
+            let (tail, tail_start) = match read_zip_tail_for_anchor(
                 &reader,
                 offset,
                 size,
                 ZIP_TAIL_MAX,
                 &prefix,
                 &mut result.bytes_read,
-            );
+            ) {
+                Ok(value) => value,
+                Err(error) => {
+                    result.error = error.to_string();
+                    return result;
+                }
+            };
             probe_zip(&prefix, &tail, tail_start, &mut result)
         }
         _ => false,
