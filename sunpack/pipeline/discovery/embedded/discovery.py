@@ -143,6 +143,7 @@ class EmbeddedDiscovery:
                 end,
                 logical_name,
                 confidence=float(item.confidence),
+                password_required=item.password_required,
             )
             segments.append((descriptor, item.to_dict()))
 
@@ -206,13 +207,21 @@ def _descriptor_for_candidate(
     logical_name: str,
     *,
     confidence: float,
+    password_required: bool = False,
 ) -> ArchiveInputDescriptor:
+    analysis = {
+        "segment_confidence": confidence,
+        "segment_source": "embedded",
+    }
+    if password_required:
+        analysis["password_required"] = True
     if start == 0 and (end is None or end >= size):
-        return ArchiveInputDescriptor.from_parts(
-            archive_path=path,
-            part_paths=[path],
+        return ArchiveInputDescriptor(
+            entry_path=path,
             format_hint=archive_format,
             logical_name=logical_name,
+            parts=[ArchiveInputPart(extent=InputExtent(path=path), role="main", volume_number=1)],
+            analysis=analysis,
         )
     extent = InputExtent(path=path, start=start, end=end)
     return ArchiveInputDescriptor(
@@ -221,5 +230,5 @@ def _descriptor_for_candidate(
         format_hint=archive_format,
         logical_name=logical_name,
         parts=[ArchiveInputPart(extent=extent, role="main")],
-        analysis={"segment_confidence": confidence, "segment_source": "embedded"},
+        analysis=analysis,
     )
