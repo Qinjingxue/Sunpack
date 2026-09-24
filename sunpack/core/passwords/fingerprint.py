@@ -25,11 +25,9 @@ def _archive_input_scope(archive_input: Any) -> str:
     mode = str(archive_input.get("open_mode") or archive_input.get("kind") or "")
     parts = archive_input.get("parts") or []
     ranges = archive_input.get("ranges") or []
-    segment = archive_input.get("segment")
     has_explicit_range = (
         mode in {"file_range", "concat_ranges"}
         or bool(ranges)
-        or isinstance(segment, dict)
         or any(
             isinstance(item, dict)
             and (item.get("start") is not None or item.get("end") is not None
@@ -61,7 +59,6 @@ def _archive_input_scope(archive_input: Any) -> str:
         })
         normalized_parts.append(payload)
     normalized_ranges = [range_payload(item) for item in ranges]
-    segment_payload = range_payload(segment) if isinstance(segment, dict) else {}
     return json.dumps({
         "entry_path": str(archive_input.get("entry_path") or archive_input.get("path") or ""),
         "open_mode": str(archive_input.get("open_mode") or archive_input.get("kind") or ""),
@@ -69,7 +66,6 @@ def _archive_input_scope(archive_input: Any) -> str:
         "logical_name": str(archive_input.get("logical_name") or ""),
         "parts": normalized_parts,
         "ranges": normalized_ranges,
-        "segment": segment_payload,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
