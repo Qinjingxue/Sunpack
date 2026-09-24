@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[2]
-LIFECYCLE_MODULE = ROOT / "sunpack" / "support" / "resource_lifecycle.py"
+LIFECYCLE_MODULE = ROOT / "sunpack" / "core" / "support" / "resource_lifecycle.py"
 FORBIDDEN_NAMES = {"open"}
 FORBIDDEN_ATTRIBUTES = {
     "open",
