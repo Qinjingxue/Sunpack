@@ -197,6 +197,14 @@ class EmbeddedDiscovery:
                 ),
             )
 
+        if any(
+            item.candidate_kind == "logical_archive"
+            and item.boundary_kind != "exact"
+            and item.validation == "start_header_crc_truncated_declared_range"
+            for item in scan.candidates
+        ):
+            return None, "embedded_truncated"
+
         physical = [
             item
             for item in scan.candidates
