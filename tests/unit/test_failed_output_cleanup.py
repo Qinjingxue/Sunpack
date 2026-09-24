@@ -121,4 +121,6 @@ def test_collect_result_applies_main_pipeline_cleanup_after_diagnostics(tmp_path
     assert returned is None
     assert not output.exists()
     assert extraction.diagnostics["failed_output_cleanup"]["cleaned"] is True
-    assert runner.context.failed_tasks == ["broken.zip [damaged]"]
+    assert [item.failure_message for item in runner.context.target_results] == [
+        "broken.zip [damaged]"
+    ]
