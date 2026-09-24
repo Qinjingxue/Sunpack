@@ -724,3 +724,38 @@ sunpack.py --help 通过。下面 4 个命令均退出码 1；重跑后每个命
 - 截断 7z SFX 仍未被登记为失败任务：扫描将其视作 0 个候选并正常结束。这与 watch 重复提取是独立问题。
 - `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 因未设置 `SUNPACK_RUN_GAME_TREE_TEST=1` 跳过；disk-full 8 项因需要管理员权限执行 diskpart 而跳过。`tests/memory/test_watch_growth.py` 仍是 opt-in performance 测试，不属于默认 correctness acceptance。
 - 本轮只记录结果，未修复剩余失败项。
+## 后续修复复测（543c7af5）
+
+- 被测提交：`543c7af59ca0f51321b6cb0e50eee84c5da985ea`（`fix: close final post-refactor regressions (#125)`）。
+- 本轮未修改程序或测试文件。再次执行 `scripts/setup_windows_dev.ps1 -Arch x64`，成功重建 Rust 扩展、Watch Broker、C++ 7-Zip worker 和 toast DLL；worker 6 项 CTest 与 toast 1 项 CTest 全部通过。最终 CLI probe 和 acceptance 环境预检均通过。
+- `run_acceptance_tests.ps1 -NoWait` 完整执行；Rust 单测另执行 `cargo test --lib --manifest-path native/sunpack_native/Cargo.toml`：100 passed，0 failed。
+
+### 本轮汇总
+
+| 阶段 | 用例 | 通过 | 失败 | 收集错误 | 跳过 |
+|---|---:|---:|---:|---:|---:|
+| CLI、unit、functional | 1143 | 1143 | 0 | 0 | 0 |
+| integration、real | 347 | 343 | 3 | 0 | 1 |
+| Administrator VHD disk-full | 8 | 0 | 0 | 0 | 8 |
+| **Python pytest 合计** | **1498** | **1486** | **3** | **0** | **9** |
+
+额外验证：Rust 单测 100 项全部通过；native CTest 7 项全部通过；5 项 CLI smoke 全部通过。
+
+### 本轮剩余失败项与报错
+
+- `tests.integration.test_real_archive_edge_cases::test_real_archive_edge_corrupted_sfx_archives_fail[7z]` — `assert _failure_contains(summary, expected_options)` 失败。与上一轮相比，测试现在确实得到一个 failed task，错误种类为 embedded-segments extraction failure；但失败类别/诊断没有匹配该用例要求的损坏或解压失败选项。
+- `tests.real.plan4_missing_volumes.test_plan4_split_missing_volumes::test_plan4_encrypted_split_missing_volumes[only_tail-rar]` — `AssertionError: expected missing-volume error or scan-stage ignore; kinds=['FailureKind.EMBEDDED_SEGMENTS_FAILED']`。只保留 RAR 尾卷时，被识别为 embedded segment 并进入提取，最终给出通用 embedded extraction failure；测试预期缺卷诊断或扫描阶段忽略。
+- `tests.real.plan4_missing_volumes.test_plan4_sfx_split_missing_volumes::test_plan4_encrypted_sfx_split_missing_volumes[only_tail-rar]` — 同样报 `expected missing-volume error or scan-stage ignore; kinds=['FailureKind.EMBEDDED_SEGMENTS_FAILED']`，场景为带 SFX 的 RAR 分卷只剩尾卷。
+
+### 本轮理解
+
+- 上一轮两个“数据卷先到、launcher 后到”场景的重复解压失败本轮均通过，说明该修复覆盖了 7z 和 ZIP 两种 watch 输入顺序。
+- 截断 7z SFX 现在会产生 failed task，不再是上一轮的 `failed_tasks == []`；剩余差异在失败归类/诊断匹配，测试仍未得到它要求的失败类别。
+- 新暴露的两个 RAR `only_tail` 用例表现一致：尾卷被当成可尝试的嵌入归档，随后以 `EMBEDDED_SEGMENTS_FAILED` 结束，没有明确报告缺卷，也没有在扫描阶段忽略。普通 RAR 与 SFX RAR 共用这一失败模式。
+- 本轮 pytest 仍有 3 个失败，但失败构成与上一轮不同：两个重复提取问题已通过，截断 SFX 由“无失败任务”推进到“有失败任务但类别不匹配”，同时出现两个 RAR 尾卷缺失场景。
+
+### 跳过与边界
+
+- disk-full 8 项因需要管理员权限执行 diskpart 而跳过。
+- `tests.real.test_game_tree_recursive_scan::test_game_tree_resources_are_not_authorized_for_recursive_extraction` 因未设置 `SUNPACK_RUN_GAME_TREE_TEST=1` 跳过；`tests/memory/test_watch_growth.py` 是 opt-in performance 测试，不属于默认 correctness acceptance。
+- 本节只记录本轮结果，未修复失败项。
