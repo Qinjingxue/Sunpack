@@ -45,7 +45,7 @@ def test_shift_jis_kanji_only_zip_scan_uses_cp932(tmp_path):
     expected_name = "Warrior Girl ver2.01/更新履歴.txt"
     _write_stored_zip(archive, expected_name.encode("cp932"), b"payload")
 
-    result = ArchiveMetadataScanner().scan(str(archive))
+    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
     assert result.selected_codepage == "932"
     assert result.decoded_names == [expected_name]
@@ -57,7 +57,7 @@ def test_shift_jis_zip_scan_returns_decoded_item_paths(tmp_path):
     expected_name = "日本語/説明.txt"
     _write_stored_zip(archive, expected_name.encode("cp932"), b"payload")
 
-    result = ArchiveMetadataScanner().scan(str(archive))
+    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
     assert result.selected_codepage == "932"
     assert result.decoded_names == [expected_name]
@@ -109,7 +109,7 @@ def test_unicode_path_extra_field_takes_precedence_over_codepage_guess(tmp_path)
     expected_name = "【サンプル】テスト素材.psd"
     _write_stored_zip(archive, raw_name, b"payload", unicode_name=expected_name)
 
-    result = ArchiveMetadataScanner().scan(str(archive))
+    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
     assert result.error is None
     assert result.selected_codepage is None
