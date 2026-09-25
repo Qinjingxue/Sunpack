@@ -77,6 +77,35 @@ def test_prefixed_single_disk_zip_is_not_promoted_to_multivolume(tmp_path):
     assert "zip:eocd_single_disk_without_local_header" in evidence.evidence
 
 
+def test_nonempty_single_disk_eocd_only_chunk_is_terminal_not_empty_zip(tmp_path):
+    candidate = tmp_path / "archive.zip.002"
+    candidate.write_bytes(
+        struct.pack(
+            "<4s4H2LH",
+            b"PK\x05\x06",
+            0,
+            0,
+            1,
+            1,
+            56,
+            45,
+            0,
+        )
+    )
+
+    evidence = probe_volume_anchor_paths([str(candidate)]).get(str(candidate))
+
+    assert evidence is not None
+    assert evidence.structurally_confirmed
+    assert evidence.format == "zip"
+    assert evidence.standalone is False
+    assert evidence.multivolume is False
+    assert "first" not in evidence.anchor_roles
+    assert "terminal" in evidence.anchor_roles
+    assert "zip:empty_eocd" not in evidence.evidence
+    assert "zip:eocd_single_disk_without_local_header" in evidence.evidence
+
+
 def test_modern_split_zip_first_marker_is_a_strong_volume_anchor(tmp_path):
     candidate = tmp_path / "archive.z01"
     name = b"x"
