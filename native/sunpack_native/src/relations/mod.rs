@@ -1658,11 +1658,12 @@ fn ordinary_file_group_to_dict(
     relation_confirmed: bool,
 ) -> PyResult<Py<PyDict>> {
     let parsed = parse_relation_numbered_volume(&row.name);
-    let archive_numbered_hypothesis = parsed.as_ref().is_some_and(|_| {
-        row.anchor.as_ref().is_some_and(|anchor| {
-            matches!(anchor.format.as_str(), "rar" | "7z" | "zip") || anchor.sfx
-        })
-    });
+    let archive_numbered_hypothesis = !relation_confirmed
+        && parsed.as_ref().is_some_and(|_| {
+            row.anchor.as_ref().is_some_and(|anchor| {
+                matches!(anchor.format.as_str(), "rar" | "7z" | "zip") || anchor.sfx
+            })
+        });
     let relation_format = row
         .anchor
         .as_ref()
