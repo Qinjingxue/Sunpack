@@ -1657,22 +1657,63 @@ fn ordinary_file_group_to_dict(
     row: &RelationInput,
     relation_confirmed: bool,
 ) -> PyResult<Py<PyDict>> {
+    let parsed = parse_relation_numbered_volume(&row.name);
+    let archive_numbered_hypothesis = parsed.as_ref().is_some_and(|_| {
+        row.anchor.as_ref().is_some_and(|anchor| {
+            matches!(anchor.format.as_str(), "rar" | "7z" | "zip") || anchor.sfx
+        })
+    });
+    let relation_format = row
+        .anchor
+        .as_ref()
+        .map(|anchor| anchor.format.as_str())
+        .filter(|format| !format.is_empty())
+        .or_else(|| parsed.as_ref().map(|value| value.family))
+        .unwrap_or("");
+    let split_family = if archive_numbered_hypothesis {
+        parsed
+            .as_ref()
+            .map(|value| split_family_for_proposal(relation_format, value.style))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let split_index = parsed
+        .as_ref()
+        .filter(|_| archive_numbered_hypothesis)
+        .map(|value| value.number)
+        .unwrap_or(0);
     let relation = FileRelationNative {
         filename: row.name.clone(),
-        logical_name: get_logical_name(&row.name, false),
-        split_role: None,
-        is_split_member: false,
-        has_generic_001_head: false,
-        is_plain_numeric_member: false,
+        logical_name: parsed
+            .as_ref()
+            .filter(|_| archive_numbered_hypothesis)
+            .map(logical_name_from_parsed)
+            .unwrap_or_else(|| get_logical_name(&row.name, false)),
+        split_role: archive_numbered_hypothesis.then(|| {
+            if split_index == 1 {
+                "first".to_string()
+            } else {
+                "member".to_string()
+            }
+        }),
+        is_split_member: archive_numbered_hypothesis,
+        has_generic_001_head: archive_numbered_hypothesis
+            && split_index == 1
+            && parsed.as_ref().is_some_and(|value| value.family == "generic"),
+        is_plain_numeric_member: archive_numbered_hypothesis
+            && parsed
+                .as_ref()
+                .is_some_and(|value| value.style == "plain_numeric_suffix"),
         has_split_companions: false,
         is_split_exe_companion: false,
         is_disguised_split_exe_companion: false,
-        is_split_related: false,
+        is_split_related: archive_numbered_hypothesis,
         match_rar_disguised: false,
         match_rar_head: false,
-        match_001_head: false,
-        split_family: String::new(),
-        split_index: 0,
+        match_001_head: archive_numbered_hypothesis && split_index == 1,
+        split_family,
+        split_index,
     };
     let dict = PyDict::new(py);
     dict.set_item("head_path", &row.path)?;
