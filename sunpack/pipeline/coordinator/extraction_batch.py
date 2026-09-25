@@ -171,15 +171,6 @@ class ExtractionBatchRunner:
                 direct=self.progress_direct_mode,
             )
 
-        if self.origin == "watch":
-            for task in prepared_tasks:
-                self.extractor.emit_semantic_event(
-                    task,
-                    "task_sources_claimed",
-                    critical=True,
-                    source_paths=tuple(task.cleanup_parts or task.all_parts or [task.main_path]),
-                )
-
         async def execute_one(task):
             task, outcome = await self._execute_one_async(
                 task,
@@ -213,6 +204,14 @@ class ExtractionBatchRunner:
         # extraction-ready task is submitted to the native worker, where
         # fairness and throughput-based concurrency control are centralized.
         try:
+            if self.origin == "watch":
+                for task in prepared_tasks:
+                    self.extractor.emit_semantic_event(
+                        task,
+                        "task_sources_claimed",
+                        critical=True,
+                        source_paths=tuple(task.cleanup_parts or task.all_parts or [task.main_path]),
+                    )
             outcomes = await map_unbounded(prepared_tasks, execute_one)
         finally:
             if cleanup_scope is not None:
