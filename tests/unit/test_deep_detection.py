@@ -7,6 +7,25 @@ from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
 
+def _godot_single_executable_bytes() -> bytes:
+    image = bytearray(0x100)
+    image[0:2] = b"MZ"
+    image[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    image[0x80:0x84] = b"PE\x00\x00"
+    image[0x86:0x88] = (1).to_bytes(2, "little")
+    image[0x94:0x96] = (0).to_bytes(2, "little")
+    section = 0x98
+    image[section:section + 8] = b"pck\x00\x00\x00\x00\x00"
+    image[section + 16:section + 20] = (0x40).to_bytes(4, "little")
+    image[section + 20:section + 24] = (0xC0).to_bytes(4, "little")
+    image[0xC0:0xC4] = b"GDPC"
+    image[0xC4:0xC8] = (3).to_bytes(4, "little")
+    # Model the exact failure class: compressed resource bytes inside the PCK
+    # can contain a valid-looking Zstandard frame signature.
+    image[0xD0:0xD4] = b"\x28\xb5\x2f\xfd"
+    return bytes(image)
+
+
 def _candidate(path):
     value = str(path)
     return DiscoveryCandidate(
@@ -49,6 +68,27 @@ def test_recursive_gate_may_exclude_small_residual_candidate(tmp_path):
 
     assert result.resolved_tasks == []
     assert any(trace.entry_path == str(small) and trace.status == "residual" for trace in result.traces)
+
+
+def test_godot_single_executable_rejects_before_embedded_zstd_scan(tmp_path, monkeypatch):
+    path = tmp_path / "godot_game.exe"
+    path.write_bytes(_godot_single_executable_bytes())
+
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("Godot single executable must reject before embedded Zstd scanning")
+        ),
+    )
+
+    result = EmbeddedDiscovery({}).discover([_candidate(path)])
+
+    assert result.resolved_tasks == []
+    assert result.residual_paths
+    assert any(
+        trace.reason == "Runtime bundle: godot_single_executable"
+        for trace in result.traces
+    )
 
 
 def test_default_embedded_scan_honors_runtime_bundle_guard(tmp_path, monkeypatch):
