@@ -827,9 +827,9 @@ Byte * CSpecState::Decode(Byte *data, size_t size) throw()
 static const unsigned kStreamingBZipMaxLanes = 4;
 static const size_t kStreamingBZipReadChunk = (size_t)1 << 18;  // 256 KiB.
 static const size_t kStreamingBZipCommitChunk = (size_t)1 << 18;
-static const UInt64 kStreamingBZipBlockMagic = UINT64_C(0x314159265359);
-static const UInt64 kStreamingBZipEndMagic = UINT64_C(0x177245385090);
-static const UInt64 kStreamingBZipMagicMask = UINT64_C(0x0000FFFFFFFFFFFF);
+static const UInt64 kStreamingBZipBlockMagic = UINT64_CONST(0x314159265359);
+static const UInt64 kStreamingBZipEndMagic = UINT64_CONST(0x177245385090);
+static const UInt64 kStreamingBZipMagicMask = UINT64_CONST(0x0000FFFFFFFFFFFF);
 // A valid block contains at most kBlockSizeMax decoded Huffman symbols and
 // each symbol is at most kMaxHuffmanLen bits. Leave generous metadata slack.
 static const UInt64 kStreamingBZipEncodedLookahead =
@@ -2089,37 +2089,15 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
     {
       unsigned blockCandidates = 0;
       UInt64 lastCandidateBit = expectedBit;
-      bool sawEnd = false;
 
       for (const CStreamingBZipMarker &marker: input.Markers())
       {
-        if (marker.BitOffset < expectedBit)
+        if (marker.BitOffset < expectedBit || marker.IsEnd)
           continue;
-        if (marker.IsEnd)
-        {
-          sawEnd = true;
-          break;
-        }
         blockCandidates++;
         lastCandidateBit = marker.BitOffset;
         if (blockCandidates >= maxLanes)
           break;
-      }
-
-      if (sawEnd)
-      {
-        const CStreamingBZipMarker *endMarker = NULL;
-        for (const CStreamingBZipMarker &marker: input.Markers())
-          if (marker.BitOffset >= expectedBit && marker.IsEnd)
-          {
-            endMarker = &marker;
-            break;
-          }
-        if (endMarker)
-        {
-          RINOK(input.EnsureBit(endMarker->BitOffset + 80))
-          break;
-        }
       }
 
       if (blockCandidates >= maxLanes)
@@ -2131,6 +2109,9 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
           break;
       }
 
+      // EOS remains speculative until an authoritative full-block decode lands
+      // exactly on it. Never stop input merely because the scanner saw an EOS
+      // bit pattern inside compressed payload.
       if (input.Eof())
         break;
 
