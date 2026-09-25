@@ -698,10 +698,10 @@ fn promote_sfx_archive_anchor(
     }
 
     // Relations only owns genuine self-extracting archives.  A PE with an
-    // arbitrary archive overlay is an Embedded concern (games and application
-    // bundles commonly use that layout).  Prove the decompressor stub first,
-    // using a bounded image-only probe, then validate the archive at the
-    // overlay offset below.
+    // arbitrary archive overlay is not enough: normal Embedded discovery skips
+    // executable carriers, while explicit deep-detect may scan them separately.
+    // Prove the decompressor stub first with a bounded image-only probe, then
+    // validate the archive at the overlay offset below.
     let sfx_path = row.path.clone();
     let sfx_profile = py.detach(move || executable_sfx_stub_profile(&sfx_path, image_end));
     let sfx_matches_format = match sfx_profile.as_str() {
