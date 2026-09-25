@@ -1,4 +1,5 @@
 #include "sevenzip_streams.hpp"
+#include "decoder_input_access.h"
 
 namespace sunpack::sevenzip
 {
@@ -136,3 +137,69 @@ namespace sunpack::sevenzip
 #endif
 
 } // namespace sunpack::sevenzip
+
+extern "C"
+{
+
+int sunpack_input_random_access_size(
+    void *stream,
+    unsigned long long *size)
+{
+#ifdef _WIN32
+    if (!stream || !size)
+        return 0;
+
+    auto *sequential = static_cast<ISequentialInStream *>(stream);
+    auto *source =
+        dynamic_cast<sunpack::sevenzip::RandomAccessInStreamSource *>(sequential);
+    if (!source)
+        return 0;
+
+    *size = static_cast<unsigned long long>(source->random_access_size());
+    return 1;
+#else
+    (void)stream;
+    (void)size;
+    return 0;
+#endif
+}
+
+long sunpack_input_read_at(
+    void *stream,
+    unsigned long long offset,
+    void *data,
+    unsigned long size,
+    unsigned long *processed)
+{
+#ifdef _WIN32
+    if (processed)
+        *processed = 0;
+    if (!stream)
+        return E_INVALIDARG;
+
+    auto *sequential = static_cast<ISequentialInStream *>(stream);
+    auto *source =
+        dynamic_cast<sunpack::sevenzip::RandomAccessInStreamSource *>(sequential);
+    if (!source)
+        return E_NOINTERFACE;
+
+    UInt32 read = 0;
+    const HRESULT result = source->random_read_at(
+        static_cast<UInt64>(offset),
+        data,
+        static_cast<UInt32>(size),
+        &read);
+    if (processed)
+        *processed = static_cast<unsigned long>(read);
+    return result;
+#else
+    (void)stream;
+    (void)offset;
+    (void)data;
+    (void)size;
+    (void)processed;
+    return -1;
+#endif
+}
+
+} // extern "C"
