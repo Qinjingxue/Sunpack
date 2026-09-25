@@ -329,8 +329,9 @@ namespace sunpack::sevenzip
         // query_root_ 未解析（synthetic 卷首次失败前）时返回 false。
         bool query_free_bytes(std::uint64_t *free_bytes, std::uint64_t *total_bytes) noexcept;
         unsigned long last_query_error() const noexcept;
-        // 卷暂时不可查询（拔盘 / UNC 断开 / 权限变化 / query_root 未解析）：只记录诊断，
-        // 不改变状态。
+        // 卷暂时不可查询（拔盘 / UNC 断开 / 权限变化 / query_root 未解析）：
+        // 记录诊断；若当前已有 probe 在途，则撤销该许可并退回 Blocked。这样查询失败之后
+        // 到达的旧 probe success 不能错误产生 space_resumed。
         void note_query_failure(unsigned long win32_error) noexcept;
 
         // 空间改善则发放一个 probe 许可并进入 Probing；全部水位规则在这里，monitor 只采样：
@@ -386,6 +387,25 @@ namespace sunpack::sevenzip
         {
             return phase_ == VolumeSpacePhase::Probing && token != 0 &&
                    probe_owner_token_ == token;
+        }
+
+        bool record_query_failure_locked(unsigned long win32_error) noexcept
+        {
+            last_query_ok_ = false;
+            last_query_error_ = win32_error;
+
+            if (phase_ != VolumeSpacePhase::Probing)
+            {
+                return false;
+            }
+
+            // A failed volume query is newer evidence than the monitor sample
+            // that authorised the current probe. Revoke that permit so its
+            // later I/O completion cannot resurrect an unavailable volume.
+            phase_ = VolumeSpacePhase::Blocked;
+            probe_owner_token_ = 0;
+            watermark_valid_ = false;
+            return true;
         }
 
         void remove_waiter_locked(std::uint64_t token) noexcept;
@@ -649,10 +669,15 @@ namespace sunpack::sevenzip
         }
         if (path.empty())
         {
-            // 没有查询根：保持 Blocked，只记录诊断。
-            std::lock_guard<std::mutex> lock(mutex_);
-            last_query_ok_ = false;
-            last_query_error_ = ERROR_PATH_NOT_FOUND;
+            bool invalidated_probe = false;
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                invalidated_probe = record_query_failure_locked(ERROR_PATH_NOT_FOUND);
+            }
+            if (invalidated_probe)
+            {
+                cv_.notify_all();
+            }
             return false;
         }
 
@@ -661,14 +686,23 @@ namespace sunpack::sevenzip
         const bool queried = query_volume_free_bytes(path, &local_free, &local_total);
         const unsigned long query_error = queried ? 0UL : GetLastError();
 
+        bool invalidated_probe = false;
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            last_query_ok_ = queried;
-            last_query_error_ = queried ? 0UL : query_error;
             if (queried)
             {
+                last_query_ok_ = true;
+                last_query_error_ = 0;
                 last_free_bytes_ = local_free;
             }
+            else
+            {
+                invalidated_probe = record_query_failure_locked(query_error);
+            }
+        }
+        if (invalidated_probe)
+        {
+            cv_.notify_all();
         }
         if (queried)
         {
@@ -692,9 +726,15 @@ namespace sunpack::sevenzip
 
     inline void VolumeSpaceGate::note_query_failure(unsigned long win32_error) noexcept
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        last_query_ok_ = false;
-        last_query_error_ = win32_error;
+        bool invalidated_probe = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            invalidated_probe = record_query_failure_locked(win32_error);
+        }
+        if (invalidated_probe)
+        {
+            cv_.notify_all();
+        }
     }
 
     inline bool VolumeSpaceGate::poll(std::uint64_t free_bytes_now) noexcept
