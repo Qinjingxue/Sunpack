@@ -2715,7 +2715,7 @@ def test_watch_event_handler_keeps_dispatcher_alive_when_native_observation_is_t
     ]
 
 
-def test_watch_scheduler_defers_pending_split_volume_during_source_cleanup_promotion(
+def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_promotion(
     tmp_path,
     monkeypatch,
 ):
@@ -2725,8 +2725,6 @@ def test_watch_scheduler_defers_pending_split_volume_during_source_cleanup_promo
     first_volume.write_bytes(b"head volume")
     sibling_volume.write_bytes(b"sibling volume")
 
-    clock = WatchClock(time.time())
-    clock.install(monkeypatch)
     watcher = WatchScheduler(
         {"watch": {"clipboard_monitor_enabled": False}},
         [str(tmp_path)],
@@ -2737,24 +2735,128 @@ def test_watch_scheduler_defers_pending_split_volume_during_source_cleanup_promo
     )
     watcher.enqueue(str(sibling_volume))
     assert watcher.pending_count == 1
-    clock.advance(10.0)
 
-    # Successful extraction cleans every source volume under one promotion
-    # barrier. A queued sibling event must remain pending until that barrier
-    # ends; its refresh currently leaks the native WouldBlock out of run_once.
+    observed = []
+    real_candidate = scheduler_module._candidate_for_event_path
+
+    def recording_candidate(path, *, since_usn=0):
+        observed.append(os.path.abspath(path))
+        return real_candidate(path, since_usn=since_usn)
+
+    monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", recording_candidate)
+    watcher._handle_pipeline_progress(
+        str(first_volume),
+        "pipeline-owner",
+        SimpleNamespace(
+            main_path=str(first_volume),
+            cleanup_parts=[str(first_volume), str(sibling_volume)],
+        ),
+        {
+            "event": "task_sources_claimed",
+            "source_paths": (str(first_volume), str(sibling_volume)),
+        },
+    )
+
+    # The pipeline claim consumes the old sibling event. During cleanup, even
+    # a new watchdog event becomes only a dirty bit; no native file observation
+    # is admitted while the promotion gate can reject it.
+    assert watcher.pending_count == 0
     with promotion_barrier((first_volume, sibling_volume), quiesce=False):
-        try:
-            result = _await(watcher.run_once())
-        except OSError as exc:
-            pytest.fail(
-                "watcher must defer a pending split-volume refresh while source "
-                f"cleanup promotion is active, not abort run_once: {exc}"
-            )
-        assert result.processed == 0
-        assert watcher.pending_count == 1
+        watcher.enqueue(str(sibling_volume), event_type="modified")
+        assert _await(watcher.run_once()).processed == 0
+        assert observed == []
 
-    result = _await(watcher.run_once())
-    assert result.processed == 1
+    watcher._release_pipeline_source_claims("pipeline-owner")
+
+    # Reconciliation happens once after the pipeline lease/promotion lifetime.
+    assert observed == [os.path.abspath(str(sibling_volume))]
+    assert watcher.pending_count == 0
+
+
+def test_watch_scheduler_claim_hands_off_only_new_generation_after_release(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    first_volume = tmp_path / "split.7z.001"
+    sibling_volume = tmp_path / "split.7z.002"
+    first_volume.write_bytes(b"head volume")
+    sibling_volume.write_bytes(b"old sibling")
+
+    watcher = WatchScheduler(
+        {"watch": {"clipboard_monitor_enabled": False}},
+        [str(tmp_path)],
+        out_dir=str(tmp_path / "out"),
+        state_path=str(tmp_path / "state.json"),
+        cold_start_seconds=0,
+        initial_scan=False,
+    )
+    watcher.enqueue(str(sibling_volume))
+    watcher._claim_pipeline_sources(
+        "pipeline-owner",
+        (str(first_volume), str(sibling_volume)),
+    )
+    assert watcher.pending_count == 0
+
+    observed = []
+    real_candidate = scheduler_module._candidate_for_event_path
+
+    def recording_candidate(path, *, since_usn=0):
+        observed.append(os.path.abspath(path))
+        return real_candidate(path, since_usn=since_usn)
+
+    monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", recording_candidate)
+    sibling_volume.write_bytes(b"new sibling generation with more bytes")
+    watcher.enqueue(str(sibling_volume), event_type="modified")
+
+    assert observed == []
+    assert watcher.pending_count == 0
+
+    watcher._release_pipeline_source_claims("pipeline-owner")
+
+    assert observed == [os.path.abspath(str(sibling_volume))]
+    assert watcher.pending_count == 1
+
+
+def test_watch_scheduler_departed_claimed_source_stays_owned_until_pipeline_finishes(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    first_volume = tmp_path / "split.7z.001"
+    sibling_volume = tmp_path / "split.7z.002"
+    first_volume.write_bytes(b"head volume")
+    sibling_volume.write_bytes(b"sibling volume")
+
+    watcher = WatchScheduler(
+        {"watch": {"clipboard_monitor_enabled": False}},
+        [str(tmp_path)],
+        out_dir=str(tmp_path / "out"),
+        state_path=str(tmp_path / "state.json"),
+        cold_start_seconds=0,
+        initial_scan=False,
+    )
+    watcher.enqueue(str(sibling_volume))
+    watcher._claim_pipeline_sources(
+        "pipeline-owner",
+        (str(first_volume), str(sibling_volume)),
+    )
+
+    forgotten = []
+    original_forget = watcher.state.forget_path
+
+    def recording_forget(path, *, recursive=False):
+        forgotten.append((path, recursive))
+        return original_forget(path, recursive=recursive)
+
+    monkeypatch.setattr(watcher.state, "forget_path", recording_forget)
+    sibling_volume.unlink()
+    watcher.notify_path_departed(str(sibling_volume))
+
+    assert forgotten == []
+    assert watcher.pending_count == 0
+
+    watcher._release_pipeline_source_claims("pipeline-owner")
     assert watcher.pending_count == 0
 
 
