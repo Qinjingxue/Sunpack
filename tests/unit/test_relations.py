@@ -173,6 +173,7 @@ def test_arbitrary_pe_zip_overlay_requires_deep_detect_for_embedded_discovery(tm
     assert descriptor.primary_extent is not None
     assert descriptor.primary_extent.start == pe_end
 
+
 def test_filename_numbered_7z_without_structural_seed_is_not_grouped(tmp_path):
     names = ["archive.7z.001", "archive.7z.002", "archive.7z.003"]
     for name in names:
