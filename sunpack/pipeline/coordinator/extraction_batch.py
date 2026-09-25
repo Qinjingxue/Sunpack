@@ -171,6 +171,15 @@ class ExtractionBatchRunner:
                 direct=self.progress_direct_mode,
             )
 
+        if self.origin == "watch":
+            for task in prepared_tasks:
+                self.extractor.emit_semantic_event(
+                    task,
+                    "task_sources_claimed",
+                    critical=True,
+                    source_paths=tuple(task.cleanup_parts or task.all_parts or [task.main_path]),
+                )
+
         async def execute_one(task):
             task, outcome = await self._execute_one_async(
                 task,
