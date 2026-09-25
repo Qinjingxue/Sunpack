@@ -160,7 +160,7 @@ fn godot_pck_section_matches(reader: &ManagedReader, section_offset: u64) -> io:
             continue;
         }
         let version = u32::from_le_bytes(probe[delta + 4..end].try_into().unwrap());
-        if (2..=4).contains(&version) {
+        if (1..=4).contains(&version) {
             return Ok(true);
         }
     }
@@ -195,7 +195,7 @@ fn godot_pck_trailer_matches(
         return Ok(false);
     }
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
-    Ok((2..=4).contains(&version))
+    Ok((1..=4).contains(&version))
 }
 
 fn nsis_overlay_layout_matches(
@@ -358,7 +358,9 @@ mod tests {
     #[test]
     fn identifies_godot_eof_pck_trailer_without_scanning_payload() {
         let image_end = 64u64;
-        let pck = [b"GDPC".as_slice(), &3u32.to_le_bytes(), b"payload"].concat();
+        let mut pck = b"GDPC".to_vec();
+        pck.extend_from_slice(&3u32.to_le_bytes());
+        pck.extend_from_slice(b"payload");
         let mut data = vec![b'x'; image_end as usize];
         data.extend_from_slice(&pck);
         data.extend_from_slice(&(pck.len() as u64).to_le_bytes());
@@ -442,7 +444,7 @@ mod tests {
         data.extend_from_slice(&QT_IFW_MAGIC_MARKERS[0].to_le_bytes());
         data.extend_from_slice(&QT_IFW_MAGIC_COOKIE.to_le_bytes());
         let path = temp_file("runtime_profile_qt", &data);
-        let profile = runtime_bundle_profile_native(path.to_str().unwrap(), 2, 2).unwrap();
+        let profile = runtime_bundle_profile_native(path.to_str().unwrap(), 2, 2, 0).unwrap();
         assert_eq!(profile, "qt_installer_framework");
         let _ = fs::remove_file(path);
     }
