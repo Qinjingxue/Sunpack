@@ -788,6 +788,7 @@ class _RequestRuntime:
                 callback(task, dict(event))
             except Exception:
                 lifecycle_event = str(event.get("event") or "") in {
+                    "task_sources_claimed",
                     "task_output_started",
                     "task_output_finished",
                 }
@@ -912,6 +913,21 @@ class _RequestRuntime:
                 )
                 if coalesced_owner:
                     raise _CoalescedWatchRequest(coalesced_owner)
+                if submission.origin == "watch" and tasks:
+                    claimed_sources = tuple(dict.fromkeys(
+                        path
+                        for task in tasks
+                        for path in (task.cleanup_parts or task.all_parts or [task.main_path])
+                        if path
+                    ))
+                    self._report_progress(
+                        tasks[0],
+                        {
+                            "type": "semantic",
+                            "event": "task_sources_claimed",
+                            "source_paths": claimed_sources,
+                        },
+                    )
 
                 watch_versions: dict[str, tuple[tuple[str, int, int, int, int], ...]] = {}
                 if submission.origin == "watch":

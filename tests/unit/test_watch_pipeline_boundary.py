@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from sunpack.core.contracts.pipeline import PipelineDiscovery
+from sunpack.pipeline.coordinator.engine import _RequestRuntime
 from sunpack.runtime.watch.scheduler import WatchScheduler, _response_claimed_paths
 
 
@@ -26,6 +27,17 @@ def test_watch_consumes_pipeline_claimed_paths_without_reconstructing_membership
         str(first),
         str(second),
     ]
+
+
+def test_watch_source_claim_is_published_at_resolved_path_lease_boundary():
+    source = inspect.getsource(_RequestRuntime.execute_async)
+
+    lease = source.index("coalesced_owner = await self.path_leases.replace")
+    claim = source.index('"task_sources_claimed"')
+    dispatch = source.index("new_roots = await self.batch_runner.execute_async")
+
+    assert lease < claim < dispatch
+    assert "task.cleanup_parts or task.all_parts" in source
 
 
 def test_watch_layer_does_not_import_archive_discovery_internals():
