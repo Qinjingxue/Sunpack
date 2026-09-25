@@ -188,6 +188,13 @@ class WatchScheduler:
             os.path.abspath(str(log_path)),
         }
         self._lock = threading.Lock()
+        # Serializes Watch file-observation admission with pipeline source-claim
+        # publication. The lock is held only across short candidate/readiness
+        # probes, so a claim is a true linearization point: an observation is
+        # either fully admitted before the claim or cannot touch the source.
+        self._claim_gate = threading.RLock()
+        self._active_claims: dict[str, str] = {}
+        self._dirty_during_claim: dict[str, dict[str, str]] = {}
         self._password_source_lock = threading.RLock()
         self._pending: dict[str, WatchCandidate] = {}
         self._inflight_requests: list[_ActivePipelineRequest] = []
@@ -703,6 +710,10 @@ class WatchScheduler:
             self._arm_idle_cache_cleanup()
             return single
         finally:
+            # PipelineEngine.run() is done here, so its path lease and any
+            # source cleanup promotion have already ended. Hand off only paths
+            # that actually changed while this request owned them.
+            self._release_pipeline_source_claims(request.notification_id)
             if request.registry_owner:
                 from sunpack.runtime.cli.runtime_state import runtime_host
 
@@ -852,101 +863,104 @@ class WatchScheduler:
             self._log_candidate_ignored(path, "directory_password_file")
             return
         lookup_path = os.path.abspath(path)
-        with self._lock:
-            previous_hint = self._candidate_baseline_locked(lookup_path)
-        if previous_hint is None:
-            previous_hint = _candidate_from_state_entry(self.state.latest_entry_for_path(lookup_path))
-        candidate = _candidate_for_event_path(
-            path,
-            since_usn=previous_hint.change_usn if previous_hint is not None else 0,
-        )
-        if candidate is None:
-            self._log_candidate_ignored(path, "not_a_file_or_unreadable")
-            return
-        password_retry = (
-            _password_retry_snapshot is not None
-            and _candidate_matches_password_failure(candidate, _password_retry_snapshot)
-        )
-        internal_recovery = bool(_crash_recovery)
-        if not self._is_under_watched_root(candidate.path) and not password_retry and not internal_recovery:
-            self._log_candidate_ignored(candidate.path, "outside_watched_roots")
-            return
-        if self._is_under_metadata_dir(candidate.path):
-            self._log_candidate_ignored(candidate.path, "under_metadata_dir")
-            return
-        now = time.time()
-        with self._lock:
-            previous = self._candidate_baseline_locked(candidate.path) or previous_hint
-            change_kind = _candidate_change_kind(previous, candidate)
-            if not force and change_kind == _CandidateChangeKind.UNCHANGED:
+        with self._claim_gate:
+            if self._defer_claimed_path_locked(lookup_path):
                 return
-            if not force and change_kind == _CandidateChangeKind.METADATA_ONLY:
-                self._accept_metadata_observation_locked(candidate, now)
+            with self._lock:
+                previous_hint = self._candidate_baseline_locked(lookup_path)
+            if previous_hint is None:
+                previous_hint = _candidate_from_state_entry(self.state.latest_entry_for_path(lookup_path))
+            candidate = _candidate_for_event_path(
+                path,
+                since_usn=previous_hint.change_usn if previous_hint is not None else 0,
+            )
+            if candidate is None:
+                self._log_candidate_ignored(path, "not_a_file_or_unreadable")
                 return
-            state = self._active_states.get(candidate.path)
-            if state is not None:
-                self._pending[candidate.path] = candidate
-                self._latest_observations[candidate.path] = candidate
-                quiet_seconds = self._observe_candidate_activity(
-                    candidate,
-                    now,
-                    content_changed=True,
-                )
-                state.last_event_at = now
-                state.quiet_seconds = quiet_seconds
-                state.generation += 1
-                self._wake_service()
+            password_retry = (
+                _password_retry_snapshot is not None
+                and _candidate_matches_password_failure(candidate, _password_retry_snapshot)
+            )
+            internal_recovery = bool(_crash_recovery)
+            if not self._is_under_watched_root(candidate.path) and not password_retry and not internal_recovery:
+                self._log_candidate_ignored(candidate.path, "outside_watched_roots")
                 return
-        became_active = False
-        active_quiet_seconds = self.cold_start_seconds
-        with self._lock:
-            previous = self._candidate_baseline_locked(candidate.path)
-            change_kind = _candidate_change_kind(previous, candidate)
-            if not force and change_kind == _CandidateChangeKind.UNCHANGED:
+            if self._is_under_metadata_dir(candidate.path):
+                self._log_candidate_ignored(candidate.path, "under_metadata_dir")
                 return
-            if not force and change_kind == _CandidateChangeKind.METADATA_ONLY:
-                self._accept_metadata_observation_locked(candidate, now)
-                return
-            state = self._active_states.get(candidate.path)
-            if state is None:
-                retry_is_unchanged = password_retry or internal_recovery
-                active_quiet_seconds = (
-                    0.0
-                    if retry_is_unchanged
-                    else self._observe_candidate_activity(candidate, now)
-                )
-                # Persist before making the candidate visible to concurrent
-                # scheduler/event paths. If fsync fails there is no in-memory
-                # work that can proceed without a crash-recovery record.
-                if not _state_prequeued:
-                    durable_owner = bool(password_retry or internal_recovery)
-                    self.state.queue_active(
+            now = time.time()
+            with self._lock:
+                previous = self._candidate_baseline_locked(candidate.path) or previous_hint
+                change_kind = _candidate_change_kind(previous, candidate)
+                if not force and change_kind == _CandidateChangeKind.UNCHANGED:
+                    return
+                if not force and change_kind == _CandidateChangeKind.METADATA_ONLY:
+                    self._accept_metadata_observation_locked(candidate, now)
+                    return
+                state = self._active_states.get(candidate.path)
+                if state is not None:
+                    self._pending[candidate.path] = candidate
+                    self._latest_observations[candidate.path] = candidate
+                    quiet_seconds = self._observe_candidate_activity(
                         candidate,
-                        force=force,
-                        password_scope_dir=_recovery_scope_dir,
-                        internal_recovery=internal_recovery,
-                        durable_owner=durable_owner,
-                        persist=durable_owner,
-                        durable=durable_owner,
+                        now,
+                        content_changed=True,
                     )
-                self._pending[candidate.path] = candidate
-                self._latest_observations[candidate.path] = candidate
-                became_active = True
-                self._active_states[candidate.path] = _ActiveCandidateState(
-                    last_event_at=now,
-                    quiet_seconds=active_quiet_seconds,
-                )
-            else:
-                self._pending[candidate.path] = candidate
-                self._latest_observations[candidate.path] = candidate
-                active_quiet_seconds = self._observe_candidate_activity(
-                    candidate,
-                    now,
-                    content_changed=True,
-                )
-                state.last_event_at = now
-                state.quiet_seconds = active_quiet_seconds
-                state.generation += 1
+                    state.last_event_at = now
+                    state.quiet_seconds = quiet_seconds
+                    state.generation += 1
+                    self._wake_service()
+                    return
+            became_active = False
+            active_quiet_seconds = self.cold_start_seconds
+            with self._lock:
+                previous = self._candidate_baseline_locked(candidate.path)
+                change_kind = _candidate_change_kind(previous, candidate)
+                if not force and change_kind == _CandidateChangeKind.UNCHANGED:
+                    return
+                if not force and change_kind == _CandidateChangeKind.METADATA_ONLY:
+                    self._accept_metadata_observation_locked(candidate, now)
+                    return
+                state = self._active_states.get(candidate.path)
+                if state is None:
+                    retry_is_unchanged = password_retry or internal_recovery
+                    active_quiet_seconds = (
+                        0.0
+                        if retry_is_unchanged
+                        else self._observe_candidate_activity(candidate, now)
+                    )
+                    # Persist before making the candidate visible to concurrent
+                    # scheduler/event paths. If fsync fails there is no in-memory
+                    # work that can proceed without a crash-recovery record.
+                    if not _state_prequeued:
+                        durable_owner = bool(password_retry or internal_recovery)
+                        self.state.queue_active(
+                            candidate,
+                            force=force,
+                            password_scope_dir=_recovery_scope_dir,
+                            internal_recovery=internal_recovery,
+                            durable_owner=durable_owner,
+                            persist=durable_owner,
+                            durable=durable_owner,
+                        )
+                    self._pending[candidate.path] = candidate
+                    self._latest_observations[candidate.path] = candidate
+                    became_active = True
+                    self._active_states[candidate.path] = _ActiveCandidateState(
+                        last_event_at=now,
+                        quiet_seconds=active_quiet_seconds,
+                    )
+                else:
+                    self._pending[candidate.path] = candidate
+                    self._latest_observations[candidate.path] = candidate
+                    active_quiet_seconds = self._observe_candidate_activity(
+                        candidate,
+                        now,
+                        content_changed=True,
+                    )
+                    state.last_event_at = now
+                    state.quiet_seconds = active_quiet_seconds
+                    state.generation += 1
         if became_active:
             self.log.write(
                 "candidate_active",
@@ -960,6 +974,81 @@ class WatchScheduler:
                 pending=self.pending_count,
             )
             self._wake_service()
+
+    def _defer_claimed_path_locked(self, path: str) -> bool:
+        normalized = os.path.abspath(path)
+        key = path_key(normalized)
+        owner = self._active_claims.get(key)
+        if not owner:
+            return False
+        self._dirty_during_claim.setdefault(owner, {})[key] = normalized
+        return True
+
+    def _claim_pipeline_sources(self, owner: str, paths: Iterable[str]) -> None:
+        normalized = dedupe_normalized_paths(
+            os.path.abspath(str(path))
+            for path in paths
+            if str(path or "")
+        )
+        if not owner or not normalized:
+            return
+        retired_pending: list[str] = []
+        with self._claim_gate:
+            claimed_keys = {path_key(path) for path in normalized}
+            for source_path in normalized:
+                key = path_key(source_path)
+                previous_owner = self._active_claims.get(key)
+                if previous_owner and previous_owner != owner:
+                    previous_dirty = self._dirty_during_claim.get(previous_owner)
+                    if previous_dirty and key in previous_dirty:
+                        self._dirty_during_claim.setdefault(owner, {})[key] = previous_dirty.pop(key)
+                        if not previous_dirty:
+                            self._dirty_during_claim.pop(previous_owner, None)
+                self._active_claims[key] = owner
+            with self._lock:
+                retired_pending = [
+                    candidate_path
+                    for candidate_path in self._pending
+                    if path_key(os.path.abspath(candidate_path)) in claimed_keys
+                ]
+                for candidate_path in retired_pending:
+                    self._pending.pop(candidate_path, None)
+                    self._active_states.pop(candidate_path, None)
+        self.log.write(
+            "pipeline_sources_claimed",
+            owner=owner,
+            paths=normalized,
+            retired_pending=len(retired_pending),
+        )
+
+    def _release_pipeline_source_claims(self, owner: str) -> None:
+        if not owner:
+            return
+        reconcile: list[str] = []
+        released = 0
+        with self._claim_gate:
+            owned_keys = [
+                key for key, current_owner in self._active_claims.items()
+                if current_owner == owner
+            ]
+            for key in owned_keys:
+                self._active_claims.pop(key, None)
+            released = len(owned_keys)
+            dirty = self._dirty_during_claim.pop(owner, {})
+            reconcile = [
+                path
+                for key, path in dirty.items()
+                if key not in self._active_claims
+            ]
+        if released or reconcile:
+            self.log.write(
+                "pipeline_sources_released",
+                owner=owner,
+                released=released,
+                dirty=len(reconcile),
+            )
+        for dirty_path in reconcile:
+            self.enqueue(dirty_path, event_type="pipeline_claim_released")
 
     def should_ignore_event_path(self, path: str) -> bool:
         if not path:
@@ -1011,45 +1100,54 @@ class WatchScheduler:
 
     def notify_path_departed(self, path: str, *, recursive: bool = False) -> None:
         normalized = os.path.abspath(path)
-        with self._lock:
-            # Watch owns only the submitted event path. Archive membership and
-            # physical ownership belong to PipelineEngine after discovery.
-            inflight_owned = any(
-                _paths_match(request.candidate.path, normalized, recursive=recursive)
-                for request in self._inflight_requests
+        with self._claim_gate:
+            claimed = [
+                (claim_path, owner)
+                for claim_path, owner in self._active_claims.items()
+                if _paths_match(claim_path, normalized, recursive=recursive)
+            ]
+            for claim_path, owner in claimed:
+                self._dirty_during_claim.setdefault(owner, {})[claim_path] = claim_path
+            with self._lock:
+                # The submitted seed is only the initial Watch ownership. Once
+                # pipeline discovery publishes its physical source claim, every
+                # claimed sibling belongs to that in-flight request as well.
+                inflight_owned = bool(claimed) or any(
+                    _paths_match(request.candidate.path, normalized, recursive=recursive)
+                    for request in self._inflight_requests
+                )
+                pending_paths = [
+                    candidate_path
+                    for candidate_path in self._pending
+                    if _paths_match(candidate_path, normalized, recursive=recursive)
+                ]
+                for candidate_path in pending_paths:
+                    self._pending.pop(candidate_path, None)
+                    self._active_states.pop(candidate_path, None)
+                tracker_paths = [
+                    candidate_path
+                    for candidate_path in self._quiet_trackers
+                    if _paths_match(candidate_path, normalized, recursive=recursive)
+                ]
+                for candidate_path in tracker_paths:
+                    self._quiet_trackers.pop(candidate_path, None)
+                observation_paths = [
+                    candidate_path
+                    for candidate_path in self._latest_observations
+                    if _paths_match(candidate_path, normalized, recursive=recursive)
+                ]
+                for candidate_path in observation_paths:
+                    self._latest_observations.pop(candidate_path, None)
+            pending_record = self.state.pending_work_for_path(normalized)
+            recovery_armed = bool(
+                pending_record is not None
+                and (pending_record.active_outputs or pending_record.committed_roots)
             )
-            pending_paths = [
-                candidate_path
-                for candidate_path in self._pending
-                if _paths_match(candidate_path, normalized, recursive=recursive)
-            ]
-            for candidate_path in pending_paths:
-                self._pending.pop(candidate_path, None)
-                self._active_states.pop(candidate_path, None)
-            tracker_paths = [
-                candidate_path
-                for candidate_path in self._quiet_trackers
-                if _paths_match(candidate_path, normalized, recursive=recursive)
-            ]
-            for candidate_path in tracker_paths:
-                self._quiet_trackers.pop(candidate_path, None)
-            observation_paths = [
-                candidate_path
-                for candidate_path in self._latest_observations
-                if _paths_match(candidate_path, normalized, recursive=recursive)
-            ]
-            for candidate_path in observation_paths:
-                self._latest_observations.pop(candidate_path, None)
-        pending_record = self.state.pending_work_for_path(normalized)
-        recovery_armed = bool(
-            pending_record is not None
-            and (pending_record.active_outputs or pending_record.committed_roots)
-        )
-        forgotten = (
-            False
-            if inflight_owned or recovery_armed
-            else self.state.forget_path(normalized, recursive=recursive)
-        )
+            forgotten = (
+                False
+                if inflight_owned or recovery_armed
+                else self.state.forget_path(normalized, recursive=recursive)
+            )
         self.log.write(
             "candidate_departed",
             path=normalized,
@@ -1082,49 +1180,55 @@ class WatchScheduler:
                     ))
 
         for path, candidate, generation, quiet_seconds in due:
-            refreshed = _candidate_for_event_path(path, since_usn=candidate.change_usn)
-            if refreshed is None:
-                self._drop_active(path, generation)
-                self.state.forget_path(path)
-                continue
-            if _candidate_observation_changed(candidate, refreshed):
-                if _candidate_content_changed(candidate, refreshed):
-                    self._record_boundary_activity(path, generation, refreshed, now)
+            # Claim publication and source observation share this admission
+            # gate. Therefore cleanup can never publish a claim in the middle
+            # of a candidate/readiness probe and later reject that same probe.
+            with self._claim_gate:
+                if path_key(os.path.abspath(path)) in self._active_claims:
                     continue
-                if not self._update_boundary_metadata(path, generation, refreshed):
+                refreshed = _candidate_for_event_path(path, since_usn=candidate.change_usn)
+                if refreshed is None:
+                    self._drop_active(path, generation)
+                    self.state.forget_path(path)
                     continue
-                candidate = refreshed
-            if not watch_file_is_ready(path):
-                self._record_boundary_activity(
-                    path,
-                    generation,
-                    refreshed,
-                    now,
-                    content_changed=False,
+                if _candidate_observation_changed(candidate, refreshed):
+                    if _candidate_content_changed(candidate, refreshed):
+                        self._record_boundary_activity(path, generation, refreshed, now)
+                        continue
+                    if not self._update_boundary_metadata(path, generation, refreshed):
+                        continue
+                    candidate = refreshed
+                if not watch_file_is_ready(path):
+                    self._record_boundary_activity(
+                        path,
+                        generation,
+                        refreshed,
+                        now,
+                        content_changed=False,
+                    )
+                    self.log.write_throttled(
+                        "candidate_busy",
+                        throttle_key=os.path.normcase(os.path.abspath(path)),
+                        interval_seconds=30.0,
+                        path=path,
+                    )
+                    continue
+                identified = refreshed
+                with self._lock:
+                    state = self._active_states.get(path)
+                    if state is None or state.generation != generation:
+                        continue
+                    self._pending.pop(path, None)
+                    self._active_states.pop(path, None)
+                self.state.record_attempt(
+                    identified.path,
+                    identified.size,
+                    identified.mtime,
+                    identified.file_id,
+                    identified.change_usn,
                 )
-                self.log.write_throttled(
-                    "candidate_busy",
-                    throttle_key=os.path.normcase(os.path.abspath(path)),
-                    interval_seconds=30.0,
-                    path=path,
-                )
-                continue
-            identified = refreshed
-            with self._lock:
-                state = self._active_states.get(path)
-                if state is None or state.generation != generation:
-                    continue
-                self._pending.pop(path, None)
-                self._active_states.pop(path, None)
-            self.state.record_attempt(
-                identified.path,
-                identified.size,
-                identified.mtime,
-                identified.file_id,
-                identified.change_usn,
-            )
-            self.log.write("candidate_quiet", path=path, generation=generation, quiet_seconds=quiet_seconds)
-            ready.append(identified)
+                self.log.write("candidate_quiet", path=path, generation=generation, quiet_seconds=quiet_seconds)
+                ready.append(identified)
         return ready
 
     def _drop_active(self, path: str, generation: int) -> None:
@@ -1318,6 +1422,10 @@ class WatchScheduler:
         event: dict,
     ) -> None:
         name = str(event.get("event") or "")
+        if name == "task_sources_claimed":
+            source_paths = event.get("source_paths") or getattr(archive_task, "cleanup_parts", ()) or ()
+            self._claim_pipeline_sources(notification_id, source_paths)
+            return
         if name == "task_output_started":
             if not self.state.record_task_output_started(
                 owner_path,
