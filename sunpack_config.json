@@ -126,7 +126,8 @@
           ".msixbundle",
           ".crdownload",
           ".downloading",
-          ".part"
+          ".part",
+          ".win"
         ]
       },
       {
