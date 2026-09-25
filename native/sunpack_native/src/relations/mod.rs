@@ -1249,24 +1249,56 @@ fn validate_relation_proposal(
         .filter_map(|row| row.anchor.clone().map(|anchor| (row.path.to_ascii_lowercase(), anchor)))
         .collect();
 
-    let mut volume_paths: Vec<String> = proposal
-        .volumes
-        .iter()
-        .map(|(path, _, _, _, _)| path.clone())
-        .collect();
-    volume_paths.sort_by_key(|path| path.to_ascii_lowercase());
-    volume_paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-    let tail_limit = if proposal.format == "zip" { 65_557 } else { 0 };
-    let deep_anchors = py.detach(|| {
-        probe_volume_anchor_paths_deep(
-            &volume_paths,
-            1024 * 1024,
-            tail_limit,
-            path_passwords,
-        )
-    });
-    for anchor in deep_anchors {
-        anchors.insert(anchor.path.to_ascii_lowercase(), anchor);
+    let bounded_raw_zip_relation = proposal.format == "zip"
+        && proposal.style != "zip_spanned"
+        && proposal
+            .volumes
+            .iter()
+            .find(|(_, number, _, _, _)| *number == 1)
+            .and_then(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()))
+            .is_some_and(|anchor| {
+                anchor
+                    .evidence
+                    .iter()
+                    .any(|item| *item == "zip:local_header")
+            })
+        && proposal
+            .volumes
+            .iter()
+            .filter_map(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()))
+            .filter(|anchor| {
+                anchor
+                    .evidence
+                    .iter()
+                    .any(|item| *item == "zip:eocd_single_disk_without_local_header")
+            })
+            .count()
+            == 1;
+
+    // Raw byte-split ZIP relations are already proven by two independent
+    // bounded anchors: the first local header and the terminal EOCD.  Do not
+    // overwrite those relation facts with a physical-file deep probe that
+    // cannot validate a central directory spanning multiple chunks.
+    if !bounded_raw_zip_relation {
+        let mut volume_paths: Vec<String> = proposal
+            .volumes
+            .iter()
+            .map(|(path, _, _, _, _)| path.clone())
+            .collect();
+        volume_paths.sort_by_key(|path| path.to_ascii_lowercase());
+        volume_paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        let tail_limit = if proposal.format == "zip" { 65_557 } else { 0 };
+        let deep_anchors = py.detach(|| {
+            probe_volume_anchor_paths_deep(
+                &volume_paths,
+                1024 * 1024,
+                tail_limit,
+                path_passwords,
+            )
+        });
+        for anchor in deep_anchors {
+            anchors.insert(anchor.path.to_ascii_lowercase(), anchor);
+        }
     }
 
     let status = match proposal.format.as_str() {
