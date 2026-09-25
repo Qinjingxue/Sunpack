@@ -1360,7 +1360,11 @@ void g32_query_failure_invalidates_inflight_probe() {
     check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe,
           "G-32: must acquire the in-flight probe lease");
 
-    gate->note_query_failure(ERROR_NOT_READY);
+    std::uint64_t ignored_free = 0;
+    std::uint64_t ignored_total = 0;
+    check(!gate->query_free_bytes(&ignored_free, &ignored_total),
+          "G-32: synthetic detached volume must be unqueryable");
+    gate->note_query_failure(gate->last_query_error());
     check(gate->phase() == VolumeSpacePhase::Blocked,
           "G-32: query failure must revoke the in-flight probe");
     check(!gate->watermark_valid(),
