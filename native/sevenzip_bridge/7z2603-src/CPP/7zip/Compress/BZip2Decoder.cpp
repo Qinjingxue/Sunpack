@@ -956,6 +956,62 @@ static bool ParallelReadStreamHeader(
 }
 
 
+static bool ParallelLooksLikeTruncatedHeader(
+    void *stream,
+    UInt64 inputSize,
+    UInt64 byteOffset)
+{
+  if (byteOffset >= inputSize)
+    return false;
+
+  const UInt64 remaining = inputSize - byteOffset;
+  if (remaining >= 4)
+    return false;
+
+  Byte bytes[3] = {};
+  if (ParallelReadExact(
+          stream,
+          inputSize,
+          byteOffset,
+          bytes,
+          (UInt32)remaining) != S_OK)
+    return false;
+
+  const Byte expected[3] = {
+      kArSig0, kArSig1, kArSig2 };
+  for (UInt64 i = 0; i < remaining; i++)
+    if (bytes[i] != expected[i])
+      return false;
+  return true;
+}
+
+
+static bool ParallelPaddingBitsNonZero(
+    void *stream,
+    UInt64 inputSize,
+    UInt64 bitOffset)
+{
+  const unsigned shift =
+      (unsigned)(bitOffset & 7);
+  if (shift == 0)
+    return false;
+
+  const UInt64 byteOffset = bitOffset >> 3;
+  Byte value = 0;
+  if (ParallelReadExact(
+          stream,
+          inputSize,
+          byteOffset,
+          &value,
+          1) != S_OK)
+    return false;
+
+  const Byte mask =
+      (Byte)(((unsigned)1 << (8 - shift)) - 1);
+  return (value & mask) != 0;
+}
+
+
 static const std::array<Byte, 256> &ParallelPrefixTable(UInt64 magic)
 {
   static const std::array<Byte, 256> blockTable = []()
@@ -2157,8 +2213,7 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
   };
 
   auto finishInputState =
-      [&](UInt64 finishedPackSize,
-          bool exactEnd)
+      [&](UInt64 finishedPackSize)
   {
     _inProcessed = inputSize;
     Base._buf = _inBuf;
@@ -2166,7 +2221,9 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
     Base._numBits = 0;
     Base._value = 0;
     Base.FinishedPackSize = finishedPackSize;
-    Base.IsBz = exactEnd ? false : false;
+    // DecodeAllStreams probes for the next concatenated stream after EOS.
+    // Leaving IsBz false matches the serial path after that probe.
+    Base.IsBz = false;
   };
 
   UInt64 headerByte = 0;
@@ -2195,8 +2252,20 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
         }
 
         Base.NumStreams++;
+
+        const UInt64 afterEndBit =
+            marker.BitOffset + 80;
+        if (afterEndBit < marker.BitOffset)
+          return E_FAIL;
+
+        if (ParallelPaddingBitsNonZero(
+                Base.InStream,
+                inputSize,
+                afterEndBit))
+          Base.MinorError = true;
+
         lastFinishedPackSize =
-            (marker.BitOffset + 80 + 7) >> 3;
+            (afterEndBit + 7) >> 3;
         Base.FinishedPackSize =
             lastFinishedPackSize;
 
@@ -2209,8 +2278,7 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
           }
 
           finishInputState(
-              lastFinishedPackSize,
-              true);
+              lastFinishedPackSize);
           return S_OK;
         }
 
@@ -2221,9 +2289,14 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
                 lastFinishedPackSize,
                 nextLevel))
         {
+          if (ParallelLooksLikeTruncatedHeader(
+                  Base.InStream,
+                  inputSize,
+                  lastFinishedPackSize))
+            Base.NeedMoreInput = true;
+
           finishInputState(
-              lastFinishedPackSize,
-              false);
+              lastFinishedPackSize);
           return S_OK;
         }
 
