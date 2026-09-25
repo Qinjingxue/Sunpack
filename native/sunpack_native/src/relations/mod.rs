@@ -379,8 +379,9 @@ fn build_candidate_groups_from_physical(
                 // look like a first/multivolume input because its declared
                 // logical end lies beyond EOF.  Suppress ordinary fallback
                 // only when at least one distinct numbered sibling exists;
-                // otherwise Embedded/Extraction must get the file and make
-                // the authoritative damage/missing-volume decision.
+                // otherwise the ordinary Relations fallback must keep the
+                // structurally proven SFX so Extraction can make the
+                // authoritative damage/missing-volume decision.
                 if related.iter().any(|path| !path.eq_ignore_ascii_case(&seed.path)) {
                     strong_suppressed_paths.insert(seed.path.to_ascii_lowercase());
                     strong_suppressed_paths.extend(
@@ -646,14 +647,15 @@ fn should_upgrade_zip_anchor(row: &RelationInput) -> bool {
 }
 
 fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
+    let offset = anchor.structure_offset.unwrap_or(0);
+    let proven_sfx = offset > 0 && anchor.sfx && anchor.pe_structure;
     if !matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
         || anchor.confidence != "strong"
-        || !(anchor.standalone || anchor.needs_password)
+        || !(anchor.standalone || anchor.needs_password || proven_sfx)
     {
         return false;
     }
-    let offset = anchor.structure_offset.unwrap_or(0);
-    offset == 0 || (anchor.sfx && anchor.pe_structure)
+    offset == 0 || proven_sfx
 }
 
 fn promote_sfx_archive_anchor(
@@ -696,10 +698,10 @@ fn promote_sfx_archive_anchor(
     }
 
     // Relations only owns genuine self-extracting archives.  A PE with an
-    // arbitrary archive overlay is an Embedded concern (games and application
-    // bundles commonly use that layout).  Prove the decompressor stub first,
-    // using a bounded image-only probe, then validate the archive at the
-    // overlay offset below.
+    // arbitrary archive overlay is not enough: normal Embedded discovery skips
+    // executable carriers, while explicit deep-detect may scan them separately.
+    // Prove the decompressor stub first with a bounded image-only probe, then
+    // validate the archive at the overlay offset below.
     let sfx_path = row.path.clone();
     let sfx_profile = py.detach(move || executable_sfx_stub_profile(&sfx_path, image_end));
     let sfx_matches_format = match sfx_profile.as_str() {
