@@ -165,7 +165,6 @@ pub(crate) fn inspect_pe_overlay_structure(
 
     let mut pe_end = 0u64;
     let mut pck_section_offset = 0u64;
-    let mut pck_section_size = 0u64;
     for index in 0..section_count as usize {
         let start = index * SECTION_HEADER_SIZE;
         let section = &section_table[start..start + SECTION_HEADER_SIZE];
@@ -175,7 +174,6 @@ pub(crate) fn inspect_pe_overlay_structure(
             pe_end = pe_end.max(raw_pointer + raw_size);
             if pck_section_offset == 0 && pe_section_name_is(section, b"pck") {
                 pck_section_offset = raw_pointer;
-                pck_section_size = raw_size;
             }
         }
     }
@@ -187,7 +185,6 @@ pub(crate) fn inspect_pe_overlay_structure(
     result.set_item("overlay_offset", pe_end)?;
     result.set_item("overlay_size", actual_size.saturating_sub(pe_end))?;
     result.set_item("pck_section_offset", pck_section_offset)?;
-    result.set_item("pck_section_size", pck_section_size)?;
     let evidence = PyList::new(py, ["pe:valid_headers"])?;
     if pck_section_offset != 0 {
         evidence.append("pe:pck_section")?;
@@ -294,7 +291,6 @@ fn empty_result<'py>(py: Python<'py>, error: &str) -> PyResult<Bound<'py, PyDict
         "archive_offset",
         "offset_delta_from_overlay",
         "pck_section_offset",
-        "pck_section_size",
     ] {
         result.set_item(key, 0)?;
     }
