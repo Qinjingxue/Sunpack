@@ -48,6 +48,7 @@ DEFAULT_LARGE_FILES = 2
 DEFAULT_LARGE_FILE_MIB = 150
 DEFAULT_RUNS = 5
 DEFAULT_TIMEOUT_SECONDS = 900.0
+RSS_SAMPLE_INTERVAL_SECONDS = 0.02
 
 METHODS = {
     "7z-split": ("LZMA2 (7-Zip default)", "solid default; -v16m", "16 MiB volumes"),
@@ -270,7 +271,7 @@ def _run_worker_case(
     timeout_seconds: float,
 ) -> list[dict[str, Any]]:
     worker = _NativeWorkerProcess(str(worker_path), None)
-    sampler = ProcessSampler(interval_seconds=0.02)
+    sampler = ProcessSampler(interval_seconds=RSS_SAMPLE_INTERVAL_SECONDS)
     rows: list[dict[str, Any]] = []
     case_slug = str(case["case_id"]).replace(":", "-")
     try:
@@ -317,47 +318,93 @@ def _run_seven_zip_case(
     rows: list[dict[str, Any]] = []
     case_slug = str(case["case_id"]).replace(":", "-")
     archive = _volume_paths(case["item"])[0]
-    for run in range(warmups + runs):
-        output = workspace.outputs / case_slug / f"seven-zip-{run}"
-        started = time.perf_counter_ns()
-        try:
-            completed = subprocess.run(
-                [str(seven_zip), "x", "-y", "-bd", "-bso0", "-bse0", "-aoa", f"-o{output}", str(archive)],
-                cwd=ROOT,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                check=False,
-                timeout=timeout_seconds,
-            )
-            wall_ms = round((time.perf_counter_ns() - started) / 1_000_000.0, 3)
-            if run >= warmups:
-                stats = _output_summary(output)
-                rows.append({
-                    "run": run - warmups,
-                    "wall_ms": wall_ms,
-                    "returncode": completed.returncode,
-                    "passed": completed.returncode == 0,
-                    "files": stats["file_count"],
-                    "bytes": stats["total_bytes"],
-                    "stderr": completed.stderr[-2000:],
-                })
-        finally:
-            shutil.rmtree(output, ignore_errors=True)
+    sampler = ProcessSampler(interval_seconds=RSS_SAMPLE_INTERVAL_SECONDS)
+    try:
+        sampler.start()
+        for run in range(warmups + runs):
+            output = workspace.outputs / case_slug / f"seven-zip-{run}"
+            sample_start = len(sampler.samples)
+            process: subprocess.Popen[str] | None = None
+            try:
+                sampler.take()
+                started = time.perf_counter_ns()
+                process = subprocess.Popen(
+                    [str(seven_zip), "x", "-y", "-bd", "-bso0", "-bse0", "-aoa", f"-o{output}", str(archive)],
+                    cwd=ROOT,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                # Capture an initial working-set sample in addition to the periodic
+                # samples, so short CLI runs do not disappear between sampler ticks.
+                sampler.take()
+                try:
+                    _, stderr = process.communicate(timeout=timeout_seconds)
+                except subprocess.TimeoutExpired:
+                    if process.poll() is None:
+                        process.kill()
+                    process.communicate()
+                    raise
+                wall_ms = round((time.perf_counter_ns() - started) / 1_000_000.0, 3)
+                sampler.take()
+                child_rss = [sample.children_rss_mib for sample in sampler.samples[sample_start:]]
+                peak_rss = round(max(child_rss), 3) if child_rss else None
+                if run >= warmups:
+                    stats = _output_summary(output)
+                    rows.append({
+                        "run": run - warmups,
+                        "wall_ms": wall_ms,
+                        "returncode": process.returncode,
+                        "passed": process.returncode == 0,
+                        "rss_peak_mib": peak_rss,
+                        "files": stats["file_count"],
+                        "bytes": stats["total_bytes"],
+                        "stderr": (stderr or "")[-2000:],
+                    })
+            finally:
+                if process is not None and process.poll() is None:
+                    try:
+                        process.kill()
+                    except OSError:
+                        if process.poll() is None:
+                            raise
+                    process.communicate()
+                shutil.rmtree(output, ignore_errors=True)
+    finally:
+        sampler.stop()
     return rows
 
 
 def _table(results: list[dict[str, Any]]) -> str:
-    lines = ["case | worker median ms | 7z.exe median ms | worker/7z", "---|---:|---:|---:"]
+    time_lines = [
+        "Wall time (median ms)",
+        "case | SunPack worker | 7z.exe | worker/7z",
+        "---|---:|---:|---:",
+    ]
+    rss_lines = [
+        "Peak RSS (median MiB)",
+        "case | SunPack worker | 7z.exe | worker/7z",
+        "---|---:|---:|---:",
+    ]
     for case in results:
         worker = _median([float(row["worker_wall_ms"]) for row in case.get("worker", [])])
         seven = _median([float(row["wall_ms"]) for row in case.get("seven_zip", [])])
-        ratio = worker / seven if worker is not None and seven else None
-        lines.append(f"{case['case_id']} | {worker or 0:.3f} | {seven or 0:.3f} | {ratio:.3f}" if ratio is not None else f"{case['case_id']} | - | - | -")
-    return "\n".join(lines) + "\n"
+        worker_rss = _median([float(row["worker_rss_peak_mib"]) for row in case.get("worker", []) if row.get("worker_rss_peak_mib") is not None])
+        seven_rss = _median([float(row["rss_peak_mib"]) for row in case.get("seven_zip", []) if row.get("rss_peak_mib") is not None])
+        time_ratio = worker / seven if worker is not None and seven else None
+        rss_ratio = worker_rss / seven_rss if worker_rss is not None and seven_rss else None
+        time_lines.append(
+            f"{case['case_id']} | {worker:.3f} | {seven:.3f} | {time_ratio:.3f}"
+            if time_ratio is not None else f"{case['case_id']} | - | - | -"
+        )
+        rss_lines.append(
+            f"{case['case_id']} | {worker_rss:.3f} | {seven_rss:.3f} | {rss_ratio:.3f}"
+            if rss_ratio is not None else f"{case['case_id']} | - | - | -"
+        )
+    return "\n".join([*time_lines, "", *rss_lines]) + "\n"
 
 
 def main() -> int:
@@ -372,7 +419,7 @@ def main() -> int:
     parser.add_argument("--worker", type=Path, help="Worker executable; defaults to the normal SunPack resource lookup.")
     parser.add_argument("--seven-zip", type=Path, help="7z.exe fixture; defaults to tests/test_tools.json/tools/7z.exe.")
     parser.add_argument("--worker-source-commit", default=None, help="Source commit used to build the worker binary.")
-    parser.add_argument("--sunpack-version", default="v0.6.2")
+    parser.add_argument("--sunpack-version", default="v0.7.0")
     parser.add_argument("--metadata-only", action="store_true", help="Generate and catalog the corpus without running extraction.")
     parser.add_argument("--results-root", type=Path)
     parser.add_argument("--json-out", type=Path)
@@ -475,6 +522,7 @@ def main() -> int:
                 "prefetch": "disabled",
                 "diagnostics": "native read/pipeline diagnostics disabled",
                 "timing": "wall-clock from submit/extraction start until the result/output process completes",
+                "memory": "sampled RSS of each native worker/7z.exe process tree every 20 ms; peak values are per-run maxima",
             },
             "environment": _collect_environment(workspace.root),
             "binaries": {
@@ -496,6 +544,15 @@ def main() -> int:
                 "sum_of_per_case_medians_seven_zip_ms": seven_sum if complete else None,
                 "sum_of_medians_worker_over_seven_zip": round(worker_sum / seven_sum, 6) if seven_sum else None,
                 "sum_of_medians_note": "A sum of independent per-case medians, not one serial combined workload measurement.",
+                "per_case_medians": {
+                    row["case_id"]: {
+                        "worker_wall_ms": _median([float(sample["worker_wall_ms"]) for sample in row["worker"]]),
+                        "worker_rss_peak_mib": _median([float(sample["worker_rss_peak_mib"]) for sample in row["worker"] if sample.get("worker_rss_peak_mib") is not None]),
+                        "seven_zip_wall_ms": _median([float(sample["wall_ms"]) for sample in row["seven_zip"]]),
+                        "seven_zip_rss_peak_mib": _median([float(sample["rss_peak_mib"]) for sample in row["seven_zip"] if sample.get("rss_peak_mib") is not None]),
+                    }
+                    for row in complete
+                },
             },
         }
         table = _table(results)

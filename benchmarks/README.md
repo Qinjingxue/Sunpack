@@ -28,7 +28,11 @@ python -m benchmarks reader embedded-scan --generate-plan5-mib 500 --rounds 3 --
 python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
 python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
 python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
-python -m benchmarks extraction worker-vs-7z-300m --small-files 8 --large-files 2 --large-file-mib 150 --runs 5 --warmups 0 --worker-source-commit 86587874 --sunpack-version v0.6.2 --json-out benchmarks/results/worker-vs-7z-300m.json
+python -m benchmarks extraction worker-vs-7z-300m `
+  --sunpack-version v0.7.0 --worker-source-commit e37c1769 `
+  --worker native/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
+  --small-files 8 --large-files 2 --large-file-mib 150 --runs 5 --warmups 0 `
+  --json-out benchmarks/results/worker-vs-7z-300m-v0.7.0-rss.json
 python -m benchmarks extraction worker-read-blocking --runs 1 --payload-gib 1 --json-out benchmarks/results/worker-read-blocking.json
 python -m benchmarks extraction worker-read-patterns --runs 1 --json-out benchmarks/results/worker-read-patterns.json
 # Enable the production format-aware prefetch policy while tuning its defaults (512 KiB x 2).
@@ -163,11 +167,12 @@ focus the matrix. Durable results contain both `report.json` and `results.csv`.
 adds explicit 7z/RAR5/RAR4 solid and non-solid variants, and covers 7z split,
 RAR split, ZIP, TAR, Gzip, BZip2, XZ, Zstandard, and their compressed-TAR
 aliases. Each case reuses one persistent native worker for its measured runs;
-each reference run starts a new `7z.exe` process. The result records the exact
+each reference run starts a new `7z.exe` process. Both process trees' RSS is
+sampled every 20 ms and each measured run records its peak. The result records the exact
 archive volume sizes, archive-listing method/solid fields, payload-to-archive
 ratio, CPU/memory/disk inventory, active power scheme, tool hashes, all raw
-samples, and per-case medians. `--metadata-only` generates only the corpus
-catalog. The full interpretation, machine identity, and recorded v0.6.2 result
+samples, and per-case time/RSS medians. `--metadata-only` generates only the corpus
+catalog. The full interpretation, machine identity, and recorded v0.7.0 result
 are documented in [English](../docs/benchmark_worker_vs_7z_300m.md) and
 [简体中文](../docs/zh-CN/benchmark_worker_vs_7z_300m.md).
 
