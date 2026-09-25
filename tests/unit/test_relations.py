@@ -144,6 +144,47 @@ def test_known_sfx_stub_is_confirmed_and_projected_as_file_range(
     assert archive_input["parts"][0]["start"] == pe_end
 
 
+def test_truncated_7z_sfx_is_confirmed_by_relations_and_projected_to_declared_range(tmp_path):
+    image, pe_end = _minimal_pe_image(b"7-Zip SFX")
+    payload = make_minimal_7z()
+    truncated = payload[:-1]
+    path = tmp_path / "truncated_7z_sfx.exe"
+    path.write_bytes(image + truncated)
+
+    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
+    metadata = group.head_metadata
+
+    assert metadata["format"] == "7z"
+    assert metadata["relation_confirmed"] is True
+    assert metadata["sfx"] is True
+    assert metadata["pe_structure"] is True
+    assert metadata["standalone"] is False
+    assert metadata["multivolume"] is True
+    assert metadata["structure_offset"] == pe_end
+    assert metadata["expected_logical_size"] == pe_end + len(payload)
+    assert metadata["expected_logical_size"] > path.stat().st_size
+
+    descriptor = archive_input_for_group(group)
+    assert descriptor is not None
+    assert descriptor.open_mode == "file_range"
+    assert descriptor.format_hint == "7z"
+    assert descriptor.primary_extent is not None
+    assert descriptor.primary_extent.start == pe_end
+    assert descriptor.primary_extent.end == pe_end + len(payload)
+
+    result = ArchiveTaskProvider({
+        "detection": {"enabled": True},
+        "embedded_scan": {"enabled": True},
+    }).discover_targets([str(path)])
+
+    assert len(result.resolved_tasks) == 1
+    task = result.resolved_tasks[0]
+    assert task.discovery_source == "relations"
+    assert task.archive_input().primary_extent is not None
+    assert task.archive_input().primary_extent.start == pe_end
+    assert task.archive_input().primary_extent.end == pe_end + len(payload)
+
+
 def test_arbitrary_pe_zip_overlay_requires_deep_detect_for_embedded_discovery(tmp_path):
     image, pe_end = _minimal_pe_image()
     path = tmp_path / "game.exe"
