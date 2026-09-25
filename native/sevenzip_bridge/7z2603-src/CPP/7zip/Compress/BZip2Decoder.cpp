@@ -902,13 +902,12 @@ static bool ParallelReadBits32(
     UInt64 bitOffset,
     UInt32 &value)
 {
-  if (bitOffset > inputSize * 8 ||
-      inputSize * 8 - bitOffset < 32)
-    return false;
-
   const UInt64 byteOffset = bitOffset >> 3;
   const unsigned shift = (unsigned)(bitOffset & 7);
   const unsigned numBytes = (shift + 32 + 7) >> 3;
+  if (byteOffset > inputSize ||
+      (UInt64)numBytes > inputSize - byteOffset)
+    return false;
   Byte bytes[8] = {};
   if (ParallelReadExact(
           stream,
@@ -1188,6 +1187,7 @@ struct CParallelBlockJob
   UInt32 CalculatedCrc;
   CBlockProps Props;
   HRESULT Result;
+  bool NeedMoreInput;
   std::vector<Byte> Compact;
 
   std::mutex Mutex;
@@ -1201,6 +1201,7 @@ struct CParallelBlockJob
       ExpectedCrc(0),
       CalculatedCrc(0),
       Result(S_OK),
+      NeedMoreInput(false),
       Done(false)
   {}
 
@@ -1216,6 +1217,7 @@ struct CParallelBlockJob
     CalculatedCrc = 0;
     Props = CBlockProps();
     Result = S_OK;
+    NeedMoreInput = false;
     Compact.clear();
 
     std::lock_guard<std::mutex> lock(Mutex);
@@ -1401,9 +1403,16 @@ public:
       }
 
       const UInt64 payloadBit = job.StartBit + 80;
-      if (payloadBit < job.StartBit ||
-          payloadBit > inputSize * 8)
+      if (payloadBit < job.StartBit)
       {
+        job.Finish(E_FAIL);
+        return;
+      }
+
+      const UInt64 byteOffset = payloadBit >> 3;
+      if (byteOffset >= inputSize)
+      {
+        job.NeedMoreInput = true;
         job.Finish(S_FALSE);
         return;
       }
@@ -1420,7 +1429,6 @@ public:
       base.Props.randMode = 1;
       base.InitBitDecoder();
 
-      const UInt64 byteOffset = payloadBit >> 3;
       const unsigned bitShift =
           (unsigned)(payloadBit & 7);
       UInt64 bufferStart = 0;
@@ -1434,6 +1442,8 @@ public:
           nextOffset);
       if (result != S_OK)
       {
+        if (result == S_FALSE)
+          job.NeedMoreInput = true;
         job.Finish(result);
         return;
       }
@@ -1470,6 +1480,7 @@ public:
         }
         if (nextOffset >= inputSize)
         {
+          job.NeedMoreInput = true;
           result = S_FALSE;
           break;
         }
@@ -1482,7 +1493,11 @@ public:
             bufferStart,
             nextOffset);
         if (result != S_OK)
+        {
+          if (result == S_FALSE)
+            job.NeedMoreInput = true;
           break;
+        }
       }
 
       if (result == S_OK)
@@ -2435,7 +2450,12 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
         const HRESULT jobRes =
             currentJob->Wait();
         if (jobRes != S_OK)
+        {
+          if (jobRes == S_FALSE &&
+              currentJob->NeedMoreInput)
+            Base.NeedMoreInput = true;
           return jobRes;
+        }
 
         if (currentJob->CalculatedCrc !=
             currentJob->ExpectedCrc)
