@@ -788,6 +788,7 @@ class _RequestRuntime:
                 callback(task, dict(event))
             except Exception:
                 lifecycle_event = str(event.get("event") or "") in {
+                    "task_sources_claimed",
                     "task_output_started",
                     "task_output_finished",
                 }
