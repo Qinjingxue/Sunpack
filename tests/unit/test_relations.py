@@ -12,6 +12,7 @@ from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_target
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.pipeline.discovery.relations import RelationsScheduler
+from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.pipeline.discovery.relations.internal.archive_input import archive_input_for_group
 from tests.helpers.fs_builder import make_minimal_7z
 
@@ -143,7 +144,7 @@ def test_known_sfx_stub_is_confirmed_and_projected_as_file_range(
     assert archive_input["parts"][0]["start"] == pe_end
 
 
-def test_arbitrary_pe_zip_overlay_is_left_for_embedded_discovery(tmp_path):
+def test_arbitrary_pe_zip_overlay_requires_deep_detect_for_embedded_discovery(tmp_path):
     image, pe_end = _minimal_pe_image()
     path = tmp_path / "game.exe"
     path.write_bytes(image + _minimal_zip_single())
@@ -151,20 +152,26 @@ def test_arbitrary_pe_zip_overlay_is_left_for_embedded_discovery(tmp_path):
     group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
     assert group.head_metadata.get("relation_confirmed") is not True
 
-    result = ArchiveTaskProvider({
+    config = {
         "detection": {"enabled": True},
         "embedded_scan": {"enabled": True},
-    }).discover_targets([str(path)])
+    }
+    default_result = ArchiveTaskProvider(config).discover_targets([str(path)])
+    assert default_result.resolved_tasks == []
 
-    assert len(result.resolved_tasks) == 1
-    task = result.resolved_tasks[0]
+    deep_result = ArchiveTaskProvider(
+        config,
+        EmbeddedOptions(force_scan=True),
+    ).discover_targets([str(path)])
+
+    assert len(deep_result.resolved_tasks) == 1
+    task = deep_result.resolved_tasks[0]
     assert task.discovery_source == "embedded"
     descriptor = task.archive_input()
     assert descriptor.format_hint == "zip"
     assert descriptor.open_mode == "file_range"
     assert descriptor.primary_extent is not None
     assert descriptor.primary_extent.start == pe_end
-
 
 def test_filename_numbered_7z_without_structural_seed_is_not_grouped(tmp_path):
     names = ["archive.7z.001", "archive.7z.002", "archive.7z.003"]
