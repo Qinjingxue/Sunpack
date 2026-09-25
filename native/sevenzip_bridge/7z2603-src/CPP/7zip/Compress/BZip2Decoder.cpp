@@ -1551,6 +1551,7 @@ class CParallelBlockPool
   bool _stop;
   void *_stream;
   UInt64 _inputSize;
+  void *_cpuContext;
 
   void WorkerLoop()
   {
@@ -1586,6 +1587,14 @@ class CParallelBlockPool
           _inputSize,
           *job);
 
+      // One submitted worker job owns exactly one extra CPU credit.
+      // Return it as soon as that full block stops consuming CPU rather
+      // than waiting for slower jobs in the same speculative batch.
+      if (_cpuContext)
+        sunpack_cpu_release_extra_for_context(
+            _cpuContext,
+            1);
+
       {
         std::lock_guard<std::mutex> lock(_mutex);
         if (_runningWorkers != 0)
@@ -1605,13 +1614,15 @@ class CParallelBlockPool
 public:
   CParallelBlockPool(
       void *stream,
-      UInt64 inputSize):
+      UInt64 inputSize,
+      void *cpuContext):
       _pending(0),
       _activeWorkers(0),
       _runningWorkers(0),
       _stop(false),
       _stream(stream),
-      _inputSize(inputSize)
+      _inputSize(inputSize),
+      _cpuContext(cpuContext)
   {}
 
   ~CParallelBlockPool()
@@ -2148,7 +2159,8 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
   CParallelBlockPool pool(
       Base.InStream,
-      inputSize);
+      inputSize,
+      cpuContext);
   CParallelBlockWorkspace callerWorkspace(
       _counters);
 
@@ -2427,10 +2439,6 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
       pool.WaitIdle();
       pool.SetActiveWorkers(0);
-      if (cpuContext && extraWorkers)
-        sunpack_cpu_release_extra_for_context(
-            cpuContext,
-            extraWorkers);
 
       bool advanced = false;
 
