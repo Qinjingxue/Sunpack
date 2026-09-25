@@ -2818,6 +2818,47 @@ def test_watch_scheduler_claim_hands_off_only_new_generation_after_release(
     assert watcher.pending_count == 1
 
 
+def test_watch_scheduler_transfers_dirty_generation_between_pipeline_claims(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    source = tmp_path / "split.7z.002"
+    source.write_bytes(b"old generation")
+
+    watcher = WatchScheduler(
+        {"watch": {"clipboard_monitor_enabled": False}},
+        [str(tmp_path)],
+        out_dir=str(tmp_path / "out"),
+        state_path=str(tmp_path / "state.json"),
+        cold_start_seconds=0,
+        initial_scan=False,
+    )
+    watcher.enqueue(str(source))
+    watcher._claim_pipeline_sources("owner-a", (str(source),))
+
+    observed = []
+    real_candidate = scheduler_module._candidate_for_event_path
+
+    def recording_candidate(path, *, since_usn=0):
+        observed.append(os.path.abspath(path))
+        return real_candidate(path, since_usn=since_usn)
+
+    monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", recording_candidate)
+    source.write_bytes(b"new generation with more bytes")
+    watcher.enqueue(str(source), event_type="modified")
+
+    assert observed == []
+    watcher._claim_pipeline_sources("owner-b", (str(source),))
+    watcher._release_pipeline_source_claims("owner-a")
+    assert observed == []
+
+    watcher._release_pipeline_source_claims("owner-b")
+
+    assert observed == [os.path.abspath(str(source))]
+    assert watcher.pending_count == 1
+
+
 def test_watch_scheduler_departed_claimed_source_stays_owned_until_pipeline_finishes(
     tmp_path,
     monkeypatch,
