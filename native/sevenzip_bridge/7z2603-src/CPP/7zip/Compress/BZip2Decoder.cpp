@@ -2349,8 +2349,12 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
                kMaxBZip2ParallelDecoders;
            i++)
       {
-        if (!markers[i].IsEnd)
-          batchMarkerIndices.push_back(i);
+        // A stream boundary must be validated in order before blocks from the
+        // next concatenated stream can become authoritative. Decoding across
+        // it here only wastes CPU, credits and compact-result memory.
+        if (markers[i].IsEnd)
+          break;
+        batchMarkerIndices.push_back(i);
       }
       if (batchMarkerIndices.empty() ||
           batchMarkerIndices.front() != markerIndex)
