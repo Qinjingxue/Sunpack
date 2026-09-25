@@ -18,6 +18,7 @@ import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_mo
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
+from sunpack.core.support.resource_lifecycle import promotion_barrier
 from sunpack.runtime.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import WatchStateStore
@@ -2712,6 +2713,49 @@ def test_watch_event_handler_keeps_dispatcher_alive_when_native_observation_is_t
             },
         )
     ]
+
+
+def test_watch_scheduler_defers_pending_split_volume_during_source_cleanup_promotion(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    first_volume = tmp_path / "split.7z.001"
+    sibling_volume = tmp_path / "split.7z.002"
+    first_volume.write_bytes(b"head volume")
+    sibling_volume.write_bytes(b"sibling volume")
+
+    clock = WatchClock(time.time())
+    clock.install(monkeypatch)
+    watcher = WatchScheduler(
+        {"watch": {"clipboard_monitor_enabled": False}},
+        [str(tmp_path)],
+        out_dir=str(tmp_path / "out"),
+        state_path=str(tmp_path / "state.json"),
+        cold_start_seconds=0,
+        initial_scan=False,
+    )
+    watcher.enqueue(str(sibling_volume))
+    assert watcher.pending_count == 1
+    clock.advance(10.0)
+
+    # Successful extraction cleans every source volume under one promotion
+    # barrier. A queued sibling event must remain pending until that barrier
+    # ends; its refresh currently leaks the native WouldBlock out of run_once.
+    with promotion_barrier((first_volume, sibling_volume), quiesce=False):
+        try:
+            result = _await(watcher.run_once())
+        except OSError as exc:
+            pytest.fail(
+                "watcher must defer a pending split-volume refresh while source "
+                f"cleanup promotion is active, not abort run_once: {exc}"
+            )
+        assert result.processed == 0
+        assert watcher.pending_count == 1
+
+    result = _await(watcher.run_once())
+    assert result.processed == 1
+    assert watcher.pending_count == 0
 
 
 def test_watch_scheduler_does_not_special_case_downloader_suffixes(tmp_path, monkeypatch):
