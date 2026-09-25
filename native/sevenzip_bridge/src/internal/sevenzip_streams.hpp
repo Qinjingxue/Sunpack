@@ -250,13 +250,39 @@ namespace sunpack::sevenzip
         std::map<std::wstring, std::unique_ptr<PathHandle>> handles_;
     };
 
-    // Decoder-side random reads use one handle cache per worker thread. This
-    // keeps file cursors independent without serializing full-block decoders.
-    inline PathHandleCache &decoder_thread_path_cache()
+    // Decoder workers need an independent file cursor, but the worker process
+    // is long lived. Keep only the current source path per thread so handles do
+    // not accumulate across every archive ever processed by that worker.
+    class DecoderThreadPathHandle final
     {
-        static thread_local PathHandleCache cache;
-        return cache;
-    }
+    public:
+        HRESULT read_at(
+            const std::wstring &path,
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            UInt32 *processed) noexcept
+        {
+            if (!handle_ || path_ != path)
+            {
+                auto next = std::make_unique<PathHandle>(path);
+                if (!next->valid())
+                    return HRESULT_FROM_WIN32(next->open_error());
+                path_ = path;
+                handle_ = std::move(next);
+            }
+            return handle_->read_at(
+                offset, data, size, processed
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+                , nullptr
+#endif
+            );
+        }
+
+    private:
+        std::wstring path_;
+        std::unique_ptr<PathHandle> handle_;
+    };
 
     inline HRESULT decoder_thread_read_path_at(
         const std::wstring &path,
@@ -264,17 +290,10 @@ namespace sunpack::sevenzip
         void *data,
         UInt32 size,
         UInt32 *processed,
-        ExtractInputTrace *trace = nullptr) noexcept
+        ExtractInputTrace * /* trace */ = nullptr) noexcept
     {
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-        return decoder_thread_path_cache().read_at(
-            path, offset, data, size, processed,
-            trace ? trace->pipeline_timing : nullptr);
-#else
-        (void)trace;
-        return decoder_thread_path_cache().read_at(
-            path, offset, data, size, processed);
-#endif
+        static thread_local DecoderThreadPathHandle handle;
+        return handle.read_at(path, offset, data, size, processed);
     }
 
     class RandomAccessInStreamSource
