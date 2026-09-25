@@ -80,7 +80,9 @@ def probe_rar_view(view, options: RarProbeOptions | None = None) -> FormatObserv
     damage_flags = sorted(set(str(item) for item in damage_flags if item))
     if raw.get("end_block_found"):
         boundary_confidence = "high"
-    elif raw.get("header_encrypted") or error:
+    elif raw.get("header_encrypted"):
+        boundary_confidence = "none"
+    elif error:
         boundary_confidence = "low"
     elif validated_prefix:
         boundary_confidence = "medium"
