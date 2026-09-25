@@ -1347,6 +1347,47 @@ void g31_monitor_drops_episode_history_after_recovery() {
     check(monitor.sampling(), "G-31: episode 2 必须重新开始采样");
 }
 
+
+void g32_query_failure_invalidates_inflight_probe() {
+    auto log = std::make_shared<SinkLog>();
+    auto gate = make_gate("job:g32", log, 20ms);
+
+    gate->register_job("A");
+    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    check(gate->poll(100), "G-32: first successful sample must authorise a probe");
+
+    auto result = wait_bounded(gate);
+    check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe,
+          "G-32: must acquire the in-flight probe lease");
+
+    std::uint64_t ignored_free = 0;
+    std::uint64_t ignored_total = 0;
+    check(!gate->query_free_bytes(&ignored_free, &ignored_total),
+          "G-32: synthetic detached volume must be unqueryable");
+    gate->note_query_failure(gate->last_query_error());
+    check(gate->phase() == VolumeSpacePhase::Blocked,
+          "G-32: query failure must revoke the in-flight probe");
+    check(!gate->watermark_valid(),
+          "G-32: query discontinuity must require a fresh baseline");
+
+    result.lease.report_success();
+    check(gate->phase() == VolumeSpacePhase::Blocked,
+          "G-32: stale probe success must not resume an unavailable volume");
+    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 0,
+          "G-32: stale probe success must not emit space_resumed");
+
+    check(gate->poll(100),
+          "G-32: first successful sample after the query failure must re-arm probing");
+    auto retry = wait_bounded(gate);
+    check(retry.kind == VolumeSpaceGate::WaitResult::Kind::Probe,
+          "G-32: recovery must issue a fresh probe lease");
+    retry.lease.report_success();
+    check(gate->phase() == VolumeSpacePhase::Ready,
+          "G-32: a fresh probe may still complete recovery");
+    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 1,
+          "G-32: only the fresh probe may emit space_resumed");
+}
+
 }  // namespace
 
 #endif
@@ -1395,6 +1436,8 @@ int main(int argc, char **argv) {
         {"G-30 probe authorising sample becomes the watermark", g30_probe_authorising_sample_becomes_the_watermark},
         {"G-31 monitor drops episode history after recovery",
          g31_monitor_drops_episode_history_after_recovery},
+        {"G-32 query failure invalidates inflight probe",
+         g32_query_failure_invalidates_inflight_probe},
     };
     constexpr int kCaseCount = static_cast<int>(std::size(cases));
 

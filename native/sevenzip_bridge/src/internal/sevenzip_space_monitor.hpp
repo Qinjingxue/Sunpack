@@ -118,7 +118,8 @@ namespace sunpack::sevenzip
                 if (!gate.query_free_bytes(&free_bytes, &total_bytes))
                 {
                     // 卷暂时不可查询（拔盘 / UNC 断开 / 权限变化 / query_root 未解析）：
-                    // 不转 Ready / Probing，只记录诊断并下轮重试。
+                    // query_free_bytes 已撤销任何在途 probe；这里保留诊断并等待下一次成功采样
+                    // 重新建立 watermark，绝不直接转 Ready。
                     const unsigned long error = gate.last_query_error();
                     gate.note_query_failure(error);
                     maybe_emit_status(state, 0, false, error, now);
