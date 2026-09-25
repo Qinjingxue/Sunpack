@@ -423,6 +423,16 @@ def test_middle_gap_keeps_structured_missing_index(tmp_path):
     assert all(group.kind == "file" for group in groups)
     assert all(len(group.input_paths) == 1 for group in groups)
 
+def test_plain_numbered_file_does_not_gain_archive_split_identity(tmp_path):
+    path = tmp_path / "notes.001"
+    path.write_bytes(b"plain data")
+
+    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
+
+    assert group.is_split_candidate is False
+    assert group.relation.is_split_related is False
+
+
 def test_only_head_7z_keeps_unconfirmed_split_identity(tmp_path):
     start_header = (
         (0).to_bytes(8, "little")
