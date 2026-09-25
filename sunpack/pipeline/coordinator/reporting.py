@@ -304,7 +304,8 @@ class RunReporter:
         if failed_tasks:
             if not self.quiet:
                 for failed_task in failed_tasks:
-                    self._print(self.i18n.t("report.failed", task=failed_task))
+                    display_task = self._format_failed_task(failed_task, structured_failures)
+                    self._print(self.i18n.t("report.failed", task=display_task))
                 if structured_failures and all(failure.is_password_failure for failure in structured_failures):
                     self._print(self.i18n.t("report.password_failure"))
         else:
@@ -321,6 +322,36 @@ class RunReporter:
 
         if not self.quiet:
             self._print("-" * 54)
+
+    def _format_failed_task(
+        self,
+        failed_task: str,
+        failures: list[FailureInfo],
+    ) -> str:
+        raw_task = str(failed_task)
+        try:
+            task_key = _absolute_key(raw_task)
+        except (OSError, ValueError):
+            task_key = ""
+        for failure in failures:
+            details = failure.details if isinstance(failure.details, dict) else {}
+            failure_path = str(details.get("path") or details.get("archive") or "")
+            if not failure_path:
+                continue
+            try:
+                same_path = bool(task_key) and _absolute_key(failure_path) == task_key
+            except (OSError, ValueError):
+                same_path = failure_path == raw_task
+            if not same_path:
+                continue
+            reason = (
+                self.i18n.t(failure.message_key, **failure.message_params)
+                if failure.message_key
+                else failure.message
+            )
+            if reason:
+                return f"{raw_task}: {reason}"
+        return raw_task
 
     def _print(self, value: str) -> None:
         print(value, file=self.stdout, flush=True)
