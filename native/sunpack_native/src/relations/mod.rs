@@ -1249,24 +1249,56 @@ fn validate_relation_proposal(
         .filter_map(|row| row.anchor.clone().map(|anchor| (row.path.to_ascii_lowercase(), anchor)))
         .collect();
 
-    let mut volume_paths: Vec<String> = proposal
-        .volumes
-        .iter()
-        .map(|(path, _, _, _, _)| path.clone())
-        .collect();
-    volume_paths.sort_by_key(|path| path.to_ascii_lowercase());
-    volume_paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
-    let tail_limit = if proposal.format == "zip" { 65_557 } else { 0 };
-    let deep_anchors = py.detach(|| {
-        probe_volume_anchor_paths_deep(
-            &volume_paths,
-            1024 * 1024,
-            tail_limit,
-            path_passwords,
-        )
-    });
-    for anchor in deep_anchors {
-        anchors.insert(anchor.path.to_ascii_lowercase(), anchor);
+    let bounded_raw_zip_relation = proposal.format == "zip"
+        && proposal.style != "zip_spanned"
+        && proposal
+            .volumes
+            .iter()
+            .find(|(_, number, _, _, _)| *number == 1)
+            .and_then(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()))
+            .is_some_and(|anchor| {
+                anchor
+                    .evidence
+                    .iter()
+                    .any(|item| *item == "zip:local_header")
+            })
+        && proposal
+            .volumes
+            .iter()
+            .filter_map(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()))
+            .filter(|anchor| {
+                anchor
+                    .evidence
+                    .iter()
+                    .any(|item| *item == "zip:eocd_single_disk_without_local_header")
+            })
+            .count()
+            == 1;
+
+    // Raw byte-split ZIP relations are already proven by two independent
+    // bounded anchors: the first local header and the terminal EOCD.  Do not
+    // overwrite those relation facts with a physical-file deep probe that
+    // cannot validate a central directory spanning multiple chunks.
+    if !bounded_raw_zip_relation {
+        let mut volume_paths: Vec<String> = proposal
+            .volumes
+            .iter()
+            .map(|(path, _, _, _, _)| path.clone())
+            .collect();
+        volume_paths.sort_by_key(|path| path.to_ascii_lowercase());
+        volume_paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+        let tail_limit = if proposal.format == "zip" { 65_557 } else { 0 };
+        let deep_anchors = py.detach(|| {
+            probe_volume_anchor_paths_deep(
+                &volume_paths,
+                1024 * 1024,
+                tail_limit,
+                path_passwords,
+            )
+        });
+        for anchor in deep_anchors {
+            anchors.insert(anchor.path.to_ascii_lowercase(), anchor);
+        }
     }
 
     let status = match proposal.format.as_str() {
@@ -1625,22 +1657,64 @@ fn ordinary_file_group_to_dict(
     row: &RelationInput,
     relation_confirmed: bool,
 ) -> PyResult<Py<PyDict>> {
+    let parsed = parse_relation_numbered_volume(&row.name);
+    let archive_numbered_hypothesis = !relation_confirmed
+        && parsed.as_ref().is_some_and(|_| {
+            row.anchor.as_ref().is_some_and(|anchor| {
+                matches!(anchor.format.as_str(), "rar" | "7z" | "zip") || anchor.sfx
+            })
+        });
+    let relation_format = row
+        .anchor
+        .as_ref()
+        .map(|anchor| anchor.format.as_str())
+        .filter(|format| !format.is_empty())
+        .or_else(|| parsed.as_ref().map(|value| value.family))
+        .unwrap_or("");
+    let split_family = if archive_numbered_hypothesis {
+        parsed
+            .as_ref()
+            .map(|value| split_family_for_proposal(relation_format, value.style))
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let split_index = parsed
+        .as_ref()
+        .filter(|_| archive_numbered_hypothesis)
+        .map(|value| value.number)
+        .unwrap_or(0);
     let relation = FileRelationNative {
         filename: row.name.clone(),
-        logical_name: get_logical_name(&row.name, false),
-        split_role: None,
-        is_split_member: false,
-        has_generic_001_head: false,
-        is_plain_numeric_member: false,
+        logical_name: parsed
+            .as_ref()
+            .filter(|_| archive_numbered_hypothesis)
+            .map(logical_name_from_parsed)
+            .unwrap_or_else(|| get_logical_name(&row.name, false)),
+        split_role: archive_numbered_hypothesis.then(|| {
+            if split_index == 1 {
+                "first".to_string()
+            } else {
+                "member".to_string()
+            }
+        }),
+        is_split_member: archive_numbered_hypothesis,
+        has_generic_001_head: archive_numbered_hypothesis
+            && split_index == 1
+            && parsed.as_ref().is_some_and(|value| value.family == "generic"),
+        is_plain_numeric_member: archive_numbered_hypothesis
+            && parsed
+                .as_ref()
+                .is_some_and(|value| value.style == "plain_numeric_suffix"),
         has_split_companions: false,
         is_split_exe_companion: false,
         is_disguised_split_exe_companion: false,
-        is_split_related: false,
+        is_split_related: archive_numbered_hypothesis,
         match_rar_disguised: false,
         match_rar_head: false,
-        match_001_head: false,
-        split_family: String::new(),
-        split_index: 0,
+        match_001_head: archive_numbered_hypothesis && split_index == 1,
+        split_family,
+        split_index,
     };
     let dict = PyDict::new(py);
     dict.set_item("head_path", &row.path)?;

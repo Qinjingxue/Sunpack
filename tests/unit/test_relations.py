@@ -423,6 +423,42 @@ def test_middle_gap_keeps_structured_missing_index(tmp_path):
     assert all(group.kind == "file" for group in groups)
     assert all(len(group.input_paths) == 1 for group in groups)
 
+def test_plain_numbered_file_does_not_gain_archive_split_identity(tmp_path):
+    path = tmp_path / "notes.001"
+    path.write_bytes(b"plain data")
+
+    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
+
+    assert group.is_split_candidate is False
+    assert group.relation.is_split_related is False
+
+
+def test_only_head_7z_keeps_unconfirmed_split_identity(tmp_path):
+    start_header = (
+        (0).to_bytes(8, "little")
+        + (4096).to_bytes(8, "little")
+        + (0).to_bytes(4, "little")
+    )
+    path = tmp_path / "only-head.7z.001"
+    path.write_bytes(
+        b"7z\xbc\xaf\x27\x1c"
+        + b"\x00\x04"
+        + (crc32(start_header) & 0xFFFFFFFF).to_bytes(4, "little")
+        + start_header
+    )
+
+    group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
+    candidate = relation_group_to_candidate(group)
+
+    assert group.is_split_candidate is False
+    assert group.relation.is_split_related is True
+    assert group.relation.split_role == "first"
+    assert group.relation.split_index == 1
+    assert group.head_metadata["format"] == "7z"
+    assert group.head_metadata.get("relation_confirmed") is not True
+    assert candidate.is_split is True
+
+
 def test_raw_zip_relation_uses_bounded_anchors_not_full_directory_revalidation(tmp_path):
     archive = tmp_path / "source.zip"
     with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_STORED) as stream:
