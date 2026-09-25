@@ -834,6 +834,9 @@ static const UInt64 kStreamingBZipMagicMask = UINT64_CONST(0x0000FFFFFFFFFFFF);
 // each symbol is at most kMaxHuffmanLen bits. Leave generous metadata slack.
 static const UInt64 kStreamingBZipEncodedLookahead =
     ((UInt64)kBlockSizeMax * kMaxHuffmanLen + 7) / 8 + ((UInt64)1 << 16);
+static const UInt64 kStreamingBZipMaxWindowBytes =
+    kStreamingBZipEncodedLookahead * kStreamingBZipMaxLanes +
+    2 * kStreamingBZipReadChunk;
 
 
 struct CStreamingBZipMarker
@@ -2015,11 +2018,16 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
   for (;;)
   {
-    // Ensure the current authoritative marker has been scanned. New input is
-    // read exactly once and remains in this bounded window for both scanning
-    // and full-block decode.
-    while (!input.FindMarker(expectedBit) && !input.Eof())
-      RINOK(input.ReadMore())
+    // An authoritative marker is only 48 bits. Read just enough to let the
+    // incremental scanner classify that exact bit position; never scan to EOF
+    // looking for a marker that should already be here.
+    const HRESULT markerInputRes =
+        input.EnsureBit(expectedBit + 56);
+    if (markerInputRes != S_OK)
+    {
+      Base.NeedMoreInput = true;
+      return S_FALSE;
+    }
 
     const CStreamingBZipMarker *authoritative =
         input.FindMarker(expectedBit);
@@ -2151,6 +2159,11 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       // EOS remains speculative until an authoritative full-block decode lands
       // exactly on it. Never stop input merely because the scanner saw an EOS
       // bit pattern inside compressed payload.
+      const UInt64 authoritativeByte = expectedBit >> 3;
+      if (input.EndByte() >=
+          authoritativeByte + kStreamingBZipMaxWindowBytes)
+        break;
+
       if (input.Eof())
         break;
 
