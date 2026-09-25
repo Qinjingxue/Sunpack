@@ -2843,13 +2843,20 @@ def test_watch_scheduler_departed_claimed_source_stays_owned_until_pipeline_fini
     )
 
     forgotten = []
+    observed = []
     original_forget = watcher.state.forget_path
+    real_candidate = scheduler_module._candidate_for_event_path
 
     def recording_forget(path, *, recursive=False):
         forgotten.append((path, recursive))
         return original_forget(path, recursive=recursive)
 
+    def recording_candidate(path, *, since_usn=0):
+        observed.append(os.path.abspath(path))
+        return real_candidate(path, since_usn=since_usn)
+
     monkeypatch.setattr(watcher.state, "forget_path", recording_forget)
+    monkeypatch.setattr(scheduler_module, "_candidate_for_event_path", recording_candidate)
     sibling_volume.unlink()
     watcher.notify_path_departed(str(sibling_volume))
 
@@ -2857,6 +2864,7 @@ def test_watch_scheduler_departed_claimed_source_stays_owned_until_pipeline_fini
     assert watcher.pending_count == 0
 
     watcher._release_pipeline_source_claims("pipeline-owner")
+    assert observed == []
     assert watcher.pending_count == 0
 
 
