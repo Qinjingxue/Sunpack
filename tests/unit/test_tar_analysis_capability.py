@@ -155,4 +155,7 @@ def test_tar_detection_uses_first_header_only_and_keeps_deep_analysis_separate(t
         str(path),
         TarProbeOptions(max_entries_to_walk=8),
     ).to_raw_dict()
-    assert deep["entry_walk_ok"] is False
+    assert deep["entry_walk_ok"] is True
+    assert deep["walk_complete"] is False
+    assert deep["error"]
+    assert deep["damage_flags"]
