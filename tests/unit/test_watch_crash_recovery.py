@@ -10,6 +10,16 @@ def _candidate(path, *, size=10, mtime=1.0):
     return WatchCandidate(path=str(path), size=size, mtime=mtime, file_id="id", change_usn=3)
 
 
+def _watch_scheduler_shell(scheduler_module):
+    import threading
+
+    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler._claim_gate = threading.RLock()
+    scheduler._active_claims = {}
+    scheduler._dirty_during_claim = {}
+    return scheduler
+
+
 def test_pending_output_recovery_state_round_trips(tmp_path):
     state_path = tmp_path / "state.json"
     source = tmp_path / "outer.zip"
@@ -76,7 +86,7 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     source.write_bytes(b"payload")
     candidate = _candidate(source, size=7)
     calls = []
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
     scheduler._active_states = {}
@@ -128,7 +138,7 @@ def test_noncritical_attempt_refresh_does_not_force_an_extra_fsync(tmp_path, mon
 def test_startup_blocker_reconciliation_is_targeted(tmp_path, monkeypatch):
     import sunpack.runtime.watch.scheduler as scheduler_module
 
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler = _watch_scheduler_shell(scheduler_module)
     password_archive = tmp_path / "password.zip"
     missing_archive = tmp_path / "missing.7z.001"
     password_archive.write_bytes(b"x")
@@ -174,7 +184,7 @@ def test_departed_inflight_owner_does_not_delete_durable_pending(tmp_path):
     state = WatchStateStore(str(tmp_path / "state.json"))
     state.queue_active(_candidate(source))
 
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
     scheduler._active_states = {}
@@ -199,7 +209,7 @@ def test_departed_unowned_path_is_still_forgotten(tmp_path):
     state = WatchStateStore(str(tmp_path / "state.json"))
     state.queue_active(_candidate(source))
 
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
     scheduler._active_states = {}
@@ -257,7 +267,7 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
     source = tmp_path / "archive.zip"
     source.write_bytes(b"payload")
     candidate = _candidate(source, size=7)
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler._lock = threading.Lock()
     scheduler._pending = {}
     scheduler._active_states = {}
@@ -333,7 +343,7 @@ def test_watch_lifecycle_state_rejection_fails_closed():
     import pytest
     import sunpack.runtime.watch.scheduler as scheduler_module
 
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler.state = SimpleNamespace(
         record_task_output_started=lambda *_args, **_kwargs: False,
         record_task_output_finished=lambda *_args, **_kwargs: False,
@@ -381,7 +391,7 @@ def test_crash_recovery_removes_partial_direct_output_and_requeues_source(tmp_pa
     assert state.record_task_output_started(str(source), str(source), str(output))
 
     restarted = WatchStateStore(str(state_path))
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler.state = restarted
     scheduler.config = {}
     scheduler.log = SimpleNamespace(write=lambda *_args, **_kwargs: None)
@@ -428,7 +438,7 @@ def test_missing_committed_output_requeues_surviving_source(tmp_path, monkeypatc
     )
 
     restarted = WatchStateStore(str(state_path))
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler.state = restarted
     scheduler.config = {}
     events = []
@@ -474,7 +484,7 @@ def test_missing_committed_output_without_source_keeps_recovery_owner(tmp_path, 
     source.unlink()
 
     restarted = WatchStateStore(str(state_path))
-    scheduler = object.__new__(scheduler_module.WatchScheduler)
+    scheduler = _watch_scheduler_shell(scheduler_module)
     scheduler.state = restarted
     scheduler.config = {}
     events = []
