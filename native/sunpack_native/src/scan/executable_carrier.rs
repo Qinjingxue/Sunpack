@@ -5,6 +5,11 @@ use std::io;
 const CHUNK_BYTES: usize = 1024 * 1024;
 const SFX_STUB_SCAN_BYTES: u64 = 1024 * 1024;
 const NSIS_OVERLAY_PROBE_BYTES: u64 = 64;
+const GODOT_PCK_MAGIC: &[u8; 4] = b"GDPC";
+const GODOT_PCK_HEADER_BYTES: usize = 8;
+const GODOT_PCK_TRAILER_BYTES: u64 = 12;
+const GODOT_PCK_SECTION_ALIGNMENT_BYTES: usize = 8;
+const GODOT_PCK_SUPPORTED_VERSIONS: [u32; 4] = [1, 2, 3, 4];
 const QT_IFW_TAIL_WINDOW_BYTES: u64 = 1024 * 1024;
 const QT_IFW_MAGIC_COOKIE: u64 = 0xC2630A1C99D668F8;
 const QT_IFW_MAGIC_MARKERS: [u64; 4] = [0x12023233, 0x12023234, 0x12023235, 0x12023236];
@@ -42,16 +47,23 @@ const PROFILES: &[(&str, &[&[u8]])] = &[
 
 /// Identify known executable application/installer bundles without exposing file bytes to Python.
 #[pyfunction]
+#[pyo3(signature = (path, scan_limit_bytes, executable_image_end, pck_section_offset=0))]
 pub(crate) fn executable_runtime_bundle_profile(
     py: Python<'_>,
     path: &str,
     scan_limit_bytes: u64,
     executable_image_end: u64,
+    pck_section_offset: u64,
 ) -> String {
     let path = path.to_owned();
     py.detach(move || {
-        runtime_bundle_profile_native(&path, scan_limit_bytes, executable_image_end)
-            .unwrap_or_default()
+        runtime_bundle_profile_native(
+            &path,
+            scan_limit_bytes,
+            executable_image_end,
+            pck_section_offset,
+        )
+        .unwrap_or_default()
     })
 }
 
@@ -59,6 +71,7 @@ fn runtime_bundle_profile_native(
     path: &str,
     scan_limit_bytes: u64,
     executable_image_end: u64,
+    pck_section_offset: u64,
 ) -> io::Result<String> {
     if path.is_empty() || scan_limit_bytes == 0 {
         return Ok(String::new());
@@ -70,6 +83,9 @@ fn runtime_bundle_profile_native(
         scan_limit_bytes
     };
     let reader = ManagedReader::open(path)?;
+    if godot_embedded_pck_layout_matches(&reader, pck_section_offset)? {
+        return Ok("godot_embedded_pck".to_owned());
+    }
     if let Some(profile) = scan_image_profiles(&reader, image_scan_limit)? {
         return Ok(profile.to_owned());
     }
@@ -117,6 +133,58 @@ fn contains_any(haystack: &[u8], patterns: &[&[u8]]) -> bool {
     patterns
         .iter()
         .any(|pattern| find_subslice(haystack, pattern).is_some())
+}
+
+fn godot_embedded_pck_layout_matches(
+    reader: &ManagedReader,
+    pck_section_offset: u64,
+) -> io::Result<bool> {
+    if pck_section_offset > 0 && pck_section_offset < reader.len() {
+        let available = reader.len() - pck_section_offset;
+        let probe_size = available.min(
+            (GODOT_PCK_SECTION_ALIGNMENT_BYTES + GODOT_PCK_HEADER_BYTES - 1) as u64,
+        ) as usize;
+        if probe_size >= GODOT_PCK_HEADER_BYTES {
+            let probe = reader.read_at(pck_section_offset, probe_size)?;
+            for offset in 0..GODOT_PCK_SECTION_ALIGNMENT_BYTES {
+                let Some(header) = probe.get(offset..offset + GODOT_PCK_HEADER_BYTES) else {
+                    break;
+                };
+                if godot_pck_header_matches(header) {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+
+    let file_size = reader.len();
+    if file_size < GODOT_PCK_TRAILER_BYTES + GODOT_PCK_HEADER_BYTES as u64 {
+        return Ok(false);
+    }
+    let trailer = reader.read_at(
+        file_size - GODOT_PCK_TRAILER_BYTES,
+        GODOT_PCK_TRAILER_BYTES as usize,
+    )?;
+    if &trailer[8..12] != GODOT_PCK_MAGIC {
+        return Ok(false);
+    }
+    let pck_size = u64::from_le_bytes(trailer[0..8].try_into().unwrap());
+    if pck_size < GODOT_PCK_HEADER_BYTES as u64
+        || pck_size > file_size - GODOT_PCK_TRAILER_BYTES
+    {
+        return Ok(false);
+    }
+    let pck_start = file_size - GODOT_PCK_TRAILER_BYTES - pck_size;
+    let header = reader.read_at(pck_start, GODOT_PCK_HEADER_BYTES)?;
+    Ok(godot_pck_header_matches(&header))
+}
+
+fn godot_pck_header_matches(header: &[u8]) -> bool {
+    if header.len() < GODOT_PCK_HEADER_BYTES || &header[..4] != GODOT_PCK_MAGIC {
+        return false;
+    }
+    let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    GODOT_PCK_SUPPORTED_VERSIONS.contains(&version)
 }
 
 fn nsis_overlay_layout_matches(
@@ -240,6 +308,7 @@ mod tests {
             path.to_str().unwrap(),
             data.len() as u64,
             data.len() as u64,
+            0,
         )
         .unwrap();
         assert_eq!(profile, "par_packer");
@@ -251,7 +320,7 @@ mod tests {
         let data = b"MZpayload Inno Setup Setup Data ( gap JR.Inno.Setup";
         let path = temp_file("runtime_profile_overlay", data);
         let profile =
-            runtime_bundle_profile_native(path.to_str().unwrap(), data.len() as u64, 2).unwrap();
+            runtime_bundle_profile_native(path.to_str().unwrap(), data.len() as u64, 2, 0).unwrap();
         assert!(profile.is_empty());
         let _ = fs::remove_file(path);
     }
@@ -264,8 +333,90 @@ mod tests {
         data.extend_from_slice(&vec![b'z'; 4096]);
         let path = temp_file("runtime_profile_nsis", &data);
         let profile =
-            runtime_bundle_profile_native(path.to_str().unwrap(), image_end, image_end).unwrap();
+            runtime_bundle_profile_native(path.to_str().unwrap(), image_end, image_end, 0).unwrap();
         assert_eq!(profile, "nsis");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn identifies_godot_embedded_pck_from_named_section_offset() {
+        let pck_offset = 64u64;
+        let mut data = vec![b'x'; pck_offset as usize];
+        data.extend_from_slice(b"\0\0GDPC");
+        data.extend_from_slice(&3u32.to_le_bytes());
+        data.extend_from_slice(b"payload");
+        let path = temp_file("runtime_profile_godot_section", &data);
+        let profile = runtime_bundle_profile_native(
+            path.to_str().unwrap(),
+            data.len() as u64,
+            pck_offset,
+            pck_offset,
+        )
+        .unwrap();
+        assert_eq!(profile, "godot_embedded_pck");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn identifies_godot_embedded_pck_from_self_describing_footer() {
+        let mut data = b"MZ ordinary executable".to_vec();
+        data.resize(64, 0);
+        let mut pck = b"GDPC".to_vec();
+        pck.extend_from_slice(&3u32.to_le_bytes());
+        pck.extend_from_slice(b"project payload");
+        data.extend_from_slice(&pck);
+        data.extend_from_slice(&(pck.len() as u64).to_le_bytes());
+        data.extend_from_slice(GODOT_PCK_MAGIC);
+        let path = temp_file("runtime_profile_godot_footer", &data);
+        let profile = runtime_bundle_profile_native(
+            path.to_str().unwrap(),
+            data.len() as u64,
+            64,
+            0,
+        )
+        .unwrap();
+        assert_eq!(profile, "godot_embedded_pck");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_godot_magic_with_unsupported_pack_version() {
+        let mut data = b"MZ ordinary executable".to_vec();
+        data.resize(64, 0);
+        let mut pck = b"GDPC".to_vec();
+        pck.extend_from_slice(&99u32.to_le_bytes());
+        pck.extend_from_slice(b"payload");
+        data.extend_from_slice(&pck);
+        data.extend_from_slice(&(pck.len() as u64).to_le_bytes());
+        data.extend_from_slice(GODOT_PCK_MAGIC);
+        let path = temp_file("runtime_profile_godot_version", &data);
+        let profile = runtime_bundle_profile_native(
+            path.to_str().unwrap(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        assert!(profile.is_empty());
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn rejects_godot_footer_magic_without_valid_back_pointer() {
+        let mut data = b"MZ ordinary executable".to_vec();
+        data.resize(64, 0);
+        data.extend_from_slice(b"not a pck");
+        data.extend_from_slice(&9u64.to_le_bytes());
+        data.extend_from_slice(GODOT_PCK_MAGIC);
+        let path = temp_file("runtime_profile_godot_false_footer", &data);
+        let profile = runtime_bundle_profile_native(
+            path.to_str().unwrap(),
+            1,
+            1,
+            0,
+        )
+        .unwrap();
+        assert!(profile.is_empty());
         let _ = fs::remove_file(path);
     }
 
@@ -314,7 +465,7 @@ mod tests {
         data.extend_from_slice(&QT_IFW_MAGIC_MARKERS[0].to_le_bytes());
         data.extend_from_slice(&QT_IFW_MAGIC_COOKIE.to_le_bytes());
         let path = temp_file("runtime_profile_qt", &data);
-        let profile = runtime_bundle_profile_native(path.to_str().unwrap(), 2, 2).unwrap();
+        let profile = runtime_bundle_profile_native(path.to_str().unwrap(), 2, 2, 0).unwrap();
         assert_eq!(profile, "qt_installer_framework");
         let _ = fs::remove_file(path);
     }

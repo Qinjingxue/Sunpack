@@ -14,5 +14,6 @@ def inspect_runtime_bundle(path: str, size: int, *, max_probe_bytes: int = 8 * 1
         path,
         int(max_probe_bytes),
         int(overlay.get("overlay_offset") or 0),
+        int(overlay.get("pck_section_offset") or 0),
     )
     return profile or None
