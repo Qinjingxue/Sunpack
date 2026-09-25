@@ -1114,6 +1114,7 @@ struct CStreamingParallelBlockJob
   UInt32 CalculatedCrc;
   CBlockProps Props;
   HRESULT Result;
+  bool NeedMoreInput;
 
   std::mutex Mutex;
   std::condition_variable FinishedEvent;
@@ -1132,6 +1133,7 @@ struct CStreamingParallelBlockJob
       ExpectedCrc(0),
       CalculatedCrc(0),
       Result(S_OK),
+      NeedMoreInput(false),
       Done(false)
   {}
 
@@ -1143,6 +1145,9 @@ struct CStreamingParallelBlockJob
 
   bool Allocate(UInt32 *borrowedCounters = NULL)
   {
+    if (Counters && Compact)
+      return true;
+
     if (borrowedCounters)
     {
       Counters = borrowedCounters;
@@ -1185,6 +1190,7 @@ struct CStreamingParallelBlockJob
     CompactSize = 0;
     Props = CBlockProps();
     Result = S_OK;
+    NeedMoreInput = false;
 
     std::lock_guard<std::mutex> lock(Mutex);
     Done = false;
@@ -1280,6 +1286,7 @@ struct CStreamingParallelBlockJob
           base.state = STATE_BLOCK_SIGNATURE;
           base.state2 = 0;
           base.IsBz = false;
+          base.CombinedCrc.Init();
           base.InitBitDecoder();
           base._buf = Input + byteOffset;
           base._lim = Input + InputSize;
@@ -1302,7 +1309,13 @@ struct CStreamingParallelBlockJob
             base.Props.randMode = 1;
             const SRes blockRes = base.ReadBlock2();
             if (blockRes != SZ_OK || base.state != STATE_BLOCK_SIGNATURE)
+            {
+              if (blockRes == SZ_OK &&
+                  base.state != STATE_BLOCK_SIGNATURE &&
+                  base._buf == base._lim)
+                NeedMoreInput = true;
               result = S_FALSE;
+            }
             else
             {
               EndBit =
@@ -1877,10 +1890,10 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
     jobs[i].reset(new (std::nothrow) CStreamingParallelBlockJob());
     if (!jobs[i])
       return E_OUTOFMEMORY;
-
-    if (!jobs[i]->Allocate(i == 0 ? _counters : NULL))
-      return E_OUTOFMEMORY;
   }
+
+  if (!jobs[0]->Allocate(_counters))
+    return E_OUTOFMEMORY;
 
   std::unique_ptr<Byte[]> commitBuffer(
       new (std::nothrow) Byte[kStreamingBZipCommitChunk]);
@@ -2012,7 +2025,8 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
         input.FindMarker(expectedBit);
     if (!authoritative)
     {
-      Base.NeedMoreInput = true;
+      if (input.EndByte() * 8 < expectedBit + 48)
+        Base.NeedMoreInput = true;
       return S_FALSE;
     }
 
@@ -2062,13 +2076,38 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       Base.FinishedPackSize = finishedPackSize;
       Base.IsBz = false;
 
-      // Probe one possible concatenated-stream header. This mirrors the serial
-      // decoder's StartRead() behavior and also lets the handler distinguish
-      // clean EOF from trailing data without consuming the input twice.
-      RINOK(input.EnsureByte(finishedPackSize + 4))
+      // Probe one possible concatenated-stream header. A clean EOF is success;
+      // a partial "BZh" prefix is unexpected-end; arbitrary trailing bytes are
+      // data-after-end and therefore return success with FinishedPackSize set.
+      const HRESULT probeRes =
+          input.EnsureByte(finishedPackSize + 4);
+      if (probeRes != S_OK)
+      {
+        if (!input.Eof())
+          return probeRes;
 
-      if (input.EndByte() == finishedPackSize && input.Eof())
+        const UInt64 remain =
+            input.EndByte() - finishedPackSize;
+        if (remain == 0)
+          return S_OK;
+
+        const size_t local =
+            (size_t)(finishedPackSize - input.BaseByte());
+        const Byte expectedHeader[3] = {
+            kArSig0, kArSig1, kArSig2 };
+        bool headerPrefix = remain <= 3;
+        for (UInt64 i = 0; headerPrefix && i < remain; i++)
+          if (input.Data()[local + (size_t)i] != expectedHeader[i])
+            headerPrefix = false;
+
+        if (headerPrefix)
+        {
+          Base.NeedMoreInput = true;
+          return S_FALSE;
+        }
+
         return S_OK;
+      }
 
       const HRESULT headerRes =
           ensureHeaderAt(finishedPackSize, false);
@@ -2156,6 +2195,19 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 
     const unsigned activeJobs = 1 + extraWorkers;
 
+    // Helper workspaces are materialized only after the scheduler grants their
+    // credits. Under CPU contention this keeps BZip2 RSS proportional to the
+    // parallelism it can actually use.
+    for (unsigned i = 1; i < activeJobs; i++)
+      if (!jobs[i]->Allocate())
+      {
+        if (cpuContext && extraWorkers)
+          sunpack_cpu_release_extra_for_context(
+              cpuContext,
+              extraWorkers);
+        return E_OUTOFMEMORY;
+      }
+
     // All job pointers refer to input.Data(). No reads or vector growth are
     // allowed until the batch has completed.
     for (unsigned i = 0; i < activeJobs; i++)
@@ -2208,7 +2260,7 @@ HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
       const HRESULT jobRes = job->Wait();
       if (jobRes != S_OK)
       {
-        if (input.Eof())
+        if (job->NeedMoreInput && input.Eof())
           Base.NeedMoreInput = true;
         return jobRes;
       }
