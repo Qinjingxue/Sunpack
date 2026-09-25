@@ -1106,7 +1106,10 @@ def test_extraction_scheduler_uses_worker_for_file_range(tmp_path, monkeypatch):
 
     assert result.success is True
     assert (tmp_path / "out" / filename).read_text(encoding="utf-8") == "range payload"
-    assert result.diagnosticsdef test_confirmed_truncated_file_range_open_failure_is_damaged(tmp_path):
+    assert result.diagnostics["result"]["input_trace"]["prefetch_enabled"] is True
+
+
+def test_confirmed_truncated_file_range_open_failure_is_damaged(tmp_path):
     _require_worker_or_skip()
     archive, _ = _create_7z(tmp_path, "truncated-range", "payload")
     data = archive.read_bytes()
@@ -1135,9 +1138,6 @@ def test_extraction_scheduler_uses_worker_for_file_range(tmp_path, monkeypatch):
     assert worker["damaged"] is True
     assert worker["failure_stage"] == "archive_open"
     assert worker["failure_kind"] == "structure_recognition"
-
-
-["result"]["input_trace"]["prefetch_enabled"] is True
 
 
 def test_extraction_scheduler_saves_worker_diagnostics_on_failure(tmp_path):
