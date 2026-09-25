@@ -164,6 +164,8 @@ pub(crate) fn inspect_pe_overlay_structure(
     }
 
     let mut pe_end = 0u64;
+    let mut pck_section_offset = 0u64;
+    let mut pck_section_size = 0u64;
     for index in 0..section_count as usize {
         let start = index * SECTION_HEADER_SIZE;
         let section = &section_table[start..start + SECTION_HEADER_SIZE];
@@ -171,6 +173,10 @@ pub(crate) fn inspect_pe_overlay_structure(
         let raw_pointer = u32_le(section, 20) as u64;
         if raw_pointer != 0 && raw_size != 0 {
             pe_end = pe_end.max(raw_pointer + raw_size);
+            if pck_section_offset == 0 && pe_section_name_is(section, b"pck") {
+                pck_section_offset = raw_pointer;
+                pck_section_size = raw_size;
+            }
         }
     }
 
@@ -180,7 +186,12 @@ pub(crate) fn inspect_pe_overlay_structure(
     result.set_item("section_count", section_count)?;
     result.set_item("overlay_offset", pe_end)?;
     result.set_item("overlay_size", actual_size.saturating_sub(pe_end))?;
+    result.set_item("pck_section_offset", pck_section_offset)?;
+    result.set_item("pck_section_size", pck_section_size)?;
     let evidence = PyList::new(py, ["pe:valid_headers"])?;
+    if pck_section_offset != 0 {
+        evidence.append("pe:pck_section")?;
+    }
     result.set_item("evidence", &evidence)?;
 
     if pe_end == 0 || pe_end >= actual_size {
@@ -282,6 +293,8 @@ fn empty_result<'py>(py: Python<'py>, error: &str) -> PyResult<Bound<'py, PyDict
         "overlay_size",
         "archive_offset",
         "offset_delta_from_overlay",
+        "pck_section_offset",
+        "pck_section_size",
     ] {
         result.set_item(key, 0)?;
     }
@@ -304,6 +317,15 @@ fn find_archive_magic(sample: &[u8]) -> Option<(&'static str, &'static str, usiz
         }
     }
     best
+}
+
+fn pe_section_name_is(section: &[u8], expected: &[u8]) -> bool {
+    let Some(name) = section.get(..8) else {
+        return false;
+    };
+    expected.len() <= name.len()
+        && &name[..expected.len()] == expected
+        && name[expected.len()..].iter().all(|byte| *byte == 0)
 }
 
 fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
