@@ -122,9 +122,9 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 
 ## Configuration
 
-The main configuration file is `sunpack_config.json`; there is also an advanced configuration file, `sunpack_advanced_config.json`.Configuration changes are automatically hot-reloaded in watch mode, so there is no need to restart the process.
+The main configuration file is `sunpack_config.json`; `sunpack_advanced_config.json` supplies additional defaults. Watch automatically reloads configuration changes.
 
-The main configuration file overrides the advanced configuration for the same fields; fields can be moved manually from the advanced configuration to the main one.
+Add only the fields you want to change to the main configuration file.
 
 Configuration validation command:
 
@@ -132,7 +132,7 @@ Configuration validation command:
 python sunpack.py config validate
 ```
 
-See [Configuration file reference](docs/configuration.md) for the full configuration documentation.
+See the [configuration guide](docs/configuration.md) for common settings and examples.
 
 ---
 
@@ -158,11 +158,17 @@ See [the documentation](docs/development_boundaries.md) for development boundari
 ### Architecture at a glance
 
 ```text
-app/config
-  -> coordinator
-     filesystem->relations-> detection -> extraction -> verification
-     -> postprocess
+CLI / Watch / Explorer (runtime)
+  -> pipeline coordinator
+     -> filesystem routing
+        +-- Relations (RAR / 7z / ZIP, including volumes)
+        +-- Detection (TAR and compression streams)
+        +-- Embedded discovery (unresolved files)
+     -> recursive authorization -> password handling -> extraction
+     -> verification -> post-processing
 ```
+
+Rust provides low-level scanning and archive analysis; the C++ worker extracts with the integrated 7-Zip source code.
 
 ### Testing
 

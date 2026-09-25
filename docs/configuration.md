@@ -1,340 +1,64 @@
-# Configuration file reference
+# Configuration guide
 
 **English** | [简体中文](zh-CN/configuration.md)
 
-The commonly used configuration file is `sunpack_config.json`; the complete configuration file is `sunpack_advanced_config.json`. The program reads the advanced configuration first, then overrides fields with the same name from the simplified configuration: objects are merged recursively, while arrays and plain values are overridden wholesale.
+Edit `sunpack_config.json` to change everyday settings. When running from source, use the file in the project root. For an installed copy, use `%ProgramData%\SunPack\sunpack_config.json`. `sunpack_advanced_config.json` supplies the remaining defaults; you only need to add fields you want to change to the main file.
 
-When running from source, the configuration is usually read from the repository root or the current working directory. The installed version always reads `%ProgramData%\SunPack\sunpack_config.json` and takes `sunpack_advanced_config.json` from the install directory as the versioned base layer, so `sunpack_config.json` can be adjusted without reinstalling.
+Objects are merged by field, and `filesystem.scan_filters` entries are merged by `name`. Other arrays are replaced as a whole. Watch reloads configuration changes automatically.
 
-Check and view the effective configuration:
+Check your changes and view the resulting configuration:
 
 ```powershell
 python sunpack.py config validate
 python sunpack.py config show
 ```
 
-## Runtime overrides
+For an installed copy, replace `python sunpack.py` with `sunpack.exe`.
 
-The `SUNPACK_CONFIG_OVERRIDES` environment variable can override any configuration item before startup. Its value may be an inline JSON object or a path to a JSON file.
+## Common settings
 
-The merge order is: `sunpack_advanced_config.json` → `sunpack_config.json` → runtime overrides. `filesystem.scan_filters` is merged by `name`.
+| Setting | What to set |
+| --- | --- |
+| `cli.language` | `zh` for Chinese or `en` for English. |
+| `recursive_extract` | `"*"` to keep processing nested archives, a positive integer for a fixed number of rounds, or `"?"` to ask after each round. |
+| `recursive_authorization.enabled` | `true` to apply the nested archive selection policy; `false` to skip this policy. |
+| `post_extract.archive_cleanup_mode` | `"r"` to recycle the original archive after success, `"k"` to keep it, or `"d"` to delete it. |
+| `post_extract.flatten_single_directory` | `true` to lift the contents of a single top-level output folder. |
+| `filesystem.directory_scan_mode` | `"-"` for files directly in the selected directory, or `"*"` to scan its subdirectories too. |
+| `extraction.content_requirement` | `"complete"` to require a complete result, or `"allow_partial"` to accept partial recovery. |
+| `watch.out_dir` | Default output directory for Watch roots without their own output path; `"."` means beside the input. |
 
-For example, to temporarily disable the size filter:
-
-```powershell
-$env:SUNPACK_CONFIG_OVERRIDES = '{"filesystem": {"scan_filters": [{"name": "size_range", "enabled": false}]}}'
-python sunpack.py scan C:\Archives
-```
-
-An unknown top-level configuration section is reported as an error directly. CLI options (such as `--recur` and `--cleanup`) are applied as the last override layer after the configuration is loaded.
-
-Test runs disable the `size_range` filter by default so that tests can use files smaller than 1 MB; a `SUNPACK_CONFIG_OVERRIDES` already set by the caller is preserved.
-
-## Top-level structure
+For example, add these fields to the main configuration to keep original archives and scan subdirectories:
 
 ```json
 {
-  "cli": {},
-  "runtime": {},
-  "recursive_extract": "*",
-  "recursive_authorization": {},
-  "post_extract": {},
-  "filesystem": {},
-  "performance": {},
-  "watch": {},
-  "passwords": {},
-  "extraction": {},
-  "embedded_scan": {},
-  "input_planning": {},
-  "analysis": {},
-  "verification": {},
-  "detection": {}
+  "post_extract": {"archive_cleanup_mode": "k"},
+  "filesystem": {"directory_scan_mode": "*"}
 }
 ```
 
-## cli
+CLI options such as `--recur`, `--cleanup`, and `--out-dir` let you set extraction behavior for one command. See the [CLI parameter reference](cli_parameters.md).
 
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `language` | `str` | `zh` | CLI language. `zh` uses Chinese; any other value uses English. |
+## Scan filters
 
-## recursive_extract
-
-| Value | Description |
-| --- | --- |
-| `*` | Keep processing nested archives while each round produces new processable archives. |
-| Positive integer | A fixed number of allowed recursive rounds. |
-| `?` | Ask whether to continue after each round that produces new processable archives. |
-
-The first round runs exactly over the file or directory scope the user gave. Subsequent rounds apply `recursive_authorization` to the candidate archives found in the extraction output, and then decide whether to continue processing.
-
-The CLI can override this setting temporarily with `--recur`.
-
-## recursive_authorization
-
-Before a nested archive enters password handling and extraction, this policy decides in bulk, based on directory context, whether it is a standalone archive in the user's sense. Inputs explicitly specified by the user in the first round are not affected by this policy; from the second round on, all candidates found in the output take part in the decision.
-
-The decision uses the raw entries of a single directory snapshot and keeps the directory context from before the blacklist and size filters. Multiple candidates are aggregated together, and a volume set counts as only one archive. Rejected candidates appear in the run summary's policy-skip records and are not counted as extraction failures.
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `enabled` | `bool` | `true` | Whether nested archive authorization is enabled. |
-| `byte_ratio_exponent` | `float` | `1` | Exponent of the candidate archive byte ratio; must be positive. |
-| `project_ratio_exponent` | `float` | `1` | Exponent of the candidate archive project ratio; must be positive. |
-| `authorization_bias` | `float` | `0` | Authorization score bias; positive is more permissive, negative is more conservative. |
-| `minimum_authorization_score` | `float` | `0.85` | Minimum authorization score for the local directory and the output root directory. |
-| `minimum_archive_byte_ratio` | `float` | `0.1` | Reject when the candidate byte ratio is below this value. |
-| `hard_maximum_other_projects` | `int` | `1000` | Reject when the number of valid non-candidate projects exceeds this value. |
-
-Let the candidate byte ratio be `B`, the number of candidate archive projects be `A`, and the number of valid non-candidate projects be `O`; then the archive project ratio is `P = A / (A + O)`. The authorization score is:
-
-```text
-S = sigmoid(c + a × logit(B) + b × logit(P))
-```
-
-where `a`, `b`, and `c` correspond to the two exponents and the bias. `S` is a deterministic `0..1` score and is not a calibrated probability.
-
-## post_extract
-
-| Field | Type | Values | Description |
-| --- | --- | --- | --- |
-| `archive_cleanup_mode` | `str` | `d`, `r`, `k` | How to handle the original archive on success: delete, move to Recycle Bin, keep. |
-| `flatten_single_directory` | `bool` | `true` / `false` | Whether to lift the contents of that directory when the result has only one top-level directory. |
-
-The default cleanup mode is `r`.
-
-## filesystem
-
-### directory_scan_mode
-
-| Value | Description |
-| --- | --- |
-| `*` | Recursively scan the target directory and its subdirectories. |
-| `-` | Scan only the first level of files in the target directory. |
-
-This setting only affects the input directory scan scope, not the recursive rounds of the extraction output.
-
-### scan_filters
-
-`scan_filters_enabled` is the master switch for filters. When set to `false`, the filter configuration is kept but not executed.
-
-Filters run in array order. `directory_prune` prunes during directory traversal; `whitelist`, `blacklist`, `size_range`, and `mtime_range` act on scan entries. Filtered files do not enter relationship resolution, detection, or structural analysis.
-
-`whitelist` example:
+Set `filesystem.scan_filters_enabled` to `false` to turn off all scan filters. To change one filter, add an entry with its `name` under `filesystem.scan_filters`:
 
 ```json
 {
-  "name": "whitelist",
-  "enabled": false,
-  "path_globs": ["archives/**"],
-  "prune_dir_globs": ["archives"],
-  "allowed_files": ["sample.zip"],
-  "allowed_extensions": [".zip", ".7z", ".rar"]
+  "filesystem": {
+    "scan_filters": [
+      {"name": "size_range", "enabled": false}
+    ]
+  }
 }
 ```
 
-The non-empty fields of `whitelist` also act as constraints; `allowed_files` matches the complete file name, and `allowed_extensions` matches extensions. `blacklist` uses the corresponding `blocked_files` and `blocked_extensions`.
+Available filters are `directory_prune` (skip directories), `whitelist` (include selected paths, names, or extensions), `blacklist` (exclude them), `size_range`, and `mtime_range`. Edit their fields in `sunpack_config.json`; the shipped `sunpack_advanced_config.json` shows the expected shapes. Extension filters can hide archives with disguised names.
 
-`directory_prune` supports `prune_dir_globs` and `path_globs`. The former matches directory names at any level, the latter matches paths relative to the scan root; the whole subtree of a pruned directory is skipped.
+## Watch and passwords
 
-`size_range` restricts scan results by file size, where `r` denotes the byte count:
+Add a monitored directory with `python sunpack.py watch add C:\Downloads`. Use `-o E:\Output` to choose its output directory, or set `watch.out_dir` for roots without one. `watch list` shows the configured roots. Watch monitors files directly in each root, not its subdirectories.
 
-```json
-{"name": "size_range", "enabled": true, "range": "1 MB < r < 10 MB"}
-```
+Put `sunpack-passwords.txt` beside archives to supply passwords, one per line. Set `passwords.directory_passwords_enabled` to `false` to stop reading those files, or `watch.directory_password_file_auto_create` to `false` to stop Watch creating them. CLI passwords can also be supplied with `-p` or `--pw-file`.
 
-`B`, `KB`, `MB`, `GB`, `TB` as well as `KiB`, `MiB`, `GiB`, `TiB` are supported, advancing by 1024. The following equivalent fields are also supported:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `gt` / `greater_than` | `int` | The file size must be greater than this value. |
-| `gte` / `greater_than_or_equal` | `int` | The file size must be greater than or equal to this value. |
-| `lt` / `less_than` | `int` | The file size must be less than this value. |
-| `lte` / `less_than_or_equal` | `int` | The file size must be less than or equal to this value. |
-| `eq` / `equal` | `int` | The file size must equal this value. |
-
-`mtime_range` restricts scan results by file modification time, where `d` denotes the modification time:
-
-```json
-{"name": "mtime_range", "enabled": false, "date": "20260430 01:40 > d > 20250320 01:30"}
-```
-
-Dates support nanosecond timestamps, ISO time strings, and `YYYYMMDD HH:MM`, `YYYYMMDD HH:MM:SS`, and `YYYYMMDD`. The `gt`, `gte`, `lt`, `lte`, and `eq` fields are also supported.
-
-Directory scanning and filtering are executed by native scanning capabilities; when a filter cannot be mapped to native parameters, an error is reported explicitly.
-
-## runtime
-
-`runtime` controls process-wide runtime behavior shared by Watch and foreground workloads.
-
-| Field | Default | Description |
-| --- | ---: | --- |
-| `process_mode` | `normal` | Baseline Windows scheduling mode for the shared RuntimeHost and native worker. `normal` uses normal priority; `background` enables Windows Background Processing Mode; `high` uses `HIGH_PRIORITY_CLASS` and may reduce responsiveness of other applications. |
-
-Foreground `extract`, `scan`, and `inspect` requests temporarily override this baseline with their `--process-mode` value; when omitted, that CLI override defaults to `high`. The override remains after the command finishes and expires at the existing idle-maintenance deadline (`watch.runtime_cache_cleanup_idle_seconds`), then the latest hot-reloaded `runtime.process_mode` becomes effective again. Changing `runtime.process_mode` while Watch is running is hot-applied without restarting the scheduler; an active CLI override still wins until it expires.
-
-## performance
-
-Runtime and worker parameters live under `performance`. Defaults are:
-
-| Field | Default | Description |
-| --- | ---: | --- |
-| `persistent_server_idle_seconds` | `15` | How long the persistent server stays idle before exiting. |
-| `worker.watchdog_no_progress_timeout_seconds` | `180` | Report a stall when there has been no progress for this long; `0` means unlimited. |
-| `worker.thread_capacity` | `0` | Extraction thread capacity; `0` selects automatically based on machine capability. |
-| `worker.stage_thread_capacity` | `0` | Thread capacity for scanning, analysis, verification, and post-processing; `0` selects automatically. |
-| `worker.max_inflight_files` | `0` | File-level concurrency limit; `0` selects automatically, in the automatic range 64–512. |
-| `worker.max_pending_stage_jobs` | `4096` | Upper limit of waiting stage jobs. |
-| `worker.minimum_available_memory_ratio` | `0.10` | Start reducing the native CPU-credit budget when available physical memory falls below this fraction of total physical memory. |
-| `worker.max_queue_jobs` | `4096` | Upper limit of the native job queue. |
-| `worker.priority_aging_quantum` | `32` | Priority aging step. |
-| `worker.backpressure_retries` | `120` | Number of retries on queue backpressure. |
-| `worker.writer_threads` | `4` | Number of writer threads. |
-| `worker.job_buffer_budget_bytes` | `33554432` | Output buffer limit per job. |
-| `worker.space_gate_enabled` | `true` | Whether to check disk space before a job enters the write-out stage. |
-| `worker.space_poll_interval_ms` | `1000` | Disk space check interval. |
-| `worker.space_status_report_interval_ms` | `15000` | Disk space status report interval. |
-
-The native worker uses CPU credits as the extraction-concurrency budget. By default the nominal budget equals the logical processor count and every admitted archive job reserves one base credit; formats have no fixed CPU weights. In a SunPack worker context, archive handlers no longer derive decoder concurrency from CPU affinity/core count and LZMA2/XZ no longer reduce thread counts from RAM budgets. Decoders acquire execution lanes from the shared budget when work can actually run, while retaining algorithm-specific limits where they improve efficiency: RAR5 no longer uses an input-size threshold: a single parsed block stays on the caller thread, and extra workers are requested one at a time only after multiple independent blocks form real backlog, up to 8; BZip2 derives its worker target from the actual queued + running ready-block count, up to 12, keeps a fixed two-block-per-worker parse lookahead window, and does not start extra workers for a single block; LZMA2/XZ MtDec also grows one credited thread at a time. The 7z multithreaded mixer remains enabled according to the normal 7-Zip handler setting. Mixer pipeline threads themselves are not separately charged as CPU credits, but they explicitly inherit the parent job CPU context so any nested managed decoder continues to acquire credits from the same job budget. CPU-credit release is edge-triggered: it wakes at most one admission waiter only when the shared budget changes from saturated to available, rather than notifying on every release or broadcasting to the worker pool. The native executor keeps separate foreground/background queues so foreground-first admission is O(1), and decoder-credit bookkeeping uses allocation-free callbacks with only current/peak per-job telemetry.
-
-Throughput statistics no longer participate in concurrency control. The native worker reads system physical-memory availability only while at least one extraction job is active: it samples immediately after the first job is actually admitted, then once per second thereafter; it does not poll memory while idle. The low-frequency memory/disk-space controller has its own mutex and condition variable, so queue submission, admission, cancellation bookkeeping, and ordinary completion do not contend on the scheduler mutex with monitoring. A new active episode wakes the controller once; subsequent jobs in the same episode only update scheduler state, while a disk-space blocked transition wakes the controller directly. If `available_physical / total_physical < worker.minimum_available_memory_ratio`, the effective CPU budget is reduced by `max(1, logical_processors / 8)` per poll, down to 1. When available memory is back at or above the threshold, the same step restores the budget toward the nominal logical-processor capacity. Derating is non-preemptive: existing credit holders keep their lanes, while new jobs and decoder lanes are prevented from acquiring credits until usage falls within the lower budget.
-
-## watch
-
-`watch` controls the waiting, output, clipboard, and notification behavior of the monitoring service. CLI monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory; each line may hold `input directory` or `input directory | output root`.
-
-| Field | Default | Description |
-| --- | ---: | --- |
-| `cold_start_seconds` | `0.0` | Wait time when a file first becomes active. The default is 0, so a file can be processed as soon as it is ready. |
-| `quiet_min_seconds` | `0.0` | Lower bound of the dynamic quiet time. |
-| `quiet_max_seconds` | `180.0` | Upper bound of the dynamic quiet time; when `cold_start_seconds` is 0, no dynamic quiet wait is entered. |
-| `boundary_confirmation_seconds` | `0.5` | Observation time for file boundary confirmation. |
-| `max_folders` | `16` | Upper limit field for the number of directories in the configuration; the current CLI directory list is managed by `sunpack_watch_roots.txt`. |
-| `observer_stop_timeout_seconds` | `5.0` | Wait time for stopping the file system observer thread. |
-| `runtime_cache_cleanup_enabled` | `true` | Whether to clean up idle runtime caches. |
-| `runtime_cache_cleanup_idle_seconds` | `10.0` | Shared idle-maintenance delay. At this deadline a CLI process-mode override expires; runtime caches are also cleared when `runtime_cache_cleanup_enabled` is true. |
-| `password_retry_debounce_seconds` | `0.5` | Wait time before triggering a retry of failed jobs after the password file or clipboard changes. |
-| `password_retry_include_subtree` | `true` | Whether a password source change retries the subtree tasks of the corresponding directory. |
-| `directory_password_file_auto_create` | `true` | Whether Watch automatically creates `sunpack-passwords.txt` in each monitored directory. Existing files are still used when this is `false`. |
-| `clipboard_monitor_enabled` | `true` | Whether to monitor clipboard password changes. |
-| `clipboard_builtin_max_entries` | `30` | Number of clipboard passwords to keep. |
-| `enabled` | `false` | Configuration-layer marker; the actual running state of the CLI service is managed by `watch start` and `watch stop`. |
-| `roots` | `[]` | Default root directory list in the configuration; the CLI service uses the list in the root directory file. |
-| `out_dir` | `.` | Default output location used when no output root is given in the root directory file; relative paths are resolved against the input directory. |
-| `tray_enabled` | `true` | Whether the tray entry point is enabled. |
-| `toast_enabled` | `true` | Whether to send Windows notifications. |
-| `toast_update_interval_ms` | `50` | Notification progress update interval. |
-| `toast_completion_debounce_ms` | `800` | Wait time for coalescing completion notifications. |
-| `toast_success_ttl_seconds` | `3.0` | How long success notifications are kept. |
-| `toast_failure_ttl_seconds` | `5.0` | How long failure notifications are kept. |
-| `toast_report_retention_days` | `30` | Retention days for notification failure reports. |
-| `toast_report_max_files` | `16` | Upper limit of failure report files. |
-| `toast_report_max_bytes` | `2097152` | Upper limit of total failure report size, in bytes. |
-| `state_dir` | `""` | Monitoring state directory; when empty, `.sunpack_watch` next to the root directory file is used. |
-
-The monitoring service only observes the direct files of each root directory and does not recursively watch subdirectories. The input root must be on an NTFS volume, and that volume must have a readable USN Journal; otherwise the root cannot start monitoring.
-
-`created`, `moved`, and `modified` events make a file active. Monitoring learns the quiet interval from actual content changes; plain size or mtime changes take part in interval learning, while other content events reset the current timing. One active cycle submits the main processing pipeline only once. The arrival of a new volume or a change in password sources reactivates the affected tasks.
-
-The output root may be on a different drive. Complete output, partial output, and failed output are all written directly to the corresponding output root; when an output root sits inside a monitored input directory, output directory events are not treated as new input candidates. The output roots of different monitored roots must not be strict ancestors or descendants of one another; the same output root may be shared.
-
-## passwords
-
-| Field | Default | Description |
-| --- | ---: | --- |
-| `clipboard_passwords_enabled` | `true` | Whether to read the current clipboard text when a normal CLI starts. |
-| `directory_passwords_enabled` | `true` | Whether to read the password file in the archive's own directory. |
-| `directory_passwords_max_file_bytes` | `1048576` | Maximum read size of the per-directory password file. |
-| `directory_passwords_max_password_length` | `512` | Maximum length of a single password. |
-
-The per-directory password file is named `sunpack-passwords.txt`, one password per line. During archive extraction, candidate sources are merged and deduplicated in the order "most recent successful password → per-directory passwords → CLI arguments and password files → clipboard → built-in passwords"; while the archive's encryption state is still undetermined, the empty password may also be tried as the first candidate. `--no-builtin-pw` and `--no-dir-pw` disable built-in passwords and per-directory passwords respectively.
-
-## extraction
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `write_progress_manifest` | `bool` | `false` | Whether to write a progress manifest to `.sunpack/pipeline/extraction_manifest.json` in the output directory. |
-| `content_requirement` | `str` | `complete` | Content requirement; one of `complete` or `allow_partial`. |
-
-## embedded_scan
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `enabled` | `bool` | `true` | Whether scanning for embedded archives in file carriers is allowed. |
-| `recursive_candidate_ratio` | `float` | `0.3` | In recursive rounds, the minimum share of unresolved bytes for an individual candidate. |
-
-This layer scans only physical files left unclaimed and unblocked by Relations and Detection. The native scanner handles carriers with arbitrary leading and trailing data.
-
-## input_planning
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `enabled` | `bool` | `true` | Whether archive input planning is enabled. |
-| `cache_size` | `int` | `512` | Number of analysis reports retained within a single request. |
-
-Input planning turns structural analysis results into plain archives, split volumes, and embedded inputs; it does not modify the source files.
-
-## analysis
-
-| Field | Default | Description |
-| --- | ---: | --- |
-| `max_concurrent_reads` | `1` | Concurrency limit for reads of a single input. |
-| `shared_cache_mb` | `64` | Size of the shared binary read cache. |
-| `max_read_mb_per_archive` | `256` | Read limit for a single archive; `null` means unlimited. |
-| `prepass.enabled` | `true` | Whether to read the head and tail regions for a quick pre-check. |
-| `prepass.head_bytes` / `tail_bytes` | `1048576` / `1048576` | Head and tail pre-check sizes. |
-| `thresholds.extractable_confidence` | `0.85` | Minimum confidence for direct extraction. |
-
-Default structural modules and their main limits:
-
-| Module | Default limit |
-| --- | --- |
-| `zip` | `max_cd_entries_to_walk = 64` |
-| `rar` | `max_blocks_to_walk = 4096` |
-| `seven_zip` | `max_next_header_check_bytes = 1048576` |
-| `tar` | `max_entries_to_walk = 64` |
-| `gzip`, `bzip2`, `xz`, `zstd`, `tar_gz`, `tar_bz2`, `tar_xz`, `tar_zst` | `max_probe_bytes = 4194304` |
-
-## verification
-
-Verification combines the extraction exit status, output presence, entry matches, manifest sizes, CRC, and sample readability, and then produces a complete, partial, or failed verdict.
-
-| Field | Default | Description |
-| --- | ---: | --- |
-| `enabled` | `true` | Whether result verification is enabled. |
-| `max_retries` | `2` | Number of normal retries after a verification failure. |
-| `cleanup_failed_output` | `true` | Whether to clean up failed output before retrying. |
-| `complete_accept_threshold` | `0.999` | Minimum completeness for a complete result. |
-| `partial_accept_threshold` | `0.2` | Minimum completeness for a partial result. |
-| `retry_on_verification_failure` | `true` | Whether a retry is allowed after a verification failure. |
-| `methods` | see the table below | Ordered list of verification methods. |
-
-Default methods and key parameters:
-
-| Method | Key parameters | Purpose |
-| --- | --- | --- |
-| `extraction_exit_signal` | `enabled: true` | Read the extraction status, diagnostics, and progress manifest. |
-| `output_presence` | `enabled: true` | Check the output directory and its contents. |
-| `expected_name_presence` | `max_expected_names: 50`, `required_match_ratio: 0.8` | Check the hit ratio of expected entry names; the missing penalty is `10/35/60`. |
-| `manifest_size_match` | `max_expected_names: 2000`, file count tolerance `2` or `5%`, size tolerance `1048576` bytes or `2%` | Compare the archive manifest against the output scale. |
-| `archive_test_crc` | `max_items: 200000`, `max_reported_items: 20` | Read the archive status and compare CRC. |
-| `sample_readability` | `max_samples: 64`, `read_bytes: 4096`, `max_reported_items: 20` | Sample-read output files to confirm the artifacts are basically readable. |
-
-## detection
-
-| Field | Type | Default | Description |
-| --- | --- | --- | --- |
-| `enabled` | `bool` | `true` | Confirm TAR, gzip, bzip2, xz, and zstd single-file inputs routed by the native filesystem probe. |
-
-Relations resolves RAR, 7z, and ZIP, including standalone and split inputs. Unclaimed, unblocked physical files go to the separate Embedded layer. Format confirmation plugins live in `sunpack/pipeline/discovery/detection/formats`; add a module there and register it in `CONFIRMERS` to extend supported formats. Content probes determine formats. Extensions are used only by scan filters and to infer volume membership.
-
-## Password table and password files
-
-`builtin_passwords.txt` stores one built-in password per line; when the file is missing, the program tries to create a default file. The per-directory password file is `sunpack-passwords.txt`, subject to the size and length limits of the `passwords` configuration section.
-
-## Tuning suggestions
-
-- To reduce wrong extractions: adjust `filesystem.scan_filters`; format confirmation lives in `sunpack/pipeline/discovery/detection/formats`.
-- To improve recall for disguised archives and carriers: review `embedded_scan` and the native scanner.
-- To analyze the decision process of a single input: use `inspect --analyze -v`.
-- After changes, run `python sunpack.py config validate`.
+For less common settings, inspect `sunpack_advanced_config.json` and run `config show`. `SUNPACK_CONFIG_OVERRIDES` accepts an inline JSON object or a JSON file path for temporary overrides.
