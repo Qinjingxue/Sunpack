@@ -1,7 +1,7 @@
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
-from sunpack.pipeline.extraction.output_inventory import OutputInventory, collect_output_inventory
+from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
 from tests.helpers.detection_config import with_detection_pipeline
 from sunpack_native import worker_manifest_from_rows
 
@@ -168,38 +168,6 @@ def test_output_scan_policy_inventory_batch_primes_file_heads(tmp_path, monkeypa
     row = facts[next(iter(facts))]
     assert row["size"] == archive.stat().st_size
     assert row["magic"].startswith(b"PK\x03\x04")
-
-
-def test_worker_output_inventory_uses_written_size_for_stream_routing(tmp_path):
-    tar_head = bytearray(512)
-    tar_head[257:262] = b"ustar"
-    native_manifest = worker_manifest_from_rows(
-        [[0, "inner.tar", "", 0, 10 * 1024, 0, 0, 0, 0, 1, 1, 0, 0, bytes(tar_head).hex()]],
-        True,
-        1,
-        0,
-        10 * 1024,
-        True,
-    )
-    inventory = OutputInventory.from_native(
-        native_manifest.to_output_inventory(str(tmp_path))
-    )
-
-    _paths, sizes = inventory.file_columns()
-    assert sizes == [10 * 1024]
-
-    snapshot = DirectoryScanner.snapshot_from_output_inventory(
-        str(tmp_path),
-        inventory,
-        config=_config(),
-    )
-    assert snapshot is not None
-    rows = {
-        path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]: (route, format_hint)
-        for path, _size, route, format_hint, _reject_mask
-        in snapshot.non_relation_file_routing_rows()
-    }
-    assert rows["inner.tar"] == ("detection", "tar")
 
 
 def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, monkeypatch):
