@@ -349,3 +349,19 @@ fn u32_le(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 3],
     ])
 }
+
+
+#[cfg(test)]
+mod tests {
+    use super::pe_section_name_is;
+
+    #[test]
+    fn matches_only_exact_null_padded_pck_section_name() {
+        let mut section = [0u8; 40];
+        section[..3].copy_from_slice(b"pck");
+        assert!(pe_section_name_is(&section, b"pck"));
+
+        section[3] = b'x';
+        assert!(!pe_section_name_is(&section, b"pck"));
+    }
+}
