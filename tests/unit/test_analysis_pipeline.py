@@ -253,9 +253,13 @@ def test_zip_embedded_boundary_defers_payload_integrity(tmp_path):
     prefix = b"carrier-prefix"
     path = _write_bytes(tmp_path / "crc_bad_carrier.bin", prefix + bytes(data))
 
+    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
     zip_evidence = {
         item.format: item
-        for item in AnalysisEngine().analyze_path(str(path)).evidences
+        for item in AnalysisEngine().analyze_path(
+            str(path),
+            initial_prepass=scan.to_prepass(),
+        ).evidences
     }["zip"]
 
     assert zip_evidence.status == "extractable"
@@ -404,7 +408,11 @@ def test_analysis_scheduler_uses_7z_start_header_for_segment_end(tmp_path):
     path = tmp_path / "seven.bin"
     path.write_bytes(payload)
 
-    report = AnalysisEngine().analyze_path(str(path))
+    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
+    report = AnalysisEngine().analyze_path(
+        str(path),
+        initial_prepass=scan.to_prepass(),
+    )
     seven = {item.format: item for item in report.evidences}["7z"]
 
     assert seven.status == "extractable"
@@ -436,9 +444,13 @@ def test_7z_next_header_damage_does_not_trigger_embedded_revalidation(tmp_path):
     seven_data[32 + next_offset] ^= 0xFF
     path = _write_bytes(tmp_path / "next_crc_bad.7z", bytes(seven_data))
 
+    scan = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
     seven = {
         item.format: item
-        for item in AnalysisEngine().analyze_path(str(path)).evidences
+        for item in AnalysisEngine().analyze_path(
+            str(path),
+            initial_prepass=scan.to_prepass(),
+        ).evidences
     }["7z"]
 
     assert seven.status == "extractable"
