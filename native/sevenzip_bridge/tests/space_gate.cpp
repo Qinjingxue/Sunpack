@@ -1024,16 +1024,19 @@ void g25_two_volumes_recover_independently() {
     check(status_seen_b->load(), "G-25: A 恢复之后 B 必须仍被采样");
     check(status_calls->load() >= 1, "G-25: monitor 必须仍在工作");
 
-    // B 之后释放空间必须仍能恢复。
+    // B 是 synthetic key，monitor 的查询会失败。自 G-32 的 stale-probe 修复后，
+    // query failure 必须撤销在途 probe：旧许可不能再被结算，否则失联卷可能被旧 I/O
+    // completion 错误恢复成 Ready。这里验证 A 恢复不影响 B 的独立恢复能力，但 B 必须
+    // 通过一次新的成功采样重新获得 probe。
+    check(gate_b->phase() == VolumeSpacePhase::Blocked,
+          "G-25: B 查询失败后必须撤销旧 probe 并回到 Blocked");
+    check(!gate_b->watermark_valid(),
+          "G-25: B 查询失败后必须要求新的 watermark baseline");
+
+    check(gate_b->poll(999 * kMib), "G-25: B 新采样后必须能重新发放许可");
     {
         auto result = wait_bounded(gate_b);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-25: B 必须仍可结算");
-        result.lease.report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
-    }
-    check(gate_b->poll(999 * kMib), "G-25: B 水位改善后必须能再发放许可");
-    {
-        auto result = wait_bounded(gate_b);
-        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-25: B 拿到许可");
+        check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe, "G-25: B 必须拿到新许可");
         result.lease.report_success();
     }
     check(gate_b->phase() == VolumeSpacePhase::Ready, "G-25: B 后释放空间时必须仍能恢复");
