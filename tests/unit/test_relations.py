@@ -430,8 +430,8 @@ def test_raw_zip_relation_uses_bounded_anchors_not_full_directory_revalidation(t
     data = bytearray(archive.read_bytes())
     archive.unlink()
 
-    cd_offset = data.index(b"PK\\x01\\x02")
-    eocd_offset = data.index(b"PK\\x05\\x06")
+    cd_offset = data.index(b"PK\x01\x02")
+    eocd_offset = data.index(b"PK\x05\x06")
     data[cd_offset:cd_offset + 2] = b"XX"
 
     first = tmp_path / "bounded.zip.001"
