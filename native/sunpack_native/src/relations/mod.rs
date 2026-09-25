@@ -379,8 +379,9 @@ fn build_candidate_groups_from_physical(
                 // look like a first/multivolume input because its declared
                 // logical end lies beyond EOF.  Suppress ordinary fallback
                 // only when at least one distinct numbered sibling exists;
-                // otherwise Embedded/Extraction must get the file and make
-                // the authoritative damage/missing-volume decision.
+                // otherwise the ordinary Relations fallback must keep the
+                // structurally proven SFX so Extraction can make the
+                // authoritative damage/missing-volume decision.
                 if related.iter().any(|path| !path.eq_ignore_ascii_case(&seed.path)) {
                     strong_suppressed_paths.insert(seed.path.to_ascii_lowercase());
                     strong_suppressed_paths.extend(
@@ -646,14 +647,15 @@ fn should_upgrade_zip_anchor(row: &RelationInput) -> bool {
 }
 
 fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
+    let offset = anchor.structure_offset.unwrap_or(0);
+    let proven_sfx = offset > 0 && anchor.sfx && anchor.pe_structure;
     if !matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
         || anchor.confidence != "strong"
-        || !(anchor.standalone || anchor.needs_password)
+        || !(anchor.standalone || anchor.needs_password || proven_sfx)
     {
         return false;
     }
-    let offset = anchor.structure_offset.unwrap_or(0);
-    offset == 0 || (anchor.sfx && anchor.pe_structure)
+    offset == 0 || proven_sfx
 }
 
 fn promote_sfx_archive_anchor(
