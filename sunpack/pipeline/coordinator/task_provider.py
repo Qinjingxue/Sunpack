@@ -38,15 +38,35 @@ class ArchiveTaskProvider:
         is_recursive_scan: bool = False,
     ) -> StageResult:
         session = scan_session or DiscoveryScanSession(config=self.config)
-        candidates = build_candidates_for_targets(
-            scan_roots,
-            session=session,
-            config=self.config,
-        )
-        result = self.discovery.discover(
-            candidates,
-            is_recursive_scan=is_recursive_scan,
-        )
+        roots = list(dict.fromkeys(str(root) for root in scan_roots if str(root)))
+        if is_recursive_scan and len(roots) > 1:
+            result = StageResult()
+            for root in roots:
+                candidates = build_candidates_for_targets(
+                    [root],
+                    session=session,
+                    config=self.config,
+                )
+                partial = self.discovery.discover(
+                    candidates,
+                    is_recursive_scan=True,
+                )
+                result.resolved_tasks.extend(partial.resolved_tasks)
+                result.claimed_paths.update(partial.claimed_paths)
+                result.blocked_paths.update(partial.blocked_paths)
+                result.residual_paths.update(partial.residual_paths)
+                result.traces.extend(partial.traces)
+            result.validate()
+        else:
+            candidates = build_candidates_for_targets(
+                roots,
+                session=session,
+                config=self.config,
+            )
+            result = self.discovery.discover(
+                candidates,
+                is_recursive_scan=is_recursive_scan,
+            )
         self._record_discovery_failures(result)
         return result
 

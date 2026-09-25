@@ -88,6 +88,27 @@ def test_partial_recovery_prints_possible_missing_volume_warning(tmp_path, capsy
     assert "[警告] 压缩包内容不完整；可能缺少一个或多个分卷" in output
 
 
+def test_final_summary_localizes_structured_scan_failure(tmp_path):
+    stream = io.StringIO()
+    path = tmp_path / "broken.7z"
+    failure = FailureInfo(
+        FailureKind.DAMAGED,
+        "embedded_boundary",
+        "Embedded archive is truncated before its terminal boundary",
+        message_key="failure.damaged",
+        details={"path": str(path)},
+    )
+
+    RunReporter("zh", stdout=stream).log_final_summary(
+        0,
+        0,
+        [str(path)],
+        failures=[failure],
+    )
+
+    assert f"{path}: 压缩包损坏" in stream.getvalue()
+
+
 def test_interactive_panel_updates_fixed_row_with_progress_and_colors(tmp_path, monkeypatch):
     stream = io.StringIO()
     stream.terminal_columns = 72

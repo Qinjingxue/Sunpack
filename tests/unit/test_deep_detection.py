@@ -256,6 +256,60 @@ def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypat
     )
 
 
+def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path, monkeypatch):
+    path = tmp_path / "archive.7z.001"
+    path.write_bytes(b"x" * 128)
+    scan = EmbeddedScanResult(
+        complete=True,
+        candidates=(
+            EmbeddedCandidate(
+                format="7z",
+                offset=0,
+                end_offset=None,
+                confidence=0.90,
+                validation="start_header_crc_truncated_declared_range",
+                candidate_kind="logical_archive",
+                boundary_kind="unresolved",
+                extractable=False,
+            ),
+        ),
+        hits=(),
+        read_bytes=128,
+        file_size=128,
+        logical_resolution_complete=False,
+        raw_hit_count=1,
+        budget_exhausted=False,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
+        lambda _path, _size: None,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
+        lambda *_args, **_kwargs: scan,
+    )
+    base = _candidate(path)
+    split = DiscoveryCandidate(
+        archive_input=base.archive_input,
+        carrier_path=base.carrier_path,
+        cleanup_paths=base.cleanup_paths,
+        route=base.route,
+        size=base.size,
+        is_split=True,
+        relation_anchor={"format": "7z", "multivolume": True},
+    )
+
+    result = EmbeddedDiscovery({}).discover([split])
+
+    assert result.resolved_tasks == []
+    assert not result.blocked_paths
+    assert result.residual_paths
+    assert any(
+        trace.reason == "no_complete_embedded_archive" and trace.status == "residual"
+        for trace in result.traces
+    )
+
+
 def test_embedded_rar_wrong_password_blocks_whole_carrier(tmp_path, monkeypatch):
     path = tmp_path / "carrier.bin"
     path.write_bytes(b"x" * 128)

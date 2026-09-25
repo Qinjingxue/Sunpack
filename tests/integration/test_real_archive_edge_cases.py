@@ -6,6 +6,7 @@ import pytest
 
 from tests.helpers.pipeline_engine import execute_pipeline
 from sunpack.core.config.schema import normalize_config
+from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.marker_utils import marker_was_extracted
 from tests.helpers.real_archives import ArchiveCase, ArchiveFixtureFactory
 from tests.helpers.detection_config import with_detection_pipeline
@@ -191,7 +192,12 @@ def test_real_archive_edge_corrupted_sfx_archives_fail(tmp_path, archive_format)
     require_7z()
     case = FACTORY.create(tmp_path, f"corrupted_sfx_{archive_format}", archive_format, sfx=True, corruption="truncate")
 
-    assert_failure_contains(case, {"压缩包损坏", "致命错误"})
+    summary = run_pipeline(case.archive_dir)
+
+    assert summary.success_count == 0
+    assert summary.failed_tasks
+    assert any(failure.contains(FailureKind.DAMAGED) for failure in summary.failures)
+    assert not marker_was_extracted(case.archive_dir, case.marker_name, case.marker_text)
 
 
 @pytest.mark.parametrize("carrier", carrier_params())

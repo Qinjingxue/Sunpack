@@ -561,7 +561,9 @@ impl AnalysisBinaryView {
             set_view_read_fault(&result, &fault, "short_tar_header")?;
             return Ok(result);
         }
-        while checked < max_entries && cursor.saturating_add(TAR_BLOCK_SIZE as u64) <= size {
+        while (checked < max_entries || (max_entries == 0 && checked == 0))
+            && cursor.saturating_add(TAR_BLOCK_SIZE as u64) <= size
+        {
             let location = if checked == 0 {
                 FieldLocation::Head
             } else {
@@ -669,6 +671,16 @@ impl AnalysisBinaryView {
                         PyList::new(py, ["tar:header_checksum", "tar:block_walk_prefix"])?,
                     )?;
                 }
+                return Ok(result);
+            }
+            if max_entries == 0 {
+                result.set_item("plausible", true)?;
+                result.set_item("validation_scope", "format_identity")?;
+                result.set_item("identity_strong", true)?;
+                result.set_item("entries_checked", 0usize)?;
+                result.set_item("entry_walk_ok", false)?;
+                result.set_item("end_zero_blocks", false)?;
+                result.set_item("damage_flags", PyList::empty(py))?;
                 return Ok(result);
             }
             let mut sparse_extension_span = 0u64;

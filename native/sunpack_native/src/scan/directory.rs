@@ -235,14 +235,7 @@ impl NativeWorkerManifest {
             total_size: self.total_size,
             transient_file_count: 0,
             unreadable_count: 0,
-            files: if self.files.iter().all(|item| item.size == item.bytes_written) {
-                Arc::clone(&self.files)
-            } else {
-                Arc::new(self.files.iter().cloned().map(|mut item| {
-                    item.size = item.bytes_written;
-                    item
-                }).collect())
-            },
+            files: Arc::clone(&self.files),
             worker_crc_available: !self.files.is_empty(),
             worker_inventory_complete: self.complete && self.all_complete(),
             identity_paths: self.identity_paths,

@@ -197,7 +197,7 @@ class EmbeddedDiscovery:
                 ),
             )
 
-        if any(
+        if not candidate.is_split and any(
             item.candidate_kind == "logical_archive"
             and item.boundary_kind != "exact"
             and item.validation == "start_header_crc_truncated_declared_range"
