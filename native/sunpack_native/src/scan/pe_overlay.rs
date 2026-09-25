@@ -164,6 +164,7 @@ pub(crate) fn inspect_pe_overlay_structure(
     }
 
     let mut pe_end = 0u64;
+    let mut godot_pck_offset = 0u64;
     for index in 0..section_count as usize {
         let start = index * SECTION_HEADER_SIZE;
         let section = &section_table[start..start + SECTION_HEADER_SIZE];
@@ -171,6 +172,13 @@ pub(crate) fn inspect_pe_overlay_structure(
         let raw_pointer = u32_le(section, 20) as u64;
         if raw_pointer != 0 && raw_size != 0 {
             pe_end = pe_end.max(raw_pointer + raw_size);
+            if godot_pck_offset == 0
+                && &section[..8] == b"pck\0\0\0\0\0"
+                && raw_size >= 8
+                && raw_pointer + raw_size <= actual_size
+            {
+                godot_pck_offset = raw_pointer;
+            }
         }
     }
 
@@ -178,6 +186,7 @@ pub(crate) fn inspect_pe_overlay_structure(
     result.set_item("is_pe", true)?;
     result.set_item("pe_header_offset", pe_header_offset)?;
     result.set_item("section_count", section_count)?;
+    result.set_item("godot_pck_offset", godot_pck_offset)?;
     result.set_item("overlay_offset", pe_end)?;
     result.set_item("overlay_size", actual_size.saturating_sub(pe_end))?;
     let evidence = PyList::new(py, ["pe:valid_headers"])?;
@@ -278,6 +287,7 @@ fn empty_result<'py>(py: Python<'py>, error: &str) -> PyResult<Bound<'py, PyDict
     for key in [
         "pe_header_offset",
         "section_count",
+        "godot_pck_offset",
         "overlay_offset",
         "overlay_size",
         "archive_offset",
