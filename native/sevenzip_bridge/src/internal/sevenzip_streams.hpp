@@ -163,12 +163,19 @@ namespace sunpack::sevenzip
             {
                 return HRESULT_FROM_WIN32(open_error_ != ERROR_SUCCESS ? open_error_ : ERROR_INVALID_HANDLE);
             }
-            LARGE_INTEGER distance{};
-            distance.QuadPart = static_cast<LONGLONG>(offset);
-            if (!SetFilePointerEx(handle_, distance, nullptr, FILE_BEGIN))
+            if (!position_known_ || position_ != offset)
             {
-                return HRESULT_FROM_WIN32(GetLastError());
+                LARGE_INTEGER distance{};
+                distance.QuadPart = static_cast<LONGLONG>(offset);
+                if (!SetFilePointerEx(handle_, distance, nullptr, FILE_BEGIN))
+                {
+                    position_known_ = false;
+                    return HRESULT_FROM_WIN32(GetLastError());
+                }
+                position_ = offset;
+                position_known_ = true;
             }
+
             DWORD read = 0;
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             PipelineStageScope pipeline_scope(pipeline_timing, PipelineStage::Input);
@@ -176,8 +183,10 @@ namespace sunpack::sevenzip
             const BOOL ok = ReadFile(handle_, data, size, &read, nullptr);
             if (!ok)
             {
+                position_known_ = false;
                 return HRESULT_FROM_WIN32(GetLastError());
             }
+            position_ += read;
             if (processed)
             {
                 *processed = read;
@@ -197,6 +206,8 @@ namespace sunpack::sevenzip
     private:
         HANDLE handle_ = INVALID_HANDLE_VALUE;
         DWORD open_error_ = ERROR_SUCCESS;
+        UInt64 position_ = 0;
+        bool position_known_ = true;
     };
 
     // One long lived handle per distinct path, opened on first use; only the owning thread touches a cache, never two at once.
