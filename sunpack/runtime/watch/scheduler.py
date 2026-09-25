@@ -1017,7 +1017,7 @@ class WatchScheduler:
         self.log.write(
             "pipeline_sources_claimed",
             owner=owner,
-            paths=normalized,
+            path_count=len(normalized),
             retired_pending=len(retired_pending),
         )
 
@@ -1106,8 +1106,6 @@ class WatchScheduler:
                 for claim_path, owner in self._active_claims.items()
                 if _paths_match(claim_path, normalized, recursive=recursive)
             ]
-            for claim_path, owner in claimed:
-                self._dirty_during_claim.setdefault(owner, {})[claim_path] = claim_path
             with self._lock:
                 # The submitted seed is only the initial Watch ownership. Once
                 # pipeline discovery publishes its physical source claim, every
