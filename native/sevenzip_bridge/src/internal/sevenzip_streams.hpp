@@ -250,6 +250,45 @@ namespace sunpack::sevenzip
         std::map<std::wstring, std::unique_ptr<PathHandle>> handles_;
     };
 
+    // Decoder-side random reads use one handle cache per worker thread. This
+    // keeps file cursors independent without serializing full-block decoders.
+    inline PathHandleCache &decoder_thread_path_cache()
+    {
+        static thread_local PathHandleCache cache;
+        return cache;
+    }
+
+    inline HRESULT decoder_thread_read_path_at(
+        const std::wstring &path,
+        UInt64 offset,
+        void *data,
+        UInt32 size,
+        UInt32 *processed,
+        ExtractInputTrace *trace = nullptr) noexcept
+    {
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+        return decoder_thread_path_cache().read_at(
+            path, offset, data, size, processed,
+            trace ? trace->pipeline_timing : nullptr);
+#else
+        (void)trace;
+        return decoder_thread_path_cache().read_at(
+            path, offset, data, size, processed);
+#endif
+    }
+
+    class RandomAccessInStreamSource
+    {
+    public:
+        virtual ~RandomAccessInStreamSource() = default;
+        virtual UInt64 random_access_size() const noexcept = 0;
+        virtual HRESULT random_read_at(
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            UInt32 *processed) const noexcept = 0;
+    };
+
     class SequentialPrefetcher final
     {
     public:
@@ -574,7 +613,7 @@ namespace sunpack::sevenzip
         }
     }
 
-    class FileInStream final : public CMyUnknownImp, public IInStream
+    class FileInStream final : public CMyUnknownImp, public IInStream, public RandomAccessInStreamSource
     {
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
         
@@ -666,6 +705,26 @@ namespace sunpack::sevenzip
         bool is_open() const { return handle_ != INVALID_HANDLE_VALUE; }
 
         bool prefetch_enabled() const noexcept { return prefetch_ && prefetch_->enabled(); }
+
+        UInt64 random_access_size() const noexcept override { return size_; }
+
+        HRESULT random_read_at(
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            UInt32 *processed) const noexcept override
+        {
+            if (offset >= size_)
+            {
+                if (processed)
+                    *processed = 0;
+                return S_OK;
+            }
+            const UInt32 wanted = static_cast<UInt32>(
+                std::min<UInt64>(size, size_ - offset));
+            return decoder_thread_read_path_at(
+                path_, offset, data, wanted, processed, trace_);
+        }
 
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
@@ -879,7 +938,7 @@ namespace sunpack::sevenzip
         std::unique_ptr<SequentialPrefetcher> prefetch_;
     };
 
-    class MultiFileInStream final : public CMyUnknownImp, public IInStream
+    class MultiFileInStream final : public CMyUnknownImp, public IInStream, public RandomAccessInStreamSource
     {
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
         
@@ -946,6 +1005,54 @@ namespace sunpack::sevenzip
         ~MultiFileInStream() { close_cached_handle(); }
 
         bool is_open() const { return valid_; }
+
+        UInt64 random_access_size() const noexcept override { return total_size_; }
+
+        HRESULT random_read_at(
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            UInt32 *processed) const noexcept override
+        {
+            if (processed)
+                *processed = 0;
+            if (!valid_ || !data)
+                return E_FAIL;
+
+            auto *out = static_cast<unsigned char *>(data);
+            UInt32 total_read = 0;
+            while (total_read < size && offset < total_size_)
+            {
+                const std::size_t index = find_part_index(offset);
+                if (index >= paths_.size())
+                    break;
+
+                const UInt64 part_offset = offset - offsets_[index];
+                const UInt64 remaining = sizes_[index] - part_offset;
+                const UInt32 wanted = static_cast<UInt32>(
+                    std::min<UInt64>(size - total_read, remaining));
+
+                UInt32 read = 0;
+                const HRESULT result = decoder_thread_read_path_at(
+                    paths_[index],
+                    part_offset,
+                    out + total_read,
+                    wanted,
+                    &read,
+                    trace_);
+                if (result != S_OK)
+                    return result;
+
+                total_read += read;
+                offset += read;
+                if (read != wanted)
+                    break;
+            }
+
+            if (processed)
+                *processed = total_read;
+            return S_OK;
+        }
 
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
@@ -1374,7 +1481,7 @@ namespace sunpack::sevenzip
         UInt64 virtual_offset = 0;
     };
 
-    class MultiRangeInStream final : public CMyUnknownImp, public IInStream
+    class MultiRangeInStream final : public CMyUnknownImp, public IInStream, public RandomAccessInStreamSource
     {
         Z7_COM_UNKNOWN_IMP_2(ISequentialInStream, IInStream)
         
@@ -1471,6 +1578,55 @@ namespace sunpack::sevenzip
         }
 
         bool is_open() const { return valid_; }
+
+        UInt64 random_access_size() const noexcept override { return total_size_; }
+
+        HRESULT random_read_at(
+            UInt64 offset,
+            void *data,
+            UInt32 size,
+            UInt32 *processed) const noexcept override
+        {
+            if (processed)
+                *processed = 0;
+            if (!valid_ || !data)
+                return E_FAIL;
+
+            auto *out = static_cast<unsigned char *>(data);
+            UInt32 total_read = 0;
+            while (total_read < size && offset < total_size_)
+            {
+                const std::size_t index = find_range_index(offset);
+                if (index >= ranges_.size())
+                    break;
+
+                const auto &range = ranges_[index];
+                const UInt64 offset_in_range = offset - range.virtual_offset;
+                const UInt64 remaining = range.length - offset_in_range;
+                const UInt32 wanted = static_cast<UInt32>(
+                    std::min<UInt64>(size - total_read, remaining));
+
+                UInt32 read = 0;
+                const HRESULT result = decoder_thread_read_path_at(
+                    range.path,
+                    range.start + offset_in_range,
+                    out + total_read,
+                    wanted,
+                    &read,
+                    trace_);
+                if (result != S_OK)
+                    return result;
+
+                total_read += read;
+                offset += read;
+                if (read != wanted)
+                    break;
+            }
+
+            if (processed)
+                *processed = total_read;
+            return S_OK;
+        }
 
 
         HRESULT STDMETHODCALLTYPE Read(void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
