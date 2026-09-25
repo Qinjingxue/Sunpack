@@ -17,7 +17,6 @@ from sunpack.core.contracts.discovery import (
 )
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.analysis.embedded import (
-    inspect_runtime_bundle,
     resolve_encrypted_rar_boundaries,
     scan_embedded_archives,
 )
@@ -119,16 +118,14 @@ class EmbeddedDiscovery:
         path = candidate.entry_path
         if not path:
             return None, "missing_or_empty_file"
+        if not self.options.force_scan and path.casefold().endswith(".exe"):
+            return None, "embedded_executable_skipped"
 
         try:
             identity = file_identity(path)
             size = int(identity[1])
             if size <= 0:
                 return None, "missing_or_empty_file"
-            if not self.options.force_scan:
-                profile = inspect_runtime_bundle(path, size)
-                if profile:
-                    return None, f"Runtime bundle: {profile}"
             scan = scan_embedded_archives(
                 path,
                 expected_size=size,
