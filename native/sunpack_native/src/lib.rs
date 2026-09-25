@@ -90,10 +90,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(analysis_native::probe_volume_anchors, m)?)?;
     m.add_function(wrap_pyfunction!(scan::embedded::scan_embedded_archives, m)?)?;
     m.add_function(wrap_pyfunction!(
-        scan::executable_carrier::executable_runtime_bundle_profile,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
         scan::zip_names::scan_zip_central_directory_names,
         m
     )?)?;
