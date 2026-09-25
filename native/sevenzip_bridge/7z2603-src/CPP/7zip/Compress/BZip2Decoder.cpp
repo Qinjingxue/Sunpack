@@ -4,6 +4,7 @@
 
 #ifndef Z7_ST
 #include <algorithm>
+#include <array>
 #include <condition_variable>
 #include <deque>
 #include <memory>
@@ -38,6 +39,7 @@
 
 #include "BZip2Decoder.h"
 #include "internal/decoder_cpu_budget.h"
+#include "internal/decoder_input_access.h"
 
 
 namespace NCompress {
@@ -823,123 +825,349 @@ Byte * CSpecState::Decode(Byte *data, size_t size) throw()
 
 #ifndef Z7_ST
 
-struct CParallelOutputChunk
+struct CParallelMarker
 {
-  std::unique_ptr<Byte[]> Data;
-  size_t Size;
+  UInt64 BitOffset;
+  UInt32 ExpectedCrc;
+  bool IsEnd;
 
-  CParallelOutputChunk(): Size(0) {}
+  CParallelMarker(UInt64 bitOffset, UInt32 expectedCrc, bool isEnd):
+      BitOffset(bitOffset),
+      ExpectedCrc(expectedCrc),
+      IsEnd(isEnd)
+  {}
 };
+
+
+static const UInt64 kBZip2BlockMagic48 = UINT64_CONST(0x314159265359);
+static const UInt64 kBZip2EndMagic48 = UINT64_CONST(0x177245385090);
+static const UInt64 kBZip2MagicMask48 = UINT64_CONST(0x0000FFFFFFFFFFFF);
+static const UInt64 kBZip2WindowMask56 = UINT64_CONST(0x00FFFFFFFFFFFFFF);
+static const size_t kBZip2ScanChunk = (size_t)1 << 20;
+static const unsigned kMaxBZip2ParallelDecoders = 8;
+
+
+static HRESULT ParallelReadAt(
+    void *stream,
+    UInt64 offset,
+    void *data,
+    UInt32 size,
+    UInt32 &processed)
+{
+  unsigned long read = 0;
+  const long result = sunpack_input_read_at(
+      stream,
+      (unsigned long long)offset,
+      data,
+      (unsigned long)size,
+      &read);
+  processed = (UInt32)read;
+  return (HRESULT)result;
+}
+
+
+static HRESULT ParallelReadExact(
+    void *stream,
+    UInt64 inputSize,
+    UInt64 offset,
+    void *data,
+    UInt32 size)
+{
+  if (offset > inputSize || (UInt64)size > inputSize - offset)
+    return S_FALSE;
+
+  UInt32 total = 0;
+  while (total < size)
+  {
+    UInt32 read = 0;
+    const HRESULT result = ParallelReadAt(
+        stream,
+        offset + total,
+        (Byte *)data + total,
+        size - total,
+        read);
+    if (result != S_OK)
+      return result;
+    if (read == 0)
+      return S_FALSE;
+    total += read;
+  }
+  return S_OK;
+}
+
+
+static bool ParallelReadBits32(
+    void *stream,
+    UInt64 inputSize,
+    UInt64 bitOffset,
+    UInt32 &value)
+{
+  if (bitOffset > inputSize * 8 ||
+      inputSize * 8 - bitOffset < 32)
+    return false;
+
+  const UInt64 byteOffset = bitOffset >> 3;
+  const unsigned shift = (unsigned)(bitOffset & 7);
+  const unsigned numBytes = (shift + 32 + 7) >> 3;
+  Byte bytes[8] = {};
+  if (ParallelReadExact(
+          stream,
+          inputSize,
+          byteOffset,
+          bytes,
+          numBytes) != S_OK)
+    return false;
+
+  value = 0;
+  for (unsigned i = 0; i < 32; i++)
+  {
+    const unsigned bit = shift + i;
+    value = (value << 1) |
+        ((bytes[bit >> 3] >> (7 - (bit & 7))) & 1);
+  }
+  return true;
+}
+
+
+static bool ParallelReadStreamHeader(
+    void *stream,
+    UInt64 inputSize,
+    UInt64 byteOffset,
+    unsigned &level)
+{
+  Byte header[4];
+  if (ParallelReadExact(
+          stream,
+          inputSize,
+          byteOffset,
+          header,
+          4) != S_OK)
+    return false;
+
+  if (header[0] != kArSig0 ||
+      header[1] != kArSig1 ||
+      header[2] != kArSig2 ||
+      header[3] <= kArSig3 ||
+      header[3] > kArSig3 + kBlockSizeMultMax)
+    return false;
+
+  level = (unsigned)(header[3] - kArSig3);
+  return true;
+}
+
+
+static const std::array<Byte, 256> &ParallelPrefixTable(UInt64 magic)
+{
+  static const std::array<Byte, 256> blockTable = []()
+  {
+    std::array<Byte, 256> table = {};
+    for (unsigned byte = 0; byte < 256; byte++)
+      for (unsigned shift = 0; shift < 8; shift++)
+      {
+        const Byte wanted = (Byte)(kBZip2BlockMagic48 >> (40 + shift));
+        const Byte kept = (Byte)(((unsigned)1 << (8 - shift)) - 1);
+        if (((Byte)byte & kept) == wanted)
+          table[byte] |= (Byte)((unsigned)1 << shift);
+      }
+    return table;
+  }();
+
+  static const std::array<Byte, 256> endTable = []()
+  {
+    std::array<Byte, 256> table = {};
+    for (unsigned byte = 0; byte < 256; byte++)
+      for (unsigned shift = 0; shift < 8; shift++)
+      {
+        const Byte wanted = (Byte)(kBZip2EndMagic48 >> (40 + shift));
+        const Byte kept = (Byte)(((unsigned)1 << (8 - shift)) - 1);
+        if (((Byte)byte & kept) == wanted)
+          table[byte] |= (Byte)((unsigned)1 << shift);
+      }
+    return table;
+  }();
+
+  return magic == kBZip2BlockMagic48 ? blockTable : endTable;
+}
+
+
+static HRESULT ScanParallelMarkers(
+    void *stream,
+    UInt64 inputSize,
+    std::vector<CParallelMarker> &markers)
+{
+  markers.clear();
+  if (inputSize < 10)
+    return S_FALSE;
+
+  const std::array<Byte, 256> &blockPrefix =
+      ParallelPrefixTable(kBZip2BlockMagic48);
+  const std::array<Byte, 256> &endPrefix =
+      ParallelPrefixTable(kBZip2EndMagic48);
+
+  std::vector<Byte> bytes;
+  try
+  {
+    bytes.resize(kBZip2ScanChunk + 16);
+  }
+  catch (const std::bad_alloc &)
+  {
+    return E_OUTOFMEMORY;
+  }
+
+  for (UInt64 chunkStart = 0; chunkStart < inputSize; )
+  {
+    const UInt64 remaining = inputSize - chunkStart;
+    const size_t payload =
+        (size_t)std::min<UInt64>(remaining, kBZip2ScanChunk);
+    const size_t wanted =
+        (size_t)std::min<UInt64>(remaining, payload + 16);
+
+    UInt32 read = 0;
+    const HRESULT readRes = ParallelReadAt(
+        stream,
+        chunkStart,
+        bytes.data(),
+        (UInt32)wanted,
+        read);
+    if (readRes != S_OK)
+      return readRes;
+    if (read < payload)
+      return S_FALSE;
+
+    UInt64 window = 0;
+    for (unsigned i = 0; i < 7; i++)
+      window = (window << 8) |
+          (i < read ? (UInt64)bytes[i] : 0);
+
+    for (size_t local = 0; local < payload; local++)
+    {
+      Byte shifts =
+          (Byte)(blockPrefix[(Byte)(window >> 48)] |
+                 endPrefix[(Byte)(window >> 48)]);
+      while (shifts != 0)
+      {
+        unsigned shift = 0;
+        while (((shifts >> shift) & 1) == 0)
+          shift++;
+        shifts = (Byte)(shifts & (Byte)(shifts - 1));
+
+        const UInt64 marker =
+            (window >> (8 - shift)) & kBZip2MagicMask48;
+        const UInt64 bitOffset =
+            (chunkStart + local) * 8 + shift;
+        UInt32 crc = 0;
+        if (ParallelReadBits32(
+                stream,
+                inputSize,
+                bitOffset + 48,
+                crc))
+        {
+          if (marker == kBZip2BlockMagic48)
+            markers.emplace_back(bitOffset, crc, false);
+          else if (marker == kBZip2EndMagic48)
+            markers.emplace_back(bitOffset, crc, true);
+        }
+      }
+
+      const size_t next = local + 7;
+      const UInt64 nextByte =
+          next < read ? (UInt64)bytes[next] : 0;
+      window =
+          ((window << 8) & kBZip2WindowMask56) |
+          nextByte;
+    }
+
+    if (markers.size() >
+        (size_t)(inputSize / 16 + 64))
+      return S_FALSE;
+
+    chunkStart += payload;
+  }
+
+  std::sort(
+      markers.begin(),
+      markers.end(),
+      [](const CParallelMarker &a, const CParallelMarker &b)
+      {
+        return a.BitOffset < b.BitOffset;
+      });
+  markers.erase(
+      std::unique(
+          markers.begin(),
+          markers.end(),
+          [](const CParallelMarker &a, const CParallelMarker &b)
+          {
+            return a.BitOffset == b.BitOffset;
+          }),
+      markers.end());
+
+  return S_OK;
+}
+
+
+static size_t FindParallelMarker(
+    const std::vector<CParallelMarker> &markers,
+    UInt64 bitOffset)
+{
+  const auto it = std::lower_bound(
+      markers.begin(),
+      markers.end(),
+      bitOffset,
+      [](const CParallelMarker &marker, UInt64 value)
+      {
+        return marker.BitOffset < value;
+      });
+  if (it == markers.end() || it->BitOffset != bitOffset)
+    return (size_t)-1;
+  return (size_t)(it - markers.begin());
+}
 
 
 struct CParallelBlockJob
 {
-  UInt32 *Counters;
-  CBlockProps Props;
+  size_t MarkerIndex;
+  UInt64 StartBit;
+  UInt64 EndBit;
   UInt32 ExpectedCrc;
   UInt32 CalculatedCrc;
-  UInt64 PackPos;
-  UInt64 Sequence;
+  CBlockProps Props;
   HRESULT Result;
-
-  std::vector<CParallelOutputChunk> Output;
+  std::vector<Byte> Compact;
 
   std::mutex Mutex;
   std::condition_variable FinishedEvent;
   bool Done;
 
   CParallelBlockJob():
-      Counters(NULL),
+      MarkerIndex((size_t)-1),
+      StartBit(0),
+      EndBit(0),
       ExpectedCrc(0),
       CalculatedCrc(0),
-      PackPos(0),
-      Sequence(0),
       Result(S_OK),
       Done(false)
   {}
 
-  ~CParallelBlockJob()
+  void Reset(
+      size_t markerIndex,
+      UInt64 startBit,
+      UInt32 expectedCrc)
   {
-    BigFree(Counters);
-  }
-
-  bool Allocate()
-  {
-    if (Counters)
-      return true;
-
-    const size_t size = (256 + kBlockSizeMax) * sizeof(UInt32)
-      #ifdef BZIP2_BYTE_MODE
-        + kBlockSizeMax
-      #endif
-        + 256;
-
-    Counters = (UInt32 *)::BigAlloc(size);
-    return Counters != NULL;
-  }
-
-  void Reset(UInt64 sequence)
-  {
-    Props = CBlockProps();
-    ExpectedCrc = 0;
+    MarkerIndex = markerIndex;
+    StartBit = startBit;
+    EndBit = 0;
+    ExpectedCrc = expectedCrc;
     CalculatedCrc = 0;
-    PackPos = 0;
-    Sequence = sequence;
+    Props = CBlockProps();
     Result = S_OK;
-    Output.clear();
+    Compact.clear();
 
     std::lock_guard<std::mutex> lock(Mutex);
     Done = false;
   }
 
-  void Process()
+  void Finish(HRESULT result)
   {
-    HRESULT result = S_OK;
-
-    try
-    {
-      DecodeBlock1(Counters, Props.blockSize);
-
-      CSpecState block;
-      block._blockSize = Props.blockSize;
-      block._tt = Counters + 256;
-      block.Init(Props.origPtr, Props.randMode);
-
-      while (!block.Finished())
-      {
-        CParallelOutputChunk chunk;
-        chunk.Data.reset(new (std::nothrow) Byte[kOutBufSize]);
-        if (!chunk.Data)
-        {
-          result = E_OUTOFMEMORY;
-          break;
-        }
-
-        Byte * const begin = chunk.Data.get();
-        Byte * const end = block.Decode(begin, kOutBufSize);
-        chunk.Size = (size_t)(end - begin);
-
-        if (chunk.Size != 0)
-          Output.push_back(std::move(chunk));
-        else if (!block.Finished())
-        {
-          result = E_FAIL;
-          break;
-        }
-      }
-
-      if (result == S_OK)
-        CalculatedCrc = block._crc.GetDigest();
-    }
-    catch (const std::bad_alloc &)
-    {
-      result = E_OUTOFMEMORY;
-    }
-    catch (...)
-    {
-      result = E_FAIL;
-    }
-
     {
       std::lock_guard<std::mutex> lock(Mutex);
       Result = result;
@@ -957,58 +1185,418 @@ struct CParallelBlockJob
 };
 
 
+class CParallelBlockWorkspace
+{
+  UInt32 *_counters;
+  bool _ownsCounters;
+  std::unique_ptr<Byte[]> _input;
+
+  HRESULT FillInput(
+      void *stream,
+      UInt64 inputSize,
+      UInt64 offset,
+      CBase &base,
+      UInt64 &bufferStart,
+      UInt64 &nextOffset)
+  {
+    if (!_input)
+    {
+      _input.reset(new (std::nothrow) Byte[kInBufSize]);
+      if (!_input)
+        return E_OUTOFMEMORY;
+    }
+
+    if (offset >= inputSize)
+      return S_FALSE;
+
+    const UInt32 wanted = (UInt32)std::min<UInt64>(
+        inputSize - offset,
+        kInBufSize);
+    UInt32 read = 0;
+    const HRESULT result = ParallelReadAt(
+        stream,
+        offset,
+        _input.get(),
+        wanted,
+        read);
+    if (result != S_OK)
+      return result;
+    if (read == 0)
+      return S_FALSE;
+
+    bufferStart = offset;
+    nextOffset = offset + read;
+    base._buf = _input.get();
+    base._lim = _input.get() + read;
+    return S_OK;
+  }
+
+  HRESULT BuildCompactResult(
+      CParallelBlockJob &job)
+  {
+    DecodeBlock1(_counters, job.Props.blockSize);
+
+    UInt32 *tt = _counters + 256;
+    UInt32 tPos =
+        tt[tt[job.Props.origPtr] >> 8];
+
+    int randToGo = -1;
+    unsigned randIndex = 0;
+    if (job.Props.randMode)
+    {
+      randIndex = 1;
+      randToGo = kRandNums[0] - 2;
+    }
+
+    try
+    {
+      job.Compact.resize(job.Props.blockSize);
+    }
+    catch (const std::bad_alloc &)
+    {
+      return E_OUTOFMEMORY;
+    }
+
+    CBZip2Crc crc;
+    unsigned previous = 0;
+    unsigned runLength = 0;
+
+    for (UInt32 i = 0; i < job.Props.blockSize; i++)
+    {
+      unsigned b = (unsigned)(tPos & 0xFF);
+      tPos = tt[tPos >> 8];
+
+      if (randToGo >= 0)
+      {
+        if (randToGo == 0)
+        {
+          b ^= 1;
+          randToGo = kRandNums[randIndex];
+          randIndex++;
+          randIndex &= 0x1FF;
+        }
+        randToGo--;
+      }
+
+      job.Compact[i] = (Byte)b;
+
+      if (runLength == 4)
+      {
+        for (unsigned repeat = 0; repeat < b; repeat++)
+          crc.UpdateByte(previous);
+        runLength = 0;
+        continue;
+      }
+
+      crc.UpdateByte(b);
+      if (runLength != 0 && b == previous)
+        runLength++;
+      else
+      {
+        previous = b;
+        runLength = 1;
+      }
+    }
+
+    job.CalculatedCrc = crc.GetDigest();
+    return S_OK;
+  }
+
+public:
+  explicit CParallelBlockWorkspace(UInt32 *externalCounters = NULL):
+      _counters(externalCounters),
+      _ownsCounters(externalCounters == NULL)
+  {}
+
+  ~CParallelBlockWorkspace()
+  {
+    if (_ownsCounters)
+      BigFree(_counters);
+  }
+
+  bool Allocate()
+  {
+    if (_counters)
+      return true;
+
+    const size_t size =
+        (256 + kBlockSizeMax) * sizeof(UInt32)
+      #ifdef BZIP2_BYTE_MODE
+        + kBlockSizeMax
+      #endif
+        + 256;
+
+    _counters = (UInt32 *)::BigAlloc(size);
+    return _counters != NULL;
+  }
+
+  void Process(
+      void *stream,
+      UInt64 inputSize,
+      CParallelBlockJob &job)
+  {
+    HRESULT result = S_OK;
+    try
+    {
+      if (!Allocate())
+      {
+        job.Finish(E_OUTOFMEMORY);
+        return;
+      }
+
+      const UInt64 payloadBit = job.StartBit + 80;
+      if (payloadBit < job.StartBit ||
+          payloadBit > inputSize * 8)
+      {
+        job.Finish(S_FALSE);
+        return;
+      }
+
+      CBase base;
+      base.Counters = _counters;
+      base.blockSizeMax = kBlockSizeMax;
+      base.state = STATE_BLOCK_START;
+      base.state2 = 0;
+      base.state3 = 0;
+      base.state4 = 0;
+      base.state5 = 0;
+      base.Props = CBlockProps();
+      base.Props.randMode = 1;
+      base.InitBitDecoder();
+
+      const UInt64 byteOffset = payloadBit >> 3;
+      const unsigned bitShift =
+          (unsigned)(payloadBit & 7);
+      UInt64 bufferStart = 0;
+      UInt64 nextOffset = 0;
+      result = FillInput(
+          stream,
+          inputSize,
+          byteOffset,
+          base,
+          bufferStart,
+          nextOffset);
+      if (result != S_OK)
+      {
+        job.Finish(result);
+        return;
+      }
+
+      if (bitShift != 0)
+      {
+        if (base._buf == base._lim)
+        {
+          job.Finish(S_FALSE);
+          return;
+        }
+        base._value =
+            (UInt32)(*base._buf) << 24;
+        base._numBits = 8;
+        base._buf++;
+        base._value <<= bitShift;
+        base._numBits -= bitShift;
+      }
+
+      for (;;)
+      {
+        const SRes readRes = base.ReadBlock2();
+        if (readRes != SZ_OK)
+        {
+          result = S_FALSE;
+          break;
+        }
+        if (base.state == STATE_BLOCK_SIGNATURE)
+          break;
+        if (base._buf != base._lim)
+        {
+          result = E_FAIL;
+          break;
+        }
+        if (nextOffset >= inputSize)
+        {
+          result = S_FALSE;
+          break;
+        }
+
+        result = FillInput(
+            stream,
+            inputSize,
+            nextOffset,
+            base,
+            bufferStart,
+            nextOffset);
+        if (result != S_OK)
+          break;
+      }
+
+      if (result == S_OK)
+      {
+        const UInt64 consumedBytes =
+            bufferStart +
+            (UInt64)(base._buf - _input.get());
+        const UInt64 consumedBits =
+            consumedBytes * 8;
+        if (consumedBits < base._numBits)
+          result = E_FAIL;
+        else
+        {
+          job.EndBit =
+              consumedBits - base._numBits;
+          job.Props = base.Props;
+          if (job.EndBit <= job.StartBit ||
+              job.Props.blockSize == 0 ||
+              job.Props.blockSize > kBlockSizeMax)
+            result = S_FALSE;
+        }
+      }
+
+      if (result == S_OK)
+        result = BuildCompactResult(job);
+    }
+    catch (const std::bad_alloc &)
+    {
+      result = E_OUTOFMEMORY;
+    }
+    catch (...)
+    {
+      result = E_FAIL;
+    }
+
+    job.Finish(result);
+  }
+};
+
+
 class CParallelBlockPool
 {
   std::vector<std::thread> _threads;
   std::deque<CParallelBlockJob *> _queue;
   std::mutex _mutex;
   std::condition_variable _workEvent;
+  std::condition_variable _idleEvent;
+  size_t _pending;
+  unsigned _activeWorkers;
+  unsigned _runningWorkers;
   bool _stop;
+  void *_stream;
+  UInt64 _inputSize;
 
   void WorkerLoop()
   {
+    CParallelBlockWorkspace workspace;
+
     for (;;)
     {
       CParallelBlockJob *job = NULL;
       {
         std::unique_lock<std::mutex> lock(_mutex);
-        _workEvent.wait(lock, [this] { return _stop || !_queue.empty(); });
+        _workEvent.wait(
+            lock,
+            [this]
+            {
+              return _stop ||
+                  (!_queue.empty() &&
+                   _runningWorkers < _activeWorkers);
+            });
         if (_stop && _queue.empty())
           return;
+        if (_queue.empty() ||
+            (!_stop &&
+             _runningWorkers >= _activeWorkers))
+          continue;
+
         job = _queue.front();
         _queue.pop_front();
+        _runningWorkers++;
       }
 
-      job->Process();
+      workspace.Process(
+          _stream,
+          _inputSize,
+          *job);
+
+      {
+        std::lock_guard<std::mutex> lock(_mutex);
+        if (_runningWorkers != 0)
+          _runningWorkers--;
+        if (_pending != 0)
+          _pending--;
+        if (_pending == 0)
+          _idleEvent.notify_all();
+        else if (!_queue.empty() &&
+                 (_stop ||
+                  _runningWorkers < _activeWorkers))
+          _workEvent.notify_one();
+      }
     }
   }
 
 public:
-  CParallelBlockPool(): _stop(false) {}
+  CParallelBlockPool(
+      void *stream,
+      UInt64 inputSize):
+      _pending(0),
+      _activeWorkers(0),
+      _runningWorkers(0),
+      _stop(false),
+      _stream(stream),
+      _inputSize(inputSize)
+  {}
 
   ~CParallelBlockPool()
   {
     Stop();
   }
 
-  bool Start(unsigned numWorkers)
+  bool EnsureWorkerCount(unsigned numWorkers)
   {
     try
     {
       _threads.reserve(numWorkers);
-      for (unsigned i = 0; i < numWorkers; i++)
-        _threads.emplace_back([this] { WorkerLoop(); });
+      while (_threads.size() < numWorkers)
+        _threads.emplace_back(
+            [this] { WorkerLoop(); });
     }
     catch (...)
     {
-      Stop();
       return false;
     }
     return true;
   }
 
+  void SetActiveWorkers(unsigned numWorkers)
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _activeWorkers =
+          (std::min)(
+              numWorkers,
+              (unsigned)_threads.size());
+    }
+    _workEvent.notify_all();
+  }
+
+  void Submit(CParallelBlockJob *job)
+  {
+    {
+      std::lock_guard<std::mutex> lock(_mutex);
+      _pending++;
+      _queue.push_back(job);
+    }
+    _workEvent.notify_one();
+  }
+
+  void WaitIdle()
+  {
+    std::unique_lock<std::mutex> lock(_mutex);
+    _idleEvent.wait(
+        lock,
+        [this] { return _pending == 0; });
+  }
+
   void Stop()
   {
+    WaitIdle();
     {
       std::lock_guard<std::mutex> lock(_mutex);
       _stop = true;
@@ -1020,15 +1608,6 @@ public:
         thread.join();
 
     _threads.clear();
-  }
-
-  void Submit(CParallelBlockJob *job)
-  {
-    {
-      std::lock_guard<std::mutex> lock(_mutex);
-      _queue.push_back(job);
-    }
-    _workEvent.notify_one();
   }
 };
 
@@ -1457,205 +2036,390 @@ HRESULT CDecoder::DecodeStreams(ICompressProgressInfo *progress)
 
 HRESULT CDecoder::DecodeStreamsParallel(ICompressProgressInfo *progress)
 {
-  static const unsigned kMaxBZip2ParallelWorkers = 8;
+  unsigned long long rawInputSize = 0;
+  if (!sunpack_input_random_access_size(
+          Base.InStream,
+          &rawInputSize))
+    return E_NOTIMPL;
 
-  void *cpuContext = sunpack_cpu_current_job_context();
-  unsigned numWorkers = 0;
+  const UInt64 inputSize = (UInt64)rawInputSize;
+  if (inputSize < 4)
+    return S_FALSE;
 
-  if (cpuContext)
-  {
-    // BZip2 has a serial block parser followed by parallel inverse-transform
-    // work. Choose the useful execution width once, before parsing starts, so
-    // workers are already waiting when blocks become ready. The outer job's
-    // base credit covers the caller/parser thread; each block worker borrows
-    // one extra shared CPU credit.
-    numWorkers =
-        sunpack_cpu_acquire_extra_for_context(
-            cpuContext, kMaxBZip2ParallelWorkers, 1);
-  }
-  else if (NumThreads >= 4)
-  {
-    // Preserve the pre-credit v0.6.2 behavior for standalone 7-Zip callers.
-    numWorkers = (unsigned)std::min<UInt32>(
-        NumThreads, kMaxBZip2ParallelWorkers);
-  }
+  unsigned firstLevel = 0;
+  if (!ParallelReadStreamHeader(
+          Base.InStream,
+          inputSize,
+          0,
+          firstLevel))
+    return S_FALSE;
 
-  if (numWorkers == 0)
-    return DecodeStreams(progress);
+  std::vector<CParallelMarker> markers;
+  RINOK(ScanParallelMarkers(
+      Base.InStream,
+      inputSize,
+      markers))
 
-  struct CSunPackCpuCreditReleaser
-  {
-    void *Context;
-    unsigned Credits;
-    ~CSunPackCpuCreditReleaser()
-    {
-      if (Context && Credits)
-        sunpack_cpu_release_extra_for_context(Context, Credits);
-    }
-  } cpuCredits = { cpuContext, cpuContext ? numWorkers : 0 };
+  const size_t firstMarker =
+      FindParallelMarker(markers, 32);
+  if (firstMarker == (size_t)-1)
+    return S_FALSE;
 
-  RINOK(StartRead())
+  void *cpuContext =
+      sunpack_cpu_current_job_context();
 
-  // One workspace per worker bounds both the inverse-BWT state and the
-  // out-of-order output retained by the ordered retire ring.
-  const size_t ringSize = numWorkers;
-  std::vector<std::unique_ptr<CParallelBlockJob>> ring;
+  const unsigned standaloneLanes =
+      cpuContext ? 0 :
+      (NumThreads == 0 ? 1 :
+       (unsigned)std::min<UInt32>(
+           NumThreads,
+           kMaxBZip2ParallelDecoders));
+
+  CParallelBlockPool pool(
+      Base.InStream,
+      inputSize);
+  CParallelBlockWorkspace callerWorkspace(
+      _counters);
+
+  std::vector<Byte> commitBuffer;
   try
   {
-    ring.reserve(ringSize);
-    for (size_t i = 0; i < ringSize; i++)
-    {
-      std::unique_ptr<CParallelBlockJob> job(new CParallelBlockJob());
-      if (!job->Allocate())
-        return E_OUTOFMEMORY;
-      ring.push_back(std::move(job));
-    }
+    commitBuffer.resize(kOutBufSize);
   }
   catch (const std::bad_alloc &)
   {
     return E_OUTOFMEMORY;
   }
 
-  CParallelBlockPool pool;
-  if (!pool.Start(numWorkers))
-    return E_FAIL;
-
-  struct CCountersRestore
-  {
-    CBase &BaseRef;
-    UInt32 *Counters;
-    ~CCountersRestore() { BaseRef.Counters = Counters; }
-  } countersRestore = { Base, _counters };
-
-  UInt64 submitted = 0;
-  UInt64 retired = 0;
   UInt64 inPrev = 0;
   UInt64 outPrev = 0;
 
-  auto retireOne = [&](CParallelBlockJob &job) -> HRESULT
+  auto writeCompact =
+      [&](const CParallelBlockJob &job) -> HRESULT
   {
-    const HRESULT jobRes = job.Wait();
-    if (jobRes != S_OK)
-      return jobRes;
+    size_t outPos = 0;
 
-    for (const CParallelOutputChunk &chunk: job.Output)
+    auto flush = [&]() -> HRESULT
     {
-      if (chunk.Size == 0)
+      if (outPos == 0)
+        return S_OK;
+      const HRESULT result =
+          WriteStream(
+              _outStream,
+              commitBuffer.data(),
+              outPos);
+      if (result != S_OK)
+      {
+        _writeRes = result;
+        return result;
+      }
+      _outWritten += outPos;
+      _outPosTotal += outPos;
+      outPos = 0;
+      return S_OK;
+    };
+
+    auto emit = [&](Byte value) -> HRESULT
+    {
+      commitBuffer[outPos++] = value;
+      if (outPos == commitBuffer.size())
+        return flush();
+      return S_OK;
+    };
+
+    unsigned previous = 0;
+    unsigned runLength = 0;
+
+    for (Byte value: job.Compact)
+    {
+      if (runLength == 4)
+      {
+        for (unsigned repeat = 0;
+             repeat < value;
+             repeat++)
+          RINOK(emit((Byte)previous))
+        runLength = 0;
         continue;
-
-      const HRESULT writeRes = WriteStream(_outStream, chunk.Data.get(), chunk.Size);
-      _outWritten += chunk.Size;
-      _outPosTotal += chunk.Size;
-      if (writeRes != S_OK)
-      {
-        _writeRes = writeRes;
-        return writeRes;
       }
 
-      if (progress)
+      RINOK(emit(value))
+      if (runLength != 0 &&
+          value == previous)
+        runLength++;
+      else
       {
-        const UInt64 outCur = GetOutProcessedSize();
-        if (job.PackPos - inPrev >= kProgressStep || outCur - outPrev >= kProgressStep)
-        {
-          RINOK(progress->SetRatioInfo(&job.PackPos, &outCur))
-          inPrev = job.PackPos;
-          outPrev = outCur;
-        }
+        previous = value;
+        runLength = 1;
       }
     }
 
-    if (job.CalculatedCrc != job.ExpectedCrc)
-    {
-      BlockCrcError = true;
-      return S_FALSE;
-    }
-
-    return S_OK;
+    return flush();
   };
 
-  HRESULT parseRes = S_OK;
-  HRESULT retireRes = S_OK;
-  bool parserDone = false;
-
-  while (!parserDone && retireRes == S_OK)
+  auto finishInputState =
+      [&](UInt64 finishedPackSize,
+          bool exactEnd)
   {
-    // Keep the producer bounded. Reusing a slot is legal only after the
-    // corresponding earlier block has been retired in stream order.
-    if (submitted - retired >= ringSize)
-    {
-      CParallelBlockJob &job = *ring[(size_t)(retired % ringSize)];
-      retireRes = retireOne(job);
-      retired++;
-      continue;
-    }
+    _inProcessed = inputSize;
+    Base._buf = _inBuf;
+    Base._lim = _inBuf;
+    Base._numBits = 0;
+    Base._value = 0;
+    Base.FinishedPackSize = finishedPackSize;
+    Base.IsBz = exactEnd ? false : false;
+  };
 
-    if (Base.state == STATE_BLOCK_SIGNATURE)
-    {
-      parseRes = ReadBlockSignature();
-      if (parseRes != S_OK)
-        break;
-    }
+  UInt64 headerByte = 0;
+  unsigned level = firstLevel;
+  size_t markerIndex = firstMarker;
+  UInt64 lastFinishedPackSize = 0;
 
-    if (Base.state == STATE_STREAM_FINISHED)
+  for (;;)
+  {
+    UInt32 combinedCrc = 0;
+
+    for (;;)
     {
-      if (!Base.DecodeAllStreams)
+      if (markerIndex >= markers.size())
+        return S_FALSE;
+
+      const CParallelMarker &marker =
+          markers[markerIndex];
+
+      if (marker.IsEnd)
       {
-        parserDone = true;
+        if (marker.ExpectedCrc != combinedCrc)
+        {
+          Base.StreamCrcError = true;
+          return S_FALSE;
+        }
+
+        Base.NumStreams++;
+        lastFinishedPackSize =
+            (marker.BitOffset + 80 + 7) >> 3;
+        Base.FinishedPackSize =
+            lastFinishedPackSize;
+
+        if (lastFinishedPackSize >= inputSize)
+        {
+          if (lastFinishedPackSize > inputSize)
+          {
+            Base.NeedMoreInput = true;
+            return S_FALSE;
+          }
+
+          finishInputState(
+              lastFinishedPackSize,
+              true);
+          return S_OK;
+        }
+
+        unsigned nextLevel = 0;
+        if (!ParallelReadStreamHeader(
+                Base.InStream,
+                inputSize,
+                lastFinishedPackSize,
+                nextLevel))
+        {
+          finishInputState(
+              lastFinishedPackSize,
+              false);
+          return S_OK;
+        }
+
+        headerByte = lastFinishedPackSize;
+        level = nextLevel;
+        const UInt64 nextBit =
+            headerByte * 8 + 32;
+        markerIndex =
+            FindParallelMarker(
+                markers,
+                nextBit);
+        if (markerIndex == (size_t)-1)
+          return S_FALSE;
         break;
       }
 
-      parseRes = StartRead();
-
-      if (Base.NeedMoreInput)
+      std::vector<size_t> batchMarkerIndices;
+      batchMarkerIndices.reserve(
+          kMaxBZip2ParallelDecoders);
+      for (size_t i = markerIndex;
+           i < markers.size() &&
+           batchMarkerIndices.size() <
+               kMaxBZip2ParallelDecoders;
+           i++)
       {
-        if (Base.state2 == 0)
-          Base.NeedMoreInput = false;
-        parseRes = S_OK;
-        parserDone = true;
-        break;
+        if (!markers[i].IsEnd)
+          batchMarkerIndices.push_back(i);
+      }
+      if (batchMarkerIndices.empty() ||
+          batchMarkerIndices.front() != markerIndex)
+        return S_FALSE;
+
+      unsigned extraWorkers = 0;
+      const unsigned wantedExtra =
+          (unsigned)batchMarkerIndices.size() - 1;
+      if (cpuContext)
+      {
+        if (wantedExtra != 0)
+          extraWorkers =
+              sunpack_cpu_acquire_extra_for_context(
+                  cpuContext,
+                  wantedExtra,
+                  1);
+      }
+      else if (standaloneLanes > 1)
+      {
+        extraWorkers =
+            (std::min)(
+                wantedExtra,
+                standaloneLanes - 1);
       }
 
-      if (parseRes != S_OK)
-        break;
+      const size_t batchSize =
+          (size_t)extraWorkers + 1;
+      batchMarkerIndices.resize(batchSize);
 
-      continue;
+      if (extraWorkers != 0)
+      {
+        if (!pool.EnsureWorkerCount(
+                extraWorkers))
+        {
+          if (cpuContext)
+            sunpack_cpu_release_extra_for_context(
+                cpuContext,
+                extraWorkers);
+          return E_FAIL;
+        }
+        pool.SetActiveWorkers(
+            extraWorkers);
+      }
+
+      std::vector<std::unique_ptr<CParallelBlockJob>>
+          jobs;
+      try
+      {
+        jobs.reserve(batchSize);
+        for (size_t i = 0;
+             i < batchSize;
+             i++)
+        {
+          const size_t index =
+              batchMarkerIndices[i];
+          const CParallelMarker &candidate =
+              markers[index];
+          std::unique_ptr<CParallelBlockJob> job(
+              new CParallelBlockJob());
+          job->Reset(
+              index,
+              candidate.BitOffset,
+              candidate.ExpectedCrc);
+          jobs.push_back(std::move(job));
+        }
+      }
+      catch (const std::bad_alloc &)
+      {
+        pool.SetActiveWorkers(0);
+        if (cpuContext && extraWorkers)
+          sunpack_cpu_release_extra_for_context(
+              cpuContext,
+              extraWorkers);
+        return E_OUTOFMEMORY;
+      }
+
+      for (size_t i = 1;
+           i < jobs.size();
+           i++)
+        pool.Submit(jobs[i].get());
+
+      callerWorkspace.Process(
+          Base.InStream,
+          inputSize,
+          *jobs[0]);
+
+      pool.WaitIdle();
+      pool.SetActiveWorkers(0);
+      if (cpuContext && extraWorkers)
+        sunpack_cpu_release_extra_for_context(
+            cpuContext,
+            extraWorkers);
+
+      bool advanced = false;
+
+      for (;;)
+      {
+        CParallelBlockJob *currentJob = NULL;
+        for (const auto &job: jobs)
+          if (job->MarkerIndex == markerIndex)
+          {
+            currentJob = job.get();
+            break;
+          }
+
+        if (!currentJob)
+          break;
+
+        const HRESULT jobRes =
+            currentJob->Wait();
+        if (jobRes != S_OK)
+          return jobRes;
+
+        if (currentJob->CalculatedCrc !=
+            currentJob->ExpectedCrc)
+        {
+          BlockCrcError = true;
+          return S_FALSE;
+        }
+
+        if (currentJob->Props.blockSize >
+            (UInt32)level * kBlockSizeStep)
+          return S_FALSE;
+
+        const size_t endIndex =
+            FindParallelMarker(
+                markers,
+                currentJob->EndBit);
+        if (endIndex == (size_t)-1 ||
+            endIndex <= markerIndex)
+          return S_FALSE;
+
+        RINOK(writeCompact(*currentJob))
+
+        Base.NumBlocks++;
+        combinedCrc =
+            ((combinedCrc << 1) |
+             (combinedCrc >> 31)) ^
+            currentJob->ExpectedCrc;
+
+        markerIndex = endIndex;
+        advanced = true;
+
+        if (progress)
+        {
+          const UInt64 inCur =
+              (currentJob->EndBit + 7) >> 3;
+          const UInt64 outCur =
+              GetOutProcessedSize();
+          if (inCur - inPrev >= kProgressStep ||
+              outCur - outPrev >= kProgressStep)
+          {
+            RINOK(progress->SetRatioInfo(
+                &inCur,
+                &outCur))
+            inPrev = inCur;
+            outPrev = outCur;
+          }
+        }
+
+        if (markerIndex >= markers.size() ||
+            markers[markerIndex].IsEnd)
+          break;
+      }
+
+      if (!advanced)
+        return E_FAIL;
     }
-
-    if (Base.state != STATE_BLOCK_START)
-    {
-      parseRes = E_FAIL;
-      break;
-    }
-
-    CParallelBlockJob &job = *ring[(size_t)(submitted % ringSize)];
-    job.Reset(submitted);
-
-    Base.Counters = job.Counters;
-    job.ExpectedCrc = Base.crc;
-
-    Base.Props.randMode = 1;
-    parseRes = ReadBlock();
-    if (parseRes != S_OK)
-      break;
-
-    job.Props = Base.Props;
-    job.PackPos = GetInputProcessedSize();
-
-    pool.Submit(&job);
-    submitted++;
   }
-
-  // A parser error can be discovered after earlier blocks were already
-  // submitted. Match the serial decoder: publish those earlier blocks first,
-  // but stop at the first ordered block/write failure.
-  while (retireRes == S_OK && retired < submitted)
-  {
-    CParallelBlockJob &job = *ring[(size_t)(retired % ringSize)];
-    retireRes = retireOne(job);
-    retired++;
-  }
-
-  return retireRes != S_OK ? retireRes : parseRes;
 }
 
 #endif
@@ -1735,10 +2499,14 @@ Z7_COM7F_IMF(CDecoder::Code(ISequentialInStream *inStream, ISequentialOutStream 
     return E_OUTOFMEMORY;
 
   #ifndef Z7_ST
+  unsigned long long randomAccessInputSize = 0;
   const bool useParallelBlocks =
       (sunpack_cpu_current_job_context() || NumThreads > 1) &&
       !_outSizeDefined &&
-      Base.DecodeAllStreams;
+      Base.DecodeAllStreams &&
+      sunpack_input_random_access_size(
+          inStream,
+          &randomAccessInputSize) != 0;
   #else
   const bool useParallelBlocks = false;
   #endif
