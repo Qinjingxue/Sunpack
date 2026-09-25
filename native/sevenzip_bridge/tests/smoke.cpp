@@ -6,6 +6,8 @@
 #include "internal/native_memory_guard.hpp"
 #include "internal/native_cpu_budget.hpp"
 #include "internal/decoder_cpu_budget.h"
+#include "internal/decoder_input_access.h"
+#include "internal/sevenzip_streams.hpp"
 #include "internal/native_worker_sizing.hpp"
 
 #include <filesystem>
@@ -348,6 +350,92 @@ bool check_cpu_budget_acquire_all_available() {
     return budget.reserved_credits() == 0;
 }
 
+bool check_decoder_random_access_preserves_sequential_cursor() {
+    using namespace sunpack::sevenzip;
+
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-decoder-random-access-" + std::to_wstring(GetCurrentProcessId()));
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    error.clear();
+    std::filesystem::create_directories(root, error);
+    if (error) {
+        return false;
+    }
+
+    const auto path = root / L"input.bin";
+    {
+        std::ofstream stream(path, std::ios::binary | std::ios::trunc);
+        for (unsigned value = 0; value < 256; ++value) {
+            const unsigned char byte = static_cast<unsigned char>(value);
+            stream.write(reinterpret_cast<const char*>(&byte), 1);
+        }
+    }
+
+    auto* raw = new FileInStream(
+        path.wstring(),
+        nullptr,
+        L"file",
+        InputPrefetchConfig{false, 512 * 1024, 2});
+    CMyComPtr<IInStream> owner(raw);
+    if (!raw->is_open()) {
+        std::filesystem::remove_all(root, error);
+        return false;
+    }
+
+    Byte sequential_first[4] = {};
+    UInt32 sequential_first_read = 0;
+    if (raw->Read(
+            sequential_first,
+            sizeof(sequential_first),
+            &sequential_first_read) != S_OK ||
+        sequential_first_read != sizeof(sequential_first) ||
+        sequential_first[0] != 0 ||
+        sequential_first[3] != 3) {
+        std::filesystem::remove_all(root, error);
+        return false;
+    }
+
+    unsigned long long size = 0;
+    if (!sunpack_input_random_access_size(
+            static_cast<ISequentialInStream*>(raw),
+            &size) ||
+        size != 256) {
+        std::filesystem::remove_all(root, error);
+        return false;
+    }
+
+    Byte random_bytes[8] = {};
+    unsigned long random_read = 0;
+    if (sunpack_input_read_at(
+            static_cast<ISequentialInStream*>(raw),
+            100,
+            random_bytes,
+            sizeof(random_bytes),
+            &random_read) != S_OK ||
+        random_read != sizeof(random_bytes) ||
+        random_bytes[0] != 100 ||
+        random_bytes[7] != 107) {
+        std::filesystem::remove_all(root, error);
+        return false;
+    }
+
+    Byte sequential_second[4] = {};
+    UInt32 sequential_second_read = 0;
+    const bool ok =
+        raw->Read(
+            sequential_second,
+            sizeof(sequential_second),
+            &sequential_second_read) == S_OK &&
+        sequential_second_read == sizeof(sequential_second) &&
+        sequential_second[0] == 4 &&
+        sequential_second[3] == 7;
+
+    owner.Release();
+    std::filesystem::remove_all(root, error);
+    return ok;
+}
+
 bool check_memory_guard_reduces_below_ten_percent() {
     using namespace sunpack::sevenzip;
     NativeMemoryGuard guard(16);
@@ -505,6 +593,10 @@ int wmain(int argc, wchar_t** argv) {
     if (!check_cpu_context_exchange_propagates_and_restores()) {
         std::cerr << "CPU context exchange check failed\n";
         return 32;
+    }
+    if (!check_decoder_random_access_preserves_sequential_cursor()) {
+        std::cerr << "decoder random-access cursor isolation check failed\n";
+        return 34;
     }
     if (!check_memory_guard_reduces_below_ten_percent()) {
         std::cerr << "memory guard pressure threshold check failed\n";
