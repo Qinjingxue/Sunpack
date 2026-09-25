@@ -477,7 +477,7 @@ def test_raw_zip_relation_uses_bounded_anchors_not_full_directory_revalidation(t
 
     group = next(group for group in _groups(tmp_path) if group.logical_name == "bounded")
 
-    assert group.kind == "split"
+    assert group.kind == "split_archive"
     assert [Path(path).name for path in group.input_paths] == [first.name, terminal.name]
     assert group.head_metadata["format"] == "zip"
     assert group.head_metadata["relation_confirmed"] is True
