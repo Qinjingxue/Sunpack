@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from sunpack.core.contracts.pipeline import PipelineDiscovery
+from sunpack.pipeline.coordinator.extraction_batch import ExtractionBatchRunner
 from sunpack.runtime.watch.scheduler import WatchScheduler, _response_claimed_paths
 
 
@@ -26,6 +27,17 @@ def test_watch_consumes_pipeline_claimed_paths_without_reconstructing_membership
         str(first),
         str(second),
     ]
+
+
+def test_watch_source_claim_is_published_before_batch_task_execution():
+    source = inspect.getsource(ExtractionBatchRunner.execute_async)
+
+    claim = source.index('"task_sources_claimed"')
+    dispatch = source.index("outcomes = await map_unbounded")
+
+    assert claim < dispatch
+    assert "task.cleanup_parts or task.all_parts" in source
+    assert "critical=True" in source[claim:dispatch]
 
 
 def test_watch_layer_does_not_import_archive_discovery_internals():
