@@ -746,14 +746,13 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
         .starts_with(ZIP_SPLIT_MARKER)
         .then_some(ZIP_SPLIT_MARKER.len())
         .filter(|offset| plausible_zip_local(prefix, *offset));
+    let empty_eocd_offset = zip_empty_eocd_offset(prefix, allow_embedded);
     let start_offset = split_start_offset.or_else(|| {
         anchored_signature(prefix, ZIP_LOCAL, allow_embedded)
             .filter(|offset| plausible_zip_local(prefix, *offset))
-            .or_else(|| anchored_signature(prefix, ZIP_EMPTY, allow_embedded))
+            .or(empty_eocd_offset)
     });
-    let empty_eocd_start = split_start_offset.is_none()
-        && prefix.starts_with(ZIP_EMPTY)
-        && !prefix.starts_with(ZIP_LOCAL);
+    let empty_eocd_start = empty_eocd_offset == Some(0);
     let eocd_index = memmem::rfind(tail, ZIP_EOCD).filter(|index| {
         tail.get(index + 20..index + 22)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]) as usize)
@@ -771,7 +770,7 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
         out.internal_volume_number = Some(1);
         out.evidence.push(if split_start_offset.is_some() {
             "zip:split_marker"
-        } else if empty_eocd_start {
+        } else if empty_eocd_offset == Some(offset) {
             "zip:empty_eocd"
         } else if out.sfx {
             "zip:sfx_local_header"
@@ -951,6 +950,24 @@ fn anchored_signature(data: &[u8], signature: &[u8], allow_embedded: bool) -> Op
     } else {
         None
     }
+}
+
+fn zip_empty_eocd_offset(data: &[u8], allow_embedded: bool) -> Option<usize> {
+    let offset = anchored_signature(data, ZIP_EOCD, allow_embedded)?;
+    let record = data.get(offset..offset + 22)?;
+    let disk = u16::from_le_bytes([record[4], record[5]]);
+    let cd_disk = u16::from_le_bytes([record[6], record[7]]);
+    let entries_on_disk = u16::from_le_bytes([record[8], record[9]]);
+    let total_entries = u16::from_le_bytes([record[10], record[11]]);
+    let cd_size = u32::from_le_bytes(record[12..16].try_into().ok()?);
+    let cd_offset = u32::from_le_bytes(record[16..20].try_into().ok()?);
+    (disk == 0
+        && cd_disk == 0
+        && entries_on_disk == 0
+        && total_entries == 0
+        && cd_size == 0
+        && cd_offset == 0)
+        .then_some(offset)
 }
 
 fn plausible_zip_local(data: &[u8], offset: usize) -> bool {
