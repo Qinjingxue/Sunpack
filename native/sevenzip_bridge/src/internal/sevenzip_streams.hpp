@@ -723,7 +723,7 @@ namespace sunpack::sevenzip
             const UInt32 wanted = static_cast<UInt32>(
                 std::min<UInt64>(size, size_ - offset));
             return decoder_thread_read_path_at(
-                path_, offset, data, wanted, processed, trace_);
+                path_, offset, data, wanted, processed, nullptr);
         }
 
 
@@ -1039,7 +1039,7 @@ namespace sunpack::sevenzip
                     out + total_read,
                     wanted,
                     &read,
-                    trace_);
+                    nullptr);
                 if (result != S_OK)
                     return result;
 
@@ -1613,7 +1613,7 @@ namespace sunpack::sevenzip
                     out + total_read,
                     wanted,
                     &read,
-                    trace_);
+                    nullptr);
                 if (result != S_OK)
                     return result;
 
