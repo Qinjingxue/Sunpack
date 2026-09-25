@@ -51,18 +51,20 @@ def test_recursive_gate_may_exclude_small_residual_candidate(tmp_path):
     assert any(trace.entry_path == str(small) and trace.status == "residual" for trace in result.traces)
 
 
-def test_default_embedded_scan_honors_runtime_bundle_guard(tmp_path, monkeypatch):
-    path = tmp_path / "installer.exe"
+def test_default_embedded_scan_skips_exe_before_any_file_probe(tmp_path, monkeypatch):
+    path = tmp_path / "application.EXE"
     path.write_bytes(b"x" * 128)
 
     monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
-        lambda _path, _size: "nsis",
+        "sunpack.pipeline.discovery.embedded.discovery.file_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("default embedded EXE gate must run before file probing")
+        ),
     )
     monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("runtime bundle guard must reject before full embedded scan")
+            AssertionError("default embedded EXE gate must reject before full scan")
         ),
     )
 
@@ -70,10 +72,14 @@ def test_default_embedded_scan_honors_runtime_bundle_guard(tmp_path, monkeypatch
 
     assert result.resolved_tasks == []
     assert result.residual_paths
+    assert any(
+        trace.reason == "embedded_executable_skipped" and trace.status == "residual"
+        for trace in result.traces
+    )
 
 
-def test_force_scan_bypasses_all_runtime_bundle_guards(tmp_path, monkeypatch):
-    path = tmp_path / "installer.exe"
+def test_force_scan_bypasses_exe_suffix_gate(tmp_path, monkeypatch):
+    path = tmp_path / "application.exe"
     path.write_bytes(b"x" * 128)
     scan = EmbeddedScanResult(
         complete=True,
@@ -97,12 +103,6 @@ def test_force_scan_bypasses_all_runtime_bundle_guards(tmp_path, monkeypatch):
         budget_exhausted=False,
     )
 
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("deep scan must bypass every runtime/installer guard")
-        ),
-    )
     monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
         lambda *_args, **_kwargs: scan,
@@ -148,10 +148,6 @@ def test_embedded_discovery_uses_current_identity_size_not_stale_candidate_size(
         lambda scan_path: (str(scan_path), 48, 123),
     )
     monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
-        lambda _path, _size: None,
-    )
-    monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
         fake_scan,
     )
@@ -185,10 +181,6 @@ def test_embedded_rar_header_encryption_reaches_canonical_input(tmp_path, monkey
         logical_resolution_complete=False,
         raw_hit_count=1,
         budget_exhausted=False,
-    )
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
-        lambda _path, _size: None,
     )
     monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
@@ -238,10 +230,6 @@ def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypat
         budget_exhausted=False,
     )
     monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
-        lambda _path, _size: None,
-    )
-    monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
         lambda *_args, **_kwargs: scan,
     )
@@ -279,10 +267,6 @@ def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path, mon
         logical_resolution_complete=False,
         raw_hit_count=1,
         budget_exhausted=False,
-    )
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
-        lambda _path, _size: None,
     )
     monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
@@ -333,10 +317,6 @@ def test_embedded_rar_wrong_password_blocks_whole_carrier(tmp_path, monkeypatch)
         logical_resolution_complete=False,
         raw_hit_count=1,
         budget_exhausted=False,
-    )
-    monkeypatch.setattr(
-        "sunpack.pipeline.discovery.embedded.discovery.inspect_runtime_bundle",
-        lambda _path, _size: None,
     )
     monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
