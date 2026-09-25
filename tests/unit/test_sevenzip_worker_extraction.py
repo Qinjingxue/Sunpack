@@ -10,6 +10,7 @@ import zipfile
 import pytest
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
+from sunpack.core.contracts.failures import FailureKind
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import (
     SevenZipRunner,
@@ -1106,6 +1107,37 @@ def test_extraction_scheduler_uses_worker_for_file_range(tmp_path, monkeypatch):
     assert result.success is True
     assert (tmp_path / "out" / filename).read_text(encoding="utf-8") == "range payload"
     assert result.diagnostics["result"]["input_trace"]["prefetch_enabled"] is True
+
+
+def test_confirmed_truncated_file_range_open_failure_is_damaged(tmp_path):
+    _require_worker_or_skip()
+    archive, _ = _create_7z(tmp_path, "truncated-range", "payload")
+    data = archive.read_bytes()
+    prefix = b"SFX-STUB"
+    truncated = tmp_path / "truncated.exe"
+    truncated.write_bytes(prefix + data[:-1])
+
+    task = _task(truncated, {
+        "kind": "archive_input",
+        "entry_path": str(truncated),
+        "open_mode": "file_range",
+        "format_hint": "7z",
+        "parts": [{
+            "path": str(truncated),
+            "role": "main",
+            "start": len(prefix),
+            "end": len(prefix) + len(data),
+        }],
+    })
+    result = ExtractionScheduler(max_retries=1).extract(task, str(tmp_path / "out"))
+
+    assert result.success is False
+    assert result.failure.kind is FailureKind.DAMAGED
+    worker = result.diagnostics["result"]
+    assert worker["native_status"] == "damaged"
+    assert worker["damaged"] is True
+    assert worker["failure_stage"] == "archive_open"
+    assert worker["failure_kind"] == "structure_recognition"
 
 
 def test_extraction_scheduler_saves_worker_diagnostics_on_failure(tmp_path):

@@ -808,17 +808,33 @@ namespace sunpack::sevenzip
                 return result;
             }
 
-            result.status = looks_wrong_password(last_hr, last_op_res, last_encryption_evidence) ? PasswordTestStatus::WrongPassword : PasswordTestStatus::Unsupported;
-
-            result.wrong_password = result.status == PasswordTestStatus::WrongPassword;
-
-            result.password_rejected = result.wrong_password && last_op_res == kOpWrongPassword;
-
-            result.encrypted = result.wrong_password;
-
-            set_failure(result, "archive_open", result.wrong_password ? "encrypted_or_wrong_password" : "structure_recognition", last_hr);
-
-            result.message = result.wrong_password ? "archive is encrypted or password is wrong" : "archive could not be opened by supported handlers";
+            const bool wrong_password = looks_wrong_password(last_hr, last_op_res, last_encryption_evidence);
+            if (wrong_password)
+            {
+                result.status = PasswordTestStatus::WrongPassword;
+                result.wrong_password = true;
+                result.password_rejected = last_op_res == kOpWrongPassword;
+                result.encrypted = true;
+                set_failure(result, "archive_open", "encrypted_or_wrong_password", last_hr);
+                result.message = "archive is encrypted or password is wrong";
+            }
+            else if (!format_hint.empty())
+            {
+                // Extraction receives an already analyzed format identity from
+                // the discovery pipeline. If that exact handler was created but
+                // cannot open the supplied input, the format is not unsupported:
+                // the confirmed archive structure is incomplete or damaged.
+                result.status = PasswordTestStatus::Damaged;
+                result.damaged = true;
+                set_failure(result, "archive_open", "structure_recognition", last_hr);
+                result.message = "confirmed archive structure could not be opened";
+            }
+            else
+            {
+                result.status = PasswordTestStatus::Unsupported;
+                set_failure(result, "archive_open", "structure_recognition", last_hr);
+                result.message = "archive could not be opened by supported handlers";
+            }
         }
 
         return result;
