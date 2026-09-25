@@ -19,7 +19,6 @@ const RAR4: &[u8] = b"Rar!\x1a\x07\x00";
 const RAR5: &[u8] = b"Rar!\x1a\x07\x01\x00";
 const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
 const ZIP_EOCD: &[u8] = b"PK\x05\x06";
-const ZIP_EMPTY: &[u8] = b"PK\x05\x06";
 const ZIP_SPLIT_MARKER: &[u8] = b"PK\x07\x08";
 const DEFAULT_PREFIX_LIMIT: usize = 1024 * 1024;
 const DEFAULT_TAIL_LIMIT: usize = 65_557;
