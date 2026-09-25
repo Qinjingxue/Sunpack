@@ -210,7 +210,7 @@ Times are per-case medians in milliseconds.
 
 ## Notice
 
-Some executable installers legitimately contain standard archive payloads and can be structurally indistinguishable from self-extracting archives. SunPack prioritizes archive detection and therefore may identify or extract such custom installers as archives. Known common runtime bundles may be excluded, but exhaustive installer detection is intentionally out of scope.
+Normal embedded discovery does not scan files whose names end in `.exe`. Structurally confirmed self-extracting archives are still recognized by the relations stage, while `--deep-detect` explicitly opts executable carriers back into embedded scanning. This keeps ordinary application and installer executables out of the full-file embedded scan without maintaining runtime- or installer-specific exclusion rules.
 
 SunPack is not yet mature, and its handling of uncontrolled inputs is limited. It is not guaranteed to be safe. If you have concerns, use it only in a trusted environment.
 
