@@ -29,10 +29,10 @@ python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/s
 python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
 python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
 python -m benchmarks extraction worker-vs-7z-300m `
-  --sunpack-version v0.7.0 --worker-source-commit e37c1769 `
+  --sunpack-version v0.7.0 --worker-source-commit c3eaec11 `
   --worker native/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
   --small-files 8 --large-files 2 --large-file-mib 150 --runs 5 --warmups 0 `
-  --json-out benchmarks/results/worker-vs-7z-300m-v0.7.0-rss.json
+  --json-out benchmarks/results/worker-vs-7z-300m-v0.7.0-c3eaec11-rss.json
 python -m benchmarks extraction worker-read-blocking --runs 1 --payload-gib 1 --json-out benchmarks/results/worker-read-blocking.json
 python -m benchmarks extraction worker-read-patterns --runs 1 --json-out benchmarks/results/worker-read-patterns.json
 # Enable the production format-aware prefetch policy while tuning its defaults (512 KiB x 2).
@@ -58,7 +58,7 @@ python -m benchmarks memory many-tasks --python-rounds 5 --worker-rounds 3 --jso
 
 Every scenario runs in a child process under a hard wall-clock deadline, so a
 stale scenario that calls a removed API and blocks forever is killed instead
-of hanging the whole benchmark run.  The global limit defaults to 3600 seconds
+of hanging the whole benchmark run. The global limit defaults to 3600 seconds
 and can be overridden before the scenario name, or via
 `SUNPACK_BENCH_TIMEOUT`:
 
@@ -66,7 +66,7 @@ and can be overridden before the scenario name, or via
 python -m benchmarks --timeout 600 extraction format-matrix --runs 3
 ```
 
-A killed scenario exits with code 124.  Scenario-internal subprocesses (7-Zip,
+A killed scenario exits with code 124. Scenario-internal subprocesses (7-Zip,
 the CLI client, native workers, worker children) all carry their own timeouts
 too; they honour `SUNPACK_BENCH_SUBPROCESS_TIMEOUT` (default 600s) where
 applicable.
@@ -187,7 +187,7 @@ the spread to each request's first admission, and the longest same-request admis
 run. The early index detects short-term monopolization; the overall index detects
 whether requests receive equal admission counts by the end of the batch.
 
-`memory many-tasks` measures memory *growth* (not peak) of the two long-lived
+`memory many-tasks` measures memory _growth_ (not peak) of the two long-lived
 components under a large task count across every format: the Python pipeline and
 the native 7z worker. One mixed-format corpus is built with the format-matrix
 builder (archives kept above the 1 MiB scanner floor, e.g.

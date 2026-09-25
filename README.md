@@ -62,7 +62,7 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
 | `passwords` | Show the password list that will be attempted in this run.           |
 | `config`    | Show or validate the effective configuration.                        |
 | `doctor`    | Non-destructive check of installation and runtime health.            |
-| `version`   | Print the installed SunPack version.                                  |
+| `version`   | Print the installed SunPack version.                                 |
 
 > See [CLI parameter reference](docs/cli_parameters.md) for detailed options.
 
@@ -189,67 +189,36 @@ Acceptance tests:
 
 Detailed machine identity, archive construction, compression methods, and
 reproduction instructions are in [the benchmark document](docs/benchmark_worker_vs_7z_300m.md).
-These results use SunPack **v0.7.0**, five measured runs per case, and no warmups.
-Times and sampled peak process-tree RSS are per-case medians; RSS is in MiB.
+These results use SunPack **v0.7.0** from repository commit `c3eaec11`, with the
+worker built from commit `c3eaec11`. Each case has five measured runs and no
+warmups. Times and sampled process-tree peak RSS are per-case medians; RSS is in
+MiB. Worker time and memory are grouped together, followed by the same metrics
+for `7z.exe`.
 
-#### Wall time (median ms)
-
-| Format / variant | SunPack worker | `7z.exe` | worker / 7-Zip |
-| ---------------- | -------------: | -------: | -------------: |
-| 7z split | 152.428 | 212.774 | 0.716 |
-| 7z non-solid | 191.658 | 249.196 | 0.769 |
-| 7z solid | 152.874 | 208.849 | 0.732 |
-| BZip2 | 2,903.218 | 3,018.483 | 0.962 |
-| Gzip | 85.065 | 210.524 | 0.404 |
-| RAR5 split | 225.367 | 774.706 | 0.291 |
-| RAR4 non-solid | 167.379 | 189.960 | 0.881 |
-| RAR4 solid | 646.962 | 663.775 | 0.975 |
-| RAR5 non-solid | 133.381 | 185.708 | 0.718 |
-| RAR5 solid | 205.989 | 764.585 | 0.269 |
-| TAR | 86.117 | 139.751 | 0.616 |
-| TBZ2 | 2,795.495 | 2,952.648 | 0.947 |
-| TGZ | 83.694 | 199.684 | 0.419 |
-| TXZ | 176.999 | 179.940 | 0.984 |
-| TZST | 90.564 | 167.695 | 0.540 |
-| XZ | 172.809 | 180.811 | 0.956 |
-| ZIP | 96.212 | 202.997 | 0.474 |
-| ZST | 88.075 | 154.881 | 0.569 |
-
-#### Peak RSS (median MiB)
-
-| Format / variant | SunPack worker | `7z.exe` | worker / 7-Zip |
-| ---------------- | -------------: | -------: | -------------: |
-| 7z split | 474.410 | 458.383 | 1.035 |
-| 7z non-solid | 323.938 | 308.055 | 1.052 |
-| 7z solid | 474.148 | 458.312 | 1.035 |
-| BZip2 | 146.871 | 12.637 | 11.622 |
-| Gzip | 25.055 | 8.219 | 3.048 |
-| RAR5 split | 52.145 | 40.516 | 1.287 |
-| RAR4 non-solid | 24.320 | 11.613 | 2.094 |
-| RAR4 solid | 25.027 | 12.359 | 2.025 |
-| RAR5 non-solid | 52.008 | 39.613 | 1.313 |
-| RAR5 solid | 53.043 | 40.480 | 1.310 |
-| TAR | 24.074 | 7.305 | 3.296 |
-| TBZ2 | 146.953 | 12.641 | 11.625 |
-| TGZ | 25.051 | 8.227 | 3.045 |
-| TXZ | 474.520 | 458.531 | 1.035 |
-| TZST | 21.871 | 9.801 | 2.232 |
-| XZ | 474.484 | 458.527 | 1.035 |
-| ZIP | 23.090 | 7.992 | 2.889 |
-| ZST | 21.500 | 9.793 | 2.195 |
-
-Across 18 cases, the sum of per-case time medians is 8,454.286 ms for SunPack
-and 10,656.967 ms for `7z.exe` (0.793x). Memory use varies by format; BZip2/TBZ2
-are about 147 MiB for the worker versus 13 MiB for `7z.exe`. In the time table,
-a ratio below 1 means the worker is faster; in the RSS table, it means the
-worker uses less memory. RSS values are per-case medians, not sums across
-independent cases.
+| Format / variant | Worker time (ms) | `7z.exe` time (ms) | Time ratio | Worker peak RSS (MiB) | `7z.exe` peak RSS (MiB) | RSS ratio |
+| ---------------- | ---------------: | -----------------: | ---------: | --------------------: | ----------------------: | --------: |
+| 7z split         |          151.347 |            209.220 |      0.723 |               469.258 |                 458.383 |     1.024 |
+| 7z non-solid     |          192.130 |            249.181 |      0.771 |               319.113 |                 308.051 |     1.036 |
+| 7z solid         |          148.431 |            206.594 |      0.718 |               469.215 |                 458.309 |     1.024 |
+| BZip2            |        1,752.476 |          2,947.405 |      0.595 |                43.137 |                  12.637 |     3.414 |
+| Gzip             |           67.378 |            195.667 |      0.344 |                24.992 |                   8.219 |     3.041 |
+| RAR5 split       |          224.977 |            780.676 |      0.288 |                52.066 |                  40.504 |     1.285 |
+| RAR4 non-solid   |          170.297 |            181.628 |      0.938 |                24.281 |                  11.605 |     2.092 |
+| RAR4 solid       |          630.189 |            655.308 |      0.962 |                25.020 |                  12.352 |     2.026 |
+| RAR5 non-solid   |          126.030 |            180.823 |      0.697 |                52.008 |                  39.609 |     1.313 |
+| RAR5 solid       |          192.755 |            756.119 |      0.255 |                53.059 |                  40.473 |     1.311 |
+| TAR              |           72.315 |            118.175 |      0.612 |                25.000 |                   7.301 |     3.424 |
+| TBZ2             |        1,769.768 |          2,972.193 |      0.595 |                44.023 |                  12.629 |     3.486 |
+| TGZ              |           71.309 |            202.180 |      0.353 |                25.016 |                   8.211 |     3.047 |
+| TXZ              |          169.861 |            183.313 |      0.927 |               474.453 |                 458.520 |     1.035 |
+| TZST             |           93.847 |            152.214 |      0.617 |                21.473 |                   9.801 |     2.191 |
+| XZ               |          165.727 |            182.915 |      0.906 |               474.484 |                 458.520 |     1.035 |
+| ZIP              |           93.797 |            197.793 |      0.474 |                20.379 |                   7.988 |     2.551 |
+| ZST              |           95.207 |            156.096 |      0.610 |                21.414 |                   9.801 |     2.185 |
 
 ---
 
 ## Notice
-
-Normal embedded discovery does not scan files whose names end in `.exe`. Structurally confirmed self-extracting archives are still recognized by the relations stage, while `--deep-detect` explicitly opts executable carriers back into embedded scanning. This keeps ordinary application and installer executables out of the full-file embedded scan without maintaining runtime- or installer-specific exclusion rules.
 
 SunPack is not yet mature, and its handling of uncontrolled inputs is limited. It is not guaranteed to be safe. If you have concerns, use it only in a trusted environment.
 
