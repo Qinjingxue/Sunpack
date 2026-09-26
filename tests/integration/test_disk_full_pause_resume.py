@@ -1030,11 +1030,28 @@ def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
                 + json.dumps(session.space_events(), ensure_ascii=False)
             )
             assert int(status.get("volume_query_error") or 0) != 0
-            # 绝不能变成"已恢复"。
+
+            # space_blocked 对测试线程可见后，到 detach 真正完成之前，monitor 仍可能
+            # 在已挂载的卷上完成一次成功采样并授权 probe；若真实 probe 先成功，
+            # space_resumed 合法地发生在"卷不可查询"这一新事实之前。#147 保证的是
+            # 查询失败发生后，已经发出的旧 probe 不得再恢复同一个 episode。
+            events = session.events()
+            status_index = next(
+                index for index, event in enumerate(events) if event is status
+            )
+            status_episode = int(status.get("episode_id") or 0)
+
+            # 保留原来的 2 秒观察窗，但只检查 query failure 之后的新事件，避免把
+            # detach 之前已经合法完成的 probe 误判成 stale resume。
+            time.sleep(2.0)
+            events_after_status = session.events()[status_index + 1 :]
             assert not [
                 event
-                for event in session.space_events()
+                for event in events_after_status
                 if event.get("event") == "space_resumed"
-            ], "不可查询的卷绝不能产生 space_resumed"
-            # 也绝不能产生终态结果：空间压力本身不得产生 job 终态。
-            assert session.wait_for(lambda e: e.get("type") == "result", timeout=2.0) is None
+                and int(event.get("episode_id") or 0) == status_episode
+            ], "卷查询失败之后，同一 episode 的旧 probe 绝不能产生 space_resumed"
+            # query failure 之后也绝不能产生终态结果：空间压力本身不得结束 job。
+            assert not [
+                event for event in events_after_status if event.get("type") == "result"
+            ], "卷查询失败之后不得产生 job 终态"
