@@ -47,7 +47,6 @@ class ToastSnapshot:
     progress_status: str = ""
     progress_value_text: str = ""
     actions: tuple[ToastAction, ...] = ()
-    ttl_ms: int = 0
 
 
 def encode_snapshot(snapshot: ToastSnapshot) -> bytes:
@@ -57,13 +56,12 @@ def encode_snapshot(snapshot: ToastSnapshot) -> bytes:
         progress = 0.0
     progress = min(1.0, max(0.0, progress))
     payload = bytearray(struct.pack(
-        "<BBBBdI",
+        "<BBBBd",
         int(snapshot.kind),
         int(snapshot.progress_mode),
         len(actions),
         0,
         progress,
-        max(0, min(0xFFFFFFFF, int(snapshot.ttl_ms))),
     ))
     for value in (
         snapshot.batch_id,

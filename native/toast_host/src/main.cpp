@@ -42,8 +42,6 @@ using winrt::Windows::UI::Notifications::ToastNotification;
 using winrt::Windows::UI::Notifications::ToastNotificationManager;
 
 constexpr wchar_t kAppId[] = L"SunPack.Watch.Toast";
-constexpr wchar_t kProgressToastTag[] = L"watch-progress";
-constexpr wchar_t kFinalToastTag[] = L"watch-final";
 constexpr wchar_t kToastGroup[] = L"SunPack";
 constexpr wchar_t kClsidText[] = L"{C5A6B4E9-3184-44E2-9F15-6A71804F7A36}";
 constexpr wchar_t kToastDisplayName[] = L"SunPack";
@@ -101,7 +99,6 @@ struct Snapshot {
     SnapshotKind kind{};
     ProgressMode progress_mode{};
     double progress_value{};
-    std::uint32_t ttl_ms{};
     std::wstring batch_id;
     std::wstring title;
     std::wstring body;
@@ -632,7 +629,6 @@ Snapshot parse_snapshot(const std::vector<std::uint8_t>& payload) {
     }
     const double progress = reader.floating();
     result.progress_value = std::isfinite(progress) ? std::clamp(progress, 0.0, 1.0) : 0.0;
-    result.ttl_ms = reader.uint32();
     result.batch_id = reader.string();
     result.title = reader.string();
     result.body = reader.string();
@@ -683,13 +679,24 @@ public:
         }
     }
 
+    // Explicit clear only cancels a currently active progress notification.
+    // Terminal notifications belong to Windows notification history and must
+    // survive presenter teardown, watch reloads, and later batches.
     void clear() noexcept {
-        remove(kProgressToastTag);
-        remove(kFinalToastTag);
-        progress_shown_ = false;
+        if (!progress_tag_.empty()) {
+            remove(progress_tag_);
+            progress_tag_.clear();
+        }
     }
 
 private:
+    static std::wstring toast_tag(const Snapshot& snapshot) {
+        if (snapshot.batch_id.empty() || snapshot.batch_id.size() > 64) {
+            throw std::runtime_error("invalid Toast batch id");
+        }
+        return snapshot.batch_id;
+    }
+
     void remove(std::wstring_view tag) noexcept {
         try {
             ToastNotificationManager::History().Remove(tag, kToastGroup, kAppId);
@@ -710,6 +717,7 @@ private:
     }
 
     void show_progress(const Snapshot& snapshot, std::uint64_t sequence) {
+        const std::wstring tag = toast_tag(snapshot);
         NotificationData data;
         const auto values = data.Values();
         values.Insert(L"title", snapshot.title);
@@ -723,30 +731,40 @@ private:
             values.Insert(L"progressValue", winrt::to_hstring(snapshot.progress_value));
         }
         data.SequenceNumber(static_cast<std::uint32_t>(sequence & 0xffffffff));
-        if (progress_shown_) {
-            const auto updated = notifier_.Update(data, kProgressToastTag, kToastGroup);
+        if (progress_tag_ == tag) {
+            const auto updated = notifier_.Update(data, tag, kToastGroup);
             if (updated == NotificationUpdateResult::Succeeded) {
                 return;
             }
+        } else if (!progress_tag_.empty()) {
+            // A new batch arrived while an older progress notification was
+            // still active. The old progress is stale and may be removed.
+            clear();
         }
-        remove(kFinalToastTag);
+
         XmlDocument document;
         document.LoadXml(
             LR"(<toast duration="long" launch="noop"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text><progress title="{progressTitle}" value="{progressValue}" valueStringOverride="{progressValueString}" status="{progressStatus}"/></binding></visual></toast>)"
         );
         ToastNotification toast(document);
-        toast.Tag(kProgressToastTag);
+        toast.Tag(tag);
         toast.Group(kToastGroup);
         toast.Data(data);
         observe_dismissal(toast, "progress");
         notifier_.Show(toast);
-        progress_shown_ = true;
+        progress_tag_ = tag;
     }
 
     void show_final(const Snapshot& snapshot) {
-        remove(kProgressToastTag);
-        progress_shown_ = false;
-        std::wstring xml = L"<toast duration=\"long\" launch=\"noop\"><visual><binding template=\"ToastGeneric\"><text>";
+        const std::wstring tag = toast_tag(snapshot);
+        if (!progress_tag_.empty() && progress_tag_ != tag) {
+            clear();
+        }
+
+        // Reusing the batch tag makes Show() replace the progress toast with
+        // the terminal layout. Do not remove it from History: Windows owns the
+        // banner lifetime and keeps the final notification in Notification Center.
+        std::wstring xml = L"<toast launch=\"noop\"><visual><binding template=\"ToastGeneric\"><text>";
         xml += xml_escape(snapshot.title);
         xml += L"</text>";
         if (!snapshot.body.empty()) {
@@ -768,15 +786,18 @@ private:
         XmlDocument document;
         document.LoadXml(xml);
         ToastNotification toast(document);
-        toast.Tag(kFinalToastTag);
+        toast.Tag(tag);
         toast.Group(kToastGroup);
         observe_dismissal(toast, "final");
         notifier_.Show(toast);
+        if (progress_tag_ == tag) {
+            progress_tag_.clear();
+        }
     }
 
     winrt::Windows::UI::Notifications::ToastNotifier notifier_{nullptr};
     std::wstring diagnostic_log_path_;
-    bool progress_shown_{};
+    std::wstring progress_tag_;
 };
 
 struct ToastContext {
@@ -814,7 +835,7 @@ int self_test() {
     const auto decoded = hex_decode(hex_encode(original));
     if (!decoded || *decoded != original) return 1;
     if (xml_escape(L"<&\"'>") != L"&lt;&amp;&quot;&apos;&gt;") return 2;
-    std::vector<std::uint8_t> payload(40, 0);
+    std::vector<std::uint8_t> payload(36, 0);
     payload[0] = static_cast<std::uint8_t>(SnapshotKind::success);
     payload[1] = static_cast<std::uint8_t>(ProgressMode::determinate);
     const double progress = 0.25;
@@ -881,7 +902,12 @@ HRESULT sunpack_toast_show(void* raw, const std::uint8_t* data,
 }
 
 HRESULT sunpack_toast_clear(void* raw) noexcept {
-    return protect([&] { context_on_owner_thread(raw).presenter.reset(); });
+    return protect([&] {
+        auto& context = context_on_owner_thread(raw);
+        if (context.presenter) {
+            context.presenter->clear();
+        }
+    });
 }
 
 HRESULT sunpack_toast_destroy(void* raw) noexcept {

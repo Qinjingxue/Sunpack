@@ -57,6 +57,29 @@ def test_native_toast_identity_uses_current_user_and_keeps_machine_com_activator
     assert "remove_legacy_toast_shortcut" not in source
 
 
+def test_native_toast_replaces_progress_per_batch_without_deleting_terminal_history():
+    source = (ROOT / "native/toast_host/src/main.cpp").read_text(encoding="utf-8")
+    presenter = source[source.index("class ToastPresenter"):source.index("struct ToastContext")]
+    progress = presenter[presenter.index("void show_progress"):presenter.index("void show_final")]
+    final = presenter[presenter.index("void show_final"):]
+
+    assert "kProgressToastTag" not in source
+    assert "kFinalToastTag" not in source
+    assert "return snapshot.batch_id;" in presenter
+    assert "notifier_.Update(data, tag, kToastGroup)" in progress
+    assert "toast.Tag(tag);" in progress
+    assert "remove(kFinalToastTag)" not in progress
+
+    assert "toast.Tag(tag);" in final
+    assert "notifier_.Show(toast);" in final
+    assert "if (!progress_tag_.empty() && progress_tag_ != tag)" in final
+    assert final.index("notifier_.Show(toast);") < final.index("progress_tag_.clear();")
+
+    clear = presenter[presenter.index("void clear() noexcept"):presenter.index("private:")]
+    assert "remove(progress_tag_);" in clear
+    assert "History().Remove(tag, kToastGroup, kAppId)" in presenter
+
+
 def test_build_produces_library_and_only_packages_library():
     cmake = (ROOT / "native/toast_host/CMakeLists.txt").read_text(encoding="utf-8")
     assert "SHARED src/main.cpp" in cmake

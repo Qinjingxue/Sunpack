@@ -50,8 +50,6 @@ def normalize_watch_config(value: Any) -> dict[str, Any]:
     config["toast_enabled"] = bool(config["toast_enabled"])
     config["toast_update_interval_ms"] = max(10, _int_field(config, "toast_update_interval_ms"))
     config["toast_completion_debounce_ms"] = max(0, _int_field(config, "toast_completion_debounce_ms"))
-    config["toast_success_ttl_seconds"] = max(0.0, _float_field(config, "toast_success_ttl_seconds"))
-    config["toast_failure_ttl_seconds"] = max(0.0, _float_field(config, "toast_failure_ttl_seconds"))
     config["toast_report_retention_days"] = max(1, _int_field(config, "toast_report_retention_days"))
     config["toast_report_max_files"] = max(1, _int_field(config, "toast_report_max_files"))
     config["toast_report_max_bytes"] = max(1024, _int_field(config, "toast_report_max_bytes"))
