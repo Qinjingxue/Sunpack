@@ -105,11 +105,13 @@ def test_expected_name_presence_reports_missing_entries(tmp_path):
     (out_dir / "actual.txt").write_text("hello", encoding="utf-8")
     result = ExtractionResult(success=True, out_dir=str(out_dir))
 
-    _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
+    verification_result = _scheduler(
+        [{"name": "expected_name_presence"}]
+    ).verify(task, result)
 
-    assert verification.decision_hint == "retry_extract"
-    assert verification.missing_files == 2
-    assert verification.issues[0].code == "fail.expected_names_all_missing"
+    assert verification_result.decision_hint == "retry_extract"
+    assert verification_result.missing_files == 2
+    assert verification_result.issues[0].code == "fail.expected_names_all_missing"
 
 
 def test_expected_name_presence_skips_without_manifest_names(tmp_path):

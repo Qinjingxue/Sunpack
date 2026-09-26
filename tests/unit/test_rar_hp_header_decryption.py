@@ -81,17 +81,19 @@ def test_probe_hp_single_volume_requires_and_accepts_password(tmp_path):
 
 
 def test_probe_hp_split_volumes_use_decrypted_numbers(tmp_path):
-    _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
-    second = _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX)
-    passwords = {first: "secret", second: "secret"}
+    volumes = [
+        _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX),
+        _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX),
+    ]
+    passwords = {volume: "secret" for volume in volumes}
 
-    rows = probe_volume_anchor_paths([first, second], path_passwords=passwords)
-    assert rows.get(first).multivolume is True
-    assert rows.get(first).internal_volume_number == 1
-    assert rows.get(first).anchor_roles == ("any_volume", "first")
-    assert rows.get(second).multivolume is True
-    assert rows.get(second).internal_volume_number == 2
-    assert rows.get(second).anchor_roles == ("any_volume", "member")
+    rows = probe_volume_anchor_paths(volumes, path_passwords=passwords)
+    assert rows.get(volumes[0]).multivolume is True
+    assert rows.get(volumes[0]).internal_volume_number == 1
+    assert rows.get(volumes[0]).anchor_roles == ("any_volume", "first")
+    assert rows.get(volumes[1]).multivolume is True
+    assert rows.get(volumes[1]).internal_volume_number == 2
+    assert rows.get(volumes[1]).anchor_roles == ("any_volume", "member")
 
 
 def test_probe_rar4_hp_split_volumes_decrypts_following_headers(tmp_path):
