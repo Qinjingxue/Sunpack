@@ -14,28 +14,18 @@ class ArchiveFingerprint:
     part_paths: tuple[str, ...] = ()
 
 
-def _archive_input_scope(archive_input: Any) -> str:
-    """Serialize the logical input boundary for password-cache isolation."""
+def _archive_input_dict(archive_input: Any) -> dict[str, Any]:
     if archive_input is None:
-        return ""
+        return {}
     if hasattr(archive_input, "to_dict"):
         archive_input = archive_input.to_dict()
-    if not isinstance(archive_input, dict) or not archive_input:
-        return ""
-    mode = str(archive_input.get("open_mode") or archive_input.get("kind") or "")
-    parts = archive_input.get("parts") or []
-    ranges = archive_input.get("ranges") or []
-    has_explicit_range = (
-        mode in {"file_range", "concat_ranges"}
-        or bool(ranges)
-        or any(
-            isinstance(item, dict)
-            and (item.get("start") is not None or item.get("end") is not None
-                 or item.get("start_offset") is not None or item.get("end_offset") is not None)
-            for item in parts
-        )
-    )
-    if not has_explicit_range:
+    return dict(archive_input) if isinstance(archive_input, dict) else {}
+
+
+def _archive_input_scope(archive_input: Any) -> str:
+    """Serialize the complete logical input boundary for cache isolation."""
+    raw = _archive_input_dict(archive_input)
+    if not raw:
         return ""
 
     def range_payload(item: Any) -> dict[str, Any]:
@@ -48,7 +38,7 @@ def _archive_input_scope(archive_input: Any) -> str:
         }
 
     normalized_parts = []
-    for item in parts:
+    for item in raw.get("parts") or []:
         if not isinstance(item, dict):
             continue
         payload = range_payload(item)
@@ -58,15 +48,39 @@ def _archive_input_scope(archive_input: Any) -> str:
             "canonical_name": str(item.get("canonical_name") or ""),
         })
         normalized_parts.append(payload)
-    normalized_ranges = [range_payload(item) for item in ranges]
+
+    normalized_ranges = [
+        range_payload(item)
+        for item in raw.get("ranges") or []
+        if isinstance(item, dict)
+    ]
     return json.dumps({
-        "entry_path": str(archive_input.get("entry_path") or archive_input.get("path") or ""),
-        "open_mode": str(archive_input.get("open_mode") or archive_input.get("kind") or ""),
-        "format_hint": str(archive_input.get("format_hint") or archive_input.get("format") or ""),
-        "logical_name": str(archive_input.get("logical_name") or ""),
+        "entry_path": str(raw.get("entry_path") or raw.get("path") or ""),
+        "open_mode": str(raw.get("open_mode") or raw.get("kind") or ""),
+        "format_hint": str(raw.get("format_hint") or raw.get("format") or ""),
+        "logical_name": str(raw.get("logical_name") or ""),
+        "volume_style": str(raw.get("volume_style") or ""),
         "parts": normalized_parts,
         "ranges": normalized_ranges,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _archive_input_paths(archive_input: Any) -> tuple[str, ...]:
+    raw = _archive_input_dict(archive_input)
+    if not raw:
+        return ()
+    paths: list[str] = []
+    entry = str(raw.get("entry_path") or raw.get("path") or "")
+    if entry:
+        paths.append(entry)
+    for field in ("parts", "ranges"):
+        for item in raw.get(field) or []:
+            if not isinstance(item, dict):
+                continue
+            path = str(item.get("path") or "")
+            if path:
+                paths.append(path)
+    return tuple(dict.fromkeys(paths))
 
 
 def build_archive_fingerprint(
@@ -75,27 +89,35 @@ def build_archive_fingerprint(
     archive_input: Any = None,
 ) -> ArchiveFingerprint:
     normalized_archive = str(Path(archive_path).resolve())
-    normalized_parts = tuple(str(Path(path).resolve()) for path in part_paths or [])
+    source_paths = [
+        normalized_archive,
+        *(str(Path(path).resolve()) for path in part_paths or []),
+        *(str(Path(path).resolve()) for path in _archive_input_paths(archive_input)),
+    ]
+    normalized_sources = tuple(dict.fromkeys(source_paths))
     digest = hashlib.sha256()
-    for path in (normalized_archive, *normalized_parts):
+    for path in normalized_sources:
         digest.update(path.encode("utf-8", errors="surrogatepass"))
         digest.update(b"\0")
         try:
             stat = Path(path).stat()
         except OSError:
             digest.update(b"missing")
+            digest.update(b"\0")
             continue
         digest.update(str(stat.st_size).encode("ascii"))
         digest.update(b":")
         digest.update(str(stat.st_mtime_ns).encode("ascii"))
         digest.update(b"\0")
+
     scope = _archive_input_scope(archive_input)
     if scope:
         digest.update(b"logical-input\0")
         digest.update(scope.encode("utf-8", errors="surrogatepass"))
         digest.update(b"\0")
+
     return ArchiveFingerprint(
         key=digest.hexdigest(),
         archive_path=normalized_archive,
-        part_paths=normalized_parts,
+        part_paths=tuple(path for path in normalized_sources if path != normalized_archive),
     )
