@@ -29,7 +29,8 @@ static CP437_TABLE: OnceLock<Vec<char>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ZipNameEntry {
-    raw_name: Vec<u8>,
+    name_start: usize,
+    name_end: usize,
     utf8_flag: bool,
     unicode_path: bool,
 }
@@ -37,6 +38,7 @@ struct ZipNameEntry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ZipNameScan {
     status: &'static str,
+    central: Vec<u8>,
     entries: Vec<ZipNameEntry>,
     truncated: bool,
 }
@@ -45,6 +47,7 @@ impl ZipNameScan {
     fn status(status: &'static str) -> Self {
         Self {
             status,
+            central: Vec::new(),
             entries: Vec::new(),
             truncated: false,
         }
@@ -308,12 +311,16 @@ fn analyze_zip_input(
         .filter(|entry| entry.unicode_path)
         .count();
     let authoritative_all = !scan.entries.is_empty()
-        && scan.entries.iter().all(has_authoritative_name);
-    let ascii_only = !scan.entries.is_empty()
         && scan
             .entries
             .iter()
-            .all(|entry| entry.raw_name.iter().all(|byte| *byte < 128));
+            .all(|entry| has_authoritative_name(entry, &scan.central));
+    let ascii_only = !scan.entries.is_empty()
+        && scan.entries.iter().all(|entry| {
+            scan.central[entry.name_start..entry.name_end]
+                .iter()
+                .all(|byte| *byte < 128)
+        });
 
     let mut result = ZipFilenameAnalysis {
         status: "ok",
@@ -342,8 +349,8 @@ fn analyze_zip_input(
     let unresolved = scan
         .entries
         .iter()
-        .filter(|entry| !has_authoritative_name(entry))
-        .map(|entry| entry.raw_name.as_slice())
+        .filter(|entry| !has_authoritative_name(entry, &scan.central))
+        .map(|entry| &scan.central[entry.name_start..entry.name_end])
         .collect::<Vec<_>>();
     let (selection, evidence, confidence) = select_codepage(&unresolved);
     result.selected_label = selection.kind.label();
@@ -391,6 +398,7 @@ fn scan_zip_names(
     if central_size == 0 && total_entries == 0 {
         return Ok(ZipNameScan {
             status: "ok",
+            central: Vec::new(),
             entries: Vec::new(),
             truncated: false,
         });
@@ -427,7 +435,7 @@ fn scan_zip_names(
     })?;
     let central = reader.read_at(central_logical_offset, read_size)?;
     Ok(collect_zip_names(
-        &central,
+        central,
         total_entries,
         max_samples,
         max_filename_bytes,
@@ -435,7 +443,7 @@ fn scan_zip_names(
 }
 
 fn collect_zip_names(
-    central: &[u8],
+    central: Vec<u8>,
     total_entries: usize,
     max_samples: usize,
     max_filename_bytes: usize,
@@ -451,7 +459,7 @@ fn collect_zip_names(
     let mut truncated = false;
 
     while entries.len() < expected_entries {
-        let Some(record) = super::parse_central_directory_record(central, offset, central.len()) else {
+        let Some(record) = super::parse_central_directory_record(&central, offset, central.len()) else {
             if offset
                 .checked_add(ZIP_CENTRAL_HEADER_LENGTH)
                 .is_some_and(|end| end <= central.len())
@@ -464,7 +472,8 @@ fn collect_zip_names(
 
         if !record.name.is_empty() {
             entries.push(ZipNameEntry {
-                raw_name: record.name.to_vec(),
+                name_start: record.offset + 46,
+                name_end: record.offset + 46 + record.name.len(),
                 utf8_flag: record.flags & ZIP_UTF8_FLAG != 0,
                 unicode_path: valid_unicode_path_name(record.name, record.extra),
             });
@@ -479,14 +488,15 @@ fn collect_zip_names(
 
     ZipNameScan {
         status: "ok",
+        central,
         entries,
         truncated,
     }
 }
 
-fn has_authoritative_name(entry: &ZipNameEntry) -> bool {
+fn has_authoritative_name(entry: &ZipNameEntry, central: &[u8]) -> bool {
     if entry.utf8_flag {
-        std::str::from_utf8(&entry.raw_name).is_ok()
+        std::str::from_utf8(&central[entry.name_start..entry.name_end]).is_ok()
     } else {
         entry.unicode_path
     }
@@ -843,7 +853,10 @@ mod tests {
 
         assert_eq!(scan.status, "ok");
         assert_eq!(scan.entries.len(), 1);
-        assert_eq!(scan.entries[0].raw_name, raw_name);
+        assert_eq!(
+            &scan.central[scan.entries[0].name_start..scan.entries[0].name_end],
+            raw_name
+        );
         assert!(scan.entries[0].utf8_flag);
         assert!(!scan.entries[0].unicode_path);
         assert!(!scan.truncated);
