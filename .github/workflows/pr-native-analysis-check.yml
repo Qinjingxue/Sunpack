@@ -37,9 +37,9 @@ jobs:
       - name: Run focused analysis tests
         shell: pwsh
         run: |
-          .\.venv\Scripts\python.exe -m pytest -q \`
-            tests\unit\test_native_multivolume_analysis.py \`
-            tests\unit\test_zip_multidisk_metadata.py \`
-            tests\unit\test_zip_analysis_capability.py \`
-            tests\unit\test_seven_zip_analysis_capability.py \`
+          .\.venv\Scripts\python.exe -m pytest -q `
+            tests\unit\test_native_multivolume_analysis.py `
+            tests\unit\test_zip_multidisk_metadata.py `
+            tests\unit\test_zip_analysis_capability.py `
+            tests\unit\test_seven_zip_analysis_capability.py `
             tests\unit\test_tar_probe_boundaries.py
