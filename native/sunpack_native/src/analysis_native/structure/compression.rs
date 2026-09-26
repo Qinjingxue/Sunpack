@@ -153,7 +153,7 @@ fn inspect_compression_stream_identity_impl(
     };
     let file_size = reader.len();
     let read_size = file_size.min(32) as usize;
-    let mut data = match reader.read_at(0, read_size) {
+    let mut data = match reader.read_cached_at(0, read_size) {
         Ok(value) => value,
         Err(_) => {
             return compression_identity_result(
@@ -167,7 +167,7 @@ fn inspect_compression_stream_identity_impl(
         && file_size > data.len() as u64
     {
         let expanded = file_size.min(IDENTITY_PROBE_MAX_BYTES) as usize;
-        data = match reader.read_at(0, expanded) {
+        data = match reader.read_cached_at(0, expanded) {
             Ok(value) => value,
             Err(_) => {
                 return compression_identity_result(
@@ -461,7 +461,7 @@ fn inspect_large_structural_stream(
         Ok(value) => value,
         Err(_) => return compression_empty(py, "os_error", format, ext, false),
     };
-    let head = reader.read_at(0, magic.len()).unwrap_or_default();
+    let head = reader.read_cached_at(0, magic.len()).unwrap_or_default();
     let magic_matched = head.starts_with(magic);
     let d = compression_base(py, format, ext, magic_matched)?;
     for field in fields {
