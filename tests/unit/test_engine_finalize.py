@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import contextlib
 
-import pytest
-
 import sunpack.pipeline.coordinator.engine as engine_module
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineResponse
 from sunpack.core.contracts.results import ArchiveCleanupResult, RunSummary
 
 
-def _recording(monkeypatch, barrier_calls, apply_calls):
+def _recording(monkeypatch, barrier_calls, apply_calls, shell_calls):
     @contextlib.contextmanager
     def recording_barrier(roots, **_kwargs):
         barrier_calls.append(tuple(roots))
@@ -25,68 +23,47 @@ def _recording(monkeypatch, barrier_calls, apply_calls):
 
     monkeypatch.setattr(engine_module, "promotion_barrier", recording_barrier)
     monkeypatch.setattr(engine_module, "PostProcessActions", RecordingActions)
-    monkeypatch.setattr(engine_module, "notify_shell_directories_updated", lambda _paths: None)
+    monkeypatch.setattr(
+        engine_module,
+        "notify_shell_directories_updated",
+        lambda paths: shell_calls.append(tuple(paths)),
+    )
 
 
-@pytest.mark.parametrize(
-    ("flatten_enabled", "expected_roots"),
-    [
-        (False, ()),
-        (True, ("output",)),
-    ],
-)
-def test_finalize_response_gates_only_flatten_targets(
-    tmp_path,
-    monkeypatch,
-    flatten_enabled,
-    expected_roots,
-):
-    """Source archives are removed per task, so finalize only gates flattening."""
-
-    output = tmp_path / "output"
+def test_finalize_response_is_aggregation_only(monkeypatch):
     response = PipelineResponse(
-        request_id="finalize-roots",
+        request_id="finalize",
         summary=RunSummary(),
-        artifacts=PipelineArtifacts(flatten_targets=(str(output),)),
+        artifacts=PipelineArtifacts(shell_refresh_paths=("output",)),
     )
-    barrier_calls: list[tuple[str, ...]] = []
-    apply_calls: list[dict] = []
-    _recording(monkeypatch, barrier_calls, apply_calls)
+    barrier_calls = []
+    apply_calls = []
+    shell_calls = []
+    _recording(monkeypatch, barrier_calls, apply_calls, shell_calls)
 
-    finalized = engine_module._finalize_response(
-        {"post_extract": {"archive_cleanup_mode": "recycle", "flatten_single_directory": flatten_enabled}},
-        response,
-    )
+    finalized = engine_module._finalize_response({}, response)
 
     assert finalized.summary.postprocess_completed is True
-    expected = tuple(str(tmp_path / name) for name in expected_roots)
-    assert barrier_calls == ([expected] if expected else [])
-    assert apply_calls == [
-        {
-            "archives_to_clean": [],
-            "flatten_targets": [str(output)] if flatten_enabled else [],
-            "previous_cleanup": None,
-        }
-    ]
+    assert barrier_calls == []
+    assert apply_calls == []
+    assert shell_calls == [("output",)]
 
 
 def test_finalize_response_retries_only_failed_cleanups(tmp_path, monkeypatch):
-    """The retry pass deletes the failed leftovers and never flattens."""
-
     archive = tmp_path / "archive.zip"
-    output = tmp_path / "output"
     failed = ArchiveCleanupResult(str(archive), "recycle", "failed", 1, 32, "sharing violation")
     response = PipelineResponse(
         request_id="finalize-retry",
-        summary=RunSummary(),
-        artifacts=PipelineArtifacts(flatten_targets=(str(output),)),
+        summary=RunSummary(cleanup_results=(failed,)),
+        artifacts=PipelineArtifacts(),
     )
-    barrier_calls: list[tuple[str, ...]] = []
-    apply_calls: list[dict] = []
-    _recording(monkeypatch, barrier_calls, apply_calls)
+    barrier_calls = []
+    apply_calls = []
+    shell_calls = []
+    _recording(monkeypatch, barrier_calls, apply_calls, shell_calls)
 
     finalized = engine_module._finalize_response(
-        {"post_extract": {"archive_cleanup_mode": "recycle", "flatten_single_directory": True}},
+        {"post_extract": {"archive_cleanup_mode": "recycle"}},
         response,
         retry_results=[failed],
     )
@@ -100,3 +77,4 @@ def test_finalize_response_retries_only_failed_cleanups(tmp_path, monkeypatch):
             "previous_cleanup": {engine_module.path_key(str(archive)): failed},
         }
     ]
+    assert shell_calls == [()]
