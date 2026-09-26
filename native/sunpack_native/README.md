@@ -101,19 +101,25 @@ Return value:
 [{"detected_ext": ".zip", "offset": 123, "scan_scope": ""}]
 ```
 
-`analyze_zip_filename_encoding(path, max_samples, max_filename_bytes)`
-reads ZIP central-directory metadata and returns raw filename samples for
-encoding detection. ZIP64 central directory parsing is intentionally not handled
-here; Python reports the unsupported status instead of reparsing it.
+`analyze_zip_filename_encoding(archive_input, max_samples, max_filename_bytes)`
+consumes the canonical serialized archive-input descriptor, reads the logical ZIP
+central directory across file ranges or multipart inputs, and performs filename
+codepage scoring plus strict decoding entirely in Rust. Heavy work runs without
+the Python GIL. Python receives only the selected override, compact score
+evidence, and decoded item names when an override is actually required. ZIP64
+central-directory parsing is intentionally not handled here.
 
 Return value:
 
 ```python
 {
     "status": "ok",
-    "raw_names": [b"name.txt"],
-    "utf8_flags": [true],
-    "unicode_path_names": [None],
+    "sample_count": 12,
+    "selected_codepage": "932",
+    "selected_label": "Shift-JIS/CP932",
+    "confidence": 0.833,
+    "decoded_names": ["日本語/説明.txt"],
+    "evidence": {"best_score": 42, "second_score": 18, "lead": 24},
     "truncated": False,
 }
 ```
