@@ -144,7 +144,6 @@ class NestedOutputScanPolicy:
             inventory is None
             or not inventory.stats.exists
             or not inventory.stats.is_dir
-            or not inventory.worker_inventory_complete
         ):
             return None
         scan_session.prime_output_inventory(inventory)
