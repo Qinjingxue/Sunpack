@@ -33,7 +33,7 @@ fn sfx_stub_profile_native(path: &str, executable_image_end: u64) -> io::Result<
     if probe_size == 0 {
         return Ok(String::new());
     }
-    let image = reader.read_at(0, probe_size as usize)?;
+    let image = reader.read_cached_at(0, probe_size as usize)?;
 
     if contains_any(&image, SEVEN_ZIP_SFX_MARKERS) {
         return Ok("seven_zip_sfx".to_owned());
