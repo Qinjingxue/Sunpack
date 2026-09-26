@@ -103,7 +103,10 @@ def test_promotion_batches_cache_releasers_across_roots(tmp_path):
         pass
 
     assert len(calls) == 1
-    assert set(calls[0]) == {\n        os.path.normcase(os.path.abspath(first)),\n        os.path.normcase(os.path.abspath(second)),\n    }
+    assert set(calls[0]) == {
+        os.path.normcase(os.path.abspath(first)),
+        os.path.normcase(os.path.abspath(second)),
+    }
     assert report.cache_reports == [{"roots": calls[0]}]
 
 
