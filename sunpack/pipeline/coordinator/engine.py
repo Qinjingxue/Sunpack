@@ -1086,7 +1086,7 @@ class _RequestRuntime:
                 reservation_registry=self.services.output_reservations,
                 owner=self.submission.request_id,
             )
-            task, outcome, output_dir = await self.job_executor.execute_async(
+            task, outcome, result = await self.job_executor.execute_async(
                 task,
                 depth=depth,
                 output_dir_resolver=output_dir_resolver,
@@ -1094,6 +1094,12 @@ class _RequestRuntime:
                 cancellation=cancellation,
                 missing_volume_retry=self._resolve_missing_volume_once,
                 ensure_input_lease=self._ensure_task_lease,
+            )
+            ownership.remember_results([result])
+            output_dir = (
+                result.output_dir
+                if result.outcome_kind != OutcomeKind.FAILURE
+                else ""
             )
 
             cleanup_request = self.source_cleanup.release_task(
