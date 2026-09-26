@@ -40,6 +40,7 @@ class CandidateGroup:
     input_paths: List[str]
     is_split_candidate: bool = False
     head_size: int | None = None
+    logical_size: int | None = None
     split_volumes: List[SplitVolumeEntry] = None
     head_metadata: Dict[str, Any] | None = None
     # Launcher-only SFX files are related to a split archive, but are not
