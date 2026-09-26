@@ -1604,7 +1604,6 @@ class WatchScheduler:
             else getattr(target_result, "output_dir", "")
         ) if target_result is not None else ""
         generated_output_dirs = dedupe_normalized_paths([
-            *response.artifacts.flatten_targets,
             *getattr(response.artifacts, "shell_refresh_paths", ()),
             *(
                 str(item.get("out_dir") or "")
