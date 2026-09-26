@@ -27,10 +27,9 @@ def probe_seven_zip_view(view, options: SevenZipProbeOptions | None = None) -> F
         start_offset=start,
         max_next_header_check_bytes=int(options.max_next_header_check_bytes),
     ) or {})
-    header = view.read_at(start, 32)
     magic_matched = bool(raw.get("magic_matched"))
-    version_major = header[6] if len(header) >= 8 and magic_matched else 0
-    version_minor = header[7] if len(header) >= 8 and magic_matched else 0
+    version_major = int(raw.get("version_major") or 0)
+    version_minor = int(raw.get("version_minor") or 0)
     raw.update({
         "format": "7z" if magic_matched else str(raw.get("format") or "7z"),
         "detected_ext": ".7z" if magic_matched else "",
