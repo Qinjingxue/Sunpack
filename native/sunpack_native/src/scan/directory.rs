@@ -484,32 +484,68 @@ impl NativeOutputInventory {
             .into_iter()
             .map(|path| inventory_path_key(&path))
             .collect();
-        let root = Path::new(&self.root);
-        let mut rows = Vec::with_capacity(requested.len().min(self.files.len()));
-        for item in self.files.iter() {
-            let path = item.abs_path.clone().unwrap_or_else(|| {
-                let relative = item.output_path.as_ref().unwrap_or(&item.path);
-                path_to_string(&root.join(relative))
-            });
-            if !requested.contains(&inventory_path_key(&path)) {
-                continue;
+        let root = PathBuf::from(&self.root);
+        let files = Arc::clone(&self.files);
+        let facts = py.detach(move || {
+            let mut facts = Vec::with_capacity(requested.len().min(files.len()));
+            for item in files.iter() {
+                let path = item.abs_path.clone().unwrap_or_else(|| {
+                    let relative = item.output_path.as_ref().unwrap_or(&item.path);
+                    path_to_string(&root.join(relative))
+                });
+                if !requested.contains(&inventory_path_key(&path)) {
+                    continue;
+                }
+
+                let stored_magic_complete =
+                    item.magic.len() >= magic_size || item.size <= item.magic.len() as u64;
+                if stored_magic_complete {
+                    let magic_len = magic_size.min(item.magic.len());
+                    facts.push((
+                        path,
+                        true,
+                        true,
+                        Some(item.size),
+                        item.mtime_ns,
+                        item.magic[..magic_len].to_vec(),
+                        true,
+                    ));
+                } else {
+                    let fact = file_head_record(path, magic_size);
+                    let magic_complete = !fact.exists
+                        || !fact.is_file
+                        || fact.magic.len() >= magic_size
+                        || fact
+                            .size
+                            .is_some_and(|size| size <= fact.magic.len() as u64);
+                    facts.push((
+                        fact.path,
+                        fact.exists,
+                        fact.is_file,
+                        fact.size,
+                        fact.mtime_ns,
+                        fact.magic,
+                        magic_complete,
+                    ));
+                }
+                if facts.len() == requested.len() {
+                    break;
+                }
             }
+            facts
+        });
+
+        let mut rows = Vec::with_capacity(facts.len());
+        for (path, exists, is_file, size, mtime_ns, magic, magic_complete) in facts {
             let row = PyDict::new(py);
-            row.set_item("path", &path)?;
-            row.set_item("exists", true)?;
-            row.set_item("is_file", true)?;
-            row.set_item("size", item.size)?;
-            row.set_item("mtime_ns", item.mtime_ns)?;
-            let magic_len = magic_size.min(item.magic.len());
-            row.set_item("magic", PyBytes::new(py, &item.magic[..magic_len]))?;
-            row.set_item(
-                "magic_complete",
-                item.magic.len() >= magic_size || item.size <= item.magic.len() as u64,
-            )?;
+            row.set_item("path", path)?;
+            row.set_item("exists", exists)?;
+            row.set_item("is_file", is_file)?;
+            row.set_item("size", size)?;
+            row.set_item("mtime_ns", mtime_ns)?;
+            row.set_item("magic", PyBytes::new(py, &magic))?;
+            row.set_item("magic_complete", magic_complete)?;
             rows.push(row.unbind());
-            if rows.len() == requested.len() {
-                break;
-            }
         }
         Ok(rows)
     }
