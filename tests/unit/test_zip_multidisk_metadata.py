@@ -1,6 +1,6 @@
 import struct
 
-from sunpack.core.analysis.view import MultiVolumeBinaryView, _probe_zip_view
+from sunpack.core.analysis.view import MultiVolumeBinaryView
 
 
 def _local(name=b"a"):
@@ -27,7 +27,7 @@ def test_zip_probe_maps_spanned_disk_relative_offsets(tmp_path):
         {"path": str(last), "number": 2, "style": "zip_spanned"},
     ])
 
-    result = _probe_zip_view(view, len(_local()) + len(central), 32)
+    result = view.probe_zip(eocd_offset=len(_local()) + len(central), max_cd_entries_to_walk=32)
 
     assert result["error"] == ""
     assert result["plausible"] is True
@@ -64,7 +64,7 @@ def test_zip_probe_resolves_zip64_tail_and_central_extra_across_raw_splits(tmp_p
         {"path": str(second), "number": 2, "style": "zip_zero_numbered"},
     ])
 
-    result = _probe_zip_view(view, len(archive) - len(eocd), 32)
+    result = view.probe_zip(eocd_offset=len(archive) - len(eocd), max_cd_entries_to_walk=32)
 
     assert result["error"] == ""
     assert result["plausible"] is True
