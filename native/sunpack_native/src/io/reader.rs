@@ -1379,16 +1379,20 @@ impl CacheShard {
 
     fn compact_stale_orders(&mut self) {
         if self.hot_stale >= CACHE_ORDER_COMPACT_STALE_MIN {
-            self.hot_order.retain(|(key, generation)| {
-                self.entries
+            let entries = &self.entries;
+            let order = &mut self.hot_order;
+            order.retain(|(key, generation)| {
+                entries
                     .get(key)
                     .is_some_and(|entry| entry.generation == *generation)
             });
             self.hot_stale = 0;
         }
         if self.general_stale >= CACHE_ORDER_COMPACT_STALE_MIN {
-            self.general_order.retain(|(key, generation)| {
-                self.entries
+            let entries = &self.entries;
+            let order = &mut self.general_order;
+            order.retain(|(key, generation)| {
+                entries
                     .get(key)
                     .is_some_and(|entry| entry.generation == *generation)
             });
@@ -2330,6 +2334,61 @@ mod tests {
 
         drop(reader);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn batched_release_removes_only_indexed_file_identities() {
+        let first_path = temp_file("managed_reader_release_first", b"abcdefgh");
+        let second_path = temp_file("managed_reader_release_second", b"ijklmnop");
+        let other_path = temp_file("managed_reader_release_other", b"qrstuvwx");
+
+        let first = manager().open_file(&first_path).unwrap();
+        let second = manager().open_file(&second_path).unwrap();
+        let other = manager().open_file(&other_path).unwrap();
+        assert_eq!(first.read_at(0, 8).unwrap(), b"abcdefgh");
+        assert_eq!(second.read_at(0, 8).unwrap(), b"ijklmnop");
+        assert_eq!(other.read_at(0, 8).unwrap(), b"qrstuvwx");
+
+        let first_key = BlockKey {
+            identity: first.identity.clone(),
+            index: 0,
+        };
+        let second_key = BlockKey {
+            identity: second.identity.clone(),
+            index: 0,
+        };
+        let other_key = BlockKey {
+            identity: other.identity.clone(),
+            index: 0,
+        };
+        assert!(manager().contains_block(&first_key).unwrap());
+        assert!(manager().contains_block(&second_key).unwrap());
+        assert!(manager().contains_block(&other_key).unwrap());
+
+        let roots = vec![
+            std::fs::canonicalize(&first_path).unwrap_or_else(|_| first_path.clone()),
+            std::fs::canonicalize(&second_path).unwrap_or_else(|_| second_path.clone()),
+        ];
+        let (handles, entries, bytes) = manager()
+            .release_resources_under_roots(&roots)
+            .unwrap();
+
+        assert_eq!(handles, 2);
+        assert_eq!(entries, 2);
+        assert_eq!(bytes, 16);
+        assert!(!manager().contains_block(&first_key).unwrap());
+        assert!(!manager().contains_block(&second_key).unwrap());
+        assert!(manager().contains_block(&other_key).unwrap());
+        assert_eq!(other.read_at(0, 8).unwrap(), b"qrstuvwx");
+
+        let other_root =
+            std::fs::canonicalize(&other_path).unwrap_or_else(|_| other_path.clone());
+        manager()
+            .release_resources_under_roots(&[other_root])
+            .unwrap();
+        let _ = std::fs::remove_file(first_path);
+        let _ = std::fs::remove_file(second_path);
+        let _ = std::fs::remove_file(other_path);
     }
 
     #[test]
