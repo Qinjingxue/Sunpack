@@ -429,32 +429,36 @@ impl NativeOutputInventory {
         if paths.is_empty() || self.files.is_empty() {
             return Ok(Vec::new());
         }
+        let requested: HashSet<String> = paths
+            .into_iter()
+            .map(|path| inventory_path_key(&path))
+            .collect();
         let root = Path::new(&self.root);
-        let mut rows_by_path = HashMap::with_capacity(self.files.len());
-        for (index, item) in self.files.iter().enumerate() {
+        let mut rows = Vec::with_capacity(requested.len().min(self.files.len()));
+        for item in self.files.iter() {
             let path = item.abs_path.clone().unwrap_or_else(|| {
                 let relative = item.output_path.as_ref().unwrap_or(&item.path);
                 path_to_string(&root.join(relative))
             });
-            rows_by_path.insert(inventory_path_key(&path), (index, path));
-        }
-
-        let mut rows = Vec::with_capacity(paths.len().min(self.files.len()));
-        for requested in paths {
-            let Some((index, path)) = rows_by_path.get(&inventory_path_key(&requested)) else {
+            if !requested.contains(&inventory_path_key(&path)) {
                 continue;
-            };
-            let item = &self.files[*index];
+            }
             let row = PyDict::new(py);
-            row.set_item("path", path)?;
+            row.set_item("path", &path)?;
             row.set_item("exists", true)?;
             row.set_item("is_file", true)?;
             row.set_item("size", item.size)?;
             row.set_item("mtime_ns", item.mtime_ns)?;
             let magic_len = magic_size.min(item.magic.len());
             row.set_item("magic", PyBytes::new(py, &item.magic[..magic_len]))?;
-            row.set_item("magic_complete", item.magic.len() >= magic_size)?;
+            row.set_item(
+                "magic_complete",
+                item.magic.len() >= magic_size || item.size <= item.magic.len() as u64,
+            )?;
             rows.push(row.unbind());
+            if rows.len() == requested.len() {
+                break;
+            }
         }
         Ok(rows)
     }
