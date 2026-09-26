@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import asyncio
 import os
+import stat
 import time
 import uuid
 from dataclasses import dataclass, replace
@@ -282,23 +283,140 @@ class _CoalescedWatchRequest(RuntimeError):
         self.owner_request_id = owner_request_id
 
 
+@dataclass(frozen=True, slots=True)
+class _LeasePath:
+    path: str
+    key: str
+    resolved_key: str
+    ancestor_keys: tuple[str, ...]
+    is_dir: bool
+    version_row: tuple[str, int, int, int, int] | None
+
+
+def _snapshot_lease_path(path: str) -> _LeasePath:
+    normalized = os.path.abspath(os.path.normpath(path))
+    key = path_key(normalized)
+    try:
+        stat_result = os.stat(normalized)
+    except OSError:
+        stat_result = None
+
+    is_dir = bool(stat_result is not None and stat.S_ISDIR(stat_result.st_mode))
+    version_row = (
+        (
+            key,
+            int(stat_result.st_dev),
+            int(stat_result.st_ino),
+            int(stat_result.st_size),
+            int(stat_result.st_mtime_ns),
+        )
+        if stat_result is not None
+        else None
+    )
+
+    try:
+        resolved = Path(normalized).resolve()
+    except (OSError, ValueError):
+        resolved_key = ""
+        ancestor_keys = ()
+    else:
+        resolved_key = path_key(str(resolved))
+        ancestor_keys = tuple(path_key(str(parent)) for parent in resolved.parents)
+
+    return _LeasePath(
+        path=normalized,
+        key=key,
+        resolved_key=resolved_key,
+        ancestor_keys=ancestor_keys,
+        is_dir=is_dir,
+        version_row=version_row,
+    )
+
+
+def _lease_ownership_version(
+    paths: Iterable[_LeasePath],
+) -> tuple[tuple[str, int, int, int, int], ...]:
+    rows = []
+    for path in paths:
+        if path.version_row is None:
+            return ()
+        rows.append(path.version_row)
+    rows.sort(key=lambda row: row[0])
+    return tuple(rows)
+
+
 class _PathLeaseRegistry:
     _COMPLETED_WATCH_LIMIT = 4096
 
     def __init__(self):
         self._owned: dict[str, set[str]] = {}
+        self._lease_paths: dict[str, dict[str, _LeasePath]] = {}
+        self._exact_owners: dict[str, str] = {}
+        self._entries_by_key: dict[str, _LeasePath] = {}
+        self._directory_owners: dict[str, set[str]] = {}
+        self._prefix_owners: dict[str, set[str]] = {}
         self._ownership_versions: dict[str, tuple[tuple[str, int, int, int, int], ...]] = {}
+        self._generation_owners: dict[
+            tuple[tuple[str, int, int, int, int], ...],
+            str,
+        ] = {}
         self._completed_watch_generations: dict[
             tuple[str, ...],
             tuple[tuple[tuple[str, int, int, int, int], ...], str],
         ] = {}
-        self._changed = asyncio.Condition()
+        self._waiters_by_blocker: dict[str, set[asyncio.Future[None]]] = {}
+        self._waiter_blockers: dict[
+            asyncio.Future[None],
+            frozenset[str],
+        ] = {}
+        self._lock = asyncio.Lock()
+
+    def _snapshot_paths(
+        self,
+        paths: Iterable[str],
+        *,
+        refresh: bool,
+    ) -> tuple[_LeasePath, ...]:
+        prepared: dict[str, _LeasePath] = {}
+        for raw_path in paths:
+            if not raw_path:
+                continue
+            normalized = os.path.abspath(os.path.normpath(raw_path))
+            key = path_key(normalized)
+            if key in prepared:
+                continue
+            existing = self._entries_by_key.get(key)
+            if existing is not None and not refresh:
+                if existing.path == normalized:
+                    prepared[key] = existing
+                else:
+                    prepared[key] = _LeasePath(
+                        path=normalized,
+                        key=key,
+                        resolved_key=existing.resolved_key,
+                        ancestor_keys=existing.ancestor_keys,
+                        is_dir=existing.is_dir,
+                        version_row=existing.version_row,
+                    )
+                continue
+            prepared[key] = _snapshot_lease_path(normalized)
+        return tuple(prepared.values())
 
     async def acquire(self, owner: str, paths: Iterable[str]) -> None:
-        normalized = {os.path.abspath(os.path.normpath(path)) for path in paths if path}
-        async with self._changed:
-            await self._changed.wait_for(lambda: not self._conflicts(owner, normalized))
-            self._owned.setdefault(owner, set()).update(normalized)
+        prepared = self._snapshot_paths(paths, refresh=False)
+        while True:
+            async with self._lock:
+                blockers = self._blocking_owners(owner, prepared)
+                if not blockers:
+                    self._claim(owner, prepared)
+                    return
+                waiter = self._register_waiter(blockers)
+            try:
+                await waiter
+            except BaseException:
+                async with self._lock:
+                    self._unregister_waiter(waiter)
+                raise
 
     async def replace(
         self,
@@ -319,30 +437,42 @@ class _PathLeaseRegistry:
         physical ownership, the later request can coalesce with the active one
         instead of waiting and extracting the same logical archive twice.
         """
-        normalized = {os.path.abspath(os.path.normpath(path)) for path in paths if path}
-        ownership_version = _physical_ownership_version(normalized) if coalesce_exact else ()
-        async with self._changed:
-            previous = self._owned.pop(owner, None)
-            self._ownership_versions.pop(owner, None)
-            if previous is not None:
-                self._changed.notify_all()
-            if coalesce_exact:
-                exact_owner = self._exact_owner(owner, normalized, ownership_version)
-                if exact_owner:
-                    return exact_owner
-            await self._changed.wait_for(lambda: not self._conflicts(owner, normalized))
-            self._owned[owner] = normalized
-            if coalesce_exact:
-                self._ownership_versions[owner] = ownership_version
-            self._changed.notify_all()
-            return None
+        prepared = self._snapshot_paths(paths, refresh=coalesce_exact)
+        ownership_version = _lease_ownership_version(prepared) if coalesce_exact else ()
+        release_previous = True
+
+        while True:
+            async with self._lock:
+                if release_previous:
+                    release_previous = False
+                    if self._remove_owner(owner):
+                        self._wake_waiters_for(owner)
+
+                if coalesce_exact:
+                    exact_owner = self._generation_owners.get(ownership_version, "")
+                    if exact_owner and exact_owner != owner:
+                        return exact_owner
+
+                blockers = self._blocking_owners(owner, prepared)
+                if not blockers:
+                    self._claim(
+                        owner,
+                        prepared,
+                        ownership_version=ownership_version,
+                    )
+                    return None
+                waiter = self._register_waiter(blockers)
+            try:
+                await waiter
+            except BaseException:
+                async with self._lock:
+                    self._unregister_waiter(waiter)
+                raise
 
     async def release(self, owner: str) -> None:
-        async with self._changed:
-            released = self._owned.pop(owner, None)
-            self._ownership_versions.pop(owner, None)
-            if released is not None:
-                self._changed.notify_all()
+        async with self._lock:
+            if self._remove_owner(owner):
+                self._wake_waiters_for(owner)
 
     def ownership_version_for(
         self,
@@ -398,67 +528,114 @@ class _PathLeaseRegistry:
             oldest = next(iter(self._completed_watch_generations))
             self._completed_watch_generations.pop(oldest, None)
 
-    def _exact_owner(
+    def _blocking_owners(
         self,
         owner: str,
-        candidates: set[str],
-        ownership_version: tuple[tuple[str, int, int, int, int], ...],
-    ) -> str:
-        if not candidates or not ownership_version:
-            return ""
-        candidate_keys = {path_key(path) for path in candidates}
-        for current_owner, current_paths in self._owned.items():
-            if current_owner == owner:
+        candidates: Iterable[_LeasePath],
+    ) -> set[str]:
+        blockers: set[str] = set()
+        for candidate in candidates:
+            exact_owner = self._exact_owners.get(candidate.key)
+            if exact_owner:
+                blockers.add(exact_owner)
+
+            if not candidate.resolved_key:
                 continue
-            if (
-                {path_key(path) for path in current_paths} == candidate_keys
-                and self._ownership_versions.get(current_owner) == ownership_version
-            ):
-                return current_owner
-        return ""
 
-    def _conflicts(self, owner: str, candidates: set[str]) -> bool:
-        for current_owner, current_paths in self._owned.items():
-            if current_owner == owner:
+            for prefix in (candidate.resolved_key, *candidate.ancestor_keys):
+                blockers.update(self._directory_owners.get(prefix, ()))
+
+            if candidate.is_dir:
+                blockers.update(self._prefix_owners.get(candidate.resolved_key, ()))
+
+        blockers.discard(owner)
+        return blockers
+
+    def _claim(
+        self,
+        owner: str,
+        paths: Iterable[_LeasePath],
+        *,
+        ownership_version: tuple[tuple[str, int, int, int, int], ...] = (),
+    ) -> None:
+        owner_paths = self._lease_paths.setdefault(owner, {})
+        owned = self._owned.setdefault(owner, set())
+        for path in paths:
+            if path.key in owner_paths:
                 continue
-            for candidate in candidates:
-                for current in current_paths:
-                    if path_key(candidate) == path_key(current):
-                        return True
-                    if os.path.isdir(candidate) and _is_relative_to(current, candidate):
-                        return True
-                    if os.path.isdir(current) and _is_relative_to(candidate, current):
-                        return True
-        return False
+            owner_paths[path.key] = path
+            owned.add(path.path)
+            self._exact_owners[path.key] = owner
+            self._entries_by_key[path.key] = path
 
+            if path.resolved_key:
+                if path.is_dir:
+                    self._directory_owners.setdefault(path.resolved_key, set()).add(owner)
+                for prefix in (path.resolved_key, *path.ancestor_keys):
+                    self._prefix_owners.setdefault(prefix, set()).add(owner)
 
+        if ownership_version:
+            self._ownership_versions[owner] = ownership_version
+            self._generation_owners[ownership_version] = owner
 
-def _physical_ownership_version(
-    paths: Iterable[str],
-) -> tuple[tuple[str, int, int, int, int], ...]:
-    """Cheap byte-version identity for Watch request coalescing.
+    def _remove_owner(self, owner: str) -> bool:
+        paths = self._lease_paths.pop(owner, {})
+        owned = self._owned.pop(owner, None)
+        ownership_version = self._ownership_versions.pop(owner, ())
+        if (
+            ownership_version
+            and self._generation_owners.get(ownership_version) == owner
+        ):
+            self._generation_owners.pop(ownership_version, None)
 
-    Paths alone are insufficient: a volume may receive new bytes while an
-    earlier request is still active. Size/mtime plus filesystem identity keeps
-    same-version duplicate events cheap without swallowing a newer arrival.
-    """
+        for path in paths.values():
+            if self._exact_owners.get(path.key) == owner:
+                self._exact_owners.pop(path.key, None)
+                self._entries_by_key.pop(path.key, None)
 
-    rows = []
-    for raw_path in paths:
-        normalized = os.path.abspath(os.path.normpath(raw_path))
-        try:
-            stat = os.stat(normalized)
-        except OSError:
-            return ()
-        rows.append((
-            path_key(normalized),
-            int(stat.st_dev),
-            int(stat.st_ino),
-            int(stat.st_size),
-            int(stat.st_mtime_ns),
-        ))
-    rows.sort(key=lambda row: row[0])
-    return tuple(rows)
+            if path.resolved_key:
+                if path.is_dir:
+                    directory_owners = self._directory_owners.get(path.resolved_key)
+                    if directory_owners is not None:
+                        directory_owners.discard(owner)
+                        if not directory_owners:
+                            self._directory_owners.pop(path.resolved_key, None)
+
+                for prefix in (path.resolved_key, *path.ancestor_keys):
+                    prefix_owners = self._prefix_owners.get(prefix)
+                    if prefix_owners is None:
+                        continue
+                    prefix_owners.discard(owner)
+                    if not prefix_owners:
+                        self._prefix_owners.pop(prefix, None)
+
+        return owned is not None or bool(paths) or bool(ownership_version)
+
+    def _register_waiter(self, blockers: set[str]) -> asyncio.Future[None]:
+        waiter = asyncio.get_running_loop().create_future()
+        frozen = frozenset(blockers)
+        self._waiter_blockers[waiter] = frozen
+        for blocker in frozen:
+            self._waiters_by_blocker.setdefault(blocker, set()).add(waiter)
+        return waiter
+
+    def _unregister_waiter(self, waiter: asyncio.Future[None]) -> None:
+        blockers = self._waiter_blockers.pop(waiter, ())
+        for blocker in blockers:
+            waiters = self._waiters_by_blocker.get(blocker)
+            if waiters is None:
+                continue
+            waiters.discard(waiter)
+            if not waiters:
+                self._waiters_by_blocker.pop(blocker, None)
+
+    def _wake_waiters_for(self, blocker: str) -> None:
+        waiters = tuple(self._waiters_by_blocker.get(blocker, ()))
+        for waiter in waiters:
+            self._unregister_waiter(waiter)
+            if not waiter.done():
+                waiter.set_result(None)
+
 
 def _replace_mapping_in_place(target: dict, source: dict) -> None:
     for key in tuple(target):
