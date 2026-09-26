@@ -341,7 +341,7 @@ def test_failed_cleanup_is_bounded_and_repeat_commit_is_idempotent(tmp_path, mon
 
 
 def test_pipeline_artifacts_public_schema_is_stable():
-    assert set(asdict(PipelineArtifacts()).keys()) == {'flatten_targets', 'shell_refresh_paths'}
+    assert set(asdict(PipelineArtifacts()).keys()) == {'shell_refresh_paths'}
 
 
 def test_retry_only_touches_the_failed_leftovers(tmp_path, monkeypatch):
