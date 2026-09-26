@@ -101,26 +101,29 @@ Return value:
 [{"detected_ext": ".zip", "offset": 123, "scan_scope": ""}]
 ```
 
-`scan_zip_central_directory_names(path, max_samples, max_filename_bytes)`
-reads ZIP central-directory metadata and returns raw filename samples for
-encoding detection. ZIP64 central directory parsing is intentionally not handled
-here; Python reports the unsupported status instead of reparsing it.
+`analyze_zip_filename_encoding(archive_input, max_samples, max_filename_bytes)`
+consumes the canonical serialized archive-input descriptor, reads the logical ZIP
+central directory across file ranges or multipart inputs, and performs filename
+codepage scoring entirely in Rust. Heavy work runs without the Python GIL.
+Python receives only the selected codepage and compact score evidence; item
+names never cross the Rust/Python boundary. Extraction applies the selected
+codepage directly to the embedded 7-Zip ZIP handler. ZIP64 central-directory
+parsing is intentionally not handled here.
 
 Return value:
 
 ```python
 {
     "status": "ok",
-    "raw_names": [b"name.txt"],
-    "utf8_flags": [true],
-    "unicode_path_names": [None],
+    "sample_count": 12,
+    "selected_codepage": "932",
+    "selected_label": "Shift-JIS/CP932",
+    "confidence": 0.833,
+    "evidence": {"best_score": 42, "second_score": 18, "lead": 24},
     "truncated": False,
 }
 ```
 
-`unicode_path_names` 与 `raw_names` 一一对应；元素仅在中央目录中的
-Info-ZIP Unicode Path Extra Field (`0x7075`) 版本、原始文件名 CRC32 和
-UTF-8 载荷均校验成功时返回 `bytes`，否则为 `None`。
 
 The module also exposes lightweight structure inspectors used by the detection
 pipeline:

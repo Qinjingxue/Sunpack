@@ -203,6 +203,46 @@ namespace sunpack::sevenzip
             return count;
         }
 
+        HRESULT apply_zip_codepage(IInArchive *archive, const std::wstring &codepage)
+        {
+            if (!archive || codepage.empty())
+            {
+                return codepage.empty() ? S_OK : E_POINTER;
+            }
+
+            UInt32 parsed = 0;
+            for (const wchar_t ch : codepage)
+            {
+                if (ch < L'0' || ch > L'9')
+                {
+                    return E_INVALIDARG;
+                }
+                const UInt32 digit = static_cast<UInt32>(ch - L'0');
+                if (parsed > (0xFFFFFFFFu - digit) / 10u)
+                {
+                    return E_INVALIDARG;
+                }
+                parsed = parsed * 10u + digit;
+            }
+            if (parsed == 0)
+            {
+                return E_INVALIDARG;
+            }
+
+            CMyComPtr<ISetProperties> properties;
+            HRESULT hr = archive->QueryInterface(IID_ISetProperties, (void **)&properties);
+            if (hr != S_OK || !properties)
+            {
+                return hr == S_OK ? E_NOINTERFACE : hr;
+            }
+
+            const wchar_t *names[] = {L"cp"};
+            PROPVARIANT value{};
+            value.vt = VT_UI4;
+            value.ulVal = parsed;
+            return properties->SetProperties(names, &value, 1);
+        }
+
     } // namespace
 
     ExtractArchiveResult extract_archive_internal(
@@ -221,8 +261,6 @@ namespace sunpack::sevenzip
         const std::wstring &output_dir,
 
         const std::wstring &codepage,
-
-        const std::vector<std::wstring> &decoded_names,
 
         ExtractProgressCallback progress,
 
@@ -382,6 +420,21 @@ namespace sunpack::sevenzip
 
             any_format_created = true;
 
+            if (!codepage.empty() && attempt.format == L"zip")
+            {
+                hr = apply_zip_codepage(archive.Interface(), codepage);
+                if (hr != S_OK)
+                {
+                    result.status = PasswordTestStatus::Error;
+                    set_failure(result, "filename_encoding", "codepage_apply_failed", hr);
+                    result.message = "ZIP filename codepage could not be applied to the archive handler";
+                    result.handler_attempts.push_back(attempt);
+                    return result;
+                }
+                result.applied_codepage = codepage;
+                result.filename_decoder = L"sevenzip_zip_codepage";
+            }
+
             bool stream_opened = false;
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
@@ -525,27 +578,6 @@ namespace sunpack::sevenzip
                 result.output_trace.items.reserve(num_items);
             }
 
-            if (!codepage.empty())
-            {
-                if (decoded_names.size() != num_items)
-                {
-#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-                    {
-                        PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveClose);
-                        archive->Close();
-                    }
-#else
-                    archive->Close();
-#endif
-                    result.status = PasswordTestStatus::Error;
-                    set_failure(result, "filename_encoding", "decoded_name_count_mismatch");
-                    result.message = "decoded ZIP filename count does not match archive item count";
-                    return result;
-                }
-                result.applied_codepage = codepage;
-                result.filename_decoder = L"sunpack_zip_raw_names";
-            }
-
             result.archive_type = !format_hint.empty() ? format_hint : archive_type_for_path(archive_path);
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
@@ -556,7 +588,6 @@ namespace sunpack::sevenzip
                 archive.Interface(),
                 password,
                 output_dir,
-                decoded_names,
                 std::move(progress),
                 dry_run,
                 &result.output_trace,
@@ -572,7 +603,6 @@ namespace sunpack::sevenzip
                 archive.Interface(),
                 password,
                 output_dir,
-                decoded_names,
                 std::move(progress),
                 dry_run,
                 &result.output_trace,
@@ -874,8 +904,6 @@ namespace sunpack::sevenzip
 
         const std::wstring &codepage,
 
-        const std::vector<std::wstring> &decoded_names,
-
         ExtractProgressCallback progress,
 
         bool dry_run,
@@ -917,7 +945,6 @@ namespace sunpack::sevenzip
 
             codepage,
 
-            decoded_names,
 
             std::move(progress),
 
@@ -944,7 +971,6 @@ namespace sunpack::sevenzip
 
         (void)codepage;
 
-        (void)decoded_names;
 
         (void)progress;
 
@@ -980,8 +1006,6 @@ namespace sunpack::sevenzip
 
         const std::wstring &codepage,
 
-        const std::vector<std::wstring> &decoded_names,
-
         ExtractProgressCallback progress,
 
         bool dry_run,
@@ -1015,7 +1039,6 @@ namespace sunpack::sevenzip
 
             codepage,
 
-            decoded_names,
 
             std::move(progress),
 
@@ -1041,7 +1064,6 @@ namespace sunpack::sevenzip
 
         (void)codepage;
 
-        (void)decoded_names;
 
         (void)progress;
 

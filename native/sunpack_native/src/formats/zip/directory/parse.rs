@@ -95,21 +95,67 @@ fn resolve_central_directory(data: &[u8], eocd: &EocdInfo) -> ResolvedCentralDir
     }
 }
 
+struct CentralDirectoryRecord<'a> {
+    offset: usize,
+    end: usize,
+    flags: u16,
+    method: u16,
+    crc32: u32,
+    compressed_size: u32,
+    uncompressed_size: u32,
+    name_len: u16,
+    extra_len: u16,
+    name: &'a [u8],
+    extra: &'a [u8],
+    extra_offset: usize,
+    disk_number_start: u16,
+    local_header_offset: u32,
+}
+
+fn parse_central_directory_record(
+    data: &[u8],
+    offset: usize,
+    expected_end: usize,
+) -> Option<CentralDirectoryRecord<'_>> {
+    if offset >= expected_end
+        || offset.checked_add(46)? > data.len()
+        || data.get(offset..offset + 4) != Some(CD_SIG)
+    {
+        return None;
+    }
+    let name_len = u16_le(data, offset + 28);
+    let extra_len = u16_le(data, offset + 30);
+    let comment_len = u16_le(data, offset + 32) as usize;
+    let name_start = offset.checked_add(46)?;
+    let extra_start = name_start.checked_add(name_len as usize)?;
+    let comment_start = extra_start.checked_add(extra_len as usize)?;
+    let record_end = comment_start.checked_add(comment_len)?;
+    if record_end > data.len() || record_end > expected_end {
+        return None;
+    }
+    Some(CentralDirectoryRecord {
+        offset,
+        end: record_end,
+        flags: u16_le(data, offset + 8),
+        method: u16_le(data, offset + 10),
+        crc32: u32_le(data, offset + 16),
+        compressed_size: u32_le(data, offset + 20),
+        uncompressed_size: u32_le(data, offset + 24),
+        name_len,
+        extra_len,
+        name: &data[name_start..extra_start],
+        extra: &data[extra_start..comment_start],
+        extra_offset: extra_start,
+        disk_number_start: u16_le(data, offset + 34),
+        local_header_offset: u32_le(data, offset + 42),
+    })
+}
+
 fn walk_central_directory_range(data: &[u8], offset: usize, expected_end: Option<usize>) -> CdWalk {
     let mut pos = offset;
     let mut count = 0usize;
-    while pos + 46 <= data.len() && &data[pos..pos + 4] == CD_SIG {
-        let name_len = u16_le(data, pos + 28) as usize;
-        let extra_len = u16_le(data, pos + 30) as usize;
-        let comment_len = u16_le(data, pos + 32) as usize;
-        let record_len = 46usize
-            .saturating_add(name_len)
-            .saturating_add(extra_len)
-            .saturating_add(comment_len);
-        if record_len < 46 || pos + record_len > data.len() {
-            break;
-        }
-        pos += record_len;
+    while let Some(record) = parse_central_directory_record(data, pos, data.len()) {
+        pos = record.end;
         count += 1;
         if expected_end.is_some_and(|end| pos >= end) {
             break;
@@ -128,33 +174,23 @@ fn parse_central_directory_entries(
 ) -> Vec<CentralEntry> {
     let mut entries = Vec::new();
     let mut pos = offset;
-    while pos + 46 <= data.len() && pos < expected_end && &data[pos..pos + 4] == CD_SIG {
-        let name_len = u16_le(data, pos + 28);
-        let extra_len = u16_le(data, pos + 30);
-        let comment_len = u16_le(data, pos + 32) as usize;
-        let name_start = pos + 46;
-        let extra_start = name_start + name_len as usize;
-        let comment_start = extra_start + extra_len as usize;
-        let record_end = comment_start + comment_len;
-        if record_end > data.len() || record_end > expected_end {
-            break;
-        }
+    while let Some(record) = parse_central_directory_record(data, pos, expected_end) {
         entries.push(CentralEntry {
-            offset: pos,
-            flags: u16_le(data, pos + 8),
-            method: u16_le(data, pos + 10),
-            crc32: u32_le(data, pos + 16),
-            compressed_size: u32_le(data, pos + 20),
-            uncompressed_size: u32_le(data, pos + 24),
-            name_len,
-            extra_len,
-            name: data[name_start..extra_start].to_vec(),
-            extra: data[extra_start..comment_start].to_vec(),
-            extra_offset: extra_start,
-            disk_number_start: u16_le(data, pos + 34),
-            local_header_offset: u32_le(data, pos + 42),
+            offset: record.offset,
+            flags: record.flags,
+            method: record.method,
+            crc32: record.crc32,
+            compressed_size: record.compressed_size,
+            uncompressed_size: record.uncompressed_size,
+            name_len: record.name_len,
+            extra_len: record.extra_len,
+            name: record.name.to_vec(),
+            extra: record.extra.to_vec(),
+            extra_offset: record.extra_offset,
+            disk_number_start: record.disk_number_start,
+            local_header_offset: record.local_header_offset,
         });
-        pos = record_end;
+        pos = record.end;
     }
     entries
 }

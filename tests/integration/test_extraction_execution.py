@@ -53,7 +53,6 @@ class FakeFailingMetadataScanner:
         )
         result.error = "ZIP 文件名编码置信度不足"
         result.selected_codepage = "932"
-        result.decoded_names = ["incorrect override.txt"]
         return result
 
 
@@ -76,7 +75,6 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             self.assertTrue(result.success)
             self.assertEqual(calls[0]["selected_codepage"], None)
-            self.assertEqual(calls[0]["decoded_names"], [])
 
     def test_extractor_success_reports_cleanup_parts_not_candidate_run_parts(self):
         with tempfile.TemporaryDirectory() as tmp:

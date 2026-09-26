@@ -856,7 +856,6 @@ class SevenZipRunner:
         password: str | None,
         password_candidates: list[str] | tuple[str, ...] | None = None,
         selected_codepage: str | None,
-        decoded_names: list[str],
         startupinfo,
         task: ArchiveTask,
         phase_timer: Any | None = None,
@@ -871,7 +870,6 @@ class SevenZipRunner:
                     password=password,
                     password_candidates=password_candidates,
                     selected_codepage=selected_codepage,
-                    decoded_names=decoded_names,
                     task=task,
                     phase_timer=phase_timer,
                     phase_prefix=f"{phase_prefix}_build_job",
@@ -908,7 +906,6 @@ class SevenZipRunner:
                     password=kwargs.get("password"),
                     password_candidates=kwargs.get("password_candidates"),
                     selected_codepage=kwargs.get("selected_codepage"),
-                    decoded_names=kwargs.get("decoded_names") or [],
                     task=kwargs["task"],
                     phase_timer=kwargs.get("phase_timer"),
                     phase_prefix=kwargs.get("phase_prefix", "sevenzip"),
@@ -945,7 +942,6 @@ class SevenZipRunner:
                     password=kwargs.get("password"),
                     password_candidates=kwargs.get("password_candidates"),
                     selected_codepage=kwargs.get("selected_codepage"),
-                    decoded_names=kwargs.get("decoded_names") or [],
                     task=kwargs["task"],
                     phase_timer=kwargs.get("phase_timer"),
                     phase_prefix=kwargs.get("phase_prefix", "sevenzip"),
@@ -1275,7 +1271,6 @@ class SevenZipRunner:
         password: str | None,
         password_candidates: list[str] | tuple[str, ...] | None,
         selected_codepage: str | None,
-        decoded_names: list[str],
         task: ArchiveTask,
         phase_timer: Any | None = None,
         phase_prefix: str = "sevenzip_build_job",
@@ -1305,7 +1300,6 @@ class SevenZipRunner:
             job["password_candidates"] = list(candidates)
         if selected_codepage:
             job["codepage"] = selected_codepage
-            job["decoded_names"] = list(decoded_names)
 
         with _phase(phase_timer, f"{phase_prefix}_archive_input"):
             archive_input = self._archive_input(task, archive_path, part_paths)

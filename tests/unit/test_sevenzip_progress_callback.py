@@ -25,7 +25,6 @@ def test_native_worker_progress_event_is_forwarded_to_task_callback(tmp_path):
             out_dir=str(tmp_path / "out"),
             password=None,
             selected_codepage=None,
-            decoded_names=[],
             startupinfo=None,
             task=task,
         ).result(timeout=15)

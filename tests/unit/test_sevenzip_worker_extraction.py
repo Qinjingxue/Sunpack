@@ -696,16 +696,18 @@ def test_worker_output_trace_includes_per_item_failure(tmp_path):
 
 def test_worker_propagates_delayed_async_file_open_failure(tmp_path):
     worker = _require_worker_or_skip()
-    archive, _ = _create_7z(tmp_path, "async-open-failure", "payload")
+    archive = tmp_path / "async-open-failure.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        # Wildcards pass archive path traversal validation, but CreateFileW
+        # rejects them. The async writer must report that delayed failure
+        # after draining instead of publishing a successful extraction.
+        zf.writestr("invalid*output.txt", "payload")
     out_dir = tmp_path / "out"
     payload = {
         "job_id": "async-open-failure",
         "archive_path": str(archive),
         "output_dir": str(out_dir),
-        # Wildcards pass archive path traversal validation, but CreateFileW
-        # rejects them. The async writer must report that delayed failure
-        # after draining instead of publishing a successful extraction.
-        "decoded_names": ["invalid*output.txt"],
+        "format_hint": "zip",
     }
 
     result = subprocess.run(
@@ -948,6 +950,26 @@ def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
     assert (out_dir / source.name).read_bytes() == payload
 
 
+def test_runner_serializes_only_codepage_for_filename_override(tmp_path):
+    archive = tmp_path / "legacy.zip"
+    archive.write_bytes(b"PK")
+    task = make_archive_task(archive, format_hint="zip")
+    runner = SevenZipRunner({})
+
+    job = runner._build_job(
+        archive_path=str(archive),
+        part_paths=[str(archive)],
+        out_dir=str(tmp_path / "out"),
+        password=None,
+        password_candidates=None,
+        selected_codepage="932",
+        task=task,
+    )
+
+    assert job["codepage"] == "932"
+    assert "decoded_names" not in job
+
+
 def test_worker_applies_explicit_shift_jis_item_paths(tmp_path):
     worker = _require_worker_or_skip()
     archive, expected_name, payload_bytes = _create_shift_jis_zip(tmp_path)
@@ -958,7 +980,6 @@ def test_worker_applies_explicit_shift_jis_item_paths(tmp_path):
         "output_dir": str(out_dir),
         "format_hint": "zip",
         "codepage": "932",
-        "decoded_names": [expected_name],
     }
 
     result = subprocess.run(
@@ -973,7 +994,7 @@ def test_worker_applies_explicit_shift_jis_item_paths(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert worker_result["requested_codepage"] == "932"
     assert worker_result["applied_codepage"] == "932"
-    assert worker_result["filename_decoder"] == "sunpack_zip_raw_names"
+    assert worker_result["filename_decoder"] == "sevenzip_zip_codepage"
     assert (out_dir / "日本語" / "説明.txt").read_bytes() == payload_bytes
 
 

@@ -248,7 +248,6 @@ class SingleArchiveExtractor:
                         self.i18n.t("extract.log.metadata_override_not_used", error=filename_encoding.error)
                     )
                     selected_codepage = None
-                    filename_encoding.decoded_names = []
 
             if correct_pwd is None:
                 err = test_err
@@ -268,7 +267,6 @@ class SingleArchiveExtractor:
                         "password": correct_pwd,
                         "password_candidates": list(resolution.candidate_passwords),
                         "selected_codepage": selected_codepage,
-                        "decoded_names": filename_encoding.decoded_names,
                         "startupinfo": startupinfo,
                         "task": task,
                         "phase_timer": phase_timer,
