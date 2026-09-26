@@ -14,7 +14,7 @@ class RunState:
         self.scan_failures: list[FailureInfo] = []
         self.processed_keys: set[str] = set()
         self.cleanup_refs: dict[str, Any] = {}
-        self.flatten_candidates: set[str] = set()
+        self.cleanup_results = []
         self.target_results: list[TargetRunResult] = []
         self.policy_skips: list[dict] = []
 
@@ -31,4 +31,5 @@ class RunState:
             scan_failed_tasks=tuple(scan_failed_tasks),
             scan_failures=tuple(scan_failures),
             policy_skips=tuple(policy_skips),
+            cleanup_results=tuple(self.cleanup_results),
         )
