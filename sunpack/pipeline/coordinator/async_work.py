@@ -351,6 +351,8 @@ class AsyncWorkBroker:
 
 def _stage_priority(stage: str) -> int:
     value = str(stage or "").lower()
+    if "background" in value:
+        return 0
     if any(token in value for token in ("cancel", "close", "cleanup")):
         return 50
     if any(token in value for token in ("commit", "postprocess", "promotion")):
