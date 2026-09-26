@@ -64,6 +64,23 @@ impl AnalysisBinaryView {
         Ok(PyBytes::new(py, &data))
     }
 
+    fn probe_zip_local_header(
+        &self,
+        py: Python<'_>,
+        offset: u64,
+    ) -> PyResult<Py<PyDict>> {
+        self.probe_zip_local_header_native(py, offset)
+    }
+
+    #[pyo3(signature = (eocd_offset=None))]
+    fn locate_zip_eocd(
+        &self,
+        py: Python<'_>,
+        eocd_offset: Option<u64>,
+    ) -> PyResult<Py<PyDict>> {
+        self.locate_zip_eocd_native(py, eocd_offset)
+    }
+
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         self.ensure_open()?;
         let stats = self.reader.stats()?;
@@ -165,6 +182,8 @@ impl AnalysisBinaryView {
         result.set_item("next_header_crc_ok", false)?;
         result.set_item("next_header_nid", 0u8)?;
         result.set_item("next_header_nid_valid", false)?;
+        result.set_item("version_major", 0u8)?;
+        result.set_item("version_minor", 0u8)?;
         result.set_item("password_required", false)?;
         result.set_item("encrypted_header", false)?;
         result.set_item("encrypted_payload", false)?;
@@ -189,6 +208,8 @@ impl AnalysisBinaryView {
             return Ok(result.unbind());
         }
         result.set_item("magic_matched", true)?;
+        result.set_item("version_major", header[6])?;
+        result.set_item("version_minor", header[7])?;
         if header[6] != 0 {
             result.set_item("error", "unsupported_version")?;
             return Ok(result.unbind());
