@@ -50,19 +50,6 @@ class OutputInventory:
     def materialize_files(self) -> tuple[dict[str, Any], ...]:
         return tuple(dict(item) for item in self._native.materialize_files())
 
-    def file_columns(self) -> tuple[list[str], list[int]]:
-        paths, sizes = self._native.file_columns()
-        return list(paths), [int(item) for item in sizes]
-
-    def file_head_columns(self) -> tuple[list[str], list[int], list[int | None], list[bytes]]:
-        paths, sizes, mtimes_ns, magics = self._native.file_head_columns()
-        return (
-            list(paths),
-            [int(item) for item in sizes],
-            [int(item) if item is not None else None for item in mtimes_ns],
-            [bytes(item) for item in magics],
-        )
-
     def parent_directories(self) -> tuple[str, ...]:
         return tuple(self._native.parent_directories())
 
