@@ -9,6 +9,7 @@ from sunpack.core.support.global_cache_manager import GLOBAL_CACHE, file_identit
 
 
 _CACHE_NAMESPACE = "embedded_archive_scan_v4"
+GLOBAL_CACHE.register_immutable_namespace(_CACHE_NAMESPACE)
 _SCAN_LOCKS = tuple(threading.Lock() for _ in range(32))
 
 _RESULT_FIELDS = frozenset({
@@ -49,20 +50,20 @@ def scan_embedded_archives(
 ) -> EmbeddedScanResult:
     """Run the canonical native full-stream embedded scan at most once per file identity."""
     cache_key = identity or file_identity(path)
-    payload = GLOBAL_CACHE.get(_CACHE_NAMESPACE, cache_key)
-    if payload is None:
+    result = GLOBAL_CACHE.get(_CACHE_NAMESPACE, cache_key)
+    if result is None:
         lock = _SCAN_LOCKS[hash(cache_key) % len(_SCAN_LOCKS)]
         with lock:
-            payload = GLOBAL_CACHE.get(_CACHE_NAMESPACE, cache_key)
-            if payload is None:
+            result = GLOBAL_CACHE.get(_CACHE_NAMESPACE, cache_key)
+            if result is None:
                 session = get_archive_session(path)
                 native_result = session.scan_embedded_archives()
-                payload = _normalize_native_result(
+                result = _normalize_native_result(
                     native_result,
                     expected_size,
-                ).to_dict()
-                GLOBAL_CACHE.set(_CACHE_NAMESPACE, cache_key, payload)
-    return embedded_result_from_dict(payload)
+                )
+                GLOBAL_CACHE.set(_CACHE_NAMESPACE, cache_key, result)
+    return result
 
 
 def _normalize_native_result(value: Any, expected_size: int) -> EmbeddedScanResult:
