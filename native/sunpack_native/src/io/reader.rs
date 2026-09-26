@@ -2000,6 +2000,32 @@ mod tests {
     }
 
     #[test]
+    fn shared_request_data_survives_file_resource_release() {
+        let mut source = vec![0u8; BLOCK_SIZE + 1];
+        source[..7].copy_from_slice(b"payload");
+        let path = temp_file("managed_reader_shared_release", &source);
+        let reader = ManagedReader::open_with_config(
+            &path,
+            ReaderConfig {
+                cache_bytes: BLOCK_SIZE,
+                max_read_bytes: Some(8),
+                max_concurrent_reads: 1,
+            },
+        )
+        .unwrap();
+
+        let data = reader.read_cached_at(0, 7).unwrap();
+        let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        let (handles, entries, _) = manager().release_resources_under(&canonical).unwrap();
+        assert!(handles >= 1);
+        assert!(entries >= 1);
+        assert_eq!(&*data, b"payload");
+
+        drop(reader);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn request_cache_coalesces_cross_volume_data_once() {
         let first_path = temp_file("managed_reader_shared_part1", b"abc");
         let second_path = temp_file("managed_reader_shared_part2", b"def");
