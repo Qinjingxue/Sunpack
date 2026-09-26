@@ -141,7 +141,7 @@ def wrap_method(owner, method_name: str, recorder: TimingRecorder, label: str, d
 class PipelineTimingProbe:
     """Instrument every per-request runtime created by the async PipelineEngine.
 
-    The engine no longer exposes ``task_scanner``/``batch_runner`` as public
+    The engine no longer exposes request runtime stages as public
     attributes, so the probe hooks the private ``_request_runtime_factory``
     seam (the same one the large-archive profiler uses) and wraps the sync
     pipeline stages that still exist after the async refactor.  Stages that no
@@ -178,20 +178,18 @@ class PipelineTimingProbe:
     def _instrument_runtime(self, runtime: Any) -> None:
         scanner = getattr(runtime, "task_scanner", None)
         planning = getattr(runtime, "input_planning_stage", None)
-        batch = getattr(runtime, "batch_runner", None)
+        job = getattr(runtime, "job_executor", None)
         extractor = getattr(runtime, "extractor", None)
         output_scan = getattr(runtime, "output_scan_policy", None)
 
         self._wrap(scanner, "scan_targets", "pipeline_scan")
         self._wrap(scanner, "direct_file_tasks", "pipeline_direct_scan")
         self._wrap(planning, "plan_tasks", "input_planning")
-        self._wrap(batch, "_skip_tasks_inside_batch_outputs", "batch_skip_inside_outputs")
-        self._wrap(batch, "_inspect_tasks_before_extract", "batch_password_preflight")
-        self._wrap(batch, "collect_result", "batch_collect_result")
-        self._wrap(batch, "_report_task_started", "batch_report_task_started")
-        self._wrap(batch, "_report_task_finished", "batch_report_task_finished")
-        self._wrap(output_scan, "scan_roots_from_outputs", "output_scan")
-        self._wrap(output_scan, "take_scan_session", "output_take_scan_session")
+                self._wrap(job, "_inspect_tasks_before_extract", "job_password_preflight")
+        self._wrap(job, "collect_result", "job_collect_result")
+        self._wrap(job, "_report_task_started", "job_report_task_started")
+        self._wrap(job, "_report_task_finished", "job_report_task_finished")
+        self._wrap(output_scan, "prepare_scan", "output_scan")
         self._wrap(extractor, "inspect", "password_preflight")
         self._wrap(extractor, "extract", "extract")
         self._wrap(extractor, "close", "extractor_close")
@@ -200,7 +198,7 @@ class PipelineTimingProbe:
         password_tester = getattr(extractor, "password_tester", None)
         password_scheduler = getattr(password_tester, "password_scheduler", None) if password_tester is not None else None
         self._wrap(password_scheduler, "plan_for_extraction", "password_bounded_verify")
-        verifier = getattr(batch, "verifier", None)
+        verifier = getattr(job, "verifier", None)
         self._wrap(verifier, "verify", "verify")
 
 
@@ -208,7 +206,7 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
     if recorder is None:
         return {
             "pipeline_scan_ms": 0.0,
-            "batch_execute_ms": 0.0,
+            "job_execute_ms": 0.0,
             "prepare_ms": 0.0,
             "analysis_ms": 0.0,
             "execute_ready_ms": 0.0,
@@ -225,21 +223,21 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
             "extractor_close_ms": 0.0,
             "timings": {},
         }
-    batch_execute_ms = round(
-        recorder.ms("batch_prepare")
-        + recorder.ms("batch_skip_inside_outputs")
-        + recorder.ms("batch_password_preflight")
-        + recorder.ms("batch_collect_result")
-        + recorder.ms("batch_report_task_started")
-        + recorder.ms("batch_report_task_finished")
+    job_execute_ms = round(
+        recorder.ms("job_prepare")
+        + recorder.ms("job_skip_inside_outputs")
+        + recorder.ms("job_password_preflight")
+        + recorder.ms("job_collect_result")
+        + recorder.ms("job_report_task_started")
+        + recorder.ms("job_report_task_finished")
         + recorder.ms("output_scan")
-        + recorder.ms("output_take_scan_session"),
+        + 0.0,
         2,
     )
     measured_stages = (
         recorder.ms("pipeline_scan")
         + recorder.ms("input_planning")
-        + batch_execute_ms
+        + job_execute_ms
         + recorder.ms("password_preflight")
         + recorder.ms("password_resolve")
         + recorder.ms("password_bounded_verify")
@@ -252,8 +250,8 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
     extract_ms = round(max(0.0, pipeline_ms - measured_stages), 2)
     return {
         "pipeline_scan_ms": recorder.ms("pipeline_scan"),
-        "batch_execute_ms": batch_execute_ms,
-        "prepare_ms": recorder.ms("batch_prepare"),
+        "job_execute_ms": job_execute_ms,
+        "prepare_ms": recorder.ms("job_prepare"),
         "analysis_ms": recorder.ms("input_planning"),
         "execute_ready_ms": 0.0,
         "execute_all_wall_ms": round(pipeline_ms, 2),
@@ -262,7 +260,7 @@ def timing_columns(recorder: TimingRecorder | None, pipeline_ms: float = 0.0) ->
         "password_verify_ms": recorder.ms("password_bounded_verify"),
         "extract_ms": extract_ms,
         "verify_ms": recorder.ms("verify"),
-        "collect_result_ms": recorder.ms("batch_collect_result"),
+        "collect_result_ms": recorder.ms("job_collect_result"),
         "output_scan_ms": recorder.ms("output_scan"),
         "postprocess_ms": 0.0,
         "final_summary_ms": 0.0,
@@ -755,7 +753,7 @@ def print_table(rows: list[dict]):
         "scan_ms",
         "pipeline_ms",
         "pipeline_scan_ms",
-        "batch_execute_ms",
+        "job_execute_ms",
         "analysis_ms",
         "execute_ready_ms",
         "execute_all_wall_ms",
