@@ -89,7 +89,7 @@ void check_extract_to_disk_callback()
     std::printf("ExtractToDiskCallback\n");
     ExtractOutputTrace trace;
     auto *raw = new ExtractToDiskCallback(
-        nullptr, L"", L"", std::vector<std::wstring>{},
+        nullptr, L"", L"",
         ExtractProgressCallback{}, true, &trace, 0);
     CMyComPtr<IArchiveExtractCallback> callback(raw);
     auto *probe = raw;
