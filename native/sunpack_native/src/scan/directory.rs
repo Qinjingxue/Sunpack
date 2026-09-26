@@ -408,6 +408,9 @@ impl NativeOutputInventory {
                 let relative = item.output_path.as_ref().unwrap_or(&item.path);
                 root.join(relative)
             });
+            if !path.starts_with(root) {
+                continue;
+            }
             let Some(parent) = path.parent() else {
                 continue;
             };
