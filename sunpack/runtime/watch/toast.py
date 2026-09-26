@@ -174,8 +174,6 @@ class WatchToastCoordinator:
         self.host = host
         self.i18n = I18nContext(config.get("cli", {}).get("language") if isinstance(config.get("cli"), dict) else None)
         self._debounce_seconds = max(0.0, int(watch.get("toast_completion_debounce_ms", 800)) / 1000.0)
-        self._success_ttl_ms = max(0, int(float(watch.get("toast_success_ttl_seconds", 3.0)) * 1000))
-        self._failure_ttl_ms = max(0, int(float(watch.get("toast_failure_ttl_seconds", 5.0)) * 1000))
         self._lock = threading.RLock()
         self._requests: dict[str, _RequestProgress] = {}
         self._batch_id = ""
@@ -490,17 +488,14 @@ class WatchToastCoordinator:
                     failed=len(failed),
                     duration=duration,
                 )
-                ttl = self._failure_ttl_ms
             elif failed:
                 kind = ToastSnapshotKind.FAILURE
                 title = self.i18n.t("toast.final.failure.title")
                 body = self.i18n.t("toast.final.failure.body", failed=len(failed), duration=duration)
-                ttl = self._failure_ttl_ms
             else:
                 kind = ToastSnapshotKind.SUCCESS
                 title = self.i18n.t("toast.final.success.title")
                 body = self.i18n.t("toast.final.success.body", succeeded=len(succeeded), duration=duration)
-                ttl = self._success_ttl_ms
             warnings = [error for request in succeeded for error in request.errors]
             if warnings:
                 body += "\n" + "\n".join(warnings)
@@ -510,7 +505,6 @@ class WatchToastCoordinator:
                 title=title,
                 body=body,
                 actions=tuple(actions[:2]),
-                ttl_ms=ttl,
             ))
             self._requests = {
                 request_id: request
