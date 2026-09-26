@@ -46,7 +46,7 @@ def test_shift_jis_kanji_only_zip_scan_uses_cp932(tmp_path):
     assert result.confidence > 0.5
 
 
-def test_shift_jis_zip_scan_returns_decoded_item_paths(tmp_path):
+def test_shift_jis_zip_scan_selects_cp932(tmp_path):
     archive = tmp_path / "shift-jis.zip"
     expected_name = "日本語/説明.txt"
     _write_stored_zip(archive, expected_name.encode("cp932"), b"payload")
@@ -67,6 +67,17 @@ def test_format_hint_scans_disguised_zip_without_renaming_it(tmp_path):
     assert archive.is_file()
     assert not (tmp_path / "downloaded.zip").exists()
     assert result.archive_type == "zip"
+
+
+def test_sfx_prefix_uses_physical_central_directory(tmp_path):
+    expected_name = "日本語/説明.txt"
+    archive_bytes = _stored_zip_bytes(expected_name.encode("cp932"), b"payload")
+    sfx = tmp_path / "self-extracting.exe"
+    sfx.write_bytes(b"MZ" + b"stub" * 97 + archive_bytes)
+
+    result = ArchiveMetadataScanner().scan(str(sfx), format_hint="zip")
+
+    assert result.selected_codepage == "932"
 
 
 def test_carrier_range_uses_canonical_archive_input(tmp_path):
