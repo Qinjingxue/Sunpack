@@ -22,6 +22,16 @@ def filesystem_config(config: dict[str, Any]) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def discovery_run_config(config: dict[str, Any], *, deep_detect: bool) -> dict[str, Any]:
+    """Apply detection policy to one request without changing its config source."""
+    if not deep_detect or not scan_filters_enabled(config):
+        return config
+    return {
+        **config,
+        "filesystem": {**filesystem_config(config), "scan_filters_enabled": False},
+    }
+
+
 def directory_scan_mode(config: dict[str, Any]) -> str:
     value = filesystem_config(config).get("directory_scan_mode")
     if value in DIRECTORY_SCAN_MODES:

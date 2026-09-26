@@ -14,6 +14,8 @@ from pathlib import Path
 from typing import Callable, Iterable
 
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
+from sunpack.core.config.detection_view import discovery_run_config
+from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.core.contracts.failures import FailureKind
 from sunpack.core.contracts.retry_targets import (
     failure_contains,
@@ -39,6 +41,7 @@ from sunpack.runtime.watch.scanner import (
 )
 from sunpack.runtime.watch.scanner import _candidate_for as _watch_candidate_for_path
 from sunpack.runtime.watch.state import WatchStateEntry, WatchStateStore
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.toast import NullWatchNotificationSink
 from sunpack.core.i18n import I18nContext
 from sunpack.core.passwords.internal import builtin as builtin_passwords_module
@@ -110,6 +113,7 @@ class _ActivePipelineRequest:
     candidate: WatchCandidate
     task: asyncio.Task
     registry_owner: str = ""
+    source_input_root: str = ""
 
 
 class WatchScheduler:
@@ -119,6 +123,7 @@ class WatchScheduler:
         watch_roots: list[str],
         *,
         output_roots: dict[str, str] | None = None,
+        root_entries: Iterable[WatchRootEntry] | None = None,
         out_dir: str = ".",
         state_path: str,
         cold_start_seconds: float | None = None,
@@ -153,6 +158,15 @@ class WatchScheduler:
                 os.path.abspath(os.path.join(root, self.out_dir)) if not os.path.isabs(expanded_out_dir) else self.out_dir,
             )
         self._validate_output_roots()
+        configured_entries = {path_key(entry.input_root): entry for entry in root_entries or ()}
+        self.root_entries = {
+            path_key(root): WatchRootEntry(
+                root,
+                self.output_roots[path_key(root)],
+                configured_entries[path_key(root)].deep_detect if path_key(root) in configured_entries else False,
+            )
+            for root in self.watch_roots
+        }
         configured_cold_start = watch_config.get(
             "cold_start_seconds",
             DEFAULT_WATCH_CONFIG["cold_start_seconds"],
@@ -556,6 +570,7 @@ class WatchScheduler:
                 pending.path,
                 candidates,
                 password_scope_dir=scope_dir,
+                source_input_root=pending.source_input_root,
             )
             for candidate in candidates:
                 self.enqueue(
@@ -1020,6 +1035,10 @@ class WatchScheduler:
                             candidate,
                             force=force,
                             password_scope_dir=_recovery_scope_dir,
+                            source_input_root=(
+                                _password_retry_snapshot.source_input_root if password_retry
+                                else self._source_input_root_for(candidate.path)
+                            ),
                             internal_recovery=internal_recovery,
                             durable_owner=durable_owner,
                             persist=durable_owner,
@@ -1462,6 +1481,13 @@ class WatchScheduler:
         self,
         candidate: WatchCandidate,
     ) -> _ActivePipelineRequest | None:
+        source_input_root = self._source_input_root_for(candidate.path)
+        root_entry = self.root_entries.get(path_key(source_input_root))
+        if root_entry is None:
+            self.log.write("processing_deferred_missing_input_root", path=candidate.path, source_input_root=source_input_root)
+            return None
+        options = EmbeddedOptions(force_scan=root_entry.deep_detect)
+        self.state.bind_input_root(candidate.path, source_input_root)
         notification_id = uuid.uuid4().hex
         with self._password_source_lock:
             run_config = dict(self.config)
@@ -1491,6 +1517,7 @@ class WatchScheduler:
             "root": output_root,
             "common_root": self._common_root_for(candidate.path),
         }
+        run_config = discovery_run_config(run_config, deep_detect=options.force_scan)
         from sunpack.runtime.cli.runtime_state import runtime_host
 
         host = runtime_host()
@@ -1519,6 +1546,7 @@ class WatchScheduler:
                 ),
                 request_config=run_config,
                 origin="watch",
+                detection_options=options,
             ))
         except BaseException:
             if host is not None:
@@ -1531,6 +1559,7 @@ class WatchScheduler:
             candidate=candidate,
             task=task,
             registry_owner=notification_id if host is not None else "",
+            source_input_root=source_input_root,
         )
 
     def _handle_pipeline_progress(
@@ -1653,6 +1682,7 @@ class WatchScheduler:
                 blockers=blockers,
                 password_scope_dir=password_scope_dir if direct_password else "",
                 password_scope_signature=password_scope_signature if direct_password else "",
+                source_input_root=request.source_input_root,
             )
             error = _failure_message(
                 direct_failure,
@@ -1705,6 +1735,7 @@ class WatchScheduler:
                 blockers=[BLOCKER_PASSWORD],
                 password_scope_dir=password_scope_dir,
                 password_scope_signature=password_scope_signature,
+                source_input_root=request.source_input_root,
             )
             error = _failure_message(failure, self.i18n.t("watch.failure.extraction_failed"))
             self.state.mark(
@@ -1875,6 +1906,14 @@ class WatchScheduler:
             self.state.clear_entries(retired)
         if path_key(candidate.path) not in pending_keys:
             self.state.complete_work_if_matches(candidate)
+
+    def _source_input_root_for(self, path: str) -> str:
+        entry = self.state.latest_entry_for_path(path)
+        pending = self.state.pending_work_for_path(path)
+        source_root = (pending.source_input_root if pending else "") or (entry.source_input_root if entry else "")
+        if source_root:
+            return source_root
+        return _longest_matching_root(os.path.abspath(path), self.watch_roots) or ""
 
     def _common_root_for(self, path: str) -> str:
         path = os.path.abspath(path)
@@ -2185,8 +2224,11 @@ def _failure_payload(
     blockers: list[str] | None = None,
     password_scope_dir: str = "",
     password_scope_signature: str = "",
+    source_input_root: str = "",
 ) -> dict:
     payload = _failure_to_dict(failure)
+    if source_input_root:
+        payload["source_input_root"] = source_input_root
     if blockers is not None:
         payload["blockers"] = list(blockers)
     if password_scope_dir:

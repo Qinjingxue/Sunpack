@@ -118,10 +118,12 @@ function New-CommandString {
         [hashtable]$Launcher,
         [string]$TargetToken,
         [string]$OutDirToken,
-        [bool]$PromptPasswords
+        [bool]$PromptPasswords,
+        [bool]$DeepDetect = $false
     )
 
     $passwordArg = if ($PromptPasswords) { " --ask-pw" } else { "" }
+    if ($DeepDetect) { $passwordArg += " --deep-detect" }
     if ($Launcher.Mode -eq "app") {
         return ('"{0}" extract "{1}" --out-dir "{2}"{3} --pause' -f $Launcher.AppPath, $TargetToken, $OutDirToken, $passwordArg)
     }
@@ -136,7 +138,7 @@ function New-FileCommandString {
         [bool]$PromptPasswords
     )
 
-    $passwordArg = if ($PromptPasswords) { " --ask-pw" } else { "" }
+    $passwordArg = if ($PromptPasswords) { " --ask-pw --deep-detect" } else { " --deep-detect" }
     if ($Launcher.Mode -eq "app") {
         return ('"{0}" extract "{1}"{2} --pause' -f $Launcher.AppPath, $TargetToken, $passwordArg)
     }
@@ -147,14 +149,14 @@ function New-FileCommandString {
 function New-WatchCommandString {
     param(
         [hashtable]$Launcher,
-        [string]$TargetToken
+        [string]$TargetToken,
+        [bool]$DeepDetect = $false
     )
 
-    if ($Launcher.Mode -eq "app") {
-        return New-HiddenStartProcessCommand -FilePath $Launcher.AppPath -ArgumentList @("watch", "add", $TargetToken, "--start", "--initial-scan")
-    }
-
-    return New-HiddenStartProcessCommand -FilePath $Launcher.AppPath -ArgumentList @($Launcher.ScriptPath, "watch", "add", $TargetToken, "--start", "--initial-scan")
+    $watchArguments = @("watch", "add", $TargetToken, "--start", "--initial-scan")
+    if ($DeepDetect) { $watchArguments += "--deep-detect" }
+    if ($Launcher.Mode -ne "app") { $watchArguments = @($Launcher.ScriptPath) + $watchArguments }
+    return New-HiddenStartProcessCommand -FilePath $Launcher.AppPath -ArgumentList $watchArguments
 }
 
 function New-WatchRemoveCommandString {
@@ -274,6 +276,9 @@ function Get-SubMenuTexts {
         return @{
             Prompt = New-ChineseText @(0x4EA4, 0x4E92, 0x8F93, 0x5165, 0x5BC6, 0x7801, 0x89E3, 0x538B)
             Direct = New-ChineseText @(0x76F4, 0x63A5, 0x89E3, 0x538B)
+            DeepDirect = New-ChineseText @(0x6DF1, 0x5EA6, 0x626B, 0x63CF, 0x89E3, 0x538B)
+            DeepPrompt = New-ChineseText @(0x4EA4, 0x4E92, 0x8F93, 0x5165, 0x5BC6, 0x7801, 0x6DF1, 0x5EA6, 0x89E3, 0x538B)
+            DeepWatch = New-ChineseText @(0x6DF1, 0x5EA6, 0x76D1, 0x63A7, 0x6B64, 0x76EE, 0x5F55)
             Watch = New-ChineseText @(0x76D1, 0x63A7, 0x6B64, 0x76EE, 0x5F55)
             Unwatch = New-ChineseText @(0x53D6, 0x6D88, 0x76D1, 0x63A7, 0x6B64, 0x76EE, 0x5F55)
         }
@@ -281,6 +286,9 @@ function Get-SubMenuTexts {
     return @{
         Prompt = "Extract with password prompt"
         Direct = "Extract directly"
+        DeepDirect = "Extract with deep scan"
+        DeepPrompt = "Deep extract with password prompt"
+        DeepWatch = "Deep watch this folder"
         Watch = "Watch this folder"
         Unwatch = "Stop watching this folder"
     }
@@ -308,10 +316,16 @@ $folderToken = ConvertTo-RootSafeDirectoryToken -Token "%1"
 $backgroundToken = ConvertTo-RootSafeDirectoryToken -Token "%V"
 $folderPromptCommand = New-CommandString -Launcher $launcher -TargetToken $folderToken -OutDirToken $folderToken -PromptPasswords $true
 $folderDirectCommand = New-CommandString -Launcher $launcher -TargetToken $folderToken -OutDirToken $folderToken -PromptPasswords $false
+$folderDeepDirectCommand = New-CommandString -Launcher $launcher -TargetToken $folderToken -OutDirToken $folderToken -PromptPasswords $false -DeepDetect $true
+$folderDeepPromptCommand = New-CommandString -Launcher $launcher -TargetToken $folderToken -OutDirToken $folderToken -PromptPasswords $true -DeepDetect $true
+$folderDeepWatchCommand = New-WatchCommandString -Launcher $launcher -TargetToken $folderToken -DeepDetect $true
 $folderWatchCommand = New-WatchCommandString -Launcher $launcher -TargetToken $folderToken
 $folderUnwatchCommand = New-WatchRemoveCommandString -Launcher $launcher -TargetToken $folderToken
 $backgroundPromptCommand = New-CommandString -Launcher $launcher -TargetToken $backgroundToken -OutDirToken $backgroundToken -PromptPasswords $true
 $backgroundDirectCommand = New-CommandString -Launcher $launcher -TargetToken $backgroundToken -OutDirToken $backgroundToken -PromptPasswords $false
+$backgroundDeepDirectCommand = New-CommandString -Launcher $launcher -TargetToken $backgroundToken -OutDirToken $backgroundToken -PromptPasswords $false -DeepDetect $true
+$backgroundDeepPromptCommand = New-CommandString -Launcher $launcher -TargetToken $backgroundToken -OutDirToken $backgroundToken -PromptPasswords $true -DeepDetect $true
+$backgroundDeepWatchCommand = New-WatchCommandString -Launcher $launcher -TargetToken $backgroundToken -DeepDetect $true
 $backgroundWatchCommand = New-WatchCommandString -Launcher $launcher -TargetToken $backgroundToken
 $backgroundUnwatchCommand = New-WatchRemoveCommandString -Launcher $launcher -TargetToken $backgroundToken
 $filePromptCommand = New-FileCommandString -Launcher $launcher -TargetToken "%1" -PromptPasswords $true
@@ -322,10 +336,16 @@ if ($DryRun) {
         menu_text = $resolvedMenuText
         folder_prompt = $folderPromptCommand
         folder_direct = $folderDirectCommand
+        folder_deep_direct = $folderDeepDirectCommand
+        folder_deep_prompt = $folderDeepPromptCommand
+        folder_deep_watch = $folderDeepWatchCommand
         folder_watch = $folderWatchCommand
         folder_unwatch = $folderUnwatchCommand
         background_prompt = $backgroundPromptCommand
         background_direct = $backgroundDirectCommand
+        background_deep_direct = $backgroundDeepDirectCommand
+        background_deep_prompt = $backgroundDeepPromptCommand
+        background_deep_watch = $backgroundDeepWatchCommand
         background_watch = $backgroundWatchCommand
         background_unwatch = $backgroundUnwatchCommand
         file_prompt = $filePromptCommand
@@ -337,11 +357,17 @@ if ($DryRun) {
 Set-ContextMenuParent -KeyPath $folderKey -MenuLabel $resolvedMenuText -IconValue $resolvedIconPath -SubCommandsKey $folderSubCommandsName
 Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "PromptPassword" -MenuLabel $subMenuTexts.Prompt -CommandLine $folderPromptCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "DirectExtract" -MenuLabel $subMenuTexts.Direct -CommandLine $folderDirectCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "DeepExtract" -MenuLabel $subMenuTexts.DeepDirect -CommandLine $folderDeepDirectCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "DeepPromptPassword" -MenuLabel $subMenuTexts.DeepPrompt -CommandLine $folderDeepPromptCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "DeepWatchFolder" -MenuLabel $subMenuTexts.DeepWatch -CommandLine $folderDeepWatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "WatchFolder" -MenuLabel $subMenuTexts.Watch -CommandLine $folderWatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $folderSubCommandsKey -CommandName "UnwatchFolder" -MenuLabel $subMenuTexts.Unwatch -CommandLine $folderUnwatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuParent -KeyPath $backgroundKey -MenuLabel $resolvedMenuText -IconValue $resolvedIconPath -SubCommandsKey $backgroundSubCommandsName
 Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "PromptPassword" -MenuLabel $subMenuTexts.Prompt -CommandLine $backgroundPromptCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "DirectExtract" -MenuLabel $subMenuTexts.Direct -CommandLine $backgroundDirectCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "DeepExtract" -MenuLabel $subMenuTexts.DeepDirect -CommandLine $backgroundDeepDirectCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "DeepPromptPassword" -MenuLabel $subMenuTexts.DeepPrompt -CommandLine $backgroundDeepPromptCommand -IconValue $resolvedIconPath
+Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "DeepWatchFolder" -MenuLabel $subMenuTexts.DeepWatch -CommandLine $backgroundDeepWatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "WatchFolder" -MenuLabel $subMenuTexts.Watch -CommandLine $backgroundWatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuCommand -ParentKeyPath $backgroundSubCommandsKey -CommandName "UnwatchFolder" -MenuLabel $subMenuTexts.Unwatch -CommandLine $backgroundUnwatchCommand -IconValue $resolvedIconPath
 Set-ContextMenuParent -KeyPath $fileKey -MenuLabel $resolvedMenuText -IconValue $resolvedIconPath -SubCommandsKey $fileSubCommandsName

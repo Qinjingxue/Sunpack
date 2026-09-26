@@ -26,7 +26,7 @@ from sunpack.core.support.resource_lifecycle import (
     task_scandir,
 )
 
-STATE_VERSION = 17
+STATE_VERSION = 18
 DEFAULT_JOURNAL_COMPACT_RECORDS = 8192
 DEFAULT_JOURNAL_COMPACT_BYTES = 8 * 1024 * 1024
 DEFAULT_JOURNAL_HARD_BYTES = 256 * 1024 * 1024
@@ -122,6 +122,7 @@ class WatchPendingWork:
     change_usn: int = 0
     force: bool = False
     password_scope_dir: str = ""
+    source_input_root: str = ""
     internal_recovery: bool = False
     durable_owner: bool = False
     active_outputs: dict[str, str] = field(default_factory=dict)
@@ -162,6 +163,10 @@ class WatchStateEntry:
         payload = self.failure_payload if isinstance(self.failure_payload, dict) else {}
         configured = str(payload.get("password_scope_dir") or "").strip()
         return os.path.abspath(configured) if configured else os.path.dirname(os.path.abspath(self.path))
+
+    @property
+    def source_input_root(self) -> str:
+        return str(self.failure_payload.get("source_input_root") or "")
 
 
 @dataclass(frozen=True)
@@ -867,6 +872,7 @@ class WatchStateStore:
         *,
         force: bool = False,
         password_scope_dir: str = "",
+        source_input_root: str = "",
         internal_recovery: bool = False,
         durable_owner: bool = False,
         persist: bool = True,
@@ -882,6 +888,7 @@ class WatchStateStore:
                 file_id=str(getattr(candidate, "file_id", "") or ""),
                 change_usn=int(getattr(candidate, "change_usn", 0) or 0),
                 force=bool(force),
+                source_input_root=source_input_root or (previous.source_input_root if previous else ""),
                 password_scope_dir=os.path.abspath(
                     password_scope_dir
                     or (previous.password_scope_dir if previous else "")
@@ -922,6 +929,7 @@ class WatchStateStore:
                 file_id=file_id,
                 change_usn=int(change_usn),
                 force=False,
+                source_input_root=previous.source_input_root if previous else "",
                 password_scope_dir=(
                     previous.password_scope_dir
                     if previous
@@ -943,6 +951,18 @@ class WatchStateStore:
     def pending_work_items(self) -> list[WatchPendingWork]:
         with self._state_lock:
             return list(self.pending_work.values())
+
+    def bind_input_root(self, path: str, input_root: str) -> None:
+        """Persist request provenance before an extraction can create outputs."""
+        with self._state_lock:
+            key = _path_key(path)
+            pending = self.pending_work.get(key)
+            if pending is None or pending.source_input_root == input_root:
+                return
+            updated = replace(pending, source_input_root=input_root)
+            self._commit_operations_locked([
+                self._put_operation("pending_work", key, updated),
+            ], durable=pending.durable_owner)
 
     def pending_work_for_path(self, path: str) -> WatchPendingWork | None:
         with self._state_lock:
@@ -1024,6 +1044,7 @@ class WatchStateStore:
         candidates: Iterable,
         *,
         password_scope_dir: str = "",
+        source_input_root: str = "",
     ) -> None:
         with self._state_lock:
             owner_key = _path_key(owner_path)
@@ -1045,6 +1066,7 @@ class WatchStateStore:
                     file_id=str(getattr(candidate, "file_id", "") or ""),
                     change_usn=int(getattr(candidate, "change_usn", 0) or 0),
                     force=True,
+                    source_input_root=source_input_root or (previous.source_input_root if previous else ""),
                     password_scope_dir=scope,
                     internal_recovery=True,
                     durable_owner=True,
@@ -1134,6 +1156,7 @@ class WatchStateStore:
                     file_id=str(getattr(candidate, "file_id", "") or ""),
                     change_usn=int(getattr(candidate, "change_usn", 0) or 0),
                     force=True,
+                    source_input_root=previous.source_input_root if previous else "",
                     password_scope_dir=os.path.abspath(
                         (previous.password_scope_dir if previous else "")
                         or os.path.dirname(os.path.abspath(candidate.path))

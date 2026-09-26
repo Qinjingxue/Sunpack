@@ -45,9 +45,10 @@ def handle(args, ctx):
         return result_for_missing(COMMAND, args, missing_paths, ctx)
 
     config = load_request_config(ctx.cwd)
-    effective_config = build_effective_config(config)
     detection_options = EmbeddedOptions(force_scan=bool(args.deep_detect))
-    results = DetectionDiagnostics(config, detection_options).collect(target_paths)
+    diagnostics = DetectionDiagnostics(config, detection_options)
+    effective_config = build_effective_config(diagnostics.provider.config)
+    results = diagnostics.collect(target_paths)
     all_items = [inspect_result_to_item(res) for res in results]
     if args.analyze:
         analyses = _analysis_preview_by_path(results, config)

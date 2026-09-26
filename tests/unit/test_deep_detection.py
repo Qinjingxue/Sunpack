@@ -1,10 +1,85 @@
+import asyncio
 import gzip
+from types import SimpleNamespace
+
+import pytest
 
 from sunpack.core.analysis.embedded.result import EmbeddedCandidate, EmbeddedScanResult
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
+
+
+@pytest.mark.parametrize("rule", [
+    {"name": "blacklist", "enabled": True, "blocked_extensions": [".bin"]},
+    {"name": "whitelist", "enabled": True, "allowed_extensions": [".zip"]},
+    {"name": "size_range", "enabled": True, "gte": 1024},
+    {"name": "mtime_range", "enabled": True, "lt": 1},
+])
+@pytest.mark.parametrize("recursive", [False, True])
+def test_deep_discovery_disables_each_filesystem_filter(tmp_path, rule, recursive):
+    from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
+    from sunpack.core.contracts.run_state import RunState
+
+    carrier = tmp_path / "carrier.bin"
+    carrier.write_bytes(b"leading junk" + gzip.compress(b"payload") + b"trailing junk")
+    config = {"filesystem": {"scan_filters_enabled": True, "scan_filters": [rule]}}
+    ordinary = ArchiveTaskScanner(config, RunState())
+    deep = ArchiveTaskScanner(config, RunState(), EmbeddedOptions(force_scan=True))
+
+    assert ordinary.discover_targets([str(tmp_path)], is_recursive_scan=recursive) == []
+    [task] = deep.discover_targets([str(tmp_path)], is_recursive_scan=recursive)
+    assert task.archive_input().format_hint == "gzip"
+    assert config["filesystem"]["scan_filters_enabled"] is True
+
+
+def test_one_engine_keeps_watch_and_cli_detection_modes_per_request(tmp_path, monkeypatch):
+    import sunpack.pipeline.coordinator.engine as engine_module
+    from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineResponse
+    from sunpack.core.contracts.results import RunSummary
+
+    class Services:
+        def __init__(self, _config, _broker):
+            self.output_reservations = SimpleNamespace(release=lambda _request_id: None)
+
+        async def start(self):
+            pass
+
+        async def close(self, _broker):
+            pass
+
+    monkeypatch.setattr(engine_module, "_PipelineServices", Services)
+
+    async def scenario():
+        config = {"filesystem": {"scan_filters_enabled": True}}
+        observed = []
+        both_started = asyncio.Event()
+
+        class Runtime:
+            def __init__(self, _services, submission, options, _leases):
+                self.submission = submission
+                assert submission.detection_options == options
+
+            async def execute_async(self, _broker, _cancellation):
+                observed.append(self.submission)
+                if len(observed) >= 2:
+                    both_started.set()
+                await both_started.wait()
+                return PipelineResponse(self.submission.request_id, RunSummary(), PipelineArtifacts())
+
+        async with engine_module.PipelineEngine(config) as engine:
+            engine._request_runtime_factory = Runtime
+            await asyncio.gather(
+                engine.run([str(tmp_path / "watch.bin")], origin="watch", detection_options=EmbeddedOptions(force_scan=True)),
+                engine.run([str(tmp_path / "cli.bin")]),
+            )
+            await engine.run([str(tmp_path / "next-watch.bin")], origin="watch")
+        assert [request.detection_options.force_scan for request in observed] == [True, False, False]
+        assert [request.config["filesystem"]["scan_filters_enabled"] for request in observed] == [False, True, True]
+        assert config["filesystem"]["scan_filters_enabled"] is True
+
+    asyncio.run(scenario())
 
 
 def _candidate(path):

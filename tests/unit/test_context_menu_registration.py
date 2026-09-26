@@ -42,6 +42,7 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         assert argv[1] == "extract"
         assert ntpath.normpath(argv[2]) == "D:\\"
         assert ntpath.normpath(argv[argv.index("--out-dir") + 1]) == "D:\\"
+        assert "--deep-detect" not in argv
         assert "--ask-pw" in argv
         assert "--pause" in argv
 
@@ -50,6 +51,7 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         argv = _windows_argv(expanded)
         assert argv[1] == "extract"
         assert "--reuse" not in argv
+        assert "--deep-detect" not in argv
         assert "--ask-pw" not in argv
         assert "--pause" in argv
 
@@ -59,6 +61,7 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         assert argv[1] == "extract"
         assert ntpath.normpath(argv[2]) == r"D:\archive.bin"
         assert "--out-dir" not in argv
+        assert "--deep-detect" in argv
         assert "--ask-pw" in argv
         assert "--pause" in argv
 
@@ -68,8 +71,24 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         assert argv[1] == "extract"
         assert ntpath.normpath(argv[2]) == r"D:\archive.bin"
         assert "--out-dir" not in argv
+        assert "--deep-detect" in argv
         assert "--ask-pw" not in argv
         assert "--pause" in argv
+
+    for surface in ("folder", "background"):
+        for action in ("deep_direct", "deep_prompt"):
+            expanded = commands[f"{surface}_{action}"].replace("%1", "D:\\").replace("%V", "D:\\")
+            argv = _windows_argv(expanded)
+            assert argv[1] == "extract"
+            assert "--deep-detect" in argv
+            assert ("--ask-pw" in argv) == (action == "deep_prompt")
+            assert ntpath.normpath(argv[2]) == "D:\\"
+            assert ntpath.normpath(argv[argv.index("--out-dir") + 1]) == "D:\\"
+        argv = _windows_argv(commands[f"{surface}_deep_watch"])
+        command_text = argv[argv.index("-Command") + 1]
+        assert "'watch','add'," in command_text
+        assert "'--deep-detect'" in command_text
+        assert "'--initial-scan'" in command_text
 
     for key in ("folder_watch", "background_watch"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")
@@ -86,6 +105,7 @@ def test_context_menu_commands_are_safe_for_drive_roots_and_keep_password_flag()
         assert "'--start'" in command_text
         assert "'--initial-scan'" in command_text
         assert "--pause" not in command_text
+        assert "--deep-detect" not in command_text
 
     for key in ("folder_unwatch", "background_unwatch"):
         expanded = commands[key].replace("%1", "D:\\").replace("%V", "D:\\")

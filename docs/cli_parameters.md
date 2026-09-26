@@ -34,7 +34,7 @@ Short command examples:
 ```powershell
 sunpack x D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt -k --no-pause
 sunpack i D:\Downloads --analysis -d -j
-sunpack w add D:\Downloads -o E:\Output -s -i
+sunpack w add D:\Downloads -o E:\Output -s -i -d
 sunpack w ls
 sunpack w st
 ```
@@ -75,7 +75,7 @@ Options:
 | `-a`, `--ask-pw` | Prompt for passwords interactively in the terminal; an empty line ends input. |
 | `--no-builtin-pw`, `--no-bpw` | Disable the built-in password table. |
 | `--no-dir-pw`, `--no-dpw` | Disable `sunpack-passwords.txt` from the archive's own directory. |
-| `-d`, `--deep-detect` | Enable a full embedded scan for candidates that detection did not resolve. |
+| `-d`, `--deep-detect` | Enable a full embedded scan for unresolved candidates and disable all filesystem scan filters for this request. |
 | `-r VALUE`, `--recur VALUE` | Override the number of nested extraction rounds; accepts a positive integer, `*`, or `?`. |
 | `-c VALUE`, `--cleanup VALUE` | Override how the original archive is handled on success: `d` delete, `r` Recycle Bin, `k` keep. |
 | `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | Set the output root; relative paths are resolved against the current command directory. |
@@ -122,7 +122,7 @@ python sunpack.py scan [options] <paths...>
 
 `scan` outputs the identified extraction tasks, volume relationships, detected extensions, verdicts, and matched rules. It does not extract or clean up files.
 
-`--deep-detect` performs a full embedded scan on candidates that qualify but were not resolved by normal detection. The directory scope is affected by `filesystem.directory_scan_mode`, `filesystem.scan_filters_enabled`, and `filesystem.scan_filters`.
+`--deep-detect` performs a full embedded scan on candidates not resolved by normal detection and disables all filesystem scan filters for this request, including nested output scans. `filesystem.directory_scan_mode` still determines the directory scope. Each CLI request uses its own arguments, even when it shares a runtime with deep monitoring of the same input directory.
 
 Examples:
 
@@ -148,7 +148,7 @@ Options:
 | --- | --- |
 | `--archives-only`, `--archives` | Show only items finally judged extractable. |
 | `--analyze`, `--analysis` | Attach format, fragment, damage markers, and candidate summaries to extractable or pending candidates. |
-| `-d`, `--deep-detect` | Enable a full embedded scan for candidates that detection did not resolve. |
+| `-d`, `--deep-detect` | Enable a full embedded scan for unresolved candidates and disable all filesystem scan filters for this request. |
 
 `-v` additionally prints the effective configuration, matched rules, scoring details, and factual errors; JSON output keeps the corresponding structured fields.
 
@@ -169,15 +169,18 @@ Usage:
 python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
 ```
 
-Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. Each line may contain only an input directory, or may use `|` to specify an output root:
+Monitored roots are stored in `sunpack_watch_roots.txt` inside the program resource directory. The format is `input directory | output root | deep_detect`; the last two columns are optional:
 
 ```text
 C:\Downloads
 E:\Archives | E:\Output
-F:\Incoming | .
+F:\Incoming | . | true
+G:\Incoming | | true
 ```
 
 When only the input directory is given, `watch.out_dir` is used; a relative output path is resolved against that input directory and persisted as an absolute path. The output root may be on a different drive. `watch` only observes the direct files of each root and does not recursively watch subdirectories; the input root must be on an NTFS volume with a readable USN Journal.
+
+`deep_detect` accepts `true` or `false`; an omitted or empty value defaults to `false`. This mode belongs to the input directory. Different input roots may share an output root and use different modes. Nested extraction, password retries, and crash recovery retain the original input root and use its configured mode. Deep mode disables all filesystem scan filters for that root's requests. Editing the column triggers configuration reload; `watch reload` also applies it.
 
 Subcommands and options:
 
@@ -188,7 +191,8 @@ Subcommands and options:
 | `start` | `-i`, `--initial-scan` | Process existing files at startup. |
 | `add PATH...` | `-o/--out-dir DIR` | Add a monitored root; only one path may be added at a time. |
 | `add PATH...` | `-s`, `--start` | Start continuous monitoring after adding. |
-| `add PATH...` | `-i`, `--initial-scan` | Run an initial scan for the new root after adding. |
+| `add PATH...` | `-i`, `--initial-scan` | Run an initial scan for newly added roots or roots whose deep mode changed. |
+| `add PATH...` | `-d`, `--deep-detect` | Persist `deep_detect=true` for each input root; update already registered roots too. |
 | `remove PATH...`, `rm PATH...` | — | Remove a monitored root by input directory, and clean up that root's per-directory password file. |
 | `list`, `ls` | — | List the persisted input directories. |
 | `reload` | — | Re-read the configuration and monitored roots. |
@@ -199,6 +203,14 @@ Subcommands and options:
 `start` keeps running until a stop request arrives; `start --once` completes one current scheduling pass and then exits. Writing, moving, or modifying a file triggers an active cycle; once the file is ready it is submitted for processing according to the configured quiet policy. The arrival of a new volume or a change in password sources reactivates the affected tasks.
 
 `add`'s `-o/--out-dir` can only be used together with a single input directory. Adding the same input directory again does not change the existing output mapping; you must `remove` and then `add` to update the mapping. The output roots of different monitored roots must not be strict ancestors or descendants of one another; the same output root may be shared.
+
+Adding a new root without `--deep-detect` leaves deep mode disabled. Re-adding an existing root without the flag preserves its mode; set the third column to `false` or leave it empty to disable deep mode.
+
+```powershell
+sunpack.exe watch add D:\Downloads --deep-detect --start --initial-scan
+```
+
+The directory and directory-background context menus include separate deep scan extraction, deep extraction with a password prompt, and deep monitoring entries. The existing two file extraction entries enable `--deep-detect` by default. Re-run `scripts/register_context_menu.ps1` to apply the updated menus.
 
 ## passwords
 

@@ -7,7 +7,7 @@ import os
 from copy import deepcopy
 from contextlib import contextmanager
 from ctypes import wintypes
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
@@ -16,6 +16,7 @@ from sunpack.core.contracts.content_recovery import require_complete_content
 from sunpack.runtime.watch.config_observer import ConfigFileObserver
 from sunpack.runtime.watch.log import WatchLogStore
 from sunpack.runtime.watch.scheduler import WatchScheduler
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.toast import WatchToastCoordinator
 from sunpack.core.passwords.internal.local_files import DIRECTORY_PASSWORD_FILE_NAME
 from sunpack.core.support.path_keys import path_key
@@ -28,11 +29,9 @@ from sunpack.core.support.resource_lifecycle import (
 
 SERVICE_STATE = "state.json"
 WATCH_ROOTS_FILENAME = "sunpack_watch_roots.txt"
-# One roots entry is ``<input root> | <output root>``; ``|`` cannot appear in a Windows path.
-# A line without the separator means "output beside the input", a form understood only here.
+# Optional columns: ``<input root> | <output root> | <deep_detect>``.
 WATCH_ROOT_OUTPUT_SEPARATOR = "|"
 ROOTS_MUTEX_PREFIX = "Local\\SunPackWatchRoots"
-WatchRootEntry = tuple[str, str | None]
 CONTROL_STOP = "stop"
 CONTROL_RELOAD = "reload"
 CONTROL_SCHEDULER_WAKEUP = "scheduler_wakeup"
@@ -77,10 +76,8 @@ def _release_watch_broker() -> None:
 def service_config_from(config: dict) -> dict:
     service = config.get("watch") if isinstance(config.get("watch"), dict) else {}
     default_output_root = str(service.get("out_dir") or ".")
-    root_outputs = read_watch_root_outputs(default_output_root)
     result = dict(service)
-    result["roots"] = read_watch_roots(default_output_root)
-    result["root_outputs"] = root_outputs
+    result["root_entries"] = list(_iter_watch_root_entries(default_output_root, None))
     return result
 
 
@@ -110,7 +107,7 @@ def existing_roots(roots: list[str]) -> list[str]:
 
 
 def service_state_dir(config: dict) -> str:
-    service = service_config_from(config)
+    service = config.get("watch") if isinstance(config.get("watch"), dict) else {}
     state_dir = str(service.get("state_dir") or "").strip()
     if state_dir:
         return resolve_service_path(state_dir)
@@ -204,12 +201,7 @@ def _resolve_watch_output_root(input_root: str, configured_output_root: str) -> 
 
 
 def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
-    """Read unique ``(input_root, explicit_output_root)`` entries in file order.
-
-    A missing explicit output is represented by ``None`` so callers can preserve the distinction
-    between a legacy line and a root with its own output mapping.  If a file contains duplicate
-    input roots, the first input spelling/order is kept and the last output mapping wins.
-    """
+    """Read optional output/deep columns; the last record for an input root wins."""
     roots_path = path or watch_roots_path()
     try:
         lines = read_task_text(roots_path, encoding="utf-8").splitlines()
@@ -217,38 +209,43 @@ def _read_watch_root_entries(path: Path | None = None) -> list[WatchRootEntry]:
         return []
     entries: list[WatchRootEntry] = []
     positions: dict[str, int] = {}
-    for line in lines:
+    for line_number, line in enumerate(lines, 1):
         value = line.strip()
         if not value or value.startswith("#"):
             continue
-        input_part, separator, output_part = value.partition(WATCH_ROOT_OUTPUT_SEPARATOR)
-        input_root = input_part.strip()
+        parts = [part.strip() for part in value.split(WATCH_ROOT_OUTPUT_SEPARATOR)]
+        if len(parts) > 3:
+            raise ValueError(f"{roots_path}:{line_number}: expected input | output | deep_detect")
+        input_root = parts[0]
         if not input_root:
             continue
         input_root = normalize_root(input_root)
         explicit_output = None
-        if separator and output_part.strip():
-            explicit_output = _resolve_watch_output_root(input_root, output_part)
+        if len(parts) >= 2 and parts[1]:
+            explicit_output = _resolve_watch_output_root(input_root, parts[1])
+        deep_value = parts[2].casefold() if len(parts) == 3 else ""
+        if deep_value not in {"", "true", "false"}:
+            raise ValueError(f"{roots_path}:{line_number}: deep_detect must be true or false")
+        entry = WatchRootEntry(input_root, explicit_output, deep_value == "true")
         key = path_key(input_root)
         position = positions.get(key)
         if position is None:
             positions[key] = len(entries)
-            entries.append((input_root, explicit_output))
+            entries.append(entry)
         else:
-            original_input, _original_output = entries[position]
-            entries[position] = (original_input, explicit_output)
+            entries[position] = replace(entry, input_root=entries[position].input_root)
     return entries
 
 
 def _iter_watch_root_entries(default_output_root: str, path: Path | None):
-    """Yield ``(input_root, output_root)`` as absolute paths, in file order.
+    """Yield input policies with resolved absolute output paths, in file order.
 
     A line without an explicit output keeps the configured ``watch.out_dir``.  Relative output
     roots are resolved against their own input root, never against the process working directory.
     """
-    for input_root, explicit_output in _read_watch_root_entries(path):
-        output_root = explicit_output or _resolve_watch_output_root(input_root, default_output_root)
-        yield input_root, output_root
+    for entry in _read_watch_root_entries(path):
+        output_root = entry.output_root or _resolve_watch_output_root(entry.input_root, default_output_root)
+        yield replace(entry, output_root=output_root)
 
 
 def read_watch_root_outputs(
@@ -261,8 +258,8 @@ def read_watch_root_outputs(
     last line that names a root wins.
     """
     return {
-        path_key(input_root): output_root
-        for input_root, output_root in _iter_watch_root_entries(default_output_root, path)
+        path_key(entry.input_root): entry.output_root
+        for entry in _iter_watch_root_entries(default_output_root, path)
     }
 
 
@@ -270,7 +267,8 @@ def read_watch_roots(default_output_root: str = ".", path: Path | None = None) -
     """The watched input roots, in their own casing and file order."""
     roots: list[str] = []
     seen: set[str] = set()
-    for input_root, _output_root in _iter_watch_root_entries(default_output_root, path):
+    for entry in _iter_watch_root_entries(default_output_root, path):
+        input_root = entry.input_root
         key = path_key(input_root)
         if key in seen:
             continue
@@ -282,7 +280,8 @@ def read_watch_roots(default_output_root: str = ".", path: Path | None = None) -
 def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path: Path) -> Path:
     normalized_entries: list[WatchRootEntry] = []
     seen = set()
-    for input_root, output_root in entries:
+    for entry in entries:
+        input_root, output_root = entry.input_root, entry.output_root
         normalized_input = normalize_root(input_root)
         key = path_key(normalized_input)
         if key in seen:
@@ -292,7 +291,7 @@ def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path
             if output_root is None or not str(output_root).strip()
             else _resolve_watch_output_root(normalized_input, str(output_root))
         )
-        normalized_entries.append((normalized_input, normalized_output))
+        normalized_entries.append(replace(entry, input_root=normalized_input, output_root=normalized_output))
         seen.add(key)
     comments: list[str] = []
     try:
@@ -309,8 +308,10 @@ def _write_watch_root_entries_unlocked(entries: list[WatchRootEntry], roots_path
         roots_path,
         prefix
         + "".join(
-            f"{input_root}{f' {WATCH_ROOT_OUTPUT_SEPARATOR} {output_root}' if output_root else ''}\n"
-            for input_root, output_root in normalized_entries
+            entry.input_root
+            + (f" | {entry.output_root or ''} | true" if entry.deep_detect else f" | {entry.output_root}" if entry.output_root else "")
+            + "\n"
+            for entry in normalized_entries
         ),
         encoding="utf-8",
     )
@@ -321,28 +322,35 @@ def add_watch_roots(
     paths: list[str],
     *,
     output_dir: str | None = None,
-) -> tuple[Path, list[str]]:
+    deep_detect: bool | None = None,
+) -> tuple[Path, list[str], list[str]]:
     roots_path = watch_roots_path()
     with _watch_roots_mutex(roots_path):
         entries = _read_watch_root_entries(path=roots_path)
-        seen = {path_key(input_root) for input_root, _output_root in entries}
+        positions = {path_key(entry.input_root): index for index, entry in enumerate(entries)}
         added = []
+        updated = []
         for path in paths:
             normalized = normalize_root(path)
             key = path_key(normalized)
-            if key in seen:
+            if key in positions:
+                index = positions[key]
+                entry = entries[index]
+                if deep_detect is not None and entry.deep_detect != deep_detect:
+                    entries[index] = replace(entry, deep_detect=deep_detect)
+                    updated.append(entry.input_root)
                 continue
             explicit_output = (
                 None
                 if output_dir is None
                 else _resolve_watch_output_root(normalized, output_dir)
             )
-            entries.append((normalized, explicit_output))
-            seen.add(key)
+            positions[key] = len(entries)
+            entries.append(WatchRootEntry(normalized, explicit_output, bool(deep_detect)))
             added.append(normalized)
-        if added:
+        if added or updated:
             _write_watch_root_entries_unlocked(entries, roots_path)
-    return roots_path, added
+    return roots_path, added, updated
 
 
 def remove_watch_roots(paths: list[str], *, cleanup: bool = True) -> tuple[Path, list[str]]:
@@ -352,11 +360,12 @@ def remove_watch_roots(paths: list[str], *, cleanup: bool = True) -> tuple[Path,
         entries = _read_watch_root_entries(path=roots_path)
         kept: list[WatchRootEntry] = []
         removed = []
-        for input_root, output_root in entries:
+        for entry in entries:
+            input_root = entry.input_root
             if path_key(input_root) in expected:
                 removed.append(input_root)
             else:
-                kept.append((input_root, output_root))
+                kept.append(entry)
         if removed:
             _write_watch_root_entries_unlocked(kept, roots_path)
     if cleanup:
@@ -420,15 +429,13 @@ class WatchService:
 
     @property
     def roots(self) -> list[str]:
-        return existing_roots(list(self.service_config.get("roots") or []))
+        return existing_roots([entry.input_root for entry in self.service_config["root_entries"]])
 
     @property
     def root_outputs(self) -> dict[str, str]:
         """Output root of every existing watch root, keyed by the input root."""
-        configured = self.service_config.get("root_outputs")
-        if not isinstance(configured, dict):
-            return {}
-        return {path_key(root): configured[path_key(root)] for root in self.roots if path_key(root) in configured}
+        roots = {path_key(root) for root in self.roots}
+        return {path_key(entry.input_root): entry.output_root for entry in self.service_config["root_entries"] if path_key(entry.input_root) in roots}
 
     async def run(
         self,
@@ -571,15 +578,17 @@ class WatchService:
         paths: list[str],
         *,
         output_dir: str | None = None,
+        deep_detect: bool | None = None,
         initial_scan: bool = True,
     ) -> dict:
         async with self._reload_lock:
-            roots_path, added = add_watch_roots(paths, output_dir=output_dir)
-            if not added:
+            roots_path, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect)
+            if not added and not updated:
                 self.log.write("watch_roots_add_skipped", requested=_normalize_scan_roots(paths))
                 return {
                     "roots_path": str(roots_path),
                     "added": [],
+                    "updated": [],
                     "applied": False,
                 }
             new_service_config = service_config_from(self.config)
@@ -587,11 +596,12 @@ class WatchService:
                 self.config,
                 new_service_config,
                 service_state_dir(self.config),
-                initial_scan_roots=added if initial_scan else None,
+                initial_scan_roots=added + updated if initial_scan else None,
             )
             return {
                 "roots_path": str(roots_path),
                 "added": added,
+                "updated": updated,
                 "applied": applied,
             }
 
@@ -645,7 +655,7 @@ class WatchService:
         roots = self.roots
         if not roots:
             self._stop_toast_host()
-            self.log.write("scheduler_not_started", reason="no_existing_roots", configured_roots=list(self.service_config.get("roots") or []))
+            self.log.write("scheduler_not_started", reason="no_existing_roots", configured_roots=[entry.input_root for entry in self.service_config["root_entries"]])
             return
         configured_out_dir = str(self.service_config.get("out_dir") or self.config.get("output", {}).get("root") or ".")
         out_dir = resolve_service_path(configured_out_dir) if Path(configured_out_dir).expanduser().is_absolute() else configured_out_dir
@@ -674,6 +684,7 @@ class WatchService:
                 roots,
                 out_dir=out_dir,
                 output_roots=self.root_outputs,
+                root_entries=self.service_config["root_entries"],
                 state_path=state_path,
                 cold_start_seconds=float(
                     watch_config.get(

@@ -19,9 +19,9 @@ class ArchiveTaskScanner:
         context: RunState,
         detection_options: EmbeddedOptions | None = None,
     ):
-        self.config = config
         self.context = context
         self.provider = ArchiveTaskProvider(config, detection_options=detection_options)
+        self.config = self.provider.config
         self.detector = self.provider.detector
         self.last_scan_session: DiscoveryScanSession | None = None
 

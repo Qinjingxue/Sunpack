@@ -7,6 +7,7 @@ from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.scheduler import WatchScheduler, _ActivePipelineRequest
+from sunpack.runtime.watch.roots import WatchRootEntry
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 
@@ -46,7 +47,7 @@ def _candidate(path):
     return WatchCandidate(str(path), stat.st_size, stat.st_mtime)
 
 
-def _watcher(tmp_path, monkeypatch):
+def _watcher(tmp_path, monkeypatch, *, deep_detect=False):
     root = tmp_path / "in"
     output = tmp_path / "out"
     root.mkdir()
@@ -57,6 +58,7 @@ def _watcher(tmp_path, monkeypatch):
         {"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}},
         [str(root)],
         output_roots={str(root): str(output)},
+        root_entries=[WatchRootEntry(str(root), str(output), deep_detect)],
         state_path=str(tmp_path / "state.json"),
         cold_start_seconds=0,
         initial_scan=False,
@@ -79,6 +81,7 @@ async def _complete(watcher, candidate, response):
         notification_id="request",
         candidate=candidate,
         task=asyncio.create_task(done()),
+        source_input_root=watcher._source_input_root_for(candidate.path),
     )
     return await watcher._complete_candidate(request)
 
@@ -143,6 +146,7 @@ def test_password_retry_can_advance_to_the_next_generated_task(tmp_path, monkeyp
             "kind": "wrong_password",
             "blockers": ["password"],
             "password_scope_dir": str(root),
+            "source_input_root": str(root),
         },
     )
     failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")
@@ -158,6 +162,52 @@ def test_password_retry_can_advance_to_the_next_generated_task(tmp_path, monkeyp
     assert entry is not None and entry.status == "failed_password"
     assert entry.password_scope_dir == str(root.resolve())
     assert [action for action, _ in sink.actions] == ["suppressed"]
+
+
+def test_shared_output_password_retry_keeps_original_input_detection_mode(tmp_path, monkeypatch):
+    async def scenario():
+        watcher, root, output, _sink = _watcher(tmp_path, monkeypatch, deep_detect=True)
+        ordinary_root = tmp_path / "ordinary"
+        ordinary_root.mkdir()
+        watcher.watch_roots.append(str(ordinary_root))
+        watcher.root_entries[scheduler_module.path_key(str(ordinary_root))] = WatchRootEntry(
+            str(ordinary_root), str(output), False,
+        )
+        watcher.output_roots[scheduler_module.path_key(str(ordinary_root))] = str(output)
+        outer = root / "outer.bin"
+        ordinary = ordinary_root / "ordinary.bin"
+        inner = output / "outer" / "inner.bin"
+        inner.parent.mkdir()
+        for path in (outer, ordinary, inner):
+            path.write_bytes(b"payload")
+        failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")
+        await _complete(watcher, _candidate(outer), _response(
+            TargetRunResult(str(outer), OutcomeKind.COMPLETE_SUCCESS),
+            TargetRunResult(str(inner), OutcomeKind.FAILURE, failure=failure),
+        ))
+        entry = watcher.state.latest_entry_for_path(str(inner))
+        assert entry.source_input_root == str(root)
+        watcher.enqueue(str(inner), force=True, event_type="password_retry", _password_retry_snapshot=entry)
+        assert watcher.state.pending_work_for_path(str(inner)).source_input_root == str(root)
+
+        # Restart reads both pending provenance and the blocker from native persistence.
+        watcher.state = scheduler_module.WatchStateStore(str(watcher.state.path))
+        captured = []
+
+        async def run(_targets, **kwargs):
+            captured.append(kwargs)
+            return PipelineResponse("request", RunSummary(), PipelineArtifacts())
+
+        watcher.pipeline_engine.run = run
+        for path in (inner, ordinary):
+            request = await watcher._submit_candidate(_candidate(path))
+            assert request is not None
+            await request.task
+        assert [item["detection_options"].force_scan for item in captured] == [True, False]
+        assert captured[0]["request_config"]["filesystem"]["scan_filters_enabled"] is False
+        assert "filesystem" not in watcher.config
+
+    asyncio.run(scenario())
 
 
 def test_generated_missing_volume_is_terminal_and_not_suspended(tmp_path, monkeypatch):

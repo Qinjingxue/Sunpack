@@ -34,6 +34,7 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
     state.queue_active(
         _candidate(source),
         password_scope_dir=str(tmp_path),
+        source_input_root=str(tmp_path),
         durable_owner=True,
         persist=True,
         durable=True,
@@ -46,6 +47,7 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
     [before_finish] = WatchStateStore(str(state_path)).pending_work_items()
     assert before_finish.active_outputs[str(inner.resolve())] == str(output.resolve())
     assert before_finish.password_scope_dir == str(tmp_path.resolve())
+    assert before_finish.source_input_root == str(tmp_path)
 
     assert state.record_task_output_finished(
         str(source),
@@ -57,6 +59,7 @@ def test_pending_output_recovery_state_round_trips(tmp_path):
     assert finished.active_outputs == {}
     assert finished.committed_roots == [str(output.resolve())]
     assert finished.completed_sources == [str(inner.resolve())]
+    assert finished.source_input_root == str(tmp_path)
 
 
 def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
@@ -68,7 +71,7 @@ def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"x")
     state = WatchStateStore(str(state_path))
-    state.queue_active(_candidate(outer), password_scope_dir=str(tmp_path))
+    state.queue_active(_candidate(outer), password_scope_dir=str(tmp_path), source_input_root=str(tmp_path))
     state.rebase_pending_work(
         str(outer),
         [_candidate(first), _candidate(second)],
@@ -79,6 +82,7 @@ def test_rebase_pending_work_atomically_moves_recovery_anchor(tmp_path):
     assert {item.path for item in recovered} == {str(first.resolve()), str(second.resolve())}
     assert all(item.internal_recovery for item in recovered)
     assert all(item.password_scope_dir == str(tmp_path.resolve()) for item in recovered)
+    assert all(item.source_input_root == str(tmp_path) for item in recovered)
     assert all(not item.active_outputs and not item.committed_roots for item in recovered)
 
 
@@ -100,6 +104,7 @@ def test_live_enqueue_keeps_owner_memory_only(tmp_path):
     scheduler._quiet_policy = SimpleNamespace()
     scheduler.state = SimpleNamespace(
         latest_entry_for_path=lambda _path: None,
+        pending_work_for_path=lambda _path: None,
         queue_active=lambda *_args, **kwargs: calls.append(kwargs),
     )
     scheduler.config = {}
@@ -288,6 +293,7 @@ def test_enqueue_does_not_publish_memory_work_when_durable_queue_fails(tmp_path)
 
     scheduler.state = SimpleNamespace(
         latest_entry_for_path=lambda _path: None,
+        pending_work_for_path=lambda _path: None,
         queue_active=fail_queue,
     )
     scheduler.config = {}

@@ -288,3 +288,47 @@ def test_reacquiring_owned_path_reuses_snapshotted_path_facts(tmp_path):
         assert registry._owned == {"owner": {str(path)}}
 
     asyncio.run(scenario())
+
+
+def test_watch_requests_with_different_detection_modes_do_not_coalesce(tmp_path):
+    async def scenario():
+        registry = _PathLeaseRegistry()
+        path = tmp_path / "archive.part1.rar"
+        path.write_bytes(b"payload")
+        await registry.replace("ordinary", (path,), coalesce_exact=True)
+
+        waiting = asyncio.create_task(registry.replace(
+            "deep", (path,), coalesce_exact=True, deep_detect=True,
+        ))
+        await asyncio.sleep(0)
+        assert not waiting.done()
+
+        await registry.release("ordinary")
+        assert await asyncio.wait_for(waiting, timeout=0.1) is None
+        assert await registry.replace(
+            "also-deep", (path,), coalesce_exact=True, deep_detect=True,
+        ) == "deep"
+        await registry.release("deep")
+        assert not registry._owner_modes
+        assert not registry._generation_owners
+
+    asyncio.run(scenario())
+
+
+def test_completed_watch_outputs_are_isolated_by_detection_mode(tmp_path):
+    async def scenario():
+        registry = _PathLeaseRegistry()
+        path = tmp_path / "archive.bin"
+        path.write_bytes(b"payload")
+        output = tmp_path / "out"
+        output.mkdir()
+        await registry.replace("ordinary", (path,), coalesce_exact=True)
+        version = registry.ownership_version_for("ordinary", (path,))
+        registry.remember_completed_watch(version, str(output))
+        assert registry.completed_watch_output(version) == str(output)
+        assert registry.completed_watch_output(version, deep_detect=True) == ""
+
+        registry.remember_completed_watch(version, str(output), deep_detect=True)
+        assert registry.completed_watch_output(version, deep_detect=True) == str(output)
+
+    asyncio.run(scenario())

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, TextIO
 
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
+from sunpack.core.config.detection_view import discovery_run_config
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse, PipelineTarget
 from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, TargetRunResult
 from sunpack.core.contracts.run_state import RunState
@@ -46,7 +47,7 @@ class _Submission:
     builtin_passwords: tuple[str, ...]
     config: dict
     origin: str = "foreground"
-    detection_options: EmbeddedOptions | None = None
+    detection_options: EmbeddedOptions = EmbeddedOptions()
     stdout: TextIO | None = None
     stderr: TextIO | None = None
     progress_callback: Callable[[Any, dict[str, Any]], None] | None = None
@@ -55,9 +56,8 @@ class _Submission:
 class PipelineEngine:
     """Single-event-loop owner for independently completing requests."""
 
-    def __init__(self, config: dict, detection_options: EmbeddedOptions | None = None):
+    def __init__(self, config: dict):
         self.config = config
-        self.detection_options = detection_options or EmbeddedOptions()
         worker_config = _worker_config(config)
         self._broker = AsyncWorkBroker(
             thread_capacity=int(worker_config.get("stage_thread_capacity", 0) or 0),
@@ -65,7 +65,7 @@ class PipelineEngine:
                 worker_config.get("max_pending_stage_jobs", worker_config.get("max_queue_jobs", 4096)) or 4096
             ),
         )
-        self._services = _PipelineServices(config, self._broker, self.detection_options)
+        self._services = _PipelineServices(config, self._broker)
         self._runtime = self._services
         self._active_requests: dict[str, asyncio.Task] = {}
         self._request_runtime_factory = _RequestRuntime
@@ -133,6 +133,8 @@ class PipelineEngine:
         if not normalized:
             raise ValueError("PipelineEngine.run requires at least one target")
         request_config = copy.deepcopy(request_config if request_config is not None else self.config)
+        detection_options = detection_options or EmbeddedOptions()
+        request_config = discovery_run_config(request_config, deep_detect=detection_options.force_scan)
         user_passwords = tuple(request_config.get("user_passwords", self._user_passwords) or [])
         builtin_passwords = tuple(request_config.get("builtin_passwords", self._builtin_passwords) or [])
         request_config["user_passwords"] = list(user_passwords)
@@ -145,7 +147,7 @@ class PipelineEngine:
             builtin_passwords=builtin_passwords,
             config=request_config,
             origin="watch" if str(origin).lower() == "watch" else "foreground",
-            detection_options=detection_options or self.detection_options,
+            detection_options=detection_options,
             stdout=stdout,
             stderr=stderr,
             progress_callback=progress_callback,
@@ -166,7 +168,7 @@ class PipelineEngine:
                 runtime = self._request_runtime_factory(
                     self._services,
                     submission,
-                    submission.detection_options or self.detection_options,
+                    submission.detection_options,
                     self._path_leases,
                 )
                 start_time = time.time()
@@ -356,12 +358,13 @@ class _PathLeaseRegistry:
         self._directory_owners: dict[str, set[str]] = {}
         self._prefix_owners: dict[str, set[str]] = {}
         self._ownership_versions: dict[str, tuple[tuple[str, int, int, int, int], ...]] = {}
+        self._owner_modes: dict[str, bool] = {}
         self._generation_owners: dict[
-            tuple[tuple[str, int, int, int, int], ...],
+            tuple[tuple[tuple[str, int, int, int, int], ...], bool],
             str,
         ] = {}
         self._completed_watch_generations: dict[
-            tuple[str, ...],
+            tuple[tuple[str, ...], bool],
             tuple[tuple[tuple[str, int, int, int, int], ...], str],
         ] = {}
         self._waiters_by_blocker: dict[str, set[asyncio.Future[None]]] = {}
@@ -424,6 +427,7 @@ class _PathLeaseRegistry:
         paths: Iterable[str],
         *,
         coalesce_exact: bool = False,
+        deep_detect: bool = False,
     ) -> str | None:
         """Atomically claim a fully resolved physical input set.
 
@@ -449,7 +453,7 @@ class _PathLeaseRegistry:
                         self._wake_waiters_for(owner)
 
                 if coalesce_exact:
-                    exact_owner = self._generation_owners.get(ownership_version, "")
+                    exact_owner = self._generation_owners.get((ownership_version, deep_detect), "")
                     if exact_owner and exact_owner != owner:
                         return exact_owner
 
@@ -459,6 +463,7 @@ class _PathLeaseRegistry:
                         owner,
                         prepared,
                         ownership_version=ownership_version,
+                        deep_detect=deep_detect,
                     )
                     return None
                 waiter = self._register_waiter(blockers)
@@ -496,11 +501,13 @@ class _PathLeaseRegistry:
     def completed_watch_output(
         self,
         ownership_version: tuple[tuple[str, int, int, int, int], ...],
+        *,
+        deep_detect: bool = False,
     ) -> str:
         """Return the prior output only for the exact unchanged physical generation."""
         if not ownership_version:
             return ""
-        key = tuple(row[0] for row in ownership_version)
+        key = (tuple(row[0] for row in ownership_version), deep_detect)
         record = self._completed_watch_generations.get(key)
         if record is None:
             return ""
@@ -517,10 +524,12 @@ class _PathLeaseRegistry:
         self,
         ownership_version: tuple[tuple[str, int, int, int, int], ...],
         output_dir: str,
+        *,
+        deep_detect: bool = False,
     ) -> None:
         if not ownership_version or not output_dir:
             return
-        key = tuple(row[0] for row in ownership_version)
+        key = (tuple(row[0] for row in ownership_version), deep_detect)
         record = (ownership_version, os.path.abspath(os.path.normpath(output_dir)))
         self._completed_watch_generations.pop(key, None)
         self._completed_watch_generations[key] = record
@@ -557,6 +566,7 @@ class _PathLeaseRegistry:
         paths: Iterable[_LeasePath],
         *,
         ownership_version: tuple[tuple[str, int, int, int, int], ...] = (),
+        deep_detect: bool = False,
     ) -> None:
         owner_paths = self._lease_paths.setdefault(owner, {})
         owned = self._owned.setdefault(owner, set())
@@ -576,17 +586,19 @@ class _PathLeaseRegistry:
 
         if ownership_version:
             self._ownership_versions[owner] = ownership_version
-            self._generation_owners[ownership_version] = owner
+            self._owner_modes[owner] = deep_detect
+            self._generation_owners[(ownership_version, deep_detect)] = owner
 
     def _remove_owner(self, owner: str) -> bool:
         paths = self._lease_paths.pop(owner, {})
         owned = self._owned.pop(owner, None)
         ownership_version = self._ownership_versions.pop(owner, ())
+        mode = self._owner_modes.pop(owner, False)
         if (
             ownership_version
-            and self._generation_owners.get(ownership_version) == owner
+            and self._generation_owners.get((ownership_version, mode)) == owner
         ):
-            self._generation_owners.pop(ownership_version, None)
+            self._generation_owners.pop((ownership_version, mode), None)
 
         for path in paths.values():
             if self._exact_owners.get(path.key) == owner:
@@ -668,7 +680,6 @@ class _PipelineServices:
         self,
         config: dict,
         broker: AsyncWorkBroker,
-        detection_options: EmbeddedOptions | None = None,
     ):
         self.config = config
         self.broker = broker
@@ -1152,6 +1163,7 @@ class _RequestRuntime:
                 self.submission.request_id,
                 member_paths,
                 coalesce_exact=True,
+                deep_detect=self.submission.detection_options.force_scan,
             )
             if coalesced_owner:
                 raise _CoalescedWatchRequest(coalesced_owner)
@@ -1236,7 +1248,9 @@ class _RequestRuntime:
             if watch_version:
                 task.runtime["source_generation"] = watch_version
             if watch_version and self._watch_task_can_reuse_completed(task):
-                completed_output = self.path_leases.completed_watch_output(watch_version)
+                completed_output = self.path_leases.completed_watch_output(
+                    watch_version, deep_detect=self.submission.detection_options.force_scan,
+                )
                 if completed_output:
                     reused = TargetRunResult(
                         input_path=task.main_path,
@@ -1302,6 +1316,7 @@ class _RequestRuntime:
                 self.path_leases.remember_completed_watch(
                     watch_version,
                     output_dir,
+                    deep_detect=self.submission.detection_options.force_scan,
                 )
 
             if output_dir and self.recursion.allows_children(depth):

@@ -42,6 +42,7 @@ def register(subparsers, ctx):
     add_parser.add_argument("-o", "--out-dir", dest="output_dir", help=ctx.t("cli.watch.output_dir"))
     add_parser.add_argument("-s", "--start", dest="start", action="store_true", help=ctx.t("cli.watch.start_after_add"))
     add_parser.add_argument("-i", "--initial-scan", dest="initial_scan", action="store_true", help=ctx.t("cli.watch.initial_scan"))
+    add_parser.add_argument("-d", "--deep-detect", dest="deep_detect", action="store_true", default=None, help=ctx.t("cli.watch.deep_detect"))
 
     remove_parser = actions.add_parser("remove", aliases=["rm"], parents=[common], help=ctx.t("cli.watch.remove"), formatter_class=CliHelpFormatter)
     remove_parser.set_defaults(watch_action="remove")
@@ -103,6 +104,7 @@ async def _handle_add(args, ctx):
     initial_scan_requested = bool(getattr(args, "initial_scan", False))
     paths = list(args.paths or [])
     output_dir = getattr(args, "output_dir", None)
+    deep_detect = getattr(args, "deep_detect", None)
     if output_dir is not None and len(paths) != 1:
         return EXIT_USAGE, CliCommandResult(
             command=COMMAND,
@@ -116,24 +118,27 @@ async def _handle_add(args, ctx):
         apply_summary = await host.add_watch_roots(
             paths,
             output_dir=output_dir,
+            deep_detect=deep_detect,
             initial_scan=initial_scan_requested,
         )
         roots_path = apply_summary["roots_path"]
         added = list(apply_summary["added"])
+        updated = list(apply_summary["updated"])
     else:
-        roots_path_obj, added = add_watch_roots(paths, output_dir=output_dir)
+        roots_path_obj, added, updated = add_watch_roots(paths, output_dir=output_dir, deep_detect=deep_detect)
         roots_path = str(roots_path_obj)
     start_summary = None
     if start_requested and not host.watch_enabled:
         start_summary = await host.start_watch(
-            initial_scan_roots=added if initial_scan_requested else None,
+            initial_scan_roots=added + updated if initial_scan_requested else None,
         )
     return 0, CliCommandResult(
         command=COMMAND,
-        inputs={"action": "add", "paths": paths, "output_dir": output_dir},
+        inputs={"action": "add", "paths": paths, "output_dir": output_dir, "deep_detect": deep_detect},
         summary={
             "roots_path": str(roots_path),
             "added": added,
+            "updated": updated,
             "apply": apply_summary,
             "start": start_summary,
             "start_requested": start_requested,

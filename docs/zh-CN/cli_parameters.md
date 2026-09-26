@@ -34,7 +34,7 @@ sunpack.exe <command> [options] [paths...]
 ```powershell
 sunpack x D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt -k --no-pause
 sunpack i D:\Downloads --analysis -d -j
-sunpack w add D:\Downloads -o E:\Output -s -i
+sunpack w add D:\Downloads -o E:\Output -s -i -d
 sunpack w ls
 sunpack w st
 ```
@@ -75,7 +75,7 @@ python sunpack.py extract [options] <paths...>
 | `-a`, `--ask-pw` | 在终端交互输入密码，空行结束。 |
 | `--no-builtin-pw`, `--no-bpw` | 禁用内置密码表。 |
 | `--no-dir-pw`, `--no-dpw` | 禁用归档同目录的 `sunpack-passwords.txt`。 |
-| `-d`, `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
+| `-d`, `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块。 |
 | `-r VALUE`, `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
 | `-c VALUE`, `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
 | `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录；相对路径按当前命令目录解析。 |
@@ -122,7 +122,7 @@ python sunpack.py scan [options] <paths...>
 
 `scan` 输出识别到的解压任务、分卷关系、检测扩展名、判定和命中规则，不会解压或清理文件。
 
-`--deep-detect` 会对符合条件但普通检测未解决的候选执行完整嵌入扫描。目录范围受 `filesystem.directory_scan_mode`、`filesystem.scan_filters_enabled` 和 `filesystem.scan_filters` 影响。
+`--deep-detect` 会对普通检测未解决的候选执行完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块，包括嵌套输出扫描。目录范围仍由 `filesystem.directory_scan_mode` 决定。每次 CLI 请求只按自身参数决定是否启用 deep；即使共享 runtime 正在深度监控同一输入目录，也不会影响 CLI 请求。
 
 示例：
 
@@ -148,7 +148,7 @@ python sunpack.py inspect [options] <paths...>
 | --- | --- |
 | `--archives-only`, `--archives` | 只显示最终判定为可解压的项目。 |
 | `--analyze`, `--analysis` | 为可解压或待确认候选附加格式、片段、损坏标记和候选摘要。 |
-| `-d`, `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
+| `-d`, `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描，并关闭本次请求的全部 filesystem 扫描过滤模块。 |
 
 `-v` 会额外打印有效配置、命中规则、评分细节和事实错误；JSON 输出保留对应结构化字段。
 
@@ -169,15 +169,18 @@ python sunpack.py inspect D:\Downloads -v
 python sunpack.py watch <add|remove|list|start|stop|reload|status|startup> [options]
 ```
 
-监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。每行可以只写输入目录，也可以用 `|` 指定输出根：
+监控根目录保存在程序资源目录下的 `sunpack_watch_roots.txt`。格式为 `输入目录 | 输出根 | deep_detect`，后两列可省略：
 
 ```text
 C:\Downloads
 E:\Archives | E:\Output
-F:\Incoming | .
+F:\Incoming | . | true
+G:\Incoming | | true
 ```
 
 只写输入目录时使用 `watch.out_dir`；相对输出路径按该输入目录解析并持久化为绝对路径。输出根可以跨盘。`watch` 只观察每个根目录的直接文件，不递归监听子目录；输入根需要位于 NTFS 卷且有可读取的 USN Journal。
+
+`deep_detect` 接受 `true` 或 `false`，省略或留空时默认为 `false`。模式绑定输入目录；多个输入目录可共用输出根，并分别采用不同模式。嵌套解压、密码重试和崩溃恢复均保留原始输入目录，按该目录的配置执行。启用 deep 时，该目录请求的全部 filesystem 扫描过滤模块失效。修改此列会触发配置重载，也可执行 `watch reload` 应用修改。
 
 子命令和参数：
 
@@ -188,7 +191,8 @@ F:\Incoming | .
 | `start` | `-i`, `--initial-scan` | 启动时处理已有文件。 |
 | `add PATH...` | `-o/--out-dir DIR` | 添加监控根；只能同时添加一个路径。 |
 | `add PATH...` | `-s`, `--start` | 添加后启动持续监控。 |
-| `add PATH...` | `-i`, `--initial-scan` | 添加后对新根执行初始扫描。 |
+| `add PATH...` | `-i`, `--initial-scan` | 对新增根或 deep 模式发生变化的根执行初始扫描。 |
+| `add PATH...` | `-d`, `--deep-detect` | 将各输入目录的 `deep_detect` 写为 `true`；已登记目录也会更新。 |
 | `remove PATH...`, `rm PATH...` | — | 按输入目录移除监控根，并清理该根的同目录密码文件。 |
 | `list`, `ls` | — | 列出持久化的输入目录。 |
 | `reload` | — | 重新读取配置和监控根。 |
@@ -199,6 +203,14 @@ F:\Incoming | .
 `start` 会持续运行直到收到停止请求；`start --once` 完成一次当前调度后退出。文件写入、移动或修改会触发活跃周期，文件准备好后按配置的静默策略提交处理。新分卷到达或密码来源变化会重新激活受影响任务。
 
 `add` 的 `-o/--out-dir` 只能和一个输入目录一起使用。重复添加同一输入目录不会改变已有输出映射；先 `remove` 再 `add` 才能更新映射。不同监控根的输出根不能互为严格的祖先和子目录，相同输出根可以共享。
+
+新增目录时不传 `--deep-detect`，默认不启用 deep。重复添加已登记目录时，不传该参数会保留已有模式；关闭 deep 可将第三列改为 `false` 或留空。
+
+```powershell
+sunpack.exe watch add D:\Downloads --deep-detect --start --initial-scan
+```
+
+目录和目录背景右键菜单保留普通入口，并新增“深度扫描解压”“交互输入密码深度解压”“深度监控此目录”。文件对象已有的两个解压入口默认启用 `--deep-detect`。重新运行 `scripts/register_context_menu.ps1` 可应用新菜单。
 
 ## passwords
 

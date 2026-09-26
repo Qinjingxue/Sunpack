@@ -2,6 +2,8 @@
 
 from typing import Any
 
+from sunpack.core.config.detection_view import discovery_run_config
+
 from sunpack.core.contracts.discovery import DiscoveryCandidate, StageResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
@@ -19,12 +21,14 @@ class ArchiveTaskProvider:
         config: dict[str, Any],
         detection_options: EmbeddedOptions | None = None,
     ):
+        options = detection_options or EmbeddedOptions()
+        config = discovery_run_config(config, deep_detect=options.force_scan)
         self.config = config
         self.detector = DetectionScheduler(config)
         self.discovery = ArchiveDiscoveryPipeline(
             config,
             self.detector,
-            detection_options or EmbeddedOptions(),
+            options,
         )
         self._relations = RelationsScheduler(config)
         self.failed_candidates: list[str] = []
