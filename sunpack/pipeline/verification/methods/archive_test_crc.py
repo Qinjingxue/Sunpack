@@ -366,30 +366,3 @@ def _coverage_float(coverage: dict[str, Any], key: str, default: float) -> float
         return float(coverage.get(key, default))
     except (TypeError, ValueError):
         return default
-
-
-def _optional_int(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _optional_float(value: Any) -> float | None:
-    if value is None or value == "":
-        return None
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return None
-
-
-def _optional_crc(value: Any) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value or 0) & 0xFFFFFFFF
-    except (TypeError, ValueError):
-        return None
