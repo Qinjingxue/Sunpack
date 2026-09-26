@@ -725,7 +725,6 @@ fn verify_winzip_aes_material(
     strength: u8,
     salt_and_verifier: &[u8],
 ) -> PyResult<Py<PyAny>> {
-    let result = PyDict::new(py);
     let Some((salt_len, key_len)) = aes_lengths(strength) else {
         return simple_status(
             py,
@@ -742,40 +741,47 @@ fn verify_winzip_aes_material(
             "winzip AES salt or password verifier is incomplete",
         );
     }
+
     let salt = &salt_and_verifier[..salt_len];
     let verifier = &salt_and_verifier[salt_len..];
-    let mut matched_indices = if candidates.len() >= AES_PARALLEL_PASSWORD_THRESHOLD {
-        candidates
-            .par_iter()
-            .enumerate()
-            .filter_map(|(index, password)| {
-                winzip_aes_verifier_matches(password.as_bytes(), salt, verifier, key_len)
-                    .then_some(index as i32)
-            })
-            .collect::<Vec<_>>()
-    } else {
-        candidates
-            .iter()
-            .enumerate()
-            .filter_map(|(index, password)| {
-                winzip_aes_verifier_matches(password.as_bytes(), salt, verifier, key_len)
-                    .then_some(index as i32)
-            })
-            .collect::<Vec<_>>()
-    };
-    matched_indices.sort_unstable();
+    let attempts = candidates.len() as i32;
+    let matched_indices = py.detach(|| {
+        let mut matched_indices = if candidates.len() >= AES_PARALLEL_PASSWORD_THRESHOLD {
+            candidates
+                .par_iter()
+                .enumerate()
+                .filter_map(|(index, password)| {
+                    winzip_aes_verifier_matches(password.as_bytes(), salt, verifier, key_len)
+                        .then_some(index as i32)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(index, password)| {
+                    winzip_aes_verifier_matches(password.as_bytes(), salt, verifier, key_len)
+                        .then_some(index as i32)
+                })
+                .collect::<Vec<_>>()
+        };
+        matched_indices.sort_unstable();
+        matched_indices
+    });
+
+    let result = PyDict::new(py);
     if let Some(first) = matched_indices.first().copied() {
         result.set_item("status", "match")?;
         result.set_item("matched_index", first)?;
         result.set_item("matched_indices", matched_indices)?;
-        result.set_item("attempts", candidates.len() as i32)?;
+        result.set_item("attempts", attempts)?;
         result.set_item("match_evidence", "winzip_aes_password_verifier")?;
         result.set_item("message", "winzip aes password verifiers matched")?;
         return Ok(result.into());
     }
     result.set_item("status", "no_match")?;
     result.set_item("matched_index", -1)?;
-    result.set_item("attempts", candidates.len() as i32)?;
+    result.set_item("attempts", attempts)?;
     result.set_item("message", "winzip aes password verifier did not match")?;
     Ok(result.into())
 }
@@ -786,39 +792,44 @@ fn verify_zipcrypto_material(
     encryption_header: &[u8; 12],
     check_byte: u8,
 ) -> PyResult<Py<PyAny>> {
+    let attempts = candidates.len() as i32;
+    let matched_indices = py.detach(|| {
+        let mut matched_indices = if candidates.len() >= ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD {
+            candidates
+                .par_iter()
+                .enumerate()
+                .filter_map(|(index, password)| {
+                    zipcrypto_header_matches(password.as_bytes(), encryption_header, check_byte)
+                        .then_some(index as i32)
+                })
+                .collect::<Vec<_>>()
+        } else {
+            candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(index, password)| {
+                    zipcrypto_header_matches(password.as_bytes(), encryption_header, check_byte)
+                        .then_some(index as i32)
+                })
+                .collect::<Vec<_>>()
+        };
+        matched_indices.sort_unstable();
+        matched_indices
+    });
+
     let result = PyDict::new(py);
-    let mut matched_indices = if candidates.len() >= ZIPCRYPTO_PARALLEL_PASSWORD_THRESHOLD {
-        candidates
-            .par_iter()
-            .enumerate()
-            .filter_map(|(index, password)| {
-                zipcrypto_header_matches(password.as_bytes(), encryption_header, check_byte)
-                    .then_some(index as i32)
-            })
-            .collect::<Vec<_>>()
-    } else {
-        candidates
-            .iter()
-            .enumerate()
-            .filter_map(|(index, password)| {
-                zipcrypto_header_matches(password.as_bytes(), encryption_header, check_byte)
-                    .then_some(index as i32)
-            })
-            .collect::<Vec<_>>()
-    };
-    matched_indices.sort_unstable();
     if let Some(first) = matched_indices.first().copied() {
         result.set_item("status", "match")?;
         result.set_item("matched_index", first)?;
         result.set_item("matched_indices", matched_indices)?;
-        result.set_item("attempts", candidates.len() as i32)?;
+        result.set_item("attempts", attempts)?;
         result.set_item("match_evidence", "zipcrypto_header_byte")?;
         result.set_item("message", "zipcrypto password headers matched")?;
         return Ok(result.into());
     }
     result.set_item("status", "no_match")?;
     result.set_item("matched_index", -1)?;
-    result.set_item("attempts", candidates.len() as i32)?;
+    result.set_item("attempts", attempts)?;
     result.set_item("message", "zipcrypto password header did not match")?;
     Ok(result.into())
 }
