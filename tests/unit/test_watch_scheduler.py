@@ -220,6 +220,80 @@ class WatchEvents:
         return result
 
 
+
+class _NoItemsDict(dict):
+    def items(self):
+        raise AssertionError("ready scheduling must not scan active mappings")
+
+
+def _indexed_scheduler_for_test():
+    watcher = object.__new__(RuntimeWatchScheduler)
+    watcher._lock = threading.Lock()
+    watcher._pending = {}
+    watcher._inflight_requests = []
+    watcher._inflight_path_counts = {}
+    watcher._active_states = {}
+    watcher._ready_heap = []
+    watcher._password_dirty_dirs = {}
+    watcher._cache_cleanup_deadline = None
+    watcher.password_retry_debounce_seconds = 0.0
+    return watcher
+
+
+def test_watch_ready_index_lazily_discards_stale_generations_without_mapping_scan(monkeypatch):
+    watcher = _indexed_scheduler_for_test()
+    path = os.path.abspath("stale-generation.zip")
+    candidate = WatchCandidate(path, 10, 1.0, "file", 1)
+    state = scheduler_module._ActiveCandidateState(
+        last_event_at=100.0,
+        quiet_seconds=5.0,
+    )
+    watcher._pending[path] = candidate
+    watcher._active_states[path] = state
+    with watcher._lock:
+        watcher._schedule_active_locked(path, state)
+        state.last_event_at = 110.0
+        state.generation += 1
+        watcher._schedule_active_locked(path, state)
+    watcher._active_states = _NoItemsDict(watcher._active_states)
+    watcher._pending = _NoItemsDict(watcher._pending)
+    monkeypatch.setattr(scheduler_module.time, "time", lambda: 100.0)
+    monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 100.0)
+
+    assert watcher.next_delay_seconds() == pytest.approx(15.0)
+    assert len(watcher._ready_heap) == 1
+    assert watcher._ready_heap[0][1] == state.generation
+
+
+def test_watch_ready_index_skips_inflight_path_and_requeues_current_generation(monkeypatch):
+    watcher = _indexed_scheduler_for_test()
+    first_path = os.path.abspath("first.zip")
+    second_path = os.path.abspath("second.zip")
+    first = WatchCandidate(first_path, 10, 1.0, "first", 1)
+    second = WatchCandidate(second_path, 10, 1.0, "second", 1)
+    first_state = scheduler_module._ActiveCandidateState(100.0, 1.0)
+    second_state = scheduler_module._ActiveCandidateState(100.0, 2.0)
+    watcher._pending.update({first_path: first, second_path: second})
+    watcher._active_states.update({first_path: first_state, second_path: second_state})
+    request = SimpleNamespace(candidate=first)
+
+    with watcher._lock:
+        watcher._schedule_active_locked(first_path, first_state)
+        watcher._schedule_active_locked(second_path, second_state)
+        watcher._register_inflight_requests_locked([request])
+
+    monkeypatch.setattr(scheduler_module.time, "time", lambda: 100.0)
+    monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 100.0)
+    assert watcher.next_delay_seconds() == pytest.approx(2.0)
+
+    with watcher._lock:
+        watcher._inflight_requests.clear()
+        watcher._unregister_inflight_requests_locked([request])
+
+    assert watcher.next_delay_seconds() == pytest.approx(1.0)
+    assert watcher._inflight_path_counts == {}
+
+
 class WatchState:
     @staticmethod
     def assert_pending(watcher, count: int):
