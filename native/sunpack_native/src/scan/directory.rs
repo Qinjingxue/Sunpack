@@ -1839,7 +1839,6 @@ fn parse_worker_manifest_rows(text: &str) -> PyResult<Vec<OutputFileRecord>> {
     let mut files = Vec::new();
     cursor.skip_ws();
     if cursor.text.as_bytes().get(cursor.pos).copied() == Some(b']') {
-        cursor.pos += 1;
         return Ok(files);
     }
     loop {

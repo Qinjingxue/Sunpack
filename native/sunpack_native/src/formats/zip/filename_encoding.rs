@@ -9,6 +9,7 @@ use std::io;
 use std::sync::OnceLock;
 
 const ZIP_EOCD_SIGNATURE: &[u8] = b"PK\x05\x06";
+#[cfg(test)]
 const ZIP_CENTRAL_DIRECTORY_SIGNATURE: &[u8] = b"PK\x01\x02";
 const ZIP_UTF8_FLAG: u16 = 0x800;
 const ZIP_UNICODE_PATH_EXTRA_FIELD: u16 = 0x7075;
