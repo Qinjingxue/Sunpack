@@ -1,4 +1,4 @@
-use crate::io::reader::ManagedReader;
+use crate::io::reader::{CachedBytes, ManagedReader};
 use crc32fast::{hash as crc32, Hasher};
 use std::io;
 
@@ -70,7 +70,7 @@ struct ByteCursor<'a> {
     pos: u64,
     limit: u64,
     buffer_start: u64,
-    buffer: Vec<u8>,
+    buffer: CachedBytes,
 }
 
 impl<'a> ByteCursor<'a> {
@@ -80,7 +80,7 @@ impl<'a> ByteCursor<'a> {
             pos,
             limit,
             buffer_start: u64::MAX,
-            buffer: Vec::new(),
+            buffer: CachedBytes::default(),
         }
     }
 
@@ -98,7 +98,7 @@ impl<'a> ByteCursor<'a> {
         if outside {
             self.buffer_start = self.pos;
             let count = BUFFER_SIZE.min((self.limit - self.pos) as usize);
-            self.buffer = self.reader.read_at(self.pos, count)?;
+            self.buffer = self.reader.read_cached_at(self.pos, count)?;
             if self.buffer.is_empty() {
                 return invalid("unexpected_end_of_stream");
             }
@@ -691,7 +691,7 @@ fn walk_gzip_structure(
         if cursor.position() + 3 > limit {
             break;
         }
-        let next = reader.read_at(cursor.position(), 3)?;
+        let next = reader.read_cached_at(cursor.position(), 3)?;
         if next.as_slice() != GZIP_MAGIC {
             break;
         }
@@ -922,7 +922,7 @@ pub(crate) fn validate_bzip2_structure(
         if cursor.position() + 4 > limit {
             break;
         }
-        let next = reader.read_at(cursor.position(), 4)?;
+        let next = reader.read_cached_at(cursor.position(), 4)?;
         if next.len() != 4 || !next.starts_with(BZIP2_MAGIC) || !(b'1'..=b'9').contains(&next[3]) {
             break;
         }
@@ -1001,7 +1001,7 @@ pub(crate) fn resolve_xz_boundary_exact(
     let mut checksum_present = false;
     while reverse_end > offset {
         while reverse_end >= offset + 4 {
-            let word = reader.read_at(reverse_end - 4, 4)?;
+            let word = reader.read_cached_at(reverse_end - 4, 4)?;
             if word.as_slice() != [0, 0, 0, 0] {
                 break;
             }
@@ -1011,7 +1011,7 @@ pub(crate) fn resolve_xz_boundary_exact(
             return invalid("xz_footer_missing");
         }
         let footer_start = reverse_end - 12;
-        let footer = reader.read_at(footer_start, 12)?;
+        let footer = reader.read_cached_at(footer_start, 12)?;
         if footer.len() != 12 || &footer[10..12] != b"YZ" {
             return invalid("xz_footer_magic_invalid");
         }
@@ -1081,7 +1081,7 @@ pub(crate) fn resolve_xz_boundary_exact(
         if stream_start < offset {
             return invalid("xz_stream_start_out_of_range");
         }
-        let header = reader.read_at(stream_start, 12)?;
+        let header = reader.read_cached_at(stream_start, 12)?;
         if header.len() != 12 || !header.starts_with(XZ_MAGIC) {
             return invalid("xz_header_magic_invalid");
         }
@@ -1130,7 +1130,7 @@ pub(crate) fn validate_xz_structure_exact(
     while reverse_end > offset {
         let mut padding = 0u64;
         while reverse_end >= offset + 4 {
-            let word = reader.read_at(reverse_end - 4, 4)?;
+            let word = reader.read_cached_at(reverse_end - 4, 4)?;
             if word.as_slice() != [0, 0, 0, 0] {
                 break;
             }
@@ -1141,7 +1141,7 @@ pub(crate) fn validate_xz_structure_exact(
             return invalid("xz_footer_missing");
         }
         let footer_start = reverse_end - 12;
-        let footer = reader.read_at(footer_start, 12)?;
+        let footer = reader.read_cached_at(footer_start, 12)?;
         if footer.len() != 12 || &footer[10..12] != b"YZ" {
             return invalid("xz_footer_magic_invalid");
         }
@@ -1210,7 +1210,7 @@ pub(crate) fn validate_xz_structure_exact(
         if stream_start < offset {
             return invalid("xz_stream_start_out_of_range");
         }
-        let header = reader.read_at(stream_start, 12)?;
+        let header = reader.read_cached_at(stream_start, 12)?;
         if header.len() != 12 || !header.starts_with(XZ_MAGIC) {
             return invalid("xz_header_magic_invalid");
         }
@@ -1223,7 +1223,7 @@ pub(crate) fn validate_xz_structure_exact(
 
         let mut block_cursor = stream_start + 12;
         for (unpadded, uncompressed) in records {
-            let size_byte = reader.read_at(block_cursor, 1)?;
+            let size_byte = reader.read_cached_at(block_cursor, 1)?;
             if size_byte.len() != 1 || size_byte[0] == 0 {
                 return invalid("xz_block_header_missing");
             }
@@ -1231,7 +1231,7 @@ pub(crate) fn validate_xz_structure_exact(
             if header_size > unpadded || header_size > 1024 {
                 return invalid("xz_block_header_size_invalid");
             }
-            let block_header = reader.read_at(block_cursor, header_size as usize)?;
+            let block_header = reader.read_cached_at(block_cursor, header_size as usize)?;
             if block_header.len() != header_size as usize {
                 return invalid("xz_block_header_truncated");
             }
@@ -1292,7 +1292,7 @@ pub(crate) fn validate_xz_structure_exact(
             let padding_size = padded - unpadded;
             if padding_size > 0 {
                 let padding_offset = block_cursor + header_size + compressed;
-                let padding_bytes = reader.read_at(padding_offset, padding_size as usize)?;
+                let padding_bytes = reader.read_cached_at(padding_offset, padding_size as usize)?;
                 if padding_bytes.len() != padding_size as usize
                     || padding_bytes.iter().any(|byte| *byte != 0)
                 {
@@ -1332,11 +1332,11 @@ fn read_u32(reader: &ManagedReader, offset: u64, limit: u64) -> ValidationResult
     if offset + 4 > limit {
         return invalid("unexpected_end_of_stream");
     }
-    let bytes = reader.read_at(offset, 4)?;
+    let bytes = reader.read_cached_at(offset, 4)?;
     if bytes.len() != 4 {
         return invalid("unexpected_end_of_stream");
     }
-    Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    Ok(u32::from_le_bytes(bytes.as_slice().try_into().unwrap()))
 }
 
 pub(crate) fn validate_zstd_structure(
