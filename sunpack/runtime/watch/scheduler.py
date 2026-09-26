@@ -814,13 +814,17 @@ class WatchScheduler:
             ):
                 heapq.heappop(self._ready_heap)
                 continue
-            return deadline, generation, key, path
+            return deadline, epoch, generation, key, path
         return None
 
-    def _reschedule_generation(self, path: str, generation: int) -> None:
+    def _reschedule_generation(self, path: str, epoch: int, generation: int) -> None:
         with self._lock:
             state = self._active_states.get(path)
-            if state is None or state.generation != generation:
+            if (
+                state is None
+                or state.epoch != epoch
+                or state.generation != generation
+            ):
                 return
             self._schedule_active_locked(path, state)
 
@@ -1248,14 +1252,14 @@ class WatchScheduler:
 
     def _pop_ready(self, now: float) -> list[WatchCandidate]:
         ready: list[WatchCandidate] = []
-        due: list[tuple[str, WatchCandidate, int, float]] = []
+        due: list[tuple[str, WatchCandidate, int, int, float]] = []
         due_paths: set[str] = set()
         with self._lock:
             while True:
                 entry = self._next_ready_entry_locked()
                 if entry is None or entry[0] > now:
                     break
-                _, _, generation, _, path = heapq.heappop(self._ready_heap)
+                _, epoch, generation, _, path = heapq.heappop(self._ready_heap)
                 if path in due_paths:
                     continue
                 state = self._active_states.get(path)
@@ -1263,6 +1267,7 @@ class WatchScheduler:
                 if (
                     state is None
                     or candidate is None
+                    or state.epoch != epoch
                     or state.generation != generation
                 ):
                     continue
@@ -1270,33 +1275,35 @@ class WatchScheduler:
                 due.append((
                     path,
                     candidate,
+                    epoch,
                     generation,
                     state.quiet_seconds,
                 ))
 
-        for path, candidate, generation, quiet_seconds in due:
+        for path, candidate, epoch, generation, quiet_seconds in due:
             # Claim publication and source observation share this admission
             # gate. Therefore cleanup can never publish a claim in the middle
             # of a candidate/readiness probe and later reject that same probe.
             with self._claim_gate:
                 if path_key(os.path.abspath(path)) in self._active_claims:
-                    self._reschedule_generation(path, generation)
+                    self._reschedule_generation(path, epoch, generation)
                     continue
                 refreshed = _candidate_for_event_path(path, since_usn=candidate.change_usn)
                 if refreshed is None:
-                    self._drop_active(path, generation)
+                    self._drop_active(path, epoch, generation)
                     self.state.forget_path(path)
                     continue
                 if _candidate_observation_changed(candidate, refreshed):
                     if _candidate_content_changed(candidate, refreshed):
-                        self._record_boundary_activity(path, generation, refreshed, now)
+                        self._record_boundary_activity(path, epoch, generation, refreshed, now)
                         continue
-                    if not self._update_boundary_metadata(path, generation, refreshed):
+                    if not self._update_boundary_metadata(path, epoch, generation, refreshed):
                         continue
                     candidate = refreshed
                 if not watch_file_is_ready(path):
                     self._record_boundary_activity(
                         path,
+                        epoch,
                         generation,
                         refreshed,
                         now,
@@ -1312,7 +1319,11 @@ class WatchScheduler:
                 identified = refreshed
                 with self._lock:
                     state = self._active_states.get(path)
-                    if state is None or state.generation != generation:
+                    if (
+                        state is None
+                        or state.epoch != epoch
+                        or state.generation != generation
+                    ):
                         continue
                     self._pending.pop(path, None)
                     self._active_states.pop(path, None)
@@ -1327,10 +1338,14 @@ class WatchScheduler:
                 ready.append(identified)
         return ready
 
-    def _drop_active(self, path: str, generation: int) -> None:
+    def _drop_active(self, path: str, epoch: int, generation: int) -> None:
         with self._lock:
             state = self._active_states.get(path)
-            if state is None or state.generation != generation:
+            if (
+                state is None
+                or state.epoch != epoch
+                or state.generation != generation
+            ):
                 return
             self._pending.pop(path, None)
             self._active_states.pop(path, None)
@@ -1338,6 +1353,7 @@ class WatchScheduler:
     def _record_boundary_activity(
         self,
         path: str,
+        epoch: int,
         generation: int,
         candidate: WatchCandidate,
         now: float,
@@ -1346,7 +1362,11 @@ class WatchScheduler:
     ) -> None:
         with self._lock:
             state = self._active_states.get(path)
-            if state is None or state.generation != generation:
+            if (
+                state is None
+                or state.epoch != epoch
+                or state.generation != generation
+            ):
                 return
             self._pending[path] = candidate
             self._latest_observations[path] = candidate
@@ -1364,12 +1384,17 @@ class WatchScheduler:
     def _update_boundary_metadata(
         self,
         path: str,
+        epoch: int,
         generation: int,
         candidate: WatchCandidate,
     ) -> bool:
         with self._lock:
             state = self._active_states.get(path)
-            if state is None or state.generation != generation:
+            if (
+                state is None
+                or state.epoch != epoch
+                or state.generation != generation
+            ):
                 return False
             self._pending[path] = candidate
             self._latest_observations[path] = candidate
