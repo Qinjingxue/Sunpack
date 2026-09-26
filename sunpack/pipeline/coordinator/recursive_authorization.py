@@ -28,11 +28,11 @@ class RecursiveAuthorization:
         scan_roots: list[str],
         scan_session: DiscoveryScanSession | None,
         *,
-        round_index: int,
+        depth: int,
     ) -> AuthorizationBatch:
-        # The first round is the user's requested discovery scope.  This policy
+        # Depth one is the user's requested discovery scope.  This policy
         # only governs archives discovered from extraction output in later rounds.
-        if not tasks or round_index <= 1 or not self.config.get("enabled", True):
+        if not tasks or depth <= 1 or not self.config.get("enabled", True):
             return AuthorizationBatch(list(tasks), [])
         if scan_session is None:
             raise RuntimeError("Nested extraction authorization requires the detection scan session")
@@ -63,7 +63,7 @@ class RecursiveAuthorization:
                 skipped.append({
                     "path": task.main_path,
                     "task_key": task.key,
-                    "round": round_index,
+                    "depth": depth,
                     "policy": "recursive_authorization",
                     "allowed": False,
                     "reason": "outside_scan_root",
@@ -101,7 +101,7 @@ class RecursiveAuthorization:
                 skipped.append({
                     "path": task.main_path,
                     "task_key": task.key,
-                    "round": round_index,
+                    "depth": depth,
                     "policy": "recursive_authorization",
                     **row,
                 })
