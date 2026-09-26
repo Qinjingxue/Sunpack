@@ -118,42 +118,13 @@ impl AnalysisBinaryView {
         result.set_item("eocd_candidate_cd_size", 0u32)?;
 
         let size = self.reader.len();
-        let mut set_candidate = |offset: u64, record: &[u8], available: i64| -> PyResult<()> {
-            if record.len() < 22 || &record[..4] != ZIP_EOCD {
-                return Ok(());
-            }
-            let comment_length = u16_le(record, 20);
-            let total_entries = u16_le(record, 10);
-            let cd_offset = u32_le(record, 16);
-            let cd_size = u32_le(record, 12);
-            result.set_item("eocd_candidate_found", true)?;
-            result.set_item("eocd_candidate_offset", offset)?;
-            result.set_item("eocd_candidate_comment_length", comment_length)?;
-            result.set_item(
-                "eocd_candidate_comment_available_delta",
-                available - i64::from(comment_length),
-            )?;
-            result.set_item(
-                "eocd_candidate_declared_entry_count_present",
-                total_entries > 0,
-            )?;
-            result.set_item(
-                "eocd_candidate_declared_cd_offset_present",
-                cd_offset > 0,
-            )?;
-            result.set_item("eocd_candidate_total_entries", total_entries)?;
-            result.set_item("eocd_candidate_cd_offset", cd_offset)?;
-            result.set_item("eocd_candidate_cd_size", cd_size)?;
-            Ok(())
-        };
-
         if let Some(offset) = requested_offset {
             let record = self.read_at_bytes(offset, 22)?;
             if record.len() == 22 && record.starts_with(ZIP_EOCD) {
                 let available = size
                     .saturating_sub(offset.saturating_add(22))
                     .min(i64::MAX as u64) as i64;
-                set_candidate(offset, &record, available)?;
+                set_zip_eocd_candidate(&result, offset, &record, available)?;
             }
             return Ok(result.unbind());
         }
@@ -182,7 +153,7 @@ impl AnalysisBinaryView {
                     fallback = Some((offset, record, available));
                 }
                 if available == i64::from(u16_le(&record, 20)) {
-                    set_candidate(offset, &record, available)?;
+                    set_zip_eocd_candidate(&result, offset, &record, available)?;
                     return Ok(result.unbind());
                 }
             }
@@ -192,7 +163,7 @@ impl AnalysisBinaryView {
             search_end = index;
         }
         if let Some((offset, record, available)) = fallback {
-            set_candidate(offset, &record, available)?;
+            set_zip_eocd_candidate(&result, offset, &record, available)?;
         }
         Ok(result.unbind())
     }
@@ -1561,6 +1532,41 @@ impl AnalysisMultiVolumeView {
             .map_err(reader_error_to_py)
     }
 }
+
+fn set_zip_eocd_candidate(
+    result: &Bound<'_, PyDict>,
+    offset: u64,
+    record: &[u8],
+    available: i64,
+) -> PyResult<()> {
+    if record.len() < 22 || &record[..4] != ZIP_EOCD {
+        return Ok(());
+    }
+    let comment_length = u16_le(record, 20);
+    let total_entries = u16_le(record, 10);
+    let cd_offset = u32_le(record, 16);
+    let cd_size = u32_le(record, 12);
+    result.set_item("eocd_candidate_found", true)?;
+    result.set_item("eocd_candidate_offset", offset)?;
+    result.set_item("eocd_candidate_comment_length", comment_length)?;
+    result.set_item(
+        "eocd_candidate_comment_available_delta",
+        available - i64::from(comment_length),
+    )?;
+    result.set_item(
+        "eocd_candidate_declared_entry_count_present",
+        total_entries > 0,
+    )?;
+    result.set_item(
+        "eocd_candidate_declared_cd_offset_present",
+        cd_offset > 0,
+    )?;
+    result.set_item("eocd_candidate_total_entries", total_entries)?;
+    result.set_item("eocd_candidate_cd_offset", cd_offset)?;
+    result.set_item("eocd_candidate_cd_size", cd_size)?;
+    Ok(())
+}
+
 
 fn resolve_zip64_central_location(header: &[u8], extra: &[u8]) -> Option<(u64, u64)> {
     if header.len() < 46 {
