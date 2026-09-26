@@ -124,9 +124,6 @@ Return value:
 }
 ```
 
-`unicode_path_names` 与 `raw_names` 一一对应；元素仅在中央目录中的
-Info-ZIP Unicode Path Extra Field (`0x7075`) 版本、原始文件名 CRC32 和
-UTF-8 载荷均校验成功时返回 `bytes`，否则为 `None`。
 
 The module also exposes lightweight structure inspectors used by the detection
 pipeline:
