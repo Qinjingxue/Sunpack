@@ -456,7 +456,7 @@ fn collect_zip_names(
     } else {
         total_entries.min(max_samples)
     };
-    let mut truncated = false;
+    let mut truncated = total_entries > max_samples;
 
     while entries.len() < expected_entries {
         let Some(record) = super::parse_central_directory_record(&central, offset, central.len()) else {
@@ -484,6 +484,13 @@ fn collect_zip_names(
             truncated = true;
             break;
         }
+    }
+
+    if total_entries == 0
+        && entries.len() == max_samples
+        && super::parse_central_directory_record(&central, offset, central.len()).is_some()
+    {
+        truncated = true;
     }
 
     ZipNameScan {
