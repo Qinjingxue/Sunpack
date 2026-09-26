@@ -209,9 +209,9 @@ class ToastManager:
         presenter = None
         sent_revision = -1
         next_progress_send = 0.0
-        expires_at = 0.0
         sequence = 0
         failures = 0
+        active_progress = False
         try:
             while True:
                 with self._condition:
@@ -219,19 +219,13 @@ class ToastManager:
                         break
                     snapshot, revision = self._snapshot, self._revision
                     now = time.monotonic()
-                    # Expiry applies to the delivered snapshot, even while a
-                    # newer progress update is waiting for its throttle slot.
-                    expire = bool(expires_at and now >= expires_at)
                     changed = revision != sent_revision
                     due = changed and (
                         snapshot is None or snapshot.kind != ToastSnapshotKind.PROGRESS
                         or now >= next_progress_send
                     )
-                    if not expire and not due and presenter is not None:
-                        deadlines = [expires_at] if expires_at else []
-                        if changed:
-                            deadlines.append(next_progress_send)
-                        timeout = max(0.0, min(deadlines) - now) if deadlines else None
+                    if not due and presenter is not None:
+                        timeout = max(0.0, next_progress_send - now) if changed else None
                         self._condition.wait_for(
                             lambda: self._stopping or self._revision != revision, timeout=timeout,
                         )
@@ -244,25 +238,16 @@ class ToastManager:
                         )
                         sent_revision = -1
                         self._log("toast_started", pid=os.getpid())
-                    if expire:
-                        presenter.clear()
-                        expires_at = 0.0
-                        with self._condition:
-                            if self._revision == sent_revision:
-                                self._snapshot = None
-                        if not due:
-                            continue
                     if due:
                         if snapshot is None:
                             presenter.clear()
+                            active_progress = False
                         else:
                             payload = encode_snapshot(snapshot)
                             sequence += 1
                             presenter.show(payload, sequence)
+                            active_progress = snapshot.kind == ToastSnapshotKind.PROGRESS
                         sent_revision = revision
-                        # Start the visible TTL only after Show succeeded.
-                        ttl_ms = max(0, min(0xFFFFFFFF, int(snapshot.ttl_ms))) if snapshot else 0
-                        expires_at = time.monotonic() + ttl_ms / 1000.0 if ttl_ms else 0.0
                         if snapshot is None or snapshot.kind == ToastSnapshotKind.PROGRESS:
                             next_progress_send = time.monotonic() + self._update_interval
                     failures = 0
@@ -278,13 +263,14 @@ class ToastManager:
                     if presenter is not None:
                         presenter.close()
                         presenter = None
-                    # A delivered terminal must not reappear after its TTL.
-                    with self._condition:
-                        if expires_at and time.monotonic() >= expires_at and self._revision == sent_revision:
-                            self._snapshot = None
                     self._wait_for_stop(min(30.0, 0.25 * (2 ** min(failures - 1, 7))))
         finally:
             if presenter is not None:
+                if active_progress:
+                    try:
+                        presenter.clear()
+                    except Exception as exc:
+                        self._log("toast_error", error=str(exc), attempt=failures + 1)
                 presenter.close()
 
     def _wait_for_stop(self, seconds: float) -> None:
