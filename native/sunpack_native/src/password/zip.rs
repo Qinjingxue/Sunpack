@@ -1,9 +1,9 @@
 use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
+use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
 use crate::password::input::{
-    parse_ranges, parse_volumes, ranges_total_len, VirtualRangeReader, VolumeSet,
+    parse_ranges, parse_volumes, ranges_key, ranges_total_len, VirtualRangeReader, VolumeSet,
 };
-use crate::password::password_read_fault_status;
 use pbkdf2::pbkdf2_hmac;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
@@ -40,8 +40,10 @@ pub(crate) fn zip_fast_verify_passwords_with_reader(
         .map(|item| item.extract::<String>())
         .collect::<PyResult<Vec<_>>>()?;
 
-    let total_len = reader.len();
-    verify_zip_stream(py, &mut reader.cursor(), total_len, &candidates)
+    let key = InputKey::file("zip", reader)?;
+    verify_prepared(py, key, &candidates, || {
+        prepare_zip_stream(&mut reader.cursor(), reader.len()).map(PasswordContext::Zip)
+    })
 }
 
 #[pyfunction]
@@ -56,8 +58,11 @@ pub(crate) fn zip_fast_verify_passwords_from_ranges(
         .collect::<PyResult<Vec<_>>>()?;
     let parsed = parse_ranges(ranges)?;
     let total_len = ranges_total_len(&parsed);
-    let mut reader = VirtualRangeReader::new(parsed.into());
-    verify_zip_stream(py, &mut reader, total_len, &candidates)
+    let key = ranges_key("zip", &parsed)?;
+    verify_prepared(py, key, &candidates, || {
+        prepare_zip_stream(&mut VirtualRangeReader::new(parsed.into()), total_len)
+            .map(PasswordContext::Zip)
+    })
 }
 
 #[pyfunction]
@@ -71,23 +76,21 @@ pub(crate) fn zip_fast_verify_passwords_from_volumes(
         .map(|item| item.extract::<String>())
         .collect::<PyResult<Vec<_>>>()?;
     let volumes = VolumeSet::new(parse_volumes(parts)?);
-    verify_zip_volumes(py, &volumes, &candidates)
+    verify_prepared(py, volumes.key("zip")?, &candidates, || {
+        prepare_zip_volumes(&volumes).map(PasswordContext::Zip)
+    })
 }
 
-fn verify_zip_volumes(
-    py: Python<'_>,
-    volumes: &VolumeSet,
-    candidates: &[String],
-) -> PyResult<Py<PyAny>> {
+fn prepare_zip_volumes(volumes: &VolumeSet) -> Result<ZipPasswordContext, PreparedStatus> {
     let tail = match volumes.read_last_tail_field(MAX_EOCD_SCAN, "zip.eocd_search_window") {
         Ok(tail) => tail,
-        Err(fault) => return password_read_fault_status(py, &fault),
+        Err(fault) => return Err(fault.into()),
     };
     let Some(eocd_offset) = find_last_signature(&tail, ZIP_EOCD) else {
         let fault =
             ReadFault::invalid_field("locate", 0, 22, tail.len() as u64, "ZIP EOCD was not found")
                 .with_field("zip.eocd", FieldLocation::Tail);
-        return password_read_fault_status(py, &fault);
+        return Err(fault.into());
     };
     if eocd_offset + 22 > tail.len() {
         let fault = ReadFault::short_read(
@@ -98,7 +101,7 @@ fn verify_zip_volumes(
             tail.len() as u64,
         )
         .with_field("zip.eocd", FieldLocation::Tail);
-        return password_read_fault_status(py, &fault);
+        return Err(fault.into());
     }
     let disk_number = le_u16(&tail, eocd_offset + 4).unwrap_or(u16::MAX) as usize;
     let central_disk = le_u16(&tail, eocd_offset + 6).unwrap_or(u16::MAX) as usize;
@@ -118,26 +121,22 @@ fn verify_zip_volumes(
             ),
         )
         .with_field("zip.eocd.disk_number", FieldLocation::Tail);
-        return password_read_fault_status(py, &fault);
+        return Err(fault.into());
     }
     if total_entries == u16::MAX as usize
         || central_size == u32::MAX as u64
         || central_offset == u32::MAX as u64
     {
-        return simple_status(
-            py,
+        return Err(PreparedStatus::new(
             "unknown_needs_final_verifier",
-            0,
             "zip64 spanned password probing is not supported",
-        );
+        ));
     }
     if central_size > MAX_CENTRAL_SCAN {
-        return simple_status(
-            py,
+        return Err(PreparedStatus::new(
             "unknown_needs_final_verifier",
-            0,
             "zip central directory exceeds bounded probe budget",
-        );
+        ));
     }
 
     let mut disk = central_disk;
@@ -151,7 +150,7 @@ fn verify_zip_volumes(
             FieldLocation::Tail,
         ) {
             Ok(data) => data,
-            Err(fault) => return password_read_fault_status(py, &fault),
+            Err(fault) => return Err(fault.into()),
         };
         if &fixed[..4] != ZIP_CENTRAL {
             let fault = ReadFault::invalid_field(
@@ -162,7 +161,7 @@ fn verify_zip_volumes(
                 "invalid ZIP central-directory signature",
             )
             .with_field("zip.central_directory.entry_signature", FieldLocation::Tail);
-            return password_read_fault_status(py, &fault);
+            return Err(fault.into());
         }
         let flags = le_u16(&fixed, 8).unwrap_or(0);
         let name_len = le_u16(&fixed, 28).unwrap_or(0) as u64;
@@ -172,36 +171,30 @@ fn verify_zip_volumes(
         let local_offset = le_u32(&fixed, 42).unwrap_or(u32::MAX) as u64;
         if flags & 0x0001 != 0 {
             if entry_disk == u16::MAX as usize || local_offset == u32::MAX as u64 {
-                return simple_status(
-                    py,
+                return Err(PreparedStatus::new(
                     "unknown_needs_final_verifier",
-                    0,
                     "zip64 encrypted entry location requires fallback",
-                );
+                ));
             }
-            return verify_zip_volume_entry(py, volumes, entry_disk, local_offset, candidates);
+            return prepare_zip_volume_entry(volumes, entry_disk, local_offset);
         }
         let record_len = 46u64 + name_len + extra_len + comment_len;
         let Some(next) = volumes.advance_disk_offset(disk, offset, record_len) else {
-            return simple_status(
-                py,
-                "needs_volume_or_tail_damaged",
-                0,
-                "zip central directory crosses unavailable data; missing volume or damaged tail field",
-            );
+            return Err(PreparedStatus::new("needs_volume_or_tail_damaged", "zip central directory crosses unavailable data; missing volume or damaged tail field"));
         };
         (disk, offset) = next;
     }
-    simple_status(py, "not_required", -1, "zip has no encrypted entries")
+    Err(PreparedStatus::new(
+        "not_required",
+        "zip has no encrypted entries",
+    ))
 }
 
-fn verify_zip_volume_entry(
-    py: Python<'_>,
+fn prepare_zip_volume_entry(
     volumes: &VolumeSet,
     disk: usize,
     local_offset: u64,
-    candidates: &[String],
-) -> PyResult<Py<PyAny>> {
+) -> Result<ZipPasswordContext, PreparedStatus> {
     let fixed = match volumes.read_disk_spanning_field(
         disk,
         local_offset,
@@ -210,7 +203,7 @@ fn verify_zip_volume_entry(
         FieldLocation::Body,
     ) {
         Ok(data) => data,
-        Err(fault) => return password_read_fault_status(py, &fault),
+        Err(fault) => return Err(fault.into()),
     };
     if &fixed[..4] != ZIP_LOCAL {
         let fault = ReadFault::invalid_field(
@@ -221,7 +214,7 @@ fn verify_zip_volume_entry(
             "invalid ZIP local-header signature",
         )
         .with_field("zip.local_header.signature", FieldLocation::Body);
-        return password_read_fault_status(py, &fault);
+        return Err(fault.into());
     }
     let flags = le_u16(&fixed, 6).unwrap_or(0);
     let method = le_u16(&fixed, 8).unwrap_or(0);
@@ -232,12 +225,10 @@ fn verify_zip_volume_entry(
     let Some((variable_disk, variable_offset)) =
         volumes.advance_disk_offset(disk, local_offset, 30)
     else {
-        return simple_status(
-            py,
+        return Err(PreparedStatus::new(
             "needs_volume_or_tail_damaged",
-            0,
             "zip local header crosses a missing volume",
-        );
+        ));
     };
     let variable = match volumes.read_disk_spanning_field(
         variable_disk,
@@ -247,36 +238,30 @@ fn verify_zip_volume_entry(
         FieldLocation::Body,
     ) {
         Ok(data) => data,
-        Err(fault) => return password_read_fault_status(py, &fault),
+        Err(fault) => return Err(fault.into()),
     };
     let extra = &variable[name_len as usize..];
     let data_delta = 30 + name_len + extra_len;
     let Some((data_disk, data_offset)) =
         volumes.advance_disk_offset(disk, local_offset, data_delta)
     else {
-        return simple_status(
-            py,
+        return Err(PreparedStatus::new(
             "needs_volume_or_tail_damaged",
-            0,
             "zip encrypted data starts beyond available volumes",
-        );
+        ));
     };
     if method == 99 {
         let Some(strength) = parse_winzip_aes_strength(extra) else {
-            return simple_status(
-                py,
+            return Err(PreparedStatus::new(
                 "unsupported_method",
-                0,
                 "winzip AES extra field not found",
-            );
+            ));
         };
         let Some((salt_len, _)) = aes_lengths(strength) else {
-            return simple_status(
-                py,
+            return Err(PreparedStatus::new(
                 "unsupported_method",
-                0,
                 "unsupported winzip AES strength",
-            );
+            ));
         };
         let material = match volumes.read_disk_spanning_field(
             data_disk,
@@ -286,9 +271,9 @@ fn verify_zip_volume_entry(
             FieldLocation::Body,
         ) {
             Ok(data) => data,
-            Err(fault) => return password_read_fault_status(py, &fault),
+            Err(fault) => return Err(fault.into()),
         };
-        return verify_winzip_aes_material(py, candidates, strength, &material);
+        return ZipPasswordContext::aes(strength, material);
     }
     let material = match volumes.read_disk_spanning_field(
         data_disk,
@@ -298,7 +283,7 @@ fn verify_zip_volume_entry(
         FieldLocation::Body,
     ) {
         Ok(data) => data,
-        Err(fault) => return password_read_fault_status(py, &fault),
+        Err(fault) => return Err(fault.into()),
     };
     let mut header = [0u8; 12];
     header.copy_from_slice(&material);
@@ -307,111 +292,147 @@ fn verify_zip_volume_entry(
     } else {
         (crc32 >> 24) as u8
     };
-    verify_zipcrypto_material(py, candidates, &header, check_byte)
+    Ok(ZipPasswordContext::ZipCrypto { header, check_byte })
 }
 
-fn verify_zip_stream<R: Read + Seek>(
-    py: Python<'_>,
+pub(crate) enum ZipPasswordContext {
+    Aes {
+        key_len: usize,
+        salt: Vec<u8>,
+        verifier: [u8; 2],
+    },
+    ZipCrypto {
+        header: [u8; 12],
+        check_byte: u8,
+    },
+}
+
+impl ZipPasswordContext {
+    fn aes(strength: u8, material: Vec<u8>) -> Result<Self, PreparedStatus> {
+        let (salt_len, key_len) = aes_lengths(strength).ok_or_else(|| {
+            PreparedStatus::new("unsupported_method", "unsupported winzip AES strength")
+        })?;
+        if material.len() != salt_len + 2 {
+            return Err(PreparedStatus::new(
+                "damaged",
+                "winzip AES salt or password verifier is incomplete",
+            ));
+        }
+        Ok(Self::Aes {
+            key_len,
+            salt: material[..salt_len].to_vec(),
+            verifier: material[salt_len..].try_into().unwrap(),
+        })
+    }
+
+    pub(crate) fn retained_bytes(&self) -> usize {
+        match self {
+            Self::Aes { salt, .. } => salt.len() + 2,
+            Self::ZipCrypto { .. } => 12,
+        }
+    }
+
+    pub(crate) fn verify(&self, py: Python<'_>, candidates: &[String]) -> PyResult<Py<PyAny>> {
+        match self {
+            Self::Aes {
+                key_len,
+                salt,
+                verifier,
+            } => verify_winzip_aes_candidates(py, candidates, *key_len, salt, verifier),
+            Self::ZipCrypto { header, check_byte } => {
+                verify_zipcrypto_material(py, candidates, header, *check_byte)
+            }
+        }
+    }
+}
+
+fn prepare_zip_stream<R: Read + Seek>(
     file: &mut R,
     total_len: u64,
-    candidates: &[String],
-) -> PyResult<Py<PyAny>> {
-    let result = PyDict::new(py);
-    if let Err(fault) = zip_tail_requirement(file, total_len) {
-        return password_read_fault_status(py, &fault);
+) -> Result<ZipPasswordContext, PreparedStatus> {
+    zip_tail_requirement(file, total_len)?;
+    if let Some(mut header) = locate_encrypted_entry_from_central_directory(file, total_len)? {
+        header.source_len = total_len;
+        return prepare_zip_header(file, &header);
     }
-    match locate_encrypted_entry_from_central_directory(file, total_len) {
-        Ok(Some(mut header)) => {
-            header.source_len = total_len;
-            return verify_zip_header(py, file, candidates, &header);
-        }
-        Ok(None) => {}
-        Err(fault) => return password_read_fault_status(py, &fault),
-    }
-    // Central-directory probing leaves the shared/range reader near the end.
-    // Rewind before the bounded local-header fallback; otherwise an
-    // unencrypted ZIP (or an inconclusive central scan) reads from EOF and
-    // leaks `failed to fill whole buffer` into the watch completion path.
-    if let Err(fault) = seek_field(
+    seek_field(
         file,
         0,
         total_len,
         "zip.local_header_scan",
         FieldLocation::Head,
-    ) {
-        return password_read_fault_status(py, &fault);
-    }
-    let scan_len = total_len.min(MAX_PREFIX_SCAN as u64) as usize;
-    let mut prefix = vec![0u8; scan_len];
-    if let Err(fault) = read_exact_field(
+    )?;
+    let mut prefix = vec![0u8; total_len.min(MAX_PREFIX_SCAN as u64) as usize];
+    read_exact_field(
         file,
         &mut prefix,
         total_len,
         "zip.local_header_scan",
         FieldLocation::Head,
-    ) {
-        return password_read_fault_status(py, &fault);
-    }
-
-    let Some(local_offset) = find_signature(&prefix, ZIP_LOCAL) else {
-        result.set_item("status", "unsupported_method")?;
-        result.set_item("matched_index", -1)?;
-        result.set_item("attempts", 0)?;
-        result.set_item("message", "zip local header not found in prefix")?;
-        return Ok(result.into());
-    };
-
-    let Some(mut header) = parse_local_header(&prefix, local_offset) else {
-        result.set_item("status", "damaged")?;
-        result.set_item("matched_index", -1)?;
-        result.set_item("attempts", 0)?;
-        result.set_item("message", "zip local header is incomplete or malformed")?;
-        return Ok(result.into());
-    };
+    )?;
+    let local_offset = find_signature(&prefix, ZIP_LOCAL).ok_or_else(|| {
+        PreparedStatus::new("unsupported_method", "zip local header not found in prefix")
+    })?;
+    let mut header = parse_local_header(&prefix, local_offset).ok_or_else(|| {
+        PreparedStatus::new("damaged", "zip local header is incomplete or malformed")
+    })?;
     header.source_len = total_len;
-
-    verify_zip_header(py, file, candidates, &header)
+    prepare_zip_header(file, &header)
 }
 
-fn verify_zip_header<R: Read + Seek>(
-    py: Python<'_>,
+fn prepare_zip_header<R: Read + Seek>(
     file: &mut R,
-    candidates: &[String],
     header: &ZipLocalHeader,
-) -> PyResult<Py<PyAny>> {
-    let result = PyDict::new(py);
+) -> Result<ZipPasswordContext, PreparedStatus> {
     if !header.encrypted {
-        result.set_item("status", "not_required")?;
-        result.set_item("matched_index", -1)?;
-        result.set_item("attempts", 0)?;
-        result.set_item("message", "zip entry is not encrypted")?;
-        return Ok(result.into());
+        return Err(PreparedStatus::new(
+            "not_required",
+            "zip entry is not encrypted",
+        ));
     }
     if header.method == 99 {
-        return verify_winzip_aes(py, file, candidates, header);
+        let strength = header.aes_strength.ok_or_else(|| {
+            PreparedStatus::new("unsupported_method", "winzip aes extra field not found")
+        })?;
+        let (salt_len, _) = aes_lengths(strength).ok_or_else(|| {
+            PreparedStatus::new("unsupported_method", "unsupported winzip aes strength")
+        })?;
+        let mut material = vec![0u8; salt_len + 2];
+        seek_field(
+            file,
+            header.data_offset,
+            header.source_len,
+            "zip.aes.salt_password_verifier",
+            FieldLocation::Body,
+        )?;
+        read_exact_field(
+            file,
+            &mut material,
+            header.source_len,
+            "zip.aes.salt_password_verifier",
+            FieldLocation::Body,
+        )?;
+        return ZipPasswordContext::aes(strength, material);
     }
-
     let mut encryption_header = [0u8; 12];
-    if let Err(fault) = seek_field(
+    seek_field(
         file,
         header.data_offset,
         header.source_len,
         "zip.zipcrypto.encryption_header",
         FieldLocation::Body,
-    ) {
-        return password_read_fault_status(py, &fault);
-    }
-    if let Err(fault) = read_exact_field(
+    )?;
+    read_exact_field(
         file,
         &mut encryption_header,
         header.source_len,
         "zip.zipcrypto.encryption_header",
         FieldLocation::Body,
-    ) {
-        return password_read_fault_status(py, &fault);
-    }
-
-    verify_zipcrypto_material(py, candidates, &encryption_header, header.check_byte)
+    )?;
+    Ok(ZipPasswordContext::ZipCrypto {
+        header: encryption_header,
+        check_byte: header.check_byte,
+    })
 }
 
 struct ZipLocalHeader {
@@ -455,49 +476,6 @@ fn parse_local_header(bytes: &[u8], offset: usize) -> Option<ZipLocalHeader> {
         data_offset: data_offset as u64,
         source_len: bytes.len() as u64,
     })
-}
-
-fn verify_winzip_aes(
-    py: Python<'_>,
-    file: &mut (impl Read + Seek),
-    candidates: &[String],
-    header: &ZipLocalHeader,
-) -> PyResult<Py<PyAny>> {
-    let result = PyDict::new(py);
-    let Some(strength) = header.aes_strength else {
-        result.set_item("status", "unsupported_method")?;
-        result.set_item("matched_index", -1)?;
-        result.set_item("attempts", 0)?;
-        result.set_item("message", "winzip aes extra field not found")?;
-        return Ok(result.into());
-    };
-    let Some((salt_len, _key_len)) = aes_lengths(strength) else {
-        result.set_item("status", "unsupported_method")?;
-        result.set_item("matched_index", -1)?;
-        result.set_item("attempts", 0)?;
-        result.set_item("message", "unsupported winzip aes strength")?;
-        return Ok(result.into());
-    };
-    let mut salt_and_verifier = vec![0u8; salt_len + 2];
-    if let Err(fault) = seek_field(
-        file,
-        header.data_offset,
-        header.source_len,
-        "zip.aes.salt_password_verifier",
-        FieldLocation::Body,
-    ) {
-        return password_read_fault_status(py, &fault);
-    }
-    if let Err(fault) = read_exact_field(
-        file,
-        &mut salt_and_verifier,
-        header.source_len,
-        "zip.aes.salt_password_verifier",
-        FieldLocation::Body,
-    ) {
-        return password_read_fault_status(py, &fault);
-    }
-    verify_winzip_aes_material(py, candidates, strength, &salt_and_verifier)
 }
 
 fn zip_tail_requirement<R: Read + Seek>(file: &mut R, total_len: u64) -> Result<(), ReadFault> {
@@ -719,31 +697,13 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
     Ok(None)
 }
 
-fn verify_winzip_aes_material(
+fn verify_winzip_aes_candidates(
     py: Python<'_>,
     candidates: &[String],
-    strength: u8,
-    salt_and_verifier: &[u8],
+    key_len: usize,
+    salt: &[u8],
+    verifier: &[u8; 2],
 ) -> PyResult<Py<PyAny>> {
-    let Some((salt_len, key_len)) = aes_lengths(strength) else {
-        return simple_status(
-            py,
-            "unsupported_method",
-            0,
-            "unsupported winzip AES strength",
-        );
-    };
-    if salt_and_verifier.len() != salt_len + 2 {
-        return simple_status(
-            py,
-            "damaged",
-            0,
-            "winzip AES salt or password verifier is incomplete",
-        );
-    }
-
-    let salt = &salt_and_verifier[..salt_len];
-    let verifier = &salt_and_verifier[salt_len..];
     let attempts = candidates.len() as i32;
     let matched_indices = py.detach(|| {
         let mut matched_indices = if candidates.len() >= AES_PARALLEL_PASSWORD_THRESHOLD {
@@ -939,20 +899,6 @@ fn find_last_signature(bytes: &[u8], signature: &[u8]) -> Option<usize> {
     bytes
         .windows(signature.len())
         .rposition(|window| window == signature)
-}
-
-fn simple_status(
-    py: Python<'_>,
-    status: &str,
-    attempts: i32,
-    message: &str,
-) -> PyResult<Py<PyAny>> {
-    let result = PyDict::new(py);
-    result.set_item("status", status)?;
-    result.set_item("matched_index", -1)?;
-    result.set_item("attempts", attempts)?;
-    result.set_item("message", message)?;
-    Ok(result.into())
 }
 
 fn le_u16(bytes: &[u8], offset: usize) -> Option<u16> {

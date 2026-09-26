@@ -1,3 +1,4 @@
+use super::context::{InputKey, InputMember};
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
 use pyo3::prelude::*;
@@ -9,6 +10,7 @@ use std::sync::Arc;
 pub(crate) struct RangeSpec {
     reader: ManagedReader,
     start: u64,
+    end: Option<u64>,
     len: u64,
     virtual_start: u64,
 }
@@ -47,12 +49,10 @@ pub(crate) fn parse_ranges(ranges: &Bound<'_, PyList>) -> PyResult<Vec<RangeSpec
             ));
         }
         let len = effective_end - start;
-        if len == 0 {
-            continue;
-        }
         parsed.push(RangeSpec {
             reader,
             start,
+            end,
             len,
             virtual_start: cursor,
         });
@@ -66,6 +66,17 @@ pub(crate) fn ranges_total_len(ranges: &[RangeSpec]) -> u64 {
         .last()
         .map(|item| item.virtual_start + item.len)
         .unwrap_or(0)
+}
+
+pub(crate) fn ranges_key(format: &'static str, ranges: &[RangeSpec]) -> std::io::Result<InputKey> {
+    Ok(InputKey::new(
+        format,
+        "ranges",
+        ranges
+            .iter()
+            .map(|range| InputMember::new(&range.reader, range.start, range.end, 0))
+            .collect::<std::io::Result<_>>()?,
+    ))
 }
 
 pub(crate) fn read_prefix_from_ranges_field(
@@ -162,6 +173,7 @@ pub(crate) struct VolumeSpec {
     pub(crate) reader: ManagedReader,
     pub(crate) number: u32,
     pub(crate) start: u64,
+    pub(crate) end: Option<u64>,
 }
 
 pub(crate) fn parse_volumes(parts: &Bound<'_, PyList>) -> PyResult<Vec<VolumeSpec>> {
@@ -182,10 +194,19 @@ pub(crate) fn parse_volumes(parts: &Bound<'_, PyList>) -> PyResult<Vec<VolumeSpe
             .extract::<u32>()?;
         let start = dict
             .get_item("start")?
-            .or_else(|| dict.get_item("start_offset").ok().flatten())
             .map(|value| value.extract::<u64>())
             .transpose()?
             .unwrap_or(0);
+        let reader = ManagedReader::open(&path)?;
+        let end = dict
+            .get_item("end")?
+            .map(|value| value.extract::<u64>())
+            .transpose()?;
+        if start > end.unwrap_or(reader.len()).min(reader.len()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "volume range is outside file length",
+            ));
+        }
         let canonical_name = dict
             .get_item("canonical_name")?
             .ok_or_else(|| {
@@ -198,9 +219,10 @@ pub(crate) fn parse_volumes(parts: &Bound<'_, PyList>) -> PyResult<Vec<VolumeSpe
             ));
         }
         parsed.push(VolumeSpec {
-            reader: ManagedReader::open(&path)?,
+            reader,
             number,
             start,
+            end,
         });
     }
     parsed.sort_by_key(|volume| volume.number);
@@ -232,8 +254,27 @@ impl VolumeSet {
         self.volumes.len()
     }
 
+    pub(crate) fn key(&self, format: &'static str) -> std::io::Result<InputKey> {
+        Ok(InputKey::new(
+            format,
+            "volumes",
+            self.volumes
+                .iter()
+                .map(|volume| {
+                    InputMember::new(&volume.reader, volume.start, volume.end, volume.number)
+                })
+                .collect::<std::io::Result<_>>()?,
+        ))
+    }
+
     pub(crate) fn volume_len(&self, disk: usize) -> Option<u64> {
-        self.volumes.get(disk).map(|volume| volume.reader.len())
+        self.volumes.get(disk).map(|volume| {
+            volume
+                .end
+                .unwrap_or(volume.reader.len())
+                .min(volume.reader.len())
+                - volume.start
+        })
     }
 
     pub(crate) fn read_disk_spanning(
@@ -248,7 +289,7 @@ impl VolumeSet {
             let Some(volume) = self.volumes.get(disk) else {
                 break;
             };
-            let volume_len = volume.reader.len();
+            let volume_len = self.volume_len(disk).unwrap();
             if offset >= volume_len {
                 if offset == volume_len {
                     disk += 1;
@@ -259,9 +300,10 @@ impl VolumeSet {
             }
             let available = (volume_len - offset) as usize;
             let requested = available.min(size - written);
-            let read = volume
-                .reader
-                .read_into_at(offset, &mut output[written..written + requested])?;
+            let read = volume.reader.read_into_at(
+                volume.start + offset,
+                &mut output[written..written + requested],
+            )?;
             if read == 0 {
                 break;
             }
@@ -365,21 +407,12 @@ impl VolumeSet {
                 .with_field(field, FieldLocation::Head)
                 .with_volume(1));
         };
-        let start = self.volumes[0].start.min(volume_len);
-        let requested = size.min(volume_len.saturating_sub(start) as usize);
-        self.read_disk_spanning(0, start, requested)
-            .map_err(|error| {
-                ReadFault::from_io(
-                    error,
-                    "read_volume",
-                    start,
-                    requested,
-                    0,
-                    volume_len,
-                )
+        let requested = size.min(volume_len as usize);
+        self.read_disk_spanning(0, 0, requested).map_err(|error| {
+            ReadFault::from_io(error, "read_volume", 0, requested, 0, volume_len)
                 .with_field(field, FieldLocation::Head)
                 .with_volume(1)
-            })
+        })
     }
 }
 
@@ -396,12 +429,14 @@ mod tests {
             RangeSpec {
                 reader: ManagedReader::open(&first).unwrap(),
                 start: 2,
+                end: Some(5),
                 len: 3,
                 virtual_start: 0,
             },
             RangeSpec {
                 reader: ManagedReader::open(&second).unwrap(),
                 start: 1,
+                end: Some(5),
                 len: 4,
                 virtual_start: 3,
             },

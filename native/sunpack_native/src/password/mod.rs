@@ -21,3 +21,4 @@ pub(crate) fn password_read_fault_status(py: Python<'_>, fault: &ReadFault) -> P
     fault.write_python(&result)?;
     Ok(result.into())
 }
+pub(crate) mod context;

@@ -127,6 +127,9 @@ impl Deref for CachedBytes {
 
 pub(crate) trait ByteSource: Send + Sync {
     fn len(&self) -> u64;
+    fn file_identity(&self) -> Option<FileIdentity> {
+        None
+    }
     /// Reads at most `len` bytes. A range crossing EOF is shortened.
     fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>>;
     fn read_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
@@ -262,6 +265,12 @@ impl ManagedReader {
 
     pub(crate) fn len(&self) -> u64 {
         self.source.len()
+    }
+
+    pub(crate) fn file_identity(&self) -> io::Result<FileIdentity> {
+        self.source.file_identity().ok_or_else(|| {
+            io::Error::other("password context requires a physical input generation")
+        })
     }
 
     #[cfg(windows)]
@@ -441,11 +450,8 @@ impl ManagedReader {
 
         let slices = self.read_request_source_slices_at(offset, read_len)?;
         let data = coalesce_cached_slices(slices);
-        self.lock_inner()?.store_cache_entry(
-            key,
-            data.clone(),
-            self.state.config.cache_bytes,
-        );
+        self.lock_inner()?
+            .store_cache_entry(key, data.clone(), self.state.config.cache_bytes);
         Ok(data)
     }
 
@@ -554,8 +560,6 @@ pub(crate) struct NativeArchiveSession {
     path: String,
     reader: ManagedReader,
     closed: bool,
-    seven_zip_password_probe:
-        OnceLock<Option<Arc<crate::formats::seven_zip::SevenZipPasswordProbe>>>,
 }
 
 impl NativeArchiveSession {
@@ -579,7 +583,6 @@ impl NativeArchiveSession {
             path,
             reader,
             closed: false,
-            seven_zip_password_probe: OnceLock::new(),
         })
     }
 
@@ -661,7 +664,7 @@ impl NativeArchiveSession {
         passwords: &Bound<'_, PyList>,
     ) -> PyResult<Py<PyAny>> {
         self.ensure_open()?;
-        crate::password::zip::zip_fast_verify_passwords_with_reader(py, &self.reader, passwords)
+        crate::password::zip::zip_fast_verify_passwords(py, self.path.clone(), passwords)
     }
 
     fn seven_zip_fast_verify_passwords(
@@ -670,11 +673,10 @@ impl NativeArchiveSession {
         passwords: &Bound<'_, PyList>,
     ) -> PyResult<Py<PyAny>> {
         self.ensure_open()?;
-        crate::password::seven_zip::seven_zip_fast_verify_passwords_with_probe_cache(
+        crate::password::seven_zip::seven_zip_fast_verify_passwords(
             py,
-            &self.reader,
+            self.path.clone(),
             passwords,
-            &self.seven_zip_password_probe,
         )
     }
 
@@ -684,7 +686,7 @@ impl NativeArchiveSession {
         passwords: &Bound<'_, PyList>,
     ) -> PyResult<Py<PyAny>> {
         self.ensure_open()?;
-        crate::password::rar::rar_fast_verify_passwords_with_reader(py, &self.reader, passwords)
+        crate::password::rar::rar_fast_verify_passwords(py, self.path.clone(), passwords)
     }
 
     #[pyo3(signature = (iocp_chunk_bytes=2097152, iocp_buffers=2, iocp_workers=4))]
@@ -861,10 +863,19 @@ impl ByteSource for BytesSource {
 }
 
 #[derive(Clone, Eq, PartialEq, Hash)]
-struct FileIdentity {
-    path: PathBuf,
+pub(crate) struct FileIdentity {
+    pub(crate) path: PathBuf,
     len: u64,
     modified: Option<SystemTime>,
+    created: Option<SystemTime>,
+}
+
+impl FileIdentity {
+    pub(crate) fn is_current(&self) -> bool {
+        std::fs::metadata(&self.path)
+            .map(|metadata| file_identity(self.path.clone(), &metadata) == *self)
+            .unwrap_or(false)
+    }
 }
 
 struct FileSource {
@@ -951,6 +962,10 @@ impl FileSource {
 }
 
 impl ByteSource for FileSource {
+    fn file_identity(&self) -> Option<FileIdentity> {
+        Some(self.identity.clone())
+    }
+
     fn len(&self) -> u64 {
         self.identity.len
     }
@@ -1533,7 +1548,7 @@ impl ReaderManager {
                 .lock()
                 .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
             if let Some(identity) = handles.by_path.get(&canonical).cloned() {
-                if identity.len == metadata.len() && identity.modified == metadata.modified().ok() {
+                if identity == file_identity(canonical.clone(), &metadata) {
                     if let Some(source) = handles.touch(&identity) {
                         self.metrics.handle_hits.fetch_add(1, Ordering::Relaxed);
                         return Ok(source);
@@ -1667,9 +1682,7 @@ impl ReaderManager {
                     let len = BLOCK_SIZE.min(source.len().saturating_sub(offset) as usize);
                     let result = source
                         .with_file(|file| read_file_at(file, offset, len, &self.metrics))
-                        .and_then(|data| {
-                            self.insert_block(key.clone(), Arc::from(data), tier)
-                        });
+                        .and_then(|data| self.insert_block(key.clone(), Arc::from(data), tier));
                     let finish_result = self.finish_block_load(source, index, &load);
                     return match result {
                         Ok(data) => {
@@ -1792,10 +1805,7 @@ impl ReaderManager {
         let shard = self.cache_shards[shard_index]
             .lock()
             .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-        let block = shard
-            .entries
-            .get(key)
-            .map(|entry| Arc::clone(&entry.data));
+        let block = shard.entries.get(key).map(|entry| Arc::clone(&entry.data));
         if block.is_some() {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             if matches!(tier, CacheTier::Hot) {
@@ -1842,10 +1852,8 @@ impl ReaderManager {
                     let Some((old_key, old_generation)) = shard.hot_order.pop_front() else {
                         break;
                     };
-                    let current_generation = shard
-                        .entries
-                        .get(&old_key)
-                        .map(|entry| entry.generation);
+                    let current_generation =
+                        shard.entries.get(&old_key).map(|entry| entry.generation);
                     if current_generation != Some(old_generation) {
                         shard.hot_stale = shard.hot_stale.saturating_sub(1);
                         continue;
@@ -1862,10 +1870,8 @@ impl ReaderManager {
                     let Some((old_key, old_generation)) = shard.general_order.pop_front() else {
                         break;
                     };
-                    let current_generation = shard
-                        .entries
-                        .get(&old_key)
-                        .map(|entry| entry.generation);
+                    let current_generation =
+                        shard.entries.get(&old_key).map(|entry| entry.generation);
                     if current_generation != Some(old_generation) {
                         shard.general_stale = shard.general_stale.saturating_sub(1);
                         continue;
@@ -1939,9 +1945,7 @@ fn canonical_release_roots(paths: &[String]) -> Vec<PathBuf> {
     let mut roots = paths
         .iter()
         .filter(|path| !path.is_empty())
-        .map(|path| {
-            std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
-        })
+        .map(|path| std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path)))
         .collect::<Vec<_>>();
     roots.sort_by(|left, right| {
         left.components()
@@ -2032,6 +2036,7 @@ pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
 
 #[pyfunction]
 pub(crate) fn clear_reader_resources(py: Python<'_>) -> PyResult<Py<PyDict>> {
+    crate::password::context::clear();
     let (handles, cache_entries, cache_bytes) = manager().clear_resources()?;
     let dict = PyDict::new(py);
     dict.set_item("handles", handles)?;
@@ -2052,6 +2057,7 @@ pub(crate) fn release_reader_resources_under_roots(
     paths: Vec<String>,
 ) -> PyResult<Py<PyDict>> {
     let roots = canonical_release_roots(&paths);
+    crate::password::context::release_under_roots(&roots);
     let (handles, cache_entries, cache_bytes) = manager().release_resources_under_roots(&roots)?;
     let dict = PyDict::new(py);
     dict.set_item("handles", handles)?;
@@ -2102,6 +2108,7 @@ fn file_identity(path: PathBuf, metadata: &Metadata) -> FileIdentity {
         path,
         len: metadata.len(),
         modified: metadata.modified().ok(),
+        created: metadata.created().ok(),
     }
 }
 
@@ -2372,9 +2379,7 @@ mod tests {
             std::fs::canonicalize(&first_path).unwrap_or_else(|_| first_path.clone()),
             std::fs::canonicalize(&second_path).unwrap_or_else(|_| second_path.clone()),
         ];
-        let (handles, entries, bytes) = manager()
-            .release_resources_under_roots(&roots)
-            .unwrap();
+        let (handles, entries, bytes) = manager().release_resources_under_roots(&roots).unwrap();
 
         assert_eq!(handles, 2);
         assert_eq!(entries, 2);
@@ -2384,8 +2389,7 @@ mod tests {
         assert!(manager().contains_block(&other_key).unwrap());
         assert_eq!(other.read_at(0, 8).unwrap(), b"qrstuvwx");
 
-        let other_root =
-            std::fs::canonicalize(&other_path).unwrap_or_else(|_| other_path.clone());
+        let other_root = std::fs::canonicalize(&other_path).unwrap_or_else(|_| other_path.clone());
         manager()
             .release_resources_under_roots(&[other_root])
             .unwrap();
@@ -2491,13 +2495,14 @@ mod tests {
 
         {
             let mut handles = manager().handles.lock().unwrap();
-            assert_eq!(handles.by_path.remove(&canonical), Some(source.identity.clone()));
+            assert_eq!(
+                handles.by_path.remove(&canonical),
+                Some(source.identity.clone())
+            );
             assert!(handles.entries.contains_key(&source.identity));
         }
 
-        let released = manager()
-            .release_handles_under_roots(&[canonical])
-            .unwrap();
+        let released = manager().release_handles_under_roots(&[canonical]).unwrap();
 
         assert_eq!(released, 1);
         assert!(source.closed.load(Ordering::Acquire));
@@ -2550,9 +2555,7 @@ mod tests {
         let worker_source = Arc::clone(&source);
         let handle = std::thread::spawn(move || {
             let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
-            worker_source
-                .prefetch(&[(0, BLOCK_SIZE * 3)])
-                .unwrap();
+            worker_source.prefetch(&[(0, BLOCK_SIZE * 3)]).unwrap();
             let after = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
             after - before
         });
@@ -2654,9 +2657,7 @@ mod tests {
         let source = manager().open_file(&path).unwrap();
         source.close().unwrap();
 
-        assert!(manager()
-            .prefetch_blocks(&source, vec![0, 1])
-            .is_err());
+        assert!(manager().prefetch_blocks(&source, vec![0, 1]).is_err());
         assert!(source.block_loads.lock().unwrap().is_empty());
 
         let _ = std::fs::remove_file(path);

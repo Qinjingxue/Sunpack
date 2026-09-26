@@ -1,14 +1,14 @@
 use crate::formats::seven_zip::SevenZipPasswordProbe;
 use crate::io::read_fault::{read_exact_field, FieldLocation, ReadFault};
 use crate::io::reader::ManagedReader;
-use crate::password::input::{parse_ranges, ranges_total_len, VirtualRangeReader};
-use crate::password::password_read_fault_status;
+use crate::password::context::{verify_prepared, InputKey, PasswordContext, PreparedStatus};
+use crate::password::input::{parse_ranges, ranges_key, ranges_total_len, VirtualRangeReader};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 use sevenz_rust2::{Archive, Error as SevenZipError, Password};
 use std::io::{Read, Seek, SeekFrom};
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 const SEVEN_Z_SIGNATURE: &[u8] = b"7z\xbc\xaf\x27\x1c";
 const SEVEN_Z_AES256_SHA256_METHOD: &[u8] = &[0x06, 0xf1, 0x07, 0x01];
@@ -51,114 +51,13 @@ pub(crate) fn seven_zip_fast_verify_passwords_with_reader(
     reader: &ManagedReader,
     passwords: &Bound<'_, PyList>,
 ) -> PyResult<Py<PyAny>> {
-    seven_zip_fast_verify_passwords_impl(py, reader, passwords, None)
-}
-
-pub(crate) fn seven_zip_fast_verify_passwords_with_probe_cache(
-    py: Python<'_>,
-    reader: &ManagedReader,
-    passwords: &Bound<'_, PyList>,
-    probe_cache: &OnceLock<Option<Arc<SevenZipPasswordProbe>>>,
-) -> PyResult<Py<PyAny>> {
-    seven_zip_fast_verify_passwords_impl(py, reader, passwords, Some(probe_cache))
-}
-
-fn seven_zip_fast_verify_passwords_impl(
-    py: Python<'_>,
-    reader: &ManagedReader,
-    passwords: &Bound<'_, PyList>,
-    probe_cache: Option<&OnceLock<Option<Arc<SevenZipPasswordProbe>>>>,
-) -> PyResult<Py<PyAny>> {
     let candidates = passwords
         .iter()
         .map(|item| item.extract::<String>())
         .collect::<PyResult<Vec<_>>>()?;
-
-    let mut signature = [0u8; 6];
-    if let Err(fault) = py.detach(|| {
-        read_exact_field(
-            &mut reader.cursor(),
-            &mut signature,
-            reader.len(),
-            "7z.signature",
-            FieldLocation::Head,
-        )
-    }) {
-        return password_read_fault_status(py, &fault);
-    }
-    if signature != SEVEN_Z_SIGNATURE {
-        return status(py, "unsupported_method", -1, 0, "7z signature not found");
-    }
-
-    if let Err(fault) = py.detach(|| seven_zip_tail_requirement(reader.cursor())) {
-        return password_read_fault_status(py, &fault);
-    }
-
-    match py.detach(|| read_archive_header_from_reader(reader.cursor(), "")) {
-        HeaderRead::Ok {
-            payload_encrypted: false,
-        } => {
-            return status(
-                py,
-                "not_required",
-                -1,
-                0,
-                "7z header is readable without password",
-            );
-        }
-        HeaderRead::Ok {
-            payload_encrypted: true,
-        } => {
-            return status(
-                py,
-                "unknown_needs_final_verifier",
-                -1,
-                0,
-                "7z header is readable but payload uses AES encryption",
-            );
-        }
-        HeaderRead::WrongPasswordOrPasswordRequired => {}
-        HeaderRead::Unsupported(message) => {
-            return status(py, "unknown_needs_final_verifier", -1, 0, &message);
-        }
-        HeaderRead::Damaged(message) => {
-            return status(py, "damaged", -1, 0, &message);
-        }
-    }
-
-    let owned_probe;
-    let probe = if std::env::var_os("SUNPACK_DISABLE_7Z_PASSWORD_PROBE").is_some() {
-        None
-    } else if let Some(cache) = probe_cache {
-        cache
-            .get_or_init(|| {
-                py.detach(|| SevenZipPasswordProbe::from_reader(reader))
-                    .ok()
-                    .map(Arc::new)
-            })
-            .as_deref()
-    } else {
-        owned_probe = py
-            .detach(|| SevenZipPasswordProbe::from_reader(reader))
-            .ok();
-        owned_probe.as_ref()
-    };
-    if let Some((index, outcome)) = py.detach(|| match probe {
-        Some(probe) => find_first_conclusive_header_with_probe(&candidates, probe),
-        None => find_first_conclusive_header(&candidates, |password| {
-            read_archive_header_from_reader(reader.cursor(), password)
-        }),
-    }) {
-        return conclusive_status(py, index, outcome);
-    }
-
-    status(
-        py,
-        "no_match",
-        -1,
-        candidates.len() as i32,
-        "7z encrypted header did not open",
-    )
+    verify_prepared(py, InputKey::file("7z", reader)?, &candidates, || {
+        prepare_seven_zip(reader.cursor(), reader.len()).map(PasswordContext::SevenZip)
+    })
 }
 
 #[pyfunction]
@@ -172,78 +71,95 @@ pub(crate) fn seven_zip_fast_verify_passwords_from_ranges(
         .map(|item| item.extract::<String>())
         .collect::<PyResult<Vec<_>>>()?;
     let parsed = parse_ranges(ranges)?;
-    let parsed: Arc<[_]> = parsed.into();
+    let total_len = ranges_total_len(&parsed);
+    verify_prepared(py, ranges_key("7z", &parsed)?, &candidates, || {
+        prepare_seven_zip(VirtualRangeReader::new(parsed.into()), total_len)
+            .map(PasswordContext::SevenZip)
+    })
+}
 
-    let mut probe_reader = VirtualRangeReader::new(parsed.clone());
+pub(crate) struct SevenZipPasswordContext {
+    probe: SevenZipPasswordProbe,
+}
+
+impl SevenZipPasswordContext {
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.probe.retained_bytes()
+    }
+
+    pub(crate) fn verify(&self, py: Python<'_>, candidates: &[String]) -> PyResult<Py<PyAny>> {
+        if let Some((index, outcome)) =
+            py.detach(|| find_first_conclusive_header_with_probe(candidates, &self.probe))
+        {
+            return conclusive_status(py, index, outcome);
+        }
+        status(
+            py,
+            "no_match",
+            -1,
+            candidates.len() as i32,
+            "7z encrypted header did not open",
+        )
+    }
+}
+
+fn prepare_seven_zip<R: Read + Seek>(
+    mut reader: R,
+    total_len: u64,
+) -> Result<SevenZipPasswordContext, PreparedStatus> {
     let mut signature = [0u8; 6];
-    let range_len = ranges_total_len(&parsed);
-    if let Err(fault) = read_exact_field(
-        &mut probe_reader,
+    read_exact_field(
+        &mut reader,
         &mut signature,
-        range_len,
+        total_len,
         "7z.signature",
         FieldLocation::Head,
-    ) {
-        return password_read_fault_status(py, &fault);
-    }
+    )?;
     if signature != SEVEN_Z_SIGNATURE {
-        return status(py, "unsupported_method", -1, 0, "7z signature not found");
+        return Err(PreparedStatus::new(
+            "unsupported_method",
+            "7z signature not found",
+        ));
     }
-
-    if let Err(fault) = seven_zip_tail_requirement(VirtualRangeReader::new(parsed.clone())) {
-        return password_read_fault_status(py, &fault);
-    }
-
-    match read_archive_header_from_reader(VirtualRangeReader::new(parsed.clone()), "") {
+    seven_zip_tail_requirement(&mut reader)?;
+    reader.seek(SeekFrom::Start(0)).map_err(|error| {
+        ReadFault::from_io(error, "seek", 0, 0, 0, total_len)
+            .with_field("7z.start_header", FieldLocation::Head)
+    })?;
+    match read_archive_header_from_reader(&mut reader, "") {
         HeaderRead::Ok {
             payload_encrypted: false,
         } => {
-            return status(
-                py,
+            return Err(PreparedStatus::new(
                 "not_required",
-                -1,
-                0,
                 "7z header is readable without password",
-            );
+            ))
         }
         HeaderRead::Ok {
             payload_encrypted: true,
         } => {
-            return status(
-                py,
+            return Err(PreparedStatus::new(
                 "unknown_needs_final_verifier",
-                -1,
-                0,
                 "7z header is readable but payload uses AES encryption",
-            );
+            ))
         }
         HeaderRead::WrongPasswordOrPasswordRequired => {}
         HeaderRead::Unsupported(message) => {
-            return status(py, "unknown_needs_final_verifier", -1, 0, &message);
+            return Err(PreparedStatus::new("unknown_needs_final_verifier", message))
         }
-        HeaderRead::Damaged(message) => {
-            return status(py, "damaged", -1, 0, &message);
-        }
+        HeaderRead::Damaged(message) => return Err(PreparedStatus::new("damaged", message)),
     }
-
-    let probe =
-        SevenZipPasswordProbe::from_seekable(&mut VirtualRangeReader::new(parsed.clone())).ok();
-    if let Some((index, outcome)) = py.detach(|| match probe.as_ref() {
-        Some(probe) => find_first_conclusive_header_with_probe(&candidates, probe),
-        None => find_first_conclusive_header(&candidates, |password| {
-            read_archive_header_from_reader(VirtualRangeReader::new(parsed.clone()), password)
-        }),
-    }) {
-        return conclusive_status(py, index, outcome);
+    if std::env::var_os("SUNPACK_DISABLE_7Z_PASSWORD_PROBE").is_some() {
+        return Err(PreparedStatus::new(
+            "unknown_needs_final_verifier",
+            "7z password probe is disabled",
+        ));
     }
-
-    status(
-        py,
-        "no_match",
-        -1,
-        candidates.len() as i32,
-        "7z encrypted header did not open",
-    )
+    // An unsupported coder graph goes to the existing final verifier. Reopening
+    // and reparsing the physical archive for each candidate defeats preparation.
+    let probe = SevenZipPasswordProbe::from_seekable(&mut reader)
+        .map_err(|message| PreparedStatus::new("unknown_needs_final_verifier", message))?;
+    Ok(SevenZipPasswordContext { probe })
 }
 
 enum HeaderRead {
@@ -292,27 +208,6 @@ fn seven_zip_tail_requirement<R: Read + Seek>(mut reader: R) -> Result<(), ReadF
         );
     }
     Ok(())
-}
-
-fn find_first_conclusive_header<F>(candidates: &[String], verify: F) -> Option<(usize, HeaderRead)>
-where
-    F: Fn(&str) -> HeaderRead + Sync,
-{
-    if candidates.len() >= PARALLEL_PASSWORD_THRESHOLD {
-        candidates
-            .par_iter()
-            .enumerate()
-            .map(|(index, password)| (index, verify(password)))
-            .find_first(|(_, outcome)| {
-                !matches!(outcome, HeaderRead::WrongPasswordOrPasswordRequired)
-            })
-    } else {
-        candidates.iter().enumerate().find_map(|(index, password)| {
-            let outcome = verify(password);
-            (!matches!(outcome, HeaderRead::WrongPasswordOrPasswordRequired))
-                .then_some((index, outcome))
-        })
-    }
 }
 
 fn find_first_conclusive_header_with_probe(
@@ -386,9 +281,13 @@ fn conclusive_status(py: Python<'_>, index: usize, outcome: HeaderRead) -> PyRes
             Some(false),
             Some("7z_encrypted_header"),
         ),
-        HeaderRead::Unsupported(message) => {
-            status(py, "unknown_needs_final_verifier", -1, index as i32, &message)
-        }
+        HeaderRead::Unsupported(message) => status(
+            py,
+            "unknown_needs_final_verifier",
+            -1,
+            index as i32,
+            &message,
+        ),
         HeaderRead::Damaged(message) => status(py, "damaged", -1, index as i32, &message),
         HeaderRead::WrongPasswordOrPasswordRequired => unreachable!("filtered outcome"),
     }

@@ -21,8 +21,8 @@ pub(crate) struct SevenZipPasswordProbe {
 }
 
 impl SevenZipPasswordProbe {
-    pub(crate) fn from_reader(reader: &crate::io::reader::ManagedReader) -> Result<Self, String> {
-        Self::from_seekable(&mut reader.cursor())
+    pub(crate) fn retained_bytes(&self) -> usize {
+        self.packed_data.iter().map(Vec::len).sum()
     }
 
     pub(crate) fn from_seekable<R: Read + Seek>(reader: &mut R) -> Result<Self, String> {
