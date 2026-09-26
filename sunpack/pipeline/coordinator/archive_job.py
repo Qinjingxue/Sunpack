@@ -217,7 +217,7 @@ class ArchiveJobExecutor:
             done, value = await broker.run(
                 "extract_prepare" if first else "verify_extract",
                 file_id,
-                _advance_extract_state,
+                _advance_job_state,
                 state,
                 sent,
                 first=first,
