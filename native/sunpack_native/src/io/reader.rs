@@ -1511,17 +1511,22 @@ impl ReaderManager {
         index: u64,
         load: &Arc<BlockLoad>,
     ) -> io::Result<()> {
-        load.finish();
-        let mut loads = source
-            .block_loads
-            .lock()
-            .map_err(|_| io::Error::other("reader block-load lock poisoned"))?;
+        let mut loads = match source.block_loads.lock() {
+            Ok(loads) => loads,
+            Err(_) => {
+                load.finish();
+                return Err(io::Error::other("reader block-load lock poisoned"));
+            }
+        };
         if loads
             .get(&index)
             .is_some_and(|current| Arc::ptr_eq(current, load))
         {
             loads.remove(&index);
         }
+        // Keep the registry locked until waiters are notified so a failed load
+        // cannot be immediately re-observed as the same completed entry.
+        load.finish();
         Ok(())
     }
 
@@ -1530,13 +1535,15 @@ impl ReaderManager {
         source: &FileSource,
         loads_to_finish: &[(u64, Arc<BlockLoad>)],
     ) -> io::Result<()> {
-        for (_, load) in loads_to_finish {
-            load.finish();
-        }
-        let mut loads = source
-            .block_loads
-            .lock()
-            .map_err(|_| io::Error::other("reader block-load lock poisoned"))?;
+        let mut loads = match source.block_loads.lock() {
+            Ok(loads) => loads,
+            Err(_) => {
+                for (_, load) in loads_to_finish {
+                    load.finish();
+                }
+                return Err(io::Error::other("reader block-load lock poisoned"));
+            }
+        };
         for (index, load) in loads_to_finish {
             if loads
                 .get(index)
@@ -1544,6 +1551,9 @@ impl ReaderManager {
             {
                 loads.remove(index);
             }
+        }
+        for (_, load) in loads_to_finish {
+            load.finish();
         }
         Ok(())
     }
