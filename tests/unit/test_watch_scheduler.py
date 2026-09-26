@@ -2292,6 +2292,8 @@ def test_idle_scheduler_has_no_polling_deadline(tmp_path, monkeypatch):
 
 def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    wall_clock = WatchClock(1_000.0)
+    wall_clock.install(monkeypatch)
     attempts = {"count": 0}
 
     class PasswordThenSuccessRunner:
@@ -2324,7 +2326,7 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
         pipeline_engine=FakePipelineEngine(PasswordThenSuccessRunner),
     )
     watcher.enqueue(str(archive_path))
-    watcher._active_states[str(archive_path)].last_event_at = 0.0
+    wall_clock.advance(watcher.cold_start_seconds + 0.01)
     assert _await(watcher.run_once()).failed == 1
     watcher._quiet_trackers[str(archive_path)].quiet_seconds = 30.0
 
@@ -2338,6 +2340,8 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
 
 def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    wall_clock = WatchClock(1_000.0)
+    wall_clock.install(monkeypatch)
 
     class PasswordFailureRunner:
         def __init__(self, config):
@@ -2368,7 +2372,7 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
         pipeline_engine=FakePipelineEngine(PasswordFailureRunner),
     )
     watcher.enqueue(str(archive_path))
-    watcher._active_states[str(archive_path)].last_event_at = 0.0
+    wall_clock.advance(watcher.cold_start_seconds + 0.01)
     assert _await(watcher.run_once()).failed == 1
     watcher._quiet_trackers[str(archive_path)].quiet_seconds = 30.0
     archive_path.write_bytes(b"PK\x03\x04changed-payload")
