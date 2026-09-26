@@ -25,13 +25,13 @@ def test_progress_displays_nested_archive_parent_chain_and_final_page(tmp_path, 
     outer_output = tmp_path / "outer"
 
     reporter.scan_started(1)
-    reporter.begin_round(1, [outer])
+    reporter.tasks_discovered(1, [outer])
     reporter.task_started(outer, 1)
     reporter.task_finished(outer, _outcome(outer_output), 1)
 
     inner = _task(outer_output / "folder" / "inner.7z")
     inner_output = outer_output / "folder" / "inner"
-    reporter.begin_round(2, [inner])
+    reporter.tasks_discovered(2, [inner])
     reporter.task_started(inner, 2)
     reporter.task_finished(inner, _outcome(inner_output), 2)
     reporter.log_final_summary(0, 2, [])
@@ -56,7 +56,7 @@ def test_progress_displays_full_lineage_for_deep_recursion(tmp_path, capsys):
 
     for depth, (archive, output_dir) in enumerate(paths, start=1):
         task = _task(archive)
-        reporter.begin_round(depth, [task])
+        reporter.tasks_discovered(depth, [task])
         reporter.task_finished(task, _outcome(output_dir), depth)
 
     output = capsys.readouterr().out
@@ -118,7 +118,7 @@ def test_interactive_panel_updates_fixed_row_with_progress_and_colors(tmp_path, 
     reporter = RunReporter("zh")
     task = _task(tmp_path / "large.7z")
 
-    reporter.begin_round(1, [task])
+    reporter.tasks_discovered(1, [task])
     reporter.task_started(task, 1)
     reporter._last_render_at = 0.0
     reporter.task_progress(task, {"completed_bytes": 50, "total_bytes": 100})
@@ -143,7 +143,7 @@ def test_interactive_row_accounts_for_wide_status_and_archive_characters(tmp_pat
     reporter = RunReporter("zh", stdout=stream)
     task = _task(tmp_path / ("很长的嵌套压缩包名称" * 8 + ".zip"))
 
-    reporter.begin_round(2, [task])
+    reporter.tasks_discovered(2, [task])
     reporter.task_progress(task, {"completed_bytes": 50, "total_bytes": 100})
 
     row = reporter._format_task_row(reporter._task_rows[id(task)])
@@ -165,7 +165,7 @@ def test_noninteractive_terminal_streams_throttled_progress_bar(tmp_path, monkey
     reporter = RunReporter("zh")
     task = _task(tmp_path / "large.7z")
 
-    reporter.begin_round(1, [task])
+    reporter.tasks_discovered(1, [task])
     reporter.task_progress(task, {"completed_bytes": 5, "total_bytes": 100})
     reporter.task_progress(task, {"completed_bytes": 9, "total_bytes": 100})
     reporter.task_progress(task, {"completed_bytes": 50, "total_bytes": 100})
