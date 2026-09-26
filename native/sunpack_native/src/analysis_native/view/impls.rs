@@ -34,6 +34,169 @@ impl AnalysisBinaryView {
         self.read_at_bytes(offset, read_size)
     }
 
+    pub(crate) fn probe_zip_local_header_native(
+        &self,
+        py: Python<'_>,
+        offset: u64,
+    ) -> PyResult<Py<PyDict>> {
+        self.ensure_open()?;
+        let result = PyDict::new(py);
+        result.set_item("offset", offset)?;
+        result.set_item("magic_matched", false)?;
+        result.set_item("plausible", false)?;
+        result.set_item("error", "")?;
+        result.set_item("version_needed", 0u16)?;
+        result.set_item("compression_method", 0u16)?;
+        result.set_item("filename_len", 0u16)?;
+        result.set_item("extra_len", 0u16)?;
+
+        let header = self.read_at_bytes(offset, 30)?;
+        if header.len() < 30 {
+            result.set_item("magic_matched", header.starts_with(b"PK"))?;
+            result.set_item("error", "short_header")?;
+            return Ok(result.unbind());
+        }
+        if &header[..4] != ZIP_LOCAL {
+            result.set_item(
+                "magic_matched",
+                header.starts_with(ZIP_LOCAL)
+                    || header.starts_with(ZIP_EOCD)
+                    || header.starts_with(b"PK\x07\x08"),
+            )?;
+            result.set_item("error", "bad_signature")?;
+            return Ok(result.unbind());
+        }
+
+        let version_needed = u16_le(&header, 4);
+        let compression_method = u16_le(&header, 8);
+        let filename_len = u16_le(&header, 26);
+        let extra_len = u16_le(&header, 28);
+        result.set_item("magic_matched", true)?;
+        result.set_item("version_needed", version_needed)?;
+        result.set_item("compression_method", compression_method)?;
+        result.set_item("filename_len", filename_len)?;
+        result.set_item("extra_len", extra_len)?;
+
+        if version_needed > 63 {
+            result.set_item("error", "unsupported_version")?;
+        } else if !matches!(
+            compression_method,
+            0 | 1 | 6 | 8 | 9 | 12 | 14 | 95 | 96 | 98 | 99
+        ) {
+            result.set_item("error", "unknown_compression_method")?;
+        } else if filename_len == 0 || filename_len > 4096 {
+            result.set_item("error", "invalid_filename_length")?;
+        } else {
+            let header_end = offset
+                .checked_add(30)
+                .and_then(|value| value.checked_add(u64::from(filename_len)))
+                .and_then(|value| value.checked_add(u64::from(extra_len)));
+            if header_end.is_none_or(|end| end > self.reader.len()) {
+                result.set_item("error", "header_exceeds_file_size")?;
+            } else {
+                result.set_item("plausible", true)?;
+            }
+        }
+        Ok(result.unbind())
+    }
+
+    pub(crate) fn locate_zip_eocd_native(
+        &self,
+        py: Python<'_>,
+        requested_offset: Option<u64>,
+    ) -> PyResult<Py<PyDict>> {
+        self.ensure_open()?;
+        let result = PyDict::new(py);
+        result.set_item("eocd_candidate_found", false)?;
+        result.set_item("eocd_candidate_offset", 0u64)?;
+        result.set_item("eocd_candidate_comment_length", 0u16)?;
+        result.set_item("eocd_candidate_comment_available_delta", 0i64)?;
+        result.set_item("eocd_candidate_declared_entry_count_present", false)?;
+        result.set_item("eocd_candidate_declared_cd_offset_present", false)?;
+        result.set_item("eocd_candidate_total_entries", 0u16)?;
+        result.set_item("eocd_candidate_cd_offset", 0u32)?;
+        result.set_item("eocd_candidate_cd_size", 0u32)?;
+
+        let size = self.reader.len();
+        let mut set_candidate = |offset: u64, record: &[u8], available: i64| -> PyResult<()> {
+            if record.len() < 22 || &record[..4] != ZIP_EOCD {
+                return Ok(());
+            }
+            let comment_length = u16_le(record, 20);
+            let total_entries = u16_le(record, 10);
+            let cd_offset = u32_le(record, 16);
+            let cd_size = u32_le(record, 12);
+            result.set_item("eocd_candidate_found", true)?;
+            result.set_item("eocd_candidate_offset", offset)?;
+            result.set_item("eocd_candidate_comment_length", comment_length)?;
+            result.set_item(
+                "eocd_candidate_comment_available_delta",
+                available - i64::from(comment_length),
+            )?;
+            result.set_item(
+                "eocd_candidate_declared_entry_count_present",
+                total_entries > 0,
+            )?;
+            result.set_item(
+                "eocd_candidate_declared_cd_offset_present",
+                cd_offset > 0,
+            )?;
+            result.set_item("eocd_candidate_total_entries", total_entries)?;
+            result.set_item("eocd_candidate_cd_offset", cd_offset)?;
+            result.set_item("eocd_candidate_cd_size", cd_size)?;
+            Ok(())
+        };
+
+        if let Some(offset) = requested_offset {
+            let record = self.read_at_bytes(offset, 22)?;
+            if record.len() == 22 && record.starts_with(ZIP_EOCD) {
+                let available = size
+                    .saturating_sub(offset.saturating_add(22))
+                    .min(i64::MAX as u64) as i64;
+                set_candidate(offset, &record, available)?;
+            }
+            return Ok(result.unbind());
+        }
+
+        let read_size = size.min((22 + 65_535) as u64) as usize;
+        if read_size < 4 {
+            return Ok(result.unbind());
+        }
+        let tail = self.read_tail_bytes(read_size)?;
+        let base = size.saturating_sub(tail.len() as u64);
+        let mut search_end = tail.len();
+        let mut fallback: Option<(u64, [u8; 22], i64)> = None;
+        while search_end >= 4 {
+            let found = (0..=search_end - 4)
+                .rev()
+                .find(|&index| &tail[index..index + 4] == ZIP_EOCD);
+            let Some(index) = found else {
+                break;
+            };
+            if index + 22 <= tail.len() {
+                let mut record = [0u8; 22];
+                record.copy_from_slice(&tail[index..index + 22]);
+                let available = (tail.len() - index - 22).min(i64::MAX as usize) as i64;
+                let offset = base + index as u64;
+                if fallback.is_none() {
+                    fallback = Some((offset, record, available));
+                }
+                if available == i64::from(u16_le(&record, 20)) {
+                    set_candidate(offset, &record, available)?;
+                    return Ok(result.unbind());
+                }
+            }
+            if index == 0 {
+                break;
+            }
+            search_end = index;
+        }
+        if let Some((offset, record, available)) = fallback {
+            set_candidate(offset, &record, available)?;
+        }
+        Ok(result.unbind())
+    }
+
     fn probe_zip_with_disk_starts(
         &self,
         py: Python<'_>,
