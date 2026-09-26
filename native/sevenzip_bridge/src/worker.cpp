@@ -21,6 +21,7 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
 #include <unordered_set>
@@ -112,244 +113,310 @@ std::string wide_to_utf8(const std::wstring& value) {
 #endif
 }
 
-std::size_t skip_ws(const std::string& json, std::size_t pos) {
+std::size_t skip_ws(std::string_view json, std::size_t pos) {
     while (pos < json.size() && static_cast<unsigned char>(json[pos]) <= 0x20) {
         ++pos;
     }
     return pos;
 }
 
-std::string parse_json_string_at(const std::string& json, std::size_t quote_pos, std::size_t* out_next = nullptr) {
-    std::string out;
+std::size_t json_string_end(std::string_view json, std::size_t quote_pos) {
     if (quote_pos >= json.size() || json[quote_pos] != '"') {
-        return out;
+        return quote_pos;
     }
-    for (std::size_t i = quote_pos + 1; i < json.size(); ++i) {
-        const char ch = json[i];
-        if (ch == '"') {
-            if (out_next) {
-                *out_next = i + 1;
-            }
-            return out;
-        }
-        if (ch == '\\' && i + 1 < json.size()) {
-            const char escaped = json[++i];
-            switch (escaped) {
-            case 'n': out.push_back('\n'); break;
-            case 'r': out.push_back('\r'); break;
-            case 't': out.push_back('\t'); break;
-            case '"': out.push_back('"'); break;
-            case '\\': out.push_back('\\'); break;
-            default: out.push_back(escaped); break;
-            }
+    bool escaped = false;
+    for (std::size_t pos = quote_pos + 1; pos < json.size(); ++pos) {
+        const char ch = json[pos];
+        if (escaped) {
+            escaped = false;
             continue;
         }
-        out.push_back(ch);
+        if (ch == '\\') {
+            escaped = true;
+            continue;
+        }
+        if (ch == '"') {
+            return pos + 1;
+        }
+    }
+    return json.size();
+}
+
+std::size_t json_composite_end(std::string_view json, std::size_t start) {
+    int object_depth = 0;
+    int array_depth = 0;
+    for (std::size_t pos = start; pos < json.size();) {
+        const char ch = json[pos];
+        if (ch == '"') {
+            pos = json_string_end(json, pos);
+            continue;
+        }
+        if (ch == '{') {
+            ++object_depth;
+        } else if (ch == '}') {
+            --object_depth;
+        } else if (ch == '[') {
+            ++array_depth;
+        } else if (ch == ']') {
+            --array_depth;
+        }
+        ++pos;
+        if (object_depth == 0 && array_depth == 0) {
+            return pos;
+        }
+    }
+    return json.size();
+}
+
+std::size_t json_value_end(std::string_view json, std::size_t start) {
+    start = skip_ws(json, start);
+    if (start >= json.size()) {
+        return start;
+    }
+    if (json[start] == '"') {
+        return json_string_end(json, start);
+    }
+    if (json[start] == '{' || json[start] == '[') {
+        return json_composite_end(json, start);
+    }
+    std::size_t pos = start;
+    while (pos < json.size()) {
+        const char ch = json[pos];
+        if (ch == ',' || ch == '}' || ch == ']' || static_cast<unsigned char>(ch) <= 0x20) {
+            break;
+        }
+        ++pos;
+    }
+    return pos;
+}
+
+std::string decode_json_string(std::string_view token) {
+    if (token.size() < 2 || token.front() != '"' || token.back() != '"') {
+        return {};
+    }
+    std::string out;
+    out.reserve(token.size() - 2);
+    for (std::size_t pos = 1; pos + 1 < token.size(); ++pos) {
+        const char ch = token[pos];
+        if (ch != '\\' || pos + 2 >= token.size()) {
+            out.push_back(ch);
+            continue;
+        }
+        const char escaped = token[++pos];
+        switch (escaped) {
+        case 'b': out.push_back('\b'); break;
+        case 'f': out.push_back('\f'); break;
+        case 'n': out.push_back('\n'); break;
+        case 'r': out.push_back('\r'); break;
+        case 't': out.push_back('\t'); break;
+        case '"': out.push_back('"'); break;
+        case '\\': out.push_back('\\'); break;
+        case '/': out.push_back('/'); break;
+        default:
+            // Python sends worker requests with ensure_ascii=False. Preserve the
+            // previous protocol behaviour for uncommon escape forms instead of
+            // adding a second general-purpose JSON decoder here.
+            out.push_back(escaped);
+            break;
+        }
     }
     return out;
 }
 
-std::string json_string_field(const std::string& json, const std::string& key, const std::string& fallback = "") {
-    const std::string needle = "\"" + key + "\"";
-    const std::size_t key_pos = json.find(needle);
-    if (key_pos == std::string::npos) {
-        return fallback;
-    }
-    const std::size_t colon = json.find(':', key_pos + needle.size());
-    if (colon == std::string::npos) {
-        return fallback;
-    }
-    const std::size_t quote = skip_ws(json, colon + 1);
-    if (quote >= json.size() || json[quote] != '"') {
-        return fallback;
-    }
-    return parse_json_string_at(json, quote);
-}
-
-std::vector<std::string> json_string_array_field(const std::string& json, const std::string& key) {
-    std::vector<std::string> values;
-    const std::string needle = "\"" + key + "\"";
-    const std::size_t key_pos = json.find(needle);
-    if (key_pos == std::string::npos) {
-        return values;
-    }
-    const std::size_t colon = json.find(':', key_pos + needle.size());
-    if (colon == std::string::npos) {
-        return values;
-    }
-    std::size_t pos = skip_ws(json, colon + 1);
-    if (pos >= json.size() || json[pos] != '[') {
+std::vector<std::string_view> json_array_values(std::string_view array_json) {
+    std::vector<std::string_view> values;
+    std::size_t pos = skip_ws(array_json, 0);
+    if (pos >= array_json.size() || array_json[pos] != '[') {
         return values;
     }
     ++pos;
-    while (pos < json.size()) {
-        pos = skip_ws(json, pos);
-        if (pos < json.size() && json[pos] == ']') {
+    while (pos < array_json.size()) {
+        pos = skip_ws(array_json, pos);
+        if (pos >= array_json.size() || array_json[pos] == ']') {
             break;
         }
-        if (pos >= json.size() || json[pos] != '"') {
+        const std::size_t end = json_value_end(array_json, pos);
+        if (end <= pos) {
             break;
         }
-        std::size_t next = pos;
-        values.push_back(parse_json_string_at(json, pos, &next));
-        pos = skip_ws(json, next);
-        if (pos < json.size() && json[pos] == ',') {
+        values.push_back(array_json.substr(pos, end - pos));
+        pos = skip_ws(array_json, end);
+        if (pos < array_json.size() && array_json[pos] == ',') {
             ++pos;
+        } else if (pos < array_json.size() && array_json[pos] != ']') {
+            break;
         }
     }
     return values;
 }
 
-unsigned long long parse_uint_at(const std::string& json, std::size_t pos, bool* ok = nullptr) {
-    if (ok) {
-        *ok = false;
-    }
-    pos = skip_ws(json, pos);
-    unsigned long long value = 0;
-    bool any = false;
-    while (pos < json.size() && json[pos] >= '0' && json[pos] <= '9') {
-        any = true;
-        value = value * 10 + static_cast<unsigned long long>(json[pos] - '0');
-        ++pos;
-    }
-    if (ok) {
-        *ok = any;
-    }
-    return value;
-}
+class JsonObjectView {
+public:
+    JsonObjectView() = default;
 
-bool json_uint_field_in_object(const std::string& object_json, const std::string& key, unsigned long long* value) {
-    const std::string needle = "\"" + key + "\"";
-    const std::size_t key_pos = object_json.find(needle);
-    if (key_pos == std::string::npos) {
-        return false;
+    explicit JsonObjectView(std::string_view json) {
+        reset(json);
     }
-    const std::size_t colon = object_json.find(':', key_pos + needle.size());
-    if (colon == std::string::npos) {
-        return false;
-    }
-    bool ok = false;
-    const unsigned long long parsed = parse_uint_at(object_json, colon + 1, &ok);
-    if (ok && value) {
-        *value = parsed;
-    }
-    return ok;
-}
 
-bool json_bool_field(const std::string& json, const std::string& key, bool fallback = false) {
-    const std::string needle = "\"" + key + "\"";
-    const std::size_t key_pos = json.find(needle);
-    if (key_pos == std::string::npos) {
-        return fallback;
+    bool valid() const noexcept {
+        return valid_;
     }
-    const std::size_t colon = json.find(':', key_pos + needle.size());
-    if (colon == std::string::npos) {
-        return fallback;
-    }
-    const std::size_t pos = skip_ws(json, colon + 1);
-    if (json.compare(pos, 4, "true") == 0) {
-        return true;
-    }
-    if (json.compare(pos, 5, "false") == 0) {
-        return false;
-    }
-    if (pos < json.size() && json[pos] == '"') {
-        const std::string text = parse_json_string_at(json, pos);
-        return text == "true" || text == "1" || text == "yes";
-    }
-    return fallback;
-}
 
-std::vector<std::string> json_object_array_field(const std::string& json, const std::string& key) {
-    std::vector<std::string> objects;
-    const std::string needle = "\"" + key + "\"";
-    const std::size_t key_pos = json.find(needle);
-    if (key_pos == std::string::npos) {
-        return objects;
-    }
-    const std::size_t colon = json.find(':', key_pos + needle.size());
-    if (colon == std::string::npos) {
-        return objects;
-    }
-    std::size_t pos = skip_ws(json, colon + 1);
-    if (pos >= json.size() || json[pos] != '[') {
-        return objects;
-    }
-    ++pos;
-    while (pos < json.size()) {
-        pos = skip_ws(json, pos);
-        if (pos < json.size() && json[pos] == ']') {
-            break;
+    std::string string_field(
+        std::string_view key,
+        std::string_view fallback = {}
+    ) const {
+        const auto value = raw_field(key);
+        if (!value || value->size() < 2 || value->front() != '"') {
+            return std::string(fallback);
         }
-        if (pos >= json.size() || json[pos] != '{') {
-            break;
+        return decode_json_string(*value);
+    }
+
+    bool uint_field(std::string_view key, unsigned long long* value) const {
+        const auto raw = raw_field(key);
+        if (!raw) {
+            return false;
         }
-        const std::size_t start = pos;
-        int depth = 0;
-        bool in_string = false;
-        for (; pos < json.size(); ++pos) {
-            const char ch = json[pos];
-            if (ch == '"' && (pos == 0 || json[pos - 1] != '\\')) {
-                in_string = !in_string;
-            }
-            if (in_string) {
-                continue;
-            }
-            if (ch == '{') {
-                ++depth;
-            } else if (ch == '}') {
-                --depth;
-                if (depth == 0) {
-                    objects.push_back(json.substr(start, pos - start + 1));
-                    ++pos;
-                    break;
-                }
-            }
-        }
-        pos = skip_ws(json, pos);
-        if (pos < json.size() && json[pos] == ',') {
+        std::size_t pos = skip_ws(*raw, 0);
+        unsigned long long parsed = 0;
+        bool any = false;
+        while (pos < raw->size() && (*raw)[pos] >= '0' && (*raw)[pos] <= '9') {
+            any = true;
+            parsed = parsed * 10 + static_cast<unsigned long long>((*raw)[pos] - '0');
             ++pos;
         }
+        if (any && value) {
+            *value = parsed;
+        }
+        return any;
     }
-    return objects;
-}
 
-std::string json_object_field(const std::string& json, const std::string& key) {
-    const std::string needle = "\"" + key + "\"";
-    const std::size_t key_pos = json.find(needle);
-    if (key_pos == std::string::npos) {
-        return "";
-    }
-    const std::size_t colon = json.find(':', key_pos + needle.size());
-    if (colon == std::string::npos) {
-        return "";
-    }
-    std::size_t pos = skip_ws(json, colon + 1);
-    if (pos >= json.size() || json[pos] != '{') {
-        return "";
-    }
-    const std::size_t start = pos;
-    int depth = 0;
-    bool in_string = false;
-    for (; pos < json.size(); ++pos) {
-        const char ch = json[pos];
-        if (ch == '"' && (pos == 0 || json[pos - 1] != '\\')) {
-            in_string = !in_string;
+    bool bool_field(std::string_view key, bool fallback = false) const {
+        const auto raw = raw_field(key);
+        if (!raw) {
+            return fallback;
         }
-        if (in_string) {
-            continue;
+        const std::size_t pos = skip_ws(*raw, 0);
+        if (raw->substr(pos, 4) == "true") {
+            return true;
         }
-        if (ch == '{') {
-            ++depth;
-        } else if (ch == '}') {
-            --depth;
-            if (depth == 0) {
-                return json.substr(start, pos - start + 1);
+        if (raw->substr(pos, 5) == "false") {
+            return false;
+        }
+        if (pos < raw->size() && (*raw)[pos] == '"') {
+            const std::string text = decode_json_string(raw->substr(pos));
+            return text == "true" || text == "1" || text == "yes";
+        }
+        return fallback;
+    }
+
+    JsonObjectView object_field(std::string_view key) const {
+        const auto raw = raw_field(key);
+        if (!raw) {
+            return {};
+        }
+        const std::size_t pos = skip_ws(*raw, 0);
+        if (pos >= raw->size() || (*raw)[pos] != '{') {
+            return {};
+        }
+        return JsonObjectView(raw->substr(pos));
+    }
+
+    std::vector<std::string> string_array_field(std::string_view key) const {
+        std::vector<std::string> values;
+        const auto raw = raw_field(key);
+        if (!raw) {
+            return values;
+        }
+        for (const auto item : json_array_values(*raw)) {
+            if (item.size() >= 2 && item.front() == '"' && item.back() == '"') {
+                values.push_back(decode_json_string(item));
             }
         }
+        return values;
     }
-    return "";
-}
+
+    std::vector<std::string_view> object_array_field(std::string_view key) const {
+        std::vector<std::string_view> values;
+        const auto raw = raw_field(key);
+        if (!raw) {
+            return values;
+        }
+        for (const auto item : json_array_values(*raw)) {
+            if (!item.empty() && item.front() == '{') {
+                values.push_back(item);
+            }
+        }
+        return values;
+    }
+
+private:
+    struct Field {
+        std::string_view key;
+        std::string_view value;
+    };
+
+    void reset(std::string_view json) {
+        source_ = json;
+        fields_.clear();
+        valid_ = false;
+
+        std::size_t pos = skip_ws(source_, 0);
+        if (pos >= source_.size() || source_[pos] != '{') {
+            return;
+        }
+        ++pos;
+        while (pos < source_.size()) {
+            pos = skip_ws(source_, pos);
+            if (pos < source_.size() && source_[pos] == '}') {
+                valid_ = true;
+                return;
+            }
+            if (pos >= source_.size() || source_[pos] != '"') {
+                return;
+            }
+            const std::size_t key_end = json_string_end(source_, pos);
+            if (key_end <= pos + 1 || key_end > source_.size()) {
+                return;
+            }
+            const std::string_view key = source_.substr(pos + 1, key_end - pos - 2);
+            pos = skip_ws(source_, key_end);
+            if (pos >= source_.size() || source_[pos] != ':') {
+                return;
+            }
+            pos = skip_ws(source_, pos + 1);
+            const std::size_t value_end = json_value_end(source_, pos);
+            if (value_end <= pos) {
+                return;
+            }
+            fields_.push_back(Field{key, source_.substr(pos, value_end - pos)});
+            pos = skip_ws(source_, value_end);
+            if (pos < source_.size() && source_[pos] == ',') {
+                ++pos;
+                continue;
+            }
+            if (pos < source_.size() && source_[pos] == '}') {
+                valid_ = true;
+                return;
+            }
+            return;
+        }
+    }
+
+    std::optional<std::string_view> raw_field(std::string_view key) const {
+        for (const auto& field : fields_) {
+            if (field.key == key) {
+                return field.value;
+            }
+        }
+        return std::nullopt;
+    }
+
+    std::string_view source_;
+    std::vector<Field> fields_;
+    bool valid_ = false;
+};
 
 struct WorkerArchiveInput {
     std::wstring archive_path;
@@ -440,16 +507,23 @@ sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
     return result;
 }
 
-std::vector<sunpack::sevenzip::ExtractInputRange> parse_input_ranges(const std::string& request, const std::string& archive_path) {
+std::vector<sunpack::sevenzip::ExtractInputRange> parse_input_ranges(
+    const JsonObjectView& request,
+    const std::string& archive_path
+) {
     using sunpack::sevenzip::ExtractInputRange;
     std::vector<ExtractInputRange> ranges;
-    const std::string kind = json_string_field(request, "kind", "file");
+    const std::string kind = request.string_field("kind", "file");
     if (kind == "file_range") {
         unsigned long long start = 0;
         unsigned long long end = 0;
-        const bool has_start = json_uint_field_in_object(request, "start", &start) || json_uint_field_in_object(request, "start_offset", &start);
-        const bool has_end = json_uint_field_in_object(request, "end", &end) || json_uint_field_in_object(request, "end_offset", &end);
-        const std::string path = json_string_field(request, "path", archive_path);
+        const bool has_start =
+            request.uint_field("start", &start) ||
+            request.uint_field("start_offset", &start);
+        const bool has_end =
+            request.uint_field("end", &end) ||
+            request.uint_field("end_offset", &end);
+        const std::string path = request.string_field("path", archive_path);
         ExtractInputRange range;
         range.path = utf8_to_wide(path.empty() ? archive_path : path);
         range.start = has_start ? start : 0;
@@ -461,12 +535,17 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_input_ranges(const std::
     if (kind != "concat_ranges") {
         return ranges;
     }
-    for (const auto& object_json : json_object_array_field(request, "ranges")) {
+    for (const auto object_json : request.object_array_field("ranges")) {
+        const JsonObjectView object(object_json);
         unsigned long long start = 0;
         unsigned long long end = 0;
-        const bool has_start = json_uint_field_in_object(object_json, "start", &start) || json_uint_field_in_object(object_json, "start_offset", &start);
-        const bool has_end = json_uint_field_in_object(object_json, "end", &end) || json_uint_field_in_object(object_json, "end_offset", &end);
-        const std::string path = json_string_field(object_json, "path", archive_path);
+        const bool has_start =
+            object.uint_field("start", &start) ||
+            object.uint_field("start_offset", &start);
+        const bool has_end =
+            object.uint_field("end", &end) ||
+            object.uint_field("end_offset", &end);
+        const std::string path = object.string_field("path", archive_path);
         ExtractInputRange range;
         range.path = utf8_to_wide(path.empty() ? archive_path : path);
         range.start = has_start ? start : 0;
@@ -478,17 +557,23 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_input_ranges(const std::
 }
 
 std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
-    const std::vector<std::string>& objects,
+    const std::vector<std::string_view>& objects,
     const std::string& default_path
 ) {
     using sunpack::sevenzip::ExtractInputRange;
     std::vector<ExtractInputRange> ranges;
-    for (const auto& object_json : objects) {
+    ranges.reserve(objects.size());
+    for (const auto object_json : objects) {
+        const JsonObjectView object(object_json);
         unsigned long long start = 0;
         unsigned long long end = 0;
-        const bool has_start = json_uint_field_in_object(object_json, "start", &start) || json_uint_field_in_object(object_json, "start_offset", &start);
-        const bool has_end = json_uint_field_in_object(object_json, "end", &end) || json_uint_field_in_object(object_json, "end_offset", &end);
-        const std::string path = json_string_field(object_json, "path", default_path);
+        const bool has_start =
+            object.uint_field("start", &start) ||
+            object.uint_field("start_offset", &start);
+        const bool has_end =
+            object.uint_field("end", &end) ||
+            object.uint_field("end_offset", &end);
+        const std::string path = object.string_field("path", default_path);
         if (path.empty() && default_path.empty()) {
             continue;
         }
@@ -503,7 +588,7 @@ std::vector<sunpack::sevenzip::ExtractInputRange> parse_ranges_from_objects(
 }
 
 WorkerArchiveInput parse_archive_input_descriptor(
-    const std::string& request,
+    const JsonObjectView& request,
     const std::wstring& fallback_archive_path,
     const std::wstring& fallback_format_hint,
     const std::vector<std::wstring>& fallback_part_paths
@@ -514,28 +599,36 @@ WorkerArchiveInput parse_archive_input_descriptor(
     input.open_mode = L"file";
     input.part_paths = fallback_part_paths;
 
-    std::string descriptor = json_object_field(request, "archive_input");
-    if (descriptor.empty()) {
-        input.ranges = parse_input_ranges(request, json_string_field(request, "archive_path", ""));
+    const JsonObjectView descriptor = request.object_field("archive_input");
+    if (!descriptor.valid()) {
+        const std::string archive_path = request.string_field("archive_path", "");
+        input.ranges = parse_input_ranges(request, archive_path);
         if (!input.ranges.empty()) {
-            input.open_mode = utf8_to_wide(json_string_field(request, "kind", "concat_ranges"));
+            input.open_mode = utf8_to_wide(request.string_field("kind", "concat_ranges"));
         }
         return input;
     }
 
-    const std::string entry_path = json_string_field(descriptor, "entry_path", json_string_field(request, "archive_path", ""));
+    const std::string request_archive_path = request.string_field("archive_path", "");
+    const std::string entry_path = descriptor.string_field("entry_path", request_archive_path);
     if (!entry_path.empty()) {
         input.archive_path = utf8_to_wide(entry_path);
     }
-    const std::string mode = json_string_field(descriptor, "open_mode", json_string_field(descriptor, "kind", "file"));
+    const std::string mode = descriptor.string_field(
+        "open_mode",
+        descriptor.string_field("kind", "file")
+    );
     input.open_mode = utf8_to_wide(mode.empty() ? "file" : mode);
-    const std::string format_hint = json_string_field(descriptor, "format_hint", json_string_field(request, "format_hint", ""));
+    const std::string format_hint = descriptor.string_field(
+        "format_hint",
+        request.string_field("format_hint", "")
+    );
     input.format_hint = utf8_to_wide(format_hint);
 
-    const std::string analysis = json_object_field(descriptor, "analysis");
-    const std::string execution_analysis = json_object_field(analysis, "execution");
+    const JsonObjectView analysis = descriptor.object_field("analysis");
+    const JsonObjectView execution_analysis = analysis.object_field("execution");
     input.analyzed_missing_volume_evidence =
-        json_string_field(execution_analysis, "missing_volume_evidence", "");
+        execution_analysis.string_field("missing_volume_evidence", "");
 
     struct ParsedPart {
         int number;
@@ -544,22 +637,25 @@ WorkerArchiveInput parse_archive_input_descriptor(
         unsigned long long start = 0;
         bool has_start = false;
     };
+    const auto part_objects = descriptor.object_array_field("parts");
     std::vector<ParsedPart> structured_parts;
     std::vector<std::wstring> parts;
-    for (const auto& object_json : json_object_array_field(descriptor, "parts")) {
-        const std::string path = json_string_field(object_json, "path", "");
+    parts.reserve(part_objects.size());
+    for (const auto object_json : part_objects) {
+        const JsonObjectView object(object_json);
+        const std::string path = object.string_field("path", "");
         if (!path.empty()) {
             parts.push_back(utf8_to_wide(path));
             unsigned long long number = 0;
-            const std::string canonical_name = json_string_field(object_json, "canonical_name", "");
+            const std::string canonical_name = object.string_field("canonical_name", "");
             if (mode == "native_volumes" || mode == "sfx_with_volumes") {
-                if (!json_uint_field_in_object(object_json, "volume_number", &number) || number == 0 || canonical_name.empty()) {
+                if (!object.uint_field("volume_number", &number) || number == 0 || canonical_name.empty()) {
                     input.validation_error = "structured volume part requires volume_number and canonical_name";
                 } else {
                     unsigned long long start = 0;
                     const bool has_start =
-                        json_uint_field_in_object(object_json, "start", &start) ||
-                        json_uint_field_in_object(object_json, "start_offset", &start);
+                        object.uint_field("start", &start) ||
+                        object.uint_field("start_offset", &start);
                     structured_parts.push_back({
                         static_cast<int>(number),
                         utf8_to_wide(path),
@@ -585,24 +681,87 @@ WorkerArchiveInput parse_archive_input_descriptor(
             input.canonical_names.push_back(structured_parts[index].canonical_name);
             input.volume_numbers.push_back(structured_parts[index].number);
         }
-        if (parts.empty()) input.validation_error = "structured volume descriptor has no parts";
+        if (parts.empty()) {
+            input.validation_error = "structured volume descriptor has no parts";
+        }
     }
     if (!parts.empty()) {
         input.part_paths = parts;
     }
 
     if (mode == "file_range") {
-        input.ranges = parse_ranges_from_objects(json_object_array_field(descriptor, "parts"), entry_path);
+        input.ranges = parse_ranges_from_objects(part_objects, entry_path);
         if (input.ranges.empty()) {
             input.validation_error = "file_range descriptor requires canonical parts with extents";
         }
     } else if (mode == "concat_ranges") {
-        input.ranges = parse_ranges_from_objects(json_object_array_field(descriptor, "ranges"), entry_path);
+        const auto range_objects = descriptor.object_array_field("ranges");
+        input.ranges = parse_ranges_from_objects(range_objects, entry_path);
         if (input.ranges.empty()) {
-            input.ranges = parse_ranges_from_objects(json_object_array_field(descriptor, "parts"), entry_path);
+            input.ranges = parse_ranges_from_objects(part_objects, entry_path);
         }
     }
     return input;
+}
+
+struct WorkerRequest {
+    std::string worker_command;
+    std::string job_id;
+    std::string request_id;
+    std::string origin = "foreground";
+    std::string output_volume_key;
+    std::string process_mode = "normal";
+    std::wstring archive_path;
+    std::wstring output_dir;
+    std::wstring password;
+    std::wstring format_hint;
+    std::wstring codepage;
+    bool dry_run = false;
+    unsigned long long job_buffer_budget = 0;
+    std::vector<std::wstring> password_candidates;
+    std::vector<std::wstring> part_paths;
+    WorkerArchiveInput archive_input;
+};
+
+WorkerRequest parse_worker_request(const std::string& request_json) {
+    const JsonObjectView json(request_json);
+    WorkerRequest request;
+    request.worker_command = json.string_field("worker_command", "");
+    request.job_id = json.string_field("job_id", "");
+    request.request_id = json.string_field("request_id", "");
+    request.origin = json.string_field("origin", "foreground");
+    request.output_volume_key = json.string_field("output_volume_key", "");
+    request.process_mode = json.string_field("mode", "normal");
+
+    if (
+        request.worker_command == "cancel" ||
+        request.worker_command == "set_process_mode" ||
+        request.worker_command == "shutdown"
+    ) {
+        return request;
+    }
+
+    request.archive_path = utf8_to_wide(json.string_field("archive_path", ""));
+    request.output_dir = utf8_to_wide(json.string_field("output_dir", ""));
+    request.password = utf8_to_wide(json.string_field("password", ""));
+    request.format_hint = utf8_to_wide(json.string_field("format_hint", ""));
+    request.codepage = utf8_to_wide(json.string_field("codepage", ""));
+    request.dry_run = json.bool_field("dry_run", false);
+    json.uint_field("job_buffer_budget_bytes", &request.job_buffer_budget);
+
+    for (const auto& candidate : json.string_array_field("password_candidates")) {
+        request.password_candidates.push_back(utf8_to_wide(candidate));
+    }
+    for (const auto& part : json.string_array_field("part_paths")) {
+        request.part_paths.push_back(utf8_to_wide(part));
+    }
+    request.archive_input = parse_archive_input_descriptor(
+        json,
+        request.archive_path,
+        request.format_hint,
+        request.part_paths
+    );
+    return request;
 }
 
 std::mutex g_output_mutex;
@@ -871,15 +1030,15 @@ std::string diagnostics_json(const sunpack::sevenzip::ExtractArchiveResult& resu
 }  // namespace
 
 int run_request(
-    const std::string& request,
+    const WorkerRequest& request,
     // The job's output-volume write facility, borrowed from the registry lease held by worker_loop; null for dry runs.
     const std::shared_ptr<sunpack::sevenzip::AsyncFileWriter>& shared_writer = nullptr,
     const std::shared_ptr<std::atomic<bool>>& cancel_token = nullptr
 ) {
     using namespace sunpack::sevenzip;
 
-    const std::string job_id = json_string_field(request, "job_id", "");
-    const std::string command = json_string_field(request, "worker_command", "");
+    const std::string& job_id = request.job_id;
+    const std::string& command = request.worker_command;
     if (command == "shutdown") {
         print_json_line(
             "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
@@ -895,24 +1054,15 @@ int run_request(
         return -101;
     }
 
-    const std::wstring archive_path = utf8_to_wide(json_string_field(request, "archive_path", ""));
-    const std::wstring output_dir = utf8_to_wide(json_string_field(request, "output_dir", ""));
-    const std::wstring password = utf8_to_wide(json_string_field(request, "password", ""));
-    const std::wstring format_hint = utf8_to_wide(json_string_field(request, "format_hint", ""));
-    const std::wstring codepage = utf8_to_wide(json_string_field(request, "codepage", ""));
-    const bool dry_run = json_bool_field(request, "dry_run", false);
-    unsigned long long job_buffer_budget = 0;
-    json_uint_field_in_object(request, "job_buffer_budget_bytes", &job_buffer_budget);
-
-    std::vector<std::wstring> password_candidates;
-    for (const auto& candidate : json_string_array_field(request, "password_candidates")) {
-        password_candidates.push_back(utf8_to_wide(candidate));
-    }
-
-    std::vector<std::wstring> part_paths;
-    for (const auto& part : json_string_array_field(request, "part_paths")) {
-        part_paths.push_back(utf8_to_wide(part));
-    }
+    const std::wstring& archive_path = request.archive_path;
+    const std::wstring& output_dir = request.output_dir;
+    const std::wstring& password = request.password;
+    const std::wstring& format_hint = request.format_hint;
+    const std::wstring& codepage = request.codepage;
+    const bool dry_run = request.dry_run;
+    const unsigned long long job_buffer_budget = request.job_buffer_budget;
+    const std::vector<std::wstring>& password_candidates = request.password_candidates;
+    const std::vector<std::wstring>& part_paths = request.part_paths;
     if (archive_path.empty() || (!dry_run && output_dir.empty())) {
         print_json_line(
             "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
@@ -971,7 +1121,7 @@ int run_request(
             coalesced_progress_events = 0;
     };
 
-    const auto archive_input = parse_archive_input_descriptor(request, archive_path, format_hint, part_paths);
+    const auto& archive_input = request.archive_input;
     if (!archive_input.validation_error.empty()) {
         print_json_line(
             "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
@@ -1277,7 +1427,7 @@ public:
     NativeJobExecutor(const NativeJobExecutor&) = delete;
     NativeJobExecutor& operator=(const NativeJobExecutor&) = delete;
 
-    void submit(std::string request) {
+    void submit(WorkerRequest request) {
         auto cancel_token = std::make_shared<std::atomic<bool>>(false);
         JobMetadata metadata = metadata_from_request(request);
         const std::string queued_event =
@@ -1435,7 +1585,7 @@ private:
     };
 
     struct Job {
-        std::string request;
+        WorkerRequest request;
         std::shared_ptr<std::atomic<bool>> cancel_token;
         JobMetadata metadata;
     };
@@ -1449,16 +1599,16 @@ private:
         std::weak_ptr<sunpack::sevenzip::AsyncFileWriter> writer;
     };
 
-    static JobMetadata metadata_from_request(const std::string& request) noexcept {
+    static JobMetadata metadata_from_request(const WorkerRequest& request) noexcept {
         JobMetadata metadata;
-        metadata.job_id = json_string_field(request, "job_id", "");
-        metadata.request_id = json_string_field(request, "request_id", "");
+        metadata.job_id = request.job_id;
+        metadata.request_id = request.request_id;
         if (metadata.request_id.empty()) {
             metadata.request_id = metadata.job_id;
         }
-        metadata.foreground = json_string_field(request, "origin", "foreground") != "watch";
-        metadata.volume_key = json_string_field(request, "output_volume_key", "");
-        metadata.requires_writer = !json_bool_field(request, "dry_run", false);
+        metadata.foreground = request.origin != "watch";
+        metadata.volume_key = request.output_volume_key;
+        metadata.requires_writer = !request.dry_run;
         metadata.escaped_job_id = json_escape(metadata.job_id);
         metadata.lifecycle_context_json =
             ",\"request_id\":\"" + json_escape(metadata.request_id) +
@@ -1991,19 +2141,19 @@ private:
 };
 
 int run_message(
-    const std::string& request,
+    WorkerRequest request,
     NativeJobExecutor& executor
 ) {
-    const std::string command = json_string_field(request, "worker_command", "");
+    const std::string& command = request.worker_command;
     if (command == "cancel") {
-        const std::string job_id = json_string_field(request, "job_id", "");
+        const std::string& job_id = request.job_id;
         const bool accepted = executor.cancel(job_id);
         print_json_line("{\"type\":\"cancel_ack\",\"job_id\":\"" + json_escape(job_id) +
             "\",\"accepted\":" + std::string(accepted ? "true" : "false") + "}");
         return accepted ? 0 : 1;
     }
     if (command == "set_process_mode") {
-        std::string mode = json_string_field(request, "mode", "normal");
+        std::string mode = request.process_mode;
         if (mode != "background" && mode != "high") {
             mode = "normal";
         }
@@ -2016,7 +2166,7 @@ int run_message(
         return 0;
     }
     // Native owns queued work and completion is reported through native events/results.
-    executor.submit(request);
+    executor.submit(std::move(request));
     return 0;
 }
 
@@ -2049,8 +2199,9 @@ int main() {
         if (line.empty()) {
             continue;
         }
-        const bool shutdown = json_string_field(line, "worker_command", "") == "shutdown";
-        const int code = run_message(line, executor);
+        WorkerRequest request = parse_worker_request(line);
+        const bool shutdown = request.worker_command == "shutdown";
+        const int code = run_message(std::move(request), executor);
         if (shutdown) {
             executor.stop();
             return code;
