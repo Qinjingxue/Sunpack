@@ -229,7 +229,7 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
     archive = input_root / "sub" / "payload.zip"
     output_root = tmp_path / "out"
     archive.parent.mkdir(parents=True)
-    archive.write_bytes(b"parent")
+    archive.write_bytes(make_zip({"parent.txt": b"parent"}))
 
     config = normalize_config(with_detection_pipeline({
         "recursive_extract": "2",
