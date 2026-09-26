@@ -7,6 +7,7 @@ from typing import Any
 from sunpack_native import (
     NativeOutputInventory,
     NativeWorkerManifest,
+    match_output_inventory_coverage as _native_match_output_inventory_coverage,
     output_inventory_from_serialized as _native_inventory_from_serialized,
     rebase_output_inventory_root as _native_rebase_output_inventory_root,
     scan_output_inventory as _native_scan_output_inventory,
@@ -49,6 +50,37 @@ class OutputInventory:
 
     def materialize_files(self) -> tuple[dict[str, Any], ...]:
         return tuple(dict(item) for item in self._native.materialize_files())
+
+    def file_page(self, *, offset: int = 0, limit: int = 128) -> tuple[dict[str, Any], ...]:
+        return tuple(
+            dict(item)
+            for item in self._native.file_page(
+                max(0, int(offset or 0)),
+                max(0, int(limit or 0)),
+            )
+        )
+
+    def verification_match(
+        self,
+        archive_files,
+        *,
+        verify_crc: bool = False,
+        basename_mode: str = "unique",
+        include_observations: bool = False,
+        detail_offset: int = 0,
+        detail_limit: int = 128,
+        max_issue_items: int = 20,
+    ) -> dict[str, Any]:
+        return dict(_native_match_output_inventory_coverage(
+            archive_files,
+            self._native,
+            bool(verify_crc),
+            str(basename_mode or "unique"),
+            bool(include_observations),
+            max(0, int(detail_offset or 0)),
+            max(0, int(detail_limit or 0)),
+            max(0, int(max_issue_items or 0)),
+        ))
 
     def parent_directories(self) -> tuple[str, ...]:
         return tuple(self._native.parent_directories())
