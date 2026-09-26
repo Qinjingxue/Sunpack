@@ -14,7 +14,6 @@ class ArchiveMetadataScanResult:
         self.warnings: list[str] = []
         self.reasons: list[str] = reasons or []
         self.selected_codepage: Optional[str] = None
-        self.decoded_names: list[str] = []
         self.error: Optional[str] = None
         self.confidence: float = 0.0
         self.sample_count: int = 0
@@ -136,7 +135,6 @@ class ArchiveMetadataScanner:
             "warnings": list(result.warnings),
             "reasons": list(result.reasons),
             "selected_codepage": result.selected_codepage,
-            "decoded_names": list(result.decoded_names),
             "error": result.error,
             "confidence": result.confidence,
             "sample_count": result.sample_count,
@@ -152,7 +150,6 @@ class ArchiveMetadataScanner:
         )
         result.warnings = list(payload.get("warnings") or [])
         result.selected_codepage = payload.get("selected_codepage")
-        result.decoded_names = list(payload.get("decoded_names") or [])
         result.error = payload.get("error")
         result.confidence = float(payload.get("confidence", 0.0) or 0.0)
         result.sample_count = int(payload.get("sample_count", 0) or 0)
@@ -198,8 +195,6 @@ class ArchiveMetadataScanner:
             if warning:
                 result.warnings.append(warning)
                 return result
-            if status == "decode_failed":
-                raise RuntimeError("selected ZIP codepage could not strictly decode every item name")
             if status != "ok":
                 raise RuntimeError(f"Native ZIP filename analyzer returned unsupported status: {status}")
 
@@ -232,12 +227,6 @@ class ArchiveMetadataScanner:
             selected_codepage = native.get("selected_codepage")
             if selected_codepage:
                 result.selected_codepage = str(selected_codepage)
-                decoded_names = native.get("decoded_names")
-                if not isinstance(decoded_names, list) or not all(
-                    isinstance(name, str) for name in decoded_names
-                ):
-                    raise TypeError("Native ZIP filename analyzer returned invalid decoded_names")
-                result.decoded_names = decoded_names
                 result.reasons.append(
                     self.i18n.t(
                         "metadata.high_confidence",
