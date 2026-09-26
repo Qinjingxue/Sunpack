@@ -174,8 +174,8 @@ class DiscoveryScanSession:
                     resolved.add(key)
                     self._file_head_facts[key] = {
                         "path": str(row["path"]),
-                        "exists": True,
-                        "is_file": True,
+                        "exists": bool(row.get("exists", True)),
+                        "is_file": bool(row.get("is_file", True)),
                         "size": row.get("size"),
                         "mtime_ns": row.get("mtime_ns"),
                         "magic": row.get("magic") if isinstance(row.get("magic"), bytes) else b"",
