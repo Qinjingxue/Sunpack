@@ -38,6 +38,13 @@ from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.i18n import I18nContext
 
 
+def _advance_job_state(state, sent, *, first: bool):
+    try:
+        return False, next(state) if first else state.send(sent)
+    except StopIteration as completed:
+        return True, completed.value
+
+
 @dataclass
 class ArchiveJobOutcome:
     result: ExtractionResult
