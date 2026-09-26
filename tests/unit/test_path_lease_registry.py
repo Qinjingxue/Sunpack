@@ -174,3 +174,117 @@ def test_completed_watch_generation_is_not_reused_after_output_disappears(tmp_pa
 
     asyncio.run(scenario())
 
+
+
+def test_directory_lease_blocks_descendants_and_descendant_blocks_parent(tmp_path):
+    async def scenario() -> None:
+        registry = _PathLeaseRegistry()
+        root = tmp_path / "tree"
+        root.mkdir()
+        child = root / "archive.zip"
+        child.write_bytes(b"payload")
+
+        await registry.acquire("directory", (root,))
+        waiting_child = asyncio.create_task(registry.acquire("child", (child,)))
+        await asyncio.sleep(0)
+        assert not waiting_child.done()
+
+        await registry.release("directory")
+        await asyncio.wait_for(waiting_child, timeout=0.1)
+        await registry.release("child")
+
+        await registry.acquire("child", (child,))
+        waiting_directory = asyncio.create_task(registry.acquire("directory", (root,)))
+        await asyncio.sleep(0)
+        assert not waiting_directory.done()
+
+        await registry.release("child")
+        await asyncio.wait_for(waiting_directory, timeout=0.1)
+        assert registry._owned == {"directory": {str(root)}}
+
+    asyncio.run(scenario())
+
+
+def test_release_only_wakes_waiters_blocked_by_that_owner(tmp_path):
+    async def scenario() -> None:
+        registry = _PathLeaseRegistry()
+        first_path = tmp_path / "first.zip"
+        second_path = tmp_path / "second.zip"
+        first_path.write_bytes(b"first")
+        second_path.write_bytes(b"second")
+        await registry.acquire("hold-first", (first_path,))
+        await registry.acquire("hold-second", (second_path,))
+
+        checks = []
+        original = registry._blocking_owners
+
+        def counted(owner, candidates):
+            checks.append(owner)
+            return original(owner, candidates)
+
+        registry._blocking_owners = counted
+        waiting_first = asyncio.create_task(registry.acquire("wait-first", (first_path,)))
+        waiting_second = asyncio.create_task(registry.acquire("wait-second", (second_path,)))
+        await asyncio.sleep(0)
+        assert set(registry._waiters_by_blocker) == {"hold-first", "hold-second"}
+
+        checks.clear()
+        await registry.release("hold-first")
+        await asyncio.wait_for(waiting_first, timeout=0.1)
+        await asyncio.sleep(0)
+
+        assert "wait-first" in checks
+        assert "wait-second" not in checks
+        assert not waiting_second.done()
+
+        waiting_second.cancel()
+        try:
+            await waiting_second
+        except asyncio.CancelledError:
+            pass
+        assert "hold-second" not in registry._waiters_by_blocker
+        assert not registry._waiter_blockers
+
+    asyncio.run(scenario())
+
+
+def test_release_clears_path_lease_indexes(tmp_path):
+    async def scenario() -> None:
+        registry = _PathLeaseRegistry()
+        root = tmp_path / "tree"
+        root.mkdir()
+        child = root / "part.001"
+        child.write_bytes(b"payload")
+
+        await registry.acquire("owner", (root, child))
+        assert registry._exact_owners
+        assert registry._directory_owners
+        assert registry._prefix_owners
+
+        await registry.release("owner")
+
+        assert not registry._owned
+        assert not registry._lease_paths
+        assert not registry._exact_owners
+        assert not registry._entries_by_key
+        assert not registry._directory_owners
+        assert not registry._prefix_owners
+
+    asyncio.run(scenario())
+
+
+def test_reacquiring_owned_path_reuses_snapshotted_path_facts(tmp_path):
+    async def scenario() -> None:
+        registry = _PathLeaseRegistry()
+        path = tmp_path / "archive.zip"
+        path.write_bytes(b"payload")
+
+        await registry.acquire("owner", (path,))
+        first = next(iter(registry._lease_paths["owner"].values()))
+        await registry.acquire("owner", (path,))
+        second = next(iter(registry._lease_paths["owner"].values()))
+
+        assert second is first
+        assert registry._owned == {"owner": {str(path)}}
+
+    asyncio.run(scenario())
