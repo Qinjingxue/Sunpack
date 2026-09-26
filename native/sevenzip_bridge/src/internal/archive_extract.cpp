@@ -230,7 +230,7 @@ namespace sunpack::sevenzip
             }
 
             CMyComPtr<ISetProperties> properties;
-            HRESULT hr = archive->QueryInterface(IID_ISetProperties, &properties);
+            HRESULT hr = archive->QueryInterface(IID_ISetProperties, (void **)&properties);
             if (hr != S_OK || !properties)
             {
                 return hr == S_OK ? E_NOINTERFACE : hr;
