@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import heapq
 import hashlib
+import heapq
 import json
 import os
 import threading
@@ -104,6 +104,7 @@ class _ActiveCandidateState:
     last_event_at: float
     quiet_seconds: float
     generation: int = 1
+    epoch: int = 0
 
 
 @dataclass
@@ -201,9 +202,10 @@ class WatchScheduler:
         self._inflight_requests: list[_ActivePipelineRequest] = []
         self._inflight_path_counts: dict[str, int] = {}
         self._active_states: dict[str, _ActiveCandidateState] = {}
-        # Incremental ready index. Entries are invalidated lazily by generation,
-        # so enqueue/activity updates stay O(log P) without heap delete/search.
-        self._ready_heap: list[tuple[float, int, str, str]] = []
+        self._active_epoch = 0
+        # Incremental ready index. Entries are invalidated lazily by active
+        # lifecycle epoch + generation, avoiding heap delete/search.
+        self._ready_heap: list[tuple[float, int, int, str, str]] = []
         self._latest_observations: dict[str, WatchCandidate] = {}
         self._quiet_trackers: dict[str, AdaptiveQuietTracker] = {}
         self._password_dirty_dirs: dict[str, float] = {}
@@ -766,6 +768,19 @@ class WatchScheduler:
             else:
                 self._inflight_path_counts[key] = count - 1
 
+    def _new_active_state_locked(
+        self,
+        *,
+        last_event_at: float,
+        quiet_seconds: float,
+    ) -> _ActiveCandidateState:
+        self._active_epoch += 1
+        return _ActiveCandidateState(
+            last_event_at=last_event_at,
+            quiet_seconds=quiet_seconds,
+            epoch=self._active_epoch,
+        )
+
     def _schedule_active_locked(
         self,
         path: str,
@@ -780,18 +795,20 @@ class WatchScheduler:
             self._ready_heap,
             (
                 state.last_event_at + state.quiet_seconds,
+                state.epoch,
                 state.generation,
                 key,
                 path,
             ),
         )
 
-    def _next_ready_entry_locked(self) -> tuple[float, int, str, str] | None:
+    def _next_ready_entry_locked(self) -> tuple[float, int, int, str, str] | None:
         while self._ready_heap:
-            deadline, generation, key, path = self._ready_heap[0]
+            deadline, epoch, generation, key, path = self._ready_heap[0]
             state = self._active_states.get(path)
             if (
                 state is None
+                or state.epoch != epoch
                 or state.generation != generation
                 or key in self._inflight_path_counts
             ):
@@ -1010,7 +1027,7 @@ class WatchScheduler:
                     self._pending[candidate.path] = candidate
                     self._latest_observations[candidate.path] = candidate
                     became_active = True
-                    self._active_states[candidate.path] = _ActiveCandidateState(
+                    self._active_states[candidate.path] = self._new_active_state_locked(
                         last_event_at=now,
                         quiet_seconds=active_quiet_seconds,
                     )
@@ -1238,7 +1255,7 @@ class WatchScheduler:
                 entry = self._next_ready_entry_locked()
                 if entry is None or entry[0] > now:
                     break
-                _, generation, _, path = heapq.heappop(self._ready_heap)
+                _, _, generation, _, path = heapq.heappop(self._ready_heap)
                 if path in due_paths:
                     continue
                 state = self._active_states.get(path)
