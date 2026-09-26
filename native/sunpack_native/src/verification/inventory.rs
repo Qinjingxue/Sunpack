@@ -316,7 +316,6 @@ fn match_inventory(
             && item.has_crc
             && item.crc32.is_some()
             && output.status != 2
-            && !size_incomplete
         {
             if actual_crc.is_some() {
                 used_worker_crc = true;
@@ -380,9 +379,6 @@ fn match_inventory(
         let (state, progress) = if output.status == 2 {
             coverage.failed_files += 1;
             ("failed", size_progress.or(Some(0.0)))
-        } else if size_incomplete {
-            coverage.partial_files += 1;
-            ("partial", size_progress)
         } else if verify_crc && item.has_crc && crc_ok == Some(false) {
             coverage.failed_files += 1;
             mismatch_count += 1;
@@ -394,6 +390,9 @@ fn match_inventory(
                 });
             }
             ("failed", Some(0.0))
+        } else if size_incomplete {
+            coverage.partial_files += 1;
+            ("partial", size_progress)
         } else if let Some(expected_size) = item.size {
             if item.has_crc && verify_crc && actual_crc.is_none() {
                 ("unverified", size_progress)
