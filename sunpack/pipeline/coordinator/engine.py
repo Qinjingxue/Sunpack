@@ -1041,11 +1041,16 @@ class _RequestRuntime:
                             verification={"reused_completed_generation": True},
                         ))
                         self.context.processed_keys.add(task.key)
-                    self.cleanup_scope.release_task(
+                    cleanup_request = self.cleanup_scope.release_task(
                         task,
                         outcome_kind=OutcomeKind.FAILURE,
                     )
                     released_source_ref = True
+                    self._schedule_cleanup(
+                        cleanup_request,
+                        broker=broker,
+                        cancellation=cancellation,
+                    )
                     return
 
             output_dir_resolver = build_output_dir_resolver(
