@@ -174,8 +174,6 @@
     "toast_enabled": true,
     "toast_update_interval_ms": 50,
     "toast_completion_debounce_ms": 800,
-    "toast_success_ttl_seconds": 3,
-    "toast_failure_ttl_seconds": 5,
     "toast_report_retention_days": 30,
     "toast_report_max_files": 16,
     "toast_report_max_bytes": 2097152,
