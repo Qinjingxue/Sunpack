@@ -2,7 +2,7 @@ import asyncio
 import threading
 import time
 
-from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CURRENT_WORK, map_unbounded
+from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CURRENT_WORK
 
 
 def test_broker_uses_fixed_workers_and_returns_on_owner_loop():
@@ -155,21 +155,42 @@ def test_broker_dispatches_waiting_foreground_before_watch_without_preemption():
     asyncio.run(scenario())
 
 
-def test_map_unbounded_starts_every_logical_item_without_a_caller_slot_limit():
+def test_broker_prioritizes_pipeline_work_over_background_cleanup():
     async def scenario():
+        broker = AsyncWorkBroker(thread_capacity=1, max_pending_jobs=8)
+        release = threading.Event()
         started = []
-        release = asyncio.Event()
 
-        async def operation(value):
-            started.append(value)
-            await release.wait()
-            return value * 2
+        def operation(label):
+            started.append(label)
+            if label == "active":
+                release.wait(timeout=2)
+            return label
 
-        task = asyncio.create_task(map_unbounded(range(32), operation))
-        await asyncio.sleep(0)
-        await asyncio.sleep(0)
-        assert started == list(range(32))
-        release.set()
-        assert await task == [value * 2 for value in range(32)]
+        try:
+            active = asyncio.create_task(
+                broker.run("verify", "active", operation, "active", request_id="request")
+            )
+            while started != ["active"]:
+                await asyncio.sleep(0)
+            cleanup_task = asyncio.create_task(
+                broker.run(
+                    "background_source_cleanup",
+                    "cleanup",
+                    operation,
+                    "cleanup",
+                    request_id="request",
+                )
+            )
+            discovery = asyncio.create_task(
+                broker.run("discover_detect", "nested", operation, "nested", request_id="request")
+            )
+            await asyncio.sleep(0)
+            release.set()
+            await asyncio.gather(active, cleanup_task, discovery)
+            assert started == ["active", "nested", "cleanup"]
+        finally:
+            release.set()
+            await broker.close()
 
     asyncio.run(scenario())

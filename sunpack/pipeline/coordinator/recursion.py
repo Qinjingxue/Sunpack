@@ -2,27 +2,20 @@ from sunpack.core.i18n import I18nContext
 
 
 class RecursionController:
-    def __init__(self, mode: str, max_rounds: int = 1, language: str = "en"):
+    def __init__(self, mode: str, max_depth: int = 1, language: str = "en"):
         self.mode = mode # "fixed", "prompt", "infinite"
-        self.max_rounds = max_rounds if mode == "fixed" else None
+        self.max_depth = max_depth if mode == "fixed" else None
         self.i18n = I18nContext(language)
 
-    def should_continue(self, round_index: int, new_roots_found: bool) -> bool:
-        if not new_roots_found:
-            return False
-            
+    def allows_children(self, depth: int) -> bool:
         if self.mode == "fixed":
-            return round_index < self.max_rounds
-            
-        if self.mode == "prompt":
-            return True
-                    
-        return True # infinite
+            return depth < int(self.max_depth or 0)
+        return True
 
-    def prompt_continue(self, round_index: int) -> bool:
+    def prompt_continue(self, depth: int) -> bool:
         while True:
             try:
-                ans = input(self.i18n.t("recursion.prompt", round=round_index)).strip().lower()
+                ans = input(self.i18n.t("recursion.prompt", round=depth)).strip().lower()
             except EOFError:
                 print(self.i18n.t("recursion.no_input"), flush=True)
                 return False

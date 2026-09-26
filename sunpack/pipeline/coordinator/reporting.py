@@ -57,16 +57,16 @@ class RunReporter:
         self._space_blocked_jobs: dict[tuple[str, int], set[str]] = {}
         self._last_render_at = 0.0
 
-    def scan_started(self, round_index: int) -> None:
+    def scan_started(self, depth: int) -> None:
         if self.quiet:
             return
-        depth = max(1, int(round_index or 1))
+        depth = max(1, int(depth or 1))
         with self._lock:
             key = "report.scan_started" if depth == 1 else "report.recursive_scan_checking"
             self._print(self.i18n.t(key, depth=depth))
 
-    def begin_round(self, round_index: int, tasks: list[Any], direct: bool = False) -> None:
-        depth = max(1, int(round_index or 1))
+    def tasks_discovered(self, depth: int, tasks: list[Any], direct: bool = False) -> None:
+        depth = max(1, int(depth or 1))
         with self._lock:
             for task in tasks:
                 parent_lineage = self._lineage_for_path(str(getattr(task, "main_path", "") or ""))
@@ -100,14 +100,14 @@ class RunReporter:
                 for task_id in self._panel_tasks:
                     self._print(self._format_task_row(self._task_rows[task_id]))
 
-    def task_started(self, task: Any, round_index: int) -> None:
+    def task_started(self, task: Any, depth: int) -> None:
         if self.quiet:
             return
         with self._lock:
             if self._interactive:
                 self._update_task_locked(task, state="preparing", force=True)
                 return
-            depth = max(1, int(round_index or 1))
+            depth = max(1, int(depth or 1))
             name = _task_name(task)
             prefix = self._tree_prefix(depth)
             progress = f"{self._completed_tasks}/{self._total_tasks}"
@@ -218,9 +218,9 @@ class RunReporter:
     def _restore_progress_locked(self, row: dict[str, Any]) -> None:
         row["state"] = "extracting"
 
-    def task_finished(self, task: Any, outcome: Any, round_index: int) -> None:
+    def task_finished(self, task: Any, outcome: Any, depth: int) -> None:
         with self._lock:
-            depth = max(1, int(round_index or 1))
+            depth = max(1, int(depth or 1))
             self._completed_tasks += 1
             name = _task_name(task)
             parent_lineage = self._task_lineages.get(id(task), ())

@@ -24,7 +24,7 @@ def _config(**overrides):
     }
 
 
-def _authorize(root: Path, entries: list[FileEntry], archives: list[Path], *, round_index=2):
+def _authorize(root: Path, entries: list[FileEntry], archives: list[Path], *, depth=2):
     snapshot = DirectorySnapshot.from_entries(root, entries, raw_entries=entries)
     session = DiscoveryScanSession(config=_config())
     session.prime_snapshot(str(root), snapshot)
@@ -33,11 +33,11 @@ def _authorize(root: Path, entries: list[FileEntry], archives: list[Path], *, ro
         tasks,
         [str(root)],
         session,
-        round_index=round_index,
+        depth=depth,
     )
 
 
-def test_first_round_bypasses_policy_for_the_user_requested_scope(tmp_path):
+def test_first_depth_bypasses_policy_for_the_user_requested_scope(tmp_path):
     wrapper = tmp_path / "game"
     archive = wrapper / "wanted.rar"
     task = direct_file_task(str(archive))
@@ -45,7 +45,7 @@ def test_first_round_bypasses_policy_for_the_user_requested_scope(tmp_path):
         [task],
         [str(tmp_path)],
         None,
-        round_index=1,
+        depth=1,
     )
 
     assert [task.main_path for task in result.allowed_tasks] == [str(archive)]
@@ -87,14 +87,14 @@ def test_normal_detection_session_retains_raw_snapshots_for_relation_evidence():
     assert DiscoveryScanSession(config=_config()).include_raw_snapshots is True
 
 
-def test_second_round_root_child_has_no_special_privilege(tmp_path):
+def test_second_depth_root_child_has_no_special_privilege(tmp_path):
     archive = tmp_path / "nested.zip"
     entries = [
         FileEntry(archive, False, 10),
         *[FileEntry(tmp_path / f"asset_{index}", False, 100) for index in range(10)],
     ]
 
-    result = _authorize(tmp_path, entries, [archive], round_index=2)
+    result = _authorize(tmp_path, entries, [archive], depth=2)
 
     assert result.allowed_tasks == []
     assert result.skipped[0]["reason"] == "archive_byte_ratio_below_floor"

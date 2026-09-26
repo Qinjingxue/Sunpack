@@ -18,7 +18,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 import sunpack.pipeline.coordinator.engine as engine_module
-import sunpack.pipeline.coordinator.extraction_batch as extraction_batch_module
 import sunpack.core.analysis.engine as analysis_engine_module
 import sunpack.core.analysis.structure_pipeline.modules.compression_streams as compression_streams_module
 import sunpack.core.analysis.structure_pipeline.modules.rar as rar_analysis_module
@@ -135,9 +134,9 @@ class RequestRuntimeProfiler:
             "output_native_batch_file_head_facts",
         )
         self._install_global_callable(
-            extraction_batch_module,
+            engine_module,
             "build_output_dir_resolver",
-            "batch_output_dir_resolver",
+            "job_output_dir_resolver",
         )
         self._install_global_callable(
             analysis_engine_module,
@@ -264,27 +263,6 @@ class RequestRuntimeProfiler:
 
         setattr(owner, name, measured)
 
-    def _install_cleanup_timer(self, scope) -> None:
-        """Time per-task source cleanup and the share spent at its barrier gate."""
-
-        if scope is None:
-            return
-        self._install_instance_method(scope, "release_task", "batch_cleanup_task")
-        original_barrier = engine_module.promotion_barrier
-
-        @contextlib.contextmanager
-        def measured_barrier(*args: Any, **kwargs: Any):
-            with original_barrier(*args, **kwargs) as report:
-                timings = self._active_timings
-                if timings is not None:
-                    timings["batch_cleanup_barrier"].append(
-                        float(getattr(report, "gate_wait_seconds", 0.0) or 0.0)
-                    )
-                yield report
-
-        self._global_restores.append((engine_module, "promotion_barrier", original_barrier))
-        engine_module.promotion_barrier = measured_barrier
-
     def _install_global_dynamic_method(self, owner: type, name: str, label: Callable[..., str]) -> None:
         descriptor = owner.__dict__[name]
         original = getattr(owner, name)
@@ -312,14 +290,16 @@ class RequestRuntimeProfiler:
 
         scanner = runtime.task_scanner
         planning = runtime.input_planning_stage
-        batch = runtime.batch_runner
+        job = runtime.job_executor
         extractor = runtime.extractor
         output_scan = runtime.output_scan_policy
 
         _wrap(runtime, "execute_async", timings, "pipeline_runtime_execute")
         _wrap(runtime, "_plan_task_isolated", timings, "pipeline_plan_task_isolated")
         _wrap(_child(runtime, "recursive_authorization"), "authorize_batch", timings, "pipeline_nested_authorize")
-        self._install_cleanup_timer(_child(runtime, "cleanup_scope"))
+        cleanup_scope = _child(runtime, "cleanup_scope")
+        self._install_instance_method(cleanup_scope, "release_task", "source_cleanup_release")
+        self._install_instance_method(cleanup_scope, "apply", "source_cleanup_apply")
 
         _wrap(scanner, "direct_file_tasks", timings, "pipeline_direct_scan")
         _wrap(scanner, "scan_targets", timings, "pipeline_nested_scan")
@@ -366,26 +346,24 @@ class RequestRuntimeProfiler:
 
             analysis_engine._run_module = timed_run_module
 
-        _wrap(batch, "execute_async", timings, "batch_execute")
+        _wrap(job, "execute_async", timings, "job_execute")
         for name, label in (
-            ("_skip_tasks_inside_batch_outputs", "batch_skip_inside_outputs"),
-            ("collect_result", "batch_collect_result"),
-            ("_inspect_tasks_before_extract", "batch_password_preflight"),
+            ("collect_result", "job_collect_result"),
+            ("_inspect_tasks_before_extract", "job_password_preflight"),
         ):
-            _wrap(batch, name, timings, label)
-        password_contexts = _child(batch, "directory_password_contexts")
-        _wrap(password_contexts, "annotate", timings, "batch_directory_password_annotate")
-        _wrap(password_contexts, "remember", timings, "batch_directory_password_remember")
+            _wrap(job, name, timings, label)
+        password_contexts = _child(job, "directory_password_contexts")
+        _wrap(password_contexts, "annotate", timings, "job_directory_password_annotate")
+        _wrap(password_contexts, "remember", timings, "job_directory_password_remember")
         reporter = runtime.reporter
-        _wrap(reporter, "begin_round", timings, "batch_report_begin_round")
-        _wrap(reporter, "task_finished", timings, "batch_report_task_finished")
+        _wrap(reporter, "tasks_discovered", timings, "job_report_tasks_discovered")
+        _wrap(reporter, "task_finished", timings, "job_report_task_finished")
         _wrap(reporter, "log_final_summary", timings, "pipeline_final_report")
 
-        _wrap(output_scan, "scan_roots_from_outputs", timings, "output_scan")
+        _wrap(output_scan, "prepare_scan", timings, "output_scan")
         _wrap(output_scan, "_snapshot_from_inventory", timings, "output_snapshot_from_inventory")
         _wrap(output_scan, "_inventory_files", timings, "output_inventory_files")
         _wrap(output_scan, "_is_within_root", timings, "output_inventory_path_check")
-        _wrap(output_scan, "take_scan_session", timings, "output_take_scan_session")
 
         _wrap(extractor, "inspect", timings, "password_preflight")
         _wrap(extractor, "extract", timings, "extract_total_legacy", phase_timer=phase)
@@ -403,7 +381,7 @@ class RequestRuntimeProfiler:
         _wrap(sevenzip, "_json_line", timings, "worker_protocol_json_decode")
         _wrap(sevenzip, "_drain_stderr", timings, "worker_protocol_drain_stderr")
         _wrap(sevenzip, "_emit_progress", timings, "worker_protocol_emit_progress")
-        _wrap(batch.verifier, "verify", timings, "verify_total", phase_timer=phase)
+        _wrap(job.verifier, "verify", timings, "verify_total", phase_timer=phase)
 
 
 def _generated_output_path(output_base: Path, kind: str, index: int) -> Path:
@@ -440,18 +418,13 @@ def _timing_totals(timings: TimingMap) -> dict[str, float]:
 
 def _derived_timing(timings: TimingMap) -> dict[str, float]:
     total = lambda label: sum(timings.get(label, []))
-    batch_direct_children = sum(total(label) for label in (
-        "batch_report_begin_round",
-        "batch_prepare",
-        "batch_directory_password_annotate",
-        "batch_output_dir_resolver",
-        "batch_skip_inside_outputs",
-        "batch_collect_result",
-        "batch_directory_password_remember",
-        "batch_password_preflight",
-        "batch_report_task_finished",
-        "batch_cleanup_task",
-        "output_scan",
+    job_direct_children = sum(total(label) for label in (
+        "job_directory_password_annotate",
+        "job_output_dir_resolver",
+        "job_collect_result",
+        "job_directory_password_remember",
+        "job_password_preflight",
+        "job_report_task_finished",
     ))
     output_snapshot_children = sum(total(label) for label in (
         "output_inventory_files",
@@ -477,26 +450,21 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         for label, values in timings.items()
         if label.startswith("planning_")
     )
-    runtime_outside_batch_children = sum(total(label) for label in (
+    runtime_outside_job_children = sum(total(label) for label in (
         "pipeline_direct_scan",
         "pipeline_plan_task_isolated",
         "pipeline_nested_authorize",
-        "output_take_scan_session",
+        "output_scan",
         "pipeline_final_report",
         "extractor_close",
+        "source_cleanup_apply",
     ))
     return {
-        "batch_overhead_excluding_extract": round(total("batch_execute") - total("extract_total"), 6),
-        "batch_parent_python_residual": round(total("batch_execute") - batch_direct_children, 6),
-        "batch_cleanup_invocations": len(timings.get("batch_cleanup_task", ())),
-        "batch_cleanup_share": round(
-            total("batch_cleanup_task") / total("batch_execute"), 6
-        ) if total("batch_execute") else 0.0,
-        "batch_cleanup_barrier_share": round(
-            total("batch_cleanup_barrier") / total("batch_cleanup_task"), 6
-        ) if total("batch_cleanup_task") else 0.0,
+        "job_overhead_excluding_extract": round(total("job_execute") - total("extract_total"), 6),
+        "job_parent_python_residual": round(total("job_execute") - job_direct_children, 6),
+        "source_cleanup_releases": len(timings.get("source_cleanup_release", ())),
         "execute_ready_overhead_excluding_extract_verify": round(
-            total("batch_execute") - total("extract_total") - total("verify_total"),
+            total("job_execute") - total("extract_total") - total("verify_total"),
             6,
         ),
         "output_snapshot_python_residual": round(
@@ -512,15 +480,15 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
             total("pipeline_plan_task_isolated") - planning_probe_children,
             6,
         ),
-        "pipeline_runtime_outside_batch": round(
-            total("pipeline_runtime_execute") - total("batch_execute"),
+        "pipeline_runtime_outside_job": round(
+            total("pipeline_runtime_execute") - total("job_execute"),
             6,
         ),
-        "pipeline_runtime_outside_batch_residual": round(
-            total("pipeline_runtime_execute") - total("batch_execute") - runtime_outside_batch_children,
+        "pipeline_runtime_outside_job_residual": round(
+            total("pipeline_runtime_execute") - total("job_execute") - runtime_outside_job_children,
             6,
         ),
-        "pipeline_run_outside_batch": round(total("pipeline_run") - total("batch_execute"), 6),
+        "pipeline_run_outside_job": round(total("pipeline_run") - total("job_execute"), 6),
         "pipeline_run_outer_residual": round(
             total("pipeline_run")
             - total("pipeline_runtime_create")
@@ -529,7 +497,6 @@ def _derived_timing(timings: TimingMap) -> dict[str, float]:
         ),
         "worker_wait_residual": round(total("sevenzip_worker") - worker_protocol_children, 6),
     }
-
 
 def _derived_timing_medians(request_timings: list[TimingMap]) -> dict[str, float]:
     derived = [_derived_timing(timings) for timings in request_timings]

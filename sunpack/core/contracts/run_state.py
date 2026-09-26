@@ -1,10 +1,9 @@
 """Mutable coordinator state for one pipeline execution."""
 
 import threading
-from typing import Any
 
 from sunpack.core.contracts.failures import FailureInfo
-from sunpack.core.contracts.results import RunSummary, TargetRunResult
+from sunpack.core.contracts.results import ArchiveCleanupResult, RunSummary, TargetRunResult
 
 
 class RunState:
@@ -13,8 +12,7 @@ class RunState:
         self.scan_failed_tasks: list[str] = []
         self.scan_failures: list[FailureInfo] = []
         self.processed_keys: set[str] = set()
-        self.cleanup_refs: dict[str, Any] = {}
-        self.flatten_candidates: set[str] = set()
+        self.cleanup_results: list[ArchiveCleanupResult] = []
         self.target_results: list[TargetRunResult] = []
         self.policy_skips: list[dict] = []
 
@@ -31,4 +29,5 @@ class RunState:
             scan_failed_tasks=tuple(scan_failed_tasks),
             scan_failures=tuple(scan_failures),
             policy_skips=tuple(policy_skips),
+            cleanup_results=tuple(self.cleanup_results),
         )

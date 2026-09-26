@@ -1,5 +1,6 @@
 import os
 from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -10,13 +11,18 @@ from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.core.support.path_keys import normalized_path, path_key
 
 
+@dataclass(frozen=True)
+class NestedScanWork:
+    roots: tuple[str, ...]
+    session: DiscoveryScanSession | None
+
+
 class NestedOutputScanPolicy:
     """Locate extracted output directories that require full archive detection."""
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self._output_scan_config = self._build_recursive_output_scan_config()
-        self._pending_scan_session: DiscoveryScanSession | None = None
 
     def should_scan_output_dir(self, target_dir: str) -> bool:
         return bool(self._candidate_parent_roots(target_dir))
@@ -60,18 +66,18 @@ class NestedOutputScanPolicy:
             for path, size in zip(paths, sizes)
         )
 
-    def scan_roots_from_outputs(
+    def prepare_scan(
         self,
         output_dirs: Iterable[str],
         inventories: dict[str, OutputInventory | dict[str, Any]] | None = None,
         logical_roots: Iterable[str] | None = None,
-    ) -> list[str]:
+    ) -> NestedScanWork:
         roots = []
         seen = set()
         inventories = inventories or {}
         # A carrier can contain several independently extracted archives.  In
         # that case the carrier output directory is only a physical container;
-        # authorization for the next recursive round must be evaluated from
+        # authorization for the next recursive discovery must be evaluated from
         # each confirmed segment directory independently.  Ordinary archives
         # continue to use their output directory as their single logical root.
         scan_dirs = logical_roots if logical_roots is not None else output_dirs
@@ -113,8 +119,10 @@ class NestedOutputScanPolicy:
                 roots.append(root)
             scan_session.prime_snapshot(root, snapshot)
             has_primed_snapshot = True
-        self._pending_scan_session = scan_session if has_primed_snapshot else None
-        return roots
+        session = scan_session if has_primed_snapshot else None
+        if session is not None:
+            session.set_scan_roots(roots)
+        return NestedScanWork(tuple(roots), session)
 
     @staticmethod
     def project_logical_scan_roots(
@@ -151,15 +159,6 @@ class NestedOutputScanPolicy:
             return projected
 
         return [(output_dir, getattr(extraction_result, "output_inventory", None))]
-
-    def take_scan_session(self, scan_roots: Iterable[str]) -> DiscoveryScanSession | None:
-        """Consume the inventory-backed session prepared for the next recursive round."""
-        session = self._pending_scan_session
-        self._pending_scan_session = None
-        if session is None:
-            return None
-        session.set_scan_roots(list(scan_roots))
-        return session
 
     def _snapshot_from_inventory(
         self,

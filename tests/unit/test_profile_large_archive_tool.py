@@ -86,23 +86,23 @@ def test_worker_wait_residual_excludes_protocol_processing():
     assert derived["worker_wait_residual"] == pytest.approx(0.85)
 
 
-def test_pipeline_derived_timings_remove_nested_batch_and_planning_costs():
+def test_pipeline_derived_timings_remove_nested_job_and_planning_costs():
     derived = _derived_timing({
         "pipeline_run": [1.0],
         "pipeline_runtime_create": [0.2],
         "pipeline_runtime_execute": [0.77],
-        "batch_execute": [0.6],
+        "job_execute": [0.6],
         "pipeline_plan_task_isolated": [0.1],
         "planning_signature_prepass": [0.08],
         "pipeline_direct_scan": [0.02],
         "pipeline_nested_authorize": [0.02],
-        "output_take_scan_session": [0.01],
+        "output_scan": [0.01],
         "pipeline_final_report": [0.01],
         "extractor_close": [0.01],
     })
 
-    assert derived["pipeline_run_outside_batch"] == pytest.approx(0.4)
-    assert derived["pipeline_runtime_outside_batch"] == pytest.approx(0.17)
+    assert derived["pipeline_run_outside_job"] == pytest.approx(0.4)
+    assert derived["pipeline_runtime_outside_job"] == pytest.approx(0.17)
     assert derived["pipeline_plan_task_unattributed"] == pytest.approx(0.02)
-    assert derived["pipeline_runtime_outside_batch_residual"] == pytest.approx(0.0)
+    assert derived["pipeline_runtime_outside_job_residual"] == pytest.approx(-0.01)
     assert derived["pipeline_run_outer_residual"] == pytest.approx(0.03)

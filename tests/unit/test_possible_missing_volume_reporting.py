@@ -5,7 +5,7 @@ import pytest
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.results import OutcomeKind
-from sunpack.pipeline.coordinator.extraction_batch import _possible_missing_volume_failure
+from sunpack.pipeline.coordinator.archive_job import _possible_missing_volume_failure
 from sunpack.core.i18n import I18nContext
 from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 

@@ -13,7 +13,7 @@ from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlan
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse, PipelineTarget
 from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, TargetRunResult
 from sunpack.core.contracts.run_state import RunState
-from sunpack.pipeline.coordinator.extraction_batch import ExtractionBatchRunner
+from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.pipeline.coordinator.recursive_authorization import RecursiveAuthorization
 from sunpack.pipeline.coordinator.recursion import RecursionController
@@ -21,18 +21,19 @@ from sunpack.pipeline.coordinator.reporting import RunReporter
 from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.core.i18n import I18nContext
 from sunpack.pipeline.postprocess.actions import PostProcessActions
 from sunpack.core.passwords.internal.store import MAX_RECENT_PASSWORDS
 from sunpack.core.platform.windows.shell_notify import notify_shell_directories_updated
-from sunpack.core.support.output_reservation import OutputReservationRegistry
+from sunpack.core.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.core.support.output_paths import default_output_dir_for_task
 from sunpack.core.support.path_keys import path_key
 from sunpack.core.support.archive_sessions import release_archive_sessions_under
 from sunpack.core.support.resource_lifecycle import TaskResourceScope, promotion_barrier
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
-from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_ORIGIN, map_bounded
+from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_ORIGIN
 
 
 @dataclass
@@ -50,36 +51,6 @@ class _Submission:
     progress_callback: Callable[[Any, dict[str, Any]], None] | None = None
 
 
-async def _commit_response(broker, config, response, *, stdout=None, defer_flatten=False):
-    response = await broker.run(
-        "postprocess",
-        response.request_id,
-        _finalize_response,
-        config,
-        response,
-        stdout=stdout,
-        defer_flatten=defer_flatten,
-        request_id=response.request_id,
-    )
-    for delay in (0.1, 0.3):
-        pending = [item for item in response.summary.cleanup_results if item.retryable and item.attempts < 3]
-        if not pending:
-            break
-        await asyncio.sleep(delay)
-        response = await broker.run(
-            "postprocess",
-            response.request_id,
-            _finalize_response,
-            config,
-            response,
-            stdout=stdout,
-            retry_results=pending,
-            defer_flatten=defer_flatten,
-            request_id=response.request_id,
-        )
-    return response
-
-
 class PipelineEngine:
     """Single-event-loop owner for independently completing requests."""
 
@@ -94,7 +65,6 @@ class PipelineEngine:
             ),
         )
         self._services = _PipelineServices(config, self._broker, self.detection_options)
-        self._services.max_inflight_files = _max_inflight_files(config, self._broker)
         self._runtime = self._services
         self._active_requests: dict[str, asyncio.Task] = {}
         self._request_runtime_factory = _RequestRuntime
@@ -215,13 +185,6 @@ class PipelineEngine:
                         ),
                     )
                 self._remember_recent_passwords(response.recent_passwords)
-                response = await _commit_response(
-                    self._broker,
-                    submission.config,
-                    response,
-                    stdout=stdout,
-                    defer_flatten=submission.origin == "watch",
-                )
                 if response.summary.postprocess_completed:
                     await self._broker.run(
                         "report",
@@ -521,15 +484,6 @@ def _worker_config(config: dict) -> dict:
     return dict(worker)
 
 
-def _max_inflight_files(config: dict, broker: AsyncWorkBroker) -> int:
-    worker = _worker_config(config)
-    configured = int(worker.get("max_inflight_files", 0) or 0)
-    if configured > 0:
-        return configured
-    native_capacity = int(worker.get("thread_capacity", 0) or broker.thread_capacity)
-    return min(512, max(64, 4 * (broker.thread_capacity + max(1, native_capacity))))
-
-
 class _PipelineServices:
     """Thread-safe process services shared by all request runtimes."""
 
@@ -541,7 +495,6 @@ class _PipelineServices:
     ):
         self.config = config
         self.broker = broker
-        self.max_inflight_files = 64
         self.output_reservations = OutputReservationRegistry()
         worker_config = _worker_config(config)
         self.sevenzip_runner = SevenZipRunner(worker_config)
@@ -553,7 +506,6 @@ class _PipelineServices:
         if self._automatic_stage_capacity:
             initial_limit = int(handshake.get("initial_active_limit", 0) or handshake.get("thread_capacity", 1) or 1)
             self.broker.configure_thread_capacity(initial_limit)
-            self.max_inflight_files = min(512, max(64, 4 * initial_limit))
 
     async def close(self, broker: AsyncWorkBroker) -> None:
         await self.sevenzip_runner.aclose()
@@ -571,45 +523,97 @@ class _PipelineServices:
         )
 
 
-class _CleanupRefScope:
-    def __init__(self, context: RunState, config: dict, factory: Callable[..., Any]):
+class _SourceCleanup:
+    """Shared-source refcount plus asynchronous source deletion."""
+
+    def __init__(
+        self,
+        context: RunState,
+        config: dict,
+        factory: Callable[..., Any],
+        request_id: str,
+    ):
         from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
 
         self._context = context
         self._config = config
         self._factory = factory
-        self.request_id = ""
-        self._table = CleanupRefTable()
-
-    def bind(self, request_id: str) -> "_CleanupRefScope":
         self.request_id = str(request_id or "")
-        self._context.cleanup_refs[self.request_id] = self._table
-        return self
+        self._table = CleanupRefTable()
 
     def register(self, tasks) -> None:
         self._table.register_all(tasks)
 
-    async def release_task(self, task, *, outcome_kind, broker, cancellation=None) -> "ReleaseOutcome":
-        from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome
+    def release_task(self, task, *, outcome_kind):
         from sunpack.core.contracts.results import OutcomeKind
 
         if outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
             self._table.mark_cleanup_eligible(task)
-        request = self._table.release(task)
+        return self._table.release(task)
+
+    def sweep_requests(self):
+        return self._table.sweep()
+
+    async def apply(self, request, *, broker, cancellation=None):
+        from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome, ReleaseRequest
+
         if not (request.paths and request.should_clean):
-            # Nothing to remove: the path is still referenced elsewhere, or every owner that released it failed.
             return ReleaseOutcome(task_key=request.task_key, released=request.paths)
-        return await self._apply(request, broker=broker, cancellation=cancellation)
 
-    async def sweep(self, *, broker, cancellation=None) -> list["ReleaseOutcome"]:
-        outcomes = []
-        for request in self._table.sweep():
-            if not (request.paths and request.should_clean):
-                continue
-            outcomes.append(await self._apply(request, broker=broker, cancellation=cancellation))
-        return outcomes
+        pending = tuple(request.paths)
+        previous: dict[str, ArchiveCleanupResult] = {}
+        deleted: list[str] = []
+        final_failed: tuple[ArchiveCleanupResult, ...] = ()
+        final_error = ""
 
-    async def _apply(self, request, *, broker, cancellation=None) -> "ReleaseOutcome":
+        for attempt, delay in enumerate((0.0, 0.1, 0.3), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            current = ReleaseRequest(
+                task_key=request.task_key,
+                paths=pending,
+                should_clean=True,
+            )
+            outcome = await self._apply_once(
+                current,
+                broker=broker,
+                cancellation=cancellation,
+                previous=previous,
+            )
+            deleted.extend(path for path in outcome.deleted if path not in deleted)
+            final_error = outcome.error
+            final_failed = outcome.failed
+            retryable = tuple(
+                item for item in outcome.failed
+                if item.retryable and item.attempts < 3
+            )
+            if not retryable:
+                break
+            previous = {path_key(item.path): item for item in retryable}
+            pending = tuple(item.path for item in retryable)
+
+        if final_failed:
+            with self._context.lock:
+                by_path = {path_key(item.path): item for item in self._context.cleanup_results}
+                by_path.update({path_key(item.path): item for item in final_failed})
+                self._context.cleanup_results[:] = list(by_path.values())
+
+        return ReleaseOutcome(
+            task_key=request.task_key,
+            released=request.paths,
+            deleted=tuple(deleted),
+            failed=final_failed,
+            error=final_error,
+        )
+
+    async def _apply_once(
+        self,
+        request,
+        *,
+        broker,
+        cancellation=None,
+        previous: dict[str, ArchiveCleanupResult] | None = None,
+    ):
         from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome
         from sunpack.core.support.archive_sessions import release_archive_sessions_under
         from sunpack.core.support.resource_lifecycle import (
@@ -617,6 +621,8 @@ class _CleanupRefScope:
             ResourceLifecycleError,
             promotion_barrier,
         )
+
+        previous = previous or {}
 
         def run_cleanup():
             existing = [path for path in request.paths if os.path.exists(path)]
@@ -626,27 +632,22 @@ class _CleanupRefScope:
                 try:
                     actions = self._factory(self._config, stdout=None)
                     if self._mode() == "keep":
-                        # Keeping sources is not a filesystem mutation.  Do not
-                        # establish a source promotion barrier merely to produce
-                        # the corresponding "kept" cleanup results.
-                        results.extend(
-                            actions.apply(
-                                archives_to_clean=[[path] for path in existing],
-                                flatten_targets=[],
-                            )
-                        )
+                        results.extend(actions.apply(
+                            archives_to_clean=[[path] for path in existing],
+                            flatten_targets=[],
+                            previous_cleanup=previous,
+                        ))
                     else:
                         with promotion_barrier(
                             existing,
                             cache_releasers=(release_archive_sessions_under,),
                             quiesce=False,
                         ):
-                            results.extend(
-                                actions.apply(
-                                    archives_to_clean=[[path] for path in existing],
-                                    flatten_targets=[],
-                                )
-                            )
+                            results.extend(actions.apply(
+                                archives_to_clean=[[path] for path in existing],
+                                flatten_targets=[],
+                                previous_cleanup=previous,
+                            ))
                 except (ResourceBusyError, ResourceLifecycleError) as exc:
                     error = str(exc)
                     code = int(getattr(exc, "winerror", 0) or 0)
@@ -655,21 +656,29 @@ class _CleanupRefScope:
                             path,
                             self._mode(),
                             "failed",
-                            1,
+                            previous.get(path_key(path)).attempts + 1
+                            if path_key(path) in previous
+                            else 1,
                             code or 32,
                             f"cleanup barrier unavailable: {exc}",
                         )
                         for path in existing
                     )
-            # A path that was already gone is reported as missing, so the summary still accounts for every source.
-            seen = {item.path for item in results}
+            seen = {path_key(item.path) for item in results}
             results.extend(
-                ArchiveCleanupResult(path, self._mode(), "missing")
+                ArchiveCleanupResult(
+                    path,
+                    self._mode(),
+                    "missing",
+                    previous.get(path_key(path)).attempts + 1
+                    if path_key(path) in previous
+                    else 1,
+                )
                 for path in request.paths
-                if path not in seen
+                if path_key(path) not in seen
             )
-            ordered = {item.path: item for item in results}
-            final = [ordered[path] for path in request.paths if path in ordered]
+            by_path = {path_key(item.path): item for item in results}
+            final = [by_path[path_key(path)] for path in request.paths if path_key(path) in by_path]
             deleted = tuple(item.path for item in final if item.status in {"recycled", "deleted"})
             return ReleaseOutcome(
                 task_key=request.task_key,
@@ -681,7 +690,7 @@ class _CleanupRefScope:
 
         try:
             outcome = await broker.run(
-                "postprocess",
+                "background_source_cleanup",
                 request.task_key or self.request_id,
                 run_cleanup,
                 request_id=self.request_id,
@@ -690,12 +699,14 @@ class _CleanupRefScope:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # A closed or unavailable broker must not fail the extraction; the sources stay in place.
             return ReleaseOutcome(task_key=request.task_key, released=request.paths, error=str(exc))
         if outcome.deleted:
-            # The deleted sources are gone, so refresh their folders.
             notify_shell_directories_updated(
-                tuple(dict.fromkeys(os.path.dirname(path) for path in outcome.deleted if os.path.dirname(path)))
+                tuple(dict.fromkeys(
+                    os.path.dirname(path)
+                    for path in outcome.deleted
+                    if os.path.dirname(path)
+                ))
             )
         return outcome
 
@@ -730,11 +741,12 @@ class _RequestRuntime:
             stdout=submission.stdout,
             stderr=submission.stderr,
         )
-        self.cleanup_scope = _CleanupRefScope(
+        self.source_cleanup = _SourceCleanup(
             self.context,
             self.config,
             _postprocess_actions_factory,
-        ).bind(submission.request_id)
+            submission.request_id,
+        )
         self.task_scanner = ArchiveTaskScanner(
             self.config,
             self.context,
@@ -768,17 +780,18 @@ class _RequestRuntime:
             output_stream=submission.stdout,
         )
         self.extractor.set_progress_callback(self._report_progress)
-        self.batch_runner = ExtractionBatchRunner(
+        self.job_executor = ArchiveJobExecutor(
             self.context,
             self.extractor,
-            self.output_scan_policy,
             self.config,
-            output_reservations=services.output_reservations,
-            reservation_owner=submission.request_id,
             progress_reporter=self.reporter,
             request_id=submission.request_id,
             origin=submission.origin,
         )
+        self.recursion = self._new_recursion()
+        self._active_task_keys: set[str] = set()
+        self._cleanup_tasks: set[asyncio.Task] = set()
+        self._prompt_gates: dict[int, asyncio.Task] = {}
 
     def _report_progress(self, task: Any, event: dict[str, Any]) -> None:
         self.reporter.task_progress(task, event)
@@ -831,188 +844,52 @@ class _RequestRuntime:
     ) -> PipelineResponse:
         submission = self.submission
         request_id = submission.request_id
-        all_targets = [target.path for target in submission.targets]
-        ownership = _RequestOwnership([submission], self.config)
-        recursion = self._new_recursion()
-        round_index = 1
-        current_roots = list(dict.fromkeys(all_targets))
-        current_tasks = None
-        current_scan_session = None
-        if submission.direct:
-            current_tasks = await broker.run(
-                "discover",
-                request_id,
-                self.task_scanner.direct_file_tasks,
-                current_roots,
-                request_id=request_id,
-                cancellation=cancellation,
-            )
+        roots = list(dict.fromkeys(target.path for target in submission.targets))
+        ownership = _RequestResults(submission, self.config)
 
         try:
-            while current_tasks if submission.direct and round_index == 1 else current_roots:
-                cancellation.raise_if_cancelled()
-                direct_round = submission.direct and round_index == 1
-                if direct_round:
-                    tasks = current_tasks or []
-                else:
-                    self.reporter.scan_started(round_index)
-                    discovered = await broker.run(
-                        "discover_detect",
-                        request_id,
-                        self.task_scanner.discover_targets,
-                        current_roots,
-                        scan_session=current_scan_session,
-                        is_recursive_scan=(round_index > 1),
-                        request_id=request_id,
-                        cancellation=cancellation,
-                    )
-                authorization = await broker.run(
-                    "nested_policy",
+            if submission.direct:
+                tasks = await broker.run(
+                    "discover",
                     request_id,
-                    self.recursive_authorization.authorize_batch,
-                    tasks if direct_round else discovered,
-                    current_roots,
-                    current_scan_session or self.task_scanner.last_scan_session,
-                    round_index=round_index,
+                    self.task_scanner.direct_file_tasks,
+                    roots,
                     request_id=request_id,
                     cancellation=cancellation,
                 )
-                authorized_tasks = (
-                    authorization.allowed_tasks
-                    if direct_round
-                    else self.task_scanner.filter_processed_tasks(authorization.allowed_tasks)
-                )
-                async def plan_one(task):
-                    return await broker.run(
-                        "plan",
-                        task.key or task.main_path,
-                        self._plan_task_isolated,
-                        task,
-                        request_id=request_id,
-                        cancellation=cancellation,
-                    )
-
-                planned_groups = await map_bounded(
-                    authorized_tasks,
-                    self.services.max_inflight_files,
-                    plan_one,
-                )
-                tasks = [task for group in planned_groups for task in group]
-                self.context.policy_skips.extend(authorization.skipped)
-                ownership.remember_tasks(tasks)
-                member_paths = [
-                    path
-                    for task in tasks
-                    for path in (task.all_parts or [task.main_path])
-                ]
-                cancellation.raise_if_cancelled()
-                coalesced_owner = await self.path_leases.replace(
-                    request_id,
-                    member_paths,
-                    coalesce_exact=submission.origin == "watch",
-                )
-                if coalesced_owner:
-                    raise _CoalescedWatchRequest(coalesced_owner)
-                if submission.origin == "watch" and tasks:
-                    claimed_sources = tuple(dict.fromkeys(
-                        path
-                        for task in tasks
-                        for path in (task.cleanup_parts or task.all_parts or [task.main_path])
-                        if path
-                    ))
-                    self._report_progress(
-                        tasks[0],
-                        {
-                            "type": "semantic",
-                            "event": "task_sources_claimed",
-                            "source_paths": claimed_sources,
-                        },
-                    )
-
-                watch_versions: dict[str, tuple[tuple[str, int, int, int, int], ...]] = {}
-                if submission.origin == "watch":
-                    reusable_ids: set[int] = set()
-                    reusable_results: list[TargetRunResult] = []
-                    for task in tasks:
-                        part_paths = tuple(task.archive_input().part_paths())
-                        if len(part_paths) < 2:
-                            continue
-                        version = self.path_leases.ownership_version_for(request_id, part_paths)
-                        if not version:
-                            continue
-                        watch_versions[path_key(task.main_path)] = version
-                        carrier = str(task.carrier_path or "")
-                        part_keys = {path_key(path) for path in part_paths}
-                        if not carrier or path_key(carrier) in part_keys:
-                            continue
-                        completed_output = self.path_leases.completed_watch_output(version)
-                        if not completed_output:
-                            continue
-                        reusable_ids.add(id(task))
-                        reusable_results.append(TargetRunResult(
-                            input_path=task.main_path,
-                            outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
-                            task_key=task.key,
-                            output_dir=completed_output,
-                            verification={"reused_completed_generation": True},
-                        ))
-                    if reusable_results:
-                        with self.context.lock:
-                            self.context.target_results.extend(reusable_results)
-                            self.context.processed_keys.update(
-                                result.task_key for result in reusable_results if result.task_key
-                            )
-                        tasks = [task for task in tasks if id(task) not in reusable_ids]
-
-                self.batch_runner.set_progress_round(
-                    round_index,
-                    direct=submission.direct and round_index == 1,
-                )
-                before_results = len(self.context.target_results)
-                new_roots = await self.batch_runner.execute_async(
+                await self._run_discovery_batch(
                     tasks,
+                    roots=roots,
+                    scan_session=None,
+                    depth=1,
+                    direct=True,
+                    ownership=ownership,
                     broker=broker,
                     cancellation=cancellation,
-                    default_output_dir_for_task=ownership.output_dir_for_task,
-                    missing_volume_retry=self._resolve_missing_volume_once,
-                    ensure_input_lease=self._ensure_task_lease,
-                    cleanup_scope=self.cleanup_scope,
                 )
-                executed_results = self.context.target_results[before_results:]
-                if submission.origin == "watch" and watch_versions:
-                    for result in executed_results:
-                        if result.outcome_kind != OutcomeKind.COMPLETE_SUCCESS:
-                            continue
-                        version = watch_versions.get(path_key(result.input_path), ())
-                        if version:
-                            self.path_leases.remember_completed_watch(
-                                version,
-                                result.output_dir,
-                            )
-                next_scan_session = self.output_scan_policy.take_scan_session(new_roots)
-                ownership.remember_results(executed_results)
-                if not recursion.should_continue(round_index, bool(new_roots)):
-                    break
-                if recursion.mode == "prompt" and not await broker.run(
-                    "prompt",
-                    request_id,
-                    recursion.prompt_continue,
-                    round_index,
-                    request_id=request_id,
+            else:
+                await self._discover_and_run(
+                    roots,
+                    scan_session=None,
+                    depth=1,
+                    ownership=ownership,
+                    broker=broker,
                     cancellation=cancellation,
-                ):
-                    break
-                current_roots = new_roots
-                current_scan_session = next_scan_session
-                current_tasks = None
-                round_index += 1
+                )
 
-            response = ownership.responses(
+            await self._drain_cleanup_tasks()
+            response = ownership.response(
                 self.context,
                 recent_passwords=self.extractor.recent_passwords,
-            )[request_id]
-            return response
+            )
+            return replace(
+                response,
+                summary=replace(response.summary, postprocess_completed=True),
+            )
         finally:
+            for request in self.source_cleanup.sweep_requests():
+                self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
+            await self._drain_cleanup_tasks()
             self.extractor.set_progress_callback(None)
             await broker.run(
                 "extractor_close",
@@ -1021,6 +898,389 @@ class _RequestRuntime:
                 request_id=request_id,
             )
             self.input_planning_stage.clear_report_cache()
+
+    async def _discover_and_run(
+        self,
+        roots: list[str],
+        *,
+        scan_session,
+        depth: int,
+        ownership,
+        broker,
+        cancellation,
+    ) -> None:
+        if not roots:
+            return
+        self.reporter.scan_started(depth)
+        discovered = await broker.run(
+            "discover_detect",
+            self.submission.request_id,
+            self.task_scanner.discover_targets,
+            roots,
+            scan_session=scan_session,
+            is_recursive_scan=depth > 1,
+            request_id=self.submission.request_id,
+            cancellation=cancellation,
+        )
+        await self._run_discovery_batch(
+            discovered,
+            roots=roots,
+            scan_session=scan_session or self.task_scanner.last_scan_session,
+            depth=depth,
+            direct=False,
+            ownership=ownership,
+            broker=broker,
+            cancellation=cancellation,
+        )
+
+    async def _run_discovery_batch(
+        self,
+        tasks,
+        *,
+        roots: list[str],
+        scan_session,
+        depth: int,
+        direct: bool,
+        ownership,
+        broker,
+        cancellation,
+    ) -> None:
+        authorization = await broker.run(
+            "nested_policy",
+            self.submission.request_id,
+            self.recursive_authorization.authorize_batch,
+            tasks,
+            roots,
+            scan_session or self.task_scanner.last_scan_session,
+            depth=depth,
+            request_id=self.submission.request_id,
+            cancellation=cancellation,
+        )
+        candidates = (
+            authorization.allowed_tasks
+            if direct
+            else self.task_scanner.filter_processed_tasks(authorization.allowed_tasks)
+        )
+        with self.context.lock:
+            self.context.policy_skips.extend(authorization.skipped)
+        tasks = self._claim_tasks(candidates)
+
+        if self.submission.origin == "watch" and depth == 1 and tasks:
+            member_paths = [
+                path
+                for task in tasks
+                for path in (task.all_parts or [task.main_path])
+            ]
+            coalesced_owner = await self.path_leases.replace(
+                self.submission.request_id,
+                member_paths,
+                coalesce_exact=True,
+            )
+            if coalesced_owner:
+                raise _CoalescedWatchRequest(coalesced_owner)
+
+        # This registration is deliberately only a source-cleanup lifetime
+        # guard. It never gates planning, extraction, verification or recursion.
+        self.source_cleanup.register(tasks)
+        self.reporter.tasks_discovered(depth, tasks, direct=direct)
+
+        if self.submission.origin == "watch" and tasks:
+            claimed_sources = tuple(dict.fromkeys(
+                path
+                for task in tasks
+                for path in (task.cleanup_parts or task.all_parts or [task.main_path])
+                if path
+            ))
+            self._report_progress(
+                tasks[0],
+                {
+                    "type": "semantic",
+                    "event": "task_sources_claimed",
+                    "source_paths": claimed_sources,
+                },
+            )
+
+        results = await asyncio.gather(
+            *(
+                self._execute_job(
+                    task,
+                    depth=depth,
+                    ownership=ownership,
+                    broker=broker,
+                    cancellation=cancellation,
+                )
+                for task in tasks
+            ),
+            return_exceptions=True,
+        )
+        for result in results:
+            if isinstance(result, BaseException):
+                raise result
+
+    def _claim_tasks(self, tasks):
+        claimed = []
+        with self.context.lock:
+            processed = set(self.context.processed_keys)
+            for task in tasks:
+                key = str(task.key or task.main_path)
+                if key in processed or key in self._active_task_keys:
+                    continue
+                self._active_task_keys.add(key)
+                claimed.append(task)
+        return claimed
+
+    async def _execute_job(
+        self,
+        task,
+        *,
+        depth: int,
+        ownership,
+        broker,
+        cancellation,
+    ) -> None:
+        released_source_ref = False
+        task_key = str(task.key or task.main_path)
+        try:
+            planned = await broker.run(
+                "plan",
+                task_key,
+                self._plan_task_isolated,
+                task,
+                request_id=self.submission.request_id,
+                cancellation=cancellation,
+            )
+            if len(planned) != 1 or planned[0] is not task:
+                raise RuntimeError(
+                    "Archive input planning must preserve one logical ArchiveTask identity"
+                )
+
+            ownership.remember_tasks([task])
+            watch_version = self._watch_generation_for_task(task)
+            if watch_version:
+                completed_output = self.path_leases.completed_watch_output(watch_version)
+                if completed_output:
+                    reused = TargetRunResult(
+                        input_path=task.main_path,
+                        outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
+                        task_key=task.key,
+                        output_dir=completed_output,
+                        verification={"reused_completed_generation": True},
+                    )
+                    with self.context.lock:
+                        self.context.target_results.append(reused)
+                        self.context.processed_keys.add(task.key)
+                    ownership.remember_results([reused])
+                    cleanup_request = self.source_cleanup.release_task(
+                        task,
+                        outcome_kind=OutcomeKind.FAILURE,
+                    )
+                    released_source_ref = True
+                    self._schedule_cleanup(
+                        cleanup_request,
+                        broker=broker,
+                        cancellation=cancellation,
+                    )
+                    return
+
+            output_dir_resolver = build_output_dir_resolver(
+                [task],
+                ownership.output_dir_for_task,
+                reservation_registry=self.services.output_reservations,
+                owner=self.submission.request_id,
+            )
+            task, outcome, result = await self.job_executor.execute_async(
+                task,
+                depth=depth,
+                output_dir_resolver=output_dir_resolver,
+                broker=broker,
+                cancellation=cancellation,
+                missing_volume_retry=self._resolve_missing_volume_once,
+                ensure_input_lease=self._ensure_task_lease,
+            )
+            ownership.remember_results([result])
+            output_dir = (
+                result.output_dir
+                if result.outcome_kind != OutcomeKind.FAILURE
+                else ""
+            )
+
+            cleanup_request = self.source_cleanup.release_task(
+                task,
+                outcome_kind=outcome.outcome_kind,
+            )
+            released_source_ref = True
+            self._schedule_cleanup(
+                cleanup_request,
+                broker=broker,
+                cancellation=cancellation,
+            )
+
+            if (
+                watch_version
+                and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS
+                and output_dir
+            ):
+                self.path_leases.remember_completed_watch(
+                    watch_version,
+                    output_dir,
+                )
+
+            if output_dir and self.recursion.allows_children(depth):
+                scan_work = await broker.run(
+                    "nested_scan",
+                    task_key,
+                    self._nested_scan_work,
+                    output_dir,
+                    outcome.result,
+                    request_id=self.submission.request_id,
+                    cancellation=cancellation,
+                )
+                if scan_work.roots and await self._allow_recursive_depth(
+                    depth + 1,
+                    broker=broker,
+                    cancellation=cancellation,
+                ):
+                    await self._discover_and_run(
+                        list(scan_work.roots),
+                        scan_session=scan_work.session,
+                        depth=depth + 1,
+                        ownership=ownership,
+                        broker=broker,
+                        cancellation=cancellation,
+                    )
+
+            if (
+                output_dir
+                and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS
+                and self.config.get("post_extract", {}).get("flatten_single_directory", True)
+            ):
+                await self._flatten_output(
+                    task,
+                    output_dir,
+                    broker=broker,
+                    cancellation=cancellation,
+                )
+
+            if output_dir:
+                notify_shell_directories_updated([output_dir])
+        finally:
+            if not released_source_ref:
+                cleanup_request = self.source_cleanup.release_task(
+                    task,
+                    outcome_kind=OutcomeKind.FAILURE,
+                )
+                self._schedule_cleanup(
+                    cleanup_request,
+                    broker=broker,
+                    cancellation=cancellation,
+                )
+            with self.context.lock:
+                self._active_task_keys.discard(task_key)
+
+    def _nested_scan_work(self, output_dir: str, extraction_result):
+        logical_roots = []
+        inventories = {}
+        for logical_root, projected_inventory in self.output_scan_policy.project_logical_scan_roots(
+            output_dir,
+            extraction_result,
+        ):
+            logical_roots.append(logical_root)
+            inventory = OutputInventory.from_value(
+                projected_inventory,
+                expected_root=logical_root,
+            )
+            if inventory is not None:
+                inventories[os.path.normcase(os.path.abspath(logical_root))] = inventory
+        return self.output_scan_policy.prepare_scan(
+            [output_dir],
+            inventories=inventories,
+            logical_roots=logical_roots,
+        )
+
+    async def _allow_recursive_depth(self, depth: int, *, broker, cancellation) -> bool:
+        if self.recursion.mode != "prompt":
+            return True
+        gate = self._prompt_gates.get(depth)
+        if gate is None:
+            gate = asyncio.create_task(
+                broker.run(
+                    "prompt",
+                    self.submission.request_id,
+                    self.recursion.prompt_continue,
+                    depth - 1,
+                    request_id=self.submission.request_id,
+                    cancellation=cancellation,
+                )
+            )
+            self._prompt_gates[depth] = gate
+        return bool(await gate)
+
+    def _watch_generation_for_task(self, task):
+        if self.submission.origin != "watch":
+            return ()
+        part_paths = tuple(task.archive_input().part_paths())
+        if len(part_paths) < 2:
+            return ()
+        carrier = str(task.carrier_path or "")
+        part_keys = {path_key(path) for path in part_paths}
+        if not carrier or path_key(carrier) in part_keys:
+            return ()
+        return _physical_ownership_version(part_paths)
+
+    def _schedule_cleanup(self, request, *, broker, cancellation) -> None:
+        if not (request.paths and request.should_clean):
+            return
+
+        async def run_cleanup():
+            await self.source_cleanup.apply(
+                request,
+                broker=broker,
+                cancellation=cancellation,
+            )
+
+        task = asyncio.create_task(run_cleanup())
+        self._cleanup_tasks.add(task)
+
+        def completed(done):
+            self._cleanup_tasks.discard(done)
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                # Source cleanup is best-effort and never invalidates a verified
+                # extraction. _SourceCleanup records actionable failures.
+                pass
+
+        task.add_done_callback(completed)
+
+    async def _drain_cleanup_tasks(self) -> None:
+        while self._cleanup_tasks:
+            pending = tuple(self._cleanup_tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _flatten_output(self, task, output_dir: str, *, broker, cancellation) -> None:
+        def flatten():
+            with promotion_barrier(
+                [output_dir],
+                cache_releasers=(release_archive_sessions_under,),
+                quiesce=False,
+            ):
+                _postprocess_actions_factory(
+                    self.config,
+                    stdout=self.submission.stdout,
+                ).apply(
+                    cleanup_archives=False,
+                    flatten_targets=[output_dir],
+                )
+
+        await broker.run(
+            "postprocess",
+            task.key or task.main_path,
+            flatten,
+            request_id=self.submission.request_id,
+            cancellation=cancellation,
+        )
 
     async def _ensure_task_lease(self, task) -> None:
         paths = task.all_parts or [task.main_path]
@@ -1039,209 +1299,123 @@ class _RequestRuntime:
             raise ValueError("recursive_extract must be normalized before PipelineEngine starts")
         return RecursionController(
             mode=str(config.get("mode", "fixed")),
-            max_rounds=int(config.get("max_rounds", 1)),
+            max_depth=int(config.get("max_rounds", 1)),
             language=self.language,
         )
 
 
-def _finalize_response(
-    config: dict,
-    response: PipelineResponse,
-    *,
-    stdout=None,
-    retry_results=None,
-    defer_flatten: bool = False,
-) -> PipelineResponse:
-    if response.summary.postprocess_completed and retry_results is None:
-        return response
-    flatten_targets_all = list(response.artifacts.flatten_targets)
-    shell_refresh_paths = list(response.artifacts.shell_refresh_paths)
-    previous = None
-    cleanup_requests = ()
-    if retry_results is not None:
-        # Only failed cleanups are retried here; successful sources are already removed task by task.
-        flatten_targets_all = []
-        shell_refresh_paths = []
-        cleanup_requests = tuple((item.path,) for item in retry_results)
-        previous = {path_key(item.path): item for item in retry_results}
-    post_extract = config.get("post_extract", {})
-    flatten_enabled = post_extract.get("flatten_single_directory", True)
-    flatten_targets = flatten_targets_all if flatten_enabled and not defer_flatten else []
-    mutation_roots = list(flatten_targets)
-    mutation_roots.extend(path for family in cleanup_requests for path in family)
-    if mutation_roots:
-        with promotion_barrier(
-            mutation_roots,
-            cache_releasers=(release_archive_sessions_under,),
-        ):
-            cleanup_results = PostProcessActions(config, stdout=stdout).apply(
-                archives_to_clean=list(cleanup_requests),
-                flatten_targets=flatten_targets,
-                previous_cleanup=previous,
-            )
-    else:
-        cleanup_results = PostProcessActions(config, stdout=stdout).apply(
-            archives_to_clean=list(cleanup_requests),
-            flatten_targets=flatten_targets,
-            previous_cleanup=previous,
-        )
-    notify_shell_directories_updated(shell_refresh_paths)
-    merged = {path_key(item.path): item for item in response.summary.cleanup_results}
-    merged.update({path_key(item.path): item for item in cleanup_results})
-    return replace(response, summary=replace(
-        response.summary,
-        cleanup_results=tuple(merged.values()),
-        postprocess_completed=True,
-    ))
+class _RequestResults:
+    """Collect one request's outputs and preserve per-target output settings."""
 
-
-class _RequestOwnership:
-    def __init__(self, submissions: list[_Submission], config: dict):
-        self.submissions = submissions
+    def __init__(self, submission: _Submission, config: dict):
+        self.submission = submission
         self.config = config
-        self._task_owner: dict[str, str] = {}
-        self._claimed_paths: dict[str, list[str]] = {item.request_id: [] for item in submissions}
-        self._task_paths: dict[str, dict[str, tuple[str, ...]]] = {item.request_id: {} for item in submissions}
-        self._output_owner: dict[str, str] = {}
+        self._task_targets: dict[str, PipelineTarget] = {}
+        self._output_targets: dict[str, PipelineTarget] = {}
+        self._claimed_paths: list[str] = []
+        self._task_paths: dict[str, tuple[str, ...]] = {}
 
     def remember_tasks(self, tasks) -> None:
         for task in tasks:
-            owner = self.owner_for_path(task.main_path)
-            owner_id = owner.request_id
+            target = self._target_for_path(task.main_path)
             paths = tuple(dict.fromkeys(task.all_parts or [task.main_path]))
-            self._task_owner[path_key(task.main_path)] = owner_id
-            self._claimed_paths[owner_id].extend(paths)
-            self._task_paths[owner_id][path_key(task.main_path)] = paths
+            self._task_targets[path_key(task.main_path)] = target
+            self._claimed_paths.extend(paths)
+            self._task_paths[path_key(task.main_path)] = paths
 
     def remember_results(self, results) -> None:
         for result in results:
-            owner = self.owner_for_path(result.input_path)
-            if result.output_dir:
-                self._output_owner[path_key(result.output_dir)] = owner.request_id
+            if not result.output_dir:
+                continue
+            target = self._target_for_path(result.input_path)
+            self._output_targets[path_key(result.output_dir)] = target
 
     def output_dir_for_task(self, task) -> str:
-        owner = self.owner_for_path(task.main_path)
-        target = self._target_for_path(owner, task.main_path)
+        target = self._target_for_path(task.main_path)
         output_config = {
             **(self.config.get("output", {}) if isinstance(self.config.get("output"), dict) else {}),
             **dict(target.output),
         }
         return default_output_dir_for_task(task, output_config)
 
-    def owner_for_path(self, path: str) -> _Submission:
-        normalized = os.path.abspath(path)
-        known = self._task_owner.get(path_key(normalized)) or self._owner_for_output(normalized)
-        if known:
-            return self._submission(known)
-        exact = []
-        containing = []
-        for submission in self.submissions:
-            for target in submission.targets:
-                if path_key(target.path) == path_key(normalized):
-                    exact.append(submission)
-                elif os.path.isdir(target.path) and _is_relative_to(normalized, target.path):
-                    containing.append((len(target.path), submission))
-        if exact:
-            return exact[0]
-        if containing:
-            return max(containing, key=lambda item: item[0])[1]
-        return self.submissions[0]
-
-    def responses(self, context: RunState, *, recent_passwords: Iterable[str]) -> dict[str, PipelineResponse]:
-        results = {item.request_id: [] for item in self.submissions}
-        for result in context.target_results:
-            results[self.owner_for_path(result.input_path).request_id].append(result)
-        flatten = {item.request_id: [] for item in self.submissions}
-        for path in context.flatten_candidates:
-            owner_id = self._owner_for_output(path) or self.owner_for_path(path).request_id
-            flatten[owner_id].append(path)
-
-        responses = {}
-        for submission in self.submissions:
-            request_results = results[submission.request_id]
-            if len(self.submissions) == 1:
-                scan_failed_tasks = list(context.scan_failed_tasks)
-                scan_failures = list(context.scan_failures)
-            else:
-                scan_failed_tasks = []
-                scan_failures = [
-                    failure
-                    for failure in context.scan_failures
-                    if self._failure_owner(failure) == submission.request_id
-                ]
-            summary = context.snapshot(
-                target_results=request_results,
-                scan_failed_tasks=scan_failed_tasks,
-                scan_failures=scan_failures,
-                policy_skips=[
-                    item
-                    for item in context.policy_skips
-                    if self.owner_for_path(str(item.get("path") or "")).request_id
-                    == submission.request_id
-                ],
-            )
-            blocked_paths = []
-            for result in request_results:
-                if result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
-                    continue
-                blocked_paths.extend(
-                    self._task_paths[submission.request_id].get(
-                        path_key(result.input_path),
-                        (result.input_path,),
-                    )
+    def response(self, context: RunState, *, recent_passwords: Iterable[str]) -> PipelineResponse:
+        request_results = list(context.target_results)
+        summary = context.snapshot(
+            target_results=request_results,
+            scan_failed_tasks=list(context.scan_failed_tasks),
+            scan_failures=list(context.scan_failures),
+            policy_skips=list(context.policy_skips),
+        )
+        blocked_paths = []
+        for result in request_results:
+            if result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
+                continue
+            blocked_paths.extend(
+                self._task_paths.get(
+                    path_key(result.input_path),
+                    (result.input_path,),
                 )
-            responses[submission.request_id] = PipelineResponse(
-                request_id=submission.request_id,
-                summary=summary,
-                artifacts=PipelineArtifacts(
-                    flatten_targets=tuple(sorted(flatten[submission.request_id], key=lambda value: value.count(os.sep))),
-                    shell_refresh_paths=tuple(dict.fromkeys([
-                        *(
-                            result.output_dir
-                            for result in request_results
-                            if result.outcome_kind in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}
-                            and result.output_dir
-                        ),
-                        *(
-                            str(item.get("out_dir") or "")
-                            for item in summary.recovered_outputs
-                            if str(item.get("out_dir") or "")
-                        ),
-                    ])),
-                ),
-                discovery=PipelineDiscovery(
-                    entry_paths=tuple(target.path for target in submission.targets),
-                    claimed_paths=tuple(dict.fromkeys(self._claimed_paths[submission.request_id])),
-                    blocked_paths=tuple(dict.fromkeys(blocked_paths)),
-                ),
-                recent_passwords=tuple(recent_passwords),
             )
-        return responses
+        return PipelineResponse(
+            request_id=self.submission.request_id,
+            summary=summary,
+            artifacts=PipelineArtifacts(
+                shell_refresh_paths=tuple(dict.fromkeys([
+                    *(
+                        result.output_dir
+                        for result in request_results
+                        if result.outcome_kind in {
+                            OutcomeKind.COMPLETE_SUCCESS,
+                            OutcomeKind.PARTIAL_SUCCESS,
+                        }
+                        and result.output_dir
+                    ),
+                    *(
+                        str(item.get("out_dir") or "")
+                        for item in summary.recovered_outputs
+                        if str(item.get("out_dir") or "")
+                    ),
+                ])),
+            ),
+            discovery=PipelineDiscovery(
+                entry_paths=tuple(target.path for target in self.submission.targets),
+                claimed_paths=tuple(dict.fromkeys(self._claimed_paths)),
+                blocked_paths=tuple(dict.fromkeys(blocked_paths)),
+            ),
+            recent_passwords=tuple(recent_passwords),
+        )
 
-    def _target_for_path(self, submission: _Submission, path: str) -> PipelineTarget:
-        exact = [target for target in submission.targets if path_key(target.path) == path_key(path)]
+    def _target_for_path(self, path: str) -> PipelineTarget:
+        normalized = os.path.abspath(path)
+        key = path_key(normalized)
+        known = self._task_targets.get(key)
+        if known is not None:
+            return known
+
+        exact = [
+            target
+            for target in self.submission.targets
+            if path_key(target.path) == key
+        ]
         if exact:
             return exact[0]
-        containing = [target for target in submission.targets if os.path.isdir(target.path) and _is_relative_to(path, target.path)]
-        return max(containing, key=lambda target: len(target.path)) if containing else submission.targets[0]
 
-    def _owner_for_output(self, path: str) -> str:
-        normalized = os.path.abspath(path)
-        matches = [
-            (len(output), owner)
-            for output_key, owner in self._output_owner.items()
-            for output in [output_key]
-            if output_key == path_key(normalized) or _is_relative_to(normalized, output_key)
+        output_matches = [
+            (len(output_root), target)
+            for output_root, target in self._output_targets.items()
+            if output_root == key or _is_relative_to(normalized, output_root)
         ]
-        return max(matches, default=(0, ""), key=lambda item: item[0])[1]
+        if output_matches:
+            return max(output_matches, key=lambda item: item[0])[1]
 
-    def _failure_owner(self, failure) -> str:
-        details = getattr(failure, "details", {})
-        path = str(details.get("path") or details.get("archive") or "") if isinstance(details, dict) else ""
-        return self.owner_for_path(path).request_id if path else ""
-
-    def _submission(self, request_id: str) -> _Submission:
-        return next(item for item in self.submissions if item.request_id == request_id)
+        containing = [
+            target
+            for target in self.submission.targets
+            if os.path.isdir(target.path) and _is_relative_to(normalized, target.path)
+        ]
+        if containing:
+            return max(containing, key=lambda target: len(target.path))
+        return self.submission.targets[0]
 
 
 def _is_relative_to(path: str, root: str) -> bool:

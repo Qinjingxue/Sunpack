@@ -72,18 +72,26 @@ class FakePipelineEngine:
         else:
             summary.cleanup_results = []
         self._recent_passwords = list(getattr(runner, "recent_passwords", ()) or ())
-        context = getattr(runner, "context", SimpleNamespace(flatten_candidates=()))
+        context = getattr(runner, "context", SimpleNamespace(generated_outputs=()))
         recovered_outputs = getattr(summary, "recovered_outputs", ()) or ()
         generated_outputs = [
-            str(item.get("out_dir") or "")
-            for item in recovered_outputs
-            if isinstance(item, dict) and item.get("out_dir")
+            *(
+                str(item.get("out_dir") or "")
+                for item in recovered_outputs
+                if isinstance(item, dict) and item.get("out_dir")
+            ),
+            *(
+                str(getattr(item, "output_dir", "") or "")
+                for item in (getattr(summary, "target_results", ()) or ())
+                if str(getattr(item, "output_dir", "") or "")
+            ),
+            *(str(path) for path in (getattr(context, "generated_outputs", ()) or ()) if str(path)),
         ]
         response = PipelineResponse(
             request_id=uuid.uuid4().hex,
             summary=summary,
             artifacts=PipelineArtifacts(
-                flatten_targets=tuple([*(getattr(context, "flatten_candidates", ()) or ()), *generated_outputs]),
+                shell_refresh_paths=tuple(dict.fromkeys(generated_outputs)),
             ),
             recent_passwords=tuple(self._recent_passwords),
         )

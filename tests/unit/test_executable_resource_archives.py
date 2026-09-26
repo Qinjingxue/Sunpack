@@ -194,6 +194,6 @@ def test_recursive_authorization_still_rejects_deep_detected_low_share_executabl
         tasks,
         [str(game_dir)],
         session,
-        round_index=2,
+        depth=2,
     )
     assert expected_path not in _task_paths(recursive.allowed_tasks)

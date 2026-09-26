@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import Any, List
+from typing import Any
 
 from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
@@ -11,24 +11,14 @@ from sunpack.core.contracts.content_recovery import (
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
 from sunpack.pipeline.coordinator.verification_stage import verify_and_project
-from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
-from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.pipeline.extraction.knowledge import write_extraction_result
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.postprocess.output_cleanup import OutputCleanupEvent, cleanup_output_for_retry
-from sunpack.pipeline.coordinator.async_work import map_unbounded
 from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL, DECISION_RETRY_EXTRACT
 
-
-def _advance_batch_state(state, sent, *, first: bool):
-    try:
-        return False, next(state) if first else state.send(sent)
-    except StopIteration as completed:
-        return True, completed.value
 from sunpack.core.passwords.directory_context import DirectoryPasswordContextStore
-from sunpack.core.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
 from sunpack.pipeline.verification import VerificationResult, VerificationScheduler
 from sunpack.pipeline.verification.error_classification import classify_verification_error
 from sunpack.core.contracts.verification import (
@@ -38,13 +28,19 @@ from sunpack.core.contracts.verification import (
     VERIFICATION_STRENGTH_CRC,
     VERIFICATION_STRENGTH_MANIFEST,
 )
-from sunpack.core.support.path_keys import absolute_path_key
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.i18n import I18nContext
 
 
+def _advance_job_state(state, sent, *, first: bool):
+    try:
+        return False, next(state) if first else state.send(sent)
+    except StopIteration as completed:
+        return True, completed.value
+
+
 @dataclass
-class BatchExtractionOutcome:
+class ArchiveJobOutcome:
     result: ExtractionResult
     verification: VerificationResult | None = None
     attempts: int = 1
@@ -88,25 +84,19 @@ class BatchExtractionOutcome:
         )
 
 
-class ExtractionBatchRunner:
+class ArchiveJobExecutor:
     def __init__(
         self,
         context: RunState,
         extractor: ExtractionScheduler,
-        output_scan_policy: NestedOutputScanPolicy,
         config: dict | None = None,
         *,
-        output_reservations: OutputReservationRegistry | None = None,
-        reservation_owner: str = "",
         progress_reporter: Any | None = None,
         request_id: str = "",
         origin: str = "",
     ):
         self.context = context
         self.extractor = extractor
-        self.output_scan_policy = output_scan_policy
-        self.output_reservations = output_reservations
-        self.reservation_owner = str(reservation_owner or "")
         self.config = config or {}
         self.content_policy = ContentRecoveryPolicy.from_config(self.config)
         cli_config = self.config.get("cli") if isinstance(self.config.get("cli"), dict) else {}
@@ -114,144 +104,63 @@ class ExtractionBatchRunner:
         self.progress_reporter = progress_reporter
         self.request_id = str(request_id or "")
         self.origin = str(origin or "")
-        self.progress_round_index = 1
-        self.progress_direct_mode = False
         self.verifier = VerificationScheduler(self.config, password_session=self.extractor.password_session)
         self.directory_password_contexts = DirectoryPasswordContextStore(self.config)
 
-    def set_progress_round(self, round_index: int, *, direct: bool = False) -> None:
-        self.progress_round_index = max(1, int(round_index or 1))
-        self.progress_direct_mode = bool(direct)
-
     async def execute_async(
         self,
-        tasks: List[ArchiveTask],
+        task: ArchiveTask,
         *,
+        depth: int,
+        output_dir_resolver,
         broker,
         cancellation,
-        default_output_dir_for_task=None,
         missing_volume_retry=None,
         ensure_input_lease=None,
-        cleanup_scope=None,
-    ) -> List[str]:
-        """Execute independent logical archives as interleaved coroutines."""
+    ) -> tuple[ArchiveTask, ArchiveJobOutcome, TargetRunResult]:
+        """Run one logical archive through preflight, extraction and verification."""
 
-        if not tasks:
-            if self.progress_reporter is not None:
-                self.progress_reporter.begin_round(self.progress_round_index, [], direct=self.progress_direct_mode)
-            return []
-
-        def prepare_batch():
-            self.directory_password_contexts.annotate(tasks)
-            resolver = build_output_dir_resolver(
-                tasks,
-                default_output_dir_for_task or self.extractor.default_output_dir_for_task,
-                reservation_registry=self.output_reservations,
-                owner=self.reservation_owner,
-            )
-            resolver = self._cached_output_dir_resolver(resolver)
-            prepared = self._skip_tasks_inside_batch_outputs(tasks, resolver)
-            if cleanup_scope is not None:
-                # Reference counts must exist before any task can finish, so a shared source path is
-                # never deleted while another task in this round still has to read it.
-                cleanup_scope.register(prepared)
-            return resolver, prepared
-
-        output_dir_resolver, prepared_tasks = await broker.run(
-            "admission",
-            self.request_id,
-            prepare_batch,
-            request_id=self.request_id,
+        self.directory_password_contexts.annotate([task])
+        task, outcome = await self._execute_one_async(
+            task,
+            output_dir_resolver,
+            depth=depth,
+            broker=broker,
             cancellation=cancellation,
+            missing_volume_retry=missing_volume_retry,
+            ensure_input_lease=ensure_input_lease,
         )
-        if self.progress_reporter is not None:
-            self.progress_reporter.begin_round(
-                self.progress_round_index,
-                prepared_tasks,
-                direct=self.progress_direct_mode,
-            )
-
-        async def execute_one(task):
-            task, outcome = await self._execute_one_async(
+        result = self.collect_result(task, outcome)
+        if self.origin == "watch":
+            self.extractor.emit_semantic_event(
                 task,
-                output_dir_resolver,
-                broker=broker,
-                cancellation=cancellation,
-                missing_volume_retry=missing_volume_retry,
-                ensure_input_lease=ensure_input_lease,
+                "task_output_finished",
+                critical=True,
+                output_dir=outcome.planned_out_dir,
+                keep_output=bool(result.output_dir and result.outcome_kind != OutcomeKind.FAILURE),
             )
-            output_dir = self.collect_result(task, outcome)
-            if self.origin == "watch":
-                self.extractor.emit_semantic_event(
-                    task,
-                    "task_output_finished",
-                    critical=True,
-                    output_dir=outcome.planned_out_dir,
-                    keep_output=bool(output_dir),
-                )
-            if cleanup_scope is not None and output_dir:
-                # Clean up as soon as extract and verification are both finished, because
-                # verification reads the source archive back to build its manifest.
-                await cleanup_scope.release_task(
-                    task,
-                    outcome_kind=outcome.outcome_kind,
-                    broker=broker,
-                    cancellation=cancellation,
-                )
-            return task, outcome
-
-        # Python only bounds blocking preparation through the broker. Every
-        # extraction-ready task is submitted to the native worker, where
-        # fairness and throughput-based concurrency control are centralized.
-        try:
-            outcomes = await map_unbounded(prepared_tasks, execute_one)
-        finally:
-            if cleanup_scope is not None:
-                # Cancelled or otherwise unreported tasks still hold references; drop them so a
-                # round can never strand the table.
-                await cleanup_scope.sweep(broker=broker)
-
-        output_dirs = []
-        logical_scan_roots = []
-        output_inventories: dict[str, OutputInventory] = {}
-        for task, outcome in outcomes:
-            output_dir = outcome.result.out_dir if outcome.result is not None else ""
-            if not output_dir:
-                continue
-            output_dirs.append(output_dir)
-            self.directory_password_contexts.remember(output_dir, task)
-            projected_roots = self.output_scan_policy.project_logical_scan_roots(
-                output_dir,
-                outcome.result,
-            )
-            for logical_root, projected_inventory in projected_roots:
-                logical_scan_roots.append(logical_root)
-                inventory = OutputInventory.from_value(projected_inventory, expected_root=logical_root)
-                if inventory is not None:
-                    output_inventories[os.path.normcase(os.path.abspath(logical_root))] = inventory
-        return self.output_scan_policy.scan_roots_from_outputs(
-            output_dirs,
-            inventories=output_inventories,
-            logical_roots=logical_scan_roots,
-        )
+        if result.output_dir and result.outcome_kind != OutcomeKind.FAILURE:
+            self.directory_password_contexts.remember(result.output_dir, task)
+        return task, outcome, result
 
     async def _execute_one_async(
         self,
         task: ArchiveTask,
         output_dir_resolver,
         *,
+        depth: int,
         broker,
         cancellation,
         missing_volume_retry=None,
         ensure_input_lease=None,
-    ) -> tuple[ArchiveTask, BatchExtractionOutcome]:
+    ) -> tuple[ArchiveTask, ArchiveJobOutcome]:
         file_id = task.key or task.main_path
 
         def preflight():
-            inspected = self._inspect_tasks_before_extract([task], output_dir_resolver)[0]
+            inspected = self._inspect_tasks_before_extract([task], output_dir_resolver, depth=depth)[0]
             _index, _task, out_dir, result = inspected
             if result.skip_result is not None:
-                return out_dir, BatchExtractionOutcome(result.skip_result)
+                return out_dir, ArchiveJobOutcome(result.skip_result)
             return out_dir, None
 
         retried_missing_volume = False
@@ -287,7 +196,7 @@ class ExtractionBatchRunner:
             task.runtime["volume_retry_attempted"] = True
         if terminal is not None:
             terminal.planned_out_dir = planned_out_dir
-            self._report_task_finished(task, terminal)
+            self._report_task_finished(task, terminal, depth)
             return task, terminal
 
         if self.origin == "watch":
@@ -308,7 +217,7 @@ class ExtractionBatchRunner:
             done, value = await broker.run(
                 "extract_prepare" if first else "verify_extract",
                 file_id,
-                _advance_batch_state,
+                _advance_job_state,
                 state,
                 sent,
                 first=first,
@@ -318,7 +227,7 @@ class ExtractionBatchRunner:
             if done:
                 outcome = value
                 outcome.planned_out_dir = planned_out_dir
-                self._report_task_finished(task, outcome)
+                self._report_task_finished(task, outcome, depth)
                 return task, outcome
             request = value
             first = False
@@ -333,34 +242,28 @@ class ExtractionBatchRunner:
                 cancellation=cancellation,
             )
 
-    def _report_task_started(self, task: ArchiveTask) -> None:
+    def _report_task_started(self, task: ArchiveTask, depth: int) -> None:
         if self.progress_reporter is not None:
-            self.progress_reporter.task_started(task, self.progress_round_index)
+            self.progress_reporter.task_started(task, depth)
 
-    def _report_task_finished(self, task: ArchiveTask, outcome: BatchExtractionOutcome) -> None:
+    def _report_task_finished(self, task: ArchiveTask, outcome: ArchiveJobOutcome, depth: int) -> None:
         if self.progress_reporter is not None:
-            self.progress_reporter.task_finished(task, outcome, self.progress_round_index)
+            self.progress_reporter.task_finished(task, outcome, depth)
 
     def _report_task_status(self, task: ArchiveTask, state: str, detail: str = "") -> None:
         if self.progress_reporter is not None:
             self.progress_reporter.task_status(task, state, detail)
 
-    @staticmethod
-    def _cached_output_dir_resolver(output_dir_resolver):
-        cache: dict[int, str] = {}
-
-        def resolve(task: ArchiveTask) -> str:
-            key = id(task)
-            if key not in cache:
-                cache[key] = output_dir_resolver(task)
-            return cache[key]
-
-        return resolve
-
-    def _inspect_tasks_before_extract(self, tasks: list[ArchiveTask], output_dir_resolver) -> list[tuple[int, ArchiveTask, str, Any]]:
+    def _inspect_tasks_before_extract(
+        self,
+        tasks: list[ArchiveTask],
+        output_dir_resolver,
+        *,
+        depth: int,
+    ) -> list[tuple[int, ArchiveTask, str, Any]]:
         results = []
         for index, task in enumerate(tasks):
-            self._report_task_started(task)
+            self._report_task_started(task, depth)
             out_dir = output_dir_resolver(task)
             results.append((index, task, out_dir, self.extractor.inspect(task, out_dir)))
         return results
@@ -389,7 +292,7 @@ class ExtractionBatchRunner:
             if not result.success:
                 self._report_task_status(task, "error", str(result.error or ""))
                 verification = verify_and_project(self.verifier, task, result)
-                current_outcome = BatchExtractionOutcome(
+                current_outcome = ArchiveJobOutcome(
                     result=result,
                     verification=verification,
                     attempts=attempt_index + 1,
@@ -423,7 +326,7 @@ class ExtractionBatchRunner:
                 return current_outcome
 
             verification = verify_and_project(self.verifier, task, result)
-            outcome = BatchExtractionOutcome(result=result, verification=verification, attempts=attempt_index + 1)
+            outcome = ArchiveJobOutcome(result=result, verification=verification, attempts=attempt_index + 1)
             if self._must_stop_for_proven_content_loss(task, result, verification):
                 return outcome
             if _verification_accepts_complete(verification):
@@ -439,7 +342,7 @@ class ExtractionBatchRunner:
                     planned_output_dir=out_dir,
                 )
             attempt_index += 1
-        return BatchExtractionOutcome(
+        return ArchiveJobOutcome(
             result=ExtractionResult(
                 success=False, out_dir=out_dir,
                 error=self.i18n.t("failure.verification_failed"),
@@ -459,37 +362,12 @@ class ExtractionBatchRunner:
     def _retry_on_verification_failure(self) -> bool:
         return bool(self.verifier.config.get("retry_on_verification_failure", True))
 
-    def _skip_tasks_inside_batch_outputs(self, tasks: List[ArchiveTask], output_dir_resolver=None) -> List[ArchiveTask]:
-        output_dir_resolver = output_dir_resolver or self.extractor.default_output_dir_for_task
-        output_roots = []
-        for task in tasks:
-            output_dir = output_dir_resolver(task)
-            if output_dir:
-                output_roots.append((task, absolute_path_key(output_dir)))
-
-        filtered = []
-        for task in tasks:
-            task_path = absolute_path_key(task.main_path)
-            inside_another_output = False
-            for owner, output_root in output_roots:
-                if owner is task:
-                    continue
-                try:
-                    if os.path.commonpath([task_path, output_root]) == output_root:
-                        inside_another_output = True
-                        break
-                except ValueError:
-                    continue
-            if not inside_another_output:
-                filtered.append(task)
-        return filtered
-
-    def collect_result(self, task: ArchiveTask, outcome: BatchExtractionOutcome | ExtractionResult) -> str | None:
+    def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> TargetRunResult:
         content_policy = getattr(self, "content_policy", None) or ContentRecoveryPolicy.from_config(
             getattr(self, "config", {})
         )
         if isinstance(outcome, ExtractionResult):
-            outcome = BatchExtractionOutcome(outcome, content_requirement=content_policy.requirement)
+            outcome = ArchiveJobOutcome(outcome, content_requirement=content_policy.requirement)
         else:
             outcome.content_requirement = content_policy.requirement
         res = outcome.result
@@ -513,72 +391,57 @@ class ExtractionBatchRunner:
             res.failure = possible_missing_volume
             res.error = possible_missing_volume.message
 
-        with self.context.lock:
-            if outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
-                self.context.processed_keys.add(task.key)
-                self.context.flatten_candidates.add(out_dir)
-                self.context.target_results.append(TargetRunResult(
-                    input_path=task.main_path,
-                    outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
-                    task_key=task.key,
-                    output_dir=out_dir,
-                    verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
-                ))
-                return out_dir
-            if outcome.outcome_kind == OutcomeKind.PARTIAL_SUCCESS:
-                recovery = None
-                if outcome.verification is not None:
-                    recovery = {
-                        "archive": task.main_path,
-                        "out_dir": out_dir,
-                        "completeness": outcome.verification.completeness,
-                        "assessment_status": outcome.verification.assessment_status,
-                        "content_integrity": outcome.verification.content_integrity,
-                        "container_integrity": outcome.verification.container_integrity,
-                        "verification_strength": outcome.verification.verification_strength,
-                        "archive_coverage": _coverage_payload(outcome.verification),
-                        "progress_manifest": res.progress_manifest,
-                        **(
-                            {"warning": possible_missing_volume.to_dict()}
-                            if possible_missing_volume is not None
-                            else {}
-                        ),
-                    }
-                self.context.processed_keys.add(task.key)
-                self.context.target_results.append(TargetRunResult(
-                    input_path=task.main_path,
-                    outcome_kind=OutcomeKind.PARTIAL_SUCCESS,
-                    task_key=task.key,
-                    output_dir=out_dir,
-                    verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
-                    error=(
-                        possible_missing_volume.message
-                        if possible_missing_volume is not None
-                        else str(res.error or "")
-                    ),
-                    failure=possible_missing_volume,
-                    recovery=recovery,
-                ))
-                return out_dir
-            self.context.target_results.append(TargetRunResult(
-                input_path=task.main_path,
-                outcome_kind=OutcomeKind.FAILURE,
-                task_key=task.key,
-                output_dir=out_dir,
-                verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
-                error=str(res.error or ""),
-                failure=outcome.result.failure,
-                failure_message=self._failure_message(task, outcome),
-            ))
-            return None
+        recovery = None
+        if outcome.outcome_kind == OutcomeKind.PARTIAL_SUCCESS and outcome.verification is not None:
+            recovery = {
+                "archive": task.main_path,
+                "out_dir": out_dir,
+                "completeness": outcome.verification.completeness,
+                "assessment_status": outcome.verification.assessment_status,
+                "content_integrity": outcome.verification.content_integrity,
+                "container_integrity": outcome.verification.container_integrity,
+                "verification_strength": outcome.verification.verification_strength,
+                "archive_coverage": _coverage_payload(outcome.verification),
+                "progress_manifest": res.progress_manifest,
+                **(
+                    {"warning": possible_missing_volume.to_dict()}
+                    if possible_missing_volume is not None
+                    else {}
+                ),
+            }
 
-    def _failure_message(self, task: ArchiveTask, outcome: BatchExtractionOutcome) -> str:
+        result = TargetRunResult(
+            input_path=task.main_path,
+            outcome_kind=outcome.outcome_kind,
+            task_key=task.key,
+            output_dir=out_dir,
+            verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
+            error=(
+                possible_missing_volume.message
+                if possible_missing_volume is not None
+                else str(res.error or "")
+            ),
+            failure=(possible_missing_volume if possible_missing_volume is not None else outcome.result.failure),
+            failure_message=(
+                self._failure_message(task, outcome)
+                if outcome.outcome_kind == OutcomeKind.FAILURE
+                else ""
+            ),
+            recovery=recovery,
+        )
+        with self.context.lock:
+            if outcome.outcome_kind in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}:
+                self.context.processed_keys.add(task.key)
+            self.context.target_results.append(result)
+        return result
+
+    def _failure_message(self, task: ArchiveTask, outcome: ArchiveJobOutcome) -> str:
         name = os.path.basename(task.main_path)
         if outcome.result.success and outcome.verification is not None and not _verification_accepts(outcome.verification):
             return f"{name} [{self._verification_failure_summary(outcome)}]"
         return f"{name} [{outcome.result.error}]"
 
-    def _verification_failure_summary(self, outcome: BatchExtractionOutcome) -> str:
+    def _verification_failure_summary(self, outcome: ArchiveJobOutcome) -> str:
         verification = outcome.verification
         if verification is None:
             return self.i18n.t("failure.verification_failed")

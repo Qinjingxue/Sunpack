@@ -3,10 +3,8 @@ import asyncio
 
 import sunpack.pipeline.coordinator.engine as engine_module
 from sunpack.pipeline.coordinator.engine import PipelineEngine
-from sunpack.pipeline.coordinator.async_work import CancellationToken
 from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.extraction import ExtractionResult
-from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.fs_builder import make_zip
 
@@ -154,8 +152,9 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
     assert summary.failed_tasks == []
     assert not archive.exists()
     assert (tmp_path / "payload" / "inside.txt").exists()
-    # Source archives are cleaned per task, so postprocess runs before the extractor is closed.
-    assert call_order[:2] == ["postprocess", "close"]
+    # Source cleanup and subtree flattening both finish before the request closes.
+    assert call_order[-1] == "close"
+    assert call_order.count("postprocess") >= 1
 
 
 def test_pipeline_runner_exposes_recent_passwords_without_password_manager():
@@ -180,7 +179,7 @@ def test_pipeline_runner_exposes_recent_passwords_without_password_manager():
     asyncio.run(run())
 
 
-def test_batch_does_not_treat_existing_same_name_directory_as_output(tmp_path, monkeypatch):
+def test_independent_jobs_do_not_treat_existing_same_name_directory_as_output(tmp_path, monkeypatch):
     archive = tmp_path / "payload.zip"
     nested = tmp_path / "payload" / "inner.zip"
     archive.write_bytes(b"parent")
@@ -197,32 +196,29 @@ def test_batch_does_not_treat_existing_same_name_directory_as_output(tmp_path, m
     })))
     extracted = []
 
-    def task_for(path):
-        return make_archive_task(path)
-
     def fake_extract(task, out_dir):
         extracted.append(task.main_path)
+        Path(out_dir).mkdir(parents=True, exist_ok=True)
         return ExtractionResult(success=True, out_dir=out_dir)
 
     async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
         return fake_extract(task, out_dir)
 
-    captured = {}
     def configure(runtime):
-        captured["runtime"] = runtime
-        monkeypatch.setattr(runtime.extractor, "inspect", lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})())
+        monkeypatch.setattr(
+            runtime.extractor,
+            "inspect",
+            lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})(),
+        )
         monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
 
     _configure_request_runtime(engine, configure)
+
     async def run():
         async with engine:
-            await engine.run([str(tmp_path / "missing.zip")])
-            await captured["runtime"].batch_runner.execute_async(
-                [task_for(archive), task_for(nested)],
-                broker=engine.work_broker,
-                cancellation=CancellationToken(),
-            )
+            await engine.run([str(archive), str(nested)], direct=True)
+
     asyncio.run(run())
 
     assert set(extracted) == {str(archive), str(nested)}
@@ -248,21 +244,25 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
         },
     }))
     engine = PipelineEngine(config)
-    task = make_archive_task(archive, logical_name="payload")
+    extracted = []
 
     def fake_extract(item, out_dir):
-        nested = Path(out_dir) / "nested.zip"
-        nested.parent.mkdir(parents=True, exist_ok=True)
-        nested.write_bytes(b"nested")
+        extracted.append(item.main_path)
+        out_path = Path(out_dir)
+        out_path.mkdir(parents=True, exist_ok=True)
+        if item.main_path == str(archive):
+            (out_path / "nested.zip").write_bytes(make_zip({"leaf.txt": b"leaf"}))
         return ExtractionResult(success=True, out_dir=out_dir)
 
     async def fake_extract_asyncio(_broker, item, out_dir, **_kwargs):
         return fake_extract(item, out_dir)
 
-    captured = {}
     def configure(runtime):
-        captured["runtime"] = runtime
-        monkeypatch.setattr(runtime.extractor, "inspect", lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})())
+        monkeypatch.setattr(
+            runtime.extractor,
+            "inspect",
+            lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})(),
+        )
         monkeypatch.setattr(runtime.extractor, "extract", fake_extract)
         monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
 
@@ -270,14 +270,72 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
 
     async def run():
         async with engine:
-            await engine.run([str(input_root / "missing.zip")])
-            return await captured["runtime"].batch_runner.execute_async(
-                [task],
-                broker=engine.work_broker,
-                cancellation=CancellationToken(),
-            )
-    scan_roots = asyncio.run(run())
+            return await engine.run([str(archive)], direct=True)
+
+    response = asyncio.run(run())
 
     expected_out_dir = output_root / "sub" / "payload"
+    nested_archive = expected_out_dir / "nested.zip"
     assert expected_out_dir.exists()
-    assert scan_roots == [str(expected_out_dir)]
+    assert str(archive) in extracted
+    assert str(nested_archive) in extracted
+    assert response.summary.success_count == 2
+
+
+
+def test_fast_job_recurses_before_slow_sibling_finishes(tmp_path, monkeypatch):
+    slow = tmp_path / "slow.zip"
+    fast = tmp_path / "fast.zip"
+    slow.write_bytes(make_zip({"slow.txt": b"slow"}))
+    fast.write_bytes(make_zip({"fast.txt": b"fast"}))
+    output_root = tmp_path / "out"
+
+    config = normalize_config(with_detection_pipeline({
+        "recursive_extract": "2",
+        "verification": {"enabled": False, "methods": []},
+        "output": {"root": str(output_root)},
+        "post_extract": {
+            "archive_cleanup_mode": "k",
+            "flatten_single_directory": False,
+        },
+    }))
+
+    slow_release = asyncio.Event()
+    nested_started = asyncio.Event()
+    nested_paths = []
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            def configure(runtime):
+                async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
+                    out_path = Path(out_dir)
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    if task.main_path == str(slow):
+                        await slow_release.wait()
+                    elif task.main_path == str(fast):
+                        nested = out_path / "nested.zip"
+                        nested.write_bytes(make_zip({"leaf.txt": b"leaf"}))
+                        nested_paths.append(str(nested))
+                    elif task.main_path in nested_paths:
+                        nested_started.set()
+                        slow_release.set()
+                    return ExtractionResult(success=True, out_dir=out_dir)
+
+                monkeypatch.setattr(
+                    runtime.extractor,
+                    "inspect",
+                    lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})(),
+                )
+                monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
+
+            _configure_request_runtime(engine, configure)
+            response = await asyncio.wait_for(
+                engine.run([str(slow), str(fast)], direct=True),
+                timeout=5,
+            )
+            return response
+
+    response = asyncio.run(run())
+
+    assert nested_started.is_set()
+    assert response.summary.success_count == 3

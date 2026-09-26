@@ -7,71 +7,12 @@ import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Awaitable, Callable, Generic, Iterable, TypeVar
+from typing import Any, AsyncIterator, Callable, Generic, Iterable, TypeVar
 
 from sunpack.core.support.work_context import CURRENT_ORIGIN, CURRENT_WORK, WorkContext
 
 
 T = TypeVar("T")
-U = TypeVar("U")
-
-
-async def map_bounded(
-    values: Iterable[T],
-    limit: int,
-    operation: Callable[[T], Awaitable[U]],
-) -> list[U]:
-    """Map async work with a hard bound on created in-flight tasks."""
-
-    source = iter(enumerate(values))
-    results: dict[int, U] = {}
-    active: dict[asyncio.Task[U], int] = {}
-
-    def fill() -> None:
-        while len(active) < max(1, int(limit)):
-            try:
-                index, value = next(source)
-            except StopIteration:
-                return
-            active[asyncio.create_task(operation(value))] = index
-
-    fill()
-    try:
-        while active:
-            done, _pending = await asyncio.wait(active, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                index = active.pop(task)
-                results[index] = task.result()
-            fill()
-    except BaseException:
-        for task in active:
-            task.cancel()
-        await asyncio.gather(*active, return_exceptions=True)
-        raise
-    return [results[index] for index in sorted(results)]
-
-
-async def map_unbounded(
-    values: Iterable[T],
-    operation: Callable[[T], Awaitable[U]],
-) -> list[U]:
-    """Start every logical item while individual stages retain their own bounds.
-
-    Native extraction owns execution admission. The operation may still await
-    bounded Python work such as preflight, but it never waits for a caller-side
-    extraction slot.
-    """
-
-    tasks: list[asyncio.Task[U]] = []
-    try:
-        tasks.extend(asyncio.create_task(operation(value)) for value in values)
-        return await asyncio.gather(*tasks)
-    except BaseException:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        raise
-
 
 class CancellationToken:
     """Cooperative cancellation shared by one request and its worker jobs."""
@@ -410,6 +351,8 @@ class AsyncWorkBroker:
 
 def _stage_priority(stage: str) -> int:
     value = str(stage or "").lower()
+    if "background" in value:
+        return 0
     if any(token in value for token in ("cancel", "close", "cleanup")):
         return 50
     if any(token in value for token in ("commit", "postprocess", "promotion")):

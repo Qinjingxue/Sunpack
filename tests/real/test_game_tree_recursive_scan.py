@@ -28,15 +28,16 @@ def test_game_tree_resources_are_not_authorized_for_recursive_extraction(monkeyp
     try:
         config = load_config()
         output_scan = NestedOutputScanPolicy(config)
-        roots = output_scan.scan_roots_from_outputs(output_dirs)
-        session = output_scan.take_scan_session(roots)
+        scan_work = output_scan.prepare_scan(output_dirs)
+        roots = list(scan_work.roots)
+        session = scan_work.session
         assert session is not None
         provider = ArchiveTaskProvider(config)
         inputs = provider.discover_targets(
             roots, scan_session=session, is_recursive_scan=True,
         ).resolved_tasks
         result = RecursiveAuthorization(config).authorize_batch(
-            inputs, roots, session, round_index=2,
+            inputs, roots, session, depth=2,
         )
         assert result.allowed_tasks == [], [
             item.main_path for item in result.allowed_tasks
