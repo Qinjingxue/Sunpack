@@ -30,6 +30,7 @@ class DiscoveryScanSession:
         self._relation_group_signatures: dict[str, str] = {}
         self._candidates: dict[str, list[DiscoveryCandidate]] = {}
         self._file_head_facts: dict[str, dict[str, Any]] = {}
+        self._output_inventories: list[Any] = []
         self._directory_identities: dict[str, tuple[str, int, tuple]] = {}
         self._scan_roots: list[str] = []
 
@@ -50,24 +51,10 @@ class DiscoveryScanSession:
     def prime_snapshot(self, directory: str, snapshot: DirectorySnapshot) -> None:
         self._snapshots[self._snapshot_key(directory, max_depth=None)] = snapshot
 
-    def prime_file_head_columns(
-        self,
-        paths: list[str],
-        sizes: list[int],
-        mtimes_ns: list[int | None],
-        magics: list[bytes],
-    ) -> None:
-        for path, size, mtime_ns, magic in zip(paths, sizes, mtimes_ns, magics):
-            normalized = normalized_path(path)
-            self._file_head_facts[path_key(normalized)] = {
-                "path": normalized,
-                "exists": True,
-                "is_file": True,
-                "size": int(size),
-                "mtime_ns": int(mtime_ns) if mtime_ns is not None else None,
-                "magic": bytes(magic),
-                "magic_complete": True,
-            }
+    def prime_output_inventory(self, inventory: Any) -> None:
+        if inventory is None:
+            return
+        self._output_inventories.append(inventory)
 
     def is_within_scan_scope(self, path: str) -> bool:
         if not self._scan_roots:
@@ -168,36 +155,77 @@ class DiscoveryScanSession:
             if self._file_head_fetch_needed_key(key, magic_size=magic_size)
         ]
         if missing:
-            rows = _native_batch_file_head_facts(missing, max(0, int(magic_size or 0)))
-            seen = set()
-            for row in rows:
-                if not isinstance(row, dict) or not row.get("path"):
+            filesystem_paths = list(missing)
+            for inventory in self._output_inventories:
+                root = normalized_path(getattr(inventory, "root", ""))
+                scoped = [
+                    path for path in filesystem_paths
+                    if root and (path_key(path) == path_key(root) or safe_relative_path(path, root) is not None)
+                ]
+                if not scoped:
                     continue
-                key = path_key(row.get("path"))
-                seen.add(key)
-                existing = self._file_head_facts.get(key, {})
-                magic = row.get("magic") if isinstance(row.get("magic"), bytes) else b""
-                self._file_head_facts[key] = {
-                    "path": str(row.get("path") or ""),
-                    "exists": bool(row.get("exists")),
-                    "is_file": bool(row.get("is_file")),
-                    "size": row.get("size"),
-                    "mtime_ns": row.get("mtime_ns"),
-                    "magic": magic if magic_size > 0 else existing.get("magic", b""),
-                    "magic_complete": bool(magic_size > 0) or bool(existing.get("magic_complete")),
-                }
-            for path in missing:
-                key = path_key(path)
-                if key not in seen:
+                rows = inventory.file_head_facts_for_paths(scoped, magic_size=magic_size)
+                resolved = set()
+                for row in rows:
+                    if not isinstance(row, dict) or not row.get("path"):
+                        continue
+                    key = path_key(row["path"])
+                    resolved.add(key)
                     self._file_head_facts[key] = {
-                        "path": path,
-                        "exists": False,
-                        "is_file": False,
-                        "size": None,
-                        "mtime_ns": None,
-                        "magic": b"",
-                        "magic_complete": True,
+                        "path": str(row["path"]),
+                        "exists": True,
+                        "is_file": True,
+                        "size": row.get("size"),
+                        "mtime_ns": row.get("mtime_ns"),
+                        "magic": row.get("magic") if isinstance(row.get("magic"), bytes) else b"",
+                        "magic_complete": bool(row.get("magic_complete")),
                     }
+                for path in scoped:
+                    key = path_key(path)
+                    if key not in resolved:
+                        self._file_head_facts[key] = {
+                            "path": path,
+                            "exists": False,
+                            "is_file": False,
+                            "size": None,
+                            "mtime_ns": None,
+                            "magic": b"",
+                            "magic_complete": True,
+                        }
+                scoped_keys = {path_key(path) for path in scoped}
+                filesystem_paths = [path for path in filesystem_paths if path_key(path) not in scoped_keys]
+
+            if filesystem_paths:
+                rows = _native_batch_file_head_facts(filesystem_paths, max(0, int(magic_size or 0)))
+                seen = set()
+                for row in rows:
+                    if not isinstance(row, dict) or not row.get("path"):
+                        continue
+                    key = path_key(row["path"])
+                    seen.add(key)
+                    existing = self._file_head_facts.get(key, {})
+                    magic = row.get("magic") if isinstance(row.get("magic"), bytes) else b""
+                    self._file_head_facts[key] = {
+                        "path": str(row["path"]),
+                        "exists": bool(row.get("exists")),
+                        "is_file": bool(row.get("is_file")),
+                        "size": row.get("size"),
+                        "mtime_ns": row.get("mtime_ns"),
+                        "magic": magic if magic_size > 0 else existing.get("magic", b""),
+                        "magic_complete": bool(magic_size > 0) or bool(existing.get("magic_complete")),
+                    }
+                for path in filesystem_paths:
+                    key = path_key(path)
+                    if key not in seen:
+                        self._file_head_facts[key] = {
+                            "path": path,
+                            "exists": False,
+                            "is_file": False,
+                            "size": None,
+                            "mtime_ns": None,
+                            "magic": b"",
+                            "magic_complete": True,
+                        }
         if copy_results:
             return {key: dict(self._file_head_facts.get(key, {})) for _path, key in keyed}
         return {key: self._file_head_facts.get(key, {}) for _path, key in keyed}

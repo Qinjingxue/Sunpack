@@ -368,35 +368,71 @@ impl NativeOutputInventory {
             .collect()
     }
 
-    fn file_columns(&self) -> (Vec<String>, Vec<u64>) {
-        let mut paths = Vec::with_capacity(self.files.len());
-        let mut sizes = Vec::with_capacity(self.files.len());
+    fn parent_directories(&self) -> Vec<String> {
+        let root = Path::new(&self.root);
+        let mut seen = HashSet::new();
+        let mut directories = Vec::new();
         for item in self.files.iter() {
-            paths.push(item.output_path.as_ref().unwrap_or(&item.path).clone());
-            sizes.push(item.size);
+            let path = item.abs_path.as_deref().map(PathBuf::from).unwrap_or_else(|| {
+                let relative = item.output_path.as_ref().unwrap_or(&item.path);
+                root.join(relative)
+            });
+            if !path.starts_with(root) {
+                continue;
+            }
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let parent = path_to_string(parent);
+            let key = inventory_path_key(&parent);
+            if seen.insert(key) {
+                directories.push(parent);
+            }
         }
-        (paths, sizes)
+        directories
     }
 
-    fn file_head_columns(
+    fn file_head_facts_for_paths(
         &self,
         py: Python<'_>,
-    ) -> (Vec<String>, Vec<u64>, Vec<Option<u64>>, Vec<Py<PyBytes>>) {
-        let mut paths = Vec::with_capacity(self.files.len());
-        let mut sizes = Vec::with_capacity(self.files.len());
-        let mut mtimes_ns = Vec::with_capacity(self.files.len());
-        let mut magics = Vec::with_capacity(self.files.len());
+        paths: Vec<String>,
+        magic_size: usize,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        if paths.is_empty() || self.files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let requested: HashSet<String> = paths
+            .into_iter()
+            .map(|path| inventory_path_key(&path))
+            .collect();
+        let root = Path::new(&self.root);
+        let mut rows = Vec::with_capacity(requested.len().min(self.files.len()));
         for item in self.files.iter() {
             let path = item.abs_path.clone().unwrap_or_else(|| {
                 let relative = item.output_path.as_ref().unwrap_or(&item.path);
-                path_to_string(&Path::new(&self.root).join(relative))
+                path_to_string(&root.join(relative))
             });
-            paths.push(path);
-            sizes.push(item.size);
-            mtimes_ns.push(item.mtime_ns);
-            magics.push(PyBytes::new(py, &item.magic).unbind());
+            if !requested.contains(&inventory_path_key(&path)) {
+                continue;
+            }
+            let row = PyDict::new(py);
+            row.set_item("path", &path)?;
+            row.set_item("exists", true)?;
+            row.set_item("is_file", true)?;
+            row.set_item("size", item.size)?;
+            row.set_item("mtime_ns", item.mtime_ns)?;
+            let magic_len = magic_size.min(item.magic.len());
+            row.set_item("magic", PyBytes::new(py, &item.magic[..magic_len]))?;
+            row.set_item(
+                "magic_complete",
+                item.magic.len() >= magic_size || item.size <= item.magic.len() as u64,
+            )?;
+            rows.push(row.unbind());
+            if rows.len() == requested.len() {
+                break;
+            }
         }
-        (paths, sizes, mtimes_ns, magics)
+        Ok(rows)
     }
 
     #[pyo3(signature = (
@@ -2625,6 +2661,17 @@ fn normalize_path_separator(path: String) -> String {
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn inventory_path_key(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        path.replace('/', "\\").to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
 }
 
 fn metadata_mtime_ns(metadata: &fs::Metadata) -> Option<u64> {
