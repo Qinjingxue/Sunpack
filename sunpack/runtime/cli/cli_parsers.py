@@ -1,7 +1,7 @@
 import argparse
 
 from sunpack.runtime.cli.cli_context import CliContext
-from sunpack.runtime.cli.cli_values import parse_archive_cleanup_value, parse_recursive_extract_value
+from sunpack.runtime.cli.cli_values import parse_archive_cleanup_value, parse_process_mode_value, parse_recursive_extract_value
 from sunpack.core.i18n import I18nContext
 
 
@@ -60,23 +60,25 @@ def build_config_output_parser(ctx: CliContext) -> argparse.ArgumentParser:
 def build_password_parser(ctx: CliContext) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("-p", "--password", action="append", default=[], help=ctx.t("cli.password"))
-    parser.add_argument("--pw-file", dest="password_file", help=ctx.t("cli.password_file"))
-    parser.add_argument("--ask-pw", dest="prompt_passwords", action="store_true", help=ctx.t("cli.prompt_passwords"))
-    parser.add_argument("--no-builtin-pw", dest="no_builtin_passwords", action="store_true", help=ctx.t("cli.no_builtin_passwords"))
-    parser.add_argument("--no-dir-pw", dest="directory_passwords", action="store_false", default=None, help=ctx.t("cli.no_directory_passwords"))
+    parser.add_argument("-P", "--pw-file", dest="password_file", help=ctx.t("cli.password_file"))
+    parser.add_argument("-a", "--ask-pw", dest="prompt_passwords", action="store_true", help=ctx.t("cli.prompt_passwords"))
+    parser.add_argument("--no-builtin-pw", "--no-bpw", dest="no_builtin_passwords", action="store_true", help=ctx.t("cli.no_builtin_passwords"))
+    parser.add_argument("--no-dir-pw", "--no-dpw", dest="directory_passwords", action="store_false", default=None, help=ctx.t("cli.no_directory_passwords"))
     return parser
 
 
 def build_detection_parser(ctx: CliContext) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--deep-detect", action="store_true", help=ctx.t("cli.deep_detect"))
+    parser.add_argument("-d", "--deep-detect", dest="deep_detect", action="store_true", help=ctx.t("cli.deep_detect"))
     return parser
 
 
 def build_process_mode_parser(ctx: CliContext) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument(
-        "--process-mode",
+        "-m", "--process-mode",
+        dest="process_mode",
+        type=parse_process_mode_value,
         choices=("background", "normal", "high"),
         default="high",
         help=ctx.t("cli.process_mode"),
@@ -86,15 +88,15 @@ def build_process_mode_parser(ctx: CliContext) -> argparse.ArgumentParser:
 
 def build_extract_config_override_parser(ctx: CliContext) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--recur", dest="recursive_extract", type=parse_recursive_extract_value, help=ctx.t("cli.recursive_extract"))
-    parser.add_argument("--cleanup", dest="archive_cleanup_mode", type=parse_archive_cleanup_value, help=ctx.t("cli.archive_cleanup_mode"))
+    parser.add_argument("-r", "--recur", dest="recursive_extract", type=parse_recursive_extract_value, help=ctx.t("cli.recursive_extract"))
+    parser.add_argument("-c", "--cleanup", dest="archive_cleanup_mode", type=parse_archive_cleanup_value, help=ctx.t("cli.archive_cleanup_mode"))
     parser.add_argument("-o", "--out-dir", dest="output_dir", help=ctx.t("cli.output_dir"))
     flatten_group = parser.add_mutually_exclusive_group()
-    flatten_group.add_argument("--flatten", dest="flatten_single_directory", action="store_true", default=None, help=ctx.t("cli.flatten"))
-    flatten_group.add_argument("--no-flatten", dest="flatten_single_directory", action="store_false", help=ctx.t("cli.no_flatten"))
-    parser.add_argument("--write-manifest", dest="write_progress_manifest", action="store_true", help=ctx.t("cli.write_manifest"))
+    flatten_group.add_argument("-f", "--flatten", dest="flatten_single_directory", action="store_true", default=None, help=ctx.t("cli.flatten"))
+    flatten_group.add_argument("-F", "--no-flatten", dest="flatten_single_directory", action="store_false", help=ctx.t("cli.no_flatten"))
+    parser.add_argument("--write-manifest", "--manifest", dest="write_progress_manifest", action="store_true", help=ctx.t("cli.write_manifest"))
     parser.add_argument(
-        "--allow-partial",
+        "-k", "--allow-partial",
         "--ap",
         dest="allow_partial",
         action="store_true",

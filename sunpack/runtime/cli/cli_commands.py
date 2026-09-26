@@ -4,6 +4,7 @@ import threading
 from types import ModuleType
 
 from sunpack.runtime.cli import commands
+from sunpack.runtime.cli.cli_aliases import canonical_command
 
 
 _COMMAND_CACHE_LOCK = threading.Lock()
@@ -17,6 +18,7 @@ _COMMAND_MODULE_NAMES = {
 
 def discover_command_modules(command: str | None = None) -> list[ModuleType]:
     global _COMMAND_MODULE_CACHE
+    command = canonical_command(command)
     if command in _COMMAND_MODULE_NAMES:
         return [importlib.import_module(_COMMAND_MODULE_NAMES[command])]
     with _COMMAND_CACHE_LOCK:

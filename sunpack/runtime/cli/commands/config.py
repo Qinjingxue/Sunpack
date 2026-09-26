@@ -1,3 +1,4 @@
+from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_USAGE
 from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_config_output_parser, localize_help_action
 from sunpack.runtime.cli.cli_types import CliCommandResult
@@ -13,11 +14,13 @@ def register(subparsers, ctx):
     common_parser = build_config_output_parser(ctx)
     config_parser = subparsers.add_parser(
         COMMAND,
+        aliases=COMMAND_ALIASES[COMMAND],
         parents=[common_parser],
         help=ctx.t("cli.config.help"),
         usage="sunpack config [options] <show|validate>",
         formatter_class=CliHelpFormatter,
     )
+    config_parser.set_defaults(command=COMMAND)
     localize_help_action(config_parser, ctx)
     config_subparsers = config_parser.add_subparsers(dest="config_action", required=True)
     config_subparsers.add_parser("show", parents=[common_parser], help=ctx.t("cli.config.show_help"), formatter_class=CliHelpFormatter)

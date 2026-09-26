@@ -5,6 +5,7 @@ import inspect
 import os
 import sys
 
+from sunpack.runtime.cli.cli_aliases import canonical_command
 from sunpack.runtime.cli.cli_commands import command_map, discover_command_modules
 from sunpack.runtime.cli.cli_constants import EXIT_OK, EXIT_RUNTIME, EXIT_USAGE
 from sunpack.runtime.cli.cli_context import (
@@ -26,6 +27,10 @@ _PARSER_STDERR: contextvars.ContextVar = contextvars.ContextVar("sunpack_parser_
 
 
 class _ContextArgumentParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("allow_abbrev", False)
+        super().__init__(*args, **kwargs)
+
     def _print_message(self, message, file=None):
         if file is sys.stderr:
             file = _PARSER_STDERR.get() or file
@@ -70,9 +75,10 @@ def build_cli_parser(ctx: CliContext | None = None, command: str | None = None) 
         usage=ctx.t("cli.usage"),
         epilog=(
             f"{ctx.t('cli.examples')}\n"
-            "  sunpack extract C:\\Archives\n"
-            "  sunpack inspect .\\fixtures\n"
-            "  sunpack passwords --ask-pw"
+            '  sunpack x C:\\Archives -r "*" -c r\n'
+            "  sunpack i .\\fixtures --analysis -j\n"
+            "  sunpack pw -a\n"
+            "  sunpack w add C:\\Downloads -s -i"
         ),
         formatter_class=CliHelpFormatter,
     )
@@ -164,9 +170,8 @@ async def async_main(
     # Extract and scan are latency-sensitive paths. Other commands retain full
     # discovery because some command registrations are imported by companion
     # command modules today.
-    selected_command = (
-        argv[0] if argv and argv[0] in {"extract", "scan"} else None
-    )
+    requested_command = canonical_command(argv[0]) if argv else None
+    selected_command = requested_command if requested_command in {"extract", "scan"} else None
     parser = cached_cli_parser(ctx, command=selected_command)
     stdout_token = _PARSER_STDOUT.set(ctx.stdout)
     stderr_token = _PARSER_STDERR.set(ctx.stderr)

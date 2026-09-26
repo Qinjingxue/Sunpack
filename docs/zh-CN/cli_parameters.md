@@ -18,14 +18,26 @@ sunpack.exe <command> [options] [paths...]
 
 | 命令 | 作用 |
 | --- | --- |
-| `extract` | 扫描、识别、解压、校验、后处理和清理。 |
-| `watch` | 监控目录，文件稳定后自动处理。 |
-| `scan` | 只扫描并列出可解压任务，不修改文件。 |
-| `inspect` | 输出检测和结构分析细节，不修改文件。 |
-| `passwords` | 查看当前命令可用的密码来源汇总。 |
-| `config` | 查看或校验合并后的有效配置。 |
+| `extract`, `x` | 扫描、识别、解压、校验、后处理和清理。 |
+| `watch`, `w` | 监控目录，文件稳定后自动处理。 |
+| `scan`, `s` | 只扫描并列出可解压任务，不修改文件。 |
+| `inspect`, `i` | 输出检测和结构分析细节，不修改文件。 |
+| `passwords`, `pw` | 查看当前命令可用的密码来源汇总。 |
+| `config`, `cfg` | 查看或校验合并后的有效配置。 |
 | `doctor` | 只读检查配置和运行环境。 |
-| `version` | 输出当前安装的 SunPack 版本号。 |
+| `version`, `ver` | 输出当前安装的 SunPack 版本号。 |
+
+完整名称和简写都是正式语法；只接受明确列出的简写，不接受任意截断长参数。简写输出的 JSON `command` 仍使用完整命令名。`-m` 接受 `background`/`b`、`normal`/`n`、`high`/`h`。`-p` 是密码，`-P` 是密码文件；`-f` 启用扁平化，`-F` 关闭扁平化。带值参数推荐分开写，例如 `-r 3`、`-c r`。
+
+常用简写示例：
+
+```powershell
+sunpack x D:\Downloads -o E:\Output -r "*" -c r -d -P D:\pw.txt -k --no-pause
+sunpack i D:\Downloads --analysis -d -j
+sunpack w add D:\Downloads -o E:\Output -s -i
+sunpack w ls
+sunpack w st
+```
 
 ## 通用输出参数
 
@@ -38,7 +50,7 @@ sunpack.exe <command> [options] [paths...]
 | `-v`, `--verbose` | 输出更多检测和诊断细节。 |
 | `--pause` | 命令结束后等待按键退出。 |
 | `--no-pause` | 命令结束后不暂停。 |
-| `--process-mode {background,normal,high}` | 临时覆盖本次工作负载使用的共享 RuntimeHost/native-worker 进程模式；默认 `high`。 |
+| `-m MODE`, `--process-mode MODE` | 临时覆盖本次工作负载使用的共享 RuntimeHost/native-worker 进程模式；默认 `high`。 |
 
 对于 `extract`、`scan`、`inspect`，process-mode override 在命令结束后继续有效，直到共享 Runtime 到达现有 Watch 空闲维护时机（`watch.runtime_cache_cleanup_idle_seconds`），随后恢复 `runtime.process_mode`。
 
@@ -59,19 +71,19 @@ python sunpack.py extract [options] <paths...>
 | 参数 | 说明 |
 | --- | --- |
 | `-p PASSWORD`, `--password PASSWORD` | 提供一个解压密码，可重复传入。 |
-| `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
-| `--ask-pw` | 在终端交互输入密码，空行结束。 |
-| `--no-builtin-pw` | 禁用内置密码表。 |
-| `--no-dir-pw` | 禁用归档同目录的 `sunpack-passwords.txt`。 |
-| `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
-| `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
-| `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
+| `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
+| `-a`, `--ask-pw` | 在终端交互输入密码，空行结束。 |
+| `--no-builtin-pw`, `--no-bpw` | 禁用内置密码表。 |
+| `--no-dir-pw`, `--no-dpw` | 禁用归档同目录的 `sunpack-passwords.txt`。 |
+| `-d`, `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
+| `-r VALUE`, `--recur VALUE` | 覆盖嵌套解压轮数，接受正整数、`*` 或 `?`。 |
+| `-c VALUE`, `--cleanup VALUE` | 覆盖成功后的原归档处理：`d` 删除，`r` 回收站，`k` 保留。 |
 | `-o OUTPUT_DIR`, `--out-dir OUTPUT_DIR` | 指定输出根目录；相对路径按当前命令目录解析。 |
-| `--flatten` | 解压后提升单一顶层目录的内容。 |
-| `--no-flatten` | 保留解压目录结构。 |
-| `--write-manifest` | 把解压进度清单写入输出目录。 |
-| `--allow-partial`, `--ap` | 允许把部分恢复结果作为可接受结果。 |
-| `--direct-file` | 将每个输入路径直接作为归档尝试，跳过目录扫描和自动候选发现。 |
+| `-f`, `--flatten` | 解压后提升单一顶层目录的内容。 |
+| `-F`, `--no-flatten` | 保留解压目录结构。 |
+| `--write-manifest`, `--manifest` | 把解压进度清单写入输出目录。 |
+| `-k`, `--allow-partial`, `--ap` | 允许把部分恢复结果作为可接受结果。 |
+| `--direct-file`, `--direct` | 将每个输入路径直接作为归档尝试，跳过目录扫描和自动候选发现。 |
 
 `--out-dir` 指定后，结果落在“输出根 / 输入路径相对公共根的部分 / 归档名”下；未指定时落在归档旁边。嵌套归档在输出根内生成时，子归档仍使用自身所在位置计算输出。
 
@@ -134,9 +146,9 @@ python sunpack.py inspect [options] <paths...>
 
 | 参数 | 说明 |
 | --- | --- |
-| `--archives-only` | 只显示最终判定为可解压的项目。 |
-| `--analyze` | 为可解压或待确认候选附加格式、片段、损坏标记和候选摘要。 |
-| `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
+| `--archives-only`, `--archives` | 只显示最终判定为可解压的项目。 |
+| `--analyze`, `--analysis` | 为可解压或待确认候选附加格式、片段、损坏标记和候选摘要。 |
+| `-d`, `--deep-detect` | 对检测未解决的候选启用完整嵌入扫描。 |
 
 `-v` 会额外打印有效配置、命中规则、评分细节和事实错误；JSON 输出保留对应结构化字段。
 
@@ -173,15 +185,15 @@ F:\Incoming | .
 | --- | --- | --- |
 | `start` | `--once` | 执行一次监控扫描后退出。 |
 | `start` | `--no-tray` | 持续运行时关闭托盘入口。 |
-| `start` | `--initial-scan` | 启动时处理已有文件。 |
+| `start` | `-i`, `--initial-scan` | 启动时处理已有文件。 |
 | `add PATH...` | `-o/--out-dir DIR` | 添加监控根；只能同时添加一个路径。 |
-| `add PATH...` | `--start` | 添加后启动持续监控。 |
-| `add PATH...` | `--initial-scan` | 添加后对新根执行初始扫描。 |
-| `remove PATH...` | — | 按输入目录移除监控根，并清理该根的同目录密码文件。 |
-| `list` | — | 列出持久化的输入目录。 |
+| `add PATH...` | `-s`, `--start` | 添加后启动持续监控。 |
+| `add PATH...` | `-i`, `--initial-scan` | 添加后对新根执行初始扫描。 |
+| `remove PATH...`, `rm PATH...` | — | 按输入目录移除监控根，并清理该根的同目录密码文件。 |
+| `list`, `ls` | — | 列出持久化的输入目录。 |
 | `reload` | — | 重新读取配置和监控根。 |
 | `stop` | — | 停止持续监控。 |
-| `status` | — | 显示运行状态、待处理数量、错误和根目录。 |
+| `status`, `st` | — | 显示运行状态、待处理数量、错误和根目录。 |
 | `startup enable\|disable\|status` | — | 管理当前用户登录启动项。 |
 
 `start` 会持续运行直到收到停止请求；`start --once` 完成一次当前调度后退出。文件写入、移动或修改会触发活跃周期，文件准备好后按配置的静默策略提交处理。新分卷到达或密码来源变化会重新激活受影响任务。
@@ -202,10 +214,10 @@ python sunpack.py passwords [options]
 | --- | --- |
 | `-j`, `--json` | 以 JSON 输出密码来源汇总。 |
 | `-p PASSWORD`, `--password PASSWORD` | 提供密码，可重复传入。 |
-| `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
-| `--ask-pw` | 在终端交互输入密码。 |
-| `--no-builtin-pw` | 不使用内置密码表。 |
-| `--no-dir-pw` | 该命令没有目标归档，不会读取同目录密码文件；在 `extract` 中用于关闭同目录密码。 |
+| `-P PASSWORD_FILE`, `--pw-file PASSWORD_FILE` | 从文本文件读取密码，每行一个。 |
+| `-a`, `--ask-pw` | 在终端交互输入密码。 |
+| `--no-builtin-pw`, `--no-bpw` | 不使用内置密码表。 |
+| `--no-dir-pw`, `--no-dpw` | 该命令没有目标归档，不会读取同目录密码文件；在 `extract` 中用于关闭同目录密码。 |
 
 `passwords` 没有归档路径，因此输出命令行输入、最近成功密码、剪贴板密码和内置密码的汇总；它不会为某个目录加载 `sunpack-passwords.txt`。归档解压时的候选顺序是“最近成功密码 → 同目录密码 → CLI 参数和密码文件 → 剪贴板 → 内置密码”，重复项会去重，必要时会先尝试空密码。
 

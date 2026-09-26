@@ -53,16 +53,16 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
 
 ### Command overview
 
-| Command     | Description                                                          |
-| ----------- | -------------------------------------------------------------------- |
-| `extract`   | Extract files.                                                       |
-| `watch`     | Monitor directories and extract archives automatically once found.   |
-| `scan`      | Scan a directory for archives; useful for identifying archives.      |
-| `inspect`   | Print detailed detection data; a debugging command with JSON output. |
-| `passwords` | Show the password list that will be attempted in this run.           |
-| `config`    | Show or validate the effective configuration.                        |
-| `doctor`    | Non-destructive check of installation and runtime health.            |
-| `version`   | Print the installed SunPack version.                                 |
+| Command     | Short form | Description                                                          |
+| ----------- | ---------- | -------------------------------------------------------------------- |
+| `extract`   | `x`        | Extract files.                                                       |
+| `watch`     | `w`        | Monitor directories and extract archives automatically once found.   |
+| `scan`      | `s`        | Scan a directory for archives; useful for identifying archives.      |
+| `inspect`   | `i`        | Print detailed detection data; a debugging command with JSON output. |
+| `passwords` | `pw`       | Show the password list that will be attempted in this run.           |
+| `config`    | `cfg`      | Show or validate the effective configuration.                        |
+| `doctor`    | —          | Non-destructive check of installation and runtime health.            |
+| `version`   | `ver`      | Print the installed SunPack version.                                 |
 
 > See [CLI parameter reference](docs/cli_parameters.md) for detailed options.
 

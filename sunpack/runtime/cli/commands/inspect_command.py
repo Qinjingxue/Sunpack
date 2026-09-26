@@ -1,3 +1,4 @@
+from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_common_parser, build_detection_parser, build_process_mode_parser, localize_help_action
 from sunpack.runtime.cli.cli_runtime import (
     build_effective_config,
@@ -24,14 +25,16 @@ ORDER = 30
 def register(subparsers, ctx):
     parser = subparsers.add_parser(
         COMMAND,
+        aliases=COMMAND_ALIASES[COMMAND],
         parents=[build_common_parser(ctx), build_detection_parser(ctx), build_process_mode_parser(ctx)],
         help=ctx.t("cli.inspect.help"),
         usage="sunpack inspect [options] <paths...>",
         formatter_class=CliHelpFormatter,
     )
+    parser.set_defaults(command=COMMAND)
     localize_help_action(parser, ctx)
-    parser.add_argument("--archives-only", action="store_true", help=ctx.t("cli.inspect.archives_only"))
-    parser.add_argument("--analyze", action="store_true", help=ctx.t("cli.inspect.analyze"))
+    parser.add_argument("--archives-only", "--archives", dest="archives_only", action="store_true", help=ctx.t("cli.inspect.archives_only"))
+    parser.add_argument("--analyze", "--analysis", dest="analyze", action="store_true", help=ctx.t("cli.inspect.analyze"))
     parser.add_argument("paths", nargs="+", help=ctx.t("cli.inspect.paths"))
 
 

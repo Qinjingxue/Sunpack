@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+
+from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_TASK_FAILED, EXIT_USAGE
 from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_common_parser, localize_help_action
 from sunpack.runtime.cli.cli_types import CliCommandResult
@@ -20,32 +22,37 @@ def register(subparsers, ctx):
     common = build_common_parser(ctx)
     parser = subparsers.add_parser(
         COMMAND,
+        aliases=COMMAND_ALIASES[COMMAND],
         parents=[common],
         help=ctx.t("cli.watch.help"),
         usage="sunpack watch <add|remove|list|start|stop|reload|status|startup> [options]",
         formatter_class=CliHelpFormatter,
     )
+    parser.set_defaults(command=COMMAND)
     localize_help_action(parser, ctx)
     actions = parser.add_subparsers(dest="watch_action", required=True)
 
     start_parser = actions.add_parser("start", parents=[common], help=ctx.t("cli.watch.start"), formatter_class=CliHelpFormatter)
     start_parser.add_argument("--once", action="store_true", help=ctx.t("cli.watch.once"))
     start_parser.add_argument("--no-tray", action="store_true", help=ctx.t("cli.watch.no_tray"))
-    start_parser.add_argument("--initial-scan", action="store_true", help=ctx.t("cli.watch.initial_scan"))
+    start_parser.add_argument("-i", "--initial-scan", dest="initial_scan", action="store_true", help=ctx.t("cli.watch.initial_scan"))
 
     add_parser = actions.add_parser("add", parents=[common], help=ctx.t("cli.watch.add"), formatter_class=CliHelpFormatter)
     add_parser.add_argument("paths", nargs="+", help=ctx.t("cli.watch.paths"))
     add_parser.add_argument("-o", "--out-dir", dest="output_dir", help=ctx.t("cli.watch.output_dir"))
-    add_parser.add_argument("--start", action="store_true", help=ctx.t("cli.watch.start_after_add"))
-    add_parser.add_argument("--initial-scan", action="store_true", help=ctx.t("cli.watch.initial_scan"))
+    add_parser.add_argument("-s", "--start", dest="start", action="store_true", help=ctx.t("cli.watch.start_after_add"))
+    add_parser.add_argument("-i", "--initial-scan", dest="initial_scan", action="store_true", help=ctx.t("cli.watch.initial_scan"))
 
-    remove_parser = actions.add_parser("remove", parents=[common], help=ctx.t("cli.watch.remove"), formatter_class=CliHelpFormatter)
+    remove_parser = actions.add_parser("remove", aliases=["rm"], parents=[common], help=ctx.t("cli.watch.remove"), formatter_class=CliHelpFormatter)
+    remove_parser.set_defaults(watch_action="remove")
     remove_parser.add_argument("paths", nargs="+", help=ctx.t("cli.watch.paths"))
 
-    actions.add_parser("list", parents=[common], help=ctx.t("cli.watch.list"), formatter_class=CliHelpFormatter)
+    list_parser = actions.add_parser("list", aliases=["ls"], parents=[common], help=ctx.t("cli.watch.list"), formatter_class=CliHelpFormatter)
+    list_parser.set_defaults(watch_action="list")
     actions.add_parser("reload", parents=[common], help=ctx.t("cli.watch.reload"), formatter_class=CliHelpFormatter)
     actions.add_parser("stop", parents=[common], help=ctx.t("cli.watch.stop"), formatter_class=CliHelpFormatter)
-    actions.add_parser("status", parents=[common], help=ctx.t("cli.watch.status"), formatter_class=CliHelpFormatter)
+    status_parser = actions.add_parser("status", aliases=["st"], parents=[common], help=ctx.t("cli.watch.status"), formatter_class=CliHelpFormatter)
+    status_parser.set_defaults(watch_action="status")
 
     startup_parser = actions.add_parser("startup", parents=[common], help=ctx.t("cli.watch.startup"), formatter_class=CliHelpFormatter)
     startup_parser.add_argument("startup_action", choices=["enable", "disable", "status"])
