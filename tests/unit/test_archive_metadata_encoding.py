@@ -248,7 +248,7 @@ def test_unicode_native_archive_formats_do_not_receive_zip_codepage_override():
         assert result.warnings == []
 
 
-def test_task_metadata_cache_survives_scanner_instance_change(tmp_path):
+def test_task_metadata_cache_survives_scanner_instance_change(tmp_path, monkeypatch):
     archive = tmp_path / "cached.zip"
     _write_stored_zip(archive, b"plain.txt", b"payload")
     descriptor = ArchiveInputDescriptor.from_parts(
@@ -258,6 +258,14 @@ def test_task_metadata_cache_survives_scanner_instance_change(tmp_path):
     task = SimpleNamespace(runtime={}, archive_input=lambda: descriptor)
 
     first = ArchiveMetadataScanner().scan_for_task(task, str(archive), format_hint="zip")
+
+    def unexpected_stat(*_args, **_kwargs):
+        pytest.fail("metadata cache hit re-statted archive parts")
+
+    monkeypatch.setattr(
+        "sunpack.pipeline.extraction.internal.sevenzip.metadata.os.stat",
+        unexpected_stat,
+    )
     second_scanner = ArchiveMetadataScanner()
     second_scanner._scan_descriptor = lambda *_args, **_kwargs: pytest.fail(
         "metadata was rescanned"
