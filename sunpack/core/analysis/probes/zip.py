@@ -14,9 +14,6 @@ from sunpack.core.support.global_cache_manager import cached_value, file_identit
 
 DEFAULT_MAX_CD_ENTRIES_TO_WALK = 16
 DEFAULT_MAX_DEEP_ENTRIES = 128
-_ZIP_METHODS = frozenset({0, 1, 6, 8, 9, 12, 14, 95, 96, 98, 99})
-
-
 @dataclass(frozen=True, slots=True)
 class ZipEocdProbeOptions:
     max_cd_entries_to_walk: int = DEFAULT_MAX_CD_ENTRIES_TO_WALK
@@ -69,83 +66,15 @@ def _zip_observation(raw: dict[str, Any], capability: str, *, start_offset: int 
 
 def probe_zip_local_header_view(view, offset: int = 0) -> FormatObservation:
     offset = max(0, int(offset))
-    header = view.read_at(offset, 30)
-    raw: dict[str, Any] = {
-        "offset": offset,
-        "magic_matched": False,
-        "plausible": False,
-        "error": "",
-        "version_needed": 0,
-        "compression_method": 0,
-        "filename_len": 0,
-        "extra_len": 0,
-    }
-    if len(header) < 30:
-        raw.update({"magic_matched": header.startswith(b"PK"), "error": "short_header"})
-        return _zip_observation(raw, "zip_local_header", start_offset=offset)
-    if header[:4] != b"PK\x03\x04":
-        raw.update({
-            "magic_matched": header[:4] in {b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08"},
-            "error": "bad_signature",
-        })
-        return _zip_observation(raw, "zip_local_header", start_offset=offset)
-    version_needed = int.from_bytes(header[4:6], "little")
-    method = int.from_bytes(header[8:10], "little")
-    filename_len = int.from_bytes(header[26:28], "little")
-    extra_len = int.from_bytes(header[28:30], "little")
-    raw.update({
-        "magic_matched": True,
-        "version_needed": version_needed,
-        "compression_method": method,
-        "filename_len": filename_len,
-        "extra_len": extra_len,
-    })
-    if version_needed > 63:
-        raw["error"] = "unsupported_version"
-    elif method not in _ZIP_METHODS:
-        raw["error"] = "unknown_compression_method"
-    elif filename_len == 0 or filename_len > 4096:
-        raw["error"] = "invalid_filename_length"
-    elif offset + 30 + filename_len + extra_len > int(view.size):
-        raw["error"] = "header_exceeds_file_size"
-    else:
-        raw["plausible"] = True
+    raw = dict(view.probe_zip_local_header(offset=offset) or {})
     return _zip_observation(raw, "zip_local_header", start_offset=offset)
 
 
 def find_zip_eocd(view) -> tuple[int | None, dict[str, Any]]:
-    read_size = min(int(view.size), 22 + 65535)
-    tail = view.read_tail(read_size)
-    base = int(view.size) - len(tail)
-    cursor = len(tail)
-    fallback = None
-    while True:
-        index = tail.rfind(b"PK\x05\x06", 0, cursor)
-        if index < 0:
-            break
-        if index + 22 <= len(tail):
-            record = tail[index:index + 22]
-            comment_length = int.from_bytes(record[20:22], "little")
-            available = len(tail) - index - 22
-            candidate = {
-                "eocd_candidate_found": True,
-                "eocd_candidate_offset": base + index,
-                "eocd_candidate_comment_length": comment_length,
-                "eocd_candidate_comment_available_delta": available - comment_length,
-                "eocd_candidate_declared_entry_count_present": int.from_bytes(record[10:12], "little") > 0,
-                "eocd_candidate_declared_cd_offset_present": int.from_bytes(record[16:20], "little") > 0,
-                "eocd_candidate_total_entries": int.from_bytes(record[10:12], "little"),
-                "eocd_candidate_cd_offset": int.from_bytes(record[16:20], "little"),
-                "eocd_candidate_cd_size": int.from_bytes(record[12:16], "little"),
-            }
-            fallback = fallback or candidate
-            if available == comment_length:
-                return base + index, candidate
-        cursor = index
-    return (fallback["eocd_candidate_offset"], fallback) if fallback else (
-        None,
-        {"eocd_candidate_found": False},
-    )
+    candidate = dict(view.locate_zip_eocd() or {})
+    if not candidate.get("eocd_candidate_found"):
+        return None, candidate
+    return int(candidate.get("eocd_candidate_offset") or 0), candidate
 
 
 def probe_zip_eocd_view(view, options: ZipEocdProbeOptions | None = None) -> FormatObservation:
@@ -153,24 +82,12 @@ def probe_zip_eocd_view(view, options: ZipEocdProbeOptions | None = None) -> For
     if options.eocd_offset is None:
         eocd_offset, candidate = find_zip_eocd(view)
     else:
-        eocd_offset = int(options.eocd_offset)
-        record = view.read_at(eocd_offset, 22)
-        if len(record) >= 22 and record[:4] == b"PK\x05\x06":
-            comment_length = int.from_bytes(record[20:22], "little")
-            candidate = {
-                "eocd_candidate_found": True,
-                "eocd_candidate_offset": eocd_offset,
-                "eocd_candidate_comment_length": comment_length,
-                "eocd_candidate_comment_available_delta": int(view.size) - eocd_offset - 22 - comment_length,
-                "eocd_candidate_declared_entry_count_present": int.from_bytes(record[10:12], "little") > 0,
-                "eocd_candidate_declared_cd_offset_present": int.from_bytes(record[16:20], "little") > 0,
-                "eocd_candidate_total_entries": int.from_bytes(record[10:12], "little"),
-                "eocd_candidate_cd_offset": int.from_bytes(record[16:20], "little"),
-                "eocd_candidate_cd_size": int.from_bytes(record[12:16], "little"),
-            }
-        else:
-            candidate = {"eocd_candidate_found": False}
-            eocd_offset = None
+        candidate = dict(view.locate_zip_eocd(eocd_offset=int(options.eocd_offset)) or {})
+        eocd_offset = (
+            int(candidate.get("eocd_candidate_offset") or 0)
+            if candidate.get("eocd_candidate_found")
+            else None
+        )
     if eocd_offset is None:
         return _zip_observation(
             {"plausible": False, "magic_matched": False, "error": "eocd_not_found", **candidate},
