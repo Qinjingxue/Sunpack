@@ -11,6 +11,8 @@ const ZSTD_MAGIC: u32 = 0xfd2fb528;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum IntegrityStatus {
+    Verified,
+    Failed,
     Deferred,
     NotPresent,
 }
@@ -18,6 +20,8 @@ pub(crate) enum IntegrityStatus {
 impl IntegrityStatus {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
+            Self::Verified => "verified",
+            Self::Failed => "failed",
             Self::Deferred => "deferred",
             Self::NotPresent => "not_present",
         }
@@ -377,8 +381,138 @@ const DIST_EXTRA: [u8; 30] = [
     13,
 ];
 
-fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(u64, usize)> {
-    let mut output_size = 0u64;
+const DEFLATE_WINDOW_SIZE: usize = 32 * 1024;
+
+struct DeflateOutput {
+    decoded_size: u64,
+    verify_limit: Option<u64>,
+    integrity_complete: bool,
+    hasher: Hasher,
+    pending: Vec<u8>,
+    window: Vec<u8>,
+    window_pos: usize,
+}
+
+impl DeflateOutput {
+    fn counting() -> Self {
+        Self {
+            decoded_size: 0,
+            verify_limit: None,
+            integrity_complete: false,
+            hasher: Hasher::new(),
+            pending: Vec::new(),
+            window: Vec::new(),
+            window_pos: 0,
+        }
+    }
+
+    fn verifying(limit: u64) -> Self {
+        Self {
+            decoded_size: 0,
+            verify_limit: Some(limit),
+            integrity_complete: true,
+            hasher: Hasher::new(),
+            pending: Vec::with_capacity(BUFFER_SIZE),
+            window: vec![0; DEFLATE_WINDOW_SIZE],
+            window_pos: 0,
+        }
+    }
+
+    fn is_verifying(&self) -> bool {
+        self.verify_limit.is_some() && self.integrity_complete
+    }
+
+    fn disable_integrity(&mut self) {
+        self.integrity_complete = false;
+        self.pending.clear();
+        self.window.clear();
+        self.window_pos = 0;
+    }
+
+    fn add_count(&mut self, count: u64) -> ValidationResult<()> {
+        self.decoded_size = self
+            .decoded_size
+            .checked_add(count)
+            .ok_or(ValidationError::Invalid("decoded_size_overflow"))?;
+        Ok(())
+    }
+
+    fn flush_pending(&mut self) {
+        if !self.pending.is_empty() {
+            self.hasher.update(&self.pending);
+            self.pending.clear();
+        }
+    }
+
+    fn write_byte(&mut self, byte: u8) -> ValidationResult<()> {
+        if self.is_verifying() {
+            let limit = self.verify_limit.unwrap();
+            if self.decoded_size >= limit {
+                self.disable_integrity();
+                return self.add_count(1);
+            }
+            self.window[self.window_pos] = byte;
+            self.window_pos = (self.window_pos + 1) % DEFLATE_WINDOW_SIZE;
+            self.pending.push(byte);
+            if self.pending.len() == BUFFER_SIZE {
+                self.flush_pending();
+            }
+        }
+        self.add_count(1)
+    }
+
+    fn write_bytes(&mut self, bytes: &[u8]) -> ValidationResult<()> {
+        if !self.is_verifying() {
+            return self.add_count(bytes.len() as u64);
+        }
+        for (index, &byte) in bytes.iter().enumerate() {
+            self.write_byte(byte)?;
+            if !self.is_verifying() {
+                return self.add_count((bytes.len() - index - 1) as u64);
+            }
+        }
+        Ok(())
+    }
+
+    fn repeat(&mut self, distance: u64, length: u64) -> ValidationResult<()> {
+        if distance == 0 || distance > self.decoded_size.min(DEFLATE_WINDOW_SIZE as u64) {
+            return invalid("deflate_distance_out_of_range");
+        }
+        if !self.is_verifying() {
+            return self.add_count(length);
+        }
+        let mut remaining = length;
+        while remaining > 0 {
+            if !self.is_verifying() {
+                return self.add_count(remaining);
+            }
+            let distance = distance as usize;
+            let source =
+                (self.window_pos + DEFLATE_WINDOW_SIZE - distance) % DEFLATE_WINDOW_SIZE;
+            let byte = self.window[source];
+            self.write_byte(byte)?;
+            remaining -= 1;
+        }
+        Ok(())
+    }
+
+    fn decoded_size(&self) -> u64 {
+        self.decoded_size
+    }
+
+    fn finish_checksum(mut self) -> Option<u32> {
+        if !self.is_verifying() {
+            return None;
+        }
+        self.flush_pending();
+        Some(self.hasher.finalize())
+    }
+}
+
+fn parse_deflate(
+    bits: &mut LsbBits<'_, '_>,
+    output: &mut DeflateOutput,
+) -> ValidationResult<usize> {
     let mut block_count = 0usize;
     loop {
         block_count = block_count
@@ -393,10 +527,13 @@ fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(u64, usize)> {
             if length != !complement {
                 return invalid("deflate_stored_length_mismatch");
             }
-            bits.cursor.skip(u64::from(length))?;
-            output_size = output_size
-                .checked_add(u64::from(length))
-                .ok_or(ValidationError::Invalid("decoded_size_overflow"))?;
+            if output.is_verifying() {
+                let stored = bits.cursor.read_exact(usize::from(length))?;
+                output.write_bytes(&stored)?;
+            } else {
+                bits.cursor.skip(u64::from(length))?;
+                output.add_count(u64::from(length))?;
+            }
         } else if block_type == 1 || block_type == 2 {
             let (literal_tree, distance_tree) = if block_type == 1 {
                 fixed_deflate_trees()?
@@ -406,11 +543,7 @@ fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(u64, usize)> {
             loop {
                 let symbol = literal_tree.decode_lsb(bits)?;
                 match symbol {
-                    0..=255 => {
-                        output_size = output_size
-                            .checked_add(1)
-                            .ok_or(ValidationError::Invalid("decoded_size_overflow"))?;
-                    }
+                    0..=255 => output.write_byte(symbol as u8)?,
                     256 => break,
                     257..=285 => {
                         let index = usize::from(symbol - 257);
@@ -422,12 +555,7 @@ fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(u64, usize)> {
                         }
                         let distance = u64::from(DIST_BASE[distance_symbol])
                             + u64::from(bits.read(DIST_EXTRA[distance_symbol])?);
-                        if distance == 0 || distance > output_size.min(32 * 1024) {
-                            return invalid("deflate_distance_out_of_range");
-                        }
-                        output_size = output_size
-                            .checked_add(length)
-                            .ok_or(ValidationError::Invalid("decoded_size_overflow"))?;
+                        output.repeat(distance, length)?;
                     }
                     _ => return invalid("invalid_deflate_literal_symbol"),
                 }
@@ -437,7 +565,7 @@ fn parse_deflate(bits: &mut LsbBits<'_, '_>) -> ValidationResult<(u64, usize)> {
         }
         if final_block {
             bits.align_byte();
-            return Ok((output_size, block_count));
+            return Ok(block_count);
         }
     }
 }
@@ -480,26 +608,66 @@ fn gzip_header(cursor: &mut ByteCursor<'_>) -> ValidationResult<()> {
     Ok(())
 }
 
-pub(crate) fn validate_gzip_structure(
+#[derive(Clone, Debug)]
+pub(crate) struct GzipAnalysis {
+    pub(crate) structure: StructureValidation,
+    pub(crate) first_member_end: u64,
+    pub(crate) first_member_compressed_bytes: u64,
+    pub(crate) first_member_block_count: usize,
+    pub(crate) first_member_decoded_size: u64,
+    pub(crate) first_member_stored_crc32: u32,
+    pub(crate) first_member_computed_crc32: Option<u32>,
+    pub(crate) first_member_stored_size: u32,
+}
+
+fn walk_gzip_structure(
     reader: &ManagedReader,
     offset: u64,
     limit: u64,
-) -> ValidationResult<StructureValidation> {
+    integrity_limit: Option<u64>,
+) -> ValidationResult<GzipAnalysis> {
     let mut cursor = ByteCursor::new(reader, offset, limit);
     let mut members = 0usize;
     let mut blocks = 0usize;
     let mut decoded_size = 0u64;
+    let mut remaining_integrity = integrity_limit;
+    let mut integrity_failed = false;
+    let mut integrity_complete = integrity_limit.is_some();
+    let mut first_member = None;
+
     loop {
         gzip_header(&mut cursor)?;
-        let (member_size, member_blocks) = {
-            let mut bits = LsbBits::new(&mut cursor);
-            parse_deflate(&mut bits)?
+        let deflate_start = cursor.position();
+        let mut output = match remaining_integrity {
+            Some(remaining) => DeflateOutput::verifying(remaining),
+            None => DeflateOutput::counting(),
         };
+        let member_blocks = {
+            let mut bits = LsbBits::new(&mut cursor);
+            parse_deflate(&mut bits, &mut output)?
+        };
+        let deflate_end = cursor.position();
+        let member_size = output.decoded_size();
+        let computed_crc = output.finish_checksum();
         let trailer = cursor.read_exact(8)?;
+        let stored_crc = u32::from_le_bytes(trailer[0..4].try_into().unwrap());
         let stored_size = u32::from_le_bytes(trailer[4..8].try_into().unwrap());
         if stored_size != member_size as u32 {
             return invalid("gzip_isize_mismatch");
         }
+
+        if let Some(computed) = computed_crc {
+            if computed != stored_crc {
+                integrity_failed = true;
+            }
+            if let Some(remaining) = remaining_integrity.as_mut() {
+                *remaining = remaining.saturating_sub(member_size);
+            }
+        } else if integrity_limit.is_some() {
+            integrity_complete = false;
+            remaining_integrity = Some(0);
+        }
+
         decoded_size = decoded_size
             .checked_add(member_size)
             .ok_or(ValidationError::Invalid("decoded_size_overflow"))?;
@@ -507,6 +675,19 @@ pub(crate) fn validate_gzip_structure(
             .checked_add(member_blocks)
             .ok_or(ValidationError::Invalid("deflate_block_count_overflow"))?;
         members += 1;
+
+        if first_member.is_none() {
+            first_member = Some((
+                cursor.position(),
+                deflate_end.saturating_sub(deflate_start),
+                member_blocks,
+                member_size,
+                stored_crc,
+                computed_crc,
+                stored_size,
+            ));
+        }
+
         if cursor.position() + 3 > limit {
             break;
         }
@@ -515,14 +696,59 @@ pub(crate) fn validate_gzip_structure(
             break;
         }
     }
-    Ok(StructureValidation {
-        end_offset: cursor.position(),
-        stream_count: members,
-        block_count: blocks,
-        decoded_size: Some(decoded_size),
-        integrity: IntegrityStatus::Deferred,
-        checksum_present: true,
+
+    let (
+        first_member_end,
+        first_member_compressed_bytes,
+        first_member_block_count,
+        first_member_decoded_size,
+        first_member_stored_crc32,
+        first_member_computed_crc32,
+        first_member_stored_size,
+    ) = first_member.ok_or(ValidationError::Invalid("gzip_member_missing"))?;
+
+    let integrity = if integrity_failed {
+        IntegrityStatus::Failed
+    } else if integrity_complete {
+        IntegrityStatus::Verified
+    } else {
+        IntegrityStatus::Deferred
+    };
+
+    Ok(GzipAnalysis {
+        structure: StructureValidation {
+            end_offset: cursor.position(),
+            stream_count: members,
+            block_count: blocks,
+            decoded_size: Some(decoded_size),
+            integrity,
+            checksum_present: true,
+        },
+        first_member_end,
+        first_member_compressed_bytes,
+        first_member_block_count,
+        first_member_decoded_size,
+        first_member_stored_crc32,
+        first_member_computed_crc32,
+        first_member_stored_size,
     })
+}
+
+pub(crate) fn analyze_gzip_structure(
+    reader: &ManagedReader,
+    offset: u64,
+    limit: u64,
+    integrity_limit: u64,
+) -> ValidationResult<GzipAnalysis> {
+    walk_gzip_structure(reader, offset, limit, Some(integrity_limit))
+}
+
+pub(crate) fn validate_gzip_structure(
+    reader: &ManagedReader,
+    offset: u64,
+    limit: u64,
+) -> ValidationResult<StructureValidation> {
+    Ok(walk_gzip_structure(reader, offset, limit, None)?.structure)
 }
 
 fn next_bzip_symbol(
@@ -1262,6 +1488,78 @@ mod tests {
         assert_eq!(result.end_offset, data.len() as u64);
         assert_eq!(result.stream_count, 2);
         assert_eq!(result.decoded_size, Some(4 * 1024 * 1024));
+    }
+
+    fn gzip_member(payload: &[u8]) -> Vec<u8> {
+        let mut data = Vec::new();
+        let mut encoder =
+            flate2::write::GzEncoder::new(&mut data, flate2::Compression::default());
+        encoder.write_all(payload).unwrap();
+        encoder.finish().unwrap();
+        data
+    }
+
+    #[test]
+    fn gzip_integrity_walk_verifies_many_small_members_in_one_pass() {
+        let member = gzip_member(b"small-member");
+        let mut data = Vec::new();
+        for _ in 0..128 {
+            data.extend_from_slice(&member);
+        }
+        let source = reader(data.clone());
+        let result =
+            analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
+        assert_eq!(result.structure.end_offset, data.len() as u64);
+        assert_eq!(result.structure.stream_count, 128);
+        assert_eq!(result.structure.integrity, IntegrityStatus::Verified);
+        assert!(result.first_member_computed_crc32.is_some());
+    }
+
+    #[test]
+    fn gzip_integrity_walk_bounds_high_ratio_output_without_losing_boundary() {
+        let payload = vec![b'Z'; 16 * 1024 * 1024];
+        let data = gzip_member(&payload);
+        let source = reader(data.clone());
+        let result =
+            analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
+        assert_eq!(result.structure.end_offset, data.len() as u64);
+        assert_eq!(result.structure.decoded_size, Some(payload.len() as u64));
+        assert_eq!(result.structure.integrity, IntegrityStatus::Deferred);
+        assert!(result.first_member_computed_crc32.is_none());
+    }
+
+    #[test]
+    fn gzip_integrity_walk_checks_later_member_crc() {
+        let first = gzip_member(b"first");
+        let second = gzip_member(b"second");
+        let mut data = first;
+        data.extend_from_slice(&second);
+        let crc_offset = data.len() - 8;
+        data[crc_offset] ^= 0x80;
+
+        let source = reader(data.clone());
+        let result =
+            analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
+        assert_eq!(result.structure.end_offset, data.len() as u64);
+        assert_eq!(result.structure.stream_count, 2);
+        assert_eq!(result.structure.integrity, IntegrityStatus::Failed);
+    }
+
+    #[test]
+    fn gzip_integrity_walk_stops_before_multi_member_carrier_tail() {
+        let first = gzip_member(b"first");
+        let second = gzip_member(b"second");
+        let mut data = first;
+        data.extend_from_slice(&second);
+        let archive_end = data.len();
+        data.extend_from_slice(b"carrier-tail");
+
+        let source = reader(data.clone());
+        let result =
+            analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
+        assert_eq!(result.structure.end_offset, archive_end as u64);
+        assert_eq!(result.structure.stream_count, 2);
+        assert_eq!(result.structure.integrity, IntegrityStatus::Verified);
     }
 
     #[test]
