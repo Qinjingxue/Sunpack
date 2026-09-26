@@ -913,19 +913,6 @@ int run_request(
     for (const auto& part : json_string_array_field(request, "part_paths")) {
         part_paths.push_back(utf8_to_wide(part));
     }
-    std::vector<std::wstring> decoded_names;
-    for (const auto& name : json_string_array_field(request, "decoded_names")) {
-        decoded_names.push_back(utf8_to_wide(name));
-    }
-    if (!codepage.empty() && decoded_names.empty()) {
-        print_json_line(
-            "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
-            "\",\"status\":\"error\",\"category\":\"invalid_request\","
-            "\"failure_stage\":\"filename_encoding\",\"failure_kind\":\"decoded_names_required\","
-            "\"message\":\"decoded_names is required when codepage is set\"}");
-        return 2;
-    }
-
     if (archive_path.empty() || (!dry_run && output_dir.empty())) {
         print_json_line(
             "{\"type\":\"result\",\"job_id\":\"" + json_escape(job_id) +
@@ -994,8 +981,8 @@ int run_request(
     }
     auto extract_with_password = [&](const std::wstring& selected_password) {
         return archive_input.ranges.empty()
-            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
-            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, decoded_names, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
+            ? extract_archive_with_parts(archive_input.archive_path, archive_input.part_paths, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, archive_input.canonical_names, archive_input.open_mode == L"native_volumes", shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token)
+            : extract_archive_with_ranges(archive_input.archive_path, archive_input.ranges, archive_input.format_hint, selected_password, output_dir, codepage, progress, dry_run, shared_writer, static_cast<std::size_t>(job_buffer_budget), cancel_token);
     };
 
     ExtractArchiveResult result;
