@@ -17,7 +17,7 @@ def test_output_scan_policy_schedules_disguised_archive_for_full_scan(tmp_path):
     policy = OutputScanPolicy(_config())
 
     assert policy.should_scan_output_dir(str(tmp_path))
-    assert policy.scan_roots_from_outputs([str(tmp_path)]) == [str(tmp_path.resolve())]
+    assert policy.prepare_scan([str(tmp_path)]).roots == (str(tmp_path.resolve()),)
 
 
 def test_output_scan_policy_finds_nested_archive_when_initial_scan_is_current_dir_only(tmp_path):
@@ -31,7 +31,7 @@ def test_output_scan_policy_finds_nested_archive_when_initial_scan_is_current_di
     policy = OutputScanPolicy(config)
 
     assert policy.should_scan_output_dir(str(tmp_path))
-    assert policy.scan_roots_from_outputs([str(tmp_path)]) == [str(tmp_path.resolve())]
+    assert policy.prepare_scan([str(tmp_path)]).roots == (str(tmp_path.resolve()),)
 
 
 def test_output_scan_policy_projects_normal_archive_as_one_logical_root(tmp_path):
@@ -105,7 +105,7 @@ def test_output_scan_policy_scans_projected_embedded_roots_with_their_inventorie
     inventory_two = collect_output_inventory(str(segment_two))
     policy = OutputScanPolicy(_config())
 
-    roots = policy.scan_roots_from_outputs(
+    work = policy.prepare_scan(
         [str(carrier_dir)],
         inventories={
             str(segment_one.resolve()).lower(): inventory_one,
@@ -113,11 +113,10 @@ def test_output_scan_policy_scans_projected_embedded_roots_with_their_inventorie
         },
         logical_roots=[str(segment_one), str(segment_two)],
     )
-
+    roots = list(work.roots)
     assert roots == [str(segment_one.resolve()), str(segment_two.resolve())]
-    session = policy.take_scan_session(roots)
-    assert session is not None
-    candidates = build_candidates_for_targets(roots, session=session, config=_config())
+    assert work.session is not None
+    candidates = build_candidates_for_targets(roots, session=work.session, config=_config())
     assert {candidate.entry_path for candidate in candidates} == {str(first.resolve()), str(second.resolve())}
 
 
@@ -134,16 +133,15 @@ def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch):
         lambda _self: (_ for _ in ()).throw(AssertionError("directory must not be rescanned")),
     )
     policy = OutputScanPolicy(_config())
-    roots = policy.scan_roots_from_outputs(
+    work = policy.prepare_scan(
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory.to_dict()},
     )
-
+    roots = list(work.roots)
     assert roots == [str(tmp_path.resolve())]
-    session = policy.take_scan_session(roots)
-    assert session is not None
-    assert session.include_raw_snapshots is True
-    candidates = build_candidates_for_targets(roots, session=session, config=_config())
+    assert work.session is not None
+    assert work.session.include_raw_snapshots is True
+    candidates = build_candidates_for_targets(roots, session=work.session, config=_config())
     assert [candidate.entry_path for candidate in candidates] == [str(nested.resolve())]
 
 
@@ -152,11 +150,12 @@ def test_output_scan_policy_inventory_batch_primes_file_heads(tmp_path, monkeypa
     archive.write_bytes(b"PK\x03\x04" + b"x" * (1024 * 1024))
     inventory = collect_output_inventory(str(tmp_path))
     policy = OutputScanPolicy(_config())
-    roots = policy.scan_roots_from_outputs(
+    work = policy.prepare_scan(
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory.to_dict()},
     )
-    session = policy.take_scan_session(roots)
+    roots = list(work.roots)
+    session = work.session
     assert session is not None
 
     monkeypatch.setattr(
@@ -209,11 +208,13 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
     )
 
     policy = OutputScanPolicy(_config())
-    roots = policy.scan_roots_from_outputs(
+    work = policy.prepare_scan(
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory},
     )
-    session = policy.take_scan_session(roots)
+    roots = list(work.roots)
+    session = work.session
+    assert session is not None
     facts = session.file_head_facts_for_paths([str(archive)], magic_size=16)
 
     row = facts[next(iter(facts))]
@@ -258,11 +259,13 @@ def test_worker_inventory_fused_snapshot_preserves_raw_entries_and_rejects_escap
     }])
     policy = OutputScanPolicy(config)
 
-    roots = policy.scan_roots_from_outputs(
+    work = policy.prepare_scan(
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory},
     )
-    session = policy.take_scan_session(roots)
+    roots = list(work.roots)
+    session = work.session
+    assert session is not None
     snapshot = session.snapshot_for_directory(str(tmp_path))
     filtered_paths = set(snapshot.native_snapshot.materialize_columns()[0])
     raw_paths = set(snapshot.raw_native_snapshot.materialize_columns()[0])
@@ -312,11 +315,13 @@ def test_worker_inventory_fused_snapshot_applies_mtime_after_directory_projectio
     }
     policy = OutputScanPolicy(config)
 
-    roots = policy.scan_roots_from_outputs(
+    work = policy.prepare_scan(
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory},
     )
-    snapshot = policy.take_scan_session(roots).snapshot_for_directory(str(tmp_path))
+    roots = list(work.roots)
+    assert work.session is not None
+    snapshot = work.session.snapshot_for_directory(str(tmp_path))
     paths, is_dirs, _sizes, _mtimes = snapshot.native_snapshot.materialize_columns()
     filtered = dict(zip(paths, is_dirs))
     raw_paths = set(snapshot.raw_native_snapshot.materialize_columns()[0])
