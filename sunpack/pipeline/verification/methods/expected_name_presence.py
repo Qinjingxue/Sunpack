@@ -61,7 +61,7 @@ class ExpectedNamePresenceMethod:
             missing = []
         else:
             detail_limit = (
-                min(len(expected_names), max(1, int(config.get("detail_page_size", 128) or 128)))
+                min(len(expected_names), 128)
                 if emit_observations
                 else 0
             )
