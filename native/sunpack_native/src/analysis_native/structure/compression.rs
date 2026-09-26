@@ -1,7 +1,7 @@
 use std::io::Cursor;
 use crate::scan::compression_stream::{
-    validate_bzip2_structure, validate_gzip_structure, validate_xz_structure_exact,
-    validate_zstd_structure, StructureValidation,
+    analyze_gzip_structure, validate_bzip2_structure, validate_gzip_structure,
+    validate_xz_structure_exact, validate_zstd_structure, StructureValidation,
 };
 
 const EAGER_STREAM_INTEGRITY_MAX_BYTES: u64 = 4 * 1024 * 1024;
@@ -703,7 +703,7 @@ fn inspect_gzip(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
         "member.header.magic",
         hex_bytes(data.get(0..2).unwrap_or(&[])),
     )?;
-    let (payload_start, flags) = match parse_gzip_header(&data, 0) {
+    let (_payload_start, flags) = match parse_gzip_header(&data, 0) {
         Ok(value) => value,
         Err(error) => {
             d.set_item("error", error)?;
@@ -762,78 +762,100 @@ fn inspect_gzip(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
         d.set_item("member.header.crc16", "absent")?;
     }
 
-    let inflater = flate2::read::DeflateDecoder::new(Cursor::new(&data[payload_start..]));
-    let mut limited_inflater = inflater.take(STREAM_STRUCTURE_DECODE_MAX_BYTES + 1);
-    let mut decoded = Vec::new();
-    let status = limited_inflater.read_to_end(&mut decoded);
-    let inflater = limited_inflater.into_inner();
-    let decode_limited = decoded.len() as u64 > STREAM_STRUCTURE_DECODE_MAX_BYTES;
-    let deflate_len = inflater.total_in() as usize;
-    let boundary = payload_start.saturating_add(deflate_len).saturating_add(8);
-    let stream_end = status.is_ok() && !decode_limited && boundary <= data.len();
+    // Move the bounded compressed input into the canonical reader so the structural
+    // walk and integrity observer share one byte source without cloning the file.
+    let reader = ManagedReader::from_bytes(data, crate::io::reader::ReaderConfig::default());
+    let analysis = match analyze_gzip_structure(
+        &reader,
+        0,
+        file_size,
+        STREAM_STRUCTURE_DECODE_MAX_BYTES,
+    ) {
+        Ok(value) => value,
+        Err(error) => {
+            let code = error.code();
+            if !damage_flags.contains(&code) {
+                damage_flags.push(code);
+            }
+            d.set_item("structure_status", "invalid")?;
+            d.set_item("structure_validation_complete", false)?;
+            d.set_item("boundary_exact", false)?;
+            d.set_item("integrity_status", "failed")?;
+            d.set_item("integrity_validation_complete", true)?;
+            d.set_item("plausible", false)?;
+            d.set_item("confidence", "none")?;
+            d.set_item("error", code)?;
+            d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;
+            d.set_item("file_size", file_size)?;
+            finish_fields(&d, GZIP_FIELDS)?;
+            return Ok(d.unbind());
+        }
+    };
+    let structure = &analysis.structure;
+    let integrity = structure.integrity.as_str();
+    if integrity == "failed" && !damage_flags.contains(&"gzip_footer_bad") {
+        damage_flags.push("gzip_footer_bad");
+    }
+
     d.set_item(
         "member.deflate.blocks",
-        format!("compressed_bytes={deflate_len};decoder_status={status:?}"),
+        format!(
+            "compressed_bytes={};block_count={};decoder_status=Ok(())",
+            analysis.first_member_compressed_bytes, analysis.first_member_block_count
+        ),
     )?;
-    d.set_item("member.deflate.final_block", stream_end)?;
-    d.set_item("member.decoded_content", decoded.len())?;
-    if stream_end && boundary <= data.len() && boundary >= 8 {
-        let trailer = boundary - 8;
-        let stored_crc = u32_le(&data, trailer);
-        let stored_size = u32_le(&data, trailer + 4);
-        let footer_ok = stored_crc == crc32(&decoded) && stored_size == decoded.len() as u32;
+    d.set_item("member.deflate.final_block", true)?;
+    d.set_item("member.decoded_content", analysis.first_member_decoded_size)?;
+    if let Some(computed) = analysis.first_member_computed_crc32 {
         d.set_item(
             "member.trailer.crc32",
             format!(
-                "stored={stored_crc};computed={};ok={}",
-                crc32(&decoded),
-                stored_crc == crc32(&decoded)
+                "stored={};computed={computed};ok={}",
+                analysis.first_member_stored_crc32,
+                analysis.first_member_stored_crc32 == computed
             ),
         )?;
-        d.set_item(
-            "member.trailer.isize",
-            format!(
-                "stored={stored_size};decoded_mod={};ok={}",
-                decoded.len() as u32,
-                stored_size == decoded.len() as u32
-            ),
-        )?;
-        if !footer_ok {
-            damage_flags.push("gzip_footer_bad");
-        }
-    }
-    d.set_item("member.boundary", boundary.min(data.len()))?;
-    let next_member =
-        stream_end && boundary + 2 <= data.len() && &data[boundary..boundary + 2] == b"\x1f\x8b";
-    d.set_item("member.next_member", next_member)?;
-    let trailing = if decode_limited || next_member {
-        0
     } else {
-        data.len().saturating_sub(boundary)
-    };
+        d.set_item(
+            "member.trailer.crc32",
+            format!(
+                "stored={};computed=deferred;ok=deferred",
+                analysis.first_member_stored_crc32
+            ),
+        )?;
+    }
+    d.set_item(
+        "member.trailer.isize",
+        format!(
+            "stored={};decoded_mod={};ok=true",
+            analysis.first_member_stored_size,
+            analysis.first_member_decoded_size as u32
+        ),
+    )?;
+    d.set_item("member.boundary", analysis.first_member_end)?;
+    d.set_item("member.next_member", structure.stream_count > 1)?;
+
+    let trailing = file_size.saturating_sub(structure.end_offset);
     d.set_item("archive.trailing_data", trailing)?;
-    if trailing > 0 {
+    if trailing > 0 && !damage_flags.contains(&"trailing_junk") {
         damage_flags.push("trailing_junk");
     }
-    d.set_item("trailing_data_verified", stream_end)?;
+    d.set_item("trailing_data_verified", true)?;
+    d.set_item("plausible", true)?;
+    d.set_item("confidence", "strong")?;
+    d.set_item("validation_scope", "complete_structure")?;
+    d.set_item("validation_cost", "compressed_token_linear+bounded_integrity")?;
+    d.set_item("structure_status", "complete")?;
+    d.set_item("structure_validation_complete", true)?;
+    d.set_item("boundary_exact", true)?;
+    d.set_item("segment_end", structure.end_offset)?;
+    d.set_item("integrity_status", integrity)?;
     d.set_item(
-        "plausible",
-        stream_end || (decode_limited && data.starts_with(b"\x1f\x8b\x08")),
+        "integrity_validation_complete",
+        integrity == "verified" || integrity == "failed",
     )?;
-    d.set_item("confidence", if stream_end { "strong" } else { "medium" })?;
-    if !stream_end && !decode_limited {
-        d.set_item("error", "gzip_deflate_or_trailer_incomplete")?;
-        damage_flags.push("probably_truncated");
-    }
-    apply_structural_contract(
-        &d,
-        path,
-        file_size,
-        file_size,
-        StructuralStreamKind::Gzip,
-        stream_end && !damage_flags.contains(&"gzip_footer_bad"),
-        &mut damage_flags,
-    )?;
+    d.set_item("checksum_present", structure.checksum_present)?;
+    project_structural_validation(&d, structure, file_size)?;
     d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;
     d.set_item("file_size", file_size)?;
     finish_fields(&d, GZIP_FIELDS)?;
