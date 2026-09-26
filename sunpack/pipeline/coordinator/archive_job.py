@@ -108,13 +108,6 @@ class ArchiveJobExecutor:
 
     async def execute_async(
         self,
-        tasks: List[ArchiveTask],
-        *,
-        broker,
-        cancellation,
-        default_output_dir_for_task=None,
-        missing_volume_retry=None    async def execute_async(
-        self,
         task: ArchiveTask,
         *,
         depth: int,
@@ -259,6 +252,20 @@ class ArchiveJobExecutor:
     def _report_task_status(self, task: ArchiveTask, state: str, detail: str = "") -> None:
         if self.progress_reporter is not None:
             self.progress_reporter.task_status(task, state, detail)
+
+    def _inspect_tasks_before_extract(
+        self,
+        tasks: list[ArchiveTask],
+        output_dir_resolver,
+        *,
+        depth: int,
+    ) -> list[tuple[int, ArchiveTask, str, Any]]:
+        results = []
+        for index, task in enumerate(tasks):
+            self._report_task_started(task, depth)
+            out_dir = output_dir_resolver(task)
+            results.append((index, task, out_dir, self.extractor.inspect(task, out_dir)))
+        return results
 
     def _extract_verify_state_machine(
         self,
