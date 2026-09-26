@@ -18,12 +18,6 @@ from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.postprocess.output_cleanup import OutputCleanupEvent, cleanup_output_for_retry
 from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL, DECISION_RETRY_EXTRACT
 
-
-def _advance_extract_state(state, sent, *, first: bool):
-    try:
-        return False, next(state) if first else state.send(sent)
-    except StopIteration as completed:
-        return True, completed.value
 from sunpack.core.passwords.directory_context import DirectoryPasswordContextStore
 from sunpack.pipeline.verification import VerificationResult, VerificationScheduler
 from sunpack.pipeline.verification.error_classification import classify_verification_error
@@ -123,7 +117,7 @@ class ArchiveJobExecutor:
         cancellation,
         missing_volume_retry=None,
         ensure_input_lease=None,
-    ) -> tuple[ArchiveTask, ArchiveJobOutcome, str | None]:
+    ) -> tuple[ArchiveTask, ArchiveJobOutcome, TargetRunResult]:
         """Run one logical archive through preflight, extraction and verification."""
 
         self.directory_password_contexts.annotate([task])
@@ -136,18 +130,18 @@ class ArchiveJobExecutor:
             missing_volume_retry=missing_volume_retry,
             ensure_input_lease=ensure_input_lease,
         )
-        output_dir = self.collect_result(task, outcome)
+        result = self.collect_result(task, outcome)
         if self.origin == "watch":
             self.extractor.emit_semantic_event(
                 task,
                 "task_output_finished",
                 critical=True,
                 output_dir=outcome.planned_out_dir,
-                keep_output=bool(output_dir),
+                keep_output=bool(result.output_dir and result.outcome_kind != OutcomeKind.FAILURE),
             )
-        if output_dir:
-            self.directory_password_contexts.remember(output_dir, task)
-        return task, outcome, output_dir
+        if result.output_dir and result.outcome_kind != OutcomeKind.FAILURE:
+            self.directory_password_contexts.remember(result.output_dir, task)
+        return task, outcome, result
 
     async def _execute_one_async(
         self,
@@ -368,7 +362,7 @@ class ArchiveJobExecutor:
     def _retry_on_verification_failure(self) -> bool:
         return bool(self.verifier.config.get("retry_on_verification_failure", True))
 
-    def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> str | None:
+    def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> TargetRunResult:
         content_policy = getattr(self, "content_policy", None) or ContentRecoveryPolicy.from_config(
             getattr(self, "config", {})
         )
@@ -397,63 +391,49 @@ class ArchiveJobExecutor:
             res.failure = possible_missing_volume
             res.error = possible_missing_volume.message
 
+        recovery = None
+        if outcome.outcome_kind == OutcomeKind.PARTIAL_SUCCESS and outcome.verification is not None:
+            recovery = {
+                "archive": task.main_path,
+                "out_dir": out_dir,
+                "completeness": outcome.verification.completeness,
+                "assessment_status": outcome.verification.assessment_status,
+                "content_integrity": outcome.verification.content_integrity,
+                "container_integrity": outcome.verification.container_integrity,
+                "verification_strength": outcome.verification.verification_strength,
+                "archive_coverage": _coverage_payload(outcome.verification),
+                "progress_manifest": res.progress_manifest,
+                **(
+                    {"warning": possible_missing_volume.to_dict()}
+                    if possible_missing_volume is not None
+                    else {}
+                ),
+            }
+
+        result = TargetRunResult(
+            input_path=task.main_path,
+            outcome_kind=outcome.outcome_kind,
+            task_key=task.key,
+            output_dir=out_dir,
+            verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
+            error=(
+                possible_missing_volume.message
+                if possible_missing_volume is not None
+                else str(res.error or "")
+            ),
+            failure=(possible_missing_volume if possible_missing_volume is not None else outcome.result.failure),
+            failure_message=(
+                self._failure_message(task, outcome)
+                if outcome.outcome_kind == OutcomeKind.FAILURE
+                else ""
+            ),
+            recovery=recovery,
+        )
         with self.context.lock:
-            if outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
+            if outcome.outcome_kind in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}:
                 self.context.processed_keys.add(task.key)
-                self.context.target_results.append(TargetRunResult(
-                    input_path=task.main_path,
-                    outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
-                    task_key=task.key,
-                    output_dir=out_dir,
-                    verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
-                ))
-                return out_dir
-            if outcome.outcome_kind == OutcomeKind.PARTIAL_SUCCESS:
-                recovery = None
-                if outcome.verification is not None:
-                    recovery = {
-                        "archive": task.main_path,
-                        "out_dir": out_dir,
-                        "completeness": outcome.verification.completeness,
-                        "assessment_status": outcome.verification.assessment_status,
-                        "content_integrity": outcome.verification.content_integrity,
-                        "container_integrity": outcome.verification.container_integrity,
-                        "verification_strength": outcome.verification.verification_strength,
-                        "archive_coverage": _coverage_payload(outcome.verification),
-                        "progress_manifest": res.progress_manifest,
-                        **(
-                            {"warning": possible_missing_volume.to_dict()}
-                            if possible_missing_volume is not None
-                            else {}
-                        ),
-                    }
-                self.context.processed_keys.add(task.key)
-                self.context.target_results.append(TargetRunResult(
-                    input_path=task.main_path,
-                    outcome_kind=OutcomeKind.PARTIAL_SUCCESS,
-                    task_key=task.key,
-                    output_dir=out_dir,
-                    verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
-                    error=(
-                        possible_missing_volume.message
-                        if possible_missing_volume is not None
-                        else str(res.error or "")
-                    ),
-                    failure=possible_missing_volume,
-                    recovery=recovery,
-                ))
-                return out_dir
-            self.context.target_results.append(TargetRunResult(
-                input_path=task.main_path,
-                outcome_kind=OutcomeKind.FAILURE,
-                task_key=task.key,
-                output_dir=out_dir,
-                verification=_verification_payload(outcome.verification) if outcome.verification is not None else {},
-                error=str(res.error or ""),
-                failure=outcome.result.failure,
-                failure_message=self._failure_message(task, outcome),
-            ))
-            return None
+            self.context.target_results.append(result)
+        return result
 
     def _failure_message(self, task: ArchiveTask, outcome: ArchiveJobOutcome) -> str:
         name = os.path.basename(task.main_path)
