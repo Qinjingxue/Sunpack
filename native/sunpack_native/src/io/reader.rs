@@ -25,7 +25,7 @@ const HOT_CACHE_FRACTION: usize = 4;
 const HOT_EDGE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HANDLE_CAPACITY: usize = 256;
 const MAX_CACHEABLE_READ_BYTES: usize = 4 * 1024 * 1024;
-const CACHE_ORDER_COMPACT_STALE_MIN: usize = 1024;
+const CACHE_ORDER_COMPACT_STALE_MIN: usize = 64;
 
 #[derive(Clone)]
 enum CachedBacking {
@@ -1497,10 +1497,10 @@ impl ReaderManager {
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
         let identities = handles
-            .by_path
-            .iter()
-            .filter(|(path, _identity)| path_is_under_roots(path, roots))
-            .map(|(_path, identity)| identity.clone())
+            .entries
+            .keys()
+            .filter(|identity| path_is_under_roots(&identity.path, roots))
+            .cloned()
             .collect::<HashSet<_>>();
         let mut sources = Vec::with_capacity(identities.len());
         for identity in &identities {
