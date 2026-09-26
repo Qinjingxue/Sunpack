@@ -15,6 +15,7 @@ use std::time::SystemTime;
 #[cfg(test)]
 thread_local! {
     static THREAD_PHYSICAL_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static THREAD_REQUEST_COALESCES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 const BLOCK_SIZE: usize = 64 * 1024;
@@ -26,10 +27,55 @@ const DEFAULT_HANDLE_CAPACITY: usize = 256;
 const MAX_CACHEABLE_READ_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Clone)]
+enum CachedBacking {
+    Shared(Arc<[u8]>),
+    Owned(Arc<Vec<u8>>),
+}
+
+impl Deref for CachedBacking {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Shared(data) => data,
+            Self::Owned(data) => data,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct CachedSlice {
-    data: Arc<[u8]>,
+    data: CachedBacking,
     start: usize,
     end: usize,
+}
+
+impl CachedSlice {
+    fn from_shared(data: Arc<[u8]>, start: usize, end: usize) -> Self {
+        Self {
+            data: CachedBacking::Shared(data),
+            start,
+            end,
+        }
+    }
+
+    fn from_vec(data: Vec<u8>) -> Self {
+        let end = data.len();
+        Self {
+            data: CachedBacking::Owned(Arc::new(data)),
+            start: 0,
+            end,
+        }
+    }
+
+    #[cfg(test)]
+    fn shares_backing(&self, other: &Self) -> bool {
+        match (&self.data, &other.data) {
+            (CachedBacking::Shared(left), CachedBacking::Shared(right)) => Arc::ptr_eq(left, right),
+            (CachedBacking::Owned(left), CachedBacking::Owned(right)) => Arc::ptr_eq(left, right),
+            _ => false,
+        }
+    }
 }
 
 impl Deref for CachedSlice {
@@ -43,6 +89,18 @@ impl Deref for CachedSlice {
 pub(crate) enum CachedBytes {
     Slice(CachedSlice),
     Owned(Vec<u8>),
+}
+
+impl CachedBytes {
+    pub(crate) fn as_slice(&self) -> &[u8] {
+        self
+    }
+}
+
+impl AsRef<[u8]> for CachedBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
 }
 
 impl Deref for CachedBytes {
@@ -66,14 +124,9 @@ pub(crate) trait ByteSource: Send + Sync {
         Ok(data.len())
     }
     fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
-        let data: Arc<[u8]> = Arc::from(self.read_at(offset, len)?);
-        let end = data.len();
-        Ok((end > 0)
-            .then_some(CachedSlice {
-                data,
-                start: 0,
-                end,
-            })
+        let data = self.read_at(offset, len)?;
+        Ok((!data.is_empty())
+            .then(|| CachedSlice::from_vec(data))
             .into_iter()
             .collect())
     }
@@ -133,7 +186,7 @@ struct ReaderState {
 
 #[derive(Default)]
 struct ReaderInner {
-    cache: HashMap<(u64, usize), Arc<[u8]>>,
+    cache: HashMap<(u64, usize), CachedSlice>,
     order: VecDeque<(u64, usize)>,
     cache_size: usize,
     stats: ReaderStats,
@@ -205,7 +258,11 @@ impl ManagedReader {
         self.source.iocp_path()
     }
 
-    /// Reads a range and shortens it at EOF, matching `Read`/positional-read semantics.
+    /// Reads a range into caller-owned storage and shortens it at EOF.
+    ///
+    /// Request-state users should prefer `read_cached_at` when they only need
+    /// immutable bytes. This owned boundary deliberately performs the one copy
+    /// needed to hand independent storage to its caller.
     pub(crate) fn read_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         if offset >= self.len() || len == 0 {
             return Ok(Vec::new());
@@ -222,31 +279,7 @@ impl ManagedReader {
                 .fetch_add(data.len() as u64, Ordering::Relaxed);
             return Ok(data);
         }
-        let key = (offset, read_len);
-        {
-            let mut inner = self.lock_inner()?;
-            if let Some(data) = inner.cache.get(&key).cloned() {
-                inner.stats.cache_hits += 1;
-                return Ok(data.as_ref().to_vec());
-            }
-            if self
-                .state
-                .config
-                .max_read_bytes
-                .is_some_and(|limit| inner.stats.read_bytes + read_len as u64 > limit)
-            {
-                return Err(io::Error::other("archive analysis read budget exceeded"));
-            }
-        }
-
-        let _permit = self.state.gate.acquire()?;
-        let data = self.source.read_at(offset, read_len).map_err(|error| {
-            ReadFault::physical("read_at", offset, read_len, 0, self.len(), &error).into_io_error()
-        })?;
-        let mut inner = self.lock_inner()?;
-        inner.stats.read_bytes += data.len() as u64;
-        inner.store_cache_entry(key, Arc::from(data.clone()), self.state.config.cache_bytes);
-        Ok(data)
+        Ok(self.read_cached_at(offset, read_len)?.as_slice().to_vec())
     }
 
     pub(crate) fn read_exact_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
@@ -278,7 +311,9 @@ impl ManagedReader {
     }
 
     /// Reads through the shared cache directly into a caller-owned buffer.
-    /// This is the allocation-free hot path used by `SourceCursor`.
+    /// Without request state this remains the allocation-free `SourceCursor`
+    /// hot path. With request state, the cache owns shared immutable data and
+    /// this boundary performs only the required copy into the caller buffer.
     pub(crate) fn read_into_at(&self, offset: u64, buffer: &mut [u8]) -> io::Result<usize> {
         if offset >= self.len() || buffer.is_empty() {
             return Ok(0);
@@ -298,13 +333,60 @@ impl ManagedReader {
                 .fetch_add(count as u64, Ordering::Relaxed);
             return Ok(count);
         }
+
+        let slices = self.read_slices_at(offset, read_len)?;
+        let mut written = 0usize;
+        for slice in slices {
+            let remaining = read_len.saturating_sub(written);
+            if remaining == 0 {
+                break;
+            }
+            let chunk = &slice[..slice.len().min(remaining)];
+            buffer[written..written + chunk.len()].copy_from_slice(chunk);
+            written += chunk.len();
+        }
+        Ok(written)
+    }
+
+    pub(crate) fn read_all(&self) -> io::Result<Vec<u8>> {
+        let len = usize::try_from(self.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "file is too large for memory")
+        })?;
+        self.read_at(0, len)
+    }
+
+    /// Returns shared slices without copying payload bytes on request-cache hits.
+    ///
+    /// For a cache miss that spans several physical blocks or volumes, the
+    /// request cache coalesces those slices once and keeps the resulting Vec
+    /// allocation behind an Arc. Later hits clone only shared ownership.
+    pub(crate) fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
+        if offset >= self.len() || len == 0 {
+            return Ok(Vec::new());
+        }
+        let read_len = len.min((self.len() - offset) as usize);
+        if !self.uses_request_state() {
+            let _permit = self.state.gate.acquire()?;
+            let slices = self
+                .source
+                .read_slices_at(offset, read_len)
+                .map_err(|error| {
+                    ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
+                        .into_io_error()
+                })?;
+            let count = slices.iter().map(|slice| slice.len()).sum::<usize>();
+            self.state
+                .uncached_read_bytes
+                .fetch_add(count as u64, Ordering::Relaxed);
+            return Ok(slices);
+        }
+
         let key = (offset, read_len);
         {
             let mut inner = self.lock_inner()?;
             if let Some(data) = inner.cache.get(&key).cloned() {
                 inner.stats.cache_hits += 1;
-                buffer[..data.len()].copy_from_slice(&data);
-                return Ok(data.len());
+                return Ok(vec![data]);
             }
             if self
                 .state
@@ -317,50 +399,6 @@ impl ManagedReader {
         }
 
         let _permit = self.state.gate.acquire()?;
-        let count = self
-            .source
-            .read_into_at(offset, &mut buffer[..read_len])
-            .map_err(|error| {
-                ReadFault::physical("read_into_at", offset, read_len, 0, self.len(), &error)
-                    .into_io_error()
-            })?;
-        let mut inner = self.lock_inner()?;
-        inner.stats.read_bytes += count as u64;
-        if self.state.config.cache_bytes > 0 {
-            inner.store_cache_entry(
-                key,
-                Arc::from(&buffer[..count]),
-                self.state.config.cache_bytes,
-            );
-        }
-        Ok(count)
-    }
-
-    pub(crate) fn read_all(&self) -> io::Result<Vec<u8>> {
-        let len = usize::try_from(self.len()).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "file is too large for memory")
-        })?;
-        self.read_at(0, len)
-    }
-
-    /// Returns cache-backed slices without copying when the request is served
-    /// by fixed blocks. Callers that require contiguous storage can use
-    /// `read_at`; parsers that only inspect fields can consume these directly.
-    pub(crate) fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
-        if offset >= self.len() || len == 0 {
-            return Ok(Vec::new());
-        }
-        let read_len = len.min((self.len() - offset) as usize);
-        if self.uses_request_state() {
-            let data: Arc<[u8]> = Arc::from(self.read_at(offset, read_len)?);
-            let end = data.len();
-            return Ok(vec![CachedSlice {
-                data,
-                start: 0,
-                end,
-            }]);
-        }
-        let _permit = self.state.gate.acquire()?;
         let slices = self
             .source
             .read_slices_at(offset, read_len)
@@ -369,10 +407,17 @@ impl ManagedReader {
                     .into_io_error()
             })?;
         let count = slices.iter().map(|slice| slice.len()).sum::<usize>();
-        self.state
-            .uncached_read_bytes
-            .fetch_add(count as u64, Ordering::Relaxed);
-        Ok(slices)
+
+        if self.state.config.cache_bytes == 0 {
+            self.lock_inner()?.stats.read_bytes += count as u64;
+            return Ok(slices);
+        }
+
+        let data = coalesce_cached_slices(slices);
+        let mut inner = self.lock_inner()?;
+        inner.stats.read_bytes += data.len() as u64;
+        inner.store_cache_entry(key, data.clone(), self.state.config.cache_bytes);
+        Ok(vec![data])
     }
 
     pub(crate) fn read_cached_at(&self, offset: u64, len: usize) -> io::Result<CachedBytes> {
@@ -522,8 +567,8 @@ impl NativeArchiveSession {
         len: usize,
     ) -> PyResult<Bound<'py, PyBytes>> {
         self.ensure_open()?;
-        let data = self.reader.read_at(offset, len)?;
-        Ok(PyBytes::new(py, &data))
+        let data = self.reader.read_cached_at(offset, len)?;
+        Ok(PyBytes::new(py, data.as_slice()))
     }
 
     fn prefetch(&self, ranges: Vec<(u64, usize)>) -> PyResult<()> {
@@ -615,8 +660,26 @@ impl NativeArchiveSession {
     }
 }
 
+fn coalesce_cached_slices(mut slices: Vec<CachedSlice>) -> CachedSlice {
+    if slices.len() == 1 {
+        return slices.remove(0);
+    }
+
+    #[cfg(test)]
+    if slices.len() > 1 {
+        THREAD_REQUEST_COALESCES.with(|count| count.set(count.get() + 1));
+    }
+
+    let total = slices.iter().map(|slice| slice.len()).sum();
+    let mut data = Vec::with_capacity(total);
+    for slice in slices {
+        data.extend_from_slice(&slice);
+    }
+    CachedSlice::from_vec(data)
+}
+
 impl ReaderInner {
-    fn store_cache_entry(&mut self, key: (u64, usize), data: Arc<[u8]>, capacity: usize) {
+    fn store_cache_entry(&mut self, key: (u64, usize), data: CachedSlice, capacity: usize) {
         if capacity == 0 || data.len() > capacity {
             return;
         }
@@ -730,6 +793,19 @@ impl ByteSource for BytesSource {
         let start = offset as usize;
         let end = start.saturating_add(len).min(self.data.len());
         Ok(self.data[start..end].to_vec())
+    }
+
+    fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
+        if offset >= self.len() || len == 0 {
+            return Ok(Vec::new());
+        }
+        let start = offset as usize;
+        let end = start.saturating_add(len).min(self.data.len());
+        Ok(vec![CachedSlice::from_shared(
+            Arc::clone(&self.data),
+            start,
+            end,
+        )])
     }
 }
 
@@ -878,13 +954,9 @@ impl ByteSource for FileSource {
         }
         let len = len.min((self.len() - offset) as usize);
         if len > MAX_CACHEABLE_READ_BYTES {
-            let data: Arc<[u8]> = Arc::from(self.read_direct_at(offset, len)?);
-            let end = data.len();
-            return Ok(vec![CachedSlice {
-                data,
-                start: 0,
-                end,
-            }]);
+            return Ok(vec![CachedSlice::from_vec(
+                self.read_direct_at(offset, len)?,
+            )]);
         }
         let first = offset / BLOCK_SIZE as u64;
         let last = (offset + len as u64 - 1) / BLOCK_SIZE as u64;
@@ -896,11 +968,7 @@ impl ByteSource for FileSource {
             let start = offset.saturating_sub(block_start) as usize;
             let end = (request_end.min(block_start + block.len() as u64) - block_start) as usize;
             if start < end && start < block.len() {
-                slices.push(CachedSlice {
-                    data: block,
-                    start,
-                    end,
-                });
+                slices.push(CachedSlice::from_shared(block, start, end));
             }
         }
         manager()
@@ -1795,6 +1863,78 @@ mod tests {
         assert_eq!(stats.read_bytes, 4);
         assert_eq!(stats.cache_hits, 1);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn request_cache_reuses_shared_backing_without_payload_copy() {
+        let path = temp_file("managed_reader_shared_request", b"abcdefgh");
+        let reader = ManagedReader::open_with_config(
+            &path,
+            ReaderConfig {
+                cache_bytes: 8,
+                max_read_bytes: Some(8),
+                max_concurrent_reads: 1,
+            },
+        )
+        .unwrap();
+
+        let before = THREAD_REQUEST_COALESCES.with(std::cell::Cell::get);
+        let first = reader.read_cached_at(0, 4).unwrap();
+        let second = reader.read_cached_at(0, 4).unwrap();
+        let after = THREAD_REQUEST_COALESCES.with(std::cell::Cell::get);
+
+        let (CachedBytes::Slice(first), CachedBytes::Slice(second)) = (first, second) else {
+            panic!("request cache should return shared slices");
+        };
+        assert_eq!(&*first, b"abcd");
+        assert_eq!(&*second, b"abcd");
+        assert!(first.shares_backing(&second));
+        assert_eq!(after - before, 0);
+
+        let stats = reader.stats().unwrap();
+        assert_eq!(stats.read_bytes, 4);
+        assert_eq!(stats.cache_hits, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn request_cache_coalesces_cross_volume_data_once() {
+        let first_path = temp_file("managed_reader_shared_part1", b"abc");
+        let second_path = temp_file("managed_reader_shared_part2", b"def");
+        let paths = vec![
+            first_path.to_string_lossy().into_owned(),
+            second_path.to_string_lossy().into_owned(),
+        ];
+        let reader = ManagedReader::open_volumes(
+            &paths,
+            ReaderConfig {
+                cache_bytes: 16,
+                max_read_bytes: Some(16),
+                max_concurrent_reads: 1,
+            },
+        )
+        .unwrap();
+
+        let before = THREAD_REQUEST_COALESCES.with(std::cell::Cell::get);
+        let first = reader.read_cached_at(2, 3).unwrap();
+        let middle = THREAD_REQUEST_COALESCES.with(std::cell::Cell::get);
+        let second = reader.read_cached_at(2, 3).unwrap();
+        let after = THREAD_REQUEST_COALESCES.with(std::cell::Cell::get);
+
+        let (CachedBytes::Slice(first), CachedBytes::Slice(second)) = (first, second) else {
+            panic!("cross-volume request should be cached as one shared slice");
+        };
+        assert_eq!(&*first, b"cde");
+        assert_eq!(&*second, b"cde");
+        assert!(first.shares_backing(&second));
+        assert_eq!(middle - before, 1);
+        assert_eq!(after - middle, 0);
+
+        let stats = reader.stats().unwrap();
+        assert_eq!(stats.read_bytes, 3);
+        assert_eq!(stats.cache_hits, 1);
+        let _ = std::fs::remove_file(first_path);
+        let _ = std::fs::remove_file(second_path);
     }
 
     #[test]
