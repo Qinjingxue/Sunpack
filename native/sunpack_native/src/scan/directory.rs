@@ -399,6 +399,66 @@ impl NativeOutputInventory {
         (paths, sizes, mtimes_ns, magics)
     }
 
+    fn parent_directories(&self) -> Vec<String> {
+        let root = Path::new(&self.root);
+        let mut seen = HashSet::new();
+        let mut directories = Vec::new();
+        for item in self.files.iter() {
+            let path = item.abs_path.as_deref().map(PathBuf::from).unwrap_or_else(|| {
+                let relative = item.output_path.as_ref().unwrap_or(&item.path);
+                root.join(relative)
+            });
+            let Some(parent) = path.parent() else {
+                continue;
+            };
+            let parent = path_to_string(parent);
+            let key = inventory_path_key(&parent);
+            if seen.insert(key) {
+                directories.push(parent);
+            }
+        }
+        directories
+    }
+
+    fn file_head_facts_for_paths(
+        &self,
+        py: Python<'_>,
+        paths: Vec<String>,
+        magic_size: usize,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        if paths.is_empty() || self.files.is_empty() {
+            return Ok(Vec::new());
+        }
+        let root = Path::new(&self.root);
+        let mut rows_by_path = HashMap::with_capacity(self.files.len());
+        for (index, item) in self.files.iter().enumerate() {
+            let path = item.abs_path.clone().unwrap_or_else(|| {
+                let relative = item.output_path.as_ref().unwrap_or(&item.path);
+                path_to_string(&root.join(relative))
+            });
+            rows_by_path.insert(inventory_path_key(&path), (index, path));
+        }
+
+        let mut rows = Vec::with_capacity(paths.len().min(self.files.len()));
+        for requested in paths {
+            let Some((index, path)) = rows_by_path.get(&inventory_path_key(&requested)) else {
+                continue;
+            };
+            let item = &self.files[*index];
+            let row = PyDict::new(py);
+            row.set_item("path", path)?;
+            row.set_item("exists", true)?;
+            row.set_item("is_file", true)?;
+            row.set_item("size", item.size)?;
+            row.set_item("mtime_ns", item.mtime_ns)?;
+            let magic_len = magic_size.min(item.magic.len());
+            row.set_item("magic", PyBytes::new(py, &item.magic[..magic_len]))?;
+            row.set_item("magic_complete", item.magic.len() >= magic_size)?;
+            rows.push(row.unbind());
+        }
+        Ok(rows)
+    }
+
     #[pyo3(signature = (
         patterns, prune_dir_globs, blocked_extensions, blocked_file_names,
         size_ranges, mtime_ranges, whitelist_rules
@@ -2625,6 +2685,17 @@ fn normalize_path_separator(path: String) -> String {
 
 fn path_to_string(path: &Path) -> String {
     path.to_string_lossy().to_string()
+}
+
+fn inventory_path_key(path: &str) -> String {
+    #[cfg(windows)]
+    {
+        path.replace('/', "\\").to_ascii_lowercase()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string()
+    }
 }
 
 fn metadata_mtime_ns(metadata: &fs::Metadata) -> Option<u64> {
