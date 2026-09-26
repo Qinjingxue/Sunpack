@@ -168,6 +168,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
+        verification::inventory::match_output_inventory_coverage,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         verification::file_crc::sample_directory_readability,
         m
     )?)?;
