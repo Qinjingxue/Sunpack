@@ -91,12 +91,12 @@ pub(crate) fn materialize_archive_state(
 }
 
 #[derive(Debug, Clone)]
-enum Segment {
+pub(crate) enum Segment {
     Range { path: String, start: u64, len: u64 },
 }
 
 impl Segment {
-    fn len(&self) -> u64 {
+    pub(crate) fn len(&self) -> u64 {
         match self {
             Segment::Range { len, .. } => *len,
         }
@@ -695,7 +695,7 @@ fn tar_duplicate_path(path: &str, index: usize) -> String {
     format!("{prefix}{stem}({index}){suffix}")
 }
 
-fn build_segments(source: &Bound<'_, PyDict>) -> PyResult<Vec<Segment>> {
+pub(crate) fn build_segments(source: &Bound<'_, PyDict>) -> PyResult<Vec<Segment>> {
     Ok(source_segments(source)?
         .into_iter()
         .filter(|segment| segment.len() > 0)
