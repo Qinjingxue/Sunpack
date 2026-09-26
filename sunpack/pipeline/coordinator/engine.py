@@ -1404,7 +1404,6 @@ class _RequestOwnership:
                 request_id=submission.request_id,
                 summary=summary,
                 artifacts=PipelineArtifacts(
-                    flatten_targets=(),
                     shell_refresh_paths=tuple(dict.fromkeys([
                         *(
                             result.output_dir
