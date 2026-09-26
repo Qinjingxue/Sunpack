@@ -5,6 +5,7 @@ import pytest
 
 from tests.helpers.archive_tasks import make_archive_task
 from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.pipeline.verification import VerificationScheduler
 import sunpack.pipeline.verification.archive_input_manifest as archive_input_manifest_module
 
@@ -172,6 +173,11 @@ def test_zip_verification_methods_share_one_full_archive_manifest(tmp_path, monk
         return native_manifest(source, max_items, password, codepage)
 
     monkeypatch.setattr(archive_input_manifest_module, "_native_archive_state_zip_manifest", counted_manifest)
+
+    def reject_materialization(self):
+        raise AssertionError("verification must consume the native output inventory")
+
+    monkeypatch.setattr(OutputInventory, "materialize_files", reject_materialization)
     verification = _scheduler([
         {"name": "expected_name_presence", "max_expected_names": 1},
         {"name": "manifest_size_match", "max_expected_names": 2},
