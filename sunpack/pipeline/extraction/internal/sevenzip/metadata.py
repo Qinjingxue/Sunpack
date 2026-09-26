@@ -64,11 +64,16 @@ class ArchiveMetadataScanner:
                 archive_input=None,
             )
         )
-        generation = self._task_cache_generation(task, descriptor)
+        source_generation = (
+            task.runtime.get("source_generation")
+            if task is not None and isinstance(getattr(task, "runtime", None), dict)
+            else None
+        )
         cached = task.runtime.get(self.TASK_CACHE_KEY) if task is not None else None
         if (
             isinstance(cached, dict)
-            and cached.get("generation") == generation
+            and cached.get("source_generation") == source_generation
+            and cached.get("descriptor") is descriptor
             and cached.get("format_hint") == descriptor.format_hint
         ):
             return self._result_from_dict(cached.get("result"), descriptor.entry_path)
@@ -76,7 +81,8 @@ class ArchiveMetadataScanner:
         result = self._scan_descriptor(descriptor)
         if task is not None:
             task.runtime[self.TASK_CACHE_KEY] = {
-                "generation": generation,
+                "source_generation": source_generation,
+                "descriptor": descriptor,
                 "format_hint": descriptor.format_hint,
                 "result": self._result_to_dict(result),
             }
@@ -97,19 +103,6 @@ class ArchiveMetadataScanner:
             archive_path=os.path.normpath(archive_path),
             part_paths=part_paths,
             format_hint=str(format_hint or "").lower().lstrip("."),
-        )
-
-    @staticmethod
-    def _task_cache_generation(task, descriptor: ArchiveInputDescriptor) -> tuple:
-        source_generation = (
-            task.runtime.get("source_generation")
-            if task is not None and isinstance(getattr(task, "runtime", None), dict)
-            else None
-        )
-        return (
-            "source" if source_generation else "task",
-            source_generation,
-            id(descriptor),
         )
 
     @staticmethod
