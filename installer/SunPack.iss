@@ -68,6 +68,7 @@ english.ToastRegisterLaunchFailed=Failed to run sunpack while registering machin
 english.ToastRegisterCommandFailed=sunpack could not register machine-wide notifications (exit code %d).
 english.TaskAddToPathFailed=Failed to add sunpack to the current user's PATH.
 english.TaskContextMenuFailed=Failed to register the sunpack folder context menu.
+english.TaskContextMenuRemoveFailed=Failed to remove the existing sunpack context menu.
 english.PrepareRuntimeRunning=sunpack runtime processes are still running. Please stop them and run the installer again.
 english.PrepareBrokerRemoveFailed=The existing sunpack Watch Broker service could not be removed. Restart Windows and run the installer again.
 english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed. Close sunpack and run the installer again.
@@ -95,6 +96,7 @@ chinesesimplified.ToastRegisterLaunchFailed=注册机器级通知时无法运行
 chinesesimplified.ToastRegisterCommandFailed=sunpack 无法注册机器级通知（退出码 %d）。
 chinesesimplified.TaskAddToPathFailed=无法将 sunpack 添加到当前用户的 PATH。
 chinesesimplified.TaskContextMenuFailed=无法注册 sunpack 文件夹右键菜单。
+chinesesimplified.TaskContextMenuRemoveFailed=无法清理现有 sunpack 右键菜单。
 chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。请先停止这些进程，然后重新运行安装程序。
 chinesesimplified.PrepareBrokerRemoveFailed=无法删除现有 sunpack Watch Broker 服务。请重启 Windows，然后重新运行安装程序。
 chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack 文件。请关闭 sunpack，然后重新运行安装程序。
@@ -913,17 +915,19 @@ begin
       RaiseException(CustomMessage('ToastRegisterLaunchFailed'))
     else if ResultCode <> 0 then
       RaiseException(Format(CustomMessage('ToastRegisterCommandFailed'), [ResultCode]));
+    if ExistingInstallation or WizardIsTaskSelected('contextmenu') then
+    begin
+      if not RunContextMenuScript(False) then
+        RaiseException(CustomMessage('TaskContextMenuRemoveFailed'));
+      if not RunContextMenuScript(True) then
+        RaiseException(CustomMessage('TaskContextMenuFailed'));
+    end;
     if ExistingInstallation then
       RestoreWatchAfterUpgrade
     else
     begin
       if WizardIsTaskSelected('addtopath') and not AddMachinePath then
         RaiseException(CustomMessage('TaskAddToPathFailed'));
-      if WizardIsTaskSelected('contextmenu') then
-      begin
-        if not RunContextMenuScript(True) then
-          RaiseException(CustomMessage('TaskContextMenuFailed'));
-      end;
     end;
     ApplySelectedStartupState;
   end;

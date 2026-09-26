@@ -223,7 +223,7 @@ def test_upgrade_restores_watch_only_when_it_was_running_before_install():
     assert "Exit;" not in upgrade_guard
 
 
-def test_upgrade_preserves_path_and_context_menu_but_applies_selected_startup_state():
+def test_upgrade_preserves_path_refreshes_context_menu_and_applies_selected_startup_state():
     script = (ROOT / "installer" / "SunPack.iss").read_text(encoding="utf-8")
 
     assert "ExistingInstallation := FileExists(ExpandConstant('{app}\\sunpack.exe'));" in script
@@ -234,13 +234,22 @@ def test_upgrade_preserves_path_and_context_menu_but_applies_selected_startup_st
 
     post = script[script.index("if CurStep = ssPostInstall then"):]
     post = post[:post.index("procedure CurUninstallStepChanged")]
+    menu_guard = post.index("if ExistingInstallation or WizardIsTaskSelected('contextmenu') then")
     upgrade_guard = post.index("if ExistingInstallation then")
-    assert post.index("'--register-toast'") < upgrade_guard
+    menu = post[menu_guard:upgrade_guard]
+    assert post.index("'--register-toast'") < menu_guard
+    assert menu.index("RunContextMenuScript(False)") < menu.index("RunContextMenuScript(True)")
+    assert "RaiseException(CustomMessage('TaskContextMenuRemoveFailed'));" in menu
+    assert "RaiseException(CustomMessage('TaskContextMenuFailed'));" in menu
+    assert "english.TaskContextMenuRemoveFailed=" in script
+    assert "chinesesimplified.TaskContextMenuRemoveFailed=" in script
+    assert "WizardIsTaskSelected" not in menu[menu.index("begin"):]
     assert upgrade_guard < post.index("AddMachinePath")
-    assert upgrade_guard < post.index("RunContextMenuScript(True)")
+    assert post.index("RunContextMenuScript(True)") < post.index("RestoreWatchAfterUpgrade")
     assert post.index("ApplySelectedStartupState;") > upgrade_guard
     assert "Exit;" not in post[upgrade_guard:]
-    assert "RunContextMenuScript(False)" not in post
+    assert post.count("RunContextMenuScript(False)") == 1
+    assert post.count("RunContextMenuScript(True)") == 1
 
 
 def test_upgrade_startup_default_tracks_current_original_user_state():

@@ -210,7 +210,7 @@ G:\Incoming | | true
 sunpack.exe watch add D:\Downloads --deep-detect --start --initial-scan
 ```
 
-目录和目录背景右键菜单保留普通入口，并新增“深度扫描解压”“交互输入密码深度解压”“深度监控此目录”。文件对象已有的两个解压入口默认启用 `--deep-detect`。重新运行 `scripts/register_context_menu.ps1` 可应用新菜单。
+目录和目录背景右键菜单只保留“直接解压”“交互输入密码解压”“监控此目录”“取消监控此目录”四项，这些入口不附加 `--deep-detect`。文件对象的两个解压入口默认启用 `--deep-detect`。重新运行 `scripts/register_context_menu.ps1` 会重建菜单并移除过时入口。
 
 ## passwords
 

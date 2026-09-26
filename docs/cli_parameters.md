@@ -210,7 +210,7 @@ Adding a new root without `--deep-detect` leaves deep mode disabled. Re-adding a
 sunpack.exe watch add D:\Downloads --deep-detect --start --initial-scan
 ```
 
-The directory and directory-background context menus include separate deep scan extraction, deep extraction with a password prompt, and deep monitoring entries. The existing two file extraction entries enable `--deep-detect` by default. Re-run `scripts/register_context_menu.ps1` to apply the updated menus.
+The directory and directory-background context menus contain four entries: extract directly, extract with a password prompt, watch this folder, and stop watching this folder. These entries do not add `--deep-detect`. The two file extraction entries enable `--deep-detect` by default. Re-run `scripts/register_context_menu.ps1` to rebuild the menus and remove obsolete entries.
 
 ## passwords
 
