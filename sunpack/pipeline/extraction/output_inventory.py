@@ -63,6 +63,17 @@ class OutputInventory:
             [bytes(item) for item in magics],
         )
 
+    def parent_directories(self) -> tuple[str, ...]:
+        return tuple(self._native.parent_directories())
+
+    def file_head_facts_for_paths(
+        self,
+        paths: list[str],
+        *,
+        magic_size: int = 16,
+    ) -> list[dict[str, Any]]:
+        return list(self._native.file_head_facts_for_paths(paths, max(0, int(magic_size or 0))))
+
     def build_directory_snapshots(self, options: dict[str, Any]):
         return self._native.build_directory_snapshots(
             options["patterns"],
