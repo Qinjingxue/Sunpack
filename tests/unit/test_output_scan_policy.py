@@ -1,4 +1,5 @@
 from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.filesystem import DirectorySnapshot
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
@@ -32,6 +33,28 @@ def test_output_scan_policy_finds_nested_archive_when_initial_scan_is_current_di
 
     assert policy.should_scan_output_dir(str(tmp_path))
     assert policy.prepare_scan([str(tmp_path)]).roots == (str(tmp_path.resolve()),)
+
+
+def test_output_scan_policy_parent_roots_bypass_file_column_materialization(tmp_path, monkeypatch):
+    first_dir = tmp_path / "one"
+    second_dir = tmp_path / "two"
+    first_dir.mkdir()
+    second_dir.mkdir()
+    (first_dir / "a.bin").write_bytes(b"a")
+    (second_dir / "b.bin").write_bytes(b"b")
+
+    monkeypatch.setattr(
+        DirectorySnapshot,
+        "iter_file_columns",
+        lambda _self: (_ for _ in ()).throw(
+            AssertionError("parent-root projection must stay in native code")
+        ),
+    )
+
+    policy = OutputScanPolicy(_config())
+    roots = policy._candidate_parent_roots(str(tmp_path))
+
+    assert set(roots) == {str(first_dir.resolve()), str(second_dir.resolve())}
 
 
 def test_output_scan_policy_projects_normal_archive_as_one_logical_root(tmp_path):

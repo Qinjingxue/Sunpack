@@ -99,6 +99,14 @@ class DirectorySnapshot:
         paths, sizes, mtimes_ns = self._native_snapshot.file_columns()
         return iter(zip(paths, sizes, mtimes_ns))
 
+    def parent_directories(self) -> list[str]:
+        return self._native_snapshot.parent_directories()
+
+    def filesystem_candidate_specs(
+        self,
+    ) -> list[tuple[str, int | None, str, str, int, str]]:
+        return self._native_snapshot.filesystem_candidate_specs()
+
     def file_entries_for_directories(self, directories: set[str]) -> list[FileEntry]:
         if not directories:
             return []
@@ -129,6 +137,10 @@ class DirectorySnapshot:
 
     def iter_relation_anchor_rows(self) -> Iterator[tuple[str, int | None, dict]]:
         return iter(self._native_snapshot.relation_anchor_rows())
+
+    def identity_digest(self) -> tuple[int, str]:
+        count, digest = self._native_snapshot.identity_digest()
+        return int(count), str(digest)
 
     def identity_rows(self) -> list[tuple[str, bool, int, int]]:
         return list(self._native_snapshot.identity_rows())

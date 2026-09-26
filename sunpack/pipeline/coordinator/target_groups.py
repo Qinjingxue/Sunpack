@@ -54,12 +54,17 @@ def filesystem_candidate(
     route: str,
     format_hint: str,
     reject_mask: int,
+    logical_name: str | None = None,
 ) -> DiscoveryCandidate:
     return DiscoveryCandidate(
         archive_input=ArchiveInputDescriptor.from_parts(
             archive_path=path,
             part_paths=[path],
-            logical_name=path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1],
+            logical_name=(
+                logical_name
+                if logical_name is not None
+                else path.rsplit("\\", 1)[-1].rsplit("/", 1)[-1]
+            ),
             format_hint=str(format_hint or "").lower(),
         ),
         carrier_path=path,

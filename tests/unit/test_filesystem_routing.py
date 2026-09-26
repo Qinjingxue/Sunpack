@@ -11,6 +11,7 @@ from sunpack.core.contracts.filesystem import (
     FILESYSTEM_ROUTE_DETECTION,
     FILESYSTEM_ROUTE_RELATIONS,
     FILESYSTEM_ROUTE_RESIDUAL,
+    DirectorySnapshot,
 )
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
@@ -114,6 +115,45 @@ def test_prefixed_and_suffixed_archive_carrier_stays_residual_for_embedded_scan(
     routes = _routing_by_name(snapshot)
 
     assert routes[carrier.name][0] == "residual"
+
+
+def test_discovery_candidate_projection_bypasses_legacy_routing_columns(tmp_path, monkeypatch):
+    payload = tmp_path / "payload.gz"
+    payload.write_bytes(gzip.compress(b"payload"))
+
+    monkeypatch.setattr(
+        DirectorySnapshot,
+        "non_relation_file_routing_rows",
+        lambda _self: (_ for _ in ()).throw(
+            AssertionError("candidate generation must not materialize legacy routing columns")
+        ),
+    )
+
+    session = DiscoveryScanSession(config={})
+    candidates = session.candidates_for_directory(str(tmp_path))
+
+    assert len(candidates) == 1
+    assert candidates[0].entry_path == str(payload)
+    assert candidates[0].logical_name == payload.name
+    assert candidates[0].route == "detection"
+    assert candidates[0].format_hint == "gzip"
+
+
+def test_directory_snapshot_identity_digest_changes_with_snapshot_content(tmp_path):
+    payload = tmp_path / "payload.bin"
+    payload.write_bytes(b"one")
+    first_snapshot = DirectoryScanner(str(tmp_path)).scan()
+    first_count, first_digest = first_snapshot.identity_digest()
+
+    payload.write_bytes(b"two-more-bytes")
+    second_snapshot = DirectoryScanner(str(tmp_path)).scan()
+    second_count, second_digest = second_snapshot.identity_digest()
+
+    assert first_count == len(first_snapshot)
+    assert second_count == len(second_snapshot)
+    assert len(first_digest) == 64
+    assert len(second_digest) == 64
+    assert first_digest != second_digest
 
 
 def test_directory_without_relation_anchor_skips_relations_entirely(tmp_path, monkeypatch):

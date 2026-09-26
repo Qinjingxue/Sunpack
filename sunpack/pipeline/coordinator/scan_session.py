@@ -31,7 +31,7 @@ class DiscoveryScanSession:
         self._candidates: dict[str, list[DiscoveryCandidate]] = {}
         self._file_head_facts: dict[str, dict[str, Any]] = {}
         self._output_inventories: list[Any] = []
-        self._directory_identities: dict[str, tuple[str, int, tuple]] = {}
+        self._directory_identities: dict[str, tuple[str, int, str]] = {}
         self._scan_roots: list[str] = []
 
     def set_scan_roots(self, roots: list[str]) -> None:
@@ -130,9 +130,10 @@ class DiscoveryScanSession:
                     route=route,
                     format_hint=format_hint,
                     reject_mask=reject_mask,
+                    logical_name=logical_name,
                 )
-                for path, size, route, format_hint, reject_mask
-                in snapshot.non_relation_file_routing_rows()
+                for path, size, route, format_hint, reject_mask, logical_name
+                in snapshot.filesystem_candidate_specs()
             )
             self._candidates[key] = candidates
         return self._candidates[key]
@@ -242,12 +243,12 @@ class DiscoveryScanSession:
             return key, size, mtime_ns
         return key, 0, 0
 
-    def directory_identity_for_path(self, directory: str) -> tuple[str, int, tuple]:
+    def directory_identity_for_path(self, directory: str) -> tuple[str, int, str]:
         key = self._directory_key(directory)
         if key not in self._directory_identities:
             snapshot = self.shallow_snapshot_for_directory(directory, max_depth=0)
-            entries = snapshot.identity_rows()
-            self._directory_identities[key] = (key, len(entries), tuple(sorted(entries)))
+            count, digest = snapshot.identity_digest()
+            self._directory_identities[key] = (key, count, digest)
         return self._directory_identities[key]
 
     def _directory_key(self, directory: str) -> str:

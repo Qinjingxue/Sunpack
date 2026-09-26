@@ -2,6 +2,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use rayon::prelude::*;
 use regex::{RegexSet, RegexSetBuilder};
+use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
@@ -132,6 +133,23 @@ impl NativeDirectorySnapshot {
             )
         })
     }
+
+    fn identity_records(&self) -> Vec<(String, bool, u64, u64)> {
+        self.rows
+            .iter()
+            .map(|&row| {
+                (
+                    Path::new(&self.table.paths[row])
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                        .unwrap_or_default(),
+                    self.table.is_dirs[row],
+                    self.table.sizes[row].unwrap_or(0),
+                    self.table.mtimes_ns[row].unwrap_or(0),
+                )
+            })
+            .collect()
+    }
 }
 
 
@@ -158,6 +176,21 @@ fn filesystem_file_route(
         return FILE_ROUTE_DETECTION;
     }
     FILE_ROUTE_RESIDUAL
+}
+
+fn filesystem_route_name(route: u8) -> &'static str {
+    match route {
+        FILE_ROUTE_DETECTION => "detection",
+        FILE_ROUTE_RELATIONS => "relations",
+        _ => "residual",
+    }
+}
+
+fn filesystem_logical_name(path: &str) -> String {
+    path.rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or(path)
+        .to_string()
 }
 
 struct DirectoryScanRecords {
@@ -561,6 +594,24 @@ impl NativeDirectorySnapshot {
         (paths, sizes, mtimes_ns)
     }
 
+    fn parent_directories(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut directories = Vec::new();
+        for &row in &self.rows {
+            if self.table.is_dirs[row] {
+                continue;
+            }
+            let Some(parent) = Path::new(&self.table.paths[row]).parent() else {
+                continue;
+            };
+            let parent = path_to_string(parent);
+            if seen.insert(inventory_path_key(&parent)) {
+                directories.push(parent);
+            }
+        }
+        directories
+    }
+
     fn file_columns_for_directories(
         &self,
         directories: Vec<String>,
@@ -626,6 +677,33 @@ impl NativeDirectorySnapshot {
             .collect()
     }
 
+    fn filesystem_candidate_specs(
+        &self,
+    ) -> Vec<(String, Option<u64>, String, String, u32, String)> {
+        let mut specs = Vec::with_capacity(self.rows.len());
+        for &row in &self.rows {
+            let route = self.table.file_routes[row];
+            if self.table.is_dirs[row] || route == FILE_ROUTE_RELATIONS {
+                continue;
+            }
+            let path = &self.table.paths[row];
+            let anchor = self.table.relation_anchors[row].as_ref();
+            specs.push((
+                path.clone(),
+                self.table.sizes[row],
+                filesystem_route_name(route).to_string(),
+                anchor
+                    .map(|value| value.format.to_ascii_lowercase())
+                    .unwrap_or_default(),
+                anchor
+                    .map(|value| value.format_reject_mask)
+                    .unwrap_or(0),
+                filesystem_logical_name(path),
+            ));
+        }
+        specs
+    }
+
     fn non_relation_file_routing_columns(
         &self,
     ) -> (
@@ -665,19 +743,23 @@ impl NativeDirectorySnapshot {
         (paths, sizes, routes, formats, reject_masks)
     }
 
+    fn identity_digest(&self) -> (usize, String) {
+        let mut rows = self.identity_records();
+        rows.sort_unstable();
+
+        let mut digest = Sha256::new();
+        for (name, is_dir, size, mtime_ns) in &rows {
+            digest.update((name.len() as u64).to_le_bytes());
+            digest.update(name.as_bytes());
+            digest.update([u8::from(*is_dir)]);
+            digest.update(size.to_le_bytes());
+            digest.update(mtime_ns.to_le_bytes());
+        }
+        (rows.len(), format!("{:x}", digest.finalize()))
+    }
+
     fn identity_rows(&self) -> Vec<(String, bool, u64, u64)> {
-        self.rows.iter().map(|&row| {
-                (
-                    Path::new(&self.table.paths[row])
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_ascii_lowercase())
-                        .unwrap_or_default(),
-                    self.table.is_dirs[row],
-                    self.table.sizes[row].unwrap_or(0),
-                    self.table.mtimes_ns[row].unwrap_or(0),
-                )
-            })
-            .collect()
+        self.identity_records()
     }
 }
 

@@ -102,15 +102,15 @@ def file_identity(path: str) -> tuple[str, int, int]:
     return norm_path, int(rows[0].get("size") or 0), int(rows[0].get("mtime_ns") or 0)
 
 
-def directory_identity(path: str) -> tuple[str, int, tuple]:
+def directory_identity(path: str) -> tuple[str, int, str]:
     norm_path = path_key(path)
     snapshot = _native_scan_directory_snapshot(
         norm_path, 0, [], [], [], [], [], [], []
     )
     if not snapshot:
-        return norm_path, 0, ()
-    entries = list(snapshot.identity_rows())
-    return norm_path, len(entries), tuple(sorted(entries))
+        return norm_path, 0, ""
+    count, digest = snapshot.identity_digest()
+    return norm_path, int(count), str(digest)
 
 
 def stable_fingerprint(value: Any) -> str:
