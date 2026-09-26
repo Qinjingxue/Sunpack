@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
 
 
 @dataclass(frozen=True)
@@ -109,14 +110,8 @@ def dry_run_archive(
 def _parse_worker_json_lines(stdout: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for line in str(stdout or "").splitlines():
-        text = line.strip()
-        if not text.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
+        parsed = parse_worker_json_line(line)
+        if parsed:
             events.append(parsed)
     return events
 

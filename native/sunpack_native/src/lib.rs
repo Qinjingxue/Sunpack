@@ -156,6 +156,10 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
+        scan::directory::compact_worker_manifest_json,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
         verification::file_crc::compute_directory_crc_manifest,
         m
     )?)?;
