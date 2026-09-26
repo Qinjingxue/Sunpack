@@ -68,6 +68,10 @@ impl CachedSlice {
         }
     }
 
+    fn retained_bytes(&self) -> usize {
+        self.data.len()
+    }
+
     #[cfg(test)]
     fn shares_backing(&self, other: &Self) -> bool {
         match (&self.data, &other.data) {
@@ -715,21 +719,26 @@ fn coalesce_cached_slices(mut slices: Vec<CachedSlice>) -> CachedSlice {
 
 impl ReaderInner {
     fn store_cache_entry(&mut self, key: (u64, usize), data: CachedSlice, capacity: usize) {
-        if capacity == 0 || data.len() > capacity {
+        let retained = data.retained_bytes();
+        if capacity == 0 || retained > capacity {
             return;
         }
         if let Some(old) = self.cache.insert(key, data) {
-            self.cache_size = self.cache_size.saturating_sub(old.len());
+            self.cache_size = self.cache_size.saturating_sub(old.retained_bytes());
             self.order.retain(|existing| *existing != key);
         }
-        self.cache_size += self.cache.get(&key).map(|value| value.len()).unwrap_or(0);
+        self.cache_size += self
+            .cache
+            .get(&key)
+            .map(CachedSlice::retained_bytes)
+            .unwrap_or(0);
         self.order.push_back(key);
         while self.cache_size > capacity {
             let Some(old_key) = self.order.pop_front() else {
                 break;
             };
             if let Some(old) = self.cache.remove(&old_key) {
-                self.cache_size = self.cache_size.saturating_sub(old.len());
+                self.cache_size = self.cache_size.saturating_sub(old.retained_bytes());
             }
         }
     }
@@ -1906,7 +1915,7 @@ mod tests {
         let reader = ManagedReader::open_with_config(
             &path,
             ReaderConfig {
-                cache_bytes: 8,
+                cache_bytes: BLOCK_SIZE,
                 max_read_bytes: Some(8),
                 max_concurrent_reads: 1,
             },
@@ -1929,6 +1938,28 @@ mod tests {
         let stats = reader.stats().unwrap();
         assert_eq!(stats.read_bytes, 4);
         assert_eq!(stats.cache_hits, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn request_cache_capacity_accounts_for_retained_shared_block() {
+        let path = temp_file("managed_reader_shared_capacity", b"abcdefgh");
+        let reader = ManagedReader::open_with_config(
+            &path,
+            ReaderConfig {
+                cache_bytes: BLOCK_SIZE - 1,
+                max_read_bytes: Some(8),
+                max_concurrent_reads: 1,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(&*reader.read_cached_at(0, 4).unwrap(), b"abcd");
+        assert_eq!(&*reader.read_cached_at(0, 4).unwrap(), b"abcd");
+        let stats = reader.stats().unwrap();
+        assert_eq!(stats.read_bytes, 8);
+        assert_eq!(stats.cache_hits, 0);
+        assert_eq!(reader.lock_inner().unwrap().cache_size, 0);
         let _ = std::fs::remove_file(path);
     }
 
