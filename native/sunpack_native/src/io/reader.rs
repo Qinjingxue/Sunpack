@@ -107,6 +107,12 @@ impl AsRef<[u8]> for CachedBytes {
     }
 }
 
+impl Default for CachedBytes {
+    fn default() -> Self {
+        Self::Owned(Vec::new())
+    }
+}
+
 impl Deref for CachedBytes {
     type Target = [u8];
 
