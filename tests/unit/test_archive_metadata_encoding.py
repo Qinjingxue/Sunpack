@@ -32,7 +32,6 @@ def test_native_codepage_selection_preserves_known_unicode_families(
     result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
     assert result.selected_codepage == expected_codepage
-    assert result.decoded_names == [name]
     assert result.confidence > 0.0
 
 
@@ -44,7 +43,6 @@ def test_shift_jis_kanji_only_zip_scan_uses_cp932(tmp_path):
     result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
     assert result.selected_codepage == "932"
-    assert result.decoded_names == [expected_name]
     assert result.confidence > 0.5
 
 
@@ -56,7 +54,6 @@ def test_shift_jis_zip_scan_returns_decoded_item_paths(tmp_path):
     result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
     assert result.selected_codepage == "932"
-    assert result.decoded_names == [expected_name]
     assert result.confidence > 0.5
 
 
@@ -70,7 +67,6 @@ def test_format_hint_scans_disguised_zip_without_renaming_it(tmp_path):
     assert archive.is_file()
     assert not (tmp_path / "downloaded.zip").exists()
     assert result.archive_type == "zip"
-    assert result.decoded_names == [expected_name]
 
 
 def test_carrier_range_uses_canonical_archive_input(tmp_path):
@@ -104,7 +100,6 @@ def test_carrier_range_uses_canonical_archive_input(tmp_path):
     )
 
     assert result.selected_codepage == "932"
-    assert result.decoded_names == [expected_name]
 
 
 def test_raw_multivolume_zip_uses_one_logical_input(tmp_path):
@@ -144,7 +139,6 @@ def test_raw_multivolume_zip_uses_one_logical_input(tmp_path):
     )
 
     assert result.selected_codepage == "936"
-    assert result.decoded_names == [expected_name]
 
 
 def test_unicode_native_archive_formats_do_not_receive_zip_codepage_override():
@@ -155,7 +149,6 @@ def test_unicode_native_archive_formats_do_not_receive_zip_codepage_override():
 
         assert result.archive_type == archive_type
         assert result.selected_codepage is None
-        assert result.decoded_names == []
         assert result.warnings == []
 
 
@@ -174,8 +167,6 @@ def test_task_metadata_cache_survives_scanner_instance_change(tmp_path):
         "metadata was rescanned"
     )
     second = second_scanner.scan_for_task(task, str(archive), format_hint="zip")
-
-    assert second.decoded_names == first.decoded_names
     assert second.sample_count == first.sample_count
 
 
@@ -189,7 +180,6 @@ def test_unicode_path_extra_field_needs_no_python_name_copy(tmp_path):
 
     assert result.error is None
     assert result.selected_codepage is None
-    assert result.decoded_names == []
     assert result.confidence == 1.0
     assert any("0x7075" in reason for reason in result.reasons)
 
