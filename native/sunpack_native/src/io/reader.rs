@@ -870,7 +870,50 @@ struct FileSource {
     identity: FileIdentity,
     file: RwLock<Option<TrackedFile>>,
     closed: AtomicBool,
-    block_loads: Mutex<HashMap<u64, Arc<Mutex<()>>>>,
+    block_loads: Mutex<HashMap<u64, Arc<BlockLoad>>>,
+}
+
+struct BlockLoad {
+    completed: Mutex<bool>,
+    ready: Condvar,
+}
+
+impl BlockLoad {
+    fn new() -> Self {
+        Self {
+            completed: Mutex::new(false),
+            ready: Condvar::new(),
+        }
+    }
+
+    fn wait(&self) -> io::Result<()> {
+        let mut completed = self
+            .completed
+            .lock()
+            .map_err(|_| io::Error::other("reader block-load state poisoned"))?;
+        while !*completed {
+            completed = self
+                .ready
+                .wait(completed)
+                .map_err(|_| io::Error::other("reader block-load state poisoned"))?;
+        }
+        Ok(())
+    }
+
+    fn finish(&self) {
+        let mut completed = self
+            .completed
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *completed = true;
+        self.ready.notify_all();
+    }
+}
+
+enum BlockLoadClaim {
+    Cached,
+    Owned(Arc<BlockLoad>),
+    Waiting(Arc<BlockLoad>),
 }
 
 impl FileSource {
@@ -1437,89 +1480,170 @@ impl ReaderManager {
         Ok(source)
     }
 
+    fn claim_block_load(&self, source: &FileSource, index: u64) -> io::Result<BlockLoadClaim> {
+        let key = BlockKey {
+            identity: source.identity.clone(),
+            index,
+        };
+        let mut loads = source
+            .block_loads
+            .lock()
+            .map_err(|_| io::Error::other("reader block-load lock poisoned"))?;
+
+        // Recheck the cache while holding the load registry. A loader publishes
+        // the block before removing its registry entry, so this closes the
+        // cache-check/claim race without holding any lock across physical I/O.
+        if self.contains_block(&key)? {
+            return Ok(BlockLoadClaim::Cached);
+        }
+        if let Some(load) = loads.get(&index) {
+            return Ok(BlockLoadClaim::Waiting(Arc::clone(load)));
+        }
+
+        let load = Arc::new(BlockLoad::new());
+        loads.insert(index, Arc::clone(&load));
+        Ok(BlockLoadClaim::Owned(load))
+    }
+
+    fn finish_block_load(
+        &self,
+        source: &FileSource,
+        index: u64,
+        load: &Arc<BlockLoad>,
+    ) -> io::Result<()> {
+        load.finish();
+        let mut loads = source
+            .block_loads
+            .lock()
+            .map_err(|_| io::Error::other("reader block-load lock poisoned"))?;
+        if loads
+            .get(&index)
+            .is_some_and(|current| Arc::ptr_eq(current, load))
+        {
+            loads.remove(&index);
+        }
+        Ok(())
+    }
+
+    fn finish_block_loads(
+        &self,
+        source: &FileSource,
+        loads_to_finish: &[(u64, Arc<BlockLoad>)],
+    ) -> io::Result<()> {
+        for (_, load) in loads_to_finish {
+            load.finish();
+        }
+        let mut loads = source
+            .block_loads
+            .lock()
+            .map_err(|_| io::Error::other("reader block-load lock poisoned"))?;
+        for (index, load) in loads_to_finish {
+            if loads
+                .get(index)
+                .is_some_and(|current| Arc::ptr_eq(current, load))
+            {
+                loads.remove(index);
+            }
+        }
+        Ok(())
+    }
+
     fn read_block(&self, source: &FileSource, index: u64) -> io::Result<Arc<[u8]>> {
         let key = BlockKey {
             identity: source.identity.clone(),
             index,
         };
         let tier = cache_tier(source, index);
-        if let Some(block) = self.cached_block(&key, tier)? {
-            return Ok(block);
-        }
 
-        // Coalesce concurrent misses for the same physical block without
-        // serializing unrelated offsets or files.
-        let load_gate = {
-            let mut loads = source
-                .block_loads
-                .lock()
-                .map_err(|_| io::Error::other("reader block-load lock poisoned"))?;
-            Arc::clone(
-                loads
-                    .entry(index)
-                    .or_insert_with(|| Arc::new(Mutex::new(()))),
-            )
-        };
-        let _load = load_gate
-            .lock()
-            .map_err(|_| io::Error::other("reader block-load gate poisoned"))?;
-        if let Some(block) = self.cached_block(&key, tier)? {
-            return Ok(block);
+        loop {
+            if let Some(block) = self.cached_block(&key, tier)? {
+                return Ok(block);
+            }
+
+            match self.claim_block_load(source, index)? {
+                BlockLoadClaim::Cached => continue,
+                BlockLoadClaim::Waiting(load) => {
+                    load.wait()?;
+                    continue;
+                }
+                BlockLoadClaim::Owned(load) => {
+                    self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
+                    let offset = index * BLOCK_SIZE as u64;
+                    let len = BLOCK_SIZE.min(source.len().saturating_sub(offset) as usize);
+                    let result = source
+                        .with_file(|file| read_file_at(file, offset, len, &self.metrics))
+                        .and_then(|data| {
+                            self.insert_block(key.clone(), Arc::from(data), tier)
+                        });
+                    let finish_result = self.finish_block_load(source, index, &load);
+                    return match result {
+                        Ok(data) => {
+                            finish_result?;
+                            Ok(data)
+                        }
+                        Err(error) => {
+                            let _ = finish_result;
+                            Err(error)
+                        }
+                    };
+                }
+            }
         }
-        self.metrics.cache_misses.fetch_add(1, Ordering::Relaxed);
-        let offset = index * BLOCK_SIZE as u64;
-        let len = BLOCK_SIZE.min(source.len().saturating_sub(offset) as usize);
-        let data: Arc<[u8]> =
-            Arc::from(source.with_file(|file| read_file_at(file, offset, len, &self.metrics))?);
-        let data = self.insert_block(key, data, tier)?;
-        drop(_load);
-        if let Ok(mut loads) = source.block_loads.lock() {
-            loads.remove(&index);
-        }
-        Ok(data)
     }
 
-    /// Loads adjacent missing blocks with one positional read. This is used by
-    /// `read_many` so callers that already know several offsets do not pay one
-    /// syscall and one miss-coordination round trip per 64 KiB block.
-    fn prefetch_blocks(&self, source: &FileSource, blocks: Vec<u64>) -> io::Result<()> {
-        let mut missing = Vec::with_capacity(blocks.len());
+    /// Loads adjacent missing blocks with one positional read. Batch prefetch
+    /// shares the same per-block load registry as `read_block`: this caller
+    /// claims only blocks that are not already cached or being loaded, merges
+    /// adjacent claimed blocks into range reads, and waits for overlapping
+    /// claims after its independent I/O has completed.
+    fn prefetch_blocks(&self, source: &FileSource, mut blocks: Vec<u64>) -> io::Result<()> {
+        blocks.sort_unstable();
+        blocks.dedup();
+
+        let mut owned = Vec::with_capacity(blocks.len());
+        let mut waiting = Vec::new();
         for index in blocks {
-            let key = BlockKey {
-                identity: source.identity.clone(),
-                index,
-            };
-            if !self.contains_block(&key)? {
-                missing.push(index);
+            match self.claim_block_load(source, index) {
+                Ok(BlockLoadClaim::Cached) => {}
+                Ok(BlockLoadClaim::Owned(load)) => owned.push((index, load)),
+                Ok(BlockLoadClaim::Waiting(load)) => waiting.push((index, load)),
+                Err(error) => {
+                    let _ = self.finish_block_loads(source, &owned);
+                    return Err(error);
+                }
             }
         }
 
-        let max_blocks = (MAX_CACHEABLE_READ_BYTES / BLOCK_SIZE).max(1) as u64;
+        let max_blocks = (MAX_CACHEABLE_READ_BYTES / BLOCK_SIZE).max(1);
         let mut cursor = 0usize;
-        while cursor < missing.len() {
-            let start = missing[cursor];
-            let mut end = start;
+        while cursor < owned.len() {
+            let range_start = cursor;
+            let start = owned[cursor].0;
             cursor += 1;
-            while cursor < missing.len()
-                && missing[cursor] == end + 1
-                && missing[cursor] - start < max_blocks
+            while cursor < owned.len()
+                && owned[cursor].0 == owned[cursor - 1].0 + 1
+                && cursor - range_start < max_blocks
             {
-                end = missing[cursor];
                 cursor += 1;
             }
-            if start == end {
-                self.read_block(source, start)?;
-                continue;
-            }
-
+            let end = owned[cursor - 1].0;
             let offset = start * BLOCK_SIZE as u64;
             let requested = ((end - start + 1) * BLOCK_SIZE as u64)
                 .min(source.len().saturating_sub(offset)) as usize;
-            let data =
-                source.with_file(|file| read_file_at(file, offset, requested, &self.metrics))?;
+
+            let data = match source
+                .with_file(|file| read_file_at(file, offset, requested, &self.metrics))
+            {
+                Ok(data) => data,
+                Err(error) => {
+                    let _ = self.finish_block_loads(source, &owned[range_start..]);
+                    return Err(error);
+                }
+            };
             self.metrics
                 .cache_misses
                 .fetch_add(end - start + 1, Ordering::Relaxed);
+
             for index in start..=end {
                 let from = ((index - start) * BLOCK_SIZE as u64) as usize;
                 if from >= data.len() {
@@ -1530,7 +1654,31 @@ impl ReaderManager {
                     identity: source.identity.clone(),
                     index,
                 };
-                self.insert_block(key, Arc::from(&data[from..to]), cache_tier(source, index))?;
+                if let Err(error) =
+                    self.insert_block(key, Arc::from(&data[from..to]), cache_tier(source, index))
+                {
+                    let _ = self.finish_block_loads(source, &owned[range_start..]);
+                    return Err(error);
+                }
+            }
+
+            if let Err(error) = self.finish_block_loads(source, &owned[range_start..cursor]) {
+                let _ = self.finish_block_loads(source, &owned[cursor..]);
+                return Err(error);
+            }
+        }
+
+        for (index, load) in waiting {
+            load.wait()?;
+            let key = BlockKey {
+                identity: source.identity.clone(),
+                index,
+            };
+            if !self.contains_block(&key)? {
+                // The overlapping loader failed before publishing. Retry this
+                // block through the normal path so prefetch keeps its
+                // synchronous "ready on success" contract.
+                self.read_block(source, index)?;
             }
         }
         Ok(())
@@ -2143,6 +2291,132 @@ mod tests {
 
         assert_eq!(many, vec![vec![0x6b; 8], vec![0x6b; 8]]);
         assert_eq!(after - before, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn batch_prefetch_skips_inflight_blocks_without_blocking_independent_ranges() {
+        let data = vec![0x7cu8; BLOCK_SIZE * 3];
+        let path = temp_file("managed_reader_batch_overlap", &data);
+        let source = manager().open_file(&path).unwrap();
+
+        let blocked_load = match manager().claim_block_load(&source, 1).unwrap() {
+            BlockLoadClaim::Owned(load) => load,
+            _ => panic!("test block should be newly claimed"),
+        };
+
+        let worker_source = Arc::clone(&source);
+        let handle = std::thread::spawn(move || {
+            let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
+            worker_source
+                .prefetch(&[(0, BLOCK_SIZE * 3)])
+                .unwrap();
+            let after = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
+            after - before
+        });
+
+        let first_key = BlockKey {
+            identity: source.identity.clone(),
+            index: 0,
+        };
+        let third_key = BlockKey {
+            identity: source.identity.clone(),
+            index: 2,
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let first_ready = manager().contains_block(&first_key).unwrap();
+            let third_ready = manager().contains_block(&third_key).unwrap();
+            if first_ready && third_ready {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "independent prefetch ranges were serialized behind an overlapping block"
+            );
+            std::thread::yield_now();
+        }
+
+        let offset = BLOCK_SIZE as u64;
+        let block = source
+            .with_file(|file| read_file_at(file, offset, BLOCK_SIZE, &manager().metrics))
+            .unwrap();
+        let blocked_key = BlockKey {
+            identity: source.identity.clone(),
+            index: 1,
+        };
+        manager()
+            .insert_block(blocked_key, Arc::from(block), cache_tier(&source, 1))
+            .unwrap();
+        manager()
+            .finish_block_load(&source, 1, &blocked_load)
+            .unwrap();
+
+        assert_eq!(handle.join().unwrap(), 2);
+        assert!(source.block_loads.lock().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn read_block_shares_an_existing_batch_load() {
+        let data = vec![0x4du8; BLOCK_SIZE];
+        let path = temp_file("managed_reader_read_overlap", &data);
+        let source = manager().open_file(&path).unwrap();
+
+        let load = match manager().claim_block_load(&source, 0).unwrap() {
+            BlockLoadClaim::Owned(load) => load,
+            _ => panic!("test block should be newly claimed"),
+        };
+
+        let worker_source = Arc::clone(&source);
+        let handle = std::thread::spawn(move || {
+            let before = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
+            let block = manager().read_block(&worker_source, 0).unwrap();
+            let after = THREAD_PHYSICAL_READS.with(std::cell::Cell::get);
+            (block, after - before)
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while Arc::strong_count(&load) < 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reader did not join the existing block load"
+            );
+            std::thread::yield_now();
+        }
+
+        let block = source
+            .with_file(|file| read_file_at(file, 0, BLOCK_SIZE, &manager().metrics))
+            .unwrap();
+        let key = BlockKey {
+            identity: source.identity.clone(),
+            index: 0,
+        };
+        manager()
+            .insert_block(key, Arc::from(block), cache_tier(&source, 0))
+            .unwrap();
+        manager().finish_block_load(&source, 0, &load).unwrap();
+
+        let (block, worker_reads) = handle.join().unwrap();
+        assert_eq!(worker_reads, 0);
+        assert_eq!(block.len(), BLOCK_SIZE);
+        assert!(block.iter().all(|byte| *byte == 0x4d));
+        assert!(source.block_loads.lock().unwrap().is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn failed_batch_prefetch_releases_claimed_blocks() {
+        let data = vec![0x31u8; BLOCK_SIZE * 2];
+        let path = temp_file("managed_reader_prefetch_error_cleanup", &data);
+        let source = manager().open_file(&path).unwrap();
+        source.close().unwrap();
+
+        assert!(manager()
+            .prefetch_blocks(&source, vec![0, 1])
+            .is_err());
+        assert!(source.block_loads.lock().unwrap().is_empty());
+
         let _ = std::fs::remove_file(path);
     }
 
