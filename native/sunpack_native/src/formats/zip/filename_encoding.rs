@@ -373,34 +373,50 @@ fn scan_zip_names(
     let search_size = file_size.min(MAX_ZIP_COMMENT_BYTES + ZIP_EOCD_LENGTH as u64);
     let tail_start = file_size - search_size;
     let tail = reader.read_at(tail_start, search_size as usize)?;
-    let Some(eocd_index) = rfind_subslice(&tail, ZIP_EOCD_SIGNATURE) else {
-        return Ok(ZipNameScan::status("eocd_not_found"));
+    let Some(eocd) = super::find_eocd_record(&tail, false) else {
+        let status = rfind_subslice(&tail, ZIP_EOCD_SIGNATURE)
+            .filter(|offset| offset.saturating_add(ZIP_EOCD_LENGTH) > tail.len())
+            .map(|_| "eocd_incomplete")
+            .unwrap_or("eocd_not_found");
+        return Ok(ZipNameScan::status(status));
     };
-    if eocd_index + ZIP_EOCD_LENGTH > tail.len() {
-        return Ok(ZipNameScan::status("eocd_incomplete"));
-    }
 
-    let eocd = &tail[eocd_index..eocd_index + ZIP_EOCD_LENGTH];
-    let central_disk = read_u16_le(eocd, 6) as usize;
-    let total_entries = read_u16_le(eocd, 10) as usize;
-    let central_size = read_u32_le(eocd, 12);
-    let central_offset = read_u32_le(eocd, 16);
+    let central_disk = super::u16_le(&tail, eocd.offset + 6) as usize;
+    let total_entries = eocd.total_entries as usize;
+    let central_size = eocd.cd_size;
+    let central_offset = eocd.cd_offset;
     if central_offset == ZIP64_MARKER || central_size == ZIP64_MARKER {
         return Ok(ZipNameScan::status("zip64"));
     }
+    if central_size == 0 && total_entries == 0 {
+        return Ok(ZipNameScan {
+            status: "ok",
+            entries: Vec::new(),
+            truncated: false,
+        });
+    }
 
-    let Some(central_logical_offset) =
-        reader.central_logical_offset(central_disk, central_offset as u64)
-    else {
+    let central_size_u64 = central_size as u64;
+    let eocd_logical_offset = tail_start.saturating_add(eocd.offset as u64);
+    let physical_candidate = eocd_logical_offset.checked_sub(central_size_u64);
+    let declared_candidate =
+        reader.central_logical_offset(central_disk, central_offset as u64);
+    let mut central_logical_offset = None;
+    for candidate in [physical_candidate, declared_candidate].into_iter().flatten() {
+        if candidate
+            .checked_add(central_size_u64)
+            .is_none_or(|end| end > file_size)
+        {
+            continue;
+        }
+        if reader.read_at(candidate, super::CD_SIG.len())?.as_slice() == super::CD_SIG {
+            central_logical_offset = Some(candidate);
+            break;
+        }
+    }
+    let Some(central_logical_offset) = central_logical_offset else {
         return Ok(ZipNameScan::status("central_range_invalid"));
     };
-    let central_size_u64 = central_size as u64;
-    if central_logical_offset
-        .checked_add(central_size_u64)
-        .is_none_or(|end| end > file_size)
-    {
-        return Ok(ZipNameScan::status("central_range_invalid"));
-    }
 
     let metadata_budget = (ZIP_CENTRAL_HEADER_LENGTH as u64)
         .saturating_mul(max_samples as u64)
