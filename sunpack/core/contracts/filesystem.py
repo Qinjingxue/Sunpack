@@ -142,5 +142,3 @@ class DirectorySnapshot:
         count, digest = self._native_snapshot.identity_digest()
         return int(count), str(digest)
 
-    def identity_rows(self) -> list[tuple[str, bool, int, int]]:
-        return list(self._native_snapshot.identity_rows())
