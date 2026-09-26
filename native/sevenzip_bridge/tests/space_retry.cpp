@@ -884,8 +884,8 @@ void r10_directory_retry_and_memo(const std::filesystem::path &directory) {
         ExtractOutputTrace trace;
 
         auto *callback_raw = new ExtractToDiskCallback(
-            nullptr, L"", directory.wstring(), std::vector<std::wstring>{},
-            ExtractProgressCallback{}, true, &trace, 4);
+            nullptr, L"", directory.wstring(),
+        ExtractProgressCallback{}, true, &trace, 4);
         CMyComPtr<IArchiveExtractCallback> callback_owner(callback_raw);
         auto *callback = callback_raw;
         check(callback != nullptr, "R-10: callback 必须构造成功");
