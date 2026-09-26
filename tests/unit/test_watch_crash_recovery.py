@@ -17,6 +17,10 @@ def _watch_scheduler_shell(scheduler_module):
     scheduler._claim_gate = threading.RLock()
     scheduler._active_claims = {}
     scheduler._dirty_during_claim = {}
+    scheduler._inflight_requests = []
+    scheduler._inflight_path_counts = {}
+    scheduler._active_epoch = 0
+    scheduler._ready_heap = []
     return scheduler
 
 

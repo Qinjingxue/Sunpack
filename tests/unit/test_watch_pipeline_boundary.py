@@ -40,6 +40,35 @@ def test_watch_source_claim_is_published_before_independent_jobs_start():
     assert "task.cleanup_parts or task.all_parts" in source
 
 
+def test_watch_completed_generation_records_data_parts_and_reuses_only_external_carrier(tmp_path):
+    first = str(tmp_path / "archive.7z.001")
+    second = str(tmp_path / "archive.7z.002")
+    version = (("first", 1, 2, 3, 4), ("second", 1, 2, 3, 4))
+    calls = []
+
+    runtime = object.__new__(_RequestRuntime)
+    runtime.submission = SimpleNamespace(origin="watch", request_id="request")
+    runtime.path_leases = SimpleNamespace(
+        ownership_version_for=lambda owner, paths: calls.append((owner, paths)) or version,
+    )
+
+    descriptor = SimpleNamespace(part_paths=lambda: (first, second))
+    data_task = SimpleNamespace(
+        archive_input=lambda: descriptor,
+        carrier_path=first,
+    )
+    launcher_task = SimpleNamespace(
+        archive_input=lambda: descriptor,
+        carrier_path=str(tmp_path / "archive.exe"),
+    )
+
+    assert runtime._watch_generation_for_task(data_task, depth=1) == version
+    assert calls == [("request", (first, second))]
+    assert not runtime._watch_task_can_reuse_completed(data_task)
+    assert runtime._watch_task_can_reuse_completed(launcher_task)
+    assert runtime._watch_generation_for_task(data_task, depth=2) == ()
+
+
 def test_watch_layer_does_not_import_archive_discovery_internals():
     source = Path(inspect.getsourcefile(WatchScheduler)).read_text(encoding="utf-8")
     forbidden = (

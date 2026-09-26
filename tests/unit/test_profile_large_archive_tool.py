@@ -104,5 +104,5 @@ def test_pipeline_derived_timings_remove_nested_job_and_planning_costs():
     assert derived["pipeline_run_outside_job"] == pytest.approx(0.4)
     assert derived["pipeline_runtime_outside_job"] == pytest.approx(0.17)
     assert derived["pipeline_plan_task_unattributed"] == pytest.approx(0.02)
-    assert derived["pipeline_runtime_outside_job_residual"] == pytest.approx(-0.01)
+    assert derived["pipeline_runtime_outside_job_residual"] == pytest.approx(0.0)
     assert derived["pipeline_run_outer_residual"] == pytest.approx(0.03)

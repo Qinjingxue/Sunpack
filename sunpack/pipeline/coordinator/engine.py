@@ -1055,8 +1055,8 @@ class _RequestRuntime:
                 )
 
             ownership.remember_tasks([task])
-            watch_version = self._watch_generation_for_task(task)
-            if watch_version:
+            watch_version = self._watch_generation_for_task(task, depth=depth)
+            if watch_version and self._watch_task_can_reuse_completed(task):
                 completed_output = self.path_leases.completed_watch_output(watch_version)
                 if completed_output:
                     reused = TargetRunResult(
@@ -1215,17 +1215,25 @@ class _RequestRuntime:
             self._prompt_gates[depth] = gate
         return bool(await gate)
 
-    def _watch_generation_for_task(self, task):
-        if self.submission.origin != "watch":
+    def _watch_generation_for_task(self, task, *, depth: int):
+        if self.submission.origin != "watch" or depth != 1:
             return ()
         part_paths = tuple(task.archive_input().part_paths())
         if len(part_paths) < 2:
             return ()
+        return self.path_leases.ownership_version_for(
+            self.submission.request_id,
+            part_paths,
+        )
+
+    @staticmethod
+    def _watch_task_can_reuse_completed(task) -> bool:
+        part_paths = tuple(task.archive_input().part_paths())
         carrier = str(task.carrier_path or "")
+        if not carrier or not part_paths:
+            return False
         part_keys = {path_key(path) for path in part_paths}
-        if not carrier or path_key(carrier) in part_keys:
-            return ()
-        return _physical_ownership_version(part_paths)
+        return path_key(carrier) not in part_keys
 
     def _schedule_cleanup(self, request, *, broker, cancellation) -> None:
         if not (request.paths and request.should_clean):
