@@ -357,9 +357,10 @@ impl ManagedReader {
 
     /// Returns shared slices without copying payload bytes on request-cache hits.
     ///
-    /// For a cache miss that spans several physical blocks or volumes, the
-    /// request cache coalesces those slices once and keeps the resulting Vec
-    /// allocation behind an Arc. Later hits clone only shared ownership.
+    /// Requests that fit the request-cache capacity are coalesced at most once
+    /// so repeated reads can clone shared ownership. Oversized requests retain
+    /// the source's native slice layout instead of paying for an uncacheable
+    /// contiguous allocation.
     pub(crate) fn read_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
         if offset >= self.len() || len == 0 {
             return Ok(Vec::new());
@@ -381,13 +382,69 @@ impl ManagedReader {
             return Ok(slices);
         }
 
+        if self.state.config.cache_bytes > 0 && read_len <= self.state.config.cache_bytes {
+            return Ok(vec![self.read_request_cached_slice_at(offset, read_len)?]);
+        }
+        self.read_request_source_slices_at(offset, read_len)
+    }
+
+    pub(crate) fn read_cached_at(&self, offset: u64, len: usize) -> io::Result<CachedBytes> {
+        if offset >= self.len() || len == 0 {
+            return Ok(CachedBytes::Owned(Vec::new()));
+        }
+        let read_len = len.min((self.len() - offset) as usize);
+        if self.uses_request_state()
+            && self.state.config.cache_bytes > 0
+            && read_len <= self.state.config.cache_bytes
+        {
+            return Ok(CachedBytes::Slice(
+                self.read_request_cached_slice_at(offset, read_len)?,
+            ));
+        }
+
+        let mut slices = self.read_slices_at(offset, read_len)?;
+        if slices.len() == 1 {
+            return Ok(CachedBytes::Slice(slices.remove(0)));
+        }
+        let total = slices.iter().map(|slice| slice.len()).sum();
+        let mut data = Vec::with_capacity(total);
+        for slice in slices {
+            data.extend_from_slice(&slice);
+        }
+        Ok(CachedBytes::Owned(data))
+    }
+
+    fn read_request_cached_slice_at(
+        &self,
+        offset: u64,
+        read_len: usize,
+    ) -> io::Result<CachedSlice> {
         let key = (offset, read_len);
         {
             let mut inner = self.lock_inner()?;
             if let Some(data) = inner.cache.get(&key).cloned() {
                 inner.stats.cache_hits += 1;
-                return Ok(vec![data]);
+                return Ok(data);
             }
+        }
+
+        let slices = self.read_request_source_slices_at(offset, read_len)?;
+        let data = coalesce_cached_slices(slices);
+        self.lock_inner()?.store_cache_entry(
+            key,
+            data.clone(),
+            self.state.config.cache_bytes,
+        );
+        Ok(data)
+    }
+
+    fn read_request_source_slices_at(
+        &self,
+        offset: u64,
+        read_len: usize,
+    ) -> io::Result<Vec<CachedSlice>> {
+        {
+            let inner = self.lock_inner()?;
             if self
                 .state
                 .config
@@ -407,30 +464,8 @@ impl ManagedReader {
                     .into_io_error()
             })?;
         let count = slices.iter().map(|slice| slice.len()).sum::<usize>();
-
-        if self.state.config.cache_bytes == 0 {
-            self.lock_inner()?.stats.read_bytes += count as u64;
-            return Ok(slices);
-        }
-
-        let data = coalesce_cached_slices(slices);
-        let mut inner = self.lock_inner()?;
-        inner.stats.read_bytes += data.len() as u64;
-        inner.store_cache_entry(key, data.clone(), self.state.config.cache_bytes);
-        Ok(vec![data])
-    }
-
-    pub(crate) fn read_cached_at(&self, offset: u64, len: usize) -> io::Result<CachedBytes> {
-        let mut slices = self.read_slices_at(offset, len)?;
-        if slices.len() == 1 {
-            return Ok(CachedBytes::Slice(slices.remove(0)));
-        }
-        let total = slices.iter().map(|slice| slice.len()).sum();
-        let mut data = Vec::with_capacity(total);
-        for slice in slices {
-            data.extend_from_slice(&slice);
-        }
-        Ok(CachedBytes::Owned(data))
+        self.lock_inner()?.stats.read_bytes += count as u64;
+        Ok(slices)
     }
 
     /// Warms every fixed block touched by the supplied ranges. Overlapping
