@@ -91,11 +91,6 @@ public:
         };
     }
 
-    std::size_t effective_cpu_budget() const noexcept
-    {
-        return effective_cpu_budget_;
-    }
-
 private:
     const std::size_t nominal_cpu_budget_;
     std::size_t effective_cpu_budget_;

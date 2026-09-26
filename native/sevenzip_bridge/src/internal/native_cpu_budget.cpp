@@ -110,11 +110,6 @@ void NativeCpuBudget::set_effective_capacity(std::size_t capacity) noexcept
     }
 }
 
-std::size_t NativeCpuBudget::nominal_capacity() const noexcept
-{
-    return nominal_capacity_;
-}
-
 std::size_t NativeCpuBudget::effective_capacity() const noexcept
 {
     return effective_capacity_.load(std::memory_order_acquire);

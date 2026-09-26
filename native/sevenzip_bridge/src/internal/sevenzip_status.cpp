@@ -22,12 +22,6 @@ namespace sunpack::sevenzip
         return op_res == kOpUnexpectedEnd || op_res == kOpHeadersError || op_res == kOpIsNotArc || op_res == kOpUnavailable;
     }
 
-    bool looks_damaged_probe_result(const std::wstring &password, Int32 op_res)
-    {
-
-        return looks_damaged(op_res) || (password.empty() && (op_res == kOpDataError || op_res == kOpCrcError));
-    }
-
     const char *operation_result_name(Int32 op_res)
     {
 

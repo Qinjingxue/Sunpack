@@ -32,7 +32,6 @@ public:
 
     void set_effective_capacity(std::size_t capacity) noexcept;
 
-    std::size_t nominal_capacity() const noexcept;
     std::size_t effective_capacity() const noexcept;
     std::size_t reserved_credits() const noexcept;
     bool can_acquire_base() const noexcept;

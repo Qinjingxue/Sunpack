@@ -33,16 +33,6 @@ namespace sunpack::sevenzip
 
     std::wstring lower_extension(const std::wstring &path);
 
-    bool looks_missing_volume(const std::wstring &archive_path, Int32 op_res);
-
-    bool has_numbered_split_head(const std::vector<std::wstring> &part_paths);
-
-    bool has_split_volume_evidence(const std::wstring &archive_path, const std::vector<std::wstring> &part_paths);
-
-    UInt64 file_size_or_zero(const std::wstring &path);
-
-    UInt64 archive_input_size(const std::wstring &archive_path, const std::vector<std::wstring> &part_paths);
-
 #endif
 
 }
