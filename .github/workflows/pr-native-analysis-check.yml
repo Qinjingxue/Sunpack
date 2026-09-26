@@ -1,0 +1,45 @@
+name: Native analysis PR check
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - "native/sunpack_native/**"
+      - "sunpack/core/analysis/**"
+      - "tests/unit/test_native_multivolume_analysis.py"
+      - "tests/unit/test_zip_multidisk_metadata.py"
+      - "tests/unit/test_zip_analysis_capability.py"
+      - "tests/unit/test_seven_zip_analysis_capability.py"
+      - "tests/unit/test_tar_probe_boundaries.py"
+      - ".github/workflows/pr-native-analysis-check.yml"
+
+jobs:
+  native-analysis:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Sync development environment
+        shell: pwsh
+        run: |
+          python -m pip install uv
+          uv sync --locked --extra test --extra build
+      - name: Build and install native extension
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\maturin.exe build --manifest-path native\sunpack_native\Cargo.toml --release --target-dir .cache\rust-target\x64
+          $wheel = Get-ChildItem .cache\rust-target\x64\wheels\sunpack_native-*.whl | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $wheel) { throw "sunpack_native wheel not found" }
+          uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
+      - name: Run focused analysis tests
+        shell: pwsh
+        run: |
+          .\.venv\Scripts\python.exe -m pytest -q \`
+            tests\unit\test_native_multivolume_analysis.py \`
+            tests\unit\test_zip_multidisk_metadata.py \`
+            tests\unit\test_zip_analysis_capability.py \`
+            tests\unit\test_seven_zip_analysis_capability.py \`
+            tests\unit\test_tar_probe_boundaries.py
