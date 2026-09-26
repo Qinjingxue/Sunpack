@@ -372,6 +372,9 @@ def test_split_zip_structure_anchor_recovers_decorated_middle_member(tmp_path):
     assert [volume.number for volume in group.split_volumes] == [1, 2, 3]
     assert [volume.role for volume in group.split_volumes] == ["first", "member", "terminal"]
     assert all(volume.style == "zip_spanned" for volume in group.split_volumes)
+    expected_size = sum(path.stat().st_size for path in (first, disguised_second, terminal))
+    assert group.logical_size == expected_size
+    assert relation_group_to_candidate(group).logical_size == expected_size
 
 
 def test_split_zip_without_terminal_reports_strong_missing_tail(tmp_path):
