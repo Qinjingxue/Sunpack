@@ -64,11 +64,11 @@ class ArchiveMetadataScanner:
                 archive_input=None,
             )
         )
-        signature = self._descriptor_signature(descriptor)
+        generation = self._task_cache_generation(task, descriptor)
         cached = task.runtime.get(self.TASK_CACHE_KEY) if task is not None else None
         if (
             isinstance(cached, dict)
-            and cached.get("signature") == signature
+            and cached.get("generation") == generation
             and cached.get("format_hint") == descriptor.format_hint
         ):
             return self._result_from_dict(cached.get("result"), descriptor.entry_path)
@@ -76,7 +76,7 @@ class ArchiveMetadataScanner:
         result = self._scan_descriptor(descriptor)
         if task is not None:
             task.runtime[self.TASK_CACHE_KEY] = {
-                "signature": signature,
+                "generation": generation,
                 "format_hint": descriptor.format_hint,
                 "result": self._result_to_dict(result),
             }
@@ -100,32 +100,16 @@ class ArchiveMetadataScanner:
         )
 
     @staticmethod
-    def _descriptor_signature(descriptor: ArchiveInputDescriptor) -> tuple:
-        extents = descriptor.extents or [part.extent for part in descriptor.parts]
-        physical = []
-        for path in dict.fromkeys(descriptor.part_paths() or [descriptor.entry_path]):
-            try:
-                stat = os.stat(path)
-                physical.append((path, stat.st_size, stat.st_mtime_ns))
-            except OSError:
-                physical.append((path, 0, 0))
+    def _task_cache_generation(task, descriptor: ArchiveInputDescriptor) -> tuple:
+        source_generation = (
+            task.runtime.get("source_generation")
+            if task is not None and isinstance(getattr(task, "runtime", None), dict)
+            else None
+        )
         return (
-            descriptor.open_mode,
-            descriptor.entry_path,
-            descriptor.format_hint,
-            descriptor.volume_style,
-            tuple(
-                (
-                    part.path,
-                    int(part.extent.start),
-                    part.extent.end,
-                    part.volume_number,
-                    part.canonical_name,
-                )
-                for part in descriptor.parts
-            ),
-            tuple((item.path, int(item.start), item.end) for item in extents),
-            tuple(physical),
+            "source" if source_generation else "task",
+            source_generation,
+            id(descriptor),
         )
 
     @staticmethod
