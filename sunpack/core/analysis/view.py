@@ -81,6 +81,22 @@ class SharedBinaryView:
     def signature_prepass(self, *, head_bytes: int, tail_bytes: int) -> dict | None:
         return dict(self._native.signature_prepass(int(head_bytes), int(tail_bytes)))
 
+    def probe_zip_local_header(self, *, offset: int = 0) -> dict | None:
+        return dict(self._native.probe_zip_local_header(int(offset)))
+
+    def locate_zip_eocd(self, *, eocd_offset: int | None = None) -> dict | None:
+        return dict(self._native.locate_zip_eocd(
+            None if eocd_offset is None else int(eocd_offset)
+        ))
+
+    def probe_zip_local_header(self, *, offset: int = 0) -> dict | None:
+        return dict(self._native.probe_zip_local_header(int(offset)))
+
+    def locate_zip_eocd(self, *, eocd_offset: int | None = None) -> dict | None:
+        return dict(self._native.locate_zip_eocd(
+            None if eocd_offset is None else int(eocd_offset)
+        ))
+
     def probe_zip(self, *, eocd_offset: int, max_cd_entries_to_walk: int = 64) -> dict | None:
         return dict(self._native.probe_zip(int(eocd_offset), int(max_cd_entries_to_walk)))
 
