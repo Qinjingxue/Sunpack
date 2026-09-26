@@ -13,6 +13,7 @@ from sunpack.core.contracts.archive_input import (
 )
 from sunpack.core.contracts.discovery import (
     DiscoveryCandidate,
+    DiscoveryFinding,
     StageResult,
 )
 from sunpack.core.contracts.tasks import ArchiveTask
@@ -95,13 +96,14 @@ class EmbeddedDiscovery:
                 )
                 continue
 
-            resolved, reason = self._discover_candidate(candidate)
+            resolved, reason, findings = self._discover_candidate(candidate)
             if resolved is None:
                 if reason in {
                     "embedded_password_required",
                     "embedded_wrong_password",
                     "embedded_truncated",
                 }:
+                    result.findings.extend(findings)
                     result.add_blocked(candidate, source="embedded", reason=reason)
                 else:
                     result.add_residual(candidate, source="embedded", reason=reason)
@@ -114,25 +116,25 @@ class EmbeddedDiscovery:
     def _discover_candidate(
         self,
         candidate: DiscoveryCandidate,
-    ) -> tuple[ArchiveTask | None, str]:
+    ) -> tuple[ArchiveTask | None, str, tuple[DiscoveryFinding, ...]]:
         path = candidate.entry_path
         if not path:
-            return None, "missing_or_empty_file"
+            return None, "missing_or_empty_file", ()
         if not self.options.force_scan and path.casefold().endswith(".exe"):
-            return None, "embedded_executable_skipped"
+            return None, "embedded_executable_skipped", ()
 
         try:
             identity = file_identity(path)
             size = int(identity[1])
             if size <= 0:
-                return None, "missing_or_empty_file"
+                return None, "missing_or_empty_file", ()
             scan = scan_embedded_archives(
                 path,
                 expected_size=size,
                 identity=identity,
             )
         except OSError:
-            return None, "embedded_scan_io_error"
+            return None, "embedded_scan_io_error", ()
 
         password_by_offset: dict[int, str] = {}
         encrypted_offsets = [
@@ -151,17 +153,8 @@ class EmbeddedDiscovery:
                     passwords,
                 )
             except (OSError, RuntimeError, ValueError):
-                return None, "embedded_scan_io_error"
+                return None, "embedded_scan_io_error", ()
             status = str(boundary.get("status") or "")
-            if status == "password_required":
-                return None, "embedded_password_required"
-            if status == "wrong_password":
-                return None, "embedded_wrong_password"
-            if status == "truncated":
-                return None, "embedded_truncated"
-            if status != "ok":
-                return None, "embedded_scan_io_error"
-
             resolved_rows = {
                 int(row["offset"]): (int(row["end_offset"]), str(row["password"]))
                 for row in boundary.get("resolved") or []
@@ -169,6 +162,25 @@ class EmbeddedDiscovery:
                 and row.get("end_offset") is not None
                 and row.get("password") is not None
             }
+            blocked_reason = {
+                "password_required": "embedded_password_required",
+                "wrong_password": "embedded_wrong_password",
+                "truncated": "embedded_truncated",
+            }.get(status)
+            if blocked_reason is not None:
+                return (
+                    None,
+                    blocked_reason,
+                    _blocked_findings(
+                        path,
+                        scan,
+                        blocked_reason,
+                        failed_offset=boundary.get("failed_offset"),
+                        resolved_rows=resolved_rows,
+                    ),
+                )
+            if status != "ok":
+                return None, "embedded_scan_io_error", ()
             rewritten = []
             for item in scan.candidates:
                 resolved = resolved_rows.get(item.offset)
@@ -194,13 +206,24 @@ class EmbeddedDiscovery:
                 ),
             )
 
-        if not candidate.is_split and any(
-            item.candidate_kind == "logical_archive"
+        truncated = next((
+            item
+            for item in scan.candidates
+            if item.candidate_kind == "logical_archive"
             and item.boundary_kind != "exact"
             and item.validation == "start_header_crc_truncated_declared_range"
-            for item in scan.candidates
-        ):
-            return None, "embedded_truncated"
+        ), None)
+        if not candidate.is_split and truncated is not None:
+            return (
+                None,
+                "embedded_truncated",
+                _blocked_findings(
+                    path,
+                    scan,
+                    "embedded_truncated",
+                    failed_offset=truncated.offset,
+                ),
+            )
 
         physical = [
             item
@@ -211,7 +234,7 @@ class EmbeddedDiscovery:
             and item.end_offset is not None
         ]
         if not scan.complete or not physical:
-            return None, "no_complete_embedded_archive"
+            return None, "no_complete_embedded_archive", ()
 
         physical.sort(key=lambda item: (item.offset, -item.confidence, item.format))
         segments: list[tuple[ArchiveInputDescriptor, dict[str, Any]]] = []
@@ -249,6 +272,7 @@ class EmbeddedDiscovery:
         return (
             task,
             f"Validated embedded {primary.format_hint} at offset {primary.primary_extent.start if primary.primary_extent else 0}",
+            (),
         )
 
     def _password_candidates(self, path: str) -> list[str]:
@@ -257,6 +281,49 @@ class EmbeddedDiscovery:
             *list(self.config.get("user_passwords") or []),
             *list(self.config.get("builtin_passwords") or []),
         ])
+
+
+def _blocked_findings(
+    path: str,
+    scan,
+    reason: str,
+    *,
+    failed_offset: int | None = None,
+    resolved_rows: dict[int, tuple[int, str]] | None = None,
+) -> tuple[DiscoveryFinding, ...]:
+    """Project already-scanned archive identities without creating execution tasks."""
+
+    resolved_rows = resolved_rows or {}
+    base_name = os.path.basename(path)
+    findings: list[DiscoveryFinding] = []
+    logical = [
+        item
+        for item in scan.candidates
+        if item.candidate_kind == "logical_archive"
+    ]
+    for index, item in enumerate(logical, start=1):
+        resolved = resolved_rows.get(item.offset)
+        end_offset = resolved[0] if resolved is not None else item.end_offset
+        boundary_kind = "exact" if resolved is not None else item.boundary_kind
+        finding_reason = (
+            reason
+            if failed_offset is None or int(item.offset) == int(failed_offset)
+            else "embedded_carrier_blocked"
+        )
+        findings.append(DiscoveryFinding(
+            entry_path=path,
+            source="embedded",
+            format=item.format,
+            status="blocked",
+            reason=finding_reason,
+            logical_name=f"{base_name}_{index:02d}_{item.format}",
+            part_paths=(path,),
+            offset=int(item.offset),
+            end_offset=int(end_offset) if end_offset is not None else None,
+            boundary_kind=boundary_kind,
+            extractable=False,
+        ))
+    return tuple(findings)
 
 
 def select_single_candidate_ratio(

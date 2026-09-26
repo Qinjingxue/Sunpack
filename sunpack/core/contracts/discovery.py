@@ -60,9 +60,27 @@ class DiscoveryTrace:
     reason: str = ""
 
 
+@dataclass(frozen=True, slots=True)
+class DiscoveryFinding:
+    """A confirmed archive identity independent from execution planning."""
+
+    entry_path: str
+    source: str
+    format: str
+    status: str
+    reason: str = ""
+    logical_name: str = ""
+    part_paths: tuple[str, ...] = ()
+    offset: int | None = None
+    end_offset: int | None = None
+    boundary_kind: str = ""
+    extractable: bool = False
+
+
 @dataclass
 class StageResult:
     resolved_tasks: list[ArchiveTask] = field(default_factory=list)
+    findings: list[DiscoveryFinding] = field(default_factory=list)
     claimed_paths: set[str] = field(default_factory=set)
     blocked_paths: set[str] = field(default_factory=set)
     residual_paths: set[str] = field(default_factory=set)

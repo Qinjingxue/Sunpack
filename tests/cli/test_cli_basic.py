@@ -46,6 +46,10 @@ class CliBasicTests(unittest.TestCase):
         self.assertEqual(payload["command"], "scan")
         self.assertIn("task_count", payload["summary"])
         self.assertGreaterEqual(payload["summary"]["task_count"], 1)
+        self.assertIn("finding_count", payload["summary"])
+        self.assertGreaterEqual(payload["summary"]["finding_count"], payload["summary"]["task_count"])
+        self.assertIn("items", payload)
+        self.assertEqual(payload["summary"]["finding_count"], len(payload["items"]))
         self.assertIn("tasks", payload)
 
     def test_inspect_json_shape(self):

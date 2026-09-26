@@ -2,6 +2,7 @@ import os
 from typing import Any
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.discovery import StageResult
 from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
@@ -44,6 +45,27 @@ class ArchiveTaskScanner:
         )
         self._record_provider_failures()
         return tasks
+
+    def scan_stage_result(
+        self,
+        scan_roots: list[str],
+        *,
+        scan_session: DiscoveryScanSession | None = None,
+        is_recursive_scan: bool = False,
+    ) -> StageResult:
+        """Return discovery facts for reporting without changing extraction semantics."""
+
+        self.provider.failed_candidates = []
+        self.provider.failed_candidate_failures = []
+        scan_session = scan_session or DiscoveryScanSession(config=self.config)
+        self.last_scan_session = scan_session
+        result = self.provider.discover_targets(
+            scan_roots,
+            scan_session=scan_session,
+            is_recursive_scan=is_recursive_scan,
+        )
+        self._record_provider_failures()
+        return result
 
     def discover_targets(
         self,

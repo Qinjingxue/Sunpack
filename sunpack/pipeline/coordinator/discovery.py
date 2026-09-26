@@ -77,6 +77,11 @@ class ArchiveDiscoveryPipeline:
                 *format_result.resolved_tasks,
                 *embedded_result.resolved_tasks,
             ],
+            findings=[
+                *relation_result.findings,
+                *format_result.findings,
+                *embedded_result.findings,
+            ],
             claimed_paths=claimed | embedded_result.claimed_paths,
             blocked_paths=blocked | embedded_result.blocked_paths,
             residual_paths=set(embedded_result.residual_paths),

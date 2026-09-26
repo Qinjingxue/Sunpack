@@ -242,6 +242,13 @@ def test_truncated_embedded_7z_is_reported_as_blocked_damage(tmp_path, monkeypat
         trace.reason == "embedded_truncated" and trace.status == "blocked"
         for trace in result.traces
     )
+    assert len(result.findings) == 1
+    finding = result.findings[0]
+    assert finding.format == "7z"
+    assert finding.offset == 16
+    assert finding.status == "blocked"
+    assert finding.reason == "embedded_truncated"
+    assert finding.extractable is False
 
 
 def test_truncated_7z_split_candidate_stays_residual_for_relations(tmp_path, monkeypatch):
@@ -339,3 +346,85 @@ def test_embedded_rar_wrong_password_blocks_whole_carrier(tmp_path, monkeypatch)
         trace.reason == "embedded_wrong_password" and trace.status == "blocked"
         for trace in result.traces
     )
+    assert len(result.findings) == 1
+    finding = result.findings[0]
+    assert finding.format == "rar"
+    assert finding.offset == 16
+    assert finding.end_offset is None
+    assert finding.status == "blocked"
+    assert finding.reason == "embedded_wrong_password"
+    assert finding.extractable is False
+
+
+
+def test_password_blocked_carrier_preserves_every_archive_finding(tmp_path, monkeypatch):
+    path = tmp_path / "carrier.bin"
+    path.write_bytes(b"x" * 160)
+    scan = EmbeddedScanResult(
+        complete=True,
+        candidates=(
+            EmbeddedCandidate(
+                format="zip",
+                offset=8,
+                end_offset=32,
+                confidence=1.0,
+                validation="eocd_geometry_and_first_local_link",
+                candidate_kind="logical_archive",
+                boundary_kind="exact",
+                extractable=True,
+            ),
+            EmbeddedCandidate(
+                format="rar",
+                offset=40,
+                end_offset=None,
+                confidence=1.0,
+                validation="rar5_encryption_header_crc",
+                candidate_kind="logical_archive",
+                boundary_kind="unresolved",
+                extractable=False,
+            ),
+            EmbeddedCandidate(
+                format="7z",
+                offset=96,
+                end_offset=144,
+                confidence=1.0,
+                validation="start_header_crc_and_declared_end",
+                candidate_kind="logical_archive",
+                boundary_kind="exact",
+                extractable=True,
+            ),
+        ),
+        hits=(),
+        read_bytes=160,
+        file_size=160,
+        logical_resolution_complete=False,
+        raw_hit_count=3,
+        budget_exhausted=False,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
+        lambda *_args, **_kwargs: scan,
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.discovery.embedded.discovery.resolve_encrypted_rar_boundaries",
+        lambda _path, _offsets, _passwords: {
+            "status": "password_required",
+            "failed_offset": 40,
+            "resolved": [],
+        },
+    )
+
+    result = EmbeddedDiscovery({}).discover([_candidate(path)])
+
+    assert result.resolved_tasks == []
+    assert result.blocked_paths
+    assert [finding.format for finding in result.findings] == ["zip", "rar", "7z"]
+    assert [finding.offset for finding in result.findings] == [8, 40, 96]
+    assert [finding.end_offset for finding in result.findings] == [32, None, 144]
+    assert [finding.reason for finding in result.findings] == [
+        "embedded_carrier_blocked",
+        "embedded_password_required",
+        "embedded_carrier_blocked",
+    ]
+    assert all(finding.status == "blocked" for finding in result.findings)
+    assert all(not finding.extractable for finding in result.findings)
