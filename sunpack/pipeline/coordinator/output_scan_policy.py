@@ -39,7 +39,7 @@ class NestedOutputScanPolicy:
             return list(inventory.parent_directories())
 
         snapshot = DirectoryScanner(target_dir, config=self._output_scan_config).scan()
-        return snapshot.parent_directories()
+        return [os.path.abspath(parent) for parent in snapshot.parent_directories()]
 
     def prepare_scan(
         self,
