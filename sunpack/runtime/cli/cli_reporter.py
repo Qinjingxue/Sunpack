@@ -1,5 +1,5 @@
 import sys
-from dataclasses import asdict
+from dataclasses import fields
 
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.core.support.json_format import to_json_text
@@ -36,4 +36,5 @@ class CliReporter:
 
     def emit_result(self, result: CliCommandResult):
         if self.json_mode:
-            print(to_json_text(asdict(result)), file=self.stdout, flush=True)
+            payload = {field.name: getattr(result, field.name) for field in fields(result)}
+            print(to_json_text(payload), file=self.stdout, flush=True)
