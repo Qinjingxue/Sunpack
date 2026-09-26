@@ -165,7 +165,7 @@ def test_promotion_drains_archive_session_borrow_before_publishing_gate(tmp_path
     monkeypatch.setattr(archive_sessions, "NativeArchiveSession", FakeArchiveSession)
     monkeypatch.setattr(
         archive_sessions.sunpack_native,
-        "release_reader_resources_under",
+        "release_reader_resources_under_roots",
         lambda _root: {},
     )
     monkeypatch.setattr(
