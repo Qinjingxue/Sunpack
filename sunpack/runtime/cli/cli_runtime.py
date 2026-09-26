@@ -241,6 +241,25 @@ def scan_result_to_item(res) -> dict[str, Any]:
     }
 
 
+def scan_finding_to_item(finding) -> dict[str, Any]:
+    part_paths = list(finding.part_paths or ())
+    if not part_paths and finding.entry_path:
+        part_paths = [finding.entry_path]
+    return {
+        "main_path": finding.entry_path,
+        "logical_name": str(finding.logical_name or ""),
+        "all_parts": part_paths,
+        "format": str(finding.format or ""),
+        "discovery_source": str(finding.source or ""),
+        "discovery_reason": str(finding.reason or ""),
+        "status": str(finding.status or ""),
+        "offset": finding.offset,
+        "end_offset": finding.end_offset,
+        "boundary_kind": str(finding.boundary_kind or ""),
+        "extractable": bool(finding.extractable),
+    }
+
+
 def inspect_result_to_item(res) -> dict[str, Any]:
     return {
         "path": res.path,
