@@ -233,6 +233,7 @@ def _indexed_scheduler_for_test():
     watcher._inflight_requests = []
     watcher._inflight_path_counts = {}
     watcher._active_states = {}
+    watcher._active_epoch = 0
     watcher._ready_heap = []
     watcher._password_dirty_dirs = {}
     watcher._cache_cleanup_deadline = None
@@ -262,7 +263,39 @@ def test_watch_ready_index_lazily_discards_stale_generations_without_mapping_sca
 
     assert watcher.next_delay_seconds() == pytest.approx(15.0)
     assert len(watcher._ready_heap) == 1
-    assert watcher._ready_heap[0][1] == state.generation
+    assert watcher._ready_heap[0][2] == state.generation
+
+
+def test_watch_ready_index_rejects_stale_entry_from_previous_active_lifecycle(monkeypatch):
+    watcher = _indexed_scheduler_for_test()
+    path = os.path.abspath("recreated.zip")
+    candidate = WatchCandidate(path, 10, 1.0, "file", 1)
+
+    with watcher._lock:
+        first_state = watcher._new_active_state_locked(
+            last_event_at=100.0,
+            quiet_seconds=1.0,
+        )
+        watcher._pending[path] = candidate
+        watcher._active_states[path] = first_state
+        watcher._schedule_active_locked(path, first_state)
+        watcher._pending.pop(path)
+        watcher._active_states.pop(path)
+
+        second_state = watcher._new_active_state_locked(
+            last_event_at=100.0,
+            quiet_seconds=5.0,
+        )
+        watcher._pending[path] = candidate
+        watcher._active_states[path] = second_state
+        watcher._schedule_active_locked(path, second_state)
+
+    monkeypatch.setattr(scheduler_module.time, "time", lambda: 100.0)
+    monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 100.0)
+
+    assert watcher.next_delay_seconds() == pytest.approx(5.0)
+    assert len(watcher._ready_heap) == 1
+    assert watcher._ready_heap[0][1] == second_state.epoch
 
 
 def test_watch_ready_index_skips_inflight_path_and_requeues_current_generation(monkeypatch):
