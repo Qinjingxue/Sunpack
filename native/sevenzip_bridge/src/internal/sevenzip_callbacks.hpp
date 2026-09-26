@@ -674,8 +674,6 @@ namespace sunpack::sevenzip
 
             std::wstring output_dir,
 
-            std::vector<std::wstring> decoded_names,
-
             ExtractProgressCallback progress,
 
             bool dry_run = false,
@@ -698,8 +696,6 @@ namespace sunpack::sevenzip
                 password_(std::move(password)),
 
                 output_dir_(std::move(output_dir)),
-
-                decoded_names_(std::move(decoded_names)),
 
                 progress_(std::move(progress)),
 
@@ -985,23 +981,16 @@ namespace sunpack::sevenzip
             clear_prop(value);
 
             std::wstring name;
-            if (!decoded_names_.empty())
+            if (get_item_property(archive_, index, kpidPath, value))
             {
-                name = decoded_names_[index];
+                name = prop_text(value);
             }
-            else
+            clear_prop(value);
+            if (name.empty() && get_item_property(archive_, index, kpidName, value))
             {
-                if (get_item_property(archive_, index, kpidPath, value))
-                {
-                    name = prop_text(value);
-                }
-                clear_prop(value);
-                if (name.empty() && get_item_property(archive_, index, kpidName, value))
-                {
-                    name = prop_text(value);
-                }
-                clear_prop(value);
+                name = prop_text(value);
             }
+            clear_prop(value);
 
             if (name.empty())
             {
@@ -1521,8 +1510,6 @@ namespace sunpack::sevenzip
         std::wstring password_;
 
         std::wstring output_dir_;
-
-        std::vector<std::wstring> decoded_names_;
 
         ExtractProgressCallback progress_;
 
