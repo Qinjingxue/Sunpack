@@ -64,11 +64,16 @@ class ArchiveMetadataScanner:
                 archive_input=None,
             )
         )
-        signature = self._descriptor_signature(descriptor)
+        source_generation = (
+            task.runtime.get("source_generation")
+            if task is not None and isinstance(getattr(task, "runtime", None), dict)
+            else None
+        )
         cached = task.runtime.get(self.TASK_CACHE_KEY) if task is not None else None
         if (
             isinstance(cached, dict)
-            and cached.get("signature") == signature
+            and cached.get("source_generation") == source_generation
+            and cached.get("descriptor") is descriptor
             and cached.get("format_hint") == descriptor.format_hint
         ):
             return self._result_from_dict(cached.get("result"), descriptor.entry_path)
@@ -76,7 +81,8 @@ class ArchiveMetadataScanner:
         result = self._scan_descriptor(descriptor)
         if task is not None:
             task.runtime[self.TASK_CACHE_KEY] = {
-                "signature": signature,
+                "source_generation": source_generation,
+                "descriptor": descriptor,
                 "format_hint": descriptor.format_hint,
                 "result": self._result_to_dict(result),
             }
@@ -97,35 +103,6 @@ class ArchiveMetadataScanner:
             archive_path=os.path.normpath(archive_path),
             part_paths=part_paths,
             format_hint=str(format_hint or "").lower().lstrip("."),
-        )
-
-    @staticmethod
-    def _descriptor_signature(descriptor: ArchiveInputDescriptor) -> tuple:
-        extents = descriptor.extents or [part.extent for part in descriptor.parts]
-        physical = []
-        for path in dict.fromkeys(descriptor.part_paths() or [descriptor.entry_path]):
-            try:
-                stat = os.stat(path)
-                physical.append((path, stat.st_size, stat.st_mtime_ns))
-            except OSError:
-                physical.append((path, 0, 0))
-        return (
-            descriptor.open_mode,
-            descriptor.entry_path,
-            descriptor.format_hint,
-            descriptor.volume_style,
-            tuple(
-                (
-                    part.path,
-                    int(part.extent.start),
-                    part.extent.end,
-                    part.volume_number,
-                    part.canonical_name,
-                )
-                for part in descriptor.parts
-            ),
-            tuple((item.path, int(item.start), item.end) for item in extents),
-            tuple(physical),
         )
 
     @staticmethod

@@ -1725,6 +1725,7 @@ fn ordinary_file_group_to_dict(
     dict.set_item("all_parts", PyList::new(py, [&row.path])?)?;
     dict.set_item("is_split_candidate", false)?;
     dict.set_item("head_size", row.size)?;
+    dict.set_item("logical_size", row.size)?;
     dict.set_item("split_volumes", PyList::empty(py))?;
     let head_metadata = row
         .anchor
@@ -1797,6 +1798,7 @@ fn validated_proposal_to_dict(
     dict.set_item("all_parts", PyList::new(py, &all_parts)?)?;
     dict.set_item("is_split_candidate", true)?;
     dict.set_item("head_size", head_anchor.map(|anchor| anchor.size))?;
+    dict.set_item("logical_size", proposal_logical_size(proposal, &validation.anchors))?;
     dict.set_item("split_volumes", PyList::new(py, &volume_dicts)?)?;
     let metadata = if let Some(anchor) = head_anchor {
         relation_confirmed_anchor_to_dict(py, anchor)?
@@ -1868,6 +1870,7 @@ fn password_error_proposal_to_dict(
     dict.set_item("all_parts", PyList::new(py, &all_parts)?)?;
     dict.set_item("is_split_candidate", true)?;
     dict.set_item("head_size", anchor.map(|value| value.size))?;
+    dict.set_item("logical_size", proposal_logical_size(proposal, &validation.anchors))?;
     dict.set_item("split_volumes", PyList::new(py, &volume_dicts)?)?;
     let mut metadata = anchor
         .map(|value| relation_confirmed_anchor_to_dict(py, value))
@@ -1889,6 +1892,17 @@ fn password_error_proposal_to_dict(
     dict.set_item("carrier_size", carrier_size)?;
     dict.set_item("format_reject_mask", anchor.map(|value| value.format_reject_mask).unwrap_or(0))?;
     Ok(dict.unbind())
+}
+
+fn proposal_logical_size(
+    proposal: &RelationProposal,
+    anchors: &HashMap<String, VolumeAnchor>,
+) -> Option<u64> {
+    proposal.volumes.iter().try_fold(0u64, |total, (path, _, _, _, _)| {
+        anchors
+            .get(&path.to_ascii_lowercase())
+            .map(|anchor| total.saturating_add(anchor.size))
+    })
 }
 
 fn proposal_volume_dicts(

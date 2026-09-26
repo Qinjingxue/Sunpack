@@ -39,6 +39,7 @@ def relation_group_to_candidate(group: CandidateGroup) -> DiscoveryCandidate:
             if group.carrier_path and isinstance(group.carrier_size, int)
             else group.head_size
         ),
+        logical_size=group.logical_size,
         format_reject_mask=int(group.format_reject_mask or 0),
         relation_anchor=metadata,
         is_split=bool(group.is_split_candidate or group.relation.is_split_related),

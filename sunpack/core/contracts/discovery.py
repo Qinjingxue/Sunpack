@@ -17,6 +17,7 @@ class DiscoveryCandidate:
     cleanup_paths: tuple[str, ...]
     route: str
     size: int | None = None
+    logical_size: int | None = None
     format_reject_mask: int = 0
     relation_anchor: dict[str, Any] = field(default_factory=dict)
     is_split: bool = False
