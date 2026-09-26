@@ -4,8 +4,8 @@ use pyo3::types::{PyAny, PyDict, PyList};
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use unicode_normalization::UnicodeNormalization;
+use crc32fast::Hasher as Crc32Hasher;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -16,39 +16,9 @@ pub(crate) fn compute_directory_crc_manifest(
     max_files: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     let root = PathBuf::from(output_dir);
-    let result = PyDict::new(py);
-    let files = PyList::empty(py);
-    let errors = PyList::empty(py);
-    result.set_item("files", &files)?;
-    result.set_item("errors", &errors)?;
-
-    if !root.exists() {
-        result.set_item("status", "missing")?;
-        return Ok(result.unbind());
-    }
-    if !root.is_dir() {
-        result.set_item("status", "not_directory")?;
-        return Ok(result.unbind());
-    }
-
     let limit = max_files.unwrap_or(usize::MAX);
-    let mut total_files = 0usize;
-    let mut scanned_files = 0usize;
-    walk_directory(
-        py,
-        &root,
-        &root,
-        limit,
-        &mut total_files,
-        &mut scanned_files,
-        &files,
-        &errors,
-    )?;
-    result.set_item("status", "ok")?;
-    result.set_item("total_files", total_files)?;
-    result.set_item("scanned_files", scanned_files)?;
-    result.set_item("truncated", scanned_files < total_files)?;
-    Ok(result.unbind())
+    let scan = py.detach(|| scan_crc_manifest(&root, limit));
+    manifest_to_py(py, scan)
 }
 
 #[pyfunction]
@@ -59,63 +29,10 @@ pub(crate) fn sample_directory_readability(
     read_bytes: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     let root = PathBuf::from(output_dir);
-    let result = PyDict::new(py);
-    let samples = PyList::empty(py);
-    let errors = PyList::empty(py);
-    result.set_item("samples", &samples)?;
-    result.set_item("errors", &errors)?;
-
-    if !root.exists() {
-        result.set_item("status", "missing")?;
-        return Ok(result.unbind());
-    }
-    if !root.is_dir() {
-        result.set_item("status", "not_directory")?;
-        return Ok(result.unbind());
-    }
-
     let max_samples = max_samples.unwrap_or(64).max(1);
     let read_bytes = read_bytes.unwrap_or(4096).max(1);
-    let mut file_paths = Vec::new();
-    collect_regular_files(&root, &root, &mut file_paths, &errors, py)?;
-
-    let selected = select_sample_paths(&file_paths, max_samples);
-    let mut readable_files = 0usize;
-    let mut empty_files = 0usize;
-    let mut unreadable_files = 0usize;
-    let mut bytes_read = 0u64;
-
-    for path in selected {
-        match read_sample(&path, read_bytes) {
-            Ok(sample) => {
-                readable_files += 1;
-                if sample.size == 0 {
-                    empty_files += 1;
-                }
-                bytes_read += sample.bytes_read;
-                let item = PyDict::new(py);
-                item.set_item("path", relative_path(&path, &root))?;
-                item.set_item("size", sample.size)?;
-                item.set_item("bytes_read", sample.bytes_read)?;
-                item.set_item("empty", sample.size == 0)?;
-                samples.append(item)?;
-            }
-            Err(err) => {
-                unreadable_files += 1;
-                append_error(py, &errors, &path, &root, &err.to_string())?;
-            }
-        }
-    }
-
-    result.set_item("status", "ok")?;
-    result.set_item("total_files", file_paths.len())?;
-    result.set_item("sampled_files", readable_files + unreadable_files)?;
-    result.set_item("readable_files", readable_files)?;
-    result.set_item("unreadable_files", unreadable_files)?;
-    result.set_item("empty_files", empty_files)?;
-    result.set_item("bytes_read", bytes_read)?;
-    result.set_item("truncated", file_paths.len() > max_samples)?;
-    Ok(result.unbind())
+    let scan = py.detach(|| scan_directory_readability(&root, max_samples, read_bytes));
+    readability_to_py(py, scan)
 }
 
 #[pyfunction]
@@ -126,36 +43,20 @@ pub(crate) fn match_archive_output_crc_coverage(
     max_files: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
     let root = PathBuf::from(output_dir);
+    let expected = archive_items_from_py(archive_files)?;
+    let limit = max_files.unwrap_or(usize::MAX);
+    let scan = py.detach(|| scan_crc_output_files(&root, limit));
+
     let result = PyDict::new(py);
     let errors = PyList::empty(py);
     result.set_item("errors", &errors)?;
-
-    if !root.exists() {
-        result.set_item("status", "missing")?;
-        return Ok(result.unbind());
-    }
-    if !root.is_dir() {
-        result.set_item("status", "not_directory")?;
+    append_errors_to_py(py, &errors, &scan.errors)?;
+    if scan.status != "ok" {
+        result.set_item("status", scan.status)?;
         return Ok(result.unbind());
     }
 
-    let expected = archive_items_from_py(archive_files)?;
-    let limit = max_files.unwrap_or(usize::MAX);
-    let mut output_files = Vec::new();
-    let mut total_files = 0usize;
-    let mut scanned_files = 0usize;
-    collect_crc_output_files(
-        py,
-        &root,
-        &root,
-        limit,
-        &mut total_files,
-        &mut scanned_files,
-        &mut output_files,
-        &errors,
-    )?;
-
-    let output_index = OutputIndex::new(output_files);
+    let output_index = OutputIndex::new(scan.files);
     let mismatches = PyList::empty(py);
     let missing = PyList::empty(py);
     let observations = PyList::empty(py);
@@ -278,9 +179,9 @@ pub(crate) fn match_archive_output_crc_coverage(
 
     let coverage_dict = coverage.to_py(py)?;
     result.set_item("status", "ok")?;
-    result.set_item("total_files", total_files)?;
-    result.set_item("scanned_files", scanned_files)?;
-    result.set_item("truncated", scanned_files < total_files)?;
+    result.set_item("total_files", scan.total_files)?;
+    result.set_item("scanned_files", scan.scanned_files)?;
+    result.set_item("truncated", scan.scanned_files < scan.total_files)?;
     result.set_item("mismatches", mismatches)?;
     result.set_item("missing", missing)?;
     result.set_item("coverage", coverage_dict)?;
@@ -288,222 +189,230 @@ pub(crate) fn match_archive_output_crc_coverage(
     Ok(result.unbind())
 }
 
-fn walk_directory(
-    py: Python<'_>,
-    root: &Path,
-    current: &Path,
-    limit: usize,
-    total_files: &mut usize,
-    scanned_files: &mut usize,
-    files: &Bound<'_, PyList>,
-    errors: &Bound<'_, PyList>,
-) -> PyResult<()> {
-    let entries = match std::fs::read_dir(current) {
-        Ok(entries) => entries,
-        Err(err) => {
-            append_error(py, errors, current, root, &err.to_string())?;
-            return Ok(());
-        }
-    };
-
-    for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                append_error(py, errors, current, root, &err.to_string())?;
-                continue;
-            }
-        };
-        let path = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                append_error(py, errors, &path, root, &err.to_string())?;
-                continue;
-            }
-        };
-        if metadata.is_dir() {
-            walk_directory(
-                py,
-                root,
-                &path,
-                limit,
-                total_files,
-                scanned_files,
-                files,
-                errors,
-            )?;
-            continue;
-        }
-        if !metadata.is_file() {
-            continue;
-        }
-        *total_files += 1;
-        if *scanned_files >= limit {
-            continue;
-        }
-        match crc32_file(&path) {
-            Ok(crc32) => {
-                let item = PyDict::new(py);
-                item.set_item("path", relative_path(&path, root))?;
-                item.set_item("size", metadata.len())?;
-                item.set_item("crc32", crc32)?;
-                files.append(item)?;
-                *scanned_files += 1;
-            }
-            Err(err) => append_error(py, errors, &path, root, &err.to_string())?,
-        }
-    }
-    Ok(())
+#[derive(Clone)]
+struct FileCrcRecord {
+    path: String,
+    size: u64,
+    crc32: u32,
 }
 
-fn collect_crc_output_files(
-    py: Python<'_>,
-    root: &Path,
-    current: &Path,
-    limit: usize,
-    total_files: &mut usize,
-    scanned_files: &mut usize,
-    files: &mut Vec<OutputFile>,
-    errors: &Bound<'_, PyList>,
-) -> PyResult<()> {
-    let entries = match std::fs::read_dir(current) {
-        Ok(entries) => entries,
-        Err(err) => {
-            append_error(py, errors, current, root, &err.to_string())?;
-            return Ok(());
-        }
-    };
+#[derive(Clone)]
+struct ScanError {
+    path: String,
+    message: String,
+}
 
+struct ManifestScan {
+    status: &'static str,
+    files: Vec<FileCrcRecord>,
+    errors: Vec<ScanError>,
+    total_files: usize,
+    scanned_files: usize,
+}
+
+struct OutputScan {
+    status: &'static str,
+    files: Vec<OutputFile>,
+    errors: Vec<ScanError>,
+    total_files: usize,
+    scanned_files: usize,
+}
+
+struct ReadabilityRecord {
+    path: String,
+    size: u64,
+    bytes_read: u64,
+}
+
+struct ReadabilityScan {
+    status: &'static str,
+    samples: Vec<ReadabilityRecord>,
+    errors: Vec<ScanError>,
+    total_files: usize,
+    readable_files: usize,
+    unreadable_files: usize,
+    empty_files: usize,
+    bytes_read: u64,
+    truncated: bool,
+}
+
+fn scan_crc_manifest(root: &Path, limit: usize) -> ManifestScan {
+    if !root.exists() {
+        return ManifestScan { status: "missing", files: Vec::new(), errors: Vec::new(), total_files: 0, scanned_files: 0 };
+    }
+    if !root.is_dir() {
+        return ManifestScan { status: "not_directory", files: Vec::new(), errors: Vec::new(), total_files: 0, scanned_files: 0 };
+    }
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    let mut total_files = 0;
+    let mut scanned_files = 0;
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    walk_crc_manifest(root, root, limit, &mut total_files, &mut scanned_files, &mut files, &mut errors, &mut buffer);
+    ManifestScan { status: "ok", files, errors, total_files, scanned_files }
+}
+
+fn walk_crc_manifest(root: &Path, current: &Path, limit: usize, total_files: &mut usize, scanned_files: &mut usize, files: &mut Vec<FileCrcRecord>, errors: &mut Vec<ScanError>, buffer: &mut [u8]) {
+    let entries = match std::fs::read_dir(current) { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); return; } };
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                append_error(py, errors, current, root, &err.to_string())?;
-                continue;
-            }
-        };
+        let entry = match entry { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); continue; } };
         let path = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                append_error(py, errors, &path, root, &err.to_string())?;
-                continue;
-            }
-        };
+        let metadata = match entry.metadata() { Ok(v) => v, Err(err) => { push_scan_error(errors, &path, root, err.to_string()); continue; } };
         if metadata.is_dir() {
-            if entry
-                .file_name()
-                .to_string_lossy()
-                .eq_ignore_ascii_case(".sunpack")
-            {
-                continue;
-            }
-            collect_crc_output_files(
-                py,
-                root,
-                &path,
-                limit,
-                total_files,
-                scanned_files,
-                files,
-                errors,
-            )?;
+            walk_crc_manifest(root, &path, limit, total_files, scanned_files, files, errors, buffer);
             continue;
         }
-        if !metadata.is_file() {
-            continue;
-        }
+        if !metadata.is_file() { continue; }
         *total_files += 1;
-        if *scanned_files >= limit {
+        if *scanned_files >= limit { continue; }
+        match crc32_file_with_buffer(&path, buffer) {
+            Ok(crc32) => { files.push(FileCrcRecord { path: relative_path(&path, root), size: metadata.len(), crc32 }); *scanned_files += 1; }
+            Err(err) => push_scan_error(errors, &path, root, err.to_string()),
+        }
+    }
+}
+
+fn scan_crc_output_files(root: &Path, limit: usize) -> OutputScan {
+    if !root.exists() { return OutputScan { status: "missing", files: Vec::new(), errors: Vec::new(), total_files: 0, scanned_files: 0 }; }
+    if !root.is_dir() { return OutputScan { status: "not_directory", files: Vec::new(), errors: Vec::new(), total_files: 0, scanned_files: 0 }; }
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+    let mut total_files = 0;
+    let mut scanned_files = 0;
+    let mut buffer = vec![0u8; BUFFER_SIZE];
+    collect_crc_output_files(root, root, limit, &mut total_files, &mut scanned_files, &mut files, &mut errors, &mut buffer);
+    OutputScan { status: "ok", files, errors, total_files, scanned_files }
+}
+
+fn collect_crc_output_files(root: &Path, current: &Path, limit: usize, total_files: &mut usize, scanned_files: &mut usize, files: &mut Vec<OutputFile>, errors: &mut Vec<ScanError>, buffer: &mut [u8]) {
+    let entries = match std::fs::read_dir(current) { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); return; } };
+    for entry in entries {
+        let entry = match entry { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); continue; } };
+        let path = entry.path();
+        let metadata = match entry.metadata() { Ok(v) => v, Err(err) => { push_scan_error(errors, &path, root, err.to_string()); continue; } };
+        if metadata.is_dir() {
+            if entry.file_name().to_string_lossy().eq_ignore_ascii_case(".sunpack") { continue; }
+            collect_crc_output_files(root, &path, limit, total_files, scanned_files, files, errors, buffer);
             continue;
         }
+        if !metadata.is_file() { continue; }
+        *total_files += 1;
+        if *scanned_files >= limit { continue; }
         let rel_path = clean_relative_archive_path(&relative_path(&path, root));
-        if rel_path.is_empty() {
-            continue;
-        }
-        match crc32_file(&path) {
-            Ok(crc32) => {
-                files.push(OutputFile {
-                    path: rel_path,
-                    size: metadata.len(),
-                    crc32,
-                    matched_by: "",
-                });
-                *scanned_files += 1;
-            }
-            Err(err) => append_error(py, errors, &path, root, &err.to_string())?,
+        if rel_path.is_empty() { continue; }
+        match crc32_file_with_buffer(&path, buffer) {
+            Ok(crc32) => { files.push(OutputFile { path: rel_path, size: metadata.len(), crc32, matched_by: "" }); *scanned_files += 1; }
+            Err(err) => push_scan_error(errors, &path, root, err.to_string()),
         }
     }
-    Ok(())
 }
 
-fn append_error(
-    py: Python<'_>,
-    errors: &Bound<'_, PyList>,
-    path: &Path,
-    root: &Path,
-    message: &str,
-) -> PyResult<()> {
-    let item = PyDict::new(py);
-    item.set_item("path", relative_path(path, root))?;
-    item.set_item("message", message)?;
-    errors.append(item)
-}
-
-fn collect_regular_files(
-    root: &Path,
-    current: &Path,
-    paths: &mut Vec<PathBuf>,
-    errors: &Bound<'_, PyList>,
-    py: Python<'_>,
-) -> PyResult<()> {
-    let entries = match std::fs::read_dir(current) {
-        Ok(entries) => entries,
-        Err(err) => {
-            append_error(py, errors, current, root, &err.to_string())?;
-            return Ok(());
+fn scan_directory_readability(root: &Path, max_samples: usize, read_bytes: usize) -> ReadabilityScan {
+    if !root.exists() { return ReadabilityScan { status: "missing", samples: Vec::new(), errors: Vec::new(), total_files: 0, readable_files: 0, unreadable_files: 0, empty_files: 0, bytes_read: 0, truncated: false }; }
+    if !root.is_dir() { return ReadabilityScan { status: "not_directory", samples: Vec::new(), errors: Vec::new(), total_files: 0, readable_files: 0, unreadable_files: 0, empty_files: 0, bytes_read: 0, truncated: false }; }
+    let mut file_paths = Vec::new();
+    let mut errors = Vec::new();
+    collect_regular_files(root, root, &mut file_paths, &mut errors);
+    let total_files = file_paths.len();
+    let selected = select_sample_paths(&file_paths, max_samples);
+    let mut samples = Vec::with_capacity(selected.len());
+    let mut readable_files = 0;
+    let mut unreadable_files = 0;
+    let mut empty_files = 0;
+    let mut bytes_read = 0;
+    let mut buffer = vec![0u8; read_bytes];
+    for path in selected {
+        match read_sample_with_buffer(&path, &mut buffer) {
+            Ok(sample) => {
+                readable_files += 1;
+                if sample.size == 0 { empty_files += 1; }
+                bytes_read += sample.bytes_read;
+                samples.push(ReadabilityRecord { path: relative_path(&path, root), size: sample.size, bytes_read: sample.bytes_read });
+            }
+            Err(err) => { unreadable_files += 1; push_scan_error(&mut errors, &path, root, err.to_string()); }
         }
-    };
+    }
+    ReadabilityScan { status: "ok", samples, errors, total_files, readable_files, unreadable_files, empty_files, bytes_read, truncated: total_files > max_samples }
+}
+
+fn collect_regular_files(root: &Path, current: &Path, paths: &mut Vec<PathBuf>, errors: &mut Vec<ScanError>) {
+    let entries = match std::fs::read_dir(current) { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); return; } };
     for entry in entries {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(err) => {
-                append_error(py, errors, current, root, &err.to_string())?;
-                continue;
-            }
-        };
+        let entry = match entry { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); continue; } };
         let path = entry.path();
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(err) => {
-                append_error(py, errors, &path, root, &err.to_string())?;
-                continue;
-            }
-        };
-        if metadata.is_dir() {
-            collect_regular_files(root, &path, paths, errors, py)?;
-        } else if metadata.is_file() {
-            paths.push(path);
-        }
+        let metadata = match entry.metadata() { Ok(v) => v, Err(err) => { push_scan_error(errors, &path, root, err.to_string()); continue; } };
+        if metadata.is_dir() { collect_regular_files(root, &path, paths, errors); } else if metadata.is_file() { paths.push(path); }
     }
-    Ok(())
 }
 
 fn select_sample_paths(paths: &[PathBuf], max_samples: usize) -> Vec<PathBuf> {
-    if paths.len() <= max_samples {
-        return paths.to_vec();
-    }
-    if max_samples == 1 {
-        return vec![paths[0].clone()];
-    }
+    if paths.len() <= max_samples { return paths.to_vec(); }
+    if max_samples == 1 { return vec![paths[0].clone()]; }
     let last = paths.len() - 1;
-    (0..max_samples)
-        .map(|index| {
-            let selected = index * last / (max_samples - 1);
-            paths[selected].clone()
-        })
-        .collect()
+    (0..max_samples).map(|index| paths[index * last / (max_samples - 1)].clone()).collect()
+}
+
+fn push_scan_error(errors: &mut Vec<ScanError>, path: &Path, root: &Path, message: String) {
+    errors.push(ScanError { path: relative_path(path, root), message });
+}
+
+fn append_errors_to_py(py: Python<'_>, errors: &Bound<'_, PyList>, scan_errors: &[ScanError]) -> PyResult<()> {
+    for error in scan_errors {
+        let item = PyDict::new(py);
+        item.set_item("path", &error.path)?;
+        item.set_item("message", &error.message)?;
+        errors.append(item)?;
+    }
+    Ok(())
+}
+
+fn manifest_to_py(py: Python<'_>, scan: ManifestScan) -> PyResult<Py<PyDict>> {
+    let result = PyDict::new(py);
+    let files = PyList::empty(py);
+    let errors = PyList::empty(py);
+    result.set_item("files", &files)?;
+    result.set_item("errors", &errors)?;
+    append_errors_to_py(py, &errors, &scan.errors)?;
+    result.set_item("status", scan.status)?;
+    if scan.status != "ok" { return Ok(result.unbind()); }
+    for record in scan.files {
+        let item = PyDict::new(py);
+        item.set_item("path", record.path)?;
+        item.set_item("size", record.size)?;
+        item.set_item("crc32", record.crc32)?;
+        files.append(item)?;
+    }
+    result.set_item("total_files", scan.total_files)?;
+    result.set_item("scanned_files", scan.scanned_files)?;
+    result.set_item("truncated", scan.scanned_files < scan.total_files)?;
+    Ok(result.unbind())
+}
+
+fn readability_to_py(py: Python<'_>, scan: ReadabilityScan) -> PyResult<Py<PyDict>> {
+    let result = PyDict::new(py);
+    let samples = PyList::empty(py);
+    let errors = PyList::empty(py);
+    result.set_item("samples", &samples)?;
+    result.set_item("errors", &errors)?;
+    append_errors_to_py(py, &errors, &scan.errors)?;
+    result.set_item("status", scan.status)?;
+    if scan.status != "ok" { return Ok(result.unbind()); }
+    for record in scan.samples {
+        let item = PyDict::new(py);
+        item.set_item("path", record.path)?;
+        item.set_item("size", record.size)?;
+        item.set_item("bytes_read", record.bytes_read)?;
+        item.set_item("empty", record.size == 0)?;
+        samples.append(item)?;
+    }
+    result.set_item("total_files", scan.total_files)?;
+    result.set_item("sampled_files", scan.readable_files + scan.unreadable_files)?;
+    result.set_item("readable_files", scan.readable_files)?;
+    result.set_item("unreadable_files", scan.unreadable_files)?;
+    result.set_item("empty_files", scan.empty_files)?;
+    result.set_item("bytes_read", scan.bytes_read)?;
+    result.set_item("truncated", scan.truncated)?;
+    Ok(result.unbind())
 }
 
 #[derive(Clone)]
@@ -808,26 +717,19 @@ struct ReadSample {
     bytes_read: u64,
 }
 
-fn read_sample(path: &Path, read_bytes: usize) -> std::io::Result<ReadSample> {
+fn read_sample_with_buffer(path: &Path, buffer: &mut [u8]) -> std::io::Result<ReadSample> {
     let reader = ManagedReader::open(path)?;
     let size = reader.len();
     if size == 0 {
-        return Ok(ReadSample {
-            size,
-            bytes_read: 0,
-        });
+        return Ok(ReadSample { size, bytes_read: 0 });
     }
-    let mut buffer = vec![0u8; read_bytes];
-    let head_read = reader.read_into_at(0, &mut buffer)? as u64;
+    let head_read = reader.read_into_at(0, buffer)? as u64;
     let mut tail_read = 0u64;
-    if size > read_bytes as u64 {
-        let tail_offset = size.saturating_sub(read_bytes as u64);
-        tail_read = reader.read_into_at(tail_offset, &mut buffer)? as u64;
+    if size > buffer.len() as u64 {
+        let tail_offset = size.saturating_sub(buffer.len() as u64);
+        tail_read = reader.read_into_at(tail_offset, buffer)? as u64;
     }
-    Ok(ReadSample {
-        size,
-        bytes_read: head_read + tail_read,
-    })
+    Ok(ReadSample { size, bytes_read: head_read + tail_read })
 }
 
 fn relative_path(path: &Path, root: &Path) -> String {
@@ -837,45 +739,14 @@ fn relative_path(path: &Path, root: &Path) -> String {
         .replace('\\', "/")
 }
 
-fn crc32_file(path: &Path) -> std::io::Result<u32> {
+fn crc32_file_with_buffer(path: &Path, buffer: &mut [u8]) -> std::io::Result<u32> {
     let reader = ManagedReader::open(path)?;
     let mut cursor = reader.stream_cursor();
-    let mut crc = 0xFFFF_FFFFu32;
-    let mut buffer = vec![0u8; BUFFER_SIZE];
+    let mut hasher = Crc32Hasher::new();
     loop {
-        let read = cursor.read(&mut buffer)?;
-        if read == 0 {
-            break;
-        }
-        crc = crc32_update(crc, &buffer[..read]);
+        let read = cursor.read(buffer)?;
+        if read == 0 { break; }
+        hasher.update(&buffer[..read]);
     }
-    Ok(!crc)
-}
-
-fn crc32_update(mut crc: u32, bytes: &[u8]) -> u32 {
-    let table = crc32_table();
-    for byte in bytes {
-        let index = ((crc ^ u32::from(*byte)) & 0xFF) as usize;
-        crc = (crc >> 8) ^ table[index];
-    }
-    crc
-}
-
-fn crc32_table() -> &'static [u32; 256] {
-    static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
-    TABLE.get_or_init(|| {
-        let mut table = [0u32; 256];
-        for i in 0..256u32 {
-            let mut crc = i;
-            for _ in 0..8 {
-                if crc & 1 != 0 {
-                    crc = (crc >> 1) ^ 0xEDB8_8320;
-                } else {
-                    crc >>= 1;
-                }
-            }
-            table[i as usize] = crc;
-        }
-        table
-    })
+    Ok(hasher.finalize())
 }
