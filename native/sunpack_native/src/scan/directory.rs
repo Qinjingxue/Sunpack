@@ -325,9 +325,6 @@ pub(crate) struct OutputInventoryVerificationSnapshot {
     pub(crate) exists: bool,
     pub(crate) is_dir: bool,
     pub(crate) files: Arc<Vec<OutputFileRecord>>,
-    pub(crate) worker_crc_available: bool,
-    pub(crate) worker_inventory_complete: bool,
-    pub(crate) identity_paths: bool,
 }
 
 impl NativeOutputInventory {
@@ -337,9 +334,6 @@ impl NativeOutputInventory {
             exists: self.exists,
             is_dir: self.is_dir,
             files: Arc::clone(&self.files),
-            worker_crc_available: self.worker_crc_available,
-            worker_inventory_complete: self.worker_inventory_complete,
-            identity_paths: self.identity_paths,
         }
     }
 }
