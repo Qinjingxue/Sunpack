@@ -1391,6 +1391,39 @@ void g32_query_failure_invalidates_inflight_probe() {
           "G-32: only the fresh probe may emit space_resumed");
 }
 
+// 查询失败发生在 probe 已经真实成功并结算之后时，不得反向改写已经完成的恢复。
+// 这与 G-32 的顺序相反：G-32 固定 query failure -> stale probe success；这里固定
+// probe success -> later query failure，避免端到端测试把此前合法的 resumed 当成 stale resume。
+void g33_late_query_failure_does_not_rewrite_completed_resume() {
+    auto log = std::make_shared<SinkLog>();
+    auto gate = make_gate("job:g33", log, 20ms);
+
+    gate->register_job("A");
+    gate->report_space_failure(ERROR_DISK_FULL, unresolved_failed_path());
+    check(gate->poll(100), "G-33: first successful sample must authorise a probe");
+
+    auto result = wait_bounded(gate);
+    check(result.kind == VolumeSpaceGate::WaitResult::Kind::Probe,
+          "G-33: must acquire the probe lease");
+    result.lease.report_success();
+
+    check(gate->phase() == VolumeSpacePhase::Ready,
+          "G-33: successful probe must complete recovery before later query failure");
+    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 1,
+          "G-33: successful probe must emit exactly one space_resumed");
+
+    std::uint64_t ignored_free = 0;
+    std::uint64_t ignored_total = 0;
+    check(!gate->query_free_bytes(&ignored_free, &ignored_total),
+          "G-33: synthetic volume query must fail after the completed resume");
+    gate->note_query_failure(gate->last_query_error());
+
+    check(gate->phase() == VolumeSpacePhase::Ready,
+          "G-33: later query failure must not retroactively reopen a completed episode");
+    check(log->count(VolumeSpaceTransition::Kind::Resumed) == 1,
+          "G-33: later query failure must not rewrite or duplicate resume history");
+}
+
 }  // namespace
 
 #endif
@@ -1441,6 +1474,8 @@ int main(int argc, char **argv) {
          g31_monitor_drops_episode_history_after_recovery},
         {"G-32 query failure invalidates inflight probe",
          g32_query_failure_invalidates_inflight_probe},
+        {"G-33 late query failure does not rewrite completed resume",
+         g33_late_query_failure_does_not_rewrite_completed_resume},
     };
     constexpr int kCaseCount = static_cast<int>(std::size(cases));
 
