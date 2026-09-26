@@ -52,6 +52,7 @@ class ArchiveTaskProvider:
                     is_recursive_scan=True,
                 )
                 result.resolved_tasks.extend(partial.resolved_tasks)
+                result.findings.extend(partial.findings)
                 result.claimed_paths.update(partial.claimed_paths)
                 result.blocked_paths.update(partial.blocked_paths)
                 result.residual_paths.update(partial.residual_paths)
