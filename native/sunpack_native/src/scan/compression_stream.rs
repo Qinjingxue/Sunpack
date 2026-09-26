@@ -1546,6 +1546,23 @@ mod tests {
     }
 
     #[test]
+    fn gzip_integrity_walk_stops_before_multi_member_carrier_tail() {
+        let first = gzip_member(b"first");
+        let second = gzip_member(b"second");
+        let mut data = first;
+        data.extend_from_slice(&second);
+        let archive_end = data.len();
+        data.extend_from_slice(b"carrier-tail");
+
+        let source = reader(data.clone());
+        let result =
+            analyze_gzip_structure(&source, 0, data.len() as u64, 8 * 1024 * 1024).unwrap();
+        assert_eq!(result.structure.end_offset, archive_end as u64);
+        assert_eq!(result.structure.stream_count, 2);
+        assert_eq!(result.structure.integrity, IntegrityStatus::Verified);
+    }
+
+    #[test]
     fn bzip2_huffman_walk_reaches_stream_end() {
         let data = bzip2::read::BzEncoder::new(
             &vec![b'B'; 2 * 1024 * 1024][..],
