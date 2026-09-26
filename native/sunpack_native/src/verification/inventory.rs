@@ -202,7 +202,7 @@ impl OutputIndex {
         item: &OutputFileRecord,
         buffer: &mut [u8],
     ) -> Result<(Option<u32>, bool), MatchError> {
-        if let Some(value) = item.output_crc32.or(item.crc32) {
+        if let Some(value) = item.output_crc32 {
             return Ok((Some(value), false));
         }
         let path = output_absolute_path(&self.root, item);
@@ -306,9 +306,18 @@ fn match_inventory(
             continue;
         };
         let output = &index.files[output_index];
+        let actual_size = output.bytes_written;
+        let size_incomplete = item
+            .size
+            .is_some_and(|expected_size| actual_size < expected_size);
 
-        let mut actual_crc = output.output_crc32.or(output.crc32);
-        if verify_crc && item.has_crc && item.crc32.is_some() {
+        let mut actual_crc = output.output_crc32;
+        if verify_crc
+            && item.has_crc
+            && item.crc32.is_some()
+            && output.status != 2
+            && !size_incomplete
+        {
             if actual_crc.is_some() {
                 used_worker_crc = true;
             } else {
@@ -351,7 +360,6 @@ fn match_inventory(
         }
 
         coverage.matched_files += 1;
-        let actual_size = output.size;
         if let Some(expected_size) = item.size {
             coverage.matched_bytes = coverage
                 .matched_bytes
@@ -372,6 +380,9 @@ fn match_inventory(
         let (state, progress) = if output.status == 2 {
             coverage.failed_files += 1;
             ("failed", size_progress.or(Some(0.0)))
+        } else if size_incomplete {
+            coverage.partial_files += 1;
+            ("partial", size_progress)
         } else if verify_crc && item.has_crc && crc_ok == Some(false) {
             coverage.failed_files += 1;
             mismatch_count += 1;
@@ -384,10 +395,7 @@ fn match_inventory(
             }
             ("failed", Some(0.0))
         } else if let Some(expected_size) = item.size {
-            if actual_size < expected_size {
-                coverage.partial_files += 1;
-                ("partial", size_progress)
-            } else if item.has_crc && verify_crc && actual_crc.is_none() {
+            if item.has_crc && verify_crc && actual_crc.is_none() {
                 ("unverified", size_progress)
             } else {
                 coverage.complete_files += 1;
