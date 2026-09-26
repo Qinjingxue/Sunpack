@@ -1,0 +1,41 @@
+name: Pipeline refactor validation
+
+on:
+  push:
+    branches:
+      - refactor/independent-archive-pipeline
+
+jobs:
+  acceptance:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustup default stable
+          rustup target add x86_64-pc-windows-msvc
+          cargo --version
+          rustc -Vv
+      - name: Prepare acceptance environment
+        shell: pwsh
+        run: |
+          .\scripts\setup_windows_dev.ps1 -Arch x64
+      - name: Run acceptance tests
+        shell: pwsh
+        run: |
+          .\run_acceptance_tests.ps1 -NoWait -SkipEnvironmentRefresh -StepTimeoutSeconds 900
