@@ -57,7 +57,6 @@ def test_native_toast_identity_uses_current_user_and_keeps_machine_com_activator
     assert "remove_legacy_toast_shortcut" not in source
 
 
-
 def test_native_toast_replaces_progress_per_batch_without_deleting_terminal_history():
     source = (ROOT / "native/toast_host/src/main.cpp").read_text(encoding="utf-8")
     presenter = source[source.index("class ToastPresenter"):source.index("struct ToastContext")]
