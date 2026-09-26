@@ -22,6 +22,17 @@ _REASON_KEYS = {
     "embedded_carrier_blocked": "cli.scan.carrier_blocked",
 }
 
+_SOURCE_KEYS = {
+    "embedded": "cli.scan.source.embedded",
+    "relations": "cli.scan.source.relations",
+    "detection": "cli.scan.source.detection",
+}
+
+_STATUS_KEYS = {
+    "resolved": "cli.scan.status.resolved",
+    "blocked": "cli.scan.status.blocked",
+}
+
 
 def register(subparsers, ctx):
     parser = subparsers.add_parser(
@@ -64,14 +75,21 @@ def handle(args, ctx):
         "blocked_finding_count": sum(1 for item in finding_items if item["status"] == "blocked"),
     }
     if not args.json:
-        reporter.info(ctx.t("cli.scan.identified", count=summary["finding_count"]))
+        reporter.info(ctx.t(
+            "cli.scan.identified",
+            count=summary["finding_count"],
+            resolved=sum(1 for item in finding_items if item["status"] == "resolved"),
+            blocked=summary["blocked_finding_count"],
+        ))
         for item in finding_items:
+            source_key = _SOURCE_KEYS.get(item["discovery_source"])
+            status_key = _STATUS_KEYS.get(item["status"])
             reporter.info(ctx.t("cli.item_path", path=item["main_path"]))
             reporter.info(ctx.t(
                 "cli.scan.details",
-                source=item["discovery_source"] or "-",
+                source=ctx.t(source_key) if source_key else item["discovery_source"] or "-",
                 format=item["format"] or "-",
-                status=item["status"] or "-",
+                status=ctx.t(status_key) if status_key else item["status"] or "-",
                 parts=len(item["all_parts"]),
             ))
             if item["offset"] is not None:
