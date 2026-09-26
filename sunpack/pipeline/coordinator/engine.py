@@ -690,7 +690,7 @@ class _SourceCleanup:
 
         try:
             outcome = await broker.run(
-                "postprocess",
+                "background_source_cleanup",
                 request.task_key or self.request_id,
                 run_cleanup,
                 request_id=self.request_id,
