@@ -5,7 +5,7 @@ import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterable
 
 import sunpack_native
 from sunpack_native import NativeArchiveSession, clear_reader_resources
@@ -178,18 +178,44 @@ def clear_archive_sessions() -> dict:
     }
 
 
-def release_archive_sessions_under(path: str) -> dict[str, Any]:
-    root = os.path.abspath(os.path.normpath(path))
+def _is_under(candidate: str, root: str) -> bool:
+    try:
+        return os.path.commonpath((candidate, root)) == root
+    except ValueError:
+        return False
 
-    def is_under(candidate: str) -> bool:
-        try:
-            return os.path.commonpath((candidate, root)) == root
-        except ValueError:
-            return False
 
+def _merge_release_roots(
+    paths: Iterable[os.PathLike[str] | str],
+) -> tuple[str, ...]:
+    normalized = tuple(
+        dict.fromkeys(
+            os.path.abspath(os.path.normpath(os.fspath(path)))
+            for path in paths
+            if path
+        )
+    )
+    return tuple(
+        root
+        for root in normalized
+        if not any(
+            other != root and _is_under(root, other)
+            for other in normalized
+        )
+    )
+
+
+def release_archive_sessions_under_roots(
+    paths: Iterable[os.PathLike[str] | str],
+) -> dict[str, Any]:
+    roots = _merge_release_roots(paths)
     with _CHANGED:
-        stale = [key for key in _SESSIONS if is_under(key[0])]
+        stale = [
+            key
+            for key in _SESSIONS
+            if any(_is_under(key[0], root) for root in roots)
+        ]
         entries = [_SESSIONS.pop(key) for key in stale]
     sessions = _close_entries(entries)
-    reader = dict(sunpack_native.release_reader_resources_under(root))
+    reader = dict(sunpack_native.release_reader_resources_under_roots(list(roots)))
     return {"sessions": sessions, "reader": reader}
