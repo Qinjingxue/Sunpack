@@ -950,6 +950,26 @@ def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
     assert (out_dir / source.name).read_bytes() == payload
 
 
+def test_runner_serializes_only_codepage_for_filename_override(tmp_path):
+    archive = tmp_path / "legacy.zip"
+    archive.write_bytes(b"PK")
+    task = make_archive_task(archive, format_hint="zip")
+    runner = SevenZipRunner({})
+
+    job = runner._build_job(
+        archive_path=str(archive),
+        part_paths=[str(archive)],
+        out_dir=str(tmp_path / "out"),
+        password=None,
+        password_candidates=None,
+        selected_codepage="932",
+        task=task,
+    )
+
+    assert job["codepage"] == "932"
+    assert "decoded_names" not in job
+
+
 def test_worker_applies_explicit_shift_jis_item_paths(tmp_path):
     worker = _require_worker_or_skip()
     archive, expected_name, payload_bytes = _create_shift_jis_zip(tmp_path)
