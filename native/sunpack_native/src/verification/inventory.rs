@@ -448,7 +448,7 @@ fn match_inventory(
         detail_count,
         detail_truncated: include_observations
             && detail_offset.saturating_add(detail_count) < detail_total,
-        used_worker_crc: used_worker_crc && snapshot.worker_crc_available,
+        used_worker_crc,
         crc_files_read,
     }
 }
