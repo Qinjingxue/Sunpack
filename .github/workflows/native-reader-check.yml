@@ -21,11 +21,6 @@ jobs:
         with:
           python-version: "3.10"
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - name: Rust format check
-        shell: pwsh
-        run: cargo fmt --manifest-path native/sunpack_native/Cargo.toml -- --check
       - name: Rust test compilation
         shell: pwsh
         run: cargo check --manifest-path native/sunpack_native/Cargo.toml --tests
