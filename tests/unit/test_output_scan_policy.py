@@ -199,6 +199,14 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker facts must avoid reopen")),
     )
     monkeypatch.setattr(
+        "sunpack.pipeline.extraction.output_inventory.OutputInventory.file_head_columns",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker head columns must stay native")),
+    )
+    monkeypatch.setattr(
+        "sunpack.pipeline.extraction.output_inventory.OutputInventory.file_columns",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker file columns must stay native")),
+    )
+    monkeypatch.setattr(
         "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.inventory_file_indices",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Python inventory filtering must be bypassed")),
     )
