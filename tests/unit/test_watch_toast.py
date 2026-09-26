@@ -137,7 +137,6 @@ def test_concurrent_requests_emit_one_unified_success_after_debounce(tmp_path):
     coordinator.stop()
 
 
-
 def test_batch_id_is_stable_through_final_and_unique_per_batch(tmp_path):
     host = _Host()
     coordinator = WatchToastCoordinator(host, _config(debounce_ms=0), str(tmp_path / "state"))
