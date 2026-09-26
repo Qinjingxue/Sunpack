@@ -6,7 +6,7 @@ from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.verification import VerificationResult
-from sunpack.pipeline.coordinator.extraction_batch import BatchExtractionOutcome, ExtractionBatchRunner
+from sunpack.pipeline.coordinator.archive_job import ArchiveJobOutcome, ArchiveJobExecutor
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
 from tests.helpers.archive_tasks import make_archive_task
@@ -90,7 +90,7 @@ def test_complete_embedded_children_are_not_policy_rejected_with_failed_siblings
         embedded_results=[({"segment_id": "plain"}, child)],
     )
 
-    assert BatchExtractionOutcome(result=outer).policy_rejected_partial_output is False
+    assert ArchiveJobOutcome(result=outer).policy_rejected_partial_output is False
 
 
 def test_collect_result_applies_main_pipeline_cleanup_after_diagnostics(tmp_path):
@@ -111,8 +111,8 @@ def test_collect_result_applies_main_pipeline_cleanup_after_diagnostics(tmp_path
 
         error="damaged",
     )
-    outcome = BatchExtractionOutcome(result=extraction, planned_out_dir=str(output))
-    runner = object.__new__(ExtractionBatchRunner)
+    outcome = ArchiveJobOutcome(result=extraction, planned_out_dir=str(output))
+    runner = object.__new__(ArchiveJobExecutor)
     runner.context = RunState()
     runner.config = {}
 
