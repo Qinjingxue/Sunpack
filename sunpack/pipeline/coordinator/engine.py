@@ -1160,6 +1160,9 @@ class _RequestRuntime:
                     broker=broker,
                     cancellation=cancellation,
                 )
+
+            if output_dir:
+                notify_shell_directories_updated([output_dir])
         finally:
             if not released_source_ref:
                 cleanup_request = self.source_cleanup.release_task(
