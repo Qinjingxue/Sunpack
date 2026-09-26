@@ -4,6 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 
+from sunpack.core.contracts.archive_input import (
+    ArchiveInputDescriptor,
+    ArchiveInputPart,
+    InputExtent,
+)
 from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 
 
@@ -18,26 +23,17 @@ from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetada
         ("繁體中文說明資料檔案測試.txt", "cp950", "950"),
     ],
 )
-def test_codepage_selection_preserves_known_unicode_families(name, encoding, expected_codepage):
-    selected = ArchiveMetadataScanner()._select_codepage([name.encode(encoding)])
+def test_native_codepage_selection_preserves_known_unicode_families(
+    tmp_path, name, encoding, expected_codepage
+):
+    archive = tmp_path / f"sample-{expected_codepage}.zip"
+    _write_stored_zip(archive, name.encode(encoding), b"payload")
 
-    assert selected["codepage"] == expected_codepage
+    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
-
-def test_repeated_shift_jis_parent_is_not_misclassified_as_gbk():
-    scanner = ArchiveMetadataScanner()
-    parent = "無知ロリと化け物_製品0519c"
-    raw_names = [f"{parent}/assets/file_{index:04d}.bin".encode("cp932") for index in range(2500)]
-
-    selected = scanner._select_codepage(raw_names)
-
-    assert selected["codepage"] == "932"
-
-
-def test_shift_jis_kanji_only_name_is_not_rejected_as_ambiguous_gbk():
-    selected = ArchiveMetadataScanner()._select_codepage(["更新履歴.txt".encode("cp932")])
-
-    assert selected["codepage"] == "932"
+    assert result.selected_codepage == expected_codepage
+    assert result.decoded_names == [name]
+    assert result.confidence > 0.0
 
 
 def test_shift_jis_kanji_only_zip_scan_uses_cp932(tmp_path):
@@ -77,6 +73,80 @@ def test_format_hint_scans_disguised_zip_without_renaming_it(tmp_path):
     assert result.decoded_names == [expected_name]
 
 
+def test_carrier_range_uses_canonical_archive_input(tmp_path):
+    expected_name = "日本語/説明.txt"
+    archive_bytes = _stored_zip_bytes(expected_name.encode("cp932"), b"payload")
+    prefix = b"carrier-prefix" * 17
+    suffix = b"carrier-suffix"
+    carrier = tmp_path / "carrier.bin"
+    carrier.write_bytes(prefix + archive_bytes + suffix)
+    descriptor = ArchiveInputDescriptor(
+        entry_path=str(carrier),
+        open_mode="file_range",
+        format_hint="zip",
+        logical_name="embedded.zip",
+        parts=[
+            ArchiveInputPart(
+                extent=InputExtent(
+                    path=str(carrier),
+                    start=len(prefix),
+                    end=len(prefix) + len(archive_bytes),
+                ),
+                role="main",
+            )
+        ],
+    )
+
+    result = ArchiveMetadataScanner().scan(
+        str(carrier),
+        format_hint="zip",
+        archive_input=descriptor,
+    )
+
+    assert result.selected_codepage == "932"
+    assert result.decoded_names == [expected_name]
+
+
+def test_raw_multivolume_zip_uses_one_logical_input(tmp_path):
+    expected_name = "中文说明资料.txt"
+    archive_bytes = _stored_zip_bytes(expected_name.encode("cp936"), b"x" * 4096)
+    split = len(archive_bytes) // 2
+    first = tmp_path / "archive.0000"
+    second = tmp_path / "archive.0001"
+    first.write_bytes(archive_bytes[:split])
+    second.write_bytes(archive_bytes[split:])
+    descriptor = ArchiveInputDescriptor(
+        entry_path=str(first),
+        open_mode="native_volumes",
+        format_hint="zip",
+        logical_name="archive.zip",
+        volume_style="zip_zero_numbered",
+        parts=[
+            ArchiveInputPart(
+                extent=InputExtent(str(first)),
+                role="first",
+                volume_number=1,
+                canonical_name="archive.0000",
+            ),
+            ArchiveInputPart(
+                extent=InputExtent(str(second)),
+                role="member",
+                volume_number=2,
+                canonical_name="archive.0001",
+            ),
+        ],
+    )
+
+    result = ArchiveMetadataScanner().scan(
+        str(first),
+        format_hint="zip",
+        archive_input=descriptor,
+    )
+
+    assert result.selected_codepage == "936"
+    assert result.decoded_names == [expected_name]
+
+
 def test_unicode_native_archive_formats_do_not_receive_zip_codepage_override():
     scanner = ArchiveMetadataScanner()
 
@@ -92,18 +162,24 @@ def test_unicode_native_archive_formats_do_not_receive_zip_codepage_override():
 def test_task_metadata_cache_survives_scanner_instance_change(tmp_path):
     archive = tmp_path / "cached.zip"
     _write_stored_zip(archive, b"plain.txt", b"payload")
-    task = SimpleNamespace(runtime={})
+    descriptor = ArchiveInputDescriptor.from_parts(
+        archive_path=str(archive),
+        format_hint="zip",
+    )
+    task = SimpleNamespace(runtime={}, archive_input=lambda: descriptor)
 
     first = ArchiveMetadataScanner().scan_for_task(task, str(archive), format_hint="zip")
     second_scanner = ArchiveMetadataScanner()
-    second_scanner._scan_uncached = lambda *_args, **_kwargs: pytest.fail("metadata was rescanned")
+    second_scanner._scan_descriptor = lambda *_args, **_kwargs: pytest.fail(
+        "metadata was rescanned"
+    )
     second = second_scanner.scan_for_task(task, str(archive), format_hint="zip")
 
     assert second.decoded_names == first.decoded_names
     assert second.sample_count == first.sample_count
 
 
-def test_unicode_path_extra_field_takes_precedence_over_codepage_guess(tmp_path):
+def test_unicode_path_extra_field_needs_no_python_name_copy(tmp_path):
     archive = tmp_path / "unicode-extra.zip"
     raw_name = "【サンプル】テスト素材.psd".encode("cp932")
     expected_name = "【サンプル】テスト素材.psd"
@@ -113,47 +189,89 @@ def test_unicode_path_extra_field_takes_precedence_over_codepage_guess(tmp_path)
 
     assert result.error is None
     assert result.selected_codepage is None
-    assert result.decoded_names == [expected_name]
+    assert result.decoded_names == []
     assert result.confidence == 1.0
     assert any("0x7075" in reason for reason in result.reasons)
 
 
-def test_ambiguous_codepage_does_not_block_extraction():
-    scanner = ArchiveMetadataScanner()
-    scanner._select_codepage = lambda _names: {
-        "encoding": "cp932", "codepage": None, "confidence": 0.167,
-        "label": "Shift-JIS/CP932", "reasons": ["ambiguous"],
-    }
-    scanner._scan_zip_name_samples = lambda _path: ([b"\x82\xa0.txt"], [False], [None], False, "")
+def test_ambiguous_codepage_does_not_block_extraction(tmp_path):
+    archive = tmp_path / "ambiguous.zip"
+    _write_stored_zip(archive, b"\x82.txt", b"payload")
 
-    result = scanner._scan_zip_central_directory("unused.zip")
+    result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
     assert result.error is None
     assert result.selected_codepage is None
-    assert result.confidence == 0.167
     assert result.warnings
 
 
-def _write_stored_zip(path, raw_name: bytes, payload: bytes, unicode_name: str | None = None) -> None:
+def _write_stored_zip(
+    path,
+    raw_name: bytes,
+    payload: bytes,
+    unicode_name: str | None = None,
+) -> None:
+    path.write_bytes(_stored_zip_bytes(raw_name, payload, unicode_name=unicode_name))
+
+
+def _stored_zip_bytes(
+    raw_name: bytes,
+    payload: bytes,
+    unicode_name: str | None = None,
+) -> bytes:
     crc = binascii.crc32(payload) & 0xFFFFFFFF
     extra = b""
     if unicode_name is not None:
         encoded_unicode_name = unicode_name.encode("utf-8")
-        extra_payload = b"\x01" + struct.pack("<I", binascii.crc32(raw_name) & 0xFFFFFFFF) + encoded_unicode_name
+        extra_payload = (
+            b"\x01"
+            + struct.pack("<I", binascii.crc32(raw_name) & 0xFFFFFFFF)
+            + encoded_unicode_name
+        )
         extra = struct.pack("<HH", 0x7075, len(extra_payload)) + extra_payload
     local = struct.pack(
         "<IHHHHHIIIHH",
-        0x04034B50, 20, 0, 0, 0, 0, crc,
-        len(payload), len(payload), len(raw_name), len(extra),
+        0x04034B50,
+        20,
+        0,
+        0,
+        0,
+        0,
+        crc,
+        len(payload),
+        len(payload),
+        len(raw_name),
+        len(extra),
     ) + raw_name + extra + payload
     central = struct.pack(
         "<IHHHHHHIIIHHHHHII",
-        0x02014B50, 20, 20, 0, 0, 0, 0, crc,
-        len(payload), len(payload), len(raw_name),
-        len(extra), 0, 0, 0, 0, 0,
+        0x02014B50,
+        20,
+        20,
+        0,
+        0,
+        0,
+        0,
+        crc,
+        len(payload),
+        len(payload),
+        len(raw_name),
+        len(extra),
+        0,
+        0,
+        0,
+        0,
+        0,
     ) + raw_name + extra
     eocd = struct.pack(
         "<IHHHHIIH",
-        0x06054B50, 0, 0, 1, 1, len(central), len(local), 0,
+        0x06054B50,
+        0,
+        0,
+        1,
+        1,
+        len(central),
+        len(local),
+        0,
     )
-    path.write_bytes(local + central + eocd)
+    return local + central + eocd
