@@ -5,11 +5,10 @@ from sunpack.pipeline.verification.methods._archive_output_match import (
     ArchiveOutputCoverage,
     archive_files_from_names,
     coverage_details,
-    coverage_from_archive_and_output,
+    coverage_from_native_inventory,
 )
 from sunpack.pipeline.verification.methods._output_stats import (
-    output_files_for_evidence,
-    output_file_index_for_evidence,
+    output_inventory_for_evidence,
     output_stats_for_evidence,
     should_emit_file_observations,
 )
@@ -60,12 +59,19 @@ class ManifestSizeMatchMethod:
                     expected_bytes=0, matched_bytes=0, complete_bytes=0,
                 )
             else:
-                name_coverage = coverage_from_archive_and_output(
+                detail_limit = (
+                    min(len(expected_names), max(1, int(config.get("detail_page_size", 128) or 128)))
+                    if emit_observations
+                    else 0
+                )
+                name_coverage, _ = coverage_from_native_inventory(
                     archive_files_from_names(expected_names),
-                    output_files_for_evidence(evidence),
+                    output_inventory_for_evidence(evidence),
                     method=self.name,
+                    basename_mode="unique",
                     include_observations=emit_observations,
-                    output_index=output_file_index_for_evidence(evidence),
+                    detail_limit=detail_limit,
+                    max_issue_items=0,
                 )
             if name_coverage.missing_files:
                 issues.append(VerificationIssue(
