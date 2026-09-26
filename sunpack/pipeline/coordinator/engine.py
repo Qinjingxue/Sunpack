@@ -1276,14 +1276,20 @@ def _finalize_response(
     if response.summary.postprocess_completed and retry_results is None:
         return response
     shell_refresh_paths = list(response.artifacts.shell_refresh_paths)
-    previous = None
-    cleanup_requests = ()
-    if retry_results is not None:
-        # Only failed cleanups are retried here; successful sources are already removed task by task.
-        shell_refresh_paths = []
-        cleanup_requests = tuple((item.path,) for item in retry_results)
-        previous = {path_key(item.path): item for item in retry_results}
+    if retry_results is None:
+        notify_shell_directories_updated(shell_refresh_paths)
+        return replace(
+            response,
+            summary=replace(response.summary, postprocess_completed=True),
+        )
+
+    # Only failed source cleanups are retried here. Successful sources were
+    # already handled beside their archive jobs, and flattening already ran at
+    # the end of each recursive subtree.
+    previous = {path_key(item.path): item for item in retry_results}
+    cleanup_requests = tuple((item.path,) for item in retry_results)
     mutation_roots = [path for family in cleanup_requests for path in family]
+    shell_refresh_paths = []
     if mutation_roots:
         with promotion_barrier(
             mutation_roots,
