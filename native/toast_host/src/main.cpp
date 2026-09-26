@@ -690,11 +690,11 @@ public:
     }
 
 private:
-    static std::wstring toast_tag(const Snapshot& snapshot) {
-        if (snapshot.batch_id.empty() || snapshot.batch_id.size() > 64) {
+    static std::wstring toast_tag(const Snapshot& snapshot, std::wstring_view suffix) {
+        if (snapshot.batch_id.empty() || snapshot.batch_id.size() + suffix.size() > 64) {
             throw std::runtime_error("invalid Toast batch id");
         }
-        return snapshot.batch_id;
+        return snapshot.batch_id + std::wstring(suffix);
     }
 
     void remove(std::wstring_view tag) noexcept {
@@ -717,7 +717,7 @@ private:
     }
 
     void show_progress(const Snapshot& snapshot, std::uint64_t sequence) {
-        const std::wstring tag = toast_tag(snapshot);
+        const std::wstring tag = toast_tag(snapshot, L"-p");
         NotificationData data;
         const auto values = data.Values();
         values.Insert(L"title", snapshot.title);
@@ -744,7 +744,7 @@ private:
 
         XmlDocument document;
         document.LoadXml(
-            LR"(<toast duration="long" launch="noop"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text><progress title="{progressTitle}" value="{progressValue}" valueStringOverride="{progressValueString}" status="{progressStatus}"/></binding></visual></toast>)"
+            LR"(<toast launch="noop"><visual><binding template="ToastGeneric"><text>{title}</text><text>{body}</text><progress title="{progressTitle}" value="{progressValue}" valueStringOverride="{progressValueString}" status="{progressStatus}"/></binding></visual></toast>)"
         );
         ToastNotification toast(document);
         toast.Tag(tag);
@@ -756,14 +756,20 @@ private:
     }
 
     void show_final(const Snapshot& snapshot) {
-        const std::wstring tag = toast_tag(snapshot);
-        if (!progress_tag_.empty() && progress_tag_ != tag) {
+        const std::wstring progress_tag = toast_tag(snapshot, L"-p");
+        const std::wstring final_tag = toast_tag(snapshot, L"-f");
+
+        // Progress is transient state. Remove it before publishing the terminal
+        // event so completion is a distinct popup request rather than an in-place
+        // replacement of a progress notification that may still be on screen.
+        if (!progress_tag_.empty() && progress_tag_ != progress_tag) {
             clear();
         }
+        remove(progress_tag);
+        progress_tag_.clear();
 
-        // Reusing the batch tag makes Show() replace the progress toast with
-        // the terminal layout. Do not remove it from History: Windows owns the
-        // banner lifetime and keeps the final notification in Notification Center.
+        // Terminal notifications intentionally use their own per-batch tag.
+        // Windows owns their banner lifetime and keeps them in Notification Center.
         std::wstring xml = L"<toast launch=\"noop\"><visual><binding template=\"ToastGeneric\"><text>";
         xml += xml_escape(snapshot.title);
         xml += L"</text>";
@@ -786,13 +792,11 @@ private:
         XmlDocument document;
         document.LoadXml(xml);
         ToastNotification toast(document);
-        toast.Tag(tag);
+        toast.Tag(final_tag);
         toast.Group(kToastGroup);
+        toast.SuppressPopup(false);
         observe_dismissal(toast, "final");
         notifier_.Show(toast);
-        if (progress_tag_ == tag) {
-            progress_tag_.clear();
-        }
     }
 
     winrt::Windows::UI::Notifications::ToastNotifier notifier_{nullptr};
