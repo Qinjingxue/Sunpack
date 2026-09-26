@@ -51,7 +51,7 @@ class ArchiveTestCrcMethod:
         max_reported_items = max(1, int(config.get("max_reported_items", 20) or 20))
         emit_observations = should_emit_file_observations(evidence, self.name)
         detail_limit = (
-            min(len(archive_files), max(1, int(config.get("detail_page_size", 128) or 128)))
+            min(len(archive_files), 128)
             if emit_observations
             else 0
         )
