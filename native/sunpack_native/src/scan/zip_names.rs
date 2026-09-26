@@ -6,6 +6,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::OnceLock;
 
 const ZIP_EOCD_SIGNATURE: &[u8] = b"PK\x05\x06";
 const ZIP_CENTRAL_DIRECTORY_SIGNATURE: &[u8] = b"PK\x01\x02";
@@ -22,6 +23,9 @@ const TRADITIONAL_COMMON_CHARS: &str =
     "的一是在不了有和人這中大為上個國我以要他繁體中文說明資料檔案測試";
 const JAPANESE_COMMON_KANJI: &str =
     "日本語説明書第一章画像映像音声写真漫画小説資料設定保存読込名前新旧上下左右大小年月日時分秒人子女男学校会社仕事場所東京大阪京都北海道";
+const CP437_HIGH: &str =
+    "ÇüéâäàåçêëèïîìÄÅÉæÆôöòûùÿÖÜ¢£¥₧ƒáíóúñÑªº¿⌐¬½¼¡«»░▒▓│┤╡╢╖╕╣║╗╝╜╛┐└┴┬├─┼╞╟╚╔╩╦╠═╬╧╨╤╥╙╘╒╓╫╪┘┌█▄▌▐▀αßΓπΣσµτΦΘΩδ∞φε∩≡±≥≤⌠⌡÷≈°∙·√ⁿ²■ ";
+static CP437_TABLE: OnceLock<Vec<char>> = OnceLock::new();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ZipNameEntry {
@@ -547,10 +551,6 @@ fn select_codepage(raw_names: &[&[u8]]) -> (EncodingScore, SelectionEvidence, f6
 }
 
 fn score_encoding(raw_names: &[&[u8]], encoding: EncodingKind) -> EncodingScore {
-    if encoding == EncodingKind::Cp437 {
-        return score_cp437(raw_names);
-    }
-
     let mut score = 0i64;
     let mut decoded_count = 0usize;
     let mut components = HashSet::<String>::new();
@@ -591,56 +591,9 @@ fn score_encoding(raw_names: &[&[u8]], encoding: EncodingKind) -> EncodingScore 
     }
 }
 
-fn score_cp437(raw_names: &[&[u8]]) -> EncodingScore {
-    let mut components = HashSet::<Vec<u8>>::new();
-    for raw_name in raw_names {
-        for component in raw_name.split(|byte| *byte == b'\\' || *byte == b'/') {
-            if !component.is_empty() {
-                components.insert(component.to_vec());
-            }
-        }
-    }
-
-    let mut score = 0i64;
-    let mut stats = NameStats::default();
-    for component in components {
-        if component.is_empty() {
-            score -= 5;
-            continue;
-        }
-        if component.iter().any(|byte| {
-            *byte == 0 || (*byte < 32 && !matches!(*byte, b'\t' | b'\n' | b'\r'))
-        }) {
-            score -= 20;
-        }
-        if component
-            .iter()
-            .any(|byte| matches!(*byte, b'<' | b'>' | b':' | b'"' | b'|' | b'?' | b'*'))
-        {
-            score -= 10;
-        }
-        if component.as_slice() == b"." || component.as_slice() == b".." {
-            score -= 3;
-        }
-        let high_bytes = component.iter().filter(|byte| **byte >= 0x80).count();
-        stats.latin_symbols += high_bytes;
-        score -= (high_bytes as i64) * 3;
-    }
-    if !raw_names.is_empty() {
-        score += 4;
-    }
-
-    EncodingScore {
-        kind: EncodingKind::Cp437,
-        score,
-        decoded_count: raw_names.len(),
-        stats,
-    }
-}
-
 fn decode_bytes(encoding: EncodingKind, raw: &[u8]) -> Option<String> {
     match encoding {
-        EncodingKind::Cp437 => None,
+        EncodingKind::Cp437 => Some(decode_cp437(raw)),
         EncodingKind::Utf8 => std::str::from_utf8(raw).ok().map(str::to_owned),
         EncodingKind::Cp936 => GBK
             .decode_without_bom_handling_and_without_replacement(raw)
@@ -652,6 +605,19 @@ fn decode_bytes(encoding: EncodingKind, raw: &[u8]) -> Option<String> {
             .decode_without_bom_handling_and_without_replacement(raw)
             .map(|value| value.into_owned()),
     }
+}
+
+fn decode_cp437(raw: &[u8]) -> String {
+    let table = CP437_TABLE.get_or_init(|| CP437_HIGH.chars().collect());
+    raw.iter()
+        .map(|byte| {
+            if *byte < 0x80 {
+                *byte as char
+            } else {
+                table[(*byte - 0x80) as usize]
+            }
+        })
+        .collect()
 }
 
 fn score_legacy_code_units(raw_names: &[&[u8]], encoding: EncodingKind) -> i64 {
