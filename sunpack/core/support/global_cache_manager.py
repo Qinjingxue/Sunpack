@@ -1,6 +1,5 @@
 import copy
 import json
-import os
 import subprocess
 import threading
 from collections import OrderedDict
@@ -21,7 +20,12 @@ class CacheManager:
         self.default_capacity = max(1, default_capacity)
         self._caches: dict[str, OrderedDict[tuple, Any]] = {}
         self._capacities: dict[str, int] = {}
+        self._immutable_namespaces: set[str] = set()
         self._lock = threading.Lock()
+
+    def register_immutable_namespace(self, namespace: str) -> None:
+        with self._lock:
+            self._immutable_namespaces.add(namespace)
 
     def get(self, namespace: str, key: tuple):
         with self._lock:
@@ -30,12 +34,16 @@ class CacheManager:
                 return None
             value = cache[key]
             cache.move_to_end(key)
-            return copy.deepcopy(value)
+            immutable = namespace in self._immutable_namespaces
+        return value if immutable else copy.deepcopy(value)
 
     def set(self, namespace: str, key: tuple, value: Any):
         with self._lock:
+            immutable = namespace in self._immutable_namespaces
+        stored = value if immutable else copy.deepcopy(value)
+        with self._lock:
             cache = self._caches.setdefault(namespace, OrderedDict())
-            cache[key] = copy.deepcopy(value)
+            cache[key] = stored
             cache.move_to_end(key)
             capacity = self._capacities.get(namespace, self.default_capacity)
             while len(cache) > capacity:
