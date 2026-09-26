@@ -14,7 +14,6 @@ class PipelineTarget:
 
 @dataclass(frozen=True)
 class PipelineArtifacts:
-    flatten_targets: tuple[str, ...] = ()
     shell_refresh_paths: tuple[str, ...] = ()
 
 
