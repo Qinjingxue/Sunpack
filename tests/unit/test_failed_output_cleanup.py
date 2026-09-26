@@ -6,6 +6,7 @@ from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.verification import VerificationResult
+from sunpack.core.contracts.results import OutcomeKind
 from sunpack.pipeline.coordinator.archive_job import ArchiveJobOutcome, ArchiveJobExecutor
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
@@ -118,7 +119,8 @@ def test_collect_result_applies_main_pipeline_cleanup_after_diagnostics(tmp_path
 
     returned = runner.collect_result(task, outcome)
 
-    assert returned is None
+    assert returned.outcome_kind == OutcomeKind.FAILURE
+    assert returned.output_dir == str(output)
     assert not output.exists()
     assert extraction.diagnostics["failed_output_cleanup"]["cleaned"] is True
     assert [item.failure_message for item in runner.context.target_results] == [
