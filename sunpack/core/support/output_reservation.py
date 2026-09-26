@@ -1,9 +1,9 @@
-import os
 import threading
 from collections.abc import Callable
 
 from sunpack.core.contracts.tasks import ArchiveTask
-from sunpack.core.support.output_paths import next_available_path
+from sunpack.core.support.output_paths import OutputPathAllocator
+from sunpack.core.support.path_keys import absolute_path_key
 
 
 class OutputReservationRegistry:
@@ -11,22 +11,24 @@ class OutputReservationRegistry:
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._reserved: dict[str, str] = {}
+        self._reserved: set[str] = set()
+        self._owner_paths: dict[str, set[str]] = {}
+        self._allocator = OutputPathAllocator()
 
     def reserve(self, default_path: str, owner: str, local_reserved: set[str]) -> str:
         with self._lock:
-            occupied = {*self._reserved, *local_reserved}
-            path = next_available_path(default_path, occupied)
-            key = os.path.normcase(os.path.abspath(path))
-            self._reserved[key] = owner
+            path = self._allocator.next_available(default_path, self._reserved, local_reserved)
+            key = absolute_path_key(path)
+            self._reserved.add(key)
+            self._owner_paths.setdefault(owner, set()).add(key)
             local_reserved.add(key)
             return path
 
     def release(self, owner: str) -> None:
         with self._lock:
-            stale = [path for path, current_owner in self._reserved.items() if current_owner == owner]
-            for path in stale:
-                self._reserved.pop(path, None)
+            for path in self._owner_paths.pop(owner, ()):
+                self._reserved.remove(path)
+                self._allocator.release(path)
 
 
 def build_output_dir_resolver(
@@ -39,10 +41,13 @@ def build_output_dir_resolver(
     """Resolve one collision-free output path for every task in a batch."""
     resolved_dirs: dict[int, str] = {}
     reserved: set[str] = set()
+    allocator = OutputPathAllocator() if reservation_registry is None else None
     for task in tasks:
         default_dir = default_output_dir_for_task(task)
         if reservation_registry is None:
-            resolved_dirs[id(task)] = next_available_path(default_dir, reserved)
+            path = allocator.next_available(default_dir, reserved)
+            reserved.add(absolute_path_key(path))
+            resolved_dirs[id(task)] = path
         else:
             resolved_dirs[id(task)] = reservation_registry.reserve(default_dir, owner, reserved)
     return lambda task: resolved_dirs[id(task)]
