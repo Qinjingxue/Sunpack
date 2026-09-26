@@ -845,7 +845,7 @@ class _RequestRuntime:
         submission = self.submission
         request_id = submission.request_id
         roots = list(dict.fromkeys(target.path for target in submission.targets))
-        ownership = _RequestOwnership([submission], self.config)
+        ownership = _RequestResults(submission, self.config)
 
         try:
             if submission.direct:
@@ -878,10 +878,10 @@ class _RequestRuntime:
                 )
 
             await self._drain_cleanup_tasks()
-            response = ownership.responses(
+            response = ownership.response(
                 self.context,
                 recent_passwords=self.extractor.recent_passwords,
-            )[request_id]
+            )
             return replace(
                 response,
                 summary=replace(response.summary, postprocess_completed=True),
@@ -1059,15 +1059,17 @@ class _RequestRuntime:
             if watch_version:
                 completed_output = self.path_leases.completed_watch_output(watch_version)
                 if completed_output:
+                    reused = TargetRunResult(
+                        input_path=task.main_path,
+                        outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
+                        task_key=task.key,
+                        output_dir=completed_output,
+                        verification={"reused_completed_generation": True},
+                    )
                     with self.context.lock:
-                        self.context.target_results.append(TargetRunResult(
-                            input_path=task.main_path,
-                            outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
-                            task_key=task.key,
-                            output_dir=completed_output,
-                            verification={"reused_completed_generation": True},
-                        ))
+                        self.context.target_results.append(reused)
                         self.context.processed_keys.add(task.key)
+                    ownership.remember_results([reused])
                     cleanup_request = self.source_cleanup.release_task(
                         task,
                         outcome_kind=OutcomeKind.FAILURE,
@@ -1299,147 +1301,118 @@ class _RequestRuntime:
         )
 
 
-class _RequestOwnership:
-    def __init__(self, submissions: list[_Submission], config: dict):
-        self.submissions = submissions
+class _RequestResults:
+    """Collect one request's outputs and preserve per-target output settings."""
+
+    def __init__(self, submission: _Submission, config: dict):
+        self.submission = submission
         self.config = config
-        self._task_owner: dict[str, str] = {}
-        self._claimed_paths: dict[str, list[str]] = {item.request_id: [] for item in submissions}
-        self._task_paths: dict[str, dict[str, tuple[str, ...]]] = {item.request_id: {} for item in submissions}
-        self._output_owner: dict[str, str] = {}
+        self._task_targets: dict[str, PipelineTarget] = {}
+        self._output_targets: dict[str, PipelineTarget] = {}
+        self._claimed_paths: list[str] = []
+        self._task_paths: dict[str, tuple[str, ...]] = {}
 
     def remember_tasks(self, tasks) -> None:
         for task in tasks:
-            owner = self.owner_for_path(task.main_path)
-            owner_id = owner.request_id
+            target = self._target_for_path(task.main_path)
             paths = tuple(dict.fromkeys(task.all_parts or [task.main_path]))
-            self._task_owner[path_key(task.main_path)] = owner_id
-            self._claimed_paths[owner_id].extend(paths)
-            self._task_paths[owner_id][path_key(task.main_path)] = paths
+            self._task_targets[path_key(task.main_path)] = target
+            self._claimed_paths.extend(paths)
+            self._task_paths[path_key(task.main_path)] = paths
 
     def remember_results(self, results) -> None:
         for result in results:
-            owner = self.owner_for_path(result.input_path)
-            if result.output_dir:
-                self._output_owner[path_key(result.output_dir)] = owner.request_id
+            if not result.output_dir:
+                continue
+            target = self._target_for_path(result.input_path)
+            self._output_targets[path_key(result.output_dir)] = target
 
     def output_dir_for_task(self, task) -> str:
-        owner = self.owner_for_path(task.main_path)
-        target = self._target_for_path(owner, task.main_path)
+        target = self._target_for_path(task.main_path)
         output_config = {
             **(self.config.get("output", {}) if isinstance(self.config.get("output"), dict) else {}),
             **dict(target.output),
         }
         return default_output_dir_for_task(task, output_config)
 
-    def owner_for_path(self, path: str) -> _Submission:
-        normalized = os.path.abspath(path)
-        known = self._task_owner.get(path_key(normalized)) or self._owner_for_output(normalized)
-        if known:
-            return self._submission(known)
-        exact = []
-        containing = []
-        for submission in self.submissions:
-            for target in submission.targets:
-                if path_key(target.path) == path_key(normalized):
-                    exact.append(submission)
-                elif os.path.isdir(target.path) and _is_relative_to(normalized, target.path):
-                    containing.append((len(target.path), submission))
-        if exact:
-            return exact[0]
-        if containing:
-            return max(containing, key=lambda item: item[0])[1]
-        return self.submissions[0]
-
-    def responses(self, context: RunState, *, recent_passwords: Iterable[str]) -> dict[str, PipelineResponse]:
-        results = {item.request_id: [] for item in self.submissions}
-        for result in context.target_results:
-            results[self.owner_for_path(result.input_path).request_id].append(result)
-        responses = {}
-        for submission in self.submissions:
-            request_results = results[submission.request_id]
-            if len(self.submissions) == 1:
-                scan_failed_tasks = list(context.scan_failed_tasks)
-                scan_failures = list(context.scan_failures)
-            else:
-                scan_failed_tasks = []
-                scan_failures = [
-                    failure
-                    for failure in context.scan_failures
-                    if self._failure_owner(failure) == submission.request_id
-                ]
-            summary = context.snapshot(
-                target_results=request_results,
-                scan_failed_tasks=scan_failed_tasks,
-                scan_failures=scan_failures,
-                policy_skips=[
-                    item
-                    for item in context.policy_skips
-                    if self.owner_for_path(str(item.get("path") or "")).request_id
-                    == submission.request_id
-                ],
-            )
-            blocked_paths = []
-            for result in request_results:
-                if result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
-                    continue
-                blocked_paths.extend(
-                    self._task_paths[submission.request_id].get(
-                        path_key(result.input_path),
-                        (result.input_path,),
-                    )
+    def response(self, context: RunState, *, recent_passwords: Iterable[str]) -> PipelineResponse:
+        request_results = list(context.target_results)
+        summary = context.snapshot(
+            target_results=request_results,
+            scan_failed_tasks=list(context.scan_failed_tasks),
+            scan_failures=list(context.scan_failures),
+            policy_skips=list(context.policy_skips),
+        )
+        blocked_paths = []
+        for result in request_results:
+            if result.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
+                continue
+            blocked_paths.extend(
+                self._task_paths.get(
+                    path_key(result.input_path),
+                    (result.input_path,),
                 )
-            responses[submission.request_id] = PipelineResponse(
-                request_id=submission.request_id,
-                summary=summary,
-                artifacts=PipelineArtifacts(
-                    shell_refresh_paths=tuple(dict.fromkeys([
-                        *(
-                            result.output_dir
-                            for result in request_results
-                            if result.outcome_kind in {OutcomeKind.COMPLETE_SUCCESS, OutcomeKind.PARTIAL_SUCCESS}
-                            and result.output_dir
-                        ),
-                        *(
-                            str(item.get("out_dir") or "")
-                            for item in summary.recovered_outputs
-                            if str(item.get("out_dir") or "")
-                        ),
-                    ])),
-                ),
-                discovery=PipelineDiscovery(
-                    entry_paths=tuple(target.path for target in submission.targets),
-                    claimed_paths=tuple(dict.fromkeys(self._claimed_paths[submission.request_id])),
-                    blocked_paths=tuple(dict.fromkeys(blocked_paths)),
-                ),
-                recent_passwords=tuple(recent_passwords),
             )
-        return responses
+        return PipelineResponse(
+            request_id=self.submission.request_id,
+            summary=summary,
+            artifacts=PipelineArtifacts(
+                shell_refresh_paths=tuple(dict.fromkeys([
+                    *(
+                        result.output_dir
+                        for result in request_results
+                        if result.outcome_kind in {
+                            OutcomeKind.COMPLETE_SUCCESS,
+                            OutcomeKind.PARTIAL_SUCCESS,
+                        }
+                        and result.output_dir
+                    ),
+                    *(
+                        str(item.get("out_dir") or "")
+                        for item in summary.recovered_outputs
+                        if str(item.get("out_dir") or "")
+                    ),
+                ])),
+            ),
+            discovery=PipelineDiscovery(
+                entry_paths=tuple(target.path for target in self.submission.targets),
+                claimed_paths=tuple(dict.fromkeys(self._claimed_paths)),
+                blocked_paths=tuple(dict.fromkeys(blocked_paths)),
+            ),
+            recent_passwords=tuple(recent_passwords),
+        )
 
-    def _target_for_path(self, submission: _Submission, path: str) -> PipelineTarget:
-        exact = [target for target in submission.targets if path_key(target.path) == path_key(path)]
+    def _target_for_path(self, path: str) -> PipelineTarget:
+        normalized = os.path.abspath(path)
+        key = path_key(normalized)
+        known = self._task_targets.get(key)
+        if known is not None:
+            return known
+
+        exact = [
+            target
+            for target in self.submission.targets
+            if path_key(target.path) == key
+        ]
         if exact:
             return exact[0]
-        containing = [target for target in submission.targets if os.path.isdir(target.path) and _is_relative_to(path, target.path)]
-        return max(containing, key=lambda target: len(target.path)) if containing else submission.targets[0]
 
-    def _owner_for_output(self, path: str) -> str:
-        normalized = os.path.abspath(path)
-        matches = [
-            (len(output), owner)
-            for output_key, owner in self._output_owner.items()
-            for output in [output_key]
-            if output_key == path_key(normalized) or _is_relative_to(normalized, output_key)
+        output_matches = [
+            (len(output_root), target)
+            for output_root, target in self._output_targets.items()
+            if output_root == key or _is_relative_to(normalized, output_root)
         ]
-        return max(matches, default=(0, ""), key=lambda item: item[0])[1]
+        if output_matches:
+            return max(output_matches, key=lambda item: item[0])[1]
 
-    def _failure_owner(self, failure) -> str:
-        details = getattr(failure, "details", {})
-        path = str(details.get("path") or details.get("archive") or "") if isinstance(details, dict) else ""
-        return self.owner_for_path(path).request_id if path else ""
-
-    def _submission(self, request_id: str) -> _Submission:
-        return next(item for item in self.submissions if item.request_id == request_id)
+        containing = [
+            target
+            for target in self.submission.targets
+            if os.path.isdir(target.path) and _is_relative_to(normalized, target.path)
+        ]
+        if containing:
+            return max(containing, key=lambda target: len(target.path))
+        return self.submission.targets[0]
 
 
 def _is_relative_to(path: str, root: str) -> bool:
