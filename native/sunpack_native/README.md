@@ -101,7 +101,7 @@ Return value:
 [{"detected_ext": ".zip", "offset": 123, "scan_scope": ""}]
 ```
 
-`scan_zip_central_directory_names(path, max_samples, max_filename_bytes)`
+`analyze_zip_filename_encoding(path, max_samples, max_filename_bytes)`
 reads ZIP central-directory metadata and returns raw filename samples for
 encoding detection. ZIP64 central directory parsing is intentionally not handled
 here; Python reports the unsupported status instead of reparsing it.
