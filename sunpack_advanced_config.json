@@ -138,7 +138,6 @@
       "watchdog_no_progress_timeout_seconds": 180,
       "thread_capacity": 0,
       "stage_thread_capacity": 0,
-      "max_inflight_files": 0,
       "max_pending_stage_jobs": 4096,
       "max_queue_jobs": 4096,
       "priority_aging_quantum": 32,
