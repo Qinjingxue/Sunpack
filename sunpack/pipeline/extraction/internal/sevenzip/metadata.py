@@ -255,6 +255,7 @@ class ArchiveMetadataScanner:
                 lead=int(evidence.get("lead", 0) or 0),
             )
         )
+        added = 0
         for key, i18n_key in (
             ("cjk_count", "metadata.cjk_count"),
             ("kana_count", "metadata.kana_count"),
@@ -264,6 +265,9 @@ class ArchiveMetadataScanner:
             count = int(evidence.get(key, 0) or 0)
             if count:
                 result.reasons.append(self.i18n.t(i18n_key, count=count))
+                added += 1
+                if added == 3:
+                    break
 
     def _zip_native_status_warning(self, status: str) -> str:
         warnings = {
