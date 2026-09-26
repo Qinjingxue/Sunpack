@@ -51,34 +51,6 @@ class _Submission:
     progress_callback: Callable[[Any, dict[str, Any]], None] | None = None
 
 
-async def _commit_response(broker, config, response, *, stdout=None):
-    response = await broker.run(
-        "postprocess",
-        response.request_id,
-        _finalize_response,
-        config,
-        response,
-        stdout=stdout,
-        request_id=response.request_id,
-    )
-    for delay in (0.1, 0.3):
-        pending = [item for item in response.summary.cleanup_results if item.retryable and item.attempts < 3]
-        if not pending:
-            break
-        await asyncio.sleep(delay)
-        response = await broker.run(
-            "postprocess",
-            response.request_id,
-            _finalize_response,
-            config,
-            response,
-            stdout=stdout,
-            retry_results=pending,
-            request_id=response.request_id,
-        )
-    return response
-
-
 class PipelineEngine:
     """Single-event-loop owner for independently completing requests."""
 
@@ -213,12 +185,6 @@ class PipelineEngine:
                         ),
                     )
                 self._remember_recent_passwords(response.recent_passwords)
-                response = await _commit_response(
-                    self._broker,
-                    submission.config,
-                    response,
-                    stdout=stdout,
-                )
                 if response.summary.postprocess_completed:
                     await self._broker.run(
                         "report",
@@ -855,10 +821,14 @@ class _RequestRuntime:
                 )
 
             await self._drain_cleanup_tasks()
-            return ownership.responses(
+            response = ownership.responses(
                 self.context,
                 recent_passwords=self.extractor.recent_passwords,
             )[request_id]
+            return replace(
+                response,
+                summary=replace(response.summary, postprocess_completed=True),
+            )
         finally:
             for request in self.cleanup_scope.sweep_requests():
                 self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
@@ -1264,56 +1234,6 @@ class _RequestRuntime:
             max_depth=int(config.get("max_rounds", 1)),
             language=self.language,
         )
-
-
-def _finalize_response(
-    config: dict,
-    response: PipelineResponse,
-    *,
-    stdout=None,
-    retry_results=None,
-) -> PipelineResponse:
-    if response.summary.postprocess_completed and retry_results is None:
-        return response
-    shell_refresh_paths = list(response.artifacts.shell_refresh_paths)
-    if retry_results is None:
-        notify_shell_directories_updated(shell_refresh_paths)
-        return replace(
-            response,
-            summary=replace(response.summary, postprocess_completed=True),
-        )
-
-    # Only failed source cleanups are retried here. Successful sources were
-    # already handled beside their archive jobs, and flattening already ran at
-    # the end of each recursive subtree.
-    previous = {path_key(item.path): item for item in retry_results}
-    cleanup_requests = tuple((item.path,) for item in retry_results)
-    mutation_roots = [path for family in cleanup_requests for path in family]
-    shell_refresh_paths = []
-    if mutation_roots:
-        with promotion_barrier(
-            mutation_roots,
-            cache_releasers=(release_archive_sessions_under,),
-        ):
-            cleanup_results = PostProcessActions(config, stdout=stdout).apply(
-                archives_to_clean=list(cleanup_requests),
-                flatten_targets=[],
-                previous_cleanup=previous,
-            )
-    else:
-        cleanup_results = PostProcessActions(config, stdout=stdout).apply(
-            archives_to_clean=list(cleanup_requests),
-            flatten_targets=[],
-            previous_cleanup=previous,
-        )
-    notify_shell_directories_updated(shell_refresh_paths)
-    merged = {path_key(item.path): item for item in response.summary.cleanup_results}
-    merged.update({path_key(item.path): item for item in cleanup_results})
-    return replace(response, summary=replace(
-        response.summary,
-        cleanup_results=tuple(merged.values()),
-        postprocess_completed=True,
-    ))
 
 
 class _RequestOwnership:
