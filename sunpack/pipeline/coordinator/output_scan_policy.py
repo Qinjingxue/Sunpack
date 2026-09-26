@@ -36,18 +36,13 @@ class NestedOutputScanPolicy:
         # user's initial directory-scan depth. Embedded segment extraction adds
         # a child directory (for example embedded_00_rar), while the next round
         # may intentionally remain current-directory-only.
-        inventory_files = self._inventory_files(inventory)
-        snapshot = None
-        if inventory_files is None:
-            snapshot = DirectoryScanner(target_dir, config=self._output_scan_config).scan()
+        if inventory is not None and inventory.stats.exists and inventory.stats.is_dir:
+            return list(inventory.parent_directories())
+
+        snapshot = DirectoryScanner(target_dir, config=self._output_scan_config).scan()
         roots = []
         seen = set()
-        candidates = (
-            ((path, size) for path, size, _mtime_ns in snapshot.iter_file_columns())
-            if snapshot is not None
-            else inventory_files
-        )
-        for path, _size in candidates:
+        for path, _size, _mtime_ns in snapshot.iter_file_columns():
             parent = os.path.abspath(os.path.dirname(path))
             key = os.path.normcase(parent)
             if key not in seen:
@@ -169,7 +164,7 @@ class NestedOutputScanPolicy:
             return None
         root = Path(os.path.abspath(inventory.root))
         if inventory.worker_inventory_complete:
-            scan_session.prime_file_head_columns(*inventory.file_head_columns())
+            scan_session.prime_output_inventory(inventory)
             snapshot = DirectoryScanner.snapshot_from_output_inventory(
                 str(root),
                 inventory,
