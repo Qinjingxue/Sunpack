@@ -226,19 +226,19 @@ struct DirectoryScanRecords {
 }
 
 #[derive(Debug, Clone)]
-struct OutputFileRecord {
-    index: u32,
-    path: String,
-    abs_path: Option<String>,
-    output_path: Option<String>,
-    size: u64,
-    bytes_written: u64,
-    crc32: Option<u32>,
-    output_crc32: Option<u32>,
-    crc_ok: Option<bool>,
-    status: u8,
-    mtime_ns: Option<u64>,
-    magic: Vec<u8>,
+pub(crate) struct OutputFileRecord {
+    pub(crate) index: u32,
+    pub(crate) path: String,
+    pub(crate) abs_path: Option<String>,
+    pub(crate) output_path: Option<String>,
+    pub(crate) size: u64,
+    pub(crate) bytes_written: u64,
+    pub(crate) crc32: Option<u32>,
+    pub(crate) output_crc32: Option<u32>,
+    pub(crate) crc_ok: Option<bool>,
+    pub(crate) status: u8,
+    pub(crate) mtime_ns: Option<u64>,
+    pub(crate) magic: Vec<u8>,
 }
 
 #[pyclass(module = "sunpack_native", frozen)]
@@ -317,6 +317,25 @@ pub(crate) struct NativeOutputInventory {
     worker_crc_available: bool,
     worker_inventory_complete: bool,
     identity_paths: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct OutputInventoryVerificationSnapshot {
+    pub(crate) root: String,
+    pub(crate) exists: bool,
+    pub(crate) is_dir: bool,
+    pub(crate) files: Arc<Vec<OutputFileRecord>>,
+}
+
+impl NativeOutputInventory {
+    pub(crate) fn verification_snapshot(&self) -> OutputInventoryVerificationSnapshot {
+        OutputInventoryVerificationSnapshot {
+            root: self.root.clone(),
+            exists: self.exists,
+            is_dir: self.is_dir,
+            files: Arc::clone(&self.files),
+        }
+    }
 }
 
 pub(crate) fn rebase_output_inventory_root_impl(
@@ -530,6 +549,23 @@ impl NativeOutputInventory {
 
     fn materialize_files(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
         self.files
+            .iter()
+            .map(|item| output_file_dict(py, item))
+            .collect()
+    }
+
+    #[pyo3(signature = (offset=0, limit=128))]
+    fn file_page(
+        &self,
+        py: Python<'_>,
+        offset: usize,
+        limit: usize,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        if limit == 0 || offset >= self.files.len() {
+            return Ok(Vec::new());
+        }
+        let end = offset.saturating_add(limit).min(self.files.len());
+        self.files[offset..end]
             .iter()
             .map(|item| output_file_dict(py, item))
             .collect()

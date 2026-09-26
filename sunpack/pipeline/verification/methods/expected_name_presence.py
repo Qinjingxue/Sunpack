@@ -1,4 +1,3 @@
-import os
 from typing import Any
 
 from sunpack.core.config.advanced_defaults import advanced_named_config
@@ -8,10 +7,9 @@ from sunpack.pipeline.verification.methods._archive_output_match import (
     ArchiveOutputCoverage,
     archive_files_from_names,
     coverage_details,
-    coverage_from_archive_and_output,
+    coverage_from_native_inventory,
 )
 from sunpack.pipeline.verification.methods._output_stats import (
-    output_file_index_for_evidence,
     output_inventory_for_evidence,
     should_emit_file_observations,
 )
@@ -27,7 +25,7 @@ from sunpack.core.contracts.verification import (
     VerificationIssue,
     VerificationStep,
 )
-from sunpack.core.support.path_names import clean_relative_archive_path, normalize_match_name, normalize_match_path
+from sunpack.core.support.path_names import clean_relative_archive_path, normalize_match_path
 
 
 
@@ -62,23 +60,21 @@ class ExpectedNamePresenceMethod:
             )
             missing = []
         else:
-            output_index = output_file_index_for_evidence(evidence)
-            output_paths = output_index.normalized_paths
-            output_basenames = output_index.normalized_basenames
-            coverage = coverage_from_archive_and_output(
-                archive_files_from_names(expected_names),
-                output_index.files,
-                method=self.name,
-                include_observations=emit_observations,
-                output_index=output_index,
+            detail_limit = (
+                min(len(expected_names), 128)
+                if emit_observations
+                else 0
             )
-            missing = []
-            for expected in expected_names:
-                normalized_path = normalize_match_path(expected)
-                basename = normalize_match_name(os.path.basename(normalized_path))
-                if normalized_path in output_paths or basename in output_basenames:
-                    continue
-                missing.append(expected)
+            coverage, native_match = coverage_from_native_inventory(
+                archive_files_from_names(expected_names),
+                inventory,
+                method=self.name,
+                basename_mode="any",
+                include_observations=emit_observations,
+                detail_limit=detail_limit,
+                max_issue_items=len(expected_names),
+            )
+            missing = [str(item) for item in native_match.get("missing") or []]
 
         if not missing:
             return VerificationStep(

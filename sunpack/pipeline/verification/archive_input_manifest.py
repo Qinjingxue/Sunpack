@@ -33,6 +33,8 @@ class ArchiveInputManifest:
     archive_walk_complete: bool = False
     verified_item_count: int = 0
     entries_truncated: bool = False
+    total_unpacked_size_hint: int = 0
+    summary_only: bool = False
     failure_kind: str = ""
 
     @property
@@ -49,6 +51,8 @@ class ArchiveInputManifest:
 
     @property
     def total_unpacked_size(self) -> int:
+        if self.summary_only:
+            return max(0, int(self.total_unpacked_size_hint or 0))
         return sum(
             max(0, int(item.get("size", 0) or 0))
             for item in self.files
@@ -113,29 +117,33 @@ def _worker_verified_manifest(evidence) -> ArchiveInputManifest | None:
         getattr(evidence.extraction_result, "output_inventory", None),
         expected_root=evidence.output_dir,
     )
-    files = list(inventory.materialize_files()) if inventory is not None and inventory.worker_inventory_complete else []
     if (
         result.get("status") != "ok"
         or not payload.get("validated")
-        or int(payload.get("file_count", -1) or 0) != len(files)
-        or any(str(item.get("status") or "") != "complete" for item in files)
+        or inventory is None
+        or not inventory.worker_inventory_complete
+        or int(payload.get("file_count", -1) or 0) != inventory.stats.file_count
     ):
         return None
+    file_count = int(inventory.stats.file_count or 0)
+    item_count = int(payload.get("item_count", file_count) or 0)
     return ArchiveInputManifest(
         status=STATUS_OK,
         is_archive=True,
         damaged=False,
         checksum_error=False,
-        item_count=int(payload.get("item_count", len(files)) or 0),
-        file_count=len(files),
-        files=files,
+        item_count=item_count,
+        file_count=file_count,
+        files=[],
         message="Archive payload was verified during extraction",
         archive_type=str(result.get("archive_type") or ""),
         source=str(payload.get("source") or "sevenzip_worker_extract"),
         input_aware=True,
         archive_walk_complete=True,
-        verified_item_count=int(payload.get("item_count", len(files)) or 0),
+        verified_item_count=item_count,
         entries_truncated=False,
+        total_unpacked_size_hint=int(inventory.stats.total_size or 0),
+        summary_only=True,
     )
 
 

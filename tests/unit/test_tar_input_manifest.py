@@ -3,7 +3,8 @@ import tarfile
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
-from sunpack.pipeline.verification.methods._archive_output_match import coverage_from_archive_and_output
+from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
+from sunpack.pipeline.verification.methods._archive_output_match import coverage_from_native_inventory
 
 
 def _input(path):
@@ -60,14 +61,16 @@ def test_tar_duplicate_members_preserve_history_and_worker_output_names(tmp_path
     assert manifest.files[1]["archive_path"] == "same.txt"
     assert manifest.files[1]["size"] == len(b"replacement")
 
-    coverage = coverage_from_archive_and_output(
+    out_dir = tmp_path / "duplicates-out"
+    out_dir.mkdir()
+    (out_dir / "same.txt").write_bytes(b"old")
+    (out_dir / "same(1).txt").write_bytes(b"replacement")
+    coverage, raw = coverage_from_native_inventory(
         manifest.files,
-        [
-            {"path": "same.txt", "size": len(b"old"), "status": "complete"},
-            {"path": "same(1).txt", "size": len(b"replacement"), "status": "complete"},
-        ],
+        collect_output_inventory(str(out_dir)),
         method="test",
     )
+    assert raw["source"] == "native_output_inventory"
     assert coverage.expected_files == 2
     assert coverage.complete_files == 2
 
