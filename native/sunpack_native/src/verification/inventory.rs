@@ -307,6 +307,7 @@ fn match_inventory(
         };
         let output = &index.files[output_index];
         let actual_size = output.bytes_written;
+        let write_incomplete = output.bytes_written < output.size;
         let size_incomplete = item
             .size
             .is_some_and(|expected_size| actual_size < expected_size);
@@ -316,6 +317,7 @@ fn match_inventory(
             && item.has_crc
             && item.crc32.is_some()
             && output.status != 2
+            && !write_incomplete
         {
             if actual_crc.is_some() {
                 used_worker_crc = true;
@@ -379,6 +381,9 @@ fn match_inventory(
         let (state, progress) = if output.status == 2 {
             coverage.failed_files += 1;
             ("failed", size_progress.or(Some(0.0)))
+        } else if write_incomplete {
+            coverage.partial_files += 1;
+            ("partial", size_progress)
         } else if verify_crc && item.has_crc && crc_ok == Some(false) {
             coverage.failed_files += 1;
             mismatch_count += 1;
