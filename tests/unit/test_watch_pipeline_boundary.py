@@ -29,12 +29,12 @@ def test_watch_consumes_pipeline_claimed_paths_without_reconstructing_membership
     ]
 
 
-def test_watch_source_claim_is_published_at_resolved_path_lease_boundary():
-    source = inspect.getsource(_RequestRuntime.execute_async)
+def test_watch_source_claim_is_published_before_independent_jobs_start():
+    source = inspect.getsource(_RequestRuntime._run_discovery_batch)
 
     lease = source.index("coalesced_owner = await self.path_leases.replace")
     claim = source.index('"task_sources_claimed"')
-    dispatch = source.index("new_roots = await self.batch_runner.execute_async")
+    dispatch = source.index("results = await asyncio.gather")
 
     assert lease < claim < dispatch
     assert "task.cleanup_parts or task.all_parts" in source
