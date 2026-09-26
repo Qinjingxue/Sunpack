@@ -17,6 +17,23 @@ impl AnalysisMultiVolumeView {
                 "AnalysisMultiVolumeView requires at least one volume",
             ));
         }
+
+        // Keep the physical-volume layout in Rust.  Format parsers consume a
+        // single logical byte view and only ZIP needs disk-relative mapping.
+        // Python must never reconstruct this layout or parse archive bytes.
+        let mut volume_starts = Vec::with_capacity(paths.len());
+        let mut logical_start = 0u64;
+        for path in &paths {
+            volume_starts.push(logical_start);
+            logical_start = logical_start
+                .checked_add(std::fs::metadata(path)?.len())
+                .ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "multi-volume logical size overflow",
+                    )
+                })?;
+        }
+
         let reader = ManagedReader::open_volumes(
             &paths,
             ReaderConfig {
@@ -28,6 +45,7 @@ impl AnalysisMultiVolumeView {
         Ok(Self {
             path: paths[0].clone(),
             reader,
+            volume_starts,
             closed: false,
         })
     }
@@ -73,25 +91,51 @@ impl AnalysisMultiVolumeView {
         Ok(PyBytes::new(py, &data))
     }
 
-    #[pyo3(signature = (spanned, empty, zip64_eocd_offset=None))]
-    fn probe_zip_archive_start(
+    fn probe_zip_local_header(
         &self,
         py: Python<'_>,
-        spanned: bool,
-        empty: bool,
-        zip64_eocd_offset: Option<u64>,
+        offset: u64,
     ) -> PyResult<Py<PyDict>> {
-        self.ensure_open()?;
-        let kind = zip_archive_start_kind(
-            &self.reader,
-            spanned,
-            empty,
-            zip64_eocd_offset,
-        )?;
-        let result = PyDict::new(py);
-        result.set_item("archive_starts_at_zero", !kind.is_empty())?;
-        result.set_item("archive_start_kind", kind)?;
-        Ok(result.unbind())
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .probe_zip_local_header_native(py, offset)
+    }
+
+    #[pyo3(signature = (eocd_offset=None))]
+    fn locate_zip_eocd(
+        &self,
+        py: Python<'_>,
+        eocd_offset: Option<u64>,
+    ) -> PyResult<Py<PyDict>> {
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .locate_zip_eocd_native(py, eocd_offset)
+    }
+
+    #[pyo3(signature = (eocd_offset, max_cd_entries_to_walk=64))]
+    fn probe_zip(
+        &self,
+        py: Python<'_>,
+        eocd_offset: u64,
+        max_cd_entries_to_walk: usize,
+    ) -> PyResult<Py<PyDict>> {
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .probe_zip_with_disk_starts(
+            py,
+            eocd_offset,
+            max_cd_entries_to_walk,
+            Some(&self.volume_starts),
+        )
     }
 
     #[pyo3(signature = (start_offset, max_blocks_to_walk=4096))]
@@ -101,16 +145,70 @@ impl AnalysisMultiVolumeView {
         start_offset: u64,
         max_blocks_to_walk: usize,
     ) -> PyResult<Py<PyDict>> {
-        // Reuse the canonical Rust RAR4/RAR5 probe.  The reader is already a
-        // logical concatenation of the supplied volumes, so cloning the
-        // ManagedReader shares its cache and read budget without reopening
-        // the files or maintaining a second parser for multi-volume input.
         AnalysisBinaryView {
             path: self.path.clone(),
             reader: self.reader.clone(),
             closed: self.closed,
         }
         .probe_rar(py, start_offset, max_blocks_to_walk)
+    }
+
+    #[pyo3(signature = (start_offset, max_next_header_check_bytes=1048576))]
+    fn probe_seven_zip(
+        &self,
+        py: Python<'_>,
+        start_offset: u64,
+        max_next_header_check_bytes: u64,
+    ) -> PyResult<Py<PyDict>> {
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .probe_seven_zip(py, start_offset, max_next_header_check_bytes)
+    }
+
+    #[pyo3(signature = (start_offset=0, max_entries_to_walk=64))]
+    fn probe_tar(
+        &self,
+        py: Python<'_>,
+        start_offset: u64,
+        max_entries_to_walk: usize,
+    ) -> PyResult<Py<PyDict>> {
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .probe_tar(py, start_offset, max_entries_to_walk)
+    }
+
+    fn probe_compression_stream(
+        &self,
+        py: Python<'_>,
+        format: &str,
+    ) -> PyResult<Py<PyDict>> {
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .probe_compression_stream(py, format)
+    }
+
+    #[pyo3(signature = (format, max_probe_bytes=4194304))]
+    fn probe_compressed_tar(
+        &self,
+        py: Python<'_>,
+        format: &str,
+        max_probe_bytes: usize,
+    ) -> PyResult<Py<PyDict>> {
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .probe_compressed_tar(py, format, max_probe_bytes)
     }
 
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {

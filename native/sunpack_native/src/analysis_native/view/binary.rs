@@ -64,6 +64,23 @@ impl AnalysisBinaryView {
         Ok(PyBytes::new(py, &data))
     }
 
+    fn probe_zip_local_header(
+        &self,
+        py: Python<'_>,
+        offset: u64,
+    ) -> PyResult<Py<PyDict>> {
+        self.probe_zip_local_header_native(py, offset)
+    }
+
+    #[pyo3(signature = (eocd_offset=None))]
+    fn locate_zip_eocd(
+        &self,
+        py: Python<'_>,
+        eocd_offset: Option<u64>,
+    ) -> PyResult<Py<PyDict>> {
+        self.locate_zip_eocd_native(py, eocd_offset)
+    }
+
     fn stats(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         self.ensure_open()?;
         let stats = self.reader.stats()?;
@@ -80,274 +97,7 @@ impl AnalysisBinaryView {
         eocd_offset: u64,
         max_cd_entries_to_walk: usize,
     ) -> PyResult<Py<PyDict>> {
-        let result = PyDict::new(py);
-        result.set_item("format", "zip")?;
-        result.set_item("plausible", false)?;
-        result.set_item("magic_matched", false)?;
-        result.set_item("error", "")?;
-        result.set_item("eocd_offset", eocd_offset)?;
-        result.set_item("archive_offset", 0u64)?;
-        result.set_item("segment_end", 0u64)?;
-        result.set_item("central_directory_offset", 0u64)?;
-        result.set_item("central_directory_size", 0u64)?;
-        result.set_item("total_entries", 0u16)?;
-        result.set_item("is_multi_disk", false)?;
-        result.set_item("disk_number", 0u16)?;
-        result.set_item("central_directory_disk", 0u16)?;
-        result.set_item("disk_entries", 0u16)?;
-        result.set_item("declared_total_disks", 1u32)?;
-        result.set_item("central_directory_present", false)?;
-        result.set_item("central_directory_walk_ok", false)?;
-        result.set_item("central_directory_entries_checked", 0usize)?;
-        result.set_item("central_directory_encrypted_entries", 0usize)?;
-        result.set_item("password_required", false)?;
-        result.set_item("password_state", "unknown")?;
-        result.set_item("encryption_scan_complete", false)?;
-        result.set_item("local_header_links_ok", false)?;
-        result.set_item("local_header_links_checked", 0usize)?;
-        result.set_item("archive_starts_at_zero", false)?;
-        result.set_item("archive_start_kind", "")?;
-        result.set_item("content_integrity_warning", "")?;
-        result.set_item("evidence", PyList::empty(py))?;
-
-        let eocd = match self.read_field_at_bytes(eocd_offset, 22, "zip.eocd", FieldLocation::Tail)
-        {
-            Ok(data) => data,
-            Err(fault) => {
-                set_view_read_fault(&result, &fault, "eocd_too_small")?;
-                return Ok(result.unbind());
-            }
-        };
-        if &eocd[0..4] != ZIP_EOCD {
-            result.set_item("error", "bad_eocd_signature")?;
-            return Ok(result.unbind());
-        }
-        result.set_item("magic_matched", true)?;
-        let disk_number = u16_le(&eocd, 4);
-        let central_directory_disk = u16_le(&eocd, 6);
-        let disk_entries = u16_le(&eocd, 8);
-        let total_entries = u16_le(&eocd, 10);
-        let central_directory_size = u32_le(&eocd, 12) as u64;
-        let central_directory_offset = u32_le(&eocd, 16) as u64;
-        let comment_length = u16_le(&eocd, 20) as u64;
-        let segment_end = eocd_offset + 22 + comment_length;
-
-        // APPNOTE 4.3.14/4.3.15: a ZIP64 archive places the Zip64 end of
-        // central directory record (56 bytes: 4-byte signature + 52 fixed
-        // bytes, size field 44) and its locator (20 bytes) between the
-        // central directory and the plain EOCD.  When present, the 8-byte
-        // fields in the Zip64 record are authoritative and the central
-        // directory ends where the Zip64 record starts, not at the EOCD.
-        let mut effective_disk_number = u64::from(disk_number);
-        let mut effective_central_directory_disk = u64::from(central_directory_disk);
-        let mut effective_disk_entries = u64::from(disk_entries);
-        let mut effective_total_entries = u64::from(total_entries);
-        let mut effective_central_directory_size = central_directory_size;
-        let mut effective_central_directory_offset = central_directory_offset;
-        let mut directory_end = eocd_offset;
-        let mut zip64_present = false;
-        let mut zip64_locator_present = false;
-        let mut zip64_eocd_offset = 0u64;
-        let mut zip64_declared_total_disks = 1u32;
-        if eocd_offset >= (ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE) as u64 {
-            let block_offset =
-                eocd_offset - (ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE) as u64;
-            if let Ok(block) = self.read_field_at_bytes(
-                block_offset,
-                ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE,
-                "zip.zip64_eocd_tail",
-                FieldLocation::Tail,
-            ) {
-                if block.len() == ZIP64_EOCD_RECORD_SIZE + ZIP64_EOCD_LOCATOR_SIZE
-                    && &block[..4] == ZIP64_EOCD
-                    && u64_le(&block, 4) == ZIP64_EOCD_RECORD_SIZE as u64 - 12
-                    && &block[ZIP64_EOCD_RECORD_SIZE..ZIP64_EOCD_RECORD_SIZE + 4] == ZIP64_LOCATOR
-                {
-                    zip64_present = true;
-                    zip64_locator_present = true;
-                    zip64_eocd_offset = block_offset;
-                    zip64_declared_total_disks = u32_le(&block, ZIP64_EOCD_RECORD_SIZE + 16);
-                    effective_disk_number = u64::from(u32_le(&block, 16));
-                    effective_central_directory_disk = u64::from(u32_le(&block, 20));
-                    effective_disk_entries = u64_le(&block, 24);
-                    effective_total_entries = u64_le(&block, 32);
-                    effective_central_directory_size = u64_le(&block, 40);
-                    effective_central_directory_offset = u64_le(&block, 48);
-                    directory_end = block_offset;
-                }
-            }
-        }
-        result.set_item("segment_end", segment_end)?;
-        result.set_item("central_directory_size", effective_central_directory_size)?;
-        result.set_item("total_entries", effective_total_entries)?;
-        result.set_item("zip64", zip64_present)?;
-        result.set_item("zip64_locator_present", zip64_locator_present)?;
-        result.set_item("zip64_eocd_present", zip64_present)?;
-        result.set_item("zip64_eocd_offset", zip64_eocd_offset)?;
-        result.set_item(
-            "zip64_locator_offset",
-            if zip64_present { eocd_offset - 20 } else { 0u64 },
-        )?;
-        let is_multi_disk =
-            effective_disk_number != 0 || effective_central_directory_disk != 0;
-        result.set_item("is_multi_disk", is_multi_disk)?;
-        result.set_item("disk_number", effective_disk_number)?;
-        result.set_item("central_directory_disk", effective_central_directory_disk)?;
-        result.set_item("disk_entries", effective_disk_entries)?;
-        result.set_item(
-            "declared_total_disks",
-            if zip64_present {
-                zip64_declared_total_disks
-            } else {
-                u32::from(disk_number) + 1
-            },
-        )?;
-        let archive_start_kind = zip_archive_start_kind(
-            &self.reader,
-            is_multi_disk,
-            effective_total_entries == 0 && effective_central_directory_size == 0,
-            zip64_present.then_some(zip64_eocd_offset),
-        )?;
-        result.set_item("archive_starts_at_zero", !archive_start_kind.is_empty())?;
-        result.set_item("archive_start_kind", archive_start_kind)?;
-        if is_multi_disk {
-            result.set_item("error", "zip_multi_disk")?;
-            let evidence = PyList::empty(py);
-            evidence.append("zip:eocd_multi_disk")?;
-            result.set_item("evidence", evidence)?;
-            return Ok(result.unbind());
-        }
-        if effective_disk_entries != effective_total_entries {
-            result.set_item("error", "entry_count_mismatch")?;
-            return Ok(result.unbind());
-        }
-        if directory_end < effective_central_directory_size {
-            result.set_item("error", "central_directory_size_out_of_range")?;
-            return Ok(result.unbind());
-        }
-        let naive_physical_central_offset = directory_end - effective_central_directory_size;
-        let declared_physical_central_offset = effective_central_directory_offset;
-        // Prefer the physically verified declared offset when the naive
-        // back-computation misses the signature (same fallback as
-        // formats/zip/directory/inspect.rs).  Otherwise keep the naive
-        // position so SFX prefixes keep working via archive_offset.
-        let physical_central_offset = if naive_physical_central_offset != declared_physical_central_offset {
-            let naive_ok = self
-                .read_field_at_bytes(
-                    naive_physical_central_offset,
-                    4,
-                    "zip.central_directory.signature",
-                    FieldLocation::Tail,
-                )
-                .is_ok_and(|sig| sig.as_slice() == ZIP_CENTRAL);
-            let declared_ok = self
-                .read_field_at_bytes(
-                    declared_physical_central_offset,
-                    4,
-                    "zip.central_directory.signature",
-                    FieldLocation::Tail,
-                )
-                .is_ok_and(|sig| sig.as_slice() == ZIP_CENTRAL);
-            if !naive_ok && declared_ok {
-                declared_physical_central_offset
-            } else {
-                naive_physical_central_offset
-            }
-        } else {
-            naive_physical_central_offset
-        };
-        if physical_central_offset < effective_central_directory_offset {
-            result.set_item("error", "archive_offset_underflow")?;
-            return Ok(result.unbind());
-        }
-        let archive_offset = physical_central_offset - effective_central_directory_offset;
-        result.set_item("archive_offset", archive_offset)?;
-        result.set_item("central_directory_offset", physical_central_offset)?;
-        if physical_central_offset
-            .checked_add(effective_central_directory_size)
-            .is_none_or(|end| end != directory_end)
-        {
-            result.set_item("error", "central_directory_size_mismatch")?;
-            return Ok(result.unbind());
-        }
-        if effective_total_entries == 0 && effective_central_directory_size == 0 {
-            result.set_item("plausible", true)?;
-            result.set_item("central_directory_walk_ok", true)?;
-            result.set_item("local_header_links_ok", true)?;
-            result.set_item("encryption_scan_complete", true)?;
-            result.set_item("password_state", "not_required")?;
-            return Ok(result.unbind());
-        }
-
-        let central_sig = match self.read_field_at_bytes(
-            physical_central_offset,
-            4,
-            "zip.central_directory.signature",
-            FieldLocation::Tail,
-        ) {
-            Ok(data) => data,
-            Err(fault) => {
-                set_view_read_fault(&result, &fault, "central_directory_read_failed")?;
-                return Ok(result.unbind());
-            }
-        };
-        if central_sig.as_slice() != ZIP_CENTRAL {
-            result.set_item("error", "bad_central_directory_signature")?;
-            return Ok(result.unbind());
-        }
-        result.set_item("central_directory_present", true)?;
-        let (entries_checked, cd_ok, links_checked, links_ok, encrypted_entries, error) = self
-            .walk_zip_central_directory(
-                archive_offset,
-                physical_central_offset,
-                effective_central_directory_size,
-                effective_total_entries as usize,
-                max_cd_entries_to_walk,
-            )?;
-        result.set_item("central_directory_entries_checked", entries_checked)?;
-        result.set_item("central_directory_encrypted_entries", encrypted_entries)?;
-        result.set_item("central_directory_walk_ok", cd_ok)?;
-        result.set_item("local_header_links_checked", links_checked)?;
-        result.set_item("local_header_links_ok", links_ok)?;
-        let encryption_scan_complete =
-            error.is_empty() && cd_ok && entries_checked == effective_total_entries as usize;
-        result.set_item("encryption_scan_complete", encryption_scan_complete)?;
-        result.set_item("password_required", encrypted_entries > 0)?;
-        result.set_item(
-            "password_state",
-            if encrypted_entries > 0 {
-                "required"
-            } else if encryption_scan_complete {
-                "not_required"
-            } else {
-                "unknown"
-            },
-        )?;
-        if error.is_empty() {
-            result.set_item("plausible", true)?;
-            result.set_item(
-                "content_integrity_warning",
-                self.zip_content_integrity_warning(
-                    archive_offset,
-                    physical_central_offset,
-                    effective_total_entries as usize,
-                    max_cd_entries_to_walk,
-                )?,
-            )?;
-            let evidence = PyList::empty(py);
-            evidence.append("zip:eocd")?;
-            evidence.append("zip:central_directory")?;
-            if cd_ok {
-                evidence.append("zip:central_directory_walk")?;
-            }
-            if links_ok {
-                evidence.append("zip:local_header_links")?;
-            }
-            result.set_item("evidence", evidence)?;
-        } else {
-            result.set_item("error", error)?;
-        }
-        Ok(result.unbind())
+        self.probe_zip_with_disk_starts(py, eocd_offset, max_cd_entries_to_walk, None)
     }
 
     #[pyo3(signature = (start_offset, max_blocks_to_walk=4096))]
@@ -432,6 +182,8 @@ impl AnalysisBinaryView {
         result.set_item("next_header_crc_ok", false)?;
         result.set_item("next_header_nid", 0u8)?;
         result.set_item("next_header_nid_valid", false)?;
+        result.set_item("version_major", 0u8)?;
+        result.set_item("version_minor", 0u8)?;
         result.set_item("password_required", false)?;
         result.set_item("encrypted_header", false)?;
         result.set_item("encrypted_payload", false)?;
@@ -456,6 +208,8 @@ impl AnalysisBinaryView {
             return Ok(result.unbind());
         }
         result.set_item("magic_matched", true)?;
+        result.set_item("version_major", header[6])?;
+        result.set_item("version_minor", header[7])?;
         if header[6] != 0 {
             result.set_item("error", "unsupported_version")?;
             return Ok(result.unbind());

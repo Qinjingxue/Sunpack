@@ -5,79 +5,22 @@ pub(crate) fn inspect_zip_local_header(
     offset: i64,
 ) -> PyResult<Py<PyDict>> {
     let offset = offset.max(0) as u64;
-    let result = dict(py)?;
-    result.set_item("offset", offset)?;
-    result.set_item("magic_matched", false)?;
-    result.set_item("plausible", false)?;
-    result.set_item("error", "")?;
-
     let reader = match ManagedReader::open(path) {
         Ok(reader) => reader,
         Err(error) => {
+            let result = dict(py)?;
             let fault = ReadFault::from_io(error, "open", offset, 0, 0, 0)
                 .with_field("zip.local_header.fixed", FieldLocation::Body);
             set_read_fault(&result, &fault, "os_error")?;
             return Ok(result.unbind());
         }
     };
-    let file_size = reader.len();
-    let header = match reader.read_exact_at(offset, ZIP_LOCAL_HEADER_LENGTH) {
-        Ok(header) => header,
-        Err(error) => {
-            let fault = ReadFault::from_io(
-                error,
-                "read_exact_at",
-                offset,
-                ZIP_LOCAL_HEADER_LENGTH,
-                0,
-                file_size,
-            )
-            .with_field("zip.local_header.fixed", FieldLocation::Body);
-            set_read_fault(&result, &fault, "short_header")?;
-            return Ok(result.unbind());
-        }
-    };
-    if &header[0..4] != b"PK\x03\x04" {
-        result.set_item(
-            "magic_matched",
-            header.starts_with(b"PK\x03\x04")
-                || header.starts_with(b"PK\x05\x06")
-                || header.starts_with(b"PK\x07\x08"),
-        )?;
-        result.set_item("error", "bad_signature")?;
-        return Ok(result.unbind());
+    crate::analysis_native::AnalysisBinaryView {
+        path: path.to_string(),
+        reader,
+        closed: false,
     }
-
-    let version_needed = u16_le(&header, 4);
-    let compression_method = u16_le(&header, 8);
-    let filename_len = u16_le(&header, 26) as u64;
-    let extra_len = u16_le(&header, 28) as u64;
-    if version_needed > 63 {
-        result.set_item("error", "unsupported_version")?;
-        return Ok(result.unbind());
-    }
-    if !matches!(
-        compression_method,
-        0 | 1 | 6 | 8 | 9 | 12 | 14 | 95 | 96 | 98 | 99
-    ) {
-        result.set_item("error", "unknown_compression_method")?;
-        return Ok(result.unbind());
-    }
-    if filename_len == 0 || filename_len > 4096 {
-        result.set_item("error", "invalid_filename_length")?;
-        return Ok(result.unbind());
-    }
-    if offset + ZIP_LOCAL_HEADER_LENGTH as u64 + filename_len + extra_len > file_size {
-        result.set_item("error", "header_exceeds_file_size")?;
-        return Ok(result.unbind());
-    }
-    result.set_item("magic_matched", true)?;
-    result.set_item("plausible", true)?;
-    result.set_item("version_needed", version_needed)?;
-    result.set_item("compression_method", compression_method)?;
-    result.set_item("filename_len", filename_len)?;
-    result.set_item("extra_len", extra_len)?;
-    Ok(result.unbind())
+    .probe_zip_local_header_native(py, offset)
 }
 
 #[pyfunction]
