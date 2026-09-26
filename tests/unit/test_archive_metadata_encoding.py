@@ -152,6 +152,91 @@ def test_raw_multivolume_zip_uses_one_logical_input(tmp_path):
     assert result.selected_codepage == "936"
 
 
+def test_spanned_zip_uses_disk_relative_central_directory_offset(tmp_path):
+    expected_name = "日本語/説明.txt"
+    raw_name = expected_name.encode("cp932")
+    payload = b"spanned"
+    crc = binascii.crc32(payload) & 0xFFFFFFFF
+    local = struct.pack(
+        "<IHHHHHIIIHH",
+        0x04034B50,
+        20,
+        0,
+        0,
+        0,
+        0,
+        crc,
+        len(payload),
+        len(payload),
+        len(raw_name),
+        0,
+    ) + raw_name + payload
+    central = struct.pack(
+        "<IHHHHHHIIIHHHHHII",
+        0x02014B50,
+        20,
+        20,
+        0,
+        0,
+        0,
+        0,
+        crc,
+        len(payload),
+        len(payload),
+        len(raw_name),
+        0,
+        0,
+        0,
+        0,
+        0,
+        0,
+    ) + raw_name
+    eocd = struct.pack(
+        "<IHHHHIIH",
+        0x06054B50,
+        1,
+        1,
+        1,
+        1,
+        len(central),
+        0,
+        0,
+    )
+    first = tmp_path / "archive.z01"
+    last = tmp_path / "archive.zip"
+    first.write_bytes(local)
+    last.write_bytes(central + eocd)
+    descriptor = ArchiveInputDescriptor(
+        entry_path=str(first),
+        open_mode="native_volumes",
+        format_hint="zip",
+        logical_name="archive.zip",
+        volume_style="zip_spanned",
+        parts=[
+            ArchiveInputPart(
+                extent=InputExtent(str(first)),
+                role="first",
+                volume_number=1,
+                canonical_name="archive.z01",
+            ),
+            ArchiveInputPart(
+                extent=InputExtent(str(last)),
+                role="terminal",
+                volume_number=2,
+                canonical_name="archive.zip",
+            ),
+        ],
+    )
+
+    result = ArchiveMetadataScanner().scan(
+        str(first),
+        format_hint="zip",
+        archive_input=descriptor,
+    )
+
+    assert result.selected_codepage == "932"
+
+
 def test_unicode_native_archive_formats_do_not_receive_zip_codepage_override():
     scanner = ArchiveMetadataScanner()
 
