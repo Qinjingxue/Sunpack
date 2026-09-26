@@ -3,6 +3,7 @@ import struct
 import tarfile
 from binascii import crc32
 
+from sunpack.core.analysis.analyzer import ArchiveAnalyzer
 from sunpack.core.analysis.view import MultiVolumeBinaryView
 
 
@@ -40,6 +41,42 @@ def _tar_bytes() -> bytes:
         info.size = 3
         archive.addfile(info, io.BytesIO(b"abc"))
     return output.getvalue()
+
+
+
+def _zip_bytes() -> bytes:
+    name = b"a"
+    local = struct.pack(
+        "<4sHHHHHIIIHH",
+        b"PK\x03\x04", 20, 0, 0, 0, 0, 0, 0, 0, len(name), 0,
+    ) + name
+    central = struct.pack(
+        "<4sHHHHHHIIIHHHHHII",
+        b"PK\x01\x02", 20, 20, 0, 0, 0, 0, 0, 0, 0,
+        len(name), 0, 0, 0, 0, 0, 0,
+    ) + name
+    eocd = struct.pack(
+        "<4sHHHHIIH",
+        b"PK\x05\x06", 0, 0, 1, 1, len(central), len(local), 0,
+    )
+    return local + central + eocd
+
+
+def test_multivolume_zip_public_probes_use_native_discovery_methods(tmp_path):
+    archive = _zip_bytes()
+    # Split inside the local header so both discovery and the full EOCD probe
+    # must consume the Rust logical multi-volume reader.
+    paths = _write_parts(tmp_path, archive[:11], archive[11:])
+    analyzer = ArchiveAnalyzer()
+
+    local = analyzer.probe_zip_local_header(paths).to_raw_dict()
+    eocd = analyzer.probe_zip_eocd(paths).to_raw_dict()
+
+    assert local["plausible"] is True
+    assert local["offset"] == 0
+    assert eocd["plausible"] is True
+    assert eocd["local_header_links_ok"] is True
+    assert eocd["total_entries"] == 1
 
 
 def test_multivolume_7z_uses_native_parser_across_header_boundary_and_carrier_offset(tmp_path):
