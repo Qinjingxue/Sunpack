@@ -30,8 +30,8 @@ jobs:
       - name: Build and install native extension
         shell: pwsh
         run: |
-          .\.venv\Scripts\maturin.exe build --manifest-path native\sunpack_native\Cargo.toml --release --target-dir .cache\rust-target\x64
-          $wheel = Get-ChildItem .cache\rust-target\x64\wheels\sunpack_native-*.whl | Select-Object -First 1 -ExpandProperty FullName
+          .\.venv\Scripts\maturin.exe build --manifest-path native\sunpack_native\Cargo.toml --release --out build\native-wheels-ci
+          $wheel = Get-ChildItem build\native-wheels-ci\sunpack_native-*.whl | Select-Object -First 1 -ExpandProperty FullName
           if (-not $wheel) { throw "sunpack_native wheel not found" }
           uv pip install --python .\.venv\Scripts\python.exe --reinstall $wheel
       - name: Run focused analysis tests
