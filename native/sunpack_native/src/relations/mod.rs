@@ -358,13 +358,17 @@ fn build_candidate_groups_from_physical(
         let mut proposals = Vec::new();
         let mut proposal_keys = HashSet::new();
 
-        for seed in directory_rows.iter().filter(|row| {
-            seed_strength_for_row(row, &directory_rows, &name_index).is_some()
-        }) {
+        let seed_strengths: Vec<Option<&'static str>> = directory_rows
+            .iter()
+            .map(|row| seed_strength_for_row(row, &directory_rows, &name_index))
+            .collect();
+        for (seed_index, strength) in seed_strengths
+            .iter()
+            .enumerate()
+            .filter_map(|(index, strength)| (*strength).map(|strength| (index, strength)))
+        {
+            let seed = &directory_rows[seed_index];
             let Some(anchor) = seed.anchor.as_ref() else {
-                continue;
-            };
-            let Some(strength) = seed_strength_for_row(seed, &directory_rows, &name_index) else {
                 continue;
             };
             if strength == "strong" {
@@ -426,13 +430,18 @@ fn build_candidate_groups_from_physical(
             )?);
         }
 
+        let validation_owned_paths: Vec<HashSet<String>> = validations
+            .iter()
+            .map(|validation| proposal_owned_paths(&validation.proposal))
+            .collect();
+
         // A password retry may structurally prove every observed member as a
         // volume while still being inconclusive because the head or terminal
         // volume is absent.  Keep that incomplete proposal out of ordinary
         // fallback.  Standalone encrypted files do not satisfy the all-volume
         // proof and therefore remain ordinary after their proposal is rejected.
         if path_passwords.is_some() {
-            for validation in &validations {
+            for (index, validation) in validations.iter().enumerate() {
                 if validation.status != ProposalStatus::Inconclusive
                     || !validation.proposal.volumes.iter().all(|(path, _, _, _, _)| {
                         validation
@@ -449,55 +458,20 @@ fn build_candidate_groups_from_physical(
                 {
                     continue;
                 }
-                strong_suppressed_paths.extend(proposal_owned_paths(&validation.proposal));
+                strong_suppressed_paths.extend(validation_owned_paths[index].iter().cloned());
             }
         }
 
-        let valid_indexes: Vec<usize> = validations
-            .iter()
-            .enumerate()
-            .filter_map(|(index, validation)| {
-                (validation.status == ProposalStatus::Valid).then_some(index)
-            })
-            .collect();
-        let mut conflicted = HashSet::new();
-        for left_index in 0..valid_indexes.len() {
-            for right_index in (left_index + 1)..valid_indexes.len() {
-                let left = &validations[valid_indexes[left_index]].proposal;
-                let right = &validations[valid_indexes[right_index]].proposal;
-                if proposal_owned_paths(left)
-                    .intersection(&proposal_owned_paths(right))
-                    .next()
-                    .is_some()
-                {
-                    conflicted.insert(valid_indexes[left_index]);
-                    conflicted.insert(valid_indexes[right_index]);
-                }
-            }
-        }
-
-        let password_indexes: Vec<usize> = validations
-            .iter()
-            .enumerate()
-            .filter_map(|(index, validation)| {
-                (validation.status == ProposalStatus::NeedsPassword).then_some(index)
-            })
-            .collect();
-        let mut password_conflicted = HashSet::new();
-        for left_index in 0..password_indexes.len() {
-            for right_index in (left_index + 1)..password_indexes.len() {
-                let left = &validations[password_indexes[left_index]].proposal;
-                let right = &validations[password_indexes[right_index]].proposal;
-                if proposal_owned_paths(left)
-                    .intersection(&proposal_owned_paths(right))
-                    .next()
-                    .is_some()
-                {
-                    password_conflicted.insert(password_indexes[left_index]);
-                    password_conflicted.insert(password_indexes[right_index]);
-                }
-            }
-        }
+        let conflicted = conflicting_proposal_indexes(
+            &validations,
+            &validation_owned_paths,
+            ProposalStatus::Valid,
+        );
+        let password_conflicted = conflicting_proposal_indexes(
+            &validations,
+            &validation_owned_paths,
+            ProposalStatus::NeedsPassword,
+        );
 
         let mut claimed_paths = HashSet::new();
         let mut password_paths = HashSet::new();
@@ -505,11 +479,11 @@ fn build_candidate_groups_from_physical(
             if validation.status != ProposalStatus::Valid || conflicted.contains(&index) {
                 continue;
             }
-            let owned = proposal_owned_paths(&validation.proposal);
+            let owned = &validation_owned_paths[index];
             if owned.iter().any(|path| claimed_paths.contains(path)) {
                 continue;
             }
-            claimed_paths.extend(owned);
+            claimed_paths.extend(owned.iter().cloned());
             output.push(validated_proposal_to_dict(py, validation)?);
         }
 
@@ -523,11 +497,11 @@ fn build_candidate_groups_from_physical(
             if password_conflicted.contains(&index) {
                 continue;
             }
-            let owned = proposal_owned_paths(&validation.proposal);
+            let owned = &validation_owned_paths[index];
             if owned.iter().any(|path| claimed_paths.contains(path)) {
                 continue;
             }
-            password_paths.extend(owned);
+            password_paths.extend(owned.iter().cloned());
             output.push(password_error_proposal_to_dict(py, validation)?);
         }
 
@@ -1211,6 +1185,31 @@ fn proposal_owned_paths(proposal: &RelationProposal) -> HashSet<String> {
         .map(|(path, _, _, _, _)| path.to_ascii_lowercase())
         .chain(proposal.companions.iter().map(|path| path.to_ascii_lowercase()))
         .collect()
+}
+
+fn conflicting_proposal_indexes(
+    validations: &[ProposalValidation],
+    owned_paths: &[HashSet<String>],
+    status: ProposalStatus,
+) -> HashSet<usize> {
+    debug_assert_eq!(validations.len(), owned_paths.len());
+
+    let mut owner_by_path: HashMap<&str, usize> = HashMap::new();
+    let mut conflicted = HashSet::new();
+    for (index, validation) in validations.iter().enumerate() {
+        if validation.status != status {
+            continue;
+        }
+        for path in &owned_paths[index] {
+            if let Some(previous_index) = owner_by_path.get(path.as_str()).copied() {
+                conflicted.insert(previous_index);
+                conflicted.insert(index);
+            } else {
+                owner_by_path.insert(path.as_str(), index);
+            }
+        }
+    }
+    conflicted
 }
 
 fn is_launcher_candidate(name: &str, logical_name: &str) -> bool {
@@ -3118,6 +3117,96 @@ mod tests {
         let parsed = parse_numbered_volume_name("example.part1.photo").unwrap();
         assert_eq!(parsed.style, "part_numbered");
         assert_eq!(parsed.family, "generic");
+    }
+
+    fn validation_with_owned_paths(
+        status: ProposalStatus,
+        paths: &[&str],
+    ) -> ProposalValidation {
+        ProposalValidation {
+            status,
+            proposal: RelationProposal {
+                format: "rar".to_string(),
+                logical_name: "test".to_string(),
+                style: "rar_part".to_string(),
+                volumes: paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        (
+                            (*path).to_string(),
+                            index as u32 + 1,
+                            "rar_part".to_string(),
+                            2,
+                            true,
+                        )
+                    })
+                    .collect(),
+                companions: Vec::new(),
+            },
+            anchors: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn inverted_conflict_index_preserves_status_scoping() {
+        let validations = vec![
+            validation_with_owned_paths(
+                ProposalStatus::Valid,
+                &[r"C:\case.part1.rar", r"C:\case.part2.rar"],
+            ),
+            validation_with_owned_paths(
+                ProposalStatus::Valid,
+                &[r"C:\case.part2.rar", r"C:\case.part3.rar"],
+            ),
+            validation_with_owned_paths(
+                ProposalStatus::Valid,
+                &[r"C:\other.part1.rar"],
+            ),
+            validation_with_owned_paths(
+                ProposalStatus::NeedsPassword,
+                &[r"C:\case.part2.rar"],
+            ),
+        ];
+        let owned_paths: Vec<HashSet<String>> = validations
+            .iter()
+            .map(|validation| proposal_owned_paths(&validation.proposal))
+            .collect();
+
+        let valid_conflicts = conflicting_proposal_indexes(
+            &validations,
+            &owned_paths,
+            ProposalStatus::Valid,
+        );
+        let password_conflicts = conflicting_proposal_indexes(
+            &validations,
+            &owned_paths,
+            ProposalStatus::NeedsPassword,
+        );
+
+        assert_eq!(valid_conflicts, HashSet::from([0, 1]));
+        assert!(password_conflicts.is_empty());
+    }
+
+    #[test]
+    fn inverted_conflict_index_marks_every_candidate_sharing_a_path() {
+        let validations = vec![
+            validation_with_owned_paths(ProposalStatus::Valid, &[r"C:\shared.bin"]),
+            validation_with_owned_paths(ProposalStatus::Valid, &[r"C:\shared.bin"]),
+            validation_with_owned_paths(ProposalStatus::Valid, &[r"C:\shared.bin"]),
+        ];
+        let owned_paths: Vec<HashSet<String>> = validations
+            .iter()
+            .map(|validation| proposal_owned_paths(&validation.proposal))
+            .collect();
+
+        let conflicts = conflicting_proposal_indexes(
+            &validations,
+            &owned_paths,
+            ProposalStatus::Valid,
+        );
+
+        assert_eq!(conflicts, HashSet::from([0, 1, 2]));
     }
 
 }
