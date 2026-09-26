@@ -3,6 +3,7 @@ from sunpack.runtime.cli.cli_runtime import (
     resolve_common_root,
     resolve_target_paths,
     result_for_missing,
+    scan_finding_to_item,
     scan_result_to_item,
 )
 from sunpack.runtime.cli.cli_types import CliCommandResult
@@ -12,6 +13,13 @@ from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 
 COMMAND = "scan"
 ORDER = 20
+
+_REASON_KEYS = {
+    "embedded_password_required": "failure.password_required",
+    "embedded_wrong_password": "failure.wrong_password",
+    "embedded_truncated": "failure.damaged",
+    "embedded_carrier_blocked": "cli.scan.carrier_blocked",
+}
 
 
 def register(subparsers, ctx):
@@ -34,29 +42,52 @@ def handle(args, ctx):
 
     config = load_request_config(ctx.cwd)
     orchestrator = ScanOrchestrator(config, EmbeddedOptions(force_scan=bool(args.deep_detect)))
-    task_items = [scan_result_to_item(res) for res in orchestrator.scan_targets(target_paths)]
+    report = orchestrator.scan_report(target_paths)
+
+    task_items = [scan_result_to_item(res) for res in report.tasks]
     task_items.sort(key=lambda item: item["main_path"].lower())
+
+    finding_items = [scan_finding_to_item(finding) for finding in report.findings]
+    finding_items.sort(key=lambda item: (
+        item["main_path"].lower(),
+        item["offset"] if item["offset"] is not None else -1,
+        item["format"],
+    ))
 
     summary = {
         "task_count": len(task_items),
         "split_task_count": sum(1 for item in task_items if len(item["all_parts"]) > 1),
+        "finding_count": len(finding_items),
+        "blocked_finding_count": sum(1 for item in finding_items if item["status"] == "blocked"),
     }
     if not args.json:
-        reporter.info(ctx.t("cli.scan.identified", count=summary["task_count"]))
-        for item in task_items:
+        reporter.info(ctx.t("cli.scan.identified", count=summary["finding_count"]))
+        for item in finding_items:
             reporter.info(ctx.t("cli.item_path", path=item["main_path"]))
             reporter.info(ctx.t(
                 "cli.scan.details",
                 source=item["discovery_source"] or "-",
                 format=item["format"] or "-",
+                status=item["status"] or "-",
                 parts=len(item["all_parts"]),
             ))
-            if reporter.verbose and item["discovery_reason"]:
-                reporter.info(ctx.t("cli.scan.reason", reason=item["discovery_reason"]))
+            if item["offset"] is not None:
+                reporter.info(ctx.t(
+                    "cli.scan.range",
+                    start=item["offset"],
+                    end=item["end_offset"] if item["end_offset"] is not None else "?",
+                ))
+            if item["discovery_reason"] and (
+                reporter.verbose or item["status"] != "resolved"
+            ):
+                reason_key = _REASON_KEYS.get(item["discovery_reason"])
+                reason = ctx.t(reason_key) if reason_key else item["discovery_reason"]
+                reporter.info(ctx.t("cli.scan.reason", reason=reason))
 
     return 0, CliCommandResult(
         command=COMMAND,
         inputs={"paths": target_paths, "common_root": resolve_common_root(target_paths), "config_overrides": {}, "deep_detect": bool(args.deep_detect)},
         summary=summary,
+        items=finding_items,
         tasks=task_items,
     )
