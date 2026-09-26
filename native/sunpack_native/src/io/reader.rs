@@ -1378,6 +1378,9 @@ impl CacheShard {
     }
 
     fn compact_stale_orders(&mut self) {
+        // Cache payloads and byte counters are removed synchronously. Only
+        // obsolete LRU queue keys are compacted amortized so targeted release
+        // does not turn back into a full-cache scan.
         if self.hot_stale >= CACHE_ORDER_COMPACT_STALE_MIN {
             let entries = &self.entries;
             let order = &mut self.hot_order;
@@ -2477,6 +2480,27 @@ mod tests {
         drop(first);
         let second = manager().open_file(&path).unwrap();
         assert_eq!(first_ptr, Arc::as_ptr(&second));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn batched_handle_release_includes_entries_missing_from_current_path_index() {
+        let path = temp_file("managed_reader_stale_handle_path", b"abcdefgh");
+        let source = manager().open_file(&path).unwrap();
+        let canonical = source.identity.path.clone();
+
+        {
+            let mut handles = manager().handles.lock().unwrap();
+            assert_eq!(handles.by_path.remove(&canonical), Some(source.identity.clone()));
+            assert!(handles.entries.contains_key(&source.identity));
+        }
+
+        let released = manager()
+            .release_handles_under_roots(&[canonical])
+            .unwrap();
+
+        assert_eq!(released, 1);
+        assert!(source.closed.load(Ordering::Acquire));
         let _ = std::fs::remove_file(path);
     }
 
