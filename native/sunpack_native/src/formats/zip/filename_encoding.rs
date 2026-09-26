@@ -434,37 +434,27 @@ fn collect_zip_names(
     };
     let mut truncated = false;
 
-    while offset + ZIP_CENTRAL_HEADER_LENGTH <= central.len() && entries.len() < expected_entries {
-        if &central[offset..offset + 4] != ZIP_CENTRAL_DIRECTORY_SIGNATURE {
+    while entries.len() < expected_entries {
+        let Some(record) = super::parse_central_directory_record(central, offset, central.len()) else {
+            if offset
+                .checked_add(ZIP_CENTRAL_HEADER_LENGTH)
+                .is_some_and(|end| end <= central.len())
+                && central.get(offset..offset + 4) == Some(super::CD_SIG)
+            {
+                truncated = true;
+            }
             break;
-        }
+        };
 
-        let flags = read_u16_le(central, offset + 8);
-        let name_len = read_u16_le(central, offset + 28) as usize;
-        let extra_len = read_u16_le(central, offset + 30) as usize;
-        let comment_len = read_u16_le(central, offset + 32) as usize;
-        let name_start = offset + ZIP_CENTRAL_HEADER_LENGTH;
-        let name_end = name_start.saturating_add(name_len);
-        let extra_end = name_end.saturating_add(extra_len);
-        let next_offset = extra_end.saturating_add(comment_len);
-        if name_end > central.len() || extra_end > central.len() || next_offset > central.len() {
-            truncated = true;
-            break;
-        }
-
-        let raw_name = &central[name_start..name_end];
-        if !raw_name.is_empty() {
+        if !record.name.is_empty() {
             entries.push(ZipNameEntry {
-                raw_name: raw_name.to_vec(),
-                utf8_flag: flags & ZIP_UTF8_FLAG != 0,
-                unicode_path: valid_unicode_path_name(
-                    raw_name,
-                    &central[name_end..extra_end],
-                ),
+                raw_name: record.name.to_vec(),
+                utf8_flag: record.flags & ZIP_UTF8_FLAG != 0,
+                unicode_path: valid_unicode_path_name(record.name, record.extra),
             });
-            filename_bytes = filename_bytes.saturating_add(raw_name.len());
+            filename_bytes = filename_bytes.saturating_add(record.name.len());
         }
-        offset = next_offset;
+        offset = record.end;
         if filename_bytes >= max_filename_bytes {
             truncated = true;
             break;
