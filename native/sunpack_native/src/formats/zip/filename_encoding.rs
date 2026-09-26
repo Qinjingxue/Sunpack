@@ -871,6 +871,23 @@ mod tests {
     }
 
     #[test]
+    fn zip_name_sample_limit_is_reported_as_truncated() {
+        let mut central = Vec::new();
+        for raw_name in [b"a.txt".as_slice(), b"b.txt".as_slice()] {
+            let mut record = vec![0; ZIP_CENTRAL_HEADER_LENGTH];
+            record[0..4].copy_from_slice(ZIP_CENTRAL_DIRECTORY_SIGNATURE);
+            record[28..30].copy_from_slice(&(raw_name.len() as u16).to_le_bytes());
+            record.extend_from_slice(raw_name);
+            central.extend_from_slice(&record);
+        }
+
+        let scan = collect_zip_names(central, 2, 1, 1024);
+
+        assert_eq!(scan.entries.len(), 1);
+        assert!(scan.truncated);
+    }
+
+    #[test]
     fn zip_scan_validates_unicode_path_extra_field() {
         let raw_name = "日本語.txt".as_bytes().to_vec();
         let unicode_name = "正しい名前.txt".as_bytes();
