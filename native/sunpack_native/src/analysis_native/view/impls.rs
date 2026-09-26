@@ -52,8 +52,16 @@ impl AnalysisBinaryView {
 
         let header = self.read_at_bytes(offset, 30)?;
         if header.len() < 30 {
+            let fault = ReadFault::short_read(
+                "read_exact_at",
+                offset,
+                30,
+                header.len(),
+                self.reader.len(),
+            )
+            .with_field("zip.local_header.fixed", FieldLocation::Body);
+            set_view_read_fault(&result, &fault, "short_header")?;
             result.set_item("magic_matched", header.starts_with(b"PK"))?;
-            result.set_item("error", "short_header")?;
             return Ok(result.unbind());
         }
         if &header[..4] != ZIP_LOCAL {
