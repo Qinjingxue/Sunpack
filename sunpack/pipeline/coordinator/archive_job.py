@@ -19,7 +19,7 @@ from sunpack.pipeline.postprocess.output_cleanup import OutputCleanupEvent, clea
 from sunpack.core.contracts.verification import DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL, DECISION_RETRY_EXTRACT
 
 
-def _advance_batch_state(state, sent, *, first: bool):
+def _advance_extract_state(state, sent, *, first: bool):
     try:
         return False, next(state) if first else state.send(sent)
     except StopIteration as completed:
@@ -39,7 +39,7 @@ from sunpack.core.i18n import I18nContext
 
 
 @dataclass
-class BatchExtractionOutcome:
+class ArchiveJobOutcome:
     result: ExtractionResult
     verification: VerificationResult | None = None
     attempts: int = 1
@@ -116,7 +116,7 @@ class ArchiveJobExecutor:
         cancellation,
         missing_volume_retry=None,
         ensure_input_lease=None,
-    ) -> tuple[ArchiveTask, BatchExtractionOutcome, str | None]:
+    ) -> tuple[ArchiveTask, ArchiveJobOutcome, str | None]:
         """Run one logical archive through preflight, extraction and verification."""
 
         self.directory_password_contexts.annotate([task])
@@ -152,14 +152,14 @@ class ArchiveJobExecutor:
         cancellation,
         missing_volume_retry=None,
         ensure_input_lease=None,
-    ) -> tuple[ArchiveTask, BatchExtractionOutcome]:
+    ) -> tuple[ArchiveTask, ArchiveJobOutcome]:
         file_id = task.key or task.main_path
 
         def preflight():
             inspected = self._inspect_tasks_before_extract([task], output_dir_resolver, depth=depth)[0]
             _index, _task, out_dir, result = inspected
             if result.skip_result is not None:
-                return out_dir, BatchExtractionOutcome(result.skip_result)
+                return out_dir, ArchiveJobOutcome(result.skip_result)
             return out_dir, None
 
         retried_missing_volume = False
@@ -216,7 +216,7 @@ class ArchiveJobExecutor:
             done, value = await broker.run(
                 "extract_prepare" if first else "verify_extract",
                 file_id,
-                _advance_batch_state,
+                _advance_extract_state,
                 state,
                 sent,
                 first=first,
@@ -245,7 +245,7 @@ class ArchiveJobExecutor:
         if self.progress_reporter is not None:
             self.progress_reporter.task_started(task, depth)
 
-    def _report_task_finished(self, task: ArchiveTask, outcome: BatchExtractionOutcome, depth: int) -> None:
+    def _report_task_finished(self, task: ArchiveTask, outcome: ArchiveJobOutcome, depth: int) -> None:
         if self.progress_reporter is not None:
             self.progress_reporter.task_finished(task, outcome, depth)
 
@@ -291,7 +291,7 @@ class ArchiveJobExecutor:
             if not result.success:
                 self._report_task_status(task, "error", str(result.error or ""))
                 verification = verify_and_project(self.verifier, task, result)
-                current_outcome = BatchExtractionOutcome(
+                current_outcome = ArchiveJobOutcome(
                     result=result,
                     verification=verification,
                     attempts=attempt_index + 1,
@@ -325,7 +325,7 @@ class ArchiveJobExecutor:
                 return current_outcome
 
             verification = verify_and_project(self.verifier, task, result)
-            outcome = BatchExtractionOutcome(result=result, verification=verification, attempts=attempt_index + 1)
+            outcome = ArchiveJobOutcome(result=result, verification=verification, attempts=attempt_index + 1)
             if self._must_stop_for_proven_content_loss(task, result, verification):
                 return outcome
             if _verification_accepts_complete(verification):
@@ -341,7 +341,7 @@ class ArchiveJobExecutor:
                     planned_output_dir=out_dir,
                 )
             attempt_index += 1
-        return BatchExtractionOutcome(
+        return ArchiveJobOutcome(
             result=ExtractionResult(
                 success=False, out_dir=out_dir,
                 error=self.i18n.t("failure.verification_failed"),
@@ -361,12 +361,12 @@ class ArchiveJobExecutor:
     def _retry_on_verification_failure(self) -> bool:
         return bool(self.verifier.config.get("retry_on_verification_failure", True))
 
-    def collect_result(self, task: ArchiveTask, outcome: BatchExtractionOutcome | ExtractionResult) -> str | None:
+    def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> str | None:
         content_policy = getattr(self, "content_policy", None) or ContentRecoveryPolicy.from_config(
             getattr(self, "config", {})
         )
         if isinstance(outcome, ExtractionResult):
-            outcome = BatchExtractionOutcome(outcome, content_requirement=content_policy.requirement)
+            outcome = ArchiveJobOutcome(outcome, content_requirement=content_policy.requirement)
         else:
             outcome.content_requirement = content_policy.requirement
         res = outcome.result
@@ -393,7 +393,6 @@ class ArchiveJobExecutor:
         with self.context.lock:
             if outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
                 self.context.processed_keys.add(task.key)
-                self.context.flatten_candidates.add(out_dir)
                 self.context.target_results.append(TargetRunResult(
                     input_path=task.main_path,
                     outcome_kind=OutcomeKind.COMPLETE_SUCCESS,
@@ -449,13 +448,13 @@ class ArchiveJobExecutor:
             ))
             return None
 
-    def _failure_message(self, task: ArchiveTask, outcome: BatchExtractionOutcome) -> str:
+    def _failure_message(self, task: ArchiveTask, outcome: ArchiveJobOutcome) -> str:
         name = os.path.basename(task.main_path)
         if outcome.result.success and outcome.verification is not None and not _verification_accepts(outcome.verification):
             return f"{name} [{self._verification_failure_summary(outcome)}]"
         return f"{name} [{outcome.result.error}]"
 
-    def _verification_failure_summary(self, outcome: BatchExtractionOutcome) -> str:
+    def _verification_failure_summary(self, outcome: ArchiveJobOutcome) -> str:
         verification = outcome.verification
         if verification is None:
             return self.i18n.t("failure.verification_failed")
