@@ -91,6 +91,33 @@ impl AnalysisMultiVolumeView {
         Ok(PyBytes::new(py, &data))
     }
 
+    fn probe_zip_local_header(
+        &self,
+        py: Python<'_>,
+        offset: u64,
+    ) -> PyResult<Py<PyDict>> {
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .probe_zip_local_header_native(py, offset)
+    }
+
+    #[pyo3(signature = (eocd_offset=None))]
+    fn locate_zip_eocd(
+        &self,
+        py: Python<'_>,
+        eocd_offset: Option<u64>,
+    ) -> PyResult<Py<PyDict>> {
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .locate_zip_eocd_native(py, eocd_offset)
+    }
+
     #[pyo3(signature = (eocd_offset, max_cd_entries_to_walk=64))]
     fn probe_zip(
         &self,
