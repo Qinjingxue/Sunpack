@@ -343,22 +343,8 @@ def select_single_candidate_ratio(
 
 
 def logical_candidate_size(candidate: DiscoveryCandidate) -> int:
-    part_paths = candidate.archive_input.part_paths()
-    if len(part_paths) > 1:
-        total = 0
-        seen: set[str] = set()
-        for raw_path in part_paths:
-            normalized = os.path.normcase(os.path.normpath(raw_path))
-            if normalized in seen:
-                continue
-            seen.add(normalized)
-            try:
-                total += os.path.getsize(raw_path)
-            except OSError:
-                continue
-        if total > 0:
-            return total
-    return int(candidate.size) if isinstance(candidate.size, int) and candidate.size > 0 else 0
+    size = candidate.logical_size if candidate.is_split else candidate.size
+    return int(size) if isinstance(size, int) and size > 0 else 0
 
 
 def _descriptor_for_candidate(
