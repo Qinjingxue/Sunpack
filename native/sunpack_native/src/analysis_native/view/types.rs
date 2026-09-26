@@ -9,5 +9,6 @@ pub(crate) struct AnalysisBinaryView {
 pub(crate) struct AnalysisMultiVolumeView {
     path: String,
     reader: ManagedReader,
+    volume_starts: Vec<u64>,
     closed: bool,
 }
