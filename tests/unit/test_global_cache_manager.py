@@ -1,5 +1,5 @@
-from dataclasses import dataclass
 import threading
+from dataclasses import dataclass
 
 from sunpack.core.support.global_cache_manager import CacheManager
 
