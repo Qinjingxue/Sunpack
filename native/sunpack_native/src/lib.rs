@@ -69,7 +69,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         m
     )?)?;
     m.add_function(wrap_pyfunction!(
-        io::reader::release_reader_resources_under,
+        io::reader::release_reader_resources_under_roots,
         m
     )?)?;
     m.add_class::<analysis_native::AnalysisBinaryView>()?;
