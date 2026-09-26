@@ -21,7 +21,6 @@ from benchmarks.scenarios.worker_single_file_write import (
     MIB,
     GIB,
     _create_archive,
-    _digest_path,
     _prefetch_archive,
     _worker_counters,
 )
@@ -726,7 +725,6 @@ def main() -> int:
     iterations = args.runs + args.warmups
     # Outputs live on the target volume; the corpus lives in the benchmark workspace.
     volume_output_bytes = iterations * (payload_bytes + payload_bytes + small_bytes)
-    workspace_bytes = 2 * (payload_bytes + small_bytes) + MIB
     for target in targets:
         if int(target["size_remaining"]) < volume_output_bytes:
             parser.error(

@@ -10,7 +10,6 @@ import pytest
 
 from sunpack.core.config.loader import load_config
 from sunpack.core.config.schema import normalize_config
-from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider

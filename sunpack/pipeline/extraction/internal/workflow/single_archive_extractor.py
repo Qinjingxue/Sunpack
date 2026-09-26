@@ -197,10 +197,6 @@ class SingleArchiveExtractor:
             descriptor = task.archive_input()
             run_archive = descriptor.entry_path
             run_parts = descriptor.part_paths()
-            cleanup_parts = list(dict.fromkeys([
-                *(task.cleanup_parts or []),
-                *run_parts,
-            ]))
             run_result = None
             test_result = None
             err = ""

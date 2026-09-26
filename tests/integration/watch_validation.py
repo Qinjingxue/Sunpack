@@ -387,7 +387,6 @@ def run_scenario(base: Path, scenario: Scenario, payload: bytes, *, chunk_bytes:
     rss_before = process.memory_info().rss
     peak_rss = rss_before
     cpu_before = sum(process.cpu_times()[:2])
-    suite_started = time.perf_counter()
     thread = threading.Thread(target=writer, name=f"watch-validation-{scenario.name}", daemon=True)
     _start_detection_scheduler(watcher)
     try:
@@ -638,7 +637,6 @@ def run_suite(args: argparse.Namespace) -> tuple[dict, Path]:
             raise RuntimeError("SunPack Watch Broker did not establish its lifecycle lease")
         broker_release = watch_broker_release
     started_at = datetime.now(timezone.utc).isoformat()
-    suite_started = time.perf_counter()
     payload = _zip_payload(args.payload_mb)
     scenarios = scenario_matrix()
     if args.scenario:

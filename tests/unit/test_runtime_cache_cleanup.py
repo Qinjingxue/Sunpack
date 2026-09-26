@@ -5,7 +5,6 @@ from types import SimpleNamespace
 
 import pytest
 from sunpack.runtime.cli.runtime_host import RuntimeHost
-from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from tests.helpers.archive_tasks import make_archive_task
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from sunpack.core.passwords.relation_prober import _shared_attempt_cache, clear_relation_probe_cache

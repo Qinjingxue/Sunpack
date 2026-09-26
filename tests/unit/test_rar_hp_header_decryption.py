@@ -81,7 +81,7 @@ def test_probe_hp_single_volume_requires_and_accepts_password(tmp_path):
 
 
 def test_probe_hp_split_volumes_use_decrypted_numbers(tmp_path):
-    first = _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
+    _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
     second = _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX)
     passwords = {first: "secret", second: "secret"}
 
@@ -240,7 +240,7 @@ def test_split_hp_rar_group_accepts_camouflage_around_contiguous_part_token(tmp_
 
 
 def test_relations_password_prober_remembers_success_and_skips_second_probe(tmp_path):
-    first = _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
+    _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
     _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX)
     snapshot = _snapshot(tmp_path, ["vol.part1.rar", "vol.part2.rar"])
     groups = RelationsScheduler().build_candidate_groups(snapshot)
@@ -270,7 +270,7 @@ def test_relations_password_prober_remembers_success_and_skips_second_probe(tmp_
 
 
 def test_relations_password_prober_returns_none_without_candidates(tmp_path):
-    first = _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
+    _write_hex(tmp_path / "vol.part1.rar", PART1_HP_HEX)
     _write_hex(tmp_path / "vol.part2.rar", PART2_HP_HEX)
     snapshot = _snapshot(tmp_path, ["vol.part1.rar", "vol.part2.rar"])
     group = next(

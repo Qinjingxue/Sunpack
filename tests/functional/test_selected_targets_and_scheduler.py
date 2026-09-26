@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from sunpack.pipeline.coordinator.task_scan import direct_file_task
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets

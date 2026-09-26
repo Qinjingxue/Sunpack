@@ -1,4 +1,3 @@
-from pathlib import Path
 import struct
 from binascii import crc32
 

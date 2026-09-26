@@ -7,7 +7,7 @@ import threading
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Any, AsyncIterator, Callable, Generic, Iterable, TypeVar
+from typing import Any, AsyncIterator, Callable, Generic, TypeVar
 
 from sunpack.core.support.work_context import CURRENT_ORIGIN, CURRENT_WORK, WorkContext
 

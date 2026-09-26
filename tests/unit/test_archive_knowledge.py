@@ -1,4 +1,3 @@
-from pathlib import Path
 
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from tests.helpers.archive_tasks import make_archive_task

@@ -249,7 +249,6 @@ class _PipeConnection:
         return buffer.raw[: read.value]
 
     def close(self) -> None:
-        import ctypes
 
         if self._handle is not None:
             _kernel32().CloseHandle(self._handle)

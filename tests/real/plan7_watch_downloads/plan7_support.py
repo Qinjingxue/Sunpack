@@ -5,7 +5,6 @@ import asyncio
 import functools
 import os
 import random
-import shutil
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field

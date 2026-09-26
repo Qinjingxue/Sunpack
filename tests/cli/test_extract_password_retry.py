@@ -1,6 +1,4 @@
 import asyncio
-import json
-from pathlib import Path
 from types import SimpleNamespace
 
 from sunpack.runtime.cli.cli_context import CliContext

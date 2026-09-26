@@ -6,7 +6,6 @@ import zipfile
 
 import pytest
 
-from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_target

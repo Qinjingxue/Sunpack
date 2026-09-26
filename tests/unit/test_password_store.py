@@ -522,7 +522,7 @@ def test_confirmed_password_is_promoted_across_already_planned_archives():
         "password_required": True,
     })
     archive_a = resolver.resolve("first.unknown", task=required, archive_key="first")
-    archive_b = resolver.resolve("second.unknown", task=required, archive_key="second")
+    resolver.resolve("second.unknown", task=required, archive_key="second")
 
     resolver.confirm_extraction(archive_a, password="shared-secret")
     promoted_b = resolver.resolve("second.unknown", task=required, archive_key="second")

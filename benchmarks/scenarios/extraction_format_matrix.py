@@ -65,7 +65,7 @@ def timed(command: list[str], cwd: Path, timeout: float = DEFAULT_SUBPROCESS_TIM
             errors="replace",
             timeout=timeout,
         )
-    except subprocess.TimeoutExpired as exc:
+    except subprocess.TimeoutExpired:
         return time.perf_counter() - started, -124, f"command timed out after {timeout:g}s: {command[0]}"
     return time.perf_counter() - started, result.returncode, result.stderr[-2000:]
 

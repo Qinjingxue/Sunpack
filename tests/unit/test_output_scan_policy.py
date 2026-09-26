@@ -177,7 +177,6 @@ def test_output_scan_policy_inventory_batch_primes_file_heads(tmp_path, monkeypa
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory.to_dict()},
     )
-    roots = list(work.roots)
     session = work.session
     assert session is not None
 
@@ -235,7 +234,6 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory},
     )
-    roots = list(work.roots)
     session = work.session
     assert session is not None
     facts = session.file_head_facts_for_paths([str(archive)], magic_size=16)
@@ -286,7 +284,6 @@ def test_worker_inventory_fused_snapshot_preserves_raw_entries_and_rejects_escap
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory},
     )
-    roots = list(work.roots)
     session = work.session
     assert session is not None
     snapshot = session.snapshot_for_directory(str(tmp_path))
@@ -342,7 +339,6 @@ def test_worker_inventory_fused_snapshot_applies_mtime_after_directory_projectio
         [str(tmp_path)],
         inventories={str(tmp_path.resolve()).lower(): inventory},
     )
-    roots = list(work.roots)
     assert work.session is not None
     snapshot = work.session.snapshot_for_directory(str(tmp_path))
     paths, is_dirs, _sizes, _mtimes = snapshot.native_snapshot.materialize_columns()

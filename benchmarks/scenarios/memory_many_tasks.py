@@ -28,9 +28,7 @@ import asyncio
 import gc
 import json
 import os
-import queue
 import shutil
-import statistics
 import sys
 import threading
 import time

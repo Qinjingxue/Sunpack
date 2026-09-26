@@ -5,10 +5,8 @@ import pytest
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.run_state import RunState
-from sunpack.core.contracts.verification import VerificationResult
 from sunpack.core.contracts.results import OutcomeKind
 from sunpack.pipeline.coordinator.archive_job import ArchiveJobOutcome, ArchiveJobExecutor
-from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
 from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
 from tests.helpers.archive_tasks import make_archive_task
 

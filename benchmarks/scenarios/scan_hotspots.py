@@ -12,7 +12,6 @@ import argparse
 import cProfile
 import gc
 import io
-import json
 import os
 import pstats
 import sys
@@ -21,7 +20,7 @@ import time
 import tracemalloc
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import psutil
 from benchmarks.harness import render_report, report_from_payload

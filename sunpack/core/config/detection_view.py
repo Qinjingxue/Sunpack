@@ -4,7 +4,6 @@ from sunpack.core.config.schema import normalize_config_value
 from sunpack.core.config.fields.filesystem import (
     DIRECTORY_SCAN_CURRENT_DIR_ONLY,
     DIRECTORY_SCAN_MODES,
-    DIRECTORY_SCAN_RECURSIVE,
 )
 
 

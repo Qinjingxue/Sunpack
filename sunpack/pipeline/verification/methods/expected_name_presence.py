@@ -103,13 +103,10 @@ class ExpectedNamePresenceMethod:
         required_match_ratio = float(config["required_match_ratio"] or 0.0)
         actual_match_ratio = matched / max(1, total)
         if actual_match_ratio >= required_match_ratio:
-            penalty = int(config["minor_missing_penalty"])
             code = "warning.expected_names_partially_missing"
         elif matched == 0:
-            penalty = int(config["all_missing_penalty"])
             code = "fail.expected_names_all_missing"
         else:
-            penalty = int(config["missing_penalty"])
             code = "fail.expected_names_missing"
 
         issue = VerificationIssue(

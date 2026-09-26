@@ -7,7 +7,6 @@ from sunpack.pipeline.postprocess.output_cleanup import (
     OutputCleanupEvent,
     OutputCleanupExecutor,
     OutputCleanupManager,
-    OutputRole,
 )
 
 

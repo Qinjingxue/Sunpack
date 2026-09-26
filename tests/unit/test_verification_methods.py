@@ -105,7 +105,7 @@ def test_expected_name_presence_reports_missing_entries(tmp_path):
     (out_dir / "actual.txt").write_text("hello", encoding="utf-8")
     result = ExtractionResult(success=True, out_dir=str(out_dir))
 
-    verification = _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
+    _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
 
     assert verification.decision_hint == "retry_extract"
     assert verification.missing_files == 2
@@ -119,7 +119,7 @@ def test_expected_name_presence_skips_without_manifest_names(tmp_path):
     task = _task(tmp_path)
     result = ExtractionResult(success=True, out_dir=str(out_dir))
 
-    verification = _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
+    _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
 
 
 def test_archive_test_crc_compares_archive_state_manifest_to_output_files(tmp_path):

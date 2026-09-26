@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import ctypes
-import os
 import threading
 from ctypes import wintypes
 from pathlib import Path

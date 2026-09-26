@@ -5,7 +5,6 @@ from typing import Any
 
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge, ensure_knowledge, write_payload
-from sunpack.core.support.collections import dedupe_strings as _dedupe
 
 
 def write_zip_runtime_evidence_facts(task: ArchiveTask) -> dict[str, Any]:
@@ -124,8 +123,6 @@ def _zip_runtime_evidence_payload(
         }
     extraction = _dict_at(knowledge, "extraction.entry_outcomes")
     coverage = _dict_at(knowledge, "verification.coverage_breakdown")
-    result = _dict_at(knowledge, "extraction.result")
-
     split_parts = [str(path) for path in source_parts if str(path)]
     checked = max(1, _as_int(directory.get("cd_entries_checked")))
     cd_local_crc = _as_int(directory.get("central_local_crc_mismatch_count"))
@@ -146,7 +143,6 @@ def _zip_runtime_evidence_payload(
     file_size = _as_int(directory.get("file_size"))
     trailing_after_eocd = _as_int(eocd.get("trailing_bytes_after_eocd"))
     eocd_offset = _as_int(eocd.get("eocd_offset") or directory.get("eocd_offset"))
-    archive_offset = _as_int(eocd.get("archive_offset") or directory.get("archive_offset"))
     declared_cd_offset = _as_int(_first_present(eocd, directory, "declared_central_directory_offset", "declared_cd_offset"))
     physical_cd_offset = _as_int(_first_present(eocd, directory, "physical_central_directory_offset", "physical_cd_offset"))
     declared_cd_size = _as_int(_first_present(eocd, directory, "declared_central_directory_size", "declared_cd_size"))

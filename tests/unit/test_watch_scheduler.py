@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 
-import json
 import os
 import threading
 import time
@@ -22,7 +21,6 @@ from sunpack.core.support.resource_lifecycle import promotion_barrier
 from sunpack.runtime.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.state import WatchStateStore
-from sunpack.core.support.path_keys import path_key
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 

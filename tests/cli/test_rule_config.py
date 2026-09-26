@@ -1,11 +1,9 @@
-import pytest
 
 from sunpack.runtime.cli.cli_runtime import (
     apply_runtime_config_overrides,
     build_effective_config,
 )
 from sunpack.runtime.config_validation import validate_config_payload
-from tests.helpers.detection_config import with_detection_pipeline
 
 
 def _payload():

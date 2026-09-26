@@ -42,7 +42,6 @@ class SampleReadabilityMethod:
 
         issues: list[VerificationIssue] = []
         if unreadable_files:
-            all_unreadable = readable_files == 0
             issues.append(VerificationIssue(
                 method=self.name,
                 code="fail.sample_unreadable",

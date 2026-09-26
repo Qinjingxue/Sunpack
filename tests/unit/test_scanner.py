@@ -4,10 +4,7 @@ import pytest
 
 from sunpack.core.contracts.filesystem import FileEntry
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
-from sunpack.pipeline.discovery.detection import DetectionScheduler
-from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
-from tests.helpers.detection_config import with_detection_pipeline
 
 
 def _entries(snapshot):

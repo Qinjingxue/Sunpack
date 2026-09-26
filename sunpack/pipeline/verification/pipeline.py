@@ -321,20 +321,6 @@ def aggregate_payload_verifications(
         for result, weight in zip(results, weights)
     ) / total_weight
     output_confidence = min((result.output_confidence for result in results), default=0.0)
-    segment_summaries = [
-        {
-            "segment_id": str(segment.get("segment_id") or ""),
-            "format": str(segment.get("format") or ""),
-            "logical_name": str(segment.get("logical_name") or ""),
-            "decision_hint": decision,
-            "verification_decision_hint": verification.decision_hint,
-            "assessment_status": verification.assessment_status,
-            "content_integrity": verification.content_integrity,
-            "verification_strength": verification.verification_strength,
-            "completeness": verification.completeness,
-        }
-        for (segment, verification), decision in zip(payloads, decisions)
-    ]
     return VerificationResult(
         methods_run=list(dict.fromkeys(method for result in results for method in result.methods_run)),
         issues=[issue for result in results for issue in result.issues],

@@ -28,7 +28,6 @@ from sunpack.core.contracts.verification import (
     VERIFICATION_STRENGTH_CRC,
     VERIFICATION_STRENGTH_MANIFEST,
 )
-from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.i18n import I18nContext
 
 
