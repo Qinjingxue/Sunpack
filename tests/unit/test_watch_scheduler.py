@@ -266,6 +266,42 @@ def test_watch_ready_index_lazily_discards_stale_generations_without_mapping_sca
     assert watcher._ready_heap[0][2] == state.generation
 
 
+def test_watch_pop_ready_uses_heap_without_pending_mapping_scan(monkeypatch):
+    watcher = _indexed_scheduler_for_test()
+    path = os.path.abspath("ready.zip")
+    candidate = WatchCandidate(path, 10, 1.0, "file", 1)
+    with watcher._lock:
+        state = watcher._new_active_state_locked(
+            last_event_at=100.0,
+            quiet_seconds=1.0,
+        )
+        watcher._pending[path] = candidate
+        watcher._active_states[path] = state
+        watcher._schedule_active_locked(path, state)
+    watcher._pending = _NoItemsDict(watcher._pending)
+    watcher._active_states = _NoItemsDict(watcher._active_states)
+    watcher._claim_gate = threading.RLock()
+    watcher._active_claims = {}
+    watcher.state = SimpleNamespace(
+        record_attempt=lambda *args, **kwargs: None,
+        forget_path=lambda *args, **kwargs: None,
+    )
+    watcher.log = SimpleNamespace(
+        write=lambda *args, **kwargs: None,
+        write_throttled=lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        scheduler_module,
+        "_candidate_for_event_path",
+        lambda candidate_path, since_usn=0: candidate,
+    )
+    monkeypatch.setattr(scheduler_module, "watch_file_is_ready", lambda candidate_path: True)
+
+    assert watcher._pop_ready(101.0) == [candidate]
+    assert watcher._pending == {}
+    assert watcher._active_states == {}
+
+
 def test_watch_ready_index_rejects_stale_entry_from_previous_active_lifecycle(monkeypatch):
     watcher = _indexed_scheduler_for_test()
     path = os.path.abspath("recreated.zip")
