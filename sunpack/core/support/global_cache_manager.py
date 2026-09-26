@@ -20,12 +20,12 @@ class CacheManager:
         self.default_capacity = max(1, default_capacity)
         self._caches: dict[str, OrderedDict[tuple, Any]] = {}
         self._capacities: dict[str, int] = {}
-        self._immutable_namespaces: set[str] = set()
+        self._immutable_namespaces: frozenset[str] = frozenset()
         self._lock = threading.Lock()
 
     def register_immutable_namespace(self, namespace: str) -> None:
         with self._lock:
-            self._immutable_namespaces.add(namespace)
+            self._immutable_namespaces = self._immutable_namespaces | {namespace}
 
     def get(self, namespace: str, key: tuple):
         with self._lock:
@@ -38,8 +38,7 @@ class CacheManager:
         return value if immutable else copy.deepcopy(value)
 
     def set(self, namespace: str, key: tuple, value: Any):
-        with self._lock:
-            immutable = namespace in self._immutable_namespaces
+        immutable = namespace in self._immutable_namespaces
         stored = value if immutable else copy.deepcopy(value)
         with self._lock:
             cache = self._caches.setdefault(namespace, OrderedDict())

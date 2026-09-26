@@ -48,6 +48,7 @@ def test_shared_embedded_scanner_is_single_flight_per_file_identity(monkeypatch)
         ))
 
     assert calls == 1
+    assert all(result is results[0] for result in results)
     assert all(result.candidates[0].offset == 128 for result in results)
 
 
