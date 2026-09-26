@@ -92,7 +92,6 @@ def test_stopping_manager_clears_active_progress_only():
     assert [e[0] for e in recorder.events][-2:] == ['clear', 'close']
 
 
-
 def test_idle_thread_does_not_poll(monkeypatch):
     recorder = Recorder()
     manager = ToastManager(presenter_factory=recorder.factory)
