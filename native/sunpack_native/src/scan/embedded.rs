@@ -1,6 +1,6 @@
 #[cfg(windows)]
 use crate::io::iocp;
-use crate::io::reader::ManagedReader;
+use crate::io::reader::{CachedBytes, ManagedReader};
 use crate::scan::compression_stream::{
     resolve_xz_boundary_exact, validate_bzip2_structure, validate_gzip_structure,
     validate_zstd_structure, ValidationError,
@@ -733,8 +733,8 @@ fn zip64_central_local_offset(
     None
 }
 
-fn read_at(file: &ManagedReader, offset: u64, len: usize) -> std::io::Result<Vec<u8>> {
-    file.read_at(offset, len)
+fn read_at(file: &ManagedReader, offset: u64, len: usize) -> std::io::Result<CachedBytes> {
+    file.read_cached_at(offset, len)
 }
 
 fn validate_zip(
