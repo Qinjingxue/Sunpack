@@ -13,7 +13,10 @@ from typing import Any, Callable
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.tasks import ArchiveTask
-from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import attach_worker_diagnostics
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
+    attach_worker_diagnostics,
+    parse_worker_json_line,
+)
 from sunpack.core.support.output_paths import normalized_output_dir, resolve_output_volume_key
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from sunpack.core.support.runtime_cwd import runtime_working_directory
@@ -243,8 +246,9 @@ class _NativeWorkerProcess:
         payload: str,
         job_id: str,
         *,
-        on_line: Callable[[str], bool],
+        on_line: Callable[..., bool],
         on_timeout: Callable[[str], None],
+        parsed_events: bool = False,
     ) -> None:
         """Send a job without allocating a Python wait thread.
 
@@ -255,6 +259,7 @@ class _NativeWorkerProcess:
         state = {
             "on_line": on_line,
             "on_timeout": on_timeout,
+            "parsed_events": bool(parsed_events),
             "last_progress_at": now,
             "cancel_requested": False,
             "cancel_deadline": 0.0,
@@ -303,10 +308,7 @@ class _NativeWorkerProcess:
     def _dispatch_stdout(self, stream) -> None:
         try:
             for line in stream:
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    payload = {}
+                payload = parse_worker_json_line(line)
                 job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
                 with self._dispatch_lock:
                     async_state = self._async_jobs.get(job_id) if job_id else None
@@ -329,7 +331,12 @@ class _NativeWorkerProcess:
                                 continue
                             async_state["last_progress_at"] = time.monotonic()
                         try:
-                            completed = bool(async_state["on_line"](line))
+                            callback = async_state["on_line"]
+                            completed = bool(
+                                callback(line, payload)
+                                if async_state.get("parsed_events")
+                                else callback(line)
+                            )
                         except Exception as exc:
                             callback_error = f"sevenzip_worker completion callback failed: {exc}"
                             completed = True
@@ -529,13 +536,22 @@ class _AsyncNativeWorkerProcess:
     def is_alive(self) -> bool:
         return self.process is not None and self.process.returncode is None
 
-    async def submit(self, payload: str, job_id: str, *, on_line, on_timeout) -> None:
+    async def submit(
+        self,
+        payload: str,
+        job_id: str,
+        *,
+        on_line,
+        on_timeout,
+        parsed_events: bool = False,
+    ) -> None:
         if job_id in self._jobs:
             raise RuntimeError(f"sevenzip_worker job id is already active: {job_id}")
         now = time.monotonic()
         self._jobs[job_id] = {
             "on_line": on_line,
             "on_timeout": on_timeout,
+            "parsed_events": bool(parsed_events),
             "last_progress_at": now,
             "cancel_requested": False,
             "cancel_deadline": 0.0,
@@ -588,10 +604,7 @@ class _AsyncNativeWorkerProcess:
         try:
             while line_bytes := await self.process.stdout.readline():
                 line = line_bytes.decode("utf-8", "replace")
-                try:
-                    payload = json.loads(line)
-                except json.JSONDecodeError:
-                    payload = {}
+                payload = parse_worker_json_line(line)
                 job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
                 if isinstance(payload, dict) and payload.get("type") == "worker_ready":
                     self.handshake = dict(payload)
@@ -617,7 +630,12 @@ class _AsyncNativeWorkerProcess:
                 ):
                     continue
                 try:
-                    completed = bool(state["on_line"](line))
+                    callback = state["on_line"]
+                    completed = bool(
+                        callback(line, payload)
+                        if state.get("parsed_events")
+                        else callback(line)
+                    )
                 except Exception as exc:
                     self._fail_job(job_id, state, f"sevenzip_worker completion callback failed: {exc}")
                     completed = True
@@ -988,13 +1006,18 @@ class SevenZipRunner:
                 if result_future.done() or not worker.is_alive():
                     return
                 try:
-                    await worker.submit(payload_text, job_id, on_line=on_line, on_timeout=on_timeout)
+                    await worker.submit(
+                        payload_text,
+                        job_id,
+                        on_line=on_line,
+                        on_timeout=on_timeout,
+                        parsed_events=True,
+                    )
                 except Exception as exc:
                     on_timeout(f"native worker retry failed: {exc}")
 
-            def on_line(line: str) -> bool:
+            def on_line(line: str, value: dict[str, Any]) -> bool:
                 nonlocal pending_result, pending_payload, retries
-                value = self._json_line(line)
                 if value:
                     value.setdefault("worker_epoch", worker.worker_epoch)
                 if value and value.get("type") == "progress":
@@ -1065,7 +1088,13 @@ class SevenZipRunner:
                     progress_events=progress_events,
                 ))
 
-            await worker.submit(payload_text, job_id, on_line=on_line, on_timeout=on_timeout)
+            await worker.submit(
+                payload_text,
+                job_id,
+                on_line=on_line,
+                on_timeout=on_timeout,
+                parsed_events=True,
+            )
             try:
                 return await result_future
             except asyncio.CancelledError:
@@ -1141,9 +1170,8 @@ class SevenZipRunner:
             )
             payload = json.dumps(prepared_job, ensure_ascii=False, separators=(",", ":"))
 
-            def on_line(line: str) -> bool:
+            def on_line(line: str, payload_value: dict[str, Any]) -> bool:
                 nonlocal pending_result, pending_result_payload, backpressure_retries
-                payload_value = self._json_line(line)
                 if payload_value:
                     payload_value.setdefault("worker_epoch", worker.worker_epoch)
                 if payload_value and payload_value.get("type") == "progress":
@@ -1175,6 +1203,7 @@ class SevenZipRunner:
                                         job_id,
                                         on_line=on_line,
                                         on_timeout=on_timeout,
+                                        parsed_events=True,
                                     )
                                 except Exception as exc:
                                     on_timeout(f"native worker retry failed: {exc}")
@@ -1237,7 +1266,13 @@ class SevenZipRunner:
                     progress_events=progress_events,
                 ))
 
-            worker.submit_async(payload, job_id, on_line=on_line, on_timeout=on_timeout)
+            worker.submit_async(
+                payload,
+                job_id,
+                on_line=on_line,
+                on_timeout=on_timeout,
+                parsed_events=True,
+            )
         except Exception as exc:
             process_failure = {
                 "failure_stage": "worker_start" if worker is None else "worker_communication",
@@ -1336,11 +1371,7 @@ class SevenZipRunner:
 
     @staticmethod
     def _json_line(line: str) -> dict:
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            return {}
-        return payload if isinstance(payload, dict) else {}
+        return parse_worker_json_line(line)
 
     @staticmethod
     def _drain_stderr(worker: _NativeWorkerProcess, stderr_lines: list[str]) -> None:

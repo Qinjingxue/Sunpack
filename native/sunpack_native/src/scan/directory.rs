@@ -1454,6 +1454,386 @@ pub(crate) fn output_inventory_from_serialized(
     })
 }
 
+
+struct WorkerManifestRowCursor<'a> {
+    text: &'a str,
+    pos: usize,
+}
+
+impl<'a> WorkerManifestRowCursor<'a> {
+    fn new(text: &'a str) -> Self {
+        Self { text, pos: 0 }
+    }
+
+    fn skip_ws(&mut self) {
+        while self
+            .text
+            .as_bytes()
+            .get(self.pos)
+            .is_some_and(|byte| byte.is_ascii_whitespace())
+        {
+            self.pos += 1;
+        }
+    }
+
+    fn expect(&mut self, expected: u8) -> PyResult<()> {
+        self.skip_ws();
+        if self.text.as_bytes().get(self.pos).copied() != Some(expected) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "worker manifest row expected '{}'",
+                expected as char
+            )));
+        }
+        self.pos += 1;
+        Ok(())
+    }
+
+    fn parse_u64(&mut self) -> PyResult<u64> {
+        self.skip_ws();
+        let start = self.pos;
+        while self
+            .text
+            .as_bytes()
+            .get(self.pos)
+            .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "worker manifest row expected an unsigned integer",
+            ));
+        }
+        self.text[start..self.pos]
+            .parse::<u64>()
+            .map_err(|_| pyo3::exceptions::PyValueError::new_err(
+                "worker manifest integer is out of range",
+            ))
+    }
+
+    fn parse_u32(&mut self) -> PyResult<u32> {
+        u32::try_from(self.parse_u64()?).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(
+                "worker manifest integer exceeds u32",
+            )
+        })
+    }
+
+    fn parse_hex_quad(&mut self) -> PyResult<u16> {
+        let mut value = 0u16;
+        for _ in 0..4 {
+            let Some(byte) = self.text.as_bytes().get(self.pos).copied() else {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "worker manifest JSON has truncated unicode escape",
+                ));
+            };
+            self.pos += 1;
+            let digit = match byte {
+                b'0'..=b'9' => (byte - b'0') as u16,
+                b'a'..=b'f' => (byte - b'a' + 10) as u16,
+                b'A'..=b'F' => (byte - b'A' + 10) as u16,
+                _ => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "worker manifest JSON has invalid unicode escape",
+                    ));
+                }
+            };
+            value = value * 16 + digit;
+        }
+        Ok(value)
+    }
+
+    fn push_unicode_escape(&mut self, output: &mut Vec<u8>) -> PyResult<()> {
+        let first = self.parse_hex_quad()?;
+        let codepoint = if (0xD800..=0xDBFF).contains(&first) {
+            if self.text.as_bytes().get(self.pos).copied() != Some(b'\\')
+                || self.text.as_bytes().get(self.pos + 1).copied() != Some(b'u')
+            {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "worker manifest JSON has incomplete surrogate pair",
+                ));
+            }
+            self.pos += 2;
+            let second = self.parse_hex_quad()?;
+            if !(0xDC00..=0xDFFF).contains(&second) {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "worker manifest JSON has invalid surrogate pair",
+                ));
+            }
+            0x10000 + (((first as u32 - 0xD800) << 10) | (second as u32 - 0xDC00))
+        } else if (0xDC00..=0xDFFF).contains(&first) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "worker manifest JSON has unpaired low surrogate",
+            ));
+        } else {
+            first as u32
+        };
+        let ch = char::from_u32(codepoint).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "worker manifest JSON has invalid unicode scalar",
+            )
+        })?;
+        let mut encoded = [0u8; 4];
+        output.extend_from_slice(ch.encode_utf8(&mut encoded).as_bytes());
+        Ok(())
+    }
+
+    fn parse_string(&mut self) -> PyResult<String> {
+        self.expect(b'"')?;
+        let mut output = Vec::new();
+        loop {
+            let Some(byte) = self.text.as_bytes().get(self.pos).copied() else {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "worker manifest JSON has unterminated string",
+                ));
+            };
+            self.pos += 1;
+            match byte {
+                b'"' => {
+                    return String::from_utf8(output).map_err(|_| {
+                        pyo3::exceptions::PyValueError::new_err(
+                            "worker manifest JSON string is not UTF-8",
+                        )
+                    });
+                }
+                b'\\' => {
+                    let Some(escape) = self.text.as_bytes().get(self.pos).copied() else {
+                        return Err(pyo3::exceptions::PyValueError::new_err(
+                            "worker manifest JSON has truncated escape",
+                        ));
+                    };
+                    self.pos += 1;
+                    match escape {
+                        b'"' => output.push(b'"'),
+                        b'\\' => output.push(b'\\'),
+                        b'/' => output.push(b'/'),
+                        b'b' => output.push(0x08),
+                        b'f' => output.push(0x0c),
+                        b'n' => output.push(b'\n'),
+                        b'r' => output.push(b'\r'),
+                        b't' => output.push(b'\t'),
+                        b'u' => self.push_unicode_escape(&mut output)?,
+                        _ => {
+                            return Err(pyo3::exceptions::PyValueError::new_err(
+                                "worker manifest JSON has invalid escape",
+                            ));
+                        }
+                    }
+                }
+                0x00..=0x1f => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "worker manifest JSON string contains a control byte",
+                    ));
+                }
+                _ => output.push(byte),
+            }
+        }
+    }
+}
+
+fn worker_manifest_rows_end(text: &str, start: usize) -> PyResult<usize> {
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (offset, byte) in text.as_bytes()[start..].iter().copied().enumerate() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match byte {
+            b'"' => in_string = true,
+            b'[' => depth += 1,
+            b']' => {
+                depth = depth.checked_sub(1).ok_or_else(|| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "worker manifest rows have unbalanced brackets",
+                    )
+                })?;
+                if depth == 0 {
+                    return Ok(start + offset + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(pyo3::exceptions::PyValueError::new_err(
+        "worker manifest rows are truncated",
+    ))
+}
+
+fn parse_worker_manifest_rows(text: &str) -> PyResult<Vec<OutputFileRecord>> {
+    let mut cursor = WorkerManifestRowCursor::new(text);
+    cursor.expect(b'[')?;
+    let mut files = Vec::new();
+    cursor.skip_ws();
+    if cursor.text.as_bytes().get(cursor.pos).copied() == Some(b']') {
+        cursor.pos += 1;
+        return Ok(files);
+    }
+    loop {
+        cursor.expect(b'[')?;
+        let index = cursor.parse_u32()?;
+        cursor.expect(b',')?;
+        let path = cursor.parse_string()?;
+        cursor.expect(b',')?;
+        let raw_output_path = cursor.parse_string()?;
+        cursor.expect(b',')?;
+        let size = cursor.parse_u64()?;
+        cursor.expect(b',')?;
+        let bytes_written = cursor.parse_u64()?;
+        cursor.expect(b',')?;
+        let has_crc = cursor.parse_u64()? != 0;
+        cursor.expect(b',')?;
+        let source_crc32 = cursor.parse_u32()?;
+        cursor.expect(b',')?;
+        let has_output_crc = cursor.parse_u64()? != 0;
+        cursor.expect(b',')?;
+        let output_crc32 = cursor.parse_u32()?;
+        cursor.expect(b',')?;
+        let crc_ok = cursor.parse_u64()? != 0;
+        cursor.expect(b',')?;
+        let status = u8::try_from(cursor.parse_u64()?).map_err(|_| {
+            pyo3::exceptions::PyValueError::new_err(
+                "worker manifest status exceeds u8",
+            )
+        })?;
+        cursor.expect(b',')?;
+        let has_mtime = cursor.parse_u64()? != 0;
+        cursor.expect(b',')?;
+        let mtime_ns = cursor.parse_u64()?;
+        cursor.expect(b',')?;
+        let magic_hex = cursor.parse_string()?;
+        cursor.expect(b']')?;
+
+        files.push(OutputFileRecord {
+            index,
+            output_path: (!raw_output_path.is_empty() && raw_output_path != path)
+                .then_some(raw_output_path),
+            path,
+            abs_path: None,
+            size,
+            bytes_written,
+            crc32: has_crc.then_some(source_crc32),
+            output_crc32: has_output_crc.then_some(output_crc32),
+            crc_ok: Some(crc_ok),
+            status,
+            mtime_ns: has_mtime.then_some(mtime_ns),
+            magic: decode_hex_bytes(&magic_hex)?,
+        });
+
+        cursor.skip_ws();
+        match cursor.text.as_bytes().get(cursor.pos).copied() {
+            Some(b',') => cursor.pos += 1,
+            Some(b']') => {
+                cursor.pos += 1;
+                break;
+            }
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "worker manifest rows have invalid separator",
+                ));
+            }
+        }
+    }
+    cursor.skip_ws();
+    if cursor.pos != text.len() {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "worker manifest rows contain trailing data",
+        ));
+    }
+    Ok(files)
+}
+
+/// Parse the compact v3 manifest emitted by the bundled worker directly into
+/// Rust-owned storage, replacing only the large rows array with [] for Python.
+#[pyfunction]
+pub(crate) fn compact_worker_manifest_json(
+    line: &str,
+) -> PyResult<Option<(String, NativeWorkerManifest)>> {
+    const MANIFEST: &str = "\"verified_manifest\":{\"version\":3,";
+    const INVENTORY: &str = "\"inventory\":[";
+    const ROWS: &str = "\"rows\":[";
+
+    let Some(manifest_start) = line.find(MANIFEST) else {
+        return Ok(None);
+    };
+    let manifest = &line[manifest_start..];
+
+    let inventory_marker = manifest.find(INVENTORY).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(
+            "worker manifest v3 is missing inventory",
+        )
+    })?;
+    let inventory_start = manifest_start + inventory_marker + INVENTORY.len();
+    let inventory_end = line[inventory_start..]
+        .find(']')
+        .map(|offset| inventory_start + offset)
+        .ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "worker manifest v3 inventory is truncated",
+            )
+        })?;
+    let inventory: Vec<u64> = line[inventory_start..inventory_end]
+        .split(',')
+        .map(|item| {
+            item.trim().parse::<u64>().map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "worker manifest v3 inventory contains a non-integer",
+                )
+            })
+        })
+        .collect::<PyResult<_>>()?;
+    if inventory.len() != 5 {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "worker manifest v3 inventory must contain five columns",
+        ));
+    }
+
+    let rows_marker = manifest.find(ROWS).ok_or_else(|| {
+        pyo3::exceptions::PyValueError::new_err(
+            "worker manifest v3 is missing rows",
+        )
+    })?;
+    let rows_start = manifest_start + rows_marker + ROWS.len() - 1;
+    let rows_end = worker_manifest_rows_end(line, rows_start)?;
+    let files = parse_worker_manifest_rows(&line[rows_start..rows_end])?;
+
+    let mut compact = String::with_capacity(
+        line.len()
+            .saturating_sub(rows_end.saturating_sub(rows_start))
+            .saturating_add(2),
+    );
+    compact.push_str(&line[..rows_start]);
+    compact.push_str("[]");
+    compact.push_str(&line[rows_end..]);
+
+    Ok(Some((
+        compact,
+        NativeWorkerManifest {
+            files: Arc::new(files),
+            complete: inventory[0] != 0,
+            file_count: usize::try_from(inventory[1]).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "worker manifest file count is out of range",
+                )
+            })?,
+            dir_count: usize::try_from(inventory[2]).map_err(|_| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "worker manifest directory count is out of range",
+                )
+            })?,
+            total_size: inventory[3],
+            identity_paths: inventory[4] != 0,
+        },
+    )))
+}
+
 #[pyfunction]
 #[pyo3(signature = (rows, complete, file_count, dir_count, total_size, identity_paths=false))]
 pub(crate) fn worker_manifest_from_rows(

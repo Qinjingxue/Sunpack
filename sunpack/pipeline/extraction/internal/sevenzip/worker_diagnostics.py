@@ -3,7 +3,11 @@ import subprocess
 from copy import deepcopy
 from typing import Any
 
-from sunpack_native import NativeWorkerManifest, worker_manifest_from_rows
+from sunpack_native import (
+    NativeWorkerManifest,
+    compact_worker_manifest_json,
+    worker_manifest_from_rows,
+)
 
 
 _STDIO_TAIL_LINES = 40
@@ -29,6 +33,36 @@ def attach_worker_diagnostics(
         progress_events=progress_events,
     )
     return completed
+
+
+def parse_worker_json_line(text: str) -> dict[str, Any]:
+    """Parse one worker event without materializing v3 manifest rows in Python."""
+    line = str(text or "").strip()
+    if not line.startswith("{"):
+        return {}
+
+    native_manifest = None
+    if '"verified_manifest"' in line and '"rows"' in line:
+        try:
+            compact = compact_worker_manifest_json(line)
+        except (TypeError, ValueError):
+            return {}
+        if compact is not None:
+            line, native_manifest = compact
+
+    try:
+        payload = json.loads(line)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+
+    _expand_manifest(payload)
+    if native_manifest is not None and len(native_manifest):
+        manifest = payload.get("verified_manifest")
+        if isinstance(manifest, dict) and int(manifest.get("version", 0) or 0) == 3:
+            manifest["native_rows"] = native_manifest
+    return payload
 
 
 def build_worker_diagnostics(
@@ -117,15 +151,8 @@ def compact_success_worker_diagnostics(diagnostics: dict[str, Any]) -> None:
 def _json_events(text: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
     for line in (text or "").splitlines():
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            payload = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            _expand_manifest(payload)
+        payload = parse_worker_json_line(line)
+        if payload:
             events.append(payload)
     return events
 

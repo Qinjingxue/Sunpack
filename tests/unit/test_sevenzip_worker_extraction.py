@@ -594,6 +594,60 @@ def test_compact_worker_manifest_is_parsed_into_native_storage():
     assert "rows" not in manifest
 
 
+def test_worker_manifest_rows_are_removed_before_python_json_decode(monkeypatch):
+    import sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics as diagnostics_module
+
+    original_loads = diagnostics_module.json.loads
+    decoded_payloads = []
+
+    def guarded_loads(value, *args, **kwargs):
+        decoded_payloads.append(value)
+        assert '"rows":[]' in value
+        assert '"a.txt"' not in value
+        return original_loads(value, *args, **kwargs)
+
+    monkeypatch.setattr(diagnostics_module.json, "loads", guarded_loads)
+    line = (
+        '{"type":"result","status":"ok","verified_manifest":'
+        '{"version":3,"validated":true,"item_count":1,"file_count":1,'
+        '"inventory":[1,1,0,3,1],"rows":[[0,"a.txt","",3,3,1,1,1,1,1,1,1,123,"616263"]]}}'
+    )
+
+    result = diagnostics_module.parse_worker_json_line(line)
+
+    assert decoded_payloads
+    assert len(result["verified_manifest"]["native_rows"]) == 1
+    assert "rows" not in result["verified_manifest"]
+
+
+def test_worker_manifest_native_parser_preserves_json_escaped_paths():
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
+        parse_worker_json_line,
+        worker_manifest_files,
+    )
+
+    path = '目录/"quoted"\\name.txt'
+    payload = {
+        "type": "result",
+        "status": "ok",
+        "verified_manifest": {
+            "version": 3,
+            "validated": True,
+            "item_count": 1,
+            "file_count": 1,
+            "inventory": [1, 1, 0, 3, 1],
+            "rows": [[0, path, "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]],
+        },
+    }
+    line = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
+
+    result = parse_worker_json_line(line)
+    materialized = worker_manifest_files(result)[0]
+
+    assert materialized["path"] == path
+    assert materialized["magic"] == b"abc"
+
+
 def test_worker_manifest_v2_is_not_accepted():
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import build_worker_diagnostics
 
