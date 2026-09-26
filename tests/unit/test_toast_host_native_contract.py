@@ -57,7 +57,7 @@ def test_native_toast_identity_uses_current_user_and_keeps_machine_com_activator
     assert "remove_legacy_toast_shortcut" not in source
 
 
-def test_native_toast_replaces_progress_per_batch_without_deleting_terminal_history():
+def test_native_toast_finishes_with_independent_popup_and_preserves_terminal_history():
     source = (ROOT / "native/toast_host/src/main.cpp").read_text(encoding="utf-8")
     presenter = source[source.index("class ToastPresenter"):source.index("struct ToastContext")]
     progress = presenter[presenter.index("void show_progress"):presenter.index("void show_final")]
@@ -65,15 +65,21 @@ def test_native_toast_replaces_progress_per_batch_without_deleting_terminal_hist
 
     assert "kProgressToastTag" not in source
     assert "kFinalToastTag" not in source
-    assert "return snapshot.batch_id;" in presenter
+    assert "snapshot.batch_id.size() + suffix.size() > 64" in presenter
+    assert "return snapshot.batch_id + std::wstring(suffix);" in presenter
+
+    assert 'toast_tag(snapshot, L"-p")' in progress
     assert "notifier_.Update(data, tag, kToastGroup)" in progress
     assert "toast.Tag(tag);" in progress
-    assert "remove(kFinalToastTag)" not in progress
+    assert 'duration="long"' not in progress
 
-    assert "toast.Tag(tag);" in final
+    assert 'toast_tag(snapshot, L"-p")' in final
+    assert 'toast_tag(snapshot, L"-f")' in final
+    assert "remove(progress_tag);" in final
+    assert "toast.Tag(final_tag);" in final
+    assert "toast.SuppressPopup(false);" in final
     assert "notifier_.Show(toast);" in final
-    assert "if (!progress_tag_.empty() && progress_tag_ != tag)" in final
-    assert final.index("notifier_.Show(toast);") < final.index("progress_tag_.clear();")
+    assert "remove(final_tag)" not in final
 
     clear = presenter[presenter.index("void clear() noexcept"):presenter.index("private:")]
     assert "remove(progress_tag_);" in clear
