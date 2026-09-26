@@ -324,6 +324,7 @@ class RelationsGroupBuilder:
                 input_paths=all_parts,
                 is_split_candidate=bool(raw.get("is_split_candidate")),
                 head_size=raw.get("head_size"),
+                logical_size=raw.get("logical_size"),
                 split_volumes=split_volumes,
                 head_metadata=dict(raw.get("head_metadata") or {}),
                 companion_paths=[str(path) for path in (raw.get("companion_paths") or [])],
