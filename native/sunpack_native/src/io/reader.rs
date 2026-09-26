@@ -25,6 +25,7 @@ const HOT_CACHE_FRACTION: usize = 4;
 const HOT_EDGE_BYTES: u64 = 4 * 1024 * 1024;
 const DEFAULT_HANDLE_CAPACITY: usize = 256;
 const MAX_CACHEABLE_READ_BYTES: usize = 4 * 1024 * 1024;
+const CACHE_ORDER_COMPACT_STALE_MIN: usize = 1024;
 
 #[derive(Clone)]
 enum CachedBacking {
@@ -1288,18 +1289,28 @@ struct BlockKey {
     index: u64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Eq, PartialEq)]
 enum CacheTier {
     Hot,
     General,
 }
 
+struct CacheEntry {
+    data: Arc<[u8]>,
+    tier: CacheTier,
+    generation: u64,
+}
+
 struct CacheShard {
-    entries: HashMap<BlockKey, Arc<[u8]>>,
-    hot_order: VecDeque<BlockKey>,
-    general_order: VecDeque<BlockKey>,
+    entries: HashMap<BlockKey, CacheEntry>,
+    by_identity: HashMap<FileIdentity, HashSet<u64>>,
+    hot_order: VecDeque<(BlockKey, u64)>,
+    general_order: VecDeque<(BlockKey, u64)>,
     hot_size: usize,
     general_size: usize,
+    hot_stale: usize,
+    general_stale: usize,
+    generation: u64,
     hot_capacity: usize,
     general_capacity: usize,
 }
@@ -1336,6 +1347,56 @@ struct ManagerMetrics {
     evictions: AtomicU64,
 }
 
+impl CacheShard {
+    fn remove_entry(&mut self, key: &BlockKey, leave_order_entry: bool) -> Option<CacheEntry> {
+        let entry = self.entries.remove(key)?;
+        match entry.tier {
+            CacheTier::Hot => {
+                self.hot_size = self.hot_size.saturating_sub(entry.data.len());
+                if leave_order_entry {
+                    self.hot_stale += 1;
+                }
+            }
+            CacheTier::General => {
+                self.general_size = self.general_size.saturating_sub(entry.data.len());
+                if leave_order_entry {
+                    self.general_stale += 1;
+                }
+            }
+        }
+
+        let remove_identity = if let Some(indices) = self.by_identity.get_mut(&key.identity) {
+            indices.remove(&key.index);
+            indices.is_empty()
+        } else {
+            false
+        };
+        if remove_identity {
+            self.by_identity.remove(&key.identity);
+        }
+        Some(entry)
+    }
+
+    fn compact_stale_orders(&mut self) {
+        if self.hot_stale >= CACHE_ORDER_COMPACT_STALE_MIN {
+            self.hot_order.retain(|(key, generation)| {
+                self.entries
+                    .get(key)
+                    .is_some_and(|entry| entry.generation == *generation)
+            });
+            self.hot_stale = 0;
+        }
+        if self.general_stale >= CACHE_ORDER_COMPACT_STALE_MIN {
+            self.general_order.retain(|(key, generation)| {
+                self.entries
+                    .get(key)
+                    .is_some_and(|entry| entry.generation == *generation)
+            });
+            self.general_stale = 0;
+        }
+    }
+}
+
 impl ReaderManager {
     fn clear_resources(&self) -> io::Result<(usize, usize, usize)> {
         let mut removed_entries = 0usize;
@@ -1347,10 +1408,14 @@ impl ReaderManager {
             removed_entries += shard.entries.len();
             removed_bytes += shard.hot_size + shard.general_size;
             shard.entries.clear();
+            shard.by_identity.clear();
             shard.hot_order.clear();
             shard.general_order.clear();
             shard.hot_size = 0;
             shard.general_size = 0;
+            shard.hot_stale = 0;
+            shard.general_stale = 0;
+            shard.generation = 0;
         }
         let mut handles = self
             .handles
@@ -1371,55 +1436,68 @@ impl ReaderManager {
         Ok((removed_handles, removed_entries, removed_bytes))
     }
 
-    fn release_resources_under(&self, root: &Path) -> io::Result<(usize, usize, usize)> {
+    fn release_resources_under_roots(
+        &self,
+        roots: &[PathBuf],
+    ) -> io::Result<(usize, usize, usize)> {
+        if roots.is_empty() {
+            return Ok((0, 0, 0));
+        }
+
         let mut removed_entries = 0usize;
         let mut removed_bytes = 0usize;
         for shard in &self.cache_shards {
             let mut shard = shard
                 .lock()
                 .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-            let keys = shard
-                .entries
+            let identities = shard
+                .by_identity
                 .keys()
-                .filter(|key| key.identity.path.starts_with(root))
+                .filter(|identity| path_is_under_roots(&identity.path, roots))
                 .cloned()
-                .collect::<HashSet<_>>();
-            for key in &keys {
-                if let Some(value) = shard.entries.remove(key) {
-                    removed_entries += 1;
-                    removed_bytes += value.len();
+                .collect::<Vec<_>>();
+            for identity in identities {
+                let indices = shard
+                    .by_identity
+                    .get(&identity)
+                    .map(|indices| indices.iter().copied().collect::<Vec<_>>())
+                    .unwrap_or_default();
+                for index in indices {
+                    let key = BlockKey {
+                        identity: identity.clone(),
+                        index,
+                    };
+                    if let Some(entry) = shard.remove_entry(&key, true) {
+                        removed_entries += 1;
+                        removed_bytes += entry.data.len();
+                    }
                 }
             }
-            shard.hot_order.retain(|key| !keys.contains(key));
-            shard.general_order.retain(|key| !keys.contains(key));
-            shard.hot_size = shard
-                .hot_order
-                .iter()
-                .filter_map(|key| shard.entries.get(key))
-                .map(|value| value.len())
-                .sum();
-            shard.general_size = shard
-                .general_order
-                .iter()
-                .filter_map(|key| shard.entries.get(key))
-                .map(|value| value.len())
-                .sum();
+            shard.compact_stale_orders();
         }
-        let removed_handles = self.release_handles_under(root)?;
+        let removed_handles = self.release_handles_under_roots(roots)?;
         Ok((removed_handles, removed_entries, removed_bytes))
     }
 
     fn release_handles_under(&self, root: &Path) -> io::Result<usize> {
+        self.release_handles_under_roots(&[root.to_path_buf()])
+    }
+
+    fn release_handles_under_roots(&self, roots: &[PathBuf]) -> io::Result<usize> {
+        if roots.is_empty() {
+            return Ok(0);
+        }
+
         let mut handles = self
             .handles
             .lock()
             .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
         let identities = handles
-            .entries
-            .keys()
-            .filter(|identity| identity.path.starts_with(root))
-            .cloned()
-            .collect::<Vec<_>>();
+            .by_path
+            .iter()
+            .filter(|(path, _identity)| path_is_under_roots(path, roots))
+            .map(|(_path, identity)| identity.clone())
+            .collect::<HashSet<_>>();
         let mut sources = Vec::with_capacity(identities.len());
         for identity in &identities {
             if let Some(entry) = handles.entries.remove(identity) {
@@ -1707,7 +1785,10 @@ impl ReaderManager {
         let shard = self.cache_shards[shard_index]
             .lock()
             .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
-        let block = shard.entries.get(key).cloned();
+        let block = shard
+            .entries
+            .get(key)
+            .map(|entry| Arc::clone(&entry.data));
         if block.is_some() {
             self.metrics.cache_hits.fetch_add(1, Ordering::Relaxed);
             if matches!(tier, CacheTier::Hot) {
@@ -1728,32 +1809,61 @@ impl ReaderManager {
             .lock()
             .map_err(|_| io::Error::other("shared reader cache shard poisoned"))?;
         if let Some(existing) = shard.entries.get(&key) {
-            return Ok(Arc::clone(existing));
+            return Ok(Arc::clone(&existing.data));
         }
-        shard.entries.insert(key.clone(), Arc::clone(&data));
+
+        shard.generation = shard.generation.wrapping_add(1);
+        let generation = shard.generation;
+        shard
+            .by_identity
+            .entry(key.identity.clone())
+            .or_default()
+            .insert(key.index);
+        shard.entries.insert(
+            key.clone(),
+            CacheEntry {
+                data: Arc::clone(&data),
+                tier,
+                generation,
+            },
+        );
         match tier {
             CacheTier::Hot => {
                 shard.hot_size += data.len();
-                shard.hot_order.push_back(key);
+                shard.hot_order.push_back((key, generation));
                 while shard.hot_size > shard.hot_capacity {
-                    let Some(old_key) = shard.hot_order.pop_front() else {
+                    let Some((old_key, old_generation)) = shard.hot_order.pop_front() else {
                         break;
                     };
-                    if let Some(old) = shard.entries.remove(&old_key) {
-                        shard.hot_size = shard.hot_size.saturating_sub(old.len());
+                    let current_generation = shard
+                        .entries
+                        .get(&old_key)
+                        .map(|entry| entry.generation);
+                    if current_generation != Some(old_generation) {
+                        shard.hot_stale = shard.hot_stale.saturating_sub(1);
+                        continue;
+                    }
+                    if shard.remove_entry(&old_key, false).is_some() {
                         self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
                     }
                 }
             }
             CacheTier::General => {
                 shard.general_size += data.len();
-                shard.general_order.push_back(key);
+                shard.general_order.push_back((key, generation));
                 while shard.general_size > shard.general_capacity {
-                    let Some(old_key) = shard.general_order.pop_front() else {
+                    let Some((old_key, old_generation)) = shard.general_order.pop_front() else {
                         break;
                     };
-                    if let Some(old) = shard.entries.remove(&old_key) {
-                        shard.general_size = shard.general_size.saturating_sub(old.len());
+                    let current_generation = shard
+                        .entries
+                        .get(&old_key)
+                        .map(|entry| entry.generation);
+                    if current_generation != Some(old_generation) {
+                        shard.general_stale = shard.general_stale.saturating_sub(1);
+                        continue;
+                    }
+                    if shard.remove_entry(&old_key, false).is_some() {
                         self.metrics.evictions.fetch_add(1, Ordering::Relaxed);
                     }
                 }
@@ -1812,6 +1922,36 @@ impl HandlePool {
             }
         }
     }
+}
+
+fn path_is_under_roots(path: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| path.starts_with(root))
+}
+
+fn canonical_release_roots(paths: &[String]) -> Vec<PathBuf> {
+    let mut roots = paths
+        .iter()
+        .filter(|path| !path.is_empty())
+        .map(|path| {
+            std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path))
+        })
+        .collect::<Vec<_>>();
+    roots.sort_by(|left, right| {
+        left.components()
+            .count()
+            .cmp(&right.components().count())
+            .then_with(|| left.cmp(right))
+    });
+    roots.dedup();
+
+    let mut merged: Vec<PathBuf> = Vec::with_capacity(roots.len());
+    for root in roots {
+        if merged.iter().any(|parent| root.starts_with(parent)) {
+            continue;
+        }
+        merged.push(root);
+    }
+    merged
 }
 
 fn cache_shard_index(key: &BlockKey) -> usize {
@@ -1900,9 +2040,12 @@ pub(crate) fn release_reader_handles_under(path: &str) -> PyResult<usize> {
 }
 
 #[pyfunction]
-pub(crate) fn release_reader_resources_under(py: Python<'_>, path: &str) -> PyResult<Py<PyDict>> {
-    let root = std::fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
-    let (handles, cache_entries, cache_bytes) = manager().release_resources_under(&root)?;
+pub(crate) fn release_reader_resources_under_roots(
+    py: Python<'_>,
+    paths: Vec<String>,
+) -> PyResult<Py<PyDict>> {
+    let roots = canonical_release_roots(&paths);
+    let (handles, cache_entries, cache_bytes) = manager().release_resources_under_roots(&roots)?;
     let dict = PyDict::new(py);
     dict.set_item("handles", handles)?;
     dict.set_item("cache_entries", cache_entries)?;
@@ -1919,10 +2062,14 @@ fn manager() -> &'static ReaderManager {
             .map(|_| {
                 Mutex::new(CacheShard {
                     entries: HashMap::new(),
+                    by_identity: HashMap::new(),
                     hot_order: VecDeque::new(),
                     general_order: VecDeque::new(),
                     hot_size: 0,
                     general_size: 0,
+                    hot_stale: 0,
+                    general_stale: 0,
+                    generation: 0,
                     hot_capacity,
                     general_capacity: shard_capacity - hot_capacity,
                 })
@@ -2174,7 +2321,9 @@ mod tests {
 
         let data = reader.read_cached_at(0, 7).unwrap();
         let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-        let (handles, entries, _) = manager().release_resources_under(&canonical).unwrap();
+        let (handles, entries, _) = manager()
+            .release_resources_under_roots(&[canonical])
+            .unwrap();
         assert!(handles >= 1);
         assert!(entries >= 1);
         assert_eq!(&*data, b"payload");
