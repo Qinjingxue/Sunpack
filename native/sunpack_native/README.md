@@ -104,10 +104,11 @@ Return value:
 `analyze_zip_filename_encoding(archive_input, max_samples, max_filename_bytes)`
 consumes the canonical serialized archive-input descriptor, reads the logical ZIP
 central directory across file ranges or multipart inputs, and performs filename
-codepage scoring plus strict decoding entirely in Rust. Heavy work runs without
-the Python GIL. Python receives only the selected override, compact score
-evidence, and decoded item names when an override is actually required. ZIP64
-central-directory parsing is intentionally not handled here.
+codepage scoring entirely in Rust. Heavy work runs without the Python GIL.
+Python receives only the selected codepage and compact score evidence; item
+names never cross the Rust/Python boundary. Extraction applies the selected
+codepage directly to the embedded 7-Zip ZIP handler. ZIP64 central-directory
+parsing is intentionally not handled here.
 
 Return value:
 
@@ -118,7 +119,6 @@ Return value:
     "selected_codepage": "932",
     "selected_label": "Shift-JIS/CP932",
     "confidence": 0.833,
-    "decoded_names": ["日本語/説明.txt"],
     "evidence": {"best_score": 42, "second_score": 18, "lead": 24},
     "truncated": False,
 }
