@@ -3,7 +3,7 @@ use crate::io::reader::ManagedReader;
 use crate::scan::magic::rfind_subslice;
 use encoding_rs::{BIG5, GBK, SHIFT_JIS};
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::PyDict;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::sync::OnceLock;
@@ -31,7 +31,7 @@ static CP437_TABLE: OnceLock<Vec<char>> = OnceLock::new();
 struct ZipNameEntry {
     raw_name: Vec<u8>,
     utf8_flag: bool,
-    unicode_path_name: Option<String>,
+    unicode_path: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,7 +116,6 @@ struct ZipFilenameAnalysis {
     selected_codepage: Option<&'static str>,
     selected_label: &'static str,
     confidence: f64,
-    decoded_names: Vec<String>,
     unicode_count: usize,
     authoritative_all: bool,
     ascii_only: bool,
@@ -132,7 +131,6 @@ impl ZipFilenameAnalysis {
             selected_codepage: None,
             selected_label: "",
             confidence: 0.0,
-            decoded_names: Vec::new(),
             unicode_count: 0,
             authoritative_all: false,
             ascii_only: false,
@@ -148,7 +146,6 @@ impl ZipFilenameAnalysis {
         dict.set_item("selected_codepage", self.selected_codepage)?;
         dict.set_item("selected_label", self.selected_label)?;
         dict.set_item("confidence", self.confidence)?;
-        dict.set_item("decoded_names", PyList::new(py, self.decoded_names)?)?;
         dict.set_item("unicode_count", self.unicode_count)?;
         dict.set_item("authoritative_all", self.authoritative_all)?;
         dict.set_item("ascii_only", self.ascii_only)?;
@@ -308,7 +305,7 @@ fn analyze_zip_input(
     let unicode_count = scan
         .entries
         .iter()
-        .filter(|entry| entry.unicode_path_name.is_some())
+        .filter(|entry| entry.unicode_path)
         .count();
     let authoritative_all = !scan.entries.is_empty()
         && scan.entries.iter().all(has_authoritative_name);
@@ -325,7 +322,6 @@ fn analyze_zip_input(
         selected_codepage: None,
         selected_label: "",
         confidence: 0.0,
-        decoded_names: Vec::new(),
         unicode_count,
         authoritative_all,
         ascii_only,
@@ -359,12 +355,7 @@ fn analyze_zip_input(
         && result.evidence.as_ref().is_some_and(|value| value.lead >= 6)
         && selection.decoded_count > 0
     {
-        let Some(decoded_names) = decode_all_names(&scan.entries, selection.kind) else {
-            result.status = "decode_failed";
-            return Ok(result);
-        };
         result.selected_codepage = selection.kind.codepage();
-        result.decoded_names = decoded_names;
     }
     Ok(result)
 }
@@ -466,7 +457,7 @@ fn collect_zip_names(
             entries.push(ZipNameEntry {
                 raw_name: raw_name.to_vec(),
                 utf8_flag: flags & ZIP_UTF8_FLAG != 0,
-                unicode_path_name: valid_unicode_path_name(
+                unicode_path: valid_unicode_path_name(
                     raw_name,
                     &central[name_end..extra_end],
                 ),
@@ -491,37 +482,8 @@ fn has_authoritative_name(entry: &ZipNameEntry) -> bool {
     if entry.utf8_flag {
         std::str::from_utf8(&entry.raw_name).is_ok()
     } else {
-        entry.unicode_path_name.is_some()
+        entry.unicode_path
     }
-}
-
-fn decode_authoritative_name(entry: &ZipNameEntry) -> Option<String> {
-    if entry.utf8_flag {
-        std::str::from_utf8(&entry.raw_name)
-            .ok()
-            .map(normalize_path)
-    } else {
-        entry
-            .unicode_path_name
-            .as_deref()
-            .map(normalize_path)
-    }
-}
-
-fn decode_all_names(entries: &[ZipNameEntry], encoding: EncodingKind) -> Option<Vec<String>> {
-    let mut decoded = Vec::with_capacity(entries.len());
-    for entry in entries {
-        if let Some(name) = decode_authoritative_name(entry) {
-            decoded.push(name);
-            continue;
-        }
-        decoded.push(normalize_path(&decode_bytes(encoding, &entry.raw_name)?));
-    }
-    Some(decoded)
-}
-
-fn normalize_path(value: &str) -> String {
-    value.replace('\\', "/")
 }
 
 fn select_codepage(raw_names: &[&[u8]]) -> (EncodingScore, SelectionEvidence, f64) {
@@ -791,15 +753,17 @@ fn score_decoded_name(decoded: &str, encoding: EncodingKind) -> (i64, NameStats)
 
 /// Info-ZIP Unicode Path Extra Field (0x7075): version 1, CRC32 of the
 /// central-directory raw name, followed by the authoritative UTF-8 name.
-fn valid_unicode_path_name(raw_name: &[u8], extra: &[u8]) -> Option<String> {
+fn valid_unicode_path_name(raw_name: &[u8], extra: &[u8]) -> bool {
     let mut offset = 0usize;
     while offset + 4 <= extra.len() {
         let field_id = read_u16_le(extra, offset);
         let field_len = read_u16_le(extra, offset + 2) as usize;
         let data_start = offset + 4;
-        let data_end = data_start.checked_add(field_len)?;
+        let Some(data_end) = data_start.checked_add(field_len) else {
+            return false;
+        };
         if data_end > extra.len() {
-            return None;
+            return false;
         }
         if field_id == ZIP_UNICODE_PATH_EXTRA_FIELD {
             let data = &extra[data_start..data_end];
@@ -808,14 +772,14 @@ fn valid_unicode_path_name(raw_name: &[u8], extra: &[u8]) -> Option<String> {
                 && read_u32_le(data, 1) == crc32fast::hash(raw_name)
                 && !data[5..].is_empty()
             {
-                if let Ok(name) = std::str::from_utf8(&data[5..]) {
-                    return Some(name.to_string());
+                if std::str::from_utf8(&data[5..]).is_ok() {
+                    return true;
                 }
             }
         }
         offset = data_end;
     }
-    None
+    false
 }
 
 fn read_u16_le(bytes: &[u8], offset: usize) -> u16 {
@@ -875,6 +839,7 @@ mod tests {
         assert_eq!(scan.entries.len(), 1);
         assert_eq!(scan.entries[0].raw_name, raw_name);
         assert!(scan.entries[0].utf8_flag);
+        assert!(!scan.entries[0].unicode_path);
         assert!(!scan.truncated);
         let _ = fs::remove_file(path);
     }
@@ -890,12 +855,9 @@ mod tests {
         extra.extend_from_slice(&crc32fast::hash(&raw_name).to_le_bytes());
         extra.extend_from_slice(unicode_name);
 
-        assert_eq!(
-            valid_unicode_path_name(&raw_name, &extra).as_deref(),
-            Some("正しい名前.txt")
-        );
+        assert!(valid_unicode_path_name(&raw_name, &extra));
         extra[5] ^= 1;
-        assert_eq!(valid_unicode_path_name(&raw_name, &extra), None);
+        assert!(!valid_unicode_path_name(&raw_name, &extra));
     }
 
     #[test]
