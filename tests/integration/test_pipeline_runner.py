@@ -281,3 +281,61 @@ def test_output_root_preserves_tree_and_recursive_scan_uses_success_outputs(tmp_
     assert str(nested_archive) in extracted
     assert response.summary.success_count == 2
 
+
+
+def test_fast_job_recurses_before_slow_sibling_finishes(tmp_path, monkeypatch):
+    slow = tmp_path / "slow.zip"
+    fast = tmp_path / "fast.zip"
+    slow.write_bytes(make_zip({"slow.txt": b"slow"}))
+    fast.write_bytes(make_zip({"fast.txt": b"fast"}))
+    output_root = tmp_path / "out"
+
+    config = normalize_config(with_detection_pipeline({
+        "recursive_extract": "2",
+        "verification": {"enabled": False, "methods": []},
+        "output": {"root": str(output_root)},
+        "post_extract": {
+            "archive_cleanup_mode": "k",
+            "flatten_single_directory": False,
+        },
+    }))
+
+    slow_release = asyncio.Event()
+    nested_started = asyncio.Event()
+    nested_paths = []
+
+    async def run():
+        async with PipelineEngine(config) as engine:
+            def configure(runtime):
+                async def fake_extract_asyncio(_broker, task, out_dir, **_kwargs):
+                    out_path = Path(out_dir)
+                    out_path.mkdir(parents=True, exist_ok=True)
+                    if task.main_path == str(slow):
+                        await slow_release.wait()
+                    elif task.main_path == str(fast):
+                        nested = out_path / "nested.zip"
+                        nested.write_bytes(make_zip({"leaf.txt": b"leaf"}))
+                        nested_paths.append(str(nested))
+                    elif task.main_path in nested_paths:
+                        nested_started.set()
+                        slow_release.set()
+                    return ExtractionResult(success=True, out_dir=out_dir)
+
+                monkeypatch.setattr(
+                    runtime.extractor,
+                    "inspect",
+                    lambda *_args, **_kwargs: type("Preflight", (), {"skip_result": None})(),
+                )
+                monkeypatch.setattr(runtime.extractor, "extract_asyncio", fake_extract_asyncio)
+
+            _configure_request_runtime(engine, configure)
+            response = await asyncio.wait_for(
+                engine.run([str(slow), str(fast)], direct=True),
+                timeout=5,
+            )
+            return response
+
+    response = asyncio.run(run())
+
+    assert nested_started.is_set()
+    assert response.summary.success_count == 3
