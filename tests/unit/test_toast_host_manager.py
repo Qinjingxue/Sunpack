@@ -9,8 +9,8 @@ from sunpack.core.platform.windows.toast_host import ToastManager
 from sunpack.core.platform.windows.toast_protocol import ToastSnapshot, ToastSnapshotKind
 
 
-def snapshot(kind=ToastSnapshotKind.SUCCESS, *, title='done', ttl_ms=0):
-    return ToastSnapshot(kind, 'batch', title, ttl_ms=ttl_ms)
+def snapshot(kind=ToastSnapshotKind.SUCCESS, *, title='done'):
+    return ToastSnapshot(kind, 'batch', title)
 
 
 class Recorder:
@@ -70,36 +70,27 @@ def test_lifecycle_owns_native_objects_on_one_main_process_thread(tmp_path):
     manager.stop()
 
 
-def test_ttl_starts_after_show_returns():
+def test_terminal_does_not_self_expire():
     recorder = Recorder()
-    entered, release = threading.Event(), threading.Event()
+    manager = ToastManager(presenter_factory=recorder.factory)
+    manager.publish(snapshot())
+    manager.start()
+    recorder.wait('show')
+    time.sleep(.15)
+    assert not any(e[0] == 'clear' for e in recorder.events)
+    manager.stop()
+    assert not any(e[0] == 'clear' for e in recorder.events)
 
-    def factory(**kwargs):
-        presenter = recorder.factory(**kwargs)
-        show = presenter.show
 
-        def delayed_show(payload, sequence):
-            entered.set()
-            assert release.wait(3)
-            show(payload, sequence)
+def test_stopping_manager_clears_active_progress_only():
+    recorder = Recorder()
+    manager = ToastManager(presenter_factory=recorder.factory)
+    manager.publish(snapshot(ToastSnapshotKind.PROGRESS))
+    manager.start()
+    recorder.wait('show')
+    manager.stop()
+    assert [e[0] for e in recorder.events][-2:] == ['clear', 'close']
 
-        presenter.show = delayed_show
-        return presenter
-
-    manager = ToastManager(presenter_factory=factory)
-    manager.publish(snapshot(ttl_ms=100))
-    try:
-        manager.start()
-        assert entered.wait(3)
-        time.sleep(.15)
-        assert not any(e[0] == 'clear' for e in recorder.events)
-        released_at = time.monotonic()
-        release.set()
-        recorder.wait('clear')
-        assert time.monotonic() - released_at >= .09
-    finally:
-        release.set()
-        manager.stop()
 
 
 def test_idle_thread_does_not_poll(monkeypatch):
