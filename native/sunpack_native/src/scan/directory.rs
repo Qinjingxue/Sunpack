@@ -133,6 +133,23 @@ impl NativeDirectorySnapshot {
             )
         })
     }
+
+    fn identity_records(&self) -> Vec<(String, bool, u64, u64)> {
+        self.rows
+            .iter()
+            .map(|&row| {
+                (
+                    Path::new(&self.table.paths[row])
+                        .file_name()
+                        .map(|name| name.to_string_lossy().to_ascii_lowercase())
+                        .unwrap_or_default(),
+                    self.table.is_dirs[row],
+                    self.table.sizes[row].unwrap_or(0),
+                    self.table.mtimes_ns[row].unwrap_or(0),
+                )
+            })
+            .collect()
+    }
 }
 
 
@@ -727,21 +744,7 @@ impl NativeDirectorySnapshot {
     }
 
     fn identity_digest(&self) -> (usize, String) {
-        let mut rows: Vec<(String, bool, u64, u64)> = self
-            .rows
-            .iter()
-            .map(|&row| {
-                (
-                    Path::new(&self.table.paths[row])
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_ascii_lowercase())
-                        .unwrap_or_default(),
-                    self.table.is_dirs[row],
-                    self.table.sizes[row].unwrap_or(0),
-                    self.table.mtimes_ns[row].unwrap_or(0),
-                )
-            })
-            .collect();
+        let mut rows = self.identity_records();
         rows.sort_unstable();
 
         let mut digest = Sha256::new();
@@ -756,18 +759,7 @@ impl NativeDirectorySnapshot {
     }
 
     fn identity_rows(&self) -> Vec<(String, bool, u64, u64)> {
-        self.rows.iter().map(|&row| {
-                (
-                    Path::new(&self.table.paths[row])
-                        .file_name()
-                        .map(|name| name.to_string_lossy().to_ascii_lowercase())
-                        .unwrap_or_default(),
-                    self.table.is_dirs[row],
-                    self.table.sizes[row].unwrap_or(0),
-                    self.table.mtimes_ns[row].unwrap_or(0),
-                )
-            })
-            .collect()
+        self.identity_records()
     }
 }
 
