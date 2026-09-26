@@ -21,6 +21,7 @@ def parser():
     (["cfg", "show"], ["config", "show"]),
     (["cfg", "validate"], ["config", "validate"]),
     (["ver"], ["version"]),
+    (["d", "-j", "-q"], ["doctor", "--json", "--quiet"]),
     (["w", "rm", "D:\\Downloads"], ["watch", "remove", "D:\\Downloads"]),
     (["w", "ls"], ["watch", "list"]),
     (["w", "st"], ["watch", "status"]),
@@ -105,6 +106,7 @@ def test_aliases_work_with_command_specific_discovery(command, canonical):
     (["w", "ls", "-j"], "watch", "list"),
     (["w", "st", "-j"], "watch", "status"),
     (["cfg", "show", "-j"], "config", None),
+    (["d", "-j"], "doctor", None),
 ])
 def test_async_entrypoint_dispatches_canonical_commands(monkeypatch, tmp_path, argv, command, action):
     monkeypatch.setattr(cli, "_should_submit_to_persistent_server", lambda _argv: False)

@@ -61,7 +61,7 @@ SunPack 仅支持 Windows 10 版本 1607 及更高版本和 Windows 11。
 | `inspect`   | `i`   | 输出详细检测数据，调试命令，支持json诊断输出 |
 | `passwords` | `pw`  | 查看本次会参与尝试的密码列表。               |
 | `config`    | `cfg` | 查看或校验当前有效配置                       |
-| `doctor`    | —     | 非破坏性检查安装状态和运行环境               |
+| `doctor`    | `d`     | 非破坏性检查安装状态和运行环境               |
 | `version`   | `ver` | 输出当前安装的 SunPack 版本号                |
 
 > 详细参数见 [CLI 参数说明](docs/zh-CN/cli_parameters.md)。

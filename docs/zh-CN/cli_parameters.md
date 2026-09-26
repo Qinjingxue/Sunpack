@@ -24,7 +24,7 @@ sunpack.exe <command> [options] [paths...]
 | `inspect`, `i` | 输出检测和结构分析细节，不修改文件。 |
 | `passwords`, `pw` | 查看当前命令可用的密码来源汇总。 |
 | `config`, `cfg` | 查看或校验合并后的有效配置。 |
-| `doctor` | 只读检查配置和运行环境。 |
+| `doctor`, `d` | 只读检查配置和运行环境。 |
 | `version`, `ver` | 输出当前安装的 SunPack 版本号。 |
 
 完整名称和简写都是正式语法；只接受明确列出的简写，不接受任意截断长参数。简写输出的 JSON `command` 仍使用完整命令名。`-m` 接受 `background`/`b`、`normal`/`n`、`high`/`h`。`-p` 是密码，`-P` 是密码文件；`-f` 启用扁平化，`-F` 关闭扁平化。带值参数推荐分开写，例如 `-r 3`、`-c r`。
@@ -263,6 +263,7 @@ python sunpack.py config validate --json
 
 ```powershell
 python sunpack.py doctor [--json] [--quiet]
+python sunpack.py d [-j] [-q]
 ```
 
 `doctor` 只读检查配置、原生扩展、`7z.dll`、SevenZip worker、Windows 通知能力以及已配置的监控根。不存在的监控根报告为警告；命令不会启动持续监控或真实解压，也不会修改注册表。存在失败项时退出码为 `1`，只有警告或跳过项时退出码为 `0`。

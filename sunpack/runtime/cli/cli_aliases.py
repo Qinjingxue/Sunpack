@@ -5,6 +5,7 @@ COMMAND_ALIASES = {
     "passwords": ("pw",),
     "watch": ("w",),
     "config": ("cfg",),
+    "doctor": ("d",),
     "version": ("ver",),
 }
 

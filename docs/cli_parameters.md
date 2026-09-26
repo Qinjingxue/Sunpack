@@ -24,7 +24,7 @@ Top-level commands:
 | `inspect`, `i` | Print detection and structural analysis details; does not modify files. |
 | `passwords`, `pw` | Show a summary of the password sources available to the current command. |
 | `config`, `cfg` | Show or validate the merged effective configuration. |
-| `doctor` | Read-only check of configuration and runtime environment. |
+| `doctor`, `d` | Read-only check of configuration and runtime environment. |
 | `version`, `ver` | Print the installed SunPack version. |
 
 Full names and the listed aliases are both supported syntax. Arbitrary long-option prefixes are rejected. JSON `command` fields always use the full command name. `-m` accepts `background`/`b`, `normal`/`n`, and `high`/`h`. `-p` supplies a password; `-P` supplies a password file. `-f` enables flattening; `-F` disables it. Separate options from their values, for example `-r 3` and `-c r`.
@@ -263,6 +263,7 @@ Usage:
 
 ```powershell
 python sunpack.py doctor [--json] [--quiet]
+python sunpack.py d [-j] [-q]
 ```
 
 `doctor` performs a read-only check of the configuration, the native extension, `7z.dll`, the SevenZip worker, Windows notification capability, and the configured monitored roots. A monitored root that does not exist is reported as a warning; the command never starts continuous monitoring or a real extraction, and never modifies the registry. The exit code is `1` when any check fails, and `0` when there are only warnings or skipped items.

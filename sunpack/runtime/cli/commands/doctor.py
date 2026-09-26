@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 from sunpack.core.support.resource_lifecycle import named_task_temporary_file
 
+from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_TASK_FAILED
 from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_config_output_parser, localize_help_action
 from sunpack.runtime.cli.cli_types import CliCommandResult
@@ -48,11 +49,13 @@ def register(subparsers, ctx):
     common_parser = build_config_output_parser(ctx)
     parser = subparsers.add_parser(
         COMMAND,
+        aliases=COMMAND_ALIASES[COMMAND],
         parents=[common_parser],
         help=ctx.t("cli.doctor.help"),
         usage="sunpack doctor [options]",
         formatter_class=CliHelpFormatter,
     )
+    parser.set_defaults(command=COMMAND)
     localize_help_action(parser, ctx)
 
 

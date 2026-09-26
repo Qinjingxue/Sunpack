@@ -61,7 +61,7 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
 | `inspect`   | `i`        | Print detailed detection data; a debugging command with JSON output. |
 | `passwords` | `pw`       | Show the password list that will be attempted in this run.           |
 | `config`    | `cfg`      | Show or validate the effective configuration.                        |
-| `doctor`    | —          | Non-destructive check of installation and runtime health.            |
+| `doctor`    | `d`          | Non-destructive check of installation and runtime health.            |
 | `version`   | `ver`      | Print the installed SunPack version.                                 |
 
 > See [CLI parameter reference](docs/cli_parameters.md) for detailed options.
