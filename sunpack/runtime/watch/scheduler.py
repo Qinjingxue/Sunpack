@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import heapq
 import json
 import os
 import threading
@@ -103,6 +104,7 @@ class _ActiveCandidateState:
     last_event_at: float
     quiet_seconds: float
     generation: int = 1
+    epoch: int = 0
 
 
 @dataclass
@@ -198,7 +200,12 @@ class WatchScheduler:
         self._password_source_lock = threading.RLock()
         self._pending: dict[str, WatchCandidate] = {}
         self._inflight_requests: list[_ActivePipelineRequest] = []
+        self._inflight_path_counts: dict[str, int] = {}
         self._active_states: dict[str, _ActiveCandidateState] = {}
+        self._active_epoch = 0
+        # Incremental ready index. Entries are invalidated lazily by active
+        # lifecycle epoch + generation, avoiding heap delete/search.
+        self._ready_heap: list[tuple[float, int, int, str, str]] = []
         self._latest_observations: dict[str, WatchCandidate] = {}
         self._quiet_trackers: dict[str, AdaptiveQuietTracker] = {}
         self._password_dirty_dirs: dict[str, float] = {}
@@ -654,7 +661,7 @@ class WatchScheduler:
             if request is not None:
                 active_requests.append(request)
         with self._lock:
-            self._inflight_requests.extend(active_requests)
+            self._register_inflight_requests_locked(active_requests)
         # Give newly submitted candidate coroutines one scheduling turn.  Fast
         # no-op/failure requests can be harvested in this tick without ever
         # waiting for slow candidates.
@@ -677,6 +684,7 @@ class WatchScheduler:
                 self._inflight_requests = [
                     request for request in self._inflight_requests if id(request) not in completed_ids
                 ]
+                self._unregister_inflight_requests_locked(completed)
         result = WatchRunResult()
         if completed:
             finished = await asyncio.gather(
@@ -728,11 +736,97 @@ class WatchScheduler:
         target.failed += source.failed
         target.errors.extend(source.errors)
 
+    @staticmethod
+    def _scheduler_path_key(path: str) -> str:
+        return os.path.normcase(os.path.abspath(path))
+
     def _inflight_path_keys_locked(self) -> set[str]:
-        paths: set[str] = set()
-        for request in self._inflight_requests:
-            paths.add(os.path.normcase(os.path.abspath(request.candidate.path)))
-        return paths
+        return set(self._inflight_path_counts)
+
+    def _register_inflight_requests_locked(
+        self,
+        requests: Iterable[_ActivePipelineRequest],
+    ) -> None:
+        for request in requests:
+            self._inflight_requests.append(request)
+            key = self._scheduler_path_key(request.candidate.path)
+            self._inflight_path_counts[key] = self._inflight_path_counts.get(key, 0) + 1
+
+    def _unregister_inflight_requests_locked(
+        self,
+        requests: Iterable[_ActivePipelineRequest],
+    ) -> None:
+        for request in requests:
+            path = request.candidate.path
+            key = self._scheduler_path_key(path)
+            count = self._inflight_path_counts.get(key, 0)
+            if count <= 1:
+                self._inflight_path_counts.pop(key, None)
+                state = self._active_states.get(path)
+                if state is not None:
+                    self._schedule_active_locked(path, state, path_key_value=key)
+            else:
+                self._inflight_path_counts[key] = count - 1
+
+    def _new_active_state_locked(
+        self,
+        *,
+        last_event_at: float,
+        quiet_seconds: float,
+    ) -> _ActiveCandidateState:
+        self._active_epoch += 1
+        return _ActiveCandidateState(
+            last_event_at=last_event_at,
+            quiet_seconds=quiet_seconds,
+            epoch=self._active_epoch,
+        )
+
+    def _schedule_active_locked(
+        self,
+        path: str,
+        state: _ActiveCandidateState,
+        *,
+        path_key_value: str | None = None,
+    ) -> None:
+        key = path_key_value or self._scheduler_path_key(path)
+        if key in self._inflight_path_counts:
+            return
+        heapq.heappush(
+            self._ready_heap,
+            (
+                state.last_event_at + state.quiet_seconds,
+                state.epoch,
+                state.generation,
+                key,
+                path,
+            ),
+        )
+
+    def _next_ready_entry_locked(self) -> tuple[float, int, int, str, str] | None:
+        while self._ready_heap:
+            deadline, epoch, generation, key, path = self._ready_heap[0]
+            state = self._active_states.get(path)
+            if (
+                state is None
+                or state.epoch != epoch
+                or state.generation != generation
+                or key in self._inflight_path_counts
+            ):
+                heapq.heappop(self._ready_heap)
+                continue
+            return deadline, epoch, generation, key, path
+        return None
+
+    def _reschedule_generation(self, path: str, epoch: int, generation: int) -> None:
+        with self._lock:
+            state = self._active_states.get(path)
+            if (
+                state is None
+                or state.epoch != epoch
+                or state.generation != generation
+            ):
+                return
+            self._schedule_active_locked(path, state)
 
     @property
     def pending_count(self) -> int:
@@ -743,22 +837,12 @@ class WatchScheduler:
         now = time.time()
         monotonic_now = time.monotonic()
         with self._lock:
-            inflight_paths = self._inflight_path_keys_locked()
-            schedulable_states = [
-                state
-                for path, state in self._active_states.items()
-                if os.path.normcase(os.path.abspath(path)) not in inflight_paths
-            ]
-            if schedulable_states:
-                delay = max(
-                    0.0,
-                    min(
-                        state.quiet_seconds - (now - state.last_event_at)
-                        for state in schedulable_states
-                    ),
-                )
-            else:
-                delay = None
+            next_ready = self._next_ready_entry_locked()
+            delay = (
+                None
+                if next_ready is None
+                else max(0.0, next_ready[0] - now)
+            )
             if self._password_dirty_dirs:
                 password_delay = max(
                     0.0,
@@ -909,6 +993,7 @@ class WatchScheduler:
                     state.last_event_at = now
                     state.quiet_seconds = quiet_seconds
                     state.generation += 1
+                    self._schedule_active_locked(candidate.path, state)
                     self._wake_service()
                     return
             became_active = False
@@ -946,9 +1031,13 @@ class WatchScheduler:
                     self._pending[candidate.path] = candidate
                     self._latest_observations[candidate.path] = candidate
                     became_active = True
-                    self._active_states[candidate.path] = _ActiveCandidateState(
+                    self._active_states[candidate.path] = self._new_active_state_locked(
                         last_event_at=now,
                         quiet_seconds=active_quiet_seconds,
+                    )
+                    self._schedule_active_locked(
+                        candidate.path,
+                        self._active_states[candidate.path],
                     )
                 else:
                     self._pending[candidate.path] = candidate
@@ -961,6 +1050,7 @@ class WatchScheduler:
                     state.last_event_at = now
                     state.quiet_seconds = active_quiet_seconds
                     state.generation += 1
+                    self._schedule_active_locked(candidate.path, state)
         if became_active:
             self.log.write(
                 "candidate_active",
@@ -1162,43 +1252,58 @@ class WatchScheduler:
 
     def _pop_ready(self, now: float) -> list[WatchCandidate]:
         ready: list[WatchCandidate] = []
-        due: list[tuple[str, WatchCandidate, int, float]] = []
+        due: list[tuple[str, WatchCandidate, int, int, float]] = []
+        due_paths: set[str] = set()
         with self._lock:
-            inflight_paths = self._inflight_path_keys_locked()
-            for path, candidate in self._pending.items():
-                if os.path.normcase(os.path.abspath(path)) in inflight_paths:
+            while True:
+                entry = self._next_ready_entry_locked()
+                if entry is None or entry[0] > now:
+                    break
+                _, epoch, generation, _, path = heapq.heappop(self._ready_heap)
+                if path in due_paths:
                     continue
-                state = self._active_states[path]
-                if now - state.last_event_at >= state.quiet_seconds:
-                    due.append((
-                        path,
-                        candidate,
-                        state.generation,
-                        state.quiet_seconds,
-                    ))
+                state = self._active_states.get(path)
+                candidate = self._pending.get(path)
+                if (
+                    state is None
+                    or candidate is None
+                    or state.epoch != epoch
+                    or state.generation != generation
+                ):
+                    continue
+                due_paths.add(path)
+                due.append((
+                    path,
+                    candidate,
+                    epoch,
+                    generation,
+                    state.quiet_seconds,
+                ))
 
-        for path, candidate, generation, quiet_seconds in due:
+        for path, candidate, epoch, generation, quiet_seconds in due:
             # Claim publication and source observation share this admission
             # gate. Therefore cleanup can never publish a claim in the middle
             # of a candidate/readiness probe and later reject that same probe.
             with self._claim_gate:
                 if path_key(os.path.abspath(path)) in self._active_claims:
+                    self._reschedule_generation(path, epoch, generation)
                     continue
                 refreshed = _candidate_for_event_path(path, since_usn=candidate.change_usn)
                 if refreshed is None:
-                    self._drop_active(path, generation)
+                    self._drop_active(path, epoch, generation)
                     self.state.forget_path(path)
                     continue
                 if _candidate_observation_changed(candidate, refreshed):
                     if _candidate_content_changed(candidate, refreshed):
-                        self._record_boundary_activity(path, generation, refreshed, now)
+                        self._record_boundary_activity(path, epoch, generation, refreshed, now)
                         continue
-                    if not self._update_boundary_metadata(path, generation, refreshed):
+                    if not self._update_boundary_metadata(path, epoch, generation, refreshed):
                         continue
                     candidate = refreshed
                 if not watch_file_is_ready(path):
                     self._record_boundary_activity(
                         path,
+                        epoch,
                         generation,
                         refreshed,
                         now,
@@ -1214,7 +1319,11 @@ class WatchScheduler:
                 identified = refreshed
                 with self._lock:
                     state = self._active_states.get(path)
-                    if state is None or state.generation != generation:
+                    if (
+                        state is None
+                        or state.epoch != epoch
+                        or state.generation != generation
+                    ):
                         continue
                     self._pending.pop(path, None)
                     self._active_states.pop(path, None)
@@ -1229,10 +1338,14 @@ class WatchScheduler:
                 ready.append(identified)
         return ready
 
-    def _drop_active(self, path: str, generation: int) -> None:
+    def _drop_active(self, path: str, epoch: int, generation: int) -> None:
         with self._lock:
             state = self._active_states.get(path)
-            if state is None or state.generation != generation:
+            if (
+                state is None
+                or state.epoch != epoch
+                or state.generation != generation
+            ):
                 return
             self._pending.pop(path, None)
             self._active_states.pop(path, None)
@@ -1240,6 +1353,7 @@ class WatchScheduler:
     def _record_boundary_activity(
         self,
         path: str,
+        epoch: int,
         generation: int,
         candidate: WatchCandidate,
         now: float,
@@ -1248,7 +1362,11 @@ class WatchScheduler:
     ) -> None:
         with self._lock:
             state = self._active_states.get(path)
-            if state is None or state.generation != generation:
+            if (
+                state is None
+                or state.epoch != epoch
+                or state.generation != generation
+            ):
                 return
             self._pending[path] = candidate
             self._latest_observations[path] = candidate
@@ -1261,16 +1379,22 @@ class WatchScheduler:
             )
             state.quiet_seconds = min(learned_quiet_seconds, self.boundary_confirmation_seconds)
             state.generation += 1
+            self._schedule_active_locked(path, state)
 
     def _update_boundary_metadata(
         self,
         path: str,
+        epoch: int,
         generation: int,
         candidate: WatchCandidate,
     ) -> bool:
         with self._lock:
             state = self._active_states.get(path)
-            if state is None or state.generation != generation:
+            if (
+                state is None
+                or state.epoch != epoch
+                or state.generation != generation
+            ):
                 return False
             self._pending[path] = candidate
             self._latest_observations[path] = candidate
