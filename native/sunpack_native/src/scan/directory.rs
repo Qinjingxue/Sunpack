@@ -368,37 +368,6 @@ impl NativeOutputInventory {
             .collect()
     }
 
-    fn file_columns(&self) -> (Vec<String>, Vec<u64>) {
-        let mut paths = Vec::with_capacity(self.files.len());
-        let mut sizes = Vec::with_capacity(self.files.len());
-        for item in self.files.iter() {
-            paths.push(item.output_path.as_ref().unwrap_or(&item.path).clone());
-            sizes.push(item.size);
-        }
-        (paths, sizes)
-    }
-
-    fn file_head_columns(
-        &self,
-        py: Python<'_>,
-    ) -> (Vec<String>, Vec<u64>, Vec<Option<u64>>, Vec<Py<PyBytes>>) {
-        let mut paths = Vec::with_capacity(self.files.len());
-        let mut sizes = Vec::with_capacity(self.files.len());
-        let mut mtimes_ns = Vec::with_capacity(self.files.len());
-        let mut magics = Vec::with_capacity(self.files.len());
-        for item in self.files.iter() {
-            let path = item.abs_path.clone().unwrap_or_else(|| {
-                let relative = item.output_path.as_ref().unwrap_or(&item.path);
-                path_to_string(&Path::new(&self.root).join(relative))
-            });
-            paths.push(path);
-            sizes.push(item.size);
-            mtimes_ns.push(item.mtime_ns);
-            magics.push(PyBytes::new(py, &item.magic).unbind());
-        }
-        (paths, sizes, mtimes_ns, magics)
-    }
-
     fn parent_directories(&self) -> Vec<String> {
         let root = Path::new(&self.root);
         let mut seen = HashSet::new();
