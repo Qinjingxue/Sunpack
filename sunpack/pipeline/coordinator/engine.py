@@ -31,7 +31,7 @@ from sunpack.core.support.output_reservation import OutputReservationRegistry, b
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.core.support.output_paths import default_output_dir_for_task
 from sunpack.core.support.path_keys import path_key
-from sunpack.core.support.archive_sessions import release_archive_sessions_under
+from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
 from sunpack.core.support.resource_lifecycle import TaskResourceScope, promotion_barrier
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.pipeline.coordinator.async_work import AsyncWorkBroker, CancellationToken, CURRENT_ORIGIN
@@ -792,7 +792,7 @@ class _SourceCleanup:
         previous: dict[str, ArchiveCleanupResult] | None = None,
     ):
         from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome
-        from sunpack.core.support.archive_sessions import release_archive_sessions_under
+        from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
         from sunpack.core.support.resource_lifecycle import (
             ResourceBusyError,
             ResourceLifecycleError,
@@ -817,7 +817,7 @@ class _SourceCleanup:
                     else:
                         with promotion_barrier(
                             existing,
-                            cache_releasers=(release_archive_sessions_under,),
+                            cache_releasers=(release_archive_sessions_under_roots,),
                             quiesce=False,
                         ):
                             results.extend(actions.apply(
@@ -1450,7 +1450,7 @@ class _RequestRuntime:
         def flatten():
             with promotion_barrier(
                 [output_dir],
-                cache_releasers=(release_archive_sessions_under,),
+                cache_releasers=(release_archive_sessions_under_roots,),
                 quiesce=False,
             ):
                 _postprocess_actions_factory(

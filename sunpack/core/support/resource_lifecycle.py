@@ -1018,7 +1018,7 @@ def _wait_for_native_resources(
 def promotion_barrier(
     roots: Iterable[os.PathLike[str] | str | FileIdentity],
     *,
-    cache_releasers: Iterable[Callable[[str], Any]] = (),
+    cache_releasers: Iterable[Callable[[tuple[str, ...]], Any]] = (),
     timeout: float = 30.0,
     strict_open_file_audit: bool = False,
     quiesce: bool = True,
@@ -1109,9 +1109,9 @@ def promotion_barrier(
 
         native_promotion_token = _begin_native_promotion(root_identities)
 
-        for root in root_identities:
-            for releaser in cache_releasers:
-                report.cache_reports.append(releaser(root.path))
+        release_roots = tuple(root.path for root in root_identities)
+        for releaser in cache_releasers:
+            report.cache_reports.append(releaser(release_roots))
 
         with _LOCK:
             busy = _matching_active_records(root_identities)

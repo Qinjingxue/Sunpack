@@ -84,6 +84,29 @@ def test_promotion_gate_excludes_new_overlapping_file_opens(tmp_path):
     assert completed.is_set()
 
 
+def test_promotion_batches_cache_releasers_across_roots(tmp_path):
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    calls: list[tuple[str, ...]] = []
+
+    def release(roots: tuple[str, ...]) -> dict:
+        calls.append(roots)
+        return {"roots": roots}
+
+    with promotion_barrier(
+        (first, second),
+        cache_releasers=(release,),
+        strict_open_file_audit=False,
+    ) as report:
+        pass
+
+    assert len(calls) == 1
+    assert set(calls[0]) == {os.fspath(first), os.fspath(second)}
+    assert report.cache_reports == [{"roots": calls[0]}]
+
+
 def test_named_temporary_file_in_ancestor_sibling_does_not_conflict_with_child_promotion(tmp_path):
     promoted = tmp_path / "out" / "archive"
     promoted.mkdir(parents=True)
@@ -165,7 +188,7 @@ def test_promotion_drains_archive_session_borrow_before_publishing_gate(tmp_path
     monkeypatch.setattr(archive_sessions, "NativeArchiveSession", FakeArchiveSession)
     monkeypatch.setattr(
         archive_sessions.sunpack_native,
-        "release_reader_resources_under",
+        "release_reader_resources_under_roots",
         lambda _root: {},
     )
     monkeypatch.setattr(

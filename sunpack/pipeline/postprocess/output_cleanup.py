@@ -177,11 +177,11 @@ class OutputCleanupManager:
                 )
 
         try:
-            from sunpack.core.support.archive_sessions import release_archive_sessions_under
+            from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
 
             with promotion_barrier(
                 (path,),
-                cache_releasers=(release_archive_sessions_under,),
+                cache_releasers=(release_archive_sessions_under_roots,),
             ):
                 if is_directory:
                     self.executor.remove_tree(path)

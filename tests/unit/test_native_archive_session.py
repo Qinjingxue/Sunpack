@@ -8,7 +8,7 @@ import pytest
 from sunpack.core.support.archive_sessions import (
     clear_archive_sessions,
     get_archive_session,
-    release_archive_sessions_under,
+    release_archive_sessions_under_roots,
 )
 from sunpack.core.analysis.view import MultiVolumeBinaryView, SharedBinaryView
 from sunpack.core.support.resource_lifecycle import TaskResourceScope, promotion_barrier
@@ -19,7 +19,7 @@ from sunpack_native import (
     native_resource_snapshot,
     native_wait_for_resources,
     reader_cache_stats,
-    release_reader_resources_under,
+    release_reader_resources_under_roots,
 )
 
 
@@ -110,9 +110,40 @@ def test_release_boundary_allows_windows_pipeline_directory_promotion(tmp_path):
     path.write_bytes(b"payload")
     assert bytes(get_archive_session(os.fspath(path)).read_at(0, 7)) == b"payload"
 
-    release_archive_sessions_under(os.fspath(source))
+    release_archive_sessions_under_roots((os.fspath(source),))
     os.replace(source, target)
     assert (target / "payload.bin").read_bytes() == b"payload"
+
+
+def test_batched_release_merges_overlapping_roots_and_preserves_unrelated_sessions(tmp_path):
+    first_root = tmp_path / "first"
+    nested_root = first_root / "nested"
+    other_root = tmp_path / "other"
+    nested_root.mkdir(parents=True)
+    other_root.mkdir()
+    first = first_root / "first.bin"
+    nested = nested_root / "nested.bin"
+    other = other_root / "other.bin"
+    first.write_bytes(b"first")
+    nested.write_bytes(b"nested")
+    other.write_bytes(b"other")
+
+    first_session = get_archive_session(os.fspath(first))
+    nested_session = get_archive_session(os.fspath(nested))
+    other_session = get_archive_session(os.fspath(other))
+    assert bytes(first_session.read_at(0, 5)) == b"first"
+    assert bytes(nested_session.read_at(0, 6)) == b"nested"
+    assert bytes(other_session.read_at(0, 5)) == b"other"
+
+    report = release_archive_sessions_under_roots(
+        (os.fspath(first_root), os.fspath(nested_root))
+    )
+
+    assert report["sessions"] == 2
+    assert first_session.closed
+    assert nested_session.closed
+    assert not other_session.closed
+    assert bytes(other_session.read_at(0, 5)) == b"other"
 
 
 def test_release_boundary_closes_retained_session_and_analysis_view(tmp_path):
@@ -125,7 +156,7 @@ def test_release_boundary_closes_retained_session_and_analysis_view(tmp_path):
     view = SharedBinaryView(os.fspath(path))
     assert view.read_at(0, 7) == b"payload"
 
-    with promotion_barrier((source,), cache_releasers=(release_archive_sessions_under,)):
+    with promotion_barrier((source,), cache_releasers=(release_archive_sessions_under_roots,)):
         assert session.closed
         assert view.closed
         os.replace(source, target)
@@ -148,7 +179,7 @@ def test_multi_volume_view_registers_and_releases_every_member(tmp_path):
     view = MultiVolumeBinaryView((first, second))
     assert view.read_at(1, 4) == b"bcde"
 
-    with promotion_barrier((source,), cache_releasers=(release_archive_sessions_under,)):
+    with promotion_barrier((source,), cache_releasers=(release_archive_sessions_under_roots,)):
         assert view.closed
         os.replace(source, target)
 
@@ -171,7 +202,7 @@ def test_shared_session_cache_waits_for_all_task_borrowers(tmp_path):
     released = threading.Event()
 
     def release() -> None:
-        release_archive_sessions_under(os.fspath(tmp_path))
+        release_archive_sessions_under_roots((os.fspath(tmp_path),))
         released.set()
 
     worker = threading.Thread(target=release)
@@ -195,7 +226,7 @@ def test_native_registry_reports_reader_until_object_and_pool_are_released(tmp_p
     assert any(item["kind"] == "reader_file" for item in snapshot)
 
     session.close()
-    release_archive_sessions_under(os.fspath(tmp_path))
+    release_archive_sessions_under_roots((os.fspath(tmp_path),))
 
     assert list(native_resource_snapshot([os.fspath(tmp_path)])) == []
 
@@ -219,7 +250,7 @@ def test_native_registry_wait_is_notified_when_reader_is_released(tmp_path):
     assert not completed.wait(0.05)
 
     session.close()
-    release_reader_resources_under(os.fspath(tmp_path))
+    release_reader_resources_under_roots([os.fspath(tmp_path)])
     worker.join(1.0)
 
     assert completed.is_set()
@@ -234,7 +265,7 @@ def test_reader_pool_release_closes_file_behind_retained_native_view(tmp_path):
     assert bytes(view.read_at(0, 7)) == b"payload"
 
     session.close()
-    report = dict(release_reader_resources_under(os.fspath(tmp_path)))
+    report = dict(release_reader_resources_under_roots([os.fspath(tmp_path)]))
 
     assert report["handles"] == 1
     assert list(native_resource_snapshot([os.fspath(tmp_path)])) == []
