@@ -1,7 +1,6 @@
 import os
 from copy import deepcopy
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Any, Iterable
 
 from sunpack.core.contracts.filesystem import DirectorySnapshot
