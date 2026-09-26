@@ -667,7 +667,9 @@ public:
         : notifier_(ToastNotificationManager::CreateToastNotifier(kAppId)),
           diagnostic_log_path_(std::move(diagnostic_log_path)) {}
 
-    ~ToastPresenter() = default;
+    ~ToastPresenter() {
+        clear();
+    }
 
     void show(const Snapshot& snapshot, std::uint64_t sequence) {
         if (snapshot.kind == SnapshotKind::progress) {
