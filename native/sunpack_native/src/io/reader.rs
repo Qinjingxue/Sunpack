@@ -1917,7 +1917,9 @@ mod tests {
 
     #[test]
     fn request_cache_reuses_shared_backing_without_payload_copy() {
-        let path = temp_file("managed_reader_shared_request", b"abcdefgh");
+        let mut source = vec![0u8; BLOCK_SIZE + 1];
+        source[..8].copy_from_slice(b"abcdefgh");
+        let path = temp_file("managed_reader_shared_request", &source);
         let reader = ManagedReader::open_with_config(
             &path,
             ReaderConfig {
@@ -1949,7 +1951,9 @@ mod tests {
 
     #[test]
     fn request_cache_capacity_accounts_for_retained_shared_block() {
-        let path = temp_file("managed_reader_shared_capacity", b"abcdefgh");
+        let mut source = vec![0u8; BLOCK_SIZE + 1];
+        source[..8].copy_from_slice(b"abcdefgh");
+        let path = temp_file("managed_reader_shared_capacity", &source);
         let reader = ManagedReader::open_with_config(
             &path,
             ReaderConfig {
@@ -1966,6 +1970,32 @@ mod tests {
         assert_eq!(stats.read_bytes, 8);
         assert_eq!(stats.cache_hits, 0);
         assert_eq!(reader.lock_inner().unwrap().cache_size, 0);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn shared_slice_remains_valid_after_request_cache_eviction() {
+        let mut source = vec![0u8; BLOCK_SIZE * 2];
+        source[..4].copy_from_slice(b"keep");
+        source[BLOCK_SIZE..BLOCK_SIZE + 4].copy_from_slice(b"next");
+        let path = temp_file("managed_reader_shared_eviction", &source);
+        let reader = ManagedReader::open_with_config(
+            &path,
+            ReaderConfig {
+                cache_bytes: BLOCK_SIZE,
+                max_read_bytes: Some(8),
+                max_concurrent_reads: 1,
+            },
+        )
+        .unwrap();
+
+        let first = reader.read_cached_at(0, 4).unwrap();
+        assert_eq!(&*first, b"keep");
+        let second = reader.read_cached_at(BLOCK_SIZE as u64, 4).unwrap();
+        assert_eq!(&*second, b"next");
+        assert_eq!(&*first, b"keep");
+        assert!(reader.lock_inner().unwrap().cache_size <= BLOCK_SIZE);
+
         let _ = std::fs::remove_file(path);
     }
 
