@@ -53,8 +53,6 @@ def _config(*, language="en", debounce_ms=20):
         "cli": {"language": language},
         "watch": {
             "toast_completion_debounce_ms": debounce_ms,
-            "toast_success_ttl_seconds": 10,
-            "toast_failure_ttl_seconds": 60,
             "toast_report_retention_days": 30,
             "toast_report_max_files": 32,
             "toast_report_max_bytes": 1024 * 1024,
@@ -134,9 +132,31 @@ def test_concurrent_requests_emit_one_unified_success_after_debounce(tmp_path):
     terminal = _terminal_snapshots(host)
     assert len(terminal) == 1
     assert terminal[0].kind == ToastSnapshotKind.SUCCESS
-    assert terminal[0].ttl_ms == 10_000
     assert terminal[0].actions[0].kind == ToastActionKind.OPEN_DIRECTORY
     assert terminal[0].actions[0].target == str(output_root)
+    coordinator.stop()
+
+
+
+def test_batch_id_is_stable_through_final_and_unique_per_batch(tmp_path):
+    host = _Host()
+    coordinator = WatchToastCoordinator(host, _config(debounce_ms=0), str(tmp_path / "state"))
+
+    first = _task(tmp_path / "first.zip")
+    coordinator.submitted("first", str(first.main_path))
+    _ready(coordinator, "first", first)
+    first_batch = host.snapshots[-1].batch_id
+    assert first_batch
+    coordinator.succeeded("first", [])
+    first_terminal = host.wait_for_terminal_snapshots()
+    assert first_terminal[-1].batch_id == first_batch
+
+    second = _task(tmp_path / "second.zip")
+    coordinator.submitted("second", str(second.main_path))
+    _ready(coordinator, "second", second)
+    second_batch = host.snapshots[-1].batch_id
+    assert second_batch
+    assert second_batch != first_batch
     coordinator.stop()
 
 
