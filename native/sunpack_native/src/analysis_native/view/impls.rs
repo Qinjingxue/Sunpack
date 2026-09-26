@@ -1508,7 +1508,7 @@ fn zip_archive_start_kind(
     // Keep this check on the same ManagedReader as the structural probe.  It
     // therefore shares the existing read budget, concurrency gate, and both
     // request/global caches instead of reopening the source from Python.
-    let head = reader.read_at(0, 8).map_err(reader_error_to_py)?;
+    let head = reader.read_cached_at(0, 8).map_err(reader_error_to_py)?;
     if head.starts_with(ZIP_LOCAL) {
         Ok("local_header")
     } else if empty && head.starts_with(ZIP_EOCD) {
