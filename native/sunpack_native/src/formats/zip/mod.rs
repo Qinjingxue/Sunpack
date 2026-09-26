@@ -1,3 +1,6 @@
+mod filename_encoding;
+pub(crate) use filename_encoding::analyze_zip_filename_encoding;
+
 include!("constants.rs");
 include!("directory/mod.rs");
 include!("directory/parse.rs");
