@@ -1056,6 +1056,8 @@ class _RequestRuntime:
 
             ownership.remember_tasks([task])
             watch_version = self._watch_generation_for_task(task, depth=depth)
+            if watch_version:
+                task.runtime["source_generation"] = watch_version
             if watch_version and self._watch_task_can_reuse_completed(task):
                 completed_output = self.path_leases.completed_watch_output(watch_version)
                 if completed_output:
