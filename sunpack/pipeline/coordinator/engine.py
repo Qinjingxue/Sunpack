@@ -523,20 +523,23 @@ class _PipelineServices:
         )
 
 
-class _CleanupRefScope:
-    def __init__(self, context: RunState, config: dict, factory: Callable[..., Any]):
+class _SourceCleanup:
+    """Shared-source refcount plus asynchronous source deletion."""
+
+    def __init__(
+        self,
+        context: RunState,
+        config: dict,
+        factory: Callable[..., Any],
+        request_id: str,
+    ):
         from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
 
         self._context = context
         self._config = config
         self._factory = factory
-        self.request_id = ""
-        self._table = CleanupRefTable()
-
-    def bind(self, request_id: str) -> "_CleanupRefScope":
         self.request_id = str(request_id or "")
-        self._context.cleanup_refs[self.request_id] = self._table
-        return self
+        self._table = CleanupRefTable()
 
     def register(self, tasks) -> None:
         self._table.register_all(tasks)
@@ -552,13 +555,65 @@ class _CleanupRefScope:
         return self._table.sweep()
 
     async def apply(self, request, *, broker, cancellation=None):
-        from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome
+        from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome, ReleaseRequest
 
         if not (request.paths and request.should_clean):
             return ReleaseOutcome(task_key=request.task_key, released=request.paths)
-        return await self._apply(request, broker=broker, cancellation=cancellation)
 
-    async def _apply(self, request, *, broker, cancellation=None) -> "ReleaseOutcome":
+        pending = tuple(request.paths)
+        previous: dict[str, ArchiveCleanupResult] = {}
+        deleted: list[str] = []
+        final_failed: tuple[ArchiveCleanupResult, ...] = ()
+        final_error = ""
+
+        for attempt, delay in enumerate((0.0, 0.1, 0.3), start=1):
+            if delay:
+                await asyncio.sleep(delay)
+            current = ReleaseRequest(
+                task_key=request.task_key,
+                paths=pending,
+                should_clean=True,
+            )
+            outcome = await self._apply_once(
+                current,
+                broker=broker,
+                cancellation=cancellation,
+                previous=previous,
+            )
+            deleted.extend(path for path in outcome.deleted if path not in deleted)
+            final_error = outcome.error
+            final_failed = outcome.failed
+            retryable = tuple(
+                item for item in outcome.failed
+                if item.retryable and item.attempts < 3
+            )
+            if not retryable:
+                break
+            previous = {path_key(item.path): item for item in retryable}
+            pending = tuple(item.path for item in retryable)
+
+        if final_failed:
+            with self._context.lock:
+                by_path = {path_key(item.path): item for item in self._context.cleanup_results}
+                by_path.update({path_key(item.path): item for item in final_failed})
+                self._context.cleanup_results[:] = list(by_path.values())
+
+        return ReleaseOutcome(
+            task_key=request.task_key,
+            released=request.paths,
+            deleted=tuple(deleted),
+            failed=final_failed,
+            error=final_error,
+        )
+
+    async def _apply_once(
+        self,
+        request,
+        *,
+        broker,
+        cancellation=None,
+        previous: dict[str, ArchiveCleanupResult] | None = None,
+    ):
         from sunpack.pipeline.coordinator.cleanup_refs import ReleaseOutcome
         from sunpack.core.support.archive_sessions import release_archive_sessions_under
         from sunpack.core.support.resource_lifecycle import (
@@ -566,6 +621,8 @@ class _CleanupRefScope:
             ResourceLifecycleError,
             promotion_barrier,
         )
+
+        previous = previous or {}
 
         def run_cleanup():
             existing = [path for path in request.paths if os.path.exists(path)]
@@ -575,27 +632,22 @@ class _CleanupRefScope:
                 try:
                     actions = self._factory(self._config, stdout=None)
                     if self._mode() == "keep":
-                        # Keeping sources is not a filesystem mutation.  Do not
-                        # establish a source promotion barrier merely to produce
-                        # the corresponding "kept" cleanup results.
-                        results.extend(
-                            actions.apply(
-                                archives_to_clean=[[path] for path in existing],
-                                flatten_targets=[],
-                            )
-                        )
+                        results.extend(actions.apply(
+                            archives_to_clean=[[path] for path in existing],
+                            flatten_targets=[],
+                            previous_cleanup=previous,
+                        ))
                     else:
                         with promotion_barrier(
                             existing,
                             cache_releasers=(release_archive_sessions_under,),
                             quiesce=False,
                         ):
-                            results.extend(
-                                actions.apply(
-                                    archives_to_clean=[[path] for path in existing],
-                                    flatten_targets=[],
-                                )
-                            )
+                            results.extend(actions.apply(
+                                archives_to_clean=[[path] for path in existing],
+                                flatten_targets=[],
+                                previous_cleanup=previous,
+                            ))
                 except (ResourceBusyError, ResourceLifecycleError) as exc:
                     error = str(exc)
                     code = int(getattr(exc, "winerror", 0) or 0)
@@ -604,21 +656,29 @@ class _CleanupRefScope:
                             path,
                             self._mode(),
                             "failed",
-                            1,
+                            previous.get(path_key(path)).attempts + 1
+                            if path_key(path) in previous
+                            else 1,
                             code or 32,
                             f"cleanup barrier unavailable: {exc}",
                         )
                         for path in existing
                     )
-            # A path that was already gone is reported as missing, so the summary still accounts for every source.
-            seen = {item.path for item in results}
+            seen = {path_key(item.path) for item in results}
             results.extend(
-                ArchiveCleanupResult(path, self._mode(), "missing")
+                ArchiveCleanupResult(
+                    path,
+                    self._mode(),
+                    "missing",
+                    previous.get(path_key(path)).attempts + 1
+                    if path_key(path) in previous
+                    else 1,
+                )
                 for path in request.paths
-                if path not in seen
+                if path_key(path) not in seen
             )
-            ordered = {item.path: item for item in results}
-            final = [ordered[path] for path in request.paths if path in ordered]
+            by_path = {path_key(item.path): item for item in results}
+            final = [by_path[path_key(path)] for path in request.paths if path_key(path) in by_path]
             deleted = tuple(item.path for item in final if item.status in {"recycled", "deleted"})
             return ReleaseOutcome(
                 task_key=request.task_key,
@@ -639,19 +699,15 @@ class _CleanupRefScope:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            # A closed or unavailable broker must not fail the extraction; the sources stay in place.
             return ReleaseOutcome(task_key=request.task_key, released=request.paths, error=str(exc))
         if outcome.deleted:
-            # The deleted sources are gone, so refresh their folders.
             notify_shell_directories_updated(
-                tuple(dict.fromkeys(os.path.dirname(path) for path in outcome.deleted if os.path.dirname(path)))
+                tuple(dict.fromkeys(
+                    os.path.dirname(path)
+                    for path in outcome.deleted
+                    if os.path.dirname(path)
+                ))
             )
-        if outcome.failed:
-            with self._context.lock:
-                known = {path_key(item.path) for item in self._context.cleanup_results}
-                self._context.cleanup_results.extend(
-                    item for item in outcome.failed if path_key(item.path) not in known
-                )
         return outcome
 
     def _mode(self) -> str:
@@ -685,11 +741,12 @@ class _RequestRuntime:
             stdout=submission.stdout,
             stderr=submission.stderr,
         )
-        self.cleanup_scope = _CleanupRefScope(
+        self.source_cleanup = _SourceCleanup(
             self.context,
             self.config,
             _postprocess_actions_factory,
-        ).bind(submission.request_id)
+            submission.request_id,
+        )
         self.task_scanner = ArchiveTaskScanner(
             self.config,
             self.context,
@@ -830,7 +887,7 @@ class _RequestRuntime:
                 summary=replace(response.summary, postprocess_completed=True),
             )
         finally:
-            for request in self.cleanup_scope.sweep_requests():
+            for request in self.source_cleanup.sweep_requests():
                 self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
             await self._drain_cleanup_tasks()
             self.extractor.set_progress_callback(None)
@@ -924,7 +981,7 @@ class _RequestRuntime:
 
         # This registration is deliberately only a source-cleanup lifetime
         # guard. It never gates planning, extraction, verification or recursion.
-        self.cleanup_scope.register(tasks)
+        self.source_cleanup.register(tasks)
         self.reporter.tasks_discovered(depth, tasks, direct=direct)
 
         if self.submission.origin == "watch" and tasks:
@@ -1011,7 +1068,7 @@ class _RequestRuntime:
                             verification={"reused_completed_generation": True},
                         ))
                         self.context.processed_keys.add(task.key)
-                    cleanup_request = self.cleanup_scope.release_task(
+                    cleanup_request = self.source_cleanup.release_task(
                         task,
                         outcome_kind=OutcomeKind.FAILURE,
                     )
@@ -1039,7 +1096,7 @@ class _RequestRuntime:
                 ensure_input_lease=self._ensure_task_lease,
             )
 
-            cleanup_request = self.cleanup_scope.release_task(
+            cleanup_request = self.source_cleanup.release_task(
                 task,
                 outcome_kind=outcome.outcome_kind,
             )
@@ -1097,7 +1154,7 @@ class _RequestRuntime:
                 )
         finally:
             if not released_source_ref:
-                cleanup_request = self.cleanup_scope.release_task(
+                cleanup_request = self.source_cleanup.release_task(
                     task,
                     outcome_kind=OutcomeKind.FAILURE,
                 )
@@ -1164,7 +1221,7 @@ class _RequestRuntime:
             return
 
         async def run_cleanup():
-            await self.cleanup_scope.apply(
+            await self.source_cleanup.apply(
                 request,
                 broker=broker,
                 cancellation=cancellation,
@@ -1181,7 +1238,7 @@ class _RequestRuntime:
                 pass
             except Exception:
                 # Source cleanup is best-effort and never invalidates a verified
-                # extraction. _CleanupRefScope records actionable failures.
+                # extraction. _SourceCleanup records actionable failures.
                 pass
 
         task.add_done_callback(completed)
