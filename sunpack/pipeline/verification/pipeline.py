@@ -43,8 +43,8 @@ class VerificationPipeline:
     def __init__(self, config: dict):
         self.config = dict(config or {})
         self.methods = list(self.config.get("methods") or [])
-        self.complete_accept_threshold = _clamp01(float(self.config.get("complete_accept_threshold", 0.999) or 0.999))
-        self.partial_accept_threshold = _clamp01(float(self.config.get("partial_accept_threshold", 0.2) or 0.2))
+        self.complete_accept_threshold = _clamp01(float(self.config.get("complete_accept_threshold", 0.999)))
+        self.partial_accept_threshold = _clamp01(float(self.config.get("partial_accept_threshold", 0.2)))
 
     def run(
         self,
