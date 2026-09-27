@@ -149,6 +149,7 @@ async def handle(args, ctx):
                 request_config=run_config,
                 stdout=ctx.stderr if args.json else ctx.stdout,
                 stderr=ctx.stderr,
+                input_reader=ctx.readline,
                 origin="foreground",
                 detection_options=EmbeddedOptions(force_scan=deep_detect),
             )
