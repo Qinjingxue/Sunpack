@@ -365,6 +365,66 @@ def test_extraction_plan_preserves_zipcrypto_candidate_evidence(tmp_path):
     assert scheduler.cache.has_negative(build_archive_fingerprint(str(archive)).key, "rejected") is True
 
 
+def test_extraction_plan_preserves_untested_suffix_after_weak_early_match(tmp_path):
+    archive = tmp_path / "encrypted.rar"
+    archive.write_bytes(b"archive")
+    fast = StaticVerifier(PasswordBatchVerification(
+        ok=True,
+        status="match",
+        matched_index=0,
+        attempts=1,
+        final_confirmation_required=True,
+        match_evidence="rar4_hp_header_crc16",
+    ))
+    scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
+    job = PasswordJob(
+        archive_path=str(archive),
+        archive_input={"format_hint": "rar"},
+        candidates=PasswordCandidatePipeline.from_values(["collision", "secret"]),
+    )
+
+    result = scheduler.plan_for_extraction(job)
+    fingerprint = build_archive_fingerprint(
+        str(archive), archive_input=job.archive_input,
+    ).key
+
+    assert result.password is None
+    assert result.extraction_candidates == ("collision", "secret")
+    assert scheduler.cache.has_negative(fingerprint, "collision") is False
+    assert scheduler.cache.has_negative(fingerprint, "secret") is False
+
+
+def test_extraction_plan_caches_only_tested_prefix_before_weak_match(tmp_path):
+    archive = tmp_path / "encrypted.rar"
+    archive.write_bytes(b"archive")
+    fast = StaticVerifier(PasswordBatchVerification(
+        ok=True,
+        status="match",
+        matched_index=1,
+        attempts=2,
+        final_confirmation_required=True,
+        match_evidence="rar4_hp_header_crc16",
+    ))
+    scheduler = PasswordScheduler(PasswordVerifierChain([fast]))
+    job = PasswordJob(
+        archive_path=str(archive),
+        archive_input={"format_hint": "rar"},
+        candidates=PasswordCandidatePipeline.from_values(
+            ["proven-bad", "collision", "secret"]
+        ),
+    )
+
+    result = scheduler.plan_for_extraction(job)
+    fingerprint = build_archive_fingerprint(
+        str(archive), archive_input=job.archive_input,
+    ).key
+
+    assert result.extraction_candidates == ("collision", "secret")
+    assert scheduler.cache.has_negative(fingerprint, "proven-bad") is True
+    assert scheduler.cache.has_negative(fingerprint, "collision") is False
+    assert scheduler.cache.has_negative(fingerprint, "secret") is False
+
+
 def test_verifier_chain_does_not_infer_format_from_extension():
     zip_fast = FormatVerifier("zip", PasswordBatchVerification(ok=False, status="unsupported_method"))
     rar_fast = FormatVerifier("rar", PasswordBatchVerification(ok=False, status="unsupported_method"))
