@@ -1,3 +1,6 @@
+from collections.abc import Awaitable, Callable
+from typing import TextIO
+
 from sunpack.core.i18n import I18nContext
 
 
@@ -12,18 +15,32 @@ class RecursionController:
             return depth < int(self.max_depth or 0)
         return True
 
-    def prompt_continue(self, depth: int) -> bool:
+    async def prompt_continue(
+        self,
+        depth: int,
+        *,
+        readline: Callable[[str], Awaitable[str]] | None,
+        stdout: TextIO | None = None,
+    ) -> bool:
+        if readline is None:
+            self._write(stdout, self.i18n.t("recursion.no_input"))
+            return False
         while True:
             try:
-                ans = input(self.i18n.t("recursion.prompt", round=depth)).strip().lower()
+                ans = (await readline(self.i18n.t("recursion.prompt", round=depth))).strip().lower()
             except EOFError:
-                print(self.i18n.t("recursion.no_input"), flush=True)
+                self._write(stdout, self.i18n.t("recursion.no_input"))
                 return False
             except KeyboardInterrupt:
-                print(self.i18n.t("recursion.cancelled"), flush=True)
+                self._write(stdout, self.i18n.t("recursion.cancelled"))
                 return False
             if ans in {"y", "yes"}:
                 return True
             if ans in {"n", "no", ""}:
                 return False
-            print(self.i18n.t("recursion.enter_yes_no"), flush=True)
+            self._write(stdout, self.i18n.t("recursion.enter_yes_no"))
+
+    @staticmethod
+    def _write(stdout: TextIO | None, message: str) -> None:
+        if stdout is not None:
+            print(message, file=stdout, flush=True)
