@@ -1,7 +1,7 @@
 from typing import Any
 
 from sunpack.core.config.advanced_defaults import advanced_config_value
-from sunpack.core.config.schema import ConfigField
+from sunpack.core.config.schema import ConfigField, require_boolean
 
 
 DIRECTORY_SCAN_RECURSIVE = "recursive"
@@ -12,6 +12,10 @@ _DIRECTORY_SCAN_ALIASES = {
     "*": DIRECTORY_SCAN_RECURSIVE,
     "-": DIRECTORY_SCAN_CURRENT_DIR_ONLY,
 }
+
+
+def normalize_scan_filters_enabled(value: Any) -> bool:
+    return require_boolean(value, "filesystem.scan_filters_enabled")
 
 
 def normalize_directory_scan_mode(value: Any) -> str:
@@ -26,7 +30,7 @@ CONFIG_FIELDS = (
     ConfigField(
         path=("filesystem", "scan_filters_enabled"),
         default=advanced_config_value(("filesystem", "scan_filters_enabled")),
-        normalize=bool,
+        normalize=normalize_scan_filters_enabled,
         owner=__name__,
     ),
     ConfigField(
