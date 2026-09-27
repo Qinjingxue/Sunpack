@@ -238,6 +238,7 @@ class PasswordScheduler:
                 self._emit_finished(job, result, started_at, len(candidates), skipped)
                 return result
             matched_indices = _valid_matched_indices(verification, len(batch))
+            tested_count = max(0, min(int(verification.attempts or 0), len(batch)))
             if verification.status == "match" and matched_indices:
                 matched = batch[matched_indices[0]]
                 if not verification.final_confirmation_required:
@@ -251,16 +252,30 @@ class PasswordScheduler:
                     )
                     self._emit_finished(job, result, started_at, len(candidates), skipped)
                     return result
+                matched_set = set(matched_indices)
                 inconclusive.extend(batch[index] for index in matched_indices)
-                rejected = [password for index, password in enumerate(batch) if index not in matched_indices]
-                self.cache.remember_negative_batch(fingerprint.key, rejected)
+                self.cache.remember_negative_batch(
+                    fingerprint.key,
+                    [
+                        batch[index]
+                        for index in range(tested_count)
+                        if index not in matched_set
+                    ],
+                )
+                inconclusive.extend(
+                    batch[index]
+                    for index in range(tested_count, len(batch))
+                    if index not in matched_set
+                )
                 if not inconclusive_evidence:
                     inconclusive_evidence = verification.match_evidence
                 elif verification.match_evidence != inconclusive_evidence:
                     inconclusive_evidence = ""
                 continue
             if verification.status == "no_match":
-                self.cache.remember_negative_batch(fingerprint.key, batch)
+                self.cache.remember_negative_batch(fingerprint.key, batch[:tested_count])
+                if tested_count < len(batch):
+                    inconclusive.extend(batch[tested_count:])
                 continue
             if verification.status == "damaged":
                 result = PasswordSearchResult(
