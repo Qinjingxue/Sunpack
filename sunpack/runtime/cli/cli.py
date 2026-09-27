@@ -52,16 +52,10 @@ def configure_stdio_encoding():
 
 
 def preprocess_sys_argv(argv: list[str]) -> list[str]:
-    cleaned = []
-    for arg in argv:
-        if isinstance(arg, str) and arg.endswith('"'):
-            path = arg[:-1]
-            if path.endswith("\\"):
-                path = path[:-1]
-            cleaned.append(path)
-        else:
-            cleaned.append(arg)
-    return cleaned
+    # sys.argv and persistent requests already contain parsed argument values.
+    # Generic quote/backslash repair corrupts legitimate passwords and other
+    # non-path values, so preserve the transport payload exactly.
+    return list(argv)
 
 
 def build_cli_parser(ctx: CliContext | None = None, command: str | None = None) -> argparse.ArgumentParser:
