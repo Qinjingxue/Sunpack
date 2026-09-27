@@ -61,6 +61,37 @@ def test_load_config_merges_simple_config_over_advanced_config(tmp_path, monkeyp
     assert config["performance"]["worker"]["minimum_available_memory_ratio"] == 0.2
 
 
+@pytest.mark.parametrize(
+    ("override", "field"),
+    [
+        ({"detection": {"enabled": "false"}}, "detection.enabled"),
+        ({"filesystem": {"scan_filters_enabled": "false"}}, "filesystem.scan_filters_enabled"),
+        ({"post_extract": {"flatten_single_directory": "false"}}, "post_extract.flatten_single_directory"),
+        ({"extraction": {"write_progress_manifest": "false"}}, "extraction.write_progress_manifest"),
+        ({"passwords": {"clipboard_passwords_enabled": "false"}}, "passwords.clipboard_passwords_enabled"),
+        ({"watch": {"toast_enabled": "false"}}, "watch.toast_enabled"),
+        ({"verification": {"enabled": "false"}}, "verification.enabled"),
+        (
+            {"verification": {"methods": [{"name": "output_presence", "enabled": "false"}]}},
+            "verification.methods[0].enabled",
+        ),
+        (
+            {"filesystem": {"scan_filters": [{"name": "size_range", "enabled": "false"}]}},
+            "filesystem.scan_filters[0].enabled",
+        ),
+    ],
+)
+def test_load_config_rejects_string_booleans(tmp_path, monkeypatch, override, field):
+    simple = tmp_path / "sunpack_config.json"
+    advanced = tmp_path / "sunpack_advanced_config.json"
+    _write_json(advanced, _advanced_payload())
+    _write_json(simple, override)
+    monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
+
+    with pytest.raises(loader.ConfigError, match=field.replace("[", r"\[").replace("]", r"\]")):
+        loader.load_config()
+
+
 def test_load_config_rejects_invalid_runtime_process_mode(tmp_path, monkeypatch):
     simple = tmp_path / "sunpack_config.json"
     advanced = tmp_path / "sunpack_advanced_config.json"
