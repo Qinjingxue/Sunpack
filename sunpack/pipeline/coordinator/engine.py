@@ -8,7 +8,7 @@ import time
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any, Callable, Iterable, TextIO
+from typing import Any, Awaitable, Callable, Iterable, TextIO
 
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.core.config.detection_view import discovery_run_config
@@ -50,6 +50,7 @@ class _Submission:
     detection_options: EmbeddedOptions = EmbeddedOptions()
     stdout: TextIO | None = None
     stderr: TextIO | None = None
+    input_reader: Callable[[str], Awaitable[str]] | None = None
     progress_callback: Callable[[Any, dict[str, Any]], None] | None = None
 
 
@@ -121,6 +122,7 @@ class PipelineEngine:
         request_config: dict | None = None,
         stdout: TextIO | None = None,
         stderr: TextIO | None = None,
+        input_reader: Callable[[str], Awaitable[str]] | None = None,
         progress_callback: Callable[[Any, dict[str, Any]], None] | None = None,
         origin: str = "foreground",
         detection_options: EmbeddedOptions | None = None,
@@ -150,6 +152,7 @@ class PipelineEngine:
             detection_options=detection_options,
             stdout=stdout,
             stderr=stderr,
+            input_reader=input_reader,
             progress_callback=progress_callback,
         )
         cancellation = CancellationToken()
@@ -1401,11 +1404,7 @@ class _RequestRuntime:
                     request_id=self.submission.request_id,
                     cancellation=cancellation,
                 )
-                if scan_work.roots and await self._allow_recursive_depth(
-                    depth + 1,
-                    broker=broker,
-                    cancellation=cancellation,
-                ):
+                if scan_work.roots and await self._allow_recursive_depth(depth + 1):
                     children_complete = await self._discover_and_run(
                         list(scan_work.roots),
                         scan_session=scan_work.session,
@@ -1466,19 +1465,16 @@ class _RequestRuntime:
             logical_roots=logical_roots,
         )
 
-    async def _allow_recursive_depth(self, depth: int, *, broker, cancellation) -> bool:
+    async def _allow_recursive_depth(self, depth: int) -> bool:
         if self.recursion.mode != "prompt":
             return True
         gate = self._prompt_gates.get(depth)
         if gate is None:
             gate = asyncio.create_task(
-                broker.run(
-                    "prompt",
-                    self.submission.request_id,
-                    self.recursion.prompt_continue,
+                self.recursion.prompt_continue(
                     depth - 1,
-                    request_id=self.submission.request_id,
-                    cancellation=cancellation,
+                    readline=self.submission.input_reader,
+                    stdout=self.submission.stdout,
                 )
             )
             self._prompt_gates[depth] = gate

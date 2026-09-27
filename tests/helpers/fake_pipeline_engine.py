@@ -55,6 +55,7 @@ class FakePipelineEngine:
         request_config=None,
         stdout=None,
         stderr=None,
+        input_reader=None,
         progress_callback=None,
         origin="foreground",
         detection_options=None,

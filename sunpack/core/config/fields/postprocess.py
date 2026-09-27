@@ -1,7 +1,7 @@
 from typing import Any
 
 from sunpack.core.config.advanced_defaults import advanced_config_value
-from sunpack.core.config.schema import ConfigField
+from sunpack.core.config.schema import ConfigField, require_boolean
 
 
 _ARCHIVE_CLEANUP_ALIASES = {
@@ -9,6 +9,10 @@ _ARCHIVE_CLEANUP_ALIASES = {
     "r": "recycle",
     "k": "keep",
 }
+
+
+def normalize_flatten_single_directory(value: Any) -> bool:
+    return require_boolean(value, "post_extract.flatten_single_directory")
 
 
 def normalize_archive_cleanup_mode(value: Any) -> str:
@@ -29,7 +33,7 @@ CONFIG_FIELDS = (
     ConfigField(
         path=("post_extract", "flatten_single_directory"),
         default=advanced_config_value(("post_extract", "flatten_single_directory")),
-        normalize=bool,
+        normalize=normalize_flatten_single_directory,
         owner=__name__,
     ),
 )

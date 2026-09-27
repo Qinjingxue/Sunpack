@@ -51,9 +51,7 @@ def scan_filters_config(config: dict[str, Any]) -> list[dict[str, Any]]:
 
 def scan_filters_enabled(config: dict[str, Any]) -> bool:
     value = filesystem_config(config).get("scan_filters_enabled")
-    if value is None:
-        return True
-    return bool(value)
+    return normalize_config_value(SCAN_FILTERS_ENABLED_PATH, value)
 
 
 def scan_filter_config(config: dict[str, Any], name: str) -> dict[str, Any]:
