@@ -79,19 +79,28 @@ pub(crate) fn ranges_key(format: &'static str, ranges: &[RangeSpec]) -> std::io:
     ))
 }
 
-pub(crate) fn read_prefix_from_ranges_field(
-    ranges: &[RangeSpec],
+/// Read up to `max_len` bytes at a logical offset; the result is shorter only
+/// at the end of the logical input.
+pub(crate) fn read_ranges_at_field(
+    ranges: &Arc<[RangeSpec]>,
+    offset: u64,
     max_len: usize,
     field: &'static str,
 ) -> Result<Vec<u8>, ReadFault> {
     let total_len = ranges_total_len(ranges);
-    let mut reader = VirtualRangeReader::new(Arc::from(ranges));
-    let requested = max_len.min(total_len as usize);
+    let requested = max_len.min(total_len.saturating_sub(offset) as usize);
     let mut data = vec![0u8; requested];
-    let len = reader.read(&mut data).map_err(|error| {
-        ReadFault::from_io(error, "read_ranges", 0, requested, 0, total_len)
-            .with_field(field, FieldLocation::Head)
-    })?;
+    if requested == 0 {
+        return Ok(data);
+    }
+    let mut reader = VirtualRangeReader::new(ranges.clone());
+    let len = reader
+        .seek(SeekFrom::Start(offset))
+        .and_then(|_| reader.read(&mut data))
+        .map_err(|error| {
+            ReadFault::from_io(error, "read_ranges", offset, requested, 0, total_len)
+                .with_field(field, FieldLocation::Head)
+        })?;
     data.truncate(len);
     Ok(data)
 }
@@ -397,19 +406,25 @@ impl VolumeSet {
         )
     }
 
-    pub(crate) fn first_prefix_field(
+    /// Read up to `size` bytes at `offset` inside the first volume only; the
+    /// result is shorter only at the end of that volume.
+    pub(crate) fn first_volume_read_at_field(
         &self,
+        offset: u64,
         size: usize,
         field: &'static str,
     ) -> Result<Vec<u8>, ReadFault> {
         let Some(volume_len) = self.volume_len(0) else {
-            return Err(ReadFault::short_read("read_volume", 0, size, 0, 0)
+            return Err(ReadFault::short_read("read_volume", offset, size, 0, 0)
                 .with_field(field, FieldLocation::Head)
                 .with_volume(1));
         };
-        let requested = size.min(volume_len as usize);
-        self.read_disk_spanning(0, 0, requested).map_err(|error| {
-            ReadFault::from_io(error, "read_volume", 0, requested, 0, volume_len)
+        let requested = size.min(volume_len.saturating_sub(offset) as usize);
+        if requested == 0 {
+            return Ok(Vec::new());
+        }
+        self.read_disk_spanning(0, offset, requested).map_err(|error| {
+            ReadFault::from_io(error, "read_volume", offset, requested, 0, volume_len)
                 .with_field(field, FieldLocation::Head)
                 .with_volume(1)
         })

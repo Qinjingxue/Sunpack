@@ -528,7 +528,7 @@ fn zip_tail_requirement<R: Read + Seek>(file: &mut R, total_len: u64) -> Result<
 fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
     file: &mut R,
     total_len: u64,
-) -> Result<Option<ZipLocalHeader>, ReadFault> {
+) -> Result<Option<ZipLocalHeader>, PreparedStatus> {
     let tail_len = MAX_EOCD_SCAN.min(total_len as usize);
     let tail_start = total_len.saturating_sub(tail_len as u64);
     let mut tail = vec![0u8; tail_len];
@@ -567,7 +567,8 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
             tail.len().saturating_sub(eocd),
             total_len,
         )
-        .with_field("zip.eocd", FieldLocation::Tail));
+        .with_field("zip.eocd", FieldLocation::Tail)
+        .into());
     }
     let total_entries = le_u16(&tail, eocd + 10).unwrap() as usize;
     let central_size = le_u32(&tail, eocd + 12).unwrap() as u64;
@@ -577,14 +578,12 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
         || central_offset == u32::MAX as u64
         || central_size > MAX_CENTRAL_SCAN
     {
-        return Err(ReadFault::invalid_field(
-            "validate_field",
-            tail_start + eocd as u64 + 10,
-            12,
-            total_len,
+        // A valid ZIP64 or very large directory is outside this bounded
+        // probe, not evidence of a missing volume or damaged tail.
+        return Err(PreparedStatus::new(
+            "unknown_needs_final_verifier",
             "ZIP central-directory location requires ZIP64 or exceeds the bounded probe",
-        )
-        .with_field("zip.eocd.central_directory_location", FieldLocation::Tail));
+        ));
     }
     let mut cursor = central_offset;
     for _ in 0..total_entries {
@@ -611,7 +610,8 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
                 total_len,
                 "invalid ZIP central-directory signature",
             )
-            .with_field("zip.central_directory.entry_signature", FieldLocation::Tail));
+            .with_field("zip.central_directory.entry_signature", FieldLocation::Tail)
+            .into());
         }
         let flags = le_u16(&fixed, 8).unwrap();
         let name_len = le_u16(&fixed, 28).unwrap() as u64;
@@ -620,16 +620,9 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
         if flags & 0x0001 != 0 {
             let local_offset = le_u32(&fixed, 42).unwrap() as u64;
             if local_offset == u32::MAX as u64 {
-                return Err(ReadFault::invalid_field(
-                    "validate_field",
-                    cursor + 42,
-                    4,
-                    total_len,
+                return Err(PreparedStatus::new(
+                    "unknown_needs_final_verifier",
                     "ZIP64 local-header offset requires fallback",
-                )
-                .with_field(
-                    "zip.central_directory.local_header_offset",
-                    FieldLocation::Tail,
                 ));
             }
             let mut local_fixed = [0u8; 30];
@@ -655,7 +648,8 @@ fn locate_encrypted_entry_from_central_directory<R: Read + Seek>(
                     total_len,
                     "invalid ZIP local-header signature",
                 )
-                .with_field("zip.local_header.signature", FieldLocation::Body));
+                .with_field("zip.local_header.signature", FieldLocation::Body)
+                .into());
             }
             let local_name_len = le_u16(&local_fixed, 26).unwrap() as usize;
             let local_extra_len = le_u16(&local_fixed, 28).unwrap() as usize;
@@ -1018,5 +1012,66 @@ mod password_encoding_tests {
             65001 => assert_eq!(&*encoded, "密码".as_bytes()),
             _ => assert_ne!(&*encoded, "密码".as_bytes()),
         }
+    }
+}
+
+#[cfg(test)]
+mod zip64_bounded_probe_tests {
+    use super::*;
+
+    fn stored_zip_with_eocd_offset(central_offset: u32) -> Vec<u8> {
+        let name = b"a.txt";
+        let payload = b"hello";
+        let mut data = Vec::new();
+        data.extend_from_slice(ZIP_LOCAL);
+        data.extend_from_slice(&[20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(name);
+        data.extend_from_slice(payload);
+        let central_start = data.len() as u32;
+        data.extend_from_slice(ZIP_CENTRAL);
+        data.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        data.extend_from_slice(&(name.len() as u16).to_le_bytes());
+        data.extend_from_slice(&[0; 12]);
+        data.extend_from_slice(&0u32.to_le_bytes());
+        data.extend_from_slice(name);
+        let central_size = data.len() as u32 - central_start;
+        data.extend_from_slice(ZIP_EOCD);
+        data.extend_from_slice(&[0, 0, 0, 0, 1, 0, 1, 0]);
+        data.extend_from_slice(&central_size.to_le_bytes());
+        data.extend_from_slice(&central_offset.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data
+    }
+
+    fn status_of(result: Result<ZipPasswordContext, PreparedStatus>) -> &'static str {
+        match result {
+            Err(PreparedStatus::Status(status, _)) => status,
+            Err(PreparedStatus::ReadFault(_)) => "read_fault",
+            Ok(_) => "prepared",
+        }
+    }
+
+    #[test]
+    fn zip64_directory_location_defers_instead_of_reporting_missing_volume() {
+        let data = stored_zip_with_eocd_offset(u32::MAX);
+        let len = data.len() as u64;
+        let result = prepare_zip_stream(&mut std::io::Cursor::new(data), len);
+        assert_eq!(status_of(result), "unknown_needs_final_verifier");
+    }
+
+    #[test]
+    fn ordinary_unencrypted_zip_is_still_not_required() {
+        let data = stored_zip_with_eocd_offset(40);
+        let len = data.len() as u64;
+        let result = prepare_zip_stream(&mut std::io::Cursor::new(data), len);
+        assert_eq!(status_of(result), "not_required");
     }
 }

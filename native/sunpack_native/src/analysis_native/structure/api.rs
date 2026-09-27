@@ -729,8 +729,14 @@ pub(crate) fn inspect_tar_header_structure(
         && parse_octal(&header[136..148]).is_some();
     let typeflag = header[156];
     let typeflag_valid = typeflag == 0 || (0x20..0x7f).contains(&typeflag);
-    let payload_in_range = member_size
-        .is_some_and(|size| start_offset + TAR_BLOCK_SIZE as u64 + size + padding_for_size(size) <= archive_end);
+    // Base-256 sizes can approach u64::MAX; an overflowing end is out of range.
+    let payload_in_range = member_size.is_some_and(|size| {
+        start_offset
+            .checked_add(TAR_BLOCK_SIZE as u64)
+            .and_then(|end| end.checked_add(size))
+            .and_then(|end| end.checked_add(padding_for_size(size)))
+            .is_some_and(|end| end <= archive_end)
+    });
     result.set_item("stored_checksum", stored_checksum.unwrap_or(0))?;
     result.set_item("computed_checksum", computed)?;
     result.set_item("member_size", member_size.unwrap_or(0))?;
