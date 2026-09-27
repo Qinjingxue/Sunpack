@@ -544,6 +544,7 @@ fn probe_rar(
             });
             out.internal_volume_number = (flags & 0x0100 != 0).then_some(1);
             out.evidence.push("rar4:volume_header");
+            out.evidence.push(rar4_volume_naming_evidence(flags));
         } else {
             out.standalone = true;
             out.anchor_roles.push("standalone");
@@ -563,6 +564,7 @@ fn probe_rar(
                 "member"
             });
             out.internal_volume_number = (flags & 0x0100 != 0).then_some(1);
+            out.evidence.push(rar4_volume_naming_evidence(flags));
             out.needs_password = false;
         } else {
             out.standalone = true;
@@ -642,6 +644,16 @@ pub(crate) fn rar5_main_volume(data: &[u8], offset: usize) -> Option<(u64, Optio
         None
     };
     Some((archive_flags, number))
+}
+
+/// RAR4 MHD_NEWNUMBERING decides how 7-Zip derives the next volume name
+/// (`name.partN.rar` versus `name.rNN`), independent of the physical name.
+fn rar4_volume_naming_evidence(flags: u16) -> &'static str {
+    if flags & 0x0010 != 0 {
+        "rar4:new_volume_naming"
+    } else {
+        "rar4:old_volume_naming"
+    }
 }
 
 fn rar4_main_flags(data: &[u8], offset: usize) -> Option<u16> {

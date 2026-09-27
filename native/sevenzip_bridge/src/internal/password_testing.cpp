@@ -233,7 +233,7 @@ namespace sunpack::sevenzip
 
                 bool stream_opened = false;
 
-                CMyComPtr<IInStream> stream = open_stream_for_plan(plan, archive_path, part_paths, stream_opened);
+                CMyComPtr<IInStream> stream = open_stream_for_plan(plan, archive_path, part_paths, stream_opened, !canonical_names.empty());
 
                 if (!stream_opened)
                 {

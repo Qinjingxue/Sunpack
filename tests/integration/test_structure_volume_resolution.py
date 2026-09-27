@@ -206,8 +206,12 @@ def test_real_strict_middle_gap_is_not_emitted_as_a_relation_group(tmp_path):
     groups = RelationsScheduler().build_candidate_groups(
         DirectoryScanner(str(case.archive_dir)).scan()
     )
-    assert all(group.kind == "file" for group in groups)
+    # No relation may form across the gap, but no remaining volume may be
+    # silently dropped from discovery either.
+    assert not any(group.is_split_candidate for group in groups)
     assert all(len(group.input_paths) == 1 for group in groups)
+    remaining = {path.name for path in parts if path.exists()}
+    assert {Path(group.head_path).name for group in groups} == remaining
 
 
 def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):

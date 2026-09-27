@@ -134,7 +134,7 @@ def test_discovery_candidate_projection_bypasses_legacy_routing_columns(tmp_path
 
     assert len(candidates) == 1
     assert candidates[0].entry_path == str(payload)
-    assert candidates[0].logical_name == payload.name
+    assert candidates[0].logical_name == "payload"
     assert candidates[0].route == "detection"
     assert candidates[0].format_hint == "gzip"
 

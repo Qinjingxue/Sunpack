@@ -1061,8 +1061,10 @@ namespace sunpack::sevenzip
 
             if (name.empty())
             {
-
-                name = L"#" + std::to_wstring(index);
+                // Stream handlers (bzip2/xz/zstd, gzip without FNAME) carry no
+                // item name.  Like 7-Zip's default-name rule, name the payload
+                // after the archive's logical name, which is the output leaf.
+                name = default_item_name(index);
             }
 
             current_item_ = name;
@@ -1304,6 +1306,21 @@ namespace sunpack::sevenzip
         }
 
     private:
+        std::wstring default_item_name(UInt32 index) const
+        {
+            std::filesystem::path root(output_dir_);
+            std::wstring leaf = root.filename().wstring();
+            if (leaf.empty())
+            {
+                leaf = root.parent_path().filename().wstring();
+            }
+            if (leaf.empty() || leaf == L"." || leaf == L"..")
+            {
+                return L"#" + std::to_wstring(index);
+            }
+            return index == 0 ? leaf : leaf + L"_" + std::to_wstring(index);
+        }
+
         // 本 callback 所属卷的空间 gate，可能为 nullptr（功能关闭 / 无卷身份）。
         VolumeSpaceGate *volume_space_gate() const noexcept
         {

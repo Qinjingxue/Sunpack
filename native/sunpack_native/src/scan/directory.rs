@@ -214,10 +214,19 @@ fn filesystem_route_name(route: u8) -> &'static str {
 }
 
 fn filesystem_logical_name(path: &str) -> String {
-    path.rsplit(|ch| ch == '/' || ch == '\\')
+    let filename = path
+        .rsplit(|ch| ch == '/' || ch == '\\')
         .next()
-        .unwrap_or(path)
-        .to_string()
+        .unwrap_or(path);
+    // The logical name becomes the output directory name.  Keeping the
+    // (possibly disguised) extension would name the directory exactly like
+    // the archive beside it and force a numbered collision name.
+    let logical = crate::relations::relations_logical_name(filename, true);
+    if logical.is_empty() {
+        filename.to_string()
+    } else {
+        logical
+    }
 }
 
 struct DirectoryScanRecords {

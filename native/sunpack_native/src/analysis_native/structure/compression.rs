@@ -740,7 +740,9 @@ fn apply_structural_contract(
     file_size: u64,
     validation_limit: u64,
     kind: StructuralStreamKind,
-    integrity_verified: bool,
+    // End offset of the prefix the eager decoder checked; integrity is only
+    // verified when that prefix covers the whole validated structure.
+    integrity_verified_end: Option<u64>,
     damage_flags: &mut Vec<&'static str>,
 ) -> PyResult<()> {
     let reader = match ManagedReader::open(path) {
@@ -764,7 +766,9 @@ fn apply_structural_contract(
             if trailing > 0 && !damage_flags.contains(&"trailing_junk") {
                 damage_flags.push("trailing_junk");
             }
-            let integrity = if integrity_verified && structure.checksum_present {
+            let integrity = if integrity_verified_end.is_some_and(|end| end >= structure.end_offset)
+                && structure.checksum_present
+            {
                 "verified"
             } else {
                 structure.integrity.as_str()
@@ -1210,10 +1214,10 @@ fn inspect_bzip2(
     } else {
         data.len().saturating_sub(marker_boundary.min(consumed))
     };
+    // The single-stream decoder stops at the first end marker; concatenated
+    // streams are not trailing data.  The structural contract below walks every
+    // stream and owns the trailing_junk decision.
     d.set_item("archive.trailing_data", trailing)?;
-    if trailing > 0 {
-        damage_flags.push("trailing_junk");
-    }
     d.set_item("trailing_data_verified", decode_ok)?;
     d.set_item(
         "plausible",
@@ -1233,7 +1237,7 @@ fn inspect_bzip2(
         file_size,
         file_size,
         StructuralStreamKind::Bzip2,
-        decode_ok,
+        decode_ok.then_some(marker_boundary as u64),
         &mut damage_flags,
     )?;
     d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;
@@ -1669,7 +1673,7 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
         file_size,
         (after_footer + aligned_padding) as u64,
         StructuralStreamKind::Xz,
-        decode_ok,
+        decode_ok.then_some(u64::MAX),
         &mut damage_flags,
     )?;
     d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;
@@ -1902,7 +1906,7 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
         file_size,
         file_size,
         StructuralStreamKind::Zstd,
-        decode_ok && checksum,
+        (decode_ok && checksum).then_some(u64::MAX),
         &mut damage_flags,
     )?;
     d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;

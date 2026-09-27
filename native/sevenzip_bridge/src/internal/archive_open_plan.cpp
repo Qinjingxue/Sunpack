@@ -26,14 +26,17 @@ CMyComPtr<IInStream> open_stream_for_plan(
     const ArchiveOpenPlan& plan,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
-    bool& stream_opened
+    bool& stream_opened,
+    bool structured_order
 ) {
     if (plan.uses_ranges()) {
         auto* range_stream = new MultiRangeInStream(plan.ranges);
         stream_opened = range_stream->is_open();
         return CMyComPtr<IInStream>(range_stream);
     }
-    return open_archive_stream(archive_path, part_paths, stream_opened);
+    // Structured (canonically named) volumes are already ordered by
+    // Relations; re-sorting by physical filename would drop a disguised head.
+    return open_archive_stream(archive_path, part_paths, stream_opened, nullptr, structured_order);
 }
 
 void apply_plan_metadata(PasswordTestResult& result, const ArchiveOpenPlan& plan) {

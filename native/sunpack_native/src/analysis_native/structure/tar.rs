@@ -408,7 +408,11 @@ fn enrich_tar_semantics(
         scan_offset += length as u64;
         remaining -= length as u64;
     }
-    let concatenated_offset = first_nonzero_tail.map(|position| position / 512 * 512);
+    // Tar blocks are aligned to the archive start, which is arbitrary inside
+    // a carrier; absolute file alignment would miss the next header.
+    let concatenated_offset = first_nonzero_tail.map(|position| {
+        archive_start + (position - archive_start) / TAR_BLOCK_SIZE as u64 * TAR_BLOCK_SIZE as u64
+    });
     let concatenated_archive = if zeros >= 2 {
         if let Some(candidate_offset) = concatenated_offset {
             if candidate_offset + TAR_BLOCK_SIZE as u64 <= archive_end {

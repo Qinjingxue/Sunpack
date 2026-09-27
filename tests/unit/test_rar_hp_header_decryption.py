@@ -200,7 +200,15 @@ def test_missing_middle_hp_rar_volume_never_validates_as_complete_split(tmp_path
             _snapshot(case.archive_dir, remaining),
             path_passwords={str(path): "secret" for path in incomplete_paths},
         )
-        assert not any(group.kind == "split_archive" for group in incomplete)
+        # A gapped set is never a complete relation; it is handed to
+        # Extraction as an explicitly incomplete set so the worker reports
+        # the missing volume instead of the set vanishing from discovery.
+        split_groups = [group for group in incomplete if group.is_split_candidate]
+        assert split_groups
+        assert all(
+            group.head_metadata.get("volume_set_incomplete") is True
+            for group in split_groups
+        )
     finally:
         hidden.rename(middle)
 

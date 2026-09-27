@@ -426,6 +426,8 @@ struct WorkerArchiveInput {
     std::vector<std::wstring> canonical_names;
     std::vector<int> volume_numbers;
     std::string analyzed_missing_volume_evidence;
+    // First absent number of a structured volume sequence (0 = contiguous).
+    int missing_volume_number = 0;
     std::string validation_error;
     std::vector<sunpack::sevenzip::ExtractInputRange> ranges;
 };
@@ -673,9 +675,19 @@ WorkerArchiveInput parse_archive_input_descriptor(
         });
         parts.clear();
         for (std::size_t index = 0; index < structured_parts.size(); ++index) {
-            if (structured_parts[index].number != static_cast<int>(index + 1)) {
-                input.validation_error = "structured volume sequence must be contiguous and start at 1";
+            // Volume numbers are the Relations contract, so a gap is a proven
+            // missing volume rather than a malformed request.  It is reported
+            // before any stream is opened: concatenating the remaining parts
+            // would shift every later byte and misreport the set as damaged.
+            const bool head_ok = index != 0 || structured_parts[index].number == 1;
+            const bool ordered = index == 0 || structured_parts[index].number > structured_parts[index - 1].number;
+            if (!head_ok || !ordered) {
+                input.validation_error = "structured volume sequence must be unique and start at 1";
                 break;
+            }
+            if (input.missing_volume_number == 0 && index > 0 &&
+                structured_parts[index].number != structured_parts[index - 1].number + 1) {
+                input.missing_volume_number = structured_parts[index - 1].number + 1;
             }
             parts.push_back(structured_parts[index].path);
             input.canonical_names.push_back(structured_parts[index].canonical_name);
@@ -1136,7 +1148,16 @@ int run_request(
     };
 
     ExtractArchiveResult result;
-    if (password_candidates.empty()) {
+    if (archive_input.missing_volume_number > 0) {
+        result.status = PasswordTestStatus::Damaged;
+        result.damaged = true;
+        result.missing_volume = true;
+        result.missing_volume_suspected = false;
+        result.missing_volume_evidence = "structured_volume_gap";
+        result.failure_stage = "archive_open";
+        result.failure_kind = "missing_volume";
+        result.message = "structured volume " + std::to_string(archive_input.missing_volume_number) + " is missing";
+    } else if (password_candidates.empty()) {
         result = extract_with_password(password);
     } else if (password_candidates.size() == 1) {
         // Single candidate: extract directly; the bounded probe runs once only as a failure diagnostic to preserve the all-candidates-rejected contract.

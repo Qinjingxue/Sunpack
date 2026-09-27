@@ -33,7 +33,8 @@ CMyComPtr<IInStream> open_stream_for_plan(
     const ArchiveOpenPlan& plan,
     const std::wstring& archive_path,
     const std::vector<std::wstring>& part_paths,
-    bool& stream_opened
+    bool& stream_opened,
+    bool structured_order = false
 );
 
 void apply_plan_metadata(PasswordTestResult& result, const ArchiveOpenPlan& plan);

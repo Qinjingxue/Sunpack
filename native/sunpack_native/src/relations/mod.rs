@@ -498,11 +498,49 @@ fn build_candidate_groups_from_physical(
             output.push(password_error_proposal_to_dict(py, validation)?);
         }
 
+        // A structurally proven volume set that is missing volumes is still
+        // one logical archive.  Hand it to Extraction as a split candidate so
+        // the worker makes the authoritative missing-volume decision (CLI
+        // partial recovery, Watch `suspended_missing_volume`) instead of the
+        // set silently vanishing from discovery.
+        let incomplete_indexes: Vec<usize> = validations
+            .iter()
+            .enumerate()
+            .filter(|(_, validation)| {
+                validation.status == ProposalStatus::Inconclusive
+                    && is_incomplete_volume_set(validation)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        let incomplete_conflicted =
+            conflicting_indexes_among(&validation_owned_paths, incomplete_indexes.iter().copied());
+        for index in incomplete_indexes {
+            if incomplete_conflicted.contains(&index) {
+                continue;
+            }
+            let owned = &validation_owned_paths[index];
+            if owned
+                .iter()
+                .any(|path| claimed_paths.contains(path) || password_paths.contains(path))
+            {
+                continue;
+            }
+            claimed_paths.extend(owned.iter().cloned());
+            output.push(incomplete_proposal_to_dict(py, &validations[index])?);
+        }
+
         for row in directory_rows.iter().filter(|row| {
-            filtered_keys.contains(&row.path.to_ascii_lowercase())
-                && !claimed_paths.contains(&row.path.to_ascii_lowercase())
-                && !password_paths.contains(&row.path.to_ascii_lowercase())
-                && !strong_suppressed_paths.contains(&row.path.to_ascii_lowercase())
+            let key = row.path.to_ascii_lowercase();
+            // Suppression only prevents a numbered member from being treated
+            // as a complete archive on its own.  A member that no emitted
+            // relation owns is still reported through the ordinary
+            // (unconfirmed, therefore blocked) fallback, never dropped.
+            let suppressed = strong_suppressed_paths.contains(&key)
+                && row.anchor.as_ref().is_some_and(anchor_is_relation_archive);
+            filtered_keys.contains(&key)
+                && !claimed_paths.contains(&key)
+                && !password_paths.contains(&key)
+                && !suppressed
         }) {
             let confirmed = row.anchor.as_ref().is_some_and(anchor_is_relation_archive);
             output.push(ordinary_file_group_to_dict(py, row, confirmed)?);
@@ -767,7 +805,9 @@ fn strong_seed_related_paths(
     let logical_name = parsed
         .map(logical_name_from_parsed)
         .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| get_logical_name(&row.name, false));
+        // The seed is structurally proven, so its extension is not part of the
+        // family name even when disguised (`set4.jpg` heads `set4.r00`).
+        .unwrap_or_else(|| get_logical_name(&row.name, true));
     if logical_name.is_empty() {
         return Vec::new();
     }
@@ -860,7 +900,9 @@ fn name_interpretations_from_candidates(
                 .internal_volume_number
                 .or_else(|| structural_head.then_some(1))
                 .unwrap_or(0);
-            let prefix = get_logical_name(name, false).to_ascii_lowercase();
+            // Structure proves an archive head/terminal here; a disguised
+            // extension must not become part of the family prefix.
+            let prefix = get_logical_name(name, true).to_ascii_lowercase();
             if number > 0 && !prefix.is_empty() {
                 values.push(NameInterpretation {
                     format: target_format.to_string(),
@@ -1073,12 +1115,10 @@ fn make_name_proposal(
     {
         return None;
     }
-    let highest = volumes.iter().map(|volume| volume.1).max().unwrap_or(0);
-    if !encrypted_rar_hypothesis
-        && (1..=highest).any(|number| !volumes.iter().any(|volume| volume.1 == number))
-    {
-        return None;
-    }
+    // A gap is still a proposal: the validator can never accept it as a
+    // complete relation (see `proposal_has_gap`), but a structurally proven
+    // head plus later volumes must reach Extraction as an incomplete set
+    // instead of disappearing from discovery.
     let has_filtered_trigger = rows.iter().any(|row| {
         filtered_keys.contains(&row.path.to_ascii_lowercase())
             && name_index
@@ -1168,12 +1208,23 @@ fn conflicting_proposal_indexes(
 ) -> HashSet<usize> {
     debug_assert_eq!(validations.len(), owned_paths.len());
 
+    conflicting_indexes_among(
+        owned_paths,
+        validations
+            .iter()
+            .enumerate()
+            .filter(|(_, validation)| validation.status == status)
+            .map(|(index, _)| index),
+    )
+}
+
+fn conflicting_indexes_among(
+    owned_paths: &[HashSet<String>],
+    indexes: impl Iterator<Item = usize>,
+) -> HashSet<usize> {
     let mut owner_by_path: HashMap<&str, usize> = HashMap::new();
     let mut conflicted = HashSet::new();
-    for (index, validation) in validations.iter().enumerate() {
-        if validation.status != status {
-            continue;
-        }
+    for index in indexes {
         for path in &owned_paths[index] {
             if let Some(previous_index) = owner_by_path.get(path.as_str()).copied() {
                 conflicted.insert(previous_index);
@@ -1278,6 +1329,14 @@ fn validate_relation_proposal(
         "zip" => validate_zip_proposal(py, &proposal, &anchors),
         _ => Ok(ProposalStatus::Unsupported),
     }?;
+    // Formats without internal volume numbers (RAR4, ZIP, 7z) cannot prove
+    // that a missing middle slot is absent, so a gapped physical set is never
+    // a complete relation.
+    let status = if status == ProposalStatus::Valid && proposal_has_gap(&proposal) {
+        ProposalStatus::Inconclusive
+    } else {
+        status
+    };
 
     // A launcher is an ownership companion, not archive input.  Validate the
     // data proposal first; only a valid relation may claim a companion.  A
@@ -1684,7 +1743,9 @@ fn ordinary_file_group_to_dict(
             .as_ref()
             .filter(|_| archive_numbered_hypothesis)
             .map(logical_name_from_parsed)
-            .unwrap_or_else(|| get_logical_name(&row.name, false)),
+            // The logical name names the output directory; a (possibly
+            // disguised) extension would collide with the archive itself.
+            .unwrap_or_else(|| get_logical_name(&row.name, true)),
         split_role: archive_numbered_hypothesis.then(|| {
             if split_index == 1 {
                 "first".to_string()
@@ -1757,7 +1818,7 @@ fn validated_proposal_to_dict(
         .unwrap_or(&proposal.volumes[0]);
     let head_path = &head.0;
     let head_anchor = validation.anchors.get(&head_path.to_ascii_lowercase());
-    let split_family = split_family_for_proposal(&proposal.format, &proposal.style);
+    let split_family = proposal_split_family(proposal, &validation.anchors);
     let relation = FileRelationNative {
         filename: basename(head_path).to_string(),
         logical_name: proposal.logical_name.clone(),
@@ -1836,7 +1897,7 @@ fn password_error_proposal_to_dict(
         .find(|(_, number, _, _, _)| *number == 1)
         .unwrap_or(&proposal.volumes[0]);
     let anchor = validation.anchors.get(&head.0.to_ascii_lowercase());
-    let split_family = split_family_for_proposal(&proposal.format, &proposal.style);
+    let split_family = proposal_split_family(proposal, &validation.anchors);
     let relation = FileRelationNative {
         filename: basename(&head.0).to_string(),
         logical_name: proposal.logical_name.clone(),
@@ -1907,6 +1968,73 @@ fn password_error_proposal_to_dict(
     Ok(dict.unbind())
 }
 
+fn proposal_has_gap(proposal: &RelationProposal) -> bool {
+    let highest = proposal
+        .volumes
+        .iter()
+        .map(|(_, number, _, _, _)| *number)
+        .max()
+        .unwrap_or(0);
+    (1..=highest).any(|number| {
+        !proposal
+            .volumes
+            .iter()
+            .any(|(_, candidate, _, _, _)| *candidate == number)
+    })
+}
+
+/// Every member is a structurally proven volume of the proposal format and
+/// exactly the filename head (slot 1) carries the first-volume role.  Only a
+/// missing or truncated member can keep such a proposal inconclusive.
+fn is_incomplete_volume_set(validation: &ProposalValidation) -> bool {
+    let proposal = &validation.proposal;
+    let mut heads = 0usize;
+    for (path, number, _, _, _) in &proposal.volumes {
+        let Some(anchor) = validation.anchors.get(&path.to_ascii_lowercase()) else {
+            return false;
+        };
+        if anchor.format != proposal.format
+            || anchor.confidence != "strong"
+            || anchor.needs_password
+            || anchor.wrong_password
+            || !(anchor.multivolume
+                || anchor.continuation_from_previous
+                || anchor.continuation_to_next)
+        {
+            return false;
+        }
+        if anchor
+            .internal_volume_number
+            .is_some_and(|internal| internal != *number)
+        {
+            return false;
+        }
+        if anchor.anchor_roles.contains(&"first") || anchor.internal_volume_number == Some(1) {
+            if *number != 1 {
+                return false;
+            }
+            heads += 1;
+        }
+    }
+    heads == 1
+}
+
+fn incomplete_proposal_to_dict(
+    py: Python<'_>,
+    validation: &ProposalValidation,
+) -> PyResult<Py<PyDict>> {
+    let dict = validated_proposal_to_dict(py, validation)?;
+    {
+        let bound = dict.bind(py);
+        if let Some(metadata) = bound.get_item("head_metadata")? {
+            if let Ok(metadata) = metadata.cast::<PyDict>() {
+                metadata.set_item("volume_set_incomplete", true)?;
+            }
+        }
+    }
+    Ok(dict)
+}
+
 fn proposal_logical_size(
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
@@ -1962,6 +2090,37 @@ fn proposal_volume_dicts(
             Ok(dict.unbind())
         })
         .collect()
+}
+
+/// Split family used for canonical volume names.  RAR volume names are
+/// derived by the handler from the archive's own numbering scheme, so a
+/// structurally proven scheme overrides the (possibly disguised) filename
+/// style: `x.part1.rar` files of an old-numbering RAR4 set must be exposed as
+/// `x.rar`/`x.r00`, and `x.rar`/`x.r00` files of a new-numbering set as parts.
+fn proposal_split_family(
+    proposal: &RelationProposal,
+    anchors: &HashMap<String, VolumeAnchor>,
+) -> String {
+    let style = proposal.style.as_str();
+    if proposal.format == "rar" && style != "rar_sfx_part" {
+        let head_evidence = proposal
+            .volumes
+            .iter()
+            .find(|(_, number, _, _, _)| *number == 1)
+            .and_then(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()))
+            .map(|anchor| anchor.evidence.as_slice())
+            .unwrap_or(&[]);
+        let old_naming = head_evidence.contains(&"rar4:old_volume_naming");
+        let new_naming = head_evidence.contains(&"rar4:new_volume_naming")
+            || head_evidence.contains(&"rar5:volume_header");
+        if old_naming && style != "rar_oldstyle" {
+            return "rar_oldstyle".to_string();
+        }
+        if new_naming && style == "rar_oldstyle" {
+            return "rar_part".to_string();
+        }
+    }
+    split_family_for_proposal(&proposal.format, style)
 }
 
 fn split_family_for_proposal(format: &str, style: &str) -> String {

@@ -2168,6 +2168,21 @@ fn windows_file_generation(file: &File) -> io::Result<WindowsFileGeneration> {
         change_time: i64,
         attributes: u32,
     }
+    #[repr(C)]
+    #[derive(Default)]
+    struct ByHandleFileInformation {
+        attributes: u32,
+        // FILETIME is two DWORDs (4-byte aligned): low, high.
+        creation_time: [u32; 2],
+        access_time: [u32; 2],
+        write_time: [u32; 2],
+        volume_serial_number: u32,
+        file_size_high: u32,
+        file_size_low: u32,
+        number_of_links: u32,
+        file_index_high: u32,
+        file_index_low: u32,
+    }
     #[link(name = "kernel32")]
     extern "system" {
         fn GetFileInformationByHandleEx(
@@ -2176,35 +2191,67 @@ fn windows_file_generation(file: &File) -> io::Result<WindowsFileGeneration> {
             information: *mut c_void,
             size: u32,
         ) -> i32;
+        fn GetFileInformationByHandle(
+            handle: *mut c_void,
+            information: *mut ByHandleFileInformation,
+        ) -> i32;
     }
+    let handle = file.as_raw_handle();
     let mut id = FileIdInfo::default();
     let mut basic = FileBasicInfo::default();
     // Query identity and generation on the same open file. Failure must not
-    // silently fall back to a timestamp-only cache key.
-    for (class, information, size) in [
-        (
+    // silently fall back to a timestamp-only cache key.  FAT/exFAT, SMB and
+    // user-mode file systems may reject the Ex information classes; the
+    // classic by-handle query still carries a real volume serial and file
+    // index for those, so it is an identity-preserving fallback.
+    let id_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
             18,
             (&mut id as *mut FileIdInfo).cast(),
-            std::mem::size_of::<FileIdInfo>(),
-        ),
-        (
+            std::mem::size_of::<FileIdInfo>() as u32,
+        )
+    } != 0;
+    let basic_ok = unsafe {
+        GetFileInformationByHandleEx(
+            handle,
             0,
             (&mut basic as *mut FileBasicInfo).cast(),
-            std::mem::size_of::<FileBasicInfo>(),
-        ),
-    ] {
-        if unsafe {
-            GetFileInformationByHandleEx(file.as_raw_handle(), class, information, size as u32)
-        } == 0
-        {
-            return Err(io::Error::last_os_error());
-        }
+            std::mem::size_of::<FileBasicInfo>() as u32,
+        )
+    } != 0;
+    if id_ok && basic_ok {
+        return Ok(WindowsFileGeneration {
+            volume: id.volume,
+            file_id: id.file_id,
+            change_time: basic.change_time,
+            write_time: basic.write_time,
+        });
     }
+    let mut legacy = ByHandleFileInformation::default();
+    if unsafe { GetFileInformationByHandle(handle, &mut legacy) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let (volume, file_id) = if id_ok {
+        (id.volume, id.file_id)
+    } else {
+        let index = (u64::from(legacy.file_index_high) << 32) | u64::from(legacy.file_index_low);
+        let mut file_id = [0u8; 16];
+        file_id[..8].copy_from_slice(&index.to_le_bytes());
+        (u64::from(legacy.volume_serial_number), file_id)
+    };
+    let legacy_write_time =
+        ((u64::from(legacy.write_time[1]) << 32) | u64::from(legacy.write_time[0])) as i64;
+    let (change_time, write_time) = if basic_ok {
+        (basic.change_time, basic.write_time)
+    } else {
+        (legacy_write_time, legacy_write_time)
+    };
     Ok(WindowsFileGeneration {
-        volume: id.volume,
-        file_id: id.file_id,
-        change_time: basic.change_time,
-        write_time: basic.write_time,
+        volume,
+        file_id,
+        change_time,
+        write_time,
     })
 }
 

@@ -411,8 +411,11 @@ def test_split_zip_without_terminal_reports_strong_missing_tail(tmp_path):
 
     groups = _groups(tmp_path)
 
-    assert all(group.kind == "file" for group in groups)
+    # No complete relation may form, but the structurally proven head must
+    # still be reported instead of silently disappearing from discovery.
+    assert not any(group.is_split_candidate for group in groups)
     assert all(len(group.input_paths) == 1 for group in groups)
+    assert {Path(group.head_path).name for group in groups} == {first.name, second.name}
 
 
 def _split_zip_first_bytes() -> bytes:
