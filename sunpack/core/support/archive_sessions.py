@@ -10,6 +10,7 @@ from typing import Any, Iterable
 import sunpack_native
 from sunpack_native import NativeArchiveSession, clear_reader_resources
 
+from sunpack.core.support.path_keys import absolute_path_key
 from sunpack.core.support.resource_lifecycle import (
     ResourceBusyError,
     ResourceKind,
@@ -179,8 +180,10 @@ def clear_archive_sessions() -> dict:
 
 
 def _is_under(candidate: str, root: str) -> bool:
+    candidate_key = absolute_path_key(candidate)
+    root_key = absolute_path_key(root)
     try:
-        return os.path.commonpath((candidate, root)) == root
+        return os.path.commonpath((candidate_key, root_key)) == root_key
     except ValueError:
         return False
 
@@ -188,13 +191,13 @@ def _is_under(candidate: str, root: str) -> bool:
 def _merge_release_roots(
     paths: Iterable[os.PathLike[str] | str],
 ) -> tuple[str, ...]:
-    normalized = tuple(
-        dict.fromkeys(
-            os.path.abspath(os.path.normpath(os.fspath(path)))
-            for path in paths
-            if path
-        )
-    )
+    unique: dict[str, str] = {}
+    for path in paths:
+        if not path:
+            continue
+        normalized_path = os.path.abspath(os.path.normpath(os.fspath(path)))
+        unique.setdefault(absolute_path_key(normalized_path), normalized_path)
+    normalized = tuple(unique.values())
     return tuple(
         root
         for root in normalized
