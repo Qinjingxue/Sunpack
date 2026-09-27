@@ -599,7 +599,7 @@ fn archive_items_from_py(archive_files: &Bound<'_, PyAny>) -> PyResult<Vec<Archi
         let raw_path = py_string(dict, "raw_path")?
             .or_else(|| py_string(dict, "archive_path").ok().flatten())
             .unwrap_or_else(|| projected.clone());
-        let path = clean_relative_archive_path(&projected);
+        let path = windows_output_relative_path(clean_relative_archive_path(&projected));
         if path.is_empty() {
             continue;
         }
@@ -715,45 +715,84 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
+/// Names the extraction worker refuses to write (see `safe_relative_item_path`
+/// in the 7z bridge): rooted paths, drive-qualified names and `..` traversal.
 fn unsafe_archive_path(raw_path: &str, cleaned: &str) -> bool {
     let text = raw_path.replace('\\', "/");
     if text.is_empty() {
         return false;
     }
-    if text.starts_with('/') || text.starts_with("//") {
+    if text.starts_with('/') {
         return true;
     }
-    if text.len() >= 3 && text.as_bytes()[1] == b':' && text.as_bytes()[2] == b'/' {
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
         return true;
     }
-    let parts: Vec<&str> = text.split('/').filter(|part| !part.is_empty()).collect();
-    if parts.iter().any(|part| *part == "..") {
-        return true;
-    }
-    if parts.iter().any(|part| windows_reserved_path_part(part)) {
-        return true;
-    }
-    if parts.iter().any(|part| part.contains(':')) {
+    if text.split('/').any(|part| part == "..") {
         return true;
     }
     !cleaned.is_empty() && cleaned != text.trim().trim_matches('/')
 }
 
-fn windows_reserved_path_part(part: &str) -> bool {
-    let stem = part
-        .split('.')
-        .next()
-        .unwrap_or("")
-        .trim()
-        .trim_end_matches([' ', '.'])
-        .to_lowercase();
-    if stem.is_empty() {
+fn is_windows_invalid_name_char(value: char) -> bool {
+    (value as u32) < 0x20 || matches!(value, '<' | '>' | ':' | '"' | '|' | '?' | '*')
+}
+
+/// Mirrors `is_windows_reserved_device_name` in the 7z bridge.
+fn is_windows_reserved_device_name(part: &str) -> bool {
+    let bytes = part.as_bytes();
+    let mut stem = part.find('.').unwrap_or(bytes.len());
+    while stem > 0 && bytes[stem - 1] == b' ' {
+        stem -= 1;
+    }
+    if stem != 3 && stem != 4 {
         return false;
     }
-    matches!(stem.as_str(), "con" | "prn" | "aux" | "nul")
-        || (stem.len() == 4
-            && (stem.starts_with("com") || stem.starts_with("lpt"))
-            && stem[3..].chars().all(|c| ('1'..='9').contains(&c)))
+    let prefix = [
+        bytes[0].to_ascii_lowercase(),
+        bytes[1].to_ascii_lowercase(),
+        bytes[2].to_ascii_lowercase(),
+    ];
+    if stem == 3 {
+        return matches!(&prefix, b"con" | b"prn" | b"aux" | b"nul");
+    }
+    matches!(bytes[3], b'1'..=b'9') && matches!(&prefix, b"com" | b"lpt")
+}
+
+fn windows_output_part_needs_mapping(part: &str) -> bool {
+    part.chars().any(is_windows_invalid_name_char)
+        || part.ends_with(['.', ' '])
+        || is_windows_reserved_device_name(part)
+}
+
+/// Mirrors `make_windows_safe_path_part` in the 7z bridge.
+fn windows_output_part(part: &str) -> String {
+    let mut mapped: String = part
+        .chars()
+        .map(|value| if is_windows_invalid_name_char(value) { '_' } else { value })
+        .collect();
+    let kept = mapped.trim_end_matches(['.', ' ']).len();
+    let trailing = mapped.len() - kept;
+    mapped.truncate(kept);
+    mapped.extend(std::iter::repeat('_').take(trailing));
+    if is_windows_reserved_device_name(&mapped) {
+        mapped.insert(0, '_');
+    }
+    mapped
+}
+
+/// Project a cleaned archive path onto the name the worker writes on disk.
+/// The mapping is idempotent, so already-projected output paths pass through.
+fn windows_output_relative_path(cleaned: String) -> String {
+    if !cleaned.split('/').any(windows_output_part_needs_mapping) {
+        return cleaned;
+    }
+    cleaned
+        .split('/')
+        .map(windows_output_part)
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn size_progress(actual_size: Option<u64>, expected_size: Option<u64>) -> Option<f64> {
@@ -770,4 +809,41 @@ fn size_progress(actual_size: Option<u64>, expected_size: Option<u64>) -> Option
 
 fn round6(value: f64) -> f64 {
     (value * 1_000_000.0).round() / 1_000_000.0
+}
+
+#[cfg(test)]
+mod windows_output_name_tests {
+    use super::*;
+
+    #[test]
+    fn archive_names_project_onto_worker_output_names() {
+        let cases = [
+            ("docs/readme.txt", "docs/readme.txt"),
+            ("logs/12:30.log", "logs/12_30.log"),
+            ("a?b*c<d>e|f\"g.txt", "a_b_c_d_e_f_g.txt"),
+            ("dir. /name.", "dir__/name_"),
+            ("con.txt", "_con.txt"),
+            ("sub/NUL", "sub/_NUL"),
+            ("com1 .log", "_com1 .log"),
+            ("console.txt", "console.txt"),
+            ("com0.txt", "com0.txt"),
+            ("ctl-\u{1}-x", "ctl-_-x"),
+        ];
+        for (raw, expected) in cases {
+            let projected = windows_output_relative_path(clean_relative_archive_path(raw));
+            assert_eq!(projected, expected, "{raw}");
+            // Already-projected output paths must pass through unchanged.
+            assert_eq!(windows_output_relative_path(projected.clone()), projected);
+        }
+    }
+
+    #[test]
+    fn only_names_the_worker_rejects_are_unsafe() {
+        for raw in ["/abs.txt", "C:/abs.txt", "c:drive-relative.txt", "../escape.txt", "a/../b.txt"] {
+            assert!(unsafe_archive_path(raw, &clean_relative_archive_path(raw)), "{raw}");
+        }
+        for raw in ["con.txt", "logs/12:30.log", "name. ", "a?b.txt"] {
+            assert!(!unsafe_archive_path(raw, &clean_relative_archive_path(raw)), "{raw}");
+        }
+    }
 }

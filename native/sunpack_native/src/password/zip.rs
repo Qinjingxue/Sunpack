@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 use sha1::Sha1;
+use std::borrow::Cow;
 use std::io::{Read, Seek};
 
 const ZIP_LOCAL: &[u8] = b"PK\x03\x04";
@@ -711,7 +712,7 @@ fn verify_winzip_aes_candidates(
                 .par_iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    winzip_aes_verifier_matches(password.as_bytes(), salt, verifier, key_len)
+                    winzip_aes_verifier_matches(&zip_password_bytes(password), salt, verifier, key_len)
                         .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
@@ -720,7 +721,7 @@ fn verify_winzip_aes_candidates(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    winzip_aes_verifier_matches(password.as_bytes(), salt, verifier, key_len)
+                    winzip_aes_verifier_matches(&zip_password_bytes(password), salt, verifier, key_len)
                         .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
@@ -759,7 +760,7 @@ fn verify_zipcrypto_material(
                 .par_iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    zipcrypto_header_matches(password.as_bytes(), encryption_header, check_byte)
+                    zipcrypto_header_matches(&zip_password_bytes(password), encryption_header, check_byte)
                         .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
@@ -768,7 +769,7 @@ fn verify_zipcrypto_material(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    zipcrypto_header_matches(password.as_bytes(), encryption_header, check_byte)
+                    zipcrypto_header_matches(&zip_password_bytes(password), encryption_header, check_byte)
                         .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
@@ -822,6 +823,83 @@ fn aes_lengths(strength: u8) -> Option<(usize, usize)> {
         3 => Some((16, 32)),
         _ => None,
     }
+}
+
+/// Encode a ZIP password exactly as the 7z.dll extractor does.
+///
+/// 7-Zip's ZIP handler converts the UTF-16 password with
+/// `UnicodeStringToMultiByte2(..., CP_ACP)` (default char `_`) for both
+/// ZipCrypto and WinZip AES, so the fast verifier must hash the same bytes or
+/// it would reject (or accept) candidates the extractor treats differently.
+/// ASCII is identical in every ANSI codepage and stays borrowed.
+fn zip_password_bytes(password: &str) -> Cow<'_, [u8]> {
+    if password.is_ascii() {
+        return Cow::Borrowed(password.as_bytes());
+    }
+    Cow::Owned(ansi_codepage_bytes(password))
+}
+
+#[cfg(windows)]
+fn ansi_codepage_bytes(password: &str) -> Vec<u8> {
+    #[link(name = "Kernel32")]
+    extern "system" {
+        fn WideCharToMultiByte(
+            code_page: u32,
+            flags: u32,
+            wide: *const u16,
+            wide_len: i32,
+            multi: *mut u8,
+            multi_len: i32,
+            default_char: *const u8,
+            used_default_char: *mut i32,
+        ) -> i32;
+    }
+    const CP_ACP: u32 = 0;
+    const DEFAULT_CHAR: &[u8; 2] = b"_\0";
+
+    let wide: Vec<u16> = password.encode_utf16().collect();
+    let Ok(wide_len) = i32::try_from(wide.len()) else {
+        return password.as_bytes().to_vec();
+    };
+    let mut used_default = 0i32;
+    let required = unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            std::ptr::null_mut(),
+            0,
+            DEFAULT_CHAR.as_ptr(),
+            &mut used_default,
+        )
+    };
+    if required <= 0 {
+        return password.as_bytes().to_vec();
+    }
+    let mut output = vec![0u8; required as usize];
+    let written = unsafe {
+        WideCharToMultiByte(
+            CP_ACP,
+            0,
+            wide.as_ptr(),
+            wide_len,
+            output.as_mut_ptr(),
+            required,
+            DEFAULT_CHAR.as_ptr(),
+            &mut used_default,
+        )
+    };
+    if written <= 0 {
+        return password.as_bytes().to_vec();
+    }
+    output.truncate(written as usize);
+    output
+}
+
+#[cfg(not(windows))]
+fn ansi_codepage_bytes(password: &str) -> Vec<u8> {
+    password.as_bytes().to_vec()
 }
 
 fn winzip_aes_verifier_matches(
@@ -915,4 +993,30 @@ fn le_u32(bytes: &[u8], offset: usize) -> Option<u32> {
         *bytes.get(offset + 2)?,
         *bytes.get(offset + 3)?,
     ]))
+}
+
+#[cfg(test)]
+mod password_encoding_tests {
+    use super::*;
+
+    #[test]
+    fn ascii_password_bytes_are_borrowed_unchanged() {
+        let encoded = zip_password_bytes("secret-123");
+        assert!(matches!(encoded, Cow::Borrowed(_)));
+        assert_eq!(&*encoded, b"secret-123");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn non_ascii_password_uses_the_ansi_codepage_like_7zip() {
+        extern "system" {
+            fn GetACP() -> u32;
+        }
+        let encoded = zip_password_bytes("密码");
+        match unsafe { GetACP() } {
+            936 => assert_eq!(&*encoded, &[0xC3, 0xDC, 0xC2, 0xEB]),
+            65001 => assert_eq!(&*encoded, "密码".as_bytes()),
+            _ => assert_ne!(&*encoded, "密码".as_bytes()),
+        }
+    }
 }

@@ -36,6 +36,9 @@ class ArchiveInputManifest:
     total_unpacked_size_hint: int = 0
     summary_only: bool = False
     failure_kind: str = ""
+    # Set on a truncated view: the file-list total of the full manifest, so
+    # aggregate size checks do not shrink with the view's item limit.
+    full_unpacked_size: int | None = None
 
     @property
     def ok(self) -> bool:
@@ -53,6 +56,8 @@ class ArchiveInputManifest:
     def total_unpacked_size(self) -> int:
         if self.summary_only:
             return max(0, int(self.total_unpacked_size_hint or 0))
+        if self.full_unpacked_size is not None:
+            return self.full_unpacked_size
         return sum(
             max(0, int(item.get("size", 0) or 0))
             for item in self.files
@@ -106,7 +111,7 @@ def archive_input_manifest_for_evidence(evidence, *, max_items: int = 200000) ->
             "manifest": full_manifest,
         }
         object.__setattr__(evidence, _EVIDENCE_CACHE_ATTRIBUTE, cached)
-    return _manifest_view(cached["manifest"], requested)
+    return _manifest_view(cached, requested)
 
 
 def _worker_verified_manifest(evidence) -> ArchiveInputManifest | None:
@@ -156,12 +161,22 @@ def _evidence_manifest_identity(evidence, codepage: str) -> tuple:
     )
 
 
-def _manifest_view(manifest: ArchiveInputManifest, max_items: int) -> ArchiveInputManifest:
+def _manifest_view(cached: dict, max_items: int) -> ArchiveInputManifest:
+    manifest: ArchiveInputManifest = cached["manifest"]
     limit = max(0, int(max_items or 0))
     if len(manifest.files) <= limit:
         return manifest
+    full_size = cached.get("full_unpacked_size")
+    if full_size is None:
+        full_size = manifest.total_unpacked_size
+        cached["full_unpacked_size"] = full_size
     files = manifest.files[:limit]
-    return replace(manifest, files=files, entries_truncated=True)
+    return replace(
+        manifest,
+        files=files,
+        entries_truncated=True,
+        full_unpacked_size=full_size,
+    )
 
 
 def archive_input_manifest(

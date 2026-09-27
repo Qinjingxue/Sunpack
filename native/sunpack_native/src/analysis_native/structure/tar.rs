@@ -560,8 +560,13 @@ fn walk_tar(
                 return Ok((checked, false, false, "oldgnu_sparse_extent_out_of_range"));
             }
         }
-        let next_offset = offset + TAR_BLOCK_SIZE as u64 + sparse_extension_span
-            + member_size + padding_for_size(member_size);
+        // Base-256 size fields can encode values near u64::MAX; saturate so a
+        // crafted size lands out of range instead of wrapping back into the file.
+        let next_offset = offset
+            .saturating_add(TAR_BLOCK_SIZE as u64)
+            .saturating_add(sparse_extension_span)
+            .saturating_add(member_size)
+            .saturating_add(padding_for_size(member_size));
         if next_offset > archive_end {
             return Ok((checked, false, false, "member_payload_out_of_range"));
         }
@@ -595,4 +600,38 @@ fn tar_header_plausible(header: &[u8]) -> (bool, &'static str, u64, bool) {
         member_size.unwrap(),
         matches!(&header[257..263], b"ustar\x00" | b"ustar "),
     )
+}
+
+#[cfg(test)]
+mod tar_walk_tests {
+    use super::*;
+    use crate::io::reader::ReaderConfig;
+
+    fn header_with_base256_size(size: u64) -> [u8; TAR_BLOCK_SIZE] {
+        let mut header = [0u8; TAR_BLOCK_SIZE];
+        header[..4].copy_from_slice(b"file");
+        header[124] = 0x80;
+        header[128..136].copy_from_slice(&size.to_be_bytes());
+        header[156] = b'0';
+        let checksum = format!("{:06o}\0 ", tar_checksum(&header));
+        header[148..156].copy_from_slice(checksum.as_bytes());
+        header
+    }
+
+    #[test]
+    fn huge_base256_member_size_is_out_of_range_instead_of_wrapping() {
+        // offset(0) + 512 + (2^64 - 512) wraps to 0 without saturation, which
+        // would re-walk the same header and report a valid archive.
+        let mut data = header_with_base256_size(u64::MAX - 511).to_vec();
+        data.extend_from_slice(&[0u8; TAR_BLOCK_SIZE * 2]);
+        let archive_end = data.len() as u64;
+        let reader = ManagedReader::from_bytes(data, ReaderConfig::default());
+        let mut cursor = reader.cursor();
+
+        let (checked, walk_ok, _, error) = walk_tar(&mut cursor, 0, archive_end, 8).unwrap();
+
+        assert_eq!(checked, 0);
+        assert!(!walk_ok);
+        assert_eq!(error, "member_payload_out_of_range");
+    }
 }

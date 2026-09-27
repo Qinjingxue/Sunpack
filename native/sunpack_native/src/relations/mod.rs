@@ -174,11 +174,6 @@ pub(crate) fn relations_parse_numbered_volume(
 }
 
 #[pyfunction]
-pub(crate) fn relations_split_sort_key(path: &str) -> (u8, u32, String) {
-    split_sort_key(path)
-}
-
-#[pyfunction]
 #[pyo3(signature = (raw_snapshot, filtered_snapshot, path_passwords=None))]
 pub(crate) fn relations_build_candidate_groups_from_snapshot(
     py: Python<'_>,
@@ -2252,15 +2247,6 @@ fn logical_name_from_parsed(parsed: &ParsedVolume) -> String {
     clean_logical_name(&parsed.prefix)
 }
 
-fn parse_numbered_volume(path: &str) -> Option<ParsedVolume> {
-    let (directory, filename) = split_relation_path(path);
-    let mut parsed = parse_numbered_volume_name(filename)?;
-    if !directory.is_empty() {
-        parsed.prefix = format!("{directory}{}", parsed.prefix);
-    }
-    Some(parsed)
-}
-
 fn parse_relation_numbered_volume(path: &str) -> Option<ParsedVolume> {
     let (directory, filename) = split_relation_path(path);
     let mut parsed = parse_volume_candidates(filename)
@@ -2390,6 +2376,7 @@ fn split_size_family_key(scheme: &str, prefix: &str) -> String {
     )
 }
 
+#[cfg(test)]
 fn parse_numbered_volume_name(filename: &str) -> Option<ParsedVolume> {
     parse_volume_candidates(filename).into_iter().next()
 }
@@ -2822,25 +2809,6 @@ fn archive_family_hint(value: &str) -> Option<&'static str> {
     (families.len() == 1).then(|| *families.iter().next().expect("one family"))
 }
 
-fn split_sort_key(path: &str) -> (u8, u32, String) {
-    if let Some(parsed) = parse_numbered_volume(path) {
-        return (0, parsed.number, path.to_ascii_lowercase());
-    }
-    let lower_name = basename(path).to_ascii_lowercase();
-    if let Some(captures) = old_rar_member_re().captures(&lower_name) {
-        if let Some(number) = captures
-            .get(1)
-            .and_then(|value| value.as_str().parse::<u32>().ok())
-        {
-            return (1, number + 2, path.to_ascii_lowercase());
-        }
-    }
-    if lower_name.ends_with(".rar") {
-        return (1, 1, path.to_ascii_lowercase());
-    }
-    (2, 0, path.to_ascii_lowercase())
-}
-
 fn split_ext(filename: &str) -> (String, String) {
     let basename_start = filename
         .rfind(['\\', '/'])
@@ -2968,11 +2936,6 @@ fn decorated_format_numeric_re() -> &'static Regex {
 fn decorated_old_rar_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
     VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.[^.]*r[^.\d]*(?P<number>\d{2,})[^.]*(?:\.[^.]+)*$"))
-}
-
-fn old_rar_member_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"\.r(\d{2})$"))
 }
 
 #[cfg(test)]

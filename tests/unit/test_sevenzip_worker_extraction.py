@@ -353,8 +353,11 @@ def test_worker_candidate_batch_rejects_all_candidates_without_full_extraction(t
 def test_native_worker_result_escapes_control_characters(tmp_path):
     worker_path = _require_worker_or_skip()
     archive = tmp_path / "control-name.zip"
+    # Control characters are mapped to '_' on disk, so an over-long component
+    # forces the item to fail while its raw name still reaches the result.
+    failed_name = "control-\x01-name" + "x" * 300 + ".txt"
     with zipfile.ZipFile(archive, "w") as zf:
-        zf.writestr("control-\x01-name.txt", "unsafe filename payload")
+        zf.writestr(failed_name, "unsafe filename payload")
     payload = {
         "job_id": "control-name",
         "archive_path": str(archive),
@@ -375,8 +378,8 @@ def test_native_worker_result_escapes_control_characters(tmp_path):
     assert completed.returncode != 0
     assert "timed out" not in completed.stderr.lower()
     assert worker_result["job_id"] == "control-name"
-    assert worker_result["failed_item"] == "control-\x01-name.txt"
-    assert worker_result["diagnostics"]["failed_item"]["path"] == "control-\x01-name.txt"
+    assert worker_result["failed_item"] == failed_name
+    assert worker_result["diagnostics"]["failed_item"]["path"] == failed_name
 
 
 def test_native_worker_asyncio_event_controller_completes_job(tmp_path):
@@ -751,11 +754,13 @@ def test_worker_output_trace_includes_per_item_failure(tmp_path):
 def test_worker_propagates_delayed_async_file_open_failure(tmp_path):
     worker = _require_worker_or_skip()
     archive = tmp_path / "async-open-failure.zip"
+    # A component longer than NTFS allows passes archive path validation (even
+    # through the extended-length prefix), but CreateFileW rejects it. The async writer must
+    # report that delayed failure after draining instead of publishing a
+    # successful extraction.
+    invalid_name = "x" * 300 + ".txt"
     with zipfile.ZipFile(archive, "w") as zf:
-        # Wildcards pass archive path traversal validation, but CreateFileW
-        # rejects them. The async writer must report that delayed failure
-        # after draining instead of publishing a successful extraction.
-        zf.writestr("invalid*output.txt", "payload")
+        zf.writestr(invalid_name, "payload")
     out_dir = tmp_path / "out"
     payload = {
         "job_id": "async-open-failure",
@@ -780,11 +785,11 @@ def test_worker_propagates_delayed_async_file_open_failure(tmp_path):
     assert worker_result["failure_stage"] == "output_write"
     assert worker_result["failure_kind"] == "output_filesystem"
     assert worker_result["files_written"] == 0
-    assert worker_result["failed_item"] == "invalid*output.txt"
-    assert worker_result["diagnostics"]["failed_item"]["path"] == "invalid*output.txt"
+    assert worker_result["failed_item"] == invalid_name
+    assert worker_result["diagnostics"]["failed_item"]["path"] == invalid_name
     assert output_items[-1]["failed"] is True
     assert output_items[-1]["bytes_written"] == 0
-    assert not list(out_dir.glob("invalid*output.txt"))
+    assert not any(out_dir.glob("*.txt"))
 
 
 def test_worker_dry_run_reports_success_diagnostics_without_writing(tmp_path):
@@ -1278,3 +1283,71 @@ def test_extraction_scheduler_uses_worker_archive_input_descriptor(tmp_path):
 
     assert result.success is True
     assert (tmp_path / "out" / filename).read_text(encoding="utf-8") == "descriptor payload"
+
+
+def test_worker_maps_windows_invalid_entry_names_like_the_verifier(tmp_path):
+    from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
+    from sunpack.pipeline.verification.methods._archive_output_match import (
+        archive_files_from_names,
+        coverage_from_native_inventory,
+    )
+
+    worker = _require_worker_or_skip()
+    archive = tmp_path / "windows-names.zip"
+    entries = {
+        "logs/12:30.log": "stream",
+        "a?b*c.txt": "wildcards",
+        "trailing.": "dot",
+        "con.txt": "device",
+        "sub/NUL": "device-dir",
+    }
+    with zipfile.ZipFile(archive, "w") as zf:
+        for name, payload in entries.items():
+            zf.writestr(name, payload)
+    out_dir = tmp_path / "out"
+    payload = {
+        "job_id": "windows-names",
+        "archive_path": str(archive),
+        "output_dir": str(out_dir),
+        "format_hint": "zip",
+    }
+
+    result = subprocess.run(
+        [worker],
+        input=json.dumps(payload, ensure_ascii=False),
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+    )
+    worker_result = _worker_result(result.stdout)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert worker_result["status"] == "ok"
+    expected_on_disk = {
+        "logs/12_30.log": "stream",
+        "a_b_c.txt": "wildcards",
+        "trailing_": "dot",
+        "_con.txt": "device",
+        "sub/_NUL": "device-dir",
+    }
+    written = {
+        entry.name
+        for entry in os.scandir(out_dir)
+    } | {f"logs/{entry.name}" for entry in os.scandir(out_dir / "logs")} | {
+        f"sub/{entry.name}" for entry in os.scandir(out_dir / "sub")
+    }
+    assert set(expected_on_disk) <= written
+    # Mapped names are ordinary Win32 names: plain paths can open them.
+    for relative, content in expected_on_disk.items():
+        assert (out_dir / relative).read_text(encoding="utf-8") == content
+    # No alternate data stream was created on a file named "12".
+    assert not (out_dir / "logs" / "12").exists()
+
+    coverage, _ = coverage_from_native_inventory(
+        archive_files_from_names(list(entries)),
+        collect_output_inventory(str(out_dir)),
+        method="test",
+    )
+    assert coverage.missing_files == 0
+    assert coverage.failed_files == 0
+    assert coverage.matched_files == len(entries)

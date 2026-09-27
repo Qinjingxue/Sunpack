@@ -862,7 +862,7 @@ impl ByteSource for BytesSource {
     }
 }
 
-#[derive(Clone, Eq, PartialEq, Hash)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub(crate) struct FileIdentity {
     pub(crate) path: PathBuf,
     len: u64,

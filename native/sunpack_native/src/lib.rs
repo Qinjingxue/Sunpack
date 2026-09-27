@@ -128,7 +128,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         relations::relations_parse_numbered_volume,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(relations::relations_split_sort_key, m)?)?;
     m.add_function(wrap_pyfunction!(
         relations::relations_size_filter_split_family_keys,
         m

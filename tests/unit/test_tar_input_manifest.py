@@ -136,3 +136,37 @@ def test_tar_manifest_applies_gnu_longname_and_longlink_to_next_member(tmp_path)
     assert manifest.expected_names == [long_name]
     assert manifest.files[0]["linkpath"] == long_link
     assert manifest.files[0]["typeflag"] == "2"
+
+
+def test_truncated_manifest_view_keeps_full_unpacked_size(tmp_path):
+    from types import SimpleNamespace
+
+    from sunpack.pipeline.verification.archive_input_manifest import (
+        archive_input_manifest_for_evidence,
+        configure_archive_input_manifest_cache,
+    )
+
+    path = tmp_path / "large.tar"
+    with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as archive:
+        for index in range(30):
+            info = tarfile.TarInfo(f"item-{index:03d}.bin")
+            info.size = 3
+            archive.addfile(info, io.BytesIO(b"abc"))
+    evidence = SimpleNamespace(
+        archive_input=_input(path),
+        selected_codepage="",
+        password=None,
+        worker_result={},
+        extraction_result=None,
+        output_dir=str(tmp_path / "out"),
+    )
+    configure_archive_input_manifest_cache(evidence, max_items=1000)
+
+    view = archive_input_manifest_for_evidence(evidence, max_items=10)
+
+    assert len(view.files) == 10
+    assert view.entries_truncated is True
+    assert view.file_count == 30
+    assert view.total_unpacked_size == 90
+    full = archive_input_manifest_for_evidence(evidence, max_items=1000)
+    assert full.total_unpacked_size == 90

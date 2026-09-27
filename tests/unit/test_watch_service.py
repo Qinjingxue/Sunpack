@@ -1390,6 +1390,39 @@ def test_watch_add_writes_a_plain_root_and_list_shows_it(tmp_path, monkeypatch):
     assert listed.items == [str(watch_root.resolve())]
 
 
+def test_watch_add_and_remove_resolve_relative_paths_against_request_cwd(tmp_path, monkeypatch):
+    from sunpack.runtime.cli.cli import build_cli_parser
+    from sunpack.runtime.cli.cli_context import CliContext
+    from sunpack.runtime.cli import runtime_state
+
+    roots_path = tmp_path / "sunpack_watch_roots.txt"
+    request_cwd = tmp_path / "client"
+    watch_root = request_cwd / "downloads"
+    watch_root.mkdir(parents=True)
+    server_cwd = tmp_path / "server-runtime-cwd"
+    server_cwd.mkdir()
+    monkeypatch.chdir(server_cwd)
+    monkeypatch.setattr(service_module, "watch_roots_path", lambda: roots_path)
+
+    class FakeHost:
+        watch_enabled = False
+
+    monkeypatch.setattr(runtime_state, "require_runtime_host", lambda: FakeHost())
+    parser = build_cli_parser(CliContext(language="en"))
+    ctx = SimpleNamespace(cwd=str(request_cwd), t=lambda key, **_: key)
+
+    code, result = _await(watch_command._handle_add(parser.parse_args(["watch", "add", "downloads"]), ctx))
+
+    assert code == 0
+    assert result.summary["added"] == [str(watch_root.resolve())]
+
+    code, result = _await(watch_command._handle_remove(parser.parse_args(["watch", "remove", "downloads"]), ctx))
+
+    assert code == 0
+    assert result.summary["removed"] == [str(watch_root.resolve())]
+    assert roots_path.read_text(encoding="utf-8").strip() == ""
+
+
 @pytest.mark.parametrize("deep_detect", [False, True])
 def test_watch_add_accepts_one_output_dir_and_persists_absolute_mapping(tmp_path, monkeypatch, deep_detect):
     from sunpack.runtime.cli.cli import build_cli_parser

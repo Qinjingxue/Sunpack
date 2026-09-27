@@ -10,7 +10,6 @@ from sunpack_native import (
     relations_logical_name as _native_logical_name,
     relations_parse_numbered_volume as _native_parse_numbered_volume,
     relations_resolve_volume_once as _native_resolve_volume_once,
-    relations_split_sort_key as _native_split_sort_key,
 )
 
 from sunpack.core.contracts.filesystem import DirectorySnapshot
@@ -183,16 +182,6 @@ class RelationsGroupBuilder:
     def parse_numbered_volume(self, path: str):
         return _native_parse_numbered_volume(path)
 
-    def split_sort_key(self, path: str) -> tuple[int, int, str]:
-        return tuple(_native_split_sort_key(path))
-
-    def select_first_volume(self, paths: List[str]) -> str:
-        if not paths:
-            return ""
-        parsed = [(path, self.parse_numbered_volume(path)) for path in paths]
-        first = next((path for path, value in parsed if value and int(value["number"]) == 1), None)
-        return first or min(paths, key=self.split_sort_key)
-
     def should_scan_split_siblings(
         self,
         archive: str,
@@ -202,23 +191,6 @@ class RelationsGroupBuilder:
     ) -> bool:
         del is_sfx_stub
         return bool(is_split or self.parse_numbered_volume(archive))
-
-    def find_standard_split_siblings(self, archive: str) -> List[str]:
-        parsed = self.parse_numbered_volume(archive)
-        if not parsed:
-            return []
-        directory = os.path.dirname(os.path.abspath(archive)) or os.getcwd()
-        matches: list[str] = []
-        for row in _native_list_regular_files_in_directory(directory):
-            if not isinstance(row, dict) or not row.get("path"):
-                continue
-            candidate = str(row["path"])
-            other = self.parse_numbered_volume(candidate)
-            if not other:
-                continue
-            if self._same_standard_family(parsed, other):
-                matches.append(candidate)
-        return sorted(dict.fromkeys(matches), key=self.split_sort_key)
 
     def build_split_volume_entries(
         self,

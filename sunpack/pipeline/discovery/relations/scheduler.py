@@ -63,14 +63,8 @@ class RelationsScheduler:
     def logical_name_for_archive(self, filename: str) -> str:
         return self._builder.get_logical_name(filename, is_archive=True)
 
-    def select_first_volume(self, paths: list[str]) -> str:
-        return self._builder.select_first_volume(paths)
-
     def should_scan_split_siblings(self, archive: str, *, is_split: bool = False, is_sfx_stub: bool = False) -> bool:
         return self._builder.should_scan_split_siblings(archive, is_split=is_split, is_sfx_stub=is_sfx_stub)
-
-    def find_standard_split_siblings(self, archive: str) -> list[str]:
-        return self._builder.find_standard_split_siblings(archive)
 
     def parse_numbered_volume(self, path: str):
         return self._builder.parse_numbered_volume(path)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 
 from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_TASK_FAILED, EXIT_USAGE
@@ -97,12 +98,21 @@ async def _handle_start(args, ctx):
     return 0, CliCommandResult(command=COMMAND, inputs={"action": "start"}, summary=summary)
 
 
+def _request_paths(paths, ctx) -> list[str]:
+    # The persistent server's process cwd is its private runtime directory;
+    # relative roots must resolve against the requesting client's cwd.
+    return [
+        path if os.path.isabs(path) else os.path.join(ctx.cwd, path)
+        for path in (str(item) for item in (paths or []))
+    ]
+
+
 async def _handle_add(args, ctx):
     from sunpack.runtime.cli.runtime_state import require_runtime_host
 
     start_requested = bool(getattr(args, "start", False))
     initial_scan_requested = bool(getattr(args, "initial_scan", False))
-    paths = list(args.paths or [])
+    paths = _request_paths(args.paths, ctx)
     output_dir = getattr(args, "output_dir", None)
     deep_detect = getattr(args, "deep_detect", None)
     if output_dir is not None and len(paths) != 1:
@@ -151,7 +161,7 @@ async def _handle_add(args, ctx):
 async def _handle_remove(args, ctx):
     from sunpack.runtime.cli.runtime_state import require_runtime_host
 
-    paths = list(args.paths or [])
+    paths = _request_paths(args.paths, ctx)
     host = require_runtime_host()
     apply_summary = None
     if host.watch_enabled:

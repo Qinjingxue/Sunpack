@@ -31,8 +31,7 @@ CMyComPtr<IInStream> open_stream_for_plan(
     if (plan.uses_ranges()) {
         auto* range_stream = new MultiRangeInStream(plan.ranges);
         stream_opened = range_stream->is_open();
-        CMyComPtr<IInStream> owner(range_stream);
-        return owner.Detach();
+        return CMyComPtr<IInStream>(range_stream);
     }
     return open_archive_stream(archive_path, part_paths, stream_opened);
 }

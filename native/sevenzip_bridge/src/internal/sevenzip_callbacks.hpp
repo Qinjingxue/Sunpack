@@ -612,6 +612,71 @@ namespace sunpack::sevenzip
         return key;
     }
 
+    inline bool is_windows_invalid_name_char(wchar_t value)
+    {
+        return value < 0x20 || value == L'<' || value == L'>' || value == L':' || value == L'"' ||
+               value == L'|' || value == L'?' || value == L'*';
+    }
+
+    // CON/PRN/AUX/NUL/COM1-9/LPT1-9 are reserved with any extension ("con.txt")
+    // and with spaces before the extension ("nul .txt").
+    inline bool is_windows_reserved_device_name(const std::wstring &part)
+    {
+        std::size_t stem = part.find(L'.');
+        if (stem == std::wstring::npos)
+        {
+            stem = part.size();
+        }
+        while (stem > 0 && part[stem - 1] == L' ')
+        {
+            --stem;
+        }
+        if (stem != 3 && stem != 4)
+        {
+            return false;
+        }
+        const auto lower = [&](std::size_t index)
+        {
+            const wchar_t value = part[index];
+            return (value >= L'A' && value <= L'Z') ? static_cast<wchar_t>(value + (L'a' - L'A')) : value;
+        };
+        const wchar_t a = lower(0);
+        const wchar_t b = lower(1);
+        const wchar_t c = lower(2);
+        if (stem == 3)
+        {
+            return (a == L'c' && b == L'o' && c == L'n') || (a == L'p' && b == L'r' && c == L'n') ||
+                   (a == L'a' && b == L'u' && c == L'x') || (a == L'n' && b == L'u' && c == L'l');
+        }
+        const wchar_t digit = part[3];
+        return digit >= L'1' && digit <= L'9' &&
+               ((a == L'c' && b == L'o' && c == L'm') || (a == L'l' && b == L'p' && c == L't'));
+    }
+
+    // Output paths are opened through the \\?\ prefix, which disables Win32 name
+    // normalization: ':' would create an alternate data stream, trailing dots or
+    // spaces and device names would create entries ordinary tools cannot remove,
+    // and the remaining characters fail the item.  Mirror 7-Zip's extractor:
+    // replace them with '_' and prefix reserved device names.
+    inline void make_windows_safe_path_part(std::wstring &part)
+    {
+        for (auto &value : part)
+        {
+            if (is_windows_invalid_name_char(value))
+            {
+                value = L'_';
+            }
+        }
+        for (std::size_t index = part.size(); index > 0 && (part[index - 1] == L'.' || part[index - 1] == L' '); --index)
+        {
+            part[index - 1] = L'_';
+        }
+        if (is_windows_reserved_device_name(part))
+        {
+            part.insert(part.begin(), L'_');
+        }
+    }
+
     inline std::optional<std::filesystem::path> safe_relative_item_path(const std::wstring &raw_name)
     {
 
@@ -634,7 +699,7 @@ namespace sunpack::sevenzip
         for (const auto &part : candidate)
         {
 
-            const auto text = part.wstring();
+            auto text = part.wstring();
 
             if (text.empty() || text == L"." || text == L"/" || text == L"\\")
             {
@@ -648,7 +713,9 @@ namespace sunpack::sevenzip
                 return std::nullopt;
             }
 
-            normalized /= part;
+            make_windows_safe_path_part(text);
+
+            normalized /= text;
         }
 
         if (normalized.empty())
