@@ -183,6 +183,7 @@ def test_promotion_drains_archive_session_borrow_before_publishing_gate(tmp_path
     class FakeArchiveSession:
         def __init__(self, archive_path):
             self.archive_path = archive_path
+            self.generation_token = "unchanged-test-file-generation"
             self.closed = False
 
         def close(self):

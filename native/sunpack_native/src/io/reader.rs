@@ -2784,7 +2784,10 @@ mod tests {
         assert_eq!(first.read_all().unwrap(), b"old!");
         std::fs::rename(&path, &old_path).unwrap();
         std::fs::write(&path, b"new!").unwrap();
-        let replacement = File::options().write(true).open(&path).unwrap();
+        let replacement = TrackedFile::open_with(&path, "generation_test_writer", |options| {
+            options.write(true);
+        })
+        .unwrap();
         restore_generation_test_times(&replacement, &metadata);
         drop(replacement);
         let second = ManagedReader::open(&path).unwrap();
@@ -2815,7 +2818,10 @@ mod tests {
         let first = ManagedReader::open(&path).unwrap();
         assert_eq!(first.read_all().unwrap(), b"old!");
         std::fs::write(&path, b"new!").unwrap();
-        let file = File::options().write(true).open(&path).unwrap();
+        let file = TrackedFile::open_with(&path, "generation_test_writer", |options| {
+            options.write(true);
+        })
+        .unwrap();
         restore_generation_test_times(&file, &metadata);
         drop(file);
         let second = ManagedReader::open(&path).unwrap();
