@@ -353,19 +353,23 @@ std::string read_input_line() {
     return std::string(buffer.data(), read);
 }
 
-bool request(const InstallContext& context, const std::vector<std::wstring>& arguments, bool shutdown, int& exit_code,
-             const std::wstring& request_cwd) {
+// Only NotDelivered may be retried: once the whole request reached the runtime
+// it may already be executing, and resending it could run the command twice.
+enum class RequestOutcome { NotDelivered, Completed, DeliveryUncertain };
+
+RequestOutcome request(const InstallContext& context, const std::vector<std::wstring>& arguments, bool shutdown,
+                       int& exit_code, const std::wstring& request_cwd) {
     std::wstring pipe_name;
     std::array<unsigned char, 32> token{};
     std::string runtime_build_id;
-    if (!parse_state(context, pipe_name, token, runtime_build_id)) return false;
+    if (!parse_state(context, pipe_name, token, runtime_build_id)) return RequestOutcome::NotDelivered;
     HANDLE pipe = connect_pipe(pipe_name);
-    if (pipe == INVALID_HANDLE_VALUE) return false;
+    if (pipe == INVALID_HANDLE_VALUE) return RequestOutcome::NotDelivered;
 
     const std::string cwd = utf8(request_cwd);
     if (cwd.size() > kMaxFieldBytes || arguments.size() > 4096) {
         CloseHandle(pipe);
-        return false;
+        return RequestOutcome::NotDelivered;
     }
     std::string wire(kRequestMagic, 4);
     wire.append(runtime_build_id);
@@ -382,25 +386,25 @@ bool request(const InstallContext& context, const std::vector<std::wstring>& arg
         const std::string encoded = utf8(argument);
         if (encoded.size() > kMaxFieldBytes) {
             CloseHandle(pipe);
-            return false;
+            return RequestOutcome::NotDelivered;
         }
         append_u32(wire, static_cast<std::uint32_t>(encoded.size()));
         wire.append(encoded);
     }
     if (!write_all(pipe, wire.data(), wire.size())) {
         CloseHandle(pipe);
-        return false;
+        return RequestOutcome::NotDelivered;
     }
     std::array<char, 4> magic{};
     if (!read_all(pipe, magic.data(), magic.size()) || memcmp(magic.data(), kStreamMagic, 4) != 0) {
         CloseHandle(pipe);
-        return false;
+        return RequestOutcome::DeliveryUncertain;
     }
     std::array<char, 16> build_id{};
     if (!read_all(pipe, build_id.data(), build_id.size()) ||
         memcmp(build_id.data(), runtime_build_id.data(), build_id.size()) != 0) {
         CloseHandle(pipe);
-        return false;
+        return RequestOutcome::DeliveryUncertain;
     }
     while (true) {
         std::array<char, 5> header{};
@@ -414,7 +418,7 @@ bool request(const InstallContext& context, const std::vector<std::wstring>& arg
             if (size != 4) break;
             exit_code = static_cast<std::int32_t>(read_u32(payload.data()));
             CloseHandle(pipe);
-            return true;
+            return RequestOutcome::Completed;
         }
         if (kind == 1) write_stream(STD_OUTPUT_HANDLE, payload);
         else if (kind == 2) write_stream(STD_ERROR_HANDLE, payload);
@@ -427,7 +431,7 @@ bool request(const InstallContext& context, const std::vector<std::wstring>& arg
         }
     }
     CloseHandle(pipe);
-    return false;
+    return RequestOutcome::DeliveryUncertain;
 }
 
 std::wstring quote_argument(const std::wstring& value) {
@@ -507,7 +511,8 @@ void write_stream(DWORD handle_id, const std::string& text) {
 
 // Localized strings printed directly by this launcher. Keep in sync with the
 // sunpack/core/i18n/catalog.py keys cli.press_enter, cli.persistent_start_timeout,
-// cli.native_runtime_launch_failed, and cli.native_runtime_exited.
+// cli.native_runtime_launch_failed, cli.native_runtime_exited, and
+// cli.persistent_delivery_uncertain.
 constexpr wchar_t kPressEnterEn[] = L"Press Enter to continue...";
 constexpr wchar_t kPressEnterZh[] = L"按回车键继续...";
 constexpr wchar_t kPersistentTimeoutEn[] = L"SunPack persistent process did not start in time.";
@@ -516,6 +521,8 @@ constexpr wchar_t kRuntimeLaunchFailedEn[] = L"sunpack runtime failed to launch 
 constexpr wchar_t kRuntimeLaunchFailedZh[] = L"sunpack 运行时启动失败（Win32 错误 {error}）。";
 constexpr wchar_t kRuntimeExitedEn[] = L"sunpack runtime exited before becoming ready, exit code {code}.";
 constexpr wchar_t kRuntimeExitedZh[] = L"sunpack 运行时尚未就绪便已退出，退出码为 {code}。";
+constexpr wchar_t kDeliveryUncertainEn[] = L"SunPack persistent process disconnected after the command was submitted; it was not retried to avoid running it twice.";
+constexpr wchar_t kDeliveryUncertainZh[] = L"SunPack 持久进程在命令提交后断开连接；为避免重复执行，未重试该命令。";
 
 std::string localized(const std::string& language, const wchar_t* english, const wchar_t* chinese) {
     return utf8(language == "zh" ? chinese : english);
@@ -557,22 +564,22 @@ int wmain(int argc, wchar_t** argv) {
         request_arguments.emplace_back(L"--no-pause");
     }
     int code = 1;
-    bool ok = request(context, request_arguments, shutdown, code, invocation_cwd);
-    if (!ok && !shutdown) {
+    RequestOutcome outcome = request(context, request_arguments, shutdown, code, invocation_cwd);
+    if (outcome == RequestOutcome::NotDelivered && !shutdown) {
         const std::string language = cli_language_from_config(launcher_cwd);
         DWORD spawn_error = ERROR_SUCCESS;
         HANDLE runtime_process = nullptr;
         DWORD runtime_exit_code = STILL_ACTIVE;
         bool runtime_failed = false;
         if (spawn_runtime(context, {L"--persistent-server"}, true, nullptr, &spawn_error, &runtime_process)) {
-            for (int attempt = 0; attempt < 400 && !ok; ++attempt) {
+            for (int attempt = 0; attempt < 400 && outcome == RequestOutcome::NotDelivered; ++attempt) {
                 if (runtime_process != nullptr && WaitForSingleObject(runtime_process, 0) == WAIT_OBJECT_0) {
                     GetExitCodeProcess(runtime_process, &runtime_exit_code);
                     runtime_failed = true;
                     break;
                 }
                 Sleep(25);
-                ok = request(context, request_arguments, false, code, invocation_cwd);
+                outcome = request(context, request_arguments, false, code, invocation_cwd);
             }
             if (runtime_process != nullptr) CloseHandle(runtime_process);
         } else {
@@ -598,13 +605,16 @@ int wmain(int argc, wchar_t** argv) {
             );
         }
     }
-    if (!ok && shutdown) code = 0;
+    const bool ok = outcome == RequestOutcome::Completed;
+    if (!ok) code = shutdown ? 0 : 1;
     std::string language;
     if (pause || (!ok && !shutdown)) {
         language = cli_language_from_config(launcher_cwd);
     }
-    if (!ok && !shutdown) {
+    if (outcome == RequestOutcome::NotDelivered && !shutdown) {
         write_stream(STD_ERROR_HANDLE, localized(language, kPersistentTimeoutEn, kPersistentTimeoutZh) + "\n");
+    } else if (outcome == RequestOutcome::DeliveryUncertain && !shutdown) {
+        write_stream(STD_ERROR_HANDLE, localized(language, kDeliveryUncertainEn, kDeliveryUncertainZh) + "\n");
     }
     if (pause && GetFileType(GetStdHandle(STD_INPUT_HANDLE)) == FILE_TYPE_CHAR) {
         write_stream(STD_OUTPUT_HANDLE, localized(language, kPressEnterEn, kPressEnterZh));

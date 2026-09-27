@@ -15,6 +15,7 @@ LAUNCHER_LITERALS = {
     "cli.persistent_start_timeout": ("kPersistentTimeoutEn", "kPersistentTimeoutZh"),
     "cli.native_runtime_launch_failed": ("kRuntimeLaunchFailedEn", "kRuntimeLaunchFailedZh"),
     "cli.native_runtime_exited": ("kRuntimeExitedEn", "kRuntimeExitedZh"),
+    "cli.persistent_delivery_uncertain": ("kDeliveryUncertainEn", "kDeliveryUncertainZh"),
 }
 
 

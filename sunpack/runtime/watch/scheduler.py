@@ -236,6 +236,8 @@ class WatchScheduler:
         self._cache_cleanup_deadline: float | None = None
         self._runtime_cache_gate = asyncio.Lock()
         self._external_activity_gate_held = False
+        self._external_activity_gate_acquiring = False
+        self._external_activity_requested = False
         if pipeline_engine is None:
             raise ValueError("WatchScheduler requires a PipelineEngine")
         self.pipeline_engine = pipeline_engine
@@ -884,11 +886,25 @@ class WatchScheduler:
         )
 
     async def set_external_activity(self, active: bool) -> None:
-        """Serialize foreground runtime work with idle maintenance."""
+        """Serialize foreground runtime work with idle maintenance.
+
+        Idempotent per state: the latest request wins, so a release that
+        arrives while an acquire is still waiting leaves the gate free.
+        """
+        self._external_activity_requested = bool(active)
         if active:
-            await self._runtime_cache_gate.acquire()
-            self._external_activity_gate_held = True
             self._reset_idle_cache_cleanup()
+            if self._external_activity_gate_held or self._external_activity_gate_acquiring:
+                return
+            self._external_activity_gate_acquiring = True
+            try:
+                await self._runtime_cache_gate.acquire()
+            finally:
+                self._external_activity_gate_acquiring = False
+            if self._external_activity_requested:
+                self._external_activity_gate_held = True
+            else:
+                self._runtime_cache_gate.release()
             return
         try:
             self._arm_idle_cache_cleanup()
@@ -905,9 +921,11 @@ class WatchScheduler:
                 return
             if self._pending or self._inflight_requests:
                 return
-        if self._external_activity_gate_held:
+        if self._external_activity_requested:
             return
         async with self._runtime_cache_gate:
+            if self._external_activity_requested:
+                return
             now = time.monotonic()
             with self._lock:
                 if self._cache_cleanup_deadline is None or now < self._cache_cleanup_deadline:

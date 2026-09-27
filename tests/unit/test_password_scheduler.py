@@ -463,3 +463,26 @@ def test_verifier_chain_prioritizes_fast_verifier_from_archive_input():
     assert outcome.status == "no_match"
     assert rar_fast.batches == [["bad"]]
     assert zip_fast.batches == []
+
+
+def test_password_scheduler_reports_backend_failure_instead_of_exhausted(tmp_path):
+    archive = tmp_path / "sample.7z"
+    archive.write_bytes(b"archive")
+    verifier = StaticVerifier(PasswordBatchVerification(
+        ok=False,
+        status="backend_unavailable",
+        attempts=0,
+        error_text="backend missing",
+    ))
+    scheduler = PasswordScheduler(verifier, default_batch_size=1)
+
+    result = scheduler.run(PasswordJob(
+        archive_path=str(archive),
+        candidates=PasswordCandidatePipeline.from_values(["one", "two", "three"]),
+    ))
+
+    assert result.status == PasswordSearchStatus.BACKEND_UNAVAILABLE
+    assert result.exhausted is False
+    assert verifier.batches == [["one"]]
+    key = build_archive_fingerprint(str(archive)).key
+    assert not scheduler.cache.has_negative(key, "one")

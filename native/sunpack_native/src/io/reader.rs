@@ -460,29 +460,37 @@ impl ManagedReader {
         offset: u64,
         read_len: usize,
     ) -> io::Result<Vec<CachedSlice>> {
+        // Check and reserve the budget in one critical section so concurrent
+        // requests sharing this reader cannot all pass the check and overshoot.
+        let reserved = read_len as u64;
         {
-            let inner = self.lock_inner()?;
+            let mut inner = self.lock_inner()?;
             if self
                 .state
                 .config
                 .max_read_bytes
-                .is_some_and(|limit| inner.stats.read_bytes + read_len as u64 > limit)
+                .is_some_and(|limit| inner.stats.read_bytes.saturating_add(reserved) > limit)
             {
                 return Err(io::Error::other("archive analysis read budget exceeded"));
             }
+            inner.stats.read_bytes += reserved;
         }
 
-        let _permit = self.state.gate.acquire()?;
-        let slices = self
-            .source
-            .read_slices_at(offset, read_len)
-            .map_err(|error| {
+        let result = self.state.gate.acquire().and_then(|_permit| {
+            self.source.read_slices_at(offset, read_len).map_err(|error| {
                 ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
                     .into_io_error()
-            })?;
-        let count = slices.iter().map(|slice| slice.len()).sum::<usize>();
-        self.lock_inner()?.stats.read_bytes += count as u64;
-        Ok(slices)
+            })
+        });
+        let count = result
+            .as_ref()
+            .map(|slices| slices.iter().map(|slice| slice.len()).sum::<usize>() as u64)
+            .unwrap_or(0);
+        if count < reserved {
+            let mut inner = self.lock_inner()?;
+            inner.stats.read_bytes = inner.stats.read_bytes.saturating_sub(reserved - count);
+        }
+        result
     }
 
     /// Warms every fixed block touched by the supplied ranges. Overlapping
@@ -1012,6 +1020,11 @@ impl ByteSource for FileSource {
             if from < to && from < block.len() {
                 output.extend_from_slice(&block[from..to.min(block.len())]);
             }
+            // A short block is the physical EOF observed now (the file shrank
+            // after open). Later blocks must not be appended after it.
+            if block.len() < BLOCK_SIZE {
+                break;
+            }
         }
         manager()
             .metrics
@@ -1057,6 +1070,9 @@ impl ByteSource for FileSource {
                 buffer[written..written + chunk.len()].copy_from_slice(chunk);
                 written += chunk.len();
             }
+            if block.len() < BLOCK_SIZE {
+                break;
+            }
         }
         manager()
             .metrics
@@ -1080,19 +1096,25 @@ impl ByteSource for FileSource {
         let last = (offset + len as u64 - 1) / BLOCK_SIZE as u64;
         let request_end = offset + len as u64;
         let mut slices = Vec::with_capacity((last - first + 1) as usize);
+        let mut produced = 0usize;
         for index in first..=last {
             let block = manager().read_block(self, index)?;
             let block_start = index * BLOCK_SIZE as u64;
             let start = offset.saturating_sub(block_start) as usize;
             let end = (request_end.min(block_start + block.len() as u64) - block_start) as usize;
+            let short = block.len() < BLOCK_SIZE;
             if start < end && start < block.len() {
+                produced += end - start;
                 slices.push(CachedSlice::from_shared(block, start, end));
+            }
+            if short {
+                break;
             }
         }
         manager()
             .metrics
             .logical_bytes
-            .fetch_add(len as u64, Ordering::Relaxed);
+            .fetch_add(produced as u64, Ordering::Relaxed);
         Ok(slices)
     }
 
@@ -1209,11 +1231,14 @@ impl ByteSource for MultiVolumeSource {
             }
             let logical_start = offset.max(volume.start);
             let logical_end = end.min(volume.end);
-            let chunk = volume.source.read_at(
-                logical_start - volume.start,
-                (logical_end - logical_start) as usize,
-            )?;
+            let chunk_len = (logical_end - logical_start) as usize;
+            let chunk = volume.source.read_at(logical_start - volume.start, chunk_len)?;
             output.extend_from_slice(&chunk);
+            // A volume that shrank after open ends the logical stream here;
+            // appending the next volume would shift every later byte.
+            if chunk.len() != chunk_len {
+                break;
+            }
         }
         Ok(output)
     }
@@ -1257,10 +1282,13 @@ impl ByteSource for MultiVolumeSource {
             }
             let logical_start = offset.max(volume.start);
             let logical_end = end.min(volume.end);
-            slices.extend(volume.source.read_slices_at(
-                logical_start - volume.start,
-                (logical_end - logical_start) as usize,
-            )?);
+            let chunk_len = (logical_end - logical_start) as usize;
+            let volume_slices = volume.source.read_slices_at(logical_start - volume.start, chunk_len)?;
+            let produced = volume_slices.iter().map(|slice| slice.len()).sum::<usize>();
+            slices.extend(volume_slices);
+            if produced != chunk_len {
+                break;
+            }
         }
         Ok(slices)
     }
@@ -1297,11 +1325,14 @@ impl ByteSource for MultiVolumeSource {
             }
             let logical_start = offset.max(volume.start);
             let logical_end = end.min(volume.end);
-            let chunk = volume.source.read_direct_at(
-                logical_start - volume.start,
-                (logical_end - logical_start) as usize,
-            )?;
+            let chunk_len = (logical_end - logical_start) as usize;
+            let chunk = volume.source.read_direct_at(logical_start - volume.start, chunk_len)?;
             output.extend_from_slice(&chunk);
+            // A volume that shrank after open ends the logical stream here;
+            // appending the next volume would shift every later byte.
+            if chunk.len() != chunk_len {
+                break;
+            }
         }
         Ok(output)
     }
@@ -2518,6 +2549,38 @@ mod tests {
         let mut data = [0u8; 3];
         cursor.read_exact(&mut data).unwrap();
         assert_eq!(&data, b"cde");
+        let _ = std::fs::remove_file(first);
+        let _ = std::fs::remove_file(second);
+    }
+
+    #[test]
+    fn multi_volume_stops_at_volume_truncated_after_open() {
+        let first = temp_file("managed_reader_shrunk_part1", b"abcdef");
+        let second = temp_file("managed_reader_shrunk_part2", b"ghi");
+        let paths = vec![
+            first.to_string_lossy().into_owned(),
+            second.to_string_lossy().into_owned(),
+        ];
+        let reader = ManagedReader::open_volumes(&paths, ReaderConfig::default()).unwrap();
+        TrackedFile::open_with(&first, "shrunk_volume_test_writer", |options| {
+            options.write(true);
+        })
+        .unwrap()
+        .set_len(3)
+        .unwrap();
+
+        // Bytes of the next volume must never slide into the missing range.
+        assert_eq!(reader.read_at(1, 7).unwrap(), b"bc");
+        let mut buffer = [0u8; 7];
+        assert_eq!(reader.read_direct_into_at(1, &mut buffer).unwrap(), 2);
+        assert_eq!(&buffer[..2], b"bc");
+        let mut cursor = reader.cursor();
+        cursor.seek(SeekFrom::Start(1)).unwrap();
+        let mut exact = [0u8; 7];
+        assert_eq!(
+            cursor.read_exact(&mut exact).unwrap_err().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
         let _ = std::fs::remove_file(first);
         let _ = std::fs::remove_file(second);
     }

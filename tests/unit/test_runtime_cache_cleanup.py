@@ -307,3 +307,44 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
         assert stats["relation_probe_cache"] == {"successes": 0, "negative": 0}
 
     asyncio.run(scenario())
+
+
+def test_external_activity_release_during_pending_acquire_leaves_gate_free(tmp_path):
+    async def scenario():
+        engine = _BlockingCleanupEngine()
+        watcher = WatchScheduler(
+            {
+                "watch": {
+                    "clipboard_monitor_enabled": False,
+                    "runtime_cache_cleanup_enabled": True,
+                    "runtime_cache_cleanup_idle_seconds": 10,
+                }
+            },
+            [str(tmp_path)],
+            out_dir=str(tmp_path / "out"),
+            state_path=str(tmp_path / "state.json"),
+            cold_start_seconds=0,
+            initial_scan=False,
+            pipeline_engine=engine,
+        )
+
+        watcher._cache_cleanup_deadline = 0
+        cleanup = asyncio.create_task(watcher._maybe_clear_idle_caches())
+        await engine.cleanup_started.wait()
+
+        foreground = asyncio.create_task(watcher.set_external_activity(True))
+        await asyncio.sleep(0)
+        # A duplicate request while the first acquire waits must not queue a
+        # second acquire that would hold the gate forever.
+        duplicate = asyncio.create_task(watcher.set_external_activity(True))
+        await asyncio.sleep(0)
+        assert duplicate.done()
+        await watcher.set_external_activity(False)
+
+        engine.release_cleanup.set()
+        await cleanup
+        await foreground
+        assert not watcher._runtime_cache_gate.locked()
+        assert watcher._external_activity_gate_held is False
+
+    asyncio.run(scenario())

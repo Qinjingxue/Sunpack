@@ -37,6 +37,10 @@ class RuntimeHost:
         self._watch_generation = 0
         self._last_watch_error = ""
         self._foreground_requests = 0
+        # Set before the first foreground request awaits its scheduler gate and
+        # cleared when the last one finishes, so a scheduler attached in
+        # between (watch start/reload/root change) inherits the gate.
+        self._foreground_gate_requested = False
         self._configured_process_mode = "normal"
         self._cli_process_mode_override: str | None = None
         self._process_mode = "normal"
@@ -103,6 +107,7 @@ class RuntimeHost:
                 tray_factory=tray_factory,
                 toast_manager_factory=toast_manager_factory,
                 config_applied_callback=self._watch_config_applied,
+                external_activity_active=lambda: self._foreground_gate_requested,
             )
             task = asyncio.create_task(
                 service.run(
@@ -245,6 +250,8 @@ class RuntimeHost:
     async def foreground_started(self) -> None:
         async with self._foreground_state_lock:
             first = self._foreground_requests == 0
+            if first:
+                self._foreground_gate_requested = True
             if first and self.watch_enabled:
                 service = self._watch_service
                 scheduler = service.scheduler if service is not None else None
@@ -256,6 +263,8 @@ class RuntimeHost:
     async def foreground_finished(self) -> None:
         async with self._foreground_state_lock:
             self._foreground_requests = max(0, self._foreground_requests - 1)
+            if self._foreground_requests == 0:
+                self._foreground_gate_requested = False
             last = self._foreground_requests == 0 and self.watch_enabled
             if last:
                 service = self._watch_service

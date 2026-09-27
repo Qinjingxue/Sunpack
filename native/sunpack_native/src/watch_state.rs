@@ -283,7 +283,6 @@ pub(crate) fn write_watch_state_snapshot_native(
     watch_cursors: &Bound<'_, PyDict>,
     pending_work: &Bound<'_, PyDict>,
     entries: &Bound<'_, PyDict>,
-    groups: &Bound<'_, PyDict>,
 ) -> PyResult<u64> {
     let path = PathBuf::from(path);
     let cursors = extract_json(watch_cursors.as_any())?;
@@ -318,7 +317,6 @@ pub(crate) fn write_watch_state_snapshot_native(
 
     write_record_map(py, &mut writer, b"\"pending_work\"", pending_work)?;
     write_record_map(py, &mut writer, b"\"entries\"", entries)?;
-    write_record_map(py, &mut writer, b"\"groups\"", groups)?;
 
     py.detach(|| -> io::Result<u64> {
         writer.write_all(b"}")?;

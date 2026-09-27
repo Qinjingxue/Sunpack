@@ -341,3 +341,38 @@ class ExtractionExecutionTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ExtractionRetryDelayTests(unittest.TestCase):
+    def test_retry_delay_is_applied_by_driver_not_state_machine(self):
+        import sunpack.pipeline.extraction.internal.workflow.single_archive_extractor as module
+
+        with tempfile.TemporaryDirectory() as tmp:
+            archive_path = Path(tmp) / "sample.zip"
+            archive_path.write_bytes(b"zip")
+            out_dir = Path(tmp) / "sample"
+
+            extractor = ExtractionScheduler(max_retries=2)
+            extractor.password_resolver = FakePasswordResolver()
+            extractor.metadata_scanner = FakeMetadataScanner()
+            attempts = iter([
+                SimpleNamespace(returncode=8, stdout="", stderr="write error"),
+                SimpleNamespace(returncode=0, stdout="", stderr=""),
+            ])
+            calls = []
+            extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
+                calls.append(kwargs) or next(attempts)
+            )
+            extractor.retry_policy.backoff = lambda _retry_count: 0.25
+            sleeps = []
+            original_sleep = module.time.sleep
+            module.time.sleep = sleeps.append
+            try:
+                result = extractor.extract(make_archive_task(archive_path), str(out_dir))
+            finally:
+                module.time.sleep = original_sleep
+
+            self.assertTrue(result.success)
+            self.assertEqual(sleeps, [0.25])
+            self.assertEqual(len(calls), 2)
+            self.assertTrue(all("retry_delay_seconds" not in call for call in calls))

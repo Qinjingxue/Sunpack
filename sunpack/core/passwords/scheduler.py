@@ -27,6 +27,16 @@ class PasswordSearchStatus(str, Enum):
     STOPPED = "stopped"
 
 
+# Verdicts about the archive/backend rather than the tried passwords. Trying
+# more candidates cannot change them, and they must not end as EXHAUSTED.
+_ARCHIVE_LEVEL_STATUSES = frozenset({
+    PasswordSearchStatus.DAMAGED,
+    PasswordSearchStatus.UNSUPPORTED,
+    PasswordSearchStatus.BACKEND_UNAVAILABLE,
+    PasswordSearchStatus.NEEDS_VOLUME_OR_TAIL_DAMAGED,
+})
+
+
 @dataclass(frozen=True)
 class PasswordSearchResult:
     password: str | None
@@ -134,7 +144,11 @@ class PasswordScheduler:
                 attempts = outcome.attempts
                 last_result = outcome.test_result
                 last_error = outcome.error_text
-                if outcome.password is not None or outcome.stopped_reason:
+                if (
+                    outcome.password is not None
+                    or outcome.stopped_reason
+                    or outcome.status in _ARCHIVE_LEVEL_STATUSES
+                ):
                     self._emit_finished(job, outcome, started_at, candidates_seen, skipped)
                     return outcome
                 batch = []
@@ -144,7 +158,11 @@ class PasswordScheduler:
             attempts = outcome.attempts
             last_result = outcome.test_result
             last_error = outcome.error_text
-            if outcome.password is not None or outcome.stopped_reason:
+            if (
+                outcome.password is not None
+                or outcome.stopped_reason
+                or outcome.status in _ARCHIVE_LEVEL_STATUSES
+            ):
                 self._emit_finished(job, outcome, started_at, candidates_seen, skipped)
                 return outcome
 

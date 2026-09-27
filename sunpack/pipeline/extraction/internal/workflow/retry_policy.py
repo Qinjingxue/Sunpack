@@ -1,5 +1,3 @@
-import time
-
 from sunpack.pipeline.extraction.internal.workflow.errors import should_retry_extract_failure
 from sunpack.core.i18n import I18nContext
 
@@ -18,8 +16,13 @@ class ExtractRetryPolicy:
             is_split_archive=is_split_archive,
         )
 
-    def backoff(self, retry_count: int) -> None:
-        time.sleep(min(2.0, 0.5 * (2 ** max(0, retry_count - 1))))
+    def backoff(self, retry_count: int) -> float:
+        """Return the delay before the next attempt.
+
+        The extraction driver applies it outside the broker slot, so a retry
+        delay never blocks a worker thread or delays cancellation.
+        """
+        return min(2.0, 0.5 * (2 ** max(0, retry_count - 1)))
 
     def append_retry_count(self, error_msg: str, retry_count: int, i18n: I18nContext | None = None) -> str:
         if retry_count <= 0:

@@ -358,3 +358,51 @@ def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_p
 
     asyncio.run(run())
     assert managers[0]["update_interval_ms"] == 123
+
+
+def test_runtime_host_hands_foreground_activity_to_later_watch_services(monkeypatch):
+    import sunpack.runtime.cli.runtime_host as runtime_host_module
+
+    services = []
+
+    class FakeService:
+        def __init__(self, *, external_activity_active=None, **_kwargs):
+            services.append(self)
+            self.external_activity_active = external_activity_active
+            self.scheduler = None
+            self._stop = asyncio.Event()
+            self._ready = asyncio.Event()
+
+        async def run(self, *, initial_scan=False, initial_scan_roots=None):
+            self._ready.set()
+            await self._stop.wait()
+            return 0
+
+        async def wait_ready(self):
+            await self._ready.wait()
+
+        def request_stop(self):
+            self._stop.set()
+
+    async def shared_engine(_config):
+        return SimpleNamespace()
+
+    async def configured_mode(self, _config):
+        return None
+
+    monkeypatch.setattr(runtime_host_module, "load_config", lambda: {})
+    monkeypatch.setattr(runtime_host_module, "shared_pipeline_engine", shared_engine)
+    monkeypatch.setattr(runtime_host_module, "WatchService", FakeService)
+    monkeypatch.setattr(RuntimeHost, "_set_configured_process_mode", configured_mode)
+
+    async def scenario():
+        host = RuntimeHost()
+        await host.foreground_started()
+        await host.start_watch(tray_enabled=False)
+        assert services[-1].external_activity_active() is True
+
+        await host.foreground_finished()
+        assert services[-1].external_activity_active() is False
+        await host.stop_watch()
+
+    asyncio.run(scenario())

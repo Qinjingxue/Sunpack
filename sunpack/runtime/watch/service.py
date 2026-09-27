@@ -399,6 +399,7 @@ class WatchService:
         tray_factory=None,
         toast_manager_factory=None,
         config_applied_callback=None,
+        external_activity_active=None,
     ):
         if engine_factory is None and pipeline_engine is None:
             raise ValueError("WatchService requires an engine_factory.")
@@ -407,6 +408,9 @@ class WatchService:
         self.tray_factory = tray_factory
         self.toast_manager_factory = toast_manager_factory
         self.config_applied_callback = config_applied_callback
+        # Foreground activity outlives any one scheduler: every scheduler built
+        # by a reload/root change must inherit the host's current gate state.
+        self.external_activity_active = external_activity_active
         self.config = load_config()
         self.service_config = service_config_from(self.config)
         self.state_dir = service_state_dir(self.config)
@@ -717,6 +721,8 @@ class WatchService:
         self.pipeline_engine = pipeline_engine
         self.scheduler = scheduler
         self.toast_coordinator = toast_coordinator
+        if self.external_activity_active is not None and self.external_activity_active():
+            await scheduler.set_external_activity(True)
         self.log.write(
             "scheduler_attached",
             roots=roots,

@@ -1681,3 +1681,56 @@ def test_watch_root_edits_preserve_hash_comments(tmp_path, monkeypatch):
     assert "# Example: C:\\Downloads | D:\\Extracted" in after_remove
     assert str(first.resolve()) not in after_remove
     assert str(second.resolve()) in after_remove
+
+
+@pytest.mark.parametrize("foreground_active", [True, False])
+def test_watch_service_new_scheduler_inherits_foreground_activity(tmp_path, monkeypatch, foreground_active):
+    monkeypatch.setattr(
+        service_module,
+        "load_config",
+        lambda: {
+            "watch": {
+                "state_dir": str(tmp_path / "state"),
+                "roots": [str(tmp_path)],
+                "tray_enabled": False,
+                "clipboard_monitor_enabled": False,
+            },
+        },
+    )
+    monkeypatch.setattr(service_module, "_read_watch_root_entries", lambda *_args, **_kwargs: [service_module.WatchRootEntry(str(tmp_path), str(tmp_path))])
+    activity = []
+
+    class Engine:
+        async def __aenter__(self):
+            return self
+
+        async def aclose(self, graceful=True):
+            pass
+
+    class Scheduler:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        async def start(self):
+            pass
+
+        async def stop(self):
+            pass
+
+        async def set_external_activity(self, active):
+            activity.append((self, active))
+
+    monkeypatch.setattr(service_module, "WatchScheduler", Scheduler)
+    service = WatchService(
+        engine_factory=lambda _config: Engine(),
+        external_activity_active=lambda: foreground_active,
+    )
+
+    # A reload replaces the scheduler; the replacement must be gated too.
+    _await(service._start_scheduler())
+    first = service.scheduler
+    _await(service._start_scheduler())
+    second = service.scheduler
+
+    expected = [(first, True), (second, True)] if foreground_active else []
+    assert activity == expected

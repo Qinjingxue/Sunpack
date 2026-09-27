@@ -318,9 +318,6 @@ class WatchStateStore:
                         payload.get("entries"),
                         WatchStateEntry,
                     )
-                    # Version 17 snapshots may still contain the retired
-                    # Watch-owned split-group cache. Pipeline discovery is now
-                    # authoritative, so that legacy field is intentionally ignored.
 
             if incompatible:
                 self._discard_incompatible_state_locked()
@@ -545,7 +542,6 @@ class WatchStateStore:
                 view.watch_cursors,
                 view.pending_work,
                 view.entries,
-                {},
             )
             os.replace(temp_path, self.path)
             _sync_file_path(self.path)
@@ -752,15 +748,6 @@ class WatchStateStore:
             self._state_lock.acquire()
         self._raise_persistence_fault_locked()
 
-    def _commit_operations_concurrent(
-        self,
-        operations: list[dict[str, Any]],
-        *,
-        durable: bool,
-    ) -> None:
-        with self._state_lock:
-            self._commit_operations_locked(operations, durable=durable)
-
     def _update_compaction_due_locked(self) -> None:
         self._compaction_due = (
             self._journal_records >= self._compact_records
@@ -824,10 +811,6 @@ class WatchStateStore:
             }
             return action, "", "", normalized
         collection = str(operation.get("collection") or "")
-        if collection == "groups":
-            # Replay and discard legacy group records so existing v17 WALs
-            # remain readable after Watch stops owning archive membership.
-            return "legacy_group", "", "", None
         record_types = {
             "pending_work": WatchPendingWork,
             "entries": WatchStateEntry,
@@ -852,8 +835,6 @@ class WatchStateStore:
 
     def _apply_decoded_operation_locked(self, operation) -> None:
         action, collection, key, value = operation
-        if action == "legacy_group":
-            return
         if action == "set_metadata":
             self.password_generation, self.password_source_signature = value
             return
@@ -1182,19 +1163,6 @@ class WatchStateStore:
         with self._state_lock:
             value = self.watch_cursors.get(str(volume_key).lower())
             return dict(value) if value is not None else None
-
-    def record_watch_cursors(self, cursors: dict[str, dict[str, int]]) -> None:
-        normalized = {
-            str(key).lower(): {
-                "journal_id": int(value.get("journal_id", 0) or 0),
-                "next_usn": int(value.get("next_usn", 0) or 0),
-            }
-            for key, value in cursors.items()
-            if isinstance(value, dict)
-        }
-        self._commit_operations_concurrent([
-            {"op": "set_watch_cursors", "value": normalized},
-        ], durable=True)
 
     def latest_entry_for_path(self, path: str) -> WatchStateEntry | None:
         with self._state_lock:
