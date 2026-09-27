@@ -1019,21 +1019,48 @@ def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
             # 拔盘：卷不再可查询，必须保持 Blocked 并带出诊断。
             # 不能先 release()：probe 会成功 → gate 回 Ready → 再也不会有 space_status。
             vhd.detach()
-            status = session.wait_for(
-                lambda event: event.get("event") == "space_status"
-                and event.get("volume_query_ok") is False,
+
+            # space_blocked 对测试线程可见后，到卷真正不可查询之前，卷上的可用空间并不
+            # 冻结：并发 writer 在不同偏移上的扩展写失败后，NTFS 回滚的簇要等到下一次
+            # checkpoint 才计入可用空间，而 detach 的 query-remove 本身就会触发一次
+            # flush/checkpoint。monitor 在卷消失前采到这次增长就会合法授权 probe，真实
+            # 写入成功 → gate 回 Ready（space_resumed）。Ready 的卷不再被采样，之后设备
+            # 移除导致的写失败不是空间错误，job 以失败终态结束，永远不会出现
+            # volume_query_ok=false 的 space_status。两条分支都必须有确定的终点。
+            outcome = session.wait_for(
+                lambda event: (
+                    event.get("event") == "space_status"
+                    and event.get("volume_query_ok") is False
+                )
+                or event.get("type") == "result",
                 timeout=90.0,
             )
-            assert status is not None, (
-                "卷不可查询时必须用 space_status 带出诊断；实际事件流："
-                + json.dumps(session.space_events(), ensure_ascii=False)
+            assert outcome is not None, (
+                "拔盘后必须带出 query failure 诊断或以终态结束，绝不能挂住；实际事件流："
+                + json.dumps(session.events(), ensure_ascii=False)
             )
+
+            if outcome.get("type") == "result":
+                # 卷不可查询之前 gate 已经被一次真实成功的 probe 恢复。
+                events = session.events()
+                result_index = next(
+                    index for index, event in enumerate(events) if event is outcome
+                )
+                assert [
+                    event
+                    for event in events[:result_index]
+                    if event.get("event") == "space_resumed"
+                ], (
+                    "gate 仍 Blocked 时拔盘绝不能直接产生 job 终态；实际事件流："
+                    + json.dumps(events, ensure_ascii=False)
+                )
+                assert outcome.get("status") == "failed", outcome
+                return
+
+            status = outcome
             assert int(status.get("volume_query_error") or 0) != 0
 
-            # space_blocked 对测试线程可见后，到 detach 真正完成之前，monitor 仍可能
-            # 在已挂载的卷上完成一次成功采样并授权 probe；若真实 probe 先成功，
-            # space_resumed 合法地发生在"卷不可查询"这一新事实之前。#147 保证的是
-            # 查询失败发生后，已经发出的旧 probe 不得再恢复同一个 episode。
+            # #147 保证的是查询失败发生后，已经发出的旧 probe 不得再恢复同一个 episode。
             events = session.events()
             status_index = next(
                 index for index, event in enumerate(events) if event is status
