@@ -102,7 +102,7 @@ fn enrich_rar5_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
     let mut blocks = 0usize;
     let mut crc_ok = 0usize;
     while checked_usize_end(offset, 6, data.len()).is_some()
-        && u64::try_from(offset).is_ok_and(|value| value < file_size)
+        && u64::try_from(offset).map_or(false, |value| value < file_size)
     {
         let stored_crc = u32_le(data, offset);
         let Some(size_field_offset) = offset.checked_add(4) else {
@@ -111,6 +111,9 @@ fn enrich_rar5_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
         let Some((header_size, after_size)) = read_vint(data, size_field_offset) else {
             break;
         };
+        if after_size.saturating_sub(size_field_offset) > 3 {
+            break;
+        }
         let Some((total_header_u64, header_end_u64)) =
             checked_rar5_header_geometry(offset, after_size, header_size)
         else {
@@ -322,7 +325,7 @@ fn enrich_rar4_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
     let mut offset = RAR4_SIGNATURE.len();
     let mut blocks = 0usize;
     while checked_usize_end(offset, 7, data.len()).is_some()
-        && u64::try_from(offset).is_ok_and(|value| value < file_size)
+        && u64::try_from(offset).map_or(false, |value| value < file_size)
     {
         let stored_crc = u16_le(data, offset) as u32;
         let header_type = data[offset + 2];
@@ -620,11 +623,10 @@ fn inspect_rar4_block(data: &[u8], offset: usize, file_size: u64) -> (bool, u8, 
             );
         };
         block_size = updated_size;
-        if u64::try_from(offset)
+        let payload_end = u64::try_from(offset)
             .ok()
-            .and_then(|start| start.checked_add(block_size))
-            .is_none_or(|end| end > file_size)
-        {
+            .and_then(|start| start.checked_add(block_size));
+        if payload_end.map_or(true, |end| end > file_size) {
             return (
                 false,
                 header_type,
@@ -670,7 +672,7 @@ fn inspect_rar5(py: Python<'_>, data: &[u8], file_size: u64) -> PyResult<Py<PyDi
         d.set_item("error", "rar5_main_or_encryption_header_missing")?;
         return Ok(d.unbind());
     }
-    let Some((first_header_total_size, first_header_end_u64)) =
+    let Some((_first_header_total_size, first_header_end_u64)) =
         checked_rar5_header_geometry(first_header_offset, after_size, header_size)
     else {
         d.set_item("error", "rar5_first_header_size_out_of_range")?;
@@ -739,7 +741,6 @@ fn inspect_rar5(py: Python<'_>, data: &[u8], file_size: u64) -> PyResult<Py<PyDi
     {
         d.set_item("strong_accept", true)?;
     }
-    let _ = first_header_total_size;
     Ok(d.unbind())
 }
 
