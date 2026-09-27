@@ -87,6 +87,9 @@ def test_load_config_rejects_string_booleans(tmp_path, monkeypatch, override, fi
     _write_json(advanced, _advanced_payload())
     _write_json(simple, override)
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
+    # The session conftest installs a scan_filters override layer that would
+    # replace the invalid file value before validation.
+    monkeypatch.delenv(loader.OVERRIDES_ENV_VAR, raising=False)
 
     with pytest.raises(loader.ConfigError, match=field.replace("[", r"\[").replace("]", r"\]")):
         loader.load_config()
@@ -103,6 +106,7 @@ def test_load_config_validates_scan_filter_entries_even_when_filters_disabled(tm
         },
     })
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
+    monkeypatch.delenv(loader.OVERRIDES_ENV_VAR, raising=False)
 
     with pytest.raises(loader.ConfigError, match=r"filesystem\.scan_filters\[0\]\.enabled"):
         loader.load_config()

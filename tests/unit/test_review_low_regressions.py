@@ -61,7 +61,9 @@ def test_output_path_containment_uses_canonical_case(monkeypatch):
     monkeypatch.setattr(
         output_paths,
         "absolute_path_key",
-        lambda value: str(value).replace("\\", "/").lower(),
+        # Mirror the real key's Windows normcase form (backslashes, lower
+        # case); os.path.commonpath always returns backslash separators.
+        lambda value: str(value).replace("/", "\\").lower(),
     )
 
     assert output_paths._is_relative_to(
@@ -74,7 +76,9 @@ def test_archive_session_containment_uses_canonical_case(monkeypatch):
     monkeypatch.setattr(
         archive_sessions,
         "absolute_path_key",
-        lambda value: str(value).replace("\\", "/").lower(),
+        # Mirror the real key's Windows normcase form (backslashes, lower
+        # case); os.path.commonpath always returns backslash separators.
+        lambda value: str(value).replace("/", "\\").lower(),
     )
 
     assert archive_sessions._is_under(
