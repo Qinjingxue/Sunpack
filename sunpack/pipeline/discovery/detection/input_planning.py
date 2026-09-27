@@ -57,7 +57,7 @@ class ArchiveInputPlanningStage:
 
     def _remember_report(self, cache_key: tuple, report: ArchiveAnalysisReport) -> None:
         planning_config = self.config.get("input_planning") if isinstance(self.config.get("input_planning"), dict) else {}
-        limit = max(0, int(planning_config.get("cache_size", 512) or 512))
+        limit = max(0, int(planning_config.get("cache_size", 512)))
         if limit <= 0:
             return
         with self._report_cache_lock:
