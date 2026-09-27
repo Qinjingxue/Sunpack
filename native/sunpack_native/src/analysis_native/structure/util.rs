@@ -1,14 +1,16 @@
 fn read_vint(data: &[u8], offset: usize) -> Option<(u64, usize)> {
     let mut value = 0u64;
     let mut shift = 0;
-    for index in offset..data.len().min(offset + 10) {
+    let end = data.len().min(offset.saturating_add(10));
+    let last_valid_index = offset.checked_add(9);
+    for index in offset..end {
         let byte = data[index];
-        if index == offset + 9 && (byte & 0x7E) != 0 {
+        if Some(index) == last_valid_index && (byte & 0x7E) != 0 {
             return None;
         }
         value |= ((byte & 0x7F) as u64) << shift;
         if byte & 0x80 == 0 {
-            return Some((value, index + 1));
+            return index.checked_add(1).map(|next| (value, next));
         }
         shift += 7;
     }
