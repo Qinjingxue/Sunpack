@@ -1023,10 +1023,13 @@ def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
             # space_blocked 对测试线程可见后，到卷真正不可查询之前，卷上的可用空间并不
             # 冻结：并发 writer 在不同偏移上的扩展写失败后，NTFS 回滚的簇要等到下一次
             # checkpoint 才计入可用空间，而 detach 的 query-remove 本身就会触发一次
-            # flush/checkpoint。monitor 在卷消失前采到这次增长就会合法授权 probe，真实
-            # 写入成功 → gate 回 Ready（space_resumed）。Ready 的卷不再被采样，之后设备
-            # 移除导致的写失败不是空间错误，job 以失败终态结束，永远不会出现
-            # volume_query_ok=false 的 space_status。两条分支都必须有确定的终点。
+            # flush/checkpoint。monitor 在卷消失前采到这次增长就会合法授权 probe。
+            #
+            # 此后 detach 与真实 probe / 后续写存在竞态：probe 可能先成功并产生
+            # space_resumed，也可能在成功结算前就收到 ERROR_NOT_READY 等永久非空间错误。
+            # 后一种路径会以失败终态结束，但不会产生 space_resumed；它同样不是“空间压力
+            # 直接结束 job”。因此这里接受 query failure 诊断，或由明确的非空间输出错误
+            # 导致的失败终态。
             outcome = session.wait_for(
                 lambda event: (
                     event.get("event") == "space_status"
@@ -1041,20 +1044,23 @@ def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
             )
 
             if outcome.get("type") == "result":
-                # 卷不可查询之前 gate 已经被一次真实成功的 probe 恢复。
-                events = session.events()
-                result_index = next(
-                    index for index, event in enumerate(events) if event is outcome
-                )
-                assert [
-                    event
-                    for event in events[:result_index]
-                    if event.get("event") == "space_resumed"
-                ], (
-                    "gate 仍 Blocked 时拔盘绝不能直接产生 job 终态；实际事件流："
-                    + json.dumps(events, ensure_ascii=False)
-                )
+                # monitor 已授权 probe 后，detach 可能在 probe 成功结算之前让真实 I/O
+                # 返回永久非空间错误。此时 retry_with_space_gate() 会把 probe 结算为
+                # inconclusive 并把该永久错误返回上层；没有 space_resumed 是合法的。
+                # 但必须证明终态确实来自这种独立的输出设备错误，而不是把空间耗尽本身
+                # 错误地当成终态。
                 assert outcome.get("status") == "failed", outcome
+                diagnostics = outcome.get("diagnostics") or {}
+                assert diagnostics.get("failure_stage") == "output_write", outcome
+                assert diagnostics.get("failure_kind") == "output_filesystem", outcome
+
+                output_trace = diagnostics.get("output_trace") or {}
+                terminal_error = int(output_trace.get("last_win32_error") or 0)
+                assert terminal_error != 0, outcome
+                assert terminal_error not in {112, 39, 314, 1295}, (
+                    "空间耗尽错误不得绕过 gate 直接结束 job；实际事件流："
+                    + json.dumps(session.events(), ensure_ascii=False)
+                )
                 return
 
             status = outcome
