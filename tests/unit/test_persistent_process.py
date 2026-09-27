@@ -240,6 +240,44 @@ def test_streaming_request_round_trips_interactive_input(monkeypatch):
     assert asyncio.run(scenario()) == 0
 
 
+def test_try_send_does_not_request_replay_after_submission_disconnect(tmp_path, monkeypatch):
+    token = b"t" * 32
+
+    class DroppedConnection:
+        def __init__(self):
+            self.sent = []
+            self.closed = False
+
+        def sendall(self, data):
+            self.sent.append(bytes(data))
+
+        def recv(self, _size):
+            return b""
+
+        def close(self):
+            self.closed = True
+
+    connection = DroppedConnection()
+    monkeypatch.setattr(
+        persistent_process,
+        "_read_state",
+        lambda: (r"\\.\pipe\SunPack-test", token),
+    )
+    monkeypatch.setattr(persistent_process, "_open_pipe", lambda _name: connection)
+    monkeypatch.setattr(persistent_process, "_runtime_binary_build_id", lambda: b"build-id")
+
+    response = persistent_process._try_send({
+        "cwd": str(tmp_path),
+        "argv": ["extract", "sample.zip"],
+    })
+
+    assert response is not None
+    assert response["exit_code"] == 1
+    assert connection.sent
+    assert connection.sent[0].startswith(persistent_process._REQUEST_MAGIC)
+    assert connection.closed is True
+
+
 def test_shutdown_does_not_start_a_missing_server(monkeypatch):
     monkeypatch.setattr(persistent_process, "_try_send", lambda payload: None)
 
