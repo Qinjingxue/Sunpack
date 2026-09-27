@@ -336,6 +336,22 @@ def _read_state() -> tuple[str, bytes] | None:
     return pipe, token
 
 
+def _delivery_uncertain_response(payload: dict[str, Any], error: BaseException | str) -> dict[str, Any]:
+    request_cwd = str(payload.get("cwd") or os.getcwd())
+    i18n = I18nContext(load_cli_language_from_config(request_cwd))
+    detail = (
+        "persistent server disconnected after request submission; "
+        "the command was not retried to avoid duplicate execution"
+    )
+    if error:
+        detail += f": {error}"
+    return {
+        "exit_code": 1,
+        "stdout": "",
+        "stderr": i18n.t("cli.operation_failed", error=detail) + "\n",
+    }
+
+
 def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
     state = _read_state()
     if state is None:
@@ -344,6 +360,7 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
     connection = _open_pipe(pipe)
     if connection is None:
         return None
+    request_started = False
     try:
         cwd = str(payload.get("cwd") or "").encode("utf-8", "surrogatepass")
         argv_values = [str(item) for item in payload.get("argv") or []]
@@ -363,11 +380,14 @@ def _try_send(payload: dict[str, Any]) -> dict[str, Any] | None:
         body = [build_id, token, struct.pack("!III", flags, len(cwd), len(argv)), cwd]
         for item in argv:
             body.extend((struct.pack("!I", len(item)), item))
+        request_started = True
         connection.sendall(_REQUEST_MAGIC + b"".join(body))
         if _recv_exact(connection, 4) != _STREAM_MAGIC or _recv_exact(connection, len(build_id)) != build_id:
-            return None
+            return _delivery_uncertain_response(payload, "invalid response handshake")
         return _recv_stream(connection)
-    except (EOFError, OSError, ValueError):
+    except (EOFError, OSError, ValueError) as exc:
+        if request_started:
+            return _delivery_uncertain_response(payload, exc)
         return None
     finally:
         connection.close()

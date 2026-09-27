@@ -198,11 +198,12 @@ def apply_runtime_config_overrides(config: dict, args, *, base_dir: str | None =
             ("post_extract", "archive_cleanup_mode"), args.archive_cleanup_mode,
         )
     output_dir = getattr(args, "output_dir", None)
-    if output_dir and not os.path.isabs(output_dir) and base_dir is not None:
-        output_dir = os.path.join(base_dir, output_dir)
-    output_root = os.path.abspath(os.path.normpath(output_dir or base_dir or "."))
-    overrides["output_dir"] = output_root
-    section("output", {})["root"] = output_root
+    if output_dir:
+        if not os.path.isabs(output_dir) and base_dir is not None:
+            output_dir = os.path.join(base_dir, output_dir)
+        output_root = os.path.abspath(os.path.normpath(output_dir))
+        overrides["output_dir"] = output_root
+        section("output", {})["root"] = output_root
     if getattr(args, "flatten_single_directory", None) is not None:
         overrides["flatten_single_directory"] = args.flatten_single_directory
         section("post_extract", {})["flatten_single_directory"] = args.flatten_single_directory
