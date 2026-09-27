@@ -50,8 +50,10 @@ def _safe_path_component(value: str) -> str:
 
 
 def _is_relative_to(path: str, root: str) -> bool:
+    candidate = absolute_path_key(path)
+    normalized_root = absolute_path_key(root)
     try:
-        return os.path.commonpath((os.path.abspath(path), os.path.abspath(root))) == os.path.abspath(root)
+        return os.path.commonpath((candidate, normalized_root)) == normalized_root
     except ValueError:
         return False
 
