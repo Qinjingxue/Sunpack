@@ -76,8 +76,9 @@ english.UninstallStopFailed=sunpack runtime processes or the Watch Broker servic
 english.BuiltinPasswordsFileHeader=# Built-in common password list. You can edit this file; use one password per line.
 english.BuiltinPasswordsWatchManagedNote=# The following section is managed automatically by SunPack Watch.
 english.WatchRootsFileHeader=# Watched folders. Add one folder per line.
-english.WatchRootsFileMapping=# Optional output mapping: input folder | output folder
-english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted
+english.WatchRootsFileMapping=# Optional columns: input folder | output folder | deep_detect
+english.WatchRootsFileDeepDetect=# deep_detect accepts true or false; blank defaults to false.
+english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted | true
 english.EditableConfigCreateFailed=Failed to create the initial editable configuration file: %s
 chinesesimplified.TaskAddToPath=将 sunpack 添加到当前用户的 PATH
 chinesesimplified.TaskContextMenu=注册 sunpack 文件夹右键菜单
@@ -104,8 +105,9 @@ chinesesimplified.UninstallStopFailed=无法停止 sunpack 运行时进程或 Wa
 chinesesimplified.BuiltinPasswordsFileHeader=# 此文件为内置高频密码配置表，用户可自行编辑，每行一个密码。
 chinesesimplified.BuiltinPasswordsWatchManagedNote=# 以下区域由 SunPack Watch 自动维护，请勿手动编辑。
 chinesesimplified.WatchRootsFileHeader=# 监控文件夹配置，每行填写一个监控目录。
-chinesesimplified.WatchRootsFileMapping=# 可选输出目录映射格式：输入目录 | 输出目录
-chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted
+chinesesimplified.WatchRootsFileMapping=# 可选字段格式：输入目录 | 输出目录 | deep_detect
+chinesesimplified.WatchRootsFileDeepDetect=# deep_detect 可填写 true 或 false；留空时默认为 false。
+chinesesimplified.WatchRootsFileExample=# 示例：C:\Downloads | D:\Extracted | true
 chinesesimplified.EditableConfigCreateFailed=无法创建初始可编辑配置文件：%s
 
 [Tasks]
@@ -767,6 +769,7 @@ begin
     SetArrayLength(Contents, 0);
     AppendTextLine(Contents, CustomMessage('WatchRootsFileHeader'));
     AppendTextLine(Contents, CustomMessage('WatchRootsFileMapping'));
+    AppendTextLine(Contents, CustomMessage('WatchRootsFileDeepDetect'));
     AppendTextLine(Contents, CustomMessage('WatchRootsFileExample'));
     SaveUTF8TextLines(FilePath, Contents);
   end;
