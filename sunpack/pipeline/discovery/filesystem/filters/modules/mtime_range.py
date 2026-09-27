@@ -52,6 +52,11 @@ def _mtime_or_none(value: Any) -> int | None:
     text = str(value).strip()
     if not text:
         return None
+    if len(text) == 8 and text.isdigit():
+        try:
+            return int(datetime.strptime(text, "%Y%m%d").timestamp() * 1_000_000_000)
+        except ValueError:
+            pass
     try:
         return int(text)
     except ValueError:
