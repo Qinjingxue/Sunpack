@@ -52,6 +52,37 @@ def test_extract_reports_watch_busy_without_starting_another_task(tmp_path):
     assert result.errors == ["该任务已由 watch 处理，请等待"]
 
 
+def test_extract_reports_foreground_busy_without_watch_wording(tmp_path):
+    from sunpack.runtime.cli.commands import extract
+    from sunpack.runtime.cli.runtime_state import set_runtime_host
+
+    archive = tmp_path / "archive.zip"
+    archive.write_bytes(b"zip")
+    registry = ActiveArchiveRegistry()
+    assert registry.reserve("foreground-job", "foreground", [str(archive)]) is None
+    set_runtime_host(SimpleNamespace(archive_registry=registry))
+    try:
+        code, result = asyncio.run(
+            extract.handle(
+                SimpleNamespace(paths=[str(archive)]),
+                SimpleNamespace(
+                    cwd=str(tmp_path),
+                    reporter=None,
+                    t=lambda key, **_kwargs: {
+                        "cli.watch_busy": "watch busy",
+                        "cli.archive_busy": "archive busy",
+                    }.get(key, key),
+                ),
+            )
+        )
+    finally:
+        set_runtime_host(None)
+
+    assert code != 0
+    assert result.summary["status"] == "busy"
+    assert result.errors == ["archive busy"]
+
+
 def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
     import sunpack.runtime.cli.runtime_host as runtime_host_module
     import sunpack.runtime.cli.persistent_runtime as persistent_runtime

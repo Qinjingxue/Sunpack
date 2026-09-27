@@ -45,6 +45,20 @@ def test_watch_clipboard_password_block_keeps_most_recent_entries(tmp_path, monk
     assert "\nc\n" in text
 
 
+def test_watch_clipboard_recopy_moves_password_to_most_recent_position(tmp_path, monkeypatch):
+    builtin_path = tmp_path / "builtin_passwords.txt"
+    _seed_builtin_file(builtin_path, "user-secret")
+    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
+
+    builtin_module.merge_watch_clipboard_passwords(["a", "b"], max_entries=2)
+    changed = builtin_module.merge_watch_clipboard_passwords(["a"], max_entries=2)
+
+    assert changed is True
+    assert builtin_module._read_watch_clipboard_block(
+        builtin_path.read_text(encoding="utf-8")
+    ) == ["b", "a"]
+
+
 def test_watch_clipboard_password_markers_do_not_change_with_cli_language(tmp_path, monkeypatch):
     builtin_path = tmp_path / "builtin_passwords.txt"
     _seed_builtin_file(builtin_path, "user-secret")

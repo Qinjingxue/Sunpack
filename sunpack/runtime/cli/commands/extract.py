@@ -82,7 +82,7 @@ async def handle(args, ctx):
                 command=COMMAND,
                 inputs={"paths": target_paths},
                 summary={"status": "busy", "conflicts": list(conflict.paths)},
-                errors=[ctx.t("cli.watch_busy")],
+                errors=[ctx.t("cli.archive_busy")],
             )
         current_task = asyncio.current_task()
         if current_task is not None:
@@ -117,6 +117,7 @@ async def handle(args, ctx):
     current_targets = list(target_paths)
     latest_target_results: dict[str, object] = {}
     all_processed_keys: list[str] = []
+    all_scan_failed_tasks: list[str] = []
     all_recovered_outputs: list[dict] = []
     cleanup_results_by_path = {}
     initial_password_summary = build_password_summary(
@@ -157,6 +158,9 @@ async def handle(args, ctx):
             failed_tasks = list(summary.failed_tasks)
             failures = list(summary.failures)
             processed_keys = list(summary.processed_keys)
+            for failed_task in list(getattr(summary, "scan_failed_tasks", ()) or ()):
+                if failed_task not in all_scan_failed_tasks:
+                    all_scan_failed_tasks.append(failed_task)
             merge_latest_results(latest_target_results, summary)
             all_processed_keys.extend(processed_keys)
             for item in list(getattr(summary, "recovered_outputs", []) or []):
@@ -212,17 +216,21 @@ async def handle(args, ctx):
             result_outcome(item) == OutcomeKind.PARTIAL_SUCCESS
             for item in final_results
         )
-        failed_tasks = [
-            _target_result_error(item)
-            for item in final_results
-            if result_outcome(item) == OutcomeKind.FAILURE
-        ]
+        failed_tasks = _dedupe([
+            *all_scan_failed_tasks,
+            *(
+                _target_result_error(item)
+                for item in final_results
+                if result_outcome(item) == OutcomeKind.FAILURE
+            ),
+        ])
         processed_keys = all_processed_keys
         recovered_outputs = all_recovered_outputs
         cleanup_results = list(cleanup_results_by_path.values())
     else:
         success_count = summary.success_count
         partial_success_count = getattr(summary, "partial_success_count", 0)
+        failed_tasks = _dedupe([*all_scan_failed_tasks, *list(summary.failed_tasks)])
         recovered_outputs = list(getattr(summary, "recovered_outputs", []) or [])
         cleanup_results = list(getattr(summary, "cleanup_results", []) or [])
 

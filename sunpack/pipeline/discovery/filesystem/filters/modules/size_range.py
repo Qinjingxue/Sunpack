@@ -107,12 +107,14 @@ def parse_range_expression(expression: Any, value_parser, *, variable: str = "r"
         return NumericRange()
     parts = [part.strip() for part in re.split(r"(<=|>=|==|=|<|>)", text) if part.strip()]
     if len(parts) < 3 or len(parts) % 2 == 0:
-        return NumericRange()
+        raise ValueError(f"Invalid range expression: {text}")
     result = NumericRange()
     operands = parts[0::2]
     operators = parts[1::2]
     for left, operator, right in zip(operands, operators, operands[1:]):
         comparison = _comparison_to_range(left, operator, right, value_parser, variable=variable)
+        if not comparison.configured:
+            raise ValueError(f"Invalid range expression: {text}")
         result = result.merge(comparison)
     return result
 

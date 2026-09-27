@@ -49,9 +49,12 @@ def merge_watch_clipboard_passwords(passwords: list[str], *, max_entries: int = 
         # The installer owns the file structure. Do not invent or migrate
         # markers here based on the current CLI language.
         return False
-    existing = _read_watch_clipboard_block(original)
-    merged = dedupe_passwords([*existing, *passwords])
-    managed = merged[-max_entries:]
+    managed = dedupe_passwords(_read_watch_clipboard_block(original))
+    for password in dedupe_passwords(passwords):
+        if password in managed:
+            managed.remove(password)
+        managed.append(password)
+    managed = managed[-max_entries:]
     updated = _replace_watch_clipboard_block(original, managed)
     if updated == original:
         return False
