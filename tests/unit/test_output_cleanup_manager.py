@@ -3,10 +3,13 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+import pytest
+
 from sunpack.pipeline.postprocess.output_cleanup import (
     OutputCleanupEvent,
     OutputCleanupExecutor,
     OutputCleanupManager,
+    OutputRole,
 )
 
 
@@ -98,6 +101,37 @@ def test_executor_failure_is_reported_without_claiming_cleanup(tmp_path):
     assert result.reason == "cleanup_failed"
     assert result.error == "locked"
     assert output.is_dir()
+
+
+@pytest.mark.parametrize("role", [OutputRole.CANONICAL, OutputRole.PARTIAL_FILE])
+def test_scoped_cleanup_authorizes_only_strict_workspace_descendants(tmp_path, role):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    inside = workspace / "owned"
+    outside = tmp_path / "outside"
+    if role == OutputRole.CANONICAL:
+        inside.mkdir()
+        outside.mkdir()
+    else:
+        inside.write_text("partial")
+        outside.write_text("unowned")
+    manager = OutputCleanupManager()
+
+    for path in (workspace, outside, workspace / ".." / "outside"):
+        result = manager.cleanup_scoped_path(
+            str(path), event=OutputCleanupEvent.EXTRACT_RETRY,
+            role=role, workspace_root=str(workspace),
+        )
+        assert result.reason == "unowned_output"
+        assert path.exists()
+
+    result = manager.cleanup_scoped_path(
+        str(inside), event=OutputCleanupEvent.EXTRACT_RETRY,
+        role=role, workspace_root=str(workspace),
+    )
+    assert result.cleaned
+    assert not inside.exists()
+    assert workspace.exists() and outside.exists()
 
 
 def test_output_deletion_primitives_are_confined_to_approved_infrastructure():

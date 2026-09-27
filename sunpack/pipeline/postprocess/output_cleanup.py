@@ -213,6 +213,12 @@ class OutputCleanupManager:
 
     @staticmethod
     def _owned(role: OutputRole, path: str, ownership: OutputOwnership) -> bool:
+        if ownership.workspace_root:
+            # Resolve junctions as well as '..': a lexical descendant alone
+            # must not authorize deleting output outside the workspace.
+            return role in (OutputRole.CANONICAL, OutputRole.PARTIAL_FILE) and _is_strict_descendant(
+                os.path.realpath(path), os.path.realpath(ownership.workspace_root),
+            )
         if role == OutputRole.CANONICAL:
             planned = _absolute(ownership.planned_output_dir)
             return bool(planned and _same_path(path, planned))

@@ -298,6 +298,8 @@ def test_filename_camouflage_without_structure_never_builds_a_group(tmp_path, na
         ("archive.part1.exe", 1, "rar_sfx_part"),
         ("archive.r00", 2, "rar_oldstyle"),
         ("archive.001", 1, "plain_numeric_suffix"),
+        ("photo.part2.7z", 2, "part_numbered"),
+        ("a.part1.zip", 1, "part_numbered"),
     ],
 )
 def test_public_parser_exposes_only_strict_names(name, number, style):
@@ -321,6 +323,31 @@ def test_public_parser_rejects_camouflage(name):
 
     assert scheduler.parse_numbered_volume(name) is None
     assert scheduler.detect_split_role(name) is None
+
+
+@pytest.mark.parametrize("name", [
+    "Counterpart2.zip", "Counterpart3.zip", "Rampart1.rar", "Rampart2.rar",
+    "apart10.bin", "report_part3_final.docx",
+    "release.Counterpart2.rar", "release.report_part3_final.rar",
+    "a.part0.rar", "a.rar.part0.hidden", "a.part4294967296.rar",
+    "a.part4294967296.rar.hidden", "a.rar.part4294967296.hidden",
+])
+def test_public_parser_rejects_embedded_words_and_invalid_part_numbers(name):
+    scheduler = RelationsScheduler()
+    assert scheduler.parse_numbered_volume(name) is None
+    assert scheduler.detect_split_role(name) is None
+
+
+@pytest.mark.parametrize("name,expected", [
+    ("Counterpart2.zip", "Counterpart2"),
+    ("Counterpart3.zip", "Counterpart3"),
+    ("Rampart1.rar", "Rampart1"),
+    ("Rampart2.rar", "Rampart2"),
+    ("a.part0.rar", "a.part0"),
+    ("a.part4294967296.rar", "a.part4294967296"),
+])
+def test_ordinary_part_words_keep_their_output_name(name, expected):
+    assert RelationsScheduler().logical_name_for_archive(name) == expected
 
 
 def test_public_parser_accepts_modern_split_zip_members():

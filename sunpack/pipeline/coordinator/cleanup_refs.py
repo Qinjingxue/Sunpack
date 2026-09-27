@@ -11,7 +11,7 @@ class ReleaseRequest:
     task_key: str
     #: All paths that lost their last owner, including paths to preserve.
     paths: tuple[str, ...] = ()
-    #: Only released paths whose owners requested cleanup.
+    #: Only released paths whose owners all authorized cleanup.
     cleanup_paths: tuple[str, ...] = ()
 
     @property
@@ -59,8 +59,8 @@ class CleanupRefTable:
         self._counts: dict[str, int] = {}
         self._paths: dict[str, str] = {}
         self._owned: dict[int, tuple[object, str, tuple[str, ...], bool]] = {}
-        #: Paths at least one owner asked to remove once it is the last one.
-        self._wanted: dict[str, int] = {}
+        #: A released unsuccessful owner vetoes deletion until all owners leave.
+        self._preserved: set[str] = set()
 
     def register(self, task) -> None:
         """Register or reconcile the task's current physical cleanup paths."""
@@ -77,18 +77,14 @@ class CleanupRefTable:
         # Rejected paths are released without authorizing their deletion.
         for key in old - new.keys():
             self._counts[key] -= 1
-            if eligible:
-                self._wanted[key] -= 1
             if not self._counts[key]:
                 self._counts.pop(key)
                 self._paths.pop(key, None)
-                self._wanted.pop(key, None)
+                self._preserved.discard(key)
         for key in new.keys() - old:
             path = new[key]
             self._paths.setdefault(key, path)
             self._counts[key] = self._counts.get(key, 0) + 1
-            if eligible:
-                self._wanted[key] = self._wanted.get(key, 0) + 1
         self._owned[owner] = (task, task_key, paths, eligible)
 
     def register_all(self, tasks) -> None:
@@ -100,15 +96,12 @@ class CleanupRefTable:
             self.register(task)
 
     def mark_cleanup_eligible(self, task) -> None:
-        """Declare that this owner wants its paths removed once it is the last one."""
+        """Declare success; deletion still requires every shared owner to succeed."""
 
         entry = self._owned.get(id(task))
         if entry is None or entry[3]:
             return
         self._owned[id(task)] = (entry[0], entry[1], entry[2], True)
-        for path in entry[2]:
-            key = absolute_path_key(path)
-            self._wanted[key] = self._wanted.get(key, 0) + 1
 
     def release(self, task) -> ReleaseRequest:
         return self._pop(id(task))
@@ -133,15 +126,16 @@ class CleanupRefTable:
             remaining = self._counts.get(key, 0) - 1
             if remaining > 0:
                 self._counts[key] = remaining
+                if not eligible:
+                    self._preserved.add(key)
                 continue
             self._counts.pop(key, None)
             self._paths.pop(key, None)
-            wanted = self._wanted.pop(key, 0)
             zeroed.append(path)
-            # Whoever takes the count to zero performs the deletion; an ineligible owner must not
-            # delete, but an eligible owner sharing the path already asked for it to go.
-            if eligible or wanted > 0:
+            # The last owner may delete only if no earlier owner needs a retry.
+            if eligible and key not in self._preserved:
                 cleanup_paths.append(path)
+            self._preserved.discard(key)
         return ReleaseRequest(
             task_key=task_key,
             paths=tuple(zeroed),

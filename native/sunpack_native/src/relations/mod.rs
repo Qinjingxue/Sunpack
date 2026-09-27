@@ -1,6 +1,6 @@
 use crate::analysis_native::volume_anchor::{
-    probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap,
-    probe_volume_anchor_paths_deep, VolumeAnchor,
+    probe_volume_anchor_at_offset, probe_volume_anchor_paths_cheap, probe_volume_anchor_paths_deep,
+    VolumeAnchor,
 };
 use crate::analysis_native::{
     probe_rar_path, probe_rar_terminal_with_password, probe_rar_volume_paths,
@@ -105,7 +105,22 @@ impl DirectoryNameIndex {
         let entries_by_path = rows
             .iter()
             .map(|row| {
-                let parsed = parse_volume_candidates(&row.name);
+                let mut parsed = parse_volume_candidates(&row.name);
+                // Loose partN spellings are only hypotheses for a structurally
+                // identified RAR volume (or password-blocked RAR headers),
+                // never for ordinary filename APIs. Proposal validation still
+                // decides whether these hypotheses form an actual volume set.
+                if row.anchor.as_ref().is_some_and(|anchor| {
+                    anchor.format == "rar"
+                        && (anchor.multivolume
+                            || anchor.needs_password
+                            || anchor.continuation_from_previous
+                            || anchor.continuation_to_next)
+                }) {
+                    if let Some(candidate) = parse_loose_rar_part_volume(&row.name) {
+                        push_unique_volume_candidate(&mut parsed, candidate);
+                    }
+                }
                 let interpretations = ["", "rar", "7z", "zip"]
                     .into_iter()
                     .map(|target_format| {
@@ -139,11 +154,7 @@ impl DirectoryNameIndex {
             .unwrap_or(&[])
     }
 
-    fn interpretations(
-        &self,
-        row: &RelationInput,
-        target_format: &str,
-    ) -> &[NameInterpretation] {
+    fn interpretations(&self, row: &RelationInput, target_format: &str) -> &[NameInterpretation] {
         self.entries_by_path
             .get(&row.path_key)
             .and_then(|entry| entry.interpretations.get(target_format))
@@ -279,11 +290,9 @@ fn build_candidate_groups_from_physical(
             })
             .collect();
         for index in sfx_indexes {
-            if let Some(anchor) = promote_sfx_archive_anchor(
-                py,
-                &directory_rows[index],
-                path_passwords,
-            )? {
+            if let Some(anchor) =
+                promote_sfx_archive_anchor(py, &directory_rows[index], path_passwords)?
+            {
                 directory_rows[index].anchor = Some(anchor);
             }
         }
@@ -296,12 +305,7 @@ fn build_candidate_groups_from_physical(
             .collect();
         if !zip_candidates.is_empty() {
             let upgraded = py.detach(|| {
-                probe_volume_anchor_paths_deep(
-                    &zip_candidates,
-                    512,
-                    22 + 65_535,
-                    path_passwords,
-                )
+                probe_volume_anchor_paths_deep(&zip_candidates, 512, 22 + 65_535, path_passwords)
             });
             let upgraded: HashMap<String, VolumeAnchor> = upgraded
                 .into_iter()
@@ -323,12 +327,7 @@ fn build_candidate_groups_from_physical(
             .collect();
         if !sfx_split_heads.is_empty() {
             let deep_anchors = py.detach(|| {
-                probe_volume_anchor_paths_deep(
-                    &sfx_split_heads,
-                    1024 * 1024,
-                    0,
-                    path_passwords,
-                )
+                probe_volume_anchor_paths_deep(&sfx_split_heads, 1024 * 1024, 0, path_passwords)
             });
             let upgraded: HashMap<String, VolumeAnchor> = deep_anchors
                 .into_iter()
@@ -367,12 +366,7 @@ fn build_candidate_groups_from_physical(
                 continue;
             };
             if strength == "strong" {
-                let related = strong_seed_related_paths(
-                    seed,
-                    &directory_rows,
-                    &name_index,
-                    anchor,
-                );
+                let related = strong_seed_related_paths(seed, &directory_rows, &name_index, anchor);
                 // A strong structural seed alone is not proof of a physical
                 // relation.  In particular, a truncated standalone SFX may
                 // look like a first/multivolume input because its declared
@@ -381,13 +375,13 @@ fn build_candidate_groups_from_physical(
                 // otherwise the ordinary Relations fallback must keep the
                 // structurally proven SFX so Extraction can make the
                 // authoritative damage/missing-volume decision.
-                if related.iter().any(|path| !path.eq_ignore_ascii_case(&seed.path)) {
+                if related
+                    .iter()
+                    .any(|path| !path.eq_ignore_ascii_case(&seed.path))
+                {
                     strong_suppressed_paths.insert(seed.path.to_ascii_lowercase());
-                    strong_suppressed_paths.extend(
-                        related
-                            .into_iter()
-                            .map(|path| path.to_ascii_lowercase()),
-                    );
+                    strong_suppressed_paths
+                        .extend(related.into_iter().map(|path| path.to_ascii_lowercase()));
                 }
             }
             for interpretation in name_index.interpretations(seed, &anchor.format) {
@@ -438,18 +432,22 @@ fn build_candidate_groups_from_physical(
         if path_passwords.is_some() {
             for (index, validation) in validations.iter().enumerate() {
                 if validation.status != ProposalStatus::Inconclusive
-                    || !validation.proposal.volumes.iter().all(|(path, _, _, _, _)| {
-                        validation
-                            .anchors
-                            .get(&path.to_ascii_lowercase())
-                            .is_some_and(|anchor| {
-                                anchor.format == "rar"
-                                    && anchor.confidence == "strong"
-                                    && (anchor.multivolume
-                                        || anchor.continuation_from_previous
-                                        || anchor.continuation_to_next)
-                            })
-                    })
+                    || !validation
+                        .proposal
+                        .volumes
+                        .iter()
+                        .all(|(path, _, _, _, _)| {
+                            validation
+                                .anchors
+                                .get(&path.to_ascii_lowercase())
+                                .is_some_and(|anchor| {
+                                    anchor.format == "rar"
+                                        && anchor.confidence == "strong"
+                                        && (anchor.multivolume
+                                            || anchor.continuation_from_previous
+                                            || anchor.continuation_to_next)
+                                })
+                        })
                 {
                     continue;
                 }
@@ -506,10 +504,7 @@ fn build_candidate_groups_from_physical(
                 && !password_paths.contains(&row.path.to_ascii_lowercase())
                 && !strong_suppressed_paths.contains(&row.path.to_ascii_lowercase())
         }) {
-            let confirmed = row
-                .anchor
-                .as_ref()
-                .is_some_and(anchor_is_relation_archive);
+            let confirmed = row.anchor.as_ref().is_some_and(anchor_is_relation_archive);
             output.push(ordinary_file_group_to_dict(py, row, confirmed)?);
         }
     }
@@ -550,7 +545,7 @@ fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
             || anchor.continuation_from_previous
             || anchor.continuation_to_next
             || anchor.anchor_roles.contains(&"terminal")))
-        .then_some("strong")
+    .then_some("strong")
 }
 
 fn seed_strength_for_row(
@@ -574,9 +569,7 @@ fn seed_strength_for_row(
         && anchor.standalone
         && anchor.structure_offset.is_some_and(|offset| offset > 0)
         && name_index.candidates(row).iter().any(|candidate| {
-            candidate.number == 1
-                && candidate.family == "rar"
-                && candidate.style == "rar_sfx_part"
+            candidate.number == 1 && candidate.family == "rar" && candidate.style == "rar_sfx_part"
         })
         && strong_seed_related_paths(row, rows, name_index, anchor).len() >= 2;
     if raw_sfx_split_seed {
@@ -589,7 +582,10 @@ fn seed_strength_for_row(
         && anchor.sfx
         && anchor.pe_structure
         && anchor.encrypted
-        && anchor.anchor_roles.iter().any(|role| *role == "encrypted_volume")
+        && anchor
+            .anchor_roles
+            .iter()
+            .any(|role| *role == "encrypted_volume")
         && anchor.structure_offset.is_some_and(|offset| offset > 0)
         && name_index.candidates(row).iter().any(|candidate| {
             candidate.number == 1
@@ -605,7 +601,6 @@ fn seed_strength_for_row(
     }
     Some(strength)
 }
-
 
 fn should_upgrade_zip_anchor(row: &RelationInput) -> bool {
     row.anchor.as_ref().is_some_and(|anchor| {
@@ -691,13 +686,12 @@ fn promote_sfx_archive_anchor(
     }
 
     let path = row.path.clone();
-    let password = path_passwords
-        .and_then(|items| {
-            items
-                .iter()
-                .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&path))
-                .map(|(_, password)| password.clone())
-        });
+    let password = path_passwords.and_then(|items| {
+        items
+            .iter()
+            .find(|(candidate, _)| candidate.eq_ignore_ascii_case(&path))
+            .map(|(_, password)| password.clone())
+    });
     let format_for_probe = format.clone();
     let mut anchor = py.detach(move || {
         probe_volume_anchor_at_offset(
@@ -720,10 +714,7 @@ fn is_weak_sfx_split_head(row: &RelationInput, name_index: &DirectoryNameIndex) 
     };
     if !(anchor.format.is_empty()
         && anchor.sfx
-        && anchor
-            .evidence
-            .iter()
-            .any(|item| *item == "sfx:pe_header"))
+        && anchor.evidence.iter().any(|item| *item == "sfx:pe_header"))
     {
         return false;
     }
@@ -731,10 +722,9 @@ fn is_weak_sfx_split_head(row: &RelationInput, name_index: &DirectoryNameIndex) 
         .extension()
         .and_then(|value| value.to_str())
         .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
-        && name_index
-            .candidates(row)
-            .iter()
-            .any(|candidate| candidate.number == 1 && !logical_name_from_parsed(candidate).is_empty())
+        && name_index.candidates(row).iter().any(|candidate| {
+            candidate.number == 1 && !logical_name_from_parsed(candidate).is_empty()
+        })
 }
 
 fn is_strong_multivolume_first_seed(
@@ -781,18 +771,19 @@ fn strong_seed_related_paths(
     if logical_name.is_empty() {
         return Vec::new();
     }
-    rows
-        .iter()
+    rows.iter()
         .filter(|candidate_row| candidate_row.relation_member_eligible)
         .filter(|candidate_row| {
-            name_index.candidates(candidate_row).iter().any(|candidate| {
-                candidate.number > 0
-                    && logical_name_from_parsed(candidate)
-                        .eq_ignore_ascii_case(&logical_name)
-                    && (candidate.family == anchor.format
-                        || candidate.family == "generic"
-                        || (anchor.sfx && candidate.family == "rar"))
-            })
+            name_index
+                .candidates(candidate_row)
+                .iter()
+                .any(|candidate| {
+                    candidate.number > 0
+                        && logical_name_from_parsed(candidate).eq_ignore_ascii_case(&logical_name)
+                        && (candidate.family == anchor.format
+                            || candidate.family == "generic"
+                            || (anchor.sfx && candidate.family == "rar"))
+                })
         })
         .map(|candidate_row| candidate_row.path.clone())
         .collect()
@@ -845,8 +836,7 @@ fn name_interpretations_from_candidates(
 
     if values.is_empty() {
         let Some(anchor) = anchor.filter(|value| {
-            value.format == target_format
-                || (value.format.is_empty() && value.sfx)
+            value.format == target_format || (value.format.is_empty() && value.sfx)
         }) else {
             return values;
         };
@@ -916,10 +906,10 @@ fn name_proposals_for_seed(
     // bounded set of concrete formats.  The resulting proposal still goes
     // through exactly one format-specific deep validator.
     let mut formats = HashSet::new();
-    for row in rows.iter().filter(|row| {
-        row.relation_member_eligible
-            && !row.path.eq_ignore_ascii_case(&seed.path)
-    }) {
+    for row in rows
+        .iter()
+        .filter(|row| row.relation_member_eligible && !row.path.eq_ignore_ascii_case(&seed.path))
+    {
         for parsed in name_index.candidates(row) {
             if !matches!(parsed.family, "rar" | "7z" | "zip")
                 || !logical_name_from_parsed(&parsed)
@@ -958,7 +948,7 @@ fn has_filtered_family_trigger(
     interpretation: &NameInterpretation,
 ) -> bool {
     rows.iter().any(|row| {
-            filtered_keys.contains(&row.path.to_ascii_lowercase())
+        filtered_keys.contains(&row.path.to_ascii_lowercase())
             && name_index
                 .interpretations(row, &interpretation.format)
                 .iter()
@@ -978,10 +968,7 @@ fn make_name_proposal(
     let mut slots: HashMap<u32, Vec<(String, NameInterpretation)>> = HashMap::new();
     let mut companions = Vec::new();
     for row in rows.iter().filter(|row| row.relation_member_eligible) {
-        let possible_launcher = row
-            .anchor
-            .as_ref()
-            .is_some_and(is_possible_sfx_launcher);
+        let possible_launcher = row.anchor.as_ref().is_some_and(is_possible_sfx_launcher);
         let numbered_volume_name = name_index
             .candidates(row)
             .iter()
@@ -997,23 +984,18 @@ fn make_name_proposal(
             companions.push(row.path.clone());
             continue;
         }
-        let interpretations = name_index.interpretations(
-            row,
-            &seed_interpretation.format,
-        );
-        let matching = interpretations
-            .iter()
-            .filter(|candidate| {
-                candidate.format == seed_interpretation.format
-                    && candidate.prefix == seed_interpretation.prefix
-            });
+        let interpretations = name_index.interpretations(row, &seed_interpretation.format);
+        let matching = interpretations.iter().filter(|candidate| {
+            candidate.format == seed_interpretation.format
+                && candidate.prefix == seed_interpretation.prefix
+        });
         let mut matched = false;
         for candidate in matching {
             matched = true;
-                slots
-                    .entry(candidate.number)
-                    .or_default()
-                    .push((row.path.clone(), candidate.clone()));
+            slots
+                .entry(candidate.number)
+                .or_default()
+                .push((row.path.clone(), candidate.clone()));
         }
         if matched {
             continue;
@@ -1098,18 +1080,15 @@ fn make_name_proposal(
         return None;
     }
     let has_filtered_trigger = rows.iter().any(|row| {
-            filtered_keys.contains(&row.path.to_ascii_lowercase())
-                && name_index
-                .interpretations(
-                    row,
-                    &seed_interpretation.format,
-                )
+        filtered_keys.contains(&row.path.to_ascii_lowercase())
+            && name_index
+                .interpretations(row, &seed_interpretation.format)
                 .iter()
                 .any(|candidate| {
                     candidate.format == seed_interpretation.format
                         && candidate.prefix == seed_interpretation.prefix
                 })
-        });
+    });
     if !has_filtered_trigger {
         return None;
     }
@@ -1133,14 +1112,9 @@ fn make_name_proposal(
 }
 
 fn is_possible_sfx_launcher(anchor: &VolumeAnchor) -> bool {
-    let weak_mz_seed = anchor
-        .format
-        .is_empty()
+    let weak_mz_seed = anchor.format.is_empty()
         && anchor.sfx
-        && anchor
-            .evidence
-            .iter()
-            .any(|item| *item == "sfx:pe_header");
+        && anchor.evidence.iter().any(|item| *item == "sfx:pe_header");
     let cheap_embedded_archive = matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
         && anchor.sfx
         && anchor.standalone
@@ -1178,7 +1152,12 @@ fn proposal_owned_paths(proposal: &RelationProposal) -> HashSet<String> {
         .volumes
         .iter()
         .map(|(path, _, _, _, _)| path.to_ascii_lowercase())
-        .chain(proposal.companions.iter().map(|path| path.to_ascii_lowercase()))
+        .chain(
+            proposal
+                .companions
+                .iter()
+                .map(|path| path.to_ascii_lowercase()),
+        )
         .collect()
 }
 
@@ -1216,10 +1195,7 @@ fn is_launcher_candidate(name: &str, logical_name: &str) -> bool {
 }
 
 fn is_camouflaged_sfx_launcher(name: &str, logical_name: &str) -> bool {
-    let Some(extension) = Path::new(name)
-        .extension()
-        .and_then(|value| value.to_str())
-    else {
+    let Some(extension) = Path::new(name).extension().and_then(|value| value.to_str()) else {
         return false;
     };
     if !extension.eq_ignore_ascii_case("exe") {
@@ -1242,7 +1218,11 @@ fn validate_relation_proposal(
     let companion_candidates = std::mem::take(&mut proposal.companions);
     let mut anchors: HashMap<String, VolumeAnchor> = rows
         .iter()
-        .filter_map(|row| row.anchor.clone().map(|anchor| (row.path.to_ascii_lowercase(), anchor)))
+        .filter_map(|row| {
+            row.anchor
+                .clone()
+                .map(|anchor| (row.path.to_ascii_lowercase(), anchor))
+        })
         .collect();
 
     let bounded_raw_zip_relation = proposal.format == "zip"
@@ -1285,12 +1265,7 @@ fn validate_relation_proposal(
         volume_paths.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
         let tail_limit = if proposal.format == "zip" { 65_557 } else { 0 };
         let deep_anchors = py.detach(|| {
-            probe_volume_anchor_paths_deep(
-                &volume_paths,
-                1024 * 1024,
-                tail_limit,
-                path_passwords,
-            )
+            probe_volume_anchor_paths_deep(&volume_paths, 1024 * 1024, tail_limit, path_passwords)
         });
         for anchor in deep_anchors {
             anchors.insert(anchor.path.to_ascii_lowercase(), anchor);
@@ -1310,12 +1285,7 @@ fn validate_relation_proposal(
     // companion proof is only a bounded PE header check.
     if status == ProposalStatus::Valid && !companion_candidates.is_empty() {
         let companion_anchors = py.detach(|| {
-            probe_volume_anchor_paths_deep(
-                &companion_candidates,
-                1024 * 1024,
-                0,
-                path_passwords,
-            )
+            probe_volume_anchor_paths_deep(&companion_candidates, 1024 * 1024, 0, path_passwords)
         });
         let mut verified_companions: Vec<VolumeAnchor> = companion_anchors
             .into_iter()
@@ -1417,7 +1387,9 @@ fn validate_rar_proposal(
         .iter()
         .find(|(_, number, _, _, _)| *number == 1)
         .and_then(|(path, _, _, _, _)| anchors.get(&path.to_ascii_lowercase()))
-        .is_some_and(|anchor| anchor.sfx && anchor.structure_offset.is_some_and(|offset| offset > 0))
+        .is_some_and(|anchor| {
+            anchor.sfx && anchor.structure_offset.is_some_and(|offset| offset > 0)
+        })
         && proposal.volumes.iter().skip(1).all(|(path, _, _, _, _)| {
             anchors
                 .get(&path.to_ascii_lowercase())
@@ -1442,7 +1414,11 @@ fn validate_rar_proposal(
         let proof_paths = if raw_sfx {
             ordered_paths.clone()
         } else {
-            let Some((path, _, _, _, _)) = proposal.volumes.iter().max_by_key(|(_, number, _, _, _)| *number) else {
+            let Some((path, _, _, _, _)) = proposal
+                .volumes
+                .iter()
+                .max_by_key(|(_, number, _, _, _)| *number)
+            else {
                 return Ok(ProposalStatus::Inconclusive);
             };
             vec![path.clone()]
@@ -1459,15 +1435,17 @@ fn validate_rar_proposal(
         let Some(password) = password else {
             return Ok(ProposalStatus::NeedsPassword);
         };
-        let proof_offset = if raw_sfx { raw_sfx_start_offset } else {
+        let proof_offset = if raw_sfx {
+            raw_sfx_start_offset
+        } else {
             anchors
                 .get(&proof_paths[0].to_ascii_lowercase())
                 .and_then(|anchor| anchor.structure_offset)
                 .unwrap_or(0)
         };
-        match py.detach(|| {
-            probe_rar_terminal_with_password(&proof_paths, proof_offset, password, 4096)
-        }) {
+        match py
+            .detach(|| probe_rar_terminal_with_password(&proof_paths, proof_offset, password, 4096))
+        {
             Ok(Some(proof)) => Some((proof.end_block_found, proof.end_block_flags)),
             Ok(None) | Err(_) => return Ok(ProposalStatus::Inconclusive),
         }
@@ -1487,7 +1465,11 @@ fn validate_rar_proposal(
             Err(_) => return Ok(ProposalStatus::Inconclusive),
         }
     } else {
-        let Some((path, _, _, _, _)) = proposal.volumes.iter().max_by_key(|(_, number, _, _, _)| *number) else {
+        let Some((path, _, _, _, _)) = proposal
+            .volumes
+            .iter()
+            .max_by_key(|(_, number, _, _, _)| *number)
+        else {
             return Ok(ProposalStatus::Inconclusive);
         };
         let offset = anchors
@@ -1537,7 +1519,10 @@ fn validate_seven_zip_proposal(
     let Some(first) = anchors.get(&first_path.to_ascii_lowercase()) else {
         return ProposalStatus::Inconclusive;
     };
-    if first.format != "7z" || first.confidence != "strong" || !first.anchor_roles.contains(&"first") {
+    if first.format != "7z"
+        || first.confidence != "strong"
+        || !first.anchor_roles.contains(&"first")
+    {
         return if first.format.is_empty() {
             ProposalStatus::Inconclusive
         } else {
@@ -1557,7 +1542,11 @@ fn validate_seven_zip_proposal(
             rows.iter()
                 .find(|row| row.path.eq_ignore_ascii_case(path))
                 .and_then(|row| row.size)
-                .or_else(|| anchors.get(&path.to_ascii_lowercase()).map(|anchor| anchor.size))
+                .or_else(|| {
+                    anchors
+                        .get(&path.to_ascii_lowercase())
+                        .map(|anchor| anchor.size)
+                })
         })
         .sum::<u64>();
     if physical_size == expected {
@@ -1616,8 +1605,14 @@ fn validate_zip_proposal(
         .unwrap_or(0);
 
     if proposal.style == "zip_spanned" {
-        let first_is_spanned = first.evidence.iter().any(|item| *item == "zip:split_marker")
-            || (first.evidence.iter().any(|item| *item == "zip:local_header")
+        let first_is_spanned = first
+            .evidence
+            .iter()
+            .any(|item| *item == "zip:split_marker")
+            || (first
+                .evidence
+                .iter()
+                .any(|item| *item == "zip:local_header")
                 && first.multivolume
                 && first.continuation_to_next);
         let terminal_is_spanned = terminal
@@ -1631,7 +1626,10 @@ fn validate_zip_proposal(
             return Ok(ProposalStatus::Reject);
         }
     } else {
-        let first_is_raw = first.evidence.iter().any(|item| *item == "zip:local_header");
+        let first_is_raw = first
+            .evidence
+            .iter()
+            .any(|item| *item == "zip:local_header");
         let terminal_is_single_disk = terminal
             .evidence
             .iter()
@@ -1697,7 +1695,9 @@ fn ordinary_file_group_to_dict(
         is_split_member: archive_numbered_hypothesis,
         has_generic_001_head: archive_numbered_hypothesis
             && split_index == 1
-            && parsed.as_ref().is_some_and(|value| value.family == "generic"),
+            && parsed
+                .as_ref()
+                .is_some_and(|value| value.family == "generic"),
         is_plain_numeric_member: archive_numbered_hypothesis
             && parsed
                 .as_ref()
@@ -1737,7 +1737,10 @@ fn ordinary_file_group_to_dict(
     dict.set_item("head_metadata", head_metadata)?;
     dict.set_item(
         "format_reject_mask",
-        row.anchor.as_ref().map(|anchor| anchor.format_reject_mask).unwrap_or(0),
+        row.anchor
+            .as_ref()
+            .map(|anchor| anchor.format_reject_mask)
+            .unwrap_or(0),
     )?;
     Ok(dict.unbind())
 }
@@ -1779,12 +1782,14 @@ fn validated_proposal_to_dict(
         .map(|(path, _, _, _, _)| path.clone())
         .collect();
     let carrier = proposal.companions.first().cloned().unwrap_or_default();
-    let carrier_size = (!carrier.is_empty()).then(|| {
-        validation
-            .anchors
-            .get(&carrier.to_ascii_lowercase())
-            .map(|anchor| anchor.size)
-    }).flatten();
+    let carrier_size = (!carrier.is_empty())
+        .then(|| {
+            validation
+                .anchors
+                .get(&carrier.to_ascii_lowercase())
+                .map(|anchor| anchor.size)
+        })
+        .flatten();
     let dict = PyDict::new(py);
     dict.set_item("head_path", head_path)?;
     dict.set_item("head_name", basename(head_path))?;
@@ -1793,7 +1798,10 @@ fn validated_proposal_to_dict(
     dict.set_item("all_parts", PyList::new(py, &all_parts)?)?;
     dict.set_item("is_split_candidate", true)?;
     dict.set_item("head_size", head_anchor.map(|anchor| anchor.size))?;
-    dict.set_item("logical_size", proposal_logical_size(proposal, &validation.anchors))?;
+    dict.set_item(
+        "logical_size",
+        proposal_logical_size(proposal, &validation.anchors),
+    )?;
     dict.set_item("split_volumes", PyList::new(py, &volume_dicts)?)?;
     let metadata = if let Some(anchor) = head_anchor {
         relation_confirmed_anchor_to_dict(py, anchor)?
@@ -1810,7 +1818,9 @@ fn validated_proposal_to_dict(
     dict.set_item("carrier_size", carrier_size)?;
     dict.set_item(
         "format_reject_mask",
-        head_anchor.map(|anchor| anchor.format_reject_mask).unwrap_or(0),
+        head_anchor
+            .map(|anchor| anchor.format_reject_mask)
+            .unwrap_or(0),
     )?;
     Ok(dict.unbind())
 }
@@ -1851,12 +1861,14 @@ fn password_error_proposal_to_dict(
         .map(|(path, _, _, _, _)| path.clone())
         .collect();
     let carrier = proposal.companions.first().cloned().unwrap_or_default();
-    let carrier_size = (!carrier.is_empty()).then(|| {
-        validation
-            .anchors
-            .get(&carrier.to_ascii_lowercase())
-            .map(|value| value.size)
-    }).flatten();
+    let carrier_size = (!carrier.is_empty())
+        .then(|| {
+            validation
+                .anchors
+                .get(&carrier.to_ascii_lowercase())
+                .map(|value| value.size)
+        })
+        .flatten();
     let dict = PyDict::new(py);
     dict.set_item("head_path", &head.0)?;
     dict.set_item("head_name", basename(&head.0))?;
@@ -1865,7 +1877,10 @@ fn password_error_proposal_to_dict(
     dict.set_item("all_parts", PyList::new(py, &all_parts)?)?;
     dict.set_item("is_split_candidate", true)?;
     dict.set_item("head_size", anchor.map(|value| value.size))?;
-    dict.set_item("logical_size", proposal_logical_size(proposal, &validation.anchors))?;
+    dict.set_item(
+        "logical_size",
+        proposal_logical_size(proposal, &validation.anchors),
+    )?;
     dict.set_item("split_volumes", PyList::new(py, &volume_dicts)?)?;
     let mut metadata = anchor
         .map(|value| relation_confirmed_anchor_to_dict(py, value))
@@ -1885,7 +1900,10 @@ fn password_error_proposal_to_dict(
     dict.set_item("companion_paths", &proposal.companions)?;
     dict.set_item("carrier_path", &carrier)?;
     dict.set_item("carrier_size", carrier_size)?;
-    dict.set_item("format_reject_mask", anchor.map(|value| value.format_reject_mask).unwrap_or(0))?;
+    dict.set_item(
+        "format_reject_mask",
+        anchor.map(|value| value.format_reject_mask).unwrap_or(0),
+    )?;
     Ok(dict.unbind())
 }
 
@@ -1893,11 +1911,14 @@ fn proposal_logical_size(
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
 ) -> Option<u64> {
-    proposal.volumes.iter().try_fold(0u64, |total, (path, _, _, _, _)| {
-        anchors
-            .get(&path.to_ascii_lowercase())
-            .map(|anchor| total.saturating_add(anchor.size))
-    })
+    proposal
+        .volumes
+        .iter()
+        .try_fold(0u64, |total, (path, _, _, _, _)| {
+            anchors
+                .get(&path.to_ascii_lowercase())
+                .map(|anchor| total.saturating_add(anchor.size))
+        })
 }
 
 fn proposal_volume_dicts(
@@ -2000,9 +2021,8 @@ pub(crate) fn relations_resolve_volume_once(
     if visible_paths.is_empty() {
         return Ok(None);
     }
-    let anchors = py.detach(|| {
-        probe_volume_anchor_paths_cheap(&visible_paths, path_passwords.as_deref())
-    });
+    let anchors =
+        py.detach(|| probe_volume_anchor_paths_cheap(&visible_paths, path_passwords.as_deref()));
     let anchor_by_path: HashMap<String, VolumeAnchor> = anchors
         .into_iter()
         .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
@@ -2025,12 +2045,8 @@ pub(crate) fn relations_resolve_volume_once(
         .filter(|path| parent_directory_key(path) == directory)
         .map(|path| path.to_ascii_lowercase())
         .collect();
-    let groups = build_candidate_groups_from_physical(
-        py,
-        rows,
-        &filtered_keys,
-        path_passwords.as_deref(),
-    )?;
+    let groups =
+        build_candidate_groups_from_physical(py, rows, &filtered_keys, path_passwords.as_deref())?;
     let format_hint = normalize_retry_format(format_hint);
     for group in groups {
         let Some(is_split) = group
@@ -2044,15 +2060,12 @@ pub(crate) fn relations_resolve_volume_once(
             continue;
         }
         if !format_hint.is_empty() {
-            let metadata_format = group
-                .bind(py)
-                .get_item("head_metadata")?
-                .and_then(|value| {
-                    value
-                        .get_item("format")
-                        .ok()
-                        .and_then(|format| format.extract::<String>().ok())
-                });
+            let metadata_format = group.bind(py).get_item("head_metadata")?.and_then(|value| {
+                value
+                    .get_item("format")
+                    .ok()
+                    .and_then(|format| format.extract::<String>().ok())
+            });
             if metadata_format.is_some_and(|format| format != format_hint) {
                 continue;
             }
@@ -2063,9 +2076,10 @@ pub(crate) fn relations_resolve_volume_once(
             .map(|value| value.extract::<Vec<String>>())
             .transpose()?
             .unwrap_or_default();
-        if current_paths.iter().all(|current| {
-            parts.iter().any(|part| part.eq_ignore_ascii_case(current))
-        }) {
+        if current_paths
+            .iter()
+            .all(|current| parts.iter().any(|part| part.eq_ignore_ascii_case(current)))
+        {
             return Ok(Some(group));
         }
     }
@@ -2136,7 +2150,6 @@ pub(crate) fn volume_anchor_to_dict(py: Python<'_>, anchor: &VolumeAnchor) -> Py
     Ok(dict.unbind())
 }
 
-
 fn relation_confirmed_anchor_to_dict(
     py: Python<'_>,
     anchor: &VolumeAnchor,
@@ -2196,13 +2209,10 @@ fn get_logical_name(filename: &str, is_archive: bool) -> String {
     if let Some(parsed) = parse_relation_numbered_volume(filename) {
         return logical_name_from_parsed(&parsed);
     }
-    let name = rar_part_suffix_re().replace(filename, "").to_string();
-    if name != filename {
-        return clean_logical_name(&name);
-    }
-
-    let zero_zip = zip_zero_numbered_suffix_re().replace(&name, "").to_string();
-    if zero_zip != name {
+    let zero_zip = zip_zero_numbered_suffix_re()
+        .replace(filename, "")
+        .to_string();
+    if zero_zip != filename {
         return clean_logical_name(&zero_zip);
     }
 
@@ -2254,7 +2264,8 @@ fn parse_relation_numbered_volume(path: &str) -> Option<ParsedVolume> {
         .find(|candidate| {
             !candidate.decorated
                 || (candidate.family == "rar"
-                    && matches!(candidate.style, "rar_part" | "rar_sfx_part"))
+                    && matches!(candidate.style, "rar_part" | "rar_sfx_part")
+                    && parse_marker_numbered_re().is_match(filename))
         })?;
     if !directory.is_empty() {
         parsed.prefix = format!("{directory}{}", parsed.prefix);
@@ -2285,8 +2296,6 @@ pub(crate) fn relations_size_filter_split_family_keys(path: &str) -> Vec<String>
             other => other,
         };
         keys.push(split_size_family_key(scheme, &parsed.prefix));
-    } else if let Some(parsed) = parse_loose_rar_part_volume(basename(path)) {
-        keys.push(split_size_family_key("rar:part", &parsed.prefix));
     }
 
     // Canonical heads/tails do not themselves carry a numeric suffix, but
@@ -2465,9 +2474,6 @@ fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
                 );
             }
         }
-        if let Some(parsed) = parse_loose_rar_part_volume(filename) {
-            push_unique_volume_candidate(&mut candidates, parsed);
-        }
         if let Some(captures) = parse_old_rar_re().captures(filename) {
             let number = captures.name("number")?.as_str();
             if let Some(number) = number.parse::<u32>().ok() {
@@ -2603,8 +2609,10 @@ fn parse_marker_numbered_volume(path: &str) -> Option<ParsedVolume> {
         style,
         width: raw_number.len(),
         family,
-        decorated: !tail.eq_ignore_ascii_case(".rar")
-            && !(number == 1 && tail.eq_ignore_ascii_case(".exe")),
+        decorated: !(tail.eq_ignore_ascii_case(".rar")
+            || tail.eq_ignore_ascii_case(".7z")
+            || tail.eq_ignore_ascii_case(".zip")
+            || (number == 1 && tail.eq_ignore_ascii_case(".exe"))),
     })
 }
 
@@ -2623,7 +2631,9 @@ fn parse_loose_rar_part_volume(path: &str) -> Option<ParsedVolume> {
         .rsplit_once('.')
         .filter(|(_, noise)| {
             (1..=4).contains(&noise.len())
-                && noise.chars().all(|character| character.is_ascii_uppercase())
+                && noise
+                    .chars()
+                    .all(|character| character.is_ascii_uppercase())
         })
         .map(|(base, _)| base)
         .unwrap_or(prefix);
@@ -2726,7 +2736,7 @@ fn parsed_decorated_marker(
     family: &'static str,
     sfx: bool,
 ) -> Option<ParsedVolume> {
-    let number = raw_number.parse().ok()?;
+    let number = raw_number.parse::<u32>().ok().filter(|value| *value > 0)?;
     if family == "rar" {
         return Some(ParsedVolume {
             prefix: prefix.to_string(),
@@ -2755,6 +2765,9 @@ fn parsed_decorated_numeric(
     sfx: bool,
 ) -> Option<ParsedVolume> {
     let mut number: u32 = raw_number.parse().ok()?;
+    if marker_numbered && number == 0 {
+        return None;
+    }
     let style = if family == "zip" && raw_number.len() == 4 && raw_number.starts_with('0') {
         number = number.saturating_add(1);
         "zip_zero_numbered"
@@ -2767,6 +2780,9 @@ fn parsed_decorated_numeric(
     } else {
         "numeric_suffix"
     };
+    if number == 0 {
+        return None;
+    }
     let canonical_prefix = if matches!(style, "rar_part" | "rar_sfx_part") {
         prefix.to_string()
     } else {
@@ -2840,11 +2856,6 @@ fn re(pattern: &str) -> Regex {
         .expect("relation regex should compile")
 }
 
-fn rar_part_suffix_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"\.part\d+\.(?:rar|exe)(?:\.[^.]+)?$"))
-}
-
 fn archive_numbered_suffix_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
     VALUE.get_or_init(|| re(r"\.(7z|zip|rar)\.\d{3}(?:\.[^.]+)?$"))
@@ -2908,14 +2919,14 @@ fn rar_loose_part_re() -> &'static Regex {
 fn decorated_marker_format_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
     VALUE.get_or_init(|| {
-        re(r"^(?P<prefix>.+)\.[^.]*(?:part|vol(?:ume)?)[^.\d]*(?P<number>\d{1,6})[^.]*\.[^.]*(?P<format>7z|zip|rar|exe)[^.]*(?:\.[^.]+)*$")
+        re(r"^(?P<prefix>.+)\.[^.]*(?:part|vol(?:ume)?)[^.\d]*(?P<number>\d+)(?:[^.\d][^.]*)?\.[^.]*(?P<format>7z|zip|rar|exe)[^.]*(?:\.[^.]+)*$")
     })
 }
 
 fn decorated_format_marker_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
     VALUE.get_or_init(|| {
-        re(r"^(?P<prefix>.+)\.[^.]*(?P<format>7z|zip|rar|exe)[^.]*\.[^.]*(?:part|vol(?:ume)?)[^.\d]*(?P<number>\d{1,6})[^.]*(?:\.[^.]+)*$")
+        re(r"^(?P<prefix>.+)\.[^.]*(?P<format>7z|zip|rar|exe)[^.]*\.[^.]*(?:part|vol(?:ume)?)[^.\d]*(?P<number>\d+)(?:[^.\d][^.]*)?(?:\.[^.]+)*$")
     })
 }
 
@@ -2941,6 +2952,65 @@ fn decorated_old_rar_re() -> &'static Regex {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ordinary_words_and_invalid_part_numbers_are_not_volumes() {
+        for name in [
+            "Counterpart2.zip",
+            "Rampart1.rar",
+            "apart10.bin",
+            "report_part3_final.docx",
+            "release.Counterpart2.rar",
+            "release.report_part3_final.rar",
+            "a.part0.rar",
+            "a.part0.rar.hidden",
+            "a.rar.part0.hidden",
+            "a.part4294967296.rar",
+            "a.rar.part4294967296.hidden",
+        ] {
+            assert!(parse_relation_numbered_volume(name).is_none(), "{name}");
+        }
+        for (name, family) in [("photo.part2.7z", "7z"), ("a.part1.zip", "zip")] {
+            let parsed = parse_relation_numbered_volume(name).unwrap();
+            assert_eq!(parsed.family, family);
+            assert_eq!(parsed.style, "part_numbered");
+        }
+        for name in ["a.part4294967295.rar.hidden", "a.rar.part4294967295.hidden"] {
+            assert_eq!(
+                parse_relation_numbered_volume(name).unwrap().number,
+                u32::MAX
+            );
+        }
+        assert_eq!(get_logical_name("Counterpart2.zip", true), "Counterpart2");
+        assert_eq!(get_logical_name("Rampart1.rar", true), "Rampart1");
+        assert!(!relations_size_filter_split_family_keys("Counterpart2.zip")
+            .iter()
+            .any(|key| key.starts_with("rar:part")));
+    }
+
+    #[test]
+    fn loose_rar_part_names_require_existing_volume_structure() {
+        for (multivolume, needs_password) in [(false, false), (true, false), (false, true)] {
+            let row = RelationInput {
+                path: "payloadAApart2.photo".to_string(),
+                path_key: "payloadaapart2.photo".to_string(),
+                name: "payloadAApart2.photo".to_string(),
+                size: Some(100),
+                relation_member_eligible: true,
+                anchor: Some(VolumeAnchor {
+                    format: "rar".to_string(),
+                    multivolume,
+                    needs_password,
+                    ..VolumeAnchor::default()
+                }),
+            };
+            let index = DirectoryNameIndex::build(std::slice::from_ref(&row));
+            assert_eq!(
+                !index.candidates(&row).is_empty(),
+                multivolume || needs_password
+            );
+        }
+    }
 
     #[test]
     fn size_filter_family_keys_join_numbered_7z_parts_and_exclude_other_prefixes() {
@@ -3096,10 +3166,7 @@ mod tests {
         assert_eq!(parsed.family, "generic");
     }
 
-    fn validation_with_owned_paths(
-        status: ProposalStatus,
-        paths: &[&str],
-    ) -> ProposalValidation {
+    fn validation_with_owned_paths(status: ProposalStatus, paths: &[&str]) -> ProposalValidation {
         ProposalValidation {
             status,
             proposal: RelationProposal {
@@ -3136,30 +3203,18 @@ mod tests {
                 ProposalStatus::Valid,
                 &[r"C:\case.part2.rar", r"C:\case.part3.rar"],
             ),
-            validation_with_owned_paths(
-                ProposalStatus::Valid,
-                &[r"C:\other.part1.rar"],
-            ),
-            validation_with_owned_paths(
-                ProposalStatus::NeedsPassword,
-                &[r"C:\case.part2.rar"],
-            ),
+            validation_with_owned_paths(ProposalStatus::Valid, &[r"C:\other.part1.rar"]),
+            validation_with_owned_paths(ProposalStatus::NeedsPassword, &[r"C:\case.part2.rar"]),
         ];
         let owned_paths: Vec<HashSet<String>> = validations
             .iter()
             .map(|validation| proposal_owned_paths(&validation.proposal))
             .collect();
 
-        let valid_conflicts = conflicting_proposal_indexes(
-            &validations,
-            &owned_paths,
-            ProposalStatus::Valid,
-        );
-        let password_conflicts = conflicting_proposal_indexes(
-            &validations,
-            &owned_paths,
-            ProposalStatus::NeedsPassword,
-        );
+        let valid_conflicts =
+            conflicting_proposal_indexes(&validations, &owned_paths, ProposalStatus::Valid);
+        let password_conflicts =
+            conflicting_proposal_indexes(&validations, &owned_paths, ProposalStatus::NeedsPassword);
 
         assert_eq!(valid_conflicts, HashSet::from([0, 1]));
         assert!(password_conflicts.is_empty());
@@ -3177,13 +3232,9 @@ mod tests {
             .map(|validation| proposal_owned_paths(&validation.proposal))
             .collect();
 
-        let conflicts = conflicting_proposal_indexes(
-            &validations,
-            &owned_paths,
-            ProposalStatus::Valid,
-        );
+        let conflicts =
+            conflicting_proposal_indexes(&validations, &owned_paths, ProposalStatus::Valid);
 
         assert_eq!(conflicts, HashSet::from([0, 1, 2]));
     }
-
 }

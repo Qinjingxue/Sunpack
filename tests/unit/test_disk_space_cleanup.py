@@ -105,7 +105,8 @@ def test_failed_owner_releases_reference_without_deleting_source(tmp_path, monke
     assert source.exists()
 
 
-def test_successful_owner_can_request_shared_cleanup_after_failed_sibling(tmp_path):
+@pytest.mark.parametrize("success_first", [False, True])
+def test_failed_sibling_vetoes_shared_cleanup(tmp_path, success_first):
     shared = str(tmp_path / "carrier.bin")
     table = CleanupRefTable()
     failed = _Task("failed", [shared])
@@ -113,11 +114,12 @@ def test_successful_owner_can_request_shared_cleanup_after_failed_sibling(tmp_pa
     table.register_all([failed, success])
     table.mark_cleanup_eligible(success)
 
-    assert table.release(failed).should_clean is False
-    request = table.release(success)
+    first, last = (success, failed) if success_first else (failed, success)
+    assert table.release(first).should_clean is False
+    request = table.release(last)
 
     assert request.paths == (shared,)
-    assert request.should_clean is True
+    assert request.should_clean is False
     assert table.count(shared) == 0
 
 
@@ -149,16 +151,18 @@ def test_source_cleanup_retry_is_local_to_cleanup_side_task(tmp_path, monkeypatc
     ("failure", True), ("failure", False),
     ("partial", True), ("partial", False), ("sweep", True),
 ])
-def test_shared_cleanup_preserves_unsuccessful_owner_exclusive_parts(
+def test_shared_cleanup_preserves_unsuccessful_owner_shared_and_exclusive_parts(
     tmp_path, monkeypatch, mode, release_kind, success_first,
 ):
     shared = tmp_path / "carrier.bin"
     exclusive = tmp_path / "failed-only.002"
+    success_only = tmp_path / "success-only.002"
     shared.write_text("shared payload")
     exclusive.write_text("unrecovered payload")
+    success_only.write_text("recovered payload")
     monkeypatch.setattr(cleanup, "send2trash", os.remove)
     scope = _scope(mode)
-    success = _Task("success", [shared])
+    success = _Task("success", [shared, success_only])
     unsuccessful = _Task("unsuccessful", [shared, exclusive])
     scope.register([success, unsuccessful])
 
@@ -183,10 +187,13 @@ def test_shared_cleanup_preserves_unsuccessful_owner_exclusive_parts(
         return [await scope.apply(request, broker=_InlineBroker()) for request in (first, second)]
 
     outcomes = asyncio.run(run())
-    assert [path for outcome in outcomes for path in outcome.deleted] == [str(shared)]
-    assert set(path for outcome in outcomes for path in outcome.released) == {str(shared), str(exclusive)}
+    assert [path for outcome in outcomes for path in outcome.deleted] == [str(success_only)]
+    assert set(path for outcome in outcomes for path in outcome.released) == {
+        str(shared), str(exclusive), str(success_only),
+    }
     assert exclusive.exists()
-    assert not shared.exists()
+    assert shared.exists()
+    assert not success_only.exists()
     assert scope._table.pending_tasks() == ()
 
 
@@ -370,3 +377,23 @@ def test_refresh_adds_shared_volume_reference_once(tmp_path):
     table.mark_cleanup_eligible(retry)
     assert set(table.release(retry).cleanup_paths) == {first, added}
     assert table.count(added) == 0
+
+
+def test_failed_sibling_veto_survives_replacement_plan_and_clears_after_release(tmp_path):
+    shared, added = [str(tmp_path / name) for name in ("carrier.bin", "added.002")]
+    table = CleanupRefTable()
+    failed = _Task("failed", [shared])
+    success = _Task("success", [shared])
+    table.register_all([failed, success])
+    table.release(failed)
+    success.cleanup_parts.append(added)
+    table.refresh(success)
+    table.mark_cleanup_eligible(success)
+    request = table.release(success)
+    assert set(request.paths) == {shared, added}
+    assert request.cleanup_paths == (added,)
+
+    # A subsequent successful retry is a new ownership lifetime.
+    table.register(failed)
+    table.mark_cleanup_eligible(failed)
+    assert table.release(failed).cleanup_paths == (shared,)
