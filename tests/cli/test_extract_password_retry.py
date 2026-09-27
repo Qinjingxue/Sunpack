@@ -5,7 +5,7 @@ from sunpack.runtime.cli.cli_context import CliContext
 from sunpack.runtime.cli.cli_reporter import CliReporter
 from sunpack.runtime.cli.commands import extract
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.results import OutcomeKind, TargetRunResult
+from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
 from sunpack.runtime.cli.cli_runtime import build_password_summary
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
@@ -26,6 +26,47 @@ def test_extract_config_combines_clipboard_passwords_for_engine():
     config = extract._extract_run_config({}, password_summary)
 
     assert config["user_passwords"] == ["cli-secret", "shared-secret", "clipboard-secret"]
+
+
+def test_extract_preserves_scan_failure_when_target_succeeds(tmp_path, monkeypatch):
+    target = tmp_path / "archive.zip"
+    target.write_bytes(b"archive")
+
+    class FakeRunner:
+        def __init__(self, _config):
+            self.recent_passwords = []
+
+        def run_targets(self, _target_paths):
+            return RunSummary(
+                target_results=(
+                    TargetRunResult(str(target), OutcomeKind.COMPLETE_SUCCESS),
+                ),
+                scan_failed_tasks=("unreadable.bin [discovery failed]",),
+            )
+
+    monkeypatch.setattr(extract, "pipeline_engine", lambda _config: FakePipelineEngine(FakeRunner))
+    monkeypatch.setattr(extract, "collect_clipboard_passwords", lambda _config: [])
+
+    args = SimpleNamespace(
+        paths=[str(target)],
+        password=[],
+        password_file=None,
+        prompt_passwords=False,
+        no_builtin_passwords=True,
+        recursive_extract=None,
+        archive_cleanup_mode=None,
+        flatten_single_directory=None,
+        json=False,
+        quiet=False,
+        verbose=False,
+    )
+    ctx = CliContext(language="en", reporter=CliReporter())
+
+    exit_code, result = asyncio.run(extract.handle(args, ctx))
+
+    assert exit_code != 0
+    assert result.summary["success_count"] == 1
+    assert result.errors == ["unreadable.bin [discovery failed]"]
 
 
 def test_extract_prompts_for_password_retry_after_wrong_password(tmp_path, monkeypatch):
