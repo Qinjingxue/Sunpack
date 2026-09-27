@@ -1,0 +1,66 @@
+import asyncio
+from datetime import datetime
+
+from sunpack.pipeline.discovery.filesystem.filters.modules.mtime_range import (
+    MtimeRangeScanFilter,
+    _mtime_or_none,
+)
+from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import (
+    SingleArchiveExtractor,
+)
+
+
+class _InlineBroker:
+    async def run(self, _stage, _file_id, func, *args, **kwargs):
+        kwargs.pop("request_id", None)
+        kwargs.pop("cancellation", None)
+        return func(*args, **kwargs)
+
+
+class _FailingRunner:
+    async def submit_attempt_asyncio(self, **_request):
+        raise RuntimeError("worker disconnected")
+
+    def failed_process_for_exception(self, exc, request):
+        assert isinstance(exc, RuntimeError)
+        assert request == {"archive": "sample.zip"}
+        return "failed-process"
+
+
+def test_async_worker_failure_reaches_failed_process_fallback():
+    runner = _FailingRunner()
+    extractor = SingleArchiveExtractor(
+        password_store=None,
+        password_resolver=None,
+        metadata_scanner=None,
+        retry_policy=None,
+        sevenzip_runner=runner,
+    )
+
+    def state():
+        sent = yield {"archive": "sample.zip"}
+        return sent
+
+    extractor._extract_state_machine = lambda *_args, **_kwargs: state()
+
+    result = asyncio.run(
+        extractor.extract_asyncio(
+            _InlineBroker(),
+            object(),
+            "out",
+            request_id="request",
+            file_id="file",
+            cancellation=None,
+        )
+    )
+
+    assert result == "failed-process"
+
+
+def test_compact_yyyymmdd_is_parsed_as_a_date_before_numeric_timestamp():
+    expected = int(datetime.strptime("20240101", "%Y%m%d").timestamp() * 1_000_000_000)
+
+    assert _mtime_or_none("20240101") == expected
+
+    configured = MtimeRangeScanFilter.from_config({"since": "20240101"})
+    assert configured.value_range.gte == expected
