@@ -6,7 +6,7 @@ import threading
 from typing import Any
 
 from sunpack.core.config.advanced_defaults import _payload as _advanced_defaults_payload
-from sunpack.core.config.detection_view import DIRECTORY_SCAN_MODES, directory_scan_mode, scan_filters_config
+from sunpack.core.config.detection_view import DIRECTORY_SCAN_MODES, directory_scan_mode
 from sunpack.core.config.schema import ConfigSchemaError, config_fields, normalize_config, validate_external_config
 from sunpack.core.support.json_format import load_json_file
 from sunpack.core.support.resources import candidate_resource_paths, dedupe_paths, first_existing_path, program_data_dir
@@ -302,7 +302,7 @@ def _validate_pipeline(config: dict[str, Any]):
     if scan_mode not in DIRECTORY_SCAN_MODES:
         allowed = ", ".join(sorted(DIRECTORY_SCAN_MODES))
         raise ConfigError(f"filesystem.directory_scan_mode must be one of: {allowed}")
-    filters = scan_filters_config(config)
+    filters = filesystem.get("scan_filters")
     if not isinstance(filters, list):
         raise ConfigError("Missing required filesystem.scan_filters list")
     for index, scan_filter in enumerate(filters):

@@ -11,6 +11,7 @@ from io import BytesIO
 
 import pytest
 
+from sunpack_native import inspect_rar_structure
 from sunpack.core.analysis.embedded import scan_embedded_archives
 from sunpack.core.analysis.result import ArchiveFormatEvidence
 from sunpack.core.analysis.engine import AnalysisEngine
@@ -64,6 +65,20 @@ def _rar5_bytes() -> bytes:
     return b"Rar!\x1a\x07\x01\x00" + _rar5_block(1) + _rar5_block(5)
 
 
+def _rar5_oversized_size_vint_block() -> bytes:
+    # A non-canonical 10-byte vint close to u64::MAX used to wrap the
+    # semantic walker's total-header arithmetic after the bounded first-pass
+    # inspector had already rejected the block.
+    oversized_header_size = _rar5_vint((1 << 64) - 11)
+    return b"\x00\x00\x00\x00" + oversized_header_size + _rar5_vint(2) + _rar5_vint(0)
+
+
+def _rar5_impossible_extra_area_block() -> bytes:
+    fields = _rar5_vint(1) + _rar5_vint(0x01) + _rar5_vint(127)
+    header_data = _rar5_vint(len(fields)) + fields
+    return crc32(header_data).to_bytes(4, "little") + header_data
+
+
 def _seven_zip_bytes() -> bytes:
     gap = b"abcde"
     next_header = b"\x01"
@@ -84,6 +99,33 @@ def _tar_bytes() -> bytes:
     with tarfile.open(fileobj=buffer, mode="w") as tf:
         tf.addfile(info, BytesIO(payload))
     return buffer.getvalue()
+
+
+def test_rar5_oversized_second_header_vint_does_not_panic(tmp_path):
+    archive = tmp_path / "crafted-rar5.bin"
+    archive.write_bytes(
+        b"Rar!\x1a\x07\x01\x00"
+        + _rar5_block(1)
+        + _rar5_oversized_size_vint_block()
+    )
+
+    result = dict(inspect_rar_structure(str(archive)))
+
+    assert result["magic_matched"] is True
+    assert result["error"] == "rar5_second_header_size_vint_too_long"
+
+
+def test_rar5_extra_area_larger_than_header_does_not_panic(tmp_path):
+    archive = tmp_path / "crafted-rar5-extra.bin"
+    archive.write_bytes(
+        b"Rar!\x1a\x07\x01\x00"
+        + _rar5_impossible_extra_area_block()
+    )
+
+    result = dict(inspect_rar_structure(str(archive)))
+
+    assert result["magic_matched"] is True
+    assert result["format"] == "rar"
 
 
 def test_clean_whole_input_formats_use_structure_evidence(tmp_path):
