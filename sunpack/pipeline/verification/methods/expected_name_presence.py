@@ -25,7 +25,7 @@ from sunpack.core.contracts.verification import (
     VerificationIssue,
     VerificationStep,
 )
-from sunpack.core.support.path_names import clean_relative_archive_path, normalize_match_path
+from sunpack.core.support.path_names import clean_relative_archive_path
 
 
 
@@ -159,7 +159,7 @@ class ExpectedNamePresenceMethod:
             cleaned = clean_relative_archive_path(candidate)
             if not cleaned:
                 continue
-            key = normalize_match_path(cleaned)
+            key = cleaned
             if key in seen:
                 continue
             seen.add(key)

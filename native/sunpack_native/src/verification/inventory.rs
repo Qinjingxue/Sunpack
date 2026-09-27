@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use unicode_normalization::UnicodeNormalization;
 
 const CRC_BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -148,53 +147,96 @@ struct OutputIndex {
     files: Arc<Vec<OutputFileRecord>>,
     root: PathBuf,
     by_path: HashMap<String, usize>,
-    by_basename: HashMap<String, Vec<usize>>,
+    by_folded_path: HashMap<String, usize>,
+    by_basename: HashMap<String, usize>,
+}
+
+const AMBIGUOUS_OUTPUT: usize = usize::MAX;
+
+fn insert_unique_output(index: &mut HashMap<String, usize>, key: String, value: usize) {
+    index
+        .entry(key)
+        .and_modify(|entry| *entry = AMBIGUOUS_OUTPUT)
+        .or_insert(value);
 }
 
 impl OutputIndex {
     fn new(snapshot: &OutputInventoryVerificationSnapshot) -> Self {
         let mut by_path = HashMap::with_capacity(snapshot.files.len());
-        let mut by_basename: HashMap<String, Vec<usize>> = HashMap::new();
         for (index, item) in snapshot.files.iter().enumerate() {
             let path = output_relative_path(item);
             if path.is_empty() || path.contains(".sunpack/") {
                 continue;
             }
-            let normalized = normalize_match_path(&path);
-            if normalized.is_empty() {
-                continue;
-            }
-            by_path.entry(normalized.clone()).or_insert(index);
-            by_basename
-                .entry(normalize_match_name(basename(&normalized)))
-                .or_default()
-                .push(index);
+            insert_unique_output(&mut by_path, path, index);
         }
         Self {
             files: Arc::clone(&snapshot.files),
             root: PathBuf::from(&snapshot.root),
             by_path,
-            by_basename,
+            by_folded_path: HashMap::new(),
+            by_basename: HashMap::new(),
         }
     }
 
-    fn match_index(&self, expected_path: &str, mode: BasenameMode) -> Option<(usize, &'static str)> {
-        let normalized = normalize_match_path(expected_path);
-        if let Some(index) = self.by_path.get(&normalized) {
-            return Some((*index, "path"));
-        }
-        if matches!(mode, BasenameMode::None) {
-            return None;
-        }
-        let basename = normalize_match_name(basename(&normalized));
-        let candidates = self.by_basename.get(&basename)?;
-        match mode {
-            BasenameMode::None => None,
-            BasenameMode::Unique if candidates.len() != 1 => None,
-            BasenameMode::Unique | BasenameMode::Any => {
-                candidates.first().copied().map(|index| (index, "basename"))
+    fn match_expected(
+        &mut self,
+        expected: &[ArchiveFile],
+        mode: BasenameMode,
+    ) -> Vec<Option<(usize, &'static str)>> {
+        let mut matched = vec![None; expected.len()];
+        let mut used = vec![false; self.files.len()];
+        let mut remaining = expected.iter().filter(|item| !item.unsafe_path).count();
+        // Reserve exact matches for the entire manifest before any fallback
+        // can steal another entry's output. Every output contributes once.
+        for pass in 0..3 {
+            if remaining == 0 || (pass == 2 && matches!(mode, BasenameMode::None)) {
+                break;
+            }
+            if pass == 1 {
+                // The common exact-path case never builds fallback indexes.
+                for (output, item) in self.files.iter().enumerate() {
+                    let path = output_relative_path(item);
+                    if path.is_empty() || path.contains(".sunpack/") {
+                        continue;
+                    }
+                    let folded = normalize_match_path(&path);
+                    insert_unique_output(&mut self.by_folded_path, folded.clone(), output);
+                    if !matches!(mode, BasenameMode::None) {
+                        insert_unique_output(
+                            &mut self.by_basename,
+                            normalize_match_name(basename(&folded)),
+                            output,
+                        );
+                    }
+                }
+            }
+            for (position, item) in expected.iter().enumerate() {
+                if item.unsafe_path || matched[position].is_some() {
+                    continue;
+                }
+                let (output, by) = match pass {
+                    0 => (self.by_path.get(&item.path), "path"),
+                    1 => (
+                        self.by_folded_path.get(&normalize_match_path(&item.path)),
+                        "path",
+                    ),
+                    _ => (
+                        self.by_basename
+                            .get(&normalize_match_name(basename(&item.path))),
+                        "basename",
+                    ),
+                };
+                if let Some(&output) = output {
+                    if output != AMBIGUOUS_OUTPUT && !used[output] {
+                        used[output] = true;
+                        matched[position] = Some((output, by));
+                        remaining -= 1;
+                    }
+                }
             }
         }
+        matched
     }
 
     fn crc_for(
@@ -233,7 +275,8 @@ fn match_inventory(
         return empty_status_result("not_directory", expected.len(), detail_offset);
     }
 
-    let index = OutputIndex::new(&snapshot);
+    let mut index = OutputIndex::new(&snapshot);
+    let matches = index.match_expected(&expected, basename_mode);
     let mut coverage = Coverage::default();
     coverage.expected_files = expected.len();
 
@@ -252,9 +295,8 @@ fn match_inventory(
         if let Some(expected_size) = item.size {
             coverage.expected_bytes = coverage.expected_bytes.saturating_add(expected_size);
         }
-        let emit = include_observations
-            && expected_index >= detail_offset
-            && expected_index < detail_end;
+        let emit =
+            include_observations && expected_index >= detail_offset && expected_index < detail_end;
 
         if item.unsafe_path {
             coverage.failed_files += 1;
@@ -279,7 +321,7 @@ fn match_inventory(
             continue;
         }
 
-        let Some((output_index, matched_by)) = index.match_index(&item.path, basename_mode) else {
+        let Some((output_index, matched_by)) = matches[expected_index] else {
             coverage.missing_files += 1;
             missing_count += 1;
             if missing.len() < max_issue_items {
@@ -403,16 +445,14 @@ fn match_inventory(
                 ("unverified", size_progress)
             } else {
                 coverage.complete_files += 1;
-                coverage.complete_bytes =
-                    coverage.complete_bytes.saturating_add(expected_size);
+                coverage.complete_bytes = coverage.complete_bytes.saturating_add(expected_size);
                 ("complete", size_progress)
             }
         } else if item.has_crc && verify_crc && actual_crc.is_none() {
             ("unverified", size_progress)
         } else {
             coverage.complete_files += 1;
-            coverage.complete_bytes =
-                coverage.complete_bytes.saturating_add(actual_size);
+            coverage.complete_bytes = coverage.complete_bytes.saturating_add(actual_size);
             ("complete", size_progress)
         };
 
@@ -457,7 +497,11 @@ fn match_inventory(
     }
 }
 
-fn empty_status_result(status: &'static str, detail_total: usize, detail_offset: usize) -> MatchResult {
+fn empty_status_result(
+    status: &'static str,
+    detail_total: usize,
+    detail_offset: usize,
+) -> MatchResult {
     MatchResult {
         status,
         coverage: Coverage {
@@ -527,8 +571,7 @@ fn match_result_to_py(py: Python<'_>, matched: MatchResult) -> PyResult<Py<PyDic
 }
 
 fn coverage_to_py(py: Python<'_>, coverage: &Coverage) -> PyResult<Py<PyDict>> {
-    let file_coverage =
-        coverage.matched_files as f64 / coverage.expected_files.max(1) as f64;
+    let file_coverage = coverage.matched_files as f64 / coverage.expected_files.max(1) as f64;
     let byte_coverage = if coverage.expected_bytes > 0 {
         (coverage.matched_bytes as f64 / coverage.expected_bytes as f64).clamp(0.0, 1.0)
     } else {
@@ -540,8 +583,7 @@ fn coverage_to_py(py: Python<'_>, coverage: &Coverage) -> PyResult<Py<PyDict>> {
             .expected_files
             .saturating_sub(coverage.failed_files + coverage.missing_files)
             as f64;
-        completeness =
-            completeness.min((non_failed / coverage.expected_files as f64).max(0.0));
+        completeness = completeness.min((non_failed / coverage.expected_files as f64).max(0.0));
     }
 
     let result = PyDict::new(py);
@@ -610,8 +652,7 @@ fn archive_items_from_py(archive_files: &Bound<'_, PyAny>) -> PyResult<Vec<Archi
             path,
             raw_path: raw_path.clone(),
             unsafe_path: unsafe_archive_path(&raw_path, &raw_cleaned),
-            size: py_u64(dict, "size")?
-                .or_else(|| py_u64(dict, "unpacked_size").ok().flatten()),
+            size: py_u64(dict, "size")?.or_else(|| py_u64(dict, "unpacked_size").ok().flatten()),
             has_crc,
             crc32: py_u32(dict, "crc32")?,
         });
@@ -699,7 +740,9 @@ fn clean_relative_archive_path(value: &str) -> String {
 }
 
 fn normalize_match_name(value: &str) -> String {
-    value.nfc().collect::<String>().to_lowercase()
+    // Non-ASCII names must retain their actual code points. Unicode text
+    // equivalence is not evidence that two filesystem entries are identical.
+    value.to_ascii_lowercase()
 }
 
 fn normalize_match_path(value: &str) -> String {
@@ -770,7 +813,13 @@ fn windows_output_part_needs_mapping(part: &str) -> bool {
 fn windows_output_part(part: &str) -> String {
     let mut mapped: String = part
         .chars()
-        .map(|value| if is_windows_invalid_name_char(value) { '_' } else { value })
+        .map(|value| {
+            if is_windows_invalid_name_char(value) {
+                '_'
+            } else {
+                value
+            }
+        })
         .collect();
     let kept = mapped.trim_end_matches(['.', ' ']).len();
     let trailing = mapped.len() - kept;
@@ -798,9 +847,7 @@ fn windows_output_relative_path(cleaned: String) -> String {
 fn size_progress(actual_size: Option<u64>, expected_size: Option<u64>) -> Option<f64> {
     match (actual_size, expected_size) {
         (Some(_), Some(0)) => Some(1.0),
-        (Some(actual), Some(expected)) => {
-            Some((actual as f64 / expected as f64).clamp(0.0, 1.0))
-        }
+        (Some(actual), Some(expected)) => Some((actual as f64 / expected as f64).clamp(0.0, 1.0)),
         (Some(_), None) => None,
         (None, Some(_)) => None,
         (None, None) => None,
@@ -814,6 +861,112 @@ fn round6(value: f64) -> f64 {
 #[cfg(test)]
 mod windows_output_name_tests {
     use super::*;
+
+    fn bug_regression_match(
+        expected: &[(&str, u32)],
+        actual: &[(&str, u32)],
+        mode: BasenameMode,
+    ) -> MatchResult {
+        let expected = expected
+            .iter()
+            .map(|(path, crc)| ArchiveFile {
+                path: (*path).into(),
+                raw_path: (*path).into(),
+                unsafe_path: false,
+                size: Some(1),
+                has_crc: true,
+                crc32: Some(*crc),
+            })
+            .collect();
+        let files = actual
+            .iter()
+            .enumerate()
+            .map(|(index, (path, crc))| OutputFileRecord {
+                index: index as u32,
+                path: (*path).into(),
+                abs_path: None,
+                output_path: None,
+                size: 1,
+                bytes_written: 1,
+                crc32: Some(*crc),
+                output_crc32: Some(*crc),
+                crc_ok: Some(true),
+                status: 1,
+                mtime_ns: None,
+                magic: Vec::new(),
+            })
+            .collect();
+        match_inventory(
+            expected,
+            OutputInventoryVerificationSnapshot {
+                root: "unused".into(),
+                exists: true,
+                is_dir: true,
+                files: Arc::new(files),
+            },
+            true,
+            mode,
+            true,
+            0,
+            128,
+            20,
+        )
+    }
+
+    #[test]
+    fn bug_regression_distinct_unicode_outputs_keep_their_own_crc() {
+        let names = [("\u{e9}.txt", 100), ("e\u{301}.txt", 200)];
+        let result = bug_regression_match(&names, &names, BasenameMode::None);
+        assert_eq!(result.coverage.complete_files, 2);
+        assert_eq!(result.mismatch_count, 0);
+        assert_eq!(result.observations[1].path, "e\u{301}.txt");
+    }
+
+    #[test]
+    fn bug_regression_missing_unicode_sibling_is_not_counted_twice() {
+        let names = [("\u{e9}.txt", 100), ("e\u{301}.txt", 100)];
+        let result = bug_regression_match(&names, &names[..1], BasenameMode::Any);
+        assert_eq!(result.coverage.complete_files, 1);
+        assert_eq!(result.missing_count, 1);
+        assert_eq!(result.coverage.complete_bytes, 1);
+    }
+
+    #[test]
+    fn bug_regression_basename_fallback_cannot_steal_later_exact_output() {
+        let result = bug_regression_match(
+            &[("a/readme.txt", 100), ("b/readme.txt", 200)],
+            &[("b/readme.txt", 200)],
+            BasenameMode::Any,
+        );
+        assert_eq!(result.missing, vec!["a/readme.txt"]);
+        assert_eq!(result.mismatch_count, 0);
+        assert_eq!(result.coverage.complete_files, 1);
+    }
+
+    #[test]
+    fn bug_regression_ambiguous_basename_does_not_choose_first_output() {
+        let result = bug_regression_match(
+            &[("missing/readme.txt", 100)],
+            &[("a/readme.txt", 100), ("b/readme.txt", 200)],
+            BasenameMode::Any,
+        );
+        assert_eq!(result.coverage.complete_files, 0);
+        assert_eq!(result.missing_count, 1);
+    }
+
+    #[test]
+    fn bug_regression_ascii_fallback_preserves_exact_case_distinctions() {
+        let names = [("A.txt", 100), ("a.txt", 200)];
+        let result = bug_regression_match(&names, &names, BasenameMode::Unique);
+        assert_eq!(result.coverage.complete_files, 2);
+        assert_eq!(result.mismatch_count, 0);
+        let result = bug_regression_match(
+            &[("README.txt", 100)],
+            &[("readme.txt", 100)],
+            BasenameMode::None,
+        );
+        assert_eq!(result.coverage.complete_files, 1);
+    }
 
     #[test]
     fn archive_names_project_onto_worker_output_names() {
@@ -839,11 +992,23 @@ mod windows_output_name_tests {
 
     #[test]
     fn only_names_the_worker_rejects_are_unsafe() {
-        for raw in ["/abs.txt", "C:/abs.txt", "c:drive-relative.txt", "../escape.txt", "a/../b.txt"] {
-            assert!(unsafe_archive_path(raw, &clean_relative_archive_path(raw)), "{raw}");
+        for raw in [
+            "/abs.txt",
+            "C:/abs.txt",
+            "c:drive-relative.txt",
+            "../escape.txt",
+            "a/../b.txt",
+        ] {
+            assert!(
+                unsafe_archive_path(raw, &clean_relative_archive_path(raw)),
+                "{raw}"
+            );
         }
         for raw in ["con.txt", "logs/12:30.log", "name. ", "a?b.txt"] {
-            assert!(!unsafe_archive_path(raw, &clean_relative_archive_path(raw)), "{raw}");
+            assert!(
+                !unsafe_archive_path(raw, &clean_relative_archive_path(raw)),
+                "{raw}"
+            );
         }
     }
 }

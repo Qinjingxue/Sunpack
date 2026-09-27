@@ -146,6 +146,12 @@ class OutputPathAllocator:
         for numbers, index in self._slots.pop(path_key, {}).items():
             heapq.heappush(numbers.available, index)
 
+    def clear_cache(self) -> dict[str, int]:
+        counts = {"families": len(self._numbers), "slots": len(self._slots)}
+        self._numbers.clear()
+        self._slots.clear()
+        return counts
+
 
 def next_available_path(path: str, reserved: MutableSet[str] | None = None) -> str:
     """Return and optionally reserve an available browser-style alternative."""

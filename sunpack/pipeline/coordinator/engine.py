@@ -233,6 +233,8 @@ class PipelineEngine:
 
             before = runtime_cache_stats()
             cleared = clear_all_runtime_caches()
+            if self._services is not None:
+                cleared["output_reservations"] = self._services.output_reservations.clear_idle_cache()
             after = runtime_cache_stats()
             return {"before": before, "cleared": cleared, "after": after}
 

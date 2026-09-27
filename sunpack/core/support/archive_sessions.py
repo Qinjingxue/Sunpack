@@ -29,7 +29,7 @@ _CHANGED = threading.Condition(_LOCK)
 
 @dataclass
 class _SessionEntry:
-    key: tuple[str, int, int]
+    key: tuple[str, str]
     session: NativeArchiveSession
     borrowers: set[str] = field(default_factory=set)
     process_lease: ResourceLease | None = None
@@ -37,13 +37,7 @@ class _SessionEntry:
     closed: bool = False
 
 
-_SESSIONS: OrderedDict[tuple[str, int, int], _SessionEntry] = OrderedDict()
-
-
-def _identity(path: str) -> tuple[str, int, int]:
-    normalized = os.path.abspath(os.path.normpath(path))
-    stat = os.stat(normalized)
-    return normalized, int(stat.st_size), int(stat.st_mtime_ns)
+_SESSIONS: OrderedDict[tuple[str, str], _SessionEntry] = OrderedDict()
 
 
 def _native_close(owner: Any) -> None:
@@ -120,18 +114,14 @@ def _retire_entries(entries: list[_SessionEntry]) -> None:
 
 
 def get_archive_session(path: str) -> NativeArchiveSession:
-    key = _identity(path)
+    normalized = os.path.abspath(os.path.normpath(path))
     stale_entries: list[_SessionEntry] = []
     duplicate: NativeArchiveSession | None = None
-    with lifecycle_registration((key[0],)):
-        with _CHANGED:
-            entry = _SESSIONS.get(key)
-            if entry is not None and not entry.retired:
-                _SESSIONS.move_to_end(key)
-                _attach_task_borrow_locked(entry)
-                return entry.session
-
-        session = NativeArchiveSession(key[0])
+    with lifecycle_registration((normalized,)):
+        # Rust validates the current path against an opened physical file and
+        # retains the pooled reader/cache only for the same generation.
+        session = NativeArchiveSession(normalized)
+        key = (normalized, session.generation_token)
         with _CHANGED:
             existing = _SESSIONS.get(key)
             if existing is not None and not existing.retired:

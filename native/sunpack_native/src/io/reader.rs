@@ -3,7 +3,7 @@ use crate::io::resource_lifecycle::TrackedFile;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyBytes, PyDict, PyList};
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read, Seek, SeekFrom};
 use std::ops::Deref;
@@ -577,8 +577,8 @@ impl NativeArchiveSession {
 #[pymethods]
 impl NativeArchiveSession {
     #[new]
-    fn new(path: String) -> PyResult<Self> {
-        let reader = ManagedReader::open(&path)?;
+    fn new(py: Python<'_>, path: String) -> PyResult<Self> {
+        let reader = py.detach(|| ManagedReader::open(&path))?;
         Ok(Self {
             path,
             reader,
@@ -595,6 +595,12 @@ impl NativeArchiveSession {
     fn size(&self) -> PyResult<u64> {
         self.ensure_open()?;
         Ok(self.reader.len())
+    }
+
+    #[getter]
+    fn generation_token(&self) -> PyResult<String> {
+        self.ensure_open()?;
+        Ok(format!("{:?}", self.reader.file_identity()?))
     }
 
     #[getter]
@@ -868,12 +874,15 @@ pub(crate) struct FileIdentity {
     len: u64,
     modified: Option<SystemTime>,
     created: Option<SystemTime>,
+    #[cfg(windows)]
+    physical: WindowsFileGeneration,
 }
 
 impl FileIdentity {
     pub(crate) fn is_current(&self) -> bool {
-        std::fs::metadata(&self.path)
-            .map(|metadata| file_identity(self.path.clone(), &metadata) == *self)
+        open_reader_file(&self.path)
+            .and_then(|file| file_identity(self.path.clone(), &file))
+            .map(|identity| identity == *self)
             .unwrap_or(false)
     }
 }
@@ -1540,27 +1549,11 @@ impl ReaderManager {
     }
 
     fn open_file(&self, path: &Path) -> io::Result<Arc<FileSource>> {
-        let metadata = std::fs::metadata(path)?;
-        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        {
-            let mut handles = self
-                .handles
-                .lock()
-                .map_err(|_| io::Error::other("reader manager handle lock poisoned"))?;
-            if let Some(identity) = handles.by_path.get(&canonical).cloned() {
-                if identity == file_identity(canonical.clone(), &metadata) {
-                    if let Some(source) = handles.touch(&identity) {
-                        self.metrics.handle_hits.fetch_add(1, Ordering::Relaxed);
-                        return Ok(source);
-                    }
-                } else {
-                    handles.by_path.remove(&canonical);
-                }
-            }
-        }
+        // Inspect the handle opened through the current path, never the pooled
+        // handle: rename/replacement can leave that handle on the old file.
         let file = open_reader_file(path)?;
-        let metadata = file.metadata()?;
-        let identity = file_identity(canonical, &metadata);
+        let canonical = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let identity = file_identity(canonical, &file)?;
         let mut handles = self
             .handles
             .lock()
@@ -2103,13 +2096,85 @@ fn manager() -> &'static ReaderManager {
     })
 }
 
-fn file_identity(path: PathBuf, metadata: &Metadata) -> FileIdentity {
-    FileIdentity {
+fn file_identity(path: PathBuf, file: &File) -> io::Result<FileIdentity> {
+    let metadata = file.metadata()?;
+    Ok(FileIdentity {
         path,
         len: metadata.len(),
         modified: metadata.modified().ok(),
         created: metadata.created().ok(),
+        #[cfg(windows)]
+        physical: windows_file_generation(file)?,
+    })
+}
+
+#[cfg(windows)]
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+struct WindowsFileGeneration {
+    volume: u64,
+    file_id: [u8; 16],
+    change_time: i64,
+    write_time: i64,
+}
+
+#[cfg(windows)]
+fn windows_file_generation(file: &File) -> io::Result<WindowsFileGeneration> {
+    use std::ffi::c_void;
+    use std::os::windows::io::AsRawHandle;
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileIdInfo {
+        volume: u64,
+        file_id: [u8; 16],
     }
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileBasicInfo {
+        creation_time: i64,
+        access_time: i64,
+        write_time: i64,
+        change_time: i64,
+        attributes: u32,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetFileInformationByHandleEx(
+            handle: *mut c_void,
+            class: i32,
+            information: *mut c_void,
+            size: u32,
+        ) -> i32;
+    }
+    let mut id = FileIdInfo::default();
+    let mut basic = FileBasicInfo::default();
+    // Query identity and generation on the same open file. Failure must not
+    // silently fall back to a timestamp-only cache key.
+    for (class, information, size) in [
+        (
+            18,
+            (&mut id as *mut FileIdInfo).cast(),
+            std::mem::size_of::<FileIdInfo>(),
+        ),
+        (
+            0,
+            (&mut basic as *mut FileBasicInfo).cast(),
+            std::mem::size_of::<FileBasicInfo>(),
+        ),
+    ] {
+        if unsafe {
+            GetFileInformationByHandleEx(file.as_raw_handle(), class, information, size as u32)
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(WindowsFileGeneration {
+        volume: id.volume,
+        file_id: id.file_id,
+        change_time: basic.change_time,
+        write_time: basic.write_time,
+    })
 }
 
 fn read_file_at(
@@ -2672,5 +2737,100 @@ mod tests {
         let second = ManagedReader::open(&path).unwrap();
         assert_eq!(second.read_all().unwrap(), b"new-data");
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(windows)]
+    fn restore_generation_test_times(file: &File, metadata: &std::fs::Metadata) {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawHandle;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetFileTime(
+                handle: *mut c_void,
+                creation: *const u64,
+                access: *const u64,
+                write: *const u64,
+            ) -> i32;
+        }
+        let created = metadata
+            .created()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap();
+        let ticks = (created.as_secs() + 11_644_473_600) * 10_000_000
+            + u64::from(created.subsec_nanos() / 100);
+        assert_ne!(
+            unsafe {
+                SetFileTime(
+                    file.as_raw_handle(),
+                    &ticks,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        file.set_times(std::fs::FileTimes::new().set_modified(metadata.modified().unwrap()))
+            .unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bug_regression_replacement_with_restored_timestamps_uses_new_file_id() {
+        let path = temp_file("generation_replace", b"old!");
+        let old_path = path.with_extension("old");
+        let metadata = std::fs::metadata(&path).unwrap();
+        let first = ManagedReader::open(&path).unwrap();
+        assert_eq!(first.read_all().unwrap(), b"old!");
+        std::fs::rename(&path, &old_path).unwrap();
+        std::fs::write(&path, b"new!").unwrap();
+        let replacement = File::options().write(true).open(&path).unwrap();
+        restore_generation_test_times(&replacement, &metadata);
+        drop(replacement);
+        let second = ManagedReader::open(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            metadata.modified().unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().created().unwrap(),
+            metadata.created().unwrap()
+        );
+        assert_ne!(
+            first.file_identity().unwrap(),
+            second.file_identity().unwrap()
+        );
+        assert!(!first.file_identity().unwrap().is_current());
+        assert_eq!(second.read_all().unwrap(), b"new!");
+        assert_eq!(first.read_all().unwrap(), b"old!");
+        std::fs::remove_file(path).unwrap();
+        std::fs::remove_file(old_path).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn bug_regression_in_place_write_with_restored_mtime_invalidates_blocks() {
+        let path = temp_file("generation_overwrite", b"old!");
+        let metadata = std::fs::metadata(&path).unwrap();
+        let first = ManagedReader::open(&path).unwrap();
+        assert_eq!(first.read_all().unwrap(), b"old!");
+        std::fs::write(&path, b"new!").unwrap();
+        let file = File::options().write(true).open(&path).unwrap();
+        restore_generation_test_times(&file, &metadata);
+        drop(file);
+        let second = ManagedReader::open(&path).unwrap();
+        assert_ne!(
+            first.file_identity().unwrap(),
+            second.file_identity().unwrap()
+        );
+        assert!(!first.file_identity().unwrap().is_current());
+        assert_eq!(second.read_all().unwrap(), b"new!");
+        let third = ManagedReader::open(&path).unwrap();
+        assert_eq!(
+            second.file_identity().unwrap(),
+            third.file_identity().unwrap()
+        );
+        assert_eq!(third.read_all().unwrap(), b"new!");
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -30,6 +30,13 @@ class OutputReservationRegistry:
                 self._reserved.remove(path)
                 self._allocator.release(path)
 
+    def clear_idle_cache(self) -> dict[str, int | bool]:
+        """Drop search history only when no request owns a reservation."""
+        with self._lock:
+            if self._reserved or self._owner_paths:
+                return {"skipped": True}
+            return self._allocator.clear_cache()
+
 
 def build_output_dir_resolver(
     tasks: list[ArchiveTask],
