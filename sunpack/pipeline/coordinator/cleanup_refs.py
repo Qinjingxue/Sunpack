@@ -9,8 +9,14 @@ from sunpack.core.support.path_keys import absolute_path_key
 @dataclass(frozen=True)
 class ReleaseRequest:
     task_key: str
+    #: All paths that lost their last owner, including paths to preserve.
     paths: tuple[str, ...] = ()
-    should_clean: bool = False
+    #: Only released paths whose owners requested cleanup.
+    cleanup_paths: tuple[str, ...] = ()
+
+    @property
+    def should_clean(self) -> bool:
+        return bool(self.cleanup_paths)
 
 
 @dataclass
@@ -100,7 +106,7 @@ class CleanupRefTable:
             return ReleaseRequest(task_key="")
         _task, task_key, paths, eligible = entry
         zeroed: list[str] = []
-        should_clean = False
+        cleanup_paths: list[str] = []
         for path in paths:
             key = absolute_path_key(path)
             remaining = self._counts.get(key, 0) - 1
@@ -114,11 +120,11 @@ class CleanupRefTable:
             # Whoever takes the count to zero performs the deletion; an ineligible owner must not
             # delete, but an eligible owner sharing the path already asked for it to go.
             if eligible or wanted > 0:
-                should_clean = True
+                cleanup_paths.append(path)
         return ReleaseRequest(
             task_key=task_key,
             paths=tuple(zeroed),
-            should_clean=should_clean and bool(zeroed),
+            cleanup_paths=tuple(cleanup_paths),
         )
 
     def count(self, path: str) -> int:

@@ -748,10 +748,10 @@ class _SourceCleanup:
         if not (request.paths and request.should_clean):
             return ReleaseOutcome(task_key=request.task_key, released=request.paths)
 
-        pending = tuple(request.paths)
+        pending = tuple(request.cleanup_paths)
         previous: dict[str, ArchiveCleanupResult] = {}
         deleted: list[str] = []
-        final_failed: tuple[ArchiveCleanupResult, ...] = ()
+        failures_by_path: dict[str, ArchiveCleanupResult] = {}
         final_error = ""
 
         for attempt, delay in enumerate((0.0, 0.1, 0.3), start=1):
@@ -760,7 +760,7 @@ class _SourceCleanup:
             current = ReleaseRequest(
                 task_key=request.task_key,
                 paths=pending,
-                should_clean=True,
+                cleanup_paths=pending,
             )
             outcome = await self._apply_once(
                 current,
@@ -770,7 +770,12 @@ class _SourceCleanup:
             )
             deleted.extend(path for path in outcome.deleted if path not in deleted)
             final_error = outcome.error
-            final_failed = outcome.failed
+            # A retry only updates its own paths; terminal failures from earlier
+            # attempts must remain visible in the request summary.
+            if not outcome.error:
+                for path in pending:
+                    failures_by_path.pop(path_key(path), None)
+            failures_by_path.update({path_key(item.path): item for item in outcome.failed})
             retryable = tuple(
                 item for item in outcome.failed
                 if item.retryable and item.attempts < 3
@@ -780,6 +785,7 @@ class _SourceCleanup:
             previous = {path_key(item.path): item for item in retryable}
             pending = tuple(item.path for item in retryable)
 
+        final_failed = tuple(failures_by_path.values())
         if final_failed:
             with self._context.lock:
                 by_path = {path_key(item.path): item for item in self._context.cleanup_results}

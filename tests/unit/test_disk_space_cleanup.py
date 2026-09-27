@@ -2,6 +2,8 @@ import asyncio
 import os
 from dataclasses import asdict
 
+import pytest
+
 import sunpack.core.support.resource_lifecycle as resource_lifecycle
 import sunpack.pipeline.postprocess.internal.cleanup as cleanup
 from sunpack.core.contracts.pipeline import PipelineArtifacts
@@ -140,6 +142,90 @@ def test_source_cleanup_retry_is_local_to_cleanup_side_task(tmp_path, monkeypatc
     assert outcome.failed[0].attempts == 3
     assert outcome.failed[0].retryable is True
     assert source.exists()
+
+
+@pytest.mark.parametrize("mode", ["recycle", "delete"])
+@pytest.mark.parametrize("release_kind,success_first", [
+    ("failure", True), ("failure", False),
+    ("partial", True), ("partial", False), ("sweep", True),
+])
+def test_shared_cleanup_preserves_unsuccessful_owner_exclusive_parts(
+    tmp_path, monkeypatch, mode, release_kind, success_first,
+):
+    shared = tmp_path / "carrier.bin"
+    exclusive = tmp_path / "failed-only.002"
+    shared.write_text("shared payload")
+    exclusive.write_text("unrecovered payload")
+    monkeypatch.setattr(cleanup, "send2trash", os.remove)
+    scope = _scope(mode)
+    success = _Task("success", [shared])
+    unsuccessful = _Task("unsuccessful", [shared, exclusive])
+    scope.register([success, unsuccessful])
+
+    def release_unsuccessful():
+        if release_kind == "sweep":
+            return scope.sweep_requests()[0]
+        return scope.release_task(
+            unsuccessful,
+            outcome_kind=(
+                OutcomeKind.FAILURE if release_kind == "failure"
+                else OutcomeKind.PARTIAL_SUCCESS
+            ),
+        )
+
+    async def run():
+        if success_first:
+            first = scope.release_task(success, outcome_kind=OutcomeKind.COMPLETE_SUCCESS)
+            second = release_unsuccessful()
+        else:
+            first = release_unsuccessful()
+            second = scope.release_task(success, outcome_kind=OutcomeKind.COMPLETE_SUCCESS)
+        return [await scope.apply(request, broker=_InlineBroker()) for request in (first, second)]
+
+    outcomes = asyncio.run(run())
+    assert [path for outcome in outcomes for path in outcome.deleted] == [str(shared)]
+    assert set(path for outcome in outcomes for path in outcome.released) == {str(shared), str(exclusive)}
+    assert exclusive.exists()
+    assert not shared.exists()
+    assert scope._table.pending_tasks() == ()
+
+
+@pytest.mark.parametrize("retry_result", ["success", "busy", "denied"])
+def test_source_cleanup_preserves_nonretryable_failure_during_other_retries(
+    tmp_path, monkeypatch, retry_result,
+):
+    inaccessible = tmp_path / "denied.001"
+    busy = tmp_path / "busy.002"
+    inaccessible.write_text("payload")
+    busy.write_text("payload")
+    calls = []
+
+    def recycle(target):
+        calls.append(target)
+        if target == str(inaccessible):
+            raise denied()
+        if calls.count(str(busy)) == 1 or retry_result == "busy":
+            raise locked()
+        if retry_result == "denied":
+            raise denied()
+        os.remove(target)
+
+    monkeypatch.setattr(cleanup, "send2trash", recycle)
+    scope = _scope()
+    task = _Task("mixed", [inaccessible, busy])
+    scope.register([task])
+    outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
+
+    failures = {item.path: (item.error_code, item.attempts) for item in outcome.failed}
+    expected = {str(inaccessible): (5, 1)}
+    if retry_result != "success":
+        expected[str(busy)] = (32, 3) if retry_result == "busy" else (5, 2)
+    assert failures == expected
+    assert tuple(scope._context.cleanup_results) == outcome.failed
+    assert calls.count(str(inaccessible)) == 1
+    assert calls.count(str(busy)) == (3 if retry_result == "busy" else 2)
+    assert inaccessible.exists()
+    assert busy.exists() == (retry_result != "success")
 
 
 def test_source_cleanup_stops_retrying_nonretryable_failure(tmp_path, monkeypatch):
