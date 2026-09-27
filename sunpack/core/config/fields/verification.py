@@ -1,7 +1,7 @@
 from typing import Any
 
 from sunpack.core.config.advanced_defaults import advanced_config_value
-from sunpack.core.config.schema import ConfigField
+from sunpack.core.config.schema import ConfigField, require_boolean
 
 
 VERIFICATION_DEFAULTS = advanced_config_value(("verification",))
@@ -18,12 +18,18 @@ def normalize_verification_config(value: Any) -> dict[str, Any]:
             f"verification has unknown fields: {', '.join(sorted(unknown))}"
         )
     config = {**VERIFICATION_DEFAULTS, **dict(value)}
-    config["enabled"] = bool(config["enabled"])
+    config["enabled"] = require_boolean(config["enabled"], "verification.enabled")
     config["max_retries"] = max(0, _int_field(config, "max_retries"))
-    config["cleanup_failed_output"] = bool(config["cleanup_failed_output"])
+    config["cleanup_failed_output"] = require_boolean(
+        config["cleanup_failed_output"],
+        "verification.cleanup_failed_output",
+    )
     config["complete_accept_threshold"] = _float_field(config, "complete_accept_threshold")
     config["partial_accept_threshold"] = _float_field(config, "partial_accept_threshold")
-    config["retry_on_verification_failure"] = bool(config["retry_on_verification_failure"])
+    config["retry_on_verification_failure"] = require_boolean(
+        config["retry_on_verification_failure"],
+        "verification.retry_on_verification_failure",
+    )
     config["methods"] = _normalize_methods(config.get("methods"))
     return config
 
@@ -56,7 +62,10 @@ def _normalize_methods(value: Any) -> list[dict[str, Any]]:
             raise ValueError(f"verification.methods[{index}].name must not be empty")
         normalized = dict(item)
         normalized["name"] = name
-        normalized["enabled"] = bool(item.get("enabled", True))
+        normalized["enabled"] = require_boolean(
+            item.get("enabled", True),
+            f"verification.methods[{index}].enabled",
+        )
         methods.append(normalized)
     return methods
 
