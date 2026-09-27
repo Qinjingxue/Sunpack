@@ -122,6 +122,22 @@ def _rar3_hp_encrypted_header_fixture() -> bytes:
     return b"Rar!\x1a\x07\x00" + salt + encrypted_header
 
 
+def test_rar_fast_verifier_preserves_multiple_match_indices_from_native():
+    outcome = RarFastVerifier._from_outcome({
+        "status": "match",
+        "matched_index": 0,
+        "matched_indices": [0, 2],
+        "attempts": 3,
+        "final_confirmation_required": True,
+        "match_evidence": "rar4_hp_header_crc16",
+        "message": "weak matches",
+    })
+
+    assert outcome.matched_index == 0
+    assert outcome.matched_indices == (0, 2)
+    assert outcome.final_confirmation_required is True
+
+
 def test_rar_fast_verifier_matches_rar3_hp_encrypted_header(tmp_path):
     archive = tmp_path / "sample.rar"
     archive.write_bytes(_rar3_hp_encrypted_header_fixture())

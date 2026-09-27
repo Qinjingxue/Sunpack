@@ -1047,7 +1047,7 @@ class _RequestRuntime:
         )
         self.recursion = self._new_recursion()
         self._active_task_keys: set[str] = set()
-        self._cleanup_tasks: set[asyncio.Task] = set()
+        self._cleanup_tasks: dict[asyncio.Task, tuple[str, ...]] = {}
         self._prompt_gates: dict[int, asyncio.Task] = {}
 
     def _report_progress(self, task: Any, event: dict[str, Any]) -> None:
@@ -1420,6 +1420,11 @@ class _RequestRuntime:
                 and subtree_complete
                 and self.config.get("post_extract", {}).get("flatten_single_directory", True)
             ):
+                # Flatten mutates the output subtree namespace. Let cleanup remain
+                # fully asynchronous during extraction/recursion, but finish only
+                # cleanup operations whose source paths would be moved by this
+                # particular flatten.
+                await self._drain_cleanup_tasks_under(output_dir)
                 await self._flatten_output(
                     task,
                     output_dir,
@@ -1517,10 +1522,12 @@ class _RequestRuntime:
                     await self.path_leases.release_lease(self.submission.request_id, lease_id)
 
         task = asyncio.create_task(run_cleanup())
-        self._cleanup_tasks.add(task)
+        self._cleanup_tasks[task] = tuple(
+            str(path) for path in request.cleanup_paths if path
+        )
 
         def completed(done):
-            self._cleanup_tasks.discard(done)
+            self._cleanup_tasks.pop(done, None)
             try:
                 done.result()
             except asyncio.CancelledError:
@@ -1536,6 +1543,27 @@ class _RequestRuntime:
         while self._cleanup_tasks:
             pending = tuple(self._cleanup_tasks)
             await asyncio.gather(*pending, return_exceptions=True)
+
+    async def _drain_cleanup_tasks_under(self, root: str) -> None:
+        while True:
+            pending = tuple(
+                task
+                for task, cleanup_paths in self._cleanup_tasks.items()
+                if not task.done()
+                and any(self._cleanup_path_is_under(path, root) for path in cleanup_paths)
+            )
+            if not pending:
+                return
+            await asyncio.gather(*pending, return_exceptions=True)
+
+    @staticmethod
+    def _cleanup_path_is_under(path: str, root: str) -> bool:
+        candidate = os.path.normcase(os.path.abspath(path))
+        normalized_root = os.path.normcase(os.path.abspath(root))
+        try:
+            return os.path.commonpath((candidate, normalized_root)) == normalized_root
+        except ValueError:
+            return False
 
     async def _flatten_output(self, task, output_dir: str, *, broker, cancellation) -> None:
         def flatten():
