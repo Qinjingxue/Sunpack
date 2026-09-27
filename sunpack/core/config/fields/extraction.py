@@ -1,7 +1,7 @@
 from typing import Any
 
 from sunpack.core.config.advanced_defaults import advanced_config_value
-from sunpack.core.config.schema import ConfigField
+from sunpack.core.config.schema import ConfigField, require_boolean
 from sunpack.core.contracts.content_recovery import CONTENT_REQUIREMENTS, CONTENT_REQUIREMENT_COMPLETE
 
 
@@ -15,7 +15,10 @@ def normalize_extraction_config(value: Any) -> dict[str, Any]:
         raise ValueError("extraction must be an object")
     config = dict(DEFAULT_EXTRACTION_CONFIG)
     config.update(value)
-    config["write_progress_manifest"] = bool(config.get("write_progress_manifest", False))
+    config["write_progress_manifest"] = require_boolean(
+        config.get("write_progress_manifest", False),
+        "extraction.write_progress_manifest",
+    )
     requirement = str(config.get("content_requirement") or CONTENT_REQUIREMENT_COMPLETE).strip().lower()
     if requirement not in CONTENT_REQUIREMENTS:
         raise ValueError("extraction.content_requirement must be 'complete' or 'allow_partial'")
