@@ -355,8 +355,10 @@ class _PathLeaseRegistry:
         self._lease_paths: dict[str, dict[str, _LeasePath]] = {}
         self._exact_owners: dict[str, str] = {}
         self._entries_by_key: dict[str, _LeasePath] = {}
-        self._directory_owners: dict[str, set[str]] = {}
-        self._prefix_owners: dict[str, set[str]] = {}
+        self._directory_owners: dict[str, dict[str, int]] = {}
+        self._prefix_owners: dict[str, dict[str, int]] = {}
+        self._pins: dict[str, dict[object, frozenset[str]]] = {}
+        self._pin_counts: dict[str, dict[str, int]] = {}
         self._ownership_versions: dict[str, tuple[tuple[str, int, int, int, int], ...]] = {}
         self._owner_modes: dict[str, bool] = {}
         self._generation_owners: dict[
@@ -405,14 +407,31 @@ class _PathLeaseRegistry:
             prepared[key] = _snapshot_lease_path(normalized)
         return tuple(prepared.values())
 
-    async def acquire(self, owner: str, paths: Iterable[str]) -> None:
+    async def acquire(self, owner: str, paths: Iterable[str], *, lease_id: object = None) -> None:
         prepared = self._snapshot_paths(paths, refresh=False)
+        # The caller has finished its previous extraction/verification attempt.
+        # Other jobs in this request keep their pins throughout an upgrade.
+        first = True
         while True:
             async with self._lock:
+                if first:
+                    self._unpin(owner, lease_id)
+                    first = False
                 blockers = self._blocking_owners(owner, prepared)
                 if not blockers:
                     self._claim(owner, prepared)
+                    keys = frozenset(path.key for path in prepared)
+                    self._pins.setdefault(owner, {})[lease_id] = keys
+                    counts = self._pin_counts.setdefault(owner, {})
+                    for key in keys:
+                        counts[key] = counts.get(key, 0) + 1
                     return
+                # Never wait while retaining an idle partial family. Only paths
+                # still used by sibling jobs or their cleanup remain protected.
+                counts = self._pin_counts.get(owner, {})
+                idle = [key for key in self._lease_paths.get(owner, {}) if key not in counts]
+                if self._remove_paths(owner, idle):
+                    self._wake_waiters_for(owner)
                 waiter = self._register_waiter(blockers)
             try:
                 await waiter
@@ -420,6 +439,27 @@ class _PathLeaseRegistry:
                 async with self._lock:
                     self._unregister_waiter(waiter)
                 raise
+
+    def _unpin(self, owner: str, lease_id: object) -> list[str]:
+        pins = self._pins.get(owner, {})
+        keys = pins.pop(lease_id, ())
+        if not pins:
+            self._pins.pop(owner, None)
+        counts = self._pin_counts.get(owner, {})
+        idle = []
+        for key in keys:
+            counts[key] -= 1
+            if not counts[key]:
+                counts.pop(key)
+                idle.append(key)
+        if not counts:
+            self._pin_counts.pop(owner, None)
+        return idle
+
+    async def release_lease(self, owner: str, lease_id: object) -> None:
+        async with self._lock:
+            if self._remove_paths(owner, self._unpin(owner, lease_id)):
+                self._wake_waiters_for(owner)
 
     async def replace(
         self,
@@ -580,9 +620,11 @@ class _PathLeaseRegistry:
 
             if path.resolved_key:
                 if path.is_dir:
-                    self._directory_owners.setdefault(path.resolved_key, set()).add(owner)
+                    owners = self._directory_owners.setdefault(path.resolved_key, {})
+                    owners[owner] = owners.get(owner, 0) + 1
                 for prefix in (path.resolved_key, *path.ancestor_keys):
-                    self._prefix_owners.setdefault(prefix, set()).add(owner)
+                    owners = self._prefix_owners.setdefault(prefix, {})
+                    owners[owner] = owners.get(owner, 0) + 1
 
         if ownership_version:
             self._ownership_versions[owner] = ownership_version
@@ -590,8 +632,11 @@ class _PathLeaseRegistry:
             self._generation_owners[(ownership_version, deep_detect)] = owner
 
     def _remove_owner(self, owner: str) -> bool:
-        paths = self._lease_paths.pop(owner, {})
+        removed = self._remove_paths(owner, tuple(self._lease_paths.get(owner, {})))
+        self._lease_paths.pop(owner, None)
         owned = self._owned.pop(owner, None)
+        self._pins.pop(owner, None)
+        self._pin_counts.pop(owner, None)
         ownership_version = self._ownership_versions.pop(owner, ())
         mode = self._owner_modes.pop(owner, False)
         if (
@@ -600,7 +645,17 @@ class _PathLeaseRegistry:
         ):
             self._generation_owners.pop((ownership_version, mode), None)
 
-        for path in paths.values():
+        return owned is not None or removed or bool(ownership_version)
+
+    def _remove_paths(self, owner: str, keys: Iterable[str]) -> bool:
+        paths = self._lease_paths.get(owner, {})
+        removed = False
+        for key in keys:
+            path = paths.pop(key, None)
+            if path is None:
+                continue
+            removed = True
+            self._owned[owner].discard(path.path)
             if self._exact_owners.get(path.key) == owner:
                 self._exact_owners.pop(path.key, None)
                 self._entries_by_key.pop(path.key, None)
@@ -609,7 +664,9 @@ class _PathLeaseRegistry:
                 if path.is_dir:
                     directory_owners = self._directory_owners.get(path.resolved_key)
                     if directory_owners is not None:
-                        directory_owners.discard(owner)
+                        directory_owners[owner] -= 1
+                        if not directory_owners[owner]:
+                            directory_owners.pop(owner)
                         if not directory_owners:
                             self._directory_owners.pop(path.resolved_key, None)
 
@@ -617,11 +674,13 @@ class _PathLeaseRegistry:
                     prefix_owners = self._prefix_owners.get(prefix)
                     if prefix_owners is None:
                         continue
-                    prefix_owners.discard(owner)
+                    prefix_owners[owner] -= 1
+                    if not prefix_owners[owner]:
+                        prefix_owners.pop(owner)
                     if not prefix_owners:
                         self._prefix_owners.pop(prefix, None)
 
-        return owned is not None or bool(paths) or bool(ownership_version)
+        return removed
 
     def _register_waiter(self, blockers: set[str]) -> asyncio.Future[None]:
         waiter = asyncio.get_running_loop().create_future()
@@ -735,6 +794,7 @@ class _SourceCleanup:
     def release_task(self, task, *, outcome_kind):
         from sunpack.core.contracts.results import OutcomeKind
 
+        self._table.refresh(task)
         if outcome_kind == OutcomeKind.COMPLETE_SUCCESS:
             self._table.mark_cleanup_eligible(task)
         return self._table.release(task)
@@ -1102,9 +1162,9 @@ class _RequestRuntime:
         ownership,
         broker,
         cancellation,
-    ) -> None:
+    ) -> bool:
         if not roots:
-            return
+            return True
         self.reporter.scan_started(depth)
         discovered = await broker.run(
             "discover_detect",
@@ -1116,7 +1176,7 @@ class _RequestRuntime:
             request_id=self.submission.request_id,
             cancellation=cancellation,
         )
-        await self._run_discovery_batch(
+        return await self._run_discovery_batch(
             discovered,
             roots=roots,
             scan_session=scan_session or self.task_scanner.last_scan_session,
@@ -1138,7 +1198,7 @@ class _RequestRuntime:
         ownership,
         broker,
         cancellation,
-    ) -> None:
+    ) -> bool:
         authorization = await broker.run(
             "nested_policy",
             self.submission.request_id,
@@ -1211,6 +1271,7 @@ class _RequestRuntime:
         for result in results:
             if isinstance(result, BaseException):
                 raise result
+        return all(results)
 
     def _claim_tasks(self, tasks):
         claimed = []
@@ -1232,7 +1293,7 @@ class _RequestRuntime:
         ownership,
         broker,
         cancellation,
-    ) -> None:
+    ) -> bool:
         released_source_ref = False
         task_key = str(task.key or task.main_path)
         try:
@@ -1278,8 +1339,9 @@ class _RequestRuntime:
                         cleanup_request,
                         broker=broker,
                         cancellation=cancellation,
+                        lease_id=id(task),
                     )
-                    return
+                    return True
 
             output_dir_resolver = build_output_dir_resolver(
                 [task],
@@ -1312,6 +1374,7 @@ class _RequestRuntime:
                 cleanup_request,
                 broker=broker,
                 cancellation=cancellation,
+                lease_id=id(task),
             )
 
             if (
@@ -1325,6 +1388,9 @@ class _RequestRuntime:
                     deep_detect=self.submission.detection_options.force_scan,
                 )
 
+            # A failed descendant still needs its recorded input path for retry.
+            # Propagate this to ancestors instead of remapping an entire subtree.
+            subtree_complete = outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS
             if output_dir and self.recursion.allows_children(depth):
                 scan_work = await broker.run(
                     "nested_scan",
@@ -1340,7 +1406,7 @@ class _RequestRuntime:
                     broker=broker,
                     cancellation=cancellation,
                 ):
-                    await self._discover_and_run(
+                    children_complete = await self._discover_and_run(
                         list(scan_work.roots),
                         scan_session=scan_work.session,
                         depth=depth + 1,
@@ -1348,10 +1414,11 @@ class _RequestRuntime:
                         broker=broker,
                         cancellation=cancellation,
                     )
+                    subtree_complete = subtree_complete and children_complete
 
             if (
                 output_dir
-                and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS
+                and subtree_complete
                 and self.config.get("post_extract", {}).get("flatten_single_directory", True)
             ):
                 await self._flatten_output(
@@ -1363,6 +1430,7 @@ class _RequestRuntime:
 
             if output_dir:
                 notify_shell_directories_updated([output_dir])
+            return subtree_complete
         finally:
             if not released_source_ref:
                 cleanup_request = self.source_cleanup.release_task(
@@ -1373,6 +1441,7 @@ class _RequestRuntime:
                     cleanup_request,
                     broker=broker,
                     cancellation=cancellation,
+                    lease_id=id(task),
                 )
             with self.context.lock:
                 self._active_task_keys.discard(task_key)
@@ -1435,16 +1504,21 @@ class _RequestRuntime:
         part_keys = {path_key(path) for path in part_paths}
         return path_key(carrier) not in part_keys
 
-    def _schedule_cleanup(self, request, *, broker, cancellation) -> None:
-        if not (request.paths and request.should_clean):
+    def _schedule_cleanup(self, request, *, broker, cancellation, lease_id=None) -> None:
+        if not request.should_clean and lease_id is None:
             return
 
         async def run_cleanup():
-            await self.source_cleanup.apply(
-                request,
-                broker=broker,
-                cancellation=cancellation,
-            )
+            try:
+                if request.should_clean:
+                    await self.source_cleanup.apply(
+                        request,
+                        broker=broker,
+                        cancellation=cancellation,
+                    )
+            finally:
+                if lease_id is not None:
+                    await self.path_leases.release_lease(self.submission.request_id, lease_id)
 
         task = asyncio.create_task(run_cleanup())
         self._cleanup_tasks.add(task)
@@ -1491,8 +1565,9 @@ class _RequestRuntime:
         )
 
     async def _ensure_task_lease(self, task) -> None:
+        self.source_cleanup.register([task])
         paths = task.all_parts or [task.main_path]
-        await self.path_leases.acquire(self.submission.request_id, paths)
+        await self.path_leases.acquire(self.submission.request_id, paths, lease_id=id(task))
 
     def _plan_task_isolated(self, task):
         stage = ArchiveInputPlanningStage(self.config)

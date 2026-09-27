@@ -1,6 +1,7 @@
 import asyncio
+from types import SimpleNamespace
 
-from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry
+from sunpack.pipeline.coordinator.engine import _PathLeaseRegistry, _RequestRuntime
 
 
 def test_conflicting_path_lease_is_woken_by_release(tmp_path):
@@ -330,5 +331,86 @@ def test_completed_watch_outputs_are_isolated_by_detection_mode(tmp_path):
 
         registry.remember_completed_watch(version, str(output), deep_detect=True)
         assert registry.completed_watch_output(version, deep_detect=True) == str(output)
+
+    asyncio.run(scenario())
+
+
+def test_retry_lease_upgrade_releases_idle_partial_families(tmp_path):
+    async def scenario():
+        registry = _PathLeaseRegistry()
+        family = [str(tmp_path / "first.001"), str(tmp_path / "second.002")]
+        tasks = [SimpleNamespace(all_parts=[path]) for path in family]
+        runtimes = [SimpleNamespace(
+            path_leases=registry,
+            submission=SimpleNamespace(request_id=owner),
+            source_cleanup=SimpleNamespace(register=lambda _tasks: None),
+        ) for owner in ("first", "second")]
+        for runtime, task in zip(runtimes, tasks):
+            await _RequestRuntime._ensure_task_lease(runtime, task)
+            task.all_parts = family
+
+        async def upgrade(runtime, task):
+            await _RequestRuntime._ensure_task_lease(runtime, task)
+            await registry.release_lease(runtime.submission.request_id, id(task))
+
+        await asyncio.wait_for(asyncio.gather(*(
+            upgrade(runtime, task) for runtime, task in zip(runtimes, tasks)
+        )), timeout=1)
+        assert not registry._exact_owners
+        assert not registry._pins
+        assert not registry._pin_counts
+
+    asyncio.run(scenario())
+
+
+def test_upgrade_keeps_active_sibling_and_shared_prefix_protected(tmp_path):
+    async def scenario():
+        registry = _PathLeaseRegistry()
+        root = tmp_path / "family"
+        root.mkdir()
+        first, sibling, other = [str(root / name) for name in ("first", "sibling", "other")]
+        await registry.acquire("A", [first], lease_id="retry")
+        await registry.acquire("A", [sibling], lease_id="sibling")
+        await registry.acquire("B", [other], lease_id="other")
+
+        upgrade = asyncio.create_task(registry.acquire("A", [first, other], lease_id="retry"))
+        directory = asyncio.create_task(registry.acquire("C", [str(root)]))
+        await asyncio.sleep(0)
+        assert registry._owned["A"] == {sibling}
+        assert not upgrade.done()
+        assert not directory.done()
+
+        await registry.release_lease("B", "other")
+        await asyncio.wait_for(upgrade, timeout=1)
+        await registry.release_lease("A", "retry")
+        await asyncio.sleep(0)
+        assert not directory.done()
+        assert registry._owned["A"] == {sibling}
+        await registry.release_lease("A", "sibling")
+        await asyncio.wait_for(directory, timeout=1)
+        await registry.release("C")
+        assert not registry._prefix_owners
+        assert not registry._directory_owners
+
+    asyncio.run(scenario())
+
+
+def test_shared_job_pin_survives_other_job_release(tmp_path):
+    async def scenario():
+        registry = _PathLeaseRegistry()
+        path = str(tmp_path / "carrier.bin")
+        await registry.acquire("A", [path], lease_id=1)
+        await registry.acquire("A", [path], lease_id=2)
+        waiting = asyncio.create_task(registry.acquire("B", [path]))
+        await asyncio.sleep(0)
+        await registry.release_lease("A", 1)
+        await asyncio.sleep(0)
+        assert not waiting.done()
+        await registry.release_lease("A", 2)
+        await asyncio.wait_for(waiting, timeout=1)
+        await registry.release("A")
+        await registry.release("B")
+        assert not registry._pins
+        assert not registry._pin_counts
 
     asyncio.run(scenario())

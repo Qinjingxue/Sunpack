@@ -335,3 +335,38 @@ def test_cleanup_result_public_schema_is_stable():
         "error_code",
         "message",
     }
+
+
+def test_replacement_plan_cleans_added_volumes_and_preserves_rejected_paths(tmp_path):
+    first, added, rejected = [tmp_path / name for name in ("a.001", "a.002", "unrelated.bin")]
+    for path in (first, added, rejected):
+        path.write_text("payload")
+    scope = _scope("delete")
+    task = _Task("old", [first, rejected])
+    scope.register([task])
+    task.key = "resolved"
+    task.cleanup_parts = [str(first), str(added)]
+
+    outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
+    assert set(outcome.deleted) == {str(first), str(added)}
+    assert outcome.task_key == "resolved"
+    assert rejected.exists()
+    assert scope._table.count(str(rejected)) == 0
+    assert scope.release_task(task, outcome_kind=OutcomeKind.COMPLETE_SUCCESS).paths == ()
+
+
+def test_refresh_adds_shared_volume_reference_once(tmp_path):
+    first, added = [str(tmp_path / name) for name in ("a.001", "a.002")]
+    table = CleanupRefTable()
+    retry = _Task("retry", [first])
+    sibling = _Task("sibling", [added])
+    table.register_all([retry, sibling])
+    retry.cleanup_parts.append(added)
+    table.register(retry)
+    table.register(retry)
+    assert table.count(added) == 2
+    table.mark_cleanup_eligible(sibling)
+    assert table.release(sibling).paths == ()
+    table.mark_cleanup_eligible(retry)
+    assert set(table.release(retry).cleanup_paths) == {first, added}
+    assert table.count(added) == 0

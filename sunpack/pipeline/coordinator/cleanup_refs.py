@@ -63,26 +63,47 @@ class CleanupRefTable:
         self._wanted: dict[str, int] = {}
 
     def register(self, task) -> None:
+        """Register or reconcile the task's current physical cleanup paths."""
         owner = id(task)
-        if owner in self._owned:
-            return
         task_key = str(getattr(task, "key", "") or getattr(task, "main_path", "") or "")
         paths = tuple(cleanup_paths_for(task))
-        self._owned[owner] = (task, task_key, paths, False)
-        for path in paths:
-            key = absolute_path_key(path)
+        previous = self._owned.get(owner)
+        if previous is not None and previous[1:3] == (task_key, paths):
+            return
+        eligible = previous[3] if previous is not None else False
+        old = {absolute_path_key(path) for path in previous[2]} if previous else set()
+        new = {absolute_path_key(path): path for path in paths}
+        # A replacement detection plan may add volumes or reject old candidates.
+        # Rejected paths are released without authorizing their deletion.
+        for key in old - new.keys():
+            self._counts[key] -= 1
+            if eligible:
+                self._wanted[key] -= 1
+            if not self._counts[key]:
+                self._counts.pop(key)
+                self._paths.pop(key, None)
+                self._wanted.pop(key, None)
+        for key in new.keys() - old:
+            path = new[key]
             self._paths.setdefault(key, path)
             self._counts[key] = self._counts.get(key, 0) + 1
+            if eligible:
+                self._wanted[key] = self._wanted.get(key, 0) + 1
+        self._owned[owner] = (task, task_key, paths, eligible)
 
     def register_all(self, tasks) -> None:
         for task in tasks:
+            self.register(task)
+
+    def refresh(self, task) -> None:
+        if id(task) in self._owned:
             self.register(task)
 
     def mark_cleanup_eligible(self, task) -> None:
         """Declare that this owner wants its paths removed once it is the last one."""
 
         entry = self._owned.get(id(task))
-        if entry is None:
+        if entry is None or entry[3]:
             return
         self._owned[id(task)] = (entry[0], entry[1], entry[2], True)
         for path in entry[2]:
