@@ -277,11 +277,10 @@ class ArchiveJobExecutor:
         verification_config = self.verifier.config
         max_verification_retries = max(0, int(verification_config.get("max_retries", 0) or 0))
         cleanup_failed_output = bool(verification_config.get("cleanup_failed_output", True))
-        attempts = max_verification_retries + 1
         volume_retry_attempted = bool(task.runtime.get("volume_retry_attempted"))
 
         attempt_index = 0
-        while attempt_index < attempts:
+        while True:
             self._report_task_status(task, "extracting")
             result = yield {
                 "task": task,
@@ -330,10 +329,12 @@ class ArchiveJobExecutor:
                 return outcome
             if _verification_accepts_complete(verification):
                 return outcome
+            if _verification_accepts_partial(verification) and self.content_policy.allows_partial:
+                return outcome
             if attempt_index >= max_verification_retries:
                 return outcome
             if verification.decision_hint != DECISION_RETRY_EXTRACT and not self._retry_on_verification_failure():
-                break
+                return outcome
             if cleanup_failed_output:
                 cleanup_output_for_retry(
                     result.out_dir,
@@ -341,12 +342,6 @@ class ArchiveJobExecutor:
                     planned_output_dir=out_dir,
                 )
             attempt_index += 1
-        return ArchiveJobOutcome(
-            result=ExtractionResult(
-                success=False, out_dir=out_dir,
-                error=self.i18n.t("failure.verification_failed"),
-            ), attempts=attempts,
-        )
 
     def _must_stop_for_proven_content_loss(
         self,
