@@ -310,6 +310,8 @@ def _validate_pipeline(config: dict[str, Any]):
             raise ConfigError(f"filesystem.scan_filters[{index}] must be an object")
         if not isinstance(scan_filter.get("name"), str) or not scan_filter["name"].strip():
             raise ConfigError(f"filesystem.scan_filters[{index}] must declare a filter name")
+        if "enabled" in scan_filter and not isinstance(scan_filter["enabled"], bool):
+            raise ConfigError(f"filesystem.scan_filters[{index}].enabled must be boolean")
 
     detection = config.get("detection")
     if not isinstance(detection, dict):
