@@ -1,3 +1,25 @@
+fn checked_rar5_header_geometry(
+    offset: usize,
+    after_size: usize,
+    header_size: u64,
+) -> Option<(u64, u64)> {
+    if header_size == 0 {
+        return None;
+    }
+    let size_field_start = offset.checked_add(4)?;
+    let vint_len = after_size.checked_sub(size_field_start)?;
+    let total_header = 4u64
+        .checked_add(u64::try_from(vint_len).ok()?)?
+        .checked_add(header_size)?;
+    let header_end = u64::try_from(offset).ok()?.checked_add(total_header)?;
+    Some((total_header, header_end))
+}
+
+fn checked_usize_end(start: usize, size: usize, limit: usize) -> Option<usize> {
+    let end = start.checked_add(size)?;
+    (end <= limit).then_some(end)
+}
+
 const RAR_FIELDS: &[&str] = &[
     "archive.signature",
     "block.header_crc32",
@@ -79,15 +101,37 @@ fn enrich_rar5_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
     let mut offset = RAR5_SIGNATURE.len();
     let mut blocks = 0usize;
     let mut crc_ok = 0usize;
-    while offset + 6 <= data.len() && offset < file_size as usize {
+    while checked_usize_end(offset, 6, data.len()).is_some()
+        && u64::try_from(offset).is_ok_and(|value| value < file_size)
+    {
         let stored_crc = u32_le(data, offset);
-        let Some((header_size, after_size)) = read_vint(data, offset + 4) else {
+        let Some(size_field_offset) = offset.checked_add(4) else {
             break;
         };
-        let total_header = 4usize + (after_size - (offset + 4)) + header_size as usize;
-        if header_size == 0 || offset + total_header > data.len() {
+        let Some((header_size, after_size)) = read_vint(data, size_field_offset) else {
+            break;
+        };
+        let Some((total_header_u64, header_end_u64)) =
+            checked_rar5_header_geometry(offset, after_size, header_size)
+        else {
+            break;
+        };
+        if header_end_u64 > file_size || header_end_u64 > data.len() as u64 {
             break;
         }
+        let Ok(total_header) = usize::try_from(total_header_u64) else {
+            break;
+        };
+        let Ok(header_end) = usize::try_from(header_end_u64) else {
+            break;
+        };
+        let Some(crc_start) = offset.checked_add(4) else {
+            break;
+        };
+        if crc_start > header_end {
+            break;
+        }
+
         let Some((header_type, mut cursor)) = read_vint(data, after_size) else {
             break;
         };
@@ -113,7 +157,17 @@ fn enrich_rar5_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
         } else {
             0
         };
-        let computed_crc = crc32(&data[offset + 4..offset + total_header]);
+        let Ok(extra_size_usize) = usize::try_from(extra_size) else {
+            break;
+        };
+        let Some(body_end) = header_end.checked_sub(extra_size_usize) else {
+            break;
+        };
+        if cursor > body_end {
+            break;
+        }
+
+        let computed_crc = crc32(&data[crc_start..header_end]);
         if computed_crc == stored_crc {
             crc_ok += 1;
         }
@@ -131,10 +185,12 @@ fn enrich_rar5_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
             d.set_item("block.extra_area", extra_size)?;
             d.set_item("block.data_area", data_size)?;
         }
-        let body_end = offset + total_header - extra_size as usize;
+
+        let header_body = &data[..body_end];
         match header_type {
             1 => {
-                let (main_flags, next) = read_vint(data, cursor).unwrap_or((0, cursor));
+                let (main_flags, next) =
+                    read_vint(header_body, cursor).unwrap_or((0, cursor));
                 d.set_item("main_header.flags", main_flags)?;
                 d.set_item("main_header.extra_area", extra_size)?;
                 d.set_item(
@@ -145,7 +201,6 @@ fn enrich_rar5_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
                         "single_volume"
                     },
                 )?;
-                // Locator records are optional extra records. Preserve explicit absence instead of inventing offsets.
                 d.set_item(
                     "main_header.locator.quick_open_offset",
                     "absent_or_unparsed_locator",
@@ -157,29 +212,57 @@ fn enrich_rar5_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
                 let _ = next;
             }
             2 => {
-                let (file_flags, next) = read_vint(data, cursor).unwrap_or((0, cursor));
+                let (file_flags, next) =
+                    read_vint(header_body, cursor).unwrap_or((0, cursor));
                 cursor = next;
-                let (unpacked, next) = read_vint(data, cursor).unwrap_or((0, cursor));
+                let (unpacked, next) =
+                    read_vint(header_body, cursor).unwrap_or((0, cursor));
                 cursor = next;
-                let (_, next) = read_vint(data, cursor).unwrap_or((0, cursor));
-                cursor = next; // attributes
+                let (_, next) = read_vint(header_body, cursor).unwrap_or((0, cursor));
+                cursor = next;
                 if file_flags & 0x02 != 0 {
-                    cursor = cursor.saturating_add(4);
+                    let Some(next_cursor) = cursor.checked_add(4) else {
+                        break;
+                    };
+                    if next_cursor > body_end {
+                        break;
+                    }
+                    cursor = next_cursor;
                 }
-                let file_crc = if file_flags & 0x04 != 0 && cursor + 4 <= body_end {
+                let file_crc = if file_flags & 0x04 != 0 {
+                    let Some(crc_end) = cursor.checked_add(4) else {
+                        break;
+                    };
+                    if crc_end > body_end {
+                        break;
+                    }
                     let value = u32_le(data, cursor);
-                    cursor += 4;
+                    cursor = crc_end;
                     Some(value)
                 } else {
                     None
                 };
-                let (compression, next) = read_vint(data, cursor).unwrap_or((0, cursor));
+                let (compression, next) =
+                    read_vint(header_body, cursor).unwrap_or((0, cursor));
                 cursor = next;
-                let (_, next) = read_vint(data, cursor).unwrap_or((0, cursor));
-                cursor = next; // host OS
-                let (name_size, next) = read_vint(data, cursor).unwrap_or((0, cursor));
+                let (_, next) = read_vint(header_body, cursor).unwrap_or((0, cursor));
                 cursor = next;
-                let name_end = cursor.saturating_add(name_size as usize).min(body_end);
+                let (name_size, next) =
+                    read_vint(header_body, cursor).unwrap_or((0, cursor));
+                cursor = next;
+                if cursor > body_end {
+                    break;
+                }
+                let Ok(name_size_usize) = usize::try_from(name_size) else {
+                    break;
+                };
+                let name_end = cursor
+                    .checked_add(name_size_usize)
+                    .map(|value| value.min(body_end))
+                    .unwrap_or(body_end);
+                if name_end < cursor {
+                    break;
+                }
                 d.set_item("file_header.flags", file_flags)?;
                 d.set_item("file_header.unpacked_size", unpacked)?;
                 d.set_item(
@@ -197,7 +280,7 @@ fn enrich_rar5_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
                 d.set_item("file_header.extra_area", extra_size)?;
                 d.set_item(
                     "file_data.packed_span",
-                    format!("offset={};size={data_size}", offset + total_header),
+                    format!("offset={header_end};size={data_size}"),
                 )?;
             }
             3 => {
@@ -213,15 +296,18 @@ fn enrich_rar5_semantics(d: &Bound<'_, PyDict>, data: &[u8], file_size: u64) -> 
                 )?;
             }
             5 => {
-                let end_flags = read_vint(data, cursor).map(|v| v.0).unwrap_or(0);
+                let end_flags = read_vint(header_body, cursor).map(|v| v.0).unwrap_or(0);
                 d.set_item("end_header.flags", end_flags)?;
             }
             _ => {}
         }
         blocks += 1;
-        let next = offset
-            .saturating_add(total_header)
-            .saturating_add(data_size as usize);
+        let Ok(data_size_usize) = usize::try_from(data_size) else {
+            break;
+        };
+        let Some(next) = header_end.checked_add(data_size_usize) else {
+            break;
+        };
         if next <= offset || next > data.len() {
             break;
         }
