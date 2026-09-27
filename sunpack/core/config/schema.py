@@ -40,6 +40,12 @@ class ConfigSchemaError(ValueError):
     pass
 
 
+def require_boolean(value: Any, path: str) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError(f"{path} must be boolean")
+    return value
+
+
 def config_fields() -> dict[tuple[str, ...], ConfigField]:
     global _FIELDS
     if _FIELDS is None:
