@@ -220,6 +220,32 @@ impl AnalysisMultiVolumeView {
         Ok(dict.unbind())
     }
 
+    #[pyo3(signature = (config, initial_prepass=None, signature_prepass=true, format_structure=true))]
+    fn analyze<'py>(
+        &self,
+        py: Python<'py>,
+        config: PyRef<'py, NativeAnalysisConfig>,
+        initial_prepass: Option<Bound<'py, PyDict>>,
+        signature_prepass: bool,
+        format_structure: bool,
+    ) -> PyResult<Py<PyDict>> {
+        AnalysisBinaryView {
+            path: self.path.clone(),
+            reader: self.reader.clone(),
+            closed: self.closed,
+        }
+        .analyze_report(
+            py,
+            &config,
+            initial_prepass.as_ref(),
+            signature_prepass,
+            format_structure,
+            Some(&self.volume_starts),
+            None,
+            |head, tail| self.signature_prepass(py, head, tail),
+        )
+    }
+
     #[pyo3(signature = (head_bytes=1048576, tail_bytes=1048576))]
     fn signature_prepass(
         &self,

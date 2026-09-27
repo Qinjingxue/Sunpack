@@ -39,16 +39,46 @@ def test_segment_ends_never_come_from_raw_signature_hits():
 
     A now deleted helper turned raw signature hits into segment boundaries.  The gzip and
     bzip2 magics are three bytes long and occur by chance inside encrypted payloads, so
-    that fallback truncated healthy carrier archives into damaged extractions.  Keep both
-    the helper and the raw-hit-as-boundary concept out of the analysis layer.
+    that fallback truncated healthy carrier archives into damaged extractions.  Keep the
+    raw-hit-as-boundary concept out of the native analysis report.
     """
-    modules_root = (
-        Path(__file__).parents[2] / "sunpack" / "core" / "analysis" / "structure_pipeline" / "modules"
-    )
-    assert not (modules_root / "_boundaries.py").exists()
+    report = (
+        Path(__file__).parents[2]
+        / "native" / "sunpack_native" / "src" / "analysis_native" / "view" / "report.rs"
+    ).read_text(encoding="utf-8")
+    assert "next_archive_boundary" not in report
+    assert "ARCHIVE_SIGNATURE_HIT_NAMES" not in report
 
-    sources = "\n".join(
-        path.read_text(encoding="utf-8") for path in sorted(modules_root.rglob("*.py"))
-    )
-    assert "next_archive_boundary" not in sources
-    assert "ARCHIVE_SIGNATURE_HIT_NAMES" not in sources
+
+NATIVE_ANALYSIS_ENTRY_POINTS = (
+    ".signature_prepass(",
+    ".probe_zip_local_header(",
+    ".locate_zip_eocd(",
+    ".probe_zip(",
+    ".probe_rar(",
+    ".probe_seven_zip(",
+    ".probe_tar(",
+    ".probe_compression_stream(",
+    ".probe_compressed_tar(",
+    "inspect_compression_stream_identity",
+    "inspect_compression_stream_structure",
+)
+
+
+def test_python_never_interprets_format_probes():
+    """Archive analysis is decided once, in the native report.
+
+    Python may run the report and project its result, but it must not call
+    the per-format probes and re-derive formats, confidences, or segments.
+    """
+    root = Path(__file__).parents[2] / "sunpack"
+    analysis = root / "core" / "analysis"
+    assert not (analysis / "probes").exists()
+    assert not (analysis / "structure_pipeline").exists()
+    violations = [
+        f"{path.relative_to(root)}: {name}"
+        for path in sorted(root.rglob("*.py"))
+        for name in NATIVE_ANALYSIS_ENTRY_POINTS
+        if name in path.read_text(encoding="utf-8")
+    ]
+    assert violations == []

@@ -1,6 +1,11 @@
 import struct
 
-from sunpack.core.analysis.view import MultiVolumeBinaryView
+from sunpack.core.analysis import ArchiveAnalyzer
+
+
+def _zip_details(volumes) -> dict:
+    report = ArchiveAnalyzer().analyze(volumes)
+    return next(item for item in report.evidences if item.format == "zip").details
 
 
 def _local(name=b"a"):
@@ -22,12 +27,10 @@ def test_zip_probe_maps_spanned_disk_relative_offsets(tmp_path):
     central = _central(disk_start=0)
     eocd = struct.pack("<4sHHHHIIH", b"PK\x05\x06", 1, 1, 1, 1, len(central), 0, 0)
     last.write_bytes(central + eocd)
-    view = MultiVolumeBinaryView([
+    result = _zip_details([
         {"path": str(first), "number": 1, "style": "zip_spanned"},
         {"path": str(last), "number": 2, "style": "zip_spanned"},
     ])
-
-    result = view.probe_zip(eocd_offset=len(_local()) + len(central), max_cd_entries_to_walk=32)
 
     assert result["error"] == ""
     assert result["plausible"] is True
@@ -59,12 +62,10 @@ def test_zip_probe_resolves_zip64_tail_and_central_extra_across_raw_splits(tmp_p
     second = tmp_path / "archive.zip.0001"
     first.write_bytes(archive[:split])
     second.write_bytes(archive[split:])
-    view = MultiVolumeBinaryView([
+    result = _zip_details([
         {"path": str(first), "number": 1, "style": "zip_zero_numbered"},
         {"path": str(second), "number": 2, "style": "zip_zero_numbered"},
     ])
-
-    result = view.probe_zip(eocd_offset=len(archive) - len(eocd), max_cd_entries_to_walk=32)
 
     assert result["error"] == ""
     assert result["plausible"] is True

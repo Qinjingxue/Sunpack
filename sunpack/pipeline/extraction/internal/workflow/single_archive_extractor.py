@@ -2,7 +2,6 @@ import asyncio
 import os
 import sys
 import subprocess
-import time
 from contextlib import nullcontext
 from typing import Any, Callable
 
@@ -25,10 +24,6 @@ from sunpack.core.support.archive_input_projection import write_source_password_
 from sunpack.pipeline.extraction.output_inventory import OutputInventory, collect_output_inventory
 from sunpack.core.i18n import I18nContext
 from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER, OutputCleanupEvent
-
-
-def _pop_retry_delay(request: dict) -> float:
-    return max(0.0, float(request.pop("retry_delay_seconds", 0.0) or 0.0))
 
 
 def _advance_state(state, sent, *, first: bool):
@@ -84,9 +79,6 @@ class SingleArchiveExtractor:
         except StopIteration as completed:
             return completed.value
         while True:
-            delay = _pop_retry_delay(request)
-            if delay:
-                time.sleep(delay)
             result = self.sevenzip_runner.extract_attempt(**request)
             try:
                 request = state.send(result)
@@ -134,11 +126,6 @@ class SingleArchiveExtractor:
                 return value
             request = value
             first = False
-            delay = _pop_retry_delay(request)
-            if delay:
-                # Backoff runs on the event loop, not in the broker slot, so it
-                # is cancellable and never occupies a worker thread.
-                await asyncio.sleep(delay)
             try:
                 sent = await self.sevenzip_runner.submit_attempt_asyncio(**request)
             except asyncio.CancelledError:
@@ -195,7 +182,6 @@ class SingleArchiveExtractor:
         with _phase(phase_timer, f"{phase_prefix}_startupinfo"):
             startupinfo = self._startupinfo()
         retry_count = 0
-        retry_delay = 0.0
         while retry_count < self.retry_policy.max_retries:
             try:
                 with _phase(phase_timer, f"{phase_prefix}_mkdir_retry"):
@@ -282,9 +268,7 @@ class SingleArchiveExtractor:
                         "task": task,
                         "phase_timer": phase_timer,
                         "phase_prefix": f"{phase_prefix}_sevenzip",
-                        "retry_delay_seconds": retry_delay,
                     }
-                retry_delay = 0.0
 
                 if run_result.returncode == 0:
                     selected_password = self._worker_selected_password(resolution, run_result)
@@ -366,7 +350,6 @@ class SingleArchiveExtractor:
                 retry_count += 1
                 self._cleanup_output(out_dir, OutputCleanupEvent.EXTRACT_RETRY)
                 self._log(self.i18n.t("extract.log.temp_retry", attempt=retry_count + 1, max_attempts=self.retry_policy.max_retries, archive=archive))
-                retry_delay = float(self.retry_policy.backoff(retry_count) or 0.0)
                 continue
 
             with _phase(phase_timer, f"{phase_prefix}_classify_error"):

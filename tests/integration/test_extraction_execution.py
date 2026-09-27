@@ -119,7 +119,6 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             attempts = iter([failed, succeeded])
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: next(attempts)
-            extractor.retry_policy.backoff = lambda _retry_count: None
             result = extractor.extract(task, str(out_dir))
 
             self.assertTrue(result.success)
@@ -151,7 +150,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             task = make_archive_task(archive_path)
 
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: fake_run()
-            extractor.retry_policy.backoff = lambda _retry_count: None
             result = extractor.extract(task, str(out_dir))
 
             self.assertTrue(result.success)
@@ -318,7 +316,6 @@ class ExtractionExecutionTests(unittest.TestCase):
             task = make_archive_task(archive_path)
 
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: failed
-            extractor.retry_policy.backoff = lambda _retry_count: None
             result = extractor.extract(task, str(out_dir))
 
             self.assertFalse(result.success)
@@ -343,10 +340,8 @@ if __name__ == "__main__":
     unittest.main()
 
 
-class ExtractionRetryDelayTests(unittest.TestCase):
-    def test_retry_delay_is_applied_by_driver_not_state_machine(self):
-        import sunpack.pipeline.extraction.internal.workflow.single_archive_extractor as module
-
+class ExtractionRetryTests(unittest.TestCase):
+    def test_retry_resubmits_immediately_without_timed_backoff(self):
         with tempfile.TemporaryDirectory() as tmp:
             archive_path = Path(tmp) / "sample.zip"
             archive_path.write_bytes(b"zip")
@@ -363,16 +358,9 @@ class ExtractionRetryDelayTests(unittest.TestCase):
             extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
                 calls.append(kwargs) or next(attempts)
             )
-            extractor.retry_policy.backoff = lambda _retry_count: 0.25
-            sleeps = []
-            original_sleep = module.time.sleep
-            module.time.sleep = sleeps.append
-            try:
-                result = extractor.extract(make_archive_task(archive_path), str(out_dir))
-            finally:
-                module.time.sleep = original_sleep
+            result = extractor.extract(make_archive_task(archive_path), str(out_dir))
 
             self.assertTrue(result.success)
-            self.assertEqual(sleeps, [0.25])
             self.assertEqual(len(calls), 2)
+            self.assertFalse(hasattr(extractor.retry_policy, "backoff"))
             self.assertTrue(all("retry_delay_seconds" not in call for call in calls))

@@ -9,7 +9,8 @@ pub(crate) use structure::{
     inspect_zip_local_header, inspect_zip_structure_graph,
 };
 pub(crate) use view::{
-    probe_rar_bytes, probe_rar_path, probe_rar_terminal_with_password, probe_rar_volume_paths,
+    clear_stream_structure_cache, confirm_format_identity, release_stream_structure_cache_under_roots,
+    NativeAnalysisConfig, probe_rar_bytes, probe_rar_path, probe_rar_terminal_with_password, probe_rar_volume_paths,
     AnalysisBinaryView, AnalysisMultiVolumeView,
 };
 pub(crate) use volume_anchor::probe_volume_anchors;

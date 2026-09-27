@@ -2061,6 +2061,7 @@ pub(crate) fn reader_cache_stats(py: Python<'_>) -> PyResult<Py<PyDict>> {
 #[pyfunction]
 pub(crate) fn clear_reader_resources(py: Python<'_>) -> PyResult<Py<PyDict>> {
     crate::password::context::clear();
+    crate::analysis_native::clear_stream_structure_cache();
     let (handles, cache_entries, cache_bytes) = manager().clear_resources()?;
     let dict = PyDict::new(py);
     dict.set_item("handles", handles)?;
@@ -2082,6 +2083,7 @@ pub(crate) fn release_reader_resources_under_roots(
 ) -> PyResult<Py<PyDict>> {
     let roots = canonical_release_roots(&paths);
     crate::password::context::release_under_roots(&roots);
+    crate::analysis_native::release_stream_structure_cache_under_roots(&roots);
     let (handles, cache_entries, cache_bytes) = manager().release_resources_under_roots(&roots)?;
     let dict = PyDict::new(py);
     dict.set_item("handles", handles)?;

@@ -1,3 +1,8 @@
+import zipfile
+from io import BytesIO
+
+from sunpack.core.analysis.embedded import scan_embedded_archives
+from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge, ensure_knowledge, write_payload
 from sunpack.core.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.pipeline.coordinator.task_scan import direct_file_task
@@ -23,26 +28,43 @@ def _task(path, *, parts=None, volumes=None, logical_name="case"):
 
 
 def _report(path, evidence, *, prepass=None):
-    return ArchiveAnalysisReport(
-        path=str(path),
-        size=100,
-        evidences=[evidence],
-        selected=[evidence],
-        prepass=prepass or {"formats": [evidence.format]},
-        read_bytes=32,
-        cache_hits=1,
+    return _multi_report(path, [evidence], prepass=prepass, size=100, read_bytes=32)
+
+
+def _multi_report(path, evidences, *, prepass=None, size=200, read_bytes=64):
+    """Build a report carrying the native plan that input planning projects.
+
+    Segment policy is decided and tested in Rust; these fixtures state the
+    plan directly so the tests cover only the Python descriptor projection.
+    """
+    evidences = list(evidences)
+    carved = tuple(
+        (evidence, segment)
+        for evidence in evidences
+        for segment in evidence.segments
+        if segment.end_offset is not None and segment.start_offset > 0
     )
-
-
-def _multi_report(path, evidences):
+    password = next(
+        (
+            (evidence, segment)
+            for evidence in evidences
+            if evidence.details.get("password_required")
+            for segment in evidence.segments
+            if segment.start_offset > 0
+        ),
+        None,
+    )
     return ArchiveAnalysisReport(
         path=str(path),
-        size=200,
-        evidences=list(evidences),
-        selected=list(evidences),
-        prepass={"formats": [evidence.format for evidence in evidences]},
-        read_bytes=64,
+        size=size,
+        evidences=evidences,
+        selected=evidences,
+        prepass=prepass or {"formats": [evidence.format for evidence in evidences]},
+        read_bytes=read_bytes,
         cache_hits=1,
+        best_selected=max(evidences, key=lambda item: item.confidence) if evidences else None,
+        extractable_segments=carved,
+        password_segment=password,
     )
 
 
@@ -111,36 +133,6 @@ def test_input_planning_stage_keeps_sfx_segment_for_standard_archive_extension(t
     assert segments[0]["archive_input"]["parts"][0]["path"] == str(archive)
     assert segments[0]["archive_input"]["parts"][0]["start"] == 7
     assert task.archive_input().open_mode == "file"
-
-
-def test_input_planning_stage_does_not_treat_native_zip_recovery_fragments_as_embedded(tmp_path):
-    archive = tmp_path / "damaged.zip"
-    archive.write_bytes(b"broken-prefix" + b"PK\x03\x04" + b"x" * 64)
-    evidence = ArchiveFormatEvidence(
-        format="zip",
-        confidence=0.94,
-        status="extractable",
-        segments=[ArchiveSegment(start_offset=13, end_offset=81, confidence=0.94)],
-        details={
-            "source": "embedded_scan",
-            "validation": "local_header_and_data_range",
-            "candidate_kind": "anchor",
-        },
-    )
-    report = _report(archive, evidence, prepass={
-        "source": "embedded_scan",
-        "formats": ["zip"],
-        "embedded_candidates": [{"format": "zip", "offset": 13, "candidate_kind": "anchor"}],
-    })
-    task = _task(archive)
-    stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
-    stage.enabled = True
-    stage.analyzer = _FakeAnalyzer(report)
-
-    stage.plan_task(task)
-
-    assert task.archive_input().format_hint == "zip"
-    assert knowledge_view.source_extractable_segments(task) == []
 
 
 def test_input_planning_stage_keeps_embedded_scan_ranges_for_neutral_carrier(tmp_path):
@@ -229,89 +221,6 @@ def test_input_planning_stage_reuses_batch_report_for_equivalent_inputs(tmp_path
     assert first.archive_input().format_hint == "zip"
     assert second.archive_input().format_hint == "zip"
     assert knowledge_view.get(second, "input_planning.cache_hits") == 2
-
-
-def test_input_planning_stage_does_not_treat_primary_multipart_archive_as_embedded_segment(tmp_path):
-    part1 = tmp_path / "archive.7z.001"
-    part2 = tmp_path / "archive.7z.002"
-    part1.write_bytes(b"7z-main")
-    part2.write_bytes(b"7z-tail")
-    evidence = ArchiveFormatEvidence(
-        format="7z",
-        confidence=0.97,
-        status="extractable",
-        segments=[ArchiveSegment(start_offset=0, end_offset=14, confidence=0.97, role="primary")],
-    )
-    task = _task(part1, parts=[part1, part2])
-    stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
-    stage.enabled = True
-    stage.analyzer = _FakeAnalyzer(_report(part1, evidence))
-
-    stage.plan_task(task)
-
-    assert task.archive_input().format_hint == "7z"
-    assert knowledge_view.source_extractable_segments(task) == []
-
-
-def test_input_planning_stage_prefers_compressed_tar_over_stream_for_same_range(tmp_path):
-    archive = tmp_path / "payload.tar.gz"
-    archive.write_bytes(b"gzipped tar")
-    gzip = ArchiveFormatEvidence(
-        format="gzip",
-        confidence=0.88,
-        status="extractable",
-        segments=[ArchiveSegment(start_offset=0, end_offset=100, confidence=0.88)],
-    )
-    tar_gz = ArchiveFormatEvidence(
-        format="tar.gz",
-        confidence=0.93,
-        status="extractable",
-        segments=[ArchiveSegment(start_offset=0, end_offset=100, confidence=0.93)],
-    )
-    task = _task(archive)
-    stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
-    stage.enabled = True
-    stage.analyzer = _FakeAnalyzer(_multi_report(archive, [gzip, tar_gz]))
-
-    tasks = stage.plan_tasks([task])
-
-    assert tasks == [task]
-    assert task.archive_input().format_hint == "tar.gz"
-
-
-def test_input_planning_stage_suppresses_inner_tar_shadowed_by_whole_compressed_tar(tmp_path):
-    archive = tmp_path / "payload.tar.zst"
-    archive.write_bytes(b"zstd compressed tar bytes")
-    tar_zst = ArchiveFormatEvidence(
-        format="tar.zst",
-        confidence=0.93,
-        status="extractable",
-        segments=[ArchiveSegment(start_offset=0, end_offset=200, confidence=0.93)],
-    )
-    false_inner_tar = ArchiveFormatEvidence(
-        format="tar",
-        confidence=0.86,
-        status="extractable",
-        segments=[
-            ArchiveSegment(
-                start_offset=12,
-                end_offset=180,
-                confidence=0.86,
-                damage_flags=["carrier_prefix"],
-                evidence=["tar:block_walk_prefix", "fuzzy:carrier_prefix"],
-            )
-        ],
-    )
-    task = _task(archive)
-    stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
-    stage.enabled = True
-    stage.analyzer = _FakeAnalyzer(_multi_report(archive, [false_inner_tar, tar_zst]))
-
-    tasks = stage.plan_tasks([task])
-
-    assert tasks == [task]
-    assert task.archive_input().format_hint == "tar.zst"
-    assert knowledge_view.source_extractable_segments(task) == []
 
 
 def test_input_planning_stage_uses_range_input_for_embedded_password_required_archive(tmp_path):
@@ -466,3 +375,36 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
         "analysis": {"status": "extractable", "confidence": 0.97, "damage_flags": []},
     }
     assert task.archive_input().open_mode == "native_volumes"
+
+
+def test_input_planning_stage_plans_real_carrier_segments_in_offset_order(tmp_path):
+    first = BytesIO()
+    with zipfile.ZipFile(first, "w") as archive:
+        archive.writestr("first.txt", "first")
+    second = BytesIO()
+    with zipfile.ZipFile(second, "w") as archive:
+        archive.writestr("second.txt", "second")
+    carrier = tmp_path / "carrier.jpg"
+    first_start = 37
+    second_start = first_start + len(first.getvalue()) + 11
+    carrier.write_bytes(b"\xff\xd8" + b"j" * 35 + first.getvalue() + b"g" * 11 + second.getvalue() + b"tail")
+    task = _task(carrier)
+    knowledge = ensure_knowledge(task)
+    write_payload(
+        knowledge,
+        "inspection",
+        {"prepass": scan_embedded_archives(str(carrier)).to_prepass()},
+        source_layer="tests",
+        source_module="input_planning",
+    )
+    commit_task_knowledge(task, knowledge)
+    stage = ArchiveInputPlanningStage({})
+
+    stage.plan_task(task)
+
+    segments = knowledge_view.source_extractable_segments(task)
+    assert [(item["format"], item["start_offset"]) for item in segments] == [
+        ("zip", first_start),
+        ("zip", second_start),
+    ]
+    assert task.archive_input().open_mode == "file"

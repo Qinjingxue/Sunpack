@@ -2,24 +2,9 @@ from __future__ import annotations
 
 from typing import Any
 
+from sunpack_native import confirm_format_identity as _native_confirm_format_identity
+
 from sunpack.core.analysis.request import AnalysisRequest
-from sunpack.core.analysis.observation import FormatObservation
-from sunpack.core.analysis.probes.compression_stream import (
-    CompressionStreamProbeOptions,
-    probe_compression_stream_path,
-    probe_compression_stream_view,
-)
-from sunpack.core.analysis.probes.rar import RarProbeOptions, probe_rar_view
-from sunpack.core.analysis.probes.seven_zip import SevenZipProbeOptions, probe_seven_zip_view
-from sunpack.core.analysis.probes.tar import TarProbeOptions, probe_tar_view
-from sunpack.core.analysis.probes.zip import (
-    ZipDeepProbeOptions,
-    ZipEocdProbeOptions,
-    probe_zip_directory_consistency_path,
-    probe_zip_eocd_view,
-    probe_zip_local_header_view,
-    probe_zip_structure_graph_path,
-)
 from sunpack.core.analysis.result import ArchiveAnalysisReport
 from sunpack.core.analysis.engine import AnalysisEngine
 from sunpack.core.analysis.source import (
@@ -31,7 +16,7 @@ from sunpack.core.analysis.source import (
 
 
 class ArchiveAnalyzer:
-    """Public, policy-free facade for archive analysis capabilities."""
+    """Public, policy-free facade for the native archive analysis report."""
 
     def __init__(
         self,
@@ -66,76 +51,7 @@ class ArchiveAnalyzer:
             )
         raise TypeError(f"unsupported analysis source: {type(resolved).__name__}")
 
-    def probe_seven_zip(
-        self,
-        source: AnalysisSource | str | list[Any] | tuple[Any, ...],
-        options: SevenZipProbeOptions | None = None,
-    ) -> FormatObservation:
-        return probe_seven_zip_view(self._view_for_source(analysis_source(source)), options)
-
-    def probe_rar(
-        self,
-        source: AnalysisSource | str | list[Any] | tuple[Any, ...],
-        options: RarProbeOptions | None = None,
-    ) -> FormatObservation:
-        return probe_rar_view(self._view_for_source(analysis_source(source)), options)
-
-    def probe_tar(
-        self,
-        source: AnalysisSource | str | list[Any] | tuple[Any, ...],
-        options: TarProbeOptions | None = None,
-    ) -> FormatObservation:
-        return probe_tar_view(self._view_for_source(analysis_source(source)), options)
-
-    def probe_compression_stream(
-        self,
-        source: AnalysisSource | str | list[Any] | tuple[Any, ...],
-        options: CompressionStreamProbeOptions | None = None,
-    ) -> FormatObservation:
-        resolved = analysis_source(source)
-        effective_options = options or CompressionStreamProbeOptions()
-        if isinstance(resolved, FileAnalysisSource):
-            return probe_compression_stream_path(resolved.path, effective_options)
-        return probe_compression_stream_view(self._view_for_source(resolved), effective_options)
-
-    def probe_zip_local_header(
-        self,
-        source: AnalysisSource | str | list[Any] | tuple[Any, ...],
-        *,
-        offset: int = 0,
-    ) -> FormatObservation:
-        return probe_zip_local_header_view(self._view_for_source(analysis_source(source)), offset)
-
-    def probe_zip_eocd(
-        self,
-        source: AnalysisSource | str | list[Any] | tuple[Any, ...],
-        options: ZipEocdProbeOptions | None = None,
-    ) -> FormatObservation:
-        return probe_zip_eocd_view(self._view_for_source(analysis_source(source)), options)
-
-    def probe_zip_directory_consistency(
-        self,
-        source: FileAnalysisSource | str,
-        options: ZipDeepProbeOptions | None = None,
-    ) -> FormatObservation:
-        resolved = analysis_source(source)
-        if not isinstance(resolved, FileAnalysisSource):
-            raise TypeError("ZIP directory consistency currently requires a file source")
-        return probe_zip_directory_consistency_path(resolved.path, options)
-
-    def probe_zip_structure_graph(
-        self,
-        source: FileAnalysisSource | str,
-        options: ZipDeepProbeOptions | None = None,
-    ) -> FormatObservation:
-        resolved = analysis_source(source)
-        if not isinstance(resolved, FileAnalysisSource):
-            raise TypeError("ZIP structure graph currently requires a file source")
-        return probe_zip_structure_graph_path(resolved.path, options)
-
-    def _view_for_source(self, source: AnalysisSource):
-        if isinstance(source, FileAnalysisSource):
-            return self._engine._build_single_view(source.path)
-        if isinstance(source, MultiVolumeAnalysisSource):
-            return self._engine._build_multi_volume_view(source.volumes)
-        raise TypeError(f"unsupported analysis source: {type(source).__name__}")
+    @staticmethod
+    def confirm_format_identity(path: str, archive_format: str) -> bool:
+        """Confirm a routed single-file TAR or compression stream in Rust."""
+        return bool(_native_confirm_format_identity(str(path), str(archive_format)))

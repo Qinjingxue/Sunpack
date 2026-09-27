@@ -4,7 +4,6 @@ import tarfile
 from binascii import crc32
 
 from sunpack.core.analysis.analyzer import ArchiveAnalyzer
-from sunpack.core.analysis.view import MultiVolumeBinaryView
 
 
 _SEVEN_ZIP_SIGNATURE = b"7z\xbc\xaf\x27\x1c"
@@ -31,7 +30,13 @@ def _write_parts(tmp_path, first: bytes, second: bytes | None = None):
         second_path = tmp_path / "archive.002"
         second_path.write_bytes(second)
         paths.append(str(second_path))
-    return paths
+    return [{"path": path, "number": index} for index, path in enumerate(paths, start=1)]
+
+
+def _evidence(volumes, archive_format: str):
+    report = ArchiveAnalyzer().analyze(volumes)
+    evidence = next(item for item in report.evidences if item.format == archive_format)
+    return report, evidence
 
 
 def _tar_bytes() -> bytes:
@@ -62,21 +67,20 @@ def _zip_bytes() -> bytes:
     return local + central + eocd
 
 
-def test_multivolume_zip_public_probes_use_native_discovery_methods(tmp_path):
+def test_multivolume_zip_analysis_uses_native_logical_reader(tmp_path):
     archive = _zip_bytes()
-    # Split inside the local header so both discovery and the full EOCD probe
+    # Split inside the local header so the EOCD walk and local-header links
     # must consume the Rust logical multi-volume reader.
     paths = _write_parts(tmp_path, archive[:11], archive[11:])
-    analyzer = ArchiveAnalyzer()
 
-    local = analyzer.probe_zip_local_header(paths).to_raw_dict()
-    eocd = analyzer.probe_zip_eocd(paths).to_raw_dict()
+    report, evidence = _evidence(paths, "zip")
 
-    assert local["plausible"] is True
-    assert local["offset"] == 0
-    assert eocd["plausible"] is True
-    assert eocd["local_header_links_ok"] is True
-    assert eocd["total_entries"] == 1
+    assert evidence.status == "extractable"
+    assert [(item.start_offset, item.end_offset) for item in evidence.segments] == [(0, len(archive))]
+    assert evidence.details["plausible"] is True
+    assert evidence.details["local_header_links_ok"] is True
+    assert evidence.details["total_entries"] == 1
+    assert report.best_selected is evidence
 
 
 def test_multivolume_7z_uses_native_parser_across_header_boundary_and_carrier_offset(tmp_path):
@@ -87,11 +91,8 @@ def test_multivolume_7z_uses_native_parser_across_header_boundary_and_carrier_of
     split = len(carrier) + 19
     paths = _write_parts(tmp_path, logical[:split], logical[split:])
 
-    with MultiVolumeBinaryView(paths) as view:
-        raw = view.probe_seven_zip(
-            start_offset=len(carrier),
-            max_next_header_check_bytes=1024 * 1024,
-        )
+    report, evidence = _evidence(paths, "7z")
+    raw = evidence.details
 
     assert raw["error"] == ""
     assert raw["plausible"] is True
@@ -99,6 +100,8 @@ def test_multivolume_7z_uses_native_parser_across_header_boundary_and_carrier_of
     assert raw["archive_offset"] == len(carrier)
     assert raw["segment_end"] == len(logical)
     assert raw["password_state"] == "not_required"
+    assert [(item.start_offset, item.end_offset) for item in evidence.segments] == [(len(carrier), len(logical))]
+    assert [(item[0].format, item[1].start_offset) for item in report.extractable_segments] == [("7z", len(carrier))]
 
 
 def test_multivolume_7z_missing_tail_reports_missing_volume(tmp_path):
@@ -106,13 +109,16 @@ def test_multivolume_7z_missing_tail_reports_missing_volume(tmp_path):
     archive = _seven_zip_bytes(next_header)
     paths = _write_parts(tmp_path, archive[:32])
 
-    with MultiVolumeBinaryView(paths) as view:
-        raw = view.probe_seven_zip(start_offset=0)
+    report, evidence = _evidence(paths, "7z")
+    raw = evidence.details
 
     assert raw["error"] == "next_header_out_of_range"
     assert raw["possible_missing_volume"] is True
     assert "missing_volume" in raw["damage_flags"]
     assert raw["read_error"]["field"] == "7z.next_header"
+    assert "missing_volume" in evidence.segments[0].damage_flags
+    assert evidence.segments[0].end_offset is None
+    assert report.missing_volume_evidence == "seven_zip_start_header_length"
 
 
 def test_multivolume_7z_encryption_is_structural_not_aes_byte_search(tmp_path):
@@ -129,8 +135,8 @@ def test_multivolume_7z_encryption_is_structural_not_aes_byte_search(tmp_path):
     archive = _seven_zip_bytes(files_info_with_aes_bytes)
     paths = _write_parts(tmp_path, archive[:35], archive[35:])
 
-    with MultiVolumeBinaryView(paths) as view:
-        raw = view.probe_seven_zip(start_offset=0)
+    _report, evidence = _evidence(paths, "7z")
+    raw = evidence.details
 
     assert raw["error"] == ""
     assert raw["password_required"] is False
@@ -157,8 +163,8 @@ def test_multivolume_7z_structural_aes_coder_is_encrypted(tmp_path):
     archive = _seven_zip_bytes(aes_header)
     paths = _write_parts(tmp_path, archive[:34], archive[34:])
 
-    with MultiVolumeBinaryView(paths) as view:
-        raw = view.probe_seven_zip(start_offset=0)
+    _report, evidence = _evidence(paths, "7z")
+    raw = evidence.details
 
     assert raw["error"] == ""
     assert raw["password_required"] is True
@@ -173,8 +179,8 @@ def test_multivolume_tar_walks_across_physical_volume_boundary(tmp_path):
     # Split inside the first 512-byte TAR header.
     paths = _write_parts(tmp_path, archive[:173], archive[173:])
 
-    with MultiVolumeBinaryView(paths) as view:
-        raw = view.probe_tar(start_offset=0, max_entries_to_walk=16)
+    _report, evidence = _evidence(paths, "tar")
+    raw = evidence.details
 
     assert raw["plausible"] is True
     assert raw["entry_walk_ok"] is True

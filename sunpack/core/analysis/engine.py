@@ -1,19 +1,23 @@
 from typing import Any
 
+from sunpack_native import NativeAnalysisConfig
+
 from sunpack.core.analysis.config import analysis_config
-from sunpack.core.analysis.structure_pipeline.prepass import run_signature_prepass
-from sunpack.core.analysis.structure_pipeline.registry import discover_analysis_modules, get_analysis_module_registry
-from sunpack.core.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence
+from sunpack.core.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
 from sunpack.core.analysis.request import AnalysisCapability, DEFAULT_ANALYSIS_CAPABILITIES
 from sunpack.core.analysis.view import MultiVolumeBinaryView, SharedBinaryView
-from sunpack.core.support.module_config import enabled_module_configs
 
 
 class AnalysisEngine:
+    """Run the native analysis report and project it into Python contracts.
+
+    Format probing, scoring, candidate merging, selection, and the extraction
+    segment plan are decided once in Rust. This class only owns view lifecycle.
+    """
+
     def __init__(self, config: dict[str, Any] | None = None):
-        root_config = config or {}
-        self.config = analysis_config(root_config)
-        discover_analysis_modules()
+        self.config = analysis_config(config or {})
+        self._native_config = NativeAnalysisConfig(self.config)
 
     def analyze_path(
         self,
@@ -23,12 +27,13 @@ class AnalysisEngine:
         initial_prepass: dict | None = None,
         capabilities: frozenset[AnalysisCapability] | None = None,
     ) -> ArchiveAnalysisReport:
-        return self.analyze_view(
-            self._build_single_view(path),
-            report_path=report_path or path,
-            initial_prepass=initial_prepass,
-            capabilities=capabilities,
-        )
+        with self._build_single_view(path) as view:
+            return self.analyze_view(
+                view,
+                report_path=report_path or path,
+                initial_prepass=initial_prepass,
+                capabilities=capabilities,
+            )
 
     def analyze_paths(
         self,
@@ -46,13 +51,13 @@ class AnalysisEngine:
                 initial_prepass=initial_prepass,
                 capabilities=capabilities,
             )
-        view = self._build_multi_volume_view(volumes)
-        return self.analyze_view(
-            view,
-            report_path=report_path or str(view.path),
-            initial_prepass=initial_prepass,
-            capabilities=capabilities,
-        )
+        with self._build_multi_volume_view(volumes) as view:
+            return self.analyze_view(
+                view,
+                report_path=report_path or str(view.path),
+                initial_prepass=initial_prepass,
+                capabilities=capabilities,
+            )
 
     def analyze_view(
         self,
@@ -63,91 +68,79 @@ class AnalysisEngine:
         capabilities: frozenset[AnalysisCapability] | None = None,
     ) -> ArchiveAnalysisReport:
         requested = DEFAULT_ANALYSIS_CAPABILITIES if capabilities is None else capabilities
-        prepass_config = self.config.get("prepass") if isinstance(self.config.get("prepass"), dict) else {}
-        prepass = dict(initial_prepass or {})
-        needs_prepass = bool(requested & {
-            AnalysisCapability.SIGNATURE_PREPASS,
-            AnalysisCapability.FORMAT_STRUCTURE,
-        })
-        if not prepass and needs_prepass and prepass_config.get("enabled", True):
-            prepass = run_signature_prepass(view, prepass_config)
-        modules = self._selected_structure_modules(prepass) if AnalysisCapability.FORMAT_STRUCTURE in requested else []
-        evidences = self._run_structure_modules(view, prepass, modules) if modules else []
-        selected = self._selected_evidences(evidences)
-        stats = view.stats()
-        return ArchiveAnalysisReport(
-            path=report_path or view.path,
-            size=view.size,
-            evidences=sorted(evidences, key=lambda item: item.confidence, reverse=True),
-            selected=selected,
-            prepass=prepass,
-            read_bytes=stats.read_bytes,
-            cache_hits=stats.cache_hits,
+        native = view.analyze(
+            self._native_config,
+            initial_prepass=initial_prepass,
+            signature_prepass=AnalysisCapability.SIGNATURE_PREPASS in requested,
+            format_structure=AnalysisCapability.FORMAT_STRUCTURE in requested,
         )
+        return _report_from_native(report_path or view.path, native)
 
     def _build_single_view(self, path: str) -> SharedBinaryView:
-        cache_bytes = int(self.config.get("shared_cache_mb", 64) or 0) * 1024 * 1024
-        max_read_mb = self.config.get("max_read_mb_per_archive", 256)
-        max_read_bytes = None if max_read_mb is None else int(max_read_mb) * 1024 * 1024
+        cache_bytes, max_read_bytes, max_concurrent_reads = self._view_limits()
         return SharedBinaryView(
             path,
             cache_bytes=cache_bytes,
             max_read_bytes=max_read_bytes,
-            max_concurrent_reads=int(self.config.get("max_concurrent_reads", 1) or 1),
+            max_concurrent_reads=max_concurrent_reads,
         )
 
     def _build_multi_volume_view(self, paths) -> MultiVolumeBinaryView:
-        cache_bytes = int(self.config.get("shared_cache_mb", 64) or 0) * 1024 * 1024
-        max_read_mb = self.config.get("max_read_mb_per_archive", 256)
-        max_read_bytes = None if max_read_mb is None else int(max_read_mb) * 1024 * 1024
+        cache_bytes, max_read_bytes, max_concurrent_reads = self._view_limits()
         return MultiVolumeBinaryView(
             paths,
             cache_bytes=cache_bytes,
             max_read_bytes=max_read_bytes,
-            max_concurrent_reads=int(self.config.get("max_concurrent_reads", 1) or 1),
+            max_concurrent_reads=max_concurrent_reads,
         )
 
-    def _selected_structure_modules(self, prepass: dict):
-        enabled_configs = enabled_module_configs(self.config)
-        registry = get_analysis_module_registry()
-        modules = []
-        for name in enabled_configs:
-            module = registry.get(name)
-            if module is None:
-                continue
-            modules.append(module)
-        return modules
+    def _view_limits(self) -> tuple[int, int | None, int]:
+        cache_bytes = int(self.config.get("shared_cache_mb", 64) or 0) * 1024 * 1024
+        max_read_mb = self.config.get("max_read_mb_per_archive", 256)
+        max_read_bytes = None if max_read_mb is None else int(max_read_mb) * 1024 * 1024
+        return cache_bytes, max_read_bytes, int(self.config.get("max_concurrent_reads", 1) or 1)
 
-    def _run_structure_modules(self, view: SharedBinaryView, prepass: dict, modules) -> list[ArchiveFormatEvidence]:
-        module_configs = enabled_module_configs(self.config)
-        if not modules:
-            return []
-        # File-level concurrency is owned by AsyncWorkBroker.  Spawning a
-        # second executor here creates nested pools, oversubscribes the host,
-        # and lets one archive consume all analysis slots.  A single archive's
-        # modules therefore run deterministically inside its broker job.
-        return [
-            self._run_module(module, view, prepass, module_configs.get(module.spec.name, {}))
-            for module in modules
-        ]
 
-    def _run_module(self, module, view: SharedBinaryView, prepass: dict, config: dict) -> ArchiveFormatEvidence:
-        try:
-            return module.analyze(view, prepass, config)
-        except Exception as exc:
-            fmt = module.spec.formats[0] if module.spec.formats else module.spec.name
-            return ArchiveFormatEvidence(
-                format=fmt,
-                confidence=0.0,
-                status="error",
-                warnings=[str(exc)],
-            )
-
-    def _selected_evidences(self, evidences: list[ArchiveFormatEvidence]) -> list[ArchiveFormatEvidence]:
-        thresholds = self.config.get("thresholds") if isinstance(self.config.get("thresholds"), dict) else {}
-        extractable = float(thresholds.get("extractable_confidence", 0.85))
-        return [
-            evidence
-            for evidence in evidences
-            if evidence.status == "extractable" and evidence.confidence >= extractable and evidence.segments
-        ]
+def _report_from_native(path: str, native: dict) -> ArchiveAnalysisReport:
+    evidences = [
+        ArchiveFormatEvidence(
+            format=fmt,
+            confidence=confidence,
+            status=status,
+            segments=[
+                ArchiveSegment(
+                    start_offset=start,
+                    end_offset=end,
+                    confidence=segment_confidence,
+                    damage_flags=damage_flags,
+                    evidence=segment_evidence,
+                )
+                for start, end, segment_confidence, damage_flags, segment_evidence in segments
+            ],
+            warnings=warnings,
+            details=details,
+        )
+        for fmt, confidence, status, segments, warnings, details in native["evidences"]
+    ]
+    password = native["password_segment"]
+    best = native["best_selected"]
+    return ArchiveAnalysisReport(
+        path=path,
+        size=native["size"],
+        evidences=evidences,
+        selected=[evidences[index] for index in native["selected"]],
+        prepass=native["prepass"],
+        read_bytes=native["read_bytes"],
+        cache_hits=native["cache_hits"],
+        best_selected=evidences[best] if best is not None else None,
+        extractable_segments=tuple(
+            (evidences[evidence], evidences[evidence].segments[segment])
+            for evidence, segment in native["extractable_segments"]
+        ),
+        password_segment=(
+            (evidences[password[0]], evidences[password[0]].segments[password[1]])
+            if password is not None
+            else None
+        ),
+        missing_volume_evidence=native["missing_volume_evidence"],
+    )

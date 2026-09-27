@@ -34,6 +34,14 @@ class ArchiveAnalysisReport:
     prepass: dict[str, Any] = field(default_factory=dict)
     read_bytes: int = 0
     cache_hits: int = 0
+    # Native selection and segment plan: the evidence naming the input format,
+    # carved extractable segments in extraction order, the encrypted segment
+    # to probe when nothing is extractable, and proof that a split input is
+    # missing a later volume.
+    best_selected: ArchiveFormatEvidence | None = None
+    extractable_segments: tuple[tuple[ArchiveFormatEvidence, ArchiveSegment], ...] = ()
+    password_segment: tuple[ArchiveFormatEvidence, ArchiveSegment] | None = None
+    missing_volume_evidence: str = ""
 
     @property
     def has_extractable(self) -> bool:

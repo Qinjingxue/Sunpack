@@ -17,13 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 import sunpack.pipeline.coordinator.engine as engine_module
-import sunpack.core.analysis.engine as analysis_engine_module
-import sunpack.core.analysis.structure_pipeline.modules.compression_streams as compression_streams_module
-import sunpack.core.analysis.structure_pipeline.modules.rar as rar_analysis_module
 import sunpack.pipeline.coordinator.scan_session as scan_session_module
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
-from sunpack.core.analysis.view import SharedBinaryView
+from sunpack.core.analysis.engine import AnalysisEngine
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from tests.helpers.performance_config import archive_pressure_config
 from benchmarks.harness import render_report, report_from_payload
@@ -137,26 +134,7 @@ class RequestRuntimeProfiler:
             "build_output_dir_resolver",
             "job_output_dir_resolver",
         )
-        self._install_global_callable(
-            analysis_engine_module,
-            "run_signature_prepass",
-            "planning_signature_prepass",
-        )
-        self._install_global_callable(
-            rar_analysis_module,
-            "probe_rar_view",
-            "planning_rar_native_probe",
-        )
-        self._install_global_dynamic_callable(
-            compression_streams_module,
-            "probe_compression_stream_view",
-            lambda _view, options: f"planning_stream_probe_{getattr(options, 'format', 'unknown')}",
-        )
-        self._install_global_dynamic_method(
-            SharedBinaryView,
-            "probe_compressed_tar",
-            lambda _view, **kwargs: f"planning_compressed_tar_probe_{kwargs.get('format', 'unknown')}",
-        )
+        self._install_global_method(AnalysisEngine, "analyze_view", "planning_native_analysis")
 
     def restore(self) -> None:
         if self._factory_restore is not None:
@@ -246,29 +224,6 @@ class RequestRuntimeProfiler:
 
         def measured(*args: Any, **kwargs: Any):
             return self._measure_active(label, original, *args, **kwargs)
-
-        setattr(owner, name, measured)
-
-    def _install_global_dynamic_callable(self, owner: Any, name: str, label: Callable[..., str]) -> None:
-        key = (id(owner), name)
-        if key in self._global_installed:
-            return
-        self._global_installed.add(key)
-        original = getattr(owner, name)
-        self._global_restores.append((owner, name, original))
-
-        def measured(*args: Any, **kwargs: Any):
-            return self._measure_active(label(*args, **kwargs), original, *args, **kwargs)
-
-        setattr(owner, name, measured)
-
-    def _install_global_dynamic_method(self, owner: type, name: str, label: Callable[..., str]) -> None:
-        descriptor = owner.__dict__[name]
-        original = getattr(owner, name)
-        self._global_restores.append((owner, name, descriptor))
-
-        def measured(instance: Any, *args: Any, **kwargs: Any):
-            return self._measure_active(label(instance, *args, **kwargs), original, instance, *args, **kwargs)
 
         setattr(owner, name, measured)
 

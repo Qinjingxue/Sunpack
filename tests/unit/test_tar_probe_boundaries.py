@@ -2,15 +2,15 @@ import io
 import tarfile
 
 import sunpack_native
+from sunpack_native import AnalysisBinaryView
 
-from sunpack.core.analysis.structure_pipeline.modules.tar import TarAnalysisModule
-from sunpack.core.analysis.view import SharedBinaryView
+from sunpack.core.analysis import AnalysisRequest, ArchiveAnalyzer
 
 
-def _native_tar_view(tmp_path, data: bytes, name: str = "probe.tar") -> SharedBinaryView:
+def _probe_tar(tmp_path, data: bytes, max_entries_to_walk: int, name: str = "probe.tar") -> dict:
     path = tmp_path / name
     path.write_bytes(data)
-    return SharedBinaryView(str(path))
+    return dict(AnalysisBinaryView(str(path)).probe_tar(0, max_entries_to_walk))
 
 
 def _many_member_tar(count: int, *, fmt=tarfile.USTAR_FORMAT) -> bytes:
@@ -38,8 +38,7 @@ def _header_offsets(data: bytes) -> list[int]:
 
 
 def test_tar_walk_budget_is_not_an_archive_boundary(tmp_path):
-    with _native_tar_view(tmp_path, _many_member_tar(1100)) as view:
-        raw = view.probe_tar(start_offset=0, max_entries_to_walk=64)
+    raw = _probe_tar(tmp_path, _many_member_tar(1100), 64)
 
     assert raw["plausible"] is True
     assert raw["entries_checked"] == 64
@@ -57,8 +56,10 @@ def test_primary_tar_owns_internal_ustar_hits(tmp_path):
         "hits": [{"name": "tar_ustar", "offset": offset + 257} for offset in _header_offsets(data)],
     }
 
-    with _native_tar_view(tmp_path, data) as view:
-        evidence = TarAnalysisModule().analyze(view, prepass, {"max_entries_to_walk": 64})
+    path = tmp_path / "probe.tar"
+    path.write_bytes(data)
+    report = ArchiveAnalyzer().analyze(str(path), AnalysisRequest(initial_prepass=prepass))
+    evidence = next(item for item in report.evidences if item.format == "tar")
 
     assert len(evidence.segments) == 1
     assert evidence.segments[0].start_offset == 0
@@ -72,8 +73,7 @@ def test_v7_tar_is_recognized_without_ustar_magic(tmp_path):
     data[148:156] = b" " * 8
     checksum = sum(data[:512])
     data[148:156] = f"{checksum:06o}\0 ".encode("ascii")
-    with _native_tar_view(tmp_path, bytes(data)) as view:
-        raw = view.probe_tar(start_offset=0, max_entries_to_walk=8)
+    raw = _probe_tar(tmp_path, bytes(data), 8)
 
     assert raw["plausible"] is True
     assert raw["entry_walk_ok"] is True
@@ -87,8 +87,7 @@ def test_gnu_base256_size_is_accepted(tmp_path):
     checksum = sum(data[:512])
     data[148:156] = f"{checksum:06o}\0 ".encode("ascii")
 
-    with _native_tar_view(tmp_path, bytes(data)) as view:
-        raw = view.probe_tar(start_offset=0, max_entries_to_walk=8)
+    raw = _probe_tar(tmp_path, bytes(data), 8)
 
     assert raw["plausible"] is True
     assert raw["member_size"] == 1

@@ -78,41 +78,22 @@ class SharedBinaryView:
             cache_hits=int(stats.get("cache_hits", 0) or 0),
         )
 
-    def signature_prepass(self, *, head_bytes: int, tail_bytes: int) -> dict | None:
-        return dict(self._native.signature_prepass(int(head_bytes), int(tail_bytes)))
-
-    def probe_zip_local_header(self, *, offset: int = 0) -> dict | None:
-        return dict(self._native.probe_zip_local_header(int(offset)))
-
-    def locate_zip_eocd(self, *, eocd_offset: int | None = None) -> dict | None:
-        return dict(self._native.locate_zip_eocd(
-            None if eocd_offset is None else int(eocd_offset)
-        ))
-
-    def probe_zip(self, *, eocd_offset: int, max_cd_entries_to_walk: int = 64) -> dict | None:
-        return dict(self._native.probe_zip(int(eocd_offset), int(max_cd_entries_to_walk)))
-
-    def probe_rar(self, *, start_offset: int, max_blocks_to_walk: int = 4096) -> dict | None:
-        return dict(self._native.probe_rar(int(start_offset), int(max_blocks_to_walk)))
-
-    def probe_seven_zip(self, *, start_offset: int, max_next_header_check_bytes: int = 1024 * 1024) -> dict | None:
-        return dict(self._native.probe_seven_zip(int(start_offset), int(max_next_header_check_bytes)))
-
-    def probe_tar(self, *, start_offset: int = 0, max_entries_to_walk: int = 64) -> dict | None:
-        return dict(self._native.probe_tar(int(start_offset), int(max_entries_to_walk)))
-
-    def probe_compression_stream(self, *, format: str) -> dict | None:
-        return dict(self._native.probe_compression_stream(str(format)))
-
-    def probe_compressed_tar(self, *, format: str, max_probe_bytes: int = 4 * 1024 * 1024) -> dict | None:
-        return dict(self._native.probe_compressed_tar(str(format), int(max_probe_bytes)))
+    def analyze(
+        self,
+        config,
+        *,
+        initial_prepass: dict | None,
+        signature_prepass: bool,
+        format_structure: bool,
+    ) -> dict:
+        return self._native.analyze(config, initial_prepass, signature_prepass, format_structure)
 
 
 class MultiVolumeBinaryView:
     """Random-access logical view over ordered split-volume files.
 
-    Archive structure parsing is native-only. Python owns lifecycle and
-    structured input normalization; Rust owns byte layout and format parsing.
+    Archive analysis is native-only. Python owns lifecycle and structured
+    input normalization; Rust owns byte layout, format parsing, and scoring.
     """
 
     def __init__(
@@ -178,34 +159,15 @@ class MultiVolumeBinaryView:
             cache_hits=int(stats.get("cache_hits", 0) or 0),
         )
 
-    def signature_prepass(self, *, head_bytes: int, tail_bytes: int) -> dict | None:
-        return dict(self._native.signature_prepass(int(head_bytes), int(tail_bytes)))
-
-    def probe_zip_local_header(self, *, offset: int = 0) -> dict | None:
-        return dict(self._native.probe_zip_local_header(int(offset)))
-
-    def locate_zip_eocd(self, *, eocd_offset: int | None = None) -> dict | None:
-        return dict(self._native.locate_zip_eocd(
-            None if eocd_offset is None else int(eocd_offset)
-        ))
-
-    def probe_zip(self, *, eocd_offset: int, max_cd_entries_to_walk: int = 64) -> dict | None:
-        return dict(self._native.probe_zip(int(eocd_offset), int(max_cd_entries_to_walk)))
-
-    def probe_rar(self, *, start_offset: int, max_blocks_to_walk: int = 4096) -> dict | None:
-        return dict(self._native.probe_rar(int(start_offset), int(max_blocks_to_walk)))
-
-    def probe_seven_zip(self, *, start_offset: int, max_next_header_check_bytes: int = 1024 * 1024) -> dict | None:
-        return dict(self._native.probe_seven_zip(int(start_offset), int(max_next_header_check_bytes)))
-
-    def probe_tar(self, *, start_offset: int = 0, max_entries_to_walk: int = 64) -> dict | None:
-        return dict(self._native.probe_tar(int(start_offset), int(max_entries_to_walk)))
-
-    def probe_compression_stream(self, *, format: str) -> dict | None:
-        return dict(self._native.probe_compression_stream(str(format)))
-
-    def probe_compressed_tar(self, *, format: str, max_probe_bytes: int = 4 * 1024 * 1024) -> dict | None:
-        return dict(self._native.probe_compressed_tar(str(format), int(max_probe_bytes)))
+    def analyze(
+        self,
+        config,
+        *,
+        initial_prepass: dict | None,
+        signature_prepass: bool,
+        format_structure: bool,
+    ) -> dict:
+        return self._native.analyze(config, initial_prepass, signature_prepass, format_structure)
 
 
 def _normalize_volume_entries(paths) -> list[dict]:

@@ -50,6 +50,7 @@ def test_planning_projects_proven_7z_split_tail_without_native_rescan():
         size=100,
         evidences=[evidence],
         selected=[],
+        missing_volume_evidence="seven_zip_start_header_length",
     )
 
     execution = ArchiveInputPlanningStage._execution_analysis_for_report(descriptor, report)
@@ -79,6 +80,7 @@ def test_planning_does_not_label_single_truncated_7z_as_missing_volume():
         size=100,
         evidences=[evidence],
         selected=[],
+        missing_volume_evidence="seven_zip_start_header_length",
     )
 
     assert ArchiveInputPlanningStage._execution_analysis_for_report(descriptor, report) == {}

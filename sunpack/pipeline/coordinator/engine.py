@@ -813,56 +813,33 @@ class _SourceCleanup:
         if not (request.paths and request.should_clean):
             return ReleaseOutcome(task_key=request.task_key, released=request.paths)
 
+        # The promotion barrier inside the cleanup waits on lifecycle events
+        # until every handle this process holds on the sources is released.
+        # A sharing violation left after it belongs to another process, so it
+        # is reported with the result instead of being retried on a timer.
         pending = tuple(request.cleanup_paths)
-        previous: dict[str, ArchiveCleanupResult] = {}
-        deleted: list[str] = []
-        failures_by_path: dict[str, ArchiveCleanupResult] = {}
-        final_error = ""
-
-        for attempt, delay in enumerate((0.0, 0.1, 0.3), start=1):
-            if delay:
-                await asyncio.sleep(delay)
-            current = ReleaseRequest(
+        outcome = await self._apply_once(
+            ReleaseRequest(
                 task_key=request.task_key,
                 paths=pending,
                 cleanup_paths=pending,
-            )
-            outcome = await self._apply_once(
-                current,
-                broker=broker,
-                cancellation=cancellation,
-                previous=previous,
-            )
-            deleted.extend(path for path in outcome.deleted if path not in deleted)
-            final_error = outcome.error
-            # A retry only updates its own paths; terminal failures from earlier
-            # attempts must remain visible in the request summary.
-            if not outcome.error:
-                for path in pending:
-                    failures_by_path.pop(path_key(path), None)
-            failures_by_path.update({path_key(item.path): item for item in outcome.failed})
-            retryable = tuple(
-                item for item in outcome.failed
-                if item.retryable and item.attempts < 3
-            )
-            if not retryable:
-                break
-            previous = {path_key(item.path): item for item in retryable}
-            pending = tuple(item.path for item in retryable)
-
-        final_failed = tuple(failures_by_path.values())
-        if final_failed:
+            ),
+            broker=broker,
+            cancellation=cancellation,
+            previous={},
+        )
+        if outcome.failed:
             with self._context.lock:
                 by_path = {path_key(item.path): item for item in self._context.cleanup_results}
-                by_path.update({path_key(item.path): item for item in final_failed})
+                by_path.update({path_key(item.path): item for item in outcome.failed})
                 self._context.cleanup_results[:] = list(by_path.values())
 
         return ReleaseOutcome(
             task_key=request.task_key,
             released=request.paths,
-            deleted=tuple(deleted),
-            failed=final_failed,
-            error=final_error,
+            deleted=outcome.deleted,
+            failed=outcome.failed,
+            error=outcome.error,
         )
 
     async def _apply_once(

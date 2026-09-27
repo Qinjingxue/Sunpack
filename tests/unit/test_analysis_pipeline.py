@@ -1,4 +1,3 @@
-import time
 import tarfile
 import zipfile
 import bz2
@@ -11,12 +10,9 @@ from io import BytesIO
 
 import pytest
 
-from sunpack_native import inspect_rar_structure
+from sunpack_native import AnalysisBinaryView, inspect_rar_structure
 from sunpack.core.analysis.embedded import scan_embedded_archives
-from sunpack.core.analysis.result import ArchiveFormatEvidence
 from sunpack.core.analysis.engine import AnalysisEngine
-from sunpack.core.analysis.structure_pipeline.module import AnalysisModuleSpec
-from sunpack.core.analysis.structure_pipeline.registry import get_analysis_module_registry
 from sunpack.core.analysis.view import SharedBinaryView
 
 
@@ -206,7 +202,7 @@ def test_analysis_respects_shared_embedded_scan_switch(tmp_path):
     assert report.prepass.get("source") != "embedded_scan"
 
 
-def test_analysis_reuses_explicit_prepass_without_shared_rescan(tmp_path, monkeypatch):
+def test_analysis_reuses_explicit_prepass_without_shared_rescan(tmp_path):
     prefix = b"v" * (2 * 1024 * 1024)
     path = tmp_path / "prepassed-middle-payload.mp4"
     path.write_bytes(prefix + _zip_bytes(tmp_path) + prefix)
@@ -218,16 +214,14 @@ def test_analysis_reuses_explicit_prepass_without_shared_rescan(tmp_path, monkey
         "source": "test_prepass",
     }
 
-    def unexpected_scan(*args, **kwargs):
-        raise AssertionError("explicit complete prepass must bypass the shared scanner")
-
-    monkeypatch.setattr(SharedBinaryView, "signature_prepass", unexpected_scan)
     report = AnalysisEngine().analyze_path(str(path), initial_prepass=prepass)
 
     assert report.prepass == prepass
     assert report.selected == []
+    # A head/tail signature prepass alone would read a full megabyte.
+    assert report.read_bytes < 1024 * 1024
 
-def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_path, monkeypatch):
+def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_path):
     path = tmp_path / "payload.bin"
     payload = b"p" * (2 * 1024 * 1024) + _zip_bytes(tmp_path) + b"s" * (2 * 1024 * 1024)
     path.write_bytes(payload)
@@ -235,12 +229,12 @@ def test_analysis_reuses_complete_detection_prepass_without_shared_rescan(tmp_pa
     prepass = scan.to_prepass()
     assert prepass["source"] == "embedded_scan"
 
-    def unexpected_scan(*args, **kwargs):
-        raise AssertionError("complete discovery prepass must bypass analysis prepass scanning")
-
-    monkeypatch.setattr(SharedBinaryView, "signature_prepass", unexpected_scan)
     reused = AnalysisEngine().analyze_path(str(path), initial_prepass=prepass)
     assert reused.prepass == prepass
+    assert reused.read_bytes < 1024 * 1024
+    assert [(item[0].format, item[1].start_offset) for item in reused.extractable_segments] == [
+        ("zip", 2 * 1024 * 1024),
+    ]
 
 def test_analysis_reuses_detection_hit_map_and_preserves_same_format_segments(tmp_path):
     first = _zip_bytes(tmp_path)
@@ -595,10 +589,10 @@ def test_bzip2_compressed_tar_stream_probe_preserves_input_budget_failure(tmp_pa
     compressed = bz2.compress(buffer.getvalue())
     path = tmp_path / "payload.tar.bz2"
     path.write_bytes(compressed)
-    view = SharedBinaryView(str(path))
+    view = AnalysisBinaryView(str(path))
 
-    incomplete = view.probe_compressed_tar(format="bzip2", max_probe_bytes=len(compressed) // 4)
-    complete = view.probe_compressed_tar(format="bzip2", max_probe_bytes=len(compressed))
+    incomplete = dict(view.probe_compressed_tar("bzip2", len(compressed) // 4))
+    complete = dict(view.probe_compressed_tar("bzip2", len(compressed)))
 
     assert incomplete["tar_plausible"] is False
     assert incomplete["tar_probe_error"] == "decompression_probe_failed"
@@ -657,38 +651,3 @@ def test_shared_binary_view_enforces_read_budget(tmp_path):
         assert "read budget" in str(exc)
     else:
         raise AssertionError("read budget should be enforced")
-
-
-class _SlowModule:
-    def __init__(self, name: str):
-        self.spec = AnalysisModuleSpec(name=name, formats=(name,), signatures=(name.encode("ascii"),))
-
-    def analyze(self, view, prepass, config):
-        time.sleep(0.15)
-        return ArchiveFormatEvidence(format=self.spec.name, confidence=0.0, status="not_found")
-
-
-def test_analysis_scheduler_runs_modules_in_single_broker_job(tmp_path):
-    registry = get_analysis_module_registry()
-    first = _SlowModule("slow_a")
-    second = _SlowModule("slow_b")
-    registry.register(first)
-    registry.register(second)
-    path = tmp_path / "slow.bin"
-    path.write_bytes(b"slow_a slow_b")
-
-    start = time.perf_counter()
-    AnalysisEngine({
-        "analysis": {
-            "modules": [
-                {"name": "slow_a", "enabled": True},
-                {"name": "slow_b", "enabled": True},
-            ],
-        },
-    }).analyze_path(str(path))
-    elapsed = time.perf_counter() - start
-
-    # Module execution is owned by the bounded work broker.  Modules for one
-    # archive share a job, while different archives can run concurrently;
-    # there is no unbounded per-archive analysis pool anymore.
-    assert elapsed >= 0.28

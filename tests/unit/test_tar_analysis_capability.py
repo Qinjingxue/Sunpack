@@ -1,8 +1,9 @@
 import io
 import tarfile
 
-from sunpack.core.analysis import ArchiveAnalyzer, MultiVolumeAnalysisSource, TarProbeOptions
-from sunpack.pipeline.discovery.detection.formats.tar import confirm as confirm_tar
+from sunpack_native import AnalysisBinaryView
+
+from sunpack.core.analysis import ArchiveAnalyzer, MultiVolumeAnalysisSource
 
 
 def _tar_bytes(payload: bytes = b"payload") -> bytes:
@@ -14,14 +15,23 @@ def _tar_bytes(payload: bytes = b"payload") -> bytes:
     return output.getvalue()
 
 
-def test_public_tar_capability_preserves_detection_fields(tmp_path):
+def _tar_details(source, max_entries_to_walk: int = 64) -> dict:
+    config = {"analysis": {"modules": [
+        {"name": "tar", "enabled": True, "max_entries_to_walk": max_entries_to_walk},
+    ]}}
+    report = ArchiveAnalyzer(config).analyze(source)
+    return next(item for item in report.evidences if item.format == "tar").details
+
+
+def confirm_tar(path: str) -> bool:
+    return ArchiveAnalyzer.confirm_format_identity(path, "tar")
+
+
+def test_tar_analysis_preserves_detection_fields(tmp_path):
     path = tmp_path / "archive.bin"
     path.write_bytes(_tar_bytes())
 
-    raw = ArchiveAnalyzer().probe_tar(
-        str(path),
-        TarProbeOptions(max_entries_to_walk=8),
-    ).to_raw_dict()
+    raw = _tar_details(str(path), max_entries_to_walk=8)
 
     assert raw["plausible"] is True
     assert raw["format"] == "ustar"
@@ -36,19 +46,19 @@ def test_public_tar_capability_preserves_detection_fields(tmp_path):
     assert raw["end_zero_blocks"] is True
 
 
-def test_tar_confirmation_uses_public_analysis_observation(tmp_path):
+def test_tar_confirmation_uses_native_identity(tmp_path):
     path = tmp_path / "disguised.bin"
     path.write_bytes(_tar_bytes())
-    assert confirm_tar(str(path), ArchiveAnalyzer()) is True
+    assert confirm_tar(str(path)) is True
 
 
-def test_public_tar_capability_keeps_fuzzy_evidence_when_checksum_is_bad(tmp_path):
+def test_tar_analysis_keeps_fuzzy_evidence_when_checksum_is_bad(tmp_path):
     data = bytearray(_tar_bytes())
     data[0] ^= 1
     path = tmp_path / "damaged.tar"
     path.write_bytes(data)
 
-    raw = ArchiveAnalyzer().probe_tar(str(path)).to_raw_dict()
+    raw = _tar_details(str(path))
 
     assert raw["plausible"] is False
     assert raw["ustar_magic"] is True
@@ -60,12 +70,12 @@ def test_public_tar_capability_keeps_fuzzy_evidence_when_checksum_is_bad(tmp_pat
     assert raw["error"] == "checksum_mismatch"
 
 
-def test_public_tar_capability_rejects_truncated_first_payload(tmp_path):
+def test_tar_analysis_rejects_truncated_first_payload(tmp_path):
     data = _tar_bytes(payload=b"A" * 600)
     path = tmp_path / "truncated.tar"
     path.write_bytes(data[:700])
 
-    raw = ArchiveAnalyzer().probe_tar(str(path)).to_raw_dict()
+    raw = _tar_details(str(path))
 
     assert raw["fuzzy_payload_in_range"] is False
     assert raw["plausible"] is False
@@ -82,13 +92,11 @@ def test_tar_file_and_multi_volume_readers_return_same_observation(tmp_path):
     whole.write_bytes(data)
     first.write_bytes(data[:400])
     second.write_bytes(data[400:])
-    analyzer = ArchiveAnalyzer()
-
-    file_raw = analyzer.probe_tar(str(whole)).to_raw_dict()
-    split_raw = analyzer.probe_tar(MultiVolumeAnalysisSource((
+    file_raw = _tar_details(str(whole))
+    split_raw = _tar_details(MultiVolumeAnalysisSource((
         {"path": str(first), "number": 1},
         {"path": str(second), "number": 2},
-    ))).to_raw_dict()
+    )))
 
     fields = {
         "plausible", "format", "stored_checksum", "computed_checksum", "member_size",
@@ -105,7 +113,6 @@ def test_tar_native_and_multi_volume_fallback_match_damage(tmp_path):
     checksum_bad = bytearray(_tar_bytes())
     checksum_bad[0] ^= 1
     cases = [bytes(checksum_bad), _tar_bytes(payload=b"A" * 600)[:700]]
-    analyzer = ArchiveAnalyzer()
 
     for index, data in enumerate(cases):
         whole = tmp_path / f"damaged-{index}.tar"
@@ -115,11 +122,11 @@ def test_tar_native_and_multi_volume_fallback_match_damage(tmp_path):
         first.write_bytes(data[:400])
         second.write_bytes(data[400:])
 
-        file_raw = analyzer.probe_tar(str(whole)).to_raw_dict()
-        split_raw = analyzer.probe_tar(MultiVolumeAnalysisSource((
+        file_raw = _tar_details(str(whole))
+        split_raw = _tar_details(MultiVolumeAnalysisSource((
             {"path": str(first), "number": 1},
             {"path": str(second), "number": 2},
-        ))).to_raw_dict()
+        )))
 
         fields = {
             "plausible", "stored_checksum", "computed_checksum", "member_size",
@@ -138,23 +145,16 @@ def test_tar_detection_uses_first_header_only_and_keeps_deep_analysis_separate(t
     data[second_header] ^= 0x5A
     path = tmp_path / "later-damaged.tar"
     path.write_bytes(data)
-    analyzer = ArchiveAnalyzer()
 
-    identity = analyzer.probe_tar(
-        str(path),
-        TarProbeOptions(max_entries_to_walk=0),
-    ).to_raw_dict()
+    identity = dict(AnalysisBinaryView(str(path)).probe_tar(0, 0))
 
     assert identity["plausible"] is True
     assert identity["validation_scope"] == "format_identity"
     assert identity["identity_strong"] is True
     assert identity["entries_checked"] == 0
-    assert confirm_tar(str(path), analyzer) is True
+    assert confirm_tar(str(path)) is True
 
-    deep = analyzer.probe_tar(
-        str(path),
-        TarProbeOptions(max_entries_to_walk=8),
-    ).to_raw_dict()
+    deep = _tar_details(str(path), max_entries_to_walk=8)
     assert deep["entry_walk_ok"] is True
     assert deep["walk_complete"] is False
     assert deep["error"]

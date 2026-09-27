@@ -66,7 +66,7 @@ def test_compact_yyyymmdd_is_parsed_as_a_date_before_numeric_timestamp():
     assert configured.value_range.gte == expected
 
 
-def test_async_retry_backoff_runs_outside_broker_slot(monkeypatch):
+def test_async_retry_resubmits_without_timed_backoff(monkeypatch):
     import sunpack.pipeline.extraction.internal.workflow.single_archive_extractor as module
 
     events = []
@@ -81,14 +81,10 @@ def test_async_retry_backoff_runs_outside_broker_slot(monkeypatch):
             events.append(("submit", request))
             return "done"
 
-    async def fake_sleep(delay):
-        events.append(("sleep", delay))
+    async def unexpected_sleep(_delay):
+        raise AssertionError("extraction retries are resubmitted, never delayed by a timer")
 
-    def blocking_sleep(_delay):
-        raise AssertionError("retry backoff must not block a broker thread")
-
-    monkeypatch.setattr(module.asyncio, "sleep", fake_sleep)
-    monkeypatch.setattr(module.time, "sleep", blocking_sleep)
+    monkeypatch.setattr(module.asyncio, "sleep", unexpected_sleep)
     extractor = SingleArchiveExtractor(
         password_store=None,
         password_resolver=None,
@@ -98,7 +94,7 @@ def test_async_retry_backoff_runs_outside_broker_slot(monkeypatch):
     )
 
     def state():
-        sent = yield {"archive": "sample.zip", "retry_delay_seconds": 0.5}
+        sent = yield {"archive": "sample.zip"}
         return sent
 
     extractor._extract_state_machine = lambda *_args, **_kwargs: state()
@@ -117,7 +113,6 @@ def test_async_retry_backoff_runs_outside_broker_slot(monkeypatch):
     assert result == "done"
     assert events == [
         ("broker", "extract_prepare"),
-        ("sleep", 0.5),
         ("submit", {"archive": "sample.zip"}),
         ("broker", "extract_continue"),
     ]

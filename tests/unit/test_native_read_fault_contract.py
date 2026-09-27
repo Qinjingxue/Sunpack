@@ -1,7 +1,6 @@
 import struct
 import zlib
 
-from sunpack.core.analysis.structure_pipeline.modules._read_fault import read_fault_damage_flags
 from sunpack_native import AnalysisBinaryView
 
 
@@ -27,8 +26,7 @@ def test_zip_tail_read_fault_names_eocd_and_suggests_missing_volume(tmp_path):
     assert result["read_error"]["requested"] == 22
     assert result["read_error"]["actual"] == 4
     assert result["read_error"]["possible_missing_volume"] is True
-    assert "field_read_error:zip.eocd" in read_fault_damage_flags(result)
-    assert "missing_volume" in read_fault_damage_flags(result)
+    assert "missing_volume" in result["damage_flags"]
 
 
 def test_seven_zip_declared_next_header_fault_names_tail_field(tmp_path):

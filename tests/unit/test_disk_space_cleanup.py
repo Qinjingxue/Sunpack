@@ -123,7 +123,7 @@ def test_failed_sibling_vetoes_shared_cleanup(tmp_path, success_first):
     assert table.count(shared) == 0
 
 
-def test_source_cleanup_retry_is_local_to_cleanup_side_task(tmp_path, monkeypatch):
+def test_source_cleanup_reports_external_lock_without_timed_retry(tmp_path, monkeypatch):
     source = tmp_path / "busy.zip"
     source.write_text("payload")
     calls = []
@@ -139,10 +139,11 @@ def test_source_cleanup_retry_is_local_to_cleanup_side_task(tmp_path, monkeypatc
 
     outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
 
-    assert calls == [str(source)] * 3
+    assert calls == [str(source)]
     assert len(outcome.failed) == 1
-    assert outcome.failed[0].attempts == 3
+    assert outcome.failed[0].attempts == 1
     assert outcome.failed[0].retryable is True
+    assert tuple(scope._context.cleanup_results) == outcome.failed
     assert source.exists()
 
 
@@ -197,10 +198,7 @@ def test_shared_cleanup_preserves_unsuccessful_owner_shared_and_exclusive_parts(
     assert scope._table.pending_tasks() == ()
 
 
-@pytest.mark.parametrize("retry_result", ["success", "busy", "denied"])
-def test_source_cleanup_preserves_nonretryable_failure_during_other_retries(
-    tmp_path, monkeypatch, retry_result,
-):
+def test_source_cleanup_reports_each_failure_once(tmp_path, monkeypatch):
     inaccessible = tmp_path / "denied.001"
     busy = tmp_path / "busy.002"
     inaccessible.write_text("payload")
@@ -209,13 +207,7 @@ def test_source_cleanup_preserves_nonretryable_failure_during_other_retries(
 
     def recycle(target):
         calls.append(target)
-        if target == str(inaccessible):
-            raise denied()
-        if calls.count(str(busy)) == 1 or retry_result == "busy":
-            raise locked()
-        if retry_result == "denied":
-            raise denied()
-        os.remove(target)
+        raise denied() if target == str(inaccessible) else locked()
 
     monkeypatch.setattr(cleanup, "send2trash", recycle)
     scope = _scope()
@@ -224,15 +216,11 @@ def test_source_cleanup_preserves_nonretryable_failure_during_other_retries(
     outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
 
     failures = {item.path: (item.error_code, item.attempts) for item in outcome.failed}
-    expected = {str(inaccessible): (5, 1)}
-    if retry_result != "success":
-        expected[str(busy)] = (32, 3) if retry_result == "busy" else (5, 2)
-    assert failures == expected
+    assert failures == {str(inaccessible): (5, 1), str(busy): (32, 1)}
     assert tuple(scope._context.cleanup_results) == outcome.failed
-    assert calls.count(str(inaccessible)) == 1
-    assert calls.count(str(busy)) == (3 if retry_result == "busy" else 2)
+    assert sorted(calls) == sorted([str(inaccessible), str(busy)])
     assert inaccessible.exists()
-    assert busy.exists() == (retry_result != "success")
+    assert busy.exists()
 
 
 def test_source_cleanup_stops_retrying_nonretryable_failure(tmp_path, monkeypatch):
@@ -255,30 +243,6 @@ def test_source_cleanup_stops_retrying_nonretryable_failure(tmp_path, monkeypatc
     assert len(outcome.failed) == 1
     assert outcome.failed[0].error_code == 5
     assert outcome.failed[0].attempts == 1
-
-
-def test_source_cleanup_retry_can_succeed_without_request_finalizer(tmp_path, monkeypatch):
-    source = tmp_path / "retry.zip"
-    source.write_text("payload")
-    calls = []
-
-    def recycle(target):
-        calls.append(target)
-        if len(calls) == 1:
-            raise locked()
-        os.remove(target)
-
-    monkeypatch.setattr(cleanup, "send2trash", recycle)
-    scope = _scope()
-    task = _Task("retry", [source])
-    scope.register([task])
-
-    outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
-
-    assert calls == [str(source), str(source)]
-    assert outcome.deleted == (str(source),)
-    assert outcome.failed == ()
-    assert not source.exists()
 
 
 def test_keep_mode_never_enters_source_promotion_barrier(tmp_path, monkeypatch):

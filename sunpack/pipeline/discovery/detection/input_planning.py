@@ -277,28 +277,9 @@ class ArchiveInputPlanningStage:
         """
         if descriptor.open_mode not in {"native_volumes", "sfx_with_volumes"}:
             return {}
-        if len(descriptor.parts) <= 1:
+        if len(descriptor.parts) <= 1 or not report.missing_volume_evidence:
             return {}
-
-        # This mirrors the old native 7z split-tail proof without rereading the
-        # volumes in the extraction worker: a CRC-valid start header declares a
-        # next-header end beyond the logical bytes Python already analyzed.
-        for evidence in sorted(report.evidences, key=lambda item: item.confidence, reverse=True):
-            if str(evidence.format or "").lower() != "7z":
-                continue
-            details = evidence.details if isinstance(evidence.details, dict) else {}
-            if not bool(details.get("start_header_crc_ok")):
-                continue
-            try:
-                archive_offset = max(0, int(details.get("archive_offset") or 0))
-                next_offset = max(0, int(details.get("next_header_offset") or 0))
-                next_size = max(0, int(details.get("next_header_size") or 0))
-                expected_end = archive_offset + 32 + next_offset + next_size
-            except (TypeError, ValueError):
-                continue
-            if expected_end > int(report.size):
-                return {"missing_volume_evidence": "seven_zip_start_header_length"}
-        return {}
+        return {"missing_volume_evidence": report.missing_volume_evidence}
 
     def _record_planning_input(
         self,
@@ -311,7 +292,7 @@ class ArchiveInputPlanningStage:
         with _phase(phase_timer, f"{phase_prefix}_record_input_get"):
             descriptor = task.archive_input()
         with _phase(phase_timer, f"{phase_prefix}_record_input_build"):
-            selected = _best_selected(report)
+            selected = report.best_selected
             analysis = dict(descriptor.analysis)
             analysis.pop("execution", None)
             execution_analysis = self._execution_analysis_for_report(descriptor, report)
@@ -327,46 +308,12 @@ class ArchiveInputPlanningStage:
             if updated != descriptor:
                 task.set_archive_input(updated)
 
-    def _extractable_segments(self, report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:
-        candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]] = []
-        index = 1
-        for evidence in sorted(report.selected, key=lambda item: item.confidence, reverse=True):
-            details = evidence.details if isinstance(evidence.details, dict) else {}
-            if (
-                str(details.get("source") or "") == "embedded_scan"
-                and details.get("candidate_kind")
-                and str(details.get("candidate_kind")) != "logical_archive"
-            ):
-                continue
-            for segment in evidence.segments:
-                if segment.end_offset is None:
-                    continue
-                if int(segment.start_offset) <= 0 and str(getattr(segment, "role", "") or "primary") == "primary":
-                    continue
-                candidates.append((evidence, segment, index))
-                index += 1
-        candidates.sort(key=lambda item: (int(item[1].start_offset), item[0].format, item[2]))
-        candidates = self._prefer_specific_segments(candidates)
-        candidates = self._suppress_segments_covered_by_whole_composite(report, candidates)
+    @staticmethod
+    def _extractable_segments(report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:
         return [
             (evidence, segment, position)
-            for position, (evidence, segment, _) in enumerate(candidates, start=1)
+            for position, (evidence, segment) in enumerate(report.extractable_segments, start=1)
         ]
-
-    def _suppress_segments_covered_by_whole_composite(
-        self,
-        report: ArchiveAnalysisReport,
-        candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]],
-    ) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:
-        whole_composites = _whole_file_composite_segments(report)
-        if not whole_composites:
-            return candidates
-        filtered = []
-        for evidence, segment, index in candidates:
-            if any(_segment_is_shadowed_by_composite(evidence, segment, composite) for composite in whole_composites):
-                continue
-            filtered.append((evidence, segment, index))
-        return filtered
 
     def _write_extractable_segments(
         self,
@@ -413,49 +360,14 @@ class ArchiveInputPlanningStage:
             })
         return payloads
 
-    def _prefer_specific_segments(
-        self,
-        candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]],
-    ) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]]:
-        stream_to_container = {
-            "gzip": "tar.gz",
-            "bzip2": "tar.bz2",
-            "xz": "tar.xz",
-            "zstd": "tar.zst",
-        }
-        by_range = {
-            (int(segment.start_offset), int(segment.end_offset), evidence.format)
-            for evidence, segment, _ in candidates
-            if segment.end_offset is not None
-        }
-        filtered = []
-        for evidence, segment, index in candidates:
-            if segment.end_offset is not None:
-                container_format = stream_to_container.get(evidence.format)
-                if container_format and (
-                    int(segment.start_offset),
-                    int(segment.end_offset),
-                    container_format,
-                ) in by_range:
-                    continue
-            filtered.append((evidence, segment, index))
-        return filtered
-
+    @staticmethod
     def _password_required_embedded_segment(
-        self,
         report: ArchiveAnalysisReport,
     ) -> tuple[ArchiveFormatEvidence, ArchiveSegment, int] | None:
-        candidates: list[tuple[ArchiveFormatEvidence, ArchiveSegment, int]] = []
-        for evidence in report.evidences:
-            if not evidence.details.get("password_required"):
-                continue
-            for index, segment in enumerate(evidence.segments, start=1):
-                if int(segment.start_offset) <= 0:
-                    continue
-                candidates.append((evidence, segment, 0))
-        if not candidates:
+        if report.password_segment is None:
             return None
-        return sorted(candidates, key=lambda item: (-item[0].confidence, int(item[1].start_offset)))[0]
+        evidence, segment = report.password_segment
+        return evidence, segment, 0
 
     def _segment_payload(self, task: ArchiveTask, evidence: ArchiveFormatEvidence, segment: ArchiveSegment) -> dict:
         payload = asdict(segment)
@@ -625,56 +537,6 @@ def _phase(timer: Callable[..., Any] | None, name: str):
     return timer(name)
 
 
-def _best_selected(report: ArchiveAnalysisReport) -> ArchiveFormatEvidence | None:
-    if not report.selected:
-        return None
-    return max(report.selected, key=lambda item: float(getattr(item, "confidence", 0.0) or 0.0))
-
-
-_COMPOSITE_INNER_FORMATS = {
-    "tar.gz": {"tar", "gzip"},
-    "tar.bz2": {"tar", "bzip2"},
-    "tar.xz": {"tar", "xz"},
-    "tar.zst": {"tar", "zstd"},
-}
-
-
-def _whole_file_composite_segments(report: ArchiveAnalysisReport) -> list[tuple[ArchiveFormatEvidence, ArchiveSegment]]:
-    result = []
-    for evidence in report.selected:
-        if evidence.format not in _COMPOSITE_INNER_FORMATS:
-            continue
-        for segment in evidence.segments:
-            if segment.end_offset is None:
-                continue
-            if int(segment.start_offset) != 0:
-                continue
-            if int(segment.end_offset) < int(report.size):
-                continue
-            result.append((evidence, segment))
-    return result
-
-
-def _segment_is_shadowed_by_composite(
-    evidence: ArchiveFormatEvidence,
-    segment: ArchiveSegment,
-    composite: tuple[ArchiveFormatEvidence, ArchiveSegment],
-) -> bool:
-    composite_evidence, composite_segment = composite
-    inner_formats = _COMPOSITE_INNER_FORMATS.get(composite_evidence.format, set())
-    if evidence.format not in inner_formats:
-        return False
-    if float(evidence.confidence or 0.0) >= float(composite_evidence.confidence or 0.0):
-        return False
-    if int(segment.start_offset) < int(composite_segment.start_offset):
-        return False
-    if segment.end_offset is None or composite_segment.end_offset is None:
-        return False
-    if int(segment.end_offset) > int(composite_segment.end_offset):
-        return False
-    return True
-
-
 def _write_plan_knowledge(
     task: ArchiveTask,
     report: ArchiveAnalysisReport,
@@ -682,7 +544,7 @@ def _write_plan_knowledge(
     selected_segment: tuple[ArchiveFormatEvidence, ArchiveSegment, int] | None,
     password_probe_input: ArchiveInputDescriptor | None,
 ) -> None:
-    selected = _best_selected(report)
+    selected = report.best_selected
     knowledge = ensure_knowledge(task)
     write_payload(
         knowledge,

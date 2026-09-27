@@ -75,6 +75,8 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<analysis_native::AnalysisBinaryView>()?;
     m.add_class::<analysis_native::AnalysisMultiVolumeView>()?;
     m.add_function(wrap_pyfunction!(analysis_native::probe_rar_bytes, m)?)?;
+    m.add_class::<analysis_native::NativeAnalysisConfig>()?;
+    m.add_function(wrap_pyfunction!(analysis_native::confirm_format_identity, m)?)?;
     m.add_class::<io::reader::NativeArchiveSession>()?;
     m.add_class::<scan::directory::NativeDirectorySnapshot>()?;
     m.add_class::<scan::directory::NativeOutputInventory>()?;

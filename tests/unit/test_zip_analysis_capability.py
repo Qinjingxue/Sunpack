@@ -1,7 +1,9 @@
 import struct
 import zipfile
 
-from sunpack.core.analysis import ArchiveAnalyzer, ZipDeepProbeOptions, ZipEocdProbeOptions
+from sunpack_native import AnalysisBinaryView, inspect_zip_directory_consistency, inspect_zip_structure_graph
+
+from sunpack.core.analysis import ArchiveAnalyzer
 
 
 def _zip_path(tmp_path):
@@ -11,35 +13,28 @@ def _zip_path(tmp_path):
     return path
 
 
-def test_public_zip_capabilities_preserve_detection_and_graph_payloads(tmp_path):
+def test_zip_capabilities_preserve_detection_and_graph_payloads(tmp_path):
     path = _zip_path(tmp_path)
-    analyzer = ArchiveAnalyzer()
 
-    local = analyzer.probe_zip_local_header(str(path)).to_raw_dict()
-    eocd = analyzer.probe_zip_eocd(
-        str(path),
-        ZipEocdProbeOptions(max_cd_entries_to_walk=16),
-    ).to_raw_dict()
-    consistency = analyzer.probe_zip_directory_consistency(
-        str(path),
-        ZipDeepProbeOptions(max_entries=128),
-    ).to_raw_dict()
-    graph = analyzer.probe_zip_structure_graph(
-        str(path),
-        ZipDeepProbeOptions(max_entries=128),
-    ).to_raw_dict()
+    local = dict(AnalysisBinaryView(str(path)).probe_zip_local_header(0))
+    report = ArchiveAnalyzer().analyze(str(path))
+    eocd = next(item for item in report.evidences if item.format == "zip").details
+    consistency = dict(inspect_zip_directory_consistency(str(path), 128))
+    graph = dict(inspect_zip_structure_graph(str(path), 128))
 
     assert local["plausible"] is True
     assert local["compression_method"] == 8
     assert eocd["plausible"] is True
     assert eocd["central_directory_walk_ok"] is True
     assert eocd["local_header_links_ok"] is True
+    assert eocd["boundary_confidence"] == "high"
+    assert report.best_selected.format == "zip"
     assert consistency["error"] == ""
     assert consistency["cd_parseable"] is True
     assert {"nodes", "edges", "violations", "relation_violations", "explanations", "summary"} <= graph.keys()
 
 
-def test_public_zip_local_header_uses_supported_method_table(tmp_path):
+def test_zip_local_header_uses_supported_method_table(tmp_path):
     path = tmp_path / "unknown-method.zip"
     name = b"a"
     path.write_bytes(struct.pack(
@@ -57,7 +52,7 @@ def test_public_zip_local_header_uses_supported_method_table(tmp_path):
         0,
     ) + name)
 
-    raw = ArchiveAnalyzer().probe_zip_local_header(str(path)).to_raw_dict()
+    raw = dict(AnalysisBinaryView(str(path)).probe_zip_local_header(0))
 
     assert raw["magic_matched"] is True
     assert raw["plausible"] is False

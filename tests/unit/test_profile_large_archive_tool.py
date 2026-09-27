@@ -93,7 +93,7 @@ def test_pipeline_derived_timings_remove_nested_job_and_planning_costs():
         "pipeline_runtime_execute": [0.77],
         "job_execute": [0.6],
         "pipeline_plan_task_isolated": [0.1],
-        "planning_signature_prepass": [0.08],
+        "planning_native_analysis": [0.08],
         "pipeline_direct_scan": [0.02],
         "pipeline_nested_authorize": [0.02],
         "output_scan": [0.01],
