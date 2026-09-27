@@ -6,7 +6,7 @@ import threading
 from typing import Any
 
 from sunpack.core.config.advanced_defaults import _payload as _advanced_defaults_payload
-from sunpack.core.config.detection_view import DIRECTORY_SCAN_MODES, directory_scan_mode, scan_filters_config
+from sunpack.core.config.detection_view import DIRECTORY_SCAN_MODES, directory_scan_mode
 from sunpack.core.config.schema import ConfigSchemaError, config_fields, normalize_config, validate_external_config
 from sunpack.core.support.json_format import load_json_file
 from sunpack.core.support.resources import candidate_resource_paths, dedupe_paths, first_existing_path, program_data_dir
