@@ -92,6 +92,22 @@ def test_load_config_rejects_string_booleans(tmp_path, monkeypatch, override, fi
         loader.load_config()
 
 
+def test_load_config_validates_scan_filter_entries_even_when_filters_disabled(tmp_path, monkeypatch):
+    simple = tmp_path / "sunpack_config.json"
+    advanced = tmp_path / "sunpack_advanced_config.json"
+    _write_json(advanced, _advanced_payload())
+    _write_json(simple, {
+        "filesystem": {
+            "scan_filters_enabled": False,
+            "scan_filters": [{"name": "size_range", "enabled": "false"}],
+        },
+    })
+    monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
+
+    with pytest.raises(loader.ConfigError, match=r"filesystem\.scan_filters\[0\]\.enabled"):
+        loader.load_config()
+
+
 def test_load_config_rejects_invalid_runtime_process_mode(tmp_path, monkeypatch):
     simple = tmp_path / "sunpack_config.json"
     advanced = tmp_path / "sunpack_advanced_config.json"
