@@ -44,6 +44,56 @@ const PATTERNS: [PatternSpec; 10] = [
 const XZ_PATTERN_INDEX: usize = 7;
 const ZSTD_PATTERN_INDEX: usize = 8;
 
+#[cfg(target_arch = "x86_64")]
+const SIMD_PREFIX_TABLES: [[u8; 32]; 6] = simd_prefix_tables();
+
+#[cfg(target_arch = "x86_64")]
+const fn simd_prefix_tables() -> [[u8; 32]; 6] {
+    let mut tables = [[0u8; 32]; 6];
+    let mut buckets = [0u8; PATTERNS.len()];
+    let mut next_bucket = 0;
+    let mut index = 0;
+    while index < PATTERNS.len() {
+        let magic = PATTERNS[index].0;
+        assert!(magic.len() >= 3);
+        assert!(magic[0] != XZ_FOOTER_MAGIC[0]);
+        let mut bucket = next_bucket;
+        let mut prior = 0;
+        while prior < index {
+            let earlier = PATTERNS[prior].0;
+            if earlier[0] == magic[0] && earlier[1] == magic[1] {
+                bucket = buckets[prior] as usize;
+                break;
+            }
+            prior += 1;
+        }
+        if prior == index {
+            next_bucket += 1;
+            assert!(next_bucket <= 8);
+        }
+        buckets[index] = bucket as u8;
+        let bit = 1u8 << bucket;
+        let (first, second, third) = (magic[0], magic[1], magic[2]);
+        tables[0][(first & 15) as usize] |= bit;
+        tables[1][(first >> 4) as usize] |= bit;
+        tables[2][(second & 15) as usize] |= bit;
+        tables[3][(second >> 4) as usize] |= bit;
+        tables[4][(third & 15) as usize] |= bit;
+        tables[5][(third >> 4) as usize] |= bit;
+        index += 1;
+    }
+    let mut table = 0;
+    while table < 6 {
+        let mut nibble = 0;
+        while nibble < 16 {
+            tables[table][nibble + 16] = tables[table][nibble];
+            nibble += 1;
+        }
+        table += 1;
+    }
+    tables
+}
+
 static EMBEDDED_MATCHER: OnceLock<AhoCorasick> = OnceLock::new();
 static EMBEDDED_PACKED_MATCHER: OnceLock<Option<packed::Searcher>> = OnceLock::new();
 
@@ -373,6 +423,17 @@ fn resolve_logical_candidates(candidates: &mut Vec<EmbeddedCandidate>) {
 }
 
 fn scan_sample(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit> {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature check guards every AVX2 instruction. The scanner
+        // only loads vectors when all 34 accessed bytes belong to `sample`.
+        return unsafe { scan_sample_avx2(sample, carry_len, base_offset) };
+    }
+
+    scan_sample_packed(sample, carry_len, base_offset)
+}
+
+fn scan_sample_packed(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit> {
     let mut hits = Vec::new();
     if let Some(matcher) = embedded_packed_matcher() {
         for matched in matcher.find_iter(sample) {
@@ -429,6 +490,106 @@ fn scan_sample(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit>
         }
     }
     hits
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn scan_sample_avx2(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit> {
+    use std::arch::x86_64::*;
+
+    let mut hits = Vec::new();
+    let low_first = _mm256_loadu_si256(SIMD_PREFIX_TABLES[0].as_ptr().cast());
+    let high_first = _mm256_loadu_si256(SIMD_PREFIX_TABLES[1].as_ptr().cast());
+    let low_second = _mm256_loadu_si256(SIMD_PREFIX_TABLES[2].as_ptr().cast());
+    let high_second = _mm256_loadu_si256(SIMD_PREFIX_TABLES[3].as_ptr().cast());
+    let low_third = _mm256_loadu_si256(SIMD_PREFIX_TABLES[4].as_ptr().cast());
+    let high_third = _mm256_loadu_si256(SIMD_PREFIX_TABLES[5].as_ptr().cast());
+    let nibble_mask = _mm256_set1_epi8(15);
+    let zero = _mm256_setzero_si256();
+    let footer_first = _mm256_set1_epi8(XZ_FOOTER_MAGIC[0] as i8);
+    let footer_second = _mm256_set1_epi8(XZ_FOOTER_MAGIC[1] as i8);
+    let mut start = 0;
+    while start + 34 <= sample.len() {
+        let first = _mm256_loadu_si256(sample.as_ptr().add(start).cast());
+        let second = _mm256_loadu_si256(sample.as_ptr().add(start + 1).cast());
+        let third = _mm256_loadu_si256(sample.as_ptr().add(start + 2).cast());
+        let first_bits = _mm256_and_si256(
+            _mm256_shuffle_epi8(low_first, _mm256_and_si256(first, nibble_mask)),
+            _mm256_shuffle_epi8(
+                high_first,
+                _mm256_and_si256(_mm256_srli_epi16(first, 4), nibble_mask),
+            ),
+        );
+        let second_bits = _mm256_and_si256(
+            _mm256_shuffle_epi8(low_second, _mm256_and_si256(second, nibble_mask)),
+            _mm256_shuffle_epi8(
+                high_second,
+                _mm256_and_si256(_mm256_srli_epi16(second, 4), nibble_mask),
+            ),
+        );
+        let third_bits = _mm256_and_si256(
+            _mm256_shuffle_epi8(low_third, _mm256_and_si256(third, nibble_mask)),
+            _mm256_shuffle_epi8(
+                high_third,
+                _mm256_and_si256(_mm256_srli_epi16(third, 4), nibble_mask),
+            ),
+        );
+        let header_matches =
+            _mm256_and_si256(_mm256_and_si256(first_bits, second_bits), third_bits);
+        let footer_matches = _mm256_and_si256(
+            _mm256_cmpeq_epi8(first, footer_first),
+            _mm256_cmpeq_epi8(second, footer_second),
+        );
+        let matches = _mm256_or_si256(header_matches, footer_matches);
+        let mut mask = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(matches, zero)) as u32);
+        while mask != 0 {
+            let candidate = start + mask.trailing_zeros() as usize;
+            scan_sample_candidate(sample, carry_len, base_offset, candidate, &mut hits);
+            mask &= mask - 1;
+        }
+        start += 32;
+    }
+    while start < sample.len() {
+        scan_sample_candidate(sample, carry_len, base_offset, start, &mut hits);
+        start += 1;
+    }
+    hits
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn scan_sample_candidate(
+    sample: &[u8],
+    carry_len: usize,
+    base_offset: u64,
+    start: usize,
+    hits: &mut Vec<RawHit>,
+) {
+    let first = sample[start];
+    if first == XZ_FOOTER_MAGIC[0] {
+        if sample.get(start..start + XZ_FOOTER_MAGIC.len()) == Some(XZ_FOOTER_MAGIC)
+            && start + XZ_FOOTER_MAGIC.len() > carry_len
+        {
+            hits.push(RawHit {
+                hit_name: "xz_footer",
+                kind: "xz_footer",
+                offset: base_offset + start as u64,
+            });
+        }
+        return;
+    }
+    for (pattern, (magic, _, _)) in PATTERNS.iter().enumerate() {
+        if magic[0] == first && sample.get(start..start + magic.len()) == Some(*magic) {
+            record_raw_hit(
+                hits,
+                carry_len,
+                base_offset,
+                pattern,
+                start,
+                start + magic.len(),
+            );
+        }
+    }
 }
 
 fn record_raw_hit(
@@ -805,9 +966,7 @@ fn validate_zip(
     if flags & 0x0008 == 0 && data_end > size {
         return Ok(None);
     }
-    Ok(Some(candidate(
-        "zip", offset, None, confidence, validation,
-    )))
+    Ok(Some(candidate("zip", offset, None, confidence, validation)))
 }
 
 fn validate_seven_zip(
@@ -1406,6 +1565,73 @@ mod tests {
         hits
     }
 
+    #[test]
+    fn simd_scan_matches_reference_with_footers_and_carry_boundaries() {
+        let mut data = vec![0x55; 256];
+        for (index, (magic, _, _)) in PATTERNS.iter().enumerate() {
+            let start = 41 + index * 19;
+            data[start..start + magic.len()].copy_from_slice(magic);
+        }
+        data[31..33].copy_from_slice(XZ_FOOTER_MAGIC);
+        data[223..225].copy_from_slice(XZ_FOOTER_MAGIC);
+
+        for length in 0..=data.len() {
+            for carry_len in [0, 31, 32, 33, 64] {
+                let sample = &data[..length];
+                let mut expected = Vec::new();
+                for matched in embedded_matcher().find_overlapping_iter(sample) {
+                    record_raw_hit(
+                        &mut expected,
+                        carry_len,
+                        4096,
+                        matched.pattern().as_usize(),
+                        matched.start(),
+                        matched.end(),
+                    );
+                }
+                for start in memmem::find_iter(sample, XZ_FOOTER_MAGIC) {
+                    if start + XZ_FOOTER_MAGIC.len() > carry_len {
+                        expected.push(RawHit {
+                            hit_name: "xz_footer",
+                            kind: "xz_footer",
+                            offset: 4096 + start as u64,
+                        });
+                    }
+                }
+                let mut actual = scan_sample(sample, carry_len, 4096);
+                expected.sort_by_key(|hit| (hit.offset, hit.hit_name));
+                actual.sort_by_key(|hit| (hit.offset, hit.hit_name));
+                assert_eq!(actual, expected, "length={length} carry={carry_len}");
+            }
+        }
+
+        for prefix in [b"PK".as_slice(), b"Rar", b"7z", b"YZ"] {
+            let dense = prefix.repeat(4096);
+            let mut expected = Vec::new();
+            for matched in embedded_matcher().find_overlapping_iter(&dense) {
+                record_raw_hit(
+                    &mut expected,
+                    0,
+                    0,
+                    matched.pattern().as_usize(),
+                    matched.start(),
+                    matched.end(),
+                );
+            }
+            for start in memmem::find_iter(&dense, XZ_FOOTER_MAGIC) {
+                expected.push(RawHit {
+                    hit_name: "xz_footer",
+                    kind: "xz_footer",
+                    offset: start as u64,
+                });
+            }
+            let mut actual = scan_sample(&dense, 0, 0);
+            expected.sort_by_key(|hit| (hit.offset, hit.hit_name));
+            actual.sort_by_key(|hit| (hit.offset, hit.hit_name));
+            assert_eq!(actual, expected, "dense prefix {prefix:?}");
+        }
+    }
+
     fn append_tar_member(data: &mut Vec<u8>, name: &str, payload: &[u8]) {
         let member_start = data.len();
         let mut header = [0u8; 512];
@@ -1520,7 +1746,10 @@ mod tests {
         assert_eq!(seven.candidate_kind, "logical_archive");
         assert_eq!(seven.boundary_kind, "unresolved");
         assert!(!seven.extractable);
-        assert_eq!(seven.validation, "start_header_crc_truncated_declared_range");
+        assert_eq!(
+            seven.validation,
+            "start_header_crc_truncated_declared_range"
+        );
         let _ = fs::remove_file(path);
     }
 
@@ -1558,7 +1787,10 @@ mod tests {
         assert_eq!(logical[0].format, "7z");
         assert_eq!(logical[0].offset, start);
         assert_eq!(logical[0].end_offset, Some(end));
-        assert!(!result.candidates.iter().any(|candidate| candidate.format == "gzip"));
+        assert!(!result
+            .candidates
+            .iter()
+            .any(|candidate| candidate.format == "gzip"));
         let _ = fs::remove_file(path);
     }
 
@@ -1577,10 +1809,7 @@ mod tests {
 
         assert_eq!(zip.offset, start);
         assert_eq!(zip.end_offset, Some(end));
-        assert_eq!(
-            zip.validation,
-            "zip64_eocd_geometry_and_first_local_link"
-        );
+        assert_eq!(zip.validation, "zip64_eocd_geometry_and_first_local_link");
         let _ = fs::remove_file(path);
     }
 
