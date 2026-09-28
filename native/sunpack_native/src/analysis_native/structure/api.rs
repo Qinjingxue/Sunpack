@@ -853,7 +853,12 @@ pub(crate) fn inspect_compression_stream_identity(
     py: Python<'_>,
     path: &str,
 ) -> PyResult<Py<PyDict>> {
-    inspect_compression_stream_identity_impl(py, path)
+    inspect_compression_stream_identity_impl(path).to_py_dict(py)
+}
+
+pub(crate) fn confirm_compression_format_identity_native(path: &str, format: &str) -> bool {
+    let result = inspect_compression_stream_identity_impl(path);
+    result.format == format && result.plausible && result.error.is_empty()
 }
 
 #[pyfunction]

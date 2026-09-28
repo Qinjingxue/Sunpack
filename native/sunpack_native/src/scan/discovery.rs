@@ -1,13 +1,14 @@
-use crate::analysis_native::confirm_format_identity;
+use crate::analysis_native::confirm_format_identity_native;
 use crate::relations::{build_native_candidate_groups_from_snapshot, NativeRelationGroup};
 use crate::scan::directory::{
     filesystem_logical_name, filesystem_route_name, DirectorySnapshotTable,
     NativeDirectorySnapshot, FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL,
 };
 use crate::scan::embedded::{scan_embedded_path, NativeScanResult};
-use pyo3::exceptions::{PyIndexError, PyOSError, PyValueError};
+use pyo3::exceptions::PyIndexError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
@@ -65,8 +66,9 @@ impl NativeEmbeddedBatch {
         self.ids.len()
     }
 
+    /// Scan this page against the current files. Repeating a page repeats I/O.
     #[pyo3(signature = (table, offset=0, limit=256))]
-    fn page(
+    fn scan_page(
         &self,
         py: Python<'_>,
         table: PyRef<'_, NativeCandidateTable>,
@@ -420,56 +422,59 @@ impl NativeCandidateTable {
                 }
             }
         }
-        for (index, row) in self.rows.iter().enumerate() {
-            let Candidate::File(table, file_index) = row else {
-                continue;
-            };
-            if table.file_routes[*file_index] != FILE_ROUTE_DETECTION {
-                continue;
-            }
-            let path = &table.paths[*file_index];
-            let key = path_key(path);
-            if claimed.contains(&key) || blocked.contains(&key) {
-                continue;
-            }
-            if !detection_enabled {
-                routes.detection_residual.push(index);
-                if include_residual_details {
-                    routes.detection_events.push((index, 3));
+        let detection_indices = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(index, row)| match row {
+                Candidate::File(table, file_index)
+                    if table.file_routes[*file_index] == FILE_ROUTE_DETECTION =>
+                {
+                    Some(index)
                 }
-                continue;
-            }
-            let format = table.relation_anchors[*file_index]
-                .as_ref()
-                .map(|anchor| anchor.format.as_str())
-                .unwrap_or("");
-            let accepted = if matches!(format, "tar" | "gzip" | "bzip2" | "xz" | "zstd") {
-                py.detach(|| {
-                    Python::attach(|attached| confirm_format_identity(attached, path, format))
-                })
-                .or_else(|error| {
-                    if error.is_instance_of::<PyOSError>(py)
-                        || error.is_instance_of::<PyValueError>(py)
-                    {
-                        Ok(false)
-                    } else {
-                        Err(error)
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        py.detach(|| {
+            for batch in detection_indices.chunks(1024) {
+                let decisions = batch
+                    .par_iter()
+                    .map(|&index| {
+                        let Candidate::File(table, file_index) = &self.rows[index] else {
+                            return None;
+                        };
+                        let path = &table.paths[*file_index];
+                        let key = path_key(path);
+                        if claimed.contains(&key) || blocked.contains(&key) {
+                            return None;
+                        }
+                        let format = table.relation_anchors[*file_index]
+                            .as_ref()
+                            .map(|anchor| anchor.format.as_str())
+                            .unwrap_or("");
+                        let accepted = detection_enabled
+                            && matches!(format, "tar" | "gzip" | "bzip2" | "xz" | "zstd")
+                            && confirm_format_identity_native(path, format);
+                        Some((index, key, accepted))
+                    })
+                    .collect::<Vec<_>>();
+                for (index, key, accepted) in decisions.into_iter().flatten() {
+                    if claimed.contains(&key) {
+                        continue;
                     }
-                })?
-            } else {
-                false
-            };
-            if accepted {
-                claimed.insert(key);
-                routes.detection_resolved.push(index);
-                routes.detection_events.push((index, 1));
-            } else {
-                routes.detection_residual.push(index);
-                if include_residual_details {
-                    routes.detection_events.push((index, 3));
+                    if accepted {
+                        claimed.insert(key);
+                        routes.detection_resolved.push(index);
+                        routes.detection_events.push((index, 1));
+                    } else {
+                        routes.detection_residual.push(index);
+                        if include_residual_details {
+                            routes.detection_events.push((index, 3));
+                        }
+                    }
                 }
             }
-        }
+        });
         // Preserve the former stage order: filesystem residuals, Relations
         // residuals, then Detection residuals.
         for (index, row) in self.rows.iter().enumerate() {

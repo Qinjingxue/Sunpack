@@ -107,52 +107,75 @@ enum StructuralStreamKind {
 
 const IDENTITY_PROBE_MAX_BYTES: u64 = 64 * 1024;
 
-fn compression_identity_result(
-    py: Python<'_>,
-    format: &str,
-    ext: &str,
+struct CompressionIdentityResult {
+    format: &'static str,
+    ext: &'static str,
     magic_matched: bool,
     file_size: u64,
     bytes_read: u64,
     plausible: bool,
-    error: &str,
-    evidence: &[&str],
-) -> PyResult<Py<PyDict>> {
-    let d = compression_base(py, format, ext, magic_matched)?;
-    d.set_item("plausible", plausible)?;
-    d.set_item("confidence", if plausible { "strong" } else { "none" })?;
-    d.set_item("identity_strong", plausible)?;
-    d.set_item("validation_scope", "format_identity")?;
-    d.set_item("validation_cost", "bounded")?;
-    d.set_item("identity_bytes_read", bytes_read)?;
-    d.set_item("file_size", file_size)?;
-    d.set_item("structure_status", "incomplete")?;
-    d.set_item("structure_validation_complete", false)?;
-    d.set_item("boundary_exact", false)?;
-    d.set_item("integrity_status", "deferred")?;
-    d.set_item("integrity_validation_complete", false)?;
-    d.set_item("segment_end", Option::<u64>::None)?;
-    d.set_item("damage_flags", PyList::empty(py))?;
-    d.set_item("error", error)?;
-    d.set_item("evidence", PyList::new(py, evidence)?)?;
-    Ok(d.unbind())
+    error: &'static str,
+    evidence: Vec<&'static str>,
 }
 
-fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyResult<Py<PyDict>> {
+impl CompressionIdentityResult {
+    fn to_py_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let d = compression_base(py, self.format, self.ext, self.magic_matched)?;
+        d.set_item("plausible", self.plausible)?;
+        d.set_item("confidence", if self.plausible { "strong" } else { "none" })?;
+        d.set_item("identity_strong", self.plausible)?;
+        d.set_item("validation_scope", "format_identity")?;
+        d.set_item("validation_cost", "bounded")?;
+        d.set_item("identity_bytes_read", self.bytes_read)?;
+        d.set_item("file_size", self.file_size)?;
+        d.set_item("structure_status", "incomplete")?;
+        d.set_item("structure_validation_complete", false)?;
+        d.set_item("boundary_exact", false)?;
+        d.set_item("integrity_status", "deferred")?;
+        d.set_item("integrity_validation_complete", false)?;
+        d.set_item("segment_end", Option::<u64>::None)?;
+        d.set_item("damage_flags", PyList::empty(py))?;
+        d.set_item("error", self.error)?;
+        d.set_item("evidence", PyList::new(py, &self.evidence)?)?;
+        Ok(d.unbind())
+    }
+}
+
+fn compression_identity_result(
+    format: &'static str,
+    ext: &'static str,
+    magic_matched: bool,
+    file_size: u64,
+    bytes_read: u64,
+    plausible: bool,
+    error: &'static str,
+    evidence: &[&'static str],
+) -> CompressionIdentityResult {
+    CompressionIdentityResult {
+        format,
+        ext,
+        magic_matched,
+        file_size,
+        bytes_read,
+        plausible,
+        error,
+        evidence: evidence.to_vec(),
+    }
+}
+
+fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityResult {
     let reader = match ManagedReader::open(path) {
         Ok(value) => value,
         Err(_) => {
-            return compression_identity_result(py, "", "", false, 0, 0, false, "os_error", &[])
+            return compression_identity_result("", "", false, 0, 0, false, "os_error", &[])
         }
     };
     let file_size = reader.len();
     let read_size = file_size.min(32) as usize;
-    let mut data = match reader.read_cached_at(0, read_size) {
+    let mut data = match reader.read_direct_at(0, read_size) {
         Ok(value) => value,
         Err(_) => {
-            return compression_identity_result(
-                py,
-                "",
+            return compression_identity_result("",
                 "",
                 false,
                 file_size,
@@ -169,12 +192,10 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         && file_size > data.len() as u64
     {
         let expanded = file_size.min(IDENTITY_PROBE_MAX_BYTES) as usize;
-        data = match reader.read_cached_at(0, expanded) {
+        data = match reader.read_direct_at(0, expanded) {
             Ok(value) => value,
             Err(_) => {
-                return compression_identity_result(
-                    py,
-                    "gzip",
+                return compression_identity_result("gzip",
                     ".gz",
                     true,
                     file_size,
@@ -192,9 +213,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         let (payload_start, flags) = match parse_gzip_header(&data, 0) {
             Ok(value) => value,
             Err(error) => {
-                return compression_identity_result(
-                    py,
-                    "gzip",
+                return compression_identity_result("gzip",
                     ".gz",
                     true,
                     file_size,
@@ -208,9 +227,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         let mut evidence = vec!["gzip:magic", "gzip:header"];
         if flags & 0x02 != 0 {
             let Some(crc_offset) = payload_start.checked_sub(2) else {
-                return compression_identity_result(
-                    py,
-                    "gzip",
+                return compression_identity_result("gzip",
                     ".gz",
                     true,
                     file_size,
@@ -221,9 +238,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
                 );
             };
             let Some(stored_bytes) = data.get(crc_offset..crc_offset + 2) else {
-                return compression_identity_result(
-                    py,
-                    "gzip",
+                return compression_identity_result("gzip",
                     ".gz",
                     true,
                     file_size,
@@ -236,9 +251,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
             let stored = u16::from_le_bytes([stored_bytes[0], stored_bytes[1]]);
             let computed = (crc32(&data[..crc_offset]) & 0xffff) as u16;
             if stored != computed {
-                return compression_identity_result(
-                    py,
-                    "gzip",
+                return compression_identity_result("gzip",
                     ".gz",
                     true,
                     file_size,
@@ -251,9 +264,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
             evidence.push("gzip:header_crc16");
         }
         if payload_start as u64 >= file_size {
-            return compression_identity_result(
-                py,
-                "gzip",
+            return compression_identity_result("gzip",
                 ".gz",
                 true,
                 file_size,
@@ -264,15 +275,13 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
             );
         }
         let block_probe = reader
-            .read_at(
+            .read_direct_at(
                 payload_start as u64,
                 file_size.saturating_sub(payload_start as u64).min(8) as usize,
             )
             .unwrap_or_default();
         if block_probe.is_empty() {
-            return compression_identity_result(
-                py,
-                "gzip",
+            return compression_identity_result("gzip",
                 ".gz",
                 true,
                 file_size,
@@ -284,9 +293,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         }
         let block_type = (block_probe[0] >> 1) & 0x03;
         if block_type == 3 {
-            return compression_identity_result(
-                py,
-                "gzip",
+            return compression_identity_result("gzip",
                 ".gz",
                 true,
                 file_size,
@@ -298,9 +305,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         }
         if block_type == 0 {
             if block_probe.len() < 5 {
-                return compression_identity_result(
-                    py,
-                    "gzip",
+                return compression_identity_result("gzip",
                     ".gz",
                     true,
                     file_size,
@@ -313,9 +318,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
             let len = u16::from_le_bytes([block_probe[1], block_probe[2]]);
             let nlen = u16::from_le_bytes([block_probe[3], block_probe[4]]);
             if len ^ nlen != 0xffff {
-                return compression_identity_result(
-                    py,
-                    "gzip",
+                return compression_identity_result("gzip",
                     ".gz",
                     true,
                     file_size,
@@ -328,9 +331,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
             evidence.push("gzip:deflate_stored_length");
         } else if block_type == 2 {
             if block_probe.len() < 3 {
-                return compression_identity_result(
-                    py,
-                    "gzip",
+                return compression_identity_result("gzip",
                     ".gz",
                     true,
                     file_size,
@@ -347,9 +348,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
                 *block_probe.get(3).unwrap_or(&0),
             ]) >> 3;
             if bits & 0x1f > 29 {
-                return compression_identity_result(
-                    py,
-                    "gzip",
+                return compression_identity_result("gzip",
                     ".gz",
                     true,
                     file_size,
@@ -363,9 +362,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         } else {
             evidence.push("gzip:deflate_fixed_header");
         }
-        return compression_identity_result(
-            py,
-            "gzip",
+        return compression_identity_result("gzip",
             ".gz",
             true,
             file_size,
@@ -378,9 +375,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
 
     if data.starts_with(b"BZh") {
         if data.len() < 14 || !matches!(data[3], b'1'..=b'9') {
-            return compression_identity_result(
-                py,
-                "bzip2",
+            return compression_identity_result("bzip2",
                 ".bz2",
                 true,
                 file_size,
@@ -394,9 +389,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         const END_MAGIC: &[u8; 6] = b"\x17\x72\x45\x38\x50\x90";
         let marker = &data[4..10];
         if marker != BLOCK_MAGIC && marker != END_MAGIC {
-            return compression_identity_result(
-                py,
-                "bzip2",
+            return compression_identity_result("bzip2",
                 ".bz2",
                 true,
                 file_size,
@@ -415,9 +408,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         } else {
             vec!["bzip2:magic", "bzip2:block_size", "bzip2:end_marker"]
         };
-        return compression_identity_result(
-            py,
-            "bzip2",
+        return compression_identity_result("bzip2",
             ".bz2",
             true,
             file_size,
@@ -430,9 +421,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
 
     if data.starts_with(XZ_MAGIC) {
         if data.len() < 12 || file_size < 24 {
-            return compression_identity_result(
-                py,
-                "xz",
+            return compression_identity_result("xz",
                 ".xz",
                 true,
                 file_size,
@@ -450,9 +439,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
             || !matches!(check_id, 0 | 1 | 4 | 10)
             || stored != crc32(&flags)
         {
-            return compression_identity_result(
-                py,
-                "xz",
+            return compression_identity_result("xz",
                 ".xz",
                 true,
                 file_size,
@@ -462,9 +449,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
                 &["xz:magic"],
             );
         }
-        return compression_identity_result(
-            py,
-            "xz",
+        return compression_identity_result("xz",
             ".xz",
             true,
             file_size,
@@ -477,9 +462,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
 
     if data.starts_with(ZSTD_MAGIC) {
         if data.len() < 8 {
-            return compression_identity_result(
-                py,
-                "zstd",
+            return compression_identity_result("zstd",
                 ".zst",
                 true,
                 file_size,
@@ -491,9 +474,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         }
         let descriptor = data[4];
         if descriptor & 0x18 != 0 {
-            return compression_identity_result(
-                py,
-                "zstd",
+            return compression_identity_result("zstd",
                 ".zst",
                 true,
                 file_size,
@@ -513,9 +494,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         let mut cursor = 5usize;
         if !single {
             if cursor >= data.len() {
-                return compression_identity_result(
-                    py,
-                    "zstd",
+                return compression_identity_result("zstd",
                     ".zst",
                     true,
                     file_size,
@@ -533,9 +512,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
             .checked_add(dict_size)
             .and_then(|value| value.checked_add(fcs_size))
         else {
-            return compression_identity_result(
-                py,
-                "zstd",
+            return compression_identity_result("zstd",
                 ".zst",
                 true,
                 file_size,
@@ -546,9 +523,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
             );
         };
         if block_header_offset + 3 > data.len() {
-            return compression_identity_result(
-                py,
-                "zstd",
+            return compression_identity_result("zstd",
                 ".zst",
                 true,
                 file_size,
@@ -564,9 +539,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         let block_type = (block_header >> 1) & 0x03;
         let block_size = u64::from(block_header >> 3);
         if block_type == 3 || block_size > 128 * 1024 {
-            return compression_identity_result(
-                py,
-                "zstd",
+            return compression_identity_result("zstd",
                 ".zst",
                 true,
                 file_size,
@@ -582,9 +555,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
             .and_then(|value| value.checked_add(stored_size))
             .map_or(true, |end| end > file_size)
         {
-            return compression_identity_result(
-                py,
-                "zstd",
+            return compression_identity_result("zstd",
                 ".zst",
                 true,
                 file_size,
@@ -594,9 +565,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
                 &["zstd:magic", "zstd:frame_descriptor"],
             );
         }
-        return compression_identity_result(
-            py,
-            "zstd",
+        return compression_identity_result("zstd",
             ".zst",
             true,
             file_size,
@@ -611,9 +580,7 @@ fn inspect_compression_stream_identity_impl(py: Python<'_>, path: &str) -> PyRes
         );
     }
 
-    compression_identity_result(
-        py,
-        "",
+    compression_identity_result("",
         "",
         false,
         file_size,

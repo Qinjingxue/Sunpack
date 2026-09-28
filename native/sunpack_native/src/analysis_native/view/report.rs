@@ -1725,43 +1725,38 @@ fn read_fault_damage_flags(native: &Bound<'_, PyDict>) -> PyResult<Vec<String>> 
 /// Confirm a routed single-file TAR or compression stream by format identity.
 #[pyfunction]
 pub(crate) fn confirm_format_identity(py: Python<'_>, path: &str, format: &str) -> PyResult<bool> {
+    Ok(py.detach(|| confirm_format_identity_native(path, format)))
+}
+
+pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
     match format {
         "tar" => {
             let reader = match ManagedReader::open(path) {
                 Ok(reader) => reader,
-                Err(_) => return Ok(false),
+                Err(_) => return false,
             };
-            let view = AnalysisBinaryView {
-                path: path.to_string(),
-                reader,
-                closed: false,
+            if reader.len() < TAR_BLOCK_SIZE as u64 {
+                return false;
+            }
+            let Ok(header) = reader.read_direct_at(0, TAR_BLOCK_SIZE) else {
+                return false;
             };
-            let raw = view.walk_tar(py, 0, 0)?;
-            let checksum_matches = match (raw.get_item("stored_checksum")?, raw.get_item("computed_checksum")?) {
-                (Some(stored), Some(computed)) => stored.eq(computed)?,
-                (None, None) => true,
-                _ => false,
-            };
-            Ok(truthy(&raw, "plausible")?
-                && str_of(&raw, "validation_scope")? == "format_identity"
-                && truthy(&raw, "identity_strong")?
-                && truthy(&raw, "fuzzy_name_nonempty")?
-                && truthy(&raw, "fuzzy_numeric_fields_valid")?
-                && truthy(&raw, "fuzzy_typeflag_valid")?
-                && truthy(&raw, "fuzzy_payload_in_range")?
-                && checksum_matches
-                && !truthy(&raw, "error")?)
+            if header.len() != TAR_BLOCK_SIZE {
+                return false;
+            }
+            let identity = tar_header_identity(&header, 0, reader.len());
+            identity.plausible
+                && identity.name_nonempty
+                && identity.numeric_fields_valid
+                && identity.typeflag_valid
+                && identity.payload_in_range
+                && identity.stored_checksum == identity.computed_checksum
+                && identity.error.is_empty()
         }
         "gzip" | "bzip2" | "xz" | "zstd" => {
-            let raw = crate::analysis_native::inspect_compression_stream_identity(py, path)?.into_bound(py);
-            Ok(str_of(&raw, "format")? == format
-                && truthy(&raw, "plausible")?
-                && truthy(&raw, "identity_strong")?
-                && str_of(&raw, "validation_scope")? == "format_identity"
-                && str_of(&raw, "confidence")? == "strong"
-                && !truthy(&raw, "error")?)
+            crate::analysis_native::confirm_compression_format_identity_native(path, format)
         }
-        _ => Ok(false),
+        _ => false,
     }
 }
 

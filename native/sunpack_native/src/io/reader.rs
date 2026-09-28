@@ -302,6 +302,21 @@ impl ManagedReader {
         Ok(self.read_cached_at(offset, read_len)?.as_slice().to_vec())
     }
 
+    /// One-shot bounded probes bypass the shared block cache while retaining
+    /// the managed file handle and resource lifecycle.
+    pub(crate) fn read_direct_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        if offset >= self.len() || len == 0 {
+            return Ok(Vec::new());
+        }
+        let read_len = len.min((self.len() - offset) as usize);
+        let _permit = self.state.gate.acquire()?;
+        let data = self.source.read_direct_at(offset, read_len)?;
+        self.state
+            .uncached_read_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        Ok(data)
+    }
+
     pub(crate) fn read_exact_at(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
         let data = self.read_at(offset, len)?;
         if data.len() != len {

@@ -136,7 +136,7 @@ class EmbeddedDiscovery:
         )
         result = StageResult()
         for offset in range(0, len(batch), 256):
-            for index, status, reason, raw_scan in batch.page(table, offset, 256):
+            for index, status, reason, raw_scan in batch.scan_page(table, offset, 256):
                 if status == 0:
                     entry_path, format_hint = table.summary(index)
                     result.residual_paths.update(table.path_keys(index))

@@ -1143,39 +1143,27 @@ impl AnalysisBinaryView {
             // archive bytes as a fallback.
             result.set_item("magic_matched", true)?;
             zero_blocks = 0;
-            if checked == 0 {
-                let stored_checksum = parse_octal(&header[148..156]);
-                let member_size = parse_octal(&header[124..136]);
-                let computed_checksum = tar_checksum(&header);
-                let ustar_magic = matches!(&header[257..263], b"ustar\x00" | b"ustar ");
-                let numeric_fields_valid = stored_checksum.is_some()
-                    && member_size.is_some()
-                    && parse_octal(&header[100..108]).is_some()
-                    && parse_octal(&header[108..116]).is_some()
-                    && parse_octal(&header[116..124]).is_some()
-                    && parse_octal(&header[136..148]).is_some();
-                let typeflag_valid = header[156] == 0 || (0x20..0x7f).contains(&header[156]);
-                let payload_in_range = member_size.is_some_and(|member_size| {
-                    cursor
-                        .saturating_add(TAR_BLOCK_SIZE as u64)
-                        .saturating_add(member_size)
-                        .saturating_add(tar_padding(member_size))
-                        <= size
-                });
-                result.set_item("stored_checksum", stored_checksum.unwrap_or(0))?;
-                result.set_item("computed_checksum", computed_checksum)?;
-                result.set_item("member_size", member_size.unwrap_or(0))?;
-                result.set_item("ustar_magic", ustar_magic)?;
-                result.set_item("format", if ustar_magic { "ustar" } else { "tar" })?;
-                result.set_item(
-                    "fuzzy_name_nonempty",
-                    header[0..100].iter().any(|byte| *byte != 0),
-                )?;
-                result.set_item("fuzzy_numeric_fields_valid", numeric_fields_valid)?;
-                result.set_item("fuzzy_typeflag_valid", typeflag_valid)?;
-                result.set_item("fuzzy_payload_in_range", payload_in_range)?;
+            let first_identity = (checked == 0).then(|| tar_header_identity(&header, cursor, size));
+            if let Some(identity) = first_identity {
+                result.set_item("stored_checksum", identity.stored_checksum)?;
+                result.set_item("computed_checksum", identity.computed_checksum)?;
+                result.set_item("member_size", identity.member_size)?;
+                result.set_item("ustar_magic", identity.ustar_magic)?;
+                result.set_item("format", if identity.ustar_magic { "ustar" } else { "tar" })?;
+                result.set_item("fuzzy_name_nonempty", identity.name_nonempty)?;
+                result.set_item("fuzzy_numeric_fields_valid", identity.numeric_fields_valid)?;
+                result.set_item("fuzzy_typeflag_valid", identity.typeflag_valid)?;
+                result.set_item("fuzzy_payload_in_range", identity.payload_in_range)?;
             }
-            let (ok, error, member_size, ustar) = tar_header_plausible(&header);
+            let (ok, error, member_size, ustar) = first_identity.map_or_else(
+                || tar_header_plausible(&header),
+                |identity| (
+                    identity.plausible,
+                    identity.error,
+                    identity.member_size,
+                    identity.ustar_magic,
+                ),
+            );
             if !ok {
                 result.set_item("entries_checked", checked)?;
                 result.set_item("error", error)?;
