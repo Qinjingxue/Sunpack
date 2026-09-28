@@ -826,7 +826,7 @@ fn aes_lengths(strength: u8) -> Option<(usize, usize)> {
 /// ZipCrypto and WinZip AES, so the fast verifier must hash the same bytes or
 /// it would reject (or accept) candidates the extractor treats differently.
 /// ASCII is identical in every ANSI codepage and stays borrowed.
-fn zip_password_bytes(password: &str) -> Cow<'_, [u8]> {
+pub(crate) fn zip_password_bytes(password: &str) -> Cow<'_, [u8]> {
     if password.is_ascii() {
         return Cow::Borrowed(password.as_bytes());
     }
@@ -908,17 +908,35 @@ fn winzip_aes_verifier_matches(
 }
 
 fn zipcrypto_header_matches(password: &[u8], encrypted_header: &[u8; 12], expected: u8) -> bool {
-    let mut state = ZipCryptoState::new();
-    for byte in password {
-        state.update_keys(*byte);
+    ZipCryptoDecryptor::new(password, encrypted_header, expected).is_some()
+}
+
+/// Stateful ZipCrypto payload decryptor positioned after the 12-byte header.
+pub(crate) struct ZipCryptoDecryptor {
+    state: ZipCryptoState,
+}
+
+impl ZipCryptoDecryptor {
+    /// Consume the encryption header; `None` when its check byte rejects the password.
+    pub(crate) fn new(password: &[u8], encrypted_header: &[u8; 12], expected: u8) -> Option<Self> {
+        let mut state = ZipCryptoState::new();
+        for byte in password {
+            state.update_keys(*byte);
+        }
+        let mut last = 0u8;
+        for encrypted in encrypted_header {
+            last = encrypted ^ state.decrypt_byte();
+            state.update_keys(last);
+        }
+        (last == expected).then_some(Self { state })
     }
-    let mut plain = [0u8; 12];
-    for (idx, encrypted) in encrypted_header.iter().enumerate() {
-        let decrypted = encrypted ^ state.decrypt_byte();
-        state.update_keys(decrypted);
-        plain[idx] = decrypted;
+
+    pub(crate) fn decrypt(&mut self, buffer: &mut [u8]) {
+        for byte in buffer {
+            *byte ^= self.state.decrypt_byte();
+            self.state.update_keys(*byte);
+        }
     }
-    plain[11] == expected
 }
 
 struct ZipCryptoState {
@@ -949,16 +967,28 @@ impl ZipCryptoState {
     }
 }
 
-fn crc32_update(crc: u32, byte: u8) -> u32 {
-    let mut value = crc ^ byte as u32;
-    for _ in 0..8 {
-        if value & 1 != 0 {
-            value = (value >> 1) ^ 0xedb8_8320;
-        } else {
-            value >>= 1;
+const CRC32_TABLE: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut index = 0;
+    while index < 256 {
+        let mut value = index as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            value = if value & 1 != 0 {
+                (value >> 1) ^ 0xedb8_8320
+            } else {
+                value >> 1
+            };
+            bit += 1;
         }
+        table[index] = value;
+        index += 1;
     }
-    value
+    table
+};
+
+fn crc32_update(crc: u32, byte: u8) -> u32 {
+    CRC32_TABLE[((crc ^ byte as u32) & 0xff) as usize] ^ (crc >> 8)
 }
 
 fn find_signature(bytes: &[u8], signature: &[u8]) -> Option<usize> {

@@ -192,11 +192,6 @@ def native_worker_manifest(result: dict[str, Any]) -> NativeWorkerManifest | Non
     return value if isinstance(value, NativeWorkerManifest) else None
 
 
-def worker_manifest_files(result: dict[str, Any]) -> list[dict[str, Any]]:
-    native = native_worker_manifest(result)
-    return [dict(item) for item in native.materialize_files()] if native is not None else []
-
-
 def _tail_lines(text: str, limit: int = _STDIO_TAIL_LINES) -> list[str]:
     # A successful worker result is a single multi-megabyte JSON line.  The
     # structured payload is retained separately, so diagnostics only need a

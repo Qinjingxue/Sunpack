@@ -5,8 +5,8 @@ import os
 from pathlib import Path
 from typing import Any
 
-from sunpack_native import scan_output_tree as _native_scan_output_tree
-from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import worker_manifest_files
+from sunpack_native import scan_output_inventory as _native_scan_output_inventory
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import native_worker_manifest
 from sunpack.pipeline.postprocess.output_cleanup import DEFAULT_OUTPUT_CLEANUP_MANAGER
 from sunpack.core.support.resource_lifecycle import read_task_text, write_task_text
 
@@ -35,7 +35,7 @@ def build_extraction_progress_manifest(
 ) -> dict[str, Any]:
     result = _worker_result(diagnostics)
     output_trace = _output_trace(result)
-    source_items = output_trace.get("items") or _verified_manifest_files(result)
+    source_items = output_trace.get("items") or _iter_verified_manifest_files(result)
     items = [
         _manifest_item(item, out_dir=out_dir, round_index=round_index)
         for item in source_items
@@ -223,7 +223,7 @@ def has_recoverable_partial_outputs(diagnostics: dict[str, Any], out_dir: str) -
         return True
     if int(result.get("files_written", 0) or 0) > 0 or int(result.get("bytes_written", 0) or 0) > 0:
         return True
-    return any(_iter_files(Path(out_dir)))
+    return len(_native_scan_output_inventory(str(out_dir))) > 0
 
 
 def _worker_result(diagnostics: dict[str, Any]) -> dict[str, Any]:
@@ -237,8 +237,10 @@ def _output_trace(result: dict[str, Any]) -> dict[str, Any]:
     return dict(trace)
 
 
-def _verified_manifest_files(result: dict[str, Any]) -> list[dict[str, Any]]:
-    return worker_manifest_files(result)
+def _iter_verified_manifest_files(result: dict[str, Any]):
+    native = native_worker_manifest(result)
+    if native is not None:
+        yield from _iter_native_pages(native)
 
 
 def _trace_has_progress(output_trace: dict[str, Any]) -> bool:
@@ -353,10 +355,15 @@ def _manifest_output_root(
 
 
 def _iter_files(root: str):
-    scan = dict(_native_scan_output_tree(str(root)))
-    for item in scan.get("files") or []:
-        if isinstance(item, dict):
-            yield item
+    yield from _iter_native_pages(_native_scan_output_inventory(str(root)))
+
+
+def _iter_native_pages(native, page_size: int = 1024):
+    # Rust owns the file table; only one bounded page is Python objects at once.
+    offset = 0
+    while page := native.file_page(offset, page_size):
+        yield from page
+        offset += len(page)
 
 
 def _summary(items: list[dict[str, Any]]) -> dict[str, int]:

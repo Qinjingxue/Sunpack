@@ -176,10 +176,10 @@ def test_zip_verification_methods_share_one_full_archive_manifest(tmp_path, monk
 
     monkeypatch.setattr(archive_input_manifest_module, "_native_archive_state_zip_manifest", counted_manifest)
 
-    def reject_materialization(self):
+    def reject_materialization(self, **_kwargs):
         raise AssertionError("verification must consume the native output inventory")
 
-    monkeypatch.setattr(OutputInventory, "materialize_files", reject_materialization)
+    monkeypatch.setattr(OutputInventory, "file_page", reject_materialization)
     verification = _scheduler([
         {"name": "expected_name_presence", "max_expected_names": 1},
         {"name": "manifest_size_match", "max_expected_names": 2},

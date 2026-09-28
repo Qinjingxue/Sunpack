@@ -570,10 +570,7 @@ def test_native_worker_reports_cpu_credit_sizing_plan():
 
 
 def test_compact_worker_manifest_is_parsed_into_native_storage():
-    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
-        build_worker_diagnostics,
-        worker_manifest_files,
-    )
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import build_worker_diagnostics
 
     stdout = (
         '{"type":"result","status":"ok","verified_manifest":'
@@ -587,7 +584,7 @@ def test_compact_worker_manifest_is_parsed_into_native_storage():
     assert len(native) == 1
     assert native.all_complete() is True
     assert "files" not in manifest
-    materialized = worker_manifest_files(result)[0]
+    materialized = native.file_page(0, 1)[0]
     assert materialized["path"] == "a.txt"
     assert "output_path" not in materialized
     assert materialized["status"] == "complete"
@@ -625,8 +622,8 @@ def test_worker_manifest_rows_are_removed_before_python_json_decode(monkeypatch)
 
 def test_worker_manifest_native_parser_preserves_json_escaped_paths():
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
+        native_worker_manifest,
         parse_worker_json_line,
-        worker_manifest_files,
     )
 
     path = '目录/"quoted"\\name.txt'
@@ -645,7 +642,7 @@ def test_worker_manifest_native_parser_preserves_json_escaped_paths():
     line = json.dumps(payload, ensure_ascii=True, separators=(",", ":"))
 
     result = parse_worker_json_line(line)
-    materialized = worker_manifest_files(result)[0]
+    materialized = native_worker_manifest(result).file_page(0, 1)[0]
 
     assert materialized["path"] == path
     assert materialized["magic"] == b"abc"
@@ -667,7 +664,7 @@ def test_worker_manifest_v2_is_not_accepted():
 def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
-        worker_manifest_files,
+        native_worker_manifest,
     )
 
     result_payload = {
@@ -690,7 +687,7 @@ def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
     assert diagnostics["result"] is result_payload
     assert "rows" not in result_payload["verified_manifest"]
     assert "files" not in result_payload["verified_manifest"]
-    files = worker_manifest_files(result_payload)
+    files = native_worker_manifest(result_payload).file_page(0, 10)
     assert files[0]["path"] == "source.txt"
     assert files[0]["output_path"] == "output.txt"
     assert sum(len(line) for line in diagnostics["process"]["stdout_tail"]) <= 4000

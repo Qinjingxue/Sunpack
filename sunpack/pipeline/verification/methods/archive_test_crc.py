@@ -38,12 +38,9 @@ class ArchiveTestCrcMethod:
         if archive_status_result is not None:
             return archive_status_result
 
-        archive_files = [
-            item for item in archive_manifest.files
-            if isinstance(item, dict) and item.get("path") and not bool(item.get("shadowed"))
-        ]
+        retained = archive_manifest.retained_file_count
         inventory = output_inventory_for_evidence(evidence)
-        if not archive_files:
+        if not retained:
             if archive_manifest.archive_walk_complete and inventory.worker_inventory_complete:
                 return _verified_manifest_result(self.name, archive_manifest, inventory)
             return VerificationStep(method=self.name, status="skipped")
@@ -51,12 +48,12 @@ class ArchiveTestCrcMethod:
         max_reported_items = max(1, int(config.get("max_reported_items", 20) or 20))
         emit_observations = should_emit_file_observations(evidence, self.name)
         detail_limit = (
-            min(len(archive_files), 128)
+            min(retained, 128)
             if emit_observations
             else 0
         )
         coverage_result, match_result = coverage_from_native_inventory(
-            archive_files,
+            archive_manifest,
             inventory,
             method=self.name,
             verify_crc=True,
@@ -86,7 +83,7 @@ class ArchiveTestCrcMethod:
                 code="fail.archive_crc_mismatch",
                 message="Output file CRC does not match archive manifest CRC",
                 path=evidence.output_dir,
-                expected=len(archive_files),
+                expected=retained,
                 actual=mismatches,
             )
             issues.append(issue)
@@ -98,7 +95,7 @@ class ArchiveTestCrcMethod:
                 code="fail.archive_crc_file_missing",
                 message="Some archive CRC entries were not found in extraction output",
                 path=evidence.output_dir,
-                expected=len(archive_files),
+                expected=retained,
                 actual=missing,
             )
             issues.append(issue)
@@ -135,9 +132,9 @@ class ArchiveTestCrcMethod:
             "total_item_count": int(archive_manifest.item_count or 0),
             "verified_item_count": int(archive_manifest.verified_item_count or 0),
             "archive_walk_complete": bool(archive_manifest.archive_walk_complete),
-            "manifest_entries_retained": len(archive_manifest.files),
+            "manifest_entries_retained": retained,
             "manifest_entries_truncated": bool(archive_manifest.entries_truncated),
-            "detail_total": int(match_result.get("detail_total", len(archive_files)) or 0),
+            "detail_total": int(match_result.get("detail_total", retained) or 0),
             "detail_count": int(match_result.get("detail_count", len(observations)) or 0),
             "detail_truncated": bool(match_result.get("detail_truncated", False)),
             "worker_crc_reused": bool(match_result.get("used_worker_crc", False)),
@@ -160,7 +157,7 @@ class ArchiveTestCrcMethod:
                     code="info.archive_output_coverage",
                     message="Archive-state files were matched against extraction output",
                     path=evidence.output_dir,
-                    expected=int(coverage.get("expected_files", len(archive_files)) or 0),
+                    expected=int(coverage.get("expected_files", retained) or 0),
                     actual={**_coverage_actual(coverage, archive_manifest, evidence), **summary},
                 )],
             )
@@ -169,7 +166,7 @@ class ArchiveTestCrcMethod:
             code="info.archive_output_coverage",
             message="Archive-state files were matched against extraction output",
             path=evidence.output_dir,
-            expected=int(coverage.get("expected_files", len(archive_files)) or 0),
+            expected=int(coverage.get("expected_files", retained) or 0),
             actual={**_coverage_actual(coverage, archive_manifest, evidence), **summary},
         ))
         return VerificationStep(
@@ -216,7 +213,7 @@ class ArchiveTestCrcMethod:
                     path=evidence.archive_path,
                 )],
             )
-        if (archive_manifest.status == STATUS_DAMAGED or archive_manifest.checksum_error or archive_manifest.damaged) and archive_manifest.files:
+        if (archive_manifest.status == STATUS_DAMAGED or archive_manifest.checksum_error or archive_manifest.damaged) and archive_manifest.retained_file_count:
             return None
         if archive_manifest.status == STATUS_DAMAGED or archive_manifest.checksum_error or archive_manifest.damaged:
             return VerificationStep(

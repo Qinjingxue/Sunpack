@@ -5,6 +5,7 @@ from typing import Any
 
 from sunpack.core.contracts.verification import FileVerificationObservation, VerificationIssue
 from sunpack.core.support.path_names import clean_relative_archive_path
+from sunpack.pipeline.verification.archive_input_manifest import ArchiveInputManifest
 
 
 @dataclass(frozen=True)
@@ -25,7 +26,7 @@ class ArchiveOutputCoverage:
 
 
 def coverage_from_native_inventory(
-    archive_files: list[dict[str, Any]],
+    archive_files: list[dict[str, Any]] | ArchiveInputManifest,
     inventory,
     *,
     method: str,
@@ -37,8 +38,14 @@ def coverage_from_native_inventory(
     max_issue_items: int = 20,
     issues_by_path: dict[str, list[VerificationIssue]] | None = None,
 ) -> tuple[ArchiveOutputCoverage, dict[str, Any]]:
+    archive_limit = None
+    if isinstance(archive_files, ArchiveInputManifest):
+        # Match straight from the Rust entry table, bounded by the view.
+        archive_limit = archive_files.retained_file_count
+        archive_files = archive_files.entries if archive_files.entries is not None else []
     raw = inventory.verification_match(
         archive_files,
+        archive_limit=archive_limit,
         verify_crc=verify_crc,
         basename_mode=basename_mode,
         include_observations=include_observations,

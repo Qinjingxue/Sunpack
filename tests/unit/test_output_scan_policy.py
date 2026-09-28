@@ -158,7 +158,7 @@ def test_output_scan_policy_reuses_extraction_inventory(tmp_path, monkeypatch):
     policy = OutputScanPolicy(_config())
     work = policy.prepare_scan(
         [str(tmp_path)],
-        inventories={str(tmp_path.resolve()).lower(): inventory.to_dict()},
+        inventories={str(tmp_path.resolve()).lower(): inventory},
     )
     roots = list(work.roots)
     assert roots == [str(tmp_path.resolve())]
@@ -175,7 +175,7 @@ def test_output_scan_policy_inventory_batch_primes_file_heads(tmp_path, monkeypa
     policy = OutputScanPolicy(_config())
     work = policy.prepare_scan(
         [str(tmp_path)],
-        inventories={str(tmp_path.resolve()).lower(): inventory.to_dict()},
+        inventories={str(tmp_path.resolve()).lower(): inventory},
     )
     session = work.session
     assert session is not None

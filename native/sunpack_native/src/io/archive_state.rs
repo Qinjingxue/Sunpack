@@ -1,11 +1,13 @@
 use crate::io::resource_lifecycle::TrackedFile;
+use crate::password::zip::{zip_password_bytes, ZipCryptoDecryptor};
+use crate::verification::archive_manifest::{ManifestEntry, NativeArchiveManifest};
 use encoding_rs::{BIG5, GBK, SHIFT_JIS, UTF_8};
 use pyo3::prelude::*;
-use pyo3::types::{PyBytes, PyDict, PyList};
+use pyo3::types::{PyDict, PyList};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::io::{Read, Seek, SeekFrom};
+use std::sync::Arc;
 
 const COPY_CHUNK_SIZE: usize = 1024 * 1024;
 const EOCD_SIG: &[u8] = b"PK\x05\x06";
@@ -14,56 +16,24 @@ const LFH_SIG: &[u8] = b"PK\x03\x04";
 const ZIP_UNICODE_PATH_EXTRA_FIELD: u16 = 0x7075;
 
 #[pyfunction]
-pub(crate) fn archive_state_to_bytes_native(
-    py: Python<'_>,
-    source: &Bound<'_, PyDict>,
-) -> PyResult<Py<PyBytes>> {
-    let data = materialize_archive_state(source)?;
-    Ok(PyBytes::new(py, &data).unbind())
-}
-
-#[pyfunction]
-pub(crate) fn archive_state_size_native(
-    source: &Bound<'_, PyDict>,
-) -> PyResult<u64> {
-    Ok(build_segments(source)?
-        .iter()
-        .map(|segment| segment.len())
-        .sum())
-}
-
-#[pyfunction]
-pub(crate) fn archive_state_write_to_file_native(
-    source: &Bound<'_, PyDict>,
-    output_path: &str,
-) -> PyResult<String> {
-    let segments = build_segments(source)?;
-    let output = Path::new(output_path);
-    ensure_parent(output)?;
-    let temp = temp_path(output);
-    let result = (|| -> PyResult<()> {
-        let mut target = TrackedFile::create(&temp, "archive_state_output")?;
-        for segment in &segments {
-            write_segment(&mut target, segment)?;
-        }
-        target.flush()?;
-        Ok(())
-    })();
-    finish_atomic_write(result, &temp, output)?;
-    Ok(output.to_string_lossy().to_string())
-}
-
-#[pyfunction]
 #[pyo3(signature = (source, max_items=200000, password=None, codepage=None))]
 pub(crate) fn archive_state_zip_manifest_native(
     py: Python<'_>,
     source: &Bound<'_, PyDict>,
     max_items: usize,
-    password: Option<&str>,
-    codepage: Option<&str>,
-) -> PyResult<Py<PyDict>> {
-    let data = materialize_archive_state(source)?;
-    zip_manifest_from_bytes(py, &data, max_items, password, codepage).map(|value| value.unbind())
+    password: Option<String>,
+    codepage: Option<String>,
+) -> PyResult<NativeArchiveManifest> {
+    let segments = build_segments(source)?;
+    py.detach(move || {
+        let mut reader = SegmentReader::new(segments);
+        zip_manifest_from_reader(
+            &mut reader,
+            max_items,
+            password.as_deref(),
+            codepage.as_deref(),
+        )
+    })
 }
 
 #[pyfunction]
@@ -72,22 +42,12 @@ pub(crate) fn archive_state_tar_manifest_native(
     py: Python<'_>,
     source: &Bound<'_, PyDict>,
     max_items: usize,
-) -> PyResult<Py<PyDict>> {
+) -> PyResult<NativeArchiveManifest> {
     let segments = build_segments(source)?;
-    let mut reader = TarSegmentReader::new(segments);
-    tar_manifest_from_reader(py, &mut reader, max_items).map(|value| value.unbind())
-}
-
-pub(crate) fn materialize_archive_state(
-    source: &Bound<'_, PyDict>,
-) -> PyResult<Vec<u8>> {
-    let segments = build_segments(source)?;
-    let total: u64 = segments.iter().map(|segment| segment.len()).sum();
-    let mut output = Vec::with_capacity(total.min(COPY_CHUNK_SIZE as u64) as usize);
-    for segment in &segments {
-        append_segment(&mut output, segment)?;
-    }
-    Ok(output)
+    py.detach(move || {
+        let mut reader = SegmentReader::new(segments);
+        tar_manifest_from_reader(&mut reader, max_items)
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -103,7 +63,7 @@ impl Segment {
     }
 }
 
-struct TarSegmentReader {
+struct SegmentReader {
     segments: Vec<Segment>,
     starts: Vec<u64>,
     total: u64,
@@ -111,7 +71,7 @@ struct TarSegmentReader {
     file: Option<TrackedFile>,
 }
 
-impl TarSegmentReader {
+impl SegmentReader {
     fn new(segments: Vec<Segment>) -> Self {
         let mut starts = Vec::with_capacity(segments.len());
         let mut total = 0u64;
@@ -146,30 +106,30 @@ impl TarSegmentReader {
 
     fn read_exact_at(&mut self, offset: u64, output: &mut [u8]) -> PyResult<()> {
         let end = offset.checked_add(output.len() as u64).ok_or_else(|| {
-            pyo3::exceptions::PyValueError::new_err("TAR logical read offset overflow")
+            pyo3::exceptions::PyValueError::new_err("archive state logical read offset overflow")
         })?;
         if end > self.total {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "TAR logical read exceeds archive state",
+                "archive state logical read exceeds input",
             ));
         }
         let mut cursor = offset;
         let mut written = 0usize;
         while written < output.len() {
             let (index, within) = self.locate(cursor).ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("TAR logical read segment is missing")
+                pyo3::exceptions::PyValueError::new_err("archive state logical read segment is missing")
             })?;
             let available = (self.segments[index].len() - within) as usize;
             let take = available.min(output.len() - written);
             match self.segments[index].clone() {
                 Segment::Range { path, start, .. } => {
                     if self.file_index != Some(index) {
-                        let file = TrackedFile::open(&path, "tar_segment_file")?;
+                        let file = TrackedFile::open(&path, "archive_state_segment_file")?;
                         self.file = Some(file);
                         self.file_index = Some(index);
                     }
                     let file = self.file.as_mut().ok_or_else(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err("TAR source file is unavailable")
+                        pyo3::exceptions::PyRuntimeError::new_err("archive state source file is unavailable")
                     })?;
                     file.seek(SeekFrom::Start(start.saturating_add(within)))?;
                     file.read_exact(&mut output[written..written + take])?;
@@ -205,27 +165,21 @@ impl TarSegmentReader {
     }
 }
 
-fn tar_manifest_from_reader<'py>(
-    py: Python<'py>,
-    reader: &mut TarSegmentReader,
+fn tar_manifest_from_reader(
+    reader: &mut SegmentReader,
     max_items: usize,
-) -> PyResult<Bound<'py, PyDict>> {
+) -> PyResult<NativeArchiveManifest> {
     const BLOCK: u64 = 512;
-    let result = PyDict::new(py);
-    result.set_item("source", "archive_state_tar_native")?;
-    result.set_item("state_aware", true)?;
-    result.set_item("archive_type", "tar")?;
-
     let mut offset = 0u64;
     let mut item_count = 0usize;
     let mut file_count = 0usize;
+    let mut total_unpacked_size = 0u64;
     let mut zero_blocks = 0usize;
-    let files = PyList::empty(py);
+    let mut entries = Vec::<ManifestEntry>::new();
     let mut used_paths = HashSet::<String>::new();
     let mut global_pax = HashMap::<String, String>::new();
     let mut next_pax = HashMap::<String, String>::new();
     let mut long_name = None::<String>;
-    let mut long_link = None::<String>;
     let mut error = None::<String>;
     let mut checksum_error = false;
 
@@ -319,11 +273,11 @@ fn tar_manifest_from_reader<'py>(
                 );
                 break;
             }
-            let payload = reader.read_vec_at(payload_start, raw_size as usize)?;
+            // A GNU longlink only names a link target, which is not part of the
+            // regular-file manifest; its payload is skipped like any member.
             if typeflag == b'L' {
+                let payload = reader.read_vec_at(payload_start, raw_size as usize)?;
                 long_name = Some(tar_text(&payload));
-            } else {
-                long_link = Some(tar_text(&payload));
             }
             item_count += 1;
             offset = raw_next;
@@ -374,11 +328,6 @@ fn tar_manifest_from_reader<'py>(
                     format!("{prefix}/{raw_name}")
                 }
             });
-        let linkpath = long_link
-            .clone()
-            .or_else(|| effective.get("linkpath").cloned())
-            .unwrap_or_else(|| tar_text(&header[157..257]));
-
         let mut logical_size = raw_size;
         for key in ["GNU.sparse.realsize", "GNU.sparse.size", "size"] {
             if let Some(value) = effective.get(key) {
@@ -425,36 +374,24 @@ fn tar_manifest_from_reader<'py>(
                 index += 1;
             }
             used_paths.insert(tar_path_key(&projected));
-            if file_count <= max_items {
-                let item = PyDict::new(py);
-                item.set_item("ordinal", item_count - 1)?;
-                item.set_item("path", &projected)?;
-                item.set_item("raw_path", &archive_path)?;
-                item.set_item(
-                    "size",
-                    if matches!(typeflag, b'1' | b'2') {
-                        0
-                    } else {
-                        logical_size
-                    },
-                )?;
-                item.set_item(
-                    "typeflag",
-                    if typeflag == 0 {
-                        "0".to_string()
-                    } else {
-                        (typeflag as char).to_string()
-                    },
-                )?;
-                item.set_item("linkpath", &linkpath)?;
-                item.set_item("has_crc", false)?;
-                item.set_item("archive_path", &archive_path)?;
-                files.append(item)?;
+            let size = if matches!(typeflag, b'1' | b'2') {
+                0
+            } else {
+                logical_size
+            };
+            total_unpacked_size = total_unpacked_size.saturating_add(size);
+            if entries.len() < max_items {
+                let raw_path = (projected != archive_path).then_some(archive_path);
+                entries.push(ManifestEntry {
+                    path: projected,
+                    raw_path,
+                    size,
+                    crc32: None,
+                });
             }
         }
         next_pax.clear();
         long_name = None;
-        long_link = None;
         offset = member_next;
         if error.is_some() || raw_payload_truncated || member_payload_truncated {
             if error.is_none() {
@@ -480,19 +417,22 @@ fn tar_manifest_from_reader<'py>(
             "TAR source manifest walked to EOF".to_string()
         }
     });
-    result.set_item("status", status)?;
-    result.set_item("is_archive", item_count > 0)?;
-    result.set_item("damaged", damaged)?;
-    result.set_item("checksum_error", checksum_error)?;
-    result.set_item("item_count", item_count)?;
-    result.set_item("file_count", file_count)?;
-    result.set_item("files", files)?;
-    result.set_item("message", message)?;
-    result.set_item("archive_walk_complete", !damaged)?;
-    result.set_item("verified_item_count", if damaged { 0 } else { item_count })?;
-    result.set_item("entries_truncated", file_count > max_items)?;
-    result.set_item("failure_kind", if damaged { "corrupted_data" } else { "" })?;
-    Ok(result)
+    Ok(NativeArchiveManifest {
+        status,
+        is_archive: item_count > 0,
+        damaged,
+        checksum_error,
+        item_count,
+        file_count,
+        total_unpacked_size,
+        message,
+        archive_type: "tar".to_string(),
+        source: "archive_state_tar_native".to_string(),
+        archive_walk_complete: !damaged,
+        verified_item_count: if damaged { 0 } else { item_count },
+        failure_kind: if damaged { "corrupted_data" } else { "" }.to_string(),
+        entries: Arc::new(entries),
+    })
 }
 
 fn tar_number(field: &[u8]) -> Option<u64> {
@@ -590,7 +530,7 @@ fn tar_pax(payload: &[u8]) -> Option<HashMap<String, String>> {
 }
 
 fn tar_sparse_extension_span(
-    reader: &mut TarSegmentReader,
+    reader: &mut SegmentReader,
     header: &[u8; 512],
     header_offset: u64,
 ) -> PyResult<Option<(u64, u64)>> {
@@ -780,127 +720,123 @@ fn range_segment(path: &str, start: u64, end: Option<u64>) -> PyResult<Segment> 
     })
 }
 
-fn append_segment(output: &mut Vec<u8>, segment: &Segment) -> PyResult<()> {
-    match segment {
-        Segment::Range { path, start, len } => {
-            let mut file = TrackedFile::open(path, "archive_state_source")?;
-            file.seek(SeekFrom::Start(*start))?;
-            let mut limited = file.take(*len);
-            limited.read_to_end(output)?;
-        }
-    }
-    Ok(())
-}
-
-fn write_segment(target: &mut TrackedFile, segment: &Segment) -> PyResult<()> {
-    match segment {
-        Segment::Range { path, start, len } => {
-            let mut source = TrackedFile::open(path, "archive_state_source")?;
-            source.seek(SeekFrom::Start(*start))?;
-            let mut limited = source.take(*len);
-            let mut buffer = vec![0u8; COPY_CHUNK_SIZE];
-            loop {
-                let read = limited.read(&mut buffer)?;
-                if read == 0 {
-                    break;
-                }
-                target.write_all(&buffer[..read])?;
-            }
-        }
-    }
-    Ok(())
-}
-
-fn zip_manifest_from_bytes<'py>(
-    py: Python<'py>,
-    data: &[u8],
+fn zip_manifest_from_reader(
+    reader: &mut SegmentReader,
     max_items: usize,
     password: Option<&str>,
     codepage: Option<&str>,
-) -> PyResult<Bound<'py, PyDict>> {
-    let result = PyDict::new(py);
-    result.set_item("source", "archive_state_native_zip_central_directory")?;
-    result.set_item("state_aware", true)?;
-    result.set_item("archive_type", "zip")?;
-    let Some(eocd) = find_eocd(data) else {
-        result.set_item("status", 2)?;
-        result.set_item("is_archive", looks_like_zip(data))?;
-        result.set_item("damaged", true)?;
-        result.set_item("checksum_error", false)?;
-        result.set_item("item_count", 0)?;
-        result.set_item("file_count", 0)?;
-        result.set_item("files", PyList::empty(py))?;
-        result.set_item(
-            "message",
-            "Archive state is not a readable ZIP: EOCD not found",
-        )?;
-        return Ok(result);
+) -> PyResult<NativeArchiveManifest> {
+    let password = password.map(zip_password_bytes);
+    let mut manifest = NativeArchiveManifest {
+        status: 2,
+        is_archive: true,
+        damaged: true,
+        checksum_error: false,
+        item_count: 0,
+        file_count: 0,
+        total_unpacked_size: 0,
+        message: "Archive state is not a readable ZIP: EOCD not found".to_string(),
+        archive_type: "zip".to_string(),
+        source: "archive_state_native_zip_central_directory".to_string(),
+        archive_walk_complete: false,
+        verified_item_count: 0,
+        failure_kind: String::new(),
+        entries: Arc::new(Vec::new()),
     };
-    let mut cursor = eocd.cd_offset as usize;
-    let expected_end = cursor.saturating_add(eocd.cd_size as usize);
-    let files = PyList::empty(py);
+    let Some(eocd) = find_eocd(reader)? else {
+        manifest.is_archive = looks_like_zip(reader)?;
+        return Ok(manifest);
+    };
+    let total = reader.total;
+    let cd_start = eocd.cd_offset as u64;
+    let expected_end = cd_start.saturating_add(eocd.cd_size as u64);
+    // Every header read below stays inside [cd_start, expected_end + 46) and
+    // inside the input, so one bounded buffer holds the whole directory walk.
+    let directory = if cd_start < total {
+        reader.read_vec_at(cd_start, (expected_end.saturating_add(46).min(total) - cd_start) as usize)?
+    } else {
+        Vec::new()
+    };
+    let mut entries = Vec::new();
+    let mut cursor = cd_start;
     let mut item_count = 0usize;
     let mut file_count = 0usize;
+    let mut total_unpacked_size = 0u64;
     let mut damaged = false;
     let mut checksum_error = false;
+    let mut wrong_password = false;
     let mut message = "Archive-state ZIP manifest loaded by native parser".to_string();
-    while cursor + 46 <= data.len() && cursor < expected_end {
-        if &data[cursor..cursor + 4] != CD_SIG {
+    let mut payload = ZipPayloadVerifier::new();
+    while cursor + 46 <= total && cursor < expected_end {
+        let at = (cursor - cd_start) as usize;
+        if &directory[at..at + 4] != CD_SIG {
             damaged = true;
             message = "Archive state ZIP central directory stopped before expected end"
                 .to_string();
             break;
         }
-        let flags = u16_le(data, cursor + 8);
-        let method = u16_le(data, cursor + 10);
-        let crc32 = u32_le(data, cursor + 16);
-        let compressed_size = u32_le(data, cursor + 20) as u64;
-        let uncompressed_size = u32_le(data, cursor + 24) as u64;
-        let name_len = u16_le(data, cursor + 28) as usize;
-        let extra_len = u16_le(data, cursor + 30) as usize;
-        let comment_len = u16_le(data, cursor + 32) as usize;
-        let local_offset = u32_le(data, cursor + 42) as usize;
-        let name_start = cursor + 46;
+        let flags = u16_le(&directory, at + 8);
+        let method = u16_le(&directory, at + 10);
+        let crc32 = u32_le(&directory, at + 16);
+        let compressed_size = u32_le(&directory, at + 20) as u64;
+        let uncompressed_size = u32_le(&directory, at + 24) as u64;
+        let name_len = u16_le(&directory, at + 28) as usize;
+        let extra_len = u16_le(&directory, at + 30) as usize;
+        let comment_len = u16_le(&directory, at + 32) as usize;
+        let local_offset = u32_le(&directory, at + 42) as u64;
+        let name_start = at + 46;
         let name_end = name_start + name_len;
         let extra_end = name_end + extra_len;
-        let record_end = name_end + extra_len + comment_len;
-        if record_end > data.len() || record_end > expected_end {
+        let record_end = cursor + 46 + (name_len + extra_len + comment_len) as u64;
+        if record_end > total || record_end > expected_end {
             damaged = true;
             message = "Archive state ZIP central directory entry is truncated".to_string();
             break;
         }
         item_count += 1;
         let name = decode_zip_filename(
-            &data[name_start..name_end],
-            &data[name_end..extra_end],
+            &directory[name_start..name_end],
+            &directory[name_end..extra_end],
             flags,
             codepage,
         )?;
-        if !name.ends_with('/') && file_count < max_items {
-            let item = PyDict::new(py);
-            item.set_item("path", &name)?;
-            item.set_item("size", uncompressed_size)?;
-            item.set_item("packed_size", compressed_size)?;
-            item.set_item("has_crc", true)?;
-            item.set_item("crc32", crc32)?;
-            item.set_item("source", "archive_state_zip_central_directory_native")?;
-            files.append(item)?;
-            file_count += 1;
+        // Encrypted entries are only checkable with a password; WinZip AES
+        // entries use method 99 and are left to the extraction worker.
+        let entry_password = if flags & 0x1 != 0 { password.as_deref() } else { None };
+        if matches!(method, 0 | 8) && (flags & 0x1 == 0 || entry_password.is_some()) {
+            match payload.verify(
+                reader,
+                local_offset,
+                method,
+                crc32,
+                compressed_size,
+                uncompressed_size,
+                entry_password,
+            )? {
+                PayloadCheck::Valid => {}
+                PayloadCheck::Corrupt => {
+                    damaged = true;
+                    checksum_error = true;
+                    message = format!("Archive state ZIP payload CRC failed at: {name}");
+                }
+                PayloadCheck::WrongPassword => {
+                    if !wrong_password && !damaged {
+                        message = format!("Archive state ZIP password does not match: {name}");
+                    }
+                    wrong_password = true;
+                }
+            }
         }
-        if flags & 0x1 == 0 || password.is_some() {
-            if matches!(method, 0 | 8)
-                && !verify_zip_payload(
-                    data,
-                    local_offset,
-                    method,
-                    crc32,
-                    compressed_size,
-                    uncompressed_size,
-                )
-            {
-                damaged = true;
-                checksum_error = true;
-                message = format!("Archive state ZIP payload CRC failed at: {name}");
+        if !name.ends_with('/') {
+            file_count += 1;
+            total_unpacked_size = total_unpacked_size.saturating_add(uncompressed_size);
+            if entries.len() < max_items {
+                entries.push(ManifestEntry {
+                    path: name,
+                    raw_path: None,
+                    size: uncompressed_size,
+                    crc32: Some(crc32),
+                });
             }
         }
         cursor = record_end;
@@ -908,15 +844,24 @@ fn zip_manifest_from_bytes<'py>(
     if cursor != expected_end {
         damaged = true;
     }
-    result.set_item("status", if damaged { 2 } else { 0 })?;
-    result.set_item("is_archive", true)?;
-    result.set_item("damaged", damaged)?;
-    result.set_item("checksum_error", checksum_error)?;
-    result.set_item("item_count", item_count)?;
-    result.set_item("file_count", file_count)?;
-    result.set_item("files", files)?;
-    result.set_item("message", message)?;
-    Ok(result)
+    let walk_complete = !damaged && !wrong_password;
+    manifest.status = if damaged {
+        2
+    } else if wrong_password {
+        1
+    } else {
+        0
+    };
+    manifest.damaged = damaged;
+    manifest.checksum_error = checksum_error;
+    manifest.item_count = item_count;
+    manifest.file_count = file_count;
+    manifest.total_unpacked_size = total_unpacked_size;
+    manifest.message = message;
+    manifest.archive_walk_complete = walk_complete;
+    manifest.verified_item_count = if walk_complete { item_count } else { 0 };
+    manifest.entries = Arc::new(entries);
+    Ok(manifest)
 }
 
 fn decode_zip_filename(
@@ -1086,139 +1031,221 @@ struct EocdRecord {
     cd_offset: u32,
 }
 
-fn find_eocd(data: &[u8]) -> Option<EocdRecord> {
-    let mut pos = find_last(data, EOCD_SIG, data.len())?;
+/// Search the logical input backwards for the last EOCD record whose comment
+/// fits inside the input, reading bounded windows instead of the whole input.
+fn find_eocd(reader: &mut SegmentReader) -> PyResult<Option<EocdRecord>> {
+    const WINDOW: u64 = 1024 * 1024;
+    let total = reader.total;
+    if total < EOCD_SIG.len() as u64 {
+        return Ok(None);
+    }
+    let overlap = EOCD_SIG.len() as u64 - 1;
+    let mut window_end = total;
+    let mut buffer = Vec::new();
     loop {
-        if pos + 22 <= data.len() {
-            let comment_len = u16_le(data, pos + 20) as usize;
-            let end = pos + 22 + comment_len;
-            if end <= data.len() {
-                return Some(EocdRecord {
-                    cd_size: u32_le(data, pos + 12),
-                    cd_offset: u32_le(data, pos + 16),
-                });
+        let window_start = window_end.saturating_sub(WINDOW);
+        let read_end = window_end.saturating_add(overlap).min(total);
+        buffer.resize((read_end - window_start) as usize, 0);
+        reader.read_exact_at(window_start, &mut buffer)?;
+        let mut index = (window_end - window_start) as usize;
+        while index > 0 {
+            index -= 1;
+            if index + EOCD_SIG.len() > buffer.len() || &buffer[index..index + 4] != EOCD_SIG {
+                continue;
+            }
+            let pos = window_start + index as u64;
+            if pos + 22 > total {
+                continue;
+            }
+            let mut record = [0u8; 22];
+            reader.read_exact_at(pos, &mut record)?;
+            let comment_len = u16_le(&record, 20) as u64;
+            if pos + 22 + comment_len <= total {
+                return Ok(Some(EocdRecord {
+                    cd_size: u32_le(&record, 12),
+                    cd_offset: u32_le(&record, 16),
+                }));
             }
         }
-        if pos == 0 {
-            return None;
+        if window_start == 0 {
+            return Ok(None);
         }
-        pos = find_last(data, EOCD_SIG, pos)?;
+        window_end = window_start;
     }
 }
 
-fn verify_zip_payload(
-    data: &[u8],
-    local_offset: usize,
-    method: u16,
-    expected_crc: u32,
-    compressed_size: u64,
-    uncompressed_size: u64,
-) -> bool {
-    if local_offset + 30 > data.len() || &data[local_offset..local_offset + 4] != LFH_SIG {
-        return false;
-    }
-    let name_len = u16_le(data, local_offset + 26) as usize;
-    let extra_len = u16_le(data, local_offset + 28) as usize;
-    let data_start = local_offset + 30 + name_len + extra_len;
-    let data_end = data_start.saturating_add(compressed_size as usize);
-    if data_end > data.len() {
-        return false;
-    }
-    match method {
-        0 => {
-            let payload = &data[data_start..data_end];
-            payload.len() as u64 == uncompressed_size && crc32(payload) == expected_crc
-        }
-        8 => verify_deflate(&data[data_start..data_end], expected_crc, uncompressed_size),
-        _ => true,
-    }
+enum PayloadCheck {
+    Valid,
+    Corrupt,
+    WrongPassword,
 }
 
-fn verify_deflate(input: &[u8], expected_crc: u32, expected_size: u64) -> bool {
-    use flate2::{Decompress, FlushDecompress, Status};
-    let mut decompressor = Decompress::new(false);
-    let mut output = [0u8; 64 * 1024];
-    let mut crc = Crc32::new();
-    loop {
-        let before_in = decompressor.total_in();
-        let before_out = decompressor.total_out();
-        let input_offset = before_in as usize;
-        if input_offset > input.len() {
-            return false;
-        }
-        let Ok(status) =
-            decompressor.decompress(&input[input_offset..], &mut output, FlushDecompress::None)
-        else {
-            return false;
-        };
-        let produced = (decompressor.total_out() - before_out) as usize;
-        if produced > 0 {
-            crc.update(&output[..produced]);
-        }
-        if status == Status::StreamEnd {
-            return decompressor.total_in() as usize == input.len()
-                && decompressor.total_out() == expected_size
-                && crc.finish() == expected_crc;
-        }
-        if decompressor.total_in() as usize >= input.len() {
-            return false;
-        }
-        if before_in == decompressor.total_in() && before_out == decompressor.total_out() {
-            return false;
-        }
-    }
+/// Streams stored / deflated ZIP payloads through fixed buffers for CRC checks,
+/// decrypting ZipCrypto entries on the fly when a password is supplied.
+struct ZipPayloadVerifier {
+    input: Vec<u8>,
+    output: Vec<u8>,
 }
 
-fn looks_like_zip(data: &[u8]) -> bool {
-    data.starts_with(LFH_SIG)
-        || data.starts_with(EOCD_SIG)
-        || find_last(data, EOCD_SIG, data.len()).is_some()
-}
-
-struct Crc32 {
-    state: u32,
-}
-
-impl Crc32 {
+impl ZipPayloadVerifier {
     fn new() -> Self {
-        Self { state: 0xFFFF_FFFF }
+        Self {
+            input: vec![0u8; COPY_CHUNK_SIZE],
+            output: vec![0u8; 64 * 1024],
+        }
     }
 
-    fn update(&mut self, bytes: &[u8]) {
-        for byte in bytes {
-            self.state ^= *byte as u32;
-            for _ in 0..8 {
-                let mask = (self.state & 1).wrapping_neg();
-                self.state = (self.state >> 1) ^ (0xEDB8_8320 & mask);
+    fn verify(
+        &mut self,
+        reader: &mut SegmentReader,
+        local_offset: u64,
+        method: u16,
+        expected_crc: u32,
+        compressed_size: u64,
+        uncompressed_size: u64,
+        password: Option<&[u8]>,
+    ) -> PyResult<PayloadCheck> {
+        let total = reader.total;
+        if local_offset + 30 > total {
+            return Ok(PayloadCheck::Corrupt);
+        }
+        let mut header = [0u8; 30];
+        reader.read_exact_at(local_offset, &mut header)?;
+        if &header[..4] != LFH_SIG {
+            return Ok(PayloadCheck::Corrupt);
+        }
+        let flags = u16_le(&header, 6);
+        let name_len = u16_le(&header, 26) as u64;
+        let extra_len = u16_le(&header, 28) as u64;
+        let mut data_start = local_offset + 30 + name_len + extra_len;
+        let mut data_len = compressed_size;
+        if data_start.saturating_add(data_len) > total {
+            return Ok(PayloadCheck::Corrupt);
+        }
+        let mut decryptor = None;
+        if let Some(password) = password {
+            if data_len < 12 {
+                return Ok(PayloadCheck::Corrupt);
+            }
+            let mut encryption_header = [0u8; 12];
+            reader.read_exact_at(data_start, &mut encryption_header)?;
+            // Same check byte 7-Zip uses: the local header's time with a data
+            // descriptor, otherwise the high byte of the local header CRC.
+            let check_byte = if flags & 0x0008 != 0 {
+                (u16_le(&header, 10) >> 8) as u8
+            } else {
+                (u32_le(&header, 14) >> 24) as u8
+            };
+            let Some(state) = ZipCryptoDecryptor::new(password, &encryption_header, check_byte)
+            else {
+                return Ok(PayloadCheck::WrongPassword);
+            };
+            decryptor = Some(state);
+            data_start += 12;
+            data_len -= 12;
+        }
+        let valid = match method {
+            0 => {
+                if data_len != uncompressed_size {
+                    return Ok(PayloadCheck::Corrupt);
+                }
+                let mut crc = crc32fast::Hasher::new();
+                let mut fed = 0u64;
+                while fed < data_len {
+                    let take = ((data_len - fed) as usize).min(self.input.len());
+                    self.read_payload(reader, data_start + fed, take, &mut decryptor)?;
+                    crc.update(&self.input[..take]);
+                    fed += take as u64;
+                }
+                crc.finalize() == expected_crc
+            }
+            8 => self.verify_deflate(
+                reader,
+                data_start,
+                data_len,
+                expected_crc,
+                uncompressed_size,
+                &mut decryptor,
+            )?,
+            _ => true,
+        };
+        Ok(if valid {
+            PayloadCheck::Valid
+        } else {
+            PayloadCheck::Corrupt
+        })
+    }
+
+    fn read_payload(
+        &mut self,
+        reader: &mut SegmentReader,
+        offset: u64,
+        take: usize,
+        decryptor: &mut Option<ZipCryptoDecryptor>,
+    ) -> PyResult<()> {
+        reader.read_exact_at(offset, &mut self.input[..take])?;
+        if let Some(decryptor) = decryptor {
+            decryptor.decrypt(&mut self.input[..take]);
+        }
+        Ok(())
+    }
+
+    fn verify_deflate(
+        &mut self,
+        reader: &mut SegmentReader,
+        start: u64,
+        length: u64,
+        expected_crc: u32,
+        expected_size: u64,
+        decryptor: &mut Option<ZipCryptoDecryptor>,
+    ) -> PyResult<bool> {
+        use flate2::{Decompress, FlushDecompress, Status};
+        let mut decompressor = Decompress::new(false);
+        let mut crc = crc32fast::Hasher::new();
+        let mut fed = 0u64;
+        let mut pending = 0..0;
+        loop {
+            if pending.is_empty() && fed < length {
+                let take = ((length - fed) as usize).min(self.input.len());
+                self.read_payload(reader, start + fed, take, decryptor)?;
+                fed += take as u64;
+                pending = 0..take;
+            }
+            let before_in = decompressor.total_in();
+            let before_out = decompressor.total_out();
+            let Ok(status) = decompressor.decompress(
+                &self.input[pending.clone()],
+                &mut self.output,
+                FlushDecompress::None,
+            ) else {
+                return Ok(false);
+            };
+            let consumed = (decompressor.total_in() - before_in) as usize;
+            let produced = (decompressor.total_out() - before_out) as usize;
+            pending.start += consumed;
+            if produced > 0 {
+                crc.update(&self.output[..produced]);
+            }
+            if status == Status::StreamEnd {
+                return Ok(decompressor.total_in() == length
+                    && decompressor.total_out() == expected_size
+                    && crc.finalize() == expected_crc);
+            }
+            if consumed == 0 && produced == 0 {
+                // Input exhausted (or a stuck stream) before the deflate end marker.
+                return Ok(false);
             }
         }
     }
-
-    fn finish(self) -> u32 {
-        !self.state
-    }
 }
 
-fn crc32(bytes: &[u8]) -> u32 {
-    let mut crc = Crc32::new();
-    crc.update(bytes);
-    crc.finish()
-}
-
-fn find_last(data: &[u8], needle: &[u8], before: usize) -> Option<usize> {
-    if needle.is_empty() || before < needle.len() || data.len() < needle.len() {
-        return None;
+fn looks_like_zip(reader: &mut SegmentReader) -> PyResult<bool> {
+    if reader.total < 4 {
+        return Ok(false);
     }
-    let mut pos = before.min(data.len()) - needle.len();
-    loop {
-        if &data[pos..pos + needle.len()] == needle {
-            return Some(pos);
-        }
-        if pos == 0 {
-            return None;
-        }
-        pos -= 1;
-    }
+    let mut head = [0u8; 4];
+    reader.read_exact_at(0, &mut head)?;
+    Ok(&head[..] == LFH_SIG || &head[..] == EOCD_SIG)
 }
 
 fn u16_le(data: &[u8], offset: usize) -> u16 {
@@ -1247,29 +1274,3 @@ fn optional_u64(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
     }
 }
 
-fn ensure_parent(path: &Path) -> PyResult<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    Ok(())
-}
-
-fn temp_path(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .and_then(|value| value.to_str())
-        .unwrap_or("candidate");
-    path.with_file_name(format!(".{name}.tmp"))
-}
-
-fn finish_atomic_write(result: PyResult<()>, temp: &Path, output: &Path) -> PyResult<()> {
-    if let Err(err) = result {
-        let _ = fs::remove_file(temp);
-        return Err(err);
-    }
-    if output.exists() {
-        fs::remove_file(output)?;
-    }
-    fs::rename(temp, output)?;
-    Ok(())
-}

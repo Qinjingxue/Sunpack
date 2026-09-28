@@ -51,17 +51,6 @@ impl TrackedFile {
     }
 
     #[track_caller]
-    pub(crate) fn create(path: impl AsRef<Path>, kind: &'static str) -> io::Result<Self> {
-        let path = path.as_ref();
-        let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
-        let file = File::create(path)?;
-        Ok(Self {
-            file: Some(file),
-            resource,
-        })
-    }
-
-    #[track_caller]
     pub(crate) fn open_with<F>(
         path: impl AsRef<Path>,
         kind: &'static str,

@@ -29,6 +29,30 @@ def test_progress_manifest_preserves_archive_path_and_numbered_output_path(tmp_p
     assert item["path"] == str(tmp_path / "out" / "report(1).txt")
 
 
+def test_progress_manifest_from_worker_rows_keeps_complete_bytes_written(tmp_path):
+    from sunpack_native import worker_manifest_from_rows
+
+    rows = worker_manifest_from_rows(
+        [
+            [0, "done.bin", "", 5, 5, 1, 7, 1, 7, 1, 1, 0, 0, ""],
+            [1, "cut.bin", "", 9, 4, 1, 7, 0, 0, 0, 2, 0, 0, ""],
+        ],
+        False, 2, 0, 14, True,
+    )
+    manifest = build_extraction_progress_manifest(
+        archive=str(tmp_path / "source.zip"),
+        out_dir=str(tmp_path / "out"),
+        diagnostics={"result": {"status": "failed", "verified_manifest": {"native_rows": rows}}},
+    )
+
+    by_archive_path = {item["archive_path"]: item for item in manifest["files"]}
+    assert by_archive_path["done.bin"]["status"] == "complete"
+    assert by_archive_path["done.bin"]["bytes_written"] == 5
+    assert by_archive_path["cut.bin"]["status"] == "failed"
+    assert by_archive_path["cut.bin"]["bytes_written"] == 4
+    assert manifest["bytes_written"] == 9
+
+
 def test_filter_extraction_outputs_discards_incomplete_when_complete_exists(tmp_path):
     good = tmp_path / "good.txt"
     partial = tmp_path / "partial.bin"

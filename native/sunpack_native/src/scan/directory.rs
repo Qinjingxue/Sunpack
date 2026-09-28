@@ -288,11 +288,9 @@ impl NativeWorkerManifest {
     fn all_complete(&self) -> bool {
         self.files.iter().all(|item| item.status == 1)
     }
-    fn materialize_files(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
-        self.files
-            .iter()
-            .map(|item| output_file_dict(py, item))
-            .collect()
+    #[pyo3(signature = (offset=0, limit=128))]
+    fn file_page(&self, py: Python<'_>, offset: usize, limit: usize) -> PyResult<Vec<Py<PyDict>>> {
+        output_file_page(py, &self.files, offset, limit)
     }
     fn to_output_inventory(&self, root: String) -> NativeOutputInventory {
         NativeOutputInventory {
@@ -449,13 +447,6 @@ impl NativeOutputInventory {
         self.files.iter().all(|item| item.crc_ok != Some(false))
     }
 
-    fn relative_paths(&self) -> Vec<String> {
-        self.files
-            .iter()
-            .map(|item| item.output_path.as_ref().unwrap_or(&item.path).clone())
-            .collect()
-    }
-
     fn parent_directories(&self) -> Vec<String> {
         let root = Path::new(&self.root);
         let mut seen = HashSet::new();
@@ -592,13 +583,6 @@ impl NativeOutputInventory {
         ))
     }
 
-    fn materialize_files(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
-        self.files
-            .iter()
-            .map(|item| output_file_dict(py, item))
-            .collect()
-    }
-
     #[pyo3(signature = (offset=0, limit=128))]
     fn file_page(
         &self,
@@ -606,15 +590,24 @@ impl NativeOutputInventory {
         offset: usize,
         limit: usize,
     ) -> PyResult<Vec<Py<PyDict>>> {
-        if limit == 0 || offset >= self.files.len() {
-            return Ok(Vec::new());
-        }
-        let end = offset.saturating_add(limit).min(self.files.len());
-        self.files[offset..end]
-            .iter()
-            .map(|item| output_file_dict(py, item))
-            .collect()
+        output_file_page(py, &self.files, offset, limit)
     }
+}
+
+fn output_file_page(
+    py: Python<'_>,
+    files: &[OutputFileRecord],
+    offset: usize,
+    limit: usize,
+) -> PyResult<Vec<Py<PyDict>>> {
+    if limit == 0 || offset >= files.len() {
+        return Ok(Vec::new());
+    }
+    let end = offset.saturating_add(limit).min(files.len());
+    files[offset..end]
+        .iter()
+        .map(|item| output_file_dict(py, item))
+        .collect()
 }
 
 fn output_file_dict(py: Python<'_>, item: &OutputFileRecord) -> PyResult<Py<PyDict>> {
@@ -628,9 +621,7 @@ fn output_file_dict(py: Python<'_>, item: &OutputFileRecord) -> PyResult<Py<PyDi
         dict.set_item("output_path", output_path)?;
     }
     dict.set_item("size", item.size)?;
-    if item.bytes_written != item.size {
-        dict.set_item("bytes_written", item.bytes_written)?;
-    }
+    dict.set_item("bytes_written", item.bytes_written)?;
     if let Some(crc32) = item.crc32 {
         dict.set_item("crc32", crc32)?;
         dict.set_item("has_crc", true)?;
@@ -1566,21 +1557,6 @@ pub(crate) fn batch_file_head_facts(
         .into_iter()
         .map(|record| record.into_py_dict(py))
         .collect()
-}
-
-#[pyfunction]
-pub(crate) fn scan_output_tree(py: Python<'_>, output_dir: &str) -> PyResult<Py<PyDict>> {
-    let inventory = scan_output_inventory_impl(output_dir);
-    let result = PyDict::new(py);
-    result.set_item("exists", inventory.exists)?;
-    result.set_item("is_dir", inventory.is_dir)?;
-    result.set_item("file_count", inventory.file_count)?;
-    result.set_item("dir_count", inventory.dir_count)?;
-    result.set_item("total_size", inventory.total_size)?;
-    result.set_item("transient_file_count", inventory.transient_file_count)?;
-    result.set_item("unreadable_count", inventory.unreadable_count)?;
-    result.set_item("files", PyList::new(py, inventory.materialize_files(py)?)?)?;
-    Ok(result.unbind())
 }
 
 #[pyfunction]

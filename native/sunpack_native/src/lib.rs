@@ -82,6 +82,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scan::directory::NativeOutputInventory>()?;
     m.add_function(wrap_pyfunction!(scan::directory::rebase_output_inventory_root, m)?)?;
     m.add_class::<scan::directory::NativeWorkerManifest>()?;
+    m.add_class::<verification::archive_manifest::NativeArchiveManifest>()?;
     m.add_function(wrap_pyfunction!(scan::magic::scan_after_markers, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_acquire, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_broker_release, m)?)?;
@@ -146,7 +147,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         relations::relations_resolve_volume_once,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(scan::directory::scan_output_tree, m)?)?;
     m.add_function(wrap_pyfunction!(scan::directory::scan_output_inventory, m)?)?;
     m.add_function(wrap_pyfunction!(
         scan::directory::output_inventory_from_serialized,
@@ -256,18 +256,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_function(wrap_pyfunction!(
         password::zip::zip_fast_verify_passwords_from_volumes,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::archive_state::archive_state_to_bytes_native,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::archive_state::archive_state_size_native,
-        m
-    )?)?;
-    m.add_function(wrap_pyfunction!(
-        io::archive_state::archive_state_write_to_file_native,
         m
     )?)?;
     m.add_function(wrap_pyfunction!(

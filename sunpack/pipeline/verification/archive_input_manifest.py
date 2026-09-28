@@ -1,8 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from dataclasses import replace
-from typing import Any
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 STATUS_OK = 0
@@ -12,6 +11,7 @@ STATUS_UNSUPPORTED = 3
 STATUS_BACKEND_UNAVAILABLE = 4
 
 from sunpack_native import (
+    NativeArchiveManifest,
     archive_state_tar_manifest_native as _native_archive_state_tar_manifest,
     archive_state_zip_manifest_native as _native_archive_state_zip_manifest,
 )
@@ -19,54 +19,47 @@ from sunpack_native import (
 
 @dataclass(frozen=True)
 class ArchiveInputManifest:
+    """Archive-input manifest summary over a Rust-owned entry table.
+
+    ``entries`` holds the retained regular-file entries in Rust; a view only
+    narrows ``entry_limit`` and never copies entries into Python objects.
+    """
+
     status: int
     is_archive: bool
     damaged: bool
     checksum_error: bool
     item_count: int
     file_count: int
-    files: list[dict[str, Any]] = field(default_factory=list)
+    entries: NativeArchiveManifest | None = None
+    entry_limit: int | None = None
     message: str = ""
     archive_type: str = ""
     source: str = "archive_input"
-    input_aware: bool = True
     archive_walk_complete: bool = False
     verified_item_count: int = 0
     entries_truncated: bool = False
-    total_unpacked_size_hint: int = 0
-    summary_only: bool = False
+    # Aggregate over every regular file the walk saw, independent of how many
+    # entries are retained or exposed by a view.
+    total_unpacked_size: int = 0
     failure_kind: str = ""
-    # Set on a truncated view: the file-list total of the full manifest, so
-    # aggregate size checks do not shrink with the view's item limit.
-    full_unpacked_size: int | None = None
 
     @property
     def ok(self) -> bool:
         return self.status == STATUS_OK and self.is_archive and not self.damaged and not self.checksum_error
 
     @property
-    def expected_names(self) -> list[str]:
-        return [
-            str(item.get("path") or "")
-            for item in self.files
-            if item.get("path") and not bool(item.get("shadowed"))
-        ]
-
-    @property
-    def total_unpacked_size(self) -> int:
-        if self.summary_only:
-            return max(0, int(self.total_unpacked_size_hint or 0))
-        if self.full_unpacked_size is not None:
-            return self.full_unpacked_size
-        return sum(
-            max(0, int(item.get("size", 0) or 0))
-            for item in self.files
-            if not bool(item.get("shadowed"))
-        )
-
-    @property
     def retained_file_count(self) -> int:
-        return sum(1 for item in self.files if not bool(item.get("shadowed")))
+        if self.entries is None:
+            return 0
+        retained = len(self.entries)
+        return retained if self.entry_limit is None else min(retained, self.entry_limit)
+
+    @property
+    def expected_names(self) -> list[str]:
+        if self.entries is None:
+            return []
+        return list(self.entries.expected_names(self.retained_file_count))
 
 
 _EVIDENCE_CACHE_ATTRIBUTE = "_archive_input_manifest_full_cache"
@@ -139,16 +132,12 @@ def _worker_verified_manifest(evidence) -> ArchiveInputManifest | None:
         checksum_error=False,
         item_count=item_count,
         file_count=file_count,
-        files=[],
         message="Archive payload was verified during extraction",
         archive_type=str(result.get("archive_type") or ""),
         source=str(payload.get("source") or "sevenzip_worker_extract"),
-        input_aware=True,
         archive_walk_complete=True,
         verified_item_count=item_count,
-        entries_truncated=False,
-        total_unpacked_size_hint=int(inventory.stats.total_size or 0),
-        summary_only=True,
+        total_unpacked_size=int(inventory.stats.total_size or 0),
     )
 
 
@@ -164,19 +153,9 @@ def _evidence_manifest_identity(evidence, codepage: str) -> tuple:
 def _manifest_view(cached: dict, max_items: int) -> ArchiveInputManifest:
     manifest: ArchiveInputManifest = cached["manifest"]
     limit = max(0, int(max_items or 0))
-    if len(manifest.files) <= limit:
+    if manifest.retained_file_count <= limit:
         return manifest
-    full_size = cached.get("full_unpacked_size")
-    if full_size is None:
-        full_size = manifest.total_unpacked_size
-        cached["full_unpacked_size"] = full_size
-    files = manifest.files[:limit]
-    return replace(
-        manifest,
-        files=files,
-        entries_truncated=True,
-        full_unpacked_size=full_size,
-    )
+    return replace(manifest, entry_limit=limit, entries_truncated=True)
 
 
 def archive_input_manifest(
@@ -202,12 +181,12 @@ def archive_input_manifest(
         )
 
     try:
-        payload = dict(_native_archive_state_zip_manifest(
+        native = _native_archive_state_zip_manifest(
             archive_input.to_dict(),
             max_items,
             password,
             codepage,
-        ))
+        )
     except (OSError, ValueError) as exc:
         return ArchiveInputManifest(
             status=STATUS_UNSUPPORTED,
@@ -218,7 +197,7 @@ def archive_input_manifest(
             file_count=0,
             message=f"Archive input cannot be opened as a verification byte view: {exc}",
         )
-    if not bool(payload.get("is_archive")) and not hint:
+    if not native.is_archive and not hint:
         return ArchiveInputManifest(
             status=STATUS_UNSUPPORTED,
             is_archive=False,
@@ -228,29 +207,7 @@ def archive_input_manifest(
             file_count=0,
             message="Archive-input manifest could not identify a supported archive format",
         )
-    files = [dict(item) for item in payload.get("files") or [] if isinstance(item, dict)]
-    file_count = int(payload.get("file_count", 0) or 0)
-    return ArchiveInputManifest(
-        status=int(payload["status"]) if payload.get("status") is not None else STATUS_DAMAGED,
-        is_archive=bool(payload.get("is_archive", False)),
-        damaged=bool(payload.get("damaged", False)),
-        checksum_error=bool(payload.get("checksum_error", False)),
-        item_count=int(payload.get("item_count", 0) or 0),
-        file_count=file_count,
-        files=files,
-        message=str(payload.get("message") or ""),
-        archive_type=str(payload.get("archive_type") or "zip"),
-        source=str(payload.get("source") or "archive_state_native"),
-        input_aware=bool(payload.get("state_aware", True)),
-        archive_walk_complete=(int(payload["status"]) if payload.get("status") is not None else STATUS_DAMAGED) == STATUS_OK,
-        verified_item_count=(
-            int(payload.get("item_count", 0) or 0)
-            if (int(payload["status"]) if payload.get("status") is not None else STATUS_DAMAGED) == STATUS_OK
-            else 0
-        ),
-        entries_truncated=len(files) < file_count,
-        failure_kind=str(payload.get("failure_kind") or ""),
-    )
+    return _manifest_from_native(native)
 
 
 def _format_hint(archive_input: ArchiveInputDescriptor) -> str:
@@ -263,35 +220,35 @@ def _tar_archive_input_manifest(
     max_items: int,
 ) -> ArchiveInputManifest:
     try:
-        payload = dict(_native_archive_state_tar_manifest(
+        native = _native_archive_state_tar_manifest(
             archive_input.to_dict(),
             max_items,
-        ))
+        )
     except (OSError, ValueError) as exc:
         return ArchiveInputManifest(
             status=STATUS_UNSUPPORTED, is_archive=False, damaged=False, checksum_error=False,
             item_count=0, file_count=0, message=f"TAR input could not be read: {exc}",
             archive_type="tar",
         )
-    files = [dict(item) for item in payload.get("files") or [] if isinstance(item, dict)]
-    status = int(
-        payload["status"] if payload.get("status") is not None else STATUS_DAMAGED
-    )
-    damaged = bool(payload.get("damaged", False))
-    file_count = int(payload.get("file_count", 0) or 0)
+    return _manifest_from_native(native)
+
+
+def _manifest_from_native(native: NativeArchiveManifest) -> ArchiveInputManifest:
+    file_count = int(native.file_count)
     return ArchiveInputManifest(
-        status=status,
-        is_archive=bool(payload.get("is_archive", False)),
-        damaged=damaged,
-        checksum_error=bool(payload.get("checksum_error", False)),
-        item_count=int(payload.get("item_count", 0) or 0),
+        status=int(native.status),
+        is_archive=bool(native.is_archive),
+        damaged=bool(native.damaged),
+        checksum_error=bool(native.checksum_error),
+        item_count=int(native.item_count),
         file_count=file_count,
-        files=files,
-        message=str(payload.get("message") or ""),
-        archive_type="tar",
-        source=str(payload.get("source") or "archive_state_tar_native"),
-        archive_walk_complete=bool(payload.get("archive_walk_complete", status == STATUS_OK)),
-        verified_item_count=int(payload.get("verified_item_count", 0) or 0),
-        entries_truncated=bool(payload.get("entries_truncated", len(files) < file_count)),
-        failure_kind=str(payload.get("failure_kind") or ("corrupted_data" if damaged else "")),
+        entries=native,
+        message=str(native.message),
+        archive_type=str(native.archive_type),
+        source=str(native.source),
+        archive_walk_complete=bool(native.archive_walk_complete),
+        verified_item_count=int(native.verified_item_count),
+        entries_truncated=len(native) < file_count,
+        total_unpacked_size=int(native.total_unpacked_size),
+        failure_kind=str(native.failure_kind),
     )

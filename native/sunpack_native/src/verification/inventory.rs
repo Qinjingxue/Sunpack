@@ -2,6 +2,7 @@ use crate::io::reader::ManagedReader;
 use crate::scan::directory::{
     NativeOutputInventory, OutputFileRecord, OutputInventoryVerificationSnapshot,
 };
+use crate::verification::archive_manifest::{ManifestEntry, NativeArchiveManifest};
 use crc32fast::Hasher as Crc32Hasher;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
@@ -21,7 +22,8 @@ const CRC_BUFFER_SIZE: usize = 1024 * 1024;
     include_observations=false,
     detail_offset=0,
     detail_limit=128,
-    max_issue_items=20
+    max_issue_items=20,
+    archive_limit=None
 ))]
 pub(crate) fn match_output_inventory_coverage(
     py: Python<'_>,
@@ -33,11 +35,22 @@ pub(crate) fn match_output_inventory_coverage(
     detail_offset: usize,
     detail_limit: usize,
     max_issue_items: usize,
+    archive_limit: Option<usize>,
 ) -> PyResult<Py<PyDict>> {
-    let expected = archive_items_from_py(archive_files)?;
+    // A native archive manifest is matched straight from its Rust entry table;
+    // plain dict iterables remain for configured / name-only expectations.
+    let manifest = archive_files.cast::<NativeArchiveManifest>().ok().map(|value| value.get());
+    let expected = match manifest {
+        Some(_) => Vec::new(),
+        None => archive_items_from_py(archive_files)?,
+    };
     let snapshot = inventory.verification_snapshot();
     let basename_mode = BasenameMode::parse(basename_mode)?;
     let matched = py.detach(|| {
+        let expected = match manifest {
+            Some(manifest) => archive_items_from_manifest(manifest.entries_view(archive_limit)),
+            None => expected,
+        };
         match_inventory(
             expected,
             snapshot,
@@ -631,9 +644,6 @@ fn archive_items_from_py(archive_files: &Bound<'_, PyAny>) -> PyResult<Vec<Archi
         let Ok(dict) = item.cast::<PyDict>() else {
             continue;
         };
-        if py_bool(dict, "shadowed")?.unwrap_or(false) {
-            continue;
-        }
         let projected = py_string(dict, "output_path")?
             .or_else(|| py_string(dict, "path").ok().flatten())
             .or_else(|| py_string(dict, "name").ok().flatten())
@@ -641,23 +651,49 @@ fn archive_items_from_py(archive_files: &Bound<'_, PyAny>) -> PyResult<Vec<Archi
         let raw_path = py_string(dict, "raw_path")?
             .or_else(|| py_string(dict, "archive_path").ok().flatten())
             .unwrap_or_else(|| projected.clone());
-        let path = windows_output_relative_path(clean_relative_archive_path(&projected));
-        if path.is_empty() {
-            continue;
-        }
-        let raw_cleaned = clean_relative_archive_path(&raw_path);
-        let has_crc = py_bool(dict, "has_crc")?
-            .unwrap_or_else(|| py_u32(dict, "crc32").ok().flatten().is_some());
-        items.push(ArchiveFile {
-            path,
-            raw_path: raw_path.clone(),
-            unsafe_path: unsafe_archive_path(&raw_path, &raw_cleaned),
-            size: py_u64(dict, "size")?.or_else(|| py_u64(dict, "unpacked_size").ok().flatten()),
-            has_crc,
-            crc32: py_u32(dict, "crc32")?,
-        });
+        let crc32 = py_u32(dict, "crc32")?;
+        let has_crc = py_bool(dict, "has_crc")?.unwrap_or(crc32.is_some());
+        let size = py_u64(dict, "size")?.or_else(|| py_u64(dict, "unpacked_size").ok().flatten());
+        items.extend(archive_file(&projected, raw_path, size, has_crc, crc32));
     }
     Ok(items)
+}
+
+fn archive_items_from_manifest(entries: &[ManifestEntry]) -> Vec<ArchiveFile> {
+    entries
+        .iter()
+        .filter_map(|item| {
+            archive_file(
+                &item.path,
+                item.raw_path.clone().unwrap_or_else(|| item.path.clone()),
+                Some(item.size),
+                item.crc32.is_some(),
+                item.crc32,
+            )
+        })
+        .collect()
+}
+
+fn archive_file(
+    projected: &str,
+    raw_path: String,
+    size: Option<u64>,
+    has_crc: bool,
+    crc32: Option<u32>,
+) -> Option<ArchiveFile> {
+    let path = windows_output_relative_path(clean_relative_archive_path(projected));
+    if path.is_empty() {
+        return None;
+    }
+    let raw_cleaned = clean_relative_archive_path(&raw_path);
+    Some(ArchiveFile {
+        path,
+        unsafe_path: unsafe_archive_path(&raw_path, &raw_cleaned),
+        raw_path,
+        size,
+        has_crc,
+        crc32,
+    })
 }
 
 fn output_relative_path(item: &OutputFileRecord) -> String {

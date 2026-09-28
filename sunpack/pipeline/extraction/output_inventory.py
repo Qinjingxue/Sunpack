@@ -44,13 +44,6 @@ class OutputInventory:
         self.worker_inventory_complete = bool(native.worker_inventory_complete)
         self.identity_paths = bool(native.identity_paths)
 
-    @property
-    def files(self) -> tuple[dict[str, Any], ...]:
-        return self.materialize_files()
-
-    def materialize_files(self) -> tuple[dict[str, Any], ...]:
-        return tuple(dict(item) for item in self._native.materialize_files())
-
     def file_page(self, *, offset: int = 0, limit: int = 128) -> tuple[dict[str, Any], ...]:
         return tuple(
             dict(item)
@@ -64,6 +57,7 @@ class OutputInventory:
         self,
         archive_files,
         *,
+        archive_limit: int | None = None,
         verify_crc: bool = False,
         basename_mode: str = "unique",
         include_observations: bool = False,
@@ -80,6 +74,7 @@ class OutputInventory:
             max(0, int(detail_offset or 0)),
             max(0, int(detail_limit or 0)),
             max(0, int(max_issue_items or 0)),
+            None if archive_limit is None else max(0, int(archive_limit)),
         ))
 
     def parent_directories(self) -> tuple[str, ...]:
@@ -104,9 +99,6 @@ class OutputInventory:
             options["whitelist_rules"],
         )
 
-    def relative_paths(self) -> tuple[str, ...]:
-        return tuple(self._native.relative_paths())
-
     def all_crc_ok(self) -> bool:
         return bool(self._native.all_crc_ok())
 
@@ -117,26 +109,6 @@ class OutputInventory:
                 os.path.abspath(new_root),
             )
         )
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "version": 1,
-            "root": self.root,
-            "stats": {
-                "exists": self.stats.exists,
-                "is_dir": self.stats.is_dir,
-                "file_count": self.stats.file_count,
-                "dir_count": self.stats.dir_count,
-                "total_size": self.stats.total_size,
-                "transient_file_count": self.stats.transient_file_count,
-                "unreadable_count": self.stats.unreadable_count,
-                "relative_paths": list(self.relative_paths()),
-            },
-            "files": list(self.materialize_files()),
-            "worker_crc_available": self.worker_crc_available,
-            "worker_inventory_complete": self.worker_inventory_complete,
-            "identity_paths": self.identity_paths,
-        }
 
     @classmethod
     def from_dict(cls, payload: dict[str, Any] | None, *, expected_root: str = "") -> "OutputInventory | None":
