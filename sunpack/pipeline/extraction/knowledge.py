@@ -3,6 +3,8 @@ from __future__ import annotations
 from contextlib import nullcontext
 from typing import Any, Callable
 
+from sunpack_native import NativeProgressManifest
+
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge, ensure_knowledge, write_payload
@@ -18,7 +20,7 @@ def write_extraction_result(task: ArchiveTask, result: ExtractionResult, *, phas
             "result": _result_payload(task, result),
             "diagnostics": diagnostics,
             "failure": _failure_payload(result, worker),
-            "progress_manifest": _compact_progress_manifest(result.progress_manifest_payload or {}),
+            "progress_manifest": _compact_progress_manifest(result.progress_manifest_payload),
             "entry_outcomes": _entry_outcomes(result, diagnostics, worker),
         }
     with _phase(phase_timer, f"{phase_prefix}_write_payload"):
@@ -177,57 +179,42 @@ def _compact_native_diagnostics(native: dict[str, Any]) -> dict[str, Any]:
     return output
 
 
-def _compact_progress_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(manifest, dict):
+def _compact_progress_manifest(manifest: NativeProgressManifest | None) -> dict[str, Any]:
+    if not isinstance(manifest, NativeProgressManifest):
         return {}
-    output: dict[str, Any] = {}
-    for key in ("summary", "files_written", "bytes_written", "status", "failure_stage", "failure_kind"):
-        if key in manifest:
-            value = manifest.get(key)
-            output[key] = _compact_mapping(value, max_items=20) if isinstance(value, dict) else value
-    for key in ("files", "items", "entries", "outputs"):
-        values = manifest.get(key)
-        if isinstance(values, list):
-            output[key] = [_compact_mapping(item, max_items=20) if isinstance(item, dict) else item for item in values[:50]]
-            if len(values) > 50:
-                output[key].append({"truncated_count": len(values) - 50})
-    return output
+    files = list(manifest.file_page(0, 50))
+    if len(manifest) > 50:
+        files.append({"truncated_count": len(manifest) - 50})
+    return {
+        "summary": manifest.summary,
+        "files_written": manifest.files_written,
+        "bytes_written": manifest.bytes_written,
+        "failure_stage": manifest.failure_stage,
+        "failure_kind": manifest.failure_kind,
+        "files": files,
+    }
 
 
 def _entry_outcomes(result: ExtractionResult, diagnostics: dict[str, Any], worker: dict[str, Any]) -> dict[str, Any]:
-    manifest = result.progress_manifest_payload if isinstance(result.progress_manifest_payload, dict) else {}
-    items = _manifest_items(manifest)
-    summary = manifest.get("summary") if isinstance(manifest.get("summary"), dict) else {}
-    failure_stage = str(worker.get("failure_stage") or diagnostics.get("failure_stage") or manifest.get("failure_stage") or "")
-    failure_kind = str(worker.get("failure_kind") or diagnostics.get("failure_kind") or manifest.get("failure_kind") or "")
-    entry_total = len(items) or _int(summary.get("total"))
+    manifest = result.progress_manifest_payload if isinstance(result.progress_manifest_payload, NativeProgressManifest) else None
+    failure_stage = str(worker.get("failure_stage") or diagnostics.get("failure_stage") or (manifest.failure_stage if manifest is not None else "") or "")
+    failure_kind = str(worker.get("failure_kind") or diagnostics.get("failure_kind") or (manifest.failure_kind if manifest is not None else "") or "")
+    # Per-file records win; a summary-only manifest falls back to its summary.
+    entries = manifest.entry_outcome_counts() if manifest is not None and len(manifest) else {}
+    summary = manifest.summary if manifest is not None else {}
+    source = entries or summary
     counts = {
-        "entry_total_count": int(entry_total),
-        "entry_complete_count": _status_count(items, "complete", fallback=summary.get("complete")),
-        "entry_partial_count": _status_count(items, "partial", fallback=summary.get("partial")),
-        "entry_failed_count": _status_count(items, "failed", fallback=summary.get("failed")),
-        "entry_unverified_count": _status_count(items, "unverified", fallback=summary.get("unverified")),
-        "crc_error_count": 0,
-        "data_error_count": 0,
-        "unexpected_end_count": 0,
-        "unsupported_method_count": 0,
-        "missing_volume_count": 0,
+        "entry_total_count": _int(source.get("total")),
+        "entry_complete_count": _int(source.get("complete")),
+        "entry_partial_count": _int(source.get("partial")),
+        "entry_failed_count": _int(source.get("failed")),
+        "entry_unverified_count": _int(source.get("unverified")),
+        "crc_error_count": _int(entries.get("crc_error")),
+        "data_error_count": _int(entries.get("data_error")),
+        "unexpected_end_count": _int(entries.get("unexpected_end")),
+        "unsupported_method_count": _int(entries.get("unsupported_method")),
+        "missing_volume_count": _int(entries.get("missing_volume")),
     }
-    for item in items:
-        kind_text = " ".join(
-            str(item.get(key) or "").lower()
-            for key in ("failure_kind", "message", "status")
-        )
-        if item.get("crc_ok") is False or "crc" in kind_text or "checksum" in kind_text:
-            counts["crc_error_count"] += 1
-        if "data_error" in kind_text or "corrupted_data" in kind_text:
-            counts["data_error_count"] += 1
-        if "unexpected_end" in kind_text or "unexpected end" in kind_text or "truncated" in kind_text:
-            counts["unexpected_end_count"] += 1
-        if "unsupported" in kind_text:
-            counts["unsupported_method_count"] += 1
-        if "missing_volume" in kind_text or "missing volume" in kind_text:
-            counts["missing_volume_count"] += 1
     global_text = " ".join(str(value or "").lower() for value in (failure_kind, result.error, worker.get("message"), diagnostics.get("message")))
     if "crc" in global_text or "checksum" in global_text:
         counts["crc_error_count"] = max(counts["crc_error_count"], 1)
@@ -252,20 +239,6 @@ def _entry_outcomes(result: ExtractionResult, diagnostics: dict[str, Any], worke
         "partial_outputs": bool(result.partial_outputs),
         "failed_ratio": float(counts["entry_failed_count"]) / float(entry_total),
     }
-
-
-def _manifest_items(manifest: dict[str, Any]) -> list[dict[str, Any]]:
-    for key in ("files", "items", "entries", "outputs"):
-        values = manifest.get(key)
-        if isinstance(values, list):
-            return [dict(item) for item in values if isinstance(item, dict)]
-    return []
-
-
-def _status_count(items: list[dict[str, Any]], status: str, *, fallback: Any = None) -> int:
-    if items:
-        return sum(1 for item in items if str(item.get("status") or "").lower() == status)
-    return _int(fallback)
 
 
 def _int(value: Any) -> int:

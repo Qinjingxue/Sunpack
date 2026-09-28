@@ -436,9 +436,9 @@ def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
             },
         },
     )
-    state.watch_cursors = {
+    state.merge_watch_cursors({
         "volume:雪": {"journal_id": 2**63 + 17, "next_usn": 2**63 + 19}
-    }
+    })
     state.save()
 
     payload = json.loads(state_path.read_text(encoding="utf-8"))

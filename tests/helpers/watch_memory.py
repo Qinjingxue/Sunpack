@@ -345,8 +345,8 @@ def _known_cache_stats(engine: PipelineEngine | None) -> dict[str, Any]:
 def _state_stats(watcher: WatchScheduler, state_path: Path) -> dict[str, Any]:
     state = watcher.state
     result = {
-        "pending_work": len(state.pending_work),
-        "entries": len(state.entries),
+        "pending_work": state.pending_work_count,
+        "entries": state.entry_count,
         "password_generation": int(state.password_generation),
     }
     try:

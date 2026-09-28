@@ -6,6 +6,7 @@ import argparse
 import math
 import statistics
 import time
+from dataclasses import asdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -40,38 +41,50 @@ def _summary(samples: list[float]) -> dict[str, float]:
 def _seed_state(state: WatchStateStore, total_records: int) -> None:
     pending_count = total_records // 2
     entry_count = total_records - pending_count
-    state.pending_work = {
-        f"pending-{index}": WatchPendingWork(
-            path=f"C:\\downloads\\pending-{index}.7z",
-            size=1048576 + index,
-            mtime=1720000000.0 + index,
-            file_id=f"pending-{index}",
-            change_usn=index,
-        )
+    operations = [
+        {
+            "op": "put",
+            "collection": "pending_work",
+            "key": f"pending-{index}",
+            "value": asdict(WatchPendingWork(
+                path=f"C:\\downloads\\pending-{index}.7z",
+                size=1048576 + index,
+                mtime=1720000000.0 + index,
+                file_id=f"pending-{index}",
+                change_usn=index,
+            )),
+        }
         for index in range(pending_count)
-    }
-    state.entries = {
-        f"entry-{index}": WatchStateEntry(
-            path=f"C:\\downloads\\failed-{index}.7z",
-            size=2097152 + index,
-            mtime=1720000000.0 + index,
-            file_id=f"failed-{index}",
-            change_usn=index,
-            status="failed_password",
-            last_error="wrong password",
-            attempt_count=3,
-            failure_kind="password",
-            failure_stage="extract",
-            failure_payload={
-                "kind": "password",
-                "stage": "extract",
-                "blockers": ["password"],
-            },
-            last_attempt_at=1720000100.0 + index,
-            password_generation=2,
-        )
+    ]
+    operations.extend(
+        {
+            "op": "put",
+            "collection": "entries",
+            "key": f"entry-{index}",
+            "value": asdict(WatchStateEntry(
+                path=f"C:\\downloads\\failed-{index}.7z",
+                size=2097152 + index,
+                mtime=1720000000.0 + index,
+                file_id=f"failed-{index}",
+                change_usn=index,
+                status="failed_password",
+                last_error="wrong password",
+                attempt_count=3,
+                failure_kind="password",
+                failure_stage="extract",
+                failure_payload={
+                    "kind": "password",
+                    "stage": "extract",
+                    "blockers": ["password"],
+                },
+                last_attempt_at=1720000100.0 + index,
+                password_generation=2,
+            )),
+        }
         for index in range(entry_count)
-    }
+    )
+    # Seed the resident maps directly; only the timed updates use the WAL.
+    state._native.apply(state._native.decode_operations(operations))
     state.save()
 
 

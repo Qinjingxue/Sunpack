@@ -1,37 +1,70 @@
 import json
 
-from sunpack.pipeline.extraction.progress import build_extraction_progress_manifest, filter_extraction_manifest_payload, filter_extraction_outputs
+from sunpack_native import load_progress_manifest, worker_manifest_from_rows
+
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
+from sunpack.pipeline.extraction.progress import (
+    build_extraction_progress_manifest,
+    iter_progress_files,
+    write_extraction_progress_manifest_payload,
+)
+
+
+def _trace_result(items, **fields):
+    return parse_worker_json_line(json.dumps({
+        "type": "result",
+        **fields,
+        "diagnostics": {"output_trace": {"items": items}},
+    }))
 
 
 def test_progress_manifest_preserves_archive_path_and_numbered_output_path(tmp_path):
     manifest = build_extraction_progress_manifest(
         archive=str(tmp_path / "source.zip"),
         out_dir=str(tmp_path / "out"),
-        diagnostics={
-            "result": {
-                "status": "ok",
-                "diagnostics": {
-                    "output_trace": {
-                        "items": [{
-                            "path": "report.txt",
-                            "output_path": "report(1).txt",
-                            "bytes_written": 6,
-                            "expected_size": 6,
-                        }],
-                    },
-                },
-            },
-        },
+        diagnostics={"result": _trace_result([{
+            "path": "report.txt",
+            "output_path": "report(1).txt",
+            "bytes_written": 6,
+            "expected_size": 6,
+        }], status="ok")},
     )
 
-    item = manifest["files"][0]
+    [item] = manifest.file_page(0, 10)
     assert item["archive_path"] == "report.txt"
     assert item["path"] == str(tmp_path / "out" / "report(1).txt")
+    assert item["status"] == "complete"
+
+
+def test_progress_manifest_classifies_trace_items_and_skips_directories(tmp_path):
+    out_dir = tmp_path / "out"
+    manifest = build_extraction_progress_manifest(
+        archive="a.7z",
+        out_dir=str(out_dir),
+        diagnostics={"result": _trace_result([
+            {"path": "dir", "is_dir": True},
+            {"path": "dir/ok.bin", "bytes_written": 4, "expected_size": 4},
+            {"path": "dir/cut.bin", "bytes_written": 2, "expected_size": 8, "failed": True},
+            {"path": "dir/none.bin", "bytes_written": 0, "expected_size": 8, "failed": True},
+        ], status="failed", failure_kind="checksum_error")},
+    )
+
+    assert manifest.summary == {"complete": 1, "partial": 1, "failed": 1, "skipped": 0, "unverified": 0, "total": 3}
+    assert manifest.failure_kind == "checksum_error"
+    assert manifest.partial_outputs is True
+    assert manifest.files_written == 2
+    assert manifest.bytes_written == 6
+    assert round(manifest.completeness(), 6) == round((1 + 0.25 + 0) / 3, 6)
+    coverage = manifest.coverage()
+    assert coverage["expected_bytes"] == 20
+    assert coverage["matched_bytes"] == 6
+    assert coverage["matched_files"] == 2
+    assert [item["archive_path"] for item in iter_progress_files(manifest, page_size=1)] == [
+        "dir/ok.bin", "dir/cut.bin", "dir/none.bin",
+    ]
 
 
 def test_progress_manifest_from_worker_rows_keeps_complete_bytes_written(tmp_path):
-    from sunpack_native import worker_manifest_from_rows
-
     rows = worker_manifest_from_rows(
         [
             [0, "done.bin", "", 5, 5, 1, 7, 1, 7, 1, 1, 0, 0, ""],
@@ -45,79 +78,86 @@ def test_progress_manifest_from_worker_rows_keeps_complete_bytes_written(tmp_pat
         diagnostics={"result": {"status": "failed", "verified_manifest": {"native_rows": rows}}},
     )
 
-    by_archive_path = {item["archive_path"]: item for item in manifest["files"]}
+    by_archive_path = {item["archive_path"]: item for item in iter_progress_files(manifest)}
     assert by_archive_path["done.bin"]["status"] == "complete"
     assert by_archive_path["done.bin"]["bytes_written"] == 5
     assert by_archive_path["cut.bin"]["status"] == "failed"
     assert by_archive_path["cut.bin"]["bytes_written"] == 4
-    assert manifest["bytes_written"] == 9
+    assert manifest.bytes_written == 9
 
 
-def test_filter_extraction_outputs_discards_incomplete_when_complete_exists(tmp_path):
-    good = tmp_path / "good.txt"
-    partial = tmp_path / "partial.bin"
-    failed = tmp_path / "failed.bin"
-    good.write_text("good", encoding="utf-8")
-    partial.write_bytes(b"part")
-    failed.write_bytes(b"")
-    manifest = _write_manifest(tmp_path, [
-        {"path": str(good), "archive_path": "good.txt", "status": "complete", "bytes_written": 4},
-        {"path": str(partial), "archive_path": "partial.bin", "status": "partial", "bytes_written": 4},
-        {"path": str(failed), "archive_path": "failed.bin", "status": "failed", "bytes_written": 0},
-    ])
+def test_progress_manifest_adds_untraced_output_files(tmp_path):
+    out_dir = tmp_path / "out"
+    (out_dir / "sub").mkdir(parents=True)
+    (out_dir / "traced.txt").write_bytes(b"abc")
+    (out_dir / "sub" / "extra.txt").write_bytes(b"hello")
 
-    updated = filter_extraction_outputs(str(manifest))
+    manifest = build_extraction_progress_manifest(
+        archive="a.zip",
+        out_dir=str(out_dir),
+        diagnostics={"result": _trace_result(
+            [{"path": "traced.txt", "bytes_written": 3, "expected_size": 3}],
+            status="failed",
+        )},
+    )
 
-    assert good.exists()
-    assert not partial.exists()
-    assert not failed.exists()
-    assert [item["archive_path"] for item in updated["files"]] == ["good.txt"]
-    assert len(updated["discarded_files"]) == 2
-
-
-def test_filter_extraction_outputs_keeps_best_partial_without_complete(tmp_path):
-    best = tmp_path / "same-best.bin"
-    worse = tmp_path / "same-worse.bin"
-    tiny = tmp_path / "tiny.bin"
-    best.write_bytes(b"x" * 100)
-    worse.write_bytes(b"x" * 50)
-    tiny.write_bytes(b"x" * 5)
-    manifest = _write_manifest(tmp_path, [
-        {"path": str(best), "archive_path": "same.bin", "status": "partial", "bytes_written": 100},
-        {"path": str(worse), "archive_path": "same.bin", "status": "partial", "bytes_written": 50},
-        {"path": str(tiny), "archive_path": "tiny.bin", "status": "partial", "bytes_written": 5},
-    ])
-
-    updated = filter_extraction_outputs(str(manifest), partial_keep_ratio=0.2)
-
-    assert best.exists()
-    assert not worse.exists()
-    assert not tiny.exists()
-    assert [item["path"] for item in updated["files"]] == [str(best)]
-    assert updated["files"][0]["retention"] == "kept_best_partial"
+    by_archive_path = {item["archive_path"]: item for item in iter_progress_files(manifest)}
+    assert set(by_archive_path) == {"traced.txt", "sub/extra.txt"}
+    extra = by_archive_path["sub/extra.txt"]
+    assert extra["status"] == "unverified"
+    assert extra["bytes_written"] == 5
+    assert extra["path"] == str(out_dir / "sub" / "extra.txt")
+    assert "not reported" in extra["message"]
 
 
-def test_filter_extraction_manifest_payload_does_not_require_manifest_file(tmp_path):
-    good = tmp_path / "good.txt"
-    partial = tmp_path / "partial.bin"
-    good.write_text("good", encoding="utf-8")
-    partial.write_bytes(b"part")
-    manifest = {
-        "files": [
-            {"path": str(good), "archive_path": "good.txt", "status": "complete", "bytes_written": 4},
-            {"path": str(partial), "archive_path": "partial.bin", "status": "partial", "bytes_written": 4},
-        ]
-    }
+def test_progress_manifest_file_round_trips_through_rust(tmp_path):
+    out_dir = tmp_path / "out"
+    path, manifest = write_extraction_progress_manifest_payload(
+        archive="a.zip",
+        out_dir=str(out_dir),
+        diagnostics={"result": _trace_result(
+            [{"path": "雪.txt", "bytes_written": 1, "expected_size": 2, "failed": True}],
+            status="failed",
+        )},
+        write_file=True,
+    )
 
-    updated = filter_extraction_manifest_payload(manifest)
+    payload = json.loads((out_dir / ".sunpack" / "extraction_manifest.json").read_text(encoding="utf-8"))
+    assert path == str(out_dir / ".sunpack" / "extraction_manifest.json")
+    assert payload["version"] == 1
+    assert payload["summary"]["partial"] == 1
+    assert payload["files"][0]["archive_path"] == "雪.txt"
+    loaded = load_progress_manifest(path)
+    assert loaded.summary == manifest.summary
+    assert loaded.file_page(0, 1) == manifest.file_page(0, 1)
+    assert load_progress_manifest(str(tmp_path / "missing.json")) is None
 
-    assert good.exists()
-    assert not partial.exists()
-    assert [item["archive_path"] for item in updated["files"]] == ["good.txt"]
 
+def test_complete_worker_inventory_uses_summary_only_manifest(tmp_path):
+    result = parse_worker_json_line(json.dumps({
+        "type": "result",
+        "status": "ok",
+        "bytes_written": 6,
+        "verified_manifest": {
+            "version": 3,
+            "validated": True,
+            "inventory": [1, 2, 0, 6, 1],
+            "rows": [
+                [0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, ""],
+                [1, "b.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 0, 0, ""],
+            ],
+        },
+    }))
 
-def _write_manifest(tmp_path, files):
-    manifest = tmp_path / ".sunpack" / "extraction_manifest.json"
-    manifest.parent.mkdir()
-    manifest.write_text(json.dumps({"files": files}, ensure_ascii=False), encoding="utf-8")
-    return manifest
+    path, manifest = write_extraction_progress_manifest_payload(
+        archive="a.zip",
+        out_dir=str(tmp_path / "out"),
+        diagnostics={"result": result},
+    )
+
+    assert path == ""
+    assert len(manifest) == 0
+    assert manifest.summary["total"] == 2
+    assert manifest.files_written == 2
+    assert manifest.bytes_written == 6
+    assert manifest.completeness() == 1.0

@@ -1,15 +1,15 @@
 from dataclasses import dataclass, field
-import json
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, Callable
+
+from sunpack_native import NativeProgressManifest, load_progress_manifest
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.passwords import PasswordSession
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
-from sunpack.core.support.resource_lifecycle import read_task_text
 
 
 @dataclass(frozen=True)
@@ -22,7 +22,7 @@ class VerificationEvidence:
     extraction_diagnostics: dict[str, Any] = field(default_factory=dict)
     worker_result: dict[str, Any] = field(default_factory=dict)
     worker_native_diagnostics: dict[str, Any] = field(default_factory=dict)
-    progress_manifest: dict[str, Any] | None = None
+    progress_manifest: NativeProgressManifest | None = None
 
     @property
     def archive_path(self) -> str:
@@ -88,9 +88,9 @@ def build_verification_evidence(
     )
 
 
-def _load_progress_manifest(extraction_result: ExtractionResult) -> dict[str, Any] | None:
+def _load_progress_manifest(extraction_result: ExtractionResult) -> NativeProgressManifest | None:
     cached = getattr(extraction_result, "progress_manifest_payload", None)
-    if isinstance(cached, dict):
+    if isinstance(cached, NativeProgressManifest):
         return cached
     manifest_path = extraction_result.progress_manifest
     if not manifest_path and extraction_result.out_dir:
@@ -99,11 +99,7 @@ def _load_progress_manifest(extraction_result: ExtractionResult) -> dict[str, An
             manifest_path = str(candidate)
     if not manifest_path:
         return None
-    try:
-        payload = json.loads(read_task_text(Path(manifest_path), encoding="utf-8"))
-    except (OSError, json.JSONDecodeError, TypeError, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
+    return load_progress_manifest(str(manifest_path))
 
 
 def _analysis_facts_from_task(task: ArchiveTask) -> dict[str, Any]:

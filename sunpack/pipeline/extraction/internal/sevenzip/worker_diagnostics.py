@@ -1,12 +1,11 @@
-import json
 import subprocess
 from copy import deepcopy
 from typing import Any
 
 from sunpack_native import (
+    NativeOutputTrace,
     NativeWorkerManifest,
-    compact_worker_manifest_json,
-    worker_manifest_from_rows,
+    parse_worker_event,
 )
 
 
@@ -35,34 +34,9 @@ def attach_worker_diagnostics(
     return completed
 
 
-def parse_worker_json_line(text: str) -> dict[str, Any]:
-    """Parse one worker event without materializing v3 manifest rows in Python."""
-    line = str(text or "").strip()
-    if not line.startswith("{"):
-        return {}
-
-    native_manifest = None
-    if '"verified_manifest"' in line and '"rows"' in line:
-        try:
-            compact = compact_worker_manifest_json(line)
-        except (TypeError, ValueError):
-            return {}
-        if compact is not None:
-            line, native_manifest = compact
-
-    try:
-        payload = json.loads(line)
-    except json.JSONDecodeError:
-        return {}
-    if not isinstance(payload, dict):
-        return {}
-
-    _expand_manifest(payload)
-    if native_manifest is not None and len(native_manifest):
-        manifest = payload.get("verified_manifest")
-        if isinstance(manifest, dict) and int(manifest.get("version", 0) or 0) == 3:
-            manifest["native_rows"] = native_manifest
-    return payload
+def parse_worker_json_line(line: bytes | str) -> dict[str, Any]:
+    """Parse one worker event in Rust; per-item arrays become native tables."""
+    return parse_worker_event(line) or {}
 
 
 def build_worker_diagnostics(
@@ -78,7 +52,6 @@ def build_worker_diagnostics(
 ) -> dict[str, Any]:
     if isinstance(result_payload, dict):
         result = result_payload
-        _expand_manifest(result)
         parsed_progress_events = list(progress_events or [])
     else:
         events = _json_events(stdout)
@@ -145,7 +118,7 @@ def compact_success_worker_diagnostics(diagnostics: dict[str, Any]) -> None:
         return
     output_trace = native.get("output_trace")
     if isinstance(output_trace, dict):
-        output_trace.pop("items", None)
+        output_trace.pop("native_items", None)
 
 
 def _json_events(text: str) -> list[dict[str, Any]]:
@@ -157,39 +130,17 @@ def _json_events(text: str) -> list[dict[str, Any]]:
     return events
 
 
-def _expand_manifest(payload: dict[str, Any]) -> None:
-    manifest = payload.get("verified_manifest")
-    if not isinstance(manifest, dict) or int(manifest.get("version", 0) or 0) != 3:
-        return
-    rows = manifest.get("rows")
-    if not isinstance(rows, list):
-        rows = []
-    inventory = manifest.get("inventory")
-    if isinstance(inventory, list) and len(inventory) == 5:
-        inventory = {
-            "complete": bool(inventory[0]), "file_count": int(inventory[1]),
-            "dir_count": int(inventory[2]), "total_size": int(inventory[3]),
-            "identity_paths": bool(inventory[4]),
-        }
-        manifest["inventory"] = inventory
-    if not isinstance(inventory, dict):
-        inventory = {}
-    if rows:
-        manifest["native_rows"] = worker_manifest_from_rows(
-            rows,
-            bool(inventory.get("complete")),
-            int(inventory.get("file_count", len(rows)) or 0),
-            int(inventory.get("dir_count", 0) or 0),
-            int(inventory.get("total_size", 0) or 0),
-            bool(inventory.get("identity_paths")),
-        )
-    manifest.pop("rows", None)
-
-
 def native_worker_manifest(result: dict[str, Any]) -> NativeWorkerManifest | None:
     manifest = result.get("verified_manifest") if isinstance(result.get("verified_manifest"), dict) else {}
     value = manifest.get("native_rows")
     return value if isinstance(value, NativeWorkerManifest) else None
+
+
+def native_output_trace(result: dict[str, Any]) -> NativeOutputTrace | None:
+    native = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
+    trace = native.get("output_trace") if isinstance(native.get("output_trace"), dict) else {}
+    value = trace.get("native_items")
+    return value if isinstance(value, NativeOutputTrace) else None
 
 
 def _tail_lines(text: str, limit: int = _STDIO_TAIL_LINES) -> list[str]:

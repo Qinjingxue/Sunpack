@@ -506,7 +506,7 @@ class SingleArchiveExtractor:
         diagnostics: dict | None = None,
         partial_outputs: bool = False,
         progress_manifest: str = "",
-        progress_manifest_payload: dict | None = None,
+        progress_manifest_payload: Any = None,
     ) -> ExtractionResult:
         diagnostic_payload = dict(diagnostics or {})
         if failure is not None:

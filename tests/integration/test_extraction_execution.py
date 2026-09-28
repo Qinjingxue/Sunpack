@@ -8,6 +8,7 @@ from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPoli
 from sunpack.core.config.schema import normalize_config
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanResult
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
 
@@ -239,6 +240,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                         },
                     },
                 }
+                diagnostics["result"] = parse_worker_json_line(json.dumps(diagnostics["result"]))
                 return SimpleNamespace(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
             task = make_archive_task(archive_path)
@@ -253,11 +255,10 @@ class ExtractionExecutionTests(unittest.TestCase):
             self.assertEqual(result.progress_manifest, "")
             self.assertFalse((out_dir / ".sunpack" / "extraction_manifest.json").exists())
             manifest = result.progress_manifest_payload
-            self.assertIsInstance(manifest, dict)
-            by_archive_path = {item["archive_path"]: item for item in manifest["files"]}
+            by_archive_path = {item["archive_path"]: item for item in manifest.file_page(0, 100)}
             self.assertEqual(by_archive_path["good.txt"]["status"], "complete")
             self.assertEqual(by_archive_path["bad.bin"]["status"], "partial")
-            self.assertEqual(manifest["summary"]["partial"], 1)
+            self.assertEqual(manifest.summary["partial"], 1)
 
     def test_extractor_can_write_progress_manifest_when_enabled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -291,6 +292,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                         },
                     }
                 }
+                diagnostics["result"] = parse_worker_json_line(json.dumps(diagnostics["result"]))
                 return SimpleNamespace(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
             task = make_archive_task(archive_path)

@@ -425,5 +425,5 @@ def test_extractor_fills_success_output_counts_when_worker_omits_them(tmp_path):
     assert result.bytes_written == 2
     assert result.diagnostics["result"]["files_written"] == 1
     assert result.diagnostics["result"]["bytes_written"] == 2
-    assert result.progress_manifest_payload["files_written"] == 1
-    assert result.progress_manifest_payload["bytes_written"] == 2
+    assert result.progress_manifest_payload.files_written == 1
+    assert result.progress_manifest_payload.bytes_written == 2

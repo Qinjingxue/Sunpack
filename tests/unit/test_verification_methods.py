@@ -3,6 +3,7 @@ import zipfile
 
 import pytest
 
+from sunpack_native import complete_progress_manifest
 from tests.helpers.archive_tasks import make_archive_task
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
@@ -14,7 +15,7 @@ import sunpack.pipeline.verification.archive_input_manifest as archive_input_man
     ("success", "progress", "expected_issue"),
     [
         (False, None, "fail.extraction_failed"),
-        (True, {"files_written": 0, "bytes_written": 0, "files": []}, "fail.extraction_success_empty"),
+        (True, "empty", "fail.extraction_success_empty"),
     ],
     ids=["failed", "success-empty"],
 )
@@ -27,7 +28,9 @@ def test_extraction_exit_signal_reports_unusable_extraction(tmp_path, success, p
         out_dir=str(out_dir),
 
         error="boom" if not success else None,
-        progress_manifest_payload=progress,
+        progress_manifest_payload=(
+            complete_progress_manifest("", str(out_dir), "", 0, 0, 0) if progress == "empty" else None
+        ),
     )
     if success:
         out_dir.mkdir()

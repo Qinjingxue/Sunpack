@@ -594,30 +594,51 @@ def test_compact_worker_manifest_is_parsed_into_native_storage():
     assert "rows" not in manifest
 
 
-def test_worker_manifest_rows_are_removed_before_python_json_decode(monkeypatch):
-    import sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics as diagnostics_module
-
-    original_loads = diagnostics_module.json.loads
-    decoded_payloads = []
-
-    def guarded_loads(value, *args, **kwargs):
-        decoded_payloads.append(value)
-        assert '"rows":[]' in value
-        assert '"a.txt"' not in value
-        return original_loads(value, *args, **kwargs)
-
-    monkeypatch.setattr(diagnostics_module.json, "loads", guarded_loads)
-    line = (
-        '{"type":"result","status":"ok","verified_manifest":'
-        '{"version":3,"validated":true,"item_count":1,"file_count":1,'
-        '"inventory":[1,1,0,3,1],"rows":[[0,"a.txt","",3,3,1,1,1,1,1,1,1,123,"616263"]]}}'
+def test_worker_event_per_item_arrays_become_native_tables():
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
+        native_output_trace,
+        native_worker_manifest,
+        parse_worker_json_line,
     )
 
-    result = diagnostics_module.parse_worker_json_line(line)
+    line = (
+        b'{"type":"result","status":"failed","verified_manifest":'
+        b'{"version":3,"validated":false,"item_count":2,"file_count":1,'
+        b'"inventory":[0,1,0,3,1],"rows":[[0,"a.txt","",3,3,1,1,1,1,1,1,1,123,"616263"]]},'
+        b'"diagnostics":{"failure_kind":"checksum_error","output_trace":{"total_bytes_written":3,'
+        b'"items":[{"index":0,"path":"dir","is_dir":true},'
+        b'{"index":1,"path":"a.txt","bytes_written":3,"failed":true,"hresult":-2147467259}]}}}\n'
+    )
 
-    assert decoded_payloads
-    assert len(result["verified_manifest"]["native_rows"]) == 1
-    assert "rows" not in result["verified_manifest"]
+    result = parse_worker_json_line(line)
+
+    manifest = result["verified_manifest"]
+    assert "rows" not in manifest
+    assert manifest["inventory"] == {
+        "complete": False, "file_count": 1, "dir_count": 0, "total_size": 3, "identity_paths": True,
+    }
+    assert len(native_worker_manifest(result)) == 1
+    trace = result["diagnostics"]["output_trace"]
+    assert "items" not in trace
+    assert trace["total_bytes_written"] == 3
+    native = native_output_trace(result)
+    assert len(native) == 2 and native.has_progress()
+    item = native.item_page(1, 1)[0]
+    assert item["path"] == "a.txt" and item["failed"] is True and item["hresult"] == -2147467259
+
+
+def test_worker_event_rejects_non_objects_and_malformed_rows():
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
+
+    assert parse_worker_json_line("not json") == {}
+    assert parse_worker_json_line("[1, 2]") == {}
+    assert parse_worker_json_line('{"type":"progress"} trailing') == {}
+    assert parse_worker_json_line(
+        '{"type":"result","verified_manifest":{"version":3,"inventory":[1,1,0,3,1],"rows":[[0,"a.txt"]]}}'
+    ) == {}
+    assert parse_worker_json_line('{"type":"progress","completed_bytes":5}') == {
+        "type": "progress", "completed_bytes": 5,
+    }
 
 
 def test_worker_manifest_native_parser_preserves_json_escaped_paths():
@@ -665,9 +686,10 @@ def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
         native_worker_manifest,
+        parse_worker_json_line,
     )
 
-    result_payload = {
+    result_payload = parse_worker_json_line(json.dumps({
         "type": "result",
         "status": "ok",
         "verified_manifest": {
@@ -676,7 +698,7 @@ def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
             "rows": [[0, "source.txt", "output.txt", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]],
             "inventory": [1, 1, 0, 3, 0],
         },
-    }
+    }))
     diagnostics = build_worker_diagnostics(
         stdout="x" * 100_000,
         stderr="",
@@ -697,9 +719,10 @@ def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace(
     from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
         build_worker_diagnostics,
         compact_success_worker_diagnostics,
+        parse_worker_json_line,
     )
 
-    result = {
+    result = parse_worker_json_line(json.dumps({
         "status": "ok",
         "verified_manifest": {
             "version": 3,
@@ -708,12 +731,13 @@ def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace(
             "rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]],
         },
         "diagnostics": {"output_trace": {"items": [{"path": "a.txt"}], "files_written": 1}},
-    }
+    }))
     diagnostics = build_worker_diagnostics(stdout="", stderr="", returncode=0, result_payload=result)
+    assert "native_items" in result["diagnostics"]["output_trace"]
 
     compact_success_worker_diagnostics(diagnostics)
 
-    assert "items" not in result["diagnostics"]["output_trace"]
+    assert "native_items" not in result["diagnostics"]["output_trace"]
     assert "native_rows" not in result["verified_manifest"]
 
 

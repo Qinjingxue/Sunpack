@@ -11,6 +11,7 @@ mod scan;
 mod verification;
 mod watch_journal;
 mod watch_state;
+mod watch_store;
 
 #[cfg(test)]
 mod test_support {
@@ -37,7 +38,12 @@ fn native_available() -> bool {
 #[pymodule]
 fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
-    m.add_function(wrap_pyfunction!(watch_state::write_watch_state_snapshot_native, m)?)?;
+    m.add_class::<watch_store::NativeWatchState>()?;
+    m.add_class::<watch_store::NativeWatchOperations>()?;
+    m.add_class::<watch_store::NativeWatchSnapshot>()?;
+    m.add_class::<watch_store::NativeWatchSnapshotLoad>()?;
+    m.add_class::<watch_store::NativeWatchReplay>()?;
+    m.add_function(wrap_pyfunction!(watch_store::watch_path_key, m)?)?;
     m.add_class::<watch_journal::NativeJournalTicket>()?;
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_submit_append, m)?)?;
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_submit_seal, m)?)?;
@@ -156,10 +162,12 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         scan::directory::worker_manifest_from_rows,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(
-        scan::directory::compact_worker_manifest_json,
-        m
-    )?)?;
+    m.add_class::<scan::worker_event::NativeOutputTrace>()?;
+    m.add_function(wrap_pyfunction!(scan::worker_event::parse_worker_event, m)?)?;
+    m.add_class::<scan::progress_manifest::NativeProgressManifest>()?;
+    m.add_function(wrap_pyfunction!(scan::progress_manifest::build_progress_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(scan::progress_manifest::complete_progress_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(scan::progress_manifest::load_progress_manifest, m)?)?;
     m.add_function(wrap_pyfunction!(
         verification::file_crc::compute_directory_crc_manifest,
         m

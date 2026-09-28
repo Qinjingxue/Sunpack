@@ -1,3 +1,4 @@
+from sunpack.pipeline.extraction.progress import iter_progress_files
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.error_classification import classify_verification_error
 from sunpack.pipeline.verification.registry import register_verification_method
@@ -95,10 +96,10 @@ class ExtractionExitSignalMethod:
                 message=result.error,
                 path=evidence.archive_path,
             ))
-        manifest = evidence.progress_manifest or {}
-        files_written = int(getattr(result, "files_written", 0) or manifest.get("files_written") or 0)
-        bytes_written = int(getattr(result, "bytes_written", 0) or manifest.get("bytes_written") or 0)
-        if files_written <= 0 and bytes_written <= 0 and not _observations_from_manifest(evidence):
+        manifest = evidence.progress_manifest
+        files_written = int(getattr(result, "files_written", 0) or (manifest.files_written if manifest is not None else 0))
+        bytes_written = int(getattr(result, "bytes_written", 0) or (manifest.bytes_written if manifest is not None else 0))
+        if files_written <= 0 and bytes_written <= 0 and not (manifest is not None and len(manifest)):
             return VerificationStep(
                 method=self.name,
                 status="failed",
@@ -127,30 +128,26 @@ class ExtractionExitSignalMethod:
         )
 
 
-def _error_class(diagnostics: dict, manifest: dict | None):
-    payload = manifest or {}
+def _error_class(diagnostics: dict, manifest):
     result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
     failure_kind = str(
         result.get("failure_kind")
         or diagnostics.get("failure_kind")
-        or payload.get("failure_kind")
+        or (manifest.failure_kind if manifest is not None else "")
         or ""
     )
     failure_stage = str(
         result.get("failure_stage")
         or diagnostics.get("failure_stage")
-        or payload.get("failure_stage")
+        or (manifest.failure_stage if manifest is not None else "")
         or ""
     )
     return classify_verification_error(failure_kind, failure_stage)
 
 
 def _observations_from_manifest(evidence: VerificationEvidence) -> list[FileVerificationObservation]:
-    manifest = evidence.progress_manifest or {}
     observations: list[FileVerificationObservation] = []
-    for item in manifest.get("files") or []:
-        if not isinstance(item, dict):
-            continue
+    for item in iter_progress_files(evidence.progress_manifest):
         state = str(item.get("status") or "unverified")
         expected = item.get("expected_size")
         bytes_written = int(item.get("bytes_written", 0) or 0)
@@ -183,7 +180,7 @@ def _observations_from_manifest(evidence: VerificationEvidence) -> list[FileVeri
     return observations
 
 
-def _manifest_completeness(manifest: dict | None, observations: list[FileVerificationObservation]) -> float:
+def _manifest_completeness(manifest, observations: list[FileVerificationObservation]) -> float:
     if observations:
         total = 0.0
         for item in observations:
@@ -194,15 +191,15 @@ def _manifest_completeness(manifest: dict | None, observations: list[FileVerific
             elif item.state == "partial":
                 total += 0.5
         return total / max(1, len(observations))
-    summary = (manifest or {}).get("summary") if isinstance((manifest or {}).get("summary"), dict) else {}
+    summary = manifest.summary if manifest is not None else {}
     total = int(summary.get("total", 0) or 0)
     if total <= 0:
         return 0.0
     return (int(summary.get("complete", 0) or 0) + 0.5 * int(summary.get("partial", 0) or 0)) / total
 
 
-def _recoverable_upper_bound(manifest: dict | None, observations: list[FileVerificationObservation]) -> float:
-    summary = (manifest or {}).get("summary") if isinstance((manifest or {}).get("summary"), dict) else {}
+def _recoverable_upper_bound(manifest, observations: list[FileVerificationObservation]) -> float:
+    summary = manifest.summary if manifest is not None else {}
     total = int(summary.get("total", 0) or 0) or len(observations)
     if total <= 0:
         return 0.0

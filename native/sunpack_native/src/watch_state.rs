@@ -1,12 +1,8 @@
-use crate::io::resource_lifecycle::TrackedFile;
-use pyo3::exceptions::{PyRuntimeError, PyTypeError};
+use pyo3::exceptions::PyTypeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBool, PyDict, PyFloat, PyInt, PyList, PyString, PyTuple};
-use std::io::{self, BufWriter, Write};
-use std::path::PathBuf;
+use std::io::{self, Write};
 
-const SNAPSHOT_BUFFER_BYTES: usize = 1024 * 1024;
-const EXTRACTION_BATCH_RECORDS: usize = 256;
 const HEX: &[u8; 16] = b"0123456789abcdef";
 
 #[derive(Debug)]
@@ -23,10 +19,6 @@ pub(crate) enum JsonValue {
 
 fn type_error(message: impl Into<String>) -> PyErr {
     PyTypeError::new_err(message.into())
-}
-
-fn io_error(error: io::Error) -> PyErr {
-    PyRuntimeError::new_err(format!("native Watch snapshot I/O failed: {error}"))
 }
 
 fn extract_json_key(value: &Bound<'_, PyAny>) -> PyResult<String> {
@@ -101,31 +93,6 @@ pub(crate) fn extract_json(value: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
     Err(type_error(
         "Watch snapshot contains a value that is not JSON serializable",
     ))
-}
-
-fn extract_record(record: &Bound<'_, PyAny>) -> PyResult<JsonValue> {
-    // Match dataclasses.fields()/getattr semantics from the former Python
-    // serializer: only declared dataclass fields belong to the persisted schema.
-    // Runtime-only attributes may exist on these mutable Python objects and must
-    // never silently become part of the v17 snapshot format.
-    let field_defs = record.getattr("__dataclass_fields__")?;
-    let field_defs = field_defs
-        .cast::<PyDict>()
-        .map_err(|_| type_error("Watch snapshot record must be a dataclass"))?;
-    let attrs = record.getattr("__dict__")?;
-    let attrs = attrs
-        .cast::<PyDict>()
-        .map_err(|_| type_error("Watch snapshot dataclass must expose __dict__"))?;
-
-    let mut items = Vec::with_capacity(field_defs.len());
-    for (field_name, _) in field_defs.iter() {
-        let key = field_name.extract::<String>()?;
-        let value = attrs.get_item(key.as_str())?.ok_or_else(|| {
-            type_error(format!("Watch snapshot dataclass field is missing: {key}"))
-        })?;
-        items.push((key, extract_json(&value)?));
-    }
-    Ok(JsonValue::Object(items))
 }
 
 fn render_float(value: f64) -> String {
@@ -221,110 +188,6 @@ pub(crate) fn write_json_value<W: Write>(writer: &mut W, value: &JsonValue) -> i
             writer.write_all(b"}")
         }
     }
-}
-
-fn write_record_batch<W: Write>(
-    writer: &mut W,
-    batch: &[(String, JsonValue)],
-    first_record: &mut bool,
-) -> io::Result<()> {
-    for (key, value) in batch {
-        if *first_record {
-            *first_record = false;
-        } else {
-            writer.write_all(b",")?;
-        }
-        write_json_string(writer, key)?;
-        writer.write_all(b":")?;
-        write_json_value(writer, value)?;
-    }
-    Ok(())
-}
-
-fn write_record_map(
-    py: Python<'_>,
-    writer: &mut BufWriter<TrackedFile>,
-    name: &'static [u8],
-    records: &Bound<'_, PyDict>,
-) -> PyResult<()> {
-    py.detach(|| {
-        writer.write_all(b",")?;
-        writer.write_all(name)?;
-        writer.write_all(b":{")
-    })
-    .map_err(io_error)?;
-
-    let mut first_record = true;
-    let mut batch = Vec::with_capacity(EXTRACTION_BATCH_RECORDS);
-    for (key, record) in records.iter() {
-        batch.push((extract_json_key(&key)?, extract_record(&record)?));
-        if batch.len() >= EXTRACTION_BATCH_RECORDS {
-            py.detach(|| write_record_batch(writer, &batch, &mut first_record))
-                .map_err(io_error)?;
-            batch.clear();
-        }
-    }
-    if !batch.is_empty() {
-        py.detach(|| write_record_batch(writer, &batch, &mut first_record))
-            .map_err(io_error)?;
-    }
-    py.detach(|| writer.write_all(b"}")).map_err(io_error)?;
-    Ok(())
-}
-
-#[pyfunction]
-pub(crate) fn write_watch_state_snapshot_native(
-    py: Python<'_>,
-    path: String,
-    version: u32,
-    checkpoint_seq: u64,
-    password_generation: u64,
-    password_source_signature: String,
-    watch_cursors: &Bound<'_, PyDict>,
-    pending_work: &Bound<'_, PyDict>,
-    entries: &Bound<'_, PyDict>,
-) -> PyResult<u64> {
-    let path = PathBuf::from(path);
-    let cursors = extract_json(watch_cursors.as_any())?;
-    let file = py
-        .detach(|| {
-            TrackedFile::open_with(&path, "watch_state_snapshot", |options| {
-                options.write(true).truncate(true);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::fs::OpenOptionsExt;
-                    const FILE_FLAG_SEQUENTIAL_SCAN: u32 = 0x0800_0000;
-                    options.custom_flags(FILE_FLAG_SEQUENTIAL_SCAN);
-                }
-            })
-        })
-        .map_err(io_error)?;
-    let mut writer = BufWriter::with_capacity(SNAPSHOT_BUFFER_BYTES, file);
-
-    py.detach(|| -> io::Result<()> {
-        writer.write_all(b"{\"version\":")?;
-        writer.write_all(version.to_string().as_bytes())?;
-        writer.write_all(b",\"checkpoint_seq\":")?;
-        writer.write_all(checkpoint_seq.to_string().as_bytes())?;
-        writer.write_all(b",\"password_generation\":")?;
-        writer.write_all(password_generation.to_string().as_bytes())?;
-        writer.write_all(b",\"password_source_signature\":")?;
-        write_json_string(&mut writer, &password_source_signature)?;
-        writer.write_all(b",\"watch_cursors\":")?;
-        write_json_value(&mut writer, &cursors)
-    })
-    .map_err(io_error)?;
-
-    write_record_map(py, &mut writer, b"\"pending_work\"", pending_work)?;
-    write_record_map(py, &mut writer, b"\"entries\"", entries)?;
-
-    py.detach(|| -> io::Result<u64> {
-        writer.write_all(b"}")?;
-        writer.flush()?;
-        writer.get_ref().sync_all()?;
-        Ok(writer.get_ref().metadata()?.len())
-    })
-    .map_err(io_error)
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+from sunpack.pipeline.extraction.progress import iter_progress_files
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.methods._output_stats import output_stats_for_evidence, should_emit_file_observations
 from sunpack.pipeline.verification.registry import register_verification_method
@@ -60,21 +61,22 @@ class OutputPresenceMethod:
             ))
 
         observations = _manifest_observations(evidence) if should_emit_file_observations(evidence, self.name) else []
-        manifest_completeness = _manifest_completeness(evidence)
-        if evidence.progress_manifest:
-            coverage = _manifest_coverage(evidence)
+        manifest = evidence.progress_manifest
+        manifest_completeness = manifest.completeness() if manifest is not None else 1.0
+        if manifest is not None:
+            summary = manifest.summary
             issues.append(VerificationIssue(
                 method=self.name,
                 code="info.output_progress_coverage",
                 message="Worker extraction progress was converted into output completeness",
                 path=evidence.output_dir,
-                expected=(evidence.progress_manifest.get("summary") or {}).get("total"),
+                expected=summary.get("total"),
                 actual={
-                    **coverage,
+                    **manifest.coverage(),
                     "completeness": manifest_completeness,
-                    "summary": dict(evidence.progress_manifest.get("summary") or {}),
-                    "files_written": evidence.progress_manifest.get("files_written"),
-                    "bytes_written": evidence.progress_manifest.get("bytes_written"),
+                    "summary": summary,
+                    "files_written": manifest.files_written,
+                    "bytes_written": manifest.bytes_written,
                 },
             ))
         return VerificationStep(
@@ -102,83 +104,25 @@ class OutputPresenceMethod:
 
 
 def _manifest_observations(evidence: VerificationEvidence) -> list[FileVerificationObservation]:
-    manifest = evidence.progress_manifest or {}
     observations: list[FileVerificationObservation] = []
-    for item in manifest.get("files") or []:
-        if not isinstance(item, dict):
-            continue
+    for item in iter_progress_files(evidence.progress_manifest):
         state = str(item.get("status") or "unverified")
         observations.append(FileVerificationObservation(
             path=str(item.get("path") or item.get("archive_path") or ""),
             archive_path=str(item.get("archive_path") or ""),
             state=state if state in {"complete", "partial", "failed", "missing", "unverified"} else "unverified",
             method="output_presence",
-            bytes_written=_as_int(item.get("bytes_written")),
-            expected_size=_optional_int(item.get("expected_size")),
+            bytes_written=int(item.get("bytes_written") or 0),
+            expected_size=item.get("expected_size"),
             progress=_progress(item),
         ))
     return observations
 
 
-def _manifest_completeness(evidence: VerificationEvidence) -> float:
-    manifest = evidence.progress_manifest or {}
-    files = [item for item in manifest.get("files") or [] if isinstance(item, dict)]
-    if not files:
-        return 1.0
-    total = 0.0
-    for item in files:
-        progress = _progress(item)
-        if progress is not None:
-            total += progress
-            continue
-        status = str(item.get("status") or "")
-        if status == "complete":
-            total += 1.0
-        elif status == "partial":
-            total += 0.5
-    return min(1.0, max(0.0, total / max(1, len(files))))
-
-
-def _manifest_coverage(evidence: VerificationEvidence) -> dict:
-    manifest = evidence.progress_manifest or {}
-    files = [item for item in manifest.get("files") or [] if isinstance(item, dict)]
-    expected_files = len(files)
-    matched_files = sum(1 for item in files if str(item.get("status") or "") != "failed" or _as_int(item.get("bytes_written")) > 0)
-    complete_files = sum(1 for item in files if str(item.get("status") or "") == "complete")
-    partial_files = sum(1 for item in files if str(item.get("status") or "") == "partial")
-    failed_files = sum(1 for item in files if str(item.get("status") or "") == "failed")
-    unverified_files = sum(1 for item in files if str(item.get("status") or "") == "unverified")
-    expected_bytes = sum(_optional_int(item.get("expected_size")) or 0 for item in files)
-    matched_bytes = 0
-    complete_bytes = 0
-    for item in files:
-        expected = _optional_int(item.get("expected_size")) or 0
-        written = _as_int(item.get("bytes_written"))
-        matched_bytes += min(written, expected) if expected else written
-        if str(item.get("status") or "") == "complete":
-            complete_bytes += expected or written
-    file_coverage = matched_files / max(1, expected_files)
-    byte_coverage = matched_bytes / expected_bytes if expected_bytes > 0 else file_coverage
-    return {
-        "file_coverage": round(file_coverage, 6),
-        "byte_coverage": round(byte_coverage, 6),
-        "expected_files": expected_files,
-        "matched_files": matched_files,
-        "complete_files": complete_files,
-        "partial_files": partial_files,
-        "failed_files": failed_files,
-        "missing_files": 0,
-        "unverified_files": unverified_files,
-        "expected_bytes": expected_bytes,
-        "matched_bytes": matched_bytes,
-        "complete_bytes": complete_bytes,
-    }
-
-
 def _progress(item: dict) -> float | None:
-    expected = _optional_int(item.get("expected_size"))
-    bytes_written = _as_int(item.get("bytes_written"))
-    if expected and expected > 0:
+    expected = item.get("expected_size")
+    bytes_written = int(item.get("bytes_written") or 0)
+    if expected:
         return min(1.0, max(0.0, bytes_written / expected))
     status = str(item.get("status") or "")
     if status == "complete":
@@ -188,19 +132,3 @@ def _progress(item: dict) -> float | None:
     if status == "partial":
         return 0.5
     return None
-
-
-def _as_int(value) -> int:
-    try:
-        return int(value or 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _optional_int(value) -> int | None:
-    if value is None or value == "":
-        return None
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return None

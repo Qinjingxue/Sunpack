@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field, replace
 import errno
-import json
 import os
 import stat
 import threading
@@ -10,7 +9,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable
 
-from sunpack_native import write_watch_state_snapshot_native as _native_write_watch_state_snapshot
+from sunpack_native import NativeWatchState, watch_path_key
 
 from sunpack.runtime.watch.journal_commit import (
     JournalTicket,
@@ -22,7 +21,6 @@ from sunpack.runtime.watch.journal_commit import (
 from sunpack.core.support.resource_lifecycle import (
     named_task_temporary_file,
     open_service_file,
-    read_task_text,
     task_scandir,
 )
 
@@ -169,18 +167,12 @@ class WatchStateEntry:
         return str(self.failure_payload.get("source_input_root") or "")
 
 
-@dataclass(frozen=True)
-class _SnapshotView:
-    checkpoint_seq: int
-    password_generation: int
-    password_source_signature: str
-    watch_cursors: dict[str, dict[str, int]]
-    pending_work: dict[str, WatchPendingWork]
-    entries: dict[str, WatchStateEntry]
-
-
 class WatchStateStore:
-    """Persistent crash queue with sequenced WAL and asynchronous checkpoints."""
+    """Persistent crash queue with sequenced WAL and asynchronous checkpoints.
+
+    Records live in a Rust-owned ``NativeWatchState``; the dataclasses above
+    are built per lookup and never kept resident by the store.
+    """
 
     def __init__(
         self,
@@ -197,12 +189,7 @@ class WatchStateStore:
         self._compact_bytes = max(1, int(compact_bytes))
         self._hard_compact_bytes = max(self._compact_bytes, int(hard_compact_bytes))
         self._writer_stream = _state_path_key(self.path)
-
-        self.pending_work: dict[str, WatchPendingWork] = {}
-        self.entries: dict[str, WatchStateEntry] = {}
-        self.password_generation = 0
-        self.password_source_signature = ""
-        self.watch_cursors: dict[str, dict[str, int]] = {}
+        self._native = NativeWatchState()
 
         self._checkpoint_seq = 0
         self._applied_seq = 0
@@ -220,6 +207,32 @@ class WatchStateStore:
         self._external_sequence_gap = False
         self.load()
         seed_state_stream(stream=self._writer_stream, seq=self._applied_seq)
+
+    @property
+    def password_generation(self) -> int:
+        return int(self._native.password_generation)
+
+    @property
+    def password_source_signature(self) -> str:
+        return str(self._native.password_source_signature)
+
+    @property
+    def pending_work_count(self) -> int:
+        return int(self._native.pending_count)
+
+    @property
+    def entry_count(self) -> int:
+        return int(self._native.entry_count)
+
+    @property
+    def pending_work(self) -> dict[str, WatchPendingWork]:
+        """Materialized diagnostic view; production code uses the lookup methods."""
+        return {_path_key(item.path): item for item in self.pending_work_items()}
+
+    @property
+    def entries(self) -> dict[str, WatchStateEntry]:
+        """Materialized diagnostic view; production code uses the lookup methods."""
+        return {_path_key(item.path): item for item in self.entry_items()}
 
     @property
     def journal_path(self) -> Path:
@@ -270,54 +283,19 @@ class WatchStateStore:
             incompatible = False
             if self.path.exists():
                 try:
-                    payload = json.loads(read_task_text(self.path, encoding="utf-8"))
-                except Exception as exc:
+                    loaded = self._native.load_snapshot(str(self.path), STATE_VERSION)
+                except ValueError as exc:
+                    raise WatchStateJournalError(str(exc)) from exc
+                except OSError as exc:
                     raise WatchStateJournalError(
                         f"corrupt watch state snapshot at {self.path}"
                     ) from exc
-                if not isinstance(payload, dict):
-                    raise WatchStateJournalError(
-                        f"invalid watch state snapshot at {self.path}"
-                    )
-                if payload.get("version") != STATE_VERSION:
+                if not loaded.compatible:
                     incompatible = True
                 else:
                     self._snapshot_exists = True
-                    try:
-                        self._checkpoint_seq = max(
-                            0,
-                            int(payload.get("checkpoint_seq", 0)),
-                        )
-                        self._applied_seq = self._checkpoint_seq
-                        self.password_generation = max(
-                            0,
-                            int(payload.get("password_generation", 0)),
-                        )
-                    except (TypeError, ValueError) as exc:
-                        raise WatchStateJournalError(
-                            f"invalid watch state snapshot metadata at {self.path}"
-                        ) from exc
-                    self.password_source_signature = str(
-                        payload.get("password_source_signature") or ""
-                    )
-                    raw_cursors = payload.get("watch_cursors")
-                    if isinstance(raw_cursors, dict):
-                        self.watch_cursors = {
-                            str(key).lower(): {
-                                "journal_id": int(value.get("journal_id", 0) or 0),
-                                "next_usn": int(value.get("next_usn", 0) or 0),
-                            }
-                            for key, value in raw_cursors.items()
-                            if isinstance(value, dict)
-                        }
-                    self.pending_work = self._load_records(
-                        payload.get("pending_work"),
-                        WatchPendingWork,
-                    )
-                    self.entries = self._load_records(
-                        payload.get("entries"),
-                        WatchStateEntry,
-                    )
+                    self._checkpoint_seq = int(loaded.checkpoint_seq)
+                    self._applied_seq = self._checkpoint_seq
 
             if incompatible:
                 self._discard_incompatible_state_locked()
@@ -331,96 +309,30 @@ class WatchStateStore:
             self._active_segment_start = _seed_sequence(self.path, self._applied_seq)
             self._update_compaction_due_locked()
 
-    @staticmethod
-    def _load_records(payload, record_type, *, normalize_keys: bool = True) -> dict:
-        result = {}
-        if not isinstance(payload, dict):
-            return result
-        for key, value in payload.items():
-            if not isinstance(value, dict):
-                continue
-            try:
-                record = record_type(**value)
-            except TypeError:
-                continue
-            record_key = _path_key(record.path) if normalize_keys and hasattr(record, "path") else str(key)
-            result[record_key] = record
-        return result
-
     def _load_journal_segments_locked(self) -> None:
-        paths = self._journal_paths()
         expected_seq = self._checkpoint_seq + 1
-        for path in paths:
+        for path in self._journal_paths():
             segment_start = self._segment_start_from_path(path)
             if segment_start is None:
                 continue
-            segment_records = 0
-            segment_bytes = 0
             try:
-                with open_service_file(path, "r", encoding="utf-8", newline="") as handle:
-                    for line_number, line in enumerate(handle, start=1):
-                        if not line:
-                            continue
-                        # A process may restart after a torn final append and then
-                        # continue in a new segment.  An incomplete final line is
-                        # therefore harmless in any immutable old segment; a real
-                        # lost transaction is still caught by the next seq gap.
-                        if not line.endswith("\n"):
-                            break
-                        try:
-                            transaction = json.loads(line)
-                        except json.JSONDecodeError as exc:
-                            raise WatchStateJournalError(
-                                f"corrupt watch state journal at {path}:{line_number}"
-                            ) from exc
-                        if not isinstance(transaction, dict):
-                            raise WatchStateJournalError(
-                                f"invalid watch state journal record at {path}:{line_number}"
-                            )
-                        if transaction.get("version") != STATE_VERSION:
-                            raise WatchStateJournalError(
-                                f"incompatible watch state journal at {path}:{line_number}"
-                            )
-                        try:
-                            seq = int(transaction["seq"])
-                        except (KeyError, TypeError, ValueError) as exc:
-                            raise WatchStateJournalError(
-                                f"invalid watch state sequence at {path}:{line_number}"
-                            ) from exc
-                        if seq <= self._checkpoint_seq:
-                            continue
-                        if seq != expected_seq:
-                            raise WatchStateJournalError(
-                                f"non-contiguous watch state sequence at {path}:{line_number}: "
-                                f"expected {expected_seq}, got {seq}"
-                            )
-                        operations = transaction.get("operations")
-                        if not isinstance(operations, list) or not operations:
-                            raise WatchStateJournalError(
-                                f"invalid watch state operations at {path}:{line_number}"
-                            )
-                        try:
-                            decoded = [
-                                self._decode_operation(operation)
-                                for operation in operations
-                            ]
-                        except (TypeError, ValueError, KeyError) as exc:
-                            raise WatchStateJournalError(
-                                f"invalid watch state operation at {path}:{line_number}"
-                            ) from exc
-                        for operation in decoded:
-                            self._apply_decoded_operation_locked(operation)
-                        self._applied_seq = seq
-                        expected_seq = seq + 1
-                        segment_records += 1
-                        segment_bytes += len(line.encode("utf-8"))
+                replay = self._native.replay_segment(
+                    str(path),
+                    self._checkpoint_seq,
+                    expected_seq,
+                    STATE_VERSION,
+                )
             except FileNotFoundError:
                 continue
-            if segment_records:
-                self._segment_records[segment_start] = segment_records
-                self._segment_bytes[segment_start] = segment_bytes
-                self._journal_records += segment_records
-                self._journal_bytes += segment_bytes
+            except ValueError as exc:
+                raise WatchStateJournalError(str(exc)) from exc
+            if replay.records:
+                self._applied_seq = int(replay.applied_seq)
+                expected_seq = int(replay.expected_seq)
+                self._segment_records[segment_start] = int(replay.records)
+                self._segment_bytes[segment_start] = int(replay.bytes)
+                self._journal_records += int(replay.records)
+                self._journal_bytes += int(replay.bytes)
 
     def _discard_incompatible_state_locked(self) -> None:
         self._reset_memory_locked()
@@ -487,14 +399,22 @@ class WatchStateStore:
 
     def entry_items(self) -> list[WatchStateEntry]:
         with self._state_lock:
-            return list(self.entries.values())
+            return [WatchStateEntry(**item) for item in self._native.entry_items()]
+
+    def _pending_record(self, path: str) -> WatchPendingWork | None:
+        raw = self._native.pending(path)
+        return WatchPendingWork(**raw) if raw is not None else None
+
+    def _entry_record(self, path: str) -> WatchStateEntry | None:
+        raw = self._native.entry(path)
+        return WatchStateEntry(**raw) if raw is not None else None
+
+    def _apply_in_memory_locked(self, operations: list[dict[str, Any]]) -> None:
+        """Apply operations that intentionally bypass the WAL."""
+        self._native.apply(self._native.decode_operations(operations))
 
     def _reset_memory_locked(self) -> None:
-        self.pending_work = {}
-        self.entries = {}
-        self.password_generation = 0
-        self.password_source_signature = ""
-        self.watch_cursors = {}
+        self._native.reset()
         self._checkpoint_seq = 0
         self._applied_seq = 0
         self._active_segment_start = 1
@@ -506,20 +426,12 @@ class WatchStateStore:
         self._snapshot_exists = False
         self._external_sequence_gap = False
 
-    def _capture_snapshot_locked(self) -> _SnapshotView:
-        # Records are replaced, not mutated in place, by WatchStateStore.  A
-        # shallow root copy therefore freezes a checkpoint view in O(dict copy)
-        # time without recursively duplicating every nested payload.
-        return _SnapshotView(
-            checkpoint_seq=self._applied_seq,
-            password_generation=self.password_generation,
-            password_source_signature=self.password_source_signature,
-            watch_cursors={key: dict(value) for key, value in self.watch_cursors.items()},
-            pending_work=self.pending_work.copy(),
-            entries=self.entries.copy(),
-        )
+    def _capture_snapshot_locked(self):
+        # Records are immutable and shared, so the native view copies only the
+        # map of record handles, not the records themselves.
+        return self._native.capture(self._applied_seq)
 
-    def _write_snapshot_view(self, view: _SnapshotView) -> None:
+    def _write_snapshot_view(self, view) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temp_path: Path | None = None
         try:
@@ -533,16 +445,7 @@ class WatchStateStore:
                 delete=False,
             ) as temp:
                 temp_path = Path(temp.name)
-            _native_write_watch_state_snapshot(
-                str(temp_path),
-                STATE_VERSION,
-                view.checkpoint_seq,
-                view.password_generation,
-                view.password_source_signature,
-                view.watch_cursors,
-                view.pending_work,
-                view.entries,
-            )
+            view.write(str(temp_path), STATE_VERSION)
             os.replace(temp_path, self.path)
             _sync_file_path(self.path)
         finally:
@@ -709,7 +612,7 @@ class WatchStateStore:
         if not operations:
             return
         self._raise_persistence_fault_locked()
-        decoded = [self._decode_operation(operation) for operation in operations]
+        decoded = self._native.decode_operations(operations)
         previous_seq = self._applied_seq
         seq, segment_start = _reserve_sequence(self.path, previous_seq)
         if seq != previous_seq + 1:
@@ -726,8 +629,7 @@ class WatchStateStore:
             on_written=self._on_journal_written,
             on_error=self._on_journal_error,
         )
-        for operation in decoded:
-            self._apply_decoded_operation_locked(operation)
+        self._native.apply(decoded)
         self._applied_seq = seq
         self._segment_records[segment_start] = (
             self._segment_records.get(segment_start, 0) + 1
@@ -784,69 +686,6 @@ class WatchStateStore:
             },
         }
 
-    @staticmethod
-    def _decode_operation(operation):
-        if not isinstance(operation, dict):
-            raise TypeError("journal operation must be an object")
-        action = operation.get("op")
-        if action == "set_metadata":
-            value = operation.get("value")
-            if not isinstance(value, dict):
-                raise TypeError("metadata value must be an object")
-            generation = max(0, int(value["password_generation"]))
-            signature = str(value.get("password_source_signature") or "")
-            return action, "", "", (generation, signature)
-
-        if action == "set_watch_cursors":
-            value = operation.get("value")
-            if not isinstance(value, dict):
-                raise TypeError("watch cursor value must be an object")
-            normalized = {
-                str(key).lower(): {
-                    "journal_id": int(item.get("journal_id", 0) or 0),
-                    "next_usn": int(item.get("next_usn", 0) or 0),
-                }
-                for key, item in value.items()
-                if isinstance(item, dict)
-            }
-            return action, "", "", normalized
-        collection = str(operation.get("collection") or "")
-        record_types = {
-            "pending_work": WatchPendingWork,
-            "entries": WatchStateEntry,
-        }
-        record_type = record_types.get(collection)
-        if record_type is None:
-            raise ValueError(f"unknown state collection: {collection}")
-        key = str(operation.get("key") or "")
-        if not key:
-            raise ValueError("state operation key must not be empty")
-        if action == "delete":
-            return action, collection, key, None
-        if action != "put":
-            raise ValueError(f"unknown state operation: {action}")
-        value = operation.get("value")
-        if not isinstance(value, dict):
-            raise TypeError("state record value must be an object")
-        record = record_type(**value)
-        if collection in {"pending_work", "entries"}:
-            key = _path_key(record.path)
-        return action, collection, key, record
-
-    def _apply_decoded_operation_locked(self, operation) -> None:
-        action, collection, key, value = operation
-        if action == "set_metadata":
-            self.password_generation, self.password_source_signature = value
-            return
-        if action == "set_watch_cursors":
-            self.watch_cursors = dict(value)
-            return
-        records = getattr(self, collection)
-        if action == "delete":
-            records.pop(key, None)
-        else:
-            records[key] = value
-
     def queue_active(
         self,
         candidate,
@@ -861,7 +700,7 @@ class WatchStateStore:
     ) -> None:
         key = _path_key(candidate.path)
         with self._state_lock:
-            previous = self.pending_work.get(key)
+            previous = self._pending_record(key)
             pending = WatchPendingWork(
                 path=os.path.abspath(candidate.path),
                 size=int(candidate.size),
@@ -885,12 +724,11 @@ class WatchStateStore:
                 committed_roots=list(previous.committed_roots if previous else []),
                 completed_sources=list(previous.completed_sources if previous else []),
             )
+            operations = [self._put_operation("pending_work", key, pending)]
             if persist:
-                self._commit_operations_locked([
-                    self._put_operation("pending_work", key, pending),
-                ], durable=durable)
+                self._commit_operations_locked(operations, durable=durable)
             else:
-                self.pending_work[key] = pending
+                self._apply_in_memory_locked(operations)
 
     def record_attempt(
         self,
@@ -902,7 +740,7 @@ class WatchStateStore:
     ) -> None:
         with self._state_lock:
             key = _path_key(path)
-            previous = self.pending_work.get(key)
+            previous = self._pending_record(key)
             pending = WatchPendingWork(
                 path=os.path.abspath(path),
                 size=size,
@@ -922,22 +760,21 @@ class WatchStateStore:
                 committed_roots=list(previous.committed_roots if previous else []),
                 completed_sources=list(previous.completed_sources if previous else []),
             )
+            operations = [self._put_operation("pending_work", key, pending)]
             if previous is not None and not previous.durable_owner:
-                self.pending_work[key] = pending
+                self._apply_in_memory_locked(operations)
             else:
-                self._commit_operations_locked([
-                    self._put_operation("pending_work", key, pending),
-                ])
+                self._commit_operations_locked(operations)
 
     def pending_work_items(self) -> list[WatchPendingWork]:
         with self._state_lock:
-            return list(self.pending_work.values())
+            return [WatchPendingWork(**item) for item in self._native.pending_items()]
 
     def bind_input_root(self, path: str, input_root: str) -> None:
         """Persist request provenance before an extraction can create outputs."""
         with self._state_lock:
             key = _path_key(path)
-            pending = self.pending_work.get(key)
+            pending = self._pending_record(key)
             if pending is None or pending.source_input_root == input_root:
                 return
             updated = replace(pending, source_input_root=input_root)
@@ -947,14 +784,14 @@ class WatchStateStore:
 
     def pending_work_for_path(self, path: str) -> WatchPendingWork | None:
         with self._state_lock:
-            return self.pending_work.get(_path_key(path))
+            return self._pending_record(path)
 
     def record_task_output_started(self, owner_path: str, task_path: str, output_dir: str) -> bool:
         if not task_path or not output_dir:
             return False
         with self._state_lock:
             key = _path_key(owner_path)
-            pending = self.pending_work.get(key)
+            pending = self._pending_record(key)
             if pending is None:
                 return False
             active = dict(pending.active_outputs)
@@ -978,7 +815,7 @@ class WatchStateStore:
             return False
         with self._state_lock:
             key = _path_key(owner_path)
-            pending = self.pending_work.get(key)
+            pending = self._pending_record(key)
             if pending is None:
                 return False
             task_path = os.path.abspath(task_path)
@@ -1029,7 +866,7 @@ class WatchStateStore:
     ) -> None:
         with self._state_lock:
             owner_key = _path_key(owner_path)
-            previous = self.pending_work.get(owner_key)
+            previous = self._pending_record(owner_key)
             scope = os.path.abspath(
                 password_scope_dir
                 or (previous.password_scope_dir if previous else "")
@@ -1060,7 +897,7 @@ class WatchStateStore:
             keys = {
                 _path_key(path)
                 for path in paths
-                if _path_key(path) in self.pending_work
+                if self._native.has_pending(path)
             }
             self._commit_operations_locked([
                 self._delete_operation("pending_work", key)
@@ -1070,7 +907,7 @@ class WatchStateStore:
     def complete_work_if_matches(self, candidate, *, durable: bool | None = None) -> None:
         with self._state_lock:
             key = _path_key(candidate.path)
-            pending = self.pending_work.get(key)
+            pending = self._pending_record(key)
             if pending is None:
                 return
             if (
@@ -1086,28 +923,22 @@ class WatchStateStore:
             ], durable=use_durable)
 
     def forget_path(self, path: str, *, recursive: bool = False) -> bool:
-        normalized = os.path.abspath(path)
         with self._state_lock:
-            operations = []
-            for collection_name, collection in (
-                ("pending_work", self.pending_work),
-                ("entries", self.entries),
-            ):
-                operations.extend(
-                    self._delete_operation(collection_name, key)
-                    for key in collection
-                    if _path_matches(key, normalized, recursive=recursive)
-                )
+            pending_keys, entry_keys = self._native.keys_matching(os.path.abspath(path), recursive)
+            operations = [
+                *(self._delete_operation("pending_work", key) for key in pending_keys),
+                *(self._delete_operation("entries", key) for key in entry_keys),
+            ]
             self._commit_operations_locked(operations)
             return bool(operations)
 
     def watch_cursor_snapshot(self) -> dict[str, dict[str, int]]:
         with self._state_lock:
-            return {key: dict(value) for key, value in self.watch_cursors.items()}
+            return dict(self._native.watch_cursors())
 
     def merge_watch_cursors(self, cursors: dict[str, dict[str, int]], *, durable: bool = True) -> None:
         with self._state_lock:
-            merged = {key: dict(value) for key, value in self.watch_cursors.items()}
+            merged = dict(self._native.watch_cursors())
             for key, value in cursors.items():
                 if not isinstance(value, dict):
                     continue
@@ -1129,7 +960,7 @@ class WatchStateStore:
             operations: list[dict[str, Any]] = []
             for candidate in candidates:
                 key = _path_key(candidate.path)
-                previous = self.pending_work.get(key)
+                previous = self._pending_record(key)
                 pending = WatchPendingWork(
                     path=os.path.abspath(candidate.path),
                     size=int(candidate.size),
@@ -1149,7 +980,7 @@ class WatchStateStore:
                     completed_sources=list(previous.completed_sources if previous else []),
                 )
                 operations.append(self._put_operation("pending_work", key, pending))
-            merged = {key: dict(value) for key, value in self.watch_cursors.items()}
+            merged = dict(self._native.watch_cursors())
             for key, value in cursors.items():
                 if isinstance(value, dict):
                     merged[str(key).lower()] = {
@@ -1161,17 +992,17 @@ class WatchStateStore:
 
     def watch_cursor(self, volume_key: str) -> dict[str, int] | None:
         with self._state_lock:
-            value = self.watch_cursors.get(str(volume_key).lower())
+            value = self._native.watch_cursor(str(volume_key))
             return dict(value) if value is not None else None
 
     def latest_entry_for_path(self, path: str) -> WatchStateEntry | None:
         with self._state_lock:
-            return self.entries.get(_path_key(path))
+            return self._entry_record(path)
 
     def advance_entry_observation(self, candidate) -> bool:
         with self._state_lock:
             key = _path_key(candidate.path)
-            entry = self.entries.get(key)
+            entry = self._entry_record(key)
             if entry is None:
                 return False
             if entry.file_id != str(candidate.file_id or "") or entry.size != int(candidate.size):
@@ -1191,7 +1022,7 @@ class WatchStateStore:
             keys = {
                 _path_key(path)
                 for path in paths
-                if _path_key(path) in self.entries
+                if self._native.has_entry(path)
             }
             self._commit_operations_locked([
                 self._delete_operation("entries", key)
@@ -1203,8 +1034,8 @@ class WatchStateStore:
         with self._state_lock:
             entry_keys = [
                 key
-                for key, entry in self.entries.items()
-                if _recorded_file_presence(entry.path) is False
+                for key, recorded_path in self._native.entry_paths()
+                if _recorded_file_presence(recorded_path) is False
             ]
             self._commit_operations_locked([
                 self._delete_operation("entries", key)
@@ -1230,10 +1061,7 @@ class WatchStateStore:
             signature = str(signature or "")
             previous = self.password_source_signature
             changed = bool(previous and previous != signature)
-            if not previous and any(
-                entry.status == "failed_password"
-                for entry in self.entries.values()
-            ):
+            if not previous and self._native.has_entry_status("failed_password"):
                 changed = True
             next_generation = self.password_generation + (1 if changed else 0)
             if previous != signature or changed:
@@ -1246,9 +1074,8 @@ class WatchStateStore:
         with self._state_lock:
             root = Path(directory).resolve()
             result: list[WatchStateEntry] = []
-            for entry in self.entries.values():
-                if entry.status != "failed_password":
-                    continue
+            for raw in self._native.entry_items("failed_password"):
+                entry = WatchStateEntry(**raw)
                 try:
                     scope = Path(entry.password_scope_dir).resolve()
                     if include_subtree:
@@ -1274,7 +1101,7 @@ class WatchStateStore:
     ) -> None:
         with self._state_lock:
             key = _path_key(path)
-            previous = self.entries.get(key)
+            previous = self._entry_record(key)
             payload = dict(failure_payload or {})
             blockers = {str(value) for value in payload.get("blockers") or []}
             if status not in {"failed_password", "suspended_missing_volume"} and not blockers:
@@ -1303,7 +1130,8 @@ class WatchStateStore:
             ], durable=True)
 
 def _path_key(path: str) -> str:
-    return os.path.normcase(os.path.abspath(path))
+    # One key function with NativeWatchState, which keys its record maps.
+    return watch_path_key(str(path))
 
 
 def _recorded_file_presence(path: str) -> bool | None:
@@ -1319,20 +1147,8 @@ def _recorded_file_presence(path: str) -> bool | None:
         return None
 
 
-def _path_matches(path: str, expected: str, *, recursive: bool) -> bool:
-    normalized = _path_key(path)
-    expected_key = _path_key(expected)
-    return normalized == expected_key or (recursive and _is_path_under(normalized, expected_key))
-
-
 def _is_path_under(path: str, root: str) -> bool:
     try:
         return os.path.commonpath([path, root]) == root
     except ValueError:
         return False
-
-
-def _paths_overlap_for_departure(path: str, departed: str, *, recursive: bool) -> bool:
-    path_key = _path_key(path)
-    departed_key = _path_key(departed)
-    return path_key == departed_key or (recursive and _is_path_under(path_key, departed_key))

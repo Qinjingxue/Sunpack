@@ -676,8 +676,11 @@ class _AsyncNativeWorkerProcess:
         assert self.process is not None and self.process.stdout is not None
         try:
             while line_bytes := await self.process.stdout.readline():
-                line = line_bytes.decode("utf-8", "replace")
-                payload = parse_worker_json_line(line)
+                payload = parse_worker_json_line(line_bytes)
+                # Result lines grow with the item count and are consumed through
+                # the parsed payload; only other lines keep a decoded copy.
+                line = "" if payload.get("type") == "result" else line_bytes.decode("utf-8", "replace")
+                del line_bytes
                 job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
                 if isinstance(payload, dict) and payload.get("type") == "worker_ready":
                     self.handshake = dict(payload)
