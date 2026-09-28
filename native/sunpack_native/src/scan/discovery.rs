@@ -91,8 +91,7 @@ impl NativeEmbeddedBatch {
                         Candidate::File(table, row) => table.paths[*row].as_str(),
                         Candidate::Relation(group) => {
                             let data = group.candidate_data();
-                            let outcome =
-                                scan_embedded_candidate(&data.entry_path, self.force_scan);
+                            let outcome = scan_embedded_candidate(data.entry_path, self.force_scan);
                             return (self.include_residual_details
                                 || matches!(outcome, EmbeddedOutcome::Scan(_)))
                             .then_some((index, outcome));
@@ -204,10 +203,9 @@ impl NativeCandidateTable {
                 Candidate::Relation(group) => {
                     let data = group.candidate_data();
                     let contains = data
-                        .parts
-                        .iter()
-                        .chain(data.companions.iter())
-                        .chain([&data.carrier_path, &data.entry_path])
+                        .parts()
+                        .chain(data.companions.iter().map(String::as_str))
+                        .chain([data.carrier_path, data.entry_path])
                         .filter(|part| {
                             let key = path_key(part);
                             if selected.contains(&key) {
@@ -235,10 +233,13 @@ impl NativeCandidateTable {
             .zip(matched)
             .filter_map(|(row, contains)| {
                 let logical_match = matches!(&row, Candidate::Relation(group)
-                        if group.candidate_data().is_split
-                            && Path::new(&group.candidate_data().logical_name)
-                                .file_name()
-                                .is_some_and(|name| expected.contains(&name.to_string_lossy().to_lowercase())));
+                        if {
+                            let data = group.candidate_data();
+                            data.is_split
+                                && Path::new(data.logical_name().as_ref())
+                                    .file_name()
+                                    .is_some_and(|name| expected.contains(&name.to_string_lossy().to_lowercase()))
+                        });
                 (contains || logical_match).then_some(row)
             })
             .collect();
@@ -259,25 +260,26 @@ impl NativeCandidateTable {
                 Candidate::Relation(group) => {
                     let data = group.candidate_data();
                     let key = if data.is_split {
-                        let parent = Path::new(&data.entry_path)
+                        let parent = Path::new(data.entry_path)
                             .parent()
                             .unwrap_or_else(|| Path::new(""));
-                        let family = if data.split_family.is_empty() {
-                            &data.format_hint
+                        let split_family = data.split_family();
+                        let family = if split_family.is_empty() {
+                            data.format_hint
                         } else {
-                            &data.split_family
+                            split_family.as_ref()
                         };
                         path_key(
                             &parent
                                 .join(format!(
                                     "{}\x1f{}",
-                                    data.logical_name.to_lowercase(),
+                                    data.logical_name().to_lowercase(),
                                     family
                                 ))
                                 .to_string_lossy(),
                         )
                     } else {
-                        path_key(&data.entry_path)
+                        path_key(data.entry_path)
                     };
                     let rank = (
                         if data.is_split && !data.needs_password {
@@ -285,8 +287,8 @@ impl NativeCandidateTable {
                         } else {
                             1
                         },
-                        if data.is_split { data.parts.len() } else { 0 },
-                        data.parts.len(),
+                        if data.is_split { data.parts_len() } else { 0 },
+                        data.parts_len(),
                     );
                     (key, rank)
                 }
@@ -350,7 +352,7 @@ impl NativeCandidateTable {
             ),
             Candidate::Relation(group) => {
                 let data = group.candidate_data();
-                (data.entry_path, data.format_hint)
+                (data.entry_path.to_owned(), data.format_hint.to_owned())
             }
         })
     }
@@ -365,10 +367,10 @@ impl NativeCandidateTable {
             Candidate::Relation(group) => {
                 let data = group.candidate_data();
                 relation_path_keys(
-                    &data.parts,
-                    &data.companions,
-                    &data.carrier_path,
-                    &data.entry_path,
+                    data.parts(),
+                    data.companions,
+                    data.carrier_path,
+                    data.entry_path,
                 )
                 .into_iter()
                 .collect()
@@ -391,26 +393,22 @@ impl NativeCandidateTable {
                 continue;
             };
             let data = group.candidate_data();
-            let keys = relation_path_keys(
-                &data.parts,
-                &data.companions,
-                &data.carrier_path,
-                &data.entry_path,
-            );
             if !data.relation_confirmed
                 && (data.needs_password
                     || (data.multivolume && (data.is_split || data.structural_non_head)))
             {
-                blocked.extend(keys);
+                blocked.extend(relation_path_keys(
+                    data.parts(),
+                    data.companions,
+                    data.carrier_path,
+                    data.entry_path,
+                ));
                 routes.relation_blocked.push(index);
                 routes.relation_events.push((index, 2));
-            } else if data.relation_confirmed
-                && matches!(data.format_hint.as_str(), "rar" | "7z" | "zip")
-            {
+            } else if data.relation_confirmed && matches!(data.format_hint, "rar" | "7z" | "zip") {
                 claimed.extend(
-                    data.parts
-                        .iter()
-                        .chain(data.companions.iter())
+                    data.parts()
+                        .chain(data.companions.iter().map(String::as_str))
                         .map(|path| path_key(path)),
                 );
                 routes.relation_resolved.push(index);
@@ -491,10 +489,10 @@ impl NativeCandidateTable {
             if let Candidate::Relation(group) = &self.rows[index] {
                 let data = group.candidate_data();
                 let keys = relation_path_keys(
-                    &data.parts,
-                    &data.companions,
-                    &data.carrier_path,
-                    &data.entry_path,
+                    data.parts(),
+                    data.companions,
+                    data.carrier_path,
+                    data.entry_path,
                 );
                 if keys
                     .iter()
@@ -535,9 +533,9 @@ impl NativeCandidateTable {
                         Candidate::Relation(group) => {
                             let data = group.candidate_data();
                             if data.is_split {
-                                data.logical_size
+                                data.logical_size()
                             } else {
-                                data.size
+                                data.size()
                             }
                         }
                     }?;
@@ -613,23 +611,21 @@ fn candidate_rank(row: &Candidate) -> (u8, usize, usize) {
                 } else {
                     1
                 },
-                if data.is_split { data.parts.len() } else { 0 },
-                data.parts.len(),
+                if data.is_split { data.parts_len() } else { 0 },
+                data.parts_len(),
             )
         }
     }
 }
 
-fn relation_path_keys(
-    parts: &[String],
-    companions: &[String],
-    carrier: &str,
-    entry: &str,
+fn relation_path_keys<'a>(
+    parts: impl Iterator<Item = &'a str>,
+    companions: &'a [String],
+    carrier: &'a str,
+    entry: &'a str,
 ) -> HashSet<String> {
     parts
-        .iter()
-        .chain(companions)
-        .map(String::as_str)
+        .chain(companions.iter().map(String::as_str))
         .chain([carrier, entry])
         .filter(|path| !path.is_empty())
         .map(path_key)
@@ -637,5 +633,9 @@ fn relation_path_keys(
 }
 
 fn path_key(path: &str) -> String {
-    path.replace('/', "\\").to_lowercase()
+    if path.contains('/') {
+        path.replace('/', "\\").to_lowercase()
+    } else {
+        path.to_lowercase()
+    }
 }

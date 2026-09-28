@@ -11,6 +11,7 @@ use crate::scan::pe_overlay::inspect_pe_overlay_structure;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use regex::{Regex, RegexBuilder};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::OnceLock;
@@ -73,21 +74,101 @@ pub(crate) enum NativeRelationGroup {
     Proposal(ProposalValidation, GroupKind),
 }
 
-pub(crate) struct RelationCandidateData {
-    pub(crate) entry_path: String,
-    pub(crate) logical_name: String,
-    pub(crate) format_hint: String,
-    pub(crate) parts: Vec<String>,
-    pub(crate) companions: Vec<String>,
-    pub(crate) carrier_path: String,
-    pub(crate) split_family: String,
+pub(crate) struct RelationCandidateData<'a> {
+    group: &'a NativeRelationGroup,
+    parsed: Option<ParsedVolume>,
+    pub(crate) entry_path: &'a str,
+    pub(crate) format_hint: &'a str,
+    pub(crate) companions: &'a [String],
+    pub(crate) carrier_path: &'a str,
     pub(crate) is_split: bool,
     pub(crate) needs_password: bool,
     pub(crate) multivolume: bool,
     pub(crate) relation_confirmed: bool,
     pub(crate) structural_non_head: bool,
-    pub(crate) size: Option<u64>,
-    pub(crate) logical_size: Option<u64>,
+}
+
+impl<'a> RelationCandidateData<'a> {
+    pub(crate) fn parts(&self) -> impl Iterator<Item = &'a str> {
+        let ordinary = match self.group {
+            NativeRelationGroup::Ordinary(row, _) => Some(row.path.as_str()),
+            NativeRelationGroup::Proposal(..) => None,
+        };
+        let volumes = match self.group {
+            NativeRelationGroup::Ordinary(..) => None,
+            NativeRelationGroup::Proposal(validation, _) => {
+                Some(validation.proposal.volumes.as_slice())
+            }
+        };
+        ordinary.into_iter().chain(
+            volumes
+                .into_iter()
+                .flat_map(|volumes| volumes.iter().map(|volume| volume.0.as_str())),
+        )
+    }
+
+    pub(crate) fn parts_len(&self) -> usize {
+        match self.group {
+            NativeRelationGroup::Ordinary(..) => 1,
+            NativeRelationGroup::Proposal(validation, _) => validation.proposal.volumes.len(),
+        }
+    }
+
+    pub(crate) fn logical_name(&self) -> Cow<'a, str> {
+        match self.group {
+            NativeRelationGroup::Ordinary(row, _) => Cow::Owned(
+                self.parsed
+                    .as_ref()
+                    .filter(|_| self.is_split)
+                    .map(logical_name_from_parsed)
+                    .unwrap_or_else(|| get_logical_name(&row.name, true)),
+            ),
+            NativeRelationGroup::Proposal(validation, _) => {
+                Cow::Borrowed(&validation.proposal.logical_name)
+            }
+        }
+    }
+
+    pub(crate) fn split_family(&self) -> Cow<'a, str> {
+        match self.group {
+            NativeRelationGroup::Ordinary(_, _) => self
+                .parsed
+                .as_ref()
+                .filter(|_| self.is_split)
+                .map(|parsed| {
+                    let format = if self.format_hint.is_empty() {
+                        parsed.family
+                    } else {
+                        self.format_hint
+                    };
+                    Cow::Owned(split_family_for_proposal(format, parsed.style))
+                })
+                .unwrap_or(Cow::Borrowed("")),
+            NativeRelationGroup::Proposal(validation, _) => Cow::Owned(proposal_split_family(
+                &validation.proposal,
+                &validation.anchors,
+            )),
+        }
+    }
+
+    pub(crate) fn size(&self) -> Option<u64> {
+        match self.group {
+            NativeRelationGroup::Ordinary(row, _) => row.size,
+            NativeRelationGroup::Proposal(validation, _) => validation
+                .anchors
+                .get(&self.entry_path.to_ascii_lowercase())
+                .map(|anchor| anchor.size),
+        }
+    }
+
+    pub(crate) fn logical_size(&self) -> Option<u64> {
+        match self.group {
+            NativeRelationGroup::Ordinary(row, _) => row.size,
+            NativeRelationGroup::Proposal(validation, _) => {
+                proposal_logical_size(&validation.proposal, &validation.anchors)
+            }
+        }
+    }
 }
 
 impl NativeRelationGroup {
@@ -106,46 +187,26 @@ impl NativeRelationGroup {
         }
     }
 
-    pub(crate) fn candidate_data(&self) -> RelationCandidateData {
+    pub(crate) fn candidate_data(&self) -> RelationCandidateData<'_> {
         match self {
             Self::Ordinary(row, confirmed) => {
-                let parsed = parse_relation_numbered_volume(&row.name);
+                let parsed = (!confirmed)
+                    .then(|| parse_relation_numbered_volume(&row.name))
+                    .flatten();
                 let hypothesis = !confirmed
                     && parsed.is_some()
                     && row.anchor.as_ref().is_some_and(|anchor| {
                         matches!(anchor.format.as_str(), "rar" | "7z" | "zip") || anchor.sfx
                     });
-                let format_hint = row
-                    .anchor
-                    .as_ref()
-                    .map(|a| a.format.clone())
-                    .unwrap_or_default();
-                let logical_name = parsed
-                    .as_ref()
-                    .filter(|_| hypothesis)
-                    .map(logical_name_from_parsed)
-                    .unwrap_or_else(|| get_logical_name(&row.name, true));
-                let split_family = parsed
-                    .as_ref()
-                    .filter(|_| hypothesis)
-                    .map(|value| {
-                        let format = if format_hint.is_empty() {
-                            value.family
-                        } else {
-                            &format_hint
-                        };
-                        split_family_for_proposal(format, value.style)
-                    })
-                    .unwrap_or_default();
+                let format_hint = row.anchor.as_ref().map(|a| a.format.as_str()).unwrap_or("");
                 let anchor = row.anchor.as_ref();
                 RelationCandidateData {
-                    entry_path: row.path.clone(),
-                    logical_name,
+                    group: self,
+                    parsed,
+                    entry_path: &row.path,
                     format_hint,
-                    parts: vec![row.path.clone()],
-                    companions: Vec::new(),
-                    carrier_path: row.path.clone(),
-                    split_family,
+                    companions: &[],
+                    carrier_path: &row.path,
                     is_split: hypothesis,
                     needs_password: anchor.is_some_and(|a| a.needs_password),
                     multivolume: anchor.is_some_and(|a| a.multivolume),
@@ -155,8 +216,6 @@ impl NativeRelationGroup {
                             || a.internal_volume_number.is_some_and(|number| number > 1)
                             || a.anchor_roles.contains(&"member")
                     }),
-                    size: row.size,
-                    logical_size: row.size,
                 }
             }
             Self::Proposal(validation, kind) => {
@@ -167,31 +226,21 @@ impl NativeRelationGroup {
                     .find(|(_, number, _, _, _)| *number == 1)
                     .unwrap_or(&proposal.volumes[0]);
                 RelationCandidateData {
-                    entry_path: head.0.clone(),
-                    logical_name: proposal.logical_name.clone(),
-                    format_hint: proposal.format.clone(),
-                    parts: proposal
-                        .volumes
-                        .iter()
-                        .map(|volume| volume.0.clone())
-                        .collect(),
-                    companions: proposal.companions.clone(),
+                    group: self,
+                    parsed: None,
+                    entry_path: &head.0,
+                    format_hint: &proposal.format,
+                    companions: &proposal.companions,
                     carrier_path: proposal
                         .companions
                         .first()
-                        .cloned()
-                        .unwrap_or_else(|| head.0.clone()),
-                    split_family: proposal_split_family(proposal, &validation.anchors),
+                        .map(String::as_str)
+                        .unwrap_or(&head.0),
                     is_split: true,
                     needs_password: matches!(kind, GroupKind::Password),
                     multivolume: true,
                     relation_confirmed: true,
                     structural_non_head: false,
-                    size: validation
-                        .anchors
-                        .get(&head.0.to_ascii_lowercase())
-                        .map(|anchor| anchor.size),
-                    logical_size: proposal_logical_size(proposal, &validation.anchors),
                 }
             }
         }
