@@ -39,7 +39,10 @@ pub(crate) fn match_output_inventory_coverage(
 ) -> PyResult<Py<PyDict>> {
     // A native archive manifest is matched straight from its Rust entry table;
     // plain dict iterables remain for configured / name-only expectations.
-    let manifest = archive_files.cast::<NativeArchiveManifest>().ok().map(|value| value.get());
+    let manifest = archive_files
+        .cast::<NativeArchiveManifest>()
+        .ok()
+        .map(|value| value.get());
     let expected = match manifest {
         Some(_) => Vec::new(),
         None => archive_items_from_py(archive_files)?,

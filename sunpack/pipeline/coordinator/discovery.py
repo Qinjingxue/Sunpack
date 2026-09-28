@@ -1,95 +1,94 @@
-"""Compose filesystem routing, Relations, format confirmation, and embedded discovery."""
+"""Project native discovery decisions into tasks and sparse diagnostics."""
 
-from sunpack.core.contracts.discovery import DiscoveryCandidate, StageResult
-from sunpack.pipeline.discovery.detection.confirmation import FormatConfirmation
-from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
+from sunpack.core.contracts.discovery import DiscoveryTrace, StageResult
+from sunpack.core.contracts.tasks import ArchiveTask
+from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
-from sunpack.pipeline.discovery.relations.resolver import RelationResolver
 
 
 class ArchiveDiscoveryPipeline:
-    def __init__(self, config: dict, detector: DetectionScheduler, options: EmbeddedOptions):
+    def __init__(self, config: dict, options: EmbeddedOptions):
         self.config = config
-        self.relations = RelationResolver()
-        self.detection = FormatConfirmation(detector)
         self.embedded = EmbeddedDiscovery(config, options)
 
-    def discover(
+    def discover_native(
         self,
-        candidates: list[DiscoveryCandidate],
+        table,
+        session: DiscoveryScanSession,
         *,
         is_recursive_scan: bool = False,
+        include_details: bool = True,
     ) -> StageResult:
-        relations = [item for item in candidates if item.route == "relations"]
-        formats = [item for item in candidates if item.route == "detection"]
-        residual = [item for item in candidates if item.route == "residual"]
-
-        relation_result = self.relations.resolve(relations)
-        claimed = set(relation_result.claimed_paths)
-        blocked = set(relation_result.blocked_paths)
-
-        if self.config.get("detection", {}).get("enabled", True):
-            eligible = [
-                item
-                for item in formats
-                if not item.path_keys & (claimed | blocked)
-            ]
-            format_result = self.detection.confirm(eligible)
-        else:
-            format_result = StageResult()
-            for item in formats:
-                format_result.add_residual(
-                    item,
-                    source="detection",
-                    reason="detection_disabled",
+        routes = table.resolve(
+            self.config.get("detection", {}).get("enabled", True),
+            include_residual_details=include_details,
+        )
+        result = StageResult()
+        for index, status in routes.relation_events:
+            if status == 1:
+                candidate = session.project_native_candidate(table, index)
+                result.add_resolved(
+                    ArchiveTask.from_archive_input(
+                        candidate.archive_input,
+                        discovery_source="relations",
+                        carrier_path=candidate.carrier_path,
+                        cleanup_paths=candidate.cleanup_paths,
+                        discovery_evidence=dict(candidate.relation_anchor),
+                    ),
+                    reason="Relations confirmed native archive identity",
                 )
+            else:
+                entry_path, format_hint = table.summary(index)
+                if status == 2:
+                    result.blocked_paths.update(table.path_keys(index))
+                result.traces.append(DiscoveryTrace(
+                    entry_path=entry_path,
+                    source="relations",
+                    status="blocked" if status == 2 else "residual",
+                    format=format_hint,
+                    reason=(
+                        "Relations requires password or additional volume evidence"
+                        if status == 2 else ""
+                    ),
+                ))
 
-        claimed.update(format_result.claimed_paths)
-        blocked.update(format_result.blocked_paths)
+        detection_enabled = self.config.get("detection", {}).get("enabled", True)
+        for index, status in routes.detection_events:
+            if status == 1:
+                candidate = session.project_native_candidate(table, index)
+                result.add_resolved(
+                    ArchiveTask.from_archive_input(
+                        candidate.archive_input,
+                        discovery_source="detection",
+                        carrier_path=candidate.carrier_path,
+                        cleanup_paths=candidate.cleanup_paths,
+                        discovery_evidence={"format": candidate.format_hint},
+                    ),
+                    reason=f"Confirmed {candidate.format_hint} structure",
+                )
+            else:
+                entry_path, format_hint = table.summary(index)
+                result.traces.append(DiscoveryTrace(
+                    entry_path=entry_path,
+                    source="detection",
+                    status="residual",
+                    format=format_hint,
+                    reason="" if detection_enabled else "detection_disabled",
+                ))
 
-        residual.extend(
-            item
-            for item in relations
-            if item.path_keys & relation_result.residual_paths
-        )
-        residual.extend(
-            item
-            for item in formats
-            if item.path_keys & format_result.residual_paths
-        )
-
-        unclaimed: list[DiscoveryCandidate] = []
-        seen: set[int] = set()
-        for item in residual:
-            if id(item) in seen or item.path_keys & (claimed | blocked):
-                continue
-            seen.add(id(item))
-            unclaimed.append(item)
-
-        embedded_result = self.embedded.discover(
-            unclaimed,
+        embedded_result = self.embedded.discover_native(
+            table,
+            routes,
+            session,
             is_recursive_scan=is_recursive_scan,
+            include_details=include_details,
         )
-        result = StageResult(
-            resolved_tasks=[
-                *relation_result.resolved_tasks,
-                *format_result.resolved_tasks,
-                *embedded_result.resolved_tasks,
-            ],
-            findings=[
-                *relation_result.findings,
-                *format_result.findings,
-                *embedded_result.findings,
-            ],
-            claimed_paths=claimed | embedded_result.claimed_paths,
-            blocked_paths=blocked | embedded_result.blocked_paths,
-            residual_paths=set(embedded_result.residual_paths),
-            traces=[
-                *relation_result.traces,
-                *format_result.traces,
-                *embedded_result.traces,
-            ],
-        )
+        result.resolved_tasks.extend(embedded_result.resolved_tasks)
+        result.findings.extend(embedded_result.findings)
+        result.claimed_paths.update(embedded_result.claimed_paths)
+        result.blocked_paths.update(embedded_result.blocked_paths)
+        result.residual_paths.update(embedded_result.residual_paths)
+        result.traces.extend(embedded_result.traces)
         result.validate()
         return result

@@ -57,26 +57,17 @@ def layer_specs():
     from sunpack.pipeline.coordinator.discovery import ArchiveDiscoveryPipeline
     from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
     from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
-    from sunpack.pipeline.discovery.detection.confirmation import FormatConfirmation
-    from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
     from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
     from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
-    from sunpack.pipeline.discovery.relations.internal.group_builder import RelationsGroupBuilder
-    from sunpack.pipeline.discovery.relations.resolver import RelationResolver
 
     return [
         ("provider.discover_targets", ArchiveTaskProvider, "discover_targets"),
         ("provider.scan_targets", ArchiveTaskProvider, "scan_targets"),
         ("session.snapshot", DiscoveryScanSession, "snapshot_for_directory"),
-        ("session.relations", DiscoveryScanSession, "relation_groups_for_directory"),
-        ("session.candidates", DiscoveryScanSession, "candidates_for_directory"),
+        ("session.native_table", DiscoveryScanSession, "native_table_for_directory"),
         ("filesystem.scan", DirectoryScanner, "scan"),
-        ("relations.build", RelationsGroupBuilder, "build_candidate_groups"),
-        ("relations.resolve", RelationResolver, "resolve"),
-        ("detection.confirm_candidate", DetectionScheduler, "confirm"),
-        ("detection.confirm_stage", FormatConfirmation, "confirm"),
-        ("embedded.discover", EmbeddedDiscovery, "discover"),
-        ("discovery.compose", ArchiveDiscoveryPipeline, "discover"),
+        ("embedded.discover_native", EmbeddedDiscovery, "discover_native"),
+        ("discovery.compose_native", ArchiveDiscoveryPipeline, "discover_native"),
     ]
 
 

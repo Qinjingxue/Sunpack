@@ -213,7 +213,10 @@ impl ZipLogicalReader {
                 logical_start,
             });
             logical_start = logical_start.checked_add(len).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "ZIP logical input size overflow")
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "ZIP logical input size overflow",
+                )
             })?;
         }
 
@@ -287,9 +290,8 @@ pub(crate) fn analyze_zip_filename_encoding(
         .map(|value| value.extract::<String>())
         .transpose()?
         .is_some_and(|style| style == "zip_spanned");
-    let analysis = py.detach(move || {
-        analyze_zip_input(segments, disk_aware, max_samples, max_filename_bytes)
-    })?;
+    let analysis = py
+        .detach(move || analyze_zip_input(segments, disk_aware, max_samples, max_filename_bytes))?;
     analysis.into_py_dict(py)
 }
 
@@ -360,7 +362,10 @@ fn analyze_zip_input(
 
     if selection.kind.codepage().is_some()
         && selection.score >= 12
-        && result.evidence.as_ref().is_some_and(|value| value.lead >= 6)
+        && result
+            .evidence
+            .as_ref()
+            .is_some_and(|value| value.lead >= 6)
         && selection.decoded_count > 0
     {
         result.selected_codepage = selection.kind.codepage();
@@ -408,10 +413,12 @@ fn scan_zip_names(
     let central_size_u64 = central_size as u64;
     let eocd_logical_offset = tail_start.saturating_add(eocd.offset as u64);
     let physical_candidate = eocd_logical_offset.checked_sub(central_size_u64);
-    let declared_candidate =
-        reader.central_logical_offset(central_disk, central_offset as u64);
+    let declared_candidate = reader.central_logical_offset(central_disk, central_offset as u64);
     let mut central_logical_offset = None;
-    for candidate in [physical_candidate, declared_candidate].into_iter().flatten() {
+    for candidate in [physical_candidate, declared_candidate]
+        .into_iter()
+        .flatten()
+    {
         if candidate
             .checked_add(central_size_u64)
             .is_none_or(|end| end > file_size)
@@ -432,7 +439,10 @@ fn scan_zip_names(
         .saturating_add(max_filename_bytes as u64);
     let read_size = central_size_u64.min(metadata_budget);
     let read_size = usize::try_from(read_size).map_err(|_| {
-        io::Error::new(io::ErrorKind::InvalidData, "ZIP central directory range too large")
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "ZIP central directory range too large",
+        )
     })?;
     let central = reader.read_at(central_logical_offset, read_size)?;
     Ok(collect_zip_names(
@@ -460,7 +470,8 @@ fn collect_zip_names(
     let mut truncated = total_entries > max_samples;
 
     while entries.len() < expected_entries {
-        let Some(record) = super::parse_central_directory_record(&central, offset, central.len()) else {
+        let Some(record) = super::parse_central_directory_record(&central, offset, central.len())
+        else {
             if offset
                 .checked_add(ZIP_CENTRAL_HEADER_LENGTH)
                 .is_some_and(|end| end <= central.len())
@@ -641,7 +652,11 @@ fn score_legacy_code_units(raw_names: &[&[u8]], encoding: EncodingKind) -> i64 {
                 let extension = (lead == 0x87 && (0x40..=0x9c).contains(&trail))
                     || (0xed..=0xee).contains(&lead)
                     || (0xf0..=0xfc).contains(&lead);
-                if extension { 0 } else { 2 }
+                if extension {
+                    0
+                } else {
+                    2
+                }
             }
             EncodingKind::Cp936 => {
                 if (0xa1..=0xf7).contains(&lead) && (0xa1..=0xfe).contains(&trail) {
@@ -651,8 +666,7 @@ fn score_legacy_code_units(raw_names: &[&[u8]], encoding: EncodingKind) -> i64 {
                 }
             }
             EncodingKind::Cp950 => {
-                let valid_trail =
-                    (0x40..=0x7e).contains(&trail) || (0xa1..=0xfe).contains(&trail);
+                let valid_trail = (0x40..=0x7e).contains(&trail) || (0xa1..=0xfe).contains(&trail);
                 if (0xa1..=0xf9).contains(&lead) && valid_trail {
                     2
                 } else {
@@ -704,18 +718,14 @@ fn score_decoded_name(decoded: &str, encoding: EncodingKind) -> (i64, NameStats)
         if ('\u{ff66}'..='\u{ff9f}').contains(&ch) {
             stats.halfwidth_kana += 1;
         }
-        if ('\u{00a0}'..='\u{00ff}').contains(&ch)
-            || ('\u{2500}'..='\u{259f}').contains(&ch)
-        {
+        if ('\u{00a0}'..='\u{00ff}').contains(&ch) || ('\u{2500}'..='\u{259f}').contains(&ch) {
             stats.latin_symbols += 1;
         }
     }
 
     match encoding {
         EncodingKind::Cp932 => {
-            score += stats.cjk as i64 * 3
-                + stats.kana as i64 * 6
-                + stats.halfwidth_kana as i64 * 6;
+            score += stats.cjk as i64 * 3 + stats.kana as i64 * 6 + stats.halfwidth_kana as i64 * 6;
             score += decoded
                 .chars()
                 .filter(|ch| JAPANESE_COMMON_KANJI.contains(*ch))
@@ -736,15 +746,13 @@ fn score_decoded_name(decoded: &str, encoding: EncodingKind) -> (i64, NameStats)
             score -= decoded
                 .chars()
                 .filter(|ch| {
-                    TRADITIONAL_COMMON_CHARS.contains(*ch)
-                        && !SIMPLIFIED_COMMON_CHARS.contains(*ch)
+                    TRADITIONAL_COMMON_CHARS.contains(*ch) && !SIMPLIFIED_COMMON_CHARS.contains(*ch)
                 })
                 .count() as i64;
             score -= decoded
                 .chars()
                 .filter(|ch| {
-                    JAPANESE_COMMON_KANJI.contains(*ch)
-                        && !SIMPLIFIED_COMMON_CHARS.contains(*ch)
+                    JAPANESE_COMMON_KANJI.contains(*ch) && !SIMPLIFIED_COMMON_CHARS.contains(*ch)
                 })
                 .count() as i64;
         }
@@ -759,8 +767,7 @@ fn score_decoded_name(decoded: &str, encoding: EncodingKind) -> (i64, NameStats)
             score -= decoded
                 .chars()
                 .filter(|ch| {
-                    SIMPLIFIED_COMMON_CHARS.contains(*ch)
-                        && !TRADITIONAL_COMMON_CHARS.contains(*ch)
+                    SIMPLIFIED_COMMON_CHARS.contains(*ch) && !TRADITIONAL_COMMON_CHARS.contains(*ch)
                 })
                 .count() as i64;
         }

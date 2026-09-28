@@ -1,9 +1,9 @@
 use crate::io::reader::ManagedReader;
+use crc32fast::Hasher as Crc32Hasher;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use crc32fast::Hasher as Crc32Hasher;
 
 const BUFFER_SIZE: usize = 1024 * 1024;
 
@@ -74,43 +74,145 @@ struct ReadabilityScan {
 
 fn scan_crc_manifest(root: &Path, limit: usize) -> ManifestScan {
     if !root.exists() {
-        return ManifestScan { status: "missing", files: Vec::new(), errors: Vec::new(), total_files: 0, scanned_files: 0 };
+        return ManifestScan {
+            status: "missing",
+            files: Vec::new(),
+            errors: Vec::new(),
+            total_files: 0,
+            scanned_files: 0,
+        };
     }
     if !root.is_dir() {
-        return ManifestScan { status: "not_directory", files: Vec::new(), errors: Vec::new(), total_files: 0, scanned_files: 0 };
+        return ManifestScan {
+            status: "not_directory",
+            files: Vec::new(),
+            errors: Vec::new(),
+            total_files: 0,
+            scanned_files: 0,
+        };
     }
     let mut files = Vec::new();
     let mut errors = Vec::new();
     let mut total_files = 0;
     let mut scanned_files = 0;
     let mut buffer = vec![0u8; BUFFER_SIZE];
-    walk_crc_manifest(root, root, limit, &mut total_files, &mut scanned_files, &mut files, &mut errors, &mut buffer);
-    ManifestScan { status: "ok", files, errors, total_files, scanned_files }
+    walk_crc_manifest(
+        root,
+        root,
+        limit,
+        &mut total_files,
+        &mut scanned_files,
+        &mut files,
+        &mut errors,
+        &mut buffer,
+    );
+    ManifestScan {
+        status: "ok",
+        files,
+        errors,
+        total_files,
+        scanned_files,
+    }
 }
 
-fn walk_crc_manifest(root: &Path, current: &Path, limit: usize, total_files: &mut usize, scanned_files: &mut usize, files: &mut Vec<FileCrcRecord>, errors: &mut Vec<ScanError>, buffer: &mut [u8]) {
-    let entries = match std::fs::read_dir(current) { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); return; } };
+fn walk_crc_manifest(
+    root: &Path,
+    current: &Path,
+    limit: usize,
+    total_files: &mut usize,
+    scanned_files: &mut usize,
+    files: &mut Vec<FileCrcRecord>,
+    errors: &mut Vec<ScanError>,
+    buffer: &mut [u8],
+) {
+    let entries = match std::fs::read_dir(current) {
+        Ok(v) => v,
+        Err(err) => {
+            push_scan_error(errors, current, root, err.to_string());
+            return;
+        }
+    };
     for entry in entries {
-        let entry = match entry { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); continue; } };
+        let entry = match entry {
+            Ok(v) => v,
+            Err(err) => {
+                push_scan_error(errors, current, root, err.to_string());
+                continue;
+            }
+        };
         let path = entry.path();
-        let metadata = match entry.metadata() { Ok(v) => v, Err(err) => { push_scan_error(errors, &path, root, err.to_string()); continue; } };
+        let metadata = match entry.metadata() {
+            Ok(v) => v,
+            Err(err) => {
+                push_scan_error(errors, &path, root, err.to_string());
+                continue;
+            }
+        };
         if metadata.is_dir() {
-            walk_crc_manifest(root, &path, limit, total_files, scanned_files, files, errors, buffer);
+            walk_crc_manifest(
+                root,
+                &path,
+                limit,
+                total_files,
+                scanned_files,
+                files,
+                errors,
+                buffer,
+            );
             continue;
         }
-        if !metadata.is_file() { continue; }
+        if !metadata.is_file() {
+            continue;
+        }
         *total_files += 1;
-        if *scanned_files >= limit { continue; }
+        if *scanned_files >= limit {
+            continue;
+        }
         match crc32_file_with_buffer(&path, buffer) {
-            Ok(crc32) => { files.push(FileCrcRecord { path: relative_path(&path, root), size: metadata.len(), crc32 }); *scanned_files += 1; }
+            Ok(crc32) => {
+                files.push(FileCrcRecord {
+                    path: relative_path(&path, root),
+                    size: metadata.len(),
+                    crc32,
+                });
+                *scanned_files += 1;
+            }
             Err(err) => push_scan_error(errors, &path, root, err.to_string()),
         }
     }
 }
 
-fn scan_directory_readability(root: &Path, max_samples: usize, read_bytes: usize) -> ReadabilityScan {
-    if !root.exists() { return ReadabilityScan { status: "missing", samples: Vec::new(), errors: Vec::new(), total_files: 0, readable_files: 0, unreadable_files: 0, empty_files: 0, bytes_read: 0, truncated: false }; }
-    if !root.is_dir() { return ReadabilityScan { status: "not_directory", samples: Vec::new(), errors: Vec::new(), total_files: 0, readable_files: 0, unreadable_files: 0, empty_files: 0, bytes_read: 0, truncated: false }; }
+fn scan_directory_readability(
+    root: &Path,
+    max_samples: usize,
+    read_bytes: usize,
+) -> ReadabilityScan {
+    if !root.exists() {
+        return ReadabilityScan {
+            status: "missing",
+            samples: Vec::new(),
+            errors: Vec::new(),
+            total_files: 0,
+            readable_files: 0,
+            unreadable_files: 0,
+            empty_files: 0,
+            bytes_read: 0,
+            truncated: false,
+        };
+    }
+    if !root.is_dir() {
+        return ReadabilityScan {
+            status: "not_directory",
+            samples: Vec::new(),
+            errors: Vec::new(),
+            total_files: 0,
+            readable_files: 0,
+            unreadable_files: 0,
+            empty_files: 0,
+            bytes_read: 0,
+            truncated: false,
+        };
+    }
     let mut file_paths = Vec::new();
     let mut errors = Vec::new();
     collect_regular_files(root, root, &mut file_paths, &mut errors);
@@ -126,38 +228,97 @@ fn scan_directory_readability(root: &Path, max_samples: usize, read_bytes: usize
         match read_sample_with_buffer(&path, &mut buffer) {
             Ok(sample) => {
                 readable_files += 1;
-                if sample.size == 0 { empty_files += 1; }
+                if sample.size == 0 {
+                    empty_files += 1;
+                }
                 bytes_read += sample.bytes_read;
-                samples.push(ReadabilityRecord { path: relative_path(&path, root), size: sample.size, bytes_read: sample.bytes_read });
+                samples.push(ReadabilityRecord {
+                    path: relative_path(&path, root),
+                    size: sample.size,
+                    bytes_read: sample.bytes_read,
+                });
             }
-            Err(err) => { unreadable_files += 1; push_scan_error(&mut errors, &path, root, err.to_string()); }
+            Err(err) => {
+                unreadable_files += 1;
+                push_scan_error(&mut errors, &path, root, err.to_string());
+            }
         }
     }
-    ReadabilityScan { status: "ok", samples, errors, total_files, readable_files, unreadable_files, empty_files, bytes_read, truncated: total_files > max_samples }
+    ReadabilityScan {
+        status: "ok",
+        samples,
+        errors,
+        total_files,
+        readable_files,
+        unreadable_files,
+        empty_files,
+        bytes_read,
+        truncated: total_files > max_samples,
+    }
 }
 
-fn collect_regular_files(root: &Path, current: &Path, paths: &mut Vec<PathBuf>, errors: &mut Vec<ScanError>) {
-    let entries = match std::fs::read_dir(current) { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); return; } };
+fn collect_regular_files(
+    root: &Path,
+    current: &Path,
+    paths: &mut Vec<PathBuf>,
+    errors: &mut Vec<ScanError>,
+) {
+    let entries = match std::fs::read_dir(current) {
+        Ok(v) => v,
+        Err(err) => {
+            push_scan_error(errors, current, root, err.to_string());
+            return;
+        }
+    };
     for entry in entries {
-        let entry = match entry { Ok(v) => v, Err(err) => { push_scan_error(errors, current, root, err.to_string()); continue; } };
+        let entry = match entry {
+            Ok(v) => v,
+            Err(err) => {
+                push_scan_error(errors, current, root, err.to_string());
+                continue;
+            }
+        };
         let path = entry.path();
-        let metadata = match entry.metadata() { Ok(v) => v, Err(err) => { push_scan_error(errors, &path, root, err.to_string()); continue; } };
-        if metadata.is_dir() { collect_regular_files(root, &path, paths, errors); } else if metadata.is_file() { paths.push(path); }
+        let metadata = match entry.metadata() {
+            Ok(v) => v,
+            Err(err) => {
+                push_scan_error(errors, &path, root, err.to_string());
+                continue;
+            }
+        };
+        if metadata.is_dir() {
+            collect_regular_files(root, &path, paths, errors);
+        } else if metadata.is_file() {
+            paths.push(path);
+        }
     }
 }
 
 fn select_sample_paths(paths: &[PathBuf], max_samples: usize) -> Vec<PathBuf> {
-    if paths.len() <= max_samples { return paths.to_vec(); }
-    if max_samples == 1 { return vec![paths[0].clone()]; }
+    if paths.len() <= max_samples {
+        return paths.to_vec();
+    }
+    if max_samples == 1 {
+        return vec![paths[0].clone()];
+    }
     let last = paths.len() - 1;
-    (0..max_samples).map(|index| paths[index * last / (max_samples - 1)].clone()).collect()
+    (0..max_samples)
+        .map(|index| paths[index * last / (max_samples - 1)].clone())
+        .collect()
 }
 
 fn push_scan_error(errors: &mut Vec<ScanError>, path: &Path, root: &Path, message: String) {
-    errors.push(ScanError { path: relative_path(path, root), message });
+    errors.push(ScanError {
+        path: relative_path(path, root),
+        message,
+    });
 }
 
-fn append_errors_to_py(py: Python<'_>, errors: &Bound<'_, PyList>, scan_errors: &[ScanError]) -> PyResult<()> {
+fn append_errors_to_py(
+    py: Python<'_>,
+    errors: &Bound<'_, PyList>,
+    scan_errors: &[ScanError],
+) -> PyResult<()> {
     for error in scan_errors {
         let item = PyDict::new(py);
         item.set_item("path", &error.path)?;
@@ -175,7 +336,9 @@ fn manifest_to_py(py: Python<'_>, scan: ManifestScan) -> PyResult<Py<PyDict>> {
     result.set_item("errors", &errors)?;
     append_errors_to_py(py, &errors, &scan.errors)?;
     result.set_item("status", scan.status)?;
-    if scan.status != "ok" { return Ok(result.unbind()); }
+    if scan.status != "ok" {
+        return Ok(result.unbind());
+    }
     for record in scan.files {
         let item = PyDict::new(py);
         item.set_item("path", record.path)?;
@@ -197,7 +360,9 @@ fn readability_to_py(py: Python<'_>, scan: ReadabilityScan) -> PyResult<Py<PyDic
     result.set_item("errors", &errors)?;
     append_errors_to_py(py, &errors, &scan.errors)?;
     result.set_item("status", scan.status)?;
-    if scan.status != "ok" { return Ok(result.unbind()); }
+    if scan.status != "ok" {
+        return Ok(result.unbind());
+    }
     for record in scan.samples {
         let item = PyDict::new(py);
         item.set_item("path", record.path)?;
@@ -225,7 +390,10 @@ fn read_sample_with_buffer(path: &Path, buffer: &mut [u8]) -> std::io::Result<Re
     let reader = ManagedReader::open(path)?;
     let size = reader.len();
     if size == 0 {
-        return Ok(ReadSample { size, bytes_read: 0 });
+        return Ok(ReadSample {
+            size,
+            bytes_read: 0,
+        });
     }
     let head_read = reader.read_into_at(0, buffer)? as u64;
     let mut tail_read = 0u64;
@@ -233,7 +401,10 @@ fn read_sample_with_buffer(path: &Path, buffer: &mut [u8]) -> std::io::Result<Re
         let tail_offset = size.saturating_sub(buffer.len() as u64);
         tail_read = reader.read_into_at(tail_offset, buffer)? as u64;
     }
-    Ok(ReadSample { size, bytes_read: head_read + tail_read })
+    Ok(ReadSample {
+        size,
+        bytes_read: head_read + tail_read,
+    })
 }
 
 fn relative_path(path: &Path, root: &Path) -> String {
@@ -249,7 +420,9 @@ fn crc32_file_with_buffer(path: &Path, buffer: &mut [u8]) -> std::io::Result<u32
     let mut hasher = Crc32Hasher::new();
     loop {
         let read = cursor.read(buffer)?;
-        if read == 0 { break; }
+        if read == 0 {
+            break;
+        }
         hasher.update(&buffer[..read]);
     }
     Ok(hasher.finalize())

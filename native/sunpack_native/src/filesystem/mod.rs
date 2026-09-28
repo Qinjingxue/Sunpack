@@ -98,7 +98,8 @@ pub(crate) fn resolve_output_volume_key(path: &str) -> PyResult<Option<String>> 
 }
 
 #[pyfunction]
-pub(crate) fn watch_broker_acquire() -> PyResult<()> {    #[cfg(windows)]
+pub(crate) fn watch_broker_acquire() -> PyResult<()> {
+    #[cfg(windows)]
     {
         return sunpack_usn_core::broker_acquire().map_err(os_error);
     }

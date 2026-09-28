@@ -17,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 import sunpack.pipeline.coordinator.engine as engine_module
-import sunpack.pipeline.coordinator.scan_session as scan_session_module
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.core.analysis.engine import AnalysisEngine
@@ -124,11 +123,6 @@ class RequestRuntimeProfiler:
         self._install_global_method(DiscoveryScanSession, "file_head_facts_for_paths", "output_file_head_facts")
         self._install_global_method(DiscoveryScanSession, "prime_snapshot", "output_prime_snapshot")
         self._install_global_method(OutputInventory, "from_value", "output_inventory_from_value")
-        self._install_global_callable(
-            scan_session_module,
-            "_native_batch_file_head_facts",
-            "output_native_batch_file_head_facts",
-        )
         self._install_global_callable(
             engine_module,
             "build_output_dir_resolver",

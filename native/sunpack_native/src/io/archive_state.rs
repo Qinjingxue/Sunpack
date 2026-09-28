@@ -117,7 +117,9 @@ impl SegmentReader {
         let mut written = 0usize;
         while written < output.len() {
             let (index, within) = self.locate(cursor).ok_or_else(|| {
-                pyo3::exceptions::PyValueError::new_err("archive state logical read segment is missing")
+                pyo3::exceptions::PyValueError::new_err(
+                    "archive state logical read segment is missing",
+                )
             })?;
             let available = (self.segments[index].len() - within) as usize;
             let take = available.min(output.len() - written);
@@ -129,7 +131,9 @@ impl SegmentReader {
                         self.file_index = Some(index);
                     }
                     let file = self.file.as_mut().ok_or_else(|| {
-                        pyo3::exceptions::PyRuntimeError::new_err("archive state source file is unavailable")
+                        pyo3::exceptions::PyRuntimeError::new_err(
+                            "archive state source file is unavailable",
+                        )
                     })?;
                     file.seek(SeekFrom::Start(start.saturating_add(within)))?;
                     file.read_exact(&mut output[written..written + take])?;
@@ -753,7 +757,10 @@ fn zip_manifest_from_reader(
     // Every header read below stays inside [cd_start, expected_end + 46) and
     // inside the input, so one bounded buffer holds the whole directory walk.
     let directory = if cd_start < total {
-        reader.read_vec_at(cd_start, (expected_end.saturating_add(46).min(total) - cd_start) as usize)?
+        reader.read_vec_at(
+            cd_start,
+            (expected_end.saturating_add(46).min(total) - cd_start) as usize,
+        )?
     } else {
         Vec::new()
     };
@@ -771,8 +778,7 @@ fn zip_manifest_from_reader(
         let at = (cursor - cd_start) as usize;
         if &directory[at..at + 4] != CD_SIG {
             damaged = true;
-            message = "Archive state ZIP central directory stopped before expected end"
-                .to_string();
+            message = "Archive state ZIP central directory stopped before expected end".to_string();
             break;
         }
         let flags = u16_le(&directory, at + 8);
@@ -802,7 +808,11 @@ fn zip_manifest_from_reader(
         )?;
         // Encrypted entries are only checkable with a password; WinZip AES
         // entries use method 99 and are left to the extraction worker.
-        let entry_password = if flags & 0x1 != 0 { password.as_deref() } else { None };
+        let entry_password = if flags & 0x1 != 0 {
+            password.as_deref()
+        } else {
+            None
+        };
         if matches!(method, 0 | 8) && (flags & 0x1 == 0 || entry_password.is_some()) {
             match payload.verify(
                 reader,
@@ -1273,4 +1283,3 @@ fn optional_u64(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u64>> {
         _ => Ok(None),
     }
 }
-

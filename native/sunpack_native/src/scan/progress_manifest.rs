@@ -348,7 +348,10 @@ impl NativeProgressManifest {
 
 /// Read a manifest file written by ``write_json``; ``None`` when unreadable.
 #[pyfunction]
-pub(crate) fn load_progress_manifest(py: Python<'_>, path: String) -> Option<NativeProgressManifest> {
+pub(crate) fn load_progress_manifest(
+    py: Python<'_>,
+    path: String,
+) -> Option<NativeProgressManifest> {
     py.detach(move || {
         let mut file = TrackedFile::open(&path, "progress_manifest_input").ok()?;
         let mut data = Vec::new();
@@ -520,7 +523,12 @@ fn file_from_row(item: &OutputFileRecord, out_dir: &str, round_index: u32) -> Pr
     }
 }
 
-fn merge_untraced_files(files: &mut Vec<ProgressFile>, out_dir: &str, round_index: u32, worker_ok: bool) {
+fn merge_untraced_files(
+    files: &mut Vec<ProgressFile>,
+    out_dir: &str,
+    round_index: u32,
+    worker_ok: bool,
+) {
     let seen: HashSet<String> = files
         .iter()
         .filter(|item| !item.path.is_empty())
@@ -617,16 +625,25 @@ mod tests {
     #[test]
     fn output_paths_match_windows_pathlib_spelling() {
         assert_eq!(output_path_text("a/b.txt", "C:\\out"), "C:\\out\\a\\b.txt");
-        assert_eq!(output_path_text("a//./b.txt", "C:\\out\\"), "C:\\out\\a\\b.txt");
+        assert_eq!(
+            output_path_text("a//./b.txt", "C:\\out\\"),
+            "C:\\out\\a\\b.txt"
+        );
         assert_eq!(output_path_text("D:/x/y.bin", "C:\\out"), "D:\\x\\y.bin");
-        assert_eq!(windows_path_text("\\\\server\\share\\a/b"), "\\\\server\\share\\a\\b");
+        assert_eq!(
+            windows_path_text("\\\\server\\share\\a/b"),
+            "\\\\server\\share\\a\\b"
+        );
         assert_eq!(windows_path_text("C:/"), "C:\\");
     }
 
     #[test]
     fn archive_paths_are_relative_with_forward_slashes() {
         assert_eq!(archive_path_text("dir\\a.txt", "C:\\out"), "dir/a.txt");
-        assert_eq!(archive_path_text("C:\\out\\dir\\a.txt", "C:\\out"), "dir/a.txt");
+        assert_eq!(
+            archive_path_text("C:\\out\\dir\\a.txt", "C:\\out"),
+            "dir/a.txt"
+        );
         assert_eq!(archive_path_text("D:\\other\\a.txt", "C:\\out"), "a.txt");
     }
 }

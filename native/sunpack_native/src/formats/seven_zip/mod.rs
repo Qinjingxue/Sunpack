@@ -7,9 +7,7 @@ use lzma_rust2::{
     filter::{bcj::BcjReader, bcj2::Bcj2Reader, delta::DeltaReader},
     Lzma2Reader, LzmaReader,
 };
-use sevenz_rust2::{
-    EncoderMethod, Password,
-};
+use sevenz_rust2::{EncoderMethod, Password};
 use std::io::{Cursor, Read, Seek};
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;

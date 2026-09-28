@@ -487,8 +487,7 @@ impl DeflateOutput {
                 return self.add_count(remaining);
             }
             let distance = distance as usize;
-            let source =
-                (self.window_pos + DEFLATE_WINDOW_SIZE - distance) % DEFLATE_WINDOW_SIZE;
+            let source = (self.window_pos + DEFLATE_WINDOW_SIZE - distance) % DEFLATE_WINDOW_SIZE;
             let byte = self.window[source];
             self.write_byte(byte)?;
             remaining -= 1;
@@ -1025,8 +1024,7 @@ pub(crate) fn resolve_xz_boundary_exact(
         let check_size = xz_check_size(flags[1] & 0x0f)?;
         checksum_present |= check_size != 0;
 
-        let index_size =
-            (u64::from(u32::from_le_bytes(footer[4..8].try_into().unwrap())) + 1) * 4;
+        let index_size = (u64::from(u32::from_le_bytes(footer[4..8].try_into().unwrap())) + 1) * 4;
         let index_start = footer_start
             .checked_sub(index_size)
             .ok_or(ValidationError::Invalid("xz_backward_size_out_of_range"))?;
@@ -1492,8 +1490,7 @@ mod tests {
 
     fn gzip_member(payload: &[u8]) -> Vec<u8> {
         let mut data = Vec::new();
-        let mut encoder =
-            flate2::write::GzEncoder::new(&mut data, flate2::Compression::default());
+        let mut encoder = flate2::write::GzEncoder::new(&mut data, flate2::Compression::default());
         encoder.write_all(payload).unwrap();
         encoder.finish().unwrap();
         data

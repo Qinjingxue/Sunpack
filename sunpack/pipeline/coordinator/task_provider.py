@@ -4,13 +4,12 @@ from typing import Any
 
 from sunpack.core.config.detection_view import discovery_run_config
 
-from sunpack.core.contracts.discovery import DiscoveryCandidate, StageResult
+from sunpack.core.contracts.discovery import StageResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.coordinator.discovery import ArchiveDiscoveryPipeline
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
-from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
-from sunpack.pipeline.discovery.detection.scheduler import DetectionScheduler
+from sunpack.pipeline.coordinator.target_scan import build_native_table_for_targets
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.pipeline.discovery.relations.scheduler import RelationsScheduler
 
@@ -24,10 +23,8 @@ class ArchiveTaskProvider:
         options = detection_options or EmbeddedOptions()
         config = discovery_run_config(config, deep_detect=options.force_scan)
         self.config = config
-        self.detector = DetectionScheduler(config)
         self.discovery = ArchiveDiscoveryPipeline(
             config,
-            self.detector,
             options,
         )
         self._relations = RelationsScheduler(config)
@@ -40,20 +37,23 @@ class ArchiveTaskProvider:
         *,
         scan_session: DiscoveryScanSession | None = None,
         is_recursive_scan: bool = False,
+        include_details: bool = True,
     ) -> StageResult:
         session = scan_session or DiscoveryScanSession(config=self.config)
         roots = list(dict.fromkeys(str(root) for root in scan_roots if str(root)))
         if is_recursive_scan and len(roots) > 1:
             result = StageResult()
             for root in roots:
-                candidates = build_candidates_for_targets(
+                table = build_native_table_for_targets(
                     [root],
                     session=session,
                     config=self.config,
                 )
-                partial = self.discovery.discover(
-                    candidates,
+                partial = self.discovery.discover_native(
+                    table,
+                    session,
                     is_recursive_scan=True,
+                    include_details=include_details,
                 )
                 result.resolved_tasks.extend(partial.resolved_tasks)
                 result.findings.extend(partial.findings)
@@ -63,14 +63,16 @@ class ArchiveTaskProvider:
                 result.traces.extend(partial.traces)
             result.validate()
         else:
-            candidates = build_candidates_for_targets(
+            table = build_native_table_for_targets(
                 roots,
                 session=session,
                 config=self.config,
             )
-            result = self.discovery.discover(
-                candidates,
+            result = self.discovery.discover_native(
+                table,
+                session,
                 is_recursive_scan=is_recursive_scan,
+                include_details=include_details,
             )
         self._record_discovery_failures(result)
         return result
@@ -89,6 +91,7 @@ class ArchiveTaskProvider:
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
+            include_details=False,
         )
         return self.filter_processed_tasks(
             discovered.resolved_tasks,
@@ -145,12 +148,6 @@ class ArchiveTaskProvider:
             )
             if info not in self.failed_candidate_failures:
                 self.failed_candidate_failures.append(info)
-
-    def task_from_candidate(self, candidate: DiscoveryCandidate) -> ArchiveTask | None:
-        result = self.discovery.discover([candidate])
-        self._record_discovery_failures(result)
-        tasks = self.filter_processed_tasks(result.resolved_tasks)
-        return tasks[0] if tasks else None
 
     def resolve_volume_once_in_directory(
         self,

@@ -706,8 +706,13 @@ fn verify_winzip_aes_candidates(
                 .par_iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    winzip_aes_verifier_matches(&zip_password_bytes(password), salt, verifier, key_len)
-                        .then_some(index as i32)
+                    winzip_aes_verifier_matches(
+                        &zip_password_bytes(password),
+                        salt,
+                        verifier,
+                        key_len,
+                    )
+                    .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -715,8 +720,13 @@ fn verify_winzip_aes_candidates(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    winzip_aes_verifier_matches(&zip_password_bytes(password), salt, verifier, key_len)
-                        .then_some(index as i32)
+                    winzip_aes_verifier_matches(
+                        &zip_password_bytes(password),
+                        salt,
+                        verifier,
+                        key_len,
+                    )
+                    .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
         };
@@ -754,8 +764,12 @@ fn verify_zipcrypto_material(
                 .par_iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    zipcrypto_header_matches(&zip_password_bytes(password), encryption_header, check_byte)
-                        .then_some(index as i32)
+                    zipcrypto_header_matches(
+                        &zip_password_bytes(password),
+                        encryption_header,
+                        check_byte,
+                    )
+                    .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
         } else {
@@ -763,8 +777,12 @@ fn verify_zipcrypto_material(
                 .iter()
                 .enumerate()
                 .filter_map(|(index, password)| {
-                    zipcrypto_header_matches(&zip_password_bytes(password), encryption_header, check_byte)
-                        .then_some(index as i32)
+                    zipcrypto_header_matches(
+                        &zip_password_bytes(password),
+                        encryption_header,
+                        check_byte,
+                    )
+                    .then_some(index as i32)
                 })
                 .collect::<Vec<_>>()
         };

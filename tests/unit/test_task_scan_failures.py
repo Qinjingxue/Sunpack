@@ -9,20 +9,21 @@ def test_recursive_provider_discovers_each_logical_root_independently(monkeypatc
     provider = ArchiveTaskProvider({})
     build_calls = []
     discover_calls = []
+    table = object()
 
     def fake_build(scan_roots, *, session, config):
         build_calls.append(tuple(scan_roots))
-        return []
+        return table
 
-    def fake_discover(candidates, *, is_recursive_scan=False):
-        discover_calls.append((tuple(candidates), is_recursive_scan))
+    def fake_discover(native_table, session, *, is_recursive_scan=False, include_details=True):
+        discover_calls.append((native_table is table, session is not None, is_recursive_scan, include_details))
         return StageResult()
 
     monkeypatch.setattr(
-        "sunpack.pipeline.coordinator.task_provider.build_candidates_for_targets",
+        "sunpack.pipeline.coordinator.task_provider.build_native_table_for_targets",
         fake_build,
     )
-    monkeypatch.setattr(provider.discovery, "discover", fake_discover)
+    monkeypatch.setattr(provider.discovery, "discover_native", fake_discover)
 
     result = provider.discover_targets(
         ["segment-a", "segment-b"],
@@ -31,7 +32,7 @@ def test_recursive_provider_discovers_each_logical_root_independently(monkeypatc
 
     assert result.resolved_tasks == []
     assert build_calls == [("segment-a",), ("segment-b",)]
-    assert discover_calls == [((), True), ((), True)]
+    assert discover_calls == [(True, True, True, True), (True, True, True, True)]
 
 
 def test_discover_targets_preserves_provider_failures_in_run_state(monkeypatch):

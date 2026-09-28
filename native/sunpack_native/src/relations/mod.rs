@@ -16,7 +16,7 @@ use std::path::Path;
 use std::sync::OnceLock;
 
 #[derive(Debug, Clone)]
-struct RelationInput {
+pub(crate) struct RelationInput {
     path: String,
     path_key: String,
     name: String,
@@ -54,10 +54,148 @@ enum ProposalStatus {
 }
 
 #[derive(Debug, Clone)]
-struct ProposalValidation {
+pub(crate) struct ProposalValidation {
     status: ProposalStatus,
     proposal: RelationProposal,
     anchors: HashMap<String, VolumeAnchor>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GroupKind {
+    Valid,
+    Password,
+    Incomplete,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum NativeRelationGroup {
+    Ordinary(RelationInput, bool),
+    Proposal(ProposalValidation, GroupKind),
+}
+
+pub(crate) struct RelationCandidateData {
+    pub(crate) entry_path: String,
+    pub(crate) logical_name: String,
+    pub(crate) format_hint: String,
+    pub(crate) parts: Vec<String>,
+    pub(crate) companions: Vec<String>,
+    pub(crate) carrier_path: String,
+    pub(crate) split_family: String,
+    pub(crate) is_split: bool,
+    pub(crate) needs_password: bool,
+    pub(crate) multivolume: bool,
+    pub(crate) relation_confirmed: bool,
+    pub(crate) structural_non_head: bool,
+    pub(crate) size: Option<u64>,
+    pub(crate) logical_size: Option<u64>,
+}
+
+impl NativeRelationGroup {
+    pub(crate) fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        match self {
+            Self::Ordinary(row, confirmed) => ordinary_file_group_to_dict(py, row, *confirmed),
+            Self::Proposal(validation, GroupKind::Valid) => {
+                validated_proposal_to_dict(py, validation)
+            }
+            Self::Proposal(validation, GroupKind::Password) => {
+                password_error_proposal_to_dict(py, validation)
+            }
+            Self::Proposal(validation, GroupKind::Incomplete) => {
+                incomplete_proposal_to_dict(py, validation)
+            }
+        }
+    }
+
+    pub(crate) fn candidate_data(&self) -> RelationCandidateData {
+        match self {
+            Self::Ordinary(row, confirmed) => {
+                let parsed = parse_relation_numbered_volume(&row.name);
+                let hypothesis = !confirmed
+                    && parsed.is_some()
+                    && row.anchor.as_ref().is_some_and(|anchor| {
+                        matches!(anchor.format.as_str(), "rar" | "7z" | "zip") || anchor.sfx
+                    });
+                let format_hint = row
+                    .anchor
+                    .as_ref()
+                    .map(|a| a.format.clone())
+                    .unwrap_or_default();
+                let logical_name = parsed
+                    .as_ref()
+                    .filter(|_| hypothesis)
+                    .map(logical_name_from_parsed)
+                    .unwrap_or_else(|| get_logical_name(&row.name, true));
+                let split_family = parsed
+                    .as_ref()
+                    .filter(|_| hypothesis)
+                    .map(|value| {
+                        let format = if format_hint.is_empty() {
+                            value.family
+                        } else {
+                            &format_hint
+                        };
+                        split_family_for_proposal(format, value.style)
+                    })
+                    .unwrap_or_default();
+                let anchor = row.anchor.as_ref();
+                RelationCandidateData {
+                    entry_path: row.path.clone(),
+                    logical_name,
+                    format_hint,
+                    parts: vec![row.path.clone()],
+                    companions: Vec::new(),
+                    carrier_path: row.path.clone(),
+                    split_family,
+                    is_split: hypothesis,
+                    needs_password: anchor.is_some_and(|a| a.needs_password),
+                    multivolume: anchor.is_some_and(|a| a.multivolume),
+                    relation_confirmed: *confirmed,
+                    structural_non_head: anchor.is_some_and(|a| {
+                        a.continuation_from_previous
+                            || a.internal_volume_number.is_some_and(|number| number > 1)
+                            || a.anchor_roles.contains(&"member")
+                    }),
+                    size: row.size,
+                    logical_size: row.size,
+                }
+            }
+            Self::Proposal(validation, kind) => {
+                let proposal = &validation.proposal;
+                let head = proposal
+                    .volumes
+                    .iter()
+                    .find(|(_, number, _, _, _)| *number == 1)
+                    .unwrap_or(&proposal.volumes[0]);
+                RelationCandidateData {
+                    entry_path: head.0.clone(),
+                    logical_name: proposal.logical_name.clone(),
+                    format_hint: proposal.format.clone(),
+                    parts: proposal
+                        .volumes
+                        .iter()
+                        .map(|volume| volume.0.clone())
+                        .collect(),
+                    companions: proposal.companions.clone(),
+                    carrier_path: proposal
+                        .companions
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| head.0.clone()),
+                    split_family: proposal_split_family(proposal, &validation.anchors),
+                    is_split: true,
+                    needs_password: matches!(kind, GroupKind::Password),
+                    multivolume: true,
+                    relation_confirmed: true,
+                    structural_non_head: false,
+                    size: validation
+                        .anchors
+                        .get(&head.0.to_ascii_lowercase())
+                        .map(|anchor| anchor.size),
+                    logical_size: proposal_logical_size(proposal, &validation.anchors),
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -192,6 +330,21 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
     filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
     path_passwords: Option<Vec<(String, String)>>,
 ) -> PyResult<Vec<Py<PyDict>>> {
+    let groups = build_native_candidate_groups_from_snapshot(
+        py,
+        &raw_snapshot,
+        &filtered_snapshot,
+        path_passwords.as_deref(),
+    )?;
+    groups.into_iter().map(|group| group.to_dict(py)).collect()
+}
+
+pub(crate) fn build_native_candidate_groups_from_snapshot(
+    py: Python<'_>,
+    raw_snapshot: &NativeDirectorySnapshot,
+    filtered_snapshot: &NativeDirectorySnapshot,
+    path_passwords: Option<&[(String, String)]>,
+) -> PyResult<Vec<NativeRelationGroup>> {
     let filtered_keys: HashSet<String> = filtered_snapshot
         .relation_file_records()
         .map(|(path, _, _, _)| path.to_ascii_lowercase())
@@ -218,13 +371,7 @@ pub(crate) fn relations_build_candidate_groups_from_snapshot(
             }
         })
         .collect();
-    let groups = build_candidate_groups_from_physical(
-        py,
-        raw_rows,
-        &filtered_keys,
-        path_passwords.as_deref(),
-    )?;
-    Ok(groups)
+    build_candidate_groups_from_physical(py, raw_rows, &filtered_keys, path_passwords)
 }
 
 fn build_candidate_groups_from_physical(
@@ -232,7 +379,7 @@ fn build_candidate_groups_from_physical(
     rows: Vec<RelationInput>,
     filtered_keys: &HashSet<String>,
     path_passwords: Option<&[(String, String)]>,
-) -> PyResult<Vec<Py<PyDict>>> {
+) -> PyResult<Vec<NativeRelationGroup>> {
     let mut by_directory: HashMap<String, Vec<RelationInput>> = HashMap::new();
     let mut directory_order = Vec::new();
     for row in rows {
@@ -477,7 +624,10 @@ fn build_candidate_groups_from_physical(
                 continue;
             }
             claimed_paths.extend(owned.iter().cloned());
-            output.push(validated_proposal_to_dict(py, validation)?);
+            output.push(NativeRelationGroup::Proposal(
+                validation.clone(),
+                GroupKind::Valid,
+            ));
         }
 
         // Only an unambiguous encrypted proposal is handed to the existing
@@ -495,7 +645,10 @@ fn build_candidate_groups_from_physical(
                 continue;
             }
             password_paths.extend(owned.iter().cloned());
-            output.push(password_error_proposal_to_dict(py, validation)?);
+            output.push(NativeRelationGroup::Proposal(
+                validation.clone(),
+                GroupKind::Password,
+            ));
         }
 
         // A structurally proven volume set that is missing volumes is still
@@ -526,7 +679,10 @@ fn build_candidate_groups_from_physical(
                 continue;
             }
             claimed_paths.extend(owned.iter().cloned());
-            output.push(incomplete_proposal_to_dict(py, &validations[index])?);
+            output.push(NativeRelationGroup::Proposal(
+                validations[index].clone(),
+                GroupKind::Incomplete,
+            ));
         }
 
         for row in directory_rows.iter().filter(|row| {
@@ -543,7 +699,7 @@ fn build_candidate_groups_from_physical(
                 && !suppressed
         }) {
             let confirmed = row.anchor.as_ref().is_some_and(anchor_is_relation_archive);
-            output.push(ordinary_file_group_to_dict(py, row, confirmed)?);
+            output.push(NativeRelationGroup::Ordinary(row.clone(), confirmed));
         }
     }
     Ok(output)
@@ -2204,8 +2360,11 @@ pub(crate) fn relations_resolve_volume_once(
         .filter(|path| parent_directory_key(path) == directory)
         .map(|path| path.to_ascii_lowercase())
         .collect();
-    let groups =
-        build_candidate_groups_from_physical(py, rows, &filtered_keys, path_passwords.as_deref())?;
+    let groups: Vec<Py<PyDict>> =
+        build_candidate_groups_from_physical(py, rows, &filtered_keys, path_passwords.as_deref())?
+            .into_iter()
+            .map(|group| group.to_dict(py))
+            .collect::<PyResult<_>>()?;
     let format_hint = normalize_retry_format(format_hint);
     for group in groups {
         let Some(is_split) = group

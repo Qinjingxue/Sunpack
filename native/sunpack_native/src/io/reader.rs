@@ -477,10 +477,12 @@ impl ManagedReader {
         }
 
         let result = self.state.gate.acquire().and_then(|_permit| {
-            self.source.read_slices_at(offset, read_len).map_err(|error| {
-                ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
-                    .into_io_error()
-            })
+            self.source
+                .read_slices_at(offset, read_len)
+                .map_err(|error| {
+                    ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
+                        .into_io_error()
+                })
         });
         let count = result
             .as_ref()
@@ -1232,7 +1234,9 @@ impl ByteSource for MultiVolumeSource {
             let logical_start = offset.max(volume.start);
             let logical_end = end.min(volume.end);
             let chunk_len = (logical_end - logical_start) as usize;
-            let chunk = volume.source.read_at(logical_start - volume.start, chunk_len)?;
+            let chunk = volume
+                .source
+                .read_at(logical_start - volume.start, chunk_len)?;
             output.extend_from_slice(&chunk);
             // A volume that shrank after open ends the logical stream here;
             // appending the next volume would shift every later byte.
@@ -1283,7 +1287,9 @@ impl ByteSource for MultiVolumeSource {
             let logical_start = offset.max(volume.start);
             let logical_end = end.min(volume.end);
             let chunk_len = (logical_end - logical_start) as usize;
-            let volume_slices = volume.source.read_slices_at(logical_start - volume.start, chunk_len)?;
+            let volume_slices = volume
+                .source
+                .read_slices_at(logical_start - volume.start, chunk_len)?;
             let produced = volume_slices.iter().map(|slice| slice.len()).sum::<usize>();
             slices.extend(volume_slices);
             if produced != chunk_len {
@@ -1326,7 +1332,9 @@ impl ByteSource for MultiVolumeSource {
             let logical_start = offset.max(volume.start);
             let logical_end = end.min(volume.end);
             let chunk_len = (logical_end - logical_start) as usize;
-            let chunk = volume.source.read_direct_at(logical_start - volume.start, chunk_len)?;
+            let chunk = volume
+                .source
+                .read_direct_at(logical_start - volume.start, chunk_len)?;
             output.extend_from_slice(&chunk);
             // A volume that shrank after open ends the logical stream here;
             // appending the next volume would shift every later byte.

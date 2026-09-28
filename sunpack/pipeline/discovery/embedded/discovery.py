@@ -14,6 +14,7 @@ from sunpack.core.contracts.archive_input import (
 from sunpack.core.contracts.discovery import (
     DiscoveryCandidate,
     DiscoveryFinding,
+    DiscoveryTrace,
     StageResult,
 )
 from sunpack.core.contracts.tasks import ArchiveTask
@@ -21,6 +22,7 @@ from sunpack.core.analysis.embedded import (
     resolve_encrypted_rar_boundaries,
     scan_embedded_archives,
 )
+from sunpack.core.analysis.embedded.scanner import _normalize_native_result
 from sunpack.core.passwords.internal.lists import dedupe_passwords
 from sunpack.core.passwords.internal.local_files import discover_directory_passwords_for_archive
 from sunpack.core.support.global_cache_manager import file_identity
@@ -113,9 +115,66 @@ class EmbeddedDiscovery:
         result.validate()
         return result
 
+    def discover_native(
+        self,
+        table,
+        routes,
+        session,
+        *,
+        is_recursive_scan: bool = False,
+        include_details: bool = True,
+    ) -> StageResult:
+        embedded_config = self.config.get("embedded_scan") or {}
+        ratio = self.gate._recursive_candidate_ratio()
+        batch = table.scan_embedded(
+            routes,
+            recursive=is_recursive_scan,
+            force_scan=self.options.force_scan,
+            enabled=embedded_config.get("enabled", True),
+            recursive_ratio=ratio,
+            include_residual_details=include_details,
+        )
+        result = StageResult()
+        for offset in range(0, len(batch), 256):
+            for index, status, reason, raw_scan in batch.page(table, offset, 256):
+                if status == 0:
+                    entry_path, format_hint = table.summary(index)
+                    result.residual_paths.update(table.path_keys(index))
+                    result.traces.append(DiscoveryTrace(
+                        entry_path=entry_path,
+                        source="embedded",
+                        status="residual",
+                        format=format_hint,
+                        reason=reason,
+                    ))
+                    continue
+
+                candidate = session.project_native_candidate(table, index)
+                scan = _normalize_native_result(raw_scan, 0)
+                resolved, reason, findings = self._discover_candidate(
+                    candidate,
+                    precomputed_scan=scan,
+                )
+                if resolved is None:
+                    if reason in {
+                        "embedded_password_required",
+                        "embedded_wrong_password",
+                        "embedded_truncated",
+                    }:
+                        result.findings.extend(findings)
+                        result.add_blocked(candidate, source="embedded", reason=reason)
+                    elif include_details:
+                        result.add_residual(candidate, source="embedded", reason=reason)
+                else:
+                    result.add_resolved(resolved, reason=reason)
+        result.validate()
+        return result
+
     def _discover_candidate(
         self,
         candidate: DiscoveryCandidate,
+        *,
+        precomputed_scan=None,
     ) -> tuple[ArchiveTask | None, str, tuple[DiscoveryFinding, ...]]:
         path = candidate.entry_path
         if not path:
@@ -123,18 +182,22 @@ class EmbeddedDiscovery:
         if not self.options.force_scan and path.casefold().endswith(".exe"):
             return None, "embedded_executable_skipped", ()
 
-        try:
-            identity = file_identity(path)
-            size = int(identity[1])
-            if size <= 0:
-                return None, "missing_or_empty_file", ()
-            scan = scan_embedded_archives(
-                path,
-                expected_size=size,
-                identity=identity,
-            )
-        except OSError:
-            return None, "embedded_scan_io_error", ()
+        if precomputed_scan is None:
+            try:
+                identity = file_identity(path)
+                size = int(identity[1])
+                if size <= 0:
+                    return None, "missing_or_empty_file", ()
+                scan = scan_embedded_archives(
+                    path,
+                    expected_size=size,
+                    identity=identity,
+                )
+            except OSError:
+                return None, "embedded_scan_io_error", ()
+        else:
+            scan = precomputed_scan
+            size = int(scan.file_size)
 
         password_by_offset: dict[int, str] = {}
         encrypted_offsets = [

@@ -180,10 +180,6 @@ def test_output_scan_policy_inventory_batch_primes_file_heads(tmp_path, monkeypa
     session = work.session
     assert session is not None
 
-    monkeypatch.setattr(
-        "sunpack.pipeline.coordinator.scan_session._native_batch_file_head_facts",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("file heads must be cached")),
-    )
     facts = session.file_head_facts_for_paths([str(archive)], magic_size=16)
 
     row = facts[next(iter(facts))]
@@ -217,10 +213,6 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
     }
     inventory = collect_output_inventory(str(tmp_path), worker_result)
     monkeypatch.setattr(
-        "sunpack.pipeline.coordinator.scan_session._native_batch_file_head_facts",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("worker facts must avoid reopen")),
-    )
-    monkeypatch.setattr(
         "sunpack.pipeline.coordinator.output_scan_policy.DirectoryScanner.inventory_file_indices",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("Python inventory filtering must be bypassed")),
     )
@@ -236,6 +228,7 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
     )
     session = work.session
     assert session is not None
+    archive.unlink()
     facts = session.file_head_facts_for_paths([str(archive)], magic_size=16)
 
     row = facts[next(iter(facts))]

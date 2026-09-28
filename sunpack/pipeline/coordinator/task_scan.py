@@ -22,7 +22,6 @@ class ArchiveTaskScanner:
         self.context = context
         self.provider = ArchiveTaskProvider(config, detection_options=detection_options)
         self.config = self.provider.config
-        self.detector = self.provider.detector
         self.last_scan_session: DiscoveryScanSession | None = None
 
     def scan_root(self, scan_root: str) -> list[ArchiveTask]:
@@ -63,6 +62,7 @@ class ArchiveTaskScanner:
             scan_roots,
             scan_session=scan_session,
             is_recursive_scan=is_recursive_scan,
+            include_details=False,
         )
         self._record_provider_failures()
         return result

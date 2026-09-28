@@ -36,8 +36,7 @@ pub(crate) fn pe_headers_plausible(prefix: &[u8], actual_size: u64) -> bool {
     if pe_header_offset < 64
         || coff_end as u64 > actual_size
         || coff_end > prefix.len()
-        || prefix.get(pe_header_offset..pe_header_offset + PE_SIGNATURE.len())
-            != Some(PE_SIGNATURE)
+        || prefix.get(pe_header_offset..pe_header_offset + PE_SIGNATURE.len()) != Some(PE_SIGNATURE)
     {
         return false;
     }

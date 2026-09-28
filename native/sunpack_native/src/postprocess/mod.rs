@@ -319,8 +319,7 @@ fn rename_root_to_visible_work(root: &Path, stats: &mut FlattenStats) -> Option<
 }
 
 fn is_name_collision(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::AlreadyExists
-        || matches!(error.raw_os_error(), Some(80 | 183))
+    error.kind() == io::ErrorKind::AlreadyExists || matches!(error.raw_os_error(), Some(80 | 183))
 }
 
 #[cfg(windows)]

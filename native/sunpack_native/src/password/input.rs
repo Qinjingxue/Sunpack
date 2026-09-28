@@ -423,11 +423,12 @@ impl VolumeSet {
         if requested == 0 {
             return Ok(Vec::new());
         }
-        self.read_disk_spanning(0, offset, requested).map_err(|error| {
-            ReadFault::from_io(error, "read_volume", offset, requested, 0, volume_len)
-                .with_field(field, FieldLocation::Head)
-                .with_volume(1)
-        })
+        self.read_disk_spanning(0, offset, requested)
+            .map_err(|error| {
+                ReadFault::from_io(error, "read_volume", offset, requested, 0, volume_len)
+                    .with_field(field, FieldLocation::Head)
+                    .with_volume(1)
+            })
     }
 }
 

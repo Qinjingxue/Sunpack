@@ -124,7 +124,7 @@ struct RawHit {
     offset: u64,
 }
 
-struct NativeScanResult {
+pub(crate) struct NativeScanResult {
     file_size: u64,
     scan_read_bytes: u64,
     scan_read_operations: u64,
@@ -133,6 +133,69 @@ struct NativeScanResult {
     logical_resolution_complete: bool,
     raw_hit_count: usize,
     budget_exhausted: bool,
+}
+
+impl NativeScanResult {
+    pub(crate) fn has_candidates(&self) -> bool {
+        !self.candidates.is_empty()
+    }
+
+    pub(crate) fn to_py_dict(self, py: Python<'_>) -> PyResult<Py<PyDict>> {
+        let result = PyDict::new(py);
+        result.set_item("complete", !self.budget_exhausted)?;
+        result.set_item("signature_scan_complete", !self.budget_exhausted)?;
+        result.set_item(
+            "logical_resolution_complete",
+            self.logical_resolution_complete,
+        )?;
+        result.set_item("file_size", self.file_size)?;
+        result.set_item("read_bytes", self.file_size)?;
+        result.set_item("scan_read_bytes", self.scan_read_bytes)?;
+        result.set_item("scan_read_operations", self.scan_read_operations)?;
+        result.set_item("raw_hit_count", self.raw_hit_count)?;
+        result.set_item("budget_exhausted", self.budget_exhausted)?;
+        let hit_rows = PyList::empty(py);
+        for hit in self.raw_hits {
+            let row = PyDict::new(py);
+            row.set_item("name", hit.hit_name)?;
+            row.set_item(
+                "offset",
+                if hit.kind == "tar" {
+                    hit.offset + 257
+                } else {
+                    hit.offset
+                },
+            )?;
+            row.set_item("source", "detection_embedded_scan")?;
+            hit_rows.append(row)?;
+        }
+        result.set_item("hits", hit_rows)?;
+        let rows = PyList::empty(py);
+        for candidate in self.candidates {
+            let row = PyDict::new(py);
+            row.set_item("format", candidate.format)?;
+            row.set_item("offset", candidate.offset)?;
+            row.set_item("end_offset", candidate.end_offset)?;
+            row.set_item("confidence", candidate.confidence)?;
+            row.set_item("validation", candidate.validation)?;
+            row.set_item("candidate_kind", candidate.candidate_kind)?;
+            row.set_item("boundary_kind", candidate.boundary_kind)?;
+            row.set_item("extractable", candidate.extractable)?;
+            rows.append(row)?;
+        }
+        result.set_item("candidates", rows)?;
+        Ok(result.unbind())
+    }
+}
+
+pub(crate) fn scan_embedded_path(path: &str) -> io::Result<NativeScanResult> {
+    let reader = ManagedReader::open(path)?;
+    scan_embedded_archives_native_with_iocp(
+        reader,
+        DEFAULT_IOCP_CHUNK_SIZE,
+        DEFAULT_IOCP_BUFFERS,
+        DEFAULT_IOCP_WORKERS,
+    )
 }
 
 /// Scan one physical byte stream once for every supported embedded format.
@@ -170,50 +233,7 @@ pub(crate) fn scan_embedded_archives_with_reader(
         )
     })?;
 
-    let result = PyDict::new(py);
-    result.set_item("complete", !scan.budget_exhausted)?;
-    result.set_item("signature_scan_complete", !scan.budget_exhausted)?;
-    result.set_item(
-        "logical_resolution_complete",
-        scan.logical_resolution_complete,
-    )?;
-    result.set_item("file_size", scan.file_size)?;
-    result.set_item("read_bytes", scan.file_size)?;
-    result.set_item("scan_read_bytes", scan.scan_read_bytes)?;
-    result.set_item("scan_read_operations", scan.scan_read_operations)?;
-    result.set_item("raw_hit_count", scan.raw_hit_count)?;
-    result.set_item("budget_exhausted", scan.budget_exhausted)?;
-    let hit_rows = PyList::empty(py);
-    for hit in scan.raw_hits {
-        let row = PyDict::new(py);
-        row.set_item("name", hit.hit_name)?;
-        row.set_item(
-            "offset",
-            if hit.kind == "tar" {
-                hit.offset + 257
-            } else {
-                hit.offset
-            },
-        )?;
-        row.set_item("source", "detection_embedded_scan")?;
-        hit_rows.append(row)?;
-    }
-    result.set_item("hits", hit_rows)?;
-    let rows = PyList::empty(py);
-    for candidate in scan.candidates {
-        let row = PyDict::new(py);
-        row.set_item("format", candidate.format)?;
-        row.set_item("offset", candidate.offset)?;
-        row.set_item("end_offset", candidate.end_offset)?;
-        row.set_item("confidence", candidate.confidence)?;
-        row.set_item("validation", candidate.validation)?;
-        row.set_item("candidate_kind", candidate.candidate_kind)?;
-        row.set_item("boundary_kind", candidate.boundary_kind)?;
-        row.set_item("extractable", candidate.extractable)?;
-        rows.append(row)?;
-    }
-    result.set_item("candidates", rows)?;
-    Ok(result.unbind())
+    scan.to_py_dict(py)
 }
 
 fn embedded_matcher() -> &'static AhoCorasick {

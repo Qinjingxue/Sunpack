@@ -5,9 +5,10 @@ use regex::{RegexSet, RegexSetBuilder};
 use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use crate::analysis_native::volume_anchor::{
@@ -26,25 +27,25 @@ struct DirectoryEntryRecord {
 }
 
 #[derive(Debug)]
-struct DirectorySnapshotTable {
-    paths: Vec<String>,
-    is_dirs: Vec<bool>,
-    sizes: Vec<Option<u64>>,
+pub(crate) struct DirectorySnapshotTable {
+    pub(crate) paths: Vec<String>,
+    pub(crate) is_dirs: Vec<bool>,
+    pub(crate) sizes: Vec<Option<u64>>,
     mtimes_ns: Vec<Option<u64>>,
     relation_member_eligible: Vec<bool>,
-    relation_anchors: Vec<Option<VolumeAnchor>>,
-    file_routes: Vec<u8>,
+    pub(crate) relation_anchors: Vec<Option<VolumeAnchor>>,
+    pub(crate) file_routes: Vec<u8>,
 }
 
-const FILE_ROUTE_RELATIONS: u8 = 1;
-const FILE_ROUTE_DETECTION: u8 = 2;
-const FILE_ROUTE_RESIDUAL: u8 = 3;
+pub(crate) const FILE_ROUTE_RELATIONS: u8 = 1;
+pub(crate) const FILE_ROUTE_DETECTION: u8 = 2;
+pub(crate) const FILE_ROUTE_RESIDUAL: u8 = 3;
 const FORMAT_REJECT_TAR: u32 = 1 << 3;
 
 #[pyclass(module = "sunpack_native", frozen)]
 pub(crate) struct NativeDirectorySnapshot {
-    table: Arc<DirectorySnapshotTable>,
-    rows: Vec<usize>,
+    pub(crate) table: Arc<DirectorySnapshotTable>,
+    pub(crate) rows: Vec<usize>,
 }
 
 impl NativeDirectorySnapshot {
@@ -93,10 +94,7 @@ impl NativeDirectorySnapshot {
             file_routes: Vec::with_capacity(records.len()),
         };
         for record in records {
-            let route = filesystem_file_route(
-                record.is_dir,
-                record.relation_anchor.as_ref(),
-            );
+            let route = filesystem_file_route(record.is_dir, record.relation_anchor.as_ref());
             table.paths.push(record.path);
             table.is_dirs.push(record.is_dir);
             table.sizes.push(record.size);
@@ -179,11 +177,7 @@ impl NativeDirectorySnapshot {
     }
 }
 
-
-fn filesystem_file_route(
-    is_dir: bool,
-    anchor: Option<&VolumeAnchor>,
-) -> u8 {
+fn filesystem_file_route(is_dir: bool, anchor: Option<&VolumeAnchor>) -> u8 {
     if is_dir {
         return 0;
     }
@@ -205,7 +199,7 @@ fn filesystem_file_route(
     FILE_ROUTE_RESIDUAL
 }
 
-fn filesystem_route_name(route: u8) -> &'static str {
+pub(crate) fn filesystem_route_name(route: u8) -> &'static str {
     match route {
         FILE_ROUTE_DETECTION => "detection",
         FILE_ROUTE_RELATIONS => "relations",
@@ -213,7 +207,7 @@ fn filesystem_route_name(route: u8) -> &'static str {
     }
 }
 
-fn filesystem_logical_name(path: &str) -> String {
+pub(crate) fn filesystem_logical_name(path: &str) -> String {
     let filename = path
         .rsplit(|ch| ch == '/' || ch == '\\')
         .next()
@@ -360,6 +354,9 @@ pub(crate) struct OutputInventoryVerificationSnapshot {
 }
 
 impl NativeOutputInventory {
+    pub(crate) fn fact_index_source(&self) -> (String, Arc<Vec<OutputFileRecord>>) {
+        (self.root.clone(), Arc::clone(&self.files))
+    }
     pub(crate) fn records(&self) -> &Arc<Vec<OutputFileRecord>> {
         &self.files
     }
@@ -385,7 +382,9 @@ pub(crate) fn rebase_output_inventory_root_impl(
     for item in inventory.files.iter() {
         let mut item = item.clone();
         for slot in [&mut item.abs_path, &mut item.output_path] {
-            let Some(raw) = slot.as_ref() else { continue; };
+            let Some(raw) = slot.as_ref() else {
+                continue;
+            };
             let path = Path::new(raw);
             if !path.is_absolute() {
                 continue;
@@ -406,7 +405,11 @@ pub(crate) fn rebase_output_inventory_root_impl(
         total_size: inventory.total_size,
         transient_file_count: inventory.transient_file_count,
         unreadable_count: inventory.unreadable_count,
-        files: if changed { Arc::new(files) } else { Arc::clone(&inventory.files) },
+        files: if changed {
+            Arc::new(files)
+        } else {
+            Arc::clone(&inventory.files)
+        },
         worker_crc_available: inventory.worker_crc_available,
         worker_inventory_complete: inventory.worker_inventory_complete,
         identity_paths: inventory.identity_paths,
@@ -481,10 +484,14 @@ impl NativeOutputInventory {
         let mut seen = HashSet::new();
         let mut directories = Vec::new();
         for item in self.files.iter() {
-            let path = item.abs_path.as_deref().map(PathBuf::from).unwrap_or_else(|| {
-                let relative = item.output_path.as_ref().unwrap_or(&item.path);
-                root.join(relative)
-            });
+            let path = item
+                .abs_path
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| {
+                    let relative = item.output_path.as_ref().unwrap_or(&item.path);
+                    root.join(relative)
+                });
             if !path.starts_with(root) {
                 continue;
             }
@@ -606,19 +613,11 @@ impl NativeOutputInventory {
         let mut records = build_inventory_snapshot_views(&self.root, self.files.as_ref(), &options);
         populate_relation_anchors(&mut records.raw);
         let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
-        Ok((
-            Py::new(py, filtered)?,
-            Py::new(py, raw)?,
-        ))
+        Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
     }
 
     #[pyo3(signature = (offset=0, limit=128))]
-    fn file_page(
-        &self,
-        py: Python<'_>,
-        offset: usize,
-        limit: usize,
-    ) -> PyResult<Vec<Py<PyDict>>> {
+    fn file_page(&self, py: Python<'_>, offset: usize, limit: usize) -> PyResult<Vec<Py<PyDict>>> {
         output_file_page(py, &self.files, offset, limit)
     }
 }
@@ -769,17 +768,14 @@ impl NativeDirectorySnapshot {
         (paths, sizes, mtimes_ns)
     }
 
-
-    fn file_route_view(&self, route: u8) -> Self {
+    pub(crate) fn file_route_view(&self, route: u8) -> Self {
         Self {
             table: Arc::clone(&self.table),
             rows: self
                 .rows
                 .iter()
                 .copied()
-                .filter(|&row| {
-                    !self.table.is_dirs[row] && self.table.file_routes[row] == route
-                })
+                .filter(|&row| !self.table.is_dirs[row] && self.table.file_routes[row] == route)
                 .collect(),
         }
     }
@@ -823,9 +819,7 @@ impl NativeDirectorySnapshot {
                 anchor
                     .map(|value| value.format.to_ascii_lowercase())
                     .unwrap_or_default(),
-                anchor
-                    .map(|value| value.format_reject_mask)
-                    .unwrap_or(0),
+                anchor.map(|value| value.format_reject_mask).unwrap_or(0),
                 filesystem_logical_name(path),
             ));
         }
@@ -848,25 +842,15 @@ impl NativeDirectorySnapshot {
         let mut formats = Vec::with_capacity(estimated);
         let mut reject_masks = Vec::with_capacity(estimated);
         for &row in &self.rows {
-            if self.table.is_dirs[row]
-                || self.table.file_routes[row] == FILE_ROUTE_RELATIONS
-            {
+            if self.table.is_dirs[row] || self.table.file_routes[row] == FILE_ROUTE_RELATIONS {
                 continue;
             }
             let anchor = self.table.relation_anchors[row].as_ref();
             paths.push(self.table.paths[row].clone());
             sizes.push(self.table.sizes[row]);
             routes.push(self.table.file_routes[row]);
-            formats.push(
-                anchor
-                    .map(|value| value.format.clone())
-                    .unwrap_or_default(),
-            );
-            reject_masks.push(
-                anchor
-                    .map(|value| value.format_reject_mask)
-                    .unwrap_or(0),
-            );
+            formats.push(anchor.map(|value| value.format.clone()).unwrap_or_default());
+            reject_masks.push(anchor.map(|value| value.format_reject_mask).unwrap_or(0));
         }
         (paths, sizes, routes, formats, reject_masks)
     }
@@ -1144,10 +1128,7 @@ pub(crate) fn scan_directory_snapshots(
     let mut records = scan_directory_views(root_path, max_depth, &options)?;
     populate_relation_anchors(&mut records.raw);
     let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
-    Ok((
-        Py::new(py, filtered)?,
-        Py::new(py, raw)?,
-    ))
+    Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
 }
 
 #[pyfunction]
@@ -1172,8 +1153,7 @@ pub(crate) fn directory_snapshot_from_columns(
             "directory snapshot columns must have equal lengths",
         ));
     }
-    let relation_member_eligible = relation_member_eligible
-        .unwrap_or_else(|| vec![true; length]);
+    let relation_member_eligible = relation_member_eligible.unwrap_or_else(|| vec![true; length]);
     let mut records = paths
         .into_iter()
         .zip(is_dirs)
@@ -1181,23 +1161,18 @@ pub(crate) fn directory_snapshot_from_columns(
         .zip(mtimes_ns)
         .zip(relation_member_eligible)
         .map(
-            |((((path, is_dir), size), mtime_ns), relation_member_eligible)| {
-                DirectoryEntryRecord {
-                    path,
-                    is_dir,
-                    size,
-                    mtime_ns,
-                    relation_member_eligible,
-                    relation_anchor: None,
-                }
+            |((((path, is_dir), size), mtime_ns), relation_member_eligible)| DirectoryEntryRecord {
+                path,
+                is_dir,
+                size,
+                mtime_ns,
+                relation_member_eligible,
+                relation_anchor: None,
             },
         )
         .collect::<Vec<_>>();
     populate_relation_anchors(&mut records);
-    Py::new(
-        py,
-        NativeDirectorySnapshot::from_records(records),
-    )
+    Py::new(py, NativeDirectorySnapshot::from_records(records))
 }
 
 #[pyfunction]
@@ -1670,7 +1645,6 @@ pub(crate) fn output_inventory_from_serialized(
     })
 }
 
-
 #[pyfunction]
 #[pyo3(signature = (rows, complete, file_count, dir_count, total_size, identity_paths=false))]
 pub(crate) fn worker_manifest_from_rows(
@@ -1806,6 +1780,7 @@ fn py_dict_bool(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<bool>> {
     value.extract::<bool>().map(Some)
 }
 
+#[derive(Clone)]
 struct FileHeadRecord {
     path: String,
     exists: bool,
@@ -1813,6 +1788,245 @@ struct FileHeadRecord {
     size: Option<u64>,
     mtime_ns: Option<u64>,
     magic: Vec<u8>,
+}
+
+struct CachedHeadFact {
+    record: FileHeadRecord,
+    magic_complete: bool,
+}
+
+struct InventoryHeadIndex {
+    root: String,
+    root_key: String,
+    root_prefix: String,
+    files: Arc<Vec<OutputFileRecord>>,
+    hashes: Vec<(u64, usize)>,
+}
+
+impl InventoryHeadIndex {
+    fn build(root: String, files: Arc<Vec<OutputFileRecord>>) -> Self {
+        let root_key = inventory_path_key(&root);
+        let hashes = files
+            .iter()
+            .enumerate()
+            .map(|(index, item)| {
+                let path = output_record_path(&root, item);
+                (hash_path_key(&inventory_path_key(&path)), index)
+            })
+            .collect::<Vec<_>>();
+        let mut hashes = hashes;
+        hashes.sort_unstable();
+        Self {
+            root,
+            root_prefix: format!("{}\\", root_key),
+            root_key,
+            files,
+            hashes,
+        }
+    }
+
+    fn contains_path(&self, key: &str) -> bool {
+        key == self.root_key || key.starts_with(&self.root_prefix)
+    }
+
+    fn find(&self, key: &str) -> Option<(String, &OutputFileRecord)> {
+        let hash = hash_path_key(key);
+        let mut index = self.hashes.partition_point(|(value, _)| *value < hash);
+        while let Some((value, row)) = self.hashes.get(index) {
+            if *value != hash {
+                break;
+            }
+            let record = &self.files[*row];
+            let path = output_record_path(&self.root, record);
+            if inventory_path_key(&path) == key {
+                return Some((path, record));
+            }
+            index += 1;
+        }
+        None
+    }
+}
+
+fn output_record_path(root: &str, item: &OutputFileRecord) -> String {
+    item.abs_path.clone().unwrap_or_else(|| {
+        let relative = item.output_path.as_ref().unwrap_or(&item.path);
+        path_to_string(&Path::new(root).join(relative))
+    })
+}
+
+fn hash_path_key(key: &str) -> u64 {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    hasher.finish()
+}
+
+#[pyclass(module = "sunpack_native")]
+#[derive(Default)]
+pub(crate) struct NativeHeadFactCache {
+    state: Mutex<HeadFactState>,
+}
+
+#[derive(Default)]
+struct HeadFactState {
+    facts: HashMap<String, CachedHeadFact>,
+    inventories: Vec<Arc<InventoryHeadIndex>>,
+}
+
+#[pymethods]
+impl NativeHeadFactCache {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn __len__(&self) -> usize {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .facts
+            .len()
+    }
+
+    fn prime_inventory(&self, py: Python<'_>, inventory: PyRef<'_, NativeOutputInventory>) {
+        let (root, files) = inventory.fact_index_source();
+        let index = Arc::new(py.detach(|| InventoryHeadIndex::build(root, files)));
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .inventories
+            .push(index);
+    }
+
+    fn facts_for_paths(
+        &self,
+        py: Python<'_>,
+        paths: Vec<String>,
+        magic_size: usize,
+    ) -> PyResult<Vec<Py<PyDict>>> {
+        let requested = paths
+            .into_iter()
+            .map(|path| (inventory_path_key(&path), path))
+            .collect::<Vec<_>>();
+        let (missing, inventories) = {
+            let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let missing = requested
+                .iter()
+                .filter(|(key, _)| {
+                    state.facts.get(key).is_none_or(|fact| {
+                        fact.record.is_file
+                            && fact.record.magic.len() < magic_size
+                            && fact
+                                .record
+                                .size
+                                .is_none_or(|size| size > fact.record.magic.len() as u64)
+                    })
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            (missing, state.inventories.clone())
+        };
+        let records = py.detach(|| {
+            missing
+                .into_par_iter()
+                .map(|(key, path)| {
+                    if let Some(inventory) = inventories
+                        .iter()
+                        .find(|inventory| inventory.contains_path(&key))
+                    {
+                        if let Some((stored_path, item)) = inventory.find(&key) {
+                            if item.magic.len() >= magic_size
+                                || item.size <= item.magic.len() as u64
+                            {
+                                let len = magic_size.min(item.magic.len());
+                                return (
+                                    key,
+                                    CachedHeadFact {
+                                        record: FileHeadRecord {
+                                            path: stored_path,
+                                            exists: true,
+                                            is_file: true,
+                                            size: Some(item.size),
+                                            mtime_ns: item.mtime_ns,
+                                            magic: item.magic[..len].to_vec(),
+                                        },
+                                        magic_complete: true,
+                                    },
+                                );
+                            }
+                            let record = file_head_record(stored_path, magic_size);
+                            let complete = !record.exists
+                                || !record.is_file
+                                || record.magic.len() >= magic_size
+                                || record
+                                    .size
+                                    .is_some_and(|size| size <= record.magic.len() as u64);
+                            return (
+                                key,
+                                CachedHeadFact {
+                                    record,
+                                    magic_complete: complete,
+                                },
+                            );
+                        }
+                        return (
+                            key,
+                            CachedHeadFact {
+                                record: FileHeadRecord {
+                                    path,
+                                    exists: false,
+                                    is_file: false,
+                                    size: None,
+                                    mtime_ns: None,
+                                    magic: Vec::new(),
+                                },
+                                magic_complete: true,
+                            },
+                        );
+                    }
+                    let record = file_head_record(path, magic_size);
+                    (
+                        key,
+                        CachedHeadFact {
+                            record,
+                            magic_complete: magic_size > 0,
+                        },
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        for (key, mut fact) in records {
+            if let Some(existing) = state.facts.get(&key) {
+                if existing.record.size == fact.record.size
+                    && existing.record.mtime_ns == fact.record.mtime_ns
+                    && existing.record.magic.len() > fact.record.magic.len()
+                {
+                    fact.record.magic = existing.record.magic.clone();
+                    fact.magic_complete = existing.magic_complete;
+                }
+            }
+            state.facts.insert(key, fact);
+        }
+        let mut output = Vec::with_capacity(requested.len());
+        for (key, _) in requested {
+            let Some(fact) = state.facts.get(&key) else {
+                continue;
+            };
+            let row = fact.record.clone().into_py_dict(py)?;
+            row.bind(py).set_item(
+                "magic_complete",
+                fact.magic_complete
+                    && (!fact.record.is_file
+                        || fact.record.magic.len() >= magic_size
+                        || fact
+                            .record
+                            .size
+                            .is_some_and(|size| size <= fact.record.magic.len() as u64)),
+            )?;
+            output.push(row);
+        }
+        Ok(output)
+    }
 }
 
 impl FileHeadRecord {
@@ -2008,9 +2222,7 @@ fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
         .iter()
         .enumerate()
         .filter_map(|(index, record)| {
-            (!record.is_dir
-                && record.relation_member_eligible
-                && record.relation_anchor.is_none())
+            (!record.is_dir && record.relation_member_eligible && record.relation_anchor.is_none())
                 .then_some(index)
         })
         .collect();
@@ -2029,7 +2241,8 @@ fn populate_relation_anchors(records: &mut [DirectoryEntryRecord]) {
         }
     }
     let mut known_anchors = probe_volume_anchor_records_cheap(&known_size_inputs).into_iter();
-    let mut unknown_anchors = probe_volume_anchor_paths_cheap(&unknown_size_inputs, None).into_iter();
+    let mut unknown_anchors =
+        probe_volume_anchor_paths_cheap(&unknown_size_inputs, None).into_iter();
     for index in eligible_indices {
         let anchor = if records[index].size.is_some() {
             known_anchors.next()

@@ -45,15 +45,27 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<watch_store::NativeWatchReplay>()?;
     m.add_function(wrap_pyfunction!(watch_store::watch_path_key, m)?)?;
     m.add_class::<watch_journal::NativeJournalTicket>()?;
-    m.add_function(wrap_pyfunction!(watch_journal::watch_journal_submit_append, m)?)?;
-    m.add_function(wrap_pyfunction!(watch_journal::watch_journal_submit_seal, m)?)?;
-    m.add_function(wrap_pyfunction!(watch_journal::watch_journal_request_flush, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        watch_journal::watch_journal_submit_append,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        watch_journal::watch_journal_submit_seal,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        watch_journal::watch_journal_request_flush,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_seed, m)?)?;
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_flush_all, m)?)?;
     m.add_function(wrap_pyfunction!(watch_journal::watch_journal_stats, m)?)?;
     m.add_function(wrap_pyfunction!(io::reader::reader_cache_stats, m)?)?;
     m.add_function(wrap_pyfunction!(io::reader::clear_reader_resources, m)?)?;
-    m.add_function(wrap_pyfunction!(io::runtime_binary::runtime_binary_build_id, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        io::runtime_binary::runtime_binary_build_id,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(
         io::resource_lifecycle::native_resource_snapshot,
         m
@@ -82,11 +94,21 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<analysis_native::AnalysisMultiVolumeView>()?;
     m.add_function(wrap_pyfunction!(analysis_native::probe_rar_bytes, m)?)?;
     m.add_class::<analysis_native::NativeAnalysisConfig>()?;
-    m.add_function(wrap_pyfunction!(analysis_native::confirm_format_identity, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        analysis_native::confirm_format_identity,
+        m
+    )?)?;
     m.add_class::<io::reader::NativeArchiveSession>()?;
     m.add_class::<scan::directory::NativeDirectorySnapshot>()?;
+    m.add_class::<scan::discovery::NativeCandidateTable>()?;
+    m.add_class::<scan::discovery::NativeDiscoveryRoutes>()?;
+    m.add_class::<scan::discovery::NativeEmbeddedBatch>()?;
     m.add_class::<scan::directory::NativeOutputInventory>()?;
-    m.add_function(wrap_pyfunction!(scan::directory::rebase_output_inventory_root, m)?)?;
+    m.add_class::<scan::directory::NativeHeadFactCache>()?;
+    m.add_function(wrap_pyfunction!(
+        scan::directory::rebase_output_inventory_root,
+        m
+    )?)?;
     m.add_class::<scan::directory::NativeWorkerManifest>()?;
     m.add_class::<verification::archive_manifest::NativeArchiveManifest>()?;
     m.add_function(wrap_pyfunction!(scan::magic::scan_after_markers, m)?)?;
@@ -165,9 +187,18 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<scan::worker_event::NativeOutputTrace>()?;
     m.add_function(wrap_pyfunction!(scan::worker_event::parse_worker_event, m)?)?;
     m.add_class::<scan::progress_manifest::NativeProgressManifest>()?;
-    m.add_function(wrap_pyfunction!(scan::progress_manifest::build_progress_manifest, m)?)?;
-    m.add_function(wrap_pyfunction!(scan::progress_manifest::complete_progress_manifest, m)?)?;
-    m.add_function(wrap_pyfunction!(scan::progress_manifest::load_progress_manifest, m)?)?;
+    m.add_function(wrap_pyfunction!(
+        scan::progress_manifest::build_progress_manifest,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        scan::progress_manifest::complete_progress_manifest,
+        m
+    )?)?;
+    m.add_function(wrap_pyfunction!(
+        scan::progress_manifest::load_progress_manifest,
+        m
+    )?)?;
     m.add_function(wrap_pyfunction!(
         verification::file_crc::compute_directory_crc_manifest,
         m

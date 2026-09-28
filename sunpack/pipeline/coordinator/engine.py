@@ -22,6 +22,7 @@ from sunpack.pipeline.coordinator.recursion import RecursionController
 from sunpack.pipeline.coordinator.reporting import RunReporter
 from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
+from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.core.i18n import I18nContext
@@ -1058,7 +1059,13 @@ class _RequestRuntime:
         if group is None:
             return None
         candidate = relation_group_to_candidate(group)
-        replacement = self.task_scanner.provider.task_from_candidate(candidate)
+        replacement = ArchiveTask.from_archive_input(
+            candidate.archive_input,
+            discovery_source="relations",
+            carrier_path=candidate.carrier_path,
+            cleanup_paths=candidate.cleanup_paths,
+            discovery_evidence=dict(candidate.relation_anchor),
+        )
         if replacement is not None:
             replacement.runtime["volume_retry_attempted"] = True
             replacement.runtime["volume_retry_basis"] = [

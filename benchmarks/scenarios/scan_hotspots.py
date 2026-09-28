@@ -289,19 +289,20 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
     recorder.wrap(group_builder.RelationsGroupBuilder, "build_candidate_groups", "relations.builder.build_candidate_groups")
     recorder.wrap(relation_resolver.RelationResolver, "resolve", "relations.resolve")
 
-    recorder.wrap(scan_session, "_native_batch_file_head_facts", "native.batch_file_head_facts")
     recorder.wrap(scan_session.DiscoveryScanSession, "snapshot_for_directory", "session.snapshot_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "shallow_snapshot_for_directory", "session.shallow_snapshot_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "relation_groups_for_directory", "session.relation_groups_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "candidates_for_directory", "session.candidates_for_directory")
+    recorder.wrap(scan_session.DiscoveryScanSession, "native_table_for_directory", "session.native_table_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "file_head_facts_for_paths", "session.file_head_facts_for_paths")
     recorder.wrap(scan_session.DiscoveryScanSession, "directory_identity_for_path", "session.directory_identity_for_path")
 
     recorder.wrap(target_scan, "build_candidates_for_targets", "coordinator.build_candidates")
+    recorder.wrap(target_scan, "build_native_table_for_targets", "coordinator.build_native_table")
     recorder.wrap(detection_scheduler.DetectionScheduler, "confirm", "detection.confirm_candidate")
     recorder.wrap(detection_confirmation.FormatConfirmation, "confirm", "detection.confirm_stage")
     recorder.wrap(embedded_discovery.EmbeddedDiscovery, "discover", "embedded.discover")
-    recorder.wrap(discovery.ArchiveDiscoveryPipeline, "discover", "discovery.compose")
+    recorder.wrap(discovery.ArchiveDiscoveryPipeline, "discover_native", "discovery.compose_native")
 
     recorder.wrap(task_provider.ArchiveTaskProvider, "discover_targets", "task_provider.discover_targets")
     recorder.wrap(task_provider.ArchiveTaskProvider, "scan_targets", "task_provider.scan_targets")
@@ -315,11 +316,7 @@ def summarize_scan_session(session: Any | None) -> dict[str, Any]:
     return {
         "snapshots": len(getattr(session, "_snapshots", {}) or {}),
         "relation_groups": len(getattr(session, "_relation_groups", {}) or {}),
-        "candidates": sum(
-            len(items)
-            for items in (getattr(session, "_candidates", {}) or {}).values()
-        ),
-        "file_head_facts": len(getattr(session, "_file_head_facts", {}) or {}),
+        "file_head_facts": len(getattr(session, "_head_facts", ())),
         "scan_roots": list(getattr(session, "_scan_roots", []) or []),
     }
 
@@ -342,23 +339,23 @@ def run_mode(mode: str, target: str, max_depth: int | None, config: dict) -> tup
 
     if mode in {"candidates", "evaluate"}:
         from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
-        from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+        from sunpack.pipeline.coordinator.target_scan import build_native_table_for_targets
         from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 
         session = DiscoveryScanSession(config=config)
-        candidates = build_candidates_for_targets([target_path], session=session, config=config)
-        extra["candidates"] = len(candidates)
+        table = build_native_table_for_targets([target_path], session=session, config=config)
+        extra["candidates"] = len(table)
         if mode == "candidates":
             extra["scan_session"] = summarize_scan_session(session)
-            return candidates, extra
+            return table, extra
 
         provider = ArchiveTaskProvider(config)
-        discovery_result = provider.discovery.discover(candidates)
-        extra["resolved_inputs"] = len(discovery_result.resolved_inputs)
+        discovery_result = provider.discovery.discover_native(table, session, include_details=False)
+        extra["resolved_inputs"] = len(discovery_result.resolved_tasks)
         extra["blocked_paths"] = len(discovery_result.blocked_paths)
         extra["residual_paths"] = len(discovery_result.residual_paths)
         extra["scan_session"] = summarize_scan_session(session)
-        return discovery_result.resolved_inputs, extra
+        return discovery_result.resolved_tasks, extra
 
     if mode == "full":
         from sunpack.pipeline.coordinator.scanner import ScanOrchestrator

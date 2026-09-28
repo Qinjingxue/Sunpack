@@ -104,7 +104,10 @@ impl NativeOutputTrace {
 
 /// Parse one worker line (``bytes`` or ``str``); ``None`` when it is not a JSON object event.
 #[pyfunction]
-pub(crate) fn parse_worker_event(py: Python<'_>, line: &Bound<'_, PyAny>) -> PyResult<Option<Py<PyDict>>> {
+pub(crate) fn parse_worker_event(
+    py: Python<'_>,
+    line: &Bound<'_, PyAny>,
+) -> PyResult<Option<Py<PyDict>>> {
     let text: Cow<'_, str> = if let Ok(bytes) = line.cast::<PyBytes>() {
         String::from_utf8_lossy(bytes.as_bytes())
     } else {
@@ -115,13 +118,21 @@ pub(crate) fn parse_worker_event(py: Python<'_>, line: &Bound<'_, PyAny>) -> PyR
         return Ok(None);
     }
     let mut deserializer = serde_json::Deserializer::from_str(text);
-    let Ok(value) = PySeed { py, scope: Scope::Root }.deserialize(&mut deserializer) else {
+    let Ok(value) = PySeed {
+        py,
+        scope: Scope::Root,
+    }
+    .deserialize(&mut deserializer) else {
         return Ok(None);
     };
     if deserializer.end().is_err() {
         return Ok(None);
     }
-    Ok(value.bind(py).cast::<PyDict>().ok().map(|dict| dict.clone().unbind()))
+    Ok(value
+        .bind(py)
+        .cast::<PyDict>()
+        .ok()
+        .map(|dict| dict.clone().unbind()))
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -187,7 +198,10 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let list = PyList::empty(self.py);
-        while let Some(value) = seq.next_element_seed(PySeed { py: self.py, scope: Scope::Plain })? {
+        while let Some(value) = seq.next_element_seed(PySeed {
+            py: self.py,
+            scope: Scope::Plain,
+        })? {
             list.append(value).map_err(py_error)?;
         }
         Ok(list.into_any().unbind())
@@ -209,11 +223,17 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
                     let columns = map.next_value::<[u64; 5]>()?;
                     let summary = PyDict::new(py);
                     let entries: [(&str, Py<PyAny>); 5] = [
-                        ("complete", (columns[0] != 0).into_py_any(py).map_err(py_error)?),
+                        (
+                            "complete",
+                            (columns[0] != 0).into_py_any(py).map_err(py_error)?,
+                        ),
                         ("file_count", columns[1].into_py_any(py).map_err(py_error)?),
                         ("dir_count", columns[2].into_py_any(py).map_err(py_error)?),
                         ("total_size", columns[3].into_py_any(py).map_err(py_error)?),
-                        ("identity_paths", (columns[4] != 0).into_py_any(py).map_err(py_error)?),
+                        (
+                            "identity_paths",
+                            (columns[4] != 0).into_py_any(py).map_err(py_error)?,
+                        ),
                     ];
                     for (name, value) in entries {
                         summary.set_item(name, value).map_err(py_error)?;
@@ -224,8 +244,13 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
                 }
                 (Scope::OutputTrace, "items") => {
                     let items = map.next_value::<Vec<OutputTraceItem>>()?;
-                    let native = Py::new(py, NativeOutputTrace { items: Arc::new(items) })
-                        .map_err(py_error)?;
+                    let native = Py::new(
+                        py,
+                        NativeOutputTrace {
+                            items: Arc::new(items),
+                        },
+                    )
+                    .map_err(py_error)?;
                     dict.set_item("native_items", native).map_err(py_error)?;
                     continue;
                 }
@@ -256,7 +281,22 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
 /// `verified_manifest.rows` v3: one fixed 14-column array per regular file.
 struct WorkerRows(Vec<OutputFileRecord>);
 
-type WorkerRow = (u32, String, String, u64, u64, u8, u32, u8, u32, u8, u8, u8, u64, String);
+type WorkerRow = (
+    u32,
+    String,
+    String,
+    u64,
+    u64,
+    u8,
+    u32,
+    u8,
+    u32,
+    u8,
+    u8,
+    u8,
+    u64,
+    String,
+);
 
 impl<'de> Deserialize<'de> for WorkerRows {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {

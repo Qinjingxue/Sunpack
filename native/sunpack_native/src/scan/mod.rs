@@ -1,5 +1,6 @@
 pub(crate) mod compression_stream;
 pub(crate) mod directory;
+pub(crate) mod discovery;
 pub(crate) mod embedded;
 pub(crate) mod executable_carrier;
 pub(crate) mod magic;

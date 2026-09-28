@@ -1,5 +1,5 @@
-use std::io::{Read, Seek, SeekFrom};
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::sync::OnceLock;
 
 use crc32fast::hash as crc32;
@@ -8,10 +8,10 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use rayon::prelude::*;
 
+use crate::analysis_native::structure::unified_prefilter_mask_from_head;
 use crate::io::reader::ManagedReader;
 use crate::io::resource_lifecycle::TrackedFile;
 use crate::password::rar::{rar4_decrypt_header_flags, rar5_decrypt_main_header};
-use crate::analysis_native::structure::unified_prefilter_mask_from_head;
 use crate::scan::pe_overlay::pe_headers_plausible;
 
 const SEVEN_ZIP: &[u8] = b"7z\xbc\xaf'\x1c";
@@ -99,9 +99,9 @@ pub(crate) fn probe_volume_anchors(
     py.detach(|| {
         probe_volume_anchor_paths(&paths, prefix_limit, tail_limit, path_passwords.as_deref())
     })
-        .into_iter()
-        .map(|anchor| anchor.into_dict(py))
-        .collect()
+    .into_iter()
+    .map(|anchor| anchor.into_dict(py))
+    .collect()
 }
 
 pub(crate) fn probe_volume_anchor_paths(
@@ -132,9 +132,7 @@ pub(crate) fn probe_volume_anchor_paths_cheap(
     )
 }
 
-pub(crate) fn probe_volume_anchor_records_cheap(
-    records: &[(String, u64)],
-) -> Vec<VolumeAnchor> {
+pub(crate) fn probe_volume_anchor_records_cheap(records: &[(String, u64)]) -> Vec<VolumeAnchor> {
     cheap_fast_probe_pool().install(|| {
         records
             .par_iter()
@@ -143,11 +141,7 @@ pub(crate) fn probe_volume_anchor_records_cheap(
     })
 }
 
-pub(crate) fn probe_volume_anchor_from_head(
-    path: &str,
-    size: u64,
-    head: &[u8],
-) -> VolumeAnchor {
+pub(crate) fn probe_volume_anchor_from_head(path: &str, size: u64, head: &[u8]) -> VolumeAnchor {
     let prefix_len = head.len().min(size.min(512) as usize);
     let mut result = VolumeAnchor {
         path: path.to_string(),
@@ -411,8 +405,7 @@ fn open_cheap_file(path: &str) -> std::io::Result<TrackedFile> {
 }
 
 fn probe_zip_split_marker(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
-    if !prefix.starts_with(ZIP_SPLIT_MARKER)
-        || !plausible_zip_local(prefix, ZIP_SPLIT_MARKER.len())
+    if !prefix.starts_with(ZIP_SPLIT_MARKER) || !plausible_zip_local(prefix, ZIP_SPLIT_MARKER.len())
     {
         return false;
     }
@@ -451,13 +444,7 @@ fn probe_zip_eocd_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
     true
 }
 
-
-fn probe_rar(
-    prefix: &[u8],
-    offset: usize,
-    out: &mut VolumeAnchor,
-    password: Option<&str>,
-) -> bool {
+fn probe_rar(prefix: &[u8], offset: usize, out: &mut VolumeAnchor, password: Option<&str>) -> bool {
     if prefix
         .get(offset..)
         .is_some_and(|value| value.starts_with(RAR5))
@@ -482,8 +469,7 @@ fn probe_rar(
                     out.wrong_password = false;
                     out.multivolume = archive_flags & 0x01 != 0;
                     if out.multivolume {
-                        out.internal_volume_number =
-                            Some(number.unwrap_or(0).saturating_add(1));
+                        out.internal_volume_number = Some(number.unwrap_or(0).saturating_add(1));
                         out.anchor_roles
                             .push(if number.is_none() { "first" } else { "member" });
                         out.evidence.push("rar5:volume_header");
@@ -550,8 +536,8 @@ fn probe_rar(
             out.anchor_roles.push("standalone");
             out.evidence.push("rar4:single_archive_header");
         }
-    } else if let Some(flags) = password
-        .and_then(|password| rar4_decrypt_header_flags(&prefix[offset..], password))
+    } else if let Some(flags) =
+        password.and_then(|password| rar4_decrypt_header_flags(&prefix[offset..], password))
     {
         initialize_rar_anchor(out, offset);
         out.encrypted = true;
@@ -842,7 +828,6 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
     true
 }
 
-
 pub(crate) fn probe_volume_anchor_at_offset(
     path: &str,
     offset: u64,
@@ -923,7 +908,6 @@ pub(crate) fn probe_volume_anchor_at_offset(
     }
     result
 }
-
 
 fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor) {
     let format = if prefix.starts_with(b"\x1f\x8b") {
@@ -1063,7 +1047,10 @@ mod tests {
         assert!(anchor.encrypted);
         assert!(anchor.needs_password);
         assert!(!anchor.wrong_password);
-        assert!(!anchor.multivolume, "encrypted headers must not force multivolume");
+        assert!(
+            !anchor.multivolume,
+            "encrypted headers must not force multivolume"
+        );
         assert!(!anchor.standalone);
         assert!(anchor.anchor_roles.contains(&"encrypted_volume"));
     }

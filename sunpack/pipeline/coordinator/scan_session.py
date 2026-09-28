@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from sunpack_native import batch_file_head_facts as _native_batch_file_head_facts
+from sunpack_native import NativeCandidateTable, NativeHeadFactCache
 
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.core.contracts.filesystem import DirectorySnapshot, FILESYSTEM_ROUTE_RELATIONS
@@ -28,9 +28,7 @@ class DiscoveryScanSession:
         self._snapshots: dict[str, DirectorySnapshot] = {}
         self._relation_groups: dict[str, list[CandidateGroup]] = {}
         self._relation_group_signatures: dict[str, str] = {}
-        self._candidates: dict[str, list[DiscoveryCandidate]] = {}
-        self._file_head_facts: dict[str, dict[str, Any]] = {}
-        self._output_inventories: list[Any] = []
+        self._head_facts = NativeHeadFactCache()
         self._directory_identities: dict[str, tuple[str, int, str]] = {}
         self._scan_roots: list[str] = []
 
@@ -54,7 +52,7 @@ class DiscoveryScanSession:
     def prime_output_inventory(self, inventory: Any) -> None:
         if inventory is None:
             return
-        self._output_inventories.append(inventory)
+        self._head_facts.prime_inventory(inventory._native)
 
     def is_within_scan_scope(self, path: str) -> bool:
         if not self._scan_roots:
@@ -115,28 +113,42 @@ class DiscoveryScanSession:
         return self._relation_groups[cache_key]
 
     def candidates_for_directory(self, directory: str) -> list[DiscoveryCandidate]:
-        key = self._directory_key(directory)
-        if key not in self._candidates:
-            snapshot = self.snapshot_for_directory(directory)
-            groups = self.relation_groups_for_directory(
-                directory,
-                filesystem_routed=True,
-            )
-            candidates = [relation_group_to_candidate(group) for group in groups]
-            candidates.extend(
-                filesystem_candidate(
-                    path,
-                    size=size,
-                    route=route,
-                    format_hint=format_hint,
-                    reject_mask=reject_mask,
-                    logical_name=logical_name,
+        table = self.native_table_for_directory(directory)
+        return [self.project_native_candidate(table, index) for index in range(len(table))]
+
+    def native_table_for_directory(self, directory: str) -> NativeCandidateTable:
+        snapshot = self.snapshot_for_directory(directory)
+        table = NativeCandidateTable()
+        table.append_directory(snapshot.raw_native_snapshot, snapshot.native_snapshot)
+        encrypted = table.encrypted_rar_groups()
+        if encrypted:
+            builder = self.relations._builder
+            groups = [builder._candidate_group_from_native(raw) for raw in encrypted]
+            discovered = builder._discover_directory_passwords([group for group in groups if group is not None])
+            if discovered:
+                table.retry_relations(
+                    snapshot.raw_native_snapshot,
+                    snapshot.native_snapshot,
+                    [(str(path), str(password)) for path, password in discovered.items()],
                 )
-                for path, size, route, format_hint, reject_mask, logical_name
-                in snapshot.filesystem_candidate_specs()
+        return table
+
+    def project_native_candidate(self, table: NativeCandidateTable, index: int) -> DiscoveryCandidate:
+        kind, raw = table.project(index)
+        if kind == "file":
+            path, size, route, format_hint, reject_mask, logical_name = raw
+            return filesystem_candidate(
+                path,
+                size=size,
+                route=route,
+                format_hint=format_hint,
+                reject_mask=reject_mask,
+                logical_name=logical_name,
             )
-            self._candidates[key] = candidates
-        return self._candidates[key]
+        group = self.relations._builder._candidate_group_from_native(raw)
+        if group is None:
+            raise ValueError("native relations returned an invalid group")
+        return relation_group_to_candidate(group)
 
     def logical_name_for_archive(self, filename: str) -> str:
         return self.relations.logical_name_for_archive(filename)
@@ -149,87 +161,10 @@ class DiscoveryScanSession:
         paths_normalized: bool = False,
         copy_results: bool = True,
     ) -> dict[str, dict[str, Any]]:
+        del copy_results
         requested = [str(path) if paths_normalized else normalized_path(path) for path in paths if path]
-        keyed = [(path, path_key(path)) for path in requested]
-        missing = [
-            path for path, key in keyed
-            if self._file_head_fetch_needed_key(key, magic_size=magic_size)
-        ]
-        if missing:
-            filesystem_paths = list(missing)
-            for inventory in self._output_inventories:
-                root = normalized_path(getattr(inventory, "root", ""))
-                scoped = [
-                    path for path in filesystem_paths
-                    if root and (path_key(path) == path_key(root) or safe_relative_path(path, root) is not None)
-                ]
-                if not scoped:
-                    continue
-                rows = inventory.file_head_facts_for_paths(scoped, magic_size=magic_size)
-                resolved = set()
-                for row in rows:
-                    if not isinstance(row, dict) or not row.get("path"):
-                        continue
-                    key = path_key(row["path"])
-                    resolved.add(key)
-                    self._file_head_facts[key] = {
-                        "path": str(row["path"]),
-                        "exists": bool(row.get("exists", True)),
-                        "is_file": bool(row.get("is_file", True)),
-                        "size": row.get("size"),
-                        "mtime_ns": row.get("mtime_ns"),
-                        "magic": row.get("magic") if isinstance(row.get("magic"), bytes) else b"",
-                        "magic_complete": bool(row.get("magic_complete")),
-                    }
-                for path in scoped:
-                    key = path_key(path)
-                    if key not in resolved:
-                        self._file_head_facts[key] = {
-                            "path": path,
-                            "exists": False,
-                            "is_file": False,
-                            "size": None,
-                            "mtime_ns": None,
-                            "magic": b"",
-                            "magic_complete": True,
-                        }
-                scoped_keys = {path_key(path) for path in scoped}
-                filesystem_paths = [path for path in filesystem_paths if path_key(path) not in scoped_keys]
-
-            if filesystem_paths:
-                rows = _native_batch_file_head_facts(filesystem_paths, max(0, int(magic_size or 0)))
-                seen = set()
-                for row in rows:
-                    if not isinstance(row, dict) or not row.get("path"):
-                        continue
-                    key = path_key(row["path"])
-                    seen.add(key)
-                    existing = self._file_head_facts.get(key, {})
-                    magic = row.get("magic") if isinstance(row.get("magic"), bytes) else b""
-                    self._file_head_facts[key] = {
-                        "path": str(row["path"]),
-                        "exists": bool(row.get("exists")),
-                        "is_file": bool(row.get("is_file")),
-                        "size": row.get("size"),
-                        "mtime_ns": row.get("mtime_ns"),
-                        "magic": magic if magic_size > 0 else existing.get("magic", b""),
-                        "magic_complete": bool(magic_size > 0) or bool(existing.get("magic_complete")),
-                    }
-                for path in filesystem_paths:
-                    key = path_key(path)
-                    if key not in seen:
-                        self._file_head_facts[key] = {
-                            "path": path,
-                            "exists": False,
-                            "is_file": False,
-                            "size": None,
-                            "mtime_ns": None,
-                            "magic": b"",
-                            "magic_complete": True,
-                        }
-        if copy_results:
-            return {key: dict(self._file_head_facts.get(key, {})) for _path, key in keyed}
-        return {key: self._file_head_facts.get(key, {}) for _path, key in keyed}
+        rows = self._head_facts.facts_for_paths(requested, max(0, int(magic_size or 0)))
+        return {path_key(row["path"]): row for row in rows}
 
     def file_head_facts_for_path(self, path: str, *, magic_size: int = 16) -> dict[str, Any]:
         return self.file_head_facts_for_paths([path], magic_size=magic_size).get(path_key(path), {})
@@ -256,12 +191,6 @@ class DiscoveryScanSession:
 
     def _snapshot_key(self, directory: str, max_depth: int | None) -> str:
         return f"{self._directory_key(directory)}::{max_depth}"
-
-    def _file_head_fetch_needed_key(self, key: str, *, magic_size: int) -> bool:
-        facts = self._file_head_facts.get(key)
-        if facts is None:
-            return True
-        return bool(magic_size > 0 and facts.get("is_file") and not facts.get("magic_complete"))
 
 
 def _password_signature(path_passwords: dict[str, str] | None) -> str:

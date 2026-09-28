@@ -195,8 +195,9 @@ impl NativeWatchSnapshot {
                 }
             })?;
             let mut writer = BufWriter::with_capacity(SNAPSHOT_BUFFER_BYTES, file);
-            serde_json::to_writer(&mut writer, &document)
-                .map_err(|error| PyValueError::new_err(format!("Watch snapshot encoding failed: {error}")))?;
+            serde_json::to_writer(&mut writer, &document).map_err(|error| {
+                PyValueError::new_err(format!("Watch snapshot encoding failed: {error}"))
+            })?;
             writer.flush()?;
             writer.get_ref().sync_all()?;
             Ok(writer.get_ref().metadata()?.len())
@@ -233,7 +234,9 @@ pub(crate) struct NativeWatchState {
 
 impl NativeWatchState {
     fn lock(&self) -> MutexGuard<'_, StateData> {
-        self.data.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.data
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -272,17 +275,24 @@ impl NativeWatchState {
 
     fn pending(&self, py: Python<'_>, path: &str) -> PyResult<Option<Py<PyDict>>> {
         let record = self.lock().pending.get(&path_key(path)).cloned();
-        record.map(|value| to_py_dict(py, value.as_ref())).transpose()
+        record
+            .map(|value| to_py_dict(py, value.as_ref()))
+            .transpose()
     }
 
     fn entry(&self, py: Python<'_>, path: &str) -> PyResult<Option<Py<PyDict>>> {
         let record = self.lock().entries.get(&path_key(path)).cloned();
-        record.map(|value| to_py_dict(py, value.as_ref())).transpose()
+        record
+            .map(|value| to_py_dict(py, value.as_ref()))
+            .transpose()
     }
 
     fn pending_items(&self, py: Python<'_>) -> PyResult<Vec<Py<PyDict>>> {
         let records: Vec<_> = self.lock().pending.values().cloned().collect();
-        records.iter().map(|value| to_py_dict(py, value.as_ref())).collect()
+        records
+            .iter()
+            .map(|value| to_py_dict(py, value.as_ref()))
+            .collect()
     }
 
     /// Entries, optionally only those with one ``status``.
@@ -295,11 +305,17 @@ impl NativeWatchState {
             .filter(|value| status.is_none_or(|status| value.status == status))
             .cloned()
             .collect();
-        records.iter().map(|value| to_py_dict(py, value.as_ref())).collect()
+        records
+            .iter()
+            .map(|value| to_py_dict(py, value.as_ref()))
+            .collect()
     }
 
     fn has_entry_status(&self, status: &str) -> bool {
-        self.lock().entries.values().any(|value| value.status == status)
+        self.lock()
+            .entries
+            .values()
+            .any(|value| value.status == status)
     }
 
     fn has_pending(&self, path: &str) -> bool {
@@ -313,10 +329,21 @@ impl NativeWatchState {
     /// Keys of both collections at ``path`` (or under it when recursive).
     fn keys_matching(&self, path: &str, recursive: bool) -> (Vec<String>, Vec<String>) {
         let expected = path_key(path);
-        let matches = |key: &String| key == &expected || (recursive && is_path_under(key, &expected));
+        let matches =
+            |key: &String| key == &expected || (recursive && is_path_under(key, &expected));
         let data = self.lock();
-        let mut pending: Vec<String> = data.pending.keys().filter(|key| matches(key)).cloned().collect();
-        let mut entries: Vec<String> = data.entries.keys().filter(|key| matches(key)).cloned().collect();
+        let mut pending: Vec<String> = data
+            .pending
+            .keys()
+            .filter(|key| matches(key))
+            .cloned()
+            .collect();
+        let mut entries: Vec<String> = data
+            .entries
+            .keys()
+            .filter(|key| matches(key))
+            .cloned()
+            .collect();
         pending.sort();
         entries.sort();
         (pending, entries)
@@ -343,7 +370,11 @@ impl NativeWatchState {
         Ok(result)
     }
 
-    fn watch_cursor<'py>(&self, py: Python<'py>, volume_key: &str) -> PyResult<Option<Bound<'py, PyDict>>> {
+    fn watch_cursor<'py>(
+        &self,
+        py: Python<'py>,
+        volume_key: &str,
+    ) -> PyResult<Option<Bound<'py, PyDict>>> {
         let cursor = self.lock().cursors.get(&volume_key.to_lowercase()).copied();
         cursor.map(|cursor| cursor_dict(py, cursor)).transpose()
     }
@@ -354,7 +385,9 @@ impl NativeWatchState {
         for operation in operations.try_iter()? {
             decoded.push(decode_operation(&py_to_json(&operation?)?)?);
         }
-        Ok(NativeWatchOperations { operations: decoded })
+        Ok(NativeWatchOperations {
+            operations: decoded,
+        })
     }
 
     fn apply(&self, operations: PyRef<'_, NativeWatchOperations>) {
@@ -372,7 +405,12 @@ impl NativeWatchState {
     }
 
     /// Replace the maps with the snapshot at ``path``.
-    fn load_snapshot(&self, py: Python<'_>, path: String, version: u32) -> PyResult<NativeWatchSnapshotLoad> {
+    fn load_snapshot(
+        &self,
+        py: Python<'_>,
+        path: String,
+        version: u32,
+    ) -> PyResult<NativeWatchSnapshotLoad> {
         let loaded = py.detach(|| load_snapshot_file(&path, version))?;
         let (compatible, checkpoint_seq, data) = loaded;
         *self.lock() = data;
@@ -392,7 +430,9 @@ impl NativeWatchState {
         version: u32,
     ) -> PyResult<NativeWatchReplay> {
         let mut data = std::mem::take(&mut *self.lock());
-        let replay = py.detach(|| replay_segment_file(&mut data, &path, checkpoint_seq, expected_seq, version));
+        let replay = py.detach(|| {
+            replay_segment_file(&mut data, &path, checkpoint_seq, expected_seq, version)
+        });
         *self.lock() = data;
         replay
     }
@@ -463,7 +503,11 @@ fn decode_operation(operation: &Value) -> PyResult<Operation> {
         }
         _ => {}
     }
-    let collection = match object.get("collection").and_then(Value::as_str).unwrap_or("") {
+    let collection = match object
+        .get("collection")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+    {
         "pending_work" => Collection::Pending,
         "entries" => Collection::Entries,
         other => return Err(invalid(format!("unknown state collection: {other}"))),
@@ -609,10 +653,16 @@ fn replay_segment_file(
         let transaction: Value = serde_json::from_slice(&line)
             .map_err(|_| invalid(format!("corrupt watch state journal at {}", at())))?;
         let Some(object) = transaction.as_object() else {
-            return Err(invalid(format!("invalid watch state journal record at {}", at())));
+            return Err(invalid(format!(
+                "invalid watch state journal record at {}",
+                at()
+            )));
         };
         if object.get("version").and_then(Value::as_u64) != Some(u64::from(version)) {
-            return Err(invalid(format!("incompatible watch state journal at {}", at())));
+            return Err(invalid(format!(
+                "incompatible watch state journal at {}",
+                at()
+            )));
         }
         let seq = object
             .get("seq")

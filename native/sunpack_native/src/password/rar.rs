@@ -141,7 +141,8 @@ pub(crate) fn rar_fast_verify_passwords_from_volumes(
         .collect::<PyResult<Vec<_>>>()?;
     let volumes = VolumeSet::new(parse_volumes(parts)?);
     verify_prepared(py, volumes.key("rar")?, &candidates, || {
-        prepare_rar(|offset, len, field| volumes.first_volume_read_at_field(offset, len, field)).map(PasswordContext::Rar)
+        prepare_rar(|offset, len, field| volumes.first_volume_read_at_field(offset, len, field))
+            .map(PasswordContext::Rar)
     })
 }
 
@@ -167,9 +168,8 @@ fn rar4_plain_main_header(data: &[u8]) -> Option<Rar4Block> {
     if !data.starts_with(RAR4_SIGNATURE) {
         return None;
     }
-    parse_rar4_block(data, RAR4_SIGNATURE.len()).filter(|block| {
-        block.header_type == 0x73 && block.flags & RAR4_MAIN_HEADER_PASSWORD == 0
-    })
+    parse_rar4_block(data, RAR4_SIGNATURE.len())
+        .filter(|block| block.header_type == 0x73 && block.flags & RAR4_MAIN_HEADER_PASSWORD == 0)
 }
 
 enum Rar4EncryptionScan {
@@ -209,7 +209,9 @@ fn scan_rar4_file_encryption(
                 }
                 if block.flags & RAR4_FILE_PASSWORD != 0 {
                     // Directories and empty files carry no payload to verify.
-                    if data_size > 0 && block.flags & RAR4_FILE_DIRECTORY_MASK != RAR4_FILE_DIRECTORY_MASK {
+                    if data_size > 0
+                        && block.flags & RAR4_FILE_DIRECTORY_MASK != RAR4_FILE_DIRECTORY_MASK
+                    {
                         return Ok(Rar4EncryptionScan::Encrypted { offset, header });
                     }
                     saw_unprovable_encrypted = true;
@@ -244,9 +246,12 @@ fn read_rar4_header_at(
     read_at: &mut impl FnMut(u64, usize, &'static str) -> Result<Vec<u8>, ReadFault>,
 ) -> Result<Option<Vec<u8>>, ReadFault> {
     // Serve the header from the prefix whenever it is fully inside it.
-    let in_prefix = usize::try_from(offset)
-        .ok()
-        .and_then(|start| Some((start, prefix.get(start..start.checked_add(RAR4_MIN_HEADER_SIZE)?)?)));
+    let in_prefix = usize::try_from(offset).ok().and_then(|start| {
+        Some((
+            start,
+            prefix.get(start..start.checked_add(RAR4_MIN_HEADER_SIZE)?)?,
+        ))
+    });
     if let Some((start, fixed)) = in_prefix {
         let header_size = u16::from_le_bytes([fixed[5], fixed[6]]) as usize;
         if header_size < RAR4_MIN_HEADER_SIZE {
@@ -1718,7 +1723,9 @@ mod rar4_file_encryption_scan_tests {
             Ok(data[start..(start + len).min(data.len())].to_vec())
         });
         match result {
-            Ok(RarPasswordContext { material: RarPasswordMaterial::Stored { .. } }) => "stored",
+            Ok(RarPasswordContext {
+                material: RarPasswordMaterial::Stored { .. },
+            }) => "stored",
             Ok(_) => "other_material",
             Err(PreparedStatus::Status(status, _)) => status,
             Err(PreparedStatus::ReadFault(_)) => "read_fault",
@@ -1773,7 +1780,10 @@ mod rar4_file_encryption_scan_tests {
 
     #[test]
     fn encrypted_empty_member_alone_is_undecided() {
-        let data = archive(&[file_block(RAR4_FILE_PASSWORD, b"empty.txt", &[], 0)], Some(0));
+        let data = archive(
+            &[file_block(RAR4_FILE_PASSWORD, b"empty.txt", &[], 0)],
+            Some(0),
+        );
         assert_eq!(status_of(data), "unknown_needs_final_verifier");
     }
 }
