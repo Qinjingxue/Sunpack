@@ -178,7 +178,10 @@ def _zipcrypto_zip(name: str, payload: bytes, password: bytes, *, deflate: bool,
         method = 8
     else:
         stored, method = payload, 0
-    header = os.urandom(11) + bytes([crc >> 24])
+    # Keep the ZipCrypto verifier fixture deterministic: only the final byte is the
+    # format-defined password check byte. Randomizing the first 11 bytes gives a wrong
+    # password a 1/256 chance to pass that check and turn this test into a CRC failure.
+    header = bytes(11) + bytes([crc >> 24])
     encrypted = _ZipCrypto(password).encrypt(header + stored)
     if corrupt:
         encrypted = encrypted[:20] + bytes([encrypted[20] ^ 0xFF]) + encrypted[21:]
