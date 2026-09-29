@@ -1,6 +1,7 @@
 import io
 import asyncio
 import os
+import secrets
 import socket
 import struct
 import threading
@@ -411,6 +412,91 @@ def test_state_cleanup_only_removes_owned_server_state(tmp_path, monkeypatch):
     assert state.exists()
     assert persistent_process._remove_state_if_owned(name, token)
     assert not state.exists()
+
+
+def _prepare_server_publication_test(tmp_path, monkeypatch):
+    from sunpack.core.platform.windows import process_job
+    from sunpack.runtime.cli import persistent_runtime, runtime_host, runtime_state
+
+    _enable_test_runtime_identity(monkeypatch)
+    state = tmp_path / "runtime.state"
+    old_name = r"\\.\pipe\SunPack-v2-0123456789abcdef-old"
+    old_token = b"a" * 32
+    new_token = b"b" * 32
+    closed = []
+
+    monkeypatch.setattr(persistent_process, "state_path", lambda: str(state))
+    monkeypatch.setattr(persistent_process, "_runtime_binary_build_id", lambda: b"0123456789abcdef")
+    monkeypatch.setattr(persistent_process, "_acquire_server_lock", lambda: io.BytesIO())
+    monkeypatch.setattr(secrets, "token_bytes", lambda _size: new_token)
+    monkeypatch.setattr(secrets, "token_hex", lambda _size: "c" * 32)
+    monkeypatch.setattr(persistent_runtime, "enable_persistent_runtime", lambda **_kwargs: None)
+    monkeypatch.setattr(persistent_runtime, "persistent_runtime_is_idle", lambda: True)
+    monkeypatch.setattr(persistent_runtime, "persistent_server_idle_seconds", lambda: 15.0)
+    monkeypatch.setattr(runtime_state, "set_runtime_host", lambda _host: None)
+    monkeypatch.setattr(process_job, "close_child_job", lambda: None)
+
+    async def close_runtime():
+        closed.append("runtime")
+
+    class FakeHost:
+        watch_enabled = False
+
+        def __init__(self, **_kwargs):
+            pass
+
+        async def close(self, **_kwargs):
+            closed.append("host")
+
+    monkeypatch.setattr(persistent_runtime, "close_persistent_runtime", close_runtime)
+    monkeypatch.setattr(runtime_host, "RuntimeHost", FakeHost)
+    persistent_process._write_state(old_name, old_token)
+    return state, old_name, new_token, closed
+
+
+def test_server_publishes_fresh_endpoint_before_it_can_accept_clients(tmp_path, monkeypatch):
+    from sunpack.core.platform.windows import secure_pipe
+
+    state, old_name, new_token, closed = _prepare_server_publication_test(tmp_path, monkeypatch)
+    published = []
+
+    class FakePipeServer:
+        def close(self):
+            published.append("closed")
+
+    async def expose_pipe(_loop, protocol_factory, name):
+        assert name != old_name
+        assert name.endswith("-" + "c" * 32)
+        assert persistent_process._read_state() == (name, new_token)
+        protocol = protocol_factory()
+        assert protocol._token == new_token
+        published.append(name)
+        protocol._on_shutdown()
+        return [FakePipeServer()]
+
+    monkeypatch.setattr(secure_pipe, "start_serving_current_user_pipe", expose_pipe)
+
+    assert asyncio.run(persistent_process.run_server()) == 0
+    assert published == [persistent_process.pipe_name() + "-" + "c" * 32, "closed"]
+    assert not state.exists()
+    assert closed == ["host", "runtime"]
+
+
+def test_server_removes_published_state_if_pipe_creation_fails(tmp_path, monkeypatch):
+    from sunpack.core.platform.windows import secure_pipe
+
+    state, old_name, new_token, closed = _prepare_server_publication_test(tmp_path, monkeypatch)
+
+    async def fail_to_expose_pipe(_loop, _protocol_factory, name):
+        assert name != old_name
+        assert persistent_process._read_state() == (name, new_token)
+        raise OSError("pipe creation failed")
+
+    monkeypatch.setattr(secure_pipe, "start_serving_current_user_pipe", fail_to_expose_pipe)
+
+    assert asyncio.run(persistent_process.run_server()) == 1
+    assert not state.exists()
+    assert closed == ["host", "runtime"]
 
 
 def test_protocol_incrementally_parses_a_fragmented_request(monkeypatch):

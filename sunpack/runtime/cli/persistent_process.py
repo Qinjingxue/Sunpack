@@ -725,7 +725,9 @@ async def run_server() -> int:
             lock_stream.close()
         return 1
 
-    name = pipe_name()
+    # Each server owns a distinct endpoint. A state file left by a terminated
+    # server can only name its dead pipe, never the next server's pipe.
+    name = f"{pipe_name()}-{secrets.token_hex(16)}"
 
     def protocol_factory() -> _PipeRequestProtocol:
         return _PipeRequestProtocol(
@@ -739,8 +741,14 @@ async def run_server() -> int:
     from sunpack.core.platform.windows.secure_pipe import start_serving_current_user_pipe
 
     try:
+        # Publish this server's token before its pipe can accept a connection.
+        # A previous session may have left a state file with an old token;
+        # exposing the new pipe first lets a client submit that stale token
+        # and mistake the resulting rejection for an uncertain delivery.
+        _write_state(name, token)
         servers = await start_serving_current_user_pipe(loop, protocol_factory, name)
     except Exception:
+        _remove_state_if_owned(name, token)
         try:
             await runtime_host.close(exit_reason="pipe_create_failed")
         finally:
@@ -748,7 +756,6 @@ async def run_server() -> int:
             await close_persistent_runtime()
             lock_stream.close()
         return 1
-    _write_state(name, token)
 
     async def monitor_idle() -> None:
         await _monitor_idle_shutdown(
