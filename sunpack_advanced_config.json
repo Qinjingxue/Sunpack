@@ -78,7 +78,7 @@
           ".xpi", ".war", ".ear", ".aab", ".ckpt",
           ".pt", ".pth", ".safetensors", ".bin", ".dat",
           ".docm", ".xlsm", ".pptm", ".msix", ".msixbundle",
-          ".crdownload", ".downloading", ".part", ".win"
+          ".crdownload", ".downloading", ".part", ".win", ".iso"
         ]
       },
       {
