@@ -1043,24 +1043,25 @@ def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
                 + json.dumps(session.events(), ensure_ascii=False)
             )
 
-            if outcome.get("type") == "result":
-                # monitor 已授权 probe 后，detach 可能在 probe 成功结算之前让真实 I/O
-                # 返回永久非空间错误。此时 retry_with_space_gate() 会把 probe 结算为
-                # inconclusive 并把该永久错误返回上层；没有 space_resumed 是合法的。
-                # 但必须证明终态确实来自这种独立的输出设备错误，而不是把空间耗尽本身
-                # 错误地当成终态。
-                assert outcome.get("status") == "failed", outcome
-                diagnostics = outcome.get("diagnostics") or {}
-                assert diagnostics.get("failure_stage") == "output_write", outcome
-                assert diagnostics.get("failure_kind") == "output_filesystem", outcome
+            def _assert_independent_output_failure(result):
+                # detach 可能让已获准的真实 I/O 返回永久非空间错误。这样的失败与
+                # space gate 本身无关，因此无论它发生在 query-failure status 的前后，
+                # 都应按同一契约接受；但空间耗尽错误本身绝不能绕过 gate 终结 job。
+                assert result.get("status") == "failed", result
+                diagnostics = result.get("diagnostics") or {}
+                assert diagnostics.get("failure_stage") == "output_write", result
+                assert diagnostics.get("failure_kind") == "output_filesystem", result
 
                 output_trace = diagnostics.get("output_trace") or {}
                 terminal_error = int(output_trace.get("last_win32_error") or 0)
-                assert terminal_error != 0, outcome
+                assert terminal_error != 0, result
                 assert terminal_error not in {112, 39, 314, 1295}, (
                     "空间耗尽错误不得绕过 gate 直接结束 job；实际事件流："
                     + json.dumps(session.events(), ensure_ascii=False)
                 )
+
+            if outcome.get("type") == "result":
+                _assert_independent_output_failure(outcome)
                 return
 
             status = outcome
@@ -1083,7 +1084,10 @@ def test_win15_unqueryable_volume_stays_blocked(tmp_path_factory):
                 if event.get("event") == "space_resumed"
                 and int(event.get("episode_id") or 0) == status_episode
             ], "卷查询失败之后，同一 episode 的旧 probe 绝不能产生 space_resumed"
-            # query failure 之后也绝不能产生终态结果：空间压力本身不得结束 job。
-            assert not [
+            # query failure 之后仍可能有已经在飞的真实 I/O 返回永久设备错误。
+            # 这与上面的 "result 先到" 是同一合法竞态，只是事件顺序相反。
+            # 逐个验证它确实是独立的 output filesystem 错误，而不是空间错误绕过 gate。
+            for result in [
                 event for event in events_after_status if event.get("type") == "result"
-            ], "卷查询失败之后不得产生 job 终态"
+            ]:
+                _assert_independent_output_failure(result)
