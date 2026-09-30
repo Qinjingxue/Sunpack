@@ -142,6 +142,60 @@ def test_worker_wrong_password_evidence_maps_to_wrong_password(payload):
 @pytest.mark.parametrize(
     ("operation_result_name", "failure_kind"),
     [
+        ("data_error", "data_error"),
+        ("crc_error", "checksum_error"),
+    ],
+)
+def test_direct_empty_zip_candidate_failure_without_crc_proof_is_wrong_password(
+    operation_result_name,
+    failure_kind,
+):
+    completed = _worker_completed({
+        "encrypted": True,
+        "damaged": operation_result_name == "crc_error",
+        "password_rejected": False,
+        "password_crc_proven": False,
+        "operation_result_name": operation_result_name,
+        "failure_kind": failure_kind,
+    })
+
+    failure = classify_extract_failure(
+        completed,
+        "",
+        archive="payload.zip",
+        password_evidence="zip_empty_password_direct",
+    )
+
+    assert failure.kind is FailureKind.WRONG_PASSWORD
+    assert failure.is_password_failure is True
+
+
+def test_direct_empty_zip_candidate_crc_proof_preserves_real_damage():
+    completed = _worker_completed({
+        "encrypted": True,
+        "damaged": True,
+        "checksum_error": True,
+        "password_rejected": False,
+        "password_crc_proven": True,
+        "password_crc_proven_items": 1,
+        "operation_result_name": "crc_error",
+        "failure_kind": "checksum_error",
+    })
+
+    failure = classify_extract_failure(
+        completed,
+        "",
+        archive="payload.zip",
+        password_evidence="zip_empty_password_direct",
+    )
+
+    assert failure.kind is FailureKind.DAMAGED
+    assert failure.details["evidence"] == "zipcrypto_entry_crc_proven_before_failure"
+
+
+@pytest.mark.parametrize(
+    ("operation_result_name", "failure_kind"),
+    [
         ("data_error", "corrupted_data"),
         ("crc_error", "checksum_error"),
     ],

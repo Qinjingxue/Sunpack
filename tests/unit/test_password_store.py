@@ -401,13 +401,13 @@ def test_password_resolver_routes_unknown_embedded_range_through_normal_schedule
     assert result.requires_extraction_confirmation is False
 
 
-def test_password_resolver_probes_empty_candidate_when_unknown_has_no_passwords():
+def test_password_resolver_unknown_without_candidates_skips_bounded_verifier():
     tester = FakePasswordTester()
     tester.password_store = PasswordStore.from_sources(
         cli_passwords=[],
         builtin_passwords=[],
     )
-    scheduler = QueuePasswordScheduler(candidate_evidence="zipcrypto_header_byte")
+    scheduler = QueuePasswordScheduler()
     resolver = PasswordResolver(tester, PasswordSession(), scheduler)
     bag = _task_with_knowledge("carrier.bin", {
         "source": {
@@ -424,12 +424,10 @@ def test_password_resolver_probes_empty_candidate_when_unknown_has_no_passwords(
 
     result = resolver.resolve("carrier.bin", task=bag, archive_key="carrier#payload")
 
-    assert scheduler.planned == [""]
+    assert scheduler.planned == []
     assert result.password == ""
     assert result.status == PasswordResolutionStatus.RESOLVED
     assert result.requires_extraction_confirmation is True
-    assert result.candidate_passwords == ("",)
-    assert result.candidate_evidence == "zipcrypto_header_byte"
 
 
 def test_password_resolver_scopes_structure_facts_to_active_embedded_format():

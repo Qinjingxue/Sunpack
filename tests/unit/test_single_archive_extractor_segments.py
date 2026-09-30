@@ -24,14 +24,6 @@ class _FakePasswordStore:
 class _FakePasswordResolver:
     password_tester = SimpleNamespace(passwords=[])
 
-    def resolve(self, _archive_path, _task, *, archive_key, **_kwargs):
-        return PasswordResolution(
-            password="",
-            status=PasswordResolutionStatus.UNENCRYPTED,
-            archive_key=archive_key,
-            encrypted=False,
-        )
-
 
 class _CandidatePasswordStore:
     def has_candidates(self, **_kwargs):
@@ -126,24 +118,31 @@ def _task(path):
     return make_archive_task(path, logical_name="case")
 
 
-def test_extractor_routes_unknown_password_state_without_candidates_to_resolver(tmp_path):
+def test_unknown_zip_without_passwords_uses_direct_empty_worker_candidate(tmp_path):
     archive = tmp_path / "carrier.zip"
     archive.write_bytes(b"unknown-password-state")
     task = make_archive_task(archive, format_hint="zip")
-    resolver = _RecordingPasswordResolver()
+
+    class Resolver:
+        password_tester = SimpleNamespace(passwords=[])
+
+        def resolve(self, *_args, **_kwargs):
+            raise AssertionError("unknown/no-password ZIP must go directly to worker")
+
     extractor = SingleArchiveExtractor(
         password_store=_FakePasswordStore(),
-        password_resolver=resolver,
+        password_resolver=Resolver(),
         metadata_scanner=ArchiveMetadataScanner(),
         retry_policy=_FakeRetryPolicy(),
         sevenzip_runner=_FakeSevenZipRunner(),
         best_effort=True,
     )
 
-    result = extractor._resolve_password(task, str(archive), [str(archive)])
+    resolution = extractor._resolve_password(task, str(archive), [str(archive)])
 
-    assert resolver.calls == [(task.key, {})]
-    assert result.status == PasswordResolutionStatus.UNENCRYPTED
+    assert resolution.password == ""
+    assert resolution.candidate_passwords == ("",)
+    assert resolution.candidate_evidence == "zip_empty_password_direct"
 
 
 def test_extractor_runs_analysis_segments_inside_same_task_and_restores_source(tmp_path):

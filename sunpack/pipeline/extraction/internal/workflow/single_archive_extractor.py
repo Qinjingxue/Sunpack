@@ -18,7 +18,7 @@ from sunpack.pipeline.extraction.progress import has_recoverable_partial_outputs
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.core.passwords.internal.local_files import directory_password_context_from_task
-from sunpack.core.passwords.resolver import archive_structure_password_state
+from sunpack.core.passwords.resolver import archive_structure_requires_password
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.support.archive_input_projection import write_source_password_probe_input
 from sunpack.pipeline.extraction.output_inventory import OutputInventory, collect_output_inventory
@@ -435,15 +435,16 @@ class SingleArchiveExtractor:
                 status=PasswordResolutionStatus.RESOLVED,
                 archive_key=archive_key,
             )
-        if (
-            not self._password_store_has_candidates(directory_passwords)
-            and archive_structure_password_state(task) == "not_required"
-        ):
+        if not self._password_store_has_candidates(directory_passwords) and not self._task_requires_password(task):
+            format_hint = str(task.archive_input().format_hint or "").strip().lower().lstrip(".")
+            direct_zip_candidate = format_hint in {"zip", "jar", "docx", "xlsx", "apk"}
             return PasswordResolution(
                 password="",
                 status=PasswordResolutionStatus.UNENCRYPTED,
                 archive_key=archive_key,
                 encrypted=False,
+                candidate_passwords=("",) if direct_zip_candidate else (),
+                candidate_evidence="zip_empty_password_direct" if direct_zip_candidate else "",
             )
         return self.password_resolver.resolve(
             archive_path,
@@ -452,6 +453,10 @@ class SingleArchiveExtractor:
             archive_key=archive_key,
             directory_passwords=directory_passwords,
         )
+
+    @staticmethod
+    def _task_requires_password(task: ArchiveTask) -> bool:
+        return archive_structure_requires_password(task)
 
     def _password_store_has_candidates(self, directory_passwords: list[str]) -> bool:
         try:
