@@ -24,6 +24,14 @@ class _FakePasswordStore:
 class _FakePasswordResolver:
     password_tester = SimpleNamespace(passwords=[])
 
+    def resolve(self, _archive_path, _task, *, archive_key, **_kwargs):
+        return PasswordResolution(
+            password="",
+            status=PasswordResolutionStatus.UNENCRYPTED,
+            archive_key=archive_key,
+            encrypted=False,
+        )
+
 
 class _CandidatePasswordStore:
     def has_candidates(self, **_kwargs):
@@ -116,6 +124,26 @@ class _FakeSevenZipRunner:
 
 def _task(path):
     return make_archive_task(path, logical_name="case")
+
+
+def test_extractor_routes_unknown_password_state_without_candidates_to_resolver(tmp_path):
+    archive = tmp_path / "carrier.zip"
+    archive.write_bytes(b"unknown-password-state")
+    task = make_archive_task(archive, format_hint="zip")
+    resolver = _RecordingPasswordResolver()
+    extractor = SingleArchiveExtractor(
+        password_store=_FakePasswordStore(),
+        password_resolver=resolver,
+        metadata_scanner=ArchiveMetadataScanner(),
+        retry_policy=_FakeRetryPolicy(),
+        sevenzip_runner=_FakeSevenZipRunner(),
+        best_effort=True,
+    )
+
+    result = extractor._resolve_password(task, str(archive), [str(archive)])
+
+    assert resolver.calls == [(task.key, {})]
+    assert result.status == PasswordResolutionStatus.UNENCRYPTED
 
 
 def test_extractor_runs_analysis_segments_inside_same_task_and_restores_source(tmp_path):

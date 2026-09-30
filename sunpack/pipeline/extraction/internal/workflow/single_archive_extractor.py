@@ -18,7 +18,7 @@ from sunpack.pipeline.extraction.progress import has_recoverable_partial_outputs
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
 from sunpack.core.passwords.internal.local_files import directory_password_context_from_task
-from sunpack.core.passwords.resolver import archive_structure_requires_password
+from sunpack.core.passwords.resolver import archive_structure_password_state
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
 from sunpack.core.support.archive_input_projection import write_source_password_probe_input
 from sunpack.pipeline.extraction.output_inventory import OutputInventory, collect_output_inventory
@@ -435,7 +435,10 @@ class SingleArchiveExtractor:
                 status=PasswordResolutionStatus.RESOLVED,
                 archive_key=archive_key,
             )
-        if not self._password_store_has_candidates(directory_passwords) and not self._task_requires_password(task):
+        if (
+            not self._password_store_has_candidates(directory_passwords)
+            and archive_structure_password_state(task) == "not_required"
+        ):
             return PasswordResolution(
                 password="",
                 status=PasswordResolutionStatus.UNENCRYPTED,
@@ -449,10 +452,6 @@ class SingleArchiveExtractor:
             archive_key=archive_key,
             directory_passwords=directory_passwords,
         )
-
-    @staticmethod
-    def _task_requires_password(task: ArchiveTask) -> bool:
-        return archive_structure_requires_password(task)
 
     def _password_store_has_candidates(self, directory_passwords: list[str]) -> bool:
         try:
