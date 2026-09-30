@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 
 import os
+import sys
 import threading
 import time
 import zipfile
+import weakref
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -228,6 +231,8 @@ def _indexed_scheduler_for_test():
     watcher = object.__new__(RuntimeWatchScheduler)
     watcher._lock = threading.Lock()
     watcher._pending = {}
+    watcher._pending_by_key = {}
+    watcher._claims_by_owner = {}
     watcher._inflight_requests = []
     watcher._inflight_path_counts = {}
     watcher._active_states = {}
@@ -239,6 +244,193 @@ def _indexed_scheduler_for_test():
     return watcher
 
 
+class _NoScanDict(dict):
+    def __iter__(self):
+        raise AssertionError("source ownership must not scan unrelated paths")
+
+    def items(self):
+        raise AssertionError("source ownership must not scan unrelated owners")
+
+
+def _claim_scheduler_for_test():
+    watcher = _indexed_scheduler_for_test()
+    watcher._claim_gate = threading.RLock()
+    watcher._active_claims = {}
+    watcher._dirty_during_claim = {}
+    watcher.log = SimpleNamespace(write=lambda *args, **kwargs: None)
+    return watcher
+
+
+def test_source_claim_index_retires_all_path_spellings_without_pending_scan():
+    watcher = _claim_scheduler_for_test()
+    path = os.path.abspath("source.7z.002")
+    aliases = (path, path.upper(), os.path.join(os.path.dirname(path), ".", os.path.basename(path)))
+    unrelated = os.path.abspath("unrelated.disguised")
+    for spelling in (*aliases, unrelated):
+        candidate = WatchCandidate(spelling, 10, 1.0, "file", 1)
+        watcher._store_pending_locked(spelling, candidate)
+        watcher._store_pending_locked(spelling, candidate)  # Metadata replacement.
+        watcher._active_states[spelling] = scheduler_module._ActiveCandidateState(0, 0)
+    watcher._pending = _NoScanDict(watcher._pending)
+
+    watcher._claim_pipeline_sources("owner", (path, path.upper()))
+
+    assert len(watcher._pending) == 1
+    assert watcher._pending.get(unrelated) is not None
+    assert watcher._pending_by_key == {scheduler_module.path_key(unrelated): {unrelated}}
+    assert all(spelling not in watcher._active_states for spelling in aliases)
+    watcher._remove_pending_locked(unrelated)
+    assert watcher._pending_by_key == {}
+    assert watcher._remove_pending_locked(unrelated) is None
+
+
+def test_source_claim_transfer_releases_only_current_owner_without_claim_scan():
+    watcher = _claim_scheduler_for_test()
+    first, second = (os.path.abspath(name) for name in ("part.001", "part.002"))
+    first_key, second_key = map(scheduler_module.path_key, (first, second))
+    replayed = []
+    watcher.enqueue = lambda path, **kwargs: replayed.append((path, kwargs))
+    watcher._claim_pipeline_sources("a", (first, second))
+    with watcher._claim_gate:
+        assert watcher._defer_claimed_path_locked(first)
+        assert watcher._defer_claimed_path_locked(second)
+    watcher._active_claims = _NoScanDict(watcher._active_claims)
+    watcher._claim_pipeline_sources("b", (second,))
+    watcher._claim_pipeline_sources("b", (second.upper(), second))
+    assert watcher._claims_by_owner == {"a": {first_key}, "b": {second_key}}
+
+    watcher._release_pipeline_source_claims("a")
+    watcher._release_pipeline_source_claims("a")
+    watcher._release_pipeline_source_claims("unknown")
+    assert replayed == [(first, {"event_type": "pipeline_claim_released"})]
+    assert watcher._active_claims.get(second_key) == "b"
+    assert watcher._claims_by_owner == {"b": {second_key}}
+    watcher._release_pipeline_source_claims("b")
+    assert replayed == [(path, {"event_type": "pipeline_claim_released"}) for path in (first, second)]
+    assert len(watcher._active_claims) == 0
+    assert watcher._claims_by_owner == watcher._dirty_during_claim == {}
+
+
+def test_source_indexes_release_buckets_and_peak_tables_after_each_batch():
+    watcher = _claim_scheduler_for_test()
+    watcher.enqueue = lambda *args, **kwargs: None
+    empty_table_bytes = sys.getsizeof({})
+    for batch in range(3):
+        paths = [os.path.abspath(f"batch-{batch}-source-{index}.disguised") for index in range(512)]
+        with watcher._lock:
+            for path in paths:
+                watcher._store_pending_locked(path, WatchCandidate(path, 10, 1.0, "file", 1))
+        pending_refs = [weakref.ref(bucket) for bucket in watcher._pending_by_key.values()]
+        owners = [f"batch-{batch}-owner-{index}" for index in range(0, len(paths), 4)]
+        for offset, owner in zip(range(0, len(paths), 4), owners):
+            watcher._claim_pipeline_sources(owner, paths[offset:offset + 4])
+        assert all(reference() is None for reference in pending_refs)
+        assert sys.getsizeof(watcher._pending_by_key) == empty_table_bytes
+        owner_refs = [weakref.ref(bucket) for bucket in watcher._claims_by_owner.values()]
+        # Transfer dirty paths and release the old owners first: neither the
+        # old owner bucket nor its deferred events may keep paths alive.
+        with watcher._claim_gate:
+            for path in paths[:4]:
+                assert watcher._defer_claimed_path_locked(path)
+        watcher._claim_pipeline_sources("transferred", paths[:4])
+        transferred_ref = weakref.ref(watcher._claims_by_owner["transferred"])
+        for owner in owners:
+            watcher._release_pipeline_source_claims(owner)
+        assert all(reference() is None for reference in owner_refs)
+        watcher._release_pipeline_source_claims("transferred")
+        assert transferred_ref() is None
+        assert watcher._pending == watcher._pending_by_key == {}
+        assert watcher._active_claims == watcher._claims_by_owner == watcher._dirty_during_claim == {}
+        assert sys.getsizeof(watcher._claims_by_owner) == empty_table_bytes
+
+
+@pytest.mark.parametrize("completion", ["success", "error", "cancelled"])
+def test_request_completion_always_releases_source_index(completion):
+    watcher = _claim_scheduler_for_test()
+    path = os.path.abspath("completion.disguised")
+    request = SimpleNamespace(
+        notification_id="owner", candidate=WatchCandidate(path, 10, 1.0, "file", 1),
+        registry_owner="",
+    )
+    watcher.enqueue = lambda *args, **kwargs: None
+    watcher._notify = lambda *args, **kwargs: None
+    watcher._arm_idle_cache_cleanup = lambda: None
+    watcher.state = SimpleNamespace(complete_work_if_matches=lambda candidate: None)
+
+    async def complete(active_request):
+        if completion == "error":
+            raise RuntimeError("completion failed")
+        if completion == "cancelled":
+            raise asyncio.CancelledError()
+        return scheduler_module.WatchRunResult(processed=1, succeeded=1)
+
+    watcher._complete_candidate = complete
+    watcher._claim_pipeline_sources("owner", (path,))
+    owner_ref = weakref.ref(watcher._claims_by_owner["owner"])
+    if completion == "cancelled":
+        with pytest.raises(asyncio.CancelledError):
+            _await(watcher._finish_active_request(request))
+    else:
+        result = _await(watcher._finish_active_request(request))
+        assert result.failed == (completion == "error")
+    assert watcher._active_claims == watcher._claims_by_owner == watcher._dirty_during_claim == {}
+    assert owner_ref() is None
+    assert sys.getsizeof(watcher._claims_by_owner) == sys.getsizeof({})
+
+
+def test_parallel_source_claims_transfer_and_replay_shared_volume_once():
+    watcher = _claim_scheduler_for_test()
+    count = 8
+    barrier = threading.Barrier(count)
+    shared = os.path.abspath("shared.001")
+    sources = [os.path.abspath(f"volume-{index}.disguised") for index in range(count)]
+    replayed = []
+    replay_lock = threading.Lock()
+
+    def enqueue(path, **kwargs):
+        assert not watcher._claim_gate._is_owned()
+        assert watcher._lock.acquire(blocking=False)
+        watcher._lock.release()
+        with replay_lock:
+            replayed.append(path)
+
+    watcher.enqueue = enqueue
+
+    def run(index):
+        owner = f"owner-{index}"
+        watcher._claim_pipeline_sources(owner, (shared, sources[index]))
+        with watcher._claim_gate:
+            assert watcher._defer_claimed_path_locked(shared)
+            assert watcher._defer_claimed_path_locked(sources[index])
+        barrier.wait(timeout=5)
+        watcher._release_pipeline_source_claims(owner)
+
+    with ThreadPoolExecutor(max_workers=count) as pool:
+        list(pool.map(run, range(count)))
+    assert sorted(replayed) == sorted([shared, *sources])
+    assert watcher._active_claims == watcher._claims_by_owner == watcher._dirty_during_claim == {}
+
+
+def test_retire_claimed_paths_preserves_pending_alias_without_pending_scan():
+    watcher = _claim_scheduler_for_test()
+    first, second = (os.path.abspath(name) for name in ("source.001", "source.002"))
+    candidate = WatchCandidate(first, 10, 1.0, "file", 1)
+    watcher._store_pending_locked(first.upper(), candidate)
+    watcher._pending = _NoScanDict(watcher._pending)
+    completed, cleared, matched = [], [], []
+    watcher.state = SimpleNamespace(
+        complete_work=completed.extend, clear_entries=cleared.extend,
+        complete_work_if_matches=matched.append,
+    )
+    watcher._retire_claimed_paths((first, second), candidate)
+    assert completed == cleared == [second]
+    assert matched == []
+    watcher._remove_pending_locked(first.upper())
+    watcher._retire_claimed_paths((first, second), candidate)
+    assert completed == cleared == [second, first, second]
+    assert matched == [candidate]
+
+
 def test_watch_ready_index_lazily_discards_stale_generations_without_mapping_scan(monkeypatch):
     watcher = _indexed_scheduler_for_test()
     path = os.path.abspath("stale-generation.zip")
@@ -247,7 +439,7 @@ def test_watch_ready_index_lazily_discards_stale_generations_without_mapping_sca
         last_event_at=100.0,
         quiet_seconds=5.0,
     )
-    watcher._pending[path] = candidate
+    watcher._store_pending_locked(path, candidate)
     watcher._active_states[path] = state
     with watcher._lock:
         watcher._schedule_active_locked(path, state)
@@ -273,7 +465,7 @@ def test_watch_pop_ready_uses_heap_without_pending_mapping_scan(monkeypatch):
             last_event_at=100.0,
             quiet_seconds=1.0,
         )
-        watcher._pending[path] = candidate
+        watcher._store_pending_locked(path, candidate)
         watcher._active_states[path] = state
         watcher._schedule_active_locked(path, state)
     watcher._pending = _NoItemsDict(watcher._pending)
@@ -297,6 +489,7 @@ def test_watch_pop_ready_uses_heap_without_pending_mapping_scan(monkeypatch):
 
     assert watcher._pop_ready(101.0) == [candidate]
     assert watcher._pending == {}
+    assert watcher._pending_by_key == {}
     assert watcher._active_states == {}
 
 
@@ -310,19 +503,22 @@ def test_watch_ready_index_rejects_stale_entry_from_previous_active_lifecycle(mo
             last_event_at=100.0,
             quiet_seconds=1.0,
         )
-        watcher._pending[path] = candidate
+        watcher._store_pending_locked(path, candidate)
         watcher._active_states[path] = first_state
         watcher._schedule_active_locked(path, first_state)
-        watcher._pending.pop(path)
+        watcher._remove_pending_locked(path)
         watcher._active_states.pop(path)
 
         second_state = watcher._new_active_state_locked(
             last_event_at=100.0,
             quiet_seconds=5.0,
         )
-        watcher._pending[path] = candidate
+        watcher._store_pending_locked(path, candidate)
         watcher._active_states[path] = second_state
         watcher._schedule_active_locked(path, second_state)
+
+    watcher._drop_active(path, first_state.epoch, first_state.generation)
+    assert watcher._pending_by_key == {scheduler_module.path_key(path): {path}}
 
     monkeypatch.setattr(scheduler_module.time, "time", lambda: 100.0)
     monkeypatch.setattr(scheduler_module.time, "monotonic", lambda: 100.0)
@@ -330,6 +526,8 @@ def test_watch_ready_index_rejects_stale_entry_from_previous_active_lifecycle(mo
     assert watcher.next_delay_seconds() == pytest.approx(5.0)
     assert len(watcher._ready_heap) == 1
     assert watcher._ready_heap[0][1] == second_state.epoch
+    watcher._drop_active(path, second_state.epoch, second_state.generation)
+    assert watcher._pending_by_key == {}
 
 
 def test_watch_ready_index_skips_inflight_path_and_requeues_current_generation(monkeypatch):
@@ -340,7 +538,8 @@ def test_watch_ready_index_skips_inflight_path_and_requeues_current_generation(m
     second = WatchCandidate(second_path, 10, 1.0, "second", 1)
     first_state = scheduler_module._ActiveCandidateState(100.0, 1.0)
     second_state = scheduler_module._ActiveCandidateState(100.0, 2.0)
-    watcher._pending.update({first_path: first, second_path: second})
+    watcher._store_pending_locked(first_path, first)
+    watcher._store_pending_locked(second_path, second)
     watcher._active_states.update({first_path: first_state, second_path: second_state})
     request = SimpleNamespace(candidate=first)
 

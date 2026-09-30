@@ -125,7 +125,7 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
     watcher._arm_idle_cache_cleanup()
     watcher._reset_idle_cache_cleanup()
     watcher._cache_cleanup_deadline = 0
-    watcher._pending["busy"] = object()
+    watcher._store_pending_locked("busy", object())
     _TEST_LOOP.run_until_complete(watcher._maybe_clear_idle_caches())
     assert engine.clear_calls == 1
 

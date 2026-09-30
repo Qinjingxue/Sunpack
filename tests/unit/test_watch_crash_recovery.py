@@ -16,6 +16,8 @@ def _watch_scheduler_shell(scheduler_module):
     scheduler = object.__new__(scheduler_module.WatchScheduler)
     scheduler._claim_gate = threading.RLock()
     scheduler._active_claims = {}
+    scheduler._claims_by_owner = {}
+    scheduler._pending_by_key = {}
     scheduler._dirty_during_claim = {}
     scheduler._inflight_requests = []
     scheduler._inflight_path_counts = {}

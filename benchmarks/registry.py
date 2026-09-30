@@ -12,12 +12,15 @@ class Scenario:
 
 
 _ROWS = [
+    ("scheduling", "broker-queue", "benchmarks.scenarios.broker_queue", "Committed versus working-tree broker queue selection and throughput."),
+    ("scheduling", "watch-source-claims", "benchmarks.scenarios.watch_source_claims", "Watch source claim/release indexes versus committed baseline, including maintenance cost."),
     ("reader", "password-fast-path", "benchmarks.scenarios.reader_password_fast_path", "Password candidate fast paths."),
     ("reader", "password-size-scaling", "benchmarks.scenarios.reader_password_size_scaling", "Password cost versus payload size."),
     ("reader", "seven-zip-password", "benchmarks.scenarios.reader_seven_zip_password", "7z password probe optimization."),
     ("reader", "embedded-scan", "benchmarks.scenarios.reader_embedded_scan", "Native and CLI embedded scanning."),
     ("reader", "volume-anchor", "benchmarks.scenarios.reader_volume_anchor", "Bounded native volume-anchor probing."),
     ("memory", "residual-rss", "benchmarks.scenarios.memory_residual_rss", "Residual RSS and Python allocations."),
+    ("memory", "watch-source-indexes", "benchmarks.scenarios.watch_source_index_retention", "Watch source-index object collection and empty-table capacity across unique batches."),
     ("memory", "worker-manifest", "benchmarks.scenarios.memory_worker_manifest", "Native manifest materialization."),
     ("memory", "many-tasks", "benchmarks.scenarios.memory_many_tasks", "Python and native worker memory growth across formats."),
     ("scan", "directory", "benchmarks.scenarios.scan_directory", "Directory scanner comparison."),

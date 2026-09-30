@@ -207,9 +207,13 @@ class WatchScheduler:
         # either fully admitted before the claim or cannot touch the source.
         self._claim_gate = threading.RLock()
         self._active_claims: dict[str, str] = {}
+        self._claims_by_owner: dict[str, set[str]] = {}
         self._dirty_during_claim: dict[str, dict[str, str]] = {}
         self._password_source_lock = threading.RLock()
         self._pending: dict[str, WatchCandidate] = {}
+        # All pending mutations use the helpers below under _lock. Keep every
+        # spelling of a path so a normalized source claim retires all aliases.
+        self._pending_by_key: dict[str, set[str]] = {}
         self._inflight_requests: list[_ActivePipelineRequest] = []
         self._inflight_path_counts: dict[str, int] = {}
         self._active_states: dict[str, _ActiveCandidateState] = {}
@@ -1013,7 +1017,7 @@ class WatchScheduler:
                     return
                 state = self._active_states.get(candidate.path)
                 if state is not None:
-                    self._pending[candidate.path] = candidate
+                    self._store_pending_locked(candidate.path, candidate)
                     self._latest_observations[candidate.path] = candidate
                     quiet_seconds = self._observe_candidate_activity(
                         candidate,
@@ -1062,7 +1066,7 @@ class WatchScheduler:
                             persist=durable_owner,
                             durable=durable_owner,
                         )
-                    self._pending[candidate.path] = candidate
+                    self._store_pending_locked(candidate.path, candidate)
                     self._latest_observations[candidate.path] = candidate
                     became_active = True
                     self._active_states[candidate.path] = self._new_active_state_locked(
@@ -1074,7 +1078,7 @@ class WatchScheduler:
                         self._active_states[candidate.path],
                     )
                 else:
-                    self._pending[candidate.path] = candidate
+                    self._store_pending_locked(candidate.path, candidate)
                     self._latest_observations[candidate.path] = candidate
                     active_quiet_seconds = self._observe_candidate_activity(
                         candidate,
@@ -1099,6 +1103,27 @@ class WatchScheduler:
             )
             self._wake_service()
 
+    def _store_pending_locked(self, path: str, candidate: WatchCandidate) -> None:
+        if path not in self._pending:
+            key = path_key(os.path.abspath(path))
+            self._pending_by_key.setdefault(key, set()).add(path)
+        self._pending[path] = candidate
+
+    def _remove_pending_locked(
+        self, path: str, *, normalized_key: str | None = None,
+    ) -> WatchCandidate | None:
+        candidate = self._pending.pop(path, None)
+        if candidate is not None:
+            key = normalized_key if normalized_key is not None else path_key(os.path.abspath(path))
+            paths = self._pending_by_key[key]
+            paths.remove(path)
+            if not paths:
+                del self._pending_by_key[key]
+                if not self._pending_by_key:
+                    # pop/del retain an empty dict's peak table allocation.
+                    self._pending_by_key.clear()
+        return candidate
+
     def _defer_claimed_path_locked(self, path: str) -> bool:
         normalized = os.path.abspath(path)
         key = path_key(normalized)
@@ -1116,27 +1141,32 @@ class WatchScheduler:
         )
         if not owner or not normalized:
             return
-        retired_pending: list[str] = []
+        retired_pending: list[tuple[str, str]] = []
         with self._claim_gate:
-            claimed_keys = {path_key(path) for path in normalized}
-            for source_path in normalized:
-                key = path_key(source_path)
+            claimed_keys = [path_key(path) for path in normalized]
+            owned_keys = self._claims_by_owner.setdefault(owner, set())
+            for key in claimed_keys:
                 previous_owner = self._active_claims.get(key)
                 if previous_owner and previous_owner != owner:
+                    previous_keys = self._claims_by_owner[previous_owner]
+                    previous_keys.remove(key)
+                    if not previous_keys:
+                        del self._claims_by_owner[previous_owner]
                     previous_dirty = self._dirty_during_claim.get(previous_owner)
                     if previous_dirty and key in previous_dirty:
                         self._dirty_during_claim.setdefault(owner, {})[key] = previous_dirty.pop(key)
                         if not previous_dirty:
                             self._dirty_during_claim.pop(previous_owner, None)
                 self._active_claims[key] = owner
+                owned_keys.add(key)
             with self._lock:
                 retired_pending = [
-                    candidate_path
-                    for candidate_path in self._pending
-                    if path_key(os.path.abspath(candidate_path)) in claimed_keys
+                    (key, candidate_path)
+                    for key in claimed_keys
+                    for candidate_path in self._pending_by_key.get(key, ())
                 ]
-                for candidate_path in retired_pending:
-                    self._pending.pop(candidate_path, None)
+                for key, candidate_path in retired_pending:
+                    self._remove_pending_locked(candidate_path, normalized_key=key)
                     self._active_states.pop(candidate_path, None)
         self.log.write(
             "pipeline_sources_claimed",
@@ -1151,10 +1181,9 @@ class WatchScheduler:
         reconcile: list[str] = []
         released = 0
         with self._claim_gate:
-            owned_keys = [
-                key for key, current_owner in self._active_claims.items()
-                if current_owner == owner
-            ]
+            owned_keys = self._claims_by_owner.pop(owner, ())
+            if not self._claims_by_owner:
+                self._claims_by_owner.clear()
             for key in owned_keys:
                 self._active_claims.pop(key, None)
             released = len(owned_keys)
@@ -1244,7 +1273,7 @@ class WatchScheduler:
                     if _paths_match(candidate_path, normalized, recursive=recursive)
                 ]
                 for candidate_path in pending_paths:
-                    self._pending.pop(candidate_path, None)
+                    self._remove_pending_locked(candidate_path)
                     self._active_states.pop(candidate_path, None)
                 tracker_paths = [
                     candidate_path
@@ -1359,7 +1388,7 @@ class WatchScheduler:
                         or state.generation != generation
                     ):
                         continue
-                    self._pending.pop(path, None)
+                    self._remove_pending_locked(path)
                     self._active_states.pop(path, None)
                 self.state.record_attempt(
                     identified.path,
@@ -1381,7 +1410,7 @@ class WatchScheduler:
                 or state.generation != generation
             ):
                 return
-            self._pending.pop(path, None)
+            self._remove_pending_locked(path)
             self._active_states.pop(path, None)
 
     def _record_boundary_activity(
@@ -1402,7 +1431,7 @@ class WatchScheduler:
                 or state.generation != generation
             ):
                 return
-            self._pending[path] = candidate
+            self._store_pending_locked(path, candidate)
             self._latest_observations[path] = candidate
             state.last_event_at = now
             learned_quiet_seconds = self._observe_candidate_activity(
@@ -1430,7 +1459,7 @@ class WatchScheduler:
                 or state.generation != generation
             ):
                 return False
-            self._pending[path] = candidate
+            self._store_pending_locked(path, candidate)
             self._latest_observations[path] = candidate
             self._observe_candidate_activity(candidate, time.time(), content_changed=False)
             return True
@@ -1449,7 +1478,7 @@ class WatchScheduler:
         self.state.advance_entry_observation(candidate)
         state = self._active_states.get(candidate.path)
         if state is not None:
-            self._pending[candidate.path] = candidate
+            self._store_pending_locked(candidate.path, candidate)
         self._observe_candidate_activity(candidate, now, content_changed=False)
 
     def _observe_candidate_activity(
@@ -1917,12 +1946,12 @@ class WatchScheduler:
     def _retire_claimed_paths(self, paths: Iterable[str], candidate: WatchCandidate) -> None:
         normalized = dedupe_normalized_paths(paths)
         with self._lock:
-            pending_keys = {path_key(path) for path in self._pending}
-        retired = [path for path in normalized if path_key(path) not in pending_keys]
+            retired = [path for path in normalized if path_key(path) not in self._pending_by_key]
+            candidate_pending = path_key(os.path.abspath(candidate.path)) in self._pending_by_key
         if retired:
             self.state.complete_work(retired)
             self.state.clear_entries(retired)
-        if path_key(candidate.path) not in pending_keys:
+        if not candidate_pending:
             self.state.complete_work_if_matches(candidate)
 
     def _source_input_root_for(self, path: str) -> str:

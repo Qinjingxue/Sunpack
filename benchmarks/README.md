@@ -52,7 +52,33 @@ python -m benchmarks watch format-matrix --formats zip,rar,tar,7z --flatten-mode
 python -m benchmarks extraction split-pressure --profile acceptance --strict
 python -m benchmarks memory residual-rss
 python -m benchmarks memory many-tasks --python-rounds 5 --worker-rounds 3 --json-out benchmarks/results/memory-growth.json
+uv run --no-sync python -m benchmarks scheduling broker-queue --baseline-ref <before-commit> --runs 5 --warmups 1
+uv run --no-sync python -m benchmarks scheduling watch-source-claims --baseline-ref <before-commit> --runs 7 --warmups 1
+uv run --no-sync python -m benchmarks memory watch-source-indexes --paths 4096 --batches 12 --warmups 2
 ```
+
+`scheduling watch-source-claims` compares watch claim, release, and state
+retirement against the committed scheduler. The lifecycle case includes pending
+index maintenance, metadata updates, dirty events, partial ownership transfer,
+and release. Each sample verifies identical ownership and ordered event replay.
+It uses metadata fixtures and production locks without requiring a Broker
+service; archive IO and log/state persistence are outside the measurement.
+Additional index allocations are measured separately with tracemalloc.
+
+`memory watch-source-indexes` repeatedly inserts unique candidates, claims
+sources, transfers dirty paths, and releases owners. It checks collection through
+weak references, empty index table capacity, and destruction of a populated
+scheduler. Scheduler allocations and RSS are reported separately; allocator
+reserves can keep RSS elevated after the indexed objects have been freed.
+
+`scheduling broker-queue` loads the exact broker source from `--baseline-ref` and
+compares it with the working tree in alternating A/B order. It verifies identical
+selection order/results and reports single-selection latency, enqueue-plus-drain
+cost, and actual broker submit-to-completion time at the same thread capacity.
+The default queue sizes range from 1 to 4096, with homogeneous and mixed stages;
+broker workloads include one request and mixed watch/foreground requests. Reports
+record both source hashes and all raw wall/CPU samples. These are scheduling
+measurements without archive decoding or filesystem IO.
 
 ## Run timeout
 

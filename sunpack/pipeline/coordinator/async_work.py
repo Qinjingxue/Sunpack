@@ -41,9 +41,77 @@ class _WorkItem(Generic[T]):
     sequence: int
 
 
+class _StageWorkQueue:
+    """FIFO buckets for the six stage priorities, owned by the event loop."""
+
+    __slots__ = ("_stages", "_size", "_first")
+
+    def __init__(self) -> None:
+        self._stages: dict[int, deque[_WorkItem[Any]]] = {}
+        self._size = 0
+        self._first: _WorkItem[Any] | None = None
+
+    def __len__(self) -> int:
+        return self._size
+
+    def append(self, item: _WorkItem[Any]) -> None:
+        # Most idle admissions dispatch immediately. Classify only once a
+        # second job actually requires a priority comparison.
+        if not self._size:
+            self._first = item
+            self._size = 1
+            return
+        if self._first is not None:
+            first = self._first
+            self._stages[_stage_priority(first.context.stage)] = deque((first,))
+            self._first = None
+        priority = _stage_priority(item.context.stage)
+        jobs = self._stages.get(priority)
+        if jobs is None:
+            jobs = self._stages[priority] = deque()
+        jobs.append(item)
+        self._size += 1
+
+    def _pop(self, priority: int) -> _WorkItem[Any]:
+        jobs = self._stages[priority]
+        item = jobs.popleft()
+        self._size -= 1
+        if not jobs:
+            del self._stages[priority]
+        return item
+
+    def popleft(self) -> _WorkItem[Any]:
+        if self._first is not None:
+            item = self._first
+            self._first = None
+            self._size = 0
+            return item
+        priority = min(self._stages, key=lambda value: self._stages[value][0].sequence)
+        return self._pop(priority)
+
+    def take_prioritized(self, current_sequence: int) -> _WorkItem[Any]:
+        if self._first is not None:
+            item = self._first
+            self._first = None
+            self._size = 0
+            return item
+        if len(self._stages) == 1:
+            return self._pop(next(iter(self._stages)))
+        # Within one priority, the oldest job always has at least as much
+        # sequence aging and wins ties. Only the bucket heads can win.
+        priority = max(
+            self._stages,
+            key=lambda value: (
+                value + max(0, current_sequence - self._stages[value][0].sequence) // 32,
+                -self._stages[value][0].sequence,
+            ),
+        )
+        return self._pop(priority)
+
+
 @dataclass
 class _RequestQueue:
-    jobs: deque[_WorkItem[Any]] = field(default_factory=deque)
+    jobs: _StageWorkQueue = field(default_factory=_StageWorkQueue)
     origin: str = "foreground"
 
 
@@ -289,22 +357,8 @@ class AsyncWorkBroker:
                 return selected
         return self._request_order.popleft()
 
-    def _take_prioritized(self, jobs: deque[_WorkItem[Any]]) -> _WorkItem[Any]:
-        if len(jobs) <= 1:
-            return jobs.popleft()
-        current_sequence = self._sequence
-        best_index = max(
-            range(len(jobs)),
-            key=lambda index: (
-                _stage_priority(jobs[index].context.stage)
-                + max(0, current_sequence - jobs[index].sequence) // 32,
-                -jobs[index].sequence,
-            ),
-        )
-        jobs.rotate(-best_index)
-        selected = jobs.popleft()
-        jobs.rotate(best_index)
-        return selected
+    def _take_prioritized(self, jobs: _StageWorkQueue) -> _WorkItem[Any]:
+        return jobs.take_prioritized(self._sequence)
 
     @staticmethod
     def _execute(item: _WorkItem[T]) -> T:
