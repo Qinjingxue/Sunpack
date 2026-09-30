@@ -1,6 +1,47 @@
+import subprocess
 import zlib
+from concurrent.futures import ThreadPoolExecutor
 
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
+
+
+def test_native_manifest_and_inventory_can_be_shared_across_concurrent_matches(tmp_path):
+    from sunpack_native import archive_state_zip_manifest_native
+    from tests.helpers.tool_config import require_7z
+
+    source = tmp_path / "source"
+    source.mkdir()
+    names = ["é.txt", "e\u0301.txt", "A.txt", "a-other.txt", "nested.txt"]
+    for name in names:
+        (source / name).write_text("abc", encoding="utf-8")
+    archive = tmp_path / "source.disguised"
+    subprocess.run(
+        [str(require_7z()), "a", "-tzip", "-mm=Store", "-bso0", "-bsp0", str(archive), "."],
+        cwd=source, check=True, capture_output=True,
+    )
+    manifest = archive_state_zip_manifest_native({"entry_path": str(archive)})
+    entries = manifest.entry_page(0, 10)
+    inventory = _inventory(
+        tmp_path / "absent-output",
+        [
+            {"index": index, "path": item["path"], "size": item["size"],
+             "bytes_written": item["size"], "has_output_crc": True,
+             "output_crc32": item["crc32"], "status": "complete"}
+            for index, item in enumerate(entries)
+        ],
+    )
+
+    def match(_):
+        return inventory.verification_match(
+            manifest, verify_crc=True, include_observations=True, detail_limit=10,
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(match, range(32)))
+    assert all(result == results[0] for result in results)
+    assert results[0]["coverage"]["complete_files"] == len(names)
+    assert results[0]["crc_files_read"] == results[0]["mismatch_count"] == 0
+    assert {item["path"] for item in results[0]["observations"]} == set(names)
 
 
 def _inventory(root, files, *, worker_crc_available=False, worker_inventory_complete=False, identity_paths=False):

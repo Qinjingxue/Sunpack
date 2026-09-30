@@ -6,9 +6,11 @@ use crate::verification::archive_manifest::{ManifestEntry, NativeArchiveManifest
 use crc32fast::Hasher as Crc32Hasher;
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyList};
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::Arc;
 
 const CRC_BUFFER_SIZE: usize = 1024 * 1024;
@@ -89,9 +91,9 @@ impl BasenameMode {
 }
 
 #[derive(Clone)]
-struct ArchiveFile {
-    path: String,
-    raw_path: String,
+struct ArchiveFile<'a> {
+    path: Cow<'a, str>,
+    raw_path: Cow<'a, str>,
     unsafe_path: bool,
     size: Option<u64>,
     has_crc: bool,
@@ -159,25 +161,29 @@ struct MatchResult {
     crc_files_read: usize,
 }
 
-struct OutputIndex {
-    files: Arc<Vec<OutputFileRecord>>,
-    root: PathBuf,
-    by_path: HashMap<String, usize>,
+struct OutputIndex<'a> {
+    files: &'a [OutputFileRecord],
+    root: &'a Path,
+    by_path: HashMap<Cow<'a, str>, usize>,
     by_folded_path: HashMap<String, usize>,
     by_basename: HashMap<String, usize>,
 }
 
 const AMBIGUOUS_OUTPUT: usize = usize::MAX;
 
-fn insert_unique_output(index: &mut HashMap<String, usize>, key: String, value: usize) {
+fn insert_unique_output<K: Eq + std::hash::Hash>(
+    index: &mut HashMap<K, usize>,
+    key: K,
+    value: usize,
+) {
     index
         .entry(key)
         .and_modify(|entry| *entry = AMBIGUOUS_OUTPUT)
         .or_insert(value);
 }
 
-impl OutputIndex {
-    fn new(snapshot: &OutputInventoryVerificationSnapshot) -> Self {
+impl<'a> OutputIndex<'a> {
+    fn new(snapshot: &'a OutputInventoryVerificationSnapshot) -> Self {
         let mut by_path = HashMap::with_capacity(snapshot.files.len());
         for (index, item) in snapshot.files.iter().enumerate() {
             let path = output_relative_path(item);
@@ -187,8 +193,8 @@ impl OutputIndex {
             insert_unique_output(&mut by_path, path, index);
         }
         Self {
-            files: Arc::clone(&snapshot.files),
-            root: PathBuf::from(&snapshot.root),
+            files: &snapshot.files,
+            root: Path::new(&snapshot.root),
             by_path,
             by_folded_path: HashMap::new(),
             by_basename: HashMap::new(),
@@ -197,7 +203,7 @@ impl OutputIndex {
 
     fn match_expected(
         &mut self,
-        expected: &[ArchiveFile],
+        expected: &[ArchiveFile<'_>],
         mode: BasenameMode,
     ) -> Vec<Option<(usize, &'static str)>> {
         let mut matched = vec![None; expected.len()];
@@ -232,7 +238,7 @@ impl OutputIndex {
                     continue;
                 }
                 let (output, by) = match pass {
-                    0 => (self.by_path.get(&item.path), "path"),
+                    0 => (self.by_path.get(item.path.as_ref()), "path"),
                     1 => (
                         self.by_folded_path.get(&normalize_match_path(&item.path)),
                         "path",
@@ -258,7 +264,7 @@ impl OutputIndex {
     fn crc_for(
         &self,
         item: &OutputFileRecord,
-        buffer: &mut [u8],
+        buffer: &mut Vec<u8>,
     ) -> Result<(Option<u32>, bool), MatchError> {
         if let Some(value) = item.output_crc32 {
             return Ok((Some(value), false));
@@ -267,7 +273,7 @@ impl OutputIndex {
         match crc32_file_with_buffer(&path, buffer) {
             Ok(value) => Ok((Some(value), true)),
             Err(error) => Err(MatchError {
-                path: output_relative_path(item),
+                path: output_relative_path(item).into_owned(),
                 message: error.to_string(),
             }),
         }
@@ -275,7 +281,7 @@ impl OutputIndex {
 }
 
 fn match_inventory(
-    expected: Vec<ArchiveFile>,
+    expected: Vec<ArchiveFile<'_>>,
     snapshot: OutputInventoryVerificationSnapshot,
     verify_crc: bool,
     basename_mode: BasenameMode,
@@ -303,7 +309,9 @@ fn match_inventory(
     let mut errors = Vec::new();
     let mut mismatch_count = 0usize;
     let mut missing_count = 0usize;
-    let mut crc_buffer = vec![0u8; CRC_BUFFER_SIZE];
+    // Allocate once, only after a matched file actually needs a disk CRC read.
+    // Worker CRC, disabled CRC, missing/failed/unwritten outputs need no buffer.
+    let mut crc_buffer = Vec::new();
     let mut used_worker_crc = false;
     let mut crc_files_read = 0usize;
 
@@ -318,8 +326,8 @@ fn match_inventory(
             coverage.failed_files += 1;
             if emit {
                 observations.push(MatchObservation {
-                    path: item.path.clone(),
-                    archive_path: item.path.clone(),
+                    path: item.path.clone().into_owned(),
+                    archive_path: item.path.clone().into_owned(),
                     state: "failed",
                     bytes_written: 0,
                     expected_size: item.size,
@@ -330,7 +338,7 @@ fn match_inventory(
                     crc_ok: None,
                     matched_by: "",
                     path_blocked: true,
-                    raw_archive_path: item.raw_path.clone(),
+                    raw_archive_path: item.raw_path.clone().into_owned(),
                     failure_kind: "output_filesystem",
                 });
             }
@@ -341,12 +349,12 @@ fn match_inventory(
             coverage.missing_files += 1;
             missing_count += 1;
             if missing.len() < max_issue_items {
-                missing.push(item.path.clone());
+                missing.push(item.path.clone().into_owned());
             }
             if emit {
                 observations.push(MatchObservation {
-                    path: item.path.clone(),
-                    archive_path: item.path.clone(),
+                    path: item.path.clone().into_owned(),
+                    archive_path: item.path.clone().into_owned(),
                     state: "missing",
                     bytes_written: 0,
                     expected_size: item.size,
@@ -357,7 +365,7 @@ fn match_inventory(
                     crc_ok: None,
                     matched_by: "",
                     path_blocked: false,
-                    raw_archive_path: item.raw_path.clone(),
+                    raw_archive_path: item.raw_path.clone().into_owned(),
                     failure_kind: "",
                 });
             }
@@ -392,12 +400,12 @@ fn match_inventory(
                         coverage.missing_files += 1;
                         missing_count += 1;
                         if missing.len() < max_issue_items {
-                            missing.push(item.path.clone());
+                            missing.push(item.path.clone().into_owned());
                         }
                         if emit {
                             observations.push(MatchObservation {
-                                path: output_relative_path(output),
-                                archive_path: item.path.clone(),
+                                path: output_relative_path(output).into_owned(),
+                                archive_path: item.path.clone().into_owned(),
                                 state: "missing",
                                 bytes_written: output.bytes_written,
                                 expected_size: item.size,
@@ -408,7 +416,7 @@ fn match_inventory(
                                 crc_ok: None,
                                 matched_by,
                                 path_blocked: false,
-                                raw_archive_path: item.raw_path.clone(),
+                                raw_archive_path: item.raw_path.clone().into_owned(),
                                 failure_kind: "output_filesystem",
                             });
                         }
@@ -447,7 +455,7 @@ fn match_inventory(
             mismatch_count += 1;
             if mismatches.len() < max_issue_items {
                 mismatches.push(Mismatch {
-                    path: item.path.clone(),
+                    path: item.path.clone().into_owned(),
                     expected_crc32: item.crc32.unwrap_or(0),
                     actual_crc32: actual_crc.unwrap_or(0),
                 });
@@ -474,8 +482,8 @@ fn match_inventory(
 
         if emit {
             observations.push(MatchObservation {
-                path: output_relative_path(output),
-                archive_path: item.path.clone(),
+                path: output_relative_path(output).into_owned(),
+                archive_path: item.path.clone().into_owned(),
                 state,
                 bytes_written: output.bytes_written,
                 expected_size: item.size,
@@ -486,7 +494,7 @@ fn match_inventory(
                 crc_ok,
                 matched_by,
                 path_blocked: false,
-                raw_archive_path: item.raw_path.clone(),
+                raw_archive_path: item.raw_path.clone().into_owned(),
                 failure_kind: "",
             });
         }
@@ -640,7 +648,7 @@ fn observation_to_py(py: Python<'_>, item: MatchObservation) -> PyResult<Py<PyDi
     Ok(row.unbind())
 }
 
-fn archive_items_from_py(archive_files: &Bound<'_, PyAny>) -> PyResult<Vec<ArchiveFile>> {
+fn archive_items_from_py(archive_files: &Bound<'_, PyAny>) -> PyResult<Vec<ArchiveFile<'static>>> {
     let mut items = Vec::new();
     for item in archive_files.try_iter()? {
         let item = item?;
@@ -657,18 +665,29 @@ fn archive_items_from_py(archive_files: &Bound<'_, PyAny>) -> PyResult<Vec<Archi
         let crc32 = py_u32(dict, "crc32")?;
         let has_crc = py_bool(dict, "has_crc")?.unwrap_or(crc32.is_some());
         let size = py_u64(dict, "size")?.or_else(|| py_u64(dict, "unpacked_size").ok().flatten());
-        items.extend(archive_file(&projected, raw_path, size, has_crc, crc32));
+        items.extend(
+            archive_file(&projected, Cow::Owned(raw_path), size, has_crc, crc32).map(|item| {
+                ArchiveFile {
+                    path: Cow::Owned(item.path.into_owned()),
+                    raw_path: Cow::Owned(item.raw_path.into_owned()),
+                    unsafe_path: item.unsafe_path,
+                    size: item.size,
+                    has_crc: item.has_crc,
+                    crc32: item.crc32,
+                }
+            }),
+        );
     }
     Ok(items)
 }
 
-fn archive_items_from_manifest(entries: &[ManifestEntry]) -> Vec<ArchiveFile> {
+fn archive_items_from_manifest(entries: &[ManifestEntry]) -> Vec<ArchiveFile<'_>> {
     entries
         .iter()
         .filter_map(|item| {
             archive_file(
                 &item.path,
-                item.raw_path.clone().unwrap_or_else(|| item.path.clone()),
+                Cow::Borrowed(item.raw_path.as_deref().unwrap_or(&item.path)),
                 Some(item.size),
                 item.crc32.is_some(),
                 item.crc32,
@@ -677,13 +696,13 @@ fn archive_items_from_manifest(entries: &[ManifestEntry]) -> Vec<ArchiveFile> {
         .collect()
 }
 
-fn archive_file(
-    projected: &str,
-    raw_path: String,
+fn archive_file<'a>(
+    projected: &'a str,
+    raw_path: Cow<'a, str>,
     size: Option<u64>,
     has_crc: bool,
     crc32: Option<u32>,
-) -> Option<ArchiveFile> {
+) -> Option<ArchiveFile<'a>> {
     let path = windows_output_relative_path(clean_relative_archive_path(projected));
     if path.is_empty() {
         return None;
@@ -699,7 +718,7 @@ fn archive_file(
     })
 }
 
-fn output_relative_path(item: &OutputFileRecord) -> String {
+fn output_relative_path(item: &OutputFileRecord) -> Cow<'_, str> {
     clean_relative_archive_path(item.output_path.as_deref().unwrap_or(&item.path))
 }
 
@@ -713,9 +732,12 @@ fn output_absolute_path(root: &Path, item: &OutputFileRecord) -> PathBuf {
     root.join(item.output_path.as_deref().unwrap_or(&item.path))
 }
 
-fn crc32_file_with_buffer(path: &Path, buffer: &mut [u8]) -> std::io::Result<u32> {
+fn crc32_file_with_buffer(path: &Path, buffer: &mut Vec<u8>) -> std::io::Result<u32> {
     let reader = ManagedReader::open(path)?;
     let mut cursor = reader.stream_cursor();
+    if buffer.is_empty() {
+        *buffer = vec![0u8; CRC_BUFFER_SIZE];
+    }
     let mut hasher = Crc32Hasher::new();
     loop {
         let read = cursor.read(buffer)?;
@@ -767,15 +789,25 @@ fn py_u32(dict: &Bound<'_, PyDict>, key: &str) -> PyResult<Option<u32>> {
     Ok(py_u64(dict, key)?.map(|value| (value & 0xFFFF_FFFF) as u32))
 }
 
-fn clean_relative_archive_path(value: &str) -> String {
-    value
-        .replace('\\', "/")
-        .trim()
-        .trim_matches('/')
-        .split('/')
-        .filter(|part| !part.is_empty() && *part != "." && *part != "..")
-        .collect::<Vec<_>>()
-        .join("/")
+fn clean_relative_archive_path(value: &str) -> Cow<'_, str> {
+    if !value.contains('\\')
+        && value.trim() == value
+        && value
+            .split('/')
+            .all(|part| !part.is_empty() && part != "." && part != "..")
+    {
+        return Cow::Borrowed(value);
+    }
+    Cow::Owned(
+        value
+            .replace('\\', "/")
+            .trim()
+            .trim_matches('/')
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != "." && *part != "..")
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 fn normalize_match_name(value: &str) -> String {
@@ -800,7 +832,11 @@ fn basename(path: &str) -> &str {
 /// Names the extraction worker refuses to write (see `safe_relative_item_path`
 /// in the 7z bridge): rooted paths, drive-qualified names and `..` traversal.
 fn unsafe_archive_path(raw_path: &str, cleaned: &str) -> bool {
-    let text = raw_path.replace('\\', "/");
+    let text = if raw_path.contains('\\') {
+        Cow::Owned(raw_path.replace('\\', "/"))
+    } else {
+        Cow::Borrowed(raw_path)
+    };
     if text.is_empty() {
         return false;
     }
@@ -872,15 +908,17 @@ fn windows_output_part(part: &str) -> String {
 
 /// Project a cleaned archive path onto the name the worker writes on disk.
 /// The mapping is idempotent, so already-projected output paths pass through.
-fn windows_output_relative_path(cleaned: String) -> String {
+fn windows_output_relative_path(cleaned: Cow<'_, str>) -> Cow<'_, str> {
     if !cleaned.split('/').any(windows_output_part_needs_mapping) {
         return cleaned;
     }
-    cleaned
-        .split('/')
-        .map(windows_output_part)
-        .collect::<Vec<_>>()
-        .join("/")
+    Cow::Owned(
+        cleaned
+            .split('/')
+            .map(windows_output_part)
+            .collect::<Vec<_>>()
+            .join("/"),
+    )
 }
 
 fn size_progress(actual_size: Option<u64>, expected_size: Option<u64>) -> Option<f64> {
@@ -900,6 +938,77 @@ fn round6(value: f64) -> f64 {
 #[cfg(test)]
 mod windows_output_name_tests {
     use super::*;
+
+    #[test]
+    fn manifest_borrows_names_but_still_projects_invalid_windows_names() {
+        let entries = vec![
+            ManifestEntry {
+                path: "dir/é.txt".into(),
+                raw_path: None,
+                size: 1,
+                crc32: Some(10),
+            },
+            ManifestEntry {
+                path: "logs/12:30.log".into(),
+                raw_path: None,
+                size: 2,
+                crc32: Some(20),
+            },
+            ManifestEntry {
+                path: "safe.txt".into(),
+                raw_path: Some("../safe.txt".into()),
+                size: 3,
+                crc32: None,
+            },
+        ];
+        let expected = archive_items_from_manifest(&entries);
+        assert!(matches!(expected[0].path, Cow::Borrowed(_)));
+        assert!(matches!(expected[0].raw_path, Cow::Borrowed(_)));
+        assert_eq!(expected[0].path.as_ptr(), entries[0].path.as_ptr());
+        assert_eq!(expected[1].path, "logs/12_30.log");
+        assert!(matches!(expected[1].path, Cow::Owned(_)));
+        assert_eq!(expected[1].raw_path, "logs/12:30.log");
+        assert!(!expected[1].unsafe_path);
+        assert!(expected[2].unsafe_path);
+    }
+
+    #[test]
+    fn borrowed_path_normalization_preserves_cleanup_semantics() {
+        let cases = [
+            ("dir/file.txt", "dir/file.txt"),
+            ("é/e\u{301}.txt", "é/e\u{301}.txt"),
+            ("dir\\file.txt", "dir/file.txt"),
+            (" /dir//./../file.txt/ ", "dir/file.txt"),
+            ("\u{2003}dir/file.txt\u{2003}", "dir/file.txt"),
+            ("dir/ name .txt", "dir/ name .txt"),
+            ("", ""),
+            ("./", ""),
+            ("../", ""),
+        ];
+        for (raw, expected) in cases {
+            assert_eq!(clean_relative_archive_path(raw), expected, "{raw}");
+        }
+    }
+
+    #[test]
+    fn crc_buffer_is_lazy_and_reused_only_for_successful_disk_reads() {
+        let path = crate::test_support::temp_file("inventory_crc_buffer", b"abc");
+        let mut buffer = Vec::new();
+        assert!(crc32_file_with_buffer(&path.with_extension("missing"), &mut buffer).is_err());
+        assert_eq!(buffer.capacity(), 0);
+        assert_eq!(
+            crc32_file_with_buffer(&path, &mut buffer).unwrap(),
+            0x352441c2
+        );
+        assert_eq!(buffer.len(), CRC_BUFFER_SIZE);
+        let allocation = buffer.as_ptr();
+        assert_eq!(
+            crc32_file_with_buffer(&path, &mut buffer).unwrap(),
+            0x352441c2
+        );
+        assert_eq!(buffer.as_ptr(), allocation);
+        std::fs::remove_file(path).unwrap();
+    }
 
     fn bug_regression_match(
         expected: &[(&str, u32)],
