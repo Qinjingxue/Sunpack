@@ -223,20 +223,22 @@ class PasswordResolver:
         candidates = self.password_tester.password_store.candidates(
             directory_passwords=directory_passwords
         )
-        if not candidates and password_state == "required":
-            return PasswordResolution(
-                password=None,
-                status=PasswordResolutionStatus.PASSWORD_REQUIRED,
-                error_text="archive requires a password but no candidates were provided",
-                archive_key=archive_key,
-                encrypted=True,
+        if not candidates:
+            if password_state == "required":
+                return PasswordResolution(
+                    password=None,
+                    status=PasswordResolutionStatus.PASSWORD_REQUIRED,
+                    error_text="archive requires a password but no candidates were provided",
+                    archive_key=archive_key,
+                    encrypted=True,
+                )
+            return self._confirmation_resolution(
+                archive_key,
+                "",
+                fingerprint.key,
+                task,
             )
 
-        # Unknown encryption state must still pass the empty password through
-        # the bounded verifier.  This is especially important for traditional
-        # ZipCrypto, whose one-byte header check has a 1/256 false-positive
-        # probability and therefore requires the extraction candidate path for
-        # final confirmation.
         search = self._plan_password_search(
             archive_path,
             task=task,

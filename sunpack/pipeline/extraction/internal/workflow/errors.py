@@ -70,6 +70,38 @@ def classify_extract_failure(
             )
         if worker_result.get("password_candidates_all_rejected"):
             return _failure(FailureKind.WRONG_PASSWORD, "failure.wrong_password", user_action="request_password")
+        if password_evidence == "zip_empty_password_direct" and worker_result.get("encrypted"):
+            operation_result_name = str(worker_result.get("operation_result_name") or "").lower()
+            failure_kind = str(worker_result.get("failure_kind") or "").lower()
+            password_or_payload_failure = operation_result_name in {
+                "wrong_password",
+                "data_error",
+                "crc_error",
+            } or failure_kind in {
+                "encrypted_or_wrong_password",
+                "data_error",
+                "checksum_error",
+                "crc_error",
+            }
+            if password_or_payload_failure:
+                if worker_result.get("password_crc_proven"):
+                    return _failure(
+                        FailureKind.DAMAGED,
+                        "failure.damaged",
+                        details={
+                            "evidence": "zipcrypto_entry_crc_proven_before_failure",
+                            "password_crc_proven_items": int(worker_result.get("password_crc_proven_items") or 0),
+                        },
+                    )
+                return _failure(
+                    FailureKind.WRONG_PASSWORD,
+                    "failure.wrong_password",
+                    user_action="request_password",
+                    details={
+                        "evidence": "zip_empty_password_failed_without_crc_proof",
+                        "backend_operation_result": operation_result_name,
+                    },
+                )
         if password_evidence == "zipcrypto_header_byte":
             operation_result_name = str(worker_result.get("operation_result_name") or "").lower()
             failure_kind = str(worker_result.get("failure_kind") or "").lower()
