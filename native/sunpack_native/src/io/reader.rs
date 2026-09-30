@@ -625,7 +625,7 @@ impl NativeArchiveSession {
     #[getter]
     fn generation_token(&self) -> PyResult<String> {
         self.ensure_open()?;
-        Ok(format!("{:?}", self.reader.file_identity()?))
+        Ok(self.reader.file_identity()?.generation_token())
     }
 
     #[getter]
@@ -904,6 +904,25 @@ pub(crate) struct FileIdentity {
 }
 
 impl FileIdentity {
+    pub(crate) fn generation_token(&self) -> String {
+        // Paths belong to the logical input key. The token identifies the
+        // opened physical generation, including writes with restored mtime.
+        #[cfg(windows)]
+        {
+            let physical = &self.physical;
+            return format!(
+                "{:x}:{:032x}:{:x}:{:x}:{:x}",
+                physical.volume,
+                u128::from_le_bytes(physical.file_id),
+                physical.change_time,
+                physical.write_time,
+                self.len
+            );
+        }
+        #[cfg(not(windows))]
+        format!("{:?}", (self.len, self.modified, self.created))
+    }
+
     pub(crate) fn is_current(&self) -> bool {
         open_reader_file(&self.path)
             .and_then(|file| file_identity(self.path.clone(), &file))
@@ -2152,7 +2171,7 @@ fn manager() -> &'static ReaderManager {
     })
 }
 
-fn file_identity(path: PathBuf, file: &File) -> io::Result<FileIdentity> {
+pub(crate) fn file_identity(path: PathBuf, file: &File) -> io::Result<FileIdentity> {
     let metadata = file.metadata()?;
     Ok(FileIdentity {
         path,

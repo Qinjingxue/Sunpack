@@ -38,6 +38,33 @@ def _require_7z_or_skip():
     return seven_zip
 
 
+def test_worker_duplicate_invalid_names_report_failure_without_spinning(tmp_path):
+    worker = _require_worker_or_skip()
+    archive = tmp_path / "duplicate-invalid.zip"
+    literal = str(archive).replace("'", "''")
+    subprocess.run(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+         "$ErrorActionPreference='Stop'; Add-Type -AssemblyName System.IO.Compression; "
+         f"$f=[IO.File]::Open('{literal}',[IO.FileMode]::Create); "
+         "$z=[IO.Compression.ZipArchive]::new($f,[IO.Compression.ZipArchiveMode]::Create); "
+         "1..1000 | ForEach-Object { [void]$z.CreateEntry(('entry'+$_+'.txt')) }; "
+         "$n=('a'*260)+'.txt'; 1..12 | ForEach-Object { [void]$z.CreateEntry($n) }; "
+         "$z.Dispose(); $f.Dispose()"],
+        check=True, capture_output=True,
+    )
+    for attempt in range(3):
+        result = subprocess.run(
+            [worker], input=json.dumps({"job_id": "invalid-name-regression", "archive_path": str(archive),
+                                       "output_dir": str(tmp_path / f"out-{attempt}"), "format_hint": "zip"}),
+            capture_output=True, text=True, encoding="utf-8", timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+        )
+        final = _worker_result(result.stdout)
+        assert result.returncode != 0
+        assert final["status"] == "failed"
+        assert final["failure_kind"] == "output_filesystem"
+
+
 def _create_7z(tmp_path, name: str, text: str):
     seven_zip = _require_7z_or_skip()
     source = tmp_path / f"{name}.txt"

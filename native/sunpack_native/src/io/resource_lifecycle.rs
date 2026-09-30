@@ -59,8 +59,31 @@ impl TrackedFile {
     where
         F: FnOnce(&mut std::fs::OpenOptions),
     {
+        Self::open_configured(path, kind, configure, false)
+    }
+
+    /// A short-lived mutation handle owned by the operation inside a promotion
+    /// barrier. Track it, but do not reject it as a new archive reader.
+    #[track_caller]
+    pub(crate) fn open_for_mutation<F>(path: impl AsRef<Path>, configure: F) -> io::Result<Self>
+    where
+        F: FnOnce(&mut std::fs::OpenOptions),
+    {
+        Self::open_configured(path, "file_mutation", configure, true)
+    }
+
+    #[track_caller]
+    fn open_configured<F>(
+        path: impl AsRef<Path>,
+        kind: &'static str,
+        configure: F,
+        mutation: bool,
+    ) -> io::Result<Self>
+    where
+        F: FnOnce(&mut std::fs::OpenOptions),
+    {
         let path = path.as_ref();
-        let resource = NativeResourceGuard::register(kind, [path.to_path_buf()])?;
+        let resource = NativeResourceGuard::register_inner(kind, [path.to_path_buf()], mutation)?;
         let mut options = std::fs::OpenOptions::new();
         configure(&mut options);
         let file = options.open(path)?;
@@ -167,6 +190,15 @@ impl NativeResourceGuard {
         kind: &'static str,
         paths: impl IntoIterator<Item = PathBuf>,
     ) -> io::Result<Self> {
+        Self::register_inner(kind, paths, false)
+    }
+
+    #[track_caller]
+    fn register_inner(
+        kind: &'static str,
+        paths: impl IntoIterator<Item = PathBuf>,
+        mutation: bool,
+    ) -> io::Result<Self> {
         static NEXT_ID: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         let paths = paths.into_iter().map(normalized_path).collect::<Vec<_>>();
@@ -174,10 +206,11 @@ impl NativeResourceGuard {
             .registry
             .lock()
             .map_err(|_| io::Error::other("native resource registry poisoned"))?;
-        if registry
-            .promotions
-            .values()
-            .any(|roots| paths_overlap(&paths, roots))
+        if !mutation
+            && registry
+                .promotions
+                .values()
+                .any(|roots| paths_overlap(&paths, roots))
         {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,

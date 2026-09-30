@@ -23,6 +23,6 @@ def safe_relative_path(path: Any, start: Any) -> str | None:
         rel = os.path.relpath(normalized_path(path), normalized_path(start))
     except ValueError:
         return None
-    if rel == "." or rel.startswith(".."):
+    if rel in {".", ".."} or rel.startswith(".." + os.sep):
         return None
     return rel

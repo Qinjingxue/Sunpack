@@ -178,6 +178,33 @@ void check_streams()
     check(queries_as(as_unknown(multi_raw), IID_IInStream), "MultiRangeInStream QI(IInStream) == S_OK");
 }
 
+void check_output_path_reservations()
+{
+    std::printf("Async output path reservations\n");
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-reserved-paths-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+    OutputPathAllocator paths;
+    const auto original = root / L"entry.txt";
+    check(paths.allocate(original, true) == original, "first output keeps original name");
+    check(paths.allocate(root / L"ENTRY.txt", true) == root / L"ENTRY(1).txt", "pending case-insensitive collision advances without a disk file");
+    check(paths.allocate(root / L"entry(1).txt", true) == root / L"entry(1)(1).txt", "explicit names cannot take a pending numbered output");
+    check(paths.allocate(original, true) == root / L"entry(2).txt", "numbered reservations advance monotonically");
+
+    OutputPathAllocator failed_paths;
+    const auto invalid = root / (std::wstring(260, L'a') + L".txt");
+    check(failed_paths.allocate(invalid, true) == invalid, "reserve a name whose async create will fail");
+    check(failed_paths.allocate(invalid, true) == root / (std::wstring(260, L'a') + L"(1).txt"), "failed create cannot spin on the same name");
+
+    OutputPathAllocator many;
+    many.reserve(10001);
+    many.allocate(original, true);
+    std::filesystem::path last;
+    for (int index = 0; index < 10000; ++index) { last = many.allocate(original, true); }
+    check(last == root / L"entry(10000).txt", "large duplicate group advances without rescanning prior reservations");
+    many.clear();
+    check(many.allocate(original, true) == original, "released reservations do not survive the output lifetime");
+}
+
 } // namespace
 
 int main()
@@ -188,6 +215,7 @@ int main()
     check_open_callback_volume_prefetch();
     check_streams();
     check_open_archive_stream_ownership();
+    check_output_path_reservations();
 
     if (g_failures != 0)
     {

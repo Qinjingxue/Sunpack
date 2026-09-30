@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sunpack_native import file_generation_tokens
+
 
 @dataclass(frozen=True)
 class ArchiveFingerprint:
@@ -74,22 +76,25 @@ def build_archive_fingerprint(
     part_paths: list[str] | None = None,
     archive_input: Any = None,
 ) -> ArchiveFingerprint:
-    normalized_archive = str(Path(archive_path).resolve())
-    normalized_parts = tuple(str(Path(path).resolve()) for path in part_paths or [])
+    descriptor = archive_input.to_dict() if hasattr(archive_input, "to_dict") else archive_input
+    source_paths = [archive_path, *(part_paths or [])]
+    if isinstance(descriptor, dict):
+        source_paths.extend(
+            str(item["path"])
+            for item in [*(descriptor.get("parts") or []), *(descriptor.get("ranges") or [])]
+            if isinstance(item, dict) and item.get("path")
+        )
+    normalized = {path: str(Path(path).resolve()) for path in dict.fromkeys(source_paths)}
+    normalized_archive = normalized[archive_path]
+    normalized_parts = tuple(normalized[path] for path in part_paths or [])
+    source_paths = list(dict.fromkeys(normalized.values()))
     digest = hashlib.sha256()
-    for path in (normalized_archive, *normalized_parts):
+    for path, generation in zip(source_paths, file_generation_tokens(source_paths)):
         digest.update(path.encode("utf-8", errors="surrogatepass"))
         digest.update(b"\0")
-        try:
-            stat = Path(path).stat()
-        except OSError:
-            digest.update(b"missing")
-            continue
-        digest.update(str(stat.st_size).encode("ascii"))
-        digest.update(b":")
-        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+        digest.update((generation or "unavailable").encode("utf-8"))
         digest.update(b"\0")
-    scope = _archive_input_scope(archive_input)
+    scope = _archive_input_scope(descriptor)
     if scope:
         digest.update(b"logical-input\0")
         digest.update(scope.encode("utf-8", errors="surrogatepass"))

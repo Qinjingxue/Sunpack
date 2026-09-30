@@ -38,6 +38,12 @@ fn native_available() -> bool {
 #[pymodule]
 fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
+    #[cfg(windows)]
+    {
+        m.add_function(wrap_pyfunction!(io::file_generation::file_generation_tokens, m)?)?;
+        m.add_function(wrap_pyfunction!(io::file_generation::prepare_file_cleanup, m)?)?;
+        m.add_function(wrap_pyfunction!(io::file_generation::restore_staged_cleanup, m)?)?;
+    }
     m.add_class::<watch_store::NativeWatchState>()?;
     m.add_class::<watch_store::NativeWatchOperations>()?;
     m.add_class::<watch_store::NativeWatchSnapshot>()?;
@@ -260,7 +266,6 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         postprocess::flatten_single_branch_directories,
         m
     )?)?;
-    m.add_function(wrap_pyfunction!(postprocess::delete_files_batch, m)?)?;
     m.add_function(wrap_pyfunction!(
         password::seven_zip::seven_zip_fast_verify_passwords,
         m

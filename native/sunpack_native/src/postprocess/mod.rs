@@ -73,47 +73,13 @@ pub(crate) fn flatten_single_branch_directories(
     let mut stats = FlattenStats::default();
     // The rename chain is pure filesystem work, and every rename publishes a
     // directory change the watch scheduler has to consume.  Release the GIL for
-    // the loop (as delete_files_batch already does) so those two can overlap
+    // the loop so these operations can overlap
     // instead of serializing on the interpreter lock.
     py.detach(|| flatten_single_branch_chain(&base_path, &mut stats));
     result.set_item("moved", stats.moved)?;
     result.set_item("removed_dirs", stats.removed_dirs)?;
     result.set_item("errors", PyList::new(py, stats.errors)?)?;
     Ok(result.unbind())
-}
-
-#[pyfunction]
-pub(crate) fn delete_files_batch(py: Python<'_>, paths: Vec<String>) -> PyResult<Py<PyList>> {
-    let rows = py.detach(|| {
-        paths
-            .into_iter()
-            .map(|raw| {
-                let result = fs::remove_file(&raw);
-                let (status, error, error_code) = match result {
-                    Ok(()) => ("deleted", String::new(), 0),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        ("missing", String::new(), 0)
-                    }
-                    Err(error) => (
-                        "error",
-                        error.to_string(),
-                        error.raw_os_error().unwrap_or(0),
-                    ),
-                };
-                (raw, status, error, error_code)
-            })
-            .collect::<Vec<_>>()
-    });
-    let results = PyList::empty(py);
-    for (raw, status, error, error_code) in rows {
-        let item = PyDict::new(py);
-        item.set_item("path", normalize_path(Path::new(&raw)))?;
-        item.set_item("status", status)?;
-        item.set_item("error", error)?;
-        item.set_item("error_code", error_code)?;
-        results.append(item)?;
-    }
-    Ok(results.unbind())
 }
 
 fn scan_watch_dir_recursive(
@@ -187,7 +153,9 @@ fn watch_candidate_from_metadata(
     metadata: &fs::Metadata,
     since_usn: Option<i64>,
 ) -> PyResult<Option<Py<PyDict>>> {
-    if metadata.len() == 0 {
+    if metadata.len() == 0 || path.file_name().is_some_and(|name| {
+        name.to_string_lossy().starts_with(crate::io::file_generation::CLEANUP_PREFIX)
+    }) {
         return Ok(None);
     }
     let observation = watch_file_observation(path, since_usn)?;

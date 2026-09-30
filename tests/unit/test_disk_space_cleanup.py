@@ -1,8 +1,11 @@
 import asyncio
 import os
+import gc
+import weakref
 from dataclasses import asdict
 
 import pytest
+from sunpack_native import file_generation_tokens
 
 import sunpack.core.support.resource_lifecycle as resource_lifecycle
 import sunpack.pipeline.postprocess.internal.cleanup as cleanup
@@ -13,6 +16,7 @@ from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
 from sunpack.pipeline.coordinator.engine import _SourceCleanup
 from sunpack.pipeline.postprocess.actions import PostProcessActions
 from tests.helpers.fake_pipeline_engine import _InlineBroker
+from sunpack.core.support.path_keys import absolute_path_key
 
 
 class _Task:
@@ -58,6 +62,14 @@ def _release_and_apply(scope, task, outcome_kind):
     return asyncio.run(scope.apply(request, broker=_InlineBroker()))
 
 
+def _assert_staged_paths(calls, originals):
+    assert len(calls) == len(originals)
+    for staged, original in zip(calls, originals):
+        assert os.path.dirname(staged) == str(original.parent)
+        assert os.path.basename(staged).startswith(".sunpack-cleanup-")
+        assert staged != str(original)
+
+
 def test_shared_source_is_deleted_only_after_last_successful_owner(tmp_path, monkeypatch):
     shared = tmp_path / "carrier.bin"
     shared.write_text("payload")
@@ -85,7 +97,7 @@ def test_shared_source_is_deleted_only_after_last_successful_owner(tmp_path, mon
     )
 
     assert second_outcome.deleted == (str(shared),)
-    assert calls == [str(shared)]
+    _assert_staged_paths(calls, [shared])
     assert not shared.exists()
 
 
@@ -139,7 +151,7 @@ def test_source_cleanup_reports_external_lock_without_timed_retry(tmp_path, monk
 
     outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
 
-    assert calls == [str(source)]
+    _assert_staged_paths(calls, [source])
     assert len(outcome.failed) == 1
     assert outcome.failed[0].attempts == 1
     assert outcome.failed[0].retryable is True
@@ -207,7 +219,7 @@ def test_source_cleanup_reports_each_failure_once(tmp_path, monkeypatch):
 
     def recycle(target):
         calls.append(target)
-        raise denied() if target == str(inaccessible) else locked()
+        raise denied() if len(calls) == 1 else locked()
 
     monkeypatch.setattr(cleanup, "send2trash", recycle)
     scope = _scope()
@@ -218,7 +230,7 @@ def test_source_cleanup_reports_each_failure_once(tmp_path, monkeypatch):
     failures = {item.path: (item.error_code, item.attempts) for item in outcome.failed}
     assert failures == {str(inaccessible): (5, 1), str(busy): (32, 1)}
     assert tuple(scope._context.cleanup_results) == outcome.failed
-    assert sorted(calls) == sorted([str(inaccessible), str(busy)])
+    _assert_staged_paths(calls, [inaccessible, busy])
     assert inaccessible.exists()
     assert busy.exists()
 
@@ -239,7 +251,7 @@ def test_source_cleanup_stops_retrying_nonretryable_failure(tmp_path, monkeypatc
 
     outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
 
-    assert calls == [str(source)]
+    _assert_staged_paths(calls, [source])
     assert len(outcome.failed) == 1
     assert outcome.failed[0].error_code == 5
     assert outcome.failed[0].attempts == 1
@@ -279,8 +291,10 @@ def test_sweep_only_releases_unreported_refs_and_does_not_request_deletion(tmp_p
 def test_native_delete_reports_missing_and_deleted(tmp_path):
     path = tmp_path / "a.zip"
     path.write_text("data")
+    paths = [str(path), str(tmp_path / "missing")]
     report = PostProcessActions(config("delete")).apply(
-        archives_to_clean=[[str(path), str(tmp_path / "missing")]]
+        archives_to_clean=[paths],
+        expected_generations=dict(zip(map(absolute_path_key, paths), file_generation_tokens(paths))),
     )
     assert {item.status for item in report} == {"deleted", "missing"}
     assert not path.exists()
@@ -317,6 +331,8 @@ def test_replacement_plan_cleans_added_volumes_and_preserves_rejected_paths(tmp_
     scope.register([task])
     task.key = "resolved"
     task.cleanup_parts = [str(first), str(added)]
+    # Retry inputs are registered before extraction, including added volumes.
+    scope.register([task])
 
     outcome = _release_and_apply(scope, task, OutcomeKind.COMPLETE_SUCCESS)
     assert set(outcome.deleted) == {str(first), str(added)}
@@ -361,3 +377,76 @@ def test_failed_sibling_veto_survives_replacement_plan_and_clears_after_release(
     table.register(failed)
     table.mark_cleanup_eligible(failed)
     assert table.release(failed).cleanup_paths == (shared,)
+
+
+@pytest.mark.parametrize("mode", ["delete", "recycle"])
+def test_destructive_cleanup_requires_recorded_generations(tmp_path, monkeypatch, mode):
+    source = tmp_path / "source.dat"
+    source.write_text("preserve")
+    monkeypatch.setattr(cleanup, "prepare_file_cleanup", lambda *_args: pytest.fail("must reject before native cleanup"))
+    with pytest.raises(ValueError, match="generations recorded before extraction"):
+        PostProcessActions(config(mode)).apply(archives_to_clean=[[str(source)]])
+    assert source.exists()
+
+
+def test_plan_reconciliation_drops_abandoned_generations_immediately(tmp_path, monkeypatch):
+    import sunpack_native
+
+    monkeypatch.setattr(sunpack_native, "file_generation_tokens", lambda paths: ["snapshot"] * len(paths))
+    scope = _scope("delete")
+    task = _Task("retry", [tmp_path / "start.001"])
+    scope.register([task])
+    for index in range(100):
+        current = tmp_path / f"part-{index}.001"
+        task.cleanup_parts = [str(current)]
+        scope.register([task])
+        assert scope._table._generations == {absolute_path_key(current): "snapshot"}
+        assert len(scope._table._counts) == 1
+    scope.sweep_requests()
+    assert scope._table._generations == {}
+    assert scope._table._counts == {}
+
+
+def test_reconciled_batch_transfers_generation_to_the_new_owner(tmp_path, monkeypatch):
+    import sunpack_native
+
+    batches = []
+    def snapshots(paths):
+        batches.append(tuple(paths))
+        return ["snapshot"] * len(paths)
+
+    monkeypatch.setattr(sunpack_native, "file_generation_tokens", snapshots)
+    path, added = tmp_path / "shared.001", tmp_path / "new.002"
+    scope = _scope("delete")
+    first = _Task("first", [path])
+    second = _Task("second", [added])
+    scope.register([first, second])
+    first.cleanup_parts = [str(added)]
+    second.cleanup_parts = [str(path)]
+    scope.register([first, second])
+    assert len(batches) == 1
+    assert scope._table.generation_for(str(path)) == "snapshot"
+    scope.release_task(first, outcome_kind=OutcomeKind.FAILURE)
+    request = scope.release_task(second, outcome_kind=OutcomeKind.COMPLETE_SUCCESS)
+    assert request.generations == ((absolute_path_key(path), "snapshot"),)
+    assert scope._table._generations == {}
+
+
+@pytest.mark.parametrize("terminal", ["success", "failure", "sweep"])
+def test_final_release_drops_task_references_and_generation_storage(tmp_path, terminal):
+    table = CleanupRefTable()
+    path = str(tmp_path / "carrier.dat")
+    task = _Task("owner", [path])
+    reference = weakref.ref(task)
+    table.register(task, generations={absolute_path_key(path): "snapshot"})
+    if terminal == "sweep":
+        table.sweep()
+    else:
+        if terminal == "success":
+            table.mark_cleanup_eligible(task)
+        table.release(task)
+    del task
+    gc.collect()
+    assert reference() is None
+    assert table._owned == table._counts == table._generations == {}
+    assert table._preserved == set()

@@ -33,13 +33,13 @@ class PostProcessActions:
         flatten_outputs: bool | None = None,
         archives_to_clean: Iterable[Iterable[str]] | None = None,
         flatten_targets: Iterable[str] | None = None,
-        previous_cleanup: dict[str, ArchiveCleanupResult] | None = None,
+        expected_generations: dict[str, str | None] | None = None,
     ) -> list[ArchiveCleanupResult]:
         results: list[ArchiveCleanupResult] = []
         if cleanup_archives:
             results = self.cleanup.cleanup_success_archives(
                 [list(parts) for parts in (archives_to_clean or [])],
-                previous_cleanup,
+                expected_generations=expected_generations,
             )
 
         if flatten_outputs is None:

@@ -27,6 +27,7 @@
 #include <string>
 
 #include <unordered_set>
+#include <unordered_map>
 
 #include <utility>
 
@@ -571,27 +572,6 @@ namespace sunpack::sevenzip
         UInt64 bytes_written_ = 0;
     };
 
-    inline std::filesystem::path browser_style_available_path(const std::filesystem::path &requested)
-    {
-        std::error_code error;
-        if (!std::filesystem::exists(requested, error))
-        {
-            return requested;
-        }
-        const auto parent = requested.parent_path();
-        const auto stem = requested.stem().wstring();
-        const auto extension = requested.extension().wstring();
-        for (unsigned int index = 1;; ++index)
-        {
-            const auto candidate = parent / (stem + L"(" + std::to_wstring(index) + L")" + extension);
-            error.clear();
-            if (!std::filesystem::exists(candidate, error))
-            {
-                return candidate;
-            }
-        }
-    }
-
     inline bool directory_is_empty_or_missing(const std::filesystem::path &path)
     {
         std::error_code error;
@@ -611,6 +591,63 @@ namespace sunpack::sevenzip
                        { return static_cast<wchar_t>(std::towlower(value)); });
         return key;
     }
+
+    class OutputPathAllocator
+    {
+    public:
+        void reserve(std::size_t count) { used_.reserve(count); }
+
+        void clear() noexcept
+        {
+            std::unordered_set<std::wstring>{}.swap(used_);
+            std::unordered_map<std::wstring, std::size_t>{}.swap(next_numbers_);
+        }
+
+        std::filesystem::path allocate(const std::filesystem::path &requested, bool initially_empty)
+        {
+            auto key = normalized_output_path_key(requested);
+            // Keep the common empty-output case to one hash-set insertion.
+            if (initially_empty)
+            {
+                const auto reservation = used_.insert(std::move(key));
+                if (reservation.second) { return requested; }
+                key = *reservation.first;
+            }
+            if (!initially_empty && available(requested, key))
+            {
+                used_.insert(std::move(key));
+                return requested;
+            }
+            auto &next = next_numbers_[key];
+            if (next == 0) { next = 1; }
+            const auto parent = requested.parent_path();
+            const auto stem = requested.stem().wstring();
+            const auto extension = requested.extension().wstring();
+            for (;;)
+            {
+                const auto candidate = parent / (stem + L"(" + std::to_wstring(next++) + L")" + extension);
+                auto candidate_key = normalized_output_path_key(candidate);
+                if (available(candidate, candidate_key))
+                {
+                    used_.insert(std::move(candidate_key));
+                    return candidate;
+                }
+            }
+        }
+
+    private:
+        bool available(const std::filesystem::path &path, const std::wstring &key) const
+        {
+            // A queued or failed async write still owns its name. Never wait
+            // for it to appear on disk; every conflict advances the number.
+            if (used_.find(key) != used_.end()) { return false; }
+            std::error_code error;
+            return !std::filesystem::exists(path, error);
+        }
+
+        std::unordered_set<std::wstring> used_;
+        std::unordered_map<std::wstring, std::size_t> next_numbers_;
+    };
 
     inline bool is_windows_invalid_name_char(wchar_t value)
     {
@@ -787,7 +824,7 @@ namespace sunpack::sevenzip
 
                 output_root_initially_empty_(directory_is_empty_or_missing(output_root_))
         {
-            used_output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
+            output_paths_.reserve(static_cast<std::size_t>(estimated_items) * 2U + 1U);
             created_directories_.reserve(static_cast<std::size_t>(estimated_items) + 1U);
         }
 
@@ -835,6 +872,10 @@ namespace sunpack::sevenzip
                 return;
             }
             output_finalized_ = true;
+            // Decoder callbacks are over. Writers own their output paths;
+            // release reservations and directory-cache buckets before draining.
+            output_paths_.clear();
+            std::unordered_set<std::wstring>{}.swap(created_directories_);
             if (!async_writer_)
             {
                 return;
@@ -1352,17 +1393,7 @@ namespace sunpack::sevenzip
 
         std::filesystem::path available_output_path(const std::filesystem::path &requested)
         {
-            const auto requested_key = normalized_output_path_key(requested);
-            if (output_root_initially_empty_ && used_output_paths_.insert(requested_key).second)
-            {
-                return requested;
-            }
-            auto candidate = browser_style_available_path(requested);
-            while (!used_output_paths_.insert(normalized_output_path_key(candidate)).second)
-            {
-                candidate = browser_style_available_path(candidate);
-            }
-            return candidate;
+            return output_paths_.allocate(requested, output_root_initially_empty_);
         }
 
         // 可暂停的目录创建，与根输出目录创建共用同一个原语。
@@ -1626,7 +1657,7 @@ namespace sunpack::sevenzip
 
         bool output_root_initially_empty_ = false;
 
-        std::unordered_set<std::wstring> used_output_paths_;
+        OutputPathAllocator output_paths_;
 
         std::unordered_set<std::wstring> created_directories_;
 
