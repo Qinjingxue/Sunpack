@@ -2,52 +2,39 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge, compact_evidence_value
 from sunpack.core.support.json_values import jsonable_value as _jsonable
 
 
-def ensure_knowledge(target: Any) -> ArchiveKnowledge:
-    if isinstance(target, ArchiveKnowledge):
-        return target
-    if hasattr(target, "knowledge") and callable(target.knowledge):
-        return target.knowledge()
-    return ArchiveKnowledge.from_any(target)
+if TYPE_CHECKING:
+    from sunpack.core.contracts.tasks import ArchiveTask
+
+
+def ensure_knowledge(target: ArchiveTask | ArchiveKnowledge) -> ArchiveKnowledge:
+    return target if isinstance(target, ArchiveKnowledge) else target.knowledge()
 
 
 def commit_task_knowledge(
-    task: Any,
-    knowledge: ArchiveKnowledge | dict[str, Any],
+    task: ArchiveTask,
+    knowledge: ArchiveKnowledge,
     *,
     phase_timer: Any | None = None,
     phase_prefix: str = "commit_task_knowledge",
 ) -> ArchiveKnowledge:
-    with _phase(phase_timer, f"{phase_prefix}_ensure_payload"):
-        payload = ensure_knowledge(knowledge)
-    existing = ArchiveKnowledge()
+    payload = knowledge
     with _phase(phase_timer, f"{phase_prefix}_existing_knowledge"):
-        if hasattr(task, "knowledge") and callable(task.knowledge):
-            existing = task.knowledge()
-        current_meta = existing.get("_meta") if isinstance(existing.get("_meta"), dict) else {}
-    try:
-        revision = int(current_meta.get("revision", 0) or 0) + 1
-    except (TypeError, ValueError):
-        revision = 1
-    meta = payload.get("_meta") if isinstance(payload.get("_meta"), dict) else {}
-    payload.set("_meta", {**meta, "revision": revision})
+        existing = task.knowledge()
+    payload.set("_meta", {**payload.get("_meta", {}), "revision": existing.revision() + 1})
     with _phase(phase_timer, f"{phase_prefix}_set_knowledge"):
-        previous_payload = existing.to_dict()
-        payload_dict = payload.incremental_snapshot(previous_payload)
-        if hasattr(task, "_replace_knowledge_payload") and callable(task._replace_knowledge_payload):
-            task._replace_knowledge_payload(payload_dict, knowledge_cache=payload)
-        elif hasattr(task, "set_knowledge") and callable(task.set_knowledge):
-            task.set_knowledge(payload_dict)
+        payload_dict = payload.incremental_snapshot(existing.to_dict())
+        task._replace_knowledge_payload(payload_dict, knowledge_cache=payload)
     return payload
 
 
 def write_value(
-    target: Any,
+    target: ArchiveTask | ArchiveKnowledge,
     path: str,
     value: Any,
     *,
@@ -67,7 +54,7 @@ def write_value(
 
 
 def write_payload(
-    target: Any,
+    target: ArchiveTask | ArchiveKnowledge,
     namespace: str,
     payload: dict[str, Any],
     *,
@@ -91,7 +78,7 @@ def write_payload(
 
 
 def write_prepared_payload(
-    target: Any,
+    target: ArchiveTask | ArchiveKnowledge,
     namespace: str,
     payload: dict[str, Any],
     *,
@@ -120,7 +107,7 @@ def prepare_knowledge_value(value: Any) -> Any:
 
 
 def write_flags(
-    target: Any,
+    target: ArchiveTask | ArchiveKnowledge,
     namespace: str,
     flags: list[str] | tuple[str, ...] | set[str],
     *,
@@ -148,7 +135,7 @@ def write_flags(
 
 
 def append_history(
-    target: Any,
+    target: ArchiveTask | ArchiveKnowledge,
     path: str,
     item: dict[str, Any],
     *,
@@ -170,7 +157,7 @@ def append_history(
 
 
 def write_evidence(
-    target: Any,
+    target: ArchiveTask | ArchiveKnowledge,
     *,
     path: str,
     value: Any,

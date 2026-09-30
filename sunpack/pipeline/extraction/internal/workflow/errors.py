@@ -24,7 +24,7 @@ def should_retry_extract_failure(
     is_split_archive: bool = False,
 ) -> bool:
     err_lower = _norm(err_text)
-    worker_result = worker_result_payload(run_result) or worker_result_payload(err_text)
+    worker_result = worker_result_payload(run_result)
     if worker_result:
         if worker_result.get("wrong_password") or worker_result.get("damaged") or worker_result.get("missing_volume"):
             return False
@@ -60,7 +60,7 @@ def classify_extract_failure(
     archive_name = os.path.basename(archive or "").lower()
     is_split_archive = is_split_archive or looks_like_split_archive_name(archive_name)
     err_lower = _norm(err_text)
-    worker_result = worker_result_payload(run_result) or worker_result_payload(err_text)
+    worker_result = worker_result_payload(run_result)
     if worker_result:
         if worker_result.get("missing_volume"):
             return _failure(

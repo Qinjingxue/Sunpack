@@ -50,7 +50,7 @@ def build_worker_diagnostics(
     result_payload: dict[str, Any] | None = None,
     progress_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    if isinstance(result_payload, dict):
+    if result_payload is not None:
         result = result_payload
         parsed_progress_events = list(progress_events or [])
     else:
@@ -86,39 +86,23 @@ def build_worker_diagnostics(
     return diagnostics
 
 
-def worker_result_payload(completed_or_text: Any) -> dict[str, Any]:
-    diagnostics = getattr(completed_or_text, "worker_diagnostics", None)
-    if isinstance(diagnostics, dict):
-        result = diagnostics.get("result")
-        if isinstance(result, dict) and result:
-            return result
-    text = completed_or_text if isinstance(completed_or_text, str) else ""
-    if not text and completed_or_text is not None:
-        text = f"{getattr(completed_or_text, 'stdout', '')}\n{getattr(completed_or_text, 'stderr', '')}"
-    for event in reversed(_json_events(str(text or ""))):
-        if event.get("type") == "result":
-            return event
-    return {}
+def worker_result_payload(completed: subprocess.CompletedProcess | None) -> dict[str, Any]:
+    return completed.worker_diagnostics["result"] if completed is not None else {}
 
 
 def compact_success_worker_diagnostics(diagnostics: dict[str, Any]) -> None:
     """Drop transient native worker rows after the output inventory owns them."""
-    result = diagnostics.get("result") if isinstance(diagnostics, dict) else None
-    if not isinstance(result, dict) or result.get("status") != "ok":
+    result = diagnostics.get("result", {})
+    if result.get("status") != "ok":
         return
-    manifest = result.get("verified_manifest")
-    if not isinstance(manifest, dict) or not manifest.get("validated"):
+    manifest = result.get("verified_manifest", {})
+    if not manifest.get("validated"):
         return
-    inventory = manifest.get("inventory")
-    if not isinstance(inventory, dict) or not inventory.get("complete"):
+    inventory = manifest.get("inventory", {})
+    if not inventory.get("complete"):
         return
     manifest.pop("native_rows", None)
-    native = result.get("diagnostics")
-    if not isinstance(native, dict):
-        return
-    output_trace = native.get("output_trace")
-    if isinstance(output_trace, dict):
-        output_trace.pop("native_items", None)
+    result.get("diagnostics", {}).get("output_trace", {}).pop("native_items", None)
 
 
 def _json_events(text: str) -> list[dict[str, Any]]:
@@ -131,16 +115,14 @@ def _json_events(text: str) -> list[dict[str, Any]]:
 
 
 def native_worker_manifest(result: dict[str, Any]) -> NativeWorkerManifest | None:
-    manifest = result.get("verified_manifest") if isinstance(result.get("verified_manifest"), dict) else {}
-    value = manifest.get("native_rows")
-    return value if isinstance(value, NativeWorkerManifest) else None
+    manifest = result.get("verified_manifest", {})
+    return manifest.get("native_rows")
 
 
 def native_output_trace(result: dict[str, Any]) -> NativeOutputTrace | None:
-    native = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
-    trace = native.get("output_trace") if isinstance(native.get("output_trace"), dict) else {}
-    value = trace.get("native_items")
-    return value if isinstance(value, NativeOutputTrace) else None
+    native = result.get("diagnostics", {})
+    trace = native.get("output_trace", {})
+    return trace.get("native_items")
 
 
 def _tail_lines(text: str, limit: int = _STDIO_TAIL_LINES) -> list[str]:

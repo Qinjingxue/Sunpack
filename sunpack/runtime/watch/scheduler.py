@@ -16,7 +16,7 @@ from typing import Callable, Iterable
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.core.config.detection_view import discovery_run_config
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
-from sunpack.core.contracts.failures import FailureKind
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.retry_targets import (
     failure_contains,
     failure_is_password,
@@ -27,8 +27,8 @@ from sunpack.core.contracts.retry_targets import (
     result_path,
     target_results,
 )
-from sunpack.core.contracts.results import OutcomeKind
-from sunpack.core.contracts.pipeline import PipelineTarget
+from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
+from sunpack.core.contracts.pipeline import PipelineResponse, PipelineTarget
 from sunpack.runtime.watch.log import WatchLogStore
 from sunpack.runtime.watch.quiet_policy import AdaptiveQuietPolicy, AdaptiveQuietTracker
 from sunpack.runtime.watch.scanner import (
@@ -135,11 +135,8 @@ class WatchScheduler:
         wake_callback: Callable[[], None] | None = None,
     ):
         self.config = config
-        cli_config = config.get("cli") if isinstance(config.get("cli"), dict) else {}
-        self.i18n = I18nContext(cli_config.get("language", "en"))
-        watch_config = dict(DEFAULT_WATCH_CONFIG)
-        if isinstance(config.get("watch"), dict):
-            watch_config.update(config["watch"])
+        self.i18n = I18nContext(config["cli"]["language"])
+        watch_config = config["watch"]
         self.watch_roots = [os.path.abspath(path) for path in watch_roots]
         validate_ntfs_watch_roots(self.watch_roots)
         expanded_out_dir = os.path.expanduser(out_dir)
@@ -1646,10 +1643,7 @@ class WatchScheduler:
         summary = response.summary
         self._remember_recent_passwords(response.recent_passwords)
         claimed_paths = _response_claimed_paths(response, candidate.path)
-        coalesced_from = str(
-            getattr(getattr(response, "discovery", None), "coalesced_from_request_id", "")
-            or ""
-        )
+        coalesced_from = response.discovery.coalesced_from_request_id
         if coalesced_from:
             # Coalescing transfers execution ownership to another pipeline
             # request; it is not a terminal result.  In particular, a password
@@ -1674,22 +1668,17 @@ class WatchScheduler:
                 target_result = results[0]
         outcome_kind = _summary_outcome_kind(summary, target_result)
         direct_outcome = result_outcome(target_result) or outcome_kind
-        target_output_dir = (
-            target_result.get("output_dir", "")
-            if isinstance(target_result, dict)
-            else getattr(target_result, "output_dir", "")
-        ) if target_result is not None else ""
+        target_output_dir = target_result.output_dir if target_result is not None else ""
         generated_output_dirs = dedupe_normalized_paths([
-            *getattr(response.artifacts, "shell_refresh_paths", ()),
+            *response.artifacts.shell_refresh_paths,
             *(
                 str(item.get("out_dir") or "")
-                for item in (getattr(summary, "recovered_outputs", []) or [])
-                if isinstance(item, dict)
+                for item in summary.recovered_outputs
             ),
             str(target_output_dir or ""),
         ])
 
-        failures = list(getattr(summary, "failures", []) or [])
+        failures = summary.failures
         for item in results:
             failure = result_failure(item)
             if failure is not None and failure not in failures:
@@ -1697,7 +1686,6 @@ class WatchScheduler:
 
         direct_failure = result_failure(target_result)
         if direct_failure is None and target_result is None and len(failures) == 1:
-            # Lightweight scheduler fakes historically expose only summary.failures.
             direct_failure = failures[0]
 
         direct_missing = bool(
@@ -1809,7 +1797,7 @@ class WatchScheduler:
             if failure not in waiting_failures
             and failure not in recorded_password_failures
         ]
-        failed = list(getattr(summary, "failed_tasks", []) or [])
+        failed = summary.failed_tasks
 
         if terminal_failures:
             payloads = [_failure_to_dict(failure) for failure in terminal_failures]
@@ -2198,37 +2186,21 @@ def _paths_match(path: str, expected: str, *, recursive: bool) -> bool:
     )
 
 
-def _response_claimed_paths(response, fallback_path: str) -> list[str]:
-    discovery = getattr(response, "discovery", None)
-    claimed = list(getattr(discovery, "claimed_paths", ()) or ())
-    return dedupe_normalized_paths([*claimed, fallback_path])
+def _response_claimed_paths(response: PipelineResponse, fallback_path: str) -> list[str]:
+    return dedupe_normalized_paths([*response.discovery.claimed_paths, fallback_path])
 
 
-def _target_result_for_path(summary, path: str):
-    expected = os.path.normcase(os.path.abspath(path))
-    for item in list(getattr(summary, "target_results", []) or []):
-        raw_path = item.get("input_path", "") if isinstance(item, dict) else getattr(item, "input_path", "")
-        if raw_path and os.path.normcase(os.path.abspath(str(raw_path))) == expected:
-            return item
-    return None
+def _target_result_for_path(summary: RunSummary, path: str) -> TargetRunResult | None:
+    expected = path_key(os.path.abspath(path))
+    return next((item for item in summary.target_results if path_key(os.path.abspath(item.input_path)) == expected), None)
 
 
-def _summary_outcome_kind(summary, target_result) -> OutcomeKind:
-    raw = (
-        target_result.get("outcome_kind")
-        if isinstance(target_result, dict)
-        else getattr(target_result, "outcome_kind", None)
-    ) if target_result is not None else None
-    if isinstance(raw, OutcomeKind):
-        return raw
-    if raw:
-        try:
-            return OutcomeKind(str(raw))
-        except ValueError:
-            pass
-    if int(getattr(summary, "partial_success_count", 0) or 0) > 0:
+def _summary_outcome_kind(summary: RunSummary, target_result: TargetRunResult | None) -> OutcomeKind:
+    if target_result is not None:
+        return target_result.outcome_kind
+    if summary.partial_success_count:
         return OutcomeKind.PARTIAL_SUCCESS
-    if int(getattr(summary, "success_count", 0) or 0) > 0:
+    if summary.success_count:
         return OutcomeKind.COMPLETE_SUCCESS
     return OutcomeKind.FAILURE
 
@@ -2245,23 +2217,12 @@ def _password_source_signature(
     return hashlib.sha256(payload).hexdigest()
 
 
-def _failure_to_dict(failure) -> dict:
-    if isinstance(failure, dict):
-        return dict(failure)
-    if hasattr(failure, "to_dict"):
-        try:
-            return failure.to_dict()
-        except Exception:
-            return {}
-    return {}
+def _failure_to_dict(failure: FailureInfo | None) -> dict:
+    return failure.to_dict() if failure is not None else {}
 
 
-def _failure_message(failure, fallback: str) -> str:
-    if isinstance(failure, dict):
-        message = failure.get("message")
-    else:
-        message = getattr(failure, "message", "") if failure is not None else ""
-    return str(message or fallback)
+def _failure_message(failure: FailureInfo | None, fallback: str) -> str:
+    return (failure.message or fallback) if failure is not None else fallback
 
 
 def _failure_payload(
@@ -2318,15 +2279,15 @@ def _directory_password_signature(scope_dir: str, config: dict) -> str:
         return f"unknown:{getattr(exc, 'winerror', None) or exc.errno or 0}"
     return ":".join((
         str(int(stat_result.st_size)),
-        str(int(getattr(stat_result, "st_mtime_ns", int(stat_result.st_mtime * 1_000_000_000)))),
-        str(int(getattr(stat_result, "st_ctime_ns", int(stat_result.st_ctime * 1_000_000_000)))),
+        str(stat_result.st_mtime_ns),
+        str(stat_result.st_ctime_ns),
     ))
 
 
-def _summary_processed_no_tasks(summary) -> bool:
+def _summary_processed_no_tasks(summary: RunSummary) -> bool:
     return (
-        int(getattr(summary, "success_count", 0) or 0) <= 0
-        and not list(getattr(summary, "failed_tasks", []) or [])
-        and not list(getattr(summary, "processed_keys", []) or [])
-        and not list(getattr(summary, "recovered_outputs", []) or [])
+        summary.success_count <= 0
+        and not summary.failed_tasks
+        and not summary.processed_keys
+        and not summary.recovered_outputs
     )

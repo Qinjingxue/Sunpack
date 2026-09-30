@@ -20,21 +20,15 @@ _DISCOVERED = False
 
 def register_verification_method(name: str):
     def decorator(factory_or_class):
-        method_name = name.strip()
-        if not method_name:
-            raise ValueError("verification method name must not be empty")
-        _REGISTRY[method_name] = factory_or_class
+        _REGISTRY[name] = factory_or_class
         return factory_or_class
 
     return decorator
 
 
-def get_verification_method(name: str) -> VerificationMethod | None:
+def get_verification_method(name: str) -> VerificationMethod:
     discover_verification_methods()
-    factory = _REGISTRY.get(name)
-    if factory is None:
-        return None
-    return factory()
+    return _REGISTRY[name]()
 
 
 def registered_verification_methods() -> dict[str, VerificationMethodFactory]:
@@ -48,4 +42,3 @@ def discover_verification_methods() -> None:
         return
     discover_package_modules("sunpack.pipeline.verification.methods")
     _DISCOVERED = True
-

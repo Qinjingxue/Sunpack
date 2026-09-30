@@ -319,7 +319,6 @@ impl NativeWorkerManifest {
             file_count: self.file_count,
             dir_count: self.dir_count,
             total_size: self.total_size,
-            transient_file_count: 0,
             unreadable_count: 0,
             files: Arc::clone(&self.files),
             worker_crc_available: !self.files.is_empty(),
@@ -337,7 +336,6 @@ pub(crate) struct NativeOutputInventory {
     file_count: usize,
     dir_count: usize,
     total_size: u64,
-    transient_file_count: usize,
     unreadable_count: usize,
     files: Arc<Vec<OutputFileRecord>>,
     worker_crc_available: bool,
@@ -403,7 +401,6 @@ pub(crate) fn rebase_output_inventory_root_impl(
         file_count: inventory.file_count,
         dir_count: inventory.dir_count,
         total_size: inventory.total_size,
-        transient_file_count: inventory.transient_file_count,
         unreadable_count: inventory.unreadable_count,
         files: if changed {
             Arc::new(files)
@@ -449,10 +446,6 @@ impl NativeOutputInventory {
     #[getter]
     fn total_size(&self) -> u64 {
         self.total_size
-    }
-    #[getter]
-    fn transient_file_count(&self) -> usize {
-        self.transient_file_count
     }
     #[getter]
     fn unreadable_count(&self) -> usize {
@@ -1571,7 +1564,7 @@ pub(crate) fn scan_output_inventory(py: Python<'_>, output_dir: String) -> Nativ
 #[pyfunction]
 #[pyo3(signature = (
     root, files, exists, is_dir, file_count, dir_count, total_size,
-    transient_file_count, unreadable_count, worker_crc_available,
+    unreadable_count, worker_crc_available,
     worker_inventory_complete, identity_paths
 ))]
 pub(crate) fn output_inventory_from_serialized(
@@ -1583,7 +1576,6 @@ pub(crate) fn output_inventory_from_serialized(
     file_count: usize,
     dir_count: usize,
     total_size: u64,
-    transient_file_count: usize,
     unreadable_count: usize,
     worker_crc_available: bool,
     worker_inventory_complete: bool,
@@ -1636,7 +1628,6 @@ pub(crate) fn output_inventory_from_serialized(
         file_count,
         dir_count,
         total_size,
-        transient_file_count,
         unreadable_count,
         files: Arc::new(records),
         worker_crc_available,
@@ -1718,7 +1709,6 @@ pub(crate) fn scan_output_inventory_impl(output_dir: &str) -> NativeOutputInvent
         file_count: stats.file_count,
         dir_count: stats.dir_count,
         total_size: stats.total_size,
-        transient_file_count: stats.transient_file_count,
         unreadable_count: stats.unreadable_count,
         files: Arc::new(stats.files),
         worker_crc_available: false,
@@ -2077,7 +2067,6 @@ struct OutputTreeStats {
     file_count: usize,
     dir_count: usize,
     total_size: u64,
-    transient_file_count: usize,
     unreadable_count: usize,
     files: Vec<OutputFileRecord>,
 }
@@ -2118,9 +2107,6 @@ fn walk_output_tree(root: &Path, current: &Path, stats: &mut OutputTreeStats) {
         stats.file_count += 1;
         let size = metadata.len();
         stats.total_size = stats.total_size.saturating_add(size);
-        if is_transient_file_name(&file_name) {
-            stats.transient_file_count += 1;
-        }
         let relative = path
             .strip_prefix(root)
             .map(path_to_string)
@@ -2140,13 +2126,6 @@ fn walk_output_tree(root: &Path, current: &Path, stats: &mut OutputTreeStats) {
             magic: Vec::new(),
         });
     }
-}
-
-fn is_transient_file_name(name: &str) -> bool {
-    let lower = name.to_ascii_lowercase();
-    [".tmp", ".temp", ".part", ".partial", ".crdownload"]
-        .iter()
-        .any(|suffix| lower.ends_with(suffix))
 }
 
 fn compile_case_insensitive_regex_set(patterns: Vec<String>) -> PyResult<RegexSet> {

@@ -6,8 +6,7 @@ import threading
 from typing import Any
 
 from sunpack.core.config.advanced_defaults import _payload as _advanced_defaults_payload
-from sunpack.core.config.detection_view import DIRECTORY_SCAN_MODES, directory_scan_mode
-from sunpack.core.config.schema import ConfigSchemaError, config_fields, normalize_config, validate_external_config
+from sunpack.core.config.schema import ConfigSchemaError, config_fields, normalize_config
 from sunpack.core.support.json_format import load_json_file
 from sunpack.core.support.resources import candidate_resource_paths, dedupe_paths, first_existing_path, program_data_dir
 from sunpack.core.support.process_executable import is_packaged_process
@@ -57,10 +56,7 @@ def _first_existing_config(filename: str, request_cwd: str | Path | None = None)
 
 def _known_config_sections() -> frozenset[str]:
     sections = {field.path[0] for field in config_fields().values()}
-    try:
-        sections.update(_advanced_defaults_payload())
-    except Exception:
-        pass
+    sections.update(_advanced_defaults_payload())
     return frozenset(sections)
 
 
@@ -71,7 +67,7 @@ def _load_override_payload() -> dict[str, Any]:
         return {}
     path = Path(raw)
     if path.is_file():
-        payload = _load_json(path)
+        payload = load_json_file(path)
     else:
         try:
             payload = json.loads(raw)
@@ -272,54 +268,6 @@ def clear_config_cache() -> None:
         _CONFIG_CACHE_PATH = None
 
 
-def _validate_pipeline(config: dict[str, Any]):
-    shortcut_errors = validate_external_config(config)
-    if shortcut_errors:
-        raise ConfigError("; ".join(shortcut_errors))
-
-    analysis = config.get("analysis")
-    prepass = analysis.get("prepass") if isinstance(analysis, dict) else None
-    removed_prepass_fields = {
-        "deep_scan",
-        "full_scan_max_bytes",
-        "full_scan_chunk_bytes",
-        "full_scan_max_hits",
-    }
-    obsolete = sorted(removed_prepass_fields & set(prepass or {}))
-    if obsolete:
-        raise ConfigError(
-            "Removed analysis.prepass fields: " + ", ".join(obsolete)
-            + "; use embedded_scan.enabled"
-        )
-
-    filesystem = config.get("filesystem")
-    if not isinstance(filesystem, dict):
-        raise ConfigError("Missing required config object: filesystem")
-    try:
-        scan_mode = directory_scan_mode(config)
-    except ValueError as exc:
-        raise ConfigError(str(exc)) from exc
-    if scan_mode not in DIRECTORY_SCAN_MODES:
-        allowed = ", ".join(sorted(DIRECTORY_SCAN_MODES))
-        raise ConfigError(f"filesystem.directory_scan_mode must be one of: {allowed}")
-    filters = filesystem.get("scan_filters")
-    if not isinstance(filters, list):
-        raise ConfigError("Missing required filesystem.scan_filters list")
-    for index, scan_filter in enumerate(filters):
-        if not isinstance(scan_filter, dict):
-            raise ConfigError(f"filesystem.scan_filters[{index}] must be an object")
-        if not isinstance(scan_filter.get("name"), str) or not scan_filter["name"].strip():
-            raise ConfigError(f"filesystem.scan_filters[{index}] must declare a filter name")
-        if "enabled" in scan_filter and not isinstance(scan_filter["enabled"], bool):
-            raise ConfigError(f"filesystem.scan_filters[{index}].enabled must be boolean")
-
-    detection = config.get("detection")
-    if not isinstance(detection, dict):
-        raise ConfigError("Missing required config object: detection")
-    if unknown := set(detection) - {"enabled"}:
-        raise ConfigError(f"Unknown detection field(s): {', '.join(sorted(unknown))}")
-
-
 def load_config(request_cwd: str | Path | None = None) -> dict[str, Any]:
     """Read the external configuration required to run the pipeline."""
     global _CONFIG_CACHE_SIGNATURE, _CONFIG_CACHE_VALUE, _CONFIG_CACHE_RAW_VALUE, _CONFIG_CACHE_PATH
@@ -334,10 +282,9 @@ def load_config(request_cwd: str | Path | None = None) -> dict[str, Any]:
         config_path, config = _load_layered_config_paths(simple_path, advanced_path, request_cwd=request_cwd)
     else:
         config_path, config = (_CONFIG_CACHE_PATH or simple_path or advanced_path), cached_raw
-    _validate_pipeline(config)
     raw_for_cache = copy.deepcopy(config)
     try:
-        normalized = normalize_config(config, validate=False)
+        normalized = normalize_config(config)
     except ConfigSchemaError as exc:
         raise ConfigError(str(exc)) from exc
     with _CONFIG_CACHE_LOCK:
@@ -346,31 +293,3 @@ def load_config(request_cwd: str | Path | None = None) -> dict[str, Any]:
         _CONFIG_CACHE_RAW_VALUE = raw_for_cache
         _CONFIG_CACHE_PATH = config_path
     return normalized
-
-
-def load_effective_config_payload(request_cwd: str | Path | None = None) -> tuple[Path, dict[str, Any]]:
-    global _CONFIG_CACHE_SIGNATURE, _CONFIG_CACHE_VALUE, _CONFIG_CACHE_RAW_VALUE, _CONFIG_CACHE_PATH
-    simple_path = _first_existing_config(SIMPLE_CONFIG_FILENAME, request_cwd)
-    advanced_path = _first_existing_config(ADVANCED_CONFIG_FILENAME, request_cwd)
-    signature = (_config_file_signature(simple_path), _config_file_signature(advanced_path), _override_signature())
-    with _CONFIG_CACHE_LOCK:
-        cached_raw = copy.deepcopy(_CONFIG_CACHE_RAW_VALUE) if (
-            signature == _CONFIG_CACHE_SIGNATURE
-            and _CONFIG_CACHE_RAW_VALUE is not None
-            and _CONFIG_CACHE_PATH is not None
-        ) else None
-    if cached_raw is None:
-        config_path, config = _load_layered_config_paths(simple_path, advanced_path, request_cwd=request_cwd)
-    else:
-        config_path, config = (_CONFIG_CACHE_PATH or simple_path or advanced_path), cached_raw
-    _validate_pipeline(config)
-    try:
-        normalized = normalize_config(config, validate=False)
-    except ConfigSchemaError as exc:
-        raise ConfigError(str(exc)) from exc
-    with _CONFIG_CACHE_LOCK:
-        _CONFIG_CACHE_SIGNATURE = signature
-        _CONFIG_CACHE_VALUE = copy.deepcopy(normalized)
-        _CONFIG_CACHE_RAW_VALUE = copy.deepcopy(config)
-        _CONFIG_CACHE_PATH = config_path
-    return config_path, config

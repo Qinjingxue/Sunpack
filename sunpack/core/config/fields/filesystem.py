@@ -26,7 +26,31 @@ def normalize_directory_scan_mode(value: Any) -> str:
     return mode
 
 
+def normalize_scan_filters(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        raise ValueError("filesystem.scan_filters must be a list")
+    filters = []
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"filesystem.scan_filters[{index}] must be an object")
+        name = item.get("name")
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"filesystem.scan_filters[{index}].name must not be empty")
+        filters.append({
+            **item,
+            "name": name.strip(),
+            "enabled": require_boolean(item.get("enabled", False), f"filesystem.scan_filters[{index}].enabled"),
+        })
+    return filters
+
+
 CONFIG_FIELDS = (
+    ConfigField(
+        path=("filesystem", "scan_filters"),
+        default=advanced_config_value(("filesystem", "scan_filters")),
+        normalize=normalize_scan_filters,
+        owner=__name__,
+    ),
     ConfigField(
         path=("filesystem", "scan_filters_enabled"),
         default=advanced_config_value(("filesystem", "scan_filters_enabled")),

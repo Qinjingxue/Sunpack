@@ -12,36 +12,6 @@ _CACHE_NAMESPACE = "embedded_archive_scan_v4"
 GLOBAL_CACHE.register_immutable_namespace(_CACHE_NAMESPACE)
 _SCAN_LOCKS = tuple(threading.Lock() for _ in range(32))
 
-_RESULT_FIELDS = frozenset({
-    "complete",
-    "signature_scan_complete",
-    "logical_resolution_complete",
-    "raw_hit_count",
-    "budget_exhausted",
-    "candidates",
-    "hits",
-    "read_bytes",
-    "file_size",
-})
-_CANDIDATE_FIELDS = frozenset({
-    "format",
-    "offset",
-    "end_offset",
-    "confidence",
-    "validation",
-    "candidate_kind",
-    "boundary_kind",
-    "extractable",
-})
-_HIT_FIELDS = frozenset({"name", "offset"})
-
-
-def _require_fields(value: dict[str, Any], required: frozenset[str], context: str) -> None:
-    missing = sorted(required.difference(value))
-    if missing:
-        raise TypeError(f"{context} missing required fields: {', '.join(missing)}")
-
-
 def scan_embedded_archives(
     path: str,
     *,
@@ -66,23 +36,13 @@ def scan_embedded_archives(
     return result
 
 
-def _normalize_native_result(value: Any, expected_size: int) -> EmbeddedScanResult:
-    if not isinstance(value, dict):
-        raise TypeError("Native scan_embedded_archives returned a non-dict result")
-    _require_fields(value, _RESULT_FIELDS, "Native scan_embedded_archives result")
+def _normalize_native_result(value: dict[str, Any], expected_size: int) -> EmbeddedScanResult:
     rows = value["candidates"]
-    if not isinstance(rows, list):
-        raise TypeError("Native scan_embedded_archives returned invalid candidates")
 
     candidates = []
     for row in rows:
-        if not isinstance(row, dict):
-            raise TypeError("Native scan_embedded_archives returned a non-dict candidate")
-        _require_fields(row, _CANDIDATE_FIELDS, "Native scan_embedded_archives candidate")
-        archive_format = str(row["format"] or "")
-        offset = int(row["offset"])
-        if not archive_format or offset < 0:
-            raise TypeError("Native scan_embedded_archives returned an invalid candidate")
+        archive_format = row["format"]
+        offset = row["offset"]
         end_offset = row["end_offset"]
         candidates.append(EmbeddedCandidate(
             format=archive_format,
@@ -96,8 +56,6 @@ def _normalize_native_result(value: Any, expected_size: int) -> EmbeddedScanResu
         ))
 
     raw_hits = value["hits"]
-    if not isinstance(raw_hits, list):
-        raise TypeError("Native scan_embedded_archives returned invalid hits")
     validated_formats = {item.format for item in candidates}
     hit_formats = {
         "zip_local": "zip", "zip_eocd": "zip", "rar4": "rar", "rar5": "rar",
@@ -106,11 +64,8 @@ def _normalize_native_result(value: Any, expected_size: int) -> EmbeddedScanResu
     }
     hits = []
     for row in raw_hits:
-        if not isinstance(row, dict):
-            raise TypeError("Native scan_embedded_archives returned a non-dict hit")
-        _require_fields(row, _HIT_FIELDS, "Native scan_embedded_archives hit")
-        name = str(row["name"] or "")
-        offset = int(row["offset"])
+        name = row["name"]
+        offset = row["offset"]
         if name and offset >= 0 and hit_formats.get(name) in validated_formats:
             hits.append(SignatureHit(name=name, offset=offset))
 
@@ -133,15 +88,6 @@ def _normalize_native_result(value: Any, expected_size: int) -> EmbeddedScanResu
 
 
 def embedded_result_from_dict(value: dict[str, Any]) -> EmbeddedScanResult:
-    _require_fields(value, _RESULT_FIELDS, "Embedded scan cache result")
-    for item in value["candidates"]:
-        if not isinstance(item, dict):
-            raise TypeError("Embedded scan cache contains a non-dict candidate")
-        _require_fields(item, _CANDIDATE_FIELDS, "Embedded scan cache candidate")
-    for item in value["hits"]:
-        if not isinstance(item, dict):
-            raise TypeError("Embedded scan cache contains a non-dict hit")
-        _require_fields(item, _HIT_FIELDS, "Embedded scan cache hit")
     return EmbeddedScanResult(
         complete=bool(value["complete"]),
         candidates=tuple(
@@ -186,6 +132,4 @@ def resolve_encrypted_rar_boundaries(
         [int(offset) for offset in offsets],
         [str(password) for password in passwords],
     )
-    if not isinstance(value, dict):
-        raise TypeError("Native encrypted RAR boundary resolver returned a non-dict result")
     return dict(value)

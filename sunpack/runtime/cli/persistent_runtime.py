@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable
 
-from sunpack.core.config.loader import config_source_key, load_config, load_effective_config_payload
+from sunpack.core.config.loader import config_source_key, load_config, load_raw_config_payload
 from sunpack.core.config.advanced_defaults import advanced_config_value
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.runtime.cli.runtime_state import server_runtime_active, set_server_runtime_active
@@ -77,7 +77,7 @@ def _snapshot_for(request_cwd: str | Path | None) -> _ConfigSnapshot:
     source_key = config_source_key(request_cwd)
     snapshot = _CONFIG_SNAPSHOTS.get(source_key)
     if snapshot is None:
-        config_path, raw_payload = load_effective_config_payload(request_cwd)
+        config_path, raw_payload = load_raw_config_payload(request_cwd)
         snapshot = _ConfigSnapshot(
             source_key=source_key,
             config_path=config_path,
@@ -98,7 +98,7 @@ def load_request_config(request_cwd: str | Path | None = None) -> dict[str, Any]
 def load_request_config_payload(request_cwd: str | Path | None = None) -> tuple[Path, dict[str, Any]]:
     """Return the external payload for a request without reloading an existing snapshot."""
     if not server_runtime_active():
-        return load_effective_config_payload(request_cwd)
+        return load_raw_config_payload(request_cwd)
     snapshot = _snapshot_for(request_cwd)
     return snapshot.config_path, copy.deepcopy(snapshot.raw_payload)
 

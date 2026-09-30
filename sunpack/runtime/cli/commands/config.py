@@ -3,7 +3,7 @@ from sunpack.runtime.cli.cli_constants import EXIT_USAGE
 from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_config_output_parser, localize_help_action
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.runtime.config_validation import validate_config_payload
-from sunpack.runtime.cli.persistent_runtime import load_request_config_payload
+from sunpack.runtime.cli.persistent_runtime import load_request_config, load_request_config_payload
 from sunpack.core.support.json_format import to_json_text
 
 COMMAND = "config"
@@ -41,7 +41,7 @@ def handle(args, ctx):
             if not args.json and not args.quiet:
                 print(to_json_text(payload), file=ctx.stdout, flush=True)
         elif args.config_action == "validate":
-            item = validate_config_payload(payload)
+            item = validate_config_payload(load_request_config(ctx.cwd))
             if not item["ok"]:
                 localized_errors = [ctx.t("cli.config.validation_error", error=error) for error in item["errors"]]
                 for error in localized_errors:

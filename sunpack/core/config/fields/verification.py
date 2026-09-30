@@ -5,6 +5,7 @@ from sunpack.core.config.schema import ConfigField, require_boolean
 
 
 VERIFICATION_DEFAULTS = advanced_config_value(("verification",))
+METHOD_DEFAULTS = {item["name"]: item for item in VERIFICATION_DEFAULTS["methods"]}
 
 
 def normalize_verification_config(value: Any) -> dict[str, Any]:
@@ -24,8 +25,8 @@ def normalize_verification_config(value: Any) -> dict[str, Any]:
         config["cleanup_failed_output"],
         "verification.cleanup_failed_output",
     )
-    config["complete_accept_threshold"] = _float_field(config, "complete_accept_threshold")
-    config["partial_accept_threshold"] = _float_field(config, "partial_accept_threshold")
+    config["complete_accept_threshold"] = min(1.0, max(0.0, _float_field(config, "complete_accept_threshold")))
+    config["partial_accept_threshold"] = min(1.0, max(0.0, _float_field(config, "partial_accept_threshold")))
     config["retry_on_verification_failure"] = require_boolean(
         config["retry_on_verification_failure"],
         "verification.retry_on_verification_failure",
@@ -60,12 +61,19 @@ def _normalize_methods(value: Any) -> list[dict[str, Any]]:
         name = str(item.get("name") or "").strip()
         if not name:
             raise ValueError(f"verification.methods[{index}].name must not be empty")
-        normalized = dict(item)
+        defaults = METHOD_DEFAULTS.get(name, {})
+        normalized = {**defaults, **item}
         normalized["name"] = name
         normalized["enabled"] = require_boolean(
             item.get("enabled", True),
             f"verification.methods[{index}].enabled",
         )
+        for key, default in defaults.items():
+            if type(default) in (int, float):
+                try:
+                    normalized[key] = max(0, type(default)(normalized[key]))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"verification.methods[{index}].{key} must be a number") from exc
         methods.append(normalized)
     return methods
 

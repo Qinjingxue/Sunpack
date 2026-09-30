@@ -16,8 +16,7 @@ _LOG = logging.getLogger(__name__)
 
 
 def _configured_runtime_process_mode(config: dict) -> str:
-    runtime = config.get("runtime") if isinstance(config.get("runtime"), dict) else {}
-    return str(runtime.get("process_mode") or "normal").strip().lower()
+    return config["runtime"]["process_mode"]
 
 
 class RuntimeHost:
@@ -95,7 +94,7 @@ class RuntimeHost:
             from sunpack.core.platform.windows.toast_host import ToastManager
 
             def toast_manager_factory(run_config: dict, state_dir: str, logger) -> ToastManager:
-                watch_config = run_config.get("watch") if isinstance(run_config.get("watch"), dict) else {}
+                watch_config = run_config["watch"]
                 return ToastManager(
                     diagnostic_log_path=str(Path(state_dir) / "toast_host_events.jsonl"),
                     update_interval_ms=int(watch_config.get("toast_update_interval_ms", 50)),

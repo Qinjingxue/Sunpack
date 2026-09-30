@@ -24,8 +24,6 @@ def is_valid_runtime_id(value: str) -> bool:
 
 def set_runtime_id(value: str | None) -> None:
     global _runtime_id
-    if value is not None and not is_valid_runtime_id(value):
-        raise ValueError(f"invalid SunPack runtime identity: {value!r}")
     _runtime_id = value
 
 
@@ -68,8 +66,6 @@ def require_runtime_id() -> str:
 
 def runtime_id_argument(value: str | None = None) -> str:
     candidate = require_runtime_id() if value is None else value
-    if not is_valid_runtime_id(candidate):
-        raise ValueError(f"invalid SunPack runtime identity: {candidate!r}")
     return RUNTIME_ID_ARGUMENT_PREFIX + candidate
 
 

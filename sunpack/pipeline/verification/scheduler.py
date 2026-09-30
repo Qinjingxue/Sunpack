@@ -20,8 +20,8 @@ from sunpack.core.contracts.verification import (
 
 
 class VerificationScheduler:
-    def __init__(self, config: dict[str, Any] | None = None, password_session: PasswordSession | None = None):
-        self.config = self._verification_config(config or {})
+    def __init__(self, config: dict[str, Any], password_session: PasswordSession | None = None):
+        self.config = config["verification"]
         self.password_session = password_session
 
     def verify(self, task: ArchiveTask, extraction_result: ExtractionResult, *, phase_timer: Callable[..., Any] | None = None, phase_prefix: str = "verify") -> VerificationResult:
@@ -95,11 +95,6 @@ class VerificationScheduler:
                 phase_prefix=f"{phase_prefix}_pipeline",
             )
         return result
-
-    def _verification_config(self, config: dict[str, Any]) -> dict:
-        if "verification" in config and isinstance(config.get("verification"), dict):
-            return dict(config["verification"])
-        return dict(config or {})
 
 
 def _phase(timer: Callable[..., Any] | None, name: str):

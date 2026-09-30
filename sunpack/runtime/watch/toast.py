@@ -170,7 +170,7 @@ class WatchToastCoordinator:
     """Build one debounced Toast snapshot from all extraction-ready requests."""
 
     def __init__(self, host, config: dict, state_dir: str):
-        watch = config.get("watch") if isinstance(config.get("watch"), dict) else {}
+        watch = config["watch"]
         self.host = host
         self.i18n = I18nContext(config.get("cli", {}).get("language") if isinstance(config.get("cli"), dict) else None)
         self._debounce_seconds = max(0.0, int(watch.get("toast_completion_debounce_ms", 800)) / 1000.0)

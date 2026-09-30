@@ -31,7 +31,7 @@ class ArchiveTestCrcMethod:
     name = "archive_test_crc"
 
     def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
-        max_items = max(0, int(config.get("max_items", 200000) or 0))
+        max_items = config["max_items"]
         archive_manifest = archive_input_manifest_for_evidence(evidence, max_items=max_items)
 
         archive_status_result = self._archive_status_result(archive_manifest, evidence)
@@ -45,7 +45,7 @@ class ArchiveTestCrcMethod:
                 return _verified_manifest_result(self.name, archive_manifest, inventory)
             return VerificationStep(method=self.name, status="skipped")
 
-        max_reported_items = max(1, int(config.get("max_reported_items", 20) or 20))
+        max_reported_items = config["max_reported_items"]
         emit_observations = should_emit_file_observations(evidence, self.name)
         detail_limit = (
             min(retained, 128)

@@ -129,7 +129,7 @@ class ExtractionExitSignalMethod:
 
 
 def _error_class(diagnostics: dict, manifest):
-    result = diagnostics.get("result") if isinstance(diagnostics.get("result"), dict) else {}
+    result = diagnostics.get("result", {})
     failure_kind = str(
         result.get("failure_kind")
         or diagnostics.get("failure_kind")

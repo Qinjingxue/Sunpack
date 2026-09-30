@@ -1,4 +1,3 @@
-from sunpack.core.config.advanced_defaults import advanced_named_config
 from sunpack.pipeline.verification.archive_input_manifest import ArchiveInputManifest, archive_input_manifest_for_evidence
 from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.verification.methods._archive_output_match import (
@@ -30,10 +29,9 @@ class ManifestSizeMatchMethod:
     name = "manifest_size_match"
 
     def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
-        config = {**advanced_named_config(("verification", "methods"), self.name), **config}
         input_manifest = archive_input_manifest_for_evidence(
             evidence,
-            max_items=max(1, int(config.get("max_expected_names", 2000) or 2000)),
+            max_items=config["max_expected_names"],
         )
         expected_files = _expected_file_count(input_manifest)
         expected_size = _expected_total_size(input_manifest)
@@ -85,8 +83,8 @@ class ManifestSizeMatchMethod:
 
         if expected_files > 0:
             file_tolerance = max(
-                int(config["file_count_abs_tolerance"] or 0),
-                int(expected_files * float(config["file_count_ratio_tolerance"] or 0.0)),
+                config["file_count_abs_tolerance"],
+                int(expected_files * config["file_count_ratio_tolerance"]),
             )
             lower_bound = max(0, expected_files - file_tolerance)
             upper_bound = expected_files + file_tolerance
@@ -111,8 +109,8 @@ class ManifestSizeMatchMethod:
 
         if expected_size > 0:
             size_tolerance = max(
-                int(config["size_abs_tolerance_bytes"] or 0),
-                int(expected_size * float(config["size_ratio_tolerance"] or 0.0)),
+                config["size_abs_tolerance_bytes"],
+                int(expected_size * config["size_ratio_tolerance"]),
             )
             lower_bound = max(0, expected_size - size_tolerance)
             upper_bound = expected_size + size_tolerance
@@ -171,9 +169,9 @@ class ManifestSizeMatchMethod:
 
 
 def _identity_worker_inventory(evidence) -> dict | None:
-    worker = evidence.worker_result if isinstance(evidence.worker_result, dict) else {}
-    manifest = worker.get("verified_manifest") if isinstance(worker.get("verified_manifest"), dict) else {}
-    inventory = manifest.get("inventory") if isinstance(manifest.get("inventory"), dict) else {}
+    worker = evidence.worker_result
+    manifest = worker.get("verified_manifest", {})
+    inventory = manifest.get("inventory", {})
     if (
         worker.get("status") == "ok"
         and manifest.get("validated")

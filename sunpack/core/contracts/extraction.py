@@ -1,7 +1,13 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Optional, TYPE_CHECKING
 
 from sunpack.core.contracts.failures import FailureInfo
+
+if TYPE_CHECKING:
+    from sunpack_native import NativeProgressManifest
+    from sunpack.pipeline.extraction.output_inventory import OutputInventory
 
 
 @dataclass
@@ -16,8 +22,8 @@ class ExtractionResult:
     partial_outputs: bool = False
     progress_manifest: str = ""
     # Rust-owned per-file progress manifest (sunpack_native.NativeProgressManifest).
-    progress_manifest_payload: Any = None
-    output_inventory: Any = None
+    progress_manifest_payload: NativeProgressManifest | None = None
+    output_inventory: OutputInventory | None = None
     # Cached native counters; the output inventory is authoritative when present.
     files_written: int = 0
     bytes_written: int = 0

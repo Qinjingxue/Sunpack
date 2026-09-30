@@ -32,7 +32,7 @@ from sunpack.core.platform.windows.shell_notify import notify_shell_directories_
 from sunpack.core.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.core.support.output_paths import default_output_dir_for_task
-from sunpack.core.support.path_keys import absolute_path_key, path_key
+from sunpack.core.support.path_keys import path_key
 from sunpack.core.support.archive_sessions import release_archive_sessions_under_roots
 from sunpack.core.support.resource_lifecycle import TaskResourceScope, promotion_barrier
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
@@ -965,7 +965,7 @@ class _RequestRuntime:
         self.submission = submission
         self.config = submission.config
         self.path_leases = path_leases
-        cli_config = self.config.get("cli") if isinstance(self.config.get("cli"), dict) else {}
+        cli_config = self.config["cli"]
         self.i18n = I18nContext(cli_config.get("language"))
         self.language = self.i18n.language
         self.quiet = bool(cli_config.get("quiet", False))

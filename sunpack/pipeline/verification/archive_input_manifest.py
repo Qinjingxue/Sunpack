@@ -69,7 +69,7 @@ _EVIDENCE_LIMIT_ATTRIBUTE = "_archive_input_manifest_full_max_items"
 def configure_archive_input_manifest_cache(evidence, *, max_items: int) -> None:
     """Declare the largest manifest view needed during this verification run."""
     requested = max(0, int(max_items or 0))
-    current = max(0, int(getattr(evidence, _EVIDENCE_LIMIT_ATTRIBUTE, 0) or 0))
+    current = evidence._archive_input_manifest_full_max_items
     object.__setattr__(evidence, _EVIDENCE_LIMIT_ATTRIBUTE, max(current, requested))
 
 
@@ -77,15 +77,10 @@ def archive_input_manifest_for_evidence(evidence, *, max_items: int = 200000) ->
     requested = max(0, int(max_items or 0))
     codepage = str(evidence.selected_codepage or "")
     identity = _evidence_manifest_identity(evidence, codepage)
-    configured_limit = max(0, int(getattr(evidence, _EVIDENCE_LIMIT_ATTRIBUTE, 0) or 0))
+    configured_limit = evidence._archive_input_manifest_full_max_items
     full_limit = max(requested, configured_limit)
-    cached = getattr(evidence, _EVIDENCE_CACHE_ATTRIBUTE, None)
-    if not (
-        isinstance(cached, dict)
-        and cached.get("identity") == identity
-        and isinstance(cached.get("manifest"), ArchiveInputManifest)
-        and int(cached.get("max_items", -1)) >= full_limit
-    ):
+    cached = evidence._archive_input_manifest_full_cache
+    if cached is None or cached["identity"] != identity or cached["max_items"] < full_limit:
         hint = _format_hint(evidence.archive_input)
         # TAR needs a source-side walk.  A worker manifest only proves that the
         # range it was handed extracted successfully; it cannot prove that an
@@ -108,11 +103,11 @@ def archive_input_manifest_for_evidence(evidence, *, max_items: int = 200000) ->
 
 
 def _worker_verified_manifest(evidence) -> ArchiveInputManifest | None:
-    result = evidence.worker_result if isinstance(evidence.worker_result, dict) else {}
-    payload = result.get("verified_manifest") if isinstance(result.get("verified_manifest"), dict) else {}
+    result = evidence.worker_result
+    payload = result.get("verified_manifest", {})
     from sunpack.pipeline.extraction.output_inventory import OutputInventory
     inventory = OutputInventory.from_value(
-        getattr(evidence.extraction_result, "output_inventory", None),
+        evidence.extraction_result.output_inventory,
         expected_root=evidence.output_dir,
     )
     if (

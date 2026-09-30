@@ -1,7 +1,6 @@
 from __future__ import annotations
 
-from typing import Any
-
+from sunpack.pipeline.verification.evidence import VerificationEvidence
 from sunpack.pipeline.extraction.output_inventory import (
     OutputInventory,
     OutputStats,
@@ -9,32 +8,29 @@ from sunpack.pipeline.extraction.output_inventory import (
 )
 
 
-def output_stats_for_evidence(evidence: Any) -> OutputStats:
+def output_stats_for_evidence(evidence: VerificationEvidence) -> OutputStats:
     return output_inventory_for_evidence(evidence).stats
 
 
-def output_inventory_for_evidence(evidence: Any) -> OutputInventory:
-    cached = getattr(evidence, "_output_inventory_cache", None)
-    if isinstance(cached, OutputInventory):
+def output_inventory_for_evidence(evidence: VerificationEvidence) -> OutputInventory:
+    cached = evidence._output_inventory_cache
+    if cached is not None:
         return cached
-    output_dir = getattr(evidence, "output_dir", "")
-    extraction_result = getattr(evidence, "extraction_result", None)
+    output_dir = evidence.output_dir
+    extraction_result = evidence.extraction_result
     inventory = OutputInventory.from_value(
-        getattr(extraction_result, "output_inventory", None),
+        extraction_result.output_inventory,
         expected_root=output_dir,
     )
     if inventory is None:
         inventory = collect_output_inventory(
             output_dir,
-            getattr(evidence, "worker_result", None),
+            evidence.worker_result,
         )
-    try:
-        object.__setattr__(evidence, "_output_inventory_cache", inventory)
-    except Exception:
-        pass
+    object.__setattr__(evidence, "_output_inventory_cache", inventory)
     return inventory
 
 
-def should_emit_file_observations(evidence: Any, method: str) -> bool:
-    owner = str(getattr(evidence, "_file_observation_owner", "") or "")
+def should_emit_file_observations(evidence: VerificationEvidence, method: str) -> bool:
+    owner = evidence._file_observation_owner
     return not owner or owner == method

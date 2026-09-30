@@ -16,12 +16,11 @@ def jsonable_value(value: Any) -> Any:
         return [jsonable_value(item) for item in value]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
+    if isinstance(value, bytes):
+        return value.hex()
     if hasattr(value, "to_dict"):
-        try:
-            return jsonable_value(value.to_dict())
-        except Exception:
-            pass
-    return str(value)
+        return jsonable_value(value.to_dict())
+    raise TypeError(f"Unsupported JSON value type: {type(value).__name__}")
 
 
 def stable_json_value(value: Any, *, bytes_digest_key: str = "sha256") -> Any:
@@ -51,6 +50,5 @@ def canonical_digest(value: Any, *, bytes_digest_key: str = "sha256") -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
-        default=str,
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()

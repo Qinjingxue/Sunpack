@@ -250,15 +250,6 @@
         "enabled": true
       },
       {
-        "name": "expected_name_presence",
-        "enabled": true,
-        "max_expected_names": 50,
-        "required_match_ratio": 0.8,
-        "minor_missing_penalty": 10,
-        "missing_penalty": 35,
-        "all_missing_penalty": 60
-      },
-      {
         "name": "manifest_size_match",
         "enabled": true,
         "max_expected_names": 2000,
@@ -271,13 +262,6 @@
         "name": "archive_test_crc",
         "enabled": true,
         "max_items": 200000,
-        "max_reported_items": 20
-      },
-      {
-        "name": "sample_readability",
-        "enabled": true,
-        "max_samples": 64,
-        "read_bytes": 4096,
         "max_reported_items": 20
       }
     ]

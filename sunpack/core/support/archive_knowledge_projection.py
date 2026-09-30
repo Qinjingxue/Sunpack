@@ -6,10 +6,13 @@ import json
 import threading
 from collections import OrderedDict, Counter
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from sunpack.core.contracts.archive_knowledge import ArchiveKnowledge
 from sunpack.core.support.json_values import stable_json_value as _jsonable
+
+if TYPE_CHECKING:
+    from sunpack.core.contracts.tasks import ArchiveTask
 
 _PROJECTION_CACHE_MAX = 512
 _PROJECTION_CACHE: OrderedDict[tuple[str, str, str], Any] = OrderedDict()
@@ -18,27 +21,21 @@ _PROJECTION_MISSES: Counter[str] = Counter()
 _PROJECTION_CACHE_LOCK = threading.RLock()
 
 
-def task_knowledge(task: Any) -> ArchiveKnowledge:
-    if isinstance(task, ArchiveKnowledge):
-        return task
-    if isinstance(task, dict):
-        return ArchiveKnowledge.from_any(task)
-    if hasattr(task, "knowledge") and callable(task.knowledge):
-        return task.knowledge()
-    return ArchiveKnowledge()
+def task_knowledge(task: ArchiveTask | ArchiveKnowledge) -> ArchiveKnowledge:
+    return task if isinstance(task, ArchiveKnowledge) else task.knowledge()
 
 
-def get(task_or_knowledge: Any, path: str, default: Any = None) -> Any:
+def get(task_or_knowledge: ArchiveTask | ArchiveKnowledge, path: str, default: Any = None) -> Any:
     knowledge = task_knowledge(task_or_knowledge)
     value = knowledge.get(path, default)
     return default if value is None else value
 
 
-def source_password_probe_input(task: Any) -> dict[str, Any]:
+def source_password_probe_input(task: ArchiveTask) -> dict[str, Any]:
     return _dict(get(task, "source.password_probe_input", {}))
 
 
-def source_fingerprint(task: Any) -> dict[str, Any]:
+def source_fingerprint(task: ArchiveTask) -> dict[str, Any]:
     knowledge = task_knowledge(task)
     identity = _task_source_fingerprint(task)
     return _cached_projection(
@@ -49,42 +46,42 @@ def source_fingerprint(task: Any) -> dict[str, Any]:
     )
 
 
-def source_selected_segment(task: Any) -> dict[str, Any]:
+def source_selected_segment(task: ArchiveTask) -> dict[str, Any]:
     return _dict(get(task, "source.selected_segment", {}))
 
 
-def source_extractable_segments(task: Any) -> list[dict[str, Any]]:
+def source_extractable_segments(task: ArchiveTask) -> list[dict[str, Any]]:
     value = get(task, "source.extractable_segments", [])
     return [dict(item) for item in value if isinstance(item, dict)] if isinstance(value, list) else []
 
 
-def inspection_prepass(task: Any) -> dict[str, Any]:
+def inspection_prepass(task: ArchiveTask) -> dict[str, Any]:
     return _dict(get(task, "inspection.prepass", {}))
 
 
-def inspection_status(task: Any) -> str:
+def inspection_status(task: ArchiveTask) -> str:
     return str(get(task, "inspection.status", "") or get(task, "inspection.summary.status", "") or "")
 
 
-def inspection_error(task: Any) -> str:
+def inspection_error(task: ArchiveTask) -> str:
     return str(get(task, "inspection.error", "") or get(task, "inspection.summary.error", "") or "")
 
 
-def selected_format(task: Any) -> str:
-    descriptor = _task_archive_input(task)
+def selected_format(task: ArchiveTask) -> str:
+    descriptor = task.archive_input()
     return str(
         get(task, "inspection.selected_format", "")
         or get(task, "inspection.summary.format", "")
-        or (getattr(descriptor, "format_hint", "") if descriptor is not None else "")
+        or descriptor.format_hint
         or ""
     )
 
 
-def verification_summary(task: Any) -> dict[str, Any]:
+def verification_summary(task: ArchiveTask) -> dict[str, Any]:
     return _dict(get(task, "verification.summary", {}))
 
 
-def zip_runtime_facts(task: Any) -> dict[str, Any]:
+def zip_runtime_facts(task: ArchiveTask) -> dict[str, Any]:
     knowledge = task_knowledge(task)
     identity = _task_source_fingerprint(task)
     return _cached_projection(
@@ -95,7 +92,7 @@ def zip_runtime_facts(task: Any) -> dict[str, Any]:
     )
 
 
-def archive_password(task: Any) -> str | None:
+def archive_password(task: ArchiveTask) -> str | None:
     value = get(task, "archive.password")
     return str(value) if value is not None else None
 
@@ -137,7 +134,7 @@ def _cached_projection(
     *,
     identity: dict[str, Any] | None = None,
 ) -> Any:
-    revision_value = knowledge.revision() if hasattr(knowledge, "revision") else int(knowledge.get("_meta.revision", 0) or 0)
+    revision_value = knowledge.revision()
     if revision_value <= 0:
         return compute()
     revision = str(revision_value)
@@ -171,20 +168,8 @@ def _format_runtime_facts_uncached(knowledge: ArchiveKnowledge, format_name: str
     }
 
 
-def _task_archive_input(task: Any):
-    getter = getattr(task, "archive_input", None)
-    if not callable(getter):
-        return None
-    try:
-        return getter()
-    except Exception:
-        return None
-
-
-def _task_source_fingerprint(task: Any) -> dict[str, Any]:
-    descriptor = _task_archive_input(task)
-    if descriptor is None or not hasattr(descriptor, "to_dict"):
-        return {}
+def _task_source_fingerprint(task: ArchiveTask) -> dict[str, Any]:
+    descriptor = task.archive_input()
     return _source_input_fingerprint(descriptor.to_dict())
 
 
@@ -241,7 +226,7 @@ def _path_fingerprint(path: str) -> dict[str, Any]:
 
 
 def _stable_digest(payload: Any) -> str:
-    return hashlib.sha256(json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+    return hashlib.sha256(json.dumps(_jsonable(payload), ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 def _dedupe(values: list[str]) -> list[str]:

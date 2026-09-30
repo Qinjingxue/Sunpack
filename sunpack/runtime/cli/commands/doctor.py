@@ -7,7 +7,7 @@ from sunpack.runtime.cli.cli_aliases import COMMAND_ALIASES
 from sunpack.runtime.cli.cli_constants import EXIT_TASK_FAILED
 from sunpack.runtime.cli.cli_parsers import CliHelpFormatter, build_config_output_parser, localize_help_action
 from sunpack.runtime.cli.cli_types import CliCommandResult
-from sunpack.runtime.cli.persistent_runtime import load_request_config_payload
+from sunpack.runtime.cli.persistent_runtime import load_request_config, load_request_config_payload
 from sunpack.runtime.config_validation import validate_config_payload
 from sunpack.runtime.watch.service import list_watch_roots
 from sunpack.core.support.process_executable import current_process_executable, is_packaged_process
@@ -69,12 +69,13 @@ def _check(name: str, status: str, detail: str | None = None, **extra) -> dict:
 
 def _config_check(ctx) -> tuple[dict, dict | None, bool]:
     try:
-        config_path, payload = load_request_config_payload(ctx.cwd)
+        config_path, _ = load_request_config_payload(ctx.cwd)
+        payload = load_request_config(ctx.cwd)
         validation = validate_config_payload(payload)
     except Exception as exc:
         return _check("config", "fail", str(exc)), None, False
-    if not validation.get("ok"):
-        errors = [str(error) for error in validation.get("errors", [])]
+    if not validation["ok"]:
+        errors = validation["errors"]
         return (
             _check(
                 "config",

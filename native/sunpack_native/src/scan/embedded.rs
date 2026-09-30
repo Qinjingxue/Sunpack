@@ -266,7 +266,7 @@ fn scan_embedded_archives_native_with_iocp(
     iocp_workers: usize,
 ) -> io::Result<NativeScanResult> {
     let file_size = reader.len();
-    let (mut raw_hits, scan_read_bytes, scan_read_operations) = {
+    let (mut raw_hits, scan_read_bytes, scan_read_operations): (Vec<RawHit>, u64, u64) = {
         #[cfg(windows)]
         {
             let path = reader.iocp_path().ok_or_else(|| {

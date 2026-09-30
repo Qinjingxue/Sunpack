@@ -4,6 +4,7 @@ from typing import Any, Optional
 from sunpack_native import analyze_zip_filename_encoding as _NATIVE_ANALYZE_ZIP_ENCODING
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
+from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.i18n import I18nContext
 
 
@@ -46,7 +47,7 @@ class ArchiveMetadataScanner:
 
     def scan_for_task(
         self,
-        task,
+        task: ArchiveTask,
         archive_path: str,
         password: Optional[str] = None,
         part_paths: list[str] | None = None,
@@ -54,38 +55,18 @@ class ArchiveMetadataScanner:
     ) -> ArchiveMetadataScanResult:
         """Reuse native filename metadata across extraction retries for one task."""
         del password
-        descriptor = (
-            task.archive_input()
-            if task is not None
-            else self._descriptor(
-                archive_path,
-                part_paths=part_paths,
-                format_hint=format_hint,
-                archive_input=None,
-            )
-        )
-        source_generation = (
-            task.runtime.get("source_generation")
-            if task is not None and isinstance(getattr(task, "runtime", None), dict)
-            else None
-        )
-        cached = task.runtime.get(self.TASK_CACHE_KEY) if task is not None else None
+        descriptor = task.archive_input()
+        source_generation = task.runtime.get("source_generation")
+        cached = task.runtime.get(self.TASK_CACHE_KEY)
         if (
-            isinstance(cached, dict)
-            and cached.get("source_generation") == source_generation
-            and cached.get("descriptor") is descriptor
-            and cached.get("format_hint") == descriptor.format_hint
+            cached is not None
+            and cached[0] == source_generation
+            and cached[1] is descriptor
         ):
-            return self._result_from_dict(cached.get("result"), descriptor.entry_path)
+            return cached[2]
 
         result = self._scan_descriptor(descriptor)
-        if task is not None:
-            task.runtime[self.TASK_CACHE_KEY] = {
-                "source_generation": source_generation,
-                "descriptor": descriptor,
-                "format_hint": descriptor.format_hint,
-                "result": self._result_to_dict(result),
-            }
+        task.runtime[self.TASK_CACHE_KEY] = (source_generation, descriptor, result)
         return result
 
     @staticmethod
@@ -104,33 +85,6 @@ class ArchiveMetadataScanner:
             part_paths=part_paths,
             format_hint=str(format_hint or "").lower().lstrip("."),
         )
-
-    @staticmethod
-    def _result_to_dict(result: ArchiveMetadataScanResult) -> dict:
-        return {
-            "archive_type": result.archive_type,
-            "warnings": list(result.warnings),
-            "reasons": list(result.reasons),
-            "selected_codepage": result.selected_codepage,
-            "error": result.error,
-            "confidence": result.confidence,
-            "sample_count": result.sample_count,
-        }
-
-    @staticmethod
-    def _result_from_dict(payload: dict, archive_path: str) -> ArchiveMetadataScanResult:
-        payload = payload if isinstance(payload, dict) else {}
-        result = ArchiveMetadataScanResult(
-            archive_path,
-            str(payload.get("archive_type") or "unknown"),
-            list(payload.get("reasons") or []),
-        )
-        result.warnings = list(payload.get("warnings") or [])
-        result.selected_codepage = payload.get("selected_codepage")
-        result.error = payload.get("error")
-        result.confidence = float(payload.get("confidence", 0.0) or 0.0)
-        result.sample_count = int(payload.get("sample_count", 0) or 0)
-        return result
 
     def _scan_descriptor(self, descriptor: ArchiveInputDescriptor) -> ArchiveMetadataScanResult:
         archive_type = descriptor.format_hint
@@ -164,9 +118,6 @@ class ArchiveMetadataScanner:
                 self.MAX_ZIP_SAMPLES,
                 self.MAX_FILENAME_BYTES,
             )
-            if not isinstance(native, dict):
-                raise TypeError("Native ZIP filename analyzer returned a non-dict result")
-
             status = str(native.get("status") or "")
             warning = self._zip_native_status_warning(status)
             if warning:

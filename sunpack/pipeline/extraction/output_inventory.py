@@ -22,7 +22,6 @@ class OutputStats:
     file_count: int = 0
     dir_count: int = 0
     total_size: int = 0
-    transient_file_count: int = 0
     unreadable_count: int = 0
 
 
@@ -37,7 +36,7 @@ class OutputInventory:
         self.stats = OutputStats(
             exists=bool(native.exists), is_dir=bool(native.is_dir),
             file_count=int(native.file_count), dir_count=int(native.dir_count),
-            total_size=int(native.total_size), transient_file_count=int(native.transient_file_count),
+            total_size=int(native.total_size),
             unreadable_count=int(native.unreadable_count),
         )
         self.worker_crc_available = bool(native.worker_crc_available)
@@ -111,32 +110,10 @@ class OutputInventory:
         )
 
     @classmethod
-    def from_dict(cls, payload: dict[str, Any] | None, *, expected_root: str = "") -> "OutputInventory | None":
-        if not isinstance(payload, dict) or int(payload.get("version", 0) or 0) != 1:
+    def from_value(cls, value: OutputInventory | None, *, expected_root: str = "") -> OutputInventory | None:
+        if value is not None and expected_root and _path_key(value.root) != _path_key(expected_root):
             return None
-        root = str(payload.get("root") or "")
-        if expected_root and _path_key(root) != _path_key(expected_root):
-            return None
-        raw_stats = payload.get("stats") if isinstance(payload.get("stats"), dict) else {}
-        files = [item for item in payload.get("files") or [] if isinstance(item, dict)]
-        return cls.from_native(
-            _native_inventory_from_serialized(
-                root, files,
-                bool(raw_stats.get("exists")), bool(raw_stats.get("is_dir")),
-                int(raw_stats.get("file_count", 0) or 0), int(raw_stats.get("dir_count", 0) or 0),
-                int(raw_stats.get("total_size", 0) or 0), int(raw_stats.get("transient_file_count", 0) or 0),
-                int(raw_stats.get("unreadable_count", 0) or 0), bool(payload.get("worker_crc_available")),
-                bool(payload.get("worker_inventory_complete")), bool(payload.get("identity_paths")),
-            )
-        )
-
-    @classmethod
-    def from_value(cls, value: Any, *, expected_root: str = "") -> "OutputInventory | None":
-        if isinstance(value, cls):
-            if expected_root and _path_key(value.root) != _path_key(expected_root):
-                return None
-            return value
-        return cls.from_dict(value, expected_root=expected_root)
+        return value
 
     @classmethod
     def from_native(cls, native: NativeOutputInventory) -> "OutputInventory":
@@ -150,7 +127,7 @@ def collect_output_inventory(
     root = os.path.abspath(output_dir) if output_dir else ""
     if not output_dir:
         return OutputInventory.from_native(_native_inventory_from_serialized(
-            root, [], False, False, 0, 0, 0, 0, 0, False, False, False,
+            root, [], False, False, 0, 0, 0, 0, False, False, False,
         ))
     worker_inventory = _complete_worker_inventory(worker_result)
     if worker_inventory is not None:
@@ -159,9 +136,9 @@ def collect_output_inventory(
 
 
 def _complete_worker_inventory(worker_result: dict[str, Any] | None) -> NativeWorkerManifest | None:
-    result = worker_result if isinstance(worker_result, dict) else {}
-    manifest = result.get("verified_manifest") if isinstance(result.get("verified_manifest"), dict) else {}
-    inventory = manifest.get("inventory") if isinstance(manifest.get("inventory"), dict) else {}
+    result = worker_result or {}
+    manifest = result.get("verified_manifest", {})
+    inventory = manifest.get("inventory", {})
     native = native_worker_manifest(result)
     if (
         result.get("status") != "ok"

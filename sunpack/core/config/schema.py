@@ -52,17 +52,13 @@ def config_fields() -> dict[tuple[str, ...], ConfigField]:
         fields: dict[tuple[str, ...], ConfigField] = {}
         for module_name in CONFIG_FIELD_PROVIDER_MODULES:
             module = import_module(module_name)
-            register_config_fields(fields, getattr(module, "CONFIG_FIELDS", ()))
+            fields.update((field.path, field) for field in module.CONFIG_FIELDS)
         _FIELDS = fields
     return _FIELDS
 
 
 def config_field(path: Iterable[str]) -> ConfigField:
-    key = tuple(path)
-    try:
-        return config_fields()[key]
-    except KeyError as exc:
-        raise ConfigSchemaError(f"Unknown config field: {'.'.join(key)}") from exc
+    return config_fields()[tuple(path)]
 
 
 def normalize_config_value(path: Iterable[str], value: Any) -> Any:
@@ -70,31 +66,16 @@ def normalize_config_value(path: Iterable[str], value: Any) -> Any:
     return field.normalize(field.default if value is None else value)
 
 
-def normalize_config(payload: dict[str, Any], *, validate: bool = True) -> dict[str, Any]:
+def normalize_config(payload: dict[str, Any]) -> dict[str, Any]:
+    """Validate external fields while constructing the internal config once."""
     normalized = deepcopy(payload)
-    if validate:
-        errors = validate_external_config(payload)
-        if errors:
-            raise ConfigSchemaError("; ".join(errors))
-    for field in config_fields().values():
-        set_config_value(normalized, field.path, normalize_config_value(field.path, get_config_value(payload, field.path)))
-    return normalized
-
-
-def validate_external_config(payload: dict[str, Any]) -> list[str]:
-    errors = []
-    performance = payload.get("performance") if isinstance(payload, dict) else None
-    worker = performance.get("worker") if isinstance(performance, dict) else None
-    if isinstance(worker, dict) and "profile" in worker:
-        errors.append(
-            "performance.worker.profile was removed; native worker sizing is derived from CPU capacity"
-        )
     for field in config_fields().values():
         try:
-            normalize_config_value(field.path, get_config_value(payload, field.path))
+            value = normalize_config_value(field.path, get_config_value(payload, field.path))
         except (TypeError, ValueError) as exc:
-            errors.append(str(exc))
-    return errors
+            raise ConfigSchemaError(str(exc)) from exc
+        set_config_value(normalized, field.path, value)
+    return normalized
 
 
 def get_config_value(config: dict[str, Any], path: Iterable[str], default: Any = None) -> Any:
@@ -108,8 +89,6 @@ def get_config_value(config: dict[str, Any], path: Iterable[str], default: Any =
 
 def set_config_value(config: dict[str, Any], path: Iterable[str], value: Any) -> None:
     parts = tuple(path)
-    if not parts:
-        raise ConfigSchemaError("Config field path must not be empty")
     current = config
     for part in parts[:-1]:
         next_value = current.get(part)
@@ -118,13 +97,3 @@ def set_config_value(config: dict[str, Any], path: Iterable[str], value: Any) ->
             current[part] = next_value
         current = next_value
     current[parts[-1]] = value
-
-
-def register_config_fields(target: dict[tuple[str, ...], ConfigField], fields: Iterable[ConfigField]) -> None:
-    for field in fields:
-        existing = target.get(field.path)
-        if existing is not None:
-            raise ConfigSchemaError(
-                f"Duplicate config field {field.dotted_path}: {existing.owner} and {field.owner}"
-            )
-        target[field.path] = field

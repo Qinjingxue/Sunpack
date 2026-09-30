@@ -74,7 +74,7 @@ def _release_watch_broker() -> None:
 
 
 def service_config_from(config: dict) -> dict:
-    service = config.get("watch") if isinstance(config.get("watch"), dict) else {}
+    service = config["watch"]
     default_output_root = str(service.get("out_dir") or ".")
     result = dict(service)
     result["root_entries"] = list(_iter_watch_root_entries(default_output_root, None))
@@ -107,7 +107,7 @@ def existing_roots(roots: list[str]) -> list[str]:
 
 
 def service_state_dir(config: dict) -> str:
-    service = config.get("watch") if isinstance(config.get("watch"), dict) else {}
+    service = config["watch"]
     state_dir = str(service.get("state_dir") or "").strip()
     if state_dir:
         return resolve_service_path(state_dir)
@@ -149,7 +149,7 @@ def _service_config_without_tray(service_config: dict) -> dict:
 
 
 def _tray_signature(config: dict, service_config: dict) -> tuple[bool, str]:
-    cli_config = config.get("cli") if isinstance(config.get("cli"), dict) else {}
+    cli_config = config["cli"]
     return (
         bool(service_config.get("tray_enabled", True)),
         str(cli_config.get("language") or "").strip().lower(),
@@ -172,8 +172,8 @@ def _build_reload_plan(
         or _service_config_without_tray(new_service_config)
         != _service_config_without_tray(old_service_config)
     )
-    old_runtime = old_config.get("runtime") if isinstance(old_config.get("runtime"), dict) else {}
-    new_runtime = new_config.get("runtime") if isinstance(new_config.get("runtime"), dict) else {}
+    old_runtime = old_config["runtime"]
+    new_runtime = new_config["runtime"]
     return ReloadPlan(
         restart_scheduler=restart_scheduler,
         reconcile_tray=(
@@ -666,7 +666,7 @@ class WatchService:
         state_path = os.path.join(self.state_dir, SERVICE_STATE)
         run_config = deepcopy(self.config)
         require_complete_content(run_config)
-        watch_config = dict(run_config.get("watch") if isinstance(run_config.get("watch"), dict) else {})
+        watch_config = dict(run_config["watch"])
         watch_config["clipboard_monitor_enabled"] = bool(self.service_config.get("clipboard_monitor_enabled", True))
         run_config["watch"] = watch_config
         self._reconcile_toast_host(run_config)
@@ -747,7 +747,7 @@ class WatchService:
         self._last_idle_tick_signature = None
 
     def _reconcile_toast_host(self, config: dict) -> None:
-        watch_config = config.get("watch") if isinstance(config.get("watch"), dict) else {}
+        watch_config = config["watch"]
         enabled = bool(watch_config.get("toast_enabled", True)) and self.toast_manager_factory is not None
         signature = (
             enabled,

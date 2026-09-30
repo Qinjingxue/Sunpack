@@ -78,7 +78,7 @@ class ArchiveJobOutcome:
         return bool(
             self.result.partial_outputs
             or _verification_accepts_partial(verification)
-            or getattr(verification, "content_integrity", "")
+            or (verification.content_integrity if verification is not None else "")
             in {CONTENT_INTEGRITY_VERIFIED_PARTIAL, CONTENT_INTEGRITY_PAYLOAD_DAMAGED}
         )
 
@@ -88,7 +88,7 @@ class ArchiveJobExecutor:
         self,
         context: RunState,
         extractor: ExtractionScheduler,
-        config: dict | None = None,
+        config: dict,
         *,
         progress_reporter: Any | None = None,
         request_id: str = "",
@@ -96,10 +96,10 @@ class ArchiveJobExecutor:
     ):
         self.context = context
         self.extractor = extractor
-        self.config = config or {}
+        self.config = config
         self.content_policy = ContentRecoveryPolicy.from_config(self.config)
-        cli_config = self.config.get("cli") if isinstance(self.config.get("cli"), dict) else {}
-        self.i18n = I18nContext(cli_config.get("language"))
+        cli_config = self.config["cli"]
+        self.i18n = I18nContext(cli_config["language"])
         self.progress_reporter = progress_reporter
         self.request_id = str(request_id or "")
         self.origin = str(origin or "")
@@ -356,9 +356,7 @@ class ArchiveJobExecutor:
         return bool(self.verifier.config.get("retry_on_verification_failure", True))
 
     def collect_result(self, task: ArchiveTask, outcome: ArchiveJobOutcome | ExtractionResult) -> TargetRunResult:
-        content_policy = getattr(self, "content_policy", None) or ContentRecoveryPolicy.from_config(
-            getattr(self, "config", {})
-        )
+        content_policy = self.content_policy
         if isinstance(outcome, ExtractionResult):
             outcome = ArchiveJobOutcome(outcome, content_requirement=content_policy.requirement)
         else:
@@ -371,14 +369,14 @@ class ArchiveJobExecutor:
             failed=outcome.outcome_kind == OutcomeKind.FAILURE,
             force_owned_output_cleanup=outcome.policy_rejected_partial_output,
         )
-        diagnostics = res.diagnostics if isinstance(res.diagnostics, dict) else {}
+        diagnostics = res.diagnostics
         res.diagnostics = {**diagnostics, "failed_output_cleanup": cleanup.to_dict()}
 
         possible_missing_volume = _possible_missing_volume_failure(
             task,
             outcome.outcome_kind,
             res.failure,
-            getattr(self, "i18n", I18nContext("en")),
+            self.i18n,
         )
         if outcome.outcome_kind == OutcomeKind.FAILURE and possible_missing_volume is not None:
             res.failure = possible_missing_volume
@@ -441,31 +439,31 @@ class ArchiveJobExecutor:
         steps = "; ".join(f"{step.method}:{step.status}" for step in verification.steps) or "none"
         return self.i18n.t(
             "failure.verification_failed_detail",
-            completeness=getattr(verification, "completeness", ""),
-            integrity=getattr(verification, "assessment_status", ""),
-            decision=getattr(verification, "decision_hint", ""),
-            coverage=getattr(getattr(verification, "archive_coverage", None), "completeness", ""),
+            completeness=verification.completeness,
+            integrity=verification.assessment_status,
+            decision=verification.decision_hint,
+            coverage=verification.archive_coverage.completeness,
             attempts=outcome.attempts,
             steps=steps,
         )
 
 
-def _verification_accepts(verification: VerificationResult | Any) -> bool:
-    decision = getattr(verification, "decision_hint", "")
+def _verification_accepts(verification: VerificationResult | None) -> bool:
+    decision = verification.decision_hint if verification is not None else ""
     return decision in {DECISION_ACCEPT, DECISION_ACCEPT_PARTIAL}
 
 
-def _verification_accepts_complete(verification: VerificationResult | Any) -> bool:
+def _verification_accepts_complete(verification: VerificationResult | None) -> bool:
     if verification is None:
         return False
     # The verifier's decision is the contract boundary. Some extraction backends
     # cannot provide per-file coverage, so an accepted result may legitimately
     # carry an "unknown" assessment while still being a full success.
-    return getattr(verification, "decision_hint", "") == DECISION_ACCEPT
+    return verification.decision_hint == DECISION_ACCEPT
 
 
-def _verification_accepts_partial(verification: VerificationResult | Any) -> bool:
-    return getattr(verification, "decision_hint", "") == DECISION_ACCEPT_PARTIAL
+def _verification_accepts_partial(verification: VerificationResult | None) -> bool:
+    return verification is not None and verification.decision_hint == DECISION_ACCEPT_PARTIAL
 
 
 def _partial_result_is_acceptable(result: ExtractionResult) -> bool:
@@ -489,8 +487,8 @@ def _proves_content_loss(result: ExtractionResult, verification: VerificationRes
         if classified.content_integrity != CONTENT_INTEGRITY_UNKNOWN:
             return True
 
-    content_integrity = str(getattr(verification, "content_integrity", "") or "")
-    strength = str(getattr(verification, "verification_strength", "") or "")
+    content_integrity = verification.content_integrity
+    strength = verification.verification_strength
     return (
         content_integrity
         in {CONTENT_INTEGRITY_VERIFIED_PARTIAL, CONTENT_INTEGRITY_PAYLOAD_DAMAGED}
@@ -561,15 +559,15 @@ def _verification_payload(verification: VerificationResult) -> dict[str, Any]:
     }
 
 
-def _output_quality_payload(verification: VerificationResult | Any) -> dict[str, Any]:
+def _output_quality_payload(verification: VerificationResult) -> dict[str, Any]:
     return {
-        "score": float(getattr(verification, "output_quality_score", 0.0) or 0.0),
-        "file_count": int(getattr(verification, "output_file_count", 0) or 0),
-        "total_bytes": int(getattr(verification, "output_total_bytes", 0) or 0),
-        "complete_ratio": float(getattr(verification, "output_complete_ratio", 0.0) or 0.0),
-        "failed_ratio": float(getattr(verification, "output_failed_ratio", 0.0) or 0.0),
-        "empty": bool(getattr(verification, "output_empty", True)),
-        "confidence": float(getattr(verification, "output_confidence", 0.0) or 0.0),
+        "score": verification.output_quality_score,
+        "file_count": verification.output_file_count,
+        "total_bytes": verification.output_total_bytes,
+        "complete_ratio": verification.output_complete_ratio,
+        "failed_ratio": verification.output_failed_ratio,
+        "empty": verification.output_empty,
+        "confidence": verification.output_confidence,
     }
 
 

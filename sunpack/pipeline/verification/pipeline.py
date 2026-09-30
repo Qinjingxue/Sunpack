@@ -41,10 +41,10 @@ from sunpack.core.contracts.verification import (
 
 class VerificationPipeline:
     def __init__(self, config: dict):
-        self.config = dict(config or {})
-        self.methods = list(self.config.get("methods") or [])
-        self.complete_accept_threshold = _clamp01(float(self.config.get("complete_accept_threshold", 0.999)))
-        self.partial_accept_threshold = _clamp01(float(self.config.get("partial_accept_threshold", 0.2)))
+        self.config = config
+        self.methods = [item for item in config["methods"] if item["enabled"]]
+        self.complete_accept_threshold = config["complete_accept_threshold"]
+        self.partial_accept_threshold = config["partial_accept_threshold"]
 
     def run(
         self,
@@ -84,19 +84,8 @@ class VerificationPipeline:
             )
 
         for method_config in self.methods:
-            if not isinstance(method_config, dict) or not method_config.get("enabled", True):
-                continue
-            method_name = str(method_config.get("name") or "").strip()
-            if not method_name:
-                continue
+            method_name = method_config["name"]
             method = get_verification_method(method_name)
-            if method is None:
-                issues.append(VerificationIssue(
-                    method=method_name,
-                    code="warning.unknown_method",
-                    message=f"Unknown verification method: {method_name}",
-                ))
-                continue
 
             with _phase(phase_timer, f"{phase_prefix}_method_{method_name}"):
                 step = method.verify(evidence, method_config)
@@ -170,7 +159,7 @@ class VerificationPipeline:
             _container_integrity_from_evidence(evidence),
         ])
         verification_strength = _aggregate_verification_strength(verification_strengths)
-        extraction_failed = not bool(getattr(evidence.extraction_result, "success", False))
+        extraction_failed = not evidence.extraction_result.success
         if not evidence_sufficient:
             completeness = 0.0
         elif content_integrity == CONTENT_INTEGRITY_UNKNOWN and not extraction_failed and not output_quality.empty:
@@ -392,38 +381,22 @@ def _aggregate_payload_coverage(
     )
 
 
-def _configured_archive_manifest_limit(methods: list[Any]) -> int | None:
-    limits = []
-    for config in methods:
-        if not isinstance(config, dict) or not config.get("enabled", True):
-            continue
-        name = str(config.get("name") or "").strip()
-        if name == "expected_name_presence":
-            limits.append(max(1, int(config.get("max_expected_names", 50) or 50)))
-        elif name == "manifest_size_match":
-            limits.append(max(1, int(config.get("max_expected_names", 2000) or 2000)))
-        elif name == "archive_test_crc":
-            limits.append(max(0, int(config.get("max_items", 200000) or 0)))
+def _configured_archive_manifest_limit(methods: list[dict[str, Any]]) -> int | None:
+    limits = [
+        config["max_items"] if config["name"] == "archive_test_crc" else config["max_expected_names"]
+        for config in methods
+        if config["name"] in {"archive_test_crc", "manifest_size_match"}
+    ]
     return max(limits) if limits else None
 
 
-def _configured_observation_owner(methods: list[Any], evidence: VerificationEvidence) -> str:
-    worker = evidence.worker_result if isinstance(evidence.worker_result, dict) else {}
-    manifest = worker.get("verified_manifest") if isinstance(worker.get("verified_manifest"), dict) else {}
+def _configured_observation_owner(methods: list[dict[str, Any]], evidence: VerificationEvidence) -> str:
+    worker = evidence.worker_result
+    manifest = worker.get("verified_manifest", {})
     if worker.get("status") != "ok" or not manifest.get("validated"):
         return ""
-    enabled = {
-        str(item.get("name") or "")
-        for item in methods
-        if isinstance(item, dict) and item.get("enabled", True)
-    }
-    for name in (
-        "archive_test_crc",
-        "manifest_size_match",
-        "expected_name_presence",
-        "output_presence",
-        "extraction_exit_signal",
-    ):
+    enabled = {item["name"] for item in methods}
+    for name in ("archive_test_crc", "manifest_size_match", "output_presence", "extraction_exit_signal"):
         if name in enabled:
             return name
     return ""
@@ -799,15 +772,8 @@ def _coverage_confidence(source: dict) -> float:
         return _clamp01(_as_float(source.get("confidence"), 0.5))
     if source.get("code") == "info.archive_output_coverage":
         return 0.95
-    if source.get("code") == "info.expected_name_coverage":
-        manifest_source = str(source.get("manifest_source") or "")
-        if manifest_source == "configured":
-            return 0.6
-        return 0.8
     if source.get("code") == "info.output_progress_coverage":
         return 0.7
-    if source.get("code") == "info.sample_readability_coverage":
-        return 0.35
     return _as_float(source.get("confidence"), 0.5)
 
 

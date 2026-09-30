@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from contextlib import nullcontext
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, TYPE_CHECKING
 
 from sunpack_native import NativeProgressManifest, load_progress_manifest
 
@@ -10,6 +12,10 @@ from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.passwords import PasswordSession
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
+
+
+if TYPE_CHECKING:
+    from sunpack.pipeline.extraction.output_inventory import OutputInventory
 
 
 @dataclass(frozen=True)
@@ -23,6 +29,10 @@ class VerificationEvidence:
     worker_result: dict[str, Any] = field(default_factory=dict)
     worker_native_diagnostics: dict[str, Any] = field(default_factory=dict)
     progress_manifest: NativeProgressManifest | None = None
+    _output_inventory_cache: OutputInventory | None = field(default=None, init=False, repr=False, compare=False)
+    _file_observation_owner: str = field(default="", init=False, repr=False, compare=False)
+    _archive_input_manifest_full_cache: dict[str, Any] | None = field(default=None, init=False, repr=False, compare=False)
+    _archive_input_manifest_full_max_items: int = field(default=0, init=False, repr=False, compare=False)
 
     @property
     def archive_path(self) -> str:
@@ -89,7 +99,7 @@ def build_verification_evidence(
 
 
 def _load_progress_manifest(extraction_result: ExtractionResult) -> NativeProgressManifest | None:
-    cached = getattr(extraction_result, "progress_manifest_payload", None)
+    cached = extraction_result.progress_manifest_payload
     if isinstance(cached, NativeProgressManifest):
         return cached
     manifest_path = extraction_result.progress_manifest
@@ -115,13 +125,13 @@ def _analysis_facts_from_task(task: ArchiveTask) -> dict[str, Any]:
 
 
 def _worker_result(diagnostics: dict[str, Any]) -> dict[str, Any]:
-    result = diagnostics.get("result") if isinstance(diagnostics, dict) else {}
-    return dict(result) if isinstance(result, dict) else {}
+    result = diagnostics.get("result", {})
+    return result
 
 
 def _worker_native_diagnostics(worker_result: dict[str, Any]) -> dict[str, Any]:
-    diagnostics = worker_result.get("diagnostics") if isinstance(worker_result, dict) else {}
-    return dict(diagnostics) if isinstance(diagnostics, dict) else {}
+    diagnostics = worker_result.get("diagnostics", {})
+    return diagnostics
 
 
 def _phase(timer: Callable[..., Any] | None, name: str):

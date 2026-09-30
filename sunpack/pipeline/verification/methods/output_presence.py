@@ -41,25 +41,6 @@ class OutputPresenceMethod:
                 actual=stats.unreadable_count,
             ))
 
-        if stats.transient_file_count and stats.transient_file_count == stats.file_count:
-            issues.append(VerificationIssue(
-                method=self.name,
-                code="fail.output_only_transient_files",
-                message="Extraction output only contains transient-looking files",
-                path=evidence.output_dir,
-                expected=0,
-                actual=stats.transient_file_count,
-            ))
-        elif stats.transient_file_count:
-            issues.append(VerificationIssue(
-                method=self.name,
-                code="warning.output_transient_files",
-                message="Extraction output contains transient-looking files",
-                path=evidence.output_dir,
-                expected=0,
-                actual=stats.transient_file_count,
-            ))
-
         observations = _manifest_observations(evidence) if should_emit_file_observations(evidence, self.name) else []
         manifest = evidence.progress_manifest
         manifest_completeness = manifest.completeness() if manifest is not None else 1.0

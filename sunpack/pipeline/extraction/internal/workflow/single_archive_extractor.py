@@ -12,6 +12,7 @@ from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
 from sunpack.pipeline.extraction.internal.workflow.retry_policy import ExtractRetryPolicy
+from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
 from sunpack.pipeline.extraction.internal.sevenzip.sevenzip_runner import SevenZipRunner
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import compact_success_worker_diagnostics, worker_result_payload
 from sunpack.pipeline.extraction.progress import has_recoverable_partial_outputs, write_extraction_progress_manifest_payload
@@ -38,7 +39,7 @@ class SingleArchiveExtractor:
         self,
         password_store,
         password_resolver,
-        metadata_scanner,
+        metadata_scanner: ArchiveMetadataScanner,
         retry_policy: ExtractRetryPolicy,
         sevenzip_runner: SevenZipRunner,
         best_effort: bool = True,
@@ -225,17 +226,10 @@ class SingleArchiveExtractor:
             test_err = resolution.error_text
             with _phase(phase_timer, f"{phase_prefix}_scan_filename_encoding"):
                 format_hint = task.archive_input().format_hint
-                scan_for_task = getattr(self.metadata_scanner, "scan_for_task", None)
-                if scan_for_task is not None:
-                    filename_encoding = scan_for_task(
-                        task, run_archive, password=correct_pwd,
-                        part_paths=run_parts, format_hint=format_hint,
-                    )
-                else:
-                    filename_encoding = self.metadata_scanner.scan(
-                        run_archive, password=correct_pwd,
-                        part_paths=run_parts, format_hint=format_hint,
-                    )
+                filename_encoding = self.metadata_scanner.scan_for_task(
+                    task, run_archive, password=correct_pwd,
+                    part_paths=run_parts, format_hint=format_hint,
+                )
                 selected_codepage = filename_encoding.selected_codepage
                 if filename_encoding.error:
                     # Filename detection is an optional override.  Failure or
@@ -354,7 +348,7 @@ class SingleArchiveExtractor:
 
             with _phase(phase_timer, f"{phase_prefix}_classify_error"):
                 failure = classify_extract_failure(
-                    run_result or test_result,
+                    run_result,
                     err,
                     archive=archive,
                     is_split_archive=is_split,
@@ -363,9 +357,9 @@ class SingleArchiveExtractor:
                 error_msg = self._append_retry_count(self._localized_failure(failure), retry_count)
             self._log(self.i18n.t("extract.log.failed", archive=archive, error=error_msg))
             with _phase(phase_timer, f"{phase_prefix}_diagnostics_failure"):
-                diagnostics = self._diagnostics_from(run_result or test_result)
+                diagnostics = self._diagnostics_from(run_result)
                 if resolution.requires_extraction_confirmation:
-                    worker_result = worker_result_payload(run_result or test_result)
+                    worker_result = worker_result_payload(run_result)
                     diagnostics["password_verification"] = self._password_verification_label(
                         resolution, worker_result
                     )
@@ -560,12 +554,11 @@ class SingleArchiveExtractor:
         )
 
     @staticmethod
-    def _diagnostics_from(result: object) -> dict:
-        diagnostics = getattr(result, "worker_diagnostics", None)
-        return dict(diagnostics) if isinstance(diagnostics, dict) else {}
+    def _diagnostics_from(result: subprocess.CompletedProcess | None) -> dict:
+        return result.worker_diagnostics if result is not None else {}
 
     @staticmethod
-    def _worker_selected_password(resolution: PasswordResolution, run_result: object) -> str | None:
+    def _worker_selected_password(resolution: PasswordResolution, run_result: subprocess.CompletedProcess | None) -> str | None:
         candidates = tuple(resolution.candidate_passwords or ())
         if not candidates:
             return resolution.password
