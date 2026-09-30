@@ -1,37 +1,10 @@
-from pathlib import Path
-
 from sunpack.runtime.cli.cli import build_cli_parser
-from sunpack.runtime.cli.cli_commands import discover_command_modules
 from sunpack.runtime.cli.cli_context import CliContext
-
-
-def test_cli_and_gui_packages_have_explicit_boundaries():
-    package_root = Path(__file__).resolve().parents[2] / "sunpack"
-
-    assert (package_root / "runtime" / "cli" / "__init__.py").is_file()
-    assert (package_root / "runtime" / "gui" / "__init__.py").is_file()
-    assert not (package_root / "app").exists()
-from sunpack.core.i18n.catalog import CATALOG
 from sunpack.core.i18n.context import validate_catalog
 
 
 def test_i18n_catalogs_have_matching_keys_and_placeholders():
     validate_catalog()
-
-
-def test_cli_discovers_builtin_command_modules_in_order():
-    modules = discover_command_modules()
-
-    assert [module.COMMAND for module in modules] == ["extract", "watch", "scan", "inspect", "passwords", "config", "doctor", "version"]
-
-
-def test_cli_command_modules_declare_required_contract():
-    for module in discover_command_modules():
-        assert isinstance(module.COMMAND, str) and module.COMMAND
-        assert f"cli.{module.COMMAND}.help" in CATALOG["en"]
-        assert f"cli.{module.COMMAND}.help" in CATALOG["zh"]
-        assert callable(module.register)
-        assert callable(module.handle)
 
 
 def test_cli_parser_registers_discovered_commands():

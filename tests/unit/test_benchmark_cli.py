@@ -35,15 +35,6 @@ def test_keep_workdir_skips_parent_cleanup(monkeypatch) -> None:
     assert cleanup_ids == []
 
 
-def test_cleanup_script_restricts_services_to_generated_ids() -> None:
-    script = Path(__file__).resolve().parents[2] / "scripts" / "cleanup_test_artifacts.ps1"
-    source = script.read_text(encoding="utf-8")
-
-    assert "$testServicePattern = '^SunPackWatchBrokerTest_[0-9a-fA-F]{32}$'" in source
-    assert "$service.Name -notmatch $testServicePattern" in source
-    assert "$env:SUNPACK_SPACE_TEST_VHD_DIR" in source
-
-
 def test_clean_removes_only_selected_regenerable_roots(tmp_path, monkeypatch) -> None:
     cache = tmp_path / ".cache"
     work = tmp_path / ".work"

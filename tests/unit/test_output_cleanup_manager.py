@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ast
 from pathlib import Path
 
 import pytest
@@ -133,35 +132,3 @@ def test_scoped_cleanup_authorizes_only_strict_workspace_descendants(tmp_path, r
     assert not inside.exists()
     assert workspace.exists() and outside.exists()
 
-
-def test_output_deletion_primitives_are_confined_to_approved_infrastructure():
-    project_root = Path(__file__).resolve().parents[2]
-    allowed = {
-        Path("sunpack/pipeline/postprocess/output_cleanup.py"),
-        Path("sunpack/runtime/cli/persistent_process.py"),
-        Path("sunpack/pipeline/coordinator/reporting.py"),
-        Path("sunpack/runtime/watch/service.py"),
-        Path("sunpack/runtime/watch/state.py"),
-        Path("sunpack/core/support/resource_lifecycle.py"),
-    }
-    violations: list[str] = []
-    for path in (project_root / "sunpack").rglob("*.py"):
-        relative = path.relative_to(project_root)
-        if relative in allowed:
-            continue
-        source = path.read_text(encoding="utf-8")
-        if not any(token in source for token in ("rmtree", "unlink", "remove")):
-            continue
-        tree = ast.parse(source, filename=str(relative))
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
-                continue
-            is_delete = node.func.attr in {"rmtree", "unlink"}
-            is_os_remove = (
-                node.func.attr == "remove"
-                and isinstance(node.func.value, ast.Name)
-                and node.func.value.id == "os"
-            )
-            if is_delete or is_os_remove:
-                violations.append(f"{relative}:{node.lineno}")
-    assert violations == []

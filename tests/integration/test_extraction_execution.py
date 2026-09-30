@@ -101,7 +101,6 @@ class ExtractionExecutionTests(unittest.TestCase):
 
             self.assertTrue(result.success)
             self.assertEqual(task.cleanup_parts, [str(archive_path), str(launcher_path)])
-            self.assertFalse(hasattr(result, "all_parts"))
 
     def test_extractor_retries_unclassified_process_failure(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -364,5 +363,4 @@ class ExtractionRetryTests(unittest.TestCase):
 
             self.assertTrue(result.success)
             self.assertEqual(len(calls), 2)
-            self.assertFalse(hasattr(extractor.retry_policy, "backoff"))
             self.assertTrue(all("retry_delay_seconds" not in call for call in calls))

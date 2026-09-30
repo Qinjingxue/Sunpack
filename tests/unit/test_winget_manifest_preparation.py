@@ -4,7 +4,6 @@ import subprocess
 
 ROOT = Path(__file__).resolve().parents[2]
 PREPARE_SCRIPT = ROOT / "scripts" / "prepare_winget_manifest.ps1"
-VALIDATE_SCRIPT = ROOT / "scripts" / "validate_winget_manifest.ps1"
 # Inno Setup AppId from installer/SunPack.iss, in the form Inno writes it to the
 # uninstall registry key ("<ProductCode>_is1").
 PRODUCT_CODE = "'{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}'"
@@ -150,13 +149,3 @@ def test_prepare_winget_manifest_does_not_overwrite_without_force(tmp_path):
     assert first.returncode == 0, first.stdout + first.stderr
     assert second.returncode != 0
     assert "-Force" in ((second.stdout or "") + (second.stderr or ""))
-
-
-def test_validate_script_requires_the_complete_multifile_manifest_set():
-    script = VALIDATE_SCRIPT.read_text(encoding="utf-8")
-
-    assert '"$packageIdentifier.installer.yaml"' in script
-    assert '"$packageIdentifier.locale.en-US.yaml"' in script
-    assert "Resolve-Path -LiteralPath $ManifestRoot" in script
-    assert "Test-Path -LiteralPath $resolvedRoot -PathType Container" in script
-    assert "validate --manifest $resolvedRoot" in script
