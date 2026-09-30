@@ -1251,6 +1251,16 @@ class _RequestRuntime:
                 },
             )
 
+        if tasks:
+            await broker.run(
+                "directory_passwords",
+                self.submission.request_id,
+                self.job_executor.directory_password_contexts.annotate,
+                tasks,
+                request_id=self.submission.request_id,
+                cancellation=cancellation,
+            )
+
         results = await asyncio.gather(
             *(
                 self._execute_job(

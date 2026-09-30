@@ -408,7 +408,9 @@ namespace sunpack::sevenzip
 
                 result.message = "the embedded 7-Zip backend did not create a supported archive handler";
             }
-            else if (!any_opened && plan.uses_ranges() && encrypted_header_range_probe_candidate(plan.archive_type))
+            else if (!any_opened &&
+                     (looks_wrong_password(last_hr, last_op_res, last_encryption_evidence) ||
+                      (plan.uses_ranges() && encrypted_header_range_probe_candidate(plan.archive_type))))
             {
 
                 result.status = PasswordTestStatus::WrongPassword;
@@ -700,32 +702,6 @@ namespace sunpack::sevenzip
             password_count = 1;
         }
 
-        const std::wstring ext = lower_extension(archive_path);
-
-        const bool retry_unsupported_as_password =
-
-            ext == L".7z" ||
-
-            ext == L".001" ||
-
-            ext == L".rar" ||
-
-            ext == L".r00" ||
-
-            ext == L".jpg" ||
-
-            ext == L".jpeg" ||
-
-            ext == L".png" ||
-
-            ext == L".gif" ||
-
-            ext == L".pdf" ||
-
-            ext == L".webp" ||
-
-            is_sfx_path(archive_path);
-
         const std::vector<std::wstring> effective_part_paths =
 
             part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
@@ -790,7 +766,7 @@ namespace sunpack::sevenzip
                 return current;
             }
 
-            if (current.status == PasswordTestStatus::Unsupported && !retry_unsupported_as_password)
+            if (current.status == PasswordTestStatus::Unsupported)
             {
 
                 current.matched_index = -1;
@@ -910,7 +886,9 @@ namespace sunpack::sevenzip
                 continue;
             }
 
-            if (current.status == PasswordTestStatus::BackendUnavailable ||
+            if (current.status == PasswordTestStatus::Unsupported ||
+
+                current.status == PasswordTestStatus::BackendUnavailable ||
 
                 current.status == PasswordTestStatus::Damaged ||
 

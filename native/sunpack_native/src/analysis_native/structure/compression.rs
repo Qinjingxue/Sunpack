@@ -166,24 +166,14 @@ fn compression_identity_result(
 fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityResult {
     let reader = match ManagedReader::open(path) {
         Ok(value) => value,
-        Err(_) => {
-            return compression_identity_result("", "", false, 0, 0, false, "os_error", &[])
-        }
+        Err(_) => return compression_identity_result("", "", false, 0, 0, false, "os_error", &[]),
     };
     let file_size = reader.len();
     let read_size = file_size.min(32) as usize;
     let mut data = match reader.read_direct_at(0, read_size) {
         Ok(value) => value,
         Err(_) => {
-            return compression_identity_result("",
-                "",
-                false,
-                file_size,
-                0,
-                false,
-                "os_error",
-                &[],
-            )
+            return compression_identity_result("", "", false, file_size, 0, false, "os_error", &[])
         }
     };
 
@@ -195,7 +185,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         data = match reader.read_direct_at(0, expanded) {
             Ok(value) => value,
             Err(_) => {
-                return compression_identity_result("gzip",
+                return compression_identity_result(
+                    "gzip",
                     ".gz",
                     true,
                     file_size,
@@ -213,7 +204,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         let (payload_start, flags) = match parse_gzip_header(&data, 0) {
             Ok(value) => value,
             Err(error) => {
-                return compression_identity_result("gzip",
+                return compression_identity_result(
+                    "gzip",
                     ".gz",
                     true,
                     file_size,
@@ -227,7 +219,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         let mut evidence = vec!["gzip:magic", "gzip:header"];
         if flags & 0x02 != 0 {
             let Some(crc_offset) = payload_start.checked_sub(2) else {
-                return compression_identity_result("gzip",
+                return compression_identity_result(
+                    "gzip",
                     ".gz",
                     true,
                     file_size,
@@ -238,7 +231,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
                 );
             };
             let Some(stored_bytes) = data.get(crc_offset..crc_offset + 2) else {
-                return compression_identity_result("gzip",
+                return compression_identity_result(
+                    "gzip",
                     ".gz",
                     true,
                     file_size,
@@ -251,7 +245,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             let stored = u16::from_le_bytes([stored_bytes[0], stored_bytes[1]]);
             let computed = (crc32(&data[..crc_offset]) & 0xffff) as u16;
             if stored != computed {
-                return compression_identity_result("gzip",
+                return compression_identity_result(
+                    "gzip",
                     ".gz",
                     true,
                     file_size,
@@ -264,7 +259,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             evidence.push("gzip:header_crc16");
         }
         if payload_start as u64 >= file_size {
-            return compression_identity_result("gzip",
+            return compression_identity_result(
+                "gzip",
                 ".gz",
                 true,
                 file_size,
@@ -281,7 +277,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             )
             .unwrap_or_default();
         if block_probe.is_empty() {
-            return compression_identity_result("gzip",
+            return compression_identity_result(
+                "gzip",
                 ".gz",
                 true,
                 file_size,
@@ -293,7 +290,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         }
         let block_type = (block_probe[0] >> 1) & 0x03;
         if block_type == 3 {
-            return compression_identity_result("gzip",
+            return compression_identity_result(
+                "gzip",
                 ".gz",
                 true,
                 file_size,
@@ -305,7 +303,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         }
         if block_type == 0 {
             if block_probe.len() < 5 {
-                return compression_identity_result("gzip",
+                return compression_identity_result(
+                    "gzip",
                     ".gz",
                     true,
                     file_size,
@@ -318,7 +317,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             let len = u16::from_le_bytes([block_probe[1], block_probe[2]]);
             let nlen = u16::from_le_bytes([block_probe[3], block_probe[4]]);
             if len ^ nlen != 0xffff {
-                return compression_identity_result("gzip",
+                return compression_identity_result(
+                    "gzip",
                     ".gz",
                     true,
                     file_size,
@@ -331,7 +331,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             evidence.push("gzip:deflate_stored_length");
         } else if block_type == 2 {
             if block_probe.len() < 3 {
-                return compression_identity_result("gzip",
+                return compression_identity_result(
+                    "gzip",
                     ".gz",
                     true,
                     file_size,
@@ -348,7 +349,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
                 *block_probe.get(3).unwrap_or(&0),
             ]) >> 3;
             if bits & 0x1f > 29 {
-                return compression_identity_result("gzip",
+                return compression_identity_result(
+                    "gzip",
                     ".gz",
                     true,
                     file_size,
@@ -362,7 +364,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         } else {
             evidence.push("gzip:deflate_fixed_header");
         }
-        return compression_identity_result("gzip",
+        return compression_identity_result(
+            "gzip",
             ".gz",
             true,
             file_size,
@@ -375,7 +378,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
 
     if data.starts_with(b"BZh") {
         if data.len() < 14 || !matches!(data[3], b'1'..=b'9') {
-            return compression_identity_result("bzip2",
+            return compression_identity_result(
+                "bzip2",
                 ".bz2",
                 true,
                 file_size,
@@ -389,7 +393,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         const END_MAGIC: &[u8; 6] = b"\x17\x72\x45\x38\x50\x90";
         let marker = &data[4..10];
         if marker != BLOCK_MAGIC && marker != END_MAGIC {
-            return compression_identity_result("bzip2",
+            return compression_identity_result(
+                "bzip2",
                 ".bz2",
                 true,
                 file_size,
@@ -408,7 +413,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         } else {
             vec!["bzip2:magic", "bzip2:block_size", "bzip2:end_marker"]
         };
-        return compression_identity_result("bzip2",
+        return compression_identity_result(
+            "bzip2",
             ".bz2",
             true,
             file_size,
@@ -421,7 +427,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
 
     if data.starts_with(XZ_MAGIC) {
         if data.len() < 12 || file_size < 24 {
-            return compression_identity_result("xz",
+            return compression_identity_result(
+                "xz",
                 ".xz",
                 true,
                 file_size,
@@ -439,7 +446,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             || !matches!(check_id, 0 | 1 | 4 | 10)
             || stored != crc32(&flags)
         {
-            return compression_identity_result("xz",
+            return compression_identity_result(
+                "xz",
                 ".xz",
                 true,
                 file_size,
@@ -449,7 +457,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
                 &["xz:magic"],
             );
         }
-        return compression_identity_result("xz",
+        return compression_identity_result(
+            "xz",
             ".xz",
             true,
             file_size,
@@ -462,7 +471,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
 
     if data.starts_with(ZSTD_MAGIC) {
         if data.len() < 8 {
-            return compression_identity_result("zstd",
+            return compression_identity_result(
+                "zstd",
                 ".zst",
                 true,
                 file_size,
@@ -474,7 +484,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         }
         let descriptor = data[4];
         if descriptor & 0x18 != 0 {
-            return compression_identity_result("zstd",
+            return compression_identity_result(
+                "zstd",
                 ".zst",
                 true,
                 file_size,
@@ -494,7 +505,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         let mut cursor = 5usize;
         if !single {
             if cursor >= data.len() {
-                return compression_identity_result("zstd",
+                return compression_identity_result(
+                    "zstd",
                     ".zst",
                     true,
                     file_size,
@@ -512,7 +524,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             .checked_add(dict_size)
             .and_then(|value| value.checked_add(fcs_size))
         else {
-            return compression_identity_result("zstd",
+            return compression_identity_result(
+                "zstd",
                 ".zst",
                 true,
                 file_size,
@@ -523,7 +536,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             );
         };
         if block_header_offset + 3 > data.len() {
-            return compression_identity_result("zstd",
+            return compression_identity_result(
+                "zstd",
                 ".zst",
                 true,
                 file_size,
@@ -539,7 +553,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         let block_type = (block_header >> 1) & 0x03;
         let block_size = u64::from(block_header >> 3);
         if block_type == 3 || block_size > 128 * 1024 {
-            return compression_identity_result("zstd",
+            return compression_identity_result(
+                "zstd",
                 ".zst",
                 true,
                 file_size,
@@ -555,7 +570,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
             .and_then(|value| value.checked_add(stored_size))
             .map_or(true, |end| end > file_size)
         {
-            return compression_identity_result("zstd",
+            return compression_identity_result(
+                "zstd",
                 ".zst",
                 true,
                 file_size,
@@ -565,7 +581,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
                 &["zstd:magic", "zstd:frame_descriptor"],
             );
         }
-        return compression_identity_result("zstd",
+        return compression_identity_result(
+            "zstd",
             ".zst",
             true,
             file_size,
@@ -580,7 +597,8 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         );
     }
 
-    compression_identity_result("",
+    compression_identity_result(
+        "",
         "",
         false,
         file_size,
@@ -627,11 +645,13 @@ fn inspect_large_structural_stream(
             "block_header_linear_payload_skipped",
         ),
     };
-    let reader = match ManagedReader::open(path) {
+    let reader = match py.detach(|| ManagedReader::open(path)) {
         Ok(value) => value,
         Err(_) => return compression_empty(py, "os_error", format, ext, false),
     };
-    let head = reader.read_cached_at(0, magic.len()).unwrap_or_default();
+    let head = py
+        .detach(|| reader.read_cached_at(0, magic.len()))
+        .unwrap_or_default();
     let magic_matched = head.starts_with(magic);
     let d = compression_base(py, format, ext, magic_matched)?;
     for field in fields {
@@ -640,12 +660,12 @@ fn inspect_large_structural_stream(
     d.set_item("validation_scope", "complete_structure")?;
     d.set_item("validation_cost", cost)?;
     d.set_item("file_size", file_size)?;
-    let validation = match kind {
+    let validation = py.detach(|| match kind {
         StructuralStreamKind::Gzip => validate_gzip_structure(&reader, 0, file_size),
         StructuralStreamKind::Bzip2 => validate_bzip2_structure(&reader, 0, file_size),
         StructuralStreamKind::Xz => validate_xz_structure_exact(&reader, 0, file_size),
         StructuralStreamKind::Zstd => validate_zstd_structure(&reader, 0, file_size),
-    };
+    });
     let structure = match validation {
         Ok(value) => value,
         Err(error) => {
@@ -712,7 +732,7 @@ fn apply_structural_contract(
     integrity_verified_end: Option<u64>,
     damage_flags: &mut Vec<&'static str>,
 ) -> PyResult<()> {
-    let reader = match ManagedReader::open(path) {
+    let reader = match d.py().detach(|| ManagedReader::open(path)) {
         Ok(value) => value,
         Err(_) => {
             d.set_item("structure_status", "invalid")?;
@@ -721,12 +741,12 @@ fn apply_structural_contract(
             return Ok(());
         }
     };
-    let validation = match kind {
+    let validation = d.py().detach(|| match kind {
         StructuralStreamKind::Gzip => validate_gzip_structure(&reader, 0, validation_limit),
         StructuralStreamKind::Bzip2 => validate_bzip2_structure(&reader, 0, validation_limit),
         StructuralStreamKind::Xz => validate_xz_structure_exact(&reader, 0, validation_limit),
         StructuralStreamKind::Zstd => validate_zstd_structure(&reader, 0, validation_limit),
-    };
+    });
     match validation {
         Ok(structure) => {
             let trailing = file_size.saturating_sub(structure.end_offset);
@@ -866,7 +886,7 @@ fn inspect_gzip(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
     if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
         return inspect_large_structural_stream(py, path, file_size, StructuralStreamKind::Gzip);
     }
-    let data = match ManagedReader::open(path).and_then(|reader| reader.read_all()) {
+    let data = match py.detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all())) {
         Ok(data) => data,
         Err(_) => {
             return compression_empty(
@@ -946,28 +966,29 @@ fn inspect_gzip(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
     // Move the bounded compressed input into the canonical reader so the structural
     // walk and integrity observer share one byte source without cloning the file.
     let reader = ManagedReader::from_bytes(data, crate::io::reader::ReaderConfig::default());
-    let analysis =
-        match analyze_gzip_structure(&reader, 0, file_size, STREAM_STRUCTURE_DECODE_MAX_BYTES) {
-            Ok(value) => value,
-            Err(error) => {
-                let code = error.code();
-                if !damage_flags.contains(&code) {
-                    damage_flags.push(code);
-                }
-                d.set_item("structure_status", "invalid")?;
-                d.set_item("structure_validation_complete", false)?;
-                d.set_item("boundary_exact", false)?;
-                d.set_item("integrity_status", "failed")?;
-                d.set_item("integrity_validation_complete", true)?;
-                d.set_item("plausible", false)?;
-                d.set_item("confidence", "none")?;
-                d.set_item("error", code)?;
-                d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;
-                d.set_item("file_size", file_size)?;
-                finish_fields(&d, GZIP_FIELDS)?;
-                return Ok(d.unbind());
+    let analysis = match py
+        .detach(|| analyze_gzip_structure(&reader, 0, file_size, STREAM_STRUCTURE_DECODE_MAX_BYTES))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            let code = error.code();
+            if !damage_flags.contains(&code) {
+                damage_flags.push(code);
             }
-        };
+            d.set_item("structure_status", "invalid")?;
+            d.set_item("structure_validation_complete", false)?;
+            d.set_item("boundary_exact", false)?;
+            d.set_item("integrity_status", "failed")?;
+            d.set_item("integrity_validation_complete", true)?;
+            d.set_item("plausible", false)?;
+            d.set_item("confidence", "none")?;
+            d.set_item("error", code)?;
+            d.set_item("damage_flags", PyList::new(py, damage_flags)?)?;
+            d.set_item("file_size", file_size)?;
+            finish_fields(&d, GZIP_FIELDS)?;
+            return Ok(d.unbind());
+        }
+    };
     let structure = &analysis.structure;
     let integrity = structure.integrity.as_str();
     if integrity == "failed" && !damage_flags.contains(&"gzip_footer_bad") {
@@ -1104,7 +1125,7 @@ fn inspect_bzip2(
     if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
         return inspect_large_structural_stream(py, path, file_size, StructuralStreamKind::Bzip2);
     }
-    let data = match ManagedReader::open(path).and_then(|reader| reader.read_all()) {
+    let data = match py.detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all())) {
         Ok(data) => data,
         Err(_) => {
             return compression_empty(py, "os_error", "bzip2", ".bz2", header.starts_with(b"BZh"))
@@ -1126,8 +1147,12 @@ fn inspect_bzip2(
         finish_fields(&d, BZIP2_FIELDS)?;
         return Ok(d.unbind());
     }
-    let blocks = marker_positions(&data, 0x314159265359);
-    let ends = marker_positions(&data, 0x177245385090);
+    let (blocks, ends) = py.detach(|| {
+        (
+            marker_positions(&data, 0x314159265359),
+            marker_positions(&data, 0x177245385090),
+        )
+    });
     d.set_item(
         "block.marker",
         blocks.first().map(|v| *v as u64).unwrap_or(u64::MAX),
@@ -1166,7 +1191,7 @@ fn inspect_bzip2(
     let decoder = bzip2::read::BzDecoder::new(Cursor::new(data.as_slice()));
     let mut limited_decoder = decoder.take(STREAM_STRUCTURE_DECODE_MAX_BYTES + 1);
     let mut decoded = Vec::new();
-    let decode_status = limited_decoder.read_to_end(&mut decoded);
+    let decode_status = py.detach(|| limited_decoder.read_to_end(&mut decoded));
     let decoder = limited_decoder.into_inner();
     let decode_limited = decoded.len() as u64 > STREAM_STRUCTURE_DECODE_MAX_BYTES;
     let decode_ok = decode_status.is_ok() && !decode_limited;
@@ -1431,7 +1456,7 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
         return inspect_large_structural_stream(py, path, file_size, StructuralStreamKind::Xz);
     }
-    let data = match ManagedReader::open(path).and_then(|reader| reader.read_all()) {
+    let data = match py.detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all())) {
         Ok(data) => data,
         Err(_) => {
             return compression_empty(py, "os_error", "xz", ".xz", header.starts_with(XZ_MAGIC))
@@ -1463,17 +1488,21 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
         damage_flags.push("xz_header_crc_bad");
     }
 
-    let footer_start = (10..data.len())
-        .rev()
-        .find_map(|magic_end| {
-            if data.get(magic_end - 1..=magic_end) != Some(b"YZ".as_slice()) || magic_end + 1 < 12 {
-                return None;
-            }
-            let start = magic_end + 1 - 12;
-            let footer = &data[start..start + 12];
-            (u32_le(footer, 0) == crc32(&footer[4..10])).then_some(start)
-        })
-        .unwrap_or(data.len() - 12);
+    let footer_start = py.detach(|| {
+        (10..data.len())
+            .rev()
+            .find_map(|magic_end| {
+                if data.get(magic_end - 1..=magic_end) != Some(b"YZ".as_slice())
+                    || magic_end + 1 < 12
+                {
+                    return None;
+                }
+                let start = magic_end + 1 - 12;
+                let footer = &data[start..start + 12];
+                (u32_le(footer, 0) == crc32(&footer[4..10])).then_some(start)
+            })
+            .unwrap_or(data.len() - 12)
+    });
     let footer = &data[footer_start..];
     let footer_crc = u32_le(footer, 0);
     let backward_size = (u32_le(footer, 4) as u64 + 1) * 4;
@@ -1510,33 +1539,31 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     d.set_item("index.record_count", record_count.unwrap_or(0))?;
     let records = record_count
         .filter(|_| index_valid_start)
-        .and_then(|count| xz_index_records(index_data, &mut index_cursor, count))
+        .and_then(|count| py.detach(|| xz_index_records(index_data, &mut index_cursor, count)))
         .unwrap_or_else(|| {
             damage_flags.push("xz_index_bad");
             Vec::new()
         });
-    d.set_item(
-        "index.records.unpadded_size",
+    let (unpadded_total, uncompressed_total) = py.detach(|| {
         records
             .iter()
-            .fold(0u64, |total, r| total.saturating_add(r.0)),
-    )?;
-    d.set_item(
-        "index.records.uncompressed_size",
-        records
-            .iter()
-            .fold(0u64, |total, r| total.saturating_add(r.1)),
-    )?;
+            .fold((0u64, 0u64), |(unpadded, uncompressed), r| {
+                (
+                    unpadded.saturating_add(r.0),
+                    uncompressed.saturating_add(r.1),
+                )
+            })
+    });
+    d.set_item("index.records.unpadded_size", unpadded_total)?;
+    d.set_item("index.records.uncompressed_size", uncompressed_total)?;
     d.set_item("index.padding", index_crc_pos.saturating_sub(index_cursor))?;
     if index_crc_pos + 4 <= data.len() && index_start <= index_crc_pos {
         let stored = u32_le(&data, index_crc_pos);
-        let ok = stored == crc32(&data[index_start..index_crc_pos]);
+        let computed = py.detach(|| crc32(&data[index_start..index_crc_pos]));
+        let ok = stored == computed;
         d.set_item(
             "index.crc32",
-            format!(
-                "stored={stored};computed={};ok={ok}",
-                crc32(&data[index_start..index_crc_pos])
-            ),
+            format!("stored={stored};computed={};ok={ok}", computed),
         )?;
         if !ok {
             damage_flags.push("xz_index_bad");
@@ -1549,55 +1576,61 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     let mut total_padding = 0usize;
     let mut first_filters = String::new();
     let check_size = xz_check_size(flags[1] & 0x0f);
-    for (unpadded, expected_uncompressed) in &records {
-        if block_cursor >= index_start {
-            break;
-        }
-        let header_size = (data[block_cursor] as usize + 1) * 4;
-        if block_cursor + header_size > index_start || header_size < 8 {
-            damage_flags.push("xz_block_header_bad");
-            break;
-        }
-        let block_flags = data[block_cursor + 1];
-        let Some((declared_compressed, declared_uncompressed, filters)) =
-            xz_block_header_fields(&data[block_cursor..block_cursor + header_size - 4])
-        else {
-            damage_flags.push("xz_block_header_bad");
-            break;
-        };
-        if first_filters.is_empty() {
-            first_filters = filters.join(",");
-        }
-        let stored_header_crc = u32_le(&data, block_cursor + header_size - 4);
-        if block_count == 0 {
-            d.set_item("block.header.size", header_size)?;
-            d.set_item("block.header.flags", block_flags)?;
-            d.set_item(
-                "block.header.compressed_size",
-                declared_compressed
-                    .unwrap_or(unpadded.saturating_sub(header_size as u64 + check_size as u64)),
-            )?;
-            d.set_item(
-                "block.header.uncompressed_size",
-                declared_uncompressed.unwrap_or(*expected_uncompressed),
-            )?;
-            d.set_item(
-                "block.header.crc32",
-                format!(
-                    "stored={stored_header_crc};computed={};ok={}",
+    let mut first_header = None;
+    py.detach(|| {
+        for (unpadded, expected_uncompressed) in &records {
+            if block_cursor >= index_start {
+                break;
+            }
+            let header_size = (data[block_cursor] as usize + 1) * 4;
+            if block_cursor + header_size > index_start || header_size < 8 {
+                damage_flags.push("xz_block_header_bad");
+                break;
+            }
+            let block_flags = data[block_cursor + 1];
+            let Some((declared_compressed, declared_uncompressed, filters)) =
+                xz_block_header_fields(&data[block_cursor..block_cursor + header_size - 4])
+            else {
+                damage_flags.push("xz_block_header_bad");
+                break;
+            };
+            if first_filters.is_empty() {
+                first_filters = filters.join(",");
+            }
+            let stored_header_crc = u32_le(&data, block_cursor + header_size - 4);
+            if block_count == 0 {
+                first_header = Some((
+                    header_size,
+                    block_flags,
+                    declared_compressed
+                        .unwrap_or(unpadded.saturating_sub(header_size as u64 + check_size as u64)),
+                    declared_uncompressed.unwrap_or(*expected_uncompressed),
+                    stored_header_crc,
                     crc32(&data[block_cursor..block_cursor + header_size - 4]),
-                    stored_header_crc == crc32(&data[block_cursor..block_cursor + header_size - 4])
-                ),
-            )?;
+                ));
+            }
+            let compressed_size = declared_compressed
+                .unwrap_or(unpadded.saturating_sub(header_size as u64 + check_size as u64));
+            total_compressed = total_compressed.saturating_add(compressed_size);
+            let unpadded_actual = header_size as u64 + compressed_size + check_size as u64;
+            let padding = ((4 - unpadded_actual % 4) % 4) as usize;
+            total_padding += padding;
+            block_cursor = block_cursor.saturating_add(unpadded_actual as usize + padding);
+            block_count += 1;
         }
-        let compressed_size = declared_compressed
-            .unwrap_or(unpadded.saturating_sub(header_size as u64 + check_size as u64));
-        total_compressed = total_compressed.saturating_add(compressed_size);
-        let unpadded_actual = header_size as u64 + compressed_size + check_size as u64;
-        let padding = ((4 - unpadded_actual % 4) % 4) as usize;
-        total_padding += padding;
-        block_cursor = block_cursor.saturating_add(unpadded_actual as usize + padding);
-        block_count += 1;
+    });
+    if let Some((size, flags, compressed, uncompressed, stored, computed)) = first_header {
+        d.set_item("block.header.size", size)?;
+        d.set_item("block.header.flags", flags)?;
+        d.set_item("block.header.compressed_size", compressed)?;
+        d.set_item("block.header.uncompressed_size", uncompressed)?;
+        d.set_item(
+            "block.header.crc32",
+            format!(
+                "stored={stored};computed={computed};ok={}",
+                stored == computed
+            ),
+        )?;
     }
     d.set_item("block.header.filters", first_filters)?;
     d.set_item("block.compressed_data", total_compressed)?;
@@ -1610,11 +1643,11 @@ fn inspect_xz(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> PyRe
     let decoder = xz2::read::XzDecoder::new(Cursor::new(data.as_slice()));
     let mut limited_decoder = decoder.take(STREAM_STRUCTURE_DECODE_MAX_BYTES + 1);
     let mut decoded = Vec::new();
-    let decode_status = limited_decoder.read_to_end(&mut decoded);
+    let decode_status = py.detach(|| limited_decoder.read_to_end(&mut decoded));
     let decode_limited = decoded.len() as u64 > STREAM_STRUCTURE_DECODE_MAX_BYTES;
     let decode_ok = decode_status.is_ok() && !decode_limited;
     d.set_item("block.uncompressed_data", decoded.len())?;
-    let stream_count = data.windows(6).filter(|w| *w == XZ_MAGIC).count();
+    let stream_count = py.detach(|| data.windows(6).filter(|w| *w == XZ_MAGIC).count());
     d.set_item("archive.stream_sequence", stream_count)?;
     let after_footer = footer_start + 12;
     let zero_padding = data[after_footer..].iter().take_while(|b| **b == 0).count();
@@ -1672,7 +1705,7 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
     if file_size > EAGER_STREAM_INTEGRITY_MAX_BYTES {
         return inspect_large_structural_stream(py, path, file_size, StructuralStreamKind::Zstd);
     }
-    let data = match ManagedReader::open(path).and_then(|reader| reader.read_all()) {
+    let data = match py.detach(|| ManagedReader::open(path).and_then(|reader| reader.read_all())) {
         Ok(data) => data,
         Err(_) => {
             return compression_empty(
@@ -1752,25 +1785,28 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
     let mut last = false;
     let mut first_type = 0u8;
     let mut first_size = 0usize;
-    while cursor + 3 <= data.len() && !last {
-        let h =
-            data[cursor] as u32 | (data[cursor + 1] as u32) << 8 | (data[cursor + 2] as u32) << 16;
-        cursor += 3;
-        last = h & 1 != 0;
-        let block_type = ((h >> 1) & 3) as u8;
-        let block_size = (h >> 3) as usize;
-        if blocks == 0 {
-            first_type = block_type;
-            first_size = block_size;
+    py.detach(|| {
+        while cursor + 3 <= data.len() && !last {
+            let h = data[cursor] as u32
+                | (data[cursor + 1] as u32) << 8
+                | (data[cursor + 2] as u32) << 16;
+            cursor += 3;
+            last = h & 1 != 0;
+            let block_type = ((h >> 1) & 3) as u8;
+            let block_size = (h >> 3) as usize;
+            if blocks == 0 {
+                first_type = block_type;
+                first_size = block_size;
+            }
+            let stored_size = if block_type == 1 { 1 } else { block_size };
+            if block_type == 3 || cursor + stored_size > data.len() {
+                break;
+            }
+            total_content += stored_size;
+            cursor += stored_size;
+            blocks += 1;
         }
-        let stored_size = if block_type == 1 { 1 } else { block_size };
-        if block_type == 3 || cursor + stored_size > data.len() {
-            break;
-        }
-        total_content += stored_size;
-        cursor += stored_size;
-        blocks += 1;
-    }
+    });
     d.set_item("block.header.last_block", last)?;
     d.set_item("block.header.type", first_type)?;
     d.set_item("block.header.size", first_size)?;
@@ -1818,7 +1854,7 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
         match zstd::stream::read::Decoder::new(Cursor::new(&data[..cursor])) {
             Ok(decoder) => {
                 let mut limited_decoder = decoder.take(STREAM_STRUCTURE_DECODE_MAX_BYTES + 1);
-                let status = limited_decoder.read_to_end(&mut decoded);
+                let status = py.detach(|| limited_decoder.read_to_end(&mut decoded));
                 let limited = decoded.len() as u64 > STREAM_STRUCTURE_DECODE_MAX_BYTES;
                 (status.is_ok() && !limited, limited)
             }
@@ -1827,24 +1863,26 @@ fn inspect_zstd(py: Python<'_>, path: &str, header: &[u8], file_size: u64) -> Py
     d.set_item("frame.decoded_content", decoded.len())?;
     d.set_item(
         "frame.sequence",
-        data.windows(4).filter(|w| *w == ZSTD_MAGIC).count(),
+        py.detach(|| data.windows(4).filter(|w| *w == ZSTD_MAGIC).count()),
     )?;
     let mut skippable_count = 0usize;
     let mut skip_size = 0usize;
     let mut skip_data = 0usize;
     let mut scan = 0usize;
-    while scan + 8 <= data.len() {
-        let magic = u32_le(&data, scan);
-        if (0x184d2a50..=0x184d2a5f).contains(&magic) {
-            let size = u32_le(&data, scan + 4) as usize;
-            skippable_count += 1;
-            skip_size += size;
-            skip_data += size.min(data.len().saturating_sub(scan + 8));
-            scan = scan.saturating_add(8 + size);
-            continue;
+    py.detach(|| {
+        while scan + 8 <= data.len() {
+            let magic = u32_le(&data, scan);
+            if (0x184d2a50..=0x184d2a5f).contains(&magic) {
+                let size = u32_le(&data, scan + 4) as usize;
+                skippable_count += 1;
+                skip_size += size;
+                skip_data += size.min(data.len().saturating_sub(scan + 8));
+                scan = scan.saturating_add(8 + size);
+                continue;
+            }
+            scan += 1;
         }
-        scan += 1;
-    }
+    });
     d.set_item("skippable.magic", skippable_count)?;
     d.set_item("skippable.frame_size", skip_size)?;
     d.set_item("skippable.user_data", skip_data)?;

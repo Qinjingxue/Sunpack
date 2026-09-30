@@ -529,14 +529,9 @@ def _call_fast_verifier(
             attempts=0,
             error_text="bounded password verifier is unavailable",
         )
-    try:
-        return fast(
-            archive_path,
-            passwords,
-            part_paths=part_paths,
-            archive_input=archive_input,
-        )
-    except TypeError as error:
-        if "archive_input" not in str(error):
-            raise
-        return fast(archive_path, passwords, part_paths=part_paths)
+    return fast(
+        archive_path,
+        passwords,
+        part_paths=part_paths,
+        archive_input=archive_input,
+    )

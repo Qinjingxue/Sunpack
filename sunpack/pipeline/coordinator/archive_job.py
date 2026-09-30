@@ -119,7 +119,6 @@ class ArchiveJobExecutor:
     ) -> tuple[ArchiveTask, ArchiveJobOutcome, TargetRunResult]:
         """Run one logical archive through preflight, extraction and verification."""
 
-        self.directory_password_contexts.annotate([task])
         task, outcome = await self._execute_one_async(
             task,
             output_dir_resolver,

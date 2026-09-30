@@ -506,6 +506,130 @@ def test_native_worker_asyncio_no_progress_cancels_without_polling(tmp_path):
     assert "no observable progress" in completed.stderr
 
 
+@pytest.mark.parametrize("completion", ["job_finished", "worker_exit", "grace_expired"])
+def test_cancelled_request_retains_input_lease_until_native_work_stops(tmp_path, completion):
+    from sunpack.pipeline.coordinator.engine import PipelineEngine
+
+    worker = tmp_path / "cancel_worker.cmd"
+    ending = (
+        '@echo {"type":"result","job_id":"cancel-job","status":"failed"}\r\n'
+        '@echo {"type":"native_event","event":"job_finished","job_id":"cancel-job"}\r\n'
+        '@set /p shutdown=\r\n'
+        if completion == "job_finished"
+        else '@set /p ignored=\r\n' if completion == "grace_expired"
+        else '@exit /b 7\r\n'
+    )
+    worker.write_text(
+        '@echo {"type":"worker_ready"}\r\n'
+        '@set /p request=\r\n'
+        '@echo {"type":"native_event","event":"job_started","job_id":"cancel-job"}\r\n'
+        '@set /p cancellation=\r\n'
+        '@echo {"type":"cancel_ack","job_id":"cancel-job"}\r\n'
+        '@echo {"type":"native_event","event":"job_cancelling","job_id":"cancel-job"}\r\n'
+        '@set /p finish=\r\n' + ending,
+        encoding="utf-8",
+    )
+
+    async def scenario():
+        runner = SevenZipRunner({"cancel_grace_seconds": 0.5 if completion == "grace_expired" else 5})
+        runner.worker_path = str(worker)
+        started, cancelling = asyncio.Event(), asyncio.Event()
+
+        def event(_task, value):
+            if value.get("event") == "job_started":
+                started.set()
+            elif value.get("event") == "job_cancelling":
+                cancelling.set()
+
+        runner.native_event_callback = event
+
+        class Runtime:
+            def __init__(self, services, submission, options, leases):
+                self.submission, self.leases = submission, leases
+
+            async def execute_async(self, broker, cancellation):
+                await self.leases.acquire(self.submission.request_id, [str(worker)])
+                await runner.submit_attempt_asyncio({"job_id": "cancel-job"}, task=_task(worker))
+                raise AssertionError("the request must remain cancelled")
+
+        async with PipelineEngine({}) as engine:
+            engine._request_runtime_factory = Runtime
+            request = asyncio.create_task(engine.run([str(worker)]))
+            waiting = None
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                request.cancel()
+                await asyncio.wait_for(cancelling.wait(), 2)
+                request.cancel()
+                waiting = asyncio.create_task(engine._path_leases.acquire("second", [str(worker)]))
+                await asyncio.sleep(0)
+                assert not request.done()
+                assert not waiting.done()
+                assert not engine.is_idle()
+                if completion != "grace_expired":
+                    native = await runner._async_worker_holder_or_create().get_or_start(None)
+                    await native.send('{"worker_command":"finish"}')
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(request, 2)
+                await asyncio.wait_for(waiting, 2)
+                assert engine.is_idle()
+            finally:
+                await runner.aclose()
+                await asyncio.gather(request, return_exceptions=True)
+                if waiting is not None:
+                    waiting.cancel()
+                    await asyncio.gather(waiting, return_exceptions=True)
+                await engine._path_leases.release("second")
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("layout", ["plain", "carrier", "split"])
+def test_worker_header_encrypted_7z_tries_candidates_with_disguised_names(tmp_path, layout):
+    seven_zip = _require_7z_or_skip()
+    worker = _require_worker_or_skip()
+    source = tmp_path / "payload.txt"
+    source.write_text("encrypted payload", encoding="utf-8")
+    archive = tmp_path / "encrypted.7z"
+    subprocess.run(
+        [str(seven_zip), "a", str(archive), str(source), "-psecret", "-mhe=on", "-mx=0", "-y"],
+        check=True, capture_output=True,
+    )
+    data = archive.read_bytes()
+    disguised = tmp_path / "input.blob"
+    descriptor = {"entry_path": str(disguised), "format_hint": "7z", "open_mode": "file"}
+    if layout == "plain":
+        disguised.write_bytes(data)
+    elif layout == "carrier":
+        prefix = b"carrier prefix"
+        disguised.write_bytes(prefix + data + b"carrier suffix")
+        descriptor.update(open_mode="file_range", parts=[{
+            "path": str(disguised), "start": len(prefix), "end": len(prefix) + len(data),
+        }])
+    else:
+        second = tmp_path / "part.disguised"
+        midpoint = len(data) // 2
+        disguised.write_bytes(data[:midpoint])
+        second.write_bytes(data[midpoint:])
+        descriptor.update(open_mode="concat_ranges", ranges=[
+            {"path": str(disguised), "start": 0}, {"path": str(second), "start": 0},
+        ])
+    out = tmp_path / "out"
+    result = subprocess.run(
+        [worker], input=json.dumps({
+            "job_id": "header-passwords", "archive_path": str(disguised),
+            "output_dir": str(out), "format_hint": "7z", "archive_input": descriptor,
+            "password_candidates": ["wrong", "secret"],
+        }), capture_output=True, text=True, encoding="utf-8", timeout=10,
+    )
+    final = _worker_result(result.stdout)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert final["status"] == "ok"
+    assert final["matched_index"] == 1
+    assert final["password_attempts"] == 2
+    assert (out / source.name).read_text(encoding="utf-8") == "encrypted payload"
+
+
 def test_native_worker_starts_in_neutral_working_directory(tmp_path, monkeypatch):
     captured = {}
 

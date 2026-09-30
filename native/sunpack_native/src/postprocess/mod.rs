@@ -153,9 +153,12 @@ fn watch_candidate_from_metadata(
     metadata: &fs::Metadata,
     since_usn: Option<i64>,
 ) -> PyResult<Option<Py<PyDict>>> {
-    if metadata.len() == 0 || path.file_name().is_some_and(|name| {
-        name.to_string_lossy().starts_with(crate::io::file_generation::CLEANUP_PREFIX)
-    }) {
+    if metadata.len() == 0
+        || path.file_name().is_some_and(|name| {
+            name.to_string_lossy()
+                .starts_with(crate::io::file_generation::CLEANUP_PREFIX)
+        })
+    {
         return Ok(None);
     }
     let observation = watch_file_observation(path, since_usn)?;

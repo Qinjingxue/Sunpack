@@ -37,7 +37,7 @@ def is_directory_password_file(path: str, config: dict | None = None) -> bool:
     password_config = _password_config(config)
     if not password_config["directory_passwords_enabled"]:
         return False
-    return Path(path).name == DIRECTORY_PASSWORD_FILE_NAME
+    return os.path.normcase(Path(path).name) == DIRECTORY_PASSWORD_FILE_NAME
 
 
 def directory_password_context_from_task(task: Any) -> list[str]:

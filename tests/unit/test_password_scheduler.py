@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import pytest
 import sunpack.core.passwords.scheduler as password_scheduler_module
 from sunpack.core.passwords.cache import (
     MAX_CACHED_NEGATIVE_ATTEMPTS,
@@ -11,6 +12,22 @@ from sunpack.core.passwords.fingerprint import build_archive_fingerprint
 from sunpack.core.passwords.job import PasswordJob
 from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
 from sunpack.core.passwords.verifier import PasswordBatchVerification, PasswordVerifierChain
+
+
+def test_fast_verifier_receives_archive_input_and_does_not_retry_type_errors():
+    calls = []
+    descriptor = {"open_mode": "file_range", "format_hint": "7z"}
+
+    class Verifier:
+        def verify_fast_batch(self, archive_path, passwords, *, part_paths=None, archive_input=None):
+            calls.append((archive_path, passwords, part_paths, archive_input))
+            raise TypeError("archive_input processing failed")
+
+    with pytest.raises(TypeError, match="archive_input processing failed"):
+        password_scheduler_module._call_fast_verifier(
+            Verifier(), "carrier.blob", ["secret"], part_paths=["carrier.blob"], archive_input=descriptor,
+        )
+    assert calls == [("carrier.blob", ["secret"], ["carrier.blob"], descriptor)]
 
 
 class FakeVerifier:

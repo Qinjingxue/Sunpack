@@ -2906,7 +2906,8 @@ def test_watch_scheduler_promotes_recent_success_password_and_retries_other_fail
     ]
 
 
-def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path, monkeypatch):
+@pytest.mark.parametrize("filename", ["sunpack-passwords.txt", "SUNPACK-PASSWORDS.TXT"])
+def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path, monkeypatch, filename):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     attempts = {"count": 0}
 
@@ -2927,7 +2928,7 @@ def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path,
     watch_root = tmp_path / "in"
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
-    password_table = watch_root / "sunpack-passwords.txt"
+    password_table = watch_root / filename
     archive_path.write_bytes(b"PK\x03\x04payload")
     password_table.write_text("secret\n", encoding="utf-8")
 
@@ -2954,7 +2955,7 @@ def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path,
 
     assert result.succeeded == 1
     assert attempts["count"] == 2
-    assert not any(path.endswith("sunpack-passwords.txt") for path in watcher._pending)
+    assert not any(path.lower().endswith("sunpack-passwords.txt") for path in watcher._pending)
 
 
 def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):

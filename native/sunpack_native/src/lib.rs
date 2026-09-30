@@ -40,9 +40,18 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
     #[cfg(windows)]
     {
-        m.add_function(wrap_pyfunction!(io::file_generation::file_generation_tokens, m)?)?;
-        m.add_function(wrap_pyfunction!(io::file_generation::prepare_file_cleanup, m)?)?;
-        m.add_function(wrap_pyfunction!(io::file_generation::restore_staged_cleanup, m)?)?;
+        m.add_function(wrap_pyfunction!(
+            io::file_generation::file_generation_tokens,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            io::file_generation::prepare_file_cleanup,
+            m
+        )?)?;
+        m.add_function(wrap_pyfunction!(
+            io::file_generation::restore_staged_cleanup,
+            m
+        )?)?;
     }
     m.add_class::<watch_store::NativeWatchState>()?;
     m.add_class::<watch_store::NativeWatchOperations>()?;

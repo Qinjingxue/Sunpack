@@ -153,8 +153,7 @@ pub(crate) fn inspect_zip_eocd_structure(
         }
     }
 
-    let is_multi_disk =
-        effective_disk_number != 0 || effective_central_directory_disk != 0;
+    let is_multi_disk = effective_disk_number != 0 || effective_central_directory_disk != 0;
     if is_multi_disk || effective_disk_entries != effective_total_entries {
         result.set_item(
             "error",
@@ -176,7 +175,10 @@ pub(crate) fn inspect_zip_eocd_structure(
             "declared_central_directory_offset",
             effective_central_directory_offset,
         )?;
-        result.set_item("declared_central_directory_size", effective_central_directory_size)?;
+        result.set_item(
+            "declared_central_directory_size",
+            effective_central_directory_size,
+        )?;
         result.set_item("declared_total_entries", effective_total_entries)?;
         result.set_item("trailing_bytes_after_eocd", trailing_bytes_after_eocd)?;
         result.set_item("is_multi_disk", is_multi_disk)?;
@@ -196,32 +198,28 @@ pub(crate) fn inspect_zip_eocd_structure(
         return Ok(result.unbind());
     }
 
-    let naive_physical_central_offset = directory_end.saturating_sub(effective_central_directory_size);
+    let naive_physical_central_offset =
+        directory_end.saturating_sub(effective_central_directory_size);
     let declared_physical_central_offset = effective_central_directory_offset;
     // Prefer the physically verified declared offset when the naive
     // back-computation misses the signature (same fallback as
     // formats/zip/directory/inspect.rs).  Otherwise keep the naive position
     // so SFX prefixes keep working via archive_offset.
-    let physical_central_offset =
-        if naive_physical_central_offset != declared_physical_central_offset {
-            let naive_ok = has_central_directory_signature(
-                &mut file,
-                naive_physical_central_offset,
-                file_size,
-            );
-            let declared_ok = has_central_directory_signature(
-                &mut file,
-                declared_physical_central_offset,
-                file_size,
-            );
-            if !naive_ok && declared_ok {
-                declared_physical_central_offset
-            } else {
-                naive_physical_central_offset
-            }
+    let physical_central_offset = if naive_physical_central_offset
+        != declared_physical_central_offset
+    {
+        let naive_ok =
+            has_central_directory_signature(&mut file, naive_physical_central_offset, file_size);
+        let declared_ok =
+            has_central_directory_signature(&mut file, declared_physical_central_offset, file_size);
+        if !naive_ok && declared_ok {
+            declared_physical_central_offset
         } else {
             naive_physical_central_offset
-        };
+        }
+    } else {
+        naive_physical_central_offset
+    };
     let archive_offset = physical_central_offset.saturating_sub(effective_central_directory_offset);
     result = dict(py)?;
     result.set_item("plausible", false)?;
@@ -234,7 +232,10 @@ pub(crate) fn inspect_zip_eocd_structure(
         "declared_central_directory_offset",
         effective_central_directory_offset,
     )?;
-    result.set_item("declared_central_directory_size", effective_central_directory_size)?;
+    result.set_item(
+        "declared_central_directory_size",
+        effective_central_directory_size,
+    )?;
     result.set_item("declared_total_entries", effective_total_entries)?;
     result.set_item("physical_central_directory_offset", physical_central_offset)?;
     result.set_item("inferred_central_directory_offset", physical_central_offset)?;
@@ -798,7 +799,13 @@ pub(crate) fn inspect_tar_header_structure(
         result.set_item("error", walk.3)?;
         result.set_item("plausible", false)?;
     }
-    enrich_tar_semantics(&result, &mut file, start_offset, archive_end, max_entries_to_walk)?;
+    enrich_tar_semantics(
+        &result,
+        &mut file,
+        start_offset,
+        archive_end,
+        max_entries_to_walk,
+    )?;
     Ok(result.unbind())
 }
 
@@ -853,7 +860,8 @@ pub(crate) fn inspect_compression_stream_identity(
     py: Python<'_>,
     path: &str,
 ) -> PyResult<Py<PyDict>> {
-    inspect_compression_stream_identity_impl(path).to_py_dict(py)
+    py.detach(|| inspect_compression_stream_identity_impl(path))
+        .to_py_dict(py)
 }
 
 pub(crate) fn confirm_compression_format_identity_native(path: &str, format: &str) -> bool {
@@ -866,7 +874,7 @@ pub(crate) fn inspect_compression_stream_structure(
     py: Python<'_>,
     path: &str,
 ) -> PyResult<Py<PyDict>> {
-    let Ok((file_size, header)) = read_at(path, 0, 32) else {
+    let Ok((file_size, header)) = py.detach(|| read_at(path, 0, 32)) else {
         return compression_empty(py, "os_error", "", "", false);
     };
     if header.starts_with(b"\x1f\x8b") {

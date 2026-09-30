@@ -1,6 +1,9 @@
 import bz2
+import asyncio
 import io
+import os
 import tarfile
+import time
 
 import pytest
 from sunpack_native import inspect_compression_stream_structure, inspect_tar_header_structure
@@ -53,3 +56,37 @@ def test_bzip2_real_trailing_junk_is_still_flagged(tmp_path):
     assert result["archive.trailing_data"] == 80
     assert "trailing_junk" in result["damage_flags"]
     assert result["integrity_status"] == "verified"
+
+
+@pytest.mark.performance
+def test_bzip2_structure_analysis_allows_event_loop_progress(tmp_path):
+    path = tmp_path / "random.blob"
+    path.write_bytes(bz2.compress(os.urandom(3 * 1024 * 1024)))
+
+    def inspect():
+        start = time.perf_counter()
+        result = inspect_compression_stream_structure(str(path))
+        return result, start, time.perf_counter()
+
+    async def scenario():
+        ticks = []
+
+        async def heartbeat():
+            while True:
+                ticks.append(time.perf_counter())
+                await asyncio.sleep(0.001)
+
+        pulse = asyncio.create_task(heartbeat())
+        try:
+            result, start, end = await asyncio.to_thread(inspect)
+        finally:
+            pulse.cancel()
+            await asyncio.gather(pulse, return_exceptions=True)
+        assert result["plausible"] is True
+        assert result["integrity_status"] == "verified"
+        assert sum(start < tick < end for tick in ticks) >= 2
+        points = [start, *(tick for tick in ticks if start < tick < end), end]
+        max_gap = max(right - left for left, right in zip(points, points[1:]))
+        print(f"analysis={end - start:.4f}s, event_loop_max_gap={max_gap:.4f}s")
+
+    asyncio.run(scenario())
