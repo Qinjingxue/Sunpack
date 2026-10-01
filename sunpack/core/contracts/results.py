@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List
@@ -23,6 +24,35 @@ class ArchiveCleanupResult:
     @property
     def retryable(self) -> bool:
         return self.status == "failed" and self.error_code in {32, 33}
+
+
+@dataclass(frozen=True)
+class DirectoryFlattenResult:
+    path: str
+    output_dir: str
+    source_dir: str = ""
+    moved: int = 0
+    removed_dirs: int = 0
+    errors: tuple[str, ...] = ()
+
+    def relocate(self, path: str) -> str:
+        """Project a recorded output through the native directory rename."""
+        if not path or not self.source_dir:
+            return path
+        candidate = os.path.normcase(os.path.abspath(path))
+        source = os.path.normcase(os.path.abspath(self.source_dir))
+        root = os.path.normcase(os.path.abspath(self.path))
+        try:
+            if os.path.commonpath((candidate, source)) == source:
+                relative = os.path.relpath(path, self.source_dir)
+                return os.path.normpath(os.path.join(self.output_dir, relative))
+            # Removed wrapper directories now refer to the promoted payload root.
+            if (self.moved and os.path.commonpath((candidate, root)) == root
+                    and os.path.commonpath((candidate, source)) == candidate):
+                return self.output_dir
+        except ValueError:
+            pass
+        return path
 
 
 @dataclass(frozen=True)

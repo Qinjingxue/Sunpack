@@ -22,7 +22,7 @@ from sunpack.core.contracts.pipeline import (
     PipelineDiscovery,
     PipelineResponse,
 )
-from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
+from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, RunSummary, TargetRunResult
 from sunpack.core.support.resource_lifecycle import promotion_barrier
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
@@ -61,6 +61,38 @@ def test_usn_data_reason_detects_same_size_in_place_content_change():
         scheduler_module._candidate_change_kind(previous, current)
         == scheduler_module._CandidateChangeKind.CONTENT_CHANGED
     )
+
+
+@pytest.mark.parametrize("mode", ["delete", "flatten"])
+def test_existing_watch_success_notification_includes_postprocess_warning(tmp_path, monkeypatch, mode):
+    monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
+    source = tmp_path / "archive.disguised"
+    source.write_text("source")
+    output = str(tmp_path / "output.__sunpack_flatten_work__")
+    summary = RunSummary(
+        target_results=(TargetRunResult(str(source), OutcomeKind.COMPLETE_SUCCESS, output_dir=output),),
+        cleanup_results=(ArchiveCleanupResult(output, mode, "failed", message="postprocess failed"),),
+    )
+    watcher = WatchScheduler(
+        make_config({"watch": {"clipboard_monitor_enabled": False}}), [str(tmp_path)],
+        state_path=str(tmp_path / "state.json"), initial_scan=False,
+    )
+    notices = []
+    watcher._notify = lambda *args: notices.append(args)
+
+    async def scenario():
+        async def complete():
+            return PipelineResponse("request", summary, PipelineArtifacts((output,)))
+        request = scheduler_module._ActivePipelineRequest(
+            "notice", WatchCandidate(str(source), 6, 1.0), asyncio.create_task(complete()),
+        )
+        return await watcher._complete_candidate(request)
+
+    result = _await(scenario())
+    assert result.succeeded == 1 and result.failed == 0
+    assert notices[-1][0] == "succeeded"
+    assert notices[-1][2] == [output]
+    assert notices[-1][3] == [watcher.i18n.t("cleanup.incomplete", count=1)]
 
 
 def test_usn_metadata_reason_does_not_count_as_content_change():

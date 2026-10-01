@@ -108,6 +108,7 @@ def test_pipeline_runner_uses_tmp_path_and_applies_success_postprocess(tmp_path,
     class TrackedPostProcessActions:
         def __init__(self, *args, **kwargs):
             self._delegate = postprocess_actions(*args, **kwargs)
+            self.flattener = self._delegate.flattener
 
         def apply(self, **kwargs):
             call_order.append("postprocess")

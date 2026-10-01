@@ -46,7 +46,12 @@ class PostProcessActions:
             flatten_outputs = self.config.get("post_extract", {}).get("flatten_single_directory", True)
         if flatten_outputs:
             for index, target in enumerate(self._consume_flatten_targets(flatten_targets)):
-                self.flattener.flatten_dirs(target, announce=index == 0)
+                flattened = self.flattener.flatten_dirs(target, announce=index == 0)
+                if flattened.errors:
+                    results.append(ArchiveCleanupResult(
+                        flattened.output_dir, "flatten", "failed",
+                        message="; ".join(flattened.errors),
+                    ))
         return results
 
     def t(self, key: str, **params) -> str:

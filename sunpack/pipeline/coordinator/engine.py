@@ -13,7 +13,7 @@ from typing import Any, Awaitable, Callable, Iterable, TextIO
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.core.config.detection_view import discovery_run_config
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse, PipelineTarget
-from sunpack.core.contracts.results import ArchiveCleanupResult, OutcomeKind, TargetRunResult
+from sunpack.core.contracts.results import ArchiveCleanupResult, DirectoryFlattenResult, OutcomeKind, TargetRunResult
 from sunpack.core.contracts.run_state import RunState
 from sunpack.pipeline.coordinator.archive_job import ArchiveJobExecutor
 from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy
@@ -936,7 +936,14 @@ class _SourceCleanup:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            return ReleaseOutcome(task_key=request.task_key, released=request.paths, error=str(exc))
+            return ReleaseOutcome(
+                task_key=request.task_key, released=request.paths, error=str(exc),
+                failed=tuple(ArchiveCleanupResult(
+                    path, self._mode(), "failed",
+                    previous[path_key(path)].attempts + 1 if path_key(path) in previous else 1,
+                    int(getattr(exc, "winerror", 0) or 0), str(exc),
+                ) for path in request.paths),
+            )
         if outcome.deleted:
             notify_shell_directories_updated(
                 tuple(dict.fromkeys(
@@ -1376,17 +1383,6 @@ class _RequestRuntime:
                 lease_id=id(task),
             )
 
-            if (
-                watch_version
-                and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS
-                and output_dir
-            ):
-                self.path_leases.remember_completed_watch(
-                    watch_version,
-                    output_dir,
-                    deep_detect=self.submission.detection_options.force_scan,
-                )
-
             # A failed descendant still needs its recorded input path for retry.
             # Propagate this to ancestors instead of remapping an entire subtree.
             subtree_complete = outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS
@@ -1421,11 +1417,20 @@ class _RequestRuntime:
                 # cleanup operations whose source paths would be moved by this
                 # particular flatten.
                 await self._drain_cleanup_tasks_under(output_dir)
-                await self._flatten_output(
+                flattened = await self._flatten_output(
                     task,
                     output_dir,
                     broker=broker,
                     cancellation=cancellation,
+                )
+                output_dir = flattened.output_dir
+                subtree_complete = subtree_complete and not flattened.errors
+                ownership.relocate_outputs(flattened)
+
+            if watch_version and outcome.outcome_kind == OutcomeKind.COMPLETE_SUCCESS and output_dir:
+                self.path_leases.remember_completed_watch(
+                    watch_version, output_dir,
+                    deep_detect=self.submission.detection_options.force_scan,
                 )
 
             if output_dir:
@@ -1561,28 +1566,44 @@ class _RequestRuntime:
         except ValueError:
             return False
 
-    async def _flatten_output(self, task, output_dir: str, *, broker, cancellation) -> None:
+    async def _flatten_output(self, task, output_dir: str, *, broker, cancellation) -> DirectoryFlattenResult:
         def flatten():
             with promotion_barrier(
                 [output_dir],
                 cache_releasers=(release_archive_sessions_under_roots,),
                 quiesce=False,
             ):
-                _postprocess_actions_factory(
+                return _postprocess_actions_factory(
                     self.config,
                     stdout=self.submission.stdout,
-                ).apply(
-                    cleanup_archives=False,
-                    flatten_targets=[output_dir],
-                )
+                ).flattener.flatten_dirs(output_dir)
 
-        await broker.run(
-            "postprocess",
-            task.key or task.main_path,
-            flatten,
-            request_id=self.submission.request_id,
-            cancellation=cancellation,
-        )
+        try:
+            result = await broker.run(
+                "postprocess", task.key or task.main_path, flatten,
+                request_id=self.submission.request_id, cancellation=cancellation,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            result = DirectoryFlattenResult(output_dir, output_dir, errors=(str(exc),))
+        with self.context.lock:
+            if result.source_dir:
+                self.context.target_results[:] = [
+                    replace(item, output_dir=result.relocate(item.output_dir))
+                    for item in self.context.target_results
+                ]
+                self.context.cleanup_results[:] = [
+                    replace(item, path=result.relocate(item.path))
+                    for item in self.context.cleanup_results
+                ]
+            if result.errors:
+                self.context.cleanup_results.append(ArchiveCleanupResult(
+                    result.output_dir, "flatten", "failed", message="; ".join(result.errors),
+                ))
+        if result.source_dir:
+            self.reporter.relocate_outputs(result)
+        return result
 
     async def _ensure_task_lease(self, task) -> None:
         self.source_cleanup.register([task])
@@ -1632,6 +1653,14 @@ class _RequestResults:
                 continue
             target = self._target_for_path(result.input_path)
             self._output_targets[path_key(result.output_dir)] = target
+
+    def relocate_outputs(self, result: DirectoryFlattenResult) -> None:
+        if not result.source_dir:
+            return
+        self._output_targets = {
+            path_key(result.relocate(path)): target
+            for path, target in self._output_targets.items()
+        }
 
     def output_dir_for_task(self, task) -> str:
         target = self._target_for_path(task.main_path)

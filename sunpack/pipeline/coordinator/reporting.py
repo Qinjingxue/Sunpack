@@ -6,7 +6,7 @@ import time
 from typing import Any, List
 
 from sunpack.core.contracts.failures import FailureInfo
-from sunpack.core.contracts.results import ArchiveCleanupResult
+from sunpack.core.contracts.results import ArchiveCleanupResult, DirectoryFlattenResult
 from sunpack.core.i18n import I18nContext
 
 # native 侧的空间事件名（与 sevenzip_runner 的 _SPACE_EVENTS 一致），表达等待状态而非 job 生命周期状态。
@@ -264,6 +264,16 @@ class RunReporter:
                 error = str(getattr(result, "error", "") or "")
                 detail = self.i18n.t("report.detail.error", error=error) if error else ""
             self._print(f"{prefix}[{status} {progress}] {name}{relation}{detail}")
+
+    def relocate_outputs(self, result: DirectoryFlattenResult) -> None:
+        with self._lock:
+            self._top_level_outputs = list(dict.fromkeys(
+                result.relocate(path) for path in self._top_level_outputs
+            ))
+            self._output_lineages = {
+                _absolute_key(result.relocate(path)): lineage
+                for path, lineage in self._output_lineages.items()
+            }
 
     def log_final_summary(
         self,

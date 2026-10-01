@@ -66,6 +66,8 @@ pub(crate) fn flatten_single_branch_directories(
     result.set_item("moved", 0usize)?;
     result.set_item("removed_dirs", 0usize)?;
     result.set_item("errors", PyList::empty(py))?;
+    result.set_item("output_dir", normalize_path(&base_path))?;
+    result.set_item("source_dir", "")?;
     if !base_path.is_dir() {
         return Ok(result.unbind());
     }
@@ -79,6 +81,12 @@ pub(crate) fn flatten_single_branch_directories(
     result.set_item("moved", stats.moved)?;
     result.set_item("removed_dirs", stats.removed_dirs)?;
     result.set_item("errors", PyList::new(py, stats.errors)?)?;
+    if let Some(output) = stats.output_dir {
+        result.set_item("output_dir", normalize_path(&output))?;
+    }
+    if let Some(source) = stats.source_dir {
+        result.set_item("source_dir", normalize_path(&source))?;
+    }
     Ok(result.unbind())
 }
 
@@ -212,9 +220,19 @@ struct FlattenStats {
     moved: usize,
     removed_dirs: usize,
     errors: Vec<String>,
+    output_dir: Option<PathBuf>,
+    source_dir: Option<PathBuf>,
 }
 
 fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats) {
+    flatten_single_branch_chain_with_publisher(root, stats, rename_no_replace);
+}
+
+fn flatten_single_branch_chain_with_publisher(
+    root: &Path,
+    stats: &mut FlattenStats,
+    publish: impl FnOnce(&Path, &Path) -> io::Result<()>,
+) {
     let chain = discover_flatten_chain(root);
     let Some(leaf) = chain.last() else {
         return;
@@ -233,8 +251,10 @@ fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats) {
     let Some(work) = rename_root_to_visible_work(root, stats) else {
         return;
     };
+    stats.output_dir = Some(work.clone());
+    stats.source_dir = Some(root.to_path_buf());
     let leaf_in_work = work.join(&leaf_relative);
-    if let Err(error) = rename_no_replace(&leaf_in_work, root) {
+    if let Err(error) = publish(&leaf_in_work, root) {
         stats.errors.push(format!(
             "{} -> {}: {}",
             normalize_path(&leaf_in_work),
@@ -246,6 +266,8 @@ fn flatten_single_branch_chain(root: &Path, stats: &mut FlattenStats) {
         return;
     }
     stats.moved += 1;
+    stats.output_dir = Some(root.to_path_buf());
+    stats.source_dir = Some(leaf.clone());
 
     match remove_empty_flatten_wrappers(&work, &leaf_relative) {
         Ok(removed) => stats.removed_dirs += removed,
@@ -459,6 +481,8 @@ mod tests {
             .join("StreamingAssets/aa/catalog.bin")
             .is_file());
         assert_eq!(stats.removed_dirs, 1);
+        assert_eq!(stats.output_dir.as_deref(), Some(output.path()));
+        assert_eq!(stats.source_dir.as_ref(), Some(&build));
         assert!(stats.errors.is_empty());
     }
 
@@ -476,6 +500,36 @@ mod tests {
         assert!(!output.path().join("outer").exists());
         assert!(!output.path().join("inner").exists());
         assert_eq!(stats.removed_dirs, 2);
+        assert_eq!(stats.output_dir.as_deref(), Some(output.path()));
+        assert_eq!(stats.source_dir.as_deref(), payload.parent());
         assert!(stats.errors.is_empty());
+    }
+
+    #[test]
+    fn flatten_publish_failure_reports_retained_payload_without_touching_collision() {
+        let container = TestDirectory::new("publish_failure");
+        let output = container.path().join("output");
+        fs::create_dir_all(output.join("outer/inner")).unwrap();
+        fs::write(output.join("outer/inner/payload.txt"), b"payload").unwrap();
+        let mut stats = FlattenStats::default();
+        flatten_single_branch_chain_with_publisher(&output, &mut stats, |leaf, root| {
+            fs::create_dir(root)?;
+            fs::write(root.join("unrelated.txt"), b"unrelated")?;
+            rename_no_replace(leaf, root)
+        });
+        let retained = stats.output_dir.as_ref().unwrap();
+        assert_ne!(retained, &output);
+        assert_eq!(stats.source_dir.as_ref(), Some(&output));
+        assert_eq!(
+            fs::read(retained.join("outer/inner/payload.txt")).unwrap(),
+            b"payload"
+        );
+        assert_eq!(
+            fs::read(output.join("unrelated.txt")).unwrap(),
+            b"unrelated"
+        );
+        assert_eq!(stats.moved, 0);
+        assert_eq!(stats.removed_dirs, 0);
+        assert_eq!(stats.errors.len(), 1);
     }
 }

@@ -9,6 +9,8 @@ def test_flatten_reports_native_errors(monkeypatch, capsys):
         "moved": 1,
         "removed_dirs": 0,
         "errors": [r"C:\source\child -> C:\target\child: Access is denied"],
+        "output_dir": r"C:\target",
+        "source_dir": r"C:\target\child",
     }
     monkeypatch.setattr(
         flatten_module,
@@ -19,7 +21,9 @@ def test_flatten_reports_native_errors(monkeypatch, capsys):
     result = DirectoryFlattener("en").flatten_dirs(r"C:\target")
 
     output = capsys.readouterr().out
-    assert result == native_result
+    assert result.output_dir == native_result["output_dir"]
+    assert result.source_dir == native_result["source_dir"]
+    assert result.errors == tuple(native_result["errors"])
     assert r"C:\source\child -> C:\target\child: Access is denied" in output
 
 
@@ -47,7 +51,9 @@ def test_postprocess_uses_config_language_and_prints_flatten_once(tmp_path, monk
     monkeypatch.setattr(
         flatten_module,
         "_native_flatten_single_branch_directories",
-        lambda base: calls.append(base) or {"moved": 0, "removed_dirs": 0, "errors": []},
+        lambda base: calls.append(base) or {
+            "moved": 0, "removed_dirs": 0, "errors": [], "output_dir": base, "source_dir": "",
+        },
     )
 
     PostProcessActions(normalize_config({"cli": {"language": "zh"}, "verification": {}})).apply(

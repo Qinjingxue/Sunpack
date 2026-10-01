@@ -1,6 +1,6 @@
 CATALOG = {
     "en": {
-        "cleanup.incomplete": "Extraction completed; {count} source files could not be cleaned up.",
+        "cleanup.incomplete": "Extraction completed; {count} post-processing operations failed.",
         "cli.description": "sunpack command line interface.",
         "cli.usage": "sunpack [-h] <command> [command options] [paths...]",
         "cli.examples": "Examples:",
@@ -325,7 +325,7 @@ CATALOG = {
         "metadata.latin_noise_count": "Detected {count} suspicious Latin symbol noise character(s)",
     },
     "zh": {
-        "cleanup.incomplete": "解压完成，{count} 个源文件未能清理。",
+        "cleanup.incomplete": "解压完成，{count} 项后处理操作失败。",
         "cli.description": "sunpack 命令行界面。",
         "cli.usage": "sunpack [-h] <command> [command options] [paths...]",
         "cli.examples": "示例：",

@@ -223,6 +223,37 @@ def test_source_cleanup_reports_each_failure_once(tmp_path, monkeypatch):
     assert busy.exists()
 
 
+@pytest.mark.parametrize("failure_site", ["factory", "broker"])
+def test_unexpected_source_cleanup_error_reaches_summary_for_each_volume(tmp_path, failure_site):
+    paths = [tmp_path / "first.001", tmp_path / "second.disguised"]
+    for path in paths:
+        path.write_text("payload")
+    scope = _scope("delete")
+    task = _Task("split", paths)
+    scope.register([task])
+    error = OSError("cleanup service unavailable")
+    error.winerror = 5
+
+    def failing_factory(*_args, **_kwargs):
+        raise error
+
+    class FailingBroker:
+        async def run(self, *_args, **_kwargs):
+            raise error
+
+    if failure_site == "factory":
+        scope._factory = failing_factory
+    outcome = asyncio.run(scope.apply(
+        scope.release_task(task, outcome_kind=OutcomeKind.COMPLETE_SUCCESS),
+        broker=FailingBroker() if failure_site == "broker" else _InlineBroker(),
+    ))
+    assert outcome.error == str(error)
+    assert set(item.path for item in outcome.failed) == {str(path) for path in paths}
+    assert all(item.status == "failed" and item.error_code == 5 for item in outcome.failed)
+    assert tuple(scope._context.cleanup_results) == outcome.failed
+    assert all(path.exists() for path in paths)
+
+
 def test_source_cleanup_stops_retrying_nonretryable_failure(tmp_path, monkeypatch):
     source = tmp_path / "denied.zip"
     source.write_text("payload")
