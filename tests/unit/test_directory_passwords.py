@@ -1,11 +1,10 @@
-from types import SimpleNamespace
-
-import os
 import asyncio
+import os
 import threading
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
+from types import SimpleNamespace
 
 from sunpack.core.passwords.directory_context import DirectoryPasswordContextStore
 from sunpack.core.passwords.internal.clipboard import _plausible_passwords
@@ -14,6 +13,7 @@ from sunpack.core.passwords.internal.local_files import (
     discover_directory_passwords_for_archive,
     is_directory_password_file,
 )
+from tests.helpers.config_factory import make_config
 
 
 def test_discovers_same_directory_sunpack_passwords(tmp_path):
@@ -154,7 +154,7 @@ def test_pipeline_reads_directory_passwords_once_off_the_event_loop(tmp_path, mo
 
     async def scenario():
         owner = threading.get_ident()
-        async with PipelineEngine({"post_extract": {"archive_cleanup_mode": "keep"}}) as engine:
+        async with PipelineEngine(make_config({"post_extract": {"archive_cleanup_mode": "k"}})) as engine:
             response = await engine.run([str(tmp_path)])
             assert response.summary.success_count == 2
         assert len(threads) == 1

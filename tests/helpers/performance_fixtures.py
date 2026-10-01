@@ -5,11 +5,12 @@ from __future__ import annotations
 import zipfile
 from pathlib import Path
 
+from tests.helpers.config_factory import make_config
 from tests.helpers.fs_builder import make_minimal_7z, make_zip
 
 
 def pressure_scan_config() -> dict:
-    return {
+    return make_config({
         "detection": {"enabled": True},
         "embedded_scan": {"enabled": True, "recursive_candidate_ratio": 1e-9},
         "filesystem": {"scan_filters": [
@@ -17,7 +18,7 @@ def pressure_scan_config() -> dict:
             {"name": "blacklist", "enabled": True,
              "blocked_extensions": [".jar", ".docx", ".apk", ".xlsx"]},
         ]},
-    }
+    })
 
 
 def write_large_resource(path: Path, label: str, size: int = 128 * 1024) -> None:

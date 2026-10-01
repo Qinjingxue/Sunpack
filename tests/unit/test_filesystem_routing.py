@@ -15,6 +15,7 @@ from sunpack.core.contracts.filesystem import (
 )
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from tests.helpers.config_factory import make_config
 
 
 def _basename(path: str) -> str:
@@ -62,7 +63,7 @@ def test_filesystem_routes_native_archive_stream_and_residual_without_rescan(tmp
     split_name_path = tmp_path / "payload.7z.002"
     split_name_path.write_bytes(b"continuation bytes")
 
-    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True).scan()
+    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config()).scan()
     routes = _routing_by_name(snapshot)
 
     assert routes["empty.zip"] == ("relations", "zip")
@@ -96,7 +97,7 @@ def test_filesystem_routes_by_structure_not_extension(tmp_path):
     disguised_gzip = tmp_path / "payload.random"
     disguised_gzip.write_bytes(gzip.compress(b"payload"))
 
-    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True).scan()
+    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config()).scan()
     routes = _routing_by_name(snapshot)
 
     assert routes[disguised_zip.name] == ("relations", "zip")
@@ -111,7 +112,7 @@ def test_prefixed_and_suffixed_archive_carrier_stays_residual_for_embedded_scan(
     carrier = tmp_path / "carrier.data"
     carrier.write_bytes(b"invalid-prefix" + zip_buffer.getvalue() + b"invalid-suffix")
 
-    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True).scan()
+    snapshot = DirectoryScanner(str(tmp_path), include_raw_snapshot=True, config=make_config()).scan()
     routes = _routing_by_name(snapshot)
 
     assert routes[carrier.name][0] == "residual"
@@ -129,7 +130,7 @@ def test_discovery_candidate_projection_bypasses_legacy_routing_columns(tmp_path
         ),
     )
 
-    session = DiscoveryScanSession(config={})
+    session = DiscoveryScanSession(config=make_config({}))
     candidates = session.candidates_for_directory(str(tmp_path))
 
     assert len(candidates) == 1
@@ -142,11 +143,11 @@ def test_discovery_candidate_projection_bypasses_legacy_routing_columns(tmp_path
 def test_directory_snapshot_identity_digest_changes_with_snapshot_content(tmp_path):
     payload = tmp_path / "payload.bin"
     payload.write_bytes(b"one")
-    first_snapshot = DirectoryScanner(str(tmp_path)).scan()
+    first_snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
     first_count, first_digest = first_snapshot.identity_digest()
 
     payload.write_bytes(b"two-more-bytes")
-    second_snapshot = DirectoryScanner(str(tmp_path)).scan()
+    second_snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
     second_count, second_digest = second_snapshot.identity_digest()
 
     assert first_count == len(first_snapshot)
@@ -160,7 +161,7 @@ def test_directory_without_relation_anchor_skips_relations_entirely(tmp_path, mo
     (tmp_path / "payload.gz").write_bytes(gzip.compress(b"payload"))
     (tmp_path / "plain.bin").write_bytes(b"ordinary")
 
-    session = DiscoveryScanSession(config={})
+    session = DiscoveryScanSession(config=make_config({}))
     monkeypatch.setattr(
         session.relations,
         "build_candidate_groups",
@@ -192,7 +193,7 @@ def test_relations_anchor_view_recovers_unrouted_split_members_from_raw_snapshot
     first.write_bytes(archive[:32])
     second.write_bytes(archive[32:])
 
-    session = DiscoveryScanSession(config={})
+    session = DiscoveryScanSession(config=make_config({}))
     snapshot = session.snapshot_for_directory(str(tmp_path))
     routes = _routing_by_name(snapshot)
 
@@ -213,7 +214,7 @@ def test_main_scan_routes_only_native_container_candidates_through_relations(tmp
     (tmp_path / "payload.gz").write_bytes(gzip.compress(b"payload"))
     (tmp_path / "plain.bin").write_bytes(b"ordinary file")
 
-    session = DiscoveryScanSession(config={})
+    session = DiscoveryScanSession(config=make_config({}))
     candidates = session.candidates_for_directory(str(tmp_path))
     by_name = {
         _basename(candidate.entry_path): candidate

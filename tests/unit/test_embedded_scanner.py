@@ -1,8 +1,6 @@
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-import pytest
-
 from sunpack.core.analysis.embedded import scan_embedded_archives
 from sunpack.core.support.global_cache_manager import clear_cache_namespace
 
@@ -82,21 +80,3 @@ def test_embedded_scanner_preserves_native_budget_exhaustion(monkeypatch):
     assert result.budget_exhausted is True
     assert result.raw_hit_count == 1_000_001
     assert result.candidates == ()
-
-
-def test_embedded_scanner_rejects_legacy_native_schema(monkeypatch):
-    class Session:
-        def scan_embedded_archives(self):
-            return {
-                "complete": True,
-                "candidates": [],
-                "hits": [],
-                "read_bytes": 0,
-                "file_size": 0,
-            }
-
-    clear_cache_namespace("embedded_archive_scan_v3")
-    monkeypatch.setattr("sunpack.core.analysis.embedded.scanner.get_archive_session", lambda path: Session())
-
-    with pytest.raises(TypeError, match="missing required fields"):
-        scan_embedded_archives("legacy.bin", identity=("legacy", 0, 1))

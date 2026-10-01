@@ -1,13 +1,13 @@
-
-from sunpack.pipeline.coordinator.task_scan import direct_file_task
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
+from sunpack.pipeline.coordinator.task_scan import direct_file_task
+from tests.helpers.config_factory import make_config
 
 
 def test_selected_directory_and_file_inside_it_are_deduped(tmp_path):
     archive = tmp_path / "sample.zip"
     archive.write_bytes(b"PK\x05\x06" + b"\0" * 18)
 
-    candidates = build_candidates_for_targets([str(tmp_path), str(archive)])
+    candidates = build_candidates_for_targets([str(tmp_path), str(archive)], config=make_config())
 
     matching = [candidate for candidate in candidates if candidate.entry_path == str(archive)]
     assert len(matching) == 1
@@ -19,7 +19,7 @@ def test_selected_split_member_without_structural_proof_stays_single_candidate(t
     first.write_bytes(b"7z\xbc\xaf\x27\x1c")
     second.write_bytes(b"part")
 
-    candidates = build_candidates_for_targets([str(second)])
+    candidates = build_candidates_for_targets([str(second)], config=make_config())
 
     assert len(candidates) == 1
     assert candidates[0].entry_path == str(second)

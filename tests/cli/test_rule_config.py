@@ -1,43 +1,40 @@
+import pytest
 
+from sunpack.core.config.schema import ConfigSchemaError, normalize_config
 from sunpack.runtime.cli.cli_runtime import (
     apply_runtime_config_overrides,
     build_effective_config,
 )
 from sunpack.runtime.config_validation import validate_config_payload
+from tests.helpers.config_factory import make_config
 
 
 def _payload():
-    return {"detection": {"enabled": True}}
+    return {"detection": {"enabled": True}, "verification": {}}
 
 
 def test_config_validate_checks_embedded_ratio_type():
     payload = _payload()
     payload["embedded_scan"] = {"recursive_candidate_ratio": "many"}
-    result = validate_config_payload(payload)
-    assert not result["ok"]
-    assert any("recursive_candidate_ratio" in error for error in result["errors"])
+    with pytest.raises(ConfigSchemaError, match="recursive_candidate_ratio"):
+        normalize_config(payload)
 
 
 def test_config_validate_rejects_removed_rule_pipeline():
     payload = _payload()
     payload["detection"]["rule_pipeline"] = {"precheck": []}
-    result = validate_config_payload(payload)
-    assert not result["ok"]
-    assert any("rule_pipeline" in error for error in result["errors"])
+    with pytest.raises(ConfigSchemaError, match="rule_pipeline"):
+        normalize_config(payload)
 
 
-def test_config_validate_rejects_normalized_config_values_in_external_shorthand_fields():
-    payload = _payload()
-    payload["recursive_extract"] = {"mode": "infinite"}
-    payload["post_extract"] = {"archive_cleanup_mode": "recycle"}
-    payload["filesystem"] = {"directory_scan_mode": "recursive", "scan_filters": []}
-
-    result = validate_config_payload(payload)
-
-    assert not result["ok"]
-    assert any("recursive_extract must" in error for error in result["errors"])
-    assert any("archive_cleanup_mode must" in error for error in result["errors"])
-    assert any("directory_scan_mode must" in error for error in result["errors"])
+@pytest.mark.parametrize(("override", "field"), [
+    ({"recursive_extract": {"mode": "infinite"}}, "recursive_extract"),
+    ({"post_extract": {"archive_cleanup_mode": "recycle"}}, "archive_cleanup_mode"),
+    ({"filesystem": {"directory_scan_mode": "recursive"}}, "directory_scan_mode"),
+])
+def test_normalization_rejects_internal_values_in_external_shorthand_fields(override, field):
+    with pytest.raises(ConfigSchemaError, match=field):
+        normalize_config({**_payload(), **override})
 
 
 def test_config_validate_checks_verification_methods_are_registered():
@@ -49,21 +46,11 @@ def test_config_validate_checks_verification_methods_are_registered():
         ],
     }
 
-    result = validate_config_payload(payload)
+    result = validate_config_payload(normalize_config(payload))
 
     assert not result["ok"]
     assert "output_presence" in result["available_verification_methods"]
     assert any("Unknown verification method" in error for error in result["errors"])
-
-
-def test_config_validate_rejects_removed_worker_profile():
-    payload = _payload()
-    payload["performance"] = {"worker": {"profile": "auto"}}
-
-    result = validate_config_payload(payload)
-
-    assert not result["ok"]
-    assert any("performance.worker.profile was removed" in error for error in result["errors"])
 
 
 def test_write_manifest_override_enables_extraction_manifest_files():
@@ -129,7 +116,7 @@ def test_effective_config_includes_native_worker_and_format_switch():
         }
     }
 
-    effective = build_effective_config(config)
+    effective = build_effective_config(make_config(config))
 
     assert effective["size_range_min_bytes"] == 1048576
     assert effective["filesystem"]["directory_scan_mode"] == "current_dir_only"

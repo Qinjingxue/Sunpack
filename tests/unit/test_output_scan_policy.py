@@ -1,14 +1,18 @@
+from sunpack_native import worker_manifest_from_rows
+
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.filesystem import DirectorySnapshot
-from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
+from sunpack.pipeline.coordinator.output_scan_policy import (
+    NestedOutputScanPolicy as OutputScanPolicy,
+)
 from sunpack.pipeline.coordinator.target_scan import build_candidates_for_targets
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
+from tests.helpers.config_factory import make_config
 from tests.helpers.detection_config import with_detection_pipeline
-from sunpack_native import worker_manifest_from_rows
 
 
 def _config():
-    return with_detection_pipeline()
+    return make_config(with_detection_pipeline())
 
 
 def test_output_scan_policy_schedules_disguised_archive_for_full_scan(tmp_path):
@@ -266,11 +270,11 @@ def test_worker_inventory_fused_snapshot_preserves_raw_entries_and_rejects_escap
         },
     }
     inventory = collect_output_inventory(str(tmp_path), worker_result)
-    config = with_detection_pipeline(precheck=[{
+    config = make_config(with_detection_pipeline(precheck=[{
         "name": "blacklist",
         "enabled": True,
         "blocked_extensions": [".tmp"],
-    }])
+    }]))
     policy = OutputScanPolicy(config)
 
     work = policy.prepare_scan(
@@ -319,13 +323,13 @@ def test_worker_inventory_fused_snapshot_applies_mtime_after_directory_projectio
         },
     }
     inventory = collect_output_inventory(str(tmp_path), worker_result)
-    config = {
+    config = make_config({
         "filesystem": {
             "scan_filters": [
                 {"name": "mtime_range", "enabled": True, "gte": cutoff_ns},
             ],
         },
-    }
+    })
     policy = OutputScanPolicy(config)
 
     work = policy.prepare_scan(

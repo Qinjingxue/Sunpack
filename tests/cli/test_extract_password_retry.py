@@ -1,12 +1,12 @@
 import asyncio
 from types import SimpleNamespace
 
-from sunpack.runtime.cli.cli_context import CliContext
-from sunpack.runtime.cli.cli_reporter import CliReporter
-from sunpack.runtime.cli.commands import extract
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
+from sunpack.runtime.cli.cli_context import CliContext
+from sunpack.runtime.cli.cli_reporter import CliReporter
 from sunpack.runtime.cli.cli_runtime import build_password_summary
+from sunpack.runtime.cli.commands import extract
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 
@@ -82,23 +82,17 @@ def test_extract_prompts_for_password_retry_after_wrong_password(tmp_path, monke
         def run_targets(self, _target_paths):
             if len(attempts) == 1:
                 failure = FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "密码错误")
-                return SimpleNamespace(
-                    success_count=0,
-                    failed_tasks=["secret.zip [密码错误]"],
-                    processed_keys=["secret"],
-                    failures=[failure],
-                    target_results=[
-                        TargetRunResult(str(target), OutcomeKind.FAILURE, error="密码错误", failure=failure)
-                    ],
-                )
+                return RunSummary(target_results=(
+                    TargetRunResult(
+                        str(target), OutcomeKind.FAILURE, task_key="secret",
+                        error="密码错误", failure=failure,
+                        failure_message="secret.zip [密码错误]",
+                    ),
+                ))
             self.recent_passwords = ["secret"]
-            return SimpleNamespace(
-                success_count=1,
-                failed_tasks=[],
-                processed_keys=["secret"],
-                failures=[],
-                target_results=[TargetRunResult(str(target), OutcomeKind.COMPLETE_SUCCESS)],
-            )
+            return RunSummary(target_results=(
+                TargetRunResult(str(target), OutcomeKind.COMPLETE_SUCCESS, task_key="secret"),
+            ))
 
     answers = iter(["y", "secret", ""])
     monkeypatch.setattr(extract, "pipeline_engine", lambda _config: FakePipelineEngine(FakeRunner))

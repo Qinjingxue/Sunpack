@@ -1,30 +1,34 @@
-from pathlib import Path
-from io import BytesIO
-from binascii import crc32
 import struct
 import zipfile
+from binascii import crc32
+from io import BytesIO
+from pathlib import Path
 
 import pytest
 
-from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
-from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.pipeline.coordinator.target_scan import build_candidates_for_target
+from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
-from sunpack.pipeline.discovery.relations import RelationsScheduler
+from sunpack.pipeline.coordinator.target_scan import build_candidates_for_target
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
-from sunpack.pipeline.discovery.relations.internal.archive_input import archive_input_for_group
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
+from sunpack.pipeline.discovery.relations import RelationsScheduler
+from sunpack.pipeline.discovery.relations.internal.archive_input import (
+    archive_input_for_group,
+)
+from tests.helpers.config_factory import make_config
 from tests.helpers.fs_builder import make_minimal_7z
 
 
 def _groups(tmp_path: Path):
-    return RelationsScheduler().build_candidate_groups(DirectoryScanner(str(tmp_path)).scan())
+    return RelationsScheduler().build_candidate_groups(DirectoryScanner(str(tmp_path), config=make_config()).scan())
 
 
 def test_plain_file_relation_omits_empty_volume_anchor(tmp_path):
     path = tmp_path / "ordinary.bin"
     path.write_bytes(b"ordinary data")
 
-    candidates = build_candidates_for_target(str(path))
+    candidates = build_candidates_for_target(str(path), session=DiscoveryScanSession(config=make_config()))
 
     assert candidates
     assert all(candidate.relation_anchor == {} for candidate in candidates)
@@ -171,10 +175,10 @@ def test_truncated_7z_sfx_is_confirmed_by_relations_and_projected_to_declared_ra
     assert descriptor.primary_extent.start == pe_end
     assert descriptor.primary_extent.end == pe_end + len(payload)
 
-    result = ArchiveTaskProvider({
+    result = ArchiveTaskProvider(make_config({
         "detection": {"enabled": True},
         "embedded_scan": {"enabled": True},
-    }).discover_targets([str(path)])
+    })).discover_targets([str(path)])
 
     assert len(result.resolved_tasks) == 1
     task = result.resolved_tasks[0]
@@ -192,10 +196,10 @@ def test_arbitrary_pe_zip_overlay_requires_deep_detect_for_embedded_discovery(tm
     group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
     assert group.head_metadata.get("relation_confirmed") is not True
 
-    config = {
+    config = make_config({
         "detection": {"enabled": True},
         "embedded_scan": {"enabled": True},
-    }
+    })
     default_result = ArchiveTaskProvider(config).discover_targets([str(path)])
     assert default_result.resolved_tasks == []
 
@@ -472,10 +476,10 @@ def test_prefixed_single_disk_zip_carrier_is_resolved_by_embedded_discovery(tmp_
     carrier.write_bytes(b"fake-jpeg-prefix" + archive.read_bytes())
     archive.unlink()
 
-    result = ArchiveTaskProvider({
+    result = ArchiveTaskProvider(make_config({
         "detection": {"enabled": True},
         "embedded_scan": {"enabled": True},
-    }).discover_targets([str(carrier)])
+    })).discover_targets([str(carrier)])
 
     assert len(result.resolved_tasks) == 1
     task = result.resolved_tasks[0]

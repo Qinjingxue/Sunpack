@@ -4,8 +4,9 @@ import asyncio
 import os
 from types import SimpleNamespace
 
-from sunpack.runtime.cli.runtime_host import RuntimeHost
 from sunpack.pipeline.coordinator.archive_registry import ActiveArchiveRegistry
+from sunpack.runtime.cli.runtime_host import RuntimeHost
+from tests.helpers.config_factory import make_config
 
 
 def test_archive_registry_detects_watch_owner_by_file_identity(tmp_path):
@@ -84,9 +85,9 @@ def test_extract_reports_foreground_busy_without_watch_wording(tmp_path):
 
 
 def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
-    import sunpack.runtime.cli.runtime_host as runtime_host_module
-    import sunpack.runtime.cli.persistent_runtime as persistent_runtime
     import sunpack.core.platform.windows.process_qos as process_qos
+    import sunpack.runtime.cli.persistent_runtime as persistent_runtime
+    import sunpack.runtime.cli.runtime_host as runtime_host_module
 
     events = []
 
@@ -194,8 +195,8 @@ def test_runtime_host_uses_cli_override_until_idle_expiry(monkeypatch):
     ]
 
 def test_runtime_host_without_watch_scheduler_expires_cli_override_on_foreground_finish(monkeypatch):
-    import sunpack.runtime.cli.persistent_runtime as persistent_runtime
     import sunpack.core.platform.windows.process_qos as process_qos
+    import sunpack.runtime.cli.persistent_runtime as persistent_runtime
 
     modes = []
 
@@ -300,8 +301,8 @@ def test_runtime_host_does_not_bypass_a_waiting_first_foreground():
 
 
 def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_path):
-    import sunpack.runtime.cli.runtime_host as module
     import sunpack.core.platform.windows.toast_host as toast
+    import sunpack.runtime.cli.runtime_host as module
 
     managers = []
     services = []
@@ -336,7 +337,7 @@ def test_runtime_host_creates_toast_only_for_continuous_watch(monkeypatch, tmp_p
     async def engine(_config):
         return object()
 
-    monkeypatch.setattr(module, "load_config", lambda: {})
+    monkeypatch.setattr(module, "load_config", make_config)
     monkeypatch.setattr(module, "shared_pipeline_engine", engine)
     monkeypatch.setattr(module, "WatchService", FakeService)
     monkeypatch.setattr(toast, "ToastManager", FakeManager)

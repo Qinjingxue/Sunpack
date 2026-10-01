@@ -1,6 +1,20 @@
 from copy import deepcopy
 from typing import Any
 
+from sunpack.core.config.schema import normalize_config
+
+
+def make_config(payload: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Build the internal config contract from a small test input payload.
+
+    Small archive fixtures bypass default size filters; tests of filtering
+    supply their own scan_filters explicitly. Normalize only at this boundary.
+    """
+    config = deepcopy(payload or {})
+    config.setdefault("cli", {}).setdefault("language", "en")
+    config.setdefault("verification", {})
+    config.setdefault("filesystem", {}).setdefault("scan_filters", [])
+    return normalize_config(config)
 
 
 CONFIGS: dict[str, dict[str, Any]] = {
@@ -30,7 +44,7 @@ def get_config(name: str = "minimal", overrides: dict[str, Any] | None = None) -
     config = deepcopy(CONFIGS[name])
     if overrides:
         deep_merge(config, overrides)
-    return config
+    return make_config(config)
 
 
 def deep_merge(target: dict[str, Any], source: dict[str, Any]):

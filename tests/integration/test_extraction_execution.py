@@ -1,16 +1,33 @@
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
 
-from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
 from sunpack.core.config.schema import normalize_config
+from sunpack.pipeline.coordinator.output_scan_policy import (
+    NestedOutputScanPolicy as OutputScanPolicy,
+)
+from sunpack.pipeline.extraction.internal.sevenzip.metadata import (
+    ArchiveMetadataScanResult,
+)
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
+    attach_worker_diagnostics,
+    parse_worker_json_line,
+)
 from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
-from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanResult
-from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
 from tests.helpers.archive_tasks import make_archive_task
 from tests.helpers.detection_config import with_detection_pipeline
+
+
+def _completed(*, returncode, stdout, stderr, worker_diagnostics=None):
+    completed = attach_worker_diagnostics(subprocess.CompletedProcess(
+        args=[], returncode=returncode, stdout=stdout, stderr=stderr,
+    ))
+    if worker_diagnostics is not None:
+        completed.worker_diagnostics = worker_diagnostics
+    return completed
 
 
 def runner_config():
@@ -37,7 +54,7 @@ class FakePasswordResolver:
 
 
 class FakeMetadataScanner:
-    def scan(self, archive, password=None, part_paths=None, format_hint=""):
+    def scan_for_task(self, task, archive, password=None, part_paths=None, format_hint=""):
         return ArchiveMetadataScanResult(
             archive_path=str(archive),
             archive_type=Path(str(archive)).suffix.lower().lstrip(".") or "unknown",
@@ -46,7 +63,7 @@ class FakeMetadataScanner:
 
 
 class FakeFailingMetadataScanner:
-    def scan(self, archive, password=None, part_paths=None, format_hint=""):
+    def scan_for_task(self, task, archive, password=None, part_paths=None, format_hint=""):
         result = ArchiveMetadataScanResult(
             archive_path=str(archive),
             archive_type="zip",
@@ -68,7 +85,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.metadata_scanner = FakeFailingMetadataScanner()
             calls = []
             extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (
-                calls.append(kwargs) or SimpleNamespace(returncode=0, stdout="", stderr="")
+                calls.append(kwargs) or _completed(returncode=0, stdout="", stderr="")
             )
             task = make_archive_task(archive_path)
 
@@ -95,7 +112,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             task.carrier_path = str(launcher_path)
             task.cleanup_parts = [str(archive_path), str(launcher_path)]
 
-            succeeded = SimpleNamespace(returncode=0, stdout="", stderr="")
+            succeeded = _completed(returncode=0, stdout="", stderr="")
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: succeeded
             result = extractor.extract(task, str(out_dir))
 
@@ -112,8 +129,8 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
 
-            failed = SimpleNamespace(returncode=8, stdout="", stderr="write error")
-            succeeded = SimpleNamespace(returncode=0, stdout="", stderr="")
+            failed = _completed(returncode=8, stdout="", stderr="write error")
+            succeeded = _completed(returncode=0, stdout="", stderr="")
 
             task = make_archive_task(archive_path)
 
@@ -134,8 +151,8 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
 
-            failed = SimpleNamespace(returncode=-102, stdout="", stderr="7z process made no observable progress")
-            succeeded = SimpleNamespace(returncode=0, stdout="", stderr="")
+            failed = _completed(returncode=-102, stdout="", stderr="7z process made no observable progress")
+            succeeded = _completed(returncode=0, stdout="", stderr="")
             calls = 0
 
             def fake_run(*_args, **_kwargs):
@@ -165,7 +182,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
 
-            failed = SimpleNamespace(returncode=2, stdout="", stderr="Headers Error")
+            failed = _completed(returncode=2, stdout="", stderr="Headers Error")
             task = make_archive_task(archive_path)
 
             calls = 0
@@ -240,7 +257,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                     },
                 }
                 diagnostics["result"] = parse_worker_json_line(json.dumps(diagnostics["result"]))
-                return SimpleNamespace(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
+                return _completed(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
             task = make_archive_task(archive_path)
             extractor.sevenzip_runner.extract_attempt = fake_extract
@@ -292,7 +309,7 @@ class ExtractionExecutionTests(unittest.TestCase):
                     }
                 }
                 diagnostics["result"] = parse_worker_json_line(json.dumps(diagnostics["result"]))
-                return SimpleNamespace(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
+                return _completed(returncode=2, stdout="", stderr="CRC Failed", worker_diagnostics=diagnostics)
 
             task = make_archive_task(archive_path)
             extractor.sevenzip_runner.extract_attempt = fake_extract
@@ -313,7 +330,7 @@ class ExtractionExecutionTests(unittest.TestCase):
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
 
-            failed = SimpleNamespace(returncode=-100, stdout="", stderr="7z process failed to start")
+            failed = _completed(returncode=-100, stdout="", stderr="7z process failed to start")
             task = make_archive_task(archive_path)
 
             extractor.sevenzip_runner.extract_attempt = lambda **_kwargs: failed
@@ -352,8 +369,8 @@ class ExtractionRetryTests(unittest.TestCase):
             extractor.password_resolver = FakePasswordResolver()
             extractor.metadata_scanner = FakeMetadataScanner()
             attempts = iter([
-                SimpleNamespace(returncode=8, stdout="", stderr="write error"),
-                SimpleNamespace(returncode=0, stdout="", stderr=""),
+                _completed(returncode=8, stdout="", stderr="write error"),
+                _completed(returncode=0, stdout="", stderr=""),
             ])
             calls = []
             extractor.sevenzip_runner.extract_attempt = lambda **kwargs: (

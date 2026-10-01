@@ -4,10 +4,17 @@ import pytest
 
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.run_state import RunState
 from sunpack.core.contracts.results import OutcomeKind
-from sunpack.pipeline.coordinator.archive_job import ArchiveJobOutcome, ArchiveJobExecutor
-from sunpack.pipeline.postprocess.failed_output_cleanup import cleanup_failed_output_if_eligible
+from sunpack.core.contracts.run_state import RunState
+from sunpack.core.i18n import I18nContext
+from sunpack.pipeline.coordinator.archive_job import (
+    ArchiveJobExecutor,
+    ArchiveJobOutcome,
+    ContentRecoveryPolicy,
+)
+from sunpack.pipeline.postprocess.failed_output_cleanup import (
+    cleanup_failed_output_if_eligible,
+)
 from tests.helpers.archive_tasks import make_archive_task
 
 
@@ -113,7 +120,9 @@ def test_collect_result_applies_main_pipeline_cleanup_after_diagnostics(tmp_path
     outcome = ArchiveJobOutcome(result=extraction, planned_out_dir=str(output))
     runner = object.__new__(ArchiveJobExecutor)
     runner.context = RunState()
+    runner.i18n = I18nContext("en")
     runner.config = {}
+    runner.content_policy = ContentRecoveryPolicy.from_config(runner.config)
 
     returned = runner.collect_result(task, outcome)
 

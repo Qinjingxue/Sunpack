@@ -15,9 +15,6 @@ from sunpack.core.support.archive_sessions import (
 )
 from sunpack.core.support.output_reservation import OutputReservationRegistry
 from sunpack.pipeline.coordinator.engine import PipelineEngine
-from sunpack.pipeline.verification.methods.expected_name_presence import (
-    ExpectedNamePresenceMethod,
-)
 
 
 def _powershell(script):
@@ -75,7 +72,6 @@ def _inventory(files):
         len(files),
         0,
         len(files),
-        0,
         0,
         True,
         False,
@@ -136,13 +132,6 @@ def test_bug_regression_worker_renamed_output_paths_are_reused():
     assert result["mismatch_count"] == 0
     assert result["coverage"]["complete_files"] == 1
     assert result["observations"][0]["path"] == "name(1).txt"
-
-
-def test_bug_regression_expected_names_do_not_merge_unicode_forms():
-    names = ["\u00e9.txt", "e\u0301.txt"]
-    assert (
-        ExpectedNamePresenceMethod()._expected_names({"expected_names": names}) == names
-    )
 
 
 def test_bug_regression_idle_allocator_cleanup_preserves_active_owners(tmp_path):

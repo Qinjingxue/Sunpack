@@ -4,18 +4,25 @@ import asyncio
 from types import SimpleNamespace
 
 import pytest
-from sunpack.runtime.cli.runtime_host import RuntimeHost
-from tests.helpers.archive_tasks import make_archive_task
-from sunpack.runtime.watch.scheduler import WatchScheduler
-from sunpack.core.passwords.relation_prober import _shared_attempt_cache, clear_relation_probe_cache
+
+from sunpack.core.passwords.relation_prober import (
+    _shared_attempt_cache,
+    clear_relation_probe_cache,
+)
 from sunpack.core.support.archive_knowledge_projection import (
     clear_projection_cache,
     source_fingerprint,
 )
-from sunpack.core.support.global_cache_manager import GLOBAL_CACHE
 from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge
-from sunpack.core.support.runtime_cache_cleanup import clear_all_runtime_caches, runtime_cache_stats
-
+from sunpack.core.support.global_cache_manager import GLOBAL_CACHE
+from sunpack.core.support.runtime_cache_cleanup import (
+    clear_all_runtime_caches,
+    runtime_cache_stats,
+)
+from sunpack.runtime.cli.runtime_host import RuntimeHost
+from sunpack.runtime.watch.scheduler import WatchScheduler
+from tests.helpers.archive_tasks import make_archive_task
+from tests.helpers.config_factory import make_config
 
 _TEST_LOOP = asyncio.new_event_loop()
 
@@ -100,13 +107,13 @@ class _StatsCleanupEngine(_CleanupOnlyEngine):
 def test_watch_deadline_clears_only_after_idle_window(tmp_path):
     engine = _CleanupOnlyEngine()
     watcher = WatchScheduler(
-        {
+        make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "runtime_cache_cleanup_enabled": True,
                 "runtime_cache_cleanup_idle_seconds": 10,
             }
-        },
+        }),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -133,13 +140,13 @@ def test_watch_deadline_clears_only_after_idle_window(tmp_path):
 def test_external_activity_resets_and_rearms_idle_cleanup(tmp_path):
     wakeups = []
     watcher = WatchScheduler(
-        {
+        make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "runtime_cache_cleanup_enabled": True,
                 "runtime_cache_cleanup_idle_seconds": 10,
             }
-        },
+        }),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -164,13 +171,13 @@ def test_idle_maintenance_expires_cli_mode_when_cache_cleanup_is_disabled(tmp_pa
     async def scenario():
         engine = _CleanupOnlyEngine()
         watcher = WatchScheduler(
-            {
+            make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
                     "runtime_cache_cleanup_enabled": False,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
-            },
+            }),
             [str(tmp_path)],
             out_dir=str(tmp_path / "out"),
             state_path=str(tmp_path / "state.json"),
@@ -202,13 +209,13 @@ def test_cleanup_gate_waits_for_foreground_activity(tmp_path):
     async def scenario():
         engine = _CleanupOnlyEngine()
         watcher = WatchScheduler(
-            {
+            make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
                     "runtime_cache_cleanup_enabled": True,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
-            },
+            }),
             [str(tmp_path)],
             out_dir=str(tmp_path / "out"),
             state_path=str(tmp_path / "state.json"),
@@ -235,13 +242,13 @@ def test_external_activity_waits_for_cleanup_already_in_progress(tmp_path):
     async def scenario():
         engine = _BlockingCleanupEngine()
         watcher = WatchScheduler(
-            {
+            make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
                     "runtime_cache_cleanup_enabled": True,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
-            },
+            }),
             [str(tmp_path)],
             out_dir=str(tmp_path / "out"),
             state_path=str(tmp_path / "state.json"),
@@ -271,13 +278,13 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
     async def scenario():
         engine = _StatsCleanupEngine()
         watcher = WatchScheduler(
-            {
+            make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
                     "runtime_cache_cleanup_enabled": True,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
-            },
+            }),
             [str(tmp_path)],
             out_dir=str(tmp_path / "out"),
             state_path=str(tmp_path / "state.json"),
@@ -313,13 +320,13 @@ def test_external_activity_release_during_pending_acquire_leaves_gate_free(tmp_p
     async def scenario():
         engine = _BlockingCleanupEngine()
         watcher = WatchScheduler(
-            {
+            make_config({
                 "watch": {
                     "clipboard_monitor_enabled": False,
                     "runtime_cache_cleanup_enabled": True,
                     "runtime_cache_cleanup_idle_seconds": 10,
                 }
-            },
+            }),
             [str(tmp_path)],
             out_dir=str(tmp_path / "out"),
             state_path=str(tmp_path / "state.json"),

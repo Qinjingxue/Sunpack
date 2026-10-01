@@ -1,29 +1,33 @@
 from __future__ import annotations
 
 import asyncio
-
 import os
 import sys
 import threading
 import time
-import zipfile
 import weakref
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
-import sunpack.runtime.watch.scheduler as scheduler_module
 import sunpack.core.passwords.internal.builtin as builtin_module
 import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
+import sunpack.runtime.watch.scheduler as scheduler_module
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse
+from sunpack.core.contracts.pipeline import (
+    PipelineArtifacts,
+    PipelineDiscovery,
+    PipelineResponse,
+)
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
 from sunpack.core.support.resource_lifecycle import promotion_barrier
-from sunpack.runtime.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
 from sunpack.runtime.watch.scanner import WatchCandidate
+from sunpack.runtime.watch.scheduler import WatchScheduler as RuntimeWatchScheduler
 from sunpack.runtime.watch.state import WatchStateStore
+from tests.helpers.config_factory import make_config
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 
@@ -171,7 +175,7 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
     persisted.save()
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=".",
         state_path=str(state_path),
@@ -186,12 +190,6 @@ def test_watch_scheduler_prunes_missing_state_before_start(tmp_path, monkeypatch
         assert not reloaded.entries
     finally:
         watcher._stop_blocking()
-
-
-class FakeSummary:
-    success_count = 1
-    failed_tasks = []
-    failures = []
 
 
 class WatchClock:
@@ -606,7 +604,7 @@ def _summary_pipeline_engine():
         lambda _config: SimpleNamespace(
             context=SimpleNamespace(generated_outputs=set()),
             recent_passwords=[],
-            run_targets=lambda _paths: FakeSummary(),
+            run_targets=lambda _paths: RunSummary(target_results=(TargetRunResult(_paths[0], OutcomeKind.COMPLETE_SUCCESS),)),
         )
     )
 
@@ -617,7 +615,7 @@ def test_coalesced_pipeline_completion_is_consumed_without_duplicate_terminal_no
     stat = archive.stat()
     notifications = CapturingNotificationSink()
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -633,7 +631,7 @@ def test_coalesced_pipeline_completion_is_consumed_without_duplicate_terminal_no
     )
     response = PipelineResponse(
         request_id="coalesced",
-        summary=FakeSummary(),
+        summary=RunSummary(target_results=(TargetRunResult(candidate.path, OutcomeKind.COMPLETE_SUCCESS),)),
         discovery=PipelineDiscovery(
             entry_paths=(candidate.path,),
             claimed_paths=(candidate.path,),
@@ -730,7 +728,7 @@ def test_watch_run_once_harvests_futures_without_waiting_for_slow_batch(tmp_path
         _write_zip(archive)
     engine = _DeferredPipelineEngine()
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -786,7 +784,7 @@ def test_watch_candidate_coroutines_are_harvested_without_completion_pool(tmp_pa
             return _watch_summary(self.path, OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -844,7 +842,7 @@ def test_successful_watch_task_uses_direct_output_root(tmp_path, monkeypatch):
             return _watch_summary(paths[0], OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -874,19 +872,13 @@ def test_failed_watch_task_writes_to_direct_output_root(tmp_path, monkeypatch):
         def run_targets(self, paths):
             self.output_dir.mkdir(parents=True)
             (self.output_dir / "invalid.bin").write_bytes(b"invalid")
-            return SimpleNamespace(
-                success_count=0,
-                partial_success_count=0,
-                failed_tasks=["boom"],
-                failures=[FailureInfo(kind=FailureKind.UNKNOWN, stage="extraction", message="boom")],
-                processed_keys=[paths[0]],
-                target_results=[
-                    TargetRunResult(paths[0], OutcomeKind.FAILURE, verification={"decision_hint": "reject"})
-                ],
-            )
+            return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="boom",
+                failure=FailureInfo(kind=FailureKind.UNKNOWN, stage="extraction", message="boom"), verification={"decision_hint": "reject"},
+            ),))
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -936,7 +928,7 @@ def test_partial_result_does_not_self_retry_but_modified_epoch_does(tmp_path, mo
             )
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -980,7 +972,7 @@ def test_partial_result_is_rejected_but_direct_output_remains(tmp_path, monkeypa
             )
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1023,7 +1015,7 @@ def test_content_event_during_processing_starts_a_new_active_epoch(tmp_path, mon
             return _watch_summary(paths[0], OutcomeKind.PARTIAL_SUCCESS, {"decision_hint": "accept_partial"})
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1047,7 +1039,7 @@ def test_metadata_event_during_and_after_processing_does_not_start_new_epoch(tmp
     engine = _DeferredPipelineEngine()
     wakeups = []
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1126,7 +1118,7 @@ def test_content_event_during_processing_still_starts_new_epoch_from_latest_meta
     _write_zip(archive)
     engine = _DeferredPipelineEngine()
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1195,7 +1187,7 @@ def test_watch_scheduler_uses_watchdog_observer_and_initial_scan(tmp_path, monke
     state_path = tmp_path / "state.json"
 
     watcher = WatchScheduler(
-        {},
+        make_config({}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(state_path),
@@ -1225,7 +1217,7 @@ def test_watch_scheduler_scans_only_requested_initial_scan_roots(tmp_path, monke
     _write_zip(second_root / "second.zip")
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(first_root), str(second_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1247,7 +1239,7 @@ def test_watch_scheduler_observes_builtin_password_file_directory(tmp_path, monk
     watch_root = tmp_path / "in"
     watch_root.mkdir()
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1269,7 +1261,7 @@ def test_watch_scheduler_preserves_existing_directory_password_file(tmp_path, mo
     password_file.write_text("existing-secret\n", encoding="utf-8")
 
     watcher = WatchScheduler(
-        {},
+        make_config({}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1293,7 +1285,7 @@ def test_watch_scheduler_never_recurses_for_current_directory_scan_mode(tmp_path
     _write_zip(nested / "nested.zip")
 
     watcher = WatchScheduler(
-        {"filesystem": {"directory_scan_mode": "-", "scan_filters": []}},
+        make_config({"filesystem": {"directory_scan_mode": "-", "scan_filters": []}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1318,7 +1310,7 @@ def test_watch_scheduler_never_recurses_for_recursive_directory_scan_mode(tmp_pa
     _write_zip(nested / "nested.zip")
 
     watcher = WatchScheduler(
-        {"filesystem": {"directory_scan_mode": "*", "scan_filters": []}},
+        make_config({"filesystem": {"directory_scan_mode": "*", "scan_filters": []}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1343,14 +1335,14 @@ def test_watch_scheduler_does_not_apply_pipeline_filesystem_filters(tmp_path, mo
     blocked.write_bytes(b"payload")
 
     watcher = WatchScheduler(
-        {
+        make_config({
             "filesystem": {
                 "scan_filters": [
                     {"name": "path_pattern", "enabled": True, "exclude": ["*.zip"]},
                 ],
             },
             "watch": {"clipboard_monitor_enabled": False},
-        },
+        }),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1377,7 +1369,7 @@ def test_watch_scheduler_uses_stop_timeout_without_suffix_prefilter(tmp_path, mo
     _write_zip(watch_root / "sample.zip")
 
     watcher = WatchScheduler(
-        {},
+        make_config({}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1403,7 +1395,7 @@ def test_event_burst_with_unchanged_usn_does_not_restart_quiet_window(tmp_path, 
     archive = tmp_path / "sample.zip"
     _write_zip(archive)
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1430,7 +1422,7 @@ def test_candidate_deadline_changes_wake_watch_service(tmp_path, monkeypatch):
     archive.write_bytes(b"PK\x03\x04payload")
     wakeups = []
     watcher = WatchScheduler(
-        {"filesystem": {"scan_filters": []}, "watch": {"clipboard_monitor_enabled": False}},
+        make_config({"filesystem": {"scan_filters": []}, "watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1463,7 +1455,7 @@ def test_watch_scheduler_processes_direct_quiet_candidate_with_watch_root_common
 
         def run_targets(self, paths):
             captured["paths"] = paths
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -1471,7 +1463,7 @@ def test_watch_scheduler_processes_direct_quiet_candidate_with_watch_root_common
     _write_zip(archive_path)
 
     watcher = WatchScheduler(
-        {},
+        make_config({}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1501,7 +1493,7 @@ def test_watch_scheduler_sends_quiet_nonstandard_extension_to_main_pipeline(tmp_
 
         def run_targets(self, paths):
             captured["paths"] = paths
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -1509,7 +1501,7 @@ def test_watch_scheduler_sends_quiet_nonstandard_extension_to_main_pipeline(tmp_
     target.write_bytes(b"PK\x03\x04payload")
 
     watcher = WatchScheduler(
-        {"filesystem": {"scan_filters": []}},
+        make_config({"filesystem": {"scan_filters": []}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1536,7 +1528,7 @@ def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypat
             self.context = SimpleNamespace(generated_outputs=set())
 
         def run_targets(self, paths):
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -1544,7 +1536,7 @@ def test_watch_scheduler_moved_file_uses_common_quiet_window(tmp_path, monkeypat
     _write_zip(archive_path)
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -1570,7 +1562,7 @@ def test_watch_scheduler_timestamp_restore_does_not_reset_content_quiet_window(t
             self.context = SimpleNamespace(generated_outputs=set())
 
         def run_targets(self, paths):
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -1581,7 +1573,7 @@ def test_watch_scheduler_timestamp_restore_does_not_reset_content_quiet_window(t
     os.utime(archive_path, (os_time, os_time))
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -1612,7 +1604,7 @@ def test_pending_metadata_event_advances_snapshot_without_generation_or_wakeup(t
     _write_zip(archive)
     wakeups = []
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1674,7 +1666,7 @@ def test_watch_scheduler_growth_resets_the_common_quiet_window(tmp_path, monkeyp
             self.context = SimpleNamespace(generated_outputs=set())
 
         def run_targets(self, paths):
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -1684,7 +1676,7 @@ def test_watch_scheduler_growth_resets_the_common_quiet_window(tmp_path, monkeyp
     os.utime(archive_path, (2000002000.0, 2000002000.0))
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -1714,7 +1706,7 @@ def test_watch_scheduler_does_not_log_duplicate_pending_candidate(tmp_path, monk
     _write_zip(archive_path)
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -1745,7 +1737,7 @@ def test_watch_scheduler_ignores_unchanged_event_after_no_tasks_result(tmp_path,
     target.write_bytes(b"%PDF-" + b"x" * 1024)
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -1779,7 +1771,7 @@ def test_watch_scheduler_ignores_nested_paths(tmp_path, monkeypatch):
     _write_zip(archive_path)
 
     watcher = WatchScheduler(
-        {},
+        make_config({}),
         [str(watch_root)],
         out_dir=str(out_root),
         state_path=str(tmp_path / "state.json"),
@@ -1804,13 +1796,13 @@ def test_watch_scheduler_processes_archive_when_output_root_matches_watch_root(t
         def run_targets(self, paths):
             captured["paths"] = paths
             self.output_dir.mkdir(parents=True)
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     archive_path = tmp_path / "sample.zip"
     _write_zip(archive_path)
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -1843,10 +1835,10 @@ def test_watch_scheduler_does_not_reprocess_unchanged_input_when_output_is_delet
         def run_targets(self, paths):
             runs.append(list(paths))
             output_dir.mkdir(exist_ok=True)
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=".",
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -1889,10 +1881,10 @@ def test_watch_scheduler_reprocesses_identical_archive_after_it_moves_out_and_ba
         def run_targets(self, paths):
             runs.append(list(paths))
             output_dir.mkdir(exist_ok=True)
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=".",
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -1918,7 +1910,7 @@ def test_watch_event_handler_cleans_moved_directory_source_without_arrival_enque
     watch_root = tmp_path / "watched"
     watch_root.mkdir()
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -1954,10 +1946,10 @@ def test_watch_scheduler_processes_same_path_again_after_input_changes(tmp_path,
 
         def run_targets(self, paths):
             runs.append(list(paths))
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=".",
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -1981,7 +1973,7 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
     _write_zip(archive_path)
     state_path = tmp_path / ".sunpack_watch" / "state.json"
     first = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=".",
         state_path=str(state_path),
@@ -2000,10 +1992,10 @@ def test_watch_scheduler_recovers_persisted_pending_input_after_restart(tmp_path
 
         def run_targets(self, paths):
             runs.append(list(paths))
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     restarted = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=".",
         state_path=str(state_path),
@@ -2037,10 +2029,10 @@ def test_relative_output_directory_is_resolved_per_matching_watch_root(tmp_path,
 
         def run_targets(self, paths):
             self.output_dir.mkdir(parents=True)
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(first_root), str(second_root)],
         out_dir=".",
         state_path=str(first_root / ".sunpack_watch" / "state.json"),
@@ -2084,7 +2076,7 @@ def test_watch_scheduler_routes_each_watch_root_to_its_configured_output_root(tm
             return _watch_summary(paths[0], OutcomeKind.COMPLETE_SUCCESS, {"decision_hint": "accept"})
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(first_root), str(second_root)],
         out_dir=str(tmp_path / "legacy-out"),
         output_roots={
@@ -2116,7 +2108,7 @@ def test_watch_scheduler_rejects_nested_output_roots(tmp_path, monkeypatch):
 
     with pytest.raises(ValueError, match="must not contain one another"):
         WatchScheduler(
-            {"watch": {"clipboard_monitor_enabled": False}},
+            make_config({"watch": {"clipboard_monitor_enabled": False}}),
             [str(first_root), str(second_root)],
             output_roots={
                 str(first_root): str(tmp_path / "output"),
@@ -2136,7 +2128,7 @@ def test_watch_scheduler_allows_shared_output_root(tmp_path, monkeypatch):
     output_root = tmp_path / "output"
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(first_root), str(second_root)],
         output_roots={
             str(first_root): str(output_root),
@@ -2162,7 +2154,7 @@ def test_watch_root_always_has_a_resolved_output_root(tmp_path, monkeypatch):
 
     def output_root_for(out_dir, output_roots=None):
         watcher = WatchScheduler(
-            {},
+            make_config({}),
             [str(watch_root)],
             out_dir=out_dir,
             output_roots=output_roots,
@@ -2193,7 +2185,7 @@ def test_watch_scheduler_initial_scan_ignores_nested_archives(tmp_path, monkeypa
 
     state_path = tmp_path / ".sunpack_watch" / "state.json"
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path),
         state_path=str(state_path),
@@ -2216,11 +2208,10 @@ def test_watch_scheduler_does_not_retry_terminal_failure_for_unchanged_event(tmp
             pass
 
         def run_targets(self, paths):
-            return SimpleNamespace(
-                success_count=0,
-                failed_tasks=["damaged"],
-                failures=[FailureInfo(FailureKind.DAMAGED, "extraction", "damaged")],
-            )
+            return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="damaged",
+                failure=FailureInfo(FailureKind.DAMAGED, "extraction", "damaged"),
+            ),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2229,7 +2220,7 @@ def test_watch_scheduler_does_not_retry_terminal_failure_for_unchanged_event(tmp
 
     notifications = CapturingNotificationSink()
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2270,7 +2261,7 @@ def test_unstructured_nested_password_failure_is_terminal_without_retry_anchor(t
     archive_path.write_bytes(b"PK\x03\x04payload")
     notifications = CapturingNotificationSink()
     watcher = WatchScheduler(
-        {"cli": {"language": "zh"}, "watch": {"clipboard_monitor_enabled": False}},
+        make_config({"cli": {"language": "zh"}, "watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2311,7 +2302,7 @@ def test_unstructured_nested_missing_volume_is_terminal_without_wait_anchor(tmp_
     archive_path.write_bytes(b"PK\x03\x04payload")
     notifications = CapturingNotificationSink()
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2343,15 +2334,14 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
 
         def run_targets(self, paths):
             attempts["count"] += 1
-            return SimpleNamespace(
-                success_count=0,
-                failed_tasks=["password or damage is inconclusive"],
-                failures=[FailureInfo(
+            return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="password or damage is inconclusive",
+                failure=FailureInfo(
                     FailureKind.PASSWORD_INCONCLUSIVE,
                     "extraction",
                     "password or damage is inconclusive",
-                )],
-            )
+                ),
+            ),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2359,7 +2349,7 @@ def test_watch_scheduler_does_not_retry_password_inconclusive_after_password_sou
     archive_path.write_bytes(b"PK\x03\x04payload")
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}},
+        make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2389,12 +2379,11 @@ def test_watch_scheduler_retries_password_failure_after_password_source_change(t
         def run_targets(self, paths):
             attempts["count"] += 1
             if attempts["count"] == 1:
-                return SimpleNamespace(
-                    success_count=0,
-                    failed_tasks=["wrong password"],
-                    failures=[FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")],
-                )
-            return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
+                return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="wrong password",
+                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+            ),))
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2403,12 +2392,12 @@ def test_watch_scheduler_retries_password_failure_after_password_source_change(t
 
     notifications = CapturingNotificationSink()
     watcher = WatchScheduler(
-        {
+        make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 0,
             }
-        },
+        }),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2445,12 +2434,12 @@ def test_password_retry_wakeup_uses_debounce_deadline_without_pending_candidate(
     archive_path.write_bytes(b"PK\x03\x04payload")
     stat = archive_path.stat()
     watcher = WatchScheduler(
-        {
+        make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 5,
             }
-        },
+        }),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2477,7 +2466,7 @@ def test_password_retry_wakeup_uses_debounce_deadline_without_pending_candidate(
 def test_idle_scheduler_has_no_polling_deadline(tmp_path, monkeypatch):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2501,22 +2490,21 @@ def test_password_retry_bypasses_learned_quiet_for_unchanged_failed_archive(tmp_
         def run_targets(self, paths):
             attempts["count"] += 1
             if attempts["count"] == 1:
-                return SimpleNamespace(
-                    success_count=0,
-                    failed_tasks=["wrong password"],
-                    failures=[FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")],
-                )
-            return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
+                return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="wrong password",
+                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+            ),))
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
     watcher = WatchScheduler(
-        {
+        make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 0,
             }
-        },
+        }),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2546,23 +2534,22 @@ def test_password_retry_preserves_quiet_when_failed_archive_changed(tmp_path, mo
             pass
 
         def run_targets(self, paths):
-            return SimpleNamespace(
-                success_count=0,
-                failed_tasks=["wrong password"],
-                failures=[FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")],
-            )
+            return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="wrong password",
+                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+            ),))
 
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
     watcher = WatchScheduler(
-        {
+        make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 0,
                 "cold_start_seconds": 1.0,
                 "quiet_min_seconds": 1.25,
             }
-        },
+        }),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2598,24 +2585,23 @@ def test_password_retry_debounce_uses_monotonic_clock_when_wall_clock_moves_back
         def run_targets(self, paths):
             attempts["count"] += 1
             if attempts["count"] == 1:
-                return SimpleNamespace(
-                    success_count=0,
-                    failed_tasks=["wrong password"],
-                    failures=[FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")],
-                )
-            return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
+                return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="wrong password",
+                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+            ),))
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
     watcher = WatchScheduler(
-        {
+        make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 5,
             }
-        },
+        }),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2652,7 +2638,7 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
             captured.append(config)
 
         def run_targets(self, paths):
-            return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2660,7 +2646,7 @@ def test_watch_scheduler_defaults_to_user_and_builtin_password_sources(tmp_path,
     archive_path.write_bytes(b"PK\x03\x04payload")
     state_path = tmp_path / "state.json"
     watcher = WatchScheduler(
-        {"user_passwords": ["user-secret"], "watch": {"clipboard_monitor_enabled": False}},
+        make_config({"user_passwords": ["user-secret"], "watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(state_path),
@@ -2704,19 +2690,18 @@ def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(
             candidates = list(self.config.get("builtin_passwords") or [])
             attempts.append(candidates)
             if "clipboard-secret" in candidates:
-                return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
-            return SimpleNamespace(
-                success_count=0,
-                failed_tasks=["wrong password"],
-                failures=[FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")],
-            )
+                return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
+            return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="wrong password",
+                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+            ),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": True, "password_retry_debounce_seconds": 0}},
+        make_config({"watch": {"clipboard_monitor_enabled": True, "password_retry_debounce_seconds": 0}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2759,19 +2744,18 @@ def test_watch_scheduler_retries_on_builtin_password_file_watchdog_event(tmp_pat
         def run_targets(self, paths):
             attempts.append(list(self.config.get("builtin_passwords") or []))
             if "new-secret" in self.config.get("builtin_passwords", []):
-                return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
-            return SimpleNamespace(
-                success_count=0,
-                failed_tasks=["wrong password"],
-                failures=[FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")],
-            )
+                return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
+            return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="wrong password",
+                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+            ),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
     archive_path.write_bytes(b"PK\x03\x04payload")
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}},
+        make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2812,12 +2796,11 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
         def run_targets(self, paths):
             attempts.append(list(self.config.get("user_passwords") or []))
             if "new-secret" in self.config.get("user_passwords", []):
-                return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
-            return SimpleNamespace(
-                success_count=0,
-                failed_tasks=["wrong password"],
-                failures=[FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")],
-            )
+                return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
+            return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="wrong password",
+                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+            ),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2825,7 +2808,7 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
     archive_path.write_bytes(b"PK\x03\x04payload")
     state_path = tmp_path / "state.json"
     first_watcher = WatchScheduler(
-        {"user_passwords": ["wrong"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}},
+        make_config({"user_passwords": ["wrong"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(state_path),
@@ -2837,7 +2820,7 @@ def test_watch_scheduler_retries_persisted_password_failure_when_config_password
     _await(first_watcher.run_once())
 
     second_watcher = WatchScheduler(
-        {"user_passwords": ["new-secret"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}},
+        make_config({"user_passwords": ["new-secret"], "watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(state_path),
@@ -2867,14 +2850,13 @@ def test_watch_scheduler_promotes_recent_success_password_and_retries_other_fail
             attempts.append((archive_name, candidates))
             if archive_name == "teacher.zip":
                 self.recent_passwords = ["learned-secret"]
-                return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
+                return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
             if "learned-secret" in candidates:
-                return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
-            return SimpleNamespace(
-                success_count=0,
-                failed_tasks=["wrong password"],
-                failures=[FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")],
-            )
+                return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
+            return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="wrong password",
+                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+            ),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2883,7 +2865,7 @@ def test_watch_scheduler_promotes_recent_success_password_and_retries_other_fail
     failed_archive.write_bytes(b"PK\x03\x04failed")
     teacher_archive.write_bytes(b"PK\x03\x04teacher")
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}},
+        make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2918,12 +2900,11 @@ def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path,
         def run_targets(self, paths):
             attempts["count"] += 1
             if attempts["count"] == 1:
-                return SimpleNamespace(
-                    success_count=0,
-                    failed_tasks=["password required"],
-                    failures=[FailureInfo(FailureKind.PASSWORD_REQUIRED, "password_resolution", "password required")],
-                )
-            return SimpleNamespace(success_count=1, failed_tasks=[], failures=[])
+                return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="password required",
+                failure=FailureInfo(FailureKind.PASSWORD_REQUIRED, "password_resolution", "password required"),
+            ),))
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2933,12 +2914,12 @@ def test_watch_scheduler_password_table_event_retries_password_failure(tmp_path,
     password_table.write_text("secret\n", encoding="utf-8")
 
     watcher = WatchScheduler(
-        {
+        make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "password_retry_debounce_seconds": 0,
             }
-        },
+        }),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -2966,11 +2947,10 @@ def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):
             pass
 
         def run_targets(self, paths):
-            return SimpleNamespace(
-                success_count=0,
-                failed_tasks=["wrong password"],
-                failures=[FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password")],
-            )
+            return RunSummary(target_results=(TargetRunResult(
+                paths[0], OutcomeKind.FAILURE, error="wrong password",
+                failure=FailureInfo(FailureKind.WRONG_PASSWORD, "password_resolution", "wrong password"),
+            ),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -2978,7 +2958,7 @@ def test_watch_scheduler_writes_jsonl_log_for_failures(tmp_path, monkeypatch):
     archive_path.write_bytes(b"PK\x03\x04payload")
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / ".sunpack_watch" / "state.json"),
@@ -3005,7 +2985,7 @@ def test_watch_scheduler_silently_ignores_metadata_events(tmp_path, monkeypatch)
     log_path.write_text("", encoding="utf-8")
 
     watcher = WatchScheduler(
-        {},
+        make_config({}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(metadata_dir / "state.json"),
@@ -3027,7 +3007,7 @@ def test_watch_event_handler_keeps_dispatcher_alive_when_native_observation_is_t
     ignored = []
 
     class Scheduler:
-        config = {}
+        config = make_config({})
 
         @staticmethod
         def is_builtin_password_file(path):
@@ -3072,7 +3052,7 @@ def test_watch_scheduler_claim_removes_pending_sibling_before_source_cleanup_pro
     sibling_volume.write_bytes(b"sibling volume")
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3130,7 +3110,7 @@ def test_watch_scheduler_claim_hands_off_only_new_generation_after_release(
     sibling_volume.write_bytes(b"old sibling")
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3173,7 +3153,7 @@ def test_watch_scheduler_transfers_dirty_generation_between_pipeline_claims(
     source.write_bytes(b"old generation")
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3216,7 +3196,7 @@ def test_watch_scheduler_departed_claimed_source_stays_owned_until_pipeline_fini
     sibling_volume.write_bytes(b"sibling volume")
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3263,7 +3243,7 @@ def test_watch_scheduler_does_not_special_case_downloader_suffixes(tmp_path, mon
     temporary.write_bytes(b"PK\x03\x04payload")
 
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3286,14 +3266,14 @@ def test_watch_scheduler_same_stat_same_usn_event_does_not_reset_quiet_window(tm
             self.context = SimpleNamespace(generated_outputs=set())
 
         def run_targets(self, paths):
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
     archive_path = watch_root / "sample.zip"
     _write_zip(archive_path)
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3318,7 +3298,7 @@ def test_modified_epoch_triggers_even_when_size_mtime_and_file_id_are_unchanged(
             self.context = SimpleNamespace(generated_outputs=set())
 
         def run_targets(self, paths):
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -3326,7 +3306,7 @@ def test_modified_epoch_triggers_even_when_size_mtime_and_file_id_are_unchanged(
     archive_path.write_bytes(b"A" * (512 * 1024))
     original_mtime = archive_path.stat().st_mtime
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3354,11 +3334,11 @@ def test_watch_scheduler_adapts_quiet_window_to_fast_content_writes(tmp_path, mo
     archive_path.write_bytes(b"0")
     os.utime(archive_path, (clock.value, clock.value))
     watcher = WatchScheduler(
-        {"watch": {
+        make_config({"watch": {
             "clipboard_monitor_enabled": False,
             "cold_start_seconds": 1.0,
             "quiet_min_seconds": 1.25,
-        }},
+        }}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3385,7 +3365,7 @@ def test_watch_scheduler_default_cold_start_is_zero_seconds(tmp_path, monkeypatc
     archive_path = tmp_path / "sample.zip"
     _write_zip(archive_path)
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3407,11 +3387,11 @@ def test_watch_scheduler_retains_slow_interval_learning_across_active_epochs(tmp
     archive_path.write_bytes(b"first")
     os.utime(archive_path, (clock.value, clock.value))
     watcher = WatchScheduler(
-        {"watch": {
+        make_config({"watch": {
             "clipboard_monitor_enabled": False,
             "cold_start_seconds": 1.0,
             "quiet_min_seconds": 1.25,
-        }},
+        }}),
         [str(tmp_path)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),
@@ -3441,7 +3421,7 @@ def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):
 
         def run_targets(self, paths):
             attempts.append(list(paths))
-            return FakeSummary()
+            return RunSummary(target_results=(TargetRunResult(paths[0], OutcomeKind.COMPLETE_SUCCESS),))
 
     watch_root = tmp_path / "in"
     watch_root.mkdir()
@@ -3449,7 +3429,7 @@ def test_modified_event_retries_same_metadata_identity(tmp_path, monkeypatch):
     archive_path.write_bytes(b"A" * (256 * 1024))
     original_mtime = archive_path.stat().st_mtime
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False}},
+        make_config({"watch": {"clipboard_monitor_enabled": False}}),
         [str(watch_root)],
         out_dir=str(tmp_path / "out"),
         state_path=str(tmp_path / "state.json"),

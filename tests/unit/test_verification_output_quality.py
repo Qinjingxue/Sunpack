@@ -1,17 +1,25 @@
-from types import SimpleNamespace
-
 import pytest
 
-from sunpack.pipeline.verification.output_quality import compute_output_quality
-from sunpack.pipeline.verification.pipeline import _decision_hint
+from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.core.contracts.verification import (
     ASSESSMENT_COMPLETE,
+    CONTENT_INTEGRITY_UNKNOWN,
     DECISION_ACCEPT,
     DECISION_ACCEPT_PARTIAL,
-    CONTENT_INTEGRITY_UNKNOWN,
     ArchiveCoverage,
     FileVerificationObservation,
 )
+from sunpack.pipeline.verification.evidence import build_verification_evidence
+from sunpack.pipeline.verification.output_quality import compute_output_quality
+from sunpack.pipeline.verification.pipeline import _decision_hint
+from tests.helpers.archive_tasks import make_archive_task
+
+
+def _evidence(output_dir):
+    task = make_archive_task(output_dir / "source.zip")
+    return build_verification_evidence(
+        task, ExtractionResult(success=True, out_dir=str(output_dir)),
+    )
 
 
 def test_output_quality_complete_manifest_like_observations(tmp_path):
@@ -22,7 +30,7 @@ def test_output_quality_complete_manifest_like_observations(tmp_path):
         FileVerificationObservation(path="b.txt", state="complete", bytes_written=4, expected_size=4),
     ]
 
-    quality = compute_output_quality(SimpleNamespace(output_dir=str(tmp_path)), observations)
+    quality = compute_output_quality(_evidence(tmp_path), observations)
 
     assert quality.file_count == 2
     assert quality.total_bytes == 9
@@ -34,7 +42,7 @@ def test_output_quality_complete_manifest_like_observations(tmp_path):
 
 
 def test_output_quality_empty_output_dir_is_zero(tmp_path):
-    quality = compute_output_quality(SimpleNamespace(output_dir=str(tmp_path)), [])
+    quality = compute_output_quality(_evidence(tmp_path), [])
 
     assert quality.file_count == 0
     assert quality.total_bytes == 0
@@ -55,7 +63,7 @@ def test_output_quality_uses_archive_coverage_when_observations_missing(tmp_path
     )
 
     quality = compute_output_quality(
-        SimpleNamespace(output_dir=str(tmp_path)),
+        _evidence(tmp_path),
         [],
         archive_coverage=coverage,
     )
@@ -72,7 +80,7 @@ def test_output_quality_keeps_value_for_large_failed_output(tmp_path):
         FileVerificationObservation(path="song.mp3", state="failed", bytes_written=4096, expected_size=4096)
     ]
 
-    quality = compute_output_quality(SimpleNamespace(output_dir=str(tmp_path)), observations)
+    quality = compute_output_quality(_evidence(tmp_path), observations)
 
     assert quality.score > 0.6
     assert quality.failed_ratio == pytest.approx(1.0)

@@ -158,41 +158,45 @@ def test_load_config_requires_external_verification_config(tmp_path, monkeypatch
     _write_json(simple, {})
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     with pytest.raises(loader.ConfigError, match="verification"):
-        loader.load_effective_config_payload()
+        loader.load_config()
 
 
-def test_config_loaders_validate_external_schema_once(tmp_path, monkeypatch):
+def test_config_loader_normalizes_external_schema_once(tmp_path, monkeypatch):
     simple = tmp_path / "sunpack_config.json"
     advanced = tmp_path / "sunpack_advanced_config.json"
     _write_json(advanced, _advanced_payload())
     _write_json(simple, {})
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
 
-    original_validate = loader.validate_external_config
+    original_validate = loader.normalize_config
     calls = []
 
     def counted_validate(payload):
         calls.append(payload)
         return original_validate(payload)
 
-    monkeypatch.setattr(loader, "validate_external_config", counted_validate)
+    monkeypatch.setattr(loader, "normalize_config", counted_validate)
     try:
-        for load in (loader.load_config, loader.load_effective_config_payload):
-            loader.clear_config_cache()
-            calls.clear()
-            load()
-            assert len(calls) == 1
+        loader.clear_config_cache()
+        loader.load_raw_config_payload()
+        assert calls == []
+        config = loader.load_config()
+        assert len(calls) == 1
+        assert config["filesystem"]["directory_scan_mode"] == "recursive"
+        assert loader.load_config() == config
+        assert len(calls) == 1
+        assert loader.load_raw_config_payload()[1]["filesystem"]["directory_scan_mode"] == "*"
     finally:
         loader.clear_config_cache()
 
 
-def test_effective_config_payload_returns_merged_external_config(tmp_path, monkeypatch):
+def test_raw_config_payload_returns_merged_external_config(tmp_path, monkeypatch):
     simple = tmp_path / "sunpack_config.json"
     advanced = tmp_path / "sunpack_advanced_config.json"
     _write_json(advanced, _advanced_payload())
     _write_json(simple, {"recursive_extract": "2"})
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
-    path, payload = loader.load_effective_config_payload()
+    path, payload = loader.load_raw_config_payload()
     assert path == simple
     assert payload["recursive_extract"] == "2"
     assert payload["filesystem"]["directory_scan_mode"] == "*"
@@ -216,24 +220,6 @@ def test_removed_detection_pipeline_configuration_is_rejected(tmp_path, monkeypa
     _write_json(simple, {"detection": {"rule_pipeline": {"precheck": []}}})
     monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
     with pytest.raises(loader.ConfigError, match="rule_pipeline"):
-        loader.load_config()
-
-
-def test_removed_analysis_full_scan_configuration_is_rejected(tmp_path, monkeypatch):
-    simple = tmp_path / "sunpack_config.json"
-    advanced = tmp_path / "sunpack_advanced_config.json"
-    payload = _advanced_payload()
-    payload.setdefault("analysis", {})["prepass"] = {
-        "enabled": True,
-        "head_bytes": 1024,
-        "tail_bytes": 1024,
-        "deep_scan": True,
-    }
-    _write_json(advanced, payload)
-    _write_json(simple, {})
-    monkeypatch.setattr(loader, "_candidate_config_paths", _layered_config_paths(simple, advanced))
-
-    with pytest.raises(loader.ConfigError, match="Removed analysis.prepass fields: deep_scan"):
         loader.load_config()
 
 

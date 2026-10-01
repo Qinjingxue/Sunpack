@@ -2,13 +2,14 @@ import json
 import zipfile
 
 import pytest
-
 from sunpack_native import complete_progress_manifest
-from tests.helpers.archive_tasks import make_archive_task
+
+import sunpack.pipeline.verification.archive_input_manifest as archive_input_manifest_module
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.pipeline.verification import VerificationScheduler
-import sunpack.pipeline.verification.archive_input_manifest as archive_input_manifest_module
+from tests.helpers.archive_tasks import make_archive_task
+from tests.helpers.config_factory import make_config
 
 
 @pytest.mark.parametrize(
@@ -101,7 +102,7 @@ def test_manifest_size_match_reports_retry_for_large_manifest_gap(tmp_path):
     }
 
 
-def test_expected_name_presence_reports_missing_entries(tmp_path):
+def test_manifest_size_match_reports_missing_entries(tmp_path):
     task = _zip_task(tmp_path, {"expected.txt": "one", "missing.bin": "two"})
     out_dir = tmp_path / "out"
     out_dir.mkdir()
@@ -109,22 +110,12 @@ def test_expected_name_presence_reports_missing_entries(tmp_path):
     result = ExtractionResult(success=True, out_dir=str(out_dir))
 
     verification_result = _scheduler(
-        [{"name": "expected_name_presence"}]
+        [{"name": "manifest_size_match"}]
     ).verify(task, result)
 
     assert verification_result.decision_hint == "retry_extract"
     assert verification_result.missing_files == 2
-    assert verification_result.issues[0].code == "fail.expected_names_all_missing"
-
-
-def test_expected_name_presence_skips_without_manifest_names(tmp_path):
-    out_dir = tmp_path / "out"
-    out_dir.mkdir()
-    (out_dir / "actual.txt").write_text("hello", encoding="utf-8")
-    task = _task(tmp_path)
-    result = ExtractionResult(success=True, out_dir=str(out_dir))
-
-    _scheduler([{"name": "expected_name_presence"}]).verify(task, result)
+    assert verification_result.issues[0].code == "fail.manifest_named_files_missing"
 
 
 def test_archive_test_crc_compares_archive_state_manifest_to_output_files(tmp_path):
@@ -184,7 +175,6 @@ def test_zip_verification_methods_share_one_full_archive_manifest(tmp_path, monk
 
     monkeypatch.setattr(OutputInventory, "file_page", reject_materialization)
     verification = _scheduler([
-        {"name": "expected_name_presence", "max_expected_names": 1},
         {"name": "manifest_size_match", "max_expected_names": 2},
         {"name": "archive_test_crc", "max_items": 3},
     ]).verify(task, result)
@@ -266,12 +256,12 @@ def _task(tmp_path):
 
 
 def _scheduler(methods):
-    return VerificationScheduler({
+    return VerificationScheduler(make_config({
         "verification": {
             "enabled": True,
             "methods": methods,
         }
-    })
+    }))
 
 
 def _zip_task(tmp_path, entries):

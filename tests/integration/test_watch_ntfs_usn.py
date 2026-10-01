@@ -11,6 +11,7 @@ import sunpack_native
 
 from sunpack.runtime.watch.scheduler import WatchScheduler
 from sunpack.runtime.watch.scanner import _candidate_for
+from tests.helpers.config_factory import make_config
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 
@@ -31,13 +32,13 @@ def _watch_broker_lease():
 
 def _watcher(root: Path, *, cold_start_seconds: float = 0.05) -> WatchScheduler:
     return WatchScheduler(
-        {
+        make_config({
             "watch": {
                 "clipboard_monitor_enabled": False,
                 "quiet_min_seconds": 0.05,
                 "quiet_max_seconds": 0.25,
             }
-        },
+        }),
         [str(root)],
         out_dir=str(root / "out"),
         state_path=str(root / ".watch-state" / "state.json"),

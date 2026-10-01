@@ -1,5 +1,5 @@
-import io
 import asyncio
+import io
 import os
 import secrets
 import socket
@@ -7,8 +7,8 @@ import struct
 import threading
 import time
 
-from sunpack.runtime.cli import persistent_process
 from sunpack.core.support import runtime_identity
+from sunpack.runtime.cli import persistent_process
 
 
 def _enable_test_runtime_identity(monkeypatch):
@@ -100,8 +100,7 @@ def test_submit_request_does_not_claim_unverified_terminal_updates(tmp_path, mon
 
 
 def test_extract_is_submitted_to_persistent_server_by_default(monkeypatch):
-    from sunpack.runtime.cli import cli
-    from sunpack.runtime.cli import runtime_state
+    from sunpack.runtime.cli import cli, runtime_state
 
     _enable_test_runtime_identity(monkeypatch)
     submitted = []
@@ -113,8 +112,7 @@ def test_extract_is_submitted_to_persistent_server_by_default(monkeypatch):
 
 
 def test_all_short_commands_are_submitted_to_persistent_server(monkeypatch):
-    from sunpack.runtime.cli import cli
-    from sunpack.runtime.cli import runtime_state
+    from sunpack.runtime.cli import cli, runtime_state
 
     _enable_test_runtime_identity(monkeypatch)
     submitted = []
@@ -618,7 +616,7 @@ def test_persistent_config_snapshot_reuses_a_source_without_mtime_checks(tmp_pat
     monkeypatch.setattr(persistent_runtime, "config_source_key", lambda cwd=None: sources[str(cwd)])
     monkeypatch.setattr(
         persistent_runtime,
-        "load_effective_config_payload",
+        "load_raw_config_payload",
         lambda cwd=None: (tmp_path / f"{cwd}.json", {"cli": {"language": str(cwd)}}),
     )
 

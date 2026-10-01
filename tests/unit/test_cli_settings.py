@@ -19,7 +19,7 @@ def test_cli_language_load_uses_raw_payload_without_full_validation(tmp_path, mo
     monkeypatch.setattr(loader, "_candidate_config_paths", candidate_paths)
     monkeypatch.setattr(
         loader,
-        "_validate_pipeline",
+        "normalize_config",
         lambda _payload: (_ for _ in ()).throw(AssertionError("language bootstrap must not validate the full config")),
     )
     loader.clear_config_cache()

@@ -1,8 +1,13 @@
 import zipfile
 
 from sunpack.core.config.schema import normalize_config
-from tests.helpers.archive_tasks import make_archive_task
 from sunpack.core.contracts.extraction import ExtractionResult
+from sunpack.core.contracts.verification import (
+    CONTAINER_INTEGRITY_NONCANONICAL,
+    CONTENT_INTEGRITY_VERIFIED_COMPLETE,
+    VERIFICATION_STRENGTH_CRC,
+    VerificationIssue,
+)
 from sunpack.core.passwords import PasswordSession
 from sunpack.pipeline.verification import (
     FileVerificationObservation,
@@ -10,13 +15,8 @@ from sunpack.pipeline.verification import (
     VerificationStep,
     register_verification_method,
 )
-from sunpack.core.contracts.verification import VerificationIssue
-from sunpack.core.contracts.verification import (
-    CONTAINER_INTEGRITY_NONCANONICAL,
-    CONTENT_INTEGRITY_VERIFIED_COMPLETE,
-    VERIFICATION_STRENGTH_CRC,
-)
-
+from tests.helpers.archive_tasks import make_archive_task
+from tests.helpers.config_factory import make_config
 
 CALLS = []
 
@@ -118,12 +118,12 @@ class UnitVerifiedCarrierMethod:
 def test_verification_scheduler_disabled_returns_disabled_assessment(tmp_path):
     CALLS.clear()
     task, result = _task_and_result(tmp_path)
-    scheduler = VerificationScheduler({
+    scheduler = VerificationScheduler(make_config({
         "verification": {
             "enabled": False,
             "methods": [{"name": "unit_complete_observation", "enabled": True}],
         }
-    })
+    }))
 
     verification = scheduler.verify(task, result)
 
@@ -143,12 +143,12 @@ def test_verification_scheduler_disabled_routes_failed_extraction_to_failure(tmp
 
         error="fatal archive damage",
     )
-    scheduler = VerificationScheduler({
+    scheduler = VerificationScheduler(make_config({
         "verification": {
             "enabled": False,
             "methods": [{"name": "unit_complete_observation", "enabled": True}],
         }
-    })
+    }))
 
     verification = scheduler.verify(task, result)
 
@@ -161,7 +161,7 @@ def test_verification_scheduler_disabled_routes_failed_extraction_to_failure(tmp
 def test_verification_pipeline_aggregates_completeness_and_decision(tmp_path):
     CALLS.clear()
     task, result = _task_and_result(tmp_path)
-    scheduler = VerificationScheduler({
+    scheduler = VerificationScheduler(make_config({
         "verification": {
             "enabled": True,
             "methods": [
@@ -169,7 +169,7 @@ def test_verification_pipeline_aggregates_completeness_and_decision(tmp_path):
                 {"name": "unit_missing_observation", "enabled": True},
             ],
         }
-    })
+    }))
 
     verification = scheduler.verify(task, result)
 
@@ -183,14 +183,14 @@ def test_verification_pipeline_aggregates_completeness_and_decision(tmp_path):
 
 def test_complete_assessment_accepts_despite_warning_hint(tmp_path):
     task, result = _task_and_result(tmp_path)
-    scheduler = VerificationScheduler({
+    scheduler = VerificationScheduler(make_config({
         "verification": {
             "enabled": True,
             "methods": [
                 {"name": "unit_warning_complete", "enabled": True},
             ],
         }
-    })
+    }))
 
     verification = scheduler.verify(task, result)
 
@@ -201,12 +201,12 @@ def test_complete_assessment_accepts_despite_warning_hint(tmp_path):
 
 def test_noncanonical_container_does_not_downgrade_verified_content(tmp_path):
     task, result = _task_and_result(tmp_path)
-    scheduler = VerificationScheduler({
+    scheduler = VerificationScheduler(make_config({
         "verification": {
             "enabled": True,
             "methods": [{"name": "unit_verified_carrier", "enabled": True}],
         }
-    })
+    }))
 
     verification = scheduler.verify(task, result)
 
@@ -224,14 +224,14 @@ def test_verification_evidence_uses_password_session_when_result_has_no_password
     task, result = _task_and_result(tmp_path)
     session = PasswordSession()
     session.set_resolved("sample-key", "secret")
-    scheduler = VerificationScheduler({
+    scheduler = VerificationScheduler(make_config({
         "verification": {
             "enabled": True,
             "methods": [
                 {"name": "unit_password_assessment", "enabled": True, "expected_password": "secret"},
             ],
         }
-    }, password_session=session)
+    }), password_session=session)
 
     verification = scheduler.verify(task, result)
 
@@ -244,14 +244,14 @@ def test_verification_evidence_uses_archive_password_fact_when_session_has_none(
     knowledge = task.knowledge()
     knowledge.set("archive.password", "secret", source_layer="test", source_module="fixture")
     task.set_knowledge(knowledge)
-    scheduler = VerificationScheduler({
+    scheduler = VerificationScheduler(make_config({
         "verification": {
             "enabled": True,
             "methods": [
                 {"name": "unit_password_assessment", "enabled": True, "expected_password": "secret"},
             ],
         }
-    })
+    }))
 
     verification = scheduler.verify(task, result)
 

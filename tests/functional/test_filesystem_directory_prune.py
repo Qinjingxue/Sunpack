@@ -1,8 +1,10 @@
 from pathlib import Path
 
+from sunpack_native import profile_directory_scan
+
 from sunpack.core.contracts.filesystem import FileEntry
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
-from sunpack_native import profile_directory_scan
+from tests.helpers.config_factory import make_config
 
 
 def _entries(snapshot):
@@ -13,9 +15,9 @@ def _entries(snapshot):
 
 
 def _config(*, prune_dir_globs=None, path_globs=None):
-    return {
+    return make_config({
         "filesystem": {
-            "directory_scan_mode": "recursive",
+            "directory_scan_mode": "*",
             "scan_filters": [
                 {
                     "name": "directory_prune",
@@ -25,7 +27,7 @@ def _config(*, prune_dir_globs=None, path_globs=None):
                 }
             ],
         }
-    }
+    })
 
 
 def test_directory_prune_exact_name_stops_descending(tmp_path):

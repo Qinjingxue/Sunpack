@@ -14,5 +14,6 @@ def with_detection_pipeline(
         filesystem = dict(result.get("filesystem") or {})
         filesystem["scan_filters"] = scan_filters
         result["filesystem"] = filesystem
+    result.setdefault("filesystem", {}).setdefault("scan_filters", [])
     result["detection"] = {"enabled": True}
     return result

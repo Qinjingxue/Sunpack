@@ -5,7 +5,6 @@ from dataclasses import replace
 from types import SimpleNamespace
 
 from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineResponse
-from sunpack.core.contracts.results import RunSummary
 
 
 class FakePipelineEngine:
@@ -68,10 +67,7 @@ class FakePipelineEngine:
         config.setdefault("builtin_passwords", list(self.builtin_passwords))
         runner = self.runner_factory(config)
         summary = runner.run_targets(paths)
-        if isinstance(summary, RunSummary):
-            summary = replace(summary, cleanup_results=())
-        else:
-            summary.cleanup_results = []
+        summary = replace(summary, cleanup_results=())
         self._recent_passwords = list(getattr(runner, "recent_passwords", ()) or ())
         context = getattr(runner, "context", SimpleNamespace(generated_outputs=()))
         recovered_outputs = getattr(summary, "recovered_outputs", ()) or ()

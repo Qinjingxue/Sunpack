@@ -1,16 +1,23 @@
 import pytest
 
-from sunpack.core.contracts.failures import FailureInfo, FailureKind
 from sunpack.core.contracts.extraction import ExtractionResult
-from tests.helpers.archive_tasks import make_archive_task
+from sunpack.core.contracts.failures import FailureInfo, FailureKind
+from sunpack.core.contracts.verification import (
+    CONTENT_INTEGRITY_UNKNOWN,
+    DECISION_REQUEST_PASSWORD,
+)
 from sunpack.core.passwords.candidates import PasswordCandidatePipeline
 from sunpack.core.passwords.job import PasswordJob
 from sunpack.core.passwords.scheduler import PasswordScheduler, PasswordSearchStatus
 from sunpack.core.passwords.verifier import PasswordBatchVerification
-from sunpack.core.passwords.verifier.base import VERIFIER_STATUSES, normalize_verifier_status
+from sunpack.core.passwords.verifier.base import (
+    VERIFIER_STATUSES,
+    normalize_verifier_status,
+)
 from sunpack.core.passwords.verifier.zip_fast import ZipFastVerifier
 from sunpack.pipeline.verification import VerificationScheduler
-from sunpack.core.contracts.verification import DECISION_REQUEST_PASSWORD, CONTENT_INTEGRITY_UNKNOWN
+from tests.helpers.archive_tasks import make_archive_task
+from tests.helpers.config_factory import make_config
 
 
 @pytest.mark.parametrize("status", sorted(VERIFIER_STATUSES))
@@ -132,12 +139,12 @@ def test_password_failure_bypasses_verification(tmp_path):
         failure=failure,
     )
 
-    verification = VerificationScheduler({
+    verification = VerificationScheduler(make_config({
         "verification": {
             "enabled": True,
             "methods": [{"name": "extraction_exit_signal"}],
         }
-    }).verify(_task(archive), result)
+    })).verify(_task(archive), result)
 
     assert verification.decision_hint == DECISION_REQUEST_PASSWORD
     assert verification.content_integrity == CONTENT_INTEGRITY_UNKNOWN

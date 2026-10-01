@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import re
 import asyncio
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -11,19 +11,21 @@ import pytest
 from sunpack.core.config.loader import load_config
 from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.filesystem import DirectorySnapshot, FileEntry
-from sunpack.pipeline.coordinator.engine import PipelineEngine
-from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
-from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
-from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
-from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
-from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.core.passwords.directory_context import DirectoryPasswordContextStore
+from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
+from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.discovery.detection.input_planning import (
+    ArchiveInputPlanningStage,
+)
+from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.pipeline.discovery.relations import RelationsScheduler
 from sunpack.pipeline.discovery.relations.resolver import RelationResolver
+from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
+from tests.helpers.config_factory import make_config
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.real_archives import ArchiveFixtureFactory
 from tests.helpers.tool_config import get_optional_winrar, get_test_tools
-
 
 MIB = 1024 * 1024
 
@@ -204,7 +206,7 @@ def test_real_strict_middle_gap_is_not_emitted_as_a_relation_group(tmp_path):
     parts[1].unlink()
 
     groups = RelationsScheduler().build_candidate_groups(
-        DirectoryScanner(str(case.archive_dir)).scan()
+        DirectoryScanner(str(case.archive_dir), config=make_config()).scan()
     )
     # No relation may form across the gap, but no remaining volume may be
     # silently dropped from discovery either.

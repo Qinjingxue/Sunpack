@@ -1,17 +1,20 @@
 from pathlib import Path
 
-from sunpack.pipeline.coordinator.output_scan_policy import NestedOutputScanPolicy as OutputScanPolicy
+from sunpack.pipeline.coordinator.output_scan_policy import (
+    NestedOutputScanPolicy as OutputScanPolicy,
+)
 from sunpack.pipeline.coordinator.scanner import ScanOrchestrator
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+from tests.helpers.config_factory import make_config
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.helpers.fs_builder import make_zip
 
 
 def scan_config(blocked_files=None, blocked_extensions=None):
-    return with_detection_pipeline({
+    return make_config(with_detection_pipeline({
         "thresholds": {"archive_score_threshold": 5, "maybe_archive_threshold": 3},
         "filesystem": {
-            "directory_scan_mode": "recursive",
+            "directory_scan_mode": "*",
         },
     }, precheck=[
         {"name": "size_range", "enabled": True, "gte": 0},
@@ -23,7 +26,7 @@ def scan_config(blocked_files=None, blocked_extensions=None):
         },
         {"name": "embedded_payload_identity", "enabled": True},
         {"name": "zip_structure_accept", "enabled": True},
-    ])
+    ]))
 
 
 def decisions_for(root: Path, config: dict):

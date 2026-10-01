@@ -2,9 +2,11 @@ import io
 import tarfile
 
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
 from sunpack.pipeline.extraction.output_inventory import collect_output_inventory
-from sunpack.pipeline.verification.methods._archive_output_match import coverage_from_native_inventory
+from sunpack.pipeline.verification.archive_input_manifest import archive_input_manifest
+from sunpack.pipeline.verification.methods._archive_output_match import (
+    coverage_from_native_inventory,
+)
 
 
 def _input(path):
@@ -139,12 +141,13 @@ def test_tar_manifest_applies_gnu_longname_and_skips_longlink_payload(tmp_path):
 
 
 def test_truncated_manifest_view_keeps_full_unpacked_size(tmp_path):
-    from types import SimpleNamespace
-
+    from sunpack.core.contracts.extraction import ExtractionResult
     from sunpack.pipeline.verification.archive_input_manifest import (
         archive_input_manifest_for_evidence,
         configure_archive_input_manifest_cache,
     )
+    from sunpack.pipeline.verification.evidence import build_verification_evidence
+    from tests.helpers.archive_tasks import make_task_from_descriptor
 
     path = tmp_path / "large.tar"
     with tarfile.open(path, "w", format=tarfile.USTAR_FORMAT) as archive:
@@ -152,13 +155,9 @@ def test_truncated_manifest_view_keeps_full_unpacked_size(tmp_path):
             info = tarfile.TarInfo(f"item-{index:03d}.bin")
             info.size = 3
             archive.addfile(info, io.BytesIO(b"abc"))
-    evidence = SimpleNamespace(
-        archive_input=_input(path),
-        selected_codepage="",
-        password=None,
-        worker_result={},
-        extraction_result=None,
-        output_dir=str(tmp_path / "out"),
+    evidence = build_verification_evidence(
+        make_task_from_descriptor(_input(path)),
+        ExtractionResult(success=True, out_dir=str(tmp_path / "out")),
     )
     configure_archive_input_manifest_cache(evidence, max_items=1000)
 

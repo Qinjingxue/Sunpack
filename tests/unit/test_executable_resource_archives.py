@@ -1,9 +1,9 @@
 from __future__ import annotations
 
-from io import BytesIO
-from pathlib import Path
 import os
 import zipfile
+from io import BytesIO
+from pathlib import Path
 
 import pytest
 
@@ -11,6 +11,7 @@ from sunpack.pipeline.coordinator.recursive_authorization import RecursiveAuthor
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
+from tests.helpers.config_factory import make_config
 from tests.helpers.fs_builder import make_minimal_7z
 
 
@@ -70,7 +71,7 @@ _EXECUTABLE_RESOURCE_CASES = [
 
 
 def _config() -> dict:
-    return {
+    return make_config({
         "embedded_scan": {"enabled": True, "recursive_candidate_ratio": 0.3},
         "recursive_authorization": {
             "enabled": True,
@@ -86,7 +87,7 @@ def _config() -> dict:
                 {"name": "size_range", "enabled": True, "gte": 0},
             ],
         },
-    }
+    })
 
 
 def _make_game_tree(

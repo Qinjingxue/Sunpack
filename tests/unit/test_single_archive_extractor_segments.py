@@ -1,19 +1,27 @@
 from types import SimpleNamespace
 
-from sunpack.core.support.archive_input_projection import write_source_extractable_segments
+from sunpack_native import worker_manifest_from_rows
+
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
-from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
-from sunpack.pipeline.extraction.internal.sevenzip.metadata import ArchiveMetadataScanner
-from sunpack.pipeline.verification.scheduler import VerificationScheduler
 from sunpack.core.contracts.verification import (
     ASSESSMENT_COMPLETE,
-    CONTENT_INTEGRITY_VERIFIED_COMPLETE,
     CONTAINER_INTEGRITY_UNKNOWN,
+    CONTENT_INTEGRITY_VERIFIED_COMPLETE,
     DECISION_ACCEPT,
 )
-from sunpack_native import worker_manifest_from_rows
+from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
+from sunpack.core.support.archive_input_projection import (
+    write_source_extractable_segments,
+)
+from sunpack.pipeline.extraction.internal.sevenzip.metadata import (
+    ArchiveMetadataScanner,
+)
+from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import (
+    SingleArchiveExtractor,
+)
+from sunpack.pipeline.verification.scheduler import VerificationScheduler
 from tests.helpers.archive_tasks import make_archive_task
+from tests.helpers.config_factory import make_config
 
 
 class _FakePasswordStore:
@@ -315,12 +323,12 @@ def test_verifier_accepts_carrier_when_every_embedded_payload_is_complete(tmp_pa
     )
 
     extraction = extractor.extract(task, str(tmp_path / "out"))
-    verification = VerificationScheduler({
+    verification = VerificationScheduler(make_config({
         "verification": {
             "enabled": True,
             "methods": [{"name": "archive_test_crc"}],
         },
-    }).verify(task, extraction)
+    })).verify(task, extraction)
 
     assert verification.decision_hint == DECISION_ACCEPT
     assert verification.assessment_status == ASSESSMENT_COMPLETE

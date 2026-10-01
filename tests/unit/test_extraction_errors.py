@@ -3,11 +3,18 @@ import subprocess
 
 import pytest
 
-from sunpack.pipeline.extraction.internal.workflow.errors import classify_extract_failure
 from sunpack.core.contracts.failures import FailureKind
-from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
-from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import SingleArchiveExtractor
 from sunpack.core.i18n import I18nContext
+from sunpack.core.passwords.result import PasswordResolution, PasswordResolutionStatus
+from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
+    attach_worker_diagnostics,
+)
+from sunpack.pipeline.extraction.internal.workflow.errors import (
+    classify_extract_failure,
+)
+from sunpack.pipeline.extraction.internal.workflow.single_archive_extractor import (
+    SingleArchiveExtractor,
+)
 
 
 def test_split_worker_damage_takes_precedence_over_wrong_password_signal():
@@ -366,9 +373,9 @@ def test_explicit_backend_missing_volume_line_remains_missing_volume():
 
 def _worker_completed(payload: dict) -> subprocess.CompletedProcess:
     event = {"type": "result", **payload}
-    return subprocess.CompletedProcess(
+    return attach_worker_diagnostics(subprocess.CompletedProcess(
         args=["sevenzip_worker"],
         returncode=1,
         stdout=json.dumps(event),
         stderr="",
-    )
+    ))

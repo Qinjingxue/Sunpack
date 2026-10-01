@@ -3,11 +3,16 @@ import os
 
 import sunpack.runtime.watch.scheduler as scheduler_module
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
-from sunpack.core.contracts.pipeline import PipelineArtifacts, PipelineDiscovery, PipelineResponse
+from sunpack.core.contracts.pipeline import (
+    PipelineArtifacts,
+    PipelineDiscovery,
+    PipelineResponse,
+)
 from sunpack.core.contracts.results import OutcomeKind, RunSummary, TargetRunResult
+from sunpack.runtime.watch.roots import WatchRootEntry
 from sunpack.runtime.watch.scanner import WatchCandidate
 from sunpack.runtime.watch.scheduler import WatchScheduler, _ActivePipelineRequest
-from sunpack.runtime.watch.roots import WatchRootEntry
+from tests.helpers.config_factory import make_config
 from tests.helpers.fake_pipeline_engine import FakePipelineEngine
 
 
@@ -55,7 +60,7 @@ def _watcher(tmp_path, monkeypatch, *, deep_detect=False):
     monkeypatch.setattr(scheduler_module, "validate_ntfs_watch_roots", lambda _roots: None)
     sink = _Sink()
     watcher = WatchScheduler(
-        {"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}},
+        make_config({"watch": {"clipboard_monitor_enabled": False, "password_retry_debounce_seconds": 0}}),
         [str(root)],
         output_roots={str(root): str(output)},
         root_entries=[WatchRootEntry(str(root), str(output), deep_detect)],
@@ -205,7 +210,7 @@ def test_shared_output_password_retry_keeps_original_input_detection_mode(tmp_pa
             await request.task
         assert [item["detection_options"].force_scan for item in captured] == [True, False]
         assert captured[0]["request_config"]["filesystem"]["scan_filters_enabled"] is False
-        assert "filesystem" not in watcher.config
+        assert watcher.config["filesystem"]["scan_filters_enabled"] is True
 
     asyncio.run(scenario())
 

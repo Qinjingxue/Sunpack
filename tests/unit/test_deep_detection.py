@@ -9,6 +9,7 @@ from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.discovery.embedded.discovery import EmbeddedDiscovery
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
+from tests.helpers.config_factory import make_config
 
 
 @pytest.mark.parametrize("rule", [
@@ -19,12 +20,12 @@ from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 ])
 @pytest.mark.parametrize("recursive", [False, True])
 def test_deep_discovery_disables_each_filesystem_filter(tmp_path, rule, recursive):
-    from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
     from sunpack.core.contracts.run_state import RunState
+    from sunpack.pipeline.coordinator.task_scan import ArchiveTaskScanner
 
     carrier = tmp_path / "carrier.bin"
     carrier.write_bytes(b"leading junk" + gzip.compress(b"payload") + b"trailing junk")
-    config = {"filesystem": {"scan_filters_enabled": True, "scan_filters": [rule]}}
+    config = make_config({"filesystem": {"scan_filters_enabled": True, "scan_filters": [rule]}})
     ordinary = ArchiveTaskScanner(config, RunState())
     deep = ArchiveTaskScanner(config, RunState(), EmbeddedOptions(force_scan=True))
 
@@ -52,7 +53,7 @@ def test_one_engine_keeps_watch_and_cli_detection_modes_per_request(tmp_path, mo
     monkeypatch.setattr(engine_module, "_PipelineServices", Services)
 
     async def scenario():
-        config = {"filesystem": {"scan_filters_enabled": True}}
+        config = make_config({"filesystem": {"scan_filters_enabled": True}})
         observed = []
         both_started = asyncio.Event()
 

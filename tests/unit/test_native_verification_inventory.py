@@ -2,11 +2,14 @@ import subprocess
 import zlib
 from concurrent.futures import ThreadPoolExecutor
 
+from sunpack_native import output_inventory_from_serialized
+
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 
 
 def test_native_manifest_and_inventory_can_be_shared_across_concurrent_matches(tmp_path):
     from sunpack_native import archive_state_zip_manifest_native
+
     from tests.helpers.tool_config import require_7z
 
     source = tmp_path / "source"
@@ -45,23 +48,11 @@ def test_native_manifest_and_inventory_can_be_shared_across_concurrent_matches(t
 
 
 def _inventory(root, files, *, worker_crc_available=False, worker_inventory_complete=False, identity_paths=False):
-    return OutputInventory.from_dict({
-        "version": 1,
-        "root": str(root),
-        "stats": {
-            "exists": True,
-            "is_dir": True,
-            "file_count": len(files),
-            "dir_count": 0,
-            "total_size": sum(int(item.get("bytes_written", item.get("size", 0)) or 0) for item in files),
-            "transient_file_count": 0,
-            "unreadable_count": 0,
-        },
-        "files": files,
-        "worker_crc_available": worker_crc_available,
-        "worker_inventory_complete": worker_inventory_complete,
-        "identity_paths": identity_paths,
-    })
+    return OutputInventory.from_native(output_inventory_from_serialized(
+        str(root), files, True, True, len(files), 0,
+        sum(int(item.get("bytes_written", item.get("size", 0)) or 0) for item in files),
+        0, worker_crc_available, worker_inventory_complete, identity_paths,
+    ))
 
 
 def test_native_inventory_details_are_paged_without_full_materialization(tmp_path):

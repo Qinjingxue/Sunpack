@@ -1,11 +1,12 @@
 import zipfile
 
-from tests.helpers.archive_tasks import make_archive_task
 from sunpack.core.contracts.extraction import ExtractionResult
 from sunpack.pipeline.verification import VerificationScheduler
+from tests.helpers.archive_tasks import make_archive_task
+from tests.helpers.config_factory import make_config
 
 
-def test_expected_name_matching_is_case_and_path_normalized(tmp_path):
+def test_manifest_matching_is_case_and_path_normalized(tmp_path):
     archive = tmp_path / "sample.zip"
     with zipfile.ZipFile(archive, "w") as zf:
         zf.writestr("docs/readme.txt", "hello")
@@ -16,12 +17,12 @@ def test_expected_name_matching_is_case_and_path_normalized(tmp_path):
     task = make_archive_task(archive, key="sample", format_hint="zip")
     result = ExtractionResult(success=True, out_dir=str(out_dir))
 
-    verification = VerificationScheduler({
+    verification = VerificationScheduler(make_config({
         "verification": {
             "enabled": True,
-            "methods": [{"name": "expected_name_presence"}],
+            "methods": [{"name": "manifest_size_match"}],
         }
-    }).verify(task, result)
+    })).verify(task, result)
 
     assert verification.decision_hint == "accept"
     assert verification.assessment_status == "complete"
