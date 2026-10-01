@@ -12,6 +12,8 @@ from concurrent.futures import Future
 from contextlib import nullcontext
 from typing import Any, Callable
 
+from sunpack_native import NativeWorkerResultAccumulator, parse_worker_transport_event
+
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.tasks import ArchiveTask
 from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
@@ -23,6 +25,7 @@ from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
 from sunpack.core.support.runtime_cwd import runtime_working_directory
 
 _LOGGER = logging.getLogger(__name__)
+_WORKER_STREAM_LIMIT = 4 * 1024 * 1024
 
 
 def _is_job_finished(payload: Any) -> bool:
@@ -316,6 +319,7 @@ class _NativeWorkerProcess:
             "cancel_requested": False,
             "cancel_deadline": 0.0,
             "completion_lock": threading.Lock(),
+            "accumulator": NativeWorkerResultAccumulator(job_id),
             "worker_epoch": self.worker_epoch,
             "no_progress_timeout": max(
                 0.0,
@@ -362,22 +366,25 @@ class _NativeWorkerProcess:
             return any(other != job_id for other in self._async_jobs)
 
     def _dispatch_stdout(self, stream) -> None:
+        failure = "sevenzip_worker exited before job completion"
         try:
             for line in stream:
-                payload = parse_worker_json_line(line)
+                payload = parse_worker_transport_event(line)
                 job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
                 try:
                     self._dispatch_line(line, payload, job_id)
                 finally:
                     if job_id and _is_job_finished(payload):
                         self.queue_capacity.release(job_id)
-        except Exception:
-            pass
+        except Exception as exc:
+            failure = f"sevenzip_worker transport/protocol failed: {exc}"
         finally:
+            # A broken stream does not prove that native IO has stopped.
+            self.close()
             with self._dispatch_lock:
                 async_jobs = list(self._async_jobs.items())
             for job_id, state in async_jobs:
-                self._fail_async_job(job_id, state, "sevenzip_worker exited before job completion")
+                self._fail_async_job(job_id, state, str(state.get("timeout_message") or failure))
             self.queue_capacity.flush()
             self._deadline_changed.set()
 
@@ -396,26 +403,50 @@ class _NativeWorkerProcess:
                 job_state["last_progress_at"] = time.monotonic()
         if forward and async_state is not None:
             completed = False
-            callback_error = ""
+            cancel_job = False
+            callback_error = str(async_state.get("callback_error") or "")
             with async_state["completion_lock"]:
                 with self._dispatch_lock:
                     if self._async_jobs.get(job_id) is not async_state:
                         return
                     async_state["last_progress_at"] = time.monotonic()
                 try:
-                    callback = async_state["on_line"]
-                    completed = bool(
-                        callback(line, payload)
-                        if async_state.get("parsed_events")
-                        else callback(line)
-                    )
+                    if callback_error:
+                        completed = _is_job_finished(payload)
+                    else:
+                        if payload.get("type") == "protocol_error":
+                            raise ValueError(payload["message"])
+                        if async_state["accumulator"].accept(payload):
+                            self._deadline_changed.set()
+                            return
+                        callback = async_state["on_line"]
+                        completed = bool(
+                            callback(line, payload)
+                            if async_state.get("parsed_events")
+                            else callback(line)
+                        )
                 except Exception as exc:
-                    callback_error = f"sevenzip_worker completion callback failed: {exc}"
-                    completed = True
+                    callback_error = f"sevenzip_worker job protocol/callback failed: {exc}"
+                    async_state["callback_error"] = callback_error
+                    async_state.pop("accumulator", None)
+                    completed = _is_job_finished(payload)
+                    cancel_job = not completed
+                    if cancel_job and not async_state["cancel_requested"]:
+                        async_state["cancel_requested"] = True
+                        async_state["timeout_message"] = callback_error
+                        async_state["cancel_deadline"] = time.monotonic() + max(
+                            0.5,
+                            float(self.process_config.get("cancel_grace_seconds", 5) or 5),
+                        )
                 if completed:
                     self._finish_async_job(job_id, expected=async_state)
             self._deadline_changed.set()
-            if callback_error:
+            if cancel_job:
+                try:
+                    self.cancel(job_id)
+                except Exception:
+                    self.close()
+            if completed and callback_error:
                 try:
                     async_state["on_timeout"](callback_error)
                 except Exception:
@@ -478,9 +509,9 @@ class _NativeWorkerProcess:
                 except Exception:
                     fail_jobs.append((job_id, state, message))
             if fail_jobs:
+                self.close()
                 failed = any(self._fail_async_job(job_id, state, message) for job_id, state, message in fail_jobs)
                 if failed:
-                    self.close()
                     return
 
     def close(self) -> None:
@@ -503,6 +534,7 @@ class _NativeWorkerProcess:
             except Exception:
                 try:
                     self.process.kill()
+                    self.process.wait()
                 except Exception:
                     pass
         except Exception:
@@ -566,13 +598,14 @@ class _AsyncNativeWorkerProcess:
             return
         self.worker_epoch = uuid.uuid4().hex
         environment = _apply_native_environment(os.environ.copy(), self.process_config)
-        # Result lines grow with the extracted file count; asyncio's 64 KiB default would raise LimitOverrunError and kill the stdout dispatcher.
+        # Per-item data uses byte-bounded chunks. This limit guards the protocol,
+        # independent of an archive's total number of files.
         self.process = await asyncio.create_subprocess_exec(
             self.worker_path,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            limit=64 * 1024 * 1024,
+            limit=_WORKER_STREAM_LIMIT,
             startupinfo=self.startupinfo,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
             cwd=runtime_working_directory(),
@@ -617,6 +650,7 @@ class _AsyncNativeWorkerProcess:
             "on_line": on_line,
             "on_timeout": on_timeout,
             "finished": asyncio.get_running_loop().create_future(),
+            "accumulator": NativeWorkerResultAccumulator(job_id),
             "parsed_events": bool(parsed_events),
             "last_progress_at": now,
             "cancel_requested": False,
@@ -694,12 +728,12 @@ class _AsyncNativeWorkerProcess:
 
     async def _dispatch_stdout(self) -> None:
         assert self.process is not None and self.process.stdout is not None
+        failure = "sevenzip_worker exited before job completion"
         try:
             while line_bytes := await self.process.stdout.readline():
-                payload = parse_worker_json_line(line_bytes)
-                # Result lines grow with the item count and are consumed through
-                # the parsed payload; only other lines keep a decoded copy.
-                line = "" if payload.get("type") == "result" else line_bytes.decode("utf-8", "replace")
+                payload = parse_worker_transport_event(line_bytes)
+                # Chunk data stays in Rust and never reaches job callbacks.
+                line = "" if payload.get("type") in {"result", "manifest_chunk", "trace_chunk"} else line_bytes.decode("utf-8", "replace")
                 del line_bytes
                 job_id = str(payload.get("job_id") or "") if isinstance(payload, dict) else ""
                 if isinstance(payload, dict) and payload.get("type") == "worker_ready":
@@ -733,6 +767,10 @@ class _AsyncNativeWorkerProcess:
                         self.queue_capacity.release(job_id)
                     continue
                 try:
+                    if payload.get("type") == "protocol_error":
+                        raise ValueError(payload["message"])
+                    if state["accumulator"].accept(payload):
+                        continue
                     callback = state["on_line"]
                     completed = bool(
                         callback(line, payload)
@@ -740,7 +778,9 @@ class _AsyncNativeWorkerProcess:
                         else callback(line)
                     )
                 except Exception as exc:
-                    state["callback_error"] = f"sevenzip_worker completion callback failed: {exc}"
+                    state["callback_error"] = f"sevenzip_worker job protocol/callback failed: {exc}"
+                    state["timeout_message"] = state["callback_error"]
+                    state.pop("accumulator", None)
                     if _is_job_finished(payload):
                         self._fail_job(job_id, state, state["callback_error"])
                     else:
@@ -755,6 +795,8 @@ class _AsyncNativeWorkerProcess:
                     self._fail_job(job_id, state, "sevenzip_worker finished without a result")
                 if _is_job_finished(payload):
                     self.queue_capacity.release(job_id)
+        except Exception as exc:
+            failure = f"sevenzip_worker transport/protocol failed: {exc}"
         finally:
             if self._ready is not None and not self._ready.done():
                 self._ready.set_exception(RuntimeError("sevenzip_worker exited before startup completed"))
@@ -765,7 +807,7 @@ class _AsyncNativeWorkerProcess:
                 if self.is_alive():
                     self.process.terminate()
                 await self.process.wait()
-                self._fail_all_jobs("sevenzip_worker exited before job completion")
+                self._fail_all_jobs(failure)
             self.queue_capacity.flush()
             self._deadline_changed.set()
 
@@ -1196,7 +1238,8 @@ class SevenZipRunner:
 
             def on_timeout(message: str) -> None:
                 failure_kind = (
-                    "timeout" if "no observable progress" in message or "grace expired" in message
+                    "process_io" if "job protocol/callback failed" in message
+                    else "timeout" if "no observable progress" in message or "grace expired" in message
                     else "worker_lost" if not worker.is_alive()
                     else "timeout"
                 )
@@ -1392,7 +1435,9 @@ class SevenZipRunner:
                 with worker._dispatch_lock:
                     lifecycle_state = dict(worker._job_states.get(job_id) or {})
                 failure_kind = (
-                    "worker_lost"
+                    "process_io" if "job protocol/callback failed" in message
+                    else "timeout" if "no observable progress" in message or "grace expired" in message
+                    else "worker_lost"
                     if "exited before job completion" in message or not worker.is_alive()
                     else "timeout"
                 )

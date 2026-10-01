@@ -15,20 +15,28 @@ pub(crate) struct WatchFileObservation {
 #[cfg(windows)]
 mod windows;
 
-#[cfg(windows)]
-pub(crate) fn watch_file_observation(
-    path: &Path,
-    since_usn: Option<i64>,
-) -> PyResult<WatchFileObservation> {
-    windows::watch_file_observation(path, since_usn).map_err(os_error)
-}
-
 #[cfg(not(windows))]
 pub(crate) fn watch_file_observation(
     _path: &Path,
     _since_usn: Option<i64>,
 ) -> PyResult<WatchFileObservation> {
     Err(PyRuntimeError::new_err("watch mode requires Windows NTFS"))
+}
+
+pub(crate) fn watch_file_observation_known_kind(
+    path: &Path,
+    since_usn: Option<i64>,
+    is_directory: bool,
+) -> PyResult<WatchFileObservation> {
+    #[cfg(windows)]
+    {
+        windows::watch_file_observation_known_kind(path, since_usn, is_directory).map_err(os_error)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = is_directory;
+        watch_file_observation(path, since_usn)
+    }
 }
 
 #[pyfunction]

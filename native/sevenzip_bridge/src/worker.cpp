@@ -20,6 +20,7 @@
 #include <limits>
 #include <optional>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -854,14 +855,62 @@ std::string input_trace_json(const sunpack::sevenzip::ExtractInputTrace& trace) 
         "}}";
 }
 
-std::string output_item_traces_json(const std::vector<sunpack::sevenzip::ExtractOutputItemTrace>& items) {
-    std::string out = "[";
-    for (std::size_t index = 0; index < items.size(); ++index) {
-        const auto& item = items[index];
-        if (index) {
-            out += ",";
+// Bound each serialized event by bytes, including its routing envelope. The
+// retained buffer is reused; no result-sized intermediate string is built.
+class WorkerChunks {
+public:
+    WorkerChunks(const std::string& job_id, const char* type, const char* field)
+        : prefix_("{\"type\":\"" + std::string(type) + "\",\"job_id\":\"" + json_escape(job_id) + "\",\"seq\":"),
+          field_(field) {
+        buffer_.reserve(kChunkBytes);
+    }
+
+    void append(const std::string& row) {
+        const std::size_t envelope = prefix_.size() + 20 + field_.size() + 8;
+        if (envelope + row.size() > kChunkBytes) {
+            throw std::runtime_error("worker item exceeds the chunk byte limit");
         }
-        out += "{\"index\":" + std::to_string(item.index) +
+        if (count_ && buffer_.size() + 1 + row.size() + 2 > kChunkBytes) {
+            flush();
+        }
+        if (!count_) {
+            buffer_ += prefix_;
+            buffer_ += std::to_string(seq_);
+            buffer_ += ",\"";
+            buffer_ += field_;
+            buffer_ += "\":[";
+        } else {
+            buffer_ += ',';
+        }
+        buffer_ += row;
+        ++count_;
+    }
+
+    std::size_t finish() {
+        flush();
+        return seq_;
+    }
+
+private:
+    void flush() {
+        if (!count_) { return; }
+        buffer_ += "]}";
+        print_json_line(buffer_);
+        ++seq_;
+        count_ = 0;
+        buffer_.clear();
+    }
+
+    static constexpr std::size_t kChunkBytes = 512 * 1024;
+    std::string prefix_;
+    std::string field_;
+    std::string buffer_;
+    std::size_t seq_ = 0;
+    std::size_t count_ = 0;
+};
+
+std::string output_item_trace_json(const sunpack::sevenzip::ExtractOutputItemTrace& item) {
+    return "{\"index\":" + std::to_string(item.index) +
             ",\"path\":\"" + json_escape(wide_to_utf8(item.path)) +
             "\",\"output_path\":\"" + json_escape(wide_to_utf8(item.output_path)) +
             "\",\"is_dir\":" + std::string(item.is_dir ? "true" : "false") +
@@ -882,12 +931,15 @@ std::string output_item_traces_json(const std::vector<sunpack::sevenzip::Extract
             ",\"done\":" + std::string(item.done ? "true" : "false") +
             ",\"failed\":" + std::string(item.failed ? "true" : "false") +
             "}";
-    }
-    out += "]";
-    return out;
 }
 
-std::string output_trace_json(const sunpack::sevenzip::ExtractOutputTrace& trace) {
+std::size_t emit_output_trace_chunks(const std::string& job_id, const sunpack::sevenzip::ExtractOutputTrace& trace) {
+    WorkerChunks chunks(job_id, "trace_chunk", "items");
+    for (const auto& item : trace.items) { chunks.append(output_item_trace_json(item)); }
+    return chunks.finish();
+}
+
+std::string output_trace_json(const sunpack::sevenzip::ExtractOutputTrace& trace, std::size_t chunk_count) {
     return std::string("{") +
         "\"total_bytes_written\":" + std::to_string(trace.total_bytes_written) +
         ",\"current_item_index\":" + std::to_string(trace.current_item_index) +
@@ -897,7 +949,8 @@ std::string output_trace_json(const sunpack::sevenzip::ExtractOutputTrace& trace
         ",\"last_hresult\":" + std::to_string(trace.last_hresult) +
         ",\"last_hresult_hex\":\"" + hresult_hex(trace.last_hresult) +
         "\",\"last_win32_error\":" + std::to_string(trace.last_win32_error) +
-        ",\"items\":" + output_item_traces_json(trace.items) +
+        ",\"item_count\":" + std::to_string(trace.items.size()) +
+        ",\"chunk_count\":" + std::to_string(chunk_count) +
         "}";
 }
 
@@ -928,10 +981,8 @@ std::string pipeline_timing_json(const sunpack::sevenzip::ExtractPipelineTiming&
 }
 #endif
 
-std::string verified_manifest_json(const sunpack::sevenzip::ExtractArchiveResult& result, bool validated) {
-    std::string rows = "[";
-    rows.reserve(result.output_trace.items.size() * 96);
-    bool first = true;
+std::string verified_manifest_json(const std::string& job_id, const sunpack::sevenzip::ExtractArchiveResult& result, bool validated) {
+    WorkerChunks chunks(job_id, "manifest_chunk", "rows");
     unsigned int file_count = 0;
     unsigned long long total_size = 0;
     bool identity_paths = true;
@@ -947,16 +998,12 @@ std::string verified_manifest_json(const sunpack::sevenzip::ExtractArchiveResult
         for (auto parent = output_path.parent_path(); !parent.empty(); parent = parent.parent_path()) {
             directories.insert(parent.lexically_normal().generic_wstring());
         }
-        if (!first) {
-            rows += ",";
-        }
-        first = false;
         ++file_count;
         total_size += item.bytes_written;
         const bool identity_path =
             std::filesystem::path(item.path).lexically_normal().generic_wstring() == output_path.lexically_normal().generic_wstring();
         identity_paths = identity_paths && identity_path;
-        rows += "[" + std::to_string(item.index) +
+        chunks.append("[" + std::to_string(item.index) +
             ",\"" + json_escape(wide_to_utf8(item.path)) +
             "\",\"" + (identity_path ? std::string() : json_escape(wide_to_utf8(item.output_path))) +
             "\"," + std::to_string(item.has_expected_size ? item.expected_size : item.bytes_written) +
@@ -969,9 +1016,9 @@ std::string verified_manifest_json(const sunpack::sevenzip::ExtractArchiveResult
             "," + std::string(item.done ? "1" : item.failed ? "2" : "0") +
             "," + std::string(item.has_mtime_ns ? "1" : "0") +
             "," + std::to_string(item.mtime_ns) +
-            ",\"" + bytes_hex(item.magic) + "\"]";
+            ",\"" + bytes_hex(item.magic) + "\"]");
     }
-    rows += "]";
+    const auto chunk_count = chunks.finish();
     const bool inventory_complete = validated && result.output_inventory_complete && file_count == result.files_written;
     return std::string("{") +
         "\"version\":3,\"source\":\"sevenzip_worker_extract\"" +
@@ -983,7 +1030,7 @@ std::string verified_manifest_json(const sunpack::sevenzip::ExtractArchiveResult
         "," + std::to_string(directories.size()) +
         "," + std::to_string(total_size) +
         "," + std::string(identity_paths ? "1" : "0") + "]" +
-        ",\"rows\":" + rows + "}";
+        ",\"chunk_count\":" + std::to_string(chunk_count) + "}";
 }
 
 std::string handler_attempts_json(const std::vector<sunpack::sevenzip::ExtractHandlerAttempt>& attempts) {
@@ -1015,7 +1062,7 @@ std::string failed_item_json(const sunpack::sevenzip::ExtractArchiveResult& resu
         "\"}";
 }
 
-std::string diagnostics_json(const sunpack::sevenzip::ExtractArchiveResult& result) {
+std::string diagnostics_json(const sunpack::sevenzip::ExtractArchiveResult& result, std::size_t trace_chunks) {
     return std::string("{") +
         "\"failure_stage\":\"" + json_escape(result.failure_stage) +
         "\",\"failure_kind\":\"" + json_escape(result.failure_kind) +
@@ -1034,7 +1081,7 @@ std::string diagnostics_json(const sunpack::sevenzip::ExtractArchiveResult& resu
         ",\"matched_index\":" + std::to_string(result.matched_index) +
         ",\"handler_attempts\":" + handler_attempts_json(result.handler_attempts) +
         ",\"input_trace\":" + input_trace_json(result.input_trace) +
-        ",\"output_trace\":" + output_trace_json(result.output_trace) +
+        ",\"output_trace\":" + output_trace_json(result.output_trace, trace_chunks) +
         ",\"failed_item\":" + failed_item_json(result) +
         "}";
 }
@@ -1228,13 +1275,15 @@ int run_request(
     }
 
     const bool ok = result.status == PasswordTestStatus::Ok && result.command_ok;
+    const auto manifest_summary = verified_manifest_json(job_id, result, ok && !dry_run);
+    const auto trace_chunks = (!ok || dry_run) ? emit_output_trace_chunks(job_id, result.output_trace) : 0;
     const std::string failure_fields = ok ? "" :
         ",\"failure_stage\":\"" + json_escape(result.failure_stage) +
         "\",\"failure_kind\":\"" + json_escape(result.failure_kind) +
         "\",\"hresult\":" + std::to_string(result.hresult) +
         ",\"hresult_hex\":\"" + hresult_hex(result.hresult) + "\"";
     const std::string diagnostic_fields = (!ok || dry_run) ?
-        ",\"diagnostics\":" + diagnostics_json(result) : "";
+        ",\"diagnostics\":" + diagnostics_json(result, trace_chunks) : "";
     const std::string input_trace_field = read_file_timing_enabled() ?
         ",\"input_trace\":" + input_trace_json(result.input_trace) : "";
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
@@ -1276,7 +1325,7 @@ int run_request(
         "\",\"requested_codepage\":\"" + json_escape(wide_to_utf8(result.requested_codepage)) +
         "\",\"applied_codepage\":\"" + json_escape(wide_to_utf8(result.applied_codepage)) +
         "\",\"filename_decoder\":\"" + json_escape(wide_to_utf8(result.filename_decoder)) +
-        "\",\"verified_manifest\":" + verified_manifest_json(result, ok && !dry_run) +
+        "\",\"verified_manifest\":" + manifest_summary +
         ",\"failed_item\":\"" + json_escape(wide_to_utf8(result.failed_item)) +
         "\",\"message\":\"" + json_escape(result.message) + "\"" +
         failure_fields + input_trace_field

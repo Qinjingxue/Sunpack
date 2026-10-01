@@ -122,11 +122,19 @@ pub(super) fn watch_file_observation(
     since_usn: Option<i64>,
 ) -> io::Result<WatchFileObservation> {
     let metadata = std::fs::metadata(path)?;
+    watch_file_observation_known_kind(path, since_usn, metadata.is_dir())
+}
+
+pub(super) fn watch_file_observation_known_kind(
+    path: &Path,
+    since_usn: Option<i64>,
+    is_directory: bool,
+) -> io::Result<WatchFileObservation> {
     let handle = open_path(
         path,
         FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        metadata.is_dir(),
+        is_directory,
     )?;
     let mut observation = read_file_usn(handle.raw())?;
     if let Some(previous_usn) = since_usn.filter(|value| *value > 0) {

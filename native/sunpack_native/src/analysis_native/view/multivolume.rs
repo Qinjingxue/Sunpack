@@ -28,9 +28,7 @@ impl AnalysisMultiVolumeView {
             logical_start = logical_start
                 .checked_add(std::fs::metadata(path)?.len())
                 .ok_or_else(|| {
-                    pyo3::exceptions::PyValueError::new_err(
-                        "multi-volume logical size overflow",
-                    )
+                    pyo3::exceptions::PyValueError::new_err("multi-volume logical size overflow")
                 })?;
         }
 
@@ -91,11 +89,7 @@ impl AnalysisMultiVolumeView {
         Ok(PyBytes::new(py, &data))
     }
 
-    fn probe_zip_local_header(
-        &self,
-        py: Python<'_>,
-        offset: u64,
-    ) -> PyResult<Py<PyDict>> {
+    fn probe_zip_local_header(&self, py: Python<'_>, offset: u64) -> PyResult<Py<PyDict>> {
         AnalysisBinaryView {
             path: self.path.clone(),
             reader: self.reader.clone(),
@@ -105,11 +99,7 @@ impl AnalysisMultiVolumeView {
     }
 
     #[pyo3(signature = (eocd_offset=None))]
-    fn locate_zip_eocd(
-        &self,
-        py: Python<'_>,
-        eocd_offset: Option<u64>,
-    ) -> PyResult<Py<PyDict>> {
+    fn locate_zip_eocd(&self, py: Python<'_>, eocd_offset: Option<u64>) -> PyResult<Py<PyDict>> {
         AnalysisBinaryView {
             path: self.path.clone(),
             reader: self.reader.clone(),
@@ -183,11 +173,7 @@ impl AnalysisMultiVolumeView {
         .probe_tar(py, start_offset, max_entries_to_walk)
     }
 
-    fn probe_compression_stream(
-        &self,
-        py: Python<'_>,
-        format: &str,
-    ) -> PyResult<Py<PyDict>> {
+    fn probe_compression_stream(&self, py: Python<'_>, format: &str) -> PyResult<Py<PyDict>> {
         AnalysisBinaryView {
             path: self.path.clone(),
             reader: self.reader.clone(),
@@ -253,49 +239,10 @@ impl AnalysisMultiVolumeView {
         head_bytes: usize,
         tail_bytes: usize,
     ) -> PyResult<Py<PyDict>> {
-        let size = self.reader.len();
-        let head_len = head_bytes.min(size as usize);
-        let tail_len = tail_bytes.min(size as usize);
-        let tail_start = size.saturating_sub(tail_len as u64);
-        let head_end = head_len as u64;
-        let mut hits = Vec::new();
-        let scanned_head = head_len;
-        let scanned_tail = tail_len;
-
-        if tail_start <= head_end {
-            let data = self.read_at_bytes(0, size as usize)?;
-            collect_signature_hits(&mut hits, 0, &data);
-        } else {
-            let mut ranges = self
-                .reader
-                .read_many(&[(0, head_len), (tail_start, tail_len)])
-                .map_err(reader_error_to_py)?;
-            let head = ranges.remove(0);
-            collect_signature_hits(&mut hits, 0, &head);
-            let tail = ranges.remove(0);
-            collect_signature_hits(&mut hits, tail_start, &tail);
-        }
-        hits.sort_by_key(|(_, offset)| *offset);
-        hits.dedup();
-
-        let dict = PyDict::new(py);
-        let py_hits = PyList::empty(py);
-        let mut formats = Vec::new();
-        for (name, offset) in hits {
-            let hit = PyDict::new(py);
-            hit.set_item("name", name)?;
-            hit.set_item("offset", offset)?;
-            py_hits.append(hit)?;
-            let format = format_for_hit(name);
-            if !formats.contains(&format) {
-                formats.push(format);
-            }
-        }
-        formats.sort();
-        dict.set_item("hits", py_hits)?;
-        dict.set_item("formats", formats)?;
-        dict.set_item("head_bytes", scanned_head)?;
-        dict.set_item("tail_bytes", scanned_tail)?;
-        Ok(dict.unbind())
+        self.ensure_open()?;
+        let data = py
+            .detach(|| signature_prepass_native(&self.reader, head_bytes, tail_bytes))
+            .map_err(reader_error_to_py)?;
+        signature_prepass_to_python(py, data)
     }
 }

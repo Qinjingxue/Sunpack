@@ -911,9 +911,9 @@ def test_worker_output_trace_includes_per_item_failure(tmp_path):
         text=True,
         encoding="utf-8",
     )
-    lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
-    worker_result = next(item for item in lines if item.get("type") == "result")
-    output_items = worker_result["diagnostics"]["output_trace"]["items"]
+    worker_result = _worker_result(result.stdout)
+    native = worker_result["diagnostics"]["output_trace"]["native_items"]
+    output_items = native.item_page(0, len(native))
     failed_items = [item for item in output_items if item["failed"]]
 
     assert result.returncode != 0
@@ -948,9 +948,9 @@ def test_worker_propagates_delayed_async_file_open_failure(tmp_path):
         text=True,
         encoding="utf-8",
     )
-    lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
-    worker_result = next(item for item in lines if item.get("type") == "result")
-    output_items = worker_result["diagnostics"]["output_trace"]["items"]
+    worker_result = _worker_result(result.stdout)
+    native = worker_result["diagnostics"]["output_trace"]["native_items"]
+    output_items = native.item_page(0, len(native))
 
     assert result.returncode != 0
     assert worker_result["status"] == "failed"
@@ -983,8 +983,7 @@ def test_worker_dry_run_reports_success_diagnostics_without_writing(tmp_path):
         text=True,
         encoding="utf-8",
     )
-    lines = [json.loads(line) for line in result.stdout.splitlines() if line.strip().startswith("{")]
-    worker_result = next(item for item in lines if item.get("type") == "result")
+    worker_result = _worker_result(result.stdout)
     output_trace = worker_result["diagnostics"]["output_trace"]
 
     assert result.returncode == 0
@@ -992,8 +991,8 @@ def test_worker_dry_run_reports_success_diagnostics_without_writing(tmp_path):
     assert worker_result["dry_run"] is True
     assert worker_result["files_written"] == 1
     assert worker_result["bytes_written"] == len("dry-run payload")
-    assert output_trace["items"]
-    item = output_trace["items"][0]
+    assert len(output_trace["native_items"]) == 1
+    item = output_trace["native_items"].item_page(0, 1)[0]
     assert item["path"].endswith(filename)
     assert item["has_source_crc32"] is True
     assert item["has_output_crc32"] is True
@@ -1032,7 +1031,7 @@ def test_worker_skips_output_crc_when_source_crc_is_missing(tmp_path, dry_run):
     assert worker_result["dry_run"] is dry_run
     if dry_run:
         item = next(
-            row for row in worker_result["diagnostics"]["output_trace"]["items"]
+            row for row in worker_result["diagnostics"]["output_trace"]["native_items"].item_page(0, 128)
             if not row["is_dir"]
         )
         assert item["has_source_crc32"] is False
@@ -1173,11 +1172,9 @@ def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
     assert worker_result["bytes_written"] == len(payload)
     manifest = worker_result["verified_manifest"]
     assert manifest["version"] == 3
-    row = manifest["rows"][0]
-    assert len(row) == 14
-    assert row[11] == 1
-    assert row[12] > 0
-    assert row[13] == payload.hex()
+    row = manifest["native_rows"].file_page(0, 1)[0]
+    assert row["mtime_ns"] > 0
+    assert row["magic"] == payload
     assert (out_dir / source.name).read_bytes() == payload
 
 
@@ -1330,8 +1327,21 @@ def _task(path, archive_input=None):
 
 
 def _worker_result(stdout: str) -> dict:
-    lines = [json.loads(line) for line in stdout.splitlines() if line.strip().startswith("{")]
-    return next(item for item in lines if item.get("type") == "result")
+    from sunpack_native import NativeWorkerResultAccumulator, parse_worker_transport_event
+
+    accumulators = {}
+    for line in stdout.splitlines():
+        if not line.strip():
+            continue
+        payload = parse_worker_transport_event(line)
+        job_id = payload.get("job_id")
+        if payload["type"] not in {"manifest_chunk", "trace_chunk", "result"}:
+            continue
+        accumulator = accumulators.setdefault(job_id, NativeWorkerResultAccumulator(job_id))
+        accumulator.accept(payload)
+        if payload["type"] == "result":
+            return payload
+    raise AssertionError("worker did not emit a result")
 
 
 def test_extraction_scheduler_uses_worker_for_file_range(tmp_path, monkeypatch):

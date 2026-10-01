@@ -1,11 +1,11 @@
 //! Parse one sevenzip worker stdout line straight into Python objects.
 //!
-//! The per-item arrays of a result event (`verified_manifest.rows` and
-//! `diagnostics.output_trace.items`) grow with the archive's item count, so
-//! they are decoded into Rust-owned tables while the rest of the event becomes
-//! an ordinary Python dict. Python never holds the raw line as parsed JSON.
+//! Per-item manifest and trace chunks are decoded directly into Rust-owned
+//! tables. A job accumulator moves them into the final native_rows/native_items
+//! objects while only event envelopes and result summaries become Python dicts.
 
 use crate::scan::directory::{decode_hex_bytes, NativeWorkerManifest, OutputFileRecord};
+use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyString};
 use pyo3::IntoPyObjectExt;
@@ -254,6 +254,22 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
                     dict.set_item("native_items", native).map_err(py_error)?;
                     continue;
                 }
+                (Scope::Root, "rows") => {
+                    let chunk = WorkerChunk {
+                        data: Some(ChunkData::Manifest(map.next_value::<WorkerRows>()?.0)),
+                    };
+                    dict.set_item("native_chunk", Py::new(py, chunk).map_err(py_error)?)
+                        .map_err(py_error)?;
+                    continue;
+                }
+                (Scope::Root, "items") => {
+                    let chunk = WorkerChunk {
+                        data: Some(ChunkData::Trace(map.next_value::<Vec<OutputTraceItem>>()?)),
+                    };
+                    dict.set_item("native_chunk", Py::new(py, chunk).map_err(py_error)?)
+                        .map_err(py_error)?;
+                    continue;
+                }
                 _ => {}
             }
             let child = match (self.scope, key.as_str()) {
@@ -275,6 +291,229 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
                 .map_err(py_error)?;
         }
         Ok(dict.into_any().unbind())
+    }
+}
+
+enum ChunkData {
+    Manifest(Vec<OutputFileRecord>),
+    Trace(Vec<OutputTraceItem>),
+}
+
+#[pyclass]
+struct WorkerChunk {
+    data: Option<ChunkData>,
+}
+
+/// Transport-only storage. Chunk vectors are moved into the job's tables;
+/// finalization moves those tables into the existing immutable native objects.
+#[pyclass(module = "sunpack_native")]
+pub(crate) struct NativeWorkerResultAccumulator {
+    job_id: String,
+    manifest_seq: usize,
+    trace_seq: usize,
+    files: Vec<OutputFileRecord>,
+    items: Vec<OutputTraceItem>,
+    finished: bool,
+}
+
+#[pymethods]
+impl NativeWorkerResultAccumulator {
+    #[new]
+    fn new(job_id: String) -> Self {
+        Self {
+            job_id,
+            manifest_seq: 0,
+            trace_seq: 0,
+            files: Vec::new(),
+            items: Vec::new(),
+            finished: false,
+        }
+    }
+
+    /// True for a consumed chunk; result events are finalized in place.
+    fn accept(&mut self, py: Python<'_>, payload: &Bound<'_, PyDict>) -> PyResult<bool> {
+        let kind = payload
+            .get_item("type")?
+            .ok_or_else(|| PyValueError::new_err("worker event type missing"))?
+            .extract::<String>()?;
+        if !matches!(kind.as_str(), "manifest_chunk" | "trace_chunk" | "result") {
+            return Ok(false);
+        }
+        if self.finished {
+            return Err(PyValueError::new_err("worker data received after result"));
+        }
+        let job_id = payload
+            .get_item("job_id")?
+            .ok_or_else(|| PyValueError::new_err("worker job_id missing"))?
+            .extract::<String>()?;
+        if job_id != self.job_id {
+            return Err(PyValueError::new_err("worker chunk belongs to another job"));
+        }
+        if kind != "result" {
+            let seq = payload
+                .get_item("seq")?
+                .ok_or_else(|| PyValueError::new_err("worker chunk sequence missing"))?
+                .extract::<usize>()?;
+            let expected = if kind == "manifest_chunk" {
+                self.manifest_seq
+            } else {
+                self.trace_seq
+            };
+            if seq != expected {
+                return Err(PyValueError::new_err(format!(
+                    "{kind} sequence {seq}, expected {expected}"
+                )));
+            }
+            let chunk = payload
+                .get_item("native_chunk")?
+                .ok_or_else(|| PyValueError::new_err("worker chunk data missing"))?;
+            let mut chunk = chunk.extract::<PyRefMut<'_, WorkerChunk>>()?;
+            match chunk.data.take() {
+                Some(ChunkData::Manifest(mut files)) if kind == "manifest_chunk" => {
+                    self.files.append(&mut files);
+                    self.manifest_seq += 1;
+                }
+                Some(ChunkData::Trace(mut items)) if kind == "trace_chunk" => {
+                    self.items.append(&mut items);
+                    self.trace_seq += 1;
+                }
+                _ => return Err(PyValueError::new_err("worker chunk data type mismatch")),
+            }
+            return Ok(true);
+        }
+
+        let manifest = payload.get_item("verified_manifest")?;
+        let trace = payload
+            .get_item("diagnostics")?
+            .map(|value| value.cast_into::<PyDict>())
+            .transpose()?
+            .map(|dict| dict.get_item("output_trace"))
+            .transpose()?
+            .flatten();
+        if let Some(manifest) = &manifest {
+            let manifest = manifest.cast::<PyDict>()?;
+            check_chunk_summary(manifest, self.manifest_seq, self.files.len(), "file_count")?;
+        } else if self.manifest_seq != 0 {
+            return Err(PyValueError::new_err(
+                "manifest chunks have no result summary",
+            ));
+        }
+        if let Some(trace) = &trace {
+            check_chunk_summary(
+                trace.cast::<PyDict>()?,
+                self.trace_seq,
+                self.items.len(),
+                "item_count",
+            )?;
+        } else if self.trace_seq != 0 {
+            return Err(PyValueError::new_err("trace chunks have no result summary"));
+        }
+
+        if let Some(manifest) = manifest {
+            let manifest = manifest.cast::<PyDict>()?;
+            let inventory = manifest
+                .get_item("inventory")?
+                .ok_or_else(|| PyValueError::new_err("manifest inventory missing"))?;
+            let inventory = inventory.cast::<PyDict>()?;
+            let field = |key: &str| {
+                inventory.get_item(key)?.ok_or_else(|| {
+                    PyValueError::new_err(format!("manifest inventory {key} missing"))
+                })
+            };
+            let columns = [
+                u64::from(field("complete")?.is_truthy()?),
+                field("file_count")?.extract::<u64>()?,
+                field("dir_count")?.extract::<u64>()?,
+                field("total_size")?.extract::<u64>()?,
+                u64::from(field("identity_paths")?.is_truthy()?),
+            ];
+            let native =
+                NativeWorkerManifest::from_parts(std::mem::take(&mut self.files), columns)?;
+            manifest.set_item("native_rows", Py::new(py, native)?)?;
+            manifest.del_item("chunk_count")?;
+        }
+        if let Some(trace) = trace {
+            let trace = trace.cast::<PyDict>()?;
+            trace.set_item(
+                "native_items",
+                Py::new(
+                    py,
+                    NativeOutputTrace {
+                        items: Arc::new(std::mem::take(&mut self.items)),
+                    },
+                )?,
+            )?;
+            trace.del_item("chunk_count")?;
+            trace.del_item("item_count")?;
+        }
+        self.finished = true;
+        Ok(false)
+    }
+}
+
+fn check_chunk_summary(
+    dict: &Bound<'_, PyDict>,
+    chunks: usize,
+    rows: usize,
+    count_key: &str,
+) -> PyResult<()> {
+    let count = |key: &str| -> PyResult<usize> {
+        dict.get_item(key)?
+            .ok_or_else(|| PyValueError::new_err(format!("worker summary {key} missing")))?
+            .extract()
+    };
+    if count("chunk_count")? != chunks || count(count_key)? != rows {
+        return Err(PyValueError::new_err("worker chunk summary count mismatch"));
+    }
+    Ok(())
+}
+
+/// The normal parser is single-pass. On a malformed event only, recover the
+/// top-level routing prefix without parsing the damaged per-item body again.
+#[pyfunction]
+pub(crate) fn parse_worker_transport_event(
+    py: Python<'_>,
+    line: &Bound<'_, PyAny>,
+) -> PyResult<Py<PyDict>> {
+    if let Some(payload) = parse_worker_event(py, line)? {
+        return Ok(payload);
+    }
+    let text = if let Ok(bytes) = line.cast::<PyBytes>() {
+        String::from_utf8_lossy(bytes.as_bytes())
+    } else {
+        line.cast::<PyString>()?.to_cow()?
+    };
+    let job_id = recover_job_id(&text)
+        .filter(|id| !id.is_empty())
+        .ok_or_else(|| PyValueError::new_err("unattributable worker protocol error"))?;
+    let payload = PyDict::new(py);
+    payload.set_item("type", "protocol_error")?;
+    payload.set_item("job_id", job_id)?;
+    payload.set_item("message", "malformed worker event")?;
+    Ok(payload.unbind())
+}
+
+fn recover_job_id(text: &str) -> Option<String> {
+    let mut rest = text.trim_start().strip_prefix('{')?.trim_start();
+    loop {
+        let mut key = serde_json::Deserializer::from_str(rest).into_iter::<String>();
+        let name = key.next()?.ok()?;
+        rest = rest[key.byte_offset()..]
+            .trim_start()
+            .strip_prefix(':')?
+            .trim_start();
+        if name == "job_id" {
+            return serde_json::Deserializer::from_str(rest)
+                .into_iter::<String>()
+                .next()?
+                .ok();
+        }
+        let mut value = serde_json::Deserializer::from_str(rest).into_iter::<de::IgnoredAny>();
+        value.next()?.ok()?;
+        rest = rest[value.byte_offset()..]
+            .trim_start()
+            .strip_prefix(',')?
+            .trim_start();
     }
 }
 

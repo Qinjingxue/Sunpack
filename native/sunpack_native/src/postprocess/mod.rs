@@ -5,7 +5,14 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-use crate::filesystem::watch_file_observation;
+use crate::filesystem::{watch_file_observation_known_kind, WatchFileObservation};
+
+struct WatchCandidateRow {
+    path: String,
+    size: u64,
+    mtime: f64,
+    observation: WatchFileObservation,
+}
 
 #[cfg(windows)]
 #[link(name = "Kernel32")]
@@ -20,30 +27,41 @@ pub(crate) fn scan_watch_candidates(
     roots: Vec<String>,
     recursive: bool,
 ) -> PyResult<Py<PyList>> {
-    let mut candidates: Vec<(String, Py<PyDict>)> = Vec::new();
+    let candidates = py.detach(|| scan_watch_candidate_rows(roots, recursive))?;
+    let values = PyList::empty(py);
+    for row in candidates {
+        values.append(watch_candidate_to_python(py, row)?)?;
+    }
+    Ok(values.unbind())
+}
+
+fn scan_watch_candidate_rows(
+    roots: Vec<String>,
+    recursive: bool,
+) -> PyResult<Vec<WatchCandidateRow>> {
+    let mut candidates = Vec::new();
     for root in roots {
         let path = PathBuf::from(root);
-        if path.is_file() {
-            if let Some(candidate) = watch_candidate_dict(py, &path, None)? {
-                candidates.push((normalize_path(&path), candidate));
+        let Ok(metadata) = fs::metadata(&path) else {
+            continue;
+        };
+        if metadata.is_file() {
+            if let Some(candidate) = watch_candidate_from_metadata(&path, &metadata, None)? {
+                candidates.push(candidate);
             }
             continue;
         }
-        if !path.is_dir() {
+        if !metadata.is_dir() {
             continue;
         }
         if recursive {
-            scan_watch_dir_recursive(py, &path, &mut candidates)?;
+            scan_watch_dir_recursive(&path, &mut candidates)?;
         } else {
-            scan_watch_dir_shallow(py, &path, &mut candidates)?;
+            scan_watch_dir_shallow(&path, &mut candidates)?;
         }
     }
-    candidates.sort_by(|left, right| left.0.cmp(&right.0));
-    let values = candidates
-        .into_iter()
-        .map(|(_, candidate)| candidate)
-        .collect::<Vec<_>>();
-    Ok(PyList::new(py, values)?.unbind())
+    candidates.sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(candidates)
 }
 
 #[pyfunction]
@@ -53,7 +71,9 @@ pub(crate) fn watch_candidate_for_path(
     path: &str,
     since_usn: Option<i64>,
 ) -> PyResult<Option<Py<PyDict>>> {
-    watch_candidate_dict(py, Path::new(path), since_usn)
+    py.detach(|| watch_candidate_row(Path::new(path), since_usn))?
+        .map(|row| watch_candidate_to_python(py, row))
+        .transpose()
 }
 
 #[pyfunction]
@@ -124,11 +144,7 @@ pub(crate) fn delete_files_batch(py: Python<'_>, paths: Vec<String>) -> PyResult
     Ok(results.unbind())
 }
 
-fn scan_watch_dir_recursive(
-    py: Python<'_>,
-    root: &Path,
-    candidates: &mut Vec<(String, Py<PyDict>)>,
-) -> PyResult<()> {
+fn scan_watch_dir_recursive(root: &Path, candidates: &mut Vec<WatchCandidateRow>) -> PyResult<()> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
@@ -140,21 +156,17 @@ fn scan_watch_dir_recursive(
             Err(_) => continue,
         };
         if metadata.is_dir() {
-            scan_watch_dir_recursive(py, &path, candidates)?;
+            scan_watch_dir_recursive(&path, candidates)?;
         } else if metadata.is_file() {
-            if let Some(candidate) = watch_candidate_from_metadata(py, &path, &metadata, None)? {
-                candidates.push((normalize_path(&path), candidate));
+            if let Some(candidate) = watch_candidate_from_metadata(&path, &metadata, None)? {
+                candidates.push(candidate);
             }
         }
     }
     Ok(())
 }
 
-fn scan_watch_dir_shallow(
-    py: Python<'_>,
-    root: &Path,
-    candidates: &mut Vec<(String, Py<PyDict>)>,
-) -> PyResult<()> {
+fn scan_watch_dir_shallow(root: &Path, candidates: &mut Vec<WatchCandidateRow>) -> PyResult<()> {
     let entries = match fs::read_dir(root) {
         Ok(entries) => entries,
         Err(_) => return Ok(()),
@@ -166,19 +178,15 @@ fn scan_watch_dir_shallow(
             Err(_) => continue,
         };
         if metadata.is_file() {
-            if let Some(candidate) = watch_candidate_from_metadata(py, &path, &metadata, None)? {
-                candidates.push((normalize_path(&path), candidate));
+            if let Some(candidate) = watch_candidate_from_metadata(&path, &metadata, None)? {
+                candidates.push(candidate);
             }
         }
     }
     Ok(())
 }
 
-fn watch_candidate_dict(
-    py: Python<'_>,
-    path: &Path,
-    since_usn: Option<i64>,
-) -> PyResult<Option<Py<PyDict>>> {
+fn watch_candidate_row(path: &Path, since_usn: Option<i64>) -> PyResult<Option<WatchCandidateRow>> {
     let metadata = match fs::metadata(path) {
         Ok(metadata) => metadata,
         Err(_) => return Ok(None),
@@ -186,23 +194,32 @@ fn watch_candidate_dict(
     if !metadata.is_file() {
         return Ok(None);
     }
-    watch_candidate_from_metadata(py, path, &metadata, since_usn)
+    watch_candidate_from_metadata(path, &metadata, since_usn)
 }
 
 fn watch_candidate_from_metadata(
-    py: Python<'_>,
     path: &Path,
     metadata: &fs::Metadata,
     since_usn: Option<i64>,
-) -> PyResult<Option<Py<PyDict>>> {
+) -> PyResult<Option<WatchCandidateRow>> {
     if metadata.len() == 0 {
         return Ok(None);
     }
-    let observation = watch_file_observation(path, since_usn)?;
+    let observation = watch_file_observation_known_kind(path, since_usn, false)?;
+    Ok(Some(WatchCandidateRow {
+        path: normalize_path(path),
+        size: metadata.len(),
+        mtime: mtime_seconds(metadata),
+        observation,
+    }))
+}
+
+fn watch_candidate_to_python(py: Python<'_>, row: WatchCandidateRow) -> PyResult<Py<PyDict>> {
+    let observation = row.observation;
     let dict = PyDict::new(py);
-    dict.set_item("path", normalize_path(path))?;
-    dict.set_item("size", metadata.len())?;
-    dict.set_item("mtime", mtime_seconds(metadata))?;
+    dict.set_item("path", row.path)?;
+    dict.set_item("size", row.size)?;
+    dict.set_item("mtime", row.mtime)?;
     dict.set_item("file_id", observation.file_id)?;
     dict.set_item("change_usn", observation.change_usn)?;
     dict.set_item("change_reasons", observation.change_reasons)?;
@@ -212,7 +229,7 @@ fn watch_candidate_from_metadata(
     )?;
     dict.set_item("change_reasons_known", observation.change_reasons_known)?;
     dict.set_item("change_reason_error", observation.change_reason_error)?;
-    Ok(Some(dict.unbind()))
+    Ok(dict.unbind())
 }
 
 #[derive(Default)]

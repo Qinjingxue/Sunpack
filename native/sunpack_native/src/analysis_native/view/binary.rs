@@ -64,20 +64,12 @@ impl AnalysisBinaryView {
         Ok(PyBytes::new(py, &data))
     }
 
-    fn probe_zip_local_header(
-        &self,
-        py: Python<'_>,
-        offset: u64,
-    ) -> PyResult<Py<PyDict>> {
+    fn probe_zip_local_header(&self, py: Python<'_>, offset: u64) -> PyResult<Py<PyDict>> {
         self.probe_zip_local_header_native(py, offset)
     }
 
     #[pyo3(signature = (eocd_offset=None))]
-    fn locate_zip_eocd(
-        &self,
-        py: Python<'_>,
-        eocd_offset: Option<u64>,
-    ) -> PyResult<Py<PyDict>> {
+    fn locate_zip_eocd(&self, py: Python<'_>, eocd_offset: Option<u64>) -> PyResult<Py<PyDict>> {
         self.locate_zip_eocd_native(py, eocd_offset)
     }
 
@@ -406,67 +398,10 @@ impl AnalysisBinaryView {
         head_bytes: usize,
         tail_bytes: usize,
     ) -> PyResult<Py<PyDict>> {
-        let size = self.reader.len();
-        let head_len = head_bytes.min(size as usize);
-        let tail_len = tail_bytes.min(size as usize);
-        let tail_start = size.saturating_sub(tail_len as u64);
-        let head_end = head_len as u64;
-        let scan_start = 0u64;
-        let tail_end = size;
-        let (scan_start, scan_len, scanned_head, scanned_tail) = if tail_start <= head_end {
-            let end = head_end.max(tail_end);
-            (
-                scan_start,
-                end.saturating_sub(scan_start) as usize,
-                head_len,
-                tail_len,
-            )
-        } else {
-            (0u64, head_len, head_len, 0usize)
-        };
-
-        let mut hits = Vec::new();
-        if tail_start <= head_end {
-            let data = self.read_at_bytes(scan_start, scan_len)?;
-            collect_signature_hits(&mut hits, scan_start, &data);
-        } else {
-            let mut ranges = self
-                .reader
-                .read_many(&[(0, head_len), (tail_start, tail_len)])
-                .map_err(reader_error_to_py)?;
-            let head = ranges.remove(0);
-            collect_signature_hits(&mut hits, 0, &head);
-            let tail = ranges.remove(0);
-            collect_signature_hits(&mut hits, tail_start, &tail);
-        }
-        hits.sort_by_key(|(_, offset)| *offset);
-        hits.dedup();
-
-        let dict = PyDict::new(py);
-        let py_hits = PyList::empty(py);
-        let mut formats = Vec::new();
-        for (name, offset) in hits {
-            let hit = PyDict::new(py);
-            hit.set_item("name", name)?;
-            hit.set_item("offset", offset)?;
-            py_hits.append(hit)?;
-            let format = format_for_hit(name);
-            if !formats.contains(&format) {
-                formats.push(format);
-            }
-        }
-        formats.sort();
-        dict.set_item("hits", py_hits)?;
-        dict.set_item("formats", formats)?;
-        dict.set_item("head_bytes", scanned_head)?;
-        dict.set_item(
-            "tail_bytes",
-            if scanned_tail == 0 {
-                tail_len
-            } else {
-                scanned_tail
-            },
-        )?;
-        Ok(dict.unbind())
+        self.ensure_open()?;
+        let data = py
+            .detach(|| signature_prepass_native(&self.reader, head_bytes, tail_bytes))
+            .map_err(reader_error_to_py)?;
+        signature_prepass_to_python(py, data)
     }
 }

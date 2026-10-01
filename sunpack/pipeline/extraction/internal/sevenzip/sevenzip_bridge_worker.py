@@ -6,8 +6,9 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any
 
+from sunpack_native import NativeWorkerResultAccumulator, parse_worker_transport_event
+
 from sunpack.core.support.resources import get_sevenzip_bridge_worker_path
-from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import parse_worker_json_line
 
 
 @dataclass(frozen=True)
@@ -81,7 +82,12 @@ def dry_run_archive(
             message=f"sevenzip_worker dry-run failed to start: {exc}",
         )
 
-    events = _parse_worker_json_lines(completed.stdout)
+    protocol_error = ""
+    try:
+        events = _parse_worker_json_lines(completed.stdout, job_id)
+    except (ValueError, TypeError) as exc:
+        events = []
+        protocol_error = f"sevenzip_worker dry-run protocol failed: {exc}"
     result = next((item for item in reversed(events) if item.get("type") == "result"), {})
     progress = [item for item in events if item.get("type") == "progress"]
     if not result:
@@ -91,6 +97,7 @@ def dry_run_archive(
             "status": "failed",
             "failure_stage": "worker_protocol",
             "failure_kind": "process_io",
+            "message": protocol_error or "sevenzip_worker dry-run did not emit a result",
         }
     diagnostics = result.get("diagnostics") if isinstance(result.get("diagnostics"), dict) else {}
     ok = completed.returncode == 0 and result.get("status") == "ok"
@@ -107,11 +114,16 @@ def dry_run_archive(
     )
 
 
-def _parse_worker_json_lines(stdout: str) -> list[dict[str, Any]]:
+def _parse_worker_json_lines(stdout: str, job_id: str) -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
+    accumulator = NativeWorkerResultAccumulator(job_id)
     for line in str(stdout or "").splitlines():
-        parsed = parse_worker_json_line(line)
-        if parsed:
+        if not line.strip():
+            continue
+        parsed = parse_worker_transport_event(line)
+        if parsed["type"] == "protocol_error":
+            raise ValueError(parsed["message"])
+        if not accumulator.accept(parsed):
             events.append(parsed)
     return events
 
