@@ -2115,10 +2115,8 @@ def _candidate_observation_changed(previous: WatchCandidate, current: WatchCandi
 def _candidate_matches_password_failure(candidate: WatchCandidate, entry: WatchStateEntry) -> bool:
     return (
         os.path.normcase(os.path.abspath(candidate.path)) == os.path.normcase(os.path.abspath(entry.path))
-        and candidate.size == entry.size
-        and candidate.mtime == entry.mtime
-        and candidate.file_id == entry.file_id
-        and candidate.change_usn == entry.change_usn
+        and _candidate_change_kind(_candidate_from_state_entry(entry), candidate)
+        != _CandidateChangeKind.CONTENT_CHANGED
     )
 
 

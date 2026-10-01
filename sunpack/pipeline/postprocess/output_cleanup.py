@@ -182,6 +182,9 @@ class OutputCleanupManager:
             with promotion_barrier(
                 (path,),
                 cache_releasers=(release_archive_sessions_under_roots,),
+                # A request can still be extracting sibling archives. The
+                # path barrier protects this output without quiescing them.
+                quiesce=False,
             ):
                 if is_directory:
                     self.executor.remove_tree(path)

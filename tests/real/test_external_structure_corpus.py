@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ctypes
 import shutil
 from pathlib import Path
 
@@ -12,29 +11,7 @@ from tests.real.plan1_real_archives.plan1_support import run_plan1_pipeline
 from scripts.generate_real_structure_corpus import STRUCTURE_CASES, generate
 
 
-class LegacyZipFilenameMismatch(AssertionError):
-    """Only the reproduced CP437-to-private-use filename defect is expected."""
-
-
-CP936_ENVIRONMENT = (
-    ctypes.windll.kernel32.GetACP() == 936
-    and ctypes.windll.kernel32.GetOEMCP() == 936
-)
-
-
-SAMPLE_PARAMETERS = [
-    pytest.param(
-        case,
-        marks=pytest.mark.xfail(
-            condition=CP936_ENVIRONMENT,
-            strict=True,
-            raises=LegacyZipFilenameMismatch,
-            reason="Unlabelled CP437 ZIP names currently fall back to Windows OEM decoding (café/über becomes private-use characters)",
-        ) if case[0] == "bsdtar-zip-cp437" else (),
-        id=case[0],
-    )
-    for case in STRUCTURE_CASES
-]
+SAMPLE_PARAMETERS = [pytest.param(case, id=case[0]) for case in STRUCTURE_CASES]
 
 
 @pytest.fixture(scope="module", params=SAMPLE_PARAMETERS)
@@ -70,16 +47,4 @@ def test_external_writer_structure_extracts_exact_members(tmp_path, plan_error, 
     assert summary.success_count == 1
     result = next(item for item in summary.target_results if Path(item.input_path) == archive)
     output_dir = Path(result.output_dir)
-    if sample["id"] == "bsdtar-zip-cp437":
-        actual = file_inventory(output_dir)
-        known_wrong_name = "caf\uef82/\uef81ber.txt"
-        if known_wrong_name in actual:
-            corrected = dict(actual)
-            corrected["café/über.txt"] = corrected.pop(known_wrong_name)
-            if corrected == sample["expected_files"]:
-                raise LegacyZipFilenameMismatch(f"CP437 filename decoded to private-use characters: {actual!r}")
-        # Missing/corrupted/extra members, different filename regressions and
-        # fixture errors must remain ordinary failures, not expected failures.
-        assert actual == sample["expected_files"]
-    else:
-        assert_exact_tree(output_dir, sample["expected_files"])
+    assert_exact_tree(output_dir, sample["expected_files"])

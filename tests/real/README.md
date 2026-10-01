@@ -39,16 +39,7 @@ with bounded 64 KiB buffers. It is built with the workspace's existing locked
 dependencies and does not add production APIs or dependencies. Python reads
 only text manifests and orchestrates existing fixture/tool paths.
 
-## Known regression
-
-The unlabelled libarchive CP437 ZIP with `café/über.txt` currently extracts that
-name with private-use characters on this Windows environment. The native
-encoding analysis elects not to override the codepage and the worker's default
-decoding does not preserve CP437. Its three container cases have **strict
-xfail** markers: the exact original path/content assertions remain enabled,
-and a future fix will produce XPASS failures until the marker is removed.
-Only the reproduced filename substitution with otherwise exact member hashes
-raises the expected exception; fixture failures or additional output defects
-remain ordinary failures.
-The marker is active only in the reproduced Windows CP936 environment. Other
-system codepages still run the same exact-path assertion as a normal test.
+The legacy CP437 case asserts exact names and contents in all three containers.
+Rust passes CP437 explicitly when it wins the filename analysis, so the native
+handler cannot substitute its Unix UTF-8 heuristic or the machine's codepage.
+UTF-8 flags and valid Unicode path fields retain precedence in the handler.

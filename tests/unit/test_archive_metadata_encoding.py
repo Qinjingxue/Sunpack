@@ -288,15 +288,16 @@ def test_unicode_path_extra_field_needs_no_python_name_copy(tmp_path):
     assert any("0x7075" in reason for reason in result.reasons)
 
 
-def test_ambiguous_codepage_does_not_block_extraction(tmp_path):
+def test_cp437_default_is_explicit_even_without_high_confidence(tmp_path):
     archive = tmp_path / "ambiguous.zip"
     _write_stored_zip(archive, b"\x82.txt", b"payload")
 
     result = ArchiveMetadataScanner().scan(str(archive), format_hint="zip")
 
     assert result.error is None
-    assert result.selected_codepage is None
-    assert result.warnings
+    assert result.selected_codepage == "437"
+    assert result.confidence < 0.5
+    assert not result.warnings
 
 
 def _write_stored_zip(

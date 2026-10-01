@@ -63,6 +63,26 @@ def test_usn_data_reason_detects_same_size_in_place_content_change():
     )
 
 
+@pytest.mark.parametrize(("size", "mtime", "file_id", "usn", "reasons", "known", "matches"), [
+    (100, 10.0, "file", 100, 0, False, True),
+    (100, 10.000000000000002, "file", 100, 0, False, True),
+    (100, 11.0, "file", 101, 0x00008000, True, True),
+    (100, 10.0, "file", 101, scheduler_module.USN_REASON_DATA_OVERWRITE, True, False),
+    (100, 10.0, "file", 101, 0, False, False),
+    (101, 10.0, "file", 100, 0, False, False),
+    (100, 10.0, "replacement", 100, 0, False, False),
+])
+def test_password_retry_identity_uses_existing_content_change_rules(
+    tmp_path, size, mtime, file_id, usn, reasons, known, matches,
+):
+    path = str(tmp_path / "retained.unrelated")
+    entry = SimpleNamespace(path=path, size=100, mtime=10.0, file_id="file", change_usn=100)
+    candidate = WatchCandidate(path, size, mtime, file_id, usn,
+                               change_reasons=reasons, change_reasons_without_close=reasons,
+                               change_reasons_known=known)
+    assert scheduler_module._candidate_matches_password_failure(candidate, entry) is matches
+
+
 @pytest.mark.parametrize("mode", ["delete", "flatten"])
 def test_existing_watch_success_notification_includes_postprocess_warning(tmp_path, monkeypatch, mode):
     monkeypatch.setattr(scheduler_module, "Observer", FakeObserver)

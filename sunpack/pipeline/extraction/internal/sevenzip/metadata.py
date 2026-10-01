@@ -157,7 +157,7 @@ class ArchiveMetadataScanner:
                 result.selected_codepage = str(selected_codepage)
                 result.reasons.append(
                     self.i18n.t(
-                        "metadata.high_confidence",
+                        "metadata.selected_codepage",
                         label=str(native.get("selected_label") or ""),
                         codepage=result.selected_codepage,
                     )

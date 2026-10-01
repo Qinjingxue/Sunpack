@@ -65,13 +65,13 @@ enum EncodingKind {
 }
 
 impl EncodingKind {
-    fn codepage(self) -> Option<&'static str> {
+    fn codepage(self) -> &'static str {
         match self {
-            Self::Cp437 => None,
-            Self::Utf8 => Some("65001"),
-            Self::Cp936 => Some("936"),
-            Self::Cp950 => Some("950"),
-            Self::Cp932 => Some("932"),
+            Self::Cp437 => "437",
+            Self::Utf8 => "65001",
+            Self::Cp936 => "936",
+            Self::Cp950 => "950",
+            Self::Cp932 => "932",
         }
     }
 
@@ -360,15 +360,17 @@ fn analyze_zip_input(
     result.confidence = confidence;
     result.evidence = Some(evidence);
 
-    if selection.kind.codepage().is_some()
-        && selection.score >= 12
-        && result
-            .evidence
-            .as_ref()
-            .is_some_and(|value| value.lead >= 6)
-        && selection.decoded_count > 0
+    // CP437 is the ZIP default, not a heuristic override. Pass it explicitly:
+    // the native handler's default depends on HostOS and the system locale.
+    if matches!(selection.kind, EncodingKind::Cp437)
+        || (selection.score >= 12
+            && result
+                .evidence
+                .as_ref()
+                .is_some_and(|value| value.lead >= 6)
+            && selection.decoded_count > 0)
     {
-        result.selected_codepage = selection.kind.codepage();
+        result.selected_codepage = Some(selection.kind.codepage());
     }
     Ok(result)
 }

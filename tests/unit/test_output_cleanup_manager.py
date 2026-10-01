@@ -102,6 +102,38 @@ def test_executor_failure_is_reported_without_claiming_cleanup(tmp_path):
     assert output.is_dir()
 
 
+def test_cleanup_admits_unrelated_sibling_operation_in_same_request(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from sunpack.core.support.resource_lifecycle import TaskResourceScope
+
+    output = tmp_path / "output"
+    output.mkdir()
+    sibling = tmp_path / "sibling.txt"
+    sibling.write_text("unrelated input", encoding="utf-8")
+    scope = TaskResourceScope("cleanup-sibling", files=(sibling,))
+
+    class ConcurrentExecutor(OutputCleanupExecutor):
+        @staticmethod
+        def remove_tree(path):
+            def sibling_operation():
+                with scope.operation(files=(sibling,)):
+                    return True
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                assert pool.submit(sibling_operation).result(timeout=2)
+            OutputCleanupExecutor.remove_tree(path)
+
+    try:
+        with scope.activate():
+            result = OutputCleanupManager(ConcurrentExecutor()).cleanup_canonical(
+                str(output), event=OutputCleanupEvent.EXTRACT_RETRY,
+            )
+        assert result.cleaned
+        assert sibling.is_file()
+    finally:
+        scope.close()
+
+
 @pytest.mark.parametrize("role", [OutputRole.CANONICAL, OutputRole.PARTIAL_FILE])
 def test_scoped_cleanup_authorizes_only_strict_workspace_descendants(tmp_path, role):
     workspace = tmp_path / "workspace"
@@ -131,4 +163,3 @@ def test_scoped_cleanup_authorizes_only_strict_workspace_descendants(tmp_path, r
     assert result.cleaned
     assert not inside.exists()
     assert workspace.exists() and outside.exists()
-
