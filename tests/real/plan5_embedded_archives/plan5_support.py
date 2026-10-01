@@ -1,8 +1,6 @@
 from __future__ import annotations
 
-import hashlib
 import os
-import random
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -26,6 +24,7 @@ from tests.helpers.real_archives import (
     create_encrypted_zip_archive,
     create_rar4_archive,
 )
+from tests.helpers.native_fixture import assemble_carrier
 from tests.helpers.tool_config import get_optional_rar, get_test_tools
 from tests.real.plan1_real_archives.plan1_support import run_plan1_pipeline
 
@@ -36,11 +35,9 @@ FILE_NAME = "plan5_embedded.bin"
 PAYLOAD_SIZE = 8 * 1024
 JUNK_MIN = 192
 JUNK_MAX = 6 * 1024
-MAX_ASSEMBLY_ATTEMPTS = 40
 LARGE_SEGMENT_COUNT = 128
 LARGE_JUNK_MIN = 24
 LARGE_JUNK_MAX = 96
-LARGE_MAX_ASSEMBLY_ATTEMPTS = 12
 
 
 # 段顺序刻意打散：相邻段避免同格式，且加密段与非加密段交错，
@@ -144,7 +141,7 @@ def available_segment_specs() -> list[dict[str, Any]]:
     ]
 
 
-def _create_archive_bytes(
+def _create_segment_archive(
     scratch: Path,
     spec: dict[str, Any],
     password: str,
@@ -205,35 +202,38 @@ def _create_archive_bytes(
     raise ValueError(f"unknown plan5 segment creator: {creator}")
 
 
-def _assemble(segments: list[dict[str, Any]], salt: int, junk_min: int, junk_max: int):
-    """按 [垃圾][压缩段]…[垃圾] 组装字节流；每个垃圾块用独立种子随机生成。"""
-    blob = bytearray()
-    junk_blocks: list[tuple[int, str]] = []
-    offset = 0
-    for index, segment in enumerate(segments):
-        rng = random.Random((0x5A17C0DE ^ (index * 0x9E3779B9) ^ ((salt + 1) * 0x2545F491)) & 0xFFFFFFFF)
-        junk_len = rng.randrange(junk_min, junk_max + 1)
-        junk = bytes(rng.getrandbits(8) for _ in range(junk_len))
-        blob.extend(junk)
-        junk_blocks.append((junk_len, hashlib.sha256(junk).hexdigest()))
-        offset += junk_len
-
-        segment["offset"] = offset
-        blob.extend(segment["bytes"])
-        segment["length"] = len(segment["bytes"])
-        offset += len(segment["bytes"])
-
-    tail_rng = random.Random((0xDEADBEEF ^ (salt * 0x9E3779B9)) & 0xFFFFFFFF)
-    tail_len = tail_rng.randrange(junk_min, junk_max + 1)
-    tail = bytes(tail_rng.getrandbits(8) for _ in range(tail_len))
-    blob.extend(tail)
-    junk_blocks.append((tail_len, hashlib.sha256(tail).hexdigest()))
-    return bytes(blob), junk_blocks
-
-
-def _candidate_offsets(path: Path) -> set[tuple[str, int]]:
-    result = scan_embedded_archives(str(path), expected_size=path.stat().st_size)
-    return {(candidate.format, candidate.offset) for candidate in result.candidates}
+def _write_embedded_case(
+    file_path: Path, segments: list[dict[str, Any]], *, case_id: str,
+    password: str, seed: int, junk_min: int, junk_max: int,
+    skipped: tuple[str, ...], scratch: Path, error_info: dict | None,
+) -> EmbeddedMixedCase:
+    # Ground truth comes exclusively from bytes written by the Rust fixture tool.
+    # Never ask the detector whether an input is suitable for this test.
+    try:
+        layout = assemble_carrier(
+            file_path, [segment["path"] for segment in segments],
+            seed=seed, junk_min=junk_min, junk_max=junk_max,
+        )
+        specs = tuple(
+            EmbeddedSegmentSpec(
+                position=index, archive_format=str(segment["format"]),
+                variant=str(segment["variant"]), encrypted=bool(segment.get("encrypted", False)),
+                password=segment["password"], marker_name=segment["marker_name"],
+                marker_text=segment["marker_text"], offset=extent["offset"],
+                length=extent["length"], source_name=segment["source_name"],
+            )
+            for index, (segment, extent) in enumerate(zip(segments, layout["segments"], strict=True))
+        )
+        if error_info is not None:
+            error_info["fixture_seed"] = seed
+            error_info["fixture_layout"] = layout
+        return EmbeddedMixedCase(
+            case_id=case_id, file_path=file_path, segments=specs, password=password,
+            junk_blocks=tuple((block["length"], block["sha256"]) for block in layout["junk_blocks"]),
+            skipped_formats=skipped,
+        )
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def build_embedded_mixed_case(
@@ -243,14 +243,13 @@ def build_embedded_mixed_case(
     payload_size: int = PAYLOAD_SIZE,
     junk_min: int = JUNK_MIN,
     junk_max: int = JUNK_MAX,
-    max_attempts: int = MAX_ASSEMBLY_ATTEMPTS,
+    seed: int = 0x5A17C0DE,
     error_info: dict[str, Any] | None = None,
 ) -> EmbeddedMixedCase:
     """构造第 5 条测试文件：[垃圾][压缩段][垃圾][压缩段]…[垃圾]。
 
-    垃圾块全部随机生成（每个块独立种子、长度可变），组装后立刻用
-    scan_embedded_archives 验证每个构造段都能被识别；随机垃圾若撞出
-    可验证签名导致缺段，则换盐值重新组装（有界重试）。
+    Rust 按固定种子一次性流式组装，预期偏移由写入位置决定。
+    扫描漏段必须在断言中失败，禁止换输入掩盖漏检。
     """
     root = Path(root)
     scratch = root / "_plan5_sources"
@@ -269,70 +268,22 @@ def build_embedded_mixed_case(
 
     segments: list[dict[str, Any]] = []
     for spec in selected:
-        archive_path, marker_name, marker_text = _create_archive_bytes(
+        archive_path, marker_name, marker_text = _create_segment_archive(
             scratch, spec, password, payload_size
         )
         segments.append({
             **spec,
-            "bytes": archive_path.read_bytes(),
+            "path": archive_path,
             "source_name": archive_path.name,
             "marker_name": marker_name,
             "marker_text": marker_text,
             "password": password if spec["encrypted"] else None,
         })
 
-    attempts: list[dict[str, Any]] = []
-    for salt in range(max_attempts):
-        assembled, junk_blocks = _assemble(segments, salt, junk_min, junk_max)
-        tmp_path = mixed_dir / ".plan5_embedded.tmp"
-        tmp_path.write_bytes(assembled)
-        found = _candidate_offsets(tmp_path)
-        missing = [
-            str(segment["variant"])
-            for segment in segments
-            if (segment["format"], int(segment["offset"])) not in found
-        ]
-        digests = [digest for _length, digest in junk_blocks]
-        if not missing and len(set(digests)) == len(digests):
-            file_path.write_bytes(assembled)
-            tmp_path.unlink(missing_ok=True)
-            shutil.rmtree(scratch, ignore_errors=True)
-            spec_objects = tuple(
-                EmbeddedSegmentSpec(
-                    position=index,
-                    archive_format=str(segment["format"]),
-                    variant=str(segment["variant"]),
-                    encrypted=bool(segment["encrypted"]),
-                    password=str(segment["password"]) if segment["password"] else None,
-                    marker_name=str(segment["marker_name"]),
-                    marker_text=str(segment["marker_text"]),
-                    offset=int(segment["offset"]),
-                    length=int(segment["length"]),
-                    source_name=str(segment["source_name"]),
-                )
-                for index, segment in enumerate(segments)
-            )
-            return EmbeddedMixedCase(
-                case_id=CASE_ID,
-                file_path=file_path,
-                segments=spec_objects,
-                password=password,
-                junk_blocks=tuple(junk_blocks),
-                skipped_formats=skipped,
-            )
-        attempts.append({
-            "salt": salt,
-            "missing_variants": missing,
-            "junk_collision": len(set(digests)) != len(digests),
-        })
-        tmp_path.unlink(missing_ok=True)
-
-    shutil.rmtree(scratch, ignore_errors=True)
-    if error_info is not None:
-        error_info["plan5_build_attempts"] = attempts
-    raise RuntimeError(
-        f"plan5 fixture could not assemble a file covering every segment "
-        f"after {max_attempts} attempts; last missing={attempts[-1] if attempts else None}"
+    return _write_embedded_case(
+        file_path, segments, case_id=CASE_ID, password=password, seed=seed,
+        junk_min=junk_min, junk_max=junk_max, skipped=skipped,
+        scratch=scratch, error_info=error_info,
     )
 
 
@@ -344,7 +295,7 @@ def build_large_embedded_case(
     payload_size: int = 64,
     junk_min: int = LARGE_JUNK_MIN,
     junk_max: int = LARGE_JUNK_MAX,
-    max_attempts: int = LARGE_MAX_ASSEMBLY_ATTEMPTS,
+    seed: int = 0x1285A17C0DE,
     error_info: dict[str, Any] | None = None,
 ) -> EmbeddedMixedCase:
     """构造百级真实嵌入归档：[无效数据][压缩包][无效数据]循环。"""
@@ -373,70 +324,22 @@ def build_large_embedded_case(
 
     segments: list[dict[str, Any]] = []
     for spec in selected:
-        archive_path, marker_name, marker_text = _create_archive_bytes(
+        archive_path, marker_name, marker_text = _create_segment_archive(
             scratch, spec, password, payload_size
         )
         segments.append({
             **spec,
-            "bytes": archive_path.read_bytes(),
+            "path": archive_path,
             "source_name": archive_path.name,
             "marker_name": marker_name,
             "marker_text": marker_text,
             "password": None,
         })
 
-    attempts: list[dict[str, Any]] = []
-    for salt in range(max_attempts):
-        assembled, junk_blocks = _assemble(segments, salt, junk_min, junk_max)
-        tmp_path = mixed_dir / ".plan5_large_embedded.tmp"
-        tmp_path.write_bytes(assembled)
-        found = _candidate_offsets(tmp_path)
-        missing = [
-            str(segment["variant"])
-            for segment in segments
-            if (segment["format"], int(segment["offset"])) not in found
-        ]
-        digests = [digest for _length, digest in junk_blocks]
-        if not missing and len(set(digests)) == len(digests):
-            file_path.write_bytes(assembled)
-            tmp_path.unlink(missing_ok=True)
-            shutil.rmtree(scratch, ignore_errors=True)
-            spec_objects = tuple(
-                EmbeddedSegmentSpec(
-                    position=index,
-                    archive_format=str(segment["format"]),
-                    variant=str(segment["variant"]),
-                    encrypted=False,
-                    password=None,
-                    marker_name=str(segment["marker_name"]),
-                    marker_text=str(segment["marker_text"]),
-                    offset=int(segment["offset"]),
-                    length=int(segment["length"]),
-                    source_name=str(segment["source_name"]),
-                )
-                for index, segment in enumerate(segments)
-            )
-            return EmbeddedMixedCase(
-                case_id=f"plan5_large_{count}",
-                file_path=file_path,
-                segments=spec_objects,
-                password=password,
-                junk_blocks=tuple(junk_blocks),
-                skipped_formats=(),
-            )
-        attempts.append({
-            "salt": salt,
-            "missing_variants": missing,
-            "junk_collision": len(set(digests)) != len(digests),
-        })
-        tmp_path.unlink(missing_ok=True)
-
-    shutil.rmtree(scratch, ignore_errors=True)
-    if error_info is not None:
-        error_info["plan5_large_build_attempts"] = attempts
-    raise RuntimeError(
-        f"large plan5 fixture could not assemble {count} archives after "
-        f"{max_attempts} attempts; last missing={attempts[-1] if attempts else None}"
+    return _write_embedded_case(
+        file_path, segments, case_id=f"plan5_large_{count}", password=password, seed=seed,
+        junk_min=junk_min, junk_max=junk_max, skipped=(),
+        scratch=scratch, error_info=error_info,
     )
 
 

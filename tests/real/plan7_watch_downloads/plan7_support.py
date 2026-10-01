@@ -489,6 +489,7 @@ def start_watch(
     state_path: Path | None = None,
     initial_scan: bool = False,
     notification_sink: Any | None = None,
+    flatten_single_directory: bool = False,
 ) -> WatchHarness:
     watch_root = tmp_path / label / "watch"
     output_root = tmp_path / label / "out"
@@ -500,6 +501,7 @@ def start_watch(
     )
     config = plan7_watch_config(passwords=passwords)
     config["post_extract"]["archive_cleanup_mode"] = cleanup_mode
+    config["post_extract"]["flatten_single_directory"] = flatten_single_directory
     submit_times: list[float] = []
     submission_events: list[SubmissionEvent] = []
     run_durations: list[float] = []
