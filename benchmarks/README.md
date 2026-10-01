@@ -34,6 +34,7 @@ python -m benchmarks extraction worker-vs-7z-300m `
   --small-files 8 --large-files 2 --large-file-mib 150 --runs 5 --warmups 0 `
   --json-out benchmarks/results/worker-vs-7z-300m-v0.7.0-c3eaec11-rss.json
 python -m benchmarks extraction worker-read-blocking --runs 1 --payload-gib 1 --json-out benchmarks/results/worker-read-blocking.json
+uv run python -m benchmarks extraction worker-concurrency-300m --concurrency 8 --runs 2 --json-out benchmarks/results/worker-concurrency-300m.json
 python -m benchmarks extraction worker-read-patterns --runs 1 --json-out benchmarks/results/worker-read-patterns.json
 # Enable the production format-aware prefetch policy while tuning its defaults (512 KiB x 2).
 python -m benchmarks extraction worker-read-patterns --runs 2 --prefetch on --prefetch-window-kib 512 --prefetch-depth 2
@@ -212,6 +213,22 @@ worker CPU/RSS/read/write utilization, early- and overall-admission Jain fairnes
 the spread to each request's first admission, and the longest same-request admission
 run. The early index detects short-term monopolization; the overall index detects
 whether requests receive equal admission counts by the end of the batch.
+
+`extraction worker-concurrency-300m` compares one persistent native worker with
+concurrent fresh `7z.exe` processes on all 18 generated 300 MiB format/variant
+cases. It reuses the format builder with payloads written by a standalone Rust
+fixture generator (requires `rustc`), caches fixtures, passes the real output
+volume identity, and validates output counts and sizes outside the timer.
+Each homogeneous burst contains as many jobs as the requested concurrency;
+the mixed batch contains two rounds of all cases at every concurrency. Reports
+include paired trials with alternating engine order, throughput, sampled RSS,
+process CPU time, and worker start/finish timelines. `--resume` continues completed
+batches after checking binary and configuration fingerprints. For diagnosis,
+`--dry-run` compares decode/verify against `7z t`, `--writer-threads` changes the
+per-volume writer width, and `--profile` enables available native diagnostics.
+`--format` and `--no-mixed` restrict diagnostic runs. These direct worker tests
+exclude CLI/watch planning, recursive extraction, and post-extract verification.
+Compressed TAR codecs are measured as one outer stream layer for both engines.
 
 `memory many-tasks` measures memory _growth_ (not peak) of the two long-lived
 components under a large task count across every format: the Python pipeline and

@@ -270,9 +270,13 @@ def create_corpus(
     large_files: int,
     large_file_mib: int,
     progress: Callable[[str], None] | None = None,
+    *,
+    payloads: dict[str, Path] | None = None,
+    copy_file: Callable[[Path, Path], Any] = shutil.copy2,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, str]]:
     root.mkdir(parents=True, exist_ok=True)
-    payloads = _write_payloads(root / "payloads", small_files, large_files, large_file_mib, progress=progress)
+    if payloads is None:
+        payloads = _write_payloads(root / "payloads", small_files, large_files, large_file_mib, progress=progress)
     expected_payload_bytes = {name: _payload_total_bytes(path) for name, path in payloads.items()}
     corpus: dict[str, dict[str, Any]] = {}
     skipped: dict[str, str] = {}
@@ -347,7 +351,7 @@ def create_corpus(
                 corpus[f"{workload}:{ext}"] = {"workload": workload, "format": ext, "path": target}
                 alias = {"gz": "tgz", "bz2": "tbz2", "xz": "txz"}[ext]
                 alias_target = root / f"{workload}.{alias}"
-                shutil.copy2(target, alias_target)
+                copy_file(target, alias_target)
                 corpus[f"{workload}:{alias}"] = {"workload": workload, "format": alias, "path": alias_target}
             else:
                 skipped[f"{workload}:{ext}"] = "bundled 7-Zip cannot create this format"
@@ -358,7 +362,7 @@ def create_corpus(
         if tar_source is not None and _create_zstd_archive(zstd_target, tar_source):
             corpus[f"{workload}:zst"] = {"workload": workload, "format": "zst", "path": zstd_target}
             tzst_target = root / f"{workload}.tzst"
-            shutil.copy2(zstd_target, tzst_target)
+            copy_file(zstd_target, tzst_target)
             corpus[f"{workload}:tzst"] = {"workload": workload, "format": "tzst", "path": tzst_target}
         else:
             skipped[f"{workload}:zst"] = "zstandard runtime cannot create this format"
