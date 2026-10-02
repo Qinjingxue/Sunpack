@@ -89,7 +89,13 @@ def generate(destination: Path = DESTINATION, cases: tuple = STRUCTURE_CASES) ->
                 command = [tar, "--format", writer_format, "-cf", str(archive)]
                 if variant == "zip-cp437":
                     command.extend(["--options", "zip:hdrcharset=CP437"])
-                command.extend(sorted(members))
+                if variant in {"pax", "zip"}:
+                    # Let bsdtar discover Unicode paths while walking the
+                    # source tree. Passing those paths as Windows argv can
+                    # lose characters in tar.exe's code-page conversion.
+                    command.append(".")
+                else:
+                    command.extend(sorted(members))
                 if variant == "zip-duplicate":
                     command.append("same.txt")
                     expected["same(1).txt"] = expected["same.txt"]
