@@ -128,12 +128,11 @@ class ArchiveInputPlanningStage:
         _, tasks = self._plan_task_to_tasks(task)
         return tasks
 
+    def requires_analysis(self, task: ArchiveTask) -> bool:
+        return self.analyzer is not None and not _discovery_confirmed(task)
+
     def _plan_task_to_tasks(self, task: ArchiveTask) -> tuple[ArchiveAnalysisReport | None, list[ArchiveTask]]:
-        if _discovery_confirmed(task):
-            # Discovery already supplied the exact native input descriptor.
-            # The worker decides whether extraction actually succeeds.
-            return None, [task]
-        if self.analyzer is None:
+        if not self.requires_analysis(task):
             return None, [task]
         try:
             report = self._get_or_create_report(task)

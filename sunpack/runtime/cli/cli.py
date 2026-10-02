@@ -19,6 +19,7 @@ from sunpack.runtime.cli.cli_parsers import (
 from sunpack.runtime.cli.cli_reporter import CliReporter
 from sunpack.runtime.cli.cli_types import CliCommandResult
 from sunpack.core.support.runtime_identity import runtime_id_available
+from sunpack.core.support.resources import resource_path_resolution_scope
 
 CURRENT_CLI_LANG = DEFAULT_CLI_LANG
 _PARSER_CACHE: dict[str, argparse.ArgumentParser] = {}
@@ -150,84 +151,87 @@ async def async_main(
 
             return submit_request(list(argv))
 
-    argv = preprocess_sys_argv(argv)
-    request_cwd = os.path.abspath(cwd or os.getcwd())
-    CURRENT_CLI_LANG = load_cli_language_from_config(request_cwd)
-    ctx = CliContext(
-        language=CURRENT_CLI_LANG,
-        cwd=request_cwd,
-        stdin=stdin if stdin is not None else sys.stdin,
-        stdout=stdout if stdout is not None else sys.stdout,
-        stderr=stderr if stderr is not None else sys.stderr,
-        input_reader=input_reader,
-    )
-    # Extract and scan are latency-sensitive paths. Other commands retain full
-    # discovery because some command registrations are imported by companion
-    # command modules today.
-    requested_command = canonical_command(argv[0]) if argv else None
-    selected_command = requested_command if requested_command in {"extract", "scan"} else None
-    parser = cached_cli_parser(ctx, command=selected_command)
-    stdout_token = _PARSER_STDOUT.set(ctx.stdout)
-    stderr_token = _PARSER_STDERR.set(ctx.stderr)
-    try:
-        if not argv:
-            parser.print_help()
-            return EXIT_OK
+    with resource_path_resolution_scope(
+        enabled=bool(argv) and canonical_command(argv[0]) in {"extract", "scan"},
+    ):
+        argv = preprocess_sys_argv(argv)
+        request_cwd = os.path.abspath(cwd or os.getcwd())
+        CURRENT_CLI_LANG = load_cli_language_from_config(request_cwd)
+        ctx = CliContext(
+            language=CURRENT_CLI_LANG,
+            cwd=request_cwd,
+            stdin=stdin if stdin is not None else sys.stdin,
+            stdout=stdout if stdout is not None else sys.stdout,
+            stderr=stderr if stderr is not None else sys.stderr,
+            input_reader=input_reader,
+        )
+        # Extract and scan are latency-sensitive paths. Other commands retain full
+        # discovery because some command registrations are imported by companion
+        # command modules today.
+        requested_command = canonical_command(argv[0]) if argv else None
+        selected_command = requested_command if requested_command in {"extract", "scan"} else None
+        parser = cached_cli_parser(ctx, command=selected_command)
+        stdout_token = _PARSER_STDOUT.set(ctx.stdout)
+        stderr_token = _PARSER_STDERR.set(ctx.stderr)
         try:
-            args = parser.parse_args(argv)
-        except SystemExit as exc:
-            return int(exc.code)
-    finally:
-        _PARSER_STDOUT.reset(stdout_token)
-        _PARSER_STDERR.reset(stderr_token)
+            if not argv:
+                parser.print_help()
+                return EXIT_OK
+            try:
+                args = parser.parse_args(argv)
+            except SystemExit as exc:
+                return int(exc.code)
+        finally:
+            _PARSER_STDOUT.reset(stdout_token)
+            _PARSER_STDERR.reset(stderr_token)
 
-    args.json = bool(getattr(args, "json", False) or "-j" in argv or "--json" in argv)
-    args.quiet = bool(getattr(args, "quiet", False) or "-q" in argv or "--quiet" in argv)
-    args.verbose = bool(getattr(args, "verbose", False) or "-v" in argv or "--verbose" in argv)
-    args.pause_on_exit = bool(getattr(args, "pause_on_exit", False) or "--pause" in argv)
-    process_mode = getattr(args, "process_mode", None)
-    if process_mode is not None:
-        from sunpack.runtime.cli.runtime_state import runtime_host
+        args.json = bool(getattr(args, "json", False) or "-j" in argv or "--json" in argv)
+        args.quiet = bool(getattr(args, "quiet", False) or "-q" in argv or "--quiet" in argv)
+        args.verbose = bool(getattr(args, "verbose", False) or "-v" in argv or "--verbose" in argv)
+        args.pause_on_exit = bool(getattr(args, "pause_on_exit", False) or "--pause" in argv)
+        process_mode = getattr(args, "process_mode", None)
+        if process_mode is not None:
+            from sunpack.runtime.cli.runtime_state import runtime_host
 
-        host = runtime_host()
-        if host is not None:
-            await host.set_cli_process_mode_override(process_mode)
-    reporter = CliReporter(
-        json_mode=args.json,
-        quiet=args.quiet,
-        verbose=args.verbose,
-        stdout=ctx.stdout,
-        stderr=ctx.stderr,
-    )
-    ctx.reporter = reporter
-    if args.json and getattr(args, "prompt_passwords", False):
-        result = CliCommandResult(
-            command=getattr(args, "command", ""),
-            inputs={"argv": argv},
-            summary={},
-            errors=[ctx.t("cli.json_password_prompt_unavailable")],
+            host = runtime_host()
+            if host is not None:
+                await host.set_cli_process_mode_override(process_mode)
+        reporter = CliReporter(
+            json_mode=args.json,
+            quiet=args.quiet,
+            verbose=args.verbose,
+            stdout=ctx.stdout,
+            stderr=ctx.stderr,
         )
-        reporter.emit_result(result)
-        return EXIT_USAGE
-    if args.json:
-        args.pause_on_exit = False
-    try:
-        exit_code, result = await dispatch_command(args, ctx)
-    except Exception as exc:
-        reporter.error(ctx.t("cli.runtime_failure", error=exc))
-        result = CliCommandResult(
-            command=getattr(args, "command", ""),
-            inputs={"argv": argv},
-            summary={},
-            errors=[ctx.t("cli.runtime_failure", error=exc)],
-        )
-        reporter.emit_result(result)
-        await maybe_pause(args, ctx, EXIT_RUNTIME, result)
-        return EXIT_RUNTIME
+        ctx.reporter = reporter
+        if args.json and getattr(args, "prompt_passwords", False):
+            result = CliCommandResult(
+                command=getattr(args, "command", ""),
+                inputs={"argv": argv},
+                summary={},
+                errors=[ctx.t("cli.json_password_prompt_unavailable")],
+            )
+            reporter.emit_result(result)
+            return EXIT_USAGE
+        if args.json:
+            args.pause_on_exit = False
+        try:
+            exit_code, result = await dispatch_command(args, ctx)
+        except Exception as exc:
+            reporter.error(ctx.t("cli.runtime_failure", error=exc))
+            result = CliCommandResult(
+                command=getattr(args, "command", ""),
+                inputs={"argv": argv},
+                summary={},
+                errors=[ctx.t("cli.runtime_failure", error=exc)],
+            )
+            reporter.emit_result(result)
+            await maybe_pause(args, ctx, EXIT_RUNTIME, result)
+            return EXIT_RUNTIME
 
-    reporter.emit_result(result)
-    await maybe_pause(args, ctx, exit_code, result)
-    return exit_code
+        reporter.emit_result(result)
+        await maybe_pause(args, ctx, exit_code, result)
+        return exit_code
 
 
 def _should_submit_to_persistent_server(argv: list[str]) -> bool:

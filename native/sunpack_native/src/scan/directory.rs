@@ -579,31 +579,12 @@ impl NativeOutputInventory {
         Ok(rows)
     }
 
-    #[pyo3(signature = (
-        patterns, prune_dir_globs, blocked_extensions, blocked_file_names,
-        size_ranges, mtime_ranges, whitelist_rules
-    ))]
     fn build_directory_snapshots(
         &self,
         py: Python<'_>,
-        patterns: Vec<String>,
-        prune_dir_globs: Vec<String>,
-        blocked_extensions: Vec<String>,
-        blocked_file_names: Vec<String>,
-        size_ranges: Vec<NumericRangeTuple>,
-        mtime_ranges: Vec<NumericRangeTuple>,
-        whitelist_rules: Vec<WhitelistRuleTuple>,
+        options: PyRef<'_, NativeDirectoryScanOptions>,
     ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-        let options = DirectoryScanOptions::new(
-            patterns,
-            prune_dir_globs,
-            blocked_extensions,
-            blocked_file_names,
-            size_ranges,
-            mtime_ranges,
-            whitelist_rules,
-        )?;
-        let mut records = build_inventory_snapshot_views(&self.root, self.files.as_ref(), &options);
+        let mut records = build_inventory_snapshot_views(&self.root, self.files.as_ref(), &options.options);
         populate_relation_anchors(&mut records.raw);
         let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
@@ -1067,6 +1048,51 @@ impl DirectoryScanOptions {
     }
 }
 
+#[pyclass(module = "sunpack_native", frozen)]
+pub(crate) struct NativeDirectoryScanOptions {
+    options: DirectoryScanOptions,
+}
+
+#[pymethods]
+impl NativeDirectoryScanOptions {
+    #[new]
+    fn new(
+        patterns: Vec<String>,
+        prune_dir_globs: Vec<String>,
+        blocked_extensions: Vec<String>,
+        blocked_file_names: Vec<String>,
+        size_ranges: Vec<NumericRangeTuple>,
+        mtime_ranges: Vec<NumericRangeTuple>,
+        whitelist_rules: Vec<WhitelistRuleTuple>,
+    ) -> PyResult<Self> {
+        Ok(Self { options: DirectoryScanOptions::new(
+            patterns, prune_dir_globs, blocked_extensions, blocked_file_names,
+            size_ranges, mtime_ranges, whitelist_rules,
+        )? })
+    }
+
+    fn scan(
+        &self,
+        py: Python<'_>,
+        root_path: &str,
+        max_depth: Option<usize>,
+    ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
+        scan_snapshots_with_options(py, root_path, max_depth, &self.options)
+    }
+}
+
+fn scan_snapshots_with_options(
+    py: Python<'_>,
+    root_path: &str,
+    max_depth: Option<usize>,
+    options: &DirectoryScanOptions,
+) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
+    let mut records = scan_directory_views(root_path, max_depth, options)?;
+    populate_relation_anchors(&mut records.raw);
+    let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
+    Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
+}
+
 #[pyfunction]
 #[pyo3(signature = (root_path, max_depth, patterns, prune_dir_globs, blocked_extensions, blocked_file_names, size_ranges, mtime_ranges, whitelist_rules))]
 pub(crate) fn scan_directory_snapshot(
@@ -1118,10 +1144,7 @@ pub(crate) fn scan_directory_snapshots(
         mtime_ranges,
         whitelist_rules,
     )?;
-    let mut records = scan_directory_views(root_path, max_depth, &options)?;
-    populate_relation_anchors(&mut records.raw);
-    let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
-    Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
+    scan_snapshots_with_options(py, root_path, max_depth, &options)
 }
 
 #[pyfunction]

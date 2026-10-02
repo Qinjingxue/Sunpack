@@ -106,18 +106,6 @@ class ArchiveTask:
     def set_knowledge(self, knowledge: ArchiveKnowledge | dict) -> None:
         self._knowledge = ArchiveKnowledge.from_any(knowledge)
 
-    def _replace_knowledge_payload(
-        self,
-        payload: dict[str, Any],
-        *,
-        knowledge_cache: ArchiveKnowledge | None = None,
-    ) -> None:
-        self._knowledge = (
-            knowledge_cache
-            if knowledge_cache is not None
-            else ArchiveKnowledge.from_any(payload)
-        )
-
     def set_archive_input(self, descriptor: ArchiveInputDescriptor) -> None:
         self.cleanup_parts = list(dedupe_values([
             *descriptor.part_paths(),

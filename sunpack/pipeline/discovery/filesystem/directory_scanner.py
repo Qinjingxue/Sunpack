@@ -2,6 +2,7 @@ from pathlib import Path
 import re
 
 from sunpack_native import (
+    NativeDirectoryScanOptions,
     filter_inventory_file_indices as _NATIVE_FILTER_INVENTORY_FILE_INDICES,
     scan_directory_snapshot as _NATIVE_SCAN_DIRECTORY_SNAPSHOT,
     scan_directory_snapshots as _NATIVE_SCAN_DIRECTORY_SNAPSHOTS,
@@ -87,23 +88,25 @@ class DirectoryScanner:
         ))
 
     @classmethod
+    def compile_scan_options(cls, config: dict | None = None):
+        options = cls(".", config=config)._native_filter_options()
+        if options is None:
+            raise RuntimeError("Native directory scan requires built-in filesystem filters only")
+        return NativeDirectoryScanOptions(**options)
+
+    @classmethod
     def snapshot_from_output_inventory(
         cls,
         root_path: str,
         inventory,
         *,
         config: dict | None = None,
+        scan_options=None,
     ) -> DirectorySnapshot | None:
-        scanner = cls(root_path, config=config)
-        options = scanner._native_inventory_filter_options()
-        if options is None:
-            return None
-        native_snapshot, raw_native_snapshot = inventory.build_directory_snapshots(options)
-        return DirectorySnapshot.from_native(
-            scanner.root_path,
-            native_snapshot,
-            raw_native_snapshot,
-        )
+        if scan_options is None:
+            scan_options = cls.compile_scan_options(config)
+        native_snapshot, raw_native_snapshot = inventory.build_directory_snapshots(scan_options)
+        return DirectorySnapshot.from_native(Path(root_path), native_snapshot, raw_native_snapshot)
 
     def _native_inventory_filter_options(self) -> dict | None:
         return self._native_filter_options()

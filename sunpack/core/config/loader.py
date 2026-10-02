@@ -8,7 +8,7 @@ from typing import Any
 from sunpack.core.config.advanced_defaults import _payload as _advanced_defaults_payload
 from sunpack.core.config.schema import ConfigSchemaError, config_fields, normalize_config
 from sunpack.core.support.json_format import load_json_file
-from sunpack.core.support.resources import candidate_resource_paths, dedupe_paths, first_existing_path, program_data_dir
+from sunpack.core.support.resources import candidate_resource_paths, first_existing_path, program_data_dir, resolve_resource_path
 from sunpack.core.support.process_executable import is_packaged_process
 
 
@@ -36,12 +36,7 @@ def _load_json(path: Path) -> dict[str, Any]:
 
 
 def _candidate_config_paths(filename: str, request_cwd: str | Path | None = None) -> list[Path]:
-    project_root = Path(__file__).resolve().parents[3]
-    invocation_root = Path(request_cwd).resolve() if request_cwd is not None else Path.cwd()
-    return dedupe_paths(
-        candidate_resource_paths(filename, request_cwd=request_cwd)
-        + [project_root / filename, invocation_root / filename, invocation_root / "sunpack-2" / filename]
-    )
+    return candidate_resource_paths(filename, request_cwd=request_cwd)
 
 
 def _searched_config_paths(filename: str, request_cwd: str | Path | None = None) -> list[Path]:
@@ -97,8 +92,8 @@ def _override_signature() -> tuple[str, int, int] | str | None:
     try:
         stat = path.stat()
     except OSError:
-        return (str(path.resolve()), -1, -1)
-    return (str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size))
+        return (str(resolve_resource_path(path)), -1, -1)
+    return (str(resolve_resource_path(path)), int(stat.st_mtime_ns), int(stat.st_size))
 
 
 _NAMED_MODULE_LIST_PATHS = {
@@ -229,8 +224,8 @@ def _config_file_signature(path: Path | None) -> tuple[str, int, int] | None:
     try:
         stat = path.stat()
     except OSError:
-        return (str(path.resolve()), -1, -1)
-    return (str(path.resolve()), int(stat.st_mtime_ns), int(stat.st_size))
+        return (str(resolve_resource_path(path)), -1, -1)
+    return (str(resolve_resource_path(path)), int(stat.st_mtime_ns), int(stat.st_size))
 
 
 def config_cache_token(request_cwd: str | Path | None = None) -> tuple[Any, ...]:
@@ -241,7 +236,7 @@ def config_cache_token(request_cwd: str | Path | None = None) -> tuple[Any, ...]
 
 
 def _config_source_path(path: Path | None) -> str | None:
-    return str(path.resolve()) if path is not None else None
+    return str(resolve_resource_path(path)) if path is not None else None
 
 
 def _override_source_identity() -> str | None:
@@ -249,7 +244,7 @@ def _override_source_identity() -> str | None:
     if not raw:
         return None
     path = Path(raw)
-    return f"file:{path.resolve()}" if path.is_file() else f"inline:{raw}"
+    return f"file:{resolve_resource_path(path)}" if path.is_file() else f"inline:{raw}"
 
 
 def config_source_key(request_cwd: str | Path | None = None) -> tuple[str | None, str | None, str | None]:

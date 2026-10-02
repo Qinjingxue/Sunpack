@@ -27,6 +27,7 @@ from sunpack.pipeline.extraction.scheduler import ExtractionScheduler
 from sunpack.pipeline.extraction.output_inventory import OutputInventory
 from sunpack.core.i18n import I18nContext
 from sunpack.pipeline.postprocess.actions import PostProcessActions
+from sunpack.pipeline.postprocess.internal.cleanup import ArchiveCleanup
 from sunpack.core.passwords.internal.store import MAX_RECENT_PASSWORDS
 from sunpack.core.platform.windows.shell_notify import notify_shell_directories_updated
 from sunpack.core.support.output_reservation import OutputReservationRegistry, build_output_dir_resolver
@@ -785,12 +786,15 @@ class _SourceCleanup:
         config: dict,
         factory: Callable[..., Any],
         request_id: str,
+        *,
+        notify: Callable = notify_shell_directories_updated,
     ):
         from sunpack.pipeline.coordinator.cleanup_refs import CleanupRefTable
 
         self._context = context
         self._config = config
         self._factory = factory
+        self._notify = notify
         self.request_id = str(request_id or "")
         self._table = CleanupRefTable()
 
@@ -867,14 +871,13 @@ class _SourceCleanup:
             error = ""
             if existing:
                 try:
-                    actions = self._factory(self._config, stdout=None)
                     if self._mode() == "keep":
-                        results.extend(actions.apply(
-                            archives_to_clean=[[path] for path in existing],
-                            flatten_targets=[],
-                            previous_cleanup=previous,
+                        cleanup = ArchiveCleanup("keep", self._config.get("cli", {}).get("language", "en"))
+                        results.extend(cleanup.cleanup_success_archives(
+                            [[path] for path in existing], previous=previous,
                         ))
                     else:
+                        actions = self._factory(self._config, stdout=None)
                         with promotion_barrier(
                             existing,
                             cache_releasers=(release_archive_sessions_under_roots,),
@@ -945,7 +948,7 @@ class _SourceCleanup:
                 ) for path in request.paths),
             )
         if outcome.deleted:
-            notify_shell_directories_updated(
+            self._notify(
                 tuple(dict.fromkeys(
                     os.path.dirname(path)
                     for path in outcome.deleted
@@ -956,6 +959,31 @@ class _SourceCleanup:
 
     def _mode(self) -> str:
         return str(self._config.get("post_extract", {}).get("archive_cleanup_mode", "recycle"))
+
+
+class _ShellUpdateBatch:
+    """Coalesce the current loop turn's notifications and release them on flush."""
+
+    def __init__(self):
+        self._paths: dict[str, str] = {}
+        self._handle: asyncio.Handle | None = None
+
+    def add(self, paths: Iterable[str]) -> None:
+        for path in paths:
+            if path:
+                absolute = os.path.abspath(path)
+                self._paths.setdefault(os.path.normcase(absolute), absolute)
+        if self._paths and self._handle is None:
+            self._handle = asyncio.get_running_loop().call_soon(self.flush)
+
+    def flush(self) -> None:
+        if self._handle is not None:
+            self._handle.cancel()
+            self._handle = None
+        paths = tuple(self._paths.values())
+        self._paths.clear()
+        if paths:
+            notify_shell_directories_updated(paths)
 
 
 class _RequestRuntime:
@@ -985,11 +1013,13 @@ class _RequestRuntime:
             stdout=submission.stdout,
             stderr=submission.stderr,
         )
+        self._shell_updates = _ShellUpdateBatch()
         self.source_cleanup = _SourceCleanup(
             self.context,
             self.config,
             _postprocess_actions_factory,
             submission.request_id,
+            notify=self._shell_updates.add,
         )
         self.task_scanner = ArchiveTaskScanner(
             self.config,
@@ -1140,6 +1170,7 @@ class _RequestRuntime:
             for request in self.source_cleanup.sweep_requests():
                 self._schedule_cleanup(request, broker=broker, cancellation=cancellation)
             await self._drain_cleanup_tasks()
+            self._shell_updates.flush()
             self.extractor.set_progress_callback(None)
             await broker.run(
                 "extractor_close",
@@ -1303,14 +1334,15 @@ class _RequestRuntime:
         released_source_ref = False
         task_key = str(task.key or task.main_path)
         try:
-            planned = await broker.run(
-                "plan",
-                task_key,
-                self._plan_task_isolated,
-                task,
-                request_id=self.submission.request_id,
-                cancellation=cancellation,
-            )
+            if self.input_planning_stage.requires_analysis(task):
+                planned = await broker.run(
+                    "plan", task_key, self._plan_task_isolated, task,
+                    request_id=self.submission.request_id,
+                    cancellation=cancellation,
+                )
+            else:
+                cancellation.raise_if_cancelled()
+                planned = [task]
             if len(planned) != 1 or planned[0] is not task:
                 raise RuntimeError(
                     "Archive input planning must preserve one logical ArchiveTask identity"
@@ -1434,7 +1466,7 @@ class _RequestRuntime:
                 )
 
             if output_dir:
-                notify_shell_directories_updated([output_dir])
+                self._shell_updates.add([output_dir])
             return subtree_complete
         finally:
             if not released_source_ref:

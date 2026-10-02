@@ -1,6 +1,8 @@
 import os
 from copy import deepcopy
 from dataclasses import dataclass
+from pathlib import Path
+from threading import Lock
 from typing import Any, Iterable
 
 from sunpack.core.contracts.filesystem import DirectorySnapshot
@@ -21,6 +23,8 @@ class NestedOutputScanPolicy:
     def __init__(self, config: dict[str, Any]):
         self.config = config
         self._output_scan_config = self._build_recursive_output_scan_config()
+        self._scan_options = None
+        self._scan_options_lock = Lock()
 
     def should_scan_output_dir(self, target_dir: str) -> bool:
         return bool(self._candidate_parent_roots(target_dir))
@@ -37,7 +41,7 @@ class NestedOutputScanPolicy:
         if inventory is not None and inventory.stats.exists and inventory.stats.is_dir:
             return list(inventory.parent_directories())
 
-        snapshot = DirectoryScanner(target_dir, config=self._output_scan_config).scan()
+        snapshot = self._scan_output(target_dir)
         return [os.path.abspath(parent) for parent in snapshot.parent_directories()]
 
     def prepare_scan(
@@ -79,11 +83,7 @@ class NestedOutputScanPolicy:
                 scan_session.prime_snapshot(root, snapshot)
                 has_primed_snapshot = True
                 continue
-            snapshot = DirectoryScanner(
-                output_dir,
-                config=self._output_scan_config,
-                include_raw_snapshot=True,
-            ).scan()
+            snapshot = self._scan_output(output_dir)
             if not snapshot.has_files:
                 continue
             root = os.path.abspath(output_dir)
@@ -149,8 +149,18 @@ class NestedOutputScanPolicy:
         return DirectoryScanner.snapshot_from_output_inventory(
             os.path.abspath(inventory.root),
             inventory,
-            config=self._output_scan_config,
+            scan_options=self._compiled_scan_options(),
         )
+
+    def _compiled_scan_options(self):
+        with self._scan_options_lock:
+            if self._scan_options is None:
+                self._scan_options = DirectoryScanner.compile_scan_options(self._output_scan_config)
+            return self._scan_options
+
+    def _scan_output(self, root: str) -> DirectorySnapshot:
+        filtered, raw = self._compiled_scan_options().scan(root, None)
+        return DirectorySnapshot.from_native(Path(root), filtered, raw)
 
     def _build_recursive_output_scan_config(self) -> dict[str, Any]:
         config = deepcopy(self.config)

@@ -107,6 +107,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     )?)?;
     m.add_class::<io::reader::NativeArchiveSession>()?;
     m.add_class::<scan::directory::NativeDirectorySnapshot>()?;
+    m.add_class::<scan::directory::NativeDirectoryScanOptions>()?;
     m.add_class::<scan::discovery::NativeCandidateTable>()?;
     m.add_class::<scan::discovery::NativeDiscoveryRoutes>()?;
     m.add_class::<scan::discovery::NativeEmbeddedBatch>()?;

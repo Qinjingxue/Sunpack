@@ -1,9 +1,40 @@
 import os
 import platform
 import sys
+from contextlib import contextmanager
+from contextvars import ContextVar
 from pathlib import Path
 
 from sunpack.core.support.process_executable import current_process_executable, is_packaged_process
+
+
+_REQUEST_RESOLVED_PATHS: ContextVar[dict[Path, Path] | None] = ContextVar(
+    "resource_request_resolved_paths", default=None,
+)
+
+
+@contextmanager
+def resource_path_resolution_scope(*, enabled: bool = True):
+    """Reuse canonical resource paths within one request, never across requests."""
+    token = _REQUEST_RESOLVED_PATHS.set({} if enabled else None)
+    try:
+        yield
+    finally:
+        _REQUEST_RESOLVED_PATHS.reset(token)
+
+
+def resolve_resource_path(path: Path) -> Path:
+    resolved = _REQUEST_RESOLVED_PATHS.get()
+    if resolved is None:
+        return path.resolve()
+    # Absolute lexical keys keep relative paths correct if a command changes cwd.
+    key = Path(os.path.abspath(path))
+    value = resolved.get(key)
+    if value is None:
+        value = path.resolve()
+        resolved[key] = value
+        resolved.setdefault(value, value)
+    return value
 
 
 def program_data_dir() -> Path:
@@ -21,7 +52,7 @@ def dedupe_paths(paths: list[Path]) -> list[Path]:
     deduped: list[Path] = []
     seen: set[str] = set()
     for path in paths:
-        key = str(path.resolve()).lower()
+        key = str(resolve_resource_path(path)).lower()
         if key not in seen:
             seen.add(key)
             deduped.append(path)
@@ -29,7 +60,7 @@ def dedupe_paths(paths: list[Path]) -> list[Path]:
 
 
 def first_existing_path(paths: list[Path]) -> Path | None:
-    for path in dedupe_paths(paths):
+    for path in paths:
         if path.exists():
             return path
     return None
@@ -42,10 +73,10 @@ def candidate_resource_roots(request_cwd: str | Path | None = None) -> list[Path
         roots.append(current_process_executable().parent)
         meipass = getattr(sys, "_MEIPASS", None)
         if meipass:
-            roots.append(Path(meipass).resolve())
+            roots.append(resolve_resource_path(Path(meipass)))
 
-    module_root = Path(__file__).resolve().parents[3]
-    invocation_root = Path(request_cwd).resolve() if request_cwd is not None else Path.cwd().resolve()
+    module_root = resolve_resource_path(Path(__file__)).parents[3]
+    invocation_root = resolve_resource_path(Path(request_cwd) if request_cwd is not None else Path.cwd())
     roots.extend([
         module_root,
         invocation_root,

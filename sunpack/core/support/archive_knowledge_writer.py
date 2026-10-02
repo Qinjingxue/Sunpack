@@ -28,8 +28,9 @@ def commit_task_knowledge(
         existing = task.knowledge()
     payload.set("_meta", {**payload.get("_meta", {}), "revision": existing.revision() + 1})
     with _phase(phase_timer, f"{phase_prefix}_set_knowledge"):
-        payload_dict = payload.incremental_snapshot(existing.to_dict())
-        task._replace_knowledge_payload(payload_dict, knowledge_cache=payload)
+        # The task owns this mutable Knowledge object. Exported dictionaries are
+        # isolated by to_dict(); committing does not need an intermediate tree.
+        task._knowledge = payload
     return payload
 
 

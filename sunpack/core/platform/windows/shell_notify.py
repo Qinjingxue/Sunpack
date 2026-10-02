@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sys
+from functools import lru_cache
 from typing import Iterable
 
 # SHCNE_UPDATEDIR: directory contents changed; Explorer refreshes open views.
@@ -61,7 +62,8 @@ def _refresh_directories_for_path(path: str) -> list[str]:
     return [item for item in directories if item and os.path.isdir(item)]
 
 
-def _sh_change_notify_updatedir(directories: list[str]) -> None:
+@lru_cache(maxsize=1)
+def _shell_notifier():
     import ctypes
     from ctypes import wintypes
 
@@ -69,6 +71,11 @@ def _sh_change_notify_updatedir(directories: list[str]) -> None:
     notify = shell32.SHChangeNotify
     notify.argtypes = [wintypes.LONG, wintypes.UINT, wintypes.LPCVOID, wintypes.LPCVOID]
     notify.restype = None
+    return shell32, notify
+
+
+def _sh_change_notify_updatedir(directories: list[str]) -> None:
+    _shell32, notify = _shell_notifier()
     flags = _SHCNF_PATHW | _SHCNF_FLUSHNOWAIT
     for directory in directories:
         notify(_SHCNE_UPDATEDIR, flags, directory, None)

@@ -87,16 +87,8 @@ class OutputInventory:
     ) -> list[dict[str, Any]]:
         return list(self._native.file_head_facts_for_paths(paths, max(0, int(magic_size or 0))))
 
-    def build_directory_snapshots(self, options: dict[str, Any]):
-        return self._native.build_directory_snapshots(
-            options["patterns"],
-            options["prune_dir_globs"],
-            options["blocked_extensions"],
-            options["blocked_file_names"],
-            options["size_ranges"],
-            options["mtime_ranges"],
-            options["whitelist_rules"],
-        )
+    def build_directory_snapshots(self, options):
+        return self._native.build_directory_snapshots(options)
 
     def all_crc_ok(self) -> bool:
         return bool(self._native.all_crc_ok())
