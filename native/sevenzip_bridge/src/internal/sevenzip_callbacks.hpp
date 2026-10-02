@@ -980,6 +980,15 @@ namespace sunpack::sevenzip
                     has_source_crc32);
             }
 
+            // These directory entries denote the extraction root itself.
+            // Consume them without mapping a path or creating an output.
+            if (is_dir && (name == L"." || name == L"./" || name == L".\\"))
+            {
+                emit("item_start", index, name);
+                dirs_written_ += 1;
+                return S_OK;
+            }
+
             const auto safe_path = safe_relative_item_path(name);
 
             if (!safe_path.has_value())

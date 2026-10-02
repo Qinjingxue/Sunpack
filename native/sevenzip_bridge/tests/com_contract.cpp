@@ -11,6 +11,7 @@
 #include "../7z2603-src/C/7zCrc.h"
 
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -101,6 +102,111 @@ void check_extract_to_disk_callback()
     check(queries_as(as_unknown(probe), IID_IArchiveExtractCallback), "QI(IArchiveExtractCallback) == S_OK");
     check(queries_as(as_unknown(probe), IID_ICryptoGetTextPassword), "QI(ICryptoGetTextPassword) == S_OK");
     check(rejects(as_unknown(probe), IID_IInStream), "QI(foreign IID) == E_NOINTERFACE");
+}
+
+// Supply raw item properties so handler name rewriting cannot mask callback
+// path validation, particularly Windows backslash and drive-root cases.
+class EntryArchive final : public CMyUnknownImp, public IInArchive
+{
+    Z7_COM_UNKNOWN_IMP_1(IInArchive)
+public:
+    EntryArchive(const wchar_t *name, bool is_dir) : name_(name), is_dir_(is_dir) {}
+    HRESULT STDMETHODCALLTYPE GetProperty(UInt32, PROPID prop, PROPVARIANT *value) SUP7Z_NOEXCEPT override
+    {
+        PropVariantInit(value);
+        if (prop == kpidPath)
+        {
+            value->bstrVal = SysAllocString(name_.c_str());
+            if (!value->bstrVal) { return E_OUTOFMEMORY; }
+            value->vt = VT_BSTR;
+        }
+        else if (prop == kpidIsDir)
+        {
+            value->vt = VT_BOOL;
+            value->boolVal = is_dir_ ? VARIANT_TRUE : VARIANT_FALSE;
+        }
+        return S_OK;
+    }
+    HRESULT STDMETHODCALLTYPE Open(IInStream *, const UInt64 *, IArchiveOpenCallback *) SUP7Z_NOEXCEPT override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Close() SUP7Z_NOEXCEPT override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetNumberOfItems(UInt32 *) SUP7Z_NOEXCEPT override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE Extract(const UInt32 *, UInt32, Int32, IArchiveExtractCallback *) SUP7Z_NOEXCEPT override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetArchiveProperty(PROPID, PROPVARIANT *) SUP7Z_NOEXCEPT override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetNumberOfProperties(UInt32 *) SUP7Z_NOEXCEPT override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetPropertyInfo(UInt32, BSTR *, PROPID *, VARTYPE *) SUP7Z_NOEXCEPT override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetNumberOfArchiveProperties(UInt32 *) SUP7Z_NOEXCEPT override { return E_NOTIMPL; }
+    HRESULT STDMETHODCALLTYPE GetArchivePropertyInfo(UInt32, BSTR *, PROPID *, VARTYPE *) SUP7Z_NOEXCEPT override { return E_NOTIMPL; }
+private:
+    const std::wstring name_;
+    const bool is_dir_;
+};
+
+void check_archive_root_directory_entries()
+{
+    std::printf("Archive root directory entries\n");
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-root-entry-" + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+    std::filesystem::create_directories(root);
+    struct EntryCase {
+        const wchar_t *name;
+        bool is_dir;
+        bool accepted;
+    };
+    const EntryCase cases[] = {
+        {L".", true, true}, {L"./", true, true}, {L".\\", true, true},
+        {L".", false, false}, {L"./", false, false}, {L".\\", false, false},
+        {L"../", true, false}, {L"../x", false, false},
+        {L"../../foo", true, false}, {L"C:\\", true, false},
+        {L"\\foo", true, false}, {L"/foo", true, false},
+    };
+    unsigned index = 0;
+    for (const auto &entry : cases)
+    {
+        std::printf("  %s %ls\n", entry.is_dir ? "directory" : "file", entry.name);
+        CMyComPtr<IInArchive> archive(new EntryArchive(entry.name, entry.is_dir));
+        ++index;
+        for (const bool dry_run : {false, true})
+        {
+            const auto output = root / (std::to_wstring(index) + (dry_run ? L"-dry" : L"-disk"));
+            std::vector<std::string> events;
+            ExtractOutputTrace trace;
+            auto *raw = new ExtractToDiskCallback(
+                archive.Interface(), L"", output.wstring(),
+                [&events](const ExtractProgressEvent &event) { events.push_back(event.event); }, dry_run, &trace, 1);
+            CMyComPtr<IArchiveExtractCallback> callback(raw);
+            CMyComPtr<ISequentialOutStream> stream;
+            const HRESULT hr = callback->GetStream(0, &stream, kExtractMode);
+            check(!stream && trace.items.size() == 1, "callback records the member without an output stream");
+            if (entry.accepted)
+            {
+                check(hr == S_OK && callback->SetOperationResult(kOpOk) == S_OK,
+                      "root directory entry succeeds as a no-op");
+                check(raw->dirs_written() == 1 && raw->files_written() == 0 && raw->bytes_written() == 0 &&
+                      !raw->output_error() && raw->failed_item().empty(),
+                      "root directory entry only increments the directory count");
+                check(!std::filesystem::exists(output) || std::filesystem::is_empty(output),
+                      "root directory entry creates no child output");
+                check(events == std::vector<std::string>{"item_start", "item_done"},
+                      "root directory entry reports start and completion");
+                if (trace.items.size() == 1)
+                {
+                    const auto &item = trace.items.front();
+                    check(item.is_dir && item.done && !item.failed && item.output_path.empty(),
+                          "root directory trace completes without an output path");
+                }
+            }
+            else
+            {
+                check(hr == E_INVALIDARG && raw->output_error() && raw->failed_item() == entry.name &&
+                      raw->dirs_written() == 0 && raw->files_written() == 0,
+                      "unsafe output path is rejected");
+                check(trace.items.size() == 1 && trace.items.front().failed &&
+                      trace.items.front().hresult == E_INVALIDARG,
+                      "unsafe output path retains its failure trace");
+            }
+        }
+    }
+    std::filesystem::remove_all(root);
 }
 
 void check_open_callback()
@@ -412,6 +518,7 @@ int main()
 {
     check_extract_callback();
     check_extract_to_disk_callback();
+    check_archive_root_directory_entries();
     check_open_callback();
     check_open_callback_volume_prefetch();
     check_streams();
