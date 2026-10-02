@@ -13,7 +13,7 @@ import tempfile
 from pathlib import Path
 
 from tests.helpers.native_fixture import file_inventory
-from tests.helpers.tool_config import get_optional_rar, get_optional_winrar
+from tests.helpers.tool_config import get_optional_rar, get_optional_winrar, require_7z
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -87,7 +87,9 @@ def generate(destination: Path = DESTINATION, cases: tuple = STRUCTURE_CASES) ->
             else:
                 writer_format = "ustar" if variant == "duplicate" else "zip" if variant.startswith("zip") else variant
                 command = [tar, "--format", writer_format, "-cf", str(archive)]
-                if variant == "zip-cp437":
+                if variant == "zip":
+                    command.extend(["--options", "zip:hdrcharset=UTF-8"])
+                elif variant == "zip-cp437":
                     command.extend(["--options", "zip:hdrcharset=CP437"])
                 if variant in {"pax", "zip"}:
                     # Let bsdtar discover Unicode paths while walking the
@@ -105,6 +107,17 @@ def generate(destination: Path = DESTINATION, cases: tuple = STRUCTURE_CASES) ->
                     command.extend(["-T", file_list.name])
                 creator = run([tar, "--version"], source).strip()
             run(command, source)
+            if variant == "zip":
+                listing = run([str(require_7z()), "l", "-slt", "-sccUTF-8", str(archive)], source)
+                listed_paths = {
+                    line.removeprefix("Path = ").replace("\\", "/").removeprefix("./").rstrip("/")
+                    for line in listing.splitlines()
+                    if line.startswith("Path = ")
+                }
+                assert "日本語/说明.txt" in listed_paths, (
+                    "bsdtar ZIP writer did not preserve the Unicode member name; "
+                    f"archive listing was: {listing!r}"
+                )
             commands = [command]
             if variant == "duplicate":
                 (source / "same.txt").write_text("second revision\n", encoding="utf-8", newline="\n")
