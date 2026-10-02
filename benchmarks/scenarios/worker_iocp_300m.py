@@ -1,4 +1,4 @@
-"""Paired old writer / IOCP / CLI extraction plus explicit native output flush."""
+"""Paired worker / CLI extraction plus explicit native output flush."""
 from __future__ import annotations
 
 import argparse
@@ -34,7 +34,9 @@ def main():
     parser.add_argument("--all-formats", action="store_true", help="All 18 cached format/variant cases")
     parser.add_argument("--case-id", action="append", help="Select exact case IDs, preserving solid/split variants")
     parser.add_argument("--no-cli", action="store_true", help="Only compare the saved writer and IOCP")
+    parser.add_argument("--candidate-only", action="store_true", help="Skip the old writer; compare current worker against CLI")
     parser.add_argument("--mixed", action="store_true", help="Also compare one heterogeneous batch at maximum concurrency")
+    parser.add_argument("--mixed-only", action="store_true", help="Only run the heterogeneous batch")
     parser.add_argument("--prefetch", choices=("on", "off"), default="on")
     parser.add_argument("--json-out", type=Path, required=True)
     args = parser.parse_args()
@@ -48,6 +50,7 @@ def main():
     report = {"complete": False, "runs": args.runs, "prefetch": args.prefetch,
               "baseline": str(args.baseline.resolve()), "candidate": str(args.candidate.resolve()),
               "writer_threads": {"baseline": args.baseline_writer_threads, "iocp": args.candidate_writer_threads},
+              "candidate_only": args.candidate_only,
               "method": "Same 300 MiB cached inputs; configured IOCP consumers, unchanged file/job/buffer limits. "
                         "Rotated paired order. wall_ms is extraction return; flush_ms is Rust sync_all "
                         "including helper launch immediately after run returns. extract_and_flush_ms "
@@ -57,7 +60,7 @@ def main():
     seven, dll = require_7z().resolve(), Path(get_7z_cli_dll_path()).resolve()
     report["source_commit"] = _git_commit()
     report["binaries"] = {}
-    for name, binary in {"baseline": args.baseline, "candidate": args.candidate, "dll": dll}.items():
+    for name, binary in {"baseline": args.baseline, "candidate": args.candidate, "cli": seven, "dll": dll}.items():
         literal = "'" + str(binary.resolve()).replace("'", "''") + "'"
         script = (f"$stream=[IO.File]::OpenRead({literal}); $hash=[Security.Cryptography.SHA256]::Create(); "
                   "try { [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '') } "
@@ -78,8 +81,8 @@ def main():
                     and (not args.case_id or c["case_id"] in args.case_id)]
         if args.case_id and set(args.case_id) - {c["case_id"] for c in selected}:
             parser.error("Unknown/unselected case IDs")
-        workloads = [(c["case_id"], c["format"], [c], widths) for c in selected]
-        if args.mixed:
+        workloads = [] if args.mixed_only else [(c["case_id"], c["format"], [c], widths) for c in selected]
+        if args.mixed or args.mixed_only:
             workloads.append(("mixed", "mixed", selected, [max(widths)]))
         report["cases"] = selected
         report["concurrency"] = widths
@@ -87,7 +90,7 @@ def main():
         for case_index, (case_id, fmt, base, case_widths) in enumerate(workloads):
             for width in case_widths:
                 batch = base if case_id == "mixed" else base * width
-                modes = ["baseline", "iocp"] + ([] if args.no_cli else ["cli"])
+                modes = ([] if args.candidate_only else ["baseline"]) + ["iocp"] + ([] if args.no_cli else ["cli"])
                 records = {m: {"case_id": case_id, "format": fmt, "concurrency": width,
                                "jobs": len(batch), "mode": m, "rows": []} for m in modes}
                 for trial in range(args.runs):

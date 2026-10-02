@@ -194,6 +194,10 @@ The latest four-thread IOCP experiment, including output flush timings, is docum
 The follow-up [full-format regression](docs/zh-CN/benchmark_worker_iocp_fullformats_300m.md)
 and [1/4/8 IOCP consumer comparison](docs/zh-CN/benchmark_worker_iocp_threads_300m.md)
 include paired timings and explicit output flushes.
+The [current 8-thread IOCP worker vs. concurrent 7z.exe retest](docs/zh-CN/benchmark_worker_iocp_vs_cli_300m.md)
+covers all 18 format/variant cases, a mixed queue, and targeted input/CPU diagnostics.
+The [subsequent parallelism optimization report](docs/zh-CN/benchmark_worker_parallel_300m.md)
+records retained CRC32/Open changes, administrator CPU sampling, and remaining gaps.
 These results use SunPack **v0.7.0** from repository commit `c3eaec11`, with the
 worker built from commit `c3eaec11`. Each case has five measured runs and no
 warmups. Times and sampled process-tree peak RSS are per-case medians; RSS is in
@@ -234,3 +238,6 @@ SunPack-original source code is licensed under the MIT License; see [LICENSE](LI
 The repository also vendors third-party source code, including 7-Zip 26.03 under `native/sevenzip_bridge/7z2603-src/` and zlib-ng 2.3.3 under `native/sevenzip_bridge/zlib-ng-2.3.3/`. Third-party source and binaries remain subject to their original licenses and are not relicensed under MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md) for the exact license scope and release-compliance information.
 
 The 7-Zip source license is copied at [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt), the full GNU LGPL 2.1 text is available at [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt), and the zlib-ng license is copied at [licenses/zlib-ng-license.txt](licenses/zlib-ng-license.txt).
+
+The [input prefetch optimization experiments](docs/zh-CN/benchmark_worker_prefetch_300m.md)
+were rejected because gains did not hold across single-job and concurrent workloads.

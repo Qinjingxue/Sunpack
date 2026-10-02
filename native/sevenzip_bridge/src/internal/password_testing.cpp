@@ -214,8 +214,11 @@ namespace sunpack::sevenzip
             Int32 last_op_res = kOpOk;
             bool last_encryption_evidence = false;
 
-            for (const GUID &format : plan.formats)
+            const UInt64 start_only = 0;
+            for (std::size_t attempt_index = 0; attempt_index < plan.formats.size() * 2; ++attempt_index)
             {
+                const GUID &format = plan.formats[attempt_index % plan.formats.size()];
+                const UInt64 *search_limit = attempt_index < plan.formats.size() ? &start_only : nullptr;
 
                 CMyComPtr<IInArchive> archive;
 
@@ -260,7 +263,7 @@ namespace sunpack::sevenzip
                 auto *raw_open_callback = new OpenCallback(password, callback_path, part_paths, canonical_names);
                 CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
-                hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
+                hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
                 last_encryption_evidence = raw_open_callback->password_requested();
 
                 if (raw_open_callback->missing_volume_requested())
@@ -516,8 +519,11 @@ namespace sunpack::sevenzip
 
         stream->Seek(0, 0, &pos);
 
-        for (const GUID &format : formats)
+        const UInt64 start_only = 0;
+        for (std::size_t attempt_index = 0; attempt_index < formats.size() * 2; ++attempt_index)
         {
+            const GUID &format = formats[attempt_index % formats.size()];
+            const UInt64 *search_limit = attempt_index < formats.size() ? &start_only : nullptr;
 
             CMyComPtr<IInArchive> archive;
 
@@ -536,7 +542,7 @@ namespace sunpack::sevenzip
             auto *raw_open_callback = new OpenCallback(password, callback_archive_path(archive_path, part_paths), part_paths);
             CMyComPtr<IArchiveOpenCallback> open_callback(raw_open_callback);
 
-            hr = archive->Open(stream, nullptr, open_callback.Interface());
+            hr = archive->Open(stream, search_limit, open_callback.Interface());
             last_encryption_evidence = raw_open_callback->password_requested();
 
             if (raw_open_callback->missing_volume_requested())

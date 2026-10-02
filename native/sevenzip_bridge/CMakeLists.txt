@@ -36,7 +36,7 @@ endfunction()
 
 set(SUP7Z_7Z_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/7z2603-src")
 
-# zlib-ng is used only for selected ZIP Deflate entries. Keep the exact
+# zlib-ng supplies Deflate decoding and IEEE CRC32. Keep the exact
 # benchmarked 2.3.3 sources in-tree so native builds remain deterministic and
 # fully offline, like the bundled 7-Zip backend.
 set(SUP7Z_ZLIB_NG_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/zlib-ng-2.3.3")
@@ -227,6 +227,7 @@ target_include_directories(sunpack_7zip_objects PRIVATE
 )
 
 target_compile_definitions(sunpack_7zip_objects PRIVATE NOMINMAX)
+target_link_libraries(sunpack_7zip_objects PRIVATE zlib-ng::zlibstatic)
 apply_release_optimizations(sunpack_7zip_objects)
 apply_source_charset(sunpack_7zip_objects)
 

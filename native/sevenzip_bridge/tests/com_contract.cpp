@@ -8,8 +8,10 @@
 
 #include "internal/sevenzip_callbacks.hpp"
 #include "internal/sevenzip_streams.hpp"
+#include "../7z2603-src/C/7zCrc.h"
 
 #include <cstdio>
+#include <fstream>
 #include <string>
 #include <vector>
 
@@ -178,6 +180,205 @@ void check_streams()
     check(queries_as(as_unknown(multi_raw), IID_IInStream), "MultiRangeInStream QI(IInStream) == S_OK");
 }
 
+void check_crc32_incremental_contract()
+{
+    check(CrcCalc("123456789", 9) == 0xCBF43926u, "CRC32 IEEE known vector");
+    check(CrcUpdate(0x13579BDFu, nullptr, 0) == 0x13579BDFu, "empty CRC preserves arbitrary incremental state");
+    std::vector<unsigned char> data(131072 + 64);
+    UInt32 random = 0x9E3779B9u;
+    for (auto &byte : data)
+    {
+        random ^= random << 13; random ^= random >> 17; random ^= random << 5;
+        byte = static_cast<unsigned char>(random);
+    }
+    bool correct = true;
+    for (unsigned alignment : {0u, 1u, 3u, 15u, 31u})
+    for (unsigned length : {0u, 1u, 7u, 15u, 16u, 31u, 32u, 63u, 64u, 511u, 4096u, 65536u, 131072u})
+    for (UInt32 initial : {0u, 0xFFFFFFFFu, 0x13579BDFu})
+    {
+        UInt32 expected = initial;
+        for (unsigned i = 0; i < length; ++i)
+        {
+            expected ^= data[alignment + i];
+            for (unsigned bit = 0; bit < 8; ++bit)
+                expected = (expected >> 1) ^ (0xEDB88320u & (0u - (expected & 1)));
+        }
+        correct &= CrcUpdate(initial, data.data() + alignment, length) == expected;
+        UInt32 incremental = initial;
+        for (unsigned offset = 0; offset < length; offset += 43)
+            incremental = CrcUpdate(incremental, data.data() + alignment + offset, (std::min)(43u, length - offset));
+        correct &= incremental == expected;
+        const auto update = z7_GetFunc_CrcUpdate(0);
+        correct &= update && update(initial, data.data() + alignment, length) == expected;
+    }
+    check(correct, "CRC32 matches independent bitwise oracle for alignment, arbitrary seeds and chunk boundaries");
+}
+
+void check_archive_open_start_and_carrier_fallback()
+{
+    // A valid empty RAR4 with a large carrier tail: the RAR5 candidate must
+    // fail at the logical start instead of scanning that tail first.
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-open-contract-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(root);
+    std::vector<unsigned char> rar = {0x52, 0x61, 0x72, 0x21, 0x1a, 0x07, 0x00};
+    for (unsigned type : {0x73u, 0x7bu}) {
+        std::vector<unsigned char> header(type == 0x73 ? 13 : 7, 0);
+        header[2] = static_cast<unsigned char>(type);
+        header[5] = static_cast<unsigned char>(header.size());
+        const UInt32 crc = CrcCalc(header.data() + 2, header.size() - 2);
+        header[0] = static_cast<unsigned char>(crc);
+        header[1] = static_cast<unsigned char>(crc >> 8);
+        rar.insert(rar.end(), header.begin(), header.end());
+    }
+    const std::vector<char> tail(4u << 20, 'x');
+    const char *prefetch_env = std::getenv("SUNPACK_SEVENZIP_PREFETCH");
+    const std::string previous_prefetch = prefetch_env ? prefetch_env : "";
+    _putenv_s("SUNPACK_SEVENZIP_PREFETCH", "0");
+    for (unsigned prefix : {0u, 103u}) {
+        const auto path = root / (prefix ? L"carrier.payload" : L"disguised.payload");
+        {
+            std::ofstream output(path, std::ios::binary);
+            const std::string padding(prefix, 'p');
+            output.write(padding.data(), padding.size());
+            output.write(reinterpret_cast<const char *>(rar.data()), rar.size());
+            output.write(tail.data(), tail.size());
+        }
+        const auto result = extract_archive_with_parts(path.wstring(), {path.wstring()}, L"rar", L"", root.wstring(), L"", {}, true);
+        check(result.status == PasswordTestStatus::Ok, "RAR4 opens with a generic family hint, including carrier prefix fallback");
+        if (!prefix) {
+            check(result.handler_attempts.size() == 2 && result.handler_attempts.back().opened,
+                  "generic RAR reaches RAR4 on the initial handler pass");
+            check(result.input_trace.total_bytes_returned < (512u << 10),
+                  "wrong RAR handler does not consume the large carrier tail");
+        } else {
+            check(result.handler_attempts.size() == 4 && result.handler_attempts.back().opened,
+                  "carrier prefix uses the existing signature search after the start-only pass");
+            const std::vector<ExtractInputRange> ranges = {{path.wstring(), prefix, prefix + rar.size(), true}};
+            const auto carved = extract_archive_with_ranges(path.wstring(), ranges, L"rar", L"", root.wstring(), L"", {}, true);
+            check(carved.status == PasswordTestStatus::Ok && carved.handler_attempts.size() == 2,
+                  "canonical carrier range opens without searching the underlying prefix");
+        }
+    }
+    _putenv_s("SUNPACK_SEVENZIP_PREFETCH", previous_prefetch.c_str());
+    std::filesystem::remove_all(root);
+}
+
+void check_prefetch_lifetime_and_seek()
+{
+    std::printf("Prefetch seek\n");
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool entered = false, release = false;
+    SequentialPrefetcher prefetch({true, 64, 2}, 1024,
+        [&](UInt64 offset, void *data, UInt32 size, UInt32 *read) {
+            if (offset == 1)
+            {
+                std::unique_lock lock(mutex);
+                entered = true;
+                cv.notify_one();
+                cv.wait(lock, [&] { return release; });
+            }
+            std::memset(data, static_cast<int>(offset % 251), size);
+            *read = size;
+            return S_OK;
+        });
+    prefetch.after_sync_read(1);
+    {
+        std::unique_lock lock(mutex);
+        cv.wait(lock, [&] { return entered; });
+    }
+    prefetch.invalidate(400, nullptr);
+    prefetch.after_sync_read(400);
+    {
+        std::lock_guard lock(mutex);
+        release = true;
+    }
+    cv.notify_one();
+    unsigned char bytes[64]{};
+    check(prefetch.consume(400, bytes, 64, nullptr) && bytes[0] == 400 % 251 && bytes[63] == 400 % 251,
+          "seek during a blocked read discards its completion without reusing its live buffer");
+
+    SequentialPrefetcher failed({true, 64, 1}, 256,
+        [](UInt64, void *, UInt32, UInt32 *read) { *read = 0; return S_FALSE; });
+    failed.after_sync_read(64);
+    check(!failed.consume(64, bytes, 64, nullptr), "short/error prefetch reads fall back without publishing bytes");
+
+    wchar_t executable[MAX_PATH]{};
+    GetModuleFileNameW(nullptr, executable, MAX_PATH);
+    auto *raw = new FileInStream(executable, nullptr, L"file", {true, 64, 2});
+    CMyComPtr<IInStream> stream(raw);
+    UInt32 read = 0;
+    check(stream->Read(bytes, 64, &read) == S_OK && read == 64, "file stream starts with direct read");
+    check(stream->Read(bytes, 64, &read) == S_OK && read == 64, "file stream reads the prefetched next window");
+    UInt64 position = 0;
+    check(stream->Seek(0, FILE_CURRENT, &position) == S_OK && position == 128,
+          "relative Seek uses logical cursor after cached reads");
+    check(stream->Seek(-65, FILE_CURRENT, &position) == S_OK && position == 63,
+          "backward relative Seek recalibrates the decoder handle");
+    unsigned char expected[65]{};
+    InputPrefetchConfig disabled{false, 64, 2};
+    auto *direct_raw = new FileInStream(executable, nullptr, L"file", disabled);
+    CMyComPtr<IInStream> direct(direct_raw);
+    direct->Read(expected, 65, &read);
+    check(stream->Read(bytes, 1, &read) == S_OK && read == 1 && bytes[0] == expected[63],
+          "fallback after seek reads from the logical file offset");
+}
+
+void check_prefetch_virtual_inputs()
+{
+    const auto root = std::filesystem::temp_directory_path() /
+        (L"sunpack-prefetch-" + std::to_wstring(GetCurrentProcessId()));
+    std::filesystem::create_directories(root);
+    const auto first = root / L"disguised-a.bin";
+    const auto second = root / L"disguised-b.bin";
+    unsigned char payload[513];
+    for (unsigned i = 0; i < sizeof(payload); ++i) payload[i] = static_cast<unsigned char>(i % 251);
+    {
+        std::ofstream a(first, std::ios::binary), b(second, std::ios::binary);
+        a.write(reinterpret_cast<const char *>(payload), 257);
+        b.write(reinterpret_cast<const char *>(payload + 257), 256);
+    }
+    {
+        auto *raw = new MultiFileInStream({first.wstring(), second.wstring()}, nullptr, {true, 64, 2});
+        CMyComPtr<IInStream> stream(raw);
+        unsigned char bytes[513]{};
+        bool correct = true;
+        UInt32 read = 0;
+        for (unsigned offset = 0; offset < sizeof(bytes); offset += 17)
+        {
+            const UInt32 size = (std::min)(17u, static_cast<unsigned>(sizeof(bytes) - offset));
+            correct &= stream->Read(bytes + offset, size, &read) == S_OK && read == size;
+        }
+        check(correct && !std::memcmp(bytes, payload, sizeof(bytes)),
+              "prefetch and direct fallback preserve bytes across unaligned volume/window boundaries");
+        UInt64 position = 0;
+        stream->Seek(-33, FILE_END, &position);
+        correct = position == 480 && stream->Read(bytes, 33, &read) == S_OK && read == 33;
+        check(correct && !std::memcmp(bytes, payload + 480, 33), "volume seek discards prior prefetched windows");
+    }
+    {
+        // Same physical inputs represent an embedded payload whose prefix and
+        // tail must not leak into the decoder's virtual stream.
+        ExtractInputRange a, b;
+        a.path = first.wstring(); a.start = 3; a.has_end = true; a.end = 251;
+        b.path = second.wstring(); b.start = 7; b.has_end = true; b.end = 250;
+        auto *raw = new MultiRangeInStream({a, b}, nullptr, {true, 64, 2});
+        CMyComPtr<IInStream> stream(raw);
+        unsigned char bytes[491]{};
+        bool correct = true;
+        UInt32 read = 0;
+        for (unsigned offset = 0; offset < sizeof(bytes); offset += 17)
+        {
+            const UInt32 size = (std::min)(17u, static_cast<unsigned>(sizeof(bytes) - offset));
+            correct &= stream->Read(bytes + offset, size, &read) == S_OK && read == size;
+        }
+        check(correct && !std::memcmp(bytes, payload + 3, 248) && !std::memcmp(bytes + 248, payload + 264, 243),
+              "range prefetch respects embedded payload offsets and clipped range ends");
+    }
+    std::filesystem::remove_all(root);
+}
+
 void check_output_path_reservations()
 {
     std::printf("Async output path reservations\n");
@@ -214,6 +415,10 @@ int main()
     check_open_callback();
     check_open_callback_volume_prefetch();
     check_streams();
+    check_crc32_incremental_contract();
+    check_archive_open_start_and_carrier_fallback();
+    check_prefetch_lifetime_and_seek();
+    check_prefetch_virtual_inputs();
     check_open_archive_stream_ownership();
     check_output_path_reservations();
 

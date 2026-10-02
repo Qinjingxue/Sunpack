@@ -385,8 +385,14 @@ namespace sunpack::sevenzip
 #endif
         const auto prefetch_config = input_prefetch_config_for_archive(format_hint, native_volume_input);
 
-        for (const GUID &format : formats)
+        // Try each handler at the canonical input start before allowing
+        // signature search. A wrong handler must not scan the whole archive
+        // before the right one gets its turn. Keep search for carrier fallback.
+        const UInt64 start_only = 0;
+        for (std::size_t attempt_index = 0; attempt_index < formats.size() * 2; ++attempt_index)
         {
+            const GUID &format = formats[attempt_index % formats.size()];
+            const UInt64 *search_limit = attempt_index < formats.size() ? &start_only : nullptr;
 
             ExtractHandlerAttempt attempt;
 
@@ -523,10 +529,10 @@ namespace sunpack::sevenzip
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             {
                 PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::ArchiveOpen);
-                hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
+                hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
             }
 #else
-            hr = archive->Open(stream.Interface(), nullptr, open_callback.Interface());
+            hr = archive->Open(stream.Interface(), search_limit, open_callback.Interface());
 #endif
             last_encryption_evidence = raw_open_callback->password_requested();
 

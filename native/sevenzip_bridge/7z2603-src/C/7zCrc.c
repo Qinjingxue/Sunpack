@@ -5,6 +5,7 @@
 
 #include "7zCrc.h"
 #include "CpuArch.h"
+#include <zlib-ng.h>
 
 // for debug:
 // #define __ARM_FEATURE_CRC32 1
@@ -268,7 +269,11 @@ Z7_NO_INLINE
 #endif
 
 #ifdef MY_CPU_LE
-    return FUNC_NAME_LE(crc, data, size, g_CrcTable);
+    /* 7-Zip carries the unfinalized IEEE CRC state; zlib-ng carries the
+       finalized state. Keep the existing incremental CRC contract. */
+    if (size == 0)
+      return crc;
+    return zng_crc32_z(crc ^ CRC_INIT_VAL, (const Byte *)data, size) ^ CRC_INIT_VAL;
 #elif defined(MY_CPU_BE)
     return FUNC_NAME_BE(crc, data, size, g_CrcTable);
 #else
