@@ -230,6 +230,44 @@ per-volume writer width, and `--profile` enables available native diagnostics.
 exclude CLI/watch planning, recursive extraction, and post-extract verification.
 Compressed TAR codecs are measured as one outer stream layer for both engines.
 
+`extraction worker-fair-timing` is the like-for-like wall-clock comparison. The worker's
+completion means "bytes are on the device", while `7z.exe` returns as soon as the bytes
+are in the page cache, so timing only the return is not comparable. It measures each run
+twice — extraction wall as reported by `worker-concurrency-300m`, then a Rust `sync_all`
+over the produced tree — and treats `wall + flush` as the decisive number. A "wait until
+the host disk goes quiet" probe was tried and removed: unrelated background writeback
+keeps the disk busy for about a second here regardless of workload size, so it measured
+the machine rather than the extraction.
+`worker-window-sweep` and `worker-paired-ab` are benchmark-only reproduction helpers
+used by the analysis below: the sweep rewrites the single residency-window constant in
+`sevenzip_async_output.hpp`, rebuilds the probe worker once per value, runs every value in
+alternating order per trial, and restores the original header on exit; the paired A/B
+compares two worker binaries on the same cached corpus with alternating order, and can
+apply per-engine environment overrides such as
+`SUNPACK_ASYNC_WRITER_FILE_INFLIGHT_MIB` (only effective on a build that reads it).
+Run them as scripts (`python benchmarks/scenarios/worker_window_sweep.py --help`)
+because the sweep mutates source.
+`extraction worker-concurrency-ablation` decomposes the parallel worker deficit into
+single-variable ablations on the same cached 300 MiB corpus: per-volume writer width,
+shared buffer count, volume space gate, native CPU budget, and input prefetch, each
+optionally paired with concurrent `7z.exe` and with `--dry` (worker `dry_run` against
+`7z t`) to separate decode cost from output-write cost. It reports wall time, process
+CPU split, and per-job decoder credit grants.
+`extraction worker-writer-ablation` reuses the probe-instrumented worker to break the
+output path into phases (dispatch, WriteFile, producer, capacity wait, copy, queue) and
+reports write-completion depth (`inflight_peak`, `queue_depth_peak`) and per-write
+latency. Its `memory` and `memory-nocopy` sink modes write nothing, so decode-only cost
+can be compared against the real write path; the probe phases overlap across threads and
+must not be summed as batch wall time. Both scenarios accept a probe binary built with
+`-DSUP7Z_ENABLE_WRITER_PROBE=ON -DSUP7Z_ENABLE_PIPELINE_TIMING=ON`; the product worker
+build does not carry that instrumentation. The measured root causes are written up in
+[简体中文](../docs/zh-CN/benchmark_worker_concurrency_gap_analysis.md), together with the
+fixes that measurement rejected (deeper per-volume IOCP writer threads, releasing the
+residency window at submission instead of at IO completion, enlarging the residency
+window or the buffer pool) and the two harness bugs found while fixing the timing
+(7z.exe output directories were not cleared before `-aoa`, and one scenario recorded only
+the last `--format`).
+
 `memory many-tasks` measures memory _growth_ (not peak) of the two long-lived
 components under a large task count across every format: the Python pipeline and
 the native 7z worker. One mixed-format corpus is built with the format-matrix

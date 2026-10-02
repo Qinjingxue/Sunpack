@@ -1175,6 +1175,11 @@ namespace sunpack::sevenzip
             {
 #ifdef SUP7Z_ENABLE_WRITER_PROBE
                 buffer->probe_queued_at = file->job->probe.enabled ? writer_probe_clock() : 0;
+                if (buffer->probe_queued_at)
+                {
+                    file->job->probe.begin_inflight();
+                    file->job->probe.observe_queue_depth(queued_jobs_ + 1);
+                }
 #endif
                 work_queue_.emplace_back(WorkItem::data(buffer, output_offset));
                 const DWORD error = post_work_locked();
@@ -1774,6 +1779,13 @@ namespace sunpack::sevenzip
             }
             const auto file = buffer->file;
             const auto job = file ? file->job : nullptr;
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            if (job && buffer->probe_queued_at)
+            {
+                job->probe.end_inflight(buffer->probe_queued_at);
+                buffer->probe_queued_at = 0;
+            }
+#endif
             bool direct_close = false;
             {
 

@@ -303,6 +303,9 @@ def main():
                     for run in range(args.runs):
                         for engine in (("worker", "7z") if run % 2 == 0 else ("7z", "worker")):
                             output = workspace.outputs / f"batch-{len(report['results'])}-{run}-{engine}"
+                            # 7z.exe 的 -aoa 只在单次调用内覆盖；同一目录复用会让重名条目
+                            # 变成 "name(1).bin"，使输出校验看到翻倍的字节数。
+                            shutil.rmtree(output, ignore_errors=True)
                             try:
                                 row = (run_worker(worker, batch, output, width, dll, 900, args.dry_run) if engine == "worker"
                                        else run_cli(seven, batch, output, width, 900, args.dry_run))
