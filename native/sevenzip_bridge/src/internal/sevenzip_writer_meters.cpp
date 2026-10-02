@@ -13,7 +13,7 @@ namespace sunpack::sevenzip
     namespace
     {
 
-        constexpr std::size_t kDefaultThreadsPerVolume = 4;
+        constexpr std::size_t kDefaultThreadsPerVolume = 8;
         constexpr std::size_t kMaxThreadsPerVolume = 8;
         constexpr std::size_t kDefaultBufferCount = 64;
         constexpr std::size_t kMaxBufferCount = 256;

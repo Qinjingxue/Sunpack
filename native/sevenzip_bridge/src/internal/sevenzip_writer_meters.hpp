@@ -80,7 +80,7 @@ namespace sunpack::sevenzip
 
     struct AsyncWriterConfig
     {
-        std::size_t threads_per_volume = 4;
+        std::size_t threads_per_volume = 8;
         std::size_t buffer_count = 64;
         std::size_t queue_limit = 4096;
         bool write_through = false;

@@ -15,7 +15,7 @@ namespace sunpack::sevenzip
         enum class Kind
         {
             Succeeded,        // 一次真实操作成功
-            SpaceFailure,     // 空间不足（gate 存在时进入冷路径重试；gate 为 null 时由调用方转旧语义）
+            SpaceFailure,     // 空间不足（有 gate 时恢复；无 gate 时由调用方记录失败）
             PermanentFailure, // 确凿的非空间错误（不可重试）
             Terminal,         // 调用方要求终止（取消 / draining）；本次 attempt 未产生任何副作用
         };
@@ -24,7 +24,27 @@ namespace sunpack::sevenzip
         unsigned long win32_error = 0; // 仅 SpaceFailure / PermanentFailure 有意义
     };
 
-    // 唯一的重试骨架，也是全项目唯一有权调用 gate 空间状态接口的地方。语义是异常驱动的
+    // Async completions must publish failure evidence before handing off to
+    // their IOCP retry queue. Delaying it until dequeue can incorrectly open
+    // a new blocked episode after another request has already recovered.
+    inline void report_retry_space_failure(VolumeSpaceGate *gate,
+                                           unsigned long error,
+                                           std::wstring_view failed_path) noexcept
+    {
+        if (gate) gate->report_space_failure(error, failed_path);
+    }
+
+    inline void settle_space_attempt(ProbeLease &lease, const AttemptResult &result,
+                                     std::wstring_view path) noexcept
+    {
+        if (!lease.valid()) return;
+        if (result.kind == AttemptResult::Kind::Succeeded) lease.report_success();
+        else if (result.kind == AttemptResult::Kind::SpaceFailure)
+            lease.report_space_failure(result.win32_error, path);
+        else lease.report_inconclusive();
+    }
+
+    // 目录操作的阻塞重试骨架；与 IOCP 共享 gate 裁决及许可结算。语义是异常驱动的
     // 冷路径：先做一次真实操作，只有真的返回 SpaceFailure 才触碰 gate；gate == nullptr 时
     // 原样外泄结果。写成功不回报 gate —— 卷恢复的唯一裁决者是 monitor 采样 + 一次真实 probe。
     //
@@ -50,12 +70,12 @@ namespace sunpack::sevenzip
 
         if (gate == nullptr)
         {
-            // gate 关闭：只试一次，原样返回结果，旧语义副作用由调用方负责。
+            // 没有恢复 gate：只试一次，由调用方记录失败。
             return result;
         }
 
         // 失败证据必须先于 wait() 上报：wait() 只做裁决，不产生证据。
-        gate->report_space_failure(result.win32_error, failed_path);
+        report_retry_space_failure(gate, result.win32_error, failed_path);
 
         const TerminalPredicate terminal = make_terminal();
 
@@ -76,42 +96,11 @@ namespace sunpack::sevenzip
 
             result = attempt();
 
-            switch (result.kind)
-            {
-            case AttemptResult::Kind::Succeeded:
-                if (lease.valid())
-                {
-                    lease.report_success();
-                }
-                return result;
+            const bool held_probe = lease.valid();
+            settle_space_attempt(lease, result, failed_path);
+            if (result.kind != AttemptResult::Kind::SpaceFailure) return result;
+            if (!held_probe) report_retry_space_failure(gate, result.win32_error, failed_path);
 
-            case AttemptResult::Kind::SpaceFailure:
-                // 唯一的空间失败上报点。
-                if (lease.valid())
-                {
-                    lease.report_space_failure(result.win32_error, failed_path);
-                }
-                else
-                {
-                    gate->report_space_failure(result.win32_error, failed_path);
-                }
-                continue; // 回到 wait() 重新裁决
-
-            case AttemptResult::Kind::PermanentFailure:
-                // 非空间错误不能证明卷可写 → probe inconclusive（绝不 Ready）。
-                if (lease.valid())
-                {
-                    lease.report_inconclusive();
-                }
-                return result;
-
-            case AttemptResult::Kind::Terminal:
-                if (lease.valid())
-                {
-                    lease.report_inconclusive();
-                }
-                return result;
-            }
         }
     }
 

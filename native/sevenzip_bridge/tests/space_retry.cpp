@@ -294,8 +294,9 @@ void r4_producer_backpressure(const std::filesystem::path &directory) {
     const auto payload = make_payload(kPayload);
     const auto path = directory / L"r4-backpressure.bin";
 
-    // 第一次 WriteFile 就失败 → 立刻暂停，buffer 一直被 writer 线程持有。
-    writer.set_write_fault_for_test(ERROR_DISK_FULL, 1);
+    // IOCP can submit other buffers while the first failed buffer is paused.
+    // Model an actually full volume, not a one-shot fault on a writable disk.
+    writer.set_write_fault_for_test(ERROR_DISK_FULL, 64);
 
     const auto job = writer.make_job(kBudget);
     const auto file = writer.make_file(job, path.wstring(), L"r4-backpressure.bin", 0, 0);
@@ -321,6 +322,7 @@ void r4_producer_backpressure(const std::filesystem::path &directory) {
     const auto paused = writer.snapshot_metrics();
     check(paused.pending_bytes > 0, "R-4: 暂停期间 pending 必须保持非零");
 
+    writer.set_write_fault_for_test(ERROR_DISK_FULL, 0);
     check(harness.release_probe_and_wait_ready(), "R-4: 恢复后必须回到 Ready");
     producer.join();
     check(producer_returned.load(), "R-4: 恢复后 producer 必须被唤醒并返回");
@@ -1148,6 +1150,65 @@ void r22_partial_write_then_space_failure(const std::filesystem::path &directory
           "R-22: 输出必须逐字节等于 payload（续写不得丢数据、不得错位）");
 }
 
+// Cancelling one job must drain its deferred requests while the same volume's
+// IOCP retry queue remains paused on a different job.
+void r24_cancel_queued_retry(const std::filesystem::path &directory) {
+    Harness harness(directory, 4, 8);
+    auto &writer = *harness.writer;
+    const auto payload = make_payload(kMib);
+    writer.set_write_fault_for_test(ERROR_DISK_FULL, 64);
+    const auto a = writer.make_job(2 * kMib);
+    const auto b = writer.make_job(2 * kMib);
+    const auto fa = writer.make_file(a, (directory / L"r24-a.bin").wstring(), L"a", 0, 0);
+    const auto fb = writer.make_file(b, (directory / L"r24-b.bin").wstring(), L"b", 1, 1);
+    std::uint32_t processed = 0;
+    writer.write(fa, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed);
+    check(wait_until([&] { return harness.gate->wait_call_count() > 0; }, 5s),
+          "R-24: first job must enter IOCP deferred admission");
+    writer.write(fb, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed);
+    writer.close_file(fa, {});
+    writer.close_file(fb, {});
+    const auto start = std::chrono::steady_clock::now();
+    writer.cancel_job(b);
+    check(writer.finish_job(b) != S_OK, "R-24: queued job cancellation must fail that job");
+    check(std::chrono::steady_clock::now() - start < 1s,
+          "R-24: queued cancellation must not wait for another job's space recovery");
+    check(harness.gate->blocked(), "R-24: cancellation must not resume the other job");
+    writer.set_write_fault_for_test(ERROR_DISK_FULL, 0);
+    check(harness.release_probe_and_wait_ready(), "R-24: other job must still recover");
+    check(writer.finish_job(a) == S_OK, "R-24: uncancelled job must succeed");
+    check(read_file(directory / L"r24-a.bin") == payload, "R-24: recovered bytes must match");
+    const auto metrics = writer.snapshot_metrics();
+    check(metrics.pending_bytes == 0 && metrics.accepted_bytes == metrics.written_bytes + metrics.discarded_bytes,
+          "R-24: all accepted bytes must be settled exactly once");
+}
+
+void r25_cancel_blocked_producer(const std::filesystem::path &directory) {
+    for (const bool shutdown : {false, true}) {
+        Harness harness(directory, 4, 8);
+        auto &writer = *harness.writer;
+        writer.set_write_fault_for_test(ERROR_DISK_FULL, 64);
+        const auto payload = make_payload(16 * kMib);
+        const auto job = writer.make_job(2 * kMib);
+        const auto name = shutdown ? L"r25-shutdown.bin" : L"r25-cancel.bin";
+        const auto file = writer.make_file(job, (directory / name).wstring(), name, 0, 0);
+        std::thread producer([&] {
+            std::uint32_t processed = 0;
+            writer.write(file, payload.data(), static_cast<std::uint32_t>(payload.size()), &processed);
+        });
+        check(wait_until([&] { return harness.gate->blocked(); }, 5s), "R-25: writes must pause");
+        const auto start = std::chrono::steady_clock::now();
+        if (shutdown) writer.finish(); else writer.cancel_job(job);
+        producer.join();
+        check(writer.finish_job(job) != S_OK, "R-25: cancelled producer job must fail");
+        check(std::chrono::steady_clock::now() - start < 1s,
+              "R-25: cancel/shutdown must release a producer holding the file mutex");
+        const auto metrics = writer.snapshot_metrics();
+        check(metrics.pending_bytes == 0 && metrics.accepted_bytes == metrics.written_bytes + metrics.discarded_bytes,
+              "R-25: blocked producer cancellation must settle all bytes");
+    }
+}
+
 // R-23 正常路径从不进入 gate
 void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) {
     // ① 干净卷：多 buffer 的正常写入一次都不能调用 wait() —— 骨架先做真实 WriteFile，
@@ -1198,7 +1259,7 @@ void r23_hot_path_never_enters_the_gate(const std::filesystem::path &directory) 
 
         check(wait_until([&] { return harness.gate->blocked(); }, 5s),
               "R-23: ② 真实空间失败必须让卷进入暂停");
-        check(harness.gate->wait_call_count() >= 1,
+        check(wait_until([&] { return harness.gate->wait_call_count() >= 1; }, 5s),
               "R-23: ★ 只有真实空间失败之后才允许调用 wait()");
 
         check(harness.release_probe_and_wait_ready(), "R-23: ② 恢复后必须回到 Ready");
@@ -1369,6 +1430,8 @@ int main(int argc, char **argv) {
          [&] { r22_partial_write_then_space_failure(directory); }},
         {"R-23 hot path never enters the gate",
          [&] { r23_hot_path_never_enters_the_gate(directory); }},
+        {"R-24 queued retry cancellation", [&] { r24_cancel_queued_retry(directory); }},
+        {"R-25 blocked producer cancellation", [&] { r25_cancel_blocked_producer(directory); }},
         {"Phase 6c default enabled", phase_6c_default_enabled},
         {"error code contract", error_code_contract},
     };

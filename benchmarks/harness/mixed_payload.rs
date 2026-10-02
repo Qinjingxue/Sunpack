@@ -1,7 +1,54 @@
 //! Standalone, bounded-memory benchmark fixture writer; no production API.
-use std::{env, fs::{self, File}, io::{self, Write}, path::PathBuf};
+use std::{env, fs::{self, File}, io::{self, Read, Write}, path::PathBuf};
 
 fn main() -> io::Result<()> {
+    if env::args().nth(1).as_deref() == Some("--verify-output") {
+        fn files(root: &std::path::Path, output: &mut Vec<PathBuf>) -> io::Result<()> {
+            for entry in fs::read_dir(root)? {
+                let path = entry?.path();
+                if path.is_dir() { files(&path, output)?; } else { output.push(path); }
+            }
+            Ok(())
+        }
+        fn equal(left: &std::path::Path, right: &std::path::Path) -> io::Result<()> {
+            let (mut a, mut b) = (File::open(left)?, File::open(right)?);
+            if a.metadata()?.len() != b.metadata()?.len() {
+                return Err(io::Error::other("output length mismatch"));
+            }
+            let (mut x, mut y) = ([0u8; 65536], [0u8; 65536]);
+            loop {
+                let n = a.read(&mut x)?;
+                if n == 0 { break; }
+                b.read_exact(&mut y[..n])?;
+                if x[..n] != y[..n] { return Err(io::Error::other("output bytes mismatch")); }
+            }
+            Ok(())
+        }
+        let fmt = env::args().nth(2).expect("format");
+        let reference = PathBuf::from(env::args_os().nth(3).expect("reference"));
+        let output = PathBuf::from(env::args_os().nth(4).expect("output root"));
+        let mut actual = Vec::new();
+        files(&output, &mut actual)?;
+        if fmt == "gz" || fmt == "stream" {
+            if actual.len() != 1 { return Err(io::Error::other("gzip file count")); }
+            return equal(&reference, &actual[0]);
+        }
+        let expected = fs::read_dir(&reference)?.count();
+        if actual.len() != expected { return Err(io::Error::other("zip file count")); }
+        for file in actual { equal(&reference.join(file.file_name().unwrap()), &file)?; }
+        return Ok(());
+    }
+    if env::args().nth(1).as_deref() == Some("--sync-tree") {
+        fn sync_tree(path: &std::path::Path) -> io::Result<()> {
+            if path.is_dir() {
+                for entry in fs::read_dir(path)? { sync_tree(&entry?.path())?; }
+            } else if path.is_file() {
+                fs::OpenOptions::new().write(true).open(path)?.sync_all()?;
+            }
+            Ok(())
+        }
+        return sync_tree(&PathBuf::from(env::args_os().nth(2).expect("output root")));
+    }
     if env::args().nth(1).as_deref() == Some("--copy") {
         fs::copy(env::args_os().nth(2).expect("source"), env::args_os().nth(3).expect("destination"))?;
         return Ok(());

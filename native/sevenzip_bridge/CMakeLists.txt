@@ -71,6 +71,7 @@ option(SUP7Z_USE_ARM64_ASM
 option(SUP7Z_ENABLE_PIPELINE_TIMING
     "Build the benchmark-only worker pipeline timing instrumentation"
     OFF)
+option(SUP7Z_ENABLE_WRITER_PROBE "Build benchmark-only writer phase probes and IO ablations" OFF)
 
 set(SUP7Z_TARGET_UARCH "unknown")
 if(MSVC)
@@ -364,6 +365,9 @@ add_library(sunpack_sevenzip_core STATIC
 )
 apply_release_optimizations(sunpack_sevenzip_core)
 apply_source_charset(sunpack_sevenzip_core)
+if(SUP7Z_ENABLE_WRITER_PROBE)
+    target_compile_definitions(sunpack_sevenzip_core PUBLIC SUP7Z_ENABLE_WRITER_PROBE=1)
+endif()
 
 target_include_directories(sunpack_sevenzip_core
     PUBLIC

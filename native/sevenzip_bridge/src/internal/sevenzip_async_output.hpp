@@ -4,6 +4,7 @@
 #include "sevenzip_space_retry.hpp"
 #include "sevenzip_volume_state.hpp"
 #include "sevenzip_writer_meters.hpp"
+#include "sevenzip_writer_probe.hpp"
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
 #include "worker_pipeline_timing.hpp"
 #endif
@@ -63,6 +64,9 @@ namespace sunpack::sevenzip
             std::shared_ptr<std::atomic<bool>> cancel_token;
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             PipelineTiming *pipeline_timing = nullptr;
+#endif
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            WriterProbe probe;
 #endif
         };
 
@@ -146,6 +150,7 @@ namespace sunpack::sevenzip
             Buffer *buffer = nullptr;
             FileStatePtr file;
             UInt64 output_offset = 0;
+            unsigned long retry_error = 0;
         };
 
         struct FileState
@@ -199,31 +204,35 @@ namespace sunpack::sevenzip
             bool inflight_released = false;
             HANDLE handle = INVALID_HANDLE_VALUE;
             bool open_attempted = false;
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            UInt64 probe_expected_size = 0;
+#endif
         };
+
+        struct IoRequest
+        {
+            OVERLAPPED overlapped{};
+            Buffer *buffer = nullptr;
+        };
+        static_assert(offsetof(IoRequest, overlapped) == 0);
 
         struct Buffer
         {
-            Buffer()
-                : completion_event(CreateEventW(nullptr, TRUE, FALSE, nullptr))
-            {
-                if (completion_event == nullptr)
-                {
-                    throw std::bad_alloc();
-                }
-            }
-
-            ~Buffer()
-            {
-                if (completion_event != nullptr)
-                {
-                    CloseHandle(completion_event);
-                }
-            }
+            Buffer() { request.buffer = this; }
 
             std::unique_ptr<unsigned char[]> data;
-            HANDLE completion_event = nullptr;
+            IoRequest request;
+            // Completion can be dequeued before WriteFile returns. Serialize
+            // that handoff, including synchronous success, before recycling.
+            std::mutex io_mutex;
+            UInt64 output_offset = 0;
+            UInt32 transferred = 0;
+            ProbeLease probe_lease;
             FileStatePtr file;
             UInt32 size = 0;
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            unsigned long long probe_queued_at = 0;
+#endif
         };
 
         static constexpr std::size_t kBufferSize = 1U << 20;
@@ -287,12 +296,19 @@ namespace sunpack::sevenzip
             std::wstring path,
             std::wstring item_path,
             UInt32 item_index,
-            std::size_t trace_index)
+            std::size_t trace_index
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            , UInt64 expected_size = 0
+#endif
+            )
         {
             auto file = std::make_shared<FileState>(
                 job ? job : make_job(),
                 std::move(path), std::move(item_path), item_index, trace_index);
             std::lock_guard<std::mutex> lock(mutex_);
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            file->probe_expected_size = expected_size;
+#endif
             // 快照本卷的空间 gate；功能关闭 / 空 key 时为 nullptr。
             file->space_gate = state_ ? state_->space_gate : nullptr;
             active_files_.push_back(file);
@@ -331,7 +347,19 @@ namespace sunpack::sevenzip
             {
                 return E_FAIL;
             }
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_producer(job->probe, WriterProbePhase::Producer);
+#endif
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_filelock(job->probe, WriterProbePhase::FileLock);
+#endif
             std::unique_lock<std::mutex> producer_lock(file->producer_mutex);
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_filelock.finish();
+#endif
+
             while (consumed < size)
             {
                 bool queued_staging = false;
@@ -340,10 +368,33 @@ namespace sunpack::sevenzip
                 UInt32 chunk = 0;
                 HRESULT setup_error = S_OK;
                 {
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_setup(job->probe, WriterProbePhase::SetupLock);
+#endif
                     std::unique_lock<std::mutex> lock(mutex_);
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_setup.finish();
+#endif
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                    if (!can_accept_locked(job, file)) {
+                        if (file->inflight_bytes >= kDefaultFileInFlightBytes) job->probe.file_full++;
+                        if (job->inflight_bytes >= job->max_inflight_bytes) job->probe.job_full++;
+                        if (free_buffers_.empty()) job->probe.buffers_empty++;
+                    }
+#endif
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_capacity(job->probe, WriterProbePhase::CapacityWait);
+#endif
                     producer_cv_.wait(lock, [this, &job, &file]
                                       { return terminal_result_locked(job) != S_OK || file->close_requested ||
                                                can_accept_locked(job, file); });
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_capacity.finish();
+#endif
+
                     const HRESULT error = terminal_result_locked(job);
                     if (error != S_OK || file->close_requested)
                     {
@@ -443,14 +494,31 @@ namespace sunpack::sevenzip
                     return setup_error;
                 }
 
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_copy(job->probe, WriterProbePhase::Copy);
+#endif
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                if (std::strcmp(writer_probe_mode(), "memory-nocopy") != 0)
+#endif
                 std::memcpy(
                     file->staging_buffer->data.get() + previous_size,
                     source + consumed,
                     chunk);
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_copy.finish();
+#endif
 
                 HRESULT enqueue_result = S_OK;
                 {
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_commit(job->probe, WriterProbePhase::CommitLock);
+#endif
                     std::unique_lock<std::mutex> lock(mutex_);
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_commit.finish();
+#endif
                     const HRESULT error = terminal_result_locked(job);
                     Buffer *buffer = file->staging_buffer;
                     if (error != S_OK || file->close_requested || !buffer)
@@ -504,10 +572,6 @@ namespace sunpack::sevenzip
                     }
                     return enqueue_result;
                 }
-                if (queued_staging)
-                {
-                    work_cv_.notify_one();
-                }
             }
 
             if (processed_size)
@@ -527,8 +591,6 @@ namespace sunpack::sevenzip
             }
 
             std::unique_lock<std::mutex> producer_lock(file->producer_mutex);
-            bool queued_close = false;
-            bool queued_data = false;
             bool direct_close = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
@@ -549,20 +611,12 @@ namespace sunpack::sevenzip
                 }
                 else if (file->staging_buffer)
                 {
-                    queued_data = enqueue_staging_locked(file, true);
+                    enqueue_staging_locked(file, true);
                 }
                 if (file->outstanding_data == 0)
                 {
-                    queued_close = enqueue_close_locked(file, &direct_close);
+                    enqueue_close_locked(file, &direct_close);
                 }
-            }
-            if (queued_data)
-            {
-                work_cv_.notify_one();
-            }
-            if (queued_close)
-            {
-                work_cv_.notify_one();
             }
             if (direct_close)
             {
@@ -577,19 +631,34 @@ namespace sunpack::sevenzip
             {
                 return E_FAIL;
             }
-            bool cancelled = false;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 synchronize_cancellation_locked(job);
-                cancelled = terminal_result_locked(job) != S_OK;
             }
-            if (cancelled)
-            {
-                cleanup_cancelled_staging(job);
-            }
+            // Seal all files even if an error arrives after this call starts,
+            // or the caller never reached the stream's Close().
+            seal_job_files(job);
+            drain_cancelled_retries();
+            if (job->terminal_requested.load(std::memory_order_acquire) && state_->space_gate)
+                state_->space_gate->wake_waiters();
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_finishlock(job->probe, WriterProbePhase::FinishLock);
+#endif
             std::unique_lock<std::mutex> lock(mutex_);
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_finishlock.finish();
+#endif
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_finishwait(job->probe, WriterProbePhase::FinishWait);
+#endif
             producer_cv_.wait(lock, [&job]
                               { return job->pending_jobs == 0; });
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_finishwait.finish();
+#endif
+
             const HRESULT result = terminal_result_locked(job);
             unregister_job_locked(job);
             prune_expired_files_locked();
@@ -598,6 +667,10 @@ namespace sunpack::sevenzip
                 meters_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
                 state_->counters.completed_jobs.fetch_add(1, std::memory_order_relaxed);
             }
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            lock.unlock();
+            job->probe.dump();
+#endif
             return result;
         }
 
@@ -611,15 +684,12 @@ namespace sunpack::sevenzip
                 std::lock_guard<std::mutex> lock(mutex_);
                 cancel_job_locked(job);
             }
-            cleanup_cancelled_staging(job);
-            // 置 terminal_requested 之后必须唤醒卡在卷 gate 上的 writer 线程，
-            // 否则取消只能等 wait_tick 超时才被察觉。
-            if (state_ && state_->space_gate)
-            {
-                state_->space_gate->wake_waiters();
-            }
-            work_cv_.notify_all();
+            // Release a producer's capacity wait before acquiring its file
+            // mutex to seal it; the producer holds that mutex during Write().
             producer_cv_.notify_all();
+            if (state_->space_gate) state_->space_gate->wake_waiters();
+            seal_job_files(job);
+            drain_cancelled_retries();
         }
 
         void wake_waiters() noexcept
@@ -639,6 +709,7 @@ namespace sunpack::sevenzip
                     }
                 }
             }
+            drain_cancelled_retries();
             // 取消必须能穿透"因满盘而暂停"：卷 gate 的等待者也要被唤醒。
             if (state_ && state_->space_gate)
             {
@@ -753,39 +824,36 @@ namespace sunpack::sevenzip
 
         void finish() noexcept
         {
+            std::lock_guard<std::mutex> finish_lock(finish_mutex_);
+            if (!completion_port_) return;
             std::vector<JobStatePtr> jobs;
+            std::vector<FileStatePtr> files;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 stopping_.store(true, std::memory_order_release);
-                for (const auto &weak_job : active_jobs_)
-                {
-                    if (const auto job = weak_job.lock())
-                    {
-                        cancel_job_locked(job);
-                        jobs.push_back(job);
-                    }
-                }
+                for (const auto &weak : active_jobs_)
+                    if (auto job = weak.lock()) { cancel_job_locked(job); jobs.push_back(job); }
+                for (const auto &weak : active_files_)
+                    if (auto file = weak.lock()) files.push_back(file);
             }
-            for (const auto &job : jobs)
-            {
-                cleanup_cancelled_staging(job);
-            }
-
-            // 只唤醒，不 abort：所有 active job 已置 terminal_requested，谓词此刻为真；
-            // gate 状态不因关停而改变，否则 persistent 卷的 gate 会被 idle reap 永久毒死。
-            if (state_ && state_->space_gate)
-            {
-                state_->space_gate->wake_waiters();
-            }
-            work_cv_.notify_all();
             producer_cv_.notify_all();
-            for (auto &worker : workers_)
+            if (state_->space_gate) state_->space_gate->wake_waiters();
+            for (const auto &job : jobs) seal_job_files(job);
+            for (const auto &file : files) close_file(file, {});
+            if (state_ && state_->space_gate) state_->space_gate->wake_waiters();
+            producer_cv_.notify_all();
+            drain_cancelled_retries();
             {
-                if (worker.joinable())
-                {
-                    worker.join();
-                }
+                std::unique_lock<std::mutex> lock(mutex_);
+                producer_cv_.wait(lock, [this] { return queued_jobs_ == 0 && inflight_file_count_ == 0; });
             }
+            // No packet can reference a recycled buffer or a closed file now.
+            space_wake_->disable();
+            for (std::size_t i = 0; i < workers_.size(); ++i)
+                PostQueuedCompletionStatus(completion_port_, 0, kStopPacket, nullptr);
+            for (auto &worker : workers_) if (worker.joinable()) worker.join();
+            CloseHandle(completion_port_);
+            completion_port_ = nullptr;
         }
 
     private:
@@ -808,9 +876,14 @@ namespace sunpack::sevenzip
                 free_buffers_.push_back(buffer.get());
                 buffers_.push_back(std::move(buffer));
             }
-            workers_.reserve(writer_count_);
+            completion_port_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0,
+                                                       static_cast<DWORD>(writer_count_));
+            if (!completion_port_) throw std::bad_alloc();
             try
             {
+                space_wake_ = std::make_shared<CompletionWake>(completion_port_);
+                if (state_->space_gate) state_->space_gate->subscribe(space_wake_);
+                workers_.reserve(writer_count_);
                 for (std::size_t index = 0; index < writer_count_; ++index)
                 {
                     workers_.emplace_back([this]
@@ -823,7 +896,8 @@ namespace sunpack::sevenzip
                     std::lock_guard<std::mutex> lock(mutex_);
                     stopping_.store(true, std::memory_order_release);
                 }
-                work_cv_.notify_all();
+                for (std::size_t i = 0; i < workers_.size(); ++i)
+                    PostQueuedCompletionStatus(completion_port_, 0, kStopPacket, nullptr);
                 for (auto &worker : workers_)
                 {
                     if (worker.joinable())
@@ -831,6 +905,9 @@ namespace sunpack::sevenzip
                         worker.join();
                     }
                 }
+                if (space_wake_) space_wake_->disable();
+                CloseHandle(completion_port_);
+                completion_port_ = nullptr;
                 throw;
             }
         }
@@ -989,7 +1066,7 @@ namespace sunpack::sevenzip
             }
         }
 
-        void cleanup_cancelled_staging(const JobStatePtr &job) noexcept
+        void seal_job_files(const JobStatePtr &job) noexcept
         {
             if (!job)
             {
@@ -1003,7 +1080,7 @@ namespace sunpack::sevenzip
                 {
                     if (const auto file = it->lock())
                     {
-                        if (file->job.get() == job.get())
+                        if (file->job.get() == job.get() && !file->close_requested)
                         {
                             files.push_back(file);
                         }
@@ -1022,25 +1099,9 @@ namespace sunpack::sevenzip
 
             for (const auto &file : files)
             {
-                std::unique_lock<std::mutex> producer_lock(file->producer_mutex);
-                bool queued_close = false;
-                {
-                    std::lock_guard<std::mutex> lock(mutex_);
-                    if (terminal_result_locked(job) == S_OK)
-                    {
-                        continue;
-                    }
-                    discard_staging_locked(file);
-                    if (file->close_requested && file->outstanding_data == 0)
-                    {
-                        queued_close = enqueue_close_locked(file, nullptr);
-                    }
-                }
-                if (queued_close)
-                {
-                    work_cv_.notify_one();
-                }
-                producer_cv_.notify_all();
+                // Callers need not have reached Close(). Keep the file alive
+                // until submitted I/O drains and its handle closes.
+                close_file(file, {});
             }
         }
 
@@ -1112,7 +1173,19 @@ namespace sunpack::sevenzip
             }
             try
             {
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                buffer->probe_queued_at = file->job->probe.enabled ? writer_probe_clock() : 0;
+#endif
                 work_queue_.emplace_back(WorkItem::data(buffer, output_offset));
+                const DWORD error = post_work_locked();
+                if (error != ERROR_SUCCESS)
+                {
+                    work_queue_.pop_back();
+                    discard_staging_locked(file);
+                    mark_file_failure_locked(file, HRESULT_FROM_WIN32(error), error);
+                    set_job_error_locked(file->job, HRESULT_FROM_WIN32(error), error);
+                    return false;
+                }
             }
             catch (...)
             {
@@ -1139,6 +1212,15 @@ namespace sunpack::sevenzip
             try
             {
                 work_queue_.push_back(WorkItem::close(file));
+                const DWORD error = post_work_locked();
+                if (error != ERROR_SUCCESS)
+                {
+                    work_queue_.pop_back();
+                    mark_file_failure_locked(file, HRESULT_FROM_WIN32(error), error);
+                    set_job_error_locked(file->job, HRESULT_FROM_WIN32(error), error);
+                    if (direct_close) *direct_close = true;
+                    return false;
+                }
                 ++queued_jobs_;
                 return true;
             }
@@ -1154,89 +1236,219 @@ namespace sunpack::sevenzip
             }
         }
 
+        static constexpr ULONG_PTR kWorkPacket = 1;
+        static constexpr ULONG_PTR kStopPacket = 2;
+        static constexpr ULONG_PTR kRetryPacket = 3;
+
+        class CompletionWake final : public SpaceWakeTarget
+        {
+        public:
+            explicit CompletionWake(HANDLE port) : port_(port) {}
+            void wake() noexcept override
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                if (port_ && !posted_)
+                    posted_ = PostQueuedCompletionStatus(port_, 0, kRetryPacket, nullptr) != FALSE;
+            }
+            void acknowledge() noexcept { std::lock_guard<std::mutex> lock(mutex_); posted_ = false; }
+            void disable() noexcept { std::lock_guard<std::mutex> lock(mutex_); port_ = nullptr; }
+        private:
+            std::mutex mutex_;
+            HANDLE port_;
+            bool posted_ = false;
+        };
+
+        DWORD post_work_locked() noexcept
+        {
+            // The live port is owned by this facility until all files drain.
+            if (PostQueuedCompletionStatus(completion_port_, 0, kWorkPacket, nullptr)) return ERROR_SUCCESS;
+            return GetLastError();
+        }
+
         void writer_loop() noexcept
         {
             for (;;)
             {
+                DWORD bytes = 0;
+                ULONG_PTR key = 0;
+                OVERLAPPED *overlapped = nullptr;
+                const BOOL ok = GetQueuedCompletionStatus(completion_port_, &bytes, &key, &overlapped, INFINITE);
+                const DWORD error = ok ? ERROR_SUCCESS : GetLastError();
+                if (key == kRetryPacket)
+                {
+                    space_wake_->acknowledge();
+                    dispatch_space_retries();
+                    continue;
+                }
+                if (overlapped)
+                {
+                    auto *request = reinterpret_cast<IoRequest *>(overlapped);
+                    complete_data_write(request->buffer, bytes, error);
+                    continue;
+                }
+                if (key == kStopPacket || (!ok && error == ERROR_ABANDONED_WAIT_0)) break;
+                if (key != kWorkPacket) continue;
                 WorkItem item;
                 {
-                    std::unique_lock<std::mutex> lock(mutex_);
-                    work_cv_.wait(lock, [this]
-                                  { return stopping_.load(std::memory_order_acquire) ||
-                                           !work_queue_.empty(); });
-                    if (work_queue_.empty())
-                    {
-                        if (stopping_.load(std::memory_order_acquire))
-                        {
-                            break;
-                        }
-                        continue;
-                    }
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    if (work_queue_.empty()) continue;
                     item = std::move(work_queue_.front());
                     work_queue_.pop_front();
                     --queued_jobs_;
                 }
                 producer_cv_.notify_all();
-
-                if (item.kind == WorkItem::Kind::Data)
+                if (item.kind == WorkItem::Kind::Close)
                 {
-                    // buffer 的所有权在本循环内，只有真正终结时才 release，
-                    // 因此"暂停"期间 buffer 天然保持 inflight，producer 反压成立。
-                    Buffer *buffer = item.buffer;
-                    const FileStatePtr file = buffer ? buffer->file : nullptr;
+                    process_close(item.file);
+                    continue;
+                }
+                Buffer *buffer = item.buffer;
+                const auto file = buffer->file;
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                if (file && file->job->probe.enabled && buffer->probe_queued_at)
+                    file->job->probe.add(WriterProbePhase::Queue, writer_probe_clock() - buffer->probe_queued_at);
+#endif
+                buffer->output_offset = item.output_offset;
+                buffer->transferred = 0;
+                dispatch_data(buffer);
+            }
+        }
 
-                    // dequeue 的 buffer 剩余字节只由 writer_loop 结算：空间失败时已落盘的
-                    // 前缀不被重复记账，重试从 output_offset + transferred 继续（同 handle、同 offset）。
-                    UInt32 transferred = 0;
+        void dispatch_data(Buffer *buffer) noexcept
+        {
+            bool submitted = false;
+            const auto result = attempt_data_write(buffer->file, buffer, submitted);
+            // Once submitted, ONLY the completion packet owns this buffer.
+            if (!submitted)
+            {
+                finish_data_attempt(buffer, result);
+            }
+        }
 
-                    const AttemptResult result = retry_with_space_gate(
-                        file ? file->volume_space_gate() : nullptr,
-                        [this, &file] { return writer_terminal_predicate(file ? file->job : nullptr); },
-                        file ? std::wstring_view(file->path) : std::wstring_view{},
-                        [&] {
-                            // 一次真实尝试：只返回 AttemptResult，绝不碰 gate、绝不记账
-                            return attempt_data_write(file, buffer, item.output_offset, transferred);
-                        });
+        void finish_data_attempt(Buffer *buffer, AttemptResult result) noexcept
+        {
+            const auto file = buffer->file;
+            const bool held_probe = buffer->probe_lease.valid();
+            settle_space_attempt(buffer->probe_lease, result, file->path);
+            if (result.kind == AttemptResult::Kind::SpaceFailure && file->space_gate)
+            {
+                auto item = WorkItem::data(buffer, buffer->output_offset);
+                item.retry_error = held_probe ? 0 : result.win32_error;
+                defer_space_work(std::move(item));
+                return;
+            }
+            if (result.kind == AttemptResult::Kind::SpaceFailure)
+                record_failure(file, HRESULT_FROM_WIN32(result.win32_error), result.win32_error);
+            if (result.kind != AttemptResult::Kind::Succeeded && buffer->size > buffer->transferred)
+                account_discarded(buffer->size - buffer->transferred);
+            release_buffer(buffer);
+        }
 
-                    // 收尾记账：dequeue 的 buffer 剩余字节只在这里结算。
-                    if (result.kind == AttemptResult::Kind::SpaceFailure)
-                    {
-                        record_legacy_space_failure(file, buffer, transferred, result.win32_error);
-                        release_buffer(buffer);
-                        continue;
-                    }
-                    switch (result.kind)
-                    {
-                    case AttemptResult::Kind::Succeeded:
-                        break; // remaining == 0，无需记
-                    case AttemptResult::Kind::PermanentFailure:
-                    case AttemptResult::Kind::Terminal:
-                        if (buffer && buffer->size > transferred)
-                        {
-                            account_discarded(buffer->size - transferred);
-                        }
-                        break;
-                    }
-
-                    release_buffer(buffer);
+        void complete_data_write(Buffer *buffer, DWORD bytes, DWORD error) noexcept
+        {
+            AttemptResult result;
+            {
+                std::lock_guard<std::mutex> io_lock(buffer->io_mutex);
+                const auto file = buffer->file;
+                end_data_write(file);
+                if (error != ERROR_SUCCESS)
+                    result = classify_data_failure(file, error);
+                else if (bytes == 0 || bytes > buffer->size - buffer->transferred)
+                {
+                    record_failure(file, HRESULT_FROM_WIN32(ERROR_WRITE_FAULT), ERROR_WRITE_FAULT, 0);
+                    result = {AttemptResult::Kind::PermanentFailure, ERROR_WRITE_FAULT};
                 }
                 else
                 {
-                    process_close(item.file);
+                    buffer->transferred += bytes;
+                    add_written_bytes(file, bytes);
                 }
             }
+            if (result.kind == AttemptResult::Kind::Succeeded && buffer->transferred < buffer->size)
+                dispatch_data(buffer); // short write continues at the confirmed prefix
+            else
+                finish_data_attempt(buffer, result);
+        }
+
+        // No waiter thread: the monitor/gate posts one coalesced IOCP packet.
+        // Queue publication and admission share mutex_, so a transition cannot
+        // be lost between testing Pending and leaving the item in this queue.
+        void defer_space_work(WorkItem item) noexcept
+        {
+            const auto file = item.kind == WorkItem::Kind::Data ? item.buffer->file : item.file;
+            if (item.retry_error)
+                report_retry_space_failure(file->space_gate.get(), item.retry_error, file->path);
+            try
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                retry_queue_.push_back(std::move(item));
+            }
+            catch (...)
+            {
+                record_failure(file, E_OUTOFMEMORY, ERROR_OUTOFMEMORY);
+                if (item.kind == WorkItem::Kind::Data)
+                    finish_data_attempt(item.buffer, {AttemptResult::Kind::PermanentFailure, ERROR_OUTOFMEMORY});
+                else process_close(file);
+            }
+            space_wake_->wake();
+        }
+
+        void dispatch_space_retries() noexcept
+        {
+            for (;;)
+            {
+                WorkItem item;
+                ProbeLease lease;
+                bool found = false;
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    for (auto it = retry_queue_.begin(); it != retry_queue_.end(); ++it)
+                    {
+                        const auto file = it->kind == WorkItem::Kind::Data ? it->buffer->file : it->file;
+                        synchronize_cancellation_locked(file->job);
+                        auto decision = file->space_gate->try_wait(writer_terminal_predicate(file->job));
+                        if (decision.kind == VolumeSpaceGate::WaitResult::Kind::Pending) continue;
+                        lease = std::move(decision.lease);
+                        item = std::move(*it);
+                        retry_queue_.erase(it);
+                        found = true;
+                        break;
+                    }
+                }
+                if (!found) return;
+                if (item.kind == WorkItem::Kind::Data)
+                {
+                    item.buffer->probe_lease = std::move(lease);
+                    dispatch_data(item.buffer);
+                }
+                else process_close(item.file, std::move(lease));
+            }
+        }
+
+        void drain_cancelled_retries() noexcept
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (!retry_queue_.empty()) space_wake_->wake();
         }
 
         // 一次 CreateFileW 尝试：在 writer mutex_ 内且只做一次，绝不等待。
         // 同一 FileState 的多个 Data WorkItem 会被多个 writer 线程并发处理，去锁后
         // 两个线程可能同时 CreateFileW(CREATE_NEW)，后者得到 ERROR_FILE_EXISTS 而把 job 标成永久失败；
-        // 等磁盘恢复由调用方在锁外做（retry_with_space_gate）。
+        // 空间失败由调用方排入 IOCP 恢复队列，绝不在这里等待。
         // open_attempted 的语义是"已建立 handle 或已永久失败"，空间错误不置位。
         // 空间错误无需清理残留：0 字节可用时 CreateFileW(CREATE_NEW) 仍成功，
         // 错误实际发生在随后的 WriteFile，因此整个 FileState 生命周期内只调用一次 CreateFileW。
         AttemptResult try_open_file_locked(const FileStatePtr &file) noexcept
         {
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_openlock(file ? &file->job->probe : nullptr, WriterProbePhase::OpenLock);
+#endif
             std::lock_guard<std::mutex> lock(mutex_);
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_openlock.finish();
+#endif
             if (!file || file->failed)
             {
                 return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
@@ -1261,6 +1473,10 @@ namespace sunpack::sevenzip
             {
                 open_probe_(file->path);
             }
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_open(file->job->probe, WriterProbePhase::Open);
+#endif
             const HANDLE handle = CreateFileW(
                 win32_extended_path(file->path).c_str(),
                 GENERIC_WRITE,
@@ -1269,9 +1485,13 @@ namespace sunpack::sevenzip
                 CREATE_NEW,
                 creation_flags,
                 nullptr);
+            const DWORD open_error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_open.finish();
+#endif
             if (handle == INVALID_HANDLE_VALUE)
             {
-                const DWORD error = GetLastError();
+                const DWORD error = open_error;
                 if (failure_classifier_(static_cast<unsigned long>(error)))
                 {
                     if (!file->space_gate)
@@ -1291,54 +1511,30 @@ namespace sunpack::sevenzip
                 return {AttemptResult::Kind::PermanentFailure,
                         static_cast<unsigned long>(error)};
             }
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            if (file->probe_expected_size && std::strcmp(writer_probe_mode(), "eof") == 0) {
+                WriterProbeSpan preallocate(file->job->probe, WriterProbePhase::Preallocate);
+                FILE_END_OF_FILE_INFO info{};
+                info.EndOfFile.QuadPart = file->probe_expected_size;
+                if (!SetFileInformationByHandle(handle, FileEndOfFileInfo, &info, sizeof(info))) {
+                    const DWORD error = GetLastError();
+                    CloseHandle(handle);
+                    return {AttemptResult::Kind::PermanentFailure, error};
+                }
+            }
+#endif
+            if (!CreateIoCompletionPort(handle, completion_port_, 0, static_cast<DWORD>(writer_count_)))
+            {
+                const DWORD error = GetLastError();
+                CloseHandle(handle);
+                file->open_attempted = true;
+                mark_file_failure_locked(file, HRESULT_FROM_WIN32(error), error);
+                set_job_error_locked(file->job, HRESULT_FROM_WIN32(error), error);
+                return {AttemptResult::Kind::PermanentFailure, error};
+            }
             file->handle = handle;
             file->open_attempted = true;
             return {AttemptResult::Kind::Succeeded, 0};
-        }
-
-        // 打开文件（锁外等待）：一次真实尝试 = 一次 try_open_file_locked。
-        // gate == nullptr 时只尝试一次并原样外泄 SpaceFailure，由这里按 Open 路径收尾：
-        // mark_file_failure + set_job_error + 置 open_attempted = true。
-        AttemptResult open_file_with_space_gate(const FileStatePtr &file,
-                                                const TerminalPredicate &terminal) noexcept
-        {
-            // 终态前置检查属于调用方语义：取消 / draining 时绝不产生任何真实 I/O，
-            // 否则会凭空创建一个空文件；只在 gate 存在时检查。
-            if (file && file->space_gate && terminal && terminal())
-            {
-                return {AttemptResult::Kind::Terminal, 0};
-            }
-
-            const AttemptResult result = retry_with_space_gate(
-                file ? file->space_gate.get() : nullptr,
-                [&terminal] { return terminal; }, // 只做一次真实 open —— 冷路径才需要谓词
-                file ? std::wstring_view(file->path) : std::wstring_view{},
-                [this, &file] { return try_open_file_locked(file); });
-
-            if (result.kind == AttemptResult::Kind::SpaceFailure)
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                if (file && !file->failed)
-                {
-                    file->open_attempted = true;
-                    mark_file_failure_locked(
-                        file,
-                        HRESULT_FROM_WIN32(static_cast<DWORD>(result.win32_error)),
-                        static_cast<int>(result.win32_error));
-                    set_job_error_locked(
-                        file->job,
-                        HRESULT_FROM_WIN32(static_cast<DWORD>(result.win32_error)),
-                        static_cast<int>(result.win32_error));
-                }
-                producer_cv_.notify_all();
-            }
-            return result;
-        }
-
-        bool open_file(const FileStatePtr &file, const TerminalPredicate &terminal) noexcept
-        {
-            return open_file_with_space_gate(file, terminal).kind ==
-                   AttemptResult::Kind::Succeeded;
         }
 
         // gate 的终态谓词：只读 atomic，并在冷路径上才被求值。
@@ -1384,109 +1580,64 @@ namespace sunpack::sevenzip
             }
         }
 
-        // 一次真实的 WriteFile 尝试：只返回结果，绝不碰 gate、绝不记 discarded。
-        // `transferred` 是 in/out（本次 buffer 已落盘的前缀，跨重试保留），add_written_bytes
-        // 只对新写入的字节调用，因此重试不会重复记账。
-        // 不变量：所有失败路径都配对 end_data_write（active_data_writes 归零）；
-        // 空间失败路径不调用 record_failure，否则记账与 job 终态都被破坏。
+        // Submit exactly one request. A successful submit (including TRUE)
+        // is NOT a completed write: IOCP owns its memory until dequeued.
         AttemptResult attempt_data_write(const FileStatePtr &file,
                                          Buffer *buffer,
-                                         UInt64 output_offset,
-                                         UInt32 &transferred) noexcept
+                                         bool &submitted) noexcept
         {
-            // 绝不在这里重置 transferred：清零会把已落盘前缀从原始 offset 再写一遍，
-            // add_written_bytes 二次记账 -> accepted = written + discarded + pending 被破坏。
-            if (!file || !buffer || !buffer->data)
-            {
-                return {AttemptResult::Kind::PermanentFailure, ERROR_INVALID_STATE};
-            }
-
+            std::lock_guard<std::mutex> io_lock(buffer->io_mutex);
+            submitted = false;
             const auto job = file->job;
-            const HRESULT global_error = current_error(job);
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            WriterProbeSpan probe_dispatch(job->probe, WriterProbePhase::Dispatch);
+#endif
+            const auto global_error = current_error(job);
             if (global_error != S_OK)
             {
-                // 已是终态：仍需标记本文件失败，否则 process_close 会把它计入 completed_files；
-                // 剩余字节的 discarded 由 writer_loop 收尾（此处传 0）。
-                record_failure(file, global_error, current_win32_error(job), 0);
+                record_failure(file, global_error, current_win32_error(job));
                 return {AttemptResult::Kind::Terminal, 0};
             }
-
-            // 打开文件只做一次锁内尝试，绝不在这里嵌套 retry_with_space_gate：
-            // 外层可能正持有 probe 许可，内层 wait() 会在 Probing 上永久阻塞。
-            const AttemptResult open_result = try_open_file_locked(file);
-            if (open_result.kind != AttemptResult::Kind::Succeeded)
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            if (writer_probe_memory())
             {
-                return open_result;
+                add_written_bytes(file, buffer->size - buffer->transferred);
+                buffer->transferred = buffer->size;
+                return {};
             }
-
-            if (!begin_data_write(file))
+#endif
+            const auto opened = try_open_file_locked(file);
+            if (opened.kind != AttemptResult::Kind::Succeeded) return opened;
+            if (!begin_data_write(file)) return {AttemptResult::Kind::Terminal, 0};
+            unsigned long injected = 0;
+            if (consume_injected_write_fault(&injected))
             {
-                const HRESULT error = current_error(job);
-                if (error != S_OK)
-                {
-                    record_failure(file, error, current_win32_error(job), 0);
-                }
-                return {AttemptResult::Kind::Terminal, 0};
+                end_data_write(file);
+                return classify_data_failure(file, injected);
             }
-
-            while (transferred < buffer->size)
+            const UInt64 offset = buffer->output_offset + buffer->transferred;
+            buffer->request.overlapped = {};
+            buffer->request.overlapped.Offset = static_cast<DWORD>(offset);
+            buffer->request.overlapped.OffsetHigh = static_cast<DWORD>(offset >> 32U);
+            DWORD size = buffer->size - buffer->transferred;
+            const auto chunk = max_write_chunk_.load(std::memory_order_relaxed);
+            if (chunk && size > chunk) size = chunk;
+#ifdef SUP7Z_ENABLE_PIPELINE_TIMING
+            PipelineStageScope pipeline_scope(job->pipeline_timing, PipelineStage::Output);
+#endif
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+            WriterProbeSpan probe_writefile(job->probe, WriterProbePhase::WriteFile);
+#endif
+            const BOOL started = WriteFile(file->handle, buffer->data.get() + buffer->transferred,
+                                           size, nullptr, &buffer->request.overlapped);
+            const DWORD error = started ? ERROR_SUCCESS : GetLastError();
+            if (!started && error != ERROR_IO_PENDING)
             {
-                unsigned long injected_error = 0;
-                if (consume_injected_write_fault(&injected_error))
-                {
-                    end_data_write(file);
-                    return classify_data_failure(file, static_cast<DWORD>(injected_error));
-                }
-
-                const UInt64 request_offset = output_offset + transferred;
-                OVERLAPPED overlapped{};
-                overlapped.Offset = static_cast<DWORD>(request_offset);
-                overlapped.OffsetHigh = static_cast<DWORD>(request_offset >> 32U);
-                overlapped.hEvent = buffer->completion_event;
-                ResetEvent(buffer->completion_event);
-
-                const DWORD request_size = buffer->size - transferred;
-                DWORD effective_size = request_size;
-                const UInt32 chunk_limit = max_write_chunk_.load(std::memory_order_relaxed);
-                if (chunk_limit != 0 && effective_size > chunk_limit)
-                {
-                    effective_size = chunk_limit; // 测试注入：强制制造 partial write
-                }
-                #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
-                PipelineStageScope pipeline_scope(job->pipeline_timing, PipelineStage::Output);
-                #endif
-                const BOOL started = WriteFile(
-                    file->handle,
-                    buffer->data.get() + transferred,
-                    effective_size,
-                    nullptr,
-                    &overlapped);
-                if (!started && GetLastError() != ERROR_IO_PENDING)
-                {
-                    const DWORD error = GetLastError();
-                    end_data_write(file);
-                    return classify_data_failure(file, error);
-                }
-
-                DWORD written = 0;
-                if (!GetOverlappedResult(file->handle, &overlapped, &written, TRUE))
-                {
-                    const DWORD error = GetLastError();
-                    end_data_write(file);
-                    return classify_data_failure(file, error);
-                }
-                if (written == 0)
-                {
-                    end_data_write(file);
-                    record_failure(
-                        file, HRESULT_FROM_WIN32(ERROR_WRITE_FAULT), ERROR_WRITE_FAULT, 0);
-                    return {AttemptResult::Kind::PermanentFailure, ERROR_WRITE_FAULT};
-                }
-                transferred += written;
-                add_written_bytes(file, written);
+                end_data_write(file);
+                return classify_data_failure(file, error);
             }
-            end_data_write(file);
-            return {AttemptResult::Kind::Succeeded, 0};
+            submitted = true;
+            return {};
         }
 
         // 空间类错误必须走 SpaceFailure 交给骨架重试，绝不能在这里调用 record_failure
@@ -1501,7 +1652,7 @@ namespace sunpack::sevenzip
             return {AttemptResult::Kind::PermanentFailure, static_cast<unsigned long>(error)};
         }
 
-        void process_close(const FileStatePtr &file) noexcept
+        void process_close(const FileStatePtr &file, ProbeLease lease = {}) noexcept
         {
             if (!file)
             {
@@ -1519,71 +1670,47 @@ namespace sunpack::sevenzip
                 std::lock_guard<std::mutex> lock(mutex_);
                 should_open = !file->failed && file->handle == INVALID_HANDLE_VALUE &&
                               !file->open_attempted;
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                if (writer_probe_memory()) should_open = false;
+#endif
             }
-            if (should_open)
-            {
-                // close 阶段的 open 走同一骨架：在 writer 线程上、不持有 probe 许可。
-                open_file(file, writer_terminal_predicate(job));
-            }
-
-            HANDLE handle = INVALID_HANDLE_VALUE;
+            AttemptResult result;
+            if (should_open) result = try_open_file_locked(file);
+            HANDLE handle;
             {
                 std::lock_guard<std::mutex> lock(mutex_);
                 handle = file->handle;
+            }
+            if (result.kind == AttemptResult::Kind::Succeeded && handle != INVALID_HANDLE_VALUE && write_through())
+            {
+                unsigned long injected = 0;
+                const bool fault = consume_injected_flush_fault(&injected);
+                if (fault || !FlushFileBuffers(handle))
+                {
+                    const DWORD error = fault ? injected : GetLastError();
+                    result = {is_space_exhaustion_error(error) ? AttemptResult::Kind::SpaceFailure
+                               : AttemptResult::Kind::PermanentFailure, error};
+                }
+            }
+            const bool held_probe = lease.valid();
+            // A terminal job cannot prove recovery even if its cleanup flush succeeds.
+            if (current_error(job) != S_OK) result = {AttemptResult::Kind::Terminal, 0};
+            settle_space_attempt(lease, result, file->path);
+            if (result.kind == AttemptResult::Kind::SpaceFailure && file->space_gate)
+            {
+                auto item = WorkItem::close(file);
+                item.retry_error = held_probe ? 0 : result.win32_error;
+                defer_space_work(std::move(item));
+                return;
+            }
+            if (result.kind == AttemptResult::Kind::SpaceFailure || result.kind == AttemptResult::Kind::PermanentFailure)
+                record_failure(file, HRESULT_FROM_WIN32(result.win32_error), result.win32_error);
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
                 file->handle = INVALID_HANDLE_VALUE;
             }
             if (handle != INVALID_HANDLE_VALUE)
             {
-                if (write_through())
-                {
-                    // flush 必须走同一个骨架（report_space_failure / ProbeLease / probe 结算），
-                    // 否则 gate 原本 Ready 时 wait() 立刻返回，flush 变成忙重试；
-                    // 仅 write-through 路径需要它（非 write-through 时 CloseHandle 本身就会 flush）。
-                    // handle 在骨架外被摘下，暂停期间不关闭，flush 复用同一个 handle。
-                    // flush 在 drain 期间必须真实执行，因此这里不做终态前置检查。
-                    const AttemptResult flush_result = retry_with_space_gate(
-                        file->space_gate.get(),
-                        [this, &job] { return writer_terminal_predicate(job); },
-                        file->path,
-                        [this, handle]() noexcept -> AttemptResult
-                        {
-                            unsigned long injected = 0;
-                            if (consume_injected_flush_fault(&injected))
-                            {
-                                const DWORD error = static_cast<DWORD>(injected);
-                                if (is_space_exhaustion_error(static_cast<unsigned long>(error)))
-                                {
-                                    return {AttemptResult::Kind::SpaceFailure,
-                                            static_cast<unsigned long>(error)};
-                                }
-                                return {AttemptResult::Kind::PermanentFailure,
-                                        static_cast<unsigned long>(error)};
-                            }
-                            if (FlushFileBuffers(handle))
-                            {
-                                return {AttemptResult::Kind::Succeeded, 0};
-                            }
-                            const DWORD error = GetLastError();
-                            if (is_space_exhaustion_error(static_cast<unsigned long>(error)))
-                            {
-                                return {AttemptResult::Kind::SpaceFailure,
-                                        static_cast<unsigned long>(error)};
-                            }
-                            return {AttemptResult::Kind::PermanentFailure,
-                                    static_cast<unsigned long>(error)};
-                        });
-
-                    if (flush_result.kind != AttemptResult::Kind::Succeeded)
-                    {
-                        // Flush 路径用 record_failure(file, hr, err, 0)：剩余字节由 writer_loop 收尾，
-                        // SpaceFailure 只可能在 gate == nullptr 时外泄。
-                        record_failure(
-                            file,
-                            HRESULT_FROM_WIN32(static_cast<DWORD>(flush_result.win32_error)),
-                            static_cast<int>(flush_result.win32_error),
-                            0);
-                    }
-                }
                 FILETIME last_write{};
                 if (GetFileTime(handle, nullptr, nullptr, &last_write))
                 {
@@ -1598,9 +1725,18 @@ namespace sunpack::sevenzip
                         file->has_mtime_ns = true;
                     }
                 }
-                if (!CloseHandle(handle))
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_close(job->probe, WriterProbePhase::Close);
+#endif
+                const BOOL closed = CloseHandle(handle);
+                const DWORD close_error = closed ? ERROR_SUCCESS : GetLastError();
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_close.finish();
+#endif
+                if (!closed)
                 {
-                    const DWORD error = GetLastError();
+                    const DWORD error = close_error;
                     record_failure(file, HRESULT_FROM_WIN32(error), static_cast<int>(error));
                 }
             }
@@ -1638,10 +1774,17 @@ namespace sunpack::sevenzip
             }
             const auto file = buffer->file;
             const auto job = file ? file->job : nullptr;
-            bool queued_close = false;
             bool direct_close = false;
             {
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                WriterProbeSpan probe_release(job ? &job->probe : nullptr, WriterProbePhase::ReleaseLock);
+#endif
                 std::lock_guard<std::mutex> lock(mutex_);
+
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                probe_release.finish();
+#endif
                 if (file)
                 {
                     file->inflight_bytes -= buffer->size;
@@ -1663,40 +1806,12 @@ namespace sunpack::sevenzip
                 free_buffers_.push_back(buffer);
                 if (file && file->close_requested && file->outstanding_data == 0)
                 {
-                    queued_close = enqueue_close_locked(file, &direct_close);
+                    enqueue_close_locked(file, &direct_close);
                 }
-            }
-            if (queued_close)
-            {
-                work_cv_.notify_one();
             }
             if (direct_close)
             {
                 process_close(file);
-            }
-            producer_cv_.notify_all();
-        }
-
-        // gate == nullptr（功能关闭 / 无卷身份）时的永久失败收尾，只适用于 Data 路径：
-        // account_discarded(remaining) + file 终局失败 + job 终局失败 + 唤醒 producer。
-        void record_legacy_space_failure(const FileStatePtr &file,
-                                         const Buffer *buffer,
-                                         UInt32 transferred,
-                                         unsigned long win32_error) noexcept
-        {
-            if (buffer && buffer->size > transferred)
-            {
-                account_discarded(buffer->size - transferred);
-            }
-            {
-                std::lock_guard<std::mutex> lock(mutex_);
-                mark_file_failure_locked(
-                    file, HRESULT_FROM_WIN32(win32_error), static_cast<int>(win32_error));
-                if (file)
-                {
-                    set_job_error_locked(
-                        file->job, HRESULT_FROM_WIN32(win32_error), static_cast<int>(win32_error));
-                }
             }
             producer_cv_.notify_all();
         }
@@ -1719,6 +1834,7 @@ namespace sunpack::sevenzip
                     set_job_error_locked(file->job, hr, win32_error);
                 }
             }
+            if (file && file->space_gate) file->space_gate->wake_waiters();
             producer_cv_.notify_all();
         }
 
@@ -1741,7 +1857,10 @@ namespace sunpack::sevenzip
         std::vector<std::weak_ptr<FileState>> active_files_;
         mutable std::mutex mutex_;
         std::condition_variable producer_cv_;
-        std::condition_variable work_cv_;
+        HANDLE completion_port_ = nullptr;
+        std::mutex finish_mutex_;
+        std::deque<WorkItem> retry_queue_;
+        std::shared_ptr<CompletionWake> space_wake_;
         const std::shared_ptr<WriterMeters> meters_;
         const VolumeStatePtr state_;
         const AsyncWriterConfig config_;
@@ -1826,7 +1945,12 @@ namespace sunpack::sevenzip
                     return false; // 本次调用被放过
                 }
             }
-            remaining.fetch_sub(1, std::memory_order_relaxed);
+            int pending = remaining.load(std::memory_order_relaxed);
+            do
+            {
+                if (pending <= 0) return false;
+            } while (!remaining.compare_exchange_weak(pending, pending - 1,
+                                                       std::memory_order_relaxed));
             if (win32_error)
             {
                 *win32_error = 0;

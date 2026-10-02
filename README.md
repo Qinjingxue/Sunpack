@@ -189,6 +189,11 @@ Acceptance tests:
 
 Detailed machine identity, archive construction, compression methods, and
 reproduction instructions are in [the benchmark document](docs/benchmark_worker_vs_7z_300m.md).
+The latest four-thread IOCP experiment, including output flush timings, is documented in
+[the Gzip/ZIP concurrency report (Chinese)](docs/zh-CN/benchmark_worker_iocp_300m.md).
+The follow-up [full-format regression](docs/zh-CN/benchmark_worker_iocp_fullformats_300m.md)
+and [1/4/8 IOCP consumer comparison](docs/zh-CN/benchmark_worker_iocp_threads_300m.md)
+include paired timings and explicit output flushes.
 These results use SunPack **v0.7.0** from repository commit `c3eaec11`, with the
 worker built from commit `c3eaec11`. Each case has five measured runs and no
 warmups. Times and sampled process-tree peak RSS are per-case medians; RSS is in

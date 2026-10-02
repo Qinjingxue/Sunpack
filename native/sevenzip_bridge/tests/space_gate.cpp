@@ -1424,6 +1424,35 @@ void g33_late_query_failure_does_not_rewrite_completed_resume() {
           "G-33: later query failure must not rewrite or duplicate resume history");
 }
 
+void g34_iocp_admission_and_weak_wake_lifetime() {
+    struct Wake final : sunpack::sevenzip::SpaceWakeTarget {
+        unsigned calls = 0;
+        void wake() noexcept override { ++calls; }
+    };
+    auto gate = std::make_shared<VolumeSpaceGate>("iocp:test", "", nullptr);
+    auto target = std::make_shared<Wake>();
+    std::weak_ptr<Wake> weak = target;
+    gate->subscribe(target);
+    using Kind = VolumeSpaceGate::WaitResult::Kind;
+    const TerminalPredicate live = [] { return false; };
+    check(gate->try_wait(live).kind == Kind::Ready, "G-34: Ready admission must not wait");
+    gate->report_space_failure(ERROR_DISK_FULL, L"");
+    check(target->calls == 1, "G-34: failure must wake the completion port target");
+    check(gate->try_wait(live).kind == Kind::Pending, "G-34: Blocked admission is nonblocking");
+    check(gate->waiter_count() == 0, "G-34: IOCP admission must not register a waiting thread");
+    check(gate->poll(10 * kMib), "G-34: monitor sample must issue a probe");
+    auto owner = gate->try_wait(live);
+    check(owner.kind == Kind::Probe && owner.lease.valid(), "G-34: exactly one request owns the lease");
+    check(gate->try_wait(live).kind == Kind::Pending, "G-34: second request cannot take the lease");
+    owner.lease.report_success();
+    check(gate->try_wait(live).kind == Kind::Ready, "G-34: real completion resumes queued requests");
+    check(gate->try_wait([] { return true; }).kind == Kind::Terminal,
+          "G-34: cancellation takes precedence over Ready");
+    target.reset();
+    check(weak.expired(), "G-34: the volume must not retain a retired facility's wake target");
+    gate->wake_waiters(); // expired subscriber is pruned without accessing a retired port
+}
+
 }  // namespace
 
 #endif
@@ -1476,6 +1505,7 @@ int main(int argc, char **argv) {
          g32_query_failure_invalidates_inflight_probe},
         {"G-33 late query failure does not rewrite completed resume",
          g33_late_query_failure_does_not_rewrite_completed_resume},
+        {"G-34 IOCP admission and weak wake lifetime", g34_iocp_admission_and_weak_wake_lifetime},
     };
     constexpr int kCaseCount = static_cast<int>(std::size(cases));
 

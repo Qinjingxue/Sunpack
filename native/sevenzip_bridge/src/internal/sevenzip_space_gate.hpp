@@ -188,6 +188,14 @@ namespace sunpack::sevenzip
 
     class VolumeSpaceGate;
 
+    // A weak subscription: a retired facility can disable its port without
+    // extending either the writer or the volume's lifetime.
+    struct SpaceWakeTarget
+    {
+        virtual ~SpaceWakeTarget() = default;
+        virtual void wake() noexcept = 0;
+    };
+
     // probe 许可的 RAII 结算句柄：
     //     report_success()           真实成功           → Probing -> Ready
     //     report_space_failure(...)  仍然空间不足        → Probing -> Blocked
@@ -313,6 +321,7 @@ namespace sunpack::sevenzip
             {
                 Ready,    // 可以正常重试一次（未持有许可，无需结算）
                 Probe,    // 持有 probe 许可，必须结算（lease 有效）
+                Pending,  // IOCP request stays queued; no thread waits
                 Terminal, // job 取消 / writer draining → 放弃并走既有失败路径
             } kind = Kind::Ready;
             ProbeLease lease; // 仅 kind == Probe 时有效
@@ -323,6 +332,16 @@ namespace sunpack::sevenzip
         //
         // terminal：每次调用传入的终态谓词；gate 不保存它。
         WaitResult wait(const TerminalPredicate &terminal) noexcept;
+        WaitResult try_wait(const TerminalPredicate &terminal) noexcept;
+        void subscribe(const std::shared_ptr<SpaceWakeTarget> &target)
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            wake_targets_.erase(std::remove_if(wake_targets_.begin(), wake_targets_.end(),
+                                               [](const auto &value)
+                                               { return value.expired(); }),
+                                wake_targets_.end());
+            wake_targets_.push_back(target);
+        }
 
         // 全项目唯一的卷空间查询入口，只允许 monitor 调用：writer / probe owner 线程从不
         // 查询磁盘空间，GetDiskFreeSpaceExW 因此不会阻塞写路径。
@@ -340,7 +359,7 @@ namespace sunpack::sevenzip
         //     否则                        → 无新证据，保持 Blocked
         bool poll(std::uint64_t free_bytes_now) noexcept;
 
-        // 唯一用途：让阻塞在 cv_ 上的线程重新求值自己的 terminal predicate；不改变状态。
+        // 唤醒目录等待者并通知 IOCP 重新裁决排队请求；不改变状态。
         void wake_waiters() noexcept;
 
         VolumeSpacePhase phase() const noexcept;
@@ -409,6 +428,8 @@ namespace sunpack::sevenzip
         }
 
         void remove_waiter_locked(std::uint64_t token) noexcept;
+        WaitResult decide_locked(const std::shared_ptr<VolumeSpaceGate> &self,
+                                 const TerminalPredicate &terminal) noexcept;
         VolumeSpaceTransition make_transition_locked(VolumeSpaceTransition::Kind kind,
                                                      bool discontinuity) const;
         void emit_transitions(const std::vector<VolumeSpaceTransition> &transitions) noexcept;
@@ -444,10 +465,11 @@ namespace sunpack::sevenzip
 
         mutable std::mutex mutex_;
         std::condition_variable cv_;
+        std::vector<std::weak_ptr<SpaceWakeTarget>> wake_targets_;
 
         VolumeSpacePhase phase_ = VolumeSpacePhase::Ready;
-        std::uint64_t episode_id_ = 0;            // 每次 Ready→Blocked 递增
-        bool watermark_valid_ = false;            // 初期查询失败则不猜
+        std::uint64_t episode_id_ = 0; // 每次 Ready→Blocked 递增
+        bool watermark_valid_ = false; // 初期查询失败则不猜
         // 当前 episode 的 space_blocked 是否已经生成（transition 已发给 sink）：把
         // register_job() 的补发限制在初始事件发出之后，避免同 episode 重复投递 blocked。
         bool blocked_event_emitted_ = false;
@@ -460,8 +482,8 @@ namespace sunpack::sevenzip
         bool last_query_ok_ = true;
         unsigned long last_query_error_ = 0;
 
-        std::string volume_key_;   // 身份键：\\?\Volume{GUID} 小写无尾反斜杠 / job:<id>
-        std::wstring query_root_;  // 身份键的可查询形态（补回尾反斜杠）或就地解析结果
+        std::string volume_key_;  // 身份键：\\?\Volume{GUID} 小写无尾反斜杠 / job:<id>
+        std::wstring query_root_; // 身份键的可查询形态（补回尾反斜杠）或就地解析结果
         bool query_root_resolved_ = false;
 
         std::vector<Waiter> waiters_;            // 线程：只做 probe 许可仲裁
@@ -601,9 +623,34 @@ namespace sunpack::sevenzip
             // "盘是否已恢复"的裁决权属于当前 probe owner 的真实操作。
         }
 
-        cv_.notify_all();
+        wake_waiters();
         emit_transitions(transitions);
         return opened_episode;
+    }
+
+    inline VolumeSpaceGate::WaitResult VolumeSpaceGate::decide_locked(
+        const std::shared_ptr<VolumeSpaceGate> &self, const TerminalPredicate &terminal) noexcept
+    {
+        if (!self || (terminal && terminal()))
+            return {WaitResult::Kind::Terminal, {}};
+        if (phase_ == VolumeSpacePhase::Ready)
+            return {WaitResult::Kind::Ready, {}};
+        if (phase_ == VolumeSpacePhase::Probing && probe_owner_token_ == 0)
+        {
+            const auto token = next_token_++;
+            probe_owner_token_ = token;
+            return {WaitResult::Kind::Probe, ProbeLease(self, token)};
+        }
+        return {WaitResult::Kind::Pending, {}};
+    }
+
+    inline VolumeSpaceGate::WaitResult VolumeSpaceGate::try_wait(
+        const TerminalPredicate &terminal) noexcept
+    {
+        auto self = weak_from_this().lock();
+        std::lock_guard<std::mutex> lock(mutex_);
+        ++next_waiter_token_;
+        return decide_locked(self, terminal);
     }
 
     inline VolumeSpaceGate::WaitResult VolumeSpaceGate::wait(
@@ -622,31 +669,11 @@ namespace sunpack::sevenzip
 
         for (;;)
         {
-            if (terminal && terminal())
+            auto decision = decide_locked(self, terminal);
+            if (decision.kind != WaitResult::Kind::Pending)
             {
-                if (registered)
-                {
-                    remove_waiter_locked(waiter_token);
-                }
-                return WaitResult{WaitResult::Kind::Terminal, ProbeLease{}};
-            }
-            if (phase_ == VolumeSpacePhase::Ready)
-            {
-                if (registered)
-                {
-                    remove_waiter_locked(waiter_token);
-                }
-                return WaitResult{WaitResult::Kind::Ready, ProbeLease{}};
-            }
-            if (phase_ == VolumeSpacePhase::Probing && probe_owner_token_ == 0)
-            {
-                const std::uint64_t token = next_token_++;
-                probe_owner_token_ = token;
-                if (registered)
-                {
-                    remove_waiter_locked(waiter_token);
-                }
-                return WaitResult{WaitResult::Kind::Probe, ProbeLease(self, token)};
+                if (registered) remove_waiter_locked(waiter_token);
+                return decision;
             }
 
             if (!registered)
@@ -676,7 +703,7 @@ namespace sunpack::sevenzip
             }
             if (invalidated_probe)
             {
-                cv_.notify_all();
+                wake_waiters();
             }
             return false;
         }
@@ -702,7 +729,7 @@ namespace sunpack::sevenzip
         }
         if (invalidated_probe)
         {
-            cv_.notify_all();
+            wake_waiters();
         }
         if (queried)
         {
@@ -733,7 +760,7 @@ namespace sunpack::sevenzip
         }
         if (invalidated_probe)
         {
-            cv_.notify_all();
+            wake_waiters();
         }
     }
 
@@ -774,7 +801,7 @@ namespace sunpack::sevenzip
         }
         if (issued)
         {
-            cv_.notify_all(); // 唤醒等待者；只有一个能拿到许可
+            wake_waiters(); // 唤醒等待者；只有一个能拿到许可
         }
         return issued;
     }
@@ -782,6 +809,12 @@ namespace sunpack::sevenzip
     inline void VolumeSpaceGate::wake_waiters() noexcept
     {
         cv_.notify_all();
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (auto it = wake_targets_.begin(); it != wake_targets_.end();)
+        {
+            if (auto target = it->lock()) { target->wake(); ++it; }
+            else it = wake_targets_.erase(it);
+        }
     }
 
     inline void VolumeSpaceGate::settle_success(std::uint64_t token) noexcept
@@ -802,7 +835,7 @@ namespace sunpack::sevenzip
             transitions.push_back(make_transition_locked(
                 VolumeSpaceTransition::Kind::Resumed, /*discontinuity=*/true));
         }
-        cv_.notify_all(); // 全部等待者恢复
+        wake_waiters(); // 全部等待者恢复
         emit_transitions(transitions);
     }
 
@@ -823,7 +856,7 @@ namespace sunpack::sevenzip
             // 不做新鲜查询：水位已由 poll() 在发放许可时推进，下一次许可要求一次严格更高的
             // monitor 采样。
         }
-        cv_.notify_all();
+        wake_waiters();
     }
 
     inline void VolumeSpaceGate::settle_inconclusive(std::uint64_t token) noexcept
@@ -837,7 +870,7 @@ namespace sunpack::sevenzip
             phase_ = VolumeSpacePhase::Blocked;
             probe_owner_token_ = 0;
         }
-        cv_.notify_all(); // 若仍有 affected job，等待者会重新裁决并重选一个 probe
+        wake_waiters(); // 若仍有 affected job，等待者会重新裁决并重选一个 probe
     }
 
     inline VolumeSpacePhase VolumeSpaceGate::phase() const noexcept

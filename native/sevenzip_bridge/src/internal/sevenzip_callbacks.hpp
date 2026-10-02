@@ -300,158 +300,6 @@ namespace sunpack::sevenzip
         bool password_requested_ = false;
     };
 
-    class SynchronousFileOutStream final : public CMyUnknownImp, public ISequentialOutStream
-    {
-        Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
-        
-
-    public:
-        explicit SynchronousFileOutStream(const std::wstring &path, ExtractOutputTrace *trace = nullptr, std::size_t item_trace_index = 0)
-
-            : trace_(trace),
-              item_trace_index_(item_trace_index),
-
-              handle_(CreateFileW(win32_extended_path(path).c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
-                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr))
-        {
-
-            if (trace_ && handle_ == INVALID_HANDLE_VALUE)
-            {
-
-                const DWORD error = GetLastError();
-
-                trace_->last_hresult = HRESULT_FROM_WIN32(error);
-
-                trace_->last_win32_error = static_cast<int>(error);
-
-                mark_item_failure(trace_->last_hresult, trace_->last_win32_error);
-            }
-        }
-
-        ~SynchronousFileOutStream()
-        {
-
-            if (handle_ != INVALID_HANDLE_VALUE)
-            {
-
-                CloseHandle(handle_);
-            }
-        }
-
-        bool is_open() const { return handle_ != INVALID_HANDLE_VALUE; }
-
-        UInt64 bytes_written() const { return bytes_written_; }
-
-
-        HRESULT STDMETHODCALLTYPE Write(const void *data, UInt32 size, UInt32 *processedSize) SUP7Z_NOEXCEPT override
-        {
-
-            if (processedSize)
-            {
-
-                *processedSize = 0;
-            }
-
-            if (handle_ == INVALID_HANDLE_VALUE)
-            {
-
-                if (trace_)
-                {
-
-                    trace_->last_hresult = E_FAIL;
-                }
-
-                return E_FAIL;
-            }
-
-            DWORD written = 0;
-
-            if (!WriteFile(handle_, data, size, &written, nullptr))
-            {
-
-                const DWORD error = GetLastError();
-
-                const HRESULT hr = HRESULT_FROM_WIN32(error);
-
-                if (trace_)
-                {
-
-                    trace_->last_hresult = hr;
-
-                    trace_->last_win32_error = static_cast<int>(error);
-
-                    trace_->last_write_size = 0;
-
-                    mark_item_failure(hr, static_cast<int>(error));
-                }
-
-                return hr;
-            }
-
-            bytes_written_ += written;
-
-            if (trace_)
-            {
-
-                trace_->total_bytes_written += written;
-
-                trace_->current_item_bytes_written += written;
-
-                trace_->last_write_size = written;
-
-                trace_->last_hresult = S_OK;
-
-                trace_->last_win32_error = 0;
-
-                if (item_trace_index_ < trace_->items.size())
-                {
-
-                    trace_->items[item_trace_index_].bytes_written += written;
-
-                    trace_->items[item_trace_index_].hresult = S_OK;
-
-                    trace_->items[item_trace_index_].win32_error = 0;
-                }
-            }
-
-            if (processedSize)
-            {
-
-                *processedSize = written;
-            }
-
-            return S_OK;
-        }
-
-    private:
-        void mark_item_failure(HRESULT hr, int win32_error)
-        {
-
-            if (!trace_ || item_trace_index_ >= trace_->items.size())
-            {
-
-                return;
-            }
-
-            auto &item = trace_->items[item_trace_index_];
-
-            item.failed = true;
-
-            item.hresult = static_cast<int>(hr);
-
-            item.win32_error = win32_error;
-        }
-
-
-        ExtractOutputTrace *trace_ = nullptr;
-
-        std::size_t item_trace_index_ = 0;
-
-        HANDLE handle_ = INVALID_HANDLE_VALUE;
-
-        UInt64 bytes_written_ = 0;
-    };
-
     class AsyncFileOutStream final : public CMyUnknownImp, public ISequentialOutStream
     {
         Z7_COM_UNKNOWN_IMP_1(ISequentialOutStream)
@@ -1254,7 +1102,11 @@ namespace sunpack::sevenzip
                 return E_FAIL;
             }
             current_async_file_ = async_writer_->make_file(async_job_,
-                                                           target.wstring(), name, index, current_trace_index_);
+                                                           target.wstring(), name, index, current_trace_index_
+#ifdef SUP7Z_ENABLE_WRITER_PROBE
+                                                           , has_expected_size ? expected_size : 0
+#endif
+                                                           );
             async_files_.push_back(current_async_file_);
 
             CMyComPtr<ISequentialOutStream> stream_owner(new AsyncFileOutStream(async_writer_, current_async_file_));

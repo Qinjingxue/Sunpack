@@ -38,6 +38,7 @@ _ROWS = [
     ("extraction", "sevenzip-worker-matrix", "benchmarks.scenarios.sevenzip_worker_matrix", "Direct native 7z.dll worker format and size matrix."),
     ("extraction", "worker-vs-7z-300m", "benchmarks.scenarios.worker_vs_7z_300m", "Reproducible 300 MiB native worker versus 7z.exe matrix with timing, peak RSS, archive, and machine metadata."),
     ("extraction", "worker-concurrency-300m", "benchmarks.scenarios.worker_concurrency_300m", "Single persistent worker versus concurrent 7z processes on the 300 MiB full format matrix."),
+    ("extraction", "worker-iocp-300m", "benchmarks.scenarios.worker_iocp_300m", "Paired old writer, IOCP and 7z comparison, with native output flush and byte verification."),
     ("extraction", "worker-read-blocking", "benchmarks.scenarios.worker_read_blocking", "ReadFile wall-time share for a single 1 GiB archive through IInStream::Read."),
     ("extraction", "worker-read-patterns", "benchmarks.scenarios.worker_read_patterns", "Configurable native-worker IInStream seek/read pattern profile, with solid-mode variants and prefetch comparison."),
     ("extraction", "worker-small-file-scheduling", "benchmarks.scenarios.worker_small_file_scheduling", "Native worker parallelism and fairness under many small archive jobs."),
