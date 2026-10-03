@@ -1028,6 +1028,11 @@ Test-NativeImport -PythonPath $venvPython
 Write-Step "Building minimal Windows Watch Broker service"
 Invoke-Native -FilePath "cargo" -Arguments @(
     "build",
+    # The service lives outside the Python DLL directory and must start on a
+    # clean machine. Scope static CRT flags to this build, not the PyO3 wheel.
+    # TOML literal strings keep their quotes through Windows PowerShell's
+    # native argument marshalling, which strips embedded double quotes.
+    "--config", ('target.' + $rustTarget + '.rustflags=[''-C'', ''target-feature=+crt-static'']'),
     "--locked",
     "--manifest-path", $watchBrokerCargoToml,
     "--release",
@@ -1038,6 +1043,16 @@ Assert-PathExists -LiteralPath $watchBrokerBuildPath -Description "SunPack Watch
 Assert-PeMachine -LiteralPath $watchBrokerBuildPath -BuildArch $buildArch -Description "SunPack Watch Broker executable"
 
 Build-SevenZipWorker -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -WrapperRoot $sevenZipWrapperRoot -BuildDir $sevenZipWrapperBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
+$nativeLinkerEntry = @(Get-Content -LiteralPath (Join-Path $sevenZipWrapperBuildDir "CMakeCache.txt") |
+    Where-Object { $_ -like "CMAKE_LINKER:FILEPATH=*" })
+if ($nativeLinkerEntry.Count -ne 1) {
+    throw "Cannot locate the native linker for the Watch Broker CRT dependency check."
+}
+$nativeLinker = $nativeLinkerEntry[0].Substring("CMAKE_LINKER:FILEPATH=".Length)
+Invoke-Native -FilePath $cmakeCommand -Arguments @(
+    "-DLINKER=$nativeLinker", "-DBINARY=$watchBrokerBuildPath",
+    "-P", (Join-Path $sevenZipWrapperRoot "tests\static_runtime.cmake")
+)
 Build-ToastLibrary -CMakeCommand $cmakeCommand -CTestCommand $ctestCommand -SourceRoot $toastHostRoot -BuildDir $toastHostBuildDir -ToolsRoot $toolsRoot -BuildArch $buildArch
 Assert-PathExists -LiteralPath $sevenZipWorkerPath -Description "Bundled 7z worker executable"
 Assert-PathExists -LiteralPath $toastHostPath -Description "Bundled toast DLL"

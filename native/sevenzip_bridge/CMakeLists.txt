@@ -2,6 +2,13 @@ cmake_minimum_required(VERSION 3.20)
 
 project(sunpack_sevenzip LANGUAGES C CXX)
 
+# Standalone processes must run on clean Windows installations. Apply /MT to
+# every target, including bundled 7-Zip and zlib-ng, to keep linked objects on
+# the same CRT and avoid requiring a machine-wide VC++ redistributable.
+if(MSVC)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -507,6 +514,17 @@ if(WIN32)
     apply_source_charset(sunpack_launcher)
     target_compile_definitions(sunpack_launcher PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
     target_link_libraries(sunpack_launcher PRIVATE Shell32)
+
+    if(MSVC)
+        foreach(target_name IN ITEMS sunpack_launcher sunpack_sevenzip_worker)
+            add_custom_command(TARGET ${target_name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND}
+                    "-DLINKER=${CMAKE_LINKER}"
+                    "-DBINARY=$<TARGET_FILE:${target_name}>"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/static_runtime.cmake"
+                VERBATIM)
+        endforeach()
+    endif()
 endif()
 
 # QueryInterface contract for the callback/stream objects handed to 7-Zip.
