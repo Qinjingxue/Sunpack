@@ -207,12 +207,16 @@ def test_competing_heads_with_shared_stem_use_suffix_discriminators(tmp_path, fo
         cases.append(case)
 
     all_paths = [str(path) for paths in sets for path in paths]
-    for paths, archive_format, case in zip(sets, formats, cases):
+    logical_names = set()
+    for paths, archive_format, case, label in zip(sets, formats, cases, ("alpha", "beta")):
         group = RelationsScheduler().resolve_volume_once(
             [str(paths[0])], all_paths, format_hint=archive_format,
         )
         assert group is not None
         assert set(group.input_paths) == {str(path) for path in paths}
+        assert label in group.logical_name
+        assert "\0" not in group.logical_name
+        logical_names.add(group.logical_name)
         tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
         assert len(tasks) == 1
         planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
@@ -225,6 +229,52 @@ def test_competing_heads_with_shared_stem_use_suffix_discriminators(tmp_path, fo
             extractor.close()
         assert result.success is True, result.error
         assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+    assert len(logical_names) == 2
+
+
+@pytest.mark.parametrize("competing", [False, True])
+@pytest.mark.parametrize("sfx", [False, True])
+@pytest.mark.parametrize("marker", [1, 99])
+def test_rar_structure_overrides_false_part_marker(tmp_path, competing, sfx, marker):
+    factory = ArchiveFixtureFactory()
+    case = factory.create(tmp_path, "alpha", "rar", split=True, sfx=sfx,
+        payload_size=MIB, split_volume_size=MIB // 4)
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    paths = []
+    for index, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
+        number = _source_volume_number(source.name, index)
+        target = mixed / f"shared.alpha.part{marker}.chunk{number}.opaque"
+        source.rename(target)
+        paths.append((number, target))
+    paths.sort()
+    all_paths = [str(path) for _, path in paths]
+    if competing:
+        other = factory.create(tmp_path, "beta", "7z", split=True,
+            payload_size=MIB, split_volume_size=MIB // 4)
+        for index, source in enumerate(sorted(other.archive_dir.iterdir()), start=1):
+            number = _source_volume_number(source.name, index)
+            target = mixed / f"shared.beta.chunk{number}.opaque"
+            source.rename(target)
+            all_paths.append(str(target))
+    group = RelationsScheduler().resolve_volume_once(
+        [str(paths[0][1])], all_paths, format_hint="rar")
+    assert group is not None
+    assert set(group.input_paths) == {str(path) for _, path in paths}
+    assert [part.number for part in group.split_volumes] == [number for number, _ in paths]
+    assert all(part.source == "structure" for part in group.split_volumes)
+    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    assert len(tasks) == 1
+    planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
+    assert len(planned) == 1
+    output = tmp_path / "output"
+    extractor = ExtractionScheduler(max_retries=0)
+    try:
+        result = extractor.extract(planned[0], str(output))
+    finally:
+        extractor.close()
+    assert result.success is True, result.error
+    assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
 
 @pytest.mark.parametrize("sfx_format", ["7z", "rar"])
@@ -623,7 +673,8 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
     assert descriptor.volume_style == "zip_spanned"
     assert [part.volume_number for part in descriptor.parts] == [1, 2, 3, 4]
     assert [part.role for part in descriptor.parts] == ["first", "member", "member", "terminal"]
-    logical = "shared" if opaque_competition else "shared.alpha"
+    logical = "shared.chunk.zipdata.bin" if opaque_competition else "shared.alpha"
+    assert task.logical_name == logical
     assert [part.canonical_name for part in descriptor.parts] == [
         f"{logical}.z01", f"{logical}.z02", f"{logical}.z03", f"{logical}.zip",
     ]
