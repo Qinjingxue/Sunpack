@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="sunpack.png" width="72" alt="SunPack">
+  <img src="sunpack.png" width="120" alt="SunPack">
 </p>
 <h1 align="center">SunPack</h1>
 <p align="center"><b>面向 Windows 的自动化压缩包处理工具，在后台安静运行</b><br>
