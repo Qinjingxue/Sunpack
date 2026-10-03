@@ -2,10 +2,7 @@
   <img src="sunpack.png" width="120" alt="SunPack">
 </p>
 <h1 align="center">SunPack</h1>
-<p align="center"><b>面向 Windows 的自动化压缩包处理工具，在后台安静运行</b><br>
-无需依赖宿主软件，后台监控文件夹，自动发现、处理并校验压缩包，完成后移入回收站<br>
-基于二进制特征识别，擅长处理复杂伪装压缩包；采用 WAL 崩溃恢复机制，应对断电或进程崩溃<br>
-丰富可自定义的自动化处理配置</p>
+<p align="center"><b>面向 Windows 的全自动化压缩包处理工具，后台自动处理压缩包，无需手动解压</b><br></p>
 
 <p align="center"><b>简体中文</b> · <a href="README.en.md">English</a> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">下载</a></p>
 

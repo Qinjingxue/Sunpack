@@ -2,10 +2,7 @@
   <img src="sunpack.png" width="120" alt="SunPack">
 </p>
 <h1 align="center">SunPack</h1>
-<p align="center"><b>Automated archive processing for Windows, running quietly in the background</b><br>
-Monitor folders without relying on a host application; automatically find, process, and verify archives, then move them to the Recycle Bin<br>
-Binary-signature detection handles complex disguised archives. WAL crash recovery helps SunPack recover from power loss or process crashes<br>
-Rich, highly customizable automation options</p>
+<p align="center"><b>A fully automated archive processing tool for Windows that handles compressed files in the background—no manual extraction required.</b><br></p>
 
 <p align="center"><a href="README.md">简体中文</a> · <b>English</b> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">Downloads</a></p>
 
