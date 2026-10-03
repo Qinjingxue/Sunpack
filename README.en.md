@@ -111,7 +111,7 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 - Automatically pauses extraction tasks when disk space runs out, and resumes them once enough disk space is available again — no manual retry needed.
 - Has a file verification system that allows partially damaged files to yield whatever usable files they can, instead of failing outright. When everything fails, it automatically cleans up the damaged files, leaving no leftovers that need manual cleanup.
 - Adopts a database-like WAL design: an unexpected power loss or process crash during extraction leaves no half-finished or corrupted state; the program handles it correctly and completes the task after recovery.
-- Has a test suite containing a rich set of complex cases that guarantee the correctness of the program's behavior.
+- The test suite covers a wide range of complex archive formats, concurrency scenarios, and crash recovery cases to continuously verify processing correctness.
 
 ### High concurrency and speed optimization
 
