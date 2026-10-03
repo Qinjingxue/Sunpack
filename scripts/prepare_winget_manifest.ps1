@@ -13,6 +13,9 @@ param(
 
     [string]$ReleaseTag,
 
+    [ValidatePattern('^\d{4}-\d{2}-\d{2}$')]
+    [string]$ReleaseDate,
+
     [string]$Repository = "Qinjingxue/Sunpack",
 
     [string]$OutputRoot,
@@ -28,10 +31,10 @@ $packageIdentifier = "Qinjingxue.SunPack"
 $manifestVersion = "1.12.0"
 # Inno Setup AppId from installer/SunPack.iss. Inno escapes a literal leading
 # brace by doubling it, so the registry uninstall key is "<AppId>_is1" and the
-# Add/Remove Programs product code keeps the single-brace form. Both
+# Add/Remove Programs product code is this full uninstall key name. Both
 # architectures share this AppId. The value must stay quoted in YAML because a
 # leading brace otherwise parses as a flow mapping rather than a string.
-$productCode = "'{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}'"
+$productCode = "'{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1'"
 
 function Normalize-PackageVersion {
     param([Parameter(Mandatory = $true)][string]$Value)
@@ -95,16 +98,12 @@ $arm64InstallerUrl = "$releaseBaseUrl/sunpack-windows-arm64-$tag-setup.exe"
 $x64Hash = $X64Sha256.ToUpperInvariant()
 $arm64Hash = $Arm64Sha256.ToUpperInvariant()
 
-# ReleaseDate is the tag's own commit date, so the manifest describes when the
-# release was cut rather than when the manifest happened to be prepared. The
-# field is optional, so a version without a local tag still produces a valid
-# manifest; it just omits the date.
+# Supply the published release date, not the tag commit date. The field is
+# optional and belongs to the installer manifest.
 $releaseDateLine = ""
-$tagCommitDate = (& git -C $repoRoot log -1 --format=%cs "$tag^{commit}" 2>&1 | Out-String).Trim()
-if ($LASTEXITCODE -eq 0 -and $tagCommitDate -match '^[0-9]{4}-[0-9]{2}-[0-9]{2}$') {
-    $releaseDateLine = "ReleaseDate: $tagCommitDate"
-} else {
-    Write-Warning "Tag '$tag' was not found locally, so the manifest omits ReleaseDate."
+if ($ReleaseDate) {
+    $parsedReleaseDate = [datetime]::ParseExact($ReleaseDate, 'yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+    $releaseDateLine = "ReleaseDate: $($parsedReleaseDate.ToString('yyyy-MM-dd'))"
 }
 
 $versionManifest = @"
@@ -120,10 +119,12 @@ $installerManifest = @"
 # yaml-language-server: `$schema=https://aka.ms/winget-manifest.installer.$manifestVersion.schema.json
 PackageIdentifier: $packageIdentifier
 PackageVersion: $packageVersion
+MinimumOSVersion: 10.0.14393.0
 InstallerType: inno
 Scope: machine
 ElevationRequirement: elevationRequired
 UpgradeBehavior: install
+$releaseDateLine
 InstallerSwitches:
   Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-
   SilentWithProgress: /SILENT /SUPPRESSMSGBOXES /NORESTART /SP-
@@ -134,7 +135,6 @@ Installers:
     ProductCode: $productCode
     AppsAndFeaturesEntries:
       - DisplayName: SunPack $tag (x64)
-        DisplayVersion: $tag
         Publisher: SunPack
         ProductCode: $productCode
   - Architecture: arm64
@@ -143,7 +143,6 @@ Installers:
     ProductCode: $productCode
     AppsAndFeaturesEntries:
       - DisplayName: SunPack $tag (arm64)
-        DisplayVersion: $tag
         Publisher: SunPack
         ProductCode: $productCode
 ManifestType: installer
@@ -164,7 +163,6 @@ License: MIT
 LicenseUrl: https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE
 ShortDescription: Windows archive detection, extraction, and verification tool
 Description: SunPack identifies and processes archives by binary features, including disguised extensions, nested archives, encrypted archives, split volumes, and embedded archives.
-$releaseDateLine
 Tags:
   - archive
   - compression

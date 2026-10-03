@@ -5,14 +5,15 @@ import subprocess
 ROOT = Path(__file__).resolve().parents[2]
 PREPARE_SCRIPT = ROOT / "scripts" / "prepare_winget_manifest.ps1"
 # Inno Setup AppId from installer/SunPack.iss, in the form Inno writes it to the
-# uninstall registry key ("<ProductCode>_is1").
-PRODUCT_CODE = "'{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}'"
+# uninstall registry key ("<AppId>_is1").
+PRODUCT_CODE = "'{9E8C73E5-C540-4E68-93E0-1FBAAFB89713}_is1'"
 
 
 def _run_prepare(
     output_root: Path,
     version: str = "9.8.7",
     release_tag: str | None = None,
+    release_date: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [
         "pwsh",
@@ -32,6 +33,8 @@ def _run_prepare(
     ]
     if release_tag is not None:
         command += ["-ReleaseTag", release_tag]
+    if release_date is not None:
+        command += ["-ReleaseDate", release_date]
     return subprocess.run(
         command,
         cwd=ROOT,
@@ -66,6 +69,7 @@ def test_prepare_winget_manifest_emits_a_complete_multifile_set(tmp_path):
     assert "PackageVersion: 9.8.7" in version
     assert "ManifestType: version" in version
     assert "InstallerType: inno" in installer
+    assert "MinimumOSVersion: 10.0.14393.0" in installer
     assert "Scope: machine" in installer
     assert "ElevationRequirement: elevationRequired" in installer
     assert "Silent: /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP-" in installer
@@ -74,7 +78,7 @@ def test_prepare_winget_manifest_emits_a_complete_multifile_set(tmp_path):
     assert "Architecture: arm64" in installer
     assert "DisplayName: SunPack 9.8.7 (x64)" in installer
     assert "DisplayName: SunPack 9.8.7 (arm64)" in installer
-    assert "DisplayVersion: 9.8.7" in installer
+    assert "DisplayVersion:" not in installer
     assert "InstallerSha256: " + "A" * 64 in installer
     assert "InstallerSha256: " + "B" * 64 in installer
     assert "PackageLocale: en-US" in locale
@@ -104,7 +108,7 @@ def test_prepare_winget_manifest_keeps_package_version_equal_to_the_release_tag(
     ) in installer
     assert "DisplayName: SunPack v0.5.1 (x64)" in installer
     assert "DisplayName: SunPack v0.5.1 (arm64)" in installer
-    assert "DisplayVersion: v0.5.1" in installer
+    assert "DisplayVersion:" not in installer
 
 
 def test_prepare_winget_manifest_declares_the_inno_product_code(tmp_path):
@@ -130,16 +134,33 @@ def test_prepare_winget_manifest_rejects_a_release_tag_that_differs_from_version
     assert "ReleaseTag must match Version" in (result.stdout or "") + (result.stderr or "")
 
 
-def test_prepare_winget_manifest_records_the_tag_commit_date_when_available(tmp_path):
-    result = _run_prepare(tmp_path, version="v0.5.1")
+def test_prepare_winget_manifest_records_published_date_in_installer(tmp_path):
+    result = _run_prepare(tmp_path, release_date="2026-10-03")
 
     assert result.returncode == 0, result.stdout + result.stderr
     locale = (
-        tmp_path / "q" / "Qinjingxue" / "SunPack" / "v0.5.1"
+        tmp_path / "q" / "Qinjingxue" / "SunPack" / "9.8.7"
         / "Qinjingxue.SunPack.locale.en-US.yaml"
     ).read_text(encoding="utf-8")
 
-    assert "ReleaseDate: 20" in locale
+    installer = (
+        tmp_path / "q" / "Qinjingxue" / "SunPack" / "9.8.7"
+        / "Qinjingxue.SunPack.installer.yaml"
+    ).read_text(encoding="utf-8")
+    assert "ReleaseDate: 2026-10-03" in installer
+    assert "ReleaseDate:" not in locale
+
+
+def test_prepare_winget_manifest_omits_unspecified_date(tmp_path):
+    result = _run_prepare(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+    for path in (tmp_path / "q" / "Qinjingxue" / "SunPack" / "9.8.7").glob("*.yaml"):
+        assert "ReleaseDate:" not in path.read_text(encoding="utf-8")
+
+
+def test_prepare_winget_manifest_rejects_invalid_calendar_date(tmp_path):
+    result = _run_prepare(tmp_path, release_date="2026-02-30")
+    assert result.returncode != 0
 
 
 def test_prepare_winget_manifest_does_not_overwrite_without_force(tmp_path):
