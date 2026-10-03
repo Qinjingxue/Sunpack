@@ -584,7 +584,8 @@ impl NativeOutputInventory {
         py: Python<'_>,
         options: PyRef<'_, NativeDirectoryScanOptions>,
     ) -> PyResult<(Py<NativeDirectorySnapshot>, Py<NativeDirectorySnapshot>)> {
-        let mut records = build_inventory_snapshot_views(&self.root, self.files.as_ref(), &options.options);
+        let mut records =
+            build_inventory_snapshot_views(&self.root, self.files.as_ref(), &options.options);
         populate_relation_anchors(&mut records.raw);
         let (filtered, raw) = NativeDirectorySnapshot::from_views(records.filtered, records.raw);
         Ok((Py::new(py, filtered)?, Py::new(py, raw)?))
@@ -1065,10 +1066,17 @@ impl NativeDirectoryScanOptions {
         mtime_ranges: Vec<NumericRangeTuple>,
         whitelist_rules: Vec<WhitelistRuleTuple>,
     ) -> PyResult<Self> {
-        Ok(Self { options: DirectoryScanOptions::new(
-            patterns, prune_dir_globs, blocked_extensions, blocked_file_names,
-            size_ranges, mtime_ranges, whitelist_rules,
-        )? })
+        Ok(Self {
+            options: DirectoryScanOptions::new(
+                patterns,
+                prune_dir_globs,
+                blocked_extensions,
+                blocked_file_names,
+                size_ranges,
+                mtime_ranges,
+                whitelist_rules,
+            )?,
+        })
     }
 
     fn scan(

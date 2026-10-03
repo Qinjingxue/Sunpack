@@ -76,6 +76,179 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
         assert marker.read_text(encoding="utf-8") == cases[archive_format].marker_text
 
 
+@pytest.mark.parametrize("archive_format", ("7z", "zip", "rar"))
+@pytest.mark.parametrize("name_style", ("format_number", "number_only", "extensionless_head"))
+def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
+    tmp_path, archive_format, name_style
+):
+    """Probe the requested filename tolerance against real split archives."""
+    factory = ArchiveFixtureFactory()
+    scheduler = RelationsScheduler()
+
+    try:
+        case = factory.create(
+            tmp_path,
+            f"first_dot_{archive_format}",
+            archive_format,
+            split=True,
+            payload_size=1024 * 1024,
+            split_volume_size=256 * 1024,
+        )
+    except (FileNotFoundError, RuntimeError) as exc:
+        pytest.skip(str(exc))
+
+    renamed = []
+    originals = sorted(path for path in case.archive_dir.iterdir() if path.is_file())
+    for index, source in enumerate(originals, start=1):
+        number = _source_volume_number(source.name, index)
+        if name_style == "extensionless_head" and number == 1:
+            target_name = "shared"
+        elif name_style != "format_number":
+            target_name = f"shared.noise{index}.chunk{number}.opaque"
+        elif archive_format == "rar":
+            # RAR's requested filename signal is only part + number.
+            target_name = f"shared.noise{index}.part{number}.opaque"
+        elif archive_format == "7z":
+            # The format and a non-zero-padded number appear in the suffix.
+            target_name = f"shared.noise{index}.7z.chunk{number}.opaque"
+        else:
+            # ZIP reverses the format/number order and changes the noise.
+            target_name = f"shared.noise{index}.chunk{number}.zip.opaque"
+        target = case.archive_dir / target_name
+        source.rename(target)
+        renamed.append((number, target))
+
+    renamed.sort(key=lambda item: item[0])
+    first_path = str(renamed[0][1])
+    all_paths = [str(path) for _number, path in renamed]
+    group = scheduler.resolve_volume_once(
+        [first_path],
+        all_paths,
+        format_hint=archive_format,
+    )
+
+    assert group is not None, (archive_format, [path.name for _number, path in renamed])
+    assert set(group.input_paths) == set(all_paths)
+    assert group.logical_name == "shared"
+    assert [volume.number for volume in group.split_volumes] == [
+        number for number, _path in renamed
+    ]
+    resolved = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    assert len(resolved) == 1
+    planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
+    assert len(planned) == 1
+    output = tmp_path / "output"
+    extractor = ExtractionScheduler(max_retries=0)
+    try:
+        result = extractor.extract(planned[0], str(output))
+    finally:
+        extractor.close()
+    assert result.success is True, result.error
+    assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
+def test_same_stem_opaque_members_with_competing_formats_are_not_guessed(tmp_path):
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    paths_by_format = {}
+    for archive_format in ("7z", "zip"):
+        case = ArchiveFixtureFactory().create(
+            tmp_path, f"ambiguous_{archive_format}", archive_format,
+            split=True, payload_size=MIB, split_volume_size=MIB // 4,
+        )
+        paths = []
+        for index, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
+            number = _source_volume_number(source.name, index)
+            target = mixed / f"shared.source-{archive_format}.chunk{number}.opaque"
+            source.rename(target)
+            paths.append(target)
+        paths_by_format[archive_format] = paths
+
+    all_paths = [str(path) for paths in paths_by_format.values() for path in paths]
+    for archive_format, paths in paths_by_format.items():
+        assert RelationsScheduler().resolve_volume_once(
+            [str(paths[0])], all_paths, format_hint=archive_format,
+        ) is None
+
+
+def test_same_format_heads_with_shared_stem_keep_their_specific_prefixes(tmp_path):
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    sets = []
+    for label in ("alpha", "beta"):
+        case = ArchiveFixtureFactory().create(
+            tmp_path, label, "7z", split=True,
+            payload_size=MIB, split_volume_size=MIB // 4,
+        )
+        paths = []
+        for index, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
+            number = _source_volume_number(source.name, index)
+            target = mixed / f"shared.{label}.7z.{number:03d}.opaque"
+            source.rename(target)
+            paths.append(target)
+        sets.append(paths)
+
+    all_paths = [str(path) for paths in sets for path in paths]
+    for paths in sets:
+        group = RelationsScheduler().resolve_volume_once([str(paths[0])], all_paths, format_hint="7z")
+        assert group is not None
+        assert set(group.input_paths) == {str(path) for path in paths}
+
+
+def test_password_blocked_seed_cannot_share_opaque_members_with_another_format(tmp_path):
+    factory = ArchiveFixtureFactory()
+    seven_zip = factory.create(tmp_path, "plain", "7z", split=True,
+        payload_size=MIB, split_volume_size=MIB // 4)
+    encrypted_rar = factory.create(tmp_path, "encrypted", "rar", split=True,
+        password="candidate-password", payload_size=MIB, split_volume_size=MIB // 4)
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    paths = []
+    for index, source in enumerate(sorted(seven_zip.archive_dir.iterdir()), start=1):
+        number = _source_volume_number(source.name, index)
+        name = "shared.7z.part1.opaque" if number == 1 else f"shared.part{number}.opaque"
+        target = mixed / name
+        source.rename(target)
+        paths.append(target)
+    rar_head = mixed / "shared.rar.part1.opaque"
+    sorted(encrypted_rar.archive_dir.iterdir())[0].rename(rar_head)
+    all_paths = [str(path) for path in paths] + [str(rar_head)]
+    for head, archive_format in ((paths[0], "7z"), (rar_head, "rar")):
+        assert RelationsScheduler().resolve_volume_once(
+            [str(head)], all_paths, format_hint=archive_format,
+        ) is None
+
+
+def test_loose_rar_names_reconcile_after_missing_middle_volume_arrives(tmp_path):
+    case = ArchiveFixtureFactory().create(
+        tmp_path, "gap", "rar", split=True,
+        payload_size=MIB, split_volume_size=MIB // 4,
+    )
+    paths = []
+    for index, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
+        number = _source_volume_number(source.name, index)
+        target = case.archive_dir / f"shared.noise{number}.chunk{number}.opaque"
+        source.rename(target)
+        paths.append(target)
+    middle = paths[1]
+    withheld = tmp_path / "withheld"
+    middle.rename(withheld)
+    scheduler = RelationsScheduler()
+    incomplete = scheduler.resolve_volume_once(
+        [str(paths[0])], [str(path) for path in paths if path.exists()], format_hint="rar",
+    )
+    assert incomplete is not None
+    assert incomplete.head_metadata["volume_set_incomplete"] is True
+
+    withheld.rename(middle)
+    complete = scheduler.resolve_volume_once(
+        [str(paths[0])], [str(path) for path in paths], format_hint="rar",
+    )
+    assert complete is not None
+    assert not complete.head_metadata.get("volume_set_incomplete", False)
+    assert set(complete.input_paths) == {str(path) for path in paths}
+
+
 def test_mixed_directory_schedules_only_one_structural_head_per_format(mixed_real_volumes):
     _tmp_path, common, _cases, paths_by_format = mixed_real_volumes
     config = normalize_config(

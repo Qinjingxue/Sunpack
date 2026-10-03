@@ -12,9 +12,7 @@ const SHARE_ALL: u32 = 7;
 
 fn open_attributes(path: &Path) -> io::Result<TrackedFile> {
     TrackedFile::open_with(path, "file_generation", |options| {
-        options
-            .access_mode(READ_ATTRIBUTES)
-            .share_mode(SHARE_ALL);
+        options.access_mode(READ_ATTRIBUTES).share_mode(SHARE_ALL);
     })
 }
 
