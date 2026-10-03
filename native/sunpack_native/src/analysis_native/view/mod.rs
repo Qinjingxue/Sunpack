@@ -1,6 +1,5 @@
 use crate::io::read_fault::{FieldLocation, ReadFault};
 use crate::io::reader::{ManagedReader, ReaderConfig};
-use crate::password::rar::{probe_header_encrypted_terminal, RarTerminalProof};
 use bzip2::read::BzDecoder;
 use flate2::read::GzDecoder;
 use pyo3::prelude::*;
@@ -32,68 +31,6 @@ pub(crate) fn probe_rar_bytes(
         closed: false,
     };
     view.probe_rar(py, start_offset, max_blocks_to_walk)
-}
-
-/// Internal relation validators reuse the canonical view parsers without
-/// opening a second Python-side binary-analysis path. These helpers keep
-/// path-based construction and all binary I/O inside Rust.
-pub(crate) fn probe_rar_path(
-    py: Python<'_>,
-    path: &str,
-    start_offset: u64,
-    max_blocks_to_walk: usize,
-) -> PyResult<Py<PyDict>> {
-    let reader = ManagedReader::open(path).map_err(reader_error_to_py)?;
-    AnalysisBinaryView {
-        path: path.to_string(),
-        reader,
-        closed: false,
-    }
-    .probe_rar(py, start_offset, max_blocks_to_walk)
-}
-
-pub(crate) fn probe_rar_volume_paths(
-    py: Python<'_>,
-    paths: &[String],
-    start_offset: u64,
-    max_blocks_to_walk: usize,
-) -> PyResult<Py<PyDict>> {
-    let reader = ManagedReader::open_volumes(
-        paths,
-        ReaderConfig {
-            cache_bytes: 64 * 1024 * 1024,
-            max_read_bytes: None,
-            max_concurrent_reads: 1,
-        },
-    )
-    .map_err(reader_error_to_py)?;
-    AnalysisBinaryView {
-        path: paths.first().cloned().unwrap_or_default(),
-        reader,
-        closed: false,
-    }
-    .probe_rar(py, start_offset, max_blocks_to_walk)
-}
-
-pub(crate) fn probe_rar_terminal_with_password(
-    paths: &[String],
-    start_offset: u64,
-    password: &str,
-    max_blocks: usize,
-) -> io::Result<Option<RarTerminalProof>> {
-    let reader = if paths.len() == 1 {
-        ManagedReader::open(&paths[0])?
-    } else {
-        ManagedReader::open_volumes(
-            paths,
-            ReaderConfig {
-                cache_bytes: 64 * 1024 * 1024,
-                max_read_bytes: None,
-                max_concurrent_reads: 1,
-            },
-        )?
-    };
-    probe_header_encrypted_terminal(&reader, start_offset, password, max_blocks)
 }
 
 fn reader_error_to_py(error: std::io::Error) -> PyErr {

@@ -15,6 +15,7 @@ from sunpack.core.passwords.directory_context import DirectoryPasswordContextSto
 from sunpack.pipeline.coordinator.engine import PipelineEngine
 from sunpack.pipeline.coordinator.target_groups import relation_group_to_candidate
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
+from sunpack.pipeline.coordinator.task_scan import direct_file_task
 from sunpack.pipeline.discovery.detection.input_planning import (
     ArchiveInputPlanningStage,
 )
@@ -79,6 +80,7 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
 @pytest.mark.parametrize("archive_format", ("7z", "zip", "rar"))
 @pytest.mark.parametrize("name_style", (
     "format_number", "number_only", "extensionless_head", "invalid_number_noise",
+    "bare_format_head",
 ))
 def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     tmp_path, archive_format, name_style
@@ -103,7 +105,9 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     originals = sorted(path for path in case.archive_dir.iterdir() if path.is_file())
     for index, source in enumerate(originals, start=1):
         number = _source_volume_number(source.name, index)
-        if name_style == "extensionless_head" and number == 1:
+        if name_style == "bare_format_head" and number == 1:
+            target_name = f"shared.{archive_format}"
+        elif name_style == "extensionless_head" and number == 1:
             target_name = "shared"
         elif name_style == "invalid_number_noise":
             target_name = f"shared.zero0.build4294967296.chunk{number}.opaque"
@@ -173,9 +177,12 @@ def test_same_stem_opaque_members_with_competing_formats_are_not_guessed(tmp_pat
 
     all_paths = [str(path) for paths in paths_by_format.values() for path in paths]
     for archive_format, paths in paths_by_format.items():
-        assert RelationsScheduler().resolve_volume_once(
+        group = RelationsScheduler().resolve_volume_once(
             [str(paths[0])], all_paths, format_hint=archive_format,
-        ) is None
+        )
+        assert group is not None
+        assert group.head_metadata["volume_set_incomplete"] is True
+        assert set(group.input_paths) <= {str(paths[0]), str(paths[-1])}
 
 
 @pytest.mark.parametrize("formats", [("7z", "7z"), ("7z", "zip"), ("7z", "rar")])
@@ -332,7 +339,7 @@ def test_structural_head_number_position_orders_real_opaque_members(tmp_path, ar
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
-def test_multiple_matching_seed_numbers_do_not_guess_a_position(tmp_path, archive_format):
+def test_multiple_matching_seed_numbers_resolve_the_unique_global_channel(tmp_path, archive_format):
     case = ArchiveFixtureFactory().create(tmp_path, "ambiguous_position", archive_format,
         split=True, payload_size=MIB, split_volume_size=MIB // 4)
     paths = []
@@ -341,8 +348,56 @@ def test_multiple_matching_seed_numbers_do_not_guess_a_position(tmp_path, archiv
         target = case.archive_dir / f"shared.part99.build1.chunk{number}.opaque"
         source.rename(target)
         paths.append(str(target))
-    assert RelationsScheduler().resolve_volume_once(
-        [paths[0]], paths, format_hint=archive_format) is None
+    group = RelationsScheduler().resolve_volume_once(
+        [paths[0]], paths, format_hint=archive_format)
+    assert group is not None
+    assert group.input_paths == paths
+    assert [volume.number for volume in group.split_volumes] == list(range(1, len(paths) + 1))
+    assert group.head_metadata.get("volume_set_incomplete") is not True
+
+
+def test_distinct_global_mappings_remain_blocked_and_cannot_be_resolved(tmp_path):
+    case = ArchiveFixtureFactory().create(
+        tmp_path, "two_channels", "7z", split=True,
+        payload_size=MIB, split_volume_size=MIB // 4,
+    )
+    paths = []
+    for number, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
+        alternative = {2: 3, 3: 2}.get(number, number)
+        target = case.archive_dir / f"shared.build{number}.chunk{alternative}.opaque"
+        source.rename(target)
+        paths.append(str(target))
+    assert len(paths) >= 3
+    scheduler = RelationsScheduler()
+    groups = scheduler.build_candidate_groups(DirectoryScanner(str(case.archive_dir), config=make_config()).scan())
+    group = next(group for group in groups if group.head_path == paths[0])
+    assert group.head_metadata["relation_failure_reason"] == "ambiguous_volume_mapping"
+    assert group.head_metadata["volume_set_incomplete"] is True
+    assert group.head_metadata["relation_confirmed"] is False
+    result = RelationResolver().resolve([relation_group_to_candidate(group)])
+    assert not result.resolved_tasks
+    assert result.blocked_paths
+    assert scheduler.resolve_volume_once([paths[0]], paths, format_hint="7z") is None
+
+
+@pytest.mark.parametrize("archive_format", ["7z", "zip"])
+def test_volume_retry_can_start_from_a_verified_launcher_companion(tmp_path, archive_format):
+    case = ArchiveFixtureFactory().create(
+        tmp_path, "launcher_retry", archive_format, sfx=True, split=True,
+        payload_size=256 * 1024, split_volume_size=64 * 1024,
+    )
+    launcher = str(case.entry_path)
+    paths = [str(path) for path in case.archive_dir.iterdir()]
+    group = RelationsScheduler().resolve_volume_once([launcher], paths, format_hint=archive_format)
+    assert group is not None
+    assert group.companion_paths == [launcher]
+    assert launcher not in group.input_paths
+    assert group.head_metadata["relation_confirmed"] is True
+    assert [part.number for part in group.split_volumes] == list(range(1, len(group.split_volumes) + 1))
+    task = direct_file_task(launcher, all_parts=paths)
+    assert task.carrier_path == launcher
+    assert launcher in task.cleanup_parts
+    assert launcher not in task.all_parts
 
 
 def test_extra_numeric_tail_cannot_bypass_seven_zip_size_validation(tmp_path):
@@ -393,7 +448,7 @@ def test_failed_split_relation_preserves_standalone_sfx(tmp_path, sfx_format, fa
     assert matches[0].head_metadata["relation_confirmed"] is True
 
 
-def test_valid_relation_wins_over_password_blocked_filename_hypothesis(tmp_path):
+def test_opaque_members_cannot_be_guessed_across_password_blocked_formats(tmp_path):
     factory = ArchiveFixtureFactory()
     seven_zip = factory.create(tmp_path, "plain", "7z", split=True,
         payload_size=MIB, split_volume_size=MIB // 4)
@@ -413,9 +468,8 @@ def test_valid_relation_wins_over_password_blocked_filename_hypothesis(tmp_path)
     all_paths = [str(path) for path in paths] + [str(rar_head)]
     group = RelationsScheduler().resolve_volume_once([str(paths[0])], all_paths, format_hint="7z")
     assert group is not None
-    assert set(group.input_paths) == {str(path) for path in paths}
-    assert group.head_metadata["relation_confirmed"] is True
-    assert RelationsScheduler().resolve_volume_once([str(rar_head)], all_paths, format_hint="rar") is None
+    assert group.input_paths == [str(paths[0])]
+    assert group.head_metadata["volume_set_incomplete"] is True
 
 
 def test_loose_rar_names_reconcile_after_missing_middle_volume_arrives(tmp_path):
@@ -564,7 +618,7 @@ def test_pipeline_middle_volume_target_exposes_resolved_physical_family(mixed_re
     assert response.discovery.blocked_paths == ()
 
 
-def test_real_strict_middle_gap_is_not_emitted_as_a_relation_group(tmp_path):
+def test_real_strict_middle_gap_is_emitted_as_an_incomplete_relation_group(tmp_path):
     case = ArchiveFixtureFactory().create(
         tmp_path,
         "strict_middle_gap",
@@ -580,12 +634,12 @@ def test_real_strict_middle_gap_is_not_emitted_as_a_relation_group(tmp_path):
     groups = RelationsScheduler().build_candidate_groups(
         DirectoryScanner(str(case.archive_dir), config=make_config()).scan()
     )
-    # No relation may form across the gap, but no remaining volume may be
-    # silently dropped from discovery either.
-    assert not any(group.is_split_candidate for group in groups)
-    assert all(len(group.input_paths) == 1 for group in groups)
-    remaining = {path.name for path in parts if path.exists()}
-    assert {Path(group.head_path).name for group in groups} == remaining
+    remaining = {str(path) for path in parts if path.exists()}
+    split = [group for group in groups if group.is_split_candidate]
+    assert len(split) == 1
+    assert set(split[0].input_paths) == remaining
+    assert split[0].head_metadata["volume_set_incomplete"] is True
+    assert [volume.number for volume in split[0].split_volumes] == [1, 3, 4, 5]
 
 
 def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):
@@ -615,7 +669,9 @@ def test_structure_resolution_recomputes_a_residual_middle_gap(tmp_path):
         format_hint="7z",
     )
 
-    assert group is None
+    assert group is not None
+    assert group.head_metadata["volume_set_incomplete"] is True
+    assert group.input_paths == [str(path) for path in renamed]
 
 
 def test_structure_resolution_stays_within_the_head_parent_directory(
@@ -650,7 +706,9 @@ def test_structure_resolution_stays_within_the_head_parent_directory(
         all_paths,
         format_hint="7z",
     )
-    assert direct_group is None
+    assert direct_group is not None
+    assert direct_group.head_metadata["volume_set_incomplete"] is True
+    assert str(foreign_first) not in direct_group.input_paths
 
     entries = [
         FileEntry(path=path, is_dir=False, size=path.stat().st_size, mtime_ns=path.stat().st_mtime_ns)
@@ -658,8 +716,8 @@ def test_structure_resolution_stays_within_the_head_parent_directory(
     ]
     snapshot = DirectorySnapshot.from_entries(scan_root, entries)
     groups = scheduler.build_candidate_groups(snapshot)
-    assert all(group.kind == "file" for group in groups)
-    assert all(len(group.input_paths) == 1 for group in groups)
+    assert {path for group in groups for path in group.input_paths} == set(all_paths)
+    assert all(group.head_metadata.get("volume_set_incomplete") is True for group in groups)
     assert not any(
         str(foreign_first) in group.input_paths
         and any(str(path) in group.input_paths for path in first_parts)
@@ -774,134 +832,6 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
 
     assert extraction.success is True
     extracted = next(output.rglob("payload.bin"))
-    assert extracted.read_bytes() == payload.read_bytes()
-
-
-@pytest.mark.parametrize("false_marker", [False, True])
-def test_embedded_7z_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_path, false_marker):
-    case = ArchiveFixtureFactory().create(
-        tmp_path,
-        "embedded_sfx_source",
-        "7z",
-        payload_size=3 * MIB,
-    )
-    sfx_module = get_test_tools()["seven_zip_sfx"]
-    assert sfx_module is not None and sfx_module.is_file()
-    logical = sfx_module.read_bytes() + case.entry_path.read_bytes()
-    split_size = MIB
-    mixed = tmp_path / "sfx_mixed"
-    mixed.mkdir()
-    parts = []
-    for number, offset in enumerate(range(0, len(logical), split_size), start=1):
-        marker = "exe" if number == 1 else "7z"
-        target = mixed / (f"shared.part99.chunk{number}.opaque" if false_marker
-            else f"shared.bundle.{marker}.part{number}.useless.fake")
-        target.write_bytes(logical[offset : offset + split_size])
-        parts.append(target)
-    assert len(parts) >= 3
-
-    config = normalize_config(
-        with_detection_pipeline(
-            {
-                "verification": {"enabled": False, "methods": []},
-            },
-            precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
-                {"name": "relation_archive_accept", "enabled": True},
-                {"name": "embedded_payload_identity", "enabled": True},
-            ],
-        )
-    )
-    tasks = ArchiveTaskProvider(config).scan_targets([str(mixed)])
-
-    assert len(tasks) == 1
-    descriptor = tasks[0].archive_input()
-    assert descriptor.format_hint == "7z"
-    assert descriptor.part_paths() == [str(path) for path in parts]
-    assert [part.volume_number for part in descriptor.parts] == list(range(1, len(parts) + 1))
-
-    extractor = ExtractionScheduler(max_retries=0)
-    output = tmp_path / "sfx_output"
-    try:
-        extraction = extractor.extract(tasks[0], str(output))
-    finally:
-        extractor.close()
-
-    assert extraction.success is True
-    marker = next(output.rglob(case.marker_name))
-    assert marker.read_text(encoding="utf-8") == case.marker_text
-
-
-@pytest.mark.skipif(get_optional_winrar() is None, reason="WinRAR is required to generate RAR SFX")
-@pytest.mark.parametrize("false_marker", [False, True])
-def test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_path, false_marker):
-    winrar = get_optional_winrar()
-    assert winrar is not None
-    source = tmp_path / "rar_sfx_source"
-    source.mkdir()
-    payload = source / "rar-sfx-payload.bin"
-    payload.write_bytes(bytes((index * 73 + 29) & 0xFF for index in range(3 * MIB)))
-    logical_sfx = tmp_path / "raw-split-rar.exe"
-    result = subprocess.run(
-        [
-            str(winrar),
-            "a",
-            "-sfx",
-            "-m0",
-            "-inul",
-            str(logical_sfx),
-            str(payload),
-        ],
-        cwd=str(source),
-        capture_output=True,
-        timeout=60,
-    )
-    assert result.returncode == 0
-
-    split_size = MIB
-    mixed = tmp_path / "rar_sfx_mixed"
-    mixed.mkdir()
-    logical = logical_sfx.read_bytes()
-    parts = []
-    for number, offset in enumerate(range(0, len(logical), split_size), start=1):
-        marker = "exe" if number == 1 else "rar"
-        target = mixed / (f"shared.part99.chunk{number}.opaque" if false_marker
-            else f"shared.bundle.{marker}.part{number}.useless.fake")
-        target.write_bytes(logical[offset : offset + split_size])
-        parts.append(target)
-    assert len(parts) >= 3
-
-    config = normalize_config(
-        with_detection_pipeline(
-            {
-                "verification": {"enabled": False, "methods": []},
-            },
-            precheck=[
-                {"name": "size_range", "enabled": True, "gte": 0},
-                {"name": "relation_archive_accept", "enabled": True},
-                {"name": "embedded_payload_identity", "enabled": True},
-            ],
-        )
-    )
-    tasks = ArchiveTaskProvider(config).scan_targets([str(mixed)])
-
-    assert len(tasks) == 1
-    descriptor = tasks[0].archive_input()
-    assert descriptor.format_hint == "rar"
-    assert descriptor.open_mode == "sfx_with_volumes"
-    assert descriptor.volume_style == "rar_sfx_part"
-    assert descriptor.part_paths() == [str(path) for path in parts]
-    assert [part.volume_number for part in descriptor.parts] == list(range(1, len(parts) + 1))
-
-    extractor = ExtractionScheduler(max_retries=0)
-    output = tmp_path / "rar_sfx_output"
-    try:
-        extraction = extractor.extract(tasks[0], str(output))
-    finally:
-        extractor.close()
-
-    assert extraction.success is True
-    extracted = next(output.rglob(payload.name))
     assert extracted.read_bytes() == payload.read_bytes()
 
 

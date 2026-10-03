@@ -59,6 +59,8 @@ struct Zip64Eocd {
     total_entries: u64,
     cd_size: u64,
     cd_offset: u64,
+    disk: u32,
+    cd_disk: u32,
 }
 
 #[derive(Clone, Copy)]

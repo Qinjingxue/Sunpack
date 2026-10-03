@@ -417,9 +417,11 @@ def test_split_zip_without_terminal_reports_strong_missing_tail(tmp_path):
 
     # No complete relation may form, but the structurally proven head must
     # still be reported instead of silently disappearing from discovery.
-    assert not any(group.is_split_candidate for group in groups)
-    assert all(len(group.input_paths) == 1 for group in groups)
-    assert {Path(group.head_path).name for group in groups} == {first.name, second.name}
+    assert len(groups) == 1
+    assert groups[0].is_split_candidate is True
+    assert groups[0].input_paths == [str(first), str(second)]
+    assert groups[0].head_metadata["volume_set_incomplete"] is True
+    assert groups[0].head_metadata["relation_failure_reason"] == "missing_volume"
 
 
 def _split_zip_first_bytes() -> bytes:
@@ -518,7 +520,7 @@ def test_plain_numbered_file_does_not_gain_archive_split_identity(tmp_path):
     assert group.relation.is_split_related is False
 
 
-def test_only_head_7z_keeps_unconfirmed_split_identity(tmp_path):
+def test_only_head_7z_keeps_incomplete_split_identity(tmp_path):
     start_header = (
         (0).to_bytes(8, "little")
         + (4096).to_bytes(8, "little")
@@ -535,12 +537,13 @@ def test_only_head_7z_keeps_unconfirmed_split_identity(tmp_path):
     group = next(group for group in _groups(tmp_path) if Path(group.head_path) == path)
     candidate = relation_group_to_candidate(group)
 
-    assert group.is_split_candidate is False
+    assert group.is_split_candidate is True
+    assert group.head_metadata["volume_set_incomplete"] is True
     assert group.relation.is_split_related is True
     assert group.relation.split_role == "first"
     assert group.relation.split_index == 1
     assert group.head_metadata["format"] == "7z"
-    assert group.head_metadata.get("relation_confirmed") is not True
+    assert group.head_metadata["relation_confirmed"] is True
     assert candidate.is_split is True
 
 

@@ -1,5 +1,9 @@
 use crate::analysis_native::confirm_format_identity_native;
-use crate::relations::{build_native_candidate_groups_from_snapshot, NativeRelationGroup};
+use crate::relations::{
+    build_native_candidate_groups_from_snapshot,
+    build_native_candidate_groups_from_snapshot_cached, relation_group_cached_anchors,
+    NativeRelationGroup, RelationCache,
+};
 use crate::scan::directory::{
     filesystem_logical_name, filesystem_route_name, DirectorySnapshotTable,
     NativeDirectorySnapshot, FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL,
@@ -124,6 +128,26 @@ impl NativeCandidateTable {
         self.rows.len()
     }
 
+    /// Keep relation facts native while Python discovers directory passwords.
+    #[pyo3(signature = (raw_snapshot, filtered_snapshot, path_passwords=None))]
+    fn append_relations(
+        &mut self,
+        py: Python<'_>,
+        raw_snapshot: PyRef<'_, NativeDirectorySnapshot>,
+        filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
+        path_passwords: Option<Vec<(String, String)>>,
+    ) -> PyResult<()> {
+        let groups = build_native_candidate_groups_from_snapshot(
+            py,
+            &raw_snapshot,
+            &filtered_snapshot,
+            path_passwords.as_deref(),
+        )?;
+        self.rows
+            .extend(groups.into_iter().map(Candidate::Relation));
+        Ok(())
+    }
+
     fn append_directory(
         &mut self,
         py: Python<'_>,
@@ -170,12 +194,18 @@ impl NativeCandidateTable {
         filtered_snapshot: PyRef<'_, NativeDirectorySnapshot>,
         path_passwords: Vec<(String, String)>,
     ) -> PyResult<()> {
-        let relation_view = filtered_snapshot.file_route_view(FILE_ROUTE_RELATIONS);
-        let groups = build_native_candidate_groups_from_snapshot(
+        let mut cached = RelationCache::default();
+        for row in &self.rows {
+            if let Candidate::Relation(group) = row {
+                relation_group_cached_anchors(group, &mut cached);
+            }
+        }
+        let groups = build_native_candidate_groups_from_snapshot_cached(
             py,
             &raw_snapshot,
-            &relation_view,
+            &filtered_snapshot,
             Some(&path_passwords),
+            Some(&cached),
         )?;
         self.rows.retain(|row| matches!(row, Candidate::File(..)));
         let mut replacement = Vec::with_capacity(groups.len() + self.rows.len());

@@ -49,6 +49,8 @@ pub(crate) struct VolumeAnchor {
     pub(crate) expected_logical_size: Option<u64>,
     pub(crate) continuation_from_previous: bool,
     pub(crate) continuation_to_next: bool,
+    pub(crate) relation_has_next: Option<bool>,
+    pub(crate) rar_next_header_offset: Option<u64>,
     pub(crate) sfx: bool,
     pub(crate) pe_structure: bool,
     pub(crate) evidence: Vec<&'static str>,
@@ -161,21 +163,6 @@ fn cheap_fast_probe_pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("cheap volume anchor probe pool must build")
     })
-}
-
-pub(crate) fn probe_volume_anchor_paths_deep(
-    paths: &[String],
-    prefix_limit: usize,
-    tail_limit: usize,
-    path_passwords: Option<&[(String, String)]>,
-) -> Vec<VolumeAnchor> {
-    probe_volume_anchor_paths_with_depth(
-        paths,
-        prefix_limit,
-        tail_limit,
-        path_passwords,
-        VolumeAnchorProbeDepth::Deep,
-    )
 }
 
 fn probe_volume_anchor_paths_with_depth(
@@ -427,8 +414,8 @@ fn probe_zip_local_head(prefix: &[u8], out: &mut VolumeAnchor) -> bool {
     out.format = "zip".to_string();
     out.confidence = "weak".to_string();
     out.structure_offset = Some(0);
-    out.internal_volume_number = Some(1);
-    out.anchor_roles.push("first");
+    // A local header also occurs on continuation disks. Only a split marker
+    // or a paired raw-stream terminal can establish the first volume.
     out.evidence.push("zip:local_header");
     true
 }
@@ -490,6 +477,8 @@ fn probe_rar(prefix: &[u8], offset: usize, out: &mut VolumeAnchor, password: Opt
             return true;
         };
         initialize_rar_anchor(out, offset);
+        out.rar_next_header_offset = read_vint(prefix, header_offset + 4)
+            .and_then(|(size, start)| (start as u64).checked_add(size));
         out.multivolume = archive_flags & 0x01 != 0;
         if out.multivolume {
             out.internal_volume_number = Some(number.unwrap_or(0).saturating_add(1));
@@ -503,6 +492,8 @@ fn probe_rar(prefix: &[u8], offset: usize, out: &mut VolumeAnchor, password: Opt
         }
     } else if let Some(flags) = rar4_main_flags(prefix, offset + RAR4.len()) {
         initialize_rar_anchor(out, offset);
+        out.rar_next_header_offset = u16_le(prefix, offset + RAR4.len() + 5)
+            .map(|size| offset as u64 + RAR4.len() as u64 + u64::from(size));
         // RAR4 MHD_VOLUME and MHD_FIRSTVOLUME.
         out.encrypted = flags & RAR4_MAIN_HEADER_PASSWORD != 0;
         if out.encrypted {
@@ -724,7 +715,9 @@ fn read_zip_tail_for_anchor(
 
     let exact_eocd = fast.len() == EOCD_MIN_SIZE as usize
         && fast.starts_with(ZIP_EOCD)
-        && u16::from_le_bytes([fast[20], fast[21]]) == 0;
+        && u16::from_le_bytes([fast[20], fast[21]]) == 0
+        && u16_le(&fast, 4) != Some(0xffff)
+        && u16_le(&fast, 6) != Some(0xffff);
     if exact_eocd || tail_len == fast_len {
         return Ok((fast, remaining - fast_len));
     }
@@ -764,7 +757,9 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
         out.structure_offset = Some(offset as u64);
         out.sfx = offset > 0 && split_start_offset.is_none();
         out.anchor_roles.push("first");
-        out.internal_volume_number = Some(1);
+        // A local entry can also begin a later disk. Only the split marker
+        // proves the physical first disk before EOCD information is known.
+        out.internal_volume_number = split_start_offset.map(|_| 1);
         out.evidence.push(if split_start_offset.is_some() {
             "zip:split_marker"
         } else if empty_eocd_offset == Some(offset) {
@@ -778,8 +773,21 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
     let mut split_terminal = false;
     if let Some(index) = eocd_index {
         if let Some(record) = tail.get(index..index + 22) {
-            let disk = u16::from_le_bytes([record[4], record[5]]);
-            let cd_disk = u16::from_le_bytes([record[6], record[7]]);
+            let mut disk = u32::from(u16::from_le_bytes([record[4], record[5]]));
+            let mut cd_disk = u32::from(u16::from_le_bytes([record[6], record[7]]));
+            if disk == 0xffff || cd_disk == 0xffff {
+                // ZIP64 is only needed when the classic disk fields overflow.
+                let Some((zip64_disk, zip64_cd_disk)) =
+                    crate::formats::zip::zip64_relation_disk_numbers(tail, index, tail_start)
+                else {
+                    out.error = "zip64_disk_identity_missing".into();
+                    out.confidence = "weak".into();
+                    out.anchor_roles.push("terminal");
+                    return true;
+                };
+                disk = zip64_disk;
+                cd_disk = zip64_cd_disk;
+            }
             if cd_disk > disk {
                 out.error = "invalid_zip_multidisk_order".to_string();
                 out.confidence = "unsupported".to_string();
@@ -793,7 +801,8 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
                 "zip:eocd_single_disk"
             });
             if split_terminal {
-                out.internal_volume_number = Some(u32::from(disk).saturating_add(1));
+                out.internal_volume_number = disk.checked_add(1);
+                out.anchor_roles.retain(|role| *role != "first");
                 if empty_eocd_start {
                     out.anchor_roles.retain(|role| *role != "first");
                     out.structure_offset = None;
@@ -826,6 +835,247 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
         out.continuation_to_next = has_first;
     }
     true
+}
+
+/// Upgrade only the missing tail facts; preserve the already parsed head.
+/// Opaque 7z chunks also use this bounded pass only when a ZIP family shares
+/// their bucket, so physical first/terminal disks are found before naming.
+pub(crate) fn upgrade_relation_zip_tail(anchor: &VolumeAnchor) -> VolumeAnchor {
+    let mut out = anchor.clone();
+    out.evidence.push("relation:zip_tail_checked");
+    let Ok(reader) = ManagedReader::open(&anchor.path) else {
+        return out;
+    };
+    let Ok((tail, start)) = read_zip_tail_for_anchor(
+        &reader,
+        0,
+        reader.len(),
+        DEFAULT_TAIL_LIMIT as u64,
+        &[],
+        &mut out.bytes_read,
+    ) else {
+        return out;
+    };
+    let mut terminal = VolumeAnchor {
+        path: anchor.path.clone(),
+        size: reader.len(),
+        ..Default::default()
+    };
+    if !probe_zip(&[], &tail, start, &mut terminal) {
+        return out;
+    }
+    out.format = terminal.format;
+    out.confidence = terminal.confidence;
+    out.internal_volume_number = terminal
+        .internal_volume_number
+        .or(out.internal_volume_number);
+    out.expected_logical_size = terminal.expected_logical_size;
+    out.continuation_from_previous = terminal.continuation_from_previous;
+    out.error = terminal.error;
+    for role in terminal.anchor_roles {
+        if !out.anchor_roles.contains(&role) {
+            out.anchor_roles.push(role);
+        }
+    }
+    for evidence in terminal.evidence {
+        if !out.evidence.contains(&evidence) {
+            out.evidence.push(evidence);
+        }
+    }
+    if out.evidence.contains(&"zip:eocd_split_terminal") {
+        out.multivolume = true;
+        out.anchor_roles.retain(|r| *r != "first");
+    } else if anchor.evidence.contains(&"zip:local_header")
+        && out.anchor_roles.contains(&"terminal")
+    {
+        out.standalone = true;
+        out.multivolume = false;
+        out.evidence
+            .retain(|e| *e != "zip:eocd_single_disk_without_local_header");
+    }
+    out
+}
+
+/// ENDARC is a separately cached field, not a second main-header probe.
+/// Plain ENDARC records are tiny and CRC protected. Encrypted records reuse
+/// the existing password parser rather than a Python dictionary round trip.
+pub(crate) fn upgrade_relation_rar_end(
+    anchor: &VolumeAnchor,
+    password: Option<&str>,
+) -> VolumeAnchor {
+    let mut out = anchor.clone();
+    if out.relation_has_next.is_some()
+        || out.needs_password
+        || out.evidence.contains(&"relation:rar_end_checked")
+    {
+        return out;
+    }
+    out.evidence.push("relation:rar_end_checked");
+    let Ok(reader) = ManagedReader::open(&out.path) else {
+        return out;
+    };
+    if out.encrypted {
+        if let Some(password) = password {
+            if let Ok(Some(proof)) = crate::password::rar::probe_header_encrypted_terminal(
+                &reader,
+                out.structure_offset.unwrap_or(0),
+                password,
+                usize::try_from(reader.len() / 7).unwrap_or(usize::MAX),
+            ) {
+                if proof.end_block_found {
+                    out.relation_has_next = Some(proof.end_block_flags & 1 != 0);
+                }
+            }
+        }
+    } else if let Some(mut cursor) = out.rar_next_header_offset {
+        let rar5 = out.evidence.contains(&"rar5:volume_header");
+        let mut first_file = true;
+        // Walk header spans only; data is skipped, never buffered. Start after
+        // the main header whose CRC/identity the cheap probe already verified.
+        loop {
+            if cursor.checked_add(7).is_none_or(|end| end > reader.len()) {
+                break;
+            }
+            let Ok(mut header) = reader.read_at(cursor, 7) else {
+                break;
+            };
+            if header.len() != 7 {
+                break;
+            }
+            out.bytes_read += 7;
+            let (header_len, body_start) = if rar5 {
+                let Some((size, start)) = read_vint(&header, 4) else {
+                    break;
+                };
+                let Some(end) = start
+                    .checked_add(size as usize)
+                    .filter(|n| *n <= 2 * 1024 * 1024)
+                else {
+                    break;
+                };
+                (end, start)
+            } else {
+                (usize::from(u16_le(&header, 5).unwrap()), 7)
+            };
+            if header_len < 7
+                || cursor
+                    .checked_add(header_len as u64)
+                    .is_none_or(|end| end > reader.len())
+            {
+                break;
+            }
+            if header_len > 7 {
+                let Ok(rest) = reader.read_at(cursor + 7, header_len - 7) else {
+                    break;
+                };
+                if rest.len() != header_len - 7 {
+                    break;
+                }
+                out.bytes_read += rest.len() as u64;
+                header.extend(rest);
+            }
+            let data_size;
+            if rar5 {
+                if u32_le(&header, 0) != Some(crc32(&header[4..])) {
+                    out.error = "rar_header_crc_mismatch".into();
+                    break;
+                }
+                let Some((kind, pos)) = read_vint(&header, body_start) else {
+                    break;
+                };
+                let Some((flags, mut pos)) = read_vint(&header, pos) else {
+                    break;
+                };
+                if flags & 1 != 0 {
+                    let Some((_, next)) = read_vint(&header, pos) else {
+                        break;
+                    };
+                    pos = next;
+                }
+                if flags & 2 != 0 {
+                    let Some((size, next)) = read_vint(&header, pos) else {
+                        break;
+                    };
+                    data_size = size;
+                    pos = next;
+                } else {
+                    data_size = 0;
+                }
+                if kind == 2 && first_file {
+                    out.continuation_from_previous |= flags & 8 != 0;
+                    out.continuation_to_next |= flags & 16 != 0;
+                    first_file = false;
+                }
+                if kind == 5 {
+                    let Some((end_flags, _)) = read_vint(&header, pos) else {
+                        break;
+                    };
+                    out.relation_has_next = Some(end_flags & 1 != 0);
+                    break;
+                }
+            } else {
+                if u16_le(&header, 0) != Some((crc32(&header[2..]) & 0xffff) as u16) {
+                    out.error = "rar_header_crc_mismatch".into();
+                    break;
+                }
+                let flags = u16_le(&header, 3).unwrap();
+                let kind = header[2];
+                data_size = if flags & 0x8000 != 0 {
+                    let Some(low) = u32_le(&header, 7) else {
+                        break;
+                    };
+                    let high = if kind == 0x74 && flags & 0x100 != 0 {
+                        let Some(high) = u32_le(&header, 32) else {
+                            break;
+                        };
+                        u64::from(high) << 32
+                    } else {
+                        0
+                    };
+                    u64::from(low) | high
+                } else {
+                    0
+                };
+                if kind == 0x74 && first_file {
+                    out.continuation_from_previous |= flags & 1 != 0;
+                    out.continuation_to_next |= flags & 2 != 0;
+                    first_file = false;
+                }
+                if kind == 0x7b {
+                    out.relation_has_next = Some(flags & 1 != 0);
+                    if flags & 8 != 0 {
+                        let pos = 7 + if flags & 2 != 0 { 4 } else { 0 };
+                        if let Some(number) = u16_le(&header, pos) {
+                            let slot = u32::from(number) + 1;
+                            if out.internal_volume_number.is_some_and(|old| old != slot) {
+                                out.error = "rar_volume_identity_conflict".into();
+                            } else {
+                                out.internal_volume_number = Some(slot);
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            let Some(next) = cursor
+                .checked_add(header_len as u64)
+                .and_then(|n| n.checked_add(data_size))
+            else {
+                break;
+            };
+            if next > reader.len() {
+                break;
+            }
+            cursor = next;
+        }
+    }
+    if let Some(next) = out.relation_has_next {
+        out.continuation_to_next = next;
+        if !next && !out.anchor_roles.contains(&"terminal") {
+            out.anchor_roles.push("terminal");
+        }
+    }
+    out
 }
 
 pub(crate) fn probe_volume_anchor_at_offset(
@@ -892,6 +1142,9 @@ pub(crate) fn probe_volume_anchor_at_offset(
     }
 
     if offset > 0 {
+        if let Some(next) = result.rar_next_header_offset.as_mut() {
+            *next += offset;
+        }
         if let Some(structure_offset) = result.structure_offset.as_mut() {
             *structure_offset = structure_offset.saturating_add(offset);
         } else {
@@ -1011,6 +1264,140 @@ fn read_vint(data: &[u8], mut offset: usize) -> Option<(u64, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn rar4_block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0, 0, kind];
+        bytes.extend(flags.to_le_bytes());
+        bytes.extend(((7 + body.len()) as u16).to_le_bytes());
+        bytes.extend(body);
+        let crc = (crc32(&bytes[2..]) & 0xffff) as u16;
+        bytes[..2].copy_from_slice(&crc.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn rar4_roles_and_numbering_are_independent_from_exact_identity() {
+        for (flags, slot, style) in [
+            (0x111, Some(1), "rar4:new_volume_naming"),
+            (0x11, None, "rar4:new_volume_naming"),
+            (1, None, "rar4:old_volume_naming"),
+        ] {
+            let mut bytes = RAR4.to_vec();
+            bytes.extend(rar4_block(0x73, flags, &[0; 6]));
+            bytes.extend(rar4_block(0x7b, 1, &[]));
+            let path = crate::test_support::temp_file("rar4_relation_roles", &bytes);
+            let anchor =
+                probe_volume_anchor_paths_cheap(&[path.to_string_lossy().into_owned()], None)
+                    .remove(0);
+            assert_eq!(anchor.internal_volume_number, slot);
+            assert!(anchor.evidence.contains(&style));
+            let end = upgrade_relation_rar_end(&anchor, None);
+            assert_eq!(end.relation_has_next, Some(true));
+            assert_eq!(end.internal_volume_number, slot);
+            assert!(!end.anchor_roles.contains(&"terminal"));
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn rar4_legacy_endarc_identity_is_a_bonus_and_cached_once() {
+        let mut bytes = RAR4.to_vec();
+        bytes.extend(rar4_block(0x73, 0x11, &[0; 6]));
+        bytes.extend(rar4_block(0x7b, 8, &2u16.to_le_bytes()));
+        let path = crate::test_support::temp_file("rar4_legacy_identity", &bytes);
+        let anchor =
+            probe_volume_anchor_paths_cheap(&[path.to_string_lossy().into_owned()], None).remove(0);
+        assert_eq!(anchor.internal_volume_number, None);
+        let upgraded = upgrade_relation_rar_end(&anchor, None);
+        assert_eq!(upgraded.internal_volume_number, Some(3));
+        assert_eq!(upgraded.relation_has_next, Some(false));
+        assert!(upgraded.anchor_roles.contains(&"terminal"));
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(
+            upgrade_relation_rar_end(&upgraded, None).bytes_read,
+            upgraded.bytes_read
+        );
+    }
+
+    #[test]
+    fn rar_endarc_inside_payload_does_not_create_a_terminal_fact() {
+        let mut bytes = RAR4.to_vec();
+        bytes.extend(rar4_block(0x73, 0x111, &[0; 6]));
+        let fake_end = rar4_block(0x7b, 0, &[]);
+        let mut file_body = vec![0; 25];
+        file_body[..4].copy_from_slice(&(fake_end.len() as u32).to_le_bytes());
+        bytes.extend(rar4_block(0x74, 0x8002, &file_body));
+        bytes.extend(fake_end);
+        bytes.extend(rar4_block(0x7b, 1, &[]));
+        bytes.extend(vec![0; 2048]); // Carriers may have trailing junk.
+        let path = crate::test_support::temp_file("rar_payload_fake_end", &bytes);
+        let anchor =
+            probe_volume_anchor_paths_cheap(&[path.to_string_lossy().into_owned()], None).remove(0);
+        let upgraded = upgrade_relation_rar_end(&anchor, None);
+        assert_eq!(upgraded.relation_has_next, Some(true));
+        assert!(!upgraded.anchor_roles.contains(&"terminal"));
+        assert!(upgraded.bytes_read < 700);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn rar_terminal_walk_is_bounded_by_file_spans_not_entry_count() {
+        let mut bytes = RAR4.to_vec();
+        bytes.extend(rar4_block(0x73, 0x111, &[0; 6]));
+        let mut file_body = vec![0; 25];
+        file_body[8] = 2; // Windows host.
+        file_body[17] = 20; // Unpack version.
+        file_body[18] = 0x30; // Stored empty file.
+        file_body[19..21].copy_from_slice(&1u16.to_le_bytes());
+        file_body.push(b'a');
+        let block = rar4_block(0x74, 0x8000, &file_body);
+        for _ in 0..4100 {
+            bytes.extend(&block);
+        }
+        bytes.extend(rar4_block(0x7b, 0, &[]));
+        let path = crate::test_support::temp_file("rar_many_headers", &bytes);
+        let anchor =
+            probe_volume_anchor_paths_cheap(&[path.to_string_lossy().into_owned()], None).remove(0);
+        let upgraded = upgrade_relation_rar_end(&anchor, None);
+        assert_eq!(upgraded.relation_has_next, Some(false));
+        assert!(upgraded.anchor_roles.contains(&"terminal"));
+        assert!(upgraded.error.is_empty());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn zip64_disk_identity_upgrades_only_overflowed_classic_fields() {
+        let mut tail = b"PK\x06\x06".to_vec();
+        tail.extend(44u64.to_le_bytes());
+        tail.extend([0; 4]);
+        tail.extend(70000u32.to_le_bytes());
+        tail.extend(69999u32.to_le_bytes());
+        tail.extend([0; 32]);
+        tail.extend(b"PK\x06\x07");
+        tail.extend(70000u32.to_le_bytes());
+        tail.extend(0u64.to_le_bytes());
+        tail.extend(70001u32.to_le_bytes());
+        tail.extend(b"PK\x05\x06");
+        tail.extend(0xffffu16.to_le_bytes());
+        tail.extend(0xffffu16.to_le_bytes());
+        tail.extend([0; 14]);
+        let path = crate::test_support::temp_file("zip64_terminal", &tail);
+        let anchor =
+            probe_volume_anchor_paths_cheap(&[path.to_string_lossy().into_owned()], None).remove(0);
+        let upgraded = upgrade_relation_zip_tail(&anchor);
+        assert_eq!(upgraded.internal_volume_number, Some(70001));
+        assert!(upgraded.evidence.contains(&"zip:eocd_split_terminal"));
+        assert!(upgraded.bytes_read <= 512 + tail.len() as u64);
+        std::fs::remove_file(path).unwrap();
+        // Invalid ZIP64 bytes must not matter when classic identity is valid.
+        let mut classic = b"PK\x05\x06".to_vec();
+        classic.extend(4u16.to_le_bytes());
+        classic.extend(3u16.to_le_bytes());
+        classic.extend([0; 14]);
+        let mut out = VolumeAnchor::default();
+        assert!(probe_zip(&[], &classic, 0, &mut out));
+        assert_eq!(out.internal_volume_number, Some(5));
+    }
 
     #[test]
     fn rar4_main_header_requires_its_stored_crc() {

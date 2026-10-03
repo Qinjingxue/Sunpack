@@ -2928,6 +2928,45 @@ mod tests {
             .unwrap();
     }
 
+    #[cfg(windows)]
+    fn set_generation_test_change_time(file: &File, change_time: i64) {
+        use std::ffi::c_void;
+        use std::os::windows::io::AsRawHandle;
+        #[repr(C)]
+        #[derive(Default)]
+        struct FileBasicInfo {
+            creation_time: i64,
+            access_time: i64,
+            write_time: i64,
+            change_time: i64,
+            attributes: u32,
+        }
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetFileInformationByHandle(
+                handle: *mut c_void,
+                class: i32,
+                information: *const c_void,
+                size: u32,
+            ) -> i32;
+        }
+        let information = FileBasicInfo {
+            change_time,
+            ..Default::default()
+        };
+        assert_ne!(
+            unsafe {
+                SetFileInformationByHandle(
+                    file.as_raw_handle(),
+                    0,
+                    (&information as *const FileBasicInfo).cast(),
+                    std::mem::size_of::<FileBasicInfo>() as u32,
+                )
+            },
+            0
+        );
+    }
+
     #[test]
     #[cfg(windows)]
     fn bug_regression_replacement_with_restored_timestamps_uses_new_file_id() {
@@ -2969,6 +3008,16 @@ mod tests {
     fn bug_regression_in_place_write_with_restored_mtime_invalidates_blocks() {
         let path = temp_file("generation_overwrite", b"old!");
         let metadata = std::fs::metadata(&path).unwrap();
+        // Creation and overwrite can occur in the same Windows clock tick.
+        // Start with a historical ChangeTime so the real write/metadata update
+        // has a distinct generation without sleeps or altered production I/O.
+        let initial = TrackedFile::open_with(&path, "generation_test_writer", |options| {
+            options.write(true);
+        })
+        .unwrap();
+        let initial_generation = windows_file_generation(&initial).unwrap();
+        set_generation_test_change_time(&initial, initial_generation.change_time - 10_000_000);
+        drop(initial);
         let first = ManagedReader::open(&path).unwrap();
         assert_eq!(first.read_all().unwrap(), b"old!");
         std::fs::write(&path, b"new!").unwrap();

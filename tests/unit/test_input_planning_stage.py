@@ -5,10 +5,9 @@ from sunpack.core.analysis.embedded import scan_embedded_archives
 from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge, ensure_knowledge, write_payload
 from sunpack.core.analysis.result import ArchiveAnalysisReport, ArchiveFormatEvidence, ArchiveSegment
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
-from sunpack.pipeline.coordinator.task_scan import direct_file_task
 from sunpack.pipeline.discovery.detection.input_planning import ArchiveInputPlanningStage
 from sunpack.core.support import archive_knowledge_projection as knowledge_view
-from tests.helpers.archive_tasks import make_archive_task
+from tests.helpers.archive_tasks import make_archive_task, make_task_from_descriptor
 
 
 class _FakeAnalyzer:
@@ -23,7 +22,9 @@ class _FakeAnalyzer:
 
 def _task(path, *, parts=None, volumes=None, logical_name="case"):
     if parts and len(parts) > 1:
-        return direct_file_task(str(path), all_parts=[str(item) for item in parts])
+        return make_task_from_descriptor(ArchiveInputDescriptor.from_split_volumes(
+            archive_path=str(path), volumes=volumes, logical_name=logical_name, format_hint="",
+        ))
     return make_archive_task(path, logical_name=logical_name)
 
 
@@ -280,7 +281,10 @@ def test_input_planning_stage_projects_rar_sfx_volume_password_probe(tmp_path):
         segments=[ArchiveSegment(start_offset=start, end_offset=None, confidence=0.97)],
         details={"password_required": True, "header_encrypted": True},
     )
-    task = _task(first, parts=[first, second])
+    task = _task(first, parts=[first, second], volumes=[
+        {"path": str(first), "number": 1, "style": "rar_sfx_part", "prefix": "case", "role": "first", "width": 1},
+        {"path": str(second), "number": 2, "style": "rar_sfx_part", "prefix": "case", "role": "member", "width": 1},
+    ])
     stage = ArchiveInputPlanningStage({"input_planning": {"enabled": False}})
     stage.enabled = True
     stage.analyzer = _FakeAnalyzer(_multi_report(first, [evidence]))
@@ -312,7 +316,7 @@ def test_input_planning_preserves_structured_password_probe_for_split_segment_at
         segments=[ArchiveSegment(start_offset=0, end_offset=None, confidence=0.99)],
         details={"password_required": True},
     )
-    task = _task(first, parts=[first, second])
+    task = _task(first)
     descriptor = ArchiveInputDescriptor.from_split_volumes(
         archive_path=str(first),
         volumes=[
@@ -342,9 +346,9 @@ def test_input_planning_stage_maps_split_logical_segment_to_concat_ranges(tmp_pa
     part2.write_bytes(b"b" * 10)
     part3.write_bytes(b"c" * 10)
     volumes = [
-        {"path": str(part2), "number": 2},
-        {"path": str(part1), "number": 1},
-        {"path": str(part3), "number": 3},
+        {"path": str(part2), "number": 2, "style": "numeric_suffix", "prefix": "case.7z", "role": "member", "width": 3},
+        {"path": str(part1), "number": 1, "style": "numeric_suffix", "prefix": "case.7z", "role": "first", "width": 3},
+        {"path": str(part3), "number": 3, "style": "numeric_suffix", "prefix": "case.7z", "role": "member", "width": 3},
     ]
     evidence = ArchiveFormatEvidence(
         format="7z",

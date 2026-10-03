@@ -54,9 +54,9 @@ SCENARIOS: tuple[VolumeConfusionScenario, ...] = (
     ),
     VolumeConfusionScenario(
         case_id="prefix-suffix-junk-all",
-        description="每个数据卷在卷号标识前后都附加无效数据（前缀统一，保证 stem 一致）",
+        description="全部成员使用同一 first-dot 前缀，数据卷在卷号标识前后附加无效数据",
         name_for=lambda base, fmt, index, count, launcher: (
-            _canonical_name(base, fmt, index, count, launcher)
+            f"noise.{_canonical_name(base, fmt, index, count, launcher)}"
             if launcher
             else f"noise.{_canonical_name(base, fmt, index, count, launcher)}.junk{index:02d}.tmp"
         ),
@@ -72,7 +72,7 @@ def apply_volume_confusion(
 ) -> list[Path]:
     """把分卷改名为“部分混乱”形式，并放入几个同目录干扰文件。
 
-    - 7z/zip SFX：`.exe` 只是启动器（不含数据），保持标准名，只混淆数据卷；
+    - 7z/zip SFX：`.exe` 只是启动器（不含数据），与数据卷保持同一 first-dot stem；
     - rar SFX：`part1.exe` 本身就是数据头卷，与其他分卷一样参与混淆；
     - 普通分卷：所有卷按卷号顺序命名。
     """

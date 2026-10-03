@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import os
-from typing import List, Optional, Set
+from typing import Iterable, List, Optional
 
 from sunpack_native import (
+    NativeCandidateTable,
     list_regular_files_in_directory as _native_list_regular_files_in_directory,
-    relations_build_candidate_groups_from_snapshot as _native_build_candidate_groups,
     relations_detect_split_role as _native_detect_split_role,
     relations_logical_name as _native_logical_name,
     relations_parse_numbered_volume as _native_parse_numbered_volume,
@@ -13,6 +13,7 @@ from sunpack_native import (
 )
 
 from sunpack.core.contracts.filesystem import DirectorySnapshot
+from sunpack.core.contracts.archive_input import ArchiveInputDescriptor, ArchiveInputPart, InputExtent
 from sunpack.core.passwords.internal.local_files import discover_directory_passwords_for_archive
 from sunpack.core.passwords.internal.store import PasswordStore
 from sunpack.core.passwords.relation_prober import RelationsPasswordProber
@@ -48,12 +49,22 @@ class RelationsGroupBuilder:
         snapshot: DirectorySnapshot,
         path_passwords: dict[str, str] | None = None,
     ) -> List[CandidateGroup]:
-        groups = self.build_candidate_groups_without_discovery(snapshot, path_passwords)
+        table = NativeCandidateTable()
+        table.append_relations(
+            snapshot.raw_native_snapshot,
+            snapshot.native_snapshot,
+            _native_password_pairs(path_passwords),
+        )
         if path_passwords is None:
-            discovered = self._discover_directory_passwords(groups)
+            encrypted_groups = self._groups_from_native(table.encrypted_rar_groups())
+            discovered = self._discover_directory_passwords(encrypted_groups)
             if discovered:
-                groups = self.build_candidate_groups_without_discovery(snapshot, discovered)
-        return groups
+                table.retry_relations(
+                    snapshot.raw_native_snapshot,
+                    snapshot.native_snapshot,
+                    _native_password_pairs(discovered),
+                )
+        return self._groups_from_native(table.project(index)[1] for index in range(len(table)))
 
     def _discover_directory_passwords(
         self,
@@ -89,7 +100,19 @@ class RelationsGroupBuilder:
                     if member
                 ))
                 descriptor = archive_input_for_group(group)
-                archive_input = descriptor.to_dict() if descriptor is not None else None
+                if descriptor is None:
+                    # Rust already located the encrypted RAR header. Probe its
+                    # physical range without inventing a volume order first.
+                    descriptor = ArchiveInputDescriptor(
+                        entry_path=group.entry_path,
+                        open_mode="file_range",
+                        format_hint="rar",
+                        parts=[ArchiveInputPart(InputExtent(
+                            path=group.entry_path,
+                            start=int(metadata.get("structure_offset") or 0),
+                        ))],
+                    )
+                archive_input = descriptor.to_dict()
                 encrypted_groups.append((sorted(proposal_paths), part_paths, archive_input))
         if not encrypted_groups:
             return None
@@ -106,26 +129,13 @@ class RelationsGroupBuilder:
             )
             if not password:
                 continue
-            # A password belongs to the proposal, not just to the head path
-            # that happened to make the bounded verifier succeed.  The native
-            # validator then rechecks every member in the original path union
-            # with that one password.
+            # Upgrade encrypted facts for the proposal's physical paths. Native
+            # retry preserves the unrelated structure and filename features.
             for proposal_path in proposal_paths:
                 found[proposal_path] = password
         return found or None
 
-    def build_candidate_groups_without_discovery(
-        self,
-        snapshot: DirectorySnapshot,
-        path_passwords: dict[str, str] | None = None,
-    ) -> List[CandidateGroup]:
-        native_groups = _native_build_candidate_groups(
-            snapshot.raw_native_snapshot,
-            snapshot.native_snapshot,
-            _native_password_pairs(path_passwords),
-        )
-        if not isinstance(native_groups, list):
-            raise ValueError("native relations returned invalid groups")
+    def _groups_from_native(self, native_groups: Iterable[dict]) -> List[CandidateGroup]:
         groups: List[CandidateGroup] = []
         for raw in native_groups:
             if not isinstance(raw, dict):
@@ -191,84 +201,6 @@ class RelationsGroupBuilder:
     ) -> bool:
         del is_sfx_stub
         return bool(is_split or self.parse_numbered_volume(archive))
-
-    def build_split_volume_entries(
-        self,
-        archive: str,
-        all_parts: List[str],
-        directory_index=None,
-    ) -> tuple[List[SplitVolumeEntry], Optional[bool], str, List[int]]:
-        del directory_index
-        paths = list(dict.fromkeys(str(path) for path in all_parts if path))
-        parsed_rows = [(path, self.parse_numbered_volume(path)) for path in paths]
-        parsed_rows = [(path, parsed) for path, parsed in parsed_rows if parsed]
-        if not parsed_rows:
-            return [], None, "", []
-        anchor = next((parsed for path, parsed in parsed_rows if path_key(path) == path_key(archive)), parsed_rows[0][1])
-        members = [
-            (path, parsed)
-            for path, parsed in parsed_rows
-            if self._same_standard_family(anchor, parsed)
-        ]
-        by_number: dict[int, tuple[str, dict]] = {}
-        for path, parsed in members:
-            number = int(parsed["number"])
-            if number > 0:
-                by_number.setdefault(number, (path, parsed))
-        if not by_number:
-            return [], None, "", []
-        volumes = [
-            SplitVolumeEntry(
-                path=path,
-                number=number,
-                role="first" if number == 1 else "member",
-                source="standard",
-                style=str(anchor.get("style") or ""),
-                prefix=str(anchor.get("prefix") or ""),
-                width=int(anchor.get("width") or 3),
-            )
-            for number, (path, parsed) in sorted(by_number.items())
-        ]
-        highest = max(by_number)
-        missing = [number for number in range(1, highest + 1) if number not in by_number]
-        if 1 in missing:
-            reason = "missing_head"
-        elif missing:
-            reason = "missing_middle"
-        else:
-            reason = ""
-        return volumes, not missing, reason, missing
-
-    def build_file_relation(self, filename: str, sibling_names: Set[str]) -> FileRelation:
-        del sibling_names
-        parsed = self.parse_numbered_volume(filename)
-        if not parsed:
-            return FileRelation(filename=filename, logical_name=self.get_logical_name(filename))
-        number = int(parsed["number"])
-        family = str(parsed.get("style") or "")
-        return FileRelation(
-            filename=filename,
-            logical_name=self.get_logical_name(filename),
-            split_role="first" if number == 1 else "member",
-            is_split_member=True,
-            is_split_related=True,
-            split_family=family,
-            split_index=number,
-        )
-
-    @staticmethod
-    def _same_standard_family(left: dict, right: dict) -> bool:
-        left_style = str(left.get("style") or "")
-        right_style = str(right.get("style") or "")
-        compatible_styles = left_style == right_style or {
-            left_style,
-            right_style,
-        } <= {"rar_part", "rar_sfx_part"}
-        return bool(
-            compatible_styles
-            and os.path.normcase(os.path.abspath(str(left.get("prefix") or "")))
-            == os.path.normcase(os.path.abspath(str(right.get("prefix") or "")))
-        )
 
     def _candidate_group_from_native(self, raw: dict) -> CandidateGroup | None:
         relation_payload = raw.get("relation")

@@ -78,7 +78,20 @@ fn find_zip64_eocd(data: &[u8], before: usize) -> Option<Zip64Eocd> {
         total_entries: u64_le(data, pos + 32),
         cd_size: u64_le(data, pos + 40),
         cd_offset: u64_le(data, pos + 48),
+        disk: u32_le(data, pos + 16),
+        cd_disk: u32_le(data, pos + 20),
     })
+}
+
+/// Bounded relation identity reuses the directory inspector's ZIP64 parsers.
+pub(crate) fn zip64_relation_disk_numbers(data: &[u8], eocd: usize, tail_start: u64) -> Option<(u32, u32)> {
+    let record = find_zip64_eocd(data, eocd)?;
+    let locator = find_zip64_locator(data, eocd)?;
+    if record.end != locator.offset || locator.end != eocd
+        || locator.zip64_eocd_offset != tail_start.checked_add(record.offset as u64)?
+        || u32_le(data, locator.offset + 4) != record.disk
+        || locator.total_disks != record.disk.checked_add(1)? { return None; }
+    Some((record.disk, record.cd_disk))
 }
 
 fn find_zip64_locator(data: &[u8], eocd_offset: usize) -> Option<Zip64Locator> {

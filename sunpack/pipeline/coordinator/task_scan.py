@@ -9,6 +9,7 @@ from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.pipeline.discovery.relations.internal.group_builder import RelationsGroupBuilder
+from sunpack.pipeline.discovery.relations.internal.archive_input import archive_input_for_group
 from sunpack.core.support.path_keys import path_key
 
 
@@ -133,27 +134,15 @@ def direct_file_task(path: str, all_parts: list[str] | None = None) -> ArchiveTa
         os.path.abspath(os.path.normpath(item))
         for item in (all_parts or [path])
     ]
+    group = None
     if len(parts) > 1:
         builder = RelationsGroupBuilder()
-        logical_name = builder.get_logical_name(name, is_archive=True) or logical_name
-        anchor = next(
-            (item for item in parts if builder.parse_numbered_volume(item)),
-            path,
-        )
-        volumes, _complete, _reason, _missing = builder.build_split_volume_entries(
-            anchor,
-            parts,
-        )
-        if not volumes:
+        group = builder.resolve_volume_once([path], parts)
+        descriptor = archive_input_for_group(group) if group is not None else None
+        if descriptor is None:
             raise ValueError(
                 "explicit multi-volume input could not be represented structurally"
             )
-        descriptor = ArchiveInputDescriptor.from_split_volumes(
-            archive_path=path,
-            volumes=volumes,
-            format_hint="",
-            logical_name=logical_name,
-        )
     else:
         descriptor = ArchiveInputDescriptor.from_parts(
             archive_path=path,
@@ -164,4 +153,7 @@ def direct_file_task(path: str, all_parts: list[str] | None = None) -> ArchiveTa
         descriptor,
         discovery_source="direct",
         discovery_reason="cli_direct_file",
+        carrier_path=group.carrier_path if group is not None else path,
+        cleanup_paths=group.owned_paths if group is not None else (),
+        discovery_evidence=group.head_metadata if group is not None else None,
     )

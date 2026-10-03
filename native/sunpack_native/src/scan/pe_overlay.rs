@@ -57,16 +57,42 @@ pub(crate) fn pe_headers_plausible(prefix: &[u8], actual_size: u64) -> bool {
         && section_table_end <= prefix.len()
 }
 
-#[pyfunction]
-#[pyo3(signature = (path, file_size=None, magic_bytes=None))]
-pub(crate) fn inspect_pe_overlay_structure(
-    py: Python<'_>,
+#[derive(Default)]
+pub(crate) struct PeOverlayStructure {
+    pub(crate) is_pe: bool,
+    pub(crate) has_overlay: bool,
+    pub(crate) archive_like: bool,
+    pub(crate) pe_header_offset: u64,
+    pub(crate) section_count: u64,
+    pub(crate) overlay_offset: u64,
+    pub(crate) overlay_size: u64,
+    pub(crate) archive_offset: u64,
+    pub(crate) offset_delta_from_overlay: u64,
+    pub(crate) format: &'static str,
+    detected_ext: &'static str,
+    confidence: &'static str,
+    error: &'static str,
+    evidence: Vec<&'static str>,
+    read_fault: Option<ReadFault>,
+}
+
+impl PeOverlayStructure {
+    fn failed(error: &'static str) -> Self {
+        Self {
+            error,
+            confidence: "none",
+            ..Default::default()
+        }
+    }
+}
+
+pub(crate) fn inspect_pe_overlay_native(
     path: &str,
     file_size: Option<i64>,
     magic_bytes: Option<&[u8]>,
-) -> PyResult<Py<PyDict>> {
+) -> PeOverlayStructure {
     let Ok(reader) = ManagedReader::open(path) else {
-        return Ok(empty_result(py, "os_error")?.unbind());
+        return PeOverlayStructure::failed("os_error");
     };
     let mut file = reader.cursor();
     let actual_size = match file_size {
@@ -93,18 +119,18 @@ pub(crate) fn inspect_pe_overlay_structure(
                 FieldLocation::Head,
             )
         }) {
-            let out = empty_result(py, "dos_header_read_failed")?;
-            write_read_fault(&out, &fault)?;
-            return Ok(out.unbind());
+            let mut out = PeOverlayStructure::failed("dos_header_read_failed");
+            out.read_fault = Some(fault);
+            return out;
         }
     }
     if prefix.len() < 64 || !prefix.starts_with(b"MZ") {
-        return Ok(empty_result(py, "mz_magic_not_found")?.unbind());
+        return PeOverlayStructure::failed("mz_magic_not_found");
     }
 
     let pe_header_offset = u32_le(&prefix, 0x3C) as u64;
     if pe_header_offset < 64 || pe_header_offset + 24 > actual_size {
-        return Ok(empty_result(py, "pe_header_offset_out_of_range")?.unbind());
+        return PeOverlayStructure::failed("pe_header_offset_out_of_range");
     }
 
     let mut pe_header = [0u8; 24];
@@ -124,12 +150,12 @@ pub(crate) fn inspect_pe_overlay_structure(
             FieldLocation::Head,
         )
     }) {
-        let out = empty_result(py, "pe_header_read_failed")?;
-        write_read_fault(&out, &fault)?;
-        return Ok(out.unbind());
+        let mut out = PeOverlayStructure::failed("pe_header_read_failed");
+        out.read_fault = Some(fault);
+        return out;
     }
     if &pe_header[0..4] != PE_SIGNATURE {
-        return Ok(empty_result(py, "pe_signature_not_found")?.unbind());
+        return PeOverlayStructure::failed("pe_signature_not_found");
     }
 
     let section_count = u16_le(&pe_header, 6) as u64;
@@ -137,7 +163,7 @@ pub(crate) fn inspect_pe_overlay_structure(
     let section_table_offset = pe_header_offset + 24 + optional_header_size;
     let section_table_size = section_count * SECTION_HEADER_SIZE as u64;
     if section_count == 0 || section_table_offset + section_table_size > actual_size {
-        return Ok(empty_result(py, "section_table_out_of_range")?.unbind());
+        return PeOverlayStructure::failed("section_table_out_of_range");
     }
 
     let mut section_table = vec![0; section_table_size as usize];
@@ -157,9 +183,9 @@ pub(crate) fn inspect_pe_overlay_structure(
             FieldLocation::Head,
         )
     }) {
-        let out = empty_result(py, "section_table_read_failed")?;
-        write_read_fault(&out, &fault)?;
-        return Ok(out.unbind());
+        let mut out = PeOverlayStructure::failed("section_table_read_failed");
+        out.read_fault = Some(fault);
+        return out;
     }
 
     let mut pe_end = 0u64;
@@ -173,21 +199,20 @@ pub(crate) fn inspect_pe_overlay_structure(
         }
     }
 
-    let result = empty_result(py, "")?;
-    result.set_item("is_pe", true)?;
-    result.set_item("pe_header_offset", pe_header_offset)?;
-    result.set_item("section_count", section_count)?;
-    result.set_item("overlay_offset", pe_end)?;
-    result.set_item("overlay_size", actual_size.saturating_sub(pe_end))?;
-    let evidence = PyList::new(py, ["pe:valid_headers"])?;
-    result.set_item("evidence", &evidence)?;
+    let mut result = PeOverlayStructure::default();
+    result.is_pe = true;
+    result.pe_header_offset = pe_header_offset;
+    result.section_count = section_count;
+    result.overlay_offset = pe_end;
+    result.overlay_size = actual_size.saturating_sub(pe_end);
+    result.evidence.push("pe:valid_headers");
 
     if pe_end == 0 || pe_end >= actual_size {
-        result.set_item("error", "overlay_not_found")?;
-        return Ok(result.unbind());
+        result.error = "overlay_not_found";
+        return result;
     }
-    result.set_item("has_overlay", true)?;
-    evidence.append("pe:overlay_present")?;
+    result.has_overlay = true;
+    result.evidence.push("pe:overlay_present");
 
     let sample_size = OVERLAY_SCAN_WINDOW_BYTES.min(actual_size - pe_end);
     let mut sample = vec![0; sample_size as usize];
@@ -207,52 +232,80 @@ pub(crate) fn inspect_pe_overlay_structure(
             FieldLocation::Body,
         )
     }) {
-        result.set_item("error", "overlay_sample_read_failed")?;
-        write_read_fault(&result, &fault)?;
-        return Ok(result.unbind());
+        result.error = "overlay_sample_read_failed";
+        result.read_fault = Some(fault);
+        return result;
     }
 
     let Some((archive_format, detected_ext, relative_offset)) = find_archive_magic(&sample) else {
-        result.set_item("error", "overlay_archive_magic_not_found")?;
-        return Ok(result.unbind());
+        result.error = "overlay_archive_magic_not_found";
+        return result;
     };
     let archive_offset = pe_end + relative_offset as u64;
-    result.set_item("archive_like", true)?;
-    result.set_item("error", "")?;
-    result.set_item("archive_offset", archive_offset)?;
-    result.set_item("offset_delta_from_overlay", relative_offset)?;
-    result.set_item("format", archive_format)?;
-    result.set_item("detected_ext", detected_ext)?;
-    result.set_item(
-        "confidence",
-        if relative_offset == 0 {
-            "strong"
-        } else {
-            "medium"
-        },
-    )?;
-    evidence.append(if relative_offset == 0 {
+    result.archive_like = true;
+    result.error = "";
+    result.archive_offset = archive_offset;
+    result.offset_delta_from_overlay = relative_offset as u64;
+    result.format = archive_format;
+    result.detected_ext = detected_ext;
+    result.confidence = if relative_offset == 0 {
+        "strong"
+    } else {
+        "medium"
+    };
+    result.evidence.push(if relative_offset == 0 {
         "overlay:archive_magic_at_start"
     } else {
         "overlay:archive_magic_near_start"
-    })?;
+    });
 
-    if detected_ext == ".zip" {
-        let zip_header = inspect_zip_local_header(py, path, archive_offset as i64)?;
-        let zip_bound = zip_header.bind(py);
-        result.set_item("zip_local_header", zip_bound)?;
-        let plausible = zip_bound
+    result
+}
+
+#[pyfunction]
+#[pyo3(signature = (path, file_size=None, magic_bytes=None))]
+pub(crate) fn inspect_pe_overlay_structure(
+    py: Python<'_>,
+    path: &str,
+    file_size: Option<i64>,
+    magic_bytes: Option<&[u8]>,
+) -> PyResult<Py<PyDict>> {
+    let facts = py.detach(|| inspect_pe_overlay_native(path, file_size, magic_bytes));
+    let result = empty_result(py, facts.error)?;
+    result.set_item("is_pe", facts.is_pe)?;
+    result.set_item("has_overlay", facts.has_overlay)?;
+    result.set_item("archive_like", facts.archive_like)?;
+    result.set_item("pe_header_offset", facts.pe_header_offset)?;
+    result.set_item("section_count", facts.section_count)?;
+    result.set_item("overlay_offset", facts.overlay_offset)?;
+    result.set_item("overlay_size", facts.overlay_size)?;
+    result.set_item("archive_offset", facts.archive_offset)?;
+    result.set_item("offset_delta_from_overlay", facts.offset_delta_from_overlay)?;
+    result.set_item("format", facts.format)?;
+    result.set_item("detected_ext", facts.detected_ext)?;
+    result.set_item("confidence", facts.confidence)?;
+    let evidence = PyList::new(py, facts.evidence)?;
+    result.set_item("evidence", &evidence)?;
+    if let Some(fault) = facts.read_fault {
+        write_read_fault(&result, &fault)?;
+    }
+    if facts.archive_like && facts.detected_ext == ".zip" {
+        let header = inspect_zip_local_header(py, path, facts.archive_offset as i64)?;
+        let plausible = header
+            .bind(py)
             .get_item("plausible")?
-            .and_then(|value| value.extract::<bool>().ok())
+            .and_then(|v| v.extract::<bool>().ok())
             .unwrap_or(false);
-        if plausible {
-            evidence.append("zip_local_header:plausible")?;
+        result.set_item("zip_local_header", header)?;
+        evidence.append(if plausible {
+            "zip_local_header:plausible"
         } else {
+            "zip_local_header:implausible"
+        })?;
+        if !plausible {
             result.set_item("confidence", "medium")?;
-            evidence.append("zip_local_header:implausible")?;
         }
     }
-
     Ok(result.unbind())
 }
 

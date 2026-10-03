@@ -10,8 +10,7 @@ pub(crate) use structure::{
 };
 pub(crate) use view::{
     clear_stream_structure_cache, confirm_format_identity, confirm_format_identity_native,
-    probe_rar_bytes, probe_rar_path, probe_rar_terminal_with_password, probe_rar_volume_paths,
-    release_stream_structure_cache_under_roots, AnalysisBinaryView, AnalysisMultiVolumeView,
-    NativeAnalysisConfig,
+    probe_rar_bytes, release_stream_structure_cache_under_roots, AnalysisBinaryView,
+    AnalysisMultiVolumeView, NativeAnalysisConfig,
 };
 pub(crate) use volume_anchor::probe_volume_anchors;

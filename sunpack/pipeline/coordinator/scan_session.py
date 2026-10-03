@@ -128,7 +128,7 @@ class DiscoveryScanSession:
             if discovered:
                 table.retry_relations(
                     snapshot.raw_native_snapshot,
-                    snapshot.native_snapshot,
+                    snapshot.file_route_view(FILESYSTEM_ROUTE_RELATIONS).native_snapshot,
                     [(str(path), str(password)) for path, password in discovered.items()],
                 )
         return table
