@@ -2,11 +2,12 @@
   <img src="sunpack.png" width="72" alt="SunPack">
 </p>
 <h1 align="center">SunPack</h1>
-<p align="center"><b>Automated archive processing for Windows, running quietly in the background.</b><br>
-Monitor folders without relying on a host application; automatically find, process, and verify archives, then move them to the Recycle Bin.<br>
-Binary-signature detection handles complex disguised archives. WAL crash recovery helps SunPack recover from power loss or process crashes.</p>
+<p align="center"><b>Automated archive processing for Windows, running quietly in the background</b><br>
+Monitor folders without relying on a host application; automatically find, process, and verify archives, then move them to the Recycle Bin<br>
+Binary-signature detection handles complex disguised archives. WAL crash recovery helps SunPack recover from power loss or process crashes<br>
+Rich, highly customizable automation options</p>
 
-<p align="center"><a href="README.md">简体中文</a> · <b>English</b></p>
+<p align="center"><a href="README.md">简体中文</a> · <b>English</b> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">Downloads</a></p>
 
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=Latest%20release" alt="Latest release"></a>
@@ -36,13 +37,14 @@ Binary-signature detection handles complex disguised archives. WAL crash recover
   - [Testing](#testing)
   - [Reproducible worker vs. 7-Zip benchmark](#reproducible-worker-vs-7-zip-benchmark)
 - [Notice](#notice)
+- [Contributing](#contributing)
 - [License](#license)
 
 ## Installation
 
 ### System requirements
 
-SunPack supports only Windows 10 version 1607 or later and Windows 11.
+SunPack supports only Windows 10 version 1607 or later and Windows 11. Watch mode only supports NTFS.
 
 Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Releases](https://github.com/Qinjingxue/Sunpack/releases/latest).
 
@@ -233,6 +235,10 @@ followed by the same metrics for `7z.exe`. The raw full-matrix report is
 | ZST              | 104.599          | 181.936            | 0.575      | 23.039                | 9.789                   | 2.354     |
 
 ---
+
+## Contributing
+
+Contributions are welcome. Use [GitHub Issues](https://github.com/Qinjingxue/Sunpack/issues) to report bugs or suggest improvements, and submit a [Pull Request](https://github.com/Qinjingxue/Sunpack/pulls) to help improve the project.
 
 ## License
 

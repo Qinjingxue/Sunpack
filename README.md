@@ -2,11 +2,12 @@
   <img src="sunpack.png" width="72" alt="SunPack">
 </p>
 <h1 align="center">SunPack</h1>
-<p align="center"><b>面向 Windows 的自动化压缩包处理工具，在后台安静运行。</b><br>
-无需依赖宿主软件，后台监控文件夹，自动发现、处理并校验压缩包，完成后移入回收站。<br>
-基于二进制特征识别，擅长处理复杂伪装压缩包；采用 WAL 崩溃恢复机制，应对断电或进程崩溃。</p>
+<p align="center"><b>面向 Windows 的自动化压缩包处理工具，在后台安静运行</b><br>
+无需依赖宿主软件，后台监控文件夹，自动发现、处理并校验压缩包，完成后移入回收站<br>
+基于二进制特征识别，擅长处理复杂伪装压缩包；采用 WAL 崩溃恢复机制，应对断电或进程崩溃<br>
+丰富可自定义的自动化处理配置</p>
 
-<p align="center"><b>简体中文</b> · <a href="README.en.md">English</a></p>
+<p align="center"><b>简体中文</b> · <a href="README.en.md">English</a> · <a href="https://github.com/Qinjingxue/Sunpack/releases/latest">下载</a></p>
 
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC" alt="最新版本"></a>
@@ -36,13 +37,14 @@
   - [测试](#测试)
   - [可复现的 worker 与 7-Zip 对比测试](#可复现的-worker-与-7-zip-对比测试)
 - [注意事项](#注意事项)
+- [参与贡献](#参与贡献)
 - [许可证](#许可证)
 
 ## 安装说明
 
 ### 系统要求
 
-SunPack 仅支持 Windows 10 版本 1607 及更高版本和 Windows 11。
+SunPack 仅支持 Windows 10 版本 1607 及更高版本和 Windows 11。其中Watch模式仅支持NTFS文件系统。
 
 从 [GitHub Releases](https://github.com/Qinjingxue/Sunpack/releases/latest) 下载最新的 `sunpack-windows-<arch>-<version>-setup.exe`
 
@@ -220,6 +222,10 @@ uv run --locked pytest
 | ZST            | 104.599           | 181.936             | 0.575  | 23.039                 | 9.789                    | 2.354  |
 
 ---
+
+## 参与贡献
+
+欢迎通过 [GitHub Issues](https://github.com/Qinjingxue/Sunpack/issues) 报告问题、提出建议，也欢迎提交 [Pull Request](https://github.com/Qinjingxue/Sunpack/pulls) 改进项目。
 
 ## 许可证
 
