@@ -285,15 +285,47 @@ struct DirectoryNameIndex {
 
 #[derive(Debug, Default)]
 struct DirectoryNameEntry {
+    row_index: usize,
     parsed: Vec<ParsedVolume>,
     interpretations: HashMap<String, Vec<NameInterpretation>>,
 }
 
 impl DirectoryNameIndex {
-    fn build(rows: &[RelationInput]) -> Self {
+    fn build(rows: &[RelationInput], filtered_keys: Option<&HashSet<String>>) -> Self {
+        // Ordinary files need no relation name objects. Include standalone
+        // RAR SFX seeds for the existing physical byte-split escalation.
+        let mut seed_stems: HashSet<String> = rows
+            .iter()
+            .filter(|row| {
+                row.anchor.as_ref().is_some_and(|anchor| {
+                    cheap_seed_strength(anchor).is_some()
+                        || (!anchor.standalone && (anchor.multivolume || anchor.needs_password))
+                        || (anchor.format == "rar" && anchor.sfx && anchor.pe_structure)
+                })
+            })
+            .map(|row| first_dot_stem(&row.name).to_ascii_lowercase())
+            .collect();
+        if seed_stems.is_empty() {
+            return Self::default();
+        }
+        if let Some(filtered_keys) = filtered_keys {
+            seed_stems = rows
+                .iter()
+                .filter(|row| filtered_keys.contains(&row.path_key))
+                .map(|row| first_dot_stem(&row.name).to_ascii_lowercase())
+                .filter(|stem| seed_stems.contains(stem))
+                .collect();
+        }
+        let mut rows_by_stem: HashMap<String, Vec<usize>> = HashMap::new();
         let entries_by_path = rows
             .iter()
-            .map(|row| {
+            .enumerate()
+            .filter_map(|(index, row)| {
+                let stem = first_dot_stem(&row.name).to_ascii_lowercase();
+                if !seed_stems.contains(&stem) {
+                    return None;
+                }
+                rows_by_stem.entry(stem).or_default().push(index);
                 let mut parsed = parse_volume_candidates(&row.name);
                 // Loose partN spellings are only hypotheses for a structurally
                 // identified RAR volume (or password-blocked RAR headers),
@@ -324,27 +356,27 @@ impl DirectoryNameIndex {
                         )
                     })
                     .collect();
-                (
+                Some((
                     row.path_key.clone(),
                     DirectoryNameEntry {
+                        row_index: index,
                         parsed,
                         interpretations,
                     },
-                )
+                ))
             })
             .collect();
-        let mut rows_by_stem: HashMap<String, Vec<usize>> = HashMap::new();
-        for (index, row) in rows.iter().enumerate() {
-            rows_by_stem
-                .entry(first_dot_stem(&row.name).to_ascii_lowercase())
-                .or_default()
-                .push(index);
-        }
         Self {
             entries_by_path,
             rows_by_stem,
             rows_by_family: HashMap::new(),
         }
+    }
+
+    fn row<'a>(&self, rows: &'a [RelationInput], path: &str) -> Option<&'a RelationInput> {
+        self.entries_by_path
+            .get(&path.to_ascii_lowercase())
+            .map(|entry| &rows[entry.row_index])
     }
 
     fn rows_for_prefix<'a>(
@@ -361,7 +393,9 @@ impl DirectoryNameIndex {
 
     fn index_families(&mut self, rows: &[RelationInput]) {
         for (index, row) in rows.iter().enumerate() {
-            let entry = &self.entries_by_path[&row.path_key];
+            let Some(entry) = self.entries_by_path.get(&row.path_key) else {
+                continue;
+            };
             for (format, values) in &entry.interpretations {
                 for value in values {
                     let members = self
@@ -431,8 +465,8 @@ impl DirectoryNameIndex {
     }
 
     /// Widen names only after a concrete archive seed exists. Competing
-    /// formats or heads keep the existing scheme/prefix interpretations;
-    /// opaque members must never be assigned by trying path combinations.
+    /// seeds use bounded suffix discriminators alongside existing schemes;
+    /// never try combinations of physical paths.
     fn match_seed_buckets(&mut self, rows: &[RelationInput], strengths: &[Option<&str>]) {
         for (stem, indexes) in &self.rows_by_stem {
             if stem.is_empty() {
@@ -464,6 +498,7 @@ impl DirectoryNameIndex {
                         || anchor.evidence.contains(&"zip:eocd_split_terminal"));
             }
             if formats.len() != 1 || heads > 1 {
+                match_competing_suffixes(rows, indexes, strengths, &mut self.entries_by_path);
                 continue;
             }
             let format = *formats.iter().next().expect("one concrete format");
@@ -602,6 +637,130 @@ impl DirectoryNameIndex {
             .and_then(|entry| entry.interpretations.get(target_format))
             .map(Vec::as_slice)
             .unwrap_or(&[])
+    }
+}
+
+// Existing numbering schemes keep their interpretations. For otherwise
+// opaque names, first distinguish the text preceding the volume number;
+// only colliding prefixes require the full suffix with that number erased.
+fn match_competing_suffixes(
+    rows: &[RelationInput],
+    indexes: &[usize],
+    strengths: &[Option<&str>],
+    entries: &mut HashMap<String, DirectoryNameEntry>,
+) {
+    // A declared scheme can itself collide (e.g. part1.alpha/part1.beta).
+    // Refine only those prefixes; intact declared families keep their rules.
+    let mut crowded = HashMap::<String, usize>::new();
+    for index in indexes {
+        let row = &rows[*index];
+        if strengths[*index].is_some() {
+            if let Some(part) = entries[&row.path_key]
+                .parsed
+                .iter()
+                .find(|part| part.number == 1)
+            {
+                *crowded
+                    .entry(logical_name_from_parsed(part).to_ascii_lowercase())
+                    .or_default() += 1;
+            }
+        }
+    }
+    crowded.retain(|_, heads| *heads > 1);
+    let refinable = |entry: &DirectoryNameEntry| {
+        entry.parsed.is_empty()
+            || entry.parsed.iter().any(|part| {
+                crowded.contains_key(&logical_name_from_parsed(part).to_ascii_lowercase())
+            })
+    };
+    let mut prefixes: HashMap<String, Option<&str>> = HashMap::new();
+    let mut shapes: HashMap<String, Option<&str>> = HashMap::new();
+    for index in indexes {
+        let row = &rows[*index];
+        let Some(anchor) = row.anchor.as_ref().filter(|_| strengths[*index].is_some()) else {
+            continue;
+        };
+        let entry = &entries[&row.path_key];
+        if !matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
+            || !refinable(entry)
+            || entry
+                .parsed
+                .first()
+                .map(|part| part.number)
+                .or_else(|| suffix_volume_number(&row.name, anchor.internal_volume_number))
+                != Some(1)
+        {
+            continue;
+        }
+        for (groups, full) in [(&mut prefixes, false), (&mut shapes, true)] {
+            if let Some(key) = suffix_discriminator(&row.name, 1, full) {
+                groups
+                    .entry(key)
+                    .and_modify(|owner| *owner = None)
+                    .or_insert(Some(&anchor.format));
+            }
+        }
+    }
+    if prefixes.is_empty() {
+        return;
+    }
+    for index in indexes {
+        let row = &rows[*index];
+        let entry = &entries[&row.path_key];
+        if !row.relation_member_eligible
+            || !refinable(entry)
+            || row.anchor.as_ref().is_some_and(|anchor| anchor.standalone)
+        {
+            continue;
+        }
+        let Some(number) = entry.parsed.first().map(|part| part.number).or_else(|| {
+            suffix_volume_number(
+                &row.name,
+                row.anchor
+                    .as_ref()
+                    .and_then(|anchor| anchor.internal_volume_number),
+            )
+        }) else {
+            continue;
+        };
+        let Some(prefix) = suffix_discriminator(&row.name, number, false) else {
+            continue;
+        };
+        let (key, format) = match prefixes.get(&prefix) {
+            Some(Some(format)) => (prefix, *format),
+            Some(None) => {
+                let Some(shape) = suffix_discriminator(&row.name, number, true) else {
+                    continue;
+                };
+                let Some(Some(format)) = shapes.get(&shape) else {
+                    continue;
+                };
+                (shape, *format)
+            }
+            None => continue,
+        };
+        if row
+            .anchor
+            .as_ref()
+            .is_some_and(|anchor| !anchor.format.is_empty() && anchor.format != format)
+        {
+            continue;
+        }
+        let values = entries
+            .get_mut(&row.path_key)
+            .expect("indexed row")
+            .interpretations
+            .get_mut(format)
+            .expect("indexed format");
+        values.clear();
+        values.push(NameInterpretation {
+            format: format.to_string(),
+            prefix: key,
+            number,
+            style: "suffix_discriminator".to_string(),
+            width: 3,
+            decorated: true,
+        });
     }
 }
 
@@ -770,7 +929,7 @@ fn build_candidate_groups_from_physical(
             }
         }
 
-        let mut name_index = DirectoryNameIndex::build(&directory_rows);
+        let mut name_index = DirectoryNameIndex::build(&directory_rows, Some(filtered_keys));
         let sfx_split_heads: Vec<String> = directory_rows
             .iter()
             .filter(|row| is_weak_sfx_split_head(row, &name_index))
@@ -783,9 +942,7 @@ fn build_candidate_groups_from_physical(
             let upgraded: HashMap<String, VolumeAnchor> = deep_anchors
                 .into_iter()
                 .filter_map(|anchor| {
-                    let row = directory_rows
-                        .iter()
-                        .find(|row| row.path.eq_ignore_ascii_case(&anchor.path))?;
+                    let row = name_index.row(&directory_rows, &anchor.path)?;
                     is_strong_multivolume_first_seed(row, &name_index, &anchor)
                         .then_some((anchor.path.to_ascii_lowercase(), anchor))
                 })
@@ -797,7 +954,7 @@ fn build_candidate_groups_from_physical(
             }
             // The name index stores the anchor-sensitive interpretations, so
             // rebuild it after an MZ seed has been promoted by structure.
-            name_index = DirectoryNameIndex::build(&directory_rows);
+            name_index = DirectoryNameIndex::build(&directory_rows, Some(filtered_keys));
         }
         let mut strong_suppressed_paths = HashSet::new();
         let mut proposals = Vec::new();
@@ -809,11 +966,6 @@ fn build_candidate_groups_from_physical(
             .collect();
         name_index.match_seed_buckets(&directory_rows, &seed_strengths);
         name_index.index_families(&directory_rows);
-        let triggered_stems: HashSet<String> = directory_rows
-            .iter()
-            .filter(|row| filtered_keys.contains(&row.path.to_ascii_lowercase()))
-            .map(|row| first_dot_stem(&row.name).to_ascii_lowercase())
-            .collect();
         let mut seeded_families = HashSet::new();
         for (seed_index, strength) in seed_strengths
             .iter()
@@ -821,7 +973,7 @@ fn build_candidate_groups_from_physical(
             .filter_map(|(index, strength)| (*strength).map(|strength| (index, strength)))
         {
             let seed = &directory_rows[seed_index];
-            if !triggered_stems.contains(&first_dot_stem(&seed.name).to_ascii_lowercase()) {
+            if !name_index.entries_by_path.contains_key(&seed.path_key) {
                 continue;
             }
             let Some(anchor) = seed.anchor.as_ref() else {
@@ -845,7 +997,14 @@ fn build_candidate_groups_from_physical(
                     // Only a concrete multi-file proposal suppresses standalone
                     // fallback. Compute ownership once per family, not per seed.
                     if strength == "strong" {
-                        strong_suppressed_paths.extend(proposal_owned_paths(&proposal));
+                        // Unverified companions retain their standalone path.
+                        // Only a validated relation may claim a launcher.
+                        strong_suppressed_paths.extend(
+                            proposal
+                                .volumes
+                                .iter()
+                                .map(|part| part.0.to_ascii_lowercase()),
+                        );
                     }
                     proposals.push(proposal);
                 }
@@ -895,6 +1054,7 @@ fn build_candidate_groups_from_physical(
                 py,
                 proposal,
                 &directory_rows,
+                &name_index,
                 path_passwords,
             )?);
         }
@@ -1582,14 +1742,12 @@ fn make_name_proposal(
         // proposal turn that seed into a watch-dispatchable split candidate
         // before the remaining volumes arrive.
         && !volumes.iter().any(|(path, _, _, _, _)| {
-            rows.iter()
-                .find(|row| row.path.eq_ignore_ascii_case(path))
+            name_index.row(rows, path)
                 .and_then(|row| row.anchor.as_ref())
                 .is_some_and(|anchor| anchor.sfx)
         })
         && volumes.iter().all(|(path, _, _, _, _)| {
-            rows.iter()
-                .find(|row| row.path.eq_ignore_ascii_case(path))
+            name_index.row(rows, path)
                 .and_then(|row| row.anchor.as_ref())
                 .is_some_and(|anchor| {
                     anchor.format == "rar"
@@ -1617,9 +1775,30 @@ fn make_name_proposal(
         .find(|style| *style != "structural_name")
         .map(str::to_owned)
         .unwrap_or_else(|| seed_interpretation.style.clone());
+    // The discriminator is an internal grouping key. Preserve the existing
+    // physical format styles used by validation and archive input planning.
+    let (logical_name, style) = if style == "suffix_discriminator" {
+        let head = name_index
+            .row(rows, &volumes[0].0)
+            .and_then(|row| row.anchor.as_ref());
+        let physical_style = match seed_interpretation.format.as_str() {
+            "rar" if head.is_some_and(|anchor| anchor.sfx) => "rar_sfx_part",
+            "rar" => "rar_part",
+            "zip" if head.is_some_and(|anchor| anchor.evidence.contains(&"zip:split_marker")) => {
+                "zip_spanned"
+            }
+            _ => "numeric_suffix",
+        };
+        (
+            first_dot_stem(&seed_interpretation.prefix).to_string(),
+            physical_style.to_string(),
+        )
+    } else {
+        (seed_interpretation.prefix.clone(), style)
+    };
     Some(RelationProposal {
         format: seed_interpretation.format.clone(),
-        logical_name: seed_interpretation.prefix.clone(),
+        logical_name,
         style,
         volumes,
         companions,
@@ -1739,12 +1918,15 @@ fn validate_relation_proposal(
     py: Python<'_>,
     mut proposal: RelationProposal,
     rows: &[RelationInput],
+    name_index: &DirectoryNameIndex,
     path_passwords: Option<&[(String, String)]>,
 ) -> PyResult<ProposalValidation> {
     let companion_candidates = std::mem::take(&mut proposal.companions);
-    let mut anchors: HashMap<String, VolumeAnchor> = rows
+    let mut anchors: HashMap<String, VolumeAnchor> = proposal
+        .volumes
         .iter()
-        .filter_map(|row| {
+        .filter_map(|part| {
+            let row = name_index.row(rows, &part.0)?;
             row.anchor
                 .clone()
                 .map(|anchor| (row.path.to_ascii_lowercase(), anchor))
@@ -1800,7 +1982,9 @@ fn validate_relation_proposal(
 
     let status = match proposal.format.as_str() {
         "rar" => validate_rar_proposal(py, &proposal, &anchors, path_passwords),
-        "7z" => Ok(validate_seven_zip_proposal(&proposal, &anchors, rows)),
+        "7z" => Ok(validate_seven_zip_proposal(
+            &proposal, &anchors, rows, name_index,
+        )),
         "zip" => validate_zip_proposal(py, &proposal, &anchors),
         _ => Ok(ProposalStatus::Unsupported),
     }?;
@@ -2042,6 +2226,7 @@ fn validate_seven_zip_proposal(
     proposal: &RelationProposal,
     anchors: &HashMap<String, VolumeAnchor>,
     rows: &[RelationInput],
+    name_index: &DirectoryNameIndex,
 ) -> ProposalStatus {
     let Some((first_path, _, _, _, _)) = proposal
         .volumes
@@ -2073,8 +2258,8 @@ fn validate_seven_zip_proposal(
         .volumes
         .iter()
         .filter_map(|(path, _, _, _, _)| {
-            rows.iter()
-                .find(|row| row.path.eq_ignore_ascii_case(path))
+            name_index
+                .row(rows, path)
                 .and_then(|row| row.size)
                 .or_else(|| {
                     anchors
@@ -3463,6 +3648,45 @@ fn first_dot_stem(name: &str) -> &str {
     name.split_once('.').map(|(stem, _)| stem).unwrap_or(name)
 }
 
+fn suffix_discriminator(name: &str, number: u32, full: bool) -> Option<String> {
+    let mut position = name.find('.')? + 1;
+    let bytes = name.as_bytes();
+    let mut copied = 0;
+    let mut key = String::new();
+    while position < bytes.len() {
+        if !bytes[position].is_ascii_digit() {
+            position += 1;
+            continue;
+        }
+        let start = position;
+        while position < bytes.len() && bytes[position].is_ascii_digit() {
+            position += 1;
+        }
+        if name[start..position].parse::<u32>().ok() != Some(number)
+            || (position == start + 1
+                && bytes[start] == b'7'
+                && bytes
+                    .get(position)
+                    .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'z')))
+        {
+            continue;
+        }
+        if !full {
+            return Some(name[..start].to_ascii_lowercase());
+        }
+        key.push_str(&name[copied..start]);
+        // NUL cannot occur in physical Windows names, so this is an internal
+        // separator rather than a potentially colliding filename character.
+        key.push('\0');
+        copied = position;
+    }
+    if copied == 0 {
+        return None;
+    }
+    key.push_str(&name[copied..]);
+    Some(key.to_ascii_lowercase())
+}
+
 /// Filename hints order a seeded proposal; they never prove an archive.
 /// Prefer explicit numbering parsed above, then accept one distinct ASCII
 /// integer. A structural number may disambiguate decorations, but cannot
@@ -3483,13 +3707,16 @@ fn suffix_volume_number(name: &str, structural: Option<u32>) -> Option<u32> {
             continue;
         }
         let start = position;
-        let mut value = 0u32;
+        let mut value = Some(0u32);
         while position < suffix.len() && suffix[position].is_ascii_digit() {
             value = value
-                .checked_mul(10)?
-                .checked_add(u32::from(suffix[position] - b'0'))?;
+                .and_then(|value| value.checked_mul(10))
+                .and_then(|value| value.checked_add(u32::from(suffix[position] - b'0')));
             position += 1;
         }
+        let Some(value) = value.filter(|value| *value > 0) else {
+            continue;
+        };
         if value == 7
             && position == start + 1
             && suffix
@@ -3497,9 +3724,6 @@ fn suffix_volume_number(name: &str, structural: Option<u32>) -> Option<u32> {
                 .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'z'))
         {
             continue;
-        }
-        if value == 0 {
-            return None;
         }
         matches_structure |= structural == Some(value);
         ambiguous |= number.is_some_and(|previous| previous != value);
@@ -3651,6 +3875,10 @@ mod tests {
             ("name.chunk2.build2026", Some(2), Some(2)),
             ("name.chunk3", Some(2), None),
             ("name.chunk0", None, None),
+            ("name.foo0.chunk2", None, Some(2)),
+            ("name.foo0.chunk2", Some(2), Some(2)),
+            ("name.chunk4294967296.chunk2", None, Some(2)),
+            ("name.chunk4294967296.chunk2", Some(2), Some(2)),
             ("name.chunk4294967296", None, None),
             ("name.chunk4294967295", None, Some(u32::MAX)),
         ] {
@@ -3664,6 +3892,85 @@ mod tests {
         assert!(!proposal_has_gap(&validation.proposal));
         validation.proposal.volumes[1].1 = u32::MAX;
         assert!(proposal_has_gap(&validation.proposal));
+    }
+
+    #[test]
+    fn name_index_omits_ordinary_and_unselected_buckets() {
+        let mut rows: Vec<RelationInput> = (0..100_000)
+            .map(|number| test_relation_row(&format!("plain{number}.bin"), None))
+            .collect();
+        assert!(DirectoryNameIndex::build(&rows, None)
+            .entries_by_path
+            .is_empty());
+        rows.push(test_relation_row("selected.chunk1.bin", Some("7z")));
+        rows.push(test_relation_row("selected.chunk2.bin", None));
+        rows.push(test_relation_row("unselected.chunk1.bin", Some("zip")));
+        let keys = HashSet::from([rows[100_001].path_key.clone()]);
+        let mut index = DirectoryNameIndex::build(&rows, Some(&keys));
+        index.index_families(&rows);
+        assert_eq!(index.entries_by_path.len(), 2);
+        assert_eq!(index.rows_by_stem.len(), 1);
+        assert_eq!(
+            index.row(&rows, "SELECTED.CHUNK2.BIN").unwrap().size,
+            Some(100)
+        );
+        assert!(index.row(&rows, "unselected.chunk1.bin").is_none());
+    }
+
+    #[test]
+    fn competing_suffixes_escalate_only_colliding_prefixes() {
+        for names in [
+            [
+                "same.alpha.chunk1.bin",
+                "same.alpha.chunk2.bin",
+                "same.beta.chunk1.bin",
+                "same.beta.chunk2.bin",
+            ],
+            [
+                "same.chunk1.alpha",
+                "same.chunk2.alpha",
+                "same.chunk1.beta",
+                "same.chunk2.beta",
+            ],
+            [
+                "same.part1.alpha",
+                "same.part2.alpha",
+                "same.part1.beta",
+                "same.part2.beta",
+            ],
+        ] {
+            let rows: Vec<_> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| test_relation_row(name, (index % 2 == 0).then_some("7z")))
+                .collect();
+            let mut index = DirectoryNameIndex::build(&rows, None);
+            let strengths = vec![Some("strong"), None, Some("strong"), None];
+            index.match_seed_buckets(&rows, &strengths);
+            index.index_families(&rows);
+            let first = &index.interpretations(&rows[0], "7z")[0];
+            let other = &index.interpretations(&rows[2], "7z")[0];
+            assert_ne!(first.prefix, other.prefix);
+            assert_eq!(index.rows_for_family(&rows, first).count(), 2);
+            assert_eq!(index.rows_for_family(&rows, other).count(), 2);
+        }
+    }
+
+    fn test_relation_row(name: &str, format: Option<&str>) -> RelationInput {
+        RelationInput {
+            path: name.to_string(),
+            path_key: name.to_ascii_lowercase(),
+            name: name.to_string(),
+            size: Some(100),
+            relation_member_eligible: true,
+            anchor: format.map(|format| VolumeAnchor {
+                format: format.to_string(),
+                confidence: "strong".to_string(),
+                multivolume: true,
+                anchor_roles: vec!["first"],
+                ..VolumeAnchor::default()
+            }),
+        }
     }
 
     #[test]
@@ -3717,7 +4024,7 @@ mod tests {
                     ..VolumeAnchor::default()
                 }),
             };
-            let index = DirectoryNameIndex::build(std::slice::from_ref(&row));
+            let index = DirectoryNameIndex::build(std::slice::from_ref(&row), None);
             assert_eq!(
                 !index.candidates(&row).is_empty(),
                 multivolume || needs_password
@@ -3830,7 +4137,7 @@ mod tests {
                 ..VolumeAnchor::default()
             }),
         };
-        let index = DirectoryNameIndex::build(std::slice::from_ref(&row));
+        let index = DirectoryNameIndex::build(std::slice::from_ref(&row), None);
         assert!(is_weak_sfx_split_head(&row, &index));
     }
 
@@ -3864,7 +4171,7 @@ mod tests {
                 anchor: None,
             },
         ];
-        let index = DirectoryNameIndex::build(&rows);
+        let index = DirectoryNameIndex::build(&rows, None);
 
         assert_eq!(
             seed_strength_for_row(&rows[0], &rows, &index),

@@ -77,7 +77,9 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
 
 
 @pytest.mark.parametrize("archive_format", ("7z", "zip", "rar"))
-@pytest.mark.parametrize("name_style", ("format_number", "number_only", "extensionless_head"))
+@pytest.mark.parametrize("name_style", (
+    "format_number", "number_only", "extensionless_head", "invalid_number_noise",
+))
 def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     tmp_path, archive_format, name_style
 ):
@@ -103,6 +105,8 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
         number = _source_volume_number(source.name, index)
         if name_style == "extensionless_head" and number == 1:
             target_name = "shared"
+        elif name_style == "invalid_number_noise":
+            target_name = f"shared.zero0.build4294967296.chunk{number}.opaque"
         elif name_style != "format_number":
             target_name = f"shared.noise{index}.chunk{number}.opaque"
         elif archive_format == "rar":
@@ -159,7 +163,9 @@ def test_same_stem_opaque_members_with_competing_formats_are_not_guessed(tmp_pat
         paths = []
         for index, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
             number = _source_volume_number(source.name, index)
-            target = mixed / f"shared.source-{archive_format}.chunk{number}.opaque"
+            # Every part changes its text prefix, so neither suffix
+            # discriminator provides a stable family for the opaque tails.
+            target = mixed / f"shared.noise{chr(96 + number)}.source-{archive_format}.chunk{number}.opaque"
             source.rename(target)
             paths.append(target)
         paths_by_format[archive_format] = paths
@@ -171,28 +177,85 @@ def test_same_stem_opaque_members_with_competing_formats_are_not_guessed(tmp_pat
         ) is None
 
 
-def test_same_format_heads_with_shared_stem_keep_their_specific_prefixes(tmp_path):
+@pytest.mark.parametrize("formats", [("7z", "7z"), ("7z", "zip"), ("7z", "rar")])
+@pytest.mark.parametrize("name_style", ["standard", "prefix", "shape", "marker_shape"])
+def test_competing_heads_with_shared_stem_use_suffix_discriminators(tmp_path, formats, name_style):
     mixed = tmp_path / "mixed"
     mixed.mkdir()
     sets = []
-    for label in ("alpha", "beta"):
+    cases = []
+    for label, archive_format in zip(("alpha", "beta"), formats):
         case = ArchiveFixtureFactory().create(
-            tmp_path, label, "7z", split=True,
+            tmp_path, label, archive_format, split=True,
             payload_size=MIB, split_volume_size=MIB // 4,
         )
         paths = []
         for index, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
             number = _source_volume_number(source.name, index)
-            target = mixed / f"shared.{label}.7z.{number:03d}.opaque"
+            if name_style == "standard":
+                name = f"shared.{label}.{archive_format}.{number:03d}.opaque"
+            elif name_style == "prefix":
+                name = f"shared.{label}.chunk{number}.opaque"
+            elif name_style == "marker_shape":
+                name = f"shared.part{number}.{label}.opaque"
+            else:
+                name = f"shared.chunk{number}.{label}.opaque"
+            target = mixed / name
             source.rename(target)
             paths.append(target)
         sets.append(paths)
+        cases.append(case)
 
     all_paths = [str(path) for paths in sets for path in paths]
-    for paths in sets:
-        group = RelationsScheduler().resolve_volume_once([str(paths[0])], all_paths, format_hint="7z")
+    for paths, archive_format, case in zip(sets, formats, cases):
+        group = RelationsScheduler().resolve_volume_once(
+            [str(paths[0])], all_paths, format_hint=archive_format,
+        )
         assert group is not None
         assert set(group.input_paths) == {str(path) for path in paths}
+        tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+        assert len(tasks) == 1
+        planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
+        assert len(planned) == 1
+        output = tmp_path / "outputs" / case.case_id
+        extractor = ExtractionScheduler(max_retries=0)
+        try:
+            result = extractor.extract(planned[0], str(output))
+        finally:
+            extractor.close()
+        assert result.success is True, result.error
+        assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
+@pytest.mark.parametrize("sfx_format", ["7z", "rar"])
+@pytest.mark.parametrize("failed_relation", ["incomplete", "rejected"])
+def test_failed_split_relation_preserves_standalone_sfx(tmp_path, sfx_format, failed_relation):
+    factory = ArchiveFixtureFactory()
+    standalone = factory.create(tmp_path, "standalone", sfx_format, sfx=True, payload_size=MIB)
+    split = factory.create(tmp_path, "split", "7z", split=True,
+        payload_size=MIB, split_volume_size=MIB // 4)
+    mixed = tmp_path / "mixed"
+    mixed.mkdir()
+    launcher = mixed / "shared.exe"
+    standalone.entry_path.rename(launcher)
+    parts = sorted(split.archive_dir.iterdir())
+    parts[0].rename(mixed / "shared.7z.001")
+    if failed_relation == "incomplete":
+        parts[1].rename(mixed / "shared.7z.002")
+    else:
+        oversized = factory.create(tmp_path, "oversized", "7z", split=True,
+            payload_size=4 * MIB, split_volume_size=2 * MIB)
+        sorted(oversized.archive_dir.iterdir())[0].rename(mixed / "shared.7z.002")
+
+    config = make_config({"filesystem": {"scan_filters": []}})
+    groups = RelationsScheduler().build_candidate_groups(
+        DirectoryScanner(str(mixed), config=config).scan(),
+    )
+    matches = [group for group in groups if group.head_path == str(launcher)]
+    assert len(matches) == 1
+    assert matches[0].kind == "file"
+    assert matches[0].input_paths == [str(launcher)]
+    assert matches[0].head_metadata["relation_confirmed"] is True
 
 
 def test_password_blocked_seed_cannot_share_opaque_members_with_another_format(tmp_path):
@@ -490,7 +553,8 @@ def test_structure_resolution_rejects_current_paths_from_different_directories(
 
 
 @pytest.mark.skipif(get_optional_winrar() is None, reason="WinRAR is required to generate modern split ZIP")
-def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path):
+@pytest.mark.parametrize("opaque_competition", [False, True])
+def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, opaque_competition):
     winrar = get_optional_winrar()
     assert winrar is not None
     source = tmp_path / "source"
@@ -525,9 +589,17 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path):
     for source_part in parts:
         suffix = source_part.suffix.lower()
         marker = suffix.removeprefix(".")
-        target = mixed / f"shared.alpha.{marker}.useless.{len(renamed)}.fake"
+        name = (f"shared.chunk{len(renamed) + 1}.zipdata.bin" if opaque_competition
+            else f"shared.alpha.{marker}.useless.{len(renamed)}.fake")
+        target = mixed / name
         source_part.replace(target)
         renamed.append(target)
+
+    if opaque_competition:
+        other = ArchiveFixtureFactory().create(tmp_path, "other", "7z", split=True,
+            payload_size=MIB, split_volume_size=MIB // 4)
+        for number, part in enumerate(sorted(other.archive_dir.iterdir()), start=1):
+            part.rename(mixed / f"shared.chunk{number}.sevendata.bin")
 
     config = normalize_config(
         with_detection_pipeline(
@@ -542,23 +614,24 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path):
     )
     tasks = ArchiveTaskProvider(config).scan_targets([str(mixed)])
 
-    assert len(tasks) == 1
-    assert tasks[0].discovery_source == "relations"
-    descriptor = tasks[0].archive_input()
+    assert len(tasks) == (2 if opaque_competition else 1)
+    zip_tasks = [task for task in tasks if task.archive_input().format_hint == "zip"]
+    assert len(zip_tasks) == 1
+    task = zip_tasks[0]
+    assert task.discovery_source == "relations"
+    descriptor = task.archive_input()
     assert descriptor.volume_style == "zip_spanned"
     assert [part.volume_number for part in descriptor.parts] == [1, 2, 3, 4]
     assert [part.role for part in descriptor.parts] == ["first", "member", "member", "terminal"]
+    logical = "shared" if opaque_competition else "shared.alpha"
     assert [part.canonical_name for part in descriptor.parts] == [
-        "shared.alpha.z01",
-        "shared.alpha.z02",
-        "shared.alpha.z03",
-        "shared.alpha.zip",
+        f"{logical}.z01", f"{logical}.z02", f"{logical}.z03", f"{logical}.zip",
     ]
 
     extractor = ExtractionScheduler(max_retries=0)
     output = tmp_path / "output"
     try:
-        extraction = extractor.extract(tasks[0], str(output))
+        extraction = extractor.extract(task, str(output))
     finally:
         extractor.close()
 
