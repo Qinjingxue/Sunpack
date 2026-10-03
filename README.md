@@ -12,6 +12,10 @@
   <a href="https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Qinjingxue/Sunpack" alt="MIT License"></a>
 </p>
 
+<p align="center">
+  <img src="sunpack_zh.gif" width="80%" alt="SunPack demo">
+</p>
+
 ---
 
 ## 内容导航
