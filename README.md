@@ -1,244 +1,235 @@
-# SunPack
+<p align="center">
+  <img src="sunpack.png" width="72" alt="SunPack">
+</p>
+<h1 align="center">SunPack</h1>
+<p align="center"><b>面向 Windows 的自动化压缩包处理工具，在后台安静运行。</b><br>
+无需依赖宿主软件，后台监控文件夹，自动发现、处理并校验压缩包，完成后移入回收站。<br>
+基于二进制特征识别，擅长处理复杂伪装压缩包；采用 WAL 崩溃恢复机制，应对断电或进程崩溃。</p>
 
-**English** | [简体中文](README.zh-CN.md)
+<p align="center"><b>简体中文</b> · <a href="README.en.md">English</a></p>
 
-**SunPack is a Windows-only automated archive processing tool that supports command-line, Watch monitoring, and Explorer context-menu invocation.**
-
-It supports 7z, RAR, ZIP, and other formats, with experimental support for XZ, BZip2, Gzip, TAR, and Zstandard. It handles multi-volume archives, self-extracting archives, and archives embedded in invalid data.
-
-SunPack identifies archives by binary signatures rather than file extensions, and tolerates messy extensions and incomplete file names.
-
----
-
-## Contents
-
-- [Installation](#installation)
-- [Usage guide](#usage-guide)
-  - [Command overview](#command-overview)
-  - [Password management](#password-management)
-- [Core capabilities](#core-capabilities)
-  - [Recursive processing](#recursive-processing)
-  - [Post-processing](#post-processing)
-  - [Watch mode monitoring system](#watch-mode-monitoring-system)
-  - [Robustness and WAL crash recovery](#robustness-and-wal-crash-recovery)
-  - [High concurrency and speed optimization](#high-concurrency-and-speed-optimization)
-  - [Low background resource usage](#low-background-resource-usage)
-- [Configuration](#configuration)
-- [Development and testing](#development-and-testing)
-  - [Development](#development)
-  - [Architecture at a glance](#architecture-at-a-glance)
-  - [Testing](#testing)
-  - [Reproducible worker vs. 7-Zip benchmark](#reproducible-worker-vs-7-zip-benchmark)
-- [Notice](#notice)
-- [License](#license)
-
-## Installation
-
-### System requirements
-
-SunPack supports only Windows 10 version 1607 or later and Windows 11.
-
-Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Releases](https://github.com/Qinjingxue/Sunpack/releases/latest).
-
-1. Pick the installer that matches your system architecture: `x64` for Intel/AMD 64-bit Windows, `arm64` for Windows on ARM.
-2. Run the installer and accept the UAC elevation prompt. It installs to `C:\Program Files\SunPack` by default; installing the Watch Broker service requires administrator privileges.
-3. Choose the optional items in the setup wizard as needed:
-   - Add the installation directory to the machine `PATH`. Reopen PowerShell after the installation completes.
-   - Register the Explorer context menu for folders and folder backgrounds.
-   - Start SunPack Watch with Windows (disabled by default).
+<p align="center">
+  <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC" alt="最新版本"></a>
+  <a href="https://github.com/Qinjingxue/Sunpack/actions/workflows/release.yml"><img src="https://github.com/Qinjingxue/Sunpack/actions/workflows/release.yml/badge.svg" alt="构建与测试"></a>
+  <img src="https://img.shields.io/badge/平台-Windows%20%E4%B8%93%E7%94%A8-2f6070" alt="Windows 专用">
+  <a href="https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Qinjingxue/Sunpack" alt="MIT License"></a>
+</p>
 
 ---
 
-## Usage guide
+## 内容导航
 
-### Command overview
+- [安装说明](#安装说明)
+- [使用指南](#使用指南)
+  - [命令速览](#命令速览)
+  - [密码管理](#密码管理)
+- [核心能力](#核心能力)
+  - [递归处理](#递归处理)
+  - [后处理](#后处理)
+  - [Watch模式监控系统](#watch模式监控系统)
+  - [稳健性和wal崩溃恢复](#稳健性和wal崩溃恢复)
+  - [高并发和速度优化](#高并发和速度优化)
+  - [后台低资源占用](#后台低资源占用)
+- [配置](#配置)
+- [开发与测试](#开发与测试)
+  - [开发相关](#开发相关)
+  - [架构速览](#架构速览)
+  - [测试](#测试)
+  - [可复现的 worker 与 7-Zip 对比测试](#可复现的-worker-与-7-zip-对比测试)
+- [注意事项](#注意事项)
+- [许可证](#许可证)
 
-| Command     | Short form | Description                                                          |
-| ----------- | ---------- | -------------------------------------------------------------------- |
-| `extract`   | `x`        | Extract files.                                                       |
-| `watch`     | `w`        | Monitor directories and extract archives automatically once found.   |
-| `scan`      | `s`        | Scan a directory for archives; useful for identifying archives.      |
-| `inspect`   | `i`        | Print detailed detection data; a debugging command with JSON output. |
-| `passwords` | `pw`       | Show the password list that will be attempted in this run.           |
-| `config`    | `cfg`      | Show or validate the effective configuration.                        |
-| `doctor`    | `d`        | Non-destructive check of installation and runtime health.            |
-| `version`   | `ver`      | Print the installed SunPack version.                                 |
+## 安装说明
 
-> See [CLI parameter reference](docs/cli_parameters.md) for detailed options.
+### 系统要求
 
-### Password management
+SunPack 仅支持 Windows 10 版本 1607 及更高版本和 Windows 11。
 
-For maximum convenience, SunPack gathers passwords from several sources at run time, tries all candidate passwords at high speed — with thousands of candidates it is nearly imperceptible — and automatically finds and uses the correct one. The password sources are:
+从 [GitHub Releases](https://github.com/Qinjingxue/Sunpack/releases/latest) 下载最新的 `sunpack-windows-<arch>-<version>-setup.exe`
 
-- Built-in password file: used on every extraction. It can be opened and edited from the tray context menu in watch mode, and lives at `%ProgramData%\SunPack\builtin_passwords.txt` in the installed version. Watch mode automatically collects clipboard history into this file, with a default limit of 30 entries.
-- User input: the context menu, and the interactive password prompt launched from the CLI.
-- Clipboard: the clipboard text is read as a password before extraction.
-- Per-directory password file: SunPack automatically looks for `sunpack-passwords.txt` in the directory and reads each line as one password; watch mode creates it automatically by default. Set `watch.directory_password_file_auto_create` to `false` to disable automatic creation.
-
----
-
-## Core capabilities
-
-### Recognition Capability
-
-- Identifies potential archive files by analyzing their binary data, including disguised archives embedded within carrier files and multi-volume archives.
-
-### Recursive processing
-
-- Recursively searches for nested archives by default: after a successful extraction it checks whether the resulting folder contains archives that clearly should be extracted further, and processes them recursively. The algorithm is tuned so that, in most cases, it does not wrongly extract files that should not be extracted further.
-
-### Post-processing
-
-- Automatically flattens meaningless nested single-child directories after a successful extraction, keeping only the top-level folder, and moves the original archive to the Recycle Bin or deletes it (controlled by the `"archive_cleanup_mode": "r"` setting; the Recycle Bin is the default). If processing fails, it automatically cleans up the failed output and reports an error.
-
-### Watch mode monitoring system
-
-- The watch system is built on a carefully designed identification algorithm that monitors and processes archives. It quickly detects and identifies newly added archives in the relevant directories and ignores non-archive files.
-- It can recognize situations with missing volumes or passwords, and automatically retries after the password sources or the volumes change. It uses Windows notifications to show progress while processing.
-- Each monitored directory can be configured with its own output root. See [CLI parameter reference](docs/cli_parameters.md) for the exact commands and the persistence format.
-
-### Robustness and WAL crash recovery
-
-- Automatically pauses extraction tasks when disk space runs out, and resumes them once enough disk space is available again — no manual retry needed.
-- Has a file verification system that allows partially damaged files to yield whatever usable files they can, instead of failing outright. When everything fails, it automatically cleans up the damaged files, leaving no leftovers that need manual cleanup.
-- Adopts a database-like WAL design: an unexpected power loss or process crash during extraction leaves no half-finished or corrupted state; the program handles it correctly and completes the task after recovery.
-- Has a test suite containing a rich set of complex cases that guarantee the correctness of the program's behavior.
-
-### High concurrency and speed optimization
-
-- Processes large numbers of archives concurrently, and has a concurrency algorithm that distributes work sensibly. In multi-file scenarios there is no need to extract files one by one — just drop them into a directory and they are all extracted quickly and automatically.
-- Handles the high-performance computation and I/O paths in Rust and C++ native code, using overlapped I/O to overlap the read, compute, and output stages of 7z extraction. Resource utilization is good, the output path is tuned separately for mechanical and NVMe drives, and cross-drive writes are direct writes with no staging copy.
-
-* For the 7-Zip backend decoders, zlib-ng was used to accelerate Deflate decompression, while parallel decoding was implemented to improve RAR and BZip2 decompression performance.
-
-- Has a rich set of benchmark cases for various scenarios, and is optimized for those benchmarks close to the maintainability limit.
-
-### Low background resource usage
-
-- Manages cache lifetimes well and automatically releases useless caches after processing files.
-- Uses purely event notifications while the system is idle; an idle background process consumes no CPU on polling.
+1. 根据系统架构选择安装包：Intel/AMD 64 位 Windows 选择 `x64`，Windows on ARM 选择 `arm64`。
+2. 运行安装器并接受 UAC 提权。默认安装到 `C:\Program Files\SunPack`；安装 Watch Broker 服务需要管理员权限。
+3. 按需选择安装向导中的附加项：
+   - 将安装目录加入本机 `PATH`。完成安装后请重新打开 PowerShell。
+   - 注册资源管理器中的文件夹、文件夹背景右键菜单。
+   - 随 Windows 启动 SunPack Watch（默认不启用）。
 
 ---
 
-## Configuration
+## 使用指南
 
-The main configuration file is `sunpack_config.json`; `sunpack_advanced_config.json` supplies additional defaults. Watch automatically reloads configuration changes.
+### 命令速览
 
-Add only the fields you want to change to the main configuration file.
+| 命令        | 简写  | 说明                                         |
+| ----------- | ----- | -------------------------------------------- |
+| `extract`   | `x`   | 解压文件                                     |
+| `watch`     | `w`   | 监控目录，发现压缩文件后自动解压             |
+| `scan`      | `s`   | 扫描发现目录下压缩包，可用于识别归档         |
+| `inspect`   | `i`   | 输出详细检测数据，调试命令，支持json诊断输出 |
+| `passwords` | `pw`  | 查看本次会参与尝试的密码列表。               |
+| `config`    | `cfg` | 查看或校验当前有效配置                       |
+| `doctor`    | `d`   | 非破坏性检查安装状态和运行环境               |
+| `version`   | `ver` | 输出当前安装的 SunPack 版本号                |
 
-Configuration validation command:
+> 详细参数见 [CLI 参数说明](docs/zh-CN/cli_parameters.md)。
+
+### 密码管理
+
+Sunpack为达到最大方便性，在使用时会尝试从各处获取密码，高速尝试所有候选密码，在上千候选密码下几乎无感速度，自动找到正确密码并使用，使用的密码来源有：
+
+- 内置密码文件：每次解压均使用，可在watch模式下使用托盘右键菜单打开修改，安装版位于%ProgramData%\SunPack\builtin_passwords.txt。其中watch模式会自动收集剪贴板历史记录写入该文件，上限配置默认30条
+- 用户输入：右键菜单，CLI调出的交互输入密码模式的输入
+- 剪贴板：解压前自动读取剪贴板文本作为密码
+- 目录下的密码记录文件：自动寻找目录下的sunpack-passwords.txt，读取每行作为一个密码；watch模式默认会自动创建，可将 `watch.directory_password_file_auto_create` 设为 `false` 关闭自动创建
+
+---
+
+## 核心能力
+
+### 识别能力
+
+- 通过文件二进制数据识别潜在的压缩文件，支持伪装性嵌入载体文件，分卷文件等
+
+### 递归处理
+
+- 默认递归寻找嵌套压缩包，即在解压成功后的文件夹下寻找是否有明显的需要进一步解压的压缩包并进行递归处理，该算法经过优化，大部分情况下不会误解压不应进一步解压的文件
+
+### 后处理
+
+- 自动在解压成功后压平无意义嵌套单子目录，只保留顶层文件夹，并将原压缩文件移入回收站或者直接删除（配置："archive_cleanup_mode": "r"调整，默认移入回收站），如果处理出错会自动清理错误输出并报错
+
+### Watch模式监控系统
+
+- watch监控系统基于精心设计的识别算法，监控并处理压缩文件，能够迅速监控并识别对应目录新增的压缩文件，不处理非压缩文件
+- 能够识别缺失分卷或密码的场景，并在密码来源或者分卷变化后自动重试。进行处理时使用windows通知来显示进度
+- 每个监控目录可以配置独立的输出根目录，具体命令和持久化格式见 [CLI 参数说明](docs/zh-CN/cli_parameters.md)。
+
+### 稳健性和WAL崩溃恢复
+
+- 在磁盘空间不足时自动暂停解压任务，并能够自动在磁盘空间充足后继续解压，无需手动重试
+- 拥有文件验证系统，允许部分损坏文件解压出部分可用文件，而不是一次性失败，完全失败时也能自动清理损坏文件，不会残留需手动清理的遗留文件
+- 采用类似数据库的WAL思想，解压处理过程中意外断电或进程崩溃不会留下半成品或损坏状态，程序能正确处理并在恢复后完成任务
+- 测试体系拥有丰富的复杂案例，保证程序处理的正确性
+
+### 高并发和速度优化
+
+- 一次性可并发处理大量归档文件，且有一套并发算法来合理分配并发，在多文件解压场景下无需手动单独解压，将文件放入一个目录内即可自动迅速完成解压
+- 高性能计算和IO部分使用Rust和C++原生代码处理，且使用overlapped IO，重叠7z解压时的读取，计算和输出部分，拥有较好的资源利用能力，且输出针对机械，NVMe硬盘有区分优化，在跨盘写入时是直写而没有搬运过程
+- 7z后端解码器上，使用zlib-ng优化了7z的Deflate解码速度，使用并发计算优化了rar和bz2的解码速度
+- 针对各种场景有丰富benchmark用例，针对benchmark优化接近可维护性上限
+
+### 后台低资源占用
+
+- 缓存生命周期管理完善，自动在处理文件后释放无用缓存
+- 系统空闲时完全事件通知，后台空闲无轮询检测占用CPU
+
+---
+
+## 配置
+
+主配置文件是 `sunpack_config.json`，`sunpack_advanced_config.json` 提供其余默认值。Watch 会自动重新加载配置变更。
+
+只需把想修改的字段写进主配置文件。
+
+配置校验命令：
 
 ```powershell
 python sunpack.py config validate
 ```
 
-See the [configuration guide](docs/configuration.md) for common settings and examples.
+常用设置和示例见 [配置指南](docs/zh-CN/configuration.md)。
 
 ---
 
-## Development and testing
+## 开发与测试
 
-### Development
+### 开发相关
 
-Prepare the development environment:
+准备开发环境：
 
 ```powershell
 .\scripts\setup_windows_dev.ps1
 ```
 
-Build the project:
+构建项目：
 
 ```powershell
 .\scripts\build_windows.ps1
 ```
 
-See [the documentation](docs/development_setup.md) for development environment and build instructions.
-See [the documentation](docs/development_boundaries.md) for development boundaries.
+开发环境和构建说明见 [文档](docs/zh-CN/development_setup.md)。
+开发边界见文档 [文档](docs/zh-CN/development_boundaries.md)
 
-### Architecture at a glance
+### 架构速览
 
 ```text
-CLI / Watch / Explorer (runtime)
-  -> pipeline coordinator
-     -> filesystem routing
-        +-- Relations (RAR / 7z / ZIP, including volumes)
-        +-- Detection (TAR and compression streams)
-        +-- Embedded discovery (unresolved files)
-     -> recursive authorization -> password handling -> extraction
-     -> verification -> post-processing
+CLI / Watch / 资源管理器（runtime）
+  -> 流程协调器（pipeline）
+     -> 文件系统扫描与分流
+        +-- Relations：RAR / 7z / ZIP，含分卷
+        +-- Detection：TAR 和压缩流
+        +-- Embedded：处理未识别文件中的嵌入归档
+     -> 递归授权 -> 密码处理 -> 解压
+     -> 结果校验 -> 后处理
 ```
 
-Rust provides low-level scanning and archive analysis; the C++ worker extracts with the integrated 7-Zip source code.
+Rust 负责底层扫描和归档分析；C++ worker 集成 7-Zip 源码执行解压。
 
-### Testing
+### 测试
 
-Install the test dependencies and run the default tests:
+安装测试依赖并运行默认测试：
 
 ```powershell
 uv sync --locked --extra test
 uv run --locked pytest
 ```
 
-Acceptance tests:
+验收测试：
 
 ```powershell
 .\run_acceptance_tests.ps1
 ```
 
-### Reproducible worker vs. 7-Zip benchmark
+### 可复现的 worker 与 7-Zip 对比测试
 
-Detailed machine identity, archive construction, compression methods, and
-reproduction instructions are in [the benchmark document](docs/benchmark_worker_vs_7z_300m.md).
-The latest four-thread IOCP experiment, including output flush timings, is documented in
-[the Gzip/ZIP concurrency report (Chinese)](docs/zh-CN/benchmark_worker_iocp_300m.md).
-The follow-up [full-format regression](docs/zh-CN/benchmark_worker_iocp_fullformats_300m.md)
-and [1/4/8 IOCP consumer comparison](docs/zh-CN/benchmark_worker_iocp_threads_300m.md)
-include paired timings and explicit output flushes.
-The [current 8-thread IOCP worker vs. concurrent 7z.exe retest](docs/zh-CN/benchmark_worker_iocp_vs_cli_300m.md)
-covers all 18 format/variant cases, a mixed queue, and targeted input/CPU diagnostics.
-The [subsequent parallelism optimization report](docs/zh-CN/benchmark_worker_parallel_300m.md)
-records retained CRC32/Open changes, administrator CPU sampling, and remaining gaps.
-These results use SunPack **v0.7.9** from repository commit `b9fdfa6d`, with the
-worker built from the same commit. The retest ran on 2026-10-03: 18 cases, five
-measured runs per case, and no warmups. Times and sampled process-tree peak RSS
-are per-case medians; RSS is in MiB. Worker time and memory are grouped together,
-followed by the same metrics for `7z.exe`. The raw full-matrix report is
-`benchmarks/results/worker-vs-7z-300m-v0.7.9-b9fdfa6-rss-20261003.json`.
+详细的机器信息、归档构造、压缩方法和复现说明见[独立 benchmark 文档](docs/zh-CN/benchmark_worker_vs_7z_300m.md)。
+以下结果使用 **SunPack v0.7.9**，仓库与 worker 源码提交均为 `b9fdfa6d`。
+测试日期为 2026-10-03，共 18 个 case，每个测量 5 次、不预热。耗时和进程树
+采样峰值 RSS 均为每个 case 的中位数，RSS 单位为 MiB。表中先展示 worker 的
+耗时和内存，再展示 `7z.exe` 的对应数据。全矩阵报告位于
+`benchmarks/results/worker-vs-7z-300m-v0.7.9-b9fdfa6-rss-20261003.json`。
 
-| Format / variant | Worker time (ms) | `7z.exe` time (ms) | Time ratio | Worker peak RSS (MiB) | `7z.exe` peak RSS (MiB) | RSS ratio |
-| ---------------- | :--------------- | :----------------- | :--------- | :-------------------- | :---------------------- | :-------- |
-| 7z split         | 141.886          | 203.605            | 0.697      | 476.199               | 458.379                 | 1.039     |
-| 7z non-solid     | 188.029          | 250.020            | 0.752      | 324.137               | 308.047                 | 1.052     |
-| 7z solid         | 142.802          | 204.641            | 0.698      | 475.652               | 458.309                 | 1.038     |
-| BZip2            | 1,670.859        | 2,914.191          | 0.573      | 43.289                | 12.625                  | 3.429     |
-| Gzip             | 81.731           | 209.743            | 0.390      | 25.188                | 8.215                   | 3.066     |
-| RAR5 split       | 172.453          | 768.066            | 0.225      | 54.242                | 40.516                  | 1.339     |
-| RAR4 non-solid   | 80.926           | 185.464            | 0.436      | 27.488                | 11.598                  | 2.370     |
-| RAR4 solid       | 539.789          | 652.330            | 0.827      | 28.211                | 12.348                  | 2.285     |
-| RAR5 non-solid   | 95.293           | 186.992            | 0.510      | 56.250                | 39.605                  | 1.420     |
-| RAR5 solid       | 168.938          | 745.597            | 0.227      | 57.289                | 40.477                  | 1.415     |
-| TAR              | 76.350           | 120.331            | 0.634      | 24.031                | 7.297                   | 3.293     |
-| TBZ2             | 1,663.736        | 2,890.008          | 0.576      | 44.141                | 12.625                  | 3.496     |
-| TGZ              | 84.974           | 213.233            | 0.399      | 25.215                | 8.219                   | 3.068     |
-| TXZ              | 156.893          | 181.328            | 0.865      | 474.617               | 458.523                 | 1.035     |
-| TZST             | 100.259          | 188.752            | 0.531      | 23.012                | 9.789                   | 2.351     |
-| XZ               | 169.011          | 183.459            | 0.921      | 474.621               | 458.520                 | 1.035     |
-| ZIP              | 76.254           | 198.892            | 0.383      | 25.289                | 7.984                   | 3.167     |
-| ZST              | 104.599          | 181.936            | 0.575      | 23.039                | 9.789                   | 2.354     |
+| 格式 / 变体    | Worker 耗时（ms） | `7z.exe` 耗时（ms） | 耗时比 | Worker 峰值 RSS（MiB） | `7z.exe` 峰值 RSS（MiB） | RSS 比 |
+| -------------- | :---------------- | :------------------ | :----- | :--------------------- | :----------------------- | :----- |
+| 7z split       | 141.886           | 203.605             | 0.697  | 476.199                | 458.379                  | 1.039  |
+| 7z non-solid   | 188.029           | 250.020             | 0.752  | 324.137                | 308.047                  | 1.052  |
+| 7z solid       | 142.802           | 204.641             | 0.698  | 475.652                | 458.309                  | 1.038  |
+| BZip2          | 1,670.859         | 2,914.191           | 0.573  | 43.289                 | 12.625                   | 3.429  |
+| Gzip           | 81.731            | 209.743             | 0.390  | 25.188                 | 8.215                    | 3.066  |
+| RAR5 split     | 172.453           | 768.066             | 0.225  | 54.242                 | 40.516                   | 1.339  |
+| RAR4 non-solid | 80.926            | 185.464             | 0.436  | 27.488                 | 11.598                   | 2.370  |
+| RAR4 solid     | 539.789           | 652.330             | 0.827  | 28.211                 | 12.348                   | 2.285  |
+| RAR5 non-solid | 95.293            | 186.992             | 0.510  | 56.250                 | 39.605                   | 1.420  |
+| RAR5 solid     | 168.938           | 745.597             | 0.227  | 57.289                 | 40.477                   | 1.415  |
+| TAR            | 76.350            | 120.331             | 0.634  | 24.031                 | 7.297                    | 3.293  |
+| TBZ2           | 1,663.736         | 2,890.008           | 0.576  | 44.141                 | 12.625                   | 3.496  |
+| TGZ            | 84.974            | 213.233             | 0.399  | 25.215                 | 8.219                    | 3.068  |
+| TXZ            | 156.893           | 181.328             | 0.865  | 474.617                | 458.523                  | 1.035  |
+| TZST           | 100.259           | 188.752             | 0.531  | 23.012                 | 9.789                    | 2.351  |
+| XZ             | 169.011           | 183.459             | 0.921  | 474.621                | 458.520                  | 1.035  |
+| ZIP            | 76.254            | 198.892             | 0.383  | 25.289                 | 7.984                    | 3.167  |
+| ZST            | 104.599           | 181.936             | 0.575  | 23.039                 | 9.789                    | 2.354  |
 
 ---
 
-## Notice
+## 注意事项
 
-SunPack is not yet mature, and its handling of uncontrolled inputs is limited. It is not guaranteed to be safe. If you have concerns, use it only in a trusted environment.
+SunPack 目前尚不成熟，对于不可控输入的处理能力有限，不保证安全。如有顾虑，请仅在可信环境中使用。
 
-## License
+## 许可证
 
-SunPack-original source code is licensed under the MIT License; see [LICENSE](LICENSE).
+SunPack 原创源代码采用 MIT 许可证，详见 [LICENSE](LICENSE)。
 
-The repository also vendors third-party source code, including 7-Zip 26.03 under `native/sevenzip_bridge/7z2603-src/` and zlib-ng 2.3.3 under `native/sevenzip_bridge/zlib-ng-2.3.3/`. Third-party source and binaries remain subject to their original licenses and are not relicensed under MIT. See [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md), [licenses/](licenses/), and [docs/licensing.md](docs/licensing.md) for the exact license scope and release-compliance information.
+仓库同时包含第三方源码，其中包括位于 `native/sevenzip_bridge/7z2603-src/` 的 7-Zip 26.03 源码，以及位于 `native/sevenzip_bridge/zlib-ng-2.3.3/` 的 zlib-ng 2.3.3 源码。第三方源码和二进制继续受各自原始许可证约束，不因进入 SunPack 仓库而改为 MIT。许可证边界和发布合规要求详见 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)、[licenses/](licenses/) 和 [docs/licensing.md](docs/licensing.md)。
 
-The 7-Zip source license is copied at [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt), the full GNU LGPL 2.1 text is available at [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt), and the zlib-ng license is copied at [licenses/zlib-ng-license.txt](licenses/zlib-ng-license.txt).
-
-The [input prefetch optimization experiments](docs/zh-CN/benchmark_worker_prefetch_300m.md)
-were rejected because gains did not hold across single-job and concurrent workloads.
+7-Zip 源码许可证副本位于 [licenses/7zip-source-license.txt](licenses/7zip-source-license.txt)，GNU LGPL 2.1 完整文本位于 [licenses/LGPL-2.1.txt](licenses/LGPL-2.1.txt)，zlib-ng 许可证副本位于 [licenses/zlib-ng-license.txt](licenses/zlib-ng-license.txt)。
