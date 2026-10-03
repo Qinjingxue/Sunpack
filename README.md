@@ -61,7 +61,7 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
 | `inspect`   | `i`        | Print detailed detection data; a debugging command with JSON output. |
 | `passwords` | `pw`       | Show the password list that will be attempted in this run.           |
 | `config`    | `cfg`      | Show or validate the effective configuration.                        |
-| `doctor`    | `d`          | Non-destructive check of installation and runtime health.            |
+| `doctor`    | `d`        | Non-destructive check of installation and runtime health.            |
 | `version`   | `ver`      | Print the installed SunPack version.                                 |
 
 > See [CLI parameter reference](docs/cli_parameters.md) for detailed options.
@@ -198,32 +198,33 @@ The [current 8-thread IOCP worker vs. concurrent 7z.exe retest](docs/zh-CN/bench
 covers all 18 format/variant cases, a mixed queue, and targeted input/CPU diagnostics.
 The [subsequent parallelism optimization report](docs/zh-CN/benchmark_worker_parallel_300m.md)
 records retained CRC32/Open changes, administrator CPU sampling, and remaining gaps.
-These results use SunPack **v0.7.0** from repository commit `c3eaec11`, with the
-worker built from commit `c3eaec11`. Each case has five measured runs and no
-warmups. Times and sampled process-tree peak RSS are per-case medians; RSS is in
-MiB. Worker time and memory are grouped together, followed by the same metrics
-for `7z.exe`.
+These results use SunPack **v0.7.9** from repository commit `b9fdfa6d`, with the
+worker built from the same commit. The retest ran on 2026-10-03: 18 cases, five
+measured runs per case, and no warmups. Times and sampled process-tree peak RSS
+are per-case medians; RSS is in MiB. Worker time and memory are grouped together,
+followed by the same metrics for `7z.exe`. The raw full-matrix report is
+`benchmarks/results/worker-vs-7z-300m-v0.7.9-b9fdfa6-rss-20261003.json`.
 
 | Format / variant | Worker time (ms) | `7z.exe` time (ms) | Time ratio | Worker peak RSS (MiB) | `7z.exe` peak RSS (MiB) | RSS ratio |
-| ---------------- | ---------------: | -----------------: | ---------: | --------------------: | ----------------------: | --------: |
-| 7z split         |          151.347 |            209.220 |      0.723 |               469.258 |                 458.383 |     1.024 |
-| 7z non-solid     |          192.130 |            249.181 |      0.771 |               319.113 |                 308.051 |     1.036 |
-| 7z solid         |          148.431 |            206.594 |      0.718 |               469.215 |                 458.309 |     1.024 |
-| BZip2            |        1,752.476 |          2,947.405 |      0.595 |                43.137 |                  12.637 |     3.414 |
-| Gzip             |           67.378 |            195.667 |      0.344 |                24.992 |                   8.219 |     3.041 |
-| RAR5 split       |          224.977 |            780.676 |      0.288 |                52.066 |                  40.504 |     1.285 |
-| RAR4 non-solid   |          170.297 |            181.628 |      0.938 |                24.281 |                  11.605 |     2.092 |
-| RAR4 solid       |          630.189 |            655.308 |      0.962 |                25.020 |                  12.352 |     2.026 |
-| RAR5 non-solid   |          126.030 |            180.823 |      0.697 |                52.008 |                  39.609 |     1.313 |
-| RAR5 solid       |          192.755 |            756.119 |      0.255 |                53.059 |                  40.473 |     1.311 |
-| TAR              |           72.315 |            118.175 |      0.612 |                25.000 |                   7.301 |     3.424 |
-| TBZ2             |        1,769.768 |          2,972.193 |      0.595 |                44.023 |                  12.629 |     3.486 |
-| TGZ              |           71.309 |            202.180 |      0.353 |                25.016 |                   8.211 |     3.047 |
-| TXZ              |          169.861 |            183.313 |      0.927 |               474.453 |                 458.520 |     1.035 |
-| TZST             |           93.847 |            152.214 |      0.617 |                21.473 |                   9.801 |     2.191 |
-| XZ               |          165.727 |            182.915 |      0.906 |               474.484 |                 458.520 |     1.035 |
-| ZIP              |           93.797 |            197.793 |      0.474 |                20.379 |                   7.988 |     2.551 |
-| ZST              |           95.207 |            156.096 |      0.610 |                21.414 |                   9.801 |     2.185 |
+| ---------------- | :--------------- | :----------------- | :--------- | :-------------------- | :---------------------- | :-------- |
+| 7z split         | 141.886          | 203.605            | 0.697      | 476.199               | 458.379                 | 1.039     |
+| 7z non-solid     | 188.029          | 250.020            | 0.752      | 324.137               | 308.047                 | 1.052     |
+| 7z solid         | 142.802          | 204.641            | 0.698      | 475.652               | 458.309                 | 1.038     |
+| BZip2            | 1,670.859        | 2,914.191          | 0.573      | 43.289                | 12.625                  | 3.429     |
+| Gzip             | 81.731           | 209.743            | 0.390      | 25.188                | 8.215                   | 3.066     |
+| RAR5 split       | 172.453          | 768.066            | 0.225      | 54.242                | 40.516                  | 1.339     |
+| RAR4 non-solid   | 80.926           | 185.464            | 0.436      | 27.488                | 11.598                  | 2.370     |
+| RAR4 solid       | 539.789          | 652.330            | 0.827      | 28.211                | 12.348                  | 2.285     |
+| RAR5 non-solid   | 95.293           | 186.992            | 0.510      | 56.250                | 39.605                  | 1.420     |
+| RAR5 solid       | 168.938          | 745.597            | 0.227      | 57.289                | 40.477                  | 1.415     |
+| TAR              | 76.350           | 120.331            | 0.634      | 24.031                | 7.297                   | 3.293     |
+| TBZ2             | 1,663.736        | 2,890.008          | 0.576      | 44.141                | 12.625                  | 3.496     |
+| TGZ              | 84.974           | 213.233            | 0.399      | 25.215                | 8.219                   | 3.068     |
+| TXZ              | 156.893          | 181.328            | 0.865      | 474.617               | 458.523                 | 1.035     |
+| TZST             | 100.259          | 188.752            | 0.531      | 23.012                | 9.789                   | 2.351     |
+| XZ               | 169.011          | 183.459            | 0.921      | 474.621               | 458.520                 | 1.035     |
+| ZIP              | 76.254           | 198.892            | 0.383      | 25.289                | 7.984                   | 3.167     |
+| ZST              | 104.599          | 181.936            | 0.575      | 23.039                | 9.789                   | 2.354     |
 
 ---
 
