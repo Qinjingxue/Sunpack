@@ -163,9 +163,10 @@ def test_same_stem_opaque_members_with_competing_formats_are_not_guessed(tmp_pat
         paths = []
         for index, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
             number = _source_volume_number(source.name, index)
-            # Every part changes its text prefix, so neither suffix
-            # discriminator provides a stable family for the opaque tails.
-            target = mixed / f"shared.noise{chr(96 + number)}.source-{archive_format}.chunk{number}.opaque"
+            # Both formats would own the same numeric slots; opaque suffixes
+            # provide no format fact with which to split those slots.
+            label = "alpha" if archive_format == "7z" else "beta"
+            target = mixed / f"shared.noise{chr(96 + number)}.source-{label}.chunk{number}.opaque"
             source.rename(target)
             paths.append(target)
         paths_by_format[archive_format] = paths
@@ -179,7 +180,7 @@ def test_same_stem_opaque_members_with_competing_formats_are_not_guessed(tmp_pat
 
 @pytest.mark.parametrize("formats", [("7z", "7z"), ("7z", "zip"), ("7z", "rar")])
 @pytest.mark.parametrize("name_style", ["standard", "prefix", "shape", "marker_shape"])
-def test_competing_heads_with_shared_stem_use_suffix_discriminators(tmp_path, formats, name_style):
+def test_competing_heads_keep_direct_schemes_and_partition_declared_formats(tmp_path, formats, name_style):
     mixed = tmp_path / "mixed"
     mixed.mkdir()
     sets = []
@@ -200,6 +201,8 @@ def test_competing_heads_with_shared_stem_use_suffix_discriminators(tmp_path, fo
                 name = f"shared.part{number}.{label}.opaque"
             else:
                 name = f"shared.chunk{number}.{label}.opaque"
+            if formats[0] != formats[1] and name_style != "standard":
+                name += f".{archive_format}"
             target = mixed / name
             source.rename(target)
             paths.append(target)
@@ -212,9 +215,13 @@ def test_competing_heads_with_shared_stem_use_suffix_discriminators(tmp_path, fo
         group = RelationsScheduler().resolve_volume_once(
             [str(paths[0])], all_paths, format_hint=archive_format,
         )
+        if formats[0] == formats[1] and name_style != "standard":
+            assert group is None
+            continue
         assert group is not None
         assert set(group.input_paths) == {str(path) for path in paths}
-        assert label in group.logical_name
+        if name_style == "standard":
+            assert label in group.logical_name
         assert "\0" not in group.logical_name
         logical_names.add(group.logical_name)
         tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
@@ -229,7 +236,8 @@ def test_competing_heads_with_shared_stem_use_suffix_discriminators(tmp_path, fo
             extractor.close()
         assert result.success is True, result.error
         assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
-    assert len(logical_names) == 2
+    if name_style == "standard":
+        assert len(logical_names) == 2
 
 
 @pytest.mark.parametrize("competing", [False, True])
@@ -254,7 +262,7 @@ def test_rar_structure_overrides_false_part_marker(tmp_path, competing, sfx, mar
             payload_size=MIB, split_volume_size=MIB // 4)
         for index, source in enumerate(sorted(other.archive_dir.iterdir()), start=1):
             number = _source_volume_number(source.name, index)
-            target = mixed / f"shared.beta.chunk{number}.opaque"
+            target = mixed / f"shared.beta.7z.chunk{number}.opaque"
             source.rename(target)
             all_paths.append(str(target))
     group = RelationsScheduler().resolve_volume_once(
@@ -275,6 +283,83 @@ def test_rar_structure_overrides_false_part_marker(tmp_path, competing, sfx, mar
         extractor.close()
     assert result.success is True, result.error
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
+@pytest.mark.parametrize("archive_format", ["7z", "zip"])
+@pytest.mark.parametrize("sfx", [False, True])
+@pytest.mark.parametrize("password", [None, "number-position-password"])
+def test_structural_head_number_position_orders_real_opaque_members(tmp_path, archive_format, sfx, password):
+    case = ArchiveFixtureFactory().create(tmp_path, "position", archive_format,
+        split=True, sfx=sfx, password=password, payload_size=MIB, split_volume_size=MIB // 4)
+    paths = []
+    for index, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
+        number = _source_volume_number(source.name, 0)
+        if number == 0:
+            source.rename(case.archive_dir / "shared.exe")
+            continue
+        # All opaque middle volumes have a false part99 marker. Padding can
+        # change without changing the number position learned from the head.
+        token = str(number).zfill(2 if number % 2 else 3)
+        target = case.archive_dir / f"shared.part99.chunk{token}.opaque"
+        source.rename(target)
+        paths.append((number, target))
+    paths.sort()
+    inputs = [str(path) for _, path in paths]
+    passwords = {path: password for path in inputs} if password else None
+    group = RelationsScheduler().resolve_volume_once(
+        [inputs[0]], inputs, format_hint=archive_format, path_passwords=passwords)
+    assert group is not None
+    assert set(group.input_paths) == set(inputs)
+    assert [part.number for part in group.split_volumes] == [number for number, _ in paths]
+    assert group.head_metadata.get("volume_set_incomplete") is not True
+    if password:
+        (case.archive_dir / "sunpack-passwords.txt").write_text(
+            f"wrong-password\n{password}\n", encoding="utf-8")
+    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    assert len(tasks) == 1
+    config = load_config()
+    planned = ArchiveInputPlanningStage(config).plan_task_to_tasks(tasks[0])
+    assert len(planned) == 1
+    DirectoryPasswordContextStore(config).annotate(planned)
+    extractor = ExtractionScheduler(max_retries=0)
+    output = tmp_path / "output"
+    try:
+        result = extractor.extract(planned[0], str(output))
+    finally:
+        extractor.close()
+    assert result.success is True, result.error
+    assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
+@pytest.mark.parametrize("archive_format", ["7z", "zip"])
+def test_multiple_matching_seed_numbers_do_not_guess_a_position(tmp_path, archive_format):
+    case = ArchiveFixtureFactory().create(tmp_path, "ambiguous_position", archive_format,
+        split=True, payload_size=MIB, split_volume_size=MIB // 4)
+    paths = []
+    for index, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
+        number = _source_volume_number(source.name, index)
+        target = case.archive_dir / f"shared.part99.build1.chunk{number}.opaque"
+        source.rename(target)
+        paths.append(str(target))
+    assert RelationsScheduler().resolve_volume_once(
+        [paths[0]], paths, format_hint=archive_format) is None
+
+
+def test_extra_numeric_tail_cannot_bypass_seven_zip_size_validation(tmp_path):
+    factory = ArchiveFixtureFactory()
+    case = factory.create(tmp_path, "valid", "7z", split=True,
+        payload_size=MIB, split_volume_size=MIB // 4)
+    other = factory.create(tmp_path, "extra", "7z", split=True,
+        payload_size=MIB, split_volume_size=MIB // 4)
+    paths = []
+    for number, source in enumerate(sorted(case.archive_dir.iterdir()), start=1):
+        target = case.archive_dir / f"shared.chunk{number}.opaque"
+        source.rename(target)
+        paths.append(str(target))
+    extra = case.archive_dir / "shared.chunk999.opaque"
+    sorted(other.archive_dir.iterdir())[-1].rename(extra)
+    paths.append(str(extra))
+    assert RelationsScheduler().resolve_volume_once([paths[0]], paths, format_hint="7z") is None
 
 
 @pytest.mark.parametrize("sfx_format", ["7z", "rar"])
@@ -308,7 +393,7 @@ def test_failed_split_relation_preserves_standalone_sfx(tmp_path, sfx_format, fa
     assert matches[0].head_metadata["relation_confirmed"] is True
 
 
-def test_password_blocked_seed_cannot_share_opaque_members_with_another_format(tmp_path):
+def test_valid_relation_wins_over_password_blocked_filename_hypothesis(tmp_path):
     factory = ArchiveFixtureFactory()
     seven_zip = factory.create(tmp_path, "plain", "7z", split=True,
         payload_size=MIB, split_volume_size=MIB // 4)
@@ -326,10 +411,11 @@ def test_password_blocked_seed_cannot_share_opaque_members_with_another_format(t
     rar_head = mixed / "shared.rar.part1.opaque"
     sorted(encrypted_rar.archive_dir.iterdir())[0].rename(rar_head)
     all_paths = [str(path) for path in paths] + [str(rar_head)]
-    for head, archive_format in ((paths[0], "7z"), (rar_head, "rar")):
-        assert RelationsScheduler().resolve_volume_once(
-            [str(head)], all_paths, format_hint=archive_format,
-        ) is None
+    group = RelationsScheduler().resolve_volume_once([str(paths[0])], all_paths, format_hint="7z")
+    assert group is not None
+    assert set(group.input_paths) == {str(path) for path in paths}
+    assert group.head_metadata["relation_confirmed"] is True
+    assert RelationsScheduler().resolve_volume_once([str(rar_head)], all_paths, format_hint="rar") is None
 
 
 def test_loose_rar_names_reconcile_after_missing_middle_volume_arrives(tmp_path):
@@ -649,7 +735,7 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
         other = ArchiveFixtureFactory().create(tmp_path, "other", "7z", split=True,
             payload_size=MIB, split_volume_size=MIB // 4)
         for number, part in enumerate(sorted(other.archive_dir.iterdir()), start=1):
-            part.rename(mixed / f"shared.chunk{number}.sevendata.bin")
+            part.rename(mixed / f"shared.chunk{number}.7zdata.bin")
 
     config = normalize_config(
         with_detection_pipeline(
@@ -673,7 +759,7 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
     assert descriptor.volume_style == "zip_spanned"
     assert [part.volume_number for part in descriptor.parts] == [1, 2, 3, 4]
     assert [part.role for part in descriptor.parts] == ["first", "member", "member", "terminal"]
-    logical = "shared.chunk.zipdata.bin" if opaque_competition else "shared.alpha"
+    logical = "shared" if opaque_competition else "shared.alpha"
     assert task.logical_name == logical
     assert [part.canonical_name for part in descriptor.parts] == [
         f"{logical}.z01", f"{logical}.z02", f"{logical}.z03", f"{logical}.zip",
@@ -691,7 +777,8 @@ def test_modern_split_zip_with_camouflaged_names_runs_full_pipeline(tmp_path, op
     assert extracted.read_bytes() == payload.read_bytes()
 
 
-def test_embedded_7z_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_path):
+@pytest.mark.parametrize("false_marker", [False, True])
+def test_embedded_7z_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_path, false_marker):
     case = ArchiveFixtureFactory().create(
         tmp_path,
         "embedded_sfx_source",
@@ -707,7 +794,8 @@ def test_embedded_7z_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_
     parts = []
     for number, offset in enumerate(range(0, len(logical), split_size), start=1):
         marker = "exe" if number == 1 else "7z"
-        target = mixed / f"shared.bundle.{marker}.part{number}.useless.fake"
+        target = mixed / (f"shared.part99.chunk{number}.opaque" if false_marker
+            else f"shared.bundle.{marker}.part{number}.useless.fake")
         target.write_bytes(logical[offset : offset + split_size])
         parts.append(target)
     assert len(parts) >= 3
@@ -745,7 +833,8 @@ def test_embedded_7z_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_
 
 
 @pytest.mark.skipif(get_optional_winrar() is None, reason="WinRAR is required to generate RAR SFX")
-def test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_path):
+@pytest.mark.parametrize("false_marker", [False, True])
+def test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tmp_path, false_marker):
     winrar = get_optional_winrar()
     assert winrar is not None
     source = tmp_path / "rar_sfx_source"
@@ -776,7 +865,8 @@ def test_raw_split_rar_sfx_with_opaque_camouflaged_members_runs_full_pipeline(tm
     parts = []
     for number, offset in enumerate(range(0, len(logical), split_size), start=1):
         marker = "exe" if number == 1 else "rar"
-        target = mixed / f"shared.bundle.{marker}.part{number}.useless.fake"
+        target = mixed / (f"shared.part99.chunk{number}.opaque" if false_marker
+            else f"shared.bundle.{marker}.part{number}.useless.fake")
         target.write_bytes(logical[offset : offset + split_size])
         parts.append(target)
     assert len(parts) >= 3
@@ -973,13 +1063,6 @@ def _mixed_real_volume_directory(tmp_path: Path):
             renamed.append(target)
         cases[archive_format] = case
         paths_by_format[archive_format] = sorted(renamed, key=lambda path: _source_volume_number(path.name, 0))
-
-    for name in (
-        "shared.alpha.7z.999.noise.bin",
-        "shared.beta.zip.999.junk.dat",
-    ):
-        with (common / name).open("wb") as stream:
-            stream.truncate(MIB + 1)
 
     return common, cases, paths_by_format
 

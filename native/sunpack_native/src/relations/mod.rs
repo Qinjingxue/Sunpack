@@ -28,7 +28,6 @@ pub(crate) struct RelationInput {
 
 #[derive(Debug, Clone)]
 struct NameInterpretation {
-    format: String,
     prefix: String,
     number: u32,
     style: String,
@@ -280,14 +279,12 @@ struct ParsedVolume {
 struct DirectoryNameIndex {
     entries_by_path: HashMap<String, DirectoryNameEntry>,
     rows_by_stem: HashMap<String, Vec<usize>>,
-    rows_by_family: HashMap<String, HashMap<String, Vec<usize>>>,
 }
 
 #[derive(Debug, Default)]
 struct DirectoryNameEntry {
     row_index: usize,
     parsed: Vec<ParsedVolume>,
-    interpretations: HashMap<String, Vec<NameInterpretation>>,
 }
 
 impl DirectoryNameIndex {
@@ -342,21 +339,11 @@ impl DirectoryNameIndex {
                         push_unique_volume_candidate(&mut parsed, candidate);
                     }
                 }
-                let interpretations = ["", "rar", "7z", "zip"]
-                    .into_iter()
-                    .map(|target_format| {
-                        (
-                            target_format.to_string(),
-                            name_interpretations_from_candidates(row, &parsed, target_format),
-                        )
-                    })
-                    .collect();
                 Some((
                     row.path_key.clone(),
                     DirectoryNameEntry {
                         row_index: index,
                         parsed,
-                        interpretations,
                     },
                 ))
             })
@@ -364,7 +351,6 @@ impl DirectoryNameIndex {
         Self {
             entries_by_path,
             rows_by_stem,
-            rows_by_family: HashMap::new(),
         }
     }
 
@@ -386,236 +372,6 @@ impl DirectoryNameIndex {
             .map(|index| &rows[*index])
     }
 
-    fn index_families(&mut self, rows: &[RelationInput]) {
-        for (index, row) in rows.iter().enumerate() {
-            let Some(entry) = self.entries_by_path.get(&row.path_key) else {
-                continue;
-            };
-            for (format, values) in &entry.interpretations {
-                for value in values {
-                    let members = self
-                        .rows_by_family
-                        .entry(format.clone())
-                        .or_default()
-                        .entry(value.prefix.clone())
-                        .or_default();
-                    if members.last() != Some(&index) {
-                        members.push(index);
-                    }
-                }
-            }
-            let name = row.name.to_ascii_lowercase();
-            if let Some((prefix, tail)) = name.split_once(".zip") {
-                if tail.is_empty() || tail.starts_with('.') {
-                    let members = self
-                        .rows_by_family
-                        .entry("zip".to_string())
-                        .or_default()
-                        .entry(prefix.to_string())
-                        .or_default();
-                    if members.last() != Some(&index) {
-                        members.push(index);
-                    }
-                }
-            }
-            if entry.parsed.is_empty() && row.anchor.as_ref().is_some_and(is_possible_sfx_launcher)
-            {
-                let members = self
-                    .rows_by_family
-                    .entry(String::new())
-                    .or_default()
-                    .entry(first_dot_stem(&name).to_string())
-                    .or_default();
-                if members.last() != Some(&index) {
-                    members.push(index);
-                }
-            }
-        }
-    }
-
-    fn rows_for_family<'a>(
-        &'a self,
-        rows: &'a [RelationInput],
-        family: &'a NameInterpretation,
-    ) -> impl Iterator<Item = &'a RelationInput> {
-        let members = self
-            .rows_by_family
-            .get(&family.format)
-            .and_then(|groups| groups.get(&family.prefix));
-        let companions = self
-            .rows_by_family
-            .get("")
-            .and_then(|groups| groups.get(first_dot_stem(&family.prefix)));
-        members
-            .into_iter()
-            .flatten()
-            .chain(companions.into_iter().flatten().filter(move |index| {
-                !family.format.is_empty()
-                    && !self
-                        .interpretations(&rows[**index], &family.format)
-                        .iter()
-                        .any(|value| value.prefix == family.prefix)
-            }))
-            .map(|index| &rows[*index])
-    }
-
-    /// Widen names only after a concrete archive seed exists. Competing
-    /// seeds use bounded suffix discriminators alongside existing schemes;
-    /// never try combinations of physical paths.
-    fn match_seed_buckets(&mut self, rows: &[RelationInput], strengths: &[Option<&str>]) {
-        for (stem, indexes) in &self.rows_by_stem {
-            if stem.is_empty() {
-                continue;
-            }
-            let mut formats = HashSet::new();
-            let mut heads = 0usize;
-            let mut zip_spanned = false;
-            for index in indexes {
-                let row = &rows[*index];
-                let Some(anchor) = row.anchor.as_ref().filter(|_| strengths[*index].is_some())
-                else {
-                    continue;
-                };
-                if !matches!(anchor.format.as_str(), "7z" | "zip" | "rar") {
-                    continue;
-                }
-                formats.insert(anchor.format.as_str());
-                heads += usize::from(
-                    resolved_volume_number(
-                        row,
-                        &self.entries_by_path[&row.path_key].parsed,
-                        &anchor.format,
-                    ) == Some(1)
-                        || (anchor.internal_volume_number.is_none()
-                            && anchor.anchor_roles.contains(&"first")),
-                );
-                zip_spanned |= anchor.format == "zip"
-                    && (anchor.evidence.contains(&"zip:split_marker")
-                        || anchor.evidence.contains(&"zip:eocd_split_terminal"));
-            }
-            if formats.len() != 1 || heads > 1 {
-                match_competing_suffixes(rows, indexes, strengths, &mut self.entries_by_path);
-                continue;
-            }
-            let format = *formats.iter().next().expect("one concrete format");
-            let default_style = match format {
-                "rar" => "rar_part",
-                "zip" if zip_spanned => "zip_spanned",
-                _ => "numeric_suffix",
-            };
-            let mut terminal = None;
-            let mut terminal_count = 0usize;
-            let mut highest = 0u32;
-            let mut common_prefix = None;
-            let mut mixed_prefixes = false;
-            for index in indexes {
-                if let Some(part) = self.entries_by_path[&rows[*index].path_key]
-                    .parsed
-                    .iter()
-                    .find(|part| part.family == format || part.family == "generic")
-                {
-                    let prefix = logical_name_from_parsed(part).to_ascii_lowercase();
-                    mixed_prefixes |= common_prefix
-                        .as_ref()
-                        .is_some_and(|previous| previous != &prefix);
-                    common_prefix = Some(prefix);
-                }
-            }
-            // Keep the existing canonical name when recognized members agree;
-            // varying/opaque prefixes use only the first-dot stem.
-            let prefix = common_prefix
-                .filter(|_| !mixed_prefixes)
-                .unwrap_or_else(|| stem.clone());
-            for index in indexes {
-                let row = &rows[*index];
-                let entry = self
-                    .entries_by_path
-                    .get_mut(&row.path_key)
-                    .expect("indexed row");
-                let values = entry
-                    .interpretations
-                    .get_mut(format)
-                    .expect("indexed format");
-                values.clear();
-                if !row.relation_member_eligible
-                    || row.anchor.as_ref().is_some_and(|anchor| {
-                        (!anchor.format.is_empty() && anchor.format != format)
-                            || (anchor.standalone && !anchor.sfx)
-                    })
-                {
-                    continue;
-                }
-                let parsed = entry
-                    .parsed
-                    .iter()
-                    .find(|part| part.family == format || part.family == "generic");
-                if zip_spanned
-                    && parsed.is_none()
-                    && row
-                        .anchor
-                        .as_ref()
-                        .and_then(|a| a.internal_volume_number)
-                        .is_none()
-                    && zip_terminal_name_matches(&row.name, &prefix)
-                {
-                    terminal = Some(*index);
-                    terminal_count += 1;
-                    continue;
-                }
-                let number = resolved_volume_number(row, &entry.parsed, format);
-                let Some(number) = number.filter(|number| *number > 0) else {
-                    if format == "zip"
-                        && row
-                            .anchor
-                            .as_ref()
-                            .is_some_and(|a| a.anchor_roles.contains(&"terminal"))
-                    {
-                        terminal = Some(*index);
-                        terminal_count += 1;
-                    }
-                    continue;
-                };
-                highest = highest.max(number);
-                values.push(NameInterpretation {
-                    format: format.to_string(),
-                    prefix: prefix.clone(),
-                    number,
-                    style: if zip_spanned {
-                        "zip_spanned"
-                    } else if format == "rar"
-                        && number == 1
-                        && row.anchor.as_ref().is_some_and(|a| a.sfx)
-                    {
-                        "rar_sfx_part"
-                    } else {
-                        parsed.map(|part| part.style).unwrap_or(default_style)
-                    }
-                    .to_string(),
-                    width: parsed.map(|part| part.width).unwrap_or(3),
-                    decorated: true,
-                });
-            }
-            if let Some(index) = terminal.filter(|_| terminal_count == 1) {
-                if let Some(number) = highest.checked_add(1) {
-                    self.entries_by_path
-                        .get_mut(&rows[index].path_key)
-                        .expect("indexed row")
-                        .interpretations
-                        .get_mut(format)
-                        .expect("indexed format")
-                        .push(NameInterpretation {
-                            format: format.to_string(),
-                            prefix: prefix.clone(),
-                            number,
-                            style: default_style.to_string(),
-                            width: 3,
-                            decorated: true,
-                        });
-                }
-            }
-        }
-    }
-
     fn candidates<'a>(&'a self, row: &RelationInput) -> &'a [ParsedVolume] {
         self.entries_by_path
             .get(&row.path_key)
@@ -623,134 +379,269 @@ impl DirectoryNameIndex {
             .unwrap_or(&[])
     }
 
-    fn interpretations(&self, row: &RelationInput, target_format: &str) -> &[NameInterpretation] {
-        self.entries_by_path
-            .get(&row.path_key)
-            .and_then(|entry| entry.interpretations.get(target_format))
-            .map(Vec::as_slice)
-            .unwrap_or(&[])
-    }
-}
-
-// Existing numbering schemes keep their interpretations. For otherwise
-// opaque names, first distinguish the text preceding the volume number;
-// only colliding prefixes require the full suffix with that number erased.
-fn match_competing_suffixes(
-    rows: &[RelationInput],
-    indexes: &[usize],
-    strengths: &[Option<&str>],
-    entries: &mut HashMap<String, DirectoryNameEntry>,
-) {
-    // A declared scheme can itself collide (e.g. part1.alpha/part1.beta).
-    // Refine only those prefixes; intact declared families keep their rules.
-    let mut crowded = HashMap::<String, usize>::new();
-    for index in indexes {
-        let row = &rows[*index];
-        if let Some(anchor) = row.anchor.as_ref().filter(|_| strengths[*index].is_some()) {
-            let entry = &entries[&row.path_key];
-            if resolved_volume_number(row, &entry.parsed, &anchor.format) == Some(1) {
-                if let Some(part) = entry.parsed.first() {
-                    *crowded
-                        .entry(logical_name_from_parsed(part).to_ascii_lowercase())
-                        .or_default() += 1;
+    /// Process one stem and one concrete format at a time. Only a unique
+    /// head authorizes loose recovery; multiple heads retain parsed families.
+    fn proposals(
+        &self,
+        rows: &[RelationInput],
+        strengths: &[Option<&str>],
+    ) -> Vec<(RelationProposal, bool)> {
+        let mut proposals = Vec::new();
+        for (stem, indexes) in &self.rows_by_stem {
+            if stem.is_empty() {
+                continue;
+            }
+            let mut formats = HashSet::new();
+            let mut launchers: HashMap<String, Vec<usize>> = HashMap::new();
+            let mut terminals: HashMap<String, Vec<usize>> = HashMap::new();
+            for &index in indexes {
+                let row = &rows[index];
+                if !row.relation_member_eligible {
+                    continue;
+                }
+                if strengths[index].is_some() {
+                    if let Some(anchor) = &row.anchor {
+                        formats.insert(anchor.format.as_str());
+                    }
+                }
+                if self.candidates(row).is_empty()
+                    && Path::new(&row.name)
+                        .extension()
+                        .is_some_and(|ext| ext.eq_ignore_ascii_case("exe"))
+                    && row.anchor.as_ref().is_some_and(is_possible_sfx_launcher)
+                {
+                    launchers
+                        .entry(get_logical_name(&row.name, false).to_ascii_lowercase())
+                        .or_default()
+                        .push(index);
+                }
+                let name = row.name.to_ascii_lowercase();
+                if let Some((prefix, tail)) = name.split_once(".zip") {
+                    if tail.is_empty() || tail.starts_with('.') {
+                        terminals.entry(prefix.to_string()).or_default().push(index);
+                    }
+                }
+            }
+            // An unknown MZ head may nominate one declared format, never
+            // guess between formats. Its payload still requires validation.
+            let mut mz_format = None;
+            if formats.contains("") {
+                let declared: HashSet<_> = indexes
+                    .iter()
+                    .flat_map(|index| self.candidates(&rows[*index]))
+                    .map(|part| part.family)
+                    .filter(|format| matches!(*format, "rar" | "7z" | "zip"))
+                    .collect();
+                if declared.len() == 1 {
+                    mz_format = declared.into_iter().next();
+                    formats.insert(mz_format.unwrap());
+                }
+            }
+            let mixed_formats = formats
+                .iter()
+                .filter(|format| matches!(**format, "rar" | "7z" | "zip"))
+                .count()
+                > 1;
+            for format in ["rar", "7z", "zip"] {
+                if !formats.contains(format) {
+                    continue;
+                }
+                let mut head = None;
+                let mut heads = 0usize;
+                let mut zip_spanned = false;
+                for &index in indexes {
+                    let row = &rows[index];
+                    let Some(anchor) = row.anchor.as_ref().filter(|anchor| {
+                        strengths[index].is_some()
+                            && (anchor.format == format
+                                || (anchor.format.is_empty() && mz_format == Some(format)))
+                    }) else {
+                        continue;
+                    };
+                    if resolved_volume_number(row, self.candidates(row), format) == Some(1) {
+                        heads += 1;
+                        head = Some(index);
+                    }
+                    zip_spanned |= format == "zip"
+                        && (anchor.evidence.contains(&"zip:split_marker")
+                            || anchor.evidence.contains(&"zip:eocd_split_terminal"));
+                }
+                let loose = heads == 1;
+                let shape = head.filter(|_| loose).and_then(|index| {
+                    let row = &rows[index];
+                    NumberShape::from_seed(&row.name, structural_volume_number(row, format)?)
+                });
+                let mut members = Vec::new();
+                for &index in indexes {
+                    let row = &rows[index];
+                    if !row.relation_member_eligible
+                        || row.anchor.as_ref().is_some_and(|anchor| {
+                            (!anchor.format.is_empty() && anchor.format != format)
+                                || (anchor.standalone && !anchor.sfx)
+                        })
+                    {
+                        continue;
+                    }
+                    if mixed_formats
+                        && row
+                            .anchor
+                            .as_ref()
+                            .is_none_or(|anchor| anchor.format.is_empty())
+                    {
+                        let suffix = row.name.split_once('.').map_or("", |(_, suffix)| suffix);
+                        if archive_family_hint(suffix).is_some_and(|hint| hint != format) {
+                            continue;
+                        }
+                    }
+                    // An unnumbered .zip terminal is a deferred slot. Digits
+                    // in its decoration must not collide with the last .zNN.
+                    if zip_spanned
+                        && self.candidates(row).is_empty()
+                        && row
+                            .anchor
+                            .as_ref()
+                            .and_then(|anchor| anchor.internal_volume_number)
+                            .is_none()
+                        && row
+                            .name
+                            .to_ascii_lowercase()
+                            .split_once(".zip")
+                            .is_some_and(|(_, tail)| tail.is_empty() || tail.starts_with('.'))
+                    {
+                        continue;
+                    }
+                    // Unnumbered launchers are ownership companions, never
+                    // archive bytes or a structural fallback volume #1.
+                    if self.candidates(row).is_empty()
+                        && row.anchor.as_ref().is_some_and(is_possible_sfx_launcher)
+                    {
+                        continue;
+                    }
+                    if let Some(value) = name_interpretation(row, self.candidates(row), format) {
+                        members.push((index, value));
+                    } else if loose {
+                        if let Some(number) =
+                            loose_volume_number(row, self.candidates(row), format, shape.as_ref())
+                        {
+                            members.push((
+                                index,
+                                NameInterpretation {
+                                    prefix: stem.clone(),
+                                    number,
+                                    style: "numeric_suffix".to_string(),
+                                    width: 3,
+                                    decorated: true,
+                                },
+                            ));
+                        }
+                    }
+                }
+                if loose {
+                    let mut common_prefix = None;
+                    let mut mixed = false;
+                    for &(index, _) in &members {
+                        if let Some(part) = self
+                            .candidates(&rows[index])
+                            .iter()
+                            .find(|part| part.family == format || part.family == "generic")
+                        {
+                            let prefix = logical_name_from_parsed(part).to_ascii_lowercase();
+                            mixed |= common_prefix.as_ref().is_some_and(|old| old != &prefix);
+                            common_prefix = Some(prefix);
+                        }
+                    }
+                    let prefix = common_prefix
+                        .filter(|_| !mixed)
+                        .unwrap_or_else(|| stem.clone());
+                    for (index, value) in &mut members {
+                        let row = &rows[*index];
+                        value.prefix = prefix.clone();
+                        value.number =
+                            loose_volume_number(row, self.candidates(row), format, shape.as_ref())
+                                .unwrap_or(value.number);
+                        value.style = if zip_spanned {
+                            "zip_spanned"
+                        } else if format == "rar"
+                            && value.number == 1
+                            && row.anchor.as_ref().is_some_and(|anchor| anchor.sfx)
+                        {
+                            "rar_sfx_part"
+                        } else if format == "rar" && value.style == "numeric_suffix" {
+                            "rar_part"
+                        } else {
+                            &value.style
+                        }
+                        .to_string();
+                    }
+                }
+                let mut families: HashMap<String, NameFamily> = HashMap::new();
+                for (index, value) in members {
+                    let family = families.entry(value.prefix.clone()).or_default();
+                    if strengths[index].is_some() {
+                        family.strength = Some(
+                            family.strength.unwrap_or(false) || strengths[index] == Some("strong"),
+                        );
+                    }
+                    family.members.push((index, value));
+                }
+                for (prefix, family) in families {
+                    let companions: Vec<_> = launchers
+                        .get(&prefix)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .chain(
+                            launchers
+                                .get(stem)
+                                .into_iter()
+                                .flatten()
+                                .copied()
+                                .filter(|_| prefix != *stem),
+                        )
+                        .collect();
+                    let strength = family.strength.or_else(|| {
+                        companions
+                            .iter()
+                            .any(|index| {
+                                strengths[*index].is_some()
+                                    && rows[*index]
+                                        .anchor
+                                        .as_ref()
+                                        .is_some_and(|anchor| anchor.format.is_empty())
+                                    && mz_format == Some(format)
+                            })
+                            .then_some(false)
+                    });
+                    let Some(strong) = strength else {
+                        continue;
+                    };
+                    let terminal = terminals.get(&prefix).map(Vec::as_slice).unwrap_or(&[]);
+                    if let Some(proposal) = make_name_proposal(
+                        rows,
+                        format,
+                        &prefix,
+                        &family.members,
+                        companions,
+                        terminal,
+                    ) {
+                        proposals.push((proposal, strong));
+                    }
                 }
             }
         }
-    }
-    crowded.retain(|_, heads| *heads > 1);
-    let refinable = |row: &RelationInput, entry: &DirectoryNameEntry| {
-        entry.parsed.is_empty()
-            || entry.parsed.iter().any(|part| {
-                crowded.contains_key(&logical_name_from_parsed(part).to_ascii_lowercase())
-            })
-            // A declared marker contradicted by structure is decoration,
-            // so let the same bounded discriminators find the real number.
-            || row.anchor.as_ref().is_some_and(|anchor| {
-                resolved_volume_number(row, &entry.parsed, &anchor.format)
-                    != entry.parsed.first().map(|part| part.number)
-            })
-    };
-    let mut prefixes: HashMap<String, Option<&str>> = HashMap::new();
-    let mut shapes: HashMap<String, Option<&str>> = HashMap::new();
-    for index in indexes {
-        let row = &rows[*index];
-        let Some(anchor) = row.anchor.as_ref().filter(|_| strengths[*index].is_some()) else {
-            continue;
-        };
-        let entry = &entries[&row.path_key];
-        if !matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
-            || !refinable(row, entry)
-            || resolved_volume_number(row, &entry.parsed, &anchor.format) != Some(1)
-        {
-            continue;
-        }
-        for (groups, full) in [(&mut prefixes, false), (&mut shapes, true)] {
-            if let Some(key) = suffix_discriminator(&row.name, 1, full) {
-                groups
-                    .entry(key)
-                    .and_modify(|owner| *owner = None)
-                    .or_insert(Some(&anchor.format));
-            }
-        }
-    }
-    if prefixes.is_empty() {
-        return;
-    }
-    for index in indexes {
-        let row = &rows[*index];
-        let entry = &entries[&row.path_key];
-        if !row.relation_member_eligible
-            || !refinable(row, entry)
-            || row.anchor.as_ref().is_some_and(|anchor| anchor.standalone)
-        {
-            continue;
-        }
-        let format = row
-            .anchor
-            .as_ref()
-            .map_or("", |anchor| anchor.format.as_str());
-        let Some(number) = resolved_volume_number(row, &entry.parsed, format) else {
-            continue;
-        };
-        let Some(prefix) = suffix_discriminator(&row.name, number, false) else {
-            continue;
-        };
-        let (key, format) = match prefixes.get(&prefix) {
-            Some(Some(format)) => (prefix, *format),
-            Some(None) => {
-                let Some(shape) = suffix_discriminator(&row.name, number, true) else {
-                    continue;
-                };
-                let Some(Some(format)) = shapes.get(&shape) else {
-                    continue;
-                };
-                (shape, *format)
-            }
-            None => continue,
-        };
-        if row
-            .anchor
-            .as_ref()
-            .is_some_and(|anchor| !anchor.format.is_empty() && anchor.format != format)
-        {
-            continue;
-        }
-        let values = entries
-            .get_mut(&row.path_key)
-            .expect("indexed row")
-            .interpretations
-            .get_mut(format)
-            .expect("indexed format");
-        values.clear();
-        values.push(NameInterpretation {
-            format: format.to_string(),
-            prefix: key,
-            number,
-            style: "suffix_discriminator".to_string(),
-            width: 3,
-            decorated: true,
+        proposals.sort_by(|a, b| {
+            a.0.logical_name
+                .cmp(&b.0.logical_name)
+                .then_with(|| a.0.format.cmp(&b.0.format))
         });
+        proposals
     }
+}
+
+#[derive(Default)]
+struct NameFamily {
+    strength: Option<bool>,
+    members: Vec<(usize, NameInterpretation)>,
 }
 
 #[pyfunction]
@@ -941,103 +832,24 @@ fn build_candidate_groups_from_physical(
                     row.anchor = Some(anchor.clone());
                 }
             }
-            // The name index stores the anchor-sensitive interpretations, so
-            // rebuild it after an MZ seed has been promoted by structure.
+            // Promotion can change which stems contain a potential seed.
             name_index = DirectoryNameIndex::build(&directory_rows, Some(filtered_keys));
         }
         let mut strong_suppressed_paths = HashSet::new();
-        let mut proposals = Vec::new();
-        let mut proposal_keys = HashSet::new();
-
         let seed_strengths: Vec<Option<&'static str>> = directory_rows
             .iter()
             .map(|row| seed_strength_for_row(row, &directory_rows, &name_index))
             .collect();
-        name_index.match_seed_buckets(&directory_rows, &seed_strengths);
-        name_index.index_families(&directory_rows);
-        let mut seeded_families = HashSet::new();
-        for (seed_index, strength) in seed_strengths
-            .iter()
-            .enumerate()
-            .filter_map(|(index, strength)| (*strength).map(|strength| (index, strength)))
-        {
-            let seed = &directory_rows[seed_index];
-            if !name_index.entries_by_path.contains_key(&seed.path_key) {
-                continue;
-            }
-            let Some(anchor) = seed.anchor.as_ref() else {
-                continue;
-            };
-            for interpretation in name_index.interpretations(seed, &anchor.format) {
-                if !seeded_families.insert((
-                    interpretation.format.clone(),
-                    interpretation.prefix.clone(),
-                    interpretation.style.clone(),
-                )) {
-                    continue;
-                }
-                for proposal in
-                    name_proposals_for_seed(&name_index, &directory_rows, seed, &interpretation)
-                {
-                    let key = proposal_key(&proposal);
-                    if !proposal_keys.insert(key) {
-                        continue;
-                    }
-                    // Only a concrete multi-file proposal suppresses standalone
-                    // fallback. Compute ownership once per family, not per seed.
-                    if strength == "strong" {
-                        // Unverified companions retain their standalone path.
-                        // Only a validated relation may claim a launcher.
-                        strong_suppressed_paths.extend(
-                            proposal
-                                .volumes
-                                .iter()
-                                .map(|part| part.0.to_ascii_lowercase()),
-                        );
-                    }
-                    proposals.push(proposal);
-                }
-            }
-        }
-
-        // Resolve ownership before any deep IO. A weak/password-blocked
-        // proposal must not lose shared opaque members to whichever format
-        // happens to validate first. Equal proposals were deduplicated above.
-        let ambiguous = {
-            let paths: Vec<HashSet<&str>> = proposals
-                .iter()
-                .map(|proposal| {
+        let mut validations = Vec::new();
+        for (proposal, strong) in name_index.proposals(&directory_rows, &seed_strengths) {
+            if strong {
+                // Companions are claimed only after successful validation.
+                strong_suppressed_paths.extend(
                     proposal
                         .volumes
                         .iter()
-                        .map(|part| part.0.as_str())
-                        .collect()
-                })
-                .collect();
-            conflicting_indexes_among(&paths, 0..proposals.len())
-        };
-        let mut validations = Vec::new();
-        for (index, proposal) in proposals.into_iter().enumerate() {
-            // Selection follows bucket-wide ownership, so an unselected
-            // competing seed still protects its possible members from mixing.
-            let selected = proposal
-                .volumes
-                .iter()
-                .any(|part| filtered_keys.contains(&part.0.to_ascii_lowercase()))
-                || proposal
-                    .companions
-                    .iter()
-                    .any(|path| filtered_keys.contains(&path.to_ascii_lowercase()));
-            if ambiguous.contains(&index) || !selected {
-                for (path, _, _, _, _) in &proposal.volumes {
-                    strong_suppressed_paths.remove(&path.to_ascii_lowercase());
-                }
-                validations.push(ProposalValidation {
-                    status: ProposalStatus::Reject,
-                    proposal,
-                    anchors: HashMap::new(),
-                });
-                continue;
+                        .map(|part| part.0.to_ascii_lowercase()),
+                );
             }
             validations.push(validate_relation_proposal(
                 py,
@@ -1047,6 +859,23 @@ fn build_candidate_groups_from_physical(
                 path_passwords,
             )?);
         }
+        // Arbitration considers every candidate in the active stem bucket,
+        // including competitors whose head was not selected by the caller.
+        let selected: Vec<_> = validations
+            .iter()
+            .map(|validation| {
+                validation
+                    .proposal
+                    .volumes
+                    .iter()
+                    .any(|part| filtered_keys.contains(&part.0.to_ascii_lowercase()))
+                    || validation
+                        .proposal
+                        .companions
+                        .iter()
+                        .any(|path| filtered_keys.contains(&path.to_ascii_lowercase()))
+            })
+            .collect();
 
         let validation_owned_paths: Vec<HashSet<String>> = validations
             .iter()
@@ -1106,10 +935,12 @@ fn build_candidate_groups_from_physical(
                 continue;
             }
             claimed_paths.extend(owned.iter().cloned());
-            output.push(NativeRelationGroup::Proposal(
-                validation.clone(),
-                GroupKind::Valid,
-            ));
+            if selected[index] {
+                output.push(NativeRelationGroup::Proposal(
+                    validation.clone(),
+                    GroupKind::Valid,
+                ));
+            }
         }
 
         // Only an unambiguous encrypted proposal is handed to the existing
@@ -1127,10 +958,12 @@ fn build_candidate_groups_from_physical(
                 continue;
             }
             password_paths.extend(owned.iter().cloned());
-            output.push(NativeRelationGroup::Proposal(
-                validation.clone(),
-                GroupKind::Password,
-            ));
+            if selected[index] {
+                output.push(NativeRelationGroup::Proposal(
+                    validation.clone(),
+                    GroupKind::Password,
+                ));
+            }
         }
 
         // A structurally proven volume set that is missing volumes is still
@@ -1161,10 +994,12 @@ fn build_candidate_groups_from_physical(
                 continue;
             }
             claimed_paths.extend(owned.iter().cloned());
-            output.push(NativeRelationGroup::Proposal(
-                validations[index].clone(),
-                GroupKind::Incomplete,
-            ));
+            if selected[index] {
+                output.push(NativeRelationGroup::Proposal(
+                    validations[index].clone(),
+                    GroupKind::Incomplete,
+                ));
+            }
         }
 
         for row in directory_rows.iter().filter(|row| {
@@ -1244,9 +1079,11 @@ fn seed_strength_for_row(
         && anchor.pe_structure
         && anchor.standalone
         && anchor.structure_offset.is_some_and(|offset| offset > 0)
-        && name_index.candidates(row).iter().any(|candidate| {
-            candidate.number == 1 && candidate.family == "rar" && candidate.style == "rar_sfx_part"
-        })
+        && resolved_volume_number(row, name_index.candidates(row), "rar") == Some(1)
+        && name_index
+            .candidates(row)
+            .iter()
+            .any(|candidate| candidate.number > 0)
         && strong_seed_related_paths(row, rows, name_index, anchor).len() >= 2;
     if raw_sfx_split_seed {
         return Some("strong");
@@ -1468,330 +1305,148 @@ fn strong_seed_related_paths(
         .collect()
 }
 
-fn name_interpretations_from_candidates(
+fn name_interpretation(
     row: &RelationInput,
-    parsed_candidates: &[ParsedVolume],
-    target_format: &str,
-) -> Vec<NameInterpretation> {
-    let name = &row.name;
+    parsed: &[ParsedVolume],
+    format: &str,
+) -> Option<NameInterpretation> {
     let anchor = row.anchor.as_ref();
-    let mut values = Vec::new();
-    if !target_format.is_empty()
-        && anchor.is_some_and(|value| !value.format.is_empty() && value.format != target_format)
-    {
-        return values;
+    if anchor.is_some_and(|anchor| !anchor.format.is_empty() && anchor.format != format) {
+        return None;
     }
-    let resolved_number = resolved_volume_number(row, parsed_candidates, target_format);
-    for parsed in parsed_candidates {
-        // A split SFX data head commonly keeps the launcher token in the
-        // filename (for example `bundle.exe.part1.*`) even when the payload
-        // format is 7z or ZIP.  The filename parser quite correctly treats
-        // `.exe` as the RAR/SFX spelling when it has no structural context.
-        // Once the cheap seed has proved that this exact file is a 7z/ZIP
-        // SFX head, reinterpret only that first slot for the seeded format.
-        // This is still a hypothesis; the format validator must prove the
-        // complete path union before the relation is emitted.
-        let sfx_data_head = target_format != "rar"
-            && parsed.number == 1
-            && parsed.family == "rar"
-            && anchor.is_some_and(|value| value.sfx)
-            && name.to_ascii_lowercase().contains(".exe.");
-        if target_format.is_empty() && !anchor.is_some_and(|value| value.sfx) {
-            continue;
-        }
-        if parsed.family != target_format && parsed.family != "generic" && !sfx_data_head {
-            continue;
-        }
-        let prefix = logical_name_from_parsed(&parsed).to_ascii_lowercase();
-        if prefix.is_empty() || parsed.number == 0 {
-            continue;
-        }
-        values.push(NameInterpretation {
-            format: target_format.to_string(),
-            prefix,
-            number: resolved_number.unwrap_or(parsed.number),
-            style: if sfx_data_head {
-                "part_numbered".to_string()
+    let number = resolved_volume_number(row, parsed, format);
+    let sfx_head = |part: &&ParsedVolume| {
+        part.number == 1
+            && part.family == "rar"
+            && anchor.is_some_and(|anchor| anchor.sfx)
+            && row.name.to_ascii_lowercase().contains(".exe.")
+    };
+    let candidate = parsed
+        .iter()
+        .find(|part| part.family == format)
+        .or_else(|| parsed.iter().find(|part| part.family == "generic"))
+        .or_else(|| parsed.iter().find(sfx_head));
+    if let Some(part) = candidate {
+        return Some(NameInterpretation {
+            prefix: logical_name_from_parsed(part).to_ascii_lowercase(),
+            number: number.unwrap_or(part.number),
+            style: if part.family == "rar" && format != "rar" {
+                "part_numbered"
             } else {
-                parsed.style.to_string()
-            },
-            width: parsed.width,
-            decorated: parsed.decorated,
+                part.style
+            }
+            .to_string(),
+            width: part.width,
+            decorated: part.decorated,
         });
     }
-
-    if values.is_empty() {
-        let Some(anchor) = anchor.filter(|value| {
-            value.format == target_format || (value.format.is_empty() && value.sfx)
-        }) else {
-            return values;
-        };
-        let sfx_data_bearing = !anchor.sfx
-            || anchor.multivolume
-            || anchor.continuation_to_next
-            || anchor.continuation_from_previous
-            || anchor
-                .expected_logical_size
-                .is_some_and(|expected| expected > anchor.size);
-        let structural_head = if target_format.is_empty() && anchor.format.is_empty() {
-            anchor.sfx
-        } else if anchor.sfx {
-            anchor.anchor_roles.contains(&"first") && sfx_data_bearing
-        } else {
-            anchor.anchor_roles.contains(&"first")
-        };
-        let structural_terminal = anchor.anchor_roles.contains(&"terminal");
-        if structural_head || structural_terminal {
-            let number = resolved_number
-                .or_else(|| structural_head.then_some(1))
-                .unwrap_or(0);
-            // Structure proves an archive head/terminal here; a disguised
-            // extension must not become part of the family prefix.
-            let prefix = get_logical_name(name, true).to_ascii_lowercase();
-            if number > 0 && !prefix.is_empty() {
-                values.push(NameInterpretation {
-                    format: target_format.to_string(),
-                    prefix,
-                    number,
-                    style: "structural_name".to_string(),
-                    width: 3,
-                    decorated: false,
-                });
-            }
-        }
+    let anchor = anchor?;
+    let data_bearing = !anchor.sfx
+        || anchor.multivolume
+        || anchor.continuation_to_next
+        || anchor.continuation_from_previous
+        || anchor
+            .expected_logical_size
+            .is_some_and(|size| size > anchor.size);
+    let head = anchor.anchor_roles.contains(&"first") && data_bearing;
+    if !(head || anchor.anchor_roles.contains(&"terminal")) {
+        return None;
     }
-    values.sort_by(|left, right| {
-        left.number
-            .cmp(&right.number)
-            .then_with(|| left.style.cmp(&right.style))
-            .then_with(|| left.prefix.cmp(&right.prefix))
-    });
-    values.dedup_by(|left, right| {
-        left.format == right.format
-            && left.prefix == right.prefix
-            && left.number == right.number
-            && left.style == right.style
-    });
-    values
-}
-
-fn name_proposals_for_seed(
-    name_index: &DirectoryNameIndex,
-    rows: &[RelationInput],
-    seed: &RelationInput,
-    seed_interpretation: &NameInterpretation,
-) -> Vec<RelationProposal> {
-    if !seed_interpretation.format.is_empty() {
-        return make_name_proposal(name_index, rows, seed_interpretation)
-            .into_iter()
-            .collect();
-    }
-
-    // An MZ seed has no format fact at the 512-byte cheap boundary.  Use only
-    // the same-family filename tokens on other physical rows to nominate a
-    // bounded set of concrete formats.  The resulting proposal still goes
-    // through exactly one format-specific deep validator.
-    let mut formats = HashSet::new();
-    for row in name_index
-        .rows_for_prefix(rows, &seed_interpretation.prefix)
-        .filter(|row| row.relation_member_eligible && !row.path.eq_ignore_ascii_case(&seed.path))
-    {
-        for parsed in name_index.candidates(row) {
-            if !matches!(parsed.family, "rar" | "7z" | "zip")
-                || !logical_name_from_parsed(&parsed)
-                    .eq_ignore_ascii_case(&seed_interpretation.prefix)
-            {
-                continue;
-            }
-            formats.insert(parsed.family);
-        }
-    }
-
-    // An unknown MZ seed must converge to one filename-declared format before
-    // any deep validator is authorized.  A mixed 7z/ZIP/RAR family remains
-    // ambiguous and is intentionally left to the ordinary embedded pipeline.
-    if formats.len() != 1 {
-        return Vec::new();
-    }
-    let format = formats.into_iter().next().unwrap();
-    let mut concrete = seed_interpretation.clone();
-    concrete.format = format.to_string();
-    concrete.style = if format == "rar" {
-        "rar_sfx_part".to_string()
-    } else {
-        "part_numbered".to_string()
-    };
-    if let Some(proposal) = make_name_proposal(name_index, rows, &concrete) {
-        return vec![proposal];
-    }
-    Vec::new()
+    Some(NameInterpretation {
+        prefix: get_logical_name(&row.name, true).to_ascii_lowercase(),
+        number: number.or_else(|| head.then_some(1))?,
+        style: "structural_name".to_string(),
+        width: 3,
+        decorated: false,
+    })
 }
 
 fn make_name_proposal(
-    name_index: &DirectoryNameIndex,
     rows: &[RelationInput],
-    seed_interpretation: &NameInterpretation,
+    format: &str,
+    prefix: &str,
+    members: &[(usize, NameInterpretation)],
+    companions: Vec<usize>,
+    terminals: &[usize],
 ) -> Option<RelationProposal> {
-    let mut slots: HashMap<u32, Vec<(String, NameInterpretation)>> = HashMap::new();
-    let mut companions = Vec::new();
-    for row in name_index
-        .rows_for_family(rows, seed_interpretation)
-        .filter(|row| row.relation_member_eligible)
-    {
-        let possible_launcher = row.anchor.as_ref().is_some_and(is_possible_sfx_launcher);
-        let numbered_volume_name = name_index
-            .candidates(row)
-            .iter()
-            .any(|candidate| candidate.number > 0);
-        let launcher_name_match = !numbered_volume_name
-            && (is_launcher_candidate(&row.name, &seed_interpretation.prefix)
-                || is_camouflaged_sfx_launcher(&row.name, &seed_interpretation.prefix));
-        // An unnumbered MZ/SFX file with the proposal's logical name is a
-        // launcher companion, even though the structural fallback below can
-        // otherwise reinterpret any SFX seed as volume 1.  Numbered `.exe`
-        // members do not match this predicate and remain real volumes.
-        if possible_launcher && launcher_name_match {
-            companions.push(row.path.clone());
-            continue;
-        }
-        let interpretations = name_index.interpretations(row, &seed_interpretation.format);
-        let matching = interpretations.iter().filter(|candidate| {
-            candidate.format == seed_interpretation.format
-                && candidate.prefix == seed_interpretation.prefix
-        });
-        let mut matched = false;
-        for candidate in matching {
-            matched = true;
-            slots
-                .entry(candidate.number)
-                .or_default()
-                .push((row.path.clone(), candidate.clone()));
-        }
-        if matched {
-            continue;
-        }
-    }
-
-    // Native ZIP spanning keeps its terminal volume as `name.zip`, while
-    // only the preceding `.zNN` members carry a number.  Treat that terminal
-    // name as a proposal slot; the validator still has to prove the EOCD and
-    // disk semantics, so this is a filename hypothesis rather than a fact.
-    if seed_interpretation.format == "zip" && seed_interpretation.style == "zip_spanned" {
-        let next_number = slots.keys().copied().max().unwrap_or(0).saturating_add(1);
-        for row in name_index
-            .rows_for_family(rows, seed_interpretation)
-            .filter(|row| row.relation_member_eligible)
-        {
-            if !zip_terminal_name_matches(&row.name, &seed_interpretation.prefix) {
-                continue;
+    let mut slots = HashMap::new();
+    let mut volumes = Vec::new();
+    let mut member_indexes = HashSet::new();
+    for (index, value) in members {
+        if let Some(previous) = slots.insert(value.number, *index) {
+            if previous != *index {
+                return None;
             }
-            if slots
-                .values()
-                .flatten()
-                .any(|(path, _)| path.eq_ignore_ascii_case(&row.path))
+            continue;
+        }
+        member_indexes.insert(*index);
+        volumes.push((
+            rows[*index].path.clone(),
+            value.number,
+            value.style.clone(),
+            value.width,
+            value.decorated,
+        ));
+    }
+    let style = volumes
+        .iter()
+        .map(|part| part.2.as_str())
+        .find(|style| *style != "structural_name")
+        .unwrap_or("structural_name")
+        .to_string();
+    if format == "zip" && style == "zip_spanned" {
+        let next = slots.keys().copied().max().unwrap_or(0).checked_add(1)?;
+        for &index in terminals {
+            let row = &rows[index];
+            if member_indexes.contains(&index)
+                || !row.relation_member_eligible
+                || row
+                    .anchor
+                    .as_ref()
+                    .is_some_and(|anchor| !anchor.format.is_empty() && anchor.format != format)
             {
                 continue;
             }
-            slots.entry(next_number).or_default().push((
+            let number = row
+                .anchor
+                .as_ref()
+                .and_then(|anchor| anchor.internal_volume_number)
+                .unwrap_or(next);
+            if slots.insert(number, index).is_some() {
+                return None;
+            }
+            volumes.push((
                 row.path.clone(),
-                NameInterpretation {
-                    format: "zip".to_string(),
-                    prefix: seed_interpretation.prefix.clone(),
-                    number: next_number,
-                    style: "zip_spanned".to_string(),
-                    width: 2,
-                    decorated: false,
-                },
+                number,
+                "zip_spanned".to_string(),
+                2,
+                false,
             ));
         }
     }
-
-    let mut volumes = Vec::new();
-    for (number, candidates) in &slots {
-        let unique_paths: HashSet<String> = candidates
-            .iter()
-            .map(|(path, _)| path.to_ascii_lowercase())
-            .collect();
-        if unique_paths.len() != 1 {
-            return None;
-        }
-        let (path, interpretation) = candidates.first()?.clone();
-        volumes.push((
-            path,
-            *number,
-            interpretation.style,
-            interpretation.width,
-            interpretation.decorated,
-        ));
-    }
-    volumes.sort_by(|left, right| left.1.cmp(&right.1).then_with(|| left.0.cmp(&right.0)));
-    let encrypted_rar_hypothesis = seed_interpretation.format == "rar"
-        && volumes.len() >= 2
-        // An encrypted RAR SFX part1.exe is already promoted by the narrow
-        // structural SFX seed rule above.  Do not let an incomplete filename
-        // proposal turn that seed into a watch-dispatchable split candidate
-        // before the remaining volumes arrive.
-        && !volumes.iter().any(|(path, _, _, _, _)| {
-            name_index.row(rows, path)
-                .and_then(|row| row.anchor.as_ref())
-                .is_some_and(|anchor| anchor.sfx)
-        })
-        && volumes.iter().all(|(path, _, _, _, _)| {
-            name_index.row(rows, path)
-                .and_then(|row| row.anchor.as_ref())
-                .is_some_and(|anchor| {
-                    anchor.format == "rar"
-                        && anchor.encrypted
-                        && anchor.needs_password
-                        && !anchor.standalone
-                })
+    let encrypted_rar = format == "rar"
+        && members.iter().all(|(index, _)| {
+            rows[*index].anchor.as_ref().is_some_and(|anchor| {
+                anchor.format == "rar"
+                    && anchor.encrypted
+                    && anchor.needs_password
+                    && !anchor.standalone
+                    && !anchor.sfx
+            })
         });
-    if volumes.len() < 2
-        || (!encrypted_rar_hypothesis && !volumes.iter().any(|volume| volume.1 == 1))
-    {
+    if volumes.len() < 2 || (!encrypted_rar && !slots.contains_key(&1)) {
         return None;
     }
-    // A gap is still a proposal: the validator can never accept it as a
-    // complete relation (see `proposal_has_gap`), but a structurally proven
-    // head plus later volumes must reach Extraction as an incomplete set
-    // instead of disappearing from discovery.
-    // A structural fallback is only a placeholder for the unnumbered head;
-    // it must not erase a concrete family style supplied by another member.
-    // In particular, `archive.rar` may be structurally identified as volume
-    // 1 while `archive.r00` carries the actual `rar_oldstyle` contract.
-    let style = volumes
-        .iter()
-        .map(|volume| volume.2.as_str())
-        .find(|style| *style != "structural_name")
-        .map(str::to_owned)
-        .unwrap_or_else(|| seed_interpretation.style.clone());
-    // The discriminator is an internal grouping key. Preserve the existing
-    // physical format styles used by validation and archive input planning.
-    let (logical_name, style) = if style == "suffix_discriminator" {
-        let head = name_index
-            .row(rows, &volumes[0].0)
-            .and_then(|row| row.anchor.as_ref());
-        let physical_style = match seed_interpretation.format.as_str() {
-            "rar" if head.is_some_and(|anchor| anchor.sfx) => "rar_sfx_part",
-            "rar" => "rar_part",
-            "zip" if head.is_some_and(|anchor| anchor.evidence.contains(&"zip:split_marker")) => {
-                "zip_spanned"
-            }
-            _ => "numeric_suffix",
-        };
-        (
-            clean_logical_name(&seed_interpretation.prefix.replace('\0', "")),
-            physical_style.to_string(),
-        )
-    } else {
-        (seed_interpretation.prefix.clone(), style)
-    };
+    volumes.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
     Some(RelationProposal {
-        format: seed_interpretation.format.clone(),
-        logical_name,
+        format: format.to_string(),
+        logical_name: prefix.to_string(),
         style,
         volumes,
-        companions,
+        companions: companions
+            .into_iter()
+            .map(|index| rows[index].path.clone())
+            .collect(),
     })
 }
 
@@ -1805,30 +1460,6 @@ fn is_possible_sfx_launcher(anchor: &VolumeAnchor) -> bool {
         && anchor.structure_offset.is_some_and(|offset| offset > 0)
         && anchor.anchor_roles.iter().any(|role| *role == "first");
     weak_mz_seed || cheap_embedded_archive
-}
-
-fn zip_terminal_name_matches(name: &str, logical_prefix: &str) -> bool {
-    let lower_name = basename(name).to_ascii_lowercase();
-    let marker = format!("{}.zip", logical_prefix.to_ascii_lowercase());
-    lower_name == marker
-        || lower_name
-            .strip_prefix(&marker)
-            .is_some_and(|tail| tail.starts_with('.'))
-}
-
-fn proposal_key(proposal: &RelationProposal) -> String {
-    let mut paths: Vec<String> = proposal
-        .volumes
-        .iter()
-        .map(|(path, number, _, _, _)| format!("{number}:{}", path.to_ascii_lowercase()))
-        .collect();
-    paths.sort();
-    // Different parser interpretations can describe the same physical
-    // proposal (for example `payload.7z.001` can also be read as a generic
-    // numeric suffix).  They are not competing relations; keep the first,
-    // strongest interpretation and only treat a different path union or
-    // format as a distinct proposal.
-    format!("{}|{}", proposal.format, paths.join(","))
 }
 
 fn proposal_owned_paths(proposal: &RelationProposal) -> HashSet<String> {
@@ -1879,29 +1510,6 @@ fn conflicting_indexes_among<T: AsRef<str>>(
         }
     }
     conflicted
-}
-
-fn is_launcher_candidate(name: &str, logical_name: &str) -> bool {
-    Path::new(name)
-        .extension()
-        .and_then(|value| value.to_str())
-        .is_some_and(|value| value.eq_ignore_ascii_case("exe"))
-        && get_logical_name(name, false).eq_ignore_ascii_case(logical_name)
-}
-
-fn is_camouflaged_sfx_launcher(name: &str, logical_name: &str) -> bool {
-    let Some(extension) = Path::new(name).extension().and_then(|value| value.to_str()) else {
-        return false;
-    };
-    if !extension.eq_ignore_ascii_case("exe") {
-        return false;
-    }
-    let launcher = get_logical_name(name, false).to_ascii_lowercase();
-    let candidate = logical_name.to_ascii_lowercase();
-    candidate == launcher
-        || candidate.starts_with(&format!("{launcher}."))
-        || candidate.ends_with(&format!(".{launcher}"))
-        || candidate.contains(&format!(".{launcher}."))
 }
 
 fn validate_relation_proposal(
@@ -3199,9 +2807,9 @@ fn parse_numbered_volume_name(filename: &str) -> Option<ParsedVolume> {
     parse_volume_candidates(filename).into_iter().next()
 }
 
-/// Produce every plausible filename interpretation in descending semantic
-/// strength.  Callers that still expose the legacy single-result API use the
-/// first candidate, while directory grouping can reason about alternatives.
+/// Parse standard numbering schemes in descending semantic strength.
+/// Format-specific offsets stay here; seeded loose recovery uses the linear
+/// suffix scanner instead of inventing additional format/number spellings.
 ///
 /// A structural marker such as `part2` deliberately outranks a final numeric
 /// token.  For example, `movie.part2.456` is primarily part #2 with `.456` as
@@ -3230,7 +2838,9 @@ fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
                         style: "zip_zero_numbered",
                         width: captures.name("number")?.as_str().len(),
                         family: "zip",
-                        decorated: false,
+                        decorated: captures
+                            .name("tail")
+                            .is_some_and(|tail| !tail.as_str().is_empty()),
                     },
                 );
             }
@@ -3256,7 +2866,9 @@ fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
                             style: "numeric_suffix",
                             width: raw_number.as_str().len(),
                             family,
-                            decorated: false,
+                            decorated: captures
+                                .name("tail")
+                                .is_some_and(|tail| !tail.as_str().is_empty()),
                         },
                     );
                 }
@@ -3294,14 +2906,12 @@ fn parse_volume_candidates(filename: &str) -> Vec<ParsedVolume> {
                         style: "rar_oldstyle",
                         width: captures.name("number")?.as_str().len(),
                         family: "rar",
-                        decorated: false,
+                        decorated: captures
+                            .name("tail")
+                            .is_some_and(|tail| !tail.as_str().is_empty()),
                     },
                 );
             }
-        }
-
-        if let Some(parsed) = parse_decorated_numbered_volume(filename) {
-            push_unique_volume_candidate(&mut candidates, parsed);
         }
 
         // A final all-numeric token is intentionally last.  It is a discovery
@@ -3479,138 +3089,6 @@ fn split_relation_path(path: &str) -> (&str, &str) {
     (&path[..filename_index], &path[filename_index..])
 }
 
-fn parse_decorated_numbered_volume(path: &str) -> Option<ParsedVolume> {
-    if let Some(captures) = decorated_marker_format_re().captures(path) {
-        let raw_number = captures.name("number")?.as_str();
-        let format = captures.name("format")?.as_str();
-        let family = archive_family(format)?;
-        return parsed_decorated_marker(
-            captures.name("prefix")?.as_str(),
-            raw_number,
-            family,
-            format.eq_ignore_ascii_case("exe"),
-        );
-    }
-    if let Some(captures) = decorated_format_marker_re().captures(path) {
-        let raw_number = captures.name("number")?.as_str();
-        let format = captures.name("format")?.as_str();
-        let family = archive_family(format)?;
-        return parsed_decorated_numeric(
-            captures.name("prefix")?.as_str(),
-            raw_number,
-            family,
-            true,
-            format.eq_ignore_ascii_case("exe"),
-        );
-    }
-    if let Some(captures) = decorated_numeric_format_re().captures(path) {
-        let raw_number = captures.name("number")?.as_str();
-        let family = archive_family(captures.name("format")?.as_str())?;
-        return parsed_decorated_numeric(
-            captures.name("prefix")?.as_str(),
-            raw_number,
-            family,
-            false,
-            false,
-        );
-    }
-    if let Some(captures) = decorated_format_numeric_re().captures(path) {
-        let raw_number = captures.name("number")?.as_str();
-        let family = archive_family(captures.name("format")?.as_str())?;
-        return parsed_decorated_numeric(
-            captures.name("prefix")?.as_str(),
-            raw_number,
-            family,
-            false,
-            false,
-        );
-    }
-    if let Some(captures) = decorated_old_rar_re().captures(path) {
-        let number = captures.name("number")?.as_str();
-        return Some(ParsedVolume {
-            prefix: captures.name("prefix")?.as_str().to_string(),
-            number: number.parse::<u32>().ok()?.saturating_add(2),
-            style: "rar_oldstyle",
-            width: number.len(),
-            family: "rar",
-            decorated: true,
-        });
-    }
-    None
-}
-
-fn parsed_decorated_marker(
-    prefix: &str,
-    raw_number: &str,
-    family: &'static str,
-    sfx: bool,
-) -> Option<ParsedVolume> {
-    let number = raw_number.parse::<u32>().ok().filter(|value| *value > 0)?;
-    if family == "rar" {
-        return Some(ParsedVolume {
-            prefix: prefix.to_string(),
-            number,
-            style: if sfx { "rar_sfx_part" } else { "rar_part" },
-            width: raw_number.len(),
-            family,
-            decorated: true,
-        });
-    }
-    Some(ParsedVolume {
-        prefix: format!("{prefix}.{family}"),
-        number,
-        style: "numeric_suffix",
-        width: 3,
-        family,
-        decorated: true,
-    })
-}
-
-fn parsed_decorated_numeric(
-    prefix: &str,
-    raw_number: &str,
-    family: &'static str,
-    marker_numbered: bool,
-    sfx: bool,
-) -> Option<ParsedVolume> {
-    let mut number: u32 = raw_number.parse().ok()?;
-    if marker_numbered && number == 0 {
-        return None;
-    }
-    let style = if family == "zip" && raw_number.len() == 4 && raw_number.starts_with('0') {
-        number = number.saturating_add(1);
-        "zip_zero_numbered"
-    } else if family == "rar" && marker_numbered {
-        if sfx {
-            "rar_sfx_part"
-        } else {
-            "rar_part"
-        }
-    } else {
-        "numeric_suffix"
-    };
-    if number == 0 {
-        return None;
-    }
-    let canonical_prefix = if matches!(style, "rar_part" | "rar_sfx_part") {
-        prefix.to_string()
-    } else {
-        format!("{prefix}.{family}")
-    };
-    Some(ParsedVolume {
-        prefix: canonical_prefix,
-        number,
-        style,
-        width: if style == "numeric_suffix" {
-            3
-        } else {
-            raw_number.len()
-        },
-        family,
-        decorated: true,
-    })
-}
-
 fn archive_family(value: &str) -> Option<&'static str> {
     match value.to_ascii_lowercase().as_str() {
         "7z" => Some("7z"),
@@ -3647,11 +3125,7 @@ fn resolved_volume_number(
     parsed: &[ParsedVolume],
     target_format: &str,
 ) -> Option<u32> {
-    row.anchor
-        .as_ref()
-        .filter(|anchor| target_format.is_empty() || anchor.format == target_format)
-        .and_then(|anchor| anchor.internal_volume_number)
-        .filter(|number| *number > 0)
+    structural_volume_number(row, target_format)
         .or_else(|| {
             let candidate = if target_format.is_empty() {
                 parsed.first()
@@ -3668,89 +3142,106 @@ fn resolved_volume_number(
         .or_else(|| suffix_volume_number(&row.name))
 }
 
-fn suffix_discriminator(name: &str, number: u32, full: bool) -> Option<String> {
-    let mut position = name.find('.')? + 1;
-    let bytes = name.as_bytes();
-    let mut copied = 0;
-    let mut key = String::new();
-    while position < bytes.len() {
-        if !bytes[position].is_ascii_digit() {
-            position += 1;
-            continue;
-        }
-        let start = position;
-        while position < bytes.len() && bytes[position].is_ascii_digit() {
-            position += 1;
-        }
-        if name[start..position].parse::<u32>().ok() != Some(number)
-            || (position == start + 1
-                && bytes[start] == b'7'
-                && bytes
-                    .get(position)
-                    .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'z')))
-        {
-            continue;
-        }
-        if !full {
-            return Some(name[..start].to_ascii_lowercase());
-        }
-        key.push_str(&name[copied..start]);
-        // NUL cannot occur in physical Windows names, so this is an internal
-        // separator rather than a potentially colliding filename character.
-        key.push('\0');
-        copied = position;
-    }
-    if copied == 0 {
-        return None;
-    }
-    key.push_str(&name[copied..]);
-    Some(key.to_ascii_lowercase())
+fn structural_volume_number(row: &RelationInput, format: &str) -> Option<u32> {
+    let anchor = row
+        .anchor
+        .as_ref()
+        .filter(|anchor| format.is_empty() || anchor.format == format)?;
+    anchor
+        .internal_volume_number
+        // A first role or a standalone archive header proves the stream head
+        // even without an internal disk number (e.g. raw RAR SFX chunks).
+        .or_else(|| (anchor.anchor_roles.contains(&"first") || anchor.standalone).then_some(1))
+        .filter(|number| *number > 0)
 }
 
-/// Filename hints order a seeded proposal; they never prove an archive.
-/// The loose fallback accepts one distinct positive ASCII integer, ignoring
-/// zero/overflow noise. `7z`'s 7 is not a volume number.
-fn suffix_volume_number(name: &str) -> Option<u32> {
-    let suffix = name
-        .split_once('.')
-        .map(|(_, suffix)| suffix)
-        .unwrap_or("")
-        .as_bytes();
-    let mut position = 0usize;
-    let mut number = None;
-    let mut ambiguous = false;
-    while position < suffix.len() {
-        if !suffix[position].is_ascii_digit() {
-            position += 1;
-            continue;
+#[derive(Debug)]
+struct NumberShape<'a> {
+    prefix: &'a str,
+    suffix: &'a str,
+}
+
+impl<'a> NumberShape<'a> {
+    fn from_seed(name: &'a str, number: u32) -> Option<Self> {
+        let mut positions = suffix_numbers(name).filter(|(_, _, value)| *value == number);
+        let (start, end, _) = positions.next()?;
+        if positions.next().is_some() {
+            return None;
         }
-        let start = position;
-        let mut value = Some(0u32);
-        while position < suffix.len() && suffix[position].is_ascii_digit() {
-            value = value
-                .and_then(|value| value.checked_mul(10))
-                .and_then(|value| value.checked_add(u32::from(suffix[position] - b'0')));
-            position += 1;
-        }
-        let Some(value) = value.filter(|value| *value > 0) else {
-            continue;
-        };
-        if value == 7
-            && position == start + 1
-            && suffix
-                .get(position)
-                .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'z'))
+        Some(Self {
+            prefix: &name[..start],
+            suffix: &name[end..],
+        })
+    }
+
+    fn number(&self, name: &str) -> Option<u32> {
+        let end = name.len().checked_sub(self.suffix.len())?;
+        if !name
+            .get(..self.prefix.len())?
+            .eq_ignore_ascii_case(self.prefix)
+            || !name.get(end..)?.eq_ignore_ascii_case(self.suffix)
         {
-            continue;
+            return None;
         }
-        ambiguous |= number.is_some_and(|previous| previous != value);
-        number = Some(value);
+        name.get(self.prefix.len()..end)?
+            .parse::<u32>()
+            .ok()
+            .filter(|number| *number > 0)
     }
-    if ambiguous {
+}
+
+fn loose_volume_number(
+    row: &RelationInput,
+    parsed: &[ParsedVolume],
+    format: &str,
+    shape: Option<&NumberShape<'_>>,
+) -> Option<u32> {
+    structural_volume_number(row, format)
+        .or_else(|| shape.and_then(|shape| shape.number(&row.name)))
+        .or_else(|| resolved_volume_number(row, parsed, format))
+        .filter(|number| *number > 0)
+}
+
+// Borrowed positions, no token strings or regex hypotheses. Numeric noise
+// is skipped once; both the head-position rule and loose fallback reuse this.
+fn suffix_numbers(name: &str) -> impl Iterator<Item = (usize, usize, u32)> + '_ {
+    let bytes = name.as_bytes();
+    let mut position = name.find('.').map_or(bytes.len(), |dot| dot + 1);
+    std::iter::from_fn(move || {
+        while position < bytes.len() {
+            if !bytes[position].is_ascii_digit() {
+                position += 1;
+                continue;
+            }
+            let start = position;
+            while position < bytes.len() && bytes[position].is_ascii_digit() {
+                position += 1;
+            }
+            let Some(number) = name[start..position]
+                .parse::<u32>()
+                .ok()
+                .filter(|number| *number > 0)
+            else {
+                continue;
+            };
+            if number == 7
+                && position == start + 1
+                && bytes
+                    .get(position)
+                    .is_some_and(|byte| byte.eq_ignore_ascii_case(&b'z'))
+            {
+                continue;
+            }
+            return Some((start, position, number));
+        }
         None
-    } else {
-        number
-    }
+    })
+}
+
+fn suffix_volume_number(name: &str) -> Option<u32> {
+    let mut numbers = suffix_numbers(name).map(|(_, _, number)| number);
+    let number = numbers.next()?;
+    numbers.all(|other| other == number).then_some(number)
 }
 
 fn split_ext(filename: &str) -> (String, String) {
@@ -3801,12 +3292,14 @@ fn plain_numeric_suffix_re() -> &'static Regex {
 
 fn parse_archive_numbered_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.(?P<format>7z|zip|rar)\.(?P<number>\d+)$"))
+    VALUE.get_or_init(|| {
+        re(r"^(?P<prefix>.+)\.(?P<format>7z|zip|rar)\.(?P<number>\d+)(?P<tail>(?:\.[^.]+)*)$")
+    })
 }
 
 fn parse_zip_zero_numbered_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+\.zip)\.(?P<number>\d{4})$"))
+    VALUE.get_or_init(|| re(r"^(?P<prefix>.+\.zip)\.(?P<number>\d{4})(?P<tail>(?:\.[^.]+)*)$"))
 }
 
 fn parse_zip_split_re() -> &'static Regex {
@@ -3821,7 +3314,7 @@ fn parse_rar_part_re() -> &'static Regex {
 
 fn parse_old_rar_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.r(?P<number>\d{2,})$"))
+    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.r(?P<number>\d{2,})(?P<tail>(?:\.[^.]+)*)$"))
 }
 
 fn parse_plain_numbered_re() -> &'static Regex {
@@ -3839,42 +3332,6 @@ fn parse_marker_numbered_re() -> &'static Regex {
 fn rar_loose_part_re() -> &'static Regex {
     static VALUE: OnceLock<Regex> = OnceLock::new();
     VALUE.get_or_init(|| re(r"^(?P<prefix>.*?)part(?P<number>\d+).*$"))
-}
-
-// Decorated names preserve only the meaningful token order. Everything surrounding
-// the marker, number, and archive-family token is intentionally treated as noise;
-// downstream archive structure detection is responsible for rejecting false positives.
-fn decorated_marker_format_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| {
-        re(r"^(?P<prefix>.+)\.[^.]*(?:part|vol(?:ume)?)[^.\d]*(?P<number>\d+)(?:[^.\d][^.]*)?\.[^.]*(?P<format>7z|zip|rar|exe)[^.]*(?:\.[^.]+)*$")
-    })
-}
-
-fn decorated_format_marker_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| {
-        re(r"^(?P<prefix>.+)\.[^.]*(?P<format>7z|zip|rar|exe)[^.]*\.[^.]*(?:part|vol(?:ume)?)[^.\d]*(?P<number>\d+)(?:[^.\d][^.]*)?(?:\.[^.]+)*$")
-    })
-}
-
-fn decorated_numeric_format_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| {
-        re(r"^(?P<prefix>.+)\.[^.]*?(?P<number>0\d{2,3})[^.]*\.[^.]*(?P<format>7z|zip|rar)[^.]*(?:\.[^.]+)*$")
-    })
-}
-
-fn decorated_format_numeric_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| {
-        re(r"^(?P<prefix>.+)\.[^.]*(?P<format>7z|zip|rar)[^.]*\.[^.]*?(?P<number>0\d{2,3})[^.]*(?:\.[^.]+)*$")
-    })
-}
-
-fn decorated_old_rar_re() -> &'static Regex {
-    static VALUE: OnceLock<Regex> = OnceLock::new();
-    VALUE.get_or_init(|| re(r"^(?P<prefix>.+)\.[^.]*r[^.\d]*(?P<number>\d{2,})[^.]*(?:\.[^.]+)*$"))
 }
 
 #[cfg(test)]
@@ -3980,13 +3437,11 @@ mod tests {
                         rows.push(row);
                     }
                 }
-                let mut index = DirectoryNameIndex::build(&rows, None);
-                index.match_seed_buckets(&rows, &vec![Some("strong"); rows.len()]);
-                index.index_families(&rows);
+                let index = DirectoryNameIndex::build(&rows, None);
+                let proposals = index.proposals(&rows, &vec![Some("strong"); rows.len()]);
+                assert_eq!(proposals.len(), rows.len() / 2);
                 let mut names = HashSet::new();
-                for head in (0..rows.len()).step_by(2) {
-                    let family = &index.interpretations(&rows[head], "rar")[0];
-                    let proposal = make_name_proposal(&index, &rows, family).unwrap();
+                for (head, (proposal, _)) in (0..rows.len()).step_by(2).zip(proposals) {
                     assert_eq!(
                         proposal
                             .volumes
@@ -4019,11 +3474,10 @@ mod tests {
             terminal.internal_volume_number = Some(4);
             terminal.anchor_roles = vec!["terminal"];
             terminal.evidence.push("zip:eocd_split_terminal");
-            let mut index = DirectoryNameIndex::build(&rows, None);
-            index.match_seed_buckets(&rows, &[Some("strong"), None, Some("strong")]);
-            index.index_families(&rows);
-            let family = &index.interpretations(&rows[0], "zip")[0];
-            let proposal = make_name_proposal(&index, &rows, family).unwrap();
+            let index = DirectoryNameIndex::build(&rows, None);
+            let proposals = index.proposals(&rows, &[Some("strong"), None, Some("strong")]);
+            assert_eq!(proposals.len(), 1);
+            let proposal = &proposals[0].0;
             assert_eq!(proposal.style, "zip_spanned");
             assert_eq!(
                 proposal
@@ -4057,8 +3511,7 @@ mod tests {
         rows.push(test_relation_row("selected.chunk2.bin", None));
         rows.push(test_relation_row("unselected.chunk1.bin", Some("zip")));
         let keys = HashSet::from([rows[100_001].path_key.clone()]);
-        let mut index = DirectoryNameIndex::build(&rows, Some(&keys));
-        index.index_families(&rows);
+        let index = DirectoryNameIndex::build(&rows, Some(&keys));
         assert_eq!(index.entries_by_path.len(), 2);
         assert_eq!(index.rows_by_stem.len(), 1);
         assert_eq!(
@@ -4069,47 +3522,99 @@ mod tests {
     }
 
     #[test]
-    fn competing_suffixes_escalate_only_colliding_prefixes() {
-        for names in [
-            [
-                "same.alpha.chunk1.bin",
-                "same.alpha.chunk2.bin",
-                "same.beta.chunk1.bin",
-                "same.beta.chunk2.bin",
-            ],
-            [
-                "same.chunk1.alpha",
-                "same.chunk2.alpha",
-                "same.chunk1.beta",
-                "same.chunk2.beta",
-            ],
-            [
-                "same.part1.alpha",
-                "same.part2.alpha",
-                "same.part1.beta",
-                "same.part2.beta",
-            ],
+    fn same_format_competition_keeps_only_direct_families() {
+        for (names, count) in [
+            (
+                [
+                    "same.alpha.chunk1.bin",
+                    "same.alpha.chunk2.bin",
+                    "same.beta.chunk1.bin",
+                    "same.beta.chunk2.bin",
+                ],
+                0,
+            ),
+            (
+                [
+                    "same.part1.alpha",
+                    "same.part2.alpha",
+                    "same.part1.beta",
+                    "same.part2.beta",
+                ],
+                0,
+            ),
+            (
+                [
+                    "same.alpha.7z.001.bin",
+                    "same.alpha.7z.002.bin",
+                    "same.beta.7z.001.bin",
+                    "same.beta.7z.002.bin",
+                ],
+                2,
+            ),
         ] {
             let rows: Vec<_> = names
                 .iter()
                 .enumerate()
                 .map(|(index, name)| test_relation_row(name, (index % 2 == 0).then_some("7z")))
                 .collect();
-            let mut index = DirectoryNameIndex::build(&rows, None);
-            let strengths = vec![Some("strong"), None, Some("strong"), None];
-            index.match_seed_buckets(&rows, &strengths);
-            index.index_families(&rows);
-            let first = &index.interpretations(&rows[0], "7z")[0];
-            let other = &index.interpretations(&rows[2], "7z")[0];
-            assert_ne!(first.prefix, other.prefix);
-            assert_eq!(index.rows_for_family(&rows, first).count(), 2);
-            assert_eq!(index.rows_for_family(&rows, other).count(), 2);
-            let first_proposal = make_name_proposal(&index, &rows, first).unwrap();
-            let other_proposal = make_name_proposal(&index, &rows, other).unwrap();
-            assert_ne!(first_proposal.logical_name, other_proposal.logical_name);
-            assert!(!first_proposal.logical_name.contains('\0'));
-            assert!(!other_proposal.logical_name.contains('\0'));
+            let index = DirectoryNameIndex::build(&rows, None);
+            let proposals = index.proposals(&rows, &[Some("strong"), None, Some("strong"), None]);
+            assert_eq!(proposals.len(), count);
         }
+    }
+
+    #[test]
+    fn unique_number_position_orders_opaque_members_without_marker_guessing() {
+        let mut rows = vec![
+            test_relation_row("same.part99.chunk01.bin", Some("7z")),
+            test_relation_row("same.part99.chunk002.bin", None),
+            test_relation_row("same.part99.chunk3.bin", None),
+        ];
+        rows[0].anchor.as_mut().unwrap().internal_volume_number = Some(1);
+        let index = DirectoryNameIndex::build(&rows, None);
+        let proposals = index.proposals(&rows, &[Some("strong"), None, None]);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(
+            proposals[0]
+                .0
+                .volumes
+                .iter()
+                .map(|part| part.1)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(NumberShape::from_seed("same.foo1.chunk1", 1).is_none());
+        let shape = NumberShape::from_seed("same.7z.chunk1", 1).unwrap();
+        assert_eq!(shape.number("SAME.7Z.CHUNK22"), Some(22));
+        assert_eq!(shape.number("same.7z.chunk0"), None);
+        assert_eq!(shape.number("same.7z.chunk4294967296"), None);
+        assert_eq!(shape.number("same.7z.other2"), None);
+        let mut raw_rar = rows.clone();
+        let head = raw_rar[0].anchor.as_mut().unwrap();
+        head.format = "rar".to_string();
+        head.anchor_roles = vec!["standalone"];
+        head.internal_volume_number = None;
+        head.standalone = true;
+        head.sfx = true;
+        head.pe_structure = true;
+        head.structure_offset = Some(256);
+        let index = DirectoryNameIndex::build(&raw_rar, None);
+        assert_eq!(
+            seed_strength_for_row(&raw_rar[0], &raw_rar, &index),
+            Some("strong")
+        );
+        let proposals = index.proposals(&raw_rar, &[Some("strong"), None, None]);
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].0.style, "rar_sfx_part");
+        assert_eq!(
+            proposals[0]
+                .0
+                .volumes
+                .iter()
+                .map(|part| part.1)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
     }
 
     fn test_relation_row(name: &str, format: Option<&str>) -> RelationInput {
@@ -4211,38 +3716,6 @@ mod tests {
         assert_eq!(second.style, "rar_part");
         assert_eq!(second.prefix, "shared.bundle");
         assert_eq!(second.number, 2);
-    }
-
-    #[test]
-    fn noisy_rar_part_names_keep_the_same_declared_family_and_prefix() {
-        let first = parse_numbered_volume_name("X.AApart01tail.BBrarCC").unwrap();
-        let second = parse_numbered_volume_name("X.DDpart02more.EErarFF").unwrap();
-
-        assert_eq!(first.family, "rar");
-        assert_eq!(second.family, "rar");
-        assert_eq!(first.style, "rar_part");
-        assert_eq!(second.style, "rar_part");
-        assert_eq!(first.prefix, "X");
-        assert_eq!(second.prefix, "X");
-        assert_eq!((first.number, second.number), (1, 2));
-        assert!(first.decorated && second.decorated);
-    }
-
-    #[test]
-    fn noisy_format_tokens_remain_cross_family_incompatible() {
-        let seven_zip = parse_numbered_volume_name("X.AA7zZZ.BB001CC").unwrap();
-        let zip = parse_numbered_volume_name("X.DDzipYY.EE001FF").unwrap();
-        let rar = parse_numbered_volume_name("X.GGpart01noise.HHrarII").unwrap();
-
-        assert_eq!(
-            (seven_zip.family, seven_zip.style),
-            ("7z", "numeric_suffix")
-        );
-        assert_eq!((zip.family, zip.style), ("zip", "numeric_suffix"));
-        assert_eq!((rar.family, rar.style), ("rar", "rar_part"));
-        assert_ne!(seven_zip.family, zip.family);
-        assert_ne!(seven_zip.family, rar.family);
-        assert_ne!(zip.family, rar.family);
     }
 
     #[test]
