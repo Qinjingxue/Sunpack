@@ -10,7 +10,6 @@ Binary-signature detection handles complex disguised archives. WAL crash recover
 
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=Latest%20release" alt="Latest release"></a>
-  <a href="https://github.com/Qinjingxue/Sunpack/actions/workflows/release.yml"><img src="https://github.com/Qinjingxue/Sunpack/actions/workflows/release.yml/badge.svg" alt="Build and tests"></a>
   <img src="https://img.shields.io/badge/platform-Windows%20only-2f6070" alt="Windows only">
   <a href="https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Qinjingxue/Sunpack" alt="MIT License"></a>
 </p>
@@ -234,10 +233,6 @@ followed by the same metrics for `7z.exe`. The raw full-matrix report is
 | ZST              | 104.599          | 181.936            | 0.575      | 23.039                | 9.789                   | 2.354     |
 
 ---
-
-## Notice
-
-SunPack is not yet mature, and its handling of uncontrolled inputs is limited. It is not guaranteed to be safe. If you have concerns, use it only in a trusted environment.
 
 ## License
 

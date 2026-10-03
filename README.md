@@ -10,7 +10,6 @@
 
 <p align="center">
   <a href="https://github.com/Qinjingxue/Sunpack/releases/latest"><img src="https://img.shields.io/github/v/release/Qinjingxue/Sunpack?label=%E6%9C%80%E6%96%B0%E7%89%88%E6%9C%AC" alt="最新版本"></a>
-  <a href="https://github.com/Qinjingxue/Sunpack/actions/workflows/release.yml"><img src="https://github.com/Qinjingxue/Sunpack/actions/workflows/release.yml/badge.svg" alt="构建与测试"></a>
   <img src="https://img.shields.io/badge/平台-Windows%20%E4%B8%93%E7%94%A8-2f6070" alt="Windows 专用">
   <a href="https://github.com/Qinjingxue/Sunpack/blob/main/LICENSE"><img src="https://img.shields.io/github/license/Qinjingxue/Sunpack" alt="MIT License"></a>
 </p>
@@ -221,10 +220,6 @@ uv run --locked pytest
 | ZST            | 104.599           | 181.936             | 0.575  | 23.039                 | 9.789                    | 2.354  |
 
 ---
-
-## 注意事项
-
-SunPack 目前尚不成熟，对于不可控输入的处理能力有限，不保证安全。如有顾虑，请仅在可信环境中使用。
 
 ## 许可证
 
