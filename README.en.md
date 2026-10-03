@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="sunpack.png" width="120" alt="SunPack">
+  <img src="sunpack.png" width="96" alt="SunPack">
 </p>
 <h1 align="center">SunPack</h1>
 <p align="center"><b>A fully automated archive processing tool for Windows that handles compressed files in the background—no manual extraction required.</b><br></p>
