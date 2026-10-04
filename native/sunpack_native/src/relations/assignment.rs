@@ -39,6 +39,7 @@ struct BucketView<'a> {
     facts: &'a HashMap<usize, StructuralFacts>,
     features: &'a HashMap<usize, NameFeatures>,
     format: &'a str,
+    loose_numeric_allowed: bool,
 }
 
 impl BucketView<'_> {
@@ -65,6 +66,37 @@ impl BucketView<'_> {
                     .flatten()
             })
             .min()
+    }
+
+    fn terminal_for_assignment(&self, fixed: &VolumeAssignment) -> Option<u32> {
+        fixed
+            .slots
+            .iter()
+            .filter_map(|(&n, i)| (self.facts[i].has_next == Some(false)).then_some(n))
+            .min()
+            .or_else(|| self.terminal())
+    }
+
+    fn complete(&self, fixed: &VolumeAssignment) -> bool {
+        !fixed.unresolved.iter().any(|i| self.facts[i].owned)
+            && validate::assignment_status(
+                self.format,
+                self.spanned(),
+                fixed
+                    .slots
+                    .iter()
+                    .map(|(&n, &i)| (n, self.rows[i].anchor.as_ref())),
+            ) == ProposalStatus::Valid
+    }
+
+    fn spanned(&self) -> bool {
+        self.format == "zip"
+            && self.indexes.iter().any(|i| {
+                self.rows[*i].anchor.as_ref().is_some_and(|a| {
+                    a.evidence.contains(&"zip:split_marker")
+                        || a.evidence.contains(&"zip:eocd_split_terminal")
+                })
+            })
     }
 
     fn fixed(&self) -> Result<VolumeAssignment, RelationFailureReason> {
@@ -107,14 +139,15 @@ impl BucketView<'_> {
     fn evaluate(
         &self,
         fixed: &VolumeAssignment,
+        structural: &VolumeAssignment,
         channel: &NumberChannel,
         generic: bool,
     ) -> Option<VolumeAssignment> {
         let mut out = fixed.clone();
         out.unresolved.clear();
-        let terminal = self.terminal();
+        let terminal = self.terminal_for_assignment(fixed);
         if generic {
-            for (&n, &i) in &fixed.slots {
+            for (&n, &i) in &structural.slots {
                 if let Some(features) = self.features.get(&i) {
                     // Unnumbered structural terminals do not nominate a
                     // channel; every numbered structural anchor constrains it.
@@ -148,16 +181,55 @@ impl BucketView<'_> {
                     }
                     inferred += 1;
                 }
-                _ if self.facts[&i].owned => return None,
-                _ => {} // No ownership: leave it to residual discovery.
+                _ => out.unresolved.push(i),
             }
         }
         // A channel that assigns nothing is not a successful hypothesis.
         (inferred > 0).then_some(out)
     }
 
+    fn solve_loose_numeric(
+        &self,
+        fixed: &VolumeAssignment,
+    ) -> Result<VolumeAssignment, RelationFailureReason> {
+        if !self.loose_numeric_allowed || !fixed.slots.contains_key(&1) {
+            return Err(RelationFailureReason::MissingVolume);
+        }
+        let terminal = self.terminal_for_assignment(fixed);
+        // This is only a weak filename bound, never a new structural fact.
+        // Missing huge slot numbers remain available in the stronger tiers.
+        let maximum =
+            terminal.unwrap_or_else(|| u32::try_from(self.indexes.len()).unwrap_or(u32::MAX));
+        let mut domains = Vec::with_capacity(fixed.unresolved.len());
+        for &i in &fixed.unresolved {
+            let mut numbers = BTreeMap::<u32, usize>::new();
+            if let Some(features) = self.features.get(&i) {
+                for n in &features.numbers {
+                    if n.value <= maximum
+                        && !(self.format == "7z" && n.seven_zip_literal)
+                        && !fixed.slots.contains_key(&n.value)
+                        && self.legal(i, n.value, terminal)
+                    {
+                        numbers
+                            .entry(n.value)
+                            .and_modify(|width| *width = (*width).min(n.width))
+                            .or_insert(n.width);
+                    }
+                }
+            }
+            domains.push(numeric::NumericDomain {
+                row: i,
+                required: self.facts[&i].owned,
+                numbers: numbers.into_iter().collect(),
+            });
+        }
+        let mut out = fixed.clone();
+        numeric::solve(&mut out, domains)?;
+        Ok(out)
+    }
+
     fn solve(&self) -> (VolumeAssignment, Option<RelationFailureReason>) {
-        let fixed = match self.fixed() {
+        let mut fixed = match self.fixed() {
             Ok(fixed) => fixed,
             Err(reason) => {
                 // Preserve each physical member without inventing a slot for
@@ -174,6 +246,7 @@ impl BucketView<'_> {
         if fixed.unresolved.is_empty() {
             return (fixed, None);
         }
+        let structural = fixed.clone();
         let numbering_style = self
             .indexes
             .iter()
@@ -194,7 +267,15 @@ impl BucketView<'_> {
             })
             .map(|p| NumberChannel::Canonical {
                 format: self.format.into(),
-                style: p.style.into(),
+                // EXE identifies the carrier, not a competing numbering
+                // scheme. Encrypted SFX heads and ordinary RAR parts share
+                // one canonical mapping before Main Header decryption.
+                style: if p.style == "rar_sfx_part" {
+                    "rar_part"
+                } else {
+                    p.style
+                }
+                .into(),
                 family: None,
             })
             .collect();
@@ -208,7 +289,7 @@ impl BucketView<'_> {
         }
         // Seed hypotheses from a numbered structural anchor, then constrain
         // each by every other anchor. K does not grow with bucket size.
-        let seed = fixed
+        let seed = structural
             .slots
             .values()
             .chain(fixed.unresolved.iter())
@@ -224,7 +305,7 @@ impl BucketView<'_> {
         for (channels, generic) in [(&canonical, false), (&tokens, true)] {
             let mut mapping: Option<VolumeAssignment> = None;
             for channel in channels {
-                let Some(candidate) = self.evaluate(&fixed, channel, generic) else {
+                let Some(candidate) = self.evaluate(&fixed, &structural, channel, generic) else {
                     continue;
                 };
                 if mapping
@@ -236,7 +317,11 @@ impl BucketView<'_> {
                 mapping = Some(candidate);
             }
             if let Some(mapping) = mapping {
-                return (mapping, None);
+                fixed = mapping;
+                if fixed.unresolved.is_empty() || self.complete(&fixed) {
+                    fixed.unresolved.clear();
+                    return (fixed, None);
+                }
             }
         }
         // Exact RAR members do not need unrelated opaque same-stem files.
@@ -252,7 +337,10 @@ impl BucketView<'_> {
                 None,
             );
         }
-        (fixed, Some(RelationFailureReason::MissingVolume))
+        match self.solve_loose_numeric(&fixed) {
+            Ok(mapping) => (mapping, None),
+            Err(reason) => (fixed, Some(reason)),
+        }
     }
 }
 
@@ -369,6 +457,7 @@ pub(super) fn resolve_buckets(
                 facts: &facts,
                 features: &features,
                 format,
+                loose_numeric_allowed: false,
             };
             let need_names = heads > 1
                 || structural_only
@@ -480,6 +569,8 @@ pub(super) fn resolve_buckets(
                 }
                 let view = BucketView {
                     rows,
+                    loose_numeric_allowed: !competing_families
+                        && indexes.iter().filter(|i| head_indexes.contains(i)).count() == 1,
                     indexes,
                     facts: &facts,
                     features: &features,
@@ -537,13 +628,7 @@ fn materialize(
     reason: Option<RelationFailureReason>,
 ) -> Option<ProposalValidation> {
     let rows = view.rows;
-    let spanned = view.format == "zip"
-        && view.indexes.iter().any(|i| {
-            rows[*i].anchor.as_ref().is_some_and(|a| {
-                a.evidence.contains(&"zip:split_marker")
-                    || a.evidence.contains(&"zip:eocd_split_terminal")
-            })
-        });
+    let spanned = view.spanned();
     let sfx = view.format == "rar"
         && assignment
             .slots
@@ -750,6 +835,226 @@ mod tests {
             Some(RelationFailureReason::AmbiguousVolumeMapping)
         );
         assert_eq!(slots(&groups[0]), vec![1]);
+    }
+
+    #[test]
+    fn loose_numbers_ignore_context_and_ordinal_without_reparsing() {
+        let rows = vec![
+            row("same.header1", "7z", Some(1), false),
+            row("same.download002foo", "", None, false),
+            row("same.zero0.blob0003bar", "", None, false),
+            row("same.2024.txt", "", None, false),
+            row("same.4294967295.txt", "", None, false),
+        ];
+        let groups = resolve(&rows);
+        assert_eq!(slots(&groups[0]), vec![1, 2, 3]);
+        assert_eq!(groups[0].reason, None);
+        assert_eq!(groups[0].proposal.volumes[1].0, rows[1].path);
+        assert_eq!(groups[0].proposal.volumes[2].0, rows[2].path);
+        assert!(!validation_owned_paths(&groups[0]).contains(&rows[3].path));
+        assert!(!validation_owned_paths(&groups[0]).contains(&rows[4].path));
+
+        let cache = RelationCache {
+            anchors: groups[0].anchors.clone(),
+            names: groups[0].name_features.clone(),
+        };
+        let mut renamed = rows.clone();
+        for row in &mut renamed[1..] {
+            row.name = "same.no_digits".into();
+        }
+        let retried = resolve_buckets(&renamed, &BucketIndex::build(&renamed, None), Some(&cache));
+        assert_eq!(retried[0].proposal.volumes, groups[0].proposal.volumes);
+    }
+
+    #[test]
+    fn numeric_propagation_prevents_shortest_width_from_stealing_a_singleton() {
+        let rows = vec![
+            row("same.header1", "7z", Some(1), false),
+            row("same.x2.y03", "", None, false),
+            row("same.alone02", "", None, false),
+        ];
+        let groups = resolve(&rows);
+        assert_eq!(groups[0].reason, None);
+        assert_eq!(groups[0].proposal.volumes[1].0, rows[2].path);
+        assert_eq!(groups[0].proposal.volumes[2].0, rows[1].path);
+    }
+
+    #[test]
+    fn loose_width_arbitration_is_unique_or_ambiguous() {
+        for tie in [false, true] {
+            let rows = vec![
+                row("same.header1", "7z", Some(1), false),
+                row("same.a2", "", None, false),
+                row(if tie { "same.b2" } else { "same.b002" }, "", None, false),
+                row("same.c0002", "", None, false),
+            ];
+            let groups = resolve(&rows);
+            if tie {
+                assert_eq!(
+                    groups[0].reason,
+                    Some(RelationFailureReason::AmbiguousVolumeMapping)
+                );
+                assert_eq!(slots(&groups[0]), vec![1]);
+            } else {
+                assert_eq!(groups[0].reason, None);
+                assert_eq!(slots(&groups[0]), vec![1, 2]);
+                assert_eq!(groups[0].proposal.volumes[1].0, rows[1].path);
+            }
+        }
+    }
+
+    #[test]
+    fn canonical_and_stable_facts_are_monotonic_before_loose_numbers() {
+        let rows = vec![
+            row("same.header1", "7z", Some(1), false),
+            row("same.7z.002", "", None, false),
+            row("same.header3", "", None, false),
+            row("same.x2.y4", "", None, false),
+        ];
+        let groups = resolve(&rows);
+        assert_eq!(groups[0].reason, None);
+        assert_eq!(slots(&groups[0]), vec![1, 2, 3, 4]);
+        for (i, volume) in groups[0].proposal.volumes.iter().enumerate() {
+            assert_eq!(volume.0, rows[i].path);
+        }
+    }
+
+    #[test]
+    fn partial_canonical_ambiguity_does_not_fall_through_to_widths() {
+        let rows = vec![
+            row("same.header1", "zip", Some(1), false),
+            row("same.part2.zip", "", None, false),
+            row("same.zip.003", "", None, false),
+        ];
+        let groups = resolve(&rows);
+        assert_eq!(
+            groups[0].reason,
+            Some(RelationFailureReason::AmbiguousVolumeMapping)
+        );
+        assert_eq!(slots(&groups[0]), vec![1]);
+    }
+
+    #[test]
+    fn encrypted_rar_sfx_and_plain_members_share_one_canonical_channel() {
+        let mut rows = vec![
+            row("same.part1.exe", "rar", None, false),
+            row("same.part2.rar", "rar", None, false),
+        ];
+        for row in &mut rows {
+            let anchor = row.anchor.as_mut().unwrap();
+            anchor.needs_password = true;
+            anchor.anchor_roles.clear();
+            anchor.relation_has_next = None;
+            anchor.evidence = vec!["rar5:encryption_header"];
+        }
+        let head = rows[0].anchor.as_mut().unwrap();
+        head.sfx = true;
+        head.pe_structure = true;
+        head.structure_offset = Some(128);
+        let mut groups = resolve(&rows);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].reason, None);
+        assert_eq!(slots(&groups[0]), vec![1, 2]);
+        validate::validate(&mut groups[0]);
+        assert_eq!(groups[0].status, ProposalStatus::NeedsPassword);
+        assert!(validation_relation_confirmed(&groups[0]));
+    }
+
+    #[test]
+    fn stable_ambiguity_keeps_canonical_facts_even_when_loose_widths_differ() {
+        let rows = vec![
+            row("same.build1.chunk1", "7z", Some(1), false),
+            row("same.7z.002", "", None, false),
+            row("same.build003.chunk4", "", None, false),
+            row("same.build4.chunk0003", "", None, false),
+        ];
+        let groups = resolve(&rows);
+        assert_eq!(
+            groups[0].reason,
+            Some(RelationFailureReason::AmbiguousVolumeMapping)
+        );
+        assert_eq!(slots(&groups[0]), vec![1, 2]);
+        assert_eq!(groups[0].proposal.volumes[1].0, rows[1].path);
+    }
+
+    #[test]
+    fn complete_stronger_mapping_does_not_claim_numeric_residual_noise() {
+        let mut rows = vec![
+            row("same.7z.001", "7z", Some(1), false),
+            row("same.7z.002", "", None, false),
+            row("same.x3", "", None, false),
+            row("same.2024.txt", "", None, false),
+        ];
+        rows[0].anchor.as_mut().unwrap().expected_logical_size = Some(200);
+        let groups = resolve(&rows);
+        assert_eq!(slots(&groups[0]), vec![1, 2]);
+        assert_eq!(groups[0].reason, None);
+    }
+
+    #[test]
+    fn loose_numbers_respect_format_roles_and_do_not_drop_owned_members() {
+        let mut rows = vec![
+            row("same.header1", "zip", Some(1), false),
+            row("same.x2", "", None, false),
+            row("same.y3", "", None, false),
+            row("same.z0.a4.b7", "zip", Some(4), true),
+            row("same.unassigned", "zip", None, false),
+        ];
+        rows[4].anchor.as_mut().unwrap().evidence.clear();
+        let groups = resolve(&rows);
+        assert_eq!(groups[0].reason, Some(RelationFailureReason::MissingVolume));
+        assert!(validation_owned_paths(&groups[0]).contains(&rows[4].path));
+    }
+
+    #[test]
+    fn weak_numeric_seven_zip_literal_and_zero_are_not_slots() {
+        let mut rows = vec![
+            row("same.header1", "7z", Some(1), false),
+            row("same.7z.blob0", "", None, false),
+        ];
+        // Put 7 inside the weak domain so this checks literal exclusion,
+        // independently of the filename-bound filter.
+        for suffix in ['a', 'b', 'c', 'd', 'e', 'f'] {
+            rows.push(row(&format!("same.noise{suffix}"), "", None, false));
+        }
+        let groups = resolve(&rows);
+        assert_eq!(slots(&groups[0]), vec![1]);
+    }
+
+    #[test]
+    fn seven_zip_literal_is_a_legal_loose_number_for_other_formats() {
+        let rows = vec![
+            row("same.header1", "zip", Some(1), false),
+            row("same.7z.blob0", "", None, false),
+            row("same.end", "zip", Some(8), true),
+        ];
+        let groups = resolve(&rows);
+        assert_eq!(slots(&groups[0]), vec![1, 7, 8]);
+    }
+
+    #[test]
+    fn duplicate_numeric_occurrences_collapse_to_one_file_slot_edge() {
+        let rows = vec![
+            row("same.header1", "7z", Some(1), false),
+            row("same.a002.b2.c03", "", None, false),
+            row("same.d03", "", None, false),
+        ];
+        let groups = resolve(&rows);
+        assert_eq!(groups[0].reason, None);
+        assert_eq!(slots(&groups[0]), vec![1, 2, 3]);
+        assert_eq!(groups[0].proposal.volumes[1].0, rows[1].path);
+    }
+
+    #[test]
+    fn missing_head_cannot_enable_context_free_inference() {
+        let rows = vec![
+            row("same.end0", "zip", Some(4), true),
+            row("same.x2", "", None, false),
+            row("same.y3", "", None, false),
+        ];
+        let groups = resolve(&rows);
+        assert_eq!(groups[0].reason, Some(RelationFailureReason::MissingVolume));
+        assert_eq!(slots(&groups[0]), vec![4]);
     }
 
     #[test]

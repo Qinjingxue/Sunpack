@@ -17,6 +17,26 @@ pytestmark = [
 
 
 def test_installed_broker_lifecycle_usn_roundtrip_and_hot_ipc(tmp_path):
+    # A pytest worker can retain leases from other Watch tests. This contract
+    # needs a process that owns exactly the acquire/release pair below.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from pathlib import Path; "
+            "from tests.integration.test_watch_broker_service import _broker_lifecycle_roundtrip; "
+            "_broker_lifecycle_roundtrip(Path(sys.argv[1]))",
+            str(tmp_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30.0,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _broker_lifecycle_roundtrip(tmp_path):
     import sunpack_native
     from sunpack.core.platform.windows.elevation import is_process_elevated
 
@@ -65,7 +85,6 @@ def test_installed_broker_lifecycle_usn_roundtrip_and_hot_ipc(tmp_path):
         sunpack_native.watch_broker_release()
 
     assert not sunpack_native.watch_broker_is_connected()
-    time.sleep(1.2)
 
 
 def test_service_stays_alive_until_the_last_process_lease_is_released():

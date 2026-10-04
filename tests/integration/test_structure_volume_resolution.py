@@ -81,6 +81,7 @@ def test_mixed_camouflaged_real_volumes_are_structure_resolved_and_extractable(m
 @pytest.mark.parametrize("name_style", (
     "format_number", "number_only", "extensionless_head", "invalid_number_noise",
     "bare_format_head",
+    "context_free_numbers", "monotonic_filename_tiers",
 ))
 def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     tmp_path, archive_format, name_style
@@ -105,7 +106,16 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     originals = sorted(path for path in case.archive_dir.iterdir() if path.is_file())
     for index, source in enumerate(originals, start=1):
         number = _source_volume_number(source.name, index)
-        if name_style == "bare_format_head" and number == 1:
+        if name_style in {"context_free_numbers", "monotonic_filename_tiers"}:
+            if number == 1:
+                target_name = "shared.header1"
+            elif name_style == "monotonic_filename_tiers" and number == 2:
+                target_name = f"shared.{archive_format}.002"
+            elif name_style == "monotonic_filename_tiers" and number == 3:
+                target_name = "shared.header3"
+            else:
+                target_name = f"shared.zero0.segment{chr(96 + number)}{number:04d}data"
+        elif name_style == "bare_format_head" and number == 1:
             target_name = f"shared.{archive_format}"
         elif name_style == "extensionless_head" and number == 1:
             target_name = "shared"
@@ -152,6 +162,48 @@ def test_first_dot_stem_and_loose_format_markers_resolve_real_volume_sets(
     finally:
         extractor.close()
     assert result.success is True, result.error
+    assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+
+
+@pytest.mark.parametrize("archive_format", ("7z", "zip"))
+def test_context_free_numbers_preserve_encrypted_sfx_launcher_ownership(tmp_path, archive_format):
+    password = "context-free-encrypted-sfx"
+    case = ArchiveFixtureFactory().create(
+        tmp_path, f"loose_sfx_{archive_format}", archive_format,
+        split=True, sfx=True, password=password,
+        payload_size=MIB, split_volume_size=MIB // 4,
+    )
+    renamed = []
+    launcher = None
+    for source in sorted(case.archive_dir.iterdir()):
+        number = _source_volume_number(source.name, 0)
+        if number == 0:
+            launcher = source.replace(case.archive_dir / "shared.exe")
+            continue
+        name = "shared.header1" if number == 1 else f"shared.blob{chr(96 + number)}{number:04d}tail"
+        renamed.append((number, source.replace(case.archive_dir / name)))
+    renamed.sort()
+    assert launcher is not None
+    paths = [str(path) for _, path in renamed]
+    group = RelationsScheduler().resolve_volume_once(
+        [paths[0]], paths + [str(launcher)], format_hint=archive_format,
+    )
+    assert group is not None
+    assert group.input_paths == paths
+    assert group.carrier_path == str(launcher)
+    assert set(group.owned_paths) == set(paths + [str(launcher)])
+    tasks = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    assert len(tasks) == 1
+    planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(tasks[0])
+    assert len(planned) == 1
+    extractor = ExtractionScheduler(cli_passwords=["wrong", password], builtin_passwords=[], max_retries=1)
+    output = tmp_path / "output"
+    try:
+        result = extractor.extract(planned[0], str(output))
+    finally:
+        extractor.close()
+    assert result.success is True, result.error
+    assert result.password_used == password
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
 

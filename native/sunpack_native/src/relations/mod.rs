@@ -15,6 +15,7 @@ use std::sync::OnceLock;
 mod assignment;
 mod bucket;
 mod filename;
+mod numeric;
 mod structural;
 mod validate;
 use assignment::RelationFailureReason;
@@ -967,16 +968,6 @@ fn password_error_proposal_to_dict(
         )?;
     }
     Ok(dict)
-}
-
-fn proposal_has_gap(proposal: &RelationProposal) -> bool {
-    // Proposals are already sorted and have unique slots. Never walk up to
-    // a filename-supplied maximum: it can be u32::MAX for just two files.
-    proposal.volumes.first().is_none_or(|part| part.1 != 1)
-        || proposal
-            .volumes
-            .windows(2)
-            .any(|pair| pair[0].1.checked_add(1) != Some(pair[1].1))
 }
 
 fn incomplete_proposal_to_dict(

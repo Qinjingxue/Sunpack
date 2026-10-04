@@ -114,7 +114,10 @@ impl NumberChannel {
             } => {
                 let mut found = features.canonical.iter().filter(|p| {
                     p.family == format
-                        && p.style == style
+                        && (p.style == style
+                            || (format == "rar"
+                                && style == "rar_part"
+                                && p.style == "rar_sfx_part"))
                         && family
                             .as_ref()
                             .is_none_or(|f| logical_name_from_parsed(p).eq_ignore_ascii_case(f))

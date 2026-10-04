@@ -1313,3 +1313,37 @@ structure → filename
 > **先把整个 bucket 的结构事实一次性变成硬约束，再把剩余未知卷号建模成一个小规模的全局映射问题；文件名只是求解这个映射的辅助证据，最终 validator 只验证唯一解。**
 
 这应该成为 SunPack 后续分卷识别的稳定长期架构。
+
+---
+
+## 25. Context-free numeric 最末层（追加实现）
+
+文件名推断改为单调累积的三层：
+
+```text
+结构 fixed
+  → canonical / format-specific partial mapping
+  → stable NumberChannel partial mapping
+  → context-free numeric residual mapping
+```
+
+每层的唯一 mapping 固定下来，后层只处理其 unresolved；不同 channel
+产生不同 mapping 时立即返回 `AmbiguousVolumeMapping`，不能继续降级。
+已经通过现有纯内存 validator 的完整强映射直接结束，普通 residual 不再被吸入。
+
+第三层只使用完成格式和 family partition 后的 `BucketView.indexes` 中剩余候选，
+并要求当前 family 有且仅有一个 relation head。竞争 head 不进入第三层。
+完全复用已缓存的 `NameFeatures.numbers`，只取 value 和 width，不重新 parse、probe
+或在 Python 中求解。0、7z 字面数字 7、已固定 slot、违反结构 role 或超出 terminal
+的值不进入候选；无 terminal 时，最后一层的弱候选上界取当前 family 文件数，
+避免把年份和巨大噪声数字扩成卷号域。更强层和已有结构编号不受该弱上界影响。
+
+同一文件内相同数值的 occurrence 合并并保留最短 width。用稀疏二分图记录
+file → slots 和 slot → files：先传播唯一候选，再对最小的剩余 slot 选择唯一最短
+width，每次选择后立即继续传播。同宽竞争返回 ambiguity；两个 singleton 文件
+争抢同一 slot 时不任意固定其一。结构 owned 的文件始终必需，不能因竞争而丢弃。
+
+事件队列只处理受影响的边，singleton 使用 degree / XOR 定位；每条边最多删除
+一次，不逐卷重扫 bucket，不枚举 `1..max_number`，不进行组合搜索。
+候选索引和有序输出的成本取决于实际 occurrence 数，图只存活于本次 family 求解。
+最终继续使用同一个 relation validator 和 CLI / Watch 缺卷路径。
