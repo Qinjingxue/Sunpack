@@ -17,8 +17,6 @@ $ErrorActionPreference = "Stop"
 $interactivePrompting = -not $NoPause -and -not [Console]::IsInputRedirected
 $promptForAcceptanceTests = ($PSBoundParameters.Count -eq 0) -and $interactivePrompting
 
-. (Join-Path $PSScriptRoot "sevenzip_asm_check.ps1")
-
 function Write-Step {
     param([string]$Message)
     Write-Host ""
@@ -30,14 +28,7 @@ function Wait-BeforeBuildExit {
         return
     }
     Write-Host ""
-    Write-Host "Press any key to exit..." -ForegroundColor Cyan
-    try {
-        if (-not [Console]::IsInputRedirected) {
-            $null = [Console]::ReadKey($true)
-            return
-        }
-    } catch {
-    }
+    Write-Host "Press Enter to exit..." -ForegroundColor Cyan
     try {
         $null = Read-Host
     } catch {
@@ -884,6 +875,7 @@ function Assert-PackagedRuntimeTools {
 }
 
 try {
+. (Join-Path $PSScriptRoot "sevenzip_asm_check.ps1")
 $repoRoot = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $repoRoot
 $buildArch = $Arch.ToLowerInvariant()
@@ -1255,7 +1247,7 @@ Write-Host "Windows installer: $releaseInstallerPath"
     Write-Host ""
     Write-Host ("Build failed: {0}" -f $_.Exception.Message) -ForegroundColor Red
     Wait-BeforeBuildExit
-    throw
+    exit 1
 }
 
 Wait-BeforeBuildExit
