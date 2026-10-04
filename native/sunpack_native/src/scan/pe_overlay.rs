@@ -215,6 +215,8 @@ pub(crate) fn inspect_pe_overlay_native(
     result.evidence.push("pe:overlay_present");
 
     let sample_size = OVERLAY_SCAN_WINDOW_BYTES.min(actual_size - pe_end);
+    // Keep reusable PE header blocks; the overlay search sample is one-shot.
+    let mut file = reader.probe_reader().cursor();
     let mut sample = vec![0; sample_size as usize];
     if let Err(fault) = seek_field(
         &mut file,

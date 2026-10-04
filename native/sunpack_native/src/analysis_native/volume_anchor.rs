@@ -253,6 +253,9 @@ fn probe_path(
         prefix_len = size.min(prefix_limit as u64) as usize;
     }
     if prefix_len > base_prefix_len {
+        // The expanded SFX search prefix is reused by the parsers below, then
+        // dropped. The ordinary leading header keeps its existing cache path.
+        let mut file = reader.probe_reader().cursor();
         prefix.resize(prefix_len, 0);
         if file.seek(SeekFrom::Start(base_prefix_len as u64)).is_err()
             || file.read_exact(&mut prefix[base_prefix_len..]).is_err()

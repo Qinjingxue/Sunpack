@@ -323,7 +323,10 @@ fn scan_embedded_archives_native_with_iocp(
         });
     }
 
-    let mut candidates = validate_raw_hits(&reader, file_size, &raw_hits, &xz_footer_ends)?;
+    // Structural facts survive in the result; transient validation windows
+    // share this reader's generation/request state, not the global block cache.
+    let probe_reader = reader.probe_reader();
+    let mut candidates = validate_raw_hits(&probe_reader, file_size, &raw_hits, &xz_footer_ends)?;
     candidates.sort_by_key(|candidate| {
         (
             candidate.offset,

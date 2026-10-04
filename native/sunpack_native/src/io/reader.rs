@@ -189,6 +189,7 @@ pub(crate) struct ReaderStats {
 pub(crate) struct ManagedReader {
     source: Arc<dyn ByteSource>,
     state: Arc<ReaderState>,
+    shared_blocks: bool,
 }
 
 struct ReaderState {
@@ -220,6 +221,7 @@ impl ManagedReader {
     pub(crate) fn new(source: Arc<dyn ByteSource>, config: ReaderConfig) -> Self {
         Self {
             source,
+            shared_blocks: true,
             state: Arc::new(ReaderState {
                 gate: ReadGate {
                     limit: config.max_concurrent_reads.max(1),
@@ -260,7 +262,20 @@ impl ManagedReader {
     }
 
     pub(crate) fn with_config(&self, config: ReaderConfig) -> Self {
-        Self::new(Arc::clone(&self.source), config)
+        let mut reader = Self::new(Arc::clone(&self.source), config);
+        reader.shared_blocks = self.shared_blocks;
+        reader
+    }
+
+    /// One analysis borrows the same generation, budget, gate and request
+    /// cache. Its transient reads use the existing direct source path, so
+    /// search/validation windows do not become process-wide retained blocks.
+    pub(crate) fn probe_reader(&self) -> Self {
+        Self {
+            source: Arc::clone(&self.source),
+            state: Arc::clone(&self.state),
+            shared_blocks: false,
+        }
     }
 
     pub(crate) fn len(&self) -> u64 {
@@ -290,7 +305,12 @@ impl ManagedReader {
         let read_len = len.min((self.len() - offset) as usize);
         if !self.uses_request_state() {
             let _permit = self.state.gate.acquire()?;
-            let data = self.source.read_at(offset, read_len).map_err(|error| {
+            let result = if self.shared_blocks {
+                self.source.read_at(offset, read_len)
+            } else {
+                self.source.read_direct_at(offset, read_len)
+            };
+            let data = result.map_err(|error| {
                 ReadFault::physical("read_at", offset, read_len, 0, self.len(), &error)
                     .into_io_error()
             })?;
@@ -356,13 +376,16 @@ impl ManagedReader {
         let read_len = buffer.len().min((self.len() - offset) as usize);
         if !self.uses_request_state() {
             let _permit = self.state.gate.acquire()?;
-            let count = self
-                .source
-                .read_into_at(offset, &mut buffer[..read_len])
-                .map_err(|error| {
-                    ReadFault::physical("read_into_at", offset, read_len, 0, self.len(), &error)
-                        .into_io_error()
-                })?;
+            let result = if self.shared_blocks {
+                self.source.read_into_at(offset, &mut buffer[..read_len])
+            } else {
+                self.source
+                    .read_direct_into_at(offset, &mut buffer[..read_len])
+            };
+            let count = result.map_err(|error| {
+                ReadFault::physical("read_into_at", offset, read_len, 0, self.len(), &error)
+                    .into_io_error()
+            })?;
             self.state
                 .uncached_read_bytes
                 .fetch_add(count as u64, Ordering::Relaxed);
@@ -403,13 +426,10 @@ impl ManagedReader {
         let read_len = len.min((self.len() - offset) as usize);
         if !self.uses_request_state() {
             let _permit = self.state.gate.acquire()?;
-            let slices = self
-                .source
-                .read_slices_at(offset, read_len)
-                .map_err(|error| {
-                    ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
-                        .into_io_error()
-                })?;
+            let slices = self.source_slices_at(offset, read_len).map_err(|error| {
+                ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
+                    .into_io_error()
+            })?;
             let count = slices.iter().map(|slice| slice.len()).sum::<usize>();
             self.state
                 .uncached_read_bytes
@@ -492,12 +512,10 @@ impl ManagedReader {
         }
 
         let result = self.state.gate.acquire().and_then(|_permit| {
-            self.source
-                .read_slices_at(offset, read_len)
-                .map_err(|error| {
-                    ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
-                        .into_io_error()
-                })
+            self.source_slices_at(offset, read_len).map_err(|error| {
+                ReadFault::physical("read_slices_at", offset, read_len, 0, self.len(), &error)
+                    .into_io_error()
+            })
         });
         let count = result
             .as_ref()
@@ -510,9 +528,24 @@ impl ManagedReader {
         result
     }
 
+    fn source_slices_at(&self, offset: u64, len: usize) -> io::Result<Vec<CachedSlice>> {
+        if self.shared_blocks {
+            self.source.read_slices_at(offset, len)
+        } else {
+            let data = self.source.read_direct_at(offset, len)?;
+            Ok((!data.is_empty())
+                .then(|| CachedSlice::from_vec(data))
+                .into_iter()
+                .collect())
+        }
+    }
+
     /// Warms every fixed block touched by the supplied ranges. Overlapping
     /// ranges are coalesced by the source before physical I/O.
     pub(crate) fn prefetch(&self, ranges: &[(u64, usize)]) -> io::Result<()> {
+        if !self.shared_blocks {
+            return Ok(());
+        }
         let _permit = self.state.gate.acquire()?;
         self.source.prefetch(ranges)
     }
@@ -2394,6 +2427,135 @@ mod tests {
         assert_eq!(stats.read_bytes, 4);
         assert_eq!(stats.cache_hits, 1);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn probe_reads_keep_ranges_and_generation_without_retaining_shared_blocks() {
+        let data = vec![0x5au8; BLOCK_SIZE * 2 + 3];
+        let path = temp_file("managed_reader_probe_scope", &data);
+        let reader = ManagedReader::open(&path).unwrap();
+        let probe = reader.probe_reader();
+        assert!(Arc::ptr_eq(&reader.source, &probe.source));
+        assert!(Arc::ptr_eq(&reader.state, &probe.state));
+        assert_eq!(
+            reader.file_identity().unwrap(),
+            probe.file_identity().unwrap()
+        );
+        assert_eq!(probe.read_at(BLOCK_SIZE as u64 - 2, 8).unwrap(), [0x5a; 8]);
+        assert_eq!(
+            &*probe.read_cached_at(BLOCK_SIZE as u64, 4).unwrap(),
+            &[0x5a; 4]
+        );
+        assert_eq!(probe.read_at(data.len() as u64 - 2, 8).unwrap(), [0x5a; 2]);
+        let fault = probe
+            .read_exact_field_at(data.len() as u64 - 2, 8, "zip.eocd", FieldLocation::Tail)
+            .unwrap_err();
+        assert_eq!(fault.code, "unexpected_eof");
+        assert_eq!(fault.field, "zip.eocd");
+        assert_eq!(fault.requested, 8);
+        assert_eq!(fault.actual, 2);
+        assert_eq!(fault.source_len, data.len() as u64);
+        assert!(fault.possible_missing_volume());
+        probe.prefetch(&[(0, data.len())]).unwrap();
+        let mut cursor = probe.cursor();
+        cursor.seek(SeekFrom::Start(3)).unwrap();
+        let mut bytes = [0; 4];
+        cursor.read_exact(&mut bytes).unwrap();
+        assert_eq!(bytes, [0x5a; 4]);
+        let (_, blocks, retained) = manager()
+            .release_resources_under_roots(&[reader.file_identity().unwrap().path])
+            .unwrap();
+        assert_eq!((blocks, retained), (0, 0));
+        let fault = probe
+            .read_exact_field_at(2, 4, "zip.eocd", FieldLocation::Tail)
+            .unwrap_err();
+        assert_eq!(fault.code, "io_error");
+        assert_eq!(fault.operation, "read_at");
+        assert_eq!(fault.offset, 2);
+        assert_eq!(fault.requested, 4);
+        assert_eq!(fault.actual, 0);
+        assert_eq!(fault.field, "zip.eocd");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn probe_reuses_existing_request_window_and_the_same_read_budget() {
+        let path = temp_file("managed_reader_probe_request", b"abcdefgh");
+        let reader = ManagedReader::open_with_config(
+            &path,
+            ReaderConfig {
+                cache_bytes: BLOCK_SIZE,
+                max_read_bytes: Some(4),
+                max_concurrent_reads: 1,
+            },
+        )
+        .unwrap();
+        let first = reader.read_cached_at(0, 4).unwrap();
+        let probe = reader.probe_reader();
+        let second = probe.read_cached_at(0, 4).unwrap();
+        let (CachedBytes::Slice(first), CachedBytes::Slice(second)) = (first, second) else {
+            panic!("request windows must remain shared");
+        };
+        assert!(first.shares_backing(&second));
+        assert!(probe.read_at(4, 1).is_err());
+        assert_eq!(reader.stats().unwrap().read_bytes, 4);
+        assert_eq!(reader.stats().unwrap().cache_hits, 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn probe_request_cache_reuses_direct_windows_and_survives_release() {
+        let path = temp_file("managed_reader_probe_direct_request", b"abcdefgh");
+        let reader = ManagedReader::open_with_config(
+            &path,
+            ReaderConfig {
+                cache_bytes: 8,
+                max_read_bytes: Some(4),
+                max_concurrent_reads: 1,
+            },
+        )
+        .unwrap();
+        let probe = reader.probe_reader();
+        let first = probe.read_cached_at(0, 4).unwrap();
+        assert_eq!(&*probe.read_cached_at(0, 4).unwrap(), b"abcd");
+        assert_eq!(reader.stats().unwrap().read_bytes, 4);
+        assert_eq!(reader.stats().unwrap().cache_hits, 1);
+        let (_, blocks, retained) = manager()
+            .release_resources_under_roots(&[reader.file_identity().unwrap().path])
+            .unwrap();
+        assert_eq!((blocks, retained), (0, 0));
+        assert_eq!(&*first, b"abcd");
+        // Resource release must not reset the request's accumulated budget.
+        let error = probe.read_at(4, 1).unwrap_err();
+        assert!(error.to_string().contains("budget"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn probe_reads_reserve_a_shared_budget_atomically() {
+        let reader = ManagedReader::from_bytes(
+            vec![0; 128],
+            ReaderConfig {
+                cache_bytes: 0,
+                max_read_bytes: Some(32),
+                max_concurrent_reads: 4,
+            },
+        );
+        std::thread::scope(|scope| {
+            let jobs: Vec<_> = (0..16)
+                .map(|i| {
+                    let probe = reader.probe_reader();
+                    scope.spawn(move || probe.read_at(i * 4, 4))
+                })
+                .collect();
+            let success = jobs
+                .into_iter()
+                .map(|job| job.join().unwrap())
+                .filter(Result::is_ok)
+                .count();
+            assert_eq!(success, 8);
+        });
+        assert_eq!(reader.stats().unwrap().read_bytes, 32);
     }
 
     #[test]
