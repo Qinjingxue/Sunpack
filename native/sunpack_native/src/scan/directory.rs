@@ -32,7 +32,7 @@ pub(crate) struct DirectorySnapshotTable {
     pub(crate) is_dirs: Vec<bool>,
     pub(crate) sizes: Vec<Option<u64>>,
     mtimes_ns: Vec<Option<u64>>,
-    relation_member_eligible: Vec<bool>,
+    pub(crate) relation_member_eligible: Vec<bool>,
     pub(crate) relation_anchors: Vec<Option<VolumeAnchor>>,
     pub(crate) file_routes: Vec<u8>,
 }
@@ -106,19 +106,6 @@ impl NativeDirectorySnapshot {
             table.file_routes.push(route);
         }
         table
-    }
-
-    pub(crate) fn relation_file_records(
-        &self,
-    ) -> impl Iterator<Item = (&str, Option<u64>, bool, Option<&VolumeAnchor>)> + '_ {
-        self.rows.iter().filter_map(|&row| {
-            (!self.table.is_dirs[row]).then_some((
-                self.table.paths[row].as_str(),
-                self.table.sizes[row],
-                self.table.relation_member_eligible[row],
-                self.table.relation_anchors[row].as_ref(),
-            ))
-        })
     }
 
     pub(crate) fn records(&self) -> impl Iterator<Item = (&str, bool, Option<u64>, Option<u64>)> {

@@ -16,10 +16,12 @@ mod assignment;
 mod bucket;
 mod filename;
 mod numeric;
+mod scope;
 mod structural;
 mod validate;
 use assignment::RelationFailureReason;
 use bucket::BucketIndex;
+use scope::{RelationScopeIndex, RelationSource};
 
 #[derive(Debug, Clone)]
 pub(crate) struct RelationInput {
@@ -349,36 +351,21 @@ pub(crate) fn build_native_candidate_groups_from_snapshot_cached(
     cached: Option<&RelationCache>,
 ) -> PyResult<Vec<NativeRelationGroup>> {
     let filtered_keys: HashSet<String> = filtered_snapshot
-        .relation_file_records()
-        .map(|(path, _, _, _)| path.to_ascii_lowercase())
+        .rows
+        .iter()
+        .filter(|&&row| !filtered_snapshot.table.is_dirs[row])
+        .map(|&row| filtered_snapshot.table.paths[row].to_ascii_lowercase())
         .collect();
     if filtered_keys.is_empty() {
         return Ok(Vec::new());
     }
-    let raw_rows: Vec<RelationInput> = raw_snapshot
-        .relation_file_records()
-        .map(|(path, size, relation_member_eligible, anchor)| {
-            let path = path.to_string();
-            let path_key = path.to_ascii_lowercase();
-            let name = Path::new(&path)
-                .file_name()
-                .map(|value| value.to_string_lossy().to_string())
-                .unwrap_or_default();
-            let anchor = cached
-                .and_then(|cache| cache.anchors.get(&path_key))
-                .cloned()
-                .or_else(|| anchor.cloned());
-            RelationInput {
-                path,
-                path_key,
-                name,
-                size,
-                relation_member_eligible,
-                anchor,
-            }
-        })
-        .collect();
-    build_candidate_groups_from_physical(py, raw_rows, &filtered_keys, path_passwords, cached)
+    build_candidate_groups_from_source(
+        py,
+        RelationSource::Snapshot(raw_snapshot, cached),
+        &filtered_keys,
+        path_passwords,
+        cached,
+    )
 }
 
 pub(crate) fn relation_group_cached_anchors(
@@ -408,28 +395,20 @@ pub(crate) fn relation_group_cached_anchors(
     }
 }
 
-fn build_candidate_groups_from_physical(
+fn build_candidate_groups_from_source(
     py: Python<'_>,
-    rows: Vec<RelationInput>,
+    source: RelationSource<'_>,
     filtered_keys: &HashSet<String>,
     path_passwords: Option<&[(String, String)]>,
     cached: Option<&RelationCache>,
 ) -> PyResult<Vec<NativeRelationGroup>> {
-    let mut by_directory: HashMap<String, Vec<RelationInput>> = HashMap::new();
-    let mut directory_order = Vec::new();
-    for row in rows {
-        let directory = parent_directory_key(&row.path);
-        if !by_directory.contains_key(&directory) {
-            directory_order.push(directory.clone());
-        }
-        by_directory.entry(directory).or_default().push(row);
-    }
-
+    let scope = RelationScopeIndex::build(&source, filtered_keys);
     let mut output = Vec::new();
-    for directory in directory_order {
-        let Some(mut directory_rows) = by_directory.remove(&directory) else {
-            continue;
-        };
+    for indices in scope.directories {
+        let mut directory_rows: Vec<_> = indices
+            .into_iter()
+            .map(|row| source.materialize(row))
+            .collect();
         let name_index = BucketIndex::build(&directory_rows, Some(filtered_keys));
         structural::collect(py, &mut directory_rows, &name_index, path_passwords)?;
         let mut validations = assignment::resolve_buckets(&directory_rows, &name_index, cached);
@@ -557,14 +536,13 @@ fn build_candidate_groups_from_physical(
             }
         }
 
-        for row in directory_rows.iter().filter(|row| {
-            let key = row.path.to_ascii_lowercase();
-            filtered_keys.contains(&key)
-                && !claimed_paths.contains(&key)
-                && !password_paths.contains(&key)
+        for row in directory_rows.into_iter().filter(|row| {
+            filtered_keys.contains(&row.path_key)
+                && !claimed_paths.contains(&row.path_key)
+                && !password_paths.contains(&row.path_key)
         }) {
             let confirmed = row.anchor.as_ref().is_some_and(anchor_is_relation_archive);
-            output.push(NativeRelationGroup::Ordinary(row.clone(), confirmed));
+            output.push(NativeRelationGroup::Ordinary(row, confirmed));
         }
     }
     Ok(output)
@@ -1147,7 +1125,7 @@ pub(crate) fn relations_resolve_volume_once(
         .into_iter()
         .map(|anchor| (anchor.path.to_ascii_lowercase(), anchor))
         .collect();
-    let rows = visible_paths
+    let rows: Vec<_> = visible_paths
         .iter()
         .map(|path| RelationInput {
             path: path.clone(),
@@ -1165,9 +1143,9 @@ pub(crate) fn relations_resolve_volume_once(
         .filter(|path| parent_directory_key(path) == directory)
         .map(|path| path.to_ascii_lowercase())
         .collect();
-    let groups = build_candidate_groups_from_physical(
+    let groups = build_candidate_groups_from_source(
         py,
-        rows,
+        RelationSource::Physical(&rows),
         &filtered_keys,
         path_passwords.as_deref(),
         None,

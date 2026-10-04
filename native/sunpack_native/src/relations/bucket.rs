@@ -8,6 +8,11 @@ pub(super) struct BucketIndex {
 }
 
 impl BucketIndex {
+    pub(super) fn has_seed(anchor: &VolumeAnchor) -> bool {
+        cheap_seed_strength(anchor).is_some()
+            || (!anchor.standalone && (anchor.multivolume || anchor.needs_password))
+    }
+
     pub fn build(rows: &[RelationInput], filtered_keys: Option<&HashSet<String>>) -> Self {
         let selected: Option<HashSet<_>> = filtered_keys.map(|keys| {
             rows.iter()
@@ -17,12 +22,7 @@ impl BucketIndex {
         });
         let stems: HashSet<_> = rows
             .iter()
-            .filter(|r| {
-                r.anchor.as_ref().is_some_and(|a| {
-                    cheap_seed_strength(a).is_some()
-                        || (!a.standalone && (a.multivolume || a.needs_password))
-                })
-            })
+            .filter(|r| r.anchor.as_ref().is_some_and(Self::has_seed))
             .map(|r| first_dot_stem(&r.name).to_ascii_lowercase())
             .filter(|s| selected.as_ref().is_none_or(|set| set.contains(s)))
             .collect();
