@@ -56,6 +56,12 @@ Download the latest `sunpack-windows-<arch>-<version>-setup.exe` from [GitHub Re
    - Register the Explorer context menu for folders and folder backgrounds.
    - Start SunPack Watch with Windows (disabled by default).
 
+You can also run this command in PowerShell to download and install the latest version for your system architecture:
+
+```powershell
+$r = Invoke-RestMethod 'https://api.github.com/repos/Qinjingxue/Sunpack/releases/latest'; $arch = if ([Runtime.InteropServices.RuntimeInformation]::OSArchitecture -eq 'Arm64') { 'arm64' } else { 'x64' }; $a = $r.assets | Where-Object name -eq "sunpack-windows-$arch-$($r.tag_name)-setup.exe"; if (-not $a) { throw "Installer not found for $arch" }; $p = Join-Path $env:TEMP $a.name; Invoke-WebRequest $a.browser_download_url -OutFile $p; Start-Process $p -ArgumentList '/VERYSILENT','/SUPPRESSMSGBOXES','/NORESTART' -Wait
+```
+
 ---
 
 ## Usage guide
