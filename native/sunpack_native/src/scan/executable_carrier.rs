@@ -1,4 +1,5 @@
 use crate::io::reader::ManagedReader;
+use memchr::memmem;
 use std::io;
 
 const SFX_STUB_SCAN_BYTES: u64 = 1024 * 1024;
@@ -47,16 +48,7 @@ fn sfx_stub_profile_native(path: &str, executable_image_end: u64) -> io::Result<
 fn contains_any(haystack: &[u8], patterns: &[&[u8]]) -> bool {
     patterns
         .iter()
-        .any(|pattern| find_subslice(haystack, pattern).is_some())
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || needle.len() > haystack.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
+        .any(|pattern| memmem::find(haystack, pattern).is_some())
 }
 
 #[cfg(test)]

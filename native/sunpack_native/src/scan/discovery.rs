@@ -19,7 +19,8 @@ use std::sync::Arc;
 
 enum Candidate {
     File(Arc<DirectorySnapshotTable>, usize),
-    Relation(NativeRelationGroup),
+    // Keep ordinary file rows compact; relation facts live with their candidate.
+    Relation(Box<NativeRelationGroup>),
 }
 
 #[pyclass(module = "sunpack_native")]
@@ -143,8 +144,11 @@ impl NativeCandidateTable {
             &filtered_snapshot,
             path_passwords.as_deref(),
         )?;
-        self.rows
-            .extend(groups.into_iter().map(Candidate::Relation));
+        self.rows.extend(
+            groups
+                .into_iter()
+                .map(|group| Candidate::Relation(Box::new(group))),
+        );
         Ok(())
     }
 
@@ -159,8 +163,11 @@ impl NativeCandidateTable {
             build_native_candidate_groups_from_snapshot(py, &raw_snapshot, &relation_view, None)?;
         self.rows
             .reserve(groups.len() + filtered_snapshot.rows.len());
-        self.rows
-            .extend(groups.into_iter().map(Candidate::Relation));
+        self.rows.extend(
+            groups
+                .into_iter()
+                .map(|group| Candidate::Relation(Box::new(group))),
+        );
         for &row in &filtered_snapshot.rows {
             if !filtered_snapshot.table.is_dirs[row]
                 && filtered_snapshot.table.file_routes[row] != FILE_ROUTE_RELATIONS
@@ -209,7 +216,11 @@ impl NativeCandidateTable {
         )?;
         self.rows.retain(|row| matches!(row, Candidate::File(..)));
         let mut replacement = Vec::with_capacity(groups.len() + self.rows.len());
-        replacement.extend(groups.into_iter().map(Candidate::Relation));
+        replacement.extend(
+            groups
+                .into_iter()
+                .map(|group| Candidate::Relation(Box::new(group))),
+        );
         replacement.append(&mut self.rows);
         self.rows = replacement;
         Ok(())
