@@ -1339,9 +1339,11 @@ structure → filename
 避免把年份和巨大噪声数字扩成卷号域。更强层和已有结构编号不受该弱上界影响。
 
 同一文件内相同数值的 occurrence 合并并保留最短 width。用稀疏二分图记录
-file → slots 和 slot → files：先传播唯一候选，再对最小的剩余 slot 选择唯一最短
-width，每次选择后立即继续传播。同宽竞争返回 ambiguity；两个 singleton 文件
-争抢同一 slot 时不任意固定其一。结构 owned 的文件始终必需，不能因竞争而丢弃。
+file → slots 和 slot → files：只强制传播文件仅剩一个合法 slot 的情况；某个 slot
+仅剩一个文件不能证明该数字必须存在，不能强制传播。传播结束后，对最小的剩余
+slot 选择唯一最短 width，每次选择后立即继续传播。同宽竞争返回 ambiguity；两个
+singleton 文件争抢同一 slot 时不任意固定其一。结构 owned 的文件始终必需，
+不能因竞争而丢弃。
 
 事件队列只处理受影响的边，singleton 使用 degree / XOR 定位；每条边最多删除
 一次，不逐卷重扫 bucket，不枚举 `1..max_number`，不进行组合搜索。

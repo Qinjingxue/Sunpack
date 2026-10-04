@@ -207,6 +207,41 @@ def test_context_free_numbers_preserve_encrypted_sfx_launcher_ownership(tmp_path
     assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
 
 
+def test_context_free_numeric_noise_does_not_create_a_missing_7z_volume(tmp_path):
+    case = ArchiveFixtureFactory().create(
+        tmp_path, "loose_numeric_slot_noise", "7z", split=True,
+        payload_size=MIB // 2, split_volume_size=MIB // 4,
+    )
+    originals = sorted(case.archive_dir.iterdir())
+    assert len(originals) == 3
+    names = ("shared.header1", "shared.x2.y03", "shared.z3.w0004")
+    parts = [source.replace(case.archive_dir / name) for source, name in zip(originals, names)]
+    noise = case.archive_dir / "shared.notes"
+    noise.write_text("unrelated same-stem notes", encoding="utf-8")
+    paths = [str(path) for path in parts]
+    group = RelationsScheduler().resolve_volume_once(
+        [paths[0]], paths + [str(noise)], format_hint="7z",
+    )
+    assert group is not None
+    assert group.input_paths == paths
+    assert [volume.number for volume in group.split_volumes] == [1, 2, 3]
+    assert set(group.owned_paths) == set(paths)
+    resolved = RelationResolver().resolve([relation_group_to_candidate(group)]).resolved_tasks
+    assert len(resolved) == 1
+    planned = ArchiveInputPlanningStage(load_config()).plan_task_to_tasks(resolved[0])
+    assert len(planned) == 1
+    output = tmp_path / "output"
+    extractor = ExtractionScheduler(max_retries=0)
+    try:
+        result = extractor.extract(planned[0], str(output))
+    finally:
+        extractor.close()
+    assert result.success is True, result.error
+    assert next(output.rglob(case.marker_name)).read_text(encoding="utf-8") == case.marker_text
+    assert next(output.rglob("payload.bin")).stat().st_size == MIB // 2
+    assert noise.read_text(encoding="utf-8") == "unrelated same-stem notes"
+
+
 def test_same_stem_opaque_members_with_competing_formats_are_not_guessed(tmp_path):
     mixed = tmp_path / "mixed"
     mixed.mkdir()

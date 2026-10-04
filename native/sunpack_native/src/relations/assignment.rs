@@ -867,6 +867,26 @@ mod tests {
     }
 
     #[test]
+    fn optional_numeric_slots_do_not_force_a_gap_with_same_stem_noise() {
+        let mut rows = vec![
+            row("same.header1", "7z", Some(1), false),
+            row("same.x2.y03", "", None, false),
+            row("same.z3.w0004", "", None, false),
+            row("same.notes", "", None, false),
+        ];
+        rows[0].anchor.as_mut().unwrap().expected_logical_size = Some(300);
+        let mut groups = resolve(&rows);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].reason, None);
+        assert_eq!(slots(&groups[0]), vec![1, 2, 3]);
+        assert_eq!(groups[0].proposal.volumes[1].0, rows[1].path);
+        assert_eq!(groups[0].proposal.volumes[2].0, rows[2].path);
+        assert!(!validation_owned_paths(&groups[0]).contains(&rows[3].path));
+        validate::validate(&mut groups[0]);
+        assert_eq!(groups[0].status, ProposalStatus::Valid);
+    }
+
+    #[test]
     fn numeric_propagation_prevents_shortest_width_from_stealing_a_singleton() {
         let rows = vec![
             row("same.header1", "7z", Some(1), false),

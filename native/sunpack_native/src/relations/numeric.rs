@@ -23,7 +23,6 @@ struct SlotNode {
     number: u32,
     edges: Vec<usize>,
     degree: usize,
-    remaining: usize,
     single_files: usize,
     single_remaining: usize,
 }
@@ -86,7 +85,6 @@ impl NumericSolver {
                 let target = &mut graph.slots[slot];
                 target.edges.push(edge);
                 target.degree += 1;
-                target.remaining ^= edge;
             }
             if node.degree == 1 {
                 let slot = graph.edges[node.remaining].slot;
@@ -99,7 +97,7 @@ impl NumericSolver {
         }
         graph.order = by_number.into_values().collect();
         for &slot in &graph.order {
-            if graph.slots[slot].degree == 1 || graph.slots[slot].single_files == 1 {
+            if graph.slots[slot].single_files == 1 {
                 graph.pending.push_back(slot);
             }
         }
@@ -120,8 +118,7 @@ impl NumericSolver {
         self.files[file].degree -= 1;
         self.files[file].remaining ^= edge;
         self.slots[slot].degree -= 1;
-        self.slots[slot].remaining ^= edge;
-        if self.slots[slot].degree == 1 || self.slots[slot].single_files == 1 {
+        if self.slots[slot].single_files == 1 {
             self.pending.push_back(slot);
         }
         if self.files[file].assigned {
@@ -161,17 +158,12 @@ impl NumericSolver {
     fn propagate(&mut self, assignment: &mut VolumeAssignment) {
         while let Some(slot) = self.pending.pop_front() {
             let target = &self.slots[slot];
-            let edge = if target.degree == 1 {
-                Some(target.remaining)
-            } else if target.single_files == 1 {
+            if target.single_files == 1 {
+                // A file's only remaining slot is forced. A slot's only
+                // candidate is not: the number itself can be filename noise.
                 // Two singleton files competing for one slot are not both
                 // forced. Width arbitration handles that conflict later.
-                Some(target.single_remaining)
-            } else {
-                None
-            };
-            if let Some(edge) = edge {
-                self.claim(edge, assignment);
+                self.claim(target.single_remaining, assignment);
                 if self.missing {
                     return;
                 }
@@ -222,8 +214,8 @@ impl NumericSolver {
 }
 
 /// O(E log S) construction and O(E + F + S) graph updates, plus ordered output
-/// insertions. Slot
-/// storage depends on observed occurrences, never a filename's largest value.
+/// insertions. Slot storage depends on observed occurrences, never a filename's
+/// largest value.
 /// All nodes and edges are released with this one family resolution.
 pub(super) fn solve(
     assignment: &mut VolumeAssignment,
