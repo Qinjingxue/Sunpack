@@ -915,7 +915,7 @@ mod tests {
 
     #[test]
     fn scoring_keeps_repeated_shift_jis_parent_from_looking_like_gbk() {
-        let parent = "無知ロリと化け物_製品0519c";
+        let parent = "無知_製品0519c";
         let mut owned = Vec::new();
         for index in 0..2500 {
             let value = format!("{parent}/assets/file_{index:04}.bin");
