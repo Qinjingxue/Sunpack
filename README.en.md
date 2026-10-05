@@ -139,7 +139,7 @@ For maximum convenience, SunPack gathers passwords from several sources at run t
 
 The main configuration file is `sunpack_config.json`; `sunpack_advanced_config.json` supplies additional defaults. Watch automatically reloads configuration changes.
 
-Add only the fields you want to change to the main configuration file.
+The main configuration automatically overrides the advanced configuration, and fields can be freely moved between the two.
 
 Configuration validation command:
 
