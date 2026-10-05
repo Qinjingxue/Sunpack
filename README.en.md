@@ -169,6 +169,7 @@ Build the project:
 
 See [the documentation](docs/development_setup.md) for development environment and build instructions.
 See [the documentation](docs/development_boundaries.md) for development boundaries.
+Developers using AI must ensure that the AI reads the repository's AGENTS.md before making any changes and follows the development guidelines specified therein.
 
 ### Architecture at a glance
 

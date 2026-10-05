@@ -167,6 +167,7 @@ python sunpack.py config validate
 
 开发环境和构建说明见 [文档](docs/zh-CN/development_setup.md)。
 开发边界见文档 [文档](docs/zh-CN/development_boundaries.md)
+使用AI开发者务必使AI阅读仓库内的AGENTS.md进行开发，并遵守开发规范
 
 ### 架构速览
 

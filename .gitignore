@@ -62,7 +62,6 @@ test_extract/
 GEMINI.md
 test_extract_folder/
 test_targz/
-AGENTS.md
 native/sunpack_native/target/
 native/**/target/
 native/target/
