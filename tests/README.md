@@ -34,7 +34,7 @@ CI 和 acceptance runner 默认使用逻辑 CPU 核心数的四分之一（向�
 列出性能场景：
 
 ```powershell
-python -m benchmarks --list
+uv run --locked python -m benchmarks --list
 ```
 
 运行项目验收脚本：
@@ -70,7 +70,7 @@ RARLAB WinRAR 6.22，以保留 Plan 7 所需的 RAR4 生成能力；zstd 固定�
 真实归档测试默认运行。真实归档计划的完整入口示例：
 
 ```powershell
-pytest tests/real -q
+uv run --locked pytest tests/real -q
 ```
 
 ## 公共接口边界

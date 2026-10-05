@@ -17,17 +17,20 @@ function Write-Step {
     Write-Host "==> $Message" -ForegroundColor Cyan
 }
 
-function Get-PythonCommand {
+function Get-UvBootstrapPythonCommand {
     foreach ($candidate in @("python", "py")) {
         try {
-            & $candidate --version *> $null
+            $resolvedPython = & $candidate -c "import sys; print(sys.executable)" 2>$null
             if ($LASTEXITCODE -eq 0) {
-                return $candidate
+                $resolvedPython = @($resolvedPython | Where-Object { $_ }) | Select-Object -Last 1
+                if ($resolvedPython) {
+                    return ([string]$resolvedPython).Trim()
+                }
             }
         } catch {
         }
     }
-    throw "Python interpreter not found in PATH."
+    throw "A base Python interpreter is required by uv to create .venv, but none was found in PATH."
 }
 
 function Remove-IfExists {
@@ -767,7 +770,6 @@ if ($processArch -ne $buildArch) {
     throw "Development setup for native Python extensions must run under a target-architecture Python. This process is '$processArch', so it cannot prepare a real '$buildArch' environment."
 }
 
-$pythonCommand = Get-PythonCommand
 $venvPath = Join-Path $repoRoot ".venv"
 $venvPython = Join-Path $venvPath "Scripts\python.exe"
 $venvScripts = Join-Path $venvPath "Scripts"
@@ -807,7 +809,12 @@ if (Test-Path -LiteralPath $venvConfigPath) {
         Remove-IfExists -LiteralPath $venvPath
     }
 }
-Invoke-Native -FilePath "uv" -Arguments @("sync", "--locked", "--extra", "dev", "--python", $pythonCommand)
+$syncArguments = @("sync", "--locked", "--extra", "dev")
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    $syncArguments += @("--python", (Get-UvBootstrapPythonCommand))
+}
+Invoke-Native -FilePath "uv" -Arguments $syncArguments
+Assert-PathExists -LiteralPath $venvPython -Description "Project virtual environment Python"
 
 $env:Path = "$venvScripts;$env:Path"
 $env:PYTHONPATH = $repoRoot

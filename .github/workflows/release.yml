@@ -149,16 +149,16 @@ jobs:
           cargo --version
           rustc -Vv
 
-      - name: Show toolchain architecture
-        shell: pwsh
-        run: |
-          python -c "import platform, sys; print(sys.version); print(platform.machine())"
-          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
-
       - name: Prepare native/tool environment
         shell: pwsh
         run: |
           .\scripts\setup_windows_dev.ps1 -Arch ${{ matrix.arch }} -SkipAcceptanceTestTools
+
+      - name: Show toolchain architecture
+        shell: pwsh
+        run: |
+          & .\.venv\Scripts\python.exe -c "import platform, sys; print(sys.version); print(platform.machine())"
+          Write-Host "PROCESSOR_ARCHITECTURE=$env:PROCESSOR_ARCHITECTURE"
 
       - name: Ensure Inno Setup compiler
         shell: pwsh

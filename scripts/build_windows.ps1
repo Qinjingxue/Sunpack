@@ -36,17 +36,20 @@ function Wait-BeforeBuildExit {
     }
 }
 
-function Get-PythonCommand {
+function Get-UvBootstrapPythonCommand {
     foreach ($candidate in @("python", "py")) {
         try {
-            & $candidate --version *> $null
+            $resolvedPython = & $candidate -c "import sys; print(sys.executable)" 2>$null
             if ($LASTEXITCODE -eq 0) {
-                return $candidate
+                $resolvedPython = @($resolvedPython | Where-Object { $_ }) | Select-Object -Last 1
+                if ($resolvedPython) {
+                    return ([string]$resolvedPython).Trim()
+                }
             }
         } catch {
         }
     }
-    throw "Python interpreter not found in PATH."
+    throw "A base Python interpreter is required by uv to create .venv, but none was found in PATH."
 }
 
 function Remove-IfExists {
@@ -893,7 +896,6 @@ if ($processArch -ne $buildArch) {
     throw "Windows Nuitka/PyO3 final executable builds must run under a target-architecture Python. This machine/process is '$processArch', so it cannot produce a real '$buildArch' sunpack.exe. Use an ARM64 Windows Python environment for -Arch arm64; use static PE validation on the resulting package."
 }
 
-$pythonCommand = Get-PythonCommand
 $venvPath = Join-Path $repoRoot ".venv"
 $venvPython = Join-Path $venvPath "Scripts\python.exe"
 $venvScripts = Join-Path $venvPath "Scripts"
@@ -985,7 +987,12 @@ if (Test-Path -LiteralPath (Join-Path $venvPath "pyvenv.cfg")) {
         Remove-IfExists -LiteralPath $venvPath
     }
 }
-Invoke-Native -FilePath "uv" -Arguments @("sync", "--locked", "--extra", "dev", "--python", $pythonCommand)
+$syncArguments = @("sync", "--locked", "--extra", "dev")
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    $syncArguments += @("--python", (Get-UvBootstrapPythonCommand))
+}
+Invoke-Native -FilePath "uv" -Arguments $syncArguments
+Assert-PathExists -LiteralPath $venvPython -Description "Project virtual environment Python"
 Invoke-Native -FilePath "uv" -Arguments @("pip", "check", "--python", $venvPython)
 $maturinCommand = Get-MaturinCommand -VenvScripts $venvScripts
 $cmakeCommand = Get-CMakeCommand -VenvScripts $venvScripts

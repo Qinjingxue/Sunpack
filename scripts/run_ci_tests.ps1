@@ -49,21 +49,33 @@ function Invoke-TestStep {
     Write-Host ("    PASS ({0:N2}s)" -f $duration) -ForegroundColor Green
 }
 
-function Get-PythonCommand {
+function Get-UvBootstrapPythonCommand {
     foreach ($candidate in @("python", "py")) {
         try {
-            & $candidate --version *> $null
+            $resolvedPython = & $candidate -c "import sys; print(sys.executable)" 2>$null
             if ($LASTEXITCODE -eq 0) {
-                return $candidate
+                $resolvedPython = @($resolvedPython | Where-Object { $_ }) | Select-Object -Last 1
+                if ($resolvedPython) {
+                    return ([string]$resolvedPython).Trim()
+                }
             }
         } catch {
         }
     }
-    throw "Python interpreter not found in PATH."
+    throw "A base Python interpreter is required by uv to create .venv, but none was found in PATH."
 }
 
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
-$python = if (Test-Path -LiteralPath $venvPython) { $venvPython } else { Get-PythonCommand }
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    $bootstrapPython = Get-UvBootstrapPythonCommand
+    Invoke-TestStep -Label "Prepare .venv with uv" -Command @(
+        "uv", "sync", "--locked", "--extra", "dev", "--python", $bootstrapPython
+    )
+}
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    throw "uv sync completed without creating the project virtual environment: $venvPython"
+}
+$python = $venvPython
 $env:PYTHONPATH = $repoRoot
 
 Invoke-TestStep -Label "Native extension smoke test" -Command @(

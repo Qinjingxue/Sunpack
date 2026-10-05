@@ -5,7 +5,7 @@ Performance measurements and diagnostic profiles live here; behavioural assertio
 List the supported scenarios:
 
 ```powershell
-python -m benchmarks --list
+uv run --locked python -m benchmarks --list
 ```
 
 Run a scenario by group and name. Arguments after the scenario are passed to that scenario:
@@ -18,41 +18,41 @@ elevated account; interactive UAC is deliberately disabled there. Watch reports
 include the test service/pipe identity, Broker binary SHA-256, and connection state.
 
 ```powershell
-python -m benchmarks reader password-fast-path --rounds 5
-python -m benchmarks reader volume-anchor --files 128 --logical-mib 64 --rounds 5
-python -m benchmarks reader embedded-scan --generate-gib 10 --rounds 3 --skip-cli `
+uv run --locked python -m benchmarks reader password-fast-path --rounds 5
+uv run --locked python -m benchmarks reader volume-anchor --files 128 --logical-mib 64 --rounds 5
+uv run --locked python -m benchmarks reader embedded-scan --generate-gib 10 --rounds 3 --skip-cli `
   --iocp-chunk-mib 2 --iocp-buffers 8 --iocp-workers 2
-python -m benchmarks reader embedded-scan --generate-plan5-mib 500 --rounds 3 --skip-cli `
+uv run --locked python -m benchmarks reader embedded-scan --generate-plan5-mib 500 --rounds 3 --skip-cli `
   --baseline-report benchmarks/results/reader.embedded-scan/<baseline-run>/report.json `
   --max-regression-percent 5
-python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
-python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
-python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
-python -m benchmarks extraction worker-vs-7z-300m `
+uv run --locked python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
+uv run --locked python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
+uv run --locked python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
+uv run --locked python -m benchmarks extraction worker-vs-7z-300m `
   --sunpack-version v0.7.0 --worker-source-commit c3eaec11 `
   --worker native/sevenzip_bridge/build-x64/Release/sunpack_sevenzip_worker.exe `
   --small-files 8 --large-files 2 --large-file-mib 150 --runs 5 --warmups 0 `
   --json-out benchmarks/results/worker-vs-7z-300m-v0.7.0-c3eaec11-rss.json
-python -m benchmarks extraction worker-read-blocking --runs 1 --payload-gib 1 --json-out benchmarks/results/worker-read-blocking.json
-uv run python -m benchmarks extraction worker-concurrency-300m --concurrency 8 --runs 2 --json-out benchmarks/results/worker-concurrency-300m.json
-python -m benchmarks extraction worker-read-patterns --runs 1 --json-out benchmarks/results/worker-read-patterns.json
+uv run --locked python -m benchmarks extraction worker-read-blocking --runs 1 --payload-gib 1 --json-out benchmarks/results/worker-read-blocking.json
+uv run --locked python -m benchmarks extraction worker-concurrency-300m --concurrency 8 --runs 2 --json-out benchmarks/results/worker-concurrency-300m.json
+uv run --locked python -m benchmarks extraction worker-read-patterns --runs 1 --json-out benchmarks/results/worker-read-patterns.json
 # Enable the production format-aware prefetch policy while tuning its defaults (512 KiB x 2).
-python -m benchmarks extraction worker-read-patterns --runs 2 --prefetch on --prefetch-window-kib 512 --prefetch-depth 2
+uv run --locked python -m benchmarks extraction worker-read-patterns --runs 2 --prefetch on --prefetch-window-kib 512 --prefetch-depth 2
 # Compare production-policy prefetch on/off in alternating order. Two 512 MiB members retain a meaningful solid-7z case.
-python -m benchmarks extraction worker-read-patterns --format tar --format rar-split --format 7z --7z-variant solid --large-files 2 --large-file-mib 512 --large-content random --runs 5 --prefetch compare
-python -m benchmarks extraction worker-small-file-scheduling --jobs 256 --clients 4 --capacities 1,2,4,8 --runs 3
-python -m benchmarks extraction worker-single-file-write --baseline-worker-path C:\path\to\before\sunpack_sevenzip_worker.exe --candidate-worker-path C:\path\to\after\sunpack_sevenzip_worker.exe --payload-gib 1 --writer-threads 4 --runs 3 --warmups 1
-python -m benchmarks extraction worker-resource-pressure --modes cpu,io --capacities 1,2,4 --jobs 4
-python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
-python -m benchmarks watch arrival-matrix C:\path\to\sample.jpg --quiet-values 0,1.25 --runs 2 --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-arrival-matrix.json
-python -m benchmarks watch split-arrival C:\path\to\archive.7z.001 C:\path\to\archive.7z.002 C:\path\to\archive.7z.003 C:\path\to\archive.7z.004 --quiet-values 0,1.25 --chunk-mib 4 --chunk-delay-ms 50 --json-out benchmarks/results/watch-split-arrival.json
-python -m benchmarks watch format-matrix --runs 3 --warmups 1 --json-out benchmarks/results/watch-format-matrix.json
-python -m benchmarks watch format-matrix --formats 7z,zip,rar --variants plain,encrypted --workloads many_small --runs 3
+uv run --locked python -m benchmarks extraction worker-read-patterns --format tar --format rar-split --format 7z --7z-variant solid --large-files 2 --large-file-mib 512 --large-content random --runs 5 --prefetch compare
+uv run --locked python -m benchmarks extraction worker-small-file-scheduling --jobs 256 --clients 4 --capacities 1,2,4,8 --runs 3
+uv run --locked python -m benchmarks extraction worker-single-file-write --baseline-worker-path C:\path\to\before\sunpack_sevenzip_worker.exe --candidate-worker-path C:\path\to\after\sunpack_sevenzip_worker.exe --payload-gib 1 --writer-threads 4 --runs 3 --warmups 1
+uv run --locked python -m benchmarks extraction worker-resource-pressure --modes cpu,io --capacities 1,2,4 --jobs 4
+uv run --locked python -m benchmarks watch real-file C:\path\to\sample.jpg --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-real-file.json
+uv run --locked python -m benchmarks watch arrival-matrix C:\path\to\sample.jpg --quiet-values 0,1.25 --runs 2 --wrong-password-count 100 --password '⑨' --json-out benchmarks/results/watch-arrival-matrix.json
+uv run --locked python -m benchmarks watch split-arrival C:\path\to\archive.7z.001 C:\path\to\archive.7z.002 C:\path\to\archive.7z.003 C:\path\to\archive.7z.004 --quiet-values 0,1.25 --chunk-mib 4 --chunk-delay-ms 50 --json-out benchmarks/results/watch-split-arrival.json
+uv run --locked python -m benchmarks watch format-matrix --runs 3 --warmups 1 --json-out benchmarks/results/watch-format-matrix.json
+uv run --locked python -m benchmarks watch format-matrix --formats 7z,zip,rar --variants plain,encrypted --workloads many_small --runs 3
 # A/B the post-extract flatten stage (post_extract.flatten_single_directory) on real outputs
-python -m benchmarks watch format-matrix --formats zip,rar,tar,7z --flatten-modes on,off --runs 1
-python -m benchmarks extraction split-pressure --profile acceptance --strict
-python -m benchmarks memory residual-rss
-python -m benchmarks memory many-tasks --python-rounds 5 --worker-rounds 3 --json-out benchmarks/results/memory-growth.json
+uv run --locked python -m benchmarks watch format-matrix --formats zip,rar,tar,7z --flatten-modes on,off --runs 1
+uv run --locked python -m benchmarks extraction split-pressure --profile acceptance --strict
+uv run --locked python -m benchmarks memory residual-rss
+uv run --locked python -m benchmarks memory many-tasks --python-rounds 5 --worker-rounds 3 --json-out benchmarks/results/memory-growth.json
 uv run --no-sync python -m benchmarks scheduling broker-queue --baseline-ref <before-commit> --runs 5 --warmups 1
 uv run --no-sync python -m benchmarks scheduling watch-source-claims --baseline-ref <before-commit> --runs 7 --warmups 1
 uv run --no-sync python -m benchmarks memory watch-source-indexes --paths 4096 --batches 12 --warmups 2
@@ -90,7 +90,7 @@ and can be overridden before the scenario name, or via
 `SUNPACK_BENCH_TIMEOUT`:
 
 ```powershell
-python -m benchmarks --timeout 600 extraction format-matrix --runs 3
+uv run --locked python -m benchmarks --timeout 600 extraction format-matrix --runs 3
 ```
 
 A killed scenario exits with code 124. Scenario-internal subprocesses (7-Zip,
@@ -117,7 +117,7 @@ accumulate. A scenario may explicitly preserve a small diagnostic artifact with 
 Remove regenerable benchmark data without touching versioned reports:
 
 ```powershell
-python -m benchmarks clean --cache --work
+uv run --locked python -m benchmarks clean --cache --work
 ```
 
 `extraction format-matrix` builds ZIP, 7z, split 7z, RAR, split RAR, TAR, gzip,

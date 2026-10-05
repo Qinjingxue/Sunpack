@@ -282,17 +282,20 @@ function Invoke-TestStep {
     }
 }
 
-function Get-PythonCommand {
+function Get-UvBootstrapPythonCommand {
     foreach ($candidate in @("python", "py")) {
         try {
-            & $candidate --version *> $null
+            $resolvedPython = & $candidate -c "import sys; print(sys.executable)" 2>$null
             if ($LASTEXITCODE -eq 0) {
-                return $candidate
+                $resolvedPython = @($resolvedPython | Where-Object { $_ }) | Select-Object -Last 1
+                if ($resolvedPython) {
+                    return ([string]$resolvedPython).Trim()
+                }
             }
         } catch {
         }
     }
-    throw "Python interpreter not found in PATH."
+    throw "A base Python interpreter is required by uv to create .venv, but none was found in PATH."
 }
 
 function Invoke-Native {
@@ -761,7 +764,17 @@ trap {
 $venvPython = Join-Path $repoRoot ".venv\Scripts\python.exe"
 Ensure-AcceptanceEnvironment -RepoRoot $repoRoot -VenvPython $venvPython
 Assert-AcceptanceTestTools -RepoRoot $repoRoot
-$python = if (Test-Path -LiteralPath $venvPython) { $venvPython } else { Get-PythonCommand }
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    $bootstrapPython = Get-UvBootstrapPythonCommand
+    Write-Host "==> Preparing .venv with uv" -ForegroundColor Cyan
+    Invoke-Native -FilePath "uv" -Arguments @(
+        "sync", "--locked", "--extra", "dev", "--python", $bootstrapPython
+    )
+}
+if (-not (Test-Path -LiteralPath $venvPython -PathType Leaf)) {
+    throw "uv sync completed without creating the project virtual environment: $venvPython"
+}
+$python = $venvPython
 $env:PYTHONPATH = $repoRoot
 
 $rustTarget = if ($Arch -eq "arm64") { "aarch64-pc-windows-msvc" } else { "x86_64-pc-windows-msvc" }
