@@ -14,6 +14,7 @@ from types import SimpleNamespace
 import pytest
 
 import sunpack.core.passwords.internal.builtin as builtin_module
+import sunpack.core.passwords.internal.clipboard as clipboard_module
 import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
 import sunpack.runtime.watch.scheduler as scheduler_module
 from sunpack.core.contracts.failures import FailureInfo, FailureKind
@@ -2726,9 +2727,9 @@ def test_watch_scheduler_clipboard_persistence_refreshes_candidates_and_retries(
     builtin_path = tmp_path / "builtin_passwords.txt"
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
     monkeypatch.setattr(
-        clipboard_monitor_module,
-        "read_clipboard_passwords",
-        lambda *, single_line: ["clipboard-secret"],
+        clipboard_module,
+        "_read_windows_unicode_clipboard",
+        lambda *, max_chars: "wrong-secret\r\n\r\nclipboard-secret\n",
     )
     attempts = []
 

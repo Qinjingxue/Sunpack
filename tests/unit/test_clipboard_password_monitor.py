@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sunpack.core.passwords.internal.builtin as builtin_module
+import sunpack.core.passwords.internal.clipboard as clipboard_module
 import sunpack.core.passwords.internal.clipboard_monitor as clipboard_monitor_module
 from sunpack.core.passwords.internal.clipboard_monitor import ClipboardPasswordMonitor
 from sunpack.core.passwords.internal.clipboard_monitor import _WindowsClipboardLoop
@@ -15,13 +16,13 @@ def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, m
         encoding="utf-8",
     )
     monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
-    single_line_calls = []
-
-    def _read_clipboard_passwords(*, single_line):
-        single_line_calls.append(single_line)
-        return [f"clip-{index}" for index in range(35)]
-
-    monkeypatch.setattr(clipboard_monitor_module, "read_clipboard_passwords", _read_clipboard_passwords)
+    monkeypatch.setattr(
+        clipboard_module,
+        "_read_windows_unicode_clipboard",
+        lambda *, max_chars: "\r\n".join(
+            line for index in range(35) for line in ("", f"clip-{index}", f"clip-{index}")
+        ) + "\r\n",
+    )
     notifications = []
 
     monitor = ClipboardPasswordMonitor(
@@ -33,12 +34,11 @@ def test_clipboard_monitor_persists_clipboard_passwords_and_notifies(tmp_path, m
     monitor._handle_clipboard_update()
 
     passwords = builtin_module.get_builtin_passwords()
-    assert single_line_calls == [True]
     assert notifications == ["clipboard"]
     assert "existing" in passwords
-    assert "clip-0" not in passwords
-    assert "clip-5" in passwords
-    assert "clip-34" in passwords
+    assert passwords == ["existing"] + [f"clip-{index}" for index in range(5, 35)]
+    monitor._handle_clipboard_update()
+    assert notifications == ["clipboard"]
 
 
 def test_windows_clipboard_loop_reads_current_clipboard_after_listener_registration():
@@ -155,9 +155,7 @@ def test_windows_clipboard_loop_unregisters_class_before_releasing_wndproc():
     assert loop._wndproc_ref is None
 
 
-def test_clipboard_monitor_rejects_internal_multiline_text(tmp_path, monkeypatch):
-    import sunpack.core.passwords.internal.clipboard as clipboard_module
-
+def test_clipboard_monitor_persists_multiline_text(tmp_path, monkeypatch):
     builtin_path = tmp_path / "builtin_passwords.txt"
     original = (
         "existing\n"
@@ -169,7 +167,7 @@ def test_clipboard_monitor_rejects_internal_multiline_text(tmp_path, monkeypatch
     monkeypatch.setattr(
         clipboard_module,
         "_read_windows_unicode_clipboard",
-        lambda *, max_chars: "first line\nsecond line",
+        lambda *, max_chars: "\r\nfirst line\n\nsecond line\rfirst line\r\n",
     )
 
     notifications = []
@@ -181,5 +179,15 @@ def test_clipboard_monitor_rejects_internal_multiline_text(tmp_path, monkeypatch
 
     monitor._handle_clipboard_update()
 
-    assert builtin_path.read_text(encoding="utf-8") == original
-    assert notifications == []
+    assert builtin_module.get_builtin_passwords() == ["existing", "first line", "second line"]
+    assert notifications == ["clipboard"]
+
+    persisted = builtin_path.read_text(encoding="utf-8")
+    monkeypatch.setattr(
+        clipboard_module,
+        "_read_windows_unicode_clipboard",
+        lambda *, max_chars: "\r\n\n\r",
+    )
+    monitor._handle_clipboard_update()
+    assert builtin_path.read_text(encoding="utf-8") == persisted
+    assert notifications == ["clipboard"]

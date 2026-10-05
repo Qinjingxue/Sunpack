@@ -1,5 +1,6 @@
 from types import SimpleNamespace
 
+import sunpack.core.passwords.internal.clipboard as clipboard_module
 import sunpack.runtime.cli.cli_runtime as cli_runtime
 import sunpack.runtime.cli.commands.passwords as passwords_command
 from sunpack.runtime.cli.cli_context import CliContext
@@ -33,6 +34,18 @@ def test_collect_clipboard_passwords_skips_when_config_disabled(monkeypatch):
 
     assert cli_runtime.collect_clipboard_passwords({"passwords": {"clipboard_passwords_enabled": False}}) == []
     assert called is False
+
+
+def test_collect_clipboard_passwords_splits_multiline_text(monkeypatch):
+    monkeypatch.setattr(
+        clipboard_module,
+        "_read_windows_unicode_clipboard",
+        lambda *, max_chars: "\r\nfirst\n\nsecond\rfirst\r\n",
+    )
+
+    assert cli_runtime.collect_clipboard_passwords(
+        {"passwords": {"clipboard_passwords_enabled": True}}
+    ) == ["first", "second"]
 
 
 def test_passwords_command_includes_config_enabled_clipboard_password(monkeypatch):

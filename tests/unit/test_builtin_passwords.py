@@ -59,6 +59,17 @@ def test_watch_clipboard_recopy_moves_password_to_most_recent_position(tmp_path,
     ) == ["b", "a"]
 
 
+def test_watch_clipboard_batch_merges_existing_entries_before_truncation(tmp_path, monkeypatch):
+    builtin_path = tmp_path / "builtin_passwords.txt"
+    _seed_builtin_file(builtin_path, "user-secret")
+    monkeypatch.setattr(builtin_module, "builtin_password_path", lambda: builtin_path)
+
+    builtin_module.merge_watch_clipboard_passwords(["a", "b", "c"], max_entries=3)
+    assert builtin_module.merge_watch_clipboard_passwords(["b", "d", "d", "e"], max_entries=3)
+
+    assert builtin_module.get_builtin_passwords() == ["user-secret", "b", "d", "e"]
+
+
 def test_watch_clipboard_password_markers_do_not_change_with_cli_language(tmp_path, monkeypatch):
     builtin_path = tmp_path / "builtin_passwords.txt"
     _seed_builtin_file(builtin_path, "user-secret")

@@ -108,7 +108,7 @@ def test_watch_retries_real_encrypted_zip_after_password_source_update(tmp_path,
                 monkeypatch.setattr(
                     clipboard_monitor_module,
                     "read_clipboard_passwords",
-                    lambda *, single_line: [password],
+                    lambda: [password],
                 )
                 watcher._clipboard_monitor._handle_clipboard_update()
             second = await _wait_for_completed_watch_run(watcher)
