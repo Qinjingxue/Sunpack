@@ -194,11 +194,13 @@ def _machine_path_check() -> dict:
         machine_path = _read_hklm_value(ENVIRONMENT_REGISTRY_KEY, "Path")
         if machine_path is None:
             return _check("machine_path", "fail", "machine PATH is unavailable")
-        install_dir = _normalized_path_entry(_install_dir())
+        launcher_dir = _install_dir() / "bin"
         entries = {_normalized_path_entry(entry) for entry in str(machine_path).split(";") if entry.strip()}
-        if install_dir not in entries:
-            return _check("machine_path", "fail", "installer marker exists but install directory is missing")
-        return _check("machine_path", "ok", str(_install_dir()))
+        if _normalized_path_entry(_install_dir()) in entries:
+            return _check("machine_path", "fail", "runtime directory in PATH exposes bundled DLLs")
+        if _normalized_path_entry(launcher_dir) not in entries:
+            return _check("machine_path", "fail", "installer marker exists but launcher directory is missing")
+        return _check("machine_path", "ok", str(launcher_dir))
     except Exception as exc:
         return _check("machine_path", "fail", str(exc))
 
@@ -211,7 +213,7 @@ def _context_menu_check() -> dict:
         if not all(parents):
             return _check("context_menu", "fail", "registration is incomplete")
 
-        launcher = _install_dir() / "sunpack.exe"
+        launcher = _install_dir() / "bin" / "sunpack.exe"
         for command_key in CONTEXT_COMMAND_KEYS:
             command = _read_hklm_value(command_key)
             if command is None:

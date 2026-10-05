@@ -1,4 +1,18 @@
 import sunpack.runtime.watch.launcher as launcher_module
+import pytest
+
+
+@pytest.mark.parametrize("installed", [False, True])
+def test_runtime_finds_launcher_for_both_package_layouts(tmp_path, monkeypatch, installed):
+    runtime = tmp_path / "sunpack-runtime.exe"
+    cli_executable = (tmp_path / "bin" if installed else tmp_path) / "sunpack.exe"
+    cli_executable.parent.mkdir(exist_ok=True)
+    cli_executable.touch()
+    monkeypatch.setattr(launcher_module, "current_process_executable", lambda: runtime)
+
+    assert launcher_module.watch_launch_argv(initial_scan=True) == [
+        str(cli_executable), "watch", "start", "--initial-scan",
+    ]
 
 
 def test_packaged_watch_launcher_uses_public_cli_command(tmp_path, monkeypatch):

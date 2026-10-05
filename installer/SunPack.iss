@@ -51,7 +51,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "chinesesimplified"; MessagesFile: "Languages\ChineseSimplified.isl"
 
 [CustomMessages]
-english.TaskAddToPath=Add sunpack to the current user's PATH
+english.TaskAddToPath=Add sunpack to the system PATH
 english.TaskContextMenu=Register the sunpack folder context menu
 english.TaskAutostart=Start sunpack Watch when Windows starts
 english.GroupShellIntegration=Shell integration:
@@ -66,7 +66,7 @@ english.StartupEnableLaunchFailed=Failed to run sunpack while configuring startu
 english.StartupEnableCommandFailed=sunpack could not configure startup (exit code %d).
 english.ToastRegisterLaunchFailed=Failed to run sunpack while registering machine-wide notifications.
 english.ToastRegisterCommandFailed=sunpack could not register machine-wide notifications (exit code %d).
-english.TaskAddToPathFailed=Failed to add sunpack to the current user's PATH.
+english.TaskAddToPathFailed=Failed to add sunpack to the system PATH.
 english.TaskContextMenuFailed=Failed to register the sunpack folder context menu.
 english.TaskContextMenuRemoveFailed=Failed to remove the existing sunpack context menu.
 english.PrepareRuntimeRunning=sunpack runtime processes are still running. Please stop them and run the installer again.
@@ -80,7 +80,7 @@ english.WatchRootsFileMapping=# Optional columns: input folder | output folder |
 english.WatchRootsFileDeepDetect=# deep_detect accepts true or false; blank defaults to false.
 english.WatchRootsFileExample=# Example: C:\Downloads | D:\Extracted | true
 english.EditableConfigCreateFailed=Failed to create the initial editable configuration file: %s
-chinesesimplified.TaskAddToPath=将 sunpack 添加到当前用户的 PATH
+chinesesimplified.TaskAddToPath=将 sunpack 添加到系统 PATH
 chinesesimplified.TaskContextMenu=注册 sunpack 文件夹右键菜单
 chinesesimplified.TaskAutostart=Windows 启动时运行 sunpack 监控
 chinesesimplified.GroupShellIntegration=资源管理器集成：
@@ -95,7 +95,7 @@ chinesesimplified.StartupEnableLaunchFailed=配置开机启动时无法运行 su
 chinesesimplified.StartupEnableCommandFailed=sunpack 无法配置开机启动（退出码 %d）。
 chinesesimplified.ToastRegisterLaunchFailed=注册机器级通知时无法运行 sunpack。
 chinesesimplified.ToastRegisterCommandFailed=sunpack 无法注册机器级通知（退出码 %d）。
-chinesesimplified.TaskAddToPathFailed=无法将 sunpack 添加到当前用户的 PATH。
+chinesesimplified.TaskAddToPathFailed=无法将 sunpack 添加到系统 PATH。
 chinesesimplified.TaskContextMenuFailed=无法注册 sunpack 文件夹右键菜单。
 chinesesimplified.TaskContextMenuRemoveFailed=无法清理现有 sunpack 右键菜单。
 chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。请先停止这些进程，然后重新运行安装程序。
@@ -116,7 +116,8 @@ Name: "contextmenu"; Description: "{cm:TaskContextMenu}"; GroupDescription: "{cm
 Name: "autostart"; Description: "{cm:TaskAutostart}"; GroupDescription: "{cm:GroupBackgroundWatch}"; Flags: unchecked
 
 [Files]
-Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\*"; DestDir: "{app}"; Excludes: "sunpack.exe,sunpack_config.json,sunpack_watch_roots.txt,builtin_passwords.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#SourceDir}\sunpack.exe"; DestDir: "{app}\bin"; Flags: ignoreversion
 Source: "{#SourceDir}\sunpack_config.json"; DestDir: "{commonappdata}\SunPack"; Flags: onlyifdoesntexist skipifsourcedoesntexist
 
 [Dirs]
@@ -135,8 +136,8 @@ Name: "{autoprograms}\SunPack\Uninstall SunPack"; Filename: "{uninstallexe}"
 [UninstallRun]
 Filename: "{app}\sunpack-runtime.exe"; Parameters: "--configure-startup-current-user disable"; RunOnceId: "SunPackStartup"; Flags: runhidden waituntilterminated skipifdoesntexist
 Filename: "{app}\sunpack-runtime.exe"; Parameters: "--unregister-toast"; RunOnceId: "SunPackToast"; Flags: runhidden waituntilterminated skipifdoesntexist
-Filename: "{app}\sunpack.exe"; Parameters: "--persistent-shutdown"; RunOnceId: "SunPackFinalRuntimeShutdown"; Flags: runhidden waituntilterminated skipifdoesntexist
-Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\wait_sunpack_runtime_exit.ps1"" -CliAppPath ""{app}\sunpack.exe"" -RuntimeAppPath ""{app}\sunpack-runtime.exe"" -TimeoutSeconds 20"; RunOnceId: "SunPackFinalRuntimeWait"; Flags: runhidden waituntilterminated
+Filename: "{app}\bin\sunpack.exe"; Parameters: "--persistent-shutdown"; RunOnceId: "SunPackFinalRuntimeShutdown"; Flags: runhidden waituntilterminated skipifdoesntexist
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ""{app}\scripts\wait_sunpack_runtime_exit.ps1"" -CliAppPath ""{app}\bin\sunpack.exe"" -RuntimeAppPath ""{app}\sunpack-runtime.exe"" -TimeoutSeconds 20"; RunOnceId: "SunPackFinalRuntimeWait"; Flags: runhidden waituntilterminated
 
 [Code]
 const
@@ -242,6 +243,7 @@ begin
   Value := Trim(Value);
   if (Length(Value) >= 2) and (Value[1] = '"') and (Value[Length(Value)] = '"') then
     Value := Copy(Value, 2, Length(Value) - 2);
+  StringChangeEx(Value, '/', '\', True);
   while (Length(Value) > 3) and ((Value[Length(Value)] = '\') or (Value[Length(Value)] = '/')) do
     Delete(Value, Length(Value), 1);
   Result := Lowercase(Value);
@@ -284,24 +286,55 @@ begin
   end;
 end;
 
+function InstallerOwnsMachinePath: Boolean;
+var
+  WasAdded: Cardinal;
+begin
+  Result := RegQueryDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, WasAdded) and (WasAdded = 1);
+end;
+
+function PathWithoutEntry(const PathValue, Entry: string): string;
+var
+  Remaining: string;
+  Token: string;
+begin
+  Result := '';
+  Remaining := PathValue;
+  while Remaining <> '' do
+  begin
+    Token := PopPathEntry(Remaining);
+    if (Trim(Token) <> '') and (NormalizePathEntry(Token) <> NormalizePathEntry(Entry)) then
+    begin
+      if Result <> '' then
+        Result := Result + ';';
+      Result := Result + Trim(Token);
+    end;
+  end;
+end;
+
 function AddMachinePath: Boolean;
 var
   CurrentPath: string;
   AppPath: string;
   NewPath: string;
 begin
-  AppPath := ExpandConstant('{app}');
+  AppPath := ExpandConstant('{app}\bin');
   if not RegQueryStringValue(HKLM, EnvironmentRegistryKey, 'Path', CurrentPath) then
     CurrentPath := '';
-  if PathContains(CurrentPath, AppPath) then
+  NewPath := CurrentPath;
+  if InstallerOwnsMachinePath and PathContains(NewPath, ExpandConstant('{app}')) then
+    NewPath := PathWithoutEntry(NewPath, ExpandConstant('{app}'));
+  if not PathContains(NewPath, AppPath) then
+  begin
+    if (NewPath <> '') and (NewPath[Length(NewPath)] <> ';') then
+      NewPath := NewPath + ';';
+    NewPath := NewPath + AppPath;
+  end;
+  if NewPath = CurrentPath then
   begin
     Result := True;
     Exit;
   end;
-  NewPath := CurrentPath;
-  if (NewPath <> '') and (NewPath[Length(NewPath)] <> ';') then
-    NewPath := NewPath + ';';
-  NewPath := NewPath + AppPath;
   Result := RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath);
   if Result then
     Result := RegWriteDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, 1);
@@ -309,31 +342,20 @@ end;
 
 procedure RemoveMachinePath;
 var
-  WasAdded: Cardinal;
   CurrentPath: string;
-  Remaining: string;
-  Token: string;
   NewPath: string;
-  AppPath: string;
 begin
-  if not RegQueryDWordValue(HKLM, SunPackRegistryKey, PathMarkerName, WasAdded) or (WasAdded <> 1) then
+  if not InstallerOwnsMachinePath then
     Exit;
   if not RegQueryStringValue(HKLM, EnvironmentRegistryKey, 'Path', CurrentPath) then
     CurrentPath := '';
-  Remaining := CurrentPath;
-  AppPath := NormalizePathEntry(ExpandConstant('{app}'));
-  NewPath := '';
-  while Remaining <> '' do
+  NewPath := PathWithoutEntry(CurrentPath, ExpandConstant('{app}'));
+  NewPath := PathWithoutEntry(NewPath, ExpandConstant('{app}\bin'));
+  if not RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath) then
   begin
-    Token := PopPathEntry(Remaining);
-    if (Trim(Token) <> '') and (NormalizePathEntry(Token) <> AppPath) then
-    begin
-      if NewPath <> '' then
-        NewPath := NewPath + ';';
-      NewPath := NewPath + Trim(Token);
-    end;
+    Log('Failed to remove SunPack from the system PATH.');
+    Exit;
   end;
-  RegWriteExpandStringValue(HKLM, EnvironmentRegistryKey, 'Path', NewPath);
   RegDeleteValue(HKLM, SunPackRegistryKey, PathMarkerName);
   RegDeleteKeyIfEmpty(HKLM, SunPackRegistryKey);
 end;
@@ -396,6 +418,13 @@ begin
   end;
 end;
 
+function ExistingLauncherPath: string;
+begin
+  Result := ExpandConstant('{app}\bin\sunpack.exe');
+  if not FileExists(Result) then
+    Result := ExpandConstant('{app}\sunpack.exe');
+end;
+
 function QueryExistingWatchRunning(var WatchStateDir: string): Boolean;
 var
   ExistingApp: string;
@@ -407,7 +436,7 @@ begin
   Result := False;
   WatchStateDir := '';
   RegDeleteValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName);
-  ExistingApp := ExpandConstant('{app}\sunpack.exe');
+  ExistingApp := ExistingLauncherPath;
   if not FileExists(ExistingApp) then
     Exit;
 
@@ -467,7 +496,7 @@ begin
   begin
     ScriptPath := ExpandConstant('{app}\scripts\register_context_menu.ps1');
     Parameters := '-NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File ' +
-      AddQuotes(ScriptPath) + ' -AppPath ' + AddQuotes(ExpandConstant('{app}\sunpack.exe')) +
+      AddQuotes(ScriptPath) + ' -AppPath ' + AddQuotes(ExpandConstant('{app}\bin\sunpack.exe')) +
       ' -IconPath ' + AddQuotes(ExpandConstant('{app}\sunpack.ico'));
   end
   else
@@ -500,7 +529,7 @@ var
   ExistingApp: string;
   ResultCode: Integer;
 begin
-  ExistingApp := ExpandConstant('{app}\sunpack.exe');
+  ExistingApp := ExistingLauncherPath;
   if not FileExists(ExistingApp) then
     Exit;
   if not Exec(ExistingApp, 'watch stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
@@ -523,7 +552,7 @@ var
   ResultCode: Integer;
 begin
   Result := True;
-  CliAppPath := ExpandConstant('{app}\sunpack.exe');
+  CliAppPath := ExistingLauncherPath;
   RuntimeAppPath := ExpandConstant('{app}\sunpack-runtime.exe');
   if (not FileExists(CliAppPath)) and (not FileExists(RuntimeAppPath)) then
     Exit;
@@ -813,7 +842,7 @@ begin
 
   if HasExplicitTaskSelection then
     Exit;
-  if not FileExists(ExpandConstant('{app}\sunpack.exe')) then
+  if not FileExists(ExistingLauncherPath) then
     Exit;
   if not QueryOriginalUserStartupEnabled(Enabled) then
     Exit;
@@ -862,7 +891,7 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 begin
   ApplyStartupTaskDefault;
-  ExistingInstallation := FileExists(ExpandConstant('{app}\sunpack.exe'));
+  ExistingInstallation := FileExists(ExistingLauncherPath);
   RestartWatchAfterUpgrade := False;
   ExistingWatchStateDir := '';
   if ExistingInstallation then
@@ -925,13 +954,13 @@ begin
       if not RunContextMenuScript(True) then
         RaiseException(CustomMessage('TaskContextMenuFailed'));
     end;
-    if ExistingInstallation then
-      RestoreWatchAfterUpgrade
-    else
+    if InstallerOwnsMachinePath or ((not ExistingInstallation) and WizardIsTaskSelected('addtopath')) then
     begin
-      if WizardIsTaskSelected('addtopath') and not AddMachinePath then
+      if not AddMachinePath then
         RaiseException(CustomMessage('TaskAddToPathFailed'));
     end;
+    if ExistingInstallation then
+      RestoreWatchAfterUpgrade;
     ApplySelectedStartupState;
   end;
 end;

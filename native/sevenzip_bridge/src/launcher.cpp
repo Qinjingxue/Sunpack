@@ -96,6 +96,10 @@ InstallContext install_context() {
     std::wstring directory = executable;
     const auto slash = directory.find_last_of(L"\\/");
     directory.resize(slash == std::wstring::npos ? 0 : slash);
+    const auto parent_slash = directory.find_last_of(L"\\/");
+    if (parent_slash != std::wstring::npos && directory.substr(parent_slash + 1) == L"bin") {
+        directory.resize(parent_slash);
+    }
     return {directory, "v2-" + fnv1a_hex(utf8(executable))};
 }
 

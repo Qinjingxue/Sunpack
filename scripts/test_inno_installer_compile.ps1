@@ -54,6 +54,7 @@ $outputDir = Join-Path $tempRoot "output"
 New-Item -ItemType Directory -Path $sourceDir, $outputDir -Force | Out-Null
 
 try {
+    [System.IO.File]::WriteAllBytes((Join-Path $sourceDir "sunpack.exe"), [byte[]]@())
     Copy-Item -LiteralPath $iconPath -Destination (Join-Path $sourceDir "sunpack.ico") -Force
     [System.IO.File]::WriteAllText(
         (Join-Path $sourceDir "sunpack_config.json"),

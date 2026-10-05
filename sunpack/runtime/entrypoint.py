@@ -5,11 +5,15 @@ import sys
 def _launch_unelevated_launcher(arguments: list[str]) -> int:
     from sunpack.core.platform.windows.process_launch import launch_unelevated
     from sunpack.core.support.process_executable import current_process_executable
+    from sunpack.runtime.watch.launcher import packaged_runtime_executable
 
-    launcher = current_process_executable().with_name("sunpack.exe")
+    executable = current_process_executable()
+    launcher = packaged_runtime_executable(executable)
+    if launcher is None:
+        return 1
     process = launch_unelevated(
         [str(launcher), *arguments],
-        cwd=str(launcher.parent),
+        cwd=str(executable.parent),
     )
     try:
         try:

@@ -1,4 +1,5 @@
 import sunpack.runtime.entrypoint as entrypoint
+import pytest
 import sunpack.core.support.resources as resources
 from sunpack.core.support import runtime_identity
 
@@ -28,9 +29,12 @@ def test_entrypoint_consumes_private_runtime_identity_before_cli(monkeypatch):
     assert entrypoint.main() == 19
 
 
-def test_entrypoint_launches_watch_unelevated_for_installer(tmp_path, monkeypatch):
+@pytest.mark.parametrize("installed", [False, True])
+def test_entrypoint_launches_watch_unelevated_for_installer(tmp_path, monkeypatch, installed):
     runtime = tmp_path / "sunpack-runtime.exe"
-    launcher = tmp_path / "sunpack.exe"
+    launcher = (tmp_path / "bin" if installed else tmp_path) / "sunpack.exe"
+    launcher.parent.mkdir(exist_ok=True)
+    launcher.touch()
     captured = {}
 
     class FakeProcess:

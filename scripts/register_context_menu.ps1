@@ -27,6 +27,7 @@ function Resolve-Launcher {
     }
 
     $exeCandidates = @(
+        (Join-Path $RepoRoot "bin\sunpack.exe"),
         (Join-Path $RepoRoot "sunpack.exe"),
         (Join-Path $RepoRoot "dist\sunpack\sunpack.exe"),
         (Join-Path $RepoRoot "dist\sunpack.exe")
@@ -244,7 +245,8 @@ function Set-ContextMenuCommand {
 function Get-MenuLanguage {
     param([string]$RepoRoot)
 
-    $configPath = if (Test-Path -LiteralPath (Join-Path $RepoRoot "sunpack.exe") -PathType Leaf) {
+    $configPath = if ((Test-Path -LiteralPath (Join-Path $RepoRoot "bin\sunpack.exe") -PathType Leaf) -or
+                      (Test-Path -LiteralPath (Join-Path $RepoRoot "sunpack.exe") -PathType Leaf)) {
         Join-Path $env:ProgramData "SunPack\sunpack_config.json"
     } else {
         Join-Path $RepoRoot "sunpack_config.json"

@@ -77,7 +77,7 @@ def test_doctor_returns_task_failed_when_a_check_fails(tmp_path, monkeypatch):
 def test_installation_checks_accept_machine_toast_com_registration(tmp_path, monkeypatch):
     install_dir = tmp_path / "SunPack"
     runtime = install_dir / "sunpack-runtime.exe"
-    launcher = install_dir / "sunpack.exe"
+    launcher = install_dir / "bin" / "sunpack.exe"
     broker = install_dir / "service" / "sunpack-watch-broker.exe"
     data_dir = tmp_path / "ProgramData" / "SunPack"
     data_dir.mkdir(parents=True)
@@ -86,7 +86,7 @@ def test_installation_checks_accept_machine_toast_com_registration(tmp_path, mon
         (doctor.SERVICE_REGISTRY_KEY, "ImagePath"): f'"{broker}"',
         (doctor.TOAST_LOCAL_SERVER_KEY, ""): f'"{runtime}" --toast-activated',
         (doctor.SUNPACK_REGISTRY_KEY, doctor.PATH_MARKER_NAME): 1,
-        (doctor.ENVIRONMENT_REGISTRY_KEY, "Path"): f"C:\\Windows;{install_dir}",
+        (doctor.ENVIRONMENT_REGISTRY_KEY, "Path"): f"C:\\Windows;{launcher.parent}",
     }
     for command_key in doctor.CONTEXT_COMMAND_KEYS:
         values[(command_key, "")] = f'"{launcher}" extract "%1"'
@@ -121,7 +121,7 @@ def test_optional_machine_integrations_are_skipped_when_not_enabled(monkeypatch)
     assert doctor._startup_check()["status"] == "skip"
 
 
-def test_machine_path_marker_requires_current_install_directory(tmp_path, monkeypatch):
+def test_machine_path_marker_requires_launcher_directory(tmp_path, monkeypatch):
     runtime = tmp_path / "SunPack" / "sunpack-runtime.exe"
 
     def read_value(path, name=""):
@@ -137,4 +137,21 @@ def test_machine_path_marker_requires_current_install_directory(tmp_path, monkey
     check = doctor._machine_path_check()
 
     assert check["status"] == "fail"
-    assert "install directory is missing" in check["detail"]
+    assert "launcher directory is missing" in check["detail"]
+
+
+def test_machine_path_rejects_runtime_directory_even_with_bin(tmp_path, monkeypatch):
+    install_dir = tmp_path / "SunPack"
+    runtime = install_dir / "sunpack-runtime.exe"
+    values = {
+        (doctor.SUNPACK_REGISTRY_KEY, doctor.PATH_MARKER_NAME): 1,
+        (doctor.ENVIRONMENT_REGISTRY_KEY, "Path"):
+            f'C:\\Windows;"{install_dir}\\";{install_dir / "bin"}',
+    }
+    monkeypatch.setattr(doctor, "current_process_executable", lambda: runtime)
+    monkeypatch.setattr(doctor, "_read_hklm_value", lambda path, name="": values.get((path, name)))
+
+    check = doctor._machine_path_check()
+
+    assert check["status"] == "fail"
+    assert "bundled DLLs" in check["detail"]

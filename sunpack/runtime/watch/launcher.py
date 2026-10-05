@@ -9,6 +9,9 @@ LAUNCHER_EXECUTABLE_NAME = "sunpack.exe"
 
 def packaged_runtime_executable(executable: str | Path | None = None) -> Path | None:
     current = Path(executable).resolve() if executable is not None else current_process_executable()
+    installed = current.parent / "bin" / LAUNCHER_EXECUTABLE_NAME
+    if installed.is_file():
+        return installed
     candidate = current.parent / LAUNCHER_EXECUTABLE_NAME
     return candidate if candidate.is_file() else None
 
