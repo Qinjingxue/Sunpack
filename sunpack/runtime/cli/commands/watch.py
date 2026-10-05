@@ -57,7 +57,7 @@ def register(subparsers, ctx):
     status_parser.set_defaults(watch_action="status")
 
     startup_parser = actions.add_parser("startup", parents=[common], help=ctx.t("cli.watch.startup"), formatter_class=CliHelpFormatter)
-    startup_parser.add_argument("startup_action", choices=["enable", "disable", "status"])
+    startup_parser.add_argument("startup_action", choices=["enable", "disable", "status"], help=ctx.t("cli.watch.startup_action"))
 
 
 async def handle(args, ctx):

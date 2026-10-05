@@ -81,6 +81,7 @@ def build_cli_parser(ctx: CliContext | None = None, command: str | None = None) 
     subparsers = parser.add_subparsers(dest="command", required=True, parser_class=_ContextArgumentParser)
     for module in modules:
         module.register(subparsers, ctx)
+    localize_help_action(parser, ctx)
     return parser
 
 

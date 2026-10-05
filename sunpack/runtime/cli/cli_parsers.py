@@ -27,11 +27,12 @@ class CliHelpFormatter(argparse.RawDescriptionHelpFormatter):
 
 
 def localize_help_action(parser: argparse.ArgumentParser, ctx: CliContext):
-    if ctx.language != "zh":
-        return
     for action in parser._actions:
         if "-h" in getattr(action, "option_strings", []):
             action.help = ctx.t("cli.help")
+        if isinstance(action, argparse._SubParsersAction):
+            for child in dict.fromkeys(action.choices.values()):
+                localize_help_action(child, ctx)
 
 
 def build_common_parser(ctx: CliContext) -> argparse.ArgumentParser:
