@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import contextlib
 import os
 import threading
 import time
+import uuid
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Iterable
@@ -18,6 +20,7 @@ from sunpack.core.support.resource_lifecycle import (
     current_task_resource_scope,
     lifecycle_registration,
     register_process_cache_resource,
+    register_resource,
 )
 
 
@@ -114,6 +117,15 @@ def _retire_entries(entries: list[_SessionEntry]) -> None:
 
 
 def get_archive_session(path: str) -> NativeArchiveSession:
+    return _get_archive_session(path)
+
+
+def _get_archive_session(
+    path: str,
+    *,
+    borrow_token: str | None = None,
+    leases: list[ResourceLease] | None = None,
+) -> NativeArchiveSession:
     normalized = os.path.abspath(os.path.normpath(path))
     stale_entries: list[_SessionEntry] = []
     duplicate: NativeArchiveSession | None = None
@@ -127,7 +139,7 @@ def get_archive_session(path: str) -> NativeArchiveSession:
             if existing is not None and not existing.retired:
                 duplicate = session
                 _SESSIONS.move_to_end(key)
-                _attach_task_borrow_locked(existing)
+                _attach_borrow_locked(existing, borrow_token, leases)
                 result = existing.session
             else:
                 stale_keys = [item for item in _SESSIONS if item[0] == key[0] and item != key]
@@ -141,7 +153,7 @@ def get_archive_session(path: str) -> NativeArchiveSession:
                     registration_held=True,
                 )
                 _SESSIONS[key] = entry
-                _attach_task_borrow_locked(entry)
+                _attach_borrow_locked(entry, borrow_token, leases)
                 while len(_SESSIONS) > _MAX_SESSIONS:
                     _old_key, old_entry = _SESSIONS.popitem(last=False)
                     stale_entries.append(old_entry)
@@ -153,9 +165,55 @@ def get_archive_session(path: str) -> NativeArchiveSession:
     return result
 
 
-def retain_archive_sessions(paths) -> None:
-    for path in dict.fromkeys(str(path) for path in paths if path):
-        get_archive_session(path)
+def _attach_borrow_locked(
+    entry: _SessionEntry,
+    borrow_token: str | None,
+    leases: list[ResourceLease] | None,
+) -> None:
+    if borrow_token is None:
+        _attach_task_borrow_locked(entry)
+        return
+    assert leases is not None
+    scope = current_task_resource_scope()
+    lease = register_resource(
+        entry.session,
+        (entry.key[0],),
+        lambda: _release_borrow(entry, borrow_token),
+        kind=ResourceKind.ARCHIVE_SESSION_BORROW,
+        task_id=scope.task_id if scope is not None else borrow_token,
+        registration_held=True,
+    )
+    entry.borrowers.add(borrow_token)
+    leases.append(lease)
+
+
+@contextlib.contextmanager
+def borrow_archive_sessions(paths: Iterable[os.PathLike[str] | str | None]):
+    """Retain cached sessions only while a synchronous native probe uses them.
+
+    Each call owns independent leases, including concurrent calls in one task.
+    Do not add these leases to the request's resource list: directory probes
+    touch other requests' sources and must release them before source cleanup.
+    Admit the entire volume set atomically against promotion gates.
+    """
+    unique: dict[str, str] = {}
+    for path in paths:
+        if path:
+            unique.setdefault(absolute_path_key(path), os.fspath(path))
+    paths = tuple(unique.values())
+    leases: list[ResourceLease] = []
+    token = uuid.uuid4().hex
+    try:
+        with lifecycle_registration(paths):
+            sessions = tuple(
+                _get_archive_session(path, borrow_token=token, leases=leases)
+                for path in paths
+            )
+        yield sessions
+    finally:
+        with contextlib.ExitStack() as releases:
+            for lease in leases:
+                releases.callback(lease.close)
 
 
 def clear_archive_sessions() -> dict:

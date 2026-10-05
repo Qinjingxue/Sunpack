@@ -6,7 +6,7 @@ from sunpack.core.passwords.verifier.input import (
     structured_volume_input,
     verifier_input,
 )
-from sunpack.core.support.archive_sessions import get_archive_session, retain_archive_sessions
+from sunpack.core.support.archive_sessions import borrow_archive_sessions
 from sunpack_native import rar_fast_verify_passwords_from_ranges, rar_fast_verify_passwords_from_volumes
 
 
@@ -47,10 +47,9 @@ class RarFastVerifier:
                         ),
                     }
                 )
-            retain_archive_sessions([item.get("path") for item in volume_input[1]])
-            return self._from_outcome(
-                rar_fast_verify_passwords_from_volumes(volume_input[1], normalized_passwords)
-            )
+            with borrow_archive_sessions(item.get("path") for item in volume_input[1]):
+                outcome = rar_fast_verify_passwords_from_volumes(volume_input[1], normalized_passwords)
+            return self._from_outcome(outcome)
         if requires_volume_aware_verifier(
             archive_path,
             part_paths=part_paths,
@@ -67,14 +66,14 @@ class RarFastVerifier:
             part_paths=part_paths,
             archive_input=archive_input,
         )
-        retain_archive_sessions(
+        with borrow_archive_sessions(
             [item.get("path") for item in ranges] if ranges else [verifier_path]
-        )
-        outcome = (
-            rar_fast_verify_passwords_from_ranges(ranges, normalized_passwords)
-            if ranges
-            else get_archive_session(verifier_path).rar_fast_verify_passwords(normalized_passwords)
-        )
+        ) as sessions:
+            outcome = (
+                rar_fast_verify_passwords_from_ranges(ranges, normalized_passwords)
+                if ranges
+                else sessions[0].rar_fast_verify_passwords(normalized_passwords)
+            )
         return self._from_outcome(outcome)
 
     @staticmethod
