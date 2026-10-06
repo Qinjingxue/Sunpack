@@ -8,6 +8,10 @@ use std::borrow::Cow;
 const OVERLAY_SCAN_WINDOW_BYTES: u64 = 65_536;
 const PE_SIGNATURE: &[u8] = b"PE\x00\x00";
 const SECTION_HEADER_SIZE: usize = 40;
+// The Windows loader accepts at most 96 sections; reject before allocating
+// or reading the optional header / section table.
+const MAX_PE_SECTIONS: usize = 96;
+const IMAGE_FILE_EXECUTABLE_IMAGE: u16 = 0x0002;
 
 const ARCHIVE_MAGICS: &[(&[u8], &str, &str)] = &[
     (b"7z\xbc\xaf\x27\x1c", "7z", ".7z"),
@@ -98,12 +102,12 @@ fn inspect_pe_headers<'a, E>(
         return Ok(PeProbe::NotPe);
     }
     let coff = field!(pe_header_offset, 24);
-    if u16_le(&coff, 4) == 0 {
+    if u16_le(&coff, 4) == 0 || u16_le(&coff, 22) & IMAGE_FILE_EXECUTABLE_IMAGE == 0 {
         return Ok(PeProbe::NotPe);
     }
     let section_count = u16_le(&coff, 6) as usize;
     let optional_size = u16_le(&coff, 20) as usize;
-    if section_count == 0 || optional_size < 64 {
+    if section_count == 0 || section_count > MAX_PE_SECTIONS || optional_size < 64 {
         return Ok(PeProbe::NotPe);
     }
     let optional_offset = pe_header_offset + 24;
@@ -486,6 +490,8 @@ mod tests {
         bytes[pe_offset + 6..pe_offset + 8].copy_from_slice(&1u16.to_le_bytes());
         bytes[pe_offset + 20..pe_offset + 22]
             .copy_from_slice(&(optional_size as u16).to_le_bytes());
+        bytes[pe_offset + 22..pe_offset + 24]
+            .copy_from_slice(&IMAGE_FILE_EXECUTABLE_IMAGE.to_le_bytes());
         bytes[optional..optional + 2]
             .copy_from_slice(&(if pe64 { 0x20bu16 } else { 0x10b }).to_le_bytes());
         bytes[optional + 60..optional + 64].copy_from_slice(&(headers_size as u32).to_le_bytes());
@@ -592,6 +598,73 @@ mod tests {
                 anchor.pe_image_end,
                 (offset == 0x80).then_some(bytes.len() as u64)
             );
+        }
+    }
+
+    #[test]
+    fn invalid_section_counts_and_non_executable_images_stop_at_coff() {
+        for pe64 in [false, true] {
+            for (section_count, characteristics) in [
+                (0, IMAGE_FILE_EXECUTABLE_IMAGE),
+                (97, IMAGE_FILE_EXECUTABLE_IMAGE),
+                (u16::MAX, IMAGE_FILE_EXECUTABLE_IMAGE),
+                (1, 0),
+                (1, 0x2000), // DLL without EXECUTABLE_IMAGE is not confirmed.
+            ] {
+                let pe_offset = 0x800;
+                let mut bytes = image(pe_offset, pe64);
+                bytes[pe_offset + 6..pe_offset + 8].copy_from_slice(&section_count.to_le_bytes());
+                bytes[pe_offset + 22..pe_offset + 24]
+                    .copy_from_slice(&characteristics.to_le_bytes());
+                // Claim enough physical space even for a 65535-section table.
+                // The parser must reject COFF before requesting more bytes.
+                let result = inspect_pe_headers::<std::convert::Infallible>(
+                    u32::MAX as u64,
+                    |offset, len| {
+                        assert!(offset + len as u64 <= (pe_offset + 24) as u64);
+                        Ok(Some(Cow::Borrowed(
+                            &bytes[offset as usize..offset as usize + len],
+                        )))
+                    },
+                )
+                .unwrap();
+                assert_eq!(result, PeProbe::NotPe);
+                let path = crate::test_support::temp_file("invalid_pe_coff", &bytes);
+                assert_eq!(
+                    inspect_pe_image_native(path.to_str().unwrap()).unwrap(),
+                    PeProbe::NotPe
+                );
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn ninety_six_sections_and_executable_dlls_remain_valid() {
+        for pe64 in [false, true] {
+            let pe_offset = 0x800;
+            let optional = pe_offset + 24;
+            let section = optional + if pe64 { 240 } else { 224 };
+            let headers_size = (section + 96 * SECTION_HEADER_SIZE + 511) & !511;
+            let mut bytes = image(pe_offset, pe64);
+            bytes.resize(headers_size + 32, 0);
+            bytes[pe_offset + 6..pe_offset + 8].copy_from_slice(&96u16.to_le_bytes());
+            bytes[pe_offset + 22..pe_offset + 24].copy_from_slice(&0x2002u16.to_le_bytes());
+            bytes[optional + 60..optional + 64]
+                .copy_from_slice(&(headers_size as u32).to_le_bytes());
+            bytes[section + 20..section + 24].copy_from_slice(&(headers_size as u32).to_le_bytes());
+            assert_eq!(
+                probe_pe_prefix(&bytes[..512], bytes.len() as u64),
+                PeProbe::NeedMore
+            );
+            let path = crate::test_support::temp_file("pe_96_section_dll", &bytes);
+            assert_eq!(
+                inspect_pe_image_native(path.to_str().unwrap())
+                    .unwrap()
+                    .image_end(),
+                Some(bytes.len() as u64)
+            );
+            std::fs::remove_file(path).unwrap();
         }
     }
 }

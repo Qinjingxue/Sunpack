@@ -61,6 +61,7 @@ def make_minimal_pe(
     image[pe_offset + 4:pe_offset + 6] = (0x8664 if pe64 else 0x14C).to_bytes(2, "little")
     image[pe_offset + 6:pe_offset + 8] = (1).to_bytes(2, "little")
     image[pe_offset + 20:pe_offset + 22] = optional_size.to_bytes(2, "little")
+    image[pe_offset + 22:pe_offset + 24] = (0x0002).to_bytes(2, "little")
     image[optional:optional + 2] = (0x20B if pe64 else 0x10B).to_bytes(2, "little")
     image[optional + 32:optional + 36] = (4096).to_bytes(4, "little")
     image[optional + 36:optional + 40] = (512).to_bytes(4, "little")

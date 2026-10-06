@@ -2,7 +2,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from sunpack_native import inspect_pe_image, inspect_pe_overlay_structure
+from sunpack_native import inspect_pe_image, inspect_pe_overlay_structure, probe_volume_anchors
 from sunpack.core.contracts.archive_input import ArchiveInputDescriptor
 from sunpack.core.contracts.discovery import DiscoveryCandidate
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
@@ -12,7 +12,7 @@ from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from sunpack.pipeline.discovery.filesystem.directory_scanner import DirectoryScanner
 from sunpack.pipeline.discovery.relations import RelationsScheduler
 from tests.helpers.config_factory import make_config
-from tests.helpers.fs_builder import make_minimal_7z, make_minimal_pe
+from tests.helpers.fs_builder import make_minimal_7z, make_minimal_pe, make_zip
 
 
 def _config():
@@ -133,3 +133,51 @@ def test_native_embedded_reuses_confirmed_residual_without_reopening_pe(tmp_path
     assert status == 0
     assert reason == "embedded_executable_skipped"
     assert scan is None
+
+
+@pytest.mark.parametrize("pe_offset", [0x80, 0x800])
+@pytest.mark.parametrize("sections,characteristics", [
+    (1, 0), (1, 0x2000), (97, 0x0002), (65535, 0x0002),
+])
+def test_invalid_coff_carriers_are_scanned_instead_of_skipped(tmp_path, pe_offset, sections, characteristics):
+    image = bytearray(make_minimal_pe(b"7-Zip SFX", pe_offset=pe_offset))
+    image[pe_offset + 6:pe_offset + 8] = sections.to_bytes(2, "little")
+    image[pe_offset + 22:pe_offset + 24] = characteristics.to_bytes(2, "little")
+    path = tmp_path / "invalid_image.exe"
+    path.write_bytes(image + make_minimal_7z() + b"trailing junk")
+    assert inspect_pe_image(str(path)) is False
+    for result in [
+        ArchiveTaskProvider(_config()).discover_targets([str(path)]),
+        EmbeddedDiscovery(_config()).discover([_candidate(path)]),
+    ]:
+        [task] = result.resolved_tasks
+        assert task.discovery_source == "embedded"
+        assert task.archive_input().primary_extent.start == len(image)
+
+
+@pytest.mark.parametrize("pe_offset", [0x80, 0x800])
+@pytest.mark.parametrize("archive_format,payload", [
+    ("7z", make_minimal_7z()), ("zip", make_zip({"payload.txt": "contents"})),
+])
+def test_deep_anchor_reuses_pe_facts_for_nonleading_archives(tmp_path, pe_offset, archive_format, payload):
+    image = make_minimal_pe(pe_offset=pe_offset)
+    path = tmp_path / "image.jpg"
+    path.write_bytes(image + payload)
+    [anchor] = probe_volume_anchors([str(path)])
+    assert anchor["pe_structure"] is True
+    assert anchor["format"] == archive_format
+    assert anchor["structure_offset"] == len(image)
+    assert anchor["sfx"] is False
+
+
+@pytest.mark.parametrize("archive_format,payload", [
+    ("7z", make_minimal_7z()), ("zip", make_zip({"payload.txt": "contents"})),
+])
+def test_deep_anchor_candidate_refined_to_none_does_not_authorize_archive_search(tmp_path, archive_format, payload):
+    image = make_minimal_pe(pe_offset=0x800).replace(b"PE\x00\x00", b"NO\x00\x00")
+    path = tmp_path / "invalid_image.jpg"
+    path.write_bytes(image + payload)
+    [anchor] = probe_volume_anchors([str(path)], tail_limit=0)
+    assert anchor["pe_structure"] is False
+    assert anchor["format"] == ""
+    assert anchor["sfx"] is False

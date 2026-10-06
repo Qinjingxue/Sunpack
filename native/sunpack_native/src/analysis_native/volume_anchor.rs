@@ -230,9 +230,8 @@ fn probe_path(
     let mut file = reader.cursor();
     result.size = size;
     // Most formats put their identifying structure in the first few hundred
-    // bytes.  Only a validated PE/SFX candidate gets the larger prefix window.
-    // This keeps the ordinary directory-wide pass at roughly 512 B + ZIP tail
-    // rather than reading 1 MiB from every candidate.
+    // bytes. Deep probing may expand a canonical PE candidate or an encrypted
+    // leading RAR4 header. Cheap probing never adds I/O to confirm PE facts.
     let base_prefix_len = size.min(512) as usize;
     let mut prefix_len = base_prefix_len;
     let mut prefix = vec![0u8; base_prefix_len];
@@ -247,7 +246,10 @@ fn probe_path(
         return probe_cheap_prefix(result, &prefix, password);
     }
 
-    let allow_embedded = prefix.starts_with(b"MZ");
+    let pe = probe_pe_prefix(&prefix, size);
+    result.pe_state = pe.state();
+    result.pe_image_end = pe.image_end();
+    let allow_embedded = result.pe_state != PeState::None;
     let has_rar4_signature = anchored_signature(&prefix, RAR4, allow_embedded).is_some();
     if (allow_embedded || (password.is_some() && has_rar4_signature))
         && prefix_limit > base_prefix_len
@@ -266,11 +268,16 @@ fn probe_path(
             return result;
         }
         result.bytes_read += (prefix_len - base_prefix_len) as u64;
+        if result.pe_state == PeState::Candidate {
+            // Refine only when expansion supplied missing structure. Reuse a
+            // previously Confirmed boundary without parsing the image again.
+            let pe = probe_pe_prefix(&prefix, size);
+            result.pe_state = pe.state();
+            result.pe_image_end = pe.image_end();
+        }
     }
 
-    let pe = probe_pe_prefix(&prefix, size);
-    result.pe_state = pe.state();
-    result.pe_image_end = pe.image_end();
+    let allow_embedded = result.pe_state != PeState::None;
 
     // RAR and 7z have all relation-seed structure at the head.  Do not pay
     // the ZIP EOCD tail read for a proposal that has already identified one
@@ -712,7 +719,7 @@ fn read_zip_tail_for_anchor(
 }
 
 fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor) -> bool {
-    let allow_embedded = prefix.starts_with(b"MZ");
+    let allow_embedded = out.pe_state != PeState::None;
     let split_start_offset = prefix
         .starts_with(ZIP_SPLIT_MARKER)
         .then_some(ZIP_SPLIT_MARKER.len())
@@ -1240,6 +1247,43 @@ fn read_vint(data: &[u8], mut offset: usize) -> Option<(u64, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bare_mz_does_not_expand_or_authorize_nonleading_archive_probes() {
+        let mut seven_zip = SEVEN_ZIP.to_vec();
+        seven_zip.extend([0, 4]);
+        let mut start = 0u64.to_le_bytes().to_vec();
+        start.extend(1u64.to_le_bytes());
+        start.extend(crc32(&[1]).to_le_bytes());
+        seven_zip.extend(crc32(&start).to_le_bytes());
+        seven_zip.extend(start);
+        seven_zip.push(1);
+        let mut zip_local = ZIP_LOCAL.to_vec();
+        zip_local.resize(30, 0);
+        zip_local[4..6].copy_from_slice(&20u16.to_le_bytes());
+        zip_local[26..28].copy_from_slice(&1u16.to_le_bytes());
+        zip_local.push(b'a');
+        for archive in [seven_zip, zip_local] {
+            for offset in [64, 0x800] {
+                let mut bytes = vec![0; 8192];
+                bytes[..2].copy_from_slice(b"MZ");
+                bytes[offset..offset + archive.len()].copy_from_slice(&archive);
+                let path = crate::test_support::temp_file("mz_not_pe_deep_anchor", &bytes);
+                let anchor = probe_path(
+                    path.to_str().unwrap(),
+                    DEFAULT_PREFIX_LIMIT,
+                    0,
+                    None,
+                    VolumeAnchorProbeDepth::Deep,
+                );
+                assert_eq!(anchor.pe_state, PeState::None);
+                assert_eq!(anchor.bytes_read, 512);
+                assert!(anchor.format.is_empty());
+                assert!(!anchor.sfx);
+                std::fs::remove_file(path).unwrap();
+            }
+        }
+    }
 
     fn rar4_block(kind: u8, flags: u16, body: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0, 0, kind];
