@@ -62,6 +62,14 @@ def classify_extract_failure(
     err_lower = _norm(err_text)
     worker_result = worker_result_payload(run_result)
     if worker_result:
+        if worker_result.get("failure_kind") in {"dictionary_required", "dictionary_or_data"}:
+            return FailureInfo(
+                kind=FailureKind.UNKNOWN, stage="extraction",
+                message=str(worker_result.get("message") or "LZ4 dictionary is required"),
+                user_action=("check_lz4_dictionary_or_data" if worker_result.get("failure_kind") == "dictionary_or_data"
+                             else "provide_lz4_dictionary"),
+                details={"information_required": True, "dictionary_id": dict(worker_result.get("stream_receipt") or {}).get("dictionary_id")},
+            )
         if worker_result.get("missing_volume"):
             return _failure(
                 FailureKind.MISSING_VOLUME,

@@ -13,6 +13,8 @@ const GZIP: &[u8] = b"\x1f\x8b\x08";
 const BZIP2: &[u8] = b"BZh";
 const XZ: &[u8] = b"\xfd7zXZ\x00";
 const ZSTD: &[u8] = b"\x28\xb5\x2f\xfd";
+const LZ4: &[u8] = crate::formats::lz4::MAGIC;
+const LZ4_LEGACY: &[u8] = crate::formats::lz4::LEGACY;
 const TAR_USTAR: &[u8] = b"ustar";
 const TAR_BLOCK_SIZE: usize = 512;
 
@@ -23,4 +25,6 @@ const ANALYSIS_SIGNATURES_GZIP: &[(&str, &[u8])] = &[("gzip", GZIP)];
 const ANALYSIS_SIGNATURES_BZIP2: &[(&str, &[u8])] = &[("bzip2", BZIP2)];
 const ANALYSIS_SIGNATURES_XZ: &[(&str, &[u8])] = &[("xz", XZ)];
 const ANALYSIS_SIGNATURES_ZSTD: &[(&str, &[u8])] = &[("zstd", ZSTD)];
+const ANALYSIS_SIGNATURES_LZ4: &[(&str, &[u8])] = &[("lz4", LZ4)];
+const ANALYSIS_SIGNATURES_LZ4_LEGACY: &[(&str, &[u8])] = &[("lz4_legacy", LZ4_LEGACY)];
 const ANALYSIS_SIGNATURES_TAR: &[(&str, &[u8])] = &[("tar_ustar", TAR_USTAR)];

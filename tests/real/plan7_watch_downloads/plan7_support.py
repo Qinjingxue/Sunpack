@@ -27,6 +27,7 @@ from tests.helpers.real_archives import (
 from tests.real.plan1_real_archives.plan1_support import (
     PLAIN_FORMATS as PLAN1_PLAIN_FORMATS,
     plan1_config,
+    assert_expected_files_extracted,
 )
 
 
@@ -427,6 +428,8 @@ def build_disguised_cases(root: Path) -> tuple[dict[str, Plan7Case], list[str]]:
         ("disguised_7z", "7z", {"disguise_ext": ".payload"}),
         ("carrier_zip", "zip", {"carrier": "jpg"}),
         ("disguised_rar", "rar", {"disguise_ext": ".payload"}),
+        ("disguised_lz4", "lz4", {"disguise_ext": ".payload"}),
+        ("carrier_tar_lz4", "tar.lz4", {"carrier": "jpg"}),
     )
     for key, archive_format, options in definitions:
         try:
@@ -438,7 +441,7 @@ def build_disguised_cases(root: Path) -> tuple[dict[str, Plan7Case], list[str]]:
                     root,
                     f"p7_{key}",
                     archive_format,
-                    password=PASSWORD,
+                    password=PASSWORD if archive_format in {"7z", "zip", "rar"} else None,
                     payload_size=96 * 1024,
                     **options,
                 ),
@@ -450,25 +453,24 @@ def build_disguised_cases(root: Path) -> tuple[dict[str, Plan7Case], list[str]]:
 
 @_recorded_fixture_build("embedded")
 def build_embedded_watch_cases(root: Path) -> tuple[dict[str, Plan7Case], list[str]]:
-    """Build three independent files, each containing one archive format."""
+    """Build independent carriers including a fully bounded LZ4 frame."""
+    from tests.helpers.native_fixture import assemble_carrier
+
     cases: dict[str, Plan7Case] = {}
     skipped: list[str] = []
-    for archive_format in ("7z", "zip", "rar"):
+    for archive_format in ("7z", "zip", "rar", "lz4"):
         key = f"embedded_{archive_format}"
         try:
             case = FACTORY.create(
                 root,
                 f"p7_source_{key}",
                 archive_format,
-                password=PASSWORD,
+                password=PASSWORD if archive_format != "lz4" else None,
                 payload_size=64 * 1024,
             )
-            raw = case.entry_path.read_bytes()
             embedded_path = case.archive_dir / f"p7_{key}.bin"
-            embedded_path.write_bytes(
-                f"PLAN7-EMBEDDED-{archive_format}-PREFIX".encode("ascii")
-                + raw
-                + f"-PLAN7-EMBEDDED-{archive_format}-SUFFIX".encode("ascii")
+            case.metadata["carrier_layout"] = assemble_carrier(
+                embedded_path, [case.entry_path], seed=0x7004, decoys=True,
             )
             case.entry_path.unlink()
             case.entry_path = embedded_path
@@ -807,6 +809,8 @@ def assert_plan7_success(
             assert marker_text_extracted(root, plan7_case.case.marker_name, plan7_case.case.marker_text), (
                 f"marker missing for {plan7_case.key}: {plan7_case.case.marker_name}"
             )
+            if plan7_case.archive_format in {"lz4", "tar.lz4"}:
+                assert_expected_files_extracted(plan7_case.case, root)
     assert not any(harness.watcher.state.entries.values()), "watch state must not retain failures"
     assert harness.submit_times, "pipeline never submitted any archive"
 

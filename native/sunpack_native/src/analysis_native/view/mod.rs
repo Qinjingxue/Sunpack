@@ -17,6 +17,7 @@ include!("signatures.rs");
 include!("tar.rs");
 include!("compression.rs");
 include!("report.rs");
+include!("lz4.rs");
 
 #[pyfunction]
 pub(crate) fn probe_rar_bytes(

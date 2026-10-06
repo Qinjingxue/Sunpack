@@ -23,14 +23,6 @@ _KNOWLEDGE_ROOTS = (
 )
 
 
-def _sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for block in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(block)
-    return digest.hexdigest()
-
-
 def jsonable(value: Any, *, _depth: int = 0) -> Any:
     """Convert diagnostic values to bounded JSON-compatible data.
 
@@ -43,7 +35,7 @@ def jsonable(value: Any, *, _depth: int = 0) -> Any:
     if value is None or isinstance(value, (str, int, float, bool)):
         return value
     if isinstance(value, bytes):
-        return {"bytes": len(value), "sha256": hashlib.sha256(value).hexdigest()}
+        return {"bytes": len(value)}
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, Enum):
@@ -108,10 +100,6 @@ def snapshot_path(
         return result
 
     if not root.is_dir():
-        try:
-            result["sha256"] = _sha256(root)
-        except OSError as exc:
-            result["read_error"] = repr(exc)
         return result
 
     candidates = sorted(root.rglob("*"), key=lambda item: str(item).casefold()) if recursive else []
@@ -127,8 +115,6 @@ def snapshot_path(
                 "size": stat.st_size,
                 "mtime_ns": stat.st_mtime_ns,
             }
-            if child.is_file():
-                item["sha256"] = _sha256(child)
         except OSError as exc:
             item = {
                 "relative_path": str(child.relative_to(root)),
@@ -305,7 +291,6 @@ def marker_locations(root: Path | str, marker_name: str, marker_text: str) -> li
             "path": str(path),
             "relative_path": str(path.relative_to(root_path)),
             "size": path.stat().st_size,
-            "sha256": hashlib.sha256(data).hexdigest(),
             "marker_name": marker_name,
         })
     return matches

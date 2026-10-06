@@ -1359,6 +1359,10 @@ impl AnalysisBinaryView {
         result.set_item("damage_flags", PyList::empty(py))?;
         let header = self.read_at_bytes(0, 64)?;
         match format {
+            "lz4" => {
+                return crate::formats::lz4::walk(&self.reader, 0, self.reader.len())
+                    .to_dict(py, self.reader.len());
+            }
             "gzip" => {
                 if !header.starts_with(GZIP) {
                     result.set_item("error", "gzip_magic_not_found")?;

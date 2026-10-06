@@ -42,6 +42,7 @@ def _selected_structure_format(task: Any | None) -> str:
         "bz2", "bzip2", "tbz", "tbz2", "tar.bz2",
         "xz", "txz", "tar.xz",
         "zst", "zstd", "tzst", "tar.zst",
+        "lz4", "tar.lz4",
     }:
         return "compression"
     return ""

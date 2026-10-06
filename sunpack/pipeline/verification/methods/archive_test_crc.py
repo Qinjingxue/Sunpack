@@ -31,6 +31,8 @@ class ArchiveTestCrcMethod:
     name = "archive_test_crc"
 
     def verify(self, evidence: VerificationEvidence, config: dict) -> VerificationStep:
+        if evidence.archive_input.format_hint in {"lz4", "tar.lz4"}:
+            return _stream_receipt_result(self.name, evidence)
         max_items = config["max_items"]
         archive_manifest = archive_input_manifest_for_evidence(evidence, max_items=max_items)
 
@@ -363,3 +365,27 @@ def _coverage_float(coverage: dict[str, Any], key: str, default: float) -> float
         return float(coverage.get(key, default))
     except (TypeError, ValueError):
         return default
+
+
+def _stream_receipt_result(method: str, evidence: VerificationEvidence) -> VerificationStep:
+    plan = dict(evidence.archive_input.analysis.get("stream_plan") or {})
+    receipt = dict(evidence.worker_result.get("stream_receipt") or {})
+    if not plan or not receipt:
+        return VerificationStep(method=method, status="skipped")
+    inventory = output_inventory_for_evidence(evidence)
+    result = inventory.verify_stream_receipt(plan, receipt)
+    status = result["status"]
+    return VerificationStep(
+        method=method, status=status,
+        completeness_hint=1.0 if status == "passed" else None,
+        content_integrity_hint=result["content_integrity"] if status == "passed" else CONTENT_INTEGRITY_UNKNOWN,
+        verification_strength=result["verification_strength"],
+        total_item_count=1, verified_item_count=1 if status == "passed" else 0,
+        archive_walk_complete=bool(plan.get("complete")),
+        decision_hint=DECISION_RETRY_EXTRACT if status == "failed" else "none",
+        issues=[VerificationIssue(
+            method=method, code="fail.stream_execution_mismatch" if status == "failed" else "info.stream_execution_coverage",
+            message="LZ4 frame sequence, checksums and finalized output were compared with the source plan",
+            path=evidence.output_dir, actual=result,
+        )],
+    )

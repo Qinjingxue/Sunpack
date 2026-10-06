@@ -77,6 +77,8 @@ SEVEN_ZIP_METHOD_CASES = [
     pytest.param("PPMd", 5, True, "PPMd", id="ppmd-solid"),
     pytest.param("BZip2", 5, True, "BZip2", id="bzip2-solid"),
     pytest.param("Deflate", 5, True, "Deflate", id="deflate-solid"),
+    pytest.param("LZ4", 1, True, "04F71104", id="lz4-solid"),
+    pytest.param("LZ4", 1, False, "04F71104", id="lz4-nonsolid"),
 ]
 
 

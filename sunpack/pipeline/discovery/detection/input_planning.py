@@ -6,7 +6,7 @@ from dataclasses import asdict, replace
 from typing import Any, Callable
 
 from sunpack.core.analysis import ArchiveAnalysisReport, ArchiveAnalyzer
-from sunpack.core.analysis.request import AnalysisRequest
+from sunpack.core.analysis.request import AnalysisCapability, AnalysisRequest, DEFAULT_ANALYSIS_CAPABILITIES
 from sunpack.core.analysis.source import analysis_source_for_descriptor
 from sunpack.core.support.archive_input_projection import (
     write_source_extractable_segments,
@@ -129,7 +129,14 @@ class ArchiveInputPlanningStage:
         return tasks
 
     def requires_analysis(self, task: ArchiveTask) -> bool:
-        return self.analyzer is not None and not _discovery_confirmed(task)
+        if self.analyzer is None:
+            return False
+        descriptor = task.archive_input()
+        # Identity confirmation does not carry frame coverage or dictionaries.
+        # Embedded tasks already own the canonical plan; reuse it directly.
+        if descriptor.format_hint in {"lz4", "tar.lz4"}:
+            return not descriptor.analysis.get("stream_plan")
+        return not _discovery_confirmed(task)
 
     def _plan_task_to_tasks(self, task: ArchiveTask) -> tuple[ArchiveAnalysisReport | None, list[ArchiveTask]]:
         if not self.requires_analysis(task):
@@ -157,8 +164,9 @@ class ArchiveInputPlanningStage:
         return replace(report, cache_hits=report.cache_hits + 1)
 
     def _analyze_task(self, task: ArchiveTask) -> ArchiveAnalysisReport:
+        descriptor = task.archive_input()
         source = analysis_source_for_descriptor(
-            task.archive_input(),
+            descriptor,
             report_path=task.main_path,
         )
         prepass = knowledge_view.inspection_prepass(task)
@@ -171,6 +179,9 @@ class ArchiveInputPlanningStage:
             source,
             AnalysisRequest(
                 initial_prepass=initial_prepass,
+                capabilities=(frozenset({AnalysisCapability.FORMAT_STRUCTURE})
+                    if _discovery_confirmed(task) and descriptor.format_hint in {"lz4", "tar.lz4"}
+                    else DEFAULT_ANALYSIS_CAPABILITIES),
             ),
         )
 
@@ -298,6 +309,8 @@ class ArchiveInputPlanningStage:
             if execution_analysis:
                 analysis["execution"] = execution_analysis
             selected_format = str(getattr(selected, "format", "") or "")
+            if selected_format in {"lz4", "tar.lz4"}:
+                analysis.update(_lz4_execution_analysis(selected, 0))
             updated = replace(
                 descriptor,
                 format_hint=selected_format or descriptor.format_hint,
@@ -375,6 +388,7 @@ class ArchiveInputPlanningStage:
             "format_hint": evidence.format,
             "path": task.main_path,
         })
+        payload.update(_lz4_execution_analysis(evidence, segment.start_offset))
         return payload
 
     def _archive_input_for_segment(
@@ -395,10 +409,11 @@ class ArchiveInputPlanningStage:
             "segment_confidence": float(segment.confidence),
             "segment_source": "analysis",
         }
+        segment_analysis.update(_lz4_execution_analysis(evidence, segment.start_offset))
         if evidence.details.get("password_required"):
             segment_analysis["password_required"] = True
         if len(parts) == 1:
-            if int(segment.start_offset) <= 0:
+            if int(segment.start_offset) <= 0 and evidence.format not in {"lz4", "tar.lz4"}:
                 return None
             extent = InputExtent(
                 path=parts[0],
@@ -413,7 +428,7 @@ class ArchiveInputPlanningStage:
                 parts=[ArchiveInputPart(extent=extent)],
                 analysis=dict(segment_analysis),
             )
-        if int(segment.start_offset) <= 0:
+        if int(segment.start_offset) <= 0 and evidence.format not in {"lz4", "tar.lz4"}:
             return None
         if evidence.format == "rar":
             return None
@@ -588,3 +603,14 @@ def _discovery_confirmed(task: ArchiveTask) -> bool:
         "detection",
         "embedded",
     }
+
+
+def _lz4_execution_analysis(evidence: ArchiveFormatEvidence, offset: int) -> dict[str, Any]:
+    if evidence is None or evidence.format not in {"lz4", "tar.lz4"}:
+        return {}
+    details = evidence.details
+    plan = dict(details.get("stream_plans", {}).get(str(offset)) or details.get("stream_plan") or {})
+    result = {"lz4": dict(details.get("lz4") or {})}
+    if plan:
+        result["stream_plan"] = plan
+    return result

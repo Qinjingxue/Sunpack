@@ -86,3 +86,13 @@ LGPL must be added.
 If a release compiles or links LGPL-covered 7-Zip source into a SunPack binary,
 that release must also satisfy the applicable LGPL source, modification, and
 rebuild/relink requirements for the exact code used to produce the binary.
+
+## LZ4 1.10.0 and xxHash
+
+SunPack vendors the unmodified LZ4 1.10.0 library sources and bundled xxHash at
+`native/third_party/lz4/`. They are compiled into the Rust extension and the
+archive worker for LZ4 Frame and Legacy decoding. The library remains under
+the BSD 2-Clause license. The full notice is distributed at
+[licenses/lz4-license.txt](licenses/lz4-license.txt).
+
+Source: https://github.com/lz4/lz4/tree/v1.10.0/lib

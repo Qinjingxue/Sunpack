@@ -27,6 +27,7 @@ def test_plan7_plain_and_sfx_downloads_complete_and_record_memory(
     plan7_error["archives"] = sorted(cases)
     assert not skipped, f"Plan 7 requires the full generator matrix: {skipped}"
     assert cases, "no plain/SFX cases could be generated"
+    assert {"plain_lz4", "plain_tar.lz4"} <= cases.keys()
 
     passwords = [*wrong_password_list(), PASSWORD]
     harness = start_watch(tmp_path, "plain_sfx", passwords=passwords)

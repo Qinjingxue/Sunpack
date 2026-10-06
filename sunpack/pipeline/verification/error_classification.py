@@ -68,6 +68,8 @@ _EXECUTION = {
 def classify_verification_error(failure_kind: str, failure_stage: str = "") -> VerificationErrorClass:
     kind = str(failure_kind or "").strip().lower()
     stage = str(failure_stage or "").strip().lower()
+    if kind in {"dictionary_required", "dictionary_config", "dictionary_or_data", "information_required"}:
+        return VerificationErrorClass(category="information_required")
     if kind in _PAYLOAD_DAMAGE or (stage == "item_extract" and kind not in _PASSWORD | _INCOMPLETE_CONTENT):
         return VerificationErrorClass(
             content_integrity=CONTENT_INTEGRITY_PAYLOAD_DAMAGED,

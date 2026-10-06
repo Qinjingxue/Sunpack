@@ -328,7 +328,26 @@ if(SUP7Z_ARM64_ASM_ENABLED)
 endif()
 
 
+set(SUP_LZ4_ROOT "${CMAKE_CURRENT_SOURCE_DIR}/../third_party/lz4")
+add_library(sunpack_lz4 STATIC
+    ${SUP_LZ4_ROOT}/lz4.c ${SUP_LZ4_ROOT}/lz4hc.c
+    ${SUP_LZ4_ROOT}/lz4frame.c ${SUP_LZ4_ROOT}/xxhash.c
+    ../lz4_stream/stream.c)
+target_include_directories(sunpack_lz4 PUBLIC ${SUP_LZ4_ROOT} ../lz4_stream)
+target_compile_definitions(sunpack_lz4 PRIVATE XXH_NAMESPACE=SUNPACK_LZ4_)
+apply_release_optimizations(sunpack_lz4)
+if(WIN32)
+    add_library(sunpack_lz4_handler OBJECT src/internal/lz4_handler.cpp src/internal/lz4_codec.cpp)
+    target_include_directories(sunpack_lz4_handler PRIVATE ${SUP7Z_7Z_ROOT}/CPP include ${SUP_LZ4_ROOT} ../lz4_stream)
+    target_compile_definitions(sunpack_lz4_handler PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+    apply_release_optimizations(sunpack_lz4_handler)
+    apply_source_charset(sunpack_lz4_handler)
+endif()
+
 function(sup7z_attach_bundled_7z target_name)
+    if(TARGET sunpack_lz4_handler)
+        target_sources(${target_name} PRIVATE $<TARGET_OBJECTS:sunpack_lz4_handler>)
+    endif()
     if(WIN32 AND TARGET sunpack_7zip_objects)
         target_sources(${target_name} PRIVATE
             $<TARGET_OBJECTS:sunpack_7zip_objects>)
@@ -393,7 +412,7 @@ if(WIN32)
     target_compile_definitions(sunpack_sevenzip_core PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
     target_link_libraries(sunpack_sevenzip_core PUBLIC OleAut32)
 endif()
-target_link_libraries(sunpack_sevenzip_core PRIVATE zlib-ng::zlibstatic)
+target_link_libraries(sunpack_sevenzip_core PUBLIC sunpack_lz4 PRIVATE zlib-ng::zlibstatic)
 if(SUP7Z_ENABLE_PIPELINE_TIMING)
     target_compile_definitions(sunpack_sevenzip_core PRIVATE SUP7Z_ENABLE_PIPELINE_TIMING=1)
 endif()
@@ -401,6 +420,11 @@ endif()
 add_executable(sunpack_sevenzip_smoke
     tests/smoke.cpp
 )
+add_executable(sunpack_sevenzip_lz4 tests/lz4.cpp)
+apply_release_optimizations(sunpack_sevenzip_lz4)
+apply_source_charset(sunpack_sevenzip_lz4)
+target_link_libraries(sunpack_sevenzip_lz4 PRIVATE sunpack_sevenzip_core)
+sup7z_attach_bundled_7z(sunpack_sevenzip_lz4)
 apply_release_optimizations(sunpack_sevenzip_smoke)
 apply_source_charset(sunpack_sevenzip_smoke)
 

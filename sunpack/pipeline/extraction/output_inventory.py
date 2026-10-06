@@ -90,6 +90,10 @@ class OutputInventory:
     def build_directory_snapshots(self, options):
         return self._native.build_directory_snapshots(options)
 
+    def verify_stream_receipt(self, plan: dict, receipt: dict) -> dict:
+        from sunpack_native import verify_stream_receipt
+        return dict(verify_stream_receipt(plan, receipt, self._native))
+
     def all_crc_ok(self) -> bool:
         return bool(self._native.all_crc_ok())
 

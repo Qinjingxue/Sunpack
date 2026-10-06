@@ -199,6 +199,15 @@ fn inspect_compression_stream_identity_impl(path: &str) -> CompressionIdentityRe
         };
     }
     let base_bytes_read = data.len() as u64;
+    if crate::formats::lz4::leading(&data) {
+        let identity=crate::formats::lz4::identity(&reader,0);
+        // Skippable magic is shared with Zstandard and does not establish LZ4.
+        if identity != Ok(false) {
+            let (valid,error)=match identity {Ok(valid)=>(valid,""),Err(e)=>(false,e)};
+            let bytes_read=reader.stats().map(|s| s.read_bytes).unwrap_or(base_bytes_read);
+            return compression_identity_result("lz4",".lz4",true,file_size,bytes_read,valid,error,&["lz4:header"]);
+        }
+    }
 
     if data.starts_with(b"\x1f\x8b") {
         let (payload_start, flags) = match parse_gzip_header(&data, 0) {

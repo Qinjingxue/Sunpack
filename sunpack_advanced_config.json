@@ -159,6 +159,10 @@
     "cache_size": 512
   },
   "analysis": {
+    "lz4": {
+      "default_dictionary": "",
+      "dictionaries": {}
+    },
     "max_concurrent_reads": 1,
     "shared_cache_mb": 64,
     "max_read_mb_per_archive": 256,
@@ -203,6 +207,15 @@
       },
       {
         "name": "xz",
+        "enabled": true,
+        "max_probe_bytes": 4194304
+      },
+      {
+        "name": "lz4",
+        "enabled": true
+      },
+      {
+        "name": "tar_lz4",
         "enabled": true,
         "max_probe_bytes": 4194304
       },

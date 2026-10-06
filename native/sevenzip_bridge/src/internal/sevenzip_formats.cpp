@@ -44,6 +44,8 @@ namespace sunpack::sevenzip
                 return {0x02, 0xEE};
             if (hint == L"xz" || hint == L"tar.xz" || hint == L"txz")
                 return {0x0C, 0xEE};
+            if (hint == L"lz4" || hint == L"tar.lz4")
+                return {0xFA, 0xEE};
             if (hint == L"zst" || hint == L"zstd" || hint == L"tar.zst" || hint == L"tzst")
                 return {0x0E, 0xEE};
             return {};
@@ -74,11 +76,12 @@ namespace sunpack::sevenzip
                 return {0x02, 0xEE};
             if (ext == L".xz" || ext == L".txz")
                 return {0x0C, 0xEE};
+            if (ext == L".lz4") return {0xFA, 0xEE};
             if (ext == L".zst" || ext == L".tzst")
                 return {0x0E, 0xEE};
             if (ext == L".001")
                 return {0x07, 0x01, 0xCC, 0x03};
-            return {0x07, 0x01, 0xCC, 0x03, 0xEE, 0xEF, 0x02, 0x0C, 0x0E};
+            return {0x07, 0x01, 0xCC, 0x03, 0xEE, 0xEF, 0x02, 0x0C, 0x0E, 0xFA};
         }
 
         std::vector<GUID> format_guids(const std::vector<unsigned char> &ids)
@@ -140,6 +143,7 @@ namespace sunpack::sevenzip
         {
             return L"bzip2";
         }
+        if (ext == L".lz4") return L"lz4";
         if (ext == L".xz" || ext == L".txz")
         {
             return L"xz";

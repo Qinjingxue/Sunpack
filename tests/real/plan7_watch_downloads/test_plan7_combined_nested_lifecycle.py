@@ -30,6 +30,7 @@ def test_plan7_disguised_split_nested_carrier_survives_two_restarts_and_password
             arrive_slowly(first, part)
         assert not marker_present(first.output_root, case.ready_marker)
         assert not marker_present(first.output_root, case.blocked.marker_name)
+        assert not marker_present(first.output_root, case.lz4_marker)
     finally:
         first.close()
 

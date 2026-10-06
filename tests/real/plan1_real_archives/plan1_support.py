@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 from pathlib import Path
 
 from sunpack.core.config.schema import normalize_config
@@ -9,6 +8,8 @@ from tests.helpers.detection_probe import detect_archive_hits
 from tests.helpers.marker_utils import marker_was_extracted
 from tests.helpers.pipeline_engine import execute_pipeline
 from tests.helpers.real_archives import ArchiveCase
+from tests.helpers.real_archives import STREAM_FORMATS
+from tests.helpers.native_fixture import file_inventory
 
 
 # 第 1 条：扫描时顶层检测到的格式。tar 变体的顶层是外层流格式，
@@ -22,10 +23,12 @@ EXPECTED_DETECTED_EXT = {
     "tar.bz2": ".bz2",
     "tar.xz": ".xz",
     "tar.zst": ".zst",
+    "tar.lz4": ".lz4",
     "gzip": ".gz",
     "bzip2": ".bz2",
     "xz": ".xz",
     "zstd": ".zst",
+    "lz4": ".lz4",
 }
 
 PLAIN_FORMATS = list(EXPECTED_DETECTED_EXT)
@@ -39,6 +42,7 @@ _FORMAT_TO_EXT = {
     "bzip2": ".bz2",
     "xz": ".xz",
     "zstd": ".zst",
+    "lz4": ".lz4",
 }
 
 
@@ -140,37 +144,30 @@ def marker_text_contained(root: Path, marker_text: str) -> bool:
 
 
 def _expected_files_extracted(case: ArchiveCase, root: Path) -> dict[str, dict[str, object]]:
-    """Validate every known fixture member by size and SHA-256, not only its marker."""
+    """Validate known fixture members by size and native CRC32."""
     expected_files = case.metadata.get("expected_files") or {}
     validation: dict[str, dict[str, object]] = {}
+    actual_files = file_inventory(root)
     for member_name, expected in expected_files.items():
         normalized_name = str(member_name).replace("\\", "/")
         expected_size = int(expected["size"])
-        expected_sha256 = str(expected["sha256"])
+        expected_crc32 = int(expected["crc32"])
         matches = []
-        for path in root.rglob("*"):
-            if not path.is_file():
-                continue
-            relative = path.relative_to(root).as_posix()
+        for relative, actual in actual_files.items():
+            path = root / relative
             name_matches = (
-                case.archive_format in {"gzip", "bzip2", "xz", "zstd"}
+                case.archive_format in STREAM_FORMATS
                 or relative == normalized_name
                 or relative.endswith(f"/{normalized_name}")
                 or path.name == Path(normalized_name).name
             )
             if not name_matches:
                 continue
-            try:
-                if path.stat().st_size != expected_size:
-                    continue
-                digest = hashlib.sha256(path.read_bytes()).hexdigest()
-            except OSError:
-                continue
-            if digest == expected_sha256:
+            if actual["size"] == expected_size and actual["crc32"] == expected_crc32:
                 matches.append(str(path))
         validation[normalized_name] = {
             "expected_size": expected_size,
-            "expected_sha256": expected_sha256,
+            "expected_crc32": expected_crc32,
             "matches": matches,
             "ok": bool(matches),
         }

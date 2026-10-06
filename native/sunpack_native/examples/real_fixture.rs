@@ -3,7 +3,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize)]
@@ -23,6 +23,209 @@ enum Request {
     Inventory {
         root: PathBuf,
     },
+    Lz4 {
+        output: PathBuf,
+        paths: Vec<PathBuf>,
+    },
+    SevenZipLz4Header {
+        source: PathBuf,
+        output: PathBuf,
+    },
+    Flip {
+        path: PathBuf,
+        offset: u64,
+    },
+}
+
+fn seven_zip_uint(value: u64, output: &mut Vec<u8>) {
+    for extra in 0..8 {
+        if value < (1u64 << (7 + 7 * extra)) {
+            let prefix = if extra == 0 { 0 } else { 0xffu8 << (8 - extra) };
+            output.push(prefix | (value >> (8 * extra)) as u8);
+            output.extend_from_slice(&value.to_le_bytes()[..extra]);
+            return;
+        }
+    }
+    output.push(0xff);
+    output.extend_from_slice(&value.to_le_bytes());
+}
+fn seven_zip_lz4_header(source: &Path, output: &Path) -> io::Result<Value> {
+    let mut reader = File::open(source)?;
+    let mut start = [0u8; 32];
+    reader.read_exact(&mut start)?;
+    if start[..6] != *b"7z\xbc\xaf\x27\x1c" {
+        return Err(io::Error::other("not 7z"));
+    }
+    let offset = u64::from_le_bytes(start[12..20].try_into().unwrap());
+    let length = u64::from_le_bytes(start[20..28].try_into().unwrap());
+    if length > 64 * 1024 * 1024 {
+        return Err(io::Error::other("header too large"));
+    }
+    reader.seek(SeekFrom::Start(32 + offset))?;
+    let mut header = vec![0u8; length as usize];
+    reader.read_exact(&mut header)?;
+    if header.first() != Some(&1) {
+        return Err(io::Error::other("use -mhc=off for fixture source"));
+    }
+    let raw = output.with_extension("header.raw");
+    let compressed = output.with_extension("header.lz4");
+    fs::write(&raw, &header)?;
+    compress_lz4(&[raw.clone()], &compressed)?;
+    let packed = fs::metadata(&compressed)?.len();
+    let mut descriptor = vec![0x17, 6];
+    seven_zip_uint(offset, &mut descriptor);
+    seven_zip_uint(1, &mut descriptor);
+    descriptor.push(9);
+    seven_zip_uint(packed, &mut descriptor);
+    descriptor.extend_from_slice(&[
+        0, 7, 0x0b, 1, 0, 1, 0x24, 4, 0xf7, 0x11, 4, 5, 1, 10, 1, 0, 0, 0x0c,
+    ]);
+    seven_zip_uint(length, &mut descriptor);
+    descriptor.extend_from_slice(&[0x0a, 1]);
+    descriptor.extend_from_slice(&crc32fast::hash(&header).to_le_bytes());
+    descriptor.extend_from_slice(&[0, 0]);
+    start[12..20].copy_from_slice(&(offset + packed).to_le_bytes());
+    start[20..28].copy_from_slice(&(descriptor.len() as u64).to_le_bytes());
+    start[28..32].copy_from_slice(&crc32fast::hash(&descriptor).to_le_bytes());
+    let crc = crc32fast::hash(&start[12..32]);
+    start[8..12].copy_from_slice(&crc.to_le_bytes());
+    let mut writer = BufWriter::new(File::create(output)?);
+    writer.write_all(&start)?;
+    reader.seek(SeekFrom::Start(32))?;
+    io::copy(&mut reader.take(offset), &mut writer)?;
+    io::copy(&mut File::open(&compressed)?, &mut writer)?;
+    writer.write_all(&descriptor)?;
+    writer.flush()?;
+    fs::remove_file(raw)?;
+    fs::remove_file(compressed)?;
+    Ok(json!({"encoded_header_method": "04F71104", "header_size": length}))
+}
+
+// Test-only writer using the pinned upstream encoder, independent of SunPack's
+// parser/decoder. Each source is one frame; memory stays bounded for large files.
+#[repr(C)]
+#[derive(Default)]
+struct FrameInfo {
+    block_size: u32,
+    block_mode: u32,
+    content_checksum: u32,
+    frame_type: u32,
+    content_size: u64,
+    dictionary_id: u32,
+    block_checksum: u32,
+}
+#[repr(C)]
+#[derive(Default)]
+struct Preferences {
+    frame: FrameInfo,
+    level: i32,
+    auto_flush: u32,
+    favor_decode: u32,
+    reserved: [u32; 3],
+}
+#[link(name = "sunpack_lz4", kind = "static")]
+extern "C" {
+    fn LZ4F_createCompressionContext(context: *mut *mut std::ffi::c_void, version: u32) -> usize;
+    fn LZ4F_freeCompressionContext(context: *mut std::ffi::c_void) -> usize;
+    fn LZ4F_compressBound(size: usize, prefs: *const Preferences) -> usize;
+    fn LZ4F_compressBegin(
+        context: *mut std::ffi::c_void,
+        output: *mut u8,
+        capacity: usize,
+        prefs: *const Preferences,
+    ) -> usize;
+    fn LZ4F_compressUpdate(
+        context: *mut std::ffi::c_void,
+        output: *mut u8,
+        capacity: usize,
+        input: *const u8,
+        size: usize,
+        options: *const std::ffi::c_void,
+    ) -> usize;
+    fn LZ4F_compressEnd(
+        context: *mut std::ffi::c_void,
+        output: *mut u8,
+        capacity: usize,
+        options: *const std::ffi::c_void,
+    ) -> usize;
+    fn LZ4F_isError(code: usize) -> u32;
+}
+struct CompressionContext(*mut std::ffi::c_void);
+impl Drop for CompressionContext {
+    fn drop(&mut self) {
+        unsafe {
+            LZ4F_freeCompressionContext(self.0);
+        }
+    }
+}
+fn checked_lz4(code: usize) -> io::Result<usize> {
+    if unsafe { LZ4F_isError(code) } != 0 {
+        Err(io::Error::other("upstream LZ4 fixture compression failed"))
+    } else {
+        Ok(code)
+    }
+}
+fn compress_lz4(paths: &[PathBuf], output: &Path) -> io::Result<Value> {
+    if paths.is_empty() {
+        return Err(io::Error::other("LZ4 requires at least one source"));
+    }
+    let mut writer = BufWriter::new(File::create(output)?);
+    let mut input = vec![0u8; 256 * 1024];
+    let mut total = 0u64;
+    let mut digest = crc32fast::Hasher::new();
+    for path in paths {
+        let mut source = BufReader::new(File::open(path)?);
+        let prefs = Preferences {
+            frame: FrameInfo {
+                block_size: 4,
+                block_mode: 0,
+                content_checksum: 1,
+                content_size: source.get_ref().metadata()?.len(),
+                block_checksum: 1,
+                ..FrameInfo::default()
+            },
+            ..Preferences::default()
+        };
+        let mut raw = std::ptr::null_mut();
+        checked_lz4(unsafe { LZ4F_createCompressionContext(&mut raw, 100) })?;
+        let context = CompressionContext(raw);
+        let capacity = checked_lz4(unsafe { LZ4F_compressBound(input.len(), &prefs) })?.max(19);
+        let mut packed = vec![0u8; capacity];
+        let count = checked_lz4(unsafe {
+            LZ4F_compressBegin(context.0, packed.as_mut_ptr(), packed.len(), &prefs)
+        })?;
+        writer.write_all(&packed[..count])?;
+        loop {
+            let count = source.read(&mut input)?;
+            if count == 0 {
+                break;
+            }
+            total += count as u64;
+            digest.update(&input[..count]);
+            let written = checked_lz4(unsafe {
+                LZ4F_compressUpdate(
+                    context.0,
+                    packed.as_mut_ptr(),
+                    packed.len(),
+                    input.as_ptr(),
+                    count,
+                    std::ptr::null(),
+                )
+            })?;
+            writer.write_all(&packed[..written])?;
+        }
+        let count = checked_lz4(unsafe {
+            LZ4F_compressEnd(
+                context.0,
+                packed.as_mut_ptr(),
+                packed.len(),
+                std::ptr::null(),
+            )
+        })?;
+        writer.write_all(&packed[..count])?;
+    }
+    writer.flush()?;
+    Ok(json!({"frames": paths.len(), "source_bytes": total, "source_crc32": digest.finalize()}))
 }
 
 fn next(state: &mut u64) -> u64 {
@@ -87,10 +290,21 @@ fn inventory(root: &Path, directory: &Path, entries: &mut Vec<Value>) -> io::Res
         if kind.is_dir() {
             inventory(root, &path, entries)?;
         } else if kind.is_file() {
-            let (size, sha256) = transfer(&path, &mut io::sink())?;
+            let mut source = BufReader::new(File::open(&path)?);
+            let mut digest = crc32fast::Hasher::new();
+            let mut buffer = [0u8; 64 * 1024];
+            let mut size = 0u64;
+            loop {
+                let count = source.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                digest.update(&buffer[..count]);
+                size += count as u64;
+            }
             entries.push(json!({
                 "path": path.strip_prefix(root).unwrap().to_string_lossy().replace('\\', "/"),
-                "size": size, "sha256": sha256,
+                "size": size, "crc32": digest.finalize(),
             }));
         } else {
             return Err(io::Error::other(
@@ -103,6 +317,18 @@ fn inventory(root: &Path, directory: &Path, entries: &mut Vec<Value>) -> io::Res
 
 fn run(request: Request) -> io::Result<Value> {
     match request {
+        Request::SevenZipLz4Header { source, output } => seven_zip_lz4_header(&source, &output),
+        Request::Flip { path, offset } => {
+            let mut file = fs::OpenOptions::new().read(true).write(true).open(path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            let mut byte = [0u8];
+            file.read_exact(&mut byte)?;
+            byte[0] ^= 1;
+            file.seek(SeekFrom::Start(offset))?;
+            file.write_all(&byte)?;
+            Ok(json!({"offset": offset}))
+        }
+        Request::Lz4 { output, paths } => compress_lz4(&paths, &output),
         Request::Inventory { root } => {
             let mut entries = Vec::new();
             inventory(&root, &root, &mut entries)?;

@@ -333,6 +333,19 @@ fn decode_seven_zip_encoded_coder(
         decrypted.truncate(unpack_size);
         return Ok(decrypted);
     }
+    if coder.method_id.as_slice() == [0x04, 0xf7, 0x11, 0x04] {
+        if coder.properties.len() != 5 {
+            return Err("encoded_header_decoder_unsupported_method:lz4_properties".to_string());
+        }
+        // One extra byte detects an output-size lie while still consuming and
+        // checking all frame checksums when the declared size is correct.
+        let decoded = crate::formats::lz4::sample(Cursor::new(data), unpack_size as usize + 1)
+            .map_err(|err| format!("encoded_header_payload_crc_bad:{err}"))?;
+        if decoded.len() as u64 != unpack_size {
+            return Err("encoded_header_payload_crc_bad:lz4_unpack_size".to_string());
+        }
+        return Ok(decoded);
+    }
     let compressed = Cursor::new(data.to_vec());
     let mut decoded = Vec::with_capacity(
         usize::try_from(unpack_size)
@@ -643,6 +656,10 @@ fn seven_zip_probe_folder_supported(folder: &SevenZipEncodedHeaderFolder) -> boo
                 return false;
             }
         } else if method == EncoderMethod::ID_COPY {
+        } else if method == [0x04, 0xf7, 0x11, 0x04] {
+            if coder.properties.len() != 5 {
+                return false;
+            }
         } else if method == EncoderMethod::ID_LZMA {
             if coder.properties.len() < 5 {
                 return false;
@@ -685,6 +702,33 @@ fn seven_zip_probe_folder_supported(folder: &SevenZipEncodedHeaderFolder) -> boo
 #[cfg(test)]
 mod encoded_folder_graph_tests {
     use super::*;
+
+    #[test]
+    fn lz4_encoded_coder_checks_size_properties_and_checksum() {
+        let mut bytes = vec![0x04, 0x22, 0x4d, 0x18, 0x64, 0x40];
+        bytes.push((crate::formats::lz4::xxh32(&bytes[4..]) >> 8) as u8);
+        bytes.extend_from_slice(&0x80000004u32.to_le_bytes());
+        bytes.extend_from_slice(b"test");
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        bytes.extend_from_slice(&crate::formats::lz4::xxh32(b"test").to_le_bytes());
+        let mut coder = SevenZipEncodedHeaderCoder {
+            method_id: vec![0x04, 0xf7, 0x11, 0x04],
+            properties: vec![1, 10, 1, 0, 0],
+            num_in_streams: 1,
+            num_out_streams: 1,
+        };
+        assert_eq!(
+            decode_seven_zip_encoded_coder(&bytes, &coder, None, 4).unwrap(),
+            b"test"
+        );
+        for wrong_size in [0, 3, 5, 64 * 1024 * 1024 + 1] {
+            assert!(decode_seven_zip_encoded_coder(&bytes, &coder, None, wrong_size).is_err());
+        }
+        *bytes.last_mut().unwrap() ^= 1;
+        assert!(decode_seven_zip_encoded_coder(&bytes, &coder, None, 4).is_err());
+        coder.properties.clear();
+        assert!(decode_seven_zip_encoded_coder(&bytes, &coder, None, 4).is_err());
+    }
 
     fn reference_aes_key(properties: &[u8], password: &[u8]) -> [u8; 32] {
         let b0 = properties[0];

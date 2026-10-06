@@ -17,6 +17,8 @@ const ARCHIVE_MAGICS: &[(&[u8], &str, &str)] = &[
     (b"BZh", "bzip2", ".bz2"),
     (b"\xfd7zXZ\x00", "xz", ".xz"),
     (b"\x28\xb5\x2f\xfd", "zstd", ".zst"),
+    (crate::formats::lz4::MAGIC, "lz4", ".lz4"),
+    (crate::formats::lz4::LEGACY, "lz4", ".lz4"),
 ];
 
 /// Validate the bounded PE header region already read by a caller.
@@ -355,6 +357,14 @@ fn find_archive_magic(sample: &[u8]) -> Option<(&'static str, &'static str, usiz
         };
         if best.is_none_or(|(_, _, best_index)| index < best_index) {
             best = Some((archive_format, detected_ext, index));
+        }
+    }
+    if let Some(offset) = memchr::memmem::find_iter(sample, b"\x2a\x4d\x18")
+        .filter_map(|offset| offset.checked_sub(1))
+        .find(|offset| (0x50..=0x5f).contains(&sample[*offset]))
+    {
+        if best.is_none_or(|(_, _, best_index)| offset < best_index) {
+            best = Some(("lz4", ".lz4", offset));
         }
     }
     best

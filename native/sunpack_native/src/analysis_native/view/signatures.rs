@@ -84,6 +84,8 @@ fn signatures_for_first_byte(byte: u8) -> &'static [(&'static str, &'static [u8]
         b'B' => ANALYSIS_SIGNATURES_BZIP2,
         0xfd => ANALYSIS_SIGNATURES_XZ,
         b'(' => ANALYSIS_SIGNATURES_ZSTD,
+        4 => ANALYSIS_SIGNATURES_LZ4,
+        2 => ANALYSIS_SIGNATURES_LZ4_LEGACY,
         b'u' => ANALYSIS_SIGNATURES_TAR,
         _ => &[],
     }
@@ -106,6 +108,8 @@ fn format_for_hit(name: &str) -> &'static str {
         "xz"
     } else if name == "zstd" {
         "zstd"
+    } else if name == "lz4" || name == "lz4_legacy" {
+        "lz4"
     } else {
         ""
     }

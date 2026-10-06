@@ -844,6 +844,7 @@ pub(crate) fn unified_prefilter_mask_from_head(file_size: u64, head: &[u8]) -> u
         && !head.starts_with(b"BZh")
         && !head.starts_with(XZ_MAGIC)
         && !head.starts_with(ZSTD_MAGIC)
+        && !crate::formats::lz4::leading(head)
     {
         rejected |= UNIFIED_PREFILTER_COMPRESSION;
     }
@@ -888,6 +889,15 @@ pub(crate) fn inspect_compression_stream_structure(
     }
     if header.starts_with(ZSTD_MAGIC) {
         return inspect_zstd(py, path, &header, file_size);
+    }
+    if crate::formats::lz4::leading(&header) {
+        let index = py.detach(|| {
+            ManagedReader::open(path).map(|reader| crate::formats::lz4::walk(&reader, 0, file_size))
+          }).map_err(|e| pyo3::exceptions::PyOSError::new_err(e.to_string()))?;
+          if index.frames == 0 && matches!(index.error, "" | "lz4_magic_not_found") {
+              return compression_empty(py, "ambiguous_skippable_stream", "", "", false);
+          }
+        return Ok(index.to_dict(py, file_size)?.unbind());
     }
     compression_empty(py, "compression_stream_magic_not_found", "", "", false)
 }

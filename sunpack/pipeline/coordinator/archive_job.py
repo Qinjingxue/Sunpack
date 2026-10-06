@@ -493,7 +493,7 @@ def _proves_content_loss(result: ExtractionResult, verification: VerificationRes
         content_integrity
         in {CONTENT_INTEGRITY_VERIFIED_PARTIAL, CONTENT_INTEGRITY_PAYLOAD_DAMAGED}
         and strength
-        in {VERIFICATION_STRENGTH_MANIFEST, VERIFICATION_STRENGTH_CRC}
+        in {VERIFICATION_STRENGTH_MANIFEST, VERIFICATION_STRENGTH_CRC, "checksum"}
     )
 
 

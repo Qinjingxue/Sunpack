@@ -29,7 +29,7 @@ const XZ_FOOTER_MAGIC: &[u8] = b"YZ";
 
 type PatternSpec = (&'static [u8], &'static str, &'static str);
 
-const PATTERNS: [PatternSpec; 10] = [
+const PATTERNS: [PatternSpec; 13] = [
     (ZIP_LOCAL, "zip_local", "zip"),
     (ZIP_EOCD, "zip_eocd", "zip_eocd"),
     (SEVEN_ZIP, "7z", "7z"),
@@ -40,20 +40,21 @@ const PATTERNS: [PatternSpec; 10] = [
     (XZ, "xz", "xz"),
     (ZSTD, "zstd", "zstd"),
     (TAR_USTAR, "tar_ustar", "tar"),
+    (crate::formats::lz4::MAGIC, "lz4", "lz4"),
+    (crate::formats::lz4::LEGACY, "lz4_legacy", "lz4"),
+    (b"\x2a\x4d\x18", "lz4_skippable", "lz4_skippable"),
 ];
-const XZ_PATTERN_INDEX: usize = 7;
-const ZSTD_PATTERN_INDEX: usize = 8;
 
 #[cfg(target_arch = "x86_64")]
-const SIMD_PREFIX_TABLES: [[u8; 32]; 6] = simd_prefix_tables();
+const SIMD_PREFIX_TABLES: [[u8; 32]; 6] = simd_prefix_tables(PATTERNS.len());
 
 #[cfg(target_arch = "x86_64")]
-const fn simd_prefix_tables() -> [[u8; 32]; 6] {
+const fn simd_prefix_tables(pattern_count: usize) -> [[u8; 32]; 6] {
     let mut tables = [[0u8; 32]; 6];
     let mut buckets = [0u8; PATTERNS.len()];
     let mut next_bucket = 0;
     let mut index = 0;
-    while index < PATTERNS.len() {
+    while index < pattern_count {
         let magic = PATTERNS[index].0;
         assert!(magic.len() >= 3);
         assert!(magic[0] != XZ_FOOTER_MAGIC[0]);
@@ -69,7 +70,8 @@ const fn simd_prefix_tables() -> [[u8; 32]; 6] {
         }
         if prior == index {
             next_bucket += 1;
-            assert!(next_bucket <= 8);
+            // Fold extra buckets into the same SIMD pass; full magic checks remove false hits.
+            bucket %= 8;
         }
         buckets[index] = bucket as u8;
         let bit = 1u8 << bucket;
@@ -115,6 +117,7 @@ struct EmbeddedCandidate {
     candidate_kind: &'static str,
     boundary_kind: &'static str,
     extractable: bool,
+    lz4_index: Option<Box<crate::formats::lz4::Index>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +184,12 @@ impl NativeScanResult {
             row.set_item("candidate_kind", candidate.candidate_kind)?;
             row.set_item("boundary_kind", candidate.boundary_kind)?;
             row.set_item("extractable", candidate.extractable)?;
+            if let Some(index) = &candidate.lz4_index {
+                let facts=index.to_dict(py,self.file_size)?;
+                row.set_item("stream_plan",facts.get_item("stream_plan")?)?;
+                row.set_item("information_required",!index.complete)?;
+                row.set_item("error",index.error)?;
+            }
             rows.append(row)?;
         }
         result.set_item("candidates", rows)?;
@@ -450,10 +459,21 @@ fn scan_sample(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit>
     if is_x86_feature_detected!("avx2") {
         // SAFETY: the feature check guards every AVX2 instruction. The scanner
         // only loads vectors when all 34 accessed bytes belong to `sample`.
-        return unsafe { scan_sample_avx2(sample, carry_len, base_offset) };
+        return unsafe { scan_sample_avx2::<13>(sample, carry_len, base_offset) };
     }
 
     scan_sample_packed(sample, carry_len, base_offset)
+}
+
+fn signature_overlaps() -> &'static Vec<Vec<(usize,usize)>> {
+    static OVERLAPS: OnceLock<Vec<Vec<(usize,usize)>>>=OnceLock::new();
+    OVERLAPS.get_or_init(|| PATTERNS.iter().map(|(left,_,_)| {
+        PATTERNS.iter().enumerate().flat_map(|(index,(right,_,_))| {
+            (1..left.len().min(right.len())).filter_map(move |n| {
+                (left[left.len()-n..]==right[..n]).then_some((index,n))
+            })
+        }).collect()
+    }).collect())
 }
 
 fn scan_sample_packed(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit> {
@@ -470,23 +490,13 @@ fn scan_sample_packed(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<
                 matched.end(),
             );
 
-            // Packed search is deliberately non-overlapping. The current
-            // signature set has exactly one proper suffix/prefix overlap:
-            // Zstd ends in FD and XZ begins with FD. Recover that one match
-            // explicitly so this path is exactly equivalent to Standard
-            // Aho-Corasick overlapping semantics.
-            if pattern == ZSTD_PATTERN_INDEX {
-                let xz_start = matched.end() - 1;
-                let xz_end = xz_start + XZ.len();
-                if sample.get(xz_start..xz_end) == Some(XZ) {
-                    record_raw_hit(
-                        &mut hits,
-                        carry_len,
-                        base_offset,
-                        XZ_PATTERN_INDEX,
-                        xz_start,
-                        xz_end,
-                    );
+            // Recover only proper suffix/prefix overlaps. This table is computed
+            // once for the signature set; no additional file pass is needed.
+            for &(next, overlap) in &signature_overlaps()[pattern] {
+                let begin=matched.end()-overlap;
+                let magic=PATTERNS[next].0;
+                if sample.get(begin..begin+magic.len())==Some(magic) {
+                    record_raw_hit(&mut hits,carry_len,base_offset,next,begin,begin+magic.len());
                 }
             }
         }
@@ -517,16 +527,17 @@ fn scan_sample_packed(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn scan_sample_avx2(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit> {
+unsafe fn scan_sample_avx2<const N: usize>(sample: &[u8], carry_len: usize, base_offset: u64) -> Vec<RawHit> {
     use std::arch::x86_64::*;
 
+    let tables=if N==PATTERNS.len() {SIMD_PREFIX_TABLES} else {simd_prefix_tables(N)};
     let mut hits = Vec::new();
-    let low_first = _mm256_loadu_si256(SIMD_PREFIX_TABLES[0].as_ptr().cast());
-    let high_first = _mm256_loadu_si256(SIMD_PREFIX_TABLES[1].as_ptr().cast());
-    let low_second = _mm256_loadu_si256(SIMD_PREFIX_TABLES[2].as_ptr().cast());
-    let high_second = _mm256_loadu_si256(SIMD_PREFIX_TABLES[3].as_ptr().cast());
-    let low_third = _mm256_loadu_si256(SIMD_PREFIX_TABLES[4].as_ptr().cast());
-    let high_third = _mm256_loadu_si256(SIMD_PREFIX_TABLES[5].as_ptr().cast());
+    let low_first = _mm256_loadu_si256(tables[0].as_ptr().cast());
+    let high_first = _mm256_loadu_si256(tables[1].as_ptr().cast());
+    let low_second = _mm256_loadu_si256(tables[2].as_ptr().cast());
+    let high_second = _mm256_loadu_si256(tables[3].as_ptr().cast());
+    let low_third = _mm256_loadu_si256(tables[4].as_ptr().cast());
+    let high_third = _mm256_loadu_si256(tables[5].as_ptr().cast());
     let nibble_mask = _mm256_set1_epi8(15);
     let zero = _mm256_setzero_si256();
     let footer_first = _mm256_set1_epi8(XZ_FOOTER_MAGIC[0] as i8);
@@ -567,27 +578,29 @@ unsafe fn scan_sample_avx2(sample: &[u8], carry_len: usize, base_offset: u64) ->
         let mut mask = !(_mm256_movemask_epi8(_mm256_cmpeq_epi8(matches, zero)) as u32);
         while mask != 0 {
             let candidate = start + mask.trailing_zeros() as usize;
-            scan_sample_candidate(sample, carry_len, base_offset, candidate, &mut hits);
+            scan_sample_candidate::<N>(sample, carry_len, base_offset, candidate, &mut hits);
             mask &= mask - 1;
         }
         start += 32;
     }
     while start < sample.len() {
-        scan_sample_candidate(sample, carry_len, base_offset, start, &mut hits);
+        scan_sample_candidate::<N>(sample, carry_len, base_offset, start, &mut hits);
         start += 1;
     }
     hits
 }
 
 #[cfg(target_arch = "x86_64")]
-#[inline]
-fn scan_sample_candidate(
+#[inline(always)]
+fn scan_sample_candidate<const N: usize>(
     sample: &[u8],
     carry_len: usize,
     base_offset: u64,
     start: usize,
     hits: &mut Vec<RawHit>,
 ) {
+    #[cfg(test)]
+    if N==10 {return scan_sample_candidate_prior(sample,carry_len,base_offset,start,hits);}
     let first = sample[start];
     if first == XZ_FOOTER_MAGIC[0] {
         if sample.get(start..start + XZ_FOOTER_MAGIC.len()) == Some(XZ_FOOTER_MAGIC)
@@ -601,16 +614,44 @@ fn scan_sample_candidate(
         }
         return;
     }
-    for (pattern, (magic, _, _)) in PATTERNS.iter().enumerate() {
-        if magic[0] == first && sample.get(start..start + magic.len()) == Some(*magic) {
-            record_raw_hit(
-                hits,
-                carry_len,
-                base_offset,
-                pattern,
-                start,
-                start + magic.len(),
-            );
+    // Direct dispatch keeps dense rejected prefixes cheap. A longer generic
+    // loop stops being unrolled by the compiler when new signatures are added.
+    macro_rules! check {
+        ($index:expr) => {
+            if $index < N {
+                let magic=PATTERNS[$index].0;
+                if sample.get(start..start+magic.len())==Some(magic) {
+                    record_raw_hit(hits,carry_len,base_offset,$index,start,start+magic.len());
+                }
+            }
+        }
+    }
+    // ZIP/RAR prefixes dominate rejected candidates in executables and images.
+    // Keep these paths outside the sparse dispatch table.
+    if first == b'P' { check!(0); check!(1); return; }
+    if first == b'R' { check!(3); check!(4); return; }
+    match first {
+        b'7'=>check!(2),
+        0x1f=>check!(5), b'B'=>check!(6), 0xfd=>check!(7),
+        b'('=>check!(8), b'u'=>check!(9), 4=>check!(10),
+        2=>check!(11), 0x2a=>check!(12), _=>{},
+    }
+}
+
+// Exact pre-LZ4 candidate loop retained only for the paired release benchmark.
+#[cfg(all(test,target_arch="x86_64"))]
+#[inline]
+fn scan_sample_candidate_prior(sample:&[u8],carry_len:usize,base_offset:u64,start:usize,hits:&mut Vec<RawHit>) {
+    let first=sample[start];
+    if first==XZ_FOOTER_MAGIC[0] {
+        if sample.get(start..start+XZ_FOOTER_MAGIC.len())==Some(XZ_FOOTER_MAGIC) && start+XZ_FOOTER_MAGIC.len()>carry_len {
+            hits.push(RawHit {hit_name:"xz_footer",kind:"xz_footer",offset:base_offset+start as u64});
+        }
+        return;
+    }
+    for (pattern,(magic,_,_)) in PATTERNS[..10].iter().enumerate() {
+        if magic[0]==first && sample.get(start..start+magic.len())==Some(*magic) {
+            record_raw_hit(hits,carry_len,base_offset,pattern,start,start+magic.len());
         }
     }
 }
@@ -631,7 +672,9 @@ fn record_raw_hit(
     }
     let (_, hit_name, kind) = PATTERNS[pattern];
     let absolute = base_offset + start as u64;
-    let candidate_offset = if kind == "tar" {
+    let candidate_offset = if kind == "lz4_skippable" {
+        let Some(value)=absolute.checked_sub(1) else {return;}; value
+    } else if kind == "tar" {
         let Some(value) = absolute.checked_sub(257) else {
             return;
         };
@@ -662,6 +705,18 @@ fn validate_candidate(
         "bzip2" => validate_bzip2(file, file_size, offset),
         "zstd" => validate_zstd(file, file_size, offset),
         "tar" => validate_tar(file, file_size, offset),
+        "lz4" | "lz4_skippable" => {
+            if kind=="lz4_skippable" {
+                let magic=read_at(file,offset,4)?;
+                if magic.len()!=4 || !crate::formats::lz4::skippable(u32::from_le_bytes(magic.as_slice().try_into().unwrap())) { return Ok(None); }
+            }
+            let index=crate::formats::lz4::walk(file,offset,file_size);
+            if index.frames==0 && index.error!="lz4_legacy_boundary_unknown" { return Ok(None); }
+            let mut item=logical_candidate("lz4",offset,index.complete.then_some(index.end),
+                if index.complete {0.98} else {0.72},"lz4_frame_structure");
+            item.lz4_index=Some(Box::new(index));
+            Ok(Some(item))
+        },
         _ => Ok(None),
     }
 }
@@ -1510,6 +1565,7 @@ fn candidate(
         candidate_kind: if exact { "logical_archive" } else { "anchor" },
         boundary_kind: if exact { "exact" } else { "unresolved" },
         extractable: exact,
+        lz4_index: None,
     }
 }
 
@@ -1563,7 +1619,9 @@ mod tests {
         for matched in embedded_matcher().find_overlapping_iter(data) {
             let (_, hit_name, kind) = PATTERNS[matched.pattern().as_usize()];
             let absolute = matched.start() as u64;
-            let candidate_offset = if kind == "tar" {
+            let candidate_offset = if kind == "lz4_skippable" {
+                let Some(value)=absolute.checked_sub(1) else {continue;}; value
+            } else if kind == "tar" {
                 let Some(value) = absolute.checked_sub(257) else {
                     continue;
                 };
@@ -1589,8 +1647,31 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "manual release performance comparison"]
+    fn lz4_scan_performance_against_prior_signatures() {
+        if !is_x86_feature_detected!("avx2") {return;}
+        let mut random=vec![0u8;32*1024*1024];let mut rng=42u64;
+        for byte in &mut random {rng^=rng<<13;rng^=rng>>7;rng^=rng<<17;*byte=rng as u8;}
+        for (name,bytes) in [("random",random),("dense_PKRar",b"PKRar".repeat(32*1024*1024/5))] {
+            let mut old=Vec::new();let mut new=Vec::new();
+            for i in 0..22 {
+                let mut run=|added:bool| {
+                    let start=std::time::Instant::now();
+                    let hits=unsafe {if added {scan_sample_avx2::<13>(&bytes,0,0)} else {scan_sample_avx2::<10>(&bytes,0,0)}};
+                    std::hint::black_box(hits);
+                    let elapsed=start.elapsed().as_secs_f64();
+                    if i>=2 {if added {new.push(elapsed)} else {old.push(elapsed)}}
+                };
+                if i%2==0 {run(false);run(true)} else {run(true);run(false)}
+            }
+            old.sort_by(f64::total_cmp);new.sort_by(f64::total_cmp);
+            println!("{name}: before={:.3} GB/s after={:.3} GB/s ratio={:.3}",bytes.len() as f64/old[10]/1e9,bytes.len() as f64/new[10]/1e9,new[10]/old[10]);
+        }
+    }
+
+    #[test]
     fn simd_scan_matches_reference_with_footers_and_carry_boundaries() {
-        let mut data = vec![0x55; 256];
+        let mut data = vec![0x55; 64+PATTERNS.len()*19];
         for (index, (magic, _, _)) in PATTERNS.iter().enumerate() {
             let start = 41 + index * 19;
             data[start..start + magic.len()].copy_from_slice(magic);
@@ -1926,11 +2007,7 @@ mod tests {
                     data.extend_from_slice(left);
                     data.extend_from_slice(&right[overlap..]);
                     data.extend_from_slice(&[0x11; 32]);
-                    assert_eq!(
-                        (left_index, right_index, overlap),
-                        (ZSTD_PATTERN_INDEX, XZ_PATTERN_INDEX, 1),
-                        "the packed compensation must cover every overlap",
-                    );
+                    assert!(signature_overlaps()[left_index].contains(&(right_index, overlap)));
                     assert!(start > 0);
                 }
             }

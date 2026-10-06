@@ -8,7 +8,7 @@ from pathlib import Path
 from tests.helpers.native_fixture import assemble_carrier, assert_exact_tree, file_inventory
 from tests.helpers.real_archives import (
     ArchiveCase, ArchiveFixtureFactory, choose_entry_path,
-    create_7z_archive, create_rar_archive, create_zip_archive,
+    create_7z_archive, create_rar_archive, create_zip_archive, create_tar_archive,
 )
 from tests.real.plan6_confused_volumes.plan6_support import SCENARIOS, apply_volume_confusion
 
@@ -23,6 +23,8 @@ class NestedCase:
     blocked: ArchiveCase
     blocked_name: str
     layout: dict
+    lz4_marker: str
+    lz4_files: dict
 
 
 def build_nested_case(root: Path, tag: str, outer_format: str) -> NestedCase:
@@ -30,7 +32,8 @@ def build_nested_case(root: Path, tag: str, outer_format: str) -> NestedCase:
 
     Every encryption level has a distinct secret. The healthy ZIP branch must
     survive a failure/retry in its sibling. Only external tools build archives;
-    Rust writes the carrier and calculates expected payload hashes.
+    A healthy TAR/LZ4 segment shares the carrier with encrypted 7z. Rust writes
+    LZ4 frames/the carrier and calculates expected payload hashes.
     """
     secrets = tuple(f"{tag}-{level}-{uuid.uuid4().hex}" for level in ("outer", "middle", "leaf"))
     fixtures = root / f"sources-{tag}"
@@ -53,7 +56,14 @@ def build_nested_case(root: Path, tag: str, outer_format: str) -> NestedCase:
     create_7z_archive(branches, middle, password=secrets[1])
     outer_source = fixtures / f"wrapper-{tag}"
     outer_source.mkdir()
-    layout = assemble_carrier(outer_source / "nested-picture.jpg", [middle], seed=0x1A2B3C, decoys=True)
+    lz4_source = fixtures / f"lz4-source-{tag}"
+    lz4_source.mkdir()
+    lz4_marker = f"lz4-{tag}.txt"
+    (lz4_source / lz4_marker).write_text(f"healthy LZ4 segment::{tag}\n", encoding="utf-8")
+    lz4_files = file_inventory(lz4_source)
+    lz4 = fixtures / "healthy.tar.lz4"
+    create_tar_archive(lz4_source, lz4, "tar.lz4")
+    layout = assemble_carrier(outer_source / "nested-picture.jpg", [middle, lz4], seed=0x1A2B3C, decoys=True)
     (outer_source / "outer-note.txt").write_text(f"outer::{tag}\n", encoding="utf-8")
     archive_dir = root / f"input-{tag}"
     archive_dir.mkdir()
@@ -70,13 +80,17 @@ def build_nested_case(root: Path, tag: str, outer_format: str) -> NestedCase:
     )
     parts = apply_volume_confusion(outer, SCENARIOS[2], add_distractors=False)
     assert len(parts) >= 3, "the lifecycle fixture must really span several volumes"
-    return NestedCase(outer, tuple(parts), secrets, ready_marker, ready_files, blocked, blocked_name, layout)
+    return NestedCase(outer, tuple(parts), secrets, ready_marker, ready_files, blocked, blocked_name, layout,
+                      lz4_marker, lz4_files)
 
 
 def assert_nested_outputs(root: Path, case: NestedCase, *, leaf_success: bool) -> None:
     ready = list(root.rglob(case.ready_marker))
     assert len(ready) == 1, f"healthy branch missing or extracted more than once: {ready}"
     assert_exact_tree(ready[0].parent, case.ready_files)
+    lz4 = list(root.rglob(case.lz4_marker))
+    assert len(lz4) == 1, f"healthy LZ4 segment missing or extracted more than once: {lz4}"
+    assert_exact_tree(lz4[0].parent, case.lz4_files)
     blocked = list(root.rglob(case.blocked.marker_name))
     if leaf_success:
         assert len(blocked) == 1, f"blocked branch missing or extracted more than once: {blocked}"

@@ -5,6 +5,7 @@ fn decompress_sample<R: Read>(
 ) -> Result<Vec<u8>, &'static str> {
     let mut output = Vec::new();
     let result = match format {
+        "lz4" => return crate::formats::lz4::sample(reader, max_output),
         "gzip" => GzDecoder::new(reader)
             .take(max_output as u64)
             .read_to_end(&mut output),

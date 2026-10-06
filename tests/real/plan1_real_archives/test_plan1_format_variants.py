@@ -17,6 +17,7 @@ from tests.helpers.tool_config import get_optional_rar, get_test_tools
 from tests.real.plan1_real_archives.plan1_support import (
     EXPECTED_DETECTED_EXT,
     assert_plan1_success,
+    assert_expected_files_extracted,
     detected_ext,
     marker_text_contained,
     run_plan1_pipeline,
@@ -129,8 +130,9 @@ def test_plan1_rar4_split_archive_extracts_and_detects(tmp_path, plan1_error):
         ("bzip2", ".bz2"),
         ("xz", ".xz"),
         ("zstd", ".zst"),
+        ("lz4", ".lz4"),
     ],
-    ids=["gzip", "bzip2", "xz", "zstd"],
+    ids=["gzip", "bzip2", "xz", "zstd", "lz4"],
 )
 def test_plan1_multi_member_streams_extract_all_members(
     tmp_path, stream_format, expected_ext, plan1_error
@@ -161,6 +163,8 @@ def test_plan1_multi_member_streams_extract_all_members(
     plan1_error["first_member_contained"] = marker_text_contained(
         case.archive_dir, case.marker_text
     )
+    if stream_format == "lz4":
+        assert_expected_files_extracted(case, case.archive_dir)
     plan1_error["second_member_contained"] = marker_text_contained(
         case.archive_dir, second_content
     )

@@ -15,10 +15,10 @@ from tests.real.plan7_watch_downloads.plan7_support import (
 )
 
 
-def test_plan7_single_format_embedded_downloads_react_for_7z_zip_and_rar(tmp_path):
+def test_plan7_single_format_embedded_downloads_react_for_7z_zip_rar_and_lz4(tmp_path):
     cases, skipped = build_embedded_watch_cases(tmp_path / "fixtures")
     assert not skipped, f"required Plan 7 generator capability missing: {skipped}"
-    assert set(cases) == {"embedded_7z", "embedded_zip", "embedded_rar"}
+    assert set(cases) == {"embedded_7z", "embedded_zip", "embedded_rar", "embedded_lz4"}
     harness = start_watch(
         tmp_path,
         "embedded",

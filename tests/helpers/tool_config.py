@@ -63,6 +63,10 @@ def get_test_tools() -> dict[str, Path | None]:
         legacy=None,
         repo_root=repo_root,
     )
+    seven_zip_zstd = _resolve_configured_tool(
+        env_name="sunpack_TEST_7Z_ZSTD", config=config, config_key="seven_zip_zstd",
+        default=".sunpack_test_tools/7zip-zstd/7z.exe", legacy=None, repo_root=repo_root,
+    )
     zstd_exe = _resolve_configured_tool(
         env_name="sunpack_TEST_ZSTD",
         config=config,
@@ -93,6 +97,7 @@ def get_test_tools() -> dict[str, Path | None]:
 
     return {
         "seven_zip": seven_zip,
+        "seven_zip_zstd": seven_zip_zstd,
         "seven_zip_sfx": seven_zip_sfx,
         "zstd_exe": zstd_exe,
         "rar_exe": rar_exe,
@@ -105,6 +110,13 @@ def require_7z() -> Path:
     if not seven_zip or not seven_zip.is_file():
         raise FileNotFoundError("7z.exe is required for this test. Configure tests/test_tools.json or sunpack_TEST_7Z.")
     return seven_zip
+
+
+def require_7z_zstd() -> Path:
+    tool = get_test_tools()["seven_zip_zstd"]
+    if not tool or not tool.is_file():
+        raise FileNotFoundError("7-Zip-Zstandard fixture writer requires sunpack_TEST_7Z_ZSTD or seven_zip_zstd in tests/test_tools.json")
+    return tool
 
 
 def get_7z_cli_dll_path() -> str:

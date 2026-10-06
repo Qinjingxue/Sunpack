@@ -47,9 +47,10 @@ def test_cli_disguised_split_carrier_multilevel_passwords(tmp_path, plan_error, 
     report = json.loads(result.stdout)
     assert report["summary"]["partial_success_count"] == 0
     assert report["summary"]["failed_count"] == (0 if leaf_password_known else 1)
-    assert report["summary"]["success_count"] == (4 if leaf_password_known else 3)
+    assert report["summary"]["success_count"] == (5 if leaf_password_known else 4)
     if not leaf_password_known:
-        assert report["tasks"][-1]["wrong_password_failure"] is True
+        failed = [task for task in report["tasks"] if task.get("wrong_password_failure")]
+        assert len(failed) == 1
         assert case.blocked_name in report["errors"][0]
     assert_nested_outputs(out_dir, case, leaf_success=leaf_password_known)
     assert all(path.is_file() for path in case.parts), "keep policy must preserve all outer volumes"
@@ -64,7 +65,7 @@ def test_concurrent_nested_groups_isolate_password_failure_and_cleanup(tmp_path,
     summary = execute_pipeline(config, [str(healthy.outer.archive_dir), str(blocked.outer.archive_dir)])
     plan_error.update({"failed_tasks": summary.failed_tasks, "failures": [item.to_dict() for item in summary.failures]})
     assert summary.partial_success_count == 0
-    assert summary.success_count == 7
+    assert summary.success_count == 9
     assert len(summary.failed_tasks) == 1
     failure = next(result for result in summary.target_results if result.failure is not None)
     assert Path(failure.input_path).name == blocked.blocked_name

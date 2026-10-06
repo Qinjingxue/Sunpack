@@ -5,6 +5,13 @@ require the isolated Broker environment established by `run_acceptance_tests.ps1
 
 The new regression cases cover:
 
+* LZ4 and TAR/LZ4 participate in Plan 1's ordinary/disguised/mixed directory
+  matrices and concatenated streams. The nested CLI and Plan 7 restart/password
+  fixtures contain a valid TAR/LZ4 carrier segment alongside encrypted 7z;
+  expected sizes/CRC32 verify that this healthy segment survives sibling
+  failures and is extracted exactly once. Plan 7 also covers LZ4 ordinary,
+  disguised, embedded, chunked downloads and writes to the final path.
+
 * Plan 5 constructs carriers once with a declared seed. Rust streams source
   files into the carrier and records byte offsets/lengths independently of the
   scanner. Scanner failures cannot cause fixture regeneration. Fixed fake
@@ -23,7 +30,7 @@ The new regression cases cover:
   fixture writer. It checks USTAR, PAX long Unicode paths, GNU longname,
   duplicate TAR/ZIP members, empty ZIP, legacy CP437 ZIP and solid RAR5 under
   plain names, disguised names and junk-prefixed/suffixed carriers. Expected
-  output paths, sizes and SHA-256 come from source files, not extraction output.
+  output paths, sizes and CRC32 come from source files, not extraction output.
 
 Samples are generated once per structure per test module and reused for all
 three container variants. The ignored `tests/real/corpus/` directory is optional;
@@ -35,7 +42,10 @@ inspectable corpus with tool/command/artifact provenance:
 ```
 
 Binary assembly and hashing use the test-only Cargo example `real_fixture`,
-with bounded 64 KiB buffers. It is built with the workspace's existing locked
+with bounded buffers (64 KiB for assembly/hashing, 256 KiB input for LZ4).
+LZ4 frames use the pinned upstream encoder with block/content checksums,
+declared content size and linked 64 KiB blocks; multiple sources produce
+concatenated frames without querying the product parser. It is built with the workspace's existing locked
 dependencies and does not add production APIs or dependencies. Python reads
 only text manifests and orchestrates existing fixture/tool paths.
 

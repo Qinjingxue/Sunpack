@@ -33,3 +33,6 @@ sunpack-usn-core = { path = "../sunpack_usn_core", default-features = false, fea
 xz2 = "0.1"
 zstd = "0.13"
 unicode-normalization = "0.1"
+
+[build-dependencies]
+cc = "1"

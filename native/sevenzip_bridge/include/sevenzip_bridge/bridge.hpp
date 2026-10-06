@@ -171,7 +171,20 @@ struct ExtractOutputTrace {
     std::vector<ExtractOutputItemTrace> items;
 };
 
+struct Lz4Options {
+    std::wstring default_dictionary;
+    std::vector<std::pair<unsigned int, std::wstring>> dictionaries;
+};
+
+struct StreamDecodeReceipt {
+    unsigned long long input_bytes = 0, output_bytes = 0, frames = 0, skippable_frames = 0;
+    unsigned long long content_checked_frames = 0, block_checked_frames = 0, legacy_frames = 0;
+    unsigned int error = 0, dictionary_id = 0;
+};
+
 struct ExtractArchiveResult {
+    bool has_stream_receipt = false;
+    StreamDecodeReceipt stream_receipt;
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
     ExtractPipelineTiming pipeline_timing;
 #endif
@@ -259,7 +272,8 @@ ExtractArchiveResult extract_archive_with_parts(
     bool native_volume_input = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
     std::size_t job_buffer_budget = 0,
-    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+    const Lz4Options& lz4_options = {}
 );
 
 ExtractArchiveResult extract_archive_with_ranges(
@@ -273,7 +287,8 @@ ExtractArchiveResult extract_archive_with_ranges(
     bool dry_run = false,
     std::shared_ptr<AsyncFileWriter> shared_writer = nullptr,
     std::size_t job_buffer_budget = 0,
-    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr
+    std::shared_ptr<std::atomic<bool>> cancel_token = nullptr,
+    const Lz4Options& lz4_options = {}
 );
 
 const char* status_name(PasswordTestStatus status);

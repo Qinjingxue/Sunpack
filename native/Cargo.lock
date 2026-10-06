@@ -715,6 +715,7 @@ dependencies = [
  "base64",
  "bzip2",
  "cbc",
+ "cc",
  "crc32fast",
  "encoding_rs",
  "flate2",

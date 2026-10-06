@@ -43,12 +43,14 @@ const COMPOSITE_INNER_FORMATS: &[(&str, &[&str])] = &[
     ("tar.bz2", &["tar", "bzip2"]),
     ("tar.xz", &["tar", "xz"]),
     ("tar.zst", &["tar", "zstd"]),
+    ("tar.lz4", &["tar", "lz4"]),
 ];
 const STREAM_CONTAINERS: &[(&str, &str)] = &[
     ("gzip", "tar.gz"),
     ("bzip2", "tar.bz2"),
     ("xz", "tar.xz"),
     ("zstd", "tar.zst"),
+    ("lz4", "tar.lz4"),
 ];
 
 #[derive(Clone, Copy)]
@@ -73,10 +75,12 @@ impl ModuleKind {
             "bzip2" => (Self::Stream("bzip2"), "", 0),
             "xz" => (Self::Stream("xz"), "", 0),
             "zstd" => (Self::Stream("zstd"), "", 0),
+            "lz4" => (Self::Stream("lz4"), "", 0),
             "tar_gz" => (Self::CompressedTar("tar.gz", "gzip"), "max_probe_bytes", 4 * 1024 * 1024),
             "tar_bz2" => (Self::CompressedTar("tar.bz2", "bzip2"), "max_probe_bytes", 4 * 1024 * 1024),
             "tar_xz" => (Self::CompressedTar("tar.xz", "xz"), "max_probe_bytes", 4 * 1024 * 1024),
             "tar_zst" => (Self::CompressedTar("tar.zst", "zstd"), "max_probe_bytes", 4 * 1024 * 1024),
+            "tar_lz4" => (Self::CompressedTar("tar.lz4", "lz4"), "max_probe_bytes", 4 * 1024 * 1024),
             _ => return None,
         })
     }
@@ -108,6 +112,7 @@ pub(crate) struct NativeAnalysisConfig {
     tail_bytes: usize,
     extractable_confidence: f64,
     modules: Vec<ModuleConfig>,
+    lz4_dictionaries: crate::formats::lz4::Dictionaries,
 }
 
 #[pymethods]
@@ -165,7 +170,30 @@ impl NativeAnalysisConfig {
                 }
             }
         }
+        let mut lz4_dictionaries=crate::formats::lz4::Dictionaries::default();
+        if let Some(lz4)=dict_item(config,"lz4")? {
+            // Workers use an isolated cwd. Resolve control-plane paths once,
+            // without opening files, before transmitting the configuration.
+            let resolve = |path: String| -> PyResult<String> {
+                if path.is_empty() { return Ok(path); }
+                std::path::absolute(path)
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .map_err(|error| pyo3::exceptions::PyOSError::new_err(error.to_string()))
+            };
+            lz4_dictionaries.default=resolve(str_of(&lz4,"default_dictionary")?)?;
+            if let Some(mapping)=dict_item(&lz4,"dictionaries")? {
+                for (id,path) in mapping.iter() {
+                    let id=id.str()?.to_string().parse::<u32>().map_err(|_| pyo3::exceptions::PyValueError::new_err("LZ4 dictionary ID must be a uint32"))?;
+                    let path=resolve(path.extract::<String>()?)?;
+                    if path.is_empty() { return Err(pyo3::exceptions::PyValueError::new_err("LZ4 dictionary path is empty")); }
+                    if lz4_dictionaries.by_id.insert(id,path).is_some() {
+                        return Err(pyo3::exceptions::PyValueError::new_err("Duplicate LZ4 dictionary ID"));
+                    }
+                }
+            }
+        }
         Ok(Self {
+            lz4_dictionaries,
             prepass_enabled,
             head_bytes,
             tail_bytes,
@@ -239,6 +267,7 @@ impl<'py> Evidence<'py> {
 
 /// Probe access shared by single-file and multi-volume analysis.
 struct ReportContext<'a, 'py> {
+    lz4_dictionaries: &'a crate::formats::lz4::Dictionaries,
     py: Python<'py>,
     view: &'a AnalysisBinaryView,
     disk_starts: Option<&'a [u64]>,
@@ -271,6 +300,7 @@ impl AnalysisBinaryView {
             _ => PyDict::new(py),
         };
         let mut context = ReportContext {
+            lz4_dictionaries: &config.lz4_dictionaries,
             py,
             view: self,
             disk_starts,
@@ -360,7 +390,9 @@ impl<'a, 'py> ReportContext<'a, 'py> {
             ModuleKind::Rar => self.rar_module(module.budget as usize),
             ModuleKind::SevenZip => self.seven_zip_module(module.budget),
             ModuleKind::Tar => self.tar_module(module.budget as usize),
+            ModuleKind::Stream("lz4") => self.lz4_module(false,0),
             ModuleKind::Stream(format) => self.stream_module(format),
+            ModuleKind::CompressedTar("tar.lz4", "lz4") => self.lz4_module(true,module.budget),
             ModuleKind::CompressedTar(format, stream) => {
                 self.compressed_tar_module(format, stream, module.budget as usize)
             }
@@ -1381,6 +1413,7 @@ fn zip_local_header_recovery<'py>(
 
 fn stream_family(head: &[u8]) -> bool {
     head.starts_with(b"\x1f\x8b") || head.starts_with(BZIP2) || head.starts_with(XZ) || head.starts_with(ZSTD)
+        || crate::formats::lz4::leading(head)
 }
 
 fn stream_observation<'py>(py: Python<'py>, raw: Bound<'py, PyDict>, requested: &str) -> PyResult<Bound<'py, PyDict>> {
@@ -1547,7 +1580,7 @@ impl SegmentPlan {
                 }
             }
             for (segment_index, segment) in evidence.segments.iter().enumerate() {
-                if segment.end.is_none() || segment.start == 0 {
+                if segment.end.is_none() || (segment.start == 0 && !(evidence.format.ends_with("lz4") && segment.end.is_some_and(|end| end<size))) {
                     continue;
                 }
                 candidates.push((evidence_index, segment_index, candidates.len()));
@@ -1753,7 +1786,7 @@ pub(crate) fn confirm_format_identity_native(path: &str, format: &str) -> bool {
                 && identity.stored_checksum == identity.computed_checksum
                 && identity.error.is_empty()
         }
-        "gzip" | "bzip2" | "xz" | "zstd" => {
+        "gzip" | "bzip2" | "xz" | "zstd" | "lz4" => {
             crate::analysis_native::confirm_compression_format_identity_native(path, format)
         }
         _ => false,

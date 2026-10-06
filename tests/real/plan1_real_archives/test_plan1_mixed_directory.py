@@ -31,8 +31,9 @@ def test_plan1_mixed_same_name_plain_formats_in_one_directory(tmp_path, plan1_er
     common = tmp_path / "mixed_plain"
     common.mkdir()
     cases = {}
-    expected_ext = {"zip": ".zip", "rar": ".rar", "7z": ".7z", "tar.gz": ".gz"}
-    for archive_format in ("zip", "rar", "7z", "tar.gz"):
+    expected_ext = {"zip": ".zip", "rar": ".rar", "7z": ".7z", "tar.gz": ".gz",
+                    "lz4": ".lz4", "tar.lz4": ".lz4"}
+    for archive_format in expected_ext:
         if archive_format == "rar" and not RAR_AVAILABLE:
             pytest.skip("RAR generator is not configured")
         if archive_format == "tar.gz" and not _zstd_available():
@@ -45,7 +46,7 @@ def test_plan1_mixed_same_name_plain_formats_in_one_directory(tmp_path, plan1_er
             payload_size=256,
             payload_profile="structured",
         )
-        suffix = {"zip": ".zip", "rar": ".rar", "7z": ".7z", "tar.gz": ".tar.gz"}[archive_format]
+        suffix = f".{archive_format}"
         target = common / f"release{suffix}"
         case.entry_path.replace(target)
         cases[archive_format] = (target, case)
@@ -61,17 +62,13 @@ def test_plan1_mixed_same_name_plain_formats_in_one_directory(tmp_path, plan1_er
         assert len(hits) == 1, f"{target.name}: expected one hit, got {len(hits)}"
         assert detected_ext(hits[0]) == expected_ext[archive_format]
 
-    # 目录扫描应得到 4 个逻辑归档。
+    # 目录扫描应得到全部逻辑归档，包括同名 LZ4 / TAR-LZ4。
     tasks = ArchiveTaskProvider(detection_pipeline_config()).scan_targets([str(common)])
     tasks_by_name = {Path(task.main_path).name: task for task in tasks}
     plan1_error["directory_scan_heads"] = sorted(tasks_by_name)
-    assert len(tasks_by_name) == 4, f"expected 4 logical archives, got {sorted(tasks_by_name)}"
-    for name, expected in (
-        ("release.zip", ".zip"),
-        ("release.rar", ".rar"),
-        ("release.7z", ".7z"),
-        ("release.tar.gz", ".gz"),
-    ):
+    assert len(tasks_by_name) == len(cases), f"missing logical archives: {sorted(tasks_by_name)}"
+    for archive_format, expected in expected_ext.items():
+        name = f"release.{archive_format}"
         assert name in tasks_by_name
         assert detected_ext_from_format(tasks_by_name[name].archive_input().format_hint) == expected
 

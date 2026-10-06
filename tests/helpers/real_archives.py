@@ -1,6 +1,5 @@
 import bz2
 import gzip
-import hashlib
 import io
 import lzma
 import random
@@ -19,6 +18,7 @@ from tests.helpers.tool_config import (
     get_optional_winrar,
     get_test_tools,
     require_7z,
+    require_7z_zstd,
     require_zstd,
 )
 
@@ -49,8 +49,8 @@ MINIMAL_PDF_BYTES = (
 MINIMAL_WEBP_BYTES = b"RIFF" + (16).to_bytes(4, "little") + b"WEBP" + b"VP8 " + (4).to_bytes(4, "little") + b"\0\0\0\0"
 CORRUPT_TRUNCATE_BYTES = 16 * 1024
 SUPPORTED_CARRIERS = {"jpg", "png", "gif", "pdf", "webp"}
-TAR_FORMATS = {"tar", "tar.gz", "tar.bz2", "tar.xz", "tar.zst"}
-STREAM_FORMATS = {"gzip", "bzip2", "xz", "zstd"}
+TAR_FORMATS = {"tar", "tar.gz", "tar.bz2", "tar.xz", "tar.zst", "tar.lz4"}
+STREAM_FORMATS = {"gzip", "bzip2", "xz", "zstd", "lz4"}
 ARCHIVE_EXTENSIONS = {
     "7z": ".7z",
     "zip": ".zip",
@@ -60,10 +60,12 @@ ARCHIVE_EXTENSIONS = {
     "tar.bz2": ".tar.bz2",
     "tar.xz": ".tar.xz",
     "tar.zst": ".tar.zst",
+    "tar.lz4": ".tar.lz4",
     "gzip": ".gz",
     "bzip2": ".bz2",
     "xz": ".xz",
     "zstd": ".zst",
+    "lz4": ".lz4",
 }
 FORMAT_ALIASES = {
     "Tar": "tar",
@@ -71,10 +73,12 @@ FORMAT_ALIASES = {
     "TarBz2": "tar.bz2",
     "TarXz": "tar.xz",
     "TarZst": "tar.zst",
+    "TarLz4": "tar.lz4",
     "Gzip": "gzip",
     "Bzip2": "bzip2",
     "Xz": "xz",
     "Zstd": "zstd",
+    "Lz4": "lz4",
 }
 
 
@@ -304,15 +308,9 @@ def run_cmd(cmd: list[str], cwd: Path):
 
 
 def _file_manifest(source_dir: Path) -> dict[str, dict[str, int | str]]:
-    manifest: dict[str, dict[str, int | str]] = {}
-    for path in sorted(path for path in source_dir.rglob("*") if path.is_file()):
-        data = path.read_bytes()
-        name = path.relative_to(source_dir).as_posix()
-        manifest[name] = {
-            "size": len(data),
-            "sha256": hashlib.sha256(data).hexdigest(),
-        }
-    return manifest
+    from tests.helpers.native_fixture import file_inventory
+
+    return file_inventory(source_dir)
 
 
 def write_payload(
@@ -360,7 +358,7 @@ def create_7z_archive(
     solid: bool | None = None,
 ):
     tools = get_test_tools()
-    seven_zip = require_7z()
+    seven_zip = require_7z_zstd() if str(compression_method).upper() == "LZ4" else require_7z()
     level = 0 if compression_level is None else int(compression_level)
     if not 0 <= level <= 9:
         raise ValueError("7z compression level must be between 0 and 9")
@@ -445,10 +443,10 @@ def create_rar_archive(
 
 
 def create_tar_archive(source_dir: Path, output_path: Path, archive_format: str):
-    if archive_format == "tar.zst":
+    if archive_format in {"tar.zst", "tar.lz4"}:
         tar_path = output_path.with_suffix("")
         create_tar_archive(source_dir, tar_path, "tar")
-        create_compression_stream(tar_path, output_path, "zstd")
+        create_compression_stream(tar_path, output_path, "lz4" if archive_format == "tar.lz4" else "zstd")
         tar_path.unlink(missing_ok=True)
         return
 
@@ -476,6 +474,13 @@ def create_compression_stream(
     xz_check: str | None = None,
     zstd_checksum: bool = True,
 ):
+    if archive_format == "lz4":
+        from tests.helpers.native_fixture import create_lz4_frames
+
+        if compression_level is not None:
+            raise ValueError("the native real LZ4 fixture uses upstream's default level")
+        create_lz4_frames(output_path, [source_path])
+        return
     if archive_format == "gzip":
         level = 9 if compression_level is None else int(compression_level)
         with source_path.open("rb") as src, output_path.open("wb") as raw:
@@ -938,19 +943,29 @@ def create_multi_member_stream_archive(
     *,
     payload_size: int = 16 * 1024,
 ) -> ArchiveCase:
-    """Concatenated stream: gzip members / bzip2 streams / xz streams / zstd frames."""
+    """Concatenated gzip members, bzip2/XZ streams or Zstandard/LZ4 frames."""
     stream_format = normalize_archive_format(stream_format)
-    if stream_format not in {"gzip", "bzip2", "xz", "zstd"}:
+    if stream_format not in STREAM_FORMATS:
         raise ValueError(f"Unsupported multi-member stream format: {stream_format}")
     source_dir = root / f"{case_id}_src"
     payload = write_payload(source_dir, case_id, size_bytes=payload_size)
     archive_dir = root / case_id
     archive_dir.mkdir(parents=True, exist_ok=True)
     archive_path = archive_dir / f"{case_id}{ARCHIVE_EXTENSIONS[stream_format]}"
-    marker_bytes = (source_dir / payload["marker_name"]).read_bytes()
     second_content = f"SUNPACK-SECOND-MEMBER-{case_id}".encode("utf-8")
+    stream_metadata = {}
+    if stream_format != "lz4":
+        marker_bytes = (source_dir / payload["marker_name"]).read_bytes()
+    if stream_format == "lz4":
+        from tests.helpers.native_fixture import create_lz4_frames
 
-    if stream_format == "gzip":
+        extra_path = source_dir / "second_member.txt"
+        extra_path.write_text(second_content.decode("utf-8"), encoding="utf-8")
+        receipt = create_lz4_frames(archive_path, [source_dir / payload["marker_name"], extra_path])
+        stream_metadata["expected_files"] = {
+            case_id: {"size": receipt["source_bytes"], "crc32": receipt["source_crc32"]}
+        }
+    elif stream_format == "gzip":
         with archive_path.open("wb") as stream:
             with gzip.GzipFile(filename=payload["marker_name"], mode="wb", fileobj=stream) as member:
                 member.write(marker_bytes)
@@ -983,6 +998,7 @@ def create_multi_member_stream_archive(
         root, case_id, stream_format, archive_dir, archive_path, payload,
         multi_member=True,
         second_member_content=second_content.decode("utf-8"),
+        **stream_metadata,
     )
 
 

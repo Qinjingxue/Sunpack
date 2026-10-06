@@ -1166,7 +1166,9 @@ pub(crate) fn probe_volume_anchor_at_offset(
 }
 
 fn probe_standalone_stream(prefix: &[u8], out: &mut VolumeAnchor) {
-    let format = if prefix.starts_with(b"\x1f\x8b") {
+    let format = if crate::formats::lz4::leading(prefix) {
+        "lz4"
+    } else if prefix.starts_with(b"\x1f\x8b") {
         "gzip"
     } else if prefix.starts_with(b"BZh") {
         "bzip2"

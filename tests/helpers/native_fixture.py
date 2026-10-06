@@ -43,9 +43,14 @@ def assemble_carrier(
     )
 
 
+def create_lz4_frames(output: Path, paths: list[Path]) -> dict:
+    """Use the independent upstream encoder in the test-only native tool."""
+    return native_fixture("lz4", output=str(output), paths=[str(path) for path in paths])
+
+
 def file_inventory(root: Path) -> dict[str, dict]:
     return {
-        item["path"]: {"size": item["size"], "sha256": item["sha256"]}
+        item["path"]: {"size": item["size"], "crc32": item["crc32"]}
         for item in native_fixture("inventory", root=str(root))["files"]
     }
 

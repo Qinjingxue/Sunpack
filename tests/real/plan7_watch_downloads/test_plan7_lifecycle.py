@@ -290,7 +290,7 @@ def test_plan7_replacement_and_reappearance_are_processed(tmp_path):
         harness.close()
 
 
-@pytest.mark.parametrize("archive_format", ["tar.gz", "tar.bz2", "tar.xz", "tar.zst", "gzip", "bzip2", "xz", "zstd"])
+@pytest.mark.parametrize("archive_format", ["tar.gz", "tar.bz2", "tar.xz", "tar.zst", "tar.lz4", "gzip", "bzip2", "xz", "zstd", "lz4"])
 def test_plan7_stream_formats_direct_final_path_complete(tmp_path, archive_format):
     """流格式直接写入最终路径时，完整下载后都应有用户可见输出。"""
     case = FACTORY.create(
