@@ -70,6 +70,7 @@ english.TaskAddToPathFailed=Failed to add sunpack to the system PATH.
 english.TaskContextMenuFailed=Failed to register the sunpack folder context menu.
 english.TaskContextMenuRemoveFailed=Failed to remove the existing sunpack context menu.
 english.PrepareRuntimeRunning=sunpack runtime processes are still running. Please stop them and run the installer again.
+english.PrepareWatchStateQueryFailed=Could not determine the existing sunpack Watch state directory. Repair the existing installation and run the installer again.
 english.PrepareBrokerRemoveFailed=The existing sunpack Watch Broker service could not be removed. Restart Windows and run the installer again.
 english.PrepareOldFilesRemoveFailed=Some old sunpack files could not be removed. Close sunpack and run the installer again.
 english.UninstallStopFailed=sunpack runtime processes or the Watch Broker service could not be stopped. Please restart Windows and run the uninstaller again.
@@ -99,6 +100,7 @@ chinesesimplified.TaskAddToPathFailed=无法将 sunpack 添加到系统 PATH。
 chinesesimplified.TaskContextMenuFailed=无法注册 sunpack 文件夹右键菜单。
 chinesesimplified.TaskContextMenuRemoveFailed=无法清理现有 sunpack 右键菜单。
 chinesesimplified.PrepareRuntimeRunning=sunpack 运行时进程仍在运行。请先停止这些进程，然后重新运行安装程序。
+chinesesimplified.PrepareWatchStateQueryFailed=无法确定现有 sunpack Watch 状态目录。请修复现有安装，然后重新运行安装程序。
 chinesesimplified.PrepareBrokerRemoveFailed=无法删除现有 sunpack Watch Broker 服务。请重启 Windows，然后重新运行安装程序。
 chinesesimplified.PrepareOldFilesRemoveFailed=无法删除部分旧版 sunpack 文件。请关闭 sunpack，然后重新运行安装程序。
 chinesesimplified.UninstallStopFailed=无法停止 sunpack 运行时进程或 Watch Broker 服务。请重启 Windows，然后重新运行卸载程序。
@@ -425,7 +427,10 @@ begin
     Result := ExpandConstant('{app}\sunpack.exe');
 end;
 
-function QueryExistingWatchRunning(var WatchStateDir: string): Boolean;
+function QueryExistingWatchState(
+  var WatchStateDir: string;
+  var WatchRunning: Boolean
+): Boolean;
 var
   ExistingApp: string;
   PowerShellPath: string;
@@ -435,6 +440,7 @@ var
 begin
   Result := False;
   WatchStateDir := '';
+  WatchRunning := False;
   RegDeleteValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName);
   ExistingApp := ExistingLauncherPath;
   if not FileExists(ExistingApp) then
@@ -447,10 +453,13 @@ begin
     '  $json = (& ' + PowerShellSingleQuotedString(ExistingApp) + ' watch status --json 2>$null | Out-String); ' +
     '  if ($LASTEXITCODE -ne 0) { exit 2 }; ' +
     '  $status = $json | ConvertFrom-Json; ' +
+    '  $stateDir = [string]$status.summary.state_dir; ' +
+    '  if ([string]::IsNullOrWhiteSpace($stateDir) -or -not [System.IO.Path]::IsPathRooted($stateDir)) { exit 2 }; ' +
+    '  $stateDir = [System.IO.Path]::GetFullPath($stateDir); ' +
     '  $key = [Microsoft.Win32.Registry]::LocalMachine.CreateSubKey(' +
          PowerShellSingleQuotedString(SunPackRegistryKey) + '); ' +
     '  try { $key.SetValue(' + PowerShellSingleQuotedString(UpgradeWatchStateDirValueName) +
-         ', [string]$status.summary.state_dir, [Microsoft.Win32.RegistryValueKind]::String) } finally { $key.Dispose() }; ' +
+         ', $stateDir, [Microsoft.Win32.RegistryValueKind]::String) } finally { $key.Dispose() }; ' +
     '  if ($status.summary.running -eq $true) { exit 0 }; ' +
     '  exit 1; ' +
     '} catch { exit 2 }';
@@ -467,21 +476,21 @@ begin
   ) then
     Log('Failed to query the existing SunPack Watch state before upgrade.');
 
-  if RegQueryStringValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName, WatchStateDir) then
+  Result := RegQueryStringValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName, WatchStateDir);
+  RegDeleteValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName);
+  Result := Result and (WatchStateDir <> '') and ((ResultCode = 0) or (ResultCode = 1));
+  if not Result then
   begin
-    RegDeleteValue(HKLM, SunPackRegistryKey, UpgradeWatchStateDirValueName);
-    Log('Existing SunPack Watch state directory: ' + WatchStateDir);
+    Log(Format('Existing SunPack Watch state query failed with exit code %d.', [ResultCode]));
+    Exit;
   end;
 
-  if ResultCode = 0 then
-  begin
-    Result := True;
-    Log('Existing SunPack Watch is running and will be restored after upgrade.');
-  end
-  else if ResultCode = 1 then
-    Log('Existing SunPack Watch is not running; upgrade will leave it stopped.')
+  Log('Existing SunPack Watch state directory: ' + WatchStateDir);
+  WatchRunning := ResultCode = 0;
+  if WatchRunning then
+    Log('Existing SunPack Watch is running and will be restored after upgrade.')
   else
-    Log(Format('Existing SunPack Watch state query failed with exit code %d; upgrade will not auto-start Watch.', [ResultCode]));
+    Log('Existing SunPack Watch is not running; upgrade will leave it stopped.');
 end;
 
 function RunContextMenuScript(RegisterMenu: Boolean): Boolean;
@@ -633,45 +642,46 @@ begin
   end;
 end;
 
-function IsSameOrChildPath(const PathValue, ParentValue: string): Boolean;
+function ClearWatchDurableState(const WatchStateDir: string): Boolean;
 var
-  NormalizedPath: string;
-  NormalizedParent: string;
+  Patterns: TArrayOfString;
+  Index: Integer;
+  ItemPath: string;
+  FindData: TFindRec;
 begin
-  NormalizedPath := NormalizePathEntry(PathValue);
-  NormalizedParent := NormalizePathEntry(ParentValue);
-  Result :=
-    (NormalizedPath <> '') and
-    (NormalizedParent <> '') and
-    ((NormalizedPath = NormalizedParent) or
-     ((Length(NormalizedPath) > Length(NormalizedParent)) and
-      (Copy(NormalizedPath, 1, Length(NormalizedParent) + 1) = NormalizedParent + '\')));
-end;
-
-function IsPersistentWatchStatePath(
-  const ItemPath, ItemName, WatchStateDir: string;
-  PreserveWatchState: Boolean
-): Boolean;
-begin
-  Result := False;
-  if not PreserveWatchState then
+  Result := True;
+  if (WatchStateDir = '') or (not DirExists(WatchStateDir)) then
     Exit;
-  if CompareText(ItemName, '.sunpack_watch') = 0 then
+
+  { A configured state directory may also contain user data. Never recurse or remove it. }
+  SetArrayLength(Patterns, 3);
+  Patterns[0] := 'state.json';
+  Patterns[1] := 'state.journal.*.jsonl';
+  Patterns[2] := '.state.json.*.tmp';
+  for Index := 0 to GetArrayLength(Patterns) - 1 do
   begin
-    Result := True;
-    Exit;
+    if FindFirst(AddBackslash(WatchStateDir) + Patterns[Index], FindData) then
+    begin
+      try
+        repeat
+          ItemPath := AddBackslash(WatchStateDir) + FindData.Name;
+          if not DirExists(ItemPath) then
+          begin
+            if not DeleteFile(ItemPath) and FileExists(ItemPath) then
+            begin
+              Log('Failed to remove old SunPack Watch durable state file: ' + ItemPath);
+              Result := False;
+            end;
+          end;
+        until not FindNext(FindData);
+      finally
+        FindClose(FindData);
+      end;
+    end;
   end;
-  if WatchStateDir = '' then
-    Exit;
-  Result :=
-    IsSameOrChildPath(WatchStateDir, ItemPath) or
-    IsSameOrChildPath(ItemPath, WatchStateDir);
 end;
 
-function ClearProgramDataExceptPersistentFiles(
-  PreserveWatchState: Boolean;
-  const WatchStateDir: string
-): Boolean;
+function ClearProgramDataExceptPersistentFiles: Boolean;
 var
   DataPath: string;
   SearchPath: string;
@@ -693,18 +703,13 @@ begin
         ItemPath := AddBackslash(DataPath) + FindData.Name;
         if DirExists(ItemPath) then
         begin
-          if not IsPersistentWatchStatePath(ItemPath, FindData.Name, WatchStateDir, PreserveWatchState) then
+          if not DelTree(ItemPath, True, True, True) and DirExists(ItemPath) then
           begin
-            if not DelTree(ItemPath, True, True, True) and DirExists(ItemPath) then
-            begin
-              Log('Failed to remove old SunPack runtime state directory: ' + ItemPath);
-              Result := False;
-            end;
+            Log('Failed to remove old SunPack runtime state directory: ' + ItemPath);
+            Result := False;
           end;
         end
-        else if
-          (not IsPersistentProgramDataFile(FindData.Name)) and
-          (not IsPersistentWatchStatePath(ItemPath, FindData.Name, WatchStateDir, PreserveWatchState)) then
+        else if not IsPersistentProgramDataFile(FindData.Name) then
         begin
           if not DeleteFile(ItemPath) and FileExists(ItemPath) then
           begin
@@ -895,7 +900,13 @@ begin
   RestartWatchAfterUpgrade := False;
   ExistingWatchStateDir := '';
   if ExistingInstallation then
-    RestartWatchAfterUpgrade := QueryExistingWatchRunning(ExistingWatchStateDir);
+  begin
+    if not QueryExistingWatchState(ExistingWatchStateDir, RestartWatchAfterUpgrade) then
+    begin
+      Result := CustomMessage('PrepareWatchStateQueryFailed');
+      Exit;
+    end;
+  end;
   if not StopExistingProcessesAndWait then
   begin
     Result := CustomMessage('PrepareRuntimeRunning');
@@ -906,7 +917,12 @@ begin
     Result := CustomMessage('PrepareBrokerRemoveFailed');
     Exit;
   end;
-  if not ClearProgramDataExceptPersistentFiles(ExistingInstallation, ExistingWatchStateDir) then
+  if not ClearWatchDurableState(ExistingWatchStateDir) then
+  begin
+    Result := CustomMessage('PrepareOldFilesRemoveFailed');
+    Exit;
+  end;
+  if not ClearProgramDataExceptPersistentFiles then
   begin
     Result := CustomMessage('PrepareOldFilesRemoveFailed');
     Exit;
