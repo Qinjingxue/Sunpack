@@ -3,6 +3,7 @@ use crate::io::read_fault::{read_exact_field, seek_field, FieldLocation, ReadFau
 use crate::io::reader::ManagedReader;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
+use std::borrow::Cow;
 
 const OVERLAY_SCAN_WINDOW_BYTES: u64 = 65_536;
 const PE_SIGNATURE: &[u8] = b"PE\x00\x00";
@@ -21,42 +22,189 @@ const ARCHIVE_MAGICS: &[(&[u8], &str, &str)] = &[
     (crate::formats::lz4::LEGACY, "lz4", ".lz4"),
 ];
 
-/// Validate the bounded PE header region already read by a caller.
-///
-/// This is deliberately only the header/section-table proof.  It does not
-/// inspect an overlay or look for an embedded archive, so relation handling
-/// can distinguish a real launcher from an arbitrary file beginning with
-/// `MZ` without introducing another binary scan path.
-pub(crate) fn pe_headers_plausible(prefix: &[u8], actual_size: u64) -> bool {
-    if prefix.len() < 64 || !prefix.starts_with(b"MZ") {
-        return false;
-    }
-    let pe_header_offset = u32_le(prefix, 0x3C) as usize;
-    let Some(coff_end) = pe_header_offset.checked_add(24) else {
-        return false;
-    };
-    if pe_header_offset < 64
-        || coff_end as u64 > actual_size
-        || coff_end > prefix.len()
-        || prefix.get(pe_header_offset..pe_header_offset + PE_SIGNATURE.len()) != Some(PE_SIGNATURE)
-    {
-        return false;
+/// PE structure facts only; SFX classification belongs to Relations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum PeState {
+    #[default]
+    None,
+    Candidate,
+    Confirmed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PeFacts {
+    pub(crate) image_end: u64,
+    pe_header_offset: u64,
+    section_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PeProbe {
+    NotPe,
+    NeedMore,
+    Confirmed(PeFacts),
+}
+
+impl PeProbe {
+    pub(crate) fn state(self) -> PeState {
+        match self {
+            Self::NotPe => PeState::None,
+            Self::NeedMore => PeState::Candidate,
+            Self::Confirmed(_) => PeState::Confirmed,
+        }
     }
 
-    let section_count = u16_le(prefix, pe_header_offset + 6) as usize;
-    let optional_header_size = u16_le(prefix, pe_header_offset + 20) as usize;
-    let Some(section_table_offset) = coff_end.checked_add(optional_header_size) else {
-        return false;
+    pub(crate) fn image_end(self) -> Option<u64> {
+        match self {
+            Self::Confirmed(facts) => Some(facts.image_end),
+            _ => None,
+        }
+    }
+}
+
+/// The only PE parser. Prefix and I/O callers supply bytes to the same proof.
+/// Missing prefix bytes mean Candidate; out-of-file structure means NotPe.
+fn inspect_pe_headers<'a, E>(
+    actual_size: u64,
+    mut read: impl FnMut(u64, usize) -> Result<Option<Cow<'a, [u8]>>, E>,
+) -> Result<PeProbe, E> {
+    macro_rules! field {
+        ($offset:expr, $len:expr) => {{
+            let offset: u64 = $offset;
+            let len: usize = $len;
+            if offset
+                .checked_add(len as u64)
+                .is_none_or(|end| end > actual_size)
+            {
+                return Ok(PeProbe::NotPe);
+            }
+            let Some(bytes) = read(offset, len)? else {
+                return Ok(PeProbe::NeedMore);
+            };
+            bytes
+        }};
+    }
+    let magic = field!(0, 2);
+    if magic.as_ref() != b"MZ" {
+        return Ok(PeProbe::NotPe);
+    }
+    let dos = field!(0, 64);
+    let pe_header_offset = u32_le(&dos, 0x3c) as u64;
+    if pe_header_offset < 64 {
+        return Ok(PeProbe::NotPe);
+    }
+    let signature = field!(pe_header_offset, 4);
+    if signature.as_ref() != PE_SIGNATURE {
+        return Ok(PeProbe::NotPe);
+    }
+    let coff = field!(pe_header_offset, 24);
+    if u16_le(&coff, 4) == 0 {
+        return Ok(PeProbe::NotPe);
+    }
+    let section_count = u16_le(&coff, 6) as usize;
+    let optional_size = u16_le(&coff, 20) as usize;
+    if section_count == 0 || optional_size < 64 {
+        return Ok(PeProbe::NotPe);
+    }
+    let optional_offset = pe_header_offset + 24;
+    let optional = field!(optional_offset, optional_size);
+    let (fixed_size, directory_count_offset) = match u16_le(&optional, 0) {
+        0x10b => (96, 92),
+        0x20b => (112, 108),
+        _ => return Ok(PeProbe::NotPe),
     };
-    let Some(section_table_size) = section_count.checked_mul(SECTION_HEADER_SIZE) else {
-        return false;
-    };
-    let Some(section_table_end) = section_table_offset.checked_add(section_table_size) else {
-        return false;
-    };
-    section_count > 0
-        && section_table_end as u64 <= actual_size
-        && section_table_end <= prefix.len()
+    if optional_size < fixed_size
+        || u32_le(&optional, directory_count_offset) as usize > (optional_size - fixed_size) / 8
+    {
+        return Ok(PeProbe::NotPe);
+    }
+    let table_offset = optional_offset + optional_size as u64;
+    let table_size = section_count * SECTION_HEADER_SIZE;
+    let sections = field!(table_offset, table_size);
+    let table_end = table_offset + table_size as u64;
+    let headers_size = u32_le(&optional, 60) as u64;
+    if headers_size < table_end || headers_size > actual_size {
+        return Ok(PeProbe::NotPe);
+    }
+    let mut image_end = headers_size;
+    for section in sections.chunks_exact(SECTION_HEADER_SIZE) {
+        let raw_size = u32_le(section, 16) as u64;
+        let raw_pointer = u32_le(section, 20) as u64;
+        if raw_size != 0 {
+            let end = raw_pointer + raw_size;
+            if raw_pointer < headers_size || end > actual_size {
+                return Ok(PeProbe::NotPe);
+            }
+            image_end = image_end.max(end);
+        }
+    }
+    Ok(PeProbe::Confirmed(PeFacts {
+        image_end,
+        pe_header_offset,
+        section_count: section_count as u64,
+    }))
+}
+
+/// Zero I/O: filesystem must only use the bounded prefix it already owns.
+pub(crate) fn probe_pe_prefix(prefix: &[u8], actual_size: u64) -> PeProbe {
+    inspect_pe_headers::<std::convert::Infallible>(actual_size, |offset, len| {
+        Ok(usize::try_from(offset).ok().and_then(|start| {
+            start
+                .checked_add(len)
+                .and_then(|end| prefix.get(start..end))
+                .map(Cow::Borrowed)
+        }))
+    })
+    .unwrap()
+}
+
+fn inspect_pe_image_reader(
+    reader: &ManagedReader,
+    actual_size: u64,
+    prefix: &[u8],
+) -> Result<PeProbe, ReadFault> {
+    let mut file = reader.cursor();
+    inspect_pe_headers(actual_size, |offset, len| {
+        if let Ok(start) = usize::try_from(offset) {
+            if let Some(bytes) = start
+                .checked_add(len)
+                .and_then(|end| prefix.get(start..end))
+            {
+                return Ok(Some(Cow::Borrowed(bytes)));
+            }
+        }
+        let mut bytes = vec![0; len];
+        seek_field(
+            &mut file,
+            offset,
+            actual_size,
+            "pe.image_headers",
+            FieldLocation::Head,
+        )?;
+        read_exact_field(
+            &mut file,
+            &mut bytes,
+            actual_size,
+            "pe.image_headers",
+            FieldLocation::Head,
+        )?;
+        Ok(Some(Cow::Owned(bytes)))
+    })
+}
+
+pub(crate) fn inspect_pe_image_native(path: &str) -> std::io::Result<PeProbe> {
+    let reader = ManagedReader::open(path)?;
+    inspect_pe_image_reader(&reader, reader.len(), &[])
+        .map_err(|fault| std::io::Error::new(fault.io_kind, fault))
+}
+
+/// Python fallback consumes only PE identity; production facts stay in Rust.
+#[pyfunction]
+pub(crate) fn inspect_pe_image(py: Python<'_>, path: &str) -> PyResult<bool> {
+    Ok(matches!(
+        py.detach(|| inspect_pe_image_native(path))?,
+        PeProbe::Confirmed(_)
+    ))
 }
 
 #[derive(Default)]
@@ -96,115 +244,44 @@ pub(crate) fn inspect_pe_overlay_native(
     let Ok(reader) = ManagedReader::open(path) else {
         return PeOverlayStructure::failed("os_error");
     };
-    let mut file = reader.cursor();
     let actual_size = match file_size {
         Some(value) if value >= 0 => value as u64,
         _ => reader.len(),
     };
-
-    let mut prefix = magic_bytes.unwrap_or(&[]).to_vec();
-    if prefix.len() < 64 {
-        prefix.resize(actual_size.min(64) as usize, 0);
-        if let Err(fault) = seek_field(
-            &mut file,
-            0,
-            actual_size,
-            "pe.dos_header",
-            FieldLocation::Head,
-        )
-        .and_then(|_| {
-            read_exact_field(
-                &mut file,
-                &mut prefix,
-                actual_size,
-                "pe.dos_header",
-                FieldLocation::Head,
-            )
-        }) {
-            let mut out = PeOverlayStructure::failed("dos_header_read_failed");
+    let facts = match inspect_pe_image_reader(&reader, actual_size, magic_bytes.unwrap_or(&[])) {
+        Ok(PeProbe::Confirmed(facts)) => facts,
+        Ok(_) => return PeOverlayStructure::failed("pe_structure_not_confirmed"),
+        Err(fault) => {
+            let mut out = PeOverlayStructure::failed("pe_header_read_failed");
             out.read_fault = Some(fault);
             return out;
         }
-    }
-    if prefix.len() < 64 || !prefix.starts_with(b"MZ") {
-        return PeOverlayStructure::failed("mz_magic_not_found");
-    }
+    };
+    let mut result = inspect_pe_overlay_reader(&reader, actual_size, facts.image_end);
+    result.pe_header_offset = facts.pe_header_offset;
+    result.section_count = facts.section_count;
+    result
+}
 
-    let pe_header_offset = u32_le(&prefix, 0x3C) as u64;
-    if pe_header_offset < 64 || pe_header_offset + 24 > actual_size {
-        return PeOverlayStructure::failed("pe_header_offset_out_of_range");
-    }
+/// Relations consumes a confirmed image boundary without parsing headers again.
+pub(crate) fn inspect_pe_overlay_from_image_end(
+    path: &str,
+    file_size: u64,
+    image_end: u64,
+) -> PeOverlayStructure {
+    let Ok(reader) = ManagedReader::open(path) else {
+        return PeOverlayStructure::failed("os_error");
+    };
+    inspect_pe_overlay_reader(&reader, file_size, image_end)
+}
 
-    let mut pe_header = [0u8; 24];
-    if let Err(fault) = seek_field(
-        &mut file,
-        pe_header_offset,
-        actual_size,
-        "pe.coff_header",
-        FieldLocation::Head,
-    )
-    .and_then(|_| {
-        read_exact_field(
-            &mut file,
-            &mut pe_header,
-            actual_size,
-            "pe.coff_header",
-            FieldLocation::Head,
-        )
-    }) {
-        let mut out = PeOverlayStructure::failed("pe_header_read_failed");
-        out.read_fault = Some(fault);
-        return out;
-    }
-    if &pe_header[0..4] != PE_SIGNATURE {
-        return PeOverlayStructure::failed("pe_signature_not_found");
-    }
-
-    let section_count = u16_le(&pe_header, 6) as u64;
-    let optional_header_size = u16_le(&pe_header, 20) as u64;
-    let section_table_offset = pe_header_offset + 24 + optional_header_size;
-    let section_table_size = section_count * SECTION_HEADER_SIZE as u64;
-    if section_count == 0 || section_table_offset + section_table_size > actual_size {
-        return PeOverlayStructure::failed("section_table_out_of_range");
-    }
-
-    let mut section_table = vec![0; section_table_size as usize];
-    if let Err(fault) = seek_field(
-        &mut file,
-        section_table_offset,
-        actual_size,
-        "pe.section_table",
-        FieldLocation::Head,
-    )
-    .and_then(|_| {
-        read_exact_field(
-            &mut file,
-            &mut section_table,
-            actual_size,
-            "pe.section_table",
-            FieldLocation::Head,
-        )
-    }) {
-        let mut out = PeOverlayStructure::failed("section_table_read_failed");
-        out.read_fault = Some(fault);
-        return out;
-    }
-
-    let mut pe_end = 0u64;
-    for index in 0..section_count as usize {
-        let start = index * SECTION_HEADER_SIZE;
-        let section = &section_table[start..start + SECTION_HEADER_SIZE];
-        let raw_size = u32_le(section, 16) as u64;
-        let raw_pointer = u32_le(section, 20) as u64;
-        if raw_pointer != 0 && raw_size != 0 {
-            pe_end = pe_end.max(raw_pointer + raw_size);
-        }
-    }
-
+fn inspect_pe_overlay_reader(
+    reader: &ManagedReader,
+    actual_size: u64,
+    pe_end: u64,
+) -> PeOverlayStructure {
     let mut result = PeOverlayStructure::default();
     result.is_pe = true;
-    result.pe_header_offset = pe_header_offset;
-    result.section_count = section_count;
     result.overlay_offset = pe_end;
     result.overlay_size = actual_size.saturating_sub(pe_end);
     result.evidence.push("pe:valid_headers");
@@ -390,4 +467,131 @@ fn u32_le(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image(pe_offset: usize, pe64: bool) -> Vec<u8> {
+        let optional_size = if pe64 { 240 } else { 224 };
+        let optional = pe_offset + 24;
+        let section = optional + optional_size;
+        let headers_size = (section + 40 + 511) & !511;
+        let mut bytes = vec![0; headers_size + 32];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&(pe_offset as u32).to_le_bytes());
+        bytes[pe_offset..pe_offset + 4].copy_from_slice(PE_SIGNATURE);
+        bytes[pe_offset + 4..pe_offset + 6].copy_from_slice(&0x14cu16.to_le_bytes());
+        bytes[pe_offset + 6..pe_offset + 8].copy_from_slice(&1u16.to_le_bytes());
+        bytes[pe_offset + 20..pe_offset + 22]
+            .copy_from_slice(&(optional_size as u16).to_le_bytes());
+        bytes[optional..optional + 2]
+            .copy_from_slice(&(if pe64 { 0x20bu16 } else { 0x10b }).to_le_bytes());
+        bytes[optional + 60..optional + 64].copy_from_slice(&(headers_size as u32).to_le_bytes());
+        bytes[section + 16..section + 20].copy_from_slice(&32u32.to_le_bytes());
+        bytes[section + 20..section + 24].copy_from_slice(&(headers_size as u32).to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn prefix_confirms_pe32_and_pe64_without_io() {
+        for pe64 in [false, true] {
+            let bytes = image(0x80, pe64);
+            let probe = probe_pe_prefix(&bytes[..512], bytes.len() as u64);
+            assert_eq!(probe.state(), PeState::Confirmed);
+            assert_eq!(probe.image_end(), Some(bytes.len() as u64));
+        }
+    }
+
+    #[test]
+    fn missing_buffer_and_missing_file_structure_are_distinct() {
+        for pe_offset in [0x180, 0x800] {
+            let bytes = image(pe_offset, false);
+            assert_eq!(
+                probe_pe_prefix(&bytes[..512], bytes.len() as u64),
+                PeProbe::NeedMore
+            );
+            assert_eq!(probe_pe_prefix(&bytes[..512], 512), PeProbe::NotPe);
+            let path = crate::test_support::temp_file("pe_delayed_header", &bytes);
+            assert_eq!(
+                inspect_pe_image_native(path.to_str().unwrap()).unwrap(),
+                probe_pe_prefix(&bytes, bytes.len() as u64)
+            );
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn malformed_headers_and_raw_ranges_do_not_confirm_pe() {
+        let original = image(0x80, false);
+        for (offset, replacement) in [
+            (0x3c, vec![0xff; 4]),
+            (0x80, vec![0]),
+            (0x84, vec![0; 2]),
+            (0x86, vec![0; 2]),
+            (0x94, vec![0; 2]),
+            (0x98, vec![0; 2]),
+            (0xd4, vec![0; 4]),
+            (0xf4, vec![0xff; 4]),
+            (0x188, vec![0xff; 4]),
+            (0x18c, vec![0; 4]),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset..offset + replacement.len()].copy_from_slice(&replacement);
+            assert_eq!(
+                probe_pe_prefix(&bytes, bytes.len() as u64),
+                PeProbe::NotPe,
+                "offset {offset:x}"
+            );
+        }
+        assert_eq!(probe_pe_prefix(b"MZ", 2), PeProbe::NotPe);
+        assert_eq!(probe_pe_prefix(b"ordinary", 8), PeProbe::NotPe);
+    }
+
+    #[test]
+    fn full_detector_reads_only_header_regions_even_with_a_distant_pe_header() {
+        let bytes = image(0x800, true);
+        let mut ranges = Vec::new();
+        let result =
+            inspect_pe_headers::<std::convert::Infallible>(bytes.len() as u64, |offset, len| {
+                ranges.push((offset, len));
+                Ok(Some(Cow::Borrowed(
+                    &bytes[offset as usize..offset as usize + len],
+                )))
+            })
+            .unwrap();
+        assert_eq!(result.image_end(), Some(bytes.len() as u64));
+        assert!(ranges.iter().all(|(_, len)| *len <= 240));
+        assert!(ranges
+            .iter()
+            .all(|(offset, len)| *offset != 0 || *len <= 64));
+    }
+
+    #[test]
+    fn filesystem_probe_keeps_pe_facts_without_sfx_or_extra_reads() {
+        for offset in [0x80, 0x800] {
+            let bytes = image(offset, false);
+            let anchor = crate::analysis_native::volume_anchor::probe_volume_anchor_from_head(
+                "no_such_file.jpg",
+                bytes.len() as u64,
+                &bytes,
+            );
+            assert_eq!(anchor.bytes_read, 512);
+            assert!(!anchor.sfx);
+            assert!(anchor.format.is_empty());
+            assert_eq!(
+                anchor.pe_state,
+                if offset == 0x80 {
+                    PeState::Confirmed
+                } else {
+                    PeState::Candidate
+                }
+            );
+            assert_eq!(
+                anchor.pe_image_end,
+                (offset == 0x80).then_some(bytes.len() as u64)
+            );
+        }
+    }
 }

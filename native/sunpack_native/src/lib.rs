@@ -261,6 +261,7 @@ fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
         scan::pe_overlay::inspect_pe_overlay_structure,
         m
     )?)?;
+    m.add_function(wrap_pyfunction!(scan::pe_overlay::inspect_pe_image, m)?)?;
     m.add_function(wrap_pyfunction!(postprocess::scan_watch_candidates, m)?)?;
     m.add_function(wrap_pyfunction!(postprocess::watch_candidate_for_path, m)?)?;
     m.add_function(wrap_pyfunction!(filesystem::watch_filesystem_type, m)?)?;

@@ -3,7 +3,9 @@ use crate::analysis_native::volume_anchor::{
 };
 use crate::scan::directory::NativeDirectorySnapshot;
 use crate::scan::executable_carrier::executable_sfx_stub_profile;
-use crate::scan::pe_overlay::inspect_pe_overlay_native;
+use crate::scan::pe_overlay::{
+    inspect_pe_image_native, inspect_pe_overlay_from_image_end, PeState,
+};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 use regex::{Regex, RegexBuilder};
@@ -188,6 +190,15 @@ impl<'a> RelationCandidateData<'a> {
 }
 
 impl NativeRelationGroup {
+    pub(crate) fn entry_anchor(&self) -> Option<&VolumeAnchor> {
+        match self {
+            Self::Ordinary(row, _) => row.anchor.as_ref(),
+            Self::Proposal(validation, _) => validation
+                .anchors
+                .get(&self.candidate_data().entry_path.to_ascii_lowercase()),
+        }
+    }
+
     pub(crate) fn to_dict(&self, py: Python<'_>) -> PyResult<Py<PyDict>> {
         match self {
             Self::Ordinary(row, confirmed) => ordinary_file_group_to_dict(py, row, *confirmed),
@@ -554,7 +565,7 @@ fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
     if anchor.standalone {
         return None;
     }
-    if anchor.format.is_empty() && anchor.sfx {
+    if anchor.format.is_empty() && anchor.pe_state != PeState::None {
         return Some("weak");
     }
     if !matches!(anchor.format.as_str(), "rar" | "7z" | "zip") {
@@ -582,7 +593,7 @@ fn cheap_seed_strength(anchor: &VolumeAnchor) -> Option<&'static str> {
 
 fn anchor_is_relation_archive(anchor: &VolumeAnchor) -> bool {
     let offset = anchor.structure_offset.unwrap_or(0);
-    let proven_sfx = offset > 0 && anchor.sfx && anchor.pe_structure;
+    let proven_sfx = offset > 0 && anchor.sfx && anchor.pe_state == PeState::Confirmed;
     if !matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
         || anchor.confidence != "strong"
         || !(anchor.standalone || anchor.needs_password || proven_sfx)
@@ -597,16 +608,16 @@ fn promote_sfx_archive_anchor(
     row: &RelationInput,
     path_passwords: Option<&[(String, String)]>,
 ) -> PyResult<Option<VolumeAnchor>> {
-    let overlay = py.detach(|| {
-        inspect_pe_overlay_native(
-            &row.path,
-            row.size.and_then(|size| i64::try_from(size).ok()),
-            None,
-        )
-    });
-    if !overlay.is_pe {
+    let Some(facts) = row.anchor.as_ref() else {
+        return Ok(None);
+    };
+    if facts.pe_state != PeState::Confirmed {
         return Ok(None);
     }
+    let Some(image_end) = facts.pe_image_end else {
+        return Ok(None);
+    };
+    let overlay = py.detach(|| inspect_pe_overlay_from_image_end(&row.path, facts.size, image_end));
     let archive_like = overlay.archive_like;
     let format = overlay.format;
     if archive_like && !matches!(format, "rar" | "7z" | "zip") {
@@ -631,7 +642,9 @@ fn promote_sfx_archive_anchor(
             _ => return Ok(None),
         };
         let mut anchor = row.anchor.clone().unwrap_or_default();
-        anchor.pe_structure = true;
+        anchor.pe_state = PeState::Confirmed;
+        anchor.pe_image_end = Some(image_end);
+        anchor.sfx = true;
         anchor.evidence.push(evidence);
         return Ok(Some(anchor));
     }
@@ -668,7 +681,10 @@ fn promote_sfx_archive_anchor(
     if anchor.format != format || anchor.confidence != "strong" {
         return Ok(None);
     }
-    anchor.pe_structure = true;
+    anchor.pe_state = PeState::Confirmed;
+    anchor.pe_image_end = Some(image_end);
+    anchor.sfx = true;
+    anchor.evidence.push("sfx:pe_overlay");
     Ok(Some(anchor))
 }
 
@@ -1227,7 +1243,7 @@ pub(crate) fn volume_anchor_to_dict(py: Python<'_>, anchor: &VolumeAnchor) -> Py
     )?;
     dict.set_item("continuation_to_next", anchor.continuation_to_next)?;
     dict.set_item("sfx", anchor.sfx)?;
-    dict.set_item("pe_structure", anchor.pe_structure)?;
+    dict.set_item("pe_structure", anchor.pe_state == PeState::Confirmed)?;
     dict.set_item("evidence", PyList::new(py, &anchor.evidence)?)?;
     dict.set_item("error", &anchor.error)?;
     dict.set_item("bytes_read", anchor.bytes_read)?;

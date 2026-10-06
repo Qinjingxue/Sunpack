@@ -6,6 +6,8 @@ from dataclasses import dataclass, replace
 import os
 from typing import Any
 
+from sunpack_native import inspect_pe_image
+
 from sunpack.core.contracts.archive_input import (
     ArchiveInputDescriptor,
     ArchiveInputPart,
@@ -181,11 +183,10 @@ class EmbeddedDiscovery:
         path = candidate.entry_path
         if not path:
             return None, "missing_or_empty_file", ()
-        if not self.options.force_scan and path.casefold().endswith(".exe"):
-            return None, "embedded_executable_skipped", ()
-
         if precomputed_scan is None:
             try:
+                if not self.options.force_scan and inspect_pe_image(path):
+                    return None, "embedded_executable_skipped", ()
                 identity = file_identity(path)
                 size = int(identity[1])
                 if size <= 0:

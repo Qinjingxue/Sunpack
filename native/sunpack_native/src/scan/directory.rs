@@ -117,8 +117,6 @@ impl NativeDirectorySnapshot {
             )
         })
     }
-
-
 }
 
 fn filesystem_file_route(is_dir: bool, anchor: Option<&VolumeAnchor>) -> u8 {
@@ -128,7 +126,10 @@ fn filesystem_file_route(is_dir: bool, anchor: Option<&VolumeAnchor>) -> u8 {
     let Some(anchor) = anchor else {
         return FILE_ROUTE_RESIDUAL;
     };
-    if anchor.sfx || matches!(anchor.format.as_str(), "rar" | "7z" | "zip") {
+    // PE facts authorize Relations refinement; they never terminate discovery.
+    if anchor.pe_state != crate::scan::pe_overlay::PeState::None
+        || matches!(anchor.format.as_str(), "rar" | "7z" | "zip")
+    {
         return FILE_ROUTE_RELATIONS;
     }
     if matches!(
@@ -773,7 +774,6 @@ impl NativeDirectorySnapshot {
         }
         (paths, sizes, routes, formats, reject_masks)
     }
-
 }
 
 struct DirectoryScanOptions {

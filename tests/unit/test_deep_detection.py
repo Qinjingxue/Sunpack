@@ -127,20 +127,22 @@ def test_recursive_gate_may_exclude_small_residual_candidate(tmp_path):
     assert any(trace.entry_path == str(small) and trace.status == "residual" for trace in result.traces)
 
 
-def test_default_embedded_scan_skips_exe_before_any_file_probe(tmp_path, monkeypatch):
-    path = tmp_path / "application.EXE"
-    path.write_bytes(b"x" * 128)
+def test_default_embedded_scan_skips_confirmed_pe_before_full_scan(tmp_path, monkeypatch):
+    from tests.helpers.fs_builder import make_minimal_pe
+
+    path = tmp_path / "application.jpg"
+    path.write_bytes(make_minimal_pe())
 
     monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.file_identity",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("default embedded EXE gate must run before file probing")
+            AssertionError("confirmed PE gate must run before file probing")
         ),
     )
     monkeypatch.setattr(
         "sunpack.pipeline.discovery.embedded.discovery.scan_embedded_archives",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("default embedded EXE gate must reject before full scan")
+            AssertionError("confirmed PE gate must reject before full scan")
         ),
     )
 
@@ -154,7 +156,7 @@ def test_default_embedded_scan_skips_exe_before_any_file_probe(tmp_path, monkeyp
     )
 
 
-def test_force_scan_bypasses_exe_suffix_gate(tmp_path, monkeypatch):
+def test_force_scan_bypasses_pe_policy(tmp_path, monkeypatch):
     path = tmp_path / "application.exe"
     path.write_bytes(b"x" * 128)
     scan = EmbeddedScanResult(

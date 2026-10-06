@@ -9,6 +9,7 @@ use crate::scan::directory::{
     NativeDirectorySnapshot, FILE_ROUTE_DETECTION, FILE_ROUTE_RELATIONS, FILE_ROUTE_RESIDUAL,
 };
 use crate::scan::embedded::{scan_embedded_path, NativeScanResult};
+use crate::scan::pe_overlay::{inspect_pe_image_native, PeProbe, PeState};
 use pyo3::exceptions::PyIndexError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -92,17 +93,22 @@ impl NativeEmbeddedBatch {
                             .include_residual_details
                             .then_some((index, EmbeddedOutcome::Residual(self.skipped_reason)));
                     }
-                    let path = match &rows[index] {
-                        Candidate::File(table, row) => table.paths[*row].as_str(),
+                    let (path, pe_state) = match &rows[index] {
+                        Candidate::File(table, row) => (
+                            table.paths[*row].as_str(),
+                            table.relation_anchors[*row].as_ref().map(|a| a.pe_state),
+                        ),
                         Candidate::Relation(group) => {
                             let data = group.candidate_data();
-                            let outcome = scan_embedded_candidate(data.entry_path, self.force_scan);
+                            let pe_state = group.entry_anchor().map(|a| a.pe_state);
+                            let outcome =
+                                scan_embedded_candidate(data.entry_path, self.force_scan, pe_state);
                             return (self.include_residual_details
                                 || matches!(outcome, EmbeddedOutcome::Scan(_)))
                             .then_some((index, outcome));
                         }
                     };
-                    let outcome = scan_embedded_candidate(path, self.force_scan);
+                    let outcome = scan_embedded_candidate(path, self.force_scan, pe_state);
                     (self.include_residual_details || matches!(outcome, EmbeddedOutcome::Scan(_)))
                         .then_some((index, outcome))
                 })
@@ -621,12 +627,29 @@ impl NativeCandidateTable {
     }
 }
 
-fn scan_embedded_candidate(path: &str, force_scan: bool) -> EmbeddedOutcome {
+fn scan_embedded_candidate(
+    path: &str,
+    force_scan: bool,
+    pe_state: Option<PeState>,
+) -> EmbeddedOutcome {
     if path.is_empty() {
         return EmbeddedOutcome::Residual("missing_or_empty_file");
     }
-    if !force_scan && path.to_lowercase().ends_with(".exe") {
-        return EmbeddedOutcome::Residual("embedded_executable_skipped");
+    if !force_scan {
+        // Only residuals reach Embedded. Consume refined native facts; filename
+        // extensions never establish executable identity or SFX policy.
+        let is_pe = match pe_state {
+            Some(PeState::Confirmed) => true,
+            Some(PeState::None) => false,
+            Some(PeState::Candidate) | None => match inspect_pe_image_native(path) {
+                Ok(PeProbe::Confirmed(_)) => true,
+                Ok(_) => false,
+                Err(_) => return EmbeddedOutcome::Residual("embedded_scan_io_error"),
+            },
+        };
+        if is_pe {
+            return EmbeddedOutcome::Residual("embedded_executable_skipped");
+        }
     }
     let Ok(metadata) = std::fs::metadata(path) else {
         return EmbeddedOutcome::Residual("embedded_scan_io_error");

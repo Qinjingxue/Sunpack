@@ -17,7 +17,7 @@ from sunpack.pipeline.discovery.relations.internal.archive_input import (
     archive_input_for_group,
 )
 from tests.helpers.config_factory import make_config
-from tests.helpers.fs_builder import make_minimal_7z
+from tests.helpers.fs_builder import make_minimal_7z, make_minimal_pe
 
 
 def _groups(tmp_path: Path):
@@ -91,19 +91,8 @@ def test_empty_zip_is_confirmed_by_relations(tmp_path):
 
 
 def _minimal_pe_image(marker: bytes = b"") -> tuple[bytes, int]:
-    pe_end = 0xE0
-    image = bytearray(pe_end)
-    image[0:2] = b"MZ"
-    image[0x3C:0x40] = (0x80).to_bytes(4, "little")
-    image[0x80:0x84] = b"PE\x00\x00"
-    image[0x86:0x88] = (1).to_bytes(2, "little")
-    image[0x94:0x96] = (0).to_bytes(2, "little")
-    section = 0x98
-    image[section + 16:section + 20] = (0x20).to_bytes(4, "little")
-    image[section + 20:section + 24] = (0xC0).to_bytes(4, "little")
-    if marker:
-        image[0x20:0x20 + len(marker)] = marker
-    return bytes(image), pe_end
+    image = make_minimal_pe(marker)
+    return image, len(image)
 
 
 def _minimal_zip_single() -> bytes:
@@ -230,7 +219,7 @@ def test_filename_numbered_7z_without_structural_seed_is_not_grouped(tmp_path):
 
 
 @pytest.mark.parametrize("archive_format", ["7z", "zip"])
-def test_sfx_launcher_attaches_to_data_volumes_but_stays_out_of_input(tmp_path, archive_format):
+def test_unconfirmed_launcher_does_not_claim_filename_like_data_volumes(tmp_path, archive_format):
     launcher = tmp_path / "payload.exe"
     first = tmp_path / f"payload.{archive_format}.001"
     second = tmp_path / f"payload.{archive_format}.002"
@@ -240,8 +229,7 @@ def test_sfx_launcher_attaches_to_data_volumes_but_stays_out_of_input(tmp_path, 
 
     groups = _groups(tmp_path)
 
-    # MZ alone is only a weak SFX seed.  Without a structurally verifiable
-    # proposal it must not turn filename-like siblings into a relation.
+    # MZ alone proves neither PE nor SFX and cannot claim filename-like siblings.
     assert all(group.kind == "file" for group in groups)
     assert all(len(group.input_paths) == 1 for group in groups)
 

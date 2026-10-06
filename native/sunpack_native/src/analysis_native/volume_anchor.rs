@@ -12,7 +12,7 @@ use crate::analysis_native::structure::unified_prefilter_mask_from_head;
 use crate::io::reader::ManagedReader;
 use crate::io::resource_lifecycle::TrackedFile;
 use crate::password::rar::{rar4_decrypt_header_flags, rar5_decrypt_main_header};
-use crate::scan::pe_overlay::pe_headers_plausible;
+use crate::scan::pe_overlay::{probe_pe_prefix, PeState};
 
 const SEVEN_ZIP: &[u8] = b"7z\xbc\xaf'\x1c";
 const RAR4: &[u8] = b"Rar!\x1a\x07\x00";
@@ -51,8 +51,10 @@ pub(crate) struct VolumeAnchor {
     pub(crate) continuation_to_next: bool,
     pub(crate) relation_has_next: Option<bool>,
     pub(crate) rar_next_header_offset: Option<u64>,
+    // True only after Relations proves an SFX stub/archive or launcher.
     pub(crate) sfx: bool,
-    pub(crate) pe_structure: bool,
+    pub(crate) pe_state: PeState,
+    pub(crate) pe_image_end: Option<u64>,
     pub(crate) evidence: Vec<&'static str>,
     pub(crate) error: String,
     pub(crate) bytes_read: u64,
@@ -81,7 +83,7 @@ impl VolumeAnchor {
         )?;
         out.set_item("continuation_to_next", self.continuation_to_next)?;
         out.set_item("sfx", self.sfx)?;
-        out.set_item("pe_structure", self.pe_structure)?;
+        out.set_item("pe_structure", self.pe_state == PeState::Confirmed)?;
         out.set_item("evidence", PyList::new(py, self.evidence)?)?;
         out.set_item("error", self.error)?;
         out.set_item("bytes_read", self.bytes_read)?;
@@ -266,10 +268,9 @@ fn probe_path(
         result.bytes_read += (prefix_len - base_prefix_len) as u64;
     }
 
-    if allow_embedded && pe_headers_plausible(&prefix, size) {
-        result.pe_structure = true;
-        result.evidence.push("sfx:pe_structure");
-    }
+    let pe = probe_pe_prefix(&prefix, size);
+    result.pe_state = pe.state();
+    result.pe_image_end = pe.image_end();
 
     // RAR and 7z have all relation-seed structure at the head.  Do not pay
     // the ZIP EOCD tail read for a proposal that has already identified one
@@ -302,21 +303,6 @@ fn probe_path(
         return result;
     }
     probe_standalone_stream(&prefix, &mut result);
-    // A deep probe of a launcher that carries its archive in external
-    // split-volume files still needs to retain the PE/SFX seed.  There is no
-    // embedded archive signature to promote it to a format-specific anchor,
-    // but losing the MZ evidence here would make the filename proposal look
-    // like an ordinary non-SFX executable and detach the companion from the
-    // already validated external volumes.
-    if allow_embedded
-        && result.format.is_empty()
-        && result.error.is_empty()
-        && !result.evidence.iter().any(|item| *item == "sfx:pe_header")
-    {
-        result.confidence = "weak".to_string();
-        result.sfx = true;
-        result.evidence.push("sfx:pe_header");
-    }
     result
 }
 
@@ -351,15 +337,9 @@ fn probe_cheap_prefix(
     if probe_zip_eocd_head(prefix, &mut result) {
         return result;
     }
-    if prefix.starts_with(b"MZ") {
-        // An MZ header is only a weak SFX/carrier seed.  Do not scan a
-        // larger prefix here: the relation layer may use the filename
-        // proposal to authorize one bounded deep probe later.
-        result.confidence = "weak".to_string();
-        result.sfx = true;
-        result.evidence.push("sfx:pe_header");
-        return result;
-    }
+    let pe = probe_pe_prefix(prefix, result.size);
+    result.pe_state = pe.state();
+    result.pe_image_end = pe.image_end();
     probe_standalone_stream(prefix, &mut result);
     result
 }
@@ -586,9 +566,8 @@ fn initialize_rar_anchor(out: &mut VolumeAnchor, offset: usize) {
     out.format = "rar".to_string();
     out.confidence = "strong".to_string();
     out.structure_offset = Some(offset as u64);
-    out.sfx = offset > 0;
-    out.evidence.push(if out.sfx {
-        "rar:sfx_signature"
+    out.evidence.push(if offset > 0 {
+        "rar:embedded_signature"
     } else {
         "rar:signature"
     });
@@ -660,11 +639,10 @@ fn probe_seven_zip(prefix: &[u8], offset: usize, size: u64, out: &mut VolumeAnch
     }
     out.format = "7z".to_string();
     out.structure_offset = Some(offset as u64);
-    out.sfx = offset > 0;
     out.anchor_roles.push("first");
     out.internal_volume_number = Some(1);
-    out.evidence.push(if out.sfx {
-        "7z:sfx_signature"
+    out.evidence.push(if offset > 0 {
+        "7z:embedded_signature"
     } else {
         "7z:start_signature"
     });
@@ -758,7 +736,6 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
     out.confidence = "strong".to_string();
     if let Some(offset) = start_offset {
         out.structure_offset = Some(offset as u64);
-        out.sfx = offset > 0 && split_start_offset.is_none();
         out.anchor_roles.push("first");
         // A local entry can also begin a later disk. Only the split marker
         // proves the physical first disk before EOCD information is known.
@@ -767,8 +744,8 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
             "zip:split_marker"
         } else if empty_eocd_offset == Some(offset) {
             "zip:empty_eocd"
-        } else if out.sfx {
-            "zip:sfx_local_header"
+        } else if offset > 0 {
+            "zip:embedded_local_header"
         } else {
             "zip:local_header"
         });
@@ -809,7 +786,6 @@ fn probe_zip(prefix: &[u8], tail: &[u8], tail_start: u64, out: &mut VolumeAnchor
                 if empty_eocd_start {
                     out.anchor_roles.retain(|role| *role != "first");
                     out.structure_offset = None;
-                    out.sfx = false;
                     out.continuation_to_next = false;
                 }
             }
@@ -1155,11 +1131,6 @@ pub(crate) fn probe_volume_anchor_at_offset(
         }
         if let Some(expected_logical_size) = result.expected_logical_size.as_mut() {
             *expected_logical_size = expected_logical_size.saturating_add(offset);
-        }
-        result.sfx = true;
-        result.pe_structure = true;
-        if !result.evidence.iter().any(|item| *item == "sfx:pe_overlay") {
-            result.evidence.push("sfx:pe_overlay");
         }
     }
     result

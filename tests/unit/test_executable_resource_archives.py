@@ -12,22 +12,7 @@ from sunpack.pipeline.coordinator.scan_session import DiscoveryScanSession
 from sunpack.pipeline.coordinator.task_provider import ArchiveTaskProvider
 from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from tests.helpers.config_factory import make_config
-from tests.helpers.fs_builder import make_minimal_7z
-
-
-def _minimal_pe_stub() -> bytes:
-    """Build a small PE image with a 0xE0-byte image/overlay boundary."""
-    pe_end = 0xE0
-    image = bytearray(pe_end)
-    image[0:2] = b"MZ"
-    image[0x3C:0x40] = (0x80).to_bytes(4, "little")
-    image[0x80:0x84] = b"PE\x00\x00"
-    image[0x86:0x88] = (1).to_bytes(2, "little")
-    image[0x94:0x96] = (0).to_bytes(2, "little")
-    section = 0x98
-    image[section + 16:section + 20] = (0x20).to_bytes(4, "little")
-    image[section + 20:section + 24] = (0xC0).to_bytes(4, "little")
-    return bytes(image)
+from tests.helpers.fs_builder import make_minimal_7z, make_minimal_pe
 
 
 def _zip_archive(entries: dict[str, bytes]) -> bytes:
@@ -98,7 +83,7 @@ def _make_game_tree(
     game_dir = root / "game"
     game_dir.mkdir()
     executable = game_dir / filename
-    executable.write_bytes(_minimal_pe_stub() + embedded_archive)
+    executable.write_bytes(make_minimal_pe() + embedded_archive)
 
     resource_payload = "installed game resource entry\n" * 160
     for index in range(24):

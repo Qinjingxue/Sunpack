@@ -89,11 +89,13 @@ impl StructuralFacts {
             }
         });
         let sfx_role = match row.anchor.as_ref() {
-            Some(a) if a.sfx && a.pe_structure && a.format.is_empty() => SfxRole::LauncherCompanion,
+            Some(a) if a.sfx && a.pe_state == PeState::Confirmed && a.format.is_empty() => {
+                SfxRole::LauncherCompanion
+            }
             Some(a)
                 if format == "rar"
                     && a.sfx
-                    && a.pe_structure
+                    && a.pe_state == PeState::Confirmed
                     && a.format == format
                     && a.multivolume
                     && first =>
@@ -122,7 +124,7 @@ impl StructuralFacts {
 }
 
 /// One collection per active bucket. Only encrypted headers and missing tail
-/// fields are upgraded. Opaque continuations of a pure 7z family do no I/O.
+/// fields and PE/SFX facts are upgraded. Opaque 7z continuations do no I/O.
 pub(super) fn collect(
     py: Python<'_>,
     rows: &mut [RelationInput],
@@ -177,22 +179,42 @@ pub(super) fn collect(
                         Some(password),
                     )
                 });
-                upgraded.pe_structure = anchor.pe_structure;
+                upgraded.pe_state = anchor.pe_state;
+                upgraded.pe_image_end = anchor.pe_image_end;
+                upgraded.sfx = anchor.sfx;
                 rows[i].anchor = Some(upgraded);
             }
         }
     }
-    let sfx: Vec<_> = index
+    let pe_rows: Vec<_> = index
         .entries_by_path
         .values()
         .copied()
         .filter(|i| {
             rows[*i].anchor.as_ref().is_some_and(|a| {
-                a.sfx && !a.pe_structure && !a.evidence.contains(&"relation:sfx_checked")
+                a.pe_state != PeState::None
+                    && !a.sfx
+                    && !a.evidence.contains(&"relation:sfx_checked")
             })
         })
         .collect();
-    for i in sfx {
+    for i in pe_rows {
+        if rows[i]
+            .anchor
+            .as_ref()
+            .is_some_and(|a| a.pe_state == PeState::Candidate)
+        {
+            // Refine only structure facts. Stage ownership and filesystem routes
+            // stay unchanged; the native residual retains this refined anchor.
+            let probe = py.detach(|| inspect_pe_image_native(&rows[i].path));
+            let Ok(probe) = probe else {
+                // A transient read error is not evidence against PE identity.
+                continue;
+            };
+            let anchor = rows[i].anchor.as_mut().unwrap();
+            anchor.pe_state = probe.state();
+            anchor.pe_image_end = probe.image_end();
+        }
         if let Some(anchor) = promote_sfx_archive_anchor(py, &rows[i], passwords)? {
             rows[i].anchor = Some(anchor);
         }

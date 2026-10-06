@@ -969,7 +969,7 @@ mod tests {
         }
         let head = rows[0].anchor.as_mut().unwrap();
         head.sfx = true;
-        head.pe_structure = true;
+        head.pe_state = PeState::Confirmed;
         head.structure_offset = Some(128);
         let mut groups = resolve(&rows);
         assert_eq!(groups.len(), 1);
@@ -1259,7 +1259,7 @@ mod tests {
             let mut launcher = row(name, "", None, false);
             let anchor = launcher.anchor.as_mut().unwrap();
             anchor.sfx = true;
-            anchor.pe_structure = true;
+            anchor.pe_state = PeState::Confirmed;
             anchor.evidence = vec!["sfx:seven_zip_stub"];
             let rows = vec![
                 row("same.7z.001", "7z", Some(1), false),
