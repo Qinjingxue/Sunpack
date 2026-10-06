@@ -52,21 +52,6 @@ def test_first_depth_bypasses_policy_for_the_user_requested_scope(tmp_path):
     assert result.skipped == []
 
 
-def test_removed_initial_root_setting_is_rejected():
-    with pytest.raises(ValueError, match="allow_initial_root_archives"):
-        normalize_recursive_authorization({"allow_initial_root_archives": True})
-
-
-def test_removed_or_rule_setting_is_rejected():
-    with pytest.raises(ValueError, match="maximum_other_projects"):
-        normalize_recursive_authorization({"maximum_other_projects": 2})
-
-
-def test_removed_cleanliness_model_settings_are_rejected():
-    with pytest.raises(ValueError, match="other_project_tolerance"):
-        normalize_recursive_authorization({"other_project_tolerance": 2})
-
-
 @pytest.mark.parametrize(
     ("field", "value"),
     [

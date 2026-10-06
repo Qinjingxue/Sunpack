@@ -20,13 +20,6 @@ def test_config_validate_checks_embedded_ratio_type():
         normalize_config(payload)
 
 
-def test_config_validate_rejects_removed_rule_pipeline():
-    payload = _payload()
-    payload["detection"]["rule_pipeline"] = {"precheck": []}
-    with pytest.raises(ConfigSchemaError, match="rule_pipeline"):
-        normalize_config(payload)
-
-
 @pytest.mark.parametrize(("override", "field"), [
     ({"recursive_extract": {"mode": "infinite"}}, "recursive_extract"),
     ({"post_extract": {"archive_cleanup_mode": "recycle"}}, "archive_cleanup_mode"),

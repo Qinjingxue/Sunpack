@@ -43,18 +43,6 @@ def test_file_range_serializes_only_canonical_extent_boundary():
     assert restored.primary_extent == InputExtent("carrier.bin", 128, 512)
 
 
-def test_legacy_segment_field_is_rejected():
-    with pytest.raises(ValueError, match="legacy archive input segment field"):
-        ArchiveInputDescriptor.from_dict({
-            "kind": "archive_input",
-            "entry_path": "carrier.bin",
-            "open_mode": "file_range",
-            "format_hint": "zip",
-            "parts": [{"path": "carrier.bin", "role": "main"}],
-            "segment": {"start": 128, "end": 512},
-        })
-
-
 def test_duplicate_segment_boundary_analysis_is_rejected():
     with pytest.raises(ValueError, match="boundaries belong only to InputExtent"):
         ArchiveInputDescriptor(

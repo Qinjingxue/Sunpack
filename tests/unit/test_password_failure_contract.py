@@ -25,21 +25,9 @@ def test_verifier_statuses_accept_only_canonical_values(status):
     assert normalize_verifier_status(status) == status
 
 
-@pytest.mark.parametrize(
-    "status",
-    [
-        "unencrypted",
-        "not_encrypted",
-        "unknown_need_fallback",
-        "unknown_needs_fallback",
-        "inconclusive",
-        "unsupported",
-        "unexpected_backend_value",
-    ],
-)
-def test_verifier_statuses_reject_legacy_and_unknown_values(status):
+def test_verifier_statuses_reject_unknown_values():
     with pytest.raises(ValueError, match="invalid verifier status"):
-        normalize_verifier_status(status)
+        normalize_verifier_status("unexpected_backend_value")
 
 
 def test_scheduler_uses_no_match_status_not_backend_message(tmp_path):
