@@ -309,7 +309,6 @@ fn ensure_ok(response: Response) -> io::Result<Response> {
     let kind = match response.status {
         Status::InvalidRequest => io::ErrorKind::InvalidInput,
         Status::NotFound => io::ErrorKind::NotFound,
-        Status::VersionMismatch => io::ErrorKind::Unsupported,
         _ => io::ErrorKind::Other,
     };
     Err(io::Error::new(

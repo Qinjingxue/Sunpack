@@ -290,13 +290,9 @@ fn serve_client(
 
         let request = match Request::decode(&request_bytes) {
             Ok(request) => request,
-            Err(error) => {
+            Err(_) => {
                 let response = Response {
-                    status: if error.kind() == io::ErrorKind::Unsupported {
-                        Status::VersionMismatch
-                    } else {
-                        Status::InvalidRequest
-                    },
+                    status: Status::InvalidRequest,
                     ..Response::ok(0)
                 };
                 let _ = write_overlapped(pipe.raw(), stop_event, &response.encode());

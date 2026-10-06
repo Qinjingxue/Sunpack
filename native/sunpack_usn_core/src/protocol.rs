@@ -1,7 +1,6 @@
 use std::io;
 
 pub const MAGIC: u32 = u32::from_le_bytes(*b"SPWB");
-pub const VERSION: u16 = 3;
 pub const MAX_VOLUME_GUID_BYTES: usize = 64;
 pub const FILE_ID_BYTES: usize = 16;
 pub const REQUEST_BYTES: usize = 128;
@@ -47,8 +46,7 @@ pub enum Status {
     NotFound = 3,
     ScanLimit = 4,
     InternalError = 5,
-    VersionMismatch = 6,
-    JournalReset = 7,
+    JournalReset = 6,
 }
 
 impl TryFrom<u16> for Status {
@@ -62,8 +60,7 @@ impl TryFrom<u16> for Status {
             3 => Ok(Self::NotFound),
             4 => Ok(Self::ScanLimit),
             5 => Ok(Self::InternalError),
-            6 => Ok(Self::VersionMismatch),
-            7 => Ok(Self::JournalReset),
+            6 => Ok(Self::JournalReset),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown broker status",
@@ -112,7 +109,6 @@ impl Request {
         }
         let mut bytes = [0u8; REQUEST_BYTES];
         bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
         bytes[6..8].copy_from_slice(&(self.opcode as u16).to_le_bytes());
         bytes[8..16].copy_from_slice(&self.request_id.to_le_bytes());
         bytes[16..24].copy_from_slice(&self.previous_usn.to_le_bytes());
@@ -137,10 +133,10 @@ impl Request {
                 "invalid broker request magic",
             ));
         }
-        if u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != VERSION {
+        if bytes[4..6] != [0, 0] {
             return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "broker protocol version mismatch",
+                io::ErrorKind::InvalidData,
+                "broker request contains non-zero reserved bytes",
             ));
         }
         let opcode = Opcode::try_from(u16::from_le_bytes(bytes[6..8].try_into().unwrap()))?;
@@ -207,7 +203,6 @@ impl Response {
     pub fn encode(self) -> [u8; RESPONSE_BYTES] {
         let mut bytes = [0u8; RESPONSE_BYTES];
         bytes[0..4].copy_from_slice(&MAGIC.to_le_bytes());
-        bytes[4..6].copy_from_slice(&VERSION.to_le_bytes());
         bytes[6..8].copy_from_slice(&(self.status as u16).to_le_bytes());
         bytes[8..16].copy_from_slice(&self.request_id.to_le_bytes());
         bytes[16..20].copy_from_slice(&self.win32_error.to_le_bytes());
@@ -226,7 +221,7 @@ impl Response {
             ));
         }
         if u32::from_le_bytes(bytes[0..4].try_into().unwrap()) != MAGIC
-            || u16::from_le_bytes(bytes[4..6].try_into().unwrap()) != VERSION
+            || bytes[4..6] != [0, 0]
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -295,13 +290,26 @@ mod tests {
     }
 
     #[test]
-    fn wrong_protocol_version_is_rejected_before_fields_are_used() {
-        let mut encoded = Request::simple(Opcode::Hello, 1).encode().unwrap();
-        encoded[4..6].copy_from_slice(&(VERSION + 1).to_le_bytes());
-        assert_eq!(
-            Request::decode(&encoded).unwrap_err().kind(),
-            io::ErrorKind::Unsupported
-        );
+    fn non_zero_reserved_header_bytes_are_rejected() {
+        for offset in 4..6 {
+            let mut request = Request::simple(Opcode::Hello, 1).encode().unwrap();
+            assert_eq!(&request[4..6], &[0, 0]);
+            request[offset] = 3;
+            assert_eq!(
+                Request::decode(&request).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+
+            let response = Response::ok(1);
+            let mut encoded = response.encode();
+            assert_eq!(Response::decode(&encoded).unwrap(), response);
+            assert_eq!(&encoded[4..6], &[0, 0]);
+            encoded[offset] = 3;
+            assert_eq!(
+                Response::decode(&encoded).unwrap_err().kind(),
+                io::ErrorKind::InvalidData
+            );
+        }
     }
 
     #[test]
