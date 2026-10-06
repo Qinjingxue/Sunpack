@@ -122,8 +122,8 @@ static int write_mem(void *p,const void *src,size_t n) {
     auto &s=*static_cast<Memory *>(p); const auto *b=static_cast<const unsigned char *>(src);
     s.output.insert(s.output.end(),b,b+n); return 0;
 }
-static int dict_mem(void *p,uint32_t id,int,const void **data,size_t *n) {
-    auto &s=*static_cast<Memory *>(p); if (!s.dictionary || (id && id!=s.id)) return 0;
+static int dict_mem(void *p,uint32_t id,int has_id,const void **data,size_t *n) {
+    auto &s=*static_cast<Memory *>(p); if (!s.dictionary || (has_id && id!=s.id)) return 0;
     *data=s.dictionary->data(); *n=s.dictionary->size(); return 1;
 }
 static int progress_mem(void *p,uint64_t,uint64_t) { return static_cast<Memory *>(p)->cancel; }
@@ -152,6 +152,13 @@ static Bytes tar(const Bytes &input) {
     std::memcpy(out.data()+257,"ustar",5);std::memcpy(out.data()+263,"00",2);
     unsigned sum=0;for(auto b:out)sum+=b;char crc[8];std::snprintf(crc,sizeof(crc),"%06o",sum);std::memcpy(out.data()+148,crc,7);out[155]=' ';
     out.insert(out.end(),input.begin(),input.end());out.resize(((out.size()+511)/512)*512+1024);return out;
+}
+static Bytes zero_dictionary_id(Bytes bytes) {
+    check((bytes[4] & 1) != 0, "explicit dictionary field");
+    const size_t at = 6 + ((bytes[4] & 8) ? 8 : 0);
+    std::fill(bytes.begin() + at, bytes.begin() + at + 4, 0);
+    bytes[at + 4] = static_cast<unsigned char>(XXH32(bytes.data() + 4, at, 0) >> 8);
+    return bytes;
 }
 static void benchmark(const Bytes &input) {
     const auto packed=frame(input,7,true,true,true,true);
@@ -232,9 +239,16 @@ int wmain(int argc,wchar_t **argv) {
         std::filesystem::create_directories(root/L"expected_dictionary");
         save(root/L"expected_dictionary"/L"payload",dict_input);
         save(root/L"dictionary_no_id.lz4",frame(dict_input,4,true,true,true,true,&dictionary,0));
-        auto zero_id=dict_frame;std::fill(zero_id.begin()+14,zero_id.begin()+18,0);
-        zero_id[18]=static_cast<unsigned char>(XXH32(zero_id.data()+4,14,0)>>8);
+        auto zero_id=zero_dictionary_id(dict_frame);
         decode(zero_id,dict_input,31,&dictionary,0);save(root/L"dictionary_zero_id.lz4",zero_id);
+        check(decode(zero_id,{},31,nullptr,0,SUP_LZ4_DICTIONARY).dictionary_id==0,"missing explicit ID zero");
+        decode(zero_id,{},31,&dictionary,123,SUP_LZ4_DICTIONARY);
+        Memory no_dictionary{&zero_id};sup_lz4_result missing_zero{};
+        check(sup_lz4_decode(&no_dictionary,read_mem,nullptr,write_mem,nullptr,nullptr,&missing_zero)==SUP_LZ4_DICTIONARY,
+              "ID zero also requires context without a dictionary callback");
+        Bytes zero_carrier(1031,0x89);zero_carrier.insert(zero_carrier.end(),zero_id.begin(),zero_id.end());
+        zero_carrier.resize(zero_carrier.size()+29,0x88);save(root/L"dictionary_zero_id_carrier.dat",zero_carrier);
+        save(root/L"payload_zero_id.tar.lz4",zero_dictionary_id(frame(tar(Bytes{'h','e','l','l','o','\n'}),4,true,true,true,true,&dictionary,123)));
         for(int block=4;block<=7;++block) for(bool linked:{false,true})
             decode(frame(dict_input,block,linked,true,true,true,&dictionary,123),dict_input,31,&dictionary,123);
         Bytes padded_dictionary(256*1024,0x89);padded_dictionary.insert(padded_dictionary.end(),dictionary.begin(),dictionary.end());

@@ -100,6 +100,19 @@ def test_worker_receipt_matches_plan_and_finalized_inventory(fixtures, tmp_path,
     assert not rows[0]["crc_ok"]
     forged = dict(receipt, frames=frames + 1)
     assert inventory.verify_stream_receipt(descriptor.analysis["stream_plan"], forged)["status"] == "failed"
+    diagnostics = {"skippable_frames", "legacy_frames", "block_checked_frames"}
+    # Diagnostic changes/omissions must not bind planner and decoder state machines.
+    for projected in (
+        {key: value for key, value in receipt.items() if key not in diagnostics},
+        dict(receipt, **{key: receipt[key] + 1 for key in diagnostics}),
+    ):
+        projected_plan = {key: value for key, value in descriptor.analysis["stream_plan"].items() if key not in diagnostics}
+        assert inventory.verify_stream_receipt(projected_plan, projected)["status"] == "passed"
+    for field in ("input_bytes", "output_bytes", "content_checked_frames", "error"):
+        assert inventory.verify_stream_receipt(descriptor.analysis["stream_plan"],
+            dict(receipt, **{field: receipt[field] + 1}))["status"] == "failed", field
+    missing_coverage = {key: value for key, value in receipt.items() if key != "content_checked_frames"}
+    assert inventory.verify_stream_receipt(descriptor.analysis["stream_plan"], missing_coverage)["status"] == "failed"
 
 
 def test_skippable_prefix_disguised_identity_and_exact_carrier(fixtures, tmp_path):
@@ -158,14 +171,45 @@ def test_dictionary_flows_through_planning_extraction_and_verification(fixtures,
         runner.close()
 
 
-def test_missing_dictionary_is_information_required(fixtures, tmp_path):
-    path = fixtures / "dictionary.lz4"
-    report = AnalysisEngine().analyze_path(str(path))
+@pytest.mark.parametrize("name,id", [("dictionary.lz4", 123), ("dictionary_zero_id.lz4", 0)])
+@pytest.mark.parametrize("default", [False, True])
+def test_missing_dictionary_is_information_required(fixtures, tmp_path, name, id, default):
+    path = fixtures / name
+    options = {"default_dictionary": str(fixtures / "dict.raw") if default else "", "dictionaries": {}}
+    report = AnalysisEngine({"analysis": {"lz4": options}}).analyze_path(str(path))
     lz4 = next(e for e in report.evidences if e.format == "lz4")
     assert lz4.details["information_required"] and lz4.status == "damaged"
-    result = worker(ArchiveInputDescriptor(entry_path=str(path), format_hint="lz4"), tmp_path / "missing")
+    assert lz4.details["stream_plan"]["missing_dictionary_ids"] == [id]
+    result = worker(ArchiveInputDescriptor(entry_path=str(path), format_hint="lz4", analysis={"lz4": options}), tmp_path / "missing")
     assert result["failure_kind"] == "dictionary_required" and not result["damaged"]
-    assert result["stream_receipt"]["dictionary_id"] == 123 and path.exists()
+    assert result["stream_receipt"]["dictionary_id"] == id and path.exists()
+
+
+@pytest.mark.parametrize("configured", [False, True])
+def test_explicit_zero_dictionary_id_carrier_reuses_dependency_gate(fixtures, tmp_path, configured):
+    path = fixtures / "dictionary_zero_id_carrier.dat"
+    options = {"default_dictionary": str(fixtures / "dict.raw"),
+               "dictionaries": {"0": str(fixtures / "dict.raw")} if configured else {}}
+    candidate = DiscoveryCandidate(ArchiveInputDescriptor(entry_path=str(path)), "", (), "embedded", size=path.stat().st_size)
+    discovery = EmbeddedDiscovery({"analysis": {"lz4": options}}).discover([candidate])
+    if not configured:
+        assert not discovery.resolved_tasks
+        assert discovery.findings[0].reason == "embedded_information_required"
+        assert path.exists()
+        return
+    assert len(discovery.resolved_tasks) == 1
+    result = worker(discovery.resolved_tasks[0].archive_input(), tmp_path / "output")
+    assert result["status"] == "ok"
+    assert fingerprints(tmp_path / "output") == fingerprints(fixtures / "expected_dictionary")
+
+
+def test_explicit_zero_dictionary_id_tar_sample_uses_the_mapping(fixtures):
+    path = fixtures / "payload_zero_id.tar.lz4"
+    options = {"default_dictionary": str(fixtures / "dict_second.raw"),
+               "dictionaries": {"0": str(fixtures / "dict.raw")}}
+    report = AnalysisEngine({"analysis": {"lz4": options}}).analyze_path(str(path))
+    assert report.best_selected.format == "tar.lz4"
+    assert report.best_selected.details["stream_plan"]["dictionary_ids"] == [0]
 
 
 def test_explicit_concat_input_reuses_multivolume_reader_and_worker(fixtures, tmp_path):

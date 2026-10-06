@@ -467,7 +467,7 @@ unsafe extern "C" fn sample_dictionary<R: Read>(
     size: *mut usize,
 ) -> i32 {
     let state = &mut *opaque.cast::<Sample<R>>();
-    let keyed = has_id != 0 && (id != 0 || state.dictionaries.by_id.contains_key(&0));
+    let keyed = has_id != 0;
     let key = if keyed { u64::from(id) } else { 1u64 << 32 };
     if state.dictionary_key == Some(key) {
         *data = state.dictionary.as_ptr().cast();
@@ -590,7 +590,13 @@ fn run_sample<R: Read>(
 mod tests {
     use super::*;
     use crate::io::reader::ReaderConfig;
-    fn frame(payload: &[u8], flags: u8, bd: u8, size: Option<u64>, dict: Option<u32>) -> Vec<u8> {
+    pub(super) fn frame(
+        payload: &[u8],
+        flags: u8,
+        bd: u8,
+        size: Option<u64>,
+        dict: Option<u32>,
+    ) -> Vec<u8> {
         let mut out = MAGIC.to_vec();
         out.extend_from_slice(&[flags, bd]);
         if let Some(size) = size {
@@ -613,7 +619,7 @@ mod tests {
         }
         out
     }
-    fn index(data: Vec<u8>, start: u64) -> Index {
+    pub(super) fn index(data: Vec<u8>, start: u64) -> Index {
         let reader = ManagedReader::from_bytes(data, ReaderConfig::default());
         walk(&reader, start, reader.len())
     }
@@ -725,4 +731,52 @@ mod tests {
         *bytes.last_mut().unwrap() ^= 1;
         assert!(sample(std::io::Cursor::new(&bytes), 65536).is_err());
     }
+    #[test]
+    fn explicit_zero_dictionary_id_never_uses_the_default() {
+        let bytes = frame(b"hello", 0x61, 0x40, None, Some(0));
+        assert_eq!(index(bytes.clone(), 0).dictionaries, [0]);
+        let dictionaries = Dictionaries {
+            default: "default-must-not-be-opened".into(),
+            ..Dictionaries::default()
+        };
+        assert_eq!(
+            sample_with_dictionaries(std::io::Cursor::new(&bytes), 32, &dictionaries),
+            Err("lz4_dictionary_required")
+        );
+        // The missing dependency is required even when this frame's blocks
+        // happen to contain only literals and could decode without a dictionary.
+        assert_eq!(
+            sample(std::io::Cursor::new(&bytes), 32),
+            Err("lz4_dictionary_required")
+        );
+        let mut state = Sample {
+            reader: std::io::Cursor::new(&bytes),
+            output: Vec::new(),
+            limit: 32,
+            stopped: false,
+            error: None,
+            dictionaries,
+            dictionary: Vec::new(),
+            dictionary_key: None,
+            input_remaining: u64::MAX,
+            read_remaining: u64::MAX,
+        };
+        let mut data = std::ptr::null();
+        let mut size = 0;
+        let opaque = (&mut state as *mut Sample<_>).cast();
+        assert_eq!(
+            unsafe {
+                sample_dictionary::<std::io::Cursor<&Vec<u8>>>(opaque, 0, 1, &mut data, &mut size)
+            },
+            0
+        );
+        assert!(
+            state.error.is_none(),
+            "an explicit ID must not open the default path"
+        );
+    }
 }
+
+#[cfg(test)]
+#[path = "lz4_differential_tests.rs"]
+mod differential_tests;

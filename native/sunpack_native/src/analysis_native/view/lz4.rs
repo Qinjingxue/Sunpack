@@ -59,7 +59,7 @@ impl<'a, 'py> ReportContext<'a, 'py> {
                 .unwrap_or_default();
             let missing: Vec<u32> = ids
                 .into_iter()
-                .filter(|id| *id != 0 && !self.lz4_dictionaries.by_id.contains_key(id))
+                .filter(|id| !self.lz4_dictionaries.by_id.contains_key(id))
                 .collect();
             let complete = truthy(&plan, "complete")?;
             let info = !missing.is_empty() || truthy(row, "information_required")?;

@@ -293,7 +293,7 @@ class EmbeddedDiscovery:
         lz4_config = (self.config.get("analysis") or {}).get("lz4") or {}
         dictionaries = lz4_config.get("dictionaries") or {}
         unavailable = next((item for item in scan.candidates if item.format == "lz4" and (
-            item.information_required or any(key != 0 and str(key) not in dictionaries and key not in dictionaries
+            item.information_required or any(str(key) not in dictionaries and key not in dictionaries
                                            for key in (item.stream_plan or {}).get("dictionary_ids", []))
         )), None)
         if unavailable is not None:

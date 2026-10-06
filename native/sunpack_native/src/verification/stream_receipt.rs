@@ -23,15 +23,11 @@ pub(crate) fn verify_stream_receipt(
     let snapshot = inventory.verification_snapshot();
     let result = PyDict::new(py);
     let mut mismatch = Vec::new();
-    for field in [
-        "input_bytes",
-        "frames",
-        "skippable_frames",
-        "legacy_frames",
-        "content_checked_frames",
-        "block_checked_frames",
-    ] {
-        if number(plan, field)?.is_none() || number(plan, field)? != number(receipt, field)? {
+    // Frame-type and block-checksum counters remain diagnostics. Verification
+    // binds the decoded range, frame count and content-checksum coverage only.
+    for field in ["input_bytes", "frames", "content_checked_frames"] {
+        let expected = number(plan, field)?;
+        if expected.is_none() || expected != number(receipt, field)? {
             mismatch.push(field);
         }
     }

@@ -113,7 +113,7 @@ static int dictionary(void *p, uint32_t id, int has_id, const void **data, size_
         auto it = std::lower_bound(c.options->dictionaries.begin(), c.options->dictionaries.end(), id,
             [](const auto &entry, auto value) { return entry.first < value; });
         if (it != c.options->dictionaries.end() && it->first == id) path = &it->second;
-        else if (id) return 0;
+        else return 0;
     }
     if (path->empty()) return 0;
     if (c.dictionary_path == path) { *data=c.dictionary.data(); *size=c.dictionary.size(); return 1; }

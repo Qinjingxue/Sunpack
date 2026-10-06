@@ -130,11 +130,11 @@ static int modern(stream *s) {
     if (s->dictionary) {
         int found = s->dictionary(s->opaque, info.dictID, (flags&1)!=0, &dict, &dict_size);
         if (found < 0) { s->result->dictionary_id=info.dictID; rc = SUP_LZ4_DICTIONARY_IO; goto done; }
-        if (!found && info.dictID) {
+        if (!found && (flags & 1)) {
             s->result->dictionary_id = info.dictID;
             rc = SUP_LZ4_DICTIONARY; goto done;
         }
-    } else if (info.dictID) {
+    } else if (flags & 1) {
         s->result->dictionary_id = info.dictID;
         rc = SUP_LZ4_DICTIONARY; goto done;
     }
@@ -149,7 +149,7 @@ static int modern(stream *s) {
             rc = library_error(hint);
             /* A frame can reference an external dictionary without a Dict-ID.
                Without that context, a failed block cannot prove source damage. */
-            if (!info.dictID && !dict_size && LZ4F_getErrorCode(hint) == LZ4F_ERROR_decompressionFailed)
+            if (!(flags & 1) && !dict_size && LZ4F_getErrorCode(hint) == LZ4F_ERROR_decompressionFailed)
                 rc = SUP_LZ4_DICTIONARY_OR_DATA;
             goto done;
         }

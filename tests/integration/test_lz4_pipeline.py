@@ -11,6 +11,7 @@ import pytest
 from sunpack.core.config.schema import normalize_config
 from sunpack.core.contracts.results import OutcomeKind
 from sunpack.pipeline.coordinator.engine import PipelineEngine
+from sunpack.pipeline.discovery.embedded.options import EmbeddedOptions
 from tests.helpers.detection_config import with_detection_pipeline
 from tests.unit.test_lz4_support import ROOT, fixtures, fingerprints  # shared native fixtures
 
@@ -90,19 +91,26 @@ def test_cli_extract_detects_disguised_lz4_and_returns_verified_success(fixtures
     assert fingerprints(fixtures / "expected_standard") <= fingerprints(output)
 
 
-def test_embedded_dictionary_dependency_is_reported_until_configured(fixtures, tmp_path):
-    source = tmp_path / "dictionary.lz4"
-    shutil.copyfile(fixtures / "dictionary.lz4", source)
+@pytest.mark.parametrize("origin", ["foreground", "watch"])
+@pytest.mark.parametrize("name", ["dictionary.lz4", "dictionary_zero_id.lz4", "dictionary_zero_id_carrier.dat"])
+def test_embedded_dictionary_dependency_is_reported_until_configured(fixtures, tmp_path, origin, name):
+    source = tmp_path / name
+    shutil.copyfile(fixtures / name, source)
     config = config_for(tmp_path, fixtures)
     config["analysis"]["lz4"]["dictionaries"] = {}
+    config["analysis"]["lz4"]["default_dictionary"] = str(fixtures / "dict.raw")
+    config["post_extract"]["archive_cleanup_mode"] = "d"
 
     async def run():
         async with PipelineEngine(config) as engine:
-            return await engine.run([str(source)], origin="watch")
+            return await engine.run([str(source)], origin=origin, detection_options=EmbeddedOptions(force_scan=True))
 
     response = asyncio.run(run())
     assert response.summary.success_count == 0
-    assert response.summary.target_results or response.discovery.findings
+    assert response.summary.target_results or response.summary.scan_failures
+    if name.endswith(".dat"):
+        assert response.summary.scan_failures[0].kind.value == "unknown"
+        assert response.summary.scan_failures[0].details["reason"] == "embedded_information_required"
     assert source.exists()
 
 
