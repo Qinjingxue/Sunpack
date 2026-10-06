@@ -29,7 +29,6 @@ class DiscoveryScanSession:
         self._relation_groups: dict[str, list[CandidateGroup]] = {}
         self._relation_group_signatures: dict[str, str] = {}
         self._head_facts = NativeHeadFactCache()
-        self._directory_identities: dict[str, tuple[str, int, str]] = {}
         self._scan_roots: list[str] = []
 
     def set_scan_roots(self, roots: list[str]) -> None:
@@ -177,14 +176,6 @@ class DiscoveryScanSession:
         if isinstance(size, int) and isinstance(mtime_ns, int):
             return key, size, mtime_ns
         return key, 0, 0
-
-    def directory_identity_for_path(self, directory: str) -> tuple[str, int, str]:
-        key = self._directory_key(directory)
-        if key not in self._directory_identities:
-            snapshot = self.shallow_snapshot_for_directory(directory, max_depth=0)
-            count, digest = snapshot.identity_digest()
-            self._directory_identities[key] = (key, count, digest)
-        return self._directory_identities[key]
 
     def _directory_key(self, directory: str) -> str:
         return path_key(directory)

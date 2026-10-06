@@ -863,13 +863,6 @@ Invoke-Native -FilePath $venvPython -Arguments @(
     "from sunpack.core.support.resources import get_toast_library_path; import os; assert os.path.exists(get_toast_library_path())"
 )
 
-Write-Step "Writing environment manifest"
-Invoke-Native -FilePath "powershell" -Arguments @(
-    "-NoProfile", "-ExecutionPolicy", "Bypass",
-    "-File", (Join-Path $repoRoot "scripts\environment_manifest.ps1"),
-    "-RepoRoot", $repoRoot, "-Arch", $buildArch
-)
-
 Write-Step "Verifying local source execution"
 Invoke-Native -FilePath $venvPython -Arguments @("sunpack.py", "--help")
 Invoke-Native -FilePath $venvPython -Arguments @("-m", "pytest", "--version")

@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 
 mod analysis_native;
+mod fast_hash;
 mod filesystem;
 mod formats;
 mod io;
@@ -38,6 +39,8 @@ fn native_available() -> bool {
 #[pymodule]
 fn sunpack_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(native_available, m)?)?;
+    m.add_function(wrap_pyfunction!(fast_hash::fast_hash64, m)?)?;
+    m.add_function(wrap_pyfunction!(fast_hash::fast_hash128, m)?)?;
     #[cfg(windows)]
     {
         m.add_function(wrap_pyfunction!(

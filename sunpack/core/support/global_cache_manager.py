@@ -7,7 +7,6 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from sunpack_native import batch_file_head_facts as _native_batch_file_head_facts
-from sunpack_native import scan_directory_snapshot as _native_scan_directory_snapshot
 
 from sunpack.core.support.path_keys import path_key
 
@@ -100,17 +99,6 @@ def file_identity(path: str) -> tuple[str, int, int]:
     if not rows or not isinstance(rows[0], dict):
         return norm_path, 0, 0
     return norm_path, int(rows[0].get("size") or 0), int(rows[0].get("mtime_ns") or 0)
-
-
-def directory_identity(path: str) -> tuple[str, int, str]:
-    norm_path = path_key(path)
-    snapshot = _native_scan_directory_snapshot(
-        norm_path, 0, [], [], [], [], [], [], []
-    )
-    if not snapshot:
-        return norm_path, 0, ""
-    count, digest = snapshot.identity_digest()
-    return norm_path, int(count), str(digest)
 
 
 def stable_fingerprint(value: Any) -> str:

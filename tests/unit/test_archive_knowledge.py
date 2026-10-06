@@ -20,7 +20,7 @@ def test_archive_knowledge_namespace_merge_flags_and_roundtrip():
     assert "sfx" in ArchiveKnowledge.from_any(payload).flags()
 
 
-def test_archive_knowledge_commit_revision_and_projection_cache_invalidation(tmp_path):
+def test_archive_knowledge_commit_revision_and_current_projections(tmp_path):
     archive_path = tmp_path / "sample.zip"
     archive_path.write_bytes(b"abc")
     task = make_archive_task(archive_path, format_hint="zip")

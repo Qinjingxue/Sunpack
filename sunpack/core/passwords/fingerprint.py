@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -66,6 +65,8 @@ def _archive_input_scope(archive_input: Any) -> str:
         "open_mode": str(archive_input.get("open_mode") or archive_input.get("kind") or ""),
         "format_hint": str(archive_input.get("format_hint") or archive_input.get("format") or ""),
         "logical_name": str(archive_input.get("logical_name") or ""),
+        "start": int(archive_input.get("start", archive_input.get("start_offset", 0)) or 0),
+        "end": archive_input.get("end", archive_input.get("end_offset")),
         "parts": normalized_parts,
         "ranges": normalized_ranges,
     }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -88,19 +89,14 @@ def build_archive_fingerprint(
     normalized_archive = normalized[archive_path]
     normalized_parts = tuple(normalized[path] for path in part_paths or [])
     source_paths = list(dict.fromkeys(normalized.values()))
-    digest = hashlib.sha256()
+    # Paths and native generation tokens cannot contain NUL; JSON escapes it
+    # in logical scope. Keep the full identity rather than hashing it again.
+    fields = []
     for path, generation in zip(source_paths, file_generation_tokens(source_paths)):
-        digest.update(path.encode("utf-8", errors="surrogatepass"))
-        digest.update(b"\0")
-        digest.update((generation or "unavailable").encode("utf-8"))
-        digest.update(b"\0")
-    scope = _archive_input_scope(descriptor)
-    if scope:
-        digest.update(b"logical-input\0")
-        digest.update(scope.encode("utf-8", errors="surrogatepass"))
-        digest.update(b"\0")
+        fields.extend((path, generation or "unavailable"))
+    fields.append(_archive_input_scope(descriptor))
     return ArchiveFingerprint(
-        key=digest.hexdigest(),
+        key="\0".join(fields),
         archive_path=normalized_archive,
         part_paths=normalized_parts,
     )

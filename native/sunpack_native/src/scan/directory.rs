@@ -2,7 +2,6 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
 use rayon::prelude::*;
 use regex::{RegexSet, RegexSetBuilder};
-use sha2::{Digest as Sha2Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::hash::{Hash, Hasher};
@@ -119,49 +118,7 @@ impl NativeDirectorySnapshot {
         })
     }
 
-    fn identity_fingerprint(&self) -> (usize, String) {
-        let mut xor_acc = [0u8; 32];
-        let mut sum_acc = [0u64; 4];
 
-        for &row in &self.rows {
-            let path = Path::new(&self.table.paths[row]);
-            let name = path
-                .file_name()
-                .map(|value| value.to_string_lossy())
-                .unwrap_or_default();
-
-            let mut entry = Sha256::new();
-            entry.update((name.len() as u64).to_le_bytes());
-            for byte in name.bytes() {
-                entry.update([byte.to_ascii_lowercase()]);
-            }
-            entry.update([u8::from(self.table.is_dirs[row])]);
-            entry.update(self.table.sizes[row].unwrap_or(0).to_le_bytes());
-            entry.update(self.table.mtimes_ns[row].unwrap_or(0).to_le_bytes());
-            let entry_digest = entry.finalize();
-
-            for (index, byte) in entry_digest.iter().enumerate() {
-                xor_acc[index] ^= *byte;
-            }
-            for lane in 0..4 {
-                let start = lane * 8;
-                let value = u64::from_le_bytes(
-                    entry_digest[start..start + 8]
-                        .try_into()
-                        .expect("sha256 lane has fixed width"),
-                );
-                sum_acc[lane] = sum_acc[lane].wrapping_add(value);
-            }
-        }
-
-        let mut digest = Sha256::new();
-        digest.update((self.rows.len() as u64).to_le_bytes());
-        digest.update(xor_acc);
-        for value in sum_acc {
-            digest.update(value.to_le_bytes());
-        }
-        (self.rows.len(), format!("{:x}", digest.finalize()))
-    }
 }
 
 fn filesystem_file_route(is_dir: bool, anchor: Option<&VolumeAnchor>) -> u8 {
@@ -817,9 +774,6 @@ impl NativeDirectorySnapshot {
         (paths, sizes, routes, formats, reject_masks)
     }
 
-    fn identity_digest(&self) -> (usize, String) {
-        self.identity_fingerprint()
-    }
 }
 
 struct DirectoryScanOptions {

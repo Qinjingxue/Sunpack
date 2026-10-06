@@ -140,23 +140,6 @@ def test_discovery_candidate_projection_bypasses_legacy_routing_columns(tmp_path
     assert candidates[0].format_hint == "gzip"
 
 
-def test_directory_snapshot_identity_digest_changes_with_snapshot_content(tmp_path):
-    payload = tmp_path / "payload.bin"
-    payload.write_bytes(b"one")
-    first_snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
-    first_count, first_digest = first_snapshot.identity_digest()
-
-    payload.write_bytes(b"two-more-bytes")
-    second_snapshot = DirectoryScanner(str(tmp_path), config=make_config()).scan()
-    second_count, second_digest = second_snapshot.identity_digest()
-
-    assert first_count == len(first_snapshot)
-    assert second_count == len(second_snapshot)
-    assert len(first_digest) == 64
-    assert len(second_digest) == 64
-    assert first_digest != second_digest
-
-
 def test_directory_without_relation_anchor_skips_relations_entirely(tmp_path, monkeypatch):
     (tmp_path / "payload.gz").write_bytes(gzip.compress(b"payload"))
     (tmp_path / "plain.bin").write_bytes(b"ordinary")

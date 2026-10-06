@@ -649,10 +649,6 @@ function Get-EnvironmentRefreshReasons {
         return $reasons
     }
 
-    if (-not (Test-EnvironmentManifest -RepoRoot $RepoRoot)) {
-        $reasons.Add("environment manifest is missing or does not match current sources/artifacts")
-    }
-
     return $reasons
 }
 
@@ -724,15 +720,6 @@ function Get-NativeExtensionPath {
         return ""
     }
     return $extension.FullName
-}
-
-function Test-EnvironmentManifest {
-    param([Parameter(Mandatory = $true)][string]$RepoRoot)
-
-    $manifestScript = Join-Path $RepoRoot "scripts\environment_manifest.ps1"
-    & powershell -NoProfile -ExecutionPolicy Bypass -File $manifestScript `
-        -RepoRoot $RepoRoot -Arch $Arch -Check *> $null
-    return ($LASTEXITCODE -eq 0)
 }
 
 function Invoke-TestWatchServiceAction {

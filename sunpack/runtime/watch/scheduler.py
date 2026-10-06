@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import heapq
 import json
 import os
@@ -12,6 +11,8 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 from typing import Callable, Iterable
+
+from sunpack_native import fast_hash128
 
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.core.config.detection_view import discovery_run_config
@@ -2212,7 +2213,7 @@ def _password_source_signature(
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    return hashlib.sha256(payload).hexdigest()
+    return fast_hash128(payload)
 
 
 def _failure_to_dict(failure: FailureInfo | None) -> dict:

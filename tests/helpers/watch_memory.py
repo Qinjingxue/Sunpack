@@ -278,15 +278,6 @@ def _reader_stats() -> dict[str, Any]:
         return {}
 
 
-def _projection_stats() -> dict[str, Any]:
-    try:
-        from sunpack.core.support.archive_knowledge_projection import projection_cache_stats
-
-        return dict(projection_cache_stats())
-    except (ImportError, AttributeError, TypeError):
-        return {}
-
-
 def _relation_password_cache_stats() -> dict[str, int]:
     try:
         from sunpack.core.passwords import relation_prober
@@ -417,7 +408,6 @@ class WatchMemorySample:
     children: tuple[dict[str, Any], ...] = ()
     reader: dict[str, Any] = field(default_factory=dict)
     global_cache: dict[str, Any] = field(default_factory=dict)
-    projection_cache: dict[str, Any] = field(default_factory=dict)
     archive_sessions: int = 0
     known_caches: dict[str, Any] = field(default_factory=dict)
     watch_state: dict[str, Any] = field(default_factory=dict)
@@ -537,7 +527,6 @@ class WatchMemorySampler:
             children=tuple(child_rows),
             reader=_reader_stats(),
             global_cache=_cache_stats(),
-            projection_cache=_projection_stats(),
             archive_sessions=_archive_session_count(),
             known_caches=_known_cache_stats(self.engine),
             watch_state=state,
@@ -739,7 +728,6 @@ def summarize_watch_memory(rows: list[WatchMemorySample]) -> dict[str, Any]:
         ],
         "reader_final": final.reader,
         "global_cache_final": final.global_cache,
-        "projection_cache_final": final.projection_cache,
         "archive_sessions_final": final.archive_sessions,
         "known_caches_final": final.known_caches,
         "checkpoint_series": [checkpoint_row(row) for row in checkpoints],

@@ -248,26 +248,3 @@ def compact_evidence_value(value: Any) -> Any:
             compacted.append({"truncated_count": len(values) - 50})
         return compacted
     return _jsonable(value)
-
-
-def _compact_large_value(key: str, value: Any) -> Any:
-    if isinstance(value, dict):
-        return {
-            "kind": key,
-            "keys": sorted(str(item) for item in value.keys())[:50],
-            "sha256": _stable_repr_digest(value),
-        }
-    if isinstance(value, list):
-        return {"kind": key, "count": len(value), "sha256": _stable_repr_digest(value)}
-    return _jsonable(value)
-
-
-def _stable_repr_digest(value: Any) -> str:
-    import hashlib
-    import json
-
-    try:
-        payload = json.dumps(_jsonable(value), ensure_ascii=False, sort_keys=True, default=str)
-    except Exception:
-        payload = repr(value)
-    return hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()

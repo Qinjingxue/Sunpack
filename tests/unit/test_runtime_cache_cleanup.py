@@ -10,7 +10,6 @@ from sunpack.core.passwords.relation_prober import (
     clear_relation_probe_cache,
 )
 from sunpack.core.support.archive_knowledge_projection import (
-    clear_projection_cache,
     source_fingerprint,
 )
 from sunpack.core.support.archive_knowledge_writer import commit_task_knowledge
@@ -30,11 +29,9 @@ _TEST_LOOP = asyncio.new_event_loop()
 @pytest.fixture(autouse=True)
 def _reset_process_caches():
     GLOBAL_CACHE.clear_all()
-    clear_projection_cache()
     clear_relation_probe_cache()
     yield
     GLOBAL_CACHE.clear_all()
-    clear_projection_cache()
     clear_relation_probe_cache()
 
 
@@ -53,14 +50,12 @@ def test_clear_all_runtime_caches_clears_python_owned_caches(tmp_path):
 
     stats = runtime_cache_stats()
     assert stats["global_cache"]["entries"] >= 1
-    assert stats["projection_cache"]["entries"] >= 1
     assert stats["relation_probe_cache"] == {"successes": 1, "negative": 1}
     assert "inspection" not in stats
 
     report = clear_all_runtime_caches()
 
     assert report["global_cache"]["entries"] >= 1
-    assert report["projection_cache"]["entries"] >= 1
     assert report["relation_probe_cache"] == {"successes": 1, "negative": 1}
     assert "inspection" not in report
     assert GLOBAL_CACHE.stats()["entries"] == 0
@@ -310,7 +305,6 @@ def test_foreground_lifecycle_clears_runtime_caches_after_idle(tmp_path):
         stats = runtime_cache_stats()
         assert engine.clear_calls == 1
         assert stats["global_cache"]["entries"] == 0
-        assert stats["projection_cache"]["entries"] == 0
         assert stats["relation_probe_cache"] == {"successes": 0, "negative": 0}
 
     asyncio.run(scenario())

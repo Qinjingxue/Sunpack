@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import ctypes
 import asyncio
-import hashlib
 import os
 from copy import deepcopy
 from contextlib import contextmanager
 from ctypes import wintypes
 from dataclasses import dataclass, replace
 from pathlib import Path
+
+from sunpack_native import fast_hash64
 
 from sunpack.core.config.fields.watch import DEFAULT_WATCH_CONFIG
 from sunpack.core.config.loader import ADVANCED_CONFIG_FILENAME, SIMPLE_CONFIG_FILENAME, load_config
@@ -981,7 +982,7 @@ class WatchService:
 def watch_roots_mutex_name(path: Path | None = None) -> str:
     roots_path = path or watch_roots_path()
     identity = os.path.abspath(str(roots_path)).lower()
-    digest = hashlib.sha256(identity.encode("utf-8", errors="ignore")).hexdigest()[:24]
+    digest = fast_hash64(identity.encode("utf-8", errors="surrogatepass"))
     return f"{ROOTS_MUTEX_PREFIX}-{digest}"
 
 

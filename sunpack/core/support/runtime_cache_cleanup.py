@@ -14,10 +14,6 @@ from sunpack.core.passwords.relation_prober import (
     clear_relation_probe_cache,
     relation_probe_cache_stats,
 )
-from sunpack.core.support.archive_knowledge_projection import (
-    clear_projection_cache,
-    projection_cache_stats,
-)
 from sunpack.core.support.archive_sessions import clear_archive_sessions
 from sunpack.core.support.global_cache_manager import (
     clear_all_caches,
@@ -30,7 +26,6 @@ def runtime_cache_stats() -> dict[str, Any]:
 
     result: dict[str, Any] = {
         "global_cache": global_cache_stats(),
-        "projection_cache": projection_cache_stats(),
         "relation_probe_cache": relation_probe_cache_stats(),
         "archive_sessions": _archive_session_stats(),
         "reader": _reader_stats(),
@@ -49,7 +44,6 @@ def clear_all_runtime_caches() -> dict[str, Any]:
     report: dict[str, Any] = {"errors": []}
     for name, action in (
         ("relation_probe_cache", clear_relation_probe_cache),
-        ("projection_cache", clear_projection_cache),
         ("global_cache", clear_all_caches),
         ("archive_sessions", clear_archive_sessions),
     ):

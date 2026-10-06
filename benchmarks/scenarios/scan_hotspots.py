@@ -295,7 +295,6 @@ def install_wrappers(recorder: HotspotRecorder) -> None:
     recorder.wrap(scan_session.DiscoveryScanSession, "candidates_for_directory", "session.candidates_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "native_table_for_directory", "session.native_table_for_directory")
     recorder.wrap(scan_session.DiscoveryScanSession, "file_head_facts_for_paths", "session.file_head_facts_for_paths")
-    recorder.wrap(scan_session.DiscoveryScanSession, "directory_identity_for_path", "session.directory_identity_for_path")
 
     recorder.wrap(target_scan, "build_candidates_for_targets", "coordinator.build_candidates")
     recorder.wrap(target_scan, "build_native_table_for_targets", "coordinator.build_native_table")

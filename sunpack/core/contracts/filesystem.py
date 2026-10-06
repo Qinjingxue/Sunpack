@@ -137,8 +137,3 @@ class DirectorySnapshot:
 
     def iter_relation_anchor_rows(self) -> Iterator[tuple[str, int | None, dict]]:
         return iter(self._native_snapshot.relation_anchor_rows())
-
-    def identity_digest(self) -> tuple[int, str]:
-        count, digest = self._native_snapshot.identity_digest()
-        return int(count), str(digest)
-
