@@ -33,59 +33,6 @@ namespace sunpack::sevenzip
     namespace
     {
 
-        std::wstring format_name_for_guid(const GUID &format)
-        {
-
-            const unsigned char id = format.Data4[5];
-
-            switch (id)
-            {
-
-            case 0x01:
-
-                return L"zip";
-
-            case 0x02:
-
-                return L"bzip2";
-
-            case 0x03:
-
-                return L"rar4";
-
-            case 0x07:
-
-                return L"7z";
-
-            case 0x0C:
-
-                return L"xz";
-
-            case kLz4FormatId:
-                return L"lz4";
-
-            case 0x0E:
-
-                return L"zstd";
-
-            case 0x0F:
-
-            case 0xEF:
-
-                return L"gzip";
-
-            case 0xCC:
-
-                return L"rar5";
-
-            case 0xEE:
-
-                return L"tar";
-            }
-
-            return L"unknown";
-        }
-
         void set_failure(ExtractArchiveResult &result, const std::string &stage, const std::string &kind, HRESULT hr = S_OK)
         {
 
@@ -383,10 +330,10 @@ namespace sunpack::sevenzip
         const auto formats = [&]()
         {
             PipelinePrepareScope scope(pipeline_timing.get(), PipelinePreparePhase::FormatCandidates);
-            return extraction_formats_for_hint(format_hint, archive_path);
+            return extraction_formats_for_hint(format_hint);
         }();
 #else
-        const auto formats = extraction_formats_for_hint(format_hint, archive_path);
+        const auto formats = extraction_formats_for_hint(format_hint);
 #endif
         const auto prefetch_config = input_prefetch_config_for_archive(format_hint, native_volume_input);
 
@@ -401,7 +348,11 @@ namespace sunpack::sevenzip
 
             ExtractHandlerAttempt attempt;
 
-            attempt.format = format_name_for_guid(format);
+            attempt.format = canonical_archive_type_for_guid(format);
+            if (attempt.format.empty())
+            {
+                attempt.format = L"unknown";
+            }
 
             CMyComPtr<IInArchive> archive;
 
@@ -589,7 +540,7 @@ namespace sunpack::sevenzip
                 result.output_trace.items.reserve(num_items);
             }
 
-            result.archive_type = !format_hint.empty() ? format_hint : archive_type_for_path(archive_path);
+            result.archive_type = canonical_archive_type_for_guid(format);
 
 #ifdef SUP7Z_ENABLE_PIPELINE_TIMING
             ExtractToDiskCallback *raw_extract_callback = nullptr;

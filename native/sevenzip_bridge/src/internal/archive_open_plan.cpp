@@ -1,6 +1,5 @@
 #include "archive_open_plan.hpp"
 
-#include "sevenzip_paths.hpp"
 #include "sevenzip_streams.hpp"
 
 namespace sunpack::sevenzip {
@@ -8,7 +7,6 @@ namespace sunpack::sevenzip {
 #ifdef _WIN32
 
 std::vector<ArchiveOpenPlan> password_test_open_plans(
-    const std::wstring& archive_path,
     const std::vector<GUID>& formats,
     const std::vector<ExtractInputRange>& input_ranges,
     const std::wstring& format_hint
@@ -17,7 +15,7 @@ std::vector<ArchiveOpenPlan> password_test_open_plans(
     plan.ranges = input_ranges;
     plan.formats = formats;
     plan.archive_offset = input_ranges.empty() ? 0 : input_ranges.front().start;
-    plan.archive_type = format_hint.empty() ? archive_type_for_path(archive_path) : format_hint;
+    plan.format_hint = format_hint;
     plan.source = input_ranges.empty() ? "whole_file" : "provided_ranges";
     return {plan};
 }
@@ -41,8 +39,8 @@ CMyComPtr<IInStream> open_stream_for_plan(
 
 void apply_plan_metadata(PasswordTestResult& result, const ArchiveOpenPlan& plan) {
     result.archive_offset = plan.archive_offset;
-    if (!plan.archive_type.empty()) {
-        result.archive_type = plan.archive_type;
+    if (!plan.format_hint.empty()) {
+        result.archive_type = plan.format_hint;
     }
 }
 

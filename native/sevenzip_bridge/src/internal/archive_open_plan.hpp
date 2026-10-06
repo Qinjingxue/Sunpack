@@ -16,14 +16,13 @@ struct ArchiveOpenPlan {
     std::vector<ExtractInputRange> ranges;
     std::vector<GUID> formats;
     UInt64 archive_offset = 0;
-    std::wstring archive_type;
+    std::wstring format_hint;
     std::string source;
 
     bool uses_ranges() const { return !ranges.empty(); }
 };
 
 std::vector<ArchiveOpenPlan> password_test_open_plans(
-    const std::wstring& archive_path,
     const std::vector<GUID>& formats,
     const std::vector<ExtractInputRange>& input_ranges,
     const std::wstring& format_hint

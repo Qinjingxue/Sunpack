@@ -470,9 +470,7 @@ sunpack::sevenzip::ExtractArchiveResult password_candidate_failure(
     ExtractArchiveResult result;
     result.status = probe.status;
     result.backend_available = probe.backend_available;
-    result.archive_type = probe.archive_type.empty()
-        ? archive_type_for_path(archive_input.archive_path)
-        : probe.archive_type;
+    result.archive_type = probe.archive_type;
     result.password_candidate_batch = true;
     result.password_candidate_count = static_cast<unsigned int>(candidate_count);
     result.password_attempts = probe.attempts;

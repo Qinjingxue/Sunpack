@@ -12,6 +12,4 @@ using UInt32 = std::uint32_t;
 using UInt64 = std::uint64_t;
 using Int32 = std::int32_t;
 
-std::wstring archive_type_for_path(const std::wstring& path);
-
 }  // namespace sunpack::sevenzip

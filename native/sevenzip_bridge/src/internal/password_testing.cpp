@@ -58,9 +58,15 @@ namespace sunpack::sevenzip
             return result;
         }
 
-        bool encrypted_header_range_probe_candidate(const std::wstring &archive_type)
+        bool encrypted_header_range_probe_candidate(const std::wstring &format_hint)
         {
-            return archive_type == L"7z" || archive_type == L"rar" || archive_type == L"rar4" || archive_type == L"rar5";
+            std::wstring hint = lower_text(format_hint);
+            if (!hint.empty() && hint.front() == L'.')
+            {
+                hint.erase(hint.begin());
+            }
+            return hint == L"7z" || hint == L"sevenzip" || hint == L"seven_zip" ||
+                   hint == L"rar" || hint == L"rar4" || hint == L"rar5";
         }
 
         struct BoundedPasswordProbeSelection
@@ -191,7 +197,6 @@ namespace sunpack::sevenzip
         bool has_fallback = false;
 
         const auto plans = password_test_open_plans(
-            archive_path,
             formats,
             input_ranges,
             format_hint);
@@ -295,6 +300,7 @@ namespace sunpack::sevenzip
                 }
 
                 any_opened = true;
+                result.archive_type = canonical_archive_type_for_guid(format);
                 result.is_archive = true;
                 last_encryption_evidence = last_encryption_evidence || archive_has_encrypted_items(archive.Interface());
                 result.encrypted = result.encrypted || last_encryption_evidence;
@@ -413,7 +419,7 @@ namespace sunpack::sevenzip
             }
             else if (!any_opened &&
                      (looks_wrong_password(last_hr, last_op_res, last_encryption_evidence) ||
-                      (plan.uses_ranges() && encrypted_header_range_probe_candidate(plan.archive_type))))
+                      (plan.uses_ranges() && encrypted_header_range_probe_candidate(plan.format_hint))))
             {
 
                 result.status = PasswordTestStatus::WrongPassword;
@@ -712,9 +718,7 @@ namespace sunpack::sevenzip
 
             part_paths.empty() ? std::vector<std::wstring>{archive_path} : part_paths;
 
-        const std::vector<GUID> formats = extraction_formats_for_hint(
-            format_hint,
-            archive_path);
+        const std::vector<GUID> formats = extraction_formats_for_hint(format_hint);
 
         for (int i = 0; i < password_count; ++i)
         {
@@ -846,9 +850,7 @@ namespace sunpack::sevenzip
 
         const std::vector<std::wstring> part_paths{archive_path};
 
-        const std::vector<GUID> formats = extraction_formats_for_hint(
-            format_hint,
-            archive_path);
+        const std::vector<GUID> formats = extraction_formats_for_hint(format_hint);
 
         for (int i = 0; i < password_count; ++i)
         {

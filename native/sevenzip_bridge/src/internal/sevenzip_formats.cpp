@@ -1,11 +1,9 @@
 #include "sevenzip_formats.hpp"
 
+#include "lz4_handler.hpp"
 #include "sevenzip_paths.hpp"
 
 #ifdef _WIN32
-#include <algorithm>
-#include <cwctype>
-#include <filesystem>
 #include <vector>
 #endif
 
@@ -51,37 +49,11 @@ namespace sunpack::sevenzip
             return {};
         }
 
-        std::vector<unsigned char> metadata_format_ids_for_path(const std::wstring &archive_path)
+        const std::vector<unsigned char> &generic_format_ids()
         {
-            const std::wstring ext = lower_extension(archive_path);
-            std::wstring name = std::filesystem::path(archive_path).filename().wstring();
-            std::transform(name.begin(), name.end(), name.begin(), [](wchar_t ch)
-                           { return static_cast<wchar_t>(::towlower(ch)); });
-
-            if (ext == L".zip" || ext == L".jar" || ext == L".docx" || ext == L".xlsx" || ext == L".apk")
-                return {0x01};
-            if (name.size() >= 8 && name.compare(name.size() - 8, 8, L".zip.001") == 0)
-                return {0x01, 0x07};
-            if (name.size() >= 7 && name.compare(name.size() - 7, 7, L".7z.001") == 0)
-                return {0x07, 0x01};
-            if (ext == L".7z")
-                return {0x07};
-            if (ext == L".rar" || ext == L".r00")
-                return {0xCC, 0x03};
-            if (ext == L".tar")
-                return {0xEE};
-            if (ext == L".gz" || ext == L".tgz")
-                return {0xEF, 0xEE};
-            if (ext == L".bz2" || ext == L".tbz2" || ext == L".tbz")
-                return {0x02, 0xEE};
-            if (ext == L".xz" || ext == L".txz")
-                return {0x0C, 0xEE};
-            if (ext == L".lz4") return {0xFA, 0xEE};
-            if (ext == L".zst" || ext == L".tzst")
-                return {0x0E, 0xEE};
-            if (ext == L".001")
-                return {0x07, 0x01, 0xCC, 0x03};
-            return {0x07, 0x01, 0xCC, 0x03, 0xEE, 0xEF, 0x02, 0x0C, 0x0E, 0xFA};
+            static const std::vector<unsigned char> ids{
+                0x07, 0x01, 0xCC, 0x03, 0xEE, 0xEF, 0x02, 0x0C, 0x0E, 0xFA};
+            return ids;
         }
 
         std::vector<GUID> format_guids(const std::vector<unsigned char> &ids)
@@ -96,9 +68,7 @@ namespace sunpack::sevenzip
         }
     } // namespace
 
-    std::vector<GUID> extraction_formats_for_hint(
-        const std::wstring &format_hint,
-        const std::wstring &archive_path)
+    std::vector<GUID> extraction_formats_for_hint(const std::wstring &format_hint)
     {
         const std::wstring hint = normalized_format_hint(format_hint);
         std::vector<unsigned char> ids =
@@ -107,48 +77,28 @@ namespace sunpack::sevenzip
                 : known_format_ids_for_hint(hint);
         if (ids.empty())
         {
-            ids = metadata_format_ids_for_path(archive_path);
+            return format_guids(generic_format_ids());
         }
         return format_guids(ids);
     }
 
-    std::wstring archive_type_for_path(const std::wstring &path)
+    std::wstring canonical_archive_type_for_guid(const GUID &format)
     {
-        const std::wstring ext = lower_extension(path);
-        if (ext == L".zip" || ext == L".jar" || ext == L".docx" || ext == L".xlsx" || ext == L".apk")
+        switch (format.Data4[5])
         {
-            return L"zip";
+        case 0x01: return L"zip";
+        case 0x02: return L"bzip2";
+        case 0x03: return L"rar4";
+        case 0x07: return L"7z";
+        case 0x0C: return L"xz";
+        case 0x0E: return L"zstd";
+        case 0x0F:
+        case 0xEF: return L"gzip";
+        case 0xCC: return L"rar5";
+        case 0xEE: return L"tar";
+        case kLz4FormatId: return L"lz4";
+        default: return L"";
         }
-        if (ext == L".7z" || ext == L".001")
-        {
-            return L"7z";
-        }
-        if (ext == L".rar" || ext == L".r00")
-        {
-            return L"rar";
-        }
-        if (ext == L".exe" || ext == L".dll")
-        {
-            return L"pe";
-        }
-        if (ext == L".tar")
-        {
-            return L"tar";
-        }
-        if (ext == L".gz" || ext == L".tgz")
-        {
-            return L"gzip";
-        }
-        if (ext == L".bz2" || ext == L".tbz" || ext == L".tbz2")
-        {
-            return L"bzip2";
-        }
-        if (ext == L".lz4") return L"lz4";
-        if (ext == L".xz" || ext == L".txz")
-        {
-            return L"xz";
-        }
-        return L"";
     }
 
 #endif
