@@ -1028,7 +1028,7 @@ std::string verified_manifest_json(const std::string& job_id, const sunpack::sev
     const auto chunk_count = chunks.finish();
     const bool inventory_complete = validated && result.output_inventory_complete && file_count == result.files_written;
     return std::string("{") +
-        "\"version\":3,\"source\":\"sevenzip_worker_extract\"" +
+        "\"source\":\"sevenzip_worker_extract\"" +
         ",\"validated\":" + std::string(validated ? "true" : "false") +
         ",\"item_count\":" + std::to_string(result.item_count) +
         ",\"file_count\":" + std::to_string(file_count) +

@@ -53,7 +53,6 @@ def run_native(count: int) -> dict[str, object]:
         "type": "result",
         "status": "ok",
         "verified_manifest": {
-            "version": 3,
             "validated": True,
             "file_count": count,
             "inventory": [1, count, max(1, count // 1000), count * (count + 1) // 2, 0],

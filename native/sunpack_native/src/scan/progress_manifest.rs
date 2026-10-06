@@ -112,7 +112,6 @@ impl Summary {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 struct ManifestDocument {
-    version: u32,
     archive: String,
     out_dir: String,
     partial_outputs: bool,
@@ -375,7 +374,6 @@ pub(crate) fn complete_progress_manifest(
 ) -> NativeProgressManifest {
     NativeProgressManifest {
         document: Arc::new(ManifestDocument {
-            version: 1,
             archive,
             out_dir,
             partial_outputs: file_count > 0,
@@ -454,7 +452,6 @@ pub(crate) fn build_progress_manifest(
             files.iter().map(|item| item.bytes_written).sum()
         };
         ManifestDocument {
-            version: 1,
             archive,
             out_dir,
             partial_outputs: summary.partial > 0 || summary.complete > 0 || summary.failed > 0,

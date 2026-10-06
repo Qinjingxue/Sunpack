@@ -512,7 +512,6 @@ pub(crate) fn inspect_zip_structure_graph(
     max_entries: usize,
 ) -> PyResult<Py<PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("schema_version", 1)?;
     result.set_item("format", "zip")?;
     result.set_item("error", "")?;
     result.set_item("truncated", false)?;
@@ -1535,7 +1534,6 @@ pub(crate) fn inspect_zip_structure_graph(
 
 fn zip_directory_consistency_empty<'py>(py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
     let result = PyDict::new(py);
-    result.set_item("schema_version", 1)?;
     result.set_item("error", "")?;
     result.set_item("cd_parseable", false)?;
     result.set_item("cd_entries_checked", 0)?;

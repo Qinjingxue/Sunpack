@@ -28,7 +28,7 @@ def _result(job_id="job", *, chunks=1, files=1, trace_chunks=1, items=1):
     return _event(
         "result", job_id, status="failed",
         verified_manifest={
-            "version": 3, "validated": False, "item_count": files,
+            "validated": False, "item_count": files,
             "file_count": files, "inventory": [0, files, 0, files * 3, 0],
             "chunk_count": chunks,
         },
@@ -191,7 +191,7 @@ def test_async_bad_chunk_cancels_only_its_job_and_retains_ownership_until_finish
         assert json.loads(sent[-1]) == {"worker_command": "cancel", "job_id": "bad"}
         assert worker.process.returncode is None
         feed("manifest_chunk", "good", seq=0, rows=[_row("good.txt")])
-        feed("result", "good", verified_manifest={"version": 3, "file_count": 1, "chunk_count": 1, "inventory": [1, 1, 0, 3, 0]})
+        feed("result", "good", verified_manifest={"file_count": 1, "chunk_count": 1, "inventory": [1, 1, 0, 3, 0]})
         feed("native_event", "good", event="job_finished")
         feed("native_event", "bad", event="job_finished")
         reader.feed_eof()

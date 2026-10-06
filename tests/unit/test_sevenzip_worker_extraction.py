@@ -725,7 +725,7 @@ def test_compact_worker_manifest_is_parsed_into_native_storage():
 
     stdout = (
         '{"type":"result","status":"ok","verified_manifest":'
-        '{"version":3,"validated":true,"item_count":1,"file_count":1,'
+        '{"validated":true,"item_count":1,"file_count":1,'
         '"inventory":[1,1,0,3,1],"rows":[[0,"a.txt","",3,3,1,1,1,1,1,1,1,123,"616263"]]}}\n'
     )
     result = build_worker_diagnostics(stdout=stdout, stderr="", returncode=0)["result"]
@@ -754,7 +754,7 @@ def test_worker_event_per_item_arrays_become_native_tables():
 
     line = (
         b'{"type":"result","status":"failed","verified_manifest":'
-        b'{"version":3,"validated":false,"item_count":2,"file_count":1,'
+        b'{"validated":false,"item_count":2,"file_count":1,'
         b'"inventory":[0,1,0,3,1],"rows":[[0,"a.txt","",3,3,1,1,1,1,1,1,1,123,"616263"]]},'
         b'"diagnostics":{"failure_kind":"checksum_error","output_trace":{"total_bytes_written":3,'
         b'"items":[{"index":0,"path":"dir","is_dir":true},'
@@ -785,7 +785,7 @@ def test_worker_event_rejects_non_objects_and_malformed_rows():
     assert parse_worker_json_line("[1, 2]") == {}
     assert parse_worker_json_line('{"type":"progress"} trailing') == {}
     assert parse_worker_json_line(
-        '{"type":"result","verified_manifest":{"version":3,"inventory":[1,1,0,3,1],"rows":[[0,"a.txt"]]}}'
+        '{"type":"result","verified_manifest":{"inventory":[1,1,0,3,1],"rows":[[0,"a.txt"]]}}'
     ) == {}
     assert parse_worker_json_line('{"type":"progress","completed_bytes":5}') == {
         "type": "progress", "completed_bytes": 5,
@@ -803,7 +803,6 @@ def test_worker_manifest_native_parser_preserves_json_escaped_paths():
         "type": "result",
         "status": "ok",
         "verified_manifest": {
-            "version": 3,
             "validated": True,
             "item_count": 1,
             "file_count": 1,
@@ -820,17 +819,30 @@ def test_worker_manifest_native_parser_preserves_json_escaped_paths():
     assert materialized["magic"] == b"abc"
 
 
-def test_worker_manifest_v2_is_not_accepted():
-    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import build_worker_diagnostics
+@pytest.mark.parametrize("rows_first", [False, True])
+def test_worker_manifest_rows_and_inventory_are_order_independent(rows_first):
+    from sunpack.pipeline.extraction.internal.sevenzip.worker_diagnostics import (
+        native_worker_manifest,
+        parse_worker_json_line,
+    )
 
-    payload = {
-        "type": "result",
-        "status": "ok",
-        "verified_manifest": {"version": 2, "validated": True, "rows": []},
-    }
-    result = build_worker_diagnostics(stdout="", stderr="", returncode=0, result_payload=payload)["result"]
+    fields = [
+        ("rows", [[0, "a.txt", "", 3, 3, 1, 1, 1, 1, 1, 1, 1, 123, "616263"]]),
+        ("inventory", [1, 1, 0, 3, 1]),
+    ]
+    if not rows_first:
+        fields.reverse()
+    result = parse_worker_json_line(json.dumps({
+        "type": "result", "verified_manifest": dict(fields),
+    }))
 
-    assert "native_rows" not in result["verified_manifest"]
+    manifest = result["verified_manifest"]
+    assert "version" not in manifest
+    assert "rows" not in manifest
+    assert manifest["inventory"]["complete"] is True
+    native = native_worker_manifest(result)
+    assert native.all_complete()
+    assert native.file_page(0, 1)[0]["path"] == "a.txt"
 
 
 def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
@@ -844,7 +856,6 @@ def test_preparsed_worker_result_avoids_stdout_reparse_and_bounds_tail():
         "type": "result",
         "status": "ok",
         "verified_manifest": {
-            "version": 3,
             "validated": True,
             "rows": [[0, "source.txt", "output.txt", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]],
             "inventory": [1, 1, 0, 3, 0],
@@ -876,7 +887,6 @@ def test_complete_worker_inventory_drops_transient_native_rows_and_output_trace(
     result = parse_worker_json_line(json.dumps({
         "status": "ok",
         "verified_manifest": {
-            "version": 3,
             "validated": True,
             "inventory": [1, 1, 0, 3, 1],
             "rows": [[0, "a.txt", "", 3, 3, 1, 7, 1, 7, 1, 1, 1, 123, "616263"]],
@@ -1171,7 +1181,7 @@ def test_worker_async_output_extracts_format_without_source_crc(tmp_path):
     assert worker_result["files_written"] == 1
     assert worker_result["bytes_written"] == len(payload)
     manifest = worker_result["verified_manifest"]
-    assert manifest["version"] == 3
+    assert "version" not in manifest
     row = manifest["native_rows"].file_page(0, 1)[0]
     assert row["mtime_ns"] > 0
     assert row["magic"] == payload

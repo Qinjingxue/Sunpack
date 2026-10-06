@@ -94,7 +94,6 @@ class _FakeSevenZipRunner:
             "item_count": 1 if self.include_output_counts else 0,
             "archive_type": name,
             "verified_manifest": {
-                "version": 3,
                 "validated": True,
                 "file_count": 1,
                 "item_count": 1,

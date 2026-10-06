@@ -199,7 +199,6 @@ def test_output_scan_policy_uses_worker_magic_without_reopening_files(tmp_path, 
     worker_result = {
         "status": "ok",
         "verified_manifest": {
-            "version": 3,
             "validated": True,
             "inventory": {
                 "complete": True,
@@ -255,7 +254,6 @@ def test_worker_inventory_fused_snapshot_preserves_raw_entries_and_rejects_escap
     worker_result = {
         "status": "ok",
         "verified_manifest": {
-            "version": 3,
             "validated": True,
             "inventory": {
                 "complete": True,
@@ -310,7 +308,6 @@ def test_worker_inventory_fused_snapshot_applies_mtime_after_directory_projectio
     worker_result = {
         "status": "ok",
         "verified_manifest": {
-            "version": 3,
             "validated": True,
             "inventory": {
                 "complete": True,

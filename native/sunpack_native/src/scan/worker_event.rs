@@ -210,16 +210,15 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let py = self.py;
         let dict = PyDict::new(py);
-        let mut manifest_v3 = false;
         let mut inventory = None::<[u64; 5]>;
         let mut rows = None::<Vec<OutputFileRecord>>;
         while let Some(key) = map.next_key::<String>()? {
             match (self.scope, key.as_str()) {
-                (Scope::Manifest, "rows") if manifest_v3 => {
+                (Scope::Manifest, "rows") => {
                     rows = Some(map.next_value::<WorkerRows>()?.0);
                     continue;
                 }
-                (Scope::Manifest, "inventory") if manifest_v3 => {
+                (Scope::Manifest, "inventory") => {
                     let columns = map.next_value::<[u64; 5]>()?;
                     let summary = PyDict::new(py);
                     let entries: [(&str, Py<PyAny>); 5] = [
@@ -279,9 +278,6 @@ impl<'de, 'py> Visitor<'de> for PySeed<'py> {
                 _ => Scope::Plain,
             };
             let value = map.next_value_seed(PySeed { py, scope: child })?;
-            if self.scope == Scope::Manifest && key == "version" {
-                manifest_v3 = value.bind(py).extract::<i64>().ok() == Some(3);
-            }
             dict.set_item(key, value).map_err(py_error)?;
         }
         if let Some(files) = rows.filter(|files| !files.is_empty()) {

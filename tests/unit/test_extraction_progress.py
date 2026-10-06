@@ -124,7 +124,7 @@ def test_progress_manifest_file_round_trips_through_rust(tmp_path):
 
     payload = json.loads((out_dir / ".sunpack" / "extraction_manifest.json").read_text(encoding="utf-8"))
     assert path == str(out_dir / ".sunpack" / "extraction_manifest.json")
-    assert payload["version"] == 1
+    assert "version" not in payload
     assert payload["summary"]["partial"] == 1
     assert payload["files"][0]["archive_path"] == "雪.txt"
     loaded = load_progress_manifest(path)
@@ -139,7 +139,6 @@ def test_complete_worker_inventory_uses_summary_only_manifest(tmp_path):
         "status": "ok",
         "bytes_written": 6,
         "verified_manifest": {
-            "version": 3,
             "validated": True,
             "inventory": [1, 2, 0, 6, 1],
             "rows": [
