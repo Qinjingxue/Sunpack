@@ -24,7 +24,6 @@ from sunpack.core.support.resource_lifecycle import (
     task_scandir,
 )
 
-STATE_VERSION = 18
 DEFAULT_JOURNAL_COMPACT_RECORDS = 8192
 DEFAULT_JOURNAL_COMPACT_BYTES = 8 * 1024 * 1024
 DEFAULT_JOURNAL_HARD_BYTES = 256 * 1024 * 1024
@@ -60,14 +59,6 @@ def _seed_sequence(path: Path, last_seq: int) -> int:
     with _SEQUENCE_GUARD:
         _SEQUENCE_NEXT[key] = max(_SEQUENCE_NEXT.get(key, 1), int(last_seq) + 1)
         return _SEQUENCE_SEGMENT_START.setdefault(key, int(last_seq) + 1)
-
-
-def _reset_sequence(path: Path, next_seq: int = 1) -> None:
-    key = _state_path_key(path)
-    with _SEQUENCE_GUARD:
-        value = max(1, int(next_seq))
-        _SEQUENCE_NEXT[key] = value
-        _SEQUENCE_SEGMENT_START[key] = value
 
 
 def _reserve_sequence(path: Path, floor: int) -> tuple[int, int]:
@@ -280,30 +271,18 @@ class WatchStateStore:
     def load(self) -> None:
         with self._state_lock:
             self._reset_memory_locked()
-            incompatible = False
             if self.path.exists():
                 try:
-                    loaded = self._native.load_snapshot(str(self.path), STATE_VERSION)
+                    checkpoint_seq = self._native.load_snapshot(str(self.path))
                 except ValueError as exc:
                     raise WatchStateJournalError(str(exc)) from exc
                 except OSError as exc:
                     raise WatchStateJournalError(
                         f"corrupt watch state snapshot at {self.path}"
                     ) from exc
-                if not loaded.compatible:
-                    incompatible = True
-                else:
-                    self._snapshot_exists = True
-                    self._checkpoint_seq = int(loaded.checkpoint_seq)
-                    self._applied_seq = self._checkpoint_seq
-
-            if incompatible:
-                self._discard_incompatible_state_locked()
-                view = self._capture_snapshot_locked()
-                self._write_snapshot_view(view)
                 self._snapshot_exists = True
-                _reset_sequence(self.path, 1)
-                return
+                self._checkpoint_seq = int(checkpoint_seq)
+                self._applied_seq = self._checkpoint_seq
 
             self._load_journal_segments_locked()
             self._active_segment_start = _seed_sequence(self.path, self._applied_seq)
@@ -320,7 +299,6 @@ class WatchStateStore:
                     str(path),
                     self._checkpoint_seq,
                     expected_seq,
-                    STATE_VERSION,
                 )
             except FileNotFoundError:
                 continue
@@ -333,14 +311,6 @@ class WatchStateStore:
                 self._segment_bytes[segment_start] = int(replay.bytes)
                 self._journal_records += int(replay.records)
                 self._journal_bytes += int(replay.bytes)
-
-    def _discard_incompatible_state_locked(self) -> None:
-        self._reset_memory_locked()
-        for path in [self.path, *self._journal_paths()]:
-            try:
-                path.unlink()
-            except FileNotFoundError:
-                pass
 
     def save(self) -> None:
         """Force one checkpoint and wait until it covers the current sequence."""
@@ -445,7 +415,7 @@ class WatchStateStore:
                 delete=False,
             ) as temp:
                 temp_path = Path(temp.name)
-            view.write(str(temp_path), STATE_VERSION)
+            view.write(str(temp_path))
             os.replace(temp_path, self.path)
             _sync_file_path(self.path)
         finally:
@@ -623,7 +593,6 @@ class WatchStateStore:
             path=str(self._segment_path(segment_start)),
             segment_start=segment_start,
             seq=seq,
-            version=STATE_VERSION,
             operations=operations,
             durable=durable,
             on_written=self._on_journal_written,

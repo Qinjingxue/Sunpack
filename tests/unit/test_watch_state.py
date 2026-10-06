@@ -42,7 +42,7 @@ def test_checkpoint_uses_unique_atomic_snapshot_writer(tmp_path, monkeypatch):
     assert temporary_paths[0].parent == tmp_path
     assert temporary_paths[0].name.endswith(".tmp")
     payload = json.loads(state_path.read_text(encoding="utf-8"))
-    assert payload["version"] == watch_state_module.STATE_VERSION
+    assert "version" not in payload
     assert payload["checkpoint_seq"] == state.applied_seq
     assert not list(tmp_path.glob(".state.json.*.tmp"))
 
@@ -64,7 +64,11 @@ def test_incremental_update_appends_segment_without_replacing_snapshot(tmp_path,
 
     assert not replacements
     assert state_path.read_text(encoding="utf-8") == snapshot_before
-    assert state.journal_path.read_text(encoding="utf-8").endswith("\n")
+    journal_text = state.journal_path.read_text(encoding="utf-8")
+    assert journal_text.endswith("\n")
+    transaction = json.loads(journal_text)
+    assert "version" not in transaction
+    assert transaction["seq"] == state.applied_seq
     [reloaded] = WatchStateStore(str(state_path)).pending_work_items()
     assert reloaded.path == str((tmp_path / "queued.7z").resolve())
 
@@ -88,7 +92,7 @@ def test_truncated_segment_tail_is_ignored_and_recovered(tmp_path):
     state.queue_active(first, durable=True)
     damaged_segment = state.journal_path
     with open(damaged_segment, "ab") as handle:
-        handle.write(b'{"version":17,"seq":2,"operations":[')
+        handle.write(b'{"seq":2,"operations":[')
 
     recovered = WatchStateStore(str(state_path))
     assert [item.path for item in recovered.pending_work_items()] == [first.path]
@@ -206,20 +210,6 @@ def test_hard_limit_never_runs_snapshot_on_mutation_thread(tmp_path, monkeypatch
     assert all(thread_id != caller_thread_id for thread_id in checkpoint_thread_ids)
     assert WatchStateStore(str(state.path)).pending_work_items()
 
-
-def test_previous_state_schema_is_discarded_without_migration(tmp_path):
-    state_path = tmp_path / "state.json"
-    state_path.write_text(
-        json.dumps({"version": 16, "pending_work": {"legacy": {"path": "legacy"}}}),
-        encoding="utf-8",
-    )
-
-    state = WatchStateStore(str(state_path))
-
-    assert not state.pending_work_items()
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    assert payload["version"] == watch_state_module.STATE_VERSION
-    assert payload["checkpoint_seq"] == 0
 
 
 def test_concurrent_updates_share_one_ordered_sequence(tmp_path):
@@ -443,7 +433,7 @@ def test_native_checkpoint_round_trips_nested_unicode_payload(tmp_path):
 
     payload = json.loads(state_path.read_text(encoding="utf-8"))
     entry = next(iter(payload["entries"].values()))
-    assert payload["version"] == watch_state_module.STATE_VERSION
+    assert "version" not in payload
     assert payload["watch_cursors"]["volume:雪"]["journal_id"] == 2**63 + 17
     assert entry["last_error"] == "bad\n\"password\\雪"
     assert entry["failure_payload"]["nested"]["unicode"] == "雪☃"

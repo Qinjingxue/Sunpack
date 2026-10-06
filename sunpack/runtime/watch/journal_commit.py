@@ -64,7 +64,6 @@ def submit_state_transaction(
     path: str,
     segment_start: int,
     seq: int,
-    version: int,
     operations: list[dict[str, Any]],
     durable: bool,
     on_written: Callable[[int, int], None] | None = None,
@@ -75,7 +74,6 @@ def submit_state_transaction(
         str(path),
         int(segment_start),
         int(seq),
-        int(version),
         operations,
         bool(durable),
     )

@@ -141,7 +141,6 @@ enum WriterCommand {
         path: PathBuf,
         segment_start: u64,
         seq: u64,
-        version: u32,
         operations: JsonValue,
         durable: bool,
         bytes_written: Arc<AtomicU64>,
@@ -191,7 +190,6 @@ impl JournalRuntime {
         path: PathBuf,
         segment_start: u64,
         seq: u64,
-        version: u32,
         operations: JsonValue,
         durable: bool,
     ) -> Result<NativeJournalTicket, String> {
@@ -207,7 +205,6 @@ impl JournalRuntime {
                 path,
                 segment_start,
                 seq,
-                version,
                 operations,
                 durable,
                 bytes_written: ticket.bytes_written.clone(),
@@ -410,11 +407,9 @@ fn segment_file(
     Ok(file)
 }
 
-fn encode_transaction(version: u32, seq: u64, operations: &JsonValue) -> io::Result<Vec<u8>> {
+fn encode_transaction(seq: u64, operations: &JsonValue) -> io::Result<Vec<u8>> {
     let mut payload = Vec::with_capacity(512);
-    payload.extend_from_slice(b"{\"version\":");
-    payload.extend_from_slice(version.to_string().as_bytes());
-    payload.extend_from_slice(b",\"seq\":");
+    payload.extend_from_slice(b"{\"seq\":");
     payload.extend_from_slice(seq.to_string().as_bytes());
     payload.extend_from_slice(b",\"operations\":");
     write_json_value(&mut payload, operations)?;
@@ -431,7 +426,6 @@ struct AppendWorkItem {
     path: PathBuf,
     segment_start: u64,
     seq: u64,
-    version: u32,
     operations: JsonValue,
     durable: bool,
     bytes_written: Arc<AtomicU64>,
@@ -442,7 +436,6 @@ fn append_work_item(
     path: PathBuf,
     segment_start: u64,
     seq: u64,
-    version: u32,
     operations: JsonValue,
     durable: bool,
     bytes_written: Arc<AtomicU64>,
@@ -452,7 +445,6 @@ fn append_work_item(
         path,
         segment_start,
         seq,
-        version,
         operations,
         durable,
         bytes_written,
@@ -466,7 +458,7 @@ fn write_append_batch(shared: &Shared, batch: &[AppendWorkItem]) -> io::Result<(
     let mut payload = Vec::with_capacity(batch.len().saturating_mul(512));
     let mut record_sizes = Vec::with_capacity(batch.len());
     for item in batch {
-        let encoded = encode_transaction(item.version, item.seq, &item.operations)?;
+        let encoded = encode_transaction(item.seq, &item.operations)?;
         record_sizes.push(encoded.len());
         payload.extend_from_slice(&encoded);
     }
@@ -546,7 +538,6 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                 path,
                 segment_start,
                 seq,
-                version,
                 operations,
                 durable,
                 bytes_written,
@@ -559,7 +550,6 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                     path,
                     segment_start,
                     seq,
-                    version,
                     operations,
                     durable,
                     bytes_written,
@@ -575,7 +565,6 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                             path,
                             segment_start,
                             seq,
-                            version,
                             operations,
                             durable,
                             bytes_written,
@@ -589,7 +578,6 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                                     path,
                                     segment_start,
                                     seq,
-                                    version,
                                     operations,
                                     durable,
                                     bytes_written,
@@ -600,7 +588,6 @@ fn writer_loop(shared: Arc<Shared>, rx: mpsc::Receiver<WriterCommand>) {
                                     path,
                                     segment_start,
                                     seq,
-                                    version,
                                     operations,
                                     durable,
                                     bytes_written,
@@ -869,7 +856,6 @@ pub(crate) fn watch_journal_submit_append(
     path: String,
     segment_start: u64,
     seq: u64,
-    version: u32,
     operations: &Bound<'_, PyAny>,
     durable: bool,
 ) -> PyResult<NativeJournalTicket> {
@@ -880,7 +866,6 @@ pub(crate) fn watch_journal_submit_append(
             PathBuf::from(path),
             segment_start,
             seq,
-            version,
             operations,
             durable,
         )
@@ -1064,7 +1049,6 @@ mod tests {
                 path: path.clone(),
                 segment_start: 1,
                 seq,
-                version: 17,
                 operations: empty_operations(),
                 durable: false,
                 bytes_written: Arc::new(AtomicU64::new(0)),

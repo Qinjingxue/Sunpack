@@ -147,7 +147,6 @@ pub(crate) struct NativeWatchSnapshot {
 
 #[derive(Serialize)]
 struct SnapshotDocument<'a> {
-    version: u32,
     checkpoint_seq: u64,
     password_generation: i64,
     password_source_signature: &'a str,
@@ -164,10 +163,9 @@ impl NativeWatchSnapshot {
     }
 
     /// Encode, write and fsync the snapshot to an existing temporary file.
-    fn write(&self, py: Python<'_>, path: String, version: u32) -> PyResult<u64> {
+    fn write(&self, py: Python<'_>, path: String) -> PyResult<u64> {
         py.detach(|| -> PyResult<u64> {
             let document = SnapshotDocument {
-                version,
                 checkpoint_seq: self.checkpoint_seq,
                 password_generation: self.data.password_generation,
                 password_source_signature: &self.data.password_source_signature,
@@ -203,15 +201,6 @@ impl NativeWatchSnapshot {
             Ok(writer.get_ref().metadata()?.len())
         })
     }
-}
-
-/// Outcome of loading the snapshot file into an empty store.
-#[pyclass(module = "sunpack_native", frozen)]
-pub(crate) struct NativeWatchSnapshotLoad {
-    #[pyo3(get)]
-    compatible: bool,
-    #[pyo3(get)]
-    checkpoint_seq: u64,
 }
 
 /// Records applied from one journal segment.
@@ -405,19 +394,10 @@ impl NativeWatchState {
     }
 
     /// Replace the maps with the snapshot at ``path``.
-    fn load_snapshot(
-        &self,
-        py: Python<'_>,
-        path: String,
-        version: u32,
-    ) -> PyResult<NativeWatchSnapshotLoad> {
-        let loaded = py.detach(|| load_snapshot_file(&path, version))?;
-        let (compatible, checkpoint_seq, data) = loaded;
+    fn load_snapshot(&self, py: Python<'_>, path: String) -> PyResult<u64> {
+        let (checkpoint_seq, data) = py.detach(|| load_snapshot_file(&path))?;
         *self.lock() = data;
-        Ok(NativeWatchSnapshotLoad {
-            compatible,
-            checkpoint_seq,
-        })
+        Ok(checkpoint_seq)
     }
 
     /// Apply one journal segment after ``checkpoint_seq``; errors carry the WAL diagnosis.
@@ -427,11 +407,10 @@ impl NativeWatchState {
         path: String,
         checkpoint_seq: u64,
         expected_seq: u64,
-        version: u32,
     ) -> PyResult<NativeWatchReplay> {
         let mut data = std::mem::take(&mut *self.lock());
         let replay = py.detach(|| {
-            replay_segment_file(&mut data, &path, checkpoint_seq, expected_seq, version)
+            replay_segment_file(&mut data, &path, checkpoint_seq, expected_seq)
         });
         *self.lock() = data;
         replay
@@ -586,7 +565,7 @@ fn load_records<T: for<'de> Deserialize<'de>>(
     records
 }
 
-fn load_snapshot_file(path: &str, version: u32) -> PyResult<(bool, u64, StateData)> {
+fn load_snapshot_file(path: &str) -> PyResult<(u64, StateData)> {
     let mut file = TrackedFile::open(path, "watch_state_snapshot_input")?;
     let mut raw = Vec::new();
     std::io::Read::read_to_end(&mut file, &mut raw)?;
@@ -595,9 +574,6 @@ fn load_snapshot_file(path: &str, version: u32) -> PyResult<(bool, u64, StateDat
     let Some(object) = payload.as_object() else {
         return Err(invalid(format!("invalid watch state snapshot at {path}")));
     };
-    if object.get("version").and_then(Value::as_u64) != Some(u64::from(version)) {
-        return Ok((false, 0, StateData::default()));
-    }
     let metadata = |name: &str| -> PyResult<i128> {
         match object.get(name) {
             None => Ok(0),
@@ -618,7 +594,7 @@ fn load_snapshot_file(path: &str, version: u32) -> PyResult<(bool, u64, StateDat
             .map(decode_cursors)
             .unwrap_or_default(),
     };
-    Ok((true, checkpoint_seq, data))
+    Ok((checkpoint_seq, data))
 }
 
 fn replay_segment_file(
@@ -626,7 +602,6 @@ fn replay_segment_file(
     path: &str,
     checkpoint_seq: u64,
     mut expected_seq: u64,
-    version: u32,
 ) -> PyResult<NativeWatchReplay> {
     let file = TrackedFile::open(path, "watch_state_journal_input")?;
     let mut reader = BufReader::new(file);
@@ -658,12 +633,6 @@ fn replay_segment_file(
                 at()
             )));
         };
-        if object.get("version").and_then(Value::as_u64) != Some(u64::from(version)) {
-            return Err(invalid(format!(
-                "incompatible watch state journal at {}",
-                at()
-            )));
-        }
         let seq = object
             .get("seq")
             .and_then(Value::as_u64)
