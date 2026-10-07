@@ -11,6 +11,11 @@ The new regression cases cover:
   expected sizes/CRC32 verify that this healthy segment survives sibling
   failures and is extracted exactly once. Plan 7 also covers LZ4 ordinary,
   disguised, embedded, chunked downloads and writes to the final path.
+  `plan7_watch_downloads/test_plan7_lz4_wrapped_rar_volumes.py` delivers four
+  independently LZ4-wrapped, header-encrypted RAR volumes with the password
+  supplied before arrival. Both interleaved rename-commit and final-path writes
+  must automatically recover the complete volume group and extract each member
+  exactly once; Rust inventories verify volume/member sizes and CRC32.
 
 * Plan 5 constructs carriers once with a declared seed. Rust streams source
   files into the carrier and records byte offsets/lengths independently of the
