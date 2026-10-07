@@ -19,6 +19,7 @@ import io
 import os
 import shutil
 import statistics
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -58,16 +59,96 @@ FORMATS = (
     "tbz2",
     "txz",
     "tzst",
+    "zipx",
+    "lz4",
 )
 
 DEFAULT_WORKER = (
     ROOT
     / "native"
     / "sevenzip_bridge"
-    / "build-cli-coarse"
+    / "build-x64"
     / "Release"
     / "sunpack_sevenzip_worker.exe"
 )
+DEFAULT_LZ4_TOOL = ROOT / "native" / "sevenzip_bridge" / "build-x64" / "Release" / "sunpack_sevenzip_lz4.exe"
+
+
+def _ensure_special_archives(lz4_tool: Path, timeout_seconds: float) -> None:
+    """Build one real ZIPX and one real LZ4 frame from the fixed 300 MiB inputs."""
+    zipx_dir = CORPUS_ROOT / "few_large-zipx"
+    zipx_path = zipx_dir / "few_large.zipx"
+    if not zipx_path.is_file():
+        zipx_dir.mkdir(parents=True, exist_ok=True)
+        source = CORPUS_ROOT.parent / "source" / "zipx-staging"
+        shutil.rmtree(source, ignore_errors=True)
+        source.mkdir(parents=True, exist_ok=True)
+        seven_zip = ROOT / "tools" / "7z.exe"
+        archive = _archive_for("zip")
+        extract = subprocess.run(
+            [str(seven_zip), "x", "-y", "-bd", "-bso0", f"-o{source}", str(archive)],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if extract.returncode != 0:
+            raise RuntimeError(f"cannot prepare ZIPX source: {extract.stderr[-2000:].decode(errors='replace')}")
+        try:
+            create = subprocess.run(
+                [str(seven_zip), "a", "-y", "-tzip", "-mm=LZMA", str(zipx_path), "."],
+                cwd=source,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            if create.returncode != 0 or not zipx_path.is_file():
+                raise RuntimeError(f"cannot create ZIPX: {create.stderr[-2000:].decode(errors='replace')}")
+        finally:
+            shutil.rmtree(source, ignore_errors=True)
+
+    lz4_dir = CORPUS_ROOT / "few_large-lz4"
+    lz4_path = lz4_dir / "few_large_payload.bin.lz4"
+    if not lz4_path.is_file():
+        if not lz4_tool.is_file():
+            raise FileNotFoundError(f"native LZ4 fixture tool does not exist: {lz4_tool}")
+        lz4_dir.mkdir(parents=True, exist_ok=True)
+        source = CORPUS_ROOT.parent / "source" / "lz4-staging"
+        shutil.rmtree(source, ignore_errors=True)
+        source.mkdir(parents=True, exist_ok=True)
+        seven_zip = ROOT / "tools" / "7z.exe"
+        extract = subprocess.run(
+            [str(seven_zip), "x", "-y", "-bd", "-bso0", f"-o{source}", str(_archive_for("zip"))],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout_seconds,
+            check=False,
+        )
+        if extract.returncode != 0:
+            raise RuntimeError(f"cannot prepare LZ4 source: {extract.stderr[-2000:].decode(errors='replace')}")
+        try:
+            sources = sorted(source.rglob("*.bin"))
+            if len(sources) != 2 or sum(path.stat().st_size for path in sources) != PAYLOAD_BYTES:
+                raise RuntimeError("LZ4 source must contain the two fixed 150 MiB payload members")
+            packed = subprocess.run(
+                [str(lz4_tool), "--compress-files", str(lz4_path), *(str(path) for path in sources)],
+                cwd=ROOT,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                timeout=timeout_seconds,
+                check=False,
+            )
+            if packed.returncode != 0 or not lz4_path.is_file() or lz4_path.stat().st_size <= 0:
+                raise RuntimeError(f"cannot create LZ4 corpus case: {packed.stderr[-2000:].decode(errors='replace')}")
+        finally:
+            shutil.rmtree(source, ignore_errors=True)
 
 
 def _archive_for(format_name: str) -> Path:
@@ -224,6 +305,8 @@ async def _run_cli_once(
 
 async def _run(args: argparse.Namespace) -> int:
     selected_formats = tuple(args.formats or FORMATS)
+    if {"zipx", "lz4"}.intersection(selected_formats):
+        _ensure_special_archives(args.lz4_tool.resolve(), args.timeout)
     archives = _validate_corpus(selected_formats)
     worker_path = args.worker_path.resolve()
     if not worker_path.is_file():
@@ -236,6 +319,8 @@ async def _run(args: argparse.Namespace) -> int:
     all_rows: list[dict[str, Any]] = []
     warmup_rows: list[dict[str, Any]] = []
     profiler: RequestRuntimeProfiler | None = None
+    original_prefetch = os.environ.get("SUNPACK_SEVENZIP_PREFETCH")
+    os.environ["SUNPACK_SEVENZIP_PREFETCH"] = "1" if args.prefetch == "on" else "0"
     restore_worker = _patch_worker_path(worker_path)
     from sunpack.runtime.cli import persistent_runtime
 
@@ -376,6 +461,7 @@ async def _run(args: argparse.Namespace) -> int:
                     "warmups": args.warmups,
                     "timeout_seconds": args.timeout,
                     "worker_path": str(worker_path),
+                    "worker_prefetch": args.prefetch,
                     "cli_mode": "in-process async_main, persistent runtime",
                 },
                 "environment": {
@@ -420,6 +506,10 @@ async def _run(args: argparse.Namespace) -> int:
         with contextlib.suppress(Exception):
             await persistent_runtime.close_persistent_runtime()
         restore_worker()
+        if original_prefetch is None:
+            os.environ.pop("SUNPACK_SEVENZIP_PREFETCH", None)
+        else:
+            os.environ["SUNPACK_SEVENZIP_PREFETCH"] = original_prefetch
 
 
 def _git_revision() -> str | None:
@@ -444,6 +534,8 @@ def main() -> int:
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--format", action="append", dest="formats", choices=FORMATS)
     parser.add_argument("--worker-path", type=Path, default=DEFAULT_WORKER)
+    parser.add_argument("--lz4-tool", type=Path, default=DEFAULT_LZ4_TOOL)
+    parser.add_argument("--prefetch", choices=("on", "off"), default="on")
     parser.add_argument("--timeout", type=float, default=900.0)
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--results-root", type=Path)

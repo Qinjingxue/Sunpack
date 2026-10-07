@@ -153,6 +153,44 @@ static Bytes tar(const Bytes &input) {
     unsigned sum=0;for(auto b:out)sum+=b;char crc[8];std::snprintf(crc,sizeof(crc),"%06o",sum);std::memcpy(out.data()+148,crc,7);out[155]=' ';
     out.insert(out.end(),input.begin(),input.end());out.resize(((out.size()+511)/512)*512+1024);return out;
 }
+static void compress_files_to_lz4(const std::vector<std::filesystem::path> &source_paths, const std::filesystem::path &target_path) {
+    check(!source_paths.empty(), "LZ4 benchmark needs at least one source");
+    std::ofstream output(target_path, std::ios::binary | std::ios::trunc);
+    check(output.good(), "LZ4 benchmark target open");
+
+    LZ4F_preferences_t preferences{};
+    preferences.frameInfo.blockMode = LZ4F_blockIndependent;
+    LZ4F_cctx *context = nullptr;
+    check(!LZ4F_isError(LZ4F_createCompressionContext(&context, LZ4F_VERSION)), "LZ4 benchmark context");
+    std::vector<unsigned char> source(1024 * 1024);
+    std::vector<unsigned char> packed(LZ4F_compressBound(source.size(), &preferences));
+    auto write = [&](size_t size) {
+        output.write(reinterpret_cast<const char *>(packed.data()), static_cast<std::streamsize>(size));
+        check(output.good(), "LZ4 benchmark write");
+    };
+    const size_t header_size = LZ4F_compressBegin(context, packed.data(), packed.size(), &preferences);
+    check(!LZ4F_isError(header_size), "LZ4 benchmark frame header");
+    write(header_size);
+    for (const auto &source_path : source_paths) {
+        std::ifstream input(source_path, std::ios::binary);
+        check(input.good(), "LZ4 benchmark source open");
+        while (input) {
+            input.read(reinterpret_cast<char *>(source.data()), static_cast<std::streamsize>(source.size()));
+            const auto count = static_cast<size_t>(input.gcount());
+            if (!count) break;
+            const size_t packed_size = LZ4F_compressUpdate(context, packed.data(), packed.size(), source.data(), count, nullptr);
+            check(!LZ4F_isError(packed_size), "LZ4 benchmark frame update");
+            write(packed_size);
+        }
+        check(input.eof(), "LZ4 benchmark source read");
+    }
+    const size_t footer_size = LZ4F_compressEnd(context, packed.data(), packed.size(), nullptr);
+    check(!LZ4F_isError(footer_size), "LZ4 benchmark frame footer");
+    write(footer_size);
+    LZ4F_freeCompressionContext(context);
+    output.close();
+    check(output.good(), "LZ4 benchmark target close");
+}
 static Bytes zero_dictionary_id(Bytes bytes) {
     check((bytes[4] & 1) != 0, "explicit dictionary field");
     const size_t at = 6 + ((bytes[4] & 8) ? 8 : 0);
@@ -192,6 +230,12 @@ static void benchmark(const Bytes &input) {
 }
 int wmain(int argc,wchar_t **argv) {
     try {
+        if (argc >= 4 && std::wstring(argv[1]) == L"--compress-files") {
+            std::vector<std::filesystem::path> sources;
+            for (int index = 3; index < argc; ++index) sources.emplace_back(argv[index]);
+            compress_files_to_lz4(sources, argv[2]);
+            return 0;
+        }
         auto root=argc>1?std::filesystem::path(argv[1]):std::filesystem::temp_directory_path()/L"sunpack-lz4-tests";
         root=std::filesystem::absolute(root).make_preferred();
         std::filesystem::create_directories(root);

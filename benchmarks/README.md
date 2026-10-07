@@ -27,6 +27,9 @@ uv run --locked python -m benchmarks reader embedded-scan --generate-plan5-mib 5
   --max-regression-percent 5
 uv run --locked python -m benchmarks scan hotspots . --mode full --json-out benchmarks/results/scan-hotspots.json
 uv run --locked python -m benchmarks extraction format-matrix --runs 5 --json-out benchmarks/results/extraction-benchmark.json
+uv run --locked python -m benchmarks extraction cli-format-matrix --runs 3 --prefetch on --json-out benchmarks/results/cli-format-matrix-prefetch-on.json
+uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch on --json-out benchmarks/results/cli-zipx-lz4-prefetch-on.json
+uv run --locked python -m benchmarks extraction cli-format-matrix --format zipx --format lz4 --runs 3 --prefetch off --json-out benchmarks/results/cli-zipx-lz4-prefetch-off.json
 uv run --locked python -m benchmarks extraction sevenzip-worker-matrix --runs 3 --warmups 1 --json-out benchmarks/results/sevenzip-worker-baseline.json
 uv run --locked python -m benchmarks extraction worker-vs-7z-300m `
   --sunpack-version v0.7.0 --worker-source-commit c3eaec11 `
@@ -202,6 +205,16 @@ samples, and per-case time/RSS medians. `--metadata-only` generates only the cor
 catalog. The full interpretation, machine identity, and recorded v0.7.0 result
 are documented in [English](../docs/benchmark_worker_vs_7z_300m.md) and
 [简体中文](../docs/zh-CN/benchmark_worker_vs_7z_300m.md).
+
+`extraction cli-format-matrix` includes ZIPX (ZIP using LZMA compression) and
+LZ4 in its fixed 300 MiB full-format corpus. ZIPX is rebuilt from the existing
+payload members; LZ4 is one frame containing the concatenated 300 MiB raw
+members, so both cases produce exactly 300 MiB of output. The LZ4 corpus writer
+is part of `sunpack_sevenzip_lz4`; build it with
+`cmake --build native/sevenzip_bridge/build-x64 --config Release --target sunpack_sevenzip_lz4`
+when it is missing. `--prefetch on|off` controls the native worker's input
+prefetch setting before the persistent worker starts. Run the ZIPX/LZ4 command
+once per setting in separate benchmark processes for an apples-to-apples A/B.
 
 `extraction worker-small-file-scheduling` measures the worker-internal thread
 scheduler under a deliberately adversarial many-small-file workload. It creates
